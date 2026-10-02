@@ -549,6 +549,22 @@ _PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
 _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 
+# The environment the host-side relay is launched with, and nothing else
+# (`_ensure_pilot_egress_proxy` runs it under `env -i`). Each name is passed
+# only when set in the caller. What the relay reads, and why each is here:
+#   PATH               the relay's `#!/usr/bin/env python3` shebang
+#   HOME               Path.home() -> ~/.claude/.credentials.json
+#   LANG               interpreter locale
+#   MIKA_EGRESS_DEBUG  the relay's own debug gate
+#   SSL_CERT_FILE/DIR  read by OpenSSL for the upstream TLS context, when a
+#   OPENSSL_CONF       host sets them (OpenSSL loads its config at init)
+# Deliberately NOT here: `_MIKA_EGRESS_PREBIND_TEST_BARRIER` (a test seam the
+# relay's tests set directly, never through this launcher) and `SSLKEYLOGFILE`
+# (a diagnostic variable that would write upstream TLS secrets to disk).
+# MIKA_PILOT_EGRESS_LOG_DIR is read by this shell for the redirection, not by
+# the relay. A variable the relay comes to need for its function goes here.
+_PILOT_EGRESS_RELAY_ENV_ALLOWLIST=(PATH HOME LANG MIKA_EGRESS_DEBUG SSL_CERT_FILE SSL_CERT_DIR OPENSSL_CONF)
+
 # mika#2049: the relay-down stamp. Written HERE (shell), read by the engine
 # (Rust) — the first file under `state/` to cross that boundary in this
 # direction, so the convention is posed here rather than inherited.
@@ -851,7 +867,16 @@ _ensure_pilot_egress_proxy() {
     else
         log_file="/tmp/mika-pilot-egress-proxy.log"
     fi
-    nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
+    # The relay is a long-lived daemon that outlives the dispatch launching it,
+    # so it starts from an empty environment plus the allowlist above rather
+    # than inheriting the task's. `env` execs the relay in place: `$!` is still
+    # the relay's own pid, which the failure message below relies on.
+    local -a relay_env=()
+    local relay_var
+    for relay_var in "${_PILOT_EGRESS_RELAY_ENV_ALLOWLIST[@]}"; do
+        [ -n "${!relay_var+x}" ] && relay_env+=("$relay_var=${!relay_var}")
+    done
+    nohup env -i "${relay_env[@]}" "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
         >>"$log_file" 2>&1 </dev/null &
     # mika#2051: captured HERE, not read from `$!` further down, because the
     # failure path below needs it -- and that path is the only one this ticket

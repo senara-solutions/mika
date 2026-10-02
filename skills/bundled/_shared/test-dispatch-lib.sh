@@ -5454,7 +5454,10 @@ _egress_guard_probe() {
     # the guard must notice either way.
     cat > "$bin" <<'FAKE_PROXY'
 #!/bin/bash
-touch "$MIKA_TEST_LAUNCH_MARKER"
+# The marker lives next to this script, not in an environment variable: the
+# launcher starts the relay under `env -i`, so nothing exported by the test
+# reaches it.
+touch "$(dirname "$0")/launched"
 # Noisy on purpose: a proxy dying before bind() prints a traceback, and that
 # output goes wherever the launcher points its log. If the log override ever
 # regresses, this line lands in the operational log and the size assertion at
@@ -5495,7 +5498,6 @@ time.sleep(30)
         _PILOT_EGRESS_SOCK="$sock"
         _PILOT_EGRESS_PROXY_BIN="$bin"
         MIKA_PILOT_EGRESS_LOG_DIR="$logdir"
-        export MIKA_TEST_LAUNCH_MARKER="$marker"
         _ensure_pilot_egress_proxy 2>&1 >/dev/null
     ) && rc=0 || rc=$?
 
@@ -5611,7 +5613,6 @@ s.close()
         _PILOT_EGRESS_SOCK="$sock"
         _PILOT_EGRESS_PROXY_BIN="$bin"
         MIKA_PILOT_EGRESS_LOG_DIR="$logdir"
-        export MIKA_TEST_LAUNCH_MARKER="$tmp/launched"
         _ensure_pilot_egress_proxy 2>&1 >/dev/null
     ) || true
     rm -rf "$tmp"
