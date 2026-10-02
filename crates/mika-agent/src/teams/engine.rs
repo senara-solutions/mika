@@ -46,6 +46,111 @@ const TEAM_RUN_STUCK_THRESHOLD_SECS: i64 = 20 * 60;
 /// headroom.
 const TEAM_RUN_LIVENESS_THRESHOLD_SECS: i64 = 5 * 60;
 
+/// The deliverable posed in place of one the testimony-grade guard refused
+/// (mika#2633 U3). **Single definition site.**
+///
+/// # Why `Some(this)` and not `None`
+///
+/// `teams::notification` already renders *"Team 'X' completed (no deliverable
+/// produced)."* on `None` — which would be **false** (a deliverable was
+/// produced, it was withheld) and would make a refusal indistinguishable from a
+/// run that produced nothing. The distinction is the whole point: one is a
+/// doctrine decision, the other is an empty run, and they call for opposite
+/// operator conduct.
+///
+/// # Why ONE register, against the mika#2290 / mika#2292 motif
+///
+/// Those two tickets shipped two bodies because `FAMILY_SOUL` forbids
+/// infrastructure jargon, and mika#2292 wrote the discriminant: *what the family
+/// register gives up is the part of the fact that makes no sense to someone with
+/// no infrastructure*. **Here there is nothing to give up** — "team" and
+/// "deliverable" are ordinary words, not substrate vocabulary. Measurement to
+/// match: `run_team` is a builtin conditioned on
+/// `agents.len() > 1 || !teams.is_empty()`, and a family tenant is mono-agent,
+/// so the family population is empty in practice. Stated consequence: no `match`
+/// on `PersonaProfile` at this site, and a future profile has nothing to decide
+/// here (motif mika#1983, which had to write the same refusal).
+///
+/// It names no workaround and no substrate detail: a refusal that hands over the
+/// template is a leak with one more step (mika#2520, mika#2292).
+///
+/// # Its opening words are a WIRE FORMAT
+///
+/// The operator SQL published in the root `CLAUDE.md` finds the withheld
+/// population with `deliverable LIKE 'The team finished its work, but its
+/// deliverable%'`, so rewording the start of this sentence silently empties
+/// that query. Pinned by `mika2633_le_prefixe_de_la_ligne_neutre_est_un_format_de_fil`
+/// (motif `TESTIMONY_ACCESS_REFUSAL_PREFIX`). Changing it means changing the
+/// published query in the same commit, and dating the break.
+pub(crate) const TEAM_DELIVERABLE_WITHHELD: &str = "The team finished its work, but its deliverable could not be passed on as \
+     written. Nothing has been sent in its place. Ask again and it will be \
+     re-written.";
+
+/// The workspace-root file the writer is told to write its deliverable to
+/// (`prompt::build_deliverable_context`, step 3). Rewritten with the committed
+/// text when a deliverable is refused (mika#2633 W2).
+const WORKSPACE_DELIVERABLE_FILE: &str = "deliverable.md";
+
+/// Where a `run.deliverable` came from — and therefore what a refusal does with
+/// it (mika#2633 U1/U2).
+///
+/// **Exhaustive `match` with no `_ =>` arm** at every consumer (motif
+/// `prompt::hosting_ground_truth_line`, mika#2290): a fifth site of pose will
+/// not compile until it decides its disposition.
+enum DeliverableSource {
+    /// Site 1 — `deliver_phase`, from [`TeamEngine::deliver`] when the writer's
+    /// turn **completed**. A writer agent exists, is nameable, and wrote this
+    /// text, so a re-write can be asked of it.
+    Writer { agent_name: String },
+    /// Site 1 — `deliver_phase`, from [`TeamEngine::deliver`] when the writer's
+    /// turn **timed out**: the text is the #1128 workspace fallback (the
+    /// specialist outputs concatenated) or, with an empty workspace, the
+    /// timeout reason. **No writer wrote it**, so a re-write would tell the
+    /// agent that just exhausted its envelope a false fact about its own turn
+    /// ("the deliverable you just produced"), and spend a second full envelope
+    /// inside the run's 900 s. Neutral line directly (review finding,
+    /// adversarial P2).
+    WorkspaceFallback,
+    /// Sites 2 and 3 — `GateOutcome::Conversational`, first pass and after the
+    /// critic. The text is a **decomposition reply**, there is no writer, and
+    /// `apply_delegation_gate` already practises a reinforced retry on that very
+    /// turn (`CONVERSATIONAL_REINFORCEMENT`) — composing a second one would
+    /// stack two retries on one turn.
+    ConversationalGate,
+    /// Site 4 — `apply_delegation_gate`'s `retry_reply`, on a run already
+    /// `FailedNoDelegation`. This text **never reaches the person**
+    /// (`build_run_completion_message`'s `failed_no_delegation` arm carries a
+    /// fixed engine-composed body), so spending an LLM turn re-writing the
+    /// accompaniment of a failure is a cost with no counterpart. It is guarded
+    /// all the same because it **does** reach the next run through
+    /// `history_deliverable`.
+    NoDelegation,
+}
+
+impl DeliverableSource {
+    /// Wire value for the `deliverable_source` telemetry field. Exhaustive, no
+    /// wildcard arm — same contract as `TestimonyProposalChannel::as_wire`.
+    fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Writer { .. } => "writer",
+            Self::WorkspaceFallback => "workspace_fallback",
+            Self::ConversationalGate => "conversational_gate",
+            Self::NoDelegation => "no_delegation",
+        }
+    }
+
+    /// The agent that wrote the text, when there is one — the `writer_agent`
+    /// telemetry field. `None` is rendered as an ABSENT field (tracing omits
+    /// a `None` value), never as an empty string: a field asserting a writer
+    /// nobody measured is the mika#2304 defect.
+    fn writer_agent(&self) -> Option<&str> {
+        match self {
+            Self::Writer { agent_name } => Some(agent_name.as_str()),
+            Self::WorkspaceFallback | Self::ConversationalGate | Self::NoDelegation => None,
+        }
+    }
+}
+
 /// Resources needed to run a specific agent.
 struct AgentResources {
     db: AsyncDatabase,
@@ -136,6 +241,17 @@ pub struct TeamEngine {
     /// (mika#2290). Threaded into every member's `TeamAgentParams` so the
     /// hosting ground truth and the 5d guard reach team turns too.
     deployment: mika_common::home::Deployment,
+    /// The instant the run's own wall (`TEAM_RUN_TIMEOUT_SECS`) cuts it, set by
+    /// [`TeamEngine::execute`] next to its `tokio::time::timeout` (mika#2633).
+    /// `None` on the resumed path (`execute_from_phase`), which has no wall.
+    ///
+    /// Read by the deliverable re-write alone: that turn starts a FRESH agent
+    /// envelope at the very end of a run, so without this bound it could be cut
+    /// by the outer wall mid-turn — the commit then never lands and the run
+    /// persists `None`, i.e. "no deliverable produced", the false statement
+    /// `TEAM_DELIVERABLE_WITHHELD` exists to prevent. Same shape as `run_loop`'s
+    /// continuation gate (mika#848 F3a).
+    run_deadline: Option<std::time::Instant>,
 }
 
 /// Outcome of an `execute_tasks` iteration (mika#1671). Replaces the previous
@@ -321,6 +437,7 @@ impl TeamEngine {
             pr_reviews_posted,
             tier,
             deployment,
+            run_deadline: None,
         })
     }
 
@@ -378,6 +495,7 @@ impl TeamEngine {
             pr_reviews_posted,
             tier,
             deployment,
+            run_deadline: None,
         })
     }
 
@@ -563,6 +681,8 @@ impl TeamEngine {
             Err(e) => warn!(error = %e, "failed to persist goal message"),
         }
 
+        self.run_deadline =
+            Some(std::time::Instant::now() + Duration::from_secs(TEAM_RUN_TIMEOUT_SECS));
         let result = match tokio::time::timeout(
             Duration::from_secs(TEAM_RUN_TIMEOUT_SECS),
             self.execute_inner(),
@@ -630,14 +750,318 @@ impl TeamEngine {
         self.emit_event(TeamEvent::Progress(
             "Producing final deliverable...".to_string(),
         ));
-        let deliverable = self.deliver().await?;
-        self.run.deliverable = Some(deliverable.clone());
+        // Site 1 of four. `deliver` reports which arm produced the text: the
+        // writer (re-write possible) or the workspace fallback (no writer wrote
+        // it, so no re-write). The writer name is the one `deliver` ran, so it
+        // cannot drift from the agent that produced the text.
+        let (produced, source) = self.deliver().await?;
+        let deliverable = self.commit_deliverable(produced, source).await;
 
-        // Write deliverable metadata
-        self.write_metadata_file("deliverable.md", &deliverable);
+        // Write deliverable metadata. **The committed text, never the produced
+        // one** — `.meta/deliverable.md` is the operator-facing copy of the
+        // run's deliverable and must agree with `team_runs.deliverable` and the
+        // completion notification. It is NOT what closes the re-serve loop:
+        // `build_workspace_fallback` skips `.meta/`. The file that loop does
+        // read is the workspace-root `deliverable.md` the writer wrote itself,
+        // and `commit_deliverable` rewrites that one on a refusal.
+        self.write_metadata_file(WORKSPACE_DELIVERABLE_FILE, &deliverable);
 
         self.emit_event(TeamEvent::Deliverable(deliverable));
         Ok(())
+    }
+
+    /// **The only site that poses `self.run.deliverable`** (mika#2633 U1).
+    ///
+    /// Returns the text actually committed — which is what every caller must
+    /// hand on to `TeamEvent::Deliverable` and to the workspace metadata file,
+    /// so those surfaces are covered by construction rather than by a second
+    /// guard.
+    ///
+    /// # Why the point of pose, and not the notification
+    ///
+    /// mika#2633's AC1 names `TeamEngine::deliver` as "one site covering both
+    /// paths". Reading the code refutes that twice. `deliver()` **produces** a
+    /// text; four other sites **pose** one (`deliver_phase`, the two
+    /// `GateOutcome::Conversational` arms of `execute_inner`, and
+    /// `apply_delegation_gate`'s `NoDelegation` arm), and all four reach the
+    /// next run through `finalize_and_shutdown` → `update_team_run` →
+    /// `teams::prompt`'s `<context type="history_deliverable">`. Guarding in
+    /// `deliver()` alone would cover **one of four**.
+    ///
+    /// And guarding at `build_run_completion_message` — which both the sync and
+    /// async paths do call, so it would *look* like "one site, both paths" —
+    /// would leave the proposal in `team_runs.deliverable` and in the next run's
+    /// context. mika#2627's reasoning transposes word for word: *a refusal that
+    /// persisted anyway would leave the doctrine violated in the history.*
+    ///
+    /// # Disposition (c), and its honest perimeter
+    ///
+    /// The operator decision (MPC, 2026-10-02) is *one re-write, then a neutral
+    /// line*. The re-write covers [`DeliverableSource::Writer`] only, because
+    /// the decision says "**the writer agent** receives a re-write request" and
+    /// a writer exists at site 1 alone — each other variant carries its own
+    /// reason on itself.
+    ///
+    /// **Fail-closed**: any failure of the re-write (timeout, `Err`, an empty
+    /// result) yields the neutral line, **never** the original text.
+    ///
+    /// # What this does NOT cover, named rather than discovered
+    ///
+    /// [`TeamEngine::deliver`] persists its raw output to `messages` under the
+    /// writer's own `agent_id` (session `team-<run_id>`) **before** this site
+    /// runs, so a refused deliverable can still reach that agent's compaction
+    /// summary. A distinct vector with a distinct blast radius: closing it means
+    /// changing `deliver()`, which mika#2633's plan holds unchanged on purpose.
+    /// Bounded (one row, one agent, one session) and left open with its reason.
+    ///
+    /// `#[must_use]` (review finding, maintainability): "the surfaces are
+    /// covered by construction" holds only if every caller hands on the
+    /// RETURNED text. A site that dropped it and forwarded the produced text
+    /// instead would persist the clean text, pass the pose scan, and ship the
+    /// proposal to the person. The one deliberate discard (site 4) says so with
+    /// `let _`.
+    #[must_use = "hand the COMMITTED text on to the notification and the workspace, \
+                  never the produced one"]
+    async fn commit_deliverable(&mut self, text: String, source: DeliverableSource) -> String {
+        let Some(proposal) = crate::evidence::guards::detect_testimony_access_proposal(&text)
+        else {
+            self.run.deliverable = Some(text.clone());
+            return text;
+        };
+
+        let team_session_id = format!("team-{}", self.run.run_id);
+        // No `agent_id`: `team_db.agent_id()` is the team DB's hard-coded scope
+        // (`"mika"` on both production paths), not the acting agent, and the
+        // family's two other emitters carry the acting agent under that name.
+        // What this site does know is the team, and the writer when there is one.
+        warn!(
+            target: "mika::otel",
+            trace_id = %self.trace_id,
+            team_name = %self.run.team_name,
+            writer_agent = source.writer_agent(),
+            session_id = %team_session_id,
+            team_run_id = %self.run.run_id,
+            deliverable_source = source.as_wire(),
+            matched_subject = %proposal.subject,
+            matched_movement = %proposal.movement,
+            channel = crate::evidence::guards::TestimonyProposalChannel::TeamDeliverable.as_wire(),
+            event = "guard.testimony_access_proposal",
+            "Testimony access-proposal refused in a team deliverable before \
+             notification and before persistence"
+        );
+
+        // Exhaustive, no wildcard arm: a fifth provenance must decide.
+        let rewritten = match &source {
+            DeliverableSource::Writer { agent_name } => {
+                self.attempt_deliverable_rewrite(agent_name, &proposal)
+                    .await
+            }
+            DeliverableSource::WorkspaceFallback
+            | DeliverableSource::ConversationalGate
+            | DeliverableSource::NoDelegation => None,
+        };
+
+        let committed = match rewritten {
+            Some(clean) => clean,
+            None => {
+                // The residue this work does not close, named so it is not
+                // indistinguishable from a healthy run (motif 5h, mika#1960).
+                // Expected regime: zero.
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %self.trace_id,
+                    team_name = %self.run.team_name,
+                    writer_agent = source.writer_agent(),
+                    session_id = %team_session_id,
+                    team_run_id = %self.run.run_id,
+                    deliverable_source = source.as_wire(),
+                    matched_subject = %proposal.subject,
+                    matched_movement = %proposal.movement,
+                    channel = crate::evidence::guards::TestimonyProposalChannel::TeamDeliverable
+                        .as_wire(),
+                    event = "guard.testimony_access_proposal_uncorrected",
+                    "Team deliverable withheld — the neutral line is served in \
+                     its place"
+                );
+                TEAM_DELIVERABLE_WITHHELD.to_string()
+            }
+        };
+
+        self.overwrite_workspace_deliverable(&committed);
+        self.run.deliverable = Some(committed.clone());
+        committed
+    }
+
+    /// On a refusal, make the workspace-root deliverable file carry the
+    /// committed text (review finding, mika#2633 W2).
+    ///
+    /// `build_deliverable_context` tells the writer to write `deliverable.md`
+    /// at the workspace root itself, during `deliver()` — i.e. **before** this
+    /// site sees the text. After a refusal that file kept the proposal, readable
+    /// by `read_workspace` within the run and, through `reference_run_id`, by
+    /// any later run — the "reaches the next run" class this ticket closes for
+    /// `team_runs.deliverable`, reopened one notch. It is also the one file
+    /// `build_workspace_fallback` does re-read (it skips `.meta/`).
+    ///
+    /// Only an **existing** file is rewritten: a site that never wrote it
+    /// (sites 2–4, or a writer that did not follow the instruction) gets no
+    /// new artefact. Best-effort, like `write_metadata_file`: a failed write
+    /// warns and never changes the committed text.
+    fn overwrite_workspace_deliverable(&self, committed: &str) {
+        let path = self.workspace_dir.join(WORKSPACE_DELIVERABLE_FILE);
+        if !path.is_file() {
+            return;
+        }
+        if let Err(e) = std::fs::write(&path, committed) {
+            warn!(
+                target: "mika::otel",
+                trace_id = %self.trace_id,
+                team_run_id = %self.run.run_id,
+                error = %e,
+                event = "team_deliverable_workspace_overwrite_failed",
+                "could not overwrite the workspace deliverable after a refusal — \
+                 the refused text may remain readable by `read_workspace`"
+            );
+        }
+    }
+
+    /// Ask the writer agent for **one** re-write, modelled on guard 5h's
+    /// single-retry re-prompt (mika#1960 phase 2).
+    ///
+    /// `Some(clean)` when the second version passes the predicate; `None` on
+    /// every other outcome — still proposing, timed out, errored, or empty.
+    /// That is the fail-closed half of the operator decision: the caller turns
+    /// `None` into the neutral line and never into the original text.
+    ///
+    /// An **empty** result counts as a failure rather than a clean deliverable.
+    /// It passes the predicate trivially, and posing it would replace a complete
+    /// deliverable with a notification reading "Deliverable:" followed by
+    /// nothing — a silent loss where the neutral line is a stated one.
+    async fn attempt_deliverable_rewrite(
+        &self,
+        agent_name: &str,
+        proposal: &crate::evidence::guards::TestimonyAccessProposalMatch,
+    ) -> Option<String> {
+        // Remaining-budget gate (review finding, reliability P2) — the
+        // re-write is a full agent turn with a FRESH envelope, at the very end
+        // of a run. If that envelope does not fit before the run's own wall,
+        // the wall would cut the turn mid-flight, the commit would never land,
+        // and the run would persist `None` — "no deliverable produced", the
+        // false statement the neutral line exists to prevent. Refusing the
+        // re-write here turns that cancellation arm into the enumerated
+        // neutral-line arm. Mirrors `run_loop`'s continuation gate
+        // (mika#848 F3a). No deadline (the resumed path) ⇒ no gate.
+        if let (Some(deadline), Some(resources)) = (self.run_deadline, self.agents.get(agent_name))
+        {
+            let envelope = Duration::from_secs(crate::planning::policy::team_agent_timeout_secs(
+                resources.llm.as_ref(),
+            ));
+            if std::time::Instant::now() + envelope > deadline {
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %self.trace_id,
+                    team_run_id = %self.run.run_id,
+                    agent = %agent_name,
+                    envelope_secs = envelope.as_secs(),
+                    remaining_secs = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs(),
+                    event = "team_deliverable_rewrite_skipped_no_budget",
+                    "deliverable re-write skipped — no room left in the run for a \
+                     full agent envelope; withholding the deliverable"
+                );
+                return None;
+            }
+        }
+
+        // **Two branches, and the second is load-bearing.** Layer 1 of
+        // mika#1798 prescribes offering an operational-grade substitute instead
+        // of a bare refusal, so a request pushing only towards declining would
+        // degrade what that ticket shipped (RK3, the reason 5h's correction and
+        // mika#2627's refusal body both carry two branches). It names no
+        // workaround (mika#2520).
+        let request = format!(
+            "[mika-engine] The deliverable you just produced proposes to open \
+             access to `{subject}` (`{movement}`). That data is testimony-grade, \
+             and the non-transit doctrine is a HARD NO on **proposing** it as \
+             much as on doing it: opening such a surface is the person's own \
+             sovereign decision and it is not yours to solicit. There is no \
+             runtime override.\n\n\
+             NOTHING HAS BEEN DELIVERED; the person has received nothing. \
+             Produce the deliverable again, keeping everything else as it is, \
+             along one of these two lines — both are correct:\n\
+             1. Decline that part and name why, in the person's register: the \
+             grade of the data decides, not the convenience of the moment.\n\
+             2. Decline it and offer, in its place, what the team CAN do without \
+             opening anything — an operational-grade or non-transit substitute.\n\n\
+             Naming the doctrine while declining is expected, not a violation. \
+             What must disappear is the proposal to open the surface. This is \
+             the only re-write that will be asked: if it still proposes, no \
+             deliverable is passed on at all.",
+            subject = proposal.subject,
+            movement = proposal.movement,
+        );
+
+        let context = prompt::build_deliverable_context(&self.run);
+        let outcome = match self.run_agent(agent_name, &request, &context).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %self.trace_id,
+                    team_run_id = %self.run.run_id,
+                    agent = %agent_name,
+                    error = %e,
+                    event = "team_deliverable_rewrite_failed",
+                    "deliverable re-write errored — withholding the deliverable"
+                );
+                return None;
+            }
+        };
+
+        let rewritten = match outcome {
+            TeamAgentOutcome::Done { text, .. } => text.unwrap_or_default(),
+            TeamAgentOutcome::TimedOut(reason) => {
+                // Deliberately NOT the `read_workspace_fallback` of `deliver`:
+                // the workspace holds the specialist outputs the refused text
+                // was synthesised from, so falling back to them could re-serve
+                // the very proposal being refused.
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %self.trace_id,
+                    team_run_id = %self.run.run_id,
+                    agent = %agent_name,
+                    reason = %reason,
+                    event = "team_deliverable_rewrite_timed_out",
+                    "deliverable re-write timed out — withholding the deliverable"
+                );
+                return None;
+            }
+        };
+
+        if rewritten.trim().is_empty() {
+            return None;
+        }
+        if crate::evidence::guards::detect_testimony_access_proposal(&rewritten).is_some() {
+            return None;
+        }
+        Some(rewritten)
+    }
+
+    /// The writer agent for the deliver phase: a `communicator`/`writer` role if
+    /// the team has one, else the orchestrator.
+    ///
+    /// **One reader, one caller** ([`Self::deliver`]), which carries the name
+    /// it ran into [`DeliverableSource::Writer`] itself — so the provenance
+    /// cannot name an agent other than the one that produced the text, the
+    /// `grooming_marker` class (mika#2158).
+    fn resolve_writer_agent(&self) -> String {
+        self.team
+            .agents
+            .iter()
+            .find(|a| a.role == "communicator" || a.role == "writer")
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| self.team.team.orchestrator.clone())
     }
 
     /// Persist final run status to DB and shutdown all AsyncDatabase instances.
@@ -760,8 +1184,11 @@ impl TeamEngine {
                 self.write_metadata_file("assignments.md", &assignments);
             }
             GateOutcome::Conversational(reply) => {
-                self.run.deliverable = Some(reply.clone());
-                self.emit_event(TeamEvent::Deliverable(reply));
+                // Site 2 of four (mika#2633).
+                let committed = self
+                    .commit_deliverable(reply, DeliverableSource::ConversationalGate)
+                    .await;
+                self.emit_event(TeamEvent::Deliverable(committed));
                 return Ok(());
             }
             GateOutcome::NoDelegation => {
@@ -846,8 +1273,12 @@ impl TeamEngine {
                     self.write_metadata_file("assignments.md", &assignments);
                 }
                 GateOutcome::Conversational(reply) => {
-                    self.run.deliverable = Some(reply.clone());
-                    self.emit_event(TeamEvent::Deliverable(reply));
+                    // Site 3 of four (mika#2633) — same provenance as site 2,
+                    // one critic iteration later.
+                    let committed = self
+                        .commit_deliverable(reply, DeliverableSource::ConversationalGate)
+                        .await;
+                    self.emit_event(TeamEvent::Deliverable(committed));
                     return Ok(());
                 }
                 GateOutcome::NoDelegation => {
@@ -1132,7 +1563,15 @@ impl TeamEngine {
 
                 self.run.status = RunStatus::FailedNoDelegation;
                 self.run.failure_context = Some(format!("{{\"phase\": \"{}\"}}", phase.as_str()));
-                self.run.deliverable = Some(retry_reply);
+                // Site 4 of four (mika#2633). This text reaches no person — the
+                // `failed_no_delegation` notification arm carries a fixed
+                // engine-composed body — but it does reach the next run as
+                // `history_deliverable`, which is why it is guarded. The
+                // committed text is deliberately discarded: no event and no
+                // workspace file carry it on this failed run.
+                let _ = self
+                    .commit_deliverable(retry_reply, DeliverableSource::NoDelegation)
+                    .await;
                 warn!(
                     team_run_id = %self.run.run_id,
                     team_id = %self.team.team.name,
@@ -1734,26 +2173,27 @@ impl TeamEngine {
     ///
     /// On timeout, falls back to workspace content (#1128) rather than
     /// surfacing a misleading "Agent timed out" message.
-    async fn deliver(&self) -> Result<String> {
-        // Use a writer/communicator agent if one exists, otherwise the orchestrator
-        let writer = self
-            .team
-            .agents
-            .iter()
-            .find(|a| a.role == "communicator" || a.role == "writer");
-
-        let agent_name = match writer {
-            Some(a) => a.name.clone(),
-            None => self.team.team.orchestrator.clone(),
-        };
+    ///
+    /// Returns the text **and its provenance** (mika#2633): whether the writer
+    /// wrote it or the workspace fallback assembled it decides whether a
+    /// refusal may ask for a re-write, and only this function knows which arm
+    /// ran.
+    async fn deliver(&self) -> Result<(String, DeliverableSource)> {
+        // Writer/communicator if the team has one, else the orchestrator.
+        let agent_name = self.resolve_writer_agent();
 
         let context = prompt::build_deliverable_context(&self.run);
         let outcome = self
             .run_agent(&agent_name, "Produce the final deliverable.", &context)
             .await?;
 
-        let response = match outcome {
-            TeamAgentOutcome::Done { text, .. } => text.unwrap_or_default(),
+        let (response, source) = match outcome {
+            TeamAgentOutcome::Done { text, .. } => (
+                text.unwrap_or_default(),
+                DeliverableSource::Writer {
+                    agent_name: agent_name.clone(),
+                },
+            ),
             TeamAgentOutcome::TimedOut(reason) => {
                 warn!(
                     target: "mika::otel",
@@ -1764,7 +2204,10 @@ impl TeamEngine {
                 );
                 // Workspace-content fallback (#1128): specialist outputs are already
                 // on disk — use them rather than surfacing a misleading timeout message.
-                self.read_workspace_fallback().unwrap_or(reason)
+                (
+                    self.read_workspace_fallback().unwrap_or(reason),
+                    DeliverableSource::WorkspaceFallback,
+                )
             }
         };
 
@@ -1790,7 +2233,7 @@ impl TeamEngine {
             warn!(error = %e, "failed to persist deliverable message");
         }
 
-        Ok(response)
+        Ok((response, source))
     }
 
     /// Read workspace files and format them as a fallback deliverable (#1128).
@@ -2377,6 +2820,900 @@ fn build_workspace_fallback(workspace_dir: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use mika_common::team::*;
+
+    /// La moitié production de ce fichier, découpée par fonction, commentaires
+    /// retirés — par le lecteur unique du dépôt (mika#2321).
+    fn production_fn_bodies() -> Vec<(String, String)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/teams/engine.rs");
+        let content = std::fs::read_to_string(&path).expect("engine.rs est lisible");
+        crate::source_scan::fn_bodies(crate::source_scan::production_half(&content))
+    }
+
+    /// V1/V8 — `commit_deliverable` est le **seul** site qui pose
+    /// `run.deliverable` (mika#2633 AC1).
+    ///
+    /// # Pourquoi un scan de source, et pas un test comportemental
+    ///
+    /// Une cinquième affectation écrite demain ne rend **aucune** décision
+    /// fausse : le run se termine, la notification part, tous les tests
+    /// existants restent verts — seule la garde est contournée, en silence.
+    /// C'est la classe `grooming_marker` (mika#2158), et c'est aussi la garantie
+    /// que le recensement R1 de mika#2633 ne se rejoue pas : ce ticket a dû
+    /// établir qu'il y avait **quatre** écrivains là où son AC1 en nommait un.
+    ///
+    /// # Les deux termes
+    ///
+    /// L'affectation, et la **cardinalité** des appels. Le second est le motif
+    /// mika#2496 : sans lui, un site réécrit pour poser par un autre chemin
+    /// ferait disparaître la pose sans faire rougir l'assertion sur
+    /// l'affectation — un scan devenu trop étroit passe en ne regardant rien.
+    #[test]
+    fn mika2633_les_quatre_sites_de_pose_passent_par_le_commit() {
+        // Composé à l'exécution pour que l'aiguille ne soit pas une constante
+        // que ce test pourrait voir chez lui-même.
+        let needle = format!("self.run.{} =", "deliverable");
+        let bodies = production_fn_bodies();
+
+        // Anti-vacuité : si le découpage ne trouve plus le site autorisé, le
+        // scan vise un nom mort et un arbre vide se lit comme un arbre propre
+        // (mika#2103 / mika#2205).
+        let (_, committer) = bodies
+            .iter()
+            .find(|(name, _)| name == "commit_deliverable")
+            .expect(
+                "mika#2633 — `commit_deliverable` est introuvable dans la moitié \
+                 production : ce scan ne regarde plus la population qu'il surveille",
+            );
+        assert!(
+            committer.contains(needle.as_str()),
+            "mika#2633 — `commit_deliverable` ne pose plus le livrable : le scan \
+             viserait un site vide"
+        );
+
+        let strangers: Vec<&String> = bodies
+            .iter()
+            .filter(|(name, body)| name != "commit_deliverable" && body.contains(needle.as_str()))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2633 AC1 — un site de production pose `run.deliverable` sans passer \
+             par `commit_deliverable` : {strangers:?}\n\n\
+             RÉSOLUTION : router ce site vers `commit_deliverable` avec sa provenance \
+             (`DeliverableSource`). Ne PAS ajouter d'allowlist : une pose non gardée \
+             atteint la personne ET le prochain run par `history_deliverable`, et c'est \
+             exactement ce que ce scan existe pour refuser."
+        );
+
+        // Cardinalité : les quatre sites de pose recensés par R1.
+        let call_sites: usize = bodies
+            .iter()
+            .filter(|(name, _)| name != "commit_deliverable")
+            .map(|(_, body)| body.matches("commit_deliverable(").count())
+            .sum();
+        assert_eq!(
+            call_sites, 4,
+            "mika#2633 — {call_sites} appels à `commit_deliverable` en production, \
+             attendu 4 (deliver_phase, les deux arms `GateOutcome::Conversational` de \
+             `execute_inner`, et le bras `NoDelegation` d'`apply_delegation_gate`).\n\n\
+             Un appel en moins est une provenance qui ne pose plus rien, ou qui pose \
+             par un autre chemin ; un appel en plus est une provenance à déclarer dans \
+             `DeliverableSource` (le `match` est exhaustif, sans bras joker, donc elle \
+             ne compilera pas sans décider de sa disposition)."
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // mika#2633 V2/V3/V4 — la disposition d'un livrable refusé, sur le site de
+    // production (`commit_deliverable`), sans réseau.
+    //
+    // # Pourquoi in-crate et pas sous `tests/eval/`
+    //
+    // `commit_deliverable` est privé, et `TeamEngine::new` construit un
+    // provider LLM **réel** par agent (`agent_settings.make_llm_provider()`),
+    // qu'aucun paramètre n'injecte. Un run d'équipe complet n'est donc pas
+    // déterministe depuis une crate d'intégration. Ici, dans le module
+    // lui-même, le littéral de struct pose un `MockLlmProvider` sans ouvrir
+    // **aucun** hook de production — ce que la discipline de preuve refuse
+    // précisément d'ajouter pour le confort d'un test.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Un texte qui franchit les trois couches du prédicat testimony.
+    ///
+    /// Repris de la forme que `evidence::guards` mesure : sujet qualifié
+    /// (`ta boîte Gmail`), mouvement d'ouverture à la polarité positive, dans
+    /// une même phrase.
+    const PROPOSAL: &str =
+        "Pour aller plus loin, donne-moi accès à ta boîte Gmail et je trierai tout.";
+
+    /// Le contrôle négatif d'AC5 : un refus que la Layer 1 de mika#1798
+    /// **prescrit**, qui porte donc le sujet interdit sans rien proposer.
+    const PRESCRIBED_REFUSAL: &str = "Je ne peux pas accéder à ta boîte Gmail : ces données sont testimony-grade. \
+         En revanche je peux te préparer un rappel à partir de ce que tu me dictes.";
+
+    fn team_with_writer() -> TeamDefinition {
+        TeamDefinition {
+            team: TeamMeta {
+                name: "t2633".to_string(),
+                orchestrator: "planner".to_string(),
+            },
+            agents: vec![
+                TeamAgent {
+                    name: "planner".to_string(),
+                    role: "orchestrator".to_string(),
+                    mandate: "Plan".to_string(),
+                },
+                TeamAgent {
+                    name: "scribe".to_string(),
+                    role: "writer".to_string(),
+                    mandate: "Write".to_string(),
+                },
+            ],
+            flow: TeamFlow::default(),
+        }
+    }
+
+    /// Build a `TeamEngine` whose writer agent answers from `writer_responses`.
+    ///
+    /// An **empty** response list makes the mock error, which is the fixture for
+    /// the fail-closed arm (`attempt_deliverable_rewrite` returning `None` on an
+    /// `Err` from `run_agent`).
+    fn engine_with_mock(
+        tmp: &std::path::Path,
+        writer_responses: Vec<mika_common::llm::mock::MockResponse>,
+    ) -> TeamEngine {
+        use mika_common::llm::mock::MockLlmProvider;
+
+        let team = team_with_writer();
+        let settings = Settings::test_defaults();
+        let mut agents = HashMap::new();
+        for ta in &team.agents {
+            let home_dir = tmp.join("agents").join(&ta.name);
+            std::fs::create_dir_all(&home_dir).unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let builder = MockLlmProvider::builder()
+                .provider_name("mock")
+                .model_name("mock-model");
+            let builder = if writer_responses.is_empty() {
+                builder.error(mika_common::llm::LlmError::Transport(
+                    "mock: no response configured".to_string(),
+                ))
+            } else {
+                builder.responses(writer_responses.clone())
+            };
+            agents.insert(
+                ta.name.clone(),
+                AgentResources {
+                    db: AsyncDatabase::new_with_agent(db, &ta.name),
+                    skills: SkillRegistry::from_dir(&home_dir.join("skills")),
+                    home_dir,
+                    embedding_client: None,
+                    settings: settings.clone(),
+                    llm: Arc::new(builder.build()),
+                },
+            );
+        }
+
+        let workspace_dir = tmp.join("workspace");
+        std::fs::create_dir_all(workspace_dir.join(".meta")).unwrap();
+
+        let run = TeamRun {
+            run_id: "run-2633".to_string(),
+            team_name: team.team.name.clone(),
+            goal: "produce a report".to_string(),
+            status: RunStatus::Running,
+            iteration: 1,
+            max_iterations: team.flow.max_iterations,
+            tasks: Vec::new(),
+            started_at: crate::timestamp::now(),
+            ended_at: None,
+            deliverable: None,
+            coverage_retry_fired: false,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
+        };
+
+        TeamEngine {
+            team,
+            run,
+            workspace_dir: workspace_dir.clone(),
+            agents: Arc::new(agents),
+            tool_registry: Arc::new(build_team_tool_registry(&workspace_dir, None)),
+            callback: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            team_db: AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "planner"),
+            goal_msg_id: None,
+            trace_id: "trace-2633".to_string(),
+            reference_run_id: None,
+            pr_reviews_posted: None,
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            run_deadline: None,
+        }
+    }
+
+    /// V4 / AC5 — **le contrôle négatif porteur.**
+    ///
+    /// Sans lui, « la garde décide » est indistinguable de « la garde retient
+    /// tout », et le mécanisme mika#1798 — dont la Layer 1 *prescrit* de nommer
+    /// la doctrine en déclinant — pourrait être cassé avec tous les tests au
+    /// vert. Les deux textes passent **sur les trois provenances**.
+    #[tokio::test]
+    async fn mika2633_v4_un_refus_prescrit_passe_sur_les_trois_provenances() {
+        for text in [
+            PRESCRIBED_REFUSAL,
+            "Voici le rapport demandé, en trois parties.",
+        ] {
+            for source in [
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+                DeliverableSource::WorkspaceFallback,
+                DeliverableSource::ConversationalGate,
+                DeliverableSource::NoDelegation,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                // Aucune réponse configurée : si une re-rédaction était tentée,
+                // le mock échouerait et la ligne neutre serait posée — donc ce
+                // test atteste aussi qu'aucun tour LLM n'est dépensé sur un
+                // livrable propre.
+                let mut engine = engine_with_mock(tmp.path(), vec![]);
+                let wire = source.as_wire();
+                let committed = engine.commit_deliverable(text.to_string(), source).await;
+
+                assert_eq!(
+                    committed, text,
+                    "mika#2633 AC5 — un livrable légitime a été modifié sur la \
+                     provenance {wire}"
+                );
+                assert_eq!(engine.run.deliverable.as_deref(), Some(text));
+                assert_ne!(committed, TEAM_DELIVERABLE_WITHHELD);
+            }
+        }
+    }
+
+    /// V3 — les provenances **sans** re-rédaction posent la ligne neutre, et
+    /// aucune proposition n'atteint `run.deliverable`.
+    ///
+    /// Un cas par provenance plutôt qu'un seul : une conjonction de provenances ne
+    /// se prouve pas en en convertissant une (leçon mika#2277, qui a dû livrer
+    /// quatre contrôles négatifs à terme unique pour la même raison).
+    #[tokio::test]
+    async fn mika2633_v3_les_provenances_sans_redaction_posent_la_ligne_neutre() {
+        for source in [
+            DeliverableSource::WorkspaceFallback,
+            DeliverableSource::ConversationalGate,
+            DeliverableSource::NoDelegation,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            // Une réponse propre EST configurée : si une re-rédaction était
+            // tentée sur ces provenances, elle réussirait et ce test échouerait.
+            // C'est le discriminant entre « pas de re-rédaction » et « une
+            // re-rédaction qui a échoué ».
+            let mut engine = engine_with_mock(
+                tmp.path(),
+                vec![mika_common::llm::mock::text_response("Un rapport propre.")],
+            );
+            let wire = source.as_wire();
+            let committed = engine
+                .commit_deliverable(PROPOSAL.to_string(), source)
+                .await;
+
+            assert_eq!(
+                committed, TEAM_DELIVERABLE_WITHHELD,
+                "provenance {wire} : la ligne neutre doit être posée directement"
+            );
+            assert_eq!(
+                engine.run.deliverable.as_deref(),
+                Some(TEAM_DELIVERABLE_WITHHELD),
+                "provenance {wire} : aucune proposition ne doit atteindre la base"
+            );
+            assert!(!committed.contains("Gmail"));
+        }
+    }
+
+    /// V2 — sur `Writer`, une re-rédaction est tentée, et son résultat propre
+    /// est le livrable final.
+    #[tokio::test]
+    async fn mika2633_v2_la_redaction_aboutie_devient_le_livrable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL)],
+        );
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(committed, PRESCRIBED_REFUSAL);
+        assert_eq!(engine.run.deliverable.as_deref(), Some(PRESCRIBED_REFUSAL));
+        assert_ne!(committed, TEAM_DELIVERABLE_WITHHELD);
+    }
+
+    /// V2 (second volet) — **un seul** retry au niveau du livrable : une
+    /// re-rédaction qui propose encore donne la ligne neutre, jamais une
+    /// troisième tentative.
+    ///
+    /// # La composition avec la garde 5h, mesurée en écrivant ce test
+    ///
+    /// Le tour de re-rédaction est un tour d'agent complet, donc son EndTurn
+    /// traverse la garde 5h — qui détecte la même proposition et re-prompte,
+    /// **avec son propre budget d'un coup**. Il faut donc **deux** réponses
+    /// proposantes pour que le tour rende un texte sale : la première arme 5h,
+    /// la seconde épuise son budget (`…_uncorrected`) et sort.
+    ///
+    /// Les deux gardes composent sans se dupliquer, et c'est la raison pour
+    /// laquelle le régime attendu du canal `team_deliverable` est doublement
+    /// protégé : il ne peut firer que sur un rédacteur qui a résisté à 5h. La
+    /// troisième réponse ci-dessous est propre et **jamais consommée** — s'il
+    /// existait un second retry au niveau du livrable, elle deviendrait le
+    /// livrable et ce test échouerait.
+    #[tokio::test]
+    async fn mika2633_v2_une_redaction_encore_sale_donne_la_ligne_neutre() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![
+                mika_common::llm::mock::text_response(PROPOSAL),
+                mika_common::llm::mock::text_response(PROPOSAL),
+                mika_common::llm::mock::text_response("Un rapport propre."),
+            ],
+        );
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(committed, TEAM_DELIVERABLE_WITHHELD);
+        assert_eq!(
+            engine.run.deliverable.as_deref(),
+            Some(TEAM_DELIVERABLE_WITHHELD)
+        );
+        assert!(!committed.contains("Gmail"));
+    }
+
+    /// Le pendant du test ci-dessus, et il est porteur : **une** proposition
+    /// suivie d'une correction est rattrapée par 5h, donc le canal
+    /// `team_deliverable` ne fire pas et aucune ligne neutre n'est posée.
+    ///
+    /// Sans ce contrôle, « deux réponses sales donnent la ligne neutre » serait
+    /// indistinguable de « toute re-rédaction donne la ligne neutre ».
+    #[tokio::test]
+    async fn mika2633_v2_une_proposition_corrigee_par_5h_ne_retient_pas_le_livrable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![
+                mika_common::llm::mock::text_response(PROPOSAL),
+                mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL),
+            ],
+        );
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(committed, PRESCRIBED_REFUSAL);
+        assert_ne!(committed, TEAM_DELIVERABLE_WITHHELD);
+    }
+
+    /// V2 (troisième volet) — **fail-closed** : une erreur pendant la
+    /// re-rédaction donne la ligne neutre, **jamais** le texte initial.
+    ///
+    /// C'est la clause 3 de la décision opérateur, et la seule dont l'inverse
+    /// serait silencieux : transmettre le texte initial produirait un run
+    /// d'apparence normale portant la proposition.
+    #[tokio::test]
+    async fn mika2633_v2_une_redaction_en_erreur_ne_transmet_pas_le_texte_initial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]); // mock en erreur
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(committed, TEAM_DELIVERABLE_WITHHELD);
+        assert!(!committed.contains("Gmail"));
+        assert_eq!(
+            engine.run.deliverable.as_deref(),
+            Some(TEAM_DELIVERABLE_WITHHELD)
+        );
+    }
+
+    /// V2 (quatrième volet) — une re-rédaction **vide** est un échec, pas un
+    /// livrable propre.
+    ///
+    /// Un texte vide passe le prédicat trivialement, et le poser remplacerait
+    /// un livrable complet par une notification lisant « Deliverable: » suivi
+    /// de rien — une perte silencieuse là où la ligne neutre est une perte
+    /// énoncée.
+    #[tokio::test]
+    async fn mika2633_v2_une_redaction_vide_est_un_echec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![mika_common::llm::mock::text_response("   \n  ")],
+        );
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(committed, TEAM_DELIVERABLE_WITHHELD);
+    }
+
+    /// Constat de revue (adversarial, P2) — un livrable **reconstitué depuis le
+    /// workspace** (#1128) n'est pas la sortie du rédacteur, donc il n'a pas de
+    /// re-rédaction.
+    ///
+    /// Le rédacteur vient de dépasser son enveloppe : lui demander de
+    /// « re-rédiger le livrable que tu viens de produire » lui affirme un fait
+    /// faux sur son propre tour, et dépense une seconde enveloppe entière à
+    /// l'intérieur des 900 s du run. La troisième réponse ci-dessous est propre :
+    /// si une re-rédaction était tentée, elle deviendrait le livrable et ce test
+    /// échouerait — c'est le discriminant.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mika2633_un_repli_workspace_na_pas_de_redaction() {
+        use mika_common::llm::mock::{delayed_response, text_response, tool_call_response};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Deux appels de 250 s virtuelles chacun : le second rend la main au-delà
+        // de l'enveloppe de 300 s, donc le tour sort en `TimedOut` et `deliver`
+        // prend le repli workspace. Chaque appel reste sous le watchdog de
+        // mika#2342 (2 × 120 + 60 = 300 s), sinon le tour sortirait en erreur
+        // transport et le test changerait de sujet.
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![
+                delayed_response(
+                    250_000,
+                    tool_call_response("list_workspace", serde_json::json!({})),
+                ),
+                delayed_response(
+                    250_000,
+                    tool_call_response("list_workspace", serde_json::json!({})),
+                ),
+                text_response("Un rapport propre."),
+            ],
+        );
+        std::fs::write(tmp.path().join("workspace").join("specialist.md"), PROPOSAL).unwrap();
+
+        engine.deliver_phase().await.unwrap();
+
+        assert_eq!(
+            engine.run.deliverable.as_deref(),
+            Some(TEAM_DELIVERABLE_WITHHELD),
+            "un repli workspace porteur d'une proposition doit donner la ligne \
+             neutre directement, sans re-rédaction demandée au rédacteur"
+        );
+    }
+
+    // -- capture tracing (même forme que `kg::resolver_tick::tests`) --
+
+    struct CapturingLayer(std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V<'a>(&'a mut HashMap<String, String>);
+            impl tracing::field::Visit for V<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+            }
+            let mut fields = HashMap::new();
+            event.record(&mut V(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    /// Constat de revue (correctness, P2) — la ligne de refus portait
+    /// `agent_id = team_db.agent_id()`, c'est-à-dire la portée codée en dur de
+    /// la base d'équipe (`"mika"` en production, `"planner"` ici), quel que
+    /// soit l'agent qui a écrit le texte. Dans la famille d'événements, les deux
+    /// émetteurs frères portent l'agent qui AGIT sous ce nom : un même champ
+    /// signifiait deux choses. La ligne porte désormais ce que le site sait
+    /// vraiment — l'équipe, et le rédacteur quand il y en a un — et ne porte
+    /// plus de champ qui affirme ce qu'il n'a pas mesuré (mika#2304).
+    #[tokio::test]
+    async fn mika2633_la_ligne_de_refus_nomme_lequipe_et_le_redacteur() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]);
+        let _ = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        let events = events.lock().unwrap();
+        let refusals: Vec<_> = events
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.get("event").map(String::as_str),
+                    Some("guard.testimony_access_proposal")
+                        | Some("guard.testimony_access_proposal_uncorrected")
+                ) && f.get("channel").map(String::as_str) == Some("team_deliverable")
+            })
+            .collect();
+        assert_eq!(refusals.len(), 2, "la ligne nominale et son résidu");
+        for f in refusals {
+            assert_eq!(
+                f.get("writer_agent").map(String::as_str),
+                Some("scribe"),
+                "{f:?}"
+            );
+            assert_eq!(
+                f.get("team_name").map(String::as_str),
+                Some(engine.run.team_name.as_str()),
+                "{f:?}"
+            );
+            assert!(
+                !f.contains_key("agent_id"),
+                "`agent_id` affirmait la portée de la base d'équipe, pas l'agent qui \
+                 agit : {f:?}"
+            );
+        }
+    }
+
+    /// Le contrôle négatif : sans rédacteur, aucun `writer_agent` n'est inventé.
+    #[tokio::test]
+    async fn mika2633_sans_redacteur_aucun_writer_agent_nest_invente() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]);
+        let _ = engine
+            .commit_deliverable(PROPOSAL.to_string(), DeliverableSource::NoDelegation)
+            .await;
+
+        let events = events.lock().unwrap();
+        let refusal = events
+            .iter()
+            .find(|f| f.get("event").map(String::as_str) == Some("guard.testimony_access_proposal"))
+            .expect("la ligne de refus est émise");
+        assert!(!refusal.contains_key("writer_agent"), "{refusal:?}");
+        assert!(refusal.contains_key("team_name"), "{refusal:?}");
+    }
+
+    /// Constat de revue (reliability, P2) — la re-rédaction ouvre une enveloppe
+    /// d'agent NEUVE à la fin d'un run qui a déjà dépensé son budget. Sans garde,
+    /// le mur des 900 s du run la coupe en plein tour : le commit ne pose jamais
+    /// rien, le run persiste `None`, et la notification dit « no deliverable
+    /// produced » — l'énoncé faux que la ligne neutre existe pour empêcher.
+    ///
+    /// La réponse propre configurée est le discriminant : si la re-rédaction
+    /// était tentée malgré l'échéance trop proche, elle deviendrait le livrable.
+    #[tokio::test]
+    async fn mika2633_une_redaction_sans_budget_restant_nest_pas_tentee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL)],
+        );
+        // Dix secondes avant le mur : moins qu'une enveloppe d'agent (300 s).
+        engine.run_deadline = Some(std::time::Instant::now() + Duration::from_secs(10));
+
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            committed, TEAM_DELIVERABLE_WITHHELD,
+            "une re-rédaction qui ne tient pas dans le budget restant du run ne \
+             doit pas être tentée : la ligne neutre est posée directement"
+        );
+        assert_eq!(
+            engine.run.deliverable.as_deref(),
+            Some(TEAM_DELIVERABLE_WITHHELD)
+        );
+    }
+
+    /// Le contrôle positif : avec un budget suffisant, la re-rédaction a lieu.
+    /// Sans lui, « la garde refuse quand le budget manque » serait
+    /// indistinguable de « la garde refuse toujours ».
+    #[tokio::test]
+    async fn mika2633_une_redaction_avec_budget_restant_est_tentee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL)],
+        );
+        engine.run_deadline = Some(std::time::Instant::now() + Duration::from_secs(900));
+
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(committed, PRESCRIBED_REFUSAL);
+    }
+
+    /// Constat de revue (correctness, reliability, agent-native — W2) : le
+    /// rédacteur écrit lui-même `deliverable.md` à la racine du workspace
+    /// (`build_deliverable_context`, étape 3) **avant** que `commit_deliverable`
+    /// voie le texte. Sur un refus, ce fichier gardait la proposition, lisible
+    /// par `read_workspace` dans le run et par tout run ultérieur lancé avec
+    /// `reference_run_id` — la classe « atteint le prochain run » que ce ticket
+    /// ferme pour `team_runs.deliverable`, rouverte d'un cran.
+    ///
+    /// Deux volets : sur la ligne neutre **et** sur une re-rédaction aboutie, le
+    /// fichier porte le texte engagé, jamais le texte produit.
+    #[tokio::test]
+    async fn mika2633_le_fichier_livrable_du_workspace_porte_le_texte_engage() {
+        for (responses, attendu) in [
+            (vec![], TEAM_DELIVERABLE_WITHHELD),
+            (
+                vec![mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL)],
+                PRESCRIBED_REFUSAL,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut engine = engine_with_mock(tmp.path(), responses);
+            let fichier = tmp.path().join("workspace").join("deliverable.md");
+            std::fs::write(&fichier, PROPOSAL).unwrap();
+
+            let committed = engine
+                .commit_deliverable(
+                    PROPOSAL.to_string(),
+                    DeliverableSource::Writer {
+                        agent_name: "scribe".to_string(),
+                    },
+                )
+                .await;
+
+            assert_eq!(committed, attendu);
+            assert_eq!(
+                std::fs::read_to_string(&fichier).unwrap(),
+                attendu,
+                "le `deliverable.md` du workspace doit porter le texte engagé, \
+                 pas la proposition refusée"
+            );
+        }
+    }
+
+    /// Le contrôle négatif du test ci-dessus : sans refus, le fichier écrit par
+    /// le rédacteur n'est pas touché (il peut légitimement différer du texte
+    /// rendu, et rien ne justifie de le réécrire).
+    #[tokio::test]
+    async fn mika2633_sans_refus_le_fichier_du_workspace_est_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]);
+        let fichier = tmp.path().join("workspace").join("deliverable.md");
+        std::fs::write(&fichier, "Version longue du rapport.").unwrap();
+
+        let _ = engine
+            .commit_deliverable(
+                "Version courte du rapport.".to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&fichier).unwrap(),
+            "Version longue du rapport."
+        );
+    }
+
+    /// Pilote `deliver_phase` avec un callback qui capture les `TeamEvent`, et
+    /// rend `(événement Deliverable, contenu de .meta/deliverable.md)`.
+    async fn drive_deliver_phase(
+        writer_responses: Vec<mika_common::llm::mock::MockResponse>,
+    ) -> (Option<String>, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), writer_responses);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let sink = std::sync::Arc::clone(&seen);
+        engine.callback = Some(Arc::new(Box::new(move |event: TeamEvent| {
+            if let TeamEvent::Deliverable(text) = event {
+                *sink.lock().unwrap() = Some(text);
+            }
+        })));
+
+        engine.deliver_phase().await.unwrap();
+
+        let meta = std::fs::read_to_string(
+            tmp.path()
+                .join("workspace")
+                .join(".meta")
+                .join("deliverable.md"),
+        )
+        .unwrap();
+        let event = seen.lock().unwrap().clone();
+        (event, meta)
+    }
+
+    /// Constat de revue (testing, P2) — tous les tests de ce ticket appelaient
+    /// `commit_deliverable` directement : rien ne vérifiait que le site 1
+    /// transmet le texte ENGAGÉ à ses deux surfaces aval, l'événement
+    /// `TeamEvent::Deliverable` (que la TUI pousse dans le chat ET enregistre en
+    /// base) et `.meta/deliverable.md`. Un site qui appellerait le commit puis
+    /// transmettrait le texte produit garderait le scan de pose vert et tous les
+    /// tests au vert, en livrant la proposition — la classe même du ticket.
+    ///
+    /// Quatre réponses sales : deux pour le tour du rédacteur (5h re-prompte une
+    /// fois), deux pour la re-rédaction (idem).
+    #[tokio::test]
+    async fn mika2633_le_site_1_transmet_le_texte_engage_a_ses_surfaces() {
+        use mika_common::llm::mock::text_response;
+        let (event, meta) = drive_deliver_phase(vec![
+            text_response(PROPOSAL),
+            text_response(PROPOSAL),
+            text_response(PROPOSAL),
+            text_response(PROPOSAL),
+        ])
+        .await;
+
+        assert_eq!(event.as_deref(), Some(TEAM_DELIVERABLE_WITHHELD));
+        assert_eq!(meta, TEAM_DELIVERABLE_WITHHELD);
+    }
+
+    /// Le jumeau propre : sans refus, les deux surfaces portent le texte du
+    /// rédacteur. Sans lui, « transmet le texte engagé » serait indistinguable
+    /// de « transmet toujours la ligne neutre ».
+    #[tokio::test]
+    async fn mika2633_le_site_1_transmet_un_livrable_propre_tel_quel() {
+        let (event, meta) =
+            drive_deliver_phase(vec![mika_common::llm::mock::text_response("Le rapport.")]).await;
+
+        assert_eq!(event.as_deref(), Some("Le rapport."));
+        assert_eq!(meta, "Le rapport.");
+    }
+
+    /// La ligne neutre est `Some(…)`, jamais `None` — sinon
+    /// `teams::notification` rend « completed (no deliverable produced) », ce
+    /// qui serait **faux** et rendrait un refus indistinguable d'un run sans
+    /// livrable.
+    #[tokio::test]
+    async fn mika2633_la_ligne_neutre_est_un_livrable_pas_une_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]);
+        let _ = engine
+            .commit_deliverable(PROPOSAL.to_string(), DeliverableSource::NoDelegation)
+            .await;
+
+        let msg = crate::teams::notification::build_run_completion_message(&TeamRun {
+            status: RunStatus::Completed,
+            ..engine.run.clone()
+        })
+        .expect("un run terminal produit une notification");
+        assert_eq!(msg.notification_kind, "deliverable");
+        assert!(!msg.text.contains("no deliverable produced"));
+        assert!(!msg.text.contains("Gmail"));
+    }
+
+    /// Constat de revue (api-contract P3) — le début de la ligne neutre est la
+    /// clé de la requête SQL opérateur publiée (`LIKE 'The team finished its
+    /// work, but its deliverable%'`). Toutes les autres assertions comparent à
+    /// la constante elle-même, donc sont tautologiques quant à son contenu :
+    /// reformuler la phrase viderait la requête sans rien rougir.
+    #[test]
+    fn mika2633_le_prefixe_de_la_ligne_neutre_est_un_format_de_fil() {
+        assert!(
+            TEAM_DELIVERABLE_WITHHELD
+                .starts_with("The team finished its work, but its deliverable"),
+            "le début de TEAM_DELIVERABLE_WITHHELD est la clé de la requête SQL \
+             publiée dans le CLAUDE.md racine : la changer exige de changer la \
+             requête dans le même commit"
+        );
+    }
+
+    /// Le vocabulaire de `deliverable_source` est un format de fil : il atterrit
+    /// dans la télémétrie et un opérateur en fait des `GROUP BY`.
+    #[test]
+    fn mika2633_la_provenance_est_un_format_de_fil() {
+        assert_eq!(
+            DeliverableSource::Writer {
+                agent_name: "x".to_string()
+            }
+            .as_wire(),
+            "writer"
+        );
+        assert_eq!(
+            DeliverableSource::WorkspaceFallback.as_wire(),
+            "workspace_fallback"
+        );
+        assert_eq!(
+            DeliverableSource::ConversationalGate.as_wire(),
+            "conversational_gate"
+        );
+        assert_eq!(DeliverableSource::NoDelegation.as_wire(), "no_delegation");
+    }
+
+    /// Le contrôle de bonne foi de V1/V8 : le prédicat voit bien un second site.
+    ///
+    /// Sans lui, « aucun étranger trouvé » serait indistinguable de « le
+    /// découpage ne rend plus rien » — et l'anti-vacuité ci-dessus ne couvre que
+    /// le site autorisé, pas la capacité du prédicat à accuser.
+    #[test]
+    fn mika2633_le_scan_de_pose_voit_un_second_site() {
+        let needle = format!("self.run.{} =", "deliverable");
+        let injected = "\
+fn commit_deliverable(&mut self, t: String) {
+    self.run.deliverable = Some(t);
+}
+
+fn un_site_qui_contourne(&mut self, t: String) {
+    self.run.deliverable = Some(t);
+}
+";
+        let bodies = crate::source_scan::fn_bodies(injected);
+        let strangers: Vec<&String> = bodies
+            .iter()
+            .filter(|(name, body)| name != "commit_deliverable" && body.contains(needle.as_str()))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            strangers,
+            vec!["un_site_qui_contourne"],
+            "le prédicat de V8 n'accuse plus un second site de pose : toute garde \
+             bâtie dessus est décorative"
+        );
+    }
 
     fn test_team() -> TeamDefinition {
         TeamDefinition {

@@ -775,6 +775,22 @@ pub(crate) fn check_testimony_access_proposal(
             "Re-create it, keeping the schedule and everything else as it is, \
              with a message",
         ),
+        // **Wired and inert, and that is a precedent of this code rather than
+        // an oversight (mika#2633 U4).** `C::EndTurn` is already here and
+        // already inert — guard 5h composes its own re-prompt in `agent_loop`
+        // and never calls this helper. `C::TeamDeliverable` is the same shape:
+        // `TeamEngine` owns the predicate's third production reader because a
+        // refused deliverable's disposition (one re-write, then a neutral line)
+        // is reachable from neither a `ToolContext` nor a `ToolOutput`. The
+        // inertia is **named on the variant** (motif `CreateScheduledTask`,
+        // mika#2627 R2) and pinned by
+        // `canonical_tokens::tests::mika2633_le_bras_team_deliverable_est_inerte`
+        // — an inert coverage that reads as coverage is the mika#2205 class.
+        C::TeamDeliverable => (
+            "NOTHING WAS DELIVERED; the team deliverable was withheld and the \
+             person has received nothing.",
+            "Re-write the deliverable, keeping everything else as it is",
+        ),
     };
     Some(ToolOutput::error(format!(
         "{TESTIMONY_ACCESS_REFUSAL_PREFIX} — {nothing_happened} This text \
