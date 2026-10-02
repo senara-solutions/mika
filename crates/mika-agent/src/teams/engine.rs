@@ -804,6 +804,15 @@ impl TeamEngine {
     /// summary. A distinct vector with a distinct blast radius: closing it means
     /// changing `deliver()`, which mika#2633's plan holds unchanged on purpose.
     /// Bounded (one row, one agent, one session) and left open with its reason.
+    ///
+    /// `#[must_use]` (review finding, maintainability): "the surfaces are
+    /// covered by construction" holds only if every caller hands on the
+    /// RETURNED text. A site that dropped it and forwarded the produced text
+    /// instead would persist the clean text, pass the pose scan, and ship the
+    /// proposal to the person. The one deliberate discard (site 4) says so with
+    /// `let _`.
+    #[must_use = "hand the COMMITTED text on to the notification and the workspace, \
+                  never the produced one"]
     async fn commit_deliverable(&mut self, text: String, source: DeliverableSource) -> String {
         let Some(proposal) = crate::evidence::guards::detect_testimony_access_proposal(&text)
         else {
@@ -1548,8 +1557,11 @@ impl TeamEngine {
                 // Site 4 of four (mika#2633). This text reaches no person — the
                 // `failed_no_delegation` notification arm carries a fixed
                 // engine-composed body — but it does reach the next run as
-                // `history_deliverable`, which is why it is guarded.
-                self.commit_deliverable(retry_reply, DeliverableSource::NoDelegation)
+                // `history_deliverable`, which is why it is guarded. The
+                // committed text is deliberately discarded: no event and no
+                // workspace file carry it on this failed run.
+                let _ = self
+                    .commit_deliverable(retry_reply, DeliverableSource::NoDelegation)
                     .await;
                 warn!(
                     team_run_id = %self.run.run_id,
@@ -3343,7 +3355,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);
-        engine
+        let _ = engine
             .commit_deliverable(
                 PROPOSAL.to_string(),
                 DeliverableSource::Writer {
@@ -3395,7 +3407,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);
-        engine
+        let _ = engine
             .commit_deliverable(PROPOSAL.to_string(), DeliverableSource::NoDelegation)
             .await;
 
@@ -3523,7 +3535,7 @@ mod tests {
         let fichier = tmp.path().join("workspace").join("deliverable.md");
         std::fs::write(&fichier, "Version longue du rapport.").unwrap();
 
-        engine
+        let _ = engine
             .commit_deliverable(
                 "Version courte du rapport.".to_string(),
                 DeliverableSource::Writer {
@@ -3546,7 +3558,7 @@ mod tests {
     async fn mika2633_la_ligne_neutre_est_un_livrable_pas_une_absence() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);
-        engine
+        let _ = engine
             .commit_deliverable(PROPOSAL.to_string(), DeliverableSource::NoDelegation)
             .await;
 
