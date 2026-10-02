@@ -3147,6 +3147,238 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2161 — chacun des trois noms de cause a UNE fonction écrivante.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test jumeau l'assert.**
+    ///
+    /// Quand ce scan tire, une **seconde fonction** écrit l'un des trois noms —
+    /// donc les deux surfaces d'une même cause (ligne de journal et
+    /// `audit_events.target_key`) peuvent désormais divergier. « Ce second site
+    /// écrit-il la même population ? » est une question que la garde ne peut pas
+    /// trancher à la place de l'humain, et une mauvaise réponse scinde
+    /// silencieusement un compteur d'opérateur. La résolution est donc
+    /// **halt-and-surface** : router le site par `emit_empty_backlog_signal`, ou
+    /// le retirer — jamais une entrée ici (doctrine mika#2201 ; une allowlist née
+    /// vide est un emplacement où déposer la prochaine infraction, mika#2323).
+    const EMPTY_BACKLOG_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// La fonction de production qui englobe chaque ligne, par indentation.
+    ///
+    /// Le découpage est volontairement grossier — une `fn` au niveau d'un `impl`
+    /// ou du module — parce que la propriété à tenir l'est aussi : *un seul site
+    /// décide*. Les commentaires sont **dépouillés avant** la recherche, sinon
+    /// `auto_pull.rs` se dénonce quatre fois sur sa propre prose (l'en-tête de
+    /// module cite le nom deux fois, le doc-comment de `FEEDER_WORKING_SET_CAP`
+    /// une, celui de `phase0_feed_ready_pool` une) — c'est le piège que mika#2329
+    /// a dû nommer et le faux positif de prose du Signal S (mika#2050).
+    fn enclosing_fns_writing(content: &str, needle: &str) -> Vec<String> {
+        const MODULE_SCOPE: &str = "<module scope>";
+        let mut current = String::from(MODULE_SCOPE);
+        let mut out: Vec<String> = Vec::new();
+
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                continue;
+            }
+            // Une ligne en colonne 0 qui n'ouvre pas une `fn` est un item de
+            // niveau module (`const`, `struct`, `impl`, ou le `}` qui ferme la
+            // précédente) : la portée revient au module. Sans ce retour, un
+            // `const` déclaré après un `impl` serait attribué à la dernière `fn`
+            // de cet `impl` — mesuré : les trois `const EVENT_*` d'`auto_pull.rs`
+            // étaient imputés à `ExclusionPhase::as_str`.
+            //
+            // La CONTINUATION d'une signature est exclue, et ce terme est
+            // porteur : une `fn` dont les paramètres tiennent sur plusieurs
+            // lignes ferme sa signature par `) {` ou `) -> T {` **en colonne 0**,
+            // donc sans cette exclusion tout son corps retombait en portée de
+            // module. Mesuré : un littéral planté dans `emit_empty_backlog_signal`
+            // — dont la signature est multi-ligne — laissait le scan VERT.
+            let is_signature_continuation = trimmed.starts_with(')')
+                || trimmed.starts_with("where")
+                || trimmed.starts_with('{')
+                || trimmed.starts_with(',')
+                || trimmed.starts_with('+');
+            if !trimmed.is_empty()
+                && !line.starts_with(char::is_whitespace)
+                && !is_signature_continuation
+            {
+                current = String::from(MODULE_SCOPE);
+            }
+            if let Some(rest) = trimmed
+                .strip_prefix("fn ")
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                .or_else(|| trimmed.strip_prefix("pub(super) fn "))
+                .or_else(|| trimmed.strip_prefix("async fn "))
+                .or_else(|| trimmed.strip_prefix("pub async fn "))
+                .or_else(|| trimmed.strip_prefix("pub(crate) async fn "))
+            {
+                current = rest
+                    .split(['(', '<', ' '])
+                    .next()
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+            }
+            let carries = string_literals(line).iter().any(|lit| lit.contains(needle));
+            if carries && !out.contains(&current) {
+                out.push(current.clone());
+            }
+        }
+
+        out
+    }
+
+    /// **V8 — chaque nom de cause a exactement un site d'écriture, et c'est sa
+    /// déclaration.**
+    ///
+    /// # Ce que la mesure a déplacé par rapport à la Fire-Disposition du plan
+    ///
+    /// Le plan prescrit de compter des **fonctions écrivantes** — « exactement une
+    /// par nom » — parce qu'il décrit le code d'**avant** le correctif, où `info!`
+    /// et `log_audit_event` portaient tous deux le littéral, dans la même
+    /// fonction. Mesuré après : **zéro** fonction porte le littéral. Les deux
+    /// surfaces passent par `EmptyBacklogCause::event_name`, qui rend une
+    /// `const`, donc le seul site littéral de production est la **déclaration**.
+    ///
+    /// C'est strictement plus fort que ce que le plan demandait, et le scan le dit
+    /// plutôt que de viser la forme disparue : formulé sur « une fonction », il
+    /// aurait trouvé zéro et rougi à la naissance — un lint rouge au premier
+    /// `cargo test` se fait désarmer avant d'avoir servi, ce que la
+    /// Fire-Disposition nomme elle-même comme le piège à éviter.
+    ///
+    /// La propriété tenue est donc : **un nom, un littéral, en portée de module de
+    /// `auto_pull.rs`**. Elle interdit ce qu'il fallait interdire — un second site
+    /// épelant `"auto_feeder_pool_in_flight"` à la main — et l'unicité du site
+    /// *décisionnel* est tenue à côté par le `match` exhaustif sans bras `_ =>` de
+    /// `event_name` (une quatrième cause ne compile pas tant qu'elle n'a pas
+    /// décidé de son nom).
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second littéral écrit demain ne rendrait **aucune décision fausse** le
+    /// jour où il est écrit : le classifieur continuerait de classifier et toutes
+    /// les assertions resteraient vertes. Ce qu'il casserait est le
+    /// `GROUP BY target_key` de la sonde — plus tard, en silence, sur un compte
+    /// que personne ne saurait être devenu inexact.
+    #[test]
+    fn mika2161_chaque_nom_a_un_seul_ecrivain() {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let names = [
+            format!("auto_feeder{}", "_no_backlog"),
+            format!("auto_feeder{}", "_pool_in_flight"),
+            format!("auto_feeder{}", "_in_flight_unreadable"),
+        ];
+        let expected_site = "crates/mika-agent/src/auto_pull.rs::<module scope>";
+        let mut witnesses = 0usize;
+
+        for needle in &names {
+            let mut sites: Vec<String> = Vec::new();
+            // La coupe au module de test est obligatoire : le test de format de
+            // fil d'`auto_pull.rs` porte les trois noms en littéraux, et sans la
+            // coupe il compterait comme un second site.
+            for (rel, content) in production_sources_to_test_module() {
+                if EMPTY_BACKLOG_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                    continue;
+                }
+                for f in enclosing_fns_writing(&content, needle) {
+                    sites.push(format!("{rel}::{f}"));
+                }
+            }
+
+            // Anti-vacuité par le NOMBRE : zéro se lit exactement comme un scan
+            // propre (mika#2103 / mika#2205), donc l'égalité stricte est ce qui
+            // rend la garde non décorative.
+            assert_eq!(
+                sites,
+                vec![expected_site.to_string()],
+                "mika#2161 — `{needle}` doit avoir EXACTEMENT un site littéral en \
+                 production : sa déclaration `const`.\n\n\
+                 Zéro = ce scan vise un nom mort et ne vérifie rien (la constante \
+                 a-t-elle été renommée ?). Deux ou plus = un site épelle le nom à \
+                 la main, et les deux surfaces de cette cause peuvent désormais \
+                 divergier.\n\
+                 RÉSOLUTION (halt-and-surface) : faire passer ce site par \
+                 `EmptyBacklogCause::event_name`, ou le retirer. Ne PAS l'ajouter \
+                 à EMPTY_BACKLOG_SOLE_WRITER_EXCEPTIONS — « ce second site écrit-il \
+                 la même population ? » n'est pas une question qu'une garde peut \
+                 trancher à la place de l'humain."
+            );
+            witnesses += 1;
+        }
+
+        assert_eq!(witnesses, names.len(), "un nom n'a pas été vérifié");
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist mika#2161.
+    #[test]
+    fn mika2161_the_empty_backlog_allowlist_is_empty() {
+        assert!(
+            EMPTY_BACKLOG_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "EMPTY_BACKLOG_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain."
+        );
+    }
+
+    /// Contrôle de bonne foi : le scan voit-il seulement une seconde fonction ?
+    ///
+    /// Sans lui, « le scan tient » est indistinguable de « le scan ne regarde
+    /// rien » — la classe que son anti-vacuité couvre par le nombre et que
+    /// celui-ci couvre par la **forme** du prédicat.
+    ///
+    /// Trois formes ensemble, et chacune a été vue manquante :
+    ///
+    /// 1. **La signature multi-ligne.** Son `) {` est en colonne 0, donc une
+    ///    première version du prédicat ramenait le corps de la fonction en portée
+    ///    de module — et un littéral planté dans `emit_empty_backlog_signal`
+    ///    laissait le scan **vert**. C'est le terme que ce contrôle existe pour
+    ///    tenir.
+    /// 2. **Le `const` après un `impl`.** Sans retour en portée de module sur un
+    ///    item de colonne 0, il était imputé à la dernière `fn` de cet `impl`.
+    /// 3. **La prose.** Un doc-comment et un commentaire de ligne portant le nom
+    ///    ne sont pas des écritures : les compter rendrait le scan rouge sur la
+    ///    documentation qu'il protège (mika#2050, mika#2329).
+    #[test]
+    fn mika2161_le_scan_voit_une_seconde_fonction() {
+        let needle = "auto_feeder_pool_in_flight";
+        let fixture = "\
+const EVENT_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
+
+impl Cause {
+    fn event_name(self) -> &'static str {
+        EVENT_POOL_IN_FLIGHT
+    }
+}
+
+/// Prose citant `auto_feeder_pool_in_flight` — ne doit PAS compter.
+// Ni ce commentaire portant \"auto_feeder_pool_in_flight\".
+async fn emit_empty_backlog_signal(
+    db: &AsyncDatabase,
+    cause: Cause,
+) {
+    info!(event = \"auto_feeder_pool_in_flight\");
+}
+
+fn un_second_site() {
+    log(\"auto_feeder_pool_in_flight\");
+}
+";
+        assert_eq!(
+            enclosing_fns_writing(fixture, needle),
+            vec![
+                "<module scope>".to_string(),
+                "emit_empty_backlog_signal".to_string(),
+                "un_second_site".to_string()
+            ],
+            "le scan doit voir la déclaration en portée de module, le corps d'une \
+             fonction à signature MULTI-LIGNE, et une seconde fonction — et \
+             IGNORER les deux commentaires. Un terme manquant le rend soit \
+             aveugle, soit rouge sur la prose qu'il protège."
+        );
+    }
+
     /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
     #[test]
     fn mika2474_the_overrun_sole_writer_allowlist_is_empty() {

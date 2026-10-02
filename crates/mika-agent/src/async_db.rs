@@ -6,10 +6,11 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
-    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, RecurringRearmTarget,
-    RecurringRegistryRow, SearchResult, ServedContent, Session, SessionMessage, SessionWithStats,
-    SkillOverride, Task, TaskFilters, TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow,
-    TeamRunFilters, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    Database, Event, FailedSend, InFlightSelfDevTask, NewTask, Person, Preference, RecordOutcome,
+    RecurringRearmTarget, RecurringRegistryRow, SearchResult, ServedContent, Session,
+    SessionMessage, SessionWithStats, SkillOverride, Task, TaskFilters, TaskHealthSummary,
+    TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary,
+    TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 use crate::server::tasks_stream::{TaskEventFrame, TaskEventsChannel};
 
@@ -905,6 +906,21 @@ impl AsyncDatabase {
         let id = self.agent_id.clone();
         let url = issue_url.to_owned();
         self.with_db(move |db| db.has_active_self_dev_task_for_issue(&id, &url))
+            .await
+    }
+
+    /// The oldest active self_dev task referencing this issue (mika#2161 U3).
+    ///
+    /// The sole SQL site behind [`Self::has_active_self_dev_task_for_issue`]; the
+    /// feeder's probe loop calls **this** one so the same round trip that answers
+    /// "is it in flight?" also carries the age the (b) message names.
+    pub async fn find_active_self_dev_task_for_issue(
+        &self,
+        issue_url: &str,
+    ) -> Result<Option<InFlightSelfDevTask>> {
+        let id = self.agent_id.clone();
+        let url = issue_url.to_owned();
+        self.with_db(move |db| db.find_active_self_dev_task_for_issue(&id, &url))
             .await
     }
 
