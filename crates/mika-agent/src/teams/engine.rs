@@ -73,6 +73,15 @@ const TEAM_RUN_LIVENESS_THRESHOLD_SECS: i64 = 5 * 60;
 ///
 /// It names no workaround and no substrate detail: a refusal that hands over the
 /// template is a leak with one more step (mika#2520, mika#2292).
+///
+/// # Its opening words are a WIRE FORMAT
+///
+/// The operator SQL published in the root `CLAUDE.md` finds the withheld
+/// population with `deliverable LIKE 'The team finished its work, but its
+/// deliverable%'`, so rewording the start of this sentence silently empties
+/// that query. Pinned by `mika2633_le_prefixe_de_la_ligne_neutre_est_un_format_de_fil`
+/// (motif `TESTIMONY_ACCESS_REFUSAL_PREFIX`). Changing it means changing the
+/// published query in the same commit, and dating the break.
 pub(crate) const TEAM_DELIVERABLE_WITHHELD: &str = "The team finished its work, but its deliverable could not be passed on as \
      written. Nothing has been sent in its place. Ask again and it will be \
      re-written.";
@@ -3635,6 +3644,22 @@ mod tests {
         assert_eq!(msg.notification_kind, "deliverable");
         assert!(!msg.text.contains("no deliverable produced"));
         assert!(!msg.text.contains("Gmail"));
+    }
+
+    /// Constat de revue (api-contract P3) — le début de la ligne neutre est la
+    /// clé de la requête SQL opérateur publiée (`LIKE 'The team finished its
+    /// work, but its deliverable%'`). Toutes les autres assertions comparent à
+    /// la constante elle-même, donc sont tautologiques quant à son contenu :
+    /// reformuler la phrase viderait la requête sans rien rougir.
+    #[test]
+    fn mika2633_le_prefixe_de_la_ligne_neutre_est_un_format_de_fil() {
+        assert!(
+            TEAM_DELIVERABLE_WITHHELD
+                .starts_with("The team finished its work, but its deliverable"),
+            "le début de TEAM_DELIVERABLE_WITHHELD est la clé de la requête SQL \
+             publiée dans le CLAUDE.md racine : la changer exige de changer la \
+             requête dans le même commit"
+        );
     }
 
     /// Le vocabulaire de `deliverable_source` est un format de fil : il atterrit
