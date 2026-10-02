@@ -508,6 +508,223 @@ _emit_pilot_budget_line() {
     fi
 
     echo "dispatch-lib: pilot_budget_armed max_turns=${_mt} source=${_PILOT_MAX_TURNS_SOURCE:-unset}${_lbl} cost_bound=absent_upstream" >&2
+
+    # mika#2636 (L1.f, L1.g) — PORTE 3 : la taille estimée du plan servi, et le
+    # seuil en vigueur. MESURE, jamais refus.
+    #
+    # LE SINK N'EST PAS NÉGOCIABLE, et c'est la leçon la plus coûteuse de ce
+    # ticket. Cette ligne est posée ICI — à côté de `pilot_budget_armed`, donc
+    # sous la redirection `2>"$STDERR_FILE"` du site de lancement — pour la
+    # raison que le bloc ci-dessus vient d'écrire : l'émettre avant le
+    # lancement l'enverrait sur le stderr propre de dispatch-lib, que
+    # l'exécuteur ne lit QUE sur `if !status.success()`. Un dispatch implement
+    # RÉUSSIT, donc le tuyau serait jeté sans être lu et la ligne n'atterrirait
+    # dans AUCUN fichier (Signal M, mesuré par mika#2050).
+    #
+    # La co-location achète en plus la corrélation que Prime demande SANS
+    # JOINTURE : « ce dispatch avait 150 tours pour 1 400 lignes » se lit dans
+    # un seul fichier, deux lignes consécutives.
+    #
+    # Le seuil est DIT à chaque lancement, y compris quand aucun plan n'est
+    # servi : doctrine mika#2293, *un réglage qu'on ne peut pas observer n'est
+    # pas un réglage, c'est un espoir*. D'autant plus nécessaire ici que la
+    # borne R4 rend cette valeur gouvernante d'UNE SEULE moitié — elle décide ce
+    # que le groomeur VISE, jamais ce que l'architecte REFUSE.
+    if _plan_size_max_loc; [ -n "${_PLAN_SIZE_MAX_LOC_INVALID:-}" ]; then
+        echo "dispatch-lib: plan_size_threshold_invalid PLAN_SIZE_MAX_LOC=\"${_PLAN_SIZE_MAX_LOC_INVALID}\" — valeur ignorée, le seuil retombe sur le défaut in-file (voir source= ci-dessous)" >&2
+    fi
+    _plan_size_max_loc; echo "dispatch-lib: plan_size_threshold_resolved threshold_loc=${_PLAN_SIZE_MAX_LOC} source=${_PLAN_SIZE_MAX_LOC_SOURCE:-unset}" >&2
+
+    # Émise SEULEMENT quand un plan-on-branch a été détecté (donc
+    # `SKILL = dev-pilot`), jamais sur les pilotes de revise, pour qui la
+    # question n'a pas de sens. Et TOUJOURS quand il l'a été, y compris
+    # `total_loc=absent` : sans cela, zéro ligne se lirait « tous les plans sont
+    # dimensionnés » alors qu'elle voudrait dire « aucun ne l'est » — classe
+    # mika#2205 appliquée à la sonde de ce ticket. `absent` et jamais `0` : *un
+    # `null` n'est jamais un `0`* (mika#2331).
+    if [ -n "${_PLAN_SIZE_PLAN_PATH:-}" ]; then
+        local _ps_total="${_PLAN_SIZE_TOTAL:-absent}" _ps_verdict="unknown"
+        case "$_ps_total" in
+            ''|*[!0-9]*)
+                # `absent` et `unparsable` rendent tous deux `unknown` : aucun
+                # total comparable. Les deux VALEURS restent distinctes sur la
+                # ligne, parce que leurs remèdes sont opposés — groomer le plan,
+                # ou réparer le motif.
+                : ;;
+            *)
+                if _plan_size_max_loc; [ "$_ps_total" -gt "$_PLAN_SIZE_MAX_LOC" ]; then
+                    _ps_verdict="over_threshold"
+                else
+                    _ps_verdict="under_threshold"
+                fi
+                ;;
+        esac
+        _plan_size_max_loc; echo "dispatch-lib: plan_size_estimate total_loc=${_ps_total} threshold_loc=${_PLAN_SIZE_MAX_LOC} verdict=${_ps_verdict} plan=${_PLAN_SIZE_PLAN_PATH}" >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# mika#2636 — l'estimation de taille est une section obligatoire du plan
+# ---------------------------------------------------------------------------
+#
+# Le défaut, mesuré n=2 sur compteur corrigé (cpp#259) : deux implements
+# consécutifs ont été coupés au plafond de tours sur le seul critère du VOLUME —
+# mika#2161 (pilote `73720a14`, 151 tours, ≈ 1 470 lignes hors `docs/`) et
+# mika#2633 (pilote `2bd6fca0`, 151 tours, ≈ 1 170 lignes) — et AUCUN de leurs
+# plans ne portait d'estimation de taille. À l'inverse, le plan de mika#1960
+# phase 2 en portait une (≈ 515 estimées, 716 mesurées) et n'est pas mort de
+# volume. La pratique « découper en phases au groom » existait depuis le
+# 2026-10-01 et RIEN ne la vérifiait : la seconde passe architecte a validé le
+# plan de mika#2161 en `PLAN_GROOMED` sans que quoi que ce soit demande la
+# taille.
+#
+# TROIS PORTES, UNE SEULE REFUSE — et c'est la répartition canonique de la
+# maison, détection permissive / décision stricte :
+#
+#   porte 1, le PROMPT du groomeur   `_PLAN_SIZE_RULE`          intention
+#   porte 2, l'ARCHITECTE            Plan-Size Gate (L2/L3)     REFUS
+#     + rattrapage structurel ici si le revise n'a pas ajouté la section
+#   porte 3, le DISPATCH implement   `plan_size_estimate`       MESURE
+#
+# Ce que le `grep` peut juger : la section est-elle PRÉSENTE, le total est-il
+# PARSABLE. Ce qu'il ne peut PAS : le total est-il CRÉDIBLE, le découpage en
+# phases est-il RÉEL. Ces deux-là appartiennent à l'architecte, et c'est pour
+# ça que la porte 2 est la seule qui refuse — avec les verdicts qui existent
+# déjà (ITERATE / ESCALATE), donc sans aucun mode d'échec neuf dans la boucle.
+#
+# PORTE 3 NE REFUSE JAMAIS, et la file groomée entière le lui doit. Les deux
+# plans morts étaient groomés AVANT ce correctif ; un plan déjà groomé sur
+# disque, dont le corps de ticket porte les trois signaux du gate, ne repasse
+# par AUCUNE porte de groom au dispatch suivant (`_detect_plan_on_branch` lit le
+# callout, bascule `ENTRY_COMMAND` et le pilote part). Refuser un dispatch dont
+# le plan ne porte pas la section gèlerait d'un coup la totalité des plans
+# existants de `docs/plans/`. L'absence est NOMMÉE (`total_loc=absent`), pas
+# refusée.
+
+# Le seuil, trois paliers maison. Nom NU (sans préfixe `MIKA_`), par le
+# précédent tenu dans ce fichier : `PILOT_LOG_DIR` et `PILOT_MAX_TURNS` le sont,
+# et `sandboxed_pilot_env` (`env_clear()` + allowlist positive) n'admet pas plus
+# un `PILOT_*` nu qu'un `MIKA_*` — le nom nu est une convention sur le relais
+# `inject_pilot_dispatch_env`, jamais un contournement de scrub (mika#2508).
+#
+# ASSIGNE, n'imprime pas, et pour les deux raisons de `_pilot_max_turns` : une
+# surcharge lue une seule fois au chargement répondrait le défaut à tout
+# appelant qui la pose après le `source`, et un accesseur imprimant se lirait
+# `$(_plan_size_max_loc)` et poserait `++ printf %s <valeur>` dans la trace
+# `set -x`, forme qu'aucun scrubber ne couvre (garde mika#2039). Le coût est le
+# même aussi : tout lecteur de `$_PLAN_SIZE_MAX_LOC` doit appeler
+# `_plan_size_max_loc` sur la MÊME ligne, et test-dispatch-lib.sh (S11) refuse
+# toute lecture non co-localisée.
+#
+#   absent ou vide        -> le défaut in-file                      (default)
+#   entier > 0            -> cette valeur                               (env)
+#   illisible, 0, négatif -> le défaut, PLUS `plan_size_threshold_invalid`
+#                            nommant la valeur entre guillemets
+#
+# LE `0` NE DÉSARME PAS. Sur une garde dont le rôle est de borner un coût, une
+# coquille ne doit pas être un désarmement silencieux — c'est l'inverse de la
+# lecture de `PILOT_MAX_TURNS`, où le `0` EST le rollback, et l'asymétrie est
+# délibérée : là le `0` rend la main à un plafond amont qui existe, ici il
+# n'existe rien en dessous.
+_plan_size_max_loc() {
+    # LE défaut, un seul site. Posé par mika#2636 sur n=2, PAS mesuré sur une
+    # distribution : il est à réviser sur la première distribution que la ligne
+    # `plan_size_estimate` produira (V4).
+    local _default="1000"
+
+    _PLAN_SIZE_MAX_LOC_SOURCE="default"
+    _PLAN_SIZE_MAX_LOC_INVALID=""
+
+    # L'invalidité est posée INDÉPENDAMMENT de la résolution : la coquille est
+    # dite même quand elle ne décide rien.
+    if [ -n "${PLAN_SIZE_MAX_LOC:-}" ] \
+        && ! grep -qE -- '^[1-9][0-9]*$' <<<"$PLAN_SIZE_MAX_LOC"; then
+        _PLAN_SIZE_MAX_LOC_INVALID="$PLAN_SIZE_MAX_LOC"
+    fi
+
+    if [ -n "${PLAN_SIZE_MAX_LOC:-}" ] && [ -z "$_PLAN_SIZE_MAX_LOC_INVALID" ]; then
+        _PLAN_SIZE_MAX_LOC="$PLAN_SIZE_MAX_LOC"
+        _PLAN_SIZE_MAX_LOC_SOURCE="env"
+    else
+        _PLAN_SIZE_MAX_LOC="$_default"
+    fi
+
+    # Le résolveur ne RELIT jamais `$_PLAN_SIZE_MAX_LOC` : chaque branche
+    # l'écrit une fois et une seule. Une relecture ferait de lui son propre
+    # lecteur, et la garde de co-location ne peut pas distinguer ce lecteur-là
+    # d'un appelant qui aurait oublié le résolveur.
+    return 0
+}
+
+# LES BLOCS CLÔTURÉS SONT RETIRÉS AVANT TOUTE LECTURE, et le plan de ce ticket
+# en est la preuve vivante : son §3 documente le format dans un bloc
+# ```markdown qui contient un titre `## Taille estimée` ET une ligne
+# `Total estimé : 395 lignes` — l'exemple, pas la mesure. Un lecteur naïf qui
+# prend le premier match rapporterait 395 pour un plan qui en annonce 530 : un
+# nombre plausible, présenté avec autorité, FAUX. Pire, le terme 2 du
+# rattrapage apparierait le titre cité et conclurait que la section est
+# présente — un plan qui DOCUMENTE le format sans le remplir passerait la garde.
+#
+# Exactement le geste d'`auto_pull::is_groomed` pour ses trois prédicats de
+# callout (mika#2120) : une ligne légitimement citée à l'intérieur d'un fence
+# n'est pas une déclaration.
+#
+# FENCE NON TERMINÉ : rien n'est strippé, le corps entier est évalué. Le sens de
+# l'arbitrage est celui de mika#2120 — un faux positif coûte une relance de
+# revise, un faux négatif a coûté quinze heures de boucle.
+_plan_size_strip_fences() {
+    local _f="$1" _n
+    _n=$(grep -cE '^[[:space:]]*```' "$_f" 2>/dev/null || true)
+    if [ $(( _n % 2 )) -ne 0 ]; then
+        cat "$_f"
+        return 0
+    fi
+    awk '/^[[:space:]]*```/ { _inf = 1 - _inf; next } !_inf' "$_f"
+}
+
+# SITE UNIQUE de lecture de `$_PLAN_SIZE_HEADING_RE`. Les deux consommateurs —
+# le terme 2 du rattrapage et le re-test de journalisation — passent par ici,
+# donc ils ne peuvent pas diverger sur le strip des fences ni sur les drapeaux
+# de `grep`. C'est un cran plus fort que les deux lecteurs co-mutés de
+# `_FD_HEADING_RE` (mika#2544), et pour la même raison : perdre `-E` en écrivant
+# `-qi` rendrait le groupe et les quantificateurs littéraux, le motif
+# n'apparierait plus rien, le terme 2 deviendrait toujours vrai et le rattrapage
+# tirerait sur tout plan dont les findings mentionnent la chaîne.
+_plan_size_section_present() {
+    local _f="$1"
+    [ -r "$_f" ] || return 1
+    _plan_size_strip_fences "$_f" | grep -qiE -- "$_PLAN_SIZE_HEADING_RE"
+}
+
+# Rend sur stdout EXACTEMENT un de trois jetons, et ils sont DISTINCTS :
+#
+#   absent      — aucune section `## Taille estimée` (ou plan illisible)
+#   unparsable  — section présente, ligne `Total estimé :` non appariée
+#   <n>         — le total
+#
+# Les confondre rendrait « le plan n'a pas été dimensionné » et « le plan a été
+# dimensionné dans une forme que le lecteur ne sait pas lire » indiscernables,
+# alors que les remèdes sont OPPOSÉS : groomer le plan, ou réparer le motif.
+# Et aucun des deux n'est `0` : un total de zéro serait une valeur plausible,
+# présentée avec autorité, fausse (*un `null` n'est jamais un `0`*, mika#2331).
+#
+# APRÈS LE STRIP, LE DERNIER MATCH GAGNE, jamais le premier : un plan peut
+# légitimement porter un total par phase avant son total global, et le dernier
+# est celui qui conclut.
+#
+# Borne NOMMÉE : l'appariement du total est sensible à la casse, là où celui du
+# titre replie la casse. La forme prescrite est exacte sur cette ligne, et
+# replier la casse ici n'achèterait rien de mesuré.
+_plan_size_total_loc() {
+    local _f="$1" _body _n
+    [ -r "$_f" ] || { printf 'absent'; return 0; }
+    _plan_size_section_present "$_f" || { printf 'absent'; return 0; }
+    _body=$(_plan_size_strip_fences "$_f")
+    # Le motif est ancré sur la ligne ENTIÈRE, donc `s/…/\1/` remplace la ligne
+    # par la capture : la sortie ne porte que le nombre, sans résidu de texte.
+    _n=$(printf '%s\n' "$_body" | sed -nE "s/${_PLAN_SIZE_TOTAL_RE}/\1/p" | tail -1)
+    if [ -n "$_n" ]; then printf '%s' "$_n"; else printf 'unparsable'; fi
+    return 0
 }
 
 # mika#2165: make that directory visible — and writable — from INSIDE.
@@ -3067,6 +3284,112 @@ passe est sans recours."
 # scan d'abord.
 _FD_HEADING_RE='^##[[:space:]]+([0-9]+\.?[[:space:]]+)?Fire-Disposition'
 
+# mika#2636 — les deux motifs de la section `## Taille estimée`, format de fil.
+#
+# Le motif de titre est le JUMEAU TERME POUR TERME de `_FD_HEADING_RE`
+# ci-dessus : préfixe de numérotation optionnel borné à `<chiffres>[.]`,
+# `[[:space:]]+`, casse repliée par `-i` au site de lecture, pas d'ancre `$`,
+# texte ancré juste après le préfixe. La raison du préfixe est MESURÉE :
+# `/ce:plan` numérote ses titres, et c'est le défaut que mika#2544 a dû corriger
+# après qu'un rattrapage Fire-Disposition a relancé un pilote pour rien sur un
+# plan CONFORME. Ne pas redécouvrir cette leçon : la copier. La co-mutation des
+# deux préfixes est tenue par test-dispatch-lib.sh (S4).
+#
+# Bornes héritées, nommées plutôt que découvertes : `## 1.1 Taille estimée` et
+# `## Phase 3 — Taille estimée` ne sont PAS couverts, et élargir sur une
+# devinette est refusé ; une telle forme est un n+1 à mesurer, et
+# l'élargissement devra bouger les DEUX motifs. Corollaire assumé, identique à
+# celui de `_FD_HEADING_RE` : `## Taille estimée-ish` en tête de ligne est lu
+# comme la section — y ajouter une borne de fin ICI SEUL recréerait l'asymétrie
+# sur le suffixe.
+_PLAN_SIZE_HEADING_RE='^##[[:space:]]+([0-9]+\.?[[:space:]]+)?Taille estimée'
+
+# `Total estimé` porte l'unité dans le texte (`lignes`) mais le motif ne capture
+# que le NOMBRE : un total écrit `395 lignes`, un total suivi d'une parenthèse
+# (`300 lignes (phase 1)`) et un total nu (`395`) apparient tous trois.
+#
+# IL EST ANCRÉ À LA FIN DE LIGNE, et ce n'est pas un détail de rédaction : sans
+# l'ancre, `Total estimé : 1 400 lignes` apparie partiellement et rend **1** —
+# un nombre plausible, présenté avec autorité, faux d'un facteur mille. Pire que
+# `unparsable`, qui envoie au moins l'opérateur réparer le motif. La borne est
+# donc : le nombre doit être suivi de la fin de ligne, ou d'espaces PUIS d'une
+# lettre. Un second groupe de chiffres séparé par une espace ne satisfait ni
+# l'une ni l'autre, donc la ligne n'apparie pas du tout et le lecteur rend
+# `unparsable`.
+#
+# Hors-périmètre NOMMÉ, en conséquence : `1 400` et `1,400` avec séparateur de
+# milliers ne sont pas appariés — la forme prescrite n'en porte pas, et élargir
+# sur une devinette est refusé (même raisonnement que mika#2544). Un total non
+# apparié est journalisé `total_loc=unparsable`, JAMAIS `0`.
+#
+# Seconde borne nommée : un `\r` de fin de ligne (CRLF) fait rater l'ancre. Aucun
+# plan de l'arbre n'en porte ; le jour où un en porte, c'est l'ancre qu'il faut
+# élargir, pas le nombre qu'il faut deviner.
+#
+# LANGUE DU JETON : français, parce qu'AC1 le prescrit littéralement. Conforme à
+# la règle mika#2201 telle qu'elle est écrite — *une forme qu'un lecteur strict
+# ne voit pas est refusée ; une forme qu'un lecteur tolérant voit est admise* :
+# le seul lecteur au monde est celui livré ici, il lit le jeton qu'il prescrit,
+# et il replie la casse sur le titre. Les deux motifs sont portés par une
+# VARIABLE, donc hors population des deux lecteurs de mika#2201 — le survey « ne
+# voit PAS un motif porté par une variable », exactement comme pour
+# `Fire-Disposition`, qui n'est pas davantage déclaré dans
+# `scripts/canonical-tokens.tsv`.
+_PLAN_SIZE_TOTAL_RE='^Total estimé[[:space:]]*:[[:space:]]*([0-9]+)([[:space:]]+[[:alpha:]].*)?$'
+
+# mika#2636 — la prescription `## Taille estimée`, portée par chaque dispatch de
+# grooming. GABARIT : le seuil y est substitué à l'injection par
+# `_plan_size_rule`, jamais figé au chargement — une constante interpolée au
+# `source` répondrait le défaut à tout opérateur qui pose `PLAN_SIZE_MAX_LOC`
+# après lui.
+#
+# La règle vit ICI et non dans `.claude/commands/mika-groom-plan-only.md` pour la
+# raison que `_FIRE_DISPOSITION_RULE` a déjà dû écrire : les trois commandes de
+# groom vivent dans `senara-solutions/mika-platform` et sont semées dans le
+# worktree par `_seed_worktree_slash_commands` (mika#1415), donc un ticket ouvert
+# sur `senara-solutions/mika` NE PEUT PAS les éditer. Ce PROMPT est le seul canal
+# que ce dépôt contrôle. La moitié commandes est nommée en suivi, pas simulée.
+#
+# Ce n'est pas le prompt-enforcement que
+# `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`
+# condamne : la leçon de mika#2120 porte sur une consigne qui dépend qu'un
+# opérateur pense à la taper. Une constante injectée par le substrat à chaque
+# dispatch ne dépend d'aucune mémoire — et la moitié structurelle est livrée à
+# côté (le rattrapage de `_launch_revise_pilot`, plus les deux gates
+# architecte), ce que cette doctrine prescrit justement.
+#
+# Elle cite mika#2636 par référence ; elle ne reformule PAS la doctrine du
+# plafond de tours, pour que les deux ne puissent pas diverger.
+_PLAN_SIZE_RULE_TEMPLATE="RÈGLE DE GROOMING (mika#2636) — tout plan porte une section \`## Taille estimée\`.
+Deux implements consécutifs sont morts au plafond de tours sur le seul critère du VOLUME de
+code (mika#2161 ≈ 1 470 lignes, mika#2633 ≈ 1 170), et aucun de leurs plans ne portait
+d'estimation. Chaque mort coûte un pilote entier puis un spawn de reprise.
+La section est OBLIGATOIRE, même quand le plan n'est qu'un re-mesurage d'un plan ancien.
+Format exact — titre, tableau par livrable, puis la ligne de total :
+
+## Taille estimée
+
+| livrable | lignes de code (hors \`docs/\`) |
+|---|---|
+| \`crates/mika-agent/src/foo.rs\` | 120 |
+| tests (\`tests/eval/test_foo.rs\`) | 95 |
+
+Total estimé : 215 lignes
+
+Compte les LIGNES DE CODE, hors \`docs/\` et hors \`CLAUDE.md\`. La ligne \`Total estimé :\`
+est lue par la machine : écris-la telle quelle, sans séparateur de milliers.
+Au-dessus de __PLAN_SIZE_MAX_LOC__ lignes, DÉCOUPE EN PHASES : borne le périmètre de cette PR
+sous le seuil et renvoie explicitement la suite à un ticket de suivi ou à une phase nommée.
+Un total au-dessus du seuil sans découpage explicite fait rendre ITERATE à mika-arch en
+première passe et ESCALATE en seconde — et la seconde passe est sans recours."
+
+# Substitue le seuil en vigueur dans le gabarit. ASSIGNE `_PLAN_SIZE_RULE` (même
+# contrainte mika#2039 que les autres accesseurs de ce fichier), et la lecture de
+# `$_PLAN_SIZE_MAX_LOC` est co-localisée avec son résolveur.
+_plan_size_rule() {
+    _plan_size_max_loc; _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE_TEMPLATE//__PLAN_SIZE_MAX_LOC__/$_PLAN_SIZE_MAX_LOC}"
+}
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -3743,8 +4066,21 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # Appendue APRÈS les trois autres, donc les trois invariants de position
         # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
         # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
+        # --- mika#2636: la prescription de taille atteint le groomeur ---
+        #
+        # Même condition et même raison que mika#2306 juste au-dessus — elle
+        # s'adresse à qui ÉCRIT un plan, donc l'injecter pour `dev-pilot` serait
+        # du bruit dans le prompt d'un pilote qui n'en écrit pas. La condition
+        # est écrite explicitement, jamais héritée du voisin : la copier sans
+        # elle est exactement l'écart que le contrôle négatif S13 attrape.
+        #
+        # Appendue APRÈS celle de mika#2306, et c'est PORTANT : elle devient la
+        # règle la plus récente que lit un groomeur, et le commentaire de
+        # `_PILOT_SCRATCH_RULE` dit que la récence est le seul levier d'une règle
+        # en fin d'un prompt de 16 KiB. S13 tient l'ordre.
         if [ "$SKILL" = "dev-groom" ]; then
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
+            _plan_size_rule; PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PLAN_SIZE_RULE")
         fi
 
         # Save pre-run HEAD SHA for post-flight diff check
@@ -7396,6 +7732,12 @@ _launch_revise_pilot() {
     # être lisible sans dérouler le flot de contrôle, et le test T10 la lit.
     _FD_REVISE_RETRIED=0
 
+    # mika#2636 — compteur jumeau pour le rattrapage de taille. Compteur PROPRE
+    # et non partagé : les deux rattrapages peuvent légitimement tirer dans la
+    # même invocation (findings réclamant les deux sections), chacun borné à un.
+    # Un compteur commun ferait du premier un désarmement silencieux du second.
+    _PLAN_SIZE_REVISE_RETRIED=0
+
     local findings_file="$1"
     [ -r "$findings_file" ] || {
         echo "WARN: _launch_revise_pilot: findings file not readable: $findings_file" >&2
@@ -7439,6 +7781,14 @@ _launch_revise_pilot() {
     if [ "$pre_hash" != "$post_hash" ]; then
         echo "_launch_revise_pilot: plan revised (sha changed from ${pre_hash:0:12} to ${post_hash:0:12})" >&2
         _fd_retry_if_section_still_missing "$findings_file" "$plan_path"
+        # mika#2636 — second rattrapage, à la suite du premier. L'ORDRE est
+        # arbitraire et FIGÉ (S15) pour que la composition soit reproductible :
+        # des findings réclamant les deux sections produisent deux relances, et
+        # jusqu'à deux pilotes de revise supplémentaires sur un plan qui ignore
+        # deux sections. Coût acceptable — chacun est borné à un, et
+        # l'alternative est un ESCALATE sans recours — et NOMMÉ plutôt que
+        # découvert.
+        _plan_size_retry_if_section_still_missing "$findings_file" "$plan_path"
         return 0
     else
         echo "WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)" >&2
@@ -7569,6 +7919,151 @@ Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
     # `/mika-revise-plan` (suivi mika-platform), PAS un troisième essai ici.
     if ! grep -qiE "$_FD_HEADING_RE" "$plan_path" 2>/dev/null; then
         echo "fire_disposition_still_missing_after_retry: ${REPO:-?}#${ISSUE_NUM:-?} — la seconde tentative n'a pas produit la section ; le plan part au second passage architecte. Aucune troisième relance (budget épuisé)." >&2
+    fi
+
+    return 0
+}
+
+# mika#2636 — le rattrapage `## Taille estimée`, greffé sur la branche `sha256`
+# RÉUSSIE de `_launch_revise_pilot`. COPIE STRUCTURELLE de
+# `_fd_retry_if_section_still_missing` ci-dessus : même greffe, même budget,
+# même forme de prédicat, même vocabulaire d'événement. Imiter terme pour terme
+# plutôt qu'inventer une seconde mécanique pour la même classe est délibéré —
+# le précédent a déjà payé ses leçons (mika#2544 sur la numérotation des titres,
+# mika#2306 sur la source du prédicat).
+#
+# Le défaut qu'il ferme : le critère de convergence du revise est « le contenu a
+# changé », jamais « le finding a été traité ». Un revise qui corrige une virgule
+# sans ajouter la section réclamée est, pour la boucle, indistinguable d'un
+# revise réussi ; elle enchaîne sur le second passage, qui ESCALATE, et l'unique
+# itération a été dépensée pour rien.
+#
+# Le prédicat est une CONJONCTION DE DEUX `grep`, jamais un jugement :
+#   1. l'architecte a réclamé la section ⇔ le findings-file de PREMIÈRE PASSE
+#      contient la chaîne `Taille estimée` (le vocabulaire imposé par son propre
+#      Plan-Size Gate) ;
+#   2. la section est absente ⇔ le plan révisé ne porte pas le titre
+#      (`$_PLAN_SIZE_HEADING_RE`, via le lecteur unique qui strippe les fences).
+#
+# La SOURCE du premier terme est portante, pas un détail de rédaction. C'est
+# `$1` — le findings-file de première passe reçu par `_launch_revise_pilot`. Le
+# findings ciblé que cette fonction écrit elle-même (`findings-1-size.md`) est
+# INTERDIT comme source : il contient nécessairement la chaîne `Taille estimée`
+# puisque c'est son objet, donc un prédicat qui le relirait serait vrai par
+# construction — la garde relancerait même quand l'architecte n'a rien demandé,
+# et le test de relance-unique resterait vert sur une garde qui ne regarde plus
+# la sortie architecte. Le compteur casserait la boucle ; il ne rendrait pas le
+# défaut visible. C'est le piège que mika#2306 a documenté ; on ne le retombe
+# pas, et S8 le refuse par scan de source.
+#
+# Si l'un des deux termes est faux, RIEN ne se passe : comportement d'avant le
+# correctif, bit pour bit. Un findings-file illisible SORT le dispatch de la
+# population plutôt que de l'y faire entrer.
+#
+# Le BUDGET ARCHITECTE est inchangé : aucun appel `_arch_ask` sur ce chemin. Ce
+# qui est élargi est le budget du *revise*, qui n'est le contrat de personne —
+# et d'une seule tentative. CETTE FONCTION NE REFUSE JAMAIS RIEN : elle
+# réessaie, puis laisse passer en journalisant. Un échec dur ici déplacerait
+# l'ESCALATE d'une porte au lieu de le lever.
+#
+# Args: $1 = findings-file de première passe (source du terme 1)
+#       $2 = chemin du plan révisé (sujet du terme 2)
+# Returns: toujours 0 — l'appelant a déjà décidé que le plan a changé.
+_plan_size_retry_if_section_still_missing() {
+    local first_pass_findings="$1" plan_path="$2"
+
+    # Budget : une seule relance par invocation de `_launch_revise_pilot`.
+    [ "${_PLAN_SIZE_REVISE_RETRIED:-0}" -eq 0 ] || return 0
+    # Fail-safe : une information illisible SORT de la population.
+    [ -r "$first_pass_findings" ] || return 0
+    [ -r "$plan_path" ] || return 0
+
+    # Terme 1 — l'architecte a réclamé la section.
+    grep -qF -- 'Taille estimée' "$first_pass_findings" 2>/dev/null || return 0
+    # Terme 2 — le plan révisé ne la porte toujours pas. Même lecteur unique que
+    # le re-test de journalisation plus bas, donc les deux strippent les blocs
+    # clôturés : un plan qui DOCUMENTE le format sans le remplir ne passe pas.
+    ! _plan_size_section_present "$plan_path" || return 0
+
+    # Armé avant toute action : un échec en aval ne doit pas rouvrir le budget.
+    _PLAN_SIZE_REVISE_RETRIED=1
+
+    local size_findings_file="${first_pass_findings%/*}/findings-1-size.md"
+    # Le seuil est capté dans une locale sur une ligne CO-LOCALISÉE avec son
+    # résolveur : le corps du finding est une chaîne multi-ligne, et le scan de
+    # co-location (S11) lit l'invocation logique, qu'une chaîne multi-ligne ne
+    # joint pas. Lire `$_PLAN_SIZE_MAX_LOC` depuis l'intérieur du `printf`
+    # accuserait donc le site — à juste titre : la valeur y serait celle d'un
+    # appel antérieur.
+    local _size_threshold; _plan_size_max_loc; _size_threshold="$_PLAN_SIZE_MAX_LOC"
+    printf '%s\n' "FINDING SYNTHÉTIQUE — émis par dispatch-lib (mika#2636), pas par l'architecte.
+
+F-SIZE [BLOQUANT] — la section \`## Taille estimée\` que la première passe
+architecte a réclamée est TOUJOURS ABSENTE du plan révisé.
+
+Le plan a bien été modifié, mais le finding n'a pas été traité. En l'état il part
+au second passage architecte, où le Plan-Size Gate est SANS RECOURS
+(« No ITERATE exists at second pass per the two-pass limit ») : le verdict sera
+ESCALATE et le ticket ne sera jamais implémenté.
+
+Action demandée, et elle seule : ajouter au plan une section \`## Taille estimée\`
+au format exact ci-dessous — titre, tableau par livrable, puis la ligne de total.
+
+## Taille estimée
+
+| livrable | lignes de code (hors \`docs/\`) |
+|---|---|
+| \`chemin/du/livrable\` | 120 |
+| tests (\`chemin/du/test\`) | 95 |
+
+Total estimé : 215 lignes
+
+Compte les LIGNES DE CODE, hors \`docs/\` et hors \`CLAUDE.md\`. La ligne
+\`Total estimé :\` est lue par la machine : écris-la telle quelle, sans
+séparateur de milliers.
+
+Au-dessus de ${_size_threshold} lignes, DÉCOUPE EN PHASES : borne le périmètre de cette
+PR sous le seuil et renvoie explicitement la suite à un ticket de suivi ou à une
+phase nommée. Deux implements consécutifs sont morts au plafond de tours sur ce
+seul critère (mika#2161, mika#2633) ; chacun a coûté un pilote entier.
+
+Ne touche à rien d'autre du plan." > "$size_findings_file" 2>/dev/null || {
+        echo "WARN: plan_size_retry_findings_unwritable: cannot write $size_findings_file — skipping retry" >&2
+        return 0
+    }
+
+    echo "plan_size_revise_retried: ${REPO:-?}#${ISSUE_NUM:-?} — section absente du plan révisé alors que les findings de première passe la réclamaient ; relance unique du pilote de revise avec $(basename "$size_findings_file")" >&2
+
+    local size_log_id="${LOG_ID:-unknown}-revise-size-$(date +%s)"
+    local size_stdout; size_stdout=$(mktemp /tmp/revise-size-stdout-XXXXXX)
+    local size_stderr; size_stderr=$(mktemp /tmp/revise-size-stderr-XXXXXX)
+
+    set +e
+    # CWD_ARGS is intentionally word-split (multiple flags)
+    # shellcheck disable=SC2086
+    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$size_log_id" \
+        ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
+        --command "/mika-revise-plan" $CWD_ARGS \
+        -- "@${size_findings_file}" \
+        >"$size_stdout" 2>"$size_stderr"
+    set -e
+    rm -f "$size_stdout" "$size_stderr"
+
+    # La section est re-testée POUR JOURNALISER, jamais pour reboucler : le
+    # compteur est déjà armé, donc aucun chemin ne réarme le lancement. C'est ce
+    # qui réconcilie « une seule relance » et « l'événement doit savoir si la
+    # section manque encore » — le prédicat est évalué deux fois, il n'autorise
+    # l'action qu'une.
+    #
+    # Les deux événements sont de l'OBSERVABILITÉ PURE : consommés par
+    # l'opérateur et par l'analyse de logs (mika#2205), relus par aucune branche
+    # de ce fichier, sans effet sur le flot de la boucle. Régime attendu :
+    # `plan_size_revise_retried` rare, `plan_size_still_missing_after_retry` à
+    # zéro. Une occurrence soutenue du second dit que le pilote de revise NE SAIT
+    # PAS écrire la section — donc que le correctif est côté
+    # `/mika-revise-plan` (suivi mika-platform), PAS une troisième relance ici.
+    if ! _plan_size_section_present "$plan_path"; then
+        echo "plan_size_still_missing_after_retry: ${REPO:-?}#${ISSUE_NUM:-?} — la seconde tentative n'a pas produit la section ; le plan part au second passage architecte. Aucune troisième relance (budget épuisé)." >&2
     fi
 
     return 0
@@ -9613,6 +10108,19 @@ _detect_plan_on_branch() {
         # takes the decision, so the fact travels from its producer instead of
         # being reconstructed downstream. Read by `_pilot_had_no_shipping_tail`.
         PILOT_SHIPPING_TAIL="absent"
+        # mika#2636 (L1.e) — PORTE 3 : on pose la taille estimée du plan servi,
+        # et on ne refuse JAMAIS. GLOBALES par le précédent exact de cette même
+        # fonction — `_PLAN_CALLOUT_REFUSAL` et `PILOT_SHIPPING_TAIL` le sont
+        # déjà, et pour la même raison (`PLAN_PATH` y est `local`).
+        #
+        # `_PLAN_SIZE_PLAN_PATH` est le DISCRIMINANT d'émission : il n'est posé
+        # que sur cette branche, donc un dispatch de revise ou un `/mika` sans
+        # plan-on-branch n'émet aucune ligne de taille — la question n'y a pas de
+        # sens. Posé APRÈS la validation d'existence du fichier, parce qu'un
+        # chemin de callout qui ne correspond à rien dans le worktree n'est pas
+        # un plan à mesurer.
+        _PLAN_SIZE_PLAN_PATH="$PLAN_PATH"
+        _PLAN_SIZE_TOTAL=$(_plan_size_total_loc "$WORKTREE_DIR/$PLAN_PATH")
         echo "Plan-on-branch detected: overriding entry command to '/ce-work $PLAN_PATH'" >&2
     else
         echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2

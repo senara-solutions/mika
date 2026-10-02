@@ -6232,13 +6232,20 @@ CP_BUILT_FLAGS=$(printf '%s\n%s\n' "$CP_LITERAL_FLAGS" "$CP_VAR_FLAGS" | grep -v
 # direct invocation rather than a recursion into `_launch_revise_pilot` — the
 # recursion would make the retry's own findings-file the predicate's input and
 # render its first term true by construction.
+#
+# Count moved 4 → 5 on 2026-10-02 (mika#2636): the plan-size retry in
+# `_plan_size_retry_if_section_still_missing` is a fifth launch point, a
+# structural copy of the fourth and a direct invocation for the same reason —
+# a recursion into `_launch_revise_pilot` would make the retry's own
+# findings-file the predicate's input and render its first term true by
+# construction.
 CP_SITE_COUNT=$(printf '%s\n' "$CP_INVOCATIONS" | grep -c . || true)
-if [ "$CP_SITE_COUNT" -eq 4 ]; then
+if [ "$CP_SITE_COUNT" -eq 5 ]; then
     PASS=$((PASS + 1))
-    echo "  ✓ all 4 claude-pilot launch sites are in the guard's sight"
+    echo "  ✓ all 5 claude-pilot launch sites are in the guard's sight"
 else
     FAIL=$((FAIL + 1))
-    echo "  ✗ expected 4 claude-pilot launch sites, saw $CP_SITE_COUNT"
+    echo "  ✗ expected 5 claude-pilot launch sites, saw $CP_SITE_COUNT"
     echo "    A site the guard cannot see is a site it cannot police. If a launch"
     echo "    point was legitimately added or removed, update this count."
 fi
@@ -7099,7 +7106,11 @@ assert_eq "mika#2165: aucun --log-dir nu ne subsiste" "0" \
 # Compte passé de 2 à 3 le 2026-09-21 (mika#2306) : la relance Fire-Disposition
 # est un troisième lancement, et elle reproduit la forme co-localisée ci-dessus
 # plutôt que de lire une valeur héritée du lancement nominal.
-assert_eq "mika#2165: chaque --log-dir est valué par le résolveur" "3" \
+#
+# Compte passé de 3 à 4 le 2026-10-02 (mika#2636) : la relance de taille est un
+# quatrième lancement, copie structurelle du troisième, et elle reproduit la
+# même forme co-localisée.
+assert_eq "mika#2165: chaque --log-dir est valué par le résolveur" "4" \
     "$(grep -cF -- '--log-dir "$_PILOT_LOG_DIR"' "$DISPATCH_LIB" || true)"
 
 # L'assertion de comportement : la surcharge posée APRÈS le source est honorée.
@@ -7266,7 +7277,9 @@ _mika2496_unbounded_launches() {
 
 # Terme 5 — la cardinalité. Anti-vacuité : un scan qui ne trouve PERSONNE se lit
 # exactement comme un scan propre.
-assert_eq "mika#2496: le scan voit exactement les trois sites de lancement" "3" \
+# Compte passé de 3 à 4 le 2026-10-02 (mika#2636) : la relance de taille est un
+# quatrième site de lancement, et il porte `--max-turns` comme les trois autres.
+assert_eq "mika#2496: le scan voit exactement les quatre sites de lancement" "4" \
     "$(_mika2496_launch_candidates "$DISPATCH_LIB" | wc -l | tr -d ' ')"
 
 # L'assertion elle-même : aucun lancement sans son plafond.
@@ -7612,7 +7625,11 @@ _mika2542_unargumented_calls() {
         fi
     done < <(_mika2542_resolver_calls "$1")
 }
-assert_eq "mika#2542 (AC10): le scan voit exactement trois appels du résolveur" "3" \
+# Compte passé de 3 à 4 le 2026-10-02 (mika#2636) : la relance de taille appelle
+# le résolveur sur son propre site, en lui passant `"${LABELS:-}"` comme les
+# trois autres — un site qui l'oublierait résoudrait « aucun label », donc le
+# défaut, donc fail-safe vers 150 et jamais vers 200.
+assert_eq "mika#2542 (AC10): le scan voit exactement quatre appels du résolveur" "4" \
     "$(_mika2542_resolver_calls "$DISPATCH_LIB" | wc -l | tr -d ' ')"
 assert_eq "mika#2542 (AC10): chaque appel du résolveur passe \"\${LABELS:-}\"" "" \
     "$(_mika2542_unargumented_calls "$DISPATCH_LIB" | cut -c1-100)"
@@ -11240,6 +11257,724 @@ assert_eq "mika#2626 (V5, contrôle négatif): une mention en prose n'est PAS ac
 M2626_PUSH_SRC=$(sed -n '/^_push_branch() {/,/^}/p' "$DISPATCH_LIB")
 assert_contains "mika#2626: \`_push_branch\` consulte le lecteur avant de choisir son mode" \
     "_remote_branch_exists" "$M2626_PUSH_SRC"
+
+# ============================================================================
+# mika#2636 — la section `## Taille estimée` a un site de production (S1–S16)
+# ============================================================================
+#
+# Ce que ces seize détecteurs mesurent. Deux implements consécutifs ont été
+# coupés au plafond de tours sur le seul critère du VOLUME — mika#2161 (pilote
+# `73720a14`, 151 tours, ≈ 1 470 lignes hors `docs/`) et mika#2633 (pilote
+# `2bd6fca0`, 151 tours, ≈ 1 170 lignes) — et AUCUN de leurs plans ne portait
+# d'estimation de taille. La pratique « découper en phases au groom » existait
+# depuis le 2026-10-01 et RIEN ne la vérifiait : la seconde passe architecte a
+# validé le plan de mika#2161 en `PLAN_GROOMED` sans que quoi que ce soit
+# demande la taille.
+#
+# La répartition est celle de la maison — DÉTECTION PERMISSIVE, DÉCISION
+# STRICTE : le `grep` dit si la section est PRÉSENTE et si le total est
+# PARSABLE, l'architecte seul juge si le total est CRÉDIBLE et si le découpage
+# en phases est RÉEL. Aucun prédicat lexical ne peut rendre ces deux jugements,
+# et la moitié architecte seule serait de l'enforcement de prompt, que
+# `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` borne.
+#
+# Les quatre contrôles négatifs (S5, S6, S7, S13) sont PORTEURS, pas
+# décoratifs : sans eux, une garde qui relance TOUJOURS passerait S1 en vert
+# tout en doublant le coût de chaque grooming du dépôt.
+
+echo ""
+echo 'Test: mika#2636 — site de production de `## Taille estimée` (S1–S16)'
+echo "-----------------------------------------------------------------------"
+
+T2636_PLAN="$REPO_ROOT/docs/plans/2026-10-02-002-feat-2636-estimation-de-taille-au-groom-plan.md"
+T2636_LIB_SRC=$(cat "$DISPATCH_LIB")
+T2636_SUW_SRC=$(sed -n '/^_set_up_worktree() {/,/^}/p' "$DISPATCH_LIB")
+T2636_EMIT_SRC=$(sed -n '/^_emit_pilot_budget_line() {/,/^}/p' "$DISPATCH_LIB")
+T2636_GUARD_SRC=$(declare -f _plan_size_retry_if_section_still_missing 2>/dev/null || true)
+T2636_REVISE_SRC=$(declare -f _launch_revise_pilot 2>/dev/null || true)
+T2636_DETECT_SRC=$(sed -n '/^_detect_plan_on_branch() {/,/^}/p' "$DISPATCH_LIB")
+
+# --- Outillage local de section ---------------------------------------------
+
+# Réplique le site d'injection de `_set_up_worktree` dans son ORDRE réel :
+# contexte de ticket, règle de corps de PR (inconditionnelle), règle du scratch
+# (inconditionnelle), règle Fire-Disposition puis règle de taille (toutes deux
+# conditionnées au skill). S13 asserte sur CETTE chaîne ; une assertion sur la
+# source tient le miroir contre la dérive (patron mika#2178 T3 / mika#2306 T4).
+_t2636_inject() {
+    local skill="$1" repo="${2:-mika}" issue_num="${3:-2636}"
+    local prompt="${repo}#${issue_num}"
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PR_BODY_CONTAINMENT_RULE")
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PILOT_SCRATCH_RULE")
+    if [ "$skill" = "dev-groom" ]; then
+        prompt=$(printf '%s\n\n%s' "$prompt" "$_FIRE_DISPOSITION_RULE")
+        _plan_size_rule; prompt=$(printf '%s\n\n%s' "$prompt" "$_PLAN_SIZE_RULE")
+    fi
+    printf '%s' "$prompt"
+}
+
+# Sonde du résolveur de seuil. `__UNSET__` = variable absente.
+_t2636_threshold_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PLAN_SIZE_MAX_LOC
+        if [ "$1" != "__UNSET__" ]; then export PLAN_SIZE_MAX_LOC="$1"; fi
+        _plan_size_max_loc
+        printf '%s|%s|%s' "$_PLAN_SIZE_MAX_LOC" "${_PLAN_SIZE_MAX_LOC_SOURCE:-}" \
+            "${_PLAN_SIZE_MAX_LOC_INVALID:-}"
+    )
+}
+
+# Sonde du lecteur de total. `$1` = corps du plan (écrit tel quel dans un
+# fichier temporaire). Rend ce que `_plan_size_total_loc` imprime.
+_t2636_total_probe() {
+    local t2636_dir t2636_f t2636_out
+    t2636_dir=$(mktemp -d)
+    t2636_f="$t2636_dir/plan.md"
+    printf '%s\n' "$1" > "$t2636_f"
+    t2636_out=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _plan_size_total_loc "$t2636_f"
+    )
+    rm -rf "$t2636_dir"
+    printf '%s' "$t2636_out"
+}
+
+# Sonde du lecteur de PRÉSENCE de section. Rend `oui`/`non`.
+_t2636_present_probe() {
+    local t2636_dir t2636_f t2636_out
+    t2636_dir=$(mktemp -d)
+    t2636_f="$t2636_dir/plan.md"
+    printf '%s\n' "$1" > "$t2636_f"
+    t2636_out=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        if _plan_size_section_present "$t2636_f"; then printf 'oui'; else printf 'non'; fi
+    )
+    rm -rf "$t2636_dir"
+    printf '%s' "$t2636_out"
+}
+
+# Sonde de la ligne de journal (porte 3). `$1` = valeur de `_PLAN_SIZE_TOTAL`,
+# `$2` = surcharge d'environnement du seuil, `$3` = chemin de plan détecté
+# (vide ⇒ aucun plan-on-branch, donc AUCUNE ligne `plan_size_estimate`).
+_t2636_emit_probe() {
+    # `${3-…}` et NON `${3:-…}` : le troisième argument vide est la valeur qui
+    # exprime « aucun plan-on-branch détecté », donc le `:-` le remplacerait par
+    # le défaut et le contrôle négatif de porte 3 ne mesurerait rien.
+    local t2636_total="$1" t2636_env="${2:-__UNSET__}" t2636_path="${3-docs/plans/sonde-plan.md}"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PLAN_SIZE_MAX_LOC
+        if [ "$t2636_env" != "__UNSET__" ]; then export PLAN_SIZE_MAX_LOC="$t2636_env"; fi
+        _PLAN_SIZE_PLAN_PATH="$t2636_path"
+        _PLAN_SIZE_TOTAL="$t2636_total"
+        _emit_pilot_budget_line claude-pilot --max-turns 150 2>&1 >/dev/null
+    )
+}
+
+# Sonde comportementale de `_launch_revise_pilot`, calquée terme pour terme sur
+# `_t2306_revise_probe` : seul `_run_pilot_sandboxed` est neutralisé, tout le
+# reste de la fonction s'exécute tel quel — la seule façon de prouver que le
+# compte de relances vient de la garde et de rien d'autre.
+#
+# $1 = contenu de .iterate/findings-1.md
+# $2 = forme de la section de taille dans le plan initial :
+#      no | yes | numbered | fenced (le titre n'existe QUE dans un bloc clôturé)
+# $3 = comportement du pilote simulé : never | second | wipe
+# $4 = (optionnel) "residual-size" dépose un findings-1-size.md résiduel
+# Rend : "<rc>|<nombre d'invocations du pilote>|<stderr>"
+_t2636_revise_probe() {
+    local t2636_findings="$1" t2636_form="$2" t2636_behaviour="$3" t2636_extra="${4:-}"
+    local t2636_root t2636_wt t2636_plan t2636_counter t2636_err t2636_rc
+    t2636_root=$(mktemp -d)
+    t2636_wt="$t2636_root/.claude/worktrees/feat-2636-probe/mika"
+    mkdir -p "$t2636_wt/docs/plans" "$t2636_wt/.iterate"
+    t2636_plan="$t2636_wt/docs/plans/2026-10-02-002-feat-2636-sonde-plan.md"
+
+    # > 500 octets : `_find_issue_plan` filtre les plans plus courts (mika#1033).
+    # Un plan sous le seuil fait rendre « no plan file to revise », c'est-à-dire
+    # un vert qui n'a rien exercé de la garde.
+    {
+        printf '# mika#2636 — plan de sonde\n\n**Ticket :** mika issue#2636\n\n## Problème\n\n'
+        printf 'Corps de remplissage pour franchir le filtre des 500 octets applique par\n'
+        printf '_find_issue_plan a tous ses tiers de decouverte. Ce texte ne porte aucune\n'
+        printf 'signification pour la sonde : seules comptent sa longueur, et la presence\n'
+        printf "ou l'absence de la section testee.\n\n"
+        printf 'Le seuil existe pour ecarter les fichiers-fantomes et les ebauches vides ;\n'
+        printf "il s'applique identiquement aux trois tiers de decouverte, donc un plan\n"
+        printf 'trop court est invisible quelle que soit la façon dont il est nomme.\n\n'
+        printf '## Livrables\n\nL1 — un livrable quelconque.\n\n'
+        case "$t2636_form" in
+            yes)      printf '## Taille estimée\n\nTotal estimé : 400 lignes\n\n' ;;
+            numbered) printf '## 6. Taille estimée\n\nTotal estimé : 400 lignes\n\n' ;;
+            fenced)   printf '```markdown\n## Taille estimée\n\nTotal estimé : 395 lignes\n```\n\n' ;;
+        esac
+        printf '## Acceptance criteria\n\nAC1 — la sonde tourne.\n'
+    } > "$t2636_plan"
+
+    printf '%s\n' "$t2636_findings" > "$t2636_wt/.iterate/findings-1.md"
+    if [ "$t2636_extra" = "residual-size" ]; then
+        printf 'Taille estimée — residu laisse par un dispatch anterieur.\n' \
+            > "$t2636_wt/.iterate/findings-1-size.md"
+    fi
+
+    t2636_counter="$t2636_root/pilot-invocations"
+    printf '0\n' > "$t2636_counter"
+
+    t2636_err=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _run_pilot_sandboxed() {
+            local n; n=$(( $(cat "$t2636_counter") + 1 ))
+            printf '%s\n' "$n" > "$t2636_counter"
+            case "$t2636_behaviour" in
+                wipe) rm -f "$t2636_wt/.iterate/findings-1.md" ;;
+                second) [ "$n" -ge 2 ] && printf '\n## 6. Taille estimée\n\nTotal estimé : 400 lignes\n' >> "$t2636_plan" ;;
+            esac
+            # Mutation inconditionnelle : sans elle le sha ne bouge pas et la
+            # branche de succès — donc la garde — n'est jamais atteinte.
+            printf '\n<!-- revise %s -->\n' "$n" >> "$t2636_plan"
+            return 0
+        }
+        set +e
+        WORKTREE_DIR="$t2636_wt" ISSUE_NUM="2636" REPO="mika" LOG_ID="t2636" \
+            CWD_ARGS="--cwd $t2636_wt" \
+            _launch_revise_pilot "$t2636_wt/.iterate/findings-1.md" 2>&1 >/dev/null
+        printf '%s\n' "$?" > "$t2636_root/rc"
+    )
+    t2636_rc=$(cat "$t2636_root/rc")
+    printf '%s|%s|%s' "$t2636_rc" "$(cat "$t2636_counter")" "$t2636_err"
+    rm -rf "$t2636_root"
+}
+
+# Le champ 3 est du stderr libre — multiligne, pouvant contenir des `|`.
+_t2636_field() { printf '%s' "$2" | head -1 | cut -d'|' -f"$1"; }
+_t2636_err()   { printf '%s' "$1" | sed '1s/^[0-9]*|[0-9]*|//'; }
+
+T2636_FINDINGS_WITH_SIZE="F1 [BLOQUANT] — le plan ne porte pas de section \`## Taille estimée\`.
+Ajoute-la : lignes de code hors \`docs/\` par livrable, puis la ligne \`Total estimé :\`.
+
+Disposition: ITERATE"
+T2636_FINDINGS_WITHOUT_SIZE="F1 [BLOQUANT] — l'unité L2 laisse le choix de la structure de
+données à l'implémenteur. Tranche-le dans le plan.
+
+Disposition: ITERATE"
+T2636_FINDINGS_BOTH="F1 [BLOQUANT] — le plan livre des détecteurs et ne porte pas de section
+\`## Fire-Disposition\`.
+F2 [BLOQUANT] — le plan ne porte pas de section \`## Taille estimée\`.
+
+Disposition: ITERATE"
+
+# --- S1 : le cœur du correctif ----------------------------------------------
+#
+# Findings réclamant la section + plan révisé qui ne la porte toujours pas
+# ⇒ exactement UNE relance (deux invocations du pilote : la nominale et elle).
+# VU ROUGE avant le correctif : la fonction n'existait pas, donc zéro relance.
+
+T2636_S1=$(_t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "no" "never")
+assert_eq "S1: findings réclamant la taille + section absente ⇒ exactement une relance" \
+    "2" "$(_t2636_field 2 "$T2636_S1")"
+assert_contains "S1: et la relance est DITE, pas silencieuse" \
+    "plan_size_revise_retried" "$T2636_S1"
+assert_eq "S1: la valeur de retour reste 0 — la garde ajoute une tentative, pas un mode d'échec" \
+    "0" "$(_t2636_field 1 "$T2636_S1")"
+assert_contains "S1: l'échec de second tour est DIT" \
+    "plan_size_still_missing_after_retry" "$T2636_S1"
+
+# Et quand la seconde tentative réussit, elle se tait : l'événement d'échec est
+# réservé à l'échec, sinon il ne mesure plus rien.
+T2636_S1B=$(_t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "no" "second")
+assert_eq "S1: seconde tentative réussie ⇒ toujours une seule relance" \
+    "2" "$(_t2636_field 2 "$T2636_S1B")"
+assert_not_contains "S1: et aucun événement d'échec quand la section arrive" \
+    "plan_size_still_missing_after_retry" "$T2636_S1B"
+
+# --- S2 : un plan sous le seuil passe ---------------------------------------
+#
+# 515 lignes, la valeur d'AC4, mesurée sur mika#1960 phase 2 (qui n'est pas mort
+# de volume). Verdict `under_threshold`, et ZÉRO relance sur un plan conforme —
+# le contrôle négatif que mika#2544 a dû livrer après qu'un rattrapage a relancé
+# un pilote pour rien sur un plan numéroté conforme.
+
+T2636_S2=$(_t2636_emit_probe "515")
+assert_contains "S2: un plan à 515 lignes rend verdict=under_threshold" \
+    "verdict=under_threshold" "$T2636_S2"
+assert_contains "S2: et la ligne porte le total et le seuil" \
+    "total_loc=515 threshold_loc=1000" "$T2636_S2"
+T2636_S2B=$(_t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "numbered" "never")
+assert_eq "S2: section déjà présente ⇒ zéro relance (le chemin nominal ne paie rien)" \
+    "1" "$(_t2636_field 2 "$T2636_S2B")"
+assert_not_contains "S2: et rien n'est journalisé" \
+    "plan_size_revise_retried" "$T2636_S2B"
+
+# --- S3 : un plan au-dessus du seuil est nommé ------------------------------
+#
+# 1 400 lignes, la valeur d'AC4. VU ROUGE avant le correctif : aucune ligne
+# `plan_size_estimate` n'existait, donc le dispatch ne disait rien du volume.
+# Le REFUS, lui, vit chez l'architecte (S14 / L2 / L3) : la porte 3 journalise
+# et ne refuse JAMAIS, sans quoi la file groomée entière serait gelée (R3).
+
+T2636_S3=$(_t2636_emit_probe "1400")
+assert_contains "S3: un plan à 1 400 lignes rend verdict=over_threshold" \
+    "verdict=over_threshold" "$T2636_S3"
+assert_contains "S3: et le total est nommé" "total_loc=1400" "$T2636_S3"
+# Le seuil décide, pas le nombre : le même total sous un seuil relevé passe.
+T2636_S3B=$(_t2636_emit_probe "1400" "2000")
+assert_contains "S3: le SEUIL décide — 1 400 sous un seuil de 2 000 passe" \
+    "verdict=under_threshold" "$T2636_S3B"
+assert_contains "S3: et la provenance du seuil est dite" \
+    "threshold_loc=2000 source=env" "$T2636_S3B"
+# Porte 3 ne refuse rien : aucun vocabulaire de refus sur cette ligne.
+assert_not_contains "S3: la porte 3 ne refuse jamais (R3)" "REFUSED" "$T2636_S3"
+
+# --- S4 : la numérotation ne change pas la section --------------------------
+#
+# `/ce:plan` numérote ses titres. C'est le défaut que mika#2544 a dû corriger
+# après qu'un rattrapage Fire-Disposition a tiré à tort sur un plan conforme.
+# VU ROUGE si le motif est un littéral `^## Taille estimée`.
+
+assert_eq "S4: _PLAN_SIZE_HEADING_RE est définie et non vide" "non-vide" \
+    "$([ -n "${_PLAN_SIZE_HEADING_RE:-}" ] && echo non-vide || echo vide)"
+_t2636_heading_match() {
+    if [ -n "${_PLAN_SIZE_HEADING_RE:-}" ] && grep -qiE -- "$_PLAN_SIZE_HEADING_RE" <<<"$1"; then
+        printf 'match'
+    else
+        printf 'no-match'
+    fi
+}
+assert_eq "S4: '## Taille estimée' apparie" "match" \
+    "$(_t2636_heading_match '## Taille estimée')"
+assert_eq "S4: '## 7. Taille estimée' apparie (numérotation, mika#2544)" "match" \
+    "$(_t2636_heading_match '## 7. Taille estimée')"
+assert_eq "S4: '## 7 Taille estimée' apparie (sans point)" "match" \
+    "$(_t2636_heading_match '## 7 Taille estimée')"
+assert_eq "S4: '##   Taille estimée' apparie (espaces multiples)" "match" \
+    "$(_t2636_heading_match '##   Taille estimée')"
+assert_eq "S4: '## 6. TAILLE ESTIMÉE' apparie (casse repliée)" "match" \
+    "$(_t2636_heading_match '## 6. TAILLE ESTIMÉE')"
+assert_eq "S4: '## Taille estimée (par phase)' apparie (pas d'ancre \$)" "match" \
+    "$(_t2636_heading_match '## Taille estimée (par phase)')"
+# Contrôles négatifs du motif : le texte reste ancré juste après le préfixe.
+assert_eq "S4: '### Taille estimée' n'apparie PAS" "no-match" \
+    "$(_t2636_heading_match '### Taille estimée')"
+assert_eq "S4: '## Notes sur la Taille estimée' n'apparie PAS" "no-match" \
+    "$(_t2636_heading_match '## Notes sur la Taille estimée')"
+assert_eq "S4: '##Taille estimée' n'apparie PAS (pas un titre Markdown)" "no-match" \
+    "$(_t2636_heading_match '##Taille estimée')"
+# Hors périmètre NOMMÉ : `## 1.1 …` n'est pas couvert, exactement comme
+# `_FD_HEADING_RE`. Élargir sur une devinette est refusé (mika#2544) ; le jour
+# où la forme est mesurée, l'élargissement bouge les DEUX motifs.
+assert_eq "S4: '## 1.1 Taille estimée' n'apparie PAS (borne héritée de mika#2544)" "no-match" \
+    "$(_t2636_heading_match '## 1.1 Taille estimée')"
+# Co-mutation avec son jumeau : le préfixe de numérotation est le MÊME.
+assert_eq "S4 (co-mutation): préfixe de _PLAN_SIZE_HEADING_RE == préfixe de _FD_HEADING_RE" \
+    "${_FD_HEADING_RE%Fire-Disposition}" "${_PLAN_SIZE_HEADING_RE%Taille estimée}"
+
+# --- S5 : contrôle négatif — l'architecte n'a rien demandé ------------------
+
+T2636_S5=$(_t2636_revise_probe "$T2636_FINDINGS_WITHOUT_SIZE" "no" "never")
+assert_eq "S5: findings sans mention de la taille ⇒ zéro relance" \
+    "1" "$(_t2636_field 2 "$T2636_S5")"
+assert_not_contains "S5: et rien n'est journalisé" \
+    "plan_size_revise_retried" "$T2636_S5"
+
+# --- S6 : fail-safe — une information illisible SORT de la population -------
+
+T2636_S6=$(_t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "no" "wipe")
+assert_eq "S6: findings disparu en vol ⇒ zéro relance" \
+    "1" "$(_t2636_field 2 "$T2636_S6")"
+assert_eq "S6: et la valeur de retour reste celle d'avant le correctif" \
+    "0" "$(_t2636_field 1 "$T2636_S6")"
+assert_not_contains "S6: et aucun événement n'est émis" \
+    "plan_size_revise_retried" "$T2636_S6"
+assert_eq "S6: un plan illisible rend 'absent', jamais un total inventé" "absent" \
+    "$( (source "$DISPATCH_LIB" 2>/dev/null || true; _plan_size_total_loc /nonexistent/mika-2636.md) )"
+
+# --- S7 : relance UNIQUE, terminaison lisible sans dérouler le flot ---------
+
+assert_contains "S7: le compteur de garde existe et est armé AVANT l'action" \
+    "_PLAN_SIZE_REVISE_RETRIED=1" "$T2636_GUARD_SRC"
+assert_contains "S7: et il est remis à zéro à chaque entrée de _launch_revise_pilot" \
+    "_PLAN_SIZE_REVISE_RETRIED=0" "$T2636_REVISE_SRC"
+assert_eq "S7: un second appel avec le compteur déjà armé est un no-op" "0" \
+    "$( (source "$DISPATCH_LIB" 2>/dev/null || true
+         _PLAN_SIZE_REVISE_RETRIED=1
+         _plan_size_retry_if_section_still_missing "$T2636_PLAN" "$T2636_PLAN" 2>&1 \
+           | grep -c 'plan_size_revise_retried' || true) )"
+assert_eq "S7: et AUCUNE troisième relance sur le chemin S1" "2" "$(_t2636_field 2 "$T2636_S1")"
+assert_eq "S7: l'événement d'échec est émis exactement une fois" "1" \
+    "$(_t2636_err "$T2636_S1" | grep -c 'plan_size_still_missing_after_retry' || true)"
+# Le budget ARCHITECTE est intact : aucun `_arch_ask` sur ce chemin. La
+# régression qu'il attrape ne rendrait AUCUNE décision fausse — elle doublerait
+# le budget LLM par grooming sans qu'un test de comportement ne rougisse.
+assert_eq "S7: zéro appel _arch_ask dans la garde de rattrapage" "0" \
+    "$(printf '%s\n' "$T2636_GUARD_SRC" | grep -c '_arch_ask' || true)"
+
+# --- S8 : contrôle de source — le prédicat auto-entretenu -------------------
+#
+# La seule défaillance de cette famille qu'aucun autre test ne voit. Un
+# implémenteur qui lit le findings CIBLÉ (`findings-1-size.md`, qui contient
+# nécessairement la chaîne — c'est son objet) rend le premier terme vrai par
+# construction : la garde relance même quand l'architecte n'a rien demandé, le
+# compteur borne la boucle, et S1, S5, S6 restent TOUS verts.
+
+T2636_SIZE_VAR_LINES=$(printf '%s\n' "$T2636_GUARD_SRC" | grep 'size_findings_file' || true)
+assert_eq "S8: aucune ligne touchant findings-1-size.md ne l'interroge par grep" "0" \
+    "$(printf '%s\n' "$T2636_SIZE_VAR_LINES" | grep -c 'grep' || true)"
+assert_eq "S8: et la garde ne se relance pas par récursion sur _launch_revise_pilot" "0" \
+    "$(printf '%s\n' "$T2636_GUARD_SRC" | grep -c '_launch_revise_pilot' || true)"
+assert_eq "S8 contre-vacuité: la garde écrit bien un findings ciblé" "yes" \
+    "$([ -n "$T2636_SIZE_VAR_LINES" ] && echo yes || echo non-trouvé)"
+assert_contains "S8: le terme 1 interroge le findings de première passe REÇU EN ARGUMENT" \
+    'first_pass_findings' \
+    "$(printf '%s\n' "$T2636_GUARD_SRC" | grep 'Taille estimée' | grep 'grep -qF' || true)"
+# Comportemental : un findings-1-size.md résiduel ne rend aucun terme vrai.
+T2636_S8B=$(_t2636_revise_probe "$T2636_FINDINGS_WITHOUT_SIZE" "no" "never" "residual-size")
+assert_eq "S8: un findings-1-size.md résiduel ne déclenche aucune relance" \
+    "1" "$(_t2636_field 2 "$T2636_S8B")"
+
+# --- S9 : trois issues distinctes, et `absent` n'est JAMAIS `0` -------------
+#
+# Confondre « le plan n'a pas été dimensionné » et « le plan a été dimensionné
+# dans une forme que le lecteur ne sait pas lire » rendrait les deux
+# indiscernables, alors que les remèdes sont OPPOSÉS (groomer vs réparer le
+# motif). Et `0` serait un total plausible, présenté avec autorité, faux —
+# *un `null` n'est jamais un `0`* (mika#2331).
+
+assert_eq "S9: section absente ⇒ 'absent'" "absent" \
+    "$(_t2636_total_probe '# Plan
+
+## Livrables
+
+L1 — rien.')"
+assert_eq "S9: section présente sans total ⇒ 'unparsable'" "unparsable" \
+    "$(_t2636_total_probe '# Plan
+
+## 6. Taille estimée
+
+| livrable | lignes |
+|---|---|
+| `a.rs` | 120 |')"
+assert_eq "S9: total apparié ⇒ le nombre" "395" \
+    "$(_t2636_total_probe '# Plan
+
+## Taille estimée
+
+Total estimé : 395 lignes')"
+assert_eq "S9: un total nu (sans unité) apparie aussi" "42" \
+    "$(_t2636_total_probe '# Plan
+
+## Taille estimée
+
+Total estimé : 42')"
+assert_eq "S9: le DERNIER match gagne — un total par phase précède le total global" "900" \
+    "$(_t2636_total_probe '# Plan
+
+## Taille estimée
+
+Total estimé : 300 lignes (phase 1)
+
+Total estimé : 900 lignes')"
+# Hors périmètre NOMMÉ : séparateur de milliers non apparié, forme non
+# prescrite, élargissement sur devinette refusé (mika#2544).
+assert_eq "S9: un séparateur de milliers n'apparie pas ⇒ 'unparsable'" "unparsable" \
+    "$(_t2636_total_probe '# Plan
+
+## Taille estimée
+
+Total estimé : 1 400 lignes')"
+# Et la ligne de journal distingue bien les trois.
+assert_contains "S9: la ligne porte 'absent', jamais 0" "total_loc=absent" \
+    "$(_t2636_emit_probe "absent")"
+assert_contains "S9: 'absent' rend verdict=unknown" "verdict=unknown" \
+    "$(_t2636_emit_probe "absent")"
+assert_contains "S9: 'unparsable' rend verdict=unknown, distinct d''absent'" "total_loc=unparsable" \
+    "$(_t2636_emit_probe "unparsable")"
+# Contrôle négatif de porte 3 : aucun plan détecté ⇒ AUCUNE ligne d'estimation.
+# Et TOUJOURS une ligne quand il l'a été, sinon zéro ligne se lirait « tous les
+# plans sont dimensionnés » alors qu'elle voudrait dire « aucun ne l'est »
+# (classe mika#2205 appliquée à la sonde de ce ticket).
+assert_not_contains "S9: aucun plan-on-branch ⇒ aucune ligne plan_size_estimate" \
+    "plan_size_estimate" "$(_t2636_emit_probe "530" "__UNSET__" "")"
+assert_contains "S9: mais le seuil est DIT même sans plan (doctrine mika#2293)" \
+    "plan_size_threshold_resolved" "$(_t2636_emit_probe "530" "__UNSET__" "")"
+
+# --- S10 : le SINK, et c'est la leçon la plus coûteuse de ce ticket ---------
+#
+# Émettre avant la ligne de lancement enverrait la ligne sur le stderr propre de
+# `dispatch-lib`, que l'exécuteur ne lit QUE dans sa branche
+# `if !status.success()` : sur un dispatch qui réussit — et un dispatch implement
+# réussit — le tuyau est jeté sans être lu et la ligne n'atterrit dans AUCUN
+# fichier. C'est le Signal M, mesuré par mika#2050.
+
+assert_contains "S10: la ligne plan_size_estimate est émise depuis _emit_pilot_budget_line" \
+    "plan_size_estimate" "$T2636_EMIT_SRC"
+assert_contains "S10: idem pour plan_size_threshold_resolved" \
+    "plan_size_threshold_resolved" "$T2636_EMIT_SRC"
+assert_eq "S10: et nulle part ailleurs dans le fichier (site unique d'émission)" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF 'plan_size_estimate total_loc=' || true)"
+# Contre-vacuité : l'émetteur a bien été trouvé.
+assert_eq "S10 contre-vacuité: _emit_pilot_budget_line a été trouvée" "yes" \
+    "$([ -n "$T2636_EMIT_SRC" ] && echo yes || echo no)"
+# Et le sink lui-même : l'émetteur est appelé depuis `_run_pilot_sandboxed`,
+# donc sous la redirection `2>"$STDERR_FILE"` du site de lancement.
+assert_contains "S10: l'émetteur est appelé depuis _run_pilot_sandboxed" \
+    "_emit_pilot_budget_line" "$(sed -n '/^_run_pilot_sandboxed() {/,/^}/p' "$DISPATCH_LIB")"
+
+# --- S11 : co-location, le coût de l'accesseur assignant -------------------
+#
+# Même mécanisme et même raison que `$_PILOT_LOG_DIR` (mika#2165) et
+# `$_PILOT_MAX_TURNS` (mika#2496) : un accesseur qui ASSIGNE peut être lu
+# périmé. Lue sur l'INVOCATION LOGIQUE, pas la ligne physique.
+
+T2636_UNCOLOCATED=$(_mika2496_logical_invocations "$DISPATCH_LIB" \
+    | grep -E '\$\{?_PLAN_SIZE_MAX_LOC\b' \
+    | grep -vE '_plan_size_max_loc' \
+    || true)
+assert_eq "S11: chaque lecture de \$_PLAN_SIZE_MAX_LOC appelle le résolveur sur la même ligne" "" \
+    "$T2636_UNCOLOCATED"
+# Contre-vacuité : le scan voit bien des lectures.
+assert_eq "S11 contre-vacuité: au moins une lecture de \$_PLAN_SIZE_MAX_LOC existe" "yes" \
+    "$( [ "$(_mika2496_logical_invocations "$DISPATCH_LIB" | grep -cE '\$\{?_PLAN_SIZE_MAX_LOC\b' || true)" -gt 0 ] && echo yes || echo non-trouvé)"
+# Le résolveur ASSIGNE, il n'imprime pas — collision mika#2039.
+T2636_RESOLVER_SRC=$(sed -n '/^_plan_size_max_loc()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "S11: _plan_size_max_loc a bien été trouvée (guards the guard)" "yes" \
+    "$([ -n "$T2636_RESOLVER_SRC" ] && echo yes || echo no)"
+assert_eq "S11 × mika#2039: le résolveur n'imprime pas" "0" \
+    "$(printf '%s\n' "$T2636_RESOLVER_SRC" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+assert_eq "S11 × mika#2039: aucune substitution \$(_plan_size_max_loc) ne subsiste" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '$(_plan_size_max_loc)' || true)"
+
+# --- S12 : les trois paliers du seuil, et le `0` ne désarme pas ------------
+#
+# Sur une garde dont le rôle est de borner un coût, une coquille ne doit pas
+# être un désarmement silencieux.
+
+assert_eq "S12: absent ⇒ le défaut in-file, provenance default" "1000|default|" \
+    "$(_t2636_threshold_probe __UNSET__)"
+assert_eq "S12: vide ⇒ le défaut, provenance default" "1000|default|" \
+    "$(_t2636_threshold_probe "")"
+assert_eq "S12: entier positif ⇒ cette valeur, provenance env" "500|env|" \
+    "$(_t2636_threshold_probe 500)"
+assert_eq "S12: '0' ⇒ le défaut, et la valeur est NOMMÉE" "1000|default|0" \
+    "$(_t2636_threshold_probe 0)"
+assert_eq "S12: négatif ⇒ le défaut, et la valeur est NOMMÉE" "1000|default|-5" \
+    "$(_t2636_threshold_probe "-5")"
+assert_eq "S12: illisible ⇒ le défaut, et la valeur est NOMMÉE" "1000|default|mille" \
+    "$(_t2636_threshold_probe mille)"
+assert_contains "S12: et l'événement nomme la valeur fautive entre guillemets" \
+    'plan_size_threshold_invalid PLAN_SIZE_MAX_LOC="mille"' \
+    "$(_t2636_emit_probe "530" "mille")"
+assert_contains "S12: la provenance du seuil est journalisée (doctrine mika#2293)" \
+    "plan_size_threshold_resolved threshold_loc=1000 source=default" \
+    "$(_t2636_emit_probe "530")"
+
+# --- S13 : la règle est injectée au groomeur, et à lui SEUL ----------------
+#
+# Contrôle négatif PORTEUR : le site voisin (`_PR_BODY_CONTAINMENT_RULE`) est
+# inconditionnel dans cette branche, donc la condition se PERD en copiant le
+# voisin. Cet écart ne rendrait aucune décision fausse — il mettrait du bruit
+# dans le prompt de tout pilote d'implémentation (patron mika#2306 T3).
+
+assert_eq "S13: _PLAN_SIZE_RULE_TEMPLATE est définie et non vide" "non-vide" \
+    "$([ -n "${_PLAN_SIZE_RULE_TEMPLATE:-}" ] && echo non-vide || echo vide)"
+_plan_size_rule 2>/dev/null || true
+assert_contains "S13: la règle nomme la section exacte" \
+    '## Taille estimée' "${_PLAN_SIZE_RULE:-}"
+assert_contains "S13: la règle nomme la ligne de total" \
+    'Total estimé' "${_PLAN_SIZE_RULE:-}"
+assert_contains "S13: la règle interpole le seuil en vigueur" "1000" "${_PLAN_SIZE_RULE:-}"
+assert_not_contains "S13: et le gabarit a bien été substitué" \
+    "__PLAN_SIZE_MAX_LOC__" "${_PLAN_SIZE_RULE:-}"
+assert_contains "S13: la règle dit la conduite au-dessus du seuil" \
+    "DÉCOUPE EN PHASES" "${_PLAN_SIZE_RULE:-}"
+assert_contains "S13: et elle dit où la suite est renvoyée" \
+    "ticket de suivi" "${_PLAN_SIZE_RULE:-}"
+assert_contains "S13: la règle cite le ticket par référence" "mika#2636" "${_PLAN_SIZE_RULE:-}"
+
+T2636_PROMPT_GROOM=$(_t2636_inject "dev-groom")
+T2636_PROMPT_PILOT=$(_t2636_inject "dev-pilot")
+assert_contains "S13: la règle est injectée dans le PROMPT pour SKILL=dev-groom" \
+    '## Taille estimée' "$T2636_PROMPT_GROOM"
+assert_not_contains "S13: la règle n'est PAS injectée pour SKILL=dev-pilot" \
+    'RÈGLE DE GROOMING (mika#2636)' "$T2636_PROMPT_PILOT"
+assert_contains "S13: mais dev-pilot reçoit bien la règle inconditionnelle voisine" \
+    "RÈGLE DE DISPATCH (mika#2211)" "$T2636_PROMPT_PILOT"
+# Contrat mika#138, invariant de position 2 : si la première ligne cesse d'être
+# `<repo>#<num>`, la regex ancrée manque, le dispatch tombe en mode free-text
+# et AUCUN worktree n'est créé. Régression de premier ordre.
+assert_eq "S13: la première ligne du PROMPT reste exactement mika#2636" "mika#2636" \
+    "$(printf '%s' "$T2636_PROMPT_GROOM" | head -1)"
+assert_eq "S13: idem sur le chemin dev-pilot" "mika#2636" \
+    "$(printf '%s' "$T2636_PROMPT_PILOT" | head -1)"
+# LA RÉCENCE EST LE SEUL LEVIER d'une règle en fin d'un prompt de 16 KiB : la
+# règle de taille doit être la DERNIÈRE que lit un groomeur.
+T2636_LN_FD=$(printf '%s\n' "$T2636_PROMPT_GROOM" | grep -n 'RÈGLE DE GROOMING (mika#2306)' | head -1 | cut -d: -f1)
+T2636_LN_PS=$(printf '%s\n' "$T2636_PROMPT_GROOM" | grep -n 'RÈGLE DE GROOMING (mika#2636)' | head -1 | cut -d: -f1)
+assert_eq "S13: la règle de taille est la DERNIÈRE règle du prompt du groomeur" "yes" \
+    "$( [ -n "$T2636_LN_FD" ] && [ -n "$T2636_LN_PS" ] && [ "$T2636_LN_PS" -gt "$T2636_LN_FD" ] && echo yes || echo no)"
+assert_eq "S13: et l'injection source suit celle de mika#2306" "yes" \
+    "$(_t2178_after '"$PROMPT" "$_PLAN_SIZE_RULE")' '"$PROMPT" "$_FIRE_DISPOSITION_RULE")')"
+# La garde est lue par POSITION dans les lignes de CODE : une ligne de
+# commentaire ajoutée demain entre les deux déplacerait une fenêtre fixe.
+T2636_SUW_CODE=$(printf '%s\n' "$T2636_SUW_SRC" | grep -v '^[[:space:]]*#')
+T2636_PS_INJ_LN=$(printf '%s\n' "$T2636_SUW_CODE" | grep -n '_PLAN_SIZE_RULE' | head -1 | cut -d: -f1)
+assert_eq "S13: l'injection vit bien dans la branche gardée sur le skill" "yes" \
+    "$( [ -n "$T2636_PS_INJ_LN" ] \
+        && printf '%s\n' "$T2636_SUW_CODE" | sed -n "1,${T2636_PS_INJ_LN}p" \
+             | grep -qF 'if [ "$SKILL" = "dev-groom" ]; then' \
+        && echo yes || echo no)"
+
+# --- S14 : le seuil vit DEUX fois, et c'est le test qui tient R4 -----------
+#
+# Le jugement vit chez l'architecte, dont le prompt est un `system_prompt.md`
+# STATIQUE (aucune interpolation au dispatch). Le seuil vit donc littéral dans
+# les deux prompts architecte et en variable dans dispatch-lib. Doublon assumé,
+# du même type que `_FD_HEADING_RE` / `AC_HEADING_RE`, et tenu par le même
+# moyen. Sans ce test, baisser le défaut shell laisserait les prompts architecte
+# sur 1 000 et la divergence serait MUETTE.
+#
+# Conséquence écrite plutôt que découverte : un opérateur qui baisse
+# `PLAN_SIZE_MAX_LOC` change ce que le groomeur VISE, pas ce que l'architecte
+# REFUSE.
+
+T2636_SHELL_DEFAULT=$(_t2636_field 1 "$(_t2636_threshold_probe __UNSET__)|x|x")
+for t2636_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    t2636_pf="$SCRIPT_DIR/../$t2636_prompt/system_prompt.md"
+    if [ -r "$t2636_pf" ]; then
+        t2636_gate=$(sed -n '/^### Plan-Size Gate/,/^### /p' "$t2636_pf")
+        assert_eq "S14: $t2636_prompt porte un Plan-Size Gate" "non-vide" \
+            "$([ -n "$t2636_gate" ] && echo non-vide || echo vide)"
+        assert_contains "S14: $t2636_prompt — le gate nomme la section exacte" \
+            '`## Taille estimée`' "$t2636_gate"
+        assert_contains "S14: $t2636_prompt — le gate dit qu'un titre numéroté est la section" \
+            '`## 6. Taille estimée`' "$t2636_gate"
+        t2636_lit=$(sed -nE 's/^\*\*Threshold:\*\* ([0-9]+) lines.*/\1/p' "$t2636_pf" | head -1)
+        assert_eq "S14: $t2636_prompt — le littéral de seuil égale le défaut shell" \
+            "$T2636_SHELL_DEFAULT" "$t2636_lit"
+    else
+        assert_eq "S14: $t2636_prompt/system_prompt.md lisible" "lisible" \
+            "fichier introuvable: $t2636_pf"
+    fi
+done
+# Les verdicts sont ceux qui existent déjà : aucun mode d'échec neuf dans la
+# boucle. Première passe ITERATE, seconde passe ESCALATE (sans recours).
+assert_contains "S14: la première passe refuse en ITERATE" "ITERATE" \
+    "$(sed -n '/^### Plan-Size Gate/,/^### /p' "$SCRIPT_DIR/../mika-arch-groom-ticket/system_prompt.md" 2>/dev/null || true)"
+assert_contains "S14: la seconde passe refuse en ESCALATE" "ESCALATE" \
+    "$(sed -n '/^### Plan-Size Gate/,/^### /p' "$SCRIPT_DIR/../mika-arch-second-review/system_prompt.md" 2>/dev/null || true)"
+assert_not_contains "S14: et la seconde passe n'offre PAS d'ITERATE (limite des deux passes)" \
+    "return \`ITERATE\`" \
+    "$(sed -n '/^### Plan-Size Gate/,/^### /p' "$SCRIPT_DIR/../mika-arch-second-review/system_prompt.md" 2>/dev/null || true)"
+
+# --- S15 : les deux rattrapages COMPOSENT, dans l'ordre figé ---------------
+#
+# Si les findings de première passe réclament à la fois `Fire-Disposition` et
+# `Taille estimée`, les deux rattrapages tirent dans la même invocation de
+# `_launch_revise_pilot`, à la suite, chacun avec son propre compteur. Coût :
+# jusqu'à deux pilotes de revise supplémentaires sur un plan qui ignore deux
+# sections. Acceptable (chacun est borné à un, et l'alternative est un ESCALATE
+# sans recours), et NOMMÉ plutôt que découvert. L'ordre est arbitraire et figé
+# ici pour que la composition soit reproductible.
+
+T2636_S15=$(_t2636_revise_probe "$T2636_FINDINGS_BOTH" "no" "never")
+assert_eq "S15: findings réclamant les DEUX sections ⇒ trois invocations du pilote" \
+    "3" "$(_t2636_field 2 "$T2636_S15")"
+assert_contains "S15: le rattrapage Fire-Disposition a tiré" \
+    "fire_disposition_revise_retried" "$T2636_S15"
+assert_contains "S15: le rattrapage de taille a tiré" \
+    "plan_size_revise_retried" "$T2636_S15"
+assert_eq "S15: et l'ordre est Fire-Disposition PUIS Taille estimée" "yes" \
+    "$(_t2178_after '_plan_size_retry_if_section_still_missing "$findings_file" "$plan_path"' \
+                    '_fd_retry_if_section_still_missing "$findings_file" "$plan_path"')"
+
+# --- S16 : CE PLAN est le fixture, et c'est délibéré -----------------------
+#
+# Son §3 documente le format dans un bloc clôturé qui contient un titre
+# `## Taille estimée` ET une ligne `Total estimé : 395 lignes` — l'exemple, pas
+# la mesure. Un lecteur naïf qui prend le premier match rapporterait 395 pour un
+# plan qui en annonce 530 : un nombre plausible, présenté avec autorité, FAUX.
+# Pire, le terme 2 du rattrapage apparierait le titre cité et conclurait que la
+# section est présente — un plan qui DOCUMENTE le format sans le remplir
+# passerait la garde.
+#
+# Les deux lecteurs strippent donc les blocs clôturés d'abord, exactement comme
+# `auto_pull::is_groomed` le fait pour les trois prédicats de callout
+# (mika#2120) : une ligne légitimement citée à l'intérieur d'un fence n'est pas
+# une déclaration.
+#
+# Ce plan est le SEUL fichier de l'arbre à porter le format à la fois en exemple
+# clôturé et en mesure réelle, donc le seul qui distingue un lecteur qui strippe
+# d'un lecteur qui ne strippe pas. Il est en plus AUTO-NETTOYANT : si un futur
+# éditeur retire l'exemple du §3, l'assertion de contre-vacuité rougit et nomme
+# ce qu'elle a perdu. VU ROUGE sans le strip : rend 395.
+
+if [ -r "$T2636_PLAN" ]; then
+    # Contre-vacuité : le fixture porte bien les DEUX formes. Sans ça, un plan
+    # dont l'exemple a disparu rendrait 530 pour la mauvaise raison.
+    assert_eq "S16 contre-vacuité: le fixture porte le titre dans un bloc clôturé" "1" \
+        "$(awk '/^[[:space:]]*```/ { inf = 1 - inf; next } inf' "$T2636_PLAN" \
+            | grep -cE '^##[[:space:]]+Taille estimée' || true)"
+    assert_eq "S16 contre-vacuité: le fixture porte un total d'exemple dans ce bloc" "1" \
+        "$(awk '/^[[:space:]]*```/ { inf = 1 - inf; next } inf' "$T2636_PLAN" \
+            | grep -cE '^Total estimé' || true)"
+    assert_eq "S16: le lecteur de total rend 530, jamais 395" "530" \
+        "$( (source "$DISPATCH_LIB" 2>/dev/null || true; _plan_size_total_loc "$T2636_PLAN") )"
+    assert_eq "S16: et la section est lue PRÉSENTE (titre numéroté, hors fence)" "oui" \
+        "$( (source "$DISPATCH_LIB" 2>/dev/null || true
+             if _plan_size_section_present "$T2636_PLAN"; then printf 'oui'; else printf 'non'; fi) )"
+else
+    assert_eq "S16: le plan de ce ticket est lisible" "lisible" "fichier introuvable: $T2636_PLAN"
+fi
+
+# Un plan qui ne porte le titre QUE dans un fence est lu « section absente ».
+T2636_FENCED_ONLY='# Plan
+
+## Format prescrit
+
+```markdown
+## Taille estimée
+
+Total estimé : 395 lignes
+```
+
+## Livrables
+
+L1 — rien.'
+assert_eq "S16: un titre uniquement dans un fence ⇒ section ABSENTE" "non" \
+    "$(_t2636_present_probe "$T2636_FENCED_ONLY")"
+assert_eq "S16: et le total y est 'absent', jamais 395" "absent" \
+    "$(_t2636_total_probe "$T2636_FENCED_ONLY")"
+# Et le rattrapage tire bien sur ce plan-là : il DOCUMENTE le format sans le
+# remplir, donc l'architecte a raison de l'avoir réclamé.
+T2636_S16B=$(_t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "fenced" "never")
+assert_eq "S16: un plan qui documente le format sans le remplir ⇒ relance" \
+    "2" "$(_t2636_field 2 "$T2636_S16B")"
+# Fence NON TERMINÉ : rien n'est strippé, le corps entier est évalué. Le sens de
+# l'arbitrage est celui de mika#2120 — un faux positif coûte une relance de
+# revise, un faux négatif a coûté quinze heures de boucle.
+assert_eq "S16: un fence non terminé ne strippe RIEN (le corps entier est évalué)" "395" \
+    "$(_t2636_total_probe '# Plan
+
+## Taille estimée
+
+```markdown
+Total estimé : 395 lignes')"
+
+# --- Fire-Disposition, option (a) : les trois tables d'exceptions sont VIDES -
+#
+# Vacuité assertée À L'EXÉCUTION (modèle T2306_ARCH_ASK_ALLOWLIST) : le test
+# rougit donc LE JOUR où une exception est ajoutée, pas seulement quand elle
+# devient stale. Une table vide assertée vide est aussi ce qui distingue
+# « aucune violation » de « le scan ne regarde rien ». Quand l'un de ces scans
+# tire, on ARME le site ; on n'ajoute pas de ligne ici (doctrine mika#2201).
+T2636_SOURCE_SCAN_ALLOWLIST=()
+assert_eq "mika#2636: table d'exceptions des trois scans de source (S8, S10, S11) — zero entries" \
+    "0" "${#T2636_SOURCE_SCAN_ALLOWLIST[@]}"
 
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0

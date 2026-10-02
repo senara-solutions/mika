@@ -84,6 +84,29 @@ Detector-class deliverables: tests, assertions, lints, invariants, validations �
 
 **Gate precedence:** any `ESCALATE` from this gate or the other gates wins over `GROOMED` — emit the union of all F-findings under the `ESCALATE` verdict.
 
+### Plan-Size Gate (mika#2636)
+
+**A revised plan without a `## Taille estimée` section MUST return `ESCALATE` — never `GROOMED`.** (No ITERATE exists at second pass per the two-pass limit.)
+
+**Threshold:** 1000 lines of code outside `docs/`. (This literal is the in-file default of `_plan_size_max_loc` in `skills/bundled/_shared/dispatch-lib.sh`; a divergence between the two is caught by `test-dispatch-lib.sh` S14. The `PLAN_SIZE_MAX_LOC` environment variable changes what the groomer AIMS AT — not what you REFUSE, because this prompt is static and nothing interpolates it at dispatch.)
+
+Why, measured: two consecutive implementation pilots were cut at the turn ceiling on the single criterion of code VOLUME — mika#2161 (≈ 1 470 lines outside `docs/`) and mika#2633 (≈ 1 170) — and neither plan carried a size estimate. The second pass of mika#2161 returned `PLAN_GROOMED` because nothing asked for the size. This gate is the load-bearing backstop; the first-pass Plan-Size Gate plus the author's injection is the convergence mechanism.
+
+The section's canonical form is a table of lines of code per deliverable followed by `Total estimé : <number>` with no thousands separator.
+
+**Decision tree:**
+1. Section present, `Total estimé` at or below the threshold ⇒ gate passes.
+2. Section missing or empty ⇒ `ESCALATE` with a BLOCKING F-finding (the section was required by the first-pass Plan-Size Gate and remains absent).
+3. Section present, total above the threshold, with **no** explicit phase split naming where the remainder goes (a follow-up ticket, or a named later phase) ⇒ `ESCALATE`.
+4. Section present, total above the threshold, with an explicit phase split whose **this-PR scope falls back under the threshold** ⇒ gate passes. Judge the scope of this PR, not the sum of all phases.
+5. Total manifestly not credible against the deliverables the plan enumerates ⇒ `ESCALATE` naming the discrepancy. This is the judgment a `grep` cannot render: the dispatch-side reader sees presence and parsability, never credibility.
+
+**Heading form:** a leading section number does not change the section. The plan producer numbers its headings, so `## 6. Taille estimée` (or `## 6 Taille estimée`) IS the `## Taille estimée` section for every branch of this tree — judge its content, never its numbering (mika#2544).
+
+**Fenced examples are not the section.** A plan that quotes the format inside a fenced code block without filling it in has no section: the quoted heading is documentation, not a declaration. The dispatch-side reader strips fenced blocks before looking (mika#2120 precedent); judge the same way.
+
+**Gate precedence:** any `ESCALATE` from this gate or the other gates wins over `GROOMED` — emit the union of all F-findings under the `ESCALATE` verdict.
+
 ### Output
 
 Return the annotated revised plan content as a single string, followed by a blank line and an explicit verdict:
