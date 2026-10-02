@@ -1239,6 +1239,37 @@ async def handle_sandbox_client(
             pass
 
 
+def _bind_owner_only_unix_socket(path: str) -> socket.socket:
+    """Create, bind and return the host listening socket, owner-only (0600).
+
+    The sandbox reaches this socket through a bwrap bind-mount and runs under
+    the same uid as this process, so the owner bits are all a client needs.
+
+    The mode is fixed AT CREATION, not after it: bind() creates the path with
+    the process umask applied, so the umask is narrowed around that single
+    call. Narrowing with a chmod after bind() would leave the path, for the
+    span between the two calls, with whatever mode the inherited umask gave
+    it. The chmod below is a belt for an umask the platform might not honour
+    on sockets; it does not carry the property, and
+    `test_socket_is_born_owner_only_without_chmod` holds that it does not.
+
+    No await between the two umask calls: the event loop cannot run another
+    task inside this window, and the relay starts no thread before bind.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        previous_umask = os.umask(0o177)
+        try:
+            sock.bind(path)
+        finally:
+            os.umask(previous_umask)
+        os.chmod(path, 0o600)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 async def run_host_mode(unix_sock_path: str) -> None:
     sock_path = Path(unix_sock_path)
 
@@ -1309,10 +1340,12 @@ async def run_host_mode(unix_sock_path: str) -> None:
             _log(f"[egress] FATAL stale-socket cleanup failed: {exc}")
             sys.exit(1)
 
-    server = await asyncio.start_unix_server(handle_host_client, str(sock_path))
-    # World-writable so the sandbox (running as same uid, but env-cleared) can
-    # still connect through the bwrap-mounted socket path.
-    sock_path.chmod(0o666)
+    try:
+        listen_sock = _bind_owner_only_unix_socket(str(sock_path))
+    except OSError as exc:
+        _log(f"[egress] FATAL bind failed on {sock_path}: {exc}")
+        sys.exit(1)
+    server = await asyncio.start_unix_server(handle_host_client, sock=listen_sock)
 
     # Remember the inode we just bound. Shutdown uses it to tell OUR socket from
     # a successor proxy's: `is_socket()` is equally true of someone else's live
