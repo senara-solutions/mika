@@ -3438,6 +3438,87 @@ mod tests {
         }
     }
 
+    /// Contrôle négatif déterministe du cache d'`Interest` (mika#2646).
+    ///
+    /// Deux empoisonnements, mesurés plutôt que supposés :
+    ///
+    /// - **avant** l'installation : `set_default` répare seul, la capture voit
+    ///   l'événement même sans `rebuild_interest_cache`. Le rebuild de
+    ///   l'installateur est donc redondant sur ce chemin — conservé, aligné sur
+    ///   `mika-common/tests/llm_retry.rs`, mais ce n'est pas lui qui porte ;
+    /// - **après** l'installation, depuis un thread sans abonné : le callsite
+    ///   est éteint pour tout le processus, la capture voit **0**, et seul un
+    ///   `rebuild_interest_cache` *postérieur* le rallume. C'est cette fenêtre
+    ///   que le `#[serial_test::serial]` des tests `mika2633_*` ferme : aucun
+    ///   voisin qui atteint `commit_deliverable` ne tourne pendant une capture.
+    ///
+    /// Le corps tourne dans un **processus enfant** réduit à ce seul test :
+    /// l'extinction n'a lieu que si aucun autre abonné n'est vivant dans le
+    /// processus, ce que le binaire de test parallèle ne garantit pas. Sans
+    /// l'enfant, le contrôle serait lui-même probabiliste.
+    #[test]
+    fn mika2646_un_callsite_eteint_apres_installation_exige_un_rebuild() {
+        const ENFANT: &str = "MIKA2646_CONTROLE_ENFANT";
+        if std::env::var_os(ENFANT).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "teams::engine::tests::mika2646_un_callsite_eteint_apres_installation_exige_un_rebuild",
+                    "--test-threads=1",
+                ])
+                .env(ENFANT, "1")
+                .output()
+                .expect("relancer le binaire de test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "l'enfant doit avoir exécuté le contrôle et l'avoir passé\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        fn avant() {
+            tracing::info!(event = "mika2646.avant");
+        }
+        fn apres() {
+            tracing::info!(event = "mika2646.apres");
+        }
+        let compte = |ev: &std::sync::Mutex<Vec<HashMap<String, String>>>, nom: &str| {
+            ev.lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.get("event").map(String::as_str) == Some(nom))
+                .count()
+        };
+
+        avant(); // enregistré sans abonné : `never`
+        let (_guard, events) = capture();
+        avant();
+        assert_eq!(
+            compte(&events, "mika2646.avant"),
+            1,
+            "un empoisonnement antérieur est réparé par l'installation"
+        );
+
+        std::thread::spawn(apres).join().unwrap(); // enregistré sans abonné, après
+        apres();
+        assert_eq!(
+            compte(&events, "mika2646.apres"),
+            0,
+            "un empoisonnement postérieur éteint la capture : sans lui, ce contrôle \
+             ne prouve rien"
+        );
+
+        tracing::callsite::rebuild_interest_cache();
+        apres();
+        assert_eq!(
+            compte(&events, "mika2646.apres"),
+            1,
+            "`rebuild_interest_cache` rallume le callsite"
+        );
+    }
+
     /// Le contrôle négatif : sans rédacteur, aucun `writer_agent` n'est inventé.
     ///
     /// Non nommé par l'AC1 de mika#2646, et à exposition **identique** au test

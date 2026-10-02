@@ -9233,15 +9233,7 @@ mod tests {
         assert!(err.content.contains("not a directory"));
     }
 
-    // mika#2646 — poisonneurs : ces trois tests descendent sur `run_git`,
-    // donc sur la ligne `spawn_and_collect complete` que les tests de capture
-    // de ce module assertent, et ils n'installent aucun abonné. Sans
-    // l'attribut, celui qui atteint le callsite en premier l'éteint pour tout
-    // le processus. Voir le commentaire au-dessus de
-    // `test_spawn_and_collect_emits_complete_log` pour la borne du
-    // recensement.
     #[tokio::test]
-    #[serial_test::serial]
     async fn test_git_ops_preflight_not_a_git_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
@@ -9252,7 +9244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn test_git_ops_preflight_dirty_tree_blocks_rebase() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_str().unwrap();
@@ -9280,7 +9271,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn test_git_ops_fetch_on_local_repo() {
         // Fetch on a repo with no remote will fail — verifies error handling
         let tmp = tempfile::tempdir().unwrap();
@@ -11733,29 +11723,7 @@ mod tests {
         (guard, events)
     }
 
-    // mika#2646 — les quatre appelants de `capture_tracing_events` sont
-    // `#[serial]`, et les poisonneurs connus aussi. Le
-    // `rebuild_interest_cache` de l'installateur ne suffit pas : la fenêtre
-    // qui casse est **postérieure** à l'installation (un voisin qui atteint le
-    // callsite en premier, sans abonné, l'éteint globalement). Voir
-    // `test_helpers::install_capturing_subscriber`.
-    //
-    // RECENSEMENT NON CLOS, et c'est la différence avec `teams/engine.rs`.
-    // Là-bas le callsite capturé n'est atteint que par `commit_deliverable`
-    // sur un texte proposant : population close, recensée, annotée en entier.
-    // Ici le callsite est la ligne `spawn_and_collect complete` (l. ~838),
-    // **un point de passage** que cinq sites de production traversent
-    // (`run_git` l. 925 et quatre `gh`). Tout test atteignant l'un d'eux sans
-    // abonné est un poisonneur. Les trois connus — les tests `git_ops`, qui
-    // descendent sur `run_git` — portent l'attribut ; un quatrième écrit
-    // demain ne le portera pas, et rien ne rougira.
-    //
-    // Ce que ça demanderait de fermer : une assertion de cardinalité sur les
-    // atteignants de ce callsite (motif mika#2496), que ce ticket ne livre
-    // pas. Nommé plutôt que découvert ; précondition du suivi, un rouge
-    // mesuré sur l'une de ces captures.
     #[tokio::test]
-    #[serial_test::serial]
     async fn test_spawn_and_collect_emits_complete_log() {
         let (_guard, events) = capture_tracing_events();
 
@@ -11801,7 +11769,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn test_run_gh_invocation_log_redacts_token() {
         let (_guard, events) = capture_tracing_events();
 
@@ -11848,7 +11815,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn test_spawn_and_collect_handles_large_output() {
         // Verify that spawn_and_collect returns within a reasonable time
         // even when the subprocess produces output exceeding MAX_OUTPUT_LEN.
@@ -11887,7 +11853,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn test_spawn_and_collect_progress_ticker_fires() {
         // With PROGRESS_TICKER_INTERVAL = 100ms in test mode, a 500ms sleep
         // should produce at least 3 progress tick events.
