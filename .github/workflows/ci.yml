@@ -298,6 +298,30 @@ jobs:
       - name: Pin the four named cwd refusals, their order, and their negative controls (mika#2536)
         run: bash scripts/test-cwd-guard.sh
 
+  python-installer-guard-lint:
+    name: Python Installer Guard Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # On 2026-10-02 mika-qa ran `pip install -e . --break-system-packages`
+      # through run_shell while reviewing a claude-pilot PR, rewrote
+      # ~/.local/bin/claude-pilot with the system Python's shebang, and killed
+      # the production launcher for 2 h 45 (mika#2634). Over 48 h, 43 run_shell
+      # calls carried `pip install`; only the 5 carrying that flag could write —
+      # the host's protection held by PEP 668, i.e. by accident, until the agent
+      # learned to opt out of it (mika#2639).
+      # The harness is HERMETIC AND INSTALLS NOTHING: PATH shims and a fake
+      # `<worktree>/.venv/bin/pip` write a sentinel, so a refused form is proven
+      # to have been stopped BEFORE `eval` by the ABSENCE of that sentinel, and a
+      # positive control is proven to have RUN by its presence — without which
+      # "not refused" is indistinguishable from "refused by another block"
+      # (mika#2205). The five AC1 evasion forms are asserted ONE BY ONE, never
+      # neutralised together (mika#2277), and the suite carries its own negative
+      # control: it strips the block from a copy of the handler and checks that
+      # it would go red. Same step-level discipline as cwd-guard-lint above.
+      - name: Pin the run_shell refusal of host-Python installers, negative control included (mika#2639)
+        run: bash scripts/test-python-installer-guard.sh
+
   canonical-tokens-lint:
     name: Canonical Token Lint
     runs-on: ubuntu-22.04
