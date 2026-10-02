@@ -3869,6 +3869,258 @@ SELECT count(*) FROM tasks WHERE result LIKE '%dispatch_grooming_intent_mismatch
 - **La garde d'intention devrait-elle vérifier le numéro d'issue ?** Arbitrage
   assumé, à rouvrir si la halte 5 montre un faux positif.
 
+### Une réponse d'architecte sans disposition lisible est relancée, jamais escaladée (mika#2641)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui lit un `Outcome: ESCALATE` de groom sans
+objection d'architecte — ou qui cherche pourquoi un groom a été relancé — cherche
+dans le voisinage de mika#2545.
+
+- **Le défaut, mesuré le 2026-10-02 (groom de mika#2617).** La 1ʳᵉ passe rend
+  READY ; la 2ᵉ rend une réponse **tronquée côté modèle**. Le fichier de constats
+  préservé contenait, en tout et pour tout, deux phrases de préambule — ni ancre,
+  ni constat, ni ligne de disposition. Le moteur l'a classée
+  `GROOM ESCALATED (terminal)` : groom perdu, et gel de tout re-dispatch par
+  mika#2545, pour un ticket ratifié le matin même.
+
+- **La chaîne, et le maillon décisif.** `_parse_verdict` rend `GROOMED`,
+  `ESCALATE` **ou rien** ; le `case` de seconde passe n'avait que `GROOMED)` et
+  `*)`, donc le `*)` attrapait l'illisible **au même titre** qu'un verdict. Le
+  trail, lui, savait déjà : il écrivait `UNPARSED` à cet instant précis. Le défaut
+  n'était pas une absence d'information, c'était un bras qui la jetait.
+
+- **Trois rectifications que la lecture du code impose au ticket, et c'est le
+  premier livrable.** *(R1)* Le retry que l'AC1 demande **existe déjà**, mais
+  seulement sur la **première** passe (mika#1823, livré le 2026-07-25), et son
+  terminal de double-UNPARSED ne pose **aucun** ESCALATE — il rend `return 1` nu,
+  que l'appelant convertit en population **retryable**. Donc AC1 n'est pas
+  « inventer un retry », c'est « porter le patron mika#1823 sur la seconde
+  passe », ce qui donne le gabarit exact à suivre et garde le changement petit.
+  *(R2)* Le fuzzy ne matche **rien** sur le verbatim (il est en français, et les
+  quatorze paraphrases du tier 2 sont anglaises) : c'est bien le `*)` qui
+  convertissait, vérifié avant de toucher au `case`. *(R3)* `dispatch-lib.sh`
+  n'écrit **aucune** ligne d'audit — c'est du shell, sans accès à la base — et son
+  stderr est **structurellement jeté** sur un dispatch de groom (la boucle est
+  appelée *après* `_run_claude_pilot`, donc hors de la redirection
+  `2>"$STDERR_FILE"`, et un groom sort toujours en 0 donc le tuyau est lâché sans
+  être lu, classe mika#2050). **Toute instrumentation par `echo … >&2` serait
+  inerte**, d'où un couple à deux moitiés.
+
+- **Le piège majeur, et il retourne le correctif contre lui-même s'il est raté.**
+  `mika-arch-second-review` déclare `review_anchor_min_brief_chars = 2000`, le
+  seuil d'armement de la garde d'ancrage mika#2037. Un prompt de relance
+  **au-dessus** l'armerait — et l'architecte, qui n'a pas le brief sous les yeux
+  dans un re-prompt, ne peut produire aucune ancre : le moteur retire alors la
+  disposition ou réécrit la réponse en escalade, et `_parse_verdict` rend
+  ESCALATE. Le correctif produirait exactement le terminal qu'il existe pour
+  empêcher. Le prompt est donc court **par contrat et c'est asserté** (347 octets
+  mesurés contre 2000), avec le seuil **lu depuis le manifeste** plutôt que
+  recopié : un seuil durci sans que le prompt rétrécisse fait rougir.
+
+- **`Outcome: ESCALATE` reste la ligne de disposition, et c'est une décision.**
+  Tentant de poser un autre mot pour éviter le gel de mika#2545 ; **refusé**, et
+  la raison est mesurable : `_measure_cycle_output` P4 énumère exactement quatre
+  valeurs, et un mot hors liste ferait tomber le cycle en `empty`, c'est-à-dire un
+  **faux rouge** sur un run qui a bel et bien produit une décision. Le gel subsiste
+  donc, et c'est voulu par AC2 : deux réponses illisibles d'affilée sont une
+  non-convergence réelle. Ce que ce travail achète est **une tentative de plus
+  avant lui**, et **un motif lisible quand il arrive**.
+
+- **Sur un illisible, la ligne `Verdict:` n'est PAS écrite.** C'est le cœur
+  d'AC2 — « un motif distinct, **et non un verdict** ». `_escalate_groom` prend une
+  quatrième paramètre, la cause, avec un `case` dont le bras par défaut est
+  **bruyant** : il nomme la valeur non reconnue et n'affirme **ni** verdict **ni**
+  motif, les deux erreurs ne coûtant pas la même chose.
+
+  | cause | ce qui est écrit |
+  |---|---|
+  | `verdict` (défaut, comportement d'hier **octet pour octet**) | `GROOM ESCALATED (terminal): mika-arch escalated at <stage>.` + `Verdict: ESCALATE — human review required.` |
+  | `architect_unreadable` | `… answered at <stage> without a parsable verdict line.` + `Groom-halt-cause: architect_unreadable <stage> — …` ; **aucune ligne `Verdict:`** |
+
+- **Une `ITERATE` explicite n'est pas un illisible non plus.** `_parse_verdict`
+  n'a délibérément pas de bras ITERATE en seconde passe, donc une
+  `Disposition: ITERATE` y rend la même chaîne vide qu'une troncature. AC1
+  l'exclut nommément : `_second_pass_explicit_iterate` (lu ancré en début de
+  ligne) la route **sans relance** vers le terminal `verdict` d'avant, octet pour
+  octet. Une ITERATE **citée en prose** dans un préambule garde sa relance.
+  Leçon : `docs/solutions/logic-errors/une-chaine-vide-de-parseur-fusionne-plusieurs-populations.md`.
+
+- **Un échec de transport n'est JAMAIS un illisible, ni un `.content` vide.**
+  « N'a pas répondu » et « a répondu sans disposition » restent deux populations,
+  et le fail-safe va dans le sens du rejeu dans les deux cas — la première par le
+  `return 1` existant, la seconde par la relance. Fondre le `.content` vide ici
+  effacerait le diagnostic de budget qui a coûté trois tentatives et quatre
+  tickets à établir (mika#2296). Les quatre contrôles négatifs sont restés verts
+  **avant comme après** le correctif.
+
+- **La relance porte la session**, comme mika#1823 et pour la même raison : elle
+  ne re-demande pas la revue, elle demande à l'architecte de **compléter sa propre
+  réponse**. Sans la session la demande serait inintelligible — le portage y est la
+  condition de correction du mécanisme, pas sa contamination (le contrat mika#2305
+  est étendu de 1+3 à 1+5 appels, avec cette décision écrite à son site).
+
+#### Surfaces opérateur
+
+```bash
+# 1. Une réponse illisible a-t-elle été relancée, puis escaladée ?
+grep groom_architect_unreadable "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{repo, issue, stage, task_id}'
+
+# 2. CONTRÔLE POSITIF — des grooms tournent-ils seulement ?
+grep -cE 'Outcome: (PLAN_GROOMED|ESCALATE)' "$MIKA_SPIRIT_LOG_FILE"
+```
+
+```sql
+-- La population neuve, par étape. `after_value` porte l'étape, `target_key` le
+-- ticket : rectification assumée au § 10 du plan, dont le SQL groupait sur
+-- `target_key` en annonçant « par étape » — les deux ne peuvent pas être vrais
+-- ensemble.
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'groom_architect_unreadable'
+ GROUP BY 1 ORDER BY 2 DESC;
+
+-- Et par ticket, ce qu'un opérateur cherche réellement.
+SELECT target_key, count(*) FROM audit_events
+ WHERE tool_name = 'groom_architect_unreadable'
+ GROUP BY 1 ORDER BY 2 DESC;
+
+-- Le producteur, lu directement sur `tasks.result` — la surface de la moitié
+-- shell, lisible même si le lecteur moteur n'est pas déployé.
+SELECT id, created_at, substr(result, 1, 300) FROM tasks
+ WHERE result LIKE 'GROOM ESCALATED%' AND result LIKE '%Groom-halt-cause: architect_unreadable%'
+ ORDER BY created_at DESC;
+
+-- CONTRÔLE NÉGATIF — les escalades EXPLICITES restent-elles dominantes ?
+SELECT count(*) FROM tasks
+ WHERE result LIKE '%Verdict: ESCALATE — human review required%';
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `groom_architect_unreadable` | WARN | **non vide, faible** | chaque ligne est une passe qui a échoué **deux fois** à rendre un verdict, **après** avoir été relancée. Ce n'est pas une objection de l'architecte |
+| `Groom-halt-cause:` dans `tasks.result` | — | même population | la moitié shell ; elle suffit seule à la lecture SQL |
+| `Verdict: ESCALATE — human review required` | — | **doit rester dominant** | le contrôle négatif : si cette population s'effondre au profit de la neuve, le prédicat mord trop large |
+| `<verdict>-after-retry` au trail | — | **non vide** | la mesure que la relance **sert** à quelque chose |
+| une étape autre que `second-pass-after-{ready,iterate}` | WARN | **vide** | la première passe n'est pas dans ce périmètre (D1) ; une occurrence dit qu'elle y est entrée |
+
+**Coût daté, nommé plutôt que découvert :** les escalades **antérieures** à ce
+déploiement portent toutes `Verdict: ESCALATE — human review required`, y compris
+celles qui étaient en réalité des illisibles — dont celle du 2026-10-02 sur
+mika#2617. **Elles ne sont pas réécrites** : les réécrire rendrait faux ce qu'elles
+ont dit quand elles ont été écrites (motif mika#2361). Un `GROUP BY` qui enjambe le
+déploiement compare donc deux vocabulaires, et la population `architect_unreadable`
+démarre à zéro **par construction**, jamais parce que le défaut a cessé.
+
+#### Sondes post-déploiement, et leurs cinq haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340) : `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir, **et** le `mika-spirit` servi doit porter le lecteur —
+> sans ces deux vérifications, chacune des sondes décrit le binaire d'hier. Ce
+> sont des **gestes d'opérateur** sur l'hôte : la base n'est pas montée dans le
+> bac à sable de dispatch.
+
+**S1 — le défaut fondateur ne se rejoue pas** (première troncature réelle de
+seconde passe). Attendu : le trail porte `UNPARSED` puis un verdict
+`-after-retry`, le groom **converge**, et **aucune** ligne
+`groom_architect_unreadable`.
+*Halte 1 — un ESCALATE terminal part quand même, sans relance au trail :* **ne pas
+élargir le prédicat par réflexe.** Établir d'abord le déploiement, puis lire
+**lequel** des deux sites a servi — `second-pass-after-ready` et
+`second-pass-after-iterate` sont deux `case` distincts, et un seul corrigé se lit
+exactement comme deux.
+
+**S2 — la relance SERT (30 jours).** Le compte des `-after-retry` au trail doit
+être **supérieur** à celui de `groom_architect_unreadable`.
+*Halte 2 — ils sont égaux :* la relance ne récupère **jamais**. **Ne pas ajouter
+une seconde relance** — la famille des budgets d'un coup est délibérée. Vérifier
+d'abord la taille du prompt de relance sur le binaire servi, puis lire si le
+moteur a retiré la disposition (`grep Disposition-Withheld`).
+
+**S3 — attribution (30 jours).** Croiser `groom_architect_unreadable` avec
+`brief_size_overrun` (mika#2474) : si les illisibles tombent majoritairement sur
+les briefs du décile supérieur, la cause est la **taille**, et c'est un ticket de
+suivi sur la géométrie — **pas** sur ce prédicat.
+*Halte 3 — répartition indépendante de la taille :* c'est un **résultat**, pas un
+échec. La cause est le modèle ou le transport, et ce travail se referme sur sa
+mesure.
+
+**S4 — contrôle négatif de bruit (7 jours).** Aucun `groom_architect_unreadable`
+sur une passe dont l'architecte a rendu un verdict explicite.
+*Halte 4 — une occurrence :* faux positif, et son coût est une relance de trop
+**plus** un motif faux dans `tasks.result`. **Désarmer d'abord** (revert du terme),
+diagnostiquer ensuite.
+
+**S5 — la population de D1 (30 jours).** Les double-UNPARSED de **première** passe
+convergent-ils au rejeu ? `GROOM_LOOP_FAILURE_REASON` les nomme (« disposition
+UNPARSED after 2 attempts »).
+*Halte 5 — ils ne convergent jamais :* la prémisse de D1 est fausse, le rejeu est
+stérile, et l'uniformisation devient un ticket de suivi **avec ce compte**.
+
+**Halte transverse — les deux sondes muettes.** Zéro `groom_architect_unreadable`
+**et** zéro `-after-retry` ne prouve **rien** : il faut qu'une seconde passe ait
+tourné depuis le déploiement. Vérifier le contrôle positif avant toute conclusion.
+*Une garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas cesser la troncature.** Il rend la perte **rattrapable** (une
+  relance) et **comptable** (un motif distinct). La cause vit chez le modèle et
+  dans la taille du brief, et S3 est ce qui la dimensionne.
+- **Il ne supprime pas le gel de mika#2545** sur un double-illisible. AC2 veut un
+  ESCALATE, donc le gel reste — simplement après deux tentatives au lieu d'une, et
+  avec un motif que l'opérateur peut lire. Le ré-armement est le geste documenté de
+  mika#2545 (`remove` → `add` du label `ready`).
+- **Il ne rattrape pas l'incident du 2026-10-02 sur mika#2617.** Son `tasks.result`
+  porte `Verdict: ESCALATE` et **rien ne rétro-estampille** : fabriquer une ligne
+  décrivant une relance qui n'a pas eu lieu est l'inverse de ce que ce travail
+  défend. La sonde est la **prochaine** occurrence.
+- **Il ne couvre pas la première passe** — D1, délibérément. Elle satisfait déjà
+  AC1 (elle relance une fois et ne convertit jamais en ESCALATE terminal), son
+  double-UNPARSED reste **retryable** donc mika#2545 ne gèle pas, et le rejeu part
+  sur une session architecte **neuve** donc n'est pas stérile. La convertir serait
+  un durcissement non demandé qui gèlerait des tickets que le rejeu récupère
+  aujourd'hui. Coût nommé : son motif reste `GROOM_LOOP_FAILURE_REASON`, pas une
+  ligne d'audit. Précondition de suivi : la sonde S5.
+- **Il ne livre pas le rapport du commentaire opérateur** (« appels architecte du
+  jour : aboutis, coupés et tronqués »). Les **coupés** sont déjà mesurés par
+  `llm_call_attempt` (mika#2331) et `a2a_turn_failed` (mika#2522) ; ce qui manquait
+  était le tiers **tronqués**, et c'est exactement ce que la ligne d'audit de ce
+  ticket crée. Le **joint** des trois, par agent et par jour, est un livrable de
+  reporting distinct — **ticket de suivi**, dont la précondition est que la
+  population neuve soit non vide.
+- **Il ne donne aucun puits au stderr de `_iterate_groom_loop`** (R3). Réel, nommé,
+  adjacent — et le fermer demande de décider où `dispatch-lib` écrit après
+  `_run_claude_pilot`, c'est-à-dire un changement de substrat d'exécution.
+  **Ticket de suivi** ; c'est aussi pourquoi aucune instrumentation de ce travail
+  n'y passe.
+- **Résidu OUVERT, trouvé en revue et non fermé ici :** le prompt de relance
+  passe sous le seuil d'armement de la garde d'ancrage, donc un
+  `Verdict: GROOMED` nu **au tour de relance** n'est pas attesté par mika#2037.
+  Le piège ci-dessus ne pesait que le sens inverse. Le fermer renverse D7/V4 du
+  plan (relance courte par contrat) : décision routée, pas prise ici.
+- **Il ne durcit pas `_parse_verdict`.** Rien n'est ajouté ni retiré à ses cinq
+  tiers. Élargir le fuzzy pour attraper un préambule français serait l'inverse du
+  remède : il faudrait **deviner** un verdict là où il n'y en a pas.
+- **Résidu nommé, à population vide aujourd'hui :** le tier 0 de `_parse_verdict`
+  (`Disposition-Withheld: REVIEW-ANCHOR-MISSING`) rend **rien**, donc il
+  atteindrait ce chemin et la relance re-demanderait un verdict avec un prompt trop
+  court pour armer la garde d'ancrage. Ce qui l'en empêche est que depuis
+  mika#2338 le tier 0 est le **repli** : le tier 0b (qui rend ESCALATE, donc ne
+  passe pas par la relance) tire dès que le skill déclare un `ESCALATE` de la
+  famille retirée, ce que le manifeste livré fait. C'est une **prémisse**, pas une
+  garantie du prédicat, et une assertion la rend fausse bruyamment si quelqu'un
+  retire cette déclaration.
+- **Il n'ajoute aucune variable d'environnement, et c'est une décision.** Précédent
+  le plus proche, mika#2627 : un désarmement par variable sur un chemin de
+  convergence serait un désarmement par coquille. Le geste de désarmement est un
+  **revert**, et le coût d'un faux positif (une relance de trop, bornée à une) le
+  supporte largement.
+- **Il rend le champ lisible, pas surveillé.** Les seuls instruments sont les greps
+  et les requêtes ci-dessus, et **leur silence ne prouve rien tant que personne ne
+  les exécute**.
+
 ### Un bump Rust se vérifie en compilant, jamais en affirmant (mika#2565)
 
 **Une variable d'environnement, une branche de garde.** Cette entrée est ici
