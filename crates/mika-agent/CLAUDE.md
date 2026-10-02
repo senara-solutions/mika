@@ -2860,79 +2860,51 @@ Config, the four named `cwd` refusals, the operator query and the four halts: ro
 ### The refusal is universal BY SITE, never by enumeration (mika#2639 AC4)
 
 `run_shell` refuses to install into the host's Python environment — the fourth
-lexical scan of `shell-exec/handlers/run.sh`, after the `gws`/`gh` scan
-(mika#1957) and the egress containment (mika#1991), before the shared-checkout
-guard (mika#2449). Measured producer: mika-qa, through this handler, on
-2026-10-02 at 01:26:08/15/18Z — `pip install -e . -q --break-system-packages`
-against a claude-pilot worktree, whose `[console_scripts]` entry point rewrote
+lexical scan of `shell-exec/handlers/run.sh`, after mika#1957 and mika#1991,
+before the shared-checkout guard (mika#2449). Measured producer: mika-qa ran
+`pip install -e . --break-system-packages` against a claude-pilot worktree on
+2026-10-02; its `[console_scripts]` entry point rewrote
 `~/.local/bin/claude-pilot` and killed every pilot at launch for 2 h 45
-(mika#2634). Over 48 h, **43** `run_shell` calls from mika-qa carried
-`pip install`, 19 of them aimed at claude-pilot; **5** carried
-`--break-system-packages` and could write. The other 38 were refused by Gentoo's
-externally-managed pip (PEP 668) — the host's protection held **by accident**
-until the agent learned to opt out of it.
+(mika#2634).
 
-**AC4 is answered by the SITE, and that is the deliverable.** Which agents carry
-`shell-exec`:
+**AC4 is answered by the SITE.** Which agents carry `shell-exec`:
 
 | allowlist | site | agent |
 |---|---|---|
 | `DEFAULT_AGENT_SKILL_ALLOWLIST` | `mika-common/src/home.rs` | `mika` personal / customer (tier `default`) |
-| `DEFAULT_IDENTITY` (TOML mirror of the above; `home.rs` tests pin the equality) | `mika-common/src/home.rs` | idem |
+| `DEFAULT_IDENTITY` (TOML mirror; `home.rs` tests pin the equality) | `mika-common/src/home.rs` | idem |
 | `MIKA_DEV_IDENTITY` | `well_known_agents.rs` | mika-dev |
 | `MIKA_QA_IDENTITY` | `well_known_agents.rs` | mika-qa |
 
-**Absent** from `FAMILY_AGENT_SKILL_ALLOWLIST`, so the `family` and `champion`
-tiers do not carry it; absent from `MIKA_TEST_IDENTITY` (whose allowlist is the
-single sentinel `__mika_test_no_skills__`) and from `MIKA_ARCH_SKILL_ALLOWLIST`,
-which carries the three `mika-arch-*` review skills and nothing else.
+Absent from `FAMILY_AGENT_SKILL_ALLOWLIST` (tiers `family`, `champion`),
+`MIKA_TEST_IDENTITY` and `MIKA_ARCH_SKILL_ALLOWLIST`. The plan's fifth row,
+`MIKA_RELAY_IDENTITY`, exists nowhere in `crates/` and is dropped; § *Skills
+System* still names it (pre-existing staleness, out of scope).
 
-**One correction to this census, made by reading the tree rather than inheriting
-it.** mika#2639's plan listed a fifth row, `MIKA_RELAY_IDENTITY`. That constant
-exists **nowhere** in `crates/` — mika-relay is no longer a `WELL_KNOWN_AGENTS`
-entry, as the § *Three-Layer Memory Model* note already says of mika-prime and
-mika-relay. The row is dropped rather than repeated: a census is only worth
-having while every line of it is checkable, and the surrounding § *Skills
-System* still names that constant (a pre-existing staleness, out of scope here
-and flagged rather than silently half-fixed).
+**The real population is wider than those rows**, and that decided the site: an
+`identity.toml` with no `[skills].allowlist` is a no-op in
+`apply_identity_allowlist`, so every bundled skill — `shell-exec` included — is
+active (mika#1596 class). A per-agent refusal would be false by construction;
+the table is documentation, never a mechanism.
 
-**But the real population is wider than those four declarations, and that is
-what decided the site of the fix.** An `identity.toml` with no
-`[skills].allowlist` block is a **no-op** in `apply_identity_allowlist`, so
-**every** bundled skill is active — `shell-exec` included. That is the mika#1596
-class, and since mika#2027 a *missing* identity file fails closed while a
-*malformed* one for a user-defined agent still falls back to a permissive
-`Identity::default()`. A refusal **enumerated per agent** would therefore be
-false by construction. A refusal inside `run.sh` is universal **by
-construction**: the table above is documentation, never a mechanism.
+**Two motifs, one definition site** (`_refuse_python_installer`, stderr +
+`exit 1`): `host_installer` (installer token + install subcommand, after
+venv-qualified forms are neutralised) and `host_target_flag`
+(`--break-system-packages`/`--user`/`--target`/`--prefix`/`--system` **and** an
+install verb **and** a named installer — two terms refused
+`./configure --prefix=/usr && make install`).
 
-**Two motifs, a wire format with a single definition site**
-(`_refuse_python_installer`): `host_installer` (an installer token plus an
-install subcommand, after venv-qualified forms are neutralised) and
-`host_target_flag` (`--break-system-packages` / `--user` / `--target` /
-`--prefix` / `--system` in conjunction with an install verb **and** a named
-installer in the raw command — the three-term conjunction, where two terms
-refused `./configure --prefix=/usr && make install`). Refusal is on **stderr**
-with `exit 1`, the channel of this file's two elders; `execute_exec` combines
-both streams on a non-zero exit, so the token reaches `tool_calls.output`
-either way.
+**`tmux` stays uncovered.** `tmux/handlers/create_session.sh` sends a
+model-supplied `$COMMAND` through `send-keys`, outside `run.sh`, and `tmux` is
+in mika-dev's and mika-qa's allowlists. Population unmeasured; follow-up gated
+on root probe S4.
 
-**`tmux` is a second channel to the same host, and it stays uncovered.**
-`templates/skills/tmux/handlers/create_session.sh` runs
-`tmux send-keys -t "$NAME" -l -- "$COMMAND"` with a model-supplied `$COMMAND`,
-outside `run.sh` and therefore outside its four scans — and `tmux` is in both
-mika-dev's and mika-qa's allowlist. Population **unmeasured** (the database is
-not mounted in the dispatch sandbox). Named as an open channel and carried as a
-follow-up with its precondition, never presented as covered.
-
-The substitute is written into `qa-review/system_prompt.md` next to **Never
-compile inside the review turn** (mika#2276) — `uv run` or a venv rooted under
-the worktree. That half expresses the intent; **this block is what holds it**
-(`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`). Harness
-`scripts/test-python-installer-guard.sh` (`make test-python-installer-guard`, CI
-job `python-installer-guard-lint`); operator surfaces, expected regimes, the
-four probes and their five halts: root `CLAUDE.md` § *`shell-exec` refuse
-d'installer dans l'environnement Python de l'hôte*.
+The substitute (`uv run`, or a venv under the worktree) is in
+`qa-review/system_prompt.md` next to **Never compile inside the review turn**;
+the prompt expresses the intent, this block holds it. Harness
+`scripts/test-python-installer-guard.sh`; operator surfaces and probes: root
+`CLAUDE.md` § *`shell-exec` refuse d'installer dans l'environnement Python de
+l'hôte*.
 
 ## MCP (Model Context Protocol) Client
 

@@ -1848,83 +1848,38 @@ l'opérateur qui lit un `REFUS (python-installer-guard, …)` cherche dans ce
 voisinage.
 
 - **Le défaut, mesuré le 2026-10-02** (trace `e9432d40-bdff-11f1-837b-27cfaa9b231b`).
-  mika-qa, par `run_shell` (skill `shell-exec`, **hors bwrap**), pendant la revue
-  de la PR claude-pilot cpp#273, à 01:26:08/15/18Z :
-  `pip install -e . -q --break-system-packages`. `pip install -e` d'un dépôt dont
-  `[console_scripts]` déclare `claude-pilot` **réécrit
-  `~/.local/bin/claude-pilot`** avec le shebang du Python système : chaque pilote
-  meurt au lancement. Trace disque datée de 01:26:20Z (`dist-info`,
-  `INSTALLER=pip`, `direct_url = file:///tmp/tmp.Eqlt2PdYwK`) ; **2 h 45 de rail
-  mort** (mika#2634).
+  mika-qa a lancé par `run_shell` (**hors bwrap**), en revue de cpp#273,
+  `pip install -e . -q --break-system-packages` ; le `[console_scripts]` de
+  claude-pilot a **réécrit `~/.local/bin/claude-pilot`** avec le shebang du
+  Python système : **2 h 45 de rail mort** (mika#2634). Sur 48 h, 43 `run_shell`
+  de mika-qa portaient `pip install` ; seuls les 5 avec ce drapeau ont pu
+  écrire, les 38 autres butant sur PEP 668. La protection tenait **par
+  accident**.
 
-- **Ce n'est pas isolé, et la protection tenait par ACCIDENT.** Sur 48 h, **43**
-  `run_shell` de mika-qa contiennent `pip install`, dont 19 visant claude-pilot ;
-  seuls les **5** portant `--break-system-packages` ont pu écrire. Les 38 autres
-  ont été refusés par le pip système de Gentoo (PEP 668) — *pas par conception,*
-  jusqu'à ce que l'agent apprenne à contourner la protection. Le commentaire
-  opérateur du 2026-10-02T08:32:30Z ajoute une seconde forme mesurée : la revue
-  de cpp#280 a lancé `uv pip install -e .` à 08:20:37Z.
-
-- **Le refus vit dans `run.sh`, et c'est le site qui répond à l'AC4.** Quatrième
-  scan lexical du fichier, après mika#1957 et mika#1991, avant mika#2449. Trois
-  raisons, par ordre de poids : *(1)* `run.sh` est le fichier unique que tout
-  agent portant `shell-exec` exécute, donc le refus est universel **sans
-  énumération** — et une énumération par agent serait **fausse par
-  construction**, un `identity.toml` sans bloc `[skills].allowlist` étant un
-  no-op qui active *tous* les skills bundled (classe mika#1596) ; *(2)* AC1 exige
-  les formes d'évasion de mika#1957 (`sh -c`, `eval`, chemin absolu, `;`,
-  `$( )`), que seule la forme lexicale sur **toute la chaîne** donne ; *(3)* même
-  site, même posture, même contrat de commentaire que ses deux aînés. Le
-  recensement des agents, la population ouverte et le canal `tmux` non couvert :
-  `crates/mika-agent/CLAUDE.md` § *The refusal is universal BY SITE*.
-
-- **Pourquoi pas dans `BUILD_COMMAND_FAMILY` (mika#2423).** Son prédicat est
-  **conditionné au budget** (`if timeout_secs >= BUILD_FLOOR_SECS { return
-  None; }`) et exempte par construction les handlers `long_running` et
-  `detaches_command`. Or `pip install` dans l'environnement de l'hôte n'est pas
-  plus sûr sous 300 s que sous 30 s : l'armer là couvrirait la population mesurée
-  **par accident** (shell-exec déclare `timeout_secs = 30`) et laisserait
-  découvert tout handler au budget plus large — et le jour où quelqu'un relève ce
-  budget, la garde pip s'évapore **sans qu'un seul test rougisse** (classe
-  mika#2205). Les deux gardes **composent** ; aucune n'est la réparation de
-  l'autre. mika#2423 arbitre un **budget**, celle-ci un **containment**.
-
-- **Le prédicat INVERSE la direction évidente**, et c'est ce qui porte tout le
-  reste : plutôt que d'exprimer « un chemin qui n'est pas un venv » (inexprimable
-  en ERE sans lookbehind), l'étape 1 remplace les installateurs venv-qualifiés
-  par une sentinelle, et les étapes suivantes scannent **ce qui reste**. La
-  sentinelle ne contient aucune sous-chaîne `pip`.
-
-- **Deux corrections que le prédicat a imposées au plan**, chacune mesurée :
-  *(a)* le **guillemet fermant** est optionnel après le binaire, sans quoi
-  `"/usr/bin/pip" install foo` passe — la garde était contournable d'un
-  caractère ; *(b)* le drapeau visant l'hôte exige **trois** termes en
-  conjonction (drapeau **et** verbe d'installation **et** un installateur nommé
-  dans la commande brute) là où le plan en portait deux : à deux termes,
-  `./configure --prefix=/usr && make install` est refusé, deux énoncés vrais dont
-  aucun n'est une installation Python. Le cas motivant du plan
-  (`"$W/.venv/bin/pip" install --user -e .`, qui écrit dans `~/.local` malgré son
-  pip de venv) reste couvert.
+- **Le site répond à l'AC4.** Quatrième scan lexical de
+  `templates/skills/shell-exec/handlers/run.sh`, après mika#1957 et mika#1991,
+  avant mika#2449 : le refus vaut pour **tout** agent qui porte `shell-exec`,
+  sans énumération. Le pourquoi (et pourquoi pas `BUILD_COMMAND_FAMILY`,
+  mika#2423, dont le prédicat est conditionné au budget) est au commentaire du
+  bloc ; le recensement des agents, la population ouverte et le canal `tmux` non
+  couvert : `crates/mika-agent/CLAUDE.md` § *The refusal is universal BY SITE*.
+  Harnais : `make test-python-installer-guard` (job CI
+  `python-installer-guard-lint`), contrôle négatif inclus.
 
 ### Surfaces opérateur
 
-Aucun événement de journal neuf, et c'est une décision : `run.sh` est un
-sous-processus shell sans accès base, et son stderr d'avant-`eval` atterrit déjà
-dans `tool_calls.output` — sur un exit non nul, `execute_exec` combine stdout et
-stderr et préfixe `Exit code: 1`. Inventer un sink de journal que personne ne
-lirait reproduirait le défaut du Signal M (mika#2050). Les trois scans voisins du
-même fichier n'en ont pas non plus.
+Aucun événement de journal neuf : le stderr d'avant-`eval` atteint déjà
+`tool_calls.output` (`execute_exec` combine les deux flux sur exit non nul et
+préfixe `Exit code: 1`).
 
 ```sql
--- 1. La garde a-t-elle mordu, et sur quel agent ? (geste opérateur, sur l'hôte)
---    NON ancré en tête : l'exécuteur préfixe « Exit code: 1 ».
+-- 1. La garde a-t-elle mordu, et sur quel agent ? NON ancré en tête.
 SELECT agent_id, count(*) FROM tool_calls
  WHERE tool_name = 'run_shell'
    AND output LIKE '%REFUS (python-installer-guard, mika#2639)%'
  GROUP BY 1 ORDER BY 2 DESC;
 
--- 2. Par motif — deux LIKE explicites, jamais un substr sur un offset calculé :
---    une requête opérateur doit rester vraie quand le préfixe change de longueur.
+-- 2. Par motif — deux LIKE explicites, jamais un substr sur un offset calculé.
 SELECT
   sum(output LIKE '%mika#2639): host_installer%')   AS host_installer,
   sum(output LIKE '%mika#2639): host_target_flag%') AS host_target_flag
@@ -1936,118 +1891,40 @@ SELECT count(*) FROM tool_calls WHERE tool_name = 'run_shell';
 
 | motif | régime attendu | lecture |
 |---|---|---|
-| `host_installer` | **non vide et DÉCROISSANT** | chaque ligne est une écriture dans l'environnement de l'hôte arrêtée. Non vide les premiers jours **par construction** : 38 des 43 commandes mesurées échouaient déjà sur PEP 668 et seront désormais refusées — ce n'est **pas** une tempête de faux positifs, c'est le trafic mesuré rendu visible |
-| `host_target_flag` | proche de zéro | une forme venv portant `--user`/`--target`/… : le modèle a la bonne recette et le mauvais drapeau |
-| un même agent portant un flot soutenu après 7 jours | **anomalie** | le prompt ne l'atteint pas : lire le seed (`cat ~/.mika/skills/.manifest-writer`) **avant** de toucher au prédicat |
-| une ligne sur un `grep` de prose | faux positif **nommé** | le contournement est `grep -rn 'pip[ ]install'`, que le corps du refus rappelle ; **ne pas rétrécir la frontière arrière**, elle ferme `pip install;` |
+| `host_installer` | **non vide et DÉCROISSANT** | les premiers jours il porte le trafic mesuré (les 38 commandes que PEP 668 arrêtait), puis le substitut de `qa-review` doit le tarir — ce n'est pas une tempête de faux positifs |
+| `host_target_flag` | proche de zéro | une forme venv portant `--user`/`--target`/… : bonne recette, mauvais drapeau |
+| flot soutenu d'un même agent après 7 jours | **anomalie** | le prompt ne l'atteint pas : lire `~/.mika/skills/.manifest-writer` **avant** de toucher au prédicat |
+| une ligne sur un `grep` de prose | faux positif **nommé** | contournement `grep 'pip[ ]install'`, rappelé par le corps du refus ; ne pas rétrécir la frontière arrière, elle ferme `pip install;` |
 
-### Sondes post-déploiement, et leurs cinq haltes
+### Sondes post-déploiement, et leurs haltes
 
-> **Préalable.** `crates/mika-agent/templates/skills/` est une projection du
-> **binaire**, pas du checkout : `cat ~/.mika/skills/.manifest-writer` doit
-> porter le sha qu'on vient de bâtir. **Sans cette vérification, chacune des
-> sondes ci-dessous décrit le binaire d'hier** (classe mika#2340). Et ce sont des
-> **gestes d'opérateur sur l'hôte** : la base n'est pas montée dans le bac à
-> sable de dispatch.
+> **Préalable.** `templates/skills/` est une projection du **binaire** :
+> `cat ~/.mika/skills/.manifest-writer` doit porter le sha qu'on vient de bâtir,
+> sinon chaque sonde décrit le binaire d'hier (classe mika#2340).
 
-**S1 — le rejeu du défaut fondateur** (première revue QA d'une PR claude-pilot,
-la prochaine étant cpp#279). Attendu : une ligne `host_installer`, et
-`~/.local/bin/claude-pilot` **inchangé**.
+- **S1 — rejeu du défaut** (prochaine revue QA d'une PR claude-pilot). Attendu :
+  une ligne `host_installer` et `sha256sum < ~/.local/bin/claude-pilot`
+  identique avant/après. *Halte : le digest a bougé* — établir **par quelle
+  porte** (`tmux`, script du dépôt, évasion nommée, geste humain) avant
+  d'élargir le prédicat.
+- **S2 — décroissance sur 30 jours.** *Halte : plateau* — le prompt n'atteint
+  pas ce chemin ; vérifier le seed avant de toucher au bloc.
+- **S3 — bruit sur 7 jours** : aucun refus sur un `uv run pytest`. *Halte : une
+  occurrence* — désarmer d'abord (revert du bloc), diagnostiquer ensuite.
+- **S4 — canal `tmux`** (30 jours), précondition du suivi :
+  `SELECT id, created_at, substr(input,1,200) FROM tool_calls WHERE tool_name LIKE 'tmux%' AND (input LIKE '%pip install%' OR input LIKE '%uv pip%' OR input LIKE '%pipx install%');`
+  *Halte : des lignes* — le suivi s'ouvre avec ce compte. Zéro est un résultat,
+  pas une preuve de fermeture.
+- **Halte transverse.** Zéro refus **et** zéro `run_shell` ne prouve rien :
+  requête 3 d'abord (mika#2205).
 
-```bash
-sha256sum < ~/.local/bin/claude-pilot | cut -d' ' -f1   # AVANT, jamais le contenu
-stat -c '%s %y' ~/.local/bin/claude-pilot
-# … la revue …
-sha256sum < ~/.local/bin/claude-pilot | cut -d' ' -f1   # APRÈS — doit être identique
-```
-
-*Halte 1 — le digest a bougé.* **Ne pas élargir le prédicat par réflexe.**
-Établir d'abord **par quelle porte** l'écriture est passée : `tmux` (canal nommé
-non couvert), un script du dépôt, une évasion nommée (découpage de token,
-assemblage par variable, payload base64), ou un geste humain. Les quatre remèdes
-diffèrent, et un seul est dans ce dépôt.
-
-**S2 — la garde mord et le prompt prend** (30 jours). Le compte `host_installer`
-doit **décroître** : les premiers jours il porte le trafic mesuré, puis le
-substitut de `qa-review` doit le tarir.
-*Halte 2 — plateau plutôt que décroissance.* C'est la mesure que le prompt
-n'atteint pas ce chemin, pas que le prédicat est trop large. Vérifier le seed du
-prompt bundled **avant** de toucher au bloc.
-
-**S3 — contrôle négatif de bruit** (7 jours). Aucun refus sur un `run_shell`
-nominal, et en particulier aucun sur un `uv run pytest`.
-*Halte 3 — une occurrence.* C'est un faux positif, et son coût est une
-vérification QA impossible. **Désarmer d'abord** (revert du bloc), diagnostiquer
-ensuite : une commande légitime refusée est un arbitrage de prédicat, pas un
-seuil à régler.
-
-**S4 — le canal `tmux`** (30 jours), précondition du suivi :
-
-```sql
-SELECT id, created_at, substr(input, 1, 200) FROM tool_calls
- WHERE tool_name LIKE 'tmux%'
-   AND (input LIKE '%pip install%' OR input LIKE '%uv pip%' OR input LIKE '%pipx install%')
- ORDER BY created_at DESC;
-```
-
-*Halte 4 — elle rend des lignes.* Le canal est réel et mesuré : le suivi s'ouvre
-**avec ce compte**, et c'est lui qui décide si l'extraction d'une aide partagée
-est due. Zéro ligne est un **résultat** — il dit que le modèle n'emprunte pas
-cette route — et non une preuve qu'elle est fermée.
-
-**Halte transverse — les deux sondes muettes.** Zéro refus **et** zéro
-`run_shell` ne prouve **rien** : vérifier le contrôle positif (requête 3) avant
-toute conclusion. *Une garde que personne n'a exercée se lit exactement comme une
-garde qui marche* (mika#2205).
-
-### Ce que ce travail n'achète PAS
-
-- **Il ne rattrape pas l'incident du 2026-10-02.** `~/.local/bin/claude-pilot` a
-  été réécrit et restauré à la main ; **rien ici ne rétro-estampille** — la sonde
-  est la **prochaine** revue de PR claude-pilot.
-- **Il ne ferme pas le canal `tmux`**, ni les trois évasions nommées (découpage
-  de token, assemblage par variable, payload base64) : la garde lit une ligne de
-  commande, pas ce qu'elle exécute. Ce qui est retiré au modèle est la route
-  qu'il a **effectivement** prise, 43 fois en 48 h.
-- **Il ne met pas `shell-exec` sous bac à sable.** C'est le mur (mika#2141) et la
-  seule fermeture complète de la classe ; `run.sh` tourne hors bwrap et l'y
-  mettre est un arbitrage de confinement qui appartient à son propre ticket.
-- **Il ne borne pas ce que `pip` fait quand il est légitimement appelé** dans un
-  venv : un venv jetable sous `/tmp` reste un venv jetable, et la garde ne
-  vérifie pas qu'il est jetable.
-- **Il n'ajoute aucun compteur et aucun événement de journal.** Le seul
-  instrument neuf est le motif dans `tool_calls.output`, et **son silence ne
-  prouve rien tant que personne n'exécute les sondes**.
-- **Il ne corrige aucun prompt fautif, parce qu'il n'y en avait pas.** Recherche
-  exhaustive de `pip install` / `pipx install` / `uv pip` sur `skills/bundled/`,
-  `crates/mika-agent/templates/skills/`, `.claude/`, `docs/`, `scripts/`,
-  `Makefile`, `.github/` : **une seule** occurrence, dans un plan historique,
-  prescripteur d'aucun chemin. Les 43 commandes mesurées ont été **composées par
-  le modèle dans un vide de prescription** : il n'y a pas d'instruction fautive à
-  réécrire, il y a une recette **absente** à poser (même rectification que
-  mika#2565 R1 et mika#2290). Dire l'inverse serait revendiquer une correction
-  qui n'a pas de sujet.
-
-### Hors périmètre, délibérément
-
-- **`BUILD_COMMAND_FAMILY` / `refuse_uncontainable_build`** (mika#2423) :
-  inchangés, population disjointe, motif du refus écrit ci-dessus.
-- **`guard-shared-checkout` et ses deux modes** (mika#2107 / mika#2449) :
-  inchangés, aucune ligne touchée — le nouveau bloc est **avant** l'appel, pour
-  la raison que les deux scans existants écrivent déjà : on ne paie pas un
-  sous-processus pour une commande qu'on va refuser.
-- **Le canal `tmux`** — **suivi**, précondition : la sonde S4.
-- **Une convention `_shared/` pour `templates/skills/`** (motif
-  `_shared/cwd-guard.sh`, mika#2536) : `templates/skills/` n'en a pas, et un seul
-  handler en a besoin aujourd'hui. YAGNI — et le jour où `tmux` en aura besoin,
-  l'extraction sera le livrable de **ce** ticket-là.
-- **Le bac à sable de `shell-exec`** (mika#2141) — le mur, son propre ticket.
-- **La cause amont côté claude-pilot** : qu'un `pip install -e` d'un dépôt
-  déclarant `[console_scripts] claude-pilot` écrase le lanceur de production est
-  une propriété du **paquet**, pas de ce dépôt. `senara-solutions/claude-pilot`.
-- **La sentinelle de détection de mika#2634 (AC5)** : reste le filet, inchangée.
-- **Le classifieur de permissions** : aucun relâchement, aucune ligne — le ticket
-  le dit lui-même, c'est un **durcissement** d'outil.
+**Ce que ça n'achète pas :** ni le canal `tmux`, ni les évasions nommées
+(découpage de token, assemblage par variable, base64), ni le bac à sable de
+`shell-exec` (mika#2141, le mur). Il n'y avait aucun prompt fautif à corriger :
+les 43 commandes ont été composées par le modèle dans un vide de prescription,
+et `qa-review` reçoit une recette **absente**. La cause amont (un
+`pip install -e` qui écrase le lanceur) est une propriété du paquet
+claude-pilot.
 
 Optional (callback delivery bounds — mika#2179):
 - **The failure this bounds.** A `resume_agent` turn that errors on a callback used to write a `warn!` and nothing else: no counter, no audit event, no `next_fire_at`. The row stayed `status='completed'`, so `get_undelivered_callback_tasks` re-selected it on the very next 60s scan (`DB_SCAN_INTERVAL_TICKS`), and each attempt held the agent lock for up to `AGENT_TOTAL_TIMEOUT_SECS` (300s). The only stop condition was the LLM eventually succeeding. Measured on the night of 2026-09-03/04: 19 transport timeouts in four hours against callback `800d739f`, delivered **5 h 06** after it completed — an hour after its own parent (`ready-label: mika#2140`) had already died `phantom_aged_out` waiting for that return.
