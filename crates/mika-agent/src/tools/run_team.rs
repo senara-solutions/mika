@@ -197,24 +197,48 @@ impl Tool for RunTeamTool {
         }
 
         match result {
-            Ok(run) => {
-                if let Some(ref deliverable) = run.deliverable {
-                    Ok(ToolOutput::success(format!(
-                        "Team '{}' completed (status: {}). Deliverable:\n\n{}",
-                        run.team_name, run.status, deliverable
-                    )))
-                } else {
-                    Ok(ToolOutput::success(format!(
-                        "Team '{}' finished (status: {}). No deliverable produced.",
-                        run.team_name, run.status
-                    )))
-                }
-            }
+            Ok(run) => Ok(format_run_result(&run)),
             Err(e) => Ok(ToolOutput::error(format!(
                 "Team '{}' failed: {}",
                 team_name, e
             ))),
         }
+    }
+}
+
+/// The tool result the **calling agent** reads at the end of a run.
+///
+/// A withheld deliverable (mika#2633) gets an agent-register line rather than
+/// the neutral line itself: that line is written for the PERSON, and its "Ask
+/// again and it will be re-written" hands the agent exactly one affordance — a
+/// fresh 15-minute run on the same goal, unbounded, while it believes it is
+/// following an instruction. The engine has already spent its single re-write.
+/// The comparison is against the one constant the engine poses, so the two
+/// cannot drift. Names no workaround (mika#2520).
+fn format_run_result(run: &crate::teams::types::TeamRun) -> ToolOutput {
+    if run.deliverable.as_deref() == Some(crate::teams::engine::TEAM_DELIVERABLE_WITHHELD) {
+        return ToolOutput::success(format!(
+            "Team '{}' completed (status: {}), but its deliverable was WITHHELD by the \
+             engine: it proposed opening access to testimony-grade data, which the \
+             non-transit doctrine refuses, and the single re-write the engine allows \
+             did not remove the proposal. NOTHING from the team was passed on; the \
+             person has already received a neutral line saying so. Re-running the \
+             same goal will most likely reproduce the refusal, so do not relaunch the \
+             team for it. You may tell the person what the team CAN do without \
+             opening such access.",
+            run.team_name, run.status
+        ));
+    }
+    if let Some(ref deliverable) = run.deliverable {
+        ToolOutput::success(format!(
+            "Team '{}' completed (status: {}). Deliverable:\n\n{}",
+            run.team_name, run.status, deliverable
+        ))
+    } else {
+        ToolOutput::success(format!(
+            "Team '{}' finished (status: {}). No deliverable produced.",
+            run.team_name, run.status
+        ))
     }
 }
 
@@ -322,5 +346,53 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Only orchestrator agents"));
+    }
+
+    fn completed_run(deliverable: &str) -> crate::teams::types::TeamRun {
+        let mut run: crate::teams::types::TeamRun = serde_json::from_value(serde_json::json!({
+            "run_id": "run-2633",
+            "team_name": "dev-team",
+            "goal": "produce a report",
+        }))
+        .unwrap();
+        run.status = crate::teams::types::RunStatus::Completed;
+        run.deliverable = Some(deliverable.to_string());
+        run
+    }
+
+    /// Constat de revue (agent-native W1, mika#2633) — la ligne neutre est
+    /// écrite pour la **personne** (« Ask again and it will be re-written »).
+    /// Rendue telle quelle à l'agent appelant, elle lui donne une seule
+    /// affordance : relancer `run_team` sur le même but, c'est-à-dire un run
+    /// multi-agents complet de 15 minutes que rien ne borne, en croyant suivre
+    /// l'instruction reçue. L'agent doit lire un fait dans son registre : le
+    /// livrable a été retenu par le moteur, la personne a reçu la ligne neutre,
+    /// et relancer reproduira probablement le refus.
+    #[test]
+    fn mika2633_lagent_appelant_lit_la_retenue_dans_son_registre() {
+        let out = format_run_result(&completed_run(
+            crate::teams::engine::TEAM_DELIVERABLE_WITHHELD,
+        ));
+
+        assert!(!out.is_error);
+        assert!(
+            !out.content.contains("Ask again"),
+            "l'impératif adressé à la personne ne doit pas atteindre l'agent \
+             appelant : {}",
+            out.content
+        );
+        assert!(out.content.contains("WITHHELD"), "{}", out.content);
+        assert!(out.content.contains("non-transit"), "{}", out.content);
+    }
+
+    /// Le contrôle négatif : un livrable ordinaire est rendu tel quel, octet
+    /// pour octet comme avant.
+    #[test]
+    fn mika2633_un_livrable_ordinaire_est_rendu_tel_quel() {
+        let out = format_run_result(&completed_run("Le rapport demandé."));
+        assert_eq!(
+            out.content,
+            "Team 'dev-team' completed (status: completed). Deliverable:\n\nLe rapport demandé."
+        );
     }
 }

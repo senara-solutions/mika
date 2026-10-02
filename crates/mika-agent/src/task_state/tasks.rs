@@ -412,6 +412,33 @@ pub struct IssueDispatchChild {
     pub child: DispatchChild,
 }
 
+/// The oldest active `self_dev` task referencing one issue (mika#2161 AC3).
+///
+/// Returned by `Database::find_active_self_dev_task_for_issue`, whose boolean
+/// sibling `has_active_self_dev_task_for_issue` is derived from it so one SQL
+/// site answers the question — two queries free to diverge is the
+/// `grooming_marker` lesson (mika#2158), paid once already in this very module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightSelfDevTask {
+    pub task_id: String,
+    /// `pending` or `in_progress`. Carried because it says **which clock
+    /// started**: a `pending` row has not been dispatched, so its age is measured
+    /// from its *creation*, which is a different fact from "dispatched N minutes
+    /// ago" and must not be reported as one.
+    pub status: String,
+    /// `COALESCE(fired_at, created_at)` — the first instant the engine began
+    /// working under this row, falling back to its creation when it has not
+    /// fired.
+    ///
+    /// The fallback is load-bearing rather than defensive: `fired_at` was
+    /// **never stamped on the parent row** before mika#2335, so an operator
+    /// reading a live dispatch's parent read "never fired" (the 2026-09-15
+    /// incident). Reporting an age from `created_at` and *saying so* through
+    /// [`Self::status`] is honest; reporting nothing would make AC3
+    /// unanswerable on every pre-mika#2335 row.
+    pub in_flight_since: String,
+}
+
 /// Statuses on which a task no longer has a pilot to kill (mika#2335).
 ///
 /// Deliberately a positive list of terminal states rather than `!= pending &&

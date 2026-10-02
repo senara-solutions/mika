@@ -1695,29 +1695,73 @@ impl Database {
         Ok(n)
     }
 
+    /// The **oldest** active (pending/in_progress) self_dev task referencing this
+    /// issue, or `None` when none does (mika#2161 U3).
+    ///
+    /// `issue_url` is the canonical issue URL (e.g.
+    /// `https://github.com/senara-solutions/mika/issues/123`). The match is a
+    /// prefix `LIKE` so the `?phase=groom` suffix variant is covered — same rule
+    /// and same reason as [`Self::find_dispatch_children_for_issue_url`].
+    ///
+    /// # Why the oldest, and not the newest or an arbitrary one
+    ///
+    /// The diagnostic question AC3 asks is *"for how long"*, so the row that
+    /// answers it is the one that has been waiting longest. `ORDER BY
+    /// COALESCE(fired_at, created_at) ASC LIMIT 1`.
+    ///
+    /// # One SQL site, and why that matters here specifically
+    ///
+    /// [`Self::has_active_self_dev_task_for_issue`] is derived from this
+    /// (`.map(|o| o.is_some())`) rather than keeping its own `COUNT(*)`. The two
+    /// would have had identical `WHERE` clauses maintained in two places, which
+    /// is the shape `grooming_marker` had to close once (mika#2158): a predicate
+    /// written twice is a predicate that can disagree with itself, and the
+    /// divergence shows up as a feeder that counts a ticket in flight while the
+    /// message about it says there is none. The equivalence is pinned by test
+    /// rather than argued.
+    pub fn find_active_self_dev_task_for_issue(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+    ) -> Result<Option<InFlightSelfDevTask>> {
+        let prefix = format!("{}%", issue_url);
+        let found = self
+            .conn
+            .query_row(
+                "SELECT id, status, COALESCE(fired_at, created_at) FROM tasks
+                 WHERE agent_id = ?1
+                   AND source = 'self_dev'
+                   AND status IN ('pending', 'in_progress')
+                   AND reference_url LIKE ?2
+                 ORDER BY COALESCE(fired_at, created_at) ASC
+                 LIMIT 1",
+                params![agent_id, prefix],
+                |r| {
+                    Ok(InFlightSelfDevTask {
+                        task_id: r.get(0)?,
+                        status: r.get(1)?,
+                        in_flight_since: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(found)
+    }
+
     /// True if an active (pending/in_progress) self_dev task references this issue
     /// (mika#1824 D6). Used by the Phase 2 stuck-ready reconciler to skip tickets
     /// that already have in-flight work of their own.
     ///
-    /// `issue_url` is the canonical issue URL (e.g.
-    /// `https://github.com/senara-solutions/mika/issues/123`). The match is a
-    /// prefix `LIKE` so the `?phase=groom` suffix variant is covered.
+    /// Derived from [`Self::find_active_self_dev_task_for_issue`] since mika#2161
+    /// — see there for why the question has one SQL site. The contract is
+    /// unchanged: existence, nothing else.
     pub fn has_active_self_dev_task_for_issue(
         &self,
         agent_id: &str,
         issue_url: &str,
     ) -> Result<bool> {
-        let prefix = format!("{}%", issue_url);
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1
-               AND source = 'self_dev'
-               AND status IN ('pending', 'in_progress')
-               AND reference_url LIKE ?2",
-            params![agent_id, prefix],
-            |r| r.get(0),
-        )?;
-        Ok(count > 0)
+        self.find_active_self_dev_task_for_issue(agent_id, issue_url)
+            .map(|found| found.is_some())
     }
 
     /// Get all pending user-visible tasks (reminders and callbacks, excludes heartbeat/reflection).

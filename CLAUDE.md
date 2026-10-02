@@ -566,7 +566,7 @@ garde 5h.
   | 2 | `create_reminder` + `action_type = "send_message"` | `action_config = {"text": …}`, tiré plus tard par le dispatcher | **oui** |
   | 3 | `create_scheduled_task` + `action_type = "send_message"` | idem | **oui**, mais **inerte** — voir ci-dessous |
   | 4 | `delegate_task` | passe le sender au délégué, n'envoie **rien** lui-même | non — couvert **transitivement** (le délégué appelle `send_message`) |
-  | 5 | `run_team` | notification de fin de run qui enveloppe `run.deliverable` — la **sortie LLM** de l'agent rédacteur (`TeamEngine::deliver`), ou le repli workspace | **non couvert — canal ouvert nommé.** Le recensement du plan le disait « texte du moteur » : c'est faux (revue de code). Bon site de garde : le livrable dans `TeamEngine::deliver` — suivi |
+  | 5 | `run_team` | notification de fin de run qui enveloppe `run.deliverable` — la **sortie LLM** de l'agent rédacteur (`TeamEngine::deliver`), la réponse de la porte conversationnelle, ou le repli workspace | **oui, depuis mika#2633** — gardé **en amont** au point de pose (`TeamEngine::commit_deliverable`), donc avant la notification *et* avant la persistance. Le recensement du plan le disait « texte du moteur » : c'était faux (revue de code). Voir § *Le livrable d'équipe passe la garde* |
   | 6 | le dispatcher du tir planifié | **consommateur** du différé | non — voir « au moment de la création » |
 
   **Rectification au recensement du ticket, trouvée en lisant le code :** la
@@ -709,12 +709,13 @@ pré-déploiement ; le remède est un geste d'opérateur (`mika tasks cancel`), 
   envoyé, et **rien n'est rétro-estampillé** : la sonde est la **prochaine**
   occurrence.
 - **Il ne couvre pas les rows planifiées avant le déploiement.**
-- **Il ne couvre pas le livrable d'équipe (`run_team`).** Le livrable est du
-  texte du modèle envoyé tel quel à la personne ; le recensement du plan l'avait
-  classé « texte du moteur » à tort. Le bon site de garde est
-  `TeamEngine::deliver` (un site couvre les chemins sync et async) — **suivi
-  nommé**, dont la précondition est de décider ce que devient un livrable refusé
-  (re-rédaction une fois, puis ligne neutre « livrable retenu »).
+- **Il ne couvrait pas le livrable d'équipe (`run_team`) — mika#2633 le ferme.**
+  Le livrable est du texte du modèle envoyé tel quel à la personne ; le
+  recensement du plan l'avait classé « texte du moteur » à tort. La fermeture
+  n'est pas au site que ce ticket désignait (`TeamEngine::deliver`, qui *produit*
+  et ne *pose* pas) mais au point de **pose**, `TeamEngine::commit_deliverable` —
+  et il y avait **quatre** écrivains du livrable, pas un. § *Le livrable
+  d'équipe passe la garde* ci-dessous.
 - **Il ne ferme pas RK5** (la proposition étalée sur deux appels), nommé
   ci-dessus avec sa précondition de suivi.
 - **Il n'ajoute aucune ligne `audit_events` et aucun compteur.** Les seuls
@@ -731,6 +732,211 @@ pré-déploiement ; le remède est un geste d'opérateur (`mika tasks cancel`), 
 
 Raisonnement complet, les trois gardes structurelles et leurs allowlists livrées
 vides : `crates/mika-agent/CLAUDE.md` § 5h-bis.
+
+### Le livrable d'équipe passe la garde, au point de pose (mika#2633)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui lit un livrable d'équipe remplacé par
+une ligne neutre cherche dans le voisinage de 5h-bis.
+
+- **Le trou que ça ferme, et mika#2627 le nommait déjà.** Son recensement
+  exemptait `run_team` sur la prémisse « son texte vient du moteur ». C'est
+  **faux** : la notification de fin de run enveloppe `run.deliverable`, soit la
+  sortie LLM de l'agent rédacteur, soit la réponse de la porte conversationnelle,
+  soit le repli workspace. mika#2627 a corrigé la justification sur cinq sites et
+  nommé `run_team` **canal ouvert** ; la fermeture est ce ticket.
+
+- **Trois rectifications que la lecture du code impose au ticket, et elles sont
+  le premier livrable.** *(R1)* `TeamEngine::deliver` **n'est pas** le site
+  unique : il *produit* un texte, et **quatre** sites le *posent* —
+  `deliver_phase`, les deux bras `GateOutcome::Conversational` d'`execute_inner`,
+  et le bras `NoDelegation` d'`apply_delegation_gate`. Garder dans `deliver()`
+  seul couvre **un site sur quatre**. *(R2)* Le site juste est le point de
+  **pose**, et il doit précéder la persistance : `finalize_and_shutdown` écrit
+  `run.deliverable` en base et `teams::prompt` le ressert au run suivant en
+  `<context type="history_deliverable">` — garder à la notification aurait l'air
+  de satisfaire « un site, deux chemins » et laisserait la proposition en base.
+  *(R3)* L'AC1 nomme `detect_`, et la doctrine maison interdit de l'appeler nu ;
+  mais le helper `check_testimony_access_proposal` prend un `&ToolContext` et
+  rend un `ToolOutput`, que `TeamEngine` n'a pas — et un livrable refusé ne se
+  répare **ni par un renvoi ni par un découpage**. Le geste juste est donc
+  d'**étendre le recensement** de lecteurs de deux à trois, et de compenser par
+  un scan neuf sur le **format de fil** de la télémétrie. *Un recensement n'est
+  pas une allowlist : on y ajoute, on n'y exempte pas.*
+
+- **La disposition (c), décision opérateur (MPC, 2026-10-02) :** une re-rédaction
+  à un seul retry, puis une ligne neutre.
+
+  | provenance | détection positive ⇒ |
+  |---|---|
+  | `writer` | **une** re-rédaction (nomme la doctrine, modèle du re-prompt 5h) ; re-test ; encore sale, vide, ou en erreur ⇒ ligne neutre |
+  | `workspace_fallback` | ligne neutre directement — le rédacteur a dépassé son enveloppe, le texte est le repli workspace (#1128) et **aucun rédacteur ne l'a écrit** (constat de revue) |
+  | `conversational_gate` | ligne neutre directement |
+  | `no_delegation` | ligne neutre directement |
+
+  La re-rédaction ne couvre que `writer` parce qu'un rédacteur n'existe qu'au
+  site 1 : sur les sites 2 et 3 le texte est une réponse de décomposition et
+  `apply_delegation_gate` y pratique **déjà** un retry renforcé, et sur le site 4
+  le run est déjà `FailedNoDelegation` et le texte n'atteint jamais la personne
+  (il est gardé quand même parce qu'il atteint le **prochain run**).
+
+- **Le canal ne peut firer que sur un rédacteur qui a résisté à 5h, et c'est une
+  mesure, pas une déduction.** Le tour de re-rédaction est un tour d'agent
+  complet : son EndTurn traverse la garde 5h, qui détecte la même proposition et
+  re-prompte avec **son propre** budget d'un coup. Il faut donc deux réponses
+  proposantes pour que le tour rende un texte sale. Les deux gardes composent
+  sans se dupliquer, et le régime attendu zéro du canal `team_deliverable` en est
+  **doublement** protégé. Épinglé dans les deux sens par
+  `mika2633_v2_une_redaction_encore_sale_donne_la_ligne_neutre` et son contrôle
+  `…_une_proposition_corrigee_par_5h_ne_retient_pas_le_livrable`.
+
+- **La ligne neutre est un livrable, jamais `None`** —
+  `teams::notification` rend déjà « completed (no deliverable produced) » sur
+  `None`, ce qui serait **faux** (un livrable a été produit, il a été retenu) et
+  rendrait un refus indistinguable d'un run sans livrable. **Un seul registre**,
+  contre le motif mika#2290/#2292 : ces deux tickets ont livré deux corps parce
+  que `FAMILY_SOUL` interdit le jargon d'infrastructure, et ici **il n'y a rien à
+  abandonner** — « équipe » et « livrable » sont du français ordinaire. Mesure à
+  l'appui : `run_team` est conditionné à `agents.len() > 1 || !teams.is_empty()`
+  et un tenant famille est mono-agent, donc la population famille est vide en
+  pratique.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Un livrable d'équipe a-t-il été arrêté ? Le grep est une SOUS-CHAÎNE et
+#    rend aussi le résidu `…_uncorrected` : le `select` sur `.event` est porteur.
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.event == "guard.testimony_access_proposal"
+                  and .channel == "team_deliverable")
+           | {team_run_id, team_name, deliverable_source, writer_agent, matched_subject}'
+# `writer_agent` est ABSENT hors `deliverable_source = "writer"`. Pas d'`agent_id` sur
+# ce canal : la portée de la base d'équipe n'est pas l'agent qui agit.
+
+# 2. La re-rédaction a-t-elle échoué ? (résidu)
+grep guard.testimony_access_proposal_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel == "team_deliverable") | {team_run_id, deliverable_source}'
+
+# 3. CONTRÔLE POSITIF — la garde 5h et les canaux outils tournent-ils encore ?
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel != "team_deliverable") | .channel' | sort | uniq -c
+```
+
+```sql
+-- La ligne neutre réellement servie, par run. `team_runs` porte `team_id` et
+-- `started_at`, pas `team_name` ni `created_at` : le nom vient de `teams`.
+SELECT r.id, t.name AS team_name, r.status, r.started_at
+  FROM team_runs r JOIN teams t ON r.team_id = t.id
+ WHERE r.deliverable LIKE 'The team finished its work, but its deliverable%'
+ ORDER BY r.started_at DESC;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `channel = "team_deliverable"` | WARN | **zéro** | chaque ligne est un livrable arrêté avant la personne **et** avant la base |
+| `_uncorrected`, `deliverable_source = "writer"` | WARN | **zéro** | la re-rédaction a échoué **après** que 5h a aussi échoué : lire le prompt servi au rédacteur **avant** de toucher au prédicat |
+| `team_deliverable_rewrite_skipped_no_budget` | WARN | **zéro** | la re-rédaction n'a pas été tentée faute de place avant le mur de 900 s du run : la ligne neutre est posée au lieu d'un run coupé en plein tour qui aurait persisté « no deliverable produced ». Couvre le mur du run, **pas** celui de l'outil `run_team` synchrone (300 s), que le moteur ne connaît pas — limite nommée |
+| `_uncorrected`, `workspace_fallback` \| `conversational_gate` \| `no_delegation` | WARN | **zéro** | nominal par conception : ces provenances n'ont pas de re-rédaction |
+| un même `team_run_id` portant une ligne nominale **et** son `_uncorrected` | WARN | **nominal** | c'est la forme attendue de tout refus servi en ligne neutre — **systématique** pour `workspace_fallback`, `conversational_gate` et `no_delegation`, qui n'ont pas de re-rédaction. Ne pas la lire comme une anomalie |
+| un même `team_run_id` portant **deux lignes sous le même nom d'événement** | WARN | **anomalie** | un seul retry est prévu, donc deux lignes nominales signifient un second site de pose — et `mika2633_les_quatre_sites_de_pose_passent_par_le_commit` aurait dû l'empêcher de compiler |
+| `channel != "team_deliverable"` | — | **non vide** | le contrôle positif : zéro partout ne prouve rien |
+
+**Coût daté, nommé plutôt que découvert :** les lignes antérieures au déploiement
+de #2630 ne portent **pas** de champ `channel`, et ne sont pas réécrites (motif
+mika#2361). Une requête `select(.channel == "end_turn")` qui enjambe ce
+déploiement-**là** rend vide ; la requête juste de part en part est
+`select(.channel == null or .channel == "end_turn")`. Ce travail n'ajoute aucune
+borne de ce genre : il ajoute une **valeur** au champ existant — **et** il pose
+ce champ sur la ligne résidu de 5h, qui n'en portait aucun, ce que le scan V7 a
+mesuré.
+
+#### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** Ces sondes décrivent le **binaire servi**. Après `make deploy`,
+> établir que le `mika-spirit` qui tourne porte le correctif avant toute
+> conclusion (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte :
+> la base n'est pas montée dans le bac à sable de dispatch.
+
+**S1 — le défaut fondateur ne se rejoue pas** (premier run d'équipe dont le
+livrable tente). Attendu : une ligne `channel = "team_deliverable"`, et **aucune**
+proposition reçue par la personne ni écrite dans `team_runs.deliverable`.
+*Halte 1 — aucune ligne alors qu'une proposition est partie :* **ne pas élargir le
+prédicat par réflexe.** Lire d'abord le contrôle positif (grep 3) : zéro ligne des
+deux côtés ne prouve rien — *une garde que personne n'a exercée se lit exactement
+comme une garde qui marche* (mika#2205). Puis établir **par quel site** le texte a
+été posé : s'il y en a un cinquième, le scan de pose unique aurait dû l'empêcher
+de compiler, et c'est **lui** qu'il faut lire.
+
+**S2 — la re-rédaction aboutit (30 jours).** `_uncorrected` avec
+`deliverable_source = "writer"` reste vide.
+*Halte 2 — non vide :* le rédacteur ne se corrige **ni** sous 5h **ni** sous la
+demande de re-rédaction. **Ne pas ajouter un second retry** — la famille #953
+tient un budget d'un coup, délibérément, et un second serait la boucle qu'elle
+existe pour éviter. Le levier est la **formulation** de la demande, et c'est un
+ticket sur le corps, pas sur une détection.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus sur un livrable
+ordinaire, et en particulier aucun sur un livrable qui **décline** un accès.
+*Halte 3 — une occurrence :* faux positif, et son coût change de nature par
+rapport à #2630 — là c'était un message qui ne partait pas, ici c'est **un run
+d'équipe entier dont le livrable est jeté**. **Désarmer d'abord** (revert de
+l'appel au prédicat dans `commit_deliverable`), diagnostiquer ensuite.
+
+**S4 — la population hors périmètre.** La requête SQL ci-dessus, une fois, plus
+`SELECT deliverable FROM team_runs ORDER BY started_at DESC LIMIT 10` pour lire ce
+que `history_deliverable` ressert.
+*Halte 4 — une proposition y figure :* ce sont les livrables **pré-déploiement**.
+Le remède est un geste d'opérateur sur la base, **pas** un élargissement de la
+garde à la lecture.
+
+**Halte transverse — les deux sondes muettes.** Zéro refus **et** zéro run
+d'équipe ne prouve rien : il faut qu'un run ait tourné depuis le déploiement.
+Vérifier `SELECT count(*) FROM team_runs WHERE started_at > '<déploiement>'` avant
+toute conclusion.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne rend pas la surface *propose* structurelle.** Le refus lit un texte
+  sortant : il **rattrape avant la transmission**, il ne rend pas l'agent
+  incapable de formuler la proposition. La doctrine maison est *construis
+  l'incapacité, ne promets pas la retenue* (mika#1991), et elle **n'est pas
+  applicable ici** — il n'existe aucune capacité à retirer, le livrable est du
+  texte en langue naturelle. Le dire est la seule façon de ne pas vendre une
+  garantie qui n'existe pas.
+- **Il ne rattrape aucun livrable déjà transmis**, et **rien n'est
+  rétro-estampillé** : la sonde est la **prochaine** occurrence.
+- **Il ne couvre pas les `run.deliverable` déjà persistés** avant ce
+  déploiement, qui continueront d'être resservis en `history_deliverable`.
+  Population bornée (10 derniers runs, `load_team_runs_for_prompt`), nommée, non
+  couverte.
+- **Il ne couvre pas la ligne `messages` que `deliver()` écrit avant la pose.**
+  `TeamEngine::deliver` persiste sa sortie brute sous l'`agent_id` du rédacteur
+  (session `team-<run_id>`) **avant** `commit_deliverable`, donc un livrable
+  refusé peut encore atteindre le résumé de compaction de **cet agent**. Vecteur
+  distinct, rayon de souffle distinct : le fermer demande de modifier
+  `deliver()`, que ce travail tient inchangé à dessein. Borné (une ligne, un
+  agent, une session) et **nommé** plutôt que découvert.
+- **Il ne ferme pas RK5** (la proposition étalée sur deux phrases dont aucune ne
+  porte les deux couches) : le prédicat segmente par phrase, et l'élargir
+  rouvrirait le faux positif que la segmentation existe pour éviter. Hérité de
+  mika#1960, ni élargi ni modifié.
+- **Il ne touche ni la garde 5h, ni le prédicat, ni le re-prompt, ni le budget
+  d'un coup** — seule l'enum de canal gagne une variante, et la ligne résidu de
+  5h gagne le champ `channel` qu'elle ne portait pas.
+- **Il n'ajoute aucune ligne `audit_events` et aucun compteur**, en cohérence
+  explicite avec 5h et #2630 : la famille #953 est journal-only. Les seuls
+  instruments sont les greps et la requête ci-dessus, et **leur silence ne prouve
+  rien tant que personne ne les exécute**. **Asymétrie avec #2627, à connaître :**
+  là, chaque refus laissait une ligne durable dans `tool_calls.output` (le refus
+  *était* un résultat d'outil) ; ici il n'y en a aucune. La requête SQL ne voit
+  que le **résidu** retenu — un refus dont la re-rédaction a abouti laisse en base
+  un texte propre, indiscernable d'un run qui n'a jamais rien proposé. Cette
+  population n'existe que dans `$MIKA_SPIRIT_LOG_FILE`, et elle est donc
+  invisible à un agent, qui ne lit pas ce journal.
+- **Il n'ajoute aucune variable d'environnement, et c'est une décision.**
+  Précédent le plus proche : mika#2627, qui n'en a pas non plus, pour la raison
+  qu'il écrit — *un désarmement par variable sur un chemin de doctrine serait un
+  désarmement par coquille*. Le geste de désarmement est un **revert**.
 
 ### La doctrine matérielle est un fait posé ; sa butée est topique (mika#2292)
 
@@ -3966,7 +4172,87 @@ Optional (plan-callout predicate — mika#2120):
 - **Canonical form for writers: `docs/plans/<file>`, no prefix.** The prefix is not merely redundant, it is wrong (see the normalization above); the callout lives on the issue of the repo concerned, and the repo is given by the issue, not by the path. The readers stay permissive **for history**, not to legitimize two forms.
 
 Optional (auto-feeder ready-pool maintenance):
-- `MIKA_AUTO_FEEDER_MIN_READY` — Target size of the **pullable**-ready pool the auto-feeder (Phase 0 of `auto_pull_groomed_ticket`) keeps topped up (mika#1863, default `3`, clamp `[1, 10]`). The literal value `0` **disables** the feeder (Phase 0 returns early); missing/invalid falls back to `3` (WARN on invalid). Phase 0 runs **before** Phase 1 on each 10-min tick, sharing the same `gh issue list` / `gh pr list` fetches (zero added API load), so a promotion made by the feeder is pickable by the puller in the same tick. **Pullable-count, not raw `ready`-count, is the threshold signal (D2):** a `ready` ticket counts toward the pool only if it is actually dispatchable — no open closing PR, no in-flight self_dev task, not labelled `blocked`/`operator-review`. This is the founding-incident fix — the 2026-07-27→28 11 h idle had raw-count ≥ 1 (#1682 open-PR + #1646 in-flight) while pullable-count was 0. When the pool is under target, the feeder promotes up to `MIN_READY − pullable` groomed-and-dispatchable backlog tickets (`is_groomed` full canonical callout, not the loose `Plan:` substring — required by the #919 dispatch gate) ranked by real-label priority (`p0-critical` > `p1-important` > `agent-core` > `p2-normal` > `p3-nice-to-have`) then oldest-first. Emits three `auto_feeder` audit events (`tool_name = "auto_feeder"`): `auto_feeder_promoted` per apply, `auto_feeder_skip` when the pool already meets target, `auto_feeder_no_backlog` when under target but zero dispatchable backlog exists (a **grooming-throughput** bottleneck signal, not a feeder failure). **N+1 over-promotion bound (benign):** Phase 0 tops the pool to N, then Phase 1's `!ready` filter may promote one *additional* groomed ticket when the queue is idle → at most **N+1** ready tickets per tick. Intentional — the webhook dispatch drains the pool and the two phases have complementary intents (feeder = hold a buffer; Phase 1 = kick a dispatch when idle). **50-issue working-set cap:** the groomed-not-ready backlog the feeder ranks is capped at 50 (`FEEDER_WORKING_SET_CAP`); a dispatchable backlog exceeding 50 is itself a grooming-throughput signal (surfaced by `auto_feeder_no_backlog` and AC9 pool-sampling), kept observable rather than silently absorbed — single-line raise if real operation ever warrants it.
+- `MIKA_AUTO_FEEDER_MIN_READY` — Target size of the **pullable**-ready pool the auto-feeder (Phase 0 of `auto_pull_groomed_ticket`) keeps topped up (mika#1863, default `3`, clamp `[1, 10]`). The literal value `0` **disables** the feeder (Phase 0 returns early); missing/invalid falls back to `3` (WARN on invalid). Phase 0 runs **before** Phase 1 on each 10-min tick, sharing the same `gh issue list` / `gh pr list` fetches (zero added API load), so a promotion made by the feeder is pickable by the puller in the same tick. **Pullable-count, not raw `ready`-count, is the threshold signal (D2):** a `ready` ticket counts toward the pool only if it is actually dispatchable — no open closing PR, no in-flight self_dev task, not labelled `blocked`/`operator-review`. This is the founding-incident fix — the 2026-07-27→28 11 h idle had raw-count ≥ 1 (#1682 open-PR + #1646 in-flight) while pullable-count was 0. When the pool is under target, the feeder promotes up to `MIN_READY − pullable` groomed-and-dispatchable backlog tickets (`is_groomed` full canonical callout, not the loose `Plan:` substring — required by the #919 dispatch gate) ranked by real-label priority (`p0-critical` > `p1-important` > `agent-core` > `p2-normal` > `p3-nice-to-have`) then oldest-first. Emits `auto_feeder` audit events (`tool_name = "auto_feeder"`): `auto_feeder_promoted` per apply, `auto_feeder_skip` when the pool already meets target, and — when nothing is promotable — **one of the three cause names** below (mika#2161). **N+1 over-promotion bound (benign):** Phase 0 tops the pool to N, then Phase 1's `!ready` filter may promote one *additional* groomed ticket when the queue is idle → at most **N+1** ready tickets per tick. Intentional — the webhook dispatch drains the pool and the two phases have complementary intents (feeder = hold a buffer; Phase 1 = kick a dispatch when idle). **50-issue working-set cap:** the groomed-not-ready backlog the feeder ranks is capped at 50 (`FEEDER_WORKING_SET_CAP`); a dispatchable backlog exceeding 50 is itself a grooming-throughput signal, kept observable rather than silently absorbed — single-line raise if real operation ever warrants it. **That cap is NOT surfaced by `auto_feeder_no_backlog`**, contrary to what this entry and the constant's own doc-comment claimed until mika#2161: that event fires only when the candidate set is **empty**, i.e. exactly when there is no backlog to exceed the cap. A backlog of 80 promotable tickets truncates in silence and emits nothing; the surface AC9 names is pool sampling.
+
+### L'alimenteur nomme la cause qu'il a mesurée (mika#2161)
+
+**Aucune variable d'environnement, aucune migration, aucun seuil déplacé.** Cette entrée est ici parce que l'opérateur qui lit `auto_feeder_no_backlog` et se demande s'il doit groomer davantage cherche dans ce voisinage.
+
+- **Le défaut, mesuré la nuit du 2026-09-03.** Toutes les dix minutes : `auto_feeder_no_backlog {"pullable": 2, "min_ready": 3}`. **Le compte était juste** — six tickets portaient `ready`, quatre étaient en vol (#2127, #2108, #1772, #2140), il en restait deux. Ce qui était faux est la **conclusion** : `candidates.is_empty()` est vrai dans trois situations dont les remèdes sont **opposés**, et le message nommait toujours la première. Sur la foi de ce qu'il affirmait, **quatre sessions de grooming ont été lancées à 23:28** alors que le créneau de dispatch était pris. Le diagnostic a produit l'action exactement inverse de celle qui était due, et c'est reproductible parce que c'est ce que le message disait de faire.
+
+- **Trois causes, et la troisième n'est pas de la sur-ingénierie.**
+
+  | cause | prédicat | remède nommé | régime attendu |
+  |---|---|---|---|
+  | **(b)** `auto_feeder_pool_in_flight` | `in_flight > 0` | **débloquer** — les tickets et leurs âges sont dans l'événement | non nul pendant un blocage |
+  | **(c)** `auto_feeder_in_flight_unreadable` | sinon, `state_probe_failed > 0` **ou** `candidate_probe_failed > 0` | réparer la sonde — ni (a) ni (b) n'est établi | **zéro** |
+  | **(a)** `auto_feeder_no_backlog` | sinon | groomer davantage | nominal |
+
+  (c) est le fail-safe **existant** rendu lisible : la boucle de sonde traite déjà une erreur DB comme « en vol » — arbitrage correct pour le *seuil*, puisqu'il vaut mieux ne pas promouvoir dans le doute — mais versé tel quel dans le message de (b) il ferait **nommer comme en vol des tickets qui ne le sont peut-être pas**, c'est-à-dire donner un remède faux avec l'autorité d'une mesure. Même famille et même arbitrage que `pilot_stall_signal_unavailable` (mika#2277), `unknown_provider` (mika#2328) et la paire `below_threshold` / `no_ready_label_event` (mika#2131) : *un signal qu'on ne peut pas lire n'est jamais un terme satisfait.*
+
+- **(b) l'emporte sur (a) quand les deux sont vrais — c'est l'arbitrage central.** Le ticket présente (a) et (b) comme deux situations ; **elles ne sont pas exclusives**, et la nuit fondatrice est précisément le cas où les deux tenaient (six `ready` dont quatre en vol **et** aucun candidat groomé devant). Un classifieur « ou bien / ou bien » aurait donc pu rendre (a) cette nuit-là, c'est-à-dire reproduire le défaut. La règle est une **priorité** : si le bassin `ready` porte des exclus `in_flight`, le remède est de débloquer, **quoi que dise le backlog**, parce que promouvoir dans un bassin dont les consommateurs sont coincés ne produit rien.
+
+- **Trois noms, et le refus d'un nom unique à champ `cause`.** AC1 autorisait « un champ qui porte la raison ». Il est refusé pour une raison qui n'est pas stylistique : **le nom existant affirme (a) dans son texte**. Garder `auto_feeder_no_backlog` comme parapluie avec `cause: "pool_in_flight"` rendrait un `grep auto_feeder_no_backlog` sur des lignes de cas (b) — la fausse affirmation que ce ticket corrige, réinstallée dans le nom de l'événement. Précédent direct : mika#2368, « deux noms, et c'est ce qui sauve les sondes ».
+
+- **La scission est datée du déploiement, et c'est voulu.** Les lignes déjà écrites sous `auto_feeder_no_backlog` mêlent (a) et (b) ; les réécrire rendrait faux ce qu'elles ont dit quand elles ont été écrites. **Un opérateur qui compare de part et d'autre du déploiement doit sommer les trois noms.** Même geste et même raison que mika#2361 sur `operator_review_or_blocked` / `abandoned_operator_held`.
+
+- **`auto_feeder` reste le `tool_name` d'audit** et le nom de cause vit dans `target_key`, donc la surface SQL existante (`WHERE tool_name = 'auto_feeder'`) est préservée telle quelle et un `GROUP BY target_key` sépare désormais les trois.
+
+- **Cadence inchangée** : une ligne + une row d'audit par tick tant que la condition tient (jusqu'à 144/jour pendant un blocage). C'est **exactement** la cadence actuelle ; la changer casserait la comparabilité de la population existante. La doctrine mika#2131 (dédupliquer le détail **par ticket**) ne s'applique pas — ceci est un agrégat par tick, et pendant un blocage la vivacité *est* l'information, même raison que `auto_pull_stop_armed` (mika#2329) et le Signal P (mika#2156).
+
+- **`count_pullable_ready` est inchangé à la ligne près (AC6)**, et ce n'est pas une promesse mais un test : l'invariant `census.pullable == count_pullable_ready(…)` est épinglé sur toute forme d'entrée (modèle `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`). Le seuil ne bouge pas d'un iota — `state_probe_failed` est un **sous-ensemble d'attribution** de `in_flight` : l'ensemble que les filtres reçoivent reste l'union exacte d'aujourd'hui, seule la ventilation du compte est affinée.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Le cas (b) — la mesure que rien ne donnait
+grep auto_feeder_pool_in_flight "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{raw_ready, pullable, in_flight, open_pr, operator_held, stuck, remedy}'
+
+# 2. CONTRÔLE NÉGATIF — la sonde d'état tient-elle ? (régime attendu : VIDE)
+grep auto_feeder_in_flight_unreadable "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. CONTRÔLE POSITIF — Phase 0 tourne-t-elle seulement ?
+grep -cE 'auto_feeder_(promoted|no_backlog|pool_in_flight|in_flight_unreadable)' \
+  "$MIKA_SPIRIT_LOG_FILE"
+```
+```sql
+-- Les trois causes, soustractibles en une requête. C'est aussi le contrôle
+-- positif COMPLET : `auto_feeder_skip` n'existe qu'ici, pas au journal.
+SELECT target_key, count(*) FROM audit_events
+ WHERE tool_name = 'auto_feeder' GROUP BY 1;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `auto_feeder_pool_in_flight` | INFO | **non nul pendant un blocage** | chaque ligne est un bassin coincé nommé ; `stuck` donne les tickets, leur statut et leur âge en secondes. Tant qu'aucun dispatch n'a dépassé `MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS` (900 s), `remedy` nomme les âges sans ordonner « do NOT groom » : un pilote parti il y a deux minutes n'est pas un bassin coincé |
+| `auto_feeder_in_flight_unreadable` | INFO | **vide** | la sonde DB échoue, donc le feeder ne peut plus poser de diagnostic |
+| `auto_feeder_no_backlog` | INFO | nominal | désormais véridique : le grooming **est** le goulot |
+| `stuck` sur une ligne (a) ou (c) | INFO | **toujours `[]`** | (a) n'a pas de population en vol, (c) en a une que le moteur n'a pas su lire — la nommer serait le remède faux |
+
+**Le contrôle positif (3) n'est pas décoratif.** *Zéro ligne des trois noms* a **trois** causes, dont deux sont des configurations parfaitement saines et aucune n'est distinguable des autres sans lui : le bassin est au-dessus du seuil (nominal, `auto_feeder_skip` — **qui n'apparaît qu'en SQL**, son unique ligne de journal est un `debug!` au message différent) ; `MIKA_AUTO_FEEDER_MIN_READY=0` désarme Phase 0 avant toute sonde ; et depuis mika#2329/#2498 la sentinelle `~/.mika/state/auto-pull-stop` court-circuite `dispatch_auto_pull_groomed` **en tête**, donc Phase 0 ne tourne pas du tout. Lire les deux ensemble : zéro `pool_in_flight` **avec** un compte non nul est un bassin sain ; zéro des deux ne prouve **rien** sur le classifieur. C'est la classe mika#2205 appliquée à la sonde de ce ticket : *une garde que personne n'a exercée se lit exactement comme une garde qui marche.*
+
+#### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi**. Après `make deploy`, établir que le `mika-spirit` qui tourne porte le correctif avant toute conclusion (classe mika#2340).
+
+**S1 — le rejeu du défaut fondateur** (premier tick avec un bassin coincé). Attendu : une ligne `auto_feeder_pool_in_flight` nommant les tickets en vol, et **aucune** ligne `auto_feeder_no_backlog` sur ce tick.
+
+**Halte 1 — `auto_feeder_in_flight_unreadable` non vide.** Régime attendu zéro. Une occurrence est une sonde DB qui échoue, donc un diagnostic que le feeder ne peut plus poser. **Ne pas fondre (c) dans (b) pour faire disparaître la ligne** : c'est la fusion que ce ticket défait.
+
+**Halte 2 — `auto_feeder_pool_in_flight` soutenu sur les mêmes tickets pendant des heures.** La cause n'est pas ici : ce sont mika#2158 / mika#2160 / mika#2156, explicitement hors périmètre. L'événement a fait son travail en le disant ; le remède est en amont.
+
+**Halte 3 — `auto_feeder_no_backlog` reste dominant alors que le bassin `ready` est visiblement coincé.** Le classifieur ne voit pas les exclus `in_flight`. **Ne pas ajuster de seuil** : vérifier d'abord que la boucle de sonde remplit bien `in_flight_issue_numbers`, puis le déploiement (classe mika#2340).
+
+**Halte 4 — le contrôle positif (3) rend zéro.** Ne toucher ni au classifieur ni au recensement : **Phase 0 n'a pas tourné.** Lire dans cet ordre la sentinelle (`grep auto_pull_stop_armed "$MIKA_SPIRIT_LOG_FILE"`, un INFO par tick court-circuité), puis `MIKA_AUTO_FEEDER_MIN_READY`. Les deux sont des gestes d'opérateur, et confondre l'un avec un défaut de ce ticket est la façon la plus rapide de « réparer » du code qui n'a jamais été exécuté.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne débloque rien.** Les tickets coincés le restent ; ce qui change est qu'on sait **lequel des deux remèdes** s'applique. C'est la formulation du ticket lui-même (« il fait en sorte qu'on sache quoi débloquer »), et la tenir est ce qui garde le périmètre petit.
+- **Il ne rattrape pas la nuit du 2026-09-03.** Les lignes déjà écrites sous `auto_feeder_no_backlog` mêlent (a) et (b) pour toujours : **rien ne rétro-classe un événement qu'on n'a pas observé**, et le faire rendrait faux ce que ces lignes disaient quand elles ont été écrites (motif mika#2361). La sonde est la **prochaine** occurrence.
+- **Il ne mesure pas la cause du blocage.** `stuck` donne les tickets et leurs âges, pas *pourquoi* ils ne bougent pas. Les trois causes connues (mika#2158, mika#2160, mika#2156) ont chacune leurs propres surfaces.
+- **Il ne couvre pas le cas « bassin en vol *et* candidats disponibles »**, où le feeder promeut et se tait. L'opérateur gagnerait peut-être à savoir qu'il promeut dans un bassin coincé, mais AC1 borne le changement à `candidates.is_empty()`. **Ticket de suivi**, conditionné à une mesure : si `auto_feeder_promoted` et `auto_feeder_pool_in_flight` s'alternent sur les mêmes ticks, la question se pose avec un compte.
+- **Il ne surveille rien.** Les seuls instruments sont les greps et la requête SQL ci-dessus, et **leur silence ne prouve rien tant que personne ne les exécute** — d'où le contrôle positif, sans lequel « Phase 0 n'a pas tourné » et « le bassin est sain » rendent exactement les mêmes octets.
 
 Optional (réconciliation des demandes de revue — mika#2334):
 - **Le défaut que ça ferme, et la rectification qu'il a fallu faire au ticket.** Deux PRs du drain du 2026-09-15 (#2332/#2296, #2333/#2293) sont restées ouvertes sans revue ; l'orchestrateur a posé `mika-platform-qa` à la main. Le ticket en déduisait qu'un pas trailing `gh pr edit --add-reviewer` avait été sauté parce que le pilote mourait avant de l'atteindre, et demandait de le déplacer avant les pas fragiles. **Deux mesures déplacent le diagnostic.** (a) *Ce pas n'existait pas* : la recherche exhaustive de `--add-reviewer`, `gh api …/requested_reviewers` et `gh pr review --request` sur `.claude/commands/`, `skills/bundled/`, `crates/`, `scripts/` et `.github/` ne rend qu'une table d'arité de flags ; les huit `gh pr edit` de `dispatch-lib.sh` ne portent que `--add-label`, `--title`, `--body`. **Aucune PR de la boucle n'a jamais porté de relecteur.** (b) *La revue ne dépend pas du pilote* : `pull_request.opened` est routé vers mika-qa par le gateway sans filtre draft, donc la seule création de la PR démarre la cascade. Le défaut réel est en dessous et il est plus large : **`opened` est un événement unique, non rejouable, perdable en quatre endroits** (drop-oldest de la file bornée mika#1870 → 429 → circuit breaker du gateway → DLQ `dead` que seul un rejeu manuel ressort ; plus le tour LLM vide dont `webhook_zero_tools` n'est opposé qu'une fois) — **et aucun chemin ne relisait une PR ouverte sans revue.** Les trois scans voisins n'y touchent pas (`auto_pull` travaille les issues, `wip_rescue` les brouillons étiquetés, `curator_review` les skills), et le seul rattrapage existant, le fan-out `check_suite.completed(success)` de mika#1711, exige `draft: false` **et** une CI verte : une PR dont la CI est rouge ou n'a jamais tourné n'était jamais rattrapée.

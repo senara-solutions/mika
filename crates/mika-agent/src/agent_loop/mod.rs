@@ -3132,6 +3132,13 @@ async fn run_loop(
                             matched_subject = %proposal.subject,
                             matched_movement = %proposal.movement,
                             label = mode.label(),
+                            // mika#2633 V7 — the residue carries the channel too.
+                            // Without it, `select(.channel == "team_deliverable")`
+                            // on the `_uncorrected` population would be a filter
+                            // two emitters can disagree about: this line said
+                            // nothing, so an operator reading the family had no
+                            // way to tell 5h's residue from a future one.
+                            channel = TestimonyProposalChannel::EndTurn.as_wire(),
                             event = "guard.testimony_access_proposal_uncorrected",
                             "Testimony access-proposal guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
