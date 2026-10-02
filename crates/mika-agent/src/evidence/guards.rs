@@ -1696,6 +1696,35 @@ pub(crate) enum TestimonyProposalChannel {
     /// and the one thing this repository refuses is to let it go unsaid.
     #[allow(dead_code)]
     CreateScheduledTask,
+    /// The team-run deliverable, at the point it is **posed** on the run
+    /// (mika#2633).
+    ///
+    /// Not a tool channel: the text is the writer agent's LLM output
+    /// (`TeamEngine::deliver`), the conversational gate's reply, or the
+    /// `NoDelegation` retry reply — wrapped verbatim by
+    /// `teams::notification::build_run_completion_message` on the sync path
+    /// (`tools/run_team.rs`) and the async one (`task_engine::dispatcher`).
+    /// mika#2627's census exempted it on the premise that the notification text
+    /// came from the engine; the code says otherwise, which is the correction
+    /// this channel exists to carry.
+    ///
+    /// **The guard site is the point of POSE, never the notification.**
+    /// `finalize_and_shutdown` persists `run.deliverable` through
+    /// `update_team_run`, and `teams::prompt` re-serves it to the next run as
+    /// `<context type="history_deliverable">`. mika#2627's own reasoning
+    /// applies word for word — *a proposal written into `messages` is re-served
+    /// by compaction, so a refusal that persisted anyway would leave the
+    /// doctrine violated in the history* — so guarding at
+    /// `build_run_completion_message` would look like "one site, both paths"
+    /// and leave the proposal in the database and in the next run's context.
+    ///
+    /// **The disposition differs from every other channel, and that is why the
+    /// predicate has a third production reader rather than a third composition
+    /// of [`crate::tools::check_testimony_access_proposal`].** That helper takes
+    /// a `&ToolContext` and returns a `ToolOutput`, neither of which exists in
+    /// `TeamEngine`; and a refused deliverable is repairable by neither a resend
+    /// nor a split — its disposition is one re-write, then a neutral line.
+    TeamDeliverable,
 }
 
 impl TestimonyProposalChannel {
@@ -1705,6 +1734,7 @@ impl TestimonyProposalChannel {
             Self::SendMessage => "send_message",
             Self::CreateReminder => "create_reminder",
             Self::CreateScheduledTask => "create_scheduled_task",
+            Self::TeamDeliverable => "team_deliverable",
         }
     }
 }
@@ -7896,7 +7926,7 @@ mod tests {
     // mika#2627 — the channel is a wire format
     // -----------------------------------------------------------------------
 
-    /// V12 — the four channel values are frozen (motif
+    /// V12 — the five channel values are frozen (motif
     /// `mika2498_les_valeurs_daudit_sont_un_format_de_fil`).
     ///
     /// They feed the `channel` field of `guard.testimony_access_proposal`, which
@@ -7905,8 +7935,8 @@ mod tests {
     /// a break to **date in `CLAUDE.md`**, never a test to quietly update.
     ///
     /// The two values mika#2627's AC4 names literally are asserted as such; the
-    /// two others follow the same rule (the tool's name *is* the channel), so a
-    /// fifth site cannot change the vocabulary of the first four.
+    /// three others follow the same rule (the emitting surface's name *is* the
+    /// channel), so a sixth site cannot change the vocabulary of the first two.
     #[test]
     fn mika2627_le_canal_est_un_format_de_fil() {
         use super::TestimonyProposalChannel as C;
@@ -7917,6 +7947,8 @@ mod tests {
         // The two AC1 extensions, under the same naming rule.
         assert_eq!(C::CreateReminder.as_wire(), "create_reminder");
         assert_eq!(C::CreateScheduledTask.as_wire(), "create_scheduled_task");
+        // mika#2633 AC4 — the team deliverable, same rule.
+        assert_eq!(C::TeamDeliverable.as_wire(), "team_deliverable");
 
         // No two channels share a wire value — which is what makes a
         // `GROUP BY channel` a partition rather than a merge.
@@ -7925,6 +7957,7 @@ mod tests {
             C::SendMessage,
             C::CreateReminder,
             C::CreateScheduledTask,
+            C::TeamDeliverable,
         ];
         let unique: std::collections::HashSet<&str> = all.iter().map(|c| c.as_wire()).collect();
         assert_eq!(

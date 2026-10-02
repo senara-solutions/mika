@@ -3815,11 +3815,67 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     // mika#2627 — le prédicat testimony a DEUX lecteurs de production
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Les deux lecteurs nommés : la garde 5h et le helper d'outil.
+    /// Les **trois** lecteurs nommés : la garde 5h, le helper d'outil, et le
+    /// point de pose du livrable d'équipe.
+    ///
+    /// # Pourquoi un troisième, et pourquoi ce n'est pas une exemption
+    ///
+    /// mika#2627 avait figé la population à deux, avec la résolution écrite
+    /// « router ce site vers `tools::check_testimony_access_proposal` ». Ce
+    /// helper prend un `&ToolContext` et rend un `Option<ToolOutput>` :
+    /// `TeamEngine` n'a ni l'un ni l'autre, et surtout **un livrable refusé ne
+    /// se répare ni par un renvoi ni par un découpage** — sa disposition est
+    /// nécessairement différente (une re-rédaction, puis une ligne neutre,
+    /// décision opérateur MPC 2026-10-02).
+    ///
+    /// Donc on **étend le recensement** de deux à trois, exactement comme
+    /// mika#2627 l'avait étendu de un à deux. *Un recensement n'est pas une
+    /// allowlist : on y ajoute, on n'y exempte pas* — et l'allowlist reste vide.
+    ///
+    /// # Ce qui reste partagé, et ce qui compense la garantie perdue
+    ///
+    /// Le **vocabulaire de canal** : les trois lecteurs émettent le même nom
+    /// d'événement sous une valeur de `channel` distincte, ce que
+    /// `mika2633_tout_emetteur_de_la_famille_porte_un_canal` tient. C'est ce qui
+    /// rend `jq 'select(.channel == …)'` exact plutôt qu'un filtre sur lequel
+    /// trois sites peuvent diverger — la garantie que le scan A donnait jusqu'ici
+    /// *par accident*, en bornant la population à deux.
     const TESTIMONY_PREDICATE_READERS: &[&str] = &[
         "crates/mika-agent/src/agent_loop/mod.rs",
         "crates/mika-agent/src/tools/mod.rs",
+        "crates/mika-agent/src/teams/engine.rs",
     ];
+
+    /// Les fichiers de production qui lisent réellement
+    /// `detect_testimony_access_proposal`.
+    ///
+    /// **Un seul lecteur de cette question**, partagé par le scan A (qui refuse
+    /// un lecteur non recensé) et par le scan B (dont le terme
+    /// `TESTIMONY_SENDER_COVERED_UPSTREAM` exige que le fichier amont déclaré en
+    /// soit un). Deux copies pourraient diverger, et c'est la classe que
+    /// `grooming_marker` a dû graver une fois (mika#2158).
+    ///
+    /// La définition n'est pas un lecteur, et un commentaire qui NOMME la
+    /// fonction n'en est pas un non plus — le prédicat porte trois paragraphes
+    /// de prose à son sujet (classe mika#2050, le faux positif mesuré sur le
+    /// Signal S).
+    fn testimony_predicate_readers() -> Vec<String> {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("detect_testimony_access{}(", "_proposal");
+        let mut readers = Vec::new();
+        for (rel, content) in production_sources() {
+            let reads = crate::source_scan::strip_comment_lines(&content)
+                .lines()
+                .any(|line| {
+                    line.contains(needle.as_str())
+                        && !line.contains("fn detect_testimony_access_proposal(")
+                });
+            if reads {
+                readers.push(rel);
+            }
+        }
+        readers
+    }
 
     /// **Livrée vide, et le test frère l'assert.**
     ///
@@ -3845,40 +3901,19 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// mika#2158).
     #[test]
     fn mika2627_le_predicat_na_que_deux_lecteurs_de_production() {
-        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
-        let needle = format!("detect_testimony_access{}(", "_proposal");
-
-        let mut readers = Vec::new();
-        for (rel, content) in production_sources() {
-            if TESTIMONY_PREDICATE_READERS_ALLOWED.contains(&rel.as_str()) {
-                continue;
-            }
-            // La définition n'est pas un lecteur, et un commentaire qui NOMME la
-            // fonction n'en est pas un non plus — le prédicat porte trois
-            // paragraphes de prose à son sujet (classe mika#2050, le faux
-            // positif mesuré sur le Signal S).
-            let reads = content
-                .lines()
-                .filter(|l| {
-                    let t = l.trim_start();
-                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
-                })
-                .any(|line| {
-                    line.contains(needle.as_str())
-                        && !line.contains("fn detect_testimony_access_proposal(")
-                });
-            if reads {
-                readers.push(rel);
-            }
-        }
+        let readers: Vec<String> = testimony_predicate_readers()
+            .into_iter()
+            .filter(|r| !TESTIMONY_PREDICATE_READERS_ALLOWED.contains(&r.as_str()))
+            .collect();
 
         // Anti-vacuité : un scan qui ne trouve personne se lit exactement comme
         // un scan propre (mika#2103 / mika#2205).
         for expected in TESTIMONY_PREDICATE_READERS {
             assert!(
                 readers.iter().any(|r| r == expected),
-                "mika#2627 — `{needle}` n'est lu nulle part dans {expected} : ce scan \
-                 vise un nom mort, il ne vérifie rien. Lecteurs trouvés : {readers:?}"
+                "mika#2627 — le prédicat testimony n'est lu nulle part dans {expected} : \
+                 ce scan vise un nom mort, il ne vérifie rien. Lecteurs trouvés : \
+                 {readers:?}"
             );
         }
 
@@ -3888,11 +3923,15 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             .collect();
         assert!(
             strangers.is_empty(),
-            "mika#2627 R3 — un troisième lecteur du prédicat testimony : {strangers:?}\n\n\
+            "mika#2627 R3 — un lecteur non recensé du prédicat testimony : {strangers:?}\n\n\
              RÉSOLUTION : router ce site vers `tools::check_testimony_access_proposal`, \
              qui porte la composition refus + télémétrie. Ne PAS l'ajouter à \
-             TESTIMONY_PREDICATE_READERS_ALLOWED — trois compositions, c'est trois \
-             formulations de refus libres de diverger."
+             TESTIMONY_PREDICATE_READERS_ALLOWED — une composition de plus, c'est une \
+             formulation de refus de plus libre de diverger. Un lecteur dont la \
+             DISPOSITION est nécessairement différente (mika#2633 : un livrable refusé \
+             ne se répare ni par un renvoi ni par un découpage) se déclare dans \
+             TESTIMONY_PREDICATE_READERS, avec sa raison, et doit porter un `channel` \
+             distinct (mika2633_tout_emetteur_de_la_famille_porte_un_canal)."
         );
     }
 
@@ -3918,29 +3957,51 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     ///
     /// - `delegate_task` passe le sender au délégué et n'envoie rien lui-même —
     ///   le délégué appelle `send_message`, donc il est couvert
-    ///   **transitivement** ;
-    /// - `run_team` envoie une notification de fin de run qui enveloppe
-    ///   `run.deliverable` — la **sortie LLM** de l'agent rédacteur
-    ///   (`TeamEngine::deliver`), la réponse de la porte conversationnelle, ou
-    ///   le repli workspace sur timeout. **C'est du texte du modèle, NON
-    ///   couvert** : un **canal ouvert nommé**, pas une exemption « texte du
-    ///   moteur » (la prémisse du recensement du plan était fausse, revue de
-    ///   code mika#2627). Le bon site de garde est le livrable dans
-    ///   `TeamEngine::deliver` (un site, les deux chemins sync et async) —
-    ///   ticket de suivi, hors de ce périmètre.
+    ///   **transitivement**. C'est un motif **différent** d'une garde en amont
+    ///   sur le même appel, d'où son maintien ici plutôt qu'un déplacement vers
+    ///   `TESTIMONY_SENDER_COVERED_UPSTREAM` ;
+    /// - `tools/mod.rs` **déclare** le champ, il ne le consomme pas. Et c'est
+    ///   aussi le site du helper, donc l'y compter serait compter la garde comme
+    ///   un trou.
     ///
-    /// `tools/mod.rs` est hors population par une autre raison : il **déclare**
-    /// le champ, il ne le consomme pas. Et c'est aussi le site du helper, donc
-    /// l'y compter serait compter la garde comme un trou.
+    /// `run_team.rs` **est sorti de ce périmètre** par mika#2633 AC3 : son
+    /// livrable est désormais gardé en amont, au point de pose, dans
+    /// `teams/engine.rs`. Voir [`TESTIMONY_SENDER_COVERED_UPSTREAM`].
     ///
     /// Comparé **dans les deux sens** : une entrée dont le site a disparu fait
     /// rougir (assertion auto-nettoyante), sans quoi elle exempterait en silence
     /// un futur homonyme.
     const TESTIMONY_SENDER_PERIMETER: &[&str] = &[
         "crates/mika-agent/src/tools/delegate_task.rs",
-        "crates/mika-agent/src/tools/run_team.rs",
         "crates/mika-agent/src/tools/mod.rs",
     ];
+
+    /// Un site dont la garde vit en **AMONT**, avec le fichier qui la porte
+    /// (mika#2633 AC3/U5).
+    ///
+    /// # Pourquoi un terme neuf, et pas un simple retrait du périmètre
+    ///
+    /// `run_team.rs` consomme `ctx.message_sender` et n'appellera jamais le
+    /// helper d'outil : le texte qu'il envoie est `run.deliverable`, déjà posé —
+    /// et déjà gardé — avant qu'il ne le lise. Le retirer du périmètre **sans
+    /// plus** le ferait compter `unguarded` et rendrait le scan rouge ; le
+    /// laisser au périmètre contredirait l'AC3, qui demande qu'il soit vu
+    /// **gardé**. Donc le prédicat gagne un troisième terme : *gardé sur place,
+    /// **ou** déclaré couvert en amont par un fichier qui lit réellement le
+    /// prédicat, ou au périmètre*.
+    ///
+    /// # Ce que la déclaration coûte, et ce qu'elle ne peut pas être
+    ///
+    /// Elle est vérifiée **dans les deux sens** : le fichier aval doit exister
+    /// et consommer le sender, et le fichier **amont** doit figurer parmi les
+    /// lecteurs réels du prédicat ([`testimony_predicate_readers`]). Le jour où
+    /// `teams/engine.rs` cesse de porter la garde, cette ligne rougit — c'est
+    /// l'assertion auto-nettoyante que l'AC3 appelle « test vu rouge », et c'est
+    /// ce qui empêche la déclaration de devenir une exemption de confort.
+    const TESTIMONY_SENDER_COVERED_UPSTREAM: &[(&str, &str)] = &[(
+        "crates/mika-agent/src/tools/run_team.rs",
+        "crates/mika-agent/src/teams/engine.rs",
+    )];
 
     /// Scan B — tout consommateur de `ctx.message_sender` sous `tools/` appelle
     /// la garde, ou figure au périmètre ci-dessus (mika#2627 RK4).
@@ -3952,6 +4013,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     #[test]
     fn mika2627_tout_emetteur_sous_tools_est_garde_ou_nomme() {
         let guard_call = format!("check_testimony_access{}(", "_proposal");
+        let upstream_readers = testimony_predicate_readers();
 
         let mut unguarded = Vec::new();
         let mut consumers = Vec::new();
@@ -3960,13 +4022,8 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             if !rel.starts_with("crates/mika-agent/src/tools/") {
                 continue;
             }
-            let lines: Vec<&str> = content
-                .lines()
-                .filter(|l| {
-                    let t = l.trim_start();
-                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
-                })
-                .collect();
+            let stripped = crate::source_scan::strip_comment_lines(&content);
+            let lines: Vec<&str> = stripped.lines().collect();
 
             if !lines.iter().any(|l| l.contains("message_sender")) {
                 continue;
@@ -3974,7 +4031,16 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             consumers.push(rel.clone());
 
             let guarded = lines.iter().any(|l| l.contains(guard_call.as_str()));
-            if !guarded && !TESTIMONY_SENDER_PERIMETER.contains(&rel.as_str()) {
+            // mika#2633 — troisième terme : la garde peut vivre en amont, à
+            // condition que le fichier amont déclaré lise réellement le prédicat.
+            let covered_upstream =
+                TESTIMONY_SENDER_COVERED_UPSTREAM
+                    .iter()
+                    .any(|(site, upstream)| {
+                        *site == rel.as_str() && upstream_readers.iter().any(|r| r == upstream)
+                    });
+            if !guarded && !covered_upstream && !TESTIMONY_SENDER_PERIMETER.contains(&rel.as_str())
+            {
                 unguarded.push(rel);
             }
         }
@@ -3994,8 +4060,10 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              garde testimony : {unguarded:?}\n\n\
              RÉSOLUTION : appeler `tools::check_testimony_access_proposal` sur le corps \
              sortant AVANT l'envoi, et ajouter le nom de l'outil à \
-             `agent_loop::TESTIMONY_GATED_TOOLS`. S'il n'émet aucun texte DU MODÈLE \
-             (sender relayé, texte composé par le moteur), le déclarer dans \
+             `agent_loop::TESTIMONY_GATED_TOOLS`. Si le texte qu'il émet est déjà gardé \
+             EN AMONT de lui, le déclarer dans TESTIMONY_SENDER_COVERED_UPSTREAM avec le \
+             fichier qui porte la garde. S'il n'émet aucun texte DU MODÈLE (sender \
+             relayé, texte composé par le moteur), le déclarer dans \
              TESTIMONY_SENDER_PERIMETER avec sa raison."
         );
 
@@ -4012,6 +4080,162 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              RÉSOLUTION : retirer la ligne. Une entrée qui survit à son site exempterait \
              en silence un futur homonyme (c'est la différence entre un périmètre et un \
              tiroir, mika#2536)."
+        );
+
+        // mika#2633 AC3 — l'assertion auto-nettoyante du terme neuf, dans les
+        // deux sens : le site aval doit consommer le sender, et le fichier amont
+        // doit réellement lire le prédicat. C'est ce qui fait rougir le jour où
+        // `teams/engine.rs` cesse de porter la garde.
+        for (site, upstream) in TESTIMONY_SENDER_COVERED_UPSTREAM {
+            assert!(
+                consumers.iter().any(|c| c == site),
+                "mika#2633 — {site} est déclaré couvert en amont mais ne consomme plus \
+                 `message_sender` : retirer la ligne (un périmètre, pas un tiroir)."
+            );
+            assert!(
+                upstream_readers.iter().any(|r| r == upstream),
+                "mika#2633 AC3 — {upstream} est déclaré comme portant la garde du \
+                 livrable de {site}, et il ne lit PLUS le prédicat testimony.\n\n\
+                 Lecteurs réels : {upstream_readers:?}\n\n\
+                 RÉSOLUTION : rétablir la garde en amont, ou remettre {site} dans \
+                 TESTIMONY_SENDER_PERIMETER en le nommant canal ouvert. Ne PAS retirer \
+                 cette assertion : sans elle, la déclaration survivrait à la garde \
+                 qu'elle atteste, c'est-à-dire exempterait en silence (mika#2536)."
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2633 — le format de fil de la télémétrie, et l'inertie du bras
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test frère l'assert.**
+    const TESTIMONY_CHANNEL_FIELD_ALLOWED: &[&str] = &[];
+
+    /// V7 — tout émetteur de la famille `guard.testimony_access_proposal` porte
+    /// un champ `channel` (mika#2633).
+    ///
+    /// # Ce que ça remplace
+    ///
+    /// Le scan A bornait la population des lecteurs du prédicat à **deux**, ce
+    /// qui garantissait *par accident* que le vocabulaire de canal ne pouvait
+    /// pas diverger. mika#2633 porte cette population à trois ; cette garantie
+    /// doit donc être posée explicitement, et c'est ce qui rend
+    /// `jq 'select(.channel == "team_deliverable")'` exact plutôt qu'un filtre
+    /// sur lequel trois sites peuvent diverger.
+    ///
+    /// # La famille, pas le seul nom nominal
+    ///
+    /// Le résidu `…_uncorrected` est dans la population, et c'est porteur :
+    /// jusqu'à mika#2633 la ligne résidu de la garde 5h ne portait **aucun**
+    /// `channel`, donc un opérateur lisant la famille n'avait aucun moyen de
+    /// distinguer son résidu d'un futur. Ce scan est ce qui a mesuré ce trou, et
+    /// le même commit l'a comblé.
+    ///
+    /// Aucun test comportemental ne voit cette classe : un émetteur sans
+    /// `channel` ne rend **aucune** décision fausse — il rend une population
+    /// incomptable, en silence.
+    #[test]
+    fn mika2633_tout_emetteur_de_la_famille_porte_un_canal() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let event_prefix = format!("event = \"guard.testimony_access{}", "_proposal");
+
+        let mut emitters = Vec::new();
+        let mut channelless = Vec::new();
+
+        for (rel, content) in production_sources() {
+            if TESTIMONY_CHANNEL_FIELD_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            let stripped = crate::source_scan::strip_comment_lines(&content);
+            // Un émetteur est un `warn!`/`info!` portant la ligne `event = "…"` ;
+            // le champ `channel` est cherché dans la même invocation de macro,
+            // bornée par le `);` qui la ferme. Un scan à la ligne seule ne peut
+            // pas répondre, les champs étant sur des lignes distinctes.
+            let mut cursor = 0usize;
+            while let Some(pos) = stripped[cursor..].find(event_prefix.as_str()) {
+                let abs = cursor + pos;
+                // Remonter au début de l'invocation : le dernier `!(` avant le
+                // champ `event`.
+                let start = stripped[..abs].rfind("!(").map_or(0, |i| i + 2);
+                let end = stripped[abs..]
+                    .find(");")
+                    .map_or(stripped.len(), |i| abs + i);
+                let invocation = &stripped[start..end];
+                emitters.push(rel.clone());
+                if !invocation.contains("channel = ") {
+                    channelless.push(format!("{rel} (…{})", &stripped[abs..end].trim()));
+                }
+                cursor = abs + event_prefix.len();
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve aucun émetteur se lit exactement
+        // comme un scan propre (mika#2103 / mika#2205).
+        assert!(
+            emitters.len() >= 4,
+            "mika#2633 V7 — moins de quatre émetteurs de la famille trouvés \
+             ({emitters:?}) : ce scan ne regarde plus la population qu'il existe \
+             pour surveiller. Les émetteurs attendus sont la garde 5h (nominale et \
+             résidu), le helper d'outil, et le point de pose du livrable d'équipe \
+             (nominal et résidu)."
+        );
+
+        assert!(
+            channelless.is_empty(),
+            "mika#2633 V7 — un émetteur de `guard.testimony_access_proposal*` ne \
+             porte pas de champ `channel` : {channelless:?}\n\n\
+             RÉSOLUTION : poser `channel = TestimonyProposalChannel::<variante>.as_wire()` \
+             sur la ligne. Ne PAS l'ajouter à TESTIMONY_CHANNEL_FIELD_ALLOWED — un \
+             émetteur sans canal rend la population incomptable, ce qui est exactement \
+             ce que ce scan existe pour refuser."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist de V7.
+    #[test]
+    fn mika2633_lallowlist_du_scan_de_canal_est_vide() {
+        assert!(
+            TESTIMONY_CHANNEL_FIELD_ALLOWED.is_empty(),
+            "TESTIMONY_CHANNEL_FIELD_ALLOWED est livrée vide et doit le rester : \
+             quand le scan tire, on pose le champ. Une allowlist née vide est un \
+             emplacement où déposer la prochaine infraction (mika#2323)."
+        );
+    }
+
+    /// V6 — l'inertie du bras `TeamDeliverable` de
+    /// `check_testimony_access_proposal` est épinglée (mika#2633 U4).
+    ///
+    /// Le bras existe pour que l'`enum` reste exhaustif et pour que sa
+    /// réapparition ne soit pas une réouverture silencieuse, exactement comme
+    /// `C::EndTurn` — que la garde 5h n'atteint pas non plus. Sans cette
+    /// assertion, l'inertie nommée sur la variante serait à re-vérifier à la
+    /// main à chaque relecture, et une couverture inerte qui se lit comme une
+    /// couverture est la classe mika#2205.
+    #[test]
+    fn mika2633_le_bras_team_deliverable_est_inerte() {
+        let guard_call = format!("check_testimony_access{}(", "_proposal");
+
+        let callers: Vec<String> = production_sources()
+            .into_iter()
+            .filter(|(rel, content)| {
+                rel.starts_with("crates/mika-agent/src/teams/")
+                    && crate::source_scan::strip_comment_lines(content)
+                        .lines()
+                        .any(|l| l.contains(guard_call.as_str()))
+            })
+            .map(|(rel, _)| rel)
+            .collect();
+
+        assert!(
+            callers.is_empty(),
+            "mika#2633 V6 — un site de `teams/` appelle le helper d'outil : \
+             {callers:?}\n\n\
+             Le bras `TeamDeliverable` est documenté INERTE sur sa variante. S'il \
+             devient atteignable, c'est cette documentation qu'il faut corriger — et \
+             alors le refus composé par le helper (`ToolOutput::error`) doit être \
+             confronté à la disposition du livrable, qui est une re-rédaction puis une \
+             ligne neutre, pas un renvoi."
         );
     }
 }

@@ -566,7 +566,7 @@ garde 5h.
   | 2 | `create_reminder` + `action_type = "send_message"` | `action_config = {"text": …}`, tiré plus tard par le dispatcher | **oui** |
   | 3 | `create_scheduled_task` + `action_type = "send_message"` | idem | **oui**, mais **inerte** — voir ci-dessous |
   | 4 | `delegate_task` | passe le sender au délégué, n'envoie **rien** lui-même | non — couvert **transitivement** (le délégué appelle `send_message`) |
-  | 5 | `run_team` | notification de fin de run qui enveloppe `run.deliverable` — la **sortie LLM** de l'agent rédacteur (`TeamEngine::deliver`), ou le repli workspace | **non couvert — canal ouvert nommé.** Le recensement du plan le disait « texte du moteur » : c'est faux (revue de code). Bon site de garde : le livrable dans `TeamEngine::deliver` — suivi |
+  | 5 | `run_team` | notification de fin de run qui enveloppe `run.deliverable` — la **sortie LLM** de l'agent rédacteur (`TeamEngine::deliver`), la réponse de la porte conversationnelle, ou le repli workspace | **oui, depuis mika#2633** — gardé **en amont** au point de pose (`TeamEngine::commit_deliverable`), donc avant la notification *et* avant la persistance. Le recensement du plan le disait « texte du moteur » : c'était faux (revue de code). Voir § *Le livrable d'équipe passe la garde* |
   | 6 | le dispatcher du tir planifié | **consommateur** du différé | non — voir « au moment de la création » |
 
   **Rectification au recensement du ticket, trouvée en lisant le code :** la
@@ -709,12 +709,13 @@ pré-déploiement ; le remède est un geste d'opérateur (`mika tasks cancel`), 
   envoyé, et **rien n'est rétro-estampillé** : la sonde est la **prochaine**
   occurrence.
 - **Il ne couvre pas les rows planifiées avant le déploiement.**
-- **Il ne couvre pas le livrable d'équipe (`run_team`).** Le livrable est du
-  texte du modèle envoyé tel quel à la personne ; le recensement du plan l'avait
-  classé « texte du moteur » à tort. Le bon site de garde est
-  `TeamEngine::deliver` (un site couvre les chemins sync et async) — **suivi
-  nommé**, dont la précondition est de décider ce que devient un livrable refusé
-  (re-rédaction une fois, puis ligne neutre « livrable retenu »).
+- **Il ne couvrait pas le livrable d'équipe (`run_team`) — mika#2633 le ferme.**
+  Le livrable est du texte du modèle envoyé tel quel à la personne ; le
+  recensement du plan l'avait classé « texte du moteur » à tort. La fermeture
+  n'est pas au site que ce ticket désignait (`TeamEngine::deliver`, qui *produit*
+  et ne *pose* pas) mais au point de **pose**, `TeamEngine::commit_deliverable` —
+  et il y avait **quatre** écrivains du livrable, pas un. § *Le livrable
+  d'équipe passe la garde* ci-dessous.
 - **Il ne ferme pas RK5** (la proposition étalée sur deux appels), nommé
   ci-dessus avec sa précondition de suivi.
 - **Il n'ajoute aucune ligne `audit_events` et aucun compteur.** Les seuls
@@ -731,6 +732,196 @@ pré-déploiement ; le remède est un geste d'opérateur (`mika tasks cancel`), 
 
 Raisonnement complet, les trois gardes structurelles et leurs allowlists livrées
 vides : `crates/mika-agent/CLAUDE.md` § 5h-bis.
+
+### Le livrable d'équipe passe la garde, au point de pose (mika#2633)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui lit un livrable d'équipe remplacé par
+une ligne neutre cherche dans le voisinage de 5h-bis.
+
+- **Le trou que ça ferme, et mika#2627 le nommait déjà.** Son recensement
+  exemptait `run_team` sur la prémisse « son texte vient du moteur ». C'est
+  **faux** : la notification de fin de run enveloppe `run.deliverable`, soit la
+  sortie LLM de l'agent rédacteur, soit la réponse de la porte conversationnelle,
+  soit le repli workspace. mika#2627 a corrigé la justification sur cinq sites et
+  nommé `run_team` **canal ouvert** ; la fermeture est ce ticket.
+
+- **Trois rectifications que la lecture du code impose au ticket, et elles sont
+  le premier livrable.** *(R1)* `TeamEngine::deliver` **n'est pas** le site
+  unique : il *produit* un texte, et **quatre** sites le *posent* —
+  `deliver_phase`, les deux bras `GateOutcome::Conversational` d'`execute_inner`,
+  et le bras `NoDelegation` d'`apply_delegation_gate`. Garder dans `deliver()`
+  seul couvre **un site sur quatre**. *(R2)* Le site juste est le point de
+  **pose**, et il doit précéder la persistance : `finalize_and_shutdown` écrit
+  `run.deliverable` en base et `teams::prompt` le ressert au run suivant en
+  `<context type="history_deliverable">` — garder à la notification aurait l'air
+  de satisfaire « un site, deux chemins » et laisserait la proposition en base.
+  *(R3)* L'AC1 nomme `detect_`, et la doctrine maison interdit de l'appeler nu ;
+  mais le helper `check_testimony_access_proposal` prend un `&ToolContext` et
+  rend un `ToolOutput`, que `TeamEngine` n'a pas — et un livrable refusé ne se
+  répare **ni par un renvoi ni par un découpage**. Le geste juste est donc
+  d'**étendre le recensement** de lecteurs de deux à trois, et de compenser par
+  un scan neuf sur le **format de fil** de la télémétrie. *Un recensement n'est
+  pas une allowlist : on y ajoute, on n'y exempte pas.*
+
+- **La disposition (c), décision opérateur (MPC, 2026-10-02) :** une re-rédaction
+  à un seul retry, puis une ligne neutre.
+
+  | provenance | détection positive ⇒ |
+  |---|---|
+  | `writer` | **une** re-rédaction (nomme la doctrine, modèle du re-prompt 5h) ; re-test ; encore sale, vide, ou en erreur ⇒ ligne neutre |
+  | `conversational_gate` | ligne neutre directement |
+  | `no_delegation` | ligne neutre directement |
+
+  La re-rédaction ne couvre que `writer` parce qu'un rédacteur n'existe qu'au
+  site 1 : sur les sites 2 et 3 le texte est une réponse de décomposition et
+  `apply_delegation_gate` y pratique **déjà** un retry renforcé, et sur le site 4
+  le run est déjà `FailedNoDelegation` et le texte n'atteint jamais la personne
+  (il est gardé quand même parce qu'il atteint le **prochain run**).
+
+- **Le canal ne peut firer que sur un rédacteur qui a résisté à 5h, et c'est une
+  mesure, pas une déduction.** Le tour de re-rédaction est un tour d'agent
+  complet : son EndTurn traverse la garde 5h, qui détecte la même proposition et
+  re-prompte avec **son propre** budget d'un coup. Il faut donc deux réponses
+  proposantes pour que le tour rende un texte sale. Les deux gardes composent
+  sans se dupliquer, et le régime attendu zéro du canal `team_deliverable` en est
+  **doublement** protégé. Épinglé dans les deux sens par
+  `mika2633_v2_une_redaction_encore_sale_donne_la_ligne_neutre` et son contrôle
+  `…_une_proposition_corrigee_par_5h_ne_retient_pas_le_livrable`.
+
+- **La ligne neutre est un livrable, jamais `None`** —
+  `teams::notification` rend déjà « completed (no deliverable produced) » sur
+  `None`, ce qui serait **faux** (un livrable a été produit, il a été retenu) et
+  rendrait un refus indistinguable d'un run sans livrable. **Un seul registre**,
+  contre le motif mika#2290/#2292 : ces deux tickets ont livré deux corps parce
+  que `FAMILY_SOUL` interdit le jargon d'infrastructure, et ici **il n'y a rien à
+  abandonner** — « équipe » et « livrable » sont du français ordinaire. Mesure à
+  l'appui : `run_team` est conditionné à `agents.len() > 1 || !teams.is_empty()`
+  et un tenant famille est mono-agent, donc la population famille est vide en
+  pratique.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Un livrable d'équipe a-t-il été arrêté ?
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel == "team_deliverable")
+           | {team_run_id, deliverable_source, matched_subject, agent_id}'
+
+# 2. La re-rédaction a-t-elle échoué ? (résidu)
+grep guard.testimony_access_proposal_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel == "team_deliverable") | {team_run_id, deliverable_source}'
+
+# 3. CONTRÔLE POSITIF — la garde 5h et les canaux outils tournent-ils encore ?
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel != "team_deliverable") | .channel' | sort | uniq -c
+```
+
+```sql
+-- La ligne neutre réellement servie, par run
+SELECT id, team_name, status, created_at FROM team_runs
+ WHERE deliverable LIKE 'The team finished its work, but its deliverable%'
+ ORDER BY created_at DESC;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `channel = "team_deliverable"` | WARN | **zéro** | chaque ligne est un livrable arrêté avant la personne **et** avant la base |
+| `_uncorrected`, `deliverable_source = "writer"` | WARN | **zéro** | la re-rédaction a échoué **après** que 5h a aussi échoué : lire le prompt servi au rédacteur **avant** de toucher au prédicat |
+| `_uncorrected`, `conversational_gate` \| `no_delegation` | WARN | **zéro** | nominal par conception : ces provenances n'ont pas de re-rédaction |
+| un même `team_run_id` portant plusieurs refus | WARN | **anomalie** | un seul retry est prévu, donc deux lignes signifient un second site de pose — et `mika2633_les_quatre_sites_de_pose_passent_par_le_commit` aurait dû l'empêcher de compiler |
+| `channel != "team_deliverable"` | — | **non vide** | le contrôle positif : zéro partout ne prouve rien |
+
+**Coût daté, nommé plutôt que découvert :** les lignes antérieures au déploiement
+de #2630 ne portent **pas** de champ `channel`, et ne sont pas réécrites (motif
+mika#2361). Une requête `select(.channel == "end_turn")` qui enjambe ce
+déploiement-**là** rend vide ; la requête juste de part en part est
+`select(.channel == null or .channel == "end_turn")`. Ce travail n'ajoute aucune
+borne de ce genre : il ajoute une **valeur** au champ existant — **et** il pose
+ce champ sur la ligne résidu de 5h, qui n'en portait aucun, ce que le scan V7 a
+mesuré.
+
+#### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** Ces sondes décrivent le **binaire servi**. Après `make deploy`,
+> établir que le `mika-spirit` qui tourne porte le correctif avant toute
+> conclusion (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte :
+> la base n'est pas montée dans le bac à sable de dispatch.
+
+**S1 — le défaut fondateur ne se rejoue pas** (premier run d'équipe dont le
+livrable tente). Attendu : une ligne `channel = "team_deliverable"`, et **aucune**
+proposition reçue par la personne ni écrite dans `team_runs.deliverable`.
+*Halte 1 — aucune ligne alors qu'une proposition est partie :* **ne pas élargir le
+prédicat par réflexe.** Lire d'abord le contrôle positif (grep 3) : zéro ligne des
+deux côtés ne prouve rien — *une garde que personne n'a exercée se lit exactement
+comme une garde qui marche* (mika#2205). Puis établir **par quel site** le texte a
+été posé : s'il y en a un cinquième, le scan de pose unique aurait dû l'empêcher
+de compiler, et c'est **lui** qu'il faut lire.
+
+**S2 — la re-rédaction aboutit (30 jours).** `_uncorrected` avec
+`deliverable_source = "writer"` reste vide.
+*Halte 2 — non vide :* le rédacteur ne se corrige **ni** sous 5h **ni** sous la
+demande de re-rédaction. **Ne pas ajouter un second retry** — la famille #953
+tient un budget d'un coup, délibérément, et un second serait la boucle qu'elle
+existe pour éviter. Le levier est la **formulation** de la demande, et c'est un
+ticket sur le corps, pas sur une détection.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus sur un livrable
+ordinaire, et en particulier aucun sur un livrable qui **décline** un accès.
+*Halte 3 — une occurrence :* faux positif, et son coût change de nature par
+rapport à #2630 — là c'était un message qui ne partait pas, ici c'est **un run
+d'équipe entier dont le livrable est jeté**. **Désarmer d'abord** (revert de
+l'appel au prédicat dans `commit_deliverable`), diagnostiquer ensuite.
+
+**S4 — la population hors périmètre.** La requête SQL ci-dessus, une fois, plus
+`SELECT deliverable FROM team_runs ORDER BY created_at DESC LIMIT 10` pour lire ce
+que `history_deliverable` ressert.
+*Halte 4 — une proposition y figure :* ce sont les livrables **pré-déploiement**.
+Le remède est un geste d'opérateur sur la base, **pas** un élargissement de la
+garde à la lecture.
+
+**Halte transverse — les deux sondes muettes.** Zéro refus **et** zéro run
+d'équipe ne prouve rien : il faut qu'un run ait tourné depuis le déploiement.
+Vérifier `SELECT count(*) FROM team_runs WHERE created_at > '<déploiement>'` avant
+toute conclusion.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne rend pas la surface *propose* structurelle.** Le refus lit un texte
+  sortant : il **rattrape avant la transmission**, il ne rend pas l'agent
+  incapable de formuler la proposition. La doctrine maison est *construis
+  l'incapacité, ne promets pas la retenue* (mika#1991), et elle **n'est pas
+  applicable ici** — il n'existe aucune capacité à retirer, le livrable est du
+  texte en langue naturelle. Le dire est la seule façon de ne pas vendre une
+  garantie qui n'existe pas.
+- **Il ne rattrape aucun livrable déjà transmis**, et **rien n'est
+  rétro-estampillé** : la sonde est la **prochaine** occurrence.
+- **Il ne couvre pas les `run.deliverable` déjà persistés** avant ce
+  déploiement, qui continueront d'être resservis en `history_deliverable`.
+  Population bornée (10 derniers runs, `load_team_runs_for_prompt`), nommée, non
+  couverte.
+- **Il ne couvre pas la ligne `messages` que `deliver()` écrit avant la pose.**
+  `TeamEngine::deliver` persiste sa sortie brute sous l'`agent_id` du rédacteur
+  (session `team-<run_id>`) **avant** `commit_deliverable`, donc un livrable
+  refusé peut encore atteindre le résumé de compaction de **cet agent**. Vecteur
+  distinct, rayon de souffle distinct : le fermer demande de modifier
+  `deliver()`, que ce travail tient inchangé à dessein. Borné (une ligne, un
+  agent, une session) et **nommé** plutôt que découvert.
+- **Il ne ferme pas RK5** (la proposition étalée sur deux phrases dont aucune ne
+  porte les deux couches) : le prédicat segmente par phrase, et l'élargir
+  rouvrirait le faux positif que la segmentation existe pour éviter. Hérité de
+  mika#1960, ni élargi ni modifié.
+- **Il ne touche ni la garde 5h, ni le prédicat, ni le re-prompt, ni le budget
+  d'un coup** — seule l'enum de canal gagne une variante, et la ligne résidu de
+  5h gagne le champ `channel` qu'elle ne portait pas.
+- **Il n'ajoute aucune ligne `audit_events` et aucun compteur**, en cohérence
+  explicite avec 5h et #2630 : la famille #953 est journal-only. Les seuls
+  instruments sont les greps et la requête ci-dessus, et **leur silence ne prouve
+  rien tant que personne ne les exécute**.
+- **Il n'ajoute aucune variable d'environnement, et c'est une décision.**
+  Précédent le plus proche : mika#2627, qui n'en a pas non plus, pour la raison
+  qu'il écrit — *un désarmement par variable sur un chemin de doctrine serait un
+  désarmement par coquille*. Le geste de désarmement est un **revert**.
 
 ### La doctrine matérielle est un fait posé ; sa butée est topique (mika#2292)
 
