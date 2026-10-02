@@ -75,6 +75,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::async_db::AsyncDatabase;
+use crate::db::InFlightSelfDevTask;
 use crate::ready_label::{
     self, ReadyApplyOutcome, ReadyApplyRequest, ReadyLabelEvent, ReadyWriteAuth,
 };
@@ -8669,7 +8670,7 @@ This ticket has been GROOMED and is ready.
             task_id: task_id.to_string(),
             status: status.to_string(),
             in_flight_since: crate::timestamp::format(
-                chrono::Utc::now() - chrono::Duration::seconds(secs),
+                &(chrono::Utc::now() - chrono::Duration::seconds(secs)),
             ),
         }
     }
