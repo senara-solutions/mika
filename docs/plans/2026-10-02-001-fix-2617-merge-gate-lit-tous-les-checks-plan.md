@@ -11,11 +11,15 @@ motif rendez-vous), mika#571 (`ci_success_handler`), mika#2248 (qui merge)
 
 ## 1. Ce que la lecture du code déplace dans le ticket
 
-C'est le premier livrable. Douze rectifications, chacune change ce qu'il faut
+C'est le premier livrable. Quinze rectifications, chacune change ce qu'il faut
 écrire. R1–R9 datent de la première passe ; **R10–R12 sont les trois qu'une
 seconde lecture de l'arbre a trouvées, et les trois changent un livrable** —
 l'une ouvre une capacité que le plan supposait acquise, l'autre nomme un second
 lecteur, la troisième rend non livrables les tests tels qu'ils étaient décrits.
+**R13–R15 sont celles d'une troisième lecture, et la première est la plus
+lourde** : elle corrige un compte que ce plan posait lui-même comme une mesure,
+et le consommateur qu'elle ajoute n'hérite pas gratuitement — il change de
+comportement.
 
 ### R1 — `gh run rerun --job <id> --failed` n'est pas une commande valide
 
@@ -48,20 +52,28 @@ avant que la sonde S3 ait observé une relance réussie**. Un plan qui l'annonce
 close poserait la garantie que mika#2304 nomme : un champ qui affirme, avec
 autorité, l'override qui n'a pas eu lieu.
 
-### R4 — `--required` a UN seul lecteur, et les quatre consommateurs en descendent
+### R4 — `--required` a UN seul lecteur, et CINQ consommateurs en descendent
 
-Mesuré par lecture : `run_gh_checks_raw` est le site unique du flag, et sa sortie
-alimente
+Mesuré par lecture : `run_gh_checks_raw` est le site unique du flag (l. 850), et
+sa sortie alimente
 
-| consommateur | via |
-|---|---|
-| `tools::pr_merge_with_gate::execute` (la porte) | `run_gh_checks` → `classify_checks` |
-| `server::verdict_handler` (merge sur verdict) | idem |
-| `server::ci_success_handler` (évaluateur de la boucle) | idem |
-| la garde CI↔verdict de qa-review (mika#2455) | `run_gh_checks_raw` direct → `classify_ci_coherence` → `classify_checks` |
+| consommateur | via | hérite gratuitement ? |
+|---|---|---|
+| `tools::pr_merge_with_gate::execute` (la porte) | `run_gh_checks` → `classify_checks` | oui |
+| `server::verdict_handler` (merge sur verdict) | idem | oui |
+| `server::ci_success_handler` (évaluateur de la boucle) | idem | oui |
+| la garde CI↔verdict de qa-review (mika#2455) | `run_gh_checks_raw` direct → `classify_ci_coherence` → `classify_checks` | oui |
+| `server::ci_failure_handler::fetch_failure_context` (l. 797) | `run_gh_checks` → **filtre `fail\|cancel` à la main** | **non — R13** |
+
+**Les quatre premiers héritent parce qu'ils DÉCIDENT via `classify_checks`, qui ne
+change pas d'une ligne.** Le cinquième ne décide pas : il **collecte**, par un
+filtre écrit à la main, et élargir sa population change ce qu'il collecte — voir
+R13. La première passe de ce plan comptait quatre consommateurs et concluait
+« tous héritent » ; le compte était faux et la conclusion ne vaut que pour quatre
+d'entre eux.
 
 **Le point 4 de « Attendu » — aligner la garde qa-review sur la même source — est
-donc gratuit par construction.** mika#2455 a déjà payé ce lecteur unique, en
+gratuit par construction.** mika#2455 a déjà payé ce lecteur unique, en
 écrivant pourquoi : *« une seconde définition de « requis » est la classe que
 `grooming_marker` (mika#2158) a dû fermer après des mois de divergence
 silencieuse. »* Un seul `--required` à retirer aligne les quatre, et c'est ce qui
@@ -190,6 +202,82 @@ pure** qui reçoit ce que le réseau a produit, et laisser `execute` être la pl
 sur la décision, et le câblage est tenu par le scan d'argv plus l'assertion de
 cardinalité. Voir § 4, réécrit en conséquence.
 
+### R13 — le cinquième consommateur CHANGE de comportement, et ce n'est pas purement un gain
+
+`ci_failure_handler::fetch_failure_context` (l. 787-845) consomme `run_gh_checks`
+puis fait **son propre** filtre `fail|cancel`, et en tire les logs des
+`MAX_FAILING_JOBS` premiers pour composer le contexte de réparation servi au
+modèle. U1 élargit sa population des checks requis à **tous** les checks. Trois
+conséquences, dont la troisième est un coût :
+
+1. **Gain.** Un lint non requis rouge entre désormais dans le contexte : le modèle
+   voit l'échec qu'il doit réparer, là où il recevait un contexte muet sur lui.
+2. **Gain.** La branche `classification != HasFailures` (« CI might have recovered
+   between the event and our check ») devient plus rare — elle se déclenchait
+   quand le rouge n'était pas requis.
+3. **Coût, et c'est celui qu'il faut nommer.** `MAX_FAILING_JOBS` borne le nombre
+   de logs récupérés, et l'ordre est celui de la liste rendue par `gh`. Un vrai
+   échec de build placé derrière plusieurs lints rouges **perd son log** : le
+   contexte de réparation se dégrade exactement sur le cas où il compte le plus.
+
+**Hors périmètre, délibérément, et le refus est raisonné.** Prioriser la liste
+(mettre les échecs de build avant les lints) demande de classer les checks par
+importance, c'est-à-dire de réintroduire une notion de « check qui compte plus »
+— la divergence même que ce ticket ferme. Relever `MAX_FAILING_JOBS` échange un
+contexte tronqué contre un prompt plus gros, sans mesure qui le demande. La
+conséquence est donc **écrite** plutôt que corrigée, et sa précondition de suivi
+est nommée en § 9 : une mesure montrant un contexte d'échec dont le log utile
+manquait.
+
+### R14 — `extract_actions_run_id` serait un SECOND lecteur de la grammaire de lien
+
+`ci_failure_handler::parse_check_link` (l. 850) lit **déjà** la grammaire
+`https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}` et rend
+`(run_id, job_id)`, avec ses tests (l. 1113-1130 : nominal, sans segment `/job/`,
+vide). R2 et U3 proposaient d'écrire `extract_actions_run_id` : un jumeau de la
+même grammaire, dans le même crate, sur une maison qui tient le lecteur unique —
+et ce plan invoque lui-même ce principe à R11 pour refuser un second lecteur du
+head SHA. Être incohérent d'une rectification à l'autre serait pire que les deux
+choix.
+
+**Le remède est la promotion, pas le jumeau.** `parse_check_link` devient le
+lecteur unique : remonté en `pub(crate)` dans un module partagé, il garde ses
+tests et sa sémantique, et U3 en dérive le `run_id`. La seule chose à ajouter est
+la conversion en `u64` (il rend des `&str` aujourd'hui) et le refus d'un `run_id`
+non numérique — qui est précisément un des cas que U3 devait couvrir, donc
+l'affaire est un déplacement de test, pas une écriture neuve. **Différence à
+connaître avant de déplacer :** `parse_check_link` exige le segment `/job/` et
+rend `None` sans lui, ce que son propre test `parse_check_link_no_job_segment`
+épingle. Un lien de run sans job — forme qu'un check non-Actions ou une API
+future pourrait produire — rend donc `None` et U3 le lira comme `NoActionsRun`,
+c'est-à-dire aucune relance. C'est le bon sens de défaut, et il est **hérité
+plutôt que décidé** : à dire, pour qu'un futur lecteur ne le prenne pas pour un
+oubli.
+
+### R15 — quatre call sites de `run_gh_merge`, pas trois, et U2 les ramène à trois
+
+R8 dit « trois sites appellent `run_gh_merge` » : exact au **fichier**, faux au
+**call site**. Le tool en porte deux —
+`pr_merge_with_gate.rs:338` (`auto = true`, branche `HasPending`) et `:382`
+(`auto = false`, branche `AllPassed`) — plus `verdict_handler.rs:649` et
+`merge_ready_handler.rs:244`. Soit **quatre**.
+
+Le § 4 prévoit « l'assertion de cardinalité sur les sites de `run_gh_merge` » :
+une assertion qui porterait `3` serait rouge au premier jour, et quelqu'un la
+« corrigerait » en montant le nombre sans lire pourquoi. **Le nombre qu'elle doit
+porter est celui d'APRÈS U2, soit trois** — le retrait du paramètre `auto` fait
+disparaître la branche `HasPending` du tool, qui ne merge plus mais refuse
+(`checks_pending`). La cardinalité est donc à la fois une mesure et une
+conséquence d'U2, et c'est ce qui la rend porteuse : si elle reste à quatre après
+implémentation, U2 n'a pas pris.
+
+**Un vestige de plus à corriger, trouvé au même endroit :** le commentaire en
+ligne de `merge_ready_handler.rs:248` dit *« not auto — the evaluator already
+aggregated every required check »*. Comme le doc-comment de `run_gh_checks_raw`
+(U1), il affirmera l'inverse du code après U1. Même remède : le corriger dans le
+même changement, sinon le prochain lecteur restaure la sémantique en croyant
+réparer une incohérence.
+
 ---
 
 ## 2. Requirements
@@ -208,6 +296,13 @@ cardinalité. Voir § 4, réécrit en conséquence.
   required check** » → « aucun check du tout »).
 - `classify_checks` et `classify_ci_coherence` ne bougent pas d'une ligne : elles
   héritent (R4).
+- **`ci_failure_handler::fetch_failure_context` hérite lui aussi, mais il
+  COLLECTE au lieu de décider (R13).** Aucune ligne n'y est modifiée, et la
+  conséquence est à documenter, pas à compenser : le doc-comment de
+  `fetch_failure_context` apprend que sa population est désormais tous les checks
+  rouges, et que la troncature à `MAX_FAILING_JOBS` peut donc écarter le log d'un
+  échec de build placé derrière des lints. Un futur lecteur qui constate un
+  contexte d'échec incomplet doit trouver la raison écrite, pas la redécouvrir.
 - Ligne `merge_gate_unknown_check_bucket` (WARN, champs `repo`, `pr`, `name`,
   `bucket`) sur tout bucket hors `{pass, fail, pending, skipping, cancel}` (R6).
   **Pas** de ligne par évaluation nominale (doctrine mika#2131).
@@ -236,13 +331,30 @@ cardinalité. Voir § 4, réécrit en conséquence.
   `checks_pending` (renommé `write_pending_pr_url_to_supervisor`) : un déplacement
   d'appel, pas un mécanisme neuf.
 - La taxonomie `BlockReason` des trois prompts `self-dev*` apprend
-  `checks_paused`… **non** : `checks_pending`, à l'identique du nom de fil, et
-  rien d'autre.
+  `checks_pending`, à l'identique du nom de fil, et rien d'autre.
+- **Cardinalité attendue après U2 : trois call sites de `run_gh_merge`** (R15) —
+  `pr_merge_with_gate` n'en garde qu'un (la branche `AllPassed` ; celle de
+  `HasPending` refuse désormais), plus `verdict_handler` et
+  `merge_ready_handler`. L'assertion du § 4 porte **trois**, et sa valeur est
+  qu'elle reste rouge tant qu'U2 n'a pas pris.
+- **Vestige à corriger dans le même changement (R15) :** le commentaire en ligne
+  de `merge_ready_handler.rs:248` (« the evaluator already aggregated every
+  required check ») dira l'inverse du code après U1, exactement comme le
+  doc-comment de `run_gh_checks_raw`.
 
 ### U3 — relance une fois, puis blocage (AC2)
 
-- `extract_actions_run_id(link: &str) -> Option<u64>` — pure, R2. Rend `None` sur
-  lien absent, vide, non-Actions, ou `run_id` non numérique.
+- **Le lecteur du lien est `parse_check_link`, PROMU — pas un jumeau (R14).**
+  `ci_failure_handler::parse_check_link` lit déjà cette grammaire avec ses tests ;
+  il est remonté en `pub(crate)` dans un module partagé et devient le site unique.
+  U3 en dérive le `run_id` et n'ajoute que la conversion `&str → u64`, avec refus
+  d'un `run_id` non numérique. Écrire `extract_actions_run_id` à côté serait le
+  second lecteur que R11 refuse pour le head SHA — on ne peut pas tenir le
+  principe à une rectification et l'abandonner à l'autre.
+- **Comportement hérité, nommé plutôt que redécouvert (R14) :** `parse_check_link`
+  exige le segment `/job/` et rend `None` sans lui. Un lien de run sans job est
+  donc lu `NoActionsRun`, c'est-à-dire aucune relance — bon sens de défaut, et
+  épinglé comme tel pour qu'il ne passe pas pour un oubli.
 - `rerun_failed_jobs(repo, run_id, token)` → `gh run rerun <run_id> --failed`
   (R1), borné par `tokio::time::timeout`, 30 s.
 - **Ledger durable**, parce qu'un ledger en mémoire ne tient pas « jamais de
@@ -400,7 +512,9 @@ peut rougir sur l'arbre tel qu'il est après U1.
 | `mika2617_gh_checks_args_carries_no_required_flag` | **vu rouge sur le code actuel** — R9, le seul test qui rougit |
 | `mika2617_gh_checks_args_still_requests_the_link_field` | la relance (U3) dépend de `link` ; le perdre la rendrait inerte sans rien casser |
 | `mika2617_classify_checks_is_blind_to_the_check_name` | AC3, test de propriété sur 25 noms |
-| `mika2617_extract_actions_run_id_*` | lien nominal ; absent ; non-Actions ; `run_id` non numérique ; lien d'un autre dépôt |
+| `mika2617_run_id_has_a_single_link_reader` | scan de source : aucune seconde fonction ne lit la grammaire `actions/runs/…` hors du lecteur promu (R14), allowlist livrée vide, avec son contrôle de bonne foi |
+| `mika2617_run_id_from_link_*` | contre le lecteur **promu** (R14) : lien nominal ; absent ; non-Actions ; `run_id` non numérique ; **lien de run sans segment `/job/`** (comportement hérité → `NoActionsRun`) |
+| `mika2617_run_gh_merge_has_exactly_three_call_sites` | R15 — **trois après U2**, donc rouge tant qu'U2 n'a pas pris ; l'assertion est autant une mesure d'U2 qu'une garde |
 | `mika2617_extract_mpc_gate_shas_*` | marqueur nominal ; plusieurs commentaires ; sha tronqué ; marqueur dans un bloc de code (**contrôle négatif**) |
 | `mika2617_mpc_gate_verdict_*` | `NotRequired` hors population ; `Attested` sur égalité ; `StaleSha` sur divergence ; `Missing` sur absence et sur illisible |
 | `mika2617_merge_clearance_is_not_constructible_from_a_refusal` | le témoin de type ne se fabrique pas depuis `Missing`/`StaleSha` |
@@ -649,6 +763,13 @@ exercée se lit exactement comme une garde qui marche* (mika#2205).
   les requêtes du § 6, et **leur silence ne prouve rien tant que personne ne les
   exécute**.
 - **Il ne ferme pas le fail-open sur un bucket inconnu** (R6) : il le rend visible.
+- **Il dégrade un cas du contexte de réparation, et c'est un coût assumé (R13).**
+  `ci_failure_handler` collecte désormais les logs parmi **tous** les checks
+  rouges, bornés à `MAX_FAILING_JOBS` : un échec de build placé derrière
+  plusieurs lints rouges perd son log. Prioriser la liste réintroduirait une
+  notion de « check qui compte plus », c'est-à-dire la divergence que ce ticket
+  ferme ; relever la borne échange un contexte tronqué contre un prompt plus gros
+  sans mesure qui le demande. Nommé en § 9 avec sa précondition.
 - **Il n'atteste pas qu'`execute` obéit à la décision** (R12). La décision est une
   fonction pure testée en treize cas ; que `execute` l'appelle, et l'appelle avec les
   bons arguments, est tenu par le scan d'argv, la cardinalité des sites de merge et le
@@ -677,6 +798,10 @@ exercée se lit exactement comme une garde qui marche* (mika#2205).
   revue correctement.
 - **La fermeture du fail-open sur un bucket inconnu** (R6) — précondition : que la
   commande 5 rende au moins une ligne.
+- **La priorisation des logs d'échec de `ci_failure_handler`** (R13) — précondition :
+  une mesure montrant un contexte de réparation dont le log utile manquait parce
+  que des lints occupaient les `MAX_FAILING_JOBS` places. Ni la priorisation ni le
+  relèvement de la borne ne sont faits ici, et les deux refus sont raisonnés en R13.
 - **Le retrait de la relance** (S5) — précondition : la mesure de S5.
 - **`MergeGateResult::AutoMergeEnabled`** : conservé comme format de fil, aucun
   renommage, aucun retrait.
@@ -709,7 +834,19 @@ exercée se lit exactement comme une garde qui marche* (mika#2205).
 - [ ] Les trois prompts `self-dev*` apprennent `checks_pending` dans leur taxonomie
       `BlockReason` (U2).
 - [ ] Le doc-comment de `run_gh_checks_raw` ne dit plus l'inverse de ce que fait le
-      code, et porte la mesure du 2026-10-01 avec sa date (U1).
+      code, et porte la mesure du 2026-10-01 avec sa date (U1). **Deux autres
+      vestiges du même mot sont corrigés dans le même changement** : celui de
+      `parse_gh_checks` (« no required check ») et le commentaire en ligne de
+      `merge_ready_handler.rs:248` (R15).
+- [ ] `parse_check_link` est le **lecteur unique** de la grammaire de lien
+      (R14) : promu, pas dupliqué ; son scan de source passe, allowlist vide ; et
+      le comportement hérité « pas de segment `/job/` ⇒ `NoActionsRun` » est
+      épinglé par un test plutôt que laissé à découvrir.
+- [ ] L'assertion de cardinalité rend **trois** call sites de `run_gh_merge`
+      (R15) — elle est rouge tant qu'U2 n'a pas pris, et c'est sa valeur.
+- [ ] Le doc-comment de `ci_failure_handler::fetch_failure_context` nomme sa
+      population élargie et la troncature qui peut en découler (R13), et le corps
+      de la PR porte ce coût dans son « ce que ça n'achète pas ».
 - [ ] `crates/mika-agent/CLAUDE.md` § *PR Merge Gate* et la racine `CLAUDE.md`
       portent la nouvelle sémantique, les cinq surfaces opérateur, les six sondes
       et leurs haltes, et le § *Ce que ça n'achète pas*.
