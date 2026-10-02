@@ -181,7 +181,7 @@ fn mika2638_la_table_de_delimitation_du_site_en_vol() {
 #[test]
 fn mika2638_le_joker_underscore_de_like_est_ferme() {
     let db = db();
-    seed_parent(&db, &issue_url("acme/myXrepo", 42));
+    let parent = seed_parent(&db, &issue_url("acme/myXrepo", 42));
 
     assert!(
         db.find_active_self_dev_task_for_issue("mika", &issue_url("acme/my_repo", 42))
@@ -190,6 +190,15 @@ fn mika2638_le_joker_underscore_de_like_est_ferme() {
         "`_` a été lu comme un joker `LIKE` : la sonde de `my_repo` a trouvé la \
          tâche de `myXrepo` (mika#2638, R3)"
     );
+
+    // CONTRÔLE POSITIF sur la fixture elle-même, relevé en revue : sans lui ce
+    // test ne distingue pas « le joker est fermé » de « cette fixture
+    // n'enregistre rien », et il passerait sur un arbre où le seed est cassé.
+    let found = db
+        .find_active_self_dev_task_for_issue("mika", &issue_url("acme/myXrepo", 42))
+        .expect("la sonde doit répondre")
+        .expect("la fixture doit être enregistrée sous son propre dépôt");
+    assert_eq!(found.task_id, parent);
 }
 
 /// **V3 — non-régression mika#1934 : le site déjà correct reste correct.**

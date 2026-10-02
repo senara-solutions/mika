@@ -4623,7 +4623,12 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
                 }
                 // La moitié POSITIVE : les sites déjà délimités. Elle sert
                 // l'anti-vacuité plus bas.
-                if t.contains(" IN (") {
+                // Normalisé pour les mêmes raisons que D5 ci-dessous : `IN(`
+                // sans espace, ou la colonne et l'opérateur séparés par un
+                // retour à la ligne, sont des formes que `cargo fmt` ne touche
+                // pas dans un littéral SQL.
+                let compacte = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                if compacte.contains(" IN (") || compacte.contains(" IN(") {
                     population_in += 1;
                 }
                 if !t.contains(&operateur) {
@@ -4651,11 +4656,13 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             "mika#2638 — seulement {population_in} comparaison(s) `{colonne} IN (…)` \
              vue(s), attendu au moins 5 : les deux sondes de vol, le nettoyage de \
              mika#1934, et les deux lecteurs de verdict de groom \
-             (`has_completed_groom_for_issue`, `latest_groom_verdict_for_issue`). \
-             Ce scan ne voit plus les sites qu'il existe pour protéger.\n\n\
-             NOTE : ce seuil est un PLANCHER sur la population que le scan compte, \
-             pas sur les appelants du helper — c'est `mika2638_le_lecteur_unique_\
-             des_variantes_a_trois_appelants` qui tient la seconde moitié."
+             (`has_completed_groom_for_issue`, `latest_groom_verdict_for_issue`).\n\n\
+             DEUX LECTURES, et la seconde est la plus probable : soit une requête \
+             protégée a disparu, soit ce seuil est à zéro marge et vous venez de \
+             REFORMATER un littéral SQL. La recherche est faite sur la forme \
+             normalisée en espaces simples, donc un retour à la ligne ne devrait \
+             pas suffire — mais renommer la colonne ou scinder la requête, oui. \
+             Vérifiez d'abord les cinq sites avant de toucher au scan."
         );
 
         assert!(
@@ -4678,13 +4685,12 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// elle rougit le jour de la réparation, pas des mois après.
     #[test]
     fn mika2638_lallowlist_du_scan_ne_porte_que_des_entrees_vivantes() {
-        assert!(
-            !REFERENCE_URL_LIKE_ALLOWED.is_empty(),
-            "REFERENCE_URL_LIKE_ALLOWED est livrée avec UNE entrée déclarée \
-             (le prédicat sur le domaine). Une table vide signifie qu'elle a été \
-             purgée sans que le scan soit relu."
-        );
-
+        // Pas d'assertion « la table n'est pas vide », relevé en revue : le jour
+        // où le prédicat sur le domaine est retiré de `db/tasks.rs`, l'état sain
+        // de cette table EST le vide — la doctrine mika#2201 est « on délimite le
+        // site, on n'ajoute pas de ligne », donc une table qui se vide est un
+        // progrès, pas une purge à signaler. Seule la liveness par entrée est
+        // asserée.
         let arbre = db_layer_sources();
         for (donnee, raison) in REFERENCE_URL_LIKE_ALLOWED {
             assert!(
@@ -4739,7 +4745,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// ne voit pas (un appelant hors de `db/`, comme un futur lecteur dans
     /// `auto_pull`).
     #[test]
-    fn mika2638_le_lecteur_unique_des_variantes_a_trois_appelants() {
+    fn mika2638_toute_requete_de_la_couche_db_passe_par_le_lecteur_unique() {
         let symbole = format!("issue_url{}", "_variants");
         let appel = format!("{symbole}(");
         let colonne = format!("reference{}", "_url");
@@ -4786,16 +4792,30 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
         );
 
         // La seconde direction : l'exhaustivité sur la couche DB.
+        //
+        // Le code est NORMALISÉ en espaces simples avant la recherche, et c'est
+        // porteur : relevé en revue, `IN (` nu s'évite par `IN(?2, ?3)` ou par
+        // un retour à la ligne entre la colonne et l'opérateur — deux formes que
+        // `cargo fmt` ne touche pas, le SQL étant un littéral de chaîne. Le
+        // prédicat porterait sinon sur la mise en forme plutôt que sur la
+        // comparaison.
         let mut bypasses: Vec<String> = Vec::new();
         let mut corps_vus = 0usize;
+        let aiguille_in = format!("{colonne} IN (");
         for (rel, content) in db_layer_sources() {
             for (nom, corps) in crate::source_scan::fn_bodies(content.as_str()) {
                 let code = crate::source_scan::strip_comment_lines(corps.as_str());
-                if !code.contains(&format!("{colonne} IN (")) {
+                let normalise = code.split_whitespace().collect::<Vec<_>>().join(" ");
+                // `IN(` sans espace, et la colonne qualifiée (`parent.reference_url`),
+                // sont couvertes : la recherche est une sous-chaîne sur la forme
+                // normalisée, et `aiguille_in` ne porte pas d'ancrage à gauche.
+                if !normalise.contains(&aiguille_in)
+                    && !normalise.contains(&format!("{colonne} IN("))
+                {
                     continue;
                 }
                 corps_vus += 1;
-                if !code.contains(&appel) {
+                if !normalise.contains(&appel) {
                     bypasses.push(format!("{rel}::{nom}"));
                 }
             }

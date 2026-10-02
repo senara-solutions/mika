@@ -253,13 +253,15 @@ pub fn strip_groom_phase_suffix(reference_url: &str) -> &str {
 /// Les deux — et seulement les deux — écritures de `reference_url` qui
 /// désignent une issue donnée (mika#2638).
 ///
-/// `base_url` DOIT être canonique (sans `?phase=groom`). Les appelants y
-/// arrivent par deux chemins et un seul nettoie : les sondes de vol
+/// `base_url` est **normalisé ici** : le helper retire lui-même un
+/// `?phase=groom` résiduel via [`strip_groom_phase_suffix`], qui est idempotent.
+/// Les appelants y arrivent par deux chemins — les sondes de vol
 /// **construisent** l'URL depuis `owner/repo` + numéro, donc elle est canonique
 /// par construction ; les surfaces de nettoyage de mika#1934 reçoivent une
-/// `reference_url` de la base et la nettoient via [`strip_groom_phase_suffix`].
-/// Dire « les appelants nettoient » tout court ferait croire à un futur
-/// cinquième appelant que le nettoyage est assuré en amont.
+/// `reference_url` de la base et la nettoyaient déjà en amont. La normalisation
+/// interne ne change donc **aucune** sortie actuelle : elle rend le helper
+/// fail-safe pour un futur appelant, au lieu de faire dépendre sa justesse
+/// d'une précondition que rien ne vérifie.
 ///
 /// # Pourquoi une énumération, et jamais un préfixe `LIKE`
 ///
@@ -330,14 +332,38 @@ pub fn strip_groom_phase_suffix(reference_url: &str) -> &str {
 ///
 /// Passer du préfixe à l'énumération **rétrécit** : une ligne portant
 /// `…/issues/2638/` ou `…/issues/2638#issuecomment-1` était vue en vol hier et
-/// ne l'est plus. C'est borné parce qu'une telle ligne est **déjà** hors de
-/// `idx_tasks_manual_active_ref_url` (`UNIQUE(agent_id, reference_url)`), donc
-/// déjà un défaut en amont et plus grave que celui-ci : une sonde plus
-/// permissive que son propre index de dédup est l'incohérence. La sonde
-/// opérateur qui établit que l'ensemble est bien clos vit dans
-/// `docs/plans/2026-10-02-002-fix-2638-reference-url-numero-delimite-plan.md`
-/// § 8 S1.
+/// ne l'est plus.
+///
+/// **Ce que cette borne dit exactement**, parce que la formulation courte est
+/// fausse et qu'une revue l'a relevée : une telle ligne n'est **pas** « hors de
+/// `idx_tasks_manual_active_ref_url` » — cet index est
+/// `UNIQUE(agent_id, reference_url)` sur un prédicat partiel, donc la ligne y
+/// entre sous **sa propre** clé. Ce qui est vrai, et qui est la borne, est
+/// qu'elle **ne dédoublonne pas** contre la ligne canonique : les deux
+/// coexistent comme deux tâches actives pour la même issue. C'est donc déjà un
+/// défaut en amont, et plus grave que celui-ci.
+///
+/// **Le rétrécissement n'est pas purement théorique, et son écrivain est
+/// nommé.** Tous les écrivains **moteur** composent l'URL par `format!` à
+/// partir de littéraux et de `owner/repo`, donc ne produisent que les deux
+/// variantes. L'outil `create_task`, lui, prend `reference_url` de l'entrée du
+/// modèle avec un `.trim()` pour seule normalisation : une forme non prescrite
+/// écrite par là sort de la population des sondes, et une tâche en vol
+/// redevient invisible — c'est-à-dire la porte 2c de mika#2279 qui laisse
+/// repartir un dispatch. Population **non mesurée** (le prompt ne prescrit que
+/// les deux variantes déclarées), remède hors périmètre de mika#2638 : la
+/// canonicalisation appartient au **point d'écriture**, pas au prédicat de
+/// lecture. Précondition du suivi : la sonde opérateur § 8 S1 de
+/// `docs/plans/2026-10-02-002-fix-2638-reference-url-numero-delimite-plan.md`,
+/// qui dit si l'ensemble est clos en production.
 pub fn issue_url_variants(base_url: &str) -> [String; 2] {
+    // Le helper NORMALISE au lieu d'exiger. `strip_groom_phase_suffix` est
+    // idempotent, donc les deux appelants qui nettoient déjà en amont rendent
+    // exactement la même paire qu'avant — et un futur sixième appelant qui
+    // passerait une `reference_url` lue en base sans la nettoyer obtiendrait
+    // sinon `…?phase=groom` et `…?phase=groom?phase=groom`, c'est-à-dire une
+    // paire qui n'apparie **rien** : un silence, la pire des trois issues.
+    let base_url = strip_groom_phase_suffix(base_url);
     [
         base_url.to_string(),
         format!("{base_url}{GROOM_PHASE_SUFFIX}"),
@@ -771,6 +797,39 @@ pub struct TaskHealthSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // mika#2638 — le helper aux bornes, et l'ORDRE de ses deux fentes.
+    //
+    // Les cinq consommateurs passent la paire dans un `reference_url IN (?2, ?3)`,
+    // qui est **indifférent à l'ordre**. Donc inverser `[base, base+suffixe]`
+    // laisserait les dix tests de mika#2638 verts pendant que les cinq
+    // destructurations `let [exact, groom] = …` nomment chacune la mauvaise
+    // valeur — un renommage silencieux qu'aucun test de consommateur ne peut
+    // voir (relevé en revue). Ces deux tests sont le seul endroit où l'ordre
+    // est observable.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn mika2638_la_premiere_fente_est_lurl_exacte_la_seconde_la_variante_groom() {
+        let [exact, groom] = issue_url_variants("https://github.com/o/r/issues/42");
+        assert_eq!(exact, "https://github.com/o/r/issues/42");
+        assert_eq!(groom, "https://github.com/o/r/issues/42?phase=groom");
+    }
+
+    /// Le helper NORMALISE au lieu d'exiger : une URL portant déjà le suffixe
+    /// rend la même paire qu'une URL canonique. Sans ça, un futur appelant qui
+    /// passerait une `reference_url` lue en base obtiendrait une paire
+    /// n'appariant rien — un silence, pas une erreur.
+    #[test]
+    fn mika2638_le_helper_est_idempotent_sur_le_suffixe_groom() {
+        let base = "https://github.com/o/r/issues/42";
+        assert_eq!(
+            issue_url_variants(&format!("{base}{GROOM_PHASE_SUFFIX}")),
+            issue_url_variants(base),
+            "un `?phase=groom` résiduel doit être retiré par le helper"
+        );
+    }
 
     // ---------------------------------------------------------------------
     // mika#2590 U8c — la fonction pure aux bornes.
