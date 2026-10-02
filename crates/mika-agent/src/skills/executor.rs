@@ -25,6 +25,65 @@ use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 /// Maximum output size from a skill tool (10,000 characters).
 const MAX_OUTPUT_LEN: usize = 10_000;
 
+/// Exit code under which `dispatch-lib.sh`'s pre-flight stamps "the claude-pilot
+/// LAUNCHER did not start" (mika#2634).
+///
+/// **The engine classifies on this code and infers nothing.** The ticket
+/// proposed the conjunction *non-zero exit AND no claude-pilot log*; it has four
+/// measurable false positives in this repo — the containment refusal (exit 78,
+/// mika#2049, which has no log either and whose own text names its cause), the
+/// mika#2012 `already_groomed` refusal and the dry-run (both exit 0, so the
+/// conjunction only looks safe), and the mika#2536 `cwd-guard` refusal on a
+/// sibling skill. It would also make this a SECOND reader of
+/// `<pilot_log_dir>/<task-id>.log`, whose first is
+/// [`crate::task_engine::engine`]'s `probe_pilot_log_signal` (mika#2277) — the
+/// duplication class mika#2158 had to close, and not a free one here:
+/// [`spawn_long_running_exec`] receives no `Settings`, so the path would have to
+/// be threaded through or the config-rs cascade re-read by hand.
+///
+/// House doctrine, written three times: *PR origin is a fact stamped by its
+/// producer, never reconstructed afterwards* (mika#2026); *the engine is told,
+/// never derives* (mika#2249); *la cible PR est dite, jamais dérivée*
+/// (mika#2368, which condemns the LATE derivation by name).
+///
+/// **79 is free, and the neighbourhood is the argument.** 78 is taken by the
+/// containment refusal — same semantic family, "nothing was launched" — 64..78
+/// are the `sysexits.h` range, 126/127/128+ are reserved by the shell.
+///
+/// **Named cost:** the value is written twice, here and in
+/// `skills/bundled/_shared/dispatch-lib.sh` (`_EXIT_LAUNCHER_DEAD`). No
+/// cross-language single-source exists; this is the duplication mika#2520 had to
+/// accept for `GIT_OPS_PROTECTED_BRANCHES`. It is **guarded** by
+/// `tests::mika2634::the_exit_code_agrees_with_the_shell`, which reads the shell
+/// literal from this crate and compares it **both ways** — the shape
+/// `check-dispatch-seats-declared.sh` already uses, so the two cannot drift in
+/// either direction.
+const EXIT_PILOT_LAUNCHER_DEAD: i32 = 79;
+
+/// Audit `tool_name` under which the launcher's health is recorded (mika#2634).
+///
+/// **SOLE WRITER.** This module is the only production site that writes it, and
+/// `tests::mika2634::the_audit_name_has_a_single_writer` refuses a second one.
+/// That property is what makes the operator's
+/// `SELECT after_value, count(*) … WHERE tool_name = 'pilot_launcher_health'
+/// GROUP BY 1` an exact, subtractable count rather than a number two writers can
+/// disagree about.
+///
+/// **One name, the issue in `after_value`** — the `ready_label_outcome` shape
+/// (mika#2323) rather than the two names of `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156). The discriminant between the two motifs
+/// is whether each name carries its own cause: here `dead` and (in phase B)
+/// `recovered` belong to the same site and the same population, and one
+/// `GROUP BY` returns both counts.
+const PILOT_LAUNCHER_HEALTH_TOOL: &str = "pilot_launcher_health";
+
+/// `after_value` for a dispatch whose launcher did not start (mika#2634).
+///
+/// A wire format: it lands in `audit_events.after_value` and operators
+/// `GROUP BY` it, so two spellings would split one population without saying so.
+/// One definition site, pinned by `tests::mika2634`.
+const PILOT_LAUNCHER_DEAD_VALUE: &str = "dead";
+
 /// Plancher sous lequel une commande de build ne peut pas aboutir (mika#2423).
 ///
 /// 120 s : très au-dessus de tout budget de skill court (30 s, le défaut de
@@ -4739,21 +4798,31 @@ pub(crate) fn spawn_long_running_exec(
             let stderr_bytes = stderr_text.len();
 
             let err_msg = format!("Process {code_display}: {}", truncate_output(&stderr_text));
+            // mika#2634 — captured so the launcher-dead line below can report it
+            // as a MEASUREMENT rather than as a field it leaves empty. `None` is
+            // the DB-error arm: not knowing whether the row was terminal is a
+            // third state, and rendering it as `false` would be a lie of the
+            // kind mika#2331 names (`null` is never `0`).
+            let mut task_was_terminal: Option<bool> = None;
             match db.update_task_failed(&task_id, &err_msg).await {
-                Ok(true) => warn!(
-                    event = "long_running_handler_exit_nonzero",
-                    task_id = %task_id,
-                    %code_display,
-                    task_was_terminal = false,
-                    stderr_bytes,
-                    stderr_persisted,
-                    "long-running exec failed"
-                ),
+                Ok(true) => {
+                    task_was_terminal = Some(false);
+                    warn!(
+                        event = "long_running_handler_exit_nonzero",
+                        task_id = %task_id,
+                        %code_display,
+                        task_was_terminal = false,
+                        stderr_bytes,
+                        stderr_persisted,
+                        "long-running exec failed"
+                    )
+                }
                 Ok(false) => {
                     // The case mika#2532 was filed for: the handler's EXIT trap
                     // delivered its callback, so the row is already terminal and
                     // `err_msg` — which names the cause — reaches nothing. It is
                     // now on the row's metadata, whatever this arm does.
+                    task_was_terminal = Some(true);
                     info!(
                         event = "long_running_handler_exit_nonzero",
                         task_id = %task_id,
@@ -4766,6 +4835,77 @@ pub(crate) fn spawn_long_running_exec(
                 }
                 Err(db_err) => {
                     warn!(task_id = %task_id, error = %db_err, "failed to mark long-running exec failure in DB")
+                }
+            }
+
+            // mika#2634 AC1 — a dead LAUNCHER is a distinct fact, said under its
+            // own name.
+            //
+            // Emitted **in addition to** the generic
+            // `long_running_handler_exit_nonzero` above, which is neither
+            // removed nor modified: a dead launcher IS a non-zero exit, and
+            // dropping the generic line would break the published queries (the
+            // mika#2532 surfaces among them). What AC1 asks is that the event
+            // not be *drowned* in ordinary failures, and a second name is what
+            // gives that — a field on the existing line would not, since a
+            // `GROUP BY` over one name cannot separate two populations.
+            //
+            // Placed AFTER the match so `task_was_terminal` is a measurement
+            // rather than a guess, and that field is what proves the other half
+            // of this ticket took: with the trap now armed before the smoke
+            // test, the callback IS delivered, so the expected value here is
+            // `true`. A `false` means the trap did not fire and the pre-flight
+            // is exiting before it again.
+            //
+            // The predicate is the exit code and nothing else — no log-path
+            // read, no inference. See [`EXIT_PILOT_LAUNCHER_DEAD`] for the four
+            // false positives that removes.
+            if status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD) {
+                warn!(
+                    event = "pilot_launcher_dead",
+                    task_id = %task_id,
+                    %code_display,
+                    task_was_terminal,
+                    stderr_bytes,
+                    stderr_persisted,
+                    skill_dir = %skill_dir.display(),
+                    "mika#2634: the claude-pilot LAUNCHER did not start — no pilot ran, and \
+                     every further dispatch dies the same way until the HOST is repaired. \
+                     Remedy: `uv tool install --reinstall --force --editable \
+                     ./claude-pilot-py`, then check `head -1 ~/.local/bin/claude-pilot`"
+                );
+
+                // Fire-and-forget, like the `handler_failure` stamp above and
+                // its four siblings: an observability write must never be able
+                // to break the delivery it observes.
+                //
+                // `session_id` is composed rather than read off the row: the row
+                // is reachable (`get_task_unscoped`) but one extra query per
+                // dead launcher buys nothing — this is a callback child, and
+                // `callback-<id>` is exactly the fallback
+                // `try_report_pilot_cost_overrun` lands on for the same rows.
+                if let Err(db_err) = db
+                    .log_audit_event(
+                        &format!("callback-{task_id}"),
+                        PILOT_LAUNCHER_HEALTH_TOOL,
+                        &format!("task:{task_id}"),
+                        None,
+                        Some(PILOT_LAUNCHER_DEAD_VALUE),
+                        Some(&format!(
+                            "exit:{EXIT_PILOT_LAUNCHER_DEAD} skill_dir:{} stderr_bytes:{stderr_bytes}",
+                            skill_dir.display()
+                        )),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(
+                        event = "pilot_launcher_dead_audit_failed",
+                        task_id = %task_id,
+                        error = %db_err,
+                        "mika#2634: the WARN went out but the audit row did not — the \
+                         `GROUP BY after_value` count under-counts from here on"
+                    );
                 }
             }
         }
@@ -12308,6 +12448,433 @@ Harness ticket.
             assert!(
                 failure.get("stderr").is_none(),
                 "fd 2 stayed mute, so the key must be ABSENT — never an empty string"
+            );
+        }
+    }
+
+    /// mika#2634 — a dead LAUNCHER is classified, said, and counted apart from
+    /// a pilot that failed.
+    ///
+    /// # What is asserted, and what deliberately is not
+    ///
+    /// The observable is the **`audit_events` row**, not the `warn!` line. The
+    /// row is the durable surface — it is what the operator's `GROUP BY
+    /// after_value` reads — and asserting on it keeps these tests free of a
+    /// tracing subscriber. The log line is covered structurally instead:
+    /// [`the_warn_and_the_audit_row_share_one_predicate`] pins that both are
+    /// emitted inside the same `if`, so a future edit cannot keep the row and
+    /// silently lose the line (or the reverse).
+    ///
+    /// # Fire-Disposition
+    ///
+    /// **(c) halt-and-surface, blocking CI gate**, with the allowlists of the
+    /// two source scans shipped **empty** and a sibling test pinning that they
+    /// stay empty. A red here means either the launcher-dead class is being
+    /// drowned in ordinary failures again (the defect), or that an ordinary
+    /// failure is being reported as a dead launcher (probe S3's halt, which asks
+    /// for a disarm *before* diagnosis).
+    mod mika2634 {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::Database;
+        use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
+
+        /// Same budget and same reasoning as its mika#2532 sibling: long enough
+        /// that a green run says something, short enough that a red one does not
+        /// hang CI.
+        const SETTLE_MS: u64 = 4_000;
+
+        /// Residual window the two negative controls leave between the barrier
+        /// ([`require_handler_failure`]) and their absence assertion.
+        ///
+        /// **It is NOT a settle delay** — the barrier has already established
+        /// that the failure path ran. It covers only the handful of instructions
+        /// between `set_task_handler_failure` returning and the
+        /// `if status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD)` block posting its
+        /// `log_audit_event`: both writes travel the same `AsyncDatabase`
+        /// channel, so they are ordered, but the spawned task yields at the
+        /// `await` in between and a loaded worker can be pre-empted there.
+        /// 250 ms is ~three orders of magnitude over the need and 16× cheaper
+        /// than the blind 4 s these controls used to sleep.
+        const NEGATIVE_CONTROL_MARGIN_MS: u64 = 250;
+
+        fn db() -> AsyncDatabase {
+            AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
+        }
+
+        /// A callback row built through the production write path
+        /// ([`build_callback_task`]), deliberately — a hand-assembled `NewTask`
+        /// would be a fixture and the code agreeing with each other, which
+        /// mika#2272 measured the cost of on this very file.
+        async fn callback_row(db: &AsyncDatabase) -> String {
+            let task = build_callback_task(
+                "mika".to_string(),
+                None,
+                "run_claude_pilot",
+                &serde_json::json!({}),
+                600,
+                "session-2634",
+                "trace-2634",
+                None,
+            );
+            db.create_task(task).await.unwrap()
+        }
+
+        fn handler(dir: &std::path::Path, body: &str) -> PathBuf {
+            let path = dir.join("handler.sh");
+            write_script(&path, &format!("#!/bin/sh\n{body}\n"));
+            path
+        }
+
+        /// Read the audit trail ONCE for a `pilot_launcher_health` row.
+        ///
+        /// The session key is the one the production site composes, so a change
+        /// of that composition makes these tests red rather than silently blind.
+        async fn launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
+            let session = format!("callback-{task_id}");
+            db.get_audit_events(&session)
+                .await
+                .unwrap()
+                .iter()
+                .find(|e| e.tool_name == PILOT_LAUNCHER_HEALTH_TOOL)
+                .and_then(|row| row.after_value.clone())
+        }
+
+        /// Poll for the `pilot_launcher_health` row — the POSITIVE assertion
+        /// (T1). Returns `None` when none appeared within [`SETTLE_MS`].
+        async fn await_launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
+            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
+            loop {
+                if let Some(value) = launcher_health(db, task_id).await {
+                    return Some(value);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// **Barrier for the two negative controls — it panics rather than
+        /// returning, and that is the point.**
+        ///
+        /// `set_task_handler_failure` (mika#2532) is written **unconditionally**
+        /// on every non-zero exit and **before** the launcher-dead block, so its
+        /// `$.handler_failure` key is the positive proof that the failure path
+        /// has been traversed for this row.
+        ///
+        /// Without it, a negative control that merely slept could conclude
+        /// "absent" from a path that had not yet run — green by **default of
+        /// observation**, which reads exactly like a control that looked (class
+        /// mika#2205). A loaded CI runner is precisely where that happens, so the
+        /// control meant to catch a false positive would be the first thing to
+        /// stop catching anything. Panicking on the budget turns that silence
+        /// into a red.
+        async fn require_handler_failure(db: &AsyncDatabase, task_id: &str) {
+            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
+            loop {
+                let task = db.get_task(task_id).await.unwrap().expect("row exists");
+                if let Some(raw) = task.metadata.as_deref()
+                    && let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(raw)
+                    && map.contains_key(HANDLER_FAILURE_METADATA_KEY)
+                {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "mika#2634 — the failure path never ran for task {task_id} within \
+                     {SETTLE_MS} ms: `$.{HANDLER_FAILURE_METADATA_KEY}` never appeared. This \
+                     control cannot conclude anything about the ABSENCE of a \
+                     `pilot_launcher_health` row until it has established that the handler \
+                     exited and the engine processed it."
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// **T1 — the measured defect, and this is the test to see RED before
+        /// the fix.**
+        ///
+        /// A fake launcher that exits on the dedicated code without ever writing
+        /// a claude-pilot log — the shape of the three dispatches that died over
+        /// 2 h 45 on 2026-10-02 — must produce a `pilot_launcher_health` row
+        /// carrying `dead`. Before the fix there is no such row at all: the exit
+        /// was a bare `1`, indistinguishable from any other handler crash.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_launcher_that_never_started_is_classified_apart() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            // What the pre-flight does now: pose a terminal RESULT, deliver the
+            // callback through the trap, exit on the dedicated code. The
+            // delivery is simulated by the row already being terminal — the
+            // production shape since the trap is armed before the smoke test.
+            db.update_task_completed(&task_id, Some("LAUNCHER DEAD (exit 79, mika#2634)"))
+                .await
+                .unwrap();
+
+            let script = handler(
+                tmp.path(),
+                &format!(
+                    "echo \"ModuleNotFoundError: No module named 'claude_pilot'\" >&2\nexit {EXIT_PILOT_LAUNCHER_DEAD}"
+                ),
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            assert_eq!(
+                await_launcher_health(&db, &task_id).await.as_deref(),
+                Some(PILOT_LAUNCHER_DEAD_VALUE),
+                "mika#2634 AC1 — a launcher that did not start must be counted apart \
+                 from a pilot that failed; without this row the class is drowned in \
+                 the generic exit-non-zero population"
+            );
+        }
+
+        /// **T2 — the positive control, and it is indispensable.**
+        ///
+        /// A handler that exits `1` after having written its log stays an
+        /// ORDINARY failure: no `pilot_launcher_health` row. Without this test,
+        /// "the guard decides" is indistinguishable from "the guard accuses
+        /// everything", and T1 would be satisfied by code that classifies every
+        /// failure as a dead launcher.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_ordinary_pilot_failure_stays_ordinary() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            // The pilot ran: it wrote its log, then failed.
+            let log = tmp.path().join("pilot.log");
+            let script = handler(
+                tmp.path(),
+                &format!(
+                    "echo 'pilot session started' > {}\necho 'pilot failed' >&2\nexit 1",
+                    log.display()
+                ),
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            // Establish that the failure path RAN before concluding on an
+            // absence — see [`require_handler_failure`].
+            require_handler_failure(&db, &task_id).await;
+            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
+
+            assert_eq!(
+                launcher_health(&db, &task_id).await,
+                None,
+                "an exit 1 from a pilot that ran is NOT a dead launcher — classifying it \
+                 as one would make the population unreadable and would freeze the loop \
+                 (probe S3's halt)"
+            );
+            assert!(
+                log.exists(),
+                "anti-vacuity: the handler must really have run and written its log, \
+                 otherwise this control passes by never having exercised anything"
+            );
+        }
+
+        /// **T3 — the containment refusal is out of the population (R4).**
+        ///
+        /// Exit 78 is `_run_pilot_sandboxed` refusing to launch without its
+        /// egress relay (mika#2049 / mika#2141). It has no claude-pilot log
+        /// either, which is exactly why the ticket's proposed conjunction
+        /// "non-zero exit AND no log" would have classified it as a dead
+        /// launcher — a false positive whose cause is the relay, and whose own
+        /// refusal text already names it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_containment_refusal_is_not_a_dead_launcher() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("CONTAINMENT REFUSAL (exit 78)"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), "exit 78");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            require_handler_failure(&db, &task_id).await;
+            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
+
+            assert_eq!(
+                launcher_health(&db, &task_id).await,
+                None,
+                "exit 78 is the containment refusal, not a dead launcher — its cause is \
+                 the egress relay and its own text says so (R4)"
+            );
+        }
+
+        // ───────────────────────────────────────────────────────────────────
+        // Source scans. A behavioural test cannot see either of these classes:
+        // the regression would make NO decision wrong, it would make the
+        // measurement silently wrong, and every assertion above would stay
+        // green.
+        // ───────────────────────────────────────────────────────────────────
+
+        fn dispatch_lib_source() -> String {
+            std::fs::read_to_string(dispatch_lib_path())
+                .expect("the guard must be able to read dispatch-lib.sh")
+        }
+
+        /// **U3-10 — the exit code agrees with the shell, in BOTH directions.**
+        ///
+        /// The value is written twice across two languages and no
+        /// single-source exists for it (the duplication mika#2520 had to accept
+        /// for `GIT_OPS_PROTECTED_BRANCHES`). Both directions are checked, the
+        /// shape `check-dispatch-seats-declared.sh` already uses: a one-way
+        /// comparison lets the shell drift upward in silence.
+        #[test]
+        fn the_exit_code_agrees_with_the_shell() {
+            let shell = dispatch_lib_source();
+            let needle = format!("_EXIT_LAUNCHER_DEAD={EXIT_PILOT_LAUNCHER_DEAD}");
+
+            // Direction 1 — Rust → shell: the value this crate classifies on is
+            // the one the producer stamps.
+            assert!(
+                shell.contains(&needle),
+                "mika#2634 — the Rust side classifies on {EXIT_PILOT_LAUNCHER_DEAD} but \
+                 dispatch-lib.sh does not declare `{needle}`. The two are a cross-language \
+                 pair with no single source; a drift here makes the engine classify on a \
+                 code nothing produces, i.e. a guard whose silence proves nothing."
+            );
+
+            // Direction 2 — shell → Rust: exactly ONE declaration, so the shell
+            // cannot carry a second value that this crate never sees. Without
+            // this half, adding `_EXIT_LAUNCHER_DEAD=80` further down the file
+            // would leave direction 1 green while production exits on 80.
+            let declarations = shell
+                .lines()
+                .filter(|l| l.trim_start().starts_with("_EXIT_LAUNCHER_DEAD="))
+                .count();
+            assert_eq!(
+                declarations, 1,
+                "mika#2634 — `_EXIT_LAUNCHER_DEAD` must be declared exactly once in \
+                 dispatch-lib.sh (found {declarations}); a second assignment is a value \
+                 the engine does not classify on"
+            );
+
+            // Anti-vacuity: a scan aiming at a name the file does not carry
+            // reads exactly like a clean tree (mika#2103 / mika#2205).
+            assert!(
+                shell.contains("_EXIT_LAUNCHER_DEAD"),
+                "mika#2634 — this scan aims at a dead name: `_EXIT_LAUNCHER_DEAD` is \
+                 absent from dispatch-lib.sh, so it verifies nothing"
+            );
+
+            // Good-faith control: the predicate really does reject a divergent
+            // value. Without it, "the two agree" is indistinguishable from "the
+            // comparison is inert".
+            let tampered = shell.replace(&needle, "_EXIT_LAUNCHER_DEAD=80");
+            assert!(
+                !tampered.contains(&needle),
+                "mika#2634 (good faith) — the needle must be what makes direction 1 \
+                 pass; if a file with the value changed still contains it, the \
+                 comparison is not reading the value"
+            );
+        }
+
+        // U3-11 — the SOLE WRITER scan on `pilot_launcher_health` lives with
+        // its siblings in `canonical_tokens.rs`
+        // (`mika2634_the_launcher_health_name_has_a_single_writer`), which owns
+        // the `production_sources()` enumerator the whole family reads. A local
+        // copy of that walker would be a second inventory to keep in agreement
+        // with the first — the duplication every scan in that file exists to
+        // refuse.
+
+        /// **The `warn!` and the audit row share ONE predicate.**
+        ///
+        /// This is what lets the behavioural tests above assert on the row alone
+        /// without the log line becoming an unverified claim. A future edit that
+        /// kept the row and dropped the line — or the reverse — would leave every
+        /// assertion above green while AC1's "the engine says it" half quietly
+        /// disappeared.
+        #[test]
+        fn the_warn_and_the_audit_row_share_one_predicate() {
+            let src = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/skills/executor.rs"),
+            )
+            .expect("the guard must be able to read its own module");
+            let production = match src.find("#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => &src[..],
+            };
+
+            let guards = production
+                .lines()
+                .filter(|l| l.contains("status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD)"))
+                .count();
+            assert_eq!(
+                guards, 1,
+                "mika#2634 — the launcher-dead predicate must appear exactly once in \
+                 production (found {guards}); two copies are two things that can disagree"
+            );
+
+            // …and the condition is BARE. This term was added after a measured
+            // weakness: while seeing V4 red, the predicate was neutralised with
+            // `if false && status.code() == …` and this scan stayed GREEN —
+            // because a substring test cannot tell an armed guard from a
+            // disarmed one. A scan that cannot see a disarm is the mika#2205
+            // class applied to itself, so the shape is pinned rather than the
+            // mere presence of the text.
+            let armed = production
+                .lines()
+                .any(|l| l.trim() == "if status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD) {");
+            assert!(
+                armed,
+                "mika#2634 — the launcher-dead `if` must carry the predicate ALONE. A \
+                 conjunction added in front of it (`if false && …`, `if some_flag && …`) \
+                 disarms the classification while every substring assertion stays green. \
+                 If a kill-switch is ever wanted here, it belongs in phase B's \
+                 `pilot_launcher_health` module with its own three-tier parse, not as a \
+                 term bolted onto this predicate."
+            );
+
+            // The two emissions live between that `if` and the end of the
+            // function. Read as an ordered sequence rather than by counting
+            // occurrences: the point is that one predicate governs both.
+            let guard_at = production
+                .find("status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD)")
+                .expect("anti-vacuity: the predicate must be present");
+            let tail = &production[guard_at..];
+            let warn_at = tail
+                .find("event = \"pilot_launcher_dead\"")
+                .expect("mika#2634 — the WARN must be emitted under the predicate");
+            let audit_at = tail
+                .find("PILOT_LAUNCHER_HEALTH_TOOL")
+                .expect("mika#2634 — the audit row must be written under the predicate");
+            assert!(
+                warn_at < audit_at,
+                "mika#2634 — the WARN is emitted before the audit write, so a DB failure \
+                 can never be what silences the line; the sibling \
+                 `pilot_launcher_dead_audit_failed` reports that case"
+            );
+            assert!(
+                tail.contains("pilot_launcher_dead_audit_failed"),
+                "mika#2634 — a failed audit write must be said, not swallowed: without \
+                 that sibling event the `GROUP BY` under-counts in silence"
             );
         }
     }

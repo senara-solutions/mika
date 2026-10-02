@@ -1152,21 +1152,39 @@ async fn verdict_pass_no_task_perimeter_fail_closed_holds_for_operator() -> Resu
 async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() -> Result<()> {
     // Post-mika#1853: perimeter check runs BEFORE task-status check. A completed
     // task is no longer a passthrough exit — the gate consults the diff first.
-    // fetch_pr_files errors in test env → fail-closed to DECISION-CORE →
-    // Handled. Task-side metadata write is skipped (task is not in_progress),
-    // but the notification + audit event + hold pre-digest still fire.
+    // fetch_pr_files errors → fail-closed to DECISION-CORE → Handled. Task-side
+    // metadata write is skipped (task is not in_progress), but the notification
+    // + audit event + hold pre-digest still fire.
     //
-    // **The PR number must not name a PR that exists** (found 2026-10-02 while
-    // running the suite for mika#2617; unrelated to it). This test used #42, a
-    // real PR of this repository. On a host whose egress proxy authenticates
-    // `gh` host-side (mika#2056), `fetch_pr_files` then SUCCEEDS, the perimeter
-    // classifies MECHANICAL, and execution falls through to the
-    // `task.status != "in_progress"` passthrough — so the test failed for a
-    // reason its own premise denies. Its two siblings (#999, #50) pass today by
-    // the luck of their diffs classifying DECISION-CORE; they carry the same
+    // **The PR number is load-bearing and must stay NON-RESOLVABLE (mika#2634).**
+    // This test used `pull/42` and read its own premise as "`gh` cannot resolve in
+    // this test env" — which is false on any host where `gh` is authenticated.
+    // #42 is a real merged PR touching `CHANGELOG.md` + `Cargo.lock` +
+    // `Cargo.toml`, i.e. exactly MECHANICAL: the fetch SUCCEEDED, the gate
+    // cleared, the merge flow asked `find_active_task_by_pr_url`, that query
+    // excludes `completed`, and the handler returned Passthrough — the panic
+    // below. The test passed only while the fetch happened to fail, which is why
+    // one job ran it twice and got one green and one red (PR#2644: `cargo test`
+    // passed, `cargo test --features telemetry` failed, same test, same host).
+    //
+    // #999 is an ISSUE in this repo, so it can never become a pull request:
+    // `gh pr view 999` fails to resolve whether or not the network is up, and
+    // BOTH outcomes land on `Err` → DECISION-CORE. That is what makes this
+    // deterministic rather than lucky, and it is the fixture the no-task sibling
+    // above already relies on. Do not swap in a resolvable number.
+    //
+    // Named cost: the MECHANICAL-PR-with-a-non-active-task path (handler line
+    // ~504) loses the coverage it was getting by accident here. Covering it
+    // deterministically needs an injectable fetch, which is a separate change.
+    //
+    // mika#2617 (PR#2642) hit the same trap independently and moved this test to
+    // #424242; the merge keeps #999 because an issue number stays non-resolvable
+    // forever, while a missing number only stays so until the repo grows. Its
+    // note on the siblings still holds for #50 (below): that one is a real PR
+    // and passes only because its diff classifies DECISION-CORE — the same
     // latent dependency.
     let db = test_db().await;
-    let pr_url = "https://github.com/senara-solutions/mika/pull/424242";
+    let pr_url = "https://github.com/senara-solutions/mika/pull/999";
     let task_id = create_task_with_pr_url(&db, pr_url).await;
 
     // Transition to completed (terminal)
@@ -1177,7 +1195,7 @@ async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() 
     let text = pr_review_text(
         "approved",
         "senara-solutions/mika",
-        424242,
+        999,
         "mika-qa",
         "VERDICT: pass\n\nAll good.",
     );
@@ -1199,7 +1217,9 @@ async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() 
         }
         VerdictAction::Passthrough { .. } => {
             panic!(
-                "pass with completed task + fetch-error should be Handled (forge-gate fail-closed), not Passthrough"
+                "pass with completed task + fetch-error should be Handled (forge-gate fail-closed), \
+                 not Passthrough — if the PR number was made resolvable and classifies MECHANICAL, \
+                 this is the mika#2634 trap in the comment above, not a regression of mika#1853"
             );
         }
         VerdictAction::Handled { pre_digest } => {

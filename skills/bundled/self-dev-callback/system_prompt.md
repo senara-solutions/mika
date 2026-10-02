@@ -28,7 +28,8 @@ When you receive a callback result from a completed background task (`run_claude
 >      **Do NOT check the callback result text for `PIPELINE FAILURE:` or `Outcome:` lines — the body marker is authoritative.**
 >
 >    - **If `second-pass (GROOMED)` is ABSENT → failure routing, and the FIRST test is terminality:**
->      - If the callback result text carries a line beginning `Outcome: ESCALATE` → route to the **"Groom-escalation discriminator"** below. **This test comes first** (mika#2545): an escalated groom is terminal, and both other branches retry.
+>      - If the callback result text starts with `LAUNCHER DEAD (exit 79, mika#2634)` → route to the **"Launcher-dead discriminator"** below. **This test comes before the ESCALATE one** (mika#2634): a groom whose launcher never started produced no verdict at all, so it carries no `Outcome: ESCALATE` to be read — and its cause is a host fact that no retry and no re-groom can change.
+>      - Else if the callback result text carries a line beginning `Outcome: ESCALATE` → route to the **"Groom-escalation discriminator"** below. **This test comes before the pipeline one** (mika#2545): an escalated groom is terminal, and both other branches retry.
 >      - Else if the callback result text contains `PIPELINE FAILURE:` prefix → route to the "On pipeline failure" handler below (same retry logic and escalation threshold apply to groom callbacks).
 >      - Otherwise → route to the "On failure" handler below (Step 4.5).
 
@@ -66,6 +67,19 @@ Permitted post-callback actions are described prosaically in the success/failure
 > 3. `update_task_status(task_id, "failed")` with metadata `{"containment_refusal": true, "refusal_reason": "<cause line from RESULT>"}` — distinct from `operator_cancel`/`signal_cancel`, countable apart (mika#2131).
 > 4. `send_message` with the refusal text **verbatim** (names cause + remedy).
 > 5. Proceed to Step 6. Never announce a PR, completion, or "awaiting QA review".
+
+**Launcher-dead discriminator (mika#2634 — MANDATORY, BEFORE pipeline result classification):**
+
+> **Predicate:** `RESULT` **starts with** `LAUNCHER DEAD (exit 79, mika#2634)`. Here `starts with` is correct, unlike the two branches around it: the pre-flight poses this `RESULT` itself, as its first and only line, before any pilot ran. A line-anchored `Outcome: LAUNCHER_DEAD` is also present and either test is valid.
+>
+> **Why:** the claude-pilot **launcher** did not start — no pilot ran, no work was attempted, and the cause is a HOST fact (a broken venv, or an entry point whose shebang a `pip install -e` took over from `uv tool`). Every further dispatch dies identically until the host is repaired, so a retry cannot change the verdict; it burns a dispatch slot and no `pipeline_retry_count` budget bounds it. Measured 2026-10-02: three dispatches died this way over 2 h 45 with no alarm raised.
+>
+> 1. **Do NOT retry** — no `run_claude_pilot`, no `run_claude_pilot_groom`. The remedy is on the host, not in the loop.
+> 2. **Do NOT increment** `pipeline_retry_count`.
+> 3. **Do NOT touch any label** (`ready`, `blocked`, `operator-review`) — same rule as the containment-refusal branch above: `auto_pull` resumes the ticket as-is once the host is repaired.
+> 4. `update_task_status(task_id, "blocked")` with metadata `{"launcher_dead": true}` — countable apart from `operator_cancel` / `containment_refusal` / `groom_escalated` (mika#2131).
+> 5. `send_message` with the `RESULT` **verbatim**. It carries both halves: a `What the launcher said` block with the launcher's own stderr — typically `ModuleNotFoundError: No module named 'claude_pilot'`, the line that identifies the cause at a glance — and the prescriptive remedy naming both measured causes plus the single command that covers them (`uv tool install --reinstall --force --editable ./claude-pilot-py`) and the shebang check. Do not paraphrase either: the stderr block is what distinguishes a broken shebang from a stale dependency set, and they have different remedies.
+> 6. Proceed to Step 6. Never announce a PR, a retry, or "awaiting QA review".
 
 **Groom-escalation discriminator (mika#2545 — MANDATORY, BEFORE pipeline result classification):**
 
