@@ -9082,10 +9082,29 @@ This ticket has been GROOMED and is ready.
             }
         };
 
-        let first = seed("ready-label: first", "").await;
         // The `?phase=groom` variant must be covered by the same prefix `LIKE` —
         // the rule the sibling query already carries.
-        let _second = seed("ready-label: second", "?phase=groom").await;
+        let newer = seed("ready-label: newer", "?phase=groom").await;
+        // The OLDER row is seeded SECOND and backdated an hour: `created_at` has
+        // one-second resolution, so two rows seeded back to back tie and scan
+        // order decides — an `ASC`/`DESC` swap stayed green (review of PR #2635).
+        // Seeding it second also rules out insertion order answering in its place.
+        let older = seed("ready-label: older", "").await;
+        let backdated =
+            crate::timestamp::format(&(chrono::Utc::now() - chrono::Duration::seconds(3600)));
+        {
+            let id = older.clone();
+            let at = backdated.clone();
+            db.with_db(move |d| {
+                d.conn.execute(
+                    "UPDATE tasks SET created_at = ?1 WHERE id = ?2",
+                    rusqlite::params![at, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("backdate the older row");
+        }
 
         assert!(
             db.has_active_self_dev_task_for_issue(&url)
@@ -9098,19 +9117,19 @@ This ticket has been GROOMED and is ready.
             .expect("find probe")
             .expect("a row is in flight");
         assert_eq!(
-            found.task_id, first,
+            found.task_id, older,
             "the OLDEST row answers, because the diagnostic question AC3 asks is \
              \"for how long\""
         );
         assert_eq!(found.status, "pending");
-        assert!(
-            !found.in_flight_since.is_empty(),
-            "an age with no instant cannot be reported"
+        assert_eq!(
+            found.in_flight_since, backdated,
+            "with no fired_at, the age is measured from created_at (COALESCE)"
         );
 
         // A terminal row leaves the population — and both answers must leave it
         // together, which is the whole point of one SQL site.
-        for id in [&first, &_second] {
+        for id in [&older, &newer] {
             db.update_task_completed(id, Some("done"))
                 .await
                 .expect("complete the task");
