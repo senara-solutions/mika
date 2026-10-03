@@ -114,6 +114,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_str_payload_captured() {
         let _lock = HOOK_MUTEX.lock().unwrap();
 
@@ -145,6 +146,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_string_payload_captured() {
         let _lock = HOOK_MUTEX.lock().unwrap();
 
@@ -173,6 +175,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_non_string_payload() {
         let _lock = HOOK_MUTEX.lock().unwrap();
 

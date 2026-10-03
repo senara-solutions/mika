@@ -11724,6 +11724,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_spawn_and_collect_emits_complete_log() {
         let (_guard, events) = capture_tracing_events();
 
@@ -11769,6 +11770,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_run_gh_invocation_log_redacts_token() {
         let (_guard, events) = capture_tracing_events();
 
@@ -11815,6 +11817,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_spawn_and_collect_handles_large_output() {
         // Verify that spawn_and_collect returns within a reasonable time
         // even when the subprocess produces output exceeding MAX_OUTPUT_LEN.
@@ -11853,6 +11856,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_spawn_and_collect_progress_ticker_fires() {
         // With PROGRESS_TICKER_INTERVAL = 100ms in test mode, a 500ms sleep
         // should produce at least 3 progress tick events.
