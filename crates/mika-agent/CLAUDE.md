@@ -3177,6 +3177,198 @@ Surfaces opérateur, régimes attendus, recensement AC4 et les cinq haltes :
 `CLAUDE.md` racine § *Un dispatch ouvert par un événement PR est borné à la lignée de
 cet événement*.
 
+### Une annulation depuis un tour webhook PR ne touche pas un pilote vif (mika#2653, phase A)
+
+`CancelTaskTool::execute` gagne un terme : dans un tour dont
+l'`originating_message` est un `[GitHub] PR …` ou un `[GitHub] Check suite …`,
+l'annulation d'une tâche dont un pilote est **vif** est refusée — avant toute
+écriture de statut et avant tout signal.
+
+**Second cas mesuré de la famille mika#2649**, le même jour, et le plus coûteux :
+trace `8ec6364c-be71-11f1-908b-e931f18d2c16`, 2026-10-02, un tour ouvert par une
+revue QA sur la PR #2644 a appelé `cancel_task` sur le pilote Fix-CI en vol
+(`8a3b2082`) — **71 tours jetés**. Ce qui sortait ce vecteur du périmètre de
+mika#2649 est écrit dans le recensement AC4 de ce ticket : *son remède n'est pas
+un terme de cible mais un terme de **vivacité***.
+
+#### Six rectifications que la lecture du code impose, et elles sont le premier livrable
+
+**R1 — le booléen existant est l'INVERSE de celui dont la garde a besoin.** Le
+ticket dit *« juste un booléen de classe de tour sur le modèle
+d'`is_webhook_fallthrough_turn` »*. Sur le **modèle**, oui ; par
+**réutilisation**, non : `is_webhook_fallthrough_domain` **sort explicitement**
+les deux familles qui nous intéressent du domaine Fallthrough — parce que
+`self-dev-webhook-qa` / `-ci` y portent des dispatchs légitimes — donc le
+quatrième booléen vaut `false` **exactement sur la population de ce ticket**, et
+le lire serait une garde à population vide (classe mika#2205 : *une garde que
+personne n'a exercée se lit exactement comme une garde qui marche*).
+`is_webhook_pr_event_domain` est donc un **axe nouveau**, déclaré au même module
+que les deux constantes de préfixe — leur site de définition est unique depuis
+mika#2649 et un troisième lecteur *au même module* est exactement ce qu'elles
+existent pour permettre. Les deux axes sont **mutuellement exclusifs par
+construction**, épinglé par
+`mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs` sur deux corpus (celui de
+la famille et celui de la frontière Fallthrough) : sans ce test, un futur éditeur
+qui retirerait un `return false` du domaine Fallthrough créerait deux gardes qui
+mordent sur la même population sans que personne ait tranché laquelle décide.
+
+**Pourquoi un prédicat de préfixe et pas `webhook_event_target`.** La sémantique
+du second serait juste — `Unreadable` (préfixe présent, grammaire non parsée) est
+**dans** la population, un tour webhook PR dont la grammaire a bougé restant un
+tour webhook PR — mais il paierait deux regex par tour de conversation pour n'en
+lire qu'un booléen, et jetterait la cible. L'accord des deux faces est **épinglé**
+à la place (`mika2653_le_predicat_de_prefixe_saccorde_avec_la_cible`), motif
+`mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`.
+
+**R2 — `live_pilot_for_issue` n'est pas appelable ici.** Il prend une **URL
+d'issue** ; `cancel_task` reçoit un **identifiant de tâche**, et la topologie à
+deux lignes que `live_pilot` documente lui-même interdit de dériver l'une de
+l'autre : une ligne callback — celle qui porte le pgid, donc le cas probable du
+constat — **n'a pas d'URL**. `live_pilot_for_task` est le lecteur manquant, et il
+vit **dans `live_pilot.rs`** : son contrat écrit (*« **Sole reader** of that
+question »*) passe de deux appelants à trois plutôt que d'être recopié. *Un
+recensement n'est pas une allowlist : on y ajoute, on n'y exempte pas*
+(mika#2633).
+
+**R3 — la traversée que ce lecteur demande EXISTE DÉJÀ**, dans
+`cancel_task_and_kill` (posée par mika#2335, avec les deux mêmes filtres). Donc
+l'extraction est due, et **c'est AC6, explicitement différé en phase B** :
+la phase A livre la garde, la phase B extrait `resolve_task_pilot` et pose son
+scan de lecteur unique. **L'ordre inverse est interdit** — livrer le détecteur
+sans la garde ne referme rien. La duplication est **nommée au site** (doc-comment
+de `live_pilot_for_task`, § *AC6 différé*), avec la frontière à connaître avant de
+fusionner les deux lectures : le chemin de kill **écarte** un enfant sans
+`process_start_time` (il ne doit pas signaler un groupe de processus qu'il ne peut
+pas identifier), là où ce verdict le rend `Unreadable` (il ne peut pas prouver
+l'absence de pilote). Deux dispositions correctes pour deux questions
+différentes, à préserver à l'identique lors de l'extraction.
+
+**R4 — un site couvre deux outils.** `CancelReminderTool::execute` est
+littéralement `CancelTaskTool.execute(input, ctx).await`, donc la garde couvre
+`cancel_reminder` **gratuitement**. À nommer plutôt qu'à découvrir : un futur
+éditeur qui dédoublerait `cancel_reminder` perdrait la garde en silence.
+
+**R4-bis — les deux poignées doivent appliquer les MÊMES filtres, et la
+première rédaction ne le faisait pas.** Trouvé en revue, et les deux écarts
+étaient réels. *(a)* Le filtre terminal manquait sur la poignée « ligne
+nommée » : une ligne callback `delivered` portant encore un pgid vif rendait
+`Alive`, donc la garde refusait l'annulation sous `blocked_live_pilot` — une
+population documentée comme attendue-zéro — sur une ligne que
+`cancel_task_and_kill` aurait de toute façon déclinée par son honnête *« not in
+cancellable status »*. La fenêtre est réelle : le trap EXIT de `dispatch-lib`
+livre le callback depuis l'**intérieur** du wrapper encore vivant, donc
+`delivered` précède la sortie du processus. *(b)* La lecture de
+`process_start_time` passait par un `serde_json` inline acceptant la seule forme
+chaîne, là où la poignée « enfant » passe par le lecteur de colonne qui accepte
+**aussi** la forme entière — donc une seule fonction répondait deux choses de la
+même ligne, et sous un fail-closed cet écart refuse d'un côté ce qu'il laisse
+passer de l'autre. La règle a désormais un site partagé
+(`Database::process_start_time_from_metadata`). Les deux corrections sont
+**épinglées et vues rouges par mutation**
+(`mika2653_une_ligne_terminale_nest_pas_un_pilote` et
+`mika2653_les_deux_poignees_lisent_le_start_time_par_la_meme_regle`, chacun
+interrogeant les **deux** poignées — l'asymétrie du test reproduisait exactement
+celle du code).
+
+**R5 — le geste de reprise de l'opérateur n'est PAS sur ce chemin**, et c'est la
+rectification qui décide l'arbitrage. Les quatre appelants de
+`cancel_task_and_kill` et leur traversée du `ToolContext`, plus la raison pour
+laquelle un `mika ask` d'opérateur est hors population : `CLAUDE.md` racine
+§ *`cancel_task` n'annule pas un pilote vif depuis un tour webhook PR*.
+
+**R6 — deux vecteurs voisins ne se ferment pas par ce terme** :
+`update_task_status → cancelled` (qui **orpheline** le pilote au lieu de le tuer
+— dommage différent, remède différent) et `run_shell` (population mesurée vide).
+Tous deux **suivis nommés**, et c'est pourquoi le corps du refus ne nomme **aucune
+commande**.
+
+#### Conception
+
+`webhook_dispatch::is_webhook_pr_event_domain` (pur) →
+`ToolContext.is_webhook_pr_event_turn` (cinquième booléen, calculé au **seul** site
+de conversation par **appel** du prédicat, `false` aux trois autres sites de
+production) → `live_pilot::live_pilot_for_task` (le verdict, dans son module
+propriétaire) → `tools::cancel_task::classify_cancel_on_live_pilot` (le prédicat
+pur) → la garde.
+
+**Le terme de classe de tour est un PARAMÈTRE du prédicat pur**, jamais une
+branche de l'appelant — forme mika#2649 : « hors tour webhook PR, rien ne change »
+devient ainsi une propriété de la fonction, avec son propre test
+(`mika2653_hors_tour_webhook_pr_rien_ne_change`), plutôt qu'un `if` à lire.
+
+**Quatre issues, `match` exhaustif sans bras `_ =>`** : `Allowed` (hors
+population — aucune ligne, aucun audit, doctrine mika#2131),
+`AllowedInPopulation` (le contrôle positif), `RefusedLivePilot`,
+`RefusedUnreadable`.
+
+**Placement :** après `AgentScopedTaskId::from_tool_context` et
+`validate_task_exists` (la tâche doit exister et appartenir à l'agent avant qu'on
+parle de son pilote), **avant** `cancel_task_and_kill` — donc avant toute écriture
+de statut et avant tout signal. **Dans l'outil, jamais dans
+`cancel_task_and_kill`** : c'est ce qui préserve les trois chemins opérateur par
+construction plutôt que par prédicat. Le verdict de vivacité n'est résolu que
+**dans la population**, donc le trafic hors population ne paie aucune requête.
+
+**L'arbitrage de fail-safe est fail-CLOSED**, l'inverse de la politique propre de
+`live_pilot` pour ses deux appelants existants (mika#2279, qui a délibérément
+dérogé à mika#2277). Ce n'est pas une doctrine qu'on applique, c'est une
+**asymétrie de coût** qu'on refait site par site — la table, et le coût nommé du
+choix, sont dans la section racine.
+
+#### Quatre détecteurs
+
+- **1 — AC6, différé en phase B** (lecteur unique de la vivacité). La duplication
+  est nommée au site en attendant.
+- **2 — `mika2653_le_nom_daudit_a_un_seul_ecrivain`** (`canonical_tokens.rs`,
+  allowlist livrée **vide** et épinglée vide). La comparaison du littéral est
+  **exacte et non en sous-chaîne**, reprise mot pour mot de la correction mesurée
+  par mika#2649 puis mika#2634 sur leurs propres scans jumeaux : le nom du résidu
+  (`cancel_task_pilot_guard_audit_failed`) a le nom d'audit pour **préfixe**, donc
+  une sous-chaîne le compterait comme un second écrivain. Ces deux surfaces sont
+  distinctes — l'une répond à « combien d'annulations la garde a-t-elle
+  tranchées », l'autre à « la ligne d'audit est-elle passée » — et aucune n'a à se
+  taire pour que l'autre soit exacte. Son **contrôle de bonne foi**
+  (`mika2653_le_scan_du_nom_daudit_voit_un_second_site`) est dû : resserrer une
+  garde sans montrer qu'elle mord encore est la façon dont une garde devient
+  inerte en silence. **Aucun test comportemental ne peut voir cette classe** : un
+  second écrivain ne rendrait aucune décision fausse, seul le **compte**
+  deviendrait inexact.
+- **3 — format de fil**, deux volets :
+  `mika2653_les_valeurs_daudit_sont_un_format_de_fil` (les quatre `after_value`,
+  **dans les deux directions** — tout ce qui est produit est déclaré, et tout ce
+  qui est déclaré est atteignable ; sans la seconde, une valeur pourrait être
+  groupée par un opérateur et produite par rien) et
+  `mika2653_les_motifs_derreur_sont_un_format_de_fil` (les valeurs du champ
+  `error`, qui atterrissent dans `tool_calls.output`).
+- **4 — exclusivité des deux axes** (`webhook_dispatch.rs`), c'est AC5.
+- **5 — la garde d'exécution** : les unités de `classify_cancel_on_live_pilot`
+  avec leur **contrôle négatif hors population** (porteur : sans lui, « la garde
+  décide » est indistinguable de « la garde bloque tout »), plus
+  `tests/eval/test_cancel_task_live_pilot_2653.rs` sur le chemin de production.
+
+#### Ce que les tests attestent, et ce qu'ils ne peuvent pas
+
+Les unités de `classify_cancel_on_live_pilot` restent **vertes** si le champ
+`is_webhook_pr_event_turn` n'est jamais calculé ou jamais lu — et c'est très
+exactement le mode de panne, puisque le booléen est posé à **un** site de
+production et que les dix-neuf autres le mettent à `false`. Seul le fichier eval
+ferme ça. **Vérifié par mutation à la livraison** : en remplaçant l'appel du
+prédicat par `false` au site de conversation, V6a / V6c / V6d rougissent et V6b
+(le contrôle négatif) reste vert — ce qui est la forme attendue et ce qui dit que
+le câblage n'est pas vide.
+
+Le pilote des tests eval est un **processus enfant**, jamais celui du binaire de
+test, et la raison est porteuse : le contrôle négatif V6b **traverse**
+`cancel_task_and_kill` par conception, lequel envoie un SIGTERM au **groupe de
+processus** du pgid enregistré. Avec `std::process::id()` — la forme que
+`live_pilot.rs` emploie sans danger pour ses propres unités, aucune n'atteignant le
+chemin de kill — ce contrôle tuerait la campagne qui l'exécute, de façon
+dépendante de l'environnement.
+
+Surfaces opérateur, régimes attendus, recensement AC4, les cinq haltes et ce que
+ce travail n'achète pas : `CLAUDE.md` racine § *`cancel_task` n'annule pas un
+pilote vif depuis un tour webhook PR*.
+
 **Cancel discriminator protocol (#749):** When `cancel_task_and_kill` terminates a long-running subprocess, it pre-writes a reason file at `/tmp/mika-cancel-reason-{pid}` with `STATUS=CANCELLED_BY_OPERATOR` before sending SIGTERM. The shell-side TERM trap in `dispatch-lib.sh` writes `STATUS=CANCELLED_BY_SIGNAL` only if no reason file exists (belt-and-suspenders for signal-initiated cancels). The EXIT trap reads the reason file and prefixes the callback envelope so the consumer (`self-dev-callback`) can distinguish cancel from crash. Two discriminators: `CANCELLED_BY_OPERATOR` (cancel_task initiated) and `CANCELLED_BY_SIGNAL` (signal-initiated, no pre-write). Absence of the prefix = existing `HANDLER CRASH` / success paths fire unchanged (backward compatible).
 
 ### Platform-root relay, and the name it translates (mika#2536)

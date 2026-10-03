@@ -1378,12 +1378,24 @@ mod tests {
     /// mika#2201).
     const LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
 
-    /// Le prédicat du scan, extrait pour que son **contrôle de bonne foi**
-    /// l'exerce plutôt qu'une copie qui peut en diverger (mika#2634 phase B).
+    /// Le prédicat des scans SOLE WRITER de cette famille, extrait pour que
+    /// leur **contrôle de bonne foi** l'exerce plutôt qu'une copie qui peut en
+    /// diverger (mika#2634 phase B ; partagé avec mika#2653).
     ///
-    /// Comparaison **exacte** sur le littéral entier : voir le doc-comment du
-    /// scan pour la mesure qui l'impose.
-    fn launcher_health_literal_present(content: &str, needle: &str) -> bool {
+    /// Comparaison **exacte** sur le littéral entier : voir le doc-comment de
+    /// `mika2634_the_launcher_health_name_has_a_single_writer` pour la mesure
+    /// qui l'impose — les noms d'événement de journal de cette famille sont
+    /// construits en **préfixant** le nom d'audit, donc une comparaison par
+    /// sous-chaîne compte une ligne de journal comme un second écrivain.
+    ///
+    /// **Nom neutre, et un seul corps.** Il s'appelait
+    /// `launcher_health_literal_present` jusqu'à mika#2653, qui en a d'abord
+    /// écrit une copie octet pour octet quinze lignes plus bas : trois sites
+    /// portaient alors deux orthographes d'un même prédicat (la troisième,
+    /// inline dans le jumeau mika#2649, compare `lit` sans `trim`). Un prédicat
+    /// recopié est un prédicat qui peut diverger de son propre contrôle de bonne
+    /// foi, ce qui est la seule chose que ce contrôle existe pour empêcher.
+    fn audit_name_literal_present(content: &str, needle: &str) -> bool {
         content
             .lines()
             .filter(|l| {
@@ -1410,7 +1422,7 @@ mod tests {
         let needle = format!("pilot_launcher{}", "_health");
 
         assert!(
-            launcher_health_literal_present(
+            audit_name_literal_present(
                 &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
                 &needle
             ),
@@ -1430,7 +1442,7 @@ mod tests {
             "        warn!(event = \"pilot_launcher_dead_audit_failed\");".to_string(),
         ] {
             assert!(
-                !launcher_health_literal_present(&benign, &needle),
+                !audit_name_literal_present(&benign, &needle),
                 "faux positif du scan sur une ligne qui n'écrit pas la ligne \
                  d'audit : {benign}"
             );
@@ -1478,7 +1490,7 @@ mod tests {
             if LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
-            if launcher_health_literal_present(&content, &needle) {
+            if audit_name_literal_present(&content, &needle) {
                 writers.push(rel);
             }
         }
@@ -1514,12 +1526,141 @@ mod tests {
         );
     }
 
-    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    // ─────────────── mika#2653 — la garde d'annulation sur pilote vif ───────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable : le nom
+    /// `cancel_task_pilot_guard` est **neuf**. Il n'y a donc rien à excepter, ni
+    /// de case où déposer la prochaine infraction (mika#2323). Quand le scan
+    /// tire, **on fait passer le site par la constante partagée**, on ne
+    /// l'allowliste pas (doctrine mika#2201).
+    const CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Contrôle de bonne foi du scan ci-dessous, et il est dû.**
+    ///
+    /// Le prédicat est **exact** plutôt qu'en sous-chaîne, et un prédicat
+    /// resserré doit montrer qu'il mord encore — sans quoi il devient inerte en
+    /// silence (mika#2103 / mika#2205). L'anti-vacuité du scan ne le dit pas :
+    /// elle vérifie que le **propriétaire** porte le nom, pas qu'un **étranger**
+    /// serait vu.
+    ///
+    /// Les contrôles négatifs sont les formes réellement présentes dans l'arbre :
+    /// le nom du **résidu**, qui a le nom d'audit pour **préfixe**, et une
+    /// mention en commentaire.
+    #[test]
+    fn mika2653_le_scan_du_nom_daudit_voit_un_second_site() {
+        let needle = format!("cancel_task{}", "_pilot_guard");
+
+        assert!(
+            audit_name_literal_present(
+                &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
+                &needle
+            ),
+            "INVARIANT VIOLÉ : le prédicat ne voit plus un second écrivain de la \
+             ligne d'audit — le scan est devenu inerte et il se lirait exactement \
+             comme un arbre propre"
+        );
+
+        for benign in [
+            // Le nom du résidu, PRÉFIXÉ par le nom d'audit : c'est la forme qui
+            // ferait rougir une comparaison par sous-chaîne, et c'est une autre
+            // surface (le journal, pas `audit_events`).
+            format!("        warn!(event = \"{needle}_audit_failed\", error = %e);"),
+            // Une mention en commentaire.
+            format!("    // le nom `{needle}` vit dans tools/cancel_task.rs"),
+            // Un voisin de la même famille, autre nom.
+            "        warn!(event = \"cancel_task_live_pilot_blocked\");".to_string(),
+        ] {
+            assert!(
+                !audit_name_literal_present(&benign, &needle),
+                "faux positif du scan sur une ligne qui n'écrit pas la ligne \
+                 d'audit : {benign}"
+            );
+        }
+    }
+
+    /// **Détecteur 2 (mika#2653)** — la propriété qui rend le
+    /// `GROUP BY after_value` de l'opérateur exact.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, la garde continuerait de refuser, et chaque
+    /// assertion de `tools::cancel_task::tests::mika2653` resterait verte. Ce
+    /// qui deviendrait faux est le **compte** — et c'est lui que la sonde du
+    /// § 11.2 lit pour décider si la garde mord, si l'illisible refuse à tort,
+    /// et si le contrôle positif tourne.
+    ///
+    /// # La comparaison est EXACTE, et pas en sous-chaîne
+    ///
+    /// Reprise mot pour mot de la correction mesurée par mika#2649 puis par
+    /// mika#2634 sur leurs propres scans jumeaux : le nom du **résidu** de cette
+    /// famille (`cancel_task_pilot_guard_audit_failed`) a le nom d'audit pour
+    /// **préfixe**, donc une comparaison par sous-chaîne le compterait comme un
+    /// second écrivain. Ce sont deux surfaces distinctes — l'une répond à
+    /// « combien d'annulations la garde a-t-elle tranchées » (`audit_events`),
+    /// l'autre à « la ligne d'audit est-elle passée » (le journal) — et aucune
+    /// n'a à se taire pour que l'autre soit exacte.
+    #[test]
+    fn mika2653_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("cancel_task{}", "_pilot_guard");
+        let owner = "crates/mika-agent/src/tools/cancel_task.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2653 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2653 — le nom d'audit de la garde d'annulation a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `tools::cancel_task::CANCEL_PILOT_GUARD_AUDIT_TOOL`. Ne PAS l'ajouter \
+             à CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS — le `GROUP BY` de la \
+             sonde n'est exact que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de `PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS`.
+    ///
+    /// Nommée plutôt que désignée par position : ce test vit à ~350 lignes de sa
+    /// constante, et mika#2653 a inséré un bloc entre les deux — après quoi la
+    /// phrase « l'allowlist ci-dessus », idiome de ce fichier, désignait une
+    /// autre allowlist que celle qu'il assertait.
     #[test]
     fn mika2496_the_sole_writer_allowlist_is_empty() {
         assert!(
             PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS.is_empty(),
             "PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de `CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS`.
+    #[test]
+    fn mika2653_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
              rester : quand le scan tire, on retire le second écrivain. Une \
              allowlist née vide est un emplacement où déposer la prochaine \
              infraction (mika#2323)."

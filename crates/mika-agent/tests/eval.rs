@@ -261,6 +261,18 @@ mod eval {
     // RULE du prompt prescrit littéralement.
     mod test_fallthrough_run_gh_refused_2573;
 
+    // mika#2653 — second cas mesuré de la même famille, et le plus coûteux : un
+    // tour ouvert par un événement PR / check-suite n'annule pas une tâche dont
+    // un pilote est vif (71 tours jetés le 2026-10-02). Les trois contrôles sont
+    // porteurs : V6b (tour de conversation) sépare « la garde décide » de « la
+    // garde bloque l'annulation » — et retirer à l'opérateur son geste
+    // d'annulation est pire que le défaut, puisqu'il n'a pas de contournement ;
+    // V6c (tour webhook PR sans pilote) est le contrôle POSITIF, sans quoi zéro
+    // refus est indistinguable d'une garde qui ne tourne pas ; V6d épingle le
+    // fail-closed sur l'illisible, qui est l'arbitrage inverse de celui de
+    // `live_pilot` pour ses deux appelants.
+    mod test_cancel_task_live_pilot_2653;
+
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 
