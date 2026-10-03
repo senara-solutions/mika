@@ -2268,6 +2268,328 @@ fn seat_rejection_json(
     )
 }
 
+/// Les deux skills que les outils de pilote dispatchent (mika#2649).
+///
+/// `run_claude_pilot` pins `skill` to `dev-pilot` in its own schema and
+/// `run_claude_pilot_groom` to `dev-groom`; `deploy_mika` and every other
+/// long-running skill reach `validate_dispatch_readiness` too and are out of the
+/// lineage gate's population. Held as one named constant rather than a `matches!`
+/// at the call site so the population of the gate and the population the test
+/// enumerates are one list.
+pub(crate) const PILOT_DISPATCH_SKILLS: &[&str] = &["dev-pilot", "dev-groom"];
+
+/// True when `skill` names one of [`PILOT_DISPATCH_SKILLS`].
+pub(crate) fn is_pilot_dispatch_skill(skill: &str) -> bool {
+    PILOT_DISPATCH_SKILLS.contains(&skill)
+}
+
+/// Walk the task's lineage for a term that ties it to `target` (mika#2649).
+///
+/// Four terms, evaluated cheapest-first, and **the first that holds
+/// authorizes** — so the nominal case (L1 or L2 on the task itself) costs not a
+/// single extra query:
+///
+/// | # | term | what it covers |
+/// |---|---|---|
+/// | L1 | the task's own `reference_url` names the event's target | the PR is itself the target, and the `issue#N` case of a check-suite whose branch carries `N` |
+/// | L2 | the task's `claude_pilot.pr_url` names the event's PR | the task **is** the one whose dispatch produced that PR |
+/// | L3 | a **sibling** (same non-null `parent_task_id`) satisfies L1 or L2 | **the milestone cascade M4** |
+/// | L4 | the **parent** satisfies L1 or L2 | a retry under the milestone parent |
+///
+/// # Trois dispositions de fail-safe, et elles ne sont pas uniformes à dessein
+///
+/// 1. **Cible d'événement illisible** — traitée par l'appelant, qui ne nous
+///    appelle pas : il n'existe aucune cible à laquelle borner, donc refuser
+///    serait refuser sur l'absence de question.
+/// 2. **Un terme de lignée illisible** (metadata absente, JSON non conforme,
+///    `reference_url` nulle) ⇒ ce terme **n'est pas satisfait**, et les autres
+///    continuent d'être évalués. Doctrine `live_pilot` (mika#2279) à la lettre :
+///    *un signal qu'on ne peut pas lire n'est jamais un terme satisfait*. Et
+///    c'est **porteur ici** : la tâche du constat avait une metadata **vide**,
+///    donc « metadata absente ⇒ autorise » aurait autorisé l'occurrence mesurée.
+/// 3. **La question ne peut pas être posée du tout** (erreur base sur la
+///    traversée) ⇒ **refuse**, par cohérence avec la garde voisine
+///    `dispatch_check_failed` de la même fonction (*« Fail-closed: if we can't
+///    check global state, reject dispatch »*). Deux gardes de la même fonction
+///    qui divergeraient sur l'erreur base seraient une dette de lecture.
+///
+/// L'asymétrie de coût qui autorise ce fail-closed, nommée : un faux refus coûte
+/// un dispatch, visible et nommé (`record_dispatch_rejection` l'écrit dans
+/// `tasks.result`) ; un faux passage lance un pilote sur un ticket que personne
+/// n'a autorisé, brûle un créneau et ~20 min de travail.
+///
+/// **Aucun appel réseau.** La tentation est de résoudre
+/// `gh pr view --json closingIssuesReferences` pour trancher « le ticket fermé
+/// par cette PR » ; elle est refusée — ce serait un aller-retour GitHub de plus
+/// dans une fonction qui en fait déjà plusieurs à 10 s de timeout, sur un chemin
+/// qui spawne un processus, et le lien est **déjà porté en base** par L2.
+async fn evaluate_event_target_binding(
+    db: &AsyncDatabase,
+    task: &db::Task,
+    target: &crate::webhook_dispatch::WebhookEventTarget,
+) -> crate::webhook_dispatch::TargetBinding {
+    use crate::webhook_dispatch::{
+        LineageTerm, TargetBinding, WebhookEventTarget, pilot_pr_url_names_target,
+        reference_url_names_target,
+    };
+
+    match target {
+        WebhookEventTarget::NotApplicable => {
+            // L'appelant établit ce cas avant d'appeler ; ce bras existe pour que
+            // le `match` reste exhaustif sans bras `_ =>`.
+            return TargetBinding::NoTargetInEvent;
+        }
+        WebhookEventTarget::Unreadable => return TargetBinding::EventUnreadable,
+        // Une branche qui ne porte aucun numéro d'issue ne désigne aucune cible :
+        // il n'y a rien à quoi borner, donc on autorise — mais sous un nom à soi,
+        // parce que son régime attendu est **non vide** (un check-suite sur
+        // `main` est nominal) là où celui de `EventUnreadable` est vide. Les
+        // fondre rendrait la surface illisible (motif `below_threshold` /
+        // `no_ready_label_event`, mika#2131).
+        WebhookEventTarget::Branch { issue: None, .. } => {
+            return TargetBinding::NoTargetInEvent;
+        }
+        WebhookEventTarget::Pr { .. } | WebhookEventTarget::Branch { issue: Some(_), .. } => {}
+    }
+
+    // L1 / L2 sur la tâche elle-même — aucune requête.
+    if reference_url_names_target(target, task.reference_url.as_deref()) {
+        return TargetBinding::Bound(LineageTerm::TaskReference);
+    }
+    if pilot_pr_url_names_target(target, extract_pr_url(&task.metadata).as_deref()) {
+        return TargetBinding::Bound(LineageTerm::TaskPilotPrUrl);
+    }
+
+    // Sans parent, il n'y a ni frère ni parent à interroger : c'est la forme
+    // exacte de la tâche du constat (créée dans le tour même, `parent_task_id`
+    // nul), et elle est refusée sans une requête de plus.
+    let Some(parent_id) = task.parent_task_id.as_deref() else {
+        return TargetBinding::Refused;
+    };
+
+    // L3 — les frères. `get_child_tasks(parent)` rend aussi la tâche elle-même,
+    // sans conséquence : elle vient d'échouer L1 et L2.
+    match db.get_child_tasks(parent_id).await {
+        Ok(siblings) => {
+            for sibling in &siblings {
+                if sibling.id == task.id {
+                    continue;
+                }
+                if reference_url_names_target(target, sibling.reference_url.as_deref())
+                    || pilot_pr_url_names_target(
+                        target,
+                        extract_pr_url(&sibling.metadata).as_deref(),
+                    )
+                {
+                    return TargetBinding::Bound(LineageTerm::Sibling);
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                event = "webhook_dispatch_lineage_unreadable",
+                task_id = %task.id,
+                parent_task_id = %parent_id,
+                stage = "siblings",
+                error = %e,
+                "tool-boundary: could not walk the task's siblings — refusing by fail-closed (mika#2649)"
+            );
+            return TargetBinding::LineageUnreadable;
+        }
+    }
+
+    // L4 — le parent.
+    match db.get_task(parent_id).await {
+        Ok(Some(parent)) => {
+            if reference_url_names_target(target, parent.reference_url.as_deref())
+                || pilot_pr_url_names_target(target, extract_pr_url(&parent.metadata).as_deref())
+            {
+                return TargetBinding::Bound(LineageTerm::Parent);
+            }
+            TargetBinding::Refused
+        }
+        // Un `parent_task_id` qui ne résout aucune ligne est une lignée cassée,
+        // pas une question impossible à poser : le terme n'est pas satisfait.
+        Ok(None) => TargetBinding::Refused,
+        Err(e) => {
+            warn!(
+                event = "webhook_dispatch_lineage_unreadable",
+                task_id = %task.id,
+                parent_task_id = %parent_id,
+                stage = "parent",
+                error = %e,
+                "tool-boundary: could not read the task's parent — refusing by fail-closed (mika#2649)"
+            );
+            TargetBinding::LineageUnreadable
+        }
+    }
+}
+
+/// Journalise et audite une décision de lignée, et rend le JSON de refus quand
+/// elle refuse (mika#2649).
+///
+/// Cinq noms de journal pour cinq verdicts, chacun au niveau de son **régime
+/// attendu** — un WARN sur une population nominale est un WARN qu'on finit par
+/// museler. Un seul `tool_name` d'audit, la décision dans `after_value` : motif
+/// `ready_label_outcome` (mika#2323), parce que les cinq issues appartiennent au
+/// même site et à la même population.
+async fn report_event_target_binding(
+    db: &AsyncDatabase,
+    task_id: &str,
+    task: &db::Task,
+    target: &crate::webhook_dispatch::WebhookEventTarget,
+    binding: &crate::webhook_dispatch::TargetBinding,
+) -> Option<String> {
+    use crate::webhook_dispatch::{TARGET_BINDING_AUDIT_TOOL, TargetBinding, WebhookEventTarget};
+
+    let (event_repo, event_number, event_kind) = match target {
+        WebhookEventTarget::Pr { repo, number } => (repo.as_str(), Some(*number), "pr"),
+        WebhookEventTarget::Branch { repo, issue } => (repo.as_str(), *issue, "check_suite"),
+        // Ni l'une ni l'autre ne porte de dépôt lisible ; le champ le dit plutôt
+        // que d'inventer une valeur (mika#2304 : un champ qui affirme ce qu'on
+        // n'a pas mesuré).
+        WebhookEventTarget::Unreadable | WebhookEventTarget::NotApplicable => {
+            ("unknown", None, "unreadable")
+        }
+    };
+    let task_reference_url = task.reference_url.as_deref().unwrap_or("<none>");
+    let verdict = binding.audit_value();
+
+    // `match` exhaustif, aucun bras `_ =>` : un sixième verdict doit décider ici
+    // de son nom de journal et de son niveau.
+    let rejection = match binding {
+        TargetBinding::Bound(term) => {
+            info!(
+                event = "webhook_dispatch_target_bound",
+                task_id = task_id,
+                event_repo = event_repo,
+                event_number = event_number,
+                event_kind = event_kind,
+                lineage_term = term.as_str(),
+                task_reference_url = task_reference_url,
+                "tool-boundary: dispatch bound to the event's lineage (mika#2649)"
+            );
+            None
+        }
+        TargetBinding::NoTargetInEvent => {
+            info!(
+                event = "webhook_dispatch_target_absent",
+                task_id = task_id,
+                event_repo = event_repo,
+                event_kind = event_kind,
+                "tool-boundary: the event names no target to bind to — dispatch allowed (mika#2649)"
+            );
+            None
+        }
+        TargetBinding::EventUnreadable => {
+            warn!(
+                event = "webhook_dispatch_event_unreadable",
+                task_id = task_id,
+                event_kind = event_kind,
+                "tool-boundary: a PR / check-suite event did not parse — dispatch allowed \
+                 without a lineage bound (mika#2649)"
+            );
+            None
+        }
+        TargetBinding::Refused => {
+            warn!(
+                event = "webhook_dispatch_target_mismatch",
+                task_id = task_id,
+                event_repo = event_repo,
+                event_number = event_number,
+                event_kind = event_kind,
+                task_reference_url = task_reference_url,
+                "tool-boundary: dispatch refused — no lineage ties this task to the event's \
+                 target (mika#2649)"
+            );
+            Some(
+                serde_json::json!({
+                    "error": "webhook_dispatch_target_mismatch",
+                    "task_id": task_id,
+                    "event": {
+                        "repo": event_repo,
+                        "number": event_number,
+                        "kind": event_kind,
+                    },
+                    "task_reference_url": task.reference_url,
+                    "reason": format!(
+                        "This turn was opened by a `{event_kind}` event on `{event_repo}`, and \
+                         no lineage ties task '{task_id}' to that event's target: neither its \
+                         own reference, nor the pull request its dispatch produced, nor a \
+                         sibling or parent under the same milestone. A PR event authorizes a \
+                         dispatch for the work that PR belongs to — not for an arbitrary \
+                         ticket. Dispatching here would start a pilot nobody opened a window \
+                         for, and could put a second implement session in flight (mika#2649)."
+                    ),
+                    "recovery": "If this ticket genuinely needs a dispatch, it goes through its \
+                                 own positive-consent path: post the `ready` label as \
+                                 remove→add (GitHub only emits `labeled` on a transition — \
+                                 mika#2323). Grooming goes through \
+                                 `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"`. Both \
+                                 carry their own trigger and do not traverse this gate."
+                })
+                .to_string(),
+            )
+        }
+        TargetBinding::LineageUnreadable => {
+            // La ligne WARN est déjà posée par `evaluate_event_target_binding`,
+            // qui seul connaît l'étape et l'erreur.
+            Some(
+                serde_json::json!({
+                    "error": "webhook_dispatch_lineage_unreadable",
+                    "task_id": task_id,
+                    "event": {
+                        "repo": event_repo,
+                        "number": event_number,
+                        "kind": event_kind,
+                    },
+                    "reason": format!(
+                        "Could not establish whether task '{task_id}' belongs to the lineage of \
+                         the `{event_kind}` event on `{event_repo}`: the database did not answer. \
+                         This gate refuses when it cannot read its proof, like the \
+                         active-dispatch cross-check on this same door — a wrongful pass starts \
+                         a pilot nobody authorized, a wrongful refusal makes the ticket wait and \
+                         is re-driven by the stuck-ready reconciler (mika#2649)."
+                    )
+                })
+                .to_string(),
+            )
+        }
+    };
+
+    if let Err(e) = db
+        .log_audit_event(
+            // Aucun session id n'atteint cette garde ; le task id est
+            // l'identifiant stable du dispatch jugé, comme pour les gardes de
+            // siège et d'escalade de la même fonction.
+            task_id,
+            TARGET_BINDING_AUDIT_TOOL,
+            &format!("task:{task_id}"),
+            None,
+            Some(verdict),
+            Some(&format!(
+                "event={event_kind}:{event_repo}#{} task_reference_url={task_reference_url} \
+                 verdict={verdict}",
+                event_number
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            )),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "webhook_dispatch_target_binding_audit_failed",
+            task_id = task_id,
+            verdict = verdict,
+            error = %e,
+            "failed to write the mika#2649 audit event (non-fatal)"
+        );
+    }
+
+    rejection
+}
+
 /// Validate that a task is in a dispatchable state for long-running execution.
 ///
 /// Stricter than `validate_task()` (which also allows `blocked` for delegation).
@@ -2478,6 +2800,60 @@ pub(crate) async fn validate_dispatch_readiness(
                 "reason": format!("Failed to check active dispatches for task: {e}")
             })
             .to_string());
+        }
+    }
+
+    // mika#2649 — Tool-boundary gate: a dispatch opened by a PR / check-suite
+    // event is bound to the LINEAGE of that event.
+    //
+    // THE HOLE THIS CLOSES. Gate (0) above judges the **nature** of the source
+    // event: `[GitHub] PR …` and `[GitHub] Check suite …` leave the Fallthrough
+    // domain because `self-dev-webhook-qa` / `-ci` carry legitimate dispatches
+    // there. Once out of that domain, **no term tied the dispatch to the PR of
+    // the event**. Measured 2026-10-02 (trace `17ba765a-be9c-11f1-94aa-c13d0500c506`):
+    // a turn opened by a QA review on PR #2647 launched an implement of
+    // mika#2646 — another ticket, with no `ready` window — while an implement of
+    // #2636 was in flight.
+    //
+    // LINEAGE, NEVER IDENTITY OF THE TARGET. A literal "same target or refuse"
+    // predicate would break the milestone cascade: on a `[GitHub] PR closed:`,
+    // M4 step 1 + step 2 legitimately dispatch the **next pending sibling**
+    // (`skills/bundled/self-dev-webhook-qa/system_prompt.md`), i.e. a ticket
+    // whose number is not the PR's. What the measured occurrence does NOT share
+    // with M4 is the lineage: its task was created **in the turn itself**, with
+    // no `parent_task_id` and empty metadata. Four terms, cheapest first, and
+    // the first that holds authorizes.
+    //
+    // PLACED HERE: after the task fetch (the predicate needs the row) and before
+    // the seat gate's `gh` round trips, so a refusal spends no network; and well
+    // before the per-class guard, whose deferred-callback enqueue (mika#1011)
+    // would otherwise re-arm and re-refuse the refusal on every replay — the
+    // reason its two neighbours below already had to write down.
+    //
+    // PRE-HOC, for the reason mika#1646 had to write: `run_claude_pilot` spawns a
+    // process and creates a worktree, so a guard that fires only after the tool
+    // has run **observes** the violation without preventing it.
+    //
+    // BITES ON THE TWO PILOT SKILLS AND NOTHING ELSE — `deploy_mika` and any
+    // other skill are out of the population, the same discriminator the mika#2484
+    // intent gate above uses.
+    if let Some(msg) = originating_message
+        && tool_input
+            .and_then(extract_skill_from_input)
+            .is_some_and(is_pilot_dispatch_skill)
+    {
+        let target = crate::webhook_dispatch::webhook_event_target(msg);
+        if !matches!(
+            target,
+            crate::webhook_dispatch::WebhookEventTarget::NotApplicable
+        ) {
+            let binding = evaluate_event_target_binding(db, &task, &target).await;
+            if let Some(rejection) =
+                report_event_target_binding(db, task_id, &task, &target, &binding).await
+            {
+                record_dispatch_rejection(db, task_id, &rejection).await;
+                return Err(rejection);
+            }
         }
     }
 
@@ -11253,6 +11629,559 @@ Harness ticket.
     // -----------------------------------------------------------------------
     // mika#2545 — un ESCALATE de groom est terminal
     // -----------------------------------------------------------------------
+
+    /// mika#2649 — un dispatch ouvert par un événement PR est borné à la LIGNÉE
+    /// de cet événement.
+    mod mika2649_lignee {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+
+        /// L'événement du constat du 2026-10-02 : une revue QA sur la PR #2647.
+        const EVENT_PR_2647: &str = "[GitHub] PR review (approved) on \
+             senara-solutions/mika#2647 (un titre) by @samidarko";
+
+        /// L'événement de la cascade de jalon : la PR du frère précédent, mergée.
+        const EVENT_PR_CLOSED_2600: &str =
+            "[GitHub] PR closed: senara-solutions/mika#2600 — un titre";
+
+        const MISMATCH: &str = "webhook_dispatch_target_mismatch";
+
+        fn issue_url(n: u64) -> String {
+            format!("https://github.com/senara-solutions/mika/issues/{n}")
+        }
+
+        fn pr_url(n: u64) -> String {
+            format!("https://github.com/senara-solutions/mika/pull/{n}")
+        }
+
+        /// Crée une tâche, avec parent et metadata optionnels.
+        ///
+        /// Passe par `NewTask` plutôt que par le helper `create_task_with_ref_url`
+        /// du module parent parce que les termes L3 et L4 ont besoin d'un
+        /// `parent_task_id`, que ce helper ne sait pas poser.
+        async fn task(
+            db: &AsyncDatabase,
+            status: &str,
+            reference_url: Option<&str>,
+            parent_task_id: Option<&str>,
+        ) -> String {
+            use crate::db::NewTask;
+            use crate::task_engine::types::{action_type, trigger_type};
+
+            let new = NewTask {
+                agent_id: db.agent_id().to_string(),
+                team_run_id: None,
+                parent_task_id: parent_task_id.map(|s| s.to_string()),
+                depth: if parent_task_id.is_some() { 1 } else { 0 },
+                label: "mika2649 fixture".to_string(),
+                trigger_type: trigger_type::MANUAL.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: action_type::NONE.to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("mika2649".to_string()),
+                created_trace_id: None,
+                reference_url: reference_url.map(|u| u.to_string()),
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            };
+            let id = db.create_task(new).await.unwrap();
+            if status != "pending" {
+                db.update_manual_task_status(&id, status).await.unwrap();
+            }
+            id
+        }
+
+        async fn readiness(
+            db: &AsyncDatabase,
+            task_id: &str,
+            skill: &str,
+            prompt: &str,
+            originating_message: Option<&str>,
+        ) -> Result<String, String> {
+            let input = serde_json::json!({
+                "skill": skill,
+                "prompt": prompt,
+                "task_id": task_id,
+            });
+            validate_dispatch_readiness(db, task_id, None, Some(&input), originating_message).await
+        }
+
+        /// Asserte que **cette** garde n'a pas refusé. Le reste de la fonction
+        /// peut refuser pour d'autres raisons (porte de siège, grooming, …),
+        /// donc l'assertion porte sur le nom du refus et non sur `is_ok` —
+        /// la discipline du contrôle positif de mika#2046 juste au-dessus.
+        fn assert_not_refused_by_this_gate(outcome: &Result<String, String>, what: &str) {
+            if let Err(err) = outcome {
+                assert!(
+                    !err.contains(MISMATCH),
+                    "{what} ne doit pas être refusé par la garde de lignée, obtenu : {err}"
+                );
+                assert!(
+                    !err.contains("webhook_dispatch_lineage_unreadable"),
+                    "{what} ne doit pas tomber sur le fail-closed de lignée, obtenu : {err}"
+                );
+            }
+        }
+
+        /// **V1 — le rejeu du constat.**
+        ///
+        /// Trace `17ba765a-be9c-11f1-94aa-c13d0500c506` : un tour ouvert par une
+        /// revue QA sur la PR #2647 a lancé un implement de mika#2646 — tâche
+        /// **créée dans le tour même** (`create_task` à 20:03:13), donc sans
+        /// parent et avec une metadata vide. C'est très exactement cette forme
+        /// qui est refusée ici.
+        #[tokio::test]
+        async fn mika2649_un_tour_pr_dispatchant_un_autre_ticket_est_refuse() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let fresh = task(&db, "in_progress", Some(&issue_url(2646)), None).await;
+
+            let err = readiness(&db, &fresh, "dev-pilot", "mika#2646", Some(EVENT_PR_2647))
+                .await
+                .expect_err("un événement sur la PR #2647 n'autorise pas un implement de #2646");
+
+            let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
+            assert_eq!(parsed["error"], MISMATCH);
+            assert_eq!(parsed["task_id"], fresh);
+            assert_eq!(parsed["event"]["repo"], "senara-solutions/mika");
+            assert_eq!(parsed["event"]["number"], 2647);
+            assert_eq!(parsed["event"]["kind"], "pr");
+
+            // Le refus nomme sa levée : un refus qui ne la nomme pas est un refus
+            // qu'on contourne au jugé (doctrine mika#2545).
+            let recovery = parsed["recovery"].as_str().unwrap();
+            assert!(recovery.contains("ready"), "le geste `ready` est nommé");
+            assert!(recovery.contains("groom"), "le geste de grooming est nommé");
+
+            // Et il est écrit dans `tasks.result`, comme ses cinq sœurs.
+            let stored = db
+                .get_task(&fresh)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .expect("le refus doit être écrit dans tasks.result");
+            assert!(stored.contains(MISMATCH));
+        }
+
+        /// **V2 — contrôle positif L1 : la tâche EST la cible de l'événement.**
+        #[tokio::test]
+        async fn mika2649_un_tour_pr_dispatchant_sa_propre_cible_passe() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let own = task(&db, "in_progress", Some(&pr_url(2647)), None).await;
+
+            let outcome = readiness(&db, &own, "dev-pilot", "mika#2647", Some(EVENT_PR_2647)).await;
+            assert_not_refused_by_this_gate(&outcome, "une tâche dont la reference_url EST la PR");
+        }
+
+        /// **V3 — contrôle positif L3 : la cascade de jalon M4.**
+        ///
+        /// **L'exigence dure de ce ticket.** Sur un `[GitHub] PR closed:`, M4
+        /// step 1 + step 2 dispatchent légitimement le **frère pending suivant**
+        /// (`skills/bundled/self-dev-webhook-qa/system_prompt.md`), c'est-à-dire
+        /// un ticket dont le numéro n'est pas celui de la PR. Un prédicat
+        /// « même cible, sinon refus » casserait la boucle de jalon.
+        #[tokio::test]
+        async fn mika2649_la_cascade_de_jalon_m4_passe() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+
+            let milestone = task(&db, "in_progress", None, None).await;
+            // Le frère #1 : son dispatch a produit la PR que l'événement porte.
+            let done = task(&db, "completed", Some(&issue_url(2599)), Some(&milestone)).await;
+            set_task_pr_url(&db, &done, &pr_url(2600)).await;
+            // Le frère #2 : celui que M4 dispatche maintenant.
+            let next = task(&db, "pending", Some(&issue_url(2601)), Some(&milestone)).await;
+
+            let outcome = readiness(
+                &db,
+                &next,
+                "dev-pilot",
+                "mika#2601",
+                Some(EVENT_PR_CLOSED_2600),
+            )
+            .await;
+            assert_not_refused_by_this_gate(&outcome, "la cascade de jalon M4");
+        }
+
+        /// **V4 — contrôle positif L2 : la tâche porte la PR de l'événement.**
+        ///
+        /// C'est le chemin nominal du tour LLM sur une revue : la tâche implement
+        /// du ticket porte `claude_pilot.pr_url`, estampillé par le producteur du
+        /// dispatch. C'est aussi ce qui permet de répondre à « le ticket fermé par
+        /// cette PR » **sans appel réseau**.
+        #[tokio::test]
+        async fn mika2649_la_tache_porteuse_de_la_pr_url_passe() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let implementer = task(&db, "in_progress", Some(&issue_url(2641)), None).await;
+            set_task_pr_url(&db, &implementer, &pr_url(2647)).await;
+
+            let outcome = readiness(
+                &db,
+                &implementer,
+                "dev-pilot",
+                "mika#2641",
+                Some(EVENT_PR_2647),
+            )
+            .await;
+            assert_not_refused_by_this_gate(&outcome, "la tâche dont le dispatch a produit la PR");
+        }
+
+        /// **V4-bis — contrôle positif L4 : le parent porte la cible.**
+        #[tokio::test]
+        async fn mika2649_un_parent_porteur_de_la_cible_passe() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let parent = task(&db, "in_progress", None, None).await;
+            set_task_pr_url(&db, &parent, &pr_url(2647)).await;
+            let child = task(&db, "pending", Some(&issue_url(2650)), Some(&parent)).await;
+
+            let outcome =
+                readiness(&db, &child, "dev-pilot", "mika#2650", Some(EVENT_PR_2647)).await;
+            assert_not_refused_by_this_gate(&outcome, "une re-tentative sous le parent porteur");
+        }
+
+        /// **V5 — un tour non-PR n'est pas dans la population.**
+        ///
+        /// Le verdict doit être **identique à aujourd'hui** : ces tours ont leurs
+        /// propres gardes (gate 0 pour le domaine Fallthrough, mika#2484 pour
+        /// l'intention de grooming) et la lignée ne les interroge pas.
+        #[tokio::test]
+        async fn mika2649_un_tour_non_pr_nest_pas_dans_la_population() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+
+            // Un numéro distinct par cas : l'index unique
+            // `idx_tasks_manual_active_ref_url` interdit deux tâches actives sur
+            // la même issue, et c'est le comportement nominal du dépôt.
+            for (n, msg) in [
+                None,
+                Some("Implement mika#2649"),
+                Some("[GitHub] Issue labeled ready on senara-solutions/mika#2649 — titre"),
+                Some("[callback: long_running:run_claude_pilot]"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let num = 7000 + n as u64;
+                let t = task(&db, "in_progress", Some(&issue_url(num)), None).await;
+                let outcome = readiness(&db, &t, "dev-pilot", &format!("mika#{num}"), msg).await;
+                assert_not_refused_by_this_gate(&outcome, &format!("{msg:?}"));
+            }
+        }
+
+        /// **V6 — un check-suite est borné par le numéro que porte sa branche.**
+        #[tokio::test]
+        async fn mika2649_un_check_suite_borne_par_sa_branche() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let event =
+                "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/2646/slug)";
+
+            // Un autre ticket : refusé.
+            let other = task(&db, "in_progress", Some(&issue_url(2649)), None).await;
+            let err = readiness(&db, &other, "dev-pilot", "mika#2649", Some(event))
+                .await
+                .expect_err("la branche porte #2646, pas #2649");
+            let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
+            assert_eq!(parsed["error"], MISMATCH);
+            assert_eq!(parsed["event"]["kind"], "check_suite");
+            assert_eq!(parsed["event"]["number"], 2646);
+
+            // Le ticket de la branche : passe.
+            let own = task(&db, "in_progress", Some(&issue_url(2646)), None).await;
+            let outcome = readiness(&db, &own, "dev-pilot", "mika#2646", Some(event)).await;
+            assert_not_refused_by_this_gate(&outcome, "le ticket que la branche porte");
+        }
+
+        /// **V7 — une branche sans numéro ne désigne aucune cible : autorise.**
+        ///
+        /// Point 1 des trois dispositions : il n'existe aucune cible à laquelle
+        /// borner, donc refuser serait refuser sur l'absence de question. Son
+        /// régime attendu est **non vide** (un check-suite sur `main` est
+        /// nominal), ce qui est la raison pour laquelle il a un nom à lui et pas
+        /// celui de l'illisible.
+        #[tokio::test]
+        async fn mika2649_un_check_suite_sans_numero_de_branche_autorise() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let t = task(&db, "in_progress", Some(&issue_url(2649)), None).await;
+
+            let outcome = readiness(
+                &db,
+                &t,
+                "dev-pilot",
+                "mika#2649",
+                Some("[GitHub] Check suite success on senara-solutions/mika (branch: main)"),
+            )
+            .await;
+            assert_not_refused_by_this_gate(&outcome, "un check-suite sur `main`");
+        }
+
+        /// **V7-bis — un événement PR illisible autorise, sous son propre nom.**
+        #[tokio::test]
+        async fn mika2649_un_evenement_pr_illisible_autorise() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let t = task(&db, "in_progress", Some(&issue_url(2649)), None).await;
+
+            let outcome = readiness(
+                &db,
+                &t,
+                "dev-pilot",
+                "mika#2649",
+                Some("[GitHub] PR une-forme-que-personne-nemet"),
+            )
+            .await;
+            assert_not_refused_by_this_gate(&outcome, "un événement PR dont la grammaire a bougé");
+        }
+
+        /// **V8 — la garde ne mord que sur les deux outils de pilote.**
+        ///
+        /// `deploy_mika` atteint `validate_dispatch_readiness` lui aussi et n'est
+        /// pas dans la population : ce que la garde borne est le lancement d'un
+        /// **pilote**, pas tout travail long.
+        #[tokio::test]
+        async fn mika2649_la_garde_ne_mord_que_sur_les_deux_outils_de_pilote() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+
+            for (n, skill) in ["deploy_mika", "build-mika", "un-skill-inconnu"]
+                .into_iter()
+                .enumerate()
+            {
+                let num = 7100 + n as u64;
+                let t = task(&db, "in_progress", Some(&issue_url(num)), None).await;
+                let outcome =
+                    readiness(&db, &t, skill, &format!("mika#{num}"), Some(EVENT_PR_2647)).await;
+                assert_not_refused_by_this_gate(&outcome, skill);
+            }
+
+            // Contrôle positif du même test : les deux skills de pilote SONT
+            // dans la population. Sans lui, « la garde discrimine » serait
+            // indistinguable de « la garde ne mord sur rien ».
+            for (n, skill) in PILOT_DISPATCH_SKILLS.iter().enumerate() {
+                let num = 7200 + n as u64;
+                let t = task(&db, "in_progress", Some(&issue_url(num)), None).await;
+                let err = readiness(&db, &t, skill, &format!("mika#{num}"), Some(EVENT_PR_2647))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.contains(MISMATCH),
+                    "{skill} est un outil de pilote et doit être borné — obtenu : {err}"
+                );
+            }
+        }
+
+        /// **V9 — une metadata illisible n'est pas un terme satisfait.**
+        ///
+        /// Point 2 des trois dispositions, et **il est porteur** : la tâche du
+        /// constat avait une metadata **vide**, donc « metadata absente ⇒
+        /// autorise » aurait autorisé l'occurrence mesurée. Le contrôle négatif
+        /// qui empêche de rouvrir le constat.
+        #[tokio::test]
+        async fn mika2649_une_metadata_illisible_nest_pas_un_terme_satisfait() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+
+            for (n, metadata) in [
+                "",
+                "pas du json",
+                "{}",
+                r#"{"claude_pilot": {}}"#,
+                r#"{"claude_pilot": {"pr_url": null}}"#,
+                r#"{"claude_pilot": {"pr_url": "pas une url"}}"#,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let num = 7300 + n as u64;
+                let t = task(&db, "in_progress", Some(&issue_url(num)), None).await;
+                db.update_task_metadata(&t, metadata).await.unwrap();
+                let err = readiness(
+                    &db,
+                    &t,
+                    "dev-pilot",
+                    &format!("mika#{num}"),
+                    Some(EVENT_PR_2647),
+                )
+                .await
+                .expect_err("une metadata illisible ne borne rien");
+                assert!(
+                    err.contains(MISMATCH),
+                    "metadata {metadata:?} — obtenu : {err}"
+                );
+            }
+        }
+
+        /// **V9-bis — un frère qui ne porte pas la cible ne borne rien.**
+        ///
+        /// Le contrôle négatif de L3 : avoir un parent ne suffit pas, il faut
+        /// qu'un frère nomme réellement la cible. Sans ce test, « L3 lit les
+        /// frères » serait indistinguable de « avoir un parent autorise ».
+        #[tokio::test]
+        async fn mika2649_un_frere_sans_rapport_ne_borne_rien() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+
+            let parent = task(&db, "in_progress", None, None).await;
+            let unrelated = task(&db, "completed", Some(&issue_url(1234)), Some(&parent)).await;
+            set_task_pr_url(&db, &unrelated, &pr_url(1235)).await;
+            let target = task(&db, "pending", Some(&issue_url(2646)), Some(&parent)).await;
+
+            let err = readiness(&db, &target, "dev-pilot", "mika#2646", Some(EVENT_PR_2647))
+                .await
+                .expect_err("un frère sans rapport avec la PR de l'événement ne borne rien");
+            assert!(err.contains(MISMATCH), "obtenu : {err}");
+        }
+
+        /// **La troisième disposition — l'erreur base refuse, et elle le dit.**
+        ///
+        /// La **détection** de l'erreur base n'est pas atteignable sur une base
+        /// en mémoire : `get_child_tasks` et `get_task` n'échouent pas sur une
+        /// base saine, et la faire échouer demanderait de fermer la connexion
+        /// sous l'acteur. Ce qui est épinglé ici est donc la **disposition** —
+        /// que ce verdict refuse, et que son corps nomme sa cause — en
+        /// construisant l'état directement. C'est dit plutôt que découvert : la
+        /// moitié non couverte est la détection.
+        #[tokio::test]
+        async fn mika2649_le_fail_closed_de_lignee_refuse_et_nomme_sa_cause() {
+            use crate::webhook_dispatch::{TargetBinding, WebhookEventTarget};
+
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+            let t = task(&db, "in_progress", Some(&issue_url(2649)), None).await;
+            let row = db.get_task(&t).await.unwrap().unwrap();
+            let target = WebhookEventTarget::Pr {
+                repo: "senara-solutions/mika".to_string(),
+                number: 2647,
+            };
+
+            let rejection = report_event_target_binding(
+                &db,
+                &t,
+                &row,
+                &target,
+                &TargetBinding::LineageUnreadable,
+            )
+            .await
+            .expect("le fail-closed de lignée refuse");
+            let parsed: serde_json::Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(parsed["error"], "webhook_dispatch_lineage_unreadable");
+            assert!(
+                parsed["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("the database did not answer"),
+                "le corps nomme la cause : {rejection}"
+            );
+
+            // Et les trois verdicts qui autorisent ne composent aucun refus.
+            for allowing in [
+                TargetBinding::Bound(crate::webhook_dispatch::LineageTerm::TaskReference),
+                TargetBinding::EventUnreadable,
+                TargetBinding::NoTargetInEvent,
+            ] {
+                assert!(
+                    report_event_target_binding(&db, &t, &row, &target, &allowing)
+                        .await
+                        .is_none(),
+                    "{allowing:?} autorise, donc ne compose aucun refus"
+                );
+            }
+        }
+
+        /// **La décision est auditée, et sous un seul `tool_name`.**
+        ///
+        /// C'est cette propriété qui rend exact le `GROUP BY after_value` de la
+        /// sonde opérateur. Le test lit la base plutôt que le journal : une
+        /// ligne de journal n'est pas une population comptable.
+        #[tokio::test]
+        async fn mika2649_chaque_decision_laisse_une_ligne_sous_un_seul_nom() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            );
+
+            // Un refus…
+            let refused = task(&db, "in_progress", Some(&issue_url(2646)), None).await;
+            let _ = readiness(&db, &refused, "dev-pilot", "mika#2646", Some(EVENT_PR_2647)).await;
+            // …et un dispatch lié.
+            let bound = task(&db, "in_progress", Some(&pr_url(2647)), None).await;
+            let _ = readiness(&db, &bound, "dev-pilot", "mika#2647", Some(EVENT_PR_2647)).await;
+
+            // La clé de session de l'audit **est** le task id — aucun session id
+            // n'atteint cette garde, comme pour ses deux sœurs de la même
+            // fonction. Lire par tâche épingle donc aussi cette clé.
+            for (task_id, expected) in [
+                (&refused, crate::webhook_dispatch::TARGET_BINDING_REFUSED),
+                (&bound, crate::webhook_dispatch::TARGET_BINDING_BOUND),
+            ] {
+                let ours: Vec<_> = db
+                    .get_audit_events(task_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.tool_name == crate::webhook_dispatch::TARGET_BINDING_AUDIT_TOOL)
+                    .collect();
+                assert_eq!(
+                    ours.len(),
+                    1,
+                    "une ligne et une seule, sous un seul tool_name, pour {task_id} \
+                     — c'est ce qui rend le `GROUP BY after_value` exact"
+                );
+                let row = &ours[0];
+                assert_eq!(row.after_value.as_deref(), Some(expected));
+                assert_eq!(row.target_key, format!("task:{task_id}"));
+                // Le `reasoning` nomme la cible de l'événement : une ligne
+                // d'audit qui ne dit pas sur quoi elle a statué n'est pas une
+                // attribution.
+                let reasoning = row.reasoning.as_deref().unwrap_or_default();
+                assert!(
+                    reasoning.contains("senara-solutions/mika#2647"),
+                    "le reasoning nomme la cible de l'événement : {reasoning}"
+                );
+            }
+            // Le second cas est le **contrôle positif** de la sonde : zéro refus
+            // ET zéro `bound` se liraient pareil (mika#2205).
+        }
+    }
 
     mod mika2545_escalate_terminal {
         use super::*;
