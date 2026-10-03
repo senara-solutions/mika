@@ -284,6 +284,15 @@ DEPTH	B	crates/mika-agent/src/skills/builtin_handlers.rs::validate_review_depth_
 # is the second reader, observability-only — its unknown shape falls to `other`
 # instead of being refused, so a reworded prefix costs a class in a `GROUP BY`,
 # never a decision.
+# mika#2649 extracted the two prefix literals of the Fallthrough domain into
+# named constants, so they have ONE definition site read by BOTH faces of the
+# same border: `is_webhook_fallthrough_domain`, which takes those two families
+# OUT of the domain, and `webhook_event_target`, which finds them there again to
+# bind a dispatch to the event's target. What leaves one is exactly what must be
+# bound in the other, so the two must read the same byte. Declared, not
+# allowlisted — the resolution the survey prescribes.
+[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::CHECK_SUITE_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::PR_EVENT_PREFIX	exact:prefix
 [GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::fallthrough_marker_class	exact:prefix
 [GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::is_webhook_fallthrough_domain	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::READY_LABEL_DISPATCH_MARKER	exact:prefix
