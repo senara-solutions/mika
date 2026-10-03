@@ -1912,10 +1912,14 @@ la **formulation** du gate, jamais un seuil. Le désarmement est un revert du bl
   humain — demande de lire le diff d'une PR fusionnée depuis le moteur. **Suivi**,
   précondition : que V4 montre que la corrélation vaut d'être automatisée.
 
-### Un lanceur `claude-pilot` mort est un fait estampillé, exit 79 (mika#2634, phase A)
+### Un lanceur `claude-pilot` mort est un fait estampillé, exit 79 — et il cesse de brûler les fenêtres (mika#2634)
 
-**Aucune variable d'environnement, aucune migration, aucune valeur de réglage
-déplacée.** Cette entrée est ici parce que l'opérateur qui lit un
+**Deux phases, et la frontière est lisible.** La **phase A** (PR #2644) rend la
+mort du lanceur visible : exit 79 estampillé par le pré-flight, événement
+distinct, ligne d'audit — **aucune variable d'environnement, aucune migration,
+aucune valeur de réglage déplacée**. La **phase B** (ce bloc, § *Le frein*
+ci-dessous) la rend **bornée** : trois variables, deux surfaces de refus, aucune
+migration. Cette entrée est ici parce que l'opérateur qui lit un
 `Process Exit code: 1:` avec un `stderr_bytes: 0` et aucun journal pilote
 cherche dans ce voisinage.
 
@@ -2136,16 +2140,16 @@ discriminateur qu'il faut lire, pas le prédicat — la leçon mika#2545 à la l
 - **Il ne répare aucun lanceur.** Le shebang est un fait d'**hôte** ; la preflight
   de `make deploy` et la sonde de surveillance (AC5 du ticket) sont traitées par
   MPC dans le méta-dépôt, et le ticket les met hors périmètre en toutes lettres.
-- **Il ne borne pas encore le gaspillage (AC2).** Le frein — « à la deuxième
-  occurrence dans la fenêtre, cesser de dispatcher » — est la **phase B** de ce
-  ticket : `pilot_launcher_health.rs`, ses deux surfaces
-  (`validate_dispatch_readiness` et `auto_pull::classify_stuck_ready`, cette
-  seconde pour que le refus **ne consomme pas** le budget de re-drive mika#2020)
-  et ses trois variables. **Donc `after_value = 'recovered'`,
-  `pilot_launcher_brake_engaged` et `pilot_launcher_health_unreadable` n'existent
-  pas encore** : un grep dessus rend vide parce qu'aucun site ne les écrit,
-  jamais parce que la flotte va bien. Ce qui est livré ici est la **détection** :
-  la panne devient visible au premier lancement mort au lieu d'après 2 h 45.
+- **Il ne borne pas le gaspillage — c'est le § *Le frein* ci-dessous qui le
+  fait, et cette ligne est ce qu'il faut lire avant de grepper.** La phase A
+  livre la **détection** : la panne devient visible au premier lancement mort au
+  lieu d'après 2 h 45. Jusqu'au déploiement de la phase B, `after_value =
+  'recovered'`, `pilot_launcher_brake_engaged` et
+  `pilot_launcher_health_unreadable` **ne sont écrits par aucun site** : un grep
+  dessus rend vide parce que rien ne les produit, jamais parce que la flotte va
+  bien. Après ce déploiement, c'est le tableau de la phase B qui donne leur
+  régime attendu — **et leur absence redevient, elle, un signal de binaire
+  antérieur** (classe mika#2340).
 - **Il ne rattrape pas l'incident du 2026-10-02.** Les trois tâches mesurées
   restent ce qu'elles sont et **rien ne rétro-écrit** une ligne d'audit datée
   d'un fait qu'on n'a pas observé — ce serait l'inverse de ce que ce travail
@@ -2165,11 +2169,180 @@ discriminateur qu'il faut lire, pas le prédicat — la leçon mika#2545 à la l
   indéfiniment. Le `/dev/null` masquait peut-être ce risque par accident, et le
   lever demande de décider où va ce stderr, alors que `TASK_ID` n'est pas connu
   à la ligne qui ouvre fd 9. **Ticket de suivi**, avec cet arbitrage pour corps.
-- **Il n'ajoute aucun canal push vers le veilleur**, et aucune variable
-  d'environnement.
+- **Il n'ajoute aucun canal push vers le veilleur** (phase A n'ajoutait pas non
+  plus de variable d'environnement ; la phase B en ajoute trois, et le canal push
+  reste refusé pour la raison de D7).
 - **Il rend le champ lisible, pas surveillé.** Les seuls instruments sont les
   greps et les requêtes ci-dessus, et **leur silence ne prouve rien tant que
   personne ne les exécute.**
+
+### Le frein : à la deuxième mort, le moteur cesse de dispatcher (phase B, AC2)
+
+**Trois variables, deux surfaces de refus, aucune migration.** La phase A rendait
+la mort visible et ne bornait rien : chaque dispatch suivant repartait et mourait
+de la même façon tant que l'hôte n'était pas réparé. C'est très exactement ce
+qu'ont coûté les 2 h 45 du 2026-10-02.
+
+- `MIKA_PILOT_LAUNCHER_BRAKE_WINDOW_SECS` — la fenêtre, en secondes (défaut
+  `3600`). **Bornée des deux côtés par l'incident mesuré** : en dessous, les
+  trois morts tombées à 03:03Z, 03:05Z et 04:00Z auraient laissé la troisième
+  repartir à neuf ; au-dessus, la fenêtre cesse de se lever d'elle-même en un
+  délai qu'un opérateur accepte d'attendre après avoir réparé l'hôte — et D5 ne
+  tient que parce que la levée est gratuite.
+- `MIKA_PILOT_LAUNCHER_BRAKE_THRESHOLD` — le nombre de morts qui freine (défaut
+  `2`, **la lettre d'AC2**). Un seuil de 1 freinerait sur toute panne transitoire
+  du lanceur, et un dispatch brûlé est le prix déjà payé pour *savoir* qu'il y a
+  une panne.
+- `MIKA_PILOT_LAUNCHER_BRAKE` — kill-switch, **défaut armé**. `0`/`false`/`off`/
+  `no` désarment sans redéploiement.
+
+**Trois paliers maison pour les deux valeurs numériques** : absent ou vide →
+défaut ; illisible, `0` ou négatif → défaut **plus un WARN nommant la valeur
+entre guillemets**. Le `0` **ne désarme pas** — c'est le rôle du kill-switch, et
+ses deux lectures sont fausses dans des directions opposées (un seuil à zéro
+freine *avant* la première mort et gèle un hôte sain ; une fenêtre à zéro ne
+couvre aucun instant et rend le frein inerte). Une valeur non reconnue du
+kill-switch **laisse armé**, avec un WARN : un désarmement par coquille sur le
+frein que l'AC2 demande serait la panne silencieuse de l'incident fondateur.
+
+**Une FENÊTRE, jamais un compteur persistant (D5), et c'est ce qui dispense de
+tout geste de levée.** Un lanceur réparé sort de la fenêtre sans qu'on efface
+quoi que ce soit — la propriété que mika#2597 écrit pour son hold et que
+mika#2347 a dû bâtir à la main faute de l'avoir. Un compteur persistant
+demanderait un site de remise à zéro, et mika#2158 a mesuré ce que coûte un
+compteur remis à zéro par l'action qu'il compte : 31 re-drives affichant 1. Le
+pire cas est borné et auto-réparant : hôte non réparé ⇒ **un** dispatch brûlé par
+fenêtre au lieu de tous, ce que le ticket demande en toutes lettres.
+
+**Fail-OPEN sur la lecture, et l'asymétrie l'exige (D6).** Un ledger illisible ⇒
+**on ne bloque pas**. C'est l'inverse de `wip_rescue` (mika#2199) et de
+`run_gh pr ready` (mika#2624), et l'inversion est raisonnée : là-bas un faux
+négatif faisait attendre **une** PR ; ici un faux positif gèle **tous** les
+dispatches de la flotte. Un faux négatif coûte une fenêtre brûlée — visible
+(une ligne `pilot_launcher_dead`), bornée, rattrapable au tour suivant.
+
+**Un lecteur, deux surfaces.** `crates/mika-agent/src/pilot_launcher_health.rs`
+est le lecteur unique (patron `live_pilot.rs`, mika#2279) ; il rend trois états et
+jamais un `bool`, parce que `Braked` et `Unreadable` appellent des conduites
+**opposées** — « réparez l'hôte » contre « la base ne répond pas ».
+
+| surface | site | effet |
+|---|---|---|
+| **A** | `validate_dispatch_readiness`, après les trois gardes pures et **avant** toute résolution de jeton et tout appel `gh` | refus structuré `pilot_launcher_braked`, écrit sur `tasks.result` |
+| **B** | `auto_pull::classify_stuck_ready`, **après** le bras `in_flight` | `Skip` sous le nom `pilot_launcher_braked`, **sans** remise à zéro du budget |
+
+**Pourquoi la surface B existe, alors que A protège déjà (D8).** Un refus de
+readiness laisse le ticket `ready`, que la Phase 2 re-drive toutes les ~15 min —
+et chaque re-drive consomme un point du budget mika#2020, dont trois abandonnent
+un ticket sain en `operator-review`. Un hôte cassé une heure parquerait donc des
+tickets parfaitement valides derrière une panne qui n'est pas la leur, et le
+remède serait un geste d'opérateur **par ticket** alors que le frein se lève tout
+seul. `Skip`, jamais `SkipAndResetBudget` : un hôte cassé n'est pas un progrès.
+
+**La surface A est bornée aux skills de pilote** (`dev-pilot`, `dev-groom`, la
+constante `PILOT_DISPATCH_SKILLS` de mika#2649). `deploy_mika` atteint la même
+fonction et un lanceur `claude-pilot` mort ne dit rien d'un déploiement — pire,
+le déploiement est l'un des gestes qui **réparent** l'hôte, donc le freiner
+serait la boucle s'enfermant dehors de son propre remède.
+
+#### Surfaces opérateur (phase B)
+
+```bash
+# 1. Le frein a-t-il mordu ?
+grep pilot_launcher_brake_engaged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{task_id, dead_count, since}'
+
+# 2. CONTRÔLE NÉGATIF — le ledger est-il lisible ? (régime attendu : VIDE)
+grep pilot_launcher_health_unreadable "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. CONTRÔLE NÉGATIF — le frein est-il désarmé alors qu'il aurait mordu ?
+grep pilot_launcher_brake_disarmed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{dead_count, threshold, window_secs}'
+
+# 4. L'hôte est-il revenu ?
+grep pilot_launcher_recovered "$MIKA_SPIRIT_LOG_FILE" | jq -c '{task_id, window_secs}'
+```
+
+```sql
+-- Les deux issues du même ledger, soustractibles en une requête
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'pilot_launcher_health' GROUP BY 1;
+
+-- Les dispatches que le frein a arrêtés — population DISTINCTE des morts
+SELECT id, result FROM tasks WHERE result LIKE '%pilot_launcher_braked%';
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `pilot_launcher_brake_engaged` | WARN | **vide** | chaque ligne est un dispatch que le frein a épargné ; le corps du refus nomme le geste de réparation **et** le levier de désarmement |
+| `after_value = 'recovered'` | audit | **vide** | une ligne par réparation d'hôte — non vide est un **résultat**, pas une panne. Écrite **sur transition seulement**, donc le régime sain est silencieux (doctrine mika#2131) |
+| `pilot_launcher_health_unreadable` | WARN | **vide** | fail-open : le frein est **inerte** pour cette décision, et la base ne répond pas. C'est la panne à traiter, pas le prédicat |
+| `pilot_launcher_brake_disarmed` | WARN | **vide** | le frein aurait mordu et `MIKA_PILOT_LAUNCHER_BRAKE=0` le désarme. **Sans cette ligne, « désarmé » et « hôte sain » rendraient les mêmes octets** (classe mika#2205 appliquée au frein lui-même) |
+| `pilot_launcher_recovered_audit_failed` | WARN | **vide** | la ligne INFO est passée, l'audit non — le `GROUP BY` sur-compte les morts à partir de là |
+| `pilot_launcher_braked` dans `tasks.result` | — | **vide** | la population des **refus**, délibérément distincte de celle des **morts** : l'une compte les dispatches arrêtés, l'autre les lanceurs morts, et ce sont deux mesures du même incident |
+
+#### Sondes post-déploiement de la phase B, et leurs quatre haltes
+
+> **Préalable, le même que ci-dessus.** Ces sondes décrivent le **binaire servi** :
+> `cat ~/.mika/skills/.manifest-writer` pour le shell, et un `mika-spirit` portant
+> le correctif pour le moteur. Ce sont des **gestes d'opérateur** sur l'hôte.
+
+**S5 — le frein mord au deuxième, et se lève seul.** Casser le lanceur sur un
+hôte de test, laisser deux dispatches mourir. Attendu au troisième : refusé, une
+ligne `pilot_launcher_brake_engaged`, et le ticket **n'est pas** abandonné (le
+budget de re-drive ne bouge pas). Lanceur réparé : le dispatch suivant passe sans
+qu'aucun geste n'ait été posé, et une ligne `recovered` est écrite.
+*Halte 1 — le ticket est abandonné en `operator-review` :* la surface B n'a pas
+pris, le filtre `auto_pull` ne lit pas le ledger. **Désarmer d'abord**
+(`MIKA_PILOT_LAUNCHER_BRAKE=0`), diagnostiquer ensuite — un frein qui abandonne
+des tickets sains est pire que le gaspillage qu'il remplace.
+
+**S6 — la boucle n'est pas gelée (7 jours).** Des dispatches aboutissent, et
+`pilot_launcher_brake_engaged` reste vide.
+*Halte 2 — plus aucun dispatch alors que `pilot_launcher_dead` est vide :* le
+frein est armé sur une lecture fausse. **Le kill-switch d'abord, le prédicat
+ensuite** — et lire la sonde 2 avant tout : un ledger illisible ne peut produire
+que l'inertie, jamais un faux positif, donc un refus de trop est une erreur de
+**prédicat**, pas de lecture.
+
+**S7 — le frein n'est pas inerte (7 jours).** Les sondes 2 et 3 restent vides.
+*Halte 3 — la sonde 3 est non vide :* un opérateur a désarmé le frein et l'a
+oublié. *Halte 4 — la sonde 2 est non vide :* le frein ne décide plus rien ;
+c'est la **base** qu'il faut lire, pas le prédicat.
+
+**Halte transverse — les deux sondes muettes.** Zéro `brake_engaged` **et** zéro
+`pilot_launcher_dead` ne prouve rien : il faut qu'un lanceur soit mort depuis le
+déploiement. *Une garde que personne n'a exercée se lit exactement comme une
+garde qui marche* (mika#2205).
+
+#### Ce que la phase B n'achète PAS
+
+- **Elle ne répare aucun lanceur**, et ne détecte pas la cause **avant** la
+  première mort — c'est l'AC5 du ticket, la sentinelle de shebang, attribuée à
+  MPC dans le méta-dépôt. Le frein borne le gaspillage à **un** dispatch par
+  fenêtre ; il ne le ramène pas à zéro, et le dire est la seule façon de ne pas
+  vendre une garantie qui n'existe pas.
+- **Elle ne rattrape pas l'incident du 2026-10-02** : rien ne rétro-écrit une
+  ligne `recovered` ou un refus datés d'un fait qu'on n'a pas observé. La sonde
+  est la **prochaine** occurrence.
+- **Elle ne couvre pas un lanceur qui passe le smoke test et meurt au lancement
+  réel** — population nommée par la phase A, inchangée, **non couverte** : un tel
+  dispatch ne sort pas sur le code dédié, donc il n'écrit aucune mort et compte
+  même comme une `recovered`. **Ticket de suivi**, précondition : une mesure
+  montrant une occurrence.
+- **Elle ne couvre pas un pilote lancé hors de `validate_dispatch_readiness`.**
+  Les quatre appelants de production la traversent ; un chemin futur qui ne la
+  traverserait pas échapperait au frein, et aucun scan ne le dirait — la classe
+  que mika#2496 a dû fermer par un scan de cardinalité sur ses points de
+  lancement. **Nommé plutôt que découvert.**
+- **Elle n'ajoute aucun canal push vers le veilleur** (D7 inchangé) et **aucune
+  ligne d'audit pour les refus** : la population des refus se lit sur
+  `tasks.result`, ce qui est ce qui justifie de ne créer ni table ni second
+  `tool_name`.
+- **Elle rend le champ borné, pas surveillé.** Les seuls instruments sont les
+  quatre greps et les deux requêtes ci-dessus, et **leur silence ne prouve rien
+  tant que personne ne les exécute** — d'où le contrôle positif obligatoire de la
+  halte transverse.
 
 ### Hors périmètre, délibérément
 

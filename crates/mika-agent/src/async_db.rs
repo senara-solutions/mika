@@ -775,6 +775,23 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Count audit rows for (tool_name, after_value) newer than `since`, across
+    /// every `target_key` (mika#2634). See the sync method for why the
+    /// `target_key`-scoped sibling cannot answer this question.
+    pub async fn count_recent_audit_events_by_value(
+        &self,
+        tool_name: &str,
+        after_value: &str,
+        since: &str,
+    ) -> Result<i64> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let av = after_value.to_owned();
+        let sn = since.to_owned();
+        self.with_db(move |db| db.count_recent_audit_events_by_value(&a, &tn, &av, &sn))
+            .await
+    }
+
     /// Most recent audit row for (tool_name, target_key) newer than `since`:
     /// `(after_value, reasoning, created_at)`. Used by mika#2242's reader, which
     /// needs *which* row rather than how many.
