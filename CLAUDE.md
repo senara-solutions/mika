@@ -5044,8 +5044,8 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 | `run_claude_pilot_groom` | oui | **oui** | **fermé** — même site, même discriminant |
 | `create_task` | **oui** | oui, mais **transitivement suffisant** | **non fermé, et c'est raisonné** : une tâche créée sans dispatch ne lance aucun processus et ne consomme aucun créneau ; la fermer séparément demanderait la charge utile que R6 refuse, pour un dommage que le terme de lignée intercepte au seul endroit où il devient réel. `4df82c3a` existe encore et n'a rien coûté d'autre qu'une ligne |
 | `update_task_status` | oui | **non** | une transition d'état ne lance rien — et l'en priver **casserait M4**, dont l'étape 1 *est* un `update_task_status` sur le frère suivant |
-| `cancel_task` | oui | **OUI — et c'est le second cas mesuré** | **suivi nommé** : c'est lui qui a tué `8a3b2082` et jeté 71 tours (trace `8ec6364c-be71-11f1-908b-e931f18d2c16`). Son remède n'est pas un terme de cible mais un terme de **vivacité** (`live_pilot`, mika#2279) ; ce qui le sort d'ici est le rayon de souffle — un faux refus d'annulation retire à l'opérateur son geste de reprise le plus court — et le cinquième booléen sur `ToolContext` |
-| `promote_deferred_callback` | oui | oui | **suivi**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici |
+| `cancel_task` | oui | **OUI — et c'est le second cas mesuré** | **suivi mika#2653** : c'est lui qui a tué `8a3b2082` et jeté 71 tours (trace `8ec6364c-be71-11f1-908b-e931f18d2c16`). Son remède n'est pas un terme de cible mais un terme de **vivacité** (`live_pilot`, mika#2279) ; ce qui le sort d'ici est le rayon de souffle — un faux refus d'annulation retire à l'opérateur son geste de reprise le plus court — et le cinquième booléen sur `ToolContext` |
+| `promote_deferred_callback` | oui | oui | **suivi mika#2654**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici, avec sa précondition — **zéro occurrence mesurée**, et armer une garde sur une population vide produirait un détecteur dont le silence ne prouve rien (mika#2205) |
 | `pr_merge_with_gate` | oui | non | sa cible **est** la PR, par la forme de son entrée |
 | `git_ops`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | ne touchent pas le plan de dispatch. `run_gh` porte déjà sa propre garde de création de travail (mika#2573), bornée au domaine Fallthrough |
 
@@ -5109,7 +5109,7 @@ rien : il faut qu'un tour webhook PR ait tenté un dispatch depuis le déploieme
 ### Ce que ce travail n'achète PAS
 
 - **Il ne répare pas le cap implement**, et AC2 sort de cette PR avec sa précondition
-  écrite (S5). Le cap **est** vérifié au point de dispatch sur les quatre chemins, et
+  écrite (S5, **suivi mika#2652**). Le cap **est** vérifié au point de dispatch sur les quatre chemins, et
   un bail atomique le double ; ce qui est faux est **ce que le cap compte** — des
   **lignes** (`status IN ('pending','in_progress')`), pas des **processus**. Un pilote
   vif dont la ligne callback est devenue terminale est invisible au cap. **Le
@@ -5119,8 +5119,8 @@ rien : il faut qu'un tour webhook PR ait tenté un dispatch depuis le déploieme
   qui marche.* **Le p0 est fermé sans AC2** : le terme de lignée refuse le dispatch
   mesuré **avant** que la question du cap se pose.
 - **Il ne ferme pas `cancel_task`** — le second cas de la même famille, 71 tours
-  jetés. Suivi nommé, précondition : aucune, le cas est mesuré ; ce qui le sort d'ici
-  est le rayon de souffle.
+  jetés. **Suivi mika#2653**, précondition : aucune, le cas est mesuré ; ce qui le
+  sort d'ici est le rayon de souffle.
 - **Il ne rattrape pas l'incident du 2026-10-02.** `4df82c3a` et `f8f817ce` restent
   ce qu'ils sont, et **rien ne rétro-estampille** : fabriquer une ligne d'audit datée
   d'un refus qu'on n'a pas observé est l'inverse de ce que ce travail défend. La sonde

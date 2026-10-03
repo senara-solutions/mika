@@ -3151,12 +3151,14 @@ en rougissant.
 
 - **Il ne répare pas le cap** (R1). Il rend le dispatch hors lignée impossible sur le
   chemin mesuré ; un contournement de cap par une autre cause reste ouvert, et la
-  sonde S5 est ce qui le dimensionne.
+  sonde S5 est ce qui le dimensionne — **suivi mika#2652**.
 - **Il ne ferme pas `cancel_task` sur un pilote vif depuis un tour webhook** — le
   second cas de la même famille, mesuré le même jour (71 tours jetés sur `8a3b2082`).
   Son remède n'est pas un terme de cible mais un terme de **vivacité**, et son rayon
   de souffle est distinct : un faux refus d'annulation retire à l'opérateur son geste
-  de reprise le plus court. Suivi nommé.
+  de reprise le plus court. **Suivi mika#2653.** Même famille, population non
+  mesurée : `promote_deferred_callback` (**suivi mika#2654**), qui choisit quel
+  dispatch prend le créneau.
 - **Il ne réduit PAS le résidu per-issue de mika#2155**, et il faut le dire parce que
   le voisinage invite à le croire : ce résidu est *deux dispatch-lib vivants sur le
   **même** ticket*, dont le premier sortant strippe le seat label du second. Un
