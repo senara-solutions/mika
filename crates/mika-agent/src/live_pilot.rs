@@ -165,6 +165,158 @@ pub async fn live_pilot_for_issue(db: &AsyncDatabase, issue_url: &str) -> LivePi
     LivePilotVerdict::None
 }
 
+/// Is a pilot alive under **this task**? (mika#2653)
+///
+/// The sibling of [`live_pilot_for_issue`], asked from the other handle: that
+/// one starts from an **issue URL**, this one from a **task id**. Both answer
+/// the single question this module owns, and both live here rather than at
+/// their callers — the module's written contract (*"**Sole reader** of that
+/// question"*) goes from two callers to three rather than being copied. *A
+/// census is not an allowlist: you add to it, you do not exempt in it*
+/// (mika#2633).
+///
+/// # Why a second reader was needed at all
+///
+/// `live_pilot_for_issue(db, issue_url)` takes a URL, and `cancel_task` is
+/// given a **task id**. The two-row topology this module documents above
+/// forbids deriving one from the other: a callback row — the row that carries
+/// the pgid, and therefore the probable row of the mika#2653 incident — has
+/// **no** `reference_url`, so it has no path to the URL-keyed reader at all.
+///
+/// # The traversal
+///
+/// Two handles, in order. The row the caller named may carry the pgid itself
+/// (the callback-row case); when it does not, its dispatch children are walked
+/// (the parent-row case). Same two filters, and the same reasons, as
+/// [`live_pilot_for_issue`]: a terminal child has no pilot left and its pgid is
+/// stale, and a pgid with no readable `process_start_time` cannot be told from
+/// a recycled PID — so it is **unjudgeable**, never alive, never absent.
+///
+/// # AC6 différé — phase B, mika#2653
+///
+/// Cette traversée parent→enfant **existe déjà** dans
+/// [`crate::task_engine::process_kill::cancel_task_and_kill`] (posée par
+/// mika#2335), et la duplication est **nommée ici plutôt que découverte** : la
+/// phase A de mika#2653 livre la garde, la phase B extrait la traversée en un
+/// `live_pilot::resolve_task_pilot` que les deux sites appellent, avec son scan
+/// de source refusant un troisième. L'ordre inverse est interdit — livrer le
+/// détecteur sans la garde ne referme rien. En l'état les deux lectures
+/// **divergent délibérément sur un point**, et il faut le savoir avant de les
+/// fusionner : le chemin de kill **écarte** un enfant sans `process_start_time`
+/// (il ne doit pas signaler un groupe de processus qu'il ne peut pas
+/// identifier), là où ce verdict le rend `Unreadable` (il ne peut pas prouver
+/// l'absence de pilote). Deux dispositions correctes pour deux questions
+/// différentes, à préserver à l'identique lors de l'extraction.
+pub async fn live_pilot_for_task(db: &AsyncDatabase, task_id: &str) -> LivePilotVerdict {
+    // Le pgid porté par la ligne nommée (cas de la ligne callback).
+    let named = match db.get_task(task_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                event = "live_pilot_task_lookup_failed",
+                task_id = %task_id,
+                error = %e,
+                "live_pilot: task lookup failed — liveness cannot be established"
+            );
+            return LivePilotVerdict::Unreadable {
+                reason: UNREADABLE_DB_ERROR,
+            };
+        }
+    };
+    let Some(task) = named else {
+        // Une tâche inexistante ne porte pas de pilote. Inatteignable depuis la
+        // garde (qui tourne après `validate_task_exists`), et c'est le verdict
+        // juste pour tout autre appelant.
+        return LivePilotVerdict::None;
+    };
+
+    if let Some(pid) = task.process_id {
+        let start_time: Option<u64> = task
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("process_start_time")?.as_str()?.parse().ok());
+        return match (start_time, u32::try_from(pid)) {
+            (Some(st), Ok(p)) if is_same_process_alive(p, st) => LivePilotVerdict::Alive {
+                child_task_id: task.id.clone(),
+                parent_task_id: task
+                    .parent_task_id
+                    .clone()
+                    .unwrap_or_else(|| task.id.clone()),
+                pid: p,
+            },
+            (Some(_), Ok(_)) => LivePilotVerdict::None,
+            // Pgid présent, instance non identifiable : on ne peut pas prouver
+            // l'absence de pilote, donc ce n'est pas `None`.
+            _ => {
+                warn!(
+                    event = "live_pilot_unreadable",
+                    task_id = %task_id,
+                    candidates = 1,
+                    "live_pilot: the named row carries a pgid but no usable \
+                     process_start_time — liveness cannot be settled"
+                );
+                LivePilotVerdict::Unreadable {
+                    reason: UNREADABLE_NO_START_TIME,
+                }
+            }
+        };
+    }
+
+    // Pas de pgid sur la ligne nommée : c'est une ligne parent, le pgid vit sur
+    // un de ses enfants de dispatch.
+    let children = match db.find_dispatch_children_with_pid(task_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                event = "live_pilot_lookup_failed",
+                task_id = %task_id,
+                error = %e,
+                "live_pilot: dispatch-child lookup failed — liveness cannot be \
+                 established for this task"
+            );
+            return LivePilotVerdict::Unreadable {
+                reason: UNREADABLE_DB_ERROR,
+            };
+        }
+    };
+
+    let mut unjudgeable = 0usize;
+    for child in children {
+        if is_terminal_task_status(&child.status) {
+            continue;
+        }
+        let (Some(start_time), Ok(pid)) =
+            (child.process_start_time, u32::try_from(child.process_id))
+        else {
+            unjudgeable += 1;
+            continue;
+        };
+        if is_same_process_alive(pid, start_time) {
+            return LivePilotVerdict::Alive {
+                child_task_id: child.id,
+                parent_task_id: task_id.to_string(),
+                pid,
+            };
+        }
+    }
+
+    if unjudgeable > 0 {
+        warn!(
+            event = "live_pilot_unreadable",
+            task_id = %task_id,
+            candidates = unjudgeable,
+            "live_pilot: dispatch child carries a pgid but no usable \
+             process_start_time — liveness cannot be settled"
+        );
+        return LivePilotVerdict::Unreadable {
+            reason: UNREADABLE_NO_START_TIME,
+        };
+    }
+
+    LivePilotVerdict::None
+}
+
 impl LivePilotVerdict {
     /// `true` only for [`LivePilotVerdict::Alive`].
     ///
@@ -442,6 +594,149 @@ mod tests {
         assert!(
             live_pilot_for_issue(&db, URL).await.is_alive(),
             "un frère illisible ne doit pas masquer un pilote vif prouvé"
+        );
+    }
+
+    // ───────── mika#2653 — la même question, posée depuis un id de tâche ─────────
+
+    /// La ligne **nommée** porte le pgid : le cas d'une ligne callback, c'est-à-dire
+    /// le cas probable du constat du 2026-10-02.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2653_la_ligne_nommee_porte_le_pilote() {
+        let db = test_db();
+        let (pid, st) = self_pid_and_start();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let child = seed_child(&db, &parent, "pending", pid, Some(st)).await;
+
+        match live_pilot_for_task(&db, &child).await {
+            LivePilotVerdict::Alive {
+                child_task_id,
+                pid: got,
+                ..
+            } => {
+                assert_eq!(child_task_id, child);
+                assert_eq!(i64::from(got), pid);
+            }
+            other => panic!(
+                "la ligne qui PORTE le pgid doit rendre `Alive`, pas {other:?} — \
+                 une ligne callback n'a pas d'URL, donc aucun chemin vers \
+                 `live_pilot_for_issue`"
+            ),
+        }
+    }
+
+    /// Le cas de la **topologie à deux lignes** : la tâche nommée est le parent,
+    /// qui ne porte jamais de pgid, et le pilote vit sur un enfant non terminal.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2653_un_parent_sans_pgid_trouve_le_pilote_de_son_enfant() {
+        let db = test_db();
+        let (pid, st) = self_pid_and_start();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let child = seed_child(&db, &parent, "pending", pid, Some(st)).await;
+
+        match live_pilot_for_task(&db, &parent).await {
+            LivePilotVerdict::Alive {
+                child_task_id,
+                parent_task_id,
+                ..
+            } => {
+                assert_eq!(child_task_id, child);
+                assert_eq!(parent_task_id, parent);
+            }
+            other => panic!("un parent dont l'enfant porte un pilote vif a rendu {other:?}"),
+        }
+    }
+
+    /// Négatif — un enfant **terminal** : son pgid est périmé et ne désigne plus
+    /// rien. Même filtre, et même raison, que [`live_pilot_for_issue`].
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2653_un_enfant_terminal_nest_pas_un_pilote() {
+        for status in ["delivered", "cancelled", "failed", "completed", "expired"] {
+            let db = test_db();
+            let (pid, st) = self_pid_and_start();
+            let parent = seed_parent(&db, URL, "in_progress").await;
+            seed_child(&db, &parent, status, pid, Some(st)).await;
+
+            assert_eq!(
+                live_pilot_for_task(&db, &parent).await,
+                LivePilotVerdict::None,
+                "un enfant `{status}` porte un pgid périmé, pas un pilote"
+            );
+        }
+    }
+
+    /// Négatif — un pilote mort avec un `start_time` lisible : la réponse est
+    /// `None`, **jamais** `Unreadable`. Le signal était lisible ; il dit « pas
+    /// vivant ».
+    #[tokio::test]
+    async fn mika2653_un_pilote_mort_est_none_pas_unreadable() {
+        let db = test_db();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let child = seed_child(&db, &parent, "pending", 999_999_999, Some(12345)).await;
+
+        assert_eq!(
+            live_pilot_for_task(&db, &parent).await,
+            LivePilotVerdict::None
+        );
+        assert_eq!(
+            live_pilot_for_task(&db, &child).await,
+            LivePilotVerdict::None
+        );
+    }
+
+    /// Le terme qui décide du fail-closed de la garde mika#2653 : un pgid sans
+    /// `process_start_time` lisible est **non prouvable**, donc `Unreadable` —
+    /// par les deux handles.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2653_un_pgid_sans_start_time_est_unreadable() {
+        let db = test_db();
+        let (pid, _) = self_pid_and_start();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let child = seed_child(&db, &parent, "pending", pid, None).await;
+
+        for (handle, who) in [(&parent, "parent"), (&child, "ligne nommée")] {
+            let verdict = live_pilot_for_task(&db, handle).await;
+            assert_eq!(
+                verdict,
+                LivePilotVerdict::Unreadable {
+                    reason: UNREADABLE_NO_START_TIME
+                },
+                "{who} : sans start_time la paire qui identifie une *instance* est \
+                 incomplète, et un PID recyclé serait indistinguable du pilote"
+            );
+            assert!(
+                !verdict.is_alive(),
+                "INVARIANT VIOLÉ : un signal illisible est devenu un terme satisfait"
+            );
+        }
+    }
+
+    /// Négatif — aucune ligne ne porte de pgid : le cas nominal de la quasi-totalité
+    /// des tâches, et celui qui doit rester bon marché et faux.
+    #[tokio::test]
+    async fn mika2653_une_tache_sans_pilote_rend_none() {
+        let db = test_db();
+        let parent = seed_parent(&db, URL, "pending").await;
+
+        assert_eq!(
+            live_pilot_for_task(&db, &parent).await,
+            LivePilotVerdict::None
+        );
+    }
+
+    /// Négatif — une tâche inexistante ne porte pas de pilote. Inatteignable
+    /// depuis la garde (qui tourne après `validate_task_exists`), et c'est le
+    /// verdict juste pour tout autre appelant.
+    #[tokio::test]
+    async fn mika2653_une_tache_inexistante_rend_none() {
+        let db = test_db();
+        assert_eq!(
+            live_pilot_for_task(&db, "00000000-0000-0000-0000-000000000000").await,
+            LivePilotVerdict::None
         );
     }
 }
