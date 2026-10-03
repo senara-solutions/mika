@@ -595,9 +595,23 @@ async fn handle_pass_verdict(
         // Une résolution en échec rend la chaîne vide, que
         // `maybe_rerun_failed_checks` lit comme illisible (fail-closed) — jamais
         // comme une tête.
-        let head_sha = fetch_pr_head_sha(event.pr_number, &event.repo, token)
-            .await
-            .unwrap_or_default();
+        //
+        // **Et elle n'est tentée que si la relance va la lire.** Les deux
+        // premiers termes de `maybe_rerun_failed_checks` (un run dérivable,
+        // l'armement) ne touchent pas au `head_sha`, donc sur un process
+        // désarmé ou sur une PR dont aucun check rouge ne porte de run Actions,
+        // l'aller-retour serait payé pour être jeté — l'ordre du moins cher au
+        // plus cher qui vit dans ce module n'achèterait alors rien, puisque
+        // l'appelant paierait le terme le plus cher d'abord. `rerun_needs_the_head`
+        // est ce prédicat, à un seul lecteur, pour qu'il ne puisse pas diverger
+        // de l'ordre réel des termes.
+        let head_sha = if crate::merge_gate_rerun::rerun_needs_the_head(&checks) {
+            fetch_pr_head_sha(event.pr_number, &event.repo, token)
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let rerun = crate::merge_gate_rerun::maybe_rerun_failed_checks(
             db,
             session_id,

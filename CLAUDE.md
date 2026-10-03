@@ -4789,7 +4789,7 @@ grep merge_gate_check_rerun "$MIKA_SPIRIT_LOG_FILE" \
 
 # 2. Le budget a-t-il été épuisé ?
 grep merge_gate_rerun_exhausted "$MIKA_SPIRIT_LOG_FILE" \
-  | jq -c '{repo, pr, head_sha, run_id, failing}'
+  | jq -c '{repo, pr, head_sha, run_id, red_checks}'
 
 # 3. Le ledger est-il lisible ? (régime attendu : VIDE)
 grep -E 'merge_gate_rerun_ledger_(unreadable|unwritable)' "$MIKA_SPIRIT_LOG_FILE"
@@ -4887,6 +4887,23 @@ garde qui marche* (mika#2205).
   Comme la porte elle-même, il garde le moteur.
 - **Il ne couvre pas un check rouge sans run Actions** (check externe, lien sans
   `/job/`) : population nommée, `no_actions_run`, jamais relancée.
+- **Il ne relance qu'UN run, même sur une PR rouge sur plusieurs.** « Un seul
+  appel couvre les N lints » est vrai des N lints d'un **même** run ; ce dépôt
+  porte cinq workflows, donc une PR rouge à la fois sur `ci.yml` et sur
+  `pr-body-validation.yml` est rouge sur **deux** runs, et seul le premier est
+  relancé — le second ne l'est qu'au prochain `check_suite.completed`, ce qui
+  coûte un cycle complet. La clé de ledger porte déjà le `run_id`, donc traiter
+  tous les runs d'une passe serait sûr côté budget ; ce qui l'écarte de la phase
+  B est que ça élargirait l'issue de la relance d'une valeur à un **ensemble**,
+  donc son lecteur unique et les trois sites d'appel. **Suivi nommé**,
+  précondition : des PR rouges sur plusieurs runs dans la population de
+  `merge_gate_check_rerun`.
+- **Le champ de journal s'appelle `red_checks`, pas « ce qui a été relancé ».**
+  Il liste **tous** les checks rouges, non-Actions compris, alors que la relance
+  n'en vise qu'un run : la ligne peut donc nommer un check que rien n'a relancé.
+  Aucune décision n'en dépend — les deux champs sont de la télémétrie et la
+  porte est fermée dans tous les cas — et le nom est choisi pour ne pas le
+  suggérer.
 - **Il ne pose pas la trace de gate MPC** (phase C, AC5).
 - **Il ne rend pas la relance surveillée.** Les seuls instruments sont les greps
   et les requêtes ci-dessus, et **leur silence ne prouve rien tant que personne

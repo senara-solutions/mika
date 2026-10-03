@@ -1124,12 +1124,6 @@ mod tests {
         assert!(parse_check_suite_failure(text).is_none());
     }
 
-    // -- Check link parser tests --
-    //
-    // Ils ont suivi la fonction dans `crate::check_link` (mika#2617 U3, plan
-    // R14), verbatim : ce sont eux qui attestent que la promotion n'a rien
-    // changé à la sémantique que `fetch_job_log` consomme ici.
-
     // -- Metadata helpers --
 
     #[test]

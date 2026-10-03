@@ -242,22 +242,62 @@ pub(crate) fn rerun_ledger_key(repo: &str, pr_number: u64, head_sha: &str, run_i
 /// Un check qui n'est pas un run Actions est simplement ignoré : la fonction
 /// continue sur le suivant plutôt que de renoncer, pour qu'un check externe
 /// rouge posé en tête de liste ne rende pas la relance inerte.
+///
+/// **Limite nommée : un seul run est relancé, même si la PR est rouge sur
+/// plusieurs.** « Un seul run suffit » est vrai des N lints d'un *même* run ; ce
+/// dépôt porte cinq workflows, donc une PR rouge à la fois sur `ci.yml` et sur
+/// `pr-body-validation.yml` est rouge sur **deux** runs, et seul le premier est
+/// relancé. Le second ne l'est qu'au prochain `check_suite.completed`, ce qui
+/// coûte un cycle de ré-évaluation complet. La clé de ledger porte déjà le
+/// `run_id`, donc traiter tous les runs rouges d'une passe serait sûr côté
+/// budget — mais ça élargirait [`RerunOutcome`] d'une issue à un **ensemble**,
+/// donc son lecteur unique et les trois sites d'appel. Hors périmètre de la
+/// phase B, **nommé plutôt que découvert**, et sa précondition de suivi est une
+/// mesure : des PR rouges sur plusieurs runs dans la population de
+/// `merge_gate_check_rerun`.
 pub(crate) fn rerun_run_id(checks: &[GhCheck]) -> Option<u64> {
     red_checks(checks).find_map(|c| run_id_from_link(c.link.as_deref()))
+}
+
+/// La relance irait-elle jusqu'à avoir besoin de la tête ?
+///
+/// Les deux termes **gratuits** de [`maybe_rerun_failed_checks`] — un run
+/// dérivable, et l'armement — exposés pour qu'un appelant qui doit **payer un
+/// aller-retour réseau** pour résoudre son `head_sha` ne le paie que lorsqu'il
+/// servira. Sans ça, l'ordre du moins cher au plus cher qui vit dans ce module
+/// n'achète rien : l'appelant paie le terme le plus cher d'abord.
+///
+/// Un seul prédicat plutôt que deux lectures au site d'appel, pour que « la
+/// relance va-t-elle regarder la tête ? » ait **un** lecteur et ne puisse pas
+/// diverger de l'ordre réel des termes.
+///
+/// Ne pas en déduire qu'une relance aura lieu : les termes payants (ledger
+/// lisible, budget disponible) viennent après.
+pub(crate) fn rerun_needs_the_head(checks: &[GhCheck]) -> bool {
+    rerun_run_id(checks).is_some() && merge_gate_rerun_enabled()
 }
 
 /// Les checks rouges — **le seul site de ce module où « rouge » est écrit**.
 ///
 /// Deux consommateurs en descendent ([`rerun_run_id`] et [`failing_names`]) et
-/// doivent regarder la même population : la cible qu'on relance et les noms
-/// qu'on journalise décrivent le même échec, donc deux prédicats libres de
-/// diverger produiraient une ligne qui nomme un check et un run qui en relance
-/// un autre.
+/// regardent ainsi la **même population**.
 ///
-/// Le vocabulaire est celui de `classify_checks`, dont ce module ne peut pas
-/// réutiliser le filtre : elle rend une *classification*, et `collect_checks`
-/// — qui rend la liste — est privée à `pr_merge_with_gate`. L'élargir
-/// traverserait la frontière decision-core pour une économie de deux lignes.
+/// **Ce que ce partage ne garantit PAS, et c'est à dire :** la même population,
+/// pas le même *run*. [`rerun_run_id`] retient le **premier** run dérivable
+/// alors que [`failing_names`] liste **tous** les checks rouges, non-Actions
+/// compris — le test `mika2617_an_external_red_check_does_not_shadow_a_real_run`
+/// est exactement ce cas. La ligne peut donc nommer un check que la relance n'a
+/// pas touché ; aucune décision n'en dépend (les deux champs sont de la
+/// télémétrie, et la porte est fermée dans tous les cas), et le champ s'appelle
+/// `red_checks` plutôt que `failing` pour ne pas suggérer « ce qui a été
+/// relancé ».
+///
+/// Le vocabulaire est celui de `classify_checks`. Le prédicat d'une ligne
+/// `matches!(…, "fail" | "cancel")` vit à **six** endroits du crate
+/// (`classify_checks`, `classify_ci_coherence`, les trois handlers, et ici) ;
+/// le promouvoir en `is_red_bucket` à côté de `KNOWN_CHECK_BUCKETS` est le bon
+/// geste et il est **hors périmètre** de la phase B — il repointerait cinq
+/// sites que ce travail ne change pas pour ce motif. Suivi nommé.
 fn red_checks(checks: &[GhCheck]) -> impl Iterator<Item = &GhCheck> {
     checks
         .iter()
@@ -383,7 +423,7 @@ pub(crate) async fn maybe_rerun_failed_checks(
                 pr = pr_number,
                 head_sha,
                 run_id,
-                failing = failing_names(checks).join(", "),
+                red_checks = failing_names(checks).join(", "),
                 "mika#2617 AC2: run already re-run once on this head and still red — not \
                  flaky, broken. The gate stays closed; no second automatic re-run."
             );
@@ -424,7 +464,7 @@ pub(crate) async fn maybe_rerun_failed_checks(
             None,
             Some(MERGE_GATE_RERUN_ATTEMPTED),
             Some(&format!(
-                "repo:{repo} pr:{pr_number} head_sha:{head_sha} run_id:{run_id} failing:{}",
+                "repo:{repo} pr:{pr_number} head_sha:{head_sha} run_id:{run_id} red_checks:{}",
                 failing_names(checks).join(", ")
             )),
             Some(trace_id),
@@ -640,6 +680,39 @@ mod tests {
         );
     }
 
+    /// **La tête n'est demandée que si la relance va la lire.**
+    ///
+    /// C'est le prédicat qui épargne à `verdict_handler` un aller-retour `gh`
+    /// sur les deux populations où la relance n'atteint jamais le `head_sha` —
+    /// sans lui, l'ordre du moins cher au plus cher du module n'achèterait rien,
+    /// puisque l'appelant paierait le terme le plus cher d'abord.
+    ///
+    /// Seul le terme « run dérivable » est exercé ici : le second
+    /// ([`merge_gate_rerun_enabled`]) est mis en cache par process et le muter
+    /// demanderait d'écrire dans l'environnement global, ce qu'un test ne fait
+    /// pas. Sa logique est couverte en pur par
+    /// `mika2617_the_rerun_is_armed_by_default_and_a_typo_does_not_disarm_it`,
+    /// et la conjonction est une ligne de code lisible à l'œil.
+    #[test]
+    fn mika2617_the_head_is_only_resolved_when_the_rerun_will_read_it() {
+        assert!(
+            rerun_needs_the_head(&two_red_checks_of_one_run()),
+            "un run dérivable d'un check rouge : la tête servira"
+        );
+        assert!(
+            !rerun_needs_the_head(&[red(
+                "Netlify",
+                Some("https://app.netlify.com/sites/x/deploys/a")
+            )]),
+            "aucun run Actions dérivable : la relance rend `NoActionsRun` sans jamais \
+             lire la tête, donc l'aller-retour serait payé pour être jeté"
+        );
+        assert!(
+            !rerun_needs_the_head(&[]),
+            "aucun check du tout — même raison"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // La clé de ledger
     // ─────────────────────────────────────────────────────────────────────
@@ -808,6 +881,21 @@ mod tests {
         ]
     }
 
+    /// Combien de lignes de ledger portent cette clé — **la mesure qui tient
+    /// l'invariant**, et c'est pour ça qu'elle est lue par son propre helper
+    /// plutôt que recomposée à chaque assertion.
+    async fn ledger_count(
+        h: &crate::test_utils::test_helpers::TestHarness,
+        head_sha: &str,
+        run_id: u64,
+    ) -> i64 {
+        let key = rerun_ledger_key("o/r", 2614, head_sha, run_id);
+        let since = crate::timestamp::now_minus(chrono::Duration::days(1));
+        h.db.count_recent_audit_events_for_target(MERGE_GATE_RERUN_AUDIT_TOOL, &key, &since)
+            .await
+            .unwrap()
+    }
+
     /// **T5 — ledger vide : la relance est tentée, et la réservation est
     /// écrite.**
     #[tokio::test]
@@ -831,12 +919,8 @@ mod tests {
             "attendu une tentative refusée faute de `gh`, obtenu {outcome:?}"
         );
 
-        let key = rerun_ledger_key("o/r", 2614, "8ccaabc8", 777);
-        let since = crate::timestamp::now_minus(chrono::Duration::days(1));
         assert_eq!(
-            h.db.count_recent_audit_events_for_target(MERGE_GATE_RERUN_AUDIT_TOOL, &key, &since)
-                .await
-                .unwrap(),
+            ledger_count(&h, "8ccaabc8", 777).await,
             1,
             "la réservation doit être écrite AVANT la relance — sinon un crash entre les \
              deux rouvrirait le budget"
@@ -863,12 +947,8 @@ mod tests {
             "AC2 : jamais de seconde relance automatique"
         );
 
-        let key = rerun_ledger_key("o/r", 2614, "8ccaabc8", 777);
-        let since = crate::timestamp::now_minus(chrono::Duration::days(1));
         assert_eq!(
-            h.db.count_recent_audit_events_for_target(MERGE_GATE_RERUN_AUDIT_TOOL, &key, &since)
-                .await
-                .unwrap(),
+            ledger_count(&h, "8ccaabc8", 777).await,
             1,
             "l'épuisement n'écrit AUCUNE ligne d'audit : sinon le compte qui tient \
              l'invariant serait pollué par jusqu'à huit lignes par push (mika#1869)"
@@ -927,12 +1007,8 @@ mod tests {
         .await;
         assert_eq!(outcome, RerunOutcome::LedgerUnreadable);
 
-        let key = rerun_ledger_key("o/r", 2614, "", 777);
-        let since = crate::timestamp::now_minus(chrono::Duration::days(1));
         assert_eq!(
-            h.db.count_recent_audit_events_for_target(MERGE_GATE_RERUN_AUDIT_TOOL, &key, &since)
-                .await
-                .unwrap(),
+            ledger_count(&h, "", 777).await,
             0,
             "aucune ligne ne doit être écrite sous une clé à tête vide"
         );
@@ -942,41 +1018,90 @@ mod tests {
     // Gardes structurelles
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Allowlist du scan de bras joker — **livrée vide, et épinglée vide**.
-    const ALLOWED_RERUN_WILDCARD_SITES: &[&str] = &[];
+    /// Allowlist du terme **second-lecteur** de
+    /// [`mika2617_rerun_outcome_has_no_wildcard_arm`] — livrée vide, et
+    /// épinglée vide.
+    ///
+    /// **Chaque allowlist nomme le scan qui la LIT, et son format de chemin.**
+    /// Une entrée ici s'écrit comme une entrée de [`RERUN_CONSUMER_SOURCES`] :
+    /// relative à `src/` (`"server/verdict_handler.rs"`). Le terme de bras
+    /// joker, lui, n'en consulte aucune — il n'y a rien à exempter dans une
+    /// exhaustivité.
+    const ALLOWED_SECOND_RERUN_READERS: &[&str] = &[];
 
-    /// Allowlist du scan d'écrivain unique — **livrée vide, et épinglée vide**.
-    const ALLOWED_RERUN_NAME_WRITERS: &[&str] = &[];
+    /// Allowlist du scan de **grammaire de lien**
+    /// ([`mika2617_run_id_has_a_single_link_reader`]) — livrée vide, et
+    /// épinglée vide.
+    ///
+    /// Format de chemin **différent du précédent** : celui que rend
+    /// `production_sources`, donc relatif à la racine du dépôt
+    /// (`"crates/mika-agent/src/server/verdict_handler.rs"`). Une entrée écrite
+    /// dans l'autre forme n'apparierait rien — et une allowlist qui n'apparie
+    /// rien se lit comme une allowlist respectée.
+    const ALLOWED_LINK_GRAMMAR_READERS: &[&str] = &[];
 
+    /// Les deux allowlists sont livrées vides et le restent.
+    ///
+    /// Le scan d'écrivain unique
+    /// ([`mika2617_the_rerun_audit_name_has_a_single_writer`]) n'en a
+    /// **délibérément aucune** : un second écrivain rend le compte inexact, et
+    /// ce compte est ce qui tient l'invariant « jamais deux fois ». Il n'y a
+    /// donc pas d'exemption concevable, seulement une interpolation de
+    /// constante à écrire.
     #[test]
     fn mika2617_the_rerun_allowlists_are_empty() {
         assert!(
-            ALLOWED_RERUN_WILDCARD_SITES.is_empty(),
+            ALLOWED_SECOND_RERUN_READERS.is_empty(),
             "livrée vide et doit le rester : une allowlist née vide est un tiroir où \
              déposer la prochaine infraction (mika#2323)"
         );
-        assert!(ALLOWED_RERUN_NAME_WRITERS.is_empty());
+        assert!(ALLOWED_LINK_GRAMMAR_READERS.is_empty());
     }
 
+    /// La moitié production d'un fichier de ce crate, commentaires retirés.
+    ///
+    /// Dérivée de [`production_sources`] plutôt que d'une seconde lecture de
+    /// fichier : un module qui porterait deux énumérateurs serait deux
+    /// troncatures libres de diverger, et c'est précisément la divergence
+    /// mesurée entre les copies existantes (voir la doc de `production_sources`
+    /// ci-dessous).
     fn production_of(rel: &str) -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join(rel);
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("mika#2617 — {} illisible : {e}", path.display()));
-        crate::source_scan::strip_comment_lines(crate::source_scan::production_half(&content))
+        let suffix = format!("crates/mika-agent/src/{rel}");
+        let (_, src) = production_sources()
+            .into_iter()
+            .find(|(path, _)| *path == suffix)
+            .unwrap_or_else(|| panic!("mika#2617 — {suffix} absent de l'inventaire"));
+        crate::source_scan::strip_comment_lines(&src)
     }
 
     /// Énumère la moitié production de chaque `.rs` sous `crates/*/src`.
     ///
-    /// Calqué sur `canonical_tokens::tests::production_sources`, dont le `mod
-    /// tests` est privé et donc hors d'atteinte d'un autre module de test. Le
-    /// code de test est écarté deux fois — par le **chemin**
+    /// Le code de test est écarté deux fois — par le **chemin**
     /// ([`crate::source_scan::is_test_source_path`], la réparation mika#2321
     /// d'une prémisse que mika#2310 avait cessé de rendre vraie) **et** par
     /// troncature au module de test : une fixture porte légitimement chacune
     /// des aiguilles cherchées ici, et la compter ferait de l'inventaire un
     /// recensement de sa propre suite de tests.
+    ///
+    /// **Quatrième copie de ce marcheur, et la duplication a DÉJÀ divergé —
+    /// nommé plutôt que découvert.** Les trois autres vivent dans
+    /// `canonical_tokens::tests` (deux formes) et `task_engine::engine::tests`.
+    /// Celle-ci et celle d'`engine` tronquent par
+    /// [`crate::source_scan::production_half`] (l'ancre
+    /// `\n#[cfg(test)]\nmod tests`) ; celle de `canonical_tokens` tronque encore
+    /// au **premier** `#[cfg(test)]` nu, c'est-à-dire exactement l'aveuglement
+    /// que le doc-comment de `production_half` a été écrit pour corriger (il
+    /// nomme `builtin_handlers.rs` ligne ~674). Une copie de plus n'est donc pas
+    /// neutre : c'est ce qui empêche la correction de se propager.
+    ///
+    /// Le bon remède est une promotion dans `crate::source_scan`, qui est le
+    /// domicile déclaré de cette plomberie et porte déjà les trois primitives
+    /// composées ici. Il est **hors périmètre** de la phase B pour une raison
+    /// de sûreté, pas de paresse : y repointer `canonical_tokens` élargirait la
+    /// population que **sa** garde scanne, ce qui n'est pas préservant pour
+    /// elle et demande sa propre vérification. Suivi nommé ; la raison
+    /// d'origine (le `mod tests` privé de `canonical_tokens`) reste vraie et
+    /// n'était pas le bon motif.
     fn production_sources() -> Vec<(String, String)> {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1136,7 +1261,7 @@ fn reads_an_env_string(v: &str) -> bool {
                 if t.starts_with("match ") && t.contains("rerun") && t.contains("outcome") {
                     extra_readers.push(format!("{rel}: {t}"));
                 }
-                if t.contains("RerunOutcome::") && !ALLOWED_RERUN_WILDCARD_SITES.contains(rel) {
+                if t.contains("RerunOutcome::") && !ALLOWED_SECOND_RERUN_READERS.contains(rel) {
                     extra_readers.push(format!("{rel}: {t}"));
                 }
             }
@@ -1169,7 +1294,7 @@ fn reads_an_env_string(v: &str) -> bool {
             if rel.ends_with("/src/check_link.rs") {
                 continue;
             }
-            if ALLOWED_RERUN_NAME_WRITERS.contains(&rel.as_str()) {
+            if ALLOWED_LINK_GRAMMAR_READERS.contains(&rel.as_str()) {
                 continue;
             }
             let stripped = crate::source_scan::strip_comment_lines(&src);
@@ -1214,10 +1339,17 @@ fn reads_an_env_string(v: &str) -> bool {
              décision fausse le jour où il est écrit — il rend le compte inexact, ce \
              qu'aucun test de comportement ne peut voir."
         );
+        // Un seul terme, et la raison de ne pas en mettre deux : la forme
+        // exacte de la ligne (`pub const … = "…";`) est à la main de rustfmt,
+        // donc une assertion dessus rougirait sur un reflow. Et en disjonction
+        // avec celle-ci — dont elle contient le nom de fichier — elle
+        // n'ajouterait rien du tout : elle *implique* ce terme, donc la
+        // disjonction se réduirait exactement à ce terme tout en se lisant
+        // comme une assertion stricte.
         assert!(
-            writers[0].ends_with("src/merge_gate_rerun.rs: pub const MERGE_GATE_RERUN_AUDIT_TOOL: &str = \"merge_gate_check_rerun\";")
-                || writers[0].contains("merge_gate_rerun.rs"),
-            "l'unique écrivain doit être la constante de ce module : {writers:#?}"
+            writers[0].starts_with("crates/mika-agent/src/merge_gate_rerun.rs:"),
+            "l'unique écrivain doit être la constante de ce module, pas un littéral \
+             posé ailleurs : {writers:#?}"
         );
     }
 }

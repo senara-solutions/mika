@@ -820,6 +820,15 @@ exclusive, so AC2's literal form is unexecutable — and the correction is a
 by **one** relaunch where `--job` would need N. The granularity of the rerun is
 therefore the **run**, and the budget is counted per `(repo, PR, head, run)`.
 
+**Named limit: one run, even on a PR red across several.** "One run is enough"
+holds for N lints *within* a run; this repo ships five workflows, so a PR red on
+both `ci.yml` and `pr-body-validation.yml` is red on **two** runs and only the
+first is relaunched. The ledger key already carries the `run_id`, so handling
+every red run in one pass would be budget-safe — what keeps it out of phase B is
+that it widens the rerun's outcome from one value to a **set**, hence its single
+reader and the three call sites. Follow-up named, precondition measured: PRs red
+across several runs inside the `merge_gate_check_rerun` population.
+
 **The link grammar has ONE reader, promoted rather than twinned (plan R14).**
 `parse_check_link` moved out of `ci_failure_handler` into
 [`crate::check_link`] verbatim, tests included; U3 derives its `run_id` from it
@@ -856,6 +865,14 @@ call is added at the tool site and at `ci_success_handler` (which already holds
 so it resolves the head through `fetch_pr_head_sha` (mika#1563), one round trip on
 a path that is already red and about to make a network call anyway. Hoisting it
 above the arm would charge every branch, the nominal one included.
+
+**And that one round trip is itself conditional**, through
+`rerun_needs_the_head` — the two free terms (a derivable run, the kill-switch)
+exposed as one predicate. Without it the module's cheapest-first ordering buys
+nothing: the caller pays the most expensive term first, and pays it for nothing
+on a disarmed process or on a PR whose red checks carry no Actions run. One
+predicate rather than two reads at the call site, so "will the rerun look at the
+head?" cannot drift from the real order of the terms.
 
 **Fail-CLOSED on the ledger — the inverse of the rest of this work, and the
 arbitration is local.** A false "already rerun" costs one lost relaunch on a PR
