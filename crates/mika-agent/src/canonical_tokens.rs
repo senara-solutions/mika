@@ -4885,4 +4885,275 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              trouvée dans deux lecteurs de verdict de groom."
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2649 — le nom d'audit de la lignée a un écrivain ; la grammaire
+    // d'événement a un recensement de lecteurs.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Rien à excepter à la livraison, et c'est vérifiable : le nom
+    /// `webhook_dispatch_target_binding` est **neuf**, donc son unique écrivain
+    /// est le site créé par cette PR. Quand ce scan tire, **on retire le second
+    /// écrivain**, on ne l'excepte pas (doctrine mika#2201 — une allowlist née
+    /// vide est un emplacement où déposer la prochaine infraction, mika#2323).
+    const TARGET_BINDING_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Le nom d'audit de la lignée a un seul écrivain (mika#2649 V12).**
+    ///
+    /// C'est cette propriété qui rend exact le `GROUP BY after_value` que
+    /// l'opérateur exécute sur `tool_name = 'webhook_dispatch_target_binding'` —
+    /// un nombre sur lequel deux sites peuvent diverger n'est pas une mesure.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second écrivain
+    /// ne rend **aucune** décision fausse le jour où il est écrit — la garde
+    /// continue de refuser, les tests restent verts — il rend le compte inexact,
+    /// en silence.
+    ///
+    /// **L'énumérateur est `production_sources_to_test_module`, et c'est une
+    /// mesure.** `production_sources` coupe au premier littéral `#[cfg(test)]`
+    /// **où qu'il soit** ; `webhook_dispatch.rs` en porte un dans un
+    /// doc-comment à ~600 lignes **au-dessus** de la constante, donc réutiliser
+    /// cet énumérateur rendait ce scan vert par **population vide** — et c'est
+    /// son anti-vacuité qui l'a dit, exactement comme pour les deux scans de
+    /// mika#2624.
+    ///
+    /// # La comparaison est EXACTE, et pas en sous-chaîne comme chez ses voisins
+    ///
+    /// Le nom de l'événement de résidu de cette famille est, par construction,
+    /// `<nom d'audit>_audit_failed` — donc le nom d'audit est son **préfixe**.
+    /// Une comparaison par sous-chaîne compterait ce résidu comme un second
+    /// écrivain, alors que c'est un **autre jeton** : le scan vise *qui écrit ce
+    /// `tool_name`*, et un nom de journal qui le préfixe n'en est pas un.
+    ///
+    /// **Fait mesuré en écrivant ce scan, et nommé plutôt que laissé à
+    /// redécouvrir :** les scans voisins de la même famille (mika#2573 et ses
+    /// semblables) emploient la sous-chaîne et sont verts **par troncature
+    /// accidentelle**, pas par prédicat —
+    /// `builtin_handlers.rs:3105` porte bien `fallthrough_work_creation_audit_failed`,
+    /// mais `production_sources` tronque ce fichier à son `#[cfg(test)]` de la
+    /// ligne ~674 et ne voit jamais la ligne 3105. Leur réparation est un
+    /// changement de **leur** périmètre, donc hors de ce ticket ; ce qui est à
+    /// retenir est que la sous-chaîne n'est pas le prédicat de référence de cette
+    /// famille, c'est son accident.
+    #[test]
+    fn mika2649_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("webhook_dispatch{}", "_target_binding");
+        let owner = "crates/mika-agent/src/webhook_dispatch.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if TARGET_BINDING_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit == needle.as_str())
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2649 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2649 — le nom d'audit de la lignée a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `webhook_dispatch::TARGET_BINDING_AUDIT_TOOL`. Ne PAS l'ajouter à \
+             TARGET_BINDING_SOLE_WRITER_EXCEPTIONS — le `GROUP BY` de la sonde \
+             n'est exact que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2649_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            TARGET_BINDING_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "TARGET_BINDING_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain \
+             (doctrine mika#2201)."
+        );
+    }
+
+    /// Les fichiers qui portent une **regex de grammaire d'événement**
+    /// `[GitHub] …`, et ce que chacun lit (mika#2649 V13).
+    ///
+    /// # Un RECENSEMENT, jamais une allowlist d'exemptions
+    ///
+    /// La distinction est celle que mika#2633 a déjà dû écrire : *on y ajoute
+    /// quand un nouveau lecteur est justifié, on n'y exempte pas un doublon.* Et
+    /// c'est une **rectification mesurée au plan de mika#2649**, dont la
+    /// Fire-Disposition annonçait un `EVENT_GRAMMAR_PARSER_SITES_ALLOWED` livré
+    /// **vide** en supposant que les sites existants qui citent ces préfixes
+    /// soient des prédicats de préfixe (`starts_with`) et non des parseurs. La
+    /// mesure réfute la supposition : **cinq** regex sur **trois** fichiers, dont
+    /// `CHECK_SUITE_RE` en **double**. Une allowlist vide aurait rendu ce scan
+    /// rouge à la naissance — et un lint rouge à la naissance se fait désarmer.
+    ///
+    /// # Le doublon est NOMMÉ plutôt que caché
+    ///
+    /// `webhook_queue.rs` et `webhook_queue_v2.rs` portent la même regex
+    /// check-suite, la seconde se déclarant doublon assumé dans son propre
+    /// commentaire (*« duplicated here to keep the v2 module self-contained »*).
+    /// Ce recensement est précisément l'endroit où un futur éditeur apprend que
+    /// le doublon existe **avant** d'en écrire un troisième — c'est la classe
+    /// mika#2158, et ce ticket l'a évitée en appelant `classify_event` plutôt
+    /// qu'en recopiant l'extraction de `(branch: …)`.
+    const EVENT_GRAMMAR_PARSER_SITES: &[(&str, &str)] = &[
+        (
+            "crates/mika-agent/src/server/verdict.rs",
+            "HEADER_RE — `[GitHub] PR review (…) on <repo>#<n> …`, lecteur unique \
+             de la forme revue, consommé par `deadline_verdict::parse_pr_target`",
+        ),
+        (
+            "crates/mika-agent/src/server/webhook_queue_v2.rs",
+            "PR_ACTION_RE (`[GitHub] PR <action>: …`), CHECK_SUITE_RE \
+             (`[GitHub] Check suite … (branch: …)`) et ISSUE_LABELED_RE — les \
+             lecteurs que `classify_event` consomme",
+        ),
+        (
+            "crates/mika-agent/src/server/webhook_queue.rs",
+            "CHECK_SUITE_RE — DOUBLON assumé de celui de webhook_queue_v2 \
+             (mécanisme mika#528, distinct). Nommé ici pour qu'un troisième ne \
+             soit pas écrit par ignorance du second",
+        ),
+    ];
+
+    /// **Aucun second parseur de grammaire d'événement (mika#2649 V13).**
+    ///
+    /// Le scan part de la **forme du parseur** — un `Regex::new(` dont un
+    /// littéral porte `[GitHub]` — et confronte sa population au recensement
+    /// ci-dessus, **dans les deux sens** : un fichier porteur hors recensement
+    /// rougit, et une entrée du recensement dont le fichier ne porte plus de
+    /// regex rougit aussi. La seconde direction est celle qui compte le plus :
+    /// un recensement qui survit à son site est un tiroir, et il se lit comme
+    /// une couverture.
+    ///
+    /// Le prédicat porte sur `Regex::new(`, donc un `starts_with` ou un
+    /// `contains` sur le même préfixe est **hors population par sa forme** — ce
+    /// qui est exact : `is_webhook_fallthrough_domain` teste un préfixe et
+    /// n'extrait rien. C'est le même terme positionnel que mika#2496.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : une sixième regex
+    /// recopiée ne rend aucune décision fausse le jour où elle est écrite, elle
+    /// divergera plus tard, en silence, avec toutes les assertions vertes.
+    #[test]
+    fn mika2649_aucun_second_parseur_de_grammaire_devenement() {
+        let needle = format!("[Git{}]", "Hub");
+        let declared: Vec<&str> = EVENT_GRAMMAR_PARSER_SITES
+            .iter()
+            .map(|(path, _)| *path)
+            .collect();
+
+        let mut found: Vec<String> = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    line.contains("Regex::new(")
+                        && string_literals(line)
+                            .iter()
+                            .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                found.push(rel);
+            }
+        }
+
+        // Anti-vacuité : le recensement porte trois fichiers, et le scan doit
+        // les voir. Zéro trouvaille se lirait comme un arbre propre.
+        assert!(
+            found.len() >= EVENT_GRAMMAR_PARSER_SITES.len(),
+            "mika#2649 — le scan n'a trouvé que {} site(s) porteur(s) de regex de \
+             grammaire d'événement alors que le recensement en déclare {} : le \
+             prédicat ne regarde plus ce qu'il existe pour surveiller.\n\
+             trouvés : {found:?}",
+            found.len(),
+            EVENT_GRAMMAR_PARSER_SITES.len()
+        );
+
+        // Sens 1 — un porteur hors recensement.
+        let undeclared: Vec<&String> = found
+            .iter()
+            .filter(|f| !declared.contains(&f.as_str()))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "mika#2649 — une regex de grammaire d'événement `[GitHub] …` vit hors \
+             du recensement : {undeclared:?}\n\n\
+             RÉSOLUTION : **appeler** le lecteur unique existant plutôt que de \
+             recopier la grammaire — `deadline_verdict::parse_pr_target` pour la \
+             forme PR, `webhook_queue_v2::classify_event` pour la forme \
+             check-suite, `worktree_reaper::issue_number_from_branch` pour le \
+             numéro porté par une branche. Si un nouveau lecteur est réellement \
+             justifié, l'AJOUTER à EVENT_GRAMMAR_PARSER_SITES avec sa raison — \
+             c'est un recensement, pas une allowlist d'exemptions (mika#2633)."
+        );
+
+        // Sens 2 — une entrée périmée, qui se lit comme une couverture.
+        let stale: Vec<&&str> = declared
+            .iter()
+            .filter(|d| !found.iter().any(|f| f == *d))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "mika#2649 — le recensement nomme un fichier qui ne porte plus de \
+             regex de grammaire d'événement : {stale:?}\n\n\
+             RÉSOLUTION : retirer l'entrée. Une entrée qui survit à son site est \
+             un tiroir, et elle se lit comme une couverture (mika#2205)."
+        );
+
+        // Les deux lecteurs uniques que ce ticket APPELLE doivent encore exister
+        // sous ces noms : assertion auto-nettoyante. S'ils sont renommés ou
+        // supprimés, ce scan rougit au lieu de cesser de regarder.
+        let src = |rel: &str| {
+            std::fs::read_to_string(repo_root().join(rel))
+                .unwrap_or_else(|e| panic!("{rel} lisible : {e}"))
+        };
+        assert!(
+            src("crates/mika-agent/src/server/deadline_verdict.rs")
+                .contains("pub fn parse_pr_target("),
+            "mika#2649 — `parse_pr_target` a disparu ou changé de nom : \
+             `webhook_event_target` l'appelle, et sans lui ce ticket aurait écrit \
+             un second parseur de la grammaire PR."
+        );
+        assert!(
+            src("crates/mika-agent/src/worktree_reaper.rs")
+                .contains("pub fn issue_number_from_branch("),
+            "mika#2649 — `issue_number_from_branch` a disparu ou changé de nom : \
+             `webhook_event_target` l'appelle pour lire le numéro porté par une \
+             branche de check-suite."
+        );
+        assert!(
+            src("crates/mika-agent/src/server/webhook_queue_v2.rs")
+                .contains("pub fn classify_event("),
+            "mika#2649 — `classify_event` a disparu ou changé de nom : \
+             `webhook_event_target` l'appelle pour lire la grammaire check-suite \
+             plutôt que d'en écrire une TROISIÈME copie."
+        );
+    }
 }
