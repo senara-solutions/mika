@@ -31,6 +31,7 @@ pub mod operational;
 pub mod panic_hook;
 pub mod perimeter;
 pub mod pilot_egress_stamp;
+pub mod pilot_launcher_health;
 pub mod plan_callout;
 pub mod planning;
 pub mod post_condition;

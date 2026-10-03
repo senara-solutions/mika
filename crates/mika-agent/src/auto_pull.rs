@@ -1271,6 +1271,32 @@ const FILTER_ABANDONED_OPERATOR_HELD: &str = "abandoned_operator_held";
 /// impossible.
 const FILTER_EGRESS_DOWN: &str = "egress_relay_down";
 
+/// Le lanceur `claude-pilot` est mort au moins deux fois dans la fenêtre : la
+/// porte de dispatch refuse, donc chaque re-drive serait dépensé sur un refus
+/// (mika#2634 U4, surface B).
+///
+/// # D8 — pourquoi ce filtre existe, et pourquoi il rend `Skip`
+///
+/// La protection est la porte de `validate_dispatch_readiness`. Ce filtre achète
+/// le **budget de re-drive** : sans lui, un dispatch refusé laisse le ticket
+/// `ready`, la Phase 2 le re-drive tous les ~15 min, et à
+/// `MIKA_AUTO_PULL_MAX_REDRIVES` (défaut 3) le ticket est **abandonné** —
+/// `operator-review` posé, `ready` retiré, un commentaire écrit (mika#2020). Un
+/// hôte cassé une heure parquerait donc des tickets parfaitement sains derrière
+/// une panne qui n'est pas la leur, et le remède serait un geste d'opérateur par
+/// ticket alors que le frein se lève tout seul.
+///
+/// `Skip`, jamais `SkipAndResetBudget` : un hôte cassé n'est pas un progrès, et
+/// remettre le budget à zéro ici serait exactement le compteur remis à zéro par
+/// l'action qu'il compte que mika#2158 a mesuré à 31 re-drives affichant 1.
+///
+/// Nom distinct de [`FILTER_EGRESS_DOWN`] bien que les deux soient des pannes
+/// d'hôte globales au tick : les remèdes diffèrent (réinstaller le lanceur
+/// contre relancer le relais), et c'est la discrimination que
+/// `below_threshold` / [`FILTER_NO_READY_LABEL_EVENT`] (mika#2131) et
+/// `in_flight_self_dev` / [`FILTER_LIVE_PILOT`] (mika#2279) ont déjà dû payer.
+const FILTER_LAUNCHER_BRAKED: &str = "pilot_launcher_braked";
+
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
 /// SOLE WRITER: [`ExclusionLedger::flush`]. One literal, one site — a call site
@@ -1625,6 +1651,13 @@ struct StuckReadyFacts {
     /// name and a ledger row. Resolving it per ticket would read the same file a
     /// hundred times per tick to answer the same question.
     egress_relay_down: bool,
+    /// Le lanceur `claude-pilot` est mort au moins deux fois dans la fenêtre
+    /// (mika#2634). **Global au tick, pas par ticket** — même trajectoire et
+    /// même raison qu'[`Self::egress_relay_down`] juste au-dessus : la question
+    /// porte sur l'hôte, pas sur le ticket, donc elle est résolue une fois par
+    /// l'appelant et recopiée. La résoudre par ticket ferait N fois le même
+    /// `COUNT(*)` pour la même réponse.
+    launcher_braked: bool,
 }
 
 /// What Phase 2 should do with one `ready` ticket (mika#2020).
@@ -1816,6 +1849,34 @@ fn classify_stuck_ready(
     if facts.egress_relay_down {
         return StuckReadyVerdict::Skip {
             reason: FILTER_EGRESS_DOWN,
+        };
+    }
+
+    // mika#2634 — le lanceur claude-pilot est mort sur l'hôte, donc la porte de
+    // dispatch refusera ce re-drive.
+    //
+    // **Placé après le bras `in_flight`** (plan § U4 point 15), et après les
+    // deux autres bras « un dispatch est déjà en cours » : ceux-là nomment une
+    // cause plus précise et ne changent rien, donc un ticket dont un pilote
+    // travaille doit garder son nom `in_flight_self_dev` même pendant que le
+    // frein est armé — c'est la propriété que
+    // `mika2279_the_nominal_in_flight_case_is_still_named_in_flight` épingle pour
+    // son voisin et que `mika2634_a_braked_host_does_not_rename_the_in_flight_case`
+    // épingle pour celui-ci.
+    //
+    // L'ordre vis-à-vis d'[`FILTER_EGRESS_DOWN`] est **libre** : les deux sont
+    // des pannes d'hôte globales au tick, aucune n'est plus précise que l'autre,
+    // et chacune rend un `Skip` sous son propre nom — donc un hôte dont le
+    // lanceur ET le relais sont cassés est compté une fois sous l'un des deux,
+    // et les deux remèdes apparaissent de toute façon dans les deux populations
+    // sur la durée de la panne.
+    //
+    // Comme son voisin : avant tout ce qui mute l'état d'un ticket (`ReEntry`
+    // efface un budget, `Eligible` en dépense un, `Abandon` parque le ticket) —
+    // pendant une panne d'hôte, aucun des trois ne doit arriver.
+    if facts.launcher_braked {
+        return StuckReadyVerdict::Skip {
+            reason: FILTER_LAUNCHER_BRAKED,
         };
     }
 
@@ -4215,6 +4276,22 @@ async fn phase2_reconcile_stuck_ready(
         return 0;
     }
 
+    // mika#2634 — le frein du lanceur, résolu **une fois** pour le tick.
+    //
+    // Global à l'hôte comme `egress_relay_down`, donc une seule lecture : un
+    // `COUNT(*)` indexé par tick, et **zéro** quand aucun ticket ne porte
+    // `ready` — l'early-return juste au-dessus est ce qui rend le tick nominal
+    // gratuit. Le résoudre par ticket ferait N fois la même requête pour la même
+    // réponse (la raison écrite sur le champ de `StuckReadyFacts`).
+    //
+    // Fail-open porté par le verdict : `is_braked()` est vrai pour `Braked`
+    // seulement, donc un ledger illisible laisse la Phase 2 se comporter exactement
+    // comme avant — voir `pilot_launcher_health` pour pourquoi cette asymétrie est
+    // l'inverse de celle de `wip_rescue`.
+    let launcher_braked = crate::pilot_launcher_health::launcher_health(db)
+        .await
+        .is_braked();
+
     // Filters 2–8. Ordering is cheapest-first (in-mem → DB → GitHub API), so the
     // timeline call in the age step fires for as few tickets as possible. The
     // decision itself is the pure `classify_stuck_ready`; this loop only
@@ -4351,6 +4428,7 @@ async fn phase2_reconcile_stuck_ready(
             redrive_count,
             abandoned,
             egress_relay_down,
+            launcher_braked,
         };
 
         let verdict = classify_stuck_ready(issue, &facts, redrive_budget);
@@ -6905,6 +6983,7 @@ This ticket has been GROOMED and is ready.
             redrive_count,
             abandoned: false,
             egress_relay_down: false,
+            launcher_braked: false,
         }
     }
 
@@ -9553,6 +9632,282 @@ This ticket has been GROOMED and is ready.
             ttl >= 2 * seuil,
             "le défaut vise deux fois le seuil ({} s attendus au moins, {ttl} s posés)",
             2 * seuil
+        );
+    }
+
+    // ── mika#2634 U4 : la surface B (frein du lanceur claude-pilot) ──
+
+    /// **Le verdict : `Skip`, jamais `SkipAndResetBudget`** (plan § U4 point 15).
+    ///
+    /// Un hôte cassé n'est pas un progrès. Remettre le budget à zéro ici serait
+    /// le compteur remis à zéro par l'action qu'il compte que mika#2158 a mesuré
+    /// à 31 re-drives contre un compteur affichant 1 — quatrième occurrence de la
+    /// phrase dans ce fichier, et c'est pour ça qu'elle est assertée plutôt que
+    /// commentée.
+    #[test]
+    fn mika2634_a_braked_launcher_skips_without_resetting_the_budget() {
+        let issue = make_issue(1, GROOMED_BODY, &["ready"], "t");
+        let mut f = facts(2);
+        f.launcher_braked = true;
+
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_LAUNCHER_BRAKED
+            },
+            "un lanceur mort doit SAUTER le ticket sous son propre nom, et jamais \
+             remettre son budget de re-drive à zéro"
+        );
+
+        // Contrôle négatif : c'est bien le drapeau qui décide. Sans lui,
+        // l'assertion ci-dessus passerait sur une garde qui refuse tout le monde.
+        let mut clean = facts(2);
+        clean.launcher_braked = false;
+        assert_eq!(
+            classify_stuck_ready(&issue, &clean, 3),
+            StuckReadyVerdict::Eligible,
+            "sans frein, le ticket reste éligible — sinon l'assertion précédente \
+             ne prouverait rien sur le drapeau"
+        );
+    }
+
+    /// **Le placement : un ticket en vol garde son nom.**
+    ///
+    /// Plan § U4 point 15 : le filtre va **après** le bras `in_flight`, « le
+    /// placement que mika#2279 épingle par test ». C'est ce test-ci, et son
+    /// jumeau est `mika2279_the_nominal_in_flight_case_is_still_named_in_flight`.
+    ///
+    /// La régression qu'il attrape ne rend aucune décision fausse — les deux
+    /// branches rendent `Skip` — mais elle fusionne deux populations que
+    /// l'opérateur doit pouvoir soustraire : « un pilote travaille sur ce
+    /// ticket » (transitoire, nominal) et « le lanceur de l'hôte est mort »
+    /// (permanent jusqu'à réparation). C'est la doctrine mika#2131 appliquée à
+    /// l'ordre des bras plutôt qu'au niveau de journal.
+    #[test]
+    fn mika2634_a_braked_host_does_not_rename_the_in_flight_case() {
+        let issue = make_issue(1, GROOMED_BODY, &["ready"], "t");
+
+        let mut both = facts(0);
+        both.in_flight = true;
+        both.launcher_braked = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &both, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_IN_FLIGHT
+            },
+            "INVARIANT VIOLÉ : le frein a renommé le cas nominal. Le bras \
+             `launcher_braked` est passé AVANT `in_flight` et les deux \
+             populations ne sont plus soustractibles"
+        );
+
+        // Et le `live_pilot` de mika#2279 garde le sien aussi — les trois bras
+        // « un dispatch est déjà en cours » nomment une cause plus précise.
+        let mut with_pilot = facts(0);
+        with_pilot.live_pilot = true;
+        with_pilot.launcher_braked = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &with_pilot, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_LIVE_PILOT
+            },
+            "le frein doit aussi passer après `live_pilot`"
+        );
+    }
+
+    /// Le nom du filtre est un **format de fil** : il atterrit dans
+    /// `audit_events.after_value` par l'[`ExclusionLedger`] et l'opérateur en
+    /// fait des `GROUP BY`, donc deux orthographes couperaient une population en
+    /// deux sans le dire.
+    ///
+    /// Et il est **distinct** de celui de l'egress : les deux sont des pannes
+    /// d'hôte globales au tick, mais leurs remèdes diffèrent (réinstaller le
+    /// lanceur contre relancer le relais), et un opérateur qui lit l'un pour
+    /// l'autre répare la mauvaise chose.
+    #[test]
+    fn mika2634_the_filter_name_is_a_wire_format() {
+        assert_eq!(FILTER_LAUNCHER_BRAKED, "pilot_launcher_braked");
+        assert_ne!(
+            FILTER_LAUNCHER_BRAKED, FILTER_EGRESS_DOWN,
+            "deux pannes d'hôte, deux remèdes, deux comptes"
+        );
+    }
+
+    /// Le **tick** : la boucle applique le verdict, nomme l'exclusion, et ne
+    /// dépense ni ne parque — qui est tout l'objet de D8.
+    ///
+    /// Sans ce test, la garde pourrait être correcte dans la fonction pure et ne
+    /// jamais être atteinte par la boucle, parce que rien n'oblige la boucle à
+    /// remplir le champ. C'est la classe que mika#2484 a dû refermer en
+    /// basculant la décision ET le calcul ensemble.
+    #[tokio::test]
+    async fn mika2634_un_tick_sous_frein_ne_parque_ni_ne_depense() {
+        use crate::db::Database;
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let n = 2634u64;
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+
+        // Deux morts de lanceur dans la fenêtre — le seuil d'AC2, posé par le
+        // test lui-même plutôt qu'en cassant un vrai lanceur sur l'hôte.
+        for task in ["t-a", "t-b"] {
+            db.log_audit_event(
+                &format!("callback-{task}"),
+                crate::skills::executor::PILOT_LAUNCHER_HEALTH_TOOL,
+                &format!("task:{task}"),
+                None,
+                Some(crate::skills::executor::PILOT_LAUNCHER_DEAD_VALUE),
+                Some("exit:79"),
+                None,
+            )
+            .await
+            .expect("seed a dead-launcher row");
+        }
+
+        let mut ledger = ExclusionLedger::default();
+        let fx = test_ctx_fixture();
+        let rescued = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+            false, // le relais sert : c'est bien le FREIN qui décide ici
+            &fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            rescued, 0,
+            "aucun re-drive sur un hôte dont le lanceur est mort"
+        );
+        assert!(
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, n, FILTER_LAUNCHER_BRAKED)),
+            "l'exclusion doit être comptable sous son propre nom : c'est la requête \
+             qui répond « combien de tickets le lanceur cassé a-t-il épargnés ? » ; \
+             ledger = {:?}",
+            ledger.entries
+        );
+
+        let (redrives, abandoned) = db
+            .get_auto_pull_redrive_state(DEFAULT_REPO, n)
+            .await
+            .expect("read redrive state");
+        assert_eq!(
+            redrives, 0,
+            "attendre une réparation d'hôte ne dépense pas le budget — sans quoi une \
+             panne d'une heure parquerait chaque ticket derrière `operator-review` \
+             (D8), et le remède redeviendrait un geste d'opérateur par ticket alors \
+             que le frein se lève tout seul"
+        );
+        assert!(!abandoned, "et ne mène pas à l'abandon du ticket");
+    }
+
+    /// **Contrôle négatif du tick : une seule mort ne freine pas.**
+    ///
+    /// La lettre d'AC2 est « à la **deuxième** occurrence », et sans ce contrôle
+    /// la suite ci-dessus serait satisfaite par un frein qui mord dès la
+    /// première — c'est-à-dire sur toute panne transitoire du lanceur.
+    #[tokio::test]
+    async fn mika2634_une_seule_mort_ne_freine_pas_le_tick() {
+        use crate::db::Database;
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let n = 2635u64;
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+
+        db.log_audit_event(
+            "callback-t-solo",
+            crate::skills::executor::PILOT_LAUNCHER_HEALTH_TOOL,
+            "task:t-solo",
+            None,
+            Some(crate::skills::executor::PILOT_LAUNCHER_DEAD_VALUE),
+            Some("exit:79"),
+            None,
+        )
+        .await
+        .expect("seed one dead-launcher row");
+
+        let mut ledger = ExclusionLedger::default();
+        let fx = test_ctx_fixture();
+        let _ = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+            false,
+            &fx.ctx(),
+        )
+        .await;
+
+        assert!(
+            !ledger
+                .entries
+                .iter()
+                .any(|(_, _, reason)| *reason == FILTER_LAUNCHER_BRAKED),
+            "une seule mort n'est pas un hôte cassé ; ledger = {:?}",
+            ledger.entries
+        );
+    }
+
+    /// **Contrôle négatif du tick : une fenêtre propre ne freine pas.**
+    ///
+    /// Le pendant du précédent sur l'autre borne — zéro mort. Sans lui, « le
+    /// frein décide » serait indistinguable de « le frein refuse tout le monde ».
+    #[tokio::test]
+    async fn mika2634_une_fenetre_propre_ne_freine_pas_le_tick() {
+        use crate::db::Database;
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let n = 2636u64;
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+
+        let mut ledger = ExclusionLedger::default();
+        let fx = test_ctx_fixture();
+        let _ = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+            false,
+            &fx.ctx(),
+        )
+        .await;
+
+        assert!(
+            !ledger
+                .entries
+                .iter()
+                .any(|(_, _, reason)| *reason == FILTER_LAUNCHER_BRAKED),
+            "sans mort de lanceur, aucune exclusion de frein ; ledger = {:?}",
+            ledger.entries
         );
     }
 }

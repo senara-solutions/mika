@@ -58,7 +58,12 @@ const MAX_OUTPUT_LEN: usize = 10_000;
 /// literal from this crate and compares it **both ways** — the shape
 /// `check-dispatch-seats-declared.sh` already uses, so the two cannot drift in
 /// either direction.
-const EXIT_PILOT_LAUNCHER_DEAD: i32 = 79;
+/// `pub(crate)` since mika#2634 phase B: [`crate::pilot_launcher_health`] is the
+/// sole reader of the ledger this code writes, and the recovery write below
+/// needs the same discriminant. Exposing the constant is what keeps the value
+/// written **once** — a reader that retyped `79` would be the cross-language
+/// duplication of D1 reproduced inside one language.
+pub(crate) const EXIT_PILOT_LAUNCHER_DEAD: i32 = 79;
 
 /// Audit `tool_name` under which the launcher's health is recorded (mika#2634).
 ///
@@ -75,14 +80,38 @@ const EXIT_PILOT_LAUNCHER_DEAD: i32 = 79;
 /// is whether each name carries its own cause: here `dead` and (in phase B)
 /// `recovered` belong to the same site and the same population, and one
 /// `GROUP BY` returns both counts.
-const PILOT_LAUNCHER_HEALTH_TOOL: &str = "pilot_launcher_health";
+/// **The literal lives HERE and nowhere else, which is why
+/// [`crate::pilot_launcher_health`] imports it rather than retyping it.** That
+/// module is the ledger's sole *reader*; this one is its sole *writer*, and the
+/// scan `canonical_tokens::tests::mika2634_the_launcher_health_name_has_a_single_writer`
+/// — whose allowlist is shipped empty and pinned empty — counts a second string
+/// literal of this name anywhere under `src/` as a second writer. Importing is
+/// therefore not style: it is what keeps that scan green with nothing exempted.
+pub(crate) const PILOT_LAUNCHER_HEALTH_TOOL: &str = "pilot_launcher_health";
 
 /// `after_value` for a dispatch whose launcher did not start (mika#2634).
 ///
 /// A wire format: it lands in `audit_events.after_value` and operators
 /// `GROUP BY` it, so two spellings would split one population without saying so.
 /// One definition site, pinned by `tests::mika2634`.
-const PILOT_LAUNCHER_DEAD_VALUE: &str = "dead";
+pub(crate) const PILOT_LAUNCHER_DEAD_VALUE: &str = "dead";
+
+/// `after_value` for a dispatch that ran under a launcher the window had already
+/// seen die — the transition out of the braked state (mika#2634 §16).
+///
+/// **Written only on a transition**, never on every healthy dispatch: the window
+/// must already carry at least one [`PILOT_LAUNCHER_DEAD_VALUE`] row. That is
+/// what makes the volume **nil in a healthy regime** and keeps the mika#2131
+/// doctrine satisfied without an arbitration — one row per host repair, not one
+/// per dispatch.
+///
+/// Same wire format as its sibling, same single definition site, same
+/// `GROUP BY after_value` surface. `dead` and `recovered` belong to one site and
+/// one population, which is why they share a `tool_name` and differ in
+/// `after_value` (the `ready_label_outcome` motif, mika#2323) rather than
+/// carrying two names like `phantom_aged_out` / `phantom_sweep_spared`
+/// (mika#2156), whose discriminant is that each name carries its own cause.
+pub(crate) const PILOT_LAUNCHER_RECOVERED_VALUE: &str = "recovered";
 
 /// Plancher sous lequel une commande de build ne peut pas aboutir (mika#2423).
 ///
@@ -1845,6 +1874,23 @@ fn groom_provenance_verdict(
 /// même refus couperaient une population en deux sans le dire.
 pub(crate) const GROOMING_INTENT_MISMATCH_ERROR: &str = "dispatch_grooming_intent_mismatch";
 
+/// `error` du refus de dispatch quand le lanceur `claude-pilot` est mort sur
+/// l'hôte (mika#2634 U4, AC2).
+///
+/// Un **format de fil** : il atterrit dans `tasks.result` par
+/// [`record_dispatch_rejection`] et un opérateur le cherche là
+/// (`SELECT id, result FROM tasks WHERE result LIKE '%pilot_launcher_braked%'`),
+/// donc une seconde orthographe couperait la population en deux sans le dire.
+/// Même discipline que [`GROOMING_INTENT_MISMATCH_ERROR`] et
+/// [`GROOM_ESCALATED_ERROR`] : un site de définition, épinglé par test.
+///
+/// Délibérément **distinct** du nom d'audit [`PILOT_LAUNCHER_HEALTH_TOOL`] : ce
+/// nom-ci compte les *refus* — des dispatches que le frein a arrêtés — et
+/// celui-là compte les *morts*. Les confondre rendrait indistinguables « le
+/// lanceur est mort deux fois » et « le frein a refusé douze dispatches », qui
+/// sont deux mesures différentes du même incident.
+pub(crate) const PILOT_LAUNCHER_BRAKED_ERROR: &str = "pilot_launcher_braked";
+
 /// Est-ce qu'un `dev-pilot` peut partir sur ce ticket ? (mika#2484 D1)
 ///
 /// Quatre bras, et **pas un booléen**. Trois causes distinctes mènent au même
@@ -2720,6 +2766,63 @@ pub(crate) async fn validate_dispatch_readiness(
                  the loop; this is a structural gate, not a transient failure, so \
                  retrying the dispatch will not clear it (mika#2046)."
             )
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
+    // mika#2634 U4 — the launcher brake, and this is the FIRST gate that reads
+    // the database.
+    //
+    // Placement is the mika#2279 gate-2c placement, for the same reason the
+    // comment there gives: the predicate reads nothing but the ledger, so it
+    // belongs **after** the three pure string gates above and **before** any
+    // token resolution, any `gh` round-trip and any per-task decision. A braked
+    // host cannot dispatch *anything*, so spending a task fetch, a seat probe or
+    // a grooming-marker fetch on it buys nothing.
+    //
+    // **Bounded to the pilot dispatch skills.** `deploy_mika` reaches this
+    // function too, and a dead `claude-pilot` launcher says nothing about a
+    // deploy — arming the brake on it would stop an unrelated flow on a signal
+    // that does not describe it. Same discriminant, same constant, as mika#2649.
+    //
+    // Fail-open is in the verdict, not here: `is_braked()` is true only for
+    // `Braked`, so an unreadable ledger proceeds exactly as it did before phase
+    // B. See [`crate::pilot_launcher_health`] for why that asymmetry is the
+    // inverse of `wip_rescue`'s.
+    if tool_input
+        .and_then(extract_skill_from_input)
+        .is_some_and(is_pilot_dispatch_skill)
+        && let crate::pilot_launcher_health::LauncherHealth::Braked { dead_count, since } =
+            crate::pilot_launcher_health::launcher_health(db).await
+    {
+        warn!(
+            event = "pilot_launcher_brake_engaged",
+            task_id = %task_id,
+            dead_count,
+            since = %since,
+            "mika#2634: the claude-pilot LAUNCHER died {dead_count} times in the window — \
+             refusing this dispatch instead of burning the slot. The HOST needs repairing; \
+             the brake lifts itself once the window clears."
+        );
+        let rejection = serde_json::json!({
+            "error": PILOT_LAUNCHER_BRAKED_ERROR,
+            "task_id": task_id,
+            "dead_count": dead_count,
+            "since": since,
+            "reason": format!(
+                "The claude-pilot launcher died {dead_count} times since {since} without \
+                 ever starting a pilot (exit {EXIT_PILOT_LAUNCHER_DEAD}, see \
+                 `pilot_launcher_dead`). This is a HOST fault, not a transient one: every \
+                 further dispatch would die the same way and burn its slot, which is what \
+                 cost 2 h 45 of dead rail on 2026-10-02 (mika#2634)."
+            ),
+            "recovery": "Repair the host, then dispatch again — the brake is a WINDOW and \
+                         lifts itself with no gesture once the window clears. The repair: \
+                         `uv tool install --reinstall --force --editable ./claude-pilot-py`, \
+                         then check `head -1 ~/.local/bin/claude-pilot` names the `uv tool` \
+                         venv's Python. To dispatch anyway without repairing, disarm with \
+                         `MIKA_PILOT_LAUNCHER_BRAKE=0` on the service environment."
         });
         record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
         return Err(rejection.to_string());
@@ -5297,6 +5400,26 @@ pub(crate) fn spawn_long_running_exec(
                     );
                 }
             }
+        }
+
+        // mika#2634 §16 — `recovered`: the transition OUT of the braked state.
+        //
+        // Placed after the whole `!status.success()` block so it covers **both**
+        // ends the plan names — a dispatch that succeeded, and one that failed
+        // for any reason other than the dedicated code. A launcher that let a
+        // pilot run and then failed for its own reasons is still a launcher that
+        // works, and that is the only thing this row asserts.
+        //
+        // `code() == None` (killed by a signal — an operator cancel, the #959
+        // watchdog, the mika#2249 reaper) therefore counts as recovery, and
+        // correctly: the process had to have STARTED to be signalled.
+        //
+        // The write itself is a no-op on a clean window — see
+        // [`crate::pilot_launcher_health::record_launcher_recovery`] for why the
+        // healthy regime must stay silent, and why its one `COUNT(*)` per
+        // dispatch is the price of that silence.
+        if status.code() != Some(EXIT_PILOT_LAUNCHER_DEAD) {
+            crate::pilot_launcher_health::record_launcher_recovery(&db, &task_id).await;
         }
         // If success, the script called `mika ask --task-id` which completes the task.
         // If the script didn't call it, the task will eventually expire via timeout_at.
@@ -13817,6 +13940,355 @@ Harness ticket.
                 tail.contains("pilot_launcher_dead_audit_failed"),
                 "mika#2634 — a failed audit write must be said, not swallowed: without \
                  that sibling event the `GROUP BY` under-counts in silence"
+            );
+        }
+
+        // ───────────────────────────────────────────────────────────────────
+        // Phase B (U4) — the brake, surface A, and the `recovered` transition.
+        // ───────────────────────────────────────────────────────────────────
+
+        /// A `manual` / `action_type = none` parent row — the shape every
+        /// production caller of [`validate_dispatch_readiness`] passes.
+        ///
+        /// `issue` is a parameter because `idx_tasks_manual_active_ref_url`
+        /// enforces one active manual row per `(agent_id, reference_url)`: a test
+        /// needing two parents needs two tickets, exactly as production does.
+        async fn parent_row_for(db: &AsyncDatabase, issue: u64) -> String {
+            use crate::db::NewTask;
+            use crate::task_engine::types::{action_type, trigger_type};
+
+            let new = NewTask {
+                agent_id: db.agent_id().to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "mika2634 phase B fixture".to_string(),
+                trigger_type: trigger_type::MANUAL.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: action_type::NONE.to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("mika2634".to_string()),
+                created_trace_id: None,
+                reference_url: Some(format!(
+                    "https://github.com/senara-solutions/mika/issues/{issue}"
+                )),
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: Some("issue".to_string()),
+                dispatch_class: None,
+            };
+            let id = db.create_task(new).await.unwrap();
+            db.update_manual_task_status(&id, "in_progress")
+                .await
+                .unwrap();
+            id
+        }
+
+        /// The common case: one parent, the ticket this phase closes.
+        async fn parent_row(db: &AsyncDatabase) -> String {
+            parent_row_for(db, 2634).await
+        }
+
+        /// Seed `n` launcher deaths through the **production write path** — the
+        /// same `tool_name`, `after_value` and `target_key` shape
+        /// [`spawn_long_running_exec`] writes.
+        ///
+        /// Deliberately not a hand-built fixture: the whole brake rests on the
+        /// reader and the writer agreeing on those three values, and a fixture
+        /// that spelled them itself would be the test and the code agreeing with
+        /// each other rather than with production (the cost mika#2272 measured on
+        /// this very file).
+        async fn seed_dead_launchers(db: &AsyncDatabase, n: usize) {
+            for i in 0..n {
+                let task = format!("seed-{i}");
+                db.log_audit_event(
+                    &format!("callback-{task}"),
+                    PILOT_LAUNCHER_HEALTH_TOOL,
+                    &format!("task:{task}"),
+                    None,
+                    Some(PILOT_LAUNCHER_DEAD_VALUE),
+                    Some(&format!("exit:{EXIT_PILOT_LAUNCHER_DEAD}")),
+                    None,
+                )
+                .await
+                .expect("seed a dead-launcher row");
+            }
+        }
+
+        async fn readiness_for(
+            db: &AsyncDatabase,
+            task_id: &str,
+            skill: &str,
+        ) -> Result<String, String> {
+            let input = serde_json::json!({
+                "skill": skill,
+                "prompt": "implement senara-solutions/mika#2634",
+                "task_id": task_id,
+            });
+            validate_dispatch_readiness(db, task_id, None, Some(&input), None).await
+        }
+
+        /// **U4-14 / AC2 — the gate refuses at the second death.**
+        ///
+        /// This is the behaviour the ticket asks for in as many words: *« à la
+        /// deuxième occurrence consécutive, le moteur cesse de dispatcher des
+        /// pilotes »*. Before phase B each further dispatch left, died the same
+        /// way and burned its slot — 2 h 45 of dead rail on 2026-10-02.
+        ///
+        /// The refusal body is asserted on three things, not just the error
+        /// name: it must name the **repair gesture** and the **disarm lever**,
+        /// because a refusal that names neither is a refusal an operator works
+        /// around by guesswork; and it must carry the count and the window, since
+        /// « 2 morts » without the window is a number rather than a measurement.
+        #[tokio::test]
+        async fn the_second_dead_launcher_refuses_the_dispatch() {
+            let db = db();
+            let task_id = parent_row(&db).await;
+            seed_dead_launchers(&db, 2).await;
+
+            let err = readiness_for(&db, &task_id, "dev-pilot")
+                .await
+                .expect_err("a braked host must refuse the dispatch");
+
+            assert!(
+                err.contains(PILOT_LAUNCHER_BRAKED_ERROR),
+                "the refusal must be nameable: {err}"
+            );
+            assert!(
+                err.contains("uv tool install"),
+                "a refusal that does not name its repair is one an operator works \
+                 around by guesswork: {err}"
+            );
+            assert!(
+                err.contains("MIKA_PILOT_LAUNCHER_BRAKE=0"),
+                "a refusal that does not name its own lifting is a refusal that gets \
+                 contourned au jugé: {err}"
+            );
+            assert!(
+                err.contains("\"dead_count\":2"),
+                "the count must ride on the refusal: {err}"
+            );
+
+            // D8's other half, read on the surface an operator actually reads:
+            // the refusal lands on `tasks.result` through
+            // `record_dispatch_rejection`, so `mika tasks get` answers "why".
+            let row = db.get_task(&task_id).await.unwrap().expect("row exists");
+            assert!(
+                row.result
+                    .as_deref()
+                    .is_some_and(|r| r.contains(PILOT_LAUNCHER_BRAKED_ERROR)),
+                "the refusal must be readable without a grep; result = {:?}",
+                row.result
+            );
+        }
+
+        /// **The positive control, and it is indispensable.**
+        ///
+        /// One death is not a braked host, and a clean window is not either.
+        /// Without this test, "the brake decides" would be indistinguishable
+        /// from "the brake refuses everybody" — which is probe S4's halt: *plus
+        /// aucun dispatch alors que `pilot_launcher_dead` est vide*.
+        #[tokio::test]
+        async fn one_death_and_a_clean_window_both_let_the_dispatch_through() {
+            for seeded in [0usize, 1] {
+                let db = db();
+                let task_id = parent_row(&db).await;
+                seed_dead_launchers(&db, seeded).await;
+
+                let outcome = readiness_for(&db, &task_id, "dev-pilot").await;
+                if let Err(err) = &outcome {
+                    assert!(
+                        !err.contains(PILOT_LAUNCHER_BRAKED_ERROR),
+                        "{seeded} death(s) must not engage the brake (AC2 says the \
+                         SECOND), obtained: {err}"
+                    );
+                }
+            }
+        }
+
+        /// **The brake is bounded to the pilot dispatch skills.**
+        ///
+        /// `deploy_mika` reaches [`validate_dispatch_readiness`] too, and a dead
+        /// `claude-pilot` launcher says nothing about a deploy. Arming the brake
+        /// on it would stop an unrelated flow on a signal that does not describe
+        /// it — and the deploy is one of the gestures that **repairs** the host,
+        /// so braking it would be the loop locking itself out of its own remedy.
+        #[tokio::test]
+        async fn the_brake_does_not_reach_a_non_pilot_skill() {
+            let db = db();
+            let task_id = parent_row(&db).await;
+            seed_dead_launchers(&db, 5).await;
+
+            let outcome = readiness_for(&db, &task_id, "deploy-mika").await;
+            if let Err(err) = &outcome {
+                assert!(
+                    !err.contains(PILOT_LAUNCHER_BRAKED_ERROR),
+                    "`deploy-mika` is out of the brake's population: {err}"
+                );
+            }
+
+            // Anti-vacuity: the same host, the same window, a pilot skill — the
+            // brake IS armed. Without this the control above would pass on a
+            // brake that never fires at all.
+            let pilot_task = parent_row_for(&db, 2635).await;
+            let err = readiness_for(&db, &pilot_task, "dev-groom")
+                .await
+                .expect_err("a pilot skill on the same braked host must refuse");
+            assert!(
+                err.contains(PILOT_LAUNCHER_BRAKED_ERROR),
+                "anti-vacuity: the brake must really be armed here: {err}"
+            );
+        }
+
+        /// **§16 — `recovered` is written on a transition, and only then.**
+        ///
+        /// A dispatch that finishes **without** the dedicated code while the
+        /// window already carried a death is the host coming back: that is the
+        /// one row `after_value = 'recovered'` asserts, and it is what makes
+        /// « non vide est un **résultat**, pas une panne » readable in the
+        /// operator table.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_clean_dispatch_after_a_death_records_the_recovery() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            seed_dead_launchers(&db, 1).await;
+            let task_id = callback_row(&db).await;
+
+            let script = handler(tmp.path(), "exit 0");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            assert_eq!(
+                await_launcher_health(&db, &task_id).await.as_deref(),
+                Some(PILOT_LAUNCHER_RECOVERED_VALUE),
+                "mika#2634 §16 — a dispatch that ran under a repaired launcher must \
+                 record the transition, so the brake's own lifting is datable"
+            );
+        }
+
+        /// **The healthy regime stays silent, and that is the whole reason the
+        /// row is written on a transition.**
+        ///
+        /// A line per healthy dispatch would be the churn doctrine mika#2131
+        /// bounds, and it would make `after_value = 'recovered'` read as noise
+        /// instead of as one host repair. The absence is asserted after the
+        /// handler is established to have run — a sleep alone would conclude
+        /// "absent" from a path that had not yet executed (class mika#2205).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_clean_window_records_no_recovery() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            let marker = tmp.path().join("ran");
+            let script = handler(
+                tmp.path(),
+                &format!("echo ran > {}\nexit 0", marker.display()),
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            // Barrier: establish that the handler really ran before concluding
+            // anything about an absence.
+            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the handler never ran within {SETTLE_MS} ms, so this control \
+                     cannot conclude on the ABSENCE of a recovery row"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
+
+            assert_eq!(
+                launcher_health(&db, &task_id).await,
+                None,
+                "a healthy window must produce NO row — one per dispatch would be the \
+                 churn mika#2131 bounds and would make `recovered` unreadable"
+            );
+        }
+
+        /// **A dead launcher does not record its own recovery.**
+        ///
+        /// The §16 write is guarded on `code() != 79`, and this is the control
+        /// that the guard is the exit code rather than a constant: the same
+        /// seeded window, a handler exiting on the dedicated code, and the row
+        /// must say `dead` — never `recovered`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_dead_launcher_does_not_record_a_recovery() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            seed_dead_launchers(&db, 1).await;
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("LAUNCHER DEAD (exit 79, mika#2634)"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), &format!("exit {EXIT_PILOT_LAUNCHER_DEAD}"));
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            assert_eq!(
+                await_launcher_health(&db, &task_id).await.as_deref(),
+                Some(PILOT_LAUNCHER_DEAD_VALUE),
+                "a dispatch that died on the dedicated code must count as a DEATH; \
+                 recording a recovery here would lift the brake on the very dispatch \
+                 that proves the host is still broken"
+            );
+        }
+
+        /// The two `after_value` are a **wire format**: they land in
+        /// `audit_events.after_value` and the operator's
+        /// `SELECT after_value, count(*) … GROUP BY 1` is the whole surface.
+        ///
+        /// Two spellings would split one population without saying so; and the
+        /// refusal name must stay **distinct** from the audit `tool_name`,
+        /// because one counts the deaths and the other counts the dispatches the
+        /// brake stopped — two different measurements of one incident.
+        #[test]
+        fn the_phase_b_wire_formats_are_pinned() {
+            assert_eq!(PILOT_LAUNCHER_DEAD_VALUE, "dead");
+            assert_eq!(PILOT_LAUNCHER_RECOVERED_VALUE, "recovered");
+            assert_ne!(PILOT_LAUNCHER_DEAD_VALUE, PILOT_LAUNCHER_RECOVERED_VALUE);
+
+            assert_eq!(PILOT_LAUNCHER_BRAKED_ERROR, "pilot_launcher_braked");
+            assert_ne!(
+                PILOT_LAUNCHER_BRAKED_ERROR, PILOT_LAUNCHER_HEALTH_TOOL,
+                "le nom du refus compte les dispatches arrêtés, le nom d'audit compte \
+                 les morts — les confondre rend les deux mesures illisibles"
+            );
+
+            // The filter name on the `auto_pull` side is the same string, and
+            // that is deliberate: one incident, one word, whichever surface the
+            // operator reads it from.
+            assert_eq!(
+                PILOT_LAUNCHER_BRAKED_ERROR, "pilot_launcher_braked",
+                "si ce nom bouge, `FILTER_LAUNCHER_BRAKED` doit bouger avec lui"
             );
         }
     }

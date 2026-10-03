@@ -1378,6 +1378,65 @@ mod tests {
     /// mika#2201).
     const LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
 
+    /// Le prédicat du scan, extrait pour que son **contrôle de bonne foi**
+    /// l'exerce plutôt qu'une copie qui peut en diverger (mika#2634 phase B).
+    ///
+    /// Comparaison **exacte** sur le littéral entier : voir le doc-comment du
+    /// scan pour la mesure qui l'impose.
+    fn launcher_health_literal_present(content: &str, needle: &str) -> bool {
+        content
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+            })
+            .any(|line| string_literals(line).iter().any(|lit| lit.trim() == needle))
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessous, et il est dû.**
+    ///
+    /// La phase B a resserré le prédicat de la sous-chaîne au littéral exact.
+    /// Resserrer une garde sans montrer qu'elle mord encore est précisément la
+    /// façon dont une garde devient inerte en silence (mika#2103 / mika#2205), et
+    /// l'anti-vacuité du scan ne le dit pas : elle vérifie que le **propriétaire**
+    /// porte le nom, pas qu'un **étranger** serait vu.
+    ///
+    /// Les trois contrôles négatifs sont les trois formes réellement présentes
+    /// dans l'arbre : un nom d'événement **préfixé** par le nom d'audit (le
+    /// fail-open du lecteur), un commentaire qui le cite, et le résidu de la
+    /// phase A — aucun des trois n'est un écrivain de la ligne d'audit.
+    #[test]
+    fn mika2634_the_sole_writer_scan_still_catches_a_second_site() {
+        let needle = format!("pilot_launcher{}", "_health");
+
+        assert!(
+            launcher_health_literal_present(
+                &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
+                &needle
+            ),
+            "INVARIANT VIOLÉ : le prédicat resserré ne voit plus un second \
+             écrivain de la ligne d'audit — le scan est devenu inerte et il se \
+             lirait exactement comme un arbre propre"
+        );
+
+        for benign in [
+            // Le nom d'événement de journal du fail-open, PRÉFIXÉ par le nom
+            // d'audit : c'est la forme qui a fait rougir le scan à l'écriture de
+            // la phase B, et c'est une autre surface.
+            format!("        warn!(event = \"{needle}_unreadable\", error = %e);"),
+            // Une mention en commentaire.
+            format!("    // le nom `{needle}` vit dans executor.rs"),
+            // Le résidu de la phase A, même famille, autre nom.
+            "        warn!(event = \"pilot_launcher_dead_audit_failed\");".to_string(),
+        ] {
+            assert!(
+                !launcher_health_literal_present(&benign, &needle),
+                "faux positif du scan sur une ligne qui n'écrit pas la ligne \
+                 d'audit : {benign}"
+            );
+        }
+    }
+
     /// La propriété qui rend le `GROUP BY after_value` de l'opérateur exact.
     ///
     /// # Pourquoi un scan de source et pas un test comportemental
@@ -1389,6 +1448,25 @@ mod tests {
     /// lui que la phase B du ticket (le frein à deux occurrences) lira pour
     /// décider d'arrêter la flotte. Un compte sur lequel deux sites peuvent
     /// diverger est un frein qui mord au mauvais moment.
+    ///
+    /// # La comparaison est EXACTE, et pas en sous-chaîne (mika#2634 phase B)
+    ///
+    /// Fait mesuré en écrivant la phase B, exactement comme mika#2649 l'a mesuré
+    /// un ticket plus tôt sur son propre scan jumeau : les noms d'**événement de
+    /// journal** de cette famille sont construits en **préfixant** le nom
+    /// d'audit — `pilot_launcher_health_unreadable` pour le fail-open du lecteur
+    /// — donc une comparaison par sous-chaîne compte une ligne de journal comme
+    /// un second écrivain de la ligne d'audit. Ce sont deux surfaces distinctes :
+    /// l'une répond à « combien de lanceurs sont morts » (`audit_events`), l'autre
+    /// à « le ledger était-il lisible » (le journal), et aucune n'a à se taire pour
+    /// que l'autre soit exacte.
+    ///
+    /// La propriété gardée est donc : **un seul site de production porte le
+    /// littéral `pilot_launcher_health` entier**. Un second site qui l'écrirait —
+    /// par `db.log_audit_event(…, "pilot_launcher_health", …)` — est toujours
+    /// attrapé, ce qui est tout ce dont le `GROUP BY after_value` a besoin.
+    /// Élargir à la sous-chaîne « pour être sûr » est ce qui rend ce scan
+    /// permanemment rouge, et un lint rouge à la naissance se fait désarmer.
     #[test]
     fn mika2634_the_launcher_health_name_has_a_single_writer() {
         // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
@@ -1400,18 +1478,7 @@ mod tests {
             if LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
-            let carries = content
-                .lines()
-                .filter(|l| {
-                    let t = l.trim_start();
-                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
-                })
-                .any(|line| {
-                    string_literals(line)
-                        .iter()
-                        .any(|lit| lit.contains(needle.as_str()))
-                });
-            if carries {
+            if launcher_health_literal_present(&content, &needle) {
                 writers.push(rel);
             }
         }

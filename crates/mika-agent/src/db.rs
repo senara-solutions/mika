@@ -1886,6 +1886,39 @@ impl Database {
         Ok(n)
     }
 
+    /// Count audit_events matching (agent_id, tool_name, after_value) with
+    /// `created_at > since` — **across every `target_key`** (mika#2634 U4).
+    ///
+    /// # Why this is not [`Self::count_recent_audit_events_for_target`]
+    ///
+    /// That sibling counts one *subject* over a window: a dedup, a circuit
+    /// breaker, a per-PR bound. The launcher brake counts one *outcome* over a
+    /// window, whatever the subject — `pilot_launcher_health` rows are keyed
+    /// `task:<callback-id>`, one per dispatch, all distinct, so a
+    /// `target_key`-scoped count would answer `1` for every window however many
+    /// launchers had died. The population is the host, not the task.
+    ///
+    /// `since` must be an ISO 8601 UTC timestamp (`%Y-%m-%dT%H:%M:%SZ`); string
+    /// comparison is correct because the column format is fixed-width UTC, and
+    /// `idx_audit_agent_created` serves `(agent_id, created_at)` so the two
+    /// remaining predicates are applied over the window alone.
+    pub fn count_recent_audit_events_by_value(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        after_value: &str,
+        since: &str,
+    ) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2 AND after_value = ?3
+               AND created_at > ?4",
+            params![agent_id, tool_name, after_value, since],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// The most recent `audit_events` row for (agent, tool_name, target_key)
     /// with `created_at > since` — its `after_value`, `reasoning` and
     /// `created_at` (mika#2242).
