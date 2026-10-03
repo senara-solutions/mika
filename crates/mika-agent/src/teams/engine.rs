@@ -3044,7 +3044,19 @@ mod tests {
     /// tout », et le mécanisme mika#1798 — dont la Layer 1 *prescrit* de nommer
     /// la doctrine en déclinant — pourrait être cassé avec tous les tests au
     /// vert. Les deux textes passent **sur les trois provenances**.
+    // mika#2646 — POISONNEURS. Les tests qui suivent atteignent les callsites
+    // `guard.testimony_access_proposal{,_uncorrected}` (`commit_deliverable`,
+    // l. 848 et 882) **sans abonné installé**. Un callsite ne s'enregistre
+    // qu'à sa première atteinte, et son `Interest` est alors décidé par le
+    // thread qui l'enregistre : s'il n'a pas d'abonné, le callsite est éteint
+    // **globalement**, y compris pour le test capturant qui tourne en
+    // parallèle. C'est pour cette fenêtre-là qu'ils sont `#[serial]`, et c'est
+    // la moitié porteuse du correctif — voir
+    // `test_helpers::install_capturing_subscriber`, dont le doc-comment porte
+    // la mesure. Retirer l'attribut sur **un** de ces tests rouvre la course
+    // en entier.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_v4_un_refus_prescrit_passe_sur_les_trois_provenances() {
         for text in [
             PRESCRIBED_REFUSAL,
@@ -3085,6 +3097,7 @@ mod tests {
     /// se prouve pas en en convertissant une (leçon mika#2277, qui a dû livrer
     /// quatre contrôles négatifs à terme unique pour la même raison).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_v3_les_provenances_sans_redaction_posent_la_ligne_neutre() {
         for source in [
             DeliverableSource::WorkspaceFallback,
@@ -3121,6 +3134,7 @@ mod tests {
     /// V2 — sur `Writer`, une re-rédaction est tentée, et son résultat propre
     /// est le livrable final.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_v2_la_redaction_aboutie_devient_le_livrable() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(
@@ -3160,6 +3174,7 @@ mod tests {
     /// existait un second retry au niveau du livrable, elle deviendrait le
     /// livrable et ce test échouerait.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_v2_une_redaction_encore_sale_donne_la_ligne_neutre() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(
@@ -3194,6 +3209,7 @@ mod tests {
     /// Sans ce contrôle, « deux réponses sales donnent la ligne neutre » serait
     /// indistinguable de « toute re-rédaction donne la ligne neutre ».
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_v2_une_proposition_corrigee_par_5h_ne_retient_pas_le_livrable() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(
@@ -3223,6 +3239,7 @@ mod tests {
     /// serait silencieux : transmettre le texte initial produirait un run
     /// d'apparence normale portant la proposition.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_v2_une_redaction_en_erreur_ne_transmet_pas_le_texte_initial() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]); // mock en erreur
@@ -3251,6 +3268,7 @@ mod tests {
     /// de rien — une perte silencieuse là où la ligne neutre est une perte
     /// énoncée.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_v2_une_redaction_vide_est_un_echec() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(
@@ -3280,6 +3298,7 @@ mod tests {
     /// si une re-rédaction était tentée, elle deviendrait le livrable et ce test
     /// échouerait — c'est le discriminant.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial]
     async fn mika2633_un_repli_workspace_na_pas_de_redaction() {
         use mika_common::llm::mock::{delayed_response, text_response, tool_call_response};
 
@@ -3345,6 +3364,25 @@ mod tests {
         }
     }
 
+    /// Installe la capture et rend `(garde, événements)`.
+    ///
+    /// Même forme que `capture()` dans `kg/resolver_tick.rs` et
+    /// `capture_tracing_events()` dans `skills/builtin_handlers.rs` : ce
+    /// module était le seul des trois à inliner la mise en place, aux deux
+    /// seuls sites qui capturent.
+    #[allow(clippy::type_complexity)]
+    fn capture() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        (guard, events)
+    }
+
     /// Constat de revue (correctness, P2) — la ligne de refus portait
     /// `agent_id = team_db.agent_id()`, c'est-à-dire la portée codée en dur de
     /// la base d'équipe (`"mika"` en production, `"planner"` ici), quel que
@@ -3354,13 +3392,9 @@ mod tests {
     /// vraiment — l'équipe, et le rédacteur quand il y en a un — et ne porte
     /// plus de champ qui affirme ce qu'il n'a pas mesuré (mika#2304).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_la_ligne_de_refus_nomme_lequipe_et_le_redacteur() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_guard, events) = capture();
 
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);
@@ -3404,15 +3438,96 @@ mod tests {
         }
     }
 
-    /// Le contrôle négatif : sans rédacteur, aucun `writer_agent` n'est inventé.
-    #[tokio::test]
-    async fn mika2633_sans_redacteur_aucun_writer_agent_nest_invente() {
-        use tracing_subscriber::layer::SubscriberExt;
+    /// Contrôle négatif déterministe du cache d'`Interest` (mika#2646).
+    ///
+    /// Deux empoisonnements, mesurés plutôt que supposés :
+    ///
+    /// - **avant** l'installation : `set_default` répare seul, la capture voit
+    ///   l'événement même sans `rebuild_interest_cache`. Le rebuild de
+    ///   l'installateur est donc redondant sur ce chemin — conservé, aligné sur
+    ///   `mika-common/tests/llm_retry.rs`, mais ce n'est pas lui qui porte ;
+    /// - **après** l'installation, depuis un thread sans abonné : le callsite
+    ///   est éteint pour tout le processus, la capture voit **0**, et seul un
+    ///   `rebuild_interest_cache` *postérieur* le rallume. C'est cette fenêtre
+    ///   que le `#[serial_test::serial]` des tests `mika2633_*` ferme : aucun
+    ///   voisin qui atteint `commit_deliverable` ne tourne pendant une capture.
+    ///
+    /// Le corps tourne dans un **processus enfant** réduit à ce seul test :
+    /// l'extinction n'a lieu que si aucun autre abonné n'est vivant dans le
+    /// processus, ce que le binaire de test parallèle ne garantit pas. Sans
+    /// l'enfant, le contrôle serait lui-même probabiliste.
+    #[test]
+    fn mika2646_un_callsite_eteint_apres_installation_exige_un_rebuild() {
+        const ENFANT: &str = "MIKA2646_CONTROLE_ENFANT";
+        if std::env::var_os(ENFANT).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "teams::engine::tests::mika2646_un_callsite_eteint_apres_installation_exige_un_rebuild",
+                    "--test-threads=1",
+                ])
+                .env(ENFANT, "1")
+                .output()
+                .expect("relancer le binaire de test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "l'enfant doit avoir exécuté le contrôle et l'avoir passé\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
 
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        fn avant() {
+            tracing::info!(event = "mika2646.avant");
+        }
+        fn apres() {
+            tracing::info!(event = "mika2646.apres");
+        }
+        let compte = |ev: &std::sync::Mutex<Vec<HashMap<String, String>>>, nom: &str| {
+            ev.lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.get("event").map(String::as_str) == Some(nom))
+                .count()
+        };
+
+        avant(); // enregistré sans abonné : `never`
+        let (_guard, events) = capture();
+        avant();
+        assert_eq!(
+            compte(&events, "mika2646.avant"),
+            1,
+            "un empoisonnement antérieur est réparé par l'installation"
+        );
+
+        std::thread::spawn(apres).join().unwrap(); // enregistré sans abonné, après
+        apres();
+        assert_eq!(
+            compte(&events, "mika2646.apres"),
+            0,
+            "un empoisonnement postérieur éteint la capture : sans lui, ce contrôle \
+             ne prouve rien"
+        );
+
+        tracing::callsite::rebuild_interest_cache();
+        apres();
+        assert_eq!(
+            compte(&events, "mika2646.apres"),
+            1,
+            "`rebuild_interest_cache` rallume le callsite"
+        );
+    }
+
+    /// Le contrôle négatif : sans rédacteur, aucun `writer_agent` n'est inventé.
+    ///
+    /// Non nommé par l'AC1 de mika#2646, et à exposition **identique** au test
+    /// ci-dessus : même callsite, mêmes voisins poisonneurs. Corriger le seul
+    /// test nommé aurait laissé le défaut intact une fonction plus loin.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2633_sans_redacteur_aucun_writer_agent_nest_invente() {
+        let (_guard, events) = capture();
 
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);
@@ -3438,6 +3553,7 @@ mod tests {
     /// La réponse propre configurée est le discriminant : si la re-rédaction
     /// était tentée malgré l'échéance trop proche, elle deviendrait le livrable.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_une_redaction_sans_budget_restant_nest_pas_tentee() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(
@@ -3471,6 +3587,7 @@ mod tests {
     /// Sans lui, « la garde refuse quand le budget manque » serait
     /// indistinguable de « la garde refuse toujours ».
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_une_redaction_avec_budget_restant_est_tentee() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(
@@ -3502,6 +3619,7 @@ mod tests {
     /// Deux volets : sur la ligne neutre **et** sur une re-rédaction aboutie, le
     /// fichier porte le texte engagé, jamais le texte produit.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_le_fichier_livrable_du_workspace_porte_le_texte_engage() {
         for (responses, attendu) in [
             (vec![], TEAM_DELIVERABLE_WITHHELD),
@@ -3538,6 +3656,7 @@ mod tests {
     /// le rédacteur n'est pas touché (il peut légitimement différer du texte
     /// rendu, et rien ne justifie de le réécrire).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_sans_refus_le_fichier_du_workspace_est_intact() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);
@@ -3598,6 +3717,7 @@ mod tests {
     /// Quatre réponses sales : deux pour le tour du rédacteur (5h re-prompte une
     /// fois), deux pour la re-rédaction (idem).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_le_site_1_transmet_le_texte_engage_a_ses_surfaces() {
         use mika_common::llm::mock::text_response;
         let (event, meta) = drive_deliver_phase(vec![
@@ -3616,6 +3736,7 @@ mod tests {
     /// rédacteur. Sans lui, « transmet le texte engagé » serait indistinguable
     /// de « transmet toujours la ligne neutre ».
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_le_site_1_transmet_un_livrable_propre_tel_quel() {
         let (event, meta) =
             drive_deliver_phase(vec![mika_common::llm::mock::text_response("Le rapport.")]).await;
@@ -3629,6 +3750,7 @@ mod tests {
     /// qui serait **faux** et rendrait un refus indistinguable d'un run sans
     /// livrable.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2633_la_ligne_neutre_est_un_livrable_pas_une_absence() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);

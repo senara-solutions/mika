@@ -745,7 +745,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(CapturingLayer {
             events: StdArc::clone(&events),
         });
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
         (guard, events)
     }
 
@@ -788,6 +788,7 @@ mod tests {
     /// `pending_before` doit être **absent**, jamais `0` — le comptage n'a pas
     /// eu lieu, il n'a pas rendu zéro (motif mika#2331).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika1833_zero_budget_tick_still_emits_its_completion_line() {
         let (_tmp, home, db) = tick_fixture();
         let (_guard, events) = capture();
@@ -840,6 +841,7 @@ mod tests {
     /// Le contrôle négatif — la seconde moitié — est ce qui distingue « la
     /// sentinelle décide » de « le tick est mort ».
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika1833_the_stop_sentinel_short_circuits_the_tick() {
         let (_tmp, home, db) = tick_fixture();
         let stop_path =
