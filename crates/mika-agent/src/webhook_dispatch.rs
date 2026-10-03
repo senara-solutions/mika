@@ -10,6 +10,31 @@
 /// truth coupling. See mika#852.
 pub(crate) use mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER;
 
+/// Préfixe des événements de territoire qa (revue, action de PR).
+///
+/// **Site de définition unique des deux préfixes**, lu par les deux faces de la
+/// même frontière : [`is_webhook_fallthrough_domain`], qui sort cette famille du
+/// domaine Fallthrough, et [`webhook_event_target`] (mika#2649), qui l'y
+/// retrouve pour la borner à sa cible. Ce qui sort de l'un est exactement ce
+/// qu'il faut borner dans l'autre, donc les deux doivent lire le même octet.
+///
+/// **Déclarés ICI, en tête de module, et ce n'est pas un choix de mise en
+/// page :** `canonical_tokens`'s `production_sources` tronque chaque fichier à
+/// son premier marqueur d'attribut `cfg(test)` **où qu'il soit, commentaires
+/// compris**, et le doc-comment d'[`ALL_MARKER_CLASSES`] en porte un. Déclarées
+/// plus bas, ces constantes seraient invisibles à
+/// `mika2517_the_fallthrough_domain_has_a_single_definition`, dont
+/// l'anti-vacuité l'a dit en rougissant. Les déplacer ici est ce qui garde ce
+/// scan exact plutôt que vert par troncature — et ce paragraphe lui-même évite
+/// d'écrire la séquence littérale, faute de quoi il tronquerait le fichier juste
+/// au-dessus de la constante qu'il décrit.
+const PR_EVENT_PREFIX: &str = "[GitHub] PR ";
+
+/// Préfixe des événements de territoire ci (suite de checks).
+///
+/// Même site, même raison que [`PR_EVENT_PREFIX`].
+const CHECK_SUITE_EVENT_PREFIX: &str = "[GitHub] Check suite ";
+
 /// True when the message is a `[GitHub]` webhook event in the
 /// **Webhook Fallthrough** domain — i.e., a turn that MUST NOT call
 /// `run_claude_pilot`. The fallthrough domain is the complement of:
@@ -75,11 +100,18 @@ pub(crate) fn is_webhook_fallthrough_domain(msg: &str) -> bool {
         return false;
     }
     // qa skill territory (Phase 0 prefix surface rows E, F).
-    if msg.starts_with("[GitHub] PR ") {
+    //
+    // Depuis mika#2649 les deux littéraux de préfixe ont un **site de définition
+    // unique** ([`PR_EVENT_PREFIX`], [`CHECK_SUITE_EVENT_PREFIX`]) partagé avec
+    // `webhook_event_target`, qui lit la même frontière depuis l'autre côté : ce
+    // qui sort d'ici est exactement ce qu'il faut borner à sa cible. Même valeur,
+    // même comportement — la matrice à huit lignes de
+    // `test_is_unauthorized_webhook_dispatch_predicate` passe sans modification.
+    if msg.starts_with(PR_EVENT_PREFIX) {
         return false;
     }
     // ci skill territory (Phase 0 prefix surface row G).
-    if msg.starts_with("[GitHub] Check suite ") {
+    if msg.starts_with(CHECK_SUITE_EVENT_PREFIX) {
         return false;
     }
     // Everything else in [GitHub] domain (rows B, C, D, H) is fallthrough.
@@ -587,6 +619,275 @@ pub(crate) fn seat_refusal_sentence(verdict: &SeatVerdict) -> String {
 /// [`dispatchable_repos_display`]).
 pub(crate) fn known_dispatch_seats_display() -> String {
     KNOWN_DISPATCH_SEATS.join(", ")
+}
+
+// ───────── Lignée d'un dispatch ouvert par un événement PR (mika#2649) ─────────
+
+/// La cible qu'un événement webhook désigne, quand il en désigne une.
+///
+/// # Le trou que ça ferme
+///
+/// [`is_unauthorized_webhook_dispatch`] juge la **nature** de l'événement
+/// source : `[GitHub] PR …` et `[GitHub] Check suite …` sortent du domaine
+/// Fallthrough parce que `self-dev-webhook-qa` / `-ci` y portent des dispatchs
+/// légitimes. Une fois sortis de ce domaine, **plus aucun terme ne liait le
+/// dispatch à la PR de l'événement** : mesuré le 2026-10-02, un tour ouvert par
+/// une revue QA sur la PR #2647 a lancé un implement de mika#2646, hors fenêtre
+/// `ready`, pendant qu'un autre implement volait.
+///
+/// # Aucun second parseur de grammaire
+///
+/// Les deux grammaires sont lues par leurs lecteurs **uniques** existants —
+/// [`crate::server::deadline_verdict::parse_pr_target`] pour la forme PR
+/// (mika#2368, dont le commentaire dit : *« Aucune des deux regex n'est recopiée
+/// ici : une grammaire de fil dupliquée est exactement ce qui a laissé deux
+/// lecteurs diverger dans mika#2158 »*) et
+/// [`crate::server::webhook_queue_v2::classify_event`] pour la forme
+/// check-suite, dont le `CHECK_SUITE_RE` existe **déjà en deux copies** dans
+/// l'arbre (`webhook_queue.rs` et `webhook_queue_v2.rs`, la seconde se déclarant
+/// doublon assumé). Écrire une troisième extraction de `(branch: …)` ici serait
+/// la classe mika#2158 à son troisième tour ; le numéro d'issue porté par la
+/// branche est lu par [`crate::worktree_reaper::issue_number_from_branch`]
+/// (mika#2619, *« le deuxième segment, et rien d'autre »*).
+///
+/// C'est une **rectification au plan de mika#2649**, qui décrivait « extraction
+/// de `(branch: …)` puis `issue_number_from_branch` » en supposant qu'aucun
+/// lecteur n'existait : il en existe deux, donc on en appelle un.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WebhookEventTarget {
+    /// `[GitHub] PR …` — le numéro est celui de la **pull request**.
+    Pr { repo: String, number: u64 },
+    /// `[GitHub] Check suite …` — la grammaire porte une **branche**, jamais un
+    /// numéro de PR (épinglé à `deadline_verdict.rs` : `parse_pr_target` rend
+    /// `None` sur un texte check-suite). Le numéro d'**issue** en est le
+    /// deuxième segment, ou rien.
+    Branch { repo: String, issue: Option<u64> },
+    /// Le message porte bien un préfixe PR / check-suite, mais sa grammaire n'a
+    /// pas parsé. **Autorise** — il n'y a aucune cible à laquelle borner — mais
+    /// c'est une anomalie, donc c'est audité sous son propre nom.
+    Unreadable,
+    /// Le message n'est pas un événement PR / check-suite du tout : un tour
+    /// Telegram, un callback, un heartbeat, un `[GitHub] Issue …`. **Hors
+    /// population**, et jamais audité — ce serait l'essentiel du trafic, soit
+    /// très exactement le churn que la doctrine mika#2131 borne.
+    NotApplicable,
+}
+
+/// La cible de l'événement qui a ouvert ce tour, s'il en désigne une.
+///
+/// Pur : aucun I/O, aucune base. Les deux prédicats de préfixe sont ceux
+/// qu'[`is_webhook_fallthrough_domain`] emploie déjà pour sortir ces deux
+/// familles du domaine Fallthrough — la même frontière, lue depuis l'autre côté.
+pub(crate) fn webhook_event_target(msg: &str) -> WebhookEventTarget {
+    if msg.starts_with(PR_EVENT_PREFIX) {
+        return match crate::server::deadline_verdict::parse_pr_target(msg) {
+            Some(target) => WebhookEventTarget::Pr {
+                repo: normalize_owner_repo(&target.repo),
+                number: target.pr_number,
+            },
+            None => WebhookEventTarget::Unreadable,
+        };
+    }
+    if msg.starts_with(CHECK_SUITE_EVENT_PREFIX) {
+        return match crate::server::webhook_queue_v2::classify_event(msg) {
+            crate::server::webhook_queue_v2::WebhookEventKind::CheckSuite { repo, branch } => {
+                WebhookEventTarget::Branch {
+                    repo: normalize_owner_repo(&repo),
+                    issue: crate::worktree_reaper::issue_number_from_branch(&branch),
+                }
+            }
+            // Le préfixe est là et `classify_event` n'a pas reconnu la forme :
+            // la grammaire a bougé sous le lecteur.
+            _ => WebhookEventTarget::Unreadable,
+        };
+    }
+    WebhookEventTarget::NotApplicable
+}
+
+/// Le `tool_name` sous lequel chaque décision de lignée est auditée (mika#2649).
+///
+/// **Un seul nom**, la décision dans `after_value` — le motif `ready_label_outcome`
+/// (mika#2323) : les cinq issues appartiennent au même site et à la même
+/// population, donc un `GROUP BY after_value` les sépare et les rend
+/// soustractibles. SOLE WRITER, épinglé par
+/// `canonical_tokens::tests::mika2649_le_nom_daudit_a_un_seul_ecrivain` — c'est
+/// cette propriété qui rend le compte exact plutôt qu'un nombre sur lequel deux
+/// sites peuvent diverger.
+pub(crate) const TARGET_BINDING_AUDIT_TOOL: &str = "webhook_dispatch_target_binding";
+
+/// Un terme de lignée a tenu : le dispatch est autorisé.
+pub(crate) const TARGET_BINDING_BOUND: &str = "bound";
+/// Aucun terme de lignée n'a tenu : le dispatch est refusé.
+pub(crate) const TARGET_BINDING_REFUSED: &str = "refused";
+/// Préfixe PR / check-suite présent, grammaire non parsée ⇒ **autorise**.
+pub(crate) const TARGET_BINDING_EVENT_UNREADABLE: &str = "event_unreadable";
+/// Check-suite dont la branche ne porte aucun numéro d'issue ⇒ **autorise**.
+pub(crate) const TARGET_BINDING_NO_TARGET_IN_EVENT: &str = "no_target_in_event";
+/// La traversée de lignée n'a pas pu être faite (erreur base) ⇒ **refuse**.
+pub(crate) const TARGET_BINDING_LINEAGE_UNREADABLE: &str = "lineage_unreadable";
+
+/// Toutes les valeurs que `after_value` peut prendre, pour l'épinglage du format
+/// de fil.
+///
+/// Reste en production plutôt que derrière `#[cfg(test)]`, et c'est la raison
+/// qu'[`ALL_MARKER_CLASSES`] a déjà dû écrire : le registre d'un format de fil
+/// est ce qu'un opérateur lit pour savoir ce qu'un `GROUP BY` peut rendre, et un
+/// registre qui n'existe que sous `cfg(test)` est un registre qu'un lecteur de ce
+/// fichier ne trouve pas.
+#[allow(dead_code)]
+pub(crate) const ALL_TARGET_BINDING_VERDICTS: &[&str] = &[
+    TARGET_BINDING_BOUND,
+    TARGET_BINDING_REFUSED,
+    TARGET_BINDING_EVENT_UNREADABLE,
+    TARGET_BINDING_NO_TARGET_IN_EVENT,
+    TARGET_BINDING_LINEAGE_UNREADABLE,
+];
+
+/// Le terme de lignée qui a autorisé le dispatch, pour la ligne de journal.
+///
+/// Format de fil au même titre que les verdicts : il atterrit dans le
+/// `reasoning` de la ligne d'audit, et c'est lui qui dit à l'opérateur **lequel**
+/// des quatre termes a tenu — donc quelle moitié du prédicat réparer si la
+/// cascade de jalon se met à être refusée (halte 2 de la sonde S2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineageTerm {
+    /// L1 — la tâche elle-même nomme la cible de l'événement.
+    TaskReference,
+    /// L2 — la tâche porte la PR de l'événement en `claude_pilot.pr_url`.
+    TaskPilotPrUrl,
+    /// L3 — un **frère** satisfait L1 ou L2. **C'est la cascade de jalon M4.**
+    Sibling,
+    /// L4 — le **parent** satisfait L1 ou L2.
+    Parent,
+}
+
+impl LineageTerm {
+    /// Nom stable du terme, pour la ligne de journal et l'audit.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LineageTerm::TaskReference => "task_reference_url",
+            LineageTerm::TaskPilotPrUrl => "task_pilot_pr_url",
+            LineageTerm::Sibling => "sibling",
+            LineageTerm::Parent => "parent",
+        }
+    }
+}
+
+/// Ce que la traversée de lignée a établi.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TargetBinding {
+    /// Un terme a tenu — autorise, et nomme lequel.
+    Bound(LineageTerm),
+    /// Aucun terme n'a tenu — refuse.
+    Refused,
+    /// Le préfixe était là, la grammaire n'a pas parsé — autorise.
+    EventUnreadable,
+    /// La grammaire a parsé et ne porte aucune cible — autorise.
+    NoTargetInEvent,
+    /// La question n'a pas pu être posée — refuse.
+    LineageUnreadable,
+}
+
+impl TargetBinding {
+    /// La valeur de `after_value`, en `match` exhaustif **sans bras `_ =>`** : un
+    /// sixième état doit être tranché ici par le compilateur, pas deviné.
+    pub(crate) fn audit_value(&self) -> &'static str {
+        match self {
+            TargetBinding::Bound(_) => TARGET_BINDING_BOUND,
+            TargetBinding::Refused => TARGET_BINDING_REFUSED,
+            TargetBinding::EventUnreadable => TARGET_BINDING_EVENT_UNREADABLE,
+            TargetBinding::NoTargetInEvent => TARGET_BINDING_NO_TARGET_IN_EVENT,
+            TargetBinding::LineageUnreadable => TARGET_BINDING_LINEAGE_UNREADABLE,
+        }
+    }
+
+    // Pas de `refuses()`, contrairement à [`SeatVerdict`] — et c'est une
+    // décision. Là-bas trois appelants posent la question et un `matches!`
+    // recopié par l'un d'eux pourrait inverser la disposition ; ici le seul site
+    // qui décide (`skills::executor::report_event_target_binding`) doit de toute
+    // façon composer un **corps de refus différent par verdict refusant**, donc
+    // la disposition est inséparable du corps. Un `refuses()` à côté serait une
+    // seconde source de vérité sur la même question, libre de diverger du `match`
+    // qui compose — et c'est ce `match`, exhaustif et sans bras `_ =>`, qui tient
+    // la garantie.
+}
+
+/// `task.reference_url` nomme-t-il la cible de l'événement ? (terme L1)
+///
+/// **Strict sur le TYPE de référence**, et c'est une décision : un événement PR
+/// se compare à une `reference_url` de **pull request**, un check-suite dont la
+/// branche porte `N` à une `reference_url` d'**issue**. Un numéro de PR et un
+/// numéro d'issue vivent dans le même espace de numérotation GitHub mais
+/// désignent deux objets différents ; les apparier serait une **coïncidence de
+/// numéro**, pas une lignée. Le cas réellement fréquent — une tâche implement sur
+/// `issues/2641` et un événement sur la PR `pull/2647` qui l'implémente — est
+/// couvert par L2, qui lit le lien que le producteur du dispatch a estampillé.
+pub(crate) fn reference_url_names_target(
+    target: &WebhookEventTarget,
+    reference_url: Option<&str>,
+) -> bool {
+    let Some(url) = reference_url else {
+        return false;
+    };
+    let Some(parsed) = crate::tools::parse_github_ref(url) else {
+        return false;
+    };
+    match (target, parsed) {
+        (
+            WebhookEventTarget::Pr {
+                repo: event_repo,
+                number: event_number,
+            },
+            crate::tools::GitHubRef::PullRequest {
+                owner,
+                repo,
+                number,
+            },
+        ) => number == *event_number && &format!("{owner}/{repo}") == event_repo,
+        (
+            WebhookEventTarget::Branch {
+                repo: event_repo,
+                issue: Some(event_issue),
+            },
+            crate::tools::GitHubRef::Issue {
+                owner,
+                repo,
+                number,
+            },
+        ) => number == *event_issue && &format!("{owner}/{repo}") == event_repo,
+        _ => false,
+    }
+}
+
+/// `metadata.claude_pilot.pr_url` nomme-t-il la PR de l'événement ? (terme L2)
+///
+/// Le lien est **déjà porté en base** : `try_extract_callback_metadata`
+/// l'estampille sur le parent à la fin de chaque dispatch, et
+/// `iterate_dispatch` / `verdict_handler` le posent à la création. C'est ce qui
+/// permet de répondre à « le ticket fermé par cette PR » **sans appel réseau** —
+/// doctrine maison : *la cible est dite, jamais dérivée* (mika#2249, mika#2368).
+///
+/// Inapplicable à une cible `Branch` : une URL de PR ne dit pas quelle issue la
+/// PR ferme.
+pub(crate) fn pilot_pr_url_names_target(target: &WebhookEventTarget, pr_url: Option<&str>) -> bool {
+    let WebhookEventTarget::Pr {
+        repo: event_repo,
+        number: event_number,
+    } = target
+    else {
+        return false;
+    };
+    let Some(url) = pr_url else {
+        return false;
+    };
+    match crate::tools::parse_github_ref(url) {
+        Some(crate::tools::GitHubRef::PullRequest {
+            owner,
+            repo,
+            number,
+        }) => number == *event_number && &format!("{owner}/{repo}") == event_repo,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1357,6 +1658,270 @@ mod tests {
             assert!(
                 is_grooming_intent_message(msg),
                 "{msg:?} — un opérateur écrit indifféremment"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2649 — la cible de l'événement, et le vocabulaire d'audit.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **V10 — la cible est lue par les lecteurs uniques, sur les grammaires
+    /// réelles de `format_event_text`.**
+    ///
+    /// Les textes sont ceux que `mika_gateway::github::format_event_text`
+    /// produit, repris verbatim des fixtures du dépôt — un test écrit sur une
+    /// grammaire inventée attesterait de l'invention.
+    #[test]
+    fn mika2649_la_cible_devenement_est_lue_par_les_lecteurs_uniques() {
+        // Forme `PR review` — celle de l'incident du 2026-10-02.
+        assert_eq!(
+            webhook_event_target(
+                "[GitHub] PR review (approved) on senara-solutions/mika#2647 (un titre) by @samidarko"
+            ),
+            WebhookEventTarget::Pr {
+                repo: "senara-solutions/mika".to_string(),
+                number: 2647,
+            },
+        );
+
+        // Forme `PR {action}:` — celle de la cascade de jalon M4.
+        assert_eq!(
+            webhook_event_target("[GitHub] PR closed: senara-solutions/mika#2600 — un titre"),
+            WebhookEventTarget::Pr {
+                repo: "senara-solutions/mika".to_string(),
+                number: 2600,
+            },
+        );
+
+        // Check-suite : la grammaire porte une BRANCHE, et le numéro d'issue en
+        // est le deuxième segment.
+        assert_eq!(
+            webhook_event_target(
+                "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/2646/slug)"
+            ),
+            WebhookEventTarget::Branch {
+                repo: "senara-solutions/mika".to_string(),
+                issue: Some(2646),
+            },
+        );
+
+        // Une branche non conforme ne porte aucun numéro — jamais inventé.
+        assert_eq!(
+            webhook_event_target(
+                "[GitHub] Check suite success on senara-solutions/mika (branch: main)"
+            ),
+            WebhookEventTarget::Branch {
+                repo: "senara-solutions/mika".to_string(),
+                issue: None,
+            },
+        );
+
+        // Le dépôt est normalisé par le lecteur unique de mika#2046, donc une
+        // forme courte du gateway s'aligne sur la forme des `reference_url`.
+        assert_eq!(
+            webhook_event_target("[GitHub] PR closed: mika#2600 — un titre"),
+            WebhookEventTarget::Pr {
+                repo: "senara-solutions/mika".to_string(),
+                number: 2600,
+            },
+        );
+
+        // Préfixe présent, grammaire non parsée : la grammaire a bougé sous le
+        // lecteur. Autorise, mais sous son propre nom.
+        assert_eq!(
+            webhook_event_target("[GitHub] PR quelque chose que personne n'émet"),
+            WebhookEventTarget::Unreadable,
+        );
+
+        // Hors population : tout le reste.
+        for msg in [
+            "Implement mika#2649",
+            "[GitHub] Issue labeled ready on senara-solutions/mika#2649 — titre",
+            "[GitHub] New comment on senara-solutions/mika#2649 (titre) by @samidarko",
+            "[callback: long_running:run_claude_pilot]",
+            "",
+        ] {
+            assert_eq!(
+                webhook_event_target(msg),
+                WebhookEventTarget::NotApplicable,
+                "{msg:?} ne désigne aucune cible de PR / check-suite"
+            );
+        }
+    }
+
+    /// **V10-bis — les deux termes purs de lignée.**
+    ///
+    /// Le contrôle porteur est le **strict sur le type de référence** : un
+    /// événement PR #2647 ne doit PAS être apparié à une `reference_url`
+    /// d'issue #2647 — ce serait une coïncidence de numéro, pas une lignée.
+    #[test]
+    fn mika2649_les_deux_termes_purs_sont_stricts_sur_le_type() {
+        let pr_event = WebhookEventTarget::Pr {
+            repo: "senara-solutions/mika".to_string(),
+            number: 2647,
+        };
+
+        // L1 positif.
+        assert!(reference_url_names_target(
+            &pr_event,
+            Some("https://github.com/senara-solutions/mika/pull/2647")
+        ));
+        // L1 — coïncidence de numéro sur un AUTRE type d'objet : refusé.
+        assert!(!reference_url_names_target(
+            &pr_event,
+            Some("https://github.com/senara-solutions/mika/issues/2647")
+        ));
+        // L1 — même numéro, autre dépôt.
+        assert!(!reference_url_names_target(
+            &pr_event,
+            Some("https://github.com/senara-solutions/mika-cloud/pull/2647")
+        ));
+        // L1 — un signal illisible n'est jamais un terme satisfait.
+        for url in [None, Some(""), Some("pas une url"), Some("mika#2647")] {
+            assert!(!reference_url_names_target(&pr_event, url), "{url:?}");
+        }
+
+        // L2 positif — le lien que le producteur du dispatch a estampillé.
+        assert!(pilot_pr_url_names_target(
+            &pr_event,
+            Some("https://github.com/senara-solutions/mika/pull/2647")
+        ));
+        assert!(!pilot_pr_url_names_target(
+            &pr_event,
+            Some("https://github.com/senara-solutions/mika/pull/2646")
+        ));
+        // L2 est inapplicable à une cible `Branch` : une URL de PR ne dit pas
+        // quelle issue la PR ferme.
+        let branch_event = WebhookEventTarget::Branch {
+            repo: "senara-solutions/mika".to_string(),
+            issue: Some(2646),
+        };
+        assert!(!pilot_pr_url_names_target(
+            &branch_event,
+            Some("https://github.com/senara-solutions/mika/pull/2647")
+        ));
+        // …et L1 sur une cible `Branch` apparie une ISSUE, pas une PR.
+        assert!(reference_url_names_target(
+            &branch_event,
+            Some("https://github.com/senara-solutions/mika/issues/2646")
+        ));
+        assert!(!reference_url_names_target(
+            &branch_event,
+            Some("https://github.com/senara-solutions/mika/pull/2646")
+        ));
+        // Une branche sans numéro n'apparie rien, même pas elle-même.
+        let no_target = WebhookEventTarget::Branch {
+            repo: "senara-solutions/mika".to_string(),
+            issue: None,
+        };
+        assert!(!reference_url_names_target(
+            &no_target,
+            Some("https://github.com/senara-solutions/mika/issues/2646")
+        ));
+    }
+
+    /// **V11 — le vocabulaire d'audit est un format de fil.**
+    ///
+    /// Ces cinq valeurs atterrissent dans `audit_events.after_value` et un
+    /// opérateur en fait des `GROUP BY` : deux orthographes d'une même issue
+    /// couperaient une population en deux sans le dire. Site de définition
+    /// unique, et le `match` d'`audit_value` est exhaustif **sans bras `_ =>`**
+    /// — ce test épingle la valeur de chaque bras.
+    #[test]
+    fn mika2649_le_vocabulaire_daudit_est_un_format_de_fil() {
+        assert_eq!(TARGET_BINDING_AUDIT_TOOL, "webhook_dispatch_target_binding");
+        assert_eq!(TARGET_BINDING_BOUND, "bound");
+        assert_eq!(TARGET_BINDING_REFUSED, "refused");
+        assert_eq!(TARGET_BINDING_EVENT_UNREADABLE, "event_unreadable");
+        assert_eq!(TARGET_BINDING_NO_TARGET_IN_EVENT, "no_target_in_event");
+        assert_eq!(TARGET_BINDING_LINEAGE_UNREADABLE, "lineage_unreadable");
+
+        // Chaque état rend sa valeur, et le registre les porte toutes.
+        for (state, expected) in [
+            (
+                TargetBinding::Bound(LineageTerm::TaskReference),
+                TARGET_BINDING_BOUND,
+            ),
+            (TargetBinding::Refused, TARGET_BINDING_REFUSED),
+            (
+                TargetBinding::EventUnreadable,
+                TARGET_BINDING_EVENT_UNREADABLE,
+            ),
+            (
+                TargetBinding::NoTargetInEvent,
+                TARGET_BINDING_NO_TARGET_IN_EVENT,
+            ),
+            (
+                TargetBinding::LineageUnreadable,
+                TARGET_BINDING_LINEAGE_UNREADABLE,
+            ),
+        ] {
+            assert_eq!(state.audit_value(), expected);
+            assert!(
+                ALL_TARGET_BINDING_VERDICTS.contains(&expected),
+                "{expected} doit être au registre que l'opérateur lit"
+            );
+        }
+
+        // Le registre ne porte que ces cinq valeurs, et aucune en double : un
+        // doublon rendrait un `GROUP BY` ambigu sans le dire.
+        assert_eq!(ALL_TARGET_BINDING_VERDICTS.len(), 5);
+        let mut sorted = ALL_TARGET_BINDING_VERDICTS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "aucune valeur en double au registre");
+
+        // Les quatre termes de lignée ont eux aussi un nom stable : c'est lui
+        // qui dit à l'opérateur LEQUEL a tenu, donc quelle moitié du prédicat
+        // lire quand la cascade de jalon est refusée (halte 2 de la sonde S2).
+        assert_eq!(LineageTerm::TaskReference.as_str(), "task_reference_url");
+        assert_eq!(LineageTerm::TaskPilotPrUrl.as_str(), "task_pilot_pr_url");
+        assert_eq!(LineageTerm::Sibling.as_str(), "sibling");
+        assert_eq!(LineageTerm::Parent.as_str(), "parent");
+    }
+
+    /// **La frontière est lue d'un seul côté.**
+    ///
+    /// `is_webhook_fallthrough_domain` sort les deux familles du domaine
+    /// Fallthrough ; `webhook_event_target` les y retrouve pour les borner. Les
+    /// deux lisent les **mêmes** constantes de préfixe depuis mika#2649, donc
+    /// l'invariant est : *tout message sorti du domaine par l'un des deux
+    /// préfixes porte une cible, lisible ou non.* Une divergence future laisserait
+    /// une famille hors du domaine ET hors de la garde — exactement le trou de
+    /// mika#2649.
+    #[test]
+    fn mika2649_tout_message_hors_domaine_par_prefixe_porte_une_cible() {
+        for msg in [
+            "[GitHub] PR review (approved) on senara-solutions/mika#1 (t) by @x",
+            "[GitHub] PR closed: senara-solutions/mika#1 — t",
+            "[GitHub] PR une-forme-inconnue",
+            "[GitHub] Check suite success on senara-solutions/mika (branch: main)",
+            "[GitHub] Check suite une-forme-inconnue",
+        ] {
+            assert!(
+                !is_webhook_fallthrough_domain(msg),
+                "{msg:?} doit être hors du domaine Fallthrough"
+            );
+            assert_ne!(
+                webhook_event_target(msg),
+                WebhookEventTarget::NotApplicable,
+                "{msg:?} est hors du domaine Fallthrough, donc la garde de lignée doit \
+                 l'interroger — un message hors des deux est le trou de mika#2649"
+            );
+        }
+
+        // Le contrôle négatif : ce qui RESTE dans le domaine n'est pas interrogé
+        // par la garde de lignée (le domaine a sa propre garde, gate 0).
+        for msg in [
+            "[GitHub] Issue labeled bug on senara-solutions/mika#1",
+            "[GitHub] New comment on senara-solutions/mika#1 (t) by @x",
+        ] {
+            assert!(is_webhook_fallthrough_domain(msg), "{msg:?}");
+            assert_eq!(
+                webhook_event_target(msg),
+                WebhookEventTarget::NotApplicable,
+                "{msg:?} reste dans le domaine Fallthrough : gate 0 le juge, pas la lignée"
             );
         }
     }

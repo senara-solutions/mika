@@ -4937,6 +4937,227 @@ garde qui marche* (mika#2205).
   jointure par `trace_id` la donne, et l'inventer serait un champ qui affirme ce
   qu'on n'a pas mesuré.
 
+### Un dispatch ouvert par un événement PR est borné à la lignée de cet événement (mika#2649)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce qu'elle est la voisine de famille de la précédente — même
+fichier de prédicats, même frontière d'outil — et parce que l'opérateur qui lit un
+`webhook_dispatch_target_mismatch` cherche dans ce voisinage.
+
+- **Le défaut, mesuré le 2026-10-02** (trace
+  `17ba765a-be9c-11f1-94aa-c13d0500c506`). Un tour mika-dev ouvert par un **webhook
+  de revue QA sur la PR #2647** a lancé un **implement de mika#2646** — un autre
+  ticket, hors fenêtre `ready`, pendant qu'un implement de #2636 volait. Deux
+  pilotes implement simultanés de 20:03:17Z à ~20:24Z. Le re-prompt « required
+  tools » de 20:03:02Z est le déclencheur probable : il pousse le modèle à appeler
+  un outil dans un tour où il n'avait rien à faire, et l'outil de dispatch était
+  autorisé.
+
+- **Le mécanisme, et il était structurel.** `is_unauthorized_webhook_dispatch`
+  (mika#841 / mika#933) juge la **nature** de l'événement source : les préfixes
+  `[GitHub] PR ` et `[GitHub] Check suite ` sortent du domaine Fallthrough parce que
+  `self-dev-webhook-qa` / `-ci` y portent des dispatchs légitimes. Une fois sortis,
+  **plus aucun terme ne liait le dispatch à la PR de l'événement.**
+
+- **Le discriminant est la LIGNÉE, jamais l'identité de la cible** — et c'est la
+  rectification centrale, imposée par une mesure. Un prédicat « même cible, sinon
+  refus » **casserait la cascade de jalon M4**, qui sur un `[GitHub] PR closed:`
+  dispatche légitimement le **frère pending suivant**, c'est-à-dire un ticket dont le
+  numéro n'est pas celui de la PR (`self-dev-webhook-qa/system_prompt.md`, qui nomme
+  la garde en toutes lettres). Quatre termes, du moins cher au plus cher, **le
+  premier qui tient autorise** : la tâche nomme la cible (L1), la tâche porte la PR
+  de l'événement en `claude_pilot.pr_url` (L2), un **frère** satisfait l'un des deux
+  (L3 — **la cascade M4**), le **parent** satisfait l'un des deux (L4).
+
+- **Trois dispositions de fail-safe, et elles ne sont pas uniformes à dessein.**
+  Cible d'événement illisible ⇒ **autorise** (il n'existe aucune cible à laquelle
+  borner). Un terme de lignée illisible ⇒ **ce terme n'est pas satisfait**, les
+  autres continuent — et c'est **porteur** : la tâche du constat avait une metadata
+  **vide**, donc « metadata absente ⇒ autorise » aurait autorisé l'occurrence
+  mesurée. La question impossible à poser (erreur base) ⇒ **refuse**, par cohérence
+  avec la garde voisine `dispatch_check_failed` de la **même fonction**.
+
+- **L'asymétrie qui autorise ce fail-closed, nommée :** un faux refus coûte un
+  dispatch — visible, écrit dans `tasks.result`, re-drivé par le réconciliateur
+  stuck-ready ; un faux passage lance un pilote sur un ticket que personne n'a
+  autorisé, brûle un créneau et ~20 min de travail. C'est l'**inverse** de
+  l'arbitrage du faucheur mika#2420, et il ne se transporte pas.
+
+- **Aucun appel réseau, et aucune variable d'environnement.** « Le ticket fermé par
+  cette PR » est lu **en base** (L2), jamais par un `gh pr view --json
+  closingIssuesReferences` : ce serait un aller-retour de plus dans une fonction qui
+  en fait déjà plusieurs à 10 s de timeout, sur un chemin qui spawne un processus.
+  *La cible est dite, jamais dérivée* (mika#2249, mika#2368). Et le geste de
+  désarmement est un **revert** — un désarmement par variable sur un chemin de plan
+  de dispatch serait un désarmement par coquille (précédents mika#1646, mika#2627).
+
+### Surfaces opérateur
+
+```bash
+# 1. Un dispatch hors lignée a-t-il été refusé ?
+grep webhook_dispatch_target_mismatch "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.event == "webhook_dispatch_target_mismatch")
+           | {task_id, event_repo, event_number, event_kind, task_reference_url}'
+
+# 2. CONTRÔLE NÉGATIF — la traversée a-t-elle échoué ? (régime attendu : VIDE)
+grep webhook_dispatch_lineage_unreadable "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. CONTRÔLE POSITIF — des dispatchs traversent-ils seulement ce prédicat ?
+grep webhook_dispatch_target_bound "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{task_id, lineage_term, event_number}'
+```
+
+Le `select` sur `.event` de la commande 1 est **porteur** : `grep` est une
+sous-chaîne et rend aussi tout texte qu'un pilote écrirait *au sujet* du signal —
+classe mika#2050, mesurée sur le Signal S, et toute session qui groome ou implémente
+ce ticket recrée ce faux positif.
+
+```sql
+-- La population du refus. SOLE WRITER, donc ce compte est exact.
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'webhook_dispatch_target_binding' GROUP BY 1 ORDER BY 2 DESC;
+
+-- Le détail, avec la cible de l'événement et celle de la tâche
+SELECT target_key, created_at, reasoning FROM audit_events
+ WHERE tool_name = 'webhook_dispatch_target_binding' AND after_value = 'refused'
+ ORDER BY created_at DESC;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `webhook_dispatch_target_mismatch` | WARN | **vide** | chaque ligne est un pilote qu'un événement PR n'autorisait pas — et l'occurrence du 2026-10-02 rejouée |
+| `after_value = 'bound'` | audit | **non vide, faible** | **le contrôle positif** : M4 et les dispatchs liés traversent. Zéro des deux ne prouve rien (mika#2205). `lineage_term` dit **lequel** des quatre a tenu |
+| `webhook_dispatch_lineage_unreadable` | WARN | **vide** | erreur base : le prédicat refuse par fail-closed, donc la boucle est gelée sur ce chemin — c'est la **base** qu'il faut lire |
+| `webhook_dispatch_target_absent` | INFO | **non vide, faible** | un check-suite sur `main` : la branche ne porte aucun numéro, il n'y a rien à quoi borner. **Nominal** — nom distinct de l'illisible précisément parce que son régime attendu n'est pas vide (motif mika#2131) |
+| `webhook_dispatch_event_unreadable` | WARN | **vide** | un `[GitHub] PR …` dont la grammaire n'a pas parsé : le prédicat autorise sans avoir pu regarder, donc la grammaire a bougé sous le lecteur |
+| `webhook_dispatch_target_binding_audit_failed` | WARN | **vide** | le WARN est passé, l'audit non : le `GROUP BY` sous-compte à partir de là |
+
+### AC4 — le recensement, avec un verdict par outil
+
+Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
+`FALLTHROUGH_WITHHELD_TOOLS` (`["create_task"]`) **ne s'y applique pas** et
+`create_task` y est servi.
+
+| outil | servi ? | borné à la cible ? | verdict |
+|---|---|---|---|
+| `run_claude_pilot` | oui | **oui** | **fermé par cette PR** |
+| `run_claude_pilot_groom` | oui | **oui** | **fermé** — même site, même discriminant |
+| `create_task` | **oui** | oui, mais **transitivement suffisant** | **non fermé, et c'est raisonné** : une tâche créée sans dispatch ne lance aucun processus et ne consomme aucun créneau ; la fermer séparément demanderait la charge utile que R6 refuse, pour un dommage que le terme de lignée intercepte au seul endroit où il devient réel. `4df82c3a` existe encore et n'a rien coûté d'autre qu'une ligne |
+| `update_task_status` | oui | **non** | une transition d'état ne lance rien — et l'en priver **casserait M4**, dont l'étape 1 *est* un `update_task_status` sur le frère suivant |
+| `cancel_task` | oui | **OUI — et c'est le second cas mesuré** | **suivi nommé** : c'est lui qui a tué `8a3b2082` et jeté 71 tours (trace `8ec6364c-be71-11f1-908b-e931f18d2c16`). Son remède n'est pas un terme de cible mais un terme de **vivacité** (`live_pilot`, mika#2279) ; ce qui le sort d'ici est le rayon de souffle — un faux refus d'annulation retire à l'opérateur son geste de reprise le plus court — et le cinquième booléen sur `ToolContext` |
+| `promote_deferred_callback` | oui | oui | **suivi**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici |
+| `pr_merge_with_gate` | oui | non | sa cible **est** la PR, par la forme de son entrée |
+| `git_ops`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | ne touchent pas le plan de dispatch. `run_gh` porte déjà sa propre garde de création de travail (mika#2573), bornée au domaine Fallthrough |
+
+### Sondes post-déploiement, et leurs cinq haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** : après `make deploy`,
+> établir que le `mika-spirit` qui tourne porte le correctif avant toute conclusion
+> (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte — la base n'est
+> pas montée dans le bac à sable de dispatch.
+
+**S1 — le défaut fondateur ne se rejoue pas** (premier tour webhook PR qui tente).
+Attendu : une ligne `webhook_dispatch_target_mismatch`, une ligne d'audit `refused`,
+**aucune** ligne callback créée et **aucun** processus lancé.
+*Halte 1 — un dispatch hors lignée part quand même, la ligne absente :* **ne pas
+élargir le prédicat par réflexe.** Lire d'abord le contrôle positif (commande 3) :
+zéro ligne des deux côtés ne prouve rien — *une garde que personne n'a exercée se lit
+exactement comme une garde qui marche* (mika#2205). Établir ensuite **par quel
+appelant** le dispatch a passé : les trois chemins moteur (`verdict_handler`,
+`iterate_dispatch`, `task_engine::dispatcher`) passent `originating_message = None`
+et sont **hors population par conception** — c'est un **résultat**, pas un défaut du
+prédicat.
+
+**S2 — la cascade de jalon vit toujours (30 jours).** Au moins une ligne
+`after_value = 'bound'` dont le `lineage_term` vaut `sibling`, et aucun jalon arrêté.
+*Halte 2 — une cascade M4 est refusée :* c'est le faux positif le plus coûteux de ce
+travail, et il **arrête la boucle de jalon**. **Désarmer d'abord** (revert du terme),
+diagnostiquer ensuite : le champ `lineage_term` dit lequel des quatre a tenu quand ça
+marche, donc son absence dit lequel manquait — vérifier que le frère porte bien
+`claude_pilot.pr_url`. Un jalon gelé ne se règle pas en bougeant un seuil.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus sur un dispatch dont
+l'événement et la tâche portent la même cible.
+*Halte 3 — une occurrence :* L1 ne lit pas `reference_url` comme on croit (forme
+d'URL, `/issues/` contre `/pull/` — le prédicat est **strict sur le type**, à
+dessein). Réparer la lecture, **pas** élargir vers un appel réseau.
+
+**S4 — la traversée est lisible (7 jours).** `webhook_dispatch_lineage_unreadable`
+reste vide.
+*Halte 4 — non vide :* le fail-closed gèle le chemin LLM. Lire la base **avant** de
+retourner la disposition — l'inverser rouvrirait le constat.
+
+**S5 — la population hors périmètre (30 jours), et c'est la précondition d'AC2.**
+```sql
+-- Deux pilotes implement ont-ils coexisté depuis le déploiement ?
+SELECT t.id, t.parent_task_id, t.status, t.fired_at, t.process_id
+  FROM tasks t
+ WHERE t.trigger_type = 'callback'
+   AND COALESCE(t.dispatch_class,'implement') = 'implement'
+   AND t.fired_at > '<instant du déploiement>'
+ ORDER BY t.fired_at;
+```
+*Halte 5 — un recouvrement apparaît alors qu'aucun `webhook_dispatch_target_mismatch`
+n'est écrit :* le contournement de cap est **réel et d'une autre cause** que celle du
+constat. **Ne pas élargir cette garde** : c'est la mesure qui ouvre le suivi AC2,
+avec le `status` et le `fired_at` des lignes en cause — c'est-à-dire avec le fait que
+la lecture du code n'a **pas pu** établir depuis le bac à sable.
+
+**Halte transverse — les sondes muettes.** Zéro refus **et** zéro `bound` ne prouve
+rien : il faut qu'un tour webhook PR ait tenté un dispatch depuis le déploiement.
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne répare pas le cap implement**, et AC2 sort de cette PR avec sa précondition
+  écrite (S5). Le cap **est** vérifié au point de dispatch sur les quatre chemins, et
+  un bail atomique le double ; ce qui est faux est **ce que le cap compte** — des
+  **lignes** (`status IN ('pending','in_progress')`), pas des **processus**. Un pilote
+  vif dont la ligne callback est devenue terminale est invisible au cap. **Le
+  mécanisme réel du contournement n'est pas établissable depuis le bac à sable de
+  dispatch** : `~/.mika/data/mika.db` n'y est pas montée. *Un cap qu'on « répare »
+  sans avoir établi par où il a fui est un cap qu'on élargit au hasard sur un chemin
+  qui marche.* **Le p0 est fermé sans AC2** : le terme de lignée refuse le dispatch
+  mesuré **avant** que la question du cap se pose.
+- **Il ne ferme pas `cancel_task`** — le second cas de la même famille, 71 tours
+  jetés. Suivi nommé, précondition : aucune, le cas est mesuré ; ce qui le sort d'ici
+  est le rayon de souffle.
+- **Il ne rattrape pas l'incident du 2026-10-02.** `4df82c3a` et `f8f817ce` restent
+  ce qu'ils sont, et **rien ne rétro-estampille** : fabriquer une ligne d'audit datée
+  d'un refus qu'on n'a pas observé est l'inverse de ce que ce travail défend. La sonde
+  est la **prochaine** occurrence.
+- **Il ne touche pas le re-prompt « required tools »**, que le ticket désigne comme
+  déclencheur probable. Le modifier changerait le contrat de **tous** les tours
+  webhook pour un défaut dont la cause proximale est l'absence de borne, pas la
+  présence du re-prompt — et par
+  `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`, la moitié qui
+  tient est la garde, pas l'injonction.
+- **Il ne rend pas le modèle incapable de vouloir dispatcher** : il rend le dispatch
+  impossible. La doctrine maison est *construis l'incapacité, ne promets pas la
+  retenue* (mika#1991), et **elle est applicable ici** — il y a bien une capacité à
+  retirer, et c'est ce qui est retiré.
+- **Il rend le champ lisible, pas surveillé.** Les seuls instruments sont les greps et
+  les requêtes ci-dessus, et **leur silence ne prouve rien tant que personne ne les
+  exécute.**
+
+### Hors périmètre, délibérément
+
+- **Remettre `[GitHub] PR ` / `Check suite ` dans le domaine Fallthrough** — refusé
+  sur mesure : casserait M4.
+- **Les trois chemins moteur** (`verdict_handler`, `iterate_dispatch`,
+  `task_engine::dispatcher`) — inchangés, `originating_message = None`, hors
+  population.
+- **Le bail de créneau, le domaine Fallthrough, `FALLTHROUGH_WITHHELD_TOOLS`, la
+  garde d'intention mika#2484, la porte de siège mika#2084, l'allowlist de dépôts
+  mika#2046** — aucun octet touché. Aucune valeur de réglage déplacée (ni
+  `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT`, ni `DISPATCH_SLOT_LEASE_TTL_SECS`).
+- **Le résidu per-issue de mika#2155** (deux dispatch-lib vivants sur le **même**
+  ticket) — axe orthogonal : un dispatch sur le même ticket **passe** L1/L2 par
+  construction. Détail dans `crates/mika-agent/CLAUDE.md`.
+
+Raisonnement complet, les six rectifications et les deux scans structurels :
+`crates/mika-agent/CLAUDE.md` § *Un dispatch ouvert par un événement PR est borné à
+sa LIGNÉE*.
+
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
   ```bash

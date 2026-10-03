@@ -2920,6 +2920,261 @@ second lecteur ne rend aucune décision fausse *le jour où il est écrit*.
 Surfaces opérateur, régimes attendus et haltes : `CLAUDE.md` racine
 § *Un callout de corps sans preuve en base route vers `groom`*.
 
+### Un dispatch ouvert par un événement PR est borné à sa LIGNÉE (mika#2649)
+
+`validate_dispatch_readiness` gagne un septième terme : dans un tour dont
+l'`originating_message` est un `[GitHub] PR …` ou un `[GitHub] Check suite …`,
+`run_claude_pilot` / `run_claude_pilot_groom` n'est autorisé que pour une tâche
+**liée par lignée** à la cible de cet événement.
+
+**Le trou, et il était structurel.** La garde (0) ci-dessus juge la **nature** de
+l'événement source : les deux familles sortent du domaine Fallthrough parce que
+`self-dev-webhook-qa` / `-ci` y portent des dispatchs légitimes. Une fois sorties,
+**plus aucun terme ne liait le dispatch à la PR de l'événement.** Mesuré le
+2026-10-02 (trace `17ba765a-be9c-11f1-94aa-c13d0500c506`) : un tour ouvert par une
+revue QA sur la PR #2647 a lancé un implement de mika#2646 — un autre ticket, hors
+fenêtre `ready`, pendant qu'un implement de #2636 volait. Deux pilotes implement
+simultanés de 20:03:17Z à ~20:24Z.
+
+#### Six rectifications que la lecture du code impose, et elles sont le premier livrable
+
+**R1 — le cap implement EST vérifié au point de dispatch, sur les quatre chemins.**
+`validate_dispatch_readiness` porte la garde par classe (#583, #1001, mika#2160) et
+ses quatre appelants de production sont la frontière d'outil, le chemin ready-label,
+le tick moteur et le verdict handler ; `try_acquire_dispatch_slot` est le **dernier**
+terme de la même fonction et rend la revendication atomique (§ *The exec slot is
+CLAIMED, not checked*). Le `run_claude_pilot` du constat **a traversé cette garde**.
+Ce qui est faux n'est donc pas « le cap n'est pas vérifié » mais **ce que le cap
+compte** : `has_active_callback_tasks_excluding` filtre
+`t.status IN ('pending','in_progress')` — elle compte des **lignes**, et un pilote
+est un **processus**. Un pilote vif dont la ligne callback est devenue terminale
+(watchdog #959, supersession, `cancel_task`) est **invisible au cap**, ce qui est
+exactement la topologie que `live_pilot` (mika#2279) existe pour lire et que la
+garde du cap ne consulte pas. **Le mécanisme réel du contournement n'est pas
+établissable depuis le bac à sable de dispatch** (`~/.mika/data/mika.db` n'y est pas
+montée), donc l'AC2 du ticket sort de cette PR avec sa précondition écrite — la
+sonde S5 du `CLAUDE.md` racine.
+
+**R2 — AC1 seul referme l'occurrence mesurée, et c'est ce qui autorise le
+découpage.** L'événement portait sur #2647, le dispatch visait #2646 : sous le terme
+de lignée ce dispatch est refusé **avant** toute création de ligne callback et tout
+spawn, donc les deux pilotes ne coexistent jamais, **quoi qu'ait fait le cap**.
+*Un cap qu'on « répare » sans avoir établi par où il a fui est un cap qu'on élargit
+au hasard sur un chemin qui marche.*
+
+**R3 — les dispatchs CI-fix / QA-hold ne traversent pas la garde.** Ce sont des
+dispatchs **moteur**, et le commentaire est au site même
+(`server/verdict_handler.rs`) : *« `originating_message = None` because the dispatch
+is engine-authorized … Passing `None` skips guard (0) »*. `iterate_dispatch`
+(mika#2506) fait de même. Le contrôle positif que l'AC3 décrit est donc **hors de la
+population par construction** : il passe parce qu'il n'est pas interrogé — d'où le
+contrôle positif rectifié de R4.
+
+**R4 — la population légitime du chemin LLM n'est PAS vide, et elle dispatche un
+AUTRE ticket que la PR.** Le réflexe, une fois R3 lu, est de remettre
+`[GitHub] PR ` dans le domaine Fallthrough. **Ce serait casser un flux prescrit** :
+sur un `[GitHub] PR closed:`, la cascade de jalon M4 dispatche légitimement le
+**frère pending suivant** (`skills/bundled/self-dev-webhook-qa/system_prompt.md`,
+qui nomme même la garde en toutes lettres). **Donc le discriminant n'est pas
+l'identité de la cible mais la LIGNÉE** — ce que l'occurrence mesurée ne partage pas
+avec M4 :
+
+| | M4 légitime | le constat |
+|---|---|---|
+| action de l'événement | `PR closed:` (mergée) | `PR review (…)` soumise |
+| la tâche dispatchée | un **enfant pending préexistant** du parent jalon | une tâche **créée dans le tour même** |
+| son `parent_task_id` | le parent jalon, partagé avec la PR | aucun |
+| son `metadata` | porte la lignée du jalon | vide |
+
+**R5 — deux lecteurs uniques existent, et il y en a un TROISIÈME que le plan
+n'avait pas vu.** `deadline_verdict::parse_pr_target` est le lecteur unique de la
+grammaire PR (mika#2368) et `worktree_reaper::issue_number_from_branch` celui du
+numéro porté par une branche (mika#2619) — tous deux `pub`, tous deux **appelés**.
+Le plan décrivait en plus « une extraction de `(branch: …)` » comme si aucun lecteur
+n'existait : il en existe **deux** (`webhook_queue.rs` et `webhook_queue_v2.rs`, la
+seconde se déclarant doublon assumé). `webhook_event_target` appelle donc
+`webhook_queue_v2::classify_event` plutôt que d'en écrire une **troisième** copie —
+la classe mika#2158 évitée à son troisième tour. Mesure qui décide de la forme du
+prédicat check-suite : `parse_pr_target` rend **`None`** sur un texte check-suite
+(épinglé à `deadline_verdict.rs`), parce que cette grammaire porte une **branche**
+et pas un numéro de PR.
+
+**R6 — `ToolContext` porte un booléen, jamais `originating_message`.** `tools/mod.rs`
+(mika#2573) cite mika#2517 et tranche : ce qui traverse jusqu'aux outils est un
+**verdict** (`is_webhook_fallthrough_turn: bool`), pas une `&str` avec sa charge
+utile. Conséquence directe sur l'AC4 : `cancel_task`, `create_task` et
+`update_task_status` sont des outils ordinaires dont le `ToolContext` **ne porte pas
+la cible de l'événement**, donc les borner demanderait de filer une charge utile que
+la maison a refusée deux fois. `validate_dispatch_readiness`, lui, **reçoit déjà**
+`originating_message` **et** `tool_input` : AC1 est bon marché à ce site unique, et
+nulle part ailleurs. AC4 est donc livré comme ce qu'il demande — un **recensement
+avec un verdict par outil** (§ racine) — et non comme quatre gardes.
+
+#### Le prédicat : une moitié pure, une traversée bornée
+
+`webhook_dispatch::webhook_event_target(msg) -> WebhookEventTarget` est **pur**
+(aucun I/O) et rend quatre états : `Pr`, `Branch { issue: Option<u64> }`,
+`Unreadable` (préfixe présent, grammaire non parsée) et `NotApplicable` (hors
+population). **Quatre et non trois**, ce qui rectifie le § 3.1 du plan : son § 4
+énumérait quatre valeurs d'audit dont une pour le préfixe illisible, et les deux ne
+pouvaient pas être vraies ensemble.
+
+`skills::executor::evaluate_event_target_binding` fait la traversée, **quatre termes
+évalués du moins cher au plus cher, le premier qui tient autorise** :
+
+| # | terme | ce qu'il couvre |
+|---|---|---|
+| L1 | `task.reference_url` nomme la cible | la PR est elle-même la cible ; le cas `issue#N` d'un check-suite dont la branche porte `N` |
+| L2 | `task.metadata.claude_pilot.pr_url` nomme la PR | la tâche **est** celle dont le dispatch a produit cette PR |
+| L3 | un **frère** (même `parent_task_id` non nul) satisfait L1 ou L2 | **la cascade M4** |
+| L4 | le **parent** satisfait L1 ou L2 | une re-tentative sous le parent jalon |
+
+Le nominal (L1 ou L2 sur la tâche) ne coûte **aucune requête de plus** ; sans
+`parent_task_id` — la forme exacte de la tâche du constat — le refus tombe sans
+requête. L2 appelle `extract_pr_url`, qui existe déjà dans ce fichier et lit les deux
+formes (imbriquée et à plat), donc rien n'est rendu `pub` et aucun troisième lecteur
+n'est écrit.
+
+**L1 est strict sur le TYPE de référence**, et c'est une décision : un événement PR
+se compare à une `reference_url` de **pull request**, un check-suite à une
+`reference_url` d'**issue**. Un numéro de PR et un numéro d'issue vivent dans le
+même espace de numérotation GitHub mais désignent deux objets différents ; les
+apparier serait une **coïncidence de numéro**, pas une lignée. Le cas réellement
+fréquent — tâche sur `issues/2641`, événement sur la PR `pull/2647` — est couvert par
+L2.
+
+**Aucun appel réseau.** Résoudre `gh pr view --json closingIssuesReferences` pour
+trancher « le ticket fermé par cette PR » est **refusé** : ce serait un aller-retour
+GitHub de plus dans une fonction qui en fait déjà plusieurs à 10 s de timeout, sur un
+chemin qui spawne un processus, et le lien est **déjà porté en base** par L2 —
+`claude_pilot.pr_url` est estampillé par le producteur du dispatch. Doctrine maison :
+*la cible est dite, jamais dérivée* (mika#2249, mika#2368).
+
+#### Trois dispositions de fail-safe, et elles ne sont pas uniformes à dessein
+
+1. **Cible d'événement illisible** ⇒ **autorise**. Il n'existe aucune cible à
+   laquelle borner ; refuser serait refuser sur l'absence de question.
+2. **Un terme de lignée illisible** (metadata absente, JSON non conforme,
+   `reference_url` nulle) ⇒ ce terme **n'est pas satisfait**, les autres continuent
+   d'être évalués. Doctrine `live_pilot` à la lettre — *un signal qu'on ne peut pas
+   lire n'est jamais un terme satisfait* — et **c'est porteur ici** : la tâche du
+   constat avait une metadata **vide**, donc « metadata absente ⇒ autorise » aurait
+   autorisé l'occurrence mesurée.
+3. **La question ne peut pas être posée du tout** (erreur base) ⇒ **refuse**, par
+   cohérence avec la garde voisine `dispatch_check_failed` de la **même fonction**
+   (*« Fail-closed: if we can't check global state, reject dispatch »*). Deux gardes
+   d'une même fonction qui divergeraient sur l'erreur base seraient une dette de
+   lecture.
+
+**L'asymétrie de coût qui autorise le point 3, nommée :** un faux refus coûte un
+dispatch — visible, nommé, écrit dans `tasks.result` par
+`record_dispatch_rejection`, et re-drivé par le réconciliateur stuck-ready ; un faux
+passage lance un pilote sur un ticket que personne n'a autorisé, brûle un créneau et
+~20 min de travail. C'est l'**inverse** de l'arbitrage du faucheur mika#2420, et
+l'arbitrage ne se transporte pas.
+
+#### Placement, et il est le livrable autant que le prédicat
+
+Dans `validate_dispatch_readiness`, **après** le fetch de la tâche (le prédicat en a
+besoin) et **avant** les allers-retours GitHub de la porte de siège — donc avant tout
+coût réseau — et **bien avant** la garde par classe, dont l'enqueue de callback
+différé (mika#1011) ré-armerait et re-refuserait le refus à chaque replay, la raison
+que ses deux voisines ont déjà dû écrire. Pré-hoc et non post-hoc, pour la raison de
+mika#1646 : `run_claude_pilot` spawne un processus et crée un worktree, donc une
+garde qui ne tire qu'après l'exécution **constate** la violation sans l'empêcher.
+
+**Ne mord que sur les deux skills de pilote** (`PILOT_DISPATCH_SKILLS`, constante
+nommée plutôt qu'un `matches!` au site d'appel) : `deploy_mika` atteint cette
+fonction lui aussi et reste hors population — ce que la garde borne est le lancement
+d'un **pilote**, pas tout travail long.
+
+#### Surfaces, et un seul `tool_name`
+
+Cinq noms d'événement de journal, chacun **au niveau de son régime attendu** — un
+WARN sur une population nominale est un WARN qu'on finit par museler :
+`webhook_dispatch_target_mismatch` (WARN, le refus), `webhook_dispatch_target_bound`
+(INFO, le contrôle positif), `webhook_dispatch_lineage_unreadable` (WARN, le
+fail-closed), `webhook_dispatch_event_unreadable` (WARN, grammaire bougée),
+`webhook_dispatch_target_absent` (INFO, un check-suite sur `main` — **régime attendu
+non vide**, et c'est pourquoi il a un nom à lui et pas celui de l'illisible ; motif
+`below_threshold` / `no_ready_label_event`, mika#2131).
+
+Un seul `tool_name` d'audit, `webhook_dispatch_target_binding`, la décision dans
+`after_value` ∈ `{bound, refused, event_unreadable, no_target_in_event,
+lineage_unreadable}` — motif `ready_label_outcome` (mika#2323), parce que les cinq
+issues appartiennent au **même site** et à la **même population**, donc un
+`GROUP BY after_value` les sépare et les rend soustractibles. **SOLE WRITER**,
+épinglé par `canonical_tokens::tests::mika2649_le_nom_daudit_a_un_seul_ecrivain`,
+allowlist livrée vide.
+
+**Ce scan compare le littéral EXACTEMENT, et pas en sous-chaîne comme ses voisins —
+fait mesuré en l'écrivant.** Le nom du résidu de cette famille est, par construction,
+`<nom d'audit>_audit_failed`, donc le nom d'audit en est le **préfixe** : une
+comparaison par sous-chaîne compterait ce résidu comme un second écrivain. Les scans
+voisins (mika#2573 et ses semblables) emploient la sous-chaîne et sont verts **par
+troncature accidentelle** de `production_sources`, pas par prédicat —
+`builtin_handlers.rs:3105` porte bien `fallthrough_work_creation_audit_failed`, mais
+ce fichier est tronqué à son `cfg(test)` de la ligne ~674. Leur réparation est un
+changement de **leur** périmètre ; ce qui est à retenir est que la sous-chaîne n'est
+pas le prédicat de référence de cette famille, c'est son accident.
+
+#### Le recensement des lecteurs de grammaire, et la rectification de sa Fire-Disposition
+
+`canonical_tokens::tests::mika2649_aucun_second_parseur_de_grammaire_devenement`
+part de la **forme du parseur** (un `Regex::new(` dont un littéral porte `[GitHub]`)
+et confronte sa population à `EVENT_GRAMMAR_PARSER_SITES` **dans les deux sens** —
+un porteur hors recensement rougit, et une entrée dont le fichier ne porte plus de
+regex rougit aussi, parce qu'un recensement qui survit à son site est un tiroir qui
+se lit comme une couverture. Plus trois assertions auto-nettoyantes sur les trois
+lecteurs que ce travail **appelle**.
+
+**La Fire-Disposition du plan annonçait une allowlist livrée VIDE, et la mesure la
+réfute :** cinq regex `^\[GitHub\]` sur trois fichiers, dont `CHECK_SUITE_RE` en
+**double**. Une allowlist vide aurait rendu ce scan **rouge à la naissance** — et un
+lint rouge à la naissance se fait désarmer. C'est donc un **recensement**, pas une
+allowlist d'exemptions : la distinction que mika#2633 a déjà dû écrire — *on y
+ajoute quand un nouveau lecteur est justifié, on n'y exempte pas un doublon*. Le
+doublon existant y est **nommé**, précisément pour qu'un futur éditeur l'apprenne
+avant d'en écrire un troisième.
+
+**Effet collatéral mesuré :** les deux littéraux de préfixe ont désormais un site de
+définition unique (`PR_EVENT_PREFIX`, `CHECK_SUITE_EVENT_PREFIX`), lu par les deux
+faces de la même frontière — `is_webhook_fallthrough_domain`, qui sort la famille du
+domaine, et `webhook_event_target`, qui l'y retrouve pour la borner. Ils sont
+déclarés **en tête de module** et pas près de leur second lecteur, parce que
+`production_sources` tronque au premier marqueur `cfg(test)` **commentaires compris**
+et que `mika2517_the_fallthrough_domain_has_a_single_definition` les y confronte :
+déclarés plus bas, ce scan devenait vert par troncature, et son anti-vacuité l'a dit
+en rougissant.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne répare pas le cap** (R1). Il rend le dispatch hors lignée impossible sur le
+  chemin mesuré ; un contournement de cap par une autre cause reste ouvert, et la
+  sonde S5 est ce qui le dimensionne.
+- **Il ne ferme pas `cancel_task` sur un pilote vif depuis un tour webhook** — le
+  second cas de la même famille, mesuré le même jour (71 tours jetés sur `8a3b2082`).
+  Son remède n'est pas un terme de cible mais un terme de **vivacité**, et son rayon
+  de souffle est distinct : un faux refus d'annulation retire à l'opérateur son geste
+  de reprise le plus court. Suivi nommé.
+- **Il ne réduit PAS le résidu per-issue de mika#2155**, et il faut le dire parce que
+  le voisinage invite à le croire : ce résidu est *deux dispatch-lib vivants sur le
+  **même** ticket*, dont le premier sortant strippe le seat label du second. Un
+  dispatch sur le même ticket **passe** L1/L2 par construction. Les deux termes sont
+  sur des axes orthogonaux — `live_pilot_for_issue` répond *un pilote travaille-t-il
+  sur ce ticket ?*, celui-ci répond *cet événement autorise-t-il un dispatch sur ce
+  ticket ?* — et seul le premier adresse ce résidu.
+- **Un tour webhook servi en mode silencieux échapperait à la garde** — borne héritée
+  de mika#2517 / mika#2573, ni élargie ni modifiée, population mesurée vide (un tour
+  silencieux a `originating_message = None`).
+- **La détection de l'erreur base (disposition 3) n'est pas couverte par un test de
+  bout en bout**, seulement sa **disposition** : `get_child_tasks` et `get_task`
+  n'échouent pas sur une base en mémoire saine. Dit plutôt que découvert.
+
+Surfaces opérateur, régimes attendus, recensement AC4 et les cinq haltes :
+`CLAUDE.md` racine § *Un dispatch ouvert par un événement PR est borné à la lignée de
+cet événement*.
+
 **Cancel discriminator protocol (#749):** When `cancel_task_and_kill` terminates a long-running subprocess, it pre-writes a reason file at `/tmp/mika-cancel-reason-{pid}` with `STATUS=CANCELLED_BY_OPERATOR` before sending SIGTERM. The shell-side TERM trap in `dispatch-lib.sh` writes `STATUS=CANCELLED_BY_SIGNAL` only if no reason file exists (belt-and-suspenders for signal-initiated cancels). The EXIT trap reads the reason file and prefixes the callback envelope so the consumer (`self-dev-callback`) can distinguish cancel from crash. Two discriminators: `CANCELLED_BY_OPERATOR` (cancel_task initiated) and `CANCELLED_BY_SIGNAL` (signal-initiated, no pre-write). Absence of the prefix = existing `HANDLER CRASH` / success paths fire unchanged (backward compatible).
 
 ### Platform-root relay, and the name it translates (mika#2536)
@@ -3653,7 +3908,7 @@ indicator.
 
 **The seat vocabulary is written twice and guarded (mika#2092).** `KNOWN_DISPATCH_SEATS` (`webhook_dispatch.rs`) and the `dispatch:*` entries of `.github/labels.yml` are one list in two files, and they must move in the same commit. An undeclared seat is not merely undocumented: label-sync runs with `delete-other-labels: true`, so it is a label GitHub deletes from the repo and from every issue carrying it, without an `unlabeled` event — after which `classify_dispatch_seat` reads `NoSeatLabel` everywhere and the gate refuses nothing, silently. That happened on 2026-08-30 at 09:12:51Z, an hour before mika#2084 shipped, and it is why `dispatch:loop` — the label making `SeatVerdict::OwnedByCurrentSeat` reachable at all — did not exist until mika#2092. `scripts/check-dispatch-seats-declared.sh` now compares the two lists **both ways** (an orphan label resolves to `Unresolvable` and refuses the ticket, which is the mirror failure) and fails CI via the `dispatch-seats-lint` job; `scripts/test-check-dispatch-seats-declared.sh` pins its negative behaviour. `dispatch:zorglub`, the unknown-seat test fixture below, must stay undeclared.
 
-**The seat vocabulary is written a third time, and the loop now says its own name (mika#2155).** `skills/bundled/_shared/dispatch-lib.sh` writes the literal `dispatch:loop` — `_stamp_issue_seat` adds it to the issue when dispatch-lib takes the ticket (after the #2012 groom gate, before `git fetch origin main`, from the `LABELS` snapshot dispatch-lib fetched for its own gate — a read **later** than the engine's Rust one, so a `dispatch:*` posed between the two shows up as `owned_by_other` and is logged, never overwritten), and `_release_issue_seat` removes it **before** `mika ask --task-complete` in `_deliver_callback` — the message that lets mika-dev start the next dispatch on the ticket — with a second call at the head of the EXIT trap as the crash/cancel backstop (the first successful release lowers `ISSUE_SEAT_CLAIMED`, so the second is a no-op). Releasing only at exit would let the next dispatch read a label its predecessor is about to remove, skip its own stamp (`already_owned`), and run unclaimed for its whole life. Before that, the gate was one-directional: the loop refused a ticket claimed by ssc/mpc, but a human seat had no structural way to see the loop had taken theirs. The shell copy is a literal, not `dispatch:${SEAT}`, so rule L5 of `scripts/check-canonical-tokens.sh` confronts it with `labels.yml`; Rust↔YAML stays guarded by `check-dispatch-seats-declared.sh`. Two labels, two lifetimes: `origin:loop` on the PR answers *who produced this artefact* and is permanent (mika#2026); `dispatch:loop` on the issue answers *who is writing on this branch right now* and lives exactly as long as the dispatch. The stamp never writes over another `dispatch:*` (the refusal stays the engine's job — no second classifier in shell) and never blocks a dispatch when GitHub refuses it. A `dispatch:loop` seen with no live dispatch is the residue of a run killed without its trap; the next dispatch on that ticket reads it `already_owned` and releases it on its own exit. **Named residue, not closed here:** two dispatch-lib runs genuinely live on the same ticket at once (the exec-slot lease is keyed per `(agent_id, dispatch_class)`, not per issue; the ready-label path refuses that via `live_pilot_for_issue`, the other `validate_dispatch_readiness` callers do not) would still see the first exit strip the label from under the second — incidence unmeasured; wake condition: a `dispatch_seat.already_owned` in a dispatch trace while `tasks` shows another live dispatch on the same `repo#N`. `test_stamp_issue_seat.sh` pins the site order and the four no-write populations.
+**The seat vocabulary is written a third time, and the loop now says its own name (mika#2155).** `skills/bundled/_shared/dispatch-lib.sh` writes the literal `dispatch:loop` — `_stamp_issue_seat` adds it to the issue when dispatch-lib takes the ticket (after the #2012 groom gate, before `git fetch origin main`, from the `LABELS` snapshot dispatch-lib fetched for its own gate — a read **later** than the engine's Rust one, so a `dispatch:*` posed between the two shows up as `owned_by_other` and is logged, never overwritten), and `_release_issue_seat` removes it **before** `mika ask --task-complete` in `_deliver_callback` — the message that lets mika-dev start the next dispatch on the ticket — with a second call at the head of the EXIT trap as the crash/cancel backstop (the first successful release lowers `ISSUE_SEAT_CLAIMED`, so the second is a no-op). Releasing only at exit would let the next dispatch read a label its predecessor is about to remove, skip its own stamp (`already_owned`), and run unclaimed for its whole life. Before that, the gate was one-directional: the loop refused a ticket claimed by ssc/mpc, but a human seat had no structural way to see the loop had taken theirs. The shell copy is a literal, not `dispatch:${SEAT}`, so rule L5 of `scripts/check-canonical-tokens.sh` confronts it with `labels.yml`; Rust↔YAML stays guarded by `check-dispatch-seats-declared.sh`. Two labels, two lifetimes: `origin:loop` on the PR answers *who produced this artefact* and is permanent (mika#2026); `dispatch:loop` on the issue answers *who is writing on this branch right now* and lives exactly as long as the dispatch. The stamp never writes over another `dispatch:*` (the refusal stays the engine's job — no second classifier in shell) and never blocks a dispatch when GitHub refuses it. A `dispatch:loop` seen with no live dispatch is the residue of a run killed without its trap; the next dispatch on that ticket reads it `already_owned` and releases it on its own exit. **Named residue, not closed here:** two dispatch-lib runs genuinely live on the same ticket at once (the exec-slot lease is keyed per `(agent_id, dispatch_class)`, not per issue; the ready-label path refuses that via `live_pilot_for_issue`, the other `validate_dispatch_readiness` callers do not) would still see the first exit strip the label from under the second — incidence unmeasured; wake condition: a `dispatch_seat.already_owned` in a dispatch trace while `tasks` shows another live dispatch on the same `repo#N`. `test_stamp_issue_seat.sh` pins the site order and the four no-write populations. **mika#2649 does NOT narrow that residue, and the neighbourhood invites believing it does:** its lineage term refuses a dispatch for a ticket **other** than the event's target, so a second dispatch on the **same** ticket passes L1/L2 by construction. The two terms are orthogonal — `live_pilot_for_issue` answers *is a pilot working on this ticket?*, the lineage term answers *does this event authorize a dispatch for this ticket?* — and only the first addresses this residue.
 
 **The exec slot is CLAIMED, not checked.** `has_active_callback_tasks_excluding` is a bare SELECT: on `None` the dispatch path proceeds, and the callback row that makes the slot observably held is written much later by the caller. In between, `validate_dispatch_readiness` performs several GitHub round-trips (issue body, open-PR, grooming markers — 10s timeout each), and four production callers enter it (`ready_label_handler`, the tool boundary, `task_engine::dispatcher`, `verdict_handler`). Two dispatchers could therefore both read "free" and both proceed — the 2026-08-30 shape, where a second writer landed on a branch SSC already had a PR open on. A slot two claimants can simultaneously believe they hold is not arbitration, it is a convention. `dispatch_slot_leases` (PRIMARY KEY `(agent_id, dispatch_class)`) makes the claim a fact: `try_acquire_dispatch_slot()` runs one `INSERT … ON CONFLICT … WHERE expired OR same-holder` inside an IMMEDIATE transaction, so the second claimant's INSERT collides rather than races. The claim is the **LAST** gate in `validate_dispatch_readiness`, on purpose — no fallible step follows it, which is why no error path needs to release a lease. Refusal is `dispatch_slot_contended`, registers a deferred wrapper like any other rejection, and writes an audit event naming the holder. The lease TTL (`DISPATCH_SLOT_LEASE_TTL_SECS`, 120s, override `MIKA_DISPATCH_SLOT_LEASE_TTL_SECS`) is what keeps fail-closed from becoming loop-breaking: it must exceed the window it guards (validation done → callback row exists, i.e. a process spawn) and stay far below a real dispatch's duration, so a dispatcher that dies mid-claim stalls its class for one TTL rather than forever.
 
