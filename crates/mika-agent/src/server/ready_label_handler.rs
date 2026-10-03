@@ -924,6 +924,14 @@ where
     } = crate::live_pilot::live_pilot_for_issue(db, &issue_url).await
     {
         let owner_repo = location.owner_repo();
+        // `parent_task_id` est `Option` depuis mika#2653 : le second producteur
+        // de ce verdict peut être appelé sur une ligne callback sans parent, et
+        // un champ qui s'inventerait un parent serait un champ qui affirme une
+        // relation inexistante (classe mika#2304). Sur CE chemin il est toujours
+        // `Some` — l'enfant a été atteint *par* son parent — donc la dégradation
+        // ne se voit pas ici ; elle est **posée** au motif `repo=unknown`
+        // (mika#2496) plutôt que laissée au rendu par défaut d'un `Option`.
+        let parent_task_id = parent_task_id.as_deref().unwrap_or("unknown");
         // INFO, not WARN: a `ready` event arriving on a ticket already in flight
         // is a nominal consequence of how the feeder and the webhook path
         // compose. What would be anomalous is a sustained stream of these on one

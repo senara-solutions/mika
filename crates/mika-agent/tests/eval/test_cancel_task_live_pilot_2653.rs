@@ -49,38 +49,83 @@ const PR_REVIEW_MSG: &str = "[GitHub] PR review (changes_requested) on senara-so
 const OPERATOR_MSG: &str = "annule la tâche de dispatch, elle a l'air perdue";
 
 /// Un pilote **réellement vif**, et c'est un processus enfant — jamais le
-/// nôtre.
+/// nôtre — nettoyé par RAII.
 ///
-/// `live_pilot.rs` emploie `std::process::id()` pour ses propres unités, et ça
-/// y est sans danger : aucun de ses tests n'atteint le chemin de kill. Ici le
-/// contrôle négatif V6b **traverse** `cancel_task_and_kill` par conception, qui
-/// envoie un SIGTERM au **groupe de processus** du pgid enregistré. Avec notre
-/// propre pid, ce groupe est celui du binaire de test : le contrôle négatif
-/// tuerait la campagne qui l'exécute, de façon dépendante de l'environnement.
-/// Un `sleep` enfant est donc la seule forme sûre — motif
-/// `process_kill.rs::spawn_test_child`.
+/// # Pourquoi pas `std::process::id()`
+///
+/// `live_pilot.rs` l'emploie pour ses propres unités, et ça y est sans danger :
+/// aucune n'atteint le chemin de kill. Ici le contrôle négatif V6b **traverse**
+/// `cancel_task_and_kill` par conception, qui envoie un SIGTERM au **groupe de
+/// processus** du pgid enregistré. Avec notre propre pid, ce groupe est celui du
+/// binaire de test : le contrôle négatif tuerait la campagne qui l'exécute, de
+/// façon dépendante de l'environnement.
+///
+/// # Pourquoi `process_group(0)` et pourquoi `Drop`
+///
+/// `process_group(0)` fait de l'enfant son **propre** chef de groupe, donc le
+/// pgid enregistré en base en est un véritable et le `kill(-pid)` de
+/// `kill_process_gracefully` l'atteint sans retomber sur son repli monoprocessus
+/// — motif du frère `test_ready_label_live_pilot_noop_2279.rs`.
+///
+/// Le `Drop` est ce que `std::mem::forget` + un appel de nettoyage en dernière
+/// ligne n'offrent pas : **deux** des quatre cas de ce fichier sont des refus,
+/// donc rien d'autre ne signale l'enfant, et une assertion qui panique y
+/// abandonnerait un `sleep 120` pour deux minutes. Il `waitpid` aussi, faute de
+/// quoi chaque enfant tué reste un zombie pour la vie du binaire de test.
 #[cfg(target_os = "linux")]
-fn spawn_live_pilot() -> (i64, u64) {
-    let child = std::process::Command::new("sleep")
-        .arg("120")
-        .spawn()
-        .expect("spawn sleep child");
-    let pid = child.id();
-    let st = mika_agent::task_engine::process_liveness::read_process_start_time(pid)
-        .expect("read child start time");
-    // On ne veut pas que Rust attende à la destruction : le test est
-    // responsable du nettoyage, ou le chemin de kill le fait pour lui.
-    std::mem::forget(child);
-    (i64::from(pid), st)
+struct LivePilotChild {
+    child: std::process::Child,
+    pid: i64,
+    start_time: u64,
 }
 
-/// Nettoyage au mieux d'un enfant de test qui a survécu à son scénario.
 #[cfg(target_os = "linux")]
-fn cleanup_pid(pid: i64) {
-    let _ = std::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .output();
+impl LivePilotChild {
+    fn spawn() -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sleep")
+            .arg("120")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id();
+        let start_time = mika_agent::task_engine::process_liveness::read_process_start_time(pid)
+            .expect("read child start time");
+        Self {
+            child,
+            pid: i64::from(pid),
+            start_time,
+        }
+    }
+
+    /// Le couple `(pgid, process_start_time)` tel que l'exécuteur l'enregistre.
+    fn pgid_and_start(&self) -> (i64, u64) {
+        (self.pid, self.start_time)
+    }
+
+    fn is_alive(&self) -> bool {
+        mika_agent::task_engine::process_liveness::is_same_process_alive(
+            u32::try_from(self.pid).expect("pid fits in u32"),
+            self.start_time,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LivePilotChild {
+    fn drop(&mut self) {
+        // Le groupe d'abord (l'enfant en est le chef), puis le processus seul —
+        // même ordre et même raison que `kill_process_gracefully`.
+        for target in [format!("-{}", self.pid), self.pid.to_string()] {
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(target)
+                .output();
+        }
+        // Et on le moissonne : sans ça, un enfant tué reste un zombie jusqu'à la
+        // fin du binaire de test.
+        let _ = self.child.wait();
+    }
 }
 
 /// Une ligne callback de dispatch, telle que l'exécuteur l'écrit : c'est elle
@@ -192,7 +237,8 @@ async fn guard_rows(harness: &EvalHarness) -> Vec<Option<String>> {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn mika2653_un_tour_webhook_pr_nannule_pas_un_pilote_vif() {
-    let (pid, st) = spawn_live_pilot();
+    let pilot = LivePilotChild::spawn();
+    let (pid, st) = pilot.pgid_and_start();
     let (harness, task_id, output) = run_on_seeded(PR_REVIEW_MSG, Some((pid, Some(st)))).await;
 
     assert!(
@@ -223,10 +269,7 @@ async fn mika2653_un_tour_webhook_pr_nannule_pas_un_pilote_vif() {
     // trivial, et c'est pourtant le seul contrôle qui dise que le travail
     // survit, puisque c'est le travail que le défaut détruisait.
     assert!(
-        mika_agent::task_engine::process_liveness::is_same_process_alive(
-            u32::try_from(pid).unwrap(),
-            st
-        ),
+        pilot.is_alive(),
         "le pilote a été signalé : la garde a laissé passer le kill"
     );
 
@@ -237,8 +280,6 @@ async fn mika2653_un_tour_webhook_pr_nannule_pas_un_pilote_vif() {
         "exactement une ligne d'audit, portant la valeur du format de fil sur \
          laquelle l'opérateur groupe"
     );
-
-    cleanup_pid(pid);
 }
 
 // -------------------------------------------------------------------------
@@ -253,9 +294,10 @@ async fn mika2653_un_tour_webhook_pr_nannule_pas_un_pilote_vif() {
 #[cfg(target_os = "linux")]
 async fn mika2653_un_tour_de_conversation_annule_comme_avant() {
     // Ce contrôle traverse `cancel_task_and_kill` par conception — c'est très
-    // exactement ce qu'il atteste — donc le pilote est un enfant, et son kill
-    // est l'issue nominale du scénario.
-    let (pid, st) = spawn_live_pilot();
+    // exactement ce qu'il atteste — donc le pilote est un enfant dans son
+    // propre groupe, et son kill est l'issue nominale du scénario.
+    let pilot = LivePilotChild::spawn();
+    let (pid, st) = pilot.pgid_and_start();
     let (harness, task_id, output) = run_on_seeded(OPERATOR_MSG, Some((pid, Some(st)))).await;
 
     assert!(
@@ -282,8 +324,6 @@ async fn mika2653_un_tour_de_conversation_annule_comme_avant() {
         "hors population : aucune ligne d'audit — ce serait l'essentiel du trafic, \
          soit très exactement le churn que la doctrine mika#2131 borne"
     );
-
-    cleanup_pid(pid);
 }
 
 // -------------------------------------------------------------------------
@@ -333,7 +373,8 @@ async fn mika2653_un_tour_webhook_pr_sans_pilote_annule_et_le_dit() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn mika2653_un_signal_illisible_refuse_sur_un_tour_webhook_pr() {
-    let (pid, _) = spawn_live_pilot();
+    let pilot = LivePilotChild::spawn();
+    let (pid, _) = pilot.pgid_and_start();
     let (harness, task_id, output) = run_on_seeded(PR_REVIEW_MSG, Some((pid, None))).await;
 
     assert!(
@@ -358,6 +399,4 @@ async fn mika2653_un_signal_illisible_refuse_sur_un_tour_webhook_pr() {
          opposés — « l'instance n'est pas prouvable » contre « la base ne répond \
          pas »"
     );
-
-    cleanup_pid(pid);
 }

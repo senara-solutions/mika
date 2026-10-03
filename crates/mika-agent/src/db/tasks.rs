@@ -2146,6 +2146,37 @@ impl Database {
         }
     }
 
+    /// The same rule as [`Self::parse_process_start_time`], read out of a task's
+    /// **`metadata` JSON blob** rather than out of a column the two
+    /// dispatch-child queries selected (mika#2653).
+    ///
+    /// Both shapes are accepted here too, and that is the whole reason this
+    /// exists rather than a fourth inline `serde_json` chain: the reader above
+    /// tolerates the integer form, so a caller that hand-rolled
+    /// `.as_str()?.parse()` would answer **differently about the same row** —
+    /// which is exactly what `live_pilot_for_task` was doing between its two
+    /// handles, one going through the column reader and the other through its
+    /// own chain. *A rule written twice is a rule that can disagree with
+    /// itself*, and here it did, inside one function.
+    ///
+    /// `None` carries the same meaning as above: never "dead", never "alive",
+    /// only *the pair that identifies a process instance is incomplete*.
+    ///
+    /// **Three inline copies of the string-only form remain** — `process_kill.rs`'s
+    /// named-row branch and the two sites in `task_engine/engine.rs`. Routing
+    /// them here would *widen* their populations (they would start accepting the
+    /// integer form, and for the kill path that means attempting a signal on a
+    /// row it declines today), which is a behaviour change on the kill path and
+    /// belongs to its own ticket. Named rather than silently inherited.
+    pub(crate) fn process_start_time_from_metadata(metadata: Option<&str>) -> Option<u64> {
+        let parsed = serde_json::from_str::<serde_json::Value>(metadata?).ok()?;
+        match parsed.get("process_start_time")? {
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            serde_json::Value::Number(n) => n.as_u64(),
+            _ => None,
+        }
+    }
+
     /// The dispatch children of a tracking row that carry a `process_id`.
     ///
     /// Companion to [`Self::find_phantom_tracking_tasks`] (mika#2156), placed

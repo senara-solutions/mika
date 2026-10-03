@@ -1378,12 +1378,24 @@ mod tests {
     /// mika#2201).
     const LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
 
-    /// Le prédicat du scan, extrait pour que son **contrôle de bonne foi**
-    /// l'exerce plutôt qu'une copie qui peut en diverger (mika#2634 phase B).
+    /// Le prédicat des scans SOLE WRITER de cette famille, extrait pour que
+    /// leur **contrôle de bonne foi** l'exerce plutôt qu'une copie qui peut en
+    /// diverger (mika#2634 phase B ; partagé avec mika#2653).
     ///
-    /// Comparaison **exacte** sur le littéral entier : voir le doc-comment du
-    /// scan pour la mesure qui l'impose.
-    fn launcher_health_literal_present(content: &str, needle: &str) -> bool {
+    /// Comparaison **exacte** sur le littéral entier : voir le doc-comment de
+    /// `mika2634_the_launcher_health_name_has_a_single_writer` pour la mesure
+    /// qui l'impose — les noms d'événement de journal de cette famille sont
+    /// construits en **préfixant** le nom d'audit, donc une comparaison par
+    /// sous-chaîne compte une ligne de journal comme un second écrivain.
+    ///
+    /// **Nom neutre, et un seul corps.** Il s'appelait
+    /// `launcher_health_literal_present` jusqu'à mika#2653, qui en a d'abord
+    /// écrit une copie octet pour octet quinze lignes plus bas : trois sites
+    /// portaient alors deux orthographes d'un même prédicat (la troisième,
+    /// inline dans le jumeau mika#2649, compare `lit` sans `trim`). Un prédicat
+    /// recopié est un prédicat qui peut diverger de son propre contrôle de bonne
+    /// foi, ce qui est la seule chose que ce contrôle existe pour empêcher.
+    fn audit_name_literal_present(content: &str, needle: &str) -> bool {
         content
             .lines()
             .filter(|l| {
@@ -1410,7 +1422,7 @@ mod tests {
         let needle = format!("pilot_launcher{}", "_health");
 
         assert!(
-            launcher_health_literal_present(
+            audit_name_literal_present(
                 &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
                 &needle
             ),
@@ -1430,7 +1442,7 @@ mod tests {
             "        warn!(event = \"pilot_launcher_dead_audit_failed\");".to_string(),
         ] {
             assert!(
-                !launcher_health_literal_present(&benign, &needle),
+                !audit_name_literal_present(&benign, &needle),
                 "faux positif du scan sur une ligne qui n'écrit pas la ligne \
                  d'audit : {benign}"
             );
@@ -1478,7 +1490,7 @@ mod tests {
             if LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
-            if launcher_health_literal_present(&content, &needle) {
+            if audit_name_literal_present(&content, &needle) {
                 writers.push(rel);
             }
         }
@@ -1525,21 +1537,6 @@ mod tests {
     /// l'allowliste pas (doctrine mika#2201).
     const CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
 
-    /// Le prédicat du scan, extrait pour que son **contrôle de bonne foi**
-    /// l'exerce plutôt qu'une copie qui peut en diverger.
-    ///
-    /// Comparaison **exacte** sur le littéral entier : voir le doc-comment du
-    /// scan pour la mesure qui l'impose.
-    fn cancel_pilot_guard_literal_present(content: &str, needle: &str) -> bool {
-        content
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
-            })
-            .any(|line| string_literals(line).iter().any(|lit| lit.trim() == needle))
-    }
-
     /// **Contrôle de bonne foi du scan ci-dessous, et il est dû.**
     ///
     /// Le prédicat est **exact** plutôt qu'en sous-chaîne, et un prédicat
@@ -1556,7 +1553,7 @@ mod tests {
         let needle = format!("cancel_task{}", "_pilot_guard");
 
         assert!(
-            cancel_pilot_guard_literal_present(
+            audit_name_literal_present(
                 &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
                 &needle
             ),
@@ -1576,7 +1573,7 @@ mod tests {
             "        warn!(event = \"cancel_task_live_pilot_blocked\");".to_string(),
         ] {
             assert!(
-                !cancel_pilot_guard_literal_present(&benign, &needle),
+                !audit_name_literal_present(&benign, &needle),
                 "faux positif du scan sur une ligne qui n'écrit pas la ligne \
                  d'audit : {benign}"
             );
@@ -1616,7 +1613,7 @@ mod tests {
             if CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
-            if cancel_pilot_guard_literal_present(&content, &needle) {
+            if audit_name_literal_present(&content, &needle) {
                 writers.push(rel);
             }
         }
@@ -1641,24 +1638,29 @@ mod tests {
         );
     }
 
-    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    /// Le pendant auto-nettoyant de `PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS`.
+    ///
+    /// Nommée plutôt que désignée par position : ce test vit à ~350 lignes de sa
+    /// constante, et mika#2653 a inséré un bloc entre les deux — après quoi la
+    /// phrase « l'allowlist ci-dessus », idiome de ce fichier, désignait une
+    /// autre allowlist que celle qu'il assertait.
     #[test]
-    fn mika2653_lallowlist_du_nom_daudit_est_vide() {
+    fn mika2496_the_sole_writer_allowlist_is_empty() {
         assert!(
-            CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.is_empty(),
-            "CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+            PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
              rester : quand le scan tire, on retire le second écrivain. Une \
              allowlist née vide est un emplacement où déposer la prochaine \
              infraction (mika#2323)."
         );
     }
 
-    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    /// Le pendant auto-nettoyant de `CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS`.
     #[test]
-    fn mika2496_the_sole_writer_allowlist_is_empty() {
+    fn mika2653_lallowlist_du_nom_daudit_est_vide() {
         assert!(
-            PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS.is_empty(),
-            "PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+            CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "CANCEL_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
              rester : quand le scan tire, on retire le second écrivain. Une \
              allowlist née vide est un emplacement où déposer la prochaine \
              infraction (mika#2323)."

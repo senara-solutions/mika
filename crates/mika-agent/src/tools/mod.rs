@@ -184,9 +184,19 @@ pub struct ToolContext<'a> {
     /// explicitement ces deux familles du domaine Fallthrough, donc
     /// [`Self::is_webhook_fallthrough_turn`] vaut `false` exactement sur la
     /// population de ce ticket. Les lire l'un pour l'autre serait une garde à
-    /// population vide — la classe mika#2205. Les deux sont **mutuellement
-    /// exclusifs par construction**, épinglé par
-    /// `webhook_dispatch::tests::mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs`.
+    /// population vide — la classe mika#2205.
+    ///
+    /// **Les deux PRÉDICATS sont mutuellement exclusifs**, épinglé par
+    /// `webhook_dispatch::tests::mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs`
+    /// sur deux corpus. La **représentation**, elle, ne l'est pas : deux `bool`
+    /// admettent l'état « les deux vrais », et rien dans le type ne l'interdit.
+    /// Ce qui tient aujourd'hui est qu'un seul site les dérive tous les deux du
+    /// même message et que les vingt autres posent `false` deux fois. Les
+    /// réunir en un `webhook_turn: WebhookTurnClass`
+    /// (`None | Fallthrough | PrEvent`) rendrait l'exclusivité **structurelle**
+    /// plutôt qu'épinglée par test, et retirerait un des deux littéraux par
+    /// site — mais ça touche les vingt-et-un sites de construction et les deux
+    /// lecteurs, donc c'est un **suivi nommé**, pas ce ticket.
     ///
     /// Lu par la garde de `CancelTaskTool::execute` (et donc, gratuitement, par
     /// `cancel_reminder`, qui y délègue), qui refuse d'annuler une tâche dont un

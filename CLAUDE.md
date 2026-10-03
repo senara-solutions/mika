@@ -5599,10 +5599,33 @@ depuis un tour webhook PR depuis le déploiement.
 - **Le terme de lignée de mika#2649** : inchangé, octet pour octet. Il répond à
   *quelle cible ce dispatch vise-t-il*, celui-ci à *un pilote travaille-t-il
   ici* — axes orthogonaux, et le ticket le dit.
-- **`live_pilot_for_issue`, `LivePilotVerdict::is_alive`, la politique de
-  fail-safe des deux appelants existants** (gate 2c, `auto_pull` filtre 4b) :
-  aucun octet touché. Ce travail **ajoute** un appelant et une fonction ; il ne
-  modifie aucune disposition existante.
+- **La politique de fail-safe des deux appelants existants de `live_pilot`**
+  (gate 2c, `auto_pull` filtre 4b) et `LivePilotVerdict::is_alive` : **aucune
+  disposition existante n'est modifiée**. Ce travail **ajoute** un appelant et
+  une fonction.
+
+  **Deux exceptions, nommées plutôt que glissées sous le tapis**, toutes deux
+  venues de la revue de code et toutes deux sans effet sur une décision.
+  *(a)* `LivePilotVerdict::Alive.parent_task_id` devient `Option<String>` : le
+  lecteur par URL en a toujours un vrai (il a atteint l'enfant *par* son
+  parent), le lecteur par tâche peut recevoir une ligne callback qui n'a aucun
+  parent, et la première rédaction y posait `task.id` — une ligne se déclarant
+  son propre parent, c'est-à-dire un champ qui affirme avec autorité une
+  relation inexistante (classe mika#2304). Le champ est **journalisé et audité**
+  verbatim par gate 2c, qui rend désormais l'absence en `unknown` (motif
+  `repo=unknown`, mika#2496) ; **aucun lecteur n'en décide**. *(b)* La règle de
+  lecture de `process_start_time` a un **site partagé**
+  (`Database::process_start_time_from_metadata`) : la première rédaction avait
+  son propre `.as_str()?.parse()` sur la poignée « ligne nommée » alors que la
+  poignée « enfant » passe par le lecteur de colonne, qui accepte aussi la forme
+  **entière** du JSON — les deux poignées d'une seule fonction répondaient donc
+  différemment de la même ligne, et sous une garde fail-closed cet écart faisait
+  refuser d'un côté ce qu'il laissait passer de l'autre. **Trois copies inline de
+  la forme chaîne-seule subsistent** (la branche « ligne nommée » de
+  `cancel_task_and_kill` et deux sites de `task_engine/engine.rs`) : les router
+  **élargirait** leurs populations — pour le chemin de kill, il tenterait un
+  signal sur une ligne qu'il décline aujourd'hui — donc c'est un **suivi nommé**,
+  pas un effet de bord de ce ticket.
 - **`cancel_task_and_kill`, `kill_process_gracefully`, le watchdog #959, le
   faucheur mika#2249, le sweep phantom #1712, la supersession mika#2335** : aucun
   contact — les huit tests de `test_supersede_kills_live_pilot.rs` passent **sans

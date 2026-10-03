@@ -3248,6 +3248,28 @@ littéralement `CancelTaskTool.execute(input, ctx).await`, donc la garde couvre
 `cancel_reminder` **gratuitement**. À nommer plutôt qu'à découvrir : un futur
 éditeur qui dédoublerait `cancel_reminder` perdrait la garde en silence.
 
+**R4-bis — les deux poignées doivent appliquer les MÊMES filtres, et la
+première rédaction ne le faisait pas.** Trouvé en revue, et les deux écarts
+étaient réels. *(a)* Le filtre terminal manquait sur la poignée « ligne
+nommée » : une ligne callback `delivered` portant encore un pgid vif rendait
+`Alive`, donc la garde refusait l'annulation sous `blocked_live_pilot` — une
+population documentée comme attendue-zéro — sur une ligne que
+`cancel_task_and_kill` aurait de toute façon déclinée par son honnête *« not in
+cancellable status »*. La fenêtre est réelle : le trap EXIT de `dispatch-lib`
+livre le callback depuis l'**intérieur** du wrapper encore vivant, donc
+`delivered` précède la sortie du processus. *(b)* La lecture de
+`process_start_time` passait par un `serde_json` inline acceptant la seule forme
+chaîne, là où la poignée « enfant » passe par le lecteur de colonne qui accepte
+**aussi** la forme entière — donc une seule fonction répondait deux choses de la
+même ligne, et sous un fail-closed cet écart refuse d'un côté ce qu'il laisse
+passer de l'autre. La règle a désormais un site partagé
+(`Database::process_start_time_from_metadata`). Les deux corrections sont
+**épinglées et vues rouges par mutation**
+(`mika2653_une_ligne_terminale_nest_pas_un_pilote` et
+`mika2653_les_deux_poignees_lisent_le_start_time_par_la_meme_regle`, chacun
+interrogeant les **deux** poignées — l'asymétrie du test reproduisait exactement
+celle du code).
+
 **R5 — le geste de reprise de l'opérateur n'est PAS sur ce chemin**, et c'est la
 rectification qui décide l'arbitrage. Les quatre appelants de
 `cancel_task_and_kill` et leur traversée du `ToolContext`, plus la raison pour

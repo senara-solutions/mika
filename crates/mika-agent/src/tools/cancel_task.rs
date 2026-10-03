@@ -111,18 +111,33 @@ impl CancelPilotDecision {
 ///
 /// Les deux causes ont des **remèdes opposés** — « la base ne répond pas »
 /// contre « l'instance n'est pas prouvable » — donc elles sont comptées
-/// séparément. Un motif que cette garde ne connaît pas est toujours une
-/// question qui n'a pas pu être tranchée : il est compté avec la cause base, et
-/// la **ligne de journal porte le `reason` brut**, qui est ce qu'un opérateur
-/// lit pour les séparer.
+/// séparément, et `live_pilot` en définit exactement deux
+/// ([`UNREADABLE_DB_ERROR`], [`UNREADABLE_NO_START_TIME`]).
+///
+/// **Un troisième motif est une décision à prendre ici, pas un repli.** C'est ce
+/// que le `debug_assert_eq!` dit : en build de test il **échoue** plutôt que de
+/// compter la cause inconnue avec la cause base en silence, parce que le motif
+/// est une valeur d'audit sur laquelle un opérateur groupe et qu'un fourre-tout
+/// rendrait deux populations indiscernables. En release il retombe sur la cause
+/// base — un verdict illisible reste un verdict illisible, et la ligne de
+/// journal porte de toute façon le `reason` **brut**, qui est ce qui permet de
+/// les séparer à la lecture.
+///
+/// La dispatch sur un `&'static str` est l'héritage de
+/// `LivePilotVerdict::Unreadable { reason }`, dont la fermeture en enum de
+/// causes est un **suivi** : elle rendrait ce `match` exhaustif et retirerait à
+/// la fois l'assertion et le repli, mais elle touche les deux appelants
+/// existants de mika#2279.
 fn unreadable_audit_value(reason: &str) -> &'static str {
     if reason == UNREADABLE_NO_START_TIME {
         AUDIT_BLOCKED_START_TIME_UNREADABLE
     } else {
         debug_assert_eq!(
             reason, UNREADABLE_DB_ERROR,
-            "un troisième motif d'illisibilité est compté avec la cause base ; \
-             la ligne de journal porte le motif brut"
+            "mika#2653 — un troisième motif d'illisibilité est apparu dans \
+             `live_pilot` et n'a pas de valeur d'audit : en décider une ici, \
+             l'ajouter à ALL_CANCEL_PILOT_GUARD_VERDICTS, et ne pas la laisser \
+             se compter avec la cause base"
         );
         AUDIT_BLOCKED_DB_UNREADABLE
     }
@@ -568,7 +583,11 @@ mod tests {
     fn alive() -> LivePilotVerdict {
         LivePilotVerdict::Alive {
             child_task_id: "8a3b2082-0000-0000-0000-000000000000".to_string(),
-            parent_task_id: "parent-0000".to_string(),
+            // `None` est la forme que ce ticket a rendue possible — une ligne
+            // callback nommée directement n'a pas forcément de parent — et la
+            // garde n'en lit rien, ce qui est précisément pourquoi le champ
+            // n'avait pas à être fabriqué.
+            parent_task_id: None,
             pid: 4242,
         }
     }
@@ -602,10 +621,23 @@ mod tests {
         }
     }
 
-    /// **LE contrôle négatif, et il est porteur.** Sans lui, « la garde décide »
-    /// est indistinguable de « la garde bloque toute annulation », et les trois
-    /// chemins opérateur (CLI, HTTP, conversation) pourraient être cassés avec
-    /// tous les autres tests au vert.
+    /// Le contrôle négatif du **prédicat pur** : il épingle le contrat de la
+    /// fonction, à savoir que le terme de classe de tour décide seul.
+    ///
+    /// **Ce qu'il ne garantit pas, dit ici pour que personne ne le déduise.**
+    /// Il n'atteste aucun des trois chemins opérateur : CLI et HTTP ne
+    /// traversent aucun `ToolContext` (R5), donc aucun prédicat à ce niveau ne
+    /// peut les casser ; et le chemin de conversation est protégé par le
+    /// `if ctx.is_webhook_pr_event_turn` du site d'appel, que ce test n'exécute
+    /// jamais. Le contrôle de **production** est V6b du fichier eval
+    /// (`mika2653_un_tour_de_conversation_annule_comme_avant`) — c'est lui qui
+    /// sépare « la garde décide » de « la garde bloque toute annulation ».
+    ///
+    /// Corollaire du même fait : l'appelant ayant déjà branché sur le drapeau,
+    /// `classify_cancel_on_live_pilot` ne reçoit jamais `false` en production,
+    /// donc la branche `Allowed` n'y est pas atteignable. C'est la conséquence
+    /// assumée du choix de passer le terme en **paramètre** — ce qui rend
+    /// « hors population, rien ne change » vérifiable sans base ni tour.
     #[test]
     fn mika2653_hors_tour_webhook_pr_rien_ne_change() {
         for verdict in [
