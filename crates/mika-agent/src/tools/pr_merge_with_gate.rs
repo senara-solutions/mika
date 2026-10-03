@@ -294,15 +294,34 @@ impl Tool for PrMergeWithGateTool {
         // This arm runs ahead of the behind-main step below so a PR that is both
         // behind and failing reports the failing checks, not "branch updated".
         if let MergeGateDecision::ChecksFailed { failing } = &decision {
+            // -- Step 3a-bis: relance une fois, puis blocage (mika#2617 U3/AC2) --
+            //
+            // Effet de bord, jamais une décision : la porte est fermée par la
+            // ligne qui suit, et elle l'est quoi qu'il arrive ici. Le head SHA
+            // vient du preflight, donc **aucun appel réseau n'est ajouté** à ce
+            // site : U3 n'a allongé que sa liste `--json` (plan R11).
+            let rerun = crate::merge_gate_rerun::maybe_rerun_failed_checks(
+                ctx.db,
+                ctx.session_id,
+                ctx.trace_id,
+                repo,
+                pr_number,
+                &preflight.head_ref_oid,
+                &checks,
+                token,
+            )
+            .await;
+
             let result = MergeGateResult::Blocked {
                 reason: BlockReason::RequiredCheckFailed {
                     failing_checks: failing.clone(),
                 },
                 failing_checks: failing.clone(),
                 detail: format!(
-                    "{} check(s) failed on this head: {}",
+                    "{} check(s) failed on this head: {}.{}",
                     failing.len(),
-                    describe_checks(failing)
+                    describe_checks(failing),
+                    crate::merge_gate_rerun::rerun_detail_suffix(&rerun)
                 ),
             };
             return emit_gate_result(result, ctx).await;
@@ -713,6 +732,29 @@ pub(crate) struct PrPreflight {
     /// once the gate started pushing a merge commit in response.
     #[serde(default)]
     pub(crate) base_ref_name: String,
+    /// The SHA of **this PR's head** — the commit the checks ran on.
+    ///
+    /// Added by mika#2617 U3 (plan R11) as the ledger key of the rerun budget:
+    /// `rerun:{repo}#{pr}@{head_sha}:{run_id}`, so **a new head reopens the
+    /// budget by itself** — new code, new chance.
+    ///
+    /// **Zero network call is added at this site**, which is the whole reason
+    /// the field lives here rather than behind a second `gh` round-trip: the
+    /// preflight is already called, and U3 only lengthens its `--json` list.
+    ///
+    /// **An empty value means UNREADABLE, never a SHA.** `#[serde(default)]`
+    /// renders an absent `headRefOid` as `""`, and treating that as a head
+    /// would make the ledger key shared by every unreadable head — one
+    /// rerun budget for all of them. The rerun reader refuses on empty
+    /// (`RerunOutcome::LedgerUnreadable`) rather than keying on a sentinel.
+    ///
+    /// A second reader of the same fact exists and is **kept on purpose**:
+    /// `verdict_handler::fetch_pr_head_sha` (mika#1563) answers the same
+    /// question at a different instant on a path that does not call this
+    /// preflight. Unifying them would mean adding a call to remove a
+    /// duplication — the wrong direction (plan R11).
+    #[serde(default)]
+    pub(crate) head_ref_oid: String,
 }
 
 /// Error from `run_gh_pr_view` with optional exit code.
@@ -923,6 +965,10 @@ pub(crate) fn describe_checks(checks: &[CheckInfo]) -> String {
 
 /// Run `gh pr view <number> --repo <repo> --json mergeable,mergeStateStatus,isDraft,state`
 /// and return the parsed preflight struct.
+///
+/// `headRefOid` joined the `--json` list in mika#2617 U3: the rerun ledger keys
+/// on the head, and this call was already on the path — see
+/// [`PrPreflight::head_ref_oid`].
 pub(crate) async fn run_gh_pr_view(
     pr_number: u64,
     repo: &str,
@@ -936,7 +982,7 @@ pub(crate) async fn run_gh_pr_view(
         "--repo",
         repo,
         "--json",
-        "mergeable,mergeStateStatus,isDraft,state,baseRefOid,baseRefName",
+        "mergeable,mergeStateStatus,isDraft,state,baseRefOid,baseRefName,headRefOid",
     ];
 
     let output = run_gh_subprocess(&args, token).await.map_err(|e| {
@@ -3971,6 +4017,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
             base_ref_name: "main".to_string(),
+            head_ref_oid: "8ccaabc8".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -3992,6 +4039,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
             base_ref_name: "main".to_string(),
+            head_ref_oid: "8ccaabc8".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -4013,6 +4061,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
             base_ref_name: "main".to_string(),
+            head_ref_oid: "8ccaabc8".to_string(),
         };
         assert_eq!(classify_preflight(&preflight), None);
     }
@@ -4026,6 +4075,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             state: "CLOSED".to_string(),
             base_ref_oid: String::new(),
             base_ref_name: "main".to_string(),
+            head_ref_oid: "8ccaabc8".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -4047,6 +4097,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             state: "MERGED".to_string(),
             base_ref_oid: String::new(),
             base_ref_name: "main".to_string(),
+            head_ref_oid: "8ccaabc8".to_string(),
         };
         assert_eq!(
             classify_preflight(&preflight),
@@ -4063,6 +4114,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
             base_ref_name: "main".to_string(),
+            head_ref_oid: "8ccaabc8".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -4090,6 +4142,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
             base_ref_name: "main".to_string(),
+            head_ref_oid: "8ccaabc8".to_string(),
         };
 
         let result = classify_preflight(&preflight);
