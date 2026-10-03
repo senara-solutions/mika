@@ -6,6 +6,70 @@ pub mod test_helpers {
     use mika_common::config::Settings;
     use std::sync::atomic::{AtomicBool, AtomicU32};
 
+    /// Installe un abonné de capture pour le thread courant (mika#2646).
+    ///
+    /// **Site unique volontairement.** Sept appels nus vivaient dans ce crate,
+    /// dans quatre fichiers, et aucun ne ré-interrogeait le cache de callsites
+    /// alors que le piège était documenté à la ligne près dans
+    /// `mika-common/tests/llm_retry.rs`. Un geste qu'on peut oublier est un
+    /// geste qu'on oublie ; celui-ci n'a plus de site où être oublié. Tenu par
+    /// `mika2646_set_default_a_un_site_dinstallation_unique`.
+    ///
+    /// # Ce que `rebuild_interest_cache` achète ici — et ce qu'il n'achète PAS
+    ///
+    /// Le ticket, et `llm_retry.rs` avant lui, décrivent ce mécanisme : un
+    /// callsite `tracing` met son `Interest` en cache **globalement**, décidé
+    /// par le premier thread qui l'atteint ; dans un binaire de test c'est
+    /// couramment un thread sans abonné, qui répond `never`, après quoi le
+    /// test capturant ne voit plus rien.
+    ///
+    /// Le mécanisme existe, mais **pas dans la direction temporelle que ce
+    /// remède suppose**, et c'est mesuré plutôt que déduit (mika#2646, AC3) :
+    ///
+    /// - Un empoisonnement **antérieur** à l'installation est **déjà réparé
+    ///   par `set_default` lui-même** : `Dispatch::new` appelle
+    ///   `callsite::register_dispatch`, qui appelle `CALLSITES.rebuild_interest`
+    ///   (`tracing-core-0.1.36/src/{dispatcher.rs:479,callsite.rs:484-488}`).
+    ///   Mesuré : empoisonner puis installer **sans** rebuild capture quand
+    ///   même les 13 événements. L'appel explicite est donc **redondant** sur
+    ///   ce chemin — il est conservé parce qu'il est inoffensif, qu'il aligne
+    ///   ce crate sur `llm_retry.rs`, et qu'il reste correct si une version
+    ///   future de `tracing-core` cesse de rebuilder à l'enregistrement.
+    /// - La fenêtre qui **casse** réellement est **postérieure** à
+    ///   l'installation : un callsite ne s'enregistre qu'à sa *première*
+    ///   atteinte, et son `Interest` est alors décidé par `get_default` **du
+    ///   thread qui l'enregistre** (`callsite.rs:236-253` → `rebuilder()` →
+    ///   `JustOne` → `callsite.rs:562-567`). Un test voisin qui atteint le
+    ///   callsite en premier, sans abonné, l'éteint globalement — y compris
+    ///   pour un abonné déjà installé sur un autre thread. Mesuré : capture à
+    ///   **0** dans cette configuration, et le rebuild appelé *après*
+    ///   l'empoisonnement la ramène à 1.
+    ///
+    /// **C'est donc `#[serial_test::serial]` qui est la moitié porteuse**, et
+    /// elle doit couvrir les **poisonneurs** autant que les capturants : tout
+    /// test qui atteint un callsite capturé. Un capturant seul à être annoté
+    /// laisse la course entière ouverte, `#[serial]` ne sérialisant que contre
+    /// ses propres porteurs (`wip_rescue.rs:2289-2292`).
+    ///
+    /// Deux chemins de perte supplémentaires ont été écartés **par lecture**,
+    /// pour que personne n'ait à les re-soupçonner : l'AND entre dispatchers
+    /// rend `sometimes` et jamais `never` (`subscriber.rs:652-664`), donc il
+    /// fait consulter `enabled()` par événement ; et `LevelFilter::set_max`
+    /// prend le **max** des hints avec `unwrap_or(TRACE)`
+    /// (`callsite.rs:407-422`), `NoSubscriber` ne surchargeant pas
+    /// `max_level_hint`. Ni l'un ni l'autre ne peut éteindre une capture.
+    ///
+    /// Défaut fondateur : PR #2643, tête `26e70b43`, run `37037943870`, job
+    /// « Test with telemetry feature », 2026-10-02 17:24Z.
+    pub fn install_capturing_subscriber<S>(subscriber: S) -> tracing::subscriber::DefaultGuard
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        guard
+    }
+
     /// Create an in-memory database for tests (sync — for db module tests).
     pub fn test_db() -> Database {
         Database::open_in_memory().unwrap()
@@ -338,5 +402,294 @@ pub mod test_helpers {
     /// existing call sites in mika-agent unit tests.
     pub fn dummy_settings() -> Settings {
         Settings::test_defaults()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// **Livrée vide, et elle le reste.**
+    ///
+    /// Quand la garde ci-dessous tire, on **route le site** vers
+    /// `test_helpers::install_capturing_subscriber` ; on ne l'allowliste pas.
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction (doctrine mika#2201, motif mika#2323).
+    const SET_DEFAULT_SITES_ALLOWED: &[&str] = &[];
+
+    /// Le seul site d'installation autorisé, relatif à `src/`.
+    ///
+    /// Nommé plutôt que recopié : le prédicat (l'exemption du scan) et la
+    /// fixture du contrôle de bonne foi doivent désigner le **même** fichier,
+    /// sans quoi le contrôle cesse d'attester le prédicat sans rien rougir.
+    const INSTALLER_SITE: &str = "test_utils.rs";
+
+    /// Les orthographes d'une installation d'abonné par défaut.
+    ///
+    /// **Six, pas une, et c'est une correction de revue.** La première version
+    /// ne cherchait que `tracing::subscriber::set_default` — une des **quatre**
+    /// orthographes publiques du même acte, toutes rendant un `DefaultGuard`.
+    /// Un scan qui n'en voit qu'une accuse un proxy, pas le fait : le
+    /// contournement est à **une ligne `use` près**, puisque les quatre
+    /// helpers de capture importent déjà `SubscriberExt` du module qui exporte
+    /// aussi `SubscriberInitExt` (`tracing-subscriber-0.3.23/src/util.rs:41`,
+    /// `fn set_default(self) -> dispatcher::DefaultGuard`). C'est très
+    /// exactement le mode de panne vert-pendant-que-le-vrai-est-rouge que
+    /// cette garde existe pour refuser.
+    ///
+    /// Chaque entrée est assemblée par `concat!` : le littéral est produit à
+    /// la compilation, donc **aucune des chaînes cherchées n'apparaît dans ce
+    /// fichier**. Écrites d'un bloc, elles feraient de la garde son propre
+    /// second site — le scan n'exclut pas le code de test (voir
+    /// [`all_sources`]), donc il se compterait lui-même et serait rouge au
+    /// jour de sa naissance, c'est-à-dire désarmé le lendemain.
+    ///
+    /// **Deux bornes, nommées plutôt que découvertes.** (1) Les formes
+    /// qualifiées sont cherchées littéralement, donc une forme **aliasée**
+    /// (`use tracing::subscriber as ts; ts::set_default(…)`) passerait ;
+    /// aucune n'existe sous `src/` aujourd'hui. (2) `.set_default(` est un
+    /// jeton de **réception**, donc un futur `autre_chose.set_default(…)`
+    /// serait accusé à tort. Le sens de l'erreur est le bon : un faux positif
+    /// coûte une ligne à router, un faux négatif laisse la course ouverte.
+    /// Mesuré avant élargissement — zéro occurrence de ce jeton sous `src/`.
+    fn needles() -> Vec<&'static str> {
+        vec![
+            concat!("tracing::subscriber::", "set_default"),
+            concat!("tracing::subscriber::", "with_default"),
+            concat!("tracing::dispatcher::", "set_default"),
+            concat!("tracing::dispatcher::", "with_default"),
+            concat!("Subscriber", "InitExt"),
+            concat!(".set_", "default("),
+        ]
+    }
+
+    fn src_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Tous les `.rs` sous `crates/mika-agent/src`, **sans filtre de test**.
+    ///
+    /// PIÈGE, et c'est l'inverse de toutes les gardes voisines : celles-ci
+    /// écartent le code de test (`source_scan::is_test_source_path`,
+    /// `production_half`) parce qu'elles cherchent dans la production un motif
+    /// que la production ne doit pas porter. **Ici les sept sites vivent tous
+    /// dans du code de test.** Une garde bâtie sur `production_sources()` —
+    /// ou sur `ProductionScanner`, qui masque les régions `cfg(test)` —
+    /// trouverait **zéro** site et se lirait comme un arbre propre : la classe
+    /// mika#2205 appliquée à la garde elle-même.
+    ///
+    /// L'énumération passe par [`mika_common::source_guard::rust_sources_under`],
+    /// le lecteur unique que quinze gardes écrivaient à l'identique — c'est la
+    /// règle que `source_scan` énonce pour lui-même (« un seul lecteur, pas une
+    /// copie par garde », mika#2158). Il n'applique aucun filtre de test, ce
+    /// qui est exactement ce qu'il faut ici, et il trie, ce qui rend l'ordre
+    /// des fautifs déterministe d'une machine à l'autre.
+    ///
+    /// **Portée : `src/` seulement — et la raison que le plan donnait est
+    /// FAUSSE pour la majorité de la population qu'elle écartait.** Le plan
+    /// disait « neuf binaires distincts, un processus chacun, donc un cache
+    /// d'`Interest` chacun ». Vérifié : **deux** des neuf fichiers de
+    /// `crates/mika-agent/tests/` sont des binaires autonomes
+    /// (`manager_delivery_observability_2267.rs`, `llm_call_attempt_2342.rs`),
+    /// et les **sept** autres sont des `mod` du binaire unique
+    /// `--test eval` (`tests/eval.rs`). Ces sept partagent donc **un seul**
+    /// cache de callsites, et `grep serial` sous `tests/eval/` ne rend rien :
+    /// la course y est vivante, sur un job de CI requis. Un indice en
+    /// arbre le dit déjà — `test_context_scope_observability_2305.rs` porte un
+    /// `KEEPER` fait main dont le commentaire parle d'un `never` mis en cache
+    /// avant son démarrage.
+    ///
+    /// Ils restent **hors scan**, parce qu'ils ne peuvent pas atteindre
+    /// l'installateur (`test_helpers` est `#[cfg(test)]`, donc invisible depuis
+    /// un binaire d'intégration) et que les y router demande de le remonter
+    /// dans `mika-common` — un rayon de souffle de trois crates, que ce ticket
+    /// tient hors périmètre. **Le silence du scan sur eux n'est donc pas une
+    /// couverture, et la raison n'est pas celle que le plan donnait :** c'est
+    /// une population connue, non couverte, dont le suivi a pour précondition
+    /// un rouge mesuré dans le binaire `eval`.
+    ///
+    /// Un fichier illisible **panique** plutôt que d'être sauté : une garde qui
+    /// saute un fichier en silence est une garde qui a cessé de regarder, et le
+    /// fichier sauté peut être le fautif — l'assertion d'anti-vacuité compte
+    /// les fichiers *après* le saut et ne le verrait pas.
+    fn all_sources() -> Vec<(String, String)> {
+        let root = src_root();
+        mika_common::source_guard::rust_sources_under(&root)
+            .into_iter()
+            .map(|path| {
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("la garde doit pouvoir lire {} : {e}", path.display())
+                });
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("chemin sous src/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, content)
+            })
+            .collect()
+    }
+
+    /// Les fichiers portant l'aiguille, commentaires retirés.
+    ///
+    /// Le dépouillement est porteur : le doc-comment de l'installateur **cite**
+    /// `tracing-core` et décrit le mécanisme, et une prose qui décrit le motif
+    /// interdit n'en est pas une violation (faux positif mesuré sur le Signal S,
+    /// mika#2050).
+    ///
+    /// Le court-circuit sur la source brute est **exactement** préservant, et
+    /// la raison mérite d'être écrite pour que personne n'ait à la redériver :
+    /// `strip_comment_lines` ne fait que **supprimer des lignes entières** et
+    /// rejoindre par `"\n"`, donc toute sous-chaîne sans retour à la ligne de
+    /// sa sortie est une sous-chaîne d'une ligne de l'entrée. L'aiguille n'en
+    /// contient pas, donc `needle ∈ strip(s) ⟹ needle ∈ s` : le pré-filtre ne
+    /// peut écarter que des fichiers qui n'auraient pas pu matcher. Il évite
+    /// d'allouer une copie dépouillée des ~12 Mo de l'arbre pour trouver un
+    /// seul fichier (mesuré : 87,5 ms → 2,3 ms).
+    ///
+    /// Rend `(fichier, nombre d'installations)` : le **compte** est ce qui
+    /// permet d'exempter un *site* plutôt qu'un *fichier* — sans lui, un
+    /// second appel nu ajouté dans `test_utils.rs`, où le message d'échec de
+    /// la garde envoie précisément les gens, serait invisible.
+    fn sites_carrying_the_needle(sources: &[(String, String)]) -> Vec<(String, usize)> {
+        sources
+            .iter()
+            .filter_map(|(rel, src)| {
+                if !needles().iter().any(|n| src.contains(n)) {
+                    return None;
+                }
+                let stripped = crate::source_scan::strip_comment_lines(src);
+                let count: usize = needles().iter().map(|n| stripped.matches(n).count()).sum();
+                (count > 0).then(|| (rel.clone(), count))
+            })
+            .collect()
+    }
+
+    /// **U3 — un seul site d'installation d'abonné de capture (mika#2646).**
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un huitième
+    /// `set_default` nu ne rend **aucune** décision fausse le jour où il est
+    /// écrit — la capture marche, toutes les assertions restent vertes, et
+    /// seule la course se rouvre, en silence. C'est la classe
+    /// `grooming_marker` (mika#2158).
+    #[test]
+    fn mika2646_set_default_a_un_site_dinstallation_unique() {
+        let sources = all_sources();
+        assert!(
+            sources.len() > 100,
+            "le scan n'a énuméré que {} fichiers — un scan qui ne scanne rien est \
+             un laissez-passer vide, pas un arbre propre (mika#2103)",
+            sources.len()
+        );
+
+        let sites = sites_carrying_the_needle(&sources);
+
+        // ANTI-VACUITÉ, et elle porte sur la CARDINALITÉ, pas sur la présence.
+        // Un scan qui vise un nom mort rend zéro infraction et se lit comme un
+        // arbre sain (motif mika#2496, `!declared.is_empty()` de mika#2201) ;
+        // et une exemption par *fichier* rendrait un second appel nu ajouté
+        // dans `test_utils.rs` — là même où le message d'échec ci-dessous
+        // envoie les gens — indistinguable du premier.
+        let installer_count = sites
+            .iter()
+            .find(|(rel, _)| rel == INSTALLER_SITE)
+            .map(|(_, n)| *n);
+        assert_eq!(
+            installer_count,
+            Some(1),
+            "l'installateur doit porter exactement UNE installation ; vu {installer_count:?}. \
+             Zéro = la garde vise un nom mort (module renommé, helper déplacé) ; \
+             plus d'une = un second site s'est glissé dans le fichier exempté. \
+             Sites vus : {sites:?}"
+        );
+
+        let offenders: Vec<&String> = sites
+            .iter()
+            .filter(|(rel, _)| rel.as_str() != INSTALLER_SITE)
+            .filter(|(rel, _)| !SET_DEFAULT_SITES_ALLOWED.contains(&rel.as_str()))
+            .map(|(rel, _)| rel)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "installation d'abonné hors de l'installateur unique, dans : {offenders:?}\n\
+             \n\
+             RÉSOLUTION : router le site vers \
+             `crate::test_utils::test_helpers::install_capturing_subscriber(subscriber)`, \
+             et poser `#[serial_test::serial]` sur le test appelant **et sur tout test \
+             voisin qui atteint le même callsite** — c'est cette seconde moitié qui \
+             porte (mika#2646). Ne PAS ajouter d'entrée à `SET_DEFAULT_SITES_ALLOWED` : \
+             on déclare, on n'allowliste pas (mika#2201)."
+        );
+    }
+
+    /// Contrôle de bonne foi : le prédicat mord sur un second site, **pour
+    /// chacune des six orthographes**.
+    ///
+    /// Sans lui, « la garde décide » est indistinguable de « la garde ne
+    /// regarde rien ». Et sans la boucle sur `needles()`, il serait
+    /// indistinguable de « la garde reconnaît *cette chaîne-là* » — ce qui
+    /// était exactement l'état de la première version, dont le contrôle
+    /// construisait sa fixture à partir de la seule orthographe qu'elle
+    /// connaissait déjà.
+    #[test]
+    fn mika2646_le_scan_voit_un_second_site() {
+        for spelling in needles() {
+            let synthetic = vec![
+                (INSTALLER_SITE.to_string(), format!("let g = {spelling}s);")),
+                (
+                    "voisin.rs".to_string(),
+                    format!("    let _guard = {spelling}subscriber);\n"),
+                ),
+                (
+                    "prose.rs".to_string(),
+                    format!("    /// On n'appelle plus {spelling} ici.\n"),
+                ),
+            ];
+            let sites = sites_carrying_the_needle(&synthetic);
+            assert!(
+                sites.iter().any(|(rel, _)| rel == "voisin.rs"),
+                "le scan doit accuser un second site pour {spelling:?} : {sites:?}"
+            );
+            assert!(
+                !sites.iter().any(|(rel, _)| rel == "prose.rs"),
+                "une prose qui DÉCRIT le motif n'en est pas une violation \
+                 ({spelling:?}) : {sites:?}"
+            );
+        }
+    }
+
+    /// Le compte par site est ce qui rend l'exemption *par site* possible.
+    ///
+    /// Contrôle de bonne foi de la cardinalité : deux installations dans le
+    /// fichier exempté doivent être distinguables d'une seule, sans quoi la
+    /// garde est aveugle là où son propre message d'échec envoie les gens.
+    #[test]
+    fn mika2646_le_scan_compte_les_sites_dun_meme_fichier() {
+        let n = needles()[0];
+        let synthetic = vec![(
+            INSTALLER_SITE.to_string(),
+            format!("let a = {n}(x);\nlet b = {n}(y);\n"),
+        )];
+        let sites = sites_carrying_the_needle(&synthetic);
+        assert_eq!(
+            sites
+                .iter()
+                .find(|(rel, _)| rel == INSTALLER_SITE)
+                .map(|(_, c)| *c),
+            Some(2),
+            "deux installations dans un fichier doivent compter 2 : {sites:?}"
+        );
+    }
+
+    /// L'allowlist est livrée vide **et épinglée vide** — l'épinglage EST
+    /// l'assertion auto-nettoyante : il rougit dès qu'on y ajoute une ligne.
+    #[test]
+    fn mika2646_lallowlist_du_scan_est_livree_vide() {
+        assert!(
+            SET_DEFAULT_SITES_ALLOWED.is_empty(),
+            "il n'y a rien à excepter : les sept sites sont routés vers \
+             l'installateur. Une entrée ici est une course rouverte."
+        );
     }
 }
