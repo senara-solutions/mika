@@ -439,10 +439,39 @@ pub async fn try_handle_ci_success(
             CheckClassification::AllPassed => unreachable!(),
         };
 
+        // Relance une fois, puis blocage (mika#2617 U3/AC2), sur le seul bras
+        // rouge. Effet de bord, jamais une décision : ce chemin rend
+        // `Passthrough` quoi qu'il arrive.
+        //
+        // **Aucun appel réseau ajouté** : `find_open_pr` a déjà résolu
+        // `pr.head_sha` à l'étape 2b — c'est la ligne la plus favorable du
+        // tableau de R11, et c'est elle qui rend la relance gratuite ici.
+        //
+        // L'issue vit sur la ligne de journal, pas dans un `enrichment` : ce
+        // handler rend délibérément `enrichment: None` (il évalue, il ne parle
+        // pas au modèle — mika#2260), et U3 n'a pas pour périmètre de changer
+        // ce contrat.
+        let rerun_note = if classification == CheckClassification::HasFailures {
+            let rerun = crate::merge_gate_rerun::maybe_rerun_failed_checks(
+                db,
+                session_id,
+                trace_id,
+                &event.repo,
+                pr.number,
+                &pr.head_sha,
+                &checks,
+                token,
+            )
+            .await;
+            crate::merge_gate_rerun::rerun_detail_suffix(&rerun)
+        } else {
+            String::new()
+        };
+
         info!(
             pr_number = pr.number,
             repo = %event.repo,
-            "CI success event for one workflow but not all required checks pass yet: {detail}"
+            "CI success event for one workflow but not all checks pass yet: {detail}{rerun_note}"
         );
         return VerdictAction::Passthrough { enrichment: None };
     }

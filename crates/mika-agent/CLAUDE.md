@@ -792,11 +792,121 @@ assertion is as much a measure of U2 as a guard), and, in phase C, the
 `MergeClearance` type witness, which makes the bypass **non-compilable** rather
 than detectable.
 
-**Phases B and C are NOT in this change.** The rerun-once ledger (AC2) and the
-MPC gate trace (AC5) ship separately; the plan
+**Phase C is NOT in this change.** The MPC gate trace (AC5) ships separately;
+the plan
 `docs/plans/2026-10-02-001-fix-2617-merge-gate-lit-tous-les-checks-plan.md` is the
-design reference for all three. Phase A is autonomous: with no rerun, a red check
-blocks, which is the safe behaviour. **Credential-scope diagnostic (mika#1616):** when a `gh` call fails with a 403 / "Resource not accessible by integration" / forbidden response (GitHub App not installed on the target repo, or PAT missing write scope), `classify_credential_scope_error()` returns `GateErrorKind::CredentialScope { repo }` with an actionable detail naming the repo + remediation, instead of an opaque `gh_cli_failure`. Wired into all four `gh` failure sites (preflight, checks, auto-merge, immediate-merge). Mirrors the `classify_gh_error()` heuristic in `builtin_handlers.rs`. This stops the LLM from paraphrasing an opaque exit code into a fabricated cause (the reported symptom on mika-cloud PRs #135/#136). Decision matrix: CONFLICTING/DIRTY -> blocked[merge_conflict]; fail/cancel -> blocked[required_check_failed]; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op; infra failure -> gate_errored. 60s timeout. Requires `ctx.github_token`. See #490, #794.
+design reference for all three phases. Phase A is autonomous: with no rerun, a red
+check blocks, which is the safe behaviour. **Credential-scope diagnostic (mika#1616):** when a `gh` call fails with a 403 / "Resource not accessible by integration" / forbidden response (GitHub App not installed on the target repo, or PAT missing write scope), `classify_credential_scope_error()` returns `GateErrorKind::CredentialScope { repo }` with an actionable detail naming the repo + remediation, instead of an opaque `gh_cli_failure`. Wired into all four `gh` failure sites (preflight, checks, auto-merge, immediate-merge). Mirrors the `classify_gh_error()` heuristic in `builtin_handlers.rs`. This stops the LLM from paraphrasing an opaque exit code into a fabricated cause (the reported symptom on mika-cloud PRs #135/#136). Decision matrix: CONFLICTING/DIRTY -> blocked[merge_conflict]; fail/cancel -> blocked[required_check_failed]; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op; infra failure -> gate_errored. 60s timeout. Requires `ctx.github_token`. See #490, #794.
+
+#### Rerun once, then block (mika#2617, phase B)
+
+`crate::merge_gate_rerun` relaunches the failed jobs of a red run **once**, and
+never twice. Prime, verbatim: *« si le re-run passe c'est vert pour de bon, s'il
+échoue deux fois ce n'est pas flaky, c'est cassé, et ça doit bloquer. »*
+
+**It decides nothing about the merge, and that is the first thing to know.** The
+gate is already closed when it is called — phase A's
+`MergeGateDecision::ChecksFailed` refuses, and its refusal is not conditioned on
+anything that happens here. This module has a side effect (it relaunches) and
+returns a `RerunOutcome` the caller **quotes** in the motive it exposes. One test
+exists for exactly that property
+(`mika2617_no_rerun_outcome_claims_the_gate_may_open`): a future editor who makes
+one of those sentences say *"the merge may proceed"* would be moving the merge
+decision into a module that has no business taking it.
+
+**`--failed`, never `--job <id>` (plan R1).** The two flags are mutually
+exclusive, so AC2's literal form is unexecutable — and the correction is a
+**gain** rather than a fallback: N red lints of the same `ci.yml` run are covered
+by **one** relaunch where `--job` would need N. The granularity of the rerun is
+therefore the **run**, and the budget is counted per `(repo, PR, head, run)`.
+
+**The link grammar has ONE reader, promoted rather than twinned (plan R14).**
+`parse_check_link` moved out of `ci_failure_handler` into
+[`crate::check_link`] verbatim, tests included; U3 derives its `run_id` from it
+and adds only the `&str → u64` conversion plus the refusal of a non-numeric run.
+Writing `extract_actions_run_id` beside it would have been the second reader the
+same plan's R11 refuses for the head SHA — being inconsistent from one
+rectification to the next would be worse than either choice.
+`mika2617_run_id_has_a_single_link_reader` refuses its return, allowlist shipped
+empty, with its anti-vacuity assertion. **Inherited behaviour, pinned as such:**
+`parse_check_link` requires the `/job/` segment and returns `None` without it
+(its own `parse_check_link_no_job_segment` since #594), so a run link without a
+job reads as "no rerun" — the right default, and *inherited rather than decided*,
+which is why it carries a test of its own instead of being left to be
+rediscovered as an oversight.
+
+**The ledger is durable, and the key carries the head.** An in-memory ledger does
+not hold "never a second rerun" across a restart, so the budget lives in
+`audit_events` under `merge_gate_check_rerun`, key
+`rerun:{repo}#{pr}@{head_sha}:{run_id}`, read by
+`count_recent_audit_events_for_target` by **exact equality** (motif mika#1869 /
+mika#2347). Two properties follow: **a new sha reopens the budget by itself** —
+new code, new chance, the idempotence obtained from the *shape* of the key rather
+than from one more column — and mika#2347's `#234` ↔ `#2343` trap cannot open
+here, the comparison being an equality rather than a `LIKE`. The `@` is written
+anyway so a future prefix reader is safe by construction rather than by luck.
+
+**`PrPreflight` gained `head_ref_oid`, and an empty value is UNREADABLE, never a
+SHA.** `#[serde(default)]` renders an absent `headRefOid` as `""`; treating that
+as a head would make the ledger key shared by every unreadable head — one budget
+for all of them. The rerun refuses on empty (`LedgerUnreadable`). Zero network
+call is added at the tool site and at `ci_success_handler` (which already holds
+`pr.head_sha` from `find_open_pr`) — **this is where plan R11 needed correcting**:
+`verdict_handler`'s `HasFailures` arm `return`s *before* the behind-main preflight,
+so it resolves the head through `fetch_pr_head_sha` (mika#1563), one round trip on
+a path that is already red and about to make a network call anyway. Hoisting it
+above the arm would charge every branch, the nominal one included.
+
+**Fail-CLOSED on the ledger — the inverse of the rest of this work, and the
+arbitration is local.** A false "already rerun" costs one lost relaunch on a PR
+that is waiting for a human anyway; a false "never rerun" relaunches in a loop,
+which AC2 forbids by name. So an unreadable database, an empty head, or a failed
+ledger write all mean: no relaunch.
+
+**The ledger row is written BEFORE the relaunch, and that ordering is the
+mechanism.** `audit_events` is append-only: a row cannot be revised. Written
+*after* the relaunch, a crash in between would reopen the budget and the relaunch
+would replay — exactly what AC2 forbids. So it is written first and carries
+`attempted`: at that instant the outcome is unknown, and naming it would be
+inventing. The outcome lives on the **log line** (`outcome` field). Named
+consequence: a relaunch refused with a 403 **spends** the budget for that head —
+the letter of the plan's T8 ("aucune boucle") — and a new sha reopens it.
+
+**`AlreadySpent` writes NO audit row, which revises the plan.** It announced "two
+failures ⇒ `merge_gate_rerun_exhausted` (WARN + audit row)". The row is dropped,
+and the reason is measurable: one push produces up to eight
+`check_suite.completed` (mika#1869), so a row per *evaluation* of an
+already-relaunched head would be up to eight rows per push over a population that
+does not change — the churn doctrine mika#2131 bounds — **and** it would pollute
+the count that holds the "never twice" invariant, since that predicate *is* a
+count. The durable information ("this head had its relaunch") is already the
+attempt row; exhaustion is its corollary, not a new fact. The WARN stays:
+liveness is what the operator reads.
+
+**One reader of the enum, and a scan that keeps it one.** `rerun_detail_suffix`
+is the single `match` on `RerunOutcome`, exhaustive **with no `_ =>` arm**; the
+three call sites quote it rather than matching themselves. Three copied `match`es
+are three formulations free to diverge, which is the class `grooming_marker`
+(mika#2158) had to close. `mika2617_rerun_outcome_has_no_wildcard_arm` carries two
+terms — no wildcard in any function that *reads* a `RerunOutcome` (scoped by
+`source_scan::fn_bodies`, so the legitimate `_ =>` over an **environment string**
+in `merge_gate_rerun_is_enabled` is out of population, the unknown being exactly
+what a kill-switch must catch there), and no second reader in the three consumer
+files — plus a good-faith control on a fixture, because a predicate gone inert
+reads exactly like a clean module (class mika#2103 / mika#2205).
+
+**AC2 is shipped FAIL-SAFE and is NOT claimed held (plan R3).**
+`gh run rerun --failed` needs the `actions: write` scope, which the platform
+token's documented scopes do not carry. **AC2 may therefore be inert at deploy,
+in 403**: the relaunch fails, the gate stays closed, the motive is named, and
+that is the right state. Claiming it closed before an operator probe has observed
+a successful relaunch would be the guarantee mika#2304 names. Kill-switch
+`MIKA_MERGE_GATE_RERUN` (armed by default; polarity of
+`MIKA_QA_CI_COHERENCE_GATE`): it gates the **relaunch**, never the reading nor the
+refusal — the detection is unconditional (motif mika#2249 / mika#2272).
+
+**Operator surfaces, expected regimes and the probes:** root `CLAUDE.md`
+§ *Optional (relance une fois, puis blocage — mika#2617)*.
 
 **Supervisor pr_url write on `checks_pending` (mika#1211, arm moved by mika#2617):** On the pending-checks branch — `auto_merge_enabled` until 2026-10-02 — the tool writes `$.claude_pilot.pr_url = "https://github.com/<owner>/<repo>/pull/<n>"` to the supervisor task's metadata (resolved via `ToolContext.callback_task_id → parent`, gated by `trigger_type='manual' && source='self_dev'`). This neutralises the orphan reaper's `pr_url IS NULL` predicate (#871) and arms the parent-completer (mika#1162), so the supervisor stays `in_progress` until the dispatch callback ages past `REAPER_GRACE_SECONDS` and is then promoted to `completed`. Mirrors `dispatcher::try_extract_callback_metadata` (#376): two-level shallow merge via `task_metadata::merge_metadata`, fire-and-forget on error. Conversation-mode invocations (no `callback_task_id`) skip the write silently. See `docs/solutions/best-practices/pr-merge-with-gate-supervisor-metadata-2026-05-20.md`.
 

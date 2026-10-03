@@ -869,28 +869,20 @@ async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> Failu
     ctx
 }
 
-/// Parse a GitHub Actions check link URL into (run_id, job_id).
-///
-/// Expected format: `https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}`
-fn parse_check_link(url: &str) -> Option<(&str, &str)> {
-    // Split on "/job/" to separate run path from job_id
-    let (before_job, job_id) = url.rsplit_once("/job/")?;
-    // Extract run_id: last segment before "/job/"
-    let run_id = before_job.rsplit('/').next()?;
-    if run_id.is_empty() || job_id.is_empty() {
-        return None;
-    }
-    Some((run_id, job_id))
-}
-
 /// Fetch and truncate a failing job's log output.
 ///
 /// Extracts the run ID and job name from the check link URL, then runs
 /// `gh run view <run_id> --repo <repo> --job <job_name> --log-failed`.
+///
+/// **The link grammar has one reader, and it is no longer here (mika#2617 U3,
+/// plan R14).** `parse_check_link` moved to [`crate::check_link`] verbatim,
+/// tests included, because the rerun half of mika#2617 needed the same grammar
+/// and writing a twin of it is the class `grooming_marker` had to close after
+/// months of silent divergence (mika#2158).
 async fn fetch_job_log(check_link: &str, repo: &str, token: &str) -> Option<String> {
     // check_link format: https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
     // gh run view requires: gh run view <run_id> --repo <repo> --job <job_id> --log-failed
-    let (run_id, job_id) = parse_check_link(check_link)?;
+    let (run_id, job_id) = crate::check_link::parse_check_link(check_link)?;
 
     let args = vec![
         "run",
@@ -1133,25 +1125,10 @@ mod tests {
     }
 
     // -- Check link parser tests --
-
-    #[test]
-    fn parse_check_link_valid() {
-        let url = "https://github.com/org/repo/actions/runs/12345/job/67890";
-        let (run_id, job_id) = parse_check_link(url).unwrap();
-        assert_eq!(run_id, "12345");
-        assert_eq!(job_id, "67890");
-    }
-
-    #[test]
-    fn parse_check_link_no_job_segment() {
-        let url = "https://github.com/org/repo/actions/runs/12345";
-        assert!(parse_check_link(url).is_none());
-    }
-
-    #[test]
-    fn parse_check_link_empty_returns_none() {
-        assert!(parse_check_link("").is_none());
-    }
+    //
+    // Ils ont suivi la fonction dans `crate::check_link` (mika#2617 U3, plan
+    // R14), verbatim : ce sont eux qui attestent que la promotion n'a rien
+    // changé à la sémantique que `fetch_job_log` consomme ici.
 
     // -- Metadata helpers --
 
