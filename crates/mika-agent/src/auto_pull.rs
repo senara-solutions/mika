@@ -1775,7 +1775,9 @@ fn classify_stuck_ready(
 
     // mika#2279 — the same wait, behind a tracking row that no longer says so.
     //
-    // `in_flight` above reads one row: `reference_url LIKE …` AND a live status.
+    // `in_flight` above reads one row: `reference_url IN (…)` AND a live status
+    // (an exact enumeration of the closed variant set since mika#2638, where it
+    // was a prefix `LIKE` that also answered about a numeric neighbour).
     // A supersession cancels the parent while its pilot keeps working, so that
     // conjunction goes false on a ticket whose dispatch is very much running —
     // and Phase 2 then re-drove the label, every 20 minutes, killing a working
@@ -9082,8 +9084,9 @@ This ticket has been GROOMED and is ready.
             }
         };
 
-        // The `?phase=groom` variant must be covered by the same prefix `LIKE` —
-        // the rule the sibling query already carries.
+        // The `?phase=groom` variant must be covered by the same closed variant
+        // set — the rule the sibling query already carries (mika#2638; it was a
+        // prefix `LIKE` until then, which is what also matched a neighbour).
         let newer = seed("ready-label: newer", "?phase=groom").await;
         // The OLDER row is seeded SECOND and backdated an hour: `created_at` has
         // one-second resolution, so two rows seeded back to back tie and scan
@@ -9146,6 +9149,29 @@ This ticket has been GROOMED and is ready.
                 .await
                 .expect("find probe")
                 .is_none()
+        );
+
+        // **mika#2638 — a NUMERIC NEIGHBOUR must leave both answers together
+        // too.** `…/issues/2161` is a prefix of `…/issues/21610`, so under the
+        // prefix `LIKE` this probe returned the neighbour's task and the feeder
+        // named it as the one holding its pool. Equivalence is only worth
+        // asserting on a predicate that is itself right: two answers agreeing
+        // on a wrong row is the same defect twice, not a passing test.
+        seed("ready-label: neighbour", "0").await;
+        assert!(
+            !db.has_active_self_dev_task_for_issue(&url)
+                .await
+                .expect("boolean probe"),
+            "la sonde de #2161 a vu la tâche de #21610 : un préfixe ne délimite \
+             pas un numéro (mika#2638)"
+        );
+        assert!(
+            db.find_active_self_dev_task_for_issue(&url)
+                .await
+                .expect("find probe")
+                .is_none(),
+            "les deux réponses doivent exclure le voisin numérique ENSEMBLE — \
+             c'est ce qu'un site SQL unique rend vrai plutôt qu'espéré"
         );
     }
 

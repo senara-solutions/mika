@@ -174,7 +174,7 @@ async fn seed_child(
 /// pilote qui travaillera encore une heure — se lit `Alive`.
 ///
 /// C'est la lecture que `has_active_self_dev_task_for_issue` rend **fausse** (sa
-/// conjonction `reference_url LIKE …` ET `status IN ('pending','in_progress')`
+/// conjonction `reference_url IN (…)` ET `status IN ('pending','in_progress')`
 /// porte sur une seule row, et cette row est annulée), et c'est cette fausse
 /// réponse qui faisait re-driver le label toutes les 20 minutes.
 #[tokio::test]

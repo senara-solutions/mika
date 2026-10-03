@@ -1217,7 +1217,11 @@ impl Database {
         agent_id: &str,
         base_url: &str,
     ) -> Result<Vec<Task>> {
-        let groom_url = format!("{base_url}{}", crate::task_state::tasks::GROOM_PHASE_SUFFIX);
+        // Le même site de définition que les deux sondes de vol depuis
+        // mika#2638 : ce site était déjà délimité et sa sortie est octet pour
+        // octet la même — le but est que les trois ne puissent plus diverger,
+        // pas de modifier celui qui était juste.
+        let [exact_url, groom_url] = crate::task_state::tasks::issue_url_variants(base_url);
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1
@@ -1231,7 +1235,7 @@ impl Database {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, base_url, groom_url], Self::row_to_task)?
+            .query_map(params![agent_id, exact_url, groom_url], Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1699,9 +1703,17 @@ impl Database {
     /// issue, or `None` when none does (mika#2161 U3).
     ///
     /// `issue_url` is the canonical issue URL (e.g.
-    /// `https://github.com/senara-solutions/mika/issues/123`). The match is a
-    /// prefix `LIKE` so the `?phase=groom` suffix variant is covered — same rule
-    /// and same reason as [`Self::find_dispatch_children_for_issue_url`].
+    /// `https://github.com/senara-solutions/mika/issues/123`). The match is an
+    /// **exact enumeration of the closed variant set**
+    /// ([`crate::task_state::tasks::issue_url_variants`], `IN (?2, ?3)`), so the
+    /// `?phase=groom` variant is covered while a numeric neighbour is not —
+    /// same rule, same site, and same reason as
+    /// [`Self::find_dispatch_children_for_issue_url`] and
+    /// [`Self::find_active_tracking_rows_by_reference_url_and_variants`].
+    ///
+    /// It was a prefix `LIKE` until mika#2638, which is why the probe for
+    /// `…/issues/216` also answered about `…/issues/2161` — see the helper for
+    /// the measured defect and the two further widenings the prefix carried.
     ///
     /// # Why the oldest, and not the newest or an arbitrary one
     ///
@@ -1724,7 +1736,7 @@ impl Database {
         agent_id: &str,
         issue_url: &str,
     ) -> Result<Option<InFlightSelfDevTask>> {
-        let prefix = format!("{}%", issue_url);
+        let [exact, groom] = crate::task_state::tasks::issue_url_variants(issue_url);
         let found = self
             .conn
             .query_row(
@@ -1732,10 +1744,10 @@ impl Database {
                  WHERE agent_id = ?1
                    AND source = 'self_dev'
                    AND status IN ('pending', 'in_progress')
-                   AND reference_url LIKE ?2
+                   AND reference_url IN (?2, ?3)
                  ORDER BY COALESCE(fired_at, created_at) ASC
                  LIMIT 1",
-                params![agent_id, prefix],
+                params![agent_id, exact, groom],
                 |r| {
                     Ok(InFlightSelfDevTask {
                         task_id: r.get(0)?,
@@ -2202,16 +2214,24 @@ impl Database {
     ///
     /// **The absent predicate is the fix.** There is deliberately no condition
     /// on `parent.status`. `has_active_self_dev_task_for_issue` conjoins
-    /// `reference_url LIKE …` with `status IN ('pending','in_progress')` on one
+    /// `reference_url IN (…)` with `status IN ('pending','in_progress')` on one
     /// row, and that conjunction goes false the instant a supersession cancels
     /// the parent — while the pilot on the child keeps running. That false
     /// answer is what let the mika#2279 loop re-drive a ticket every 20 minutes
     /// with its pilot working: a cancelled parent is not the absence of a
     /// dispatch, it is exactly the state where the question needs asking.
     ///
-    /// `issue_url` is matched as a prefix `LIKE` so the `?phase=groom` variant
-    /// is covered — same rule, same reason, as
+    /// `issue_url` is matched against the **closed variant set**
+    /// ([`crate::task_state::tasks::issue_url_variants`], `IN (?2, ?3)`) so the
+    /// `?phase=groom` variant is covered while a numeric neighbour is not —
+    /// same rule, same site, same reason, as
     /// [`Self::has_active_self_dev_task_for_issue`].
+    ///
+    /// **This was a prefix `LIKE` until mika#2638, and the blast radius here is
+    /// the wider of the two sites:** gate 2c of the `ready_label_handler`
+    /// refused a `labeled ready` **on the strength of another ticket's pilot**,
+    /// which freezes a healthy ticket rather than merely mis-naming one in a log
+    /// line.
     ///
     /// Two things this query does **not** decide, both left to the caller:
     /// liveness (only `/proc` can answer that) and the child's terminal status
@@ -2241,7 +2261,7 @@ impl Database {
         agent_id: &str,
         issue_url: &str,
     ) -> Result<Vec<IssueDispatchChild>> {
-        let prefix = format!("{}%", issue_url);
+        let [exact, groom] = crate::task_state::tasks::issue_url_variants(issue_url);
         let mut stmt = self.conn.prepare(
             "SELECT child.id,
                     child.process_id,
@@ -2253,13 +2273,13 @@ impl Database {
              FROM tasks child
              JOIN tasks parent ON child.parent_task_id = parent.id
              WHERE parent.agent_id = ?1
-               AND parent.reference_url LIKE ?2
+               AND parent.reference_url IN (?2, ?3)
                AND child.trigger_type = 'callback'
                AND child.process_id IS NOT NULL
              ORDER BY child.id",
         )?;
         let rows = stmt
-            .query_map(params![agent_id, prefix], |row| {
+            .query_map(params![agent_id, exact, groom], |row| {
                 Ok(IssueDispatchChild {
                     parent_task_id: row.get(4)?,
                     child: DispatchChild {
@@ -4247,11 +4267,7 @@ impl Database {
         agent_id: &str,
         issue_url: &str,
     ) -> Result<crate::task_state::tasks::GroomConvergence> {
-        let legacy_groom_url = format!(
-            "{}{}",
-            issue_url,
-            crate::task_state::tasks::GROOM_PHASE_SUFFIX
-        );
+        let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
         let mut stmt = self.conn.prepare(
             "SELECT child.result FROM tasks child
              JOIN tasks parent ON child.parent_task_id = parent.id
@@ -4262,7 +4278,7 @@ impl Database {
                AND parent.reference_url IN (?2, ?3)",
         )?;
         let verdicts = stmt
-            .query_map(params![agent_id, issue_url, legacy_groom_url], |row| {
+            .query_map(params![agent_id, exact_url, legacy_groom_url], |row| {
                 row.get::<_, Option<String>>(0)
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
@@ -4328,11 +4344,7 @@ impl Database {
         agent_id: &str,
         issue_url: &str,
     ) -> Result<Option<Option<String>>> {
-        let legacy_groom_url = format!(
-            "{}{}",
-            issue_url,
-            crate::task_state::tasks::GROOM_PHASE_SUFFIX
-        );
+        let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
         let row: Option<Option<String>> = self
             .conn
             .query_row(
@@ -4345,7 +4357,7 @@ impl Database {
                    AND parent.reference_url IN (?2, ?3)
                  ORDER BY child.created_at DESC, child.id DESC
                  LIMIT 1",
-                params![agent_id, issue_url, legacy_groom_url],
+                params![agent_id, exact_url, legacy_groom_url],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?;

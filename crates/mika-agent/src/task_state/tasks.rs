@@ -250,6 +250,126 @@ pub fn strip_groom_phase_suffix(reference_url: &str) -> &str {
         .unwrap_or(reference_url)
 }
 
+/// Les deux — et seulement les deux — écritures de `reference_url` qui
+/// désignent une issue donnée (mika#2638).
+///
+/// `base_url` est **normalisé ici** : le helper retire lui-même un
+/// `?phase=groom` résiduel via [`strip_groom_phase_suffix`], qui est idempotent.
+/// Les appelants y arrivent par deux chemins — les sondes de vol
+/// **construisent** l'URL depuis `owner/repo` + numéro, donc elle est canonique
+/// par construction ; les surfaces de nettoyage de mika#1934 reçoivent une
+/// `reference_url` de la base et la nettoyaient déjà en amont. La normalisation
+/// interne ne change donc **aucune** sortie actuelle : elle rend le helper
+/// fail-safe pour un futur appelant, au lieu de faire dépendre sa justesse
+/// d'une précondition que rien ne vérifie.
+///
+/// # Pourquoi une énumération, et jamais un préfixe `LIKE`
+///
+/// **Un préfixe ne délimite pas un numéro.** La sonde de
+/// `…/issues/216` écrite `reference_url LIKE '…/issues/216%'` matche aussi les
+/// tâches de `…/issues/2160` à `…/issues/2169`, et `…/issues/21600` — le défaut
+/// mesuré par la revue de PR #2635, dont la conséquence était que le message
+/// « le bassin est coincé en vol » de mika#2161 **nommait la tâche d'un autre
+/// ticket**. La maison avait déjà tranché cette classe trois fois en délimitant
+/// (`degroom_marker_key` de mika#2347, qui écrit le piège `#234` vs `#2343` mot
+/// pour mot ; `hold_audit_key` de mika#2199 et le faucheur de mika#2420, tous
+/// deux bornés par un séparateur `@`) ; les sondes de vol ne l'avaient pas
+/// appliquée.
+///
+/// Le préfixe portait **deux** élargissements de plus, tous deux fermés
+/// gratuitement par l'égalité :
+///
+/// - **`_` est un joker `LIKE` d'un caractère.** GitHub autorise `_` dans un nom
+///   de dépôt, donc une sonde pour `…/my_repo/issues/42` matchait
+///   `…/myXrepo/issues/42`. Population vide aujourd'hui, réelle demain.
+/// - **`LIKE` est insensible à la casse en ASCII** alors que `reference_url` est
+///   déclarée `TEXT` sans `COLLATE NOCASE`. Conséquence de **justesse**, pas de
+///   performance : `…/ISSUES/216` matchait, et l'égalité le refuse. Population
+///   vide par construction (tout écrivain bâtit l'URL depuis des littéraux
+///   minuscules et la casse canonique de GitHub), donc nommée plutôt
+///   qu'invisible.
+///
+/// **Ce que le changement n'achète PAS, et il faut le dire ici parce que
+/// l'intuition dit le contraire :** aucun gain de plan d'exécution. Le plan de
+/// mika#2638 affirmait qu'un `LIKE 'préfixe%'` ne peut pas utiliser
+/// `idx_tasks_manual_active_ref_url` là où un `IN (…)` peut ; c'est **faux**, et
+/// mesuré tel quel (SQLite 3.53, `EXPLAIN QUERY PLAN` sur le DDL réel) : les
+/// deux formes rendent le même plan, `SEARCH tasks USING INDEX
+/// idx_tasks_agent_status` plus un B-tree temporaire. L'index partiel est en
+/// fait **inatteignable** pour ces requêtes — sa clause exige
+/// `trigger_type = 'manual'` et `status NOT IN ('completed', …)`, qu'aucune
+/// d'elles ne porte, et un `status IN ('pending','in_progress')` n'implique pas
+/// syntaxiquement le `NOT IN`. Laisser l'affirmation debout enverrait la
+/// prochaine personne qui règle ce chemin dans un cul-de-sac.
+///
+/// # Un site de définition, cinq appelants
+///
+/// Les cinq requêtes qui posent une question sur l'issue d'une tâche passent
+/// par ici :
+///
+/// | site | question |
+/// |---|---|
+/// | `Database::find_active_self_dev_task_for_issue` | « une tâche self_dev active référence-t-elle ce ticket ? » — `auto_pull` Phase 0/2 |
+/// | `Database::find_dispatch_children_for_issue_url` | « un pilote est-il vif pour ce ticket ? » — lecteur unique de [`crate::live_pilot`] (mika#2279) |
+/// | `Database::find_active_tracking_rows_by_reference_url_and_variants` | « quelles lignes de suivi nettoyer ? » (mika#1934) |
+/// | `Database::has_completed_groom_for_issue` | « ce ticket a-t-il un groom convergé ? » (mika#1620 / mika#2287) |
+/// | `Database::latest_groom_verdict_for_issue` | « quel est son dernier verdict de groom ? » |
+///
+/// Les **trois derniers étaient déjà délimités** et sont réécrits à travers ce
+/// helper **sans changement de comportement** : leur sortie est octet pour
+/// octet la même. Le but est que les cinq ne puissent plus diverger, pas de
+/// modifier ceux qui étaient justes — et les deux derniers épelaient l'ensemble
+/// à la main, c'est-à-dire étaient exactement la forme que le détecteur D5 de
+/// mika#2638 existe pour refuser.
+///
+/// Cinq appelants pour une définition : c'est ce qui empêche deux requêtes
+/// d'épeler différemment l'ensemble des variantes — la leçon que
+/// [`crate::grooming_marker`] a dû graver une fois (mika#2158, où promotion et
+/// routage répondaient différemment à la même question pendant des mois sans
+/// que rien ne casse) et que `live_pilot` a payée une seconde fois (mika#2335).
+///
+/// # L'ensemble est CLOS, et le rétrécissement est nommé
+///
+/// Passer du préfixe à l'énumération **rétrécit** : une ligne portant
+/// `…/issues/2638/` ou `…/issues/2638#issuecomment-1` était vue en vol hier et
+/// ne l'est plus.
+///
+/// **Ce que cette borne dit exactement**, parce que la formulation courte est
+/// fausse et qu'une revue l'a relevée : une telle ligne n'est **pas** « hors de
+/// `idx_tasks_manual_active_ref_url` » — cet index est
+/// `UNIQUE(agent_id, reference_url)` sur un prédicat partiel, donc la ligne y
+/// entre sous **sa propre** clé. Ce qui est vrai, et qui est la borne, est
+/// qu'elle **ne dédoublonne pas** contre la ligne canonique : les deux
+/// coexistent comme deux tâches actives pour la même issue. C'est donc déjà un
+/// défaut en amont, et plus grave que celui-ci.
+///
+/// **Le rétrécissement n'est pas purement théorique, et son écrivain est
+/// nommé.** Tous les écrivains **moteur** composent l'URL par `format!` à
+/// partir de littéraux et de `owner/repo`, donc ne produisent que les deux
+/// variantes. L'outil `create_task`, lui, prend `reference_url` de l'entrée du
+/// modèle avec un `.trim()` pour seule normalisation : une forme non prescrite
+/// écrite par là sort de la population des sondes, et une tâche en vol
+/// redevient invisible — c'est-à-dire la porte 2c de mika#2279 qui laisse
+/// repartir un dispatch. Population **non mesurée** (le prompt ne prescrit que
+/// les deux variantes déclarées), remède hors périmètre de mika#2638 : la
+/// canonicalisation appartient au **point d'écriture**, pas au prédicat de
+/// lecture. Précondition du suivi : la sonde opérateur § 8 S1 de
+/// `docs/plans/2026-10-02-002-fix-2638-reference-url-numero-delimite-plan.md`,
+/// qui dit si l'ensemble est clos en production.
+pub fn issue_url_variants(base_url: &str) -> [String; 2] {
+    // Le helper NORMALISE au lieu d'exiger. `strip_groom_phase_suffix` est
+    // idempotent, donc les deux appelants qui nettoient déjà en amont rendent
+    // exactement la même paire qu'avant — et un futur sixième appelant qui
+    // passerait une `reference_url` lue en base sans la nettoyer obtiendrait
+    // sinon `…?phase=groom` et `…?phase=groom?phase=groom`, c'est-à-dire une
+    // paire qui n'apparie **rien** : un silence, la pire des trois issues.
+    let base_url = strip_groom_phase_suffix(base_url);
+    [
+        base_url.to_string(),
+        format!("{base_url}{GROOM_PHASE_SUFFIX}"),
+    ]
+}
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: String,
@@ -677,6 +797,39 @@ pub struct TaskHealthSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // mika#2638 — le helper aux bornes, et l'ORDRE de ses deux fentes.
+    //
+    // Les cinq consommateurs passent la paire dans un `reference_url IN (?2, ?3)`,
+    // qui est **indifférent à l'ordre**. Donc inverser `[base, base+suffixe]`
+    // laisserait les dix tests de mika#2638 verts pendant que les cinq
+    // destructurations `let [exact, groom] = …` nomment chacune la mauvaise
+    // valeur — un renommage silencieux qu'aucun test de consommateur ne peut
+    // voir (relevé en revue). Ces deux tests sont le seul endroit où l'ordre
+    // est observable.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn mika2638_la_premiere_fente_est_lurl_exacte_la_seconde_la_variante_groom() {
+        let [exact, groom] = issue_url_variants("https://github.com/o/r/issues/42");
+        assert_eq!(exact, "https://github.com/o/r/issues/42");
+        assert_eq!(groom, "https://github.com/o/r/issues/42?phase=groom");
+    }
+
+    /// Le helper NORMALISE au lieu d'exiger : une URL portant déjà le suffixe
+    /// rend la même paire qu'une URL canonique. Sans ça, un futur appelant qui
+    /// passerait une `reference_url` lue en base obtiendrait une paire
+    /// n'appariant rien — un silence, pas une erreur.
+    #[test]
+    fn mika2638_le_helper_est_idempotent_sur_le_suffixe_groom() {
+        let base = "https://github.com/o/r/issues/42";
+        assert_eq!(
+            issue_url_variants(&format!("{base}{GROOM_PHASE_SUFFIX}")),
+            issue_url_variants(base),
+            "un `?phase=groom` résiduel doit être retiré par le helper"
+        );
+    }
 
     // ---------------------------------------------------------------------
     // mika#2590 U8c — la fonction pure aux bornes.
