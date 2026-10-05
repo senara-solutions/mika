@@ -43,7 +43,7 @@ toml_edit = "0.25"
 dotenvy = "0.15"
 
 # Directories
-dirs = "6"
+dirs = "7"
 
 # Logging
 tracing = "0.1"
