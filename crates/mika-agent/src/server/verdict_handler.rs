@@ -580,11 +580,56 @@ async fn handle_pass_verdict(
             "VERDICT: pass but CI checks failing — passing through to LLM"
         );
 
+        // Relance une fois, puis blocage (mika#2617 U3/AC2). Effet de bord,
+        // jamais une décision : ce bras rend `Passthrough` quoi qu'il arrive.
+        //
+        // **Rectification au plan R11, qui comptait zéro appel ajouté ici.**
+        // C'est vrai du tool et de `merge_ready_handler`, pas de ce bras : il
+        // `return` **avant** le preflight de l'étape behind-main, donc le head
+        // SHA n'est pas encore en main. `fetch_pr_head_sha` (mika#1563) le
+        // résout, et c'est **un** aller-retour de plus sur un chemin déjà
+        // rouge, où la relance elle-même est un appel réseau. Le remonter
+        // avant ce bras le ferait payer à toutes les branches, y compris la
+        // nominale.
+        //
+        // Une résolution en échec rend la chaîne vide, que
+        // `maybe_rerun_failed_checks` lit comme illisible (fail-closed) — jamais
+        // comme une tête.
+        //
+        // **Et elle n'est tentée que si la relance va la lire.** Les deux
+        // premiers termes de `maybe_rerun_failed_checks` (un run dérivable,
+        // l'armement) ne touchent pas au `head_sha`, donc sur un process
+        // désarmé ou sur une PR dont aucun check rouge ne porte de run Actions,
+        // l'aller-retour serait payé pour être jeté — l'ordre du moins cher au
+        // plus cher qui vit dans ce module n'achèterait alors rien, puisque
+        // l'appelant paierait le terme le plus cher d'abord. `rerun_needs_the_head`
+        // est ce prédicat, à un seul lecteur, pour qu'il ne puisse pas diverger
+        // de l'ordre réel des termes.
+        let head_sha = if crate::merge_gate_rerun::rerun_needs_the_head(&checks) {
+            fetch_pr_head_sha(event.pr_number, &event.repo, token)
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let rerun = crate::merge_gate_rerun::maybe_rerun_failed_checks(
+            db,
+            session_id,
+            trace_id,
+            &event.repo,
+            event.pr_number,
+            &head_sha,
+            &checks,
+            token,
+        )
+        .await;
+
         return VerdictAction::Passthrough {
             enrichment: Some(format!(
                 "[verdict_handler] VERDICT: pass received but CI checks are failing:\n{}\n\
-                 The structural merge handler did not act. Handle the CI failures.\n\n",
-                failing.join("\n")
+                 The structural merge handler did not act. Handle the CI failures.{}\n\n",
+                failing.join("\n"),
+                crate::merge_gate_rerun::rerun_detail_suffix(&rerun)
             )),
         };
     }

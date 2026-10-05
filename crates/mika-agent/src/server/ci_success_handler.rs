@@ -419,14 +419,44 @@ pub async fn try_handle_ci_success(
     let classification = classify_checks(&checks);
 
     if classification != CheckClassification::AllPassed {
-        let detail = match classification {
+        // Un seul `match` rend les deux moitiés de ce que la ligne dira. Deux
+        // discriminations successives sur la même valeur — une pour le détail,
+        // une pour décider de la relance — étaient deux endroits libres de
+        // diverger sur « ce bras est-il le rouge ? ».
+        //
+        // La relance (mika#2617 U3/AC2) est un effet de bord, jamais une
+        // décision : ce chemin rend `Passthrough` quoi qu'il arrive.
+        //
+        // **Aucun appel réseau ajouté** : `find_open_pr` a déjà résolu
+        // `pr.head_sha` à l'étape 2b — c'est la ligne la plus favorable du
+        // tableau de R11, et c'est elle qui rend la relance gratuite ici.
+        //
+        // L'issue vit sur la ligne de journal, pas dans un `enrichment` : ce
+        // handler rend délibérément `enrichment: None` (il évalue, il ne parle
+        // pas au modèle — mika#2260), et U3 n'a pas pour périmètre de changer
+        // ce contrat.
+        let (detail, rerun_note) = match classification {
             CheckClassification::HasFailures => {
                 let failing: Vec<String> = checks
                     .iter()
                     .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
                     .map(|c| format!("  - {} ({})", c.name, c.state))
                     .collect();
-                format!("failing checks:\n{}", failing.join("\n"))
+                let rerun = crate::merge_gate_rerun::maybe_rerun_failed_checks(
+                    db,
+                    session_id,
+                    trace_id,
+                    &event.repo,
+                    pr.number,
+                    &pr.head_sha,
+                    &checks,
+                    token,
+                )
+                .await;
+                (
+                    format!("failing checks:\n{}", failing.join("\n")),
+                    crate::merge_gate_rerun::rerun_detail_suffix(&rerun),
+                )
             }
             CheckClassification::HasPending => {
                 let pending: Vec<String> = checks
@@ -434,7 +464,10 @@ pub async fn try_handle_ci_success(
                     .filter(|c| c.bucket == "pending")
                     .map(|c| format!("  - {} ({})", c.name, c.state))
                     .collect();
-                format!("pending checks:\n{}", pending.join("\n"))
+                (
+                    format!("pending checks:\n{}", pending.join("\n")),
+                    String::new(),
+                )
             }
             CheckClassification::AllPassed => unreachable!(),
         };
@@ -442,7 +475,7 @@ pub async fn try_handle_ci_success(
         info!(
             pr_number = pr.number,
             repo = %event.repo,
-            "CI success event for one workflow but not all required checks pass yet: {detail}"
+            "CI success event for one workflow but not all checks pass yet: {detail}{rerun_note}"
         );
         return VerdictAction::Passthrough { enrichment: None };
     }

@@ -4902,9 +4902,9 @@ prouve rien : il faut qu'une PR ait traversé la porte depuis le déploiement.
 - **Il ne couvre pas le merge par l'interface GitHub ni par `gh pr merge` tapé à
   la main.** La porte garde le moteur. Un humain avec le bypass admin merge
   toujours sur rouge, et c'est la moitié que le pont (b) ferme.
-- **Il ne relance aucun check flaky** (phase B, AC2) et n'exige aucune trace de
-  gate MPC (phase C, AC5). Sans relance, un check rouge bloque — c'est le
-  comportement sûr, et c'est ce qui rend la phase A autonome.
+- **Il n'exige aucune trace de gate MPC** (phase C, AC5). La relance de la
+  phase B est livrée ci-dessous ; sans elle, un check rouge bloquait — c'est le
+  comportement sûr, et c'est ce qui a rendu la phase A autonome.
 - **Il ne ferme pas le fail-open sur un bucket inconnu** : il le rend visible.
 - **Il dégrade un cas du contexte de réparation, et c'est un coût assumé.**
   `ci_failure_handler` collecte désormais les logs parmi **tous** les checks
@@ -4919,6 +4919,172 @@ prouve rien : il faut qu'une PR ait traversé la porte depuis le déploiement.
 
 Raisonnement complet, les cinq consommateurs et les trois détecteurs :
 `crates/mika-agent/CLAUDE.md` § *The gate reads every check*.
+
+### Optional (relance une fois, puis blocage — mika#2617, phase B)
+
+- `MIKA_MERGE_GATE_RERUN` — désarme la **relance** d'un check rouge, et elle
+  seule. **Défaut : armée.** `0`/`false`/`off`/`no` (insensible à la casse,
+  espaces tolérés) désarment ; absent, vide ou **non reconnu** laissent armée,
+  avec un `merge_gate_rerun_unrecognized_value` nommant la valeur **entre
+  guillemets** — sans eux une espace parasite est invisible (mika#2220).
+  Polarité de `MIKA_QA_CI_COHERENCE_GATE`. Lue **une fois par process** et mise
+  en cache : poser ou retirer la variable sur un process déjà démarré n'a aucun
+  effet, par construction.
+- **Elle gate la relance, jamais la lecture ni le refus.** La détection du rouge
+  et la fermeture de la porte sont inconditionnelles (motif mika#2249 /
+  mika#2272) : désarmé, le moteur lit les checks, refuse le merge, et dit
+  simplement qu'aucune relance n'a été tentée.
+- **Aucune variable ne relève le budget, et c'est le point d'AC2.** « Jamais de
+  seconde relance automatique » n'est pas un réglage : le budget est une ligne
+  dans `audit_events` sous `merge_gate_check_rerun`, clé
+  `rerun:{repo}#{pr}@{head_sha}:{run_id}`. **Un nouveau commit rouvre le budget
+  de lui-même** — nouveau code, nouvelle chance — et c'est la seule façon de le
+  rouvrir.
+
+**Ce que ça fait, en une phrase.** Un check rouge sur la tête d'une PR déclenche
+**une** relance des jobs échoués de son run (`gh run rerun <run> --failed`,
+bornée à 30 s). S'il repasse au vert, la porte se ré-évalue par le rendez-vous
+`check_suite.completed` qui existe déjà (motif mika#2238), jamais par une boucle
+d'attente. S'il échoue deux fois, ce n'est pas un flaky, c'est cassé, et la porte
+reste fermée. Un seul appel couvre les N lints rouges d'un même run `ci.yml`.
+
+**Ce que ça ne fait PAS : ouvrir la porte.** La porte est fermée par la phase A,
+et elle l'est quoi qu'il arrive ici. La relance est un **effet de bord plus un
+motif**, et un test épingle qu'aucune de ses six issues ne prétend autoriser un
+merge.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Une relance a-t-elle été déclenchée, et sur quel run ?
+grep merge_gate_check_rerun "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{repo, pr, head_sha, run_id, outcome, reason, detail}'
+
+# 2. Le budget a-t-il été épuisé ?
+grep merge_gate_rerun_exhausted "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{repo, pr, head_sha, run_id, red_checks}'
+
+# 3. Le ledger est-il lisible ? (régime attendu : VIDE)
+grep -E 'merge_gate_rerun_ledger_(unreadable|unwritable)' "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. CONTRÔLE POSITIF — la porte s'évalue-t-elle seulement sur du rouge ?
+grep merge_gate_check_rerun "$MIKA_SPIRIT_LOG_FILE" | wc -l
+```
+
+```sql
+-- La population des tentatives. SOLE WRITER, donc ce compte est exact plutôt
+-- qu'un nombre sur lequel deux sites peuvent diverger — et c'est le même
+-- compte qui tient l'invariant « jamais deux fois ».
+SELECT count(*) FROM audit_events WHERE tool_name = 'merge_gate_check_rerun';
+
+-- Le détail, par tête et par run
+SELECT target_key, created_at, reasoning FROM audit_events
+ WHERE tool_name = 'merge_gate_check_rerun' ORDER BY created_at DESC;
+```
+
+| `outcome` | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `triggered` | INFO | **non vide après S3** | une relance est partie ; **vide** veut dire inerte, voir halte 2 |
+| `refused` | INFO | **vide** | 403 probable : le scope `actions: write` manque. Le `detail` porte la sortie de `gh` |
+| `already_spent` | INFO (+ WARN `merge_gate_rerun_exhausted`) | non vide, faible | deux échecs : ce n'est pas flaky, c'est cassé — le comportement **voulu** |
+| `no_actions_run` | INFO | faible | check externe, ou lien de run sans `/job/` : rien à relancer |
+| `ledger_unreadable` | INFO (+ WARN) | **vide** | base en échec ou `head_sha` vide ; le champ `reason` sépare les deux (`ledger_read_failed`, `ledger_write_failed`, `empty_head_sha`) |
+| `disarmed` | INFO | vide hors intervention | `MIKA_MERGE_GATE_RERUN=0` est posé sur ce process |
+
+**Pourquoi `already_spent` n'écrit AUCUNE ligne d'audit, et c'est une révision du
+plan.** Il annonçait « WARN + ligne d'audit ». Un seul push produit jusqu'à huit
+`check_suite.completed` (mika#1869), donc une ligne par *évaluation* d'une tête
+déjà relancée serait jusqu'à huit lignes par push sur une population qui ne
+change pas — le churn que la doctrine mika#2131 borne — **et** elle polluerait le
+compte qui tient l'invariant « jamais deux fois », dont le prédicat **est** un
+compte. L'information durable est déjà la ligne de tentative ; l'épuisement est
+son corollaire, pas un fait neuf. Le WARN, lui, reste.
+
+#### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi**. Après `make deploy`,
+> établir que le `mika-spirit` qui tourne porte le correctif avant toute
+> conclusion (classe mika#2340). Ce sont des **gestes d'opérateur sur l'hôte** :
+> la base n'est pas montée dans le bac à sable de dispatch et `gh` y est refusé.
+
+**S1 — la relance est tentée (première PR rouge).** Une ligne
+`merge_gate_check_rerun` portant le dépôt, la PR, la tête et le run.
+*Halte 1 — aucune ligne alors qu'une PR rouge a traversé la porte :* **ne pas
+élargir le prédicat par réflexe.** Lire le contrôle positif (commande 4) : zéro
+ligne signifie que la porte ne s'évalue pas du tout, ou que le binaire servi
+précède le correctif, et la question n'est alors pas le prédicat. Lire ensuite si
+l'issue est `no_actions_run` — un check externe rouge est une population
+légitime, pas une panne.
+
+**S2 — le scope existe, c'est-à-dire qu'AC2 n'est pas inerte (première PR
+rouge).** `outcome = triggered`, et le run réapparaît sur GitHub.
+*Halte 2 — `outcome = refused` avec un 403 :* **AC2 est inerte et il faut le
+dire** plutôt que la revendiquer. Le remède est un scope `actions: write` sur
+l'App ou le PAT — geste opérateur, pas un correctif de code. Entre-temps la porte
+reste fermée, ce qui est le bon état. **Ne pas désarmer la relance pour faire
+taire la ligne** : elle est la mesure que le scope manque.
+
+**S3 — jamais deux fois (7 jours).** Pour une tête donnée, au plus **une** ligne
+d'audit sous sa clé. La requête SQL du détail, groupée par `target_key`, ne doit
+porter aucune clé comptée au-delà de 1.
+*Halte 3 — une clé comptée deux fois :* le ledger n'est pas relu, ou la
+réservation est écrite après la relance — c'est l'invariant d'AC2 qui a sauté.
+**Désarmer d'abord** (`MIKA_MERGE_GATE_RERUN=0`), diagnostiquer ensuite : une
+relance qui boucle consomme un run CI complet à chaque tour.
+
+**S4 — la mesure qui conditionne la révision de la relance (30 jours).** Quelle
+part des `triggered` est suivie d'un run vert ?
+*Halte 4 — la part est proche de zéro :* la relance ne rattrape rien et coûte un
+run CI complet par PR rouge. C'est un **résultat**, pas une panne : il réfute
+l'hypothèse flaky pour cette flotte, et c'est la précondition d'un ticket qui la
+retire ou la restreint à une liste de checks. L'ouvrir **avec ce compte**, jamais
+avec une intuition. Et **ne pas désarmer entre-temps** : la relance est ratifiée
+par Vincent sur bearing Prime.
+
+**Halte transverse — les sondes muettes.** Zéro relance **et** zéro évaluation ne
+prouve rien : il faut qu'une PR **rouge** ait traversé la porte depuis le
+déploiement. *Une garde que personne n'a exercée se lit exactement comme une
+garde qui marche* (mika#2205).
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne garantit pas que la relance soit possible.** Le scope `actions: write`
+  n'est pas dans les scopes documentés du jeton de la plateforme : AC2 peut être
+  inerte au déploiement, en 403, et **elle n'est pas revendiquée tenue avant la
+  sonde S2** (plan R3). Annoncer la clôture avant serait la garantie que
+  mika#2304 nomme.
+- **Il ne garantit pas qu'une relance répare quoi que ce soit** (sonde S4).
+- **Il ne rattrape pas #2614 ni mika#2616**, et rien ne rétro-estampille une
+  tentative qu'on n'a pas observée : la sonde est la **prochaine** occurrence.
+- **Il ne relance rien par l'interface GitHub ni sur une PR mergée à la main.**
+  Comme la porte elle-même, il garde le moteur.
+- **Il ne couvre pas un check rouge sans run Actions** (check externe, lien sans
+  `/job/`) : population nommée, `no_actions_run`, jamais relancée.
+- **Il ne relance qu'UN run, même sur une PR rouge sur plusieurs.** « Un seul
+  appel couvre les N lints » est vrai des N lints d'un **même** run ; ce dépôt
+  porte cinq workflows, donc une PR rouge à la fois sur `ci.yml` et sur
+  `pr-body-validation.yml` est rouge sur **deux** runs, et seul le premier est
+  relancé — le second ne l'est qu'au prochain `check_suite.completed`, ce qui
+  coûte un cycle complet. La clé de ledger porte déjà le `run_id`, donc traiter
+  tous les runs d'une passe serait sûr côté budget ; ce qui l'écarte de la phase
+  B est que ça élargirait l'issue de la relance d'une valeur à un **ensemble**,
+  donc son lecteur unique et les trois sites d'appel. **Suivi nommé**,
+  précondition : des PR rouges sur plusieurs runs dans la population de
+  `merge_gate_check_rerun`.
+- **Le champ de journal s'appelle `red_checks`, pas « ce qui a été relancé ».**
+  Il liste **tous** les checks rouges, non-Actions compris, alors que la relance
+  n'en vise qu'un run : la ligne peut donc nommer un check que rien n'a relancé.
+  Aucune décision n'en dépend — les deux champs sont de la télémétrie et la
+  porte est fermée dans tous les cas — et le nom est choisi pour ne pas le
+  suggérer.
+- **Il ne pose pas la trace de gate MPC** (phase C, AC5).
+- **Il ne rend pas la relance surveillée.** Les seuls instruments sont les greps
+  et les requêtes ci-dessus, et **leur silence ne prouve rien tant que personne
+  ne les exécute**.
+
+Raisonnement complet, le lecteur unique de la grammaire de lien et l'ordre
+réservation-puis-effet : `crates/mika-agent/CLAUDE.md` § *Rerun once, then
+block*.
 
 ### Un tour Webhook Fallthrough ne crée pas de travail par `run_gh` (mika#2573)
 
