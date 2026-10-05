@@ -985,7 +985,7 @@ where
                     location,
                     pid,
                     &child_task_id,
-                    &parent_task_id,
+                    parent_task_id,
                 ),
             },
             ReadyLabelGate::PilotInFlight,
