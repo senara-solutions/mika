@@ -64,7 +64,7 @@ pub(crate) const HOLD_REVIEW_NO_TASK_MARKER: &str =
     "[verdict_handler] hold[review] without an active task";
 
 /// Audit-event `tool_name` for that passthrough (mika#2667 AC2). **SOLE
-/// WRITER**: `handle_hold_review`.
+/// WRITER**: `hold_review_without_task`.
 pub const HOLD_REVIEW_NO_TASK_AUDIT_TOOL: &str = "verdict_hold_review_no_task";
 
 /// Maximum block[ac] retries before escalation.
@@ -1845,8 +1845,6 @@ async fn handle_escalate(
 // Hold[review] handler (#889)
 // ---------------------------------------------------------------------------
 
-/// Handle VERDICT: hold[review] — notify operator, leave task in_progress.
-/// Enriches the pre-digest with diff fingerprint data (#1563).
 /// The `hold[review]` passthrough when no active task matches the PR
 /// (mika#2667 AC2).
 ///
@@ -1906,6 +1904,8 @@ async fn hold_review_without_task(
     }
 }
 
+/// Handle VERDICT: hold[review] — notify operator, leave task in_progress.
+/// Enriches the pre-digest with diff fingerprint data (#1563).
 async fn handle_hold_review(
     event: &PrReviewEvent,
     db: &AsyncDatabase,
