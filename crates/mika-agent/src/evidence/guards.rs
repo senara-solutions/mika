@@ -3741,6 +3741,112 @@ pub fn log_dependabot_verdict_gate_state() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// mika#2667 — l'identité dispatcher n'est jamais relecteur
+// ---------------------------------------------------------------------------
+//
+// La séparation des rôles à la porte de merge (mika#2218, mika#2248) donne la
+// revue à `mika-platform-qa` et le dispatch à `mika-platform-dev`. Côté
+// écriture, elle n'était tenue que par le prompt : rien n'empêchait l'agent
+// dispatcher de poster lui-même un `VERDICT:` ou une approbation sur une PR
+// qu'il n'a pas écrite, ce qui contourne la revue.
+//
+// Même famille que mika#2237 et mika#2573 : un prédicat pur sur l'argv ici,
+// l'application dans la chaîne pré-subprocess de `run_gh`. Le terme d'identité
+// (l'agent courant est-il le dispatcher ?) vit dans la fonction d'application,
+// parce que c'est elle qui tient le `ToolContext`.
+
+/// Audit-event `tool_name` pour chaque refus de verdict posé par le dispatcher
+/// (mika#2667). **SOLE WRITER** : `skills::builtin_handlers`.
+pub const DISPATCHER_REVIEW_REFUSED_AUDIT_TOOL: &str = "dispatcher_review_refused";
+
+/// Ce qu'un `gh pr review` porte qui en fait un acte de relecteur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdictAct {
+    /// `--approve` / `-a` : une approbation de revue.
+    Approve,
+    /// Un corps dont une ligne est une ligne `VERDICT:` — lue par le lecteur
+    /// unique de la grammaire, `server::verdict::verdict_raw_value`.
+    VerdictLine,
+    /// Un corps lu depuis un fichier (`--body-file` / `-F`) : l'argv ne permet
+    /// pas d'établir qu'il ne porte pas de verdict. Pour le dispatcher, un
+    /// corps illisible n'est jamais un corps sans verdict.
+    UnreadableBody,
+}
+
+impl ReviewVerdictAct {
+    /// Le motif, comme **format de fil** (`audit_events.after_value`).
+    pub fn motif(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::VerdictLine => "verdict_line",
+            Self::UnreadableBody => "unreadable_body",
+        }
+    }
+}
+
+/// Reconnaît, dans un argv `gh`, un `pr review` qui pose un verdict ou une
+/// approbation (mika#2667 AC1).
+///
+/// `None` hors `pr review`, et pour un `pr review` qui ne porte ni approbation,
+/// ni ligne `VERDICT:`, ni corps illisible — un commentaire ordinaire reste
+/// permis. Les valeurs des drapeaux à valeur sont sautées : un corps qui
+/// *cite* `--approve` dans sa prose n'est pas une approbation.
+pub fn detect_review_verdict_act(argv: &[String]) -> Option<ReviewVerdictAct> {
+    if argv.first().map(String::as_str) != Some("pr")
+        || argv.get(1).map(String::as_str) != Some("review")
+    {
+        return None;
+    }
+    let mut approve = false;
+    let mut unreadable_body = false;
+    let mut bodies: Vec<&str> = Vec::new();
+    let mut i = 2usize;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        match arg {
+            "--approve" | "-a" => approve = true,
+            "--body" | "-b" => {
+                if let Some(v) = argv.get(i + 1) {
+                    bodies.push(v);
+                }
+                i += 2;
+                continue;
+            }
+            "--body-file" | "-F" => {
+                unreadable_body = true;
+                i += 2;
+                continue;
+            }
+            "--repo" | "-R" => {
+                i += 2;
+                continue;
+            }
+            _ => {
+                if let Some(v) = arg.strip_prefix("--body=") {
+                    bodies.push(v);
+                } else if arg.starts_with("--body-file=") {
+                    unreadable_body = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    if approve {
+        return Some(ReviewVerdictAct::Approve);
+    }
+    if bodies
+        .iter()
+        .any(|b| crate::server::verdict::verdict_raw_value(b).is_some())
+    {
+        return Some(ReviewVerdictAct::VerdictLine);
+    }
+    if unreadable_body {
+        return Some(ReviewVerdictAct::UnreadableBody);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7966,5 +8072,94 @@ mod tests {
             "two channels share one wire value: their populations would merge \
              silently"
         );
+    }
+}
+
+#[cfg(test)]
+mod mika2667_tests {
+    use super::{ReviewVerdictAct, detect_review_verdict_act};
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_approval_is_a_reviewer_act() {
+        for flag in ["--approve", "-a"] {
+            assert_eq!(
+                detect_review_verdict_act(&argv(&["pr", "review", "12", flag])),
+                Some(ReviewVerdictAct::Approve),
+                "`{flag}` is an approval"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_carrying_a_verdict_line_is_a_reviewer_act() {
+        for body_args in [
+            vec!["--body", "Build OK.\nVERDICT: pass"],
+            vec!["-b", "**VERDICT:** block[ac]"],
+            vec!["--body=VERDICT: hold[review]"],
+        ] {
+            let mut a = argv(&["pr", "review", "12", "--comment"]);
+            a.extend(body_args.iter().map(|s| s.to_string()));
+            assert_eq!(
+                detect_review_verdict_act(&a),
+                Some(ReviewVerdictAct::VerdictLine),
+                "{body_args:?} carries a verdict line"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_read_from_a_file_cannot_be_proven_verdict_free() {
+        for a in [
+            argv(&["pr", "review", "12", "--comment", "--body-file", "b.md"]),
+            argv(&["pr", "review", "12", "--comment", "-F", "b.md"]),
+            argv(&["pr", "review", "12", "--comment", "--body-file=b.md"]),
+        ] {
+            assert_eq!(
+                detect_review_verdict_act(&a),
+                Some(ReviewVerdictAct::UnreadableBody)
+            );
+        }
+    }
+
+    #[test]
+    fn negative_controls_stay_out_of_the_population() {
+        // A plain comment, a comment quoting the flag in its prose, and argv
+        // that are not a `pr review` at all.
+        for a in [
+            argv(&["pr", "review", "12", "--comment", "--body", "LGTM, thanks"]),
+            argv(&[
+                "pr",
+                "review",
+                "12",
+                "--comment",
+                "--body",
+                "I will not use --approve here; the verdict is not mine to give.",
+            ]),
+            argv(&["pr", "view", "12", "--json", "reviews"]),
+            argv(&["issue", "comment", "12", "--body", "VERDICT: pass"]),
+            argv(&[
+                "pr",
+                "review",
+                "12",
+                "--repo",
+                "--approve",
+                "--comment",
+                "--body",
+                "ok",
+            ]),
+        ] {
+            assert_eq!(detect_review_verdict_act(&a), None, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn the_motifs_are_a_wire_format() {
+        assert_eq!(ReviewVerdictAct::Approve.motif(), "approve");
+        assert_eq!(ReviewVerdictAct::VerdictLine.motif(), "verdict_line");
+        assert_eq!(ReviewVerdictAct::UnreadableBody.motif(), "unreadable_body");
     }
 }
