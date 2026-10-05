@@ -504,7 +504,7 @@ jobs:
       # `ModuleNotFoundError`. La version est DÉCLARÉE ici plutôt que héritée de
       # l'image — une bascule de runner ne doit pas décider en silence si une
       # garde de confinement peut tourner.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
       - name: Enforce single-controlled search egress (mika#1807 AC4)
@@ -547,7 +547,7 @@ jobs:
       # >= 3.11) et `ubuntu-22.04` porte Python 3.10. Même raison qu'au job
       # `egress-uniqueness-lint` ci-dessus ; le câblage des deux est tenu par
       # l'assertion N16 de `scripts/test-verify-egress-manifest.sh`.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
       - name: Enforce manifest↔code lockstep on outbound sinks (mika#2408)
