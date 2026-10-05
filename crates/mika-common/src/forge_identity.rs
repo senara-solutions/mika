@@ -407,7 +407,13 @@ fn strip_code(body: &str) -> String {
         });
         match (fence, opener) {
             (None, Some(open)) => fence = Some(open),
-            (Some((c, n)), Some((c2, n2))) if c == c2 && n2 >= n => fence = None,
+            // Une clôture fermante n'a pas d'info-string (CommonMark) : une
+            // ligne ```` ```rust ```` dans un bloc ne le referme pas.
+            (Some((c, n)), Some((c2, n2)))
+                if c == c2 && n2 >= n && trimmed[n2..].trim().is_empty() =>
+            {
+                fence = None
+            }
             (Some(_), _) => {}
             (None, None) => {
                 prose.push_str(&strip_inline_code(line));
@@ -786,7 +792,16 @@ mod mpc_gate_tests {
         let inline = format!("Le marqueur s'écrit `{}`.", marker(HEAD));
         let double = format!("``{}``", marker(HEAD));
         let indented_fence = format!("- item\n  ```\n  {}\n  ```", marker(HEAD));
-        for body in [fenced, tilde, unclosed, inline, double, indented_fence] {
+        let info_inside = format!("```\n```rust\n{}\n```", marker(HEAD));
+        for body in [
+            fenced,
+            tilde,
+            unclosed,
+            inline,
+            double,
+            indented_fence,
+            info_inside,
+        ] {
             assert!(
                 extract_mpc_gate_shas(std::slice::from_ref(&body)).is_empty(),
                 "marqueur dans du code lu comme attestation : {body:?}"
