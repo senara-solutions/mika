@@ -32,8 +32,8 @@ use crate::skills::SkillRegistry;
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     BehindMainInfo, BehindMainRemediation, CheckClassification, classify_checks,
-    describe_behind_main_remediation, is_behind_main, remediate_behind_main, run_gh_checks,
-    run_gh_merge, run_gh_pr_view, run_gh_subprocess,
+    describe_behind_main_remediation, is_behind_main, mpc_gate_clearance, remediate_behind_main,
+    run_gh_checks, run_gh_merge, run_gh_pr_view, run_gh_subprocess,
 };
 
 use super::verdict::{
@@ -678,8 +678,14 @@ async fn handle_pass_verdict(
     // merge arm — the same order as the other two sites.
     //
     // Fail-open on the DETECTION API error, as before.
+    //
+    // The preflight's head SHA is kept for the MPC gate term below (mika#2617
+    // U5): this call is already on the path, so the term costs no resolution
+    // here unless the preflight itself failed.
+    let mut preflight_head = String::new();
     match run_gh_pr_view(event.pr_number, &event.repo, token).await {
         Ok(preflight) => {
+            preflight_head = preflight.head_ref_oid.clone();
             match is_behind_main(&preflight.base_ref_oid, &event.repo, token).await {
                 Ok(Some(info)) => {
                     let remediation = remediate_behind_main(
@@ -726,7 +732,49 @@ async fn handle_pass_verdict(
             unreachable!("HasPending returns before the behind-main step (mika#2617)")
         }
         CheckClassification::AllPassed => {
+            // Trace de gate MPC (mika#2617 U5/AC5), forcée ici par le témoin
+            // qu'exige `run_gh_merge`. La tête vient du preflight ci-dessus ; si
+            // celui-ci a échoué, elle n'est résolue que pour un dépôt de la
+            // population — hors population le terme ne lit rien, et payer la
+            // résolution pour la jeter serait le coût que R10 interdit. Une
+            // résolution en échec rend une chaîne vide : `Missing`, fail-closed.
+            let head_sha = if preflight_head.trim().is_empty()
+                && mika_common::forge_identity::mpc_gate_required(&event.repo)
+            {
+                fetch_pr_head_sha(event.pr_number, &event.repo, token)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                preflight_head
+            };
+            let clearance = match mpc_gate_clearance(
+                "verdict_handler",
+                event.pr_number,
+                &event.repo,
+                &head_sha,
+                token,
+            )
+            .await
+            {
+                Ok(clearance) => clearance,
+                Err(verdict) => {
+                    let reason = verdict.refusal_reason().unwrap_or("mpc_gate_missing");
+                    return VerdictAction::Passthrough {
+                        enrichment: Some(format!(
+                            "[verdict_handler] VERDICT: pass received and CI is green, but \
+                             {} requires an MPC gate trace on the head and there is none \
+                             for {head_sha} ({reason}, mika#2617). The structural merge \
+                             handler did NOT merge. Nothing is wrong with CI. Do NOT call \
+                             pr_merge_with_gate (it blocks on the same gate) and do NOT \
+                             call `run_gh pr merge` — the orchestrator rules on this head \
+                             first. Acknowledge and end the turn.\n\n",
+                            event.repo
+                        )),
+                    };
+                }
+            };
             let merge_future = run_gh_merge(
+                clearance,
                 event.pr_number,
                 &event.repo,
                 "squash",

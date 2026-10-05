@@ -5086,6 +5086,115 @@ Raisonnement complet, le lecteur unique de la grammaire de lien et l'ordre
 réservation-puis-effet : `crates/mika-agent/CLAUDE.md` § *Rerun once, then
 block*.
 
+### La trace de gate MPC, au chemin de merge (mika#2617, phase C)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui voit une PR `claude-pilot` verte refuser
+son merge sur `mpc_gate_missing` ou `mpc_gate_stale_sha` cherche dans ce
+voisinage.
+
+- **La règle (AC5, ratifiée par Vincent le 2026-10-02 sur bearing Prime).** *« La
+  porte moteur ne doit pas franchir un contrôle que la recette manuelle exige :
+  zéro check non vert ET gate MPC présent… Une porte, deux préconditions selon le
+  dépôt. »* Pour `senara-solutions/claude-pilot`, le merge autonome exige en plus
+  un **commentaire de PR** portant `<!-- mpc-gate: ok sha=<SHA complet de la tête> -->`.
+  Égalité **stricte sur le SHA complet** : tout push ultérieur invalide le
+  marqueur de lui-même. Un préfixe ne vaut pas attestation.
+- **Pourquoi un commentaire, et pourquoi l'auteur n'est pas lu.** Le compte `gh` de
+  MPC est celui de l'opérateur : ni l'auteur d'une review ni l'acteur d'un
+  `ReadyForReviewEvent` ne distinguent MPC d'un humain, et aucun ne porte le SHA
+  évalué. La garde atteste *« quelqu'un a statué sur CETTE tête »*.
+- **La population, et la rectification du 2026-10-05.** Le dépôt
+  `claude-pilot-py` a été **renommé** `claude-pilot` ; GitHub envoie le nom
+  courant dans les webhooks. `MPC_GATE_REQUIRED_REPOS`
+  (`mika_common::forge_identity`) porte le **nom courant**, épinglé par
+  `mika2617_the_current_repo_name_is_in_the_population`, **et l'ancien comme
+  alias** : GitHub redirige l'ancien nom vers la même PR, donc un appelant qui
+  l'écrit encore ne doit pas trouver la porte ouverte. Comparaison sans casse.
+- **Le marqueur n'est jamais lu dans du code** — ni bloc clôturé (```` ``` ````,
+  `~~~`), ni span en ligne. Un vrai marqueur est un commentaire HTML, invisible au
+  rendu ; dans du code il est affiché, donc c'est de la prose qui en parle (le
+  corps de mika#2617 le cite — mika#2050).
+- **Fail-CLOSED** : commentaires illisibles (`gh` en échec, délai de 15 s
+  dépassé, sortie tronquée), tête inconnue ⇒ `Missing`. Une panne de l'API GitHub
+  gèle le merge autonome de `claude-pilot` **seul** — les autres dépôts ne
+  consultent rien et ne peuvent pas être gelés par ce terme.
+- **Coût nul hors population, par construction.** Le terme de population est
+  testé **avant** la lecture (`evaluate_mpc_gate`, lecteur paresseux) : un merge
+  sur `senara-solutions/mika` ne fait **aucun** appel réseau de plus
+  (`mika2617_the_comment_reader_is_not_invoked_outside_the_population`). La
+  lecture (`gh pr view <n> --json comments`) est la **seule** capacité de lecture
+  neuve de mika#2617. **Ajouter un dépôt à la population ajoute un aller-retour à
+  chacun de ses merges.**
+- **Non contournable : un témoin de type.** `run_gh_merge` exige un
+  `MergeClearance`, dont le champ est privé et le seul constructeur
+  `from_mpc_verdict` ne rend `Some` que sur `NotRequired`/`Attested`. Les **trois**
+  sites de merge (l'outil, `verdict_handler`, `merge_ready_handler`) sont forcés
+  par le compilateur ; un scan épingle que le témoin n'est fabriqué qu'à un seul
+  site de production (`mpc_gate_clearance`).
+
+### Surfaces opérateur
+
+```bash
+# 1. Le gate MPC a-t-il refusé ? (régime attendu : VIDE hors claude-pilot)
+grep mpc_gate_refused "$MIKA_SPIRIT_LOG_FILE" | jq -c '{site, repo, pr, reason, attested, head}'
+
+# 2. Les commentaires étaient-ils LISIBLES ? (régime attendu : VIDE)
+grep mpc_gate_comments_unreadable "$MIKA_SPIRIT_LOG_FILE" | jq -c '{site, repo, pr, error}'
+```
+
+```sql
+-- Les signaux merge-ready retenus par le gate MPC à l'acteur du merge
+SELECT created_at, target_key, reasoning FROM audit_events
+ WHERE tool_name = 'merge_ready_mpc_gate_held' ORDER BY created_at DESC LIMIT 20;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `mpc_gate_refused` | WARN | **vide** hors `claude-pilot` | MPC n'a pas statué sur cette tête : le remède est le marqueur. Une occurrence sur un autre dépôt est une **fuite de population** (halte S6) |
+| `mpc_gate_comments_unreadable` | WARN | **vide** | nous n'avons pas pu lire : le remède est l'accès API, **pas** le marqueur. Soutenu ⇒ le merge autonome de `claude-pilot` est gelé, et il faut le dire plutôt que basculer en fail-open |
+| `merge_ready_mpc_gate_held` | audit | rare | le signal merge-ready tenu à l'acteur |
+| `mpc_gate_missing` / `mpc_gate_stale_sha` dans `tasks.result` | — | rare | le refus de l'outil |
+
+Les deux noms WARN sont distincts à dessein (doctrine mika#2156 / mika#2277) :
+« MPC n'a pas statué » et « nous n'avons pas pu lire » appellent deux remèdes
+opposés, et les fondre rendrait les deux populations incomptables.
+
+### Sonde post-déploiement, et sa halte
+
+> **Préalable.** Établir que le `mika-spirit` servi porte le correctif (classe
+> mika#2340), et que les trois prompts `self-dev*` servis connaissent
+> `mpc_gate_missing` / `mpc_gate_stale_sha`.
+
+**S6 — le gate MPC mord sur sa population et nulle part ailleurs (30 jours).**
+`mpc_gate_refused` ne porte que `claude-pilot`.
+*Halte 6 — une occurrence sur un autre dépôt :* la population est lue de travers
+et des merges légitimes sont refusés. **Désarmer par revert de la phase C avant
+diagnostic.**
+
+**Halte transverse — la sonde muette.** Zéro refus ne prouve rien : il faut
+qu'une PR `claude-pilot` ait atteint un chemin de merge moteur depuis le
+déploiement — et aujourd'hui, ce chemin est presque désert (ci-dessous).
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne prouve pas qu'un chemin moteur atteint `claude-pilot` aujourd'hui.**
+  `INTERNAL_REPOS` du gateway (`crates/mika-gateway/src/github.rs:265`) liste
+  encore `senara-solutions/claude-pilot-py` ; si les webhooks portent le nom
+  courant, ils ne routent plus vers `mika-dev`, et la prémisse R8 du plan
+  (« `merge_ready_handler` peut merger une PR claude-pilot ») est à **re-mesurer**.
+  Hors périmètre de la phase C, nommé ici. La garde tient sur les trois sites
+  quel que soit le routage, parce qu'elle est dans le type.
+- **Il ne ré-enclenche pas le merge quand MPC pose le marqueur.** Aucun webhook
+  ne relance la porte sur un commentaire : après le marqueur, le merge est un
+  geste (MPC, ou Vincent — c'est déjà la doctrine pour claude-pilot,
+  CC-spawns-only).
+- **Il n'atteste pas QUI a statué** (cf. plus haut) ; il atteste **sur quelle
+  tête**.
+- **La pagination des commentaires par `gh pr view --json comments` n'a pas été
+  mesurée** sur un fil très long : un marqueur au-delà de ce que `gh` rend
+  serait lu `Missing` — fail-closed, jamais ouvert.
+
 ### Un tour Webhook Fallthrough ne crée pas de travail par `run_gh` (mika#2573)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
