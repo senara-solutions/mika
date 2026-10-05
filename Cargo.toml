@@ -43,7 +43,7 @@ toml_edit = "0.25"
 dotenvy = "0.15"
 
 # Directories
-dirs = "6"
+dirs = "7"
 
 # Logging
 tracing = "0.1"
@@ -116,7 +116,7 @@ unicode-width = "0.2"
 unicode-normalization = "0.1"
 
 # MCP (Model Context Protocol)
-rmcp = { version = "2.0", default-features = false, features = [
+rmcp = { version = "3.5", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client",
