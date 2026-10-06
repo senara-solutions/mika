@@ -1684,6 +1684,10 @@ pub fn before() {}
             "mika-agent/src/server/permissions_stream.rs",
             "receiver_count",
         ),
+        // mika#2671 phase B1, case (a): a test-only accessor on `SyncDebounce`
+        // (`#[cfg(test)] pub fn held_count`), read by the debounce's own unit
+        // tests to assert a window closed. No production code calls it.
+        ("mika-agent/src/server/sync_debounce.rs", "held_count"),
         ("mika-agent/src/server/tasks_stream.rs", "receiver_count"),
         ("mika-cli/src/tui/app.rs", "new"),
         ("mika-common/src/claude.rs", "for_test"),
