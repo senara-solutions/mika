@@ -39,6 +39,8 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 55;
 /// Test-only helper for mika#1712 integration tests; extracted to a type
 /// alias to satisfy `clippy::type_complexity`.
 #[doc(hidden)]
+pub type AuditEventRowTuple = (String, Option<String>, Option<String>, Option<String>);
+
 /// One pending retention returned by [`Database::list_pending_audit_holds`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAuditHold {
@@ -48,8 +50,6 @@ pub struct PendingAuditHold {
     /// `reasoning`: the retained event's identity marker.
     pub identity: String,
 }
-
-pub type AuditEventRowTuple = (String, Option<String>, Option<String>, Option<String>);
 
 /// mika#1742 Problem B: refuse-to-zombie grace window for
 /// [`Database::create_recurring_task_if_absent`]. Recent same-label recurring

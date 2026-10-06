@@ -3430,6 +3430,39 @@ mod tests {
         assert_eq!(pending[0].text, MIKA2671_SYNC);
     }
 
+    /// Hors canal `github`, un texte classé `synchronize` n'est pas retenu : son
+    /// tour n'écrirait jamais de ligne de démarrage, et la retenue resterait
+    /// pendante pour toujours (revue de code).
+    #[tokio::test]
+    async fn mika2671_hors_github_rien_nest_retenu() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        let body = serde_json::json!({
+            "text": MIKA2671_SYNC, "channel": "telegram", "request_id": "t1", "chat_id": 1
+        })
+        .to_string();
+        let resp = test_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(agent_state.webhook_queue_v2.depth().await, 1);
+        assert!(
+            !agent_state
+                .sync_debounce
+                .is_held("pr:senara-solutions/mika#2659")
+        );
+    }
+
     /// AC4 contrôle négatif dédié : une retenue en cours pour la PR, puis
     /// `opened`, `ready_for_review`, `review_requested` sur la MÊME PR ⇒ chacun
     /// part en file immédiatement, la retenue intacte.

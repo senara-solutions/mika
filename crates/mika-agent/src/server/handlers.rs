@@ -317,7 +317,13 @@ pub async fn handle_message(
         // build périmé de la phase A compte). Aucune autre action n'est retenue
         // (`debounce_key` rend `None`), donc `opened` / `ready_for_review` /
         // `review_requested` ne sont jamais retardés (AC4).
-        if let Some(window) = super::sync_debounce::window_from_env()
+        let ingest_guard = if req.channel == "github" {
+            Some(agent_state.sync_debounce.ingest.lock().await)
+        } else {
+            None
+        };
+        if ingest_guard.is_some()
+            && let Some(window) = super::sync_debounce::window_from_env()
             && let Some(hold_key) = super::sync_debounce::debounce_key(&req.text)
             && record_pr_sync_held(&agent_state.db, &hold_key, &req.text, &req.request_id).await
         {
@@ -328,6 +334,7 @@ pub async fn handle_message(
                 req,
                 window,
             );
+            drop(ingest_guard);
             emit_webhook_queue_audit(
                 &state,
                 &agent_state,
@@ -1060,6 +1067,28 @@ const HELD_SWEEP_MIN_AGE_SECS: i64 = 60;
 /// Intervalle du balayage périodique des retenues pendantes.
 const HELD_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Balayage périodique des retenues pendantes, au plus toutes les
+/// [`HELD_SWEEP_INTERVAL`].
+async fn maybe_sweep_held_syncs(
+    agent_state: &Arc<AgentState>,
+    queue: &Arc<WebhookQueue>,
+    last: &mut std::time::Instant,
+) {
+    if last.elapsed() < HELD_SWEEP_INTERVAL {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let window = super::sync_debounce::window_from_env().unwrap_or(std::time::Duration::ZERO);
+    recover_held_syncs_into(
+        &agent_state.db,
+        &agent_state.sync_debounce,
+        queue,
+        window,
+        Some(HELD_SWEEP_MIN_AGE_SECS),
+    )
+    .await;
+}
+
 /// Corps commun de la reprise au démarrage et du balayage périodique, sans
 /// `AgentState` : testable sur une base en mémoire. Rend le nombre de retenues
 /// remises en fenêtre.
@@ -1244,22 +1273,13 @@ pub(super) fn spawn_webhook_drain_worker(
                 item = queue.dequeue() => {
                     let Some(item) = item else { continue };
                     drain_one_webhook(&state, &agent_state, &agent_label, item).await;
+                    // Sous un flux continu le bras `sleep` ne tire jamais : le
+                    // balayage est aussi évalué après chaque tour (revue de code).
+                    maybe_sweep_held_syncs(&agent_state, &queue, &mut last_held_sweep).await;
                 }
                 _ = tokio::time::sleep(WEBHOOK_QUEUE_GAUGE_INTERVAL) => {
                     emit_webhook_queue_gauge(&agent_label, &queue).await;
-                    if last_held_sweep.elapsed() >= HELD_SWEEP_INTERVAL {
-                        last_held_sweep = std::time::Instant::now();
-                        let window = super::sync_debounce::window_from_env()
-                            .unwrap_or(std::time::Duration::ZERO);
-                        recover_held_syncs_into(
-                            &agent_state.db,
-                            &agent_state.sync_debounce,
-                            &queue,
-                            window,
-                            Some(HELD_SWEEP_MIN_AGE_SECS),
-                        )
-                        .await;
-                    }
+                    maybe_sweep_held_syncs(&agent_state, &queue, &mut last_held_sweep).await;
                 }
             }
         }

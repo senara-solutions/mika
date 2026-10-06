@@ -147,6 +147,12 @@ pub struct SyncDebounce {
     /// ni retenues, ni en file, ni encore « démarrées » au registre. Lu par le
     /// balayage des pendants pour ne pas rejouer un événement vivant.
     in_flight: Mutex<HashMap<String, usize>>,
+    /// Sérialise « écrire la retenue au registre » puis « la tenir » à
+    /// l'ingestion (revue de code) : sans lui, deux `synchronize` d'une même PR
+    /// à quelques millisecondes pouvaient s'inscrire dans l'ordre A, B et se
+    /// tenir dans l'ordre B, A — la table gardait A, le registre désignait B
+    /// comme pendante, et le balayage rejouait B : une revue en double.
+    pub ingest: tokio::sync::Mutex<()>,
 }
 
 impl SyncDebounce {
@@ -269,10 +275,15 @@ pub fn admit_recovered(
 /// Échéance : le dernier retenu part dans la file v2. Rien à verser si la fenêtre
 /// a déjà été fermée (course impossible aujourd'hui, une seule tâche par clé).
 async fn close_window(debounce: &SyncDebounce, queue: &WebhookQueue, key: &str) {
+    // En vol de `take` jusqu'à l'entrée en file : entre les deux, l'événement
+    // n'est ni retenu ni en file, et le balayage le rejouerait.
+    debounce.enter_flight(key);
     let Some(req) = debounce.take(key) else {
+        debounce.leave_flight(key);
         return;
     };
     let result = queue.enqueue(req).await;
+    debounce.leave_flight(key);
     if result == EnqueueResult::Dropped {
         tracing::warn!(
             event = "qa_sync_debounce_released_into_full_queue",
