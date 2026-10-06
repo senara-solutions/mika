@@ -51,6 +51,22 @@ use super::webhook_queue::has_active_callback_child;
 /// mirror event. Pinned by `sole_writer_of_verdict_pass_without_approval`.
 pub const VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL: &str = "verdict_pass_without_approval";
 
+/// Audit-event `tool_name` for a `pass` verdict whose author is not the
+/// reviewer identity (mika#2667 AC3). **SOLE WRITER**:
+/// [`refuse_pass_from_non_reviewer`].
+pub const VERDICT_PASS_NON_REVIEWER_AUDIT_TOOL: &str = "verdict_pass_from_non_reviewer";
+
+/// Marker opening the enrichment of a `hold[review]` passthrough with no
+/// active task (mika#2667 AC2). Read by
+/// [`crate::webhook_dispatch::is_hold_review_without_task_turn`], which makes
+/// the turn create no task and dispatch nothing.
+pub(crate) const HOLD_REVIEW_NO_TASK_MARKER: &str =
+    "[verdict_handler] hold[review] without an active task";
+
+/// Audit-event `tool_name` for that passthrough (mika#2667 AC2). **SOLE
+/// WRITER**: `hold_review_without_task`.
+pub const HOLD_REVIEW_NO_TASK_AUDIT_TOOL: &str = "verdict_hold_review_no_task";
+
 /// Maximum block[ac] retries before escalation.
 const BLOCK_AC_MAX_RETRIES: u32 = 3;
 
@@ -242,6 +258,17 @@ pub async fn try_handle_pr_review_verdict(
                 }
                 return VerdictAction::Passthrough { enrichment: None };
             }
+            // mika#2667 — read side of the role separation (mika#2218,
+            // mika#2248): the merge path is reached only on a verdict authored
+            // by the reviewer identity. Placed before `handle_pass_verdict`,
+            // hence before any `gh` call and strictly before `run_gh_merge`.
+            // Any other author — the dispatcher included — passes through,
+            // named, with an audit row. A non-reviewer `pass` on a
+            // DECISION-CORE PR is refused here too, earlier than the
+            // forge-gate would have held it, and for a stronger reason.
+            if !mika_common::forge_identity::is_reviewer_forge_login(&event.reviewer) {
+                return refuse_pass_from_non_reviewer(&event, db, session_id, trace_id).await;
+            }
             handle_pass_verdict(
                 &event,
                 db,
@@ -328,6 +355,49 @@ pub async fn try_handle_pr_review_verdict(
 // ---------------------------------------------------------------------------
 // Pass verdict handler (existing #524 logic, unchanged)
 // ---------------------------------------------------------------------------
+
+/// Refuse the merge path to a `pass` verdict not authored by the reviewer
+/// identity (mika#2667 AC3): a named `Passthrough`, a WARN, an audit row, and
+/// nothing else — no `gh` call, no task write, no notification.
+async fn refuse_pass_from_non_reviewer(
+    event: &PrReviewEvent,
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+) -> VerdictAction {
+    warn!(
+        event = "verdict_pass_from_non_reviewer",
+        pr_number = event.pr_number,
+        repo = %event.repo,
+        reviewer = %event.reviewer,
+        expected = mika_common::forge_identity::REVIEWER_FORGE_LOGIN,
+        review_url = %event.review_url,
+        "verdict: `pass` not authored by the reviewer identity — the merge path is \
+         refused and the event falls through to the LLM (mika#2667)"
+    );
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            VERDICT_PASS_NON_REVIEWER_AUDIT_TOOL,
+            &format!("pr_review:{}#{}", event.repo, event.pr_number),
+            None,
+            Some(&event.reviewer),
+            Some("pass verdict not authored by the reviewer identity"),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, "failed to write the mika#2667 non-reviewer-pass audit row");
+    }
+    VerdictAction::Passthrough {
+        enrichment: Some(format!(
+            "[verdict_handler] VERDICT: pass on PR #{} ignored: the review was authored by \
+             @{}, not by the reviewer identity. Only a verdict from the reviewer identity \
+             reaches the merge path (mika#2667). Nothing was merged.\n\n",
+            event.pr_number, event.reviewer
+        )),
+    }
+}
 
 /// Handle a VERDICT: pass — look up task, initiate merge, update metadata.
 async fn handle_pass_verdict(
@@ -1775,6 +1845,65 @@ async fn handle_escalate(
 // Hold[review] handler (#889)
 // ---------------------------------------------------------------------------
 
+/// The `hold[review]` passthrough when no active task matches the PR
+/// (mika#2667 AC2).
+///
+/// It hands the turn back to the operator and says so. The enrichment opens
+/// with [`HOLD_REVIEW_NO_TASK_MARKER`], which the turn-class predicate
+/// [`crate::webhook_dispatch::is_hold_review_without_task_turn`] reads: on that
+/// turn `create_task` is withheld and every long-running dispatch is refused,
+/// so no work is created in place of the review that did not conclude.
+async fn hold_review_without_task(
+    event: &PrReviewEvent,
+    db: &AsyncDatabase,
+    message_sender: Option<&Arc<dyn MessageSender>>,
+    session_id: &str,
+    trace_id: &str,
+) -> VerdictAction {
+    let pr_url = event.pr_url();
+    info!(
+        event = "verdict_hold_review_no_task",
+        pr_number = event.pr_number,
+        repo = %event.repo,
+        reviewer = %event.reviewer,
+        "verdict: hold[review] with no active task — handed back to the operator, \
+         no work created on this turn (mika#2667)"
+    );
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            HOLD_REVIEW_NO_TASK_AUDIT_TOOL,
+            &format!("pr_review:{}#{}", event.repo, event.pr_number),
+            None,
+            Some("handed_to_operator"),
+            Some("hold[review] with no active in_progress task"),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, "failed to write the mika#2667 hold-without-task audit row");
+    }
+    if let Some(sender) = message_sender {
+        send_notification(
+            sender,
+            &format!(
+                "PR #{} on {} — VERDICT: hold[review] from @{}, and no active task matches this \
+                 PR. Handed back to the operator: no task is created and nothing is dispatched \
+                 on this turn.",
+                event.pr_number, event.repo, event.reviewer
+            ),
+        )
+        .await;
+    }
+    VerdictAction::Passthrough {
+        enrichment: Some(format!(
+            "{HOLD_REVIEW_NO_TASK_MARKER} on {pr_url}. The review is held for the operator. \
+             This turn creates no task and dispatches nothing: do not verify, review or merge \
+             this PR yourself. Acknowledge and stop.\n\n"
+        )),
+    }
+}
+
 /// Handle VERDICT: hold[review] — notify operator, leave task in_progress.
 /// Enriches the pre-digest with diff fingerprint data (#1563).
 async fn handle_hold_review(
@@ -1790,13 +1919,7 @@ async fn handle_hold_review(
     let task = match find_task_for_verdict(db, &pr_url, event).await {
         Some(t) => t,
         None => {
-            return VerdictAction::Passthrough {
-                enrichment: Some(format!(
-                    "[verdict_handler] VERDICT: hold[review] on {} but no active in_progress task \
-                     found. Passing through to LLM.\n\n",
-                    pr_url
-                )),
-            };
+            return hold_review_without_task(event, db, message_sender, session_id, trace_id).await;
         }
     };
 
@@ -4655,5 +4778,158 @@ mod tests {
             matches!(result, EngineDispatchResult::Fallback { .. }),
             "Expected Fallback when tool not in registry"
         );
+    }
+}
+
+#[cfg(test)]
+mod mika2667_tests {
+    use super::{
+        HOLD_REVIEW_NO_TASK_AUDIT_TOOL, HOLD_REVIEW_NO_TASK_MARKER,
+        VERDICT_PASS_NON_REVIEWER_AUDIT_TOOL, VerdictAction, try_handle_pr_review_verdict,
+    };
+    use crate::async_db::AsyncDatabase;
+
+    const SINCE: &str = "1970-01-01T00:00:00Z";
+
+    async fn db() -> AsyncDatabase {
+        let async_db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        async_db
+            .create_session("mika2667-session", "mika", "cli")
+            .await
+            .unwrap();
+        async_db
+    }
+
+    fn review(state: &str, pr: u64, author: &str, body: &str) -> String {
+        format!(
+            "[GitHub] PR review ({state}) on senara-solutions/mika#{pr} (fix: x) by @{author}\n\
+             https://github.com/senara-solutions/mika/pull/{pr}#pullrequestreview-1\n\
+             \n\
+             {body}"
+        )
+    }
+
+    async fn run(db: &AsyncDatabase, text: &str) -> VerdictAction {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
+        try_handle_pr_review_verdict(text, db, None, None, "mika2667-session", "trace", &skills)
+            .await
+    }
+
+    async fn audit(db: &AsyncDatabase, tool: &str, pr: u64) -> i64 {
+        db.count_recent_audit_events_for_target(
+            tool,
+            &format!("pr_review:senara-solutions/mika#{pr}"),
+            SINCE,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn enrichment(action: VerdictAction) -> String {
+        match action {
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => e,
+            other => panic!("expected an enriched passthrough, got {other:?}"),
+        }
+    }
+
+    /// AC3 — an approved `pass` authored by the dispatcher identity never
+    /// reaches the merge path. Seen red on the code before mika#2667: the event
+    /// went on into `handle_pass_verdict` (here: its "no GitHub token" arm, the
+    /// entry of the merge path).
+    #[tokio::test]
+    async fn a_pass_from_the_dispatcher_identity_does_not_reach_the_merge_path() {
+        let db = db().await;
+        let text = review("approved", 2600, "mika-platform-dev", "VERDICT: pass");
+        let e = enrichment(run(&db, &text).await);
+        assert!(e.contains("mika#2667"), "{e}");
+        assert!(e.contains("Nothing was merged"), "{e}");
+        assert!(
+            !e.contains("Manual merge required"),
+            "the merge path was entered: {e}"
+        );
+        assert_eq!(
+            audit(&db, VERDICT_PASS_NON_REVIEWER_AUDIT_TOOL, 2600).await,
+            1
+        );
+    }
+
+    /// AC3 positive control: the same event from the reviewer identity reaches
+    /// the merge path (with no token configured, its first arm).
+    #[tokio::test]
+    async fn the_same_pass_from_the_reviewer_identity_reaches_the_merge_path() {
+        let db = db().await;
+        let text = review("approved", 2601, "mika-platform-qa", "VERDICT: pass");
+        let e = enrichment(run(&db, &text).await);
+        assert!(e.contains("Manual merge required"), "{e}");
+        assert_eq!(
+            audit(&db, VERDICT_PASS_NON_REVIEWER_AUDIT_TOOL, 2601).await,
+            0
+        );
+    }
+
+    /// AC2 — the `hold[review]` passthrough with no active task opens with the
+    /// marker, says it hands back to the operator, and the turn it produces
+    /// refuses every long-running dispatch.
+    #[tokio::test]
+    async fn a_hold_review_without_task_creates_no_work() {
+        let db = db().await;
+        let text = review(
+            "commented",
+            2602,
+            "mika-platform-qa",
+            "VERDICT: hold[review]",
+        );
+        let e = enrichment(run(&db, &text).await);
+        assert!(e.starts_with(HOLD_REVIEW_NO_TASK_MARKER), "{e}");
+        assert!(e.contains("operator"), "{e}");
+        assert_eq!(audit(&db, HOLD_REVIEW_NO_TASK_AUDIT_TOOL, 2602).await, 1);
+
+        let turn = format!("{e}{text}");
+        assert!(crate::webhook_dispatch::is_hold_review_without_task_turn(
+            &turn
+        ));
+        for skill in ["dev-pilot", "dev-groom"] {
+            let err = crate::skills::executor::validate_dispatch_readiness(
+                &db,
+                "some-task",
+                None,
+                Some(&serde_json::json!({ "skill": skill })),
+                Some(&turn),
+            )
+            .await
+            .expect_err("no dispatch on this turn");
+            assert!(
+                err.contains("hold_review_without_task_no_dispatch"),
+                "{skill}: {err}"
+            );
+        }
+    }
+
+    /// AC2 negative control: a `block[ac]` turn is not in the population — the
+    /// gate does not refuse it (whatever else the readiness chain decides).
+    #[tokio::test]
+    async fn a_block_ac_turn_is_not_refused_by_the_hold_gate() {
+        let db = db().await;
+        let block = review("commented", 2603, "mika-platform-qa", "VERDICT: block[ac]");
+        assert!(!crate::webhook_dispatch::is_hold_review_without_task_turn(
+            &block
+        ));
+        let outcome = crate::skills::executor::validate_dispatch_readiness(
+            &db,
+            "some-task",
+            None,
+            Some(&serde_json::json!({ "skill": "dev-pilot" })),
+            Some(&block),
+        )
+        .await;
+        if let Err(err) = outcome {
+            assert!(
+                !err.contains("hold_review_without_task_no_dispatch"),
+                "{err}"
+            );
+        }
     }
 }

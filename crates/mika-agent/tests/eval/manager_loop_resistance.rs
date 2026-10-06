@@ -111,7 +111,7 @@ async fn cascade_never_dispatches_into_milestone_manager() -> Result<()> {
     // with an APPROVED review carrying `VERDICT: pass` from mika-qa.
     let db = test_db().await;
     let review_text = "[GitHub] PR review (approved) on senara-solutions/mika#2101 \
-                       (test: porte 1) by @mika-qa\n\
+                       (test: porte 1) by @mika-platform-qa\n\
                        https://github.com/senara-solutions/mika/pull/2101#pullrequestreview-12345\n\
                        \n\
                        VERDICT: pass\n\nAll good.";
