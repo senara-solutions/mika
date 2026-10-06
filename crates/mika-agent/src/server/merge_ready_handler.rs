@@ -50,7 +50,7 @@ use tracing::{info, warn};
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
 use crate::perimeter::{self, Classification};
-use crate::tools::pr_merge_with_gate::run_gh_merge;
+use crate::tools::pr_merge_with_gate::{mpc_gate_clearance, run_gh_merge};
 
 use super::ci_success_handler::update_verdict_merge_metadata;
 use super::verdict_handler::VerdictAction;
@@ -241,12 +241,63 @@ pub async fn try_handle_merge_ready(
         signal.repo, signal.pr_number
     );
 
+    // Trace de gate MPC (mika#2617 U5/AC5). Ce site est celui que R8 nomme : il
+    // merge sans passer par l'outil, donc AC5 posée dans l'outil seul y serait
+    // contournable — `run_gh_merge` exige le témoin, et c'est le compilateur
+    // qui l'a imposé ici. La tête vient du signal : zéro résolution ajoutée
+    // (plan R11). Hors population, zéro appel réseau.
+    let clearance = match mpc_gate_clearance(
+        "merge_ready_handler",
+        signal.pr_number,
+        &signal.repo,
+        &signal.head_sha,
+        token,
+    )
+    .await
+    {
+        Ok(clearance) => clearance,
+        Err(verdict) => {
+            let reason = verdict.refusal_reason().unwrap_or("mpc_gate_missing");
+            if let Err(e) = db
+                .log_audit_event(
+                    session_id,
+                    "merge_ready_mpc_gate_held",
+                    &target_key,
+                    Some("merge_ready_signaled"),
+                    Some("held_for_mpc_gate"),
+                    Some(&format!(
+                        "agent_id={agent_id} reason={reason} head={}",
+                        signal.head_sha
+                    )),
+                    Some(trace_id),
+                )
+                .await
+            {
+                warn!(error = %e, "Failed to log merge_ready_mpc_gate_held audit event");
+            }
+            notify(
+                message_sender,
+                &format!(
+                    "PR #{} on {} — merge-ready signal held at the merge actor: no MPC gate \
+                     trace on head {} ({reason}). The orchestrator rules on this head before \
+                     an autonomous merge.",
+                    signal.pr_number, signal.repo, signal.head_sha,
+                ),
+            )
+            .await;
+            return VerdictAction::Handled {
+                pre_digest: format_mpc_gate_hold_pre_digest(&signal, reason),
+            };
+        }
+    };
+
     // No auto-merge flag exists any more (mika#2617 U2): `run_gh_merge` lost
     // the parameter, so `--auto` is inexpressible rather than merely avoided.
     // The comment this replaces said the evaluator "already aggregated every
     // required check" — true of the pre-mika#2617 reader, and the inverse of
     // what `ci_success_handler` does now that it aggregates every check.
     let merge_future = run_gh_merge(
+        clearance,
         signal.pr_number,
         &signal.repo,
         "squash",
@@ -416,6 +467,21 @@ fn format_decision_core_hold_pre_digest(
          Notify the operator that a manual review-and-merge is required.\n\
          </merge_ready_handler>",
         signal.repo, signal.pr_number,
+    )
+}
+
+/// Le gate MPC n'atteste pas la tête (mika#2617 U5/AC5).
+fn format_mpc_gate_hold_pre_digest(signal: &MergeReadySignal, reason: &str) -> String {
+    format!(
+        "<merge_ready_handler>\n\
+         Merge-ready signal for {}#{}, but this repository requires an MPC gate trace on the \
+         head and there is none for {} ({reason}).\n\n\
+         Auto-merge HELD at the merge actor. Nothing is wrong with CI. The orchestrator posts \
+         `<!-- mpc-gate: ok sha=<head> -->` in a PR comment once it has ruled on this head.\n\n\
+         Do NOT call pr_merge_with_gate for this PR — it blocks on the same gate. Do NOT call \
+         `run_gh pr merge`. Acknowledge and end the turn.\n\
+         </merge_ready_handler>",
+        signal.repo, signal.pr_number, signal.head_sha,
     )
 }
 

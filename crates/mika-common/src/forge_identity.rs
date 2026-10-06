@@ -265,6 +265,274 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.is_empty())
 }
 
+// ---------------------------------------------------------------------------
+// Gate MPC — la trace d'une revue orchestrateur sur la tête courante (mika#2617, U5/AC5)
+// ---------------------------------------------------------------------------
+
+/// Préfixe du marqueur par lequel MPC atteste qu'il a statué sur une tête.
+///
+/// Forme complète : `<!-- mpc-gate: ok sha=<SHA complet de la tête> -->`, dans un
+/// commentaire de PR. Format retenu par MPC (corps de mika#2617, AC5) parce que
+/// le compte `gh` de MPC est celui de l'opérateur : ni l'auteur d'une review ni
+/// l'acteur d'un `ReadyForReviewEvent` ne distinguent MPC d'un humain, et aucun
+/// des deux ne porte le SHA évalué. Le marqueur, lui, le porte — donc tout push
+/// ultérieur l'invalide de lui-même.
+///
+/// **L'auteur du commentaire n'est pas lu, et c'est délibéré** : il serait
+/// Vincent dans les deux cas. La garde atteste « quelqu'un a statué sur CETTE
+/// tête », pas « MPC et personne d'autre ».
+pub const MPC_GATE_MARKER_PREFIX: &str = "<!-- mpc-gate: ok sha=";
+
+/// Fin obligatoire du marqueur. Un `sha=` suivi d'autre chose qu'un hexadécimal
+/// puis `-->` n'est pas un marqueur — c'est de la prose qui en parle.
+const MPC_GATE_MARKER_SUFFIX: &str = "-->";
+
+/// Les dépôts dont le merge autonome exige la trace de gate MPC.
+///
+/// Vit ici, à côté de [`merge_disposition`], parce que c'est la même famille de
+/// décision et qu'une seconde liste de politique de merge est la divergence
+/// programmée que ce dépôt a payée deux fois (sièges mika#2092,
+/// `DISPATCHABLE_REPOS` ↔ `labels.yml`).
+///
+/// # Le nom courant, ET l'ancien — rectification de prémisse du 2026-10-05
+///
+/// Le plan écrivait `senara-solutions/claude-pilot-py`. Le dépôt a été **renommé**
+/// `senara-solutions/claude-pilot` (mesuré : `gh repo view
+/// senara-solutions/claude-pilot-py` rend `https://github.com/senara-solutions/claude-pilot`).
+/// GitHub envoie le **nom courant** dans les webhooks : une population réduite à
+/// l'ancien nom ne correspondrait jamais, et la garde serait inerte, c'est-à-dire
+/// ouverte (classe mika#2205). Le nom courant est donc le terme porteur, épinglé
+/// par un test.
+///
+/// **L'ancien nom est gardé comme alias, et ce n'est pas de la nostalgie.** GitHub
+/// redirige un dépôt renommé : `gh pr merge <n> --repo senara-solutions/claude-pilot-py`
+/// atteint la même PR. Un appelant qui écrit encore l'ancien nom — un prompt
+/// périmé, `INTERNAL_REPOS` du gateway qui le liste toujours — ne doit pas
+/// trouver la porte ouverte pour autant. Retirer l'alias rouvrirait ce chemin ;
+/// le garder ne coûte rien, puisque la population ne grossit pas.
+///
+/// **Ajouter un dépôt ici ajoute un aller-retour `gh` à chacun de ses merges**
+/// (plan R10) — à savoir avant d'y toucher, pas à découvrir après.
+pub const MPC_GATE_REQUIRED_REPOS: &[&str] = &[
+    "senara-solutions/claude-pilot",
+    "senara-solutions/claude-pilot-py",
+];
+
+/// Vrai quand le merge autonome de `repo` exige la trace de gate MPC.
+///
+/// Sans casse et bords rognés : GitHub résout `owner/repo` sans tenir compte de
+/// la casse, donc une comparaison sensible laisserait `Senara-Solutions/…`
+/// atteindre la même PR par une porte ouverte.
+pub fn mpc_gate_required(repo: &str) -> bool {
+    let repo = repo.trim();
+    MPC_GATE_REQUIRED_REPOS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(repo))
+}
+
+/// Ce que la trace de gate MPC dit d'une tête.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MpcGateVerdict {
+    /// Le dépôt n'est pas dans [`MPC_GATE_REQUIRED_REPOS`] : le terme ne mord pas.
+    NotRequired,
+    /// Un marqueur porte exactement le SHA de la tête.
+    Attested,
+    /// Aucun marqueur lisible — ou commentaires illisibles, ou tête inconnue.
+    /// **Fail-closed** : c'est une précondition supplémentaire sur une petite
+    /// population, et une précondition qu'on ne sait pas lire n'en est pas une.
+    Missing,
+    /// Au moins un marqueur, aucun sur la tête courante : MPC a statué sur un
+    /// commit que la PR ne porte plus.
+    StaleSha {
+        /// Le SHA du marqueur le plus récent.
+        attested: String,
+        /// La tête courante.
+        head: String,
+    },
+}
+
+impl MpcGateVerdict {
+    /// Le nom de fil du refus, ou `None` quand le terme autorise.
+    ///
+    /// Ce sont les noms que porte `BlockReason` côté outil — une seule
+    /// définition, lue par les trois sites de merge.
+    pub fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NotRequired | Self::Attested => None,
+            Self::Missing => Some("mpc_gate_missing"),
+            Self::StaleSha { .. } => Some("mpc_gate_stale_sha"),
+        }
+    }
+}
+
+/// Les SHA attestés par les marqueurs de gate MPC, dans l'ordre des commentaires.
+///
+/// Pure. **Le marqueur n'est jamais cherché dans du code** — ni bloc clôturé
+/// (```` ``` ```` / `~~~`), ni span en ligne (`` ` ``). Raison mesurée par mika#2050
+/// sur le Signal S : un commentaire qui **discute** du format (le corps de
+/// mika#2617 le cite) porte le littéral et serait lu comme une attestation. Un
+/// vrai marqueur est un commentaire HTML, invisible au rendu ; dans du code il
+/// est affiché, donc c'est de la prose qui en parle.
+///
+/// Un `sha=` qui n'est pas suivi d'hexadécimal puis de `-->` est ignoré. Un SHA
+/// tronqué est extrait tel quel : c'est l'égalité de [`mpc_gate_verdict`] qui le
+/// refuse, avec un motif qui le montre, plutôt qu'un silence.
+pub fn extract_mpc_gate_shas(comments: &[String]) -> Vec<String> {
+    comments
+        .iter()
+        .flat_map(|body| shas_in_prose(&strip_code(body)))
+        .collect()
+}
+
+/// Les SHA des marqueurs d'un texte déjà débarrassé de son code.
+fn shas_in_prose(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(MPC_GATE_MARKER_PREFIX) {
+        rest = &rest[at + MPC_GATE_MARKER_PREFIX.len()..];
+        let hex_len = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if hex_len == 0 {
+            continue;
+        }
+        if rest[hex_len..]
+            .trim_start_matches([' ', '\t'])
+            .starts_with(MPC_GATE_MARKER_SUFFIX)
+        {
+            out.push(rest[..hex_len].to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// Le texte d'un commentaire sans ses blocs clôturés ni ses spans de code.
+///
+/// Un bloc non refermé court jusqu'à la fin du commentaire — comme au rendu
+/// GitHub, et dans le sens fail-closed : le marqueur qu'il contiendrait n'est
+/// pas lu.
+fn strip_code(body: &str) -> String {
+    let mut prose = String::with_capacity(body.len());
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let opener = ['`', '~'].into_iter().find_map(|c| {
+            let n = trimmed.chars().take_while(|&x| x == c).count();
+            (n >= 3).then_some((c, n))
+        });
+        match (fence, opener) {
+            (None, Some(open)) => fence = Some(open),
+            // Une clôture fermante n'a pas d'info-string (CommonMark) : une
+            // ligne ```` ```rust ```` dans un bloc ne le referme pas.
+            (Some((c, n)), Some((c2, n2)))
+                if c == c2 && n2 >= n && trimmed[n2..].trim().is_empty() =>
+            {
+                fence = None
+            }
+            (Some(_), _) => {}
+            (None, None) => {
+                prose.push_str(&strip_inline_code(line));
+                prose.push('\n');
+            }
+        }
+    }
+    prose
+}
+
+/// Une ligne sans ses spans de code en ligne (une suite de N accents graves
+/// ouvre, la prochaine suite d'exactement N ferme). Une suite sans fermeture est
+/// laissée telle quelle, comme au rendu.
+fn strip_inline_code(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let run_at = |i: usize| chars[i..].iter().take_while(|&&c| c == '`').count();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let n = run_at(i);
+        let mut j = i + n;
+        let mut close = None;
+        while j < chars.len() {
+            if chars[j] == '`' {
+                let m = run_at(j);
+                if m == n {
+                    close = Some(j + m);
+                    break;
+                }
+                j += m;
+            } else {
+                j += 1;
+            }
+        }
+        match close {
+            Some(end) => i = end,
+            None => {
+                out.extend(&chars[i..i + n]);
+                i += n;
+            }
+        }
+    }
+    out
+}
+
+/// Le verdict du gate MPC pour `repo` à la tête `head_sha`.
+///
+/// **L'ordre des termes est la propriété, pas une discipline d'appelant.** Le
+/// terme de population est testé **en premier** : hors population le verdict est
+/// [`MpcGateVerdict::NotRequired`] quels que soient les commentaires, et
+/// l'évaluateur paresseux côté agent n'invoque pas le lecteur réseau (plan R10).
+///
+/// Égalité **stricte sur le SHA complet** (casse hexadécimale normalisée) : un
+/// préfixe ne vaut pas attestation — un SHA abrégé désigne un commit par
+/// ambiguïté résolue, et ce que la garde achète, c'est qu'un push ultérieur
+/// l'invalide de lui-même.
+pub fn mpc_gate_verdict(repo: &str, head_sha: &str, comments: &[String]) -> MpcGateVerdict {
+    if !mpc_gate_required(repo) {
+        return MpcGateVerdict::NotRequired;
+    }
+    let head = head_sha.trim().to_ascii_lowercase();
+    if head.is_empty() {
+        return MpcGateVerdict::Missing;
+    }
+    let shas = extract_mpc_gate_shas(comments);
+    if shas.contains(&head) {
+        return MpcGateVerdict::Attested;
+    }
+    match shas.into_iter().last() {
+        Some(attested) => MpcGateVerdict::StaleSha { attested, head },
+        None => MpcGateVerdict::Missing,
+    }
+}
+
+/// Le témoin de type qu'exige `run_gh_merge` : la preuve que le gate MPC a été
+/// évalué et qu'il autorise ce merge.
+///
+/// **Le champ est privé et le seul constructeur est [`Self::from_mpc_verdict`]**,
+/// qui ne rend `Some` que sur `NotRequired` et `Attested`. Les trois sites de
+/// merge (l'outil, `verdict_handler`, `merge_ready_handler`) sont donc forcés
+/// **par le compilateur**, sans scan de source : poser AC5 dans l'outil seul
+/// l'aurait laissée contournable par les deux handlers (plan R8). Doctrine
+/// mika#1991 : construire l'incapacité, ne pas promettre la retenue.
+///
+/// Ni `Clone` ni `Copy`, et consommé par valeur : un témoin sert un merge, pas
+/// deux.
+#[derive(Debug)]
+pub struct MergeClearance {
+    _sealed: (),
+}
+
+impl MergeClearance {
+    /// `Some` seulement quand le verdict autorise le merge.
+    pub fn from_mpc_verdict(verdict: &MpcGateVerdict) -> Option<Self> {
+        match verdict {
+            MpcGateVerdict::NotRequired | MpcGateVerdict::Attested => Some(Self { _sealed: () }),
+            MpcGateVerdict::Missing | MpcGateVerdict::StaleSha { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +727,235 @@ mod tests {
             )
             .is_none()
         );
+    }
+}
+
+/// Gate MPC (mika#2617, U5/AC5). Contrôles négatifs déterministes : SHA
+/// périmé ⇒ refus, marqueur dans du code ⇒ ignoré, dépôt hors population ⇒
+/// `NotRequired` quels que soient les commentaires.
+#[cfg(test)]
+mod mpc_gate_tests {
+    use super::*;
+
+    const HEAD: &str = "8ccaabc8d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6";
+    const OLD: &str = "41a4a20e00112233445566778899aabbccddeeff";
+    const CP: &str = "senara-solutions/claude-pilot";
+
+    fn marker(sha: &str) -> String {
+        format!("{MPC_GATE_MARKER_PREFIX}{sha} -->")
+    }
+
+    fn c(bodies: &[&str]) -> Vec<String> {
+        bodies.iter().map(|b| (*b).to_string()).collect()
+    }
+
+    /// Rectification de prémisse du 2026-10-05 : le dépôt a été renommé, et
+    /// GitHub envoie le nom courant. Si ce test rougit, la garde est inerte
+    /// pour toute la population qu'elle existe pour garder (classe mika#2205).
+    #[test]
+    fn mika2617_the_current_repo_name_is_in_the_population() {
+        assert!(mpc_gate_required("senara-solutions/claude-pilot"));
+        // L'alias : GitHub redirige l'ancien nom vers la même PR.
+        assert!(mpc_gate_required("senara-solutions/claude-pilot-py"));
+        // GitHub résout sans casse.
+        assert!(mpc_gate_required(" Senara-Solutions/Claude-Pilot "));
+    }
+
+    #[test]
+    fn mika2617_the_population_does_not_leak() {
+        for repo in [
+            "senara-solutions/mika",
+            "senara-solutions/mika-cloud",
+            "senara-solutions/mika-skills",
+            "senara-solutions/claude-pilot-ts",
+            "senara-solutions/claude-pilot-extra",
+            "other-org/claude-pilot",
+            "",
+        ] {
+            assert!(
+                !mpc_gate_required(repo),
+                "{repo} ne doit pas exiger le gate MPC"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2617_extract_mpc_gate_shas_nominal() {
+        let body = format!("Gate MPC : OK.\n\n{}", marker(HEAD));
+        assert_eq!(extract_mpc_gate_shas(&c(&[&body])), vec![HEAD.to_string()]);
+    }
+
+    #[test]
+    fn mika2617_extract_mpc_gate_shas_several_comments_in_order() {
+        let a = marker(OLD);
+        let b = format!("relu après push\n{}", marker(HEAD));
+        assert_eq!(
+            extract_mpc_gate_shas(&c(&["sans rapport", &a, &b])),
+            vec![OLD.to_string(), HEAD.to_string()]
+        );
+    }
+
+    #[test]
+    fn mika2617_extract_mpc_gate_shas_keeps_a_truncated_sha_for_the_verdict_to_refuse() {
+        let body = marker("8ccaabc8");
+        assert_eq!(
+            extract_mpc_gate_shas(&c(&[&body])),
+            vec!["8ccaabc8".to_string()]
+        );
+    }
+
+    #[test]
+    fn mika2617_extract_mpc_gate_shas_requires_the_closing_delimiter() {
+        let prose = [
+            format!("{MPC_GATE_MARKER_PREFIX}{HEAD}"),
+            format!("{MPC_GATE_MARKER_PREFIX}{HEAD} et la suite"),
+            format!("{MPC_GATE_MARKER_PREFIX}<SHA complet de la tête> -->"),
+        ];
+        for body in prose {
+            assert!(
+                extract_mpc_gate_shas(std::slice::from_ref(&body)).is_empty(),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// **Contrôle négatif** (mika#2050) : un commentaire qui DISCUTE du format
+    /// porte le littéral. Dans un bloc clôturé ou un span en ligne, il est
+    /// affiché — ce n'est pas une attestation.
+    #[test]
+    fn mika2617_extract_mpc_gate_shas_ignores_a_marker_in_a_code_block() {
+        let fenced = format!("Format :\n```\n{}\n```\nfin", marker(HEAD));
+        let tilde = format!("~~~md\n{}\n~~~", marker(HEAD));
+        let unclosed = format!("```\n{}", marker(HEAD));
+        let inline = format!("Le marqueur s'écrit `{}`.", marker(HEAD));
+        let double = format!("``{}``", marker(HEAD));
+        let indented_fence = format!("- item\n  ```\n  {}\n  ```", marker(HEAD));
+        let info_inside = format!("```\n```rust\n{}\n```", marker(HEAD));
+        for body in [
+            fenced,
+            tilde,
+            unclosed,
+            inline,
+            double,
+            indented_fence,
+            info_inside,
+        ] {
+            assert!(
+                extract_mpc_gate_shas(std::slice::from_ref(&body)).is_empty(),
+                "marqueur dans du code lu comme attestation : {body:?}"
+            );
+        }
+        // Contrôle positif dans le même appel : le même marqueur, hors code,
+        // après un bloc refermé, est lu.
+        let after = format!("```\nx\n```\n{}", marker(HEAD));
+        assert_eq!(extract_mpc_gate_shas(&[after]), vec![HEAD.to_string()]);
+    }
+
+    /// Le corps du ticket mika#2617 lui-même cite le littéral : il ne doit
+    /// rien attester.
+    #[test]
+    fn mika2617_the_ticket_body_quoting_the_format_attests_nothing() {
+        let body = "Format retenu (décision MPC) : un commentaire de PR contenant le \
+                    marqueur `<!-- mpc-gate: ok sha=<SHA complet de la tête> -->`.";
+        assert!(extract_mpc_gate_shas(&c(&[body])).is_empty());
+    }
+
+    #[test]
+    fn mika2617_mpc_gate_verdict_not_required_outside_the_population() {
+        // Aucun marqueur, et même un marqueur périmé : hors population, rien ne mord.
+        assert_eq!(
+            mpc_gate_verdict("senara-solutions/mika", HEAD, &[]),
+            MpcGateVerdict::NotRequired
+        );
+        assert_eq!(
+            mpc_gate_verdict("senara-solutions/mika", "", &c(&[&marker(OLD)])),
+            MpcGateVerdict::NotRequired
+        );
+    }
+
+    #[test]
+    fn mika2617_mpc_gate_verdict_attested_on_equality() {
+        let comments = c(&[&marker(OLD), &marker(HEAD)]);
+        assert_eq!(
+            mpc_gate_verdict(CP, HEAD, &comments),
+            MpcGateVerdict::Attested
+        );
+        // Casse hexadécimale normalisée des deux côtés.
+        let upper = c(&[&marker(&HEAD.to_ascii_uppercase())]);
+        assert_eq!(mpc_gate_verdict(CP, HEAD, &upper), MpcGateVerdict::Attested);
+    }
+
+    #[test]
+    fn mika2617_mpc_gate_verdict_stale_sha_on_divergence() {
+        assert_eq!(
+            mpc_gate_verdict(CP, HEAD, &c(&[&marker(OLD)])),
+            MpcGateVerdict::StaleSha {
+                attested: OLD.to_string(),
+                head: HEAD.to_string()
+            }
+        );
+        // Un préfixe de la tête n'est PAS la tête.
+        assert_eq!(
+            mpc_gate_verdict(CP, HEAD, &c(&[&marker(&HEAD[..8])])),
+            MpcGateVerdict::StaleSha {
+                attested: HEAD[..8].to_string(),
+                head: HEAD.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mika2617_mpc_gate_verdict_missing_on_absence_and_on_unknown_head() {
+        assert_eq!(mpc_gate_verdict(CP, HEAD, &[]), MpcGateVerdict::Missing);
+        assert_eq!(
+            mpc_gate_verdict(CP, HEAD, &c(&["LGTM", "gate ok"])),
+            MpcGateVerdict::Missing
+        );
+        // Tête illisible : fail-closed, même avec un marqueur présent.
+        assert_eq!(
+            mpc_gate_verdict(CP, "  ", &c(&[&marker(HEAD)])),
+            MpcGateVerdict::Missing
+        );
+        // Marqueur dans du code seulement : Missing, pas Attested.
+        let fenced = format!("```\n{}\n```", marker(HEAD));
+        assert_eq!(
+            mpc_gate_verdict(CP, HEAD, &c(&[&fenced])),
+            MpcGateVerdict::Missing
+        );
+    }
+
+    #[test]
+    fn mika2617_merge_clearance_is_not_constructible_from_a_refusal() {
+        assert!(MergeClearance::from_mpc_verdict(&MpcGateVerdict::Missing).is_none());
+        assert!(
+            MergeClearance::from_mpc_verdict(&MpcGateVerdict::StaleSha {
+                attested: OLD.to_string(),
+                head: HEAD.to_string(),
+            })
+            .is_none()
+        );
+        // Contrôles positifs : sans eux, « le témoin ne se construit jamais »
+        // passerait pour « le témoin refuse bien ».
+        assert!(MergeClearance::from_mpc_verdict(&MpcGateVerdict::NotRequired).is_some());
+        assert!(MergeClearance::from_mpc_verdict(&MpcGateVerdict::Attested).is_some());
+    }
+
+    #[test]
+    fn mika2617_refusal_reason_matches_the_clearance() {
+        for v in [
+            MpcGateVerdict::NotRequired,
+            MpcGateVerdict::Attested,
+            MpcGateVerdict::Missing,
+            MpcGateVerdict::StaleSha {
+                attested: OLD.to_string(),
+                head: HEAD.to_string(),
+            },
+        ] {
+            assert_eq!(
+                v.refusal_reason().is_none(),
+                MergeClearance::from_mpc_verdict(&v).is_some(),
+                "{v:?} : le nom de refus et le témoin divergent"
+            );
+        }
     }
 }

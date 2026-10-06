@@ -858,3 +858,55 @@ exercée se lit exactement comme une garde qui marche* (mika#2205).
 - [ ] Le corps de la PR nomme la **migration manuelle** : aucune, et aucune
       variable d'environnement existante ne change de sens. La seule variable neuve
       est `MIKA_MERGE_GATE_RERUN`, armée par défaut.
+
+---
+
+## 11. Phase C — exécution (2026-10-05) : U5 seul, et ce que l'exécution a déplacé
+
+Phases A (#2642) et B (#2657) mergées et non retouchées, sauf le branchement
+d'U5 sur `run_gh_merge`. Cette section ne réécrit pas U5 : elle nomme les écarts
+entre le § U5 et le code livré, chacun avec sa raison.
+
+- **C1 — population : le nom courant, et l'ancien en alias.** Rectification de
+  prémisse du corps du ticket : `claude-pilot-py` a été **renommé**
+  `claude-pilot`, et GitHub envoie le nom courant. `MPC_GATE_REQUIRED_REPOS` porte
+  `senara-solutions/claude-pilot` (épinglé par un test) **et**
+  `senara-solutions/claude-pilot-py` : GitHub redirige l'ancien nom vers la même
+  PR, donc le retirer laisserait un appelant périmé atteindre une porte ouverte.
+  Comparaison sans casse, pour la même raison.
+- **C2 — la lecture parse du JSON, pas `--jq '.comments[].body'`.** Une ligne par
+  commentaire casse sur un corps multi-ligne : l'état de clôture d'un bloc de
+  code d'un commentaire déborderait sur le suivant. `--json comments` puis serde.
+  Sortie tronquée (`MAX_OUTPUT_LEN`) ⇒ erreur de parse ⇒ `Missing`.
+- **C3 — le marqueur est ignoré dans les spans en ligne aussi**, pas seulement les
+  blocs clôturés : un vrai marqueur est un commentaire HTML invisible ; dans du
+  code, quel qu'il soit, il est affiché, donc c'est de la prose. Le corps de
+  mika#2617 cite le littéral dans un span en ligne.
+- **C4 — `MergeClearance` vit dans `mika_common::forge_identity`**, à côté du
+  verdict : le champ privé l'est alors **d'une crate à l'autre**, ce qui est plus
+  fort qu'un `pub(crate)`. Ni `Clone` ni `Copy`, consommé par valeur par
+  `run_gh_merge` : un témoin, un merge. Un scan épingle qu'il n'est fabriqué qu'à
+  un seul site de production (`mpc_gate_clearance`) — le compilateur force
+  l'évaluation, le scan empêche de la court-circuiter en écrivant
+  `from_mpc_verdict(&NotRequired)`.
+- **C5 — l'ordre population → lecture est porté par `evaluate_mpc_gate`**, qui
+  prend le lecteur en fermeture. `mpc_gate_verdict` reste pure sur
+  `comments: &[String]` et teste aussi la population en premier.
+- **C6 — dans l'outil, le terme est le dernier**, dans le bras
+  `AllChecksPassed`, après behind-main : une PR que la porte refuse de toute façon
+  ne paie jamais la lecture. `decide_merge_gate` n'a pas reçu de paramètre
+  `mpc_verdict` : l'y faire entrer obligerait à lire les commentaires **avant** de
+  savoir si la porte s'ouvrirait, c'est-à-dire le coût que R10 interdit. T10–T13
+  se testent sur `evaluate_mpc_gate` + `mpc_gate_block`, purs ou sans réseau.
+- **C7 — `verdict_handler` réutilise le preflight de behind-main** pour la tête,
+  et ne résout par `fetch_pr_head_sha` que pour un dépôt de la population dont le
+  preflight a échoué.
+- **C8 — R8 est à re-mesurer, hors périmètre.** `INTERNAL_REPOS` du gateway
+  (`crates/mika-gateway/src/github.rs:265`) liste encore l'ancien nom ; si les
+  webhooks portent le nom courant, `merge_ready_handler` n'est plus atteint pour
+  claude-pilot. La garde tient quand même sur les trois sites : elle est dans le
+  type, pas dans le routage.
+
+**Vu rouge par mutation, un terme à la fois** (rapporté dans le corps de la PR) :
+population avant lecture ; égalité stricte ; marqueur ignoré dans le code ;
+fail-closed sur lecture illisible.
