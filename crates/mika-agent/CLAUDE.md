@@ -3332,7 +3332,7 @@ Surfaces opérateur, régimes attendus, recensement AC4 et les cinq haltes :
 `CLAUDE.md` racine § *Un dispatch ouvert par un événement PR est borné à la lignée de
 cet événement*.
 
-### Une annulation depuis un tour webhook PR ne touche pas un pilote vif (mika#2653, phase A)
+### Une annulation depuis un tour webhook PR ne touche pas un pilote vif (mika#2653, phases A et B)
 
 `CancelTaskTool::execute` gagne un terme : dans un tour dont
 l'`originating_message` est un `[GitHub] PR …` ou un `[GitHub] Check suite …`,
@@ -3385,18 +3385,41 @@ question »*) passe de deux appelants à trois plutôt que d'être recopié. *Un
 recensement n'est pas une allowlist : on y ajoute, on n'y exempte pas*
 (mika#2633).
 
-**R3 — la traversée que ce lecteur demande EXISTE DÉJÀ**, dans
-`cancel_task_and_kill` (posée par mika#2335, avec les deux mêmes filtres). Donc
-l'extraction est due, et **c'est AC6, explicitement différé en phase B** :
-la phase A livre la garde, la phase B extrait `resolve_task_pilot` et pose son
-scan de lecteur unique. **L'ordre inverse est interdit** — livrer le détecteur
-sans la garde ne referme rien. La duplication est **nommée au site** (doc-comment
-de `live_pilot_for_task`, § *AC6 différé*), avec la frontière à connaître avant de
-fusionner les deux lectures : le chemin de kill **écarte** un enfant sans
-`process_start_time` (il ne doit pas signaler un groupe de processus qu'il ne peut
-pas identifier), là où ce verdict le rend `Unreadable` (il ne peut pas prouver
-l'absence de pilote). Deux dispositions correctes pour deux questions
-différentes, à préserver à l'identique lors de l'extraction.
+**R3 — la traversée que ce lecteur demande EXISTAIT DÉJÀ**, dans
+`cancel_task_and_kill` (posée par mika#2335). **AC6, livré en phase B** :
+`live_pilot::resolve_task_pilot` est le site unique de la traversée
+parent→enfant d'un id de tâche, appelé par `cancel_task_and_kill` **et** par
+`live_pilot_for_task`. Il rend des **candidats** (`TaskPilot::Named`,
+`Children`, `ChildrenUnreadable`) ; la **classification reste à chaque appelant**,
+et elle diverge délibérément : le chemin de kill **écarte** un enfant sans
+`process_start_time` (il ne signale pas un groupe de processus qu'il ne peut pas
+identifier), le verdict le rend `Unreadable` (il ne peut pas prouver l'absence de
+pilote). La traversée n'écarte donc **rien** qu'un des deux lecteurs garde. Les
+deux filtres de la phase A (terminal sur la ligne nommée, start_time lu par
+`Database::process_start_time_from_metadata`) s'appliquent désormais aussi au
+kill — sans changement d'issue sur le terminal (`cancel_task` refuse une ligne
+terminale), et dans le sens **sûr** sur la forme entière du start_time (le kill
+vérifie l'instance au lieu d'une existence nue : population signalée plus
+étroite, jamais plus large).
+
+Le scan `canonical_tokens::mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique`
+refuse tout fichier de production hors `live_pilot.rs` qui **appelle** les trois
+termes de la question : une traversée de dispatch, `is_terminal_task_status` et
+`is_same_process_alive`. Allowlist `LIVE_PILOT_TASK_READER_ALLOWED` livrée vide
+et épinglée vide ; anti-vacuité sur `live_pilot.rs` ; contrôle de bonne foi sur la
+forme réelle du `process_kill.rs` de la phase A (vu rouge sur cet arbre).
+**Prémisse du plan corrigée :** la composition traversée × preuve d'instance
+n'était pas absente de l'arbre — `TaskEngine::dispatch_liveness` (`engine.rs`,
+mika#2156) la porte. Elle pose une autre question (*un processus tourne-t-il
+encore sous cette ligne de suivi, quel que soit le statut de l'enfant ?*) et
+refuse délibérément le filtre terminal (D-2 : 1146/1147 enfants porteurs de pid
+sont `delivered`). C'est pourquoi le terme terminal est dans le prédicat ; le
+résidu est nommé au test : un futur lecteur sans filtre terminal échapperait au
+scan, mais ne répondrait plus à la question de `live_pilot.rs`. Ce résidu n'est
+pas seulement futur : `probe_pilot_liveness` (`mika-cli`, `mika tasks show`) lit
+déjà la même vivacité sans filtre terminal (il affiche, il ne décide rien) ; le
+router par `live_pilot` demande d'exposer `resolve_task_pilot` hors du crate, et
+c'est un suivi.
 
 **R4 — un site couvre deux outils.** `CancelReminderTool::execute` est
 littéralement `CancelTaskTool.execute(input, ctx).await`, donc la garde couvre
@@ -3472,8 +3495,10 @@ choix, sont dans la section racine.
 
 #### Quatre détecteurs
 
-- **1 — AC6, différé en phase B** (lecteur unique de la vivacité). La duplication
-  est nommée au site en attendant.
+- **1 — `mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique`** (phase B, AC6 ;
+  `canonical_tokens.rs`, allowlist `LIVE_PILOT_TASK_READER_ALLOWED` livrée vide et
+  épinglée vide). Voir le paragraphe R3 ci-dessus pour son prédicat à trois
+  termes et les deux lecteurs sans filtre terminal qu'il ne voit pas.
 - **2 — `mika2653_le_nom_daudit_a_un_seul_ecrivain`** (`canonical_tokens.rs`,
   allowlist livrée **vide** et épinglée vide). La comparaison du littéral est
   **exacte et non en sous-chaîne**, reprise mot pour mot de la correction mesurée
