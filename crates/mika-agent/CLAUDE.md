@@ -3415,7 +3415,11 @@ encore sous cette ligne de suivi, quel que soit le statut de l'enfant ?*) et
 refuse délibérément le filtre terminal (D-2 : 1146/1147 enfants porteurs de pid
 sont `delivered`). C'est pourquoi le terme terminal est dans le prédicat ; le
 résidu est nommé au test : un futur lecteur sans filtre terminal échapperait au
-scan, mais ne répondrait plus à la question de `live_pilot.rs`.
+scan, mais ne répondrait plus à la question de `live_pilot.rs`. Ce résidu n'est
+pas seulement futur : `probe_pilot_liveness` (`mika-cli`, `mika tasks show`) lit
+déjà la même vivacité sans filtre terminal (il affiche, il ne décide rien) ; le
+router par `live_pilot` demande d'exposer `resolve_task_pilot` hors du crate, et
+c'est un suivi.
 
 **R4 — un site couvre deux outils.** `CancelReminderTool::execute` est
 littéralement `CancelTaskTool.execute(input, ctx).await`, donc la garde couvre
@@ -3491,8 +3495,10 @@ choix, sont dans la section racine.
 
 #### Quatre détecteurs
 
-- **1 — AC6, différé en phase B** (lecteur unique de la vivacité). La duplication
-  est nommée au site en attendant.
+- **1 — `mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique`** (phase B, AC6 ;
+  `canonical_tokens.rs`, allowlist `LIVE_PILOT_TASK_READER_ALLOWED` livrée vide et
+  épinglée vide). Voir le paragraphe R3 ci-dessus pour son prédicat à trois
+  termes et les deux lecteurs sans filtre terminal qu'il ne voit pas.
 - **2 — `mika2653_le_nom_daudit_a_un_seul_ecrivain`** (`canonical_tokens.rs`,
   allowlist livrée **vide** et épinglée vide). La comparaison du littéral est
   **exacte et non en sous-chaîne**, reprise mot pour mot de la correction mesurée

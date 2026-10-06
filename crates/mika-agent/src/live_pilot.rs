@@ -997,4 +997,71 @@ mod tests {
             other => panic!("attendu Named, obtenu {other:?}"),
         }
     }
+
+    /// La forme **entière** de `process_start_time` sur la ligne nommée est lue
+    /// par la traversée — c'est l'écart (b) que le chemin de kill hérite.
+    #[tokio::test]
+    async fn mika2653b_la_ligne_nommee_lit_la_forme_entiere_du_start_time() {
+        let db = test_db();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let (pid, st) = self_pid_and_start();
+        let child = db
+            .create_task(NewTask {
+                agent_id: AGENT.to_string(),
+                team_run_id: None,
+                parent_task_id: Some(parent.clone()),
+                depth: 1,
+                label: "long_running:run_claude_pilot".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("s".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: Some(format!("{{\"process_start_time\":{st}}}")),
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .expect("create child with integer-shaped start time");
+        db.set_task_process_id(&child, Some(pid))
+            .await
+            .expect("record pgid");
+
+        let named = db.get_task(&child).await.expect("read child");
+        assert!(
+            matches!(
+                resolve_task_pilot(&db, &child, named.as_ref()).await,
+                TaskPilot::Named { start_time: Some(s), .. } if s == st
+            ),
+            "la forme entière doit être lue `Some`, sinon le kill retombe sur \
+             une existence nue"
+        );
+    }
+
+    /// Un enfant illisible ne masque pas un enfant vif prouvé : la traversée
+    /// rend les deux, et le verdict tranche `Alive` (jumeau de
+    /// `one_unjudgeable_sibling_does_not_mask_a_live_child` côté URL).
+    #[tokio::test]
+    async fn mika2653b_un_enfant_illisible_ne_masque_pas_un_enfant_vif() {
+        let db = test_db();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let (pid, st) = self_pid_and_start();
+        seed_child(&db, &parent, "in_progress", pid, None).await;
+        seed_child(&db, &parent, "in_progress", pid, Some(st)).await;
+
+        assert!(
+            live_pilot_for_task(&db, &parent).await.is_alive(),
+            "un frère illisible ne doit pas rendre `Unreadable` quand un pilote \
+             vif est prouvé"
+        );
+    }
 }

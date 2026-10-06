@@ -99,11 +99,11 @@ réellement par la garde.
 
 ## Ce qui reste ouvert
 
-- **Traversée dupliquée, phase B.** `live_pilot_for_task` refait la résolution
-  parent → enfants que `cancel_task_and_kill` porte déjà
-  (`find_dispatch_children_with_pid`). La duplication est nommée dans le
-  doc-comment de `live_pilot_for_task`. L'extraction en un `resolve_task_pilot`
-  commun est différée à la phase B de mika#2653. Les deux lectures divergent
+- **Traversée dupliquée — fermé en phase B.** La résolution parent → enfants
+  que `live_pilot_for_task` et `cancel_task_and_kill` écrivaient chacun a un site
+  unique, `live_pilot::resolve_task_pilot`, qui rend des candidats sans les
+  classer ; le scan `mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique` refuse
+  un second lecteur. Les deux lectures divergent
   volontairement sur un point à préserver : le chemin de kill **écarte** un
   enfant sans `process_start_time`, le verdict le rend `Unreadable`.
 - **Vecteurs voisins non couverts** (plan § R6) : `update_task_status` →

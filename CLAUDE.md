@@ -5747,11 +5747,14 @@ depuis un tour webhook PR depuis le déploiement.
 - **Il ne couvre pas un tour webhook servi en mode silencieux** — borne héritée
   de mika#2517 / mika#2573, population mesurée vide (un tour silencieux a
   `originating_message = None`).
-- **AC6 est explicitement DIFFÉRÉ en phase B** : la traversée parent→enfant est
-  aujourd'hui écrite **deux fois** (ici et dans `cancel_task_and_kill`), la
-  duplication est **nommée au site** avec sa frontière, et la phase B l'extrait
-  avec son scan de lecteur unique. L'ordre inverse est interdit : livrer le
-  détecteur sans la garde ne referme rien.
+- **AC6 est livré en phase B** : la traversée parent→enfant a un site unique,
+  `live_pilot::resolve_task_pilot`, appelé par la garde (via
+  `live_pilot_for_task`) et par `cancel_task_and_kill` ; le scan
+  `mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique` refuse un second
+  lecteur. Il ne voit **pas** les lecteurs qui omettent le filtre terminal, et
+  deux existent aujourd'hui, nommés au test : `TaskEngine::dispatch_liveness`
+  (`engine.rs`, D-2 de mika#2156) et `probe_pilot_liveness` (`mika-cli`,
+  `mika tasks show`, affichage opérateur).
 - **Il ne rend pas le champ surveillé.** Les seuls instruments sont les greps et
   les requêtes ci-dessus, et **leur silence ne prouve rien tant que personne ne
   les exécute** — d'où le contrôle positif obligatoire.
@@ -5791,16 +5794,18 @@ depuis un tour webhook PR depuis le déploiement.
   poignée « enfant » passe par le lecteur de colonne, qui accepte aussi la forme
   **entière** du JSON — les deux poignées d'une seule fonction répondaient donc
   différemment de la même ligne, et sous une garde fail-closed cet écart faisait
-  refuser d'un côté ce qu'il laissait passer de l'autre. **Trois copies inline de
-  la forme chaîne-seule subsistent** (la branche « ligne nommée » de
-  `cancel_task_and_kill` et deux sites de `task_engine/engine.rs`) : les router
-  **élargirait** leurs populations — pour le chemin de kill, il tenterait un
-  signal sur une ligne qu'il décline aujourd'hui — donc c'est un **suivi nommé**,
-  pas un effet de bord de ce ticket.
-- **`cancel_task_and_kill`, `kill_process_gracefully`, le watchdog #959, le
-  faucheur mika#2249, le sweep phantom #1712, la supersession mika#2335** : aucun
-  contact — les huit tests de `test_supersede_kills_live_pilot.rs` passent **sans
-  modification**, ce qui est la mesure que le chemin de kill est intact.
+  refuser d'un côté ce qu'il laissait passer de l'autre. **Depuis la phase B, le
+  chemin de kill lit aussi par ce site** (via `resolve_task_pilot`) : une forme
+  entière, lue `None` auparavant (existence nue), est désormais lue `Some`, et le
+  kill vérifie l'**instance** avant de signaler — population signalée plus
+  étroite, jamais plus large. **Deux copies inline de la forme chaîne-seule
+  subsistent**, dans `task_engine/engine.rs` : les router est un **suivi nommé**.
+- **`kill_process_gracefully`, le watchdog #959, le faucheur mika#2249, le sweep
+  phantom #1712, la supersession mika#2335** : aucun contact.
+  `cancel_task_and_kill` ne change que par sa traversée (phase B, deux écarts
+  documentés au doc-comment de `resolve_task_pilot`) — les tests de
+  `test_supersede_kills_live_pilot.rs` et `test_cancel_task_live_pilot_2653.rs`
+  passent **sans modification**.
 - **Le domaine Fallthrough et `FALLTHROUGH_WITHHELD_TOOLS`** : inchangés ; la
   retenue est refusée avec sa raison.
 

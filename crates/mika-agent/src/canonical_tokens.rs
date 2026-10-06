@@ -1721,8 +1721,15 @@ mod tests {
     /// processus mort). Ce n'est pas un second lecteur de la question de
     /// `live_pilot.rs` ; c'est une divergence **écrite au site**, et ce scan
     /// vise la divergence silencieuse. Le résidu, nommé plutôt que découvert :
-    /// un futur lecteur qui omettrait le filtre terminal échapperait au scan —
-    /// mais il ne répondrait plus à la question de `live_pilot.rs`.
+    /// un lecteur qui omet le filtre terminal échappe au scan. Il en existe un
+    /// second **aujourd'hui** : `probe_pilot_liveness` (`mika-cli`, rendu de
+    /// `mika tasks show`), même forme que `dispatch_liveness`. Il affiche et ne
+    /// décide rien ; le router par `live_pilot` demande d'exposer
+    /// `resolve_task_pilot` hors du crate — suivi, pas une ligne d'allowlist.
+    ///
+    /// Le scan est **par fichier** : un appel à `is_terminal_task_status` ajouté
+    /// ailleurs dans `engine.rs` ou `tasks.rs` le ferait rougir sur ces deux
+    /// sites. La résolution reste alors la même — router, pas exempter.
     #[test]
     fn mika2653_le_scan_du_lecteur_voit_un_second_site() {
         let traversal = format!("find_dispatch_children{}", "_with_pid");

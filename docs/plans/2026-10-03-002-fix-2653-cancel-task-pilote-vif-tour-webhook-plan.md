@@ -801,7 +801,10 @@ Livrée en PR empilée sur la phase A. Trois écarts au § 4.3 / § 9, mesurés 
    prédicat du détecteur 1 exige donc **le troisième terme de la question de
    `live_pilot.rs`** — le filtre terminal — que `dispatch_liveness` refuse
    délibérément (D-2). Allowlist **vide**, conformément au § 9 ; le résidu (un
-   lecteur sans filtre terminal échappe au scan) est nommé au test.
+   lecteur sans filtre terminal échappe au scan) est nommé au test, et il a
+   **deux** membres présents, trouvés en revue : `dispatch_liveness` et
+   `probe_pilot_liveness` (`mika-cli`, `mika tasks show`, affichage seul ; le
+   router demande d'exposer `resolve_task_pilot` hors du crate — suivi).
 
 Ce que l'extraction change au chemin de kill, et dans quel sens : (a) une ligne
 nommée **terminale** porteuse d'un pgid retombe sur la traversée des enfants —
