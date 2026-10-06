@@ -68,6 +68,10 @@ pub struct AgentState {
     /// deferral, a different mechanism). Constructed in `init_agent` from
     /// `effective_webhook_queue_*()` config.
     pub webhook_queue_v2: Arc<WebhookQueue>,
+    /// `synchronize` retenus par l'anti-rebond (mika#2671 phase B), un par PR.
+    /// Vidé au redémarrage ; la reprise passe par le registre
+    /// `qa_pr_sync_observed` (`handlers::recover_held_syncs`).
+    pub sync_debounce: Arc<crate::server::sync_debounce::SyncDebounce>,
     /// Per-agent KG configuration resolved at init time (#778). `Disabled` skips
     /// all KG subsystem construction; `Enabled` provides the validated docs_root
     /// and precomputed docs_root_hash for the three KG startup loops.

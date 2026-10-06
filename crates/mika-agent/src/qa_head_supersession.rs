@@ -30,6 +30,24 @@
 //! réconciliation (mika#2334) ne repasse pas sur une PR qui a déjà une revue. Corollaire : aucun appel GitHub, ni en
 //! production ni à bouchonner en test.
 //!
+//! # Phase B : une retenue durable vaut un démarrage (mika#2671 KTD4)
+//!
+//! L'anti-rebond de la phase B (`server::sync_debounce`) retient un
+//! `synchronize` le temps d'une fenêtre et l'inscrit au MÊME registre, même clé,
+//! `after_value = "stage=held"`. Le compteur ci-dessous ne filtre pas
+//! `after_value` : une retenue postérieure au build fait donc sauter le
+//! callback. C'est la révision assumée de « démarré, pas reçu » : une retenue
+//! n'est pas un simple « reçu », elle est durable — rejouée au démarrage du
+//! worker de drain, et par un balayage périodique si la file l'a évincée — donc
+//! la revue de la tête suivante reste garantie. Sans ce couplage, la fenêtre
+//! retarderait le démarrage de la revue suivante au-delà du callback précédent,
+//! et l'épisode de référence coûterait plus qu'avec la phase A seule.
+//!
+//! Chaque ligne porte l'identité de l'événement dans `reasoning`
+//! (`request_id=<uuid>`) : le texte du gateway est identique pour tous les
+//! `synchronize` d'une PR, et seule l'identité dit quel événement un tour a
+//! consommé (`Database::list_pending_audit_holds`).
+//!
 //! # Le registre
 //!
 //! Une ligne `audit_events` par tour de revue démarré sur un `synchronize`,
@@ -49,7 +67,9 @@
 
 use crate::server::deadline_verdict::PrTarget;
 
-/// `audit_events.tool_name` d'un `synchronize` reçu. **SOLE WRITER** :
+/// `audit_events.tool_name` du registre des `synchronize` : tour démarré
+/// (`after_value` NULL, phase A) ou retenue de l'anti-rebond
+/// (`after_value = "stage=held"`, phase B). **SOLE WRITER** :
 /// [`crate::server::handlers`], via [`sync_observed_key`].
 pub const SYNC_OBSERVED_TOOL: &str = "qa_pr_sync_observed";
 
@@ -81,6 +101,13 @@ pub fn stale_build_guard_enabled() -> bool {
 /// `MIKA_QA_CALLBACK_VERDICT_NET`. Une coquille ne doit pas désarmer en silence
 /// une garde dont l'absence se lit exactement comme sa présence.
 pub fn parse_stale_build_guard(raw: Option<&str>) -> bool {
+    parse_switch(STALE_BUILD_GUARD_ENV, raw)
+}
+
+/// Kill-switch armé par défaut, partagé avec l'anti-rebond de la phase B
+/// (`server::sync_debounce`) : une seule table de vérité pour les interrupteurs
+/// de mika#2671, et la variable fautive nommée dans le WARN.
+pub fn parse_switch(name: &str, raw: Option<&str>) -> bool {
     let Some(raw) = raw else {
         return true;
     };
@@ -89,9 +116,10 @@ pub fn parse_stale_build_guard(raw: Option<&str>) -> bool {
         "0" | "false" | "off" | "no" => false,
         other => {
             tracing::warn!(
-                event = "qa_stale_build_guard_invalid",
+                event = "qa_switch_invalid",
+                variable = name,
                 value = %format!("\"{other}\""),
-                "valeur non reconnue pour {STALE_BUILD_GUARD_ENV} — la garde reste armée"
+                "valeur non reconnue pour {name} — l'interrupteur reste armé"
             );
             true
         }
@@ -408,6 +436,30 @@ mod tests {
         assert!(
             prod[host..].starts_with("async fn run_agent_for_message("),
             "l'appel doit vivre dans run_agent_for_message"
+        );
+    }
+
+    /// Placement (phase B) — la retenue durable n'est écrite qu'à l'ingestion :
+    /// un seul appel de production à `record_pr_sync_held`, dans
+    /// `handle_message`. Une écriture ailleurs (au démarrage d'un tour, à la
+    /// reprise) créerait des retenues que rien ne rejoue ou dédoublerait celles
+    /// qui existent — sans qu'un test comportemental ne rougisse.
+    #[test]
+    fn mika2671_la_retenue_nest_ecrite_qua_lingestion() {
+        let (_, prod) = production_files()
+            .into_iter()
+            .find(|(rel, _)| rel == "server/handlers.rs")
+            .unwrap();
+        let calls: Vec<usize> = prod
+            .match_indices("record_pr_sync_held(")
+            .map(|(i, _)| i)
+            .filter(|&i| !prod[..i].ends_with("async fn "))
+            .collect();
+        assert_eq!(calls.len(), 1, "un seul appel de production attendu");
+        let host = prod[..calls[0]].rfind("pub async fn ").unwrap();
+        assert!(
+            prod[host..].starts_with("pub async fn handle_message("),
+            "l'appel doit vivre dans handle_message"
         );
     }
 }

@@ -310,6 +310,54 @@ pub async fn handle_message(
         let key = webhook_queue_v2::coalescing_key(&kind);
         let key_display = key.as_deref().unwrap_or("none").to_string();
 
+        // mika#2671 phase B — anti-rebond : un `synchronize` est retenu le temps
+        // d'une fenêtre au lieu de partir en file ; seul le dernier de la
+        // fenêtre est versé à l'échéance. Écrit au registre AVANT la retenue :
+        // c'est la ligne durable qui survit à un redémarrage (et que la garde de
+        // build périmé de la phase A compte). Aucune autre action n'est retenue
+        // (`debounce_key` rend `None`), donc `opened` / `ready_for_review` /
+        // `review_requested` ne sont jamais retardés (AC4).
+        let ingest_guard = if req.channel == "github" {
+            Some(agent_state.sync_debounce.ingest.lock().await)
+        } else {
+            None
+        };
+        if ingest_guard.is_some()
+            && let Some(window) = super::sync_debounce::window_from_env()
+            && let Some(hold_key) = super::sync_debounce::debounce_key(&req.text)
+            && record_pr_sync_held(&agent_state.db, &hold_key, &req.text, &req.request_id).await
+        {
+            let outcome = super::sync_debounce::admit(
+                &agent_state.sync_debounce,
+                &agent_state.webhook_queue_v2,
+                hold_key.clone(),
+                req,
+                window,
+            );
+            drop(ingest_guard);
+            emit_webhook_queue_audit(
+                &state,
+                &agent_state,
+                &agent_label,
+                "webhook_queue_debounced",
+                &format!(
+                    "event_kind={kind_label} key={hold_key} outcome={} window_secs={}",
+                    outcome.label(),
+                    window.as_secs()
+                ),
+                "synchronize retenu par l'anti-rebond (mika#2671)",
+            )
+            .await;
+            return (
+                StatusCode::ACCEPTED,
+                Json(AcceptedResponse {
+                    request_id,
+                    status: "accepted".to_string(),
+                }),
+            )
+                .into_response();
+        }
+
         match agent_state.webhook_queue_v2.enqueue(req).await {
             EnqueueResult::Enqueued { depth } => {
                 emit_webhook_queue_audit(
@@ -913,7 +961,11 @@ async fn replay_deferred_webhooks(
 /// Best-effort : un échec d'écriture est journalisé et n'arrête pas
 /// l'ingestion. Fail-safe dans le sens de la revue — sans ligne, la garde ne
 /// voit aucun `synchronize` postérieur et laisse tourner le tour de callback.
-async fn record_pr_sync_observed(db: &crate::async_db::AsyncDatabase, text: &str) {
+async fn record_pr_sync_observed(
+    db: &crate::async_db::AsyncDatabase,
+    text: &str,
+    request_id: &str,
+) {
     let webhook_queue_v2::WebhookEventKind::PullRequestSync { repo, pr } =
         webhook_queue_v2::classify_event(text)
     else {
@@ -927,7 +979,10 @@ async fn record_pr_sync_observed(db: &crate::async_db::AsyncDatabase, text: &str
             &key,
             None,
             None,
-            Some("tour de revue démarré sur un pull_request.synchronize (mika#2671)"),
+            // mika#2671 phase B : l'identité de l'événement consommé, pas une
+            // phrase. C'est elle qui solde la retenue `stage=held` du même
+            // `request_id` au registre (`list_pending_audit_holds`).
+            Some(&super::sync_debounce::request_marker(request_id)),
             None,
         )
         .await
@@ -940,6 +995,188 @@ async fn record_pr_sync_observed(db: &crate::async_db::AsyncDatabase, text: &str
              build périmé ne le verra pas (le tour de callback tournera)"
         );
     }
+}
+
+/// Inscrit au registre `qa_pr_sync_observed` un `synchronize` RETENU par
+/// l'anti-rebond (mika#2671 phase B) : `after_value = "stage=held"`, texte de
+/// l'événement dans `before_value` pour le rejeu au démarrage
+/// ([`recover_held_syncs`]). Appelée uniquement depuis `handle_message`.
+///
+/// Même registre que [`record_pr_sync_observed`] et même clé, à dessein : la
+/// garde de build périmé de la phase A compte toutes les lignes de la clé, donc
+/// une retenue fait sauter le callback d'une tête qu'un `synchronize` plus récent
+/// a remplacée — sûr, parce que la retenue est durable et sera revue.
+///
+/// Rend `false` si l'écriture échoue : l'appelant ne retient PAS alors, et
+/// l'événement part en file comme avant l'anti-rebond. Une retenue non durable
+/// serait perdue au redémarrage, ce que la fenêtre ne doit jamais créer.
+async fn record_pr_sync_held(
+    db: &crate::async_db::AsyncDatabase,
+    key: &str,
+    text: &str,
+    request_id: &str,
+) -> bool {
+    match db
+        .log_audit_event(
+            "system",
+            crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+            key,
+            Some(text),
+            Some(super::sync_debounce::HELD_STAGE),
+            Some(&super::sync_debounce::request_marker(request_id)),
+            None,
+        )
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                event = "qa_sync_held_audit_failed",
+                target = %key,
+                error = %e,
+                "registre illisible — le synchronize n'est pas retenu et part en \
+                 file comme avant l'anti-rebond"
+            );
+            false
+        }
+    }
+}
+
+/// Remet en fenêtre, au démarrage du worker de drain, chaque `synchronize`
+/// retenu qu'aucun tour n'a consommé (aucune ligne de tour démarré portant son
+/// `request_id`, aucune retenue plus récente sur la clé). Couvre un redémarrage
+/// pendant la fenêtre ET entre l'échéance et le début du tour. Désarmé, la
+/// fenêtre est nulle : le pendant part aussitôt plutôt que d'être perdu.
+async fn recover_held_syncs(agent_state: &Arc<AgentState>) {
+    let window = super::sync_debounce::window_from_env().unwrap_or(std::time::Duration::ZERO);
+    recover_held_syncs_into(
+        &agent_state.db,
+        &agent_state.sync_debounce,
+        &agent_state.webhook_queue_v2,
+        window,
+        None,
+    )
+    .await;
+}
+
+/// Âge minimal d'une retenue avant que le balayage périodique ne la rejoue :
+/// couvre l'instant où l'échéance a retiré l'événement de la table sans l'avoir
+/// encore versé en file.
+const HELD_SWEEP_MIN_AGE_SECS: i64 = 60;
+
+/// Intervalle du balayage périodique des retenues pendantes.
+const HELD_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Balayage périodique des retenues pendantes, au plus toutes les
+/// [`HELD_SWEEP_INTERVAL`].
+async fn maybe_sweep_held_syncs(
+    agent_state: &Arc<AgentState>,
+    queue: &Arc<WebhookQueue>,
+    last: &mut std::time::Instant,
+) {
+    if last.elapsed() < HELD_SWEEP_INTERVAL {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let window = super::sync_debounce::window_from_env().unwrap_or(std::time::Duration::ZERO);
+    recover_held_syncs_into(
+        &agent_state.db,
+        &agent_state.sync_debounce,
+        queue,
+        window,
+        Some(HELD_SWEEP_MIN_AGE_SECS),
+    )
+    .await;
+}
+
+/// Corps commun de la reprise au démarrage et du balayage périodique, sans
+/// `AgentState` : testable sur une base en mémoire. Rend le nombre de retenues
+/// remises en fenêtre.
+///
+/// Le balayage (`min_age = Some(..)`) existe pour l'éviction drop-oldest de la
+/// file v2 : un événement versé puis évincé laisse sa retenue pendante, et la
+/// garde de build périmé de la phase A la compte — sans rejeu, la tête ne serait
+/// revue qu'au prochain redémarrage. Il ne rejoue jamais une clé encore retenue,
+/// encore en file, ou en vol (sortie de file, tour pas encore démarré).
+async fn recover_held_syncs_into(
+    db: &crate::async_db::AsyncDatabase,
+    debounce: &Arc<super::sync_debounce::SyncDebounce>,
+    queue: &Arc<WebhookQueue>,
+    window: std::time::Duration,
+    min_age_secs: Option<i64>,
+) -> usize {
+    let since = crate::timestamp::now_minus(chrono::Duration::seconds(
+        super::sync_debounce::RECOVERY_HORIZON_SECS,
+    ));
+    let until = crate::timestamp::now_minus(chrono::Duration::seconds(min_age_secs.unwrap_or(0)));
+    let pending = match db
+        .list_pending_audit_holds(
+            crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+            super::sync_debounce::HELD_STAGE,
+            &since,
+            &until,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                event = "qa_sync_debounce_recovery_unreadable",
+                error = %e,
+                "registre illisible — les synchronize retenus ne sont pas rejoués"
+            );
+            return 0;
+        }
+    };
+    let agent = db.agent_id().to_string();
+    let mut replayed = 0;
+    for hold in &pending {
+        if debounce.is_held(&hold.target_key) || debounce.is_in_flight(&hold.target_key) {
+            continue;
+        }
+        if let webhook_queue_v2::WebhookEventKind::PullRequestSync { repo, pr } =
+            webhook_queue_v2::classify_event(&hold.text)
+            && let Some(ck) = webhook_queue_v2::coalescing_key(
+                &webhook_queue_v2::WebhookEventKind::PullRequestSync { repo, pr },
+            )
+            && queue.has_coalescing_key(&ck).await
+        {
+            continue;
+        }
+        let Some(request_id) = super::sync_debounce::parse_request_marker(&hold.identity) else {
+            continue;
+        };
+        let req = MessageRequest {
+            text: hold.text.clone(),
+            chat_id: None,
+            channel: "github".to_string(),
+            // Le `request_id` d'origine : c'est lui que la ligne de tour démarré
+            // portera, et lui seul solde la retenue.
+            request_id: request_id.to_string(),
+            agent: agent.clone(),
+            images: None,
+        };
+        if super::sync_debounce::admit_recovered(
+            debounce,
+            queue,
+            hold.target_key.clone(),
+            req,
+            window,
+        ) {
+            replayed += 1;
+        }
+    }
+    if replayed > 0 {
+        info!(
+            event = "qa_sync_debounce_recovered",
+            agent = %agent,
+            count = replayed,
+            sweep = min_age_secs.is_some(),
+            window_secs = window.as_secs(),
+            "synchronize retenus non consommés remis en fenêtre (mika#2671)"
+        );
+    }
+    replayed
 }
 
 // -- Bounded webhook queue (mika#1870) --
@@ -1025,6 +1262,8 @@ pub(super) fn spawn_webhook_drain_worker(
         let agent_label = agent_state.db.agent_id().to_string();
         let queue = agent_state.webhook_queue_v2.clone();
         debug!(agent = %agent_label, "webhook drain worker started");
+        recover_held_syncs(&agent_state).await;
+        let mut last_held_sweep = std::time::Instant::now();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -1034,9 +1273,13 @@ pub(super) fn spawn_webhook_drain_worker(
                 item = queue.dequeue() => {
                     let Some(item) = item else { continue };
                     drain_one_webhook(&state, &agent_state, &agent_label, item).await;
+                    // Sous un flux continu le bras `sleep` ne tire jamais : le
+                    // balayage est aussi évalué après chaque tour (revue de code).
+                    maybe_sweep_held_syncs(&agent_state, &queue, &mut last_held_sweep).await;
                 }
                 _ = tokio::time::sleep(WEBHOOK_QUEUE_GAUGE_INTERVAL) => {
                     emit_webhook_queue_gauge(&agent_label, &queue).await;
+                    maybe_sweep_held_syncs(&agent_state, &queue, &mut last_held_sweep).await;
                 }
             }
         }
@@ -1053,6 +1296,14 @@ async fn drain_one_webhook(
 ) {
     let kind_label = item.kind.label();
     let wait_ms = item.enqueued_at.elapsed().as_millis();
+
+    // mika#2671 — en vol de la sortie de file jusqu'à la fin du tour : le
+    // balayage des retenues pendantes ne doit pas rejouer un événement qui
+    // attend `agent_lock` ou s'exécute.
+    let flight_key = super::sync_debounce::debounce_key(&item.request.text);
+    if let Some(k) = &flight_key {
+        agent_state.sync_debounce.enter_flight(k);
+    }
 
     // Blocking acquire — serialises with any other lock holder; the prior turn
     // should have released it by now. This is the exact primitive
@@ -1103,6 +1354,10 @@ async fn drain_one_webhook(
             false
         }
     };
+
+    if let Some(k) = &flight_key {
+        agent_state.sync_debounce.leave_flight(k);
+    }
 
     emit_webhook_queue_audit(
         state,
@@ -1331,7 +1586,7 @@ async fn run_agent_for_message(
     // personne ne revoie la nouvelle tête. Les trois chemins qui lancent un
     // tour passent par cette fonction (drain v2, chemin hérité, rejeu #528).
     if req.channel == "github" {
-        record_pr_sync_observed(&a.db, &req.text).await;
+        record_pr_sync_observed(&a.db, &req.text, &req.request_id).await;
     }
 
     // Hot-reload skills if the dirty flag was set by a previous turn
@@ -2295,6 +2550,7 @@ mod tests {
         record_pr_sync_observed(
             &db,
             "[GitHub] PR synchronize: senara-solutions/mika#2659 \u{2014} fix: x (branch: fix/2653/y)\nhttps://github.com/senara-solutions/mika/pull/2659",
+            "req-1",
         )
         .await;
         assert_eq!(
@@ -2316,7 +2572,7 @@ mod tests {
             "[GitHub] Check suite success on senara-solutions/mika (branch: b)",
             "salut Mika",
         ] {
-            record_pr_sync_observed(&db, text).await;
+            record_pr_sync_observed(&db, text, "req-x").await;
         }
         assert_eq!(
             db.count_audit_events_by_tool_name(crate::qa_head_supersession::SYNC_OBSERVED_TOOL)
@@ -2324,5 +2580,220 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    // ---- mika#2671 phase B — retenue durable, reprise, couplage ------------
+
+    const SYNC_2659: &str = "[GitHub] PR synchronize: senara-solutions/mika#2659 \u{2014} fix: x (branch: fix/2653/y)\nhttps://github.com/senara-solutions/mika/pull/2659";
+    const KEY_2659: &str = "pr:senara-solutions/mika#2659";
+
+    fn mika2671_queue() -> Arc<WebhookQueue> {
+        Arc::new(WebhookQueue::new(64, std::time::Duration::from_millis(100)))
+    }
+
+    async fn mika2671_pending(db: &crate::async_db::AsyncDatabase) -> Vec<String> {
+        db.list_pending_audit_holds(
+            crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+            super::super::sync_debounce::HELD_STAGE,
+            "1970-01-01T00:00:00Z",
+            "2999-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.identity)
+        .collect()
+    }
+
+    /// Une retenue seule est pendante ; contrôle négatif : le tour démarré qui
+    /// porte SON identité la solde.
+    #[tokio::test]
+    async fn mika2671_une_retenue_est_soldee_par_le_tour_de_sa_requete() {
+        let db = mika2671_db();
+        assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await);
+        assert_eq!(
+            mika2671_pending(&db).await,
+            vec!["request_id=A".to_string()]
+        );
+        record_pr_sync_observed(&db, SYNC_2659, "A").await;
+        assert!(mika2671_pending(&db).await.is_empty());
+    }
+
+    /// Le trou trouvé en revue : held(A) → held(B) → started(A). Le tour de A
+    /// (versé avant l'arrivée de B, parti en retard derrière `agent_lock`) ne
+    /// doit PAS solder B — la ligne de tour démarré dit QUEL événement elle sert.
+    #[tokio::test]
+    async fn mika2671_le_tour_dune_tete_perimee_ne_solde_pas_la_suivante() {
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await;
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        record_pr_sync_observed(&db, SYNC_2659, "A").await;
+        assert_eq!(
+            mika2671_pending(&db).await,
+            vec!["request_id=B".to_string()]
+        );
+    }
+
+    /// Une retenue plus récente remplace l'ancienne : une seule pendante par clé.
+    #[tokio::test]
+    async fn mika2671_deux_retenues_seule_la_derniere_est_pendante() {
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await;
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        assert_eq!(
+            mika2671_pending(&db).await,
+            vec!["request_id=B".to_string()]
+        );
+    }
+
+    /// AC4 à travers un redémarrage : une retenue en base, une table neuve ⇒ la
+    /// reprise remet l'événement en fenêtre avec son `request_id` d'origine.
+    #[tokio::test(start_paused = true)]
+    async fn mika2671_la_reprise_rejoue_une_retenue_apres_redemarrage() {
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        let debounce = Arc::new(super::super::sync_debounce::SyncDebounce::default());
+        let queue = mika2671_queue();
+        let w = std::time::Duration::from_secs(300);
+        assert_eq!(
+            recover_held_syncs_into(&db, &debounce, &queue, w, None).await,
+            1
+        );
+        assert_eq!(queue.depth().await, 0, "remise en fenêtre, pas en file");
+        tokio::time::advance(w + std::time::Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let item = queue.dequeue().await.unwrap();
+        assert_eq!(item.request.request_id, "B");
+        assert_eq!(item.request.text, SYNC_2659);
+    }
+
+    /// Contrôle négatif de la reprise : la retenue soldée par son tour n'est pas
+    /// rejouée.
+    #[tokio::test]
+    async fn mika2671_la_reprise_ne_rejoue_pas_une_retenue_soldee() {
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        record_pr_sync_observed(&db, SYNC_2659, "B").await;
+        let debounce = Arc::new(super::super::sync_debounce::SyncDebounce::default());
+        let queue = mika2671_queue();
+        let n =
+            recover_held_syncs_into(&db, &debounce, &queue, std::time::Duration::ZERO, None).await;
+        assert_eq!(n, 0);
+    }
+
+    /// Kill-switch désarmé : fenêtre nulle, le pendant part aussitôt en file.
+    #[tokio::test]
+    async fn mika2671_reprise_desarmee_verse_aussitot() {
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        let debounce = Arc::new(super::super::sync_debounce::SyncDebounce::default());
+        let queue = mika2671_queue();
+        recover_held_syncs_into(&db, &debounce, &queue, std::time::Duration::ZERO, None).await;
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), queue.dequeue())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.request.request_id, "B");
+    }
+
+    /// Le balayage (drop-oldest) ne rejoue jamais une clé retenue, en file ou en
+    /// vol ; contrôle : il rejoue une retenue orpheline.
+    #[tokio::test]
+    async fn mika2671_le_balayage_ne_rejoue_que_les_orphelines() {
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        let w = std::time::Duration::ZERO;
+
+        // en vol
+        let debounce = Arc::new(super::super::sync_debounce::SyncDebounce::default());
+        let queue = mika2671_queue();
+        debounce.enter_flight(KEY_2659);
+        assert_eq!(
+            recover_held_syncs_into(&db, &debounce, &queue, w, Some(0)).await,
+            0
+        );
+        debounce.leave_flight(KEY_2659);
+
+        // en file
+        queue
+            .enqueue(MessageRequest {
+                text: SYNC_2659.to_string(),
+                chat_id: None,
+                channel: "github".into(),
+                request_id: "B".into(),
+                agent: "mika".into(),
+                images: None,
+            })
+            .await;
+        assert_eq!(
+            recover_held_syncs_into(&db, &debounce, &queue, w, Some(0)).await,
+            0
+        );
+        queue.dequeue().await.unwrap();
+
+        // orpheline (évincée par drop-oldest)
+        assert_eq!(
+            recover_held_syncs_into(&db, &debounce, &queue, w, Some(0)).await,
+            1
+        );
+    }
+
+    /// L'âge minimal du balayage écarte une retenue trop jeune.
+    #[tokio::test]
+    async fn mika2671_le_balayage_respecte_lage_minimal() {
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        let debounce = Arc::new(super::super::sync_debounce::SyncDebounce::default());
+        let queue = mika2671_queue();
+        let n = recover_held_syncs_into(
+            &db,
+            &debounce,
+            &queue,
+            std::time::Duration::ZERO,
+            Some(HELD_SWEEP_MIN_AGE_SECS),
+        )
+        .await;
+        assert_eq!(n, 0);
+    }
+
+    /// Couplage phase A (KTD4) : une retenue postérieure au lancement du build
+    /// fait sauter le callback ; contrôle négatif : antérieure, il tourne.
+    #[tokio::test]
+    async fn mika2671_une_retenue_posterieure_fait_sauter_le_callback() {
+        use crate::qa_build_callback::BUILD_CALLBACK_LABEL;
+        use crate::qa_head_supersession::{BuildCallbackHead, decide_build_callback};
+        use crate::task_engine::dispatcher::read_qa_review_pr_target;
+        const META: &str = r#"{"qa_review_pr_target":"senara-solutions/mika#2659"}"#;
+
+        let db = mika2671_db();
+        record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await;
+        for (built_at, expect_skip) in [
+            ("1970-01-01T00:00:00Z", true),
+            ("2999-01-01T00:00:00Z", false),
+        ] {
+            let d = decide_build_callback(
+                BUILD_CALLBACK_LABEL,
+                Some(META),
+                read_qa_review_pr_target,
+                |k| {
+                    let db = db.clone();
+                    async move {
+                        db.count_recent_audit_events_for_target(
+                            crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+                            &k,
+                            built_at,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await;
+            assert_eq!(d.skips_turn(), expect_skip, "{built_at} → {d:?}");
+            if !expect_skip {
+                assert_eq!(d, BuildCallbackHead::Current);
+            }
+        }
     }
 }
