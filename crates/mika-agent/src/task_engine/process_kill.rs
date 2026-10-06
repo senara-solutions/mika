@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::Task;
+use crate::live_pilot::TaskPilot;
 use crate::task_engine::process_liveness;
 
 /// Grace period between SIGTERM and SIGKILL (seconds).
@@ -269,16 +270,9 @@ pub async fn cancel_task_and_kill(
     db: &AsyncDatabase,
     task_id: &str,
 ) -> anyhow::Result<Option<CancelOutcome>> {
-    // Load task to get process_id, start_time, and label before cancelling
+    // Load the task for its label, and so the traversal below can read the
+    // named row without a second fetch.
     let task: Option<Task> = db.get_task(task_id).await?;
-    let process_id = task.as_ref().and_then(|t| t.process_id);
-    // Extract process_start_time from task metadata for the PID reuse guard
-    // (#855). Mirrors the engine.rs::check_callback_process_liveness pattern.
-    let start_time: Option<u64> = task
-        .as_ref()
-        .and_then(|t| t.metadata.as_deref())
-        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-        .and_then(|v| v.get("process_start_time")?.as_str()?.parse().ok());
     let label = task
         .as_ref()
         .map(|t| t.label.clone())
@@ -296,25 +290,26 @@ pub async fn cancel_task_and_kill(
     // pilot kept writing to its worktree: the same parent/child blindness
     // mika#2263 shipped in the supersession path, on the manual path.
     //
-    // The traversal is the one that already exists and is tested
-    // (`find_dispatch_children_with_pid`, mika#2156) — not a second resolver.
-    // Its two filters are the supersession's, for the same reasons: a terminal
-    // child has no pilot left and its pgid is stale, and a child with no
-    // readable `process_start_time` is left alone because a recycled PID
-    // cannot be told from the pilot and mis-signalling a process *group* is
-    // unbounded damage.
-    let (process_id, start_time, pid_owner) = match process_id {
-        Some(pid) => (Some(pid), start_time, task_id.to_string()),
-        None => match db.find_dispatch_children_with_pid(task_id).await {
-            Ok(children) => children
+    // The traversal is `live_pilot::resolve_task_pilot` (mika#2653 phase B),
+    // shared with the liveness verdict the `cancel_task` guard reads — one
+    // site, so the pgid this path signals and the pilot that guard spares are
+    // found by the same rule. Its terminal filter is the supersession's: a
+    // terminal row has no pilot left and its pgid is stale.
+    //
+    // The classification stays HERE, and it differs from the verdict's on
+    // purpose: a child with no readable `process_start_time` is left alone,
+    // because a recycled PID cannot be told from the pilot and mis-signalling
+    // a process *group* is unbounded damage. The verdict calls the same child
+    // `Unreadable` instead — it cannot prove there is no pilot.
+    let (process_id, start_time, pid_owner) =
+        match crate::live_pilot::resolve_task_pilot(db, task_id, task.as_ref()).await {
+            TaskPilot::Named { pid, start_time } => (Some(pid), start_time, task_id.to_string()),
+            TaskPilot::Children(children) => children
                 .into_iter()
-                .find(|c| {
-                    !crate::task_state::tasks::is_terminal_task_status(&c.status)
-                        && c.process_start_time.is_some()
-                })
+                .find(|c| c.process_start_time.is_some())
                 .map(|c| (Some(c.process_id), c.process_start_time, c.id))
                 .unwrap_or((None, None, task_id.to_string())),
-            Err(e) => {
+            TaskPilot::ChildrenUnreadable(e) => {
                 // Fail-safe: an unreadable lookup is not evidence that no
                 // pilot exists. Cancel the row as before and say so, rather
                 // than reporting a kill that was never attempted.
@@ -326,8 +321,7 @@ pub async fn cancel_task_and_kill(
                 );
                 (None, None, task_id.to_string())
             }
-        },
-    };
+        };
 
     let cancelled = db.cancel_task(task_id).await?;
     if !cancelled {

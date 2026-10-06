@@ -178,6 +178,114 @@ pub async fn live_pilot_for_issue(db: &AsyncDatabase, issue_url: &str) -> LivePi
     LivePilotVerdict::None
 }
 
+/// Which pilot does **this task** carry? — the traversal, not the verdict
+/// (mika#2653, phase B).
+///
+/// What [`resolve_task_pilot`] found. It names **candidates**; it does not say
+/// whether any of them is alive, nor what to do about one that cannot be
+/// identified. Those are two different questions with two different correct
+/// answers, and they stay at their two callers (see [`resolve_task_pilot`]).
+#[derive(Debug)]
+pub(crate) enum TaskPilot {
+    /// The named row is live and carries the pgid itself (the callback-row
+    /// case). `start_time` is `None` when no usable `process_start_time` was
+    /// read off it — the caller decides what an unidentifiable pgid means.
+    Named { pid: i64, start_time: Option<u64> },
+    /// The named row carries no usable pgid — absent, pgid-less, or terminal —
+    /// so its dispatch children were walked (the parent-row case). Only the
+    /// **non-terminal** ones are kept, in the database's order; a child whose
+    /// `process_start_time` is unreadable is kept too, with `None`.
+    Children(Vec<crate::db::DispatchChild>),
+    /// The dispatch-child lookup failed. Carries the error so the caller can
+    /// report it under its own words — this function logs nothing.
+    ChildrenUnreadable(anyhow::Error),
+}
+
+/// The parent→child traversal of a **task id** — one site, two callers
+/// (mika#2653, phase B, AC6).
+///
+/// [`crate::task_engine::process_kill::cancel_task_and_kill`] (since mika#2335)
+/// and [`live_pilot_for_task`] (since mika#2653) both need the same answer:
+/// *which pgid does this task carry, on the named row or on one of its dispatch
+/// children?* Written twice, it is the class `grooming_marker` paid on this
+/// exact path (mika#2158): two resolvers that agree the day they are written and
+/// diverge later, in silence, every assertion green. The traversal is extracted;
+/// the **classification stays at each caller**, and so do the fetch of the named
+/// row and the report of a failed lookup (mika#2624's shape).
+///
+/// # The two filters, applied to both handles
+///
+/// - **Terminal.** A terminal row has no pilot left and its pgid is stale. The
+///   filter covers the **named** row too: `dispatch-lib`'s EXIT trap delivers
+///   the callback from inside the still-running wrapper, so `delivered` precedes
+///   process exit by a real window, and a terminal named row falls through to
+///   the children walk exactly like a pgid-less one.
+/// - **`process_start_time`** is read through
+///   [`crate::db::Database::process_start_time_from_metadata`] on the named row,
+///   the same rule the child handle's column reader applies (string **or**
+///   integer JSON form). A hand-rolled `.as_str()?.parse()` made the two handles
+///   of one traversal disagree about the same row.
+///
+/// # The asymmetry that stays at the callers — deliberately
+///
+/// A candidate without a `process_start_time` is **returned**, not dropped.
+/// The kill path **skips** it (a recycled PID cannot be told from the pilot, and
+/// mis-signalling a process *group* is unbounded damage — mika#2335); the
+/// verdict calls it [`LivePilotVerdict::Unreadable`] (it cannot prove there is
+/// no pilot). Two correct dispositions for two different questions: dropping the
+/// candidate here would turn the verdict's `Unreadable` into a false `None`.
+///
+/// # What moving the kill path here changed, and in which direction
+///
+/// Two things, both measured against `cancel_task_and_kill` as it was:
+///
+/// 1. A **terminal** named row carrying a pgid used to be handed to the kill
+///    as-is; it now falls through to the children walk. No outcome changes:
+///    `cancel_task` refuses a terminal row (its `NOT IN` set is exactly
+///    [`is_terminal_task_status`]), so the kill path returns `Ok(None)` before
+///    any signal, as it did.
+/// 2. An **integer-form** `process_start_time` on the named row used to read as
+///    `None`, so the kill fell back to a bare existence check; it now reads as
+///    `Some`, so the kill checks the process **instance** first. That narrows
+///    the signalled population and never widens it —
+///    [`crate::task_engine::process_kill::kill_process_gracefully`] signals on
+///    `Some(st)` only when the same instance is alive, a subset of what it
+///    signals on `None`.
+///
+/// # A source scan refuses a second composition
+///
+/// `canonical_tokens::mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique`
+/// refuses any production file outside this module that composes a dispatch
+/// traversal, the terminal filter and [`is_same_process_alive`].
+pub(crate) async fn resolve_task_pilot(
+    db: &AsyncDatabase,
+    task_id: &str,
+    named: Option<&crate::db::Task>,
+) -> TaskPilot {
+    if let Some(task) = named
+        && let Some(pid) = task
+            .process_id
+            .filter(|_| !is_terminal_task_status(&task.status))
+    {
+        return TaskPilot::Named {
+            pid,
+            start_time: crate::db::Database::process_start_time_from_metadata(
+                task.metadata.as_deref(),
+            ),
+        };
+    }
+
+    match db.find_dispatch_children_with_pid(task_id).await {
+        Ok(children) => TaskPilot::Children(
+            children
+                .into_iter()
+                .filter(|c| !is_terminal_task_status(&c.status))
+                .collect(),
+        ),
+        Err(e) => TaskPilot::ChildrenUnreadable(e),
+    }
+}
+
 /// Is a pilot alive under **this task**? (mika#2653)
 ///
 /// The sibling of [`live_pilot_for_issue`], asked from the other handle: that
@@ -196,49 +304,24 @@ pub async fn live_pilot_for_issue(db: &AsyncDatabase, issue_url: &str) -> LivePi
 /// the pgid, and therefore the probable row of the mika#2653 incident — has
 /// **no** `reference_url`, so it has no path to the URL-keyed reader at all.
 ///
-/// # The traversal
+/// # The traversal is not here
 ///
-/// Two handles, in order. The row the caller named may carry the pgid itself
-/// (the callback-row case); when it does not — **or when it is terminal** — its
-/// dispatch children are walked (the parent-row case). Same two filters, and
-/// the same reasons, as [`live_pilot_for_issue`], and they apply to **both**
-/// handles: a terminal row has no pilot left and its pgid is stale, and a pgid
-/// with no readable `process_start_time` cannot be told from a recycled PID —
-/// so it is **unjudgeable**, never alive, never absent.
+/// It is [`resolve_task_pilot`], shared with
+/// [`crate::task_engine::process_kill::cancel_task_and_kill`] (phase B, AC6).
+/// This function owns only the **classification**: a candidate is `Alive` when
+/// [`is_same_process_alive`] proves the same instance, and a candidate that
+/// cannot be identified — no `process_start_time`, or a pid outside `u32` — is
+/// **unjudgeable**, never alive, never absent.
 ///
 /// That the terminal filter covers the named handle too is not decoration.
-/// `dispatch-lib`'s EXIT trap delivers the callback from **inside** the still
-/// running wrapper, so `delivered` precedes process exit by a real window.
 /// Without it, a terminal callback row still carrying a live pgid would answer
 /// `Alive`, mika#2653's guard would refuse the cancellation under
 /// `blocked_live_pilot` — a population documented as expected-zero — and it
 /// would refuse it on a row `cancel_task_and_kill` would have declined anyway
 /// with the honest *"not in cancellable status"*.
-///
-/// The `process_start_time` rule goes through
-/// [`crate::db::Database::process_start_time_from_metadata`] rather than a
-/// fourth inline `serde_json` chain, and that is a correctness condition, not
-/// tidiness: the child handle reads it through the column reader, which accepts
-/// the integer JSON form, so a hand-rolled `.as_str()?.parse()` here made the
-/// **two handles of this one function disagree about the same row**.
-///
-/// # AC6 différé — phase B, mika#2653
-///
-/// Cette traversée parent→enfant **existe déjà** dans
-/// [`crate::task_engine::process_kill::cancel_task_and_kill`] (posée par
-/// mika#2335), et la duplication est **nommée ici plutôt que découverte** : la
-/// phase A de mika#2653 livre la garde, la phase B extrait la traversée en un
-/// `live_pilot::resolve_task_pilot` que les deux sites appellent, avec son scan
-/// de source refusant un troisième. L'ordre inverse est interdit — livrer le
-/// détecteur sans la garde ne referme rien. En l'état les deux lectures
-/// **divergent délibérément sur un point**, et il faut le savoir avant de les
-/// fusionner : le chemin de kill **écarte** un enfant sans `process_start_time`
-/// (il ne doit pas signaler un groupe de processus qu'il ne peut pas
-/// identifier), là où ce verdict le rend `Unreadable` (il ne peut pas prouver
-/// l'absence de pilote). Deux dispositions correctes pour deux questions
-/// différentes, à préserver à l'identique lors de l'extraction.
 pub(crate) async fn live_pilot_for_task(db: &AsyncDatabase, task_id: &str) -> LivePilotVerdict {
-    // Le pgid porté par la ligne nommée (cas de la ligne callback).
+    // Le fetch de la ligne nommée reste ici : son échec est un verdict
+    // (`Unreadable`), là où le chemin de kill le propage.
     let named = match db.get_task(task_id).await {
         Ok(t) => t,
         Err(e) => {
@@ -260,17 +343,8 @@ pub(crate) async fn live_pilot_for_task(db: &AsyncDatabase, task_id: &str) -> Li
         return LivePilotVerdict::None;
     };
 
-    // Le filtre terminal s'applique aussi à la ligne nommée : une ligne
-    // terminale n'a plus de pilote et son pgid est périmé. Une ligne terminale
-    // qui porterait un pgid retombe donc sur la traversée des enfants, comme
-    // une ligne sans pgid.
-    let named_pid = task
-        .process_id
-        .filter(|_| !is_terminal_task_status(&task.status));
-    if let Some(pid) = named_pid {
-        let start_time =
-            crate::db::Database::process_start_time_from_metadata(task.metadata.as_deref());
-        return match (start_time, u32::try_from(pid)) {
+    match resolve_task_pilot(db, task_id, Some(&task)).await {
+        TaskPilot::Named { pid, start_time } => match (start_time, u32::try_from(pid)) {
             (Some(st), Ok(p)) if is_same_process_alive(p, st) => LivePilotVerdict::Alive {
                 child_task_id: task.id,
                 parent_task_id: task.parent_task_id,
@@ -291,14 +365,8 @@ pub(crate) async fn live_pilot_for_task(db: &AsyncDatabase, task_id: &str) -> Li
                     reason: UNREADABLE_NO_START_TIME,
                 }
             }
-        };
-    }
-
-    // Pas de pgid sur la ligne nommée : c'est une ligne parent, le pgid vit sur
-    // un de ses enfants de dispatch.
-    let children = match db.find_dispatch_children_with_pid(task_id).await {
-        Ok(rows) => rows,
-        Err(e) => {
+        },
+        TaskPilot::ChildrenUnreadable(e) => {
             warn!(
                 event = "live_pilot_lookup_failed",
                 task_id = %task_id,
@@ -306,46 +374,44 @@ pub(crate) async fn live_pilot_for_task(db: &AsyncDatabase, task_id: &str) -> Li
                 "live_pilot: dispatch-child lookup failed — liveness cannot be \
                  established for this task"
             );
-            return LivePilotVerdict::Unreadable {
+            LivePilotVerdict::Unreadable {
                 reason: UNREADABLE_DB_ERROR,
-            };
+            }
         }
-    };
+        TaskPilot::Children(children) => {
+            let mut unjudgeable = 0usize;
+            for child in children {
+                let (Some(start_time), Ok(pid)) =
+                    (child.process_start_time, u32::try_from(child.process_id))
+                else {
+                    unjudgeable += 1;
+                    continue;
+                };
+                if is_same_process_alive(pid, start_time) {
+                    return LivePilotVerdict::Alive {
+                        child_task_id: child.id,
+                        parent_task_id: Some(task_id.to_string()),
+                        pid,
+                    };
+                }
+            }
 
-    let mut unjudgeable = 0usize;
-    for child in children {
-        if is_terminal_task_status(&child.status) {
-            continue;
-        }
-        let (Some(start_time), Ok(pid)) =
-            (child.process_start_time, u32::try_from(child.process_id))
-        else {
-            unjudgeable += 1;
-            continue;
-        };
-        if is_same_process_alive(pid, start_time) {
-            return LivePilotVerdict::Alive {
-                child_task_id: child.id,
-                parent_task_id: Some(task_id.to_string()),
-                pid,
-            };
+            if unjudgeable > 0 {
+                warn!(
+                    event = "live_pilot_unreadable",
+                    task_id = %task_id,
+                    candidates = unjudgeable,
+                    "live_pilot: dispatch child carries a pgid but no usable \
+                     process_start_time — liveness cannot be settled"
+                );
+                return LivePilotVerdict::Unreadable {
+                    reason: UNREADABLE_NO_START_TIME,
+                };
+            }
+
+            LivePilotVerdict::None
         }
     }
-
-    if unjudgeable > 0 {
-        warn!(
-            event = "live_pilot_unreadable",
-            task_id = %task_id,
-            candidates = unjudgeable,
-            "live_pilot: dispatch child carries a pgid but no usable \
-             process_start_time — liveness cannot be settled"
-        );
-        return LivePilotVerdict::Unreadable {
-            reason: UNREADABLE_NO_START_TIME,
-        };
-    }
-
-    LivePilotVerdict::None
 }
 
 impl LivePilotVerdict {
@@ -855,5 +921,80 @@ mod tests {
             live_pilot_for_task(&db, "00000000-0000-0000-0000-000000000000").await,
             LivePilotVerdict::None
         );
+    }
+
+    // ───── mika#2653 phase B — la traversée, extraite, sous ses deux lecteurs ─────
+
+    /// **L'asymétrie kill / verdict tient parce que la traversée n'écarte RIEN
+    /// qu'un des deux lecteurs garde.** Un enfant vif sans `process_start_time`
+    /// est rendu, avec `None` : le chemin de kill l'écarte (il ne signale pas un
+    /// groupe qu'il ne peut pas identifier), le verdict le rend `Unreadable`.
+    /// Si la traversée l'écartait elle-même — le raccourci qu'une extraction
+    /// « propre » de l'ancien `find(.. && process_start_time.is_some())` aurait
+    /// pris — le verdict lirait `None` sur un pilote peut-être vif, et la garde
+    /// fail-closed de mika#2653 laisserait passer l'annulation.
+    #[tokio::test]
+    async fn mika2653b_la_traversee_rend_lenfant_sans_start_time() {
+        let db = test_db();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let (pid, _) = self_pid_and_start();
+        let child = seed_child(&db, &parent, "in_progress", pid, None).await;
+
+        let named = db.get_task(&parent).await.expect("read parent");
+        match resolve_task_pilot(&db, &parent, named.as_ref()).await {
+            TaskPilot::Children(c) => {
+                assert_eq!(c.len(), 1, "l'enfant sans start_time doit être rendu");
+                assert_eq!(c[0].id, child);
+                assert_eq!(c[0].process_start_time, None);
+            }
+            other => panic!("attendu Children([enfant]), obtenu {other:?}"),
+        }
+        assert_eq!(
+            live_pilot_for_task(&db, &parent).await,
+            LivePilotVerdict::Unreadable {
+                reason: UNREADABLE_NO_START_TIME
+            },
+            "le verdict, lui, classe le même candidat comme illisible"
+        );
+    }
+
+    /// Le filtre terminal de la ligne nommée est DANS la traversée, donc sous
+    /// les deux lecteurs : une ligne callback `delivered` qui porte encore son
+    /// pgid n'est pas rendue comme `Named` — elle retombe sur ses enfants.
+    #[tokio::test]
+    async fn mika2653b_une_ligne_nommee_terminale_nest_pas_rendue() {
+        let db = test_db();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let (pid, st) = self_pid_and_start();
+        let child = seed_child(&db, &parent, "delivered", pid, Some(st)).await;
+
+        let named = db.get_task(&child).await.expect("read child");
+        assert!(
+            matches!(
+                resolve_task_pilot(&db, &child, named.as_ref()).await,
+                TaskPilot::Children(ref c) if c.is_empty()
+            ),
+            "une ligne nommée terminale ne porte plus de pilote : son pgid est périmé"
+        );
+    }
+
+    /// La ligne nommée vive lit son `process_start_time` par la règle partagée,
+    /// forme chaîne comme forme entière — c'est ce que le chemin de kill hérite
+    /// depuis la phase B.
+    #[tokio::test]
+    async fn mika2653b_la_ligne_nommee_rend_son_pgid_et_son_start_time() {
+        let db = test_db();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let (pid, st) = self_pid_and_start();
+        let child = seed_child(&db, &parent, "in_progress", pid, Some(st)).await;
+
+        let named = db.get_task(&child).await.expect("read child");
+        match resolve_task_pilot(&db, &child, named.as_ref()).await {
+            TaskPilot::Named { pid: p, start_time } => {
+                assert_eq!(p, pid);
+                assert_eq!(start_time, Some(st));
+            }
+            other => panic!("attendu Named, obtenu {other:?}"),
+        }
     }
 }
