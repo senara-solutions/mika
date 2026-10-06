@@ -4927,6 +4927,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             is_task_context: false,
             is_callback_turn: callback_task_id.is_some(),
             is_webhook_fallthrough_turn: false,
+            is_webhook_pr_event_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],

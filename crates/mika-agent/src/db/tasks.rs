@@ -2146,6 +2146,43 @@ impl Database {
         }
     }
 
+    /// The same rule as [`Self::parse_process_start_time`], read out of a task's
+    /// **`metadata` JSON blob** rather than out of a column the two
+    /// dispatch-child queries selected (mika#2653).
+    ///
+    /// Both shapes are accepted here too, and that is the whole reason this
+    /// exists rather than a fourth inline `serde_json` chain: the reader above
+    /// tolerates the integer form, so a caller that hand-rolled
+    /// `.as_str()?.parse()` would answer **differently about the same row** —
+    /// which is exactly what `live_pilot_for_task` was doing between its two
+    /// handles, one going through the column reader and the other through its
+    /// own chain. *A rule written twice is a rule that can disagree with
+    /// itself*, and here it did, inside one function.
+    ///
+    /// `None` carries the same meaning as above: never "dead", never "alive",
+    /// only *the pair that identifies a process instance is incomplete*.
+    ///
+    /// **The kill path reads it here since mika#2653 phase B**, through the
+    /// traversal it now shares with the verdict (`live_pilot::resolve_task_pilot`).
+    /// The integer form used to read as `None` there, so the kill fell back to a
+    /// bare existence check; it now reads as `Some`, and the kill checks the
+    /// process **instance** before signalling — a narrower signalled population,
+    /// never a wider one (`kill_process_gracefully` signals on `Some(st)` only
+    /// when the same instance is alive).
+    ///
+    /// **Two inline copies of the string-only form remain**, the two sites in
+    /// `task_engine/engine.rs`. Routing them here is a change to their
+    /// populations and belongs to its own ticket. Named rather than silently
+    /// inherited.
+    pub(crate) fn process_start_time_from_metadata(metadata: Option<&str>) -> Option<u64> {
+        let parsed = serde_json::from_str::<serde_json::Value>(metadata?).ok()?;
+        match parsed.get("process_start_time")? {
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            serde_json::Value::Number(n) => n.as_u64(),
+            _ => None,
+        }
+    }
+
     /// The dispatch children of a tracking row that carry a `process_id`.
     ///
     /// Companion to [`Self::find_phantom_tracking_tasks`] (mika#2156), placed

@@ -193,8 +193,13 @@ async fn the_production_topology_with_a_cancelled_parent_reads_alive() {
             pid: got,
         } => {
             assert_eq!(child_task_id, child, "la row qui PORTE le pgid");
+            // `Option` depuis mika#2653, et toujours `Some` sur CE chemin :
+            // l'enfant a été atteint *par* son parent. C'est le second
+            // producteur du verdict — celui qui part d'un id de tâche — qui
+            // peut n'avoir aucun parent, et qui ne doit pas en inventer un.
             assert_eq!(
-                parent_task_id, parent,
+                parent_task_id.as_deref(),
+                Some(parent.as_str()),
                 "et la row qu'un opérateur annulerait pour forcer un re-dispatch"
             );
             assert_eq!(i64::from(got), pid);

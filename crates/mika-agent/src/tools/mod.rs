@@ -176,6 +176,51 @@ pub struct ToolContext<'a> {
     /// servant un webhook en mode silencieux échapperait à cette garde — c'est
     /// le bord, et il hérite de la sonde S3 de mika#2517.
     pub is_webhook_fallthrough_turn: bool,
+    /// True when this turn was opened by a `[GitHub] PR …` or
+    /// `[GitHub] Check suite …` webhook event (mika#2653).
+    ///
+    /// Cinquième booléen de classe de tour, et **un axe nouveau plutôt qu'une
+    /// réutilisation du quatrième** : `is_webhook_fallthrough_domain` *sort*
+    /// explicitement ces deux familles du domaine Fallthrough, donc
+    /// [`Self::is_webhook_fallthrough_turn`] vaut `false` exactement sur la
+    /// population de ce ticket. Les lire l'un pour l'autre serait une garde à
+    /// population vide — la classe mika#2205.
+    ///
+    /// **Les deux PRÉDICATS sont mutuellement exclusifs**, épinglé par
+    /// `webhook_dispatch::tests::mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs`
+    /// sur deux corpus. La **représentation**, elle, ne l'est pas : deux `bool`
+    /// admettent l'état « les deux vrais », et rien dans le type ne l'interdit.
+    /// Ce qui tient aujourd'hui est qu'un seul site les dérive tous les deux du
+    /// même message et que les vingt autres posent `false` deux fois. Les
+    /// réunir en un `webhook_turn: WebhookTurnClass`
+    /// (`None | Fallthrough | PrEvent`) rendrait l'exclusivité **structurelle**
+    /// plutôt qu'épinglée par test, et retirerait un des deux littéraux par
+    /// site — mais ça touche les vingt-et-un sites de construction et les deux
+    /// lecteurs, donc c'est un **suivi nommé**, pas ce ticket.
+    ///
+    /// Lu par la garde de `CancelTaskTool::execute` (et donc, gratuitement, par
+    /// `cancel_reminder`, qui y délègue), qui refuse d'annuler une tâche dont un
+    /// pilote **vif** porte le travail.
+    ///
+    /// # Un verdict, jamais une charge utile
+    ///
+    /// Même frontière que le quatrième booléen, tranchée par mika#2573 en citant
+    /// mika#2517 : ce qui traverse jusqu'aux outils est le **verdict**, calculé
+    /// au seul site qui possède déjà le message et qui appelle déjà le prédicat
+    /// de domaine — jamais `originating_message` avec sa durée de vie et sa
+    /// charge utile.
+    ///
+    /// # Bord : le site de conversation, et il est structurel
+    ///
+    /// `false` aux trois autres sites de production (silent, team,
+    /// `server::investigate`), pour exactement le périmètre que le quatrième
+    /// booléen documente déjà : un webhook arrive par `POST /message` →
+    /// `run_agent` → mode conversation ; un tour silencieux n'a pas de message
+    /// de webhook (`originating_message` vaut `None` depuis mika#933) ; un tour
+    /// d'équipe lit `TeamAgentParams`. **Un futur chemin servant un webhook en
+    /// mode silencieux échapperait à cette garde** — borne héritée de
+    /// mika#2517 / mika#2573, ni élargie ni modifiée, population mesurée vide.
+    pub is_webhook_pr_event_turn: bool,
     /// Current LLM provider name (e.g., "anthropic", "openrouter").
     /// Used by builtin handlers that need to know the agent's active provider.
     pub provider_name: &'a str,

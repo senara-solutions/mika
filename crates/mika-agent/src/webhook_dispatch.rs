@@ -716,6 +716,47 @@ pub(crate) fn webhook_event_target(msg: &str) -> WebhookEventTarget {
     WebhookEventTarget::NotApplicable
 }
 
+/// Ce tour a-t-il été ouvert par un événement `[GitHub] PR …` ou
+/// `[GitHub] Check suite …` ? (mika#2653)
+///
+/// # Pourquoi un axe NOUVEAU, et pas le quatrième booléen
+///
+/// Le ticket mika#2653 dit *« juste un booléen de classe de tour sur le modèle
+/// d'`is_webhook_fallthrough_turn` »*. Sur le **modèle**, oui ; par
+/// **réutilisation**, non : [`is_webhook_fallthrough_domain`] **sort
+/// explicitement ces deux familles** du domaine Fallthrough — parce que
+/// `self-dev-webhook-qa` / `-ci` y portent des dispatchs légitimes — donc le
+/// quatrième booléen vaut `false` **exactement sur la population de ce
+/// ticket**. Le lire serait une garde à population vide, c'est-à-dire la classe
+/// mika#2205 : *une garde que personne n'a exercée se lit exactement comme une
+/// garde qui marche.* Les deux axes sont donc distincts, et **mutuellement
+/// exclusifs par construction** — propriété épinglée par
+/// `mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs`, sans quoi on aurait
+/// créé deux booléens qui se chevauchent.
+///
+/// # Pourquoi un prédicat de préfixe et pas `webhook_event_target`
+///
+/// Lire `webhook_event_target(msg) != NotApplicable` serait sémantiquement
+/// juste — [`WebhookEventTarget::Unreadable`] (préfixe présent, grammaire non
+/// parsée) est **dans** la population : un tour webhook PR dont la grammaire a
+/// bougé reste un tour webhook PR, et la garde doit mordre. Mais ça paierait
+/// deux regex par tour de conversation pour n'en lire qu'un booléen, et
+/// jetterait la cible. L'accord des deux faces est **épinglé** à la place
+/// (`mika2653_le_predicat_de_prefixe_saccorde_avec_la_cible`), motif
+/// `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position` :
+/// le jour où quelqu'un modifie l'une des deux faces sans l'autre, ce test
+/// rougit au lieu de laisser les deux prédicats diverger en silence.
+///
+/// **Au même module que les deux constantes de préfixe, et c'est ce qui rend
+/// les littéraux sûrs** : leur site de définition est unique depuis mika#2649,
+/// déjà lu par les deux faces de cette frontière, et un troisième lecteur *au
+/// même module* est exactement ce qu'elles existent pour permettre — le scan
+/// `mika2517_the_fallthrough_domain_has_a_single_definition` n'accuse que les
+/// fichiers **hors** de ce module.
+pub(crate) fn is_webhook_pr_event_domain(msg: &str) -> bool {
+    msg.starts_with(PR_EVENT_PREFIX) || msg.starts_with(CHECK_SUITE_EVENT_PREFIX)
+}
+
 /// Le `tool_name` sous lequel chaque décision de lignée est auditée (mika#2649).
 ///
 /// **Un seul nom**, la décision dans `after_value` — le motif `ready_label_outcome`
@@ -1934,6 +1975,124 @@ mod tests {
                 webhook_event_target(msg),
                 WebhookEventTarget::NotApplicable,
                 "{msg:?} reste dans le domaine Fallthrough : gate 0 le juge, pas la lignée"
+            );
+        }
+    }
+
+    // ───────────── mika#2653 — l'axe « tour ouvert par un événement PR » ─────────────
+
+    /// Le corpus des quatre variantes de la famille, plus les hors-population.
+    ///
+    /// `(message, est_dans_le_domaine_pr)`.
+    const PR_EVENT_DOMAIN_MATRIX: &[(&str, bool)] = &[
+        (
+            "[GitHub] PR review (approved) on senara-solutions/mika#2644 (t) by @reviewer",
+            true,
+        ),
+        (
+            "[GitHub] PR review (changes_requested) on senara-solutions/mika#2644 (t) by @x",
+            true,
+        ),
+        (
+            "[GitHub] PR opened: senara-solutions/mika#2644 — t (branch: fix/2653/x)",
+            true,
+        ),
+        (
+            "[GitHub] PR closed: senara-solutions/mika#2644 — t (branch: fix/2653/x)",
+            true,
+        ),
+        ("[GitHub] PR une-forme-que-personne-na-parsee", true),
+        (
+            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/2653/x)",
+            true,
+        ),
+        (
+            "[GitHub] Check suite success on senara-solutions/mika (branch: main)",
+            true,
+        ),
+        ("[GitHub] Check suite une-forme-inconnue", true),
+        // Hors population — le domaine Fallthrough, et le reste du trafic.
+        (
+            "[GitHub] Issue labeled ready on senara-solutions/mika#2653 — t",
+            false,
+        ),
+        (
+            "[GitHub] Issue labeled bug on senara-solutions/mika#2653",
+            false,
+        ),
+        (
+            "[GitHub] New comment on senara-solutions/mika#2653 (t) by @samidarko",
+            false,
+        ),
+        (
+            "[GitHub] discussion.created on senara-solutions/mika",
+            false,
+        ),
+        ("annule la tâche 8a3b2082", false),
+        ("[callback: long_running:run_claude_pilot] …", false),
+        ("", false),
+    ];
+
+    /// **AC5** — les deux axes de classe de tour webhook sont **mutuellement
+    /// exclusifs**, pour tout message du corpus.
+    ///
+    /// C'est le détecteur 4 du plan, et il existe parce que la rectification R1
+    /// est non-intuitive : `is_webhook_fallthrough_domain` **sort** les deux
+    /// familles que ce ticket vise, donc le quatrième booléen vaut `false`
+    /// exactement là où le cinquième vaut `true`. Un futur éditeur qui ferait se
+    /// chevaucher les deux (en retirant un `return false` du domaine
+    /// Fallthrough, par exemple) créerait deux axes dont la conjonction n'est
+    /// plus vide — et deux gardes qui mordent sur la même population sans que
+    /// personne ait tranché laquelle décide.
+    #[test]
+    fn mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs() {
+        for (msg, _) in PR_EVENT_DOMAIN_MATRIX {
+            assert!(
+                !(is_webhook_fallthrough_domain(msg) && is_webhook_pr_event_domain(msg)),
+                "INVARIANT VIOLÉ : {msg:?} est dans les DEUX domaines — les deux \
+                 booléens de classe de tour se chevauchent, et deux gardes mordent \
+                 désormais sur la même population"
+            );
+        }
+        // Même invariant sur le corpus de la frontière Fallthrough, qui porte les
+        // formes que `is_webhook_fallthrough_domain` existe pour trier.
+        for (msg, _, why) in PREFIX_SURFACE_MATRIX {
+            assert!(
+                !(is_webhook_fallthrough_domain(msg) && is_webhook_pr_event_domain(msg)),
+                "INVARIANT VIOLÉ sur {why}: {msg:?} est dans les deux domaines"
+            );
+        }
+    }
+
+    /// Le prédicat de préfixe reconnaît exactement la famille visée.
+    #[test]
+    fn mika2653_le_predicat_de_prefixe_reconnait_la_famille() {
+        for (msg, expected) in PR_EVENT_DOMAIN_MATRIX {
+            assert_eq!(
+                is_webhook_pr_event_domain(msg),
+                *expected,
+                "is_webhook_pr_event_domain({msg:?})"
+            );
+        }
+    }
+
+    /// **L'accord des deux faces**, qui est ce qui autorise à lire un prédicat de
+    /// préfixe plutôt que `webhook_event_target` (deux regex par tour).
+    ///
+    /// Motif `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position` :
+    /// la moitié bon marché et la moitié exacte doivent répondre la même chose, et
+    /// c'est ce test qui rougit si l'une des deux bouge seule. Note que
+    /// `Unreadable` est **dans** la population des deux côtés — un tour webhook PR
+    /// dont la grammaire a bougé reste un tour webhook PR.
+    #[test]
+    fn mika2653_le_predicat_de_prefixe_saccorde_avec_la_cible() {
+        for (msg, _) in PR_EVENT_DOMAIN_MATRIX {
+            assert_eq!(
+                is_webhook_pr_event_domain(msg),
+                webhook_event_target(msg) != WebhookEventTarget::NotApplicable,
+                "les deux faces de la frontière divergent sur {msg:?} : le prédicat \
+                 de préfixe et `webhook_event_target` lisent les MÊMES deux \
+                 constantes et doivent rendre le même verdict d'appartenance"
             );
         }
     }

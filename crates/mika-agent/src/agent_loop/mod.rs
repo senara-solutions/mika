@@ -5563,6 +5563,14 @@ async fn run_agent_inner(
         is_webhook_fallthrough_turn: crate::webhook_dispatch::is_webhook_fallthrough_domain(
             params.user_message,
         ),
+        // mika#2653 — l'axe complémentaire, au même site et pour la même
+        // raison : c'est le seul endroit qui possède le message du webhook. Le
+        // prédicat est **appelé**, jamais recopié, et les deux booléens sont
+        // mutuellement exclusifs par construction (le domaine Fallthrough sort
+        // explicitement les deux familles que celui-ci reconnaît).
+        is_webhook_pr_event_turn: crate::webhook_dispatch::is_webhook_pr_event_domain(
+            params.user_message,
+        ),
         provider_name: provider,
         model_name: model,
         active_skill_paths: &active_skill_paths,
@@ -6740,6 +6748,7 @@ async fn run_silent_inner(
         // périmètre qu'`effective_disabled_tools` documente déjà. Voir le
         // doc-comment du champ pour le bord.
         is_webhook_fallthrough_turn: false,
+        is_webhook_pr_event_turn: false,
         provider_name: provider,
         model_name: model,
         active_skill_paths: &[], // Silent mode: no context-redundancy checks needed
@@ -7411,6 +7420,7 @@ async fn run_team_agent_inner_impl(
         // mika#2573 — un tour d'équipe lit `TeamAgentParams` et ne porte aucun
         // message de webhook. Voir le doc-comment du champ.
         is_webhook_fallthrough_turn: false,
+        is_webhook_pr_event_turn: false,
         provider_name: provider,
         model_name: model,
         active_skill_paths: &[], // Team mode: no context-redundancy checks needed
