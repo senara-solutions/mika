@@ -793,6 +793,26 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Is a retention superseded by a later one on the same key (mika#2671
+    /// phase B2)? See [`Database::newer_audit_holds`].
+    pub async fn newer_audit_holds(
+        &self,
+        tool_name: &str,
+        held_value: &str,
+        target_key: &str,
+        identity: &str,
+        since: &str,
+    ) -> Result<(Option<i64>, i64)> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let hv = held_value.to_owned();
+        let tk = target_key.to_owned();
+        let id = identity.to_owned();
+        let sn = since.to_owned();
+        self.with_db(move |db| db.newer_audit_holds(&a, &tn, &hv, &tk, &id, &sn))
+            .await
+    }
+
     /// Count audit rows for (tool_name, after_value) newer than `since`, across
     /// every `target_key` (mika#2634). See the sync method for why the
     /// `target_key`-scoped sibling cannot answer this question.

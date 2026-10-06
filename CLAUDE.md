@@ -2681,7 +2681,24 @@ Optional (deferred-dispatch re-arm honesty — mika#2169):
 
 **Couplage avec la phase A, révision assumée.** La garde de build périmé compte toutes les lignes de la clé, donc une retenue postérieure au lancement d'un build fait sauter son callback. La phase A exigeait « démarré, pas reçu » parce qu'un reçu pouvait se perdre ; une retenue durable et rejouée ne se perd pas. Sans ce couplage, la fenêtre retarderait la revue suivante au-delà du callback précédent et l'épisode de référence coûterait plus qu'avec la phase A seule (≈ 3,95 M contre 3,5 M).
 
-**Ce que B1 ne fait pas.** Pas de contrôle de tête au démarrage du tour de revue (AC2-revue, **phase B2**) : une tête périmée déjà en file est revue pour rien, comme avant. Pas de retenue sur le chemin hérité (`MIKA_WEBHOOK_QUEUE_ENABLED=false`).
+**Ce que B1 ne fait pas.** Pas de retenue sur le chemin hérité (`MIKA_WEBHOOK_QUEUE_ENABLED=false`). Le contrôle de tête au tour de revue est la phase B2, ci-dessous.
+
+**Phase B2 — une tête remplacée ne paie pas de tour de revue (AC2 côté revue).** Le trou que B1 laissait, lisible dans son code : à l'échéance, A quitte la table de retenue et part en file ; un `synchronize` B arrivé pendant qu'A attend (en file ou derrière le verrou de l'agent) ouvre une **nouvelle** fenêtre, et la coalescence v2 ne fusionne qu'entre éléments en file — A payait donc un tour complet sur une tête que B avait remplacée. En tête de `run_agent_for_message`, avant la ligne de tour démarré et avant toute session, `skip_superseded_review_turn` saute le tour quand le registre porte **une retenue à soi** (`reasoning = request_id=<A>`) **et** une retenue d'une autre identité d'`id` supérieur, sur la même clé. **Zéro appel LLM**, aucune ligne de tour démarré, une ligne nommée. Même registre, même clé, même marqueur, même horizon que la reprise : une seconde *question* au registre (`Database::newer_audit_holds`), pas un second registre. Trois propriétés tiennent par construction : (1) la retenue la plus récente d'une clé n'a jamais de retenue plus récente qu'elle, donc **la dernière tête est toujours revue** (AC4) ; (2) une ligne de tour démarré d'une autre identité ne compte pas — elle ne prouve pas que sa tête est plus récente, une retenue durable si ; (3) **sans retenue à soi** (anti-rebond désarmé, chemin hérité, écriture `stage=held` en échec), aucun témoin : le tour tourne, car une retenue plus *ancienne* pendante ne doit pas faire sauter une tête plus récente. Fail-safe dans le sens de la revue : registre illisible ⇒ le tour tourne.
+
+- `MIKA_QA_STALE_REVIEW_GUARD` — kill-switch de la garde B2, **défaut armé**, même table de vérité que `MIKA_QA_STALE_BUILD_GUARD` (`parse_switch`).
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `qa_review_head_superseded` (journal + `audit_events`, **SOLE WRITER** `server/handlers.rs`) | INFO | non vide pendant les rafales, faible | chaque ligne est un tour de revue économisé ; `after_value = newer_holds=<n>`, `reasoning` = l'identité de la tête sautée |
+| `qa_review_head_unreadable` | WARN | **vide** | la base ne répond pas : le tour a tourné quand même |
+
+```sql
+-- Tours de revue sautés, par PR, et la retenue qui les a remplacés
+SELECT created_at, target_key, after_value, reasoning FROM audit_events
+ WHERE tool_name = 'qa_review_head_superseded' ORDER BY created_at DESC LIMIT 20;
+```
+
+*S5 (B2)* — sur un épisode de `synchronize` rapprochés où l'un est arrivé pendant qu'un autre attendait en file : une ligne `qa_review_head_superseded` pour la tête périmée, **aucune** session `llm_calls` mika-qa pour elle, et un tour démarré pour la dernière. *Halte* : la ligne apparaît **et** la dernière tête n'est jamais revue ⇒ la retenue de la dernière n'est pas pendante — lire `qa_sync_debounce_recovered` et le balayage **avant** de toucher au prédicat ; désarmer par `MIKA_QA_STALE_REVIEW_GUARD=0` si la boucle de revue s'arrête. Zéro ligne ne prouve rien tant qu'un épisode de ce type n'a pas eu lieu (mika#2205).
 
 ```sql
 -- Retenues, tours démarrés et rejeux, par PR

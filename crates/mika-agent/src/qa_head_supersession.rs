@@ -184,6 +184,90 @@ where
     }
 }
 
+// ---- Phase B2 : la tête est-elle encore courante au tour de REVUE ? --------
+//
+// L'anti-rebond (phase B1) verse un `synchronize` A en file à l'échéance ; si
+// un `synchronize` B de la même PR arrive pendant qu'A attend (en file, ou
+// derrière le verrou de l'agent), B ouvre une NOUVELLE fenêtre et A paie un
+// tour de revue complet sur une tête déjà remplacée. Le critère est une
+// retenue PLUS RÉCENTE que celle d'A, d'une autre identité, au même registre :
+// une retenue est durable (rejouée au démarrage et par le balayage), donc
+// sauter A ne perd aucune revue, et la retenue la plus récente d'une clé n'est
+// jamais sautée — la dernière tête est toujours revue (AC4), par construction.
+// Une ligne de tour démarré d'une autre identité ne compte pas : elle ne dit
+// pas que sa tête est plus récente. Aucune retenue à soi (anti-rebond
+// désarmé, chemin hérité, écriture `stage=held` en échec) ⇒ aucun témoin ⇒ le
+// tour tourne : une retenue plus ANCIENNE pendante ne doit pas faire sauter
+// une tête plus récente.
+
+/// Nom d'événement et `audit_events.tool_name` d'un tour de revue sauté.
+/// **SOLE WRITER** : [`crate::server::handlers`]. Observabilité seule — rien ne
+/// le relit pour décider ; ce n'est pas un second registre.
+pub const REVIEW_HEAD_SUPERSEDED_EVENT: &str = "qa_review_head_superseded";
+
+/// Nom d'événement d'un registre illisible au tour de revue : le tour tourne.
+pub const REVIEW_HEAD_UNREADABLE_EVENT: &str = "qa_review_head_unreadable";
+
+/// Kill-switch de la garde de revue. Armée par défaut.
+pub const STALE_REVIEW_GUARD_ENV: &str = "MIKA_QA_STALE_REVIEW_GUARD";
+
+/// La garde de revue est-elle armée ?
+pub fn stale_review_guard_enabled() -> bool {
+    parse_switch(
+        STALE_REVIEW_GUARD_ENV,
+        std::env::var(STALE_REVIEW_GUARD_ENV).ok().as_deref(),
+    )
+}
+
+/// Ce que la garde décide d'un tour de revue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewTurnHead {
+    /// Pas un `synchronize` : hors population, le registre n'est pas lu.
+    NotASync,
+    /// Ce `synchronize` n'a jamais été retenu : aucun témoin, le tour tourne.
+    NoWitness,
+    /// Aucune retenue plus récente : la tête est courante.
+    Current,
+    /// Une tête plus récente est retenue, durablement : le tour est sauté.
+    Superseded { target: PrTarget, newer_holds: i64 },
+    /// Le registre n'a pas pu être lu : le tour tourne (fail-safe revue).
+    LedgerUnreadable { target: PrTarget },
+}
+
+impl ReviewTurnHead {
+    /// Le seul état qui saute le tour.
+    pub fn skips_turn(&self) -> bool {
+        matches!(self, ReviewTurnHead::Superseded { .. })
+    }
+}
+
+/// La décision, pure. `lookup(key)` rend `(own_id, newer)` de
+/// [`crate::db::Database::newer_audit_holds`] pour l'identité du tour.
+pub async fn decide_review_turn<L, Fut>(text: &str, lookup: L) -> ReviewTurnHead
+where
+    L: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Option<i64>, i64)>>,
+{
+    let crate::server::webhook_queue_v2::WebhookEventKind::PullRequestSync { repo, pr } =
+        crate::server::webhook_queue_v2::classify_event(text)
+    else {
+        return ReviewTurnHead::NotASync;
+    };
+    let target = PrTarget {
+        repo,
+        pr_number: pr,
+    };
+    match lookup(sync_observed_key(&target.repo, target.pr_number)).await {
+        Ok((None, _)) => ReviewTurnHead::NoWitness,
+        Ok((Some(_), n)) if n > 0 => ReviewTurnHead::Superseded {
+            target,
+            newer_holds: n,
+        },
+        Ok((Some(_), _)) => ReviewTurnHead::Current,
+        Err(_) => ReviewTurnHead::LedgerUnreadable { target },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +398,84 @@ mod tests {
         }
     }
 
+    // ---- phase B2 : tête courante au tour de revue -------------------------
+
+    const SYNC_TEXT: &str = "[GitHub] PR synchronize: senara-solutions/mika#2659 \u{2014} fix: x (branch: b)\nhttps://github.com/senara-solutions/mika/pull/2659";
+
+    async fn review(lookup: anyhow::Result<(Option<i64>, i64)>) -> ReviewTurnHead {
+        decide_review_turn(SYNC_TEXT, |k| {
+            assert_eq!(
+                k, "pr:senara-solutions/mika#2659",
+                "même clé que le registre"
+            );
+            async move { lookup }
+        })
+        .await
+    }
+
+    /// AC2 — une retenue plus récente que la sienne : le tour est sauté.
+    #[tokio::test]
+    async fn mika2671_b2_une_retenue_plus_recente_saute_le_tour() {
+        let d = review(Ok((Some(7), 1))).await;
+        assert!(d.skips_turn(), "{d:?}");
+        assert!(matches!(
+            d,
+            ReviewTurnHead::Superseded { newer_holds: 1, .. }
+        ));
+    }
+
+    /// AC2 contrôle négatif — la retenue à soi est la dernière : tête courante.
+    #[tokio::test]
+    async fn mika2671_b2_tete_courante_le_tour_tourne() {
+        let d = review(Ok((Some(7), 0))).await;
+        assert_eq!(d, ReviewTurnHead::Current);
+        assert!(!d.skips_turn());
+    }
+
+    /// Sans retenue à soi, aucun témoin : le tour tourne, même si des retenues
+    /// (forcément plus anciennes ou d'une autre voie) existent.
+    #[tokio::test]
+    async fn mika2671_b2_sans_retenue_a_soi_le_tour_tourne() {
+        let d = review(Ok((None, 0))).await;
+        assert_eq!(d, ReviewTurnHead::NoWitness);
+        assert!(!d.skips_turn());
+    }
+
+    /// Fail-safe revue — registre illisible : le tour tourne.
+    #[tokio::test]
+    async fn mika2671_b2_registre_illisible_le_tour_tourne() {
+        let d = review(Err(anyhow::anyhow!("db down"))).await;
+        assert!(
+            matches!(d, ReviewTurnHead::LedgerUnreadable { .. }),
+            "{d:?}"
+        );
+        assert!(!d.skips_turn());
+    }
+
+    /// Hors population — `opened`, une revue, un texte libre : le registre
+    /// n'est pas lu.
+    #[tokio::test]
+    async fn mika2671_b2_hors_synchronize_le_registre_nest_pas_lu() {
+        for text in [
+            "[GitHub] PR opened: senara-solutions/mika#2659 \u{2014} fix: x (branch: b)\nu",
+            "[GitHub] PR review (approved) on senara-solutions/mika#2659 (fix: x) by @mika-platform-qa\nu",
+            "salut Mika",
+        ] {
+            let d = decide_review_turn(text, |_| async {
+                panic!("le registre ne doit pas être lu hors synchronize")
+            })
+            .await;
+            assert_eq!(d, ReviewTurnHead::NotASync, "{text}");
+        }
+    }
+
+    #[test]
+    fn mika2671_b2_les_noms_sont_un_format_de_fil() {
+        assert_eq!(REVIEW_HEAD_SUPERSEDED_EVENT, "qa_review_head_superseded");
+        assert_eq!(REVIEW_HEAD_UNREADABLE_EVENT, "qa_review_head_unreadable");
+        assert_eq!(STALE_REVIEW_GUARD_ENV, "MIKA_QA_STALE_REVIEW_GUARD");
+    }
+
     // ---- gardes structurelles ---------------------------------------------
 
     /// Les fichiers de production de `src/`, coupés au module de test de tête
@@ -387,6 +549,10 @@ mod tests {
             audit_writers("BUILD_CALLBACK_SUPERSEDED_EVENT"),
             vec!["task_engine/dispatcher.rs".to_string()]
         );
+        assert_eq!(
+            audit_writers("REVIEW_HEAD_SUPERSEDED_EVENT"),
+            vec!["server/handlers.rs".to_string()]
+        );
         // Aucun littéral recopié hors de ce module.
         for (rel, prod) in production_files() {
             if rel == "qa_head_supersession.rs" {
@@ -395,6 +561,7 @@ mod tests {
             for lit in [
                 "\"qa_pr_sync_observed\"",
                 "\"qa_build_callback_superseded\"",
+                "\"qa_review_head_superseded\"",
             ] {
                 assert!(!prod.contains(lit), "{rel} recopie le littéral {lit}");
             }
@@ -461,5 +628,41 @@ mod tests {
             prod[host..].starts_with("pub async fn handle_message("),
             "l'appel doit vivre dans handle_message"
         );
+    }
+
+    /// Placement (phase B2) — la garde de revue vit en tête de
+    /// `run_agent_for_message`, AVANT l'écriture du tour démarré et avant toute
+    /// création de session : un tour sauté ne crée ni session, ni appel LLM, ni
+    /// appel GitHub, et n'écrit pas de ligne de tour démarré pour une tête qu'il
+    /// n'a pas revue.
+    #[test]
+    fn mika2671_b2_la_garde_de_revue_precede_le_tour() {
+        let (_, prod) = production_files()
+            .into_iter()
+            .find(|(rel, _)| rel == "server/handlers.rs")
+            .unwrap();
+        let calls: Vec<usize> = prod
+            .match_indices("skip_superseded_review_turn(")
+            .map(|(i, _)| i)
+            .filter(|&i| !prod[..i].ends_with("async fn "))
+            .collect();
+        assert_eq!(calls.len(), 1, "un seul appel de production attendu");
+        let host = prod[..calls[0]].rfind("async fn ").unwrap();
+        assert!(
+            prod[host..].starts_with("async fn run_agent_for_message("),
+            "l'appel doit vivre dans run_agent_for_message"
+        );
+        let body = &prod[host..];
+        let guard = body.find("skip_superseded_review_turn(").unwrap();
+        for later in [
+            "record_pr_sync_observed(",
+            "create_session(",
+            "GatewayMessageSender::new(",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} absent de run_agent_for_message"));
+            assert!(guard < at, "la garde doit précéder {later}");
+        }
     }
 }
