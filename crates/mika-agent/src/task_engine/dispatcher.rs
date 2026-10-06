@@ -980,6 +980,101 @@ impl TaskDispatcher {
         .await;
     }
 
+    /// Un callback de build QA dont la tête a été remplacée se termine sans
+    /// tour LLM (mika#2671 AC3, moitié callback d'AC2).
+    ///
+    /// Rend `true` quand le tour est sauté — la tâche est alors `delivered`, une
+    /// ligne d'observabilité nommée est écrite, et **aucun** filet de verdict ne
+    /// part : rien n'était dû sur une tête morte, et la revue de la tête
+    /// suivante est déclenchée par le `synchronize` qui l'a rendue périmée.
+    ///
+    /// Rend `false` dans tous les autres cas, y compris registre illisible
+    /// (fail-safe dans le sens de la revue) : le tour tourne comme avant.
+    ///
+    /// Ne lit pas le statut : un callback `completed` (build fini) et un
+    /// callback `failed` (build annulé par la supersession mika#2335, ou en
+    /// échec) sont sautés pareil — AC3, « qu'il ait été annulé ou non ».
+    async fn skip_superseded_build_callback(&self, task: &Task) -> bool {
+        use crate::qa_head_supersession::{
+            BUILD_CALLBACK_SUPERSEDED_EVENT, BuildCallbackHead, SUPERSESSION_UNREADABLE_EVENT,
+            SYNC_OBSERVED_TOOL, decide_build_callback, stale_build_guard_enabled,
+            sync_observed_key,
+        };
+
+        if !stale_build_guard_enabled() {
+            return false;
+        }
+
+        let db = &self.db;
+        let since = task.created_at.clone();
+        let verdict = decide_build_callback(
+            &task.label,
+            task.metadata.as_deref(),
+            read_qa_review_pr_target,
+            |key| async move {
+                db.count_recent_audit_events_for_target(SYNC_OBSERVED_TOOL, &key, &since)
+                    .await
+            },
+        )
+        .await;
+
+        match verdict {
+            BuildCallbackHead::Superseded {
+                target,
+                later_syncs,
+            } => {
+                let target_value = target.to_metadata_value();
+                info!(
+                    event = BUILD_CALLBACK_SUPERSEDED_EVENT,
+                    agent_id = %self.db.agent_id(),
+                    task_id = %task.id,
+                    target = %target_value,
+                    later_syncs,
+                    build_launched_at = %task.created_at,
+                    "callback de build sur une tête remplacée — aucun tour LLM \
+                     (la tête suivante sera revue par son propre synchronize)"
+                );
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        "system",
+                        BUILD_CALLBACK_SUPERSEDED_EVENT,
+                        &format!("task:{}", task.id),
+                        None,
+                        Some(&format!(
+                            "{} later_syncs={later_syncs}",
+                            sync_observed_key(&target.repo, target.pr_number)
+                        )),
+                        Some(
+                            "callback de build sur une tête remplacée — tour LLM sauté (mika#2671)",
+                        ),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(task_id = %task.id, error = %e, "qa_build_callback_superseded: audit non écrit");
+                }
+                if let Err(e) = self.db.mark_task_delivered(&task.id).await {
+                    warn!(task_id = %task.id, error = %e, "callback de build périmé: mark_task_delivered a échoué");
+                }
+                true
+            }
+            BuildCallbackHead::LedgerUnreadable { target } => {
+                warn!(
+                    event = SUPERSESSION_UNREADABLE_EVENT,
+                    agent_id = %self.db.agent_id(),
+                    task_id = %task.id,
+                    target = %target.to_metadata_value(),
+                    "registre des synchronize illisible — le tour de callback tourne (fail-safe revue)"
+                );
+                false
+            }
+            BuildCallbackHead::NotABuildCallback
+            | BuildCallbackHead::NoPrTarget(_)
+            | BuildCallbackHead::Current => false,
+        }
+    }
+
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
         let is_callback = task.trigger_type == "callback";
 
@@ -1048,6 +1143,13 @@ impl TaskDispatcher {
                 r#"{"trigger": "reminder"}"#,
             )
         };
+
+        // mika#2671 — un callback de build dont la tête a été remplacée ne paie
+        // pas de tour LLM. Placé AVANT le verrou : un tour qu'on ne lance pas
+        // n'a ni à attendre le verrou ni à compter un report `AgentBusy`.
+        if is_callback && self.skip_superseded_build_callback(task).await {
+            return Ok(());
+        }
 
         // Acquire agent lock — return error if busy so caller can re-queue
         let _guard = if let Some(ref lock) = self.agent_lock {
@@ -9427,5 +9529,226 @@ mod tests {
             crate::qa_build_callback::UndeliveredVerdictCause::AgentBusyStarvation,
             "l'attribution est POSITIVE, jamais inférée d'une absence"
         );
+    }
+
+    // ---- mika#2671 — pas de tour LLM pour un callback de build périmé -----
+
+    mod mika2671 {
+        use super::*;
+        use crate::qa_build_callback::BUILD_CALLBACK_LABEL;
+        use crate::qa_head_supersession::{
+            BUILD_CALLBACK_SUPERSEDED_EVENT, SYNC_OBSERVED_TOOL, sync_observed_key,
+        };
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        const LAUNCHED_AT: &str = "2026-10-06T14:22:20Z";
+        const BEFORE_LAUNCH: &str = "2026-10-06T14:22:10Z";
+        const AFTER_LAUNCH: &str = "2026-10-06T14:22:30Z";
+        const TARGET_META: &str = r#"{"qa_review_pr_target":"senara-solutions/mika#2659"}"#;
+
+        /// Un dispatcher dont le LLM compte ses appels. Assez de réponses
+        /// EndTurn pour qu'un tour qui tourne n'épuise jamais le bouchon.
+        fn counting_dispatcher(db: AsyncDatabase) -> (TaskDispatcher, Arc<MockLlmProvider>) {
+            let mock = Arc::new(
+                MockLlmProvider::builder()
+                    .responses((0..8).map(|_| text_response("Build reviewed.")).collect())
+                    .build(),
+            );
+            let mut dispatcher = test_dispatcher(db);
+            dispatcher.llm = mock.clone();
+            (dispatcher, mock)
+        }
+
+        /// Un callback de build, tel que `build_callback_task` le forme, terminé,
+        /// lancé à `LAUNCHED_AT`.
+        async fn seed_build_callback(
+            db: &AsyncDatabase,
+            label: &str,
+            metadata: Option<&str>,
+            failed: bool,
+        ) -> String {
+            let id = db
+                .create_task(NewTask {
+                    agent_id: "mika".to_string(),
+                    team_run_id: None,
+                    parent_task_id: None,
+                    depth: 0,
+                    label: label.to_string(),
+                    trigger_type: "callback".to_string(),
+                    cron_expr: None,
+                    event_source: None,
+                    event_offset_secs: None,
+                    condition_expr: None,
+                    next_fire_at: None,
+                    timeout_at: None,
+                    action_type: "resume_agent".to_string(),
+                    action_config: "{}".to_string(),
+                    input_context: None,
+                    created_by_session: Some("qa-review-session".to_string()),
+                    created_trace_id: None,
+                    reference_url: None,
+                    source: None,
+                    metadata: metadata.map(str::to_string),
+                    r#type: None,
+                    dispatch_class: None,
+                })
+                .await
+                .unwrap();
+            if failed {
+                db.update_task_failed(&id, "Killed by signal: 15")
+                    .await
+                    .unwrap();
+            } else {
+                db.update_task_completed(&id, Some("Build succeeded"))
+                    .await
+                    .unwrap();
+            }
+            backdate(db, "tasks", "id", &id, LAUNCHED_AT).await;
+            id
+        }
+
+        async fn backdate(db: &AsyncDatabase, table: &str, col: &str, val: &str, at: &str) {
+            let sql = format!("UPDATE {table} SET created_at = ?1 WHERE {col} = ?2");
+            let (val, at) = (val.to_string(), at.to_string());
+            db.with_db(move |d| {
+                d.conn.execute(&sql, rusqlite::params![at, val])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        /// Un `synchronize` reçu pour `repo#pr`, daté de `at` — la ligne
+        /// qu'écrit `server::handlers::record_pr_sync_observed`.
+        async fn observe_sync(db: &AsyncDatabase, repo: &str, pr: u64, at: &str) {
+            let key = sync_observed_key(repo, pr);
+            db.log_audit_event("system", SYNC_OBSERVED_TOOL, &key, None, None, None, None)
+                .await
+                .unwrap();
+            backdate(db, "audit_events", "target_key", &key, at).await;
+        }
+
+        async fn status_of(db: &AsyncDatabase, id: &str) -> String {
+            db.get_task_unscoped(id).await.unwrap().unwrap().status
+        }
+
+        async fn superseded_rows(db: &AsyncDatabase) -> i64 {
+            db.count_audit_events_by_tool_name(BUILD_CALLBACK_SUPERSEDED_EVENT)
+                .await
+                .unwrap()
+        }
+
+        /// AC3 / AC2 (callback) — l'épisode mesuré : build lancé à 14:22:20,
+        /// `synchronize` reçu à 14:22:30. Le callback ne paie AUCUN appel LLM,
+        /// la tâche sort de la population des callbacks non livrés, et la ligne
+        /// d'observabilité nommée est écrite.
+        #[tokio::test]
+        async fn mika2671_un_build_perime_ne_paie_aucun_appel_llm() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, BUILD_CALLBACK_LABEL, Some(TARGET_META), false).await;
+            observe_sync(&db, "senara-solutions/mika", 2659, AFTER_LAUNCH).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert_eq!(
+                mock.calls_made(),
+                0,
+                "aucun appel LLM sur une tête remplacée"
+            );
+            assert_eq!(status_of(&db, &id).await, "delivered");
+            assert_eq!(superseded_rows(&db).await, 1);
+        }
+
+        /// AC3 — « qu'il ait été annulé ou non » : un callback `failed` (build
+        /// tué par la supersession mika#2335) est sauté pareil.
+        #[tokio::test]
+        async fn mika2671_un_build_annule_et_perime_est_saute_aussi() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, BUILD_CALLBACK_LABEL, Some(TARGET_META), true).await;
+            observe_sync(&db, "senara-solutions/mika", 2659, AFTER_LAUNCH).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert_eq!(mock.calls_made(), 0);
+            assert_eq!(status_of(&db, &id).await, "delivered");
+        }
+
+        /// AC2 contrôle négatif — tête courante : le `synchronize` connu est
+        /// ANTÉRIEUR au lancement du build (c'est celui qui l'a déclenché). Le
+        /// tour tourne, comme avant.
+        #[tokio::test]
+        async fn mika2671_tete_courante_le_tour_tourne() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, BUILD_CALLBACK_LABEL, Some(TARGET_META), false).await;
+            observe_sync(&db, "senara-solutions/mika", 2659, BEFORE_LAUNCH).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert!(mock.calls_made() >= 1, "le tour de callback doit tourner");
+            assert_eq!(superseded_rows(&db).await, 0);
+        }
+
+        /// Borne — un tour démarré dans la MÊME seconde que le lancement du
+        /// build ne le rend pas périmé (comparaison stricte, fail-safe revue).
+        #[tokio::test]
+        async fn mika2671_egalite_a_la_seconde_le_tour_tourne() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, BUILD_CALLBACK_LABEL, Some(TARGET_META), false).await;
+            observe_sync(&db, "senara-solutions/mika", 2659, LAUNCHED_AT).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert!(mock.calls_made() >= 1);
+            assert_eq!(superseded_rows(&db).await, 0);
+        }
+
+        /// Contrôle négatif — un `synchronize` postérieur sur une AUTRE PR ne
+        /// rend pas ce build périmé.
+        #[tokio::test]
+        async fn mika2671_un_sync_dune_autre_pr_ne_compte_pas() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, BUILD_CALLBACK_LABEL, Some(TARGET_META), false).await;
+            observe_sync(&db, "senara-solutions/mika", 2660, AFTER_LAUNCH).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert!(mock.calls_made() >= 1);
+            assert_eq!(superseded_rows(&db).await, 0);
+        }
+
+        /// Fail-safe revue — sans cible PR stampée, rien à quoi comparer : le
+        /// tour tourne même avec un `synchronize` postérieur au registre.
+        #[tokio::test]
+        async fn mika2671_sans_cible_pr_le_tour_tourne() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, BUILD_CALLBACK_LABEL, None, false).await;
+            observe_sync(&db, "senara-solutions/mika", 2659, AFTER_LAUNCH).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert!(mock.calls_made() >= 1);
+            assert_eq!(superseded_rows(&db).await, 0);
+        }
+
+        /// Portée — un autre flux `long_running` n'est jamais sauté.
+        #[tokio::test]
+        async fn mika2671_un_autre_long_running_nest_pas_saute() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, "long_running:deploy_mika", Some(TARGET_META), false)
+                .await;
+            observe_sync(&db, "senara-solutions/mika", 2659, AFTER_LAUNCH).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert!(mock.calls_made() >= 1);
+            assert_eq!(superseded_rows(&db).await, 0);
+        }
     }
 }

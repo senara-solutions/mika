@@ -900,6 +900,48 @@ async fn replay_deferred_webhooks(
     }
 }
 
+/// Inscrit au registre que lit la garde de callback de build périmé (mika#2671,
+/// `crate::qa_head_supersession`) un `pull_request.synchronize` dont le tour de
+/// revue DÉMARRE. Appelée uniquement depuis `run_agent_for_message`.
+///
+/// **SOLE WRITER** de `qa_pr_sync_observed`. Délibérément distinct des lignes
+/// `webhook_queue_*` : celles-ci sont bridées à une par seconde et par action
+/// (AC5 de mika#1870), et un registre dont une ligne peut manquer par bridage
+/// ne dirait plus « un `synchronize` a été reçu ». Les `synchronize` sont peu
+/// nombreux (quelques-uns par PR), donc la ligne n'est jamais bridée.
+///
+/// Best-effort : un échec d'écriture est journalisé et n'arrête pas
+/// l'ingestion. Fail-safe dans le sens de la revue — sans ligne, la garde ne
+/// voit aucun `synchronize` postérieur et laisse tourner le tour de callback.
+async fn record_pr_sync_observed(db: &crate::async_db::AsyncDatabase, text: &str) {
+    let webhook_queue_v2::WebhookEventKind::PullRequestSync { repo, pr } =
+        webhook_queue_v2::classify_event(text)
+    else {
+        return;
+    };
+    let key = crate::qa_head_supersession::sync_observed_key(&repo, pr);
+    if let Err(e) = db
+        .log_audit_event(
+            "system",
+            crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+            &key,
+            None,
+            None,
+            Some("tour de revue démarré sur un pull_request.synchronize (mika#2671)"),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "qa_pr_sync_observed_audit_failed",
+            target = %key,
+            error = %e,
+            "synchronize reçu mais non inscrit au registre — la garde de \
+             build périmé ne le verra pas (le tour de callback tournera)"
+        );
+    }
+}
+
 // -- Bounded webhook queue (mika#1870) --
 
 /// Minimum interval between `webhook_queue_*` audit-event emissions per
@@ -1280,6 +1322,17 @@ async fn run_agent_for_message(
 ) {
     let _lock = lock; // Hold lock for duration of agent loop
     let a = agent_state;
+
+    // mika#2671 — le registre des `synchronize` est écrit ICI, au démarrage du
+    // tour, et jamais à la réception : la garde de build périmé ne saute un
+    // callback que si la revue de la tête suivante a COMMENCÉ. Écrit à la
+    // réception, un `synchronize` évincé par la file bornée (drop-oldest, après
+    // un 202) ou perdu au redémarrage aurait fait sauter le callback sans que
+    // personne ne revoie la nouvelle tête. Les trois chemins qui lancent un
+    // tour passent par cette fonction (drain v2, chemin hérité, rejeu #528).
+    if req.channel == "github" {
+        record_pr_sync_observed(&a.db, &req.text).await;
+    }
 
     // Hot-reload skills if the dirty flag was set by a previous turn
     let skills = if a.skills_dirty.load(Ordering::Acquire) {
@@ -2213,5 +2266,63 @@ mod tests {
         assert_ne!(FAILED_SEND_STALE_PREFIX, FAILED_SEND_UNPARSEABLE_PREFIX);
         assert!(FAILED_SEND_STALE_PREFIX.contains("from earlier"));
         assert!(FAILED_SEND_UNPARSEABLE_PREFIX.contains("UNPARSEABLE"));
+    }
+
+    // ---- mika#2671 — le registre des `synchronize` reçus -------------------
+
+    fn mika2671_db() -> crate::async_db::AsyncDatabase {
+        crate::async_db::AsyncDatabase::new_with_agent(
+            crate::db::Database::open_in_memory().unwrap(),
+            "mika",
+        )
+    }
+
+    async fn mika2671_observed(db: &crate::async_db::AsyncDatabase, key: &str) -> i64 {
+        db.count_recent_audit_events_for_target(
+            crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+            key,
+            "1970-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Un `PR synchronize` tel que le gateway le formate écrit une ligne sous la
+    /// clé que lit la garde de build périmé.
+    #[tokio::test]
+    async fn mika2671_un_synchronize_est_inscrit_au_registre() {
+        let db = mika2671_db();
+        record_pr_sync_observed(
+            &db,
+            "[GitHub] PR synchronize: senara-solutions/mika#2659 \u{2014} fix: x (branch: fix/2653/y)\nhttps://github.com/senara-solutions/mika/pull/2659",
+        )
+        .await;
+        assert_eq!(
+            mika2671_observed(&db, "pr:senara-solutions/mika#2659").await,
+            1
+        );
+    }
+
+    /// Contrôle négatif — `opened`, `ready_for_review`, `review_requested`, une
+    /// revue, un check-suite : aucune ligne. Seul un `synchronize` déplace la tête.
+    #[tokio::test]
+    async fn mika2671_les_autres_evenements_ne_sont_pas_inscrits() {
+        let db = mika2671_db();
+        for text in [
+            "[GitHub] PR opened: senara-solutions/mika#2659 \u{2014} fix: x (branch: b)\nu",
+            "[GitHub] PR ready_for_review: senara-solutions/mika#2659 \u{2014} fix: x (branch: b)\nu",
+            "[GitHub] PR review_requested: senara-solutions/mika#2659 \u{2014} fix: x (branch: b)\nu",
+            "[GitHub] PR review (approved) on senara-solutions/mika#2659 (fix: x) by @mika-platform-qa\nu\n\nVERDICT: pass",
+            "[GitHub] Check suite success on senara-solutions/mika (branch: b)",
+            "salut Mika",
+        ] {
+            record_pr_sync_observed(&db, text).await;
+        }
+        assert_eq!(
+            db.count_audit_events_by_tool_name(crate::qa_head_supersession::SYNC_OBSERVED_TOOL)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }
