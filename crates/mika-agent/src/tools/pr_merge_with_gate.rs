@@ -6,6 +6,9 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use mika_common::claude::ToolDefinition;
+use mika_common::forge_identity::{
+    MergeClearance, MpcGateVerdict, mpc_gate_required, mpc_gate_verdict,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -402,9 +405,46 @@ impl Tool for PrMergeWithGateTool {
                 emit_gate_result(result, ctx).await
             }
             MergeGateDecision::AllChecksPassed => {
+                // -- Step 4: MPC gate trace (mika#2617 U5/AC5) --
+                //
+                // Last, because it is the only term that may read the network
+                // for nothing else: placed after every refusal, it is never paid
+                // on a PR the gate would refuse anyway. Outside its population
+                // it costs zero calls (`evaluate_mpc_gate`). The head SHA comes
+                // from the preflight — no resolution added (plan R11).
+                let clearance = match mpc_gate_clearance(
+                    "pr_merge_with_gate",
+                    pr_number,
+                    repo,
+                    &preflight.head_ref_oid,
+                    token,
+                )
+                .await
+                {
+                    Ok(clearance) => clearance,
+                    Err(verdict) => {
+                        // `mpc_gate_clearance` only errs on a refusing verdict;
+                        // the fallback stays closed rather than panicking.
+                        let result = mpc_gate_block(&verdict, repo).unwrap_or_else(|| {
+                            MergeGateResult::GateError {
+                                kind: GateErrorKind::Unknown,
+                                detail: format!("MPC gate refused without a reason: {verdict:?}"),
+                            }
+                        });
+                        return emit_gate_result(result, ctx).await;
+                    }
+                };
+
                 // Merge immediately
-                let merge_result =
-                    run_gh_merge(pr_number, repo, merge_method, delete_branch, token).await;
+                let merge_result = run_gh_merge(
+                    clearance,
+                    pr_number,
+                    repo,
+                    merge_method,
+                    delete_branch,
+                    token,
+                )
+                .await;
 
                 // Unify success/error into a single string for "already merged" detection
                 let (output, is_err) = match merge_result {
@@ -652,6 +692,18 @@ pub(crate) enum BlockReason {
         agent_id: String,
         dispatcher_agent: String,
     },
+    /// The repo requires an MPC gate trace (mika#2617 U5/AC5) and no PR comment
+    /// carries `<!-- mpc-gate: ok sha=<head> -->` — or the comments could not be
+    /// read, or the head is unknown (fail-closed). Population:
+    /// [`mika_common::forge_identity::MPC_GATE_REQUIRED_REPOS`]. Nothing is wrong
+    /// with the PR's CI: the orchestrator has not ruled on this head yet.
+    #[serde(rename = "mpc_gate_missing")]
+    MpcGateMissing,
+    /// An MPC gate marker exists, but on another commit than the current head
+    /// (mika#2617 U5/AC5): the PR was pushed after MPC ruled, so the ruling no
+    /// longer describes what would be merged.
+    #[serde(rename = "mpc_gate_stale_sha")]
+    MpcGateStaleSha { attested: String, head: String },
 }
 
 /// Why the gate tool itself failed (infrastructure, not PR state).
@@ -1935,7 +1987,15 @@ pub(crate) fn describe_behind_main_remediation(
 /// path on `check_suite.completed(success)` and requires a strict `AllPassed`
 /// (mika#571), so it was already the redundant half — and the only one of the
 /// two that reads our own definition of green.
+///
+/// **It demands a [`MergeClearance`], and that is AC5's whole enforcement
+/// (mika#2617 U5).** The witness has a private field and a single constructor,
+/// `MergeClearance::from_mpc_verdict`, which returns `Some` only when the MPC
+/// gate allows the merge — so the three call sites (the tool,
+/// `verdict_handler`, `merge_ready_handler`) cannot reach `gh pr merge` without
+/// having evaluated it. Taken by value: one witness, one merge.
 pub(crate) async fn run_gh_merge(
+    _clearance: MergeClearance,
     pr_number: u64,
     repo: &str,
     merge_method: &str,
@@ -1951,6 +2011,200 @@ pub(crate) async fn run_gh_merge(
     }
 
     run_gh_subprocess(&args, token).await
+}
+
+// ---------------------------------------------------------------------------
+// MPC gate trace (mika#2617, U5/AC5)
+// ---------------------------------------------------------------------------
+
+/// Bound on the PR-comment read. The value of `fetch_pr_head_sha` (mika#1563),
+/// its nearest neighbour on the same `gh pr view` surface, rather than a new
+/// number.
+pub(crate) const PR_COMMENTS_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Deserialize)]
+struct PrComments {
+    #[serde(default)]
+    comments: Vec<PrComment>,
+}
+
+#[derive(Deserialize)]
+struct PrComment {
+    #[serde(default)]
+    body: String,
+}
+
+/// Read the bodies of a PR's comments — **the only new read capability of
+/// mika#2617** (plan R10: no comment read existed anywhere in the tree).
+///
+/// `gh pr view <n> --repo <r> --json comments`, parsed as JSON rather than the
+/// plan's `--jq '.comments[].body'` one-line-per-comment: a comment body is
+/// multi-line, and splitting on newlines would mix one comment's fence state
+/// into the next. Bounded at [`PR_COMMENTS_TIMEOUT`]. Every failure — `gh`
+/// non-zero, timeout, unparsable output (including stdout truncated at
+/// `MAX_OUTPUT_LEN` on a very long thread) — is an `Err`, which the gate reads
+/// as `Missing` (fail-closed).
+///
+/// Only ever invoked through [`evaluate_mpc_gate`], i.e. only for a repo in
+/// `MPC_GATE_REQUIRED_REPOS`.
+pub(crate) async fn fetch_pr_comments(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+) -> Result<Vec<String>, String> {
+    let pr_str = pr_number.to_string();
+    let args = ["pr", "view", &pr_str, "--repo", repo, "--json", "comments"];
+    let output =
+        match tokio::time::timeout(PR_COMMENTS_TIMEOUT, run_gh_subprocess(&args, token)).await {
+            Ok(inner) => inner?,
+            Err(_) => {
+                return Err(format!(
+                    "gh pr view --json comments timed out after {}s",
+                    PR_COMMENTS_TIMEOUT.as_secs()
+                ));
+            }
+        };
+    parse_pr_comments(&output)
+}
+
+/// Pure half of [`fetch_pr_comments`].
+pub(crate) fn parse_pr_comments(output: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str::<PrComments>(output.trim())
+        .map(|p| p.comments.into_iter().map(|c| c.body).collect())
+        .map_err(|e| format!("Failed to parse gh pr view --json comments output: {e}"))
+}
+
+/// The MPC gate verdict, with the read error when there was one.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MpcGateEvaluation {
+    pub(crate) verdict: MpcGateVerdict,
+    /// `Some` when the comments could not be read — the verdict is then
+    /// `Missing`, and the caller must say *why* (`mpc_gate_comments_unreadable`)
+    /// rather than let "MPC has not ruled" and "we could not look" share a name.
+    pub(crate) read_error: Option<String>,
+}
+
+/// Evaluate the MPC gate with a **lazy** comment reader.
+///
+/// **The population term runs before the reader, and that order is this
+/// function's property, not a caller's discipline** (plan R10). Outside
+/// `MPC_GATE_REQUIRED_REPOS` — `senara-solutions/mika`, the overwhelming
+/// population — the reader is never invoked, so the witness that forces all
+/// three merge sites through here costs them zero network calls. An empty head
+/// is `Missing` before the read too: there is nothing a comment could match.
+pub(crate) async fn evaluate_mpc_gate<F, Fut>(
+    repo: &str,
+    head_sha: &str,
+    read_comments: F,
+) -> MpcGateEvaluation
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>, String>>,
+{
+    if !mpc_gate_required(repo) {
+        return MpcGateEvaluation {
+            verdict: MpcGateVerdict::NotRequired,
+            read_error: None,
+        };
+    }
+    if head_sha.trim().is_empty() {
+        return MpcGateEvaluation {
+            verdict: MpcGateVerdict::Missing,
+            read_error: Some("head SHA unknown".to_string()),
+        };
+    }
+    match read_comments().await {
+        Ok(comments) => MpcGateEvaluation {
+            verdict: mpc_gate_verdict(repo, head_sha, &comments),
+            read_error: None,
+        },
+        Err(e) => MpcGateEvaluation {
+            verdict: MpcGateVerdict::Missing,
+            read_error: Some(e),
+        },
+    }
+}
+
+/// The MPC gate as the three merge sites consume it: evaluate, log, and hand
+/// back either the witness `run_gh_merge` demands or the refusing verdict.
+///
+/// The two WARN names are distinct on purpose (doctrine mika#2156/mika#2277):
+/// `mpc_gate_refused` means MPC has not ruled on this head (remedy: post the
+/// marker), `mpc_gate_comments_unreadable` means we could not look (remedy: API
+/// access). Fusing them would make both populations uncountable. Nothing is
+/// logged on the nominal path.
+pub(crate) async fn mpc_gate_clearance(
+    site: &str,
+    pr_number: u64,
+    repo: &str,
+    head_sha: &str,
+    token: &str,
+) -> Result<MergeClearance, MpcGateVerdict> {
+    let eval =
+        evaluate_mpc_gate(repo, head_sha, || fetch_pr_comments(pr_number, repo, token)).await;
+    if let Some(error) = &eval.read_error {
+        warn!(
+            event = "mpc_gate_comments_unreadable",
+            site,
+            repo,
+            pr = pr_number,
+            error = %error,
+            "MPC gate: PR comments unreadable — fail-closed, merge refused (mika#2617)"
+        );
+    }
+    match MergeClearance::from_mpc_verdict(&eval.verdict) {
+        Some(clearance) => Ok(clearance),
+        None => {
+            let (attested, head) = match &eval.verdict {
+                MpcGateVerdict::StaleSha { attested, head } => (attested.as_str(), head.as_str()),
+                _ => ("", head_sha),
+            };
+            warn!(
+                event = "mpc_gate_refused",
+                site,
+                repo,
+                pr = pr_number,
+                reason = eval.verdict.refusal_reason().unwrap_or("unknown"),
+                attested,
+                head,
+                "MPC gate: no orchestrator ruling on this head — merge refused (mika#2617)"
+            );
+            Err(eval.verdict)
+        }
+    }
+}
+
+/// The tool's refusal for an MPC gate verdict that does not clear.
+pub(crate) fn mpc_gate_block(verdict: &MpcGateVerdict, repo: &str) -> Option<MergeGateResult> {
+    let (reason, detail) = match verdict {
+        MpcGateVerdict::NotRequired | MpcGateVerdict::Attested => return None,
+        MpcGateVerdict::Missing => (
+            BlockReason::MpcGateMissing,
+            format!(
+                "{repo} requires an MPC gate trace on the head: no PR comment carries \
+                 `<!-- mpc-gate: ok sha=<head> -->` (or the comments could not be read). \
+                 Nothing is wrong with CI. Do NOT merge and do NOT retry — the orchestrator \
+                 rules on this head first (mika#2617)."
+            ),
+        ),
+        MpcGateVerdict::StaleSha { attested, head } => (
+            BlockReason::MpcGateStaleSha {
+                attested: attested.clone(),
+                head: head.clone(),
+            },
+            format!(
+                "{repo} requires an MPC gate trace on the head: the latest marker attests \
+                 {attested}, the head is {head}. The PR moved after the orchestrator ruled. \
+                 Do NOT merge and do NOT retry — the orchestrator rules on the new head \
+                 first (mika#2617)."
+            ),
+        ),
+    };
+    Some(MergeGateResult::Blocked {
+        reason,
+        failing_checks: vec![],
+        detail,
+    })
 }
 
 /// Spawn a `gh` subprocess with proper env scrubbing and token injection.
@@ -5000,5 +5254,235 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
         }"#;
         let preflight: PrPreflight = serde_json::from_str(json).unwrap();
         assert_eq!(preflight.base_ref_oid, "");
+    }
+}
+
+/// Trace de gate MPC au chemin de merge (mika#2617, U5/AC5). Les termes purs
+/// vivent dans `mika_common::forge_identity` et y sont testés ; ici, ce que
+/// l'agent ajoute : l'ordre population → lecture (le test du coût, R10), le
+/// fail-closed sur lecture illisible, les refus de l'outil (T10–T13), et la
+/// garde qui empêche un site de fabriquer le témoin sans évaluer.
+#[cfg(test)]
+mod mpc_gate_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    const HEAD: &str = "8ccaabc8d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6";
+    const OLD: &str = "41a4a20e00112233445566778899aabbccddeeff";
+    const CP: &str = "senara-solutions/claude-pilot";
+    const MIKA: &str = "senara-solutions/mika";
+
+    fn marker(sha: &str) -> String {
+        format!("<!-- mpc-gate: ok sha={sha} -->")
+    }
+
+    type CommentReply = std::future::Ready<Result<Vec<String>, String>>;
+
+    /// Un lecteur qui compte ses invocations et rend `reply`.
+    fn counting_reader(
+        reply: Result<Vec<String>, String>,
+    ) -> (Arc<AtomicUsize>, impl FnOnce() -> CommentReply) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        (calls, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(reply)
+        })
+    }
+
+    /// **R10, le test du coût.** Sur `senara-solutions/mika` — la population
+    /// écrasante — le lecteur paresseux n'est PAS exécuté et le verdict est
+    /// `NotRequired`. Sans ce test, un appel `gh` par merge s'ajouterait sur
+    /// chaque PR mika sans qu'aucune assertion ne rougisse : le témoin de type
+    /// force les trois sites à évaluer, et c'est l'ordre qui rend ça gratuit.
+    #[tokio::test]
+    async fn mika2617_the_comment_reader_is_not_invoked_outside_the_population() {
+        let (calls, reader) = counting_reader(Ok(vec![]));
+        let eval = evaluate_mpc_gate(MIKA, HEAD, reader).await;
+        assert_eq!(eval.verdict, MpcGateVerdict::NotRequired);
+        assert_eq!(eval.read_error, None);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "lecteur invoqué hors population"
+        );
+
+        // Contrôle positif dans le même test : dans la population, le même
+        // lecteur EST invoqué — sinon « zéro appel » se lirait aussi d'une porte
+        // qui ne lit jamais.
+        let (calls, reader) = counting_reader(Ok(vec![marker(HEAD)]));
+        let eval = evaluate_mpc_gate(CP, HEAD, reader).await;
+        assert_eq!(eval.verdict, MpcGateVerdict::Attested);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mika2617_unreadable_comments_are_missing_and_say_why() {
+        let (calls, reader) = counting_reader(Err("HTTP 502".to_string()));
+        let eval = evaluate_mpc_gate(CP, HEAD, reader).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(eval.verdict, MpcGateVerdict::Missing);
+        assert_eq!(eval.read_error.as_deref(), Some("HTTP 502"));
+    }
+
+    #[tokio::test]
+    async fn mika2617_an_unknown_head_is_missing_without_reading() {
+        let (calls, reader) = counting_reader(Ok(vec![marker(HEAD)]));
+        let eval = evaluate_mpc_gate(CP, "", reader).await;
+        assert_eq!(eval.verdict, MpcGateVerdict::Missing);
+        assert!(eval.read_error.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn mika2617_parse_pr_comments_reads_whole_multiline_bodies() {
+        let out = serde_json::json!({
+            "comments": [
+                {"author": {"login": "samidarko"}, "body": "Gate OK.\n\n```\nx\n```\n<!-- mpc-gate: ok sha=abc -->"},
+                {"body": "second"}
+            ]
+        })
+        .to_string();
+        let bodies = parse_pr_comments(&out).unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "un commentaire multi-ligne reste UN commentaire"
+        );
+        assert!(bodies[0].contains("```\nx\n```"));
+        assert_eq!(
+            parse_pr_comments(r#"{"comments": []}"#).unwrap(),
+            Vec::<String>::new()
+        );
+        // Sortie tronquée (borne `MAX_OUTPUT_LEN`) ⇒ Err ⇒ Missing, jamais Ok(vide).
+        assert!(parse_pr_comments(r#"{"comments": [{"body": "x"#).is_err());
+        assert!(parse_pr_comments("").is_err());
+    }
+
+    /// Ce que l'outil rend pour un verdict donné.
+    async fn tool_result_for(repo: &str, comments: Vec<String>) -> Option<Value> {
+        let (_, reader) = counting_reader(Ok(comments));
+        let eval = evaluate_mpc_gate(repo, HEAD, reader).await;
+        mpc_gate_block(&eval.verdict, repo).map(|r| serde_json::to_value(&r).unwrap())
+    }
+
+    /// T10 — `claude-pilot`, aucun marqueur : merge refusé, `mpc_gate_missing`.
+    #[tokio::test]
+    async fn mika2617_t10_claude_pilot_without_marker_is_refused() {
+        let v = tool_result_for(CP, vec!["LGTM".to_string()])
+            .await
+            .expect("refus attendu");
+        assert_eq!(v["action"], "blocked");
+        assert_eq!(v["reason"]["reason"], "mpc_gate_missing");
+    }
+
+    /// T11 — `claude-pilot`, marqueur sur un sha ancien : `mpc_gate_stale_sha`,
+    /// et le refus montre les deux SHA.
+    #[tokio::test]
+    async fn mika2617_t11_claude_pilot_with_stale_marker_is_refused() {
+        let v = tool_result_for(CP, vec![marker(OLD)])
+            .await
+            .expect("refus attendu");
+        assert_eq!(v["action"], "blocked");
+        assert_eq!(v["reason"]["reason"], "mpc_gate_stale_sha");
+        assert_eq!(v["reason"]["attested"], OLD);
+        assert_eq!(v["reason"]["head"], HEAD);
+        let detail = v["detail"].as_str().unwrap();
+        assert!(detail.contains(OLD) && detail.contains(HEAD), "{detail}");
+    }
+
+    /// T12 — `claude-pilot`, marqueur sur la tête : ce terme autorise.
+    #[tokio::test]
+    async fn mika2617_t12_claude_pilot_with_marker_on_head_is_cleared() {
+        assert_eq!(
+            tool_result_for(CP, vec![marker(OLD), marker(HEAD)]).await,
+            None
+        );
+    }
+
+    /// T13 — **contrôle négatif** : `senara-solutions/mika`, aucun marqueur,
+    /// merge autorisé. Sans lui, « le gate décide » est indistinguable de « le
+    /// gate bloque tout », état qui casserait la boucle entière.
+    #[tokio::test]
+    async fn mika2617_t13_mika_without_marker_is_not_gated() {
+        assert_eq!(tool_result_for(MIKA, vec![]).await, None);
+    }
+
+    /// Le témoin ne vaut que si personne ne le fabrique sans évaluer.
+    /// `from_mpc_verdict` a **un** appelant de production dans cette crate —
+    /// `mpc_gate_clearance` —, sinon un site pourrait écrire
+    /// `MergeClearance::from_mpc_verdict(&MpcGateVerdict::NotRequired)` et
+    /// passer le compilateur sans lire un commentaire. Allowlist livrée vide.
+    #[test]
+    fn mika2617_merge_clearance_has_a_single_production_constructor_site() {
+        fn hits_in(src: &str, rel: &str) -> Vec<String> {
+            crate::source_scan::strip_comment_lines(crate::source_scan::production_half(src))
+                .lines()
+                .filter(|l| {
+                    l.contains("from_mpc_verdict(")
+                        || l.contains("MpcGateVerdict::NotRequired")
+                        || l.contains("MpcGateVerdict::Attested")
+                })
+                .map(|l| format!("{rel}: {}", l.trim()))
+                .collect()
+        }
+
+        // Contrôle de bonne foi sur fixture : le prédicat attrape la forme du
+        // contournement.
+        let bypass =
+            "fn f() { let c = MergeClearance::from_mpc_verdict(&MpcGateVerdict::NotRequired); }";
+        assert_eq!(hits_in(bypass, "fixture").len(), 1);
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !crate::source_scan::is_test_source_path(&path)
+                {
+                    let rel = path.strip_prefix(&root).unwrap().display().to_string();
+                    hits.extend(hits_in(&std::fs::read_to_string(&path).unwrap(), &rel));
+                }
+            }
+        }
+        const ALLOWED: &[&str] = &[];
+        hits.retain(|h| !ALLOWED.iter().any(|a| h.starts_with(a)));
+        // Le seul site légitime : `mpc_gate_clearance` (et l'évaluateur, qui
+        // rend `NotRequired` hors population).
+        let legit: Vec<&String> = hits
+            .iter()
+            .filter(|h| h.starts_with("tools/pr_merge_with_gate.rs"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            legit.len(),
+            "mika#2617 — le témoin `MergeClearance` est fabriqué hors de \
+             `mpc_gate_clearance` : {hits:#?}"
+        );
+        // Anti-vacuité : le scan doit voir le constructeur légitime.
+        assert!(
+            legit.iter().any(|h| h.contains("from_mpc_verdict(")),
+            "le scan ne voit plus `mpc_gate_clearance` : il vise un chemin mort. {hits:#?}"
+        );
+    }
+
+    #[test]
+    fn mika2617_mpc_gate_block_reasons_are_the_shared_wire_names() {
+        for v in [
+            MpcGateVerdict::Missing,
+            MpcGateVerdict::StaleSha {
+                attested: OLD.to_string(),
+                head: HEAD.to_string(),
+            },
+        ] {
+            let r = serde_json::to_value(mpc_gate_block(&v, CP).unwrap()).unwrap();
+            assert_eq!(r["reason"]["reason"], v.refusal_reason().unwrap());
+        }
     }
 }

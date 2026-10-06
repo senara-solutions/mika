@@ -925,6 +925,49 @@ refusal — the detection is unconditional (motif mika#2249 / mika#2272).
 **Operator surfaces, expected regimes and the probes:** root `CLAUDE.md`
 § *Optional (relance une fois, puis blocage — mika#2617)*.
 
+#### MPC gate trace at the merge path (mika#2617, phase C)
+
+For `senara-solutions/claude-pilot` (and its pre-rename alias
+`senara-solutions/claude-pilot-py`, which GitHub still redirects to the same PR),
+an autonomous merge additionally requires a PR comment carrying
+`<!-- mpc-gate: ok sha=<full head SHA> -->` — the orchestrator's ruling on **this**
+head (AC5). Strict equality on the full SHA, so any later push invalidates the
+marker by itself; a prefix is not an attestation. The pure half lives in
+`mika_common::forge_identity` next to `merge_disposition`
+(`MPC_GATE_REQUIRED_REPOS`, `extract_mpc_gate_shas`, `mpc_gate_verdict` →
+`NotRequired | Attested | Missing | StaleSha`), because a second merge-policy list
+is the drift this repo has paid twice. The marker is never read inside code —
+fenced blocks or inline spans — since a comment *discussing* the format carries
+the literal (mika#2050). Unreadable comments, a timeout (15 s) or an unknown head
+are `Missing`: fail-closed, and it can only freeze the population's merges.
+
+**AC5 cannot be bypassed by the two handlers, and that is a type, not a scan.**
+`run_gh_merge` takes a `MergeClearance` by value; its field is private and its
+only constructor, `MergeClearance::from_mpc_verdict`, returns `Some` only on
+`NotRequired`/`Attested`. The tool, `verdict_handler` and `merge_ready_handler`
+were forced by the compiler (plan R8).
+`mika2617_merge_clearance_has_a_single_production_constructor_site` pins that the
+witness is minted at one production site — `mpc_gate_clearance` — so no caller
+can write `from_mpc_verdict(&MpcGateVerdict::NotRequired)` and skip the read.
+
+**Zero added network call outside the population, by construction.**
+`evaluate_mpc_gate` tests the population term **before** invoking its lazy reader
+(`fetch_pr_comments`, `gh pr view <n> --json comments` — the only new read
+capability of mika#2617, parsed as JSON so multi-line bodies stay whole). Pinned
+by `mika2617_the_comment_reader_is_not_invoked_outside_the_population`, with its
+positive control. The head SHA costs no resolution at the tool (preflight) nor at
+`merge_ready_handler` (`signal.head_sha`); `verdict_handler` reuses its
+behind-main preflight and resolves the head only for a population repo whose
+preflight failed. In the tool the term runs last, inside the `AllChecksPassed`
+arm, so a PR the gate refuses anyway never pays it.
+
+Refusals: `blocked` / `mpc_gate_missing` | `mpc_gate_stale_sha` (tool, taught to
+the three `self-dev*` prompts), `Passthrough` (verdict handler), `Handled` +
+audit `merge_ready_mpc_gate_held` (merge actor). WARN `mpc_gate_refused` and
+`mpc_gate_comments_unreadable` are distinct names on purpose — opposite remedies
+(post the marker vs repair API access). Surfaces and the S6 probe: root
+`CLAUDE.md` § *La trace de gate MPC, au chemin de merge (mika#2617, phase C)*.
+
 **Supervisor pr_url write on `checks_pending` (mika#1211, arm moved by mika#2617):** On the pending-checks branch — `auto_merge_enabled` until 2026-10-02 — the tool writes `$.claude_pilot.pr_url = "https://github.com/<owner>/<repo>/pull/<n>"` to the supervisor task's metadata (resolved via `ToolContext.callback_task_id → parent`, gated by `trigger_type='manual' && source='self_dev'`). This neutralises the orphan reaper's `pr_url IS NULL` predicate (#871) and arms the parent-completer (mika#1162), so the supervisor stays `in_progress` until the dispatch callback ages past `REAPER_GRACE_SECONDS` and is then promoted to `completed`. Mirrors `dispatcher::try_extract_callback_metadata` (#376): two-level shallow merge via `task_metadata::merge_metadata`, fire-and-forget on error. Conversation-mode invocations (no `callback_task_id`) skip the write silently. See `docs/solutions/best-practices/pr-merge-with-gate-supervisor-metadata-2026-05-20.md`.
 
 ### Issue Dependency Resolution
