@@ -773,3 +773,41 @@ depuis un tour webhook PR depuis le déploiement.
   retenue est refusée avec sa raison (§ 5).
 - **Retirer le permanent `2>/dev/null` de `dispatch-lib.sh`**, le résidu `run_shell`
   et le vecteur `update_task_status` : trois suivis nommés, aucun ouvert ici.
+
+---
+
+## 14. Phase B — ce que l'exécution a corrigé (AC6)
+
+Livrée en PR empilée sur la phase A. Trois écarts au § 4.3 / § 9, mesurés en
+écrivant, et pourquoi :
+
+1. **`TaskPilot` rend des candidats, pas un pilote.** La forme du § 4.3
+   (`Found { pid, start_time, owner_task_id }`) choisissait **un** enfant ;
+   le verdict doit pourtant tous les examiner (un enfant mort rangé avant un
+   enfant vif ne doit pas arrêter la recherche), et le kill garde le premier qui
+   a un start_time. Un seul choix fait dans la traversée aurait été la
+   classification de l'un imposée à l'autre. Variantes livrées : `Named { pid,
+   start_time }`, `Children(Vec<DispatchChild>)` (non terminaux, start_time
+   absent **conservé**), `ChildrenUnreadable(anyhow::Error)` (l'erreur, pour que
+   chaque appelant la rapporte sous ses propres mots — le helper ne logue rien).
+2. **Signature `resolve_task_pilot(db, task_id, named: Option<&Task>)`.** Le
+   fetch de la ligne nommée reste à l'appelant : le kill en a besoin pour son
+   label et **propage** son erreur, le verdict la classe `Unreadable`. Motif
+   mika#2624 : *la classification est extraite, le fetch et le report restent où
+   ils sont.*
+3. **Prémisse du § 9 fausse : la composition traversée × `is_same_process_alive`
+   existait.** `TaskEngine::dispatch_liveness` (`engine.rs`, mika#2156) la porte,
+   et `process_kill.rs` la portait au niveau fichier avant l'extraction. Le
+   prédicat du détecteur 1 exige donc **le troisième terme de la question de
+   `live_pilot.rs`** — le filtre terminal — que `dispatch_liveness` refuse
+   délibérément (D-2). Allowlist **vide**, conformément au § 9 ; le résidu (un
+   lecteur sans filtre terminal échappe au scan) est nommé au test.
+
+Ce que l'extraction change au chemin de kill, et dans quel sens : (a) une ligne
+nommée **terminale** porteuse d'un pgid retombe sur la traversée des enfants —
+sans changement d'issue, `cancel_task` refusant une ligne terminale ; (b) un
+`process_start_time` de **forme entière** sur la ligne nommée est désormais lu,
+donc le kill vérifie l'instance avant de signaler — population signalée plus
+étroite, jamais plus large. Les tests de
+`tests/eval/test_supersede_kills_live_pilot.rs` et
+`test_cancel_task_live_pilot_2653.rs` sont restés verts **sans modification**.

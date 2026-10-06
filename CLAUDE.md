@@ -5497,7 +5497,7 @@ Raisonnement complet, les six rectifications et les deux scans structurels :
 `crates/mika-agent/CLAUDE.md` § *Un dispatch ouvert par un événement PR est borné à
 sa LIGNÉE*.
 
-### `cancel_task` n'annule pas un pilote vif depuis un tour webhook PR (mika#2653, phase A)
+### `cancel_task` n'annule pas un pilote vif depuis un tour webhook PR (mika#2653, phases A et B)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
 entrée est ici parce qu'elle est le second cas mesuré de la famille ci-dessus —
@@ -5524,9 +5524,14 @@ qui lit un `cancel_task` refusé cherche dans ce voisinage.
   topologie à deux lignes l'interdit de dériver — une ligne callback, celle qui
   porte le pgid, **n'a pas d'URL**. Le lecteur manquant est `live_pilot_for_task`,
   et le ticket le décrivait comme s'il existait. *(R3)* La traversée parent→enfant
-  **existe déjà** dans `cancel_task_and_kill` (mika#2335) : l'extraction est donc
-  due, et c'est **AC6, différé en phase B** — la duplication est **nommée au
-  site**. *(R4)* `cancel_reminder` délègue littéralement à
+  **existait déjà** dans `cancel_task_and_kill` (mika#2335) : **AC6, livré en
+  phase B** — `live_pilot::resolve_task_pilot` est son site unique, appelé par le
+  kill et par le verdict, la classification restant à chacun (le kill écarte
+  l'enfant sans start_time, le verdict le rend `Unreadable`) ; le scan
+  `mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique` refuse un second lecteur
+  (allowlist vide). `engine.rs::dispatch_liveness` compose aussi traversée et
+  preuve d'instance, mais sans filtre terminal, délibérément (D-2 de mika#2156) :
+  autre question, hors du scan, nommée au test. *(R4)* `cancel_reminder` délègue littéralement à
   `CancelTaskTool.execute`, donc **un site couvre deux outils** gratuitement.
   *(R5)* voir ci-dessous — c'est la rectification qui décide l'arbitrage.
   *(R6)* deux vecteurs voisins ne se ferment pas par ce terme (recensement).
