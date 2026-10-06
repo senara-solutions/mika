@@ -997,6 +997,92 @@ async fn record_pr_sync_observed(
     }
 }
 
+/// mika#2671 phase B2 — un tour de revue déclenché par un `synchronize` dont la
+/// tête a été remplacée par une retenue plus récente (même registre, même clé,
+/// autre `request_id`) est sauté, sans appel LLM. Rend `true` quand le tour est
+/// sauté ; une ligne d'observabilité nommée est alors écrite (journal + audit).
+///
+/// Rend `false` dans tous les autres cas — garde désarmée, pas un
+/// `synchronize`, jamais retenu, tête courante, registre illisible : le tour
+/// tourne comme avant (fail-safe dans le sens de la revue).
+///
+/// **SOLE WRITER** de `REVIEW_HEAD_SUPERSEDED_EVENT`.
+async fn skip_superseded_review_turn(
+    db: &crate::async_db::AsyncDatabase,
+    text: &str,
+    request_id: &str,
+) -> bool {
+    use crate::qa_head_supersession::{
+        REVIEW_HEAD_SUPERSEDED_EVENT, REVIEW_HEAD_UNREADABLE_EVENT, ReviewTurnHead,
+        SYNC_OBSERVED_TOOL, decide_review_turn, stale_review_guard_enabled, sync_observed_key,
+    };
+
+    if !stale_review_guard_enabled() {
+        return false;
+    }
+    let identity = super::sync_debounce::request_marker(request_id);
+    let since = crate::timestamp::now_minus(chrono::Duration::seconds(
+        super::sync_debounce::RECOVERY_HORIZON_SECS,
+    ));
+    let verdict = decide_review_turn(text, |key| {
+        let identity = identity.clone();
+        async move {
+            db.newer_audit_holds(
+                SYNC_OBSERVED_TOOL,
+                super::sync_debounce::HELD_STAGE,
+                &key,
+                &identity,
+                &since,
+            )
+            .await
+        }
+    })
+    .await;
+
+    match verdict {
+        ReviewTurnHead::Superseded {
+            target,
+            newer_holds,
+        } => {
+            let key = sync_observed_key(&target.repo, target.pr_number);
+            info!(
+                event = REVIEW_HEAD_SUPERSEDED_EVENT,
+                agent_id = %db.agent_id(),
+                target = %key,
+                request_id,
+                newer_holds,
+                "tour de revue sur une tête remplacée — aucun tour LLM \
+                 (la tête plus récente est retenue et sera revue)"
+            );
+            if let Err(e) = db
+                .log_audit_event(
+                    "system",
+                    REVIEW_HEAD_SUPERSEDED_EVENT,
+                    &key,
+                    None,
+                    Some(&format!("newer_holds={newer_holds}")),
+                    Some(&identity),
+                    None,
+                )
+                .await
+            {
+                warn!(target = %key, error = %e, "qa_review_head_superseded: audit non écrit");
+            }
+            true
+        }
+        ReviewTurnHead::LedgerUnreadable { target } => {
+            warn!(
+                event = REVIEW_HEAD_UNREADABLE_EVENT,
+                agent_id = %db.agent_id(),
+                target = %target.to_metadata_value(),
+                "registre des synchronize illisible — le tour de revue tourne (fail-safe revue)"
+            );
+            false
+        }
+        ReviewTurnHead::NotASync | ReviewTurnHead::NoWitness | ReviewTurnHead::Current => false,
+    }
+}
+
 /// Inscrit au registre `qa_pr_sync_observed` un `synchronize` RETENU par
 /// l'anti-rebond (mika#2671 phase B) : `after_value = "stage=held"`, texte de
 /// l'événement dans `before_value` pour le rejeu au démarrage
@@ -1568,7 +1654,7 @@ async fn post_verdict_if_turn_did_not_conclude(
     .await;
 }
 
-async fn run_agent_for_message(
+pub(super) async fn run_agent_for_message(
     state: &AppState,
     agent_state: &Arc<AgentState>,
     mut req: MessageRequest,
@@ -1585,7 +1671,14 @@ async fn run_agent_for_message(
     // un 202) ou perdu au redémarrage aurait fait sauter le callback sans que
     // personne ne revoie la nouvelle tête. Les trois chemins qui lancent un
     // tour passent par cette fonction (drain v2, chemin hérité, rejeu #528).
+    //
+    // mika#2671 phase B2 — avant tout cela, une tête qu'une retenue plus
+    // récente a remplacée ne paie pas de tour : aucune session, aucun appel
+    // LLM, aucune ligne de tour démarré (le tour n'a pas eu lieu).
     if req.channel == "github" {
+        if skip_superseded_review_turn(&a.db, &req.text, &req.request_id).await {
+            return;
+        }
         record_pr_sync_observed(&a.db, &req.text, &req.request_id).await;
     }
 
@@ -2795,5 +2888,68 @@ mod tests {
                 assert_eq!(d, BuildCallbackHead::Current);
             }
         }
+    }
+
+    // ---- mika#2671 phase B2 — tête courante au tour de revue ---------------
+
+    async fn mika2671_b2_superseded_rows(db: &crate::async_db::AsyncDatabase) -> i64 {
+        db.count_audit_events_by_tool_name(
+            crate::qa_head_supersession::REVIEW_HEAD_SUPERSEDED_EVENT,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// AC2 — A retenu, puis B retenu : le tour d'A est sauté, une ligne
+    /// nommée est écrite, et AUCUNE ligne de tour démarré n'existe pour A.
+    /// Contrôle négatif dans le même test : le tour de B n'est pas sauté.
+    #[tokio::test]
+    async fn mika2671_b2_une_tete_remplacee_ne_paie_pas_de_tour() {
+        let db = mika2671_db();
+        assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await);
+        assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await);
+
+        assert!(skip_superseded_review_turn(&db, SYNC_2659, "A").await);
+        assert_eq!(mika2671_b2_superseded_rows(&db).await, 1);
+        assert!(!skip_superseded_review_turn(&db, SYNC_2659, "B").await);
+        assert_eq!(mika2671_b2_superseded_rows(&db).await, 1);
+
+        // La retenue de B reste pendante : la dernière tête sera revue (AC4).
+        assert_eq!(
+            mika2671_pending(&db).await,
+            vec!["request_id=B".to_string()]
+        );
+    }
+
+    /// Une retenue sur une AUTRE PR ne rend pas la tête périmée.
+    #[tokio::test]
+    async fn mika2671_b2_une_autre_pr_ne_compte_pas() {
+        let db = mika2671_db();
+        let sync_2660 = SYNC_2659
+            .replace("#2659", "#2660")
+            .replace("/2659", "/2660");
+        assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await);
+        assert!(record_pr_sync_held(&db, "pr:senara-solutions/mika#2660", &sync_2660, "B").await);
+        assert!(!skip_superseded_review_turn(&db, SYNC_2659, "A").await);
+        assert_eq!(mika2671_b2_superseded_rows(&db).await, 0);
+    }
+
+    /// Sans retenue à soi (anti-rebond désarmé, chemin hérité), une retenue
+    /// d'une autre requête ne suffit pas : le tour tourne.
+    #[tokio::test]
+    async fn mika2671_b2_sans_retenue_a_soi_le_tour_tourne() {
+        let db = mika2671_db();
+        assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "B").await);
+        assert!(!skip_superseded_review_turn(&db, SYNC_2659, "A").await);
+    }
+
+    /// Un tour démarré d'une autre identité n'est pas une retenue : il ne rend
+    /// pas la tête d'A périmée (seule une retenue est durable).
+    #[tokio::test]
+    async fn mika2671_b2_un_tour_demarre_nest_pas_une_retenue() {
+        let db = mika2671_db();
+        assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await);
+        record_pr_sync_observed(&db, SYNC_2659, "Z").await;
+        assert!(!skip_superseded_review_turn(&db, SYNC_2659, "A").await);
     }
 }

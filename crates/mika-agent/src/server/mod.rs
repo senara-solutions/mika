@@ -5445,4 +5445,108 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
+
+    /// Un état d'agent dont le LLM compte ses appels. Assez de réponses EndTurn
+    /// pour qu'un tour qui tourne n'épuise jamais le bouchon (gardes de
+    /// re-prompt comprises).
+    fn mika2671_b2_state() -> (AppState, Arc<mika_common::llm::mock::MockLlmProvider>) {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses((0..8).map(|_| text_response("Revue faite.")).collect())
+                .build(),
+        );
+        let state = test_state();
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .llm = mock.clone();
+        }
+        (state, mock)
+    }
+
+    async fn mika2671_b2_run(state: &AppState, rid: &str) {
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        let lock = agent_state.agent_lock.clone().lock_owned().await;
+        let req = super::types::MessageRequest {
+            text: MIKA2671_SYNC.to_string(),
+            chat_id: None,
+            channel: "github".to_string(),
+            request_id: rid.to_string(),
+            agent: "mika".to_string(),
+            images: None,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            handlers::run_agent_for_message(state, &agent_state, req, Vec::new(), lock),
+        )
+        .await
+        .expect("le tour doit se terminer");
+    }
+
+    async fn mika2671_b2_started_rows(state: &AppState, rid: &str) -> usize {
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        agent_state
+            .db
+            .get_audit_event_rows_by_tool_name(crate::qa_head_supersession::SYNC_OBSERVED_TOOL)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, after, reasoning)| {
+                after.is_none() && reasoning.as_deref() == Some(&format!("request_id={rid}"))
+            })
+            .count()
+    }
+
+    async fn mika2671_b2_hold(state: &AppState, rid: &str) {
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        agent_state
+            .db
+            .log_audit_event(
+                "system",
+                crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+                "pr:senara-solutions/mika#2659",
+                Some(MIKA2671_SYNC),
+                Some(sync_debounce::HELD_STAGE),
+                Some(&sync_debounce::request_marker(rid)),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// AC2 de bout en bout — A retenu, puis B retenu : le tour d'A ne paie
+    /// AUCUN appel LLM et n'écrit aucune ligne de tour démarré.
+    #[tokio::test]
+    async fn mika2671_b2_tete_perimee_aucun_appel_llm() {
+        let (state, mock) = mika2671_b2_state();
+        mika2671_b2_hold(&state, "A").await;
+        mika2671_b2_hold(&state, "B").await;
+
+        mika2671_b2_run(&state, "A").await;
+
+        assert_eq!(
+            mock.calls_made(),
+            0,
+            "aucun appel LLM sur une tête remplacée"
+        );
+        assert_eq!(mika2671_b2_started_rows(&state, "A").await, 0);
+    }
+
+    /// AC2 contrôle négatif — tête courante (B, la dernière retenue) : le tour
+    /// tourne comme avant, et sa ligne de tour démarré est écrite.
+    #[tokio::test]
+    async fn mika2671_b2_tete_courante_comportement_inchange() {
+        let (state, mock) = mika2671_b2_state();
+        mika2671_b2_hold(&state, "A").await;
+        mika2671_b2_hold(&state, "B").await;
+
+        mika2671_b2_run(&state, "B").await;
+
+        assert!(mock.calls_made() >= 1, "le tour de revue doit tourner");
+        assert_eq!(mika2671_b2_started_rows(&state, "B").await, 1);
+    }
 }

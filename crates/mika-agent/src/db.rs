@@ -1950,6 +1950,42 @@ impl Database {
             .collect())
     }
 
+    /// Is a retention of `identity` superseded by a later retention of another
+    /// event on the same `target_key`? (mika#2671 phase B2.) Returns
+    /// `(own_id, newer)`: `own_id` is the `id` of the latest retention carrying
+    /// `identity` (`None` when the event was never held — no witness), `newer`
+    /// the count of retentions of the key with a greater `id` and a different
+    /// `reasoning`. `own_id = None` ⇒ `newer = 0`.
+    ///
+    /// Same registry, same key, same marker as [`Self::list_pending_audit_holds`]:
+    /// this is a second *question* on the one registry, not a second registry.
+    /// "Later" is by `id`, never by `created_at` (same-second ties).
+    pub fn newer_audit_holds(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        held_value: &str,
+        target_key: &str,
+        identity: &str,
+        since: &str,
+    ) -> Result<(Option<i64>, i64)> {
+        let row = self.conn.query_row(
+            "WITH own AS (
+               SELECT MAX(id) AS id FROM audit_events
+                WHERE agent_id = ?1 AND tool_name = ?2 AND after_value = ?3
+                  AND target_key = ?4 AND reasoning = ?5 AND created_at > ?6)
+             SELECT own.id,
+                    (SELECT COUNT(*) FROM audit_events b
+                      WHERE b.agent_id = ?1 AND b.tool_name = ?2 AND b.after_value = ?3
+                        AND b.target_key = ?4 AND b.id > own.id
+                        AND b.reasoning IS NOT ?5)
+               FROM own",
+            params![agent_id, tool_name, held_value, target_key, identity, since],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(row)
+    }
+
     /// Count audit_events matching (agent_id, tool_name, after_value) with
     /// `created_at > since` — **across every `target_key`** (mika#2634 U4).
     ///
