@@ -2988,6 +2988,78 @@ async fn fetch_pr_wip_rescue_view(
     parse_pr_wip_rescue_view(&output.content)
 }
 
+/// Refuse qu'un `gh pr review` portant un verdict ou une approbation parte
+/// sous l'identité dispatcher (mika#2667 AC1).
+///
+/// Même famille que mika#2237 et mika#2573 : prédicat pur dans
+/// `evidence::guards`, application ici, avant tout appel réseau. Corps de
+/// refus sobre : il nomme la règle sans donner de gabarit de contournement.
+/// Un `--comment` sans ligne `VERDICT:` reste permis, et l'agent de revue
+/// n'est pas concerné.
+async fn validate_dispatcher_not_reviewer(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    use crate::evidence::guards::{
+        DISPATCHER_REVIEW_REFUSED_AUDIT_TOOL, detect_review_verdict_act,
+    };
+
+    // Fail-open hors population : un argv qui n'est pas un acte de relecteur
+    // n'est pas l'affaire de cette garde.
+    let Some(act) = detect_review_verdict_act(args) else {
+        return Ok(());
+    };
+    // Le terme d'identité est dans le prédicat, jamais une branche de
+    // l'appelant : « l'agent de revue n'est pas touché » est une propriété de
+    // cette fonction, avec son propre test.
+    let agent_id = ctx.db.agent_id();
+    if !mika_common::forge_identity::is_dispatcher_agent(agent_id) {
+        return Ok(());
+    }
+
+    let target =
+        crate::evidence::guards::pr_review_target(args).unwrap_or_else(|| "unknown".into());
+    let target_key = format!("pr_review:{}#{}", repo.unwrap_or("__default__"), target);
+    tracing::warn!(
+        event = "dispatcher_review_refused",
+        agent_id = %agent_id,
+        session_id = %ctx.session_id,
+        trace_id = %ctx.trace_id,
+        target = %target_key,
+        motif = act.motif(),
+        "refused a review verdict posted by the dispatcher identity (mika#2667)"
+    );
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            DISPATCHER_REVIEW_REFUSED_AUDIT_TOOL,
+            &target_key,
+            None,
+            Some(act.motif()),
+            Some("the dispatcher identity never reviews"),
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(
+            event = "dispatcher_review_refused_audit_failed",
+            error = %e,
+            "the WARN landed but its audit row did not"
+        );
+    }
+
+    let payload = serde_json::json!({
+        "error": "dispatcher_cannot_review",
+        "rule": "mika#2667",
+        "reason": "The dispatcher identity never posts a review verdict or a review \
+                   approval: review belongs to the reviewer identity. This call was \
+                   refused before reaching GitHub.",
+    });
+    Err(ToolOutput::error(payload.to_string()))
+}
+
 /// Refuse, sur un tour **Webhook Fallthrough**, les verbes `run_gh` qui créent
 /// du travail (mika#2573).
 ///
@@ -4764,6 +4836,15 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // Skill-scoped scope check (mika#1196): when qa-review is in the active
     // skill set, restrict to the narrow allowlist before any side effects.
     if let Err(err) = validate_qa_review_gh_scope(&gh_args.args, ctx) {
+        return err;
+    }
+
+    // Dispatcher-never-reviews gate (mika#2667 AC1): the dispatcher identity
+    // never posts a review verdict nor a review approval. Pure argv plus the
+    // agent id, so it sits with the most local gates, before any network call.
+    if let Err(err) =
+        validate_dispatcher_not_reviewer(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
         return err;
     }
 
@@ -12991,5 +13072,122 @@ mod tests {
     #[test]
     fn test_parse_pr_wip_rescue_view_malformed_returns_none() {
         assert!(parse_pr_wip_rescue_view("Exit code: 1\nnot found").is_none());
+    }
+}
+
+#[cfg(test)]
+mod mika2667_dispatcher_review_tests {
+    use super::{run_gh, validate_dispatcher_not_reviewer};
+    use crate::evidence::guards::DISPATCHER_REVIEW_REFUSED_AUDIT_TOOL;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    const REPO: &str = "senara-solutions/mika";
+    const TARGET: &str = "pr_review:senara-solutions/mika#12";
+    const SINCE: &str = "1970-01-01T00:00:00Z";
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn refusals(h: &TestHarness) -> i64 {
+        h.db.count_recent_audit_events_for_target(
+            DISPATCHER_REVIEW_REFUSED_AUDIT_TOOL,
+            TARGET,
+            SINCE,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The refusal happens before any subprocess: `run_gh` returns the
+    /// structured error without spawning `gh`.
+    #[tokio::test]
+    async fn the_dispatcher_cannot_approve() {
+        let h = TestHarness::with_agent("mika-dev");
+        let out = run_gh(
+            &serde_json::json!({"command": ["pr", "review", "12", "--approve"], "repo": REPO}),
+            &h.ctx(),
+        )
+        .await;
+        assert!(
+            out.is_error,
+            "an approval by the dispatcher must be refused"
+        );
+        assert!(
+            out.content.contains("dispatcher_cannot_review"),
+            "{}",
+            out.content
+        );
+        assert_eq!(refusals(&h).await, 1, "the refusal leaves one audit row");
+    }
+
+    #[tokio::test]
+    async fn the_dispatcher_cannot_comment_a_verdict() {
+        let h = TestHarness::with_agent("mika-dev");
+        let out = run_gh(
+            &serde_json::json!({
+                "command": ["pr", "review", "12", "--comment", "--body", "Build OK.\nVERDICT: pass"],
+                "repo": REPO,
+            }),
+            &h.ctx(),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("dispatcher_cannot_review"),
+            "{}",
+            out.content
+        );
+        // The refusal names the rule and gives no workaround template.
+        assert!(!out.content.contains("--approve"), "{}", out.content);
+        assert!(!out.content.contains("VERDICT"), "{}", out.content);
+    }
+
+    /// Negative control: a plain comment by the dispatcher is not this guard's
+    /// business.
+    #[tokio::test]
+    async fn a_plain_comment_by_the_dispatcher_is_allowed() {
+        let h = TestHarness::with_agent("mika-dev");
+        let args = argv(&[
+            "pr",
+            "review",
+            "12",
+            "--comment",
+            "--body",
+            "Rebased on main.",
+        ]);
+        assert!(
+            validate_dispatcher_not_reviewer(&args, Some(REPO), &h.ctx())
+                .await
+                .is_ok()
+        );
+        assert_eq!(refusals(&h).await, 0);
+    }
+
+    /// Negative control: the reviewer agent is not touched, on any of the
+    /// three shapes the dispatcher is refused.
+    #[tokio::test]
+    async fn the_reviewer_agent_is_not_touched() {
+        let h = TestHarness::with_agent("mika-qa");
+        for args in [
+            argv(&["pr", "review", "12", "--approve", "--body", "VERDICT: pass"]),
+            argv(&[
+                "pr",
+                "review",
+                "12",
+                "--comment",
+                "--body",
+                "VERDICT: block[ac]",
+            ]),
+            argv(&["pr", "review", "12", "--comment", "--body-file", "b.md"]),
+        ] {
+            assert!(
+                validate_dispatcher_not_reviewer(&args, Some(REPO), &h.ctx())
+                    .await
+                    .is_ok(),
+                "{args:?}"
+            );
+        }
+        assert_eq!(refusals(&h).await, 0);
     }
 }

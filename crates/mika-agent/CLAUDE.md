@@ -1175,6 +1175,34 @@ signal that would show it.
 
 `server::verdict_handler` — intercepts `pull_request_review.submitted` webhook events **before** the LLM turn in `handle_message`. Parses `VERDICT:` line from the review body (authoritative regardless of GH `review.state`). Full dispatch table: `pass` (state=approved only) → merge via `run_gh_checks` + `run_gh_merge`; `block[ac]` → dispatch claude-pilot with AC-fix prompt, bounded retry counter (max 3), escalate on limit; `block[ci]` → dispatch claude-pilot with CI-fix prompt, bounded retry counter (max 3), escalate on limit; `block[security]`/`block[pipeline]` → mark task blocked, notify operator, NO auto-dispatch; `hold[review]` → notify operator, leave task in_progress; missing/unparseable → safe-default hold[review] semantics + `verdict_classification_failed` structured log event. AC extraction from qa-review's `[❌] unsatisfied:` lines with 2000-char fallback. Pre-digests for all verdict classes avoid completion-claim guard trigger words. Shared helpers: `find_task_for_verdict` (task lookup + in_progress gate), `has_active_callback_child` (in-flight guard), `send_notification`, `truncate_body` (UTF-8 safe). Parser in `server::verdict` depends on gateway's `format_event_text()` output format. 60s timeout on subprocess calls. See #524, #889.
 
+### The dispatcher identity never reviews (mika#2667)
+
+The role separation at the merge gate (mika#2218, mika#2248) was held by the
+prompt on the **write** side and checked nowhere on the **read** side. Three
+gates now hold it, each with its own surface:
+
+| side | site | rule | surface |
+|---|---|---|---|
+| write | `run_gh` → `validate_dispatcher_not_reviewer` (predicate `evidence::guards::detect_review_verdict_act`) | the dispatcher agent cannot post `gh pr review --approve`/`-a`, a body carrying a `VERDICT:` line (read by `verdict::verdict_raw_value`), or a body from `--body-file`/`-F` | `dispatcher_review_refused` (WARN + audit, motif in `after_value`) |
+| read | `verdict_handler`, `pass` arm, before `handle_pass_verdict` | the merge path is reached only when the review author satisfies `forge_identity::is_reviewer_forge_login` | `verdict_pass_from_non_reviewer` (WARN + audit) |
+| read | `ci_success_handler::select_pass_verdict` | a `pass` authored by any other login is never selected, so no merge-ready signal is emitted from it | — (the PR simply reads as having no pass verdict) |
+
+**One reader of the reviewer login**, `mika_common::forge_identity::is_reviewer_forge_login`,
+used by both halves of the merge path — never a copied literal.
+
+**A `hold[review]` with no active task creates no work (AC2).** The passthrough
+opens with `verdict_handler::HOLD_REVIEW_NO_TASK_MARKER`, notifies the operator
+and writes `verdict_hold_review_no_task`. `webhook_dispatch::is_hold_review_without_task_turn`
+is the single reader of that marker; `effective_disabled_tools` withholds
+`create_task` on that turn and `validate_dispatch_readiness` refuses every
+long-running dispatch with `hold_review_without_task_no_dispatch`. The message
+starts with `[verdict_handler]`, so it stays outside the Webhook Fallthrough
+domain and none of the mika#2517 consumers move.
+
+**Test fixtures use the real reviewer login.** An approved `pass` in a test must
+be authored by `mika-platform-qa`; `mika-qa` is an agent name, never a GitHub
+login, and is refused by the read side like any other author.
+
 ### Structural CI Success Handler
 
 `server::ci_success_handler` — intercepts `check_suite.completed(success)` webhook events **before** the LLM turn. Companion to `verdict_handler`: re-evaluates merge eligibility for PRs that have a pending `VERDICT: pass` but were blocked on CI at approval time. Queries GitHub API for open PR, QA pass review, stale-SHA gate (`review.commit_id == pr.head.sha`), and CI aggregation via `run_gh_checks` + `classify_checks`. Reuses `VerdictAction` return type and `pr_merge_with_gate` helpers. Order-independent with `verdict_handler` — each handler self-selects on event type. 60s timeout on subprocess calls. See #571.

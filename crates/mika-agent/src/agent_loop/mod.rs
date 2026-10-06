@@ -8504,7 +8504,11 @@ fn effective_disabled_tools<'a>(
     identity_disabled: &'a [String],
     user_message: &str,
 ) -> std::borrow::Cow<'a, [String]> {
-    if !crate::webhook_dispatch::is_webhook_fallthrough_domain(user_message) {
+    // mika#2667 AC2 — a `hold[review]` handed back with no active task is the
+    // same acknowledge-and-stop turn: it withholds the same tool.
+    if !crate::webhook_dispatch::is_webhook_fallthrough_domain(user_message)
+        && !crate::webhook_dispatch::is_hold_review_without_task_turn(user_message)
+    {
         return std::borrow::Cow::Borrowed(identity_disabled);
     }
     let mut widened = identity_disabled.to_vec();
@@ -16090,6 +16094,39 @@ mod tests {
             on_domain.iter().any(|t| t == "create_task"),
             "a fallthrough turn must not be handed create_task (mika#2517 AC1)"
         );
+    }
+
+    /// mika#2667 AC2 — the `hold[review]` turn handed back with no active task
+    /// withholds `create_task`; a `block[ac]` handed to the LLM does not.
+    #[test]
+    fn mika2667_a_hold_review_without_task_withholds_create_task() {
+        let identity: Vec<String> = Vec::new();
+        let held = format!(
+            "{} on https://github.com/senara-solutions/mika/pull/12. …\n\n\
+             [GitHub] PR review (commented) on senara-solutions/mika#12 (t) by @mika-platform-qa",
+            crate::server::verdict_handler::HOLD_REVIEW_NO_TASK_MARKER
+        );
+        assert!(
+            effective_disabled_tools(&identity, &held)
+                .iter()
+                .any(|t| t == "create_task")
+        );
+
+        // Negative control: the `block[ac]` passthrough and the raw PR review
+        // event keep the nominal, untouched slice.
+        for msg in [
+            "[verdict_handler] VERDICT: block[ac] on https://github.com/senara-solutions/mika/pull/12 \
+             but no active in_progress task found. Passing through to LLM.",
+            "[GitHub] PR review (commented) on senara-solutions/mika#12 (t) by @mika-platform-qa",
+        ] {
+            assert!(
+                matches!(
+                    effective_disabled_tools(&identity, msg),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{msg}"
+            );
+        }
     }
 
     /// The widening is idempotent: an identity that already denies the tool
