@@ -159,6 +159,19 @@ pub fn forge_login_for_agent(agent_id: &str) -> Option<&'static str> {
     }
 }
 
+/// Vrai quand `login` est le login de forge de l'identité de revue (mika#2667).
+///
+/// Lecteur unique du côté **lecture** de la séparation des rôles : la porte de
+/// merge ne reconnaît un verdict que s'il vient de [`REVIEWER_FORGE_LOGIN`].
+/// La comparaison tolère ce que les surfaces transportent réellement — bords
+/// rognés, `@` de tête, casse, suffixe `[bot]` — et rien d'autre. Un login vide
+/// n'est jamais le relecteur.
+pub fn is_reviewer_forge_login(login: &str) -> bool {
+    let trimmed = login.trim().trim_start_matches('@').to_ascii_lowercase();
+    let bare = trimmed.strip_suffix("[bot]").unwrap_or(&trimmed).trim();
+    !bare.is_empty() && bare == REVIEWER_FORGE_LOGIN
+}
+
 /// Vrai quand laisser `actor_agent_id` merger écrirait `mergedBy` avec le login
 /// qui a posé la revue — exactement la forme mesurée sur mika#2244.
 ///
@@ -623,6 +636,31 @@ mod tests {
         // rendrait toujours `true` passerait le test ci-dessus.
         assert!(!would_merge_as_reviewer("mika-dev", "mika-platform-qa"));
         assert!(!would_merge_as_reviewer("mika-qa", "samidarko"));
+    }
+
+    #[test]
+    fn mika2667_seul_le_login_de_revue_est_reconnu() {
+        for login in [
+            "mika-platform-qa",
+            "@Mika-Platform-QA",
+            " mika-platform-qa[bot] ",
+        ] {
+            assert!(is_reviewer_forge_login(login), "`{login}` est le relecteur");
+        }
+        // Contrôle négatif dans le même souffle : le dispatcher, le nom d'agent
+        // (pas un login de forge), un voisin lexical, le vide.
+        for login in [
+            DISPATCHER_FORGE_LOGIN,
+            "mika-qa",
+            "mika-platform-qa-2",
+            "",
+            "[bot]",
+        ] {
+            assert!(
+                !is_reviewer_forge_login(login),
+                "`{login}` n'est pas le relecteur"
+            );
+        }
     }
 
     #[test]

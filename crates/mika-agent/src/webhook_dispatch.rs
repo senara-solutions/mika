@@ -118,6 +118,18 @@ pub(crate) fn is_webhook_fallthrough_domain(msg: &str) -> bool {
     true
 }
 
+/// True when `msg` is the turn `verdict_handler` hands to the LLM for a
+/// `hold[review]` with no active task (mika#2667 AC2).
+///
+/// Single reader of the marker that handler writes. Two consumers, both
+/// existing gates: `effective_disabled_tools` withholds `create_task`, and
+/// `validate_dispatch_readiness` refuses every long-running dispatch. The
+/// message starts with `[verdict_handler]`, so it never enters the Webhook
+/// Fallthrough domain: none of the mika#2517 consumers move.
+pub(crate) fn is_hold_review_without_task_turn(msg: &str) -> bool {
+    msg.starts_with(crate::server::verdict_handler::HOLD_REVIEW_NO_TASK_MARKER)
+}
+
 /// The event class of a Webhook Fallthrough turn, as a **wire format**
 /// (mika#2517 U4).
 ///

@@ -2689,6 +2689,23 @@ pub(crate) async fn validate_dispatch_readiness(
         return Err(rejection.to_string());
     }
 
+    // mika#2667 AC2 — a `hold[review]` handed back with no active task creates
+    // no work on that turn. Pure string handling, sits with the other message
+    // guards ahead of the task fetch. Covers every long-running dispatch,
+    // `run_claude_pilot` and `run_claude_pilot_groom` alike.
+    if let Some(msg) = originating_message
+        && crate::webhook_dispatch::is_hold_review_without_task_turn(msg)
+    {
+        let rejection = serde_json::json!({
+            "error": "hold_review_without_task_no_dispatch",
+            "task_id": task_id,
+            "reason": "This turn hands a hold[review] back to the operator: no active task \
+                       matches the PR, so no dispatch is started on this turn (mika#2667).",
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
     // mika#2484 — Tool-boundary gate for an explicit grooming intent.
     //
     // Pure string handling on `originating_message` and on the tool input, no

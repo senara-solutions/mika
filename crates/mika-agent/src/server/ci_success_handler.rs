@@ -804,8 +804,19 @@ async fn find_pass_verdict(
     let reviews: Vec<serde_json::Value> = serde_json::from_str(trimmed)
         .map_err(|e| format!("Failed to parse reviews API output: {e}"))?;
 
-    // Find the most recent APPROVED review with "VERDICT: pass" in body.
-    // Iterate in reverse to find the latest qualifying review.
+    Ok(select_pass_verdict(&reviews))
+}
+
+/// The most recent APPROVED review whose body carries `VERDICT: pass` **and
+/// whose author is the reviewer identity** (mika#2667 AC3).
+///
+/// Pure, so the read-side rule is testable without a network call. A `pass`
+/// posted by any other login — the dispatcher identity included — is not a
+/// verdict the merge path may consume: it is skipped, never selected, and an
+/// older reviewer verdict still wins over a newer non-reviewer one. The login
+/// is read by `forge_identity::is_reviewer_forge_login`, the same single reader
+/// `verdict_handler` uses, so the two halves of the merge path agree.
+fn select_pass_verdict(reviews: &[serde_json::Value]) -> Option<PassVerdictReview> {
     for review in reviews.iter().rev() {
         let state = review["state"].as_str().unwrap_or("");
         if state != "APPROVED" {
@@ -819,19 +830,21 @@ async fn find_pass_verdict(
             continue;
         }
 
-        let reviewer = review["user"]["login"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let Some(reviewer) = review["user"]["login"].as_str() else {
+            continue;
+        };
+        if !mika_common::forge_identity::is_reviewer_forge_login(reviewer) {
+            continue;
+        }
         let commit_id = review["commit_id"].as_str().unwrap_or("").to_string();
 
-        return Ok(Some(PassVerdictReview {
-            reviewer,
+        return Some(PassVerdictReview {
+            reviewer: reviewer.to_string(),
             commit_id,
-        }));
+        });
     }
 
-    Ok(None)
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,5 +1389,49 @@ mod tests {
             .unwrap();
         assert_eq!(count_other, 0);
         assert!(!is_duplicate_processed(count_other));
+    }
+}
+
+#[cfg(test)]
+mod mika2667_tests {
+    use super::select_pass_verdict;
+    use serde_json::json;
+
+    fn review(login: &str, state: &str, body: &str, commit: &str) -> serde_json::Value {
+        json!({"user": {"login": login}, "state": state, "body": body, "commit_id": commit})
+    }
+
+    /// The `check_suite` half of the merge path honours the same read-side
+    /// rule as `verdict_handler`: an approved `pass` from the dispatcher
+    /// identity is never selected.
+    #[test]
+    fn a_pass_from_the_dispatcher_identity_is_never_selected() {
+        let reviews = vec![review(
+            "mika-platform-dev",
+            "APPROVED",
+            "VERDICT: pass",
+            "abc",
+        )];
+        assert!(select_pass_verdict(&reviews).is_none());
+    }
+
+    /// Positive control, and ordering: the reviewer's own verdict is selected,
+    /// even when a newer non-reviewer `pass` sits after it.
+    #[test]
+    fn the_reviewer_verdict_is_selected_over_a_newer_non_reviewer_one() {
+        let reviews = vec![
+            review("mika-platform-qa", "APPROVED", "VERDICT: pass", "old"),
+            review("mika-platform-dev", "APPROVED", "VERDICT: pass", "new"),
+        ];
+        let selected = select_pass_verdict(&reviews).expect("the reviewer verdict");
+        assert_eq!(selected.reviewer, "mika-platform-qa");
+        assert_eq!(selected.commit_id, "old");
+    }
+
+    /// A review with no readable author is not a reviewer verdict.
+    #[test]
+    fn a_review_with_no_author_is_not_selected() {
+        let reviews = vec![json!({"state": "APPROVED", "body": "VERDICT: pass", "commit_id": "x"})];
+        assert!(select_pass_verdict(&reviews).is_none());
     }
 }

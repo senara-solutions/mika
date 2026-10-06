@@ -900,7 +900,7 @@ async fn verdict_pass_approved_with_task_no_token_passthrough() -> Result<()> {
         "approved",
         "senara-solutions/mika",
         42,
-        "mika-qa",
+        "mika-platform-qa",
         "VERDICT: pass\n\nAll good.",
     );
 
@@ -1110,7 +1110,7 @@ async fn verdict_pass_no_task_perimeter_fail_closed_holds_for_operator() -> Resu
         "approved",
         "senara-solutions/mika",
         999,
-        "mika-qa",
+        "mika-platform-qa",
         "VERDICT: pass\n\nAll good.",
     );
 
@@ -1196,7 +1196,7 @@ async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() 
         "approved",
         "senara-solutions/mika",
         999,
-        "mika-qa",
+        "mika-platform-qa",
         "VERDICT: pass\n\nAll good.",
     );
 
@@ -1282,7 +1282,7 @@ async fn verdict_pass_pending_task_perimeter_fail_closed_holds_for_operator() ->
         "approved",
         "senara-solutions/mika",
         50,
-        "mika-qa",
+        "mika-platform-qa",
         "VERDICT: pass\n\nAll good.",
     );
 
@@ -1333,7 +1333,7 @@ async fn verdict_pass_no_github_token_passes_through() -> Result<()> {
         "approved",
         "senara-solutions/mika",
         42,
-        "mika-qa",
+        "mika-platform-qa",
         "VERDICT: pass\n\nAll good.",
     );
 
@@ -1537,7 +1537,7 @@ async fn verdict_pass_milestone_manager_pr_holds_for_operator() -> Result<()> {
         "approved",
         "senara-solutions/mika",
         1947,
-        "mika-qa",
+        "mika-platform-qa",
         "VERDICT: pass\n\nAll good.",
     );
 
