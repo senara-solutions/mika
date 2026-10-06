@@ -81,13 +81,18 @@ aujourd'hui.
 
 ## Mécanisme
 
-### 1. Le registre : une ligne d'audit par `synchronize` reçu
+### 1. Le registre : une ligne d'audit par tour de revue démarré sur un `synchronize`
 
-Dans `server::handlers::handle_message`, **avant** la bifurcation file v2 /
-chemin hérité (pour couvrir les deux), si `classify_event(text)` rend
-`PullRequestSync { repo, pr }` : `log_audit_event(tool_name =
-"qa_pr_sync_observed", target_key = "pr:{repo}#{pr}")`. Best-effort : un échec
-d'écriture est journalisé et n'arrête pas l'ingestion (fail-safe : pas de ligne
+Dans `server::handlers::run_agent_for_message` — point de passage des trois
+chemins qui lancent un tour (drain v2, chemin hérité, rejeu #528) — si le canal
+est `github` et que `classify_event(text)` rend `PullRequestSync { repo, pr }` : `log_audit_event(tool_name =
+"qa_pr_sync_observed", target_key = "pr:{repo}#{pr}")`. **Révisé en revue de code** : la
+première version écrivait à la réception, dans `handle_message` ; trois
+relecteurs ont montré qu'un `synchronize` évincé par la file bornée
+(drop-oldest après un 202) ou perdu au redémarrage aurait alors fait sauter le
+callback sans revue de la nouvelle tête. Écrit au démarrage du tour, le
+registre atteste que la revue suivante a commencé. Best-effort : un échec
+d'écriture est journalisé et n'arrête pas le tour (fail-safe : pas de ligne
 ⇒ pas de supersession ⇒ le tour tourne).
 
 Pas de nouvelle table, pas de migration : la lecture passe par

@@ -200,11 +200,6 @@ pub async fn handle_message(
         }
     };
 
-    // mika#2671 — registre des `synchronize` reçus, AVANT les trois chemins
-    // (report #528, file v2, chemin hérité) : un `synchronize` reçu est un fait,
-    // quel que soit le chemin qui le traitera ensuite.
-    record_pr_sync_observed(&agent_state.db, &req.text).await;
-
     // Webhook deferral check (#528): if this is a GitHub webhook targeting a task
     // with an in-flight callback, queue it instead of processing immediately.
     if req.channel == "github"
@@ -905,8 +900,9 @@ async fn replay_deferred_webhooks(
     }
 }
 
-/// Inscrit un `pull_request.synchronize` reçu au registre que lit la garde de
-/// callback de build périmé (mika#2671, `crate::qa_head_supersession`).
+/// Inscrit au registre que lit la garde de callback de build périmé (mika#2671,
+/// `crate::qa_head_supersession`) un `pull_request.synchronize` dont le tour de
+/// revue DÉMARRE. Appelée uniquement depuis `run_agent_for_message`.
 ///
 /// **SOLE WRITER** de `qa_pr_sync_observed`. Délibérément distinct des lignes
 /// `webhook_queue_*` : celles-ci sont bridées à une par seconde et par action
@@ -931,7 +927,7 @@ async fn record_pr_sync_observed(db: &crate::async_db::AsyncDatabase, text: &str
             &key,
             None,
             None,
-            Some("pull_request.synchronize reçu (mika#2671)"),
+            Some("tour de revue démarré sur un pull_request.synchronize (mika#2671)"),
             None,
         )
         .await
@@ -1326,6 +1322,17 @@ async fn run_agent_for_message(
 ) {
     let _lock = lock; // Hold lock for duration of agent loop
     let a = agent_state;
+
+    // mika#2671 — le registre des `synchronize` est écrit ICI, au démarrage du
+    // tour, et jamais à la réception : la garde de build périmé ne saute un
+    // callback que si la revue de la tête suivante a COMMENCÉ. Écrit à la
+    // réception, un `synchronize` évincé par la file bornée (drop-oldest, après
+    // un 202) ou perdu au redémarrage aurait fait sauter le callback sans que
+    // personne ne revoie la nouvelle tête. Les trois chemins qui lancent un
+    // tour passent par cette fonction (drain v2, chemin hérité, rejeu #528).
+    if req.channel == "github" {
+        record_pr_sync_observed(&a.db, &req.text).await;
+    }
 
     // Hot-reload skills if the dirty flag was set by a previous turn
     let skills = if a.skills_dirty.load(Ordering::Acquire) {

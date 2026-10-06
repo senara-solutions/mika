@@ -11,23 +11,30 @@
 //! que GitHub avait remplacée huit minutes plus tôt. Sur l'épisode entier
 //! (trois `synchronize` en douze minutes), ≈ 4,5 M de tokens d'entrée.
 //!
-//! # « Périmé » veut dire : un `synchronize` plus récent a été REÇU
+//! # « Périmé » veut dire : la revue d'une tête plus récente a COMMENCÉ
 //!
 //! Pas « la tête GitHub a bougé ». La différence est ce qui empêche ce module de
 //! perdre des revues. Le gateway supprime les `synchronize` sans changement de
 //! fichiers (garde no-diff, #886 — un amend de trailer) : avec la vérité GitHub,
 //! une tête déplacée par un amend rendrait le build « périmé », le callback serait
 //! sauté, et **aucun autre événement** ne déclencherait la revue de la nouvelle
-//! tête. Ici, on ne saute un tour que si l'événement qui déclenchera la revue de
-//! la tête suivante **a déjà été reçu** : « la dernière tête est toujours revue »
-//! (AC4) tient par construction. Corollaire : aucun appel GitHub, ni en
+//! tête. Ici, on ne saute un tour que si **le tour de revue de la tête suivante a
+//! déjà démarré** : « la dernière tête est toujours revue » (AC4) tient par
+//! construction.
+//!
+//! « Reçu » ne suffit pas, et c'est une correction de revue (trois relecteurs
+//! indépendants) : la file webhook v2 est en mémoire, bornée, et son
+//! drop-oldest évince un événement déjà acquitté 202 ; un redémarrage la vide.
+//! Un `synchronize` inscrit à la réception puis perdu aurait fait sauter le
+//! callback sans que personne ne revoie la nouvelle tête, et le scan de
+//! réconciliation (mika#2334) ne repasse pas sur une PR qui a déjà une revue. Corollaire : aucun appel GitHub, ni en
 //! production ni à bouchonner en test.
 //!
 //! # Le registre
 //!
-//! Une ligne `audit_events` par `synchronize` reçu, écrite par
-//! `server::handlers::handle_message` **avant** la bifurcation file / chemin
-//! hérité : `tool_name = "qa_pr_sync_observed"`, `target_key = "pr:{repo}#{pr}"`.
+//! Une ligne `audit_events` par tour de revue démarré sur un `synchronize`,
+//! écrite par `server::handlers::run_agent_for_message` — le point de passage
+//! des trois chemins qui lancent un tour (drain v2, chemin hérité, rejeu #528) : `tool_name = "qa_pr_sync_observed"`, `target_key = "pr:{repo}#{pr}"`.
 //! Pas de table, pas de migration : la lecture passe par
 //! `count_recent_audit_events_for_target`, et le registre est **par agent** — les
 //! `synchronize` ne sont routés qu'à mika-qa, donc un build de mika-dev ne peut
@@ -37,7 +44,8 @@
 //!
 //! Garde désarmée, cible PR illisible, registre illisible : le tour tourne, comme
 //! avant ce module. La seule issue qui saute un tour est une observation
-//! **positive** d'un `synchronize` postérieur au lancement du build.
+//! **positive** d'un tour de revue démarré, sur la même PR, après le lancement
+//! du build. Une égalité à la seconde se lit « non périmé ».
 
 use crate::server::deadline_verdict::PrTarget;
 
@@ -276,5 +284,130 @@ mod tests {
         for off in ["0", "false", "OFF", " no "] {
             assert!(!parse_stale_build_guard(Some(off)), "{off}");
         }
+    }
+
+    // ---- gardes structurelles ---------------------------------------------
+
+    /// Les fichiers de production de `src/`, coupés au module de test de tête
+    /// de colonne (`\n#[cfg(test)]\nmod tests`) — l'ancre de colonne zéro
+    /// évite de couper sur un `#[cfg(test)]` indenté au milieu d'un fichier.
+    fn production_files() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        walk(&root, &mut paths);
+        paths
+            .into_iter()
+            .filter(|p| !crate::source_scan::is_test_source_path(p))
+            .map(|p| {
+                let src = std::fs::read_to_string(&p).unwrap();
+                let prod = match src.find("\n#[cfg(test)]\nmod tests") {
+                    Some(i) => src[..i].to_string(),
+                    None => src,
+                };
+                let rel = p
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, prod)
+            })
+            .collect()
+    }
+
+    /// Fichiers de production où `needle` apparaît dans un appel
+    /// `log_audit_event(` (fenêtre de 4 lignes après l'ouverture de l'appel).
+    fn audit_writers(needle: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, prod) in production_files() {
+            let lines: Vec<&str> = prod.lines().collect();
+            let writes = lines.iter().enumerate().any(|(i, l)| {
+                l.contains("log_audit_event(")
+                    && lines[i..(i + 5).min(lines.len())]
+                        .iter()
+                        .any(|w| w.contains(needle))
+            });
+            if writes {
+                out.push(rel);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// SOLE WRITER — chaque nom d'audit de ce module a un seul site
+    /// d'écriture en production. Un second écrivain ne rendrait aucune décision
+    /// fausse ; il rendrait le registre, ou le compte des tours sautés, inexact
+    /// en silence — invisible à un test comportemental. Quand ce test tire,
+    /// retirer le second site ; ne pas l'autoriser.
+    #[test]
+    fn mika2671_les_noms_daudit_ont_un_seul_ecrivain() {
+        assert_eq!(
+            audit_writers("SYNC_OBSERVED_TOOL"),
+            vec!["server/handlers.rs".to_string()]
+        );
+        assert_eq!(
+            audit_writers("BUILD_CALLBACK_SUPERSEDED_EVENT"),
+            vec!["task_engine/dispatcher.rs".to_string()]
+        );
+        // Aucun littéral recopié hors de ce module.
+        for (rel, prod) in production_files() {
+            if rel == "qa_head_supersession.rs" {
+                continue;
+            }
+            for lit in [
+                "\"qa_pr_sync_observed\"",
+                "\"qa_build_callback_superseded\"",
+            ] {
+                assert!(!prod.contains(lit), "{rel} recopie le littéral {lit}");
+            }
+        }
+    }
+
+    /// Contrôle de bonne foi du scan ci-dessus : sur un texte qui écrit le nom,
+    /// le prédicat mord.
+    #[test]
+    fn mika2671_le_scan_decrivain_mord() {
+        let fixture = "db.log_audit_event(\n    \"system\",\n    SYNC_OBSERVED_TOOL,\n";
+        let lines: Vec<&str> = fixture.lines().collect();
+        assert!(lines.iter().enumerate().any(|(i, l)| {
+            l.contains("log_audit_event(")
+                && lines[i..(i + 5).min(lines.len())]
+                    .iter()
+                    .any(|w| w.contains("SYNC_OBSERVED_TOOL"))
+        }));
+    }
+
+    /// Placement — le registre n'est écrit qu'au démarrage d'un tour : un seul
+    /// appel de production à `record_pr_sync_observed`, et il vit dans
+    /// `run_agent_for_message`. Revenir à une écriture à la réception
+    /// (`handle_message`) rouvrirait la perte de revue que la revue de code a
+    /// mesurée, sans qu'aucun test comportemental ne rougisse.
+    #[test]
+    fn mika2671_le_registre_est_ecrit_au_demarrage_du_tour() {
+        let (_, prod) = production_files()
+            .into_iter()
+            .find(|(rel, _)| rel == "server/handlers.rs")
+            .unwrap();
+        let calls: Vec<usize> = prod
+            .match_indices("record_pr_sync_observed(")
+            .map(|(i, _)| i)
+            .filter(|&i| !prod[..i].ends_with("async fn "))
+            .collect();
+        assert_eq!(calls.len(), 1, "un seul appel de production attendu");
+        let host = prod[..calls[0]].rfind("async fn ").unwrap();
+        assert!(
+            prod[host..].starts_with("async fn run_agent_for_message("),
+            "l'appel doit vivre dans run_agent_for_message"
+        );
     }
 }

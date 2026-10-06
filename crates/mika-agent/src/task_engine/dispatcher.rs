@@ -998,11 +998,10 @@ impl TaskDispatcher {
         use crate::qa_head_supersession::{
             BUILD_CALLBACK_SUPERSEDED_EVENT, BuildCallbackHead, SUPERSESSION_UNREADABLE_EVENT,
             SYNC_OBSERVED_TOOL, decide_build_callback, stale_build_guard_enabled,
+            sync_observed_key,
         };
 
-        if !crate::qa_build_callback::is_build_callback_label(&task.label)
-            || !stale_build_guard_enabled()
-        {
+        if !stale_build_guard_enabled() {
             return false;
         }
 
@@ -1042,7 +1041,10 @@ impl TaskDispatcher {
                         BUILD_CALLBACK_SUPERSEDED_EVENT,
                         &format!("task:{}", task.id),
                         None,
-                        Some(&format!("pr:{target_value} later_syncs={later_syncs}")),
+                        Some(&format!(
+                            "{} later_syncs={later_syncs}",
+                            sync_observed_key(&target.repo, target.pr_number)
+                        )),
                         Some(
                             "callback de build sur une tête remplacée — tour LLM sauté (mika#2671)",
                         ),
@@ -1052,11 +1054,8 @@ impl TaskDispatcher {
                 {
                     warn!(task_id = %task.id, error = %e, "qa_build_callback_superseded: audit non écrit");
                 }
-                match self.db.mark_task_delivered(&task.id).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(task_id = %task.id, error = %e, "callback de build périmé: mark_task_delivered a échoué");
-                    }
+                if let Err(e) = self.db.mark_task_delivered(&task.id).await {
+                    warn!(task_id = %task.id, error = %e, "callback de build périmé: mark_task_delivered a échoué");
                 }
                 true
             }
@@ -9689,6 +9688,21 @@ mod tests {
             dispatcher.dispatch(&id).await.unwrap();
 
             assert!(mock.calls_made() >= 1, "le tour de callback doit tourner");
+            assert_eq!(superseded_rows(&db).await, 0);
+        }
+
+        /// Borne — un tour démarré dans la MÊME seconde que le lancement du
+        /// build ne le rend pas périmé (comparaison stricte, fail-safe revue).
+        #[tokio::test]
+        async fn mika2671_egalite_a_la_seconde_le_tour_tourne() {
+            let db = test_db();
+            let (dispatcher, mock) = counting_dispatcher(db.clone());
+            let id = seed_build_callback(&db, BUILD_CALLBACK_LABEL, Some(TARGET_META), false).await;
+            observe_sync(&db, "senara-solutions/mika", 2659, LAUNCHED_AT).await;
+
+            dispatcher.dispatch(&id).await.unwrap();
+
+            assert!(mock.calls_made() >= 1);
             assert_eq!(superseded_rows(&db).await, 0);
         }
 
