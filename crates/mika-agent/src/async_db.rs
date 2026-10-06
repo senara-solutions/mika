@@ -775,6 +775,24 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Retentions still pending in an audit registry (mika#2671 phase B). See
+    /// [`Database::list_pending_audit_holds`].
+    pub async fn list_pending_audit_holds(
+        &self,
+        tool_name: &str,
+        held_value: &str,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<crate::db::PendingAuditHold>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let hv = held_value.to_owned();
+        let sn = since.to_owned();
+        let un = until.to_owned();
+        self.with_db(move |db| db.list_pending_audit_holds(&a, &tn, &hv, &sn, &un))
+            .await
+    }
+
     /// Count audit rows for (tool_name, after_value) newer than `since`, across
     /// every `target_key` (mika#2634). See the sync method for why the
     /// `target_key`-scoped sibling cannot answer this question.

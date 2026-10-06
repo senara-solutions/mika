@@ -39,6 +39,16 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 55;
 /// Test-only helper for mika#1712 integration tests; extracted to a type
 /// alias to satisfy `clippy::type_complexity`.
 #[doc(hidden)]
+/// One pending retention returned by [`Database::list_pending_audit_holds`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAuditHold {
+    pub target_key: String,
+    /// `before_value`: the retained event's text.
+    pub text: String,
+    /// `reasoning`: the retained event's identity marker.
+    pub identity: String,
+}
+
 pub type AuditEventRowTuple = (String, Option<String>, Option<String>, Option<String>);
 
 /// mika#1742 Problem B: refuse-to-zombie grace window for
@@ -1884,6 +1894,60 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// Retentions still pending in an audit registry (mika#2671 phase B: the
+    /// `synchronize` held by the debounce). A row is pending when it carries
+    /// `after_value = held_value`, falls in `(since, until]`, and no LATER row of
+    /// its `target_key` either (a) is itself a retention — a newer head replaced
+    /// it — or (b) carries the same `reasoning` — the turn that consumed this
+    /// very event started. The `reasoning` is the event identity
+    /// (`request_id=<uuid>`): the gateway text is identical for every
+    /// `synchronize` of one PR, so a started row that names no identity would
+    /// consume a retention it never served.
+    ///
+    /// "Later" is by `id`, never by `created_at` (same-second ties). Rows with a
+    /// NULL `before_value` or `reasoning` carry nothing to replay and are left out.
+    pub fn list_pending_audit_holds(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        held_value: &str,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<PendingAuditHold>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.target_key, a.before_value, a.reasoning FROM audit_events a
+             WHERE a.agent_id = ?1 AND a.tool_name = ?2 AND a.after_value = ?3
+               AND a.created_at > ?4 AND a.created_at <= ?5
+               AND a.before_value IS NOT NULL AND a.reasoning IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM audit_events b
+                 WHERE b.agent_id = ?1 AND b.tool_name = ?2
+                   AND b.target_key = a.target_key AND b.id > a.id
+                   AND (b.after_value = ?3 OR b.reasoning = a.reasoning))
+             ORDER BY a.id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![agent_id, tool_name, held_value, since, until],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(target_key, text, identity)| PendingAuditHold {
+                target_key,
+                text,
+                identity,
+            })
+            .collect())
     }
 
     /// Count audit_events matching (agent_id, tool_name, after_value) with

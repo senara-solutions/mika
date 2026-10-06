@@ -22,6 +22,7 @@ pub mod permissions_stream;
 pub mod ready_label_handler;
 pub mod rewind;
 pub mod state;
+pub mod sync_debounce;
 pub mod tasks_stream;
 pub mod tier_guard;
 pub mod types;
@@ -755,6 +756,7 @@ async fn init_agent(
         github_app,
         webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         webhook_queue_v2,
+        sync_debounce: Arc::new(sync_debounce::SyncDebounce::default()),
         kg_config,
         canonical_session_id,
         budget_record: Arc::new(budget_record),
@@ -2314,6 +2316,7 @@ mod tests {
                 64,
                 std::time::Duration::from_millis(100),
             )),
+            sync_debounce: Arc::new(sync_debounce::SyncDebounce::default()),
             kg_config: crate::kg::config::KgAgentConfig::Disabled {
                 reason: crate::kg::config::DisabledReason::OperatorOptOut,
             },
@@ -3368,6 +3371,94 @@ mod tests {
             agent_state.webhook_queue_v2.depth().await,
             1,
             "busy-agent message must enqueue rather than 429"
+        );
+    }
+
+    // ---- mika#2671 phase B — anti-rebond à l'ingestion ---------------------
+
+    async fn mika2671_post(app: Router, text: &str, rid: &str) -> StatusCode {
+        let body = serde_json::json!({
+            "text": text, "channel": "github", "request_id": rid
+        })
+        .to_string();
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-token-secret")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    const MIKA2671_SYNC: &str = "[GitHub] PR synchronize: senara-solutions/mika#2659 \u{2014} fix: x (branch: b)\nhttps://github.com/senara-solutions/mika/pull/2659";
+
+    /// AC1 à l'ingestion : un `synchronize` est accepté, retenu (pas en file) et
+    /// inscrit durablement au registre avec son identité.
+    #[tokio::test]
+    async fn mika2671_un_synchronize_est_retenu_et_inscrit() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        let app = test_app(state);
+        assert_eq!(
+            mika2671_post(app, MIKA2671_SYNC, "s1").await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(agent_state.webhook_queue_v2.depth().await, 0);
+        assert!(
+            agent_state
+                .sync_debounce
+                .is_held("pr:senara-solutions/mika#2659")
+        );
+        let pending = agent_state
+            .db
+            .list_pending_audit_holds(
+                crate::qa_head_supersession::SYNC_OBSERVED_TOOL,
+                sync_debounce::HELD_STAGE,
+                "1970-01-01T00:00:00Z",
+                "2999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].identity, "request_id=s1");
+        assert_eq!(pending[0].text, MIKA2671_SYNC);
+    }
+
+    /// AC4 contrôle négatif dédié : une retenue en cours pour la PR, puis
+    /// `opened`, `ready_for_review`, `review_requested` sur la MÊME PR ⇒ chacun
+    /// part en file immédiatement, la retenue intacte.
+    #[tokio::test]
+    async fn mika2671_les_demandes_de_revue_ne_sont_jamais_retardees() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        // Le drain ne tourne pas dans ce test : les événements restent en file.
+        let _guard = agent_state.agent_lock.clone().lock_owned().await;
+        let app = test_app(state);
+        mika2671_post(app.clone(), MIKA2671_SYNC, "s1").await;
+        for (i, action) in ["opened", "ready_for_review", "review_requested"]
+            .iter()
+            .enumerate()
+        {
+            let text = format!(
+                "[GitHub] PR {action}: senara-solutions/mika#2659 \u{2014} fix: x (branch: b)\nhttps://github.com/senara-solutions/mika/pull/2659"
+            );
+            assert_eq!(
+                mika2671_post(app.clone(), &text, &format!("r{i}")).await,
+                StatusCode::ACCEPTED
+            );
+        }
+        assert_eq!(agent_state.webhook_queue_v2.depth().await, 3);
+        assert!(
+            agent_state
+                .sync_debounce
+                .is_held("pr:senara-solutions/mika#2659")
         );
     }
 

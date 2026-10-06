@@ -392,6 +392,17 @@ impl WebhookQueue {
         }
     }
 
+    /// Un élément portant cette clé de coalescence attend-il en file ?
+    /// (mika#2671 : le balayage des retenues pendantes ne rejoue pas un
+    /// événement encore en file.)
+    pub async fn has_coalescing_key(&self, key: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .iter()
+            .any(|e| e.coalescing_key.as_deref() == Some(key))
+    }
+
     /// Current queue depth.
     pub async fn depth(&self) -> usize {
         self.inner.lock().await.len()
