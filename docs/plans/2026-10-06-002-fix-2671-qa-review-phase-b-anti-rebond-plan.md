@@ -90,10 +90,30 @@ horizon de 24 h. Au démarrage du worker de drain
 pendant est remis en fenêtre. Un redémarrage pendant la fenêtre, ou après
 l'échéance mais avant le démarrage du tour, ne perd donc pas la dernière tête.
 
-Résiduel nommé : un événement **versé** dans la file puis évincé par le
-drop-oldest (file pleine à 64) reste « pendant » et n'est rejoué qu'au prochain
-démarrage. Il exige 64 événements distincts en file pour mika-qa ; c'est le
-même résiduel que la file v2 a aujourd'hui, borné cette fois par un rejeu.
+**Révisé après revue du plan (trois trous, tous fermés dans B1) :**
+
+1. *Identité de l'événement.* La ligne de tour démarré de la phase A ne disait
+   pas quel événement elle consommait, et le texte du gateway est identique pour
+   tous les `synchronize` d'une PR. Scénario mesuré en revue : `held(A)` →
+   `held(B)` → tour de A démarré en retard ⇒ B lu comme soldé, perdu au
+   redémarrage. Les deux lignes portent désormais `reasoning =
+   request_id=<uuid>` ; une retenue est pendante tant qu'aucune ligne plus
+   récente de sa clé n'est une retenue ou le tour démarré **de la même
+   requête**. Le rejeu réutilise le `request_id` d'origine.
+2. *Drop-oldest.* Une retenue versée puis évincée par la file bornée restait
+   pendante, comptée par la garde de phase A, et n'était rejouée qu'au prochain
+   redémarrage. Un **balayage** toutes les 5 min (dans le worker de drain) rejoue
+   les pendants âgés de plus de 60 s qui ne sont ni retenus, ni en file, ni **en
+   vol** (sortis de file, tour pas encore démarré — `SyncDebounce::enter_flight`
+   dans `drain_one_webhook`).
+3. *Course reprise / retenue en direct.* La reprise passe par `hold_if_absent`
+   et ne remplace jamais une retenue vivante, plus récente par construction.
+
+Et deux corrections mineures : une écriture `stage=held` en échec n'est **pas**
+retenue (l'événement part en file comme avant — jamais de retenue non
+durable) ; le contrôle négatif d'AC1 dépile le premier élément avant le second,
+sans quoi la coalescence v2 les fusionnerait et le test lirait 1 pour une autre
+raison que la fenêtre.
 
 ### KTD4 — La garde de phase A compte les retenues (révision assumée de « démarré, pas reçu »)
 

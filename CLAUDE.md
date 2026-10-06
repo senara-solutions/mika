@@ -2668,6 +2668,41 @@ Optional (deferred-dispatch re-arm honesty — mika#2169):
   - **Reading a wrapper's fate: three words, three meanings.** `delivered` = the turn dispatched. `expired` + a reason = the turn happened and dispatched nothing (this is the mika#2169 fix; before it, this case also read `delivered`). `completed` with no successor = the promotion never fired — which is exactly what L2b counts. `expired` is used rather than `failed` because `failed` is in the set `get_undelivered_callback_tasks` scans, so it would put the wrapper back in the delivery queue it just left.
   - **What this does NOT do.** It does not unblock the delivery queue. The 80-minute silence of 2026-09-04 came from delivery-queue starvation (head-of-line callback `800d739f`, `completed` at `22:03:24Z` and not `delivered` until `03:09:16Z` — five and a half hours), which is a separate Tier-1 ticket. This work makes the sterility **recorded, bounded and visible**; a loop that restarts is the other ticket's contract.
 
+### Une revue par tête stable : anti-rebond durable sur `synchronize` (mika#2671 phase B1)
+
+- `MIKA_QA_SYNC_DEBOUNCE` — kill-switch, **défaut armé** ; `0`/`false`/`off`/`no` désarment sans redéploiement, une coquille est **dite** (`qa_switch_invalid`, valeur entre guillemets) et laisse armé.
+- `MIKA_QA_SYNC_DEBOUNCE_SECS` — durée de la fenêtre, défaut `300`. Trois paliers maison : absent/vide → défaut ; illisible, `0`, négatif ou > 3600 → défaut + WARN `qa_sync_debounce_window_invalid`. Le `0` ne désarme pas.
+
+**Le défaut.** La coalescence de la file v2 (`pr_sync:{repo}:{pr}`) ne fusionne que des événements **encore en file** ; la file de mika-qa est presque toujours vide, donc chaque `synchronize` payait une revue complète. Épisode de référence (mika#2659, 2026-10-06) : trois `synchronize` en douze minutes, trois revues et deux callbacks, ≈ 4,5 M de tokens d'entrée.
+
+**Le mécanisme.** Un `synchronize` (et lui seul — `debounce_key`, via `classify_event`) **ouvre** une fenêtre fixe sur sa PR ; tout `synchronize` reçu pendant la fenêtre **remplace** l'événement retenu ; à l'échéance, le dernier part dans la file v2. La fenêtre n'est pas réarmée par événement : un débit continu de pushes ne retarde pas la revue au-delà de W. `opened`, `ready_for_review`, `review_requested` sont classés `Other` et ne sont **jamais** retardés (AC4, épinglé par un test routeur qui pose une retenue puis les trois actions sur la même PR).
+
+**Durable, et c'est ce qui rend la fenêtre acceptable.** La retenue est inscrite au registre de la phase A (`qa_pr_sync_observed`, même clé, `after_value = "stage=held"`, texte dans `before_value`) **avant** d'être tenue ; si l'écriture échoue, l'événement part en file comme avant — jamais de retenue non durable. Chaque ligne du registre porte l'**identité** de l'événement (`reasoning = request_id=<uuid>`), sur la retenue comme sur la ligne de tour démarré : le texte du gateway est identique pour tous les `synchronize` d'une PR, donc seule l'identité dit quel événement un tour a consommé (correction de revue : sans elle, le tour tardif d'une tête périmée soldait la retenue suivante). Une retenue est **pendante** tant qu'aucune ligne plus récente de sa clé n'est une retenue ou le tour démarré de la même requête. Les pendants sont rejoués au démarrage du worker de drain (redémarrage pendant la fenêtre, ou entre l'échéance et le début du tour), et par un **balayage** toutes les 5 min qui ne rejoue jamais une clé retenue, en file ou en vol — il existe pour l'éviction drop-oldest de la file bornée. Un rejeu ne remplace jamais une retenue vivante.
+
+**Couplage avec la phase A, révision assumée.** La garde de build périmé compte toutes les lignes de la clé, donc une retenue postérieure au lancement d'un build fait sauter son callback. La phase A exigeait « démarré, pas reçu » parce qu'un reçu pouvait se perdre ; une retenue durable et rejouée ne se perd pas. Sans ce couplage, la fenêtre retarderait la revue suivante au-delà du callback précédent et l'épisode de référence coûterait plus qu'avec la phase A seule (≈ 3,95 M contre 3,5 M).
+
+**Ce que B1 ne fait pas.** Pas de contrôle de tête au démarrage du tour de revue (AC2-revue, **phase B2**) : une tête périmée déjà en file est revue pour rien, comme avant. Pas de retenue sur le chemin hérité (`MIKA_WEBHOOK_QUEUE_ENABLED=false`).
+
+```sql
+-- Retenues, tours démarrés et rejeux, par PR
+SELECT created_at, target_key, COALESCE(after_value, 'stage=started') AS stage, reasoning
+  FROM audit_events WHERE tool_name = 'qa_pr_sync_observed'
+ ORDER BY created_at DESC LIMIT 40;
+-- AC5 : coût par session mika-qa sur la fenêtre d'un épisode
+SELECT session_id, MIN(created_at), COUNT(*), SUM(input_tokens)
+  FROM llm_calls WHERE agent_id = 'mika-qa' AND created_at BETWEEN :t0 AND :t1
+ GROUP BY session_id ORDER BY 2;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `webhook_queue_debounced` (audit, bridé 1/s) | — | non vide | `outcome=opened|replaced` : la fenêtre mord |
+| `qa_sync_debounce_released` | INFO | une par fenêtre close | la dernière tête part en revue |
+| `qa_sync_debounce_recovered` | INFO | rare | `sweep=false` : redémarrage ; `sweep=true` : une éviction drop-oldest rattrapée |
+| `qa_sync_held_audit_failed` / `qa_sync_debounce_recovery_unreadable` | WARN | **vide** | la base ne répond pas : l'événement part sans retenue / rien n'est rejoué |
+
+**Sondes post-déploiement.** *S1* — pour N `synchronize` dans W : N lignes `stage=held`, puis **une** ligne de tour démarré portant le `request_id` de la dernière. *Halte* : plusieurs tours démarrés pour un épisode ⇒ la fenêtre ne mord pas ; vérifier le binaire servi (classe mika#2340) et `MIKA_QA_SYNC_DEBOUNCE` avant de toucher au code. *S2* (AC5, cible rebasée) — dans `llm_calls`, une session de revue et au plus une de callback par épisode rapproché. *S3* — une demande de revue (`opened`/`ready_for_review`/`review_requested`) part sans délai. *Halte* : un délai ⇒ `debounce_key` mord trop large ; désarmer, puis réparer. *S4* — après un redémarrage pendant une fenêtre, la retenue est rejouée (`qa_sync_debounce_recovered`) et la tête revue.
+
 Optional (bounded webhook queue — mika#1870):
 - `MIKA_WEBHOOK_QUEUE_ENABLED` — Kill-switch for the per-agent bounded webhook queue (AC9). Default `true` — every `POST /message` request enqueues into the per-agent bounded queue and a single per-agent drain worker (sole `agent_lock` consumer) runs the agent loop, replacing the legacy `try_lock_owned()` → 429-reject pattern. Set `false` to revert to the verbatim legacy 429-reject path **without a redeploy** (instant rollback). The accepted-case HTTP response is byte-identical either way (`status: "accepted"`); only the busy case changes (429 → queued). Distinct from the mika#528 deferral queue (`server::webhook_queue`), which is unchanged.
 - `MIKA_WEBHOOK_QUEUE_MAX_DEPTH` — Per-agent queue depth cap for distinct (non-coalescing) events before the oldest is dropped (dead-letter). Default `64`. Invalid/`0` falls back to the default (WARN-logged). Redundant same-key bursts (e.g. N `check_suite.completed` on one branch) **coalesce** into a single queued entry and do not count against the depth.
