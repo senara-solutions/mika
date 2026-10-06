@@ -319,6 +319,16 @@ mod tests {
         admit(d, q, key, req, W)
     }
 
+    /// Dépile avec une borne : une fenêtre qui ne se ferme jamais fait ÉCHOUER
+    /// le test au lieu de le bloquer.
+    async fn pop(q: &WebhookQueue) -> MessageRequest {
+        tokio::time::timeout(Duration::from_secs(1), q.dequeue())
+            .await
+            .expect("rien en file : la fenêtre ne s'est pas fermée")
+            .unwrap()
+            .request
+    }
+
     /// Laisse tourner les tâches réveillées par une avance d'horloge.
     async fn settle() {
         for _ in 0..8 {
@@ -362,13 +372,13 @@ mod tests {
         assert_eq!(admit_sync(&d, &q, sync(2659, 1)), Hold::Opened);
         tokio::time::advance(W + Duration::from_secs(1)).await;
         settle().await;
-        let first = q.dequeue().await.unwrap();
-        assert!(first.request.text.ends_with("head 1"));
+        let first = pop(&q).await;
+        assert!(first.text.ends_with("head 1"));
         assert_eq!(admit_sync(&d, &q, sync(2659, 2)), Hold::Opened);
         tokio::time::advance(W + Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(q.depth().await, 1);
-        assert!(q.dequeue().await.unwrap().request.text.ends_with("head 2"));
+        assert!(pop(&q).await.text.ends_with("head 2"));
     }
 
     /// Une fenêtre par PR : deux PR dans la même fenêtre sont deux tours.
@@ -417,7 +427,7 @@ mod tests {
         settle().await;
         let mut heads = vec![];
         while q.depth().await > 0 {
-            heads.push(q.dequeue().await.unwrap().request.text);
+            heads.push(pop(&q).await.text);
         }
         assert!(heads.iter().any(|t| t.ends_with("head 9")), "{heads:?}");
         assert!(
