@@ -1770,10 +1770,14 @@ mod tests {
             ),
             (
                 "les trois déclarations, aucun appel",
+                // `pf` tient le mot-clé hors de la ligne : la garde
+                // mika#2398 lit toute ligne qui commence par lui comme une
+                // déclaration de production.
                 format!(
-                    "pub fn {traversal}(&self) {{}}\n\
-                     pub fn {terminal}(s: &str) -> bool {{ false }}\n\
-                     pub fn {alive}(p: u32, st: u64) -> bool {{ false }}\n"
+                    "{pf} {traversal}(&self) {{}}\n\
+                     {pf} {terminal}(s: &str) -> bool {{ false }}\n\
+                     {pf} {alive}(p: u32, st: u64) -> bool {{ false }}\n",
+                    pf = concat!("pub", " fn"),
                 ),
             ),
             (
