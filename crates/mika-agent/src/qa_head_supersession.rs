@@ -652,7 +652,11 @@ mod tests {
             prod[host..].starts_with("async fn run_agent_for_message("),
             "l'appel doit vivre dans run_agent_for_message"
         );
-        let body = &prod[host..];
+        // Le corps s'arrête à l'accolade de colonne zéro qui ferme la fonction :
+        // sans cette borne, un marqueur présent dans une fonction ULTÉRIEURE
+        // satisferait l'ordre même si run_agent_for_message l'avait perdu.
+        let end = prod[host..].find("\n}\n").map_or(prod.len(), |i| host + i);
+        let body = &prod[host..end];
         let guard = body.find("skip_superseded_review_turn(").unwrap();
         for later in [
             "record_pr_sync_observed(",

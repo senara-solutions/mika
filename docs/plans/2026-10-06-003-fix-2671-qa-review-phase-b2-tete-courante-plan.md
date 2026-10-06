@@ -126,10 +126,13 @@ lookup)` ; seul `Superseded` saute. Constantes `REVIEW_HEAD_SUPERSEDED_EVENT`,
 - Structurel : l'appel vit dans `run_agent_for_message`, avant
   `record_pr_sync_observed` ; un seul écrivain du nom d'audit.
 
-## Estimation
+## Taille estimée
 
 Brut ≈ 70 lignes de code + ≈ 100 de tests ≈ 170 ; marge ×2,5 ≈ 175 annoncée
-par le vol pour le code, ≈ 425 tests compris. Réel : rapporté dans la PR.
+par le vol pour le code, ≈ 425 tests compris (hors `docs/`), sous le seuil de
+1000 de `PLAN_SIZE_MAX_LOC` : pas de découpage. Réel : rapporté dans la PR.
+
+Total estimé : 425 lignes
 
 ## Definition of Done
 

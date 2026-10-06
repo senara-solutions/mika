@@ -51,6 +51,7 @@
 use super::*;
 
 mod dispatch_stamp_and_slots;
+mod newer_audit_holds;
 mod reapers;
 mod recurring_tasks;
 mod reference_url_delimitee;
