@@ -145,7 +145,8 @@ pub(crate) fn parse_pr_action_event(text: &str) -> Option<(&str, &str, u64)> {
 }
 
 /// The GitHub label whose add-event is a dispatch trigger (never coalesce).
-const READY_LABEL: &str = "ready";
+/// One constant with the pre-filter's set of labels the loop reads (mika#2675).
+use crate::webhook_dispatch::READY_LABEL;
 
 /// Classify a gateway-formatted webhook text into a [`WebhookEventKind`] (AC2).
 ///

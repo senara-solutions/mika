@@ -86,8 +86,8 @@ use super::verdict_handler::VerdictAction;
 
 /// Parsed fields from a gateway-formatted check_suite success event.
 pub(crate) struct CheckSuiteEvent {
-    repo: String,
-    branch: String,
+    pub(crate) repo: String,
+    pub(crate) branch: String,
 }
 
 /// Parse the gateway-formatted check_suite success event text.

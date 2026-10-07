@@ -1740,6 +1740,11 @@ pub(super) async fn run_agent_for_message(
     );
     let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
+    // mika#2675 — le texte tel que le gateway l'a délivré, avant que les
+    // handlers ne le remplacent ou l'enrichissent : le pré-filtre classe ce
+    // texte-là, et ne filtre que si aucun handler n'y a touché.
+    let original_github_text = (req.channel == "github").then(|| req.text.clone());
+
     // Structural verdict handler: intercept PR review webhooks before
     // the LLM turn and act on VERDICT: pass deterministically (#524).
     // NOTE: This depends on the gateway's format_event_text() output
@@ -1985,6 +1990,22 @@ pub(super) async fn run_agent_for_message(
                 unreachable!("upstream_close handler never dispatches");
             }
         }
+    }
+
+    // mika#2675 — pré-filtre déterministe : APRÈS les handlers, qui gardent
+    // tous leurs effets, AVANT le tour LLM. Un événement sans suite possible
+    // ne paie aucun appel modèle ; tout le reste passe comme avant.
+    if let Some(original) = &original_github_text
+        && super::webhook_prefilter::skip_turn(
+            &a.db,
+            original,
+            req.text != *original,
+            &req.request_id,
+            super::webhook_prefilter::prefilter_enabled(),
+        )
+        .await
+    {
+        return;
     }
 
     let params = agent::AgentParams {

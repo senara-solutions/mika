@@ -434,6 +434,52 @@ pub(crate) fn operator_held_label<'a>(
 /// rather than protecting it.
 pub(crate) const DISPATCH_SEAT_LABEL_PREFIX: &str = "dispatch:";
 
+// ──────────────────── Labels the loop reads (mika#2675) ────────────────────
+
+/// The label whose add-event is the dispatch trigger. Read by the webhook queue
+/// (never coalesced) and by [`label_read_by_loop`].
+pub(crate) const READY_LABEL: &str = "ready";
+
+/// Automation labels of `.github/labels.yml` that dispatch-lib or the engine
+/// read off a ticket or a PR. Their add-event triggers nothing today, but a
+/// label the loop reads is never declared inert: a label wrongly read as inert
+/// loses an event, a label wrongly read as live only costs a turn.
+pub(crate) const LOOP_AUTOMATION_LABELS: &[&str] = &[
+    "loop-substrate",
+    "needs-build",
+    "needs-deploy",
+    "pipeline-exempt",
+    "wip-rescue",
+    "human-review-required",
+    "needs-multi-agent-review",
+    "rescue-after-review",
+    "stale-against-main",
+];
+
+/// Prefixes of label families the loop reads: operator holds and operator
+/// verbs, dispatch seats, milestone phases, PR origin.
+pub(crate) const LOOP_READ_LABEL_PREFIXES: &[&str] =
+    &["operator-", DISPATCH_SEAT_LABEL_PREFIX, "phase:", "origin:"];
+
+/// Does any part of the loop read this label? (mika#2675 AC1(d))
+///
+/// The single set behind the webhook pre-filter: an `issues.labeled` event
+/// whose label is NOT read here costs no LLM turn. Composed from the
+/// constants its readers already use — [`READY_LABEL`],
+/// [`OPERATOR_HELD_LABELS`], [`DISPATCH_SEAT_LABEL_PREFIX`] — so a reader
+/// that grows its list grows this set in the same edit. Case-insensitive, so a
+/// casing variant is read as live rather than filtered.
+pub(crate) fn label_read_by_loop(label: &str) -> bool {
+    let label = label.trim().to_ascii_lowercase();
+    let label = label.as_str();
+    label == READY_LABEL
+        || OPERATOR_HELD_LABELS.contains(&label)
+        || LOOP_AUTOMATION_LABELS.contains(&label)
+        || LOOP_READ_LABEL_PREFIXES
+            .iter()
+            .any(|p| label.starts_with(p))
+}
+
 /// The seat this engine dispatches as.
 ///
 /// `dispatch:ssc` and `dispatch:mpc` name interactive Claude Code seats. The
