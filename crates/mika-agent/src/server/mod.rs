@@ -5683,9 +5683,26 @@ mod tests {
     async fn mika2675_texte_touche_par_un_handler_le_tour_a_lieu() {
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
+        let live = webhook_prefilter::LiveState {
+            db: &db,
+            github_token: None,
+        };
         for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
-            assert!(!webhook_prefilter::skip_turn(&db, text, true, "r", true).await);
-            assert!(webhook_prefilter::skip_turn(&db, text, false, "r", true).await);
+            assert!(
+                !webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(true), "r", true)
+                    .await
+            );
+            assert!(
+                webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(false), "r", true)
+                    .await
+            );
+        }
+    }
+
+    fn mika2675_touched(touched: bool) -> webhook_prefilter::Touched {
+        webhook_prefilter::Touched {
+            by_any_handler: touched,
+            after_verdict_handler: touched,
         }
     }
 
@@ -5694,8 +5711,27 @@ mod tests {
     async fn mika2675_interrupteur_desarme_rien_nest_filtre() {
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
-        for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
-            assert!(!webhook_prefilter::skip_turn(&db, text, false, "r", false).await);
+        let live = webhook_prefilter::LiveState {
+            db: &db,
+            github_token: None,
+        };
+        let hold = webhook_prefilter::tests::review(
+            "commented",
+            "mika-platform-qa",
+            "VERDICT: hold[review]",
+        );
+        for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL, hold.as_str()] {
+            assert!(
+                !webhook_prefilter::skip_turn(
+                    &db,
+                    &live,
+                    text,
+                    mika2675_touched(false),
+                    "r",
+                    false
+                )
+                .await
+            );
         }
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
     }
@@ -5745,5 +5781,139 @@ mod tests {
         .await;
         assert!(mock.calls_made() >= 1);
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    // ---- mika#2675 phase 2 — classe (c) -----------------------------------
+    //
+    // Sans jeton GitHub (retiré par `mika2675_state`), l'état de la PR est
+    // illisible : le quatrième terme (PR fermée) ne peut écarter que via un
+    // état bouchonné, exercé sur la porte. Les trois termes textuels, eux,
+    // écartent sans forge, donc sur le chemin réel complet.
+
+    const MIKA2675_QA: &str = "mika-platform-qa";
+
+    fn mika2675_review(state: &str, author: &str, body: &str) -> String {
+        webhook_prefilter::tests::review(state, author, body)
+    }
+
+    /// AC1(c) — chaque terme textuel, sans tâche active : zéro appel LLM.
+    #[tokio::test]
+    async fn mika2675_c_verdict_non_actionnable_aucun_appel_llm() {
+        for (state, author, body) in [
+            (
+                "commented",
+                MIKA2675_QA,
+                "VERDICT: hold[review]\n\nÀ trancher.",
+            ),
+            ("approved", "samidarko", "VERDICT: pass"),
+            ("commented", MIKA2675_QA, "VERDICT: peut-être"),
+        ] {
+            let text = mika2675_review(state, author, body);
+            assert_eq!(mika2675_run(&text).await, (0, 1), "{body} / {author}");
+        }
+    }
+
+    /// AC1(c), terme « sans tâche active » : avec une tâche sur la PR, chaque
+    /// verdict non actionnable garde son tour.
+    #[tokio::test]
+    async fn mika2675_c_tache_active_le_tour_a_lieu() {
+        for (author, body) in [
+            (MIKA2675_QA, "VERDICT: hold[review]"),
+            ("samidarko", "VERDICT: pass"),
+            (MIKA2675_QA, "VERDICT: peut-être"),
+        ] {
+            let (state, mock) = mika2675_state();
+            mika2675_seed_task(
+                &state,
+                r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/2680"}}"#,
+            )
+            .await;
+            mika2675_run_on(&state, &mika2675_review("commented", author, body)).await;
+            assert!(mock.calls_made() >= 1, "{body}");
+            assert_eq!(mika2675_skipped_rows(&state).await, 0, "{body}");
+        }
+    }
+
+    /// AC2 et AC3 — verdict actionnable du relecteur sans tâche (état de PR
+    /// illisible faute de jeton), revue-consigne sans ligne VERDICT, `hold`
+    /// inconnu, `block[*]` d'une autre identité : le tour a lieu.
+    #[tokio::test]
+    async fn mika2675_c_evenements_legitimes_le_tour_a_lieu() {
+        for (state, author, body) in [
+            ("approved", MIKA2675_QA, "VERDICT: pass"),
+            ("changes_requested", MIKA2675_QA, "VERDICT: block[ac]"),
+            ("commented", MIKA2675_QA, "VERDICT: hold[foo]"),
+            // L'identité de l'opérateur est partagée : un `block[*]` d'une
+            // autre identité n'est notifié à personne, il garde son tour.
+            (
+                "changes_requested",
+                "samidarko",
+                "VERDICT: block[security]\n\nFuite de jeton, ne pas merger.",
+            ),
+            (
+                "changes_requested",
+                "mika-platform-dev",
+                "VERDICT: block[ac]",
+            ),
+            (
+                "commented",
+                "samidarko",
+                "Renomme cette fonction, puis relance.",
+            ),
+        ] {
+            let (calls, skipped) = mika2675_run(&mika2675_review(state, author, body)).await;
+            assert!(calls >= 1, "le tour doit avoir lieu : {body}");
+            assert_eq!(skipped, 0, "aucune ligne d'écart : {body}");
+        }
+    }
+
+    /// AC1(c) quatrième terme, AC3 côté forge — sur la porte, état bouchonné :
+    /// PR fermée ou mergée écarte, ouverte ou illisible laisse passer.
+    #[tokio::test]
+    async fn mika2675_c_etat_de_forge_sur_la_porte() {
+        use webhook_prefilter::{PrForgeState, tests::Stub};
+        let (state, _) = mika2675_state();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        let text = mika2675_review("approved", MIKA2675_QA, "VERDICT: pass");
+        for (forge, skipped) in [
+            (Ok(PrForgeState::Merged), true),
+            (Ok(PrForgeState::Closed), true),
+            (Ok(PrForgeState::Open), false),
+            (Err("gh 401"), false),
+        ] {
+            let stub = Stub {
+                pr_task: Some(Ok(false)),
+                pr_state: Some(forge),
+                ..Stub::default()
+            };
+            let got =
+                webhook_prefilter::skip_turn(&db, &stub, &text, mika2675_touched(false), "r", true)
+                    .await;
+            assert_eq!(got, skipped, "{forge:?}");
+        }
+        let rows = db
+            .get_audit_event_rows_by_tool_name(webhook_prefilter::PREFILTER_SKIPPED_TOOL)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// Texte intact après le `verdict_handler` : un handler ultérieur qui le
+    /// touche garde le tour ; le `verdict_handler` lui-même, non.
+    #[tokio::test]
+    async fn mika2675_c_texte_touche_apres_le_verdict_handler() {
+        let (state, _) = mika2675_state();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        let live = webhook_prefilter::LiveState {
+            db: &db,
+            github_token: None,
+        };
+        let text = mika2675_review("commented", MIKA2675_QA, "VERDICT: hold[review]");
+        let touched = |after| webhook_prefilter::Touched {
+            by_any_handler: true,
+            after_verdict_handler: after,
+        };
+        assert!(!webhook_prefilter::skip_turn(&db, &live, &text, touched(true), "r", true).await);
+        assert!(webhook_prefilter::skip_turn(&db, &live, &text, touched(false), "r", true).await);
     }
 }

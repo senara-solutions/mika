@@ -1744,6 +1744,11 @@ pub(super) async fn run_agent_for_message(
     // handlers ne le remplacent ou l'enrichissent : le pré-filtre classe ce
     // texte-là, et ne filtre que si aucun handler n'y a touché.
     let original_github_text = (req.channel == "github").then(|| req.text.clone());
+    // mika#2675 phase 2 — le texte juste après le `verdict_handler` et le jeton
+    // qu'il a résolu : la classe (c) exige un texte intact APRÈS lui, et lit
+    // l'état de la PR côté forge avec le même jeton.
+    let mut text_after_verdict: Option<String> = None;
+    let mut prefilter_github_token: Option<String> = None;
 
     // Structural verdict handler: intercept PR review webhooks before
     // the LLM turn and act on VERDICT: pass deterministically (#524).
@@ -1781,6 +1786,8 @@ pub(super) async fn run_agent_for_message(
                 req.text = pre_digest;
             }
         }
+        text_after_verdict = Some(req.text.clone());
+        prefilter_github_token = verdict_github_token.clone();
 
         // Structural CI success handler: intercept check_suite.completed(success)
         // webhooks and re-evaluate merge eligibility for PRs with pending QA pass (#571).
@@ -1998,8 +2005,15 @@ pub(super) async fn run_agent_for_message(
     if let Some(original) = &original_github_text
         && super::webhook_prefilter::skip_turn(
             &a.db,
+            &super::webhook_prefilter::LiveState {
+                db: &a.db,
+                github_token: prefilter_github_token.as_deref(),
+            },
             original,
-            req.text != *original,
+            super::webhook_prefilter::Touched {
+                by_any_handler: req.text != *original,
+                after_verdict_handler: text_after_verdict.as_ref().is_none_or(|t| req.text != *t),
+            },
             &req.request_id,
             super::webhook_prefilter::prefilter_enabled(),
         )
