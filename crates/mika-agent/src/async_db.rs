@@ -2591,6 +2591,20 @@ impl AsyncDatabase {
             .await
     }
 
+    /// See [`Database::get_audit_events_for_target_prefix`] (mika#2675).
+    pub async fn get_audit_events_for_target_prefix(
+        &self,
+        tool_name: &str,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let pf = prefix.to_owned();
+        self.with_db(move |db| db.get_audit_events_for_target_prefix(&a, &tn, &pf, limit))
+            .await
+    }
+
     pub async fn get_messages_after_id(
         &self,
         session_id: &str,

@@ -385,3 +385,42 @@ fn mika2260_la_porte_precede_tout_travail() {
 fn mika2260_le_nom_daudit_de_la_porte_est_reel() {
     assert_audit_event_name_is_real(SKIPPED_EVENT);
 }
+
+// ---------------------------------------------------------------------------
+// mika#2675 phase 3 — l'attestation DECISION-CORE par tête
+// ---------------------------------------------------------------------------
+
+/// L'attestation `ci_success_handler_decision_core_hold` porte l'issue de la
+/// notification, donc elle est écrite APRÈS l'envoi ; et elle précède le retour
+/// de la branche, sans quoi un handler qui rend la main avant de l'écrire
+/// laisserait le pré-filtre sans trace à relire. La ligne historique
+/// `human_gate_required` garde sa place, avant l'envoi.
+#[test]
+fn mika2675_lattestation_suit_lenvoi_et_precede_le_retour() {
+    assert_audit_event_name_is_real("ci_success_handler_decision_core_hold");
+    let body = try_handle_ci_success_body();
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` absent de try_handle_ci_success"))
+    };
+    let gate = at("\"ci_success_handler_human_gate_required\"");
+    let send = at("sender.send(&notification)");
+    let attest = at("DECISION_CORE_HOLD_TOOL,");
+    let back = at("format_decision_core_hold_pre_digest(");
+    assert!(
+        gate < send,
+        "la ligne human_gate_required précède l'envoi (inchangé)"
+    );
+    assert!(
+        send < attest,
+        "l'attestation porte l'issue de l'envoi : elle le suit"
+    );
+    assert!(
+        attest < back,
+        "l'attestation précède le retour de la branche"
+    );
+    assert!(
+        body.contains("head_key(&event.repo, pr.number, &pr.head_sha)"),
+        "l'attestation cible la tête, sous la forme partagée avec la dédup"
+    );
+}

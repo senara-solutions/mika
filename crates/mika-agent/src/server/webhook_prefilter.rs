@@ -37,14 +37,35 @@
 //! consigne écrite en revue, et l'identité GitHub de l'opérateur est partagée
 //! (AC2, « un commentaire n'est jamais filtré »). Elle n'entre pas dans (c).
 //!
-//! La classe (b) vient en phase 3 ; elle ajoutera une variante et ses faits,
-//! pas un second mécanisme.
+//! # Phase 3 : la classe (b), `check_suite` verte sur une tête déjà décidée
+//!
+//! Mesuré le 2026-10-07 : les traitements d'une même tête sont espacés de
+//! plusieurs minutes, donc au-delà de la dédup de 60 s de `ci_success_handler`.
+//! Une `check_suite` tardive retraite la tête, redécide DECISION-CORE, renotifie
+//! l'opérateur, et le tour LLM qui suit conclut « Already notified ». Les
+//! retours de dédup (étapes 2b/2c) ne portent, eux, aucune trace de ce que la
+//! tête a décidé : ils gardent leur tour.
+//!
+//! Trois termes, tous lus dans une trace durable, et la fonction pure
+//! [`head_decided_and_notified`] les porte tous :
+//! - **décision attestée** — CET événement a écrit l'attestation
+//!   `ci_success_handler_decision_core_hold` (le marqueur `processed`, écrit
+//!   avant l'évaluation, ne suffit pas) ;
+//! - **même tête** — une attestation d'un AUTRE événement porte exactement la
+//!   même cible `pr:{repo}#{n}@{sha}` ;
+//! - **notification attestée** — cette attestation antérieure dit `notified`.
+//!
+//! Le texte ne doit avoir été touché que par `ci_success_handler`, comme (c)
+//! l'exige du `verdict_handler`. Une variante et ses faits, pas un second
+//! mécanisme.
 
 use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 
-use super::ci_success_handler::parse_check_suite_success;
+use super::ci_success_handler::{
+    DECISION_CORE_HOLD_NOTIFIED, DECISION_CORE_HOLD_TOOL, parse_check_suite_success,
+};
 use super::verdict::{Verdict, parse_pr_review_event, parse_verdict, verdict_raw_value};
 use super::webhook_queue_v2::{WebhookEventKind, classify_event};
 
@@ -80,6 +101,9 @@ pub(crate) enum PrefilterClass {
     VerdictUnreadable,
     /// (c) PR fermée ou mergée côté forge.
     VerdictPrClosed,
+    /// (b) `check_suite` verte sur une tête de PR déjà décidée DECISION-CORE
+    /// et notifiée, que cet événement redécide à l'identique.
+    GreenCheckSuiteHeadDecided,
 }
 
 impl PrefilterClass {
@@ -91,6 +115,7 @@ impl PrefilterClass {
             Self::VerdictNonReviewer => "verdict_non_reviewer",
             Self::VerdictUnreadable => "verdict_unreadable",
             Self::VerdictPrClosed => "verdict_pr_closed",
+            Self::GreenCheckSuiteHeadDecided => "green_check_suite_head_decided",
         }
     }
 }
@@ -122,6 +147,12 @@ pub(crate) enum Candidate {
         repo: String,
         branch: String,
     },
+    /// (b) toute `check_suite` verte hors branche par défaut. Elle n'est
+    /// écartée qu'au terme de [`decide`], sur la trace laissée par le handler.
+    GreenPrBranch {
+        repo: String,
+        branch: String,
+    },
     InertLabel {
         repo: String,
         issue: u64,
@@ -136,9 +167,16 @@ pub(crate) enum Candidate {
 /// tour a lieu. Lit les grammaires existantes, n'en écrit aucune.
 pub(crate) fn classify(text: &str) -> Option<Candidate> {
     if let Some(event) = parse_check_suite_success(text) {
-        return (event.branch == DEFAULT_BRANCH).then_some(Candidate::GreenDefaultBranch {
-            repo: event.repo,
-            branch: event.branch,
+        return Some(if event.branch == DEFAULT_BRANCH {
+            Candidate::GreenDefaultBranch {
+                repo: event.repo,
+                branch: event.branch,
+            }
+        } else {
+            Candidate::GreenPrBranch {
+                repo: event.repo,
+                branch: event.branch,
+            }
         });
     }
     if let Some(event) = parse_pr_review_event(text) {
@@ -186,18 +224,52 @@ pub(crate) fn parse_pr_state(json: &str) -> anyhow::Result<PrForgeState> {
     }
 }
 
+/// Une ligne d'audit, réduite à ce que la classe (b) lit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuditFact {
+    /// Rang d'écriture (`audit_events.id`) : seule une attestation strictement
+    /// ANTÉRIEURE à celle de cet événement vaut « déjà décidée ».
+    pub(crate) id: i64,
+    pub(crate) tool: String,
+    pub(crate) target: String,
+    pub(crate) after: Option<String>,
+    pub(crate) trace: Option<String>,
+}
+
+impl From<crate::db::AuditEvent> for AuditFact {
+    fn from(e: crate::db::AuditEvent) -> Self {
+        Self {
+            id: e.id,
+            tool: e.tool_name,
+            target: e.target_key,
+            after: e.after_value,
+            trace: e.trace_id,
+        }
+    }
+}
+
+/// Au plus autant d'attestations antérieures lues pour une PR.
+const PRIOR_HOLDS_LIMIT: u32 = 50;
+
 /// Les recherches d'état du pré-filtre, injectées pour que les tests les
 /// bouchonnent : aucun appel GitHub réel en test.
 pub(crate) trait PrefilterState {
     async fn branch_has_active_task(&self, branch: &str) -> anyhow::Result<bool>;
     async fn pr_has_active_task(&self, pr_url: &str) -> anyhow::Result<bool>;
     async fn pr_state(&self, repo: &str, pr_number: u64) -> anyhow::Result<PrForgeState>;
+    /// (b) les lignes d'audit écrites pour CET événement (son `trace_id`).
+    async fn event_audit_rows(&self) -> anyhow::Result<Vec<AuditFact>>;
+    /// (b) les attestations DECISION-CORE dont la cible commence par
+    /// `pr_prefix` (`pr:{repo}#{n}@`), tous événements confondus.
+    async fn decision_core_holds(&self, pr_prefix: &str) -> anyhow::Result<Vec<AuditFact>>;
 }
 
 /// L'état réel : base de l'agent, et `gh` pour la forge.
 pub(crate) struct LiveState<'a> {
     pub(crate) db: &'a AsyncDatabase,
     pub(crate) github_token: Option<&'a str>,
+    /// L'identité de l'événement, que les handlers posent en `trace_id`.
+    pub(crate) request_id: &'a str,
 }
 
 impl PrefilterState for LiveState<'_> {
@@ -224,6 +296,60 @@ impl PrefilterState for LiveState<'_> {
         .map_err(|e| anyhow::anyhow!(e))?;
         parse_pr_state(&output)
     }
+
+    async fn event_audit_rows(&self) -> anyhow::Result<Vec<AuditFact>> {
+        let rows = self
+            .db
+            .get_audit_events_by_trace_ids(vec![self.request_id.to_string()])
+            .await?;
+        Ok(rows.into_iter().map(AuditFact::from).collect())
+    }
+
+    async fn decision_core_holds(&self, pr_prefix: &str) -> anyhow::Result<Vec<AuditFact>> {
+        let rows = self
+            .db
+            .get_audit_events_for_target_prefix(
+                DECISION_CORE_HOLD_TOOL,
+                pr_prefix,
+                PRIOR_HOLDS_LIMIT,
+            )
+            .await?;
+        Ok(rows.into_iter().map(AuditFact::from).collect())
+    }
+}
+
+/// (b) Fonction pure, trois termes conjonctifs. Rend la tête quand CET
+/// événement a redécidé DECISION-CORE sur `repo` (décision attestée) et qu'un
+/// AUTRE événement l'avait déjà décidée AVANT lui sur la même cible (même
+/// tête) et notifiée (notification attestée). Tout le reste garde son tour —
+/// en particulier le premier traitement d'une tête, même si un traitement plus
+/// tardif a écrit son attestation avant que le premier n'atteigne la porte.
+pub(crate) fn head_decided_and_notified(
+    repo: &str,
+    this_event: &[AuditFact],
+    prior: &[AuditFact],
+) -> Option<String> {
+    let mine = this_event
+        .iter()
+        .find(|r| r.tool == DECISION_CORE_HOLD_TOOL)?;
+    if !mine.target.starts_with(&format!("pr:{repo}#")) {
+        return None;
+    }
+    prior
+        .iter()
+        .any(|p| {
+            p.tool == DECISION_CORE_HOLD_TOOL
+                && p.trace != mine.trace
+                && p.id < mine.id
+                && p.target == mine.target
+                && p.after.as_deref() == Some(DECISION_CORE_HOLD_NOTIFIED)
+        })
+        .then(|| mine.target.clone())
+}
+
+/// `pr:{repo}#{n}@{sha}` → `pr:{repo}#{n}@`. `None` si la cible n'a pas de SHA.
+fn pr_prefix(head: &str) -> Option<&str> {
+    head.rfind('@').map(|i| &head[..=i])
 }
 
 /// L'issue de la décision.
@@ -261,11 +387,43 @@ pub(crate) async fn decide(candidate: Candidate, state: &impl PrefilterState) ->
                 Err(e) => state_unreadable("branch_task", &target, &e),
             }
         }
+        Candidate::GreenPrBranch { repo, branch } => {
+            decide_head_decided(&repo, &branch, state).await
+        }
         Candidate::InertLabel { repo, issue, .. } => Decision::Skip {
             class: PrefilterClass::InertLabel,
             target: format!("issue:{repo}#{issue}"),
         },
         Candidate::ReviewVerdict(facts) => decide_review_verdict(facts, state).await,
+    }
+}
+
+/// (b) : la trace de CET événement d'abord (index sur `trace_id`, presque
+/// toujours sans attestation), les attestations de la PR ensuite. Toute lecture
+/// en erreur laisse passer (AC3).
+async fn decide_head_decided(repo: &str, branch: &str, state: &impl PrefilterState) -> Decision {
+    let pending = format!("check_suite:{repo}@{branch}");
+    let this_event = match state.event_audit_rows().await {
+        Ok(rows) => rows,
+        Err(e) => return state_unreadable("event_audit", &pending, &e),
+    };
+    let Some(prefix) = this_event
+        .iter()
+        .find(|r| r.tool == DECISION_CORE_HOLD_TOOL)
+        .and_then(|r| pr_prefix(&r.target))
+    else {
+        return Decision::Llm;
+    };
+    let prior = match state.decision_core_holds(prefix).await {
+        Ok(rows) => rows,
+        Err(e) => return state_unreadable("decision_core_holds", prefix, &e),
+    };
+    match head_decided_and_notified(repo, &this_event, &prior) {
+        Some(head) => Decision::Skip {
+            class: PrefilterClass::GreenCheckSuiteHeadDecided,
+            target: format!("check_suite:{}", head.strip_prefix("pr:").unwrap_or(&head)),
+        },
+        None => Decision::Llm,
     }
 }
 
@@ -304,17 +462,20 @@ pub(crate) fn prefilter_enabled() -> bool {
 }
 
 /// Ce que les handlers ont fait du texte. (a) et (d) exigent un texte
-/// intact ; (c) exige un texte intact APRÈS le `verdict_handler`.
+/// intact ; (c) exige un texte intact APRÈS le `verdict_handler` ; (b) exige
+/// qu'aucun handler autre que `ci_success_handler` n'y ait touché.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Touched {
     pub(crate) by_any_handler: bool,
     pub(crate) after_verdict_handler: bool,
+    pub(crate) outside_ci_success_handler: bool,
 }
 
 impl Touched {
     fn applies_to(self, candidate: &Candidate) -> bool {
         match candidate {
             Candidate::ReviewVerdict(_) => self.after_verdict_handler,
+            Candidate::GreenPrBranch { .. } => self.outside_ci_success_handler,
             Candidate::GreenDefaultBranch { .. } | Candidate::InertLabel { .. } => {
                 self.by_any_handler
             }
@@ -405,17 +566,38 @@ pub(crate) mod tests {
         );
     }
 
-    /// (a) terme par terme : conclusion, branche, préfixe.
+    /// (a) terme par terme : conclusion, branche, préfixe. Une branche autre
+    /// que `main` sort de (a) et entre dans (b) ; un échec, un `timed_out` ou
+    /// un texte sans préfixe ne sont candidats ni à l'une ni à l'autre (AC2).
     #[test]
     fn mika2675_classify_a_chaque_terme_sort_de_la_population() {
         for text in [
             "[GitHub] Check suite failure on senara-solutions/mika (branch: main)",
             "[GitHub] Check suite timed_out on senara-solutions/mika (branch: main)",
-            "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)",
-            "[GitHub] Check suite success on senara-solutions/mika (branch: mainline)",
+            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/2675/x)",
+            "[GitHub] Check suite timed_out on senara-solutions/mika (branch: fix/2675/x)",
             "Check suite success on senara-solutions/mika (branch: main)",
         ] {
             assert_eq!(classify(text), None, "{text}");
+        }
+        for (text, branch) in [
+            (
+                "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)",
+                "fix/2675/x",
+            ),
+            (
+                "[GitHub] Check suite success on senara-solutions/mika (branch: mainline)",
+                "mainline",
+            ),
+        ] {
+            assert_eq!(
+                classify(text),
+                Some(Candidate::GreenPrBranch {
+                    repo: "senara-solutions/mika".into(),
+                    branch: branch.into()
+                }),
+                "{text}"
+            );
         }
     }
 
@@ -463,6 +645,19 @@ pub(crate) mod tests {
         pub(crate) branch_task: Option<Result<bool, &'static str>>,
         pub(crate) pr_task: Option<Result<bool, &'static str>>,
         pub(crate) pr_state: Option<Result<PrForgeState, &'static str>>,
+        pub(crate) event_rows: Option<Result<Vec<AuditFact>, &'static str>>,
+        pub(crate) holds: Option<Result<Vec<AuditFact>, &'static str>>,
+    }
+
+    fn answer_rows(
+        slot: &Option<Result<Vec<AuditFact>, &'static str>>,
+        what: &str,
+    ) -> anyhow::Result<Vec<AuditFact>> {
+        match slot {
+            Some(Ok(v)) => Ok(v.clone()),
+            Some(Err(e)) => Err(anyhow::anyhow!(*e)),
+            None => panic!("recherche d'état non attendue : {what}"),
+        }
     }
 
     fn answer<T: Copy>(slot: &Option<Result<T, &'static str>>, what: &str) -> anyhow::Result<T> {
@@ -482,6 +677,12 @@ pub(crate) mod tests {
         }
         async fn pr_state(&self, _: &str, _: u64) -> anyhow::Result<PrForgeState> {
             answer(&self.pr_state, "pr_state")
+        }
+        async fn event_audit_rows(&self) -> anyhow::Result<Vec<AuditFact>> {
+            answer_rows(&self.event_rows, "event_rows")
+        }
+        async fn decision_core_holds(&self, _: &str) -> anyhow::Result<Vec<AuditFact>> {
+            answer_rows(&self.holds, "holds")
         }
     }
 
@@ -560,6 +761,10 @@ pub(crate) mod tests {
         assert_eq!(
             PrefilterClass::VerdictPrClosed.as_str(),
             "verdict_pr_closed"
+        );
+        assert_eq!(
+            PrefilterClass::GreenCheckSuiteHeadDecided.as_str(),
+            "green_check_suite_head_decided"
         );
     }
 
@@ -757,13 +962,231 @@ pub(crate) mod tests {
         let by_verdict_only = Touched {
             by_any_handler: true,
             after_verdict_handler: false,
+            outside_ci_success_handler: true,
         };
         let after = Touched {
             by_any_handler: true,
             after_verdict_handler: true,
+            outside_ci_success_handler: true,
         };
         assert!(!by_verdict_only.applies_to(&verdict));
         assert!(after.applies_to(&verdict));
         assert!(by_verdict_only.applies_to(&green));
+    }
+
+    // ---- phase 3 — classe (b) -------------------------------------------
+
+    const REPO: &str = "senara-solutions/mika";
+    pub(crate) const HEAD_A: &str =
+        "pr:senara-solutions/mika#2678@1a2edc8091fee6eec4c736b5dd974221802287b6";
+    const HEAD_B: &str = "pr:senara-solutions/mika#2678@ffffffffffffffffffffffffffffffffffffffff";
+    pub(crate) const GREEN_PR: &str =
+        "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)";
+
+    pub(crate) fn hold(target: &str, after: &str, trace: &str) -> AuditFact {
+        AuditFact {
+            // Rangs déterministes : « maintenant » / « now » écrit après tout le reste.
+            id: if trace.contains("now") || trace.contains("maintenant") {
+                10
+            } else {
+                1
+            },
+            tool: DECISION_CORE_HOLD_TOOL.into(),
+            target: target.into(),
+            after: Some(after.into()),
+            trace: Some(trace.into()),
+        }
+    }
+
+    fn processed(target: &str, trace: &str) -> AuditFact {
+        AuditFact {
+            id: 9,
+            tool: "ci_success_handler_processed".into(),
+            target: target.into(),
+            after: None,
+            trace: Some(trace.into()),
+        }
+    }
+
+    /// Le cas mesuré (mika#2672, #2674) : cet événement redécide, un
+    /// précédent avait décidé et notifié la même tête.
+    fn decided_case() -> (Vec<AuditFact>, Vec<AuditFact>) {
+        let mine = hold(HEAD_A, "notified", "rid-now");
+        (
+            vec![processed(HEAD_A, "rid-now"), mine.clone()],
+            vec![mine, hold(HEAD_A, "notified", "rid-before")],
+        )
+    }
+
+    #[test]
+    fn mika2675_b_les_trois_termes_tenus_ecartent() {
+        let (this_event, prior) = decided_case();
+        assert_eq!(
+            head_decided_and_notified(REPO, &this_event, &prior),
+            Some(HEAD_A.to_string())
+        );
+    }
+
+    /// Terme « décision attestée » : sans attestation de CET événement — dédup
+    /// 2b/2c, pas de verdict, checks en attente, simple marqueur `processed` —
+    /// le tour a lieu.
+    #[test]
+    fn mika2675_b_terme_decision_attestee() {
+        let (_, prior) = decided_case();
+        for this_event in [
+            vec![],
+            vec![processed(HEAD_A, "rid-now")],
+            vec![AuditFact {
+                tool: "ci_success_merge_ready".into(),
+                ..processed(HEAD_A, "rid-now")
+            }],
+        ] {
+            assert_eq!(
+                head_decided_and_notified(REPO, &this_event, &prior),
+                None,
+                "{this_event:?}"
+            );
+        }
+        // Une ligne antérieure d'un autre outil sur la même tête n'atteste pas
+        // la décision.
+        let (this_event, _) = decided_case();
+        let prior = vec![AuditFact {
+            tool: "ci_success_handler_human_gate_required".into(),
+            ..hold(HEAD_A, "notified", "rid-before")
+        }];
+        assert_eq!(head_decided_and_notified(REPO, &this_event, &prior), None);
+    }
+
+    /// Terme « même tête » : une décision notifiée sur un AUTRE SHA de la même
+    /// PR ne compte pas — une nouvelle tête n'est jamais filtrée (AC2).
+    #[test]
+    fn mika2675_b_terme_meme_tete() {
+        let (this_event, _) = decided_case();
+        let prior = vec![hold(HEAD_B, "notified", "rid-before")];
+        assert_eq!(head_decided_and_notified(REPO, &this_event, &prior), None);
+        // Et la tête de cet événement doit appartenir au dépôt de l'événement.
+        let (this_event, prior) = decided_case();
+        assert_eq!(
+            head_decided_and_notified("senara-solutions/mika-cloud", &this_event, &prior),
+            None
+        );
+    }
+
+    /// Terme « notification attestée » : antérieure non notifiée, ou sans
+    /// valeur, ne compte pas.
+    #[test]
+    fn mika2675_b_terme_notification_attestee() {
+        let (this_event, _) = decided_case();
+        for after in [Some("not_notified"), None] {
+            let prior = vec![AuditFact {
+                after: after.map(Into::into),
+                ..hold(HEAD_A, "", "rid-before")
+            }];
+            assert_eq!(
+                head_decided_and_notified(REPO, &this_event, &prior),
+                None,
+                "{after:?}"
+            );
+        }
+    }
+
+    /// Une attestation d'un autre événement écrite APRÈS celle de cet événement
+    /// ne vaut pas « déjà » : le premier traitement d'une tête, lent, garde son
+    /// tour même si un traitement plus tardif l'a devancé dans l'audit (AC2).
+    #[test]
+    fn mika2675_b_terme_anteriorite() {
+        let (this_event, _) = decided_case();
+        let later = AuditFact {
+            id: 11,
+            ..hold(HEAD_A, "notified", "rid-after")
+        };
+        assert_eq!(head_decided_and_notified(REPO, &this_event, &[later]), None);
+    }
+
+    /// Premier traitement d'une tête : la seule attestation est la sienne,
+    /// même notifiée — elle ne vaut pas « déjà » (AC2).
+    #[test]
+    fn mika2675_b_premier_traitement_garde_son_tour() {
+        let mine = hold(HEAD_A, "notified", "rid-now");
+        assert_eq!(
+            head_decided_and_notified(
+                REPO,
+                std::slice::from_ref(&mine),
+                std::slice::from_ref(&mine)
+            ),
+            None
+        );
+    }
+
+    fn rows(
+        event: Result<Vec<AuditFact>, &'static str>,
+        holds: Option<Result<Vec<AuditFact>, &'static str>>,
+    ) -> Stub {
+        Stub {
+            event_rows: Some(event),
+            holds,
+            ..Stub::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn mika2675_b_decide_ecarte_avec_cible_nommee() {
+        let (this_event, prior) = decided_case();
+        assert_eq!(
+            decide(
+                classify(GREEN_PR).unwrap(),
+                &rows(Ok(this_event), Some(Ok(prior)))
+            )
+            .await,
+            Decision::Skip {
+                class: PrefilterClass::GreenCheckSuiteHeadDecided,
+                target: format!("check_suite:{}", HEAD_A.strip_prefix("pr:").unwrap()),
+            }
+        );
+    }
+
+    /// Sans attestation de cet événement, les attestations de la PR ne sont
+    /// même pas lues (le bouchon paniquerait).
+    #[tokio::test]
+    async fn mika2675_b_decide_sans_attestation_ne_lit_pas_la_pr() {
+        let c = classify(GREEN_PR).unwrap();
+        assert_eq!(
+            decide(c, &rows(Ok(vec![processed(HEAD_A, "rid-now")]), None)).await,
+            Decision::Llm
+        );
+    }
+
+    /// AC3 : audit illisible, à l'une ou l'autre lecture ⇒ le tour a lieu.
+    #[tokio::test]
+    async fn mika2675_b_audit_illisible_le_tour_a_lieu() {
+        let (this_event, _) = decided_case();
+        let c = || classify(GREEN_PR).unwrap();
+        assert_eq!(
+            decide(c(), &rows(Err("db down"), None)).await,
+            Decision::Llm
+        );
+        assert_eq!(
+            decide(c(), &rows(Ok(this_event), Some(Err("db down")))).await,
+            Decision::Llm
+        );
+    }
+
+    #[test]
+    fn mika2675_b_prefixe_de_pr() {
+        assert_eq!(pr_prefix(HEAD_A), Some("pr:senara-solutions/mika#2678@"));
+        assert_eq!(pr_prefix("pr:senara-solutions/mika#2678"), None);
+    }
+
+    /// (b) n'admet qu'un texte touché par `ci_success_handler` seul.
+    #[test]
+    fn mika2675_b_texte_touche_hors_ci_success_handler() {
+        let b = classify(GREEN_PR).unwrap();
+        let by = |outside| Touched {
+            by_any_handler: true,
+            after_verdict_handler: true,
+            outside_ci_success_handler: outside,
+        };
+        assert!(!by(false).applies_to(&b));
+        assert!(by(true).applies_to(&b));
     }
 }

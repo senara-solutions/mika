@@ -5686,6 +5686,7 @@ mod tests {
         let live = webhook_prefilter::LiveState {
             db: &db,
             github_token: None,
+            request_id: "r",
         };
         for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
             assert!(
@@ -5703,6 +5704,7 @@ mod tests {
         webhook_prefilter::Touched {
             by_any_handler: touched,
             after_verdict_handler: touched,
+            outside_ci_success_handler: touched,
         }
     }
 
@@ -5714,6 +5716,7 @@ mod tests {
         let live = webhook_prefilter::LiveState {
             db: &db,
             github_token: None,
+            request_id: "r",
         };
         let hold = webhook_prefilter::tests::review(
             "commented",
@@ -5907,13 +5910,152 @@ mod tests {
         let live = webhook_prefilter::LiveState {
             db: &db,
             github_token: None,
+            request_id: "r",
         };
         let text = mika2675_review("commented", MIKA2675_QA, "VERDICT: hold[review]");
         let touched = |after| webhook_prefilter::Touched {
             by_any_handler: true,
             after_verdict_handler: after,
+            outside_ci_success_handler: true,
         };
         assert!(!webhook_prefilter::skip_turn(&db, &live, &text, touched(true), "r", true).await);
         assert!(webhook_prefilter::skip_turn(&db, &live, &text, touched(false), "r", true).await);
+    }
+
+    // ---- mika#2675 phase 3 — classe (b) -----------------------------------
+    //
+    // `ci_success_handler` ne peut atteindre sa branche DECISION-CORE sans
+    // `gh` : les attestations qu'il y écrit sont donc posées en base, sous le
+    // `trace_id` que le handler aurait utilisé (le `request_id` du tour). Le
+    // reste du chemin est le chemin réel : `run_agent_for_message`, la porte,
+    // `LiveState`, la base, et le compteur du LLM bouchonné.
+
+    const MIKA2675_RID: &str = "rid-2675";
+
+    async fn mika2675_seed_hold(state: &AppState, target: &str, after: &str, trace: &str) {
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        db.log_audit_event(
+            "s",
+            ci_success_handler::DECISION_CORE_HOLD_TOOL,
+            target,
+            None,
+            Some(after),
+            None,
+            Some(trace),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn mika2675_skipped_classes(state: &AppState) -> Vec<Option<String>> {
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        agent_state
+            .db
+            .get_audit_event_rows_by_tool_name(webhook_prefilter::PREFILTER_SKIPPED_TOOL)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, after, _)| after)
+            .collect()
+    }
+
+    /// AC1(b) — une `check_suite` verte sur une tête déjà décidée
+    /// DECISION-CORE et notifiée, que cet événement redécide : zéro appel LLM,
+    /// une ligne d'audit nommée.
+    #[tokio::test]
+    async fn mika2675_b_tete_decidee_et_notifiee_aucun_appel_llm() {
+        use webhook_prefilter::tests::{GREEN_PR, HEAD_A};
+        let (state, mock) = mika2675_state();
+        mika2675_seed_hold(&state, HEAD_A, "notified", "rid-avant").await;
+        mika2675_seed_hold(&state, HEAD_A, "notified", MIKA2675_RID).await;
+        mika2675_run_on(&state, GREEN_PR).await;
+        assert_eq!(mock.calls_made(), 0);
+        assert_eq!(
+            mika2675_skipped_classes(&state).await,
+            vec![Some("green_check_suite_head_decided".to_string())]
+        );
+    }
+
+    /// AC2, AC3 et mutations, de bout en bout : chaque terme rendu faux — et
+    /// chaque événement hors population — déclenche le tour LLM.
+    #[tokio::test]
+    async fn mika2675_b_controles_negatifs_le_tour_a_lieu() {
+        use webhook_prefilter::tests::{GREEN_PR, HEAD_A};
+        let other_sha = "pr:senara-solutions/mika#2678@ffffffffffffffffffffffffffffffffffffffff";
+        // (antérieure, cet événement, texte) — None : pas de ligne posée.
+        type Case<'a> = (Option<(&'a str, &'a str)>, Option<&'a str>, &'a str);
+        let cases: [Case; 6] = [
+            // Premier traitement de la tête : aucune décision antérieure.
+            (None, Some(HEAD_A), GREEN_PR),
+            // Cet événement n'a rien redécidé (dédup 2b/2c, pas de verdict…).
+            (Some((HEAD_A, "notified")), None, GREEN_PR),
+            // Nouvelle tête : la décision antérieure porte un autre SHA.
+            (Some((other_sha, "notified")), Some(HEAD_A), GREEN_PR),
+            // Décision antérieure non notifiée.
+            (Some((HEAD_A, "not_notified")), Some(HEAD_A), GREEN_PR),
+            // `check_suite` en échec ou `timed_out` : jamais candidate.
+            (
+                Some((HEAD_A, "notified")),
+                Some(HEAD_A),
+                "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/2675/x)",
+            ),
+            (
+                Some((HEAD_A, "notified")),
+                Some(HEAD_A),
+                "[GitHub] Check suite timed_out on senara-solutions/mika (branch: fix/2675/x)",
+            ),
+        ];
+        for (prior, mine, text) in cases {
+            let (state, mock) = mika2675_state();
+            if let Some((target, after)) = prior {
+                mika2675_seed_hold(&state, target, after, "rid-avant").await;
+            }
+            if let Some(target) = mine {
+                mika2675_seed_hold(&state, target, "notified", MIKA2675_RID).await;
+            }
+            mika2675_run_on(&state, text).await;
+            assert!(mock.calls_made() >= 1, "{prior:?} / {mine:?} / {text}");
+            assert!(
+                mika2675_skipped_classes(&state).await.is_empty(),
+                "{prior:?} / {mine:?} / {text}"
+            );
+        }
+    }
+
+    /// Sur la porte : texte touché hors `ci_success_handler`, interrupteur
+    /// désarmé, audit illisible — le tour a lieu.
+    #[tokio::test]
+    async fn mika2675_b_porte_texte_interrupteur_et_audit_illisible() {
+        use webhook_prefilter::tests::{GREEN_PR, HEAD_A, Stub, hold};
+        let (state, _) = mika2675_state();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        let decided = || Stub {
+            event_rows: Some(Ok(vec![hold(HEAD_A, "notified", "maintenant")])),
+            holds: Some(Ok(vec![hold(HEAD_A, "notified", "avant")])),
+            ..Stub::default()
+        };
+        let outside = |o| webhook_prefilter::Touched {
+            by_any_handler: true,
+            after_verdict_handler: true,
+            outside_ci_success_handler: o,
+        };
+        for (stub, touched, enabled, skipped) in [
+            (decided(), outside(false), true, true),
+            (decided(), outside(true), true, false),
+            (decided(), outside(false), false, false),
+            (
+                Stub {
+                    event_rows: Some(Err("db down")),
+                    ..Stub::default()
+                },
+                outside(false),
+                true,
+                false,
+            ),
+        ] {
+            let got =
+                webhook_prefilter::skip_turn(&db, &stub, GREEN_PR, touched, "r", enabled).await;
+            assert_eq!(got, skipped, "{touched:?} / enabled={enabled}");
+        }
     }
 }

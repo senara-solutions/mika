@@ -124,6 +124,47 @@ pub(crate) fn is_duplicate_processed(recent_marker_count: i64) -> bool {
     recent_marker_count >= 1
 }
 
+/// Clé d'une tête de PR dans l'audit : `pr:{repo}#{n}@{head_sha}`. Partagée
+/// par le marqueur de dédup (mika#1869) et l'attestation DECISION-CORE
+/// (mika#2675) — une seule forme, que le pré-filtre relit telle quelle.
+pub(crate) fn head_key(repo: &str, pr_number: u64, head_sha: &str) -> String {
+    format!("pr:{repo}#{pr_number}@{head_sha}")
+}
+
+/// `audit_events.tool_name` de l'attestation « cette tête a été décidée
+/// DECISION-CORE », écrite APRÈS l'envoi de la notification (mika#2675
+/// phase 3). Cible [`head_key`] ; `after_value` vaut
+/// [`DECISION_CORE_HOLD_NOTIFIED`] ou [`DECISION_CORE_HOLD_NOT_NOTIFIED`].
+/// **SOLE WRITER** : [`try_handle_ci_success`]. Lecteur : le pré-filtre.
+pub(crate) const DECISION_CORE_HOLD_TOOL: &str = "ci_success_handler_decision_core_hold";
+pub(crate) const DECISION_CORE_HOLD_NOTIFIED: &str = "notified";
+pub(crate) const DECISION_CORE_HOLD_NOT_NOTIFIED: &str = "not_notified";
+
+/// L'issue de l'envoi, telle que l'attestation la porte. Seul `Delivered`
+/// atteste une notification : un canal absent ou un échec n'en est pas une.
+pub(crate) fn decision_core_notification_value(
+    outcome: &anyhow::Result<crate::messaging::SendOutcome>,
+) -> (&'static str, String) {
+    use crate::messaging::SendOutcome;
+    match outcome {
+        Ok(SendOutcome::Delivered) => {
+            (DECISION_CORE_HOLD_NOTIFIED, "notification=delivered".into())
+        }
+        Ok(SendOutcome::Failed { reason }) => (
+            DECISION_CORE_HOLD_NOT_NOTIFIED,
+            format!("notification=failed reason={reason}"),
+        ),
+        Ok(SendOutcome::NoChannel) => (
+            DECISION_CORE_HOLD_NOT_NOTIFIED,
+            "notification=no_channel".into(),
+        ),
+        Err(e) => (
+            DECISION_CORE_HOLD_NOT_NOTIFIED,
+            format!("notification=error error={e}"),
+        ),
+    }
+}
+
 /// Attempt to handle a CI success event structurally before the LLM turn.
 ///
 /// Returns `VerdictAction::Handled` when the handler emitted a merge-ready
@@ -298,7 +339,7 @@ pub async fn try_handle_ci_success(
     // and carries no agent_id — so the reviewer's entry consumed the dispatcher's
     // slot. Fail-open on read error — never let an audit hiccup block a legitimate
     // merge.
-    let processed_key = format!("pr:{}#{}@{}", event.repo, pr.number, pr.head_sha);
+    let processed_key = head_key(&event.repo, pr.number, &pr.head_sha);
     let since = crate::timestamp::now_minus(chrono::Duration::seconds(60));
     match db
         .count_recent_audit_events_for_target(
@@ -542,7 +583,7 @@ pub async fn try_handle_ci_success(
         }
 
         // Notify operator with the concrete file list.
-        if let Some(sender) = message_sender {
+        let (notified_value, notified_detail) = if let Some(sender) = message_sender {
             let notification = format!(
                 "PR #{} on {} — CI checks all green + VERDICT: pass from @{}, but touches DECISION-CORE zone(s). \
                  Auto-merge blocked by forge-gate (mika#1853). {}. Operator must merge manually.",
@@ -551,7 +592,8 @@ pub async fn try_handle_ci_success(
                 verdict_review.reviewer,
                 perimeter_verdict.summary(),
             );
-            match sender.send(&notification).await {
+            let outcome = sender.send(&notification).await;
+            match &outcome {
                 Ok(crate::messaging::SendOutcome::Delivered) => {}
                 Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                     warn!(reason = %reason, "CI success DECISION-CORE hold notification delivery failed");
@@ -565,6 +607,34 @@ pub async fn try_handle_ci_success(
                     warn!(error = %e, "Failed to send CI success DECISION-CORE hold notification");
                 }
             }
+            decision_core_notification_value(&outcome)
+        } else {
+            (
+                DECISION_CORE_HOLD_NOT_NOTIFIED,
+                "notification=no_sender".to_string(),
+            )
+        };
+
+        // mika#2675 phase 3 — attestation par TÊTE, écrite APRÈS l'envoi pour
+        // porter son issue. La ligne `human_gate_required` ci-dessus cible
+        // `pr:{repo}#{n}` sans SHA et précède l'envoi : elle ne peut attester ni
+        // la tête ni la notification. Celle-ci le peut, et c'est ce que le
+        // pré-filtre relit pour écarter le tour LLM d'un retraitement qui
+        // redécide la même chose sur la même tête. Additive : aucune décision,
+        // aucun envoi, aucun retour de ce handler n'en dépend.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                DECISION_CORE_HOLD_TOOL,
+                &head_key(&event.repo, pr.number, &pr.head_sha),
+                None,
+                Some(notified_value),
+                Some(&notified_detail),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, "Failed to log ci_success_handler_decision_core_hold audit event");
         }
 
         return VerdictAction::Handled {
@@ -1433,5 +1503,38 @@ mod mika2667_tests {
     fn a_review_with_no_author_is_not_selected() {
         let reviews = vec![json!({"state": "APPROVED", "body": "VERDICT: pass", "commit_id": "x"})];
         assert!(select_pass_verdict(&reviews).is_none());
+    }
+
+    /// mika#2675 phase 3 — seul `Delivered` atteste une notification ; un
+    /// canal absent, un échec ou une erreur n'en sont pas une.
+    #[test]
+    fn mika2675_seul_delivered_atteste_la_notification() {
+        use crate::messaging::SendOutcome;
+        use crate::server::ci_success_handler::{
+            DECISION_CORE_HOLD_NOT_NOTIFIED, DECISION_CORE_HOLD_NOTIFIED, DECISION_CORE_HOLD_TOOL,
+            decision_core_notification_value, head_key,
+        };
+        let value = |o: anyhow::Result<SendOutcome>| decision_core_notification_value(&o).0;
+        assert_eq!(
+            value(Ok(SendOutcome::Delivered)),
+            DECISION_CORE_HOLD_NOTIFIED
+        );
+        for o in [
+            Ok(SendOutcome::Failed {
+                reason: "503".into(),
+            }),
+            Ok(SendOutcome::NoChannel),
+            Err(anyhow::anyhow!("réseau")),
+        ] {
+            assert_eq!(value(o), DECISION_CORE_HOLD_NOT_NOTIFIED);
+        }
+        assert_eq!(
+            DECISION_CORE_HOLD_TOOL,
+            "ci_success_handler_decision_core_hold"
+        );
+        assert_eq!(
+            head_key("senara-solutions/mika", 2678, "abc"),
+            "pr:senara-solutions/mika#2678@abc"
+        );
     }
 }
