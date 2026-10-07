@@ -55,6 +55,11 @@ erreur : le tour a lieu. Un faux « écarter » perd un événement ; un faux
 préfixe `operator-` et les labels d'automatisation. Large à dessein : un lecteur
 qui fait grandir sa liste fait grandir l'ensemble dans la même édition.
 
+Le critère est l'**événement d'ajout**, pas l'existence du label comme état :
+`p1-important` ou `bug` sont lus comme état par le feeder et dispatch-lib, mais
+leur ajout ne met rien en mouvement — d'où leur filtrage. Écrire « un label lu
+n'est jamais filtré » serait faux d'après le code ; la revue l'a relevé.
+
 ## La sonde (AC5)
 
 Les écarts, par classe et par agent :

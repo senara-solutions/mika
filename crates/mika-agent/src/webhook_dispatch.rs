@@ -441,9 +441,9 @@ pub(crate) const DISPATCH_SEAT_LABEL_PREFIX: &str = "dispatch:";
 pub(crate) const READY_LABEL: &str = "ready";
 
 /// Automation labels of `.github/labels.yml` that dispatch-lib or the engine
-/// read off a ticket or a PR. Their add-event triggers nothing today, but a
-/// label the loop reads is never declared inert: a label wrongly read as inert
-/// loses an event, a label wrongly read as live only costs a turn.
+/// read off a ticket or a PR. Their add-event triggers nothing today; they are
+/// kept out of the inert set anyway, because a label wrongly read as inert
+/// loses an event while a label wrongly read as live only costs a turn.
 pub(crate) const LOOP_AUTOMATION_LABELS: &[&str] = &[
     "loop-substrate",
     "needs-build",
@@ -461,10 +461,14 @@ pub(crate) const LOOP_AUTOMATION_LABELS: &[&str] = &[
 pub(crate) const LOOP_READ_LABEL_PREFIXES: &[&str] =
     &["operator-", DISPATCH_SEAT_LABEL_PREFIX, "phase:", "origin:"];
 
-/// Does any part of the loop read this label? (mika#2675 AC1(d))
+/// Can adding this label set anything in motion? (mika#2675 AC1(d))
 ///
-/// The single set behind the webhook pre-filter: an `issues.labeled` event
-/// whose label is NOT read here costs no LLM turn. Composed from the
+/// The criterion is the ADD-EVENT, not the label's existence as state.
+/// Priority and type labels (`p1-important`, `bug`, …) are read as state by
+/// the feeder and dispatch-lib, but adding one triggers nothing — the
+/// `self-dev` prompt already answers it with "acknowledge, do NOT dispatch" —
+/// so their `issues.labeled` event costs no LLM turn. This is the single set
+/// behind the webhook pre-filter. Composed from the
 /// constants its readers already use — [`READY_LABEL`],
 /// [`OPERATOR_HELD_LABELS`], [`DISPATCH_SEAT_LABEL_PREFIX`] — so a reader
 /// that grows its list grows this set in the same edit. Case-insensitive, so a

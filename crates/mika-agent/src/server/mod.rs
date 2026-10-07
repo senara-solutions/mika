@@ -5554,8 +5554,9 @@ mod tests {
     // ---- mika#2675 phase 1 — pré-filtre déterministe ----------------------
     //
     // Chaque test fait tourner `run_agent_for_message` sur le texte tel que le
-    // gateway le délivre, et lit le compteur du LLM bouchonné. Aucun jeton
-    // GitHub dans l'état de test : aucun handler ne lance `gh`.
+    // gateway le délivre, et lit le compteur du LLM bouchonné. Le jeton GitHub
+    // est retiré explicitement : `Settings::load` lit le `MIKA_*` du processus,
+    // et un `MIKA_GITHUB_TOKEN` exporté ferait lancer un `gh` réel aux handlers.
 
     fn mika2675_state() -> (AppState, Arc<mika_common::llm::mock::MockLlmProvider>) {
         use mika_common::llm::mock::{MockLlmProvider, text_response};
@@ -5564,9 +5565,15 @@ mod tests {
                 .responses((0..8).map(|_| text_response("Noted.")).collect())
                 .build(),
         );
-        let state = test_state();
+        let mut settings = test_settings();
+        settings.github_token = None;
+        let state = test_state_with_settings(settings);
         {
             let mut entry = state.agents.get_mut("mika").unwrap();
+            assert!(
+                entry.value().github_app.is_none(),
+                "aucune App GitHub en test"
+            );
             Arc::get_mut(entry.value_mut())
                 .expect("AgentState détenu par la seule table")
                 .llm = mock.clone();
