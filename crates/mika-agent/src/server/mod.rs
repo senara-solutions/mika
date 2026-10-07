@@ -30,6 +30,7 @@ pub mod upstream_close_handler;
 pub mod variants;
 pub(crate) mod verdict;
 pub mod verdict_handler;
+pub(crate) mod webhook_prefilter;
 pub mod webhook_queue;
 pub mod webhook_queue_v2;
 
@@ -5548,5 +5549,201 @@ mod tests {
 
         assert!(mock.calls_made() >= 1, "le tour de revue doit tourner");
         assert_eq!(mika2671_b2_started_rows(&state, "B").await, 1);
+    }
+
+    // ---- mika#2675 phase 1 — pré-filtre déterministe ----------------------
+    //
+    // Chaque test fait tourner `run_agent_for_message` sur le texte tel que le
+    // gateway le délivre, et lit le compteur du LLM bouchonné. Le jeton GitHub
+    // est retiré explicitement : `Settings::load` lit le `MIKA_*` du processus,
+    // et un `MIKA_GITHUB_TOKEN` exporté ferait lancer un `gh` réel aux handlers.
+
+    fn mika2675_state() -> (AppState, Arc<mika_common::llm::mock::MockLlmProvider>) {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses((0..8).map(|_| text_response("Noted.")).collect())
+                .build(),
+        );
+        let mut settings = test_settings();
+        settings.github_token = None;
+        let state = test_state_with_settings(settings);
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            assert!(
+                entry.value().github_app.is_none(),
+                "aucune App GitHub en test"
+            );
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .llm = mock.clone();
+        }
+        (state, mock)
+    }
+
+    /// Fait tourner un événement ; rend le nombre d'appels LLM.
+    async fn mika2675_run(text: &str) -> (usize, usize) {
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, text).await;
+        let skipped = mika2675_skipped_rows(&state).await;
+        (mock.calls_made(), skipped)
+    }
+
+    async fn mika2675_run_on(state: &AppState, text: &str) {
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        let lock = agent_state.agent_lock.clone().lock_owned().await;
+        let req = super::types::MessageRequest {
+            text: text.to_string(),
+            chat_id: None,
+            channel: "github".to_string(),
+            request_id: "rid-2675".to_string(),
+            agent: "mika".to_string(),
+            images: None,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            handlers::run_agent_for_message(state, &agent_state, req, Vec::new(), lock),
+        )
+        .await
+        .expect("le tour doit se terminer");
+    }
+
+    async fn mika2675_skipped_rows(state: &AppState) -> usize {
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        agent_state
+            .db
+            .get_audit_event_rows_by_tool_name(webhook_prefilter::PREFILTER_SKIPPED_TOOL)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Une tâche manuelle active portant `claude_pilot.branch` / `.pr_url`.
+    async fn mika2675_seed_task(state: &AppState, metadata: &str) {
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        db.create_task(crate::db::NewTask {
+            agent_id: db.agent_id.clone(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "self-dev".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: Some(metadata.to_string()),
+            r#type: None,
+            dispatch_class: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    const MIKA2675_GREEN_MAIN: &str =
+        "[GitHub] Check suite success on senara-solutions/mika (branch: main)";
+    const MIKA2675_INERT_LABEL: &str = "[GitHub] Issue labeled p1-important on senara-solutions/mika#2675 — fix(webhooks): pré-filtre déterministe\nhttps://github.com/senara-solutions/mika/issues/2675\nLabeled by: @samidarko";
+
+    /// AC1(a) — `check_suite` verte sur `main`, sans tâche : zéro appel LLM.
+    #[tokio::test]
+    async fn mika2675_a_check_suite_verte_sur_main_aucun_appel_llm() {
+        assert_eq!(mika2675_run(MIKA2675_GREEN_MAIN).await, (0, 1));
+    }
+
+    /// AC1(d) — label inerte : zéro appel LLM.
+    #[tokio::test]
+    async fn mika2675_d_label_inerte_aucun_appel_llm() {
+        assert_eq!(mika2675_run(MIKA2675_INERT_LABEL).await, (0, 1));
+    }
+
+    /// AC1(a), terme « sans tâche active liée à la branche » : avec une tâche,
+    /// le tour a lieu.
+    #[tokio::test]
+    async fn mika2675_a_tache_active_sur_la_branche_le_tour_a_lieu() {
+        let (state, mock) = mika2675_state();
+        mika2675_seed_task(&state, r#"{"claude_pilot":{"branch":"main"}}"#).await;
+        mika2675_run_on(&state, MIKA2675_GREEN_MAIN).await;
+        assert!(mock.calls_made() >= 1);
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    /// AC1(a)/(d), terme « texte intact » : un handler qui a touché le texte
+    /// garde le tour. Exercé sur la porte, le texte touché n'étant pas
+    /// atteignable sans jeton GitHub.
+    #[tokio::test]
+    async fn mika2675_texte_touche_par_un_handler_le_tour_a_lieu() {
+        let (state, _) = mika2675_state();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
+            assert!(!webhook_prefilter::skip_turn(&db, text, true, "r", true).await);
+            assert!(webhook_prefilter::skip_turn(&db, text, false, "r", true).await);
+        }
+    }
+
+    /// AC4 — désarmé, rien n'est filtré.
+    #[tokio::test]
+    async fn mika2675_interrupteur_desarme_rien_nest_filtre() {
+        let (state, _) = mika2675_state();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
+            assert!(!webhook_prefilter::skip_turn(&db, text, false, "r", false).await);
+        }
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    /// AC2 et mutations — contrôles négatifs : chaque événement légitime, et
+    /// chaque terme de (a)/(d) rendu faux, déclenche le tour LLM.
+    #[tokio::test]
+    async fn mika2675_evenements_legitimes_le_tour_a_lieu() {
+        let pr = "senara-solutions/mika#2680 — fix(x): y (branch: fix/2675/x)\nhttps://github.com/senara-solutions/mika/pull/2680";
+        let cases = [
+            format!("[GitHub] PR opened: {pr}\n\ncorps"),
+            format!("[GitHub] PR synchronize: {pr}"),
+            format!("[GitHub] PR ready_for_review: {pr}"),
+            format!("[GitHub] PR review_requested: {pr}\nRequested reviewer: @mika-platform-qa"),
+            format!("[GitHub] PR closed: {pr}\nMerged: false"),
+            format!("[GitHub] PR closed: {pr}\nMerged: true"),
+            "[GitHub] Check suite failure on senara-solutions/mika (branch: main)".into(),
+            "[GitHub] Check suite timed_out on senara-solutions/mika (branch: main)".into(),
+            "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)".into(),
+            "[GitHub] New comment on senara-solutions/mika#2675 (t) by @samidarko\nhttps://x\n\nrelance le groom".into(),
+            "[GitHub] Issue labeled ready on senara-solutions/mika#2675 — t\nhttps://x\nLabeled by: @samidarko".into(),
+            "[GitHub] Issue labeled blocked on senara-solutions/mika#2675 — t\nhttps://x".into(),
+            "[GitHub] Issue labeled operator-gated on senara-solutions/mika#2675 — t\nhttps://x".into(),
+            "[GitHub] Issue labeled dispatch:ssc on senara-solutions/mika#2675 — t\nhttps://x".into(),
+            "[GitHub] Issue labeled needs-build on senara-solutions/mika#2675 — t\nhttps://x".into(),
+        ];
+        for text in cases {
+            let (calls, skipped) = mika2675_run(&text).await;
+            assert!(calls >= 1, "le tour doit avoir lieu : {text}");
+            assert_eq!(skipped, 0, "aucune ligne d'écart : {text}");
+        }
+    }
+
+    /// AC2 — un verdict `pass` du relecteur QA sur une PR avec tâche active.
+    #[tokio::test]
+    async fn mika2675_verdict_pass_qa_tache_active_le_tour_a_lieu() {
+        let (state, mock) = mika2675_state();
+        mika2675_seed_task(
+            &state,
+            r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/2680"}}"#,
+        )
+        .await;
+        mika2675_run_on(
+            &state,
+            "[GitHub] PR review (approved) on senara-solutions/mika#2680 (t) by @mika-platform-qa\nhttps://github.com/senara-solutions/mika/pull/2680#pullrequestreview-1\n\nVERDICT: pass",
+        )
+        .await;
+        assert!(mock.calls_made() >= 1);
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
     }
 }
