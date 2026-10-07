@@ -149,3 +149,73 @@ Phase 1 : (a) `check_suite` verte sur `main`, (d) label inerte.
 Phase 2 (livrée) : (c) `pr_review` non actionnable sans tâche. Phase 3 : (b) `check_suite` verte sur
 une PR déjà décidée et notifiée pour cette tête — le SHA n'est pas dans le texte
 du gateway ; la décision vit dans `ci_success_handler` après `find_open_pr`.
+
+## Phase 3 : une décision n'est filtrable que si une trace l'atteste, tête et notification comprises
+
+La classe (b) (`check_suite` verte sur une tête déjà décidée et notifiée)
+semblait vivre dans les deux couches de dédup par tête de
+`ci_success_handler` (2b mémoire, 2c audit). **La mesure l'a déplacée.** Sur
+3 jours de `audit_events` × `llm_calls` joints par `trace_id`, les traitements
+d'une même tête sont espacés de **plusieurs minutes**, donc au-delà de la
+fenêtre de 60 s. Le cas réel est le **retraitement complet** qui redécide
+DECISION-CORE, renotifie et rend `Handled`. Exemples : mika#2672@4ab024d à
+16:54 puis 17:06, et mika#2674@a634a46 à 20:54 puis 21:05. Le tour LLM qui suit
+conclut « Already notified ».
+
+Les dédups 2b/2c **gardent leur tour**. Leur marqueur `processed` est écrit
+*avant* l'évaluation, donc il atteste « traitement commencé », jamais l'issue.
+Et un `hold` n'est atteint qu'une fois tous les checks terminés, ce qui rend
+une dédup < 60 s *après* un hold structurellement improbable.
+
+Ce qui manquait n'était pas un filtre mais une **trace**. La ligne
+`human_gate_required` cible `pr:{repo}#{n}` sans SHA et précède l'envoi : elle
+ne peut attester ni la tête ni la notification. La phase 3 ajoute donc une
+attestation additive, `ci_success_handler_decision_core_hold`. Elle cible
+`pr:{repo}#{n}@{sha}`, porte `notified` / `not_notified` et est écrite
+**après** l'envoi. Les décisions, la notification et le retour du handler sont
+inchangés.
+
+La porte écarte le tour quand quatre termes tiennent, chacun avec sa mutation
+vue rouge :
+
+- **décision attestée** : *cet* événement a écrit l'attestation ;
+- **même tête** : un *autre* événement porte la même cible exacte ;
+- **notification attestée** : cette attestation antérieure dit `notified` ;
+- **antériorité** : son `id` est strictement plus petit.
+
+Ce dernier terme vient de la revue. Sans lui, un premier traitement lent
+(plus de 60 s de `gh`) pouvait être devancé dans l'audit par un traitement plus
+tardif, et sauté, ce qui viole AC2.
+
+Leçon générale : **avant de filtrer « déjà fait », chercher la trace qui dit
+*quoi* a été fait, *sur quoi*, et *si c'est arrivé*.** Un marqueur de passage
+n'est pas une attestation d'issue.
+
+Sonde de la classe (b), avec les tours qu'elle n'attrape pas encore :
+
+```sql
+-- Les écarts (b)
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'webhook_prefilter_skipped'
+   AND after_value = 'green_check_suite_head_decided';
+
+-- Les attestations posées, par issue de notification
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'ci_success_handler_decision_core_hold' GROUP BY 1;
+
+-- Tours LLM restants sur une tête dont une attestation antérieure notifiée
+-- existe (doit tendre vers zéro)
+SELECT a.trace_id, sum(l.input_tokens) FROM audit_events a
+  JOIN llm_calls l ON l.trace_id = a.trace_id AND l.agent_id = a.agent_id
+ WHERE a.tool_name = 'ci_success_handler_decision_core_hold'
+   AND EXISTS (SELECT 1 FROM audit_events p
+                WHERE p.tool_name = a.tool_name AND p.target_key = a.target_key
+                  AND p.after_value = 'notified' AND p.id < a.id)
+ GROUP BY 1;
+```
+
+**Halte.** Zéro écart **et** zéro attestation ne prouve rien : il faut qu'une
+PR DECISION-CORE ait reçu au moins deux `check_suite` vertes sur la même tête
+depuis le déploiement. **Hors périmètre, nommé :** la renotification de
+l'opérateur à chaque retraitement est inchangée, puisque ce module ne change
+pas ce que le moteur fait. La dédupliquer est un ticket séparé.

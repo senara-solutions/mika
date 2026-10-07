@@ -273,6 +273,36 @@ impl Database {
         Ok(rows)
     }
 
+    /// Rows of one `tool_name` whose `target_key` starts with `prefix`, newest
+    /// first, at most `limit`, rewound rows excluded (mika#2675 phase 3).
+    ///
+    /// The prefix is compared with `substr`, never `LIKE`: a `_` in a repo name
+    /// is a `LIKE` wildcard, and the caller decides equality itself anyway.
+    pub fn get_audit_events_for_target_prefix(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>> {
+        let sql = format!(
+            "SELECT {} FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2
+               AND substr(target_key, 1, length(?3)) = ?3
+               AND rewound_by_trace_id IS NULL
+             ORDER BY id DESC LIMIT ?4",
+            Self::AUDIT_EVENT_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![agent_id, tool_name, prefix, limit],
+                Self::row_to_audit_event,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Mark audit events as rewound by setting rewound_by_trace_id.
     pub fn mark_audit_events_rewound(
         &self,
@@ -326,6 +356,45 @@ mod tests {
 
     fn db() -> Database {
         Database::open_in_memory().unwrap()
+    }
+
+    /// mika#2675 phase 3 — le préfixe est littéral (un `_` n'est pas un joker),
+    /// l'outil filtre, les lignes rembobinées sortent, l'ordre est du plus
+    /// récent au plus ancien et la limite tronque.
+    #[test]
+    fn mika2675_audit_events_for_target_prefix() {
+        let db = db();
+        let log = |tool: &str, target: &str, trace: &str| {
+            db.log_audit_event("mika", "s", tool, target, None, None, None, Some(trace))
+                .unwrap()
+        };
+        let hold = "ci_success_handler_decision_core_hold";
+        log(hold, "pr:o/a_b#7@1", "t1");
+        log(hold, "pr:o/a_b#7@2", "t2");
+        log(hold, "pr:o/aXb#7@3", "t3"); // `_` en LIKE l'apparierait
+        log(hold, "pr:o/a_b#70@4", "t4"); // préfixe d'une autre PR
+        log("ci_success_handler_processed", "pr:o/a_b#7@5", "t5");
+        log(hold, "pr:o/a_b#7@6", "t6");
+        db.mark_audit_events_rewound("mika", &["t6".to_string()], "rw")
+            .unwrap();
+
+        let got = db
+            .get_audit_events_for_target_prefix("mika", hold, "pr:o/a_b#7@", 50)
+            .unwrap();
+        let targets: Vec<&str> = got.iter().map(|e| e.target_key.as_str()).collect();
+        assert_eq!(targets, ["pr:o/a_b#7@2", "pr:o/a_b#7@1"]);
+
+        let got = db
+            .get_audit_events_for_target_prefix("mika", hold, "pr:o/a_b#7@", 1)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].target_key, "pr:o/a_b#7@2");
+
+        assert!(
+            db.get_audit_events_for_target_prefix("autre", hold, "pr:o/a_b#7@", 50)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1749,6 +1749,10 @@ pub(super) async fn run_agent_for_message(
     // l'état de la PR côté forge avec le même jeton.
     let mut text_after_verdict: Option<String> = None;
     let mut prefilter_github_token: Option<String> = None;
+    // mika#2675 phase 3 — le texte juste avant et juste après
+    // `ci_success_handler` : la classe (b) n'admet qu'un texte touché par lui
+    // seul (son pré-digest DECISION-CORE ne dit rien de nouveau au modèle).
+    let mut text_around_ci: Option<(String, String)> = None;
 
     // Structural verdict handler: intercept PR review webhooks before
     // the LLM turn and act on VERDICT: pass deterministically (#524).
@@ -1792,6 +1796,7 @@ pub(super) async fn run_agent_for_message(
         // Structural CI success handler: intercept check_suite.completed(success)
         // webhooks and re-evaluate merge eligibility for PRs with pending QA pass (#571).
         // Order-independent — each handler self-selects on event type.
+        let text_before_ci = req.text.clone();
         let ci_action = ci_success_handler::try_handle_ci_success(
             &req.text,
             &a.db,
@@ -1814,6 +1819,7 @@ pub(super) async fn run_agent_for_message(
             // Only the ready-label handler returns Dispatched (mika#1572).
             VerdictAction::Dispatched { .. } => {}
         }
+        text_around_ci = Some((text_before_ci, req.text.clone()));
 
         // Merge actor (mika#2248). MUST stay immediately after ci_success_handler:
         // that handler emits the merge-ready signal into `req.text`, and this one
@@ -2008,11 +2014,15 @@ pub(super) async fn run_agent_for_message(
             &super::webhook_prefilter::LiveState {
                 db: &a.db,
                 github_token: prefilter_github_token.as_deref(),
+                request_id: &req.request_id,
             },
             original,
             super::webhook_prefilter::Touched {
                 by_any_handler: req.text != *original,
                 after_verdict_handler: text_after_verdict.as_ref().is_none_or(|t| req.text != *t),
+                outside_ci_success_handler: text_around_ci
+                    .as_ref()
+                    .is_none_or(|(before, after)| before != original || req.text != *after),
             },
             &req.request_id,
             super::webhook_prefilter::prefilter_enabled(),
