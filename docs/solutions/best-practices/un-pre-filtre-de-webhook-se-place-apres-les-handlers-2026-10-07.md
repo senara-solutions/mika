@@ -94,10 +94,51 @@ Cible : ≥ 80 % de baisse des tokens d'entrée des classes filtrées. Un label 
 par la boucle (`ready`, `blocked`, `operator-*`, …) doit, lui, continuer
 d'apparaître dans la seconde requête : c'est le contrôle négatif.
 
+## Phase 2 : « texte intact » est relatif au handler qui a déjà parlé
+
+La règle de la phase 1 excluait la classe (c) par construction : sur un
+`pr_review` sans tâche, le `verdict_handler` **enrichit ou remplace toujours**
+le texte (`hold_review_without_task`, `refuse_pass_from_non_reviewer`, le
+pré-digest du verdict illisible). Ce n'est pas un signal « il a quelque chose à
+dire au modèle » : ce qu'il dit est précisément « rien d'actionnable ». La porte
+compare donc, pour (c), le texte final au texte **juste après** le
+`verdict_handler` — un handler ultérieur qui y touche garde le tour. Une seule
+règle, paramétrée par le handler responsable de la classe ; pas une exception.
+
+Trois décisions qui ne vont pas de soi :
+
+- **Une revue sans ligne `VERDICT:` n'est pas un verdict.** `Verdict::Missing`
+  confond « ligne illisible » et « pas de ligne » ; seule la première est dans
+  (c). La seconde est la forme d'une consigne écrite en revue, et l'identité
+  GitHub de l'opérateur est partagée (AC2). `verdict_raw_value` sépare les deux.
+- **« Sans tâche active » = `find_active_task_by_pr_url` rend `None`**, tout
+  statut non terminal comptant comme actif — plus large que
+  `find_task_for_verdict` (`in_progress` seul). Un faux « actif » coûte un tour,
+  un faux « inactif » perdrait un événement.
+- **La forge en dernier.** Les trois termes lus dans le texte (`hold[review]`
+  déjà remis à l'opérateur, auteur ≠ relecteur QA, valeur illisible) décident
+  sans `gh` ; `gh pr view --json state` n'est payé que si aucun ne tient. État
+  inconnu, pas de jeton, délai dépassé : le tour a lieu (AC3).
+
+La couture d'état devient un trait (`PrefilterState`) : trois recherches,
+bouchonnées en test, aucun appel GitHub réel.
+
+Sonde de la classe (c), par terme :
+
+```sql
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'webhook_prefilter_skipped'
+   AND after_value LIKE 'verdict_%'
+ GROUP BY 1;
+```
+
+Contrôle négatif : `grep webhook_prefilter_state_unreadable` avec
+`what = "pr_state"` — non vide en continu signifie que la forge n'est jamais
+lisible (jeton), donc que le terme « PR fermée » est inerte et ne compte rien.
+
 ## Découpage
 
-Phase 1 (cette PR) : (a) `check_suite` verte sur `main`, (d) label inerte.
-Phase 2 : (c) `pr_review` non actionnable sans tâche — exige l'état de la PR,
-donc une couture de forge bouchonnable. Phase 3 : (b) `check_suite` verte sur
+Phase 1 : (a) `check_suite` verte sur `main`, (d) label inerte.
+Phase 2 (livrée) : (c) `pr_review` non actionnable sans tâche. Phase 3 : (b) `check_suite` verte sur
 une PR déjà décidée et notifiée pour cette tête — le SHA n'est pas dans le texte
 du gateway ; la décision vit dans `ci_success_handler` après `find_open_pr`.
