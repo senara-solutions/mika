@@ -48,7 +48,11 @@ module ; elle ne crée pas de second mécanisme.
    - `hold[review]` — déjà suivi : `hold_review_without_task` a notifié
      l'opérateur et écrit sa ligne d'audit. Un `hold[x]` inconnu n'est suivi
      par personne : il garde son tour.
-   - auteur ≠ relecteur QA (`forge_identity::is_reviewer_forge_login`).
+   - `pass` d'un auteur ≠ relecteur QA (`forge_identity::is_reviewer_forge_login`) —
+     le seul verdict de non-relecteur que le handler referme (refus + audit,
+     mika#2667 AC3). Un `block[*]` d'une autre identité n'est notifié à
+     personne et l'identité de l'opérateur est partagée : il garde son tour
+     (correction de revue, convergente correctness + adversarial).
    - ligne `VERDICT:` présente mais illisible (`Verdict::Missing`).
    - PR `CLOSED` ou `MERGED` côté forge — consulté seulement si aucun des trois
      premiers termes ne tient, pour ne payer `gh` qu'au besoin.
@@ -60,7 +64,8 @@ module ; elle ne crée pas de second mécanisme.
    les tests sur un bouchon. Aucun appel GitHub réel en test.
 8. **Audit** : une classe par terme (`verdict_hold_tracked`,
    `verdict_non_reviewer`, `verdict_unreadable`, `verdict_pr_closed`), cible
-   `pr:<repo>#<n>`. AC5 compte par terme.
+   `pr_review:<repo>#<n>` (la forme des cibles du `verdict_handler`). AC5
+   compte par terme.
 
 ## Estimation
 
@@ -89,7 +94,7 @@ Docs (plan, compound) en sus.
 ## Acceptance criteria
 
 - [ ] AC1(c) — un `pr_review` sans tâche active pour la PR, dont le verdict
-  n'est pas actionnable (`hold[review]` déjà suivi, auteur ≠ relecteur QA,
+  n'est pas actionnable (`hold[review]` déjà suivi, `pass` d'un auteur ≠ relecteur QA,
   ligne VERDICT illisible, PR fermée ou mergée), ne produit aucun tour LLM et
   écrit une ligne d'audit nommée (classe et cible).
 - [ ] AC2 — un `VERDICT: pass` du relecteur QA sur une PR avec tâche active

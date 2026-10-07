@@ -5806,11 +5806,6 @@ mod tests {
                 "VERDICT: hold[review]\n\nÀ trancher.",
             ),
             ("approved", "samidarko", "VERDICT: pass"),
-            (
-                "changes_requested",
-                "mika-platform-dev",
-                "VERDICT: block[ac]",
-            ),
             ("commented", MIKA2675_QA, "VERDICT: peut-être"),
         ] {
             let text = mika2675_review(state, author, body);
@@ -5841,13 +5836,25 @@ mod tests {
 
     /// AC2 et AC3 — verdict actionnable du relecteur sans tâche (état de PR
     /// illisible faute de jeton), revue-consigne sans ligne VERDICT, `hold`
-    /// inconnu : le tour a lieu.
+    /// inconnu, `block[*]` d'une autre identité : le tour a lieu.
     #[tokio::test]
     async fn mika2675_c_evenements_legitimes_le_tour_a_lieu() {
         for (state, author, body) in [
             ("approved", MIKA2675_QA, "VERDICT: pass"),
             ("changes_requested", MIKA2675_QA, "VERDICT: block[ac]"),
             ("commented", MIKA2675_QA, "VERDICT: hold[foo]"),
+            // L'identité de l'opérateur est partagée : un `block[*]` d'une
+            // autre identité n'est notifié à personne, il garde son tour.
+            (
+                "changes_requested",
+                "samidarko",
+                "VERDICT: block[security]\n\nFuite de jeton, ne pas merger.",
+            ),
+            (
+                "changes_requested",
+                "mika-platform-dev",
+                "VERDICT: block[ac]",
+            ),
             (
                 "commented",
                 "samidarko",

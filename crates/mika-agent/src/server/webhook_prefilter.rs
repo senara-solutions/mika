@@ -74,7 +74,7 @@ pub(crate) enum PrefilterClass {
     /// (c) `hold[review]` sans tâche : `hold_review_without_task` l'a déjà
     /// remis à l'opérateur (notification + ligne d'audit).
     VerdictHoldTracked,
-    /// (c) verdict d'une identité qui n'est pas le relecteur QA.
+    /// (c) `pass` d'une identité qui n'est pas le relecteur QA.
     VerdictNonReviewer,
     /// (c) ligne `VERDICT:` présente mais illisible.
     VerdictUnreadable,
@@ -106,8 +106,11 @@ pub(crate) struct ReviewVerdictFacts {
     /// `hold[review]` — le seul `hold` que le handler remet à l'opérateur.
     /// Un `hold[x]` inconnu n'est suivi par personne et garde son tour.
     pub(crate) hold_tracked: bool,
-    /// L'auteur n'est pas `REVIEWER_FORGE_LOGIN`.
-    pub(crate) non_reviewer: bool,
+    /// `pass` dont l'auteur n'est pas `REVIEWER_FORGE_LOGIN` : le seul verdict
+    /// de non-relecteur que le handler referme (refus + audit, mika#2667 AC3).
+    /// Un `block[*]` ou un `hold[x]` d'une autre identité n'est notifié à
+    /// personne — l'identité de l'opérateur est partagée — et garde son tour.
+    pub(crate) non_reviewer_pass: bool,
     /// Ligne `VERDICT:` présente, valeur non reconnue.
     pub(crate) unreadable: bool,
 }
@@ -145,7 +148,8 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
         let pr_url = event.pr_url();
         return Some(Candidate::ReviewVerdict(ReviewVerdictFacts {
             hold_tracked: matches!(&verdict, Verdict::Hold(r) if r.eq_ignore_ascii_case("review")),
-            non_reviewer: !mika_common::forge_identity::is_reviewer_forge_login(&event.reviewer),
+            non_reviewer_pass: matches!(verdict, Verdict::Pass)
+                && !mika_common::forge_identity::is_reviewer_forge_login(&event.reviewer),
             unreadable: matches!(verdict, Verdict::Missing { .. }),
             repo: event.repo,
             pr_number: event.pr_number,
@@ -277,7 +281,7 @@ async fn decide_review_verdict(facts: ReviewVerdictFacts, state: &impl Prefilter
     }
     let class = if facts.hold_tracked {
         PrefilterClass::VerdictHoldTracked
-    } else if facts.non_reviewer {
+    } else if facts.non_reviewer_pass {
         PrefilterClass::VerdictNonReviewer
     } else if facts.unreadable {
         PrefilterClass::VerdictUnreadable
@@ -582,21 +586,34 @@ pub(crate) mod tests {
     #[test]
     fn mika2675_c_classify_lit_chaque_terme_separement() {
         let hold = facts(&review("commented", QA, "VERDICT: hold[review]"));
-        assert!(hold.hold_tracked && !hold.non_reviewer && !hold.unreadable);
+        assert!(hold.hold_tracked && !hold.non_reviewer_pass && !hold.unreadable);
 
         let other = facts(&review("approved", "samidarko", "VERDICT: pass"));
-        assert!(!other.hold_tracked && other.non_reviewer && !other.unreadable);
+        assert!(!other.hold_tracked && other.non_reviewer_pass && !other.unreadable);
 
         let bad = facts(&review("commented", QA, "VERDICT: peut-être"));
-        assert!(!bad.hold_tracked && !bad.non_reviewer && bad.unreadable);
+        assert!(!bad.hold_tracked && !bad.non_reviewer_pass && bad.unreadable);
 
         let pass = facts(&review("approved", QA, "VERDICT: pass"));
-        assert!(!pass.hold_tracked && !pass.non_reviewer && !pass.unreadable);
+        assert!(!pass.hold_tracked && !pass.non_reviewer_pass && !pass.unreadable);
         assert_eq!(
             pass.pr_url,
             "https://github.com/senara-solutions/mika/pull/2680"
         );
 
+        assert!(facts(&review("commented", QA, "VERDICT: hold[Review]")).hold_tracked);
+        // Seul le `pass` d'un non-relecteur est refermé par le handler : un
+        // `block[*]` ou un `hold[x]` d'une autre identité garde son tour.
+        for body in [
+            "VERDICT: block[security]",
+            "VERDICT: block[ac]",
+            "VERDICT: hold[foo]",
+        ] {
+            assert!(
+                !facts(&review("commented", "samidarko", body)).non_reviewer_pass,
+                "{body}"
+            );
+        }
         // Un `hold[x]` inconnu n'est suivi par personne.
         assert!(!facts(&review("commented", QA, "VERDICT: hold[foo]")).hold_tracked);
         // Le suffixe `[bot]` reste le relecteur.
@@ -606,7 +623,7 @@ pub(crate) mod tests {
                 "mika-platform-qa[bot]",
                 "VERDICT: pass"
             ))
-            .non_reviewer
+            .non_reviewer_pass
         );
     }
 
@@ -645,11 +662,6 @@ pub(crate) mod tests {
             (
                 "VERDICT: pass",
                 "samidarko",
-                PrefilterClass::VerdictNonReviewer,
-            ),
-            (
-                "VERDICT: block[ac]",
-                "mika-platform-dev",
                 PrefilterClass::VerdictNonReviewer,
             ),
             ("VERDICT: peut-être", QA, PrefilterClass::VerdictUnreadable),

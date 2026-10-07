@@ -117,7 +117,14 @@ Trois décisions qui ne vont pas de soi :
   un faux « inactif » perdrait un événement.
 - **La forge en dernier.** Les trois termes lus dans le texte (`hold[review]`
   déjà remis à l'opérateur, auteur ≠ relecteur QA, valeur illisible) décident
-  sans `gh` ; `gh pr view --json state` n'est payé que si aucun ne tient. État
+  sans `gh` ; `gh pr view --json state` n'est payé que si aucun ne tient.
+- **« Non actionnable » = « déjà refermé par quelqu'un ».** Le terme
+  d'identité ne couvre que le `pass` d'un non-relecteur, parce que c'est le
+  seul que le `verdict_handler` refuse et audite. Un `block[*]` d'une autre
+  identité ne déclenche aucune notification ; l'écarter aussi aurait fait
+  disparaître sans trace une consigne de l'opérateur (identité partagée).
+  Avant d'écarter, vérifier qu'un autre site a déjà dit à quelqu'un ce qui se
+  passe — la revue l'a attrapé, pas les tests, qui épinglaient la version large. État
   inconnu, pas de jeton, délai dépassé : le tour a lieu (AC3).
 
 La couture d'état devient un trait (`PrefilterState`) : trois recherches,
