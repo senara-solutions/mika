@@ -213,7 +213,7 @@ Mika's orchestrator tool surface is the `github` skill added to
 
 ## Environment Variables
 
-The full reference lives in [`docs/environment-variables.md`](docs/environment-variables.md): every `MIKA_*` variable, its default, and the operator surfaces, probes and STOP switches that go with it. Search it by variable name or by ticket number (`grep -n 'MIKA_FOO\|mika#1234' docs/environment-variables.md`); `.env.example` lists the variables.
+The full reference lives in [`docs/operator/environment-variables.md`](docs/operator/environment-variables.md): every `MIKA_*` variable, its default, and the operator surfaces, probes and STOP switches that go with it. Search it by variable name or by ticket number (`grep -n 'MIKA_FOO\|mika#1234' docs/operator/environment-variables.md`); `.env.example` lists the variables.
 
 **Document a new variable or operator surface THERE, not here.** This file is loaded whole into every pilot's prompt. It reached 825 KB and pilots on this repo died on turn 1 ("Prompt is too long"). `crates/mika-common/tests/claude_md_size.rs` fails the build when any `CLAUDE.md` in the repository goes over the cap.
 

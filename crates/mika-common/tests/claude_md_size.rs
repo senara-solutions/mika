@@ -16,7 +16,7 @@
 //! file under that crate, so the mika-agent one would have killed the same
 //! pilots one step later.
 //!
-//! The material now lives in `docs/environment-variables.md` and
+//! The material now lives in `docs/operator/environment-variables.md` and
 //! `docs/agent-internals/`, which no pilot loads unless it reads them.
 //!
 //! # Why a test, and why this number
@@ -101,7 +101,7 @@ fn every_claude_md_stays_under_the_pilot_prompt_cap() {
         "over the {CLAUDE_MD_MAX_BYTES}-byte cap: {over:?}. A CLAUDE.md is loaded whole \
          into a pilot's prompt; at 825 KB pilots died on turn 1 (\"Prompt is too long\"). \
          Move the new material to docs/ (variables and operator surfaces go in \
-         docs/environment-variables.md, subsystem references in docs/agent-internals/) \
+         docs/operator/environment-variables.md, subsystem references in docs/agent-internals/) \
          and leave a pointer. Do not raise the cap."
     );
 }
