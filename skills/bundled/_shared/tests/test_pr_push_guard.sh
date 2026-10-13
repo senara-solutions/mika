@@ -620,10 +620,10 @@ fi
 # And the documented operator query anchors on the prefix, so a refusal that
 # trails a large pilot log is a refusal the query cannot find (and that the
 # 92000-byte truncation can cut off).
-if grep -q 'REFUSED (mika#2520)%' "$REPO_ROOT/CLAUDE.md"; then
-    ok "V10 — CLAUDE.md publishes the anchored operator query"
+if grep -q 'REFUSED (mika#2520)%' "$REPO_ROOT/docs/environment-variables.md"; then
+    ok "V10 — docs/environment-variables.md publishes the anchored operator query"
 else
-    ko "V10 — CLAUDE.md publishes the anchored operator query" \
+    ko "V10 — docs/environment-variables.md publishes the anchored operator query" \
        "the documented SQL must match the shape the handler actually writes"
 fi
 
