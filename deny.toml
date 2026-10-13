@@ -17,6 +17,10 @@ reason = "event-listener !Send tags via StackSlot (unsound); transitive dep only
 id = "RUSTSEC-2026-0205"
 reason = "scc Array::insert exception safety (unsound); transitive dep only, we do not pass panicking compare fns."
 
+[[advisories.ignore]]
+id = "RUSTSEC-2024-0449"
+reason = "unsafe-libyaml unmaintained (no vulnerability, no safe upgrade); pulled by serde_yaml 0.9 (deprecated) in mika-agent and mika-cli. Remove when serde_yaml is replaced by a maintained YAML crate (mika#2686)."
+
 [licenses]
 allow = [
     "MIT",
