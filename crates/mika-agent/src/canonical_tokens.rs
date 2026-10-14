@@ -1395,6 +1395,17 @@ mod tests {
     /// inline dans le jumeau mika#2649, compare `lit` sans `trim`). Un prédicat
     /// recopié est un prédicat qui peut diverger de son propre contrôle de bonne
     /// foi, ce qui est la seule chose que ce contrôle existe pour empêcher.
+    ///
+    /// Le `needle` étant un paramètre, le prédicat n'appartient à aucun des noms
+    /// qui l'ont fait naître. mika#1745 en portait une **troisième** copie octet
+    /// pour octet sous le nom `carries_bare_surface_literal`, deux mille sept
+    /// cents lignes plus bas ; mika#2683, en la relisant pour
+    /// `ci_failure_no_action`, l'a d'abord renommée `carries_bare_literal` —
+    /// c'est-à-dire a produit deux noms neutres pour un même corps, exactement la
+    /// situation que le paragraphe ci-dessus refuse. Elle est donc supprimée, et
+    /// ses cinq sites routés ici. Conséquence utile : les contrôles de bonne foi
+    /// de mika#2634, de mika#2653 et de mika#1745 attestent désormais **le même
+    /// corps**, ce que chacun affirmait déjà séparément.
     fn audit_name_literal_present(content: &str, needle: &str) -> bool {
         content
             .lines()
@@ -4149,29 +4160,6 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// pas d'entrée** (doctrine mika#2201).
     const SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
 
-    /// Le prédicat du scan mika#1745, extrait pour être exerçable sur un contenu
-    /// fabriqué.
-    ///
-    /// Sans cette extraction, « le scan est propre » et « le scan ne regarde
-    /// rien » rendent le même vert, et la seule façon de les distinguer est une
-    /// mutation à la main que personne ne rejoue (classe mika#2205, appliquée au
-    /// scan lui-même).
-    ///
-    /// Le `needle` est un paramètre, donc le prédicat n'appartient pas au nom
-    /// qui l'a fait naître : mika#2683 le relit pour `ci_failure_no_action`.
-    /// D'où le nom générique — le contrôle de bonne foi
-    /// [`mika1745_the_writer_predicate_sees_a_bare_literal`] reste la seule
-    /// attestation qu'il mord, et il vaut pour les deux lecteurs.
-    fn carries_bare_literal(content: &str, needle: &str) -> bool {
-        content
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
-            })
-            .any(|line| string_literals(line).iter().any(|lit| lit.trim() == needle))
-    }
-
     /// Le nom du signal est écrit à **un** endroit, dans le journal comme dans
     /// `audit_events`.
     ///
@@ -4227,7 +4215,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             if SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
-            if carries_bare_literal(&content, &needle) {
+            if audit_name_literal_present(&content, &needle) {
                 writers.push(rel);
             }
         }
@@ -4262,14 +4250,17 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
         let needle = format!("surface_for{}", "_adoption");
 
         assert!(
-            carries_bare_literal(
+            audit_name_literal_present(
                 &format!("    db.log_audit_event(sid, \"{needle}\", &key).await;"),
                 &needle
             ),
             "un second écrivain porte le littéral nu — le prédicat doit le voir"
         );
         assert!(
-            carries_bare_literal(&format!("    info!(event = \"{needle}\", x = 1);"), &needle),
+            audit_name_literal_present(
+                &format!("    info!(event = \"{needle}\", x = 1);"),
+                &needle
+            ),
             "le journal compte autant que la base"
         );
 
@@ -4283,7 +4274,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             format!("    /// Voir `{needle}` pour le contrat."),
         ] {
             assert!(
-                !carries_bare_literal(&benign, &needle),
+                !audit_name_literal_present(&benign, &needle),
                 "faux positif sur une forme voisine : {benign}"
             );
         }
@@ -4362,7 +4353,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             if CI_FAILURE_NO_ACTION_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
-            if carries_bare_literal(&content, &needle) {
+            if audit_name_literal_present(&content, &needle) {
                 writers.push(rel);
             }
         }

@@ -95,7 +95,7 @@ use crate::async_db::AsyncDatabase;
 use super::ci_failure_handler::{
     CI_FAILURE_ESCALATED_TOOL, CI_FAILURE_HANDLED_TOOL, CI_FAILURE_NO_ACTION_NO_OPEN_PR,
     CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS, CI_FAILURE_NO_ACTION_TOOL,
-    SURFACE_FOR_ADOPTION_TOOL, parse_check_suite_failure,
+    SURFACE_FOR_ADOPTION_TOOL, branch_key, parse_check_suite_failure,
 };
 use super::ci_success_handler::{
     DECISION_CORE_HOLD_NOTIFIED, DECISION_CORE_HOLD_TOOL, parse_check_suite_success,
@@ -528,7 +528,7 @@ async fn decide_default_branch(
     branch: &str,
     state: &impl PrefilterState,
 ) -> Decision {
-    let target = format!("check_suite:{repo}@{branch}");
+    let target = branch_key(repo, branch);
     match state.branch_has_active_task(branch).await {
         Ok(false) => Decision::Skip { class, target },
         Ok(true) => Decision::Llm,
@@ -545,7 +545,7 @@ async fn decide_ci_failure_no_action(
     branch: &str,
     state: &impl PrefilterState,
 ) -> Decision {
-    let target = format!("check_suite:{repo}@{branch}");
+    let target = branch_key(repo, branch);
     let this_event = match state.event_audit_rows().await {
         Ok(rows) => rows,
         Err(e) => return state_unreadable("event_audit", &target, &e),
@@ -560,7 +560,7 @@ async fn decide_ci_failure_no_action(
 /// toujours sans attestation), les attestations de la PR ensuite. Toute lecture
 /// en erreur laisse passer (AC3).
 async fn decide_head_decided(repo: &str, branch: &str, state: &impl PrefilterState) -> Decision {
-    let pending = format!("check_suite:{repo}@{branch}");
+    let pending = branch_key(repo, branch);
     let this_event = match state.event_audit_rows().await {
         Ok(rows) => rows,
         Err(e) => return state_unreadable("event_audit", &pending, &e),

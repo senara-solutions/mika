@@ -209,6 +209,20 @@ pub(crate) fn parse_check_suite_failure(text: &str) -> Option<CheckSuiteFailureE
     })
 }
 
+/// Clé d'une `check_suite` de branche dans l'audit : `check_suite:{repo}@{branch}`.
+/// Écrite par [`log_no_action`], relue telle quelle par le pré-filtre — une
+/// seule forme, sur le modèle de `ci_success_handler::head_key` (mika#2683).
+///
+/// Pourquoi une fonction et pas un `format!` à chaque site : `webhook_queue_v2`
+/// construit `check_suite:{repo}:{branch}` — deux-points, pas arobase — pour un
+/// autre usage. Les deux formes ne se distinguent qu'à un caractère, et c'est
+/// l'arobase qui fait que le pré-filtre retrouve la ligne du handler. Une forme
+/// de clé retapée dans un second fichier est la classe de divergence que
+/// mika#2683 évite déjà pour les noms machine (mika#2158, mika#2362).
+pub(crate) fn branch_key(repo: &str, branch: &str) -> String {
+    format!("check_suite:{repo}@{branch}")
+}
+
 /// Write the durable trace of a terminal "nothing to do" exit — the SOLE WRITER
 /// of [`CI_FAILURE_NO_ACTION_TOOL`] (mika#2683).
 ///
@@ -316,7 +330,7 @@ pub async fn try_handle_ci_failure(
                 db,
                 session_id,
                 trace_id,
-                &format!("check_suite:{}@{}", event.repo, event.branch),
+                &branch_key(&event.repo, &event.branch),
                 CI_FAILURE_NO_ACTION_NO_OPEN_PR,
                 &format!(
                     "trigger=check_suite_{} repo={} branch={}",
