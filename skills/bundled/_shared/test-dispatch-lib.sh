@@ -12357,10 +12357,11 @@ T2693_UNCOLOCATED=$(printf '%s\n' "$T2693_READS" \
     | grep -vE '_plan_size_per_flight_bound' | grep -E . || true)
 assert_eq "V3: chaque lecture de \$_PLAN_SIZE_PER_FLIGHT_* appelle le résolveur sur la même invocation" \
     "" "$T2693_UNCOLOCATED"
-# Sa contre-vacuité — « au moins une lecture existe » — arrive avec le premier
-# lecteur, dans le commit qui ajoute `_plan_size_rule`. Écrite ici d'abord, elle
-# a été VUE ROUGE (`non-trouvé`) sur l'arbre où le résolveur n'était encore lu
-# par personne : c'est le rouge qui prouve qu'elle mesure bien quelque chose.
+# Contre-vacuité : le scan voit bien des lectures. VUE ROUGE (`non-trouvé`) sur
+# l'arbre où le résolveur n'était encore lu par personne — sans elle, supprimer
+# tous les lecteurs laisserait l'assertion ci-dessus verte et la garde aveugle.
+assert_eq "V3 contre-vacuité: au moins une lecture de \$_PLAN_SIZE_PER_FLIGHT_* existe" "yes" \
+    "$([ -n "$T2693_READS" ] && echo yes || echo non-trouvé)"
 
 T2693_RESOLVER_SRC=$(sed -n '/^_plan_size_per_flight_bound()/,/^}/p' "$DISPATCH_LIB")
 assert_eq "V3: _plan_size_per_flight_bound a bien été trouvée (guards the guard)" "yes" \
@@ -12385,6 +12386,151 @@ done
 # par cent en croyant la corriger.
 assert_contains "V3: le site dit l'annulation des deux mises à l'échelle" \
     "ÉCRIT \`900\`, JAMAIS \`9\`" "$(sed -n '/^# mika#2693 — LA SECONDE BORNE/,/^_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=/p' "$DISPATCH_LIB")"
+
+# --- V5 : la règle injectée, sa récence, sa conditionnalité ----------------
+#
+# ROUGE AVANT : le gabarit ne portait qu'un seuil, et aucun plafond.
+#
+# Miroir du site d'injection RÉEL, plafond compris. `_t2636_inject` reste
+# l'aîné et appelle `_plan_size_rule` SANS argument — c'est AC4, et c'est aussi
+# la démonstration que la signature est rétro-compatible : il résout 150, le
+# repli fail-safe. Ce miroir-ci est celui qui passe un plafond.
+_t2693_inject() {
+    local skill="$1" ceiling="${2:-}" repo="${3:-mika}" issue_num="${4:-2693}"
+    local prompt="${repo}#${issue_num}"
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PR_BODY_CONTAINMENT_RULE")
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PILOT_SCRATCH_RULE")
+    if [ "$skill" = "dev-groom" ]; then
+        prompt=$(printf '%s\n\n%s' "$prompt" "$_FIRE_DISPOSITION_RULE")
+        _plan_size_rule "$ceiling"; prompt=$(printf '%s\n\n%s' "$prompt" "$_PLAN_SIZE_RULE")
+    fi
+    printf '%s' "$prompt"
+}
+
+T2693_GROOM_200=$(_t2693_inject "dev-groom" "200")
+T2693_GROOM_150=$(_t2693_inject "dev-groom" "150")
+T2693_PILOT=$(_t2693_inject "dev-pilot" "200")
+
+# V2 (AC3), moitié comportementale : LA RÈGLE PORTE DEUX NOMBRES DIFFÉRENTS. Les
+# sondes de résolveur plus haut montrent que le calcul distingue les paliers ;
+# celles-ci montrent que la distinction ARRIVE AU GROOMEUR, ce qui est le seul
+# endroit où elle a un effet.
+assert_contains "V2 (AC3) × V5: à 200 tours la règle porte la borne 431" \
+    "431 lignes estimées" "$T2693_GROOM_200"
+assert_contains "V2 (AC3) × V5: et son plafond" \
+    "plafond de CE ticket est de 200 tours" "$T2693_GROOM_200"
+assert_not_contains "V2 (AC3) × V5: à 200 tours elle ne porte PAS 243" \
+    "243 lignes estimées" "$T2693_GROOM_200"
+assert_contains "V2 (AC3) × V5: à 150 tours la règle porte la borne 243" \
+    "243 lignes estimées" "$T2693_GROOM_150"
+assert_contains "V2 (AC3) × V5: et son plafond" \
+    "plafond de CE ticket est de 150 tours" "$T2693_GROOM_150"
+assert_not_contains "V2 (AC3) × V5: à 150 tours elle ne porte PAS 431" \
+    "431 lignes estimées" "$T2693_GROOM_150"
+
+# La DÉRIVATION est écrite, et sous la forme exacte que le format prescrit — pas
+# « / 2,0 » là où le format dit « / 2 ». Vue ROUGE à la sonde : la première
+# rédaction faisait diverger la forme donnée de la forme demandée, dès la
+# première ligne du § que le groomeur doit écrire.
+assert_contains "V5: la règle écrit la dérivation, pas seulement le nombre" \
+    "(200 − 35 − 50) × 7,5 / 2" "$T2693_GROOM_200"
+assert_contains "V5: idem au palier 150" \
+    "(150 − 35 − 50) × 7,5 / 2" "$T2693_GROOM_150"
+assert_not_contains "V5: un dixième nul ne s'écrit pas (« / 2 », jamais « / 2,0 »)" \
+    "/ 2,0" "$T2693_GROOM_200"
+# La borne par PR de mika#2636 est toujours là : les deux cohabitent, la règle
+# n'en a pas remplacé une par l'autre (AC4, moitié comportementale).
+assert_contains "V5 (AC4): la borne par PR de mika#2636 est toujours portée" \
+    "Au-dessus de 1000 lignes" "$T2693_GROOM_200"
+assert_contains "V5: et la règle dit que la plus serrée MORD" \
+    "LA PLUS SERRÉE MORD" "$T2693_GROOM_200"
+# Les trois choses sans lesquelles la règle ne serait qu'un nombre.
+assert_contains "V5: la règle nomme le découpage en VOLS" \
+    "DÉCOUPE EN VOLS" "$T2693_GROOM_200"
+assert_contains "V5: et la ligne qui nomme la suite" \
+    'Tracked in:' "$T2693_GROOM_200"
+assert_contains "V5 (AC2): la règle CITE son site de vérité" \
+    '`_plan_size_per_flight_bound` dans `skills/bundled/_shared/dispatch-lib.sh`' \
+    "$T2693_GROOM_200"
+assert_contains "V5: et le document où vit la justification des paramètres" \
+    'une-estimation-de-taille-se-compare-a-un-seuil-dans-sa-propre-unite.md' \
+    "$T2693_GROOM_200"
+assert_contains "V5: la règle dit que l'architecte juge le VOL COURANT" \
+    "jamais la somme des vols" "$T2693_GROOM_200"
+# Aucun placeholder ne survit à la substitution. Un `__…__` qui passe est la
+# régression la plus bête et la plus probable de ce gabarit : il part en prompt
+# tel quel et le groomeur lit un gabarit au lieu d'un nombre.
+assert_eq "V5: aucun placeholder __…__ ne survit dans la règle rendue" "0" \
+    "$(printf '%s\n' "$T2693_GROOM_200" | grep -cE '__[A-Z_]+__' || true)"
+assert_eq "V5: idem au palier 150" "0" \
+    "$(printf '%s\n' "$T2693_GROOM_150" | grep -cE '__[A-Z_]+__' || true)"
+# Contre-vacuité du scan de placeholder : le GABARIT, lui, en porte bien quatre.
+assert_eq "V5 contre-vacuité: le gabarit porte bien quatre placeholders distincts" "4" \
+    "$(printf '%s\n' "${_PLAN_SIZE_RULE_TEMPLATE:-}" | grep -oE '__[A-Z_]+__' | sort -u | wc -l | tr -d ' ')"
+
+# Le FORMAT PRESCRIT porte les deux lignes de déclaration EN FORME. Il est
+# interpolé à deux sites (S13-bis) dont l'un — le finding synthétique du
+# rattrapage — ne connaît aucun plafond : y figer une valeur lui ferait
+# prescrire un nombre qu'il n'a aucun moyen de vérifier.
+assert_contains "V5: le format prescrit la ligne de plafond" \
+    'Plafond de tours :' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_contains "V5: et la ligne de borne par vol" \
+    'Borne par vol :' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_contains "V5: le format porte des chevrons, donc une FORME" \
+    '<plafond>' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+for t2693_val in 200 431 243; do
+    assert_not_contains "V5: le format ne FIGE pas la valeur $t2693_val" \
+        "$t2693_val" "${_PLAN_SIZE_FORMAT_SPEC:-}"
+done
+assert_contains "V5: le format dit que l'architecte n'a QUE le plan pour l'apprendre" \
+    'jamais les labels' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_contains "V5: et nomme le repli à 150 d'un plan muet" \
+    'plafond de 150 tours' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+
+# Conditionnalité, récence, et l'invariant de position de mika#138 — les trois
+# propriétés que S13 tient pour la borne par PR, re-tenues pour celle-ci parce
+# que le site d'injection a changé de forme (le résolveur de plafond s'y est
+# ajouté) et qu'un changement de forme est exactement ce qui les casse.
+assert_not_contains "V5: la règle n'est PAS injectée pour SKILL=dev-pilot" \
+    'SECONDE BORNE (mika#2693)' "$T2693_PILOT"
+assert_contains "V5: mais dev-pilot reçoit bien la règle inconditionnelle voisine" \
+    'RÈGLE DE DISPATCH (mika#2211)' "$T2693_PILOT"
+# mika#138, invariant de position 2 : si la première ligne cesse d'être
+# `<repo>#<num>`, le dispatch tombe en mode free-text et AUCUN worktree n'est
+# créé. Le plafond résolu juste avant l'injection ne doit rien préfixer.
+assert_eq "V5 × mika#138: la première ligne du PROMPT reste exactement mika#2693" "mika#2693" \
+    "$(printf '%s' "$T2693_GROOM_200" | head -1)"
+assert_eq "V5 × mika#138: idem sur le chemin dev-pilot" "mika#2693" \
+    "$(printf '%s' "$T2693_PILOT" | head -1)"
+# LA RÉCENCE EST LE SEUL LEVIER d'une règle en fin d'un prompt de 16 KiB, et la
+# seconde borne est la DERNIÈRE chose que lit un groomeur.
+T2693_LN_FD=$(printf '%s\n' "$T2693_GROOM_200" | grep -n 'RÈGLE DE GROOMING (mika#2306)' | head -1 | cut -d: -f1)
+T2693_LN_PF=$(printf '%s\n' "$T2693_GROOM_200" | grep -n 'SECONDE BORNE (mika#2693)' | head -1 | cut -d: -f1)
+assert_eq "V5: la borne par vol vient APRÈS la règle mika#2306" "yes" \
+    "$([ -n "$T2693_LN_FD" ] && [ -n "$T2693_LN_PF" ] && [ "$T2693_LN_PF" -gt "$T2693_LN_FD" ] && echo yes || echo no)"
+T2693_TAIL=$(printf '%s\n' "$T2693_GROOM_200" | tail -1)
+assert_eq "V5: et elle est le DERNIER bloc du prompt (sa phrase de clôture le termine)" "yes" \
+    "$(case "$T2693_TAIL" in *"déjà résolus pour toi."*) echo yes ;; *) echo "non: $T2693_TAIL" ;; esac)"
+
+# La co-location du PLAFOND au site d'injection. `$_PILOT_MAX_TURNS` est posé
+# par `_pilot_max_turns` et par personne d'autre ; un site qui le lirait sans
+# l'appeler lirait l'état d'un autre dispatch. Scan mika#2496 déjà en place plus
+# haut dans ce fichier, re-tenu ici sur le nouveau lecteur.
+T2693_INJ_UNCOLOCATED=$(_mika2496_logical_invocations "$DISPATCH_LIB" \
+    | grep -E '\$\{?_PILOT_MAX_TURNS\b' | grep -vE '_pilot_max_turns' || true)
+assert_eq "V5 × mika#2496: chaque lecture de \$_PILOT_MAX_TURNS reste co-localisée" "" \
+    "$T2693_INJ_UNCOLOCATED"
+# La conditionnalité se lit par APPARTENANCE AU BLOC, jamais par un préfixe —
+# sinon déplacer l'injection d'une ligne APRÈS le `fi` reste vert, et c'est la
+# régression exacte que ce scan existe pour attraper (leçon de S13).
+T2693_GROOM_BLOCK=$(printf '%s\n' "$T2636_SUW_SRC" \
+    | sed -n '/if \[ "\$SKILL" = "dev-groom" \]; then/,/^        fi/p')
+assert_eq "V5 contre-vacuité: le bloc gardé sur le skill a bien été extrait" "non-vide" \
+    "$([ -n "$T2693_GROOM_BLOCK" ] && echo non-vide || echo vide)"
+assert_contains "V5: la résolution du plafond vit DANS la branche gardée sur le skill" \
+    '_pilot_max_turns' "$T2693_GROOM_BLOCK"
+assert_contains "V5: et le plafond est bien PASSÉ à la règle, pas lu par portée" \
+    '_plan_size_rule "$_PILOT_MAX_TURNS"' "$T2693_GROOM_BLOCK"
 
 # ===========================================================================
 # mika#2641 — une réponse d'architecte sans disposition lisible est RELANCÉE
