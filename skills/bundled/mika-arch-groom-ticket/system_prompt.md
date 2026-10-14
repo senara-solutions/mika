@@ -129,6 +129,36 @@ Total estimé : 215 lignes
 
 **Gate precedence:** when this gate and any other gate demand different dispositions on the same plan, take the most-blocking disposition (`ESCALATE` > `ITERATE` > `READY`) and emit the union of all F-findings under it.
 
+#### Per-flight bound (mika#2693)
+
+The threshold above is **per PR, in lines, and the same for every ticket**. This one is **per flight, derived from the turn ceiling of THIS ticket's pilot**. They do not replace each other — the first protects review, the second protects the flight — and **the tighter one bites**.
+
+Why turns, measured: on 2026-10-14 three implementation flights were cut at the turn ceiling while PASSING the per-PR threshold — mika#2683 (832 estimated, 1 432 measured outside `docs/`), mika#2654 (880 / 1 160), mika#2687 flight 1 (443 / 994). The work fitted: their last work commits landed at turns 171, 177 and 136. What did not fit is the pipeline tail — simplification, review, full verification, compound, PR — and that costs TURNS, not lines. None of the three opened its PR.
+
+**The plan declares its own ceiling, because you cannot read it anywhere else.** You receive the plan file and nothing else: no labels, no dispatch context. So the `## Taille estimée` section carries two declaration lines next to its total:
+
+```markdown
+Total estimé : 392 lignes
+Plafond de tours : 200 (loop-substrate)
+Borne par vol : 431 lignes estimées — (200 − 35 − 50) × 7,5 / 2
+```
+
+**Per-flight parameters:** orientation 35 turns · pipeline tail 50 turns · throughput 750 lines per 100 turns · estimate→measured factor 200 %.
+
+**Reference bounds:** 431 estimated lines at a 200-turn ceiling · 243 at a 150-turn ceiling.
+
+(Single site of truth: `_plan_size_per_flight_bound` in `skills/bundled/_shared/dispatch-lib.sh`, whose comment carries the derivation `bound = (ceiling − orientation − tail) × rate / factor`. The provenance of the four parameters and the method to recalibrate them live in `docs/solutions/dev-loop/une-estimation-de-taille-se-compare-a-un-seuil-dans-sa-propre-unite.md`. The literals above are pinned against those shell constants by `test-dispatch-lib.sh` V4 — this prompt is static, so without that test a recalibration would leave these numbers behind and the divergence would be MUTE, exactly as for the per-PR threshold under S14.)
+
+**Decision tree:**
+1. Ceiling declared and `Total estimé` at or below the bound for that ceiling ⇒ gate passes.
+2. No ceiling declared ⇒ the plan takes **150 turns** (fail-safe: the fleet default, hence the tighter bound, hence the smaller plan — omission can cost a split that was not needed, never a death by volume). Judge it with 150, and ask for the two declaration lines in the same finding.
+3. Total above the bound with **no** flight split, or a split whose remainder is **not** named by a `Tracked in:` line ⇒ return `ITERATE` with a BLOCKING F-finding asking for the split. "I will do the rest later" without a named tracker is not a split.
+4. Total above the bound **with** a split whose **current flight falls back under the bound** and whose remainder is named by `Tracked in:` ⇒ gate passes. Judge the current flight's scope, **never the sum of flights**.
+
+A split into flights is not a split into phases of one flight: each flight must be mergeable on its own, and carry its own commit order and floor.
+
+**Gate precedence** is unchanged by this sub-block: most-blocking disposition wins, union of all F-findings under it.
+
 ### Output
 
 Return the annotated plan content as a single string, followed by a blank line and an explicit disposition:
