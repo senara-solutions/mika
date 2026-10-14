@@ -5339,7 +5339,7 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 | `create_task` | **oui** | oui, mais **transitivement suffisant** | **non fermé, et c'est raisonné** : une tâche créée sans dispatch ne lance aucun processus et ne consomme aucun créneau ; la fermer séparément demanderait la charge utile que R6 refuse, pour un dommage que le terme de lignée intercepte au seul endroit où il devient réel. `4df82c3a` existe encore et n'a rien coûté d'autre qu'une ligne |
 | `update_task_status` | oui | **non** | une transition d'état ne lance rien — et l'en priver **casserait M4**, dont l'étape 1 *est* un `update_task_status` sur le frère suivant |
 | `cancel_task` | oui | **OUI — et c'est le second cas mesuré** | **suivi mika#2653** : c'est lui qui a tué `8a3b2082` et jeté 71 tours (trace `8ec6364c-be71-11f1-908b-e931f18d2c16`). Son remède n'est pas un terme de cible mais un terme de **vivacité** (`live_pilot`, mika#2279) ; ce qui le sort d'ici est le rayon de souffle — un faux refus d'annulation retire à l'opérateur son geste de reprise le plus court — et le cinquième booléen sur `ToolContext` |
-| `promote_deferred_callback` | oui | oui | **suivi mika#2654**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici, avec sa précondition — **zéro occurrence mesurée**, et armer une garde sur une population vide produirait un détecteur dont le silence ne prouve rien (mika#2205) |
+| `promote_deferred_callback` | oui | oui | **fermé par mika#2654**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici avec sa précondition — **zéro occurrence mesurée à la rédaction**, levée depuis : mesure du 2026-10-07 (73 appels / 58 sessions sur 30 j, dont 27 sessions de canal `github` pour 33 appels et 10 promotions réussies). La même mesure a **écarté le terme de lignée** pour cet outil — les 10 réussites sont toutes dans la lignée de l'événement, donc la population de refus d'une garde de lignée serait vide (mika#2205) — et le remède retenu est un terme de **classe de tour** : refus sur un tour PR / check-suite |
 | `pr_merge_with_gate` | oui | non | sa cible **est** la PR, par la forme de son entrée |
 | `git_ops`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | ne touchent pas le plan de dispatch. `run_gh` porte déjà sa propre garde de création de travail (mika#2573), bornée au domaine Fallthrough |
 
@@ -5562,7 +5562,7 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 | `cancel_task` | oui | **OUI — le vecteur mesuré** | **fermé par cette PR** |
 | `cancel_reminder` | oui | oui (délègue à `CancelTaskTool`) | **fermé** — même site, R4 |
 | `update_task_status` → `cancelled` | oui | **ne le tue pas, mais l'ORPHELINE** (ligne terminale, classe mika#2279) | **non couvert** — dommage et remède distincts. **Suivi** (R6) |
-| `promote_deferred_callback` | oui | choisit quel dispatch prend le créneau | **suivi mika#2654**, population mesurée vide |
+| `promote_deferred_callback` | oui | choisit quel dispatch prend le créneau | **fermé par mika#2654** — population mesurée depuis (2026-10-07), terme de classe de tour, section dédiée ci-dessous |
 | `run_claude_pilot{,_groom}` | oui | borné à sa lignée | **fermé par mika#2649** |
 | `run_shell` | oui | oui, par la commande d'annulation du CLI | **non couvert**, population mesurée vide. **Suivi** (R6) |
 | `complete_task`, `create_task`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | hors population |
@@ -5698,7 +5698,11 @@ depuis un tour webhook PR depuis le déploiement.
   lui est retiré est celle qu'il a **effectivement** prise, et le corps du refus
   ne lui donne pas l'autre.
 - **Il ne ferme pas `promote_deferred_callback`** (mika#2654) ni le cap implement
-  (mika#2652) : trois tickets, trois termes, trois populations.
+  (mika#2652) : trois tickets, trois termes, trois populations. **mika#2654 est
+  fermé depuis**, par un terme de **classe de tour** et non de vivacité — refus
+  sur un tour `[GitHub] PR …` / `[GitHub] Check suite …` — et il lit le **même**
+  `ToolContext.is_webhook_pr_event_turn` que ce travail a posé, sans le modifier.
+  Le cap implement (mika#2652) reste ouvert.
 - **Il ne couvre pas un tour webhook servi en mode silencieux** — borne héritée
   de mika#2517 / mika#2573, population mesurée vide (un tour silencieux a
   `originating_message = None`).
@@ -5724,7 +5728,9 @@ depuis un tour webhook PR depuis le déploiement.
 #### Hors périmètre, délibérément
 
 - **Le cap implement** (mika#2652) et **`promote_deferred_callback`**
-  (mika#2654) : aucune ligne touchée.
+  (mika#2654) : aucune ligne touchée **par ce travail**. mika#2654 a depuis posé
+  sa propre garde, dans son propre outil, en **lecteur** du champ que ce travail
+  a introduit : aucune ligne de mika#2653 n'a bougé pour l'accueillir.
 - **Le terme de lignée de mika#2649** : inchangé, octet pour octet. Il répond à
   *quelle cible ce dispatch vise-t-il*, celui-ci à *un pilote travaille-t-il
   ici* — axes orthogonaux, et le ticket le dit.
@@ -5767,6 +5773,186 @@ depuis un tour webhook PR depuis le déploiement.
 Raisonnement complet, les six rectifications, la frontière de la duplication
 différée et les quatre détecteurs : `crates/mika-agent/CLAUDE.md` § *Une
 annulation depuis un tour webhook PR ne touche pas un pilote vif*.
+
+### `promote_deferred_callback` est refusé sur un tour webhook PR (mika#2654)
+
+Sur un tour dont le message d'origine commence par `[GitHub] PR ` ou
+`[GitHub] Check suite `, `promote_deferred_callback` **refuse** de forcer la
+promotion d'un wrapper différé. Troisième et dernier cas nommé par le
+recensement AC4 de mika#2649, et le seul des trois dont la population a été
+**mesurée avant** d'armer quoi que ce soit.
+
+Ce qui est retiré au modèle est borné et dit : une **avance ≤ 60 s** sur le
+backstop périodique (`promote_pending_deferred_if_idle`,
+`DB_SCAN_INTERVAL_TICKS = 60`), et le **contournement de la priorité
+opérateur** — `force_promote_deferred_for_class` ne consulte pas
+`has_pending_operator_task_for_class` (mika#1948 AC3), le backstop oui. Rien
+n'est retiré à l'opérateur : `mika tasks promote-deferred` est intact, le CLI
+n'a pas de `ToolContext` et ne traverse pas cette garde.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Un tour webhook PR a-t-il tenté de forcer un créneau ?
+grep promote_deferred_refused_webhook_pr_turn "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_id, session_id, dispatch_class, trace_id}'
+
+# 2. CONTRÔLE NÉGATIF — l'audit a-t-il échoué derrière une ligne passée ?
+#    (régime attendu : VIDE)
+grep promote_deferred_guard_audit_failed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{dispatch_class, verdict, error}'
+```
+
+```sql
+-- Le verdict, soustractible en une requête (SOLE WRITER ⇒ compte exact)
+SELECT target_key, after_value, count(*) FROM audit_events
+ WHERE tool_name = 'deferred_dispatch_force_promote_refused_webhook_pr_turn'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+
+-- La population du refus, telle que le modèle l'a reçue
+SELECT agent_id, count(*) FROM tool_calls
+ WHERE tool_name = 'promote_deferred_callback'
+   AND output LIKE 'REFUS (webhook-pr-turn, mika#2654)%' GROUP BY 1;
+
+-- La mesure fondatrice, rejouable : promotions réussies par canal de session
+SELECT s.channel_type, tc.success, count(*) FROM tool_calls tc
+  JOIN sessions s ON s.id = tc.session_id
+ WHERE tc.tool_name = 'promote_deferred_callback'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+| nom | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `refused_webhook_pr_turn` (`after_value`) | INFO | **non vide au début, puis décroissant** | chaque ligne est une promotion forcée qu'un tour d'événement n'a pas obtenue ; `target_key` porte `dispatch_class:implement` ou `dispatch_class:groom` |
+| `promote_deferred_refused_webhook_pr_turn` (journal) | INFO | idem | le pendant journal du même refus. **INFO et non WARN** : le moteur promeut de lui-même au scan suivant, donc le refus ne laisse aucun travail en souffrance — et un WARN qu'on apprend à ignorer ne se lit plus |
+| `promote_deferred_guard_audit_failed` | WARN | **vide** | la ligne de journal est passée, l'audit non — le `GROUP BY` sous-compte à partir de là |
+
+**Il n'y a PAS de contrôle positif côté outil, et c'est une décision.**
+L'énumération `ForcePromoteTurnDecision` ne porte **aucune** variante
+`AllowedInPopulation` (la sœur mika#2653 en a une, `allowed_no_pilot`) : ici
+tout tour hors population est un tour ordinaire, soit l'essentiel du trafic de
+l'outil, et une valeur d'audit « autorisé » y serait une ligne par appel pour
+un verdict qui ne décide de rien — très exactement le churn que la doctrine
+mika#2131 borne. La contrepartie est assumée et doit être lue : **zéro refus a
+deux causes indistinguables** — aucun tour webhook PR n'a tenté (sain), ou le
+binaire servi est antérieur au correctif (classe mika#2340). C'est le
+*préalable* des sondes ci-dessous qui tranche, pas une absence de ligne.
+
+**Rien n'est écrit hors population.** Un appel sur un tour ordinaire, un
+callback de pilote ou un tour Webhook Fallthrough n'écrit **aucune** ligne :
+`audit_value()` rend `None` et le rapporteur rend la main avant tout accès à la
+base. Écriture d'audit **fire-and-forget** (motif
+`report_cancel_pilot_decision`, type de retour `()`) : un échec d'audit ne peut
+pas changer un verdict de promotion.
+
+#### Sondes post-déploiement, et leurs trois haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** : établir après
+> `make deploy` que le `mika-spirit` qui tourne porte le correctif —
+> `cat ~/.mika/skills/.manifest-writer` — avant toute conclusion tirée d'un
+> silence (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte :
+> la base n'est pas montée dans le bac à sable de dispatch.
+
+**S1 — la garde mord, et le compte décroît.**
+```sql
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'deferred_dispatch_force_promote_refused_webhook_pr_turn';
+```
+Régime attendu : **non vide au début** — la mesure du 2026-10-07 a compté 33
+appels depuis des sessions de canal `github` sur 30 jours, dont 10 réussis —
+**puis décroissant**, à mesure que le refus (qui nomme la raison, et aucun
+contournement) se répercute dans le plan de dispatch que le modèle se fait.
+
+**S2 — plus aucune promotion réussie depuis un tour github (après déploiement).**
+```sql
+SELECT count(*) FROM tool_calls tc
+  JOIN sessions s ON s.id = tc.session_id
+ WHERE tc.tool_name = 'promote_deferred_callback'
+   AND s.channel_type = 'github'
+   AND tc.success = 1
+   AND tc.created_at > '<déploiement>';
+```
+Attendu : **zéro**.
+*Halte 1 — S2 rend des lignes :* **ne pas toucher au prédicat d'abord.**
+`channel_type = 'github'` est un **surensemble** de la population de la garde
+— le texte du message d'origine n'est pas persisté dans `messages` pour ce
+canal, alors que la garde teste ce texte. Lire donc d'abord **de quel tour**
+vient la ligne : un tour Webhook Fallthrough ou un Passthrough de label `ready`
+est **hors population par décision** (AC7), et ces deux-là comptent dans
+`channel_type = 'github'`. Croiser avec
+`audit_events.tool_name = 'webhook_fallthrough_turn'` tranche le premier cas.
+Si la ligne vient bien d'un tour `[GitHub] PR …` / `[GitHub] Check suite …`,
+vérifier **ensuite** que le binaire servi porte le correctif (préalable
+ci-dessus) — et seulement alors mettre le prédicat en cause.
+
+**S3 — CONTRÔLE NÉGATIF : le moteur promeut toujours.**
+```sql
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'deferred_dispatch_promoted' AND created_at > '<déploiement>';
+```
+Attendu : **non vide**. C'est le backstop qui fait son travail, et c'est lui qui
+rend le refus sans coût fonctionnel.
+*Halte 2 — S3 tombe à zéro alors que des wrappers attendent :* ce n'est **pas**
+ce correctif. Le chemin de promotion du moteur n'a pas été touché, octet pour
+octet. Lire `deferred_dispatch_promotion_starved` (mika#2169) et la priorité
+opérateur (`has_pending_operator_task_for_class`) : un wrapper qui attend
+derrière du travail opérateur `pending` attend **par conception**.
+
+*Halte 3 — des builds QA attendent visiblement plus d'une minute après un
+refus :* c'est le coût nommé (≤ 60 s) qui se réalise, et **ce n'est pas une
+raison de rouvrir l'outil**. Mesurer l'écart entre la ligne
+`promote_deferred_refused_webhook_pr_turn` et le `deferred_dispatch_promoted`
+du **même parent** ; si l'écart dépasse un intervalle de scan, le défaut est au
+**backstop**, pas dans cette garde.
+
+**Halte transverse — les sondes muettes.** Zéro refus **et** zéro tour
+`[GitHub] PR …` depuis le déploiement ne prouve rien : une garde que personne
+n'a exercée se lit exactement comme une garde qui marche (mika#2205). Le
+préalable du binaire servi est ce qui distingue les deux.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne retire rien à l'opérateur.** `mika tasks promote-deferred` et
+  `force_promote_deferred_for_class` sont intacts ; la garde vit dans l'outil,
+  jamais dans la fonction de base, ce qui préserve le CLI **par construction**.
+- **Il ne ferme pas le domaine Fallthrough pour cet outil** : 1 tentative
+  mesurée sur 30 jours, 0 réussie. Hors population par décision (AC7), et une
+  garde sur cette population-là serait un détecteur dont le silence ne prouve
+  rien (mika#2205).
+- **Il n'ajoute pas la priorité opérateur à `force_promote_deferred_for_class`.**
+  C'est une décision distincte, qui appartient **aussi** au chemin CLI, donc à
+  son propre ticket.
+- **Il ne couvre pas un tour webhook servi en mode silencieux** — borne héritée
+  de mika#2517 / mika#2573 : un tour silencieux a `originating_message = None`,
+  donc `is_webhook_pr_event_turn` y est `false`.
+- **Il ne rend pas structurelle l'exclusivité des deux axes.** Lignée
+  (mika#2649) et classe de tour (celui-ci) restent deux termes indépendants ;
+  le suivi qui les réconcilierait — un
+  `webhook_turn: WebhookTurnClass (None | Fallthrough | PrEvent)` en place du
+  booléen — gagne ici un **second lecteur**, ce qui en renforce la précondition
+  sans la satisfaire.
+- **Il n'ajoute aucune variable d'environnement, et c'est une décision.** Même
+  raison que mika#2653, mika#2624 et mika#2573 : *un désarmement par variable
+  sur un chemin de sûreté serait un désarmement par coquille*. Le geste de
+  désarmement est un **revert** de l'appel dans
+  `PromoteDeferredCallbackTool::execute`, et le coût d'un faux positif (≤ 60 s)
+  le supporte.
+
+#### Hors périmètre, délibérément
+
+- **Le backstop périodique** (`promote_pending_deferred_if_idle`,
+  `task_engine/engine.rs`) : aucune ligne touchée.
+- **Le terme de lignée de mika#2649** et **le terme de vivacité de mika#2653** :
+  inchangés. Trois tickets, trois axes — *quelle cible ce dispatch vise-t-il*,
+  *un pilote travaille-t-il ici*, *quelle classe de tour demande* — et ce
+  travail ne lit que le troisième.
+- **Le cap implement** (mika#2652) : toujours ouvert, aucune ligne touchée.
+
+Raisonnement complet, la mesure qui a décidé la forme, les six rectifications au
+corps du ticket et ce que les tests ne peuvent pas attester :
+[`docs/agent-internals/exec-handlers.md`](../agent-internals/exec-handlers.md)
+§ *Un tour webhook PR ne force pas la promotion d'un wrapper différé
+(mika#2654)*.
 
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
