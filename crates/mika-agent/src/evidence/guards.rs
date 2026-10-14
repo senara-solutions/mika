@@ -3847,6 +3847,275 @@ pub fn detect_review_verdict_act(argv: &[String]) -> Option<ReviewVerdictAct> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// mika#2687 — un `block[pipeline]` qui ne cite aucune garde en échec n'est pas
+// un verdict, c'est une paraphrase
+// ---------------------------------------------------------------------------
+//
+// Sur mika#2685, mika-qa a rendu deux fois `VERDICT: block[pipeline]` sur la
+// même tête `0a53b5f0` alors que `scripts/verify-pipeline.sh` (check *Pipeline
+// Artifacts*) était **verte les deux fois**. Aucune des deux revues ne portait
+// la section `PIPELINE:`, et les deux raisons énonçaient une règle qu'aucune
+// garde ne porte : *« Missing plan document in docs/plans/ »* — or
+// `verify-pipeline.sh` compte `docs/solutions/` comme doc, et passait.
+//
+// **Le prompt l'interdisait déjà.** Le prompt déployé (md5 `447f1af4…`) porte
+// à Step 2 *« Do NOT re-evaluate, second-guess, or supplement any rule a guard
+// already carries »*, et à Step 2E l'obligation de citer chaque garde avec son
+// code de sortie. Le défaut est sorti du **modèle**, pas du prompt : c'est la
+// signature exacte de mika#2172 et de mika#2237, et une troisième passe de
+// prompt serait la troisième copie d'une règle qui a déjà dérivé deux fois.
+//
+// **Pourquoi B1 (mika#2519) n'a rien vu.** B1 refuse un `block[pipeline]` sur
+// le seul auteur automatisé ; l'auteur de mika#2685 est humain. B1 s'est
+// abstenue correctement — sa population n'est pas celle-ci.
+//
+// **Pourquoi ici et pas dans `verdict_handler`.** Une rétrogradation côté
+// handler agirait **après** publication : la PR porterait déjà son
+// `changes_requested`. Le critère d'acceptation du ticket dit *« n'est pas
+// publié comme bloquant »*, donc le refus vit dans la chaîne pré-subprocess de
+// `run_gh`, là où la revue n'existe pas encore sur GitHub — la raison même que
+// mika#2237 avait écrite : *« the defect is the call, not a sentence »*.
+//
+// Ce module ne porte que le prédicat pur ; l'application (lecture de l'argv,
+// audit, refus) vit dans `skills::builtin_handlers`, parce que c'est elle qui
+// tient le `ToolContext`. Dernière de la famille à ne lire **ni le réseau ni la
+// base** : sa place dans la chaîne est juste après mika#2237 et avant mika#2455.
+
+/// Le préfixe de la ligne par laquelle une revue ouvre sa section de preuve
+/// pipeline.
+///
+/// **Jeton de fil** : prescrit par Step 2E de `qa-review/system_prompt.md`, lu
+/// ici par [`pipeline_section_present`]. Il porte sa ligne dans
+/// `scripts/canonical-tokens.tsv` avec sa tolérance et son site de match ;
+/// sans cette déclaration, `canonical-tokens-lint` ne le voit pas et la classe
+/// mika#2201 se rouvre.
+pub const PIPELINE_SECTION_LINE_PREFIX: &str = "PIPELINE:";
+
+/// Le préfixe que `scripts/verify-pipeline.sh` écrit sur stderr quand il
+/// refuse.
+///
+/// Verbatim du script, qui l'émet préfixé de `[pipeline-exempt: none] ` :
+/// `REJECT: code-only PR: …` et `REJECT: docs-only PR: …`. **Jeton de fil**,
+/// déclaré dans `scripts/canonical-tokens.tsv`.
+pub const PIPELINE_GUARD_REJECT_TOKEN: &str = "REJECT:";
+
+/// La ligne de conclusion que `scripts/verify-pipeline.sh` écrit avant son
+/// `exit 1` : `Verification FAILED: $ERRORS missing artifact(s).`
+///
+/// **Jeton de fil**, déclaré dans `scripts/canonical-tokens.tsv`. Le motif
+/// s'arrête avant le `:` : le nombre d'artefacts manquants varie, la phrase
+/// non.
+pub const PIPELINE_GUARD_FAILED_TOKEN: &str = "Verification FAILED";
+
+/// Audit-event `tool_name` de **chaque** décision du gate, refus comme
+/// autorisation.
+///
+/// Même convention que [`DEPENDABOT_VERDICT_AUDIT_TOOL`] et
+/// [`QA_CI_COHERENCE_AUDIT_TOOL`] : `audit_events` n'a pas de colonne
+/// `event_type`, `tool_name` est du TEXT libre, aucune migration. **SOLE
+/// WRITER** : `skills::builtin_handlers`.
+///
+/// La ligne est écrite aussi sur [`PipelineGroundingOutcome::Allowed`], et
+/// c'est le contrôle positif de mika#2205 : une table vide dit que le maillon
+/// n'est pas atteint, jamais qu'il ne refuse rien.
+pub const PIPELINE_GROUNDING_AUDIT_TOOL: &str = "pipeline_grounding_guard";
+
+/// Variable de désarmement du gate — le STOP opérateur, nommé et greppable.
+pub const PIPELINE_GROUNDING_GATE_ENV: &str = "MIKA_PIPELINE_GROUNDING_GATE";
+
+/// Motif des codes de sortie cités dans une section `PIPELINE:`.
+///
+/// Les **deux** formes que `qa-review` émet réellement sont couvertes : Step 2E
+/// écrit `- scripts/verify-pipeline.sh → exit 1`, et la boucle de Step 2B écrit
+/// `GUARD: $g exit=$rc`. D'où le séparateur optionnel (`=`, `:`, blancs) entre
+/// le mot et le nombre. Casse repliée : un corps de revue est de la prose.
+static PIPELINE_EXIT_CODE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bexit\b[\s:=]*([0-9]+)").expect("valid pipeline exit-code regex")
+});
+
+/// Ce que le gate conclut d'un `block[pipeline]` et du corps qui le porte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineGroundingOutcome {
+    /// Le corps ne porte **aucune** ligne `PIPELINE:` — les deux revues
+    /// mesurées sur mika#2685 sont exactement dans ce cas.
+    RefusedSectionAbsent,
+    /// Le corps porte une ligne `PIPELINE:` mais rien qui cite une garde en
+    /// échec : ni code de sortie non-zéro, ni `REJECT:`, ni
+    /// `Verification FAILED`. Couvre aussi `PIPELINE: not-applicable (…)` de
+    /// Step 2D, délibérément — une garde qu'on n'a pas trouvée n'est pas une
+    /// garde qui a refusé.
+    RefusedNoFailingGuardCited,
+    /// Rien à refuser : hors population, ou section présente **et** citant au
+    /// moins une garde en échec.
+    Allowed,
+}
+
+/// Le corps ouvre-t-il une section `PIPELINE:` ?
+///
+/// Lecture **permissive**, celle de [`body_asserts_api_surface`] et de la
+/// doctrine `guard-parser-must-be-as-permissive-as-downstream-consumer` :
+/// préfixe ancré en début de ligne (blancs de tête tolérés), casse repliée,
+/// **aucune ancre de fin**. Une course d'emphase markdown de tête est franchie
+/// (`**PIPELINE: block (mika)**`) — précédent mika#1828, que `VERDICT_RE` tient
+/// déjà sur la ligne voisine, et un modèle qui met sa section en gras n'a pas
+/// commis le défaut que ce gate ferme.
+///
+/// **Aucune exigence de reste non vide, à la différence de son voisin
+/// mika#2519** : une ligne `PIPELINE:` nue est bien une section *présente*, et
+/// elle sera refusée un cran plus loin par
+/// [`PipelineGroundingOutcome::RefusedNoFailingGuardCited`] — qui nomme la
+/// vraie cause. La faire tomber ici dirait « section absente » d'une section
+/// qui est là, et enverrait le modèle réécrire ce qu'il a déjà écrit.
+///
+/// La comparaison marche caractère par caractère plutôt que par tranche
+/// d'octets : un corps de revue porte de l'UTF-8 multi-octets et
+/// `scripts/check-byte-slices.sh` refuse un offset calculé (mika#764,
+/// mika#2103).
+pub fn pipeline_section_present(body: &str) -> bool {
+    body.lines().any(|line| {
+        let mut chars = line
+            .trim_start()
+            .chars()
+            .skip_while(|c| *c == '*' || *c == '_');
+        for expected in PIPELINE_SECTION_LINE_PREFIX.chars() {
+            match chars.next() {
+                Some(got) if got.eq_ignore_ascii_case(&expected) => {}
+                _ => return false,
+            }
+        }
+        true
+    })
+}
+
+/// Le corps cite-t-il une garde réellement sortie en échec ?
+///
+/// Disjonction de trois motifs, parce que `qa-review` et
+/// `scripts/verify-pipeline.sh` donnent trois manières d'écrire le même fait :
+///
+/// 1. un code de sortie **non nul** ([`PIPELINE_EXIT_CODE_RE`]) — couvre
+///    `→ exit 1` de Step 2E et `exit=1` de la boucle de Step 2B ;
+/// 2. [`PIPELINE_GUARD_REJECT_TOKEN`] — le refus verbatim du script ;
+/// 3. [`PIPELINE_GUARD_FAILED_TOKEN`] — sa ligne de conclusion avant `exit 1`.
+///
+/// Le code de sortie est lu **chiffre par chiffre** plutôt que par `parse` :
+/// `exit 999999999999` ne doit pas dépendre d'un débordement d'entier pour
+/// être compté comme un échec, et `exit 00` doit se lire comme zéro.
+///
+/// # Dans quel sens ça se trompe
+///
+/// **Fail-open, délibérément, et la borne est nommée.** La disjonction est
+/// large : un corps dont la seule mention d'échec est un `exit 1` dans la prose
+/// d'une garde par ailleurs verte **passera**. C'est l'arithmétique de
+/// mika#2455 et de mika#2519 — un faux positif du refus rend une revue
+/// légitime impossible à poster et fait traverser la porte de merge à une PR
+/// réellement cassée ; un faux négatif laisse subsister le coût déjà payé
+/// aujourd'hui. Ce prédicat ferme la classe **mesurée** (aucune section du
+/// tout, ou une section qui ne cite aucun échec), pas toutes les manières
+/// imaginables de citer de travers.
+pub fn body_cites_failing_guard(body: &str) -> bool {
+    let cites_nonzero_exit = PIPELINE_EXIT_CODE_RE
+        .captures_iter(body)
+        .any(|caps| caps[1].chars().any(|c| c != '0'));
+    if cites_nonzero_exit {
+        return true;
+    }
+
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains(&PIPELINE_GUARD_REJECT_TOKEN.to_ascii_lowercase())
+        || lowered.contains(&PIPELINE_GUARD_FAILED_TOKEN.to_ascii_lowercase())
+}
+
+/// La classification, en une fonction pure, sur les seuls faits lus.
+///
+/// `verdict_is_pipeline_block` est passé plutôt que le `Verdict` lui-même :
+/// ce module ne dépend pas de `server::verdict`, et le point de décision doit
+/// rester testable sans construire un verdict — même convention que
+/// [`classify_dependabot_verdict`]. C'est l'appelant qui plie la casse de la
+/// classe du verdict, exactement comme `verdict_handler` la lit.
+///
+/// **La population est étroite et c'est le cœur de la décision** : seul
+/// `block[pipeline]` est concerné. `pass`, `hold[review]`, `block[ac]`,
+/// `block[ci]`, `block[security]`, `block[dependency]` et un corps sans ligne
+/// `VERDICT:` traversent intacts. Élargir aux autres classes de `block`
+/// demanderait, pour chacune, la mesure de ce qui la fonde — ce ticket n'en a
+/// qu'une.
+pub fn classify_pipeline_block_grounding(
+    verdict_is_pipeline_block: bool,
+    body: &str,
+) -> PipelineGroundingOutcome {
+    if !verdict_is_pipeline_block {
+        return PipelineGroundingOutcome::Allowed;
+    }
+    if !pipeline_section_present(body) {
+        return PipelineGroundingOutcome::RefusedSectionAbsent;
+    }
+    if !body_cites_failing_guard(body) {
+        return PipelineGroundingOutcome::RefusedNoFailingGuardCited;
+    }
+    PipelineGroundingOutcome::Allowed
+}
+
+/// Le gate est-il armé ?
+///
+/// Polarité et vocabulaire de ses deux voisins
+/// ([`qa_ci_coherence_gate_is_enabled`], [`dependabot_verdict_gate_is_enabled`]),
+/// délibérément à l'identique : armé par défaut, désarmé par le seul
+/// `0`/`false`/`off`/`no` explicite, et **toute valeur non reconnue laisse
+/// ARMÉ** avec un WARN qui nomme la valeur **entre guillemets** — sans les
+/// guillemets un espace parasite est invisible (mika#2220).
+pub fn pipeline_grounding_gate_is_enabled(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => {
+            tracing::warn!(
+                event = "pipeline_grounding_gate_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2687: MIKA_PIPELINE_GROUNDING_GATE porte une valeur non reconnue — le gate \
+                 reste ARMÉ (le défaut). Utiliser 0/false/off/no pour le désarmer."
+            );
+            true
+        }
+    }
+}
+
+/// Résolution unique par process, mise en cache.
+///
+/// Lue une fois : poser ou retirer la variable sur un process déjà démarré n'a
+/// aucun effet, par construction — même contrat que ses deux voisins. C'est
+/// pourquoi le STOP opérateur est *« poser la variable **et redémarrer** »*.
+pub fn pipeline_grounding_gate_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        pipeline_grounding_gate_is_enabled(
+            std::env::var(PIPELINE_GROUNDING_GATE_ENV).ok().as_deref(),
+        )
+    })
+}
+
+/// Dit au démarrage que le gate est désarmé — et ne dit rien s'il est armé.
+///
+/// Même raison d'être, mot pour mot, que [`log_qa_ci_coherence_gate_state`] :
+/// le silence d'un gate désarmé se lit exactement comme le silence d'un gate
+/// sain (mika#2205).
+pub fn log_pipeline_grounding_gate_state() {
+    if !pipeline_grounding_gate_enabled() {
+        tracing::info!(
+            event = "pipeline_grounding_gate_disabled",
+            env = PIPELINE_GROUNDING_GATE_ENV,
+            "mika#2687: le gate d'ancrage du `block[pipeline]` est DÉSARMÉ — un `block[pipeline]` \
+             sans section `PIPELINE:` citant une garde en échec peut être posté"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8072,6 +8341,284 @@ mod tests {
             "two channels share one wire value: their populations would merge \
              silently"
         );
+    }
+
+    // -- mika#2687 — un `block[pipeline]` qui ne cite aucune garde en échec --
+    mod mika2687 {
+        use super::super::*;
+
+        /// Revue 1 sur mika#2685, tête `0a53b5f0`, 2026-10-13 11:54Z. Aucune
+        /// section `PIPELINE:`, et la raison énonce une règle que la garde ne
+        /// porte pas : `verify-pipeline.sh` compte `docs/solutions/` comme doc,
+        /// et passait sur cette tête.
+        const MEASURED_2685_FIRST: &str = "\
+## Review
+
+VERDICT: block[pipeline]
+
+Missing plan document in docs/plans/ — pipeline compliance Check 1 fails.
+The PR changes Cargo.lock and deny.toml with a doc under docs/solutions/,
+but no plan document is present.
+";
+
+        /// Revue 2 sur mika#2685, **même tête**, 2026-10-13 17:03Z. Toujours
+        /// aucune section `PIPELINE:`.
+        const MEASURED_2685_SECOND: &str = "\
+## Review
+
+VERDICT: block[pipeline]
+
+pipeline-exempt label present but PR contains non-docs files (Cargo.lock,
+deny.toml), so label bypass does not apply.
+";
+
+        /// L'exemple bloquant de Step 2E, verbatim du prompt déployé.
+        const STEP_2E_BLOCKING: &str = "\
+VERDICT: block[pipeline]
+
+PIPELINE: block (mika)
+- scripts/verify-pipeline.sh → exit 1
+  [pipeline-exempt: none] REJECT: code-only PR: source changes present but no plan/solution doc
+          Add 'Pipeline-Exempt: code-only — <reason>' trailer to a commit
+          if this code-only ship is intentional.
+  Verification FAILED: 1 missing artifact(s).
+";
+
+        /// L'exemple vert de Step 2E — section présente, garde à `exit 0`.
+        const STEP_2E_GREEN: &str = "\
+VERDICT: block[pipeline]
+
+PIPELINE: pass (mika)
+- scripts/verify-pipeline.sh → exit 0
+  Pipeline verification passed. Plan: <none> Compound: docs/solutions/bug-fixes/x.md
+";
+
+        // -- les deux corps mesurés : le défaut que ce gate ferme --
+
+        #[test]
+        fn mika2687_les_deux_revues_mesurees_sur_2685_sont_refusees() {
+            for (label, body) in [
+                ("2026-10-13 11:54Z", MEASURED_2685_FIRST),
+                ("2026-10-13 17:03Z", MEASURED_2685_SECOND),
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(true, body),
+                    PipelineGroundingOutcome::RefusedSectionAbsent,
+                    "la revue du {label} ne porte aucune section `PIPELINE:` — \
+                     c'est exactement la classe mesurée"
+                );
+            }
+        }
+
+        // -- contrôle positif : un `block[pipeline]` fondé passe intact --
+
+        #[test]
+        fn mika2687_lexemple_bloquant_de_step_2e_passe_intact() {
+            assert_eq!(
+                classify_pipeline_block_grounding(true, STEP_2E_BLOCKING),
+                PipelineGroundingOutcome::Allowed,
+                "le corps que le prompt prescrit lui-même doit traverser : un \
+                 gate qui refuse la forme canonique rend le verdict impossible \
+                 à poster"
+            );
+        }
+
+        #[test]
+        fn mika2687_la_forme_exit_egal_de_la_boucle_de_step_2b_passe_aussi() {
+            // Step 2B émet `GUARD: $g exit=$rc` ; Step 2E émet `→ exit 1`. Les
+            // deux formes sortent du même prompt et la seconde seule ne suffit
+            // pas.
+            let body = "VERDICT: block[pipeline]\n\nPIPELINE: block (mika)\nGUARD: scripts/verify-pipeline.sh exit=1\n";
+            assert_eq!(
+                classify_pipeline_block_grounding(true, body),
+                PipelineGroundingOutcome::Allowed
+            );
+        }
+
+        #[test]
+        fn mika2687_lemphase_markdown_de_la_ligne_de_section_est_franchie() {
+            // Précédent mika#1828 : `VERDICT_RE` tolère déjà `**…**` sur la
+            // ligne voisine. Un modèle qui met sa section en gras n'a pas
+            // commis le défaut que ce gate ferme.
+            for line in [
+                "**PIPELINE: block (mika)**",
+                "__PIPELINE: block (mika)__",
+                "***PIPELINE: block (mika)***",
+            ] {
+                let body = format!("VERDICT: block[pipeline]\n\n{line}\n- guard → exit 1\n");
+                assert_eq!(
+                    classify_pipeline_block_grounding(true, &body),
+                    PipelineGroundingOutcome::Allowed,
+                    "{line}"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2687_la_casse_et_les_blancs_de_tete_sont_tolerees_sur_la_section() {
+            let body = "VERDICT: block[pipeline]\n\n   pipeline: BLOCK (mika)\n   - guard EXIT 1\n";
+            assert_eq!(
+                classify_pipeline_block_grounding(true, body),
+                PipelineGroundingOutcome::Allowed
+            );
+        }
+
+        // -- section présente, mais rien d'échoué de cité --
+
+        #[test]
+        fn mika2687_une_section_verte_est_refusee_sur_labsence_de_citation() {
+            assert_eq!(
+                classify_pipeline_block_grounding(true, STEP_2E_GREEN),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited,
+                "la section est là, la garde est à `exit 0` : le verdict n'est \
+                 pas fondé, et le refus doit nommer CETTE cause plutôt que \
+                 l'absence de section"
+            );
+        }
+
+        #[test]
+        fn mika2687_la_section_not_applicable_de_step_2d_est_refusee_deliberement() {
+            // Une garde qu'on n'a pas trouvée n'est pas une garde qui a refusé.
+            let body = "VERDICT: block[pipeline]\n\nPIPELINE: not-applicable (no executable guard found in mika: scripts/verify-pipeline.sh absent)\n";
+            assert_eq!(
+                classify_pipeline_block_grounding(true, body),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited
+            );
+        }
+
+        #[test]
+        fn mika2687_une_ligne_de_section_nue_est_presente_puis_refusee_sur_la_vraie_cause() {
+            // À la différence de `body_asserts_api_surface` (mika#2519), la
+            // présence n'exige pas un reste non vide : la faire tomber ici
+            // dirait « section absente » d'une section qui est là.
+            let body = "VERDICT: block[pipeline]\n\nPIPELINE:\n";
+            assert!(pipeline_section_present(body));
+            assert_eq!(
+                classify_pipeline_block_grounding(true, body),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited
+            );
+        }
+
+        // -- hors population : tout le reste traverse intact --
+
+        #[test]
+        fn mika2687_les_autres_verdicts_traversent_sans_section() {
+            for body in [
+                "VERDICT: pass\n\nAll acceptance criteria met.\n",
+                "VERDICT: hold[review]\n\nWaiting on CI.\n",
+                "VERDICT: block[ac]\n\nAC3 is not covered by any test.\n",
+                "VERDICT: block[ci]\n\nThe required Check job is red.\n",
+                "VERDICT: block[security]\n\nA secret is committed.\n",
+                "VERDICT: block[dependency]\n\nBreaking changelog entry.\n",
+                "LGTM, thanks — no verdict line at all here.\n",
+                "",
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(false, body),
+                    PipelineGroundingOutcome::Allowed,
+                    "{body:?}"
+                );
+            }
+        }
+
+        // -- le lecteur de code de sortie, chiffre par chiffre --
+
+        #[test]
+        fn mika2687_un_code_de_sortie_non_nul_est_une_citation_decheck() {
+            for body in [
+                "- guard → exit 1",
+                "GUARD: g exit=1",
+                "guard exit: 2",
+                "guard EXIT 10",
+                "guard exit 127",
+                // Lu chiffre par chiffre : aucun `parse` à déborder.
+                "guard exit 999999999999999999999999",
+            ] {
+                assert!(body_cites_failing_guard(body), "{body:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_un_code_de_sortie_nul_nest_pas_une_citation_decheck() {
+            for body in [
+                "- guard → exit 0",
+                "GUARD: g exit=0",
+                "guard exit 00",
+                "guard exit: 000",
+                "the guard exited cleanly",
+            ] {
+                assert!(!body_cites_failing_guard(body), "{body:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_les_deux_jetons_verbatim_du_script_sont_des_citations() {
+            // Verbatim de `scripts/verify-pipeline.sh`, qui les émet sur
+            // stderr juste avant son `exit 1`.
+            for body in [
+                "[pipeline-exempt: none] REJECT: code-only PR: source changes present but no plan/solution doc",
+                "[pipeline-exempt: none] REJECT: docs-only PR: plan/solution present but no source changes",
+                "Verification FAILED: 1 missing artifact(s).",
+                "verification failed: 2 missing artifact(s).",
+            ] {
+                assert!(body_cites_failing_guard(body), "{body:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_la_ligne_de_succes_du_script_nest_pas_une_citation_decheck() {
+            assert!(!body_cites_failing_guard(
+                "Pipeline verification passed. Plan: <none> Compound: docs/solutions/x.md"
+            ));
+        }
+
+        // -- le gate, sur ses six entrées --
+
+        #[test]
+        fn mika2687_le_gate_est_arme_par_defaut_et_desarme_par_quatre_formes() {
+            // Armé : absent, vide, toute valeur d'armement, et **toute valeur
+            // non reconnue** — un désarmement par coquille sur un gate de
+            // sûreté serait la panne silencieuse que ce travail ferme
+            // (mika#2220).
+            for raw in [
+                None,
+                Some(""),
+                Some("   "),
+                Some("1"),
+                Some("true"),
+                Some("ON"),
+                Some("yes"),
+            ] {
+                assert!(pipeline_grounding_gate_is_enabled(raw), "{raw:?}");
+            }
+            assert!(
+                pipeline_grounding_gate_is_enabled(Some("frobnicate")),
+                "une valeur non reconnue laisse ARMÉ, avec un WARN qui la nomme"
+            );
+
+            for raw in [
+                Some("0"),
+                Some("false"),
+                Some("off"),
+                Some("NO"),
+                Some(" off "),
+            ] {
+                assert!(!pipeline_grounding_gate_is_enabled(raw), "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_les_jetons_sont_un_format_de_fil() {
+            // Ces trois chaînes sont déclarées dans
+            // `scripts/canonical-tokens.tsv` avec leur site de match. Les
+            // épingler ici fait rougir le test avant que le lint ne devienne
+            // muet sur un renommage.
+            assert_eq!(PIPELINE_SECTION_LINE_PREFIX, "PIPELINE:");
+            assert_eq!(PIPELINE_GUARD_REJECT_TOKEN, "REJECT:");
+            assert_eq!(PIPELINE_GUARD_FAILED_TOKEN, "Verification FAILED");
+            assert_eq!(PIPELINE_GROUNDING_AUDIT_TOOL, "pipeline_grounding_guard");
+            assert_eq!(PIPELINE_GROUNDING_GATE_ENV, "MIKA_PIPELINE_GROUNDING_GATE");
+        }
     }
 }
 

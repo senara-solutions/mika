@@ -1395,6 +1395,17 @@ mod tests {
     /// inline dans le jumeau mika#2649, compare `lit` sans `trim`). Un prédicat
     /// recopié est un prédicat qui peut diverger de son propre contrôle de bonne
     /// foi, ce qui est la seule chose que ce contrôle existe pour empêcher.
+    ///
+    /// Le `needle` étant un paramètre, le prédicat n'appartient à aucun des noms
+    /// qui l'ont fait naître. mika#1745 en portait une **troisième** copie octet
+    /// pour octet sous le nom `carries_bare_surface_literal`, deux mille sept
+    /// cents lignes plus bas ; mika#2683, en la relisant pour
+    /// `ci_failure_no_action`, l'a d'abord renommée `carries_bare_literal` —
+    /// c'est-à-dire a produit deux noms neutres pour un même corps, exactement la
+    /// situation que le paragraphe ci-dessus refuse. Elle est donc supprimée, et
+    /// ses cinq sites routés ici. Conséquence utile : les contrôles de bonne foi
+    /// de mika#2634, de mika#2653 et de mika#1745 attestent désormais **le même
+    /// corps**, ce que chacun affirmait déjà séparément.
     fn audit_name_literal_present(content: &str, needle: &str) -> bool {
         content
             .lines()
@@ -4288,23 +4299,6 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// pas d'entrée** (doctrine mika#2201).
     const SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
 
-    /// Le prédicat du scan mika#1745, extrait pour être exerçable sur un contenu
-    /// fabriqué.
-    ///
-    /// Sans cette extraction, « le scan est propre » et « le scan ne regarde
-    /// rien » rendent le même vert, et la seule façon de les distinguer est une
-    /// mutation à la main que personne ne rejoue (classe mika#2205, appliquée au
-    /// scan lui-même).
-    fn carries_bare_surface_literal(content: &str, needle: &str) -> bool {
-        content
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
-            })
-            .any(|line| string_literals(line).iter().any(|lit| lit.trim() == needle))
-    }
-
     /// Le nom du signal est écrit à **un** endroit, dans le journal comme dans
     /// `audit_events`.
     ///
@@ -4360,7 +4354,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             if SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
-            if carries_bare_surface_literal(&content, &needle) {
+            if audit_name_literal_present(&content, &needle) {
                 writers.push(rel);
             }
         }
@@ -4395,14 +4389,14 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
         let needle = format!("surface_for{}", "_adoption");
 
         assert!(
-            carries_bare_surface_literal(
+            audit_name_literal_present(
                 &format!("    db.log_audit_event(sid, \"{needle}\", &key).await;"),
                 &needle
             ),
             "un second écrivain porte le littéral nu — le prédicat doit le voir"
         );
         assert!(
-            carries_bare_surface_literal(
+            audit_name_literal_present(
                 &format!("    info!(event = \"{needle}\", x = 1);"),
                 &needle
             ),
@@ -4419,7 +4413,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             format!("    /// Voir `{needle}` pour le contrat."),
         ] {
             assert!(
-                !carries_bare_surface_literal(&benign, &needle),
+                !audit_name_literal_present(&benign, &needle),
                 "faux positif sur une forme voisine : {benign}"
             );
         }
@@ -4431,6 +4425,106 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
         assert!(
             SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS.is_empty(),
             "SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS est livrée vide et doit \
+             le rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2683 — le nom de la sortie « rien à faire » a un seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Même construction que sa voisine mika#1745 : le nom
+    /// `ci_failure_no_action` est **créé par mika#2683**, donc la population
+    /// des violations préexistantes est vide par construction.
+    ///
+    /// **Quand le scan tire, on retire le second site d'écriture ; on n'ajoute
+    /// pas d'entrée** (doctrine mika#2201).
+    const CI_FAILURE_NO_ACTION_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom de la sortie terminale est écrit à **un** endroit : le helper
+    /// `log_no_action` de `ci_failure_handler.rs`.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Cette ligne d'audit a deux lecteurs, et un second écrivain les ment
+    /// tous les deux en silence. Le premier est l'opérateur, dont le
+    /// `SELECT after_value, count(*) … WHERE tool_name = 'ci_failure_no_action'
+    /// GROUP BY 1` **est** la mesure de la population que mika#2683 prétend
+    /// avoir rendue gratuite ; deux écrivains la font compter deux populations
+    /// mêlées. Le second est le pré-filtre lui-même : `ci_failure_no_action_class`
+    /// (`server/webhook_prefilter.rs`) lit cette ligne pour savoir qu'il ne
+    /// reste rien à décider, donc un site qui l'écrit **sans** avoir pris la
+    /// décision terminale fait sauter un tour LLM qui aurait dû avoir lieu.
+    /// Aucune assertion de comportement ne voit arriver ce site-là le jour où
+    /// il est écrit : c'est la classe `grooming_marker` (mika#2158), payée deux
+    /// fois dans ce dépôt.
+    ///
+    /// # Le prédicat est l'ÉGALITÉ, et c'est ce qui rend la constante utile
+    ///
+    /// `webhook_prefilter.rs` **lit** ce nom — il le doit, c'est le mécanisme
+    /// du volet (c) — mais par la constante [`CI_FAILURE_NO_ACTION_TOOL`], pas
+    /// par un littéral. La propriété SOLE WRITER porte sur le **littéral** :
+    /// élargir la visibilité de la constante n'élargit pas l'écriture, et
+    /// l'identifiant est invisible à ce scan. Un prédicat par `contains`
+    /// accuserait au contraire les deux motifs voisins
+    /// `ci_failure_no_action_class` et `CI_FAILURE_NO_ACTION_NO_OPEN_PR`.
+    ///
+    /// # Angle mort hérité
+    ///
+    /// Identique à celui que documente
+    /// [`mika1745_the_surface_name_has_a_single_writer`] :
+    /// [`production_sources`] tronque chaque fichier à la première occurrence
+    /// **textuelle** de `#[cfg(test)]`, doc-comments compris. La limite est
+    /// partagée par tous les scans de ce fichier ; ce qui la rend supportable
+    /// est que le prédicat, lui, est attesté séparément.
+    #[test]
+    fn mika2683_the_no_action_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("ci_failure_no{}", "_action");
+        let owner = "crates/mika-agent/src/server/ci_failure_handler.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if CI_FAILURE_NO_ACTION_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2683 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2683 — le nom de la sortie « rien à faire » du CI failure \
+             handler a un second écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site, ou le router par la constante \
+             `ci_failure_handler::CI_FAILURE_NO_ACTION_TOOL` s'il ne fait que \
+             LIRE le nom. Ne PAS l'ajouter à \
+             CI_FAILURE_NO_ACTION_SOLE_WRITER_EXCEPTIONS — le pré-filtre coupe \
+             un tour LLM sur la foi de cette ligne, et l'opérateur en compte la \
+             population."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2683_the_no_action_allowlist_is_empty() {
+        assert!(
+            CI_FAILURE_NO_ACTION_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "CI_FAILURE_NO_ACTION_SOLE_WRITER_EXCEPTIONS est livrée vide et doit \
              le rester : quand le scan tire, on retire le second écrivain. Une \
              allowlist née vide est un emplacement où déposer la prochaine \
              infraction (mika#2323)."
