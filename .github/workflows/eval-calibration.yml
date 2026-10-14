@@ -1,9 +1,28 @@
 name: Eval Calibration
 
+# LE `schedule` A ÉTÉ RETIRÉ — mika#2683, volet (b), décision de grooming D2.
+#
+# Ce workflow a échoué 17 fois sur 17 du 2026-06-22 au 2026-10-12 : la commande
+# cargo portait `--ignored` ET `--include-ignored`, mutuellement exclusifs, et
+# le `|| true` avalait l'erreur. Il n'a donc JAMAIS produit d'artefact, et
+# chaque lundi son échec sur `main` coûtait un tour LLM à mika-dev.
+#
+# Corriger le flag seul (ci-dessous) ferait passer ce cron de « échoue avant
+# tout appel » à « appelle quatre vrais fournisseurs chaque lundi » : l'étape
+# exporte `MIKA_EVAL_REAL_PROVIDERS: all` et quatre clés. Coût mesuré
+# ~2,57 $/exécution, ~150 $/an. C'est une dépense récurrente, donc une décision
+# d'opérateur — et une session dispatchée qui pose une question est une session
+# morte. Le `schedule` part ; le flag est corrigé quand même, pour que la
+# correction soit acquise et vérifiable par `workflow_dispatch`.
+#
+# RÉARMEMENT : décision de budget consignée sur mika#2683, puis réintroduire
+#
+#   schedule:
+#     - cron: '0 8 * * 1'   # lundis 08:00 UTC (09:00 Paris)
+#
+# Trois lignes de YAML, aucune autre condition. Tant qu'il n'est pas réarmé, la
+# détection de dérive de tolérance des fournisseurs (#742) est à la demande.
 on:
-  schedule:
-    # D1: Mondays 08:00 UTC (09:00 Paris)
-    - cron: '0 8 * * 1'
   workflow_dispatch:
 
 env:
@@ -55,8 +74,22 @@ jobs:
             fi
           done
 
-          # Run the calibration test suite
-          cargo test -p mika-agent --test eval -- --ignored --include-ignored 2>&1 || true
+          # Run the calibration test suite.
+          #
+          # `--ignored` SEUL (mika#2683) : l'intention de #742 est la matrice de
+          # calibration, qui est précisément ce que `#[ignore]` marque. Ajouter
+          # `--include-ignored` ferait tourner en plus toute la suite eval
+          # bouchonnée, que `ci.yml` couvre déjà à chaque PR — et les deux flags
+          # ensemble sont refusés par libtest.
+          #
+          # Pas de `|| true` : c'est lui qui a rendu 17 échecs illisibles. Un
+          # échec de cargo doit faire échouer l'étape.
+          #
+          # L'eval KG (#762) est gardée séparément derrière
+          # `MIKA_EVAL_KG_PROVIDERS`, que cette étape n'exporte pas :
+          # `parse_kg_providers` rend un vecteur vide et ses quatre tests
+          # s'auto-sautent. Aucun filtre de nom n'est donc nécessaire ici.
+          cargo test -p mika-agent --test eval -- --ignored 2>&1
 
           # Find the latest calibration artifact
           ARTIFACT=$(ls -t target/eval-calibration/*.json 2>/dev/null | head -1)
