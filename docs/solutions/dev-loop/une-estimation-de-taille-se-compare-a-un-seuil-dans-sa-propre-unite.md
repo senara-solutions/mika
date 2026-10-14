@@ -10,12 +10,16 @@ applies_when:
   - "un plan groomé porte une section « Taille estimée » et la porte de groom la compare au seuil `_plan_size_max_loc`"
   - "on recalibre `PLAN_SIZE_MAX_LOC` ou le littéral des deux prompts architecte"
   - "un groomeur estime le volume d'un livrable dont la moitié est un harnais shell (`test-dispatch-lib.sh`)"
+  - "on recalibre l'un des quatre paramètres de la borne par vol (`_plan_size_per_flight_bound`, mika#2693)"
+  - "un vol meurt au plafond de tours alors que son plan passait la borne par PR"
 symptoms:
   - "mika#2636 : plan estimé à 530 lignes de code, PR #2648 en porte 1 596 hors `docs/` et CLAUDE.md (×3,0)"
   - "mika#2641, même jour : estimé ≈ 550, livré 1 415 (×2,6), pilote mort au plafond de tours"
   - "la marge que le plan s'accordait (ratio 1,39 mesuré sur mika#1960 phase 2) a été dépassée d'un facteur 2"
+  - "2026-10-14 : trois vols (mika#2683, #2654, #2687 vol 1) morts au plafond en PASSANT la borne par PR, aucun n'ayant ouvert sa PR"
+  - "le dernier commit de travail tombe 15 à 30 tours avant la mort : c'est la fin de pipeline qui ne tient pas, pas le travail"
 root_cause: unit_mismatch_estimate_vs_measured_threshold
-tags: [plan-size, taille-estimee, max-turns, groom, estimation, calibration, threshold, plafond-de-tours, measure-before-remedy]
+tags: [plan-size, taille-estimee, max-turns, groom, estimation, calibration, threshold, plafond-de-tours, measure-before-remedy, borne-par-vol, loop-substrate]
 related_components: [mika-arch-groom-ticket, mika-arch-second-review, dev-groom]
 ticket: mika#2636
 ---
@@ -142,6 +146,107 @@ Livraison attendue : ~1 300–1 600 → au-dessus de la ligne de mort → décou
 
 Livré : 1 596.
 
+## La seconde borne est en TOURS, et elle est par VOL (mika#2693, 2026-10-14)
+
+Douze jours après la pose de la porte, trois vols sont morts au plafond **en
+passant** la borne par PR. Mesures prises sur les transcripts de pilote, session
+principale seulement, sous-agents exclus :
+
+| ticket | plafond | estimé | réel hors `docs/` | 1er Edit | dernier commit de travail | mort |
+|---|---|---|---|---|---|---|
+| mika#2683 | 200 | 832 | 1 432 | t39 | t171 | 201, dans `ce-simplify-code` |
+| mika#2654 | 200 | 880 | 1 160 | t36 | t177 | 201, dans `ce-simplify-code` |
+| mika#2687 (vol 1) | 150 | 443 | 994 | t32 | t136 | 151, dans la vérification finale |
+
+Aucun des trois n'a ouvert sa PR ; dispatch-lib les a sauvés en brouillon
+(mika#2689, #2690, #2691) et l'orchestrateur a dû les finir à la main.
+
+**Le travail tenait dans le vol.** Les derniers commits de travail tombent à t171,
+t177 et t136 — soit 15 à 30 tours avant la mort. Ce qui n'a pas tenu, c'est la
+**fin de pipeline** : simplification, revue, vérification complète, compound,
+PR. Et cette fin de pipeline coûte des **tours**, pas des lignes. Un seuil en
+lignes ne peut pas la voir, quel que soit son étalonnage : le § précédent corrige
+l'*unité* de l'estimation, celui-ci dit qu'il manquait une *seconde dimension*.
+
+La contrainte réelle dépend donc du **plafond du ticket**, qui n'est pas le même
+pour tous : 150 par défaut, 200 avec le label `loop-substrate`
+(`PILOT_LABEL_TURN_CEILINGS`). mika#2687 l'a montré en négatif — la règle avait
+été donnée à la main par commentaire opérateur, et elle supposait 200 alors que
+le ticket n'avait pas le label.
+
+### La dérivation, et d'où vient chacun de ses quatre paramètres
+
+```
+tours_de_travail = plafond − orientation − fin_de_pipeline
+borne_estimée    = tours_de_travail × débit / facteur
+```
+
+| paramètre | valeur | provenance |
+|---|---|---|
+| orientation | ~35 tours | premier `Edit` des trois vols : t39, t36, t32 — tout ce qui précède est lecture de plan, de ticket et de code |
+| fin de pipeline | ~50 tours | écart entre le dernier commit de travail et la mort (t171→201, t177→201, t136→151), majoré : les trois sont morts *dedans*, donc l'écart observé est un plancher, pas la durée réelle |
+| débit | ~7,5 lignes réelles/tour | 1 432 / (171−39), 1 160 / (177−36), 994 / (136−32) → 10,8 / 8,2 / 9,6, rabattu à 7,5 car les trois sont morts avant la fin |
+| facteur estimé → réel | 2 (prudent) | 1 432/832 = 1,7 ; 1 160/880 = 1,3 ; 994/443 = 2,2. L'intervalle 1,3–2,2 est pris à 2, pas à sa moyenne |
+
+Soit **431** lignes estimées à un plafond de 200, et **243** à 150.
+
+Les quatre paramètres vivent nommés à un seul site,
+`skills/bundled/_shared/dispatch-lib.sh`, juste au-dessus de
+`_plan_size_per_flight_bound` ; le résolveur les applique, et un test de parité
+du type S14 (V4) épingle les littéraux des deux prompts architecte contre eux.
+Un `.sh` n'a jamais eu besoin de porter cette justification — ce qu'il doit
+porter, c'est de quoi **recalculer**, et c'est pourquoi la dérivation y vit en
+commentaire plutôt qu'un nombre nu.
+
+### Arithmétique entière : les deux mises à l'échelle s'annulent
+
+`bash` n'a pas de flottants. 7,5 lignes/tour et un facteur de 2 se portent donc
+par deux entiers **dont le nom dit l'échelle** : `750` lignes pour `100` tours,
+et le facteur en pourcentage (`200`). Les deux mises à l'échelle s'annulent
+(×1/100 puis ÷1/100), ce qui rend le calcul exact en **une seule** division :
+
+```
+borne = (plafond − 35 − 50) × 750 / 200
+plafond 200 → 115 × 750 / 200 = 431
+plafond 150 →  65 × 750 / 200 = 243
+```
+
+**Qui recalibre le débit à 9 lignes/tour écrit `900`, jamais `9`.** L'annulation
+est dite au site précisément pour que le prochain recalibrage ne divise pas la
+borne par cent en croyant la corriger.
+
+### Comment recalibrer sur une distribution, et pas sur une mort
+
+n=3 n'est pas une distribution, et les trois points sont biaisés dans le même
+sens : les trois pilotes sont morts, donc chacun des quatre paramètres est
+mesuré sur une course tronquée. La méthode :
+
+1. Par vol terminé — **mort ou non** —, relever le quadruplet : plafond, total
+   estimé du plan, réel hors `docs/` par `git show --numstat`, et les trois tours
+   (premier `Edit`, dernier commit de travail, dernier tour).
+2. Les vols qui ont **fini** sont les seuls à donner une fin de pipeline et un
+   débit non tronqués. Un corpus qui ne contient que des morts majore
+   l'orientation et minore tout le reste.
+3. Recalculer les quatre paramètres sur le corpus entier, puis la borne. Comme
+   au § précédent, **c'est la borne qui bouge**, jamais la mesure.
+4. Changer la constante au site unique. V4 tirera sur les deux prompts
+   architecte tant qu'ils n'ont pas suivi — c'est exactement son office, un
+   `system_prompt.md` étant statique et incapable de lire une constante shell.
+
+Le plancher est explicite dans le résolveur : un plafond ≤ 85 (= 35 + 50) donne
+un nombre de tours de travail nul ou négatif, et la borne vaut alors **0**, avec
+la note `ceiling_below_pipeline_floor`. Jamais un négatif — « un nombre
+plausible, présenté avec autorité, faux » est la classe de défaut que l'ancre de
+`_PLAN_SIZE_TOTAL_RE` avait déjà dû fermer. Un plafond sous le plancher ne peut
+héberger aucune implémentation, et la note le dit au groomeur au lieu de lui
+servir un nombre.
+
+Enfin, **l'omission va toujours vers la borne la plus serrée**. Un plan qui ne
+déclare pas son plafond est jugé sur 150, pas sur 200 ; un site qui oublierait de
+passer le plafond au résolveur tombe sur le même repli (`disarmed_fallback`). La
+direction prudente donne un plan plus petit, donc un découpage parfois inutile —
+jamais une mort par volume.
+
 ## Related
 
 - CLAUDE.md, section d'observabilité de l'estimation de taille (sondes 1 à 4,
@@ -151,3 +256,7 @@ Livré : 1 596.
   sceller ce qu'on mesure avant de le mesurer.
 - `docs/solutions/dev-loop/un-marqueur-de-completude-doit-lire-si-la-session-a-conclu-2026-09-29.md` —
   un pilote tué à 151/150 tours, la classe de mort que cette porte vise.
+- mika#2693 — la borne par vol. Le § ci-dessus est sa justification ; sa
+  dérivation vit en commentaire au-dessus de `_plan_size_per_flight_bound`
+  (`skills/bundled/_shared/dispatch-lib.sh`), et les sondes V1 à V6 de
+  `test-dispatch-lib.sh` la tiennent.
