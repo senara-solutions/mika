@@ -31,13 +31,19 @@ const VALID_DISPATCH_CLASSES: &[&str] = &["implement", "groom"];
 ///
 /// Les trois noms frères partagent le préfixe `deferred_dispatch_force_promote`,
 /// donc un scan sur ce préfixe trouverait trois écrivains et serait **rouge à la
-/// naissance** — et un lint rouge à la naissance se fait désarmer. Dans l'autre
-/// sens, le résidu `promote_deferred_guard_audit_failed` a ce nom pour
-/// **préfixe**, donc une comparaison en sous-chaîne compterait une ligne de
-/// journal comme un second écrivain de la ligne d'audit. C'est la correction que
-/// mika#2649, puis mika#2634, puis mika#2653 ont dû écrire chacun sur son scan
-/// jumeau ; `audit_name_literal_present` compare `lit.trim() == needle`, et
-/// c'est la bonne forme.
+/// naissance** — et un lint rouge à la naissance se fait désarmer. Le needle est
+/// donc le nom entier, et la comparaison est **exacte** plutôt qu'en
+/// sous-chaîne : c'est elle qui empêche un nom *étendant* celui-ci — la forme
+/// que prennent les résidus de cette famille, `cancel_task_pilot_guard` →
+/// `cancel_task_pilot_guard_audit_failed` chez la sœur — de compter comme un
+/// second écrivain de la ligne d'audit. C'est la correction que mika#2649, puis
+/// mika#2634, puis mika#2653 ont dû écrire chacun sur son scan jumeau ;
+/// `audit_name_literal_present` compare `lit.trim() == needle`, et c'est la
+/// bonne forme.
+///
+/// Le résidu de **cette** garde, lui, s'appelle
+/// `promote_deferred_guard_audit_failed` : il ne partage pas ce nom, donc il ne
+/// pèse sur rien ici — ce qui est une propriété des noms choisis, pas du scan.
 pub(crate) const FORCE_PROMOTE_TURN_GUARD_AUDIT_TOOL: &str =
     "deferred_dispatch_force_promote_refused_webhook_pr_turn";
 
@@ -199,6 +205,86 @@ fn refusal_body(decision: ForcePromoteTurnDecision, dispatch_class: &str) -> Str
     }
 }
 
+/// Rend le verdict de la garde **observable** : une ligne de journal, puis une
+/// ligne d'audit sous [`FORCE_PROMOTE_TURN_GUARD_AUDIT_TOOL`].
+///
+/// # Tiré-oublié, et la signature est ce qui le garantit
+///
+/// Motif `report_cancel_pilot_decision` : le retour est `()`, donc **aucun
+/// échec d'audit ne peut remonter jusqu'au verdict**. Un `?` ici ferait d'une
+/// base saturée une promotion autorisée — la garde céderait précisément sous la
+/// charge qui la rend utile. Ce que l'échec laisse derrière lui est nommé plutôt
+/// que tu : le WARN résiduel `promote_deferred_guard_audit_failed` dit que la
+/// ligne de journal a atterri et que la ligne d'audit non, donc que le `GROUP
+/// BY` de la sonde S1 **sous-compte à partir de là**. On l'attend vide.
+///
+/// # « Rien hors de la population », porté ici et pas par l'appelant
+///
+/// L'`early return` sur `audit_value() == None` est ce qui tient la doctrine
+/// mika#2131 : sur les ~42 appels mesurés hors canal github, cette fonction
+/// n'écrit **rien** — ni journal, ni audit. C'est aussi ce qui permet au site
+/// d'appel de l'invoquer **inconditionnellement**, sans répéter le prédicat :
+/// un second site qui reteste la classe de tour serait un second endroit où la
+/// borne peut diverger.
+async fn report_force_promote_turn_decision(
+    decision: ForcePromoteTurnDecision,
+    dispatch_class: &str,
+    ctx: &ToolContext<'_>,
+) {
+    let Some(audit_value) = decision.audit_value() else {
+        return;
+    };
+
+    match decision {
+        ForcePromoteTurnDecision::RefusedWebhookPrTurn => {
+            // INFO et non WARN : un modèle qui tente la promotion sur un tour
+            // webhook fait une erreur de plan de dispatch, pas une panne. La
+            // sœur mika#2653 journalise en WARN parce qu'un pilote vivant qu'on
+            // tente de tuer est un incident ; ici le moteur promeut de lui-même
+            // au scan suivant, donc le refus ne laisse aucun travail en
+            // souffrance. Un WARN par refus aurait fait du bruit d'un défaut
+            // refermé — et un WARN qu'on apprend à ignorer ne se lit plus.
+            tracing::info!(
+                event = "promote_deferred_refused_webhook_pr_turn",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                trace_id = %ctx.trace_id,
+                dispatch_class = %dispatch_class,
+                "refused to force-promote a deferred wrapper on a turn opened by a \
+                 GitHub PR / check-suite event; the engine promotes it on its own at \
+                 its next scan (mika#2654)"
+            );
+        }
+        // Hors population : `audit_value()` a rendu `None` et la fonction a
+        // déjà rendu la main. Le `match` reste exhaustif, sans bras `_ =>`,
+        // pour qu'une troisième issue soit tranchée ici par le compilateur.
+        ForcePromoteTurnDecision::Allowed => {}
+    }
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            FORCE_PROMOTE_TURN_GUARD_AUDIT_TOOL,
+            &format!("dispatch_class:{dispatch_class}"),
+            None,
+            Some(audit_value),
+            None,
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(
+            event = "promote_deferred_guard_audit_failed",
+            error = %e,
+            dispatch_class = %dispatch_class,
+            verdict = %audit_value,
+            "the log line landed but its audit row did not; the GROUP BY undercounts \
+             from here"
+        );
+    }
+}
+
 pub struct PromoteDeferredCallbackTool;
 
 #[async_trait]
@@ -262,6 +348,11 @@ impl Tool for PromoteDeferredCallbackTool {
         // partagent cette fonction de base et ne traversent aucun
         // `ToolContext` (R5).
         let decision = classify_force_promote_turn(ctx.is_webhook_pr_event_turn);
+        // Appelé **inconditionnellement** : c'est la fonction elle-même qui
+        // rend la main sans rien écrire hors de la population (mika#2131). Un
+        // `if` ici répéterait le prédicat et ouvrirait un second endroit où la
+        // borne peut diverger de celle du refus.
+        report_force_promote_turn_decision(decision, dispatch_class, ctx).await;
         match decision {
             ForcePromoteTurnDecision::RefusedWebhookPrTurn => {
                 return Ok(ToolOutput::error(refusal_body(decision, dispatch_class)));
@@ -662,6 +753,99 @@ mod tests {
             .expect("task readable")
             .expect("task exists");
         assert_eq!(task.status, "pending");
+    }
+
+    /// **V4 (AC4)** — une ligne d'audit sous le nouveau nom, et **zéro** sous
+    /// `deferred_dispatch_force_promote_succeeded`.
+    ///
+    /// Les deux directions comptent. La première fait du refus une grandeur
+    /// comptable (sonde S1) ; la seconde est ce qui interdit à un refus de
+    /// laisser derrière lui la trace d'une réussite — c'est-à-dire de rendre la
+    /// sonde du § 11 inutilisable en mélangeant les deux populations sous le
+    /// même `GROUP BY`.
+    #[tokio::test]
+    async fn mika2654_le_refus_ecrit_sa_ligne_daudit() {
+        let harness = TestHarness::new();
+        let agent_id = &harness.db.agent_id;
+        harness
+            .db
+            .create_task(deferred_callback_task(agent_id, "groom"))
+            .await
+            .unwrap();
+
+        let ctx = webhook_pr_ctx(&harness);
+        let session_id = ctx.session_id.to_string();
+        let result = PromoteDeferredCallbackTool
+            .execute(serde_json::json!({"dispatch_class": "groom"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+
+        let rows = harness.db.get_audit_events(&session_id).await.unwrap();
+
+        let guard: Vec<_> = rows
+            .iter()
+            .filter(|r| r.tool_name == FORCE_PROMOTE_TURN_GUARD_AUDIT_TOOL)
+            .collect();
+        assert_eq!(
+            guard.len(),
+            1,
+            "exactement une ligne de garde attendue, obtenu {} — la sonde S1 \
+             compte des refus, donc un doublon la fausse autant qu'une absence",
+            guard.len()
+        );
+        assert_eq!(guard[0].target_key, "dispatch_class:groom");
+        assert_eq!(
+            guard[0].after_value.as_deref(),
+            Some(AUDIT_REFUSED_WEBHOOK_PR_TURN)
+        );
+        // `before_value` est NULL : il n'y a pas d'état antérieur à nommer —
+        // rien n'a changé, c'est tout le propos du refus.
+        assert_eq!(guard[0].before_value, None);
+
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.tool_name == "deferred_dispatch_force_promote_succeeded"),
+            "INVARIANT VIOLÉ : un refus a laissé une trace de réussite — les deux \
+             populations se mélangeraient sous le même GROUP BY"
+        );
+    }
+
+    /// **V5 (AC5)** — le refus ne donne aucun gabarit de contournement.
+    ///
+    /// *Un refus qui donne le gabarit est une fuite avec une étape de plus*
+    /// (doctrine mika#2520 / mika#2292). `MIKA_DEV_IDENTITY` porte `shell-exec`,
+    /// donc nommer le geste CLI ou son drapeau de forçage reviendrait à le
+    /// prescrire. La contrepartie est obligatoire : le corps doit nommer la
+    /// sortie **correcte**, sans quoi ce test serait satisfait par un refus muet.
+    #[tokio::test]
+    async fn mika2654_le_refus_ne_nomme_aucun_contournement() {
+        let body = refusal_body(ForcePromoteTurnDecision::RefusedWebhookPrTurn, "implement");
+        let lower = body.to_lowercase();
+
+        for forbidden in [
+            "promote-deferred",
+            "--override",
+            "run_shell",
+            "update_task_status",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "le corps du refus nomme « {forbidden} » — c'est le gabarit du \
+                 contournement, pas un refus : {body}"
+            );
+        }
+
+        assert!(
+            lower.contains("operator"),
+            "le refus doit nommer à qui la levée appartient : {body}"
+        );
+        assert!(
+            lower.contains("next scan"),
+            "le refus doit dire que le moteur promeut de lui-même, sans quoi il se \
+             lit comme une perte définitive et invite au contournement : {body}"
+        );
     }
 
     /// **V6** — la table de vérité du classifieur, complète : deux entrées,
