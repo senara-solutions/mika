@@ -526,9 +526,12 @@ en rougissant.
   second cas de la même famille, mesuré le même jour (71 tours jetés sur `8a3b2082`).
   Son remède n'est pas un terme de cible mais un terme de **vivacité**, et son rayon
   de souffle est distinct : un faux refus d'annulation retire à l'opérateur son geste
-  de reprise le plus court. **Suivi mika#2653.** Même famille, population non
-  mesurée : `promote_deferred_callback` (**suivi mika#2654**), qui choisit quel
-  dispatch prend le créneau.
+  de reprise le plus court. **Suivi mika#2653.** Même famille, troisième cas :
+  `promote_deferred_callback`, qui choisit quel dispatch prend le créneau —
+  population **mesurée depuis** (2026-10-07 : 73 appels / 58 sessions, dont 27
+  sessions de canal `github` pour 33 appels et 10 promotions réussies, toutes dans
+  la lignée de l'événement), et **fermé par mika#2654** par un terme de classe de
+  tour, la forme « borner à la lignée » ayant été écartée sur cette mesure même.
 - **Il ne réduit PAS le résidu per-issue de mika#2155**, et il faut le dire parce que
   le voisinage invite à le croire : ce résidu est *deux dispatch-lib vivants sur le
   **même** ticket*, dont le premier sortant strippe le seat label du second. Un
@@ -765,6 +768,213 @@ ce travail n'achète pas : `CLAUDE.md` racine § *`cancel_task` n'annule pas un
 pilote vif depuis un tour webhook PR*.
 
 **Cancel discriminator protocol (#749):** When `cancel_task_and_kill` terminates a long-running subprocess, it pre-writes a reason file at `/tmp/mika-cancel-reason-{pid}` with `STATUS=CANCELLED_BY_OPERATOR` before sending SIGTERM. The shell-side TERM trap in `dispatch-lib.sh` writes `STATUS=CANCELLED_BY_SIGNAL` only if no reason file exists (belt-and-suspenders for signal-initiated cancels). The EXIT trap reads the reason file and prefixes the callback envelope so the consumer (`self-dev-callback`) can distinguish cancel from crash. Two discriminators: `CANCELLED_BY_OPERATOR` (cancel_task initiated) and `CANCELLED_BY_SIGNAL` (signal-initiated, no pre-write). Absence of the prefix = existing `HANDLER CRASH` / success paths fire unchanged (backward compatible).
+
+### Un tour webhook PR ne force pas la promotion d'un wrapper différé (mika#2654)
+
+`PromoteDeferredCallbackTool::execute` gagne un terme : dans un tour dont
+l'`originating_message` est un `[GitHub] PR …` ou un `[GitHub] Check suite …`,
+forcer la promotion du prochain wrapper différé est **refusé** — avant toute
+lecture et toute écriture en base.
+
+**Troisième et dernier cas nommé par le recensement AC4 de mika#2649**, et le seul
+des trois qu'aucun incident n'a exercé : il est là parce que la lecture du code
+montrait qu'il est servi dans ces tours et qu'il **choisit quel dispatch prend le
+créneau** de sa classe. Les trois axes de la famille sont distincts — mika#2649 un
+terme de **lignée**, mika#2653 un terme de **vivacité**, celui-ci un terme de
+**classe de tour**, sans terme de cible.
+
+#### La mesure, et c'est elle qui a décidé la forme
+
+Le ticket s'est ouvert sur une précondition explicite : *établir que la population
+existe avant d'armer quoi que ce soit*, parce qu'un prédicat sur une population
+vide produit un détecteur dont le silence ne prouve rien (classe mika#2205). Deux
+mesures d'opérateur en lecture seule sur `~/.mika/data/mika.db`, le 2026-10-07,
+fenêtre 2026-09-07 → 2026-10-07, l'ont levée : **73 appels** à
+`promote_deferred_callback` sur **58 sessions**, dont **27 sessions (31 appels)**
+de canal `github` ; sur ces tours, 33 appels et **10 réussis** (16 « No pending
+deferred wrapper », 7 `slot_busy`).
+
+La seconde moitié de cette mesure est ce qui a **écarté** la forme que le ticket
+proposait en premier. Les 10 promotions réussies sont **toutes** le fait de
+mika-qa et promeuvent **toutes** un wrapper dont le parent est la vérification de
+build **de la PR de l'événement** — #2250 (cinq promotions en 31 s sur le même
+parent), #2273, #2393, #2406, #2416, #2661. **Zéro promotion hors lignée
+mesurée.** Borner à la lignée comme mika#2649 aurait donc autorisé 10 sur 10 : sa
+population de refus serait **vide**, et ce détecteur inerte aurait été payé au
+prix de la charge utile que mika#2517 puis mika#2573 ont refusée deux fois.
+
+**Limite de la mesure, dite plutôt que découverte.** Le texte d'origine de ces
+tours n'est pas persisté dans `messages` pour le canal `github` : la classe de
+l'événement s'y lit au **premier outil** du tour (`qa_pr_view` / `pr list` sur une
+PR précise, pour au moins 7 des 27), pas au message. La garde teste le **préfixe
+du message**, le compte testait le **canal** — `channel_type = 'github'` est donc
+un **sur-ensemble** de la population que la garde reconnaît. Cet écart est ce que
+la sonde S2 mesure après déploiement, et il est la raison de la halte 1.
+
+#### Six rectifications que la lecture du code impose au corps du ticket
+
+**R1 — l'outil n'est pas un échappatoire « quand le créneau est pris »**, et le
+corps du ticket décrivait la fonction inverse de celle que le code remplit.
+`Database::force_promote_deferred_for_class` (`db/tasks.rs`) **refuse** quand la
+classe est au plafond (`ForcePromoteResult::RejectedSlotBusy`). Quand elle ne
+l'est pas, il fait ce que le backstop périodique `promote_pending_deferred_if_idle`
+(`task_engine/engine.rs`) fait de lui-même au scan suivant :
+`DB_SCAN_INTERVAL_TICKS = 60`, soit **≤ 60 s**.
+
+**R2 — ce que l'outil ajoute au backstop, et c'est le vrai dommage.** Le backstop
+consulte la priorité opérateur (`has_pending_operator_task_for_class`, mika#1948
+AC3) et **cède la place** quand l'opérateur a du travail `pending` dans la classe.
+`force_promote_deferred_for_class` **ne la consulte pas**. Depuis un tour webhook,
+l'outil n'achète donc que deux choses : une avance ≤ 60 s et le contournement de
+cette priorité — plus le churn mesuré sur #2250.
+
+**R3 — la raison qui faisait préférer la retenue à mika#2517 ne tient plus.**
+mika#2517 retenait `create_task` parce que refuser à la frontière d'outil demandait
+un champ que `ToolContext` n'avait pas. Depuis mika#2653,
+`ToolContext.is_webhook_pr_event_turn` existe, calculé au **seul** site de
+conversation par **appel** de `webhook_dispatch::is_webhook_pr_event_domain`. La
+forme retenue ne coûte donc **aucune** plomberie : le booléen est déjà là, déjà lu
+par une garde sœur, et cette PR en ajoute un **lecteur**, pas un champ.
+
+**R4 — l'outil ne prend pas de cible.** Son unique paramètre est `dispatch_class`
+(`enum: ["implement","groom"]`) et il promeut « le prochain wrapper » de la classe.
+Borner à la lignée voudrait dire résoudre *quel* wrapper serait promu, le
+confronter à la cible de l'événement par la traversée de mika#2649, et changer
+l'API de la promotion. Ce n'est pas un terme ajouté : c'est un **second sélecteur
+de wrapper**.
+
+**R5 — aucun prompt ne prescrit l'outil**, et c'est la condition qui rend le refus
+non bouclant. Dans le dépôt il n'apparaît que dans le code, la documentation et
+des plans : aucun `system_prompt.md`, aucun `skill.toml`, aucun handler ne le cite,
+et aucune garde `required_tools` ne le réclame. Les appels mesurés sont
+**spontanés**, émis après un `{"status":"deferred"}` rendu par l'exécuteur.
+
+**R6 — refus et non retenue, alors que la retenue serait ici tenable.** mika#2653
+a écarté `FALLTHROUGH_WITHHELD_TOOLS` parce que le prompt prescrit l'annulation
+d'un dispatch réellement perdu ; ici rien ne prescrit rien (R5), donc l'argument ne
+s'applique pas. Ce qui tranche est que **le refus EST la mesure** : chaque
+tentative devient une ligne `tool_calls.output` et une ligne d'audit, là où retenir
+l'outil du tableau ferait disparaître la population et obligerait à inventer une
+ligne par tour webhook PR pour la garder observable. Ce ticket est né d'une
+exigence de mesure ; il ne pouvait pas se refermer sur une forme muette.
+
+#### Conception
+
+`webhook_dispatch::is_webhook_pr_event_domain` (pur, inchangé) →
+`ToolContext.is_webhook_pr_event_turn` (le champ de mika#2653, **inchangé**) →
+`tools::promote_deferred_callback::classify_force_promote_turn` (le prédicat pur)
+→ la garde dans `execute`.
+
+**Le terme de classe de tour est un PARAMÈTRE du prédicat pur**, jamais une branche
+de l'appelant — forme mika#2649 reprise par mika#2653 : « hors tour webhook PR,
+rien ne change » devient une propriété **testée de la fonction**
+(`mika2654_hors_tour_webhook_pr_la_promotion_passe`,
+`mika2654_la_table_de_verite_du_classifieur`) plutôt qu'un `if` à relire. La
+conséquence est assumée et nommée dans le doc-comment : l'appelant branche de toute
+façon sur le drapeau, donc en production la branche `Allowed` du prédicat n'est pas
+atteignable.
+
+**Deux issues et pas trois, contrairement à la sœur.**
+`ForcePromoteTurnDecision { Allowed, RefusedWebhookPrTurn }` n'a **pas** de
+`AllowedInPopulation`. `CancelPilotDecision` en a un parce qu'elle porte un second
+terme — la vivacité d'un pilote — donc « la garde a tourné et a laissé passer » y
+est un état distinct qui doit être compté. Ici le seul terme **est** la classe de
+tour : dans la population, la garde refuse toujours, et un `AllowedInPopulation`
+serait une valeur d'audit que rien n'écrit — une colonne de zéros qui se lit comme
+une population saine. Le contrôle positif de cette garde vit donc **hors du type**,
+dans l'eval AC9 (un tour `[GitHub] Issue …` qui passe).
+
+**Placement :** **après** la validation de `dispatch_class` — une entrée malformée
+lit la même erreur qu'ailleurs, le refus ne la masque pas — et **avant**
+`force_promote_deferred_for_class`, donc avant toute lecture et toute écriture en
+base. C'est l'ordre qu'AC2 exige : un tour PR dont la classe est au plafond est
+refusé sous le motif **webhook**, jamais sous `slot_busy`, parce que le second
+lirait comme un problème de créneau et orienterait vers le forçage. **Dans l'outil,
+jamais dans `force_promote_deferred_for_class`** : c'est ce qui préserve par
+construction le CLI `mika tasks promote-deferred` et le backstop périodique, qui
+partagent cette fonction et ne traversent aucun `ToolContext`.
+
+`report_force_promote_turn_decision` est appelée **inconditionnellement** et rend
+`()` : c'est la fonction elle-même qui sort sans rien écrire hors de la population
+(doctrine mika#2131, et c'est ce qui rend la non-régression d'AC3 *observable* —
+zéro ligne d'audit sur un tour d'opérateur), et sa signature est ce qui garantit
+qu'un échec d'audit ne peut pas remonter jusqu'au verdict (motif
+`report_cancel_pilot_decision`). Un `if` au site d'appel répéterait le prédicat et
+ouvrirait un second endroit où la borne peut diverger de celle du refus.
+
+**Le corps du refus nomme la levée sans donner de gabarit** (doctrine mika#2520 /
+mika#2292) : le fait (ce tour a été ouvert par un événement PR / check-suite), ce
+que forcer achèterait réellement (une avance d'un scan, le contournement de la
+priorité opérateur), le fait que **le moteur promeut le wrapper de lui-même** au
+prochain scan, et la sortie correcte (terminer le tour sur ce que l'événement
+demande). Il **ne nomme aucune commande** — ni le geste CLI de promotion, ni son
+drapeau de forçage, ni `run_shell`, ni `update_task_status` : `MIKA_DEV_IDENTITY`
+porte `shell-exec`, donc écrire la commande ici donnerait le gabarit du
+contournement. Liste interdite épinglée par
+`mika2654_le_refus_ne_nomme_aucun_contournement`.
+
+#### Ce que les tests attestent, et ce qu'ils ne peuvent pas
+
+Les unités posent `ctx.is_webhook_pr_event_turn` **à la main**, donc elles restent
+**vertes** si le champ n'est jamais calculé ou jamais lu — et c'est exactement le
+mode de panne de cette famille, puisque le booléen est posé à **un** site de
+production et `false` à tous les autres. Seul
+`tests/eval/test_promote_deferred_webhook_pr_2654.rs` ferme ça. **Vérifié par
+mutation à la livraison** : en posant `is_webhook_pr_event_turn: false` au site de
+conversation, les deux cas de refus de l'eval rougissent (chacun rendant *« Deferred
+wrapper promoted »*) et les dix unités restent vertes — la forme attendue, et ce qui
+dit que le câblage n'est pas vide.
+
+Les **deux** cas de refus sont porteurs parce que `is_webhook_pr_event_domain` est
+une **disjonction** : un correctif qui ne câblerait qu'un des deux préfixes
+laisserait l'autre ouvert avec le premier cas vert. Et le cas `[GitHub] Issue …`
+épingle que le domaine Webhook Fallthrough reste hors périmètre **par décision** —
+`FALLTHROUGH_WITHHELD_TOOLS` ne retient que `create_task`, donc l'outil y est
+réellement servi et le test le montre en train de promouvoir.
+
+Le scan SOLE WRITER du nom d'audit
+(`canonical_tokens::tests::mika2654_le_nom_daudit_a_un_seul_ecrivain`, allowlist
+`FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS` livrée **vide** et épinglée vide)
+compare le littéral **entier** et **exactement**, jamais en sous-chaîne : les trois
+noms frères de mika#1453 partagent le préfixe `deferred_dispatch_force_promote`,
+donc un scan sur ce préfixe serait rouge à la naissance — et un lint rouge à la
+naissance se fait désarmer. Son contrôle de bonne foi
+(`mika2654_le_scan_du_nom_daudit_voit_un_second_site`) est dû pour la raison que
+mika#2649, mika#2634 puis mika#2653 ont dû écrire chacun sur son scan jumeau :
+resserrer une garde sans montrer qu'elle mord encore est la façon dont une garde
+devient inerte en silence. **Aucun test comportemental ne peut voir cette classe** :
+un second écrivain ne rendrait aucune décision fausse, seul le **compte** de la
+sonde S1 deviendrait inexact.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne retire rien à l'opérateur.** `mika tasks promote-deferred <class>` ne
+  traverse aucun `ToolContext`, donc aucun prédicat de ce niveau ne peut
+  l'atteindre ; et un `mika ask` d'opérateur reste hors population, son message
+  étant son propre texte, qui ne commence pas par le préfixe.
+- **Il ne ferme pas les tours Webhook Fallthrough**, et c'est une décision :
+  population mesurée **1** tentative, échouée, en 30 j. Armer une garde sur une
+  population quasi vide ne prouverait rien (mika#2205). Suivi à ouvrir seulement
+  si une mesure montre une tentative **réussie** ; AC9 épingle la frontière par un
+  cas qui **passe**.
+- **Il ne corrige pas l'absence de la priorité opérateur dans
+  `force_promote_deferred_for_class`** (R2). Elle touche aussi le CLI, où ce
+  contournement est un geste d'opérateur **légitime** : décision distincte, et elle
+  appartient au CLI autant qu'au moteur.
+- **Il ne touche pas le backstop.** `promote_pending_deferred_if_idle` est inchangé,
+  octet pour octet — c'est lui qui promeut le wrapper refusé, et sous **deux**
+  contrôles au lieu de zéro.
+- **Un tour webhook servi en mode silencieux échapperait à la garde** — borne
+  héritée de mika#2517 / mika#2573, ni élargie ni modifiée, population mesurée vide
+  (un tour silencieux a `originating_message = None`).
+- **Il ne rend pas l'exclusivité des deux axes structurelle.** Le suivi nommé par
+  mika#2653 — réunir les deux booléens en un `webhook_turn: WebhookTurnClass`
+  (`None | Fallthrough | PrEvent`) — gagne ici un second lecteur à migrer, et reste
+  un suivi.
+
+Surfaces opérateur, régimes attendus, sondes S1–S3 et leurs haltes :
+[`docs/operator/environment-variables.md`](../operator/environment-variables.md)
+§ *`promote_deferred_callback` est refusé sur un tour webhook PR*.
 
 ### Platform-root relay, and the name it translates (mika#2536)
 

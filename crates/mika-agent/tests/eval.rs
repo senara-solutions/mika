@@ -273,6 +273,18 @@ mod eval {
     // `live_pilot` pour ses deux appelants.
     mod test_cancel_task_live_pilot_2653;
 
+    // mika#2654 — troisième de la famille, ajouté par le recensement AC4 de
+    // mika#2649 : un tour ouvert par un événement PR / check-suite ne force pas
+    // la promotion d'un wrapper différé, donc ne choisit pas quel dispatch prend
+    // le créneau de sa classe. Les unitaires posent
+    // `ctx.is_webhook_pr_event_turn` à la main, donc ce fichier est le SEUL à
+    // attester le câblage au site de conversation — c'est la mutation M4 du plan.
+    // Les deux contrôles sont porteurs : le tour de conversation sépare « la
+    // garde décide » de « la garde bloque la promotion forcée » (~42 appels
+    // mesurés hors canal github), et le tour `[GitHub] Issue …` épingle que le
+    // domaine Webhook Fallthrough reste hors périmètre PAR DÉCISION.
+    mod test_promote_deferred_webhook_pr_2654;
+
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 
