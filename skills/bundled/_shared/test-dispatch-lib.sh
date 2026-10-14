@@ -7652,7 +7652,14 @@ _mika2542_unargumented_calls() {
 # le résolveur sur son propre site, en lui passant `"${LABELS:-}"` comme les
 # trois autres — un site qui l'oublierait résoudrait « aucun label », donc le
 # défaut, donc fail-safe vers 150 et jamais vers 200.
-assert_eq "mika#2542 (AC10): le scan voit exactement quatre appels du résolveur" "4" \
+# Puis de 4 à 5 le 2026-10-14 (mika#2693) : l'injection de la règle de taille
+# dans le prompt du groomeur a besoin du plafond pour en dériver la borne par
+# vol, et `_pilot_max_turns` reste le LECTEUR UNIQUE de la table des labels
+# (AC5) — le cinquième site est donc un appel du résolveur, jamais une seconde
+# lecture de `PILOT_LABEL_TURN_CEILINGS`. C'est précisément ce que ce
+# recensement existe pour rendre visible : il n'empêche pas d'ajouter un site,
+# il empêche d'en ajouter un en silence.
+assert_eq "mika#2542 (AC10): le scan voit exactement cinq appels du résolveur" "5" \
     "$(_mika2542_resolver_calls "$DISPATCH_LIB" | wc -l | tr -d ' ')"
 assert_eq "mika#2542 (AC10): chaque appel du résolveur passe \"\${LABELS:-}\"" "" \
     "$(_mika2542_unargumented_calls "$DISPATCH_LIB" | cut -c1-100)"

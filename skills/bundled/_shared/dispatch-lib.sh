@@ -3541,6 +3541,15 @@ _PLAN_SIZE_TOTAL_RE='^Total estimé[[:space:]]*:[[:space:]]*([0-9]+)([[:space:]]
 # cette extraction (les deux prompts architecte restent hors d'atteinte, un
 # `.md` statique ne pouvant pas lire une constante shell : c'est la duplication
 # assumée que S14 tient par le seul nombre qui décide).
+#
+# mika#2693 — les deux lignes de déclaration (`Plafond de tours :`, `Borne par
+# vol :`) vivent ici EN FORME, à chevrons, et jamais en valeur. Ce bloc est
+# interpolé à DEUX sites (S13-bis) : la règle du groomeur, qui connaît le
+# plafond du ticket, et le finding synthétique du rattrapage, qui ne le connaît
+# pas. Y figer `200` ou `431` ferait donc prescrire au second un plafond qu'il
+# n'a aucun moyen de vérifier — et un nombre faux dans une prescription de
+# format est pire qu'un chevron. Les valeurs arrivent par les placeholders du
+# gabarit de la règle, un cran plus bas.
 _PLAN_SIZE_FORMAT_SPEC="## Taille estimée
 
 | livrable | lignes de code (hors \`docs/\`) |
@@ -3549,9 +3558,14 @@ _PLAN_SIZE_FORMAT_SPEC="## Taille estimée
 | tests (\`tests/eval/test_foo.rs\`) | 95 |
 
 Total estimé : 215 lignes
+Plafond de tours : <le plafond donné par la règle ci-dessous> (<le label qui le porte, ou « défaut »>)
+Borne par vol : <la borne donnée par la règle ci-dessous> lignes estimées — (<plafond> − 35 − 50) × 7,5 / 2
 
 Compte les LIGNES DE CODE, hors \`docs/\` et hors \`CLAUDE.md\`. La ligne \`Total estimé :\`
-est lue par la machine : écris-la telle quelle, sans séparateur de milliers."
+est lue par la machine : écris-la telle quelle, sans séparateur de milliers.
+Les deux dernières lignes sont le seul canal par lequel l'architecte apprend le plafond
+du ticket : il ne reçoit que le fichier de plan, jamais les labels. Un plan qui ne les
+déclare pas est jugé sur un plafond de 150 tours, le plus serré."
 
 _PLAN_SIZE_RULE_TEMPLATE="RÈGLE DE GROOMING (mika#2636) — tout plan porte une section \`## Taille estimée\`.
 Deux implements consécutifs sont morts au plafond de tours sur le seul critère du VOLUME de
@@ -3565,13 +3579,83 @@ ${_PLAN_SIZE_FORMAT_SPEC}
 Au-dessus de __PLAN_SIZE_MAX_LOC__ lignes, DÉCOUPE EN PHASES : borne le périmètre de cette PR
 sous le seuil et renvoie explicitement la suite à un ticket de suivi ou à une phase nommée.
 Un total au-dessus du seuil sans découpage explicite fait rendre ITERATE à mika-arch en
-première passe et ESCALATE en seconde — et la seconde passe est sans recours."
+première passe et ESCALATE en seconde — et la seconde passe est sans recours.
 
-# Substitue le seuil en vigueur dans le gabarit. ASSIGNE `_PLAN_SIZE_RULE` (même
-# contrainte mika#2039 que les autres accesseurs de ce fichier), et la lecture de
-# `$_PLAN_SIZE_MAX_LOC` est co-localisée avec son résolveur.
+SECONDE BORNE (mika#2693) — CELLE-CI EST PAR VOL, ET ELLE EST EN TOURS.
+Le seuil ci-dessus est par PR et le même pour tous les tickets. Celui-ci est par VOL, dérivé
+du plafond de tours de CE ticket. Les deux s'appliquent, et LA PLUS SERRÉE MORD.
+
+1. Le plafond de CE ticket est de __PLAN_SIZE_CEILING__ tours, et sa borne par vol vaut
+   __PLAN_SIZE_FLIGHT_BOUND__ lignes estimées hors \`docs/\` : __PLAN_SIZE_FLIGHT_DERIVATION__.
+   Sa provenance se lit sur le nombre : 200 tours vient du label \`loop-substrate\`, 150 est le
+   défaut de flotte. C'est ce que tu écris entre parenthèses sur la ligne \`Plafond de tours :\`.
+2. La dérivation est ce qui rend la borne recalibrable, donc ÉCRIS-LA dans la section, telle
+   qu'elle est donnée ci-dessus. Un nombre nu ne survit pas à la prochaine mesure de débit.
+3. Au-dessus de la borne, DÉCOUPE EN VOLS — pas en phases d'un même vol. Chaque vol est
+   mergeable seul, porte son ordre de commit et son plancher, et le vol courant doit repasser
+   SOUS la borne. La suite est nommée par une ligne \`Tracked in:\`.
+4. En deçà, un seul vol, et le plan DIT POURQUOI il tient.
+5. Un total au-dessus de la borne par vol sans découpage en vols, ou dont la suite n'est pas
+   nommée par \`Tracked in:\`, fait rendre ITERATE à mika-arch en première passe et ESCALATE en
+   seconde. L'architecte juge le périmètre du VOL COURANT, jamais la somme des vols.
+
+Pourquoi des TOURS : le 2026-10-14, trois vols sont morts au plafond en PASSANT le seuil par PR
+(mika#2683 832 estimées pour 1 432 réelles, mika#2654 880/1 160, mika#2687 vol 1 443/994). Le
+travail tenait — dernier commit de travail aux tours 171, 177 et 136 — mais pas la fin de
+pipeline, qui coûte des tours et non des lignes.
+
+La borne, ses quatre paramètres et leur dérivation ont UN SEUL site de vérité :
+\`_plan_size_per_flight_bound\` dans \`skills/bundled/_shared/dispatch-lib.sh\`. Leur
+justification et la méthode pour les recalibrer vivent dans \`docs/solutions/dev-loop/\`
+\`une-estimation-de-taille-se-compare-a-un-seuil-dans-sa-propre-unite.md\`. Ne les recalcule pas
+toi-même : les deux nombres ci-dessus sont ceux de CE ticket, déjà résolus pour toi."
+
+# Substitue les deux seuils en vigueur dans le gabarit. ASSIGNE `_PLAN_SIZE_RULE`
+# (même contrainte mika#2039 que les autres accesseurs de ce fichier), et chaque
+# lecture est co-localisée avec son résolveur.
+#
+# `$1` = le plafond de tours du ticket, tel que `_pilot_max_turns` vient de le
+# résoudre. APPELÉ SANS ARGUMENT, il retombe sur le repli fail-safe de
+# `_plan_size_per_flight_bound` — 150 tours, donc la borne la plus serrée. C'est
+# la direction prudente, et c'est délibérément une signature qu'un site existant
+# peut continuer d'appeler sans rien changer : un oubli d'argument rend un plan
+# plus petit, jamais une mort par volume.
+#
+# LES QUATRE GLOBALES DU RÉSOLVEUR SONT CAPTURÉES SUR SA PROPRE INVOCATION
+# LOGIQUE, pas relues plus bas. La garde de co-location de mika#2496 porte sur
+# toute la famille `_PLAN_SIZE_PER_FLIGHT_*`, et une exception pour trois d'entre
+# elles serait la moitié manquante de la garde : un plafond ou une provenance lus
+# 500 lignes après leur résolution se lisent périmés exactement aussi facilement
+# qu'une borne.
+#
+# La dérivation est RECONSTRUITE DEPUIS LES CONSTANTES, jamais retapée : qui
+# recalibre un paramètre déplace du même geste la phrase que lit le groomeur. Les
+# deux mises à l'échelle sont ramenées à l'unité humaine pour l'affichage (750
+# pour 100 tours s'écrit 7,5 ; un facteur de 200 % s'écrit 2), parce que la
+# phrase doit se relire comme la formule du ticket — et UN DIXIÈME NUL NE
+# S'ÉCRIT PAS : la première rédaction rendait « / 2,0 » là où le format prescrit
+# « / 2 », c'est-à-dire que la forme donnée au groomeur divergeait de la forme
+# qu'on lui demande d'écrire, dès la première ligne.
 _plan_size_rule() {
+    local _ceiling="${1:-}" _bound _ceil _derivation _rate _factor _tenth
+
+    _plan_size_per_flight_bound "$_ceiling"; _bound="$_PLAN_SIZE_PER_FLIGHT_BOUND"; _ceil="$_PLAN_SIZE_PER_FLIGHT_CEILING"
+
+    # Rien n'imprime ici — ni `printf` dans un `$( )`, ni helper imprimant : la
+    # doctrine mika#2039 de ce bloc est « on assigne », et une fonction de mise
+    # en forme lue par substitution serait l'exception qui l'use.
+    _rate=$(( _PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS / 100 ))
+    _tenth=$(( _PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS % 100 / 10 ))
+    if [ "$_tenth" -ne 0 ]; then _rate="${_rate},${_tenth}"; fi
+    _factor=$(( _PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT / 100 ))
+    _tenth=$(( _PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT % 100 / 10 ))
+    if [ "$_tenth" -ne 0 ]; then _factor="${_factor},${_tenth}"; fi
+    _derivation="(${_ceil} − ${_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS} − ${_PLAN_SIZE_FLIGHT_TAIL_TURNS}) × ${_rate} / ${_factor}"
+
     _plan_size_max_loc; _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE_TEMPLATE//__PLAN_SIZE_MAX_LOC__/$_PLAN_SIZE_MAX_LOC}"
+    _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE//__PLAN_SIZE_CEILING__/$_ceil}"
+    _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE//__PLAN_SIZE_FLIGHT_BOUND__/$_bound}"
+    _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE//__PLAN_SIZE_FLIGHT_DERIVATION__/$_derivation}"
 }
 
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
@@ -4262,9 +4346,16 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # règle la plus récente que lit un groomeur, et le commentaire de
         # `_PILOT_SCRATCH_RULE` dit que la récence est le seul levier d'une règle
         # en fin d'un prompt de 16 KiB. S13 tient l'ordre.
+        #
+        # mika#2693 — le groomeur reçoit la borne DÉJÀ CALCULÉE pour le plafond
+        # de SON ticket, pas la formule. Les labels sont ici, le groomeur ne les
+        # a pas, et `_pilot_max_turns` est le lecteur unique de leur table
+        # (mika#2542 AC5) : la résolution se fait donc à CE site, sur la même
+        # invocation logique que sa lecture, et le résultat part en texte.
         if [ "$SKILL" = "dev-groom" ]; then
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
-            _plan_size_rule; PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PLAN_SIZE_RULE")
+            _pilot_max_turns "${LABELS:-}"; _plan_size_rule "$_PILOT_MAX_TURNS"
+            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PLAN_SIZE_RULE")
         fi
 
         # Save pre-run HEAD SHA for post-flight diff check
