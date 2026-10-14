@@ -228,6 +228,10 @@ This repo is part of the [mika-platform](../CLAUDE.md) workspace. For cross-repo
 
 **Auto-groom on dispatch (mika#996):** The autonomous loop now auto-grooms ungroomed `ready`-labelled or milestone-child tickets before dispatching them to `dev-pilot`. When a ticket reaches dispatch (via `ready` label webhook or milestone-cascade M4) without a `Plan: docs/plans/` callout in its issue body, mika-dev dispatches `dev-groom` first (two-pass architect review via `mika-arch-groom-ticket`). On `Verdict: GROOMED`, the handler re-enters the dispatch flow and fires `dev-pilot`. On `Verdict: ESCALATE`, dispatch halts and surfaces to operator. Grooming and dispatch run serially as two phases of the same child task. Orchestrator-manual `/mika-groom-ticket` remains available for free-text dispatch and human-driven grooming.
 
+**Pilot flights end lean (mika#2694).** In a session started by the loop with `/ce-work <plan>`, the shipping workflow skips two steps, because mika-qa reviews every PR at code level and the turn ceiling cannot hold them:
+- **Simplification threshold: none.** Do not invoke `ce-simplify-code`.
+- **Code review: delegated to mika-qa.** Do not invoke `ce-code-review`; write `Code review: delegated to mika-qa (mika#2694)` in the PR body. Still run the full test suite, clippy, the repo lints and `scripts/verify-pipeline.sh origin/main`, then commit, push and open the PR. Interactive `/mika` keeps its review step.
+
 Cross-repo documentation:
 - `../docs/solutions/cross-repo-patterns/` — Security hardening playbook, reference architecture patterns
 
