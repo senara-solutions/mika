@@ -87,8 +87,66 @@
 //! compte (jeton GitHub absent, forge illisible, correctif déjà en vol,
 //! escalade) n'écrivent aucune ligne terminale : c'est l'absence de trace qui
 //! leur garde leur tour.
+//!
+//! # Le registre des tours webhook (mika#2680, vol 1)
+//!
+//! Tout ce qui précède décrit ce que la porte ÉCARTE. Cette section décrit ce
+//! qu'elle LAISSE PASSER, et c'est un autre instrument. Le critère
+//! d'acceptation de la mesure de mika#2680 — « refaire la mesure sur une
+//! fenêtre comparable » — est resté ouvert deux fois (2026-10-07, 2026-10-08)
+//! parce qu'il a fallu, chaque fois, rejoindre à la main `llm_calls` au
+//! PREMIER message `user` de chaque session pour deviner l'événement
+//! déclencheur. Une ligne nomme désormais ce que cette reconstruction
+//! cherchait. Elle n'ajoute aucune classe de filtre : elle rend la mesure
+//! prenable.
+//!
+//! [`WEBHOOK_TURN_CHARGED_EVENT`] est émise au seul endroit qui connaisse les
+//! deux faits à la fois — le texte d'ORIGINE du webhook, et que le tour a
+//! lieu. Quatre champs, un par question que la mesure a dû poser :
+//!
+//! - `trigger` — le terme de [`TriggerClass`], calculé sur le texte d'origine.
+//!   Calculé sur `req.text`, il classerait `other` la classe (f) du ticket (un
+//!   `pr_review` réécrit par le `verdict_handler`), c'est-à-dire précisément la
+//!   population à chiffrer : c'est la mutation rouge d'AC2 ;
+//! - `text_touched` — [`Touched::by_any_handler`], qui sépare « intact » de
+//!   « réécrit ». Sans lui, (f) est indiscernable d'un `pr_review` ordinaire ;
+//! - `candidate` — le variant de [`Candidate`] quand [`classify`] en rend un,
+//!   **absent** sinon. Absent dit « l'événement n'est pas dans la population du
+//!   pré-filtre », ce qui n'est pas la même affirmation que « il y est et a
+//!   gardé son tour ». Jamais `0`, jamais `"none"` (motif mika#2331) ;
+//! - `prefilter_enabled` — l'état de l'interrupteur, parce qu'une fenêtre où il
+//!   est désarmé est exactement une fenêtre qu'on veut pouvoir mesurer.
+//!
+//! **Classer, pas décider.** [`trigger_class`] est pure : aucune lecture
+//! d'état, aucun appel GitHub, aucune ligne de DB — testable sans bouchon. Elle
+//! n'écrit pas non plus un seul littéral de grammaire : elle lit les constantes
+//! de `mika_common::github_event_format`, source de vérité unique dont le test
+//! cross-crate de `mika-gateway::github::tests` refuse la dérive.
+//!
+//! **Aucune ligne d'audit.** `audit_events` reste réservé aux DÉCISIONS du
+//! moteur, et [`PREFILTER_SKIPPED_TOOL`] y garde son monopole. Un tour qui a
+//! lieu n'est pas une décision, c'est un fait de coût : il va dans `tracing`,
+//! sur `target: "mika::otel"`, et **dégaté** de `MIKA_STORE_LLM_CALLS` comme
+//! `turn_usage` — une fenêtre où la télémétrie a été coupée pour réduire le
+//! bruit est précisément celle qu'on ne veut pas perdre.
+//!
+//! **Contrôle positif (mika#2205, mika#2340).** Pour un `trace_id` de canal
+//! `github`, un `turn_usage` présent SANS `webhook_turn_charged` se lit
+//! « binaire en service antérieur au champ », jamais « aucun tour webhook ». La
+//! chaîne est rebuild → deploy : tant que le binaire servi n'embarque pas ce
+//! vol, le registre est vide et ce vide ne mesure rien.
+//!
+//! **Périmètre : les tours webhook.** L'émission n'a lieu que là où
+//! `original_github_text` est `Some`, c'est-à-dire `req.channel == "github"`.
+//! Telegram et les tours silencieux restent hors registre.
 
 use tracing::{info, warn};
+
+use mika_common::github_event_format::{
+    BRANCH_MARKER, CHECK_SUITE_EVENT_PREFIX, ISSUE_CLOSED_EVENT_PREFIX, ISSUE_COMMENT_EVENT_PREFIX,
+    ISSUE_EVENT_PREFIX, ISSUE_LABELED_EVENT_PREFIX, PR_CLOSED_EVENT_PREFIX, PR_EVENT_PREFIX,
+    PR_OPENED_EVENT_PREFIX, PR_REVIEW_EVENT_PREFIX, PUSH_EVENT_PREFIX,
+};
 
 use crate::async_db::AsyncDatabase;
 
@@ -110,6 +168,13 @@ pub(crate) const PREFILTER_ENV: &str = "MIKA_WEBHOOK_PREFILTER";
 /// `audit_events.tool_name` d'un événement écarté. **SOLE WRITER** :
 /// [`skip_turn`].
 pub(crate) const PREFILTER_SKIPPED_TOOL: &str = "webhook_prefilter_skipped";
+
+/// Nom d'événement `tracing` d'un tour webhook qui A LIEU (mika#2680).
+/// **SEUL ÉCRIVAIN** : [`emit_turn_charged`].
+///
+/// Ce n'est délibérément PAS un `tool_name` d'audit, contrairement à son
+/// voisin ci-dessus : un tour qui a lieu n'est pas une décision du moteur.
+pub(crate) const WEBHOOK_TURN_CHARGED_EVENT: &str = "webhook_turn_charged";
 
 /// La branche par défaut des dépôts que la boucle sert.
 pub(crate) const DEFAULT_BRANCH: &str = "main";
@@ -705,6 +770,209 @@ pub(crate) async fn skip_turn(
         );
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Le registre des tours webhook (mika#2680, vol 1)
+// ---------------------------------------------------------------------------
+
+/// Ce que le texte d'ORIGINE d'un webhook déclare être, avant tout handler.
+///
+/// Une taxonomie, pas une décision : aucun bras de ce type n'écarte quoi que
+/// ce soit, et rien dans le moteur ne le lit. C'est la valeur du champ
+/// `trigger` de [`WEBHOOK_TURN_CHARGED_EVENT`], donc un format de fil au même
+/// titre que [`PrefilterClass::as_str`] : un opérateur en fait un `GROUP BY`,
+/// et une orthographe qui change scinde une population sans le dire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerClass {
+    /// `check_suite` sur [`DEFAULT_BRANCH`], **toutes conclusions confondues**.
+    /// La taxonomie nomme l'événement, pas son issue : le vert et le rouge se
+    /// séparent par `candidate`, qui porte déjà cette distinction.
+    CheckSuiteDefaultBranch,
+    /// `check_suite` sur toute autre branche.
+    CheckSuitePrBranch,
+    /// `pull_request_review`, verdict lisible ou non.
+    PrReview,
+    /// `pull_request` action `opened`.
+    PrOpened,
+    /// `pull_request` action `closed`, **mergée ou non** : le gateway rend la
+    /// même forme dans les deux cas et ne dit `Merged: {bool}` qu'en ligne
+    /// suivante. La classe (e) du ticket vit ici.
+    PrClosed,
+    /// Toute autre action de `pull_request` (`synchronize`,
+    /// `review_requested`, `ready_for_review`, …).
+    PrOther,
+    /// `issues` action `labeled`, label lu par la boucle ou non.
+    IssueLabeled,
+    /// `issues` action `closed`. Moitié de la classe (h) du ticket.
+    IssueClosed,
+    /// Toute autre action de `issues`, `opened` comprise — la taxonomie n'a
+    /// pas de terme `issue_opened` et ne prétend pas en avoir un.
+    IssueOther,
+    /// `issue_comment`. L'autre moitié de (h), et 79 % de la fenêtre mesurée
+    /// le 2026-10-08 à elle seule.
+    IssueComment,
+    /// `push`, tel qu'il arrive réellement — par l'attrape-tout du gateway,
+    /// sous la forme `[GitHub] push.unknown on {repo}`.
+    Push,
+    /// Repli : l'attrape-tout de `format_event_text` pour un type d'événement
+    /// qu'il ne met pas en forme. Aucun des six gabarits nommés du gateway ne
+    /// doit y retomber (AC3).
+    Other,
+}
+
+impl TriggerClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CheckSuiteDefaultBranch => "check_suite_default_branch",
+            Self::CheckSuitePrBranch => "check_suite_pr_branch",
+            Self::PrReview => "pr_review",
+            Self::PrOpened => "pr_opened",
+            Self::PrClosed => "pr_closed",
+            Self::PrOther => "pr_other",
+            Self::IssueLabeled => "issue_labeled",
+            Self::IssueClosed => "issue_closed",
+            Self::IssueOther => "issue_other",
+            Self::IssueComment => "issue_comment",
+            Self::Push => "push",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// La branche d'un texte de `check_suite`, lue entre [`BRANCH_MARKER`] et le
+/// `)` qui ferme la première ligne. Même idiome que `ci_success_handler`, à
+/// ceci près que la conclusion n'est pas épinglée.
+fn check_suite_branch(head: &str) -> Option<&str> {
+    let at = head.find(BRANCH_MARKER)?;
+    head[at + BRANCH_MARKER.len()..].strip_suffix(')')
+}
+
+/// Classe le texte d'ORIGINE d'un webhook. Fonction pure : aucune lecture
+/// d'état, aucun appel GitHub, aucun littéral de grammaire.
+///
+/// **L'ordre des bras est porteur.** `PR review ` commence par `PR `, et
+/// `Issue labeled ` commence par `Issue ` : chaque raffinement passe avant son
+/// générique, faute de quoi `pr_review` et `issue_labeled` seraient
+/// inatteignables — en silence, avec toutes les assertions de comportement
+/// encore vertes. Le test cross-crate
+/// `mika2680_chaque_prefixe_declare_est_celui_que_le_gateway_emet` épingle les
+/// deux inclusions côté producteur.
+///
+/// Le terme de repli est [`TriggerClass::Other`] et il n'a pas de liste
+/// d'exclusion : il appartient au bras attrape-tout du gateway.
+pub(crate) fn trigger_class(text: &str) -> TriggerClass {
+    // Chaque gabarit du gateway tient sa forme sur sa PREMIÈRE ligne ; l'URL,
+    // le corps du ticket et la ligne `Labeled by:` suivent et ne décident rien.
+    let head = text.lines().next().unwrap_or(text);
+
+    if head.starts_with(CHECK_SUITE_EVENT_PREFIX) {
+        return match check_suite_branch(head) {
+            Some(branch) if branch == DEFAULT_BRANCH => TriggerClass::CheckSuiteDefaultBranch,
+            Some(_) => TriggerClass::CheckSuitePrBranch,
+            // Un `check_suite` dont la branche est illisible n'est ni l'un ni
+            // l'autre. Le gateway en émet toujours une (`"unknown"` à défaut),
+            // donc ce bras est inatteignable en production — et se taire y
+            // vaut mieux que nommer une branche qu'on n'a pas lue.
+            None => TriggerClass::Other,
+        };
+    }
+    if head.starts_with(PR_REVIEW_EVENT_PREFIX) {
+        return TriggerClass::PrReview;
+    }
+    if head.starts_with(PR_OPENED_EVENT_PREFIX) {
+        return TriggerClass::PrOpened;
+    }
+    if head.starts_with(PR_CLOSED_EVENT_PREFIX) {
+        return TriggerClass::PrClosed;
+    }
+    if head.starts_with(PR_EVENT_PREFIX) {
+        return TriggerClass::PrOther;
+    }
+    if head.starts_with(ISSUE_COMMENT_EVENT_PREFIX) {
+        return TriggerClass::IssueComment;
+    }
+    if head.starts_with(ISSUE_LABELED_EVENT_PREFIX) {
+        return TriggerClass::IssueLabeled;
+    }
+    if head.starts_with(ISSUE_CLOSED_EVENT_PREFIX) {
+        return TriggerClass::IssueClosed;
+    }
+    if head.starts_with(ISSUE_EVENT_PREFIX) {
+        return TriggerClass::IssueOther;
+    }
+    if head.starts_with(PUSH_EVENT_PREFIX) {
+        return TriggerClass::Push;
+    }
+    TriggerClass::Other
+}
+
+impl Candidate {
+    /// Le nom de fil du variant, pour le champ `candidate` du registre. Même
+    /// forme et même contrainte que [`PrefilterClass::as_str`].
+    ///
+    /// Vit avec le registre plutôt que sous la déclaration de [`Candidate`]
+    /// parce que c'est le registre, et lui seul, qui le consomme : aucune
+    /// décision du moteur ne lit ce nom.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::GreenDefaultBranch { .. } => "green_default_branch",
+            Self::GreenPrBranch { .. } => "green_pr_branch",
+            Self::RedDefaultBranch { .. } => "red_default_branch",
+            Self::RedPrBranch { .. } => "red_pr_branch",
+            Self::InertLabel { .. } => "inert_label",
+            Self::ReviewVerdict(_) => "review_verdict",
+        }
+    }
+}
+
+/// Émet [`WEBHOOK_TURN_CHARGED_EVENT`] : CE tour webhook a lieu. **SEUL
+/// ÉCRIVAIN** de cette ligne.
+///
+/// `original_text` est le texte d'AVANT les handlers — la seule forme qui
+/// classe correctement un événement qu'un handler a réécrit. Aucune ligne
+/// d'audit n'est écrite ici, et la ligne n'est gatée par rien : voir la
+/// section « Le registre des tours webhook » en tête de module.
+pub(crate) fn emit_turn_charged(
+    agent_id: &str,
+    original_text: &str,
+    touched: Touched,
+    request_id: &str,
+    enabled: bool,
+) {
+    let trigger = trigger_class(original_text).as_str();
+    let text_touched = touched.by_any_handler;
+
+    // Deux bras pour un seul champ de différence, parce que `candidate` doit
+    // pouvoir MANQUER. Un `?candidate` sur un `Option` écrirait la chaîne
+    // `"None"`, que le lecteur de vol 2 ne saurait pas distinguer d'une classe
+    // nommée ainsi — et « absent » dit autre chose que « aucune » (motif
+    // mika#2331). `tracing` ne sait pas omettre un champ conditionnellement
+    // dans un seul appel ; les deux listes doivent donc rester identiques
+    // champ pour champ.
+    match classify(original_text) {
+        Some(candidate) => info!(
+            target: "mika::otel",
+            event = WEBHOOK_TURN_CHARGED_EVENT,
+            agent_id,
+            request_id,
+            trigger,
+            text_touched,
+            candidate = candidate.as_str(),
+            prefilter_enabled = enabled,
+            "tour webhook facturé — le tour a lieu (mika#2680)"
+        ),
+        None => info!(
+            target: "mika::otel",
+            event = WEBHOOK_TURN_CHARGED_EVENT,
+            agent_id,
+            request_id,
+            trigger,
+            text_touched,
+            prefilter_enabled = enabled,
+            "tour webhook facturé — le tour a lieu (mika#2680)"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1591,5 +1859,283 @@ pub(crate) mod tests {
         ] {
             assert!(by(false).applies_to(&c), "{c:?}");
         }
+    }
+
+    // ---- vol 1 — le registre des tours webhook (mika#2680) ---------------
+    //
+    // Les textes de cette section sont ceux que le gateway délivre
+    // réellement ; le test cross-crate
+    // `mika2680_chaque_prefixe_declare_est_celui_que_le_gateway_emet`
+    // (`mika-gateway::github::tests`) tient l'autre bout du contrat.
+
+    /// Un `check_suite` sur la branche de PR, dans la forme que le gateway émet.
+    const PR_BRANCH_SUITE: &str =
+        "[GitHub] Check suite failure on senara-solutions/mika (branch: feat/2680/x)";
+
+    /// Le pré-digest que `verdict_handler::format_verdict_classification_failed_pre_digest`
+    /// substitue au texte d'origine. Reproduit ici en tête et en forme — c'est
+    /// la PREMIÈRE ligne qui décide, et elle est à elle seule la mutation
+    /// rouge d'AC2.
+    fn verdict_handler_rewrite(origin: &str) -> String {
+        format!(
+            "<verdict_handler>\n{origin}\n\
+             [verdict_classification_failed] No parseable VERDICT: line in review body.\n\n\
+             Operator has been notified.\n</verdict_handler>"
+        )
+    }
+
+    /// Même forme, côté `ci_success_handler` : le handler n'enrichit pas le
+    /// texte, il le remplace par un pré-digest balisé.
+    fn ci_success_handler_rewrite(origin: &str) -> String {
+        format!(
+            "<ci_success_handler>\n{origin}\n\
+             CI checks all green — every gate cleared.\n</ci_success_handler>"
+        )
+    }
+
+    /// Terme par terme : chacun des douze termes est atteint par un texte que
+    /// le gateway émet, et aucun n'est atteint par un autre.
+    #[test]
+    fn mika2680_la_taxonomie_atteint_chacun_de_ses_douze_termes() {
+        use TriggerClass::*;
+
+        let cas: [(&str, TriggerClass); 12] = [
+            (GREEN_MAIN, CheckSuiteDefaultBranch),
+            (PR_BRANCH_SUITE, CheckSuitePrBranch),
+            (
+                "[GitHub] PR review (approved) on senara-solutions/mika#2680 (t) by @mika-platform-qa",
+                PrReview,
+            ),
+            (
+                "[GitHub] PR opened: senara-solutions/mika#2680 — t (branch: feat/2680/x)",
+                PrOpened,
+            ),
+            (
+                "[GitHub] PR closed: senara-solutions/mika#2679 — t (branch: feat/2679/x)\nMerged: true",
+                PrClosed,
+            ),
+            (
+                "[GitHub] PR synchronize: senara-solutions/mika#2680 — t (branch: feat/2680/x)",
+                PrOther,
+            ),
+            (INERT, IssueLabeled),
+            (
+                "[GitHub] Issue closed: senara-solutions/mika#2294 — t",
+                IssueClosed,
+            ),
+            (
+                "[GitHub] Issue opened: senara-solutions/mika#2680 — t",
+                IssueOther,
+            ),
+            (
+                "[GitHub] New comment on senara-solutions/mika#2654 (t) by @samidarko",
+                IssueComment,
+            ),
+            ("[GitHub] push.unknown on senara-solutions/mika", Push),
+            ("une consigne de l'opérateur par Telegram", Other),
+        ];
+
+        for (texte, attendu) in cas {
+            assert_eq!(trigger_class(texte), attendu, "texte : {texte:?}");
+        }
+
+        // Douze cas pour douze termes, et deux fois le même terme passerait le
+        // bloc ci-dessus sans rien dire : la couverture est donc comptée.
+        let mut termes: Vec<&str> = cas.iter().map(|(_, c)| c.as_str()).collect();
+        termes.sort_unstable();
+        termes.dedup();
+        assert_eq!(
+            termes.len(),
+            12,
+            "un terme est couvert deux fois et un autre pas du tout : {termes:?}"
+        );
+    }
+
+    /// Les deux pièges d'ordre, pris par le bas : si un raffinement passait
+    /// après son générique, `pr_review` et `issue_labeled` deviendraient
+    /// inatteignables en silence.
+    #[test]
+    fn mika2680_un_raffinement_passe_avant_son_generique() {
+        let revue = review("commented", QA, "VERDICT: hold[review]");
+        assert!(revue.starts_with(PR_EVENT_PREFIX), "prémisse du piège");
+        assert_eq!(trigger_class(&revue), TriggerClass::PrReview);
+
+        let label = labeled("loop-substrate");
+        assert!(label.starts_with(ISSUE_EVENT_PREFIX), "prémisse du piège");
+        assert_eq!(trigger_class(&label), TriggerClass::IssueLabeled);
+    }
+
+    /// AC2 — le déclencheur se lit sur le texte d'ORIGINE, jamais sur
+    /// `req.text`. C'est la mutation rouge du ticket : les deux handlers qui
+    /// réécrivent remplacent le texte par un pré-digest balisé, dont la
+    /// première ligne est `<handler>` et ne porte donc aucun préfixe de
+    /// grammaire — la classe (f) du ticket tomberait sur `other`, c'est-à-dire
+    /// précisément sur la population à chiffrer.
+    #[test]
+    fn mika2680_le_declencheur_se_lit_sur_le_texte_dorigine() {
+        let origine = review("commented", QA, "VERDICT: illisible");
+        let reecrit = verdict_handler_rewrite(&origine);
+        assert_eq!(trigger_class(&origine), TriggerClass::PrReview);
+        assert_eq!(
+            trigger_class(&reecrit),
+            TriggerClass::Other,
+            "si ceci rend `pr_review`, la mutation rouge d'AC2 ne mord plus : \
+             le pré-digest du verdict_handler ne commence plus par sa balise"
+        );
+
+        let reecrit = ci_success_handler_rewrite(GREEN_PR);
+        assert_eq!(trigger_class(GREEN_PR), TriggerClass::CheckSuitePrBranch);
+        assert_eq!(trigger_class(&reecrit), TriggerClass::Other);
+
+        // Et c'est exactement ce que `text_touched` nomme : le tour est le
+        // même, seul le texte a changé de main.
+        let touched = Touched {
+            by_any_handler: true,
+            after_verdict_handler: true,
+            outside_ci_success_handler: true,
+            outside_ci_failure_handler: true,
+        };
+        assert!(touched.by_any_handler);
+    }
+
+    /// AC3 — exhaustivité. Les six gabarits que `format_event_text` met en
+    /// forme sont énumérés ici ; aucun ne retombe sur le terme de repli. Le
+    /// septième, l'attrape-tout, est `other` et c'est sa place légitime.
+    #[test]
+    fn mika2680_aucun_gabarit_nomme_du_gateway_ne_retombe_sur_other() {
+        use mika_common::github_event_format::ISSUE_OPENED_EVENT_PREFIX;
+
+        // Un texte minimal par gabarit, construit sur le préfixe déclaré —
+        // donc sans littéral de grammaire, comme la taxonomie elle-même.
+        let gabarits: [(&str, String); 6] = [
+            (
+                "issues.labeled",
+                format!("{ISSUE_LABELED_EVENT_PREFIX}ready on senara-solutions/mika#2680 — t"),
+            ),
+            (
+                "issues.{action}",
+                format!("{ISSUE_OPENED_EVENT_PREFIX} senara-solutions/mika#2680 — t"),
+            ),
+            (
+                "issue_comment",
+                format!("{ISSUE_COMMENT_EVENT_PREFIX}senara-solutions/mika#2680 (t) by @samidarko"),
+            ),
+            (
+                "pull_request",
+                format!("{PR_OPENED_EVENT_PREFIX} senara-solutions/mika#2680 — t (branch: x)"),
+            ),
+            (
+                "pull_request_review",
+                format!(
+                    "{PR_REVIEW_EVENT_PREFIX}(approved) on senara-solutions/mika#2680 (t) by @qa"
+                ),
+            ),
+            (
+                "check_suite",
+                format!(
+                    "{CHECK_SUITE_EVENT_PREFIX}success on senara-solutions/mika (branch: main)"
+                ),
+            ),
+        ];
+
+        for (gabarit, texte) in &gabarits {
+            assert_ne!(
+                trigger_class(texte),
+                TriggerClass::Other,
+                "le gabarit {gabarit} retombe sur le repli — la taxonomie a cessé de le nommer : \
+                 {texte:?}"
+            );
+        }
+
+        // L'attrape-tout, septième forme : c'est lui, et lui seul, que `other`
+        // décrit. Un `push` en est l'instance réelle et porte son propre terme.
+        assert_eq!(
+            trigger_class("[GitHub] deployment_status.success on senara-solutions/mika"),
+            TriggerClass::Other
+        );
+        assert_eq!(
+            trigger_class("[GitHub] push.unknown on senara-solutions/mika"),
+            TriggerClass::Push
+        );
+    }
+
+    /// Un `check_suite` dont la branche est illisible n'est ni l'une ni
+    /// l'autre : se taire vaut mieux que nommer une branche qu'on n'a pas lue.
+    #[test]
+    fn mika2680_un_check_suite_sans_branche_lisible_ne_nomme_aucune_branche() {
+        assert_eq!(
+            trigger_class("[GitHub] Check suite success on senara-solutions/mika"),
+            TriggerClass::Other
+        );
+        // La branche se lit entre le marqueur et le `)` de fin de ligne.
+        assert_eq!(
+            trigger_class("[GitHub] Check suite success on senara-solutions/mika (branch: main"),
+            TriggerClass::Other
+        );
+    }
+
+    /// AC6 — `candidate` est le nom d'un variant quand `classify` en rend un,
+    /// et **manque** sinon. Jamais `0`, jamais `"none"` : « l'événement n'est
+    /// pas dans la population du pré-filtre » n'est pas la même affirmation
+    /// que « il y est et a gardé son tour » (motif mika#2331). Le champ est
+    /// omis par le bras `None` de [`emit_turn_charged`] ; ce test en tient la
+    /// prémisse — quels textes ont un candidat, lesquels n'en ont pas.
+    #[test]
+    fn mika2680_le_candidat_manque_quand_la_classification_ne_rend_rien() {
+        // Dans la population du pré-filtre : le nom du variant est écrit.
+        for (texte, nom) in [
+            (GREEN_MAIN, "green_default_branch"),
+            (GREEN_PR, "green_pr_branch"),
+            (RED_MAIN, "red_default_branch"),
+            (RED_PR, "red_pr_branch"),
+            (INERT, "inert_label"),
+        ] {
+            assert_eq!(classify(texte).unwrap().as_str(), nom, "{texte:?}");
+        }
+        assert_eq!(
+            classify(&review("commented", QA, "VERDICT: hold[review]"))
+                .unwrap()
+                .as_str(),
+            "review_verdict"
+        );
+
+        // Hors population : aucun candidat, donc aucun champ à écrire. Chacun
+        // de ces tours a pourtant un `trigger`, et c'est tout l'intérêt —
+        // `issue_comment` est 79 % de la fenêtre mesurée le 2026-10-08.
+        for texte in [
+            "[GitHub] New comment on senara-solutions/mika#2654 (t) by @samidarko",
+            "[GitHub] Issue closed: senara-solutions/mika#2294 — t",
+            "[GitHub] PR closed: senara-solutions/mika#2679 — t (branch: x)\nMerged: true",
+        ] {
+            assert!(classify(texte).is_none(), "{texte:?}");
+            assert_ne!(trigger_class(texte), TriggerClass::Other, "{texte:?}");
+        }
+    }
+
+    /// Les orthographes de fil, figées. Le vol 2 (« le lecteur ») en fera des
+    /// `GROUP BY` : une orthographe qui bouge scinde une population sans le
+    /// dire — même discipline que [`PrefilterClass::as_str`].
+    #[test]
+    fn mika2680_les_orthographes_de_fil_sont_figees() {
+        assert_eq!(WEBHOOK_TURN_CHARGED_EVENT, "webhook_turn_charged");
+
+        assert_eq!(
+            TriggerClass::CheckSuiteDefaultBranch.as_str(),
+            "check_suite_default_branch"
+        );
+        assert_eq!(
+            TriggerClass::CheckSuitePrBranch.as_str(),
+            "check_suite_pr_branch"
+        );
+        assert_eq!(TriggerClass::PrReview.as_str(), "pr_review");
+        assert_eq!(TriggerClass::PrOpened.as_str(), "pr_opened");
+        assert_eq!(TriggerClass::PrClosed.as_str(), "pr_closed");
+        assert_eq!(TriggerClass::PrOther.as_str(), "pr_other");
+        assert_eq!(TriggerClass::IssueLabeled.as_str(), "issue_labeled");
+        assert_eq!(TriggerClass::IssueClosed.as_str(), "issue_closed");
+        assert_eq!(TriggerClass::IssueOther.as_str(), "issue_other");
+        assert_eq!(TriggerClass::IssueComment.as_str(), "issue_comment");
+        assert_eq!(TriggerClass::Push.as_str(), "push");
+        assert_eq!(TriggerClass::Other.as_str(), "other");
     }
 }

@@ -6,11 +6,12 @@ module: crates/mika-agent/src/server
 problem_type: best_practice
 component: agent-core
 severity: medium
-tags: [webhooks, llm-cost, prefilter, mika-2675]
+tags: [webhooks, llm-cost, prefilter, observability, mika-2675, mika-2680]
 applies_when:
   - "Vouloir écarter un événement webhook sans tour LLM"
   - "Ajouter une garde qui court-circuite run_agent_for_message"
   - "Mesurer les tours LLM « à vide » par classe d'événement"
+  - "Chiffrer ce que coûte une classe d'événement AVANT d'écrire son filtre"
 ---
 
 # Un pré-filtre de webhook se place après les handlers déterministes, pas avant
@@ -219,3 +220,109 @@ PR DECISION-CORE ait reçu au moins deux `check_suite` vertes sur la même tête
 depuis le déploiement. **Hors périmètre, nommé :** la renotification de
 l'opérateur à chaque retraitement est inchangée, puisque ce module ne change
 pas ce que le moteur fait. La dédupliquer est un ticket séparé.
+
+## Phase 4, vol 1 : le pré-filtre compte ce qu'il écarte, pas ce qu'il laisse passer
+
+Les trois phases ci-dessus ont chacune leur sonde, et toutes lisent la **même**
+population : `audit_events` où `tool_name = 'webhook_prefilter_skipped'`. Ce que
+le pré-filtre **laisse passer** n'était inscrit nulle part. Le chiffrage de
+mika#2680 a donc dû se refaire deux fois à la main — `llm_calls` joint au premier
+message `user` de chaque session, puis `substr(content, 1, 60)` taxonomisé à
+l'œil — et c'est cette reconstruction, pas le filtre, qui est le coût récurrent :
+la mesure 1 et la mesure 2 ont produit des découpages différents (la classe (h)
+n'existait pas dans la première) parce que la taxonomie vivait dans la tête de
+celui qui lisait.
+
+**Le symptôme à reconnaître : une porte dont on ne sait mesurer qu'un côté.**
+Tant qu'il est là, « quelles classes reste-t-il à filtrer ? » n'est pas une
+requête, c'est une enquête — et le critère d'acceptation qui en dépend reste
+ouvert, ce qu'il est encore à ce jour.
+
+### Une ligne de log, pas une ligne d'audit
+
+`webhook_turn_charged` est un `info!` sur `target: "mika::otel"`, dégaté de
+`MIKA_STORE_LLM_CALLS` comme `turn_usage`, et **n'écrit aucune ligne d'audit**.
+Ce n'est pas une économie : `audit_events` est réservé aux **décisions** du
+moteur, et `webhook_prefilter_skipped` y garde son monopole. Un tour qui a lieu
+n'est pas une décision, c'est un fait. Lui donner une ligne d'audit créerait une
+seconde population à côté de celle qui nomme les écarts, sur un axe disjoint, et
+tout `GROUP BY tool_name` sur la table deviendrait ambigu.
+
+### La jointure : `request_id` ici, `trace_id` là
+
+```
+webhook_turn_charged.request_id  ==  turn_usage.trace_id
+```
+
+Les deux champs ne portent pas le même nom et portent la même valeur
+(`req.request_id`). C'est ce qui rend le chiffrage **une requête** : le registre
+dit *de quelle classe* était le tour, `turn_usage` dit *ce qu'il a coûté*, et
+rien n'oblige plus à retaxonomiser un `substr(content, 1, 60)`.
+
+Quatre champs, chacun pour une question qui s'est posée :
+
+- **`trigger`** — le terme de taxonomie, calculé sur `original_github_text`,
+  c'est-à-dire **le texte d'avant les handlers**. Les deux handlers réécrivants
+  remplacent le texte par un pré-digest dont la première ligne est la balise nue
+  (`<verdict_handler>`, `<ci_success_handler>`) ; calculé sur `req.text`, le
+  `trigger` d'un `pr_review` réécrit vaudrait `other` — exactement la classe (f)
+  du ticket, rendue invisible par l'instrument censé la compter. C'est la
+  mutation rouge d'AC2.
+- **`text_touched`** — `Touched::by_any_handler`. Le fait qui sépare « intact »
+  de « réécrit », donc le seul qui dise si la règle de la phase 2 a joué.
+- **`candidate`** — la variante de `Candidate` quand `classify` en a rendu une,
+  **absent** sinon. Absent veut dire « l'événement n'est pas dans la population
+  du pré-filtre » ; ce n'est pas la même affirmation que « il y est et a gardé
+  son tour », que le lecteur lit sur le couple `candidate` présent +
+  `webhook_turn_charged` émis. Jamais `0`, jamais `"none"` (motif mika#2331).
+- **`prefilter_enabled`** — l'état de l'interrupteur. Une fenêtre où il est
+  désarmé est précisément une fenêtre qu'on veut pouvoir mesurer : sans ce
+  champ, une flambée de tours ne se distingue pas d'une flambée de trafic.
+
+### Le contrôle positif, et ce que son absence veut dire
+
+Pour un `trace_id` de canal `github`, `turn_usage` **sans** `webhook_turn_charged`
+signifie « binaire déployé antérieur au champ », jamais « aucun tour webhook »
+(classe mika#2205, chaîne mika#2340 `rebuild → deploy`). Le registre ne couvre
+que les tours webhook : il n'est émis que là où `original_github_text` est
+`Some`, donc `req.channel == "github"`. Telegram et les tours silencieux restent
+hors registre **par construction**, et leur silence ne se lit pas comme un
+manque.
+
+### La sonde des tours payés
+
+```sql
+-- Ce que coûte chaque classe d'événement qui a gardé son tour.
+-- `trigger` et `candidate` se lisent sur la ligne webhook_turn_charged
+-- des journaux ; cette requête en est la moitié coût.
+SELECT l.agent_id, count(DISTINCT l.trace_id) AS tours, sum(l.input_tokens)
+  FROM llm_calls l
+ WHERE l.created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-18 hours')
+ GROUP BY 1 ORDER BY 3 DESC;
+```
+
+```bash
+# La moitié taxonomie : un tour payé par ligne, avec sa classe.
+grep webhook_turn_charged "$MIKA_LOG_FILE" \
+  | jq -r '[.trigger, .text_touched, (.candidate // "-"), .prefilter_enabled] | @tsv' \
+  | sort | uniq -c | sort -rn
+```
+
+**Les deux moitiés de la sonde AC5 se lisent ensemble.** Côté écarts, la requête
+de la phase 1 (`webhook_prefilter_skipped` groupée par classe) ; côté payés, les
+deux ci-dessus. La somme des deux est la population des événements webhook, et
+c'est la première fois qu'elle est close.
+
+**Halte.** `webhook_turn_charged` absent de tous les journaux alors que des
+`turn_usage` de canal `github` existent : **établir le déploiement avant de
+conclure quoi que ce soit** sur le volume des tours webhook. Et
+`prefilter_enabled=false` sur les lignes d'une fenêtre : la mesure de cette
+fenêtre ne dit rien du filtre en service, elle dit ce que coûterait son absence.
+
+### Ce que vol 1 ne fait pas
+
+Aucune classe de pré-filtre n'est ajoutée — ni (e), ni (f), ni (g), ni (h).
+Aucun handler n'est touché, aucun `Touched` modifié, aucune décision du moteur
+changée. Le ticket chiffre, il n'implémente pas ; vol 1 livre **l'instrument qui
+rend le chiffrage prenable**, et vol 2 (« le lecteur ») en fera un refus
+explicite si l'instrument manque.

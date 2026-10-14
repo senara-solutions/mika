@@ -6263,4 +6263,251 @@ mod tests {
         assert!(mock.calls_made() >= 1);
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
     }
+
+    // ---- mika#2680 vol 1 — le registre des tours webhook -------------------
+    //
+    // Les tests unitaires de `webhook_prefilter` épinglent la taxonomie ; ceux
+    // d'ici lisent la ligne `webhook_turn_charged` telle qu'un tour RÉEL
+    // l'émet, sur le chemin complet `run_agent_for_message`. C'est la seule
+    // forme qui peut établir la jointure d'AC1 : le `request_id` du registre
+    // et le `trace_id` du `turn_usage` du MÊME tour.
+    //
+    // La capture est celle de `kg::resolver_tick::tests`, et
+    // `install_capturing_subscriber` en est le seul site d'installation permis
+    // (mika#2646). Elle se pose par `set_default`, donc par thread, et
+    // l'`Interest` d'un callsite est figé par le PREMIER thread qui l'atteint :
+    // un voisin non sérialisé qui toucherait `turn_usage` sans abonné
+    // l'éteindrait globalement. D'où `#[serial_test::serial]` sur chacun des
+    // trois — c'est la moitié porteuse du dispositif, pas une précaution.
+
+    #[derive(Debug, Clone)]
+    struct Mika2680Event {
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct Mika2680Layer {
+        events: Arc<std::sync::Mutex<Vec<Mika2680Event>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Mika2680Layer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            let mut visitor = Mika2680Visitor(&mut fields);
+            event.record(&mut visitor);
+            if let Ok(mut events) = self.events.lock() {
+                events.push(Mika2680Event { fields });
+            }
+        }
+    }
+
+    struct Mika2680Visitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for Mika2680Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn mika2680_capture() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<std::sync::Mutex<Vec<Mika2680Event>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Mika2680Layer {
+            events: Arc::clone(&events),
+        });
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        (guard, events)
+    }
+
+    fn mika2680_events_named(
+        events: &Arc<std::sync::Mutex<Vec<Mika2680Event>>>,
+        name: &str,
+    ) -> Vec<Mika2680Event> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.fields.get("event").map(String::as_str) == Some(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Pose `MIKA_WEBHOOK_PREFILTER` le temps d'un test et le restaure — par
+    /// `Drop`, donc y compris sur panique : une restauration écrite en fin de
+    /// corps laisserait la variable posée pour toute la suite dès le premier
+    /// échec. Elle est process-globale, et `#[serial_test::serial]` est ce qui
+    /// empêche un voisin de la lire pendant qu'elle l'est.
+    struct Mika2680EnvGuard(Option<String>);
+
+    impl Mika2680EnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var(webhook_prefilter::PREFILTER_ENV).ok();
+            unsafe { std::env::set_var(webhook_prefilter::PREFILTER_ENV, value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for Mika2680EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => unsafe {
+                    std::env::set_var(webhook_prefilter::PREFILTER_ENV, previous)
+                },
+                None => unsafe { std::env::remove_var(webhook_prefilter::PREFILTER_ENV) },
+            }
+        }
+    }
+
+    /// Un commentaire d'opérateur sur un ticket sans tâche de boucle : la
+    /// classe (h) de la mesure 2, 79 % de la fenêtre du 2026-10-08. Hors
+    /// population du pré-filtre, donc `candidate` doit MANQUER — et le tour a
+    /// bien lieu, ce qui en fait le porteur naturel d'AC1.
+    const MIKA2680_COMMENT: &str = "[GitHub] New comment on senara-solutions/mika#2680 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2680\n\nrelance le groom";
+
+    /// AC1 — un tour webhook qui a lieu émet UNE ligne de registre, et son
+    /// `request_id` est le `trace_id` du `turn_usage` du même tour.
+    ///
+    /// C'est toute la jointure de l'instrument : sans elle, le registre dirait
+    /// « un tour a eu lieu » sans qu'on puisse lui attacher son coût, et le
+    /// chiffrage de vol 2 n'aurait aucun moyen de rapprocher les deux tables.
+    /// La non-vacuité est assertée aussi — deux champs vides sont égaux.
+    ///
+    /// AC6 s'y lit en passant : `candidate` est ABSENT, pas `"none"` ni `0`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_le_registre_se_joint_au_cout_du_tour() {
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2680_COMMENT).await;
+
+        assert!(mock.calls_made() >= 1, "le tour doit avoir lieu");
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "une ligne de registre, et une seule");
+        let usage = mika2680_events_named(&events, "turn_usage");
+        assert!(!usage.is_empty(), "le tour facturé doit avoir un coût");
+
+        let request_id = charged[0].fields.get("request_id").expect("request_id");
+        let trace_id = usage[0].fields.get("trace_id").expect("trace_id");
+        assert!(
+            !request_id.is_empty(),
+            "une jointure sur du vide n'en est pas une"
+        );
+        assert_eq!(
+            request_id, trace_id,
+            "AC1 — la jointure du registre au coût"
+        );
+
+        assert_eq!(
+            charged[0].fields.get("trigger").map(String::as_str),
+            Some("issue_comment")
+        );
+        assert_eq!(
+            charged[0].fields.get("text_touched").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            charged[0]
+                .fields
+                .get("prefilter_enabled")
+                .map(String::as_str),
+            Some("true"),
+            "interrupteur armé par défaut"
+        );
+        assert!(
+            !charged[0].fields.contains_key("candidate"),
+            "AC6 — hors population, le champ MANQUE (motif mika#2331)"
+        );
+    }
+
+    /// AC4 — un tour écarté n'émet AUCUNE ligne de registre.
+    ///
+    /// Le registre compte les tours **payés** ; une ligne sur un tour écarté
+    /// ferait compter deux fois ce que `webhook_prefilter_skipped` compte déjà,
+    /// et sur une population disjointe de celle qu'il nomme.
+    ///
+    /// La ligne d'audit est assertée d'abord : sans elle, « aucune ligne de
+    /// registre » voudrait aussi bien dire « le tour n'a jamais été écarté »
+    /// que « le tour a été écarté et s'est tu » (classe mika#2205).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_un_tour_ecarte_nemet_aucune_ligne_de_registre() {
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2675_GREEN_MAIN).await;
+
+        assert_eq!(mock.calls_made(), 0, "la classe (a) écarte ce tour");
+        assert_eq!(
+            mika2675_skipped_rows(&state).await,
+            1,
+            "contrôle positif : l'écart a bien eu lieu"
+        );
+
+        assert!(
+            mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT)
+                .is_empty(),
+            "AC4 — un tour écarté n'est pas un tour facturé"
+        );
+        assert!(
+            mika2680_events_named(&events, "turn_usage").is_empty(),
+            "et il n'a coûté aucun appel"
+        );
+    }
+
+    /// AC5 — interrupteur désarmé : le tour a lieu, le registre le dit, et il
+    /// dit aussi que l'interrupteur l'était.
+    ///
+    /// C'est la fenêtre qu'on veut précisément pouvoir mesurer : le même texte
+    /// qu'AC4 écarte traverse ici, et la ligne porte `prefilter_enabled=false`
+    /// — sans quoi un chiffrage lirait une flambée de tours sans pouvoir dire
+    /// qu'elle vient du désarmement plutôt que du trafic.
+    ///
+    /// `candidate` est PRÉSENT : l'événement est dans la population du
+    /// pré-filtre et a gardé son tour. C'est l'autre moitié d'AC6 — celle
+    /// qu'un champ toujours absent rendrait indistinguable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_linterrupteur_desarme_le_registre_le_dit() {
+        let _env = Mika2680EnvGuard::set("0");
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2675_GREEN_MAIN).await;
+
+        assert!(mock.calls_made() >= 1, "désarmé, rien n'est filtré");
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0]
+                .fields
+                .get("prefilter_enabled")
+                .map(String::as_str),
+            Some("false"),
+            "AC5 — la ligne nomme l'état de l'interrupteur"
+        );
+        assert_eq!(
+            charged[0].fields.get("trigger").map(String::as_str),
+            Some("check_suite_default_branch")
+        );
+        assert_eq!(
+            charged[0].fields.get("candidate").map(String::as_str),
+            Some("green_default_branch"),
+            "dans la population, et le tour a quand même eu lieu"
+        );
+    }
 }

@@ -2742,6 +2742,224 @@ mod tests {
         );
     }
 
+    /// An event with every optional field cleared — mika#2680's fixtures fill
+    /// in only what the arm under test reads.
+    fn mika2680_blank_event() -> GitHubWebhookEvent {
+        GitHubWebhookEvent {
+            action: None,
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: None,
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: None,
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+            before: None,
+            after: None,
+        }
+    }
+
+    fn mika2680_issue() -> Option<GitHubIssue> {
+        Some(GitHubIssue {
+            number: Some(2680),
+            title: Some("registre des tours webhook".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/issues/2680".to_string()),
+            body: None,
+            assignee: None,
+        })
+    }
+
+    fn mika2680_pr() -> Option<GitHubPullRequest> {
+        Some(GitHubPullRequest {
+            number: Some(2681),
+            title: Some("feat: le registre".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2681".to_string()),
+            body: None,
+            head: Some(GitHubRef {
+                ref_name: Some("feat/2680/registre".to_string()),
+            }),
+            merged: Some(true),
+        })
+    }
+
+    /// mika#2680 — le contrat producteur/consommateur, étendu à la grammaire
+    /// que la taxonomie des tours webhook lit.
+    ///
+    /// `webhook_prefilter::trigger_class` classe le texte d'origine d'un
+    /// webhook en lisant ces préfixes **par constante**, donc sans écrire un
+    /// littéral de grammaire. Le prix de cette indirection est exactement ce
+    /// test : un préfixe déclaré que le gateway n'émet plus devient un terme de
+    /// taxonomie mort — il rendrait `other` pour toujours, en silence, avec
+    /// toutes les assertions de comportement encore vertes. C'est la dérive
+    /// telle qu'elle arrive : le producteur change de gabarit, le consommateur
+    /// garde l'ancien.
+    #[test]
+    fn mika2680_chaque_prefixe_declare_est_celui_que_le_gateway_emet() {
+        use mika_common::github_event_format as fmt;
+
+        // (1) `check_suite`, et le préfixe est agnostique de la conclusion.
+        for conclusion in ["success", "failure", "cancelled"] {
+            let mut event = mika2680_blank_event();
+            event.check_suite = Some(CheckSuite {
+                conclusion: Some(conclusion.to_string()),
+                head_branch: Some("main".to_string()),
+            });
+            let text = format_event_text("check_suite", &event);
+            assert!(
+                text.starts_with(fmt::CHECK_SUITE_EVENT_PREFIX),
+                "CHECK_SUITE_EVENT_PREFIX a dérivé sur la conclusion {conclusion:?} : {text:?}"
+            );
+            assert!(
+                text.contains(fmt::BRANCH_MARKER),
+                "BRANCH_MARKER a dérivé : c'est par lui que la taxonomie distingue \
+                 la branche par défaut d'une branche de PR. Texte : {text:?}"
+            );
+        }
+
+        // (2) `pull_request` : la forme générique, puis les deux actions
+        // que la taxonomie nomme.
+        let mut event = mika2680_blank_event();
+        event.action = Some("opened".to_string());
+        event.pull_request = mika2680_pr();
+        let text = format_event_text("pull_request", &event);
+        assert!(
+            text.starts_with(fmt::PR_OPENED_EVENT_PREFIX),
+            "PR_OPENED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::PR_EVENT_PREFIX),
+            "PR_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.contains(fmt::BRANCH_MARKER),
+            "BRANCH_MARKER a dérivé sur le gabarit `pull_request` : {text:?}"
+        );
+
+        event.action = Some("closed".to_string());
+        let text = format_event_text("pull_request", &event);
+        assert!(
+            text.starts_with(fmt::PR_CLOSED_EVENT_PREFIX),
+            "PR_CLOSED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.contains("Merged: true"),
+            "le gabarit `closed` ne distingue mergée de fermée qu'en ligne suivante — \
+             si cette ligne disparaît, la lecture de `pr_closed` change de sens : {text:?}"
+        );
+
+        // (3) `pull_request_review`, et le piège d'ordre qu'il porte : sa forme
+        // commence par `PR `, donc le bras `pr_review` doit être testé AVANT le
+        // bras générique.
+        let mut event = mika2680_blank_event();
+        event.pull_request = mika2680_pr();
+        event.review = Some(GitHubReview {
+            state: Some("changes_requested".to_string()),
+            body: None,
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2681#r1".to_string()),
+            user: Some(GitHubUser {
+                login: "mika-qa".to_string(),
+                user_type: None,
+            }),
+        });
+        let text = format_event_text("pull_request_review", &event);
+        assert!(
+            text.starts_with(fmt::PR_REVIEW_EVENT_PREFIX),
+            "PR_REVIEW_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::PR_EVENT_PREFIX),
+            "PR_REVIEW_EVENT_PREFIX doit rester un raffinement de PR_EVENT_PREFIX : \
+             c'est ce qui rend l'ordre des bras de `trigger_class` load-bearing. \
+             Si cette assertion tombe, l'ordre n'est plus nécessaire — relire le commentaire \
+             de PR_EVENT_PREFIX avant de le simplifier. Texte : {text:?}"
+        );
+
+        // (4) `issues` : la forme générique par son instance canonique
+        // `opened`, puis `closed`.
+        let mut event = mika2680_blank_event();
+        event.action = Some("opened".to_string());
+        event.issue = mika2680_issue();
+        let text = format_event_text("issues", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_OPENED_EVENT_PREFIX),
+            "ISSUE_OPENED_EVENT_PREFIX a dérivé — c'est le seul préfixe par lequel \
+             le gabarit générique `Issue {{action}}:` est épinglable : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::ISSUE_EVENT_PREFIX),
+            "ISSUE_EVENT_PREFIX a dérivé : {text:?}"
+        );
+
+        event.action = Some("closed".to_string());
+        let text = format_event_text("issues", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_CLOSED_EVENT_PREFIX),
+            "ISSUE_CLOSED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+
+        // (5) `issues.labeled`, quel que soit le label — et le second piège
+        // d'ordre : cette forme n'est PAS `Issue {action}:` et commence pourtant
+        // par `Issue `.
+        let mut event = mika2680_blank_event();
+        event.action = Some("labeled".to_string());
+        event.issue = mika2680_issue();
+        event.label = Some(GitHubLabel {
+            name: Some("loop-substrate".to_string()),
+        });
+        let text = format_event_text("issues", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_LABELED_EVENT_PREFIX),
+            "ISSUE_LABELED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::ISSUE_EVENT_PREFIX),
+            "ISSUE_LABELED_EVENT_PREFIX doit rester un raffinement de \
+             ISSUE_EVENT_PREFIX — même raison que pour `PR review` : {text:?}"
+        );
+        assert!(
+            !text.starts_with(fmt::READY_LABEL_DISPATCH_MARKER),
+            "un label autre que `ready` ne doit pas porter le marqueur de dispatch : {text:?}"
+        );
+
+        // (6) `issue_comment`.
+        let mut event = mika2680_blank_event();
+        event.action = Some("created".to_string());
+        event.issue = mika2680_issue();
+        event.comment = Some(GitHubComment {
+            body: Some("une consigne".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/issues/2680#c1".to_string()),
+            user: Some(GitHubUser {
+                login: "samidarko".to_string(),
+                user_type: None,
+            }),
+        });
+        let text = format_event_text("issue_comment", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_COMMENT_EVENT_PREFIX),
+            "ISSUE_COMMENT_EVENT_PREFIX a dérivé : {text:?}"
+        );
+
+        // (7) `push` — et c'est l'attrape-tout qui l'émet, pas un bras dédié.
+        // `action` vaut `"unknown"` par défaut, d'où le point dans le préfixe.
+        let event = mika2680_blank_event();
+        let text = format_event_text("push", &event);
+        assert!(
+            text.starts_with(fmt::PUSH_EVENT_PREFIX),
+            "PUSH_EVENT_PREFIX a dérivé. `format_event_text` n'a aucun bras `push` : \
+             si un bras dédié apparaît, c'est ici qu'il faut relire le préfixe. Texte : {text:?}"
+        );
+        assert_eq!(
+            text, "[GitHub] push.unknown on senara-solutions/mika",
+            "la forme réelle d'un push est celle de l'attrape-tout"
+        );
+    }
+
     #[test]
     fn test_format_event_text_issue_labeled_empty_label_name() {
         // Empty label name should fall back to generic format, not produce
