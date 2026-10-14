@@ -27,7 +27,7 @@
 //!
 //! **Les deux contrôles sont porteurs, pas décoratifs.** Les deux cas de refus
 //! seuls seraient satisfaits par une garde qui refuse l'outil sur **tout** tour
-//! — c'est-à-dire par un correctif qui retire la promotion forcée aux ~42 appels
+//! — c'est-à-dire par un correctif qui retire la promotion forcée aux 40 appels
 //! mesurés hors canal github. Le tour d'opérateur est l'axe qui sépare « la
 //! garde décide » de « la garde bloque la promotion ». Et le tour
 //! `[GitHub] Issue …` épingle que le **Webhook Fallthrough reste hors
@@ -251,7 +251,7 @@ async fn mika2654_un_tour_check_suite_ne_force_pas_la_promotion() {
 // AC9c (AC3) — LE contrôle négatif : hors tour webhook PR, rien ne change.
 //
 // Sans lui, « la garde décide » est indistinguable de « la garde bloque toute
-// promotion forcée », et les ~42 appels mesurés hors canal github pourraient
+// promotion forcée », et les 40 appels mesurés hors canal github pourraient
 // être cassés avec tous les autres tests au vert.
 // -------------------------------------------------------------------------
 

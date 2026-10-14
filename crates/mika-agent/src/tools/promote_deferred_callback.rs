@@ -173,11 +173,21 @@ pub(crate) fn classify_force_promote_turn(
 /// correcte (terminer le tour sur ce que l'événement demande).
 ///
 /// Et il **ne nomme aucune commande** — ni le geste CLI de promotion, ni son
-/// drapeau de forçage, ni `run_shell`, ni `update_task_status` :
-/// `MIKA_DEV_IDENTITY` porte `shell-exec`, donc écrire la commande ici
-/// donnerait au modèle le gabarit du contournement, et *un refus qui donne le
-/// gabarit est une fuite avec une étape de plus*. La liste interdite est
-/// épinglée par V5.
+/// drapeau de forçage, ni `run_shell`, ni `update_task_status` : un refus qui
+/// donne le gabarit est une fuite avec une étape de plus (mika#2520 /
+/// mika#2292), et `MIKA_DEV_IDENTITY` porte `shell-exec`. La liste interdite
+/// est épinglée par V5.
+///
+/// **Ce que V5 tient exactement, et c'est plus étroit qu'une garantie de
+/// confinement :** le refus ne **restitue** pas le gabarit. Il ne le retire pas
+/// du tour, parce que deux surfaces préexistantes le portent déjà et qu'aucune
+/// n'appartient à ce travail — la **description** de l'outil, servie au
+/// catalogue à chaque tour puisque l'outil est *refusé* et non *retenu*, et le
+/// corps d'erreur `slot_busy`, tous deux citant
+/// `mika tasks promote-deferred <class> --override`. Les retirer serait une
+/// décision de surface de prompt, pas un corollaire de cette garde : elle est
+/// nommée ici plutôt que présumée, pour qu'un lecteur ne prenne pas V5 pour ce
+/// qu'elle n'atteste pas.
 ///
 /// `match` exhaustif **sans bras `_ =>`**, comme chez la sœur : `Allowed` ne
 /// compose rien, et une troisième issue devra être tranchée ici.
@@ -221,7 +231,7 @@ fn refusal_body(decision: ForcePromoteTurnDecision, dispatch_class: &str) -> Str
 /// # « Rien hors de la population », porté ici et pas par l'appelant
 ///
 /// L'`early return` sur `audit_value() == None` est ce qui tient la doctrine
-/// mika#2131 : sur les ~42 appels mesurés hors canal github, cette fonction
+/// mika#2131 : sur les 40 appels mesurés hors canal github, cette fonction
 /// n'écrit **rien** — ni journal, ni audit. C'est aussi ce qui permet au site
 /// d'appel de l'invoquer **inconditionnellement**, sans répéter le prédicat :
 /// un second site qui reteste la classe de tour serait un second endroit où la
@@ -596,8 +606,10 @@ mod tests {
     /// check-suite.
     ///
     /// Le booléen est posé **à la main** : `TestHarness::ctx()` le laisse à
-    /// `false`, exactement comme les vingt sites de production qui ne servent
-    /// pas de webhook. Ce qui veut dire que les trois tests ci-dessous
+    /// `false`, exactement comme les trois sites de production qui ne servent
+    /// pas de webhook (mode silencieux et agents d'équipe dans
+    /// `agent_loop/mod.rs`, `server/investigate.rs`) — le **seul** site qui le
+    /// calcule est celui de conversation. Ce qui veut dire que les trois tests
     /// n'attestent **pas** le câblage — le champ pourrait n'être jamais calculé
     /// au site de conversation et ils resteraient verts. C'est AC9 qui l'atteste,
     /// et c'est pourquoi la mutation M4 ne fait rougir que lui.
@@ -660,8 +672,8 @@ mod tests {
     ///
     /// Sans lui, « la garde décide » ne se distingue pas de « la garde bloque
     /// tout », et la seconde serait un correctif qui casse le chemin de reprise
-    /// (`DeferredDispatch`, callbacks de pilote : 31 des 73 appels mesurés) en
-    /// ayant l'air de fermer le ticket.
+    /// (`DeferredDispatch`, callbacks de pilote : 40 des 73 appels mesurés, sur
+    /// 31 des 58 sessions) en ayant l'air de fermer le ticket.
     #[tokio::test]
     async fn mika2654_hors_tour_webhook_pr_la_promotion_passe() {
         let harness = TestHarness::new();
@@ -876,7 +888,7 @@ mod tests {
             classify_force_promote_turn(false),
             ForcePromoteTurnDecision::Allowed,
             "INVARIANT VIOLÉ (AC3) : la garde a mordu hors de sa population — \
-             les 31 appels mesurés hors canal github (callbacks de pilote, \
+             les 40 appels mesurés hors canal github (callbacks de pilote, \
              deferred-dispatch) sont le chemin de reprise, et le casser serait \
              pire que le défaut qu'on referme"
         );

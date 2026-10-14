@@ -1674,9 +1674,12 @@ mod tests {
     /// Zéro violation existante, et c'est **mesuré** et non supposé : avant le
     /// commit du scan, `grep -rn
     /// 'deferred_dispatch_force_promote_refused_webhook_pr_turn' crates/` rendait
-    /// exactement deux lignes, la constante propriétaire et son épinglage sous
-    /// `mod tests` — que `production_sources_to_test_module` tronque. Il n'y a
-    /// donc rien à excepter, ni de case où déposer la prochaine infraction
+    /// trois lignes, et aucune n'est un second écrivain de production — la
+    /// constante propriétaire, son épinglage sous `mod tests` (que
+    /// `production_sources_to_test_module` tronque) et une occurrence dans
+    /// `tests/eval/test_promote_deferred_webhook_pr_2654.rs` (que
+    /// `source_scan::is_test_source_path` écarte). Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction
     /// (mika#2323). Quand le scan tire, **on fait passer le site par la
     /// constante partagée**, on ne l'allowliste pas (doctrine mika#2201).
     const FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
