@@ -272,6 +272,14 @@ ESCALATE	B	crates/mika-agent/src/skills/executor.rs::GROOM_ESCALATE_MARKER	exact
 STRUCTURAL VIOLATION	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
 PIPELINE FAILURE	B	skills/bundled/_shared/dispatch-lib.sh::_post_flight_recovery	exact:literal
 NO_PR	B	crates/mika-agent/src/task_engine/dispatcher.rs::RE_NO_PR	exact:line-anchored
+# mika#2698 — les deux bannières ont gagné un second lecteur strict, côté
+# moteur : `death_cause` classe un vol mort en lisant `tasks.result`. Le
+# producteur de ces deux lignes est `dispatch-lib.sh` ci-dessus ; le lecteur est
+# ici. Une bannière reformulée ferait retomber la mort en `Unknown`, c'est-à-dire
+# ferait disparaître du rapport du manager la distinction refus / panne de
+# pipeline — exactement ce que l'AC3 demande de distinguer.
+STRUCTURAL VIOLATION	B	crates/mika-agent/src/milestone_manager/evaluator.rs::death_cause	exact:literal
+PIPELINE FAILURE	B	crates/mika-agent/src/milestone_manager/evaluator.rs::death_cause	exact:literal
 
 # ── Cancel-reason discriminators (mika#749, #2249). The shell TERM trap and
 # `self-dev-callback` read these byte-exact; a reworded one makes a reaped pilot

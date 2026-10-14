@@ -75,6 +75,10 @@ impl Assessor {
             // Phase 1 is read-only, so there is nothing to contend for yet.
             // Populated by the Phase 2 dispatch path (mika#1948).
             contention_events: Vec::new(),
+            // L'assesseur ne voit pas les vols : il ne lit que l'état du
+            // milestone. Les verdicts sont posés par la cadence, qui tient la
+            // `FlightSource` et la borne du cycle précédent (mika#2698).
+            flight_verdicts: Vec::new(),
         }
     }
 }

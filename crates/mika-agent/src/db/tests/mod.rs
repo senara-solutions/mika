@@ -60,6 +60,7 @@ mod settle_dispatch_parents;
 mod skill_overrides_and_task_types;
 mod task_messages_and_groom;
 mod tool_calls_and_messages;
+mod vols_termines_du_manager;
 
 pub(crate) fn db() -> Database {
     Database::open_in_memory().unwrap()
