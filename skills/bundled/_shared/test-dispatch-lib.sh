@@ -12683,6 +12683,128 @@ T2693_SOURCE_SCAN_ALLOWLIST=()
 assert_eq "V6: table d'exceptions des scans de source (V3, V5, V6) — zero entries" \
     "0" "${#T2693_SOURCE_SCAN_ALLOWLIST[@]}"
 
+# --- V7 : le diagnostic résolu ARRIVE au groomeur --------------------------
+#
+# ROUGE AVANT : `_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE` et
+# `_PLAN_SIZE_PER_FLIGHT_NOTE` étaient résolues puis jetées — write-only partout
+# sauf dans les sondes de V1/V2. Le plan engageait l'inverse au § du plancher :
+# « la règle injectée DIT alors au groomeur que le plafond en vigueur ne peut
+# héberger aucune implémentation ». UN DIAGNOSTIC CALCULÉ PUIS TU EST PIRE QU'UN
+# DIAGNOSTIC ABSENT : la globale existe, la sonde la voit, et la garde se relit
+# comme posée alors que personne ne la reçoit. Trouvé par la revue de code de ce
+# vol, pas par le pilote.
+#
+# Le groomeur est le destinataire, pas l'opérateur : l'implémentation part dans
+# la même seconde que le succès du groom (mika#1614), donc aucune fenêtre ne
+# s'ouvre pour qu'un humain lise un WARN de stderr avant que le plan soit écrit.
+_plan_size_rule "200"; T2693_RULE_200="$_PLAN_SIZE_RULE"
+_plan_size_rule "150"; T2693_RULE_150="$_PLAN_SIZE_RULE"
+_plan_size_rule "";    T2693_RULE_DISARMED="$_PLAN_SIZE_RULE"
+_plan_size_rule "70";  T2693_RULE_FLOOR="$_PLAN_SIZE_RULE"
+
+# Contre-vacuité d'abord : les quatre rendus existent. Sans elle, un
+# `_plan_size_rule` qui rendrait la chaîne vide ferait passer les quatre
+# `assert_not_contains` ci-dessous.
+for t2693_body in "$T2693_RULE_200" "$T2693_RULE_150" "$T2693_RULE_DISARMED" \
+    "$T2693_RULE_FLOOR"; do
+    assert_eq "V7 contre-vacuité: les quatre règles rendues ne sont pas vides" "non-vide" \
+        "$([ -n "$t2693_body" ] && echo non-vide || echo vide)"
+done
+
+# Le cas NOMINAL ne gagne pas une ligne — c'est la moitié qui empêche l'alerte
+# de devenir du bruit permanent qu'on cesse de lire.
+assert_not_contains "V7: un plafond de 200 ne porte AUCUNE alerte" \
+    'ALERTE PLAFOND' "$T2693_RULE_200"
+assert_not_contains "V7: un plafond de 150 ne porte AUCUNE alerte" \
+    'ALERTE PLAFOND' "$T2693_RULE_150"
+
+# Budget DÉSARMÉ : la provenance `disarmed_fallback` est dite, et elle est dite
+# comme telle — ni « défaut » ni un label, parce que le groomeur doit écrire une
+# parenthèse vraie sur la ligne `Plafond de tours :`.
+assert_contains "V7: un budget désarmé est DIT au groomeur" \
+    'ALERTE PLAFOND' "$T2693_RULE_DISARMED"
+assert_contains "V7: et il est nommé comme désarmé" 'DÉSARMÉ' "$T2693_RULE_DISARMED"
+assert_contains "V7: la provenance à écrire est le repli, pas un label" \
+    'repli fail-safe' "$T2693_RULE_DISARMED"
+assert_not_contains "V7: le désarmement n'emprunte pas la phrase du plancher" \
+    'AUCUNE' "$T2693_RULE_DISARMED"
+
+# PLANCHER : la note `ceiling_below_pipeline_floor` dit au groomeur de ne pas
+# écrire de plan et de remonter le plafond. La borne de 0 seule ne le dirait
+# pas : lue sans la phrase, elle se confond avec « découpe plus fin ».
+assert_contains "V7: un plafond sous le plancher est DIT au groomeur" \
+    'ALERTE PLAFOND' "$T2693_RULE_FLOOR"
+assert_contains "V7: et il dit qu'aucune implémentation ne tient" \
+    'ne peut héberger AUCUNE' "$T2693_RULE_FLOOR"
+assert_contains "V7: et il nomme la remontée à l'opérateur" \
+    "remonte-le" "$T2693_RULE_FLOOR"
+assert_not_contains "V7: le plancher n'emprunte pas la phrase du désarmement" \
+    'DÉSARMÉ' "$T2693_RULE_FLOOR"
+
+# RÉCENCE (S13) : l'alerte est le DERNIER paragraphe de la règle, qui est
+# elle-même le dernier bloc du prompt. Une alerte posée avant la citation du
+# site de vérité perdrait le seul levier qu'a une consigne en fin de 16 KiB.
+assert_contains "V7 récence: l'alerte plancher est le dernier mot de la règle" \
+    "l'opérateur." \
+    "$(printf '%s\n' "$T2693_RULE_FLOOR" | grep -vE '^[[:space:]]*$' | tail -1)"
+assert_contains "V7 récence: l'alerte de désarmement est le dernier mot de la règle" \
+    'défaut' \
+    "$(printf '%s\n' "$T2693_RULE_DISARMED" | grep -vE '^[[:space:]]*$' | tail -1)"
+
+# --- V7-bis : les deux 150 sont tenus ensemble -----------------------------
+#
+# Le repli de `_plan_size_per_flight_bound` et le défaut de flotte de
+# `_pilot_max_turns` sont le MÊME nombre pour la même raison, et mika#2542 (AC9)
+# épingle `local _default="150"` littéralement — on ne peut donc pas hisser une
+# constante partagée sans toucher au test d'un autre ticket. La duplication est
+# alors FORCÉE, et c'est exactement le cas où un test de parité la tient :
+# retoucher le défaut de flotte sans retoucher le repli laisserait V1 et V4
+# vertes, les deux prompts statiques à 150, et la divergence MUETTE — le défaut
+# que toute cette section existe pour refuser.
+T2693_FLEET_DEFAULT=$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB" \
+    | sed -n 's/^[[:space:]]*local _default="\([0-9]\{1,\}\)".*/\1/p')
+T2693_FLIGHT_FALLBACK=$(sed -n '/^_plan_size_per_flight_bound()/,/^}/p' "$DISPATCH_LIB" \
+    | sed -n 's/^[[:space:]]*_ceiling="\([0-9]\{1,\}\)".*/\1/p')
+assert_eq "V7-bis contre-vacuité: le défaut de flotte a bien été extrait" "yes" \
+    "$([ -n "$T2693_FLEET_DEFAULT" ] && echo yes || echo non-trouvé)"
+assert_eq "V7-bis contre-vacuité: le repli de la borne a bien été extrait" "yes" \
+    "$([ -n "$T2693_FLIGHT_FALLBACK" ] && echo yes || echo non-trouvé)"
+assert_eq "V7-bis: le repli de la borne par vol EST le défaut de flotte" \
+    "$T2693_FLEET_DEFAULT" "$T2693_FLIGHT_FALLBACK"
+
+# --- V7-ter : la dérivation affichée reproduit la borne --------------------
+#
+# Le rendu humain des deux mises à l'échelle garde UN chiffre après la virgule
+# (`% 100 / 10`). C'est exact tant que les deux constantes sont des multiples de
+# 10 — et ça cesse de l'être en silence sinon : un débit recalibré à 775 ferait
+# écrire « × 7,7 / 2 » (442) à côté d'une borne de 445, et la § 2 de la règle
+# demande au groomeur d'écrire CETTE dérivation comme ce qui rend la borne
+# recalibrable. On épingle donc la précondition là où un recalibrage la casse,
+# au lieu de généraliser un formateur dont personne n'a besoin aujourd'hui.
+assert_eq "V7-ter: le débit est un multiple de 10 (rendu décimal exact)" "0" \
+    "$(( ${_PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS:-7} % 10 ))"
+assert_eq "V7-ter: le facteur est un multiple de 10 (rendu décimal exact)" "0" \
+    "$(( ${_PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT:-7} % 10 ))"
+
+# --- V7-quater : le format ne retape plus les quatre paramètres ------------
+#
+# Trouvé par la revue de code : le format prescrivait « (<plafond> − 35 − 50)
+# × 7,5 / 2 », c'est-à-dire un CINQUIÈME site de vérité que rien ne tenait.
+# `_PLAN_SIZE_FORMAT_SPEC` est interpolée à deux sites (S13-bis) et le second —
+# le finding synthétique du rattrapage — n'appelle jamais `_plan_size_rule` : là,
+# ces littéraux étaient la seule formule que le groomeur voyait.
+for t2693_chev in '<orientation>' '<fin de pipeline>' '<débit>' '<facteur>'; do
+    assert_contains "V7-quater: le format porte $t2693_chev à chevrons" \
+        "$t2693_chev" "${_PLAN_SIZE_FORMAT_SPEC:-}"
+done
+assert_not_contains "V7-quater: le format ne retape pas orientation et fin de pipeline" \
+    '− 35 − 50' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_not_contains "V7-quater: le format ne retape pas débit et facteur" \
+    '7,5 / 2' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+# Et la dérivation EN VALEUR reste bien celle que la règle rend, elle.
+assert_contains "V7-quater: la règle, elle, rend la dérivation en valeur" \
+    '(200 − 35 − 50) × 7,5 / 2' "$T2693_RULE_200"
+
 # ===========================================================================
 # mika#2641 — une réponse d'architecte sans disposition lisible est RELANCÉE
 #
