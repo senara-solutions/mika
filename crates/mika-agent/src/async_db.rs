@@ -1864,6 +1864,22 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Les vols d'implémentation terminés sur un ensemble de tickets (mika#2698).
+    /// Voir [`crate::db::Database::list_finished_implement_flights`] pour la
+    /// borne temporelle, l'ensemble clos des variantes d'URL et le filtre de
+    /// statut terminal.
+    pub async fn list_finished_implement_flights(
+        &self,
+        since: Option<String>,
+        issue_urls: Vec<String>,
+    ) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| {
+            db.list_finished_implement_flights(&id, since.as_deref(), &issue_urls)
+        })
+        .await
+    }
+
     // -- Sessions --
 
     pub async fn create_session(&self, id: &str, agent_id: &str, channel_type: &str) -> Result<()> {

@@ -106,9 +106,38 @@
 //! could otherwise forge). The manager's audit trail is mika's own
 //! `audit_events`, never cm's. Pinned by `manager_write_path_needs_no_new_role`
 //! in `control-monitor/backend/crates/cm-api/src/scope.rs`.
+//!
+//! ## Phase 2 (b) vol 1 — le manager évalue chaque vol (mika#2698)
+//!
+//! **Ce que le vol 1 a ajouté :** [`evaluator`], qui voit les vols
+//! d'implémentation terminés depuis le cycle précédent sur les tickets du
+//! milestone cible et en rend un verdict structuré (issue, tours, cause de mort,
+//! recommandation). La détection passe par le trait [`evaluator::FlightSource`],
+//! dont l'implémentation base de données vit **hors** du module
+//! (`crate::flight_source::DbFlightSource`) — même idiome que
+//! `AuthBoundaryLedger` / `DbAuthBoundaryLedger`, et pour la même raison : aucun
+//! SQL ne passe ainsi sous le grep de `no_dispatch_test.rs`. Rien de nouveau sur
+//! le réseau : tout vient de `tasks` et de `SubIssue::pr_state`, déjà hydraté.
+//!
+//! **Ce que le vol 1 n'a pas ajouté, et c'est le point :** aucune autorité
+//! d'écriture, pas même désarmée. `MIKA_MANAGER_EVALUATE_WRITE` n'est **pas**
+//! déclarée — un interrupteur dont la branche ON ne fait rien est un mensonge de
+//! surface. Le verdict a exactement une destination,
+//! [`types::Assessment::flight_verdicts`], que le `Reporter` rend dans sa section
+//! « Vols terminés depuis le cycle précédent ». C'est le *mode ombre* du ticket,
+//! et au vol 1 il est structurel : il ne se configure pas, il n'existe pas
+//! autrement. L'écriture (`gh issue comment`, idempotence par checkpoint,
+//! exception nommée dans l'allowlist de `no_dispatch_test.rs`) est le vol 2, et
+//! le ticket reste ouvert jusque-là.
+//!
+//! Deux data du verdict sont **présentes et `None`** — non instrumentées, jamais
+//! `0` (motif mika#2331) : le plafond de tours, dont le lecteur unique est en
+//! shell (`_pilot_max_turns`), et le tour du dernier commit, qui demande le
+//! transcript. Les deux sont du vol 2.
 
 pub mod assessor;
 pub mod cadence;
+pub mod evaluator;
 pub mod liveness;
 pub mod reader;
 pub mod reporter;
@@ -125,6 +154,10 @@ pub use cadence::{
     ManagerConfig, MilestoneCheckpoint, ROUTE_HTTP, ROUTE_OFFLINE_SINK,
     ROUTE_OFFLINE_SINK_FALLBACK, ReportDeliverer, run_manager_cycle, run_manager_cycle_in,
     run_manager_cycle_with, run_manager_cycle_with_auth, state_digest,
+};
+pub use evaluator::{
+    DeathCause, FinishedFlight, FlightIssue, FlightRecommendation, FlightSource, FlightVerdict,
+    evaluate_flight, evaluate_flights, milestone_issue_urls,
 };
 pub use liveness::{
     ENV_LIVENESS_URL, HttpLivenessSink, LIVENESS_ENTITY, LIVENESS_TIMEOUT, LivenessBody,
