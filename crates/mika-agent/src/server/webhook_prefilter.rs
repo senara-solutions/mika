@@ -58,11 +58,45 @@
 //! Le texte ne doit avoir été touché que par `ci_success_handler`, comme (c)
 //! l'exige du `verdict_handler`. Une variante et ses faits, pas un second
 //! mécanisme.
+//!
+//! # Phase 4 : les sorties « rien à faire » du CI failure handler (mika#2683)
+//!
+//! Mesuré le 2026-10-12 : une `check_suite` ROUGE sur `main` coûte deux tours
+//! (116 k tokens d'entrée) qui concluent « No action », alors que l'étape 2 du
+//! handler a déjà tranché la même chose en code ; et la CI rouge de la PR
+//! dependabot mika#2682, non adoptée, en coûte un de plus (55 754 tokens
+//! d'entrée) APRÈS que `surface_for_adoption` a notifié l'opérateur et écrit sa
+//! ligne d'audit. Deux formes, deux mécanismes :
+//!
+//! - **rouge sur la branche par défaut** — deux termes de texte (`conclusion ∈
+//!   {failure, timed_out}`, `branch == DEFAULT_BRANCH`) et un terme d'état,
+//!   `branch_has_active_task`, par symétrie avec la classe verte voisine.
+//!   L'étape 2 du handler skippe, elle, inconditionnellement : la porte est donc
+//!   STRICTEMENT plus conservatrice que lui, le bon sens de l'écart pour un
+//!   dispositif fail-safe vers le LLM.
+//! - **rouge sur une branche de PR** — la décision du handler passe par un
+//!   appel GitHub (`find_open_pr`) et deux recherches de tâche. La re-dériver
+//!   ici serait une divergence programmée, la classe que ce dépôt a déjà payée
+//!   deux fois (mika#2158 `grooming_marker`, mika#2362 le seuil de retry
+//!   recopié). On lit donc la trace durable que le handler a laissée pour CET
+//!   événement — l'idiome de la phase 3 — et [`ci_failure_no_action_class`]
+//!   porte le terme de refus : une ligne `ci_failure_handled` ou
+//!   `ci_failure_escalated` lui fait rendre `None`, le handler a agi.
+//!
+//! Les sorties qui **informent** le modèle d'un état qu'il doit prendre en
+//! compte (jeton GitHub absent, forge illisible, correctif déjà en vol,
+//! escalade) n'écrivent aucune ligne terminale : c'est l'absence de trace qui
+//! leur garde leur tour.
 
 use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 
+use super::ci_failure_handler::{
+    CI_FAILURE_ESCALATED_TOOL, CI_FAILURE_HANDLED_TOOL, CI_FAILURE_NO_ACTION_NO_OPEN_PR,
+    CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS, CI_FAILURE_NO_ACTION_TOOL,
+    SURFACE_FOR_ADOPTION_TOOL, parse_check_suite_failure,
+};
 use super::ci_success_handler::{
     DECISION_CORE_HOLD_NOTIFIED, DECISION_CORE_HOLD_TOOL, parse_check_suite_success,
 };
@@ -104,6 +138,16 @@ pub(crate) enum PrefilterClass {
     /// (b) `check_suite` verte sur une tête de PR déjà décidée DECISION-CORE
     /// et notifiée, que cet événement redécide à l'identique.
     GreenCheckSuiteHeadDecided,
+    /// (a rouge) `check_suite` en échec ou `timed_out` sur la branche par
+    /// défaut, sans tâche active sur cette branche (mika#2683).
+    RedCheckSuiteDefaultBranch,
+    /// (c) `check_suite` rouge d'une branche sans PR ouverte.
+    CiFailureNoOpenPr,
+    /// (c) `check_suite` rouge d'une PR sans tâche : `surface_for_adoption` a
+    /// déjà notifié l'opérateur et écrit sa ligne d'audit (mika#1745).
+    CiFailureSurfacedForAdoption,
+    /// (c) `check_suite` rouge d'une PR dont la tâche n'est pas `in_progress`.
+    CiFailureTaskNotInProgress,
 }
 
 impl PrefilterClass {
@@ -116,6 +160,10 @@ impl PrefilterClass {
             Self::VerdictUnreadable => "verdict_unreadable",
             Self::VerdictPrClosed => "verdict_pr_closed",
             Self::GreenCheckSuiteHeadDecided => "green_check_suite_head_decided",
+            Self::RedCheckSuiteDefaultBranch => "red_check_suite_default_branch",
+            Self::CiFailureNoOpenPr => "ci_failure_no_open_pr",
+            Self::CiFailureSurfacedForAdoption => "ci_failure_surfaced_for_adoption",
+            Self::CiFailureTaskNotInProgress => "ci_failure_task_not_in_progress",
         }
     }
 }
@@ -153,6 +201,18 @@ pub(crate) enum Candidate {
         repo: String,
         branch: String,
     },
+    /// (a rouge) `check_suite` en échec ou `timed_out` sur la branche par
+    /// défaut (mika#2683).
+    RedDefaultBranch {
+        repo: String,
+        branch: String,
+    },
+    /// (c) toute `check_suite` rouge hors branche par défaut. Elle n'est écartée
+    /// qu'au terme de [`decide`], sur la trace laissée par le handler.
+    RedPrBranch {
+        repo: String,
+        branch: String,
+    },
     InertLabel {
         repo: String,
         issue: u64,
@@ -174,6 +234,19 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
             }
         } else {
             Candidate::GreenPrBranch {
+                repo: event.repo,
+                branch: event.branch,
+            }
+        });
+    }
+    if let Some(event) = parse_check_suite_failure(text) {
+        return Some(if event.branch == DEFAULT_BRANCH {
+            Candidate::RedDefaultBranch {
+                repo: event.repo,
+                branch: event.branch,
+            }
+        } else {
+            Candidate::RedPrBranch {
                 repo: event.repo,
                 branch: event.branch,
             }
@@ -347,6 +420,44 @@ pub(crate) fn head_decided_and_notified(
         .then(|| mine.target.clone())
 }
 
+/// (c) Fonction pure sur les lignes d'audit de CET événement. Rend la classe
+/// lorsqu'elles montrent une sortie terminale du CI failure handler — et `None`
+/// dès qu'une ligne dit que le handler a AGI (`ci_failure_handled`,
+/// `ci_failure_escalated`), auquel cas le tour a lieu. C'est le garde-fou qui
+/// empêche la classe de mordre sur un événement où quelque chose a été fait.
+///
+/// Les trois noms lus le sont par constante, jamais par littéral recopié : la
+/// même trace, lue par un second fichier. `surface_for_adoption` reste SOLE
+/// WRITER de son nom (le garde porte sur le littéral, pas sur l'identifiant).
+///
+/// Un motif `ci_failure_no_action` que cette version ne connaît pas rend `None`
+/// comme le reste : une valeur de fil ajoutée en amont ne fait pas écarter de
+/// tour avant que la porte ne la connaisse.
+pub(crate) fn ci_failure_no_action_class(this_event: &[AuditFact]) -> Option<PrefilterClass> {
+    if this_event
+        .iter()
+        .any(|r| r.tool == CI_FAILURE_HANDLED_TOOL || r.tool == CI_FAILURE_ESCALATED_TOOL)
+    {
+        return None;
+    }
+    this_event.iter().find_map(|r| {
+        if r.tool == SURFACE_FOR_ADOPTION_TOOL {
+            return Some(PrefilterClass::CiFailureSurfacedForAdoption);
+        }
+        if r.tool != CI_FAILURE_NO_ACTION_TOOL {
+            return None;
+        }
+        let motive = r.after.as_deref()?;
+        if motive == CI_FAILURE_NO_ACTION_NO_OPEN_PR {
+            Some(PrefilterClass::CiFailureNoOpenPr)
+        } else if motive == CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS {
+            Some(PrefilterClass::CiFailureTaskNotInProgress)
+        } else {
+            None
+        }
+    })
+}
+
 /// `pr:{repo}#{n}@{sha}` → `pr:{repo}#{n}@`. `None` si la cible n'a pas de SHA.
 fn pr_prefix(head: &str) -> Option<&str> {
     head.rfind('@').map(|i| &head[..=i])
@@ -377,24 +488,71 @@ fn state_unreadable(what: &str, target: &str, e: &anyhow::Error) -> Decision {
 pub(crate) async fn decide(candidate: Candidate, state: &impl PrefilterState) -> Decision {
     match candidate {
         Candidate::GreenDefaultBranch { repo, branch } => {
-            let target = format!("check_suite:{repo}@{branch}");
-            match state.branch_has_active_task(&branch).await {
-                Ok(false) => Decision::Skip {
-                    class: PrefilterClass::GreenCheckSuiteDefaultBranch,
-                    target,
-                },
-                Ok(true) => Decision::Llm,
-                Err(e) => state_unreadable("branch_task", &target, &e),
-            }
+            decide_default_branch(
+                PrefilterClass::GreenCheckSuiteDefaultBranch,
+                &repo,
+                &branch,
+                state,
+            )
+            .await
+        }
+        Candidate::RedDefaultBranch { repo, branch } => {
+            decide_default_branch(
+                PrefilterClass::RedCheckSuiteDefaultBranch,
+                &repo,
+                &branch,
+                state,
+            )
+            .await
         }
         Candidate::GreenPrBranch { repo, branch } => {
             decide_head_decided(&repo, &branch, state).await
+        }
+        Candidate::RedPrBranch { repo, branch } => {
+            decide_ci_failure_no_action(&repo, &branch, state).await
         }
         Candidate::InertLabel { repo, issue, .. } => Decision::Skip {
             class: PrefilterClass::InertLabel,
             target: format!("issue:{repo}#{issue}"),
         },
         Candidate::ReviewVerdict(facts) => decide_review_verdict(facts, state).await,
+    }
+}
+
+/// (a) verte et rouge sur la branche par défaut : deux classes, un seul terme
+/// d'état. Une tâche active sur la branche est un état que le modèle doit
+/// prendre en compte ; une lecture en erreur laisse passer (AC3).
+async fn decide_default_branch(
+    class: PrefilterClass,
+    repo: &str,
+    branch: &str,
+    state: &impl PrefilterState,
+) -> Decision {
+    let target = format!("check_suite:{repo}@{branch}");
+    match state.branch_has_active_task(branch).await {
+        Ok(false) => Decision::Skip { class, target },
+        Ok(true) => Decision::Llm,
+        Err(e) => state_unreadable("branch_task", &target, &e),
+    }
+}
+
+/// (c) : la trace que le CI failure handler a laissée pour CET événement, lue
+/// par [`ci_failure_no_action_class`]. Aucune autre recherche d'état — la
+/// décision a déjà été prise en code, on ne la re-dérive pas. Un audit
+/// illisible laisse passer (AC3).
+async fn decide_ci_failure_no_action(
+    repo: &str,
+    branch: &str,
+    state: &impl PrefilterState,
+) -> Decision {
+    let target = format!("check_suite:{repo}@{branch}");
+    let this_event = match state.event_audit_rows().await {
+        Ok(rows) => rows,
+        Err(e) => return state_unreadable("event_audit", &target, &e),
+    };
+    match ci_failure_no_action_class(&this_event) {
+        Some(class) => Decision::Skip { class, target },
+        None => Decision::Llm,
     }
 }
 
@@ -461,14 +619,24 @@ pub(crate) fn prefilter_enabled() -> bool {
     )
 }
 
-/// Ce que les handlers ont fait du texte. (a) et (d) exigent un texte
-/// intact ; (c) exige un texte intact APRÈS le `verdict_handler` ; (b) exige
-/// qu'aucun handler autre que `ci_success_handler` n'y ait touché.
+/// Ce que les handlers ont fait du texte. (a) verte et (d) exigent un texte
+/// intact ; (c) revue exige un texte intact APRÈS le `verdict_handler` ; (b)
+/// exige qu'aucun handler autre que `ci_success_handler` n'y ait touché ; les
+/// classes de mika#2683, qu'aucun autre que `ci_failure_handler`.
+///
+/// Un terme par fenêtre, et non un assouplissement du premier : le sens de ce
+/// type est « quel handler a le droit d'avoir touché ce texte pour cette
+/// classe ». Élargir `by_any_handler` ferait porter le relâchement à toutes les
+/// classes, dont celles où un texte touché est précisément le signal de danger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Touched {
     pub(crate) by_any_handler: bool,
     pub(crate) after_verdict_handler: bool,
     pub(crate) outside_ci_success_handler: bool,
+    /// mika#2683 : `surface_for_adoption` ENRICHIT `req.text`, donc
+    /// `by_any_handler` et `outside_ci_success_handler` sont tous deux vrais dès
+    /// que le handler a signalé — la fenêtre doit être son propre appel.
+    pub(crate) outside_ci_failure_handler: bool,
 }
 
 impl Touched {
@@ -476,6 +644,9 @@ impl Touched {
         match candidate {
             Candidate::ReviewVerdict(_) => self.after_verdict_handler,
             Candidate::GreenPrBranch { .. } => self.outside_ci_success_handler,
+            Candidate::RedDefaultBranch { .. } | Candidate::RedPrBranch { .. } => {
+                self.outside_ci_failure_handler
+            }
             Candidate::GreenDefaultBranch { .. } | Candidate::InertLabel { .. } => {
                 self.by_any_handler
             }
@@ -567,19 +738,15 @@ pub(crate) mod tests {
     }
 
     /// (a) terme par terme : conclusion, branche, préfixe. Une branche autre
-    /// que `main` sort de (a) et entre dans (b) ; un échec, un `timed_out` ou
-    /// un texte sans préfixe ne sont candidats ni à l'une ni à l'autre (AC2).
+    /// que `main` sort de (a) et entre dans (b) ; un texte sans préfixe n'est
+    /// candidat à rien (AC2). Depuis mika#2683, un échec et un `timed_out`
+    /// entrent dans leur propre population — plus bas.
     #[test]
     fn mika2675_classify_a_chaque_terme_sort_de_la_population() {
-        for text in [
-            "[GitHub] Check suite failure on senara-solutions/mika (branch: main)",
-            "[GitHub] Check suite timed_out on senara-solutions/mika (branch: main)",
-            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/2675/x)",
-            "[GitHub] Check suite timed_out on senara-solutions/mika (branch: fix/2675/x)",
-            "Check suite success on senara-solutions/mika (branch: main)",
-        ] {
-            assert_eq!(classify(text), None, "{text}");
-        }
+        assert_eq!(
+            classify("Check suite success on senara-solutions/mika (branch: main)"),
+            None
+        );
         for (text, branch) in [
             (
                 "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)",
@@ -765,6 +932,30 @@ pub(crate) mod tests {
         assert_eq!(
             PrefilterClass::GreenCheckSuiteHeadDecided.as_str(),
             "green_check_suite_head_decided"
+        );
+        assert_eq!(
+            PrefilterClass::RedCheckSuiteDefaultBranch.as_str(),
+            "red_check_suite_default_branch"
+        );
+        assert_eq!(
+            PrefilterClass::CiFailureNoOpenPr.as_str(),
+            "ci_failure_no_open_pr"
+        );
+        assert_eq!(
+            PrefilterClass::CiFailureSurfacedForAdoption.as_str(),
+            "ci_failure_surfaced_for_adoption"
+        );
+        assert_eq!(
+            PrefilterClass::CiFailureTaskNotInProgress.as_str(),
+            "ci_failure_task_not_in_progress"
+        );
+        // Les deux motifs écrits par le handler sont lus par des `GROUP BY` :
+        // même discipline de format de fil (mika#2683).
+        assert_eq!(CI_FAILURE_NO_ACTION_TOOL, "ci_failure_no_action");
+        assert_eq!(CI_FAILURE_NO_ACTION_NO_OPEN_PR, "no_open_pr");
+        assert_eq!(
+            CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS,
+            "task_not_in_progress"
         );
     }
 
@@ -963,11 +1154,13 @@ pub(crate) mod tests {
             by_any_handler: true,
             after_verdict_handler: false,
             outside_ci_success_handler: true,
+            outside_ci_failure_handler: true,
         };
         let after = Touched {
             by_any_handler: true,
             after_verdict_handler: true,
             outside_ci_success_handler: true,
+            outside_ci_failure_handler: true,
         };
         assert!(!by_verdict_only.applies_to(&verdict));
         assert!(after.applies_to(&verdict));
@@ -1185,8 +1378,218 @@ pub(crate) mod tests {
             by_any_handler: true,
             after_verdict_handler: true,
             outside_ci_success_handler: outside,
+            outside_ci_failure_handler: true,
         };
         assert!(!by(false).applies_to(&b));
         assert!(by(true).applies_to(&b));
+    }
+
+    // ---- phase 4 — les sorties « rien à faire » du CI failure handler ----
+    //
+    // mika#2683. Les textes sont ceux que le gateway délivre réellement.
+
+    const RED_MAIN: &str = "[GitHub] Check suite failure on senara-solutions/mika (branch: main)";
+    const RED_PR: &str =
+        "[GitHub] Check suite failure on senara-solutions/mika (branch: dependabot/cargo/x)";
+
+    /// (a rouge) terme par terme. La conclusion est portée par
+    /// `parse_check_suite_failure` : retirer ce terme ferait entrer les
+    /// conclusions neutres dans la population. La branche sépare (a) de (c) :
+    /// retirer ce terme ferait rendre `RedDefaultBranch` sur une branche de PR.
+    #[test]
+    fn mika2683_classify_les_deux_termes_de_la_classe_rouge() {
+        for conclusion in ["failure", "timed_out"] {
+            assert_eq!(
+                classify(&format!(
+                    "[GitHub] Check suite {conclusion} on senara-solutions/mika (branch: main)"
+                )),
+                Some(Candidate::RedDefaultBranch {
+                    repo: "senara-solutions/mika".into(),
+                    branch: "main".into()
+                }),
+                "{conclusion}"
+            );
+            // Hors branche par défaut : jugée par (c), jamais par (a).
+            assert_eq!(
+                classify(&format!(
+                    "[GitHub] Check suite {conclusion} on senara-solutions/mika (branch: fix/2683/x)"
+                )),
+                Some(Candidate::RedPrBranch {
+                    repo: "senara-solutions/mika".into(),
+                    branch: "fix/2683/x".into()
+                }),
+                "{conclusion}"
+            );
+        }
+        // Toute autre conclusion sort de la population : ni verte, ni rouge.
+        for conclusion in [
+            "cancelled",
+            "neutral",
+            "action_required",
+            "stale",
+            "skipped",
+        ] {
+            for branch in ["main", "fix/2683/x"] {
+                let text = format!(
+                    "[GitHub] Check suite {conclusion} on senara-solutions/mika (branch: {branch})"
+                );
+                assert_eq!(classify(&text), None, "{text}");
+            }
+        }
+    }
+
+    /// (a rouge) le terme d'état, par symétrie avec la classe verte voisine.
+    #[tokio::test]
+    async fn mika2683_a_rouge_suit_la_recherche_de_tache() {
+        let c = || classify(RED_MAIN).unwrap();
+        assert_eq!(
+            decide(c(), &branch(Ok(false))).await,
+            Decision::Skip {
+                class: PrefilterClass::RedCheckSuiteDefaultBranch,
+                target: "check_suite:senara-solutions/mika@main".into()
+            }
+        );
+        // Une tâche active sur `main` est un état que le modèle doit prendre en
+        // compte — la porte est strictement plus conservatrice que l'étape 2 du
+        // handler, qui skippe inconditionnellement.
+        assert_eq!(decide(c(), &branch(Ok(true))).await, Decision::Llm);
+        // AC3 : base illisible ⇒ le tour a lieu.
+        assert_eq!(decide(c(), &branch(Err("db down"))).await, Decision::Llm);
+    }
+
+    fn no_action(motive: &str) -> AuditFact {
+        AuditFact {
+            id: 7,
+            tool: CI_FAILURE_NO_ACTION_TOOL.into(),
+            target: "check_suite:senara-solutions/mika@dependabot/cargo/x".into(),
+            after: Some(motive.into()),
+            trace: Some("rid-now".into()),
+        }
+    }
+
+    fn acted(tool: &str) -> AuditFact {
+        AuditFact {
+            tool: tool.into(),
+            ..no_action("ignoré")
+        }
+    }
+
+    /// (c) chaque ligne terminale rend SA classe — trois populations
+    /// dénombrables séparément (mika#2156).
+    #[test]
+    fn mika2683_c_chaque_sortie_terminale_rend_sa_classe() {
+        for (row, class) in [
+            (
+                no_action(CI_FAILURE_NO_ACTION_NO_OPEN_PR),
+                PrefilterClass::CiFailureNoOpenPr,
+            ),
+            (
+                no_action(CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS),
+                PrefilterClass::CiFailureTaskNotInProgress,
+            ),
+            (
+                acted(SURFACE_FOR_ADOPTION_TOOL),
+                PrefilterClass::CiFailureSurfacedForAdoption,
+            ),
+        ] {
+            assert_eq!(
+                ci_failure_no_action_class(std::slice::from_ref(&row)),
+                Some(class),
+                "{row:?}"
+            );
+        }
+    }
+
+    /// (c) le garde-fou : dès qu'une ligne dit que le handler a AGI, le tour a
+    /// lieu — même quand une ligne terminale est présente par ailleurs.
+    #[test]
+    fn mika2683_c_une_ligne_dagir_rend_le_tour() {
+        for acted_tool in [CI_FAILURE_HANDLED_TOOL, CI_FAILURE_ESCALATED_TOOL] {
+            for terminal in [
+                no_action(CI_FAILURE_NO_ACTION_NO_OPEN_PR),
+                acted(SURFACE_FOR_ADOPTION_TOOL),
+            ] {
+                let rows = vec![terminal.clone(), acted(acted_tool)];
+                assert_eq!(
+                    ci_failure_no_action_class(&rows),
+                    None,
+                    "{acted_tool} / {terminal:?}"
+                );
+            }
+        }
+    }
+
+    /// (c) l'absence de ligne est ce qui garde son tour à une sortie qui
+    /// INFORME le modèle : jeton GitHub absent, forge illisible, correctif en
+    /// vol. Et un motif que cette version ne connaît pas ne mord pas.
+    #[test]
+    fn mika2683_c_sans_ligne_terminale_le_tour_a_lieu() {
+        assert_eq!(ci_failure_no_action_class(&[]), None);
+        for row in [
+            // Les lignes du voisin `ci_success_handler`, sur le même événement.
+            acted(DECISION_CORE_HOLD_TOOL),
+            acted("ci_success_handler_processed"),
+            // Motif inconnu, ou absent.
+            no_action("motif_du_futur"),
+            AuditFact {
+                after: None,
+                ..no_action(CI_FAILURE_NO_ACTION_NO_OPEN_PR)
+            },
+        ] {
+            assert_eq!(
+                ci_failure_no_action_class(std::slice::from_ref(&row)),
+                None,
+                "{row:?}"
+            );
+        }
+    }
+
+    /// (c) sur `decide` : la classe vient de la trace, et un audit illisible
+    /// laisse passer (AC3).
+    #[tokio::test]
+    async fn mika2683_c_decide_lit_la_trace_de_levenement() {
+        let c = || classify(RED_PR).unwrap();
+        assert_eq!(
+            decide(
+                c(),
+                &rows(Ok(vec![no_action(CI_FAILURE_NO_ACTION_NO_OPEN_PR)]), None)
+            )
+            .await,
+            Decision::Skip {
+                class: PrefilterClass::CiFailureNoOpenPr,
+                target: "check_suite:senara-solutions/mika@dependabot/cargo/x".into(),
+            }
+        );
+        assert_eq!(decide(c(), &rows(Ok(vec![]), None)).await, Decision::Llm);
+        assert_eq!(
+            decide(c(), &rows(Err("db down"), None)).await,
+            Decision::Llm
+        );
+    }
+
+    /// Les classes de la phase 4 n'admettent qu'un texte touché par le
+    /// `ci_failure_handler` seul — et les classes voisines ne sont pas
+    /// relâchées par le nouveau terme.
+    #[test]
+    fn mika2683_texte_touche_hors_ci_failure_handler() {
+        let by = |outside| Touched {
+            by_any_handler: true,
+            after_verdict_handler: true,
+            outside_ci_success_handler: true,
+            outside_ci_failure_handler: outside,
+        };
+        for c in [classify(RED_MAIN).unwrap(), classify(RED_PR).unwrap()] {
+            assert!(!by(false).applies_to(&c), "{c:?}");
+            assert!(by(true).applies_to(&c), "{c:?}");
+        }
+        // Le nouveau terme ne décide d'aucune classe antérieure.
+        for c in [
+            classify(GREEN_MAIN).unwrap(),
+            classify(INERT).unwrap(),
+            classify(GREEN_PR).unwrap(),
+            classify(&review("commented", QA, "VERDICT: hold[review]")).unwrap(),
+        ] {
+            assert!(by(false).applies_to(&c), "{c:?}");
+        }
     }
 }
