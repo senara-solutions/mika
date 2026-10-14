@@ -667,6 +667,110 @@ _plan_size_max_loc() {
     return 0
 }
 
+# mika#2693 — LA SECONDE BORNE DU MÊME GATE, ET ELLE EST EN TOURS.
+#
+# Voisinage délibéré : les deux bornes du Plan-Size Gate se lisent ensemble.
+# Celle du dessus est PAR PR, en lignes, et la même pour tous les tickets ;
+# celle-ci est PAR VOL, dérivée du plafond de tours DU ticket (150 par défaut,
+# 200 avec `loop-substrate`). Elles ne se remplacent pas — la première protège
+# la revue, la seconde protège le vol — et LA PLUS SERRÉE MORD.
+#
+# LA DÉRIVATION, et elle seule, vit ici :
+#
+#   tours_de_travail = plafond − orientation − fin_de_pipeline
+#   borne_estimée    = tours_de_travail × débit / facteur
+#
+# Sa JUSTIFICATION vit dans `docs/solutions/dev-loop/`
+# `une-estimation-de-taille-se-compare-a-un-seuil-dans-sa-propre-unite.md` :
+# les trois vols morts au plafond le 2026-10-14 (mika#2683, #2654, #2687), la
+# provenance de chacun des quatre paramètres ci-dessous, et la méthode pour les
+# recalibrer sur une distribution. Un `.sh` n'a jamais eu besoin de la porter ;
+# ce qu'il doit porter, c'est de quoi RECALCULER — un nombre nu ne serait pas
+# recalibrable, et c'est la raison d'être de ce bloc.
+#
+# ARITHMÉTIQUE ENTIÈRE, PAR MISE À L'ÉCHELLE DES CONSTANTES. `bash` n'a pas de
+# flottants, donc 7,5 lignes/tour et un facteur de 2 se portent par deux entiers
+# DONT LE NOM DIT L'ÉCHELLE : 750 lignes pour 100 tours, et un facteur en
+# pourcentage. LES DEUX MISES À L'ÉCHELLE S'ANNULENT (×1/100 puis ÷1/100), et
+# c'est ce qui rend le calcul exact en UNE SEULE division :
+#
+#   borne = (plafond − 35 − 50) × 750 / 200
+#
+#   plafond 200 -> 115 × 750 / 200 = 431
+#   plafond 150 ->  65 × 750 / 200 = 243
+#
+# QUI RECALIBRE LE DÉBIT À 9 LIGNES/TOUR ÉCRIT `900`, JAMAIS `9` — l'annulation
+# est dite ici précisément pour que le prochain recalibrage ne divise pas la
+# borne par cent en croyant la corriger.
+_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=35
+_PLAN_SIZE_FLIGHT_TAIL_TURNS=50
+_PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS=750
+_PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT=200
+
+# `$1` = le plafond de tours DÉJÀ RÉSOLU (vide = budget désarmé).
+#
+# Quatre propriétés, chacune reprise d'un précédent tenu dans ce fichier :
+#
+#   1. IL ASSIGNE, IL N'IMPRIME PAS — même collision mika#2039 que
+#      `_pilot_log_dir`, `_pilot_max_turns` et `_plan_size_max_loc` : un
+#      accesseur imprimant se lirait `$(_plan_size_per_flight_bound)` et
+#      poserait `++ printf %s <valeur>` dans la trace `set -x`, forme qu'aucun
+#      scrubber ne couvre. Corollaire assumé et testé : tout lecteur de
+#      `$_PLAN_SIZE_PER_FLIGHT_BOUND` appelle le résolveur sur la MÊME
+#      invocation logique.
+#   2. LE PLAFOND EST PASSÉ, jamais lu par portée dynamique — exactement la
+#      contrainte que `_pilot_max_turns` s'impose pour `LABELS` : un état posé
+#      500 lignes plus haut par une autre fonction peut être lu périmé sans que
+#      rien ne le dise.
+#   3. IL NE RELIT JAMAIS LA TABLE DES LABELS. mika#2542 AC5 est explicite :
+#      `PILOT_LABEL_TURN_CEILINGS` a UN SEUL lecteur. Un second lecteur de
+#      label serait la seconde table de classification de mika#2539 — juste le
+#      jour où on l'écrit, divergente en silence ensuite.
+#   4. PLAFOND VIDE ⇒ REPLI SUR 150, PROVENANCE DITE. `_PILOT_MAX_TURNS` est
+#      vide dans un seul cas : le ROLLBACK (`PILOT_MAX_TURNS=0` ou `""`), où
+#      claude-pilot retombe sur son `maxTurns=200` amont. On NE prend PAS 200 :
+#      ce 200 appartient à un composant qu'on ne possède pas, et un rollback est
+#      une posture d'incident. On prend 150, la valeur que CE fichier possède,
+#      et qui est la direction prudente — borne plus serrée ⇒ plan plus petit ⇒
+#      jamais une mort par volume. `disarmed_fallback` rend le choix visible au
+#      lieu de le taire. Un site qui oublierait l'argument tombe sur le même
+#      repli : l'oubli est fail-safe vers 150, jamais vers 200.
+#
+# PLANCHER : un plafond ≤ orientation + fin_de_pipeline (85) donne un nombre de
+# tours de travail nul ou négatif. La borne est alors 0, JAMAIS un négatif —
+# « un nombre plausible, présenté avec autorité, faux » est le défaut que
+# l'ancre de `_PLAN_SIZE_TOTAL_RE` a déjà dû fermer — et la note porte
+# `ceiling_below_pipeline_floor`, qui dit au groomeur que le plafond en vigueur
+# ne peut héberger AUCUNE implémentation et qu'il faut le remonter à
+# l'opérateur. Cas atteignable uniquement par un `PILOT_MAX_TURNS=70` délibéré.
+_plan_size_per_flight_bound() {
+    # ASSIGNE : _PLAN_SIZE_PER_FLIGHT_BOUND
+    #           _PLAN_SIZE_PER_FLIGHT_CEILING
+    #           _PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE  (resolved|disarmed_fallback)
+    #           _PLAN_SIZE_PER_FLIGHT_NOTE            (""|ceiling_below_pipeline_floor)
+    local _ceiling="${1:-}" _work
+
+    _PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE="resolved"
+    _PLAN_SIZE_PER_FLIGHT_NOTE=""
+
+    if [ -z "$_ceiling" ]; then
+        _ceiling="150"
+        _PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE="disarmed_fallback"
+    fi
+    _PLAN_SIZE_PER_FLIGHT_CEILING="$_ceiling"
+
+    _work=$(( _ceiling - _PLAN_SIZE_FLIGHT_ORIENTATION_TURNS - _PLAN_SIZE_FLIGHT_TAIL_TURNS ))
+    if [ "$_work" -le 0 ]; then
+        _PLAN_SIZE_PER_FLIGHT_BOUND=0
+        _PLAN_SIZE_PER_FLIGHT_NOTE="ceiling_below_pipeline_floor"
+        return 0
+    fi
+
+    _PLAN_SIZE_PER_FLIGHT_BOUND=$(( _work * _PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS \
+        / _PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT ))
+    return 0
+}
+
 # LES BLOCS CLÔTURÉS SONT RETIRÉS AVANT TOUTE LECTURE, et le plan de ce ticket
 # en est la preuve vivante : son §3 documente le format dans un bloc
 # ```markdown qui contient un titre `## Taille estimée` ET une ligne
