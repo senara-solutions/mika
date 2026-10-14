@@ -3549,7 +3549,12 @@ _PLAN_SIZE_TOTAL_RE='^Total estimé[[:space:]]*:[[:space:]]*([0-9]+)([[:space:]]
 # pas. Y figer `200` ou `431` ferait donc prescrire au second un plafond qu'il
 # n'a aucun moyen de vérifier — et un nombre faux dans une prescription de
 # format est pire qu'un chevron. Les valeurs arrivent par les placeholders du
-# gabarit de la règle, un cran plus bas.
+# gabarit de la règle, un cran plus bas. LES QUATRE PARAMÈTRES DE LA DÉRIVATION
+# SONT À CHEVRONS POUR LA MÊME RAISON : la première rédaction les avait retapés
+# (`− 35 − 50) × 7,5 / 2`), et c'était un cinquième site de vérité que rien ne
+# tenait — un recalibrage aurait déplacé la formule de la règle, laissé celle du
+# format en arrière, et fait prescrire au groomeur une dérivation qui ne reproduit
+# plus la borne écrite juste au-dessus d'elle.
 _PLAN_SIZE_FORMAT_SPEC="## Taille estimée
 
 | livrable | lignes de code (hors \`docs/\`) |
@@ -3559,13 +3564,14 @@ _PLAN_SIZE_FORMAT_SPEC="## Taille estimée
 
 Total estimé : 215 lignes
 Plafond de tours : <le plafond donné par la règle ci-dessous> (<le label qui le porte, ou « défaut »>)
-Borne par vol : <la borne donnée par la règle ci-dessous> lignes estimées — (<plafond> − 35 − 50) × 7,5 / 2
+Borne par vol : <la borne donnée par la règle ci-dessous> lignes estimées — (<plafond> − <orientation> − <fin de pipeline>) × <débit> / <facteur>
 
 Compte les LIGNES DE CODE, hors \`docs/\` et hors \`CLAUDE.md\`. La ligne \`Total estimé :\`
 est lue par la machine : écris-la telle quelle, sans séparateur de milliers.
-Les deux dernières lignes sont le seul canal par lequel l'architecte apprend le plafond
-du ticket : il ne reçoit que le fichier de plan, jamais les labels. Un plan qui ne les
-déclare pas est jugé sur un plafond de 150 tours, le plus serré."
+Les lignes \`Plafond de tours :\` et \`Borne par vol :\` sont le seul canal par lequel
+l'architecte apprend le plafond du ticket : il ne reçoit que le fichier de plan,
+jamais les labels. Un plan qui ne les déclare pas est jugé sur un plafond de 150 tours,
+le plus serré."
 
 _PLAN_SIZE_RULE_TEMPLATE="RÈGLE DE GROOMING (mika#2636) — tout plan porte une section \`## Taille estimée\`.
 Deux implements consécutifs sont morts au plafond de tours sur le seul critère du VOLUME de
@@ -3588,7 +3594,9 @@ du plafond de tours de CE ticket. Les deux s'appliquent, et LA PLUS SERRÉE MORD
 1. Le plafond de CE ticket est de __PLAN_SIZE_CEILING__ tours, et sa borne par vol vaut
    __PLAN_SIZE_FLIGHT_BOUND__ lignes estimées hors \`docs/\` : __PLAN_SIZE_FLIGHT_DERIVATION__.
    Sa provenance se lit sur le nombre : 200 tours vient du label \`loop-substrate\`, 150 est le
-   défaut de flotte. C'est ce que tu écris entre parenthèses sur la ligne \`Plafond de tours :\`.
+   défaut de flotte, et tout autre nombre vient d'une surcharge \`PILOT_MAX_TURNS\` — n'écris donc
+   un label entre parenthèses que si le nombre est bien celui qu'il porte. C'est cette parenthèse
+   qui va sur la ligne \`Plafond de tours :\`.
 2. La dérivation est ce qui rend la borne recalibrable, donc ÉCRIS-LA dans la section, telle
    qu'elle est donnée ci-dessus. Un nombre nu ne survit pas à la prochaine mesure de débit.
 3. Au-dessus de la borne, DÉCOUPE EN VOLS — pas en phases d'un même vol. Chaque vol est
@@ -3637,9 +3645,11 @@ toi-même : les deux nombres ci-dessus sont ceux de CE ticket, déjà résolus p
 # « / 2 », c'est-à-dire que la forme donnée au groomeur divergeait de la forme
 # qu'on lui demande d'écrire, dès la première ligne.
 _plan_size_rule() {
-    local _ceiling="${1:-}" _bound _ceil _derivation _rate _factor _tenth
+    local _ceiling="${1:-}" _bound _ceil _src _note _derivation _rate _factor _tenth
 
-    _plan_size_per_flight_bound "$_ceiling"; _bound="$_PLAN_SIZE_PER_FLIGHT_BOUND"; _ceil="$_PLAN_SIZE_PER_FLIGHT_CEILING"
+    _plan_size_per_flight_bound "$_ceiling"; _bound="$_PLAN_SIZE_PER_FLIGHT_BOUND" \
+        _ceil="$_PLAN_SIZE_PER_FLIGHT_CEILING" _src="$_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE" \
+        _note="$_PLAN_SIZE_PER_FLIGHT_NOTE"
 
     # Rien n'imprime ici — ni `printf` dans un `$( )`, ni helper imprimant : la
     # doctrine mika#2039 de ce bloc est « on assigne », et une fonction de mise
@@ -3656,6 +3666,29 @@ _plan_size_rule() {
     _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE//__PLAN_SIZE_CEILING__/$_ceil}"
     _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE//__PLAN_SIZE_FLIGHT_BOUND__/$_bound}"
     _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE//__PLAN_SIZE_FLIGHT_DERIVATION__/$_derivation}"
+
+    # UN PLAFOND ANORMAL EST DIT AU GROOMEUR, PAS SEULEMENT CALCULÉ. Le résolveur
+    # distingue deux anomalies ; les laisser dans leurs globales sans les rendre
+    # serait un diagnostic muet — et c'est le groomeur, pas l'opérateur, qui écrit
+    # la section. Le paragraphe part en DERNIER parce que la récence est le seul
+    # levier d'une consigne en fin de prompt (S13), et il n'existe que dans les
+    # deux cas anormaux : le nominal ne gagne pas une ligne.
+    if [ "$_note" = "ceiling_below_pipeline_floor" ]; then
+        _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE}
+
+ALERTE PLAFOND (mika#2693) — le plafond en vigueur, ${_ceil} tours, est sous le seul coût de
+l'orientation et de la fin de pipeline (${_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS} + ${_PLAN_SIZE_FLIGHT_TAIL_TURNS} tours). Il ne peut héberger AUCUNE
+implémentation, et c'est pourquoi la borne par vol ci-dessus vaut 0. N'écris pas un plan sous une
+borne de 0 : dis dans la section que le plafond en vigueur ne peut héberger aucun vol, et remonte-le
+à l'opérateur."
+    elif [ "$_src" = "disarmed_fallback" ]; then
+        _PLAN_SIZE_RULE="${_PLAN_SIZE_RULE}
+
+ALERTE PLAFOND (mika#2693) — le budget de tours de ce ticket est DÉSARMÉ : aucun plafond n'a été
+résolu, et les deux nombres ci-dessus sont ceux du repli fail-safe, ${_ceil} tours, le plus serré.
+Écris-les tels quels. Sur la ligne \`Plafond de tours :\`, la provenance est « repli fail-safe » —
+pas un label, et pas « défaut »."
+    fi
 }
 
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
