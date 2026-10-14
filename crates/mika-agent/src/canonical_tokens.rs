@@ -1678,6 +1678,145 @@ mod tests {
         );
     }
 
+    // ───── mika#2654 — la garde de promotion forcée sur tour webhook PR ─────
+
+    /// **Livrée vide, et `mika2654_lallowlist_du_nom_daudit_est_vide` l'assert.**
+    ///
+    /// Zéro violation existante, et c'est **mesuré** et non supposé : avant le
+    /// commit du scan, `grep -rn
+    /// 'deferred_dispatch_force_promote_refused_webhook_pr_turn' crates/` rendait
+    /// trois lignes, et aucune n'est un second écrivain de production — la
+    /// constante propriétaire, son épinglage sous `mod tests` (que
+    /// `production_sources_to_test_module` tronque) et une occurrence dans
+    /// `tests/eval/test_promote_deferred_webhook_pr_2654.rs` (que
+    /// `source_scan::is_test_source_path` écarte). Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction
+    /// (mika#2323). Quand le scan tire, **on fait passer le site par la
+    /// constante partagée**, on ne l'allowliste pas (doctrine mika#2201).
+    const FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Contrôle de bonne foi du scan ci-dessous, et il est dû.**
+    ///
+    /// Le prédicat est **exact** plutôt qu'en sous-chaîne, et un prédicat
+    /// resserré doit montrer qu'il mord encore — sans quoi il devient inerte en
+    /// silence (mika#2103 / mika#2205). L'anti-vacuité du scan ne le dit pas :
+    /// elle vérifie que le **propriétaire** porte le nom, pas qu'un **étranger**
+    /// serait vu.
+    ///
+    /// Les contrôles négatifs sont les formes réellement présentes dans l'arbre :
+    /// les **trois noms frères** de mika#1453, qui partagent le préfixe
+    /// `deferred_dispatch_force_promote` et vivent dans ce même fichier de
+    /// production, plus une mention en commentaire.
+    #[test]
+    fn mika2654_le_scan_du_nom_daudit_voit_un_second_site() {
+        let needle = format!(
+            "deferred_dispatch_force_promote{}",
+            "_refused_webhook_pr_turn"
+        );
+
+        assert!(
+            audit_name_literal_present(
+                &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
+                &needle
+            ),
+            "INVARIANT VIOLÉ : le prédicat ne voit plus un second écrivain de la \
+             ligne d'audit — le scan est devenu inerte et il se lirait exactement \
+             comme un arbre propre"
+        );
+
+        for benign in [
+            // Les trois frères de mika#1453, écrits par le MÊME fichier : ce
+            // sont eux qui rendraient un scan sur le préfixe partagé rouge à la
+            // naissance, et un lint rouge à la naissance se fait désarmer.
+            "        \"deferred_dispatch_force_promote_succeeded\",".to_string(),
+            "        \"deferred_dispatch_force_promote_rejected_slot_busy\",".to_string(),
+            "        \"deferred_dispatch_force_promote_override\",".to_string(),
+            // Une mention en commentaire.
+            format!("    // le nom `{needle}` vit dans tools/promote_deferred_callback.rs"),
+            // Le résidu de journal de cette garde — autre surface, autre nom.
+            "        warn!(event = \"promote_deferred_guard_audit_failed\");".to_string(),
+        ] {
+            assert!(
+                !audit_name_literal_present(&benign, &needle),
+                "faux positif du scan sur une ligne qui n'écrit pas la ligne \
+                 d'audit : {benign}"
+            );
+        }
+    }
+
+    /// **S1 (mika#2654)** — la propriété qui rend le compte de refus de
+    /// l'opérateur exact.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, la garde continuerait de refuser, et chaque assertion
+    /// de `tools::promote_deferred_callback::tests::mika2654` resterait verte —
+    /// y compris V4, qui compte les lignes d'une **session** et ne voit pas un
+    /// site qui écrit ailleurs. Ce qui deviendrait faux est le **compte**, et
+    /// c'est lui que la sonde S1 du § 11 lit pour décider si la garde mord.
+    ///
+    /// # La comparaison est EXACTE, et pas en sous-chaîne
+    ///
+    /// Reprise mot pour mot de la correction mesurée par mika#2649, puis
+    /// mika#2634, puis mika#2653 sur leurs propres scans jumeaux. Ici elle porte
+    /// dans les deux sens : le needle est le nom **entier** parce que les trois
+    /// frères de mika#1453 partagent son préfixe (un scan sur le préfixe serait
+    /// rouge à la naissance), et la comparaison est exacte parce qu'un nom
+    /// **étendant** celui-ci — la forme qu'a prise le résidu de la sœur — ne doit
+    /// pas compter comme un second écrivain.
+    #[test]
+    fn mika2654_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!(
+            "deferred_dispatch_force_promote{}",
+            "_refused_webhook_pr_turn"
+        );
+        let owner = "crates/mika-agent/src/tools/promote_deferred_callback.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2654 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2654 — le nom d'audit de la garde de promotion forcée a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `tools::promote_deferred_callback::FORCE_PROMOTE_TURN_GUARD_AUDIT_TOOL`. \
+             Ne PAS l'ajouter à FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS — le \
+             compte de la sonde n'est exact que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// **S2** — le pendant auto-nettoyant de
+    /// `FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS`.
+    #[test]
+    fn mika2654_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS est livrée vide et doit \
+             le rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     // ───── mika#2653 phase B — la vivacité d'un pilote a un lecteur unique ─────
 
     /// **Livrée vide, et le test plus bas l'assert.**
