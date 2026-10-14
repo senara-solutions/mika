@@ -3544,12 +3544,11 @@ _PLAN_SIZE_TOTAL_RE='^Total estimé[[:space:]]*:[[:space:]]*([0-9]+)([[:space:]]
 #
 # mika#2693 — les deux lignes de déclaration (`Plafond de tours :`, `Borne par
 # vol :`) vivent ici EN FORME, à chevrons, et jamais en valeur. Ce bloc est
-# interpolé à DEUX sites (S13-bis) : la règle du groomeur, qui connaît le
-# plafond du ticket, et le finding synthétique du rattrapage, qui ne le connaît
-# pas. Y figer `200` ou `431` ferait donc prescrire au second un plafond qu'il
-# n'a aucun moyen de vérifier — et un nombre faux dans une prescription de
-# format est pire qu'un chevron. Les valeurs arrivent par les placeholders du
-# gabarit de la règle, un cran plus bas. LES QUATRE PARAMÈTRES DE LA DÉRIVATION
+# interpolé à UN site (S13-bis), le gabarit de la règle ; le finding synthétique
+# du rattrapage remet la règle RENDUE, plafond du ticket compris. Y figer `200`
+# ou `431` ferait prescrire un plafond faux à tout ticket qui n'a pas ce label —
+# et un nombre faux dans une prescription de format est pire qu'un chevron. Les
+# valeurs arrivent par les placeholders du gabarit de la règle, un cran plus bas. LES QUATRE PARAMÈTRES DE LA DÉRIVATION
 # SONT À CHEVRONS POUR LA MÊME RAISON : la première rédaction les avait retapés
 # (`− 35 − 50) × 7,5 / 2`), et c'était un cinquième site de vérité que rien ne
 # tenait — un recalibrage aurait déplacé la formule de la règle, laissé celle du
@@ -8304,6 +8303,11 @@ _plan_size_retry_if_section_still_missing() {
     # accuserait donc le site — à juste titre : la valeur y serait celle d'un
     # appel antérieur.
     local _size_threshold; _plan_size_max_loc; _size_threshold="$_PLAN_SIZE_MAX_LOC"
+    # mika#2693 — la règle est RENDUE ici avec le plafond de CE ticket, comme au
+    # groom : les labels sont dans `LABELS`, que le lancement plus bas lit déjà.
+    # Remettre le seul format à chevrons laissait le pilote de révision sans
+    # plafond ni borne, donc libre de recopier l'exemple `200` de l'architecte.
+    local _size_rule; _pilot_max_turns "${LABELS:-}"; _plan_size_rule "$_PILOT_MAX_TURNS"; _size_rule="$_PLAN_SIZE_RULE"
     printf '%s\n' "FINDING SYNTHÉTIQUE — émis par dispatch-lib (mika#2636), pas par l'architecte.
 
 F-SIZE [BLOQUANT] — la section \`## Taille estimée\` que la première passe
@@ -8315,14 +8319,10 @@ au second passage architecte, où le Plan-Size Gate est SANS RECOURS
 ESCALATE et le ticket ne sera jamais implémenté.
 
 Action demandée, et elle seule : ajouter au plan une section \`## Taille estimée\`
-au format exact ci-dessous — titre, tableau par livrable, puis la ligne de total.
+en suivant la règle ci-dessous : format, seuil par PR (${_size_threshold} lignes) et
+borne par vol de CE ticket.
 
-${_PLAN_SIZE_FORMAT_SPEC}
-
-Au-dessus de ${_size_threshold} lignes, DÉCOUPE EN PHASES : borne le périmètre de cette
-PR sous le seuil et renvoie explicitement la suite à un ticket de suivi ou à une
-phase nommée. Deux implements consécutifs sont morts au plafond de tours sur ce
-seul critère (mika#2161, mika#2633) ; chacun a coûté un pilote entier.
+${_size_rule}
 
 Ne touche à rien d'autre du plan." > "$size_findings_file" 2>/dev/null || {
         echo "WARN: plan_size_retry_findings_unwritable: cannot write $size_findings_file — skipping retry" >&2

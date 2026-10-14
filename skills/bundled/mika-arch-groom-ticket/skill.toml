@@ -10,7 +10,10 @@ timeout_secs = 120
 # bytes, 99 % of the 16 KiB default, past the 95 % warn gate (mika#852). Raised
 # to 24 KiB: headroom for one more rule, well under the 80 KiB ceiling. The
 # declared size costs nothing — the real size is injected.
-max_prompt_size = 24576
+# mika#2693 — the per-flight bound rule brought the prompt to 24 099 bytes,
+# 98 % of 24 KiB, past the warn gate again. Raised to 32 KiB on the same
+# reasoning.
+max_prompt_size = 32768
 
 [triggers]
 keywords = [
