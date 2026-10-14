@@ -1753,6 +1753,10 @@ pub(super) async fn run_agent_for_message(
     // `ci_success_handler` : la classe (b) n'admet qu'un texte touché par lui
     // seul (son pré-digest DECISION-CORE ne dit rien de nouveau au modèle).
     let mut text_around_ci: Option<(String, String)> = None;
+    // mika#2683 — idem autour du `ci_failure_handler` : ses sorties terminales
+    // ENRICHISSENT parfois le texte (`surface_for_adoption`), donc les classes
+    // de la phase 4 n'admettent qu'un texte touché par lui seul.
+    let mut text_around_ci_failure: Option<(String, String)> = None;
 
     // Structural verdict handler: intercept PR review webhooks before
     // the LLM turn and act on VERDICT: pass deterministically (#524).
@@ -1854,6 +1858,7 @@ pub(super) async fn run_agent_for_message(
         // Structural CI failure handler: intercept check_suite.completed(failure|timed_out)
         // webhooks, gather failure context, and prepare dispatch pre-digest (#594).
         // Order-independent — self-selects on failure/timed_out conclusions.
+        let text_before_ci_failure = req.text.clone();
         let ci_failure_action = ci_failure_handler::try_handle_ci_failure(
             &req.text,
             &a.db,
@@ -1877,6 +1882,7 @@ pub(super) async fn run_agent_for_message(
             // Only the ready-label handler returns Dispatched (mika#1572).
             VerdictAction::Dispatched { .. } => {}
         }
+        text_around_ci_failure = Some((text_before_ci_failure, req.text.clone()));
 
         // Structural ready-label dispatch handler (mika#1384): intercepts
         // `[GitHub] Issue labeled ready on …` webhooks and pre-resolves every
@@ -2021,6 +2027,9 @@ pub(super) async fn run_agent_for_message(
                 by_any_handler: req.text != *original,
                 after_verdict_handler: text_after_verdict.as_ref().is_none_or(|t| req.text != *t),
                 outside_ci_success_handler: text_around_ci
+                    .as_ref()
+                    .is_none_or(|(before, after)| before != original || req.text != *after),
+                outside_ci_failure_handler: text_around_ci_failure
                     .as_ref()
                     .is_none_or(|(before, after)| before != original || req.text != *after),
             },

@@ -281,9 +281,9 @@ See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capabi
 
 ### Calibration CI Workflow (#742)
 
-`.github/workflows/eval-calibration.yml` — Weekly scheduled workflow that keeps the committed baseline (`tests/fixtures/eval-baseline.json`) trustworthy by detecting provider tolerance drift.
+`.github/workflows/eval-calibration.yml` — On-demand workflow (weekly cron removed, see **Schedule** below) that keeps the committed baseline (`tests/fixtures/eval-baseline.json`) trustworthy by detecting provider tolerance drift.
 
-**Schedule:** Mondays 08:00 UTC (cron) + `workflow_dispatch` for on-demand runs.
+**Schedule: `workflow_dispatch` only — the cron was removed by mika#2683 (D2).** It had failed 17/17 runs from 2026-06-22 to 2026-10-12 (`--ignored` and `--include-ignored` passed together, masked by `|| true`), so it never produced an artifact, and each Monday its red `check_suite` on `main` cost mika-dev an LLM turn. Fixing the flag alone would have turned "fails before any call" into "calls four real providers every Monday" (~$2.57/run, ~$150/yr) — a recurring spend, hence an operator decision. The flag **is** fixed; rearming the cron is three lines of YAML, documented in the workflow's own header, and gated on that decision being recorded on mika#2683. Until then, provider-tolerance drift detection is on demand.
 
 **How it works:**
 1. Runs full calibration matrix (`MIKA_EVAL_REAL_PROVIDERS=all`, `MIKA_EVAL_CALIBRATE=1`)
@@ -308,7 +308,7 @@ See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capabi
 
 **Rolling back a merged baseline:** `git revert <merge-sha>` on the baseline-update PR. The next weekly run will re-detect the drift and open a fresh PR.
 
-**Cost:** ~$2.57/run (four providers × full scenario matrix). Annual: ~$150 (52 weekly + ~10 manual runs). Bounded by 30-minute workflow timeout.
+**Cost:** ~$2.57/run (four providers × full scenario matrix). Annual **if the cron is rearmed**: ~$150 (52 weekly + ~10 manual runs) — that figure is the budget decision mika#2683 defers to the operator. With `workflow_dispatch` only, the spend is ~$2.57 per deliberate run. Bounded by 30-minute workflow timeout.
 
 ## Knowledge Graph — Domain Graph Builder
 

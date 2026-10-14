@@ -92,7 +92,42 @@ const MAX_CI_FIX_COUNT: u64 = 2;
 /// rather than a number two sites can disagree about — and the count is the
 /// explicit precondition of the auto-adoption decision AC3 defers ("until we
 /// have enough n").
-const SURFACE_FOR_ADOPTION_TOOL: &str = "surface_for_adoption";
+/// `pub(crate)` depuis mika#2683 : `webhook_prefilter` **lit** cette ligne
+/// d'audit pour savoir que le signalement a déjà eu lieu, et doit nommer
+/// l'outil par la constante. La propriété SOLE WRITER porte sur le **littéral**
+/// et non sur l'identifiant — élargir la visibilité n'élargit pas l'écriture.
+pub(crate) const SURFACE_FOR_ADOPTION_TOOL: &str = "surface_for_adoption";
+
+/// `audit_events.tool_name` d'une sortie terminale du handler : il a décidé, en
+/// code, qu'il n'y avait rien à faire — et rien à dire au modèle non plus
+/// (mika#2683, volet (c)).
+///
+/// **SOLE WRITER**, tenu par
+/// `canonical_tokens::tests::mika2683_the_no_action_name_has_a_single_writer`.
+/// C'est la trace durable que `webhook_prefilter` lit pour écarter le tour : si
+/// un second site pouvait l'écrire, la porte écarterait un tour sur une
+/// décision qui n'est pas celle-là.
+///
+/// Les sorties qui **informent** le modèle d'un état qu'il doit prendre en
+/// compte (jeton GitHub absent, état de la forge illisible, correctif déjà en
+/// vol, escalade) n'écrivent délibérément **aucune** ligne ici : c'est l'absence
+/// de ligne qui leur garde leur tour.
+pub(crate) const CI_FAILURE_NO_ACTION_TOOL: &str = "ci_failure_no_action";
+
+/// Étape 3 : aucune PR ouverte pour la branche. `after_value` — un format de
+/// fil lu par des `GROUP BY`, épinglé par test.
+pub(crate) const CI_FAILURE_NO_ACTION_NO_OPEN_PR: &str = "no_open_pr";
+
+/// Étape 5 : une tâche existe pour la PR, hors `in_progress`. Idem, format de
+/// fil.
+pub(crate) const CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS: &str = "task_not_in_progress";
+
+/// `audit_events.tool_name` des deux sorties où le handler a **agi**. Nommées
+/// par constante parce que `webhook_prefilter` les lit pour refuser d'écarter un
+/// tour : un nom recopié dans le second fichier serait la divergence que
+/// mika#2158 et mika#2362 ont déjà payée.
+pub(crate) const CI_FAILURE_HANDLED_TOOL: &str = "ci_failure_handled";
+pub(crate) const CI_FAILURE_ESCALATED_TOOL: &str = "ci_failure_escalated";
 
 /// Dedup window for a surface-for-adoption signal, keyed `(repo, PR, head_sha)`.
 ///
@@ -126,10 +161,12 @@ const SURFACE_SKIP_UNREADABLE_HEAD_SHA: &str = "unreadable_head_sha";
 // `ALL_SURFACE_SKIP_MOTIVES` — see its comment for why it is not here.
 
 /// Parsed fields from a gateway-formatted check_suite failure/timed_out event.
+/// Les champs sont `pub(crate)` depuis mika#2683 : `webhook_prefilter::classify`
+/// lit cette grammaire plutôt que d'en dupliquer une.
 pub(crate) struct CheckSuiteFailureEvent {
-    repo: String,
-    branch: String,
-    conclusion: String,
+    pub(crate) repo: String,
+    pub(crate) branch: String,
+    pub(crate) conclusion: String,
 }
 
 /// Parse the gateway-formatted check_suite failure or timed_out event text.
@@ -170,6 +207,50 @@ pub(crate) fn parse_check_suite_failure(text: &str) -> Option<CheckSuiteFailureE
         branch: branch.to_string(),
         conclusion: conclusion.to_string(),
     })
+}
+
+/// Clé d'une `check_suite` de branche dans l'audit : `check_suite:{repo}@{branch}`.
+/// Écrite par [`log_no_action`], relue telle quelle par le pré-filtre — une
+/// seule forme, sur le modèle de `ci_success_handler::head_key` (mika#2683).
+///
+/// Pourquoi une fonction et pas un `format!` à chaque site : `webhook_queue_v2`
+/// construit `check_suite:{repo}:{branch}` — deux-points, pas arobase — pour un
+/// autre usage. Les deux formes ne se distinguent qu'à un caractère, et c'est
+/// l'arobase qui fait que le pré-filtre retrouve la ligne du handler. Une forme
+/// de clé retapée dans un second fichier est la classe de divergence que
+/// mika#2683 évite déjà pour les noms machine (mika#2158, mika#2362).
+pub(crate) fn branch_key(repo: &str, branch: &str) -> String {
+    format!("check_suite:{repo}@{branch}")
+}
+
+/// Write the durable trace of a terminal "nothing to do" exit — the SOLE WRITER
+/// of [`CI_FAILURE_NO_ACTION_TOOL`] (mika#2683).
+///
+/// A write failure is named and the flow continues: the missing line only makes
+/// the LLM turn happen, which is the pre-mika#2683 behaviour. Fail-safe towards
+/// the model, like every other term of the prefilter.
+async fn log_no_action(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    target: &str,
+    motive: &str,
+    detail: &str,
+) {
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            CI_FAILURE_NO_ACTION_TOOL,
+            target,
+            None,
+            Some(motive),
+            Some(detail),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, motive, "Failed to log ci_failure_no_action audit event");
+    }
 }
 
 /// Attempt to handle a CI failure event structurally before the LLM turn.
@@ -245,8 +326,23 @@ pub async fn try_handle_ci_failure(
                 branch = %event.branch,
                 "CI failure but no open PR for branch — ignoring"
             );
+            log_no_action(
+                db,
+                session_id,
+                trace_id,
+                &branch_key(&event.repo, &event.branch),
+                CI_FAILURE_NO_ACTION_NO_OPEN_PR,
+                &format!(
+                    "trigger=check_suite_{} repo={} branch={}",
+                    event.conclusion, event.repo, event.branch
+                ),
+            )
+            .await;
             return VerdictAction::Passthrough { enrichment: None };
         }
+        // Pas de ligne `ci_failure_no_action` ici, délibérément : l'état de la
+        // forge est illisible, ce n'est pas « rien à faire ». Son absence est ce
+        // qui garde son tour LLM (mika#2683, volet (c)).
         Err(e) => {
             warn!(
                 error = %e,
@@ -288,6 +384,18 @@ pub async fn try_handle_ci_failure(
             status = %task.status,
             "CI failure but task not in_progress — passing through"
         );
+        log_no_action(
+            db,
+            session_id,
+            trace_id,
+            &format!("task:{}", task.id),
+            CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS,
+            &format!(
+                "trigger=check_suite_{} pr_url={pr_url} status={}",
+                event.conclusion, task.status
+            ),
+        )
+        .await;
         return VerdictAction::Passthrough { enrichment: None };
     }
 
@@ -323,7 +431,7 @@ pub async fn try_handle_ci_failure(
         if let Err(e) = db
             .log_audit_event(
                 session_id,
-                "ci_failure_escalated",
+                CI_FAILURE_ESCALATED_TOOL,
                 &format!("task:{}", task.id),
                 Some(&task.status),
                 None,
@@ -414,7 +522,7 @@ pub async fn try_handle_ci_failure(
     if let Err(e) = db
         .log_audit_event(
             session_id,
-            "ci_failure_handled",
+            CI_FAILURE_HANDLED_TOOL,
             &format!("task:{}", task.id),
             Some(&task.status),
             None,
