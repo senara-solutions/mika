@@ -941,6 +941,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // mika#2519 — same gesture, same reason, for the verdict↔dependabot gate.
     crate::evidence::guards::log_dependabot_verdict_gate_state();
 
+    // mika#2687 — same gesture again, for the verdict↔guard-citation gate. Its
+    // STOP is `MIKA_PIPELINE_GROUNDING_GATE=0` + restart, and an operator who
+    // pulled it needs the boot log to say so: a `block[pipeline]` that goes out
+    // ungrounded is then the declared state, not a regression.
+    crate::evidence::guards::log_pipeline_grounding_gate_state();
+
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
         warn!(
@@ -5705,6 +5711,7 @@ mod tests {
             by_any_handler: touched,
             after_verdict_handler: touched,
             outside_ci_success_handler: touched,
+            outside_ci_failure_handler: touched,
         }
     }
 
@@ -5751,8 +5758,9 @@ mod tests {
             format!("[GitHub] PR review_requested: {pr}\nRequested reviewer: @mika-platform-qa"),
             format!("[GitHub] PR closed: {pr}\nMerged: false"),
             format!("[GitHub] PR closed: {pr}\nMerged: true"),
-            "[GitHub] Check suite failure on senara-solutions/mika (branch: main)".into(),
-            "[GitHub] Check suite timed_out on senara-solutions/mika (branch: main)".into(),
+            // Les `check_suite` ROUGES sur `main` sont sorties de cette liste
+            // avec mika#2683 : elles ont leur propre classe, et leurs propres
+            // tests (`mika2683_a_*`).
             "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)".into(),
             "[GitHub] New comment on senara-solutions/mika#2675 (t) by @samidarko\nhttps://x\n\nrelance le groom".into(),
             "[GitHub] Issue labeled ready on senara-solutions/mika#2675 — t\nhttps://x\nLabeled by: @samidarko".into(),
@@ -5917,6 +5925,7 @@ mod tests {
             by_any_handler: true,
             after_verdict_handler: after,
             outside_ci_success_handler: true,
+            outside_ci_failure_handler: true,
         };
         assert!(!webhook_prefilter::skip_turn(&db, &live, &text, touched(true), "r", true).await);
         assert!(webhook_prefilter::skip_turn(&db, &live, &text, touched(false), "r", true).await);
@@ -6038,6 +6047,7 @@ mod tests {
             by_any_handler: true,
             after_verdict_handler: true,
             outside_ci_success_handler: o,
+            outside_ci_failure_handler: true,
         };
         for (stub, touched, enabled, skipped) in [
             (decided(), outside(false), true, true),
@@ -6057,5 +6067,167 @@ mod tests {
                 webhook_prefilter::skip_turn(&db, &stub, GREEN_PR, touched, "r", enabled).await;
             assert_eq!(got, skipped, "{touched:?} / enabled={enabled}");
         }
+    }
+
+    // ---- mika#2683 — les sorties « rien à faire » du CI failure handler ---
+    //
+    // Les textes sont ceux que le gateway a réellement délivrés : la
+    // `check_suite` rouge de « Eval Calibration » sur `main` le 2026-10-12 à
+    // 17:25Z, et celle de la PR dependabot mika#2682 à 22:12:58Z.
+
+    const MIKA2683_RED_MAIN: &str =
+        "[GitHub] Check suite failure on senara-solutions/mika (branch: main)";
+    const MIKA2683_TIMED_OUT_MAIN: &str =
+        "[GitHub] Check suite timed_out on senara-solutions/mika (branch: main)";
+
+    /// AC(a) — `check_suite` rouge sur `main`, sans tâche active : zéro appel au
+    /// modèle, une ligne d'audit de la classe.
+    #[tokio::test]
+    async fn mika2683_a_check_suite_rouge_sur_main_aucun_appel_llm() {
+        for text in [MIKA2683_RED_MAIN, MIKA2683_TIMED_OUT_MAIN] {
+            let (state, mock) = mika2675_state();
+            mika2675_run_on(&state, text).await;
+            assert_eq!(mock.calls_made(), 0, "{text}");
+            assert_eq!(
+                mika2675_skipped_classes(&state).await,
+                vec![Some("red_check_suite_default_branch".to_string())],
+                "{text}"
+            );
+        }
+    }
+
+    /// AC(a), contrôle négatif du terme d'état : une tâche active sur `main` est
+    /// un état que le modèle doit prendre en compte — le tour a lieu.
+    #[tokio::test]
+    async fn mika2683_a_tache_active_sur_main_le_tour_a_lieu() {
+        let (state, mock) = mika2675_state();
+        mika2675_seed_task(&state, r#"{"claude_pilot":{"branch":"main"}}"#).await;
+        mika2675_run_on(&state, MIKA2683_RED_MAIN).await;
+        assert!(mock.calls_made() >= 1);
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    // ---- volet (c) : les sorties terminales de l'étape 3 et suivantes ----
+    //
+    // `try_handle_ci_failure` ne peut atteindre ses étapes 3 à 5 sans `gh` —
+    // `mika2675_state` retire le jeton délibérément (voir l'en-tête de cette
+    // section). Les lignes que le handler y écrit sont donc POSÉES en base,
+    // sous le `trace_id` qu'il aurait utilisé (le `request_id` du tour). Le
+    // reste du chemin est le chemin réel : `run_agent_for_message`, la porte,
+    // `LiveState`, la base, et le compteur du LLM bouchonné. C'est exactement
+    // le montage que la phase 3 a établi pour `mika2675_seed_hold`.
+    //
+    // Que la notification et la ligne d'audit `surface_for_adoption` soient
+    // INCHANGÉES n'est pas réasserté ici : c'est la propriété des tests
+    // `mika1745_t*` de `ci_failure_handler.rs`, qui appellent la fonction
+    // directement et sont restés intacts dans cette PR. Ce test-ci porte la
+    // moitié que ceux-là ne peuvent pas voir : une fois cette ligne écrite,
+    // l'événement ne coûte plus de tour.
+
+    /// Le texte réel de la `check_suite` rouge de la PR dependabot mika#2682.
+    /// Le suffixe de hachage de la branche groupée est élidé : rien sur le
+    /// chemin ne le lit, seul compte « ce n'est pas la branche par défaut ».
+    const MIKA2683_RED_PR: &str = "[GitHub] Check suite failure on \
+         senara-solutions/mika (branch: dependabot/cargo/cargo-minor-patch)";
+
+    /// Pose une ligne terminale du handler sous le `trace_id` de l'événement.
+    async fn mika2683_seed_handler_line(state: &AppState, tool: &str, target: &str, after: &str) {
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        db.log_audit_event(
+            "s",
+            tool,
+            target,
+            None,
+            Some(after),
+            None,
+            Some(MIKA2675_RID),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// AC(c) — branche de PR sans tâche : le handler a signalé pour adoption
+    /// (notifié et audité en code), il ne reste rien à décider au modèle.
+    #[tokio::test]
+    async fn mika2683_c_pr_sans_tache_signalee_pour_adoption_aucun_appel_llm() {
+        let (state, mock) = mika2675_state();
+        mika2683_seed_handler_line(
+            &state,
+            ci_failure_handler::SURFACE_FOR_ADOPTION_TOOL,
+            "pr:senara-solutions/mika#2682@abc123",
+            "failure",
+        )
+        .await;
+        mika2675_run_on(&state, MIKA2683_RED_PR).await;
+        assert_eq!(mock.calls_made(), 0);
+        assert_eq!(
+            mika2675_skipped_classes(&state).await,
+            vec![Some("ci_failure_surfaced_for_adoption".to_string())]
+        );
+    }
+
+    /// AC(c) — les deux autres sorties terminales, chacune sous sa classe.
+    #[tokio::test]
+    async fn mika2683_c_les_sorties_terminales_de_letape_3_aucun_appel_llm() {
+        for (motive, class) in [
+            (
+                ci_failure_handler::CI_FAILURE_NO_ACTION_NO_OPEN_PR,
+                "ci_failure_no_open_pr",
+            ),
+            (
+                ci_failure_handler::CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS,
+                "ci_failure_task_not_in_progress",
+            ),
+        ] {
+            let (state, mock) = mika2675_state();
+            mika2683_seed_handler_line(
+                &state,
+                ci_failure_handler::CI_FAILURE_NO_ACTION_TOOL,
+                "check_suite:senara-solutions/mika@dependabot/cargo/cargo-minor-patch",
+                motive,
+            )
+            .await;
+            mika2675_run_on(&state, MIKA2683_RED_PR).await;
+            assert_eq!(mock.calls_made(), 0, "{motive}");
+            assert_eq!(
+                mika2675_skipped_classes(&state).await,
+                vec![Some(class.to_string())],
+                "{motive}"
+            );
+        }
+    }
+
+    /// AC(c) — branche de PR AVEC tâche `in_progress` : le handler a dispatché
+    /// un correctif, c'est un état que le modèle doit prendre en compte. Le
+    /// chemin de dispatch est inchangé — le tour a lieu, aucune ligne de skip.
+    #[tokio::test]
+    async fn mika2683_c_pr_avec_tache_in_progress_le_tour_a_lieu() {
+        let (state, mock) = mika2675_state();
+        mika2675_seed_task(
+            &state,
+            r#"{"claude_pilot":{"branch":"dependabot/cargo/cargo-minor-patch"}}"#,
+        )
+        .await;
+        mika2683_seed_handler_line(
+            &state,
+            ci_failure_handler::CI_FAILURE_HANDLED_TOOL,
+            "task:1",
+            "dispatched",
+        )
+        .await;
+        mika2675_run_on(&state, MIKA2683_RED_PR).await;
+        assert!(mock.calls_made() >= 1);
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    /// Contrôle négatif du volet (c) : sans ligne terminale, le tour a lieu.
+    /// Sans lui, « la porte lit la trace » serait indistinguable de « la porte
+    /// coupe tout ce qui est rouge hors branche par défaut ».
+    #[tokio::test]
+    async fn mika2683_c_sans_ligne_terminale_le_tour_a_lieu() {
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2683_RED_PR).await;
+        assert!(mock.calls_made() >= 1);
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
     }
 }

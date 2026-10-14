@@ -4029,6 +4029,181 @@ async fn validate_pr_review_flag_coherence(
     Err(ToolOutput::error(body.to_string()))
 }
 
+/// Refuse a `gh pr review` whose verdict is `block[pipeline]` while its body
+/// cites no guard that actually ran and exited non-zero (mika#2687).
+///
+/// # What gates it
+///
+/// Four fail-open terms, in this order: the gate
+/// (`MIKA_PIPELINE_GROUNDING_GATE`), a readable `--body`, a verdict inside the
+/// population, and the pure predicate. Any term the guard cannot read is a
+/// **pass**, never a refusal — same arithmetic as mika#2455 and mika#2519: a
+/// false negative leaves today's already-paid cost in place, a false positive
+/// makes a legitimate review impossible to post **and** pushes a genuinely
+/// broken PR across the merge gate.
+///
+/// Deliberately **not** gated on `required_tool_arg_suffixes`, like its three
+/// siblings: its subject is the body itself, not the active skill.
+///
+/// # Why the population is only `block[pipeline]`
+///
+/// That is the class mika#2685 measured, and the only one whose grounding has a
+/// named, executable source of truth (`scripts/verify-pipeline.sh` and the
+/// `PIPELINE:` section Step 2E prescribes). `block[ac]`, `block[ci]`,
+/// `block[security]` and `block[dependency]` are grounded in other evidence,
+/// each of which would need its own measurement. Everything outside the
+/// population traverses intact.
+///
+/// # Which way it fails
+///
+/// Audit-wise it does not fail at all: a row is written on **all three**
+/// outcomes, including `Allowed`. An `audit_events` table empty of
+/// `pipeline_grounding_guard` says the link is unreached, not that it refuses
+/// nothing (mika#2205 positive control).
+async fn validate_pipeline_block_grounding(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    validate_pipeline_block_grounding_gated(
+        crate::evidence::guards::pipeline_grounding_gate_enabled(),
+        args,
+        repo,
+        ctx,
+    )
+    .await
+}
+
+/// The body of the guard, with the gate passed as a **fact** rather than read.
+///
+/// Same convention as [`crate::evidence::guards::classify_dependabot_verdict`],
+/// which takes `verdict_is_pipeline_block: bool` rather than the `Verdict`: the
+/// decision point stays testable without the resolver. Here the resolver is an
+/// env var cached in a `OnceLock` — resolved once per process, by construction —
+/// so a test that wanted to exercise the disarmed branch by setting the
+/// variable would depend on being the first test in the binary to touch it.
+/// Passing the bit instead makes both branches deterministic, and keeps exactly
+/// one site reading the environment.
+async fn validate_pipeline_block_grounding_gated(
+    gate_enabled: bool,
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    use crate::evidence::guards::{
+        PIPELINE_GROUNDING_AUDIT_TOOL, PipelineGroundingOutcome, classify_pipeline_block_grounding,
+        pr_review_target,
+    };
+    use crate::server::verdict::{Verdict, parse_verdict};
+
+    if !gate_enabled {
+        return Ok(());
+    }
+
+    let Some(body) = extract_pr_review_body(args) else {
+        return Ok(());
+    };
+
+    // Read the verdict class **exactly as `verdict_handler` reads it** —
+    // case-folded, no `trim`. A guard stricter than the consumer it protects
+    // would abstain on the very forms the consumer acts upon
+    // (`guard-parser-must-be-as-permissive-as-downstream-consumer`).
+    let verdict_is_pipeline_block = matches!(
+        parse_verdict(&body),
+        Verdict::Block(ref kind) if kind.eq_ignore_ascii_case("pipeline")
+    );
+    if !verdict_is_pipeline_block {
+        return Ok(());
+    }
+
+    let target = pr_review_target(args).unwrap_or_else(|| "unknown".to_string());
+    let target_key = format!("pr_review:{}#{}", repo.unwrap_or("__default__"), target);
+
+    // Audit writes are warn-and-continue throughout: losing the ledger row must
+    // not change the guard's verdict in either direction.
+    async fn audit(ctx: &ToolContext<'_>, target_key: &str, outcome: &str, reasoning: &str) {
+        if let Err(e) = ctx
+            .db
+            .log_audit_event(
+                ctx.session_id,
+                PIPELINE_GROUNDING_AUDIT_TOOL,
+                target_key,
+                None,
+                Some(outcome),
+                Some(reasoning),
+                Some(ctx.trace_id),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to write pipeline-grounding audit row");
+        }
+    }
+
+    let (reason, reasoning) = match classify_pipeline_block_grounding(true, &body) {
+        PipelineGroundingOutcome::Allowed => {
+            // The positive control, and the reason this branch writes a row
+            // rather than returning early: a population of zero allowed calls
+            // is how a guard that never runs looks exactly like a guard that
+            // never has to refuse (mika#2205).
+            audit(
+                ctx,
+                &target_key,
+                "allowed",
+                "block[pipeline] carries a PIPELINE: section citing a guard that exited non-zero",
+            )
+            .await;
+            return Ok(());
+        }
+        PipelineGroundingOutcome::RefusedSectionAbsent => (
+            "section_absent",
+            "block[pipeline] with no PIPELINE: section anywhere in the body",
+        ),
+        PipelineGroundingOutcome::RefusedNoFailingGuardCited => (
+            "no_failing_guard_cited",
+            "block[pipeline] whose PIPELINE: section cites no guard at a non-zero exit",
+        ),
+    };
+
+    tracing::warn!(
+        event = "pipeline_block_refused",
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        target = %target_key,
+        verdict = "block[pipeline]",
+        reason = %reason,
+        "refused a block[pipeline] review that cites no guard actually run and failed (mika#2687)"
+    );
+    audit(ctx, &target_key, "refused", reasoning).await;
+
+    // The remedy names BOTH correct ways out, like its mika#2237 neighbour and
+    // for the same reason: naming only "add the section" would push the model
+    // to fabricate a section under the verdict it already chose, which is the
+    // measured defect with one more step. The guard cannot adjudicate which
+    // verdict is right, so it says what evidence a `block[pipeline]` is made of
+    // and leaves the choice.
+    //
+    // No line of this text may START with the verdict label: `VERDICT_RE` is
+    // anchored on that line prefix, and a stray line would be re-read as a
+    // verdict by the next consumer of this payload. The tokens are named in
+    // plain prose for that reason.
+    let body = serde_json::json!({
+        "error": "pipeline_block_ungrounded",
+        "doctrine": "mika#2687",
+        "target": target_key,
+        "reason": reason,
+        "remedy": "A block[pipeline] verdict is made of one thing only: a pipeline guard that \
+                   actually ran and exited non-zero. There are exactly two correct ways out. \
+                   (a) Run the repository's pipeline guard as Step 2B prescribes and post its \
+                   PIPELINE: section verbatim — each guard, its exit code, and its output as \
+                   printed. (b) If no guard rejected anything, then the pipeline is not what is \
+                   wrong: the verdict is pass, hold[review], or block[ac] per the other steps. \
+                   Do not restate a rule a guard already carries, and do not write a PIPELINE: \
+                   section from memory — the guard's own output is the only evidence this gate \
+                   accepts.",
+    });
+    Err(ToolOutput::error(body.to_string()))
+}
+
 /// Refuse a `gh pr review` whose body says `VERDICT: pass` while a **required**
 /// check is red on the PR's head (mika#2455).
 ///
@@ -4974,6 +5149,27 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // its subject is the body itself (see the function's docs, D1).
     if let Err(err) =
         validate_pr_review_flag_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
+        return err;
+    }
+
+    // Verdict↔guard-citation coherence (mika#2687): refuse a `block[pipeline]`
+    // whose body carries no `PIPELINE:` section, or one citing no guard at a
+    // non-zero exit. Placed immediately after mika#2237 and BEFORE mika#2455,
+    // because it is the last link in the chain that reads neither the network
+    // nor the database — the chain runs from the most local to the most
+    // committing, and spending a `gh pr checks` on a review this link is about
+    // to refuse would be paying for a decision already taken.
+    //
+    // Upstream of mika#2519 on purpose. On a dependabot PR carrying a
+    // sectionless `block[pipeline]`, both guards would refuse; this one answers
+    // first, names the nearer cause (the missing evidence rather than the
+    // author), and needs no network read to do it. mika#2519's B1 remains the
+    // sole guard for a section that is present AND grounded by an automated
+    // author. Like its three siblings it is NOT gated on
+    // `required_tool_arg_suffixes`: its subject is the body itself.
+    if let Err(err) =
+        validate_pipeline_block_grounding(&gh_args.args, gh_args.repo.as_deref(), ctx).await
     {
         return err;
     }
@@ -13189,5 +13385,205 @@ mod mika2667_dispatcher_review_tests {
             );
         }
         assert_eq!(refusals(&h).await, 0);
+    }
+}
+
+/// Layer B — the wiring. Without it, a predicate that decides well would stay
+/// compatible with a guard nobody calls (mika#2687).
+#[cfg(test)]
+mod mika2687_pipeline_grounding_tests {
+    use super::{run_gh, validate_pipeline_block_grounding_gated};
+    use crate::evidence::guards::PIPELINE_GROUNDING_AUDIT_TOOL;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    const REPO: &str = "senara-solutions/mika";
+    const TARGET: &str = "pr_review:senara-solutions/mika#2685";
+    const SINCE: &str = "1970-01-01T00:00:00Z";
+
+    /// Review 2 on mika#2685, `0a53b5f0`, 2026-10-13 17:03Z — no `PIPELINE:`
+    /// section, and a reason `verify-pipeline.sh` does not carry.
+    const MEASURED_BODY: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\npipeline-exempt label \
+                                 present but PR contains non-docs files (Cargo.lock, deny.toml), \
+                                 so label bypass does not apply.\n";
+
+    /// The blocking shape Step 2E prescribes — a guard that ran and refused.
+    const GROUNDED_BODY: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\nPIPELINE: block \
+                                 (mika)\n- scripts/verify-pipeline.sh → exit 1\n  \
+                                 [pipeline-exempt: none] REJECT: code-only PR: source changes \
+                                 present but no plan/solution doc\n  Verification FAILED: 1 \
+                                 missing artifact(s).\n";
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The per-session dedup map (mika#821), which `run_gh` `debug_assert!`s on
+    /// for any production `pr review` call — our link sits downstream of that
+    /// assertion, so a `run_gh`-level test has to carry one. Empty: seeding it
+    /// would make the mika#821 guard answer first and never reach ours.
+    type PostedMap = std::sync::Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>;
+
+    fn posted_map() -> PostedMap {
+        std::sync::Arc::new(dashmap::DashMap::new())
+    }
+
+    /// Rows this guard wrote for one outcome. Read on `after_value` rather than
+    /// counted on the tool name alone: the operator probe of § Observabilité is
+    /// a `GROUP BY target_key, after_value`, and a test that only counted rows
+    /// would stay green on a guard that wrote the wrong outcome.
+    async fn rows(h: &TestHarness, outcome: &str) -> usize {
+        h.db.get_audit_events("test-session")
+            .await
+            .expect("get_audit_events")
+            .iter()
+            .filter(|e| {
+                e.tool_name == PIPELINE_GROUNDING_AUDIT_TOOL
+                    && e.target_key == TARGET
+                    && e.after_value.as_deref() == Some(outcome)
+            })
+            .count()
+    }
+
+    /// The whole population, whatever the outcome — so an assertion of "no row"
+    /// cannot be satisfied by a row carrying an outcome the test forgot.
+    async fn all_rows(h: &TestHarness) -> i64 {
+        h.db.count_recent_audit_events_for_target(PIPELINE_GROUNDING_AUDIT_TOOL, TARGET, SINCE)
+            .await
+            .unwrap()
+    }
+
+    /// The refusal reaches the caller, and it reaches it **before any
+    /// subprocess**: `run_gh` returns the structured error without spawning
+    /// `gh`. That is the whole reason the guard lives in this chain rather than
+    /// in `verdict_handler` — by the time a post-publication arm ran, the PR
+    /// would already carry its `changes_requested`.
+    #[tokio::test]
+    async fn the_measured_body_is_refused_before_any_subprocess() {
+        let h = TestHarness::with_agent("mika-qa");
+        let posted = posted_map();
+        let mut ctx = h.ctx();
+        ctx.pr_reviews_posted = Some(&posted);
+        let out = run_gh(
+            &serde_json::json!({
+                "command": ["pr", "review", "2685", "--comment", "--body", MEASURED_BODY],
+                "repo": REPO,
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("pipeline_block_ungrounded"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("mika#2687"), "{}", out.content);
+        assert_eq!(rows(&h, "refused").await, 1, "the refusal leaves one row");
+    }
+
+    /// The remedy names BOTH ways out, and carries no line starting with the
+    /// verdict label — `VERDICT_RE` is anchored on that prefix, so a stray line
+    /// would be re-read as a verdict by the next consumer of this payload.
+    #[tokio::test]
+    async fn the_refusal_teaches_both_exits_without_forging_a_verdict_line() {
+        let h = TestHarness::with_agent("mika-qa");
+        let posted = posted_map();
+        let mut ctx = h.ctx();
+        ctx.pr_reviews_posted = Some(&posted);
+        let out = run_gh(
+            &serde_json::json!({
+                "command": ["pr", "review", "2685", "--comment", "--body", MEASURED_BODY],
+                "repo": REPO,
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("Step 2B"), "{}", out.content);
+        assert!(out.content.contains("hold[review]"), "{}", out.content);
+        for line in out.content.lines() {
+            assert!(
+                !line.trim_start().starts_with("VERDICT:"),
+                "a remedy line would be re-read as a verdict: {line:?}"
+            );
+        }
+    }
+
+    /// Positive control: the shape Step 2E prescribes traverses, and leaves the
+    /// `allowed` row that distinguishes "refuses nothing" from "never runs"
+    /// (mika#2205).
+    #[tokio::test]
+    async fn a_grounded_block_traverses_and_leaves_its_allowed_row() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
+        assert!(
+            validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
+                .await
+                .is_ok()
+        );
+        assert_eq!(rows(&h, "allowed").await, 1);
+        assert_eq!(all_rows(&h).await, 1);
+    }
+
+    /// Out of population: nothing but `block[pipeline]` is this guard's
+    /// business, and an out-of-population call leaves **no** row at all — the
+    /// `allowed` population must stay readable as "a grounded pipeline block",
+    /// not as "any review that went past".
+    #[tokio::test]
+    async fn the_other_verdicts_traverse_and_leave_nothing() {
+        let h = TestHarness::with_agent("mika-qa");
+        for (flag, body) in [
+            (
+                "--approve",
+                "DEPTH: full\n\nVERDICT: pass\n\nAll ACs met.\n",
+            ),
+            (
+                "--comment",
+                "DEPTH: full\n\nVERDICT: block[ac]\n\nAC3 is untested.\n",
+            ),
+            (
+                "--comment",
+                "DEPTH: full\n\nVERDICT: hold[review]\n\nWaiting on CI.\n",
+            ),
+        ] {
+            let args = argv(&["pr", "review", "2685", flag, "--body", body]);
+            assert!(
+                validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
+                    .await
+                    .is_ok(),
+                "{body:?}"
+            );
+        }
+        assert_eq!(all_rows(&h).await, 0);
+    }
+
+    /// The STOP switch actually stops: the very body that is refused when the
+    /// gate is armed traverses when it is disarmed, and leaves no row.
+    #[tokio::test]
+    async fn a_disarmed_gate_lets_the_measured_body_through() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", MEASURED_BODY]);
+        assert!(
+            validate_pipeline_block_grounding_gated(false, &args, Some(REPO), &h.ctx())
+                .await
+                .is_ok(),
+            "MIKA_PIPELINE_GROUNDING_GATE=0 must be a real STOP"
+        );
+        assert_eq!(all_rows(&h).await, 0);
+    }
+
+    /// Fail-open on an unreadable body: `--body-file` is not read by this
+    /// guard, so the call traverses rather than being refused on a term the
+    /// guard cannot see.
+    #[tokio::test]
+    async fn an_unreadable_body_is_an_abstention_not_a_refusal() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body-file", "b.md"]);
+        assert!(
+            validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
+                .await
+                .is_ok()
+        );
+        assert_eq!(rows(&h, "refused").await, 0);
     }
 }

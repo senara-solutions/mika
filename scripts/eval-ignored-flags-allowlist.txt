@@ -1,0 +1,32 @@
+# Allowlist for scripts/check-eval-ignored-flags.sh rule R1 (mika#2683, volet b).
+#
+# Format, one per line:
+#
+#     <path-relative-to-scan-root>:<lineno>  # why this co-occurrence is legitimate
+#
+# The reason is not decoration. It is what a future reader needs in order to
+# re-audit the site, and an entry without one is indistinguishable from a
+# forgotten exemption.
+#
+# COMPARED IN BOTH DIRECTIONS. An entry that no longer matches a real R1
+# violation fails the build exactly as an unlisted site does. An allowlist
+# nobody prunes becomes the junk drawer in which the regression this guard
+# exists to catch passes unnoticed.
+#
+# SHIPPED EMPTY, and expected to STAY empty — this one differs from the
+# a2a-timeout allowlist in kind, not merely in content. There, an exemption can
+# be legitimate: a 90-second constant may genuinely not be a call budget. Here,
+# libtest itself refuses the pair, so a co-occurrence is never a judgement call
+# and never a false positive. Any entry below is a broken invocation someone
+# parked instead of fixing, and the one-line fix is to keep exactly one flag.
+#
+# NOT the place for the guard's own negative-behaviour harness.
+# `scripts/test-check-eval-ignored-flags.sh` is inside the perimeter and must
+# build faulty fixtures; it composes the pair at runtime from two halves so no
+# live line of it carries both literals. Keep that shape. A file-level
+# exemption here would also hide a real regression written in that file.
+#
+# Measured empty on 2026-10-14: the perimeter holds four cargo-test invocation
+# sites with a `--` separator (.github/workflows/eval-calibration.yml,
+# .github/workflows/ci.yml, Makefile, scripts/generate-openapi.sh), three of
+# which carry the bare flag, none of which carries the pair.

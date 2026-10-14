@@ -255,6 +255,25 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-a2a-timeout-literals.sh
 
+  eval-ignored-flags-lint:
+    name: Eval Ignored Flags Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # `eval-calibration.yml` passed `--ignored` AND `--include-ignored` to the
+      # same cargo invocation for 17 red runs (2026-06-22 → 2026-10-12). libtest
+      # refuses the pair, `|| true` hid the refusal, and the step that failed was
+      # the next one — so the cause was never read. The predicate is the
+      # CO-OCCURRENCE at one invocation site, never the presence of either flag:
+      # both are legitimate alone, and a rule that accuses a correct invocation
+      # is a rule that gets disarmed (mika#2683).
+      - name: Reject mutually exclusive libtest flags at one invocation site (mika#2683)
+        run: bash scripts/check-eval-ignored-flags.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-eval-ignored-flags.sh
+
   pilot-push-lint:
     name: Pilot Push Site Lint
     runs-on: ubuntu-22.04
