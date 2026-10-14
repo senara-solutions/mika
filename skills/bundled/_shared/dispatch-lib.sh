@@ -548,12 +548,68 @@ _emit_pilot_budget_line() {
     # `null` n'est jamais un `0`* (mika#2331).
     if [ -n "${_PLAN_SIZE_PLAN_PATH:-}" ]; then
         local _ps_total="${_PLAN_SIZE_TOTAL:-absent}" _ps_verdict="unknown"
+
+        # mika#2701 (L1) — LA SECONDE MOITIÉ DE PORTE 3 : la même ligne porte
+        # aussi la borne PAR VOL de mika#2693 et le plafond dont elle dérive.
+        # Elle MESURE, elle ne refuse rien — la file groomée entière le lui
+        # doit : un plan déjà groomé ne repasse par aucune porte de groom au
+        # dispatch suivant, donc refuser ici gèlerait d'un coup tout
+        # `docs/plans/`.
+        #
+        # D1 — LE PLAFOND VIENT DE `$_mt`, c'est-à-dire de l'ARGV QUI PART, et
+        # de rien d'autre. Pas des labels : mika#2542 AC5 donne UN SEUL lecteur
+        # à la table des plafonds. Pas de l'état amont résolu non plus — il est
+        # posé par une autre fonction et se lit périmé sans que rien ne le dise
+        # (scan de co-location mika#2496), et le résoudre ici ferait de cette
+        # fonction un SECOND décideur de plafond. L'argv est le seul terme qui
+        # ne peut pas mentir sur ce que le vol avait : il mesure le fait, là où
+        # un plafond relu ailleurs mesurerait l'intention.
+        #
+        # D2 — `ceiling=` porte le plafond RÉSOLU, donc 150 sur budget désarmé
+        # et jamais `none` : sans lui, le `per_flight_bound_loc=243` qui
+        # l'accompagne serait un nombre sans dérivation possible. Rien n'est
+        # perdu — la valeur brute d'argv est sur la ligne immédiatement
+        # au-dessus (`pilot_budget_armed max_turns=none`), et `ceiling_source=`
+        # est le lien explicite entre les deux.
+        #
+        # D3 — `under_bound`/`over_bound`, jamais le vocabulaire du verdict par
+        # PR : deux unités, deux vocabulaires. Les réutiliser ferait qu'un
+        # `grep over_threshold` sur le corpus de logs apparierait
+        # indifféremment une borne en lignes-par-PR et une borne en
+        # lignes-dérivées-de-tours — le défaut que le titre même de la
+        # solution-doc de ce gate nomme.
+        #
+        # D4 — `per_flight_note=` n'est émis que NON VIDE, comme `label=`
+        # ci-dessus : un champ vide se lirait comme une note nommée « vide ».
+        local _pf_ceiling="" _pf_verdict="unknown" _pf_note=""
+        case "$_mt" in
+            none)
+                # Option absente de l'argv = budget DÉSARMÉ. Le résolveur fait
+                # le repli sur 150, et il le DIT dans `ceiling_source=`.
+                : ;;
+            ''|*[!0-9]*)
+                # Population mesurée aujourd'hui : VIDE — `_pilot_max_turns`
+                # n'assigne jamais que `""` ou des chiffres. Le garde-fou
+                # existe pour la raison opératoire : le résolveur de borne fait
+                # de l'ARITHMÉTIQUE sur son argument, et l'argv est sa seule
+                # entrée qui ne vienne pas d'un résolveur de la maison. Même
+                # dessin que les deux lignes `*_invalid` ci-dessus.
+                echo "dispatch-lib: plan_size_flight_ceiling_invalid max_turns=\"${_mt}\" — plafond d'argv illisible, la borne par vol retombe sur le repli (voir ceiling_source= ci-dessous)" >&2 ;;
+            *)
+                _pf_ceiling="$_mt" ;;
+        esac
+
         case "$_ps_total" in
             ''|*[!0-9]*)
                 # `absent` et `unparsable` rendent tous deux `unknown` : aucun
                 # total comparable. Les deux VALEURS restent distinctes sur la
                 # ligne, parce que leurs remèdes sont opposés — groomer le plan,
                 # ou réparer le motif.
+                #
+                # LES DEUX VERDICTS PARTAGENT CETTE BRANCHE, et c'est délibéré :
+                # un `per_flight_verdict` chiffré sur un total illisible serait
+                # un `0` déguisé en mesure (*un `null` n'est jamais un `0`*,
+                # mika#2331).
                 : ;;
             *)
                 if _plan_size_max_loc; [ "$_ps_total" -gt "$_PLAN_SIZE_MAX_LOC" ]; then
@@ -561,9 +617,28 @@ _emit_pilot_budget_line() {
                 else
                     _ps_verdict="under_threshold"
                 fi
+                if _plan_size_per_flight_bound "$_pf_ceiling"; [ "$_ps_total" -gt "$_PLAN_SIZE_PER_FLIGHT_BOUND" ]; then
+                    _pf_verdict="over_bound"
+                else
+                    _pf_verdict="under_bound"
+                fi
                 ;;
         esac
-        _plan_size_max_loc; echo "dispatch-lib: plan_size_estimate total_loc=${_ps_total} threshold_loc=${_PLAN_SIZE_MAX_LOC} verdict=${_ps_verdict} plan=${_PLAN_SIZE_PLAN_PATH}" >&2
+
+        # Le résolveur est rappelé sur CHACUNE des lignes qui lisent sa famille
+        # de globales, et ce n'est pas une redondance : c'est la contrainte V3
+        # de mika#2693, qui refuse toute lecture de `$_PLAN_SIZE_PER_FLIGHT_*`
+        # non co-localisée avec son résolveur. L'idiome est exactement celui que
+        # les lignes voisines emploient déjà pour `_plan_size_max_loc`, et le
+        # résolveur est pur pour un argument donné.
+        _plan_size_per_flight_bound "$_pf_ceiling"; _pf_note="${_PLAN_SIZE_PER_FLIGHT_NOTE:+ per_flight_note=${_PLAN_SIZE_PER_FLIGHT_NOTE}}"
+        # `plan=` RESTE EN DERNIER, et les quatre champs s'insèrent avant lui :
+        # il porte un chemin, donc la seule valeur de la ligne qui pourrait un
+        # jour contenir un espace — un champ terminal reste parsable, un champ
+        # au milieu ne l'est plus. C'est aussi le précédent de mika#2542, qui a
+        # inséré `label=` avant `cost_bound=` pour que tout grep existant
+        # continue d'apparier.
+        _plan_size_max_loc; _plan_size_per_flight_bound "$_pf_ceiling"; echo "dispatch-lib: plan_size_estimate total_loc=${_ps_total} threshold_loc=${_PLAN_SIZE_MAX_LOC} verdict=${_ps_verdict} per_flight_bound_loc=${_PLAN_SIZE_PER_FLIGHT_BOUND} ceiling=${_PLAN_SIZE_PER_FLIGHT_CEILING} ceiling_source=${_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE} per_flight_verdict=${_pf_verdict}${_pf_note} plan=${_PLAN_SIZE_PLAN_PATH}" >&2
     fi
 }
 
