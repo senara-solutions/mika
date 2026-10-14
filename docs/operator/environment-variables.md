@@ -3847,6 +3847,73 @@ grep manager_liveness_recovered "$MIKA_SPIRIT_LOG_FILE"
 - **Il ne rattrape aucun battement perdu.** Pas de file, pas de réessai : un battement raté est perdu, le suivant arrive dans 5 min. C'est le bon arbitrage pour un signal de vivacité — réessayer un « je suis vivant » périmé est au mieux inutile, au pire un mensonge daté.
 - **Il n'ajoute aucun compteur et aucune ligne d'audit** : les seuls instruments neufs sont les deux lignes de transition et le booléen de configuration, et **leur silence ne prouve rien tant que personne n'exécute les sondes**.
 
+### Une URL de battement n'est pas une route de rapport (mika#2697)
+
+**Aucune variable neuve.** Ce travail est une **garde** sur deux variables qui existent déjà, plus la phrase qui dit laquelle vise quoi.
+
+**Le défaut que ça ferme.** `MIKA_MANAGER_DELIVERY_URL` visait `…/api/v1/agents/mika-manager/heartbeat`. Cet endpoint enregistre un tick, répond **201 pour n'importe quel nom d'entité**, et **ne conserve pas le corps**. Les trois conséquences s'enchaînent : le POST réussit, donc le cycle journalise `manager_cycle_delivered route=http` ; le 2xx ferme aussi la porte du repli, donc le sink disque ne se déclenche jamais ; et personne ne peut lire le rapport. `cm health --agent mika-manager` montrait un tick frais et `last_reason: null`, `cm cat mika-manager` ne trouvait aucune entité. Trois semaines de rapports perdus — dernier fichier lisible du sink : **2026-09-27 06:08Z**. Le canal de vivacité a sa propre variable depuis mika#1990 ; c'est **elle** qui doit viser cet endpoint.
+
+**Quelle variable vise quoi — la table entière, parce que c'est leur voisinage qui crée la confusion :**
+
+| variable | cible légitime | le corps est-il conservé ? |
+|---|---|---|
+| `MIKA_MANAGER_DELIVERY_URL` | une route d'**ingestion de rapport** (sévérités normales) | doit l'être — sinon le rapport est perdu |
+| `MIKA_MANAGER_ESCALATION_URL` | une route d'ingestion de rapport (`Severity::Blocked`, route délibérément distincte) | idem |
+| `MIKA_MANAGER_LIVENESS_URL` | **l'endpoint de battement** `…/agents/mika-manager/heartbeat` | **non, et c'est correct** : un battement est un instant, pas un contenu |
+| `MIKA_MANAGER_HEALTH_URL` | la santé d'un **autre** agent, qu'on *lit* | sans objet (sens inverse) |
+
+**Ce que la garde fait, au démarrage du manager.** Les deux variables de rapport passent par `reject_heartbeat_endpoint` : si le **dernier segment non vide du chemin** est `heartbeat` (insensible à la casse), la valeur est **effacée** et une ligne ERROR est émise. Effacée, pas déviée : en aval, « refusée » et « absente » deviennent le même mot, donc `url_is_routable` reste le lecteur unique du prédicat de routage (mika#2267) et `manager_delivery_resolved` annonce `delivery_url_set=false route_normal=offline_sink` sans qu'aucune ligne n'ait à le recalculer. La route obtenue est le puits **nominal**, jamais `offline_sink_fallback` : rien n'est tombé en panne, une variable était mal remplie.
+
+Le jugement porte sur le **chemin**, en **position terminale**, sur le mot **`heartbeat` seul** : un `?from=heartbeat` en query passe, un hôte `heartbeat.example.com/reports` passe, un `/heartbeat/reports` passe, `…/heartbeats` passe. Une URL non parsable passe aussi — refuser ce qu'on ne sait pas lire ferait de cette garde un second mode de panne, et le repli après échec HTTP rattrape ce cas-là.
+
+**Le sink est la route lisible, et pour l'instant la seule.** `control-monitor` **n'expose aucun endpoint d'ingestion de rapports** à ce jour. Tant que c'est vrai, la bonne configuration est `MIKA_MANAGER_DELIVERY_URL` **absente**, et les rapports se lisent dans `~/.mika/manager/sink/` — avec `mika manager reports` (mika#2267), pas avec `cat`. Poser cette variable sur une URL quelconque ne rend rien plus lisible : au mieux elle échoue et tombe en repli, au pire elle réussit et jette le corps, ce qui est exactement l'incident ci-dessus.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Une URL de rapport a-t-elle été refusée ? (régime attendu après remédiation : VIDE)
+grep manager_report_url_rejected_heartbeat_endpoint "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{env_var, use_instead, matched_segment, route}'
+
+# 2. Quelle route est en force ? (une ligne par démarrage)
+grep manager_delivery_resolved "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{milestone, delivery_url_set, route_normal, liveness_url_set}'
+
+# 3. Le sink reçoit-il ?
+mika manager reports --limit 3
+ls -lt ~/.mika/manager/sink/ | head -3
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `manager_report_url_rejected_heartbeat_endpoint` | **ERROR** | **vide** après remédiation | `env_var` nomme la variable fautive, `use_instead` celle où déplacer la valeur. Une ligne = un geste à faire dans `~/.mika/.env`, pas un bug du moteur |
+| `manager_delivery_resolved` avec `delivery_url_set: false` + `route_normal: offline_sink` | INFO | **1 / démarrage** | la configuration attendue tant que cm n'a pas d'endpoint d'ingestion |
+| `delivery_url_set: true` + `route_normal: http` | INFO | — | une URL d'ingestion est posée et acceptée. Vérifier qu'elle **conserve** le corps : la garde ne sait refuser qu'un battement, pas tout endpoint amnésique |
+| `manager_cycle_delivered` avec `route: offline_sink` | INFO | 1 / cycle délivrant | le rapport est écrit et lisible |
+
+La ligne de refus **ne porte aucune URL ni aucun chemin** — discipline du module : un journal porte des booléens et des noms. `matched_segment` est le littéral de la garde, jamais une valeur extraite de l'entrée. Les deux noms de variables y sont parce qu'une ligne qui dit « mauvaise URL » sans dire *où la mettre* décrit un problème et aucun geste.
+
+#### Le geste de remédiation (hors code, à faire par l'opérateur)
+
+Dans `~/.mika/.env`, **déplacer** l'URL du battement d'une variable à l'autre :
+
+```diff
+-MIKA_MANAGER_DELIVERY_URL=https://cm.example.com/api/v1/agents/mika-manager/heartbeat
++MIKA_MANAGER_LIVENESS_URL=https://cm.example.com/api/v1/agents/mika-manager/heartbeat
+```
+
+Puis redémarrer le service. Déplacer, pas dupliquer : la garde effacerait de toute façon la copie restée sur `DELIVERY_URL`, mais chaque démarrage crierait une ERROR pour une configuration que personne ne corrige — et une ERROR qu'on apprend à ignorer ne protège plus rien.
+
+#### La fenêtre d'attente, parce que le silence ne prouve rien avant elle
+
+Un fichier neuf dans `~/.mika/manager/sink/` n'apparaît qu'**à l'issue du premier cycle délivrant**, et la delivery est hybride : `state_changed || heartbeat_fired`, le second sur un plancher de **6 h**. Donc après le redémarrage, l'absence de fichier ne signifie rien pendant jusqu'à six heures si aucun état de milestone n'a changé entretemps. Lire d'abord la sonde 2 (la route est-elle `offline_sink` ?), puis `manager_cycle_delivered` ; conclure à un défaut seulement si un cycle a délivré **et** que le sink est resté vide.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas exister l'endpoint d'ingestion de rapports de cm.** `control-monitor` est hors de ce workspace. Tant qu'il n'en expose pas, le puits disque est la route lisible, et c'est une configuration correcte — pas un mode dégradé.
+- **Il ne valide pas une URL d'ingestion.** La garde sait reconnaître **un** endpoint, celui du battement, parce qu'il est nommé et que son défaut est mesuré. Toute autre URL qui répond 2xx en jetant le corps produirait le même silence, et aucune inspection statique ne peut le savoir. Ce qui le dira est la sonde 3 : un sink qui ne reçoit rien alors que `route_normal: http`.
+- **Il ne rattrape aucun des rapports perdus depuis le 27/09.** Le corps n'a jamais été conservé nulle part ; il n'y a rien à rejouer.
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 

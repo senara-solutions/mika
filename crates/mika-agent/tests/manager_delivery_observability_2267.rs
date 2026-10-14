@@ -372,3 +372,100 @@ fn mika2267_delivery_resolved_names_the_sink_when_no_url_is_posted() {
     assert_eq!(lines[0].field("delivery_token_present"), "false");
     assert_eq!(lines[0].field("sink_dir_source"), "env");
 }
+
+// ---- mika#2697 — la ligne ERROR du refus d'une URL de battement ------------
+
+/// La surface opérateur de la garde, épinglée sur le **site d'émission réel**.
+///
+/// Un opérateur à qui l'on dit « mauvaise URL » sans lui dire *laquelle* ni
+/// *où la mettre* n'a pas de geste à faire. La ligne porte donc les deux noms
+/// de variables — la fautive et la correcte — et c'est ce que ce test exige.
+///
+/// Elle ne porte **aucune** URL ni aucun chemin : discipline du module (un
+/// journal porte des booléens et des noms), tenue ici par le même balayage
+/// tous-champs que T6 au lieu d'une liste de champs à surveiller, parce qu'un
+/// champ ajouté demain échapperait à la liste et pas au balayage.
+#[test]
+fn mika2697_la_ligne_de_refus_nomme_les_deux_variables_et_aucune_url() {
+    let heartbeat = "https://cm.example.com/api/v1/agents/mika-manager/heartbeat";
+    let (_guard, events) = capture();
+
+    let kept = mika_agent::milestone_manager::reject_heartbeat_endpoint(
+        Some(heartbeat.to_string()),
+        mika_agent::milestone_manager::ENV_DELIVERY_URL,
+    );
+    assert_eq!(
+        kept, None,
+        "la garde efface la valeur : en aval, « refusée » et « absente » sont \
+         le même mot"
+    );
+
+    let lines = named(&events, "manager_report_url_rejected_heartbeat_endpoint");
+    assert_eq!(lines.len(), 1, "une seule ligne, au démarrage");
+    let line = &lines[0];
+
+    assert_eq!(
+        line.field("env_var"),
+        "MIKA_MANAGER_DELIVERY_URL",
+        "la variable FAUTIVE, nommée"
+    );
+    assert_eq!(
+        line.field("use_instead"),
+        "MIKA_MANAGER_LIVENESS_URL",
+        "la variable CORRECTE, nommée — sans elle la ligne décrit un problème \
+         et aucun geste"
+    );
+    assert_eq!(
+        line.field("matched_segment"),
+        "heartbeat",
+        "le littéral de la garde, jamais une valeur extraite de l'entrée : \
+         c'est ce qui rend ce champ exact par construction"
+    );
+    assert_eq!(
+        line.field("route"),
+        ROUTE_OFFLINE_SINK,
+        "le puits NOMINAL, pas `_fallback` : rien n'est tombé en panne, une \
+         variable était mal remplie"
+    );
+
+    // Balayage négatif : ni l'URL, ni son hôte, ni son chemin, dans AUCUN champ.
+    for (key, value) in &line.fields {
+        for forbidden in [heartbeat, "cm.example.com", "/api/v1/agents"] {
+            assert!(
+                !value.contains(forbidden),
+                "de la matière d'URL (`{forbidden}`) a fuité dans le champ `{key}`"
+            );
+        }
+    }
+}
+
+/// Le contrôle négatif de la ligne : une URL d'ingestion traverse la garde
+/// **intacte** et n'émet rien. Sans lui, une garde qui refuserait tout
+/// passerait les assertions ci-dessus — et casserait la seule route de rapport
+/// qui marche le jour où cm en exposera une.
+#[test]
+fn mika2697_une_url_dingestion_traverse_la_garde_sans_une_ligne() {
+    let ingestion = "https://cm.example.com/api/v1/messages/dispatch";
+    let (_guard, events) = capture();
+
+    let kept = mika_agent::milestone_manager::reject_heartbeat_endpoint(
+        Some(ingestion.to_string()),
+        mika_agent::milestone_manager::ENV_ESCALATION_URL,
+    );
+    assert_eq!(kept.as_deref(), Some(ingestion), "rendue telle quelle");
+    assert!(
+        named(&events, "manager_report_url_rejected_heartbeat_endpoint").is_empty(),
+        "aucune ligne : une garde qui parle quand tout va bien est un bruit \
+         qu'on apprend à ignorer"
+    );
+
+    // Et le cas « rien à juger » ne parle pas davantage.
+    assert_eq!(
+        mika_agent::milestone_manager::reject_heartbeat_endpoint(
+            None,
+            mika_agent::milestone_manager::ENV_DELIVERY_URL
+        ),
+        None
+    );
+    assert!(named(&events, "manager_report_url_rejected_heartbeat_endpoint").is_empty());
+}

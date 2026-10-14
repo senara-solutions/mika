@@ -107,6 +107,57 @@ pub(crate) fn url_is_routable(url: Option<&str>) -> bool {
     matches!(url, Some(u) if !u.is_empty())
 }
 
+/// Le dernier segment de chemin qui fait d'une URL un endpoint de battement.
+///
+/// Exporté comme littéral pour que la ligne ERROR de la garde porte
+/// `matched_segment` **par construction** — le prédicat ne reconnaît que
+/// celui-ci, donc le champ ne peut pas devenir un canal de fuite d'URL
+/// (mika#2697 § Observabilité).
+pub(crate) const HEARTBEAT_PATH_SEGMENT: &str = "heartbeat";
+
+/// Cette URL désigne-t-elle un endpoint de **battement** ? (mika#2697)
+///
+/// Une `MIKA_MANAGER_DELIVERY_URL` qui vise `…/api/v1/agents/<e>/heartbeat`
+/// enregistre un tick, **ne conserve pas le corps**, et répond `201` pour
+/// n'importe quel nom d'entité. Le POST réussit donc — et c'est précisément la
+/// panne : [`select_route`] ne reprend le puits que lorsque l'URL est absente
+/// ou que la livraison **échoue**, et un `2xx` ferme les deux portes à la fois.
+/// Dix-sept jours de rapports écrits puis jetés, sous un journal qui disait
+/// « livré ». Le canal de vie a sa propre variable depuis mika#1990
+/// (`MIKA_MANAGER_LIVENESS_URL`) ; c'est **elle** qui doit viser cet endpoint.
+///
+/// # Le jugement porte sur la forme du chemin, jamais sur une liste d'URLs
+///
+/// Une liste d'endpoints cm connus serait exacte le jour de l'atterrissage et
+/// fausse au premier déploiement cm suivant. D'où trois choix, chacun porteur :
+///
+/// - **Sur le chemin, pas sur la chaîne entière.**
+///   `https://reports.example/ingest?from=heartbeat` est une route de rapport,
+///   et `https://heartbeat.example.com/reports` aussi — un
+///   `contains("heartbeat")` refuserait les deux.
+/// - **En position terminale, pas « contient un segment ».** La règle décrit ce
+///   qu'un endpoint *est*, et `…/heartbeat/reports` ne l'est pas.
+/// - **`heartbeat` seul**, pas `heartbeats` ni `ping` ni `alive` : cm n'expose
+///   que cette forme, et le reste serait de la spéculation sur des endpoints
+///   qui n'existent pas. La fonction est à un seul endroit — le jour où cm en
+///   expose une autre, le geste est d'une ligne.
+///
+/// # Une URL non parsable rend `false`, et c'est une décision
+///
+/// Refuser ce qu'on ne sait pas lire ferait de ce prédicat un **second** mode de
+/// panne. Une URL illisible partira en `http`, le POST échouera, et le repli
+/// [`ROUTE_OFFLINE_SINK_FALLBACK`] la rattrapera — route déjà livrée, déjà
+/// nommée, déjà testée.
+pub(crate) fn url_is_heartbeat_endpoint(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    parsed
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
+        .is_some_and(|last| last.eq_ignore_ascii_case(HEARTBEAT_PATH_SEGMENT))
+}
+
 /// Le nom de fil de la route qu'une sévérité prendra, vu l'URL applicable.
 pub(crate) fn route_name_for(url: Option<&str>) -> &'static str {
     if url_is_routable(url) {
@@ -1390,6 +1441,105 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<DeliveryError>().map(|d| d.kind),
             Some(DeliveryFailureKind::Unreachable)
+        );
+    }
+
+    // ---- mika#2697 — une URL de battement n'est pas une route de rapport ----
+
+    /// La table complète du prédicat, positifs et négatifs dans le **même**
+    /// test, parce que c'est leur voisinage qui dit la règle.
+    ///
+    /// Les trois négatifs du bas sont le vrai risque de relâchement : un
+    /// `contains("heartbeat")` écrit à la place rougit sur les trois — query,
+    /// host, position non terminale — et reste vert sur tout le reste. Une
+    /// table de positifs seule laisserait donc passer la réécriture qui refuse
+    /// des routes de rapport légitimes.
+    #[test]
+    fn mika2697_le_predicat_juge_le_dernier_segment_du_chemin() {
+        let cases: &[(&str, bool, &str)] = &[
+            // Le défaut mesuré : l'URL en vigueur sur l'hôte depuis le 27/09.
+            (
+                "https://cm.example.com/api/v1/agents/mika-manager/heartbeat",
+                true,
+                "l'endpoint de battement de cm, cas fondateur",
+            ),
+            (
+                "https://cm.example.com/api/v1/agents/mika-manager/heartbeat/",
+                true,
+                "le dernier segment NON VIDE : un slash final ne change rien",
+            ),
+            (
+                "https://cm.example.com/api/v1/agents/mika-manager/HeartBeat",
+                true,
+                "insensible à la casse",
+            ),
+            // Routes de rapport légitimes — aucune ne doit être refusée.
+            (
+                "https://cm.example.com/api/v1/messages/dispatch",
+                false,
+                "une route d'ingestion de rapport",
+            ),
+            (
+                "https://reports.example/ingest?from=heartbeat",
+                false,
+                "le mot est en QUERY : le jugement porte sur le chemin",
+            ),
+            (
+                "https://heartbeat.example.com/reports",
+                false,
+                "le mot est en HOST : le jugement porte sur le chemin",
+            ),
+            (
+                "https://cm.example.com/heartbeat/reports",
+                false,
+                "position NON TERMINALE : la règle décrit ce qu'un endpoint est",
+            ),
+            (
+                "https://cm.example.com/api/v1/heartbeats",
+                false,
+                "`heartbeat` seul, pas son pluriel : cm n'expose que cette forme",
+            ),
+            (
+                "pas une URL du tout",
+                false,
+                "non parsable ⇒ false : refuser ce qu'on ne sait pas lire ferait \
+                 de ce prédicat un second mode de panne (le repli le rattrape)",
+            ),
+        ];
+
+        for (url, expected, why) in cases {
+            assert_eq!(
+                url_is_heartbeat_endpoint(url),
+                *expected,
+                "url_is_heartbeat_endpoint({url:?}) : {why}"
+            );
+        }
+    }
+
+    /// Le prédicat de routage reste à **lecteur unique**, et la garde ne s'y
+    /// substitue pas : une URL de battement est parfaitement *routable*.
+    ///
+    /// C'est ce qui justifie que la garde vive à la frontière de lecture de
+    /// l'environnement et **efface la valeur**, au lieu de dévier la route ici.
+    /// Normaliser en aval laisserait `manager_delivery_resolved` annoncer
+    /// `delivery_url_set=true route_normal=http` pendant que le cycle écrit
+    /// dans le puits — un instrument qui mentirait d'une manière nouvelle pour
+    /// en réparer une ancienne (mika#2267, propriété à préserver).
+    #[test]
+    fn mika2697_les_deux_predicats_repondent_a_deux_questions_distinctes() {
+        let heartbeat = "https://cm.example.com/api/v1/agents/mika-manager/heartbeat";
+        assert!(
+            url_is_routable(Some(heartbeat)),
+            "« une URL est-elle posée » : oui — et c'est pourquoi le POST réussissait"
+        );
+        assert!(
+            url_is_heartbeat_endpoint(heartbeat),
+            "« est-ce la bonne » : non — la question que `url_is_routable` n'avait pas"
+        );
+        assert_eq!(
+            route_name_for(Some(heartbeat)),
+            ROUTE_HTTP,
+            "le nom de route d'une URL posée ne change pas : la garde agit en amont"
         );
     }
 }
