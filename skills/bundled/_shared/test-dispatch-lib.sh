@@ -12532,6 +12532,157 @@ assert_contains "V5: la résolution du plafond vit DANS la branche gardée sur l
 assert_contains "V5: et le plafond est bien PASSÉ à la règle, pas lu par portée" \
     '_plan_size_rule "$_PILOT_MAX_TURNS"' "$T2693_GROOM_BLOCK"
 
+# --- V4 (AC2) : parité des deux prompts architecte, du type S14 ------------
+#
+# ROUGE AVANT, consigné : sur les prompts nus, les six extractions rendaient la
+# chaîne VIDE et les six assertions de parité ont tiré — c'est exactement la
+# divergence MUETTE que S14 existe pour refuser, transposée aux quatre
+# paramètres de la borne par vol.
+#
+# Le jugement vit chez l'architecte, dont le `system_prompt.md` est STATIQUE :
+# aucune interpolation au dispatch. Les quatre paramètres et les deux bornes de
+# référence vivent donc littéraux dans les deux prompts et en variables dans
+# dispatch-lib. Doublon assumé, du même type que le seuil de S14, et tenu par le
+# même moyen — sans ce test, recalibrer le débit laisserait les deux prompts sur
+# l'ancienne borne et rien ne le dirait.
+#
+# LA FENÊTRE DE S14 EST RÉUTILISÉE TELLE QUELLE, et le sous-bloc est en `####`
+# pour cette raison : `sed -n '/^### Plan-Size Gate/,/^### /p'` ne s'arrête pas
+# sur `#### `, donc le sous-bloc entre dans la fenêtre des deux tests sans
+# qu'aucune ligne de S14 ne bouge (AC4).
+
+T2693_B200=$(_t2693_bound_probe 200)
+T2693_B150=$(_t2693_bound_probe 150)
+T2693_EXPECT_B200=$(_t2636_field 1 "$T2693_B200")
+T2693_EXPECT_B150=$(_t2636_field 1 "$T2693_B150")
+# Le 150 des prompts est le DÉFAUT DE FLOTTE, pas un nombre choisi : on le tient
+# contre ce que la chaîne réelle résout quand le budget est désarmé.
+T2693_EXPECT_FALLBACK=$(_t2636_field 2 "$(_t2693_bound_probe __EMPTY__)")
+
+for t2693_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    t2693_pf="$SCRIPT_DIR/../$t2693_prompt/system_prompt.md"
+    if [ -r "$t2693_pf" ]; then
+        t2693_gate=$(sed -n '/^### Plan-Size Gate/,/^### /p' "$t2693_pf")
+        t2693_sub=$(printf '%s\n' "$t2693_gate" | sed -n '/^#### Per-flight bound/,$p')
+        assert_eq "V4: $t2693_prompt porte le sous-bloc de borne par vol" "non-vide" \
+            "$([ -n "$t2693_sub" ] && echo non-vide || echo vide)"
+
+        # Les quatre paramètres, extraits à l'ancre et comparés aux CONSTANTES
+        # SHELL. C'est la moitié « un seul site de vérité » de l'AC2 : le site
+        # décide, le prompt récite, et ce test interdit qu'ils se séparent.
+        t2693_orient=$(sed -nE 's/^\*\*Per-flight parameters:\*\* orientation ([0-9]+) turns.*/\1/p' "$t2693_pf" | head -1)
+        t2693_tail=$(sed -nE 's/^\*\*Per-flight parameters:\*\*.*pipeline tail ([0-9]+) turns.*/\1/p' "$t2693_pf" | head -1)
+        t2693_rate=$(sed -nE 's/^\*\*Per-flight parameters:\*\*.*throughput ([0-9]+) lines per 100 turns.*/\1/p' "$t2693_pf" | head -1)
+        t2693_factor=$(sed -nE 's/^\*\*Per-flight parameters:\*\*.*factor ([0-9]+) %.*/\1/p' "$t2693_pf" | head -1)
+        assert_eq "V4 (AC2): $t2693_prompt — orientation égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS" "$t2693_orient"
+        assert_eq "V4 (AC2): $t2693_prompt — fin de pipeline égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_TAIL_TURNS" "$t2693_tail"
+        assert_eq "V4 (AC2): $t2693_prompt — débit égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS" "$t2693_rate"
+        assert_eq "V4 (AC2): $t2693_prompt — facteur égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT" "$t2693_factor"
+
+        # Les deux bornes de référence sont comparées à ce que le RÉSOLVEUR
+        # calcule, jamais à un littéral retapé dans le test : un test qui
+        # répéterait 431 serait un troisième site de vérité.
+        t2693_ref200=$(sed -nE 's/^\*\*Reference bounds:\*\* ([0-9]+) estimated lines at a 200-turn ceiling.*/\1/p' "$t2693_pf" | head -1)
+        # Pas de `·` dans l'ancre : un séparateur multi-octets fait dépendre
+        # l'extraction de la locale du runner, et un test qui rend la chaîne
+        # vide hors UTF-8 serait vert pour la mauvaise raison.
+        t2693_ref150=$(sed -nE 's/^\*\*Reference bounds:\*\*.* ([0-9]+) at a 150-turn ceiling.*/\1/p' "$t2693_pf" | head -1)
+        assert_eq "V4 (AC2): $t2693_prompt — borne de référence à 200 tours = résolveur" \
+            "$T2693_EXPECT_B200" "$t2693_ref200"
+        assert_eq "V4 (AC2): $t2693_prompt — borne de référence à 150 tours = résolveur" \
+            "$T2693_EXPECT_B150" "$t2693_ref150"
+
+        # Le repli d'un plan MUET. C'est la direction prudente, et c'est le seul
+        # endroit où l'architecte décide sans information : borne plus serrée ⇒
+        # plan plus petit ⇒ jamais une mort par volume.
+        t2693_fb=$(printf '%s\n' "$t2693_sub" | sed -nE 's/.*takes \*\*([0-9]+) turns\*\* \(fail-safe.*/\1/p' | head -1)
+        assert_eq "V4: $t2693_prompt — un plan sans déclaration est jugé sur le défaut de flotte" \
+            "$T2693_EXPECT_FALLBACK" "$t2693_fb"
+
+        # Le sous-bloc cite son site de vérité et nomme la ligne qui rachète un
+        # dépassement. Sans `Tracked in:` nommé, la branche 4 est une porte
+        # ouverte : « j'ai découpé » sans dire où va la suite.
+        assert_contains "V4 (AC2): $t2693_prompt — le sous-bloc CITE le site de vérité" \
+            '_plan_size_per_flight_bound' "$t2693_sub"
+        assert_contains "V4: $t2693_prompt — et nomme la ligne \`Tracked in:\`" \
+            'Tracked in:' "$t2693_sub"
+        assert_contains "V4: $t2693_prompt — il nomme les deux lignes de déclaration du plan" \
+            'Plafond de tours' "$t2693_sub"
+        assert_contains "V4: $t2693_prompt — et juge le VOL COURANT, pas la somme" \
+            'never the sum of flights' "$t2693_sub"
+        # La borne par PR est intacte dans la même fenêtre : les deux bornes
+        # cohabitent dans le prompt comme dans le shell (AC4).
+        assert_contains "V4 (AC4): $t2693_prompt — le seuil par PR de mika#2636 est intact" \
+            '**Threshold:** 1000 lines of code outside `docs/`.' "$t2693_gate"
+    else
+        assert_eq "V4: $t2693_prompt/system_prompt.md lisible" "lisible" \
+            "fichier introuvable: $t2693_pf"
+    fi
+done
+
+# Les verdicts sont ceux qui existent déjà — aucun mode d'échec neuf. Première
+# passe ITERATE, seconde ESCALATE, et la seconde est sans recours : un sous-bloc
+# qui offrirait ITERATE à la seconde passe inventerait une troisième passe.
+T2693_SUB_FIRST=$(sed -n '/^#### Per-flight bound/,/^### /p' "$SCRIPT_DIR/../mika-arch-groom-ticket/system_prompt.md")
+T2693_SUB_SECOND=$(sed -n '/^#### Per-flight bound/,/^### /p' "$SCRIPT_DIR/../mika-arch-second-review/system_prompt.md")
+assert_contains "V4: le sous-bloc de première passe rend ITERATE" \
+    '`ITERATE`' "$T2693_SUB_FIRST"
+assert_contains "V4: celui de seconde passe rend ESCALATE" \
+    '`ESCALATE`' "$T2693_SUB_SECOND"
+assert_not_contains "V4: et la seconde passe n'offre PAS ITERATE (pas de troisième passe)" \
+    '`ITERATE`' "$T2693_SUB_SECOND"
+# Contre-vacuité de l'assertion ci-dessus : elle ne serait rien sur un bloc vide,
+# et c'est l'état où ce test est né. Les deux sous-blocs sont lus NON VIDES avant
+# qu'on conclue quoi que ce soit de leur contenu.
+assert_eq "V4 contre-vacuité: les deux sous-blocs de verdict sont lus non vides" "oui|oui" \
+    "$([ -n "$T2693_SUB_FIRST" ] && printf 'oui' || printf 'non')|$([ -n "$T2693_SUB_SECOND" ] && printf 'oui' || printf 'non')"
+
+# --- V6 : anti-vacuité et hermétisme de toute la section -------------------
+#
+# Une section de test peut passer en entier sans rien avoir mesuré : fenêtre
+# vide, fichier absent lu comme « rien à reprocher », sonde qui interroge le
+# réseau au lieu du dépôt. Les quatre assertions ci-dessous sont les gardes de
+# ces quatre façons-là, et elles sont la raison pour laquelle le bloc `else` de
+# la boucle V4 asserte au lieu de passer en silence.
+
+# 1. La fenêtre de gate des deux prompts est non vide — même garde que S14, sur
+#    la même fenêtre, parce que V4 en dépend entièrement.
+for t2693_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    assert_eq "V6: $t2693_prompt — la fenêtre de Plan-Size Gate est lue non vide" "non-vide" \
+        "$([ -n "$(sed -n '/^### Plan-Size Gate/,/^### /p' "$SCRIPT_DIR/../$t2693_prompt/system_prompt.md")" ] \
+            && echo non-vide || echo vide)"
+    assert_eq "V6: $t2693_prompt/system_prompt.md est bien LISIBLE, pas absent" "lisible" \
+        "$([ -r "$SCRIPT_DIR/../$t2693_prompt/system_prompt.md" ] && echo lisible || echo "absent")"
+done
+
+# 2. Le bloc de test lui-même est extrait non vide. Une section renommée ou
+#    déplacée qui ne s'exécuterait plus serait silencieusement « verte ».
+assert_eq "V6 contre-vacuité: le bloc de test mika#2693 est extrait non vide" "non-vide" \
+    "$([ -n "$(sed -n '/^# mika#2693 — la SECONDE borne du Plan-Size Gate/,/^# mika#2641 —/p' "$0")" ] \
+        && echo non-vide || echo vide)"
+
+# 3. HERMÉTISME : aucune sonde de cette section n'appelle `gh`. Tout ce qu'elle
+#    mesure est dans le dépôt — les labels sont passés en littéral à
+#    `_pilot_max_turns`, jamais lus sur un ticket. Un test qui interrogerait
+#    GitHub serait rouge hors réseau et vert pour la mauvaise raison.
+T2693_TEST_BLOCK=$(sed -n '/^# mika#2693 — la SECONDE borne du Plan-Size Gate/,/^# mika#2641 —/p' "$0")
+assert_eq "V6 hermétisme: la section n'invoque jamais \`gh\`" "0" \
+    "$(printf '%s\n' "$T2693_TEST_BLOCK" | grep -vE '^[[:space:]]*#' | grep -cE '(^|[^A-Za-z0-9_-])gh[[:space:]]' || true)"
+
+# 4. FIRE-DISPOSITION, option (a) : la table d'exceptions des scans de source de
+#    cette section est DÉCLARÉE et VIDE, et son vide est asserté à l'exécution.
+#    Déclarée pour que le prochain qui veut y mettre une entrée voie d'abord
+#    qu'elle existe exprès ; assertée vide pour qu'une entrée ajoutée en
+#    silence tire. Les détecteurs partent ARMÉS — doctrine mika#2201 : on route
+#    le site vers la règle, on n'ajoute pas d'exception.
+T2693_SOURCE_SCAN_ALLOWLIST=()
+assert_eq "V6: table d'exceptions des scans de source (V3, V5, V6) — zero entries" \
+    "0" "${#T2693_SOURCE_SCAN_ALLOWLIST[@]}"
+
 # ===========================================================================
 # mika#2641 — une réponse d'architecte sans disposition lisible est RELANCÉE
 #
