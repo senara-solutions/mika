@@ -13,6 +13,16 @@
 //! `docs/egress/egress-manifest.toml` (`control-monitor-delivery`,
 //! `control-monitor-liveness`).
 //!
+//! **Depuis mika#2698 vol 2 il existe un troisième effet, et il est le premier à
+//! écrire sur la forge** : un commentaire de verdict sur le ticket d'un vol
+//! terminé, derrière `MIKA_MANAGER_EVALUATE_WRITE`, **OFF par défaut**. Un seul
+//! geste, `gh issue comment`, dans un seul fichier, [`verdict_poster`]. La
+//! phrase « zéro autorité d'écriture » ci-dessus décrit donc l'état par défaut
+//! — qui est l'état déployé — et non une impossibilité structurelle : la
+//! différence est l'objet du ticket, et son seuil d'ouverture est un geste
+//! opérateur (10 vols concordants, ou 7 jours). Toute autre écriture reste
+//! refusée structurellement par `no_dispatch_test.rs`.
+//!
 //! The chain of authority is Prime → Manager → Executors. `mika-manager` is a distinct
 //! entity from `mika-prime`; see the ratified brief at
 //! `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`
@@ -119,21 +129,36 @@
 //! SQL ne passe ainsi sous le grep de `no_dispatch_test.rs`. Rien de nouveau sur
 //! le réseau : tout vient de `tasks` et de `SubIssue::pr_state`, déjà hydraté.
 //!
-//! **Ce que le vol 1 n'a pas ajouté, et c'est le point :** aucune autorité
-//! d'écriture, pas même désarmée. `MIKA_MANAGER_EVALUATE_WRITE` n'est **pas**
-//! déclarée — un interrupteur dont la branche ON ne fait rien est un mensonge de
-//! surface. Le verdict a exactement une destination,
-//! [`types::Assessment::flight_verdicts`], que le `Reporter` rend dans sa section
-//! « Vols terminés depuis le cycle précédent ». C'est le *mode ombre* du ticket,
-//! et au vol 1 il est structurel : il ne se configure pas, il n'existe pas
-//! autrement. L'écriture (`gh issue comment`, idempotence par checkpoint,
-//! exception nommée dans l'allowlist de `no_dispatch_test.rs`) est le vol 2, et
-//! le ticket reste ouvert jusque-là.
+//! Le vol 1 n'a ajouté **aucune** autorité d'écriture, pas même désarmée :
+//! `MIKA_MANAGER_EVALUATE_WRITE` n'y était pas déclarée, parce qu'un
+//! interrupteur dont la branche ON ne fait rien est un mensonge de surface. Le
+//! verdict avait exactement une destination,
+//! [`types::Assessment::flight_verdicts`], que le `Reporter` rend dans sa
+//! section « Vols terminés depuis le cycle précédent ». C'est le *mode ombre*
+//! du ticket, et il reste la destination par défaut.
 //!
-//! Deux data du verdict sont **présentes et `None`** — non instrumentées, jamais
-//! `0` (motif mika#2331) : le plafond de tours, dont le lecteur unique est en
-//! shell (`_pilot_max_turns`), et le tour du dernier commit, qui demande le
-//! transcript. Les deux sont du vol 2.
+//! ## Phase 2 (b) vol 2 — l'interrupteur et le geste unique (mika#2698)
+//!
+//! **Ce que le vol 2 a ajouté :** [`verdict_poster`], et rien d'autre sur la
+//! forge. `MIKA_MANAGER_EVALUATE_WRITE` y est déclarée et **OFF par défaut** ;
+//! [`verdict_poster::write_is_armed`] en est le lecteur unique du dépôt. La
+//! branche ON autorise un seul geste, `gh issue comment` — première et seule
+//! entrée de l'allowlist de `no_dispatch_test.rs`, au fichier et au jeton près.
+//! L'idempotence (AC2) est portée par
+//! [`cadence::MilestoneCheckpoint::posted_flight_task_ids`] et non par une
+//! relecture des commentaires : le ticket autorise un geste, et c'est une
+//! écriture.
+//!
+//! L'exécutant est le [`reader::GhRunner`] déjà injectable du module
+//! (mika#1975), passé par `CycleContext::with_gh_runner` — donc aucune
+//! signature de `spawn.rs` ni de `server/mod.rs` n'a bougé.
+//!
+//! Deux data du verdict restent **présentes et `None`** — non instrumentées,
+//! jamais `0` (motif mika#2331) : le plafond de tours, dont le lecteur unique
+//! est en shell (`_pilot_max_turns`), et le tour du dernier commit, qui demande
+//! le log de session pilote. Les deux sont du **vol 3**, nommé et chiffré dans
+//! `docs/plans/2026-10-15-001-feat-2698-manager-evalue-chaque-vol-vol-2-plan.md`
+//! § *Découpage du reliquat* ; le ticket reste ouvert jusque-là.
 
 pub mod assessor;
 pub mod cadence;
@@ -144,6 +169,7 @@ pub mod reporter;
 pub mod sink_dir;
 pub mod spawn;
 pub mod types;
+pub mod verdict_poster;
 
 #[cfg(test)]
 mod no_dispatch_test;
@@ -177,4 +203,8 @@ pub use spawn::{
 pub use types::{
     Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MilestoneRef, MilestoneState,
     ProgressCounts, RecentActivity, Recommendation, Severity, SubIssue,
+};
+pub use verdict_poster::{
+    ENV_EVALUATE_WRITE, MARKER_PREFIX, post_verdicts, render_verdict_comment, verdict_marker,
+    write_is_armed,
 };

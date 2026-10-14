@@ -59,23 +59,29 @@ const FORBIDDEN_TOKENS: &[&str] = &[
 /// Files exempt from the grep — this test file itself contains the tokens as literals.
 const EXEMPT_FILES: &[&str] = &["no_dispatch_test.rs"];
 
-/// Exceptions **nommées**, par `(fichier, jeton, raison)`. Livrée **vide**, et
-/// c'est tout l'objet de mika#2698 vol 1 : le mode ombre n'est pas un
-/// interrupteur désarmé, c'est l'absence de chemin d'écriture. Il n'y a donc
-/// rien à excepter, et le ticket reste ouvert jusqu'au vol 2.
+/// Exceptions **nommées**, par `(fichier, jeton, raison)`. Le vol 2 de
+/// mika#2698 y a inscrit **exactement une** ligne, et c'est la seule que ce
+/// module aura jamais tant que le ticket décrit un seul geste.
 ///
-/// **Ce que cette liste coûte quand elle cesse d'être vide.** Le vol 2 y
-/// inscrira exactement une ligne — `gh issue comment`, dans le fichier qui porte
-/// la branche ON de `MIKA_MANAGER_EVALUATE_WRITE` — et pas une de plus. Une
-/// exception par *fichier et par jeton*, jamais par fichier seul : exempter un
-/// fichier entier rendrait ses autres jetons invisibles, ce qui est précisément
-/// la façon dont un garde structurel meurt sans bruit.
+/// Une exception par *fichier et par jeton*, jamais par fichier seul : exempter
+/// un fichier entier rendrait ses autres jetons invisibles, ce qui est
+/// précisément la façon dont un garde structurel meurt sans bruit. La propriété
+/// est tenue par `mika2698_une_exception_ne_couvre_quun_seul_jeton_du_fichier`
+/// — `verdict_poster.rs` reste donc interdit sur `gh pr merge`, `gh issue edit`
+/// et les dix-neuf autres.
 ///
-/// Un `EXEMPTED_OCCURRENCES` vide est aussi la **forme forte de l'AC1** : avec
-/// l'interrupteur OFF il n'y a aucun appel d'écriture `gh` parce qu'aucun n'est
-/// écrit, et `mika2698_lallowlist_dexceptions_est_vide_et_le_reste` rougit au
-/// premier qui le serait.
-const EXEMPTED_OCCURRENCES: &[(&str, &str, &str)] = &[];
+/// **Ce que l'exception coûte, et ce qui le paie.** Le grep ne protège plus ce
+/// couple, donc l'AC1 ne repose plus sur lui seul. Trois choses le portent
+/// ensemble : l'épinglage ci-dessous (au fichier et au jeton près), la table de
+/// vérité de l'interrupteur, et le test de comportement `armed == false` ⇒ zéro
+/// appel — avec son contrôle négatif `armed == true` ⇒ exactement un appel, sans
+/// lequel « zéro appel » serait aussi satisfait par un posteur mort. Tous dans
+/// `verdict_poster.rs`.
+const EXEMPTED_OCCURRENCES: &[(&str, &str, &str)] = &[(
+    "verdict_poster.rs",
+    "gh issue comment",
+    "mika#2698 vol 2 — le seul geste d'écriture autorisé, derrière MIKA_MANAGER_EVALUATE_WRITE",
+)];
 
 #[test]
 fn no_dispatch_scaffolding_in_milestone_manager() {
@@ -111,20 +117,40 @@ fn no_dispatch_scaffolding_in_milestone_manager() {
     }
 }
 
-/// mika#2698 vol 1 — l'allowlist part vide et y reste jusqu'au vol 2.
+/// mika#2698 vol 2 — l'allowlist porte **une** exception, et pas une de plus.
 ///
-/// Ce test n'est pas une tautologie : il est le **prix** que paie le vol 2. Le
-/// ticket autorise exactement un geste derrière `MIKA_MANAGER_EVALUATE_WRITE`,
-/// et ce test est l'endroit où ce geste devra se déclarer — avec son fichier,
-/// son jeton et sa raison. Toute autre écriture `gh` continuera de rougir.
+/// Ce test n'est pas une tautologie : il est le **prix** du geste d'écriture.
+/// Le ticket autorise exactement un geste derrière
+/// `MIKA_MANAGER_EVALUATE_WRITE`, et c'est ici qu'il se déclare — avec son
+/// fichier, son jeton et sa raison. Le vol 1 exigeait que cette assertion
+/// change « EN MÊME TEMPS que la branche ON de `MIKA_MANAGER_EVALUATE_WRITE` et
+/// que le docstring du module » : elle l'a fait, dans le commit qui a créé
+/// `verdict_poster.rs`.
+///
+/// Ce qui rougit maintenant : une deuxième entrée, un autre fichier, ou un
+/// autre jeton. Aucun des trois ne se justifie par ce ticket — un deuxième
+/// geste d'écriture est un autre ticket, avec son propre seuil d'ouverture.
 #[test]
-fn mika2698_lallowlist_dexceptions_est_vide_et_le_reste() {
+fn mika2698_lallowlist_ne_porte_que_le_geste_du_vol_2() {
+    assert_eq!(
+        EXEMPTED_OCCURRENCES.len(),
+        1,
+        "mika#2698 n'autorise qu'un seul geste d'écriture : l'allowlist doit porter exactement \
+         une entrée. Une écriture de plus est un autre ticket, avec son propre seuil \
+         d'ouverture : {EXEMPTED_OCCURRENCES:?}"
+    );
+    let (fichier, jeton, raison) = EXEMPTED_OCCURRENCES[0];
+    assert_eq!(
+        fichier, "verdict_poster.rs",
+        "l'exception nomme le fichier qui porte la branche ON de l'interrupteur, et lui seul"
+    );
+    assert_eq!(
+        jeton, "gh issue comment",
+        "le seul jeton que le ticket autorise — ni `gh issue edit`, ni `gh pr comment`"
+    );
     assert!(
-        EXEMPTED_OCCURRENCES.is_empty(),
-        "mika#2698 vol 1 ne déclare aucun chemin d'écriture : l'allowlist doit être vide. \
-         Si tu livres le vol 2, cette assertion change EN MÊME TEMPS que la branche ON de \
-         MIKA_MANAGER_EVALUATE_WRITE et que le docstring du module — jamais avant, et jamais \
-         pour un jeton autre que `gh issue comment` : {EXEMPTED_OCCURRENCES:?}"
+        raison.contains("mika#2698") && raison.contains("MIKA_MANAGER_EVALUATE_WRITE"),
+        "la raison doit nommer le ticket et l'interrupteur : {raison}"
     );
 }
 

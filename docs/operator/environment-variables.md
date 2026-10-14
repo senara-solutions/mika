@@ -3847,6 +3847,80 @@ grep manager_liveness_recovered "$MIKA_SPIRIT_LOG_FILE"
 - **Il ne rattrape aucun battement perdu.** Pas de file, pas de réessai : un battement raté est perdu, le suivant arrive dans 5 min. C'est le bon arbitrage pour un signal de vivacité — réessayer un « je suis vivant » périmé est au mieux inutile, au pire un mensonge daté.
 - **Il n'ajoute aucun compteur et aucune ligne d'audit** : les seuls instruments neufs sont les deux lignes de transition et le booléen de configuration, et **leur silence ne prouve rien tant que personne n'exécute les sondes**.
 
+### Le manager poste son verdict sur le ticket du vol (mika#2698, vol 2)
+
+- `MIKA_MANAGER_EVALUATE_WRITE` — l'unique interrupteur d'écriture du
+  `milestone_manager`, **OFF par défaut**. Armé par `1` ou `true` (insensible à
+  la casse, espaces tolérés) ; l'**absence est l'état normal**, pas un cas
+  d'erreur, et toute autre valeur laisse l'interrupteur fermé. Lecteur unique :
+  `verdict_poster::write_is_armed()` (doctrine mika#2201), consulté à un seul
+  site du cycle.
+
+  ```
+  MIKA_MANAGER_EVALUATE_WRITE=1
+  ```
+
+**Ce qu'il autorise, et rien de plus.** Un geste : `gh issue comment` sur le
+ticket d'un vol terminé, pour y poster le verdict que le rapport du manager
+porte déjà (même phrase, même fonction de rendu — `reporter::render_flight_verdict`
+est appelée par les deux, donc ils ne peuvent pas divergir). Ni `gh issue edit`,
+ni `gh pr comment`, ni une relecture de ce qui est déjà posté : le mandat est
+« un seul geste », et c'est une écriture.
+
+**Pourquoi c'est une exception nommée et pas un trou.** Le module porte un
+invariant LECTURE SEULE tenu structurellement par
+`milestone_manager/no_dispatch_test.rs`, qui refuse tout jeton de dispatch dans
+ses sources. L'allowlist de ce garde porte désormais **exactement une** entrée,
+épinglée au fichier (`verdict_poster.rs`) et au jeton (`gh issue comment`) près.
+Le posteur déclare son geste **à plat** (`const GESTE: &str = "gh issue comment"`)
+et en **dérive** son vecteur d'arguments : ce qui s'exécute est exactement ce que
+le garde voit. La forme éclatée `.args(["issue", "comment"])` échapperait au grep
+plat, et l'exception serait alors décorative.
+
+**Seuil d'ouverture — un geste opérateur, jamais une bascule automatique.** Le
+verdict ombre doit concorder avec le jugement de l'orchestrateur sur **10 vols
+consécutifs**, ou sur **7 jours** si ce délai arrive avant. Concorder veut dire :
+même verdict merge/non-merge et mêmes vols signalés. *Un désaccord se lit, il ne
+se moyenne pas.* Le rollback est le retrait de la variable — sans redéploiement.
+
+**L'idempotence est portée par le checkpoint, pas par GitHub.** Le champ
+`posted_flight_task_ids` de `MilestoneCheckpoint` retient les vols déjà postés
+(500 au plus, les plus récents), et le checkpoint est désormais sauvegardé quand
+le cycle **a posté** même sans avoir livré de rapport — sans quoi le rejeu du
+cycle reposterait. Dans ce cas les trois champs de cadence (`state_digest`,
+`last_delivered_at`, `last_observed_at`) sont **préservés** tels quels : une
+sauvegarde faite pour une autre raison ne doit pas avaler un `state_changed` en
+attente. Conséquences, nommées plutôt que silencieuses : perdre le fichier de
+checkpoint peut produire un **doublon** — jamais un verdict perdu — et le corps
+du commentaire porte un marqueur `<!-- mika-manager:verdict:<task-id> -->` pour
+qu'un doublon soit reconnaissable à l'œil.
+
+**Surfaces opérateur** (journal `$MIKA_SPIRIT_LOG_FILE`) :
+
+```
+# 1. Qu'a-t-on posté, sur quel ticket ?
+grep manager_verdict_posted "$MIKA_SPIRIT_LOG_FILE"
+
+# 2. Un verdict non postable — le ticket du vol n'a pas pu être identifié.
+#    (régime attendu avec l'interrupteur armé : rare)
+grep manager_verdict_not_postable "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Un `gh` qui refuse. Le vol n'est PAS marqué comme posté : le cycle
+#    suivant réessaiera. Un flot soutenu ici est un problème de jeton.
+grep manager_verdict_post_failed "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. CONTRÔLE POSITIF — le cycle tourne-t-il seulement ? Les trois greps
+#    ci-dessus sont muets avec l'interrupteur OFF, ce qui est le régime
+#    nominal et se lit exactement comme un manager mort (mika#2205).
+grep manager_cadence_start "$MIKA_SPIRIT_LOG_FILE"
+```
+
+**Ce que ce travail n'achète PAS.** Il n'ouvre pas l'interrupteur. Il ne lit
+aucun commentaire existant sur GitHub, donc il ne détecte pas un doublon né d'un
+checkpoint perdu — il le rend seulement reconnaissable. Et il ne ferme pas
+mika#2698 : la ligne `Turn ceiling: N` côté producteur et le tour du dernier
+commit restent dus (vol 3).
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
