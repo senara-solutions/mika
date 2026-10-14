@@ -414,6 +414,103 @@ General-purpose `gh` CLI handler. Four-tier validation: (1) global subcommand al
 
 **Regression coverage.** Predicate units in `evidence::guards::tests::mika2237` (both directions, the nine inherited body shapes with three negative controls, the hatch open and shut, URL ↔ bare-number matching); production path in `tests/eval/test_pr_review_flag_coherence_2237.rs` (`MockLlmProvider`, no network — plus three negative controls, without which "the guard decides" would be indistinguishable from "the guard blocks", and an audit-row assertion separating "accepted by the hatch" from "accepted by abstention"); U2 in `tests/eval/test_verdict_handler.rs` with its approved-pass negative control; and the two mika-qa calibration scenarios `memory_vs_skill_precedence` / `memory_vs_skill_no_verdict_degradation` (real-provider swap gate, mika#1190 — a text proxy, stated as such). Compound entry: `docs/solutions/best-practices/une-memoire-apprise-dun-echec-survit-au-fix-de-cet-echec-2026-09-19.md`.
 
+### Un `block[pipeline]` cite une garde en échec, ou il ne part pas (mika#2687, vol 1)
+
+**Le défaut, mesuré n=2 sur la même tête.** Sur mika#2685 (bump de lockfile
+`quinn-proto` + exception `deny.toml` + doc dans `docs/solutions/`), mika-qa a
+rendu `VERDICT: block[pipeline]` deux fois sur la tête `0a53b5f0` — 2026-10-13
+11:54Z et 17:03Z — pendant que `scripts/verify-pipeline.sh` (check *Pipeline
+Artifacts*) sortait **vert les deux fois**. Aucune des deux revues ne portait de
+section `PIPELINE:` ni de ligne `NEGATIVE-TEST:`, et les deux raisons énonçaient
+une règle que la garde ne porte pas (« plan manquant dans `docs/plans/` » ;
+« label `pipeline-exempt` avec des fichiers non-docs ») — `verify-pipeline.sh`
+compte `docs/solutions/` comme doc. Le prompt déployé l'interdisait déjà à ses
+Step 2 et Step 2E. Même classe que mika#2172 et mika#2519, toutes deux fermées
+par le prompt : **le correctif par le prompt seul ne tient pas**, le modèle
+paraphrase une règle que le prompt a retirée. Le PR a été débloqué en ajoutant
+un plan — on a satisfait la lecture erronée, pas corrigé la cause.
+
+**La porte est la chaîne pré-subprocess de `run_gh`, pas `verdict_handler`.**
+`validate_pipeline_block_grounding` refuse un `gh pr review` dont le corps porte
+un `block[pipeline]` qui ne cite aucune garde en échec. Le critère d'acceptation
+dit « n'est pas publié comme bloquant » : une rétrogradation dans
+`verdict_handler` agirait **après la publication** — la revue serait sur GitHub,
+lue par l'humain et par le dispatcher, et le handler ne corrigerait qu'une
+conséquence. Même raison que mika#1646 et mika#2237 ci-dessus : le défaut est
+l'appel.
+
+**Position dans la chaîne.** Immédiatement **après** le garde verdict↔flag
+(mika#2237), **avant** le garde CI↔verdict (mika#2455) et le garde
+verdict↔dependabot (mika#2519/#2565). La chaîne va du plus local au plus
+engageant : le nôtre est le dernier lien qui ne lit **ni le réseau ni la DB** —
+il décide sur le corps seul. Conséquence sur une PR dependabot portant un
+`block[pipeline]` sans section : c'est le nôtre qui répond, en amont de
+mika#2519. Comme mika#2237, il est gardé **sur le corps** et non sur
+`required_tool_arg_suffixes` : une revue humaine ou ad-hoc sans ligne
+`VERDICT:` n'est jamais bloquée, et le garde ne disparaît pas en silence le jour
+où qa-review réorganise son manifeste.
+
+**Le prédicat, et sa population.** `classify_pipeline_block_grounding`
+(`evidence::guards`) ne s'applique qu'à `parse_verdict(&body) == Verdict::Block(k)`
+avec `k.eq_ignore_ascii_case("pipeline")` — hérité de `parse_verdict`, donc des
+tolérances mika#1828/#2239 **et de leurs bornes**. Trois issues :
+`RefusedSectionAbsent` (aucune ligne `PIPELINE:`), `RefusedNoFailingGuardCited`
+(section présente, aucune citation d'échec), `Allowed`. La citation est une
+**disjonction de trois motifs**, insensible à la casse et tolérante au préfixe
+d'emphase markdown : (1) `exit` suivi d'un entier **non nul** (`PIPELINE_EXIT_CODE_RE`,
+comparaison chiffre à chiffre, jamais un `parse`) ; (2) `REJECT:` ; (3)
+`Verification FAILED`. Les trois tokens sont déclarés classe A dans
+`scripts/canonical-tokens.tsv` (`PIPELINE`, `REJECT`, `FAILED`), donc un
+renommage côté script casse la lint avant de casser le garde.
+`PIPELINE: not-applicable (…)` — la forme Step 2D — est refusée délibérément :
+un verdict qui bloque sur la pipeline tout en déclarant la pipeline non
+applicable est exactement le défaut mesuré.
+
+**Dans quel sens il échoue : fail-open.** La disjonction est volontairement
+large. Un faux positif du refus rend une revue légitime **impossible à poster**
+— le tour boucle et meurt (coût R8, cf. mika#2237) ; un faux négatif est le coût
+déjà payé aujourd'hui. **Borne nommée :** un corps dont la seule mention
+d'échec est un `exit 1` dans la prose d'une garde par ailleurs verte **passera**.
+Lire la preuve d'exécution en DB — sur le patron B3 de mika#2565 — est le vol 2,
+`Tracked in: senara-solutions/mika#2687`.
+
+**Le gate, et son STOP.** `MIKA_PIPELINE_GROUNDING_GATE`, armé par défaut,
+désarmé seulement par `0`/`false`/`off`/`no` ; toute autre valeur reste **armée**
+avec un WARN citant la valeur d'origine trimée (mika#2220). Résolu une fois par
+process (`OnceLock`), donc non commutable à chaud, et annoncé au démarrage par
+`log_pipeline_grounding_gate_state()` quand il est désarmé (mika#2205).
+**STOP opérateur : `MIKA_PIPELINE_GROUNDING_GATE=0` + redémarrage** — un
+`block[pipeline]` non fondé repart alors, et c'est l'état déclaré. L'application
+est scindée en un wrapper qui lit le gate à un seul site plus un corps
+`…_gated(gate_enabled: bool, …)`, convention du dépôt (cf.
+`classify_dependabot_verdict`) : le cache `OnceLock` rend `std::env::set_var`
+intestable depuis un binaire de test partagé.
+
+**Audit + greps opérateur.** Chaque décision — refus **et** autorisation —
+écrit une ligne `audit_events` avec `tool_name = 'pipeline_grounding_guard'`,
+`target_key = "pr_review:{repo}#{n}"` et `after_value` dans
+`{refused_section_absent, refused_no_failing_guard_cited, allowed}`. La ligne
+`allowed` est le **contrôle positif** de mika#2205 : une table vide dit que le
+lien n'est pas atteint, pas qu'il ne refuse rien. Signal grep :
+`pipeline_block_refused` (WARN, `reason` ∈ {`section_absent`,
+`no_failing_guard_cited`}) — **attendu non vide**, chaque ligne est un
+`block[pipeline]` que le moteur a retenu. Sonde, tables de lecture et les trois
+haltes post-déploiement : `docs/operator/environment-variables.md` § *Un
+`block[pipeline]` cite une garde en échec*.
+
+**Couverture de régression.** Unités du prédicat dans
+`evidence::guards::tests::mika2687` (15 cas : les deux corps mesurés du ticket,
+les trois motifs un par un, le non-zéro contre `exit 0`, l'emphase markdown, le
+`not-applicable`, et les contrôles négatifs `pass`/`hold`/`block[ac]`) ; câblage
+dans `skills::builtin_handlers::mika2687_pipeline_grounding_tests` (6 cas sur le
+chemin `run_gh` : le refus atteint l'appelant en `Err` avant tout subprocess, le
+corps fondé passe, un `pass` passe, gate désarmé ⇒ même corps et il passe, plus
+les lignes d'audit des deux côtés). Sans ce second Layer, **un prédicat qui
+décide bien resterait compatible avec une garde que personne n'appelle**. Noter
+que notre lien est en aval du `debug_assert!` de dedup mika#821 : un test au
+niveau `run_gh` sur un `pr review` doit donc fournir `ctx.pr_reviews_posted` —
+une map **vide**, car la peupler ferait répondre mika#821 avant nous.
+
 ### Per-Tool Skill Budget (mika#2276 M1)
 
 **A skill tool runs under the budget of the skill that DEFINES it**, resolved once

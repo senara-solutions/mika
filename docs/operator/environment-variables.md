@@ -4609,6 +4609,132 @@ garde que personne n'a exercée se lit exactement comme une garde qui marche*
   le gate existant, enrichi d'un motif. **Son silence ne prouve rien tant que le
   contrôle positif n'est pas établi.**
 
+### Un `block[pipeline]` cite une garde en échec, ou il ne part pas (mika#2687, vol 1)
+
+- `MIKA_PIPELINE_GROUNDING_GATE` — désarme le refus d'un `block[pipeline]` non
+  fondé. **Défaut : armé.** `0`/`false`/`off`/`no` (insensible à la casse,
+  espaces tolérés) désarment ; absent, vide ou **non reconnu** laissent armé,
+  avec un `pipeline_grounding_gate_unrecognized_value` nommant la valeur **entre
+  guillemets** — sans eux une espace parasite est invisible (mika#2220). Même
+  polarité que `MIKA_QA_CI_COHERENCE_GATE` et `MIKA_DEPENDABOT_VERDICT_GATE`.
+  Lue **une fois par process** et mise en cache : poser ou retirer la variable
+  sur un process déjà démarré n'a aucun effet, par construction.
+
+**Le défaut, mesuré (n=2, même tête).** Sur mika#2685 — bump de lockfile
+`quinn-proto` + exception `deny.toml` + doc dans `docs/solutions/` — mika-qa a
+rendu deux fois `VERDICT: block[pipeline]` sur `0a53b5f0` (2026-10-13 11:54Z et
+17:03Z) alors que le check *Pipeline Artifacts* était **vert les deux fois**.
+Aucune des deux revues ne portait la section `PIPELINE:`. Les deux raisons
+données énonçaient une règle que la garde ne porte pas : `verify-pipeline.sh`
+compte `docs/solutions/` comme doc. La PR a été débloquée en **ajoutant un plan**
+— on a satisfait la lecture erronée, pas corrigé la cause. Même classe que
+mika#2172 et mika#2519, toutes deux fermées par le prompt seul : le prompt
+déployé interdisait déjà ce verdict à son Step 2 et à son Step 2E.
+
+**Ce que ça fait, en une phrase.** Un `pr review` dont le corps porte
+`VERDICT: block[pipeline]` est refusé **avant tout sous-processus** si le corps
+ne porte aucune ligne `PIPELINE:`, ou s'il en porte une sans citer de garde en
+échec. Le refus nomme les deux sorties : exécuter Step 2B et poster la section
+verbatim, ou rendre `pass` / `hold[review]` / `block[ac]`.
+
+**Citer une garde en échec** est une disjonction de trois motifs, insensible à la
+casse : `exit` suivi d'un entier **non nul** (séparateur `=`, `:` ou espaces
+toléré, donc la forme `GUARD: … exit=1` de la boucle de Step 2B compte), le jeton
+`REJECT:`, ou `Verification FAILED` — les trois derniers étant les mots que
+`scripts/verify-pipeline.sh` écrit lui-même, déclarés dans
+`scripts/canonical-tokens.tsv`. Une section `PIPELINE: not-applicable (…)`
+(Step 2D) est refusée délibérément : elle n'est pas un `block`.
+
+**Le sens dans lequel ça se trompe, nommé.** La disjonction est **volontairement
+large** : un faux positif du refus rend une revue légitime impostable, un faux
+négatif est le coût d'aujourd'hui, déjà payé. Borne assumée : un corps dont la
+seule mention d'échec est un « exit 1 » dans la prose d'une garde par ailleurs
+verte **passera**. Même arithmétique que mika#2455 et mika#2519.
+
+#### Surfaces opérateur
+
+```bash
+# 1. La garde a-t-elle refusé, et sur quel motif ?
+grep pipeline_block_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{target, reason, agent_id, session_id}'
+
+# 2. Le gate est-il désarmé ? (une ligne INFO par démarrage, muette si armé)
+grep pipeline_grounding_gate_disabled "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Une valeur de gate illisible ? (régime attendu : VIDE)
+grep pipeline_grounding_gate_unrecognized_value "$MIKA_SPIRIT_LOG_FILE"
+```
+
+```sql
+-- CONTRÔLE POSITIF, et c'est la requête qui compte : la garde écrit une ligne
+-- sur les TROIS issues, `allowed` compris. Une table vide dit « le lien n'est
+-- jamais atteint », jamais « la garde ne refuse rien » (mika#2205).
+SELECT target_key, after_value, count(*) FROM audit_events
+ WHERE tool_name = 'pipeline_grounding_guard' GROUP BY 1, 2;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `reason = section_absent` | WARN | **non vide, décroissant** | la forme mesurée sur #2685 ; décroît quand le prompt prend |
+| `reason = no_failing_guard_cited` | WARN | faible | une section postée sans sortie de garde citée |
+| `after_value = 'allowed'` | audit | **non vide** | le contrôle positif ; son absence seule ne prouve rien |
+| `pipeline_grounding_gate_disabled` | INFO | **vide** | un `block[pipeline]` non fondé qui sort est alors l'état déclaré |
+
+#### Sondes post-déploiement, et leurs trois haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** (classe mika#2340).
+> Après `make deploy`, établir que le `mika-spirit` qui tourne porte le correctif
+> avant toute conclusion.
+
+**S1 — le rejeu du défaut fondateur** (première revue `block[pipeline]` après
+déploiement). Soit elle porte sa section `PIPELINE:` avec une sortie non nulle,
+soit elle est refusée et la ligne WARN nomme le motif.
+*Halte 1 — un `block[pipeline]` sans section est publié quand même.* **Ne pas
+élargir le prédicat par réflexe** : lire d'abord le contrôle positif SQL. Zéro
+ligne `allowed` signifie que le lien n'est pas atteint du tout, et la question
+n'est alors pas le prédicat.
+
+**S2 — contrôle négatif (7 jours).** Aucun refus sur un `block[pipeline]` qui
+citait bien une garde, et aucun sur un autre verdict.
+*Halte 2 — un refus sur une revue fondée.* Désarmer
+(`MIKA_PIPELINE_GROUNDING_GATE=0` + redémarrage), **puis** diagnostiquer : une
+garde qui rend les revues légitimes impostables coûte plus que le défaut qu'elle
+ferme.
+
+**S3 — le prompt finit par porter la règle (30 jours).** `section_absent`
+décroît. S'il reste plat, c'est le vol 2 (alignement du prompt à Step 2C/2E) qui
+manque, pas le prédicat.
+*Halte 3 — les deux sondes muettes.* Zéro refus **et** zéro `allowed` ne prouve
+rien : il faut qu'un `block[pipeline]` ait été rendu depuis le déploiement. *Une
+garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne rattrape pas les deux revues de #2685.** Elles sont publiées, la PR est
+  mergée. Rien ici ne réécrit un verdict passé. La sonde est la **prochaine**
+  occurrence.
+- **Il ne vérifie pas que la garde a RÉELLEMENT tourné.** Il lit le corps de la
+  revue, pas la base : un corps qui fabrique une sortie `exit 1` plausible passe.
+  La preuve d'exécution lue en base (motif `find_recent_build_invocation`,
+  mika#2565) est le **vol 2**, `Tracked in: senara-solutions/mika#2687`.
+- **Il ne touche pas le prompt.** L'alignement de Step 2C/2E et son test de
+  conformité sont dans le même vol 2.
+- **Il ne couvre aucune autre classe de `block[…]`.** `block[ac]` traverse sans
+  être lu : son fondement est l'énumération par AC, une autre famille.
+- **Il ne rétrograde pas en `hold[review]`.** Le ticket proposait « refuse ou
+  rétrograde » ; refuser est le bras retenu, parce qu'une rétrogradation
+  réécrirait le jugement de l'agent au lieu de le lui rendre. Le remède nomme
+  `hold[review]` comme sortie, l'agent le choisit.
+- **Aucune liste d'exemptions, et elle est vide par construction** : aucun label,
+  aucune constante, aucun dépôt ne permet de passer outre. L'échappatoire est la
+  variable ci-dessus, et elle n'est jamais silencieuse.
+
+Raisonnement complet (la position du lien dans la chaîne, et pourquoi pas
+`verdict_handler`) : `docs/agent-internals/tools.md` § *Un `block[pipeline]` cite
+une garde en échec* — c'est là que vit la doctrine de la chaîne `run_gh` depuis
+que `crates/mika-agent/CLAUDE.md` § *Tools* y a été vidé (mika#2684).
+
 ### La porte de merge lit TOUS les checks, et cesse de déléguer le vert (mika#2617, phase A)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette

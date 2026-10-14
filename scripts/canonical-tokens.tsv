@@ -105,6 +105,51 @@ Tracked in:	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
 # column names the READER, as everywhere.
 SURFACE	A	crates/mika-agent/src/evidence/guards.rs::API_SURFACE_LINE_PREFIX	ci:line-anchored
 
+# mika#2687 — the three tokens by which a `block[pipeline]` proves a guard
+# actually refused. Measured cause: on mika#2685, two reviews on the same head
+# carried `block[pipeline]` while `scripts/verify-pipeline.sh` was green, and
+# NEITHER carried a `PIPELINE:` section. The engine now refuses that call before
+# the subprocess, so these three strings became machine tokens the day that
+# guard shipped.
+#
+# The three rows are written as the SURVEY produces them — `PIPELINE`, `REJECT`,
+# `FAILED` — not as a human reads them (`PIPELINE:`, `REJECT:`,
+# `Verification FAILED`). Same shape as `SURFACE` for `API-SURFACE:` above and
+# as `VERDICT` for `DEADLINE_VERDICT_LINE` in class B: the survey's ALL-CAPS
+# rule reports the longest capital run, so it stops before the colon and drops
+# the lower-case `Verification`. Rewriting the rows by hand would make
+# `canonical-tokens-survey.sh --check` red on a correctly declared site, which
+# is the one thing this file may not do.
+#
+# All three class A, and the tolerance column is the whole reason — accusing
+# them of case would refuse forms the reader reads:
+#
+#   `PIPELINE:`           `guards.rs::pipeline_section_present` walks the prefix
+#                         character by character with `eq_ignore_ascii_case`
+#                         after `trim_start` AND after skipping a leading
+#                         markdown-emphasis run, so `**PIPELINE: block (mika)**`
+#                         IS read — the mika#1828 precedent `VERDICT_RE` already
+#                         holds on the neighbouring line. Hence
+#                         `ci+emphasis:line-anchored` rather than
+#                         `ci:line-anchored`.
+#   `REJECT:` and
+#   `Verification FAILED` `guards.rs::body_cites_failing_guard` lowercases the
+#                         whole body and the token, then `contains` — position
+#                         free, case read. `contains` is not a survey form
+#                         (§ HOW EACH HALF IS MAINTAINED), so these two rows
+#                         exist precisely because the survey cannot find them.
+#
+# Both are verbatim from `scripts/verify-pipeline.sh`, which is the PRODUCER:
+# it emits `[pipeline-exempt: none] REJECT: …` and
+# `Verification FAILED: $ERRORS missing artifact(s).` on stderr just before its
+# `exit 1`. The `Verification FAILED` row stops before the colon on purpose —
+# the artifact count varies, the sentence does not. The other producer is
+# `qa-review/system_prompt.md` Step 2B/2E, which prescribes quoting that output
+# verbatim; this column names the READER, as everywhere.
+PIPELINE	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_SECTION_LINE_PREFIX	ci+emphasis:line-anchored
+REJECT	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_GUARD_REJECT_TOKEN	ci:literal
+FAILED	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_GUARD_FAILED_TOKEN	ci:literal
+
 # `_parse_disposition` and `_parse_verdict` ARE produced by the survey — their
 # first tier is a strict `grep -oE` — and they are class A anyway. That is a
 # rectification of the mika#2201 plan, which listed those two literals as class

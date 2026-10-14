@@ -941,6 +941,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // mika#2519 — same gesture, same reason, for the verdict↔dependabot gate.
     crate::evidence::guards::log_dependabot_verdict_gate_state();
 
+    // mika#2687 — same gesture again, for the verdict↔guard-citation gate. Its
+    // STOP is `MIKA_PIPELINE_GROUNDING_GATE=0` + restart, and an operator who
+    // pulled it needs the boot log to say so: a `block[pipeline]` that goes out
+    // ungrounded is then the declared state, not a regression.
+    crate::evidence::guards::log_pipeline_grounding_gate_state();
+
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
         warn!(
