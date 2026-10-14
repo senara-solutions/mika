@@ -7659,7 +7659,10 @@ _mika2542_unargumented_calls() {
 # lecture de `PILOT_LABEL_TURN_CEILINGS`. C'est précisément ce que ce
 # recensement existe pour rendre visible : il n'empêche pas d'ajouter un site,
 # il empêche d'en ajouter un en silence.
-assert_eq "mika#2542 (AC10): le scan voit exactement cinq appels du résolveur" "5" \
+# Puis de 5 à 6 (mika#2693, revue) : le finding synthétique du rattrapage rend
+# la même règle que le groom, donc il lui faut le même plafond, par le même
+# résolveur.
+assert_eq "mika#2542 (AC10): le scan voit exactement six appels du résolveur" "6" \
     "$(_mika2542_resolver_calls "$DISPATCH_LIB" | wc -l | tr -d ' ')"
 assert_eq "mika#2542 (AC10): chaque appel du résolveur passe \"\${LABELS:-}\"" "" \
     "$(_mika2542_unargumented_calls "$DISPATCH_LIB" | cut -c1-100)"
@@ -11487,6 +11490,9 @@ _t2636_revise_probe() {
         _run_pilot_sandboxed() {
             local n; n=$(( $(cat "$t2636_counter") + 1 ))
             printf '%s\n' "$n" > "$t2636_counter"
+            if [ -n "${T2636_SIZE_BODY_OUT:-}" ] && [ -f "$t2636_wt/.iterate/findings-1-size.md" ]; then
+                cp "$t2636_wt/.iterate/findings-1-size.md" "$T2636_SIZE_BODY_OUT"
+            fi
             case "$t2636_behaviour" in
                 wipe) rm -f "$t2636_wt/.iterate/findings-1.md" ;;
                 second) [ "$n" -ge 2 ] && printf '\n## 6. Taille estimée\n\nTotal estimé : 400 lignes\n' >> "$t2636_plan" ;;
@@ -11543,6 +11549,17 @@ assert_contains "S1: l'échec de second tour est DIT" \
 
 # Et quand la seconde tentative réussit, elle se tait : l'événement d'échec est
 # réservé à l'échec, sinon il ne mesure plus rien.
+# mika#2693 (revue, P1) — le corps du finding de rattrapage porte le plafond et
+# la borne de CE ticket, pas des chevrons. Sans labels : le défaut de flotte.
+t2693_size_body=$(mktemp)
+T2636_SIZE_BODY_OUT="$t2693_size_body" _t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "no" "never" >/dev/null
+assert_contains "mika#2693 P1: le finding de rattrapage rend le plafond du ticket" \
+    'Le plafond de CE ticket est de 150 tours' "$(cat "$t2693_size_body")"
+assert_not_contains "mika#2693 P1: et ne laisse aucun placeholder non rendu" \
+    '__PLAN_SIZE_' "$(cat "$t2693_size_body")"
+assert_contains "mika#2693 P1 contre-vacuité: le corps capturé est bien le finding F-SIZE" \
+    'F-SIZE [BLOQUANT]' "$(cat "$t2693_size_body")"
+rm -f "$t2693_size_body"
 T2636_S1B=$(_t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "no" "second")
 assert_eq "S1: seconde tentative réussie ⇒ toujours une seule relance" \
     "2" "$(_t2636_field 2 "$T2636_S1B")"
@@ -11930,14 +11947,14 @@ assert_contains "S13-bis: et la ligne de total que \$_PLAN_SIZE_TOTAL_RE extrait
     'Total estimé : 215 lignes' "${_PLAN_SIZE_FORMAT_SPEC:-}"
 assert_contains "S13-bis: la règle du groomeur interpole le spec" \
     "${_PLAN_SIZE_FORMAT_SPEC:-ABSENT}" "${_PLAN_SIZE_RULE:-}"
-# Les deux sites d'interpolation, et PAS un de plus : la règle, et le finding
-# synthétique. Un troisième texte qui re-taperait le format est la régression
-# que ce scan refuse — et on l'y route vers la constante, on n'ajoute pas
-# d'exception (doctrine mika#2201).
-assert_eq "S13-bis: exactement deux sites interpolent \$_PLAN_SIZE_FORMAT_SPEC" "2" \
+# Un seul site d'interpolation, le gabarit de la règle. Le finding synthétique
+# remet la règle RENDUE (mika#2693) : un second texte qui re-taperait le format
+# est la régression que ce scan refuse — on l'y route vers la constante, on
+# n'ajoute pas d'exception (doctrine mika#2201).
+assert_eq "S13-bis: exactement un site interpole \$_PLAN_SIZE_FORMAT_SPEC" "1" \
     "$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '${_PLAN_SIZE_FORMAT_SPEC}' || true)"
-assert_contains "S13-bis: le finding synthétique du rattrapage est l'un des deux" \
-    '${_PLAN_SIZE_FORMAT_SPEC}' \
+assert_contains "S13-bis: le finding synthétique du rattrapage rend la règle sur la ligne de son résolveur" \
+    '_plan_size_rule "$_PILOT_MAX_TURNS"; _size_rule="$_PLAN_SIZE_RULE"' \
     "$(sed -n '/^_plan_size_retry_if_section_still_missing() {/,/^}/p' "$DISPATCH_LIB")"
 # Contre-vacuité : le scan voit bien la constante, et il la voit DÉFINIE une fois.
 assert_eq "S13-bis contre-vacuité: la constante a un site de définition unique" "1" \
