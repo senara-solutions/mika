@@ -416,6 +416,16 @@ REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_plan_callout_refusal	ex
 # a écrit pourquoi ce serait cacher un lecteur réel derrière un nom.
 REFUS	B	crates/mika-agent/src/tools/mod.rs::TESTIMONY_ACCESS_REFUSAL_PREFIX	exact:prefix
 
+# ── mika#2654 — le refus de promotion forcée sur un tour webhook PR.
+#
+# `REFUS (webhook-pr-turn, mika#2654)` ouvre le `ToolOutput::error` que rend
+# `promote_deferred_callback` quand un tour webhook PR demande la promotion
+# forcée d'un wrapper différé. Même forme et même lecteur que le préfixe
+# mika#2627 ci-dessus : les tests de l'outil l'épinglent par `starts_with`, et
+# la requête opérateur sur `tool_calls.output` l'ancre en tête. Constante neuve
+# dans ce ticket, donc créée et déclarée dans la même PR (§ D5/D6).
+REFUS	B	crates/mika-agent/src/tools/promote_deferred_callback.rs::PROMOTE_REFUSAL_PREFIX	exact:prefix
+
 # ═══ Labels. Out of the survey's perimeter (not source), so never compared.
 #
 # Their own exhaustiveness guards are `scripts/check-dispatch-seats-declared.sh`
