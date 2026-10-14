@@ -12230,6 +12230,156 @@ assert_eq "mika#2636: table d'exceptions des trois scans de source (S8, S10, S11
     "0" "${#T2636_SOURCE_SCAN_ALLOWLIST[@]}"
 
 # ===========================================================================
+# mika#2693 — la SECONDE borne du Plan-Size Gate est PAR VOL, et en TOURS
+#
+# Le 2026-10-14, trois vols sont morts au plafond de tours EN PASSANT la borne
+# par PR de mika#2636 : mika#2683 (832 estimées, 1 432 réelles, mort au tour 201
+# dans `ce-simplify-code`), mika#2654 (880/1 160, 201), mika#2687 vol 1
+# (443/994, 151). Le travail tenait dans le vol — dernier commit de travail à
+# t171, t177, t136 — mais pas la FIN DE PIPELINE, qui coûte des TOURS et non des
+# lignes. Et la contrainte dépend du plafond DU ticket : 150 par défaut, 200 avec
+# `loop-substrate`.
+#
+# Les deux bornes cohabitent, et la plus serrée mord. Celle de mika#2636 reste
+# intacte : S1–S18 et S13-bis doivent passer SANS UNE LIGNE MODIFIÉE (AC4).
+#
+# V1 résolveur et paliers · V2 AC3, deux bornes selon le label · V3 co-location
+# et non-impression · V4 parité des deux prompts architecte (AC2) · V5 règle
+# injectée et format prescrit en forme · V6 anti-vacuité.
+# ===========================================================================
+
+echo ""
+echo 'Test: mika#2693 — la borne PAR VOL, dérivée du plafond de tours (V1–V6)'
+echo "-----------------------------------------------------------------------"
+
+# --- Outillage local de section ---------------------------------------------
+
+# Sonde du résolveur de borne. `$1` = le plafond passé ; `__EMPTY__` demande la
+# chaîne vide, c'est-à-dire le budget désarmé.
+_t2693_bound_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        t2693_c="$1"
+        if [ "$t2693_c" = "__EMPTY__" ]; then t2693_c=""; fi
+        _plan_size_per_flight_bound "$t2693_c"
+        printf '%s|%s|%s|%s' "$_PLAN_SIZE_PER_FLIGHT_BOUND" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE" \
+            "${_PLAN_SIZE_PER_FLIGHT_NOTE:-}"
+    )
+}
+
+# Sonde de la CHAÎNE RÉELLE, et c'est ce qui fait d'elle la sonde d'AC3 :
+# `LABELS` -> `_pilot_max_turns` -> `_plan_size_per_flight_bound`. Une sonde sur
+# le résolveur seul ne verrait pas qu'un appariement de label relâché donne la
+# borne LARGE à un ticket qui n'y a pas droit.
+_t2693_chain_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        _pilot_max_turns "$1"; _plan_size_per_flight_bound "$_PILOT_MAX_TURNS"
+        printf '%s|%s|%s' "$_PLAN_SIZE_PER_FLIGHT_BOUND" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE"
+    )
+}
+
+# --- V1 : le résolveur de borne, ses paliers, son plancher ------------------
+#
+# ROUGE AVANT : la fonction n'existait pas.
+#
+# Les deux dernières lignes sont le contrôle du PLANCHER. Un plafond ≤ 85
+# (orientation 35 + fin de pipeline 50) donne un nombre de tours de travail nul
+# ou négatif, et la borne doit valoir 0 — JAMAIS un négatif, qui serait « un
+# nombre plausible, présenté avec autorité, faux », la classe que l'ancre de
+# `_PLAN_SIZE_TOTAL_RE` a déjà dû fermer.
+
+assert_eq "V1: plafond 200 ⇒ borne 431, provenance resolved" "431|200|resolved|" \
+    "$(_t2693_bound_probe 200)"
+assert_eq "V1: plafond 150 ⇒ borne 243, provenance resolved" "243|150|resolved|" \
+    "$(_t2693_bound_probe 150)"
+assert_eq "V1: plafond 120 ⇒ borne 131 (troncature entière assumée)" "131|120|resolved|" \
+    "$(_t2693_bound_probe 120)"
+assert_eq "V1: plafond VIDE (rollback) ⇒ repli 150, provenance disarmed_fallback" \
+    "243|150|disarmed_fallback|" "$(_t2693_bound_probe __EMPTY__)"
+assert_eq "V1: plafond 85 (= le plancher) ⇒ borne 0, jamais un négatif" \
+    "0|85|resolved|ceiling_below_pipeline_floor" "$(_t2693_bound_probe 85)"
+assert_eq "V1: plafond 70 (sous le plancher) ⇒ borne 0, et la note le dit" \
+    "0|70|resolved|ceiling_below_pipeline_floor" "$(_t2693_bound_probe 70)"
+# Le repli n'est PAS 200 : ce 200 appartient au `maxTurns` amont de claude-pilot,
+# un composant qu'on ne possède pas, et un rollback est une posture d'incident.
+assert_not_contains "V1: le repli de budget désarmé ne vaut PAS la borne de 200 tours" \
+    "431" "$(_t2693_bound_probe __EMPTY__)"
+
+# --- V2 : AC3 — le MÊME plan donne deux bornes selon le label --------------
+#
+# ROUGE AVANT : rien ne dérivait de borne d'un plafond.
+
+assert_eq "V2 (AC3): sans loop-substrate ⇒ plafond 150, borne 243" "243|150|resolved" \
+    "$(_t2693_chain_probe "p1-important,ready")"
+assert_eq "V2 (AC3): avec loop-substrate ⇒ plafond 200, borne 431" "431|200|resolved" \
+    "$(_t2693_chain_probe "p1-important,ready,loop-substrate")"
+# Contrôle négatif PORTEUR : l'appariement de `_pilot_label_turn_ceiling` est
+# EXACT. Un glob de sous-chaîne à la manière de `_label_to_type` rendrait 431 —
+# c'est-à-dire la borne large sur un ticket qui n'y a pas droit.
+assert_eq "V2: appariement exact — 'not-loop-substrate' ⇒ 243, jamais 431" "243|150|resolved" \
+    "$(_t2693_chain_probe "not-loop-substrate")"
+assert_eq "V2: idem pour un suffixe — 'loop-substrate-v2' ⇒ 243" "243|150|resolved" \
+    "$(_t2693_chain_probe "loop-substrate-v2")"
+assert_eq "V2: aucun label ⇒ le défaut de flotte, donc 243" "243|150|resolved" \
+    "$(_t2693_chain_probe "")"
+
+# --- V3 : co-location et non-impression (patron S11 / mika#2496) -----------
+#
+# ROUGE PAR MUTATION, consigné : rendre le résolveur imprimant (`printf` en tête
+# de ligne au lieu d'une assignation) fait tirer la 3e assertion ; lui faire
+# relire `PILOT_LABEL_TURN_CEILINGS` fait tirer la 5e ; sortir une lecture de
+# `$_PLAN_SIZE_PER_FLIGHT_BOUND` de la ligne de son résolveur fait tirer la 1re.
+#
+# Le scan porte sur TOUTE la famille `_PLAN_SIZE_PER_FLIGHT_*`, pas seulement sur
+# la borne : les trois autres globales (plafond, provenance, note) se lisent
+# périmées exactement aussi facilement, et une exception pour elles serait la
+# moitié manquante de la garde.
+
+T2693_LOGICAL=$(_mika2496_logical_invocations "$DISPATCH_LIB")
+T2693_READS=$(printf '%s\n' "$T2693_LOGICAL" \
+    | grep -E '\$\{?_PLAN_SIZE_PER_FLIGHT_[A-Z_]+' || true)
+T2693_UNCOLOCATED=$(printf '%s\n' "$T2693_READS" \
+    | grep -vE '_plan_size_per_flight_bound' | grep -E . || true)
+assert_eq "V3: chaque lecture de \$_PLAN_SIZE_PER_FLIGHT_* appelle le résolveur sur la même invocation" \
+    "" "$T2693_UNCOLOCATED"
+# Sa contre-vacuité — « au moins une lecture existe » — arrive avec le premier
+# lecteur, dans le commit qui ajoute `_plan_size_rule`. Écrite ici d'abord, elle
+# a été VUE ROUGE (`non-trouvé`) sur l'arbre où le résolveur n'était encore lu
+# par personne : c'est le rouge qui prouve qu'elle mesure bien quelque chose.
+
+T2693_RESOLVER_SRC=$(sed -n '/^_plan_size_per_flight_bound()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "V3: _plan_size_per_flight_bound a bien été trouvée (guards the guard)" "yes" \
+    "$([ -n "$T2693_RESOLVER_SRC" ] && echo yes || echo no)"
+assert_eq "V3 × mika#2039: le résolveur n'imprime pas" "0" \
+    "$(printf '%s\n' "$T2693_RESOLVER_SRC" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+assert_eq "V3 × mika#2039: aucune substitution \$(_plan_size_per_flight_bound) ne subsiste" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '$(_plan_size_per_flight_bound)' || true)"
+# mika#2542 AC5 : `PILOT_LABEL_TURN_CEILINGS` a UN SEUL lecteur. Un second
+# lecteur de label serait la seconde table de classification de mika#2539.
+assert_eq "V3 × mika#2542 AC5: le résolveur ne relit PAS la table des labels" "0" \
+    "$(printf '%s\n' "$T2693_RESOLVER_SRC" | grep -cF 'PILOT_LABEL_TURN_CEILINGS' || true)"
+# Les quatre paramètres ont un site de DÉFINITION unique — c'est la moitié
+# « un seul site de vérité » de l'AC2 que V4 complète côté prompts.
+for t2693_const in _PLAN_SIZE_FLIGHT_ORIENTATION_TURNS _PLAN_SIZE_FLIGHT_TAIL_TURNS \
+    _PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS _PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT; do
+    assert_eq "V3 (AC2): $t2693_const a un site de définition unique" "1" \
+        "$(grep -cE "^${t2693_const}=" "$DISPATCH_LIB" || true)"
+done
+# L'annulation des deux mises à l'échelle est DITE au site : sans ce commentaire,
+# un recalibrage du débit à 9 lignes/tour s'écrirait `9` et diviserait la borne
+# par cent en croyant la corriger.
+assert_contains "V3: le site dit l'annulation des deux mises à l'échelle" \
+    "ÉCRIT \`900\`, JAMAIS \`9\`" "$(sed -n '/^# mika#2693 — LA SECONDE BORNE/,/^_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=/p' "$DISPATCH_LIB")"
+
+# ===========================================================================
 # mika#2641 — une réponse d'architecte sans disposition lisible est RELANCÉE
 #
 # Le défaut mesuré le 2026-10-02 (groom de mika#2617) : la 2e passe rend un
