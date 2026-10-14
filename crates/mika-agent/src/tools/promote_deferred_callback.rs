@@ -157,6 +157,48 @@ pub(crate) fn classify_force_promote_turn(
     }
 }
 
+/// Le corps du refus rendu au modèle.
+///
+/// **Il nomme la levée sans donner de gabarit** (doctrine mika#2520 /
+/// mika#2292) : il porte le fait (ce tour a été ouvert par un événement PR /
+/// check-suite), ce que forcer la promotion achèterait réellement (une avance
+/// ≤ 60 s et le contournement de la priorité opérateur), le fait que **le
+/// moteur promeut le wrapper de lui-même** au prochain scan, et la sortie
+/// correcte (terminer le tour sur ce que l'événement demande).
+///
+/// Et il **ne nomme aucune commande** — ni le geste CLI de promotion, ni son
+/// drapeau de forçage, ni `run_shell`, ni `update_task_status` :
+/// `MIKA_DEV_IDENTITY` porte `shell-exec`, donc écrire la commande ici
+/// donnerait au modèle le gabarit du contournement, et *un refus qui donne le
+/// gabarit est une fuite avec une étape de plus*. La liste interdite est
+/// épinglée par V5.
+///
+/// `match` exhaustif **sans bras `_ =>`**, comme chez la sœur : `Allowed` ne
+/// compose rien, et une troisième issue devra être tranchée ici.
+fn refusal_body(decision: ForcePromoteTurnDecision, dispatch_class: &str) -> String {
+    match decision {
+        ForcePromoteTurnDecision::RefusedWebhookPrTurn => format!(
+            "{PROMOTE_REFUSAL_PREFIX} — NOTHING WAS PROMOTED; the deferred wrapper for \
+             class '{dispatch_class}' is untouched and still pending. This turn was opened \
+             by a GitHub pull-request or check-suite event, which authorizes reviewing and \
+             reporting on that pull request — not deciding which dispatch takes the \
+             '{dispatch_class}' slot.\n\n\
+             Forcing the promotion here buys exactly two things, and neither belongs to \
+             this turn: a head start of at most one engine scan, and a bypass of the \
+             operator-priority check that the engine itself honours. The engine promotes \
+             this wrapper ON ITS OWN at its next scan, as soon as the class has room — so \
+             not forcing it is the nominal path, not a delay you have to work around.\n\n\
+             One exit, and it is the only one: finish this turn on what the event actually \
+             asks of you — look at the pull request, report what you observed, and stop. \
+             Lifting this refusal belongs to an operator, on the host; it is not lifted by \
+             retrying under a different shape."
+        ),
+        // Hors population : aucun corps. Le `match` reste exhaustif pour
+        // qu'une troisième issue soit tranchée ici par le compilateur.
+        ForcePromoteTurnDecision::Allowed => String::new(),
+    }
+}
+
 pub struct PromoteDeferredCallbackTool;
 
 #[async_trait]
@@ -173,7 +215,10 @@ impl Tool for PromoteDeferredCallbackTool {
                 Fail-closed: if the per-class dispatch slot is already occupied by an active callback, \
                 the promotion is refused. In that case, surface the rejection to the operator via \
                 send_message — the operator can use `mika tasks promote-deferred <class> --override` \
-                to cancel the blocker and force promotion."
+                to cancel the blocker and force promotion. \
+                Not available on a turn opened by a GitHub pull-request or check-suite event: \
+                such a turn does not decide which dispatch takes the slot, and the engine \
+                promotes the next deferred wrapper on its own at its next scan (mika#2654)."
                     .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -199,6 +244,31 @@ impl Tool for PromoteDeferredCallbackTool {
                 "Invalid dispatch_class '{dispatch_class}'. Must be one of: {}",
                 VALID_DISPATCH_CLASSES.join(", ")
             )));
+        }
+
+        // ── Garde mika#2654 ──
+        //
+        // Placement : **après** la validation de `dispatch_class` (une entrée
+        // malformée lit la même erreur qu'ailleurs — le refus ne la masque
+        // pas), et **avant** `force_promote_deferred_for_class` — donc avant
+        // toute lecture et toute écriture en base. C'est l'ordre qu'AC2 exige :
+        // un tour PR dont la classe est au plafond est refusé sous le motif
+        // webhook, **jamais** sous `slot_busy`, parce que le second lirait
+        // comme un problème de créneau et orienterait vers le forçage.
+        //
+        // **Dans l'outil, jamais dans `force_promote_deferred_for_class`** :
+        // c'est ce qui préserve **par construction** le CLI
+        // `mika tasks promote-deferred` et le backstop périodique, qui
+        // partagent cette fonction de base et ne traversent aucun
+        // `ToolContext` (R5).
+        let decision = classify_force_promote_turn(ctx.is_webhook_pr_event_turn);
+        match decision {
+            ForcePromoteTurnDecision::RefusedWebhookPrTurn => {
+                return Ok(ToolOutput::error(refusal_body(decision, dispatch_class)));
+            }
+            // Hors population : rien n'a été composé, rien n'a été écrit, et
+            // la suite est octet pour octet celle d'avant (AC3).
+            ForcePromoteTurnDecision::Allowed => {}
         }
 
         let result = ctx
@@ -430,6 +500,169 @@ mod tests {
     }
 
     // ───────── mika#2654 — la garde, et ses deux issues ─────────
+
+    /// Un `ToolContext` de test sur un tour ouvert par un événement PR /
+    /// check-suite.
+    ///
+    /// Le booléen est posé **à la main** : `TestHarness::ctx()` le laisse à
+    /// `false`, exactement comme les vingt sites de production qui ne servent
+    /// pas de webhook. Ce qui veut dire que les trois tests ci-dessous
+    /// n'attestent **pas** le câblage — le champ pourrait n'être jamais calculé
+    /// au site de conversation et ils resteraient verts. C'est AC9 qui l'atteste,
+    /// et c'est pourquoi la mutation M4 ne fait rougir que lui.
+    fn webhook_pr_ctx(harness: &TestHarness) -> ToolContext<'_> {
+        let mut ctx = harness.ctx();
+        ctx.is_webhook_pr_event_turn = true;
+        ctx
+    }
+
+    /// **V1 (AC1)** — le défaut refermé : un tour webhook PR ne force pas la
+    /// promotion, et le wrapper n'a pas bougé.
+    #[tokio::test]
+    async fn mika2654_un_tour_webhook_pr_ne_force_pas_la_promotion() {
+        let harness = TestHarness::new();
+        let agent_id = &harness.db.agent_id;
+        let wrapper = harness
+            .db
+            .create_task(deferred_callback_task(agent_id, "implement"))
+            .await
+            .unwrap();
+
+        let ctx = webhook_pr_ctx(&harness);
+        let result = PromoteDeferredCallbackTool
+            .execute(serde_json::json!({"dispatch_class": "implement"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_error,
+            "la promotion doit être refusée : obtenu un succès — {}",
+            result.content
+        );
+        assert!(
+            result.content.starts_with(PROMOTE_REFUSAL_PREFIX),
+            "le refus doit ouvrir sur son préfixe de format de fil, sans quoi le \
+             compte de la sonde côté `tool_calls.output` est faux ; obtenu : {}",
+            result.content
+        );
+
+        // **L'assertion porteuse.** `promote_next_deferred_callback_for_class`
+        // passe la ligne à `completed` (c'est ce que « promouvoir » veut dire
+        // ici), donc `pending` dit littéralement qu'aucun créneau n'a été
+        // décidé — et pas seulement que l'outil a rendu une erreur.
+        let task = harness
+            .db
+            .get_task(&wrapper)
+            .await
+            .expect("task readable")
+            .expect("task exists");
+        assert_eq!(
+            task.status, "pending",
+            "INVARIANT VIOLÉ (AC1) : le wrapper a changé d'état — la garde \
+             tourne AVANT `force_promote_deferred_for_class`, donc avant toute \
+             écriture en base"
+        );
+    }
+
+    /// **V2 — LE contrôle négatif** : hors tour webhook PR, la promotion passe
+    /// comme avant.
+    ///
+    /// Sans lui, « la garde décide » ne se distingue pas de « la garde bloque
+    /// tout », et la seconde serait un correctif qui casse le chemin de reprise
+    /// (`DeferredDispatch`, callbacks de pilote : 31 des 73 appels mesurés) en
+    /// ayant l'air de fermer le ticket.
+    #[tokio::test]
+    async fn mika2654_hors_tour_webhook_pr_la_promotion_passe() {
+        let harness = TestHarness::new();
+        let agent_id = &harness.db.agent_id;
+        let wrapper = harness
+            .db
+            .create_task(deferred_callback_task(agent_id, "implement"))
+            .await
+            .unwrap();
+
+        // Même fixture que V1, à un booléen près : c'est l'axe, et rien d'autre.
+        let ctx = harness.ctx();
+        let result = PromoteDeferredCallbackTool
+            .execute(serde_json::json!({"dispatch_class": "implement"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            !result.is_error,
+            "INVARIANT VIOLÉ (AC3) : la garde a mordu hors de sa population — {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains(PROMOTE_REFUSAL_PREFIX),
+            "aucun refus hors population : {}",
+            result.content
+        );
+
+        let task = harness
+            .db
+            .get_task(&wrapper)
+            .await
+            .expect("task readable")
+            .expect("task exists");
+        assert_eq!(
+            task.status, "completed",
+            "la promotion doit aboutir exactement comme avant"
+        );
+    }
+
+    /// **V3 (AC2)** — l'ordre : classe au plafond sur un tour webhook PR ⇒
+    /// refus **webhook**, jamais `slot_busy`.
+    ///
+    /// Fixture de `test_promote_slot_busy`, à un booléen près. Le motif
+    /// importe autant que le refus : `slot_busy` se lit comme un problème de
+    /// **créneau** et sa remédiation oriente vers le forçage, alors que la
+    /// cause ici est la **classe de tour**. Et c'est aussi ce qui atteste que la
+    /// garde précède tout accès base : sous l'ordre inverse, la base aurait
+    /// répondu la première.
+    #[tokio::test]
+    async fn mika2654_la_classe_au_plafond_est_refusee_sous_le_motif_webhook() {
+        let harness = TestHarness::new();
+        let agent_id = &harness.db.agent_id;
+        let wrapper = harness
+            .db
+            .create_task(deferred_callback_task(agent_id, "implement"))
+            .await
+            .unwrap();
+        harness
+            .db
+            .create_task(real_callback_task(agent_id, "implement"))
+            .await
+            .unwrap();
+
+        let ctx = webhook_pr_ctx(&harness);
+        let result = PromoteDeferredCallbackTool
+            .execute(serde_json::json!({"dispatch_class": "implement"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(
+            result.content.starts_with(PROMOTE_REFUSAL_PREFIX),
+            "obtenu : {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("slot_busy"),
+            "INVARIANT VIOLÉ (AC2) : le refus est rendu sous le motif du \
+             créneau, dont la remédiation oriente vers le forçage — la garde a \
+             donc tourné APRÈS l'accès base ; obtenu : {}",
+            result.content
+        );
+
+        let task = harness
+            .db
+            .get_task(&wrapper)
+            .await
+            .expect("task readable")
+            .expect("task exists");
+        assert_eq!(task.status, "pending");
+    }
 
     /// **V6** — la table de vérité du classifieur, complète : deux entrées,
     /// deux issues.
