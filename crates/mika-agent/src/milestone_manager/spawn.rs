@@ -120,6 +120,54 @@ pub const DEFAULT_SILENCE_THRESHOLD_DAYS: u32 = 3;
 /// poll costs one `gh` invocation and a digest comparison — cheap.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
 
+/// Rend `None` — et le dit en ERROR — quand l'URL confiée à une variable de
+/// **rapport** vise un endpoint de **battement** (mika#2697).
+///
+/// Le défaut fondateur : `MIKA_MANAGER_DELIVERY_URL` visait
+/// `…/agents/mika-manager/heartbeat`, qui enregistre un tick, répond 201 pour
+/// n'importe quel nom d'entité et **ne conserve pas le corps**. Le POST
+/// réussissait, donc le cycle journalisait `manager_cycle_delivered route=http`,
+/// et le 2xx fermait aussi la porte du repli : trois semaines de rapports
+/// lisibles nulle part (dernier fichier du sink : 2026-09-27 06:08Z).
+///
+/// La garde **efface** la valeur plutôt que d'ouvrir une troisième route. C'est
+/// ce qui garde `cadence::url_is_routable` seul lecteur du prédicat de routage
+/// (mika#2267) : en aval, « URL effacée » et « URL absente » sont le *même* mot,
+/// donc `manager_delivery_resolved` annonce `delivery_url_set=false
+/// route_normal=offline_sink` sans qu'aucune ligne n'ait à le recalculer. Et la
+/// route obtenue est le sink **nominal**, pas `…_FALLBACK` : rien n'est tombé en
+/// panne, une variable était mal remplie.
+///
+/// La ligne ERROR nomme la variable fautive **et** la correcte — un opérateur
+/// qui lit « mauvaise URL » sans savoir où la mettre n'a pas de geste. Elle ne
+/// porte aucune URL ni aucun chemin : discipline du module (un journal porte des
+/// booléens et des noms), vérifiée par le balayage tous-champs de
+/// `tests/manager_delivery_observability_2267.rs`.
+///
+/// `pub` pour son test de contrat, pas pour des appelants — même raison
+/// qu'`emit_delivery_resolved` : la ligne ERROR est une surface opérateur, et le
+/// seul moyen honnête de l'épingler est d'appeler le site d'émission réel.
+pub fn reject_heartbeat_endpoint(url: Option<String>, env_var: &str) -> Option<String> {
+    let url = url?;
+    if !super::cadence::url_is_heartbeat_endpoint(&url) {
+        return Some(url);
+    }
+    error!(
+        target: "mika::milestone_manager",
+        event = "manager_report_url_rejected_heartbeat_endpoint",
+        env_var = env_var,
+        use_instead = ENV_LIVENESS_URL,
+        matched_segment = super::cadence::HEARTBEAT_PATH_SEGMENT,
+        route = super::cadence::ROUTE_OFFLINE_SINK,
+        "{env_var} vise un endpoint de battement : cet endpoint ne conserve pas \
+         le corps du rapport, donc le POST réussirait sans que rien ne soit \
+         lisible. L'URL est ignorée et le rapport part dans le sink disque. \
+         Déplacez-la vers {ENV_LIVENESS_URL}, qui est le canal de vivacité, \
+         puis redémarrez."
+    );
+    None
+}
+
 /// Assemble a `ManagerConfig` from the current process env, or return
 /// `Ok(None)` when the feature-gate env var is unset.
 ///
@@ -160,9 +208,16 @@ pub async fn manager_config_from_env(
     let poll_secs_effective = poll_secs.max(1).min(heartbeat_secs.max(1));
 
     // Optional string env vars — treat empty string as unset per convention.
-    let delivery_url = read_string_env(ENV_DELIVERY_URL);
+    // mika#2697 — les deux variables de RAPPORT passent par la garde : une URL
+    // de battement n'est pas une route de rapport, et sur les deux canaux
+    // l'erreur a la même forme et le même coût (un 201 qui jette le corps).
+    // `ENV_LIVENESS_URL` ne passe PAS par là : c'est la variable dont
+    // l'endpoint de battement est la cible légitime.
+    let delivery_url =
+        reject_heartbeat_endpoint(read_string_env(ENV_DELIVERY_URL), ENV_DELIVERY_URL);
     let delivery_token = read_string_env(ENV_DELIVERY_TOKEN);
-    let escalation_url = read_string_env(ENV_ESCALATION_URL);
+    let escalation_url =
+        reject_heartbeat_endpoint(read_string_env(ENV_ESCALATION_URL), ENV_ESCALATION_URL);
     let health_url = read_string_env(ENV_HEALTH_URL);
     // mika#1990 D4 — trois paliers de la forme maison : absente ou vide ⇒ canal
     // désarmé (zéro POST, zéro erreur) ; posée ⇒ canal armé. Aucune valeur
@@ -3367,5 +3422,113 @@ mod tests {
             classify_cycle_error_text("gh: the probe timed out after 15s"),
             AuthClass::Timeout
         );
+    }
+
+    // ---- mika#2697 — une URL de battement ne devient pas une route de rapport ----
+
+    /// Les trois cas que le ticket demande de tester **sans réseau**, dans un
+    /// seul test parce que c'est leur comparaison qui dit la règle : l'URL
+    /// heartbeat doit donner *exactement* la route de l'URL absente.
+    ///
+    /// Le test passe par `manager_config_from_env` (le vrai site de lecture de
+    /// l'environnement) puis par `cadence::route_name_for` (le vrai décideur de
+    /// route), donc il épingle la chaîne complète et non le prédicat seul : une
+    /// garde correcte jamais appelée laisserait les tests de `cadence` verts.
+    #[tokio::test]
+    #[serial]
+    async fn mika2697_une_url_de_battement_route_vers_le_sink_comme_une_url_absente() {
+        let heartbeat = "https://cm.example.com/api/v1/agents/mika-manager/heartbeat";
+        let ingestion = "https://cm.example.com/api/v1/messages/dispatch";
+
+        // Cas 1 — URL de battement ⇒ effacée, donc route sink.
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        set_env(ENV_DELIVERY_URL, heartbeat);
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(
+            cfg.delivery_url, None,
+            "la garde EFFACE la valeur : en aval, « refusée » et « absente » \
+             doivent être le même mot (mika#2267, lecteur unique)"
+        );
+        assert_eq!(
+            crate::milestone_manager::cadence::route_name_for(cfg.delivery_url.as_deref()),
+            crate::milestone_manager::cadence::ROUTE_OFFLINE_SINK,
+            "le sink NOMINAL, pas le repli : rien n'est tombé en panne, \
+             une variable était mal remplie"
+        );
+
+        // Cas 2 — URL d'ingestion ⇒ intacte, donc route http.
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        set_env(ENV_DELIVERY_URL, ingestion);
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(
+            cfg.delivery_url.as_deref(),
+            Some(ingestion),
+            "la garde ne juge qu'un endpoint de battement : tout le reste passe"
+        );
+        assert_eq!(
+            crate::milestone_manager::cadence::route_name_for(cfg.delivery_url.as_deref()),
+            crate::milestone_manager::cadence::ROUTE_HTTP
+        );
+
+        // Cas 3 — URL absente ⇒ le témoin de la route sink, celui auquel le
+        // cas 1 doit être identique.
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(cfg.delivery_url, None);
+        assert_eq!(
+            crate::milestone_manager::cadence::route_name_for(cfg.delivery_url.as_deref()),
+            crate::milestone_manager::cadence::ROUTE_OFFLINE_SINK
+        );
+
+        clear_manager_env();
+    }
+
+    /// `MIKA_MANAGER_ESCALATION_URL` est l'autre canal de rapport, et l'erreur
+    /// y a la même forme et le même coût : un 201 qui jette le corps. La garde
+    /// couvre donc les deux variables — et pas `MIKA_MANAGER_LIVENESS_URL`,
+    /// dont l'endpoint de battement est la cible **légitime** : ce dernier point
+    /// est l'assertion qui empêche de « généraliser » la garde à tout le module.
+    #[tokio::test]
+    #[serial]
+    async fn mika2697_la_garde_couvre_lescalade_et_epargne_le_canal_de_vivacite() {
+        let heartbeat = "https://cm.example.com/api/v1/agents/mika-manager/heartbeat";
+
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        set_env(ENV_ESCALATION_URL, heartbeat);
+        set_env(ENV_LIVENESS_URL, heartbeat);
+
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(
+            cfg.escalation_url, None,
+            "l'escalade est un rapport : même garde, même effacement"
+        );
+        assert_eq!(
+            cfg.liveness_url.as_deref(),
+            Some(heartbeat),
+            "le canal de vivacité garde son URL : c'est LA variable que le \
+             ticket demande de faire viser le battement"
+        );
+
+        clear_manager_env();
+        // SAFETY: tests are serialized via `#[serial_test::serial]`.
+        // `clear_manager_env` ne touche pas LIVENESS (il appartient à
+        // `liveness.rs`) — on le retire ici pour ne pas fuir sur le test suivant.
+        unsafe { env::remove_var(ENV_LIVENESS_URL) };
     }
 }
