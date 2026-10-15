@@ -108,7 +108,7 @@ fn run_reports(
             "{}",
             serde_json::to_string_pretty(&listing_json(&listing, limit))?
         ),
-        OutputFormat::Yaml => print!("{}", serde_yaml::to_string(&listing_json(&listing, limit))?),
+        OutputFormat::Yaml => print!("{}", yaml_serde::to_string(&listing_json(&listing, limit))?),
     }
     Ok(())
 }
@@ -233,7 +233,7 @@ fn emit<T: serde::Serialize>(value: &T, format: OutputFormat) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(value)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(value)?);
+            print!("{}", yaml_serde::to_string(value)?);
         }
         OutputFormat::Text => {
             // For the `read`/`assess` subcommands, text output falls back
