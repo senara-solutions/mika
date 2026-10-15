@@ -257,12 +257,23 @@ const QA_REVIEWER_LOGIN: &str = mika_common::forge_identity::REVIEWER_FORGE_LOGI
 /// Adding a repo here is a code change + deploy — intentionally not env-tunable
 /// (security-adjacent: changes on release cadence, not ops cadence).
 ///
+/// **Un dépôt renommé porte ici son nom courant, sans alias** (mika#2666).
+/// Cette liste est *autorisante* : une entrée **ouvre** une route. GitHub met le
+/// nom courant dans `repository.full_name`, donc garder l'ancien n'ouvre rien
+/// d'utile et ne laisse qu'une entrée morte dans une liste adjacente à la
+/// sécurité. La règle est **inverse** pour une liste *restrictive* comme
+/// `mika_common::forge_identity::MPC_GATE_REQUIRED_REPOS`, qui exige une trace
+/// avant merge : là, l'ancien nom reste en alias, parce qu'un appelant qui
+/// l'écrit encore atteint la même PR par redirection GitHub et ne doit pas
+/// trouver la porte ouverte. Les deux listes divergent donc à dessein — voir
+/// `docs/solutions/security-issues/repo-name-keyed-guard-goes-inert-on-rename-keep-the-alias-2026-10-05.md`.
+///
 /// See: mika#1382 (cross-repo ready-label dispatch).
 const INTERNAL_REPOS: &[&str] = &[
     "senara-solutions/mika",
     "senara-solutions/mika-cloud",
     "senara-solutions/mika-skills",
-    "senara-solutions/claude-pilot-py",
+    "senara-solutions/claude-pilot",
     "senara-solutions/mika-platform",
     "senara-solutions/wizzard",
 ];
@@ -2055,7 +2066,7 @@ mod tests {
         assert!(is_internal_repo("senara-solutions/mika"));
         assert!(is_internal_repo("senara-solutions/mika-cloud"));
         assert!(is_internal_repo("senara-solutions/mika-skills"));
-        assert!(is_internal_repo("senara-solutions/claude-pilot-py"));
+        assert!(is_internal_repo("senara-solutions/claude-pilot"));
         assert!(is_internal_repo("senara-solutions/mika-platform"));
         assert!(is_internal_repo("senara-solutions/wizzard"));
     }
@@ -2066,6 +2077,18 @@ mod tests {
         assert!(!is_internal_repo("other-org/mika"));
         assert!(!is_internal_repo(""));
         assert!(!is_internal_repo("mika"));
+        // mika#2666 — l'ancien nom du dépôt renommé n'est PAS un alias ici.
+        // `INTERNAL_REPOS` est une liste *autorisante* : une entrée ouvre une
+        // route sans ligne `github_repos`. GitHub n'envoie que le nom courant,
+        // donc l'alias n'ouvrirait rien qui soit utile — il ne laisserait
+        // qu'une entrée morte dans une liste adjacente à la sécurité. La règle
+        // inverse vaut pour `MPC_GATE_REQUIRED_REPOS`, qui est *restrictive* et
+        // garde les deux noms (`mika_common::forge_identity`).
+        assert!(
+            !is_internal_repo("senara-solutions/claude-pilot-py"),
+            "liste autorisante : l'ancien nom n'ouvre pas de route (mika#2666, D1). \
+             Ne pas le rajouter « par symétrie » avec MPC_GATE_REQUIRED_REPOS, qui est restrictive."
+        );
     }
 
     // -- Message text formatting tests --

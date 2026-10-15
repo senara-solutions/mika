@@ -307,9 +307,16 @@ const MPC_GATE_MARKER_SUFFIX: &str = "-->";
 /// **L'ancien nom est gardé comme alias, et ce n'est pas de la nostalgie.** GitHub
 /// redirige un dépôt renommé : `gh pr merge <n> --repo senara-solutions/claude-pilot-py`
 /// atteint la même PR. Un appelant qui écrit encore l'ancien nom — un prompt
-/// périmé, `INTERNAL_REPOS` du gateway qui le liste toujours — ne doit pas
-/// trouver la porte ouverte pour autant. Retirer l'alias rouvrirait ce chemin ;
-/// le garder ne coûte rien, puisque la population ne grossit pas.
+/// périmé, un script d'opérateur, une main humaine — ne doit pas trouver la
+/// porte ouverte pour autant. Retirer l'alias rouvrirait ce chemin ; le garder
+/// ne coûte rien, puisque la population ne grossit pas.
+///
+/// **La règle est inverse pour une liste autorisante** (mika#2666) : depuis ce
+/// ticket, `INTERNAL_REPOS` du gateway (`crates/mika-gateway/src/github.rs`)
+/// ne porte que le nom courant, car une entrée y **ouvre** une route et
+/// l'ancien nom n'en ouvrirait aucune qui soit utile. Ici une entrée **ferme**
+/// une porte, donc l'alias est une protection. Les deux listes divergent à
+/// dessein ; ne pas les aligner « par symétrie ».
 ///
 /// **Ajouter un dépôt ici ajoute un aller-retour `gh` à chacun de ses merges**
 /// (plan R10) — à savoir avant d'y toucher, pas à découvrir après.
