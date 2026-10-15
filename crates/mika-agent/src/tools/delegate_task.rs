@@ -312,6 +312,10 @@ impl Tool for DelegateTaskTool {
             message_sender: delegate_sender,
             // Propagate the orchestrator's trace_id so delegate events correlate.
             trace_id: Some(ctx.trace_id.to_string()),
+            // mika#1926: the delegating agent is the conversational parent. Same
+            // shape as the `chat_id` read above — the delegate's own agent-scoped
+            // rows don't carry what the user told the delegator.
+            parent_agent_id: Some(current_agent_id),
         };
 
         let result = crate::agent::run_team_agent(&params).await;
