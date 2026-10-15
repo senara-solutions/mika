@@ -105,11 +105,15 @@ Chaque vol est mergeable seul. Le vol 1 laisse la CI verte et la boucle
 inchangée ; le vol 2 n'a plus qu'à ajouter un lecteur devant un canal déjà
 attesté en production.
 
-`Tracked in: senara-solutions/mika#2716`
+Tracked in: senara-solutions/mika#2716
 
 L'implémenteur du vol 1 ouvre le ticket de suivi du vol 2 **avant** d'ouvrir sa
 PR et met son numéro en `Tracked in:` du corps (règle mika#2701) ; à défaut,
 mika#2716 reste ouvert et porte le reste.
+
+Le découpage est ici **volontaire**, non imposé par la borne : le vol 1 mesuré
+tient sous elle (§ 9). Il est dicté par l'ordre que le ticket prescrit — doter et
+attester avant d'armer — et non par un total qu'il faudrait faire passer.
 
 ## 4. Périmètre du vol 1 — conception
 
@@ -180,23 +184,72 @@ en deux assertions grep-visibles :
    `_PILOT_EGRESS_SENTINEL="$GH_TOKEN"` passerait la première et réouvrirait
    mika#2039 en entier.
 
-`scripts/test-verify-no-secret-in-setenv.sh` reçoit la fixture de la nouvelle
-surface : une copie mutée où la sentinelle est assignée depuis `$GH_TOKEN`, vue
-**rouge** avant le correctif. La forme `--setenv GH_TOKEN "$AUTRE"` est déjà
-couverte par la règle `CRED_NAME_PATTERN` existante et n'a pas besoin de sa
-propre fixture.
+Deux contraintes que la lecture de `scripts/test-verify-no-secret-in-setenv.sh`
+impose à la rédaction de la règle, et qu'il faut connaître **avant** de l'écrire
+— les ignorer casse six cas verts aujourd'hui :
 
-### 4.3 Migration des quatre gardes co-dépendantes
+- **La règle doit accepter le littéral *et* la variable, pas la variable seule.**
+  `gh_placeholder_fixture` (l.223-230) plante `--setenv GH_TOKEN
+  "proxy-managed-no-secret"` dans la fixture *seulement si* la source vive ne le
+  porte plus — ce qui sera exactement le cas après ce vol. La fixture portera
+  donc **deux** occurrences : la plantée (littérale) et la vraie
+  (`"$_PILOT_EGRESS_SENTINEL"`). Une règle n'admettant que la variable rendrait
+  `_total=2, _conformes=1` et ferait rougir le cas l.232-234, qui attend `exit 0`.
+  C'est cette fixture auto-adaptative — et non un confort de rédaction — qui
+  rend la liste des formes conformes binaire.
+- **Le message de violation doit continuer d'interpoler `$EXEMPT_SETENV_VALUE`.**
+  L'assertion l.240 (`real GH_TOKEN: names the placeholder it lost`) cherche la
+  chaîne `proxy-managed-no-secret` **dans la sortie du lint**. Le message actuel
+  la tient par interpolation (l.242) ; un message réécrit qui ne nommerait plus
+  que la variable rougirait cette assertion sans rien dire du pourquoi.
 
-Chacune ancre aujourd'hui sur le littéral exact et rougirait sinon. Le delta est
-un élargissement d'ancrage, pas une réécriture :
+À ces conditions, les six cas GH_TOKEN de cette suite (l.232-269) survivent
+**sans migration** : chacun opère sur la fixture plantée. La suite ne reçoit donc
+qu'un ajout — la fixture de la nouvelle surface : une copie mutée où la
+sentinelle est assignée depuis `$GH_TOKEN`, vue **rouge** avant le correctif.
 
-| garde | ancrage | en CI |
-|---|---|---|
-| `tests/test_sandbox_no_secret_in_argv.sh` Test 10b + 12(b) | littéral → `<prefix>(-[0-9a-f]{32})?` | oui (ci.yml:110) |
-| `tests/test-pilot-github-token-not-in-sandbox.sh` PART C | idem ; les assertions sur le vrai jeton sont **conservées** | oui (ci.yml:118) |
-| `tests/test_sandbox_gh_usable.sh` | `gh auth token` renvoie la sentinelle, rc 0 | non (`make test`) |
-| `scripts/canary-pilot-containment` | le `case` à trois états en gagne un quatrième | non (opérateur) |
+La forme `--setenv GH_TOKEN "$AUTRE"` est couverte par la règle 2 elle-même
+(`_total != _conformes`), et déjà épinglée par le cas `real-gh-token.sh`
+(l.236-241) — **pas** par `CRED_NAME_PATTERN` : `GH_TOKEN` est un nom exempté,
+donc `is_exempt_name` le fait sortir en `continue` (l.247) avant que la branche
+`CRED_NAME_PATTERN` (l.249) soit atteinte. Elle n'a pas besoin de sa propre
+fixture, mais la raison n'est pas celle qu'on croirait.
+
+### 4.3 Migration des ancrages co-dépendants — recensés par `grep`, pas de mémoire
+
+Le recensement est `grep -rn "proxy-managed-no-secret"` sur `skills/bundled/_shared/tests/`,
+`scripts/` et `Makefile`. Il rend **cinq** fichiers, et la nature de l'ancrage
+diffère d'un site à l'autre — c'est cette différence qui compte, parce qu'un
+seul des sites échoue **en silence** :
+
+| site | ligne(s) | nature | delta | en CI |
+|---|---|---|---|---|
+| `tests/test_sandbox_no_secret_in_argv.sh` | 525, 589 (+ prose 26, 188) | assertion d'égalité | littéral → `<prefix>(-[0-9a-f]{32})?` | oui (ci.yml:113) |
+| `tests/test-pilot-github-token-not-in-sandbox.sh` | 255 | assertion d'égalité | idem ; les assertions sur le vrai jeton **conservées** | oui (ci.yml:123) |
+| `tests/test_sandbox_gh_usable.sh` | 52, 157 | assertion d'égalité | `gh auth token` rend la sentinelle, rc 0 | non (`make test`) |
+| `tests/test_sandbox_gh_usable.sh` | **98** | **mutation** | voir ci-dessous — **échoue en silence** | non (`make test`) |
+| `scripts/canary-pilot-containment` | 693-696 | `case` à trois états | en gagne un quatrième | non (opérateur) |
+| `scripts/test-verify-no-secret-in-setenv.sh` | 223-230 | fixture auto-adaptative | **aucun** — voir § 4.2 | oui (ci.yml:114) |
+
+**Le site 98 est le piège de ce vol.** Il ne vérifie rien : il *fabrique* le
+contrôle négatif en retirant la ligne du placeholder de `dispatch-lib.sh` —
+
+```bash
+grep -vF -- "--setenv GH_TOKEN \"$PLACEHOLDER\"" "$DISPATCH_LIB" > "$MUTATED_LIB"
+```
+
+— pour prouver qu'à défaut de placeholder `gh` s'arrête sur `gh auth login`.
+Quand la ligne vive porte `"$_PILOT_EGRESS_SENTINEL"`, ce `grep -vF` ne
+correspond plus à rien : il recopie le fichier **intact**, `MUTATED_LIB` devient
+identique à l'original, et le contrôle négatif mesure la sandbox *dotée* au lieu
+de la sandbox *démunie*. Selon l'assertion attachée il rougira par chance ou
+restera **vert et vacant** — la seconde issue est celle qui coûte, parce qu'elle
+retire une garde du pipeline sans le dire. Le delta est donc d'ancrer la mutation
+sur la **forme** (`perl -ne` / `grep -vE` sur
+`--setenv GH_TOKEN "(\$_PILOT_EGRESS_SENTINEL|proxy-managed-no-secret[^"]*)"`),
+et d'y adjoindre l'assertion anti-vacuité que le repo exige partout ailleurs :
+`MUTATED_LIB` compte **une ligne de moins** que `DISPATCH_LIB`, sinon le test
+échoue en nommant la mutation qui n'a rien muté.
 
 Le canari n'est **pas** reportable au vol 2 : son `case` actuel classe toute
 valeur autre que le littéral en `LEAK: GH_TOKEN carries a value other than the
@@ -218,7 +271,7 @@ Aucune quote simple dans ces messages : le bloc vit dans un payload
 ### 4.4 La sonde — nouvelle suite `tests/test_egress_sentinel_staging.sh`
 
 Cible `make test-egress-sentinel-staging`, **ajoutée à `ci.yml`** à côté des
-gardes du canal secret (ci.yml:110). Elle monte le relais factice
+gardes du canal secret (ci.yml:111-114). Elle monte le relais factice
 `lib-fake-egress-relay.sh` comme ses voisines. C'est elle, la « sonde qui
 atteste la sentinelle au démarrage de la sandbox » que le ticket réclame :
 
@@ -229,10 +282,19 @@ atteste la sentinelle au démarrage de la sandbox » que le ticket réclame :
    premier pilote.
 3. **Permissions.** Registre `0700`, entrées `0600`, et le registre n'est pas
    parmi les binds de la sandbox.
-4. **Bout en bout.** La valeur que `gh auth token` rend **dans** le vrai bwrap
-   est exactement l'entrée écrite côté hôte. Échec, jamais skip, si `gh` est
-   présent sur l'hôte et invisible dans la sandbox — seule l'absence hôte de
-   `bwrap` ou de `gh` justifie un skip (mika#2572 corollaire 3).
+4. **Identité registre ↔ sandbox.** La valeur portée par `--setenv GH_TOKEN`
+   est exactement l'entrée écrite dans le registre côté hôte. C'est la seule
+   assertion propre à cette suite, et c'est celle dont le vol 2 dépend : il
+   comparera le credential présenté aux entrées du registre, donc une divergence
+   ici est un 403 là-bas.
+
+   Elle est délibérément mesurée sur l'argv capturé par le relais factice, **non**
+   dans un bwrap réel : `test_sandbox_gh_usable.sh:157` (`gh auth token` dans un
+   vrai bwrap) et `test_sandbox_no_secret_in_argv.sh:589` (`GH_TOKEN` dans un
+   vrai bwrap) montent déjà ce bwrap, et leur ancrage élargi au § 4.3 y mesure la
+   **forme** de la sentinelle. Remonter un troisième bwrap ici n'ajouterait
+   qu'une troisième occasion de skip sur hôte sans `bwrap` — pour une propriété
+   déjà tenue en CI par deux suites.
 5. **Interrupteur.** Sous `MIKA_PILOT_EGRESS_SENTINEL=0`, la sandbox porte le
    littéral nu et le registre ne gagne aucune entrée.
 6. **Fail-open.** Registre rendu non inscriptible → littéral nu, message sur
@@ -261,7 +323,8 @@ lui livre une sentinelle qu'aucune garde n'épingle.
    `verify-no-secret-in-setenv` et les trois suites : c'est la mesure que les
    gardes portaient bien sur la valeur.)*
 2. **PLANCHER** — `verify-no-secret-in-setenv.sh` (exemption + provenance) + sa
-   fixture, puis les quatre ancrages co-dépendants. Arbre vert.
+   fixture, puis les cinq ancrages co-dépendants du § 4.3 — dont la mutation de
+   `test_sandbox_gh_usable.sh:98`, celle qui ne rougit pas d'elle-même. Arbre vert.
 3. `test(infra)` — la suite de staging + la cible Makefile + l'entrée `ci.yml`.
 4. `docs` — variable d'environnement, note de solution.
 
@@ -272,7 +335,8 @@ lui livre une sentinelle qu'aucune garde n'épingle.
       `0700` à entrées `0600`, et fail-open sur le littéral nu.
 - [ ] `--setenv GH_TOKEN` porte `"$_PILOT_EGRESS_SENTINEL"` et le lint le vérifie
       par nom de variable **et** par provenance.
-- [ ] Les quatre gardes co-dépendantes sont migrées ; `make test-sandbox-secret-argv`,
+- [ ] Les cinq ancrages co-dépendants du § 4.3 sont migrés, mutation l.98
+      comprise, et son assertion anti-vacuité existe ; `make test-sandbox-secret-argv`,
       `make verify-no-secret-in-setenv`, `make test-github-token-not-in-sandbox`,
       `make test-sandbox-gh-usable` passent.
 - [ ] `make test-egress-sentinel-staging` existe, passe, et est appelée par `ci.yml`.
@@ -313,11 +377,16 @@ ci-dessous sont dérivés de son § *Proposed Solution* et bornés au vol 1.
    recevoir un 403 que `origin/main` n'aurait pas produit.
 8. **AC8 — le reste est nommé.** Le corps de PR porte une ligne `Tracked in:`
    désignant le vol 2 (403 à deux motifs, log `DENY`, purge TTL).
+9. **AC9 — aucune garde ne devient vacante.** Le contrôle négatif de
+   `test_sandbox_gh_usable.sh` mute toujours réellement `dispatch-lib.sh` :
+   `MUTATED_LIB` porte une ligne de moins que la source, et le test échoue en
+   nommant la mutation si ce n'est pas le cas. Prouvé en inversant l'ancrage dans
+   une copie sous `.pilot-scratch/` et en constatant l'échec. (§ 4.3, § 8.)
 
 ## 8. Fire-Disposition
 
 Le vol 1 livre des détecteurs : la règle de provenance de
-`verify-no-secret-in-setenv.sh`, les quatre ancrages migrés, la suite
+`verify-no-secret-in-setenv.sh`, les cinq ancrages migrés, la suite
 `test_egress_sentinel_staging.sh`, le `case` du canari.
 
 **Option retenue : (a) exception nommée en allowlist — avec une allowlist
@@ -342,10 +411,18 @@ Détail d'implémentation, et pourquoi elle est vide :
   seconde occurrence non conforme apparaît. La règle de provenance rougit si
   `_PILOT_EGRESS_SENTINEL` se met à lire une source de jeton. Les deux sont
   épinglées par une fixture vue rouge avant le correctif.
+- **Second anti-stale, et il porte sur un détecteur qui ne rougit pas de
+  lui-même.** Le contrôle négatif de `test_sandbox_gh_usable.sh` tient à une
+  mutation `grep -vF` qui, désancrée, recopie le fichier intact et mesure la
+  sandbox dotée en croyant mesurer la sandbox démunie (§ 4.3). Son anti-stale est
+  un compte : `MUTATED_LIB` doit porter une ligne de moins que `DISPATCH_LIB`,
+  faute de quoi le test échoue en nommant la mutation qui n'a rien muté. Sans
+  cette assertion le détecteur reste **vert et vacant** — la seule forme de
+  régression que ce vol peut introduire sans qu'aucune garde ne crie.
 - **Aucun détecteur n'atterrit désarmé.** Pas de `#[ignore]`, pas de
   `#[cfg(skip)]` : tous sont verts au merge sur un arbre sain, et la nouvelle
   suite est appelée par `ci.yml` dans le même commit qui la crée — une garde que
-  le pipeline ne lance pas ne refuse rien (leçon mika#2578, ci.yml:115-121).
+  le pipeline ne lance pas ne refuse rien (leçon mika#2578, ci.yml:116-123).
 
 ## 9. Taille estimée
 
@@ -353,22 +430,41 @@ Détail d'implémentation, et pourquoi elle est vide :
 |---|---|
 | `skills/bundled/_shared/dispatch-lib.sh` (sentinelle per-spawn, registre, interrupteur, `--setenv`, commentaires d'audit) | 58 |
 | `scripts/verify-no-secret-in-setenv.sh` (exemption par variable + règle de provenance) | 30 |
-| `scripts/test-verify-no-secret-in-setenv.sh` (fixture de provenance) | 15 |
-| `skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh` (Test 10b, 12b) | 22 |
-| `skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh` (PART C) | 12 |
-| `skills/bundled/_shared/tests/test_sandbox_gh_usable.sh` (ancrage) | 10 |
-| tests (`skills/bundled/_shared/tests/test_egress_sentinel_staging.sh`) + cible `Makefile` + entrée `ci.yml` | 65 |
+| `scripts/test-verify-no-secret-in-setenv.sh` (fixture de provenance ; les six cas GH_TOKEN survivent sans migration, § 4.2) | 15 |
+| `skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh` (l.525, 589 + prose 26, 188) | 22 |
+| `skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh` (l.255) | 12 |
+| `skills/bundled/_shared/tests/test_sandbox_gh_usable.sh` (assertions l.52/157 + **mutation l.98 et son assertion anti-vacuité**, § 4.3) | 18 |
+| tests (`skills/bundled/_shared/tests/test_egress_sentinel_staging.sh`, 6 cas sans troisième bwrap) + cible `Makefile` + entrée `ci.yml` | 50 |
 | `scripts/canary-pilot-containment` (quatrième état) | 20 |
 
-Total estimé : 232 lignes
+Total estimé : 225 lignes
 Plafond de tours : 150 (défaut)
 Borne par vol : 243 lignes estimées — (150 − 35 − 50) × 7,5 / 2
 
-**Pourquoi ce vol tient sous la borne.** 232 < 243, avec 11 lignes de marge
-seulement — c'est serré et assumé : les quatre gardes co-dépendantes (64 lignes)
-ne sont pas compressibles, puisque c'est le changement de valeur qui les rougit
-et qu'un vol qui les laisse rouges ne merge pas. Deux choses ont été
-explicitement renvoyées au vol 2 pour tenir, et chacune est renvoyée **avec son
+**Pourquoi ce vol tient sous la borne.** 225 < 243, soit 18 lignes de marge. La
+mesure a bougé deux fois dans les deux sens depuis le premier passage, et dire
+d'où elle vient vaut mieux que le nombre : +8 sur `test_sandbox_gh_usable.sh`,
+parce que le recensement par `grep` a rendu un cinquième ancrage que la mémoire
+avait manqué — la mutation de la l.98, dont l'échec est silencieux (§ 4.3) ;
+−15 sur la nouvelle suite, parce que son cas « bout en bout » remontait un
+troisième bwrap pour une propriété que deux suites déjà en CI mesurent après
+élargissement d'ancrage (§ 4.4 cas 4).
+
+La répartition : 153 lignes de travail neuf (dispatch-lib 58, la règle de lint
+30 et sa fixture de provenance 15, la suite de staging 50) et 72 lignes de
+**migration d'ancrages** sur quatre fichiers que rien n'oblige à toucher sinon
+le changement de valeur. Ces 72 lignes ne sont pas compressibles — un vol qui
+laisse ces gardes rouges ne merge pas — et la voie qui les éviterait toutes a
+été examinée puis écartée : porter la sentinelle dans une variable **distincte**
+de `GH_TOKEN` la mettrait hors de tout ancrage existant et hors de
+`CRED_NAME_PATTERN` (ni `TOKEN`, ni `SECRET`, ni `KEY` dans un nom comme
+`MIKA_EGRESS_SENTINEL`), donc ≈ 100 lignes de moins et aucune garde à migrer.
+Elle ne fermerait **rien** : un test qui écrase `GH_TOKEN` laisserait la
+sentinelle intacte et serait autorisé, et l'incident mika#2713 se reproduirait à
+l'identique (§ 2, dernier paragraphe). Ces 72 lignes sont le prix du seul canal
+qui atteste.
+
+Deux choses ont été explicitement renvoyées au vol 2, et chacune l'est **avec son
 lecteur** plutôt que livrée orpheline :
 
 - la purge TTL du registre — elle n'a de sens qu'avec le code qui lit le
@@ -379,8 +475,8 @@ lecteur** plutôt que livrée orpheline :
   estimé à ≈ 80 lignes plus ≈ 70 de tests, donc un vol propre.
 
 Le vol 1 stage malgré tout le registre, et la suite le lit : sans cela le vol 2
-devrait construire le canal **et** son lecteur dans le même vol, et les 11
-lignes de marge de celui-ci seraient payées deux fois.
+devrait construire le canal **et** son lecteur dans le même vol, et le coût de
+celui-ci serait payé deux fois.
 
 ## 10. Risques et arbitrages
 
@@ -391,7 +487,7 @@ lignes de marge de celui-ci seraient payées deux fois.
 | R3 | **Deux pilotes concurrents.** Le mitmdump est long-lived et partagé. | Registre-répertoire dès le vol 1, et non fichier unique ; cas 2 de la suite l'épingle. C'est le défaut structurel qui aurait été découvert au vol 2, en production. |
 | R4 | **Faux LEAK du canari** après déploiement. | § 4.3 : le `case` est migré dans ce vol, pas au suivant. Précédent exact : mika#2572 § 5. |
 | R5 | **`gh` refuse une valeur de 54 caractères.** | `gh` accepte toute chaîne non vide en `GH_TOKEN` ; la mesure de mika#2572 (table § Symptômes) porte sur la présence, pas sur la forme. Cas 4 de la suite le mesure dans un vrai bwrap plutôt que de le supposer. |
-| R6 | **Marge de 11 lignes.** Un dépassement en implémentation repasse au-dessus de la borne. | La variable d'ajustement nommée à l'avance : le canari (20 lignes, hors CI, § 4.3) part au vol 2 **avec** son faux LEAK documenté comme régression connue du vol 1. À n'employer que si la mesure réelle dépasse, et à dire dans le corps de PR. |
+| R6 | **Marge de 18 lignes.** Un dépassement en implémentation repasse au-dessus de la borne. | La variable d'ajustement nommée à l'avance : le **cas 3** de la suite de staging (permissions `0700`/`0600` du registre, ≈ 10 lignes) part au vol 2. Elle est choisie parce que la propriété est tenue **par construction** au site d'écriture (`mkdir` en `0700`, écriture sous `umask 077`, § 4.1 point 3) et que le vol 2 est celui qui *lit* le registre : elle le rejoint donc avec son lecteur, comme la purge TTL. À n'employer que si la mesure réelle dépasse, et à dire dans le corps de PR. **Ce n'est pas le canari** : le § 4.3 établit que le reporter produit un faux LEAK dès le premier dispatch, et une garde de sécurité qui crie à tort coûte plus que 20 lignes. |
 
 ## 11. Hors périmètre, délibérément
 
