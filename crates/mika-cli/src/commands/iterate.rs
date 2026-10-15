@@ -111,7 +111,7 @@ pub(crate) async fn run_with_out(args: IterateArgs, out: &mut impl Write) -> Res
 
     match args.format {
         OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&body)?)?,
-        OutputFormat::Yaml => writeln!(out, "{}", serde_yaml::to_string(&body)?)?,
+        OutputFormat::Yaml => writeln!(out, "{}", yaml_serde::to_string(&body)?)?,
         OutputFormat::Text => render_text(status.as_u16(), &body, out)?,
     }
 

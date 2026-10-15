@@ -56,7 +56,7 @@ fn list(global_home: &std::path::Path, format: &crate::cli::OutputFormat) -> Res
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
             crate::cli::OutputFormat::Yaml => {
-                print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                print!("{}", yaml_serde::to_string(&serde_json::json!([]))?)
             }
             crate::cli::OutputFormat::Text => {
                 println!("\n  No teams found. Run `mika teams create <name>` to create one.\n");
@@ -102,7 +102,7 @@ fn list(global_home: &std::path::Path, format: &crate::cli::OutputFormat) -> Res
                     }),
                 })
                 .collect();
-            print!("{}", serde_yaml::to_string(&entries)?);
+            print!("{}", yaml_serde::to_string(&entries)?);
         }
         crate::cli::OutputFormat::Text => {
             println!("\n  Teams:");
@@ -235,7 +235,7 @@ fn status(
                     "ended_at": run.ended_at,
                 });
             }
-            print!("{}", serde_yaml::to_string(&obj)?);
+            print!("{}", yaml_serde::to_string(&obj)?);
         }
         crate::cli::OutputFormat::Text => {
             println!("\n  Team: {}", def.team.name);
@@ -284,7 +284,7 @@ fn log(
             match format {
                 crate::cli::OutputFormat::Json => println!("[]"),
                 crate::cli::OutputFormat::Yaml => {
-                    print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                    print!("{}", yaml_serde::to_string(&serde_json::json!([]))?)
                 }
                 crate::cli::OutputFormat::Text => {
                     println!("\n  No runs found for team '{name}'.\n");
@@ -299,7 +299,7 @@ fn log(
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
             crate::cli::OutputFormat::Yaml => {
-                print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                print!("{}", yaml_serde::to_string(&serde_json::json!([]))?)
             }
             crate::cli::OutputFormat::Text => {
                 println!("\n  No runs found for team '{name}'.\n");
@@ -339,7 +339,7 @@ fn log(
                     })
                 })
                 .collect();
-            print!("{}", serde_yaml::to_string(&entries)?);
+            print!("{}", yaml_serde::to_string(&entries)?);
         }
         crate::cli::OutputFormat::Text => {
             println!("\n  Run history for team '{name}':");
@@ -399,7 +399,7 @@ fn validate_teams(
                 match format {
                     crate::cli::OutputFormat::Json => println!("[]"),
                     crate::cli::OutputFormat::Yaml => {
-                        print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                        print!("{}", yaml_serde::to_string(&serde_json::json!([]))?)
                     }
                     crate::cli::OutputFormat::Text => println!("\n  Team '{n}' not found.\n"),
                 }
@@ -413,7 +413,7 @@ fn validate_teams(
                 match format {
                     crate::cli::OutputFormat::Json => println!("[]"),
                     crate::cli::OutputFormat::Yaml => {
-                        print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                        print!("{}", yaml_serde::to_string(&serde_json::json!([]))?)
                     }
                     crate::cli::OutputFormat::Text => println!("\n  No teams found.\n"),
                 }
@@ -467,7 +467,7 @@ fn validate_teams(
             println!("{}", serde_json::to_string_pretty(&all_diags)?);
         }
         crate::cli::OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&all_diags)?);
+            print!("{}", yaml_serde::to_string(&all_diags)?);
         }
         crate::cli::OutputFormat::Text => {
             println!();

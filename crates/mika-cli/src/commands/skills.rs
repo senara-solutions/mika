@@ -354,7 +354,7 @@ fn list_skills(
                     "disabled": [],
                     "skipped": [],
                 });
-                print!("{}", serde_yaml::to_string(&output)?);
+                print!("{}", yaml_serde::to_string(&output)?);
             }
             crate::cli::OutputFormat::Text => {
                 println!("\n  No skills loaded.\n");
@@ -470,7 +470,7 @@ fn list_skills(
                 "disabled": disabled_json,
                 "skipped": skipped_json,
             });
-            print!("{}", serde_yaml::to_string(&output)?);
+            print!("{}", yaml_serde::to_string(&output)?);
         }
         crate::cli::OutputFormat::Text => {
             println!(
@@ -1631,7 +1631,7 @@ fn validate_skills(
             crate::cli::OutputFormat::Json => println!("[]"),
             crate::cli::OutputFormat::Yaml => print!(
                 "{}",
-                serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+                yaml_serde::to_string(&serde_json::json!([])).unwrap_or_default()
             ),
             crate::cli::OutputFormat::Text => {
                 println!(
@@ -1650,7 +1650,7 @@ fn validate_skills(
                     crate::cli::OutputFormat::Json => println!("[]"),
                     crate::cli::OutputFormat::Yaml => print!(
                         "{}",
-                        serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+                        yaml_serde::to_string(&serde_json::json!([])).unwrap_or_default()
                     ),
                     crate::cli::OutputFormat::Text => println!("\n  Invalid skill name: {e}\n"),
                 }
@@ -1662,7 +1662,7 @@ fn validate_skills(
                     crate::cli::OutputFormat::Json => println!("[]"),
                     crate::cli::OutputFormat::Yaml => print!(
                         "{}",
-                        serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+                        yaml_serde::to_string(&serde_json::json!([])).unwrap_or_default()
                     ),
                     crate::cli::OutputFormat::Text => {
                         println!("\n  Skill '{n}' not found at {}\n", skill_dir.display());
@@ -1694,7 +1694,7 @@ fn validate_skills(
             crate::cli::OutputFormat::Json => println!("[]"),
             crate::cli::OutputFormat::Yaml => print!(
                 "{}",
-                serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+                yaml_serde::to_string(&serde_json::json!([])).unwrap_or_default()
             ),
             crate::cli::OutputFormat::Text => println!("\n  No skills found to validate.\n"),
         }
@@ -1797,7 +1797,7 @@ fn validate_skills(
             println!("{}", serde_json::to_string_pretty(&all_diags)?);
         }
         crate::cli::OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&all_diags)?);
+            print!("{}", yaml_serde::to_string(&all_diags)?);
         }
         crate::cli::OutputFormat::Text => {
             println!();
