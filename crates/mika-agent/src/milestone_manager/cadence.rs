@@ -842,6 +842,7 @@ mod tests {
                 subject: "#1801".into(),
             }],
             executor_healthy: None,
+            ready_pool: vec![],
         }
     }
 
@@ -1179,6 +1180,39 @@ mod tests {
         assert_eq!(d2, d3);
     }
 
+    /// Cas 13 (mika#2699) — le digest est **insensible** au bassin `ready`.
+    ///
+    /// C'est une décision, pas un effet de bord. La cadence est hybride : un
+    /// changement de digest déclenche un cycle événementiel. Le bassin bouge à
+    /// chaque dispatch de n'importe quel ticket du **dépôt**, donc l'y inclure
+    /// transformerait l'activité d'autres milestones en cycles sur celui-ci —
+    /// un rapport de plus par admission, pour un milestone qui n'a pas changé.
+    /// Le bassin se lit dans le rapport, il ne décide pas de son envoi.
+    ///
+    /// Vrai par construction aujourd'hui (`state_digest` n'énumère que les
+    /// `sub_issues`) ; ce test existe pour qu'un ajout de champ au digest soit
+    /// une décision délibérée et non un accident.
+    #[test]
+    fn mika2699_le_digest_ignore_le_bassin_ready() {
+        let mut s = base_state();
+        let avant = state_digest(&s);
+        s.ready_pool = vec![
+            crate::milestone_manager::pool::ReadyTicket {
+                number: 2699,
+                labels: vec!["ready".into(), "dispatch:loop".into()],
+            },
+            crate::milestone_manager::pool::ReadyTicket {
+                number: 2687,
+                labels: vec!["ready".into()],
+            },
+        ];
+        assert_eq!(
+            avant,
+            state_digest(&s),
+            "le bassin ne doit pas déclencher de cycle événementiel"
+        );
+    }
+
     // ---- mika#1949 U3 — the delivery boundary, classified ------------------
 
     fn refused() -> Result<()> {
@@ -1422,6 +1456,7 @@ mod tests {
                 alerts: vec![],
                 cross_cutting: vec![],
                 contention_events: vec![],
+                pool: None,
             },
             generated_at: String::new(),
             cycle_kind: CycleKind::Event,

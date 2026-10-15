@@ -38,6 +38,28 @@
 //! exec (Porte 2), and `INTERNAL_TOKEN` alignment (Porte 3). None of that surface is
 //! wired in this module.
 //!
+//! ### Phase 2 (a) vol 1 — le bassin `ready` est une LECTURE (mika#2699)
+//!
+//! [`pool`] juge la profondeur du bassin `ready` et **dit** quels tickets
+//! devraient y entrer. C'est une lecture de plus, pas une autorité de plus : le
+//! verdict entre dans le rapport ([`Assessment::pool`]) et nulle part ailleurs.
+//! Le charter **LECTURE SEULE** ci-dessus reste entier, et les deux seuls effets
+//! sortants restent les deux déjà nommés.
+//!
+//! Deux conséquences qu'un éditeur futur doit connaître :
+//!
+//! - **La quatrième lecture `gh` est dépôt-large**, pas limitée au milestone
+//!   cible : le webhook `ready` dispatche à l'échelle du dépôt, donc un bassin
+//!   compté sur les seules `sub_issues` serait sous-compté. C'est la première
+//!   lecture du module qui sort du périmètre du milestone ; elle reste un
+//!   `issue list`, donc elle ne touche pas `no_dispatch_test.rs`.
+//! - **Le geste d'écriture est le vol 3**, derrière `MIKA_MANAGER_POOL_WRITE`
+//!   (OFF par défaut), et il arrivera comme **exception nommée** au scan de
+//!   `no_dispatch_test.rs`, amendée dans le même commit que ce docstring —
+//!   jamais comme un assouplissement du scan. Le vol 2 ajoute les candidats hors
+//!   milestone cible et le refus **nommé par ticket**. Suivi sur
+//!   `senara-solutions/mika#2699`.
+//!
 //! **Porte 1 discharge condition (mika#1947).** Dispatch authority is DECISION-CORE by
 //! construction, so the forge-gate perimeter classifier must fail-closed to
 //! `DecisionCore` on every path under `crates/mika-agent/src/milestone_manager/**`, at
@@ -110,6 +132,7 @@
 pub mod assessor;
 pub mod cadence;
 pub mod liveness;
+pub mod pool;
 pub mod reader;
 pub mod reporter;
 pub mod sink_dir;
@@ -131,7 +154,8 @@ pub use liveness::{
     LivenessEmitter, LivenessFailure, LivenessFailureClass, LivenessSink, REASON_DELIVERY_PREFIX,
     REASON_POLL_PREFIX, TransitionLine, liveness_reason,
 };
-pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs};
+pub use pool::{POOL_MAX, POOL_MIN, PoolBand, PoolDepth, PoolVerdict, ReadyTicket, assess_pool};
+pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs, compose_ready_pool};
 pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};
 pub use sink_dir::{
     ENV_OFFLINE_SINK_DIR, SinkDirSource, SinkEntry, SinkListing, list_sink_reports,

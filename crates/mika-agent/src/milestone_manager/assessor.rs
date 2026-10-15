@@ -11,6 +11,7 @@
 //! Silence threshold in JOURS drives the `AlertKind::Silence` alert (rule fires when
 //! `last_activity_at` is older than the threshold).
 
+use super::pool;
 use super::types::{
     Alert, AlertKind, Assessment, IssueState, MilestoneState, Recommendation, Severity, SubIssue,
 };
@@ -75,6 +76,12 @@ impl Assessor {
             // Phase 1 is read-only, so there is nothing to contend for yet.
             // Populated by the Phase 2 dispatch path (mika#1948).
             contention_events: Vec::new(),
+            // Le verdict du bassin `ready` (mika#2699 Phase 2 (a) vol 1).
+            // `assess_pool` reste pure : tout ce que l'assesseur fait ici est
+            // de lui passer les deux lectures et de poser le résultat. Toujours
+            // `Some` — un cycle qui arrive ici a lu le bassin, et `None` est
+            // réservé aux blobs antérieurs au champ.
+            pool: Some(pool::assess_pool(&state.ready_pool, &state.sub_issues)),
         }
     }
 }
@@ -309,6 +316,7 @@ mod tests {
                 subject: "#1801".into(),
             }],
             executor_healthy: None,
+            ready_pool: vec![],
         }
     }
 
@@ -629,5 +637,51 @@ mod tests {
         assert_eq!(a.severity, Severity::Attention);
         // Cross-cutting always empty in Phase 1.
         assert!(a.cross_cutting.is_empty());
+    }
+
+    /// Cas 14 (mika#2699) — l'assesseur passe les **deux** lectures à
+    /// `assess_pool` et pose le verdict, sans rien décider lui-même.
+    ///
+    /// Le fixture le rend observable : le bassin contient un ticket en vol
+    /// (famine), et le milestone un candidat groomé. Un assesseur qui aurait
+    /// oublié `state.ready_pool` donnerait une profondeur nulle ; un qui aurait
+    /// oublié `state.sub_issues` donnerait un `admit` vide. Les deux erreurs
+    /// sont distinguables ici, et c'est pour ça que les deux sont peuplées.
+    #[test]
+    fn mika2699_lassesseur_pose_le_verdict_du_bassin() {
+        let mut candidat = base_issue(1802);
+        candidat.plan_present = true;
+        candidat.priority_rank = Some(1);
+        let mut state = base_state(vec![candidat]);
+        state.ready_pool = vec![pool::ReadyTicket {
+            number: 2699,
+            labels: vec!["ready".into(), "dispatch:loop".into()],
+        }];
+
+        let a = Assessor::new(AssessorConfig {
+            silence_threshold_days: 90,
+        })
+        .assess(&state);
+
+        let verdict = a
+            .pool
+            .expect("un cycle qui a lu le bassin porte un verdict");
+        assert_eq!(
+            verdict.depth.ready_total, 1,
+            "le bassin lu est pris en compte"
+        );
+        assert_eq!(verdict.depth.in_flight, 1);
+        assert_eq!(verdict.band, pool::PoolBand::Starved);
+        assert_eq!(
+            verdict.admit,
+            vec![1802],
+            "les sub-issues du milestone sont bien les candidats"
+        );
+        // Et le verdict reste exactement ce que la fonction pure produit —
+        // l'assesseur n'ajoute ni ne retire rien.
+        assert_eq!(
+            verdict,
+            pool::assess_pool(&state.ready_pool, &state.sub_issues)
+        );
     }
 }

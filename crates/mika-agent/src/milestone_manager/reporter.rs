@@ -37,6 +37,8 @@
 //! reintroduce it. Do NOT reorder these four write_* calls in `Reporter::report`
 //! without an explicit Prime override captured in a follow-up plan.
 
+use super::pool::{POOL_MAX, POOL_MIN, PoolBand};
+use super::reader::priority_from_labels;
 use super::types::{
     Alert, AlertKind, Assessment, CiState, IssueState, MilestoneState, Severity, SubIssue,
 };
@@ -285,8 +287,84 @@ impl Reporter {
             }
         }
 
+        // Bassin `ready` (mika#2699 Phase 2 (a) vol 1). Conditionnelle comme
+        // ses deux voisines, mais pour une autre raison : ici `None` veut dire
+        // « le bassin n'a pas été lu » (blob antérieur au champ), et une section
+        // qui s'afficherait quand même mentirait sur une mesure qui n'a pas eu
+        // lieu. Lue, elle s'affiche toujours — y compris en bande nominale, où
+        // la profondeur est précisément ce que l'opérateur vient vérifier.
+        //
+        // « mode ombre » est dans le TITRE, pas en note de bas de page : la
+        // ligne « À admettre » se lit comme un geste fait si rien ne dit le
+        // contraire au moment où l'œil tombe dessus.
+        if let Some(pool) = &assessment.pool {
+            writeln!(out).unwrap();
+            writeln!(out, "### Bassin ready (mode ombre — aucune écriture)").unwrap();
+            let _ = writeln!(
+                out,
+                "- Profondeur : {} ready, {} en vol, {} disponible — {} (cible {}–{})",
+                pool.depth.ready_total,
+                pool.depth.in_flight,
+                pool.depth.available,
+                band_label(&pool.band),
+                POOL_MIN,
+                POOL_MAX,
+            );
+            if !pool.admit.is_empty() {
+                let admit = pool
+                    .admit
+                    .iter()
+                    .map(|n| format!("#{n}{}", priority_suffix(state, *n)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "- À admettre : {admit}");
+            }
+            if pool.withheld_no_plan > 0 {
+                let _ = writeln!(
+                    out,
+                    "- Écartés : {} candidat{} sans plan groomé",
+                    pool.withheld_no_plan,
+                    if pool.withheld_no_plan > 1 { "s" } else { "" }
+                );
+            }
+        }
+
         out
     }
+}
+
+/// La bande, dite en français — le `Debug` de [`PoolBand`] n'est pas une
+/// surface opérateur.
+fn band_label(band: &PoolBand) -> &'static str {
+    match band {
+        PoolBand::Starved => "famine",
+        PoolBand::Nominal => "nominal",
+        PoolBand::Saturated => "saturé",
+    }
+}
+
+/// ` (p1-important)` quand la priorité du candidat est connue, chaîne vide
+/// sinon.
+///
+/// `PoolVerdict::admit` ne porte que des numéros — l'ordre y encode déjà la
+/// priorité. Le suffixe la rend lisible sans que l'opérateur ait à faire
+/// confiance à l'ordre, et son absence dit « pas de label de priorité », ce qui
+/// est exactement le fait qui met ce ticket en dernier.
+///
+/// C'est le **nom du label** qui est rendu, pas le rang : `agent-core` vaut le
+/// rang 2 (voir [`priority_from_labels`]), donc l'écrire « p2 » serait faux.
+fn priority_suffix(state: &MilestoneState, number: u64) -> String {
+    let Some(sub) = state.sub_issues.iter().find(|s| s.number == number) else {
+        return String::new();
+    };
+    let Some(rank) = sub.priority_rank else {
+        return String::new();
+    };
+    sub.labels
+        .iter()
+        .find(|l| priority_from_labels(std::slice::from_ref(l)) == Some(rank))
+        .map(|l| format!(" ({l})"))
+        .unwrap_or_default()
 }
 
 impl Default for Reporter {
@@ -453,6 +531,7 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::milestone_manager::pool::{ReadyTicket, assess_pool};
     use crate::milestone_manager::types::{
         ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
     };
@@ -490,6 +569,7 @@ mod tests {
             progress,
             recent_activity: vec![],
             executor_healthy: None,
+            ready_pool: vec![],
         }
     }
 
@@ -503,6 +583,7 @@ mod tests {
             alerts: vec![],
             cross_cutting: vec![],
             contention_events: vec![],
+            pool: None,
         }
     }
 
@@ -936,5 +1017,146 @@ mod tests {
         // The name, never a value — there is no value to leak, and this is the
         // assertion that says so at the surface an operator actually reads.
         assert!(with.contains("token: MIKA_MANAGER_DELIVERY_TOKEN"));
+    }
+
+    // -- mika#2699 Phase 2 (a) vol 1 : la section « Bassin ready » -----------
+
+    /// Cas 15 — la section n'existe que si le bassin a été **lu**.
+    ///
+    /// `pool: None` ne veut pas dire « bassin vide » : il veut dire « pas de
+    /// mesure » (blob antérieur au champ). Une section qui s'afficherait quand
+    /// même mentirait sur une mesure qui n'a pas eu lieu.
+    #[test]
+    fn mika2699_la_section_nexiste_que_si_le_bassin_a_ete_lu() {
+        let state = state_with(vec![base_issue(1)], ProgressCounts::default());
+        let sans = Reporter::new().report(&state, &empty_assessment());
+        assert!(
+            !sans.contains("### Bassin ready"),
+            "pas de mesure ⇒ pas de section — obtenu :\n{sans}"
+        );
+
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&[], &[]));
+        let avec = Reporter::new().report(&state, &a);
+        assert!(
+            avec.contains("### Bassin ready (mode ombre — aucune écriture)"),
+            "une mesure, même de bassin vide, se dit — obtenu :\n{avec}"
+        );
+    }
+
+    /// Cas 16 — « mode ombre » est dans le **titre**, et le rendu nominal ne
+    /// recommande rien.
+    ///
+    /// Le titre porte la mention parce que la ligne « À admettre » se lit comme
+    /// un geste fait si rien ne dit le contraire à l'endroit où l'œil tombe. Une
+    /// note en fin de section arriverait après la conclusion du lecteur.
+    #[test]
+    fn mika2699_le_mode_ombre_est_dans_le_titre_et_le_nominal_se_tait() {
+        let candidat = {
+            let mut c = base_issue(1802);
+            c.plan_present = true;
+            c.priority_rank = Some(1);
+            c
+        };
+        let state = state_with(vec![candidat], ProgressCounts::default());
+        let pool = vec![
+            ReadyTicket {
+                number: 10,
+                labels: vec!["ready".into()],
+            },
+            ReadyTicket {
+                number: 11,
+                labels: vec!["ready".into()],
+            },
+            ReadyTicket {
+                number: 12,
+                labels: vec!["ready".into()],
+            },
+        ];
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&pool, &state.sub_issues));
+        let out = Reporter::new().report(&state, &a);
+
+        let titre = "### Bassin ready (mode ombre — aucune écriture)";
+        assert!(out.contains(titre), "titre attendu dans :\n{out}");
+        assert!(
+            out.contains("3 ready, 0 en vol, 3 disponible — nominal (cible 2–4)"),
+            "la profondeur et la cible se disent en bande nominale :\n{out}"
+        );
+        assert!(
+            !out.contains("À admettre"),
+            "l'hystérésis est muette entre 2 et 4 :\n{out}"
+        );
+    }
+
+    /// Cas 17 — le rendu de famine nomme la profondeur, la cible 2–4, les
+    /// numéros admis dans l'ordre, et le nombre d'écartés.
+    ///
+    /// Le fixture est l'état mesuré le 2026-10-15 : 2 `ready`, les deux en vol,
+    /// 0 disponible. La priorité rendue est le **nom du label**, pas le rang :
+    /// `agent-core` vaut le rang 2, donc l'écrire « p2 » serait faux.
+    #[test]
+    fn mika2699_le_rendu_de_famine_nomme_profondeur_cible_et_admis() {
+        let subs = vec![
+            {
+                let mut c = base_issue(2711);
+                c.plan_present = true;
+                c.priority_rank = Some(1);
+                c.labels = vec!["p1-important".into()];
+                c
+            },
+            {
+                let mut c = base_issue(2708);
+                c.plan_present = true;
+                c.priority_rank = Some(3);
+                c.labels = vec!["p2-normal".into()];
+                c
+            },
+            {
+                let mut c = base_issue(2720);
+                c.plan_present = false;
+                c.priority_rank = Some(0);
+                c
+            },
+        ];
+        let state = state_with(subs, ProgressCounts::default());
+        let pool = vec![
+            ReadyTicket {
+                number: 2699,
+                labels: vec!["ready".into(), "dispatch:loop".into()],
+            },
+            ReadyTicket {
+                number: 2687,
+                labels: vec!["ready".into(), "dispatch:loop".into()],
+            },
+        ];
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&pool, &state.sub_issues));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(
+            out.contains("- Profondeur : 2 ready, 2 en vol, 0 disponible — famine (cible 2–4)"),
+            "la ligne de profondeur doit dire les trois chiffres et la cible :\n{out}"
+        );
+        assert!(
+            out.contains("- À admettre : #2711 (p1-important), #2708 (p2-normal)"),
+            "les admis, dans l'ordre, nommés par leur label de priorité :\n{out}"
+        );
+        assert!(
+            out.contains("- Écartés : 1 candidat sans plan groomé"),
+            "le filtre doit se dire, sinon il est indistinguable d'une absence \
+             de candidat :\n{out}"
+        );
+        // Restreint à la section du bassin : #2720 a toute sa place dans
+        // `### État` (c'est une sub-issue ouverte), ce qu'il ne doit pas avoir
+        // c'est une mention dans la recommandation d'admission.
+        let section = out
+            .split("### Bassin ready")
+            .nth(1)
+            .expect("la section du bassin doit être rendue");
+        assert!(
+            !section.contains("#2720"),
+            "un candidat sans plan groomé n'est jamais nommé comme admis :\n{section}"
+        );
     }
 }

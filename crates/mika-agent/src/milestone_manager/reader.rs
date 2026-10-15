@@ -9,9 +9,11 @@
 //! `crate::auto_pull::gh_list_open_issues` verbatim (env `GH_TOKEN`,
 //! `stdin::null`, `kill_on_drop(true)`). No new GitHub client dep.
 
+use super::pool::ReadyTicket;
 use super::types::{
     CiState, IssueState, MilestoneRef, MilestoneState, ProgressCounts, RecentActivity, SubIssue,
 };
+use crate::webhook_dispatch::READY_LABEL;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -180,8 +182,76 @@ impl Reader {
             ])
             .await?;
 
-        compose_from_gh_outputs(milestone_ref, &milestone_json, &issues_json, &pr_json)
+        // 4. Le bassin `ready`, à l'échelle du **dépôt** (mika#2699). Pas de
+        //    `--milestone` ici, et c'est la décision : le webhook `ready`
+        //    dispatche sur tout le dépôt, donc un bassin compté sur les seules
+        //    issues du milestone serait sous-compté et la recommandation fausse
+        //    exactement le jour où elle compte.
+        let ready_json = runner
+            .run(&[
+                "issue",
+                "list",
+                "--repo",
+                &milestone_ref.repo,
+                "--state",
+                "open",
+                "--label",
+                READY_LABEL,
+                "--json",
+                "number,labels",
+                "--limit",
+                "100",
+            ])
+            .await?;
+
+        // `compose_from_gh_outputs` garde sa signature à quatre arguments : le
+        // bassin n'est pas une propriété du milestone, et l'eval
+        // `manager_loop_resistance` l'appelle de l'extérieur. Le bassin est donc
+        // posé ici, après composition.
+        let mut state =
+            compose_from_gh_outputs(milestone_ref, &milestone_json, &issues_json, &pr_json)?;
+        state.ready_pool = compose_ready_pool(&ready_json)?;
+        Ok(state)
     }
+}
+
+/// Compose le bassin `ready` depuis la sortie de `gh issue list --json
+/// number,labels` — fonction **pure**, pendant de `compose_from_gh_outputs`
+/// pour la quatrième lecture (mika#2699).
+///
+/// Pas de garde de troncature au vol 1, et c'est délibéré : à `--limit 100`
+/// contre un bassin dont la cible est 2–4, une page pleine ne serait pas une
+/// troncature mais une pathologie qui se voit déjà dans la profondeur rapportée
+/// (« 100 ready » ne se lit pas comme un état sain). La garde devient utile au
+/// vol 3, où le nombre lu décide d'une écriture.
+pub fn compose_ready_pool(ready_json: &str) -> Result<Vec<ReadyTicket>> {
+    let issues: Vec<Value> = serde_json::from_str(ready_json)
+        .map_err(|e| anyhow!("failed to parse ready-pool json: {e}"))?;
+    Ok(issues
+        .iter()
+        .filter_map(|i| {
+            let number = i.get("number")?.as_u64()?;
+            Some(ReadyTicket {
+                number,
+                labels: extract_labels(i),
+            })
+        })
+        .collect())
+}
+
+/// Les noms de labels d'une issue telle que `gh issue list --json labels` la
+/// rend. Un seul site d'épellation du chemin `labels[].name`, partagé par les
+/// deux lectures d'issues (sub-issues du milestone et bassin `ready`).
+fn extract_labels(issue: &Value) -> Vec<String> {
+    issue
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Priority ranks from label — pure function, easy to test.
@@ -443,15 +513,7 @@ pub fn compose_from_gh_outputs(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let labels: Vec<String> = issue
-            .get("labels")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let labels: Vec<String> = extract_labels(issue);
         let updated_at = issue
             .get("updatedAt")
             .and_then(|v| v.as_str())
@@ -553,6 +615,10 @@ pub fn compose_from_gh_outputs(
         progress,
         recent_activity,
         executor_healthy: None,
+        // Vide ici par construction : le bassin est une lecture dépôt-large que
+        // cette fonction ne reçoit pas. `Reader::read_with_runner` le pose après
+        // composition — voir `compose_ready_pool`.
+        ready_pool: Vec::new(),
     })
 }
 
@@ -1046,11 +1112,19 @@ mod gh_arg_capture_tests {
     /// panics — the guard fails LOUD on an unmapped call. This docstring lives
     /// on the struct itself (not inside the match wildcard) so it surfaces at
     /// the most likely edit surface for the maintainer wiring the new call.
+    ///
+    /// **Extension performed once (mika#2699).** The fourth call *is* an
+    /// `issue list`, so routing on the first arg alone would have served it
+    /// `issues_json` in silence — a recorder that answers the wrong question
+    /// without failing. The `issue` arm therefore disambiguates on `--label`,
+    /// which only the ready-pool call carries. A fifth `issue`-shaped call must
+    /// extend this arm the same way, on a token its own call site owns.
     struct RecordingGhRunner {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         milestone_json: String,
         issues_json: String,
         pr_json: String,
+        ready_json: String,
     }
 
     #[async_trait::async_trait]
@@ -1058,16 +1132,18 @@ mod gh_arg_capture_tests {
         async fn run(&self, args: &[&str]) -> Result<String> {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             self.calls.lock().unwrap().push(owned.clone());
-            // Route by the first arg — matches the three call sites in
-            // `Reader::read_with_runner`.
+            let labelled = owned.iter().any(|a| a == "--label");
+            // Route by the first arg — and, among the two `issue list` calls, by
+            // `--label`, which only the ready-pool read carries.
             match owned.first().map(String::as_str) {
                 Some("api") => Ok(self.milestone_json.clone()),
+                Some("issue") if labelled => Ok(self.ready_json.clone()),
                 Some("issue") => Ok(self.issues_json.clone()),
                 Some("pr") => Ok(self.pr_json.clone()),
-                // NOTE: extending `Reader::read_with_runner` with a fourth `gh`
+                // NOTE: extending `Reader::read_with_runner` with a fifth `gh`
                 // call (e.g., `gh auth status`, per-issue `gh issue view`) also
                 // requires extending this match — the guard covers only the
-                // three current call sites' arg contracts (mika#1933 testing F1).
+                // four current call sites' arg contracts (mika#1933 testing F1).
                 _ => Err(anyhow!(
                     "RecordingGhRunner: unexpected first arg in {:?}",
                     owned
@@ -1086,6 +1162,7 @@ mod gh_arg_capture_tests {
             milestone_json: r#"{"title": "T", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null}"#.into(),
             issues_json: "[]".into(),
             pr_json: "[]".into(),
+            ready_json: "[]".into(),
         };
         (calls, runner)
     }
@@ -1167,5 +1244,80 @@ mod gh_arg_capture_tests {
         // would render `closed (no linked PR)` in every case.
         assert_adjacent_pair(pr_call, "--state", "all");
         assert_adjacent_pair(pr_call, "--limit", "100");
+    }
+
+    // -- mika#2699 Phase 2 (a) vol 1 : la quatrième lecture --
+
+    /// Cas 9 — la lecture du bassin est **dépôt-large** et ciblée sur `ready`.
+    ///
+    /// Les deux assertions qui portent la décision : `--label ready` (c'est bien
+    /// le bassin qu'on lit) et **l'absence de `--milestone`** (le webhook `ready`
+    /// dispatche sur tout le dépôt, donc un bassin compté sur le seul milestone
+    /// serait sous-compté et la recommandation fausse le jour où elle compte).
+    /// `--state open` parce qu'un ticket `ready` fermé n'occupe aucun rail.
+    #[tokio::test]
+    async fn mika2699_la_lecture_du_bassin_est_depot_large_et_sur_ready() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner should succeed on canned JSON");
+
+        let calls = calls.lock().unwrap();
+        let ready_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue") && c.iter().any(|a| a == "--label")
+            })
+            .expect("l'appel du bassin ready doit être capturé");
+        assert_adjacent_pair(ready_call, "--label", "ready");
+        assert_adjacent_pair(ready_call, "--state", "open");
+        assert_adjacent_pair(ready_call, "--json", "number,labels");
+        assert_adjacent_pair(ready_call, "--limit", "100");
+        assert_adjacent_pair(ready_call, "--repo", "senara-solutions/mika");
+        assert!(
+            !ready_call.iter().any(|a| a == "--milestone"),
+            "le bassin est dépôt-large : aucun --milestone ici — {ready_call:?}"
+        );
+    }
+
+    /// Cas 10 — `compose_ready_pool` sur une sortie `gh` réelle, et sur `[]`.
+    ///
+    /// Le fixture est l'état mesuré le 2026-10-15 : deux issues `ready` ouvertes,
+    /// **les deux** portant `dispatch:loop`. Il porte aussi un label sans `name`
+    /// exploitable, pour que la lecture ne s'effondre pas sur une forme que la
+    /// forge peut rendre.
+    #[test]
+    fn mika2699_compose_ready_pool_lit_numeros_et_labels() {
+        let json = r#"[
+            {"number": 2699, "labels": [{"name":"ready"},{"name":"dispatch:loop"}]},
+            {"number": 2687, "labels": [{"name":"ready"},{"name":"dispatch:loop"},{"id":"x"}]}
+        ]"#;
+        let pool = compose_ready_pool(json).expect("une sortie gh valide doit se composer");
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].number, 2699);
+        assert_eq!(
+            pool[0].labels,
+            vec!["ready".to_string(), "dispatch:loop".to_string()]
+        );
+        assert!(
+            pool.iter().all(|t| t.holds_dispatch_seat()),
+            "les deux portaient un siège le 2026-10-15 — {pool:?}"
+        );
+        assert_eq!(
+            pool[1].labels.len(),
+            2,
+            "un label sans `name` est ignoré, il ne fait pas échouer la lecture"
+        );
+
+        let empty = compose_ready_pool("[]").expect("un bassin vide est une réponse valide");
+        assert!(
+            empty.is_empty(),
+            "`[]` donne un bassin vide, pas une erreur"
+        );
     }
 }

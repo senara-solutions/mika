@@ -4,6 +4,7 @@
 //! composers over `gh` CLI output. See the module docstring in `mod.rs`
 //! for the full Phase 1 discipline.
 
+use super::pool::{PoolVerdict, ReadyTicket};
 use serde::{Deserialize, Serialize};
 
 /// A GitHub milestone reference, e.g. `senara-solutions/mika#1799`.
@@ -149,6 +150,16 @@ pub struct MilestoneState {
     pub recent_activity: Vec<RecentActivity>,
     /// True when `MIKA_MANAGER_HEALTH_URL` was reachable and reported the target entity as fresh.
     pub executor_healthy: Option<bool>,
+    /// Le bassin `ready` à l'échelle du **dépôt**, pas du milestone (mika#2699).
+    ///
+    /// Composé par [`super::reader::compose_ready_pool`], pas par
+    /// `compose_from_gh_outputs` : le webhook `ready` dispatche sur tout le
+    /// dépôt, donc le bassin n'est pas une propriété du milestone cible et ne
+    /// sort pas des mêmes appels `gh`. `#[serde(default)]` pour la même raison
+    /// que `Assessment::contention_events` — le puits hors-ligne tient des blobs
+    /// écrits avant ce champ.
+    #[serde(default)]
+    pub ready_pool: Vec<ReadyTicket>,
 }
 
 /// Severity classification for an assessment. Drives escalation routing.
@@ -234,6 +245,19 @@ pub struct Assessment {
     /// `Option<Vec<_>>`.
     #[serde(default)]
     pub contention_events: Vec<ContentionEvent>,
+    /// Le verdict du bassin `ready` pour ce cycle (mika#2699 Phase 2 (a) vol 1).
+    ///
+    /// `Option`, et pas un `PoolVerdict` nu : `None` dit « le bassin n'a pas été
+    /// lu » — blob écrit par un binaire antérieur au champ. Un `PoolVerdict` par
+    /// défaut dirait « bassin vide, famine », ce qui est une *mesure*, pas une
+    /// absence de mesure (motif mika#2331 : un null n'est jamais un 0). Un cycle
+    /// dont la lecture du bassin échoue n'arrive jamais ici — l'erreur remonte
+    /// et il n'y a pas d'`Assessment`.
+    ///
+    /// **Vol 1 : rien de ce verdict n'est écrit sur la forge.** Il entre dans le
+    /// rapport, et nulle part ailleurs.
+    #[serde(default)]
+    pub pool: Option<PoolVerdict>,
 }
 
 /// Outcome of a single `run_manager_cycle` invocation.
@@ -316,6 +340,7 @@ mod tests {
             alerts: vec![],
             cross_cutting: vec![],
             contention_events: vec![],
+            pool: None,
         };
         let out = serde_json::to_string(&a).unwrap();
         assert!(
@@ -326,6 +351,52 @@ mod tests {
             !out.contains(r#""contention_events":null"#),
             "must never serialize as null"
         );
+    }
+
+    // -- mika#2699 Phase 2 (a) vol 1 : format fil du verdict de bassin --
+
+    /// Cas 11 — un blob de rapport écrit avant que `pool` existe doit encore se
+    /// désérialiser, et le champ doit valoir `None` : le puits hors-ligne tient
+    /// de tels fichiers, et une montée de version incapable de relire son propre
+    /// arriéré le perdrait.
+    #[test]
+    fn mika2699_un_blob_anterieur_se_relit_avec_pool_absent() {
+        let a: Assessment = serde_json::from_str(&assessment_json_without_contention())
+            .expect("un JSON antérieur au champ doit encore se parser");
+        assert_eq!(
+            a.pool, None,
+            "champ absent ⇒ None, et surtout pas un verdict par défaut"
+        );
+    }
+
+    /// Cas 12 — `None` sérialise en `null`, **jamais** en objet vide : « le
+    /// bassin n'a pas été lu » et « le bassin est vide » sont deux faits
+    /// différents, et un `{}` les confondrait (motif mika#2331). Aller-retour
+    /// pour que le puits reste relisible par lui-même.
+    #[test]
+    fn mika2699_pool_absent_serialise_en_null_jamais_en_objet_vide() {
+        let a = Assessment {
+            severity: Severity::Healthy,
+            recommendation: Recommendation {
+                next_sub_issue: None,
+                rationale: "rien à faire".into(),
+            },
+            alerts: vec![],
+            cross_cutting: vec![],
+            contention_events: vec![],
+            pool: None,
+        };
+        let out = serde_json::to_string(&a).unwrap();
+        assert!(
+            out.contains(r#""pool":null"#),
+            "un bassin non lu se dit null — obtenu : {out}"
+        );
+        assert!(
+            !out.contains(r#""pool":{}"#),
+            "jamais un objet vide — obtenu : {out}"
+        );
+        let back: Assessment = serde_json::from_str(&out).unwrap();
+        assert_eq!(back, a, "aller-retour fidèle");
     }
 
     #[test]
