@@ -1821,6 +1821,195 @@ mod tests {
         );
     }
 
+    /// Input domain of the routing↔handlers coherence sweep below: the `action`
+    /// values GitHub documents for the `pull_request` event.
+    ///
+    /// This list is the sweep's **input**, never its answer — `route_event` is
+    /// what decides which of these reach mika-qa. Adding an entry can only
+    /// widen what the guard checks; it can never make the guard pass.
+    const PULL_REQUEST_ACTIONS_FOR_COHERENCE_SWEEP: &[&str] = &[
+        "assigned",
+        "auto_merge_disabled",
+        "auto_merge_enabled",
+        "closed",
+        "converted_to_draft",
+        "demilestoned",
+        "dequeued",
+        "edited",
+        "enqueued",
+        "labeled",
+        "locked",
+        "milestoned",
+        "opened",
+        "ready_for_review",
+        "reopened",
+        "review_request_removed",
+        "review_requested",
+        "synchronize",
+        "unassigned",
+        "unlabeled",
+        "unlocked",
+    ];
+
+    /// `skills/bundled/`, resolved from this crate's manifest dir.
+    ///
+    /// The directory is versioned; `include_str!`/`build.rs` are only
+    /// consumers of it. Reading it from disk is what lets this guard see both
+    /// `route_event` and the agent-side contract without `mika-gateway` taking
+    /// a dependency on `mika-agent` (mika#2212 D-C). Same pattern as
+    /// `crates/mika-agent/tests/bundled_skills_load.rs`.
+    fn bundled_skills_dir() -> std::path::PathBuf {
+        // CARGO_MANIFEST_DIR = .../mika/crates/mika-gateway
+        // skills/bundled/    = .../mika/skills/bundled
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("skills")
+            .join("bundled")
+    }
+
+    /// Routing ↔ handlers coherence: every `pull_request` action `route_event`
+    /// sends to mika-qa must be covered on the agent side (mika#2212).
+    ///
+    /// **The founding defect this guard exists for.** mika#1822 added
+    /// `ready_for_review` to the routing table above — correctly, and for
+    /// exactly the class this ticket reports — but changed nothing on the agent
+    /// side: `qa-review/system_prompt.md` kept enumerating its triggers as
+    /// `opened` / `synchronize` / `review_requested`, and no dedicated handler
+    /// covered the new action. The event was routed, the queue did not coalesce
+    /// it, the agent received it — and no skill claimed it. **Nothing failed.**
+    /// Two PRs (#2202, #2210) and three triggerings produced zero fresh
+    /// `mika-platform-qa` verdict, and the only way to see it was to measure
+    /// the posted reviews by hand.
+    ///
+    /// Coverage is a **disjunction of two terms**, both read from disk:
+    ///
+    /// - **T1** — a `skills/bundled/qa-review*/skill.toml` declares the action
+    ///   in `[triggers] keywords`. Read by TOML **parse**, never by substring
+    ///   search: a comment mentioning the action would satisfy a raw substring,
+    ///   and that false green is precisely what this guard exists to exclude.
+    /// - **T2** — `skills/bundled/qa-review/system_prompt.md` contains the
+    ///   literal `pull_request.<action>`. This term exists because `qa-review`
+    ///   is `always_on = true`: `opened`, `synchronize` and `review_requested`
+    ///   are covered by no manifest keyword and have no need to be — their real
+    ///   contract is that enumeration. A literal-substring test on an exact
+    ///   form is mechanical, not prose analysis.
+    ///
+    /// When this fires, the remediation is to add the missing term — **never**
+    /// to remove the action from `route_event` to quiet the test.
+    #[test]
+    fn mika2212_every_pull_request_action_routed_to_qa_is_covered_by_a_handler() {
+        let skills_dir = bundled_skills_dir();
+        assert!(
+            skills_dir.is_dir(),
+            "bundled-skills directory not found at {} — repo layout changed?",
+            skills_dir.display()
+        );
+
+        // --- T1: keywords declared by the qa-review skill family ---
+        let mut family_dirs: Vec<String> = Vec::new();
+        let mut family_keywords: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(&skills_dir).expect("failed to read skills/bundled/") {
+            let path = entry.expect("failed to read dir entry").path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            // The qa-review family: the base skill and its handler siblings.
+            if dir_name != "qa-review" && !dir_name.starts_with("qa-review-") {
+                continue;
+            }
+            family_dirs.push(dir_name.clone());
+
+            let manifest_path = path.join("skill.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let toml_str = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+            let manifest: toml::Value = toml::from_str(&toml_str)
+                .unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest_path.display()));
+            let keywords = manifest
+                .get("triggers")
+                .and_then(|t| t.get("keywords"))
+                .and_then(|k| k.as_array());
+            for kw in keywords.into_iter().flatten() {
+                if let Some(s) = kw.as_str() {
+                    family_keywords.push((dir_name.clone(), s.to_lowercase()));
+                }
+            }
+        }
+        assert!(
+            !family_dirs.is_empty(),
+            "no qa-review-family skill directory found under {} — repo layout changed?",
+            skills_dir.display()
+        );
+
+        // --- T2: the trigger enumeration qa-review declares in its own prompt ---
+        let qa_prompt_path = skills_dir.join("qa-review").join("system_prompt.md");
+        let qa_prompt = std::fs::read_to_string(&qa_prompt_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read {} — repo layout changed? ({e})",
+                qa_prompt_path.display()
+            )
+        });
+
+        let mut routed: Vec<&str> = Vec::new();
+        let mut uncovered: Vec<String> = Vec::new();
+        for action in PULL_REQUEST_ACTIONS_FOR_COHERENCE_SWEEP {
+            if route_event("pull_request", Some(action), None) != Some("mika-qa") {
+                continue;
+            }
+            routed.push(action);
+
+            let action_lower = action.to_lowercase();
+            let t1 = family_keywords.iter().any(|(_, kw)| *kw == action_lower);
+            let t2 = qa_prompt.contains(&format!("pull_request.{action}"));
+            if !t1 && !t2 {
+                uncovered.push(format!(
+                    "  - pull_request.{action}\n      \
+                     T1 missing: no skills/bundled/qa-review*/skill.toml declares \
+                     \"{action}\" in [triggers].keywords\n      \
+                     T2 missing: skills/bundled/qa-review/system_prompt.md does not \
+                     contain the literal \"pull_request.{action}\""
+                ));
+            }
+        }
+
+        // Anti-vacuity: a sweep that measured nothing must not read as a pass.
+        assert!(
+            !routed.is_empty(),
+            "route_event sent no pull_request action to mika-qa — this sweep measured \
+             NOTHING. Either the candidate-action list above went stale, or the routing \
+             table changed; a green here would be meaningless."
+        );
+
+        assert!(
+            uncovered.is_empty(),
+            "\nRouting ↔ handlers incoherence (mika#2212, class mika#1822): {} of {} \
+             pull_request action(s) routed to mika-qa are claimed by no handler and by \
+             no trigger enumeration.\n\n{}\n\n\
+             The gateway delivers these events; nothing on the agent side acts on them, \
+             and nothing fails — the only symptom is a verdict that never comes.\n\n\
+             Remediation: add the missing term — a dedicated handler skill declaring the \
+             action in [triggers].keywords (T1, the structural route — engine keyword \
+             matching, see crates/mika-agent/src/skills/matcher.rs), or the \
+             `pull_request.<action>` enumeration in qa-review/system_prompt.md (T2, valid \
+             only because that skill is always_on).\n\
+             NEVER remove the action from route_event to quiet this test: that restores \
+             the mika#1822 gap it was added to close.\n\n\
+             qa-review family scanned: {:?}\n",
+            uncovered.len(),
+            routed.len(),
+            uncovered.join("\n"),
+            family_dirs,
+        );
+    }
+
     #[test]
     fn test_route_event_pr_review_is_author_independent() {
         // mika#1729 (R3/AC3): the mika-qa review trigger is gateway routing, NOT
