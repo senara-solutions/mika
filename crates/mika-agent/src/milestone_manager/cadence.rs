@@ -628,7 +628,7 @@ fn merge_posted(previous: &[String], newly: &[String]) -> Vec<String> {
     let mut merged: Vec<String> = previous.to_vec();
     merged.extend(newly.iter().cloned());
     if merged.len() > POSTED_FLIGHTS_RETAINED {
-        merged.drain(..merged.len() - POSTED_FLIGHTS_RETAINED);
+        merged.drain(..merged.len() - POSTED_FLIGHTS_RETAINED); // safe-byte-slice: Vec<String> element index, not a byte offset
     }
     merged
 }
