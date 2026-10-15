@@ -685,15 +685,26 @@ echo "--- must-fail: no GitHub token value in the sandbox (mika#2056, mika#2572)
 # holds any GitHub token inside the sandbox: git push and gh reach GitHub
 # through the egress-proxy MITM, which injects the credential HOST-SIDE. So the
 # token VALUE MUST be absent here — in the environment and on the filesystem.
-# mika#2572: the NAME GH_TOKEN is present, set to the non-secret placeholder
-# `proxy-managed-no-secret`, because gh refuses to start without some local
-# value. Any other value — the synthetic canary PAT exported above included —
-# is a LEAK. An absent GH_TOKEN is not a leak, but it is the mika#2572 defect
-# (gh stops on `gh auth login`), so it is named instead of passing silently.
+# mika#2572: the NAME GH_TOKEN is present, set to a non-secret value, because
+# gh refuses to start without some local one. Any other value — the synthetic
+# canary PAT exported above included — is a LEAK. An absent GH_TOKEN is not a
+# leak, but it is the mika#2572 defect (gh stops on `gh auth login`), so it is
+# named instead of passing silently.
+#
+# mika#2716 splits the nominal state in two, and the second one is the point of
+# this probe: `proxy-managed-no-secret-<32 hex>` is the per-spawn EGRESS
+# SENTINEL, drawn and registered host-side; the BARE prefix means the sentinel
+# is off — either an operator set MIKA_PILOT_EGRESS_SENTINEL=0, or the staging
+# fail-opened. The second is invisible from inside the sandbox and would
+# otherwise read as healthy, so it gets a WARN of its own rather than sharing
+# the `ok` line. A persistent WARN after `make deploy` is the halt documented in
+# docs/operator/environment-variables.md: read the dispatch stderr, not the
+# proxy addon log.
 case "${GH_TOKEN-__unset__}" in
-    proxy-managed-no-secret) echo "ok:   gh_token_placeholder_only" ;;
-    __unset__)               echo "WARN: GH_TOKEN unset in the sandbox — gh will stop on gh auth login (mika#2572 regressed)" ;;
-    *)                       echo "LEAK: GH_TOKEN carries a value other than the placeholder (mika#2056 regressed)" ;;
+    proxy-managed-no-secret-*) echo "ok:   gh_token_egress_sentinel" ;;
+    proxy-managed-no-secret)   echo "WARN: GH_TOKEN carries the bare static placeholder — the egress sentinel is disabled (MIKA_PILOT_EGRESS_SENTINEL=0, or the host-side staging fail-opened; mika#2716)" ;;
+    __unset__)                 echo "WARN: GH_TOKEN unset in the sandbox — gh will stop on gh auth login (mika#2572 regressed)" ;;
+    *)                         echo "LEAK: GH_TOKEN carries a value other than an egress sentinel (mika#2056 regressed)" ;;
 esac
 if [ -e /run/mika-pilot-secrets/GH_TOKEN ]; then
     echo "LEAK: /run/mika-pilot-secrets/GH_TOKEN exists (secret file channel not removed)"

@@ -18,7 +18,7 @@
 # one catches a regression of the channel itself through a path that adds
 # nothing to the allowlist.
 #
-# Two rules, in order:
+# Three rules, in order:
 #
 #   1. DENY-BY-DEFAULT (primary). `_PILOT_SANDBOX_ENV_ALLOWLIST` must equal the
 #      expected literal set recorded below. Any addition, removal, or rename
@@ -31,6 +31,14 @@
 #      — which covers the `net_setenv_args` producer, outside the allowlist —
 #      is rejected when NAME looks like a credential. `PAT` is matched
 #      delimited, not as a substring, so the legitimate `PATH` entry passes.
+#
+#   3. PROVENANCE of each exempted VARIABLE (mika#2716). Rule 2 accepts a value
+#      passed through one closed-list variable as well as through the literal
+#      placeholder, because the egress sentinel is drawn per spawn and cannot be
+#      a literal. A variable, unlike a literal, cannot be inspected by value —
+#      so the concession is paid for by three grep-visible facts about where
+#      that variable's value may come from, and where it may go. Without them,
+#      `--setenv GH_TOKEN "$ANY_VARIABLE"` would pass rule 2 unexamined.
 #
 # Exit codes:
 #   0 — clean
@@ -85,12 +93,42 @@ EXPECTED_ENV_ALLOWLIST=(
 EXEMPT_SETENV_NAMES=(ANTHROPIC_API_KEY GH_TOKEN)
 EXEMPT_SETENV_VALUE="proxy-managed-no-secret"
 
+# mika#2716: GH_TOKEN no longer carries a literal. It carries the per-spawn
+# EGRESS SENTINEL `<placeholder>-<32 hex>`, which the host draws and registers
+# so the egress proxy can tell a pilot's own `gh` from a `cargo test` that
+# overwrote GH_TOKEN with a fake (mika#2713). A per-spawn value cannot be a
+# literal, so rule 2 also accepts EXACTLY `"$<VAR>"` for a VAR on this closed
+# list — one accepted spelling, no braced variant, no other variable.
+#
+# A variable is a hole in a by-value lint, and rule 3 below is the patch: each
+# VAR here must have a producer function, and the value may neither come from a
+# credential nor become one.
+EXEMPT_SETENV_VARS=(_PILOT_EGRESS_SENTINEL)
+EXEMPT_SETENV_VAR_PRODUCERS=(_stage_pilot_egress_sentinel)
+
+# The credential names rule 3 keeps away from the exempted variables, in both
+# directions. `_PILOT_GH_TOKEN_FILE` is included because it names the host file
+# the egress addon reads the real token from: a producer that reads it is a
+# producer that can copy the token into the argv.
+EXEMPT_SETENV_VAR_CREDENTIALS='GH_TOKEN|MIKA_GITHUB_TOKEN|_PILOT_GH_TOKEN_FILE'
+
 is_exempt_name() {
     local candidate="$1" n
     for n in "${EXEMPT_SETENV_NAMES[@]}"; do
         [[ "$candidate" == "$n" ]] && return 0
     done
     return 1
+}
+
+# ERE alternation of every value rule 2 accepts for an exempted NAME: the
+# literal placeholder, or exactly one of the exempted variables.
+exempt_value_alternation() {
+    local alt v
+    alt="\"$EXEMPT_SETENV_VALUE\""
+    for v in "${EXEMPT_SETENV_VARS[@]}"; do
+        alt="$alt|\"\\\$$v\""
+    done
+    printf '(%s)' "$alt"
 }
 
 CRED_NAME_PATTERN='TOKEN|SECRET|KEY|PASSWORD|PASSWD|(^|_)PAT(_|$)'
@@ -230,16 +268,24 @@ while IFS= read -r name; do
         # counted — and then fails, since it does not carry the placeholder.
         # Both counts are OCCURRENCES (`grep -o | wc -l`), never lines
         # (`grep -c`): a decoy placeholder and a real value on the same line
-        # are two occurrences. The placeholder's closing quote is bounded, so
-        # `"proxy-managed-no-secret""$GH_TOKEN"` is not counted as placeheld.
+        # are two occurrences. The accepted value's closing quote is bounded, so
+        # `"proxy-managed-no-secret""$GH_TOKEN"` is not counted as conformant.
+        #
+        # mika#2716 widened the accepted set from the literal placeholder alone
+        # to the placeholder OR an exempted variable. Both spellings are counted
+        # here together, because the live file and a fixture may legitimately
+        # carry one each: scripts/test-verify-no-secret-in-setenv.sh plants the
+        # literal when the source no longer has it, so the fixture holds two
+        # occurrences and only a rule accepting both keeps that case green.
         _total=$({ grep -oE -- "--setenv[[:space:]]+$name([[:space:]]|\$)" "$CODE_ONLY" || true; } | wc -l)
-        _placeheld=$({ grep -oE -- "--setenv[[:space:]]+${name}[[:space:]]+\"$EXEMPT_SETENV_VALUE\"([[:space:]]|\$)" "$CODE_ONLY" || true; } | wc -l)
-        _total=$((_total)); _placeheld=$((_placeheld))
-        if [[ "$_total" -eq "$_placeheld" && "$_total" -ge 1 ]]; then
+        _conformes=$({ grep -oE -- "--setenv[[:space:]]+${name}[[:space:]]+$(exempt_value_alternation)([[:space:]]|\$)" "$CODE_ONLY" || true; } | wc -l)
+        _total=$((_total)); _conformes=$((_conformes))
+        if [[ "$_total" -eq "$_conformes" && "$_total" -ge 1 ]]; then
             continue
         fi
         echo "VIOLATION: $_total --setenv $name occurrence(s), only"
-        echo "  $_placeheld carrying the placeholder '$EXEMPT_SETENV_VALUE'."
+        echo "  $_conformes carrying the placeholder '$EXEMPT_SETENV_VALUE'"
+        echo "  or one of the exempted variables: ${EXEMPT_SETENV_VARS[*]}."
         echo "  Its exemption held only because the real credential is injected"
         echo "  host-side by the egress proxy. A real value here would be"
         echo "  readable in the sandbox argv by any local user (mika#2039)."
@@ -253,6 +299,89 @@ while IFS= read -r name; do
         VIOLATIONS=$((VIOLATIONS + 1))
     fi
 done < <(grep -oE -- '--setenv [A-Za-z_][A-Za-z0-9_]*' "$CODE_ONLY" | awk '{print $2}' | sort -u)
+
+# --- Rule 3: provenance of each exempted variable (mika#2716) --------------
+#
+# Three facts, each a single grep, together re-establishing statically what the
+# literal placeholder gave for free — the value reaching the argv is DRAWN,
+# never copied from a credential, and never becomes one:
+#
+#   3a. no line that sets the variable may mention a credential name. This is
+#       the direct data-flow statement and it holds wherever the assignment
+#       lives, so `_PILOT_EGRESS_SENTINEL="$GH_TOKEN"` fails from anywhere in
+#       the file, not only from inside the producer.
+#   3b. the producer function must exist, must set the variable at least once,
+#       and its body must name no credential. This pins the producer as the
+#       real source and forbids it reading the host token file "to derive
+#       something the proxy can match".
+#   3c. no line that assigns a credential name may mention the variable. This
+#       is the one failure mode worse than the 403 the ticket guards against:
+#       `export GH_TOKEN="$_PILOT_EGRESS_SENTINEL"` host-side would have
+#       _stage_pilot_gh_token stage the SENTINEL as the real token, the addon
+#       would inject it, and every pilot call would 401 — a refusal that comes
+#       from GitHub and names nothing of mika#2716. Rule 3a cannot see it: that
+#       line assigns the credential, not the variable.
+#
+# A function body, extracted from the code-only view: from `name() {` to the
+# first closing brace in column 0.
+extract_function_body() {
+    awk -v fn="$1" '
+        $0 ~ "^" fn "\\(\\)[[:space:]]*\\{" { inside = 1; next }
+        inside && /^\}/                     { inside = 0 }
+        inside                              { print }
+    ' "$CODE_ONLY"
+}
+
+for _i in "${!EXEMPT_SETENV_VARS[@]}"; do
+    _var="${EXEMPT_SETENV_VARS[$_i]}"
+    _producer="${EXEMPT_SETENV_VAR_PRODUCERS[$_i]}"
+    _set_re="(^|[[:space:]]|;|\\\$\\{)${_var}(=|:=)"
+
+    # 3a — every setting of the variable is credential-free.
+    while IFS= read -r _line; do
+        [[ -z "$_line" ]] && continue
+        echo "VIOLATION: $_var is set from a credential, at line ${_line%%:*}."
+        echo "  The egress sentinel is exempted from rule 2 only because it is"
+        echo "  DRAWN, never copied. Seeding it from a token makes it the token"
+        echo "  it stands for, in an argv any local user can read (mika#2716)."
+        VIOLATIONS=$((VIOLATIONS + 1))
+    done < <({ grep -nE -- "$_set_re" "$CODE_ONLY" || true; } \
+                 | { grep -E -- "$EXEMPT_SETENV_VAR_CREDENTIALS" || true; })
+
+    # 3b — the producer exists, sets the variable, and names no credential.
+    _body="$(extract_function_body "$_producer")"
+    if [[ -z "$_body" ]]; then
+        echo "VIOLATION: $_var is exempted from rule 2 but its producer"
+        echo "  $_producer() was not found in $TARGET. The exemption is on the"
+        echo "  variable NAME, so it survives the deletion of what fills it —"
+        echo "  which is exactly when it would wave a credential through."
+        VIOLATIONS=$((VIOLATIONS + 1))
+    else
+        if ! grep -qE -- "$_set_re" <<<"$_body"; then
+            echo "VIOLATION: $_producer() never sets $_var, yet rule 2 exempts"
+            echo "  that variable on the strength of this function (mika#2716)."
+            VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+        if grep -qE -- "$EXEMPT_SETENV_VAR_CREDENTIALS" <<<"$_body"; then
+            echo "VIOLATION: $_producer() names a credential"
+            echo "  ($EXEMPT_SETENV_VAR_CREDENTIALS)."
+            echo "  The producer of an exempted --setenv value must not be able"
+            echo "  to read one; drawing is the whole exemption (mika#2716)."
+            VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+    fi
+
+    # 3c — the variable never flows INTO a credential name, host-side.
+    while IFS= read -r _line; do
+        [[ -z "$_line" ]] && continue
+        echo "VIOLATION: a credential is assigned from $_var, at line ${_line%%:*}."
+        echo "  Exporting the sentinel into the host's GH_TOKEN would have"
+        echo "  _stage_pilot_gh_token stage it AS the real token: the addon"
+        echo "  would inject it and every pilot call would 401 (mika#2716 R7)."
+        VIOLATIONS=$((VIOLATIONS + 1))
+    done < <({ grep -nE -- "(^|[[:space:]]|;|\\\$\\{)($EXEMPT_SETENV_VAR_CREDENTIALS)(=|:=)" "$CODE_ONLY" || true; } \
+                 | { grep -F -- "$_var" || true; })
+done
 
 if [[ "$VIOLATIONS" -gt 0 ]]; then
     echo ""
