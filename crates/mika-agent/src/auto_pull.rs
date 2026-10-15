@@ -76,6 +76,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::InFlightSelfDevTask;
+use crate::gh_process::{GhSubject, run_gh};
 use crate::ready_label::{
     self, ReadyApplyOutcome, ReadyApplyRequest, ReadyLabelEvent, ReadyWriteAuth,
 };
@@ -2381,26 +2382,23 @@ fn select_feeder_candidates_recording(
 /// Returns all open issues with number, body, labels, and updatedAt.
 /// `gh` CLI has no negative label filter, so we fetch all and filter client-side.
 async fn gh_list_open_issues(github_token: &str) -> Result<Vec<Issue>> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "list",
-        "--repo",
-        DEFAULT_REPO,
-        "--state",
-        "open",
-        "--json",
-        "number,body,labels,updatedAt",
-        "--limit",
-        "100",
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        github_token,
+        GhSubject::Repo,
+        &[
+            "issue",
+            "list",
+            "--repo",
+            DEFAULT_REPO,
+            "--state",
+            "open",
+            "--json",
+            "number,body,labels,updatedAt",
+            "--limit",
+            "100",
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("gh issue list failed: {}", stderr));
@@ -2446,26 +2444,23 @@ async fn gh_list_open_issues(github_token: &str) -> Result<Vec<Issue>> {
 /// a PR body contains `Closes #N` (or equivalent keyword) or the PR is
 /// manually linked to an issue. Issues not so linked are absent from the set.
 async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u64>> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "pr",
-        "list",
-        "--repo",
-        DEFAULT_REPO,
-        "--state",
-        "open",
-        "--json",
-        "number,closingIssuesReferences",
-        "--limit",
-        "100",
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        github_token,
+        GhSubject::Repo,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            DEFAULT_REPO,
+            "--state",
+            "open",
+            "--json",
+            "number,closingIssuesReferences",
+            "--limit",
+            "100",
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("gh pr list failed: {}", stderr));
@@ -2500,23 +2495,20 @@ pub(crate) async fn gh_apply_label(
     issue_number: u64,
     label: &str,
 ) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "edit",
-        &issue_number.to_string(),
-        "--repo",
-        DEFAULT_REPO,
-        "--add-label",
-        label,
-    ]);
-    cmd.env("GH_TOKEN", label_auth.token());
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        label_auth.token(),
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "edit",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--add-label",
+            label,
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // AC5 : un refus de permission sous identité App a son propre nom, ici
@@ -2542,23 +2534,20 @@ async fn gh_remove_label(
     issue_number: u64,
     label: &str,
 ) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "edit",
-        &issue_number.to_string(),
-        "--repo",
-        DEFAULT_REPO,
-        "--remove-label",
-        label,
-    ]);
-    cmd.env("GH_TOKEN", label_auth.token());
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        label_auth.token(),
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "edit",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--remove-label",
+            label,
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Tolerate the idempotent "label not present" case as success.
@@ -2586,23 +2575,20 @@ async fn gh_remove_label(
 /// is not a refusal anyone reads — mika#1901 was re-driven 16 times, and the
 /// only way to notice was to count timeline events by hand.
 async fn gh_comment_issue(github_token: &str, issue_number: u64, body: &str) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "comment",
-        &issue_number.to_string(),
-        "--repo",
-        DEFAULT_REPO,
-        "--body",
-        body,
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        github_token,
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "comment",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--body",
+            body,
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
@@ -2629,18 +2615,16 @@ async fn gh_comment_issue(github_token: &str, issue_number: u64, body: &str) -> 
 /// which promotes — the gate refuses on what it measured, never on what it
 /// failed to measure.
 async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasurement {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "api",
-        &format!("repos/{DEFAULT_REPO}/compare/main...{branch}"),
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = match cmd.output().await {
+    let output = match run_gh(
+        github_token,
+        GhSubject::Repo,
+        &[
+            "api",
+            &format!("repos/{DEFAULT_REPO}/compare/main...{branch}"),
+        ],
+    )
+    .await
+    {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, branch, "auto_pull: gh api compare failed to spawn");
@@ -9519,7 +9503,10 @@ This ticket has been GROOMED and is ready.
             Database::open_in_memory().expect("open in-memory DB"),
             "mika",
         );
-        let n = 2049u64;
+        // mika#2713 — numéro hors de la plage des vrais tickets, et distinct de
+        // ceux des tests voisins : le journal d'appels `gh` est process-global.
+        let n = 990_101u64;
+        crate::gh_process::assert_fixture_issue(n);
         let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
         let mut ledger = ExclusionLedger::default();
@@ -9826,7 +9813,9 @@ This ticket has been GROOMED and is ready.
             Database::open_in_memory().expect("open in-memory DB"),
             "mika",
         );
-        let n = 2635u64;
+        // mika#2713 — voir la note du test `mika2049_…` : hors plage, et distinct.
+        let n = 990_102u64;
+        crate::gh_process::assert_fixture_issue(n);
         let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
 
@@ -9881,7 +9870,10 @@ This ticket has been GROOMED and is ready.
             Database::open_in_memory().expect("open in-memory DB"),
             "mika",
         );
-        let n = 2636u64;
+        // mika#2713 — **le** numéro de l'incident : c'est ce test qui a posté 29
+        // commentaires sur le #2636 fermé. Hors plage, et distinct de ses voisins.
+        let n = 990_103u64;
+        crate::gh_process::assert_fixture_issue(n);
         let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
 
@@ -9908,6 +9900,66 @@ This ticket has been GROOMED and is ready.
                 .any(|(_, _, reason)| *reason == FILTER_LAUNCHER_BRAKED),
             "sans mort de lanceur, aucune exclusion de frein ; ledger = {:?}",
             ledger.entries
+        );
+    }
+
+    /// **mika#2713 — la fuite historique, rejouée : elle va au journal.**
+    ///
+    /// Le 2026-10-03 puis le 2026-10-14, ce chemin exact — même corps
+    /// (`GROOMED_BODY`, dont le callout nomme `feat/123/x`), même label
+    /// `ready`, même appel à `phase2_reconcile_stuck_ready` — a posté 29
+    /// commentaires sur le ticket **fermé** #2636 sous l'identité du moteur. Le
+    /// premier appel à partir pour de vrai était la lecture de timeline.
+    ///
+    /// Ici il est **enregistré** au lieu de partir. Si quelqu'un retirait la
+    /// couture, l'appel partirait et ce journal serait vide : c'est ce que
+    /// l'assertion lit.
+    #[tokio::test]
+    async fn mika2713_la_fuite_historique_va_au_journal_pas_a_la_forge() {
+        use crate::db::Database;
+        use crate::gh_process::{GhSubject, recorded_calls};
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        // Numéro propre à ce test : le journal est process-global, donc le
+        // filtre ci-dessous doit être indifférent aux tests voisins (D4).
+        let n = 990_104u64;
+        crate::gh_process::assert_fixture_issue(n);
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+        let mut ledger = ExclusionLedger::default();
+
+        let fx = test_ctx_fixture();
+        let _ = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+            false,
+            &fx.ctx(),
+        )
+        .await;
+
+        let mine: Vec<String> = recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == GhSubject::Issue(n))
+            .map(|c| c.args)
+            .collect();
+
+        assert!(
+            mine.iter()
+                .any(|a| a.contains(&format!("repos/{DEFAULT_REPO}/issues/{n}/timeline"))),
+            "mika#2713 — l'appel qui fuyait doit être au journal du double. \
+             Un journal vide ici veut dire que la couture n'est plus sur ce \
+             chemin : l'appel est reparti vers la forge réelle. Appels vus \
+             pour #{n} : {mine:?}"
         );
     }
 }
