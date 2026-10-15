@@ -1870,12 +1870,19 @@ mod tests {
     /// mesurés sont `delivered`, et rien ne prouve que `delivered` implique un
     /// processus mort). Ce n'est pas un second lecteur de la question de
     /// `live_pilot.rs` ; c'est une divergence **écrite au site**, et ce scan
-    /// vise la divergence silencieuse. Le résidu, nommé plutôt que découvert :
-    /// un lecteur qui omet le filtre terminal échappe au scan. Il en existe un
-    /// second **aujourd'hui** : `probe_pilot_liveness` (`mika-cli`, rendu de
-    /// `mika tasks show`), même forme que `dispatch_liveness`. Il affiche et ne
-    /// décide rien ; le router par `live_pilot` demande d'exposer
-    /// `resolve_task_pilot` hors du crate — suivi, pas une ligne d'allowlist.
+    /// vise la divergence silencieuse. La borne, dite plutôt que supposée
+    /// (mika#2670) : un lecteur qui **omet** le filtre terminal n'a pas le
+    /// troisième terme, et le scan ne le nomme donc pas. Ce n'est pas un
+    /// périmètre manquant — le corpus de `production_sources_to_test_module()`
+    /// couvre `crates` en entier, `crates/mika-cli/src/` compris, et
+    /// `mika2670_le_corpus_du_scan_contient_la_cli` l'épingle. C'est le
+    /// prédicat qui est *exact* : `probe_pilot_liveness` (`mika-cli`, rendu de
+    /// `mika tasks list` / `get`) refaisait la traversée sans le filtre, et
+    /// l'absence du filtre **était** le défaut. Depuis mika#2670 ce site est
+    /// routé par `live_pilot::resolve_task_pilot`, et un lecteur hors crate est
+    /// fermé par **visibilité** plutôt que par scan : les deux poignées de
+    /// `find_dispatch_children_with_pid` sont `pub(crate)`, donc la traversée ne
+    /// se recompose plus hors de `mika-agent` — ça ne compile pas.
     ///
     /// Le scan est **par fichier** : un appel à `is_terminal_task_status` ajouté
     /// ailleurs dans `engine.rs` ou `tasks.rs` le ferait rougir sur ces deux
@@ -2010,6 +2017,47 @@ mod tests {
              quand le scan tire, on route le site par `live_pilot`. Une \
              allowlist née non vide est un emplacement où déposer la prochaine \
              infraction (mika#2323)."
+        );
+    }
+
+    /// **Assertion de périmètre (mika#2670, AC2)** — le corpus du scan du
+    /// lecteur unique contient la CLI.
+    ///
+    /// mika#2670 supposait que
+    /// `mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique` « ne voit que
+    /// `crates/mika-agent` ». C'est faux :
+    /// `production_sources_to_test_module()` marche sur `crates` en entier, et
+    /// `crates/mika-cli/src/commands/tasks.rs` y était déjà. Ce qui laissait
+    /// `probe_pilot_liveness` passer est la conjonction à trois termes — la CLI
+    /// n'appelait jamais `is_terminal_task_status`, précisément parce qu'elle
+    /// avait oublié le filtre.
+    ///
+    /// Cette assertion existe parce que cette borne est désormais **écrite** à
+    /// deux endroits : la doc de `live_pilot::resolve_task_pilot` et le
+    /// paragraphe de résidu de
+    /// `mika2653_le_scan_du_lecteur_voit_un_second_site`. Le jour où le walk se
+    /// restreindrait à `mika-agent`, les deux deviendraient fausses en silence
+    /// et la borne documentée serait un mensonge. Pas d'allowlist : une seule
+    /// proposition, dont la seule issue légitime est vraie.
+    #[test]
+    fn mika2670_le_corpus_du_scan_contient_la_cli() {
+        let cli: Vec<String> = production_sources_to_test_module()
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .filter(|rel| rel.starts_with("crates/mika-cli/src/"))
+            .collect();
+        assert!(
+            !cli.is_empty(),
+            "mika#2670 — le corpus de production_sources_to_test_module() ne \
+             contient plus aucun chemin sous crates/mika-cli/src/. La borne \
+             documentée du scan du lecteur unique — « le corpus couvre déjà la \
+             CLI, c'est le prédicat à trois termes qui laissait passer \
+             probe_pilot_liveness » — est devenue fausse.\n\n\
+             RÉSOLUTION : rétablir le périmètre du walk, ou corriger les deux \
+             sites qui énoncent la borne (doc de \
+             `live_pilot::resolve_task_pilot`, résidu de \
+             `mika2653_le_scan_du_lecteur_voit_un_second_site`). Jamais laisser \
+             une phrase affirmer un périmètre que le walk n'a plus."
         );
     }
 
