@@ -321,6 +321,7 @@ allowlist = [\n\
   \"qa-review\",\n\
   \"qa-review-build-callback\",\n\
   \"qa-review-webhook-success\",\n\
+  \"qa-review-webhook-ready\",\n\
   \"skill-review\",\n\
   \"build-mika\",\n\
   \"deploy-mika\",\n\
@@ -2470,6 +2471,12 @@ mod tests {
             "qa-review",
             "qa-review-build-callback",
             "qa-review-webhook-success",
+            // mika#2212 — handler for `pull_request.ready_for_review`. Missing
+            // it from the identity allowlist above produces a skill that
+            // exists, seeds into the canonical library, and is NEVER linked
+            // under `{global_home}/agents/mika-qa/skills/`: invisible, with no
+            // failure. That silence is the class this ticket was filed for.
+            "qa-review-webhook-ready",
         ];
         for skill in &qa_only {
             assert!(
@@ -2670,8 +2677,8 @@ mod tests {
             .expect("mika-qa must have allowlist");
         assert_eq!(
             allowlist.len(),
-            18,
-            "mika-qa allowlist should have 18 skills"
+            19,
+            "mika-qa allowlist should have 19 skills (+qa-review-webhook-ready, mika#2212)"
         );
     }
 
