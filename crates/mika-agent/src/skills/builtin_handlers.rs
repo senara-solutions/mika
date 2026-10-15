@@ -4091,8 +4091,7 @@ async fn validate_pipeline_block_grounding_gated(
     ctx: &ToolContext<'_>,
 ) -> Result<(), ToolOutput> {
     use crate::evidence::guards::{
-        PIPELINE_GROUNDING_AUDIT_TOOL, PipelineGroundingOutcome, classify_pipeline_block_grounding,
-        pr_review_target,
+        PipelineGroundingOutcome, classify_pipeline_block_grounding, pr_review_target,
     };
     use crate::server::verdict::{Verdict, parse_verdict};
 
@@ -4119,50 +4118,43 @@ async fn validate_pipeline_block_grounding_gated(
     let target = pr_review_target(args).unwrap_or_else(|| "unknown".to_string());
     let target_key = format!("pr_review:{}#{}", repo.unwrap_or("__default__"), target);
 
-    // Audit writes are warn-and-continue throughout: losing the ledger row must
-    // not change the guard's verdict in either direction.
-    async fn audit(ctx: &ToolContext<'_>, target_key: &str, outcome: &str, reasoning: &str) {
-        if let Err(e) = ctx
-            .db
-            .log_audit_event(
-                ctx.session_id,
-                PIPELINE_GROUNDING_AUDIT_TOOL,
-                target_key,
-                None,
-                Some(outcome),
-                Some(reasoning),
-                Some(ctx.trace_id),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "failed to write pipeline-grounding audit row");
-        }
-    }
+    // The DB read is paid **here**, after the verdict class is known: the
+    // population of `block[pipeline]` calls is rare, so the query costs nothing
+    // on the nominal path and no extra population predicate is needed to keep
+    // it that way.
+    let guard_execution_observed = observe_pipeline_guard_execution(ctx, &target_key).await;
 
-    let (reason, reasoning) = match classify_pipeline_block_grounding(true, &body) {
-        PipelineGroundingOutcome::Allowed => {
-            // The positive control, and the reason this branch writes a row
-            // rather than returning early: a population of zero allowed calls
-            // is how a guard that never runs looks exactly like a guard that
-            // never has to refuse (mika#2205).
-            audit(
-                ctx,
-                &target_key,
-                "allowed",
-                "block[pipeline] carries a PIPELINE: section citing a guard that exited non-zero",
-            )
-            .await;
-            return Ok(());
-        }
-        PipelineGroundingOutcome::RefusedSectionAbsent => (
-            "section_absent",
-            "block[pipeline] with no PIPELINE: section anywhere in the body",
-        ),
-        PipelineGroundingOutcome::RefusedNoFailingGuardCited => (
-            "no_failing_guard_cited",
-            "block[pipeline] whose PIPELINE: section cites no guard at a non-zero exit",
-        ),
-    };
+    let (reason, reasoning) =
+        match classify_pipeline_block_grounding(true, &body, guard_execution_observed) {
+            PipelineGroundingOutcome::Allowed => {
+                // The positive control, and the reason this branch writes a row
+                // rather than returning early: a population of zero allowed
+                // calls is how a guard that never runs looks exactly like a
+                // guard that never has to refuse (mika#2205).
+                audit_pipeline_grounding(
+                    ctx,
+                    &target_key,
+                    "allowed",
+                    "block[pipeline] carries a PIPELINE: section citing a guard that exited \
+                     non-zero, and a guard was actually invoked in this session",
+                )
+                .await;
+                return Ok(());
+            }
+            PipelineGroundingOutcome::RefusedSectionAbsent => (
+                "section_absent",
+                "block[pipeline] with no PIPELINE: section anywhere in the body",
+            ),
+            PipelineGroundingOutcome::RefusedNoFailingGuardCited => (
+                "no_failing_guard_cited",
+                "block[pipeline] whose PIPELINE: section cites no guard at a non-zero exit",
+            ),
+            PipelineGroundingOutcome::RefusedNoGuardExecuted => (
+                "no_guard_executed",
+                "block[pipeline] whose body cites a failing guard, while this session's tool \
+                 ledger records shell calls and none of them invoked a pipeline guard",
+            ),
+        };
 
     tracing::warn!(
         event = "pipeline_block_refused",
@@ -4173,7 +4165,7 @@ async fn validate_pipeline_block_grounding_gated(
         reason = %reason,
         "refused a block[pipeline] review that cites no guard actually run and failed (mika#2687)"
     );
-    audit(ctx, &target_key, "refused", reasoning).await;
+    audit_pipeline_grounding(ctx, &target_key, "refused", reasoning).await;
 
     // The remedy names BOTH correct ways out, like its mika#2237 neighbour and
     // for the same reason: naming only "add the section" would push the model
@@ -4199,9 +4191,129 @@ async fn validate_pipeline_block_grounding_gated(
                    wrong: the verdict is pass, hold[review], or block[ac] per the other steps. \
                    Do not restate a rule a guard already carries, and do not write a PIPELINE: \
                    section from memory — the guard's own output is the only evidence this gate \
-                   accepts.",
+                   accepts. On reason no_guard_executed the section you posted is well formed, \
+                   and that is precisely the point: this session's tool ledger records shell \
+                   calls and not one of them invoked a pipeline guard, so the section was \
+                   written rather than observed. Run Step 2B in this session, then post what it \
+                   prints.",
     });
     Err(ToolOutput::error(body.to_string()))
+}
+
+/// Write one `audit_events` row for a pipeline-grounding decision.
+///
+/// Warn-and-continue, on **every** outcome — allowed, refused, abstained.
+/// Losing the ledger row must not change the guard's verdict in either
+/// direction, and an empty table must keep meaning "the link was never
+/// reached", never "nothing was refused" (mika#2205).
+async fn audit_pipeline_grounding(
+    ctx: &ToolContext<'_>,
+    target_key: &str,
+    outcome: &str,
+    reasoning: &str,
+) {
+    use crate::evidence::guards::PIPELINE_GROUNDING_AUDIT_TOOL;
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            PIPELINE_GROUNDING_AUDIT_TOOL,
+            target_key,
+            None,
+            Some(outcome),
+            Some(reasoning),
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to write pipeline-grounding audit row");
+    }
+}
+
+/// Did a `run_shell` call of **this session** invoke a pipeline guard?
+///
+/// The engine fact behind `PipelineGroundingOutcome::RefusedNoGuardExecuted`,
+/// read on the B3 pattern of mika#2565: three states, and the third is the one
+/// that matters.
+///
+/// | ledger says | returned | why |
+/// |---|---|---|
+/// | a shell call names a guard script | `true` | the guard ran |
+/// | shell calls exist, none names a guard | `false` | **the refusal** — the ledger is alive and says this session ran no guard |
+/// | the read failed | `true` + abstention | a failed read is not a `false` |
+/// | zero shell calls at all | `true` + abstention | ledger disarmed, or a resumed session |
+///
+/// **The abstention is partial and it is said.** Partial, because returning
+/// early would remove the two body predicates from the decision as well —
+/// the exact shape mika#2565 had to correct on `abstain_b3`. Said, because the
+/// last row is the real false positive the plan names: a review resumed on a
+/// build callback runs under a brand-new `session_id`
+/// (`dispatcher.rs`, `format!("{session_prefix}-{}")`), so the guard's
+/// `run_shell` belongs to the session before it. Nothing in the ledger
+/// separates that from `MIKA_STORE_TOOL_CALLS` being disarmed, and both are
+/// silence rather than accusation — so both abstain, under
+/// `PipelineGroundingAbstention::NO_SHELL_CALL_RECORDED`, and
+/// `pipeline_grounding_abstained` is what makes the population countable
+/// before anyone tightens this.
+async fn observe_pipeline_guard_execution(ctx: &ToolContext<'_>, target_key: &str) -> bool {
+    use crate::evidence::guards::{
+        PIPELINE_GROUNDING_SHELL_TOOL, PIPELINE_GROUNDING_WINDOW_SECS, PipelineGroundingAbstention,
+        shell_invocation_runs_pipeline_guard,
+    };
+
+    async fn abstain(ctx: &ToolContext<'_>, target_key: &str, reason: &'static str) -> bool {
+        tracing::warn!(
+            event = "pipeline_grounding_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#2687: could not read the guard-execution term — the execution proof abstains \
+             and the body predicates still decide"
+        );
+        audit_pipeline_grounding(ctx, target_key, "abstained", reason).await;
+        true
+    }
+
+    match ctx
+        .db
+        .find_recent_tool_invocation(
+            ctx.db.agent_id(),
+            ctx.session_id,
+            PIPELINE_GROUNDING_SHELL_TOOL,
+            PIPELINE_GROUNDING_WINDOW_SECS,
+        )
+        .await
+    {
+        Err(e) => {
+            tracing::warn!(
+                event = "pipeline_grounding_ledger_unreadable",
+                error = %e,
+                target = %target_key,
+                "mika#2687: the tool ledger did not answer"
+            );
+            abstain(
+                ctx,
+                target_key,
+                PipelineGroundingAbstention::TOOL_LEDGER_UNREADABLE,
+            )
+            .await
+        }
+        Ok(rows) if rows.is_empty() => {
+            abstain(
+                ctx,
+                target_key,
+                PipelineGroundingAbstention::NO_SHELL_CALL_RECORDED,
+            )
+            .await
+        }
+        Ok(rows) => rows.iter().any(|row| {
+            row.input
+                .as_deref()
+                .is_some_and(shell_invocation_runs_pipeline_guard)
+        }),
+    }
 }
 
 /// Refuse a `gh pr review` whose body says `VERDICT: pass` while a **required**
@@ -4776,7 +4888,7 @@ where
     let build_observed = if is_pass && is_cargo_dependency_pr(&files) {
         match ctx
             .db
-            .find_recent_build_invocation(
+            .find_recent_tool_invocation(
                 ctx.db.agent_id(),
                 ctx.session_id,
                 BUILD_TOOL,
@@ -13509,12 +13621,41 @@ mod mika2687_pipeline_grounding_tests {
         }
     }
 
+    /// Record one `run_shell` row through `save_tool_call` — the production
+    /// writer — rather than a hand-rolled INSERT: a fabricated row could
+    /// satisfy a query the real writer never produces (motif mika#2565).
+    async fn record_a_shell_call(h: &TestHarness, command: &str) {
+        h.db.save_tool_call(
+            &format!("tc-{}", uuid::Uuid::new_v4()),
+            "test-session",
+            None,
+            None,
+            3,
+            crate::evidence::guards::PIPELINE_GROUNDING_SHELL_TOOL,
+            "builtin",
+            Some("qa-review"),
+            Some(&serde_json::json!({ "command": command }).to_string()),
+            Some("GUARD: scripts/verify-pipeline.sh exit=1"),
+            true,
+            false,
+            42,
+            None,
+        )
+        .await
+        .expect("the shell row must be recorded");
+    }
+
     /// Positive control: the shape Step 2E prescribes traverses, and leaves the
     /// `allowed` row that distinguishes "refuses nothing" from "never runs"
     /// (mika#2205).
+    ///
+    /// The session records a real Step 2B invocation, so the vol-2 execution
+    /// proof is **acquired** rather than abstained — which is what makes the
+    /// single `allowed` row the whole population here.
     #[tokio::test]
     async fn a_grounded_block_traverses_and_leaves_its_allowed_row() {
         let h = TestHarness::with_agent("mika-qa");
+        record_a_shell_call(&h, "bash scripts/verify-pipeline.sh origin/main").await;
         let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
         assert!(
             validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
@@ -13523,6 +13664,67 @@ mod mika2687_pipeline_grounding_tests {
         );
         assert_eq!(rows(&h, "allowed").await, 1);
         assert_eq!(all_rows(&h).await, 1);
+    }
+
+    /// **The vol-2 class.** A body Step 2E would sign off on, in a session
+    /// whose ledger records shell calls and not one of them ran a guard. The
+    /// two body predicates are satisfied; only the engine fact refuses.
+    #[tokio::test]
+    async fn a_well_formed_block_whose_session_ran_no_guard_is_refused() {
+        let h = TestHarness::with_agent("mika-qa");
+        record_a_shell_call(&h, "git diff --stat origin/main").await;
+        record_a_shell_call(&h, "cargo test -p mika-agent").await;
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
+        let err = validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
+            .await
+            .expect_err("a section written rather than observed must not publish");
+        assert!(err.content.contains("no_guard_executed"), "{}", err.content);
+        assert!(err.content.contains("Step 2B"), "{}", err.content);
+        assert_eq!(rows(&h, "refused").await, 1);
+        assert_eq!(
+            rows(&h, "abstained").await,
+            0,
+            "the ledger answered — this is a refusal, not an abstention"
+        );
+    }
+
+    /// The false positive the plan names, and it **abstains out loud**. An
+    /// empty ledger has two causes no query separates — `MIKA_STORE_TOOL_CALLS`
+    /// disarmed, or a review resumed on a build callback under a brand-new
+    /// `session_id`. Both are silence, so the execution proof steps aside and
+    /// the body predicates still decide.
+    #[tokio::test]
+    async fn an_empty_tool_ledger_abstains_rather_than_refusing() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
+        assert!(
+            validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
+                .await
+                .is_ok(),
+            "an unreadable term must not turn a grounded review into a refusal"
+        );
+        assert_eq!(rows(&h, "abstained").await, 1, "the abstention is SAID");
+        assert_eq!(
+            rows(&h, "allowed").await,
+            1,
+            "and it is PARTIAL — the body predicates still reached their verdict"
+        );
+    }
+
+    /// The abstention does not resurrect the vol-1 classes. A session with no
+    /// ledger at all still refuses the two measured bodies of mika#2685 —
+    /// otherwise a disarmed `MIKA_STORE_TOOL_CALLS` would silently disarm the
+    /// whole gate.
+    #[tokio::test]
+    async fn abstaining_on_execution_does_not_disarm_the_body_predicates() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", MEASURED_BODY]);
+        let err = validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
+            .await
+            .expect_err("the measured body is refused whatever the ledger says");
+        assert!(err.content.contains("section_absent"), "{}", err.content);
+        assert_eq!(rows(&h, "abstained").await, 1);
+        assert_eq!(rows(&h, "refused").await, 1);
     }
 
     /// Out of population: nothing but `block[pipeline]` is this guard's

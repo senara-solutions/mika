@@ -3657,8 +3657,9 @@ impl AsyncDatabase {
         .await
     }
 
-    /// Async wrapper for `Database::find_recent_build_invocation` (mika#2565).
-    pub async fn find_recent_build_invocation(
+    /// Async wrapper for `Database::find_recent_tool_invocation` (mika#2565,
+    /// mika#2687).
+    pub async fn find_recent_tool_invocation(
         &self,
         agent_id: &str,
         session_id: &str,
@@ -3669,7 +3670,7 @@ impl AsyncDatabase {
         let session_id = session_id.to_owned();
         let tool_name = tool_name.to_owned();
         self.with_db(move |db| {
-            db.find_recent_build_invocation(&agent_id, &session_id, &tool_name, window_secs)
+            db.find_recent_tool_invocation(&agent_id, &session_id, &tool_name, window_secs)
         })
         .await
     }
