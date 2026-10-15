@@ -4721,7 +4721,27 @@ ${PILOT_OUTPUT_RAW}"
 
     if [ "$_terminated_empty" = "1" ]; then
         PILOT_SESSION_TERMINATED=1
+        # mika#2029 : résoudre le sous-type ICI, en commande, AVANT la
+        # substitution ci-dessous. `RESULT=$(_classify_terminated_session)` est un
+        # SOUS-SHELL : le mémo et le `_HALT_SUBTYPE_RESOLVED` qu'il publie
+        # mourraient avec lui — le piège que le commentaire de
+        # `_resolve_halt_subtype` nomme explicitement. Résolu ici, le mémo est
+        # HÉRITÉ par le sous-shell : la bannière `Halt class:` et le motif
+        # `NO_PR:` décrivent donc la même résolution par construction, et stderr
+        # n'est lu qu'une fois.
+        _resolve_halt_subtype
         RESULT=$(_classify_terminated_session)
+        # mika#2029 (D1, D5, D6) — ce chemin est le SEUL qui saute
+        # `_post_flight_recovery`, donc le seul où aucun des deux sites de pose
+        # ne tourne. Le callback partait sans ligne `PR:` ni `NO_PR:` — 8/8 des
+        # kills depuis le 2026-09-04 — et le reaper (`engine.rs`
+        # `reap_orphaned_parent_tasks`) écrivait son défaut
+        # `callback_delivered_without_pr_url`, motif qui confond ce kill avec un
+        # callback malformé. La justification est STRUCTURELLE, pas statistique :
+        # le contrat total de mika#2121 veut exactement une ligne par callback
+        # livré, donc ce chemin en doit une même si la classe s'éteignait demain.
+        # Posé après l'affectation de RESULT ci-dessus, qui écrase et n'ajoute pas.
+        _set_pr_status_line "NO_PR: $(_no_pr_reason_from_halt_subtype "${_HALT_SUBTYPE_RESOLVED:-}")"
     else
         _post_flight_recovery
         if [ "$_terminated_with_work" = "1" ]; then
@@ -5110,6 +5130,40 @@ _halt_hint_meaning() {
         deterministic) printf '%s' "the cause is in what the session did; a re-run from the same state reproduces it — what it left behind is what counts" ;;
         *)             printf '%s' "a re-run teaches nothing until the cause has been read; neither a promise nor a ban" ;;
     esac
+}
+
+# Le motif `NO_PR:` d'un pilote tué par un garde-fou sans avoir produit (mika#2029).
+#
+# POURQUOI LE SOUS-TYPE ET NON LA FAMILLE (D2). `_halt_family` rend six familles
+# pour douze sous-types : `budget_exhausted` confond `error_max_turns` et
+# `error_max_budget_usd`, `model_unproductive` confond `stall_detected` et
+# `empty_response`. La distribution mesurée sur 578 sessions (30 jours, mika#2029
+# M2) sépare justement `error_max_turns` (30) de `stall_detected` (6) et de
+# `idle_timeout` (5) — trois remèdes différents. Un motif qui porte la famille
+# rendrait ces trois-là indiscernables dans `tasks.result`, c'est-à-dire
+# exactement la mesure que ce ticket existe pour rendre possible. Le prix est un
+# motif long (`callback_no_pr_pilot_terminated_error_max_turns`, 46 caractères) ;
+# la colonne est un TEXT libre, donc c'est un prix et non une limite.
+#
+# POURQUOI LA NORMALISATION (D3). Le lecteur de cette ligne est `RE_NO_PR` dans
+# `dispatcher.rs` : `(?m)^NO_PR:\s+([a-z_]+)`. Un caractère hors `[a-z_]` ne fait
+# pas échouer le parse — il le TRONQUE, et le motif tronqué ressemble à une
+# mesure. `Error-Max-Turns` arriverait dans `tasks.result` en
+# `callback_no_pr_pilot_terminated_error`, un motif plausible, agrégeable, et
+# faux. La normalisation rend cette classe impossible plutôt que de compter sur
+# ce que le producteur amont écrit : les sous-types viennent d'un `Literal`
+# Python (claude-pilot `types.py`) que personne ici ne contrôle.
+#
+# Une résolution VIDE est une résolution — « cette session n'a laissé aucun
+# signal de halte » — et elle a son propre motif. La laisser produire
+# `pilot_terminated_` tendrait à `RE_NO_PR` une queue vide : le `+` ne matcherait
+# pas, la ligne serait ignorée, et le kill retomberait dans le générique que ce
+# livrable comble.
+_no_pr_reason_from_halt_subtype() {
+    local s="${1:-}"
+    [ -n "$s" ] || { printf '%s' "pilot_terminated_unknown"; return 0; }
+    s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z_' '_')
+    printf '%s' "pilot_terminated_${s}"
 }
 
 # Resolve THE halt subtype of this session, once, for every consumer (mika#2539).
