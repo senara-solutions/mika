@@ -282,8 +282,14 @@ Le relevé, en ancrant sur `^dispatch-lib: ` et jamais sur le jeton nu — ce
 d'une session qui *discutait* du signal :
 
 ```sh
-grep -h '^dispatch-lib: plan_size_estimate ' ~/.mika/logs/**/*.stderr
+grep -h '^dispatch-lib: plan_size_estimate ' /var/log/claude-pilot/*.stderr
 ```
+
+Le répertoire est bien `/var/log/claude-pilot/` — c'est le `_PILOT_LOG_DIR` que
+`dispatch-lib.sh` résout tardivement (§ audit mika#2165). `~/.mika/logs/`, écrit
+ici jusqu'au 2026-10-15, **n'existe pas** : un répertoire absent rend zéro
+ligne, exactement comme un corpus vide, et les deux se confondent. C'est la
+sonde elle-même qui doit être ancrée, pas seulement le motif.
 
 Correspondance champ → terme du quadruplet de l'étape 1 :
 
@@ -305,17 +311,39 @@ déjà groomé ne repasse par aucune porte de groom au dispatch suivant. Refuser
 ici gèlerait d'un coup tout `docs/plans/`. Détection permissive, décision
 stricte — la répartition des trois portes de mika#2636, inchangée.
 
-**Note datée, 2026-10-15 : `_PLAN_SIZE_FLIGHT_TAIL_TURNS=50` surestime la queue.**
-La constante a été posée sur des vols qui passaient par `ce-simplify-code` et
-`ce-code-review`. mika#2694 / PR #2695 les a retirés des vols de pilote, et la
-mesure disponible sur le vol de mika#2693 leur attribuait ~41 + ~41 tours sur
-une queue de ~80. La borne qui en dérive est donc plus serrée que nécessaire —
-dans la direction prudente, donc rien n'est cassé, mais le coût est des vols en
-trop. Le recalibrage **n'est pas** une soustraction naïve : elle rendrait un
-reste de ~0 tour pour la vérification, le compound et la PR, ce qui est faux
-(mika#2687 vol 1 est mort *dans* la vérification après 15 tours de queue). Il
-demande le corpus que l'instrument ci-dessus produit. Suivi : mika#2707, dont la
-condition de déclenchement est **cinq vols post-#2695 ayant ouvert une PR**.
+**Note datée, 2026-10-15 — relevé fait, `n = 0`, la constante n'a pas bougé.**
+Le corpus a été relevé le 2026-10-15 avec la sonde ci-dessus : **16** lignes
+`plan_size_estimate` ancrées, dont **zéro** portant `ceiling=` ou
+`per_flight_bound_loc=`. Toutes sont au format pré-mika#2701, à quatre champs.
+Le seuil de recalibrage de `_PLAN_SIZE_FLIGHT_TAIL_TURNS` est cinq vols
+post-#2695 ayant ouvert une PR ; `n = 0 < 5`, donc **aucune des quatre
+constantes n'a été touchée** et le suivi reste mika#2707.
+
+La cause est plus nette que « l'instrument est trop jeune » : **aucun binaire
+déployé ne l'embarque**. Porte 3 est née le 2026-10-15 et la chaîne mika#2340
+— *rebuild → seed → read* — n'a pas tourné depuis, donc les vols du jour
+exécutent un `dispatch-lib.sh` qui ignore les trois champs. **Le corpus ne
+commence à se remplir qu'au premier vol suivant un `make deploy`** : c'est la
+condition que la condition de déclenchement présuppose sans la dire.
+
+La prémisse du ticket, elle, tient. Deux queues reconstruites à la main hors
+instrument — 18 tours (vol de mika#2701) et 10 tours (vol de mika#2697) — sont
+bien sous 50. Mais n=2 *est* le n=3 que la § ci-dessus refuse, et ces deux
+mesures sous-estiment même la queue : en régime allégé l'ordre est
+vérifier → commit → push → PR, donc la vérification tombe *avant* le dernier
+commit de travail que l'étape 1 prend pour origine. Contrôle de plausibilité,
+jamais une distribution.
+
+Ce qui a bougé à la place : les **cinq** sondes à plafond de plancher du harnais
+dérivent désormais leur plafond de `orientation + fin de pipeline` au lieu de
+retaper `85` et `70`, et un détecteur armé (X1) refuse qu'un littéral y
+revienne. Cinq, et non les quatre recensées : la mutation de X1 en a découvert
+une qu'aucun inventaire ne portait. Le littéral n'était pas qu'un doublon : choisi juste *sous* l'ancien
+plancher, il passe *au-dessus* du nouveau dès que la queue baisse, et la sonde
+mesure alors le bras nominal du résolveur en se croyant sur le plancher — verte,
+pour la mauvaise raison. Le recalibrage du jour J ne touchera donc que les
+constantes, les deux prompts d'architecte et les assertions qui épinglent des
+**valeurs** (V1, V2, V4, V5) — jamais le plancher.
 
 ## Related
 
