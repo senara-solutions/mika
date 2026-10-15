@@ -13323,6 +13323,377 @@ M2641_HELPER_CALLS=$(grep -cE '\$\(_second_pass_retry_prompt\)' "$DISPATCH_LIB" 
 assert_eq "mika#2641 (R-b): les deux sites de seconde passe l'appellent" \
     "2" "$M2641_HELPER_CALLS"
 
+# ===========================================================================
+# mika#2701 — PORTE 3 : la ligne `plan_size_estimate` porte la borne PAR VOL
+#
+# mika#2693 a livré les deux portes qui DÉCIDENT de la borne par vol — la règle
+# injectée au groomeur, et les deux gates architecte — et a laissé hors
+# périmètre, nommément, la porte qui MESURE. C'est ce bloc.
+#
+# La ligne émise au dispatch d'implémentation gagne quatre champs, dérivés du
+# plafond RÉELLEMENT PASSÉ EN ARGV (D1) : `per_flight_bound_loc=`, `ceiling=`,
+# `ceiling_source=`, `per_flight_verdict=`. Elle ne refuse JAMAIS (W4), et la
+# file groomée entière le lui doit : un plan déjà groomé ne repasse par aucune
+# porte de groom au dispatch suivant, donc refuser ici gèlerait d'un coup tout
+# `docs/plans/`. Détection permissive, décision stricte — la répartition des
+# trois portes de mika#2636, inchangée.
+#
+# W1 les quatre champs aux deux paliers · W2 le désarmement · W2-bis un plafond
+# d'argv illisible · W3 le plancher, et la note est CONDITIONNELLE · W4 porte 3
+# ne refuse rien · W5 un total illisible rend `unknown` dans les DEUX unités ·
+# W6 l'ARGV décide, par un discriminant COMPORTEMENTAL · W7 anti-vacuité,
+# hermétisme, ordre des champs.
+#
+# PLACÉ APRÈS LA SECTION mika#2641, et c'est mécanique : la contre-vacuité V6 de
+# mika#2693 extrait sa propre fenêtre entre son titre et le titre de la section
+# mika#2641. Un bloc neuf glissé dans cet intervalle y entrerait, et V6
+# mesurerait alors autre chose que ce que son commentaire annonce — elle
+# passerait encore, ce qui est la pire des deux issues.
+# ===========================================================================
+
+echo ""
+echo 'Test: mika#2701 — porte 3, la ligne porte la borne PAR VOL (W1–W7)'
+echo "-----------------------------------------------------------------------"
+
+# --- Outillage local de section ---------------------------------------------
+
+# Sonde de la ligne de porte 3. Elle passe l'argv TEL QUEL à l'émetteur, et
+# c'est tout le sujet : AC1 veut que le plafond vienne de là et de nulle part
+# ailleurs. `_t2636_emit_probe` n'est pas touchée — elle fige `--max-turns 150`
+# dans son argv, et elle est sous AC4.
+#
+# `$1` = valeur de `_PLAN_SIZE_TOTAL` (vide ⇒ `total_loc=absent`)
+# `$2` = plafond à poser dans l'argv ; `__NONE__` ⇒ `--max-turns` ABSENT, ce que
+#        produit un budget désarmé (`${_PILOT_MAX_TURNS:+--max-turns …}`)
+# `$3` = (optionnel) CSV de labels ; non vide, LA CHAÎNE RÉELLE EST JOUÉE —
+#        le résolveur de plafond tourne avant l'émetteur, comme au site de
+#        lancement, donc l'état amont est posé dans la portée. Sans lui, W6
+#        prouverait « l'argv gagne » contre un environnement vide, c'est-à-dire
+#        contre rien.
+# `$4` = (optionnel) valeur de `PILOT_MAX_TURNS` dans l'environnement
+#
+# Rend `rc=<rc>` sur la PREMIÈRE ligne, puis le stderr de l'émetteur. Le rc est
+# ce qui fait de W4 une preuve, et non une impression.
+_t2701_emit_probe() {
+    local t2701_total="$1" t2701_mt="${2:-__NONE__}" t2701_lbl="${3-}" t2701_env="${4-}"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PLAN_SIZE_MAX_LOC PILOT_MAX_TURNS
+        t2701_argv=(claude-pilot -p --output-format stream-json)
+        if [ "$t2701_mt" != "__NONE__" ]; then
+            t2701_argv+=(--max-turns "$t2701_mt")
+        fi
+        if [ -n "$t2701_env" ]; then export PILOT_MAX_TURNS="$t2701_env"; fi
+        if [ -n "$t2701_lbl" ]; then _pilot_max_turns "$t2701_lbl"; fi
+        _PLAN_SIZE_PLAN_PATH="$T2701_PLAN_PATH"
+        _PLAN_SIZE_TOTAL="$t2701_total"
+        t2701_err=$(_emit_pilot_budget_line "${t2701_argv[@]}" 2>&1 >/dev/null)
+        printf 'rc=%s\n%s' "$?" "$t2701_err"
+    )
+}
+
+T2701_PLAN_PATH="docs/plans/sonde-2701-plan.md"
+_t2701_rc()   { printf '%s' "$1" | head -1 | cut -d= -f2; }
+_t2701_err()  { printf '%s' "$1" | tail -n +2; }
+_t2701_line() { printf '%s' "$1" | grep -F 'dispatch-lib: plan_size_estimate ' | head -1; }
+
+# Les deux bornes de référence sont CALCULÉES par le résolveur, jamais retapées
+# en littéral : un test qui réécrirait 431 serait un troisième site de vérité, et
+# il survivrait au recalibrage du ticket de suivi EN MENTANT. Règle posée par V4
+# de mika#2693, reprise telle quelle.
+T2701_B200=$(_t2636_field 1 "$(_t2693_bound_probe 200)")
+T2701_B150=$(_t2636_field 1 "$(_t2693_bound_probe 150)")
+assert_eq "W1 contre-vacuité: les deux bornes de référence sont calculées et distinctes" "yes" \
+    "$([ -n "$T2701_B200" ] && [ -n "$T2701_B150" ] && [ "$T2701_B200" != "$T2701_B150" ] \
+        && echo yes || echo "non: '$T2701_B200' / '$T2701_B150'")"
+
+# --- W1 : les quatre champs, aux deux paliers de plafond --------------------
+#
+# ROUGE AVANT : la ligne ne portait aucun des quatre champs.
+
+T2701_P200_400=$(_t2701_emit_probe 400 200)
+T2701_P200_500=$(_t2701_emit_probe 500 200)
+T2701_P150_400=$(_t2701_emit_probe 400 150)
+T2701_P150_200=$(_t2701_emit_probe 200 150)
+
+# Contre-vacuité AVANT toute conclusion : les quatre sondes ont bien produit une
+# ligne. Un émetteur muet rendrait rouges les `assert_contains` ci-dessous, mais
+# VERTS tous les `assert_not_contains` de W2, W3, W5 et W6.
+for t2701_out in "$T2701_P200_400" "$T2701_P200_500" "$T2701_P150_400" "$T2701_P150_200"; do
+    assert_eq "W1 contre-vacuité: la sonde rend une ligne plan_size_estimate" "non-vide" \
+        "$([ -n "$(_t2701_line "$t2701_out")" ] && echo non-vide || echo vide)"
+done
+
+assert_contains "W1: plafond 200, total 400 ⇒ borne $T2701_B200, resolved, under_bound" \
+    "per_flight_bound_loc=${T2701_B200} ceiling=200 ceiling_source=resolved per_flight_verdict=under_bound" \
+    "$(_t2701_line "$T2701_P200_400")"
+assert_contains "W1: plafond 200, total 500 ⇒ même borne, verdict over_bound" \
+    "per_flight_bound_loc=${T2701_B200} ceiling=200 ceiling_source=resolved per_flight_verdict=over_bound" \
+    "$(_t2701_line "$T2701_P200_500")"
+assert_contains "W1: plafond 150, total 400 ⇒ borne $T2701_B150, resolved, over_bound" \
+    "per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=over_bound" \
+    "$(_t2701_line "$T2701_P150_400")"
+assert_contains "W1: plafond 150, total 200 ⇒ même borne, verdict under_bound" \
+    "per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=under_bound" \
+    "$(_t2701_line "$T2701_P150_200")"
+
+# LE CŒUR DE W1 : le MÊME total (400) rend deux verdicts PAR VOL opposés selon le
+# plafond, pendant que le verdict PAR PR, lui, ne bouge pas. C'est la moitié qui
+# prouve que le champ neuf mesure bien le vol, et n'est pas une seconde lecture
+# du seuil par PR sous un autre nom.
+assert_contains "W1 (le cœur): à total 400 égal, le verdict par PR est le même aux deux plafonds" \
+    "total_loc=400 threshold_loc=1000 verdict=under_threshold" \
+    "$(_t2701_line "$T2701_P150_400")"
+assert_contains "W1 (le cœur): …et celui par PR l'est aussi sur l'autre palier" \
+    "total_loc=400 threshold_loc=1000 verdict=under_threshold" \
+    "$(_t2701_line "$T2701_P200_400")"
+
+# --- W2 : AC3, moitié désarmée ----------------------------------------------
+#
+# ROUGE AVANT : aucun champ de provenance n'existait.
+
+T2701_DISARMED=$(_t2701_emit_probe 400 __NONE__)
+T2701_DISARMED_LINE=$(_t2701_line "$T2701_DISARMED")
+assert_eq "W2 contre-vacuité: la sonde désarmée rend bien une ligne" "non-vide" \
+    "$([ -n "$T2701_DISARMED_LINE" ] && echo non-vide || echo vide)"
+
+assert_contains "W2 (AC3): budget désarmé ⇒ ceiling_source=disarmed_fallback" \
+    "ceiling_source=disarmed_fallback" "$T2701_DISARMED_LINE"
+# D2 : `ceiling=` porte le plafond RÉSOLU. Sans le 150, le 243 qui l'accompagne
+# serait un nombre sans dérivation possible — « un nombre plausible, présenté
+# avec autorité », la classe que l'ancre de `_PLAN_SIZE_TOTAL_RE` a dû fermer.
+assert_contains "W2 (D2): et ceiling=150, le plafond RÉSOLU" \
+    "ceiling=150 ceiling_source=disarmed_fallback" "$T2701_DISARMED_LINE"
+assert_not_contains "W2 (D2): la ligne n'écrit JAMAIS ceiling=none" \
+    "ceiling=none" "$T2701_DISARMED_LINE"
+assert_contains "W2: la borne du repli est celle de 150 tours" \
+    "per_flight_bound_loc=${T2701_B150} " "$T2701_DISARMED_LINE"
+# Le repli n'emprunte PAS le `maxTurns=200` amont de claude-pilot : ce 200
+# appartient à un composant qu'on ne possède pas, et un rollback est une posture
+# d'incident.
+assert_not_contains "W2: le repli ne prend JAMAIS la borne de 200 tours" \
+    "per_flight_bound_loc=${T2701_B200}" "$T2701_DISARMED_LINE"
+# Les deux faits se lisent ENSEMBLE, sans jointure : la valeur brute d'argv est
+# sur la ligne immédiatement au-dessus, et `ceiling_source=` est le lien.
+assert_contains "W2: la ligne sœur pilot_budget_armed max_turns=none est sur la même sortie" \
+    "pilot_budget_armed max_turns=none" "$(_t2701_err "$T2701_DISARMED")"
+
+# --- W2-bis : D4, un plafond d'argv illisible a sa propre ligne -------------
+#
+# Population mesurée aujourd'hui : VIDE — le résolveur amont n'assigne jamais que
+# `""` ou des chiffres. Le garde-fou existe pour la raison opératoire :
+# `_plan_size_per_flight_bound` fait de l'ARITHMÉTIQUE sur son argument, et
+# l'argv est la seule entrée de cette fonction qui ne vienne pas d'un résolveur
+# de la maison.
+
+T2701_BADMT=$(_t2701_emit_probe 400 abc)
+assert_eq "W2-bis contre-vacuité: la sonde à plafond illisible rend bien du stderr" "non-vide" \
+    "$([ -n "$(_t2701_err "$T2701_BADMT")" ] && echo non-vide || echo vide)"
+assert_contains "W2-bis (D4): un plafond d'argv illisible obtient sa propre ligne" \
+    "plan_size_flight_ceiling_invalid" "$(_t2701_err "$T2701_BADMT")"
+assert_contains "W2-bis (D4): puis la borne retombe sur le repli, provenance dite" \
+    "ceiling=150 ceiling_source=disarmed_fallback" "$(_t2701_line "$T2701_BADMT")"
+assert_not_contains "W2-bis: aucune arithmétique n'est tentée sur la valeur illisible" \
+    "ceiling=abc" "$(_t2701_line "$T2701_BADMT")"
+# Contre-vacuité de la première : le cas nominal n'émet PAS cette ligne. Sans
+# elle, une ligne `*_invalid` émise inconditionnellement passerait pour une garde.
+assert_not_contains "W2-bis: un plafond valide n'émet AUCUNE ligne *_ceiling_invalid" \
+    "plan_size_flight_ceiling_invalid" "$(_t2701_err "$T2701_P200_400")"
+
+# --- W3 : AC3, moitié plancher, et la note est CONDITIONNELLE ---------------
+#
+# ROUGE PAR MUTATION, consigné : émettre la note inconditionnellement fait tirer
+# la dernière assertion ; écrire `${_PLAN_SIZE_PER_FLIGHT_NOTE}` sans le `:+`
+# produit un `per_flight_note=` vide et la fait tirer aussi.
+
+T2701_FLOOR70=$(_t2701_emit_probe 400 70)
+T2701_FLOOR85=$(_t2701_emit_probe 400 85)
+for t2701_out in "$T2701_FLOOR70" "$T2701_FLOOR85"; do
+    assert_eq "W3 contre-vacuité: la sonde de plancher rend bien une ligne" "non-vide" \
+        "$([ -n "$(_t2701_line "$t2701_out")" ] && echo non-vide || echo vide)"
+done
+
+assert_contains "W3 (AC3): plafond 70 ⇒ borne 0, et la note le DIT" \
+    "per_flight_bound_loc=0 ceiling=70 ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
+    "$(_t2701_line "$T2701_FLOOR70")"
+assert_contains "W3 (AC3): plafond 85 (= le plancher exact) ⇒ même chose" \
+    "per_flight_bound_loc=0 ceiling=85 ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
+    "$(_t2701_line "$T2701_FLOOR85")"
+assert_not_contains "W3: et JAMAIS une borne négative" \
+    "per_flight_bound_loc=-" "$(_t2701_line "$T2701_FLOOR70")"
+# LA MOITIÉ QUI COMPTE, et qui est aussi la contre-vacuité des deux précédentes :
+# sans elle, une note émise inconditionnellement les ferait passer toutes les deux.
+assert_not_contains "W3 (D4): un plafond de 200 ne porte AUCUN per_flight_note=" \
+    "per_flight_note=" "$(_t2701_line "$T2701_P200_400")"
+assert_not_contains "W3 (D4): ni un plafond de 150" \
+    "per_flight_note=" "$(_t2701_line "$T2701_P150_400")"
+
+# --- W4 : AC2, PORTE 3 NE REFUSE RIEN ---------------------------------------
+#
+# ROUGE PAR MUTATION : insérer un `return 1` après l'émission fait tirer la
+# première assertion.
+#
+# Un plan à 900 lignes dispatché à 150 tours PASSE la borne par PR (1 000) et
+# explose la borne par vol (243). C'est exactement la population que porte 3 doit
+# MESURER sans la bloquer : un plan déjà groomé ne repasse par aucune porte de
+# groom au dispatch suivant, donc refuser ici gèlerait tout `docs/plans/`.
+
+T2701_BIG=$(_t2701_emit_probe 900 150)
+T2701_BIG_ERR=$(_t2701_err "$T2701_BIG")
+assert_eq "W4 contre-vacuité: la sonde du gros plan rend bien du stderr" "non-vide" \
+    "$([ -n "$T2701_BIG_ERR" ] && echo non-vide || echo vide)"
+
+assert_eq "W4 (AC2): l'émetteur rend 0 sur un plan très au-dessus de la borne par vol" \
+    "0" "$(_t2701_rc "$T2701_BIG")"
+assert_contains "W4 (AC2): et la ligne est émise, COMPLÈTE" \
+    "total_loc=900 threshold_loc=1000 verdict=under_threshold per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=over_bound" \
+    "$(_t2701_line "$T2701_BIG")"
+for t2701_refus in 'REFUSED' 'abort' 'PIPELINE FAILURE'; do
+    assert_not_contains "W4 (AC2): aucun vocabulaire de refus sur la sortie — $t2701_refus" \
+        "$t2701_refus" "$T2701_BIG_ERR"
+done
+# LE CONTRÔLE QUI COMPTE : la ligne émise AVANT est toujours là, donc rien n'a
+# été court-circuité en amont. Sans elle, une fonction qui sortirait en tête
+# rendrait les trois `assert_not_contains` ci-dessus verts.
+assert_contains "W4: la ligne pilot_budget_armed, émise AVANT, est toujours là" \
+    "pilot_budget_armed max_turns=150" "$T2701_BIG_ERR"
+
+# --- W5 : un total illisible rend `unknown`, dans les DEUX unités -----------
+#
+# ROUGE AVANT : le champ n'existait pas. ROUGE PAR MUTATION : sortir le calcul
+# par vol du `case` lui fait comparer `absent` à un entier.
+#
+# Les deux verdicts partagent la MÊME branche de parsabilité, et ce test est ce
+# qui interdit qu'ils divergent — un `per_flight_verdict=under_bound` sur un
+# total absent serait un `0` déguisé en mesure (*un `null` n'est jamais un `0`*,
+# mika#2331).
+
+T2701_ABSENT=$(_t2701_emit_probe "" 150)
+T2701_UNPARSABLE=$(_t2701_emit_probe "mille-deux-cents" 150)
+for t2701_out in "$T2701_ABSENT" "$T2701_UNPARSABLE"; do
+    assert_eq "W5 contre-vacuité: la sonde à total illisible rend bien une ligne" "non-vide" \
+        "$([ -n "$(_t2701_line "$t2701_out")" ] && echo non-vide || echo vide)"
+done
+
+assert_contains "W5: total absent ⇒ verdict=unknown ET per_flight_verdict=unknown" \
+    "total_loc=absent threshold_loc=1000 verdict=unknown per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=unknown" \
+    "$(_t2701_line "$T2701_ABSENT")"
+# Les deux VALEURS restent distinctes sur la ligne, parce que leurs remèdes sont
+# opposés — groomer le plan, ou réparer le motif.
+assert_contains "W5: total illisible ⇒ idem, et la valeur reste distincte d'absent" \
+    "total_loc=mille-deux-cents threshold_loc=1000 verdict=unknown per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=unknown" \
+    "$(_t2701_line "$T2701_UNPARSABLE")"
+assert_not_contains "W5: un total absent ne rend JAMAIS un verdict par vol chiffré" \
+    "per_flight_verdict=under_bound" "$(_t2701_line "$T2701_ABSENT")"
+assert_not_contains "W5: ni sur un total illisible" \
+    "per_flight_verdict=over_bound" "$(_t2701_line "$T2701_UNPARSABLE")"
+
+# --- W6 : AC1, L'ARGV DÉCIDE, et le discriminant est COMPORTEMENTAL ---------
+#
+# ROUGE PAR MUTATION, consigné : remplacer le plafond d'argv par l'état amont
+# `$_PILOT_MAX_TURNS` fait tirer le discriminant comportemental ET la troisième
+# assertion de source — les deux moitiés, ce qui est la preuve qu'elles mesurent
+# la même chose par deux chemins.
+#
+# `loop-substrate` dans les labels ET 200 dans l'environnement, mais
+# `--max-turns 150` dans l'argv. Un scan de source seul dirait « le mot `LABELS`
+# n'apparaît pas », ce qui est vrai de n'importe quel code qui lirait le plafond
+# par une autre porte dérobée.
+
+T2701_ARGV_WINS=$(_t2701_emit_probe 400 150 "p1-important,ready,loop-substrate" 200)
+T2701_ARGV_LINE=$(_t2701_line "$T2701_ARGV_WINS")
+assert_eq "W6 contre-vacuité: la sonde de discriminant rend bien une ligne" "non-vide" \
+    "$([ -n "$T2701_ARGV_LINE" ] && echo non-vide || echo vide)"
+# CONTRÔLE POSITIF de la sonde : la chaîne amont a réellement tourné et a
+# réellement résolu 200 par le label. Sans lui, « l'argv gagne » se prouverait
+# contre un environnement vide, c'est-à-dire contre rien.
+assert_contains "W6 contre-vacuité: la chaîne amont a bien résolu 200 par le label" \
+    "source=label label=loop-substrate" "$(_t2701_err "$T2701_ARGV_WINS")"
+
+assert_contains "W6 (AC1): l'ARGV décide — ceiling=150 malgré loop-substrate" \
+    "ceiling=150 ceiling_source=resolved" "$T2701_ARGV_LINE"
+assert_contains "W6 (AC1): et la borne dérivée est celle de 150 tours" \
+    "per_flight_bound_loc=${T2701_B150} " "$T2701_ARGV_LINE"
+assert_not_contains "W6: la ligne ne porte JAMAIS le plafond que les labels résolvent" \
+    "ceiling=200" "$T2701_ARGV_LINE"
+assert_not_contains "W6: ni la borne de 200 tours" \
+    "per_flight_bound_loc=${T2701_B200}" "$T2701_ARGV_LINE"
+
+# Les trois assertions de source, qui sont le DÉTECTEUR.
+T2701_EMIT_SRC=$(sed -n '/^_emit_pilot_budget_line()/,/^}/p' "$DISPATCH_LIB" \
+    | grep -vE '^[[:space:]]*#')
+assert_eq "W6 contre-vacuité: le corps de _emit_pilot_budget_line a bien été extrait" "non-vide" \
+    "$([ -n "$T2701_EMIT_SRC" ] && echo non-vide || echo vide)"
+# mika#2542 AC5 : `PILOT_LABEL_TURN_CEILINGS` a UN SEUL lecteur. Un second
+# lecteur de label serait la seconde table de classification de mika#2539.
+assert_eq "W6 × mika#2542 AC5: l'émetteur ne nomme pas la table des labels" "0" \
+    "$(printf '%s\n' "$T2701_EMIT_SRC" | grep -cF 'PILOT_LABEL_TURN_CEILINGS' || true)"
+assert_eq "W6 (AC1): l'émetteur ne lit pas LABELS et ne résout pas le plafond" "0" \
+    "$(printf '%s\n' "$T2701_EMIT_SRC" | grep -cE '(\$\{?LABELS\b|_pilot_max_turns)' || true)"
+# L'ancre porte `\b`, donc les trois champs de diagnostic que l'émetteur lit
+# légitimement (`_SOURCE`, `_INVALID`, `_LABEL`) ne sont PAS appariés. C'est
+# l'ancre que V5 de mika#2693 emploie déjà, reprise telle quelle.
+assert_eq "W6 (D1): l'émetteur ne lit pas \$_PILOT_MAX_TURNS au sens strict" "0" \
+    "$(printf '%s\n' "$T2701_EMIT_SRC" | grep -cE '\$\{?_PILOT_MAX_TURNS\b' || true)"
+# Contre-vacuité de l'ancre elle-même : les champs de diagnostic SONT bien lus,
+# donc une ancre trop large tirerait au lieu de dormir.
+assert_eq "W6 contre-vacuité: les champs de diagnostic amont sont bien lus, eux" "yes" \
+    "$(grep -qE -- '\$\{?_PILOT_MAX_TURNS_(SOURCE|INVALID|LABEL)' <<<"$T2701_EMIT_SRC" \
+        && echo yes || echo non-trouvé)"
+
+# --- W7 : anti-vacuité, hermétisme, et l'ordre des champs -------------------
+
+# `plan=` EST LE DERNIER CHAMP : assertion sur le SUFFIXE, pas sur la présence.
+# C'est la propriété de parsabilité de la ligne — `plan=` porte un chemin, donc
+# la seule valeur qui pourrait un jour contenir un espace ; un champ terminal
+# reste parsable, un champ au milieu ne l'est plus. Elle se perd en ajoutant un
+# champ sans y penser, et aucune assertion de présence ne le verrait.
+assert_eq "W7: plan= est le DERNIER champ de la ligne" "yes" \
+    "$(case "$(_t2701_line "$T2701_P200_400")" in
+        *" plan=${T2701_PLAN_PATH}") echo yes ;;
+        *) echo "non: $(_t2701_line "$T2701_P200_400")" ;;
+    esac)"
+assert_eq "W7: …y compris quand per_flight_note= s'intercale" "yes" \
+    "$(case "$(_t2701_line "$T2701_FLOOR70")" in
+        *"per_flight_note=ceiling_below_pipeline_floor plan=${T2701_PLAN_PATH}") echo yes ;;
+        *) echo "non: $(_t2701_line "$T2701_FLOOR70")" ;;
+    esac)"
+
+# Les quatre champs sur UNE SEULE ligne, dans l'ordre prescrit — une assertion
+# sur la ligne entière, et non quatre `contains` indépendants qui passeraient sur
+# quatre lignes différentes.
+assert_contains "W7: les quatre champs sont sur UNE ligne, dans l'ordre prescrit" \
+    "verdict=under_threshold per_flight_bound_loc=${T2701_B200} ceiling=200 ceiling_source=resolved per_flight_verdict=under_bound plan=" \
+    "$(_t2701_line "$T2701_P200_400")"
+
+# UN SEUL SITE D'ÉMISSION. Redondant avec S10 de mika#2636, et assumé comme tel :
+# S10 est sous AC4 et ne doit pas bouger, celle-ci dit POURQUOI les champs neufs
+# n'ont pas le droit de s'émettre ailleurs.
+assert_eq "W7: un seul site d'émission de plan_size_estimate" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF 'plan_size_estimate total_loc=' || true)"
+
+# Le bloc de test lui-même est extrait non vide : une section renommée ou
+# déplacée qui ne s'exécuterait plus serait silencieusement « verte ».
+T2701_TEST_BLOCK=$(sed -n '/^# mika#2701 — PORTE 3 : la ligne/,/^# --- dispatch-lib parse toujours/p' "$0")
+assert_eq "W7 contre-vacuité: le bloc de test mika#2701 est extrait non vide" "non-vide" \
+    "$([ -n "$T2701_TEST_BLOCK" ] && echo non-vide || echo vide)"
+
+# HERMÉTISME : aucune sonde de cette section n'appelle `gh`. Tout est passé en
+# littéral à l'émetteur. Un test qui interrogerait GitHub serait rouge hors
+# réseau et vert pour la mauvaise raison.
+assert_eq "W7 hermétisme: la section n'invoque jamais \`gh\`" "0" \
+    "$(printf '%s\n' "$T2701_TEST_BLOCK" | grep -vE '^[[:space:]]*#' | grep -cE '(^|[^A-Za-z0-9_-])gh[[:space:]]' || true)"
+
+# FIRE-DISPOSITION, option (a) : la table d'exceptions des scans de source de
+# cette section est DÉCLARÉE et VIDE, et son vide est asserté à l'exécution.
+# Déclarée pour que le prochain qui veut y mettre une entrée voie d'abord qu'elle
+# existe exprès ; assertée vide pour qu'une entrée ajoutée en silence tire. Les
+# détecteurs partent ARMÉS — doctrine mika#2201.
+T2701_SOURCE_SCAN_ALLOWLIST=()
+assert_eq "W7: table d'exceptions des scans de source (W6, W7) — zero entries" \
+    "0" "${#T2701_SOURCE_SCAN_ALLOWLIST[@]}"
+
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0
 bash -n "$DISPATCH_LIB" 2>/dev/null || T2545_RC=$?
