@@ -991,7 +991,15 @@ impl TaskEngine {
             Err(e) => warn!(error = %e, "failed to prune old sessions"),
         }
 
-        // 5. Prune LLM call and tool call records older than 30 days
+        // 5. Prune LLM call and tool call records older than 30 days.
+        //
+        // mika#2658 AC2 : c'est **ici** que se joue la rétention de ces deux
+        // tables. Elles ne sont pas gardées indéfiniment — les 153 Mo de
+        // `tool_calls` et 87 Mo de `llm_calls` mesurés le 2026-10-03 sur une
+        // base de 1 Go **sont** le volume de 30 jours, pas une absence de
+        // rétention. Retirer un de ces deux appels rendrait la table
+        // illimitée en silence : `mika2658_llm_and_tool_calls_have_a_thirty_day_window`
+        // (`db/tests/tool_calls_and_messages.rs`) tient la fenêtre.
         const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
         match self.db.prune_old_llm_calls(THIRTY_DAYS_SECS).await {
             Ok(n) if n > 0 => info!(count = n, "pruned old llm_calls on startup"),

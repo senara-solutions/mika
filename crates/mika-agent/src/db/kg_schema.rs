@@ -47,7 +47,7 @@
 //!   consumer can read the per-doc hash with `SELECT DISTINCT source_doc_hash
 //!   FROM kg_chunks WHERE agent_id=? AND source_doc_path=?` (exactly one row).
 //! - **Embedding backfill:** Embeddings are generated asynchronously by the existing
-//!   startup backfill path (`embedding_json IS NULL` in `search_content`). The
+//!   startup backfill path (`embedding_dims IS NULL` in `search_content`). The
 //!   `kg_chunk` source_type is automatically included.
 //!
 //! ### Ownership (dual-write prevention)

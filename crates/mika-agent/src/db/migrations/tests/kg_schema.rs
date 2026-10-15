@@ -404,6 +404,7 @@ fn test_v1_and_incremental_schemas_converge() {
     db2.migrate_v52_to_v53().unwrap();
     db2.migrate_v53_to_v54().unwrap();
     db2.migrate_v54_to_v55().unwrap();
+    db2.migrate_v55_to_v56().unwrap();
 
     let final_version: i64 = db2
         .conn

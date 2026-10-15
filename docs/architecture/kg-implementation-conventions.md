@@ -15,8 +15,8 @@ Companion document: [`kg-id-convention.md`](./kg-id-convention.md) covers the ty
 KG chunks and any future embeddable content flow through the existing Layer 3 infrastructure:
 
 - Model: OpenAI `text-embedding-3-small`, 512 dimensions.
-- Storage: `search_content.embedding_json` + `vec_search` virtual table (`crates/mika-agent/src/db.rs`).
-- Backfill: existing path with batch size 100, idempotent by `embedding_json IS NULL`.
+- Storage: `vec_search` virtual table (`crates/mika-agent/src/db.rs`) — **seul dépositaire du vecteur**. `search_content.embedding_dims` n'en porte que le nombre de dimensions, pas le vecteur (v56, mika#2658 : la colonne s'appelait `embedding_json TEXT` et portait une copie JSON jamais relue, ≈ 7,7 Ko/ligne).
+- Backfill: existing path with batch size 100, idempotent by `embedding_dims IS NULL`.
 - Indexing is best-effort — a failed embedding call never fails the tool response or the ingestion operation.
 
 There is **no KG-specific embedding quota or concurrency cap**. Economics do not justify one: `text-embedding-3-small` costs ~$0.02 per 1M tokens; a 10,000-chunk ingestion run (~500 tokens per chunk) costs ~$0.10. The KG would need to be ingesting at a scale of millions of chunks before embedding cost becomes a material concern, at which point quota design should be informed by real usage data rather than speculation.
@@ -26,11 +26,11 @@ There is **no KG-specific embedding quota or concurrency cap**. Economics do not
 **Ingestion writes commit without waiting for embeddings.** The transactional boundary is:
 
 1. Insert `kg_chunks` row (or equivalent subject-layer row).
-2. Insert corresponding `search_content` row with `embedding_json = NULL`.
+2. Insert corresponding `search_content` row with `embedding_dims = NULL`.
 3. Insert corresponding `fts_search` row (FTS5 indexing).
 4. **COMMIT.**
 
-The actual embedding call is **not** part of the transaction. It runs later via the existing backfill path, which is idempotent by `embedding_json IS NULL`.
+The actual embedding call is **not** part of the transaction. It runs later via the existing backfill path, which is idempotent by `embedding_dims IS NULL`.
 
 **Three consequences ingestion code must handle:**
 
