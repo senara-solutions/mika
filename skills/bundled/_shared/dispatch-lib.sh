@@ -1502,11 +1502,15 @@ _pilot_egress_mark_up() {
 #     NO_PROXY / ANTHROPIC_BASE_URL / CLAUDE_CODE_API_BASE_URL (localhost
 #     URLs), MIKA_PILOT_CONTAINED ("1"), NODE_EXTRA_CA_CERTS (a path), and
 #     ANTHROPIC_API_KEY and GH_TOKEN (mika#2572). Those last two are safe ONLY
-#     because they carry the literal placeholder `proxy-managed-no-secret` —
-#     the real credentials are injected host-side by the egress proxy and
-#     never cross the bwrap boundary. Replacing either placeholder with a real
-#     value would re-open this defect; scripts/verify-no-secret-in-setenv.sh
-#     fails if it ever changes.
+#     because neither carries a credential: ANTHROPIC_API_KEY carries the
+#     literal placeholder `proxy-managed-no-secret`, and GH_TOKEN carries the
+#     per-spawn EGRESS SENTINEL `proxy-managed-no-secret-<32 hex>` (mika#2716)
+#     — a value the host draws and registers, never a token. The real
+#     credentials are injected host-side by the egress proxy and never cross
+#     the bwrap boundary. Putting a real value in either would re-open this
+#     defect; scripts/verify-no-secret-in-setenv.sh fails if it ever changes,
+#     and it checks the sentinel's PROVENANCE too (the exempted variable may
+#     not be assigned from any credential).
 _PILOT_SANDBOX_ENV_ALLOWLIST=(
     HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
     ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
@@ -1521,9 +1525,13 @@ _PILOT_SANDBOX_ENV_ALLOWLIST=(
 # removed — the file channel it used is deleted, not stacked beside the new
 # mechanism. The sandbox no longer holds any GitHub credential in its
 # environment or on its filesystem — since mika#2572 its environment carries a
-# `GH_TOKEN` NAME, set to the non-secret placeholder so gh does not refuse to
-# start, never a token VALUE; `git push` and the `gh` CLI reach GitHub
-# through the egress-proxy MITM, which injects the credential host-side
+# `GH_TOKEN` NAME, set to a non-secret value so gh does not refuse to start,
+# never a token VALUE. Since mika#2716 that value is no longer a static
+# literal but the per-spawn egress sentinel `_stage_pilot_egress_sentinel`
+# draws and registers host-side, so a later flight can tell a pilot's own `gh`
+# from a `cargo test` that overwrote GH_TOKEN with a fake; `git push` and the
+# `gh` CLI reach GitHub through the egress-proxy MITM, which injects the
+# credential host-side
 # (mika-pilot-github-auth-addon.py). This is the same invariant the Anthropic
 # key already has — "the sandbox NEVER holds secret material" — now extended to
 # GitHub. A compromised in-sandbox dependency can no longer read the PAT,
@@ -1560,6 +1568,106 @@ _stage_pilot_gh_token() {
         ( umask 077; printf '%s' "$GH_TOKEN" > "$_PILOT_GH_TOKEN_FILE" ) 2>/dev/null || \
             echo "dispatch-lib: could not stage GitHub token to $_PILOT_GH_TOKEN_FILE — github auth injection falls back to the mitmdump process env" >&2
     fi
+    if [ "$_xtrace_was_on" -eq 1 ]; then
+        set -x
+    fi
+}
+
+# mika#2716: the pilot's EGRESS SENTINEL. The value the sandbox's GH_TOKEN
+# carries stops being a static literal and becomes a per-spawn, non-guessable
+# one that the host registers — so the egress proxy can tell a pilot's own `gh`
+# (which presents the sentinel it was given) from a `cargo test` that overwrote
+# GH_TOKEN with a fake and believed it was talking to a mock (mika#2713).
+#
+# WHY THE CREDENTIAL CHANNEL AND NOT A DEDICATED HEADER. The ticket proposed an
+# `X-Mika-Egress-Sentinel` header; it is not implementable. `gh` offers no
+# environment channel for an arbitrary header (only `gh api -H`, per call) while
+# `git` does (`http.extraHeader`), so the two clients the pilots actually use
+# share NO common header channel — and a `gh` shim on the sandbox PATH would be
+# borrowed by `cargo test` just the same, attesting THE SANDBOX rather than the
+# legitimate path. The credential is the one channel both clients already
+# present, and — decisively — it is the channel the incident OVERWRITES: the
+# mika#2713 signature is a test posing a fake token, which destroys its own
+# sentinel by its own hand. A dedicated header would survive that overwrite
+# intact, the proxy would still inject, and the incident would recur.
+#
+# THREAT MODEL, stated so it is not over-promised. The sentinel travels in the
+# sandbox's environment, so `cat /proc/self/environ` reveals it INSIDE. That is
+# inherent — `gh` has to read it. What this closes is the ACCIDENT: a process
+# replacing the credential in the belief it is talking to a fake, and reaching
+# the real forge under the engine's identity. Malicious in-sandbox code
+# replaying its own sentinel stays covered by mika#2056 (the sandbox holds no
+# token, so nothing of value leaves). Host-side, bwrap's argv is world-readable
+# through /proc/<pid>/cmdline — but whoever reads it already holds
+# $_PILOT_GH_TOKEN_FILE, hence the real token: the sentinel tells them nothing.
+#
+# THE CALL ORDER IS LOAD-BEARING. This runs AFTER _stage_pilot_gh_token, and it
+# never writes the host's GH_TOKEN. _stage_pilot_gh_token reads the HOST
+# GH_TOKEN and writes it to $_PILOT_GH_TOKEN_FILE, whence the addon re-reads it
+# to inject. An implementation that exported the sentinel into the host's
+# GH_TOKEN — the most natural shape when one thinks "put the sentinel in the
+# environment" — would have the SENTINEL staged as the real token: the addon
+# would inject it towards api.github.com and EVERY pilot call would 401. That
+# failure mode is deafer than the 403 this ticket guards against, because it
+# comes from GitHub and names nothing of mika#2716. The call order is the belt;
+# the provenance rule in scripts/verify-no-secret-in-setenv.sh is the braces.
+#
+# Fail-open, same posture as _stage_pilot_gh_token: a failed draw or a failed
+# registration degrades to the bare prefix — the exact pre-mika#2716 behaviour,
+# which keeps gh usable (mika#2572) — with a message on stderr. A dispatch never
+# dies on this registry. Same xtrace bracket too: the whole dispatch runs under
+# `set -x` with BASH_XTRACEFD, and _emit_callback tails that trace back to the
+# caller, which travels further than the host argv ever does.
+#
+# A registry DIRECTORY, never a single file: mitmdump is long-lived and shared
+# between dispatches, so two concurrent pilots must both be valid at the SAME
+# instant. One overwritten file would refuse the older of the two. Its path is
+# `$_PILOT_EGRESS_SENTINEL_DIR`, overridable, and resolved AT CALL TIME rather
+# than at source time — unlike $_PILOT_GH_TOKEN_FILE, deliberately. The
+# containment suites `export HOME="$TMPROOT/home"` AFTER sourcing this file, so
+# a source-time default would freeze the operator's real registry and `make
+# test` would deposit live-looking entries in it (measured: two, on the first
+# run of this ticket). A test that forgets to override now gets its own HOME's
+# registry instead of the operator's.
+_PILOT_EGRESS_SENTINEL_PREFIX="proxy-managed-no-secret"
+# Filled by _stage_pilot_egress_sentinel, read by the net_setenv_args producer.
+# Pre-set to the bare prefix so a caller that reaches _run_pilot_sandboxed
+# without the dispatch preamble still gets a gh-usable value (mika#2572) rather
+# than an empty one.
+_PILOT_EGRESS_SENTINEL="$_PILOT_EGRESS_SENTINEL_PREFIX"
+_stage_pilot_egress_sentinel() {
+    local _xtrace_was_on=0
+    case "$-" in *x*) _xtrace_was_on=1 ;; esac
+    { set +x; } 2>/dev/null
+
+    _PILOT_EGRESS_SENTINEL="$_PILOT_EGRESS_SENTINEL_PREFIX"
+
+    # Operator switch, same vocabulary as MIKA_PILOT_SANDBOX: `0` (or
+    # false/no/off/disabled, case-insensitive) restores the pre-mika#2716
+    # static placeholder and registers nothing. Default: enabled.
+    local _mode
+    _mode=$(echo "${MIKA_PILOT_EGRESS_SENTINEL:-1}" | tr '[:upper:]' '[:lower:]')
+    case "$_mode" in
+        0|false|no|off|disabled) ;;
+        *)
+            local _dir _nonce=""
+            _dir="${_PILOT_EGRESS_SENTINEL_DIR:-$HOME/.mika/pilot-egress-sentinels}"
+            _nonce=$(openssl rand -hex 16 2>/dev/null) || _nonce=""
+            [ -n "$_nonce" ] || \
+                _nonce=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
+            if [ "${#_nonce}" -ne 32 ]; then
+                echo "dispatch-lib: could not draw an egress sentinel (no openssl, no /dev/urandom) — falling back to the static placeholder (mika#2716)" >&2
+            elif ! ( umask 077
+                     mkdir -p "$_dir" \
+                         && chmod 0700 "$_dir" \
+                         && : > "$_dir/$_nonce" ) 2>/dev/null; then
+                echo "dispatch-lib: could not register the egress sentinel under $_dir — falling back to the static placeholder (mika#2716)" >&2
+            else
+                _PILOT_EGRESS_SENTINEL="${_PILOT_EGRESS_SENTINEL_PREFIX}-${_nonce}"
+            fi
+            ;;
+    esac
+
     if [ "$_xtrace_was_on" -eq 1 ]; then
         set -x
     fi
@@ -1978,6 +2086,11 @@ Remedy: $_egress_remedy"
     # so the mitmdump github addon has a fresh credential to inject on its very
     # first request.
     _stage_pilot_gh_token
+    # mika#2716: AFTER the token staging, never before. _stage_pilot_gh_token
+    # reads the host's GH_TOKEN; a sentinel staged first and exported into that
+    # name would be staged AS the real token and 401 every pilot call. See the
+    # ORDER IS LOAD-BEARING paragraph on _stage_pilot_egress_sentinel.
+    _stage_pilot_egress_sentinel
     _ensure_pilot_helper || true
 
     # Unconditional since mika#2049 — the `if _ensure_pilot_egress_proxy; then`
@@ -2071,7 +2184,15 @@ Remedy: $_egress_remedy"
             # strips the client Authorization and sets the real one host-side
             # on api.github.com / github.com, so this value never leaves as a
             # credential — and it carries none.
-            --setenv GH_TOKEN "proxy-managed-no-secret"
+            #
+            # mika#2716: the value is no longer the bare literal but the
+            # per-spawn egress sentinel `<prefix>-<32 hex>` that
+            # _stage_pilot_egress_sentinel drew and registered host-side. Same
+            # prefix on purpose, so every existing guard stays readable by
+            # widening its anchor rather than by relaxing it. The variable may
+            # hold nothing but a sentinel: scripts/verify-no-secret-in-setenv.sh
+            # exempts it by NAME and asserts its provenance.
+            --setenv GH_TOKEN "$_PILOT_EGRESS_SENTINEL"
             # γ trust for the helper CA (Vincent-authorized 2026-08-05).
             # NODE_EXTRA_CA_CERTS is ADDITIVE (adds to Node's built-in trust)
             # so bundled claude keeps trusting the system CA for anything else;
