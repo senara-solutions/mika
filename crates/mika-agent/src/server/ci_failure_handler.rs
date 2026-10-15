@@ -589,11 +589,11 @@ pub async fn try_handle_ci_failure(
 ///
 /// Two lists exist and they are not the same question. The gateway's
 /// `INTERNAL_REPOS` decides which repositories **route** to mika-dev — it carries
-/// `claude-pilot-py` and `wizzard`. `DISPATCHABLE_REPOS` decides where the loop
+/// `claude-pilot` and `wizzard`. `DISPATCHABLE_REPOS` decides where the loop
 /// may **dispatch**, and the 2026-08-29 operator decision keeps those two out of
 /// it. AC1's "ownership list" is the second one, because it answers the question
 /// the surface actually asks: *is the adoption being proposed executable?*
-/// Surfacing `claude-pilot-py` would propose an action the mika#2046 gate refuses
+/// Surfacing `claude-pilot` would propose an action the mika#2046 gate refuses
 /// structurally — so that repository belongs to AC4 (silent-stop), not AC1. A
 /// third list would be the programmed divergence this repo has already paid for
 /// twice (dispatch seats mika#2092, `DISPATCHABLE_REPOS` ↔ `labels.yml`).
@@ -1383,7 +1383,7 @@ mod tests {
     ];
 
     const DISPATCHABLE: &str = "senara-solutions/mika";
-    const NOT_DISPATCHABLE: &str = "senara-solutions/claude-pilot-py";
+    const NOT_DISPATCHABLE: &str = "senara-solutions/claude-pilot";
     const SURFACE_SESSION: &str = "surface-1745-session";
 
     fn surface_event(repo: &str) -> CheckSuiteFailureEvent {
@@ -1512,7 +1512,7 @@ mod tests {
 
     /// T2 — **negative control (AC4)**, and it is the one that makes T1 mean
     /// something: without it, "the handler decides" is indistinguishable from
-    /// "the handler surfaces everything". `claude-pilot-py` routes to mika-dev
+    /// "the handler surfaces everything". `claude-pilot` routes to mika-dev
     /// (the gateway's `INTERNAL_REPOS`) and the loop may not dispatch into it
     /// (the 2026-08-29 operator decision), so proposing adoption there would
     /// propose an action the mika#2046 gate refuses structurally.
@@ -1526,7 +1526,7 @@ mod tests {
             &db,
             &surface_event(NOT_DISPATCHABLE),
             &pr_info("abc123"),
-            "https://github.com/senara-solutions/claude-pilot-py/pull/1745",
+            "https://github.com/senara-solutions/claude-pilot/pull/1745",
             Some(&sender),
             SURFACE_SESSION,
             "trace-1745",
@@ -1539,7 +1539,7 @@ mod tests {
             "an undispatchable repo keeps the pre-mika#1745 behaviour byte for byte"
         );
         assert_eq!(
-            audit_count(&db, "pr:senara-solutions/claude-pilot-py#1745@abc123").await,
+            audit_count(&db, "pr:senara-solutions/claude-pilot#1745@abc123").await,
             0
         );
         assert!(
