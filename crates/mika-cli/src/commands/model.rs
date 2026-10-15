@@ -213,7 +213,7 @@ pub async fn run(args: crate::cli::ModelArgs, agent_name: &str) -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
                 OutputFormat::Yaml => {
-                    print!("{}", serde_yaml::to_string(&result)?);
+                    print!("{}", yaml_serde::to_string(&result)?);
                 }
                 OutputFormat::Text => {
                     println!(
@@ -247,7 +247,7 @@ pub async fn run(args: crate::cli::ModelArgs, agent_name: &str) -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
                 OutputFormat::Yaml => {
-                    print!("{}", serde_yaml::to_string(&result)?);
+                    print!("{}", yaml_serde::to_string(&result)?);
                 }
                 OutputFormat::Text => {
                     println!("Switched to {}.", display);

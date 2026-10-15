@@ -52,7 +52,7 @@ pub async fn run(agent_name: &str, format: &OutputFormat) -> Result<()> {
                 "tokens_used": tokens.unwrap_or(0),
                 "last_message": last_message,
             });
-            print!("{}", serde_yaml::to_string(&obj)?);
+            print!("{}", yaml_serde::to_string(&obj)?);
         }
         OutputFormat::Text => {
             let size_str = if db_size > 1_000_000 {
