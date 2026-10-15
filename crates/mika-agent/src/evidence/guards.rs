@@ -3946,8 +3946,15 @@ pub enum PipelineGroundingOutcome {
     /// Step 2D, délibérément — une garde qu'on n'a pas trouvée n'est pas une
     /// garde qui a refusé.
     RefusedNoFailingGuardCited,
+    /// Le corps dit tout ce qu'il faut — section présente, échec cité — mais
+    /// **aucun appel `run_shell` de cette session n'a exécuté de garde**
+    /// (mika#2687, vol 2). C'est la classe que les deux volets précédents ne
+    /// peuvent pas voir : un corps bien formé se rédige, une invocation ne se
+    /// rédige pas. Évaluée **en dernier**, parce qu'elle coûte une lecture en
+    /// base et que les deux premières sont gratuites.
+    RefusedNoGuardExecuted,
     /// Rien à refuser : hors population, ou section présente **et** citant au
-    /// moins une garde en échec.
+    /// moins une garde en échec **et** exécution observée (ou abstention).
     Allowed,
 }
 
@@ -4040,9 +4047,26 @@ pub fn body_cites_failing_guard(body: &str) -> bool {
 /// `VERDICT:` traversent intacts. Élargir aux autres classes de `block`
 /// demanderait, pour chacune, la mesure de ce qui la fonde — ce ticket n'en a
 /// qu'une.
+///
+/// # `guard_execution_observed` — le fait que le corps ne peut pas porter
+///
+/// Troisième paramètre depuis le vol 2. Il vaut *« un appel `run_shell` de
+/// **cette session** a invoqué une garde de [`PIPELINE_GUARD_SCRIPT_PATHS`] »*,
+/// lu en base par l'appelant sur le patron de B3 (mika#2565). Les deux
+/// prédicats de corps lisent de la **prose** : un modèle qui paraphrase une
+/// règle sait aussi écrire `exit 1` sous une ligne `PIPELINE:`. Seul le
+/// ledger d'outils distingue la revue qui a exécuté la garde de celle qui l'a
+/// racontée.
+///
+/// **Il est passé, jamais lu ici** — même convention que le gate : ce module
+/// reste pur et testable sans base. Et il est **fail-open par construction**,
+/// parce que l'appelant lui passe `true` sur ses trois causes d'abstention
+/// (voir [`PipelineGroundingAbstention`]) : une lecture qui n'a pas répondu
+/// n'est pas un `false`.
 pub fn classify_pipeline_block_grounding(
     verdict_is_pipeline_block: bool,
     body: &str,
+    guard_execution_observed: bool,
 ) -> PipelineGroundingOutcome {
     if !verdict_is_pipeline_block {
         return PipelineGroundingOutcome::Allowed;
@@ -4053,7 +4077,89 @@ pub fn classify_pipeline_block_grounding(
     if !body_cites_failing_guard(body) {
         return PipelineGroundingOutcome::RefusedNoFailingGuardCited;
     }
+    if !guard_execution_observed {
+        return PipelineGroundingOutcome::RefusedNoGuardExecuted;
+    }
     PipelineGroundingOutcome::Allowed
+}
+
+/// Les gardes que Step 2B de `qa-review/system_prompt.md` prescrit d'exécuter.
+///
+/// **Jetons de fil**, au sens strict : la liste doit rester celle de la boucle
+/// `for g in …` du prompt. Un chemin ajouté là et pas ici rend l'exécution de
+/// cette garde invisible au gate ; un chemin retiré là et gardé ici ne casse
+/// rien (la disjonction est un `any`). Aucune ligne de
+/// `scripts/canonical-tokens.tsv` ne les porte : le relevé ne rapporte que les
+/// courses de capitales, et ces chemins n'en ont aucune.
+///
+/// Le match est un `contains` sur l'`input` JSON de l'appel outil, pas un
+/// parse : l'argv exact de Step 2B est une boucle shell multi-lignes, et le
+/// seul fait recherché est *« ce nom de script est passé par là »*.
+pub const PIPELINE_GUARD_SCRIPT_PATHS: &[&str] =
+    &["scripts/verify-pipeline.sh", "scripts/plan-doc-check.sh"];
+
+/// Le `tool_name` sous lequel le ledger enregistre un appel shell.
+///
+/// Paramètre de la lecture, jamais littéral au site d'appel — convention de
+/// `find_recent_tool_invocation` (mika#2565) : deux orthographes d'un même
+/// nom d'outil feraient deux vérités.
+pub const PIPELINE_GROUNDING_SHELL_TOOL: &str = "run_shell";
+
+/// Fenêtre de la lecture du ledger d'outils, en secondes.
+///
+/// Constante et **non réglable**, à la différence de
+/// [`QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS`] : la requête est déjà bornée par
+/// `session_id`, donc la fenêtre n'est pas le discriminant — c'est un garde-fou
+/// contre une session-singleton qui vivrait des jours. Un réglage de plus
+/// serait une variable d'environnement qu'aucune décision ne consulte.
+pub const PIPELINE_GROUNDING_WINDOW_SECS: i64 = 7200;
+
+/// Les causes pour lesquelles la preuve d'exécution **s'abstient**.
+///
+/// Même doctrine que [`DependabotAbstention`] : **format de fil**. Ces chaînes
+/// partent dans la colonne `after_value` d'`audit_events` et dans le champ
+/// `reason` d'un WARN `pipeline_grounding_abstained` ; deux orthographes d'une
+/// même cause scindent une population sans le dire (doctrine mika#2131).
+///
+/// Il n'y en a que deux, et la frontière entre elles est **la seule chose que
+/// le ledger sait dire** :
+///
+/// - une erreur de lecture est un non-réponse explicite ;
+/// - **zéro ligne `run_shell` dans la session** a deux causes qu'aucune requête
+///   ne sépare — `MIKA_STORE_TOOL_CALLS` désarmé (le ledger n'écrit rien), ou
+///   une revue reprise sur un callback de build, qui tourne sous un
+///   `session_id` tout neuf (`dispatcher.rs`, `format!("{session_prefix}-{}")`)
+///   et ne voit donc pas le `run_shell` de la session d'origine. Dans les deux
+///   cas le ledger est muet, pas accusateur.
+///
+/// Ce qui **n'est pas** une abstention : des lignes `run_shell` existent mais
+/// aucune ne nomme une garde. Là le ledger a parlé, il est vivant, et il dit
+/// que cette session n'a exécuté aucune garde. C'est le refus.
+pub struct PipelineGroundingAbstention;
+
+impl PipelineGroundingAbstention {
+    /// La base n'a pas répondu — l'échec de lecture n'est pas un `false`.
+    pub const TOOL_LEDGER_UNREADABLE: &'static str = "tool_ledger_unreadable";
+    /// Aucune ligne `run_shell` du tout : ledger désarmé, ou session reprise.
+    pub const NO_SHELL_CALL_RECORDED: &'static str = "no_shell_call_recorded";
+}
+
+/// Cet `input` d'appel outil invoque-t-il une garde de pipeline ?
+///
+/// # Ce que ce prédicat observe, et ce qu'il n'observe pas
+///
+/// Il observe qu'une garde a été **invoquée**, pas qu'elle est allée au bout.
+/// Resserrer en exigeant aussi un `GUARD: ` dans la sortie a été envisagé et
+/// **écarté** : cela ajoute un chemin de faux négatif (sortie tronquée, outil
+/// qui a timeouté avec la garde réellement lancée) du mauvais côté de
+/// l'arithmétique fail-open de mika#2455 — un faux refus rend une revue
+/// légitime impossible à poster *et* fait passer la porte de merge à une PR
+/// cassée. La classe mesurée est *« la revue n'a lancé aucune garde »*, et une
+/// invocation suffit à la fermer.
+pub fn shell_invocation_runs_pipeline_guard(input: &str) -> bool {
+    PIPELINE_GUARD_SCRIPT_PATHS
+        .iter()
+        .any(|path| input.contains(path))
 }
 
 /// Le gate est-il armé ?
@@ -8347,6 +8453,14 @@ mod tests {
     mod mika2687 {
         use super::super::*;
 
+        /// Le troisième paramètre, nommé plutôt qu'écrit `true` : un booléen
+        /// positionnel au bout d'un appel ne dit pas lequel des trois faits il
+        /// porte. Les cas du vol 1 passent `GUARD_RAN` parce qu'ils mesurent
+        /// les prédicats de corps, pas la preuve d'exécution.
+        const GUARD_RAN: bool = true;
+        /// Son contraire : aucun `run_shell` de la session n'a nommé de garde.
+        const GUARD_NOT_RAN: bool = false;
+
         /// Revue 1 sur mika#2685, tête `0a53b5f0`, 2026-10-13 11:54Z. Aucune
         /// section `PIPELINE:`, et la raison énonce une règle que la garde ne
         /// porte pas : `verify-pipeline.sh` compte `docs/solutions/` comme doc,
@@ -8402,7 +8516,7 @@ PIPELINE: pass (mika)
                 ("2026-10-13 17:03Z", MEASURED_2685_SECOND),
             ] {
                 assert_eq!(
-                    classify_pipeline_block_grounding(true, body),
+                    classify_pipeline_block_grounding(true, body, GUARD_RAN),
                     PipelineGroundingOutcome::RefusedSectionAbsent,
                     "la revue du {label} ne porte aucune section `PIPELINE:` — \
                      c'est exactement la classe mesurée"
@@ -8415,7 +8529,7 @@ PIPELINE: pass (mika)
         #[test]
         fn mika2687_lexemple_bloquant_de_step_2e_passe_intact() {
             assert_eq!(
-                classify_pipeline_block_grounding(true, STEP_2E_BLOCKING),
+                classify_pipeline_block_grounding(true, STEP_2E_BLOCKING, GUARD_RAN),
                 PipelineGroundingOutcome::Allowed,
                 "le corps que le prompt prescrit lui-même doit traverser : un \
                  gate qui refuse la forme canonique rend le verdict impossible \
@@ -8430,7 +8544,7 @@ PIPELINE: pass (mika)
             // pas.
             let body = "VERDICT: block[pipeline]\n\nPIPELINE: block (mika)\nGUARD: scripts/verify-pipeline.sh exit=1\n";
             assert_eq!(
-                classify_pipeline_block_grounding(true, body),
+                classify_pipeline_block_grounding(true, body, GUARD_RAN),
                 PipelineGroundingOutcome::Allowed
             );
         }
@@ -8447,7 +8561,7 @@ PIPELINE: pass (mika)
             ] {
                 let body = format!("VERDICT: block[pipeline]\n\n{line}\n- guard → exit 1\n");
                 assert_eq!(
-                    classify_pipeline_block_grounding(true, &body),
+                    classify_pipeline_block_grounding(true, &body, GUARD_RAN),
                     PipelineGroundingOutcome::Allowed,
                     "{line}"
                 );
@@ -8458,7 +8572,7 @@ PIPELINE: pass (mika)
         fn mika2687_la_casse_et_les_blancs_de_tete_sont_tolerees_sur_la_section() {
             let body = "VERDICT: block[pipeline]\n\n   pipeline: BLOCK (mika)\n   - guard EXIT 1\n";
             assert_eq!(
-                classify_pipeline_block_grounding(true, body),
+                classify_pipeline_block_grounding(true, body, GUARD_RAN),
                 PipelineGroundingOutcome::Allowed
             );
         }
@@ -8468,7 +8582,7 @@ PIPELINE: pass (mika)
         #[test]
         fn mika2687_une_section_verte_est_refusee_sur_labsence_de_citation() {
             assert_eq!(
-                classify_pipeline_block_grounding(true, STEP_2E_GREEN),
+                classify_pipeline_block_grounding(true, STEP_2E_GREEN, GUARD_RAN),
                 PipelineGroundingOutcome::RefusedNoFailingGuardCited,
                 "la section est là, la garde est à `exit 0` : le verdict n'est \
                  pas fondé, et le refus doit nommer CETTE cause plutôt que \
@@ -8481,7 +8595,7 @@ PIPELINE: pass (mika)
             // Une garde qu'on n'a pas trouvée n'est pas une garde qui a refusé.
             let body = "VERDICT: block[pipeline]\n\nPIPELINE: not-applicable (no executable guard found in mika: scripts/verify-pipeline.sh absent)\n";
             assert_eq!(
-                classify_pipeline_block_grounding(true, body),
+                classify_pipeline_block_grounding(true, body, GUARD_RAN),
                 PipelineGroundingOutcome::RefusedNoFailingGuardCited
             );
         }
@@ -8494,7 +8608,7 @@ PIPELINE: pass (mika)
             let body = "VERDICT: block[pipeline]\n\nPIPELINE:\n";
             assert!(pipeline_section_present(body));
             assert_eq!(
-                classify_pipeline_block_grounding(true, body),
+                classify_pipeline_block_grounding(true, body, GUARD_RAN),
                 PipelineGroundingOutcome::RefusedNoFailingGuardCited
             );
         }
@@ -8514,7 +8628,7 @@ PIPELINE: pass (mika)
                 "",
             ] {
                 assert_eq!(
-                    classify_pipeline_block_grounding(false, body),
+                    classify_pipeline_block_grounding(false, body, GUARD_NOT_RAN),
                     PipelineGroundingOutcome::Allowed,
                     "{body:?}"
                 );
@@ -8618,6 +8732,204 @@ PIPELINE: pass (mika)
             assert_eq!(PIPELINE_GUARD_FAILED_TOKEN, "Verification FAILED");
             assert_eq!(PIPELINE_GROUNDING_AUDIT_TOOL, "pipeline_grounding_guard");
             assert_eq!(PIPELINE_GROUNDING_GATE_ENV, "MIKA_PIPELINE_GROUNDING_GATE");
+        }
+
+        // -- vol 2 : la preuve d'exécution --
+
+        #[test]
+        fn mika2687_un_corps_irreprochable_sans_garde_executee_est_refuse() {
+            // Le cœur du vol 2, et la seule classe que les deux prédicats de
+            // corps ne peuvent pas voir : `STEP_2E_BLOCKING` est la forme que
+            // le prompt prescrit lui-même, section comprise et `exit 1`
+            // compris. Un modèle qui paraphrase une règle sait écrire ça.
+            assert_eq!(
+                classify_pipeline_block_grounding(true, STEP_2E_BLOCKING, GUARD_NOT_RAN),
+                PipelineGroundingOutcome::RefusedNoGuardExecuted,
+                "un corps qui dit tout mais qu'aucune garde n'a fondé est \
+                 rédigé, pas observé"
+            );
+        }
+
+        #[test]
+        fn mika2687_la_preuve_dexecution_est_evaluee_en_dernier() {
+            // L'ordre est une décision, pas un hasard : les deux prédicats de
+            // corps sont gratuits, la preuve d'exécution coûte une lecture en
+            // base. Un corps sans section doit donc rendre `SectionAbsent`
+            // même quand l'exécution manque aussi — sinon l'appelant paierait
+            // la requête pour un refus déjà acquis, et le motif du WARN
+            // désignerait la mauvaise cause.
+            assert_eq!(
+                classify_pipeline_block_grounding(true, MEASURED_2685_FIRST, GUARD_NOT_RAN),
+                PipelineGroundingOutcome::RefusedSectionAbsent
+            );
+            assert_eq!(
+                classify_pipeline_block_grounding(true, STEP_2E_GREEN, GUARD_NOT_RAN),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited
+            );
+        }
+
+        #[test]
+        fn mika2687_hors_population_la_preuve_dexecution_ne_mord_pas() {
+            // Contrôle négatif : un `pass` dont la session n'a lancé aucune
+            // garde traverse. Ce gate ferme `block[pipeline]`, il n'impose pas
+            // d'exécuter une garde pour rendre un verdict.
+            assert_eq!(
+                classify_pipeline_block_grounding(false, STEP_2E_BLOCKING, GUARD_NOT_RAN),
+                PipelineGroundingOutcome::Allowed
+            );
+        }
+
+        #[test]
+        fn mika2687_un_appel_shell_qui_nomme_une_garde_est_reconnu() {
+            // Verbatim de la boucle de Step 2B, telle qu'elle arrive dans
+            // l'`input` JSON de l'appel outil.
+            let step_2b = r#"{"command":"for g in scripts/verify-pipeline.sh scripts/plan-doc-check.sh; do out=$(cd \"$W\" && bash \"$W/$g\" origin/main 2>&1); rc=$?; echo \"GUARD: $g exit=$rc\"; done"}"#;
+            assert!(shell_invocation_runs_pipeline_guard(step_2b));
+
+            for path in PIPELINE_GUARD_SCRIPT_PATHS {
+                assert!(
+                    shell_invocation_runs_pipeline_guard(&format!("bash {path} origin/main")),
+                    "{path} est prescrit par Step 2B et doit être reconnu seul"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2687_les_appels_shell_de_fond_ne_sont_pas_une_garde() {
+            // Contrôle négatif du prédicat : ce sont les appels qu'une revue
+            // fait de toute façon. Si l'un d'eux comptait, la preuve
+            // d'exécution serait satisfaite par le trafic de fond — le défaut
+            // que mika#2565 avait nommé sur la fenêtre de B3.
+            for input in [
+                r#"{"command":"git diff --stat origin/main"}"#,
+                r#"{"command":"cargo test -p mika-agent"}"#,
+                r#"{"command":"ls scripts/"}"#,
+                r#"{"command":"cat docs/plans/x.md"}"#,
+            ] {
+                assert!(
+                    !shell_invocation_runs_pipeline_guard(input),
+                    "{input} n'exécute aucune garde de pipeline"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2687_les_causes_dabstention_sont_un_format_de_fil() {
+            // Même doctrine que `DependabotAbstention` (mika#2519/#2565) :
+            // ces chaînes partent en base et dans les logs, un `GROUP BY` les
+            // compte. Deux orthographes d'une cause scindent une population
+            // sans le dire.
+            assert_eq!(
+                PipelineGroundingAbstention::TOOL_LEDGER_UNREADABLE,
+                "tool_ledger_unreadable"
+            );
+            assert_eq!(
+                PipelineGroundingAbstention::NO_SHELL_CALL_RECORDED,
+                "no_shell_call_recorded"
+            );
+            assert_eq!(PIPELINE_GROUNDING_SHELL_TOOL, "run_shell");
+            assert_eq!(
+                PIPELINE_GUARD_SCRIPT_PATHS,
+                ["scripts/verify-pipeline.sh", "scripts/plan-doc-check.sh"],
+                "la liste doit rester celle de la boucle `for g in …` de Step 2B"
+            );
+        }
+
+        // -- vol 2 : le scan à lecteur unique (doctrine mika#2201/#2205) --
+
+        /// Les sites d'appel de `classify_pipeline_block_grounding` dans un
+        /// contenu de production.
+        ///
+        /// Le besoin, en un mot : un **second** lecteur appliquerait la
+        /// classification sans l'audit, sans le WARN et sans le `remedy` — un
+        /// refus muet, ou pire, une branche qui lit l'issue et n'en fait rien.
+        /// Aucune assertion de comportement ne devient fausse dans ce cas :
+        /// c'est la classe que cette maison ferme en scannant la source.
+        ///
+        /// Le prédicat anchore sur l'appel (`nom(`) et saute les lignes de
+        /// commentaire : trois paragraphes de prose *à propos* de la fonction
+        /// vivent au site de décision, et de la prose n'est pas une lecture
+        /// (motif mika#2050 Signal S). La définition est écartée par le `fn `.
+        fn classify_call_sites(content: &str) -> Vec<(usize, String)> {
+            content
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let t = line.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///") && !t.starts_with("* ")
+                })
+                .filter(|(_, line)| line.contains("classify_pipeline_block_grounding("))
+                .filter(|(_, line)| !line.contains("fn "))
+                .map(|(i, line)| (i + 1, line.trim().to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn mika2687_classify_pipeline_block_grounding_a_un_lecteur_unique() {
+            // Passe par `ProductionScanner` — et pas par une troncature à la
+            // main au premier `#[cfg(test)]`. `cargo test -p mika-common
+            // mika2398` refuse toute recomposition de la frontière
+            // production/test, sans exception possible.
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+            let src_root = scanner.src_root().to_path_buf();
+            let mut offenders: Vec<String> = Vec::new();
+            // `for_each` livre déjà la tranche de PRODUCTION, pas le fichier
+            // brut : la frontière est calculée par le scanner, jamais ici.
+            scanner.for_each(|path, production| {
+                for (line, text) in classify_call_sites(production) {
+                    let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+                    offenders.push(format!("{rel}:{line}: {text}"));
+                }
+            });
+
+            // L'allowlist est livrée VIDE et le reste. Une allowlist née vide
+            // n'est qu'un endroit où ranger la prochaine violation au lieu de
+            // la router : quand ce test rouge, **router le site par le lecteur
+            // unique**, ne pas ajouter de ligne (doctrine mika#2201).
+            assert_eq!(
+                offenders.len(),
+                1,
+                "mika#2687 : `classify_pipeline_block_grounding` doit avoir \
+                 exactement UN lecteur de production — \
+                 `skills::builtin_handlers::validate_pipeline_block_grounding_gated`, \
+                 le seul site qui écrit l'audit, le WARN et le `remedy`. \
+                 Trouvés : {offenders:#?}"
+            );
+            assert!(
+                offenders[0].starts_with("skills/builtin_handlers.rs:"),
+                "le lecteur unique doit rester dans `skills/builtin_handlers.rs` \
+                 (il y tient le `ToolContext`) — trouvé : {}",
+                offenders[0]
+            );
+        }
+
+        #[test]
+        fn mika2687_le_scan_de_lecteur_unique_voit_un_second_appel_fabrique() {
+            // Contrôle de bonne foi, écrit contre un extrait **fabriqué**
+            // plutôt qu'en éditant la vraie source : une garde vérifiée par
+            // son seul vert est une garde vérifiée par rien.
+            let second_reader = "\
+fn ailleurs(body: &str) -> bool {
+    // classify_pipeline_block_grounding(true, body, true) — en commentaire
+    matches!(
+        classify_pipeline_block_grounding(true, body, true),
+        PipelineGroundingOutcome::Allowed
+    )
+}
+";
+            let found = classify_call_sites(second_reader);
+            assert_eq!(
+                found.len(),
+                1,
+                "le scan doit voir l'appel réel et ignorer la ligne de \
+                 commentaire — trouvés : {found:#?}"
+            );
+
+            assert!(
+                classify_call_sites("pub fn classify_pipeline_block_grounding(\n").is_empty(),
+                "la définition n'est pas un lecteur"
+            );
         }
     }
 }

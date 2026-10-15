@@ -313,6 +313,6 @@ impl RoleManifest {
     /// Load a manifest from a YAML file path.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        Ok(serde_yaml::from_str(&content)?)
+        Ok(yaml_serde::from_str(&content)?)
     }
 }
