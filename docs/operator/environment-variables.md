@@ -4676,7 +4676,7 @@ garde que personne n'a exercée se lit exactement comme une garde qui marche*
   le gate existant, enrichi d'un motif. **Son silence ne prouve rien tant que le
   contrôle positif n'est pas établi.**
 
-### Un `block[pipeline]` cite une garde en échec, ou il ne part pas (mika#2687, vol 1)
+### Un `block[pipeline]` cite une garde en échec, ou il ne part pas (mika#2687, vols 1 et 2)
 
 - `MIKA_PIPELINE_GROUNDING_GATE` — désarme le refus d'un `block[pipeline]` non
   fondé. **Défaut : armé.** `0`/`false`/`off`/`no` (insensible à la casse,
@@ -4699,10 +4699,38 @@ mika#2172 et mika#2519, toutes deux fermées par le prompt seul : le prompt
 déployé interdisait déjà ce verdict à son Step 2 et à son Step 2E.
 
 **Ce que ça fait, en une phrase.** Un `pr review` dont le corps porte
-`VERDICT: block[pipeline]` est refusé **avant tout sous-processus** si le corps
-ne porte aucune ligne `PIPELINE:`, ou s'il en porte une sans citer de garde en
-échec. Le refus nomme les deux sorties : exécuter Step 2B et poster la section
-verbatim, ou rendre `pass` / `hold[review]` / `block[ac]`.
+`VERDICT: block[pipeline]` est refusé **avant tout sous-processus** dans trois
+cas : le corps ne porte aucune ligne `PIPELINE:` (`section_absent`), il en porte
+une sans citer de garde en échec (`no_failing_guard_cited`), ou — vol 2 — il
+cite bien un échec mais **aucun `run_shell` de cette session n'a invoqué de
+garde** (`no_guard_executed`). Le refus nomme les deux sorties : exécuter
+Step 2B et poster la section verbatim, ou rendre
+`pass` / `hold[review]` / `block[ac]`.
+
+**La preuve d'exécution (vol 2), et sa frontière.** Les deux premiers motifs
+lisent de la **prose**, et un modèle qui paraphrase une règle sait aussi écrire
+`exit 1` sous une ligne `PIPELINE:`. Le troisième lit le **ledger d'outils** :
+les appels `run_shell` de la session, filtrés sur ceux dont l'`input` nomme
+`scripts/verify-pipeline.sh` ou `scripts/plan-doc-check.sh` (motif
+`find_recent_tool_invocation`, mika#2565 B3 ; fenêtre constante de 2 h, la
+requête étant déjà bornée par `session_id`). Trois états, et le troisième est
+celui qui compte :
+
+| ce que le ledger dit | effet |
+|---|---|
+| un appel shell nomme une garde | la preuve est acquise |
+| des appels shell existent, aucun ne nomme de garde | **refus** `no_guard_executed` |
+| la lecture a échoué | abstention `tool_ledger_unreadable` |
+| aucun appel shell du tout | abstention `no_shell_call_recorded` |
+
+L'abstention est **partielle** (les deux prédicats de corps décident encore) et
+elle est **dite** (`pipeline_grounding_abstained` + ligne d'audit
+`after_value = 'abstained'`). La dernière ligne est le faux positif réel : une
+revue reprise sur un callback de build tourne sous un `session_id` tout neuf et
+ne voit donc pas le `run_shell` de la session d'origine — indiscernable, dans le
+ledger, d'un `MIKA_STORE_TOOL_CALLS` désarmé. Les deux sont du silence, pas une
+accusation. **Compter cette population avant de resserrer** est l'objet de la
+sonde S4.
 
 **Citer une garde en échec** est une disjonction de trois motifs, insensible à la
 casse : `exit` suivi d'un entier **non nul** (séparateur `=`, `:` ou espaces
@@ -4718,6 +4746,23 @@ négatif est le coût d'aujourd'hui, déjà payé. Borne assumée : un corps don
 seule mention d'échec est un « exit 1 » dans la prose d'une garde par ailleurs
 verte **passera**. Même arithmétique que mika#2455 et mika#2519.
 
+**Le prompt ne nomme PAS encore ce refus, et c'est un report assumé.** Le vol 2
+devait ajouter à Step 2C/2E une ligne annonçant le refus moteur et prescrivant
+le **geste** — *exécuter Step 2B dans cette session, puis poster ce qu'il a
+imprimé* — plutôt que l'artefact, parce que « écris une section `PIPELINE:` »
+est, sous la preuve d'exécution, un générateur de défaut : il pousse le modèle à
+produire la section sous le verdict déjà choisi. La ligne a été écrite, puis
+retirée : `qa-review/system_prompt.md` est à 77 259 octets pour une porte à
+77 337, soit **78 octets de marge**, et son `skill.toml` déclare depuis mika#2639
+que les deux premières remédiations sont épuisées et que *la prochaine addition
+shard* (extraire Step 1.6 en skill frère). Ce shard est un vol à lui seul, avec
+son propre risque — un handler dont personne ne dépend est injoignable et muet
+(mika#2355). **Conséquence opérationnelle à tenir d'ici là :** le refus moteur
+est en vigueur dès que le binaire tourne, face à un prompt qui ne l'annonce pas.
+Un agent qui tombe dessus le découvre dans la charge de refus, dont le champ
+`remedy` nomme Step 2B explicitement pour cette raison. C'est aussi pourquoi la
+sonde S3 ci-dessous ne peut pas encore conclure sur le prompt.
+
 #### Surfaces opérateur
 
 ```bash
@@ -4730,6 +4775,10 @@ grep pipeline_grounding_gate_disabled "$MIKA_SPIRIT_LOG_FILE"
 
 # 3. Une valeur de gate illisible ? (régime attendu : VIDE)
 grep pipeline_grounding_gate_unrecognized_value "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. La preuve d'exécution s'abstient-elle, et sur quelle cause ? (vol 2)
+grep pipeline_grounding_abstained "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{target, reason, session_id}'
 ```
 
 ```sql
@@ -4744,6 +4793,8 @@ SELECT target_key, after_value, count(*) FROM audit_events
 |---|---|---|---|
 | `reason = section_absent` | WARN | **non vide, décroissant** | la forme mesurée sur #2685 ; décroît quand le prompt prend |
 | `reason = no_failing_guard_cited` | WARN | faible | une section postée sans sortie de garde citée |
+| `reason = no_guard_executed` | WARN | faible | une section bien formée, écrite plutôt qu'observée |
+| `pipeline_grounding_abstained` | WARN | **à mesurer** | la population du faux positif de la preuve d'exécution (S4) |
 | `after_value = 'allowed'` | audit | **non vide** | le contrôle positif ; son absence seule ne prouve rien |
 | `pipeline_grounding_gate_disabled` | INFO | **vide** | un `block[pipeline]` non fondé qui sort est alors l'état déclaré |
 
@@ -4769,24 +4820,42 @@ garde qui rend les revues légitimes impostables coûte plus que le défaut qu'e
 ferme.
 
 **S3 — le prompt finit par porter la règle (30 jours).** `section_absent`
-décroît. S'il reste plat, c'est le vol 2 (alignement du prompt à Step 2C/2E) qui
-manque, pas le prédicat.
+décroît. **Lecture conditionnelle tant que le shard n'a pas eu lieu :** Step
+2C/2E n'annonce pas encore le refus (voir le report ci-dessus), donc un plateau
+s'explique d'abord par là et ne met pas le prédicat en cause. Cette sonde ne
+devient discriminante qu'une fois la ligne de prompt déployée.
 *Halte 3 — les deux sondes muettes.* Zéro refus **et** zéro `allowed` ne prouve
 rien : il faut qu'un `block[pipeline]` ait été rendu depuis le déploiement. *Une
 garde que personne n'a exercée se lit exactement comme une garde qui marche*
 (mika#2205).
+
+**S4 — le taux d'abstention de la preuve d'exécution (30 jours, vol 2).**
+Rapporter `pipeline_grounding_abstained` au nombre total de décisions de la
+garde (`SELECT after_value, count(*) … GROUP BY 1`). Un taux non nul est
+**attendu** : les revues reprises sur callback y tombent par construction.
+*Halte 4 — l'abstention est majoritaire.* Alors `no_guard_executed` ne ferme
+rien et la classe n'est pas mesurée : le travail à faire est de rendre la
+session d'origine lisible depuis la session reprise (le `parent_session_id`
+existe en base, `create_session_with_parent` l'écrit), **pas** de transformer
+l'abstention en refus.
 
 #### Ce que ce travail n'achète PAS
 
 - **Il ne rattrape pas les deux revues de #2685.** Elles sont publiées, la PR est
   mergée. Rien ici ne réécrit un verdict passé. La sonde est la **prochaine**
   occurrence.
-- **Il ne vérifie pas que la garde a RÉELLEMENT tourné.** Il lit le corps de la
-  revue, pas la base : un corps qui fabrique une sortie `exit 1` plausible passe.
-  La preuve d'exécution lue en base (motif `find_recent_build_invocation`,
-  mika#2565) est le **vol 2**, `Tracked in: senara-solutions/mika#2687`.
-- **Il ne touche pas le prompt.** L'alignement de Step 2C/2E et son test de
-  conformité sont dans le même vol 2.
+- **Il n'annonce pas le refus en amont.** Step 2C/2E ne nomme pas encore
+  `pipeline_block_ungrounded` : le prompt est à 78 octets de sa porte de taille
+  et la prochaine addition doit le sharder. L'agent rencontre donc le refus sans
+  l'avoir lu dans ses instructions. Suivi sur mika#2687.
+- **Il n'observe pas qu'une garde est allée au bout**, seulement qu'elle a été
+  **invoquée** : le prédicat lit l'`input` de l'appel outil, pas sa sortie.
+  Exiger aussi un `GUARD: ` dans la sortie a été envisagé et écarté — cela ajoute
+  un faux négatif (sortie tronquée, outil qui a timeouté) du mauvais côté de
+  l'arithmétique fail-open.
+- **Il ne voit pas la session d'origine d'une revue reprise.** La lecture est
+  scopée au `session_id` courant ; la remontée par `parent_session_id` est un
+  travail à part, et la halte 4 ci-dessus en est la condition d'ouverture.
 - **Il ne couvre aucune autre classe de `block[…]`.** `block[ac]` traverse sans
   être lu : son fondement est l'énumération par AC, une autre famille.
 - **Il ne rétrograde pas en `hold[review]`.** Le ticket proposait « refuse ou

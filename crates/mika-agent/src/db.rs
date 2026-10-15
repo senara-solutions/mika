@@ -2512,8 +2512,15 @@ impl Database {
         Ok(rows)
     }
 
-    /// Les invocations de `build_mika` de cette session, dans une fenêtre
-    /// (mika#2565, branche B3).
+    /// Les invocations d'un outil nommé, dans cette session et dans une fenêtre
+    /// (mika#2565 branche B3 ; mika#2687 vol 2).
+    ///
+    /// **Le nom de la méthode est générique parce que la requête l'est.** Elle
+    /// s'est appelée `find_recent_build_invocation` tant qu'elle n'avait qu'un
+    /// appelant ; depuis que la preuve d'exécution pipeline (mika#2687) lit
+    /// `run_shell` par le même chemin, ce nom aurait menti à l'un de ses deux
+    /// sites. `tool_name` est déjà un paramètre : c'est la signature qui disait
+    /// vrai, pas le nom.
     ///
     /// Sœur de [`Self::find_recent_destructive_actions`] (mika#1646), et pour la
     /// même raison d'être : **un fait qu'on lit en base ne se rédige pas.** La
@@ -2531,15 +2538,16 @@ impl Database {
     /// **autre** PR il y a dix minutes ne vaut rien, et l'accepter rendrait la
     /// garde satisfaisable par le trafic de fond.
     ///
-    /// `tool_name` est passé par le paramètre plutôt qu'écrit ici : le nom
-    /// canonique est [`crate::qa_build_callback::BUILD_MIKA_TOOL`], et un
+    /// `tool_name` est passé par le paramètre plutôt qu'écrit ici : les noms
+    /// canoniques sont [`crate::qa_build_callback::BUILD_MIKA_TOOL`] et
+    /// [`crate::evidence::guards::PIPELINE_GROUNDING_SHELL_TOOL`], et un
     /// littéral recopié serait une seconde vérité.
     ///
     /// **L'échec de lecture n'est pas un `false`.** La méthode rend `Result`, et
     /// l'appelant distingue « aucun build » (refus) de « la base n'a pas
     /// répondu » (abstention) — sans quoi `MIKA_STORE_TOOL_CALLS` désarmé
     /// refuserait tout `pass` en silence.
-    pub fn find_recent_build_invocation(
+    pub fn find_recent_tool_invocation(
         &self,
         agent_id: &str,
         session_id: &str,
