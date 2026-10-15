@@ -138,8 +138,9 @@ pub use sink_dir::{
     list_sink_reports_in, resolve_offline_sink_dir,
 };
 pub use spawn::{
-    AuthAlarmBody, AuthAlarmSink, HttpAuthAlarmSink, SettingsTokenResolver, TokenResolver,
-    manager_config_from_env, spawn_manager_cycle_task,
+    AuthAlarmBody, AuthAlarmSink, ENV_DELIVERY_URL, ENV_ESCALATION_URL, HttpAuthAlarmSink,
+    SettingsTokenResolver, TokenResolver, manager_config_from_env, reject_heartbeat_endpoint,
+    spawn_manager_cycle_task,
 };
 pub use types::{
     Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MilestoneRef, MilestoneState,
