@@ -446,6 +446,33 @@ const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETR
 /// le refuse d'ailleurs comme orphelin.
 const PILOT_DISPATCH_ENV: &[&str] = &["PILOT_MAX_TURNS", "PILOT_LOG_DIR", "PLAN_SIZE_MAX_LOC"];
 
+/// L'interrupteur opérateur de la sentinelle d'egress du pilote (mika#2716).
+///
+/// `_stage_pilot_egress_sentinel` (`dispatch-lib.sh`) le lit sous la forme
+/// `${MIKA_PILOT_EGRESS_SENTINEL:-1}` : `0` / `false` / `no` / `off` /
+/// `disabled` ramènent la sandbox au placeholder statique d'avant le ticket,
+/// tout le reste arme le tirage per-spawn.
+///
+/// **Liste propre, et non une entrée de [`PILOT_DISPATCH_ENV`]**, pour deux
+/// raisons qui se lisent chacune dans le doc-comment de la famille qu'elle
+/// écarte. Ce nom est `MIKA_`-préfixé, donc il n'appartient pas à la population
+/// des « formats de fil » nus du canal pilote ; et son vide **n'est pas un
+/// palier** — `:-` rend `1`, donc vide et absent se confondent — là où le vide
+/// de `PILOT_MAX_TURNS` EST le rollback documenté. Il passe par
+/// [`relayed_env_pairs`] et non par [`relayed_env_pairs_preserving_empty`] :
+/// deux populations, deux helpers, chacun testé pour lui-même.
+///
+/// Même contrat de placement que [`RESCUE_VERIFY_ENV`] — relayé APRÈS
+/// [`sandboxed_pilot_env`] — et **jamais** ajouté à
+/// [`SANDBOX_ENV_CORE_ALLOWLIST`] : mika#2354 AC9(b), tenu ici par
+/// `mika2716_the_egress_sentinel_switch_never_joins_the_sandbox_allowlist`.
+/// Sans ce relais, `MIKA_PILOT_EGRESS_SENTINEL=0` posé sur l'environnement du
+/// service serait absent du child, le staging s'armerait quand même, et
+/// l'interrupteur que le ticket exige serait décoratif (mika#2165) — ce que
+/// `mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`
+/// refuse comme orphelin.
+const EGRESS_SENTINEL_ENV: &[&str] = &["MIKA_PILOT_EGRESS_SENTINEL"];
+
 /// Decide which of `keys` to set on the child, given a reader of the spirit
 /// process environment.
 ///
@@ -558,6 +585,20 @@ fn inject_pilot_dispatch_env(cmd: &mut tokio::process::Command) {
     for (key, value) in
         relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| std::env::var(k).ok())
     {
+        cmd.env(key, value);
+    }
+}
+
+/// Relaie l'interrupteur de la sentinelle d'egress à `dispatch-lib.sh`
+/// (mika#2716).
+///
+/// Même contrat de placement que [`inject_rescue_verify_env`] — il DOIT tourner
+/// après [`sandboxed_pilot_env`], dont l'`env_clear()` effacerait sinon la
+/// variable — et même discipline best-effort : un dispatch qui ne porte pas le
+/// réglage retombe sur le défaut du shell (sentinelle armée), jamais un dispatch
+/// bloqué.
+fn inject_egress_sentinel_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in relayed_env_pairs(EGRESS_SENTINEL_ENV, |k| std::env::var(k).ok()) {
         cmd.env(key, value);
     }
 }
@@ -5098,6 +5139,12 @@ pub(crate) fn spawn_long_running_exec(
         // Same placement rationale as the four lines above: naming them
         // unprefixed never made them traverse, the explicit relay does.
         inject_pilot_dispatch_env(&mut cmd);
+        // mika#2716: relay the egress-sentinel switch the staging step reads.
+        // Same placement rationale as the lines above. Without it,
+        // `MIKA_PILOT_EGRESS_SENTINEL=0` would be a switch only its reader
+        // honours — the shell would arm the per-spawn draw regardless, and the
+        // rollback the ticket requires would be decorative (mika#2165).
+        inject_egress_sentinel_env(&mut cmd);
         // mika#2536: relay the platform root the four long-running handlers and
         // `dispatch-lib.sh` read. Same placement rationale as the five lines
         // above — and this one TRANSLATES the name (`MIKA_PLATFORM_DIR` spirit
@@ -5833,6 +5880,125 @@ mod tests {
         );
     }
 
+    /// mika#2716 : l'interrupteur de la sentinelle atteint `dispatch-lib.sh`
+    /// par injection explicite, et JAMAIS par héritage.
+    ///
+    /// Même population et même refus que ses deux voisines ci-dessus. Le remède
+    /// tentant est ici doublement interdit : `MIKA_PILOT_EGRESS_SENTINEL` est
+    /// `MIKA_`-préfixé, donc l'ajouter à [`SANDBOX_ENV_CORE_ALLOWLIST`]
+    /// percerait la garde anti-fuite de secret **et** heurterait le
+    /// `debug_assert` qui existe pour empêcher ce geste précis.
+    #[test]
+    fn mika2716_the_egress_sentinel_switch_never_joins_the_sandbox_allowlist() {
+        for key in EGRESS_SENTINEL_ENV {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "{key} must reach dispatch-lib by explicit injection, never by \
+                 inheritance — it is not the allowlist's job to carry it"
+            );
+            assert!(
+                !SANDBOX_ENV_CORE_ALLOWLIST.contains(key),
+                "{key} must not be added to SANDBOX_ENV_CORE_ALLOWLIST"
+            );
+            assert!(
+                !SANDBOX_ENV_ALLOWED_PREFIXES
+                    .iter()
+                    .any(|p| key.starts_with(p)),
+                "{key} must not be covered by SANDBOX_ENV_ALLOWED_PREFIXES"
+            );
+        }
+    }
+
+    /// mika#2716 : le réglage posé traverse, l'absent et le vide ne traversent
+    /// pas.
+    ///
+    /// Le vide est un no-op **parce que le lecteur en décide ainsi** :
+    /// `_stage_pilot_egress_sentinel` lit
+    /// `${MIKA_PILOT_EGRESS_SENTINEL:-1}`, où vide et absent rendent tous deux
+    /// `1`. Poser le vide ne changerait donc rien au child tout en rendant
+    /// « réglage absent » et « réglage posé vide » indistinguables côté spirit.
+    /// C'est ce qui range ce relais du côté de [`relayed_env_pairs`] et non de
+    /// `relayed_env_pairs_preserving_empty`, dont le vide EST le rollback de
+    /// `PILOT_MAX_TURNS` (mika#2508).
+    #[test]
+    fn mika2716_the_egress_sentinel_switch_is_relayed_when_posed() {
+        let off = relayed_env_pairs(EGRESS_SENTINEL_ENV, |k| {
+            assert_eq!(
+                k, "MIKA_PILOT_EGRESS_SENTINEL",
+                "le relais doit lire le nom que l'OPÉRATEUR pose, et le child \
+                 doit recevoir le MÊME nom : c'est celui que \
+                 `_stage_pilot_egress_sentinel` lit"
+            );
+            Some("0".to_string())
+        });
+        assert_eq!(
+            off,
+            vec![("MIKA_PILOT_EGRESS_SENTINEL", "0".to_string())],
+            "sans ce relais, `MIKA_PILOT_EGRESS_SENTINEL=0` posé sur le service \
+             serait absent du child et le staging s'armerait quand même : \
+             l'interrupteur que le ticket exige serait décoratif (mika#2165)"
+        );
+
+        assert!(
+            relayed_env_pairs(EGRESS_SENTINEL_ENV, |_| None).is_empty(),
+            "absence ⇒ no-op : le shell garde son défaut (sentinelle armée)"
+        );
+        assert!(
+            relayed_env_pairs(EGRESS_SENTINEL_ENV, |_| Some(String::new())).is_empty(),
+            "valeur vide ⇒ no-op : `${{MIKA_PILOT_EGRESS_SENTINEL:-1}}` rend `1` \
+             pour le vide comme pour l'absent"
+        );
+    }
+
+    /// mika#2716 : le relais est appelé APRÈS [`sandboxed_pilot_env`].
+    ///
+    /// Scan de source, et il n'est pas décoratif, pour la raison de
+    /// `mika2536_the_relay_runs_after_the_env_sandbox` : un appel déplacé
+    /// au-dessus de l'`env_clear()` ne casse **aucune** assertion de
+    /// comportement — le dispatch continue, l'interrupteur retombe simplement
+    /// sur son défaut, en silence.
+    #[test]
+    fn mika2716_the_egress_sentinel_relay_runs_after_the_env_sandbox() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("skills")
+            .join("executor.rs");
+        let whole = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", path.display()));
+
+        // Tronqué au premier `#[cfg(test)]` — motif `production_sources`
+        // (mika#2201) : sans ça le scan se compte lui-même, les deux aiguilles
+        // étant des littéraux de CE test.
+        let cut = whole
+            .find("#[cfg(test)]")
+            .expect("executor.rs porte un module de test : sans lui, le scan se compte lui-même");
+        let src = &whole[..cut];
+
+        let sandbox = "sandboxed_pilot_env(&mut cmd);";
+        let relay = "inject_egress_sentinel_env(&mut cmd);";
+
+        // Anti-vacuité AVANT l'ordre (mika#2103, mika#2205).
+        assert_eq!(
+            src.matches(sandbox).count(),
+            1,
+            "un seul site doit appeler `{sandbox}` — si ce compte bouge, l'ordre \
+             ci-dessous ne décide plus de rien"
+        );
+        assert_eq!(
+            src.matches(relay).count(),
+            1,
+            "un seul site doit appeler `{relay}` ; s'il a disparu, \
+             `MIKA_PILOT_EGRESS_SENTINEL` est redevenue inerte et RIEN ne le dirait"
+        );
+
+        assert!(
+            src.find(sandbox) < src.find(relay),
+            "`{relay}` doit venir APRÈS `{sandbox}` : l'`env_clear()` du bac à \
+             sable efface toute injection antérieure, et le dispatch resterait \
+             vert en retombant sur le défaut du shell"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // mika#2508 R4/R5 — le scan de classe.
     //
@@ -6004,7 +6170,8 @@ mod tests {
     /// mécanisme : l'allowlist positive, ou l'un des relais explicites.
     ///
     /// Les trois formes doivent être agrégées explicitement : `PILOT_DISPATCH_ENV`,
-    /// `RESCUE_VERIFY_ENV` et `ARCH_ASK_RETRY_ENV` sont des `&[&str]`,
+    /// `RESCUE_VERIFY_ENV`, `ARCH_ASK_RETRY_ENV` et `EGRESS_SENTINEL_ENV`
+    /// (mika#2716) sont des `&[&str]`,
     /// `DISPATCH_WORKTREE_ENV`, `PILOT_TRANSCRIPT_ENV` et
     /// `PLATFORM_DIR_RELAY_KEY` sont des **scalaires**, et `GH_TOKEN` est un
     /// littéral injecté en clair dans [`spawn_long_running_exec`]. Un
@@ -6022,6 +6189,7 @@ mod tests {
         PILOT_DISPATCH_ENV.contains(&name)
             || RESCUE_VERIFY_ENV.contains(&name)
             || ARCH_ASK_RETRY_ENV.contains(&name)
+            || EGRESS_SENTINEL_ENV.contains(&name)
             || name == DISPATCH_WORKTREE_ENV
             || name == PILOT_TRANSCRIPT_ENV
             || name == PLATFORM_DIR_RELAY_KEY
