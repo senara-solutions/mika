@@ -37,7 +37,7 @@ pub async fn run(args: ReminderArgs, agent_name: &str) -> Result<()> {
                 OutputFormat::Yaml => {
                     let json_reminders: Vec<Value> =
                         reminders.iter().map(reminder_to_json).collect();
-                    print!("{}", serde_yaml::to_string(&json_reminders)?);
+                    print!("{}", yaml_serde::to_string(&json_reminders)?);
                 }
             }
         }
@@ -59,7 +59,7 @@ pub async fn run(args: ReminderArgs, agent_name: &str) -> Result<()> {
                             println!("{}", serde_json::to_string_pretty(&reminder_to_json(&t))?);
                         }
                         OutputFormat::Yaml => {
-                            print!("{}", serde_yaml::to_string(&reminder_to_json(&t))?);
+                            print!("{}", yaml_serde::to_string(&reminder_to_json(&t))?);
                         }
                     }
                 }

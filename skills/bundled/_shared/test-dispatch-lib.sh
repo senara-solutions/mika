@@ -12310,13 +12310,32 @@ _t2693_chain_probe() {
     )
 }
 
+# Les deux plafonds de sonde du PLANCHER, dérivés des constantes (mika#2707, X1).
+# Le plancher de pipeline est une SOMME de deux constantes ; le jour où l'une
+# bouge, un littéral `85` fait tirer V1 et W3 pour une raison qui n'est pas un
+# défaut — et, pire, un littéral choisi juste sous l'ancien plancher passe
+# AU-DESSUS du nouveau et mesure le bras nominal du résolveur en se croyant sur
+# le plancher. Le détecteur qui tient cette dérivation est X1, plus bas.
+#
+# Leur non-vacuité est assertée ICI, avant V1, et non plus bas avec le reste :
+# une valeur vide passée à `_t2693_bound_probe` prend le bras du budget DÉSARMÉ
+# (`243|150|disarmed_fallback|`), et V1 resterait VERTE en ayant mesuré un autre
+# bras que celui qu'elle nomme.
+T2707_FLOOR=$(( ${_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS:-0} + ${_PLAN_SIZE_FLIGHT_TAIL_TURNS:-0} ))
+T2707_UNDER=$(( T2707_FLOOR - 15 ))
+assert_eq "X1 contre-vacuité: le plancher dérivé est un entier strictement positif" "oui" \
+    "$([ "$T2707_FLOOR" -gt 0 ] && echo oui || echo "non ($T2707_FLOOR)")"
+assert_eq "X1 contre-vacuité: le plafond SOUS le plancher l'est aussi" "oui" \
+    "$([ "$T2707_UNDER" -gt 0 ] && echo oui || echo "non ($T2707_UNDER)")"
+
 # --- V1 : le résolveur de borne, ses paliers, son plancher ------------------
 #
 # ROUGE AVANT : la fonction n'existait pas.
 #
-# Les deux dernières lignes sont le contrôle du PLANCHER. Un plafond ≤ 85
-# (orientation 35 + fin de pipeline 50) donne un nombre de tours de travail nul
-# ou négatif, et la borne doit valoir 0 — JAMAIS un négatif, qui serait « un
+# Les deux dernières lignes sont le contrôle du PLANCHER. Un plafond au niveau
+# du plancher de pipeline (orientation + fin de pipeline, dérivé en
+# `$T2707_FLOOR`) ou en dessous donne un nombre de tours de travail nul ou
+# négatif, et la borne doit valoir 0 — JAMAIS un négatif, qui serait « un
 # nombre plausible, présenté avec autorité, faux », la classe que l'ancre de
 # `_PLAN_SIZE_TOTAL_RE` a déjà dû fermer.
 
@@ -12328,10 +12347,12 @@ assert_eq "V1: plafond 120 ⇒ borne 131 (troncature entière assumée)" "131|12
     "$(_t2693_bound_probe 120)"
 assert_eq "V1: plafond VIDE (rollback) ⇒ repli 150, provenance disarmed_fallback" \
     "243|150|disarmed_fallback|" "$(_t2693_bound_probe __EMPTY__)"
-assert_eq "V1: plafond 85 (= le plancher) ⇒ borne 0, jamais un négatif" \
-    "0|85|resolved|ceiling_below_pipeline_floor" "$(_t2693_bound_probe 85)"
-assert_eq "V1: plafond 70 (sous le plancher) ⇒ borne 0, et la note le dit" \
-    "0|70|resolved|ceiling_below_pipeline_floor" "$(_t2693_bound_probe 70)"
+assert_eq "V1: plafond $T2707_FLOOR (= le plancher) ⇒ borne 0, jamais un négatif" \
+    "0|$T2707_FLOOR|resolved|ceiling_below_pipeline_floor" \
+    "$(_t2693_bound_probe "$T2707_FLOOR")"
+assert_eq "V1: plafond $T2707_UNDER (sous le plancher) ⇒ borne 0, et la note le dit" \
+    "0|$T2707_UNDER|resolved|ceiling_below_pipeline_floor" \
+    "$(_t2693_bound_probe "$T2707_UNDER")"
 # Le repli n'est PAS 200 : ce 200 appartient au `maxTurns` amont de claude-pilot,
 # un composant qu'on ne possède pas, et un rollback est une posture d'incident.
 assert_not_contains "V1: le repli de budget désarmé ne vaut PAS la borne de 200 tours" \
@@ -12717,7 +12738,12 @@ assert_eq "V6: table d'exceptions des scans de source (V3, V5, V6) — zero entr
 _plan_size_rule "200"; T2693_RULE_200="$_PLAN_SIZE_RULE"
 _plan_size_rule "150"; T2693_RULE_150="$_PLAN_SIZE_RULE"
 _plan_size_rule "";    T2693_RULE_DISARMED="$_PLAN_SIZE_RULE"
-_plan_size_rule "70";  T2693_RULE_FLOOR="$_PLAN_SIZE_RULE"
+# Le quatrième rendu est celui du PLANCHER, et son plafond est DÉRIVÉ (mika#2707,
+# X1) : écrit en littéral, il passait AU-DESSUS du plancher dès que la queue est
+# recalibrée, `_plan_size_rule` cessait d'alerter, et les quatre assertions de
+# plancher ci-dessous tiraient sans qu'aucun défaut existe. Trouvé par la
+# mutation de X1 ; ce site n'était PAS dans l'inventaire d'ancres du plan.
+_plan_size_rule "$T2707_UNDER";  T2693_RULE_FLOOR="$_PLAN_SIZE_RULE"
 
 # Contre-vacuité d'abord : les quatre rendus existent. Sans elle, un
 # `_plan_size_rule` qui rendrait la chaîne vide ferait passer les quatre
@@ -12821,6 +12847,72 @@ assert_not_contains "V7-quater: le format ne retape pas débit et facteur" \
 # Et la dérivation EN VALEUR reste bien celle que la règle rend, elle.
 assert_contains "V7-quater: la règle, elle, rend la dérivation en valeur" \
     '(200 − 35 − 50) × 7,5 / 2' "$T2693_RULE_200"
+
+# --- X1 : le plancher est dérivé -------------------------------------------
+#
+# mika#2707 recalibrera `_PLAN_SIZE_FLIGHT_TAIL_TURNS` dès que cinq vols
+# post-#2695 auront déposé leur ligne `plan_size_estimate`. Ce jour-là, le
+# plancher de pipeline — `orientation + fin de pipeline` — se DÉPLACE. Les CINQ
+# sondes à plafond de plancher le dérivent désormais (`$T2707_FLOOR` /
+# `$T2707_UNDER`, outillage de section) : deux en V1, une en V7, deux en W3.
+# Ce détecteur est ce qui empêche la dérivation de pourrir par le prochain qui
+# retape un nombre — et c'est lui qui a trouvé la cinquième, celle de V7, que
+# l'inventaire d'ancres du plan ne recensait pas.
+#
+# Pourquoi un détecteur et pas la seule bonne volonté : V1 épingle ses bornes
+# (431, 243, 131) en LITTÉRAL exprès — doctrine D3, c'est la seule assertion qui
+# vérifie l'ARITHMÉTIQUE, et la dériver la rendrait tautologique. Le plancher,
+# lui, n'est pas une borne calculée : c'est la SOMME de deux constantes. Le
+# littéral y est donc un doublon, pas une épingle — et la frontière entre les
+# deux ne se lit pas dans le code, d'où cette assertion qui la dit.
+#
+# L'ancre est le NOM de la sonde suivi de ses arguments, et le dernier d'entre
+# eux. JAMAIS le nombre nu : un `85` nu vit aussi dans un seuil, un numéro de
+# ligne, une phrase de prose — mika#2050 a mesuré ce faux positif-là sur un
+# autre jeton, et la leçon vaut pour celui-ci.
+#
+# ROUGE PAR MUTATION, consigné : réécrire `_t2693_bound_probe 85` à la place de
+# `_t2693_bound_probe "$T2707_FLOOR"` en V1 porte le compte à 1 et fait tirer.
+# Vider l'un des deux blocs extraits fait tirer la contre-vacuité de fenêtre ;
+# renommer une sonde fait tirer celle du scan.
+
+T2707_BLOCK_2693=$(sed -n '/^# mika#2693 — la SECONDE borne du Plan-Size Gate/,/^# mika#2641 —/p' "$0")
+T2707_BLOCK_2701=$(sed -n '/^# mika#2701 — PORTE 3 : la ligne/,/^# --- dispatch-lib parse toujours ---/p' "$0")
+assert_eq "X1 contre-vacuité: les deux blocs de sondes sont extraits non vides" "oui|oui" \
+    "$([ -n "$T2707_BLOCK_2693" ] && printf oui || printf non)|$([ -n "$T2707_BLOCK_2701" ] && printf oui || printf non)"
+
+# Tous les appels des TROIS sondes à plafond des deux blocs, réduits à leur
+# DERNIER argument — celui qui porte le plafond. Les commentaires sont retirés
+# d'abord : la prose ci-dessus nomme les sondes exprès.
+#
+# `)` et `;` sont HORS de la classe d'arguments, et c'est ce qui rend le dernier
+# champ juste : sans le `;`, le match avale gloutonnement l'affectation qui suit
+# la commande, `$NF` vaut `T2693_RULE_FLOOR=…` au lieu de `70`, et le détecteur
+# rend 0 sur un littéral bien présent. Mesuré par mutation, pas supposé.
+# Les guillemets tombent ensuite : `_plan_size_rule "70"` est un littéral.
+T2707_PROBE_CEILINGS=$(printf '%s\n%s\n' "$T2707_BLOCK_2693" "$T2707_BLOCK_2701" \
+    | grep -vE '^[[:space:]]*#' \
+    | grep -oE '(_t2693_bound_probe|_t2701_emit_probe|_plan_size_rule)([[:space:]]+[^[:space:]);]+)+' \
+    | awk '{ print $NF }' \
+    | tr -d '"' || true)
+# Contre-vacuité du scan : un renommage de sonde lui ferait rendre `0` pour la
+# mauvaise raison — « vert parce qu'il n'a rien lu », la classe même que X1 ferme.
+assert_eq "X1 contre-vacuité: le scan a bien trouvé des appels de sonde" "oui" \
+    "$([ -n "$T2707_PROBE_CEILINGS" ] && printf oui || printf non)"
+
+assert_eq "X1: aucune sonde ne retape le plancher ($T2707_FLOOR) en littéral" "0" \
+    "$(printf '%s\n' "$T2707_PROBE_CEILINGS" | grep -cxF "$T2707_FLOOR" || true)"
+assert_eq "X1: ni le plafond sous le plancher ($T2707_UNDER)" "0" \
+    "$(printf '%s\n' "$T2707_PROBE_CEILINGS" | grep -cxF "$T2707_UNDER" || true)"
+
+# FIRE-DISPOSITION, option (a) : la table d'exceptions de CE détecteur est
+# DÉCLARÉE et VIDE, et son vide est asserté à l'exécution. Déclarée pour que le
+# prochain qui veut y mettre une entrée voie d'abord qu'elle existe exprès ;
+# assertée vide pour qu'une entrée ajoutée en silence tire. Les détecteurs
+# partent ARMÉS — doctrine mika#2201 : on route le site vers la règle.
+T2707_FLOOR_LITERAL_ALLOWLIST=()
+assert_eq "X1: table d'exceptions des littéraux de plancher — zero entries" \
+    "0" "${#T2707_FLOOR_LITERAL_ALLOWLIST[@]}"
 
 # ===========================================================================
 # mika#2641 — une réponse d'architecte sans disposition lisible est RELANCÉE
@@ -13507,21 +13599,21 @@ assert_not_contains "W2-bis: un plafond valide n'émet AUCUNE ligne *_ceiling_in
 # la dernière assertion ; écrire `${_PLAN_SIZE_PER_FLIGHT_NOTE}` sans le `:+`
 # produit un `per_flight_note=` vide et la fait tirer aussi.
 
-T2701_FLOOR70=$(_t2701_emit_probe 400 70)
-T2701_FLOOR85=$(_t2701_emit_probe 400 85)
-for t2701_out in "$T2701_FLOOR70" "$T2701_FLOOR85"; do
+T2701_FLOOR_UNDER=$(_t2701_emit_probe 400 "$T2707_UNDER")
+T2701_FLOOR_EXACT=$(_t2701_emit_probe 400 "$T2707_FLOOR")
+for t2701_out in "$T2701_FLOOR_UNDER" "$T2701_FLOOR_EXACT"; do
     assert_eq "W3 contre-vacuité: la sonde de plancher rend bien une ligne" "non-vide" \
         "$([ -n "$(_t2701_line "$t2701_out")" ] && echo non-vide || echo vide)"
 done
 
-assert_contains "W3 (AC3): plafond 70 ⇒ borne 0, et la note le DIT" \
-    "per_flight_bound_loc=0 ceiling=70 ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
-    "$(_t2701_line "$T2701_FLOOR70")"
-assert_contains "W3 (AC3): plafond 85 (= le plancher exact) ⇒ même chose" \
-    "per_flight_bound_loc=0 ceiling=85 ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
-    "$(_t2701_line "$T2701_FLOOR85")"
+assert_contains "W3 (AC3): plafond $T2707_UNDER (sous le plancher) ⇒ borne 0, et la note le DIT" \
+    "per_flight_bound_loc=0 ceiling=$T2707_UNDER ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
+    "$(_t2701_line "$T2701_FLOOR_UNDER")"
+assert_contains "W3 (AC3): plafond $T2707_FLOOR (= le plancher exact) ⇒ même chose" \
+    "per_flight_bound_loc=0 ceiling=$T2707_FLOOR ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
+    "$(_t2701_line "$T2701_FLOOR_EXACT")"
 assert_not_contains "W3: et JAMAIS une borne négative" \
-    "per_flight_bound_loc=-" "$(_t2701_line "$T2701_FLOOR70")"
+    "per_flight_bound_loc=-" "$(_t2701_line "$T2701_FLOOR_UNDER")"
 # LA MOITIÉ QUI COMPTE, et qui est aussi la contre-vacuité des deux précédentes :
 # sans elle, une note émise inconditionnellement les ferait passer toutes les deux.
 assert_not_contains "W3 (D4): un plafond de 200 ne porte AUCUN per_flight_note=" \
@@ -13655,9 +13747,9 @@ assert_eq "W7: plan= est le DERNIER champ de la ligne" "yes" \
         *) echo "non: $(_t2701_line "$T2701_P200_400")" ;;
     esac)"
 assert_eq "W7: …y compris quand per_flight_note= s'intercale" "yes" \
-    "$(case "$(_t2701_line "$T2701_FLOOR70")" in
+    "$(case "$(_t2701_line "$T2701_FLOOR_UNDER")" in
         *"per_flight_note=ceiling_below_pipeline_floor plan=${T2701_PLAN_PATH}") echo yes ;;
-        *) echo "non: $(_t2701_line "$T2701_FLOOR70")" ;;
+        *) echo "non: $(_t2701_line "$T2701_FLOOR_UNDER")" ;;
     esac)"
 
 # Les quatre champs sur UNE SEULE ligne, dans l'ordre prescrit — une assertion
