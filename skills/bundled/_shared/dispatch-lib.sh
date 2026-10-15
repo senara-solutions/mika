@@ -2052,9 +2052,18 @@ Remedy: $_egress_remedy"
         # this alongside ANTHROPIC_BASE_URL routes ALL CC-internal traffic
         # through the /anthropic-proxy/* reverse-proxy path where host-side
         # OAuth injection lives. Without it, those internal calls fall through
-        # to HTTPS_PROXY CONNECT tunnels (carrying the sandbox placeholder key)
-        # → Anthropic 401 / SDK stall → guardrail idle_timeout 300s → pilot
-        # dies at Turns:1 with HEAD unchanged (n=6 dispatches observed).
+        # to HTTPS_PROXY CONNECT tunnels carrying the sandbox placeholder key,
+        # so they arrive at api.anthropic.com with no usable credential.
+        #
+        # What that costs has NOT been measured, and this comment used to claim
+        # it had been: the chain it asserted — auth rejection into an SDK stall
+        # into a turn-1 `idle_timeout` kill, "n=6 dispatches observed" — was
+        # REFUTED on 2026-08-29 (mika#2029). Those same sessions show
+        # `POST /v1/messages -> 200`, six candidate lineages were eliminated,
+        # and the stall cause that was eventually traced to its end lives in
+        # claude-pilot#177 (CLOSED 2026-09-11) — upstream of this variable and
+        # unaffected by it. The reason to set it is the canary below, which is
+        # a measurement; the deleted chain was a plausible story.
         # Found via `strings` on bundled claude binary; verified end-to-end
         # in canary (opus-4-8, stream-json, no --bare) → 1.7s clean completion.
         # γ (MITM CONNECT tunnels) filed as long-term robustness follow-up so
@@ -5315,7 +5324,7 @@ Duration: ${DURATION:-unknown}ms
 ${cause}
 ${halt_lines}
 
-HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. See the stall lineage on mika#1901 and the note above _run_pilot_sandboxed on the Anthropic 401 / SDK-stall chain that ends in exactly this shape.
+HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. The 'Halt class:' line above is what names it, and it is the only line here that does: this paragraph cannot tell you which kill this was. One stall cause has been traced to its end — claude-pilot#177 (CLOSED 2026-09-11), where the content_block_stop of a tool_use block closed the model-wait window its own tool result had just opened, leaving a turn 300s of budget instead of 900s. The auth lineage this text used to name was refuted by measurement on 2026-08-29 (mika#2029). The kill classes, and what each one rules out: docs/solutions/dev-loop/.
 
 Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
 }

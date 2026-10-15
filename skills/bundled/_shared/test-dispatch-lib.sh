@@ -4727,7 +4727,18 @@ assert_not_contains "U2: terminated classification carries no plan-lookup diagno
     "_find_issue_plan" "$CLASSIFY_WITH_GUARDRAIL"
 assert_not_contains "U2: terminated classification carries no convergence diagnosis" \
     "architect convergence" "$CLASSIFY_WITH_GUARDRAIL"
-assert_contains "U2: terminated classification points at the upstream stall lineage" \
+# mika#2029: this assertion TURNED, and that is the probe doing its job. Until
+# 2026-10-15 it required `mika#1901` — the auth lineage the delivered text named
+# as the cause. That lineage was refuted by measurement on 2026-08-29 (the very
+# sessions it described show `POST /v1/messages -> 200`, six candidate lineages
+# eliminated), and the cause was eventually traced upstream of this repo to
+# claude-pilot#177 (CLOSED 2026-09-11). A callback that names a dead lineage
+# costs more than a silent one: it sends the next reader into the wrong half of
+# the system. The pair below pins BOTH directions — the traced cause is named,
+# and the refuted one does not come back through an absent-minded restore.
+assert_contains "U2: terminated classification names the cause that was traced" \
+    "claude-pilot#177" "$CLASSIFY_WITH_GUARDRAIL"
+assert_not_contains "U2: and no longer points at the refuted auth lineage" \
     "mika#1901" "$CLASSIFY_WITH_GUARDRAIL"
 
 # R7: one Outcome line. The old path could stack two — _post_flight_recovery
