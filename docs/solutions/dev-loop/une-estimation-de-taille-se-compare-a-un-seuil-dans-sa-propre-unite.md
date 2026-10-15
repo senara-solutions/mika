@@ -247,6 +247,76 @@ passer le plafond au résolveur tombe sur le même repli (`disarmed_fallback`). 
 direction prudente donne un plan plus petit, donc un découpage parfois inutile —
 jamais une mort par volume.
 
+#### L'instrument : une ligne par dispatch, et où elle tombe (mika#2701)
+
+L'étape 1 ci-dessus demande de relever un quadruplet par vol. Depuis mika#2701,
+sa **moitié estimée** n'est plus à reconstituer : chaque dispatch
+d'implémentation qui sert un plan la dépose, en clair, dans le `.stderr` du vol.
+La ligne, complète :
+
+```
+dispatch-lib: plan_size_estimate total_loc=<t> threshold_loc=<T> verdict=<v> per_flight_bound_loc=<b> ceiling=<c> ceiling_source=<resolved|disarmed_fallback> per_flight_verdict=<under_bound|over_bound|unknown>[ per_flight_note=<n>] plan=<chemin>
+```
+
+Quatre propriétés de forme, et chacune a coûté quelque chose :
+
+- **`plan=` est le dernier champ**, parce qu'il porte un chemin — la seule valeur
+  de la ligne qui pourrait un jour contenir un espace. Un champ terminal reste
+  parsable ; un champ au milieu ne l'est plus. Qui ajoute un champ l'insère
+  **avant** `plan=`.
+- **`per_flight_note=` n'apparaît que non vide**, comme `label=` sur la ligne
+  `pilot_budget_armed` : un champ vide se lirait comme une note nommée « vide ».
+  Un relevé qui compte les notes compte donc des occurrences, pas des champs.
+- **Deux unités, deux vocabulaires.** `verdict=` dit `under_threshold` /
+  `over_threshold` (lignes par PR) ; `per_flight_verdict=` dit `under_bound` /
+  `over_bound` (lignes dérivées de tours). C'est le titre de ce document appliqué
+  au corpus de logs : un `grep over_threshold` qui apparierait les deux
+  mélangerait deux unités dans la même colonne.
+- **`ceiling=` porte le plafond résolu, jamais `none`.** Sur budget désarmé il
+  vaut 150 et `ceiling_source=disarmed_fallback` le dit. Sans cela, le
+  `per_flight_bound_loc=` qui l'accompagne serait un nombre sans dérivation
+  possible.
+
+Le relevé, en ancrant sur `^dispatch-lib: ` et jamais sur le jeton nu — ce
+`.stderr` porte aussi la prose du pilote, et mika#2050 a mesuré le faux positif
+d'une session qui *discutait* du signal :
+
+```sh
+grep -h '^dispatch-lib: plan_size_estimate ' ~/.mika/logs/**/*.stderr
+```
+
+Correspondance champ → terme du quadruplet de l'étape 1 :
+
+| Champ de la ligne | Terme du quadruplet | Ce qu'il reste à joindre |
+|---|---|---|
+| `ceiling=` | plafond du vol | rien — c'est l'argv réellement passé |
+| `total_loc=` | total estimé du plan | le réel hors `docs/`, par `git show --numstat` |
+| `per_flight_bound_loc=` | la borne en vigueur | rien — recalculable des quatre constantes |
+| `per_flight_verdict=` | le sens de l'écart | les trois tours, lus sur le vol lui-même |
+
+La ligne donne donc l'**estimé** et la **borne** sans jointure ; le **réel** et
+les **tours** restent à relever sur le vol. C'est la moitié qui manquait : avant
+mika#2701, le plafond d'un vol passé ne se retrouvait que par les labels de son
+ticket — c'est-à-dire par une relecture qui dit l'intention, pas le fait.
+
+**Et porte 3 ne refuse rien.** Un plan groomé au-dessus de la borne est **mesuré**
+au dispatch, jamais bloqué : la file groomée entière le lui doit, puisqu'un plan
+déjà groomé ne repasse par aucune porte de groom au dispatch suivant. Refuser
+ici gèlerait d'un coup tout `docs/plans/`. Détection permissive, décision
+stricte — la répartition des trois portes de mika#2636, inchangée.
+
+**Note datée, 2026-10-15 : `_PLAN_SIZE_FLIGHT_TAIL_TURNS=50` surestime la queue.**
+La constante a été posée sur des vols qui passaient par `ce-simplify-code` et
+`ce-code-review`. mika#2694 / PR #2695 les a retirés des vols de pilote, et la
+mesure disponible sur le vol de mika#2693 leur attribuait ~41 + ~41 tours sur
+une queue de ~80. La borne qui en dérive est donc plus serrée que nécessaire —
+dans la direction prudente, donc rien n'est cassé, mais le coût est des vols en
+trop. Le recalibrage **n'est pas** une soustraction naïve : elle rendrait un
+reste de ~0 tour pour la vérification, le compound et la PR, ce qui est faux
+(mika#2687 vol 1 est mort *dans* la vérification après 15 tours de queue). Il
+demande le corpus que l'instrument ci-dessus produit. Suivi : mika#2707, dont la
+condition de déclenchement est **cinq vols post-#2695 ayant ouvert une PR**.
+
 ## Related
 
 - CLAUDE.md, section d'observabilité de l'estimation de taille (sondes 1 à 4,
@@ -260,3 +330,9 @@ jamais une mort par volume.
   dérivation vit en commentaire au-dessus de `_plan_size_per_flight_bound`
   (`skills/bundled/_shared/dispatch-lib.sh`), et les sondes V1 à V6 de
   `test-dispatch-lib.sh` la tiennent.
+- mika#2701 — porte 3, la mesure. Les quatre champs par vol de la ligne
+  `plan_size_estimate`, tenus par les sondes W1 à W7 de `test-dispatch-lib.sh` ;
+  le § *L'instrument* ci-dessus est son mode d'emploi.
+- mika#2707 — le recalibrage de `_PLAN_SIZE_FLIGHT_TAIL_TURNS` que cette mesure
+  rend possible. Ouvert, non actionnable tant que le corpus post-#2695 n'atteint
+  pas cinq vols ayant ouvert une PR.
