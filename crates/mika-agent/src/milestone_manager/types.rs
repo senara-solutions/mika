@@ -380,8 +380,12 @@ mod tests {
         assert!(!out.contains(r#""flight_verdicts":null"#), "jamais null");
     }
 
-    /// Et un verdict non vide fait l'aller-retour sans perdre les deux data que
-    /// le vol 1 laisse non instrumentées.
+    /// Et un verdict non vide fait l'aller-retour sans perdre ses absences.
+    ///
+    /// Le cas construit ici est celui d'un résultat **antérieur** à la ligne
+    /// `Turn ceiling:` du producteur (mika#2698 vol 2) : plafond non lu,
+    /// pourtant halte au plafond. Le `null` doit survivre — il dit « non
+    /// instrumenté », là où un `0` dirait « mesuré à zéro » (motif mika#2331).
     #[test]
     fn mika2698_un_verdict_fait_laller_retour() {
         use super::super::evaluator::{

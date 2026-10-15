@@ -1,15 +1,16 @@
 //! Evaluator — le verdict du manager sur chaque vol d'implémentation terminé
-//! (mika#2698, Phase 2 (b), **vol 1**).
+//! (mika#2698, Phase 2 (b)).
 //!
 //! LECTURE SEULE, et à un degré plus fort que le reste du module : ce fichier
 //! n'a pas d'interrupteur d'écriture OFF, il n'a **aucun chemin d'écriture du
-//! tout**. Le verdict qu'il produit a exactement une destination —
-//! [`super::types::Assessment::flight_verdicts`], que le `Reporter` rend dans le
-//! rapport. C'est ce que le ticket appelle le *mode ombre*, et au vol 1 c'est
-//! une propriété structurelle, pas une configuration : `MIKA_MANAGER_EVALUATE_WRITE`
-//! n'est pas déclarée ici, parce qu'un interrupteur dont la branche ON ne fait
-//! rien est un mensonge de surface. L'écriture (`gh issue comment`, idempotence
-//! par checkpoint, exception nommée dans l'allowlist) est le vol 2.
+//! tout**. Le verdict qu'il produit a deux destinations possibles, et une seule
+//! par défaut : [`super::types::Assessment::flight_verdicts`], que le `Reporter`
+//! rend dans le rapport — c'est le *mode ombre* du ticket. La seconde,
+//! `MIKA_MANAGER_EVALUATE_WRITE` ouverte, est le commentaire que
+//! [`super::verdict_write`] poste sur le ticket ; l'interrupteur, le geste et
+//! l'exception nommée dans l'allowlist vivent là-bas, **pas ici**. Un évaluateur
+//! qui porterait son propre interrupteur d'écriture pourrait écrire : celui-ci
+//! ne peut pas.
 //!
 //! # Ce que l'évaluateur lit, et ce qu'il ne lit pas
 //!
@@ -21,18 +22,26 @@
 //! | issue du vol (PR / sauvetage / mort) | les lignes `Outcome:` / `PIPELINE FAILURE:` / `Halt class:` de `tasks.result`, écrites par `dispatch-lib.sh` |
 //! | numéro et URL de la PR | `tasks.metadata.claude_pilot.pr_number` / `.pr_url`, sinon la ligne `PR: <url>` |
 //! | tours consommés | `tasks.metadata.claude_pilot.turns`, sinon la ligne `Turns: N` |
+//! | plafond de tours | la ligne `Turn ceiling: N` de `tasks.result` (mika#2698 vol 2) |
 //! | état de la PR | [`SubIssue::pr_state`] — déjà hydraté par le `Reader` via `gh`, aucun appel de plus |
 //!
-//! **Le plafond de tours, lui, n'est pas lisible ici.** `tasks.result` porte
-//! `Turns: N` mais jamais la borne, et `_pilot_max_turns` /
+//! **Le plafond est lu, jamais recalculé.** `_pilot_max_turns` /
 //! `PILOT_LABEL_TURN_CEILINGS` (`skills/bundled/_shared/dispatch-lib.sh`)
 //! déclarent un lecteur unique : le dupliquer en Rust serait le second lecteur
-//! que cette déclaration refuse. Donc [`FlightVerdict::turn_ceiling`] est
-//! **toujours `None`** au vol 1, et [`FlightVerdict::hit_ceiling`] dit seulement
-//! si la halte `budget_exhausted` a eu lieu. `None` veut dire *non instrumenté*,
-//! jamais `0` (motif mika#2331) — même règle pour
-//! [`FlightVerdict::last_commit_turn`], que le vol 2 branchera sur le
-//! transcript.
+//! que cette déclaration refuse. Le vol 2 a donc fait écrire la valeur par le
+//! **producteur**, à côté de `Turns:`, et ce module la lit comme il lit tout le
+//! reste. Un dispatch désarmé écrit `Turn ceiling: unbounded` — qui ne parse
+//! pas, donc rend `None`, qui est la lecture juste : il n'y avait pas de borne.
+//!
+//! **Le tour du dernier commit, lui, reste non instrumenté.**
+//! [`FlightVerdict::last_commit_turn`] est **toujours `None`** : aucune des
+//! sources que le ticket autorise ne le porte. `tasks.result` donne les commits
+//! par sha (`Commits: <pre>..<post>`) et jamais par tour, et le JSON de sortie
+//! du pilote n'expose que `turns` / `cost_usd` / `duration_ms` /
+//! `session_id` — le dériver demanderait de parser le transcript de session
+//! dans un format qu'aucun test de ce dépôt ne pin, donc de deviner. `None` dit
+//! *non instrumenté*, jamais `0` (motif mika#2331), et le rapport le dit à voix
+//! haute plutôt que de laisser un chiffre inventé passer pour une mesure.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -108,10 +117,13 @@ pub struct FlightVerdict {
     pub turns_used: Option<u32>,
     /// Vrai quand le vol a heurté `budget_exhausted`.
     pub hit_ceiling: bool,
-    /// Le plafond lui-même. **Toujours `None` au vol 1** — voir le docstring du
-    /// module : son lecteur unique est en shell.
+    /// Le plafond lui-même, **lu** dans la ligne `Turn ceiling:` que le
+    /// producteur écrit (mika#2698 vol 2), jamais recalculé ici : le lecteur
+    /// unique de `PILOT_LABEL_TURN_CEILINGS` est en shell. `None` = résultat
+    /// antérieur à cette ligne, ou dispatch sans borne (`unbounded`).
     pub turn_ceiling: Option<u32>,
-    /// Tour du dernier commit. **Toujours `None` au vol 1** (vol 2 : transcript).
+    /// Tour du dernier commit. **Toujours `None`** — aucune source autorisée ne
+    /// le porte ; voir le docstring du module.
     pub last_commit_turn: Option<u32>,
     pub recommendation: FlightRecommendation,
     /// ISO 8601 UTC — `tasks.completed_at`.
@@ -208,10 +220,14 @@ pub fn evaluate_flight(
             line_value(result, "Turns:").and_then(|v| v.split_whitespace().next()?.parse().ok())
         }),
         hit_ceiling: hit_ceiling(result),
-        // Les deux data que le vol 1 n'a pas : plafond (lecteur unique en shell)
-        // et tour du dernier commit (transcript). Présent-et-`None` dit
-        // « non instrumenté » ; `0` dirait « mesuré à zéro » (motif mika#2331).
-        turn_ceiling: None,
+        // mika#2698 vol 2 — le plafond vient du producteur, qui est le lecteur
+        // unique de `PILOT_LABEL_TURN_CEILINGS`. `Turn ceiling: unbounded` (le
+        // dispatch désarmé) ne parse pas, donc rend `None` : c'est la lecture
+        // juste, il n'y avait pas de borne.
+        turn_ceiling: line_value(result, "Turn ceiling:").and_then(|v| v.parse().ok()),
+        // Le seul datum du verdict qu'aucune source n'offre encore — voir le
+        // docstring du module. Présent-et-`None` dit « non instrumenté » ; `0`
+        // dirait « mesuré à zéro » (motif mika#2331).
         last_commit_turn: None,
         completed_at: flight.completed_at.clone(),
     }
@@ -396,6 +412,7 @@ mod tests {
             result: Some(
                 "Session: 5b6f13dc\n\
                  Turns: 83\n\
+                 Turn ceiling: 150\n\
                  PR: https://github.com/senara-solutions/mika/pull/2696\n\
                  Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2696\n"
                     .to_string(),
@@ -420,6 +437,7 @@ mod tests {
                 "PIPELINE FAILURE: dirty worktree with zero commits\n\
                  Session: 7c1a\n\
                  Turns: 141\n\
+                 Turn ceiling: 200\n\
                  PR: https://github.com/senara-solutions/mika/pull/2690\n\
                  Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n"
                     .to_string(),
@@ -440,6 +458,7 @@ mod tests {
                 "PIPELINE FAILURE: pilot halted\n\
                  Session: 9f2b\n\
                  Turns: 200\n\
+                 Turn ceiling: 200\n\
                  Halt class: budget_exhausted — deterministic\n\
                  Retry hint: deterministic — a replay will halt identically\n\
                  Commits: 0\n\
@@ -526,17 +545,57 @@ mod tests {
     }
 
     #[test]
-    fn mika2698_le_plafond_et_le_tour_du_dernier_commit_sont_non_instrumentes() {
-        // Le lecteur unique du plafond est en shell (`_pilot_max_turns`), et le
-        // tour du dernier commit vient du transcript : les deux sont vol 2.
-        // `None` dit « non mesuré » — un `0` dirait « mesuré à zéro ».
+    fn mika2698_le_plafond_vient_de_la_ligne_du_producteur() {
+        // Les trois issues de l'AC3, avec le plafond lu sur chacune : c'est
+        // `tours consommés SUR LE PLAFOND` qui devient lisible, et la paire
+        // 200/200 du troisième fixture est la seule forme où « 200 tours » se
+        // laisse vérifier au lieu d'être crue.
+        for (f, expected) in [
+            (fixture_pr_opened(), 150u32),
+            (fixture_rescue_pr(), 200),
+            (fixture_dead_at_ceiling(), 200),
+        ] {
+            let v = evaluate_flight(&f, None, None);
+            assert_eq!(v.turn_ceiling, Some(expected), "{}", f.task_id);
+        }
+    }
+
+    #[test]
+    fn mika2698_un_dispatch_desarme_na_pas_de_plafond_plutot_que_zero() {
+        // `Turn ceiling: unbounded` est ce que le producteur écrit quand
+        // `_pilot_max_turns` ne pose rien. Ne pas parser est la bonne réponse :
+        // il n'y avait pas de borne, et `0` dirait « borne à zéro tour ».
+        let mut f = fixture_pr_opened();
+        f.result = Some("Turns: 83\nTurn ceiling: unbounded\n".to_string());
+        assert_eq!(evaluate_flight(&f, None, None).turn_ceiling, None);
+    }
+
+    #[test]
+    fn mika2698_un_resultat_anterieur_au_producteur_na_pas_de_plafond() {
+        // Les vols terminés AVANT que `dispatch-lib.sh` n'écrive la ligne
+        // existent en base et seront évalués. Leur plafond est inconnu, pas
+        // nul — sans quoi le premier cycle après déploiement rendrait une
+        // colonne de `0/0 tours` sur tout l'historique.
+        let mut f = fixture_dead_at_ceiling();
+        f.result = Some(f.result.unwrap().replace("Turn ceiling: 200\n", ""));
+        let v = evaluate_flight(&f, None, None);
+        assert_eq!(v.turn_ceiling, None);
+        assert!(v.hit_ceiling, "la halte reste lisible sans le plafond");
+    }
+
+    #[test]
+    fn mika2698_le_tour_du_dernier_commit_reste_non_instrumente() {
+        // Aucune source autorisée par le ticket ne le porte : `tasks.result`
+        // donne les commits par sha, et le JSON du pilote n'expose que
+        // turns/cost/duration/session. `None` dit « non mesuré » — un `0`
+        // dirait « mesuré à zéro » (motif mika#2331). Voir le docstring du
+        // module : c'est une absence tenue, pas un oubli.
         for f in [
             fixture_pr_opened(),
             fixture_rescue_pr(),
             fixture_dead_at_ceiling(),
         ] {
             let v = evaluate_flight(&f, None, None);
-            assert_eq!(v.turn_ceiling, None, "{}", f.task_id);
             assert_eq!(v.last_commit_turn, None, "{}", f.task_id);
         }
     }

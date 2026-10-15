@@ -23,9 +23,10 @@
 use super::{
     assessor::{Assessor, AssessorConfig},
     evaluator::{FlightSource, FlightVerdict, evaluate_flights, milestone_issue_urls},
-    reader::Reader,
+    reader::{GhRunner, ProcessGhRunner, Reader},
     reporter::Reporter,
     types::{Assessment, CycleOutcome, MilestoneRef, MilestoneState, Severity},
+    verdict_write,
 };
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
 use anyhow::Result;
@@ -156,6 +157,16 @@ pub struct MilestoneCheckpoint {
     pub last_delivered_at: Option<String>,
     /// ISO 8601 UTC of the last observed milestone state.
     pub last_observed_at: Option<String>,
+    /// `tasks.id` des vols dont le verdict a déjà été commenté (mika#2698 vol
+    /// 2, AC2). `#[serde(default)]` parce qu'un checkpoint écrit au vol 1 n'a
+    /// pas ce champ et doit continuer à se charger — un checkpoint illisible
+    /// vaut un cycle qui redélivre tout.
+    ///
+    /// `last_observed_at` ne suffit pas : il n'avance que quand l'activité du
+    /// milestone avance, donc deux cycles consécutifs peuvent voir la **même**
+    /// fenêtre de vols. La liste est bornée côté `verdict_write`.
+    #[serde(default)]
+    pub commented_flights: Vec<String>,
 }
 
 // ---- mika#1949 U3 — the manager delivery boundary -------------------------
@@ -443,6 +454,17 @@ pub struct CycleContext<'a> {
     /// câblée, et le rapport est alors identique à celui d'avant mika#2698 :
     /// aucun verdict, donc pas de section.
     pub flight_source: Option<&'a Arc<dyn FlightSource>>,
+    /// Par où passe le seul geste d'écriture (mika#2698 vol 2). `None` = non
+    /// câblé, et alors rien ne peut être posté quel que soit l'interrupteur.
+    pub gh_runner: Option<&'a Arc<dyn GhRunner>>,
+    /// `MIKA_MANAGER_EVALUATE_WRITE`, résolu **hors** du corps du cycle.
+    ///
+    /// La valeur voyage dans le contexte plutôt que d'être lue ici : un
+    /// `std::env::set_var` est `unsafe` en edition 2024 et se course entre
+    /// tests parallèles, donc un cycle qui lirait l'environnement lui-même ne
+    /// serait testable sur aucune de ses deux branches. Le défaut est `false`,
+    /// comme l'interrupteur.
+    pub evaluate_write: bool,
 }
 
 impl<'a> CycleContext<'a> {
@@ -453,6 +475,8 @@ impl<'a> CycleContext<'a> {
             auth_ledger: None,
             auth_notes: &[],
             flight_source: None,
+            gh_runner: None,
+            evaluate_write: false,
         }
     }
 
@@ -471,6 +495,18 @@ impl<'a> CycleContext<'a> {
 
     pub fn with_flight_source(mut self, source: Option<&'a Arc<dyn FlightSource>>) -> Self {
         self.flight_source = source;
+        self
+    }
+
+    /// Par où le geste d'écriture passe, s'il passe (mika#2698 vol 2).
+    pub fn with_gh_runner(mut self, runner: Option<&'a Arc<dyn GhRunner>>) -> Self {
+        self.gh_runner = runner;
+        self
+    }
+
+    /// L'état de `MIKA_MANAGER_EVALUATE_WRITE` pour ce cycle.
+    pub fn with_evaluate_write(mut self, enabled: bool) -> Self {
+        self.evaluate_write = enabled;
         self
     }
 }
@@ -535,8 +571,9 @@ pub async fn run_manager_cycle_in(
         silence_threshold_days: cfg.silence_threshold_days,
     });
     let mut assessment = assessor.assess(&state);
-    // mika#2698 vol 1 — mode ombre. Le verdict entre dans l'assessment, donc
-    // dans le rapport, et nulle part ailleurs.
+    // mika#2698 — mode ombre : le verdict entre dans l'assessment, donc dans le
+    // rapport. Interrupteur ouvert (vol 2), il va **aussi** en commentaire ;
+    // cette destination-là reste la seule, et elle est décidée plus bas.
     assessment.flight_verdicts = collect_flight_verdicts(ctx, &state, checkpoint.as_ref()).await;
     let severity = assessment.severity.clone();
     let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
@@ -646,11 +683,46 @@ pub async fn run_manager_cycle_in(
             }
         }
 
+        // mika#2698 vol 2 — le seul geste d'écriture du manager, et il est ici
+        // plutôt que juste après `collect_flight_verdicts` pour une raison : la
+        // mémoire d'idempotence voyage dans le checkpoint, et le checkpoint ne
+        // s'écrit que sur livraison. Poster en dehors de cette branche
+        // laisserait le commentaire posé et la mémoire non persistée — donc un
+        // doublon au cycle suivant.
+        //
+        // Ordre : poster, puis persister ce qui est **effectivement** parti.
+        // L'inverse (persister d'abord) perdrait le verdict pour de bon si le
+        // `gh` échouait. Il n'y a pas de transaction entre GitHub et un fichier
+        // JSON, et des deux risques, le doublon est celui qui se rattrape.
+        let previously_commented = checkpoint
+            .as_ref()
+            .map(|c| c.commented_flights.clone())
+            .unwrap_or_default();
+        let pending = verdict_write::comments_to_post(
+            &assessment.flight_verdicts,
+            &previously_commented,
+            ctx.evaluate_write,
+        );
+        let newly_commented = match ctx.gh_runner {
+            Some(runner) if !pending.is_empty() => {
+                verdict_write::post_verdict_comments(runner.as_ref(), &cfg.target.repo, &pending)
+                    .await
+            }
+            // Interrupteur fermé, aucun vol à commenter, ou runner non câblé :
+            // `pending` est déjà vide dans les deux premiers cas, et le
+            // troisième ne peut rien poster — dans tous, zéro appel `gh`.
+            _ => Vec::new(),
+        };
+
         // Persist checkpoint on delivery.
         let new_checkpoint = MilestoneCheckpoint {
             state_digest: digest,
             last_delivered_at: Some(generated_at.clone()),
             last_observed_at: state.last_activity_at.clone(),
+            commented_flights: verdict_write::remember_commented(
+                &previously_commented,
+                &newly_commented,
+            ),
         };
         save_checkpoint(&cfg.checkpoint_dir, &cfg.target, &new_checkpoint).await?;
     }
@@ -783,10 +855,19 @@ pub async fn run_manager_cycle_with_auth(
     // M4 review fix: honour the health_url config surface.
     state.executor_healthy = probe_executor_health(cfg.health_url.as_deref()).await;
     let deliverer = HttpReportDeliverer::new();
+    // mika#2698 vol 2 — l'interrupteur est résolu ici, une fois par cycle, et
+    // sa valeur descend par le contexte : le corps du cycle ne lit jamais
+    // l'environnement lui-même (voir `CycleContext::evaluate_write`). Le runner
+    // est câblé inconditionnellement parce que, interrupteur fermé, aucun
+    // commentaire n'est décidé — l'autorisation vient de l'interrupteur, pas de
+    // la présence du runner.
+    let gh_runner: Arc<dyn GhRunner> = Arc::new(ProcessGhRunner::new(cfg.github_token.clone()));
     let ctx = CycleContext::new(&deliverer, Utc::now())
         .with_auth_ledger(auth_ledger)
         .with_auth_notes(auth_notes)
-        .with_flight_source(flight_source);
+        .with_flight_source(flight_source)
+        .with_gh_runner(Some(&gh_runner))
+        .with_evaluate_write(verdict_write::evaluate_write_enabled());
     run_manager_cycle_in(cfg, state, &ctx).await
 }
 
@@ -1636,5 +1717,223 @@ mod tests {
         );
         let calls = rec.calls.lock().unwrap();
         assert!(calls[0].2.assessment.flight_verdicts.is_empty());
+    }
+
+    // -- mika#2698 vol 2 : l'interrupteur d'écriture, de bout en bout --------
+
+    /// Le journal des appels `gh` : un `Vec` par appel, propriétaire, pour que
+    /// le test lise les arguments **tels qu'ils seraient passés au processus**.
+    type GhCalls = Arc<Mutex<Vec<Vec<String>>>>;
+
+    /// Un `gh` qui n'exécute rien et enregistre tout.
+    ///
+    /// C'est le seul instrument capable de distinguer « l'interrupteur est
+    /// fermé » de « l'interrupteur est ouvert et le geste a échoué en
+    /// silence » : les deux rendent un cycle identique et un rapport
+    /// identique. Zéro appel contre un appel, c'est la mesure (classe
+    /// mika#2205).
+    struct RecordingGhRunner {
+        calls: GhCalls,
+    }
+
+    impl RecordingGhRunner {
+        fn wired() -> (Arc<dyn GhRunner>, GhCalls) {
+            let calls: GhCalls = Arc::new(Mutex::new(Vec::new()));
+            let runner: Arc<dyn GhRunner> = Arc::new(Self {
+                calls: calls.clone(),
+            });
+            (runner, calls)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for RecordingGhRunner {
+        async fn run(&self, args: &[&str]) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            Ok(String::new())
+        }
+    }
+
+    /// **AC1, forme nominale.** Interrupteur fermé, avec un verdict bien présent
+    /// dans le rapport : aucun appel `gh` d'écriture.
+    ///
+    /// Le point du test est dans sa seconde assertion, pas la première. Un
+    /// cycle qui n'aurait rien eu à commenter passerait aussi — ce test exige
+    /// donc qu'un verdict ait **réellement** été produit. C'est ce qui le
+    /// distingue d'une tautologie : l'écriture était à portée, et elle n'a pas
+    /// eu lieu.
+    #[tokio::test]
+    async fn mika2698_interrupteur_ferme_aucun_appel_gh_decriture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let (source, _asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
+        let (runner, gh_calls) = RecordingGhRunner::wired();
+
+        run_manager_cycle_in(
+            &cfg,
+            base_state(),
+            // `gh_runner` est câblé, `evaluate_write` laissé à son défaut : la
+            // branche OFF est celle du défaut, pas celle d'un câblage manquant.
+            &CycleContext::new(&rec, now)
+                .with_flight_source(Some(&source))
+                .with_gh_runner(Some(&runner)),
+        )
+        .await
+        .unwrap();
+
+        let verdicts_rendus = rec.calls.lock().unwrap()[0]
+            .2
+            .assessment
+            .flight_verdicts
+            .len();
+        assert_eq!(
+            verdicts_rendus, 1,
+            "précondition du test : un verdict existe, donc l'écriture était à portée"
+        );
+        let gh = gh_calls.lock().unwrap().clone();
+        assert!(
+            gh.is_empty(),
+            "AC1 : interrupteur OFF ⇒ zéro appel gh, trouvé : {gh:?}"
+        );
+        let saved = load_checkpoint(&cfg.checkpoint_dir, &cfg.target)
+            .await
+            .expect("le checkpoint est écrit");
+        assert!(
+            saved.commented_flights.is_empty(),
+            "rien n'a été posté, donc rien n'est retenu comme posté"
+        );
+    }
+
+    /// **AC2.** Interrupteur ouvert : exactement un commentaire par vol, et le
+    /// rejeu du cycle n'en poste pas un second.
+    ///
+    /// Les deux cycles voient le **même** vol — la source double le rend quelle
+    /// que soit la borne `since` — ce qui est précisément le cas que
+    /// l'idempotence doit couvrir : `last_observed_at` n'avance que quand
+    /// l'activité du milestone avance, donc deux cycles consécutifs peuvent
+    /// légitimement voir la même fenêtre.
+    #[tokio::test]
+    async fn mika2698_interrupteur_ouvert_un_seul_commentaire_par_vol_et_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let (source, _asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
+        let (runner, gh_calls) = RecordingGhRunner::wired();
+
+        for h in [12, 19] {
+            let now = Utc.with_ymd_and_hms(2026, 8, 21, h, 0, 0).unwrap();
+            run_manager_cycle_in(
+                &cfg,
+                base_state(),
+                &CycleContext::new(&rec, now)
+                    .with_flight_source(Some(&source))
+                    .with_gh_runner(Some(&runner))
+                    .with_evaluate_write(true),
+            )
+            .await
+            .unwrap();
+        }
+
+        let calls = gh_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "AC2 : un vol, un commentaire — même sur deux cycles : {calls:?}"
+        );
+        assert_eq!(
+            &calls[0][..3],
+            &[
+                "issue".to_string(),
+                "comment".to_string(),
+                "1802".to_string()
+            ],
+            "l'argv est celle du geste déclaré dans `verdict_write.rs`, suivie du \
+             ticket du vol — le jeton lui-même ne vit que là-bas, c'est tout \
+             l'objet de l'exception nommée"
+        );
+        assert!(
+            calls[0].contains(&"senara-solutions/mika".to_string()),
+            "le dépôt vient de la cible du manager, pas d'un checkout : {:?}",
+            calls[0]
+        );
+        let body = calls[0].last().expect("le corps est le dernier argument");
+        assert!(
+            body.contains("<!-- mika-manager:verdict:task-1802 -->"),
+            "le corps porte le marqueur du vol : {body}"
+        );
+        assert!(
+            body.contains("merge-candidat"),
+            "le corps porte le verdict : {body}"
+        );
+
+        let saved = load_checkpoint(&cfg.checkpoint_dir, &cfg.target)
+            .await
+            .expect("le checkpoint est écrit");
+        assert_eq!(
+            saved.commented_flights,
+            vec!["task-1802".to_string()],
+            "la mémoire d'idempotence est dans le checkpoint"
+        );
+    }
+
+    /// Interrupteur ouvert mais **aucun runner câblé** : zéro appel, et surtout
+    /// aucune panique. La configuration est incohérente ; le cycle n'en meurt
+    /// pas, et il ne retient rien comme posté.
+    #[tokio::test]
+    async fn mika2698_interrupteur_ouvert_sans_runner_ne_poste_rien() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let (source, _asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
+
+        run_manager_cycle_in(
+            &cfg,
+            base_state(),
+            &CycleContext::new(&rec, now)
+                .with_flight_source(Some(&source))
+                .with_evaluate_write(true),
+        )
+        .await
+        .unwrap();
+
+        let saved = load_checkpoint(&cfg.checkpoint_dir, &cfg.target)
+            .await
+            .expect("le checkpoint est écrit");
+        assert!(saved.commented_flights.is_empty());
+    }
+
+    /// Un checkpoint écrit au vol 1 — sans le champ `commented_flights` — doit
+    /// continuer à se charger.
+    ///
+    /// Sans le `#[serde(default)]`, le chargement échouerait, `load_checkpoint`
+    /// rendrait `None`, et le cycle relirait tous les vols **et** reposterait
+    /// tout : une migration de format silencieuse qui se paie en doublons.
+    #[tokio::test]
+    async fn mika2698_un_checkpoint_du_vol_1_se_charge_encore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        tokio::fs::create_dir_all(&cfg.checkpoint_dir)
+            .await
+            .unwrap();
+        let ancien = r#"{"state_digest":"abc","last_delivered_at":"2026-08-20T00:00:00Z","last_observed_at":"2026-08-20T00:00:00Z"}"#;
+        let path = cfg
+            .checkpoint_dir
+            .join(format!("{}.json", cfg.target.slug()));
+        tokio::fs::write(&path, ancien).await.unwrap();
+
+        let loaded = load_checkpoint(&cfg.checkpoint_dir, &cfg.target)
+            .await
+            .expect("un checkpoint du vol 1 reste lisible");
+        assert_eq!(loaded.state_digest, "abc");
+        assert!(
+            loaded.commented_flights.is_empty(),
+            "champ absent ⇒ liste vide, jamais un échec de chargement"
+        );
     }
 }

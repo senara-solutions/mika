@@ -111,6 +111,12 @@ pub use super::sink_dir::ENV_OFFLINE_SINK_DIR;
 // scanne tout le répertoire, donc la déclaration reste couverte où qu'elle vive.
 pub use super::liveness::ENV_LIVENESS_URL;
 
+// `ENV_EVALUATE_WRITE` vit dans `verdict_write.rs` depuis mika#2698 vol 2, même
+// règle : la constante appartient au fichier qui possède le canal qu'elle
+// ouvre — ici le seul geste d'écriture du module, et le seul fichier que
+// l'allowlist de `no_dispatch_test.rs` nomme.
+pub use super::verdict_write::ENV_EVALUATE_WRITE;
+
 /// Default heartbeat interval in seconds (6 hours per brief § verdict 2).
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: i64 = 21_600;
 /// Default silence threshold in days (per brief § verdict 5).

@@ -512,19 +512,26 @@ fn flight_issue_label(issue: &FlightIssue) -> String {
     }
 }
 
-/// Les tours, et ce qu'on sait du plafond.
+/// Les tours **sur le plafond**, et ce qu'on sait de l'un comme de l'autre.
 ///
-/// `(plafond non instrumenté)` est dit à voix haute quand le vol n'a pas heurté
-/// la borne : sans cette mention, « 83 tours » se lirait comme « 83 tours sur un
-/// plafond que le manager connaît », ce qui est faux au vol 1. Quand la halte
-/// `budget_exhausted` a eu lieu, la mention tombe — l'issue dit déjà que la
-/// borne a été atteinte.
+/// C'est la formulation que le ticket demande (« tours consommés sur le
+/// plafond ») et, depuis que le producteur écrit la borne (mika#2698 vol 2),
+/// elle est tenable : `83/150 tours`.
+///
+/// Quand le plafond manque — résultat écrit par un dispatch antérieur à cette
+/// ligne, ou dispatch sans borne — la mention `(plafond non instrumenté)` est
+/// dite à voix haute : sans elle, « 83 tours » se lirait comme « 83 tours sur
+/// un plafond que le manager connaît », et ce serait faux. Elle tombe quand la
+/// halte `budget_exhausted` a eu lieu : l'issue dit déjà que la borne a été
+/// atteinte, nommer son absence par-dessus serait contradictoire.
 fn flight_turns_label(v: &FlightVerdict) -> String {
-    match (v.turns_used, v.hit_ceiling) {
-        (Some(n), true) => format!("{n} tours"),
-        (Some(n), false) => format!("{n} tours (plafond non instrumenté)"),
-        (None, true) => "tours non lus".to_string(),
-        (None, false) => "tours non lus (plafond non instrumenté)".to_string(),
+    match (v.turns_used, v.turn_ceiling, v.hit_ceiling) {
+        (Some(n), Some(c), _) => format!("{n}/{c} tours"),
+        (None, Some(c), _) => format!("tours non lus (plafond {c})"),
+        (Some(n), None, true) => format!("{n} tours"),
+        (Some(n), None, false) => format!("{n} tours (plafond non instrumenté)"),
+        (None, None, true) => "tours non lus".to_string(),
+        (None, None, false) => "tours non lus (plafond non instrumenté)".to_string(),
     }
 }
 
@@ -738,6 +745,62 @@ mod tests {
         assert!(
             !out.contains("— 0 tours"),
             "une mesure absente ne devient jamais zéro (motif mika#2331). Obtenu :\n{out}"
+        );
+    }
+
+    /// Depuis que le producteur écrit la ligne `Turn ceiling:` (mika#2698 vol
+    /// 2), le plafond est lu : les tours se rendent **sur** lui, comme le
+    /// ticket le demande. Les deux bras instrumentés n'avaient aucun test —
+    /// `83/150 tours` et le cas où seul le plafond est connu.
+    #[test]
+    fn mika2698_les_tours_se_rendent_sur_le_plafond_quand_il_est_lu() {
+        let mut v = verdict(
+            Some(2693),
+            FlightIssue::PrOpened {
+                number: Some(2696),
+                url: None,
+            },
+            Some(83),
+            false,
+            FlightRecommendation::MergeCandidate,
+        );
+        v.turn_ceiling = Some(150);
+        let out = report_with_verdicts(vec![v]);
+        assert!(
+            out.contains("- #2693 — PR ouverte (#2696) — 83/150 tours — merge-candidat"),
+            "Obtenu :\n{out}"
+        );
+        assert!(
+            !out.contains("plafond non instrumenté"),
+            "le plafond est lu : la mention d'absence ne doit plus paraître. Obtenu :\n{out}"
+        );
+    }
+
+    /// Le plafond lu et les tours absents : chaque mesure se dit pour
+    /// elle-même, et l'absence ne se comble pas avec le plafond.
+    #[test]
+    fn mika2698_un_plafond_lu_sans_tours_dit_les_deux() {
+        let mut v = verdict(
+            Some(2661),
+            FlightIssue::Dead {
+                cause: DeathCause::CeilingReached,
+            },
+            None,
+            true,
+            FlightRecommendation::Regroom,
+        );
+        v.turn_ceiling = Some(200);
+        let out = report_with_verdicts(vec![v]);
+        assert!(
+            out.contains(
+                "- #2661 — mort au plafond (budget_exhausted) — tours non lus (plafond 200) \
+                 — re-groom"
+            ),
+            "Obtenu :\n{out}"
+        );
+        assert!(
+            !out.contains("— 200 tours"),
+            "un plafond n'est pas un compte de tours (motif mika#2331). Obtenu :\n{out}"
         );
     }
 

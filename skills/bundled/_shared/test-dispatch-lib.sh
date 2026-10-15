@@ -7662,7 +7662,11 @@ _mika2542_unargumented_calls() {
 # Puis de 5 à 6 (mika#2693, revue) : le finding synthétique du rattrapage rend
 # la même règle que le groom, donc il lui faut le même plafond, par le même
 # résolveur.
-assert_eq "mika#2542 (AC10): le scan voit exactement six appels du résolveur" "6" \
+# Puis de 6 à 7 le 2026-10-15 (mika#2698) : le callback écrit le plafond dans
+# `tasks.result` pour que le manager de milestone puisse juger « tours consommés
+# sur le plafond », et cette écriture passe par le résolveur comme les six
+# autres — c'est tout l'intérêt, le lecteur de la table reste unique.
+assert_eq "mika#2542 (AC10): le scan voit exactement sept appels du résolveur" "7" \
     "$(_mika2542_resolver_calls "$DISPATCH_LIB" | wc -l | tr -d ' ')"
 assert_eq "mika#2542 (AC10): chaque appel du résolveur passe \"\${LABELS:-}\"" "" \
     "$(_mika2542_unargumented_calls "$DISPATCH_LIB" | cut -c1-100)"
@@ -13322,6 +13326,37 @@ assert_eq "mika#2641 (R-b): le prompt correctif a une définition unique" \
 M2641_HELPER_CALLS=$(grep -cE '\$\(_second_pass_retry_prompt\)' "$DISPATCH_LIB" || true)
 assert_eq "mika#2641 (R-b): les deux sites de seconde passe l'appellent" \
     "2" "$M2641_HELPER_CALLS"
+
+# --- mika#2698 : le plafond de tours descend par le résultat ----------------
+#
+# Le manager de milestone juge « tours consommés sur le plafond » en lisant
+# `tasks.result`. Les tours y étaient ; la borne, non. Elle ne peut pas être
+# relue en Rust — `PILOT_LABEL_TURN_CEILINGS` se déclare à lecteur unique — donc
+# c'est le producteur qui l'écrit, et ces assertions sont ce qui l'y maintient.
+
+# R-1 : la ligne accompagne les tours PARTOUT. Un seul des trois sites qui la
+# perdrait donnerait un verdict « 200 tours (plafond non instrumenté) » sur
+# précisément la population où le plafond compte le plus — les morts au plafond
+# passent par `_classify_terminated_session`, pas par le chemin nominal.
+T2698_TURNS_LINES=$(grep -cE '^Turns: \$\{TURNS:-unknown\}' "$DISPATCH_LIB" || true)
+T2698_CEILING_LINES=$(grep -cE '^Turn ceiling: \$\{TURN_CEILING:-unbounded\}' "$DISPATCH_LIB" || true)
+assert_eq "mika#2698: chaque ligne Turns: du résultat est suivie d'un Turn ceiling:" \
+    "$T2698_TURNS_LINES" "$T2698_CEILING_LINES"
+
+# R-2 : `unbounded`, jamais `unknown`. Les deux mots disent des choses
+# différentes — `unknown` serait « il y a une borne et je ne la connais pas »,
+# et le dispatch désarmé n'a réellement PAS de borne (cf. la note de
+# `_pilot_max_turns`). Le Rust rend `None` sur les deux, mais l'opérateur qui lit
+# le résultat brut, non.
+assert_eq "mika#2698: un dispatch désarmé se lit unbounded, pas unknown" "" \
+    "$(grep -nE '^Turn ceiling:.*unknown' "$DISPATCH_LIB" || true)"
+
+# R-3 : `TURN_CEILING` est posé par une lecture CO-LOCALISÉE de
+# `$_PILOT_MAX_TURNS` (garde mika#2496, même mécanisme), et par une seule — un
+# second site poserait la question de savoir lequel a gagné.
+T2698_CEILING_SETS=$(grep -cE '_pilot_max_turns [^;]*; TURN_CEILING=' "$DISPATCH_LIB" || true)
+assert_eq "mika#2698: TURN_CEILING a un seul écrivain, co-localisé avec le résolveur" \
+    "1" "$T2698_CEILING_SETS"
 
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0

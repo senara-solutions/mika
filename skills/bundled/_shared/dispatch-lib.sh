@@ -4499,6 +4499,16 @@ _run_claude_pilot() {
     # mika#2165: --log-dir is VALUED, not bare. Bare, it fell through to
     # claude-pilot's own Python `const`, which no override here could move and
     # which the bind could therefore never be guaranteed to cover.
+    # mika#2698: le plafond, figé AVANT le lancement pour le callback. Le
+    # manager de milestone lit « tours consommés sur le plafond » dans
+    # `tasks.result` (`crates/mika-agent/src/milestone_manager/evaluator.rs`) et
+    # n'a aucun moyen de connaître la borne : `PILOT_LABEL_TURN_CEILINGS` se
+    # déclare à LECTEUR UNIQUE (note l. 726), donc la redupliquer en Rust serait
+    # le second lecteur que cette déclaration refuse. La valeur descend donc par
+    # le résultat, écrite ici — co-localisée comme toute lecture de
+    # `$_PILOT_MAX_TURNS` (garde mika#2496), et posée avant le run pour qu'un
+    # chemin de halte précoce la trouve déjà en place.
+    _pilot_max_turns "${LABELS:-}"; TURN_CEILING="${_PILOT_MAX_TURNS:-}"
     # mika#2496: `--max-turns` is resolved on THIS line (co-location, as for
     # `--log-dir`) and expands to nothing when the budget is disarmed.
     _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
@@ -4581,6 +4591,7 @@ _run_claude_pilot() {
         RESULT="claude-pilot completed (status: ${STATUS}).
 Session: ${SESSION_ID:-unknown}
 Turns: ${TURNS:-unknown}
+Turn ceiling: ${TURN_CEILING:-unbounded}
 Cost: \$${COST:-unknown}
 Duration: ${DURATION:-unknown}ms"
 
@@ -5171,6 +5182,7 @@ Retry hint: ${halt_hint} — $(_halt_hint_meaning "$halt_hint")"
 
 Session: ${SESSION_ID:-unknown}
 Turns: ${TURNS:-unknown}
+Turn ceiling: ${TURN_CEILING:-unbounded}
 Duration: ${DURATION:-unknown}ms
 ${cause}
 ${halt_lines}
@@ -5182,6 +5194,7 @@ Commits: ${PRE_RUN_HEAD:-unknown}..${POST_RUN_HEAD:-unknown}"
 
 Session: ${SESSION_ID:-unknown}
 Turns: ${TURNS:-unknown}
+Turn ceiling: ${TURN_CEILING:-unbounded}
 Duration: ${DURATION:-unknown}ms
 ${cause}
 ${halt_lines}

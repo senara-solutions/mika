@@ -119,21 +119,28 @@
 //! SQL ne passe ainsi sous le grep de `no_dispatch_test.rs`. Rien de nouveau sur
 //! le réseau : tout vient de `tasks` et de `SubIssue::pr_state`, déjà hydraté.
 //!
-//! **Ce que le vol 1 n'a pas ajouté, et c'est le point :** aucune autorité
-//! d'écriture, pas même désarmée. `MIKA_MANAGER_EVALUATE_WRITE` n'est **pas**
-//! déclarée — un interrupteur dont la branche ON ne fait rien est un mensonge de
-//! surface. Le verdict a exactement une destination,
-//! [`types::Assessment::flight_verdicts`], que le `Reporter` rend dans sa section
-//! « Vols terminés depuis le cycle précédent ». C'est le *mode ombre* du ticket,
-//! et au vol 1 il est structurel : il ne se configure pas, il n'existe pas
-//! autrement. L'écriture (`gh issue comment`, idempotence par checkpoint,
-//! exception nommée dans l'allowlist de `no_dispatch_test.rs`) est le vol 2, et
-//! le ticket reste ouvert jusque-là.
+//! **Ce que le vol 2 a ajouté :** [`verdict_write`], et là seulement, une
+//! autorité d'écriture — un geste, `gh issue comment`, derrière
+//! `MIKA_MANAGER_EVALUATE_WRITE`, OFF par défaut. C'est la première et unique
+//! entrée de l'allowlist de [`no_dispatch_test`], qui nomme ce fichier, ce
+//! jeton et ce ticket ; `gh issue edit`, `gh pr comment` et `gh pr merge`
+//! restent interdits **y compris dans ce fichier**. L'idempotence (un
+//! commentaire par vol, stable sur le rejeu du cycle) passe par
+//! [`cadence::MilestoneCheckpoint::commented_flights`], persisté par le même
+//! `save_checkpoint` que le reste.
 //!
-//! Deux data du verdict sont **présentes et `None`** — non instrumentées, jamais
-//! `0` (motif mika#2331) : le plafond de tours, dont le lecteur unique est en
-//! shell (`_pilot_max_turns`), et le tour du dernier commit, qui demande le
-//! transcript. Les deux sont du vol 2.
+//! Le *mode ombre* reste le défaut, et il reste structurel dans sa branche :
+//! interrupteur fermé, [`types::Assessment::flight_verdicts`] est la seule
+//! destination du verdict, celle que le `Reporter` rend dans sa section « Vols
+//! terminés depuis le cycle précédent ». L'interrupteur **ajoute** une
+//! destination ; il n'en remplace aucune.
+//!
+//! Une donnée du verdict reste **présente et `None`** — non instrumentée,
+//! jamais `0` (motif mika#2331) : le tour du dernier commit, qu'aucune source
+//! autorisée ne porte (voir le docstring de [`evaluator`]). Le plafond de
+//! tours, lui, est instrumenté depuis le vol 2 : le producteur l'écrit dans
+//! `tasks.result`, donc le lecteur unique de `PILOT_LABEL_TURN_CEILINGS` reste
+//! en shell et ce module le **lit** au lieu de le recalculer.
 
 pub mod assessor;
 pub mod cadence;
@@ -144,6 +151,7 @@ pub mod reporter;
 pub mod sink_dir;
 pub mod spawn;
 pub mod types;
+pub mod verdict_write;
 
 #[cfg(test)]
 mod no_dispatch_test;
