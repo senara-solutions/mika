@@ -351,7 +351,7 @@ async fn run_list(
                     })
                 })
                 .collect();
-            print!("{}", serde_yaml::to_string(&entries)?);
+            print!("{}", yaml_serde::to_string(&entries)?);
         }
         crate::cli::OutputFormat::Text => {
             println!();

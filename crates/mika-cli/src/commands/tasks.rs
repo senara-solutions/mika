@@ -77,7 +77,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
                 OutputFormat::Yaml => {
                     let json_tasks: Vec<Value> = tasks.iter().map(task_to_json).collect();
-                    print!("{}", serde_yaml::to_string(&json_tasks)?);
+                    print!("{}", yaml_serde::to_string(&json_tasks)?);
                 }
             }
         }
@@ -100,7 +100,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&task_to_json(&t))?);
                     }
                     OutputFormat::Yaml => {
-                        print!("{}", serde_yaml::to_string(&task_to_json(&t))?);
+                        print!("{}", yaml_serde::to_string(&task_to_json(&t))?);
                     }
                 },
                 None => {
@@ -253,7 +253,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
                 OutputFormat::Yaml => {
                     let rows: Vec<Value> = stuck.iter().map(stuck_task_to_json).collect();
-                    print!("{}", serde_yaml::to_string(&rows)?);
+                    print!("{}", yaml_serde::to_string(&rows)?);
                 }
             }
         }
