@@ -17,10 +17,6 @@ reason = "event-listener !Send tags via StackSlot (unsound); transitive dep only
 id = "RUSTSEC-2026-0205"
 reason = "scc Array::insert exception safety (unsound); transitive dep only, we do not pass panicking compare fns."
 
-[[advisories.ignore]]
-id = "RUSTSEC-2024-0449"
-reason = "unsafe-libyaml unmaintained (no vulnerability, no safe upgrade); pulled by serde_yaml 0.9 (deprecated) in mika-agent and mika-cli. Remove when serde_yaml is replaced by a maintained YAML crate (mika#2686)."
-
 [licenses]
 allow = [
     "MIT",
@@ -105,6 +101,24 @@ deny = [
     # the testimony lane uses).
     { name = "async-openai" },
     { name = "openai-api-rs" },
+
+    # mika#2686 — les deux caisses YAML retirées du graphe, pour qu'elles n'y
+    # reviennent pas en transitif.
+    #
+    # serde_yaml 0.9.34+deprecated est déprécié en amont et tire
+    # unsafe-libyaml, visé par RUSTSEC-2024-0449 (non maintenu, aucune faille
+    # connue, aucune mise à jour sûre). L'exception [[advisories.ignore]] posée
+    # par mika#2685 est levée dans le même commit : le remède est le
+    # remplacement par yaml_serde 0.10 (parseur libyaml-rs), déjà dans le graphe
+    # via utoipa. Ces deux entrées sont ce qui rend le retrait durable — sans
+    # elles, une dépendance future les réintroduirait en silence.
+    #
+    # Échappement — comme pour toute entrée de ce tableau : retirer la ligne en
+    # motivant, dans la PR qui en a besoin. Si c'est libyaml-rs qui se révèle
+    # porter un avis, le repli nommé au groom est serde_norway (même API, même
+    # geste de renommage), et il ne demande pas de toucher à ces deux entrées.
+    { name = "serde_yaml" },
+    { name = "unsafe-libyaml" },
 ]
 
 [sources]
