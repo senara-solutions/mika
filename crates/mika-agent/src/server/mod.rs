@@ -5596,6 +5596,27 @@ mod tests {
     // gateway le délivre, et lit le compteur du LLM bouchonné. Le jeton GitHub
     // est retiré explicitement : `Settings::load` lit le `MIKA_*` du processus,
     // et un `MIKA_GITHUB_TOKEN` exporté ferait lancer un `gh` réel aux handlers.
+    //
+    // **Tout test qui passe par `mika2675_run`/`mika2675_run_on` porte
+    // `#[serial_test::serial]`** (mika#2680). Deux états process-globaux le
+    // rendent nécessaire, et l'annotation doit couvrir les POISONNEURS autant
+    // que les lecteurs — un lecteur seul à être annoté laisse la course
+    // entière ouverte, `#[serial]` ne sérialisant que contre ses propres
+    // porteurs (`test_utils.rs` § `install_capturing_subscriber`) :
+    //
+    // 1. `MIKA_WEBHOOK_PREFILTER`, que `prefilter_enabled()` lit dans
+    //    l'environnement du processus et que le test AC5 de mika#2680 pose le
+    //    temps d'un tour. Un voisin qui attend un ÉCART pendant cette fenêtre
+    //    voit le pré-filtre désarmé et son tour avoir lieu.
+    // 2. L'`Interest` du callsite `webhook_turn_charged`, figé par le
+    //    dispatcher du thread qui l'enregistre le PREMIER. Un voisin qui
+    //    l'atteint sans abonné l'éteint globalement, et la capture des tests
+    //    mika#2680 rend 0.
+    //
+    // Mesuré sur la tête `6ba0762d` de la PR #2705, job `Check` : quatre
+    // échecs, un par état, les deux formes présentes. Les tests qui exercent
+    // la porte (`skip_turn`) directement sont hors de cette contrainte — ils
+    // reçoivent `enabled` en paramètre et n'atteignent aucun callsite capturé.
 
     fn mika2675_state() -> (AppState, Arc<mika_common::llm::mock::MockLlmProvider>) {
         use mika_common::llm::mock::{MockLlmProvider, text_response};
@@ -5694,12 +5715,14 @@ mod tests {
 
     /// AC1(a) — `check_suite` verte sur `main`, sans tâche : zéro appel LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_a_check_suite_verte_sur_main_aucun_appel_llm() {
         assert_eq!(mika2675_run(MIKA2675_GREEN_MAIN).await, (0, 1));
     }
 
     /// AC1(d) — label inerte : zéro appel LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_d_label_inerte_aucun_appel_llm() {
         assert_eq!(mika2675_run(MIKA2675_INERT_LABEL).await, (0, 1));
     }
@@ -5707,6 +5730,7 @@ mod tests {
     /// AC1(a), terme « sans tâche active liée à la branche » : avec une tâche,
     /// le tour a lieu.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_a_tache_active_sur_la_branche_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(&state, r#"{"claude_pilot":{"branch":"main"}}"#).await;
@@ -5782,6 +5806,7 @@ mod tests {
     /// AC2 et mutations — contrôles négatifs : chaque événement légitime, et
     /// chaque terme de (a)/(d) rendu faux, déclenche le tour LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_evenements_legitimes_le_tour_a_lieu() {
         let pr = "senara-solutions/mika#2680 — fix(x): y (branch: fix/2675/x)\nhttps://github.com/senara-solutions/mika/pull/2680";
         let cases = [
@@ -5811,6 +5836,7 @@ mod tests {
 
     /// AC2 — un verdict `pass` du relecteur QA sur une PR avec tâche active.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_verdict_pass_qa_tache_active_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(
@@ -5842,6 +5868,7 @@ mod tests {
 
     /// AC1(c) — chaque terme textuel, sans tâche active : zéro appel LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_c_verdict_non_actionnable_aucun_appel_llm() {
         for (state, author, body) in [
             (
@@ -5860,6 +5887,7 @@ mod tests {
     /// AC1(c), terme « sans tâche active » : avec une tâche sur la PR, chaque
     /// verdict non actionnable garde son tour.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_c_tache_active_le_tour_a_lieu() {
         for (author, body) in [
             (MIKA2675_QA, "VERDICT: hold[review]"),
@@ -5882,6 +5910,7 @@ mod tests {
     /// illisible faute de jeton), revue-consigne sans ligne VERDICT, `hold`
     /// inconnu, `block[*]` d'une autre identité : le tour a lieu.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_c_evenements_legitimes_le_tour_a_lieu() {
         for (state, author, body) in [
             ("approved", MIKA2675_QA, "VERDICT: pass"),
@@ -6005,6 +6034,7 @@ mod tests {
     /// DECISION-CORE et notifiée, que cet événement redécide : zéro appel LLM,
     /// une ligne d'audit nommée.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_b_tete_decidee_et_notifiee_aucun_appel_llm() {
         use webhook_prefilter::tests::{GREEN_PR, HEAD_A};
         let (state, mock) = mika2675_state();
@@ -6021,6 +6051,7 @@ mod tests {
     /// AC2, AC3 et mutations, de bout en bout : chaque terme rendu faux — et
     /// chaque événement hors population — déclenche le tour LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_b_controles_negatifs_le_tour_a_lieu() {
         use webhook_prefilter::tests::{GREEN_PR, HEAD_A};
         let other_sha = "pr:senara-solutions/mika#2678@ffffffffffffffffffffffffffffffffffffffff";
@@ -6116,6 +6147,7 @@ mod tests {
     /// AC(a) — `check_suite` rouge sur `main`, sans tâche active : zéro appel au
     /// modèle, une ligne d'audit de la classe.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_a_check_suite_rouge_sur_main_aucun_appel_llm() {
         for text in [MIKA2683_RED_MAIN, MIKA2683_TIMED_OUT_MAIN] {
             let (state, mock) = mika2675_state();
@@ -6132,6 +6164,7 @@ mod tests {
     /// AC(a), contrôle négatif du terme d'état : une tâche active sur `main` est
     /// un état que le modèle doit prendre en compte — le tour a lieu.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_a_tache_active_sur_main_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(&state, r#"{"claude_pilot":{"branch":"main"}}"#).await;
@@ -6182,6 +6215,7 @@ mod tests {
     /// AC(c) — branche de PR sans tâche : le handler a signalé pour adoption
     /// (notifié et audité en code), il ne reste rien à décider au modèle.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_pr_sans_tache_signalee_pour_adoption_aucun_appel_llm() {
         let (state, mock) = mika2675_state();
         mika2683_seed_handler_line(
@@ -6201,6 +6235,7 @@ mod tests {
 
     /// AC(c) — les deux autres sorties terminales, chacune sous sa classe.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_les_sorties_terminales_de_letape_3_aucun_appel_llm() {
         for (motive, class) in [
             (
@@ -6234,6 +6269,7 @@ mod tests {
     /// un correctif, c'est un état que le modèle doit prendre en compte. Le
     /// chemin de dispatch est inchangé — le tour a lieu, aucune ligne de skip.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_pr_avec_tache_in_progress_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(
@@ -6257,6 +6293,7 @@ mod tests {
     /// Sans lui, « la porte lit la trace » serait indistinguable de « la porte
     /// coupe tout ce qui est rouge hors branche par défaut ».
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_sans_ligne_terminale_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_run_on(&state, MIKA2683_RED_PR).await;
@@ -6332,6 +6369,30 @@ mod tests {
         (guard, events)
     }
 
+    /// Joue un tour webhook **avant** toute installation d'abonné, pour
+    /// enregistrer les callsites que la capture doit lire.
+    ///
+    /// `#[serial]` sur toute la famille ferme la course entre voisins, mais
+    /// pas celle-ci : un callsite ne s'enregistre qu'à sa PREMIÈRE atteinte
+    /// dans le processus, et son `Interest` est alors décidé par le dispatcher
+    /// du thread qui l'enregistre. `turn_usage` est atteint par n'importe quel
+    /// tour d'agent du crate, bien au-delà de cette famille — l'annoter
+    /// partout n'est pas une frontière qu'on puisse tenir.
+    ///
+    /// L'ordre « tour à blanc, PUIS capture » la rend sans objet :
+    /// l'enregistrement a lieu sans abonné, donc éteint, et le
+    /// `rebuild_interest_cache()` qu'`install_capturing_subscriber` appelle
+    /// juste après le rallume sous le nôtre — le rebuild réévalue les
+    /// callsites DÉJÀ enregistrés, et ne peut rien pour ceux qui le seront
+    /// après. La capture ne dépend donc plus de qui arrive premier.
+    ///
+    /// État distinct à chaque fois : ce tour-là compte un appel LLM et écrit
+    /// ses lignes d'audit, qu'aucune assertion ne doit voir.
+    async fn mika2680_warm_callsites() {
+        let (state, _) = mika2675_state();
+        mika2675_run_on(&state, MIKA2680_COMMENT).await;
+    }
+
     fn mika2680_events_named(
         events: &Arc<std::sync::Mutex<Vec<Mika2680Event>>>,
         name: &str,
@@ -6389,6 +6450,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2680_le_registre_se_joint_au_cout_du_tour() {
+        mika2680_warm_callsites().await;
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2675_state();
         mika2675_run_on(&state, MIKA2680_COMMENT).await;
@@ -6446,6 +6508,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2680_un_tour_ecarte_nemet_aucune_ligne_de_registre() {
+        mika2680_warm_callsites().await;
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2675_state();
         mika2675_run_on(&state, MIKA2675_GREEN_MAIN).await;
@@ -6482,6 +6545,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2680_linterrupteur_desarme_le_registre_le_dit() {
+        mika2680_warm_callsites().await;
         let _env = Mika2680EnvGuard::set("0");
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2675_state();
@@ -6528,6 +6592,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2680_le_site_dappel_classe_le_texte_davant_les_handlers() {
+        mika2680_warm_callsites().await;
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2675_state();
         let text = mika2675_review(

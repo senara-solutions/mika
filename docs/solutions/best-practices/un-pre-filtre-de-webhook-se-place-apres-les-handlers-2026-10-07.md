@@ -326,3 +326,41 @@ Aucun handler n'est touché, aucun `Touched` modifié, aucune décision du moteu
 changée. Le ticket chiffre, il n'implémente pas ; vol 1 livre **l'instrument qui
 rend le chiffrage prenable**, et vol 2 (« le lecteur ») en fera un refus
 explicite si l'instrument manque.
+
+### Observer le pré-filtre coûte deux états process-globaux
+
+Mesurer un tour, en test, demande deux choses que le processus partage : la
+variable qui désarme le pré-filtre, et l'abonné `tracing` qui lit la ligne.
+L'une et l'autre débordent du test qui les pose, et le débordement **ne
+ressemble pas à une casse** : le voisin lésé voit un tour avoir lieu là où il
+attendait un écart, ou une capture rendre zéro. Les deux lectures plausibles
+sont « le filtre ne filtre plus » et « la ligne n'est pas émise » — les deux
+fausses.
+
+- `MIKA_WEBHOOK_PREFILTER` est lu dans l'environnement par `prefilter_enabled()`.
+  Le test qui la pose le temps d'un tour désarme le pré-filtre de **tous** les
+  tours qui tournent en parallèle.
+- L'`Interest` d'un callsite `tracing` est figé par le dispatcher du thread qui
+  l'enregistre le **premier**. Un voisin qui l'atteint sans abonné l'éteint
+  globalement, capture déjà installée comprise.
+
+La parade est la même pour les deux, et c'est celle de
+`install_capturing_subscriber` : `#[serial_test::serial]` doit couvrir les
+**poisonneurs** autant que les lecteurs. Un lecteur seul à être annoté laisse la
+course entière ouverte. Ici, la frontière est « tout test qui passe par
+`run_agent_for_message` » ; les tests qui exercent la porte (`skip_turn`)
+reçoivent `enabled` en paramètre et sortent de la contrainte.
+
+Pour le second état, une frontière tenable n'existe pas : `turn_usage` est
+atteint par n'importe quel tour d'agent du crate. L'ordre **« tour à blanc,
+puis capture »** la rend inutile — l'enregistrement a lieu sans abonné, donc
+éteint, et le `rebuild_interest_cache()` de l'installation le rallume sous le
+nôtre. Le rebuild réévalue les callsites déjà enregistrés, et ne peut rien pour
+ceux qui le seront après : c'est pour cela que l'ordre compte, et pas seulement
+la sérialisation.
+
+Mesuré le 2026-10-16 sur le job `Check` de la PR #2705 : quatre échecs, les deux
+formes présentes, et **zéro** en local sur la suite complète — les 6 246 tests
+étalent l'ordonnancement, un `cargo test -- mika2675 mika2680 mika2683` le
+concentre et sort les quatre à coup sûr. Une suite filtrée est donc un
+instrument, pas un raccourci.
