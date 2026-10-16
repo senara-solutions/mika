@@ -1482,6 +1482,16 @@ async fn run_loop(
     // `callback_trigger_active` cannot disagree on what a build callback is.
     let qa_verdict_due =
         crate::qa_build_callback::qa_verdict_required(&user_input_text, loaded_skill_names);
+    // mika#2727 — is a SUBMITTED review DUE on this turn? Same shape, same two
+    // sources, the other end of the same review: the message is one of the four
+    // PR webhook actions the gateway routes to mika-qa AND `qa-review` is among
+    // the turn's skills. Disjoint from `qa_verdict_due` by construction (the two
+    // message prefixes cannot both match), pinned by
+    // `qa_review_submission::tests::mika2727_les_deux_gardes_ne_sont_jamais_dues_sur_le_meme_message`.
+    let qa_review_due = crate::qa_review_submission::review_submission_required(
+        &user_input_text,
+        loaded_skill_names,
+    );
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -3266,6 +3276,51 @@ async fn run_loop(
                         continue;
                     }
 
+                    // mika#2727 — QA review-submission guard (non-empty text path).
+                    // A PR webhook turn with `qa-review` loaded concludes by
+                    // SUBMITTING the review: `required_tools` only checks that a tool
+                    // NAMED `run_gh` was called, so a read-only `pr list` / `pr view`
+                    // satisfied it while nothing reached GitHub (n=2 on #2704,
+                    // 2026-10-15, both needing a manual relaunch). Inline for the same
+                    // reason as mika#2355 above: the trigger is conjunctive, and the
+                    // first term alone would re-prompt mika-dev (which receives
+                    // `pull_request.closed`) to post a review it does not owe.
+                    // Satisfaction is disjunctive — dispatching `build_mika` is a valid
+                    // way to end a review turn, and that is where mika#2355 takes over.
+                    // Single retry via intent_guard_retries.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && qa_review_due
+                        && !intent_guard_retries
+                            .contains(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL)
+                        && !crate::qa_review_submission::review_submission_satisfied(
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_review_submission::REVIEW_SUBMISSION_LABEL,
+                            "qa-review turn ending without a submitted review — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_review_submission::REVIEW_SUBMISSION_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
                     // #1218 — Webhook milestone advance guard. Mirrors
                     // callback_milestone_advance for `pull_request.closed(merged:true)`
                     // webhook turns whose correlated task has a milestone/project
@@ -4226,6 +4281,54 @@ async fn run_loop(
                             role: LlmRole::User,
                             content: LlmContent::Text(
                                 crate::qa_build_callback::QA_VERDICT_REQUIRED_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // mika#2727 — QA review-submission guard for empty-text exits.
+                    // Mirror of the inline guard in the non-empty text path, byte for
+                    // byte but for the log message.
+                    //
+                    // UNREACHABLE for this population TODAY, and that is said here
+                    // rather than left to be inferred: a review turn arrives through
+                    // `server::handlers::run_agent_for_message` → `run_agent`, i.e.
+                    // CONVERSATION mode, and this whole block is gated on
+                    // `!mode.follow_up_on_empty()` — true only for Silent. There is no
+                    // `SilentTrigger::Webhook`. The mirror is kept because the sibling
+                    // mika#2355 guard above has one and the two must not drift (if a
+                    // webhook turn ever runs silent, a guard present at one exit only
+                    // is blind by construction — mika#2515 measured the bare EndTurn as
+                    // the more probable half). Its silence is therefore NOT evidence
+                    // that no bare-EndTurn review turn exists (mika#2272): nothing can
+                    // reach it yet. The covered site is the non-empty one above.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && qa_review_due
+                        && !intent_guard_retries
+                            .contains(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL)
+                        && !crate::qa_review_submission::review_submission_satisfied(
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_review_submission::REVIEW_SUBMISSION_LABEL,
+                            "qa-review turn ending without a submitted review on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_review_submission::REVIEW_SUBMISSION_CORRECTION
                                     .to_string(),
                             ),
                         });

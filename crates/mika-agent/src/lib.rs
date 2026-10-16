@@ -40,6 +40,7 @@ pub mod prompt;
 pub mod qa_build_callback;
 pub mod qa_head_supersession;
 pub mod qa_review_reconcile;
+pub mod qa_review_submission;
 pub mod ready_label;
 pub mod research;
 pub mod rewind;
