@@ -5361,12 +5361,21 @@ déploiement — et aujourd'hui, ce chemin est presque désert (ci-dessous).
 ### Ce que ce travail n'achète PAS
 
 - **Il ne prouve pas qu'un chemin moteur atteint `claude-pilot` aujourd'hui.**
-  `INTERNAL_REPOS` du gateway (`crates/mika-gateway/src/github.rs:265`) liste
-  encore `senara-solutions/claude-pilot-py` ; si les webhooks portent le nom
-  courant, ils ne routent plus vers `mika-dev`, et la prémisse R8 du plan
-  (« `merge_ready_handler` peut merger une PR claude-pilot ») est à **re-mesurer**.
-  Hors périmètre de la phase C, nommé ici. La garde tient sur les trois sites
-  quel que soit le routage, parce qu'elle est dans le type.
+  Ce constat portait d'abord sur `INTERNAL_REPOS` du gateway, qui listait encore
+  l'ancien nom ; **mika#2666 l'a migré** (`crates/mika-gateway/src/github.rs`,
+  nom courant, sans alias). Et la crainte qui l'accompagnait — « ils ne routent
+  plus vers `mika-dev` » — **était fausse en mono-locataire**, mesuré le
+  2026-10-07 : `is_internal_repo` n'est consulté que pour un dépôt sans ligne
+  `github_repos`, et avec `agent_base_url` posé le fallback rend **la même
+  route**. L'allowlist n'y changeait que le niveau du log (`info!` au lieu de
+  `debug!`) — d'où l'absence de ligne INFO depuis le 2026-07-07, qui ne montrait
+  aucune perte. Les événements claude-pilot atteignaient déjà les agents (review
+  de claude-pilot#281 le 2026-10-02, canal `github`). La prémisse R8 du plan
+  (« `merge_ready_handler` peut merger une PR claude-pilot ») ne dépend donc pas
+  du routage ; ce qui reste à mesurer est qu'une PR claude-pilot atteigne un
+  chemin de merge **moteur**, et ce chemin est presque désert (CC-spawns-only,
+  ci-dessus). La garde tient sur les trois sites quel que soit le routage, parce
+  qu'elle est dans le type.
 - **Il ne ré-enclenche pas le merge quand MPC pose le marqueur.** Aucun webhook
   ne relance la porte sur un commentaire : après le marqueur, le merge est un
   geste (MPC, ou Vincent — c'est déjà la doctrine pour claude-pilot,
@@ -8247,7 +8256,7 @@ Optional (signal d'adoption sur un travail non dispatché — mika#1745) :
 
   **Le défaut que ça ferme.** Un CI failure sur une PR ouverte d'un dépôt que la boucle a le droit de dispatcher, sans tâche mika correspondante, était écarté en silence : `ci_failure_handler` rendait `Passthrough { enrichment: None }` — le modèle recevait le texte brut du webhook, sans un mot du moteur, puis son prompt lui disait d'ignorer. Le signal est désormais **additif** : aucune tâche créée, aucun dispatch déclenché, aucun statut modifié, aucun processus signalé. `Passthrough`, jamais `Handled` (AC3).
 
-  **Le dépôt hors `DISPATCHABLE_REPOS` reste silencieux, quelle que soit la valeur** — `claude-pilot-py` et `wizzard` sont spawn-CC-only par la décision opérateur du 2026-08-29, donc y proposer une adoption proposerait une action que la porte mika#2046 refuse structurellement. C'est AC4, et c'est maintenant **attribuable** : la ligne `surface_for_adoption_skipped` nomme le motif.
+  **Le dépôt hors `DISPATCHABLE_REPOS` reste silencieux, quelle que soit la valeur** — `claude-pilot` et `wizzard` sont spawn-CC-only par la décision opérateur du 2026-08-29, donc y proposer une adoption proposerait une action que la porte mika#2046 refuse structurellement. C'est AC4, et c'est maintenant **attribuable** : la ligne `surface_for_adoption_skipped` nomme le motif.
 
   **Surfaces opérateur.** `grep surface_for_adoption "$MIKA_SPIRIT_LOG_FILE" | jq -c '{event, repo, pr_number, branch, head_sha, dedup_skipped, notified}'` — le grep est un **préfixe**, donc il rend le signal et ses frères de saut ensemble ; `.event` discrimine. SQL : `SELECT target_key, count(*) FROM audit_events WHERE tool_name = 'surface_for_adoption' GROUP BY 1 ORDER BY 2 DESC;` — exact parce que `surface_for_adoption` est **SOLE WRITER** de son nom (scan de source, allowlist livrée vide), et ce compte **est** la précondition explicite de la décision d'auto-adoption qu'AC3 diffère (« until we have enough n »).
 
