@@ -292,6 +292,13 @@ mod eval {
     // #870 + framing) et B3 (garde positive) sur le chemin silencieux réel.
     mod test_qa_build_callback_verdict_2355;
 
+    // mika#2727 — l'AUTRE bout du même tour : le tour d'OUVERTURE de revue,
+    // ouvert par `[GitHub] PR synchronize: …` en mode conversation, qui finissait
+    // en `EndTurn` avec son verdict en texte et rien sur GitHub. AC3a (la garde
+    // tire) et AC3b (contrôle positif : `pr review` ne re-prompte pas) dans le
+    // même fichier, plus le caractère à un coup du re-prompt.
+    mod test_qa_review_submission_2727;
+
     // mika#1952 — le schéma SERVI en mode réflexion déclare `evidence` requis,
     // les autres modes sont inchangés, et la garde d'exécution reste la seule
     // barrière dure (`"evidence": ""` satisfait `required` et échoue la garde).
