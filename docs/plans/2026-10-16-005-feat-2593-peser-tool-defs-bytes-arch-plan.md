@@ -3,7 +3,7 @@
 **Ticket :** senara-solutions/mika#2593
 **Type :** feat (agent-core)
 **Suivi de :** mika#2474 § 9 (*Hors périmètre*)
-**Vol :** 1 de 2 — `Tracked in:` au § 8
+**Vol :** un seul — 223 lignes estimées sous la borne de 243 (§ *Taille estimée*)
 
 ---
 
@@ -163,7 +163,7 @@ sur les lectures orphelines.
 | lecture retirée | famille d'écriture, et son état |
 |---|---|
 | `list_reminders` | `create_reminder`, `cancel_reminder` — **déniés** |
-| `list_scheduled_tasks` | `create_scheduled_task` — **non enregistré** dans `default_tools()` ; construit en interne par `complete_task`, lui-même dénié |
+| `list_scheduled_tasks` | `create_reminder`, `cancel_reminder` — **déniés** (le doc-comment de la const les range sous *« writes to scheduled_tasks rows »*, c'est la même table) ; plus `create_scheduled_task`, **non enregistré** dans `default_tools()` ni dans `management_tools_if_needed` — il n'existe que construit en interne par `complete_task` (`complete_task.rs:185`), lui-même dénié |
 | `list_tasks` | `create_task`, `update_task_status`, `complete_task`, `cancel_task` — **les quatre déniés** |
 | `get_task` | idem |
 | `check_task` | idem |
@@ -226,7 +226,7 @@ Ensuite — et c'est l'acquis structurel — **une dénylist croît en silence**
 défaut, sans qu'aucune assertion ne rougisse : c'est la posture inverse de celle
 que l'allowlist de skills applique déjà au même agent (*denied by default*). Le
 recensement à roster attesté du § 5 D3 est ce qui arrête cette croissance ; le
-basculement complet dénylist → allowlist est le vol 2 (§ 8).
+basculement complet dénylist → allowlist est hors périmètre, motivé au § 8 (a).
 
 ---
 
@@ -317,10 +317,7 @@ La garde assère, pour chaque paire :
 1. la lecture **est** dans `MIKA_ARCH_DISABLED_TOOLS` ;
 2. chaque membre de sa famille est **soit** dans `MIKA_ARCH_DISABLED_TOOLS`,
    **soit** absent des noms déclarés par `tools::default_tools().definitions()` ;
-3. la lecture n'est **pas** dans la liste constitutive de #811 — la garde
-   réutilise les trois noms de
-   `test_mika_arch_disabled_tools_excludes_agent_self_state` plutôt que de les
-   retaper, pour que les deux tests ne puissent pas diverger.
+3. la lecture n'est **pas** dans la liste constitutive de #811.
 
 Ce qu'elle attrape, et qu'aucun test comportemental ne voit : un futur ticket qui
 élargirait la coupe à une lecture dont l'écriture est **encore servie** — la
@@ -328,17 +325,59 @@ seule forme sous laquelle cette coupe devient destructive. `promote_deferred_cal
 n'est **pas** dans la table : ce n'est pas une lecture, son motif est la voie, et
 le mélanger salirait le critère.
 
+**Le point 3 coûte une extraction, et il faut la nommer parce qu'elle touche la
+zone que V3 protège.** Les trois noms de #811 vivent aujourd'hui dans un
+tableau **local** au corps du test (`let agent_self_state_tools = [...]`,
+`well_known_agents.rs:2083`) : rien ne peut les lire de l'extérieur. Deux voies
+seulement, et l'une est exclue :
+
+- **retaper les trois noms dans D2** — refusé : deux listes du même ensemble
+  dans le même fichier divergent au premier ticket qui en modifie une, et aucune
+  assertion ne rougit (classe mika#2205) ;
+- **les extraire en `const MIKA_ARCH_AGENT_SELF_STATE_TOOLS: &[&str]`**, dont le
+  test #811 devient le **premier lecteur** et D2 le second. Retenu.
+
+Donc le diff du test #811 n'est **pas** vide, et V3 le dit ainsi plutôt que
+d'exiger l'impossible. Ce que V3 borne est précis : le changement autorisé dans
+ce test est **exactement** le remplacement du tableau local par la const, sans
+qu'un nom soit ajouté, retiré ou réécrit, et sans que l'assertion ni son message
+bougent. Le doc-comment de la const reprend mot pour mot le commentaire de trois
+lignes que le test porte aujourd'hui — c'est lui qui porte #811, et il doit
+monter avec les noms, pas rester derrière eux.
+
+Noter que la const n'est **pas** `pub` : son seul usage est ce fichier, et un
+`pub` en ferait une déclaration publique que personne ne lit — exactement
+l'inverse de ce que l'extraction achète.
+
 ### D3 — le recensement à roster attesté (détecteur)
 
-`mika2593_le_tableau_servi_a_mika_arch_est_un_roster_attesté`, dans le `mod tests`
+`mika2593_le_tableau_servi_a_mika_arch_est_un_roster_atteste`, dans le `mod tests`
 de `crates/mika-agent/src/tools/mod.rs` — là où vit déjà le scanner
 `declared_tool_names` et son consommateur `mika1952_gated_tools_match_the_reflection_contract_constant`,
 dont la garde reprend la forme.
 
 Elle construit `default_tools()`, retire les noms de `MIKA_ARCH_DISABLED_TOOLS`,
 et assère l'**égalité ensembliste** avec un roster déclaré
-`MIKA_ARCH_SERVED_BUILTINS_FROM_DEFAULT_TOOLS` (les 19 noms issus de
-`default_tools()` après coupe). Divergence attrapée **dans les deux sens** :
+`MIKA_ARCH_SERVED_BUILTINS_FROM_DEFAULT_TOOLS` : **18 noms**. Le compte se
+dérive, il ne se devine pas — et il ne vaut pas 19, qui est le nombre d'une
+autre grandeur (cf. l'avertissement sous le tableau) :
+
+| | |
+|---|---|
+| `default_tools()` | 37 |
+| − déniés **qui y sont enregistrés** (13 des 23 : les 10 autres sont des outils de management) | − 13 |
+| servis de `default_tools()` **aujourd'hui** | 24 |
+| − coupe de ce vol **qui y est enregistrée** (6 des 9 : `list_teams` / `get_team_status` / `get_team_history` sont des outils de management) | − 6 |
+| **roster** | **18** |
+
+**19 est le `kept_count` du § 6 P2, pas ce roster.** `kept_count` est mesuré sur
+le **registre global** (51 − 32 = 19) parce que `apply_agent_tool_visibility`
+filtre le tableau assemblé, management inclus ; le roster ne couvre que
+`default_tools()`. Les deux nombres sont à un écart d'une unité pour des raisons
+sans rapport, et les confondre est l'erreur que ce paragraphe existe pour
+empêcher.
+
+Divergence attrapée **dans les deux sens** :
 
 - un `register(...)` nouveau non ajouté au roster → un outil atteint mika-arch
   sans que personne l'ait décidé, et `tool_defs_bytes` remonte en silence. C'est
@@ -350,9 +389,11 @@ et assère l'**égalité ensembliste** avec un roster déclaré
 outils de `management_tools_if_needed`, qui exige un `home_dir`, un `Settings`,
 un client HTTP et une `GitHubApp`. C'est accepté, et dit : la surface de
 croissance est `default_tools()` (c'est là que les `register(...)` s'ajoutent),
-et 11 des 14 outils de management sont déjà déniés — les 3 restants
-(`list_agents`, et `list_teams` / `get_team_status` / `get_team_history` que ce
-vol dénie) sont nommés un par un par D2.
+et **10 des 14** outils de management sont déjà déniés par #811 — les **4**
+restants sont `list_agents` (conservé, § 3.3) et `list_teams` /
+`get_team_status` / `get_team_history`, que ce vol dénie et que D2 nomme un par
+un. Après ce vol, la dénylist couvre donc 13 des 14 ; le seul outil de
+management encore servi à mika-arch est `list_agents`.
 
 ### D4 — l'attestation d'octets sur l'événement existant
 
@@ -437,7 +478,7 @@ son borderline nommés.
 |---|---|---|
 | V1 | la suite passe, dont D2, D3, D5 | `cargo test -p mika-agent` |
 | V2 | lint et format | `cargo clippy && cargo fmt --check` |
-| V3 | #811 reste vert **et intouché** | `git diff origin/main -- crates/mika-agent/src/well_known_agents.rs` ne doit montrer aucune modification dans `test_mika_arch_disabled_tools_excludes_agent_self_state` ni dans le bloc *Notably allowed* |
+| V3 | #811 reste vert, et son **ensemble** est intouché | `git diff origin/main -- crates/mika-agent/src/well_known_agents.rs` : dans `test_mika_arch_disabled_tools_excludes_agent_self_state`, la seule modification admise est le remplacement du tableau local par `MIKA_ARCH_AGENT_SELF_STATE_TOOLS` (§ 5 D2) — aucun nom ajouté, retiré ou réécrit, assertion et message inchangés. Le bloc *Notably allowed* du doc-comment de la const, lui, ne montre **aucune** modification |
 | V4 | la structure des skills bundlés tient | `make verify-bundled-skills` |
 | V5 | le pipeline | `scripts/verify-pipeline.sh origin/main` |
 
@@ -461,9 +502,15 @@ précède le correctif (classe mika#2340), ce n'est pas une réconciliation qui 
 grep "tool-visibility" "$MIKA_SPIRIT_LOG_FILE" | jq -c '{hidden_count, kept_count, kept_bytes}'
 ```
 
-Attendu : `hidden_count` 23 → **32**, `kept_count` 28 → **19** (`default_tools()`
-moins coupe ; les outils de skill s'ajoutent après ce point), `kept_bytes` en
+Attendu : `hidden_count` 23 → **32**, `kept_count` 28 → **19**, `kept_bytes` en
 baisse d'environ 4,6 Ko.
+
+Le `kept_count` est celui du **registre global** au point de filtrage — 51
+builtins (37 de `default_tools()` + 14 de `management_tools_if_needed`) moins la
+dénylist : 51 − 23 = 28 aujourd'hui, 51 − 32 = 19 après. Les outils de skill
+(`gh_read`) s'ajoutent **après** ce point et ne sont comptés ni avant ni après.
+Ce 19 n'est pas le roster de D3, qui vaut 18 et ne couvre que
+`default_tools()` — le § 5 D3 porte la dérivation des deux.
 
 **P3 — l'arbitre : `tool_defs_bytes`, le champ même de la précondition.**
 
@@ -509,9 +556,10 @@ démarrage suivant — aucune migration, aucune donnée, aucun état à défaire
 
 ## 7. Ordre de commit
 
-Un seul commit. Les neuf entrées, leurs deux gardes, les deux champs et le test
-de ces champs ne sont pas séparables : D1 sans D2/D3 est une coupe sans critère
-vérifiable, et D2/D3 sans D1 sont deux tests rouges.
+Un seul commit. Les neuf entrées, leurs deux gardes, l'extraction en const des
+trois noms de #811, les deux champs et le test de ces champs ne sont pas
+séparables : D1 sans D2/D3 est une coupe sans critère vérifiable, D2/D3 sans D1
+sont deux tests rouges, et l'extraction seule est un refactor sans lecteur.
 
 ```
 feat(agent): les lectures orphelines de mika-arch quittent le tableau servi — vol 1 (mika#2593)
@@ -526,7 +574,7 @@ feat(agent): les lectures orphelines de mika-arch quittent le tableau servi — 
 
 Chaque renvoi nomme sa raison ; aucun n'est un report par fatigue.
 
-**(a) Le basculement dénylist → allowlist pour les outils — c'est le vol 2.** Le
+**(a) Le basculement dénylist → allowlist pour les outils.** Le
 doc-comment d'`apply_agent_tool_visibility` l'invite déjà en ces termes : *« Future
 migration (when well-known agents move from denylist to allowlist for tools):
 extend this hook to handle both shapes — same call site, different predicate, no
@@ -537,8 +585,20 @@ cela touche le schéma `Identity.tools` (un champ `allowed`), le prédicat du
 filtre, `CODE_OWNED_IDENTITY_SECTIONS`, la réconciliation et leurs gardes — soit
 largement au-delà de la borne par vol. D3 en livre la moitié qui tient : le
 recensement attesté arrête la croissance silencieuse sans changer le schéma.
-**Tracked in: senara-solutions/mika#2593** (vol 2, à ouvrir à la clôture de ce
-vol avec le relevé P2/P3 en corps).
+
+**Ce renvoi n'est pas nommé par une ligne `Tracked in:` dans ce plan, et c'est
+délibéré.** La règle mika#2693 exige le découpage en vols — et la ligne qui nomme
+la suite — quand le total dépasse la borne par vol ; ici il ne la dépasse pas
+(223 < 243), donc ce travail tient **en un seul vol** et le basculement est un
+hors-périmètre ordinaire, au même titre que les cinq autres de ce § 8. Une ligne
+`Tracked in:` pointant vers mika#2593 lui-même — c'est-à-dire vers le ticket
+qu'elle est censée prolonger — serait une référence circulaire : elle ressemble à
+une réponse sans en être une, exactement le défaut que la DoD de ce plan reproche
+à `tool_defs_bytes` lu comme un total. Le ticket de suivi n'existe pas encore ;
+l'implémenteur l'**ouvre** à la fin du vol (il a `gh`, ce plan ne l'a pas) et le
+nomme alors par un `Tracked in:` dans le corps de PR, avec le relevé P2/P3 en
+corps. C'est la DoD 10 qui porte cette obligation, et c'est le seul endroit où
+elle peut être tenue honnêtement.
 
 **(b) `system_prompt_bytes` sur `context_window_assembled`.** Le reliquat
 d'instrument nommé par l'opérateur (§ 1.1). C'est un défaut de mesure, pas
@@ -553,7 +613,7 @@ une question sur #740, pas sur la taille.
 **(d) Un recensement par outil de `tool_defs_bytes`.** Un événement portant les
 octets **de chaque** définition rendrait le prochain arbitrage mesurable au lieu
 d'estimé (§ 3.4 a dû transporter une proportion depuis la source faute de l'avoir).
-C'est l'instrument du vol 2, pas de celui-ci : ce vol-ci n'a pas besoin de
+C'est l'instrument du basculement (a), pas de celui-ci : ce vol-ci n'a pas besoin de
 granularité pour décider, puisque son critère est structurel et non budgétaire.
 
 **(e) Le registre global lui-même.** `server/mod.rs:979` construit un registre
@@ -605,21 +665,28 @@ que de le supposer.
 2. Le doc-comment de la const nomme le critère C1/C2/C3, le borderline
    `list_agents` et la bande attendue ; le bloc *Notably allowed* est intact.
 3. D2 existe, est armé, et assère les trois conjonctions du critère sur la table
-   `MIKA_ARCH_ORPHANED_READS`, en réutilisant les noms constitutifs de #811 plutôt
-   qu'en les retapant.
+   `MIKA_ARCH_ORPHANED_READS`. Les trois noms constitutifs de #811 vivent dans
+   `MIKA_ARCH_AGENT_SELF_STATE_TOOLS`, lue par D2 **et** par le test #811 — aucun
+   des deux ne les retape.
 4. D3 existe, est armé, et assère l'égalité ensembliste dans les **deux** sens
-   entre `default_tools()` moins la dénylist et le roster attesté ; sa borne
-   (`management_tools_if_needed` hors portée) est écrite dans son doc-comment.
+   entre `default_tools()` moins la dénylist et le roster attesté de **18** noms ;
+   sa borne (`management_tools_if_needed` hors portée) est écrite dans son
+   doc-comment, ainsi que la raison pour laquelle 18 ≠ le `kept_count` de 19.
 5. `MIKA2593_CRITERION_EXCEPTIONS` existe, est **vide**, et porte son assertion
    auto-nettoyante.
 6. `applied identity tool-visibility filter` porte `kept_count` et `kept_bytes` ;
    D5 épingle l'égalité de `kept_bytes` avec la sérialisation post-filtrage.
 7. V1 à V5 passent.
-8. `test_mika_arch_disabled_tools_excludes_agent_self_state` est vert et son
-   diff est vide (V3).
+8. `test_mika_arch_disabled_tools_excludes_agent_self_state` est vert, et son
+   diff ne contient que l'extraction en const — aucun nom ajouté, retiré ou
+   réécrit, assertion et message inchangés (V3).
 9. Le corps de PR porte les cinq sondes P1–P5 avec leur attendu, la bande
    3,5–5,5 Ko annoncée comme bande, et la procédure de reversion.
-10. Le corps de PR nomme le vol 2 par une ligne `Tracked in:` (§ 8 (a)).
+10. Le ticket de suivi du basculement dénylist → allowlist (§ 8 (a)) est
+    **ouvert** par l'implémenteur en fin de vol, avec le relevé P2/P3 en corps,
+    et le corps de PR le nomme par une ligne
+    `Tracked in: senara-solutions/mika#<n>`. Un `Tracked in:` pointant vers
+    mika#2593 ne satisfait pas ce critère : il ne nomme aucune suite.
 
 ---
 
@@ -656,7 +723,8 @@ l'arbitrage de capacité — et de la section *Contrat de vérification* ci-dess
 - **AC8 — La décision atteint un agent déjà provisionné.** `tools.disabled` est
   dans `CODE_OWNED_IDENTITY_SECTIONS`, et P1 le constate après déploiement.
 - **AC9 — Ce qui n'est pas pris est nommé avec sa raison.** Le § 8 énumère six
-  renvois, dont le basculement vers une allowlist (vol 2, `Tracked in:`) et le
+  renvois, dont le basculement vers une allowlist (ticket de suivi ouvert en fin
+  de vol, DoD 10) et le
   reliquat `system_prompt_bytes` nommé deux fois par l'opérateur.
 
 ---
@@ -667,33 +735,39 @@ l'arbitrage de capacité — et de la section *Contrat de vérification* ci-dess
 |---|---|
 | `crates/mika-agent/src/well_known_agents.rs` — D1 : 9 entrées + 2 sous-sections commentées + paragraphe de doc du critère | 52 |
 | `crates/mika-agent/src/well_known_agents.rs` — D2 : table `MIKA_ARCH_ORPHANED_READS`, garde C1, allowlist vide + assertion auto-nettoyante | 78 |
-| `crates/mika-agent/src/tools/mod.rs` — D3 : roster attesté + recensement bidirectionnel + doc de sa borne | 48 |
+| `crates/mika-agent/src/well_known_agents.rs` — D2 : extraction de `MIKA_ARCH_AGENT_SELF_STATE_TOOLS` + son doc-comment, et repointage du test #811 dessus | 5 |
+| `crates/mika-agent/src/tools/mod.rs` — D3 : roster attesté de 18 noms + recensement bidirectionnel + doc de sa borne | 48 |
 | `crates/mika-agent/src/agent_loop/mod.rs` — D4 : `kept_count` + `kept_bytes` sur l'événement existant | 12 |
 | `crates/mika-agent/src/agent_loop/mod.rs` — D5 : test de l'attestation d'octets | 28 |
 
-Total estimé : 218 lignes
+Total estimé : 223 lignes
 Plafond de tours : 150 (défaut)
 Borne par vol : 243 lignes estimées — (150 − 35 − 50) × 7,5 / 2
 
-**Un seul vol, et voici pourquoi il tient.** 218 < 243, et 218 < 1000 : les deux
-bornes passent, la plus serrée (243) avec ~10 % de marge. Trois propriétés
+**Un seul vol, et voici pourquoi il tient.** 223 < 243, et 223 < 1000 : les deux
+bornes passent, la plus serrée (243) avec ~8 % de marge. Trois propriétés
 soutiennent l'estimation plutôt qu'un espoir :
 
-- **Aucun site nouveau.** Les cinq livrables atterrissent dans trois fichiers qui
+- **Aucun site nouveau.** Les livrables atterrissent dans trois fichiers qui
   existent, sur des sites qui existent : une const (D1), deux `mod tests` déjà
   peuplés (D2, D3, D5), et **deux champs** sur un `tracing::info!` déjà écrit
-  (D4). Zéro module créé, zéro signature changée, zéro migration.
+  (D4). Zéro module créé, zéro signature changée, zéro migration. La seule
+  déclaration déplacée est l'extraction en const de D2, dont les trois noms sont
+  déjà écrits à la ligne `well_known_agents.rs:2083`.
 - **Les deux détecteurs ont leur patron en dépôt.** D3 reprend la forme de
   `mika1952_gated_tools_match_the_reflection_contract_constant`
   (`tools/mod.rs:1550`), scanner `declared_tool_names` inclus — un patron suivi
   coûte moins qu'un patron inventé. D5 se range à côté des trois
   `test_apply_agent_tool_visibility_*` existants.
-- **La part de doc-comment est forte et son volume est connu.** ~70 des 218 lignes
+- **La part de doc-comment est forte et son volume est connu.** ~75 des 223 lignes
   sont du commentaire de déclaration (motif des deux sous-sections, critère,
   borne de D3), dont le contenu est déjà rédigé aux § 3.1 à § 3.3 de ce plan : il
   reste à le transcrire, pas à le trouver.
 
-Le vol 2 — le basculement dénylist → allowlist, qui touche le schéma
-`Identity.tools` et la réconciliation — est nommé au § 8 (a), avec sa ligne
-`Tracked in:`. Il est mergeable seul et après celui-ci : il **remplace** le
-prédicat du filtre que ce vol-ci se contente de nourrir.
+Le basculement dénylist → allowlist — qui touche le schéma `Identity.tools`, le
+prédicat du filtre, `CODE_OWNED_IDENTITY_SECTIONS`, la réconciliation et leurs
+gardes — est **hors périmètre** et motivé au § 8 (a). Il n'est pas un « vol 2 »
+de ce plan : ce travail-ci est complet et mergeable seul, et le basculement
+**remplace** le prédicat du filtre que celui-ci se contente de nourrir. Son
+ticket de suivi est ouvert en fin de vol et nommé par `Tracked in:` dans le corps
+de PR (DoD 10).
