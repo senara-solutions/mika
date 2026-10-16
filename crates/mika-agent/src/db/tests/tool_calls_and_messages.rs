@@ -8,6 +8,73 @@
 
 use super::*;
 
+/// V4 (mika#2658 AC2) — `llm_calls` et `tool_calls` ont une fenêtre de 30 jours.
+///
+/// Le ticket posait la question comme *« ou dire explicitement pourquoi ils sont
+/// gardés indéfiniment »*. Ils ne le sont pas : les 153 Mo de `tool_calls` et
+/// 87 Mo de `llm_calls` mesurés le 2026-10-03 **sont** le volume de 30 jours
+/// d'activité, pas une absence de rétention. L'appelant est l'étape 5 de
+/// `startup_recovery` (`task_engine/engine.rs`), à chaque démarrage.
+///
+/// Ce test tient la fenêtre elle-même : retirer un des deux appels, ou élargir
+/// `retention_secs` sans le vouloir, rend la table illimitée **en silence** —
+/// aucune autre assertion du dépôt ne regarde ce qui est supprimé.
+#[test]
+fn mika2658_llm_and_tool_calls_have_a_thirty_day_window() {
+    let db = db();
+    db.create_session("s1", "mika", "cli").unwrap();
+
+    const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
+    let old = timestamp::format(&(Utc::now() - Duration::days(31)));
+    let recent = timestamp::format(&(Utc::now() - Duration::days(1)));
+
+    for (id, at) in [("llm-old", &old), ("llm-recent", &recent)] {
+        db.conn
+            .execute(
+                "INSERT INTO llm_calls (id, agent_id, session_id, provider, model, created_at)
+                     VALUES (?1, 'mika', 's1', 'anthropic', 'claude-sonnet-4-6', ?2)",
+                params![id, at],
+            )
+            .unwrap();
+    }
+    insert_run_gh(&db, "mika", "s1", &["pr", "view", "1"], &old);
+    insert_run_gh(&db, "mika", "s1", &["pr", "view", "2"], &recent);
+
+    let llm_pruned = db.prune_old_llm_calls(THIRTY_DAYS_SECS).unwrap();
+    let tool_pruned = db.prune_old_tool_calls(THIRTY_DAYS_SECS).unwrap();
+    assert_eq!(
+        llm_pruned, 1,
+        "une seule ligne `llm_calls` dépasse 30 jours"
+    );
+    assert_eq!(
+        tool_pruned, 1,
+        "une seule ligne `tool_calls` dépasse 30 jours"
+    );
+
+    let remaining_llm: Vec<String> = db
+        .conn
+        .prepare("SELECT id FROM llm_calls ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        remaining_llm,
+        vec!["llm-recent".to_string()],
+        "la fenêtre garde le récent et ne garde que lui"
+    );
+
+    let remaining_tool: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM tool_calls", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        remaining_tool, 1,
+        "idem pour `tool_calls` : la rétention existe, et elle est de 30 jours"
+    );
+}
+
 /// The founding incident: two closes of PR #1644 seven minutes apart, from
 /// two DIFFERENT sessions (the second came from a deferred webhook replay).
 /// The query is agent-scoped precisely so the second one can see the first.

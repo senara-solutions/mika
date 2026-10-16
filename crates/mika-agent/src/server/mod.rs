@@ -121,6 +121,21 @@ const QA_REVIEW_RECONCILE_CRON: &str = "0 */15 * * * *";
 /// l'écart entre 55 % et 85 % que la purge manuelle refait trois fois par jour.
 const WORKTREE_REAP_CRON: &str = "0 */10 * * * *";
 
+/// Seuil de l'avertissement de taille de `mika.db` (mika#2658).
+///
+/// **Dérivation.** 1 012 Mo mesurés le 2026-10-03 − ≈ 475 Mo de payload
+/// `embedding_json` récupérés par la migration v56 ≈ 540 Mo de plancher, dont
+/// ≈ 240 Mo sont les fenêtres de 30 jours de `tool_calls` + `llm_calls`
+/// (`task_engine/engine.rs`, étape 5 de `startup_recovery`). × 1,5 ≈ 800 Mo.
+///
+/// **Pourquoi il bouge.** Le 500 Mo d'origine était franchi *en permanence* :
+/// un seuil qu'on ne repasse jamais sous n'alerte sur rien. Si la ligne
+/// `v56: vacuum complete` du premier démarrage après déploiement donne un
+/// plancher qui s'écarte de plus de 20 % de 540 Mo, corriger ce nombre ici —
+/// la dérivation est écrite pour qu'il soit recalculable, pas pour qu'il soit
+/// cru.
+const DB_SIZE_WARN_BYTES: u64 = 800_000_000;
+
 /// Build the Axum router with all routes and middleware.
 ///
 /// Shared between production `run_server` and test `test_app`.
@@ -806,8 +821,12 @@ async fn startup_cleanup(db: AsyncDatabase, embedding_client: Option<EmbeddingCl
 
     // Warn if DB is growing large
     match db.db_size_bytes().await {
-        Ok(size) if size > 500_000_000 => {
-            warn!(size_bytes = size, "database size exceeds 500MB");
+        Ok(size) if size > DB_SIZE_WARN_BYTES => {
+            warn!(
+                size_bytes = size,
+                threshold_bytes = DB_SIZE_WARN_BYTES,
+                "database size exceeds threshold"
+            );
         }
         Err(e) => warn!(error = %e, "failed to check database size"),
         _ => {}
@@ -1711,6 +1730,20 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 // décide s'il est appelé, donc rien n'est posté tant que
                 // l'opérateur n'a pas déclaré l'endpoint.
                 std::sync::Arc::new(crate::milestone_manager::HttpLivenessSink::new()),
+                // mika#2698 vol 1 — d'où viennent les vols terminés à évaluer.
+                // Scopée à la base de l'agent par défaut pour la même raison que
+                // le ledger ci-dessus : la cadence est une tâche de processus,
+                // sans agent propre, et `AsyncDatabase` porte l'`agent_id` que la
+                // requête filtre. `None` quand l'agent par défaut est absent —
+                // une source manquante rend un rapport sans la section, jamais un
+                // cycle mort. Lecture seule : aucune autorité d'écriture ne passe
+                // par ce paramètre.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::flight_source::DbFlightSource::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::milestone_manager::FlightSource>
+                }),
             ),
             Ok(None) => {
                 info!(

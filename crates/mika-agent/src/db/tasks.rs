@@ -2205,7 +2205,14 @@ impl Database {
     /// `process_start_time` is extracted from `metadata` JSON, where the
     /// executor writes it as a *string* (see `skills/executor.rs`). Rows
     /// without it come back as `None` — the caller sweeps them (D-3).
-    pub fn find_dispatch_children_with_pid(
+    ///
+    /// **`pub(crate)` since mika#2670**: outside this crate the only door to
+    /// *which pilot does this task carry?* is `live_pilot::resolve_task_pilot`,
+    /// terminal filter included. A caller that walks here instead omits that
+    /// filter by construction — which is exactly what `mika-cli` did, and what
+    /// the compiler now refuses rather than a source scan reporting after the
+    /// fact.
+    pub(crate) fn find_dispatch_children_with_pid(
         &self,
         parent_task_id: &str,
     ) -> Result<Vec<DispatchChild>> {
@@ -4742,5 +4749,76 @@ impl Database {
             .query_map(refs.as_slice(), Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Les vols d'implémentation **terminés** sur un ensemble de tickets, pour le
+    /// manager de milestone (mika#2698, vol 1). Lecture seule, zéro DDL, aucune
+    /// dépendance réseau : tout est déjà dans `tasks`.
+    ///
+    /// `issue_urls` est étendu à l'**ensemble clos des variantes**
+    /// ([`crate::task_state::tasks::issue_url_variants`]) pour chaque URL, donc
+    /// le suffixe `?phase=groom` est couvert tandis qu'un voisin numérique ne
+    /// l'est pas — même règle que `find_dispatch_children_for_issue_url`. Un
+    /// `issue_urls` vide rend `vec![]` plutôt qu'un `IN ()` invalide.
+    ///
+    /// **La borne temporelle est `COALESCE(completed_at, updated_at)`**, et le
+    /// `COALESCE` est portant plutôt que défensif : `update_task_completed`
+    /// estampille `completed_at`, mais un vol mort par `failed`/`cancelled` peut
+    /// n'avoir que son `updated_at`, et un vol mort est exactement celui que le
+    /// ticket demande de voir. Comparer une colonne nulle aurait rendu `NULL`,
+    /// c'est-à-dire un silence sur la moitié des issues. `since = None` ⇒ `""`,
+    /// qui est strictement inférieur à tout horodatage ISO 8601 : « depuis
+    /// toujours », au premier cycle, et non « rien ».
+    ///
+    /// **Le statut terminal se filtre en Rust**, par
+    /// [`crate::task_state::tasks::is_terminal_task_status`], et pas dans le SQL.
+    /// Ce serait une troisième copie de la liste, dans un dialecte où sa règle
+    /// « un statut inconnu n'est pas terminal » ne se lit pas (même raison,
+    /// nommée au même endroit, que `find_dispatch_children_for_issue_url`).
+    ///
+    /// `agent_id` est dans la requête comme dans toute autre méthode de tâche :
+    /// un manager ne voit que les vols de son propre agent.
+    pub fn list_finished_implement_flights(
+        &self,
+        agent_id: &str,
+        since: Option<&str>,
+        issue_urls: &[String],
+    ) -> Result<Vec<Task>> {
+        if issue_urls.is_empty() {
+            return Ok(vec![]);
+        }
+        let variants: Vec<String> = issue_urls
+            .iter()
+            .flat_map(|u| crate::task_state::tasks::issue_url_variants(u))
+            .collect();
+        let placeholders: String = (0..variants.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND COALESCE(dispatch_class, 'implement') = 'implement'
+               AND reference_url IN ({placeholders})
+               AND COALESCE(completed_at, updated_at) > ?2
+             ORDER BY COALESCE(completed_at, updated_at) ASC",
+            Self::TASK_COLUMNS,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(agent_id.to_string()),
+            Box::new(since.unwrap_or("").to_string()),
+        ];
+        for v in &variants {
+            bind.push(Box::new(v.clone()));
+        }
+        let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+        let rows: Vec<Task> = stmt
+            .query_map(refs.as_slice(), Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|t| crate::task_state::tasks::is_terminal_task_status(&t.status))
+            .collect())
     }
 }

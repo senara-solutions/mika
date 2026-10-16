@@ -24,8 +24,8 @@ ne rougit — aucun test ne voit un terme qui ne s'évalue jamais (classe mika#2
 
 GitHub **redirige** un dépôt renommé : `gh pr merge <n> --repo <ancien-nom>`
 atteint la même PR. Un appelant qui écrit encore l'ancien nom — un prompt
-périmé, une constante non migrée (`INTERNAL_REPOS` du gateway le liste encore)
-— passerait par une porte ouverte si la liste ne porte que le nouveau nom.
+périmé, un script d'opérateur, une constante non migrée — passerait par une
+porte ouverte si la liste ne porte que le nouveau nom.
 
 D'où la forme retenue dans `MPC_GATE_REQUIRED_REPOS` :
 
@@ -38,6 +38,15 @@ D'où la forme retenue dans `MPC_GATE_REQUIRED_REPOS` :
 Pour une liste qui **restreint** (population d'une garde), garder un alias ne
 coûte rien. Pour une liste qui **autorise**, la règle s'inverse : un alias élargit
 l'autorisation, et il faut le peser.
+
+**Ce pesage a été fait, et il a tranché contre l'alias** (mika#2666, le 2026-10-15) :
+`INTERNAL_REPOS` (`crates/mika-gateway/src/github.rs`) ne porte que le nom
+courant. Une entrée y ouvre une route sans ligne `github_repos` ; comme GitHub
+n'envoie que le nom courant, l'alias n'ouvrirait aucun chemin utile et ne
+laisserait qu'une entrée morte dans une liste adjacente à la sécurité. Les deux
+listes divergent donc à dessein, chacune portant sa raison au site, et une
+assertion négative (`test_is_internal_repo_unknown_repos`) refuse le
+réalignement « par symétrie ».
 
 ## La garde elle-même : un témoin de type, pas un scan
 

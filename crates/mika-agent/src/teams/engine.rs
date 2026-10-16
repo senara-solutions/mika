@@ -1830,6 +1830,10 @@ impl TeamEngine {
                                 // Propagate the team engine's trace_id so delegate agent
                                 // events correlate with the parent team run.
                                 trace_id: Some(trace_id.clone()),
+                                // mika#1926: the conversational parent is the team DB's
+                                // own scope — the agent the user is talking to — not a
+                                // member of `team.orchestrator`.
+                                parent_agent_id: Some(team_db.agent_id()),
                             };
                             crate::agent::run_team_agent(&params).await.map(|o| {
                                 // mika#1671: preserve the delegation classification
@@ -2287,6 +2291,8 @@ impl TeamEngine {
             message_sender: None,
             // Propagate the team engine's trace_id for correlation.
             trace_id: Some(self.trace_id.clone()),
+            // mika#1926: same conversational parent as the spawned path above.
+            parent_agent_id: Some(self.team_db.agent_id()),
         };
 
         crate::agent::run_team_agent(&params).await

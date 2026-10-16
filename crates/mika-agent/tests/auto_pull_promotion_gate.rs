@@ -36,6 +36,15 @@ fn fixture(name: &str) -> StalenessMeasurement {
 /// Measured 2026-09-01: 180 behind, 2 ahead, and a real `git rebase origin/main`
 /// conflicts on `agent_loop/mod.rs` and `evidence/guards.rs` — the same two
 /// files the issue reported on 2026-08-31.
+///
+/// **This is also the named negative control of the mika#2170 slug split, and
+/// the comment has to say so.** #1680 carries four `crates/**` files *on top of
+/// its plan*, so it stays `salvage_work_on_stale_branch` while a plan-less
+/// branch moves to `stale_branch_without_plan`. Read without this paragraph,
+/// the slug assertion below looks like an arbitrary string check that a future
+/// reader would "harmonise" with its neighbour on the #2048 fixture — and the
+/// split would stop being tested in the only direction that can go wrong
+/// silently, the one where the *old* name must survive.
 #[test]
 fn auto_pull_replay_1680_is_refused_by_name() {
     let m = fixture("1680-diverged-180-behind-2-ahead.json");
@@ -143,6 +152,16 @@ fn auto_pull_replay_1959_refusal_is_the_threshold_and_nothing_else() {
 ///   plan file.
 /// - #2048 itself is CLOSED and carries no grooming callout at all.
 ///
+/// **mika#2170 changed what carries that last conclusion, not the date.** The
+/// 2026-09-04 measurement still says the population was empty *that day*; what
+/// it never was, is a guard. It used to rest on a dormant ticket whose wake
+/// condition could not be evaluated (`non_plan_files` is `docs/plans/` filtered
+/// out, so the condition was trivially true of every salvage refusal). It now
+/// rests on a slug an operator can `GROUP BY`: this fixture is the **frozen
+/// positive population** of `stale_branch_without_plan`, and the day a real
+/// branch joins it, one query says so. The refusal itself is unchanged — only
+/// its name and its wording are.
+///
 /// The negative control this test used to provide — "behind, rebasable, still
 /// promoted" — is not lost: it moves to the #2118/#2120 replays below, on
 /// branches that are actually grooming branches, which is the population this
@@ -166,20 +185,33 @@ fn auto_pull_replay_2048_no_plan_file_is_refused_and_the_prefix_is_the_sole_caus
     );
 
     match classify_promotion(&m, Some("ci/2048-re-enable-release-please"), THRESHOLD) {
-        PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch {
-            non_plan_files, ..
+        PromotionGate::Refuse(RefusalReason::StaleBranchWithoutPlan {
+            ref changed_files, ..
         }) => {
+            // The mika#2140 assertion, kept whole: the refusal carries the files
+            // the operator must judge. On this population `changed_files` and
+            // `non_plan_files` are the same three paths — which is exactly the
+            // fact the new variant names.
             assert_eq!(
-                non_plan_files,
-                vec![
+                changed_files,
+                &vec![
                     ".github/workflows/release-pr.yml".to_string(),
                     "release-please-config.json".to_string(),
                     "version.txt".to_string(),
                 ]
             );
         }
-        other => panic!("expected a named salvage refusal, got {other:?}"),
+        other => panic!("expected a named plan-less refusal, got {other:?}"),
     }
+
+    // mika#2170 AC4 — the slug the operator's `GROUP BY` reads, and the one word
+    // the message must have lost: this branch may well be finished work.
+    let PromotionGate::Refuse(r) =
+        classify_promotion(&m, Some("ci/2048-re-enable-release-please"), THRESHOLD)
+    else {
+        unreachable!("just matched a refusal")
+    };
+    assert_eq!(r.slug(), "stale_branch_without_plan");
 }
 
 /// **AC3** — regression on the two real bodies the ticket measured.
@@ -249,6 +281,14 @@ fn auto_pull_replay_2118_and_2120_multi_pass_grooming_promotes() {
 /// boundary case where the prefix is the sole cause of a refusal that would
 /// otherwise have promoted, this assertion fails and the prefix question reopens
 /// instead of answering itself in silence.
+///
+/// **Second negative control of the mika#2170 split** (#1680 is the first).
+/// #1727 carries its plan *and* one document outside the prefix, so it keeps
+/// `salvage_work_on_stale_branch`: the split turns on whether a plan file is
+/// present at all, never on whether the offending path looks like code. Pinning
+/// it here is what keeps the two questions — "is this a grooming branch?" and
+/// "is this document or code?" — from being quietly merged, the second being
+/// precisely the policy decision mika#2140 reserved and D8 refuses.
 #[test]
 fn auto_pull_replay_1727_is_the_measured_boundary_case() {
     let m = fixture("1727-diverged-190-behind-3-ahead.json");
@@ -261,11 +301,8 @@ fn auto_pull_replay_1727_is_the_measured_boundary_case() {
         s.behind_by
     );
 
-    match classify_promotion(
-        &m,
-        Some("feat/1727/tui-tui-as-thin-http-client-of-mika"),
-        THRESHOLD,
-    ) {
+    let branch = Some("feat/1727/tui-tui-as-thin-http-client-of-mika");
+    match classify_promotion(&m, branch, THRESHOLD) {
         PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch {
             non_plan_files, ..
         }) => {
@@ -279,6 +316,118 @@ fn auto_pull_replay_1727_is_the_measured_boundary_case() {
         }
         other => panic!("expected a named salvage refusal, got {other:?}"),
     }
+
+    // mika#2170 AC5 — the negative control, asserted on the slug an operator
+    // actually queries rather than only on the variant a Rust reader sees.
+    let PromotionGate::Refuse(r) = classify_promotion(&m, branch, THRESHOLD) else {
+        unreachable!("just matched a refusal")
+    };
+    assert_eq!(r.slug(), "salvage_work_on_stale_branch");
+    // Non-vacuity of *this* control: the branch really does carry a plan, which
+    // is the only reason it keeps the old name.
+    assert!(
+        s.changed_files
+            .as_ref()
+            .expect("fixture carries a file list")
+            .iter()
+            .any(|f| f.starts_with("docs/plans/")),
+        "#1727 must carry its plan, else it is no longer a control of the split"
+    );
+}
+
+/// **mika#2170 AC3 / R5 — the patch renames refusals; it decides nothing.**
+///
+/// The one thing this work must not do is move a branch across the gate. So the
+/// partition is pinned whole, over every frozen fixture at once: which branches
+/// promote, which refuse, and — for the refusals — under which of the four
+/// slugs. Written as a literal table, so a change of verdict shows up as a diff
+/// a reviewer reads rather than as a test that silently still passes.
+///
+/// It is deliberately redundant with the per-fixture tests above. Those explain
+/// *why* each branch lands where it does and would each need its own edit;
+/// this one makes a decision change impossible to ship as a one-line edit to a
+/// single test. The two refusal names that appear here are the split, side by
+/// side: `stale_branch_without_plan` on the one branch carrying no plan,
+/// `salvage_work_on_stale_branch` on the two that carry one.
+#[test]
+fn auto_pull_replay_the_promote_refuse_partition_is_unchanged() {
+    let expected: [(&str, &str, &str); 7] = [
+        // fixture, branch, verdict (promote detail, or refusal slug)
+        (
+            "1680-diverged-180-behind-2-ahead.json",
+            "fix/1680/mika-dev-tui-broken-glyph-rendering-in",
+            "salvage_work_on_stale_branch",
+        ),
+        (
+            "1727-diverged-190-behind-3-ahead.json",
+            "feat/1727/tui-tui-as-thin-http-client-of-mika",
+            "salvage_work_on_stale_branch",
+        ),
+        (
+            "1959-diverged-75-behind-1-ahead.json",
+            "feat/1959/mcp-manifest-data-grade-field-l4-forward",
+            "branch_too_far_behind",
+        ),
+        (
+            "2048-diverged-17-behind-1-ahead.json",
+            "ci/2048-re-enable-release-please",
+            "stale_branch_without_plan",
+        ),
+        (
+            "2118-diverged-13-behind-3-ahead.json",
+            "fix/2118/skills-cloud-sur-un-tenant-cloud-google",
+            "behind_within_threshold",
+        ),
+        (
+            "2120-diverged-13-behind-2-ahead.json",
+            "fix/2120/auto-pull-is-groomed-exige-docs-plans",
+            "behind_within_threshold",
+        ),
+        (
+            "2123-ahead-0-behind-1-ahead.json",
+            "fix/2123/dispatch-lib-le-rebase-est-tent-au",
+            "up_to_date",
+        ),
+    ];
+
+    // The refused set and the promoted set, named rather than counted: a count
+    // survives two branches swapping sides, which is the failure this guards.
+    let mut refused: Vec<&str> = Vec::new();
+    let mut promoted: Vec<&str> = Vec::new();
+    for (name, branch, verdict) in expected {
+        match classify_promotion(&fixture(name), Some(branch), THRESHOLD) {
+            PromotionGate::Refuse(r) => {
+                assert_eq!(r.slug(), verdict, "{name}: refusal slug changed");
+                refused.push(name);
+            }
+            PromotionGate::Promote { detail } => {
+                assert_eq!(detail, verdict, "{name}: promotion detail changed");
+                promoted.push(name);
+            }
+        }
+    }
+
+    assert_eq!(
+        refused,
+        vec![
+            "1680-diverged-180-behind-2-ahead.json",
+            "1727-diverged-190-behind-3-ahead.json",
+            "1959-diverged-75-behind-1-ahead.json",
+            "2048-diverged-17-behind-1-ahead.json",
+        ]
+    );
+    assert_eq!(
+        promoted,
+        vec![
+            "2118-diverged-13-behind-3-ahead.json",
+            "2120-diverged-13-behind-2-ahead.json",
+            "2123-ahead-0-behind-1-ahead.json",
+        ]
+    );
+    // Non-vacuity: this is a partition, so neither side may be empty — a table
+    // that accidentally lost its promotions would otherwise pass.
+    assert_eq!(refused.len() + promoted.len(), 7);
+    assert!(!refused.is_empty() && !promoted.is_empty());
 }
 
 /// AE3 — a branch at distance 0 is promoted with no further check. This is the

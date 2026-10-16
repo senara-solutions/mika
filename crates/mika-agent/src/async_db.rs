@@ -1172,7 +1172,12 @@ impl AsyncDatabase {
     /// No extra agent scoping: the parent row was already selected by
     /// `find_phantom_tracking_tasks`, which is agent-scoped, and a child is
     /// reachable only through its parent's id.
-    pub async fn find_dispatch_children_with_pid(
+    ///
+    /// **`pub(crate)` since mika#2670**, like the sync handle it wraps: outside
+    /// this crate the only door to *which pilot does this task carry?* is
+    /// `live_pilot::resolve_task_pilot`, terminal filter included. This was the
+    /// handle `mika-cli` reached for, and the filter it skipped.
+    pub(crate) async fn find_dispatch_children_with_pid(
         &self,
         parent_task_id: &str,
     ) -> Result<Vec<crate::db::DispatchChild>> {
@@ -1860,6 +1865,22 @@ impl AsyncDatabase {
         self.with_db(move |db| {
             let refs: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
             db.get_tasks_by_status_and_label(&id, &refs, label_contains.as_deref())
+        })
+        .await
+    }
+
+    /// Les vols d'implémentation terminés sur un ensemble de tickets (mika#2698).
+    /// Voir [`crate::db::Database::list_finished_implement_flights`] pour la
+    /// borne temporelle, l'ensemble clos des variantes d'URL et le filtre de
+    /// statut terminal.
+    pub async fn list_finished_implement_flights(
+        &self,
+        since: Option<String>,
+        issue_urls: Vec<String>,
+    ) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| {
+            db.list_finished_implement_flights(&id, since.as_deref(), &issue_urls)
         })
         .await
     }

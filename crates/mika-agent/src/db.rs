@@ -32,7 +32,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 55;
+pub const CURRENT_SCHEMA_VERSION: i64 = 56;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -4869,12 +4869,19 @@ impl Database {
         }
     }
 
+    /// Indexe un embedding : la copie durable part dans `vec_search`, et
+    /// `search_content` n'en garde qu'un marqueur de dimension (mika#2658).
+    ///
+    /// La sérialisation JSON reste nécessaire — c'est la forme sous laquelle
+    /// vec0 accepte un vecteur en paramètre — mais elle est **transitoire** :
+    /// stockée dans `search_content`, elle coûtait ≈ 7,7 Ko par ligne pour
+    /// dupliquer les 2 Ko que vec0 tient déjà, et aucun lecteur ne la relisait.
     pub fn index_embedding(&self, content_id: i64, embedding: &[f32]) -> Result<()> {
         let emb_json = serde_json::to_string(embedding)?;
         self.conn.execute(
-            "UPDATE search_content SET embedding_json = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            "UPDATE search_content SET embedding_dims = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?2",
-            params![emb_json, content_id],
+            params![embedding.len() as i64, content_id],
         )?;
         // Upsert into vec0 table
         let _ = self.conn.execute(
@@ -4915,10 +4922,14 @@ impl Database {
     }
 
     /// Returns search content rows that have no embedding yet (for backfill).
+    ///
+    /// Le marqueur est `embedding_dims IS NULL` depuis mika#2658 ; le contrat
+    /// d'idempotence du backfill est inchangé — seul le nom de la colonne a
+    /// bougé.
     pub fn get_unembedded_content(&self, agent_id: &str) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content FROM search_content
-             WHERE agent_id = ?1 AND embedding_json IS NULL",
+             WHERE agent_id = ?1 AND embedding_dims IS NULL",
         )?;
         let rows = stmt.query_map(params![agent_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

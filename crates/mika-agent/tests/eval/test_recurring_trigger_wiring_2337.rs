@@ -49,33 +49,63 @@
 //! la ligne de mort affirmait un décalage de version sans porter de quoi
 //! l'établir.
 //!
-//! Quatre gardes s'ajoutent ici, chacune avec sa disposition déclarée :
+//! Quatre gardes étaient annoncées ici. **Deux vivent dans l'arbre ; deux n'ont
+//! jamais été écrites** — constat du 2026-10-15, mika#2351, et il est consigné
+//! plutôt que corrigé en silence parce qu'un module-doc qui cite par `[lien]`
+//! des tests inexistants est une attestation fausse, et que la lecture de ce
+//! fichier en est la seule source.
 //!
 //! - **D-1** [`mika2446_l_inventaire_est_la_projection_exacte_du_match`] —
 //!   `ROUTABLE_TRIGGERS` est l'égal ensembliste des bras du `match`. Liste
 //!   blanche **vide** : quand elle tire, on corrige la constante. Une exception
 //!   ici recréerait très exactement le défaut que la garde interdit, un
-//!   inventaire qui ment.
-//! - **D-2** [`mika2446_chaque_trigger_routable_a_un_armement`] — la sonde de
-//!   tir a une entrée d'herméticité **par** membre de `ROUTABLE_TRIGGERS`.
-//!   **Aucune liste blanche du tout** : une entrée « ce trigger est dispensé
-//!   d'armement » signifierait « ce trigger est tiré en test sans ceinture »,
-//!   c'est-à-dire la possibilité qu'une sonde supprime de vrais worktrees.
-//! - **D-3** [`mika2446_le_stop_precede_le_jeton_et_git_dans_le_reaper`] — dans
-//!   `dispatch_worktree_reap`, le test du STOP précède la première résolution de
-//!   jeton et la première invocation de `git`. **Aucune ligne de production
-//!   n'est déplacée** : la propriété est déjà vraie (mika#2420 l'a écrite avec
-//!   son raisonnement sur le site) ; la garde l'épingle parce que la sûreté
-//!   d'une sonde destructive en dépend désormais.
+//!   inventaire qui ment. **Livrée par mika#2351** (AC2), qui en a besoin : son
+//!   prédicat de routabilité décide désormais si une ligne est réclamée.
+//!   mika#2446 l'avait citée sous ce nom sans l'écrire.
+//! - **D-2** `mika2446_chaque_trigger_routable_a_un_armement` — **absente de
+//!   l'arbre.** Elle voulait une entrée d'herméticité par membre de
+//!   `ROUTABLE_TRIGGERS`, sans aucune liste blanche. Hors périmètre de
+//!   mika#2351, qui ne touche pas à l'herméticité des sondes ; à rouvrir sur
+//!   mika#2446.
+//! - **D-3** `mika2446_le_stop_precede_le_jeton_et_git_dans_le_reaper` —
+//!   **absente de l'arbre.** Elle voulait épingler, dans
+//!   `dispatch_worktree_reap`, que le test du STOP précède la première
+//!   résolution de jeton et la première invocation de `git`. La propriété est
+//!   probablement toujours vraie (mika#2420 l'a écrite ainsi) mais **rien ne la
+//!   tient**. Hors périmètre de mika#2351 ; à rouvrir sur mika#2446.
 //! - **D-4** — le contrôle négatif `zorglub` atteste en plus la présence et la
 //!   **non-vacuité** des champs d'attribution sur la ligne émise. Complément et
 //!   non jumeau de `build_info::tests::git_hash_is_never_empty`, qui couvre la
 //!   *constante* : une constante saine câblée sur rien produirait une ligne
 //!   muette avec un test vert. Halte-et-remontée — un champ vide signifie que
 //!   l'instrument ne tient pas sa promesse, donc que le correctif est faux.
+//!   Vit dans l'arbre, portée par le test `..._meurt_nomme_audite_et_marque`.
 //!
-//! Et la sonde elle-même, [`mika2446_chaque_trigger_routable_est_tire`], tire
-//! **chaque** membre de l'inventaire par le chemin récurrent réel.
+//! La « sonde elle-même », `mika2446_chaque_trigger_routable_est_tire`, qui
+//! devait tirer **chaque** membre de l'inventaire par le chemin récurrent réel,
+//! est également **absente**. `test_dispatcher_in` et `GLOBAL_HOME_ABSENT`
+//! existent et sont documentés comme étant les degrés de liberté dont elle avait
+//! besoin : c'est l'échafaudage d'une sonde qui n'a pas été posée.
+//!
+//! # mika#2351 — le moteur CLI ne réclame pas ce qu'il ne sait pas router
+//!
+//! La « portée honnête (AC9) » ci-dessus nommait le décalage entre le code mergé
+//! et le code en exécution comme hors d'atteinte de ces gardes. Ce décalage a
+//! frappé deux fois de plus (`fb425f89` le 16/09, `9bc130d0` le 17/09) et il est
+//! désormais **localisé** : dans le `TaskEngine` du TUI, pas dans le spirit.
+//! mika#2351 le ferme côté comportement — le moteur `cli_mode` teste la
+//! routabilité **avant** `claim_and_fire_task` et laisse au démon ce qu'il ne
+//! sait pas router. Deux conséquences pour ce fichier :
+//!
+//! - [`mika2351_le_moteur_cli_ne_reclame_pas_un_trigger_inconnu`] mesure
+//!   l'invariance de la ligne sautée, **avec son contrôle positif dans le même
+//!   test** : sans lui, un moteur qui ne tirerait plus rien du tout serait vert.
+//! - [`mika2337_un_trigger_inconnu_meurt_nomme_audite_et_marque`] tourne
+//!   désormais sur le **démon** ([`test_dispatcher_daemon`]). `test_dispatcher_in`
+//!   câble `cli_mode: true`, donc ce test mesurait le moteur secondaire sans le
+//!   dire ; depuis mika#2351 cette distinction porte un comportement, et la mort
+//!   nommée est le chemin nominal du moteur canonique. Vérifié nécessaire : sous
+//!   `cli_mode: true` la sonde panique au bout de 6 s sans avoir tiré.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,7 +117,7 @@ use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, RECURRING_UNKNOWN_TRIGGER_PATH};
 use mika_agent::messaging::{MessageSender, SendOutcome};
 use mika_agent::skills::SkillRegistry;
-use mika_agent::task_engine::dispatcher::TaskDispatcher;
+use mika_agent::task_engine::dispatcher::{ROUTABLE_TRIGGERS, TaskDispatcher};
 use mika_agent::task_engine::engine::TaskEngine;
 use mika_agent::tools::default_tools;
 
@@ -468,6 +498,70 @@ fn mika2337_les_faux_membres_restent_hors_de_la_population() {
     );
 }
 
+// ──────────────── D-1 (mika#2446) — bijection inventaire ↔ `match` ────────────────
+
+/// **D-1 de mika#2446, livrée par mika#2351 (AC2).** [`ROUTABLE_TRIGGERS`] est
+/// l'égal ensembliste des bras du `match trigger_name`, **dans les deux sens**.
+///
+/// Son nom est celui que `dispatcher.rs` et le module-doc ci-dessus citaient
+/// déjà : elle a été annoncée par mika#2446 sans être écrite, et un inventaire
+/// dont l'honnêteté est *affirmée* sans être *tenue* est très exactement ce que
+/// son propre doc-comment déclare pire que pas d'inventaire. mika#2351 en a
+/// besoin pour une raison de plus : son prédicat de routabilité
+/// ([`is_routable_trigger`], consulté **avant** le claim en mode CLI) décide
+/// désormais si une ligne est tirée ou laissée au démon. Une entrée d'inventaire
+/// sans bras ferait réclamer une tâche que le `match` enverrait au catch-all ;
+/// un bras sans entrée ferait sauter une tâche que ce binaire sait router.
+///
+/// Liste blanche **vide**, et ce vide est la propriété : une exception « ce bras
+/// est dispensé d'entrée d'inventaire » recréerait le défaut que la garde
+/// interdit. Quand elle tire, on corrige la constante.
+#[test]
+fn mika2446_l_inventaire_est_la_projection_exacte_du_match() {
+    let arms = match_arm_triggers();
+
+    // Une garde qui comparerait deux ensembles vides serait verte pour la
+    // mauvaise raison : `match_arm_triggers` panique si le bloc est
+    // introuvable, mais un parseur devenu aveugle aux bras rendrait `[]`.
+    assert!(
+        arms.len() >= 7,
+        "population attendue ≥ 7 bras dans `match trigger_name` — trouvé {} : \
+         {arms:?}. Un parseur devenu aveugle doit rougir, pas comparer à vide.",
+        arms.len()
+    );
+    assert!(
+        ROUTABLE_TRIGGERS.len() >= 7,
+        "inventaire attendu ≥ 7 entrées — trouvé {} : {ROUTABLE_TRIGGERS:?}",
+        ROUTABLE_TRIGGERS.len()
+    );
+
+    let sans_entree: Vec<&String> = arms
+        .iter()
+        .filter(|arm| !ROUTABLE_TRIGGERS.contains(&arm.as_str()))
+        .collect();
+    assert!(
+        sans_entree.is_empty(),
+        "bras sans entrée d'inventaire : {sans_entree:?}. Ce binaire sait router \
+         ces triggers mais `ROUTABLE_TRIGGERS` ne les déclare pas — le prédicat \
+         de routabilité (mika#2351) laisserait au démon une ligne que le CLI \
+         savait tirer, et l'inventaire émis par la ligne de mort mentirait par \
+         défaut. Ajoutez-les à la constante."
+    );
+
+    let sans_bras: Vec<&&str> = ROUTABLE_TRIGGERS
+        .iter()
+        .filter(|trigger| !arms.iter().any(|arm| arm == *trigger))
+        .collect();
+    assert!(
+        sans_bras.is_empty(),
+        "entrée d'inventaire sans bras : {sans_bras:?}. L'inventaire promet un \
+         routage que `dispatch_run_skill` n'a pas — le prédicat de routabilité \
+         (mika#2351) réclamerait la ligne, puis le `match` l'enverrait au \
+         catch-all et elle mourrait. Retirez-les de la constante, ou ajoutez le \
+         bras."
+    );
+}
+
 // ───────────────────────── V3.2 — sonde de tir ─────────────────────────
 
 struct NoopSender;
@@ -537,6 +631,28 @@ fn test_dispatcher_in(
         auto_pull_stop_armed: AtomicBool::new(false),
         worktree_reap_stop_armed: AtomicBool::new(false),
         proactive_budget_reported: std::sync::Mutex::new(None),
+    })
+}
+
+/// Le même dispatcher, en **démon** (mika#2351 AC4-b).
+///
+/// `test_dispatcher_in` câble `cli_mode: true` : toute sonde de ce fichier
+/// mesurait donc, sans le dire, le moteur **secondaire**. Depuis mika#2351 cette
+/// distinction porte un comportement — le moteur CLI ne réclame pas un trigger
+/// qu'il ne sait pas router — alors le test qui atteste la mort nommée doit
+/// nommer le moteur où cette mort est le chemin nominal : le démon.
+///
+/// La surcharge par `..` plutôt qu'un second constructeur : `TaskDispatcher`
+/// porte des `AtomicBool` et un `Mutex`, donc n'est pas `Clone`, et dupliquer
+/// les vingt champs ferait deux dispatchers de test qui dérivent. Même motif
+/// qu'`engine.rs::mika2575_le_mode_cli_ne_rearme_pas`, dans l'autre sens.
+fn test_dispatcher_daemon(db: AsyncDatabase) -> Arc<TaskDispatcher> {
+    let dispatcher = test_dispatcher(db);
+    Arc::new(TaskDispatcher {
+        cli_mode: false,
+        ..Arc::try_unwrap(dispatcher)
+            .ok()
+            .expect("un seul détenteur à cet instant")
     })
 }
 
@@ -665,12 +781,22 @@ async fn mika2337_la_recurrence_qa_review_reconcile_ne_tombe_pas_dans_le_catch_a
 /// `task dispatch failed`) et **marquée** — et c'est ce marqueur qui empêche le
 /// veto mika#1742 de survivre à la mort, ce que les jumeaux `db::tests::mika2337_*`
 /// attestent côté ré-inscription.
+/// **Moteur : le démon** (`cli_mode: false`, mika#2351 AC4-b). C'est là que la
+/// mort par trigger inconnu est le chemin nominal — le moteur canonique n'a
+/// personne à qui déférer, donc une tâche qu'il ne sait pas router doit échouer
+/// bruyamment plutôt qu'attendre en silence. Les onze assertions ci-dessous sont
+/// inchangées ; seul le moteur est désormais **nommé**, au lieu d'être le `true`
+/// par défaut de `test_dispatcher_in`.
 #[tokio::test]
 async fn mika2337_un_trigger_inconnu_meurt_nomme_audite_et_marque() {
     let db = test_db();
-    let id = fire_recurring(&db, "zorglub_scan", r#"{"trigger":"zorglub"}"#, |t| {
-        t.status == "failed"
-    })
+    let id = fire_recurring_with(
+        &db,
+        "zorglub_scan",
+        r#"{"trigger":"zorglub"}"#,
+        test_dispatcher_daemon(db.clone()),
+        |t| t.status == "failed",
+    )
     .await;
 
     let task = db.get_task(&id).await.unwrap().unwrap();
@@ -769,5 +895,136 @@ async fn mika2337_un_trigger_inconnu_meurt_nomme_audite_et_marque() {
          c'est lui qui fait que le redémarrage suivant ré-inscrit au lieu \
          d'attendre 24 h ; metadata: {:?}",
         task.metadata
+    );
+}
+
+// ───────── mika#2351 — le moteur CLI ne réclame pas ce qu'il ne route pas ─────────
+
+/// **AC1 et AC4-a de mika#2351.** Moteur `cli_mode: true` : une récurrence due
+/// dont ce binaire ne sait pas router le trigger n'est **pas réclamée**, et sa
+/// ligne est intacte après le tick (`status`, `fired_at`, `next_fire_at`,
+/// `updated_at`). Elle reste au démon, qui est le moteur canonique.
+///
+/// C'est l'incident du 16 et du 17/09 (n=2) mis sous test : `fb425f89` et
+/// `9bc130d0` sont mortes dans le TUI `mika --agent mika-dev`, pas dans le
+/// spirit. `claim_and_fire_task` est atomique sur
+/// `(id, agent_id, status IN ('pending','recurring_active'))`, donc les deux
+/// moteurs se disputent **chaque** tick de chaque récurrence de l'agent et le
+/// premier qui réclame tire. Quand le TUI périmé gagnait, il tombait sur le
+/// catch-all et passait la ligne en `failed` ; le veto mika#1742 armait alors
+/// 24 h, correctement.
+///
+/// **Le contrôle positif est dans ce test, et le prédicat d'arrêt porte sur
+/// lui.** Un test qui ne regarderait que la ligne sautée serait vert si le
+/// moteur CLI ne tirait plus rien du tout — exactement la régression qu'un
+/// « ne réclame pas » mal posé produit. `qa_review_reconcile` est donc enregistrée
+/// sur la **même base**, tirée par le **même** moteur, et la boucle ne rend la
+/// main que lorsque *elle* a fait feu. Alors seulement l'invariance de
+/// `zorglub_scan` veut dire quelque chose.
+#[tokio::test]
+async fn mika2351_le_moteur_cli_ne_reclame_pas_un_trigger_inconnu() {
+    let db = test_db();
+
+    // La ligne non routable est inscrite **avant** le tir et son état est
+    // capturé : c'est son invariance, champ par champ, qui est mesurée.
+    mika_agent::task_engine::ensure_recurring_task(
+        &db,
+        "zorglub_scan",
+        "* * * * * *",
+        r#"{"trigger":"zorglub"}"#,
+    )
+    .await;
+    let skipped_id = db
+        .get_tasks_by_status(vec!["recurring_active".to_string()])
+        .await
+        .expect("lire les récurrences")
+        .into_iter()
+        .find(|t| t.label == "zorglub_scan")
+        .map(|t| t.id)
+        .expect("la récurrence non routable doit être enregistrée");
+    let before = db
+        .get_task(&skipped_id)
+        .await
+        .unwrap()
+        .expect("la ligne existe avant le tick");
+    assert!(
+        !mika_agent::task_engine::dispatcher::is_routable_trigger("zorglub"),
+        "le test ne vaut que si `zorglub` est bien hors de l'inventaire de ce binaire"
+    );
+
+    // Contrôle positif : `fire_recurring` câble `cli_mode: true`, et sa boucle
+    // panique si rien n'a fait feu en 6 s. Le témoin du tir est `fired_at`, que
+    // seul `claim_and_fire_task` renseigne — donc il ne peut pas être satisfait
+    // par un moteur qui aurait cessé de réclamer.
+    let control_id = fire_recurring(
+        &db,
+        "qa_review_reconcile",
+        r#"{"trigger":"qa_review_reconcile"}"#,
+        |t| t.fired_at.is_some(),
+    )
+    .await;
+
+    let control = db.get_task(&control_id).await.unwrap().unwrap();
+    assert!(
+        control.fired_at.is_some(),
+        "contrôle positif : un trigger routable doit être réclamé et tiré par le \
+         moteur CLI. Sans lui, l'invariance mesurée plus bas serait aussi celle \
+         d'un moteur qui ne tire plus rien ; résultat: {:?}",
+        control.result
+    );
+    assert_ne!(
+        control.status, "failed",
+        "contrôle positif : le trigger routable ne doit pas mourir ; résultat: {:?}",
+        control.result
+    );
+
+    // La ligne non routable, maintenant que le moteur a prouvé qu'il tirait.
+    let after = db
+        .get_task(&skipped_id)
+        .await
+        .unwrap()
+        .expect("la ligne non routable doit toujours exister");
+
+    assert_eq!(
+        after.status, "recurring_active",
+        "AC1 — la ligne non routable doit rester `recurring_active` pour le démon. \
+         `failed` signifie que le moteur CLI l'a réclamée puis tuée sur un trigger \
+         qu'il ne sait pas router : c'est l'incident de mika#2351 ; résultat: {:?}",
+        after.result
+    );
+    assert_eq!(
+        after.fired_at, before.fired_at,
+        "AC1 — `fired_at` est le témoin du claim. S'il a bougé, le moteur CLI a \
+         réclamé la tâche, et le test de routabilité est passé **après** \
+         `claim_and_fire_task` au lieu d'avant"
+    );
+    assert_eq!(
+        after.next_fire_at, before.next_fire_at,
+        "AC1 — `next_fire_at` inchangé : le moteur CLI ne doit ni replanifier ni \
+         désarmer une ligne qu'il laisse au démon"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "AC1 — la ligne est intacte, pas seulement « encore active » : une écriture \
+         sans changement d'état reste une écriture sur une ligne que deux moteurs \
+         se disputent"
+    );
+    assert_eq!(
+        db.count_audit_events_by_tool_name("recurring_unknown_trigger")
+            .await
+            .unwrap(),
+        0,
+        "une tâche non réclamée n'est pas une tâche morte : le moteur CLI n'a rien \
+         à auditer sous la classe que le démon réserve à ses propres morts"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_str(after.metadata.as_deref().unwrap_or("{}"))
+            .expect("metadata JSON valide");
+    assert_eq!(
+        metadata.get("unknown_trigger_death"),
+        None,
+        "le marqueur de mort mika#2337 ne doit pas être posé sur une ligne vivante ; \
+         metadata: {:?}",
+        after.metadata
     );
 }

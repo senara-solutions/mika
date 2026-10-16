@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
+use mika_agent::live_pilot::TaskPilot;
 use mika_agent::task_engine::engine::{HANDLER_FAILURE_METADATA_KEY, HandlerFailure};
 use mika_common::config::Settings;
 use serde_json::{Value, json};
@@ -544,18 +545,6 @@ fn short(id: &str) -> &str {
     &id[..12.min(id.len())]
 }
 
-/// `process_start_time` as the executor writes it into task metadata: a JSON
-/// *string*. An integer is accepted too, matching `find_dispatch_children_with_pid`.
-fn start_time_from_metadata(metadata: Option<&str>) -> Option<u64> {
-    let v: Value = serde_json::from_str(metadata?).ok()?;
-    let field = v.get("process_start_time")?;
-    match field {
-        Value::String(s) => s.parse().ok(),
-        Value::Number(n) => n.as_u64(),
-        _ => None,
-    }
-}
-
 /// Seconds since `<pilot_log_dir>/<task-id>.log` was last written.
 ///
 /// Same derivation as the silent-stall reaper (mika#2277) and the same
@@ -570,61 +559,68 @@ fn pilot_log_idle_secs(settings: &Settings, log_id: &str) -> Option<u64> {
 /// Measure the liveness of the pilot behind `t`, whichever of the two rows of a
 /// dispatch `t` happens to be.
 ///
-/// A **callback** row carries the pgid itself. A **parent** tracking row never
-/// does — its pilot hangs off a `parent_task_id`-linked child, which is exactly
-/// the traversal `find_dispatch_children_with_pid` performs (mika#2156). The
-/// parent is the row an operator consults, so before mika#2335 the one surface
-/// that could have contradicted the misleading status showed nothing at all.
+/// **The traversal is not performed here** (mika#2670).
+/// [`mika_agent::live_pilot::resolve_task_pilot`] is the sole reader of *which
+/// pilot does this task carry?* since mika#2653 phase B, and this function only
+/// classifies what it hands back. Written a second time — as it was until
+/// mika#2670 — the two readings diverge in silence, and they had: this one
+/// applied the **terminal filter in neither branch**, so a terminal callback row
+/// still carrying a live pgid printed "pilot alive" to the operator while the
+/// engine held it out of population. The discrimination between the two rows of
+/// a dispatch (mika#2156) is now the sole reader's — a non-terminal
+/// `process_id` on the row itself — and no longer `trigger_type == "callback"`.
+///
+/// What stays here is the **classification**, because the operator's question is
+/// not the engine's: the verdict side of `live_pilot` has three fail-safe arms,
+/// whereas an operator needs a dead PID told apart from no pilot at all, and a
+/// PID that cannot be verified printed *with* its PID.
 async fn probe_pilot_liveness(db: &AsyncDatabase, settings: &Settings, t: &Task) -> PilotLiveness {
-    if t.trigger_type == "callback" {
-        let Some(pid) = t.process_id else {
-            return PilotLiveness::NoPilot;
-        };
-        let Some(start_time) = start_time_from_metadata(t.metadata.as_deref()) else {
-            return PilotLiveness::Unverifiable {
+    match mika_agent::live_pilot::resolve_task_pilot(db, &t.id, Some(t)).await {
+        // The row carries the pgid itself. Without a readable
+        // `process_start_time` a recycled PID cannot be told from the pilot, so
+        // we claim neither.
+        TaskPilot::Named { pid, start_time } => match start_time {
+            Some(start_time) => classify(pid, None, start_time, settings, &t.id),
+            None => PilotLiveness::Unverifiable {
                 pid,
                 child_id: None,
-            };
-        };
-        return classify(pid, None, start_time, settings, &t.id);
-    }
-
-    let children = match db.find_dispatch_children_with_pid(&t.id).await {
-        Ok(c) => c,
-        Err(_) => return PilotLiveness::Unknown,
-    };
-
-    // A parent can carry several PID-bearing children across retries, so the
-    // answers must be ranked rather than overwritten: **alive > unverifiable >
-    // dead > none**. A live child is the answer outright. Failing that, an
-    // *unverifiable* child outranks a dead one — we checked the dead one and it
-    // is gone, whereas the unverifiable one might be running and we cannot tell.
-    // Letting a later dead child overwrite an earlier unverifiable one would
-    // print "no live pilot" over a genuine unknown, which is the fail-safe
-    // inversion this whole ticket exists to remove.
-    let mut fallback = PilotLiveness::NoPilot;
-    for child in children {
-        let candidate = match child.process_start_time {
-            Some(start_time) => classify(
-                child.process_id,
-                Some(child.id.clone()),
-                start_time,
-                settings,
-                &child.id,
-            ),
-            None => PilotLiveness::Unverifiable {
-                pid: child.process_id,
-                child_id: Some(child.id),
             },
-        };
-        if matches!(candidate, PilotLiveness::Alive { .. }) {
-            return candidate;
+        },
+        // A parent can carry several PID-bearing children across retries, so the
+        // answers must be ranked rather than overwritten: **alive > unverifiable >
+        // dead > none**. A live child is the answer outright. Failing that, an
+        // *unverifiable* child outranks a dead one — we checked the dead one and it
+        // is gone, whereas the unverifiable one might be running and we cannot tell.
+        // Letting a later dead child overwrite an earlier unverifiable one would
+        // print "no live pilot" over a genuine unknown, which is the fail-safe
+        // inversion this whole ticket exists to remove.
+        TaskPilot::Children(children) => {
+            let mut fallback = PilotLiveness::NoPilot;
+            for child in children {
+                let candidate = match child.process_start_time {
+                    Some(start_time) => classify(
+                        child.process_id,
+                        Some(child.id.clone()),
+                        start_time,
+                        settings,
+                        &child.id,
+                    ),
+                    None => PilotLiveness::Unverifiable {
+                        pid: child.process_id,
+                        child_id: Some(child.id),
+                    },
+                };
+                if matches!(candidate, PilotLiveness::Alive { .. }) {
+                    return candidate;
+                }
+                if candidate.rank() > fallback.rank() {
+                    fallback = candidate;
+                }
+            }
+            fallback
         }
-        if candidate.rank() > fallback.rank() {
-            fallback = candidate;
-        }
+        TaskPilot::ChildrenUnreadable(_) => PilotLiveness::Unknown,
     }
-    fallback
 }
 
 fn classify(
@@ -865,6 +861,135 @@ mod tests {
     use super::*;
     use mika_agent::db::OrphanedPendingTask;
 
+    // -- the terminal filter reaches the operator's surface (mika#2670) --
+
+    /// A callback row, as `dispatch-lib` leaves it: the pgid on the row itself,
+    /// `process_start_time` in metadata, `status` as the parameter says.
+    ///
+    /// One parameterized helper rather than two: `NewTask` carries ~22 fields,
+    /// and the only thing the negative control and its positive twin disagree
+    /// about is `status`. Two helpers would let that one difference drift.
+    #[cfg(target_os = "linux")]
+    async fn seed_callback_row(status: &str, pid: i64, start_time: u64) -> (AsyncDatabase, Task) {
+        use mika_agent::db::{Database, NewTask};
+
+        const AGENT: &str = "mika";
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            AGENT,
+        );
+        let id = db
+            .create_task(NewTask {
+                agent_id: AGENT.to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 1,
+                label: "long_running:run_claude_pilot".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("s".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .expect("create callback row");
+        if status != "pending" {
+            db.update_task_status(&id, status)
+                .await
+                .expect("set status");
+        }
+        db.set_task_process_id(&id, Some(pid))
+            .await
+            .expect("record pgid");
+        db.set_task_metadata_field(&id, "process_start_time", &start_time.to_string())
+            .await
+            .expect("record start time");
+        let t = db
+            .get_task(&id)
+            .await
+            .expect("read back")
+            .expect("row exists");
+        (db, t)
+    }
+
+    /// Our own process: alive, with a start time that matches by construction.
+    /// Same device as `live_pilot.rs`'s `self_pid_and_start()` — a *real* live
+    /// PID, because a synthetic one would make the negative control vacant.
+    #[cfg(target_os = "linux")]
+    fn self_pid_and_start() -> (i64, u64) {
+        let pid = std::process::id();
+        let st = mika_agent::task_engine::process_liveness::read_process_start_time(pid)
+            .expect("read own start time");
+        (i64::from(pid), st)
+    }
+
+    /// **AC3 of mika#2670** — a terminal row carrying a live PID is not shown
+    /// alive.
+    ///
+    /// This is the defect, in one assertion. `dispatch-lib`'s EXIT trap delivers
+    /// the callback from **inside the still-running wrapper**, so `delivered`
+    /// precedes process exit by a real window: a terminal row whose pgid is
+    /// still alive is the nominal state during that window, not a laboratory
+    /// curiosity. The engine holds such a row out of population; until mika#2670
+    /// this surface printed "pilot alive" over it, because it redid the
+    /// traversal without the terminal filter.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2670_une_ligne_terminale_a_pid_vivant_nest_pas_affichee_vivante() {
+        let (pid, start_time) = self_pid_and_start();
+        let (db, t) = seed_callback_row("delivered", pid, start_time).await;
+
+        let liveness = probe_pilot_liveness(&db, &Settings::test_defaults(), &t).await;
+
+        assert!(
+            !matches!(liveness, PilotLiveness::Alive { .. }),
+            "mika#2670 — une ligne `delivered` portant un pid vivant est lue \
+             {liveness:?} : le filtre terminal du lecteur unique n'atteint pas \
+             la surface opérateur"
+        );
+        assert!(
+            !summary_annotation(&t.trigger_type, &t.status, &liveness).contains("alive"),
+            "la ligne de résumé ne doit pas dire « pilot alive » sur une ligne \
+             terminale"
+        );
+    }
+
+    /// **Le jumeau positif, et il est dû.** Même ligne, statut non terminal ⇒
+    /// `Alive`.
+    ///
+    /// Sans lui, le contrôle négatif ci-dessus ne distingue pas « le filtre
+    /// mord » de « le semis n'a jamais produit de pid vivant » : un test qui
+    /// vise un cadavre se lit exactement comme un arbre propre (mika#2103 /
+    /// mika#2205). C'est aussi lui qui rougit le jour où `read_process_start_time`
+    /// ou le semis cessent de fonctionner, plutôt que le négatif qui verdirait
+    /// en silence.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2670_la_meme_ligne_non_terminale_est_affichee_vivante() {
+        let (pid, start_time) = self_pid_and_start();
+        let (db, t) = seed_callback_row("in_progress", pid, start_time).await;
+
+        let liveness = probe_pilot_liveness(&db, &Settings::test_defaults(), &t).await;
+
+        assert!(
+            matches!(liveness, PilotLiveness::Alive { pid: p, .. } if p == pid),
+            "le semis doit produire un pilote réellement vivant, sinon le \
+             contrôle négatif de mika#2670 est vacant — lu {liveness:?}"
+        );
+    }
+
     // -- pilot liveness surfacing (mika#2335 F2b/F2c) --
 
     /// The line an operator reads must **name the pilot**, not merely echo the
@@ -928,24 +1053,6 @@ mod tests {
         assert!(line.contains("unverifiable"), "{line}");
         assert!(!line.contains("alive —"), "{line}");
         assert!(!line.contains("not running"), "{line}");
-    }
-
-    /// `process_start_time` is written by the executor as a JSON **string**; an
-    /// integer is accepted too, and anything else degrades to `None` rather
-    /// than to a wrong number.
-    #[test]
-    fn start_time_is_read_from_metadata_in_both_shapes() {
-        assert_eq!(
-            start_time_from_metadata(Some(r#"{"process_start_time":"12345"}"#)),
-            Some(12345)
-        );
-        assert_eq!(
-            start_time_from_metadata(Some(r#"{"process_start_time":12345}"#)),
-            Some(12345)
-        );
-        assert_eq!(start_time_from_metadata(Some(r#"{"other":1}"#)), None);
-        assert_eq!(start_time_from_metadata(Some("not json")), None);
-        assert_eq!(start_time_from_metadata(None), None);
     }
 
     /// The summary line must never say a pilot is alive about a dead PID — the

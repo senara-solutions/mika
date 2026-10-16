@@ -1013,3 +1013,181 @@ fn test_migrate_v46_to_v47_is_idempotent() {
         "idempotent re-run must not lose or duplicate rows"
     );
 }
+
+// ===== mika#2658 — `search_content.embedding_json` → `embedding_dims` =====
+
+/// Ramène une base fraîche (donc déjà en v56) à l'état v55 de
+/// `search_content`, le seul que la migration regarde.
+///
+/// Fabriquer la base de départ *à l'envers* est délibéré. L'alternative —
+/// un `db_at_v55()` qui rejoue le DDL de l'époque — demanderait de figer
+/// ici une copie du schéma complet de v55, qui se périmerait au premier
+/// `ALTER TABLE` d'une migration suivante sans que rien ne l'indique.
+/// Ici, les trois gestes décrivent exactement ce que v56 a fait, à
+/// l'envers : c'est lisible, et ça ne peut pas se décorréler du reste du
+/// schéma.
+/// La ligne `55` est **insérée**, pas seulement la `56` retirée :
+/// `current_version` lit `COALESCE(MAX(version), 0)`, et une installation
+/// fraîche ne porte qu'une seule ligne (`migrate_v1` estampille
+/// directement la version courante). Retirer la 56 seule laisse la table
+/// vide, donc une version `0`, et la migration refuse ce socle.
+fn rewind_search_content_to_v55(db: &Database) {
+    db.conn
+        .execute_batch(
+            "ALTER TABLE search_content DROP COLUMN embedding_dims;
+             ALTER TABLE search_content ADD COLUMN embedding_json TEXT;
+             DELETE FROM schema_version WHERE version = 56;
+             INSERT INTO schema_version (version) VALUES (55);",
+        )
+        .expect("rembobiner search_content en v55");
+}
+
+/// V1 — la migration remplace le payload par un marqueur de dimension.
+///
+/// Les trois lignes semées sont les trois formes que la colonne porte
+/// réellement en production : un JSON de 512 flottants (le cas modal), un
+/// JSON malformé (il n'y en a pas de connu, mais `json_array_length` sur
+/// une valeur invalide *échouerait* la migration entière si le
+/// `json_valid` ne la gardait pas), et un `NULL` (une ligne jamais
+/// embarquée — c'est le marqueur de `get_unembedded_content`, et il doit
+/// rester `NULL` pour que le backfill continue de la voir).
+#[test]
+fn mika2658_migration_v55_to_v56_replaces_payload_with_marker() {
+    let mut db = db();
+    db.register_agent("mika", "Mika", "").unwrap();
+    rewind_search_content_to_v55(&db);
+
+    let valid_json = serde_json::to_string(&vec![0.125_f32; 512]).unwrap();
+    for (source_id, payload) in [
+        (1_i64, Some(valid_json.as_str())),
+        (2, Some("pas du json")),
+        (3, None),
+    ] {
+        db.conn
+            .execute(
+                "INSERT INTO search_content (agent_id, source_type, source_id, content, embedding_json)
+                     VALUES ('mika', 'fact', ?1, 'contenu', ?2)",
+                params![source_id, payload],
+            )
+            .unwrap();
+    }
+
+    db.migrate_v55_to_v56().expect("migration v55→v56");
+
+    assert!(
+        !db.column_exists("search_content", "embedding_json")
+            .unwrap(),
+        "mika#2658 — la colonne payload doit avoir disparu : c'est elle qui \
+         pesait 483 Mo pour 61 677 lignes, et elle n'avait aucun lecteur"
+    );
+    assert!(
+        db.column_exists("search_content", "embedding_dims")
+            .unwrap(),
+        "le marqueur de dimension doit exister après la migration"
+    );
+
+    let dims = |source_id: i64| -> Option<i64> {
+        db.conn
+            .query_row(
+                "SELECT embedding_dims FROM search_content WHERE source_id = ?1",
+                params![source_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        dims(1),
+        Some(512),
+        "un embedding JSON valide doit laisser sa dimension derrière lui"
+    );
+    assert_eq!(
+        dims(2),
+        None,
+        "un JSON invalide ne doit pas faire échouer la migration — le \
+         `CASE WHEN json_valid(…)` sans `ELSE` le rend `NULL`"
+    );
+    assert_eq!(
+        dims(3),
+        None,
+        "une ligne jamais embarquée reste `NULL` : c'est ce que \
+         `get_unembedded_content` interroge"
+    );
+
+    let version: i64 = db
+        .conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 56, "la migration doit estampiller la v56");
+}
+
+/// V2 — la migration v55→v56 est idempotente.
+///
+/// Même forme que `mika1833_migration_v54_to_v55_is_idempotent` : la
+/// chaîne complète peut être rejouée après un crash
+/// (`if (3..=55).contains(&version)` dans `migrate`), et le
+/// `if version >= 56 { return Ok(()); }` est ce qui protège le second
+/// passage — sans lui, le `ALTER TABLE … ADD COLUMN embedding_dims`
+/// échouerait sur une colonne déjà là.
+#[test]
+fn mika2658_migration_v55_to_v56_is_idempotent() {
+    let mut db = db();
+
+    let version_before: i64 = db
+        .conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .expect("schema version readable");
+
+    db.migrate_v55_to_v56().expect("replay must be a no-op");
+    db.migrate_v55_to_v56().expect("and stay one");
+
+    let version_after: i64 = db
+        .conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .expect("schema version readable");
+    assert_eq!(
+        version_before, version_after,
+        "un rejeu ne doit pas faire avancer la version"
+    );
+    assert!(
+        db.column_exists("search_content", "embedding_dims")
+            .unwrap(),
+        "le marqueur doit survivre au rejeu"
+    );
+}
+
+/// V3 — le couplage FTS5 survit au `DROP COLUMN`.
+///
+/// `fts_search` est une table `fts5(…, content='search_content',
+/// content_rowid='id')` : son index vit à part, mais la restitution du
+/// texte passe par `search_content`. Un `DROP COLUMN` sur la table de
+/// contenu est le geste qui pouvait désaligner les deux — SQLite ne
+/// reparse aucun déclencheur ici (une table à contenu externe n'en crée
+/// pas), mais c'est une propriété qu'on vérifie plutôt qu'on ne la
+/// suppose. Le test indexe **avant** la migration, pour que la ligne
+/// traverse le `DROP`.
+#[test]
+fn mika2658_fts_search_survives_the_column_drop() {
+    let mut db = db();
+    db.register_agent("mika", "Mika", "").unwrap();
+    rewind_search_content_to_v55(&db);
+
+    let id = db
+        .index_content(
+            "mika",
+            "fact",
+            Some(7),
+            "le vacuum rend les pages au système",
+        )
+        .expect("indexation en v55");
+
+    db.migrate_v55_to_v56().expect("migration v55→v56");
+
+    let hits = db.fts_search("mika", "vacuum", 10, None).unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "mika#2658 — le `DROP COLUMN` sur la table de contenu ne doit pas \
+         désaligner l'index FTS5 ; résultats obtenus : {hits:?}"
+    );
+    assert_eq!(hits[0].id, id, "et c'est bien la ligne indexée qui remonte");
+}
