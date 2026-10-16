@@ -2205,7 +2205,14 @@ impl Database {
     /// `process_start_time` is extracted from `metadata` JSON, where the
     /// executor writes it as a *string* (see `skills/executor.rs`). Rows
     /// without it come back as `None` — the caller sweeps them (D-3).
-    pub fn find_dispatch_children_with_pid(
+    ///
+    /// **`pub(crate)` since mika#2670**: outside this crate the only door to
+    /// *which pilot does this task carry?* is `live_pilot::resolve_task_pilot`,
+    /// terminal filter included. A caller that walks here instead omits that
+    /// filter by construction — which is exactly what `mika-cli` did, and what
+    /// the compiler now refuses rather than a source scan reporting after the
+    /// fact.
+    pub(crate) fn find_dispatch_children_with_pid(
         &self,
         parent_task_id: &str,
     ) -> Result<Vec<DispatchChild>> {

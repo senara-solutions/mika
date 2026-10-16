@@ -1172,7 +1172,12 @@ impl AsyncDatabase {
     /// No extra agent scoping: the parent row was already selected by
     /// `find_phantom_tracking_tasks`, which is agent-scoped, and a child is
     /// reachable only through its parent's id.
-    pub async fn find_dispatch_children_with_pid(
+    ///
+    /// **`pub(crate)` since mika#2670**, like the sync handle it wraps: outside
+    /// this crate the only door to *which pilot does this task carry?* is
+    /// `live_pilot::resolve_task_pilot`, terminal filter included. This was the
+    /// handle `mika-cli` reached for, and the filter it skipped.
+    pub(crate) async fn find_dispatch_children_with_pid(
         &self,
         parent_task_id: &str,
     ) -> Result<Vec<crate::db::DispatchChild>> {
