@@ -639,7 +639,7 @@ of the DB layer lives is decided by one rule, not by taste:
 | path | holds | why there |
 |---|---|---|
 | `db.rs` | types, `open`/`open_in_memory`, the ~30 thematic `impl Database` sections, free functions | the region that *churns* — methods get rewritten, replaced, deleted |
-| `db/migrations.rs` | `migrate` + every `migrate_vN_to_vM`, and their tests | **append-only**: a migration is never deleted (v1…v55, for ever) |
+| `db/migrations.rs` | `migrate` + every `migrate_vN_to_vM`, and their tests | **append-only**: a migration is never deleted (v1…v56, for ever) |
 | `db/tests/` | the `#[cfg(test)]` module, split by theme | **append-only**: a test is rarely deleted |
 | `db/kg_schema.rs`, `db/operational.rs` | their own `impl Database` blocks | pre-existing, same idiom |
 

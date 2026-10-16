@@ -53,7 +53,13 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 // les fixtures** : aucune colonne, aucune contrainte, aucun `seed_*` à changer
 // — `seed_chunk_subject` écrit les deux colonnes indexées comme avant. Seul le
 // pin avance.
-const PINNED_SCHEMA_VERSION: i64 = 55;
+//
+// v55→v56 (mika#2658) remplace `search_content.embedding_json TEXT` par
+// `embedding_dims INTEGER`. `search_content` **n'est pas une table de
+// fixture** : aucun `seed_*` ne l'écrit — les chunks KG y entrent par
+// `index_content`, qui ne nomme ni l'une ni l'autre colonne. Seul le pin
+// avance.
+const PINNED_SCHEMA_VERSION: i64 = 56;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,
