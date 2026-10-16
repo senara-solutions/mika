@@ -2177,10 +2177,11 @@ mod tests {
 
     /// **Livrée vide, et le test plus bas l'assert.**
     ///
-    /// Population mesurée : **un** site (`webhook_dispatch.rs`). Il n'y a donc
-    /// rien à excepter, ni de case où déposer la prochaine infraction
-    /// (mika#2323). Quand le scan tire, **on retire le second corps**, on ne
-    /// l'allowliste pas (doctrine mika#2201).
+    /// Population mesurée : **un** site. Il n'y a donc rien à excepter, ni de
+    /// case où déposer la prochaine infraction (mika#2323). Quand le scan tire,
+    /// **on retire le second corps**, on ne l'allowliste pas (doctrine
+    /// mika#2201) — c'est exactement ce que mika#2680 a fait en route (voir
+    /// [`FALLTHROUGH_DOMAIN_OWNER`]).
     const FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED: &[&str] = &[];
 
     /// Les deux littéraux dont la **conjonction** définit le domaine.
@@ -2206,6 +2207,24 @@ mod tests {
         ]
     }
 
+    /// Le seul fichier autorisé à écrire la conjonction.
+    ///
+    /// **Il a déménagé en mika#2680, et ce déménagement EST la résolution que
+    /// le message d'échec ci-dessous prescrit.** Il valait
+    /// `crates/mika-agent/src/webhook_dispatch.rs` tant que ce module déclarait
+    /// les deux préfixes en propre ; la taxonomie [`crate::server::webhook_prefilter`]
+    /// est arrivée comme cinquième consommateur du même domaine, dans un crate
+    /// qui ne pouvait les lire qu'en les recopiant, et ce scan l'a dit. Les deux
+    /// constantes vivent désormais dans `mika_common::github_event_format`, où
+    /// le test cross-crate de `mika-gateway::github::tests` refuse en plus la
+    /// dérive avec le producteur ; `webhook_dispatch` les `use`, donc n'écrit
+    /// plus aucun littéral et tombe lui-même sous la garde.
+    ///
+    /// La propriété gardée est inchangée : **un seul corps écrit ces deux
+    /// littéraux**, et un second lecteur qui recopierait les `starts_with` est
+    /// toujours attrapé. Seul l'endroit légitime a bougé.
+    const FALLTHROUGH_DOMAIN_OWNER: &str = "crates/mika-common/src/github_event_format.rs";
+
     /// **Un seul corps définit le domaine Webhook Fallthrough (mika#2517 U5).**
     ///
     /// Aucun test comportemental ne peut voir cette classe : un second corps ne
@@ -2213,12 +2232,14 @@ mod tests {
     /// tard, en silence, avec toutes les assertions vertes — exactement la
     /// leçon mika#2158 (une regex copiée dont le commentaire disait
     /// « Mirrors … » et qui a ensuite raté deux élargissements). Le domaine a
-    /// désormais **quatre** consommateurs (les deux refus de mika#910/#933/#1102,
-    /// plus U2 et U3), donc quatre occasions de diverger.
+    /// désormais **cinq** consommateurs (les deux refus de mika#910/#933/#1102,
+    /// plus U2 et U3, plus la taxonomie de mika#2680), donc cinq occasions de
+    /// diverger — et c'est le cinquième qui a fait tirer ce scan, puis déménager
+    /// l'`owner` (voir [`FALLTHROUGH_DOMAIN_OWNER`]).
     #[test]
     fn mika2517_the_fallthrough_domain_has_a_single_definition() {
         let needles = fallthrough_domain_needles();
-        let owner = "crates/mika-agent/src/webhook_dispatch.rs";
+        let owner = FALLTHROUGH_DOMAIN_OWNER;
 
         let mut definers = Vec::new();
         for (rel, content) in production_sources() {
@@ -2255,9 +2276,13 @@ mod tests {
             strangers.is_empty(),
             "mika#2517 — le domaine Webhook Fallthrough a une seconde définition : \
              {strangers:?}\n\n\
-             RÉSOLUTION : retirer le second corps et appeler \
-             `webhook_dispatch::is_webhook_fallthrough_domain`. Ne PAS l'ajouter à \
-             FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED — quatre consommateurs lisent ce \
+             RÉSOLUTION : retirer le second corps. Pour un site qui DÉCIDE, appeler \
+             `webhook_dispatch::is_webhook_fallthrough_domain` ; pour un site qui \
+             CLASSE ou qui a seulement besoin des préfixes, lire \
+             `mika_common::github_event_format::{{PR_EVENT_PREFIX, \
+             CHECK_SUITE_EVENT_PREFIX}}` — un `use` n'écrit aucun littéral (c'est le \
+             geste de mika#2680). Ne PAS l'ajouter à \
+             FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED — cinq consommateurs lisent ce \
              domaine, et deux corps ne rendent aucune décision fausse le jour où le \
              second est écrit."
         );

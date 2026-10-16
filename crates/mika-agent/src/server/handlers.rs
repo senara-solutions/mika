@@ -2014,8 +2014,25 @@ pub(super) async fn run_agent_for_message(
     // mika#2675 — pré-filtre déterministe : APRÈS les handlers, qui gardent
     // tous leurs effets, AVANT le tour LLM. Un événement sans suite possible
     // ne paie aucun appel modèle ; tout le reste passe comme avant.
-    if let Some(original) = &original_github_text
-        && super::webhook_prefilter::skip_turn(
+    //
+    // mika#2680 — et quand le tour a lieu, il est NOMMÉ. Le `&&` d'origine
+    // court-circuitait, si bien que la branche « payé » n'existait pas comme
+    // bloc : d'où la liaison du booléen plutôt qu'un test en ligne. Les deux
+    // sites lisent le même `touched` et le même `enabled`, et le registre lit
+    // `original` — le texte d'AVANT les handlers — jamais `req.text`.
+    if let Some(original) = &original_github_text {
+        let touched = super::webhook_prefilter::Touched {
+            by_any_handler: req.text != *original,
+            after_verdict_handler: text_after_verdict.as_ref().is_none_or(|t| req.text != *t),
+            outside_ci_success_handler: text_around_ci
+                .as_ref()
+                .is_none_or(|(before, after)| before != original || req.text != *after),
+            outside_ci_failure_handler: text_around_ci_failure
+                .as_ref()
+                .is_none_or(|(before, after)| before != original || req.text != *after),
+        };
+        let enabled = super::webhook_prefilter::prefilter_enabled();
+        let skipped = super::webhook_prefilter::skip_turn(
             &a.db,
             &super::webhook_prefilter::LiveState {
                 db: &a.db,
@@ -2023,22 +2040,21 @@ pub(super) async fn run_agent_for_message(
                 request_id: &req.request_id,
             },
             original,
-            super::webhook_prefilter::Touched {
-                by_any_handler: req.text != *original,
-                after_verdict_handler: text_after_verdict.as_ref().is_none_or(|t| req.text != *t),
-                outside_ci_success_handler: text_around_ci
-                    .as_ref()
-                    .is_none_or(|(before, after)| before != original || req.text != *after),
-                outside_ci_failure_handler: text_around_ci_failure
-                    .as_ref()
-                    .is_none_or(|(before, after)| before != original || req.text != *after),
-            },
+            touched,
             &req.request_id,
-            super::webhook_prefilter::prefilter_enabled(),
+            enabled,
         )
-        .await
-    {
-        return;
+        .await;
+        if skipped {
+            return;
+        }
+        super::webhook_prefilter::emit_turn_charged(
+            a.db.agent_id(),
+            original,
+            touched,
+            &req.request_id,
+            enabled,
+        );
     }
 
     let params = agent::AgentParams {

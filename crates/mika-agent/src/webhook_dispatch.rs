@@ -18,22 +18,26 @@ pub(crate) use mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER;
 /// retrouve pour la borner à sa cible. Ce qui sort de l'un est exactement ce
 /// qu'il faut borner dans l'autre, donc les deux doivent lire le même octet.
 ///
-/// **Déclarés ICI, en tête de module, et ce n'est pas un choix de mise en
-/// page :** `canonical_tokens`'s `production_sources` tronque chaque fichier à
-/// son premier marqueur d'attribut `cfg(test)` **où qu'il soit, commentaires
-/// compris**, et le doc-comment d'[`ALL_MARKER_CLASSES`] en porte un. Déclarées
-/// plus bas, ces constantes seraient invisibles à
-/// `mika2517_the_fallthrough_domain_has_a_single_definition`, dont
-/// l'anti-vacuité l'a dit en rougissant. Les déplacer ici est ce qui garde ce
-/// scan exact plutôt que vert par troncature — et ce paragraphe lui-même évite
-/// d'écrire la séquence littérale, faute de quoi il tronquerait le fichier juste
-/// au-dessus de la constante qu'il décrit.
-const PR_EVENT_PREFIX: &str = "[GitHub] PR ";
+/// **Déclaré dans `mika_common::github_event_format` depuis mika#2680, et
+/// seulement importé ici :** le producteur de ces deux préfixes est
+/// `mika_gateway::github::format_event_text`, dont le test cross-crate refuse
+/// la dérive producteur/consommateur. Tant que la valeur vivait ici, un
+/// consommateur de plus — la taxonomie [`crate::server::webhook_prefilter`] —
+/// ne pouvait la lire qu'en la recopiant, ce que
+/// `mika2517_the_fallthrough_domain_has_a_single_definition` a refusé en
+/// rougissant. Un `use` n'écrit aucun littéral : le site de définition reste
+/// unique, il a simplement déménagé là où le gateway peut en répondre.
+///
+/// L'`owner` de ce scan est donc désormais `github_event_format.rs`. La
+/// propriété gardée ne change pas d'un octet — un second lecteur qui recopierait
+/// les deux `starts_with` est toujours attrapé — et elle couvre maintenant aussi
+/// ce fichier-ci, qui ne peut plus les réécrire.
+use mika_common::github_event_format::PR_EVENT_PREFIX;
 
 /// Préfixe des événements de territoire ci (suite de checks).
 ///
 /// Même site, même raison que [`PR_EVENT_PREFIX`].
-const CHECK_SUITE_EVENT_PREFIX: &str = "[GitHub] Check suite ";
+use mika_common::github_event_format::CHECK_SUITE_EVENT_PREFIX;
 
 /// True when the message is a `[GitHub]` webhook event in the
 /// **Webhook Fallthrough** domain — i.e., a turn that MUST NOT call

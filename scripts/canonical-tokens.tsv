@@ -344,10 +344,42 @@ DEPTH	B	crates/mika-agent/src/skills/builtin_handlers.rs::validate_review_depth_
 # bind a dispatch to the event's target. What leaves one is exactly what must be
 # bound in the other, so the two must read the same byte. Declared, not
 # allowlisted — the resolution the survey prescribes.
-[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::CHECK_SUITE_EVENT_PREFIX	exact:prefix
-[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::PR_EVENT_PREFIX	exact:prefix
+# mika#2680 moved those two constants OUT of this file and into
+# `mika_common::github_event_format`, so their rows moved with them into the
+# group below. The taxonomy `server::webhook_prefilter::trigger_class` arrived
+# as a fifth consumer of the same domain, in a crate that could only read the
+# two bytes by copying them, and
+# `mika2517_the_fallthrough_domain_has_a_single_definition` refused that second
+# body. `webhook_dispatch` now `use`s them: a `use` line carries no token, so
+# this file is no longer their match site. What stays here is the two READERS,
+# which still `starts_with` on the imported values.
 [GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::fallthrough_marker_class	exact:prefix
 [GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::is_webhook_fallthrough_domain	exact:prefix
+# ── The gateway's whole event grammar, declared where it is produced-for
+# (mika#2680). `mika_gateway::github::format_event_text` emits every one of
+# these forms and a cross-crate test refuses producer/consumer drift; the
+# taxonomy of mika#2680 reads them through `starts_with(CONST)`, which is how it
+# classes a webhook's original text WITHOUT writing one byte of grammar of its
+# own. Declaring the definition site is therefore the whole cost of that
+# taxonomy on this list.
+#
+# Observability-only — EXCEPT two. `PR_EVENT_PREFIX` and
+# `CHECK_SUITE_EVENT_PREFIX` also carry the definition of the Webhook
+# Fallthrough domain (see the two reader rows above), which DECIDES. Changing
+# either value changes a refusal boundary, not just a name in a log.
+# `READY_LABEL_DISPATCH_MARKER` is the `ready` instance of
+# `ISSUE_LABELED_EVENT_PREFIX`, and it is the one that carries a dispatch.
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::CHECK_SUITE_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_CLOSED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_COMMENT_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_LABELED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_OPENED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_CLOSED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_OPENED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_REVIEW_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PUSH_EVENT_PREFIX	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::READY_LABEL_DISPATCH_MARKER	exact:prefix
 
 # ── Gateway body-truncation marker (mika#2242 R6). `truncate_body` appends it
