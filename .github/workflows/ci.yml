@@ -108,10 +108,20 @@ jobs:
       - name: Handler crash-step naming + trap placement (mika#2532)
         run: make test-handler-crash-step
 
-      - name: Pilot sandbox secret-channel guards (mika#2039)
+      - name: Pilot sandbox secret-channel guards (mika#2039, mika#2716)
         run: |
           make test-sandbox-secret-argv
           make verify-no-secret-in-setenv
+          make test-egress-sentinel-staging
+
+      # mika#2578 again, same lesson as the step below: `make test-sandbox-gh-usable`
+      # was local-only, so the guard that pins the VALUE `--setenv GH_TOKEN`
+      # carries — now the egress sentinel (mika#2716) — gated nothing on a PR.
+      # It is the suite that owns the real-bwrap half of the sentinel's contract
+      # and the de-anchoring precondition (`removed == 1`), and it skips cleanly
+      # when bwrap or gh is absent, so it is safe on a hosted runner.
+      - name: gh usable inside the pilot sandbox (mika#2572, mika#2716)
+        run: make test-sandbox-gh-usable
 
       # mika#2578: this suite was in `make test` — a local target CI does not
       # call — so its guards gated nothing on a PR. It now carries the scan that

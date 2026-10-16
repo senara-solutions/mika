@@ -8325,6 +8325,31 @@ grep turn_usage $MIKA_SPIRIT_LOG_FILE | jq 'select(.status == "error") | {sessio
 
 **Ce que ce travail ne fait PAS.** Il ne borne aucun prompt (conditionné à la branche 2 ci-dessus). Il ne corrige pas le plafond `120 s` en dur du rail Anthropic ni son ignorance de `max_attempts` (mika#2189 hors périmètre) — il les rend seulement lisibles sur la ligne `llm_call_attempt`. Et il ne traduit pas fidèlement `ClaudeApiError` en `LlmError` : `llm/anthropic.rs` aplatit toute erreur de ce rail en `ProviderError`, ce que l'événement contourne (émis **sous** la frontière) sans le corriger — corriger l'aplatissement changerait la classe d'erreur vue par tout le moteur sur ce rail, donc un format de fil, et mérite son propre ticket.
 
+### La sandbox de pilote présente un justificatif d'egress (mika#2716)
+
+- `MIKA_PILOT_EGRESS_SENTINEL` — Interrupteur de la **sentinelle d'egress par spawn**. **Défaut : activé** (variable absente ⇒ armée). `0`, `false`, `no`, `off`, `disabled` (insensible à la casse) reviennent au comportement d'**avant ce ticket** : `GH_TOKEN` reprend le placeholder statique nu `proxy-managed-no-secret` et rien n'est enregistré. Toute autre valeur — y compris le **vide** — laisse la sentinelle armée : la lecture est `${MIKA_PILOT_EGRESS_SENTINEL:-1}`, donc absent et vide rendent le même `1`. Lue par `_stage_pilot_egress_sentinel` (`skills/bundled/_shared/dispatch-lib.sh`) **dans le child de dispatch**, qu'elle n'atteint que par le relais `EGRESS_SENTINEL_ENV` de `crates/mika-agent/src/skills/executor.rs` : `sandboxed_pilot_env` reconstruit l'environnement par une allowlist **positive**, donc poser la variable sur le service sans ce relais en ferait un interrupteur décoratif (mika#2165). Elle n'est **pas** dans `SANDBOX_ENV_CORE_ALLOWLIST` et ne doit jamais y entrer (mika#2354 AC9(b) ; un `MIKA_*` y heurte de toute façon le `debug_assert` du confinement).
+
+  **Ce qu'elle arme.** À chaque spawn, le lanceur tire un nonce de 16 octets (`openssl rand -hex 16`, repli `/dev/urandom`), l'enregistre côté **hôte** dans le registre `~/.mika/pilot-egress-sentinels/` — un **répertoire** en `0700`, un fichier vide par nonce, `umask 077` — et passe `proxy-managed-no-secret-<32 hex>` à la sandbox en `--setenv GH_TOKEN`. Un répertoire et non un fichier unique : `mitmdump` est long-vivant et partagé entre dispatches, donc deux pilotes concurrents doivent être valides **au même instant** ; un fichier écrasé refuserait le plus ancien. Chemin surchargeable par `_PILOT_EGRESS_SENTINEL_DIR` (résolu à l'appel, pas au source : les suites de confinement réexportent `HOME` après le `source`, et un défaut figé déposerait des entrées d'allure vivante dans le registre réel de l'opérateur).
+
+  **La sentinelle n'est pas un secret, et c'est délibéré.** Elle voyage dans `GH_TOKEN` — le canal que l'incident mika#2713 écrase — parce qu'une sentinelle qui ne voyage pas dans ce canal n'atteste rien. Elle ne porte aucun jeton, n'en est pas dérivable, et quiconque lit l'argv de bwrap par `/proc/<pid>/cmdline` détient déjà `$_PILOT_GH_TOKEN_FILE`, donc le vrai jeton : la sentinelle ne lui apprend rien.
+
+  **Ce que ce vol n'achète PAS — et pourquoi aucun 403 nouveau n'est possible.** `scripts/mika-pilot-github-auth-addon.py` est **inchangé** (AC7) : il continue d'injecter le jeton de l'hôte sans rien exiger. Ce vol **dote et atteste** ; le refus (l'addon exige la sentinelle, 403 à deux motifs distincts absente/invalide, log `DENY`, purge TTL du registre) est le vol 2, suivi par son propre ticket. Conséquence opérateur : tant que le vol 2 n'est pas déployé, un `cargo test` lancé depuis une sandbox écrit toujours sur la forge réelle sous l'identité du moteur. La propriété acquise ici est qu'il devient **distinguable**, pas qu'il est refusé.
+
+  **Posture de défaillance : fail-open, comme `_stage_pilot_gh_token`.** Un tirage raté ou un enregistrement raté dégradent vers le placeholder nu avec un message sur `stderr` du dispatch (`dispatch-lib: could not draw an egress sentinel …` / `… could not register the egress sentinel under <dir> …`). **Un dispatch ne meurt jamais sur ce registre.**
+
+  **Sonde post-déploiement : `scripts/canary-pilot-containment`, ligne `gh_token_*`, quatre états.**
+
+  | ligne | lecture |
+  |---|---|
+  | `ok:   gh_token_egress_sentinel` | `GH_TOKEN` = `proxy-managed-no-secret-<32 hex>` — régime nominal, la sentinelle est posée et enregistrée |
+  | `WARN: GH_TOKEN carries the bare static placeholder …` | préfixe **nu** : soit un opérateur a posé `MIKA_PILOT_EGRESS_SENTINEL=0`, soit le staging a fail-open côté hôte. **Invisible depuis la sandbox** — d'où un WARN propre plutôt qu'un partage de la ligne `ok` |
+  | `WARN: GH_TOKEN unset in the sandbox …` | le nom a disparu : `gh` s'arrête sur `gh auth login` (mika#2572 a régressé) |
+  | `LEAK: GH_TOKEN carries a value other than an egress sentinel …` | une valeur qui n'est ni le préfixe nu ni une sentinelle — mika#2056 a régressé |
+
+  **La halte.** Un `WARN: … bare static placeholder` **persistant après un `make deploy`**, alors qu'aucun opérateur n'a désarmé l'interrupteur, signifie que **le staging échoue** côté hôte. Lire le **stderr du dispatch** (les deux messages de repli ci-dessus), **pas** le log de l'addon mitmproxy : l'addon est inchangé par ce vol et n'a rien à dire sur un tirage ou un `mkdir` ratés. Et `~/.mika/skills/` est une projection du binaire (mika#2340) : un `dispatch-lib.sh` édité dans l'arbre de travail n'atteint aucun agent avant ce `make deploy`, donc un WARN avant rebuild n'est pas un défaut.
+
+  **Hors périmètre, délibérément.** Le registre n'a **aucune purge** dans ce vol : une entrée par spawn s'accumule (un fichier vide, `0700`). La purge TTL appartient au vol 2, qui est aussi celui qui lit le registre — purger ce que personne ne lit n'achète rien, et une purge livrée sans lecteur serait un garde que la chaîne ne fait pas tourner (mika#2578).
+
 Optional (telemetry — requires `--features telemetry` build):
 - `MIKA_TELEMETRY_ENABLED` — Enable OpenTelemetry trace export (default: false)
 - `MIKA_OTLP_ENDPOINT` — OTLP HTTP endpoint URL with `/v1/traces` path

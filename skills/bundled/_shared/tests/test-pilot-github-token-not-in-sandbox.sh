@@ -250,9 +250,14 @@ else
 
     got_env=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
-    # mika#2572: the NAME travels, set to the non-secret placeholder so gh does
-    # not stop on `gh auth login`; the token VALUE never does.
-    assert_eq "GH_TOKEN in the real sandbox is the placeholder (mika#2572)" "proxy-managed-no-secret" "$got_env"
+    # mika#2572: the NAME travels, set to a non-secret value so gh does not stop
+    # on `gh auth login`; the token VALUE never does. mika#2716: that value is
+    # the per-spawn egress sentinel, so the assertion matches its FORM — prefix
+    # pinned, 32 lowercase hex pinned, bare prefix accepted for the fail-open
+    # and operator-switch shapes. The mika#2056 assertions below are untouched:
+    # they are about the real token, which must still reach nothing.
+    rc=0; [[ "$got_env" =~ ^proxy-managed-no-secret(-[0-9a-f]{32})?$ ]] || rc=1
+    assert_eq "GH_TOKEN in the real sandbox is an egress sentinel (mika#2572, mika#2716)" "0" "$rc"
     rc=1; [ "$got_env" = "$FAKE_TOKEN" ] && rc=0
     assert_eq "the staged/parent token value never reaches the sandbox env" "1" "$rc"
 

@@ -22,9 +22,11 @@
 # SYNTHETIC secret (`MIKA_TEST_SECRET`), and dedicated tests assert the
 # mika#2056 invariant directly: no GitHub token VALUE reaches the argv, the
 # --setenv list, or the real sandbox env/filesystem. Since mika#2572 the NAME
-# GH_TOKEN does travel, carrying only the non-secret placeholder
-# `proxy-managed-no-secret` (gh refuses to start without some local value) —
-# so these tests assert on the value, never on the name's absence. The
+# GH_TOKEN does travel, carrying only a non-secret value (gh refuses to start
+# without some local value) — so these tests assert on the value, never on the
+# name's absence. Since mika#2716 that value is the per-spawn EGRESS SENTINEL
+# `proxy-managed-no-secret-<32 hex>`, drawn and registered host-side, so the
+# assertions match a FORM ($SENTINEL_FORM below) rather than a literal. The
 # sandbox-absent-but-host-present
 # anti-vacuity proof lives in the sibling
 # test-pilot-github-token-not-in-sandbox.sh.
@@ -40,6 +42,15 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCH_LIB="$SCRIPT_DIR/../dispatch-lib.sh"
+
+# mika#2716: the one accepted shape for the GH_TOKEN value. The anchor is
+# WIDENED, never relaxed — the prefix is pinned, the suffix is pinned to exactly
+# 32 lowercase hex digits, and both ends are anchored. A bare prefix also
+# passes, because that is the fail-open and MIKA_PILOT_EGRESS_SENTINEL=0 shape
+# and refusing it would make this suite red on an operator's deliberate
+# rollback. What still fails is every value that matters: a real token, an empty
+# value, a prefix-shaped decoy with the wrong suffix length.
+SENTINEL_FORM='^proxy-managed-no-secret(-[0-9a-f]{32})?$'
 
 # shellcheck source=skills/bundled/_shared/dispatch-lib.sh
 source "$DISPATCH_LIB"
@@ -185,11 +196,17 @@ setenv_names() {
 #                        fast, traceable error.
 #
 # mika#2572 added GH_TOKEN, audited on the same terms as ANTHROPIC_API_KEY:
-#   GH_TOKEN             the literal "proxy-managed-no-secret". The GitHub
-#                        addon strips and replaces Authorization host-side; the
-#                        value exists only so gh does not stop on
-#                        `gh auth login`. Test 10b pins that EVERY occurrence
-#                        carries exactly this placeholder.
+#   GH_TOKEN             since mika#2716, the per-spawn EGRESS SENTINEL
+#                        "proxy-managed-no-secret-<32 hex>" — drawn host-side
+#                        and registered under ~/.mika/pilot-egress-sentinels/,
+#                        never a credential and never derived from one
+#                        (scripts/verify-no-secret-in-setenv.sh rule 3 pins the
+#                        provenance). The GitHub addon strips and replaces
+#                        Authorization host-side; the value exists so gh does
+#                        not stop on `gh auth login`, and so a later flight can
+#                        tell a pilot's own gh from a test that overwrote this
+#                        name. Test 10b pins that EVERY occurrence matches
+#                        $SENTINEL_FORM.
 AUDITED_SETENV_NAMES="ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_LOG_FILE \
 CLAUDE_CODE_API_BASE_URL GH_TOKEN GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
 GIT_TERMINAL_PROMPT HOME HOSTNAME HTTPS_PROXY HTTP_PROXY LANG LC_ALL \
@@ -513,7 +530,7 @@ _PILOT_SANDBOX_SECRET_ALLOWLIST=()   # production shape: no sandbox-held secret
 rc=1; grep -qzF -- "$GH_LEAK_TOKEN" "$CAPTURE" && rc=0
 assert_eq "GH_TOKEN value is absent from the bwrap argv" "1" "$rc"
 
-# Every `--setenv GH_TOKEN <value>` triple carries the placeholder, and there
+# Every `--setenv GH_TOKEN <value>` triple carries an egress sentinel, and there
 # is at least one (the mika#2572 fix is present on this path). A count of zero
 # would mean this block no longer runs Phase 2b and proves nothing.
 gh_tok_occ=0; gh_tok_bad=""
@@ -522,12 +539,12 @@ while IFS= read -r a; do _args+=("$a"); done < <(captured_args)
 for ((i = 0; i + 2 < ${#_args[@]}; i++)); do
     if [ "${_args[$i]}" = "--setenv" ] && [ "${_args[$((i + 1))]}" = "GH_TOKEN" ]; then
         gh_tok_occ=$((gh_tok_occ + 1))
-        [ "${_args[$((i + 2))]}" = "proxy-managed-no-secret" ] || gh_tok_bad="$gh_tok_bad ${_args[$((i + 2))]}"
+        [[ "${_args[$((i + 2))]}" =~ $SENTINEL_FORM ]] || gh_tok_bad="$gh_tok_bad ${_args[$((i + 2))]}"
     fi
 done
 unset _args
 assert_eq "GH_TOKEN travels via --setenv on the contained path (mika#2572)" "1" "$([ "$gh_tok_occ" -ge 1 ] && echo 1 || echo 0)"
-assert_eq "every --setenv GH_TOKEN carries the placeholder, never the parent token" "" "$gh_tok_bad"
+assert_eq "every --setenv GH_TOKEN carries an egress sentinel, never the parent token" "" "$gh_tok_bad"
 
 rc=1; grep -qzx -- "/run/mika-pilot-secrets/GH_TOKEN" "$CAPTURE" && rc=0
 assert_eq "no /run/mika-pilot-secrets/GH_TOKEN file channel is created" "1" "$rc"
@@ -579,14 +596,16 @@ else
 
     # (b) mika#2056: with the PRODUCTION (empty) allowlist, the GH_TOKEN VALUE
     #     present in the parent env is absent from the real sandbox — the
-    #     environment carries only the mika#2572 placeholder — and no file
-    #     materialises under /run/mika-pilot-secrets. This is the real
-    #     end-to-end proof the token cannot be read from inside the sandbox.
+    #     environment carries only the mika#2572 placeholder, since mika#2716 an
+    #     egress sentinel built on it — and no file materialises under
+    #     /run/mika-pilot-secrets. This is the real end-to-end proof the token
+    #     cannot be read from inside the sandbox.
     _SAVED_ALLOWLIST=("${_PILOT_SANDBOX_SECRET_ALLOWLIST[@]}")
     _PILOT_SANDBOX_SECRET_ALLOWLIST=()
     got_gh=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
-    assert_eq "GH_TOKEN in the real sandbox is the placeholder (mika#2572)" "proxy-managed-no-secret" "$got_gh"
+    rc=0; [[ "$got_gh" =~ $SENTINEL_FORM ]] || rc=1
+    assert_eq "GH_TOKEN in the real sandbox is an egress sentinel (mika#2572, mika#2716)" "0" "$rc"
     rc=1; [ "$got_gh" = "$FAKE_TOKEN" ] && rc=0
     assert_eq "the parent GH_TOKEN value never reaches the real sandbox" "1" "$rc"
 

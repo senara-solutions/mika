@@ -18,9 +18,11 @@
 # harness proves is the discriminant between the two states, measured on
 # gh 2.92.0:
 #
-#   PLACEHOLDER   `gh auth token` prints it; `gh api user` attempts the request
+#   SOME VALUE    `gh auth token` prints it; `gh api user` attempts the request
 #                 (`Get "https://api.github.com/user": …`) and fails on the
-#                 unreachable proxy — exit 1.
+#                 unreachable proxy — exit 1. Since mika#2716 that value is the
+#                 per-spawn egress sentinel rather than a static placeholder;
+#                 the discriminant is unchanged, only its shape.
 #   NO TOKEN      `gh auth token` fails with `no oauth token`; `gh api user`
 #                 prints `gh auth login` and exits 4 (gh: authentication
 #                 required) without any network attempt.
@@ -49,7 +51,25 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCH_LIB="$SCRIPT_DIR/../dispatch-lib.sh"
-PLACEHOLDER="proxy-managed-no-secret"
+
+# mika#2716: the value is no longer the bare placeholder but the per-spawn
+# egress sentinel built on it. Two anchors follow from that, and they move
+# together — widening one without the other turns the negative control into a
+# second positive run:
+#
+#   SENTINEL_FORM     what gh must print inside the sandbox. Prefix pinned, 32
+#                     lowercase hex pinned, both ends anchored; a bare prefix
+#                     passes too, since that is the fail-open and
+#                     MIKA_PILOT_EGRESS_SENTINEL=0 shape.
+#   SETENV_LINE_ERE   the ONE dispatch-lib line the negative control removes.
+#                     The value is a variable now, so the match is an ERE
+#                     alternation over both spellings the line may legitimately
+#                     carry. A `grep -vF` left anchored on the old literal
+#                     removes NOTHING, and the precondition below catches that
+#                     by name instead of letting the control run silently
+#                     un-mutated.
+SENTINEL_FORM='^proxy-managed-no-secret(-[0-9a-f]{32})?$'
+SETENV_LINE_ERE='--setenv GH_TOKEN "(\$_PILOT_EGRESS_SENTINEL|proxy-managed-no-secret)"'
 
 PASS=0
 FAIL=0
@@ -95,7 +115,7 @@ trap 'rm -rf "$TMPROOT"' EXIT
 
 # The negative control's library: the live file minus the ONE line under test.
 MUTATED_LIB="$TMPROOT/dispatch-lib-no-gh-placeholder.sh"
-grep -vF -- "--setenv GH_TOKEN \"$PLACEHOLDER\"" "$DISPATCH_LIB" > "$MUTATED_LIB"
+grep -vE -- "$SETENV_LINE_ERE" "$DISPATCH_LIB" > "$MUTATED_LIB"
 removed=$(( $(wc -l < "$DISPATCH_LIB") - $(wc -l < "$MUTATED_LIB") ))
 
 echo ""
@@ -154,7 +174,10 @@ assert_contains "the sandbox itself runs" "alive" "$OUT_POS"
 assert_eq "gh is visible inside the sandbox" "present" "$(field gh "$OUT_POS")"
 if [ "$(field gh "$OUT_POS")" = "present" ]; then
     assert_eq "gh auth token exits 0" "0" "$(field token_rc "$OUT_POS")"
-    assert_eq "gh auth token prints the placeholder, never the parent token" "$PLACEHOLDER" "$(field token_out "$OUT_POS")"
+    tok_out=$(field token_out "$OUT_POS")
+    tok_rc=0; [[ "$tok_out" =~ $SENTINEL_FORM ]] || tok_rc=1
+    assert_eq "gh auth token prints an egress sentinel, never the parent token (mika#2716)" "0" "$tok_rc"
+    assert_not_contains "gh auth token does not print the parent token" "ghp_2572parent" "$tok_out"
     assert_not_contains "gh api user does not stop on gh auth login" "gh auth login" "$OUT_POS"
     assert_not_contains "gh api user does not report a logged-out host" "not logged into any GitHub hosts" "$OUT_POS"
     assert_contains "gh api user attempts the request to api.github.com" 'Get "https://api.github.com/user"' "$OUT_POS"
