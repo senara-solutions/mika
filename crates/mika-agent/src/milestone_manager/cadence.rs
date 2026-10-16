@@ -22,6 +22,7 @@
 
 use super::{
     assessor::{Assessor, AssessorConfig},
+    evaluator::{FlightSource, FlightVerdict, evaluate_flights, milestone_issue_urls},
     reader::Reader,
     reporter::Reporter,
     types::{Assessment, CycleOutcome, MilestoneRef, MilestoneState, Severity},
@@ -489,6 +490,10 @@ pub struct CycleContext<'a> {
     /// report it was delivering — the report is composed first — so the loop
     /// hands them forward.
     pub auth_notes: &'a [crate::milestone_manager::reporter::AuthBoundaryNote],
+    /// D'où viennent les vols terminés à évaluer (mika#2698). `None` = non
+    /// câblée, et le rapport est alors identique à celui d'avant mika#2698 :
+    /// aucun verdict, donc pas de section.
+    pub flight_source: Option<&'a Arc<dyn FlightSource>>,
 }
 
 impl<'a> CycleContext<'a> {
@@ -498,6 +503,7 @@ impl<'a> CycleContext<'a> {
             now,
             auth_ledger: None,
             auth_notes: &[],
+            flight_source: None,
         }
     }
 
@@ -513,6 +519,38 @@ impl<'a> CycleContext<'a> {
         self.auth_notes = notes;
         self
     }
+
+    pub fn with_flight_source(mut self, source: Option<&'a Arc<dyn FlightSource>>) -> Self {
+        self.flight_source = source;
+        self
+    }
+}
+
+/// Les verdicts des vols terminés depuis le cycle précédent (mika#2698, vol 1).
+///
+/// Bornée par `since` — `checkpoint.last_observed_at`, c'est-à-dire exactement
+/// « depuis le cycle précédent » du ticket. Au premier cycle il n'y a pas de
+/// checkpoint, donc pas de borne : la source rend alors tous les vols terminés
+/// sur les tickets du milestone, ce qui est la lecture honnête de « depuis
+/// toujours » et non un silence.
+///
+/// Ne rend jamais d'erreur : une source en panne rend `vec![]` (et son propre
+/// WARN), donc un rapport sans section plutôt qu'un cycle mort.
+async fn collect_flight_verdicts(
+    ctx: &CycleContext<'_>,
+    state: &MilestoneState,
+    checkpoint: Option<&MilestoneCheckpoint>,
+) -> Vec<FlightVerdict> {
+    let Some(source) = ctx.flight_source else {
+        return Vec::new();
+    };
+    let issue_urls = milestone_issue_urls(state);
+    if issue_urls.is_empty() {
+        return Vec::new();
+    }
+    let since = checkpoint.and_then(|c| c.last_observed_at.as_deref());
+    let flights = source.finished_implement_flights(since, &issue_urls).await;
+    evaluate_flights(&flights, &state.sub_issues)
 }
 
 /// The cycle body. See [`run_manager_cycle_with`] for the four-argument form.
@@ -547,7 +585,10 @@ pub async fn run_manager_cycle_in(
     let assessor = Assessor::new(AssessorConfig {
         silence_threshold_days: cfg.silence_threshold_days,
     });
-    let assessment = assessor.assess(&state);
+    let mut assessment = assessor.assess(&state);
+    // mika#2698 vol 1 — mode ombre. Le verdict entre dans l'assessment, donc
+    // dans le rapport, et nulle part ailleurs.
+    assessment.flight_verdicts = collect_flight_verdicts(ctx, &state, checkpoint.as_ref()).await;
     let severity = assessment.severity.clone();
     let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
 
@@ -774,16 +815,19 @@ pub async fn probe_executor_health(url: Option<&str>) -> Option<bool> {
 /// Live-runner variant: reads from `gh`, probes optional health endpoint,
 /// then runs the same cycle logic.
 pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
-    run_manager_cycle_with_auth(cfg, None, &[]).await
+    run_manager_cycle_with_auth(cfg, None, &[], None).await
 }
 
 /// As [`run_manager_cycle`], with the mika#1949 auth-boundary wiring: where to
 /// record an observed failure, and which failures the report should carry
-/// forward from previous cycles.
+/// forward from previous cycles — plus, depuis mika#2698, d'où viennent les vols
+/// terminés à évaluer. `flight_source: None` rend un rapport identique à celui
+/// d'avant mika#2698 : aucun verdict, donc pas de section.
 pub async fn run_manager_cycle_with_auth(
     cfg: &ManagerConfig,
     auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
     auth_notes: &[crate::milestone_manager::reporter::AuthBoundaryNote],
+    flight_source: Option<&Arc<dyn FlightSource>>,
 ) -> Result<CycleOutcome> {
     let reader = Reader::new(cfg.github_token.clone());
     let mut state = reader.read(&cfg.target).await?;
@@ -792,7 +836,8 @@ pub async fn run_manager_cycle_with_auth(
     let deliverer = HttpReportDeliverer::new();
     let ctx = CycleContext::new(&deliverer, Utc::now())
         .with_auth_ledger(auth_ledger)
-        .with_auth_notes(auth_notes);
+        .with_auth_notes(auth_notes)
+        .with_flight_source(flight_source);
     run_manager_cycle_in(cfg, state, &ctx).await
 }
 
@@ -1422,6 +1467,7 @@ mod tests {
                 alerts: vec![],
                 cross_cutting: vec![],
                 contention_events: vec![],
+                flight_verdicts: vec![],
             },
             generated_at: String::new(),
             cycle_kind: CycleKind::Event,
@@ -1541,5 +1587,204 @@ mod tests {
             ROUTE_HTTP,
             "le nom de route d'une URL posée ne change pas : la garde agit en amont"
         );
+    }
+
+    // -- mika#2698 vol 1 : le câblage de la source de vols -------------------
+
+    /// Source de vols instrumentée : elle enregistre **ce qu'on lui a demandé**
+    /// — la borne `since` et les URLs — et rend les vols qu'on lui a donnés.
+    /// L'enregistrement est ce qui rend la borne observable : sans lui, un
+    /// `since` toujours `None` donnerait exactement les mêmes verdicts qu'un
+    /// `since` correct sur un jeu de fixtures d'un seul vol.
+    /// Le journal des demandes : une entrée par lecture, portant la borne
+    /// `since` et la liste d'URLs interrogées.
+    type FlightQueries = Arc<Mutex<Vec<(Option<String>, Vec<String>)>>>;
+
+    struct RecordingFlightSource {
+        flights: Vec<crate::milestone_manager::evaluator::FinishedFlight>,
+        asked: FlightQueries,
+    }
+
+    impl RecordingFlightSource {
+        /// Rend la source **et** son journal — pas `Self`, parce que le cycle
+        /// consomme un `Arc<dyn FlightSource>` et que le test lit le journal.
+        fn wired(
+            flights: Vec<crate::milestone_manager::evaluator::FinishedFlight>,
+        ) -> (Arc<dyn FlightSource>, FlightQueries) {
+            let asked: FlightQueries = Arc::new(Mutex::new(Vec::new()));
+            let source: Arc<dyn FlightSource> = Arc::new(Self {
+                flights,
+                asked: asked.clone(),
+            });
+            (source, asked)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlightSource for RecordingFlightSource {
+        async fn finished_implement_flights(
+            &self,
+            since: Option<&str>,
+            issue_urls: &[String],
+        ) -> Vec<crate::milestone_manager::evaluator::FinishedFlight> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((since.map(str::to_string), issue_urls.to_vec()));
+            self.flights.clone()
+        }
+    }
+
+    /// Un vol terminé sur `#1802`, le sous-ticket de [`base_state`], dont la PR
+    /// est ouverte — donc un merge-candidat.
+    fn un_vol_sur_1802() -> crate::milestone_manager::evaluator::FinishedFlight {
+        crate::milestone_manager::evaluator::FinishedFlight {
+            task_id: "task-1802".into(),
+            status: "completed".into(),
+            result: Some(
+                "Outcome: PR_OPENED\nTurns: 83\nPR: https://github.com/senara-solutions/mika/pull/2002\n"
+                    .into(),
+            ),
+            metadata: Some(r#"{"claude_pilot":{"turns":83}}"#.into()),
+            reference_url: Some("https://github.com/senara-solutions/mika/issues/1802".into()),
+            completed_at: Some("2026-08-21T06:00:00Z".into()),
+        }
+    }
+
+    /// Sans source câblée, le cycle est **celui d'avant mika#2698** : aucun
+    /// verdict dans l'assessment, et donc pas de section dans le rapport. C'est
+    /// la propriété qui rend l'ajout sûr pour les douze appelants qui ne
+    /// passent rien.
+    #[tokio::test]
+    async fn mika2698_sans_source_le_rapport_est_celui_davant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+
+        run_manager_cycle_in(&cfg, base_state(), &CycleContext::new(&rec, now))
+            .await
+            .unwrap();
+
+        let calls = rec.calls.lock().unwrap();
+        let body = &calls[0].2;
+        assert!(
+            body.assessment.flight_verdicts.is_empty(),
+            "aucune source ⇒ aucun verdict"
+        );
+        assert!(
+            !body.report_markdown.contains("Vols terminés"),
+            "aucun verdict ⇒ pas de section (anti-vacuité) :\n{}",
+            body.report_markdown
+        );
+    }
+
+    /// Avec une source câblée, le verdict entre dans l'assessment — donc dans
+    /// le rapport livré, qui est le sink disque de mika#2697 — **et nulle part
+    /// ailleurs** : le mode ombre du point 3 du ticket.
+    #[tokio::test]
+    async fn mika2698_avec_une_source_le_verdict_entre_dans_le_rapport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let (source, _asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
+
+        run_manager_cycle_in(
+            &cfg,
+            base_state(),
+            &CycleContext::new(&rec, now).with_flight_source(Some(&source)),
+        )
+        .await
+        .unwrap();
+
+        let calls = rec.calls.lock().unwrap();
+        let body = &calls[0].2;
+        assert_eq!(body.assessment.flight_verdicts.len(), 1);
+        let v = &body.assessment.flight_verdicts[0];
+        assert_eq!(v.task_id, "task-1802");
+        assert_eq!(v.issue_number, Some(1802));
+        assert_eq!(v.turns_used, Some(83));
+        assert!(
+            body.report_markdown.contains(
+                "### Vols terminés depuis le cycle précédent (mode ombre — aucune écriture)"
+            ),
+            "la section doit apparaître :\n{}",
+            body.report_markdown
+        );
+    }
+
+    /// La borne « depuis le cycle précédent » vient du checkpoint, pas d'une
+    /// horloge : au premier cycle il n'y a pas de checkpoint, donc pas de borne
+    /// — « depuis toujours », et non un silence ; au second, la borne est le
+    /// `last_observed_at` que le premier a écrit.
+    ///
+    /// Le test pin aussi les URLs demandées : ce sont celles des sous-tickets
+    /// du milestone, jamais une requête non bornée.
+    #[tokio::test]
+    async fn mika2698_la_borne_since_vient_du_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let (source, asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
+
+        for h in [12, 19] {
+            let now = Utc.with_ymd_and_hms(2026, 8, 21, h, 0, 0).unwrap();
+            run_manager_cycle_in(
+                &cfg,
+                base_state(),
+                &CycleContext::new(&rec, now).with_flight_source(Some(&source)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 2, "une lecture par cycle");
+        assert_eq!(
+            asked[0].0, None,
+            "premier cycle : aucun checkpoint, aucune borne"
+        );
+        assert_eq!(
+            asked[1].0.as_deref(),
+            Some("2026-08-20T00:00:00Z"),
+            "second cycle : la borne est le `last_observed_at` du checkpoint"
+        );
+        assert_eq!(
+            asked[0].1,
+            vec!["https://github.com/senara-solutions/mika/issues/1802".to_string()],
+            "les URLs demandées sont celles des sous-tickets du milestone"
+        );
+    }
+
+    /// Le contrôle négatif du détecteur, côté cadence : un milestone **sans
+    /// sous-ticket** ne doit pas faire lire quoi que ce soit. Sans cette borne,
+    /// une liste d'URLs vide descendrait jusqu'au SQL, où elle se lirait comme
+    /// « tous les vols de la base ».
+    #[tokio::test]
+    async fn mika2698_un_milestone_sans_sous_ticket_ne_lit_aucun_vol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let (source, asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
+
+        let mut state = base_state();
+        state.sub_issues.clear();
+
+        run_manager_cycle_in(
+            &cfg,
+            state,
+            &CycleContext::new(&rec, now).with_flight_source(Some(&source)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "aucun sous-ticket ⇒ la source n'est même pas interrogée"
+        );
+        let calls = rec.calls.lock().unwrap();
+        assert!(calls[0].2.assessment.flight_verdicts.is_empty());
     }
 }
