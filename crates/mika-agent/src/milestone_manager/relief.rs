@@ -96,7 +96,7 @@ pub fn name_relief(
     candidates.sort_by_key(|t| pool_sort_key(t.priority_rank, t.origin, t.number));
 
     let beyond = candidates.len().saturating_sub(RELIEF_SIZE);
-    candidates.truncate(RELIEF_SIZE);
+    candidates.truncate(RELIEF_SIZE); // safe-byte-slice: Vec<ReliefTicket> — element count, no char boundary
 
     ReliefVerdict {
         next: candidates,
