@@ -453,8 +453,8 @@ impl Database {
     /// démarrage : plus aucun `VACUUM` n'y tourne, et c'est la garde (a) de
     /// mika#2735, tenue structurellement par
     /// `db::migrations::tests::aucun_vacuum_au_demarrage`. Le compactage devient
-    /// un geste d'opérateur, moteur arrêté — runbook dans
-    /// `docs/deployment.md` § *Migrations de schéma et réécritures de fichier*.
+    /// un geste d'opérateur, moteur arrêté — runbook dans `docs/deployment.md`
+    /// § 4b *Schema Migrations and File Rewrites*.
     /// Une commande `mika db vacuum` sous exclusivité explicite est le vol 2 du
     /// ticket ; elle n'existe pas encore.
     ///
@@ -464,7 +464,8 @@ impl Database {
     /// (`server/mod.rs`, seuil `DB_SIZE_WARN_BYTES`) continue de sonner **à
     /// chaque démarrage** — ce n'est plus un signal transitoire qu'un `VACUUM`
     /// éteint tout seul. C'est le prix assumé : un avertissement qui insiste
-    /// coûte l'attention de l'opérateur, un fichier abîmé coûte la base.
+    /// coûte l'attention de l'opérateur, un fichier abîmé coûte la base. Le
+    /// runbook le dit aussi, pour que la ligne ne soit pas lue comme une panne.
     fn migrate_v55_to_v56(&mut self) -> Result<()> {
         let version = self.schema_version()?;
         if version >= 56 {

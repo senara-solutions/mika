@@ -137,7 +137,7 @@ const WORKTREE_REAP_CRON: &str = "0 */10 * * * *";
 /// que rendre les pages à la *freelist*. La ligne `v56: vacuum complete` qui
 /// devait donner le plancher mesuré n'existe plus. Donc ce seuil est franchi
 /// *en permanence* lui aussi, jusqu'au premier compactage opérateur (runbook :
-/// `docs/deployment.md` § *Migrations de schéma et réécritures de fichier*).
+/// `docs/deployment.md` § 4b *Schema Migrations and File Rewrites*).
 /// Le plancher à comparer à 540 Mo est la taille **après** ce geste ; s'il s'en
 /// écarte de plus de 20 %, corriger ce nombre ici — la dérivation est écrite
 /// pour qu'il soit recalculable, pas pour qu'il soit cru.
@@ -828,7 +828,7 @@ async fn startup_cleanup(db: AsyncDatabase, embedding_client: Option<EmbeddingCl
             //
             // Conséquence assumée : l'espace que cette compaction libère reste
             // dans la *freelist* du fichier jusqu'au compactage opérateur
-            // (runbook dans `docs/deployment.md`). SQLite le réutilisera pour
+            // (`docs/deployment.md` § 4b). SQLite le réutilisera pour
             // les écritures suivantes ; il ne revient pas au système de
             // fichiers.
             info!(deleted, "compacted old audit events");
