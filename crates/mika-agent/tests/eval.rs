@@ -119,6 +119,12 @@ mod eval {
     // mika#2289 AC1 — la porte : `tour mort sur erreur LLM ⇒ verdict posté`.
     // Frère de `test_deadline_verdict_2276`, sur la branche `Err` de `run_agent`.
     mod test_error_verdict_2289;
+
+    // mika#2750 — la faucheuse de parents orphelins balaie aussi la classe
+    // `groom` : le contrôle positif (un groom orphelin atteint un état terminal
+    // nommé), le contrôle négatif (pilote vivant ⇒ rien ne bouge) et la
+    // non-régression mot-pour-mot du format de fil de la classe `implement`.
+    mod test_groom_parent_reap_2750;
     // mika#1784 — une image non lue est un fait dit. Les unités de
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.
