@@ -378,6 +378,10 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
 /// - Cross-agent invocation: mika-arch is advisory; it does not initiate
 ///   activity in other agents' lanes (target-agent boundary leak)
 /// - Agent / team mutations: provisions/edits other agents and teams
+/// - Orphaned reads (mika#2593): a read whose entire write family is denied
+///   above — it prepares a decision this agent cannot make
+/// - Deferred-dispatch slot ledger (mika#2593): a write, in a lane this agent
+///   does not own
 ///
 /// Notably allowed:
 /// - `send_message`: writes to mika-arch's own session history. Constitutive
@@ -388,6 +392,49 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
 ///   scoped to `agent_id = 'mika-arch'`). Constitutive of being an agent —
 ///   persistence, not platform side-effect. See
 ///   `docs/architecture/review-guide.md` § Orthogonality.
+///
+/// # The criterion the mika#2593 entries were cut by: C1 ∧ C2 ∧ C3
+///
+/// `tool_defs_bytes` is a toll, not a tail. Measured twice on
+/// `context_window_assembled` / `brief_size_overrun` (2026-10-15, 2026-10-16),
+/// mika-arch was served **21 175 bytes of tool definitions on every turn**,
+/// constant — ~41 % of the user message on the mika#2474 threshold population,
+/// 0.76 of it on the whole population. But restricting a tool surface changes
+/// *what the architect can do*: it is a **capacity** decision, not a size one,
+/// so the nine names mika#2593 added are the ones — and only the ones — where
+/// all three of these hold at once:
+///
+/// - **C1 — the entire write family is already out of reach.** Every tool that
+///   writes the table the read reads is either denied above or absent from the
+///   served builtin surface. Such a read informs no action this agent can take.
+///   This is the half that is *verified by code*, not merely asserted in prose:
+///   `mika2593_chaque_lecture_orpheline_a_sa_famille_decriture_hors_datteinte`.
+/// - **C2 — no served prompt names it.** The three mika-arch skill prompts name
+///   exactly four tools (`gh_read` ×17, `query_knowledge_graph` ×6, `store_fact`
+///   ×2, `update_core_memory` ×2); none of the nine appears once. A reproducible
+///   measurement, not a guard — an unnamed tool can still be reached through the
+///   base prompt's generic tool contract, which is why C2 alone never authorises
+///   a cut.
+/// - **C3 — neither constitutive nor self-knowledge nor grounding instrument.**
+///   Not `send_message` nor the agent-scoped memory writes (#811, *Notably
+///   allowed* above), not the self-knowledge family (#740), not the instruments
+///   the assert-grounded guard depends on (#1331).
+///
+/// **`list_agents` satisfies C1 and C2 and is kept anyway.** It prepares no
+/// action, but it carries topology knowledge — who else exists — which #740's
+/// self-knowledge contract may lean on outside any skill prompt. The criterion
+/// would have cut it; the criterion is not an automaton.
+///
+/// **Expected gain: 3.5–5.5 KB**, announced as a band because the plan's
+/// estimate transported a proportion of *source* weight and source↔JSON is not
+/// 1:1. Serializing the nine definitions at implementation time puts the figure
+/// at **4 252 bytes** (3 246 from `default_tools()` — of which
+/// `promote_deferred_callback` alone is 899 — plus 1 003 from the three team
+/// reads, plus separators), i.e. ~20 % of the 21 175 measured. That remains a
+/// *prediction*: the arbiter is `tool_defs_bytes` itself after deploy, read
+/// next to the `kept_count` / `kept_bytes` fields of
+/// `applied identity tool-visibility filter`, which are what tell a landed cut
+/// from a half-landed one.
 pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
     // Skill mutations
     "create_skill",
@@ -419,6 +466,21 @@ pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
     "update_team",
     "add_team_member",
     "remove_team_member",
+    // Orphaned reads (mika#2593) — a read whose entire write family is denied
+    // above informs no action this agent can take. Criterion C1, pinned by
+    // `mika2593_chaque_lecture_orpheline_a_sa_famille_decriture_hors_datteinte`.
+    "list_reminders",
+    "list_scheduled_tasks",
+    "list_tasks",
+    "get_task",
+    "check_task",
+    "list_teams",
+    "get_team_status",
+    "get_team_history",
+    // Deferred-dispatch slot ledger (mika#2593) — a WRITE, in the lane this
+    // agent does not own. Same category as `a2a_call` / `delegate_task` /
+    // `run_team` above; its absence from #811's list was a gap, not a decision.
+    "promote_deferred_callback",
 ];
 
 /// mika-arch's static skill allowlist. Held as a `pub const` (rather than only
@@ -2074,17 +2136,213 @@ mod tests {
         );
     }
 
+    /// Memory writes mutate the agent's own self-state (5 core memory
+    /// blocks + 4 facts categories, scoped to agent_id='mika-arch'). They
+    /// are constitutive of being an agent, not platform side-effects.
+    /// See mika/docs/architecture/review-guide.md § Orthogonality.
+    ///
+    /// Held as a const — rather than inline in the single test that used to own
+    /// it — because mika#2593's criterion C3 is a second reader of the same
+    /// three names, and a criterion checked against a copy of a list is checked
+    /// against nothing. #811 remains the owner: this list is not widened,
+    /// narrowed or rewritten by any later ticket.
+    const MIKA_ARCH_AGENT_SELF_STATE_TOOLS: &[&str] =
+        &["update_core_memory", "store_fact", "update_fact"];
+
     #[test]
     fn test_mika_arch_disabled_tools_excludes_agent_self_state() {
-        // Memory writes mutate the agent's own self-state (5 core memory blocks
-        // + 4 facts categories, scoped to agent_id='mika-arch'). They are
-        // constitutive of being an agent, not platform side-effects.
-        // See mika/docs/architecture/review-guide.md § Orthogonality.
-        let agent_self_state_tools = ["update_core_memory", "store_fact", "update_fact"];
-        for tool in &agent_self_state_tools {
+        for tool in MIKA_ARCH_AGENT_SELF_STATE_TOOLS {
             assert!(
                 !MIKA_ARCH_DISABLED_TOOLS.contains(tool),
                 "{tool} must remain visible to mika-arch (agent self-state, not platform side-effect)"
+            );
+        }
+    }
+
+    /// The rest of criterion C3 (mika#2593), beyond #811's constitutive three.
+    ///
+    /// `send_message` is constitutive on the same grounds as the memory writes
+    /// (#811); the self-knowledge family is mika#740's; the four grounding
+    /// instruments are what the assert-grounded EndTurn guard reads (#1331).
+    /// Named here so a future widening of [`MIKA_ARCH_ORPHANED_READS`] into any
+    /// of them reddens instead of shipping — a tool can satisfy C1 and C2 and
+    /// still be one the architect must keep.
+    const MIKA_ARCH_C3_PROTECTED: &[&str] = &[
+        // Constitutive (#811), alongside MIKA_ARCH_AGENT_SELF_STATE_TOOLS
+        "send_message",
+        // Self-knowledge (#740)
+        "get_config",
+        "get_active_llm",
+        "list_skills",
+        "read_agent_file",
+        "list_agent_files",
+        // Grounding instruments the assert-grounded guard depends on (#1331)
+        "query_timeline",
+        "get_session_messages",
+        "list_audit_events",
+        "search_tool_history",
+    ];
+
+    /// The eight orphaned reads of mika#2593, each with the write family that
+    /// makes it orphaned: `(read, the tools that write the table it reads)`.
+    ///
+    /// `promote_deferred_callback` is deliberately **absent**: it is a write,
+    /// denied under the cross-agent-invocation rationale, not a read whose
+    /// family went out of reach. Putting it here would make the table claim
+    /// something about it that is not the reason it was cut.
+    const MIKA_ARCH_ORPHANED_READS: &[(&str, &[&str])] = &[
+        (
+            "list_reminders",
+            &["create_reminder", "cancel_reminder"] as &[&str],
+        ),
+        (
+            "list_scheduled_tasks",
+            &[
+                "create_reminder",
+                "cancel_reminder",
+                "create_scheduled_task",
+            ],
+        ),
+        (
+            "list_tasks",
+            &[
+                "create_task",
+                "update_task_status",
+                "complete_task",
+                "cancel_task",
+            ],
+        ),
+        (
+            "get_task",
+            &[
+                "create_task",
+                "update_task_status",
+                "complete_task",
+                "cancel_task",
+            ],
+        ),
+        (
+            "check_task",
+            &[
+                "create_task",
+                "update_task_status",
+                "complete_task",
+                "cancel_task",
+            ],
+        ),
+        (
+            "list_teams",
+            &[
+                "create_team",
+                "delete_team",
+                "update_team",
+                "add_team_member",
+                "remove_team_member",
+                "run_team",
+            ],
+        ),
+        (
+            "get_team_status",
+            &[
+                "create_team",
+                "delete_team",
+                "update_team",
+                "add_team_member",
+                "remove_team_member",
+                "run_team",
+            ],
+        ),
+        (
+            "get_team_history",
+            &[
+                "create_team",
+                "delete_team",
+                "update_team",
+                "add_team_member",
+                "remove_team_member",
+                "run_team",
+            ],
+        ),
+    ];
+
+    /// Rows of [`MIKA_ARCH_ORPHANED_READS`] exempted from the criterion, each
+    /// with the reason — `(read, why)`.
+    ///
+    /// **Shipped empty, and it is meant to stay that way.** A detector born
+    /// with exceptions is a detector that was never armed (mika#2158). An entry
+    /// here is an admission that one of the nine cuts does not meet the
+    /// criterion the const's doc-comment claims for all nine; the honest
+    /// response is to take that name back out of `MIKA_ARCH_DISABLED_TOOLS`,
+    /// not to write a line here. The emptiness is asserted, so the list cleans
+    /// itself up rather than rotting.
+    const MIKA2593_CRITERION_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// mika#2593 C1 + C3 — a read is cut only when it prepares no decision this
+    /// agent can make, and is not itself a tool the architect must keep.
+    ///
+    /// The class this catches that no behavioural test can: a future ticket
+    /// widening the cut to a read whose writes are **still served**. Such a
+    /// read is not orphaned — it informs an action the architect can still
+    /// take — and removing it is destructive, which is exactly what mika#2593
+    /// promised not to be. Nothing about the served tool array would look
+    /// wrong; the suite would stay green and the capability would be gone.
+    ///
+    /// "Out of reach" is read against the whole declared builtin surface
+    /// ([`crate::tools::BUILTIN_TOOL_NAMES`] ∪ the registry built by
+    /// `default_tools()`), not against `default_tools()` alone: a write living
+    /// in `management_tools_if_needed` is served to mika-arch too, so counting
+    /// it absent would let the guard pass on a family that is still reachable.
+    #[test]
+    fn mika2593_chaque_lecture_orpheline_a_sa_famille_decriture_hors_datteinte() {
+        assert!(
+            MIKA2593_CRITERION_EXCEPTIONS.is_empty(),
+            "MIKA2593_CRITERION_EXCEPTIONS is not empty: {MIKA2593_CRITERION_EXCEPTIONS:?}. \
+             An exception means one of mika#2593's cuts does not meet the criterion its \
+             doc-comment claims for all of them — remove that name from \
+             MIKA_ARCH_DISABLED_TOOLS instead of exempting it here."
+        );
+
+        let registry = crate::tools::default_tools();
+        let declared: std::collections::HashSet<String> = crate::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|n| (*n).to_string())
+            .chain(registry.definitions().iter().map(|d| d.name.clone()))
+            .collect();
+
+        for (read, write_family) in MIKA_ARCH_ORPHANED_READS {
+            if MIKA2593_CRITERION_EXCEPTIONS.iter().any(|(n, _)| n == read) {
+                continue;
+            }
+
+            // C1a — the read itself is actually denied. Without this the two
+            // checks below could pass on a name nobody ever cut.
+            assert!(
+                MIKA_ARCH_DISABLED_TOOLS.contains(read),
+                "{read} is listed in MIKA_ARCH_ORPHANED_READS but is not in \
+                 MIKA_ARCH_DISABLED_TOOLS. Either deny it, or drop its row from the table."
+            );
+
+            // C1b — the whole write family is out of reach.
+            for write in *write_family {
+                let denied = MIKA_ARCH_DISABLED_TOOLS.contains(write);
+                let unserved = !declared.contains(*write);
+                assert!(
+                    denied || unserved,
+                    "{read} is cut as an orphaned read, but {write} — which writes the table \
+                     it reads — is still served to mika-arch. The read is therefore NOT \
+                     orphaned: it informs an action the architect can still take, and cutting \
+                     it is destructive. Either deny {write} in MIKA_ARCH_DISABLED_TOOLS \
+                     (well_known_agents.rs) too, or take {read} back out of the denylist."
+                );
+            }
+
+            // C3 — the read is not one the architect must keep regardless.
+            assert!(
+                !MIKA_ARCH_AGENT_SELF_STATE_TOOLS.contains(read)
+                    && !MIKA_ARCH_C3_PROTECTED.contains(read),
+                "{read} is cut as an orphaned read, but it belongs to a family mika-arch keeps \
+                 by decision (#811 constitutive / #740 self-knowledge / #1331 grounding). C1 and \
+                 C2 do not authorise cutting it — remove it from MIKA_ARCH_DISABLED_TOOLS."
             );
         }
     }

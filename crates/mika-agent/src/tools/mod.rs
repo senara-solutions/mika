@@ -1636,6 +1636,104 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // mika#2593 — what `default_tools()` still serves mika-arch is a roster
+    // -----------------------------------------------------------------------
+
+    /// The builtins `default_tools()` serves mika-arch after
+    /// [`crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS`] has been applied.
+    ///
+    /// **Bound of the list, stated so it is not misread.** This covers
+    /// `default_tools()` only. `management_tools_if_needed()` is out of scope:
+    /// its membership depends on runtime state (agent count, existence of
+    /// teams), so no const can mirror it. Of its fourteen tools, ten were
+    /// already denied, three more are denied by mika#2593 (`list_teams`,
+    /// `get_team_status`, `get_team_history`), and the one that remains is
+    /// `list_agents` — kept on purpose (topology knowledge, mika#740).
+    ///
+    /// **Eighteen is not the `kept_count` the filter logs.** That field counts
+    /// what survives on the *global* registry, management tools included, and
+    /// reads 19 at the time of writing (`list_agents` is the nineteenth). Two
+    /// populations under one name do not subtract (mika#2205); comparing this
+    /// roster against a log field is reading the wrong instrument.
+    const MIKA_ARCH_SERVED_BUILTINS_FROM_DEFAULT_TOOLS: &[&str] = &[
+        "update_core_memory",
+        "store_fact",
+        "search_memory",
+        "update_fact",
+        "send_message",
+        "list_skills",
+        "get_config",
+        "get_active_llm",
+        "read_agent_file",
+        "list_agent_files",
+        "resolve_issue_order",
+        "query_knowledge_graph",
+        "query_timeline",
+        "get_session_messages",
+        "list_audit_events",
+        "search_tool_history",
+        "record_served_content",
+        "check_already_served",
+    ];
+
+    /// What mika-arch is served out of `default_tools()` is an **attested**
+    /// roster, not a residue — and divergence is caught in both directions.
+    ///
+    /// A name registered in `default_tools()` and absent from both the denylist
+    /// and this roster has been handed to the architect by nobody's decision:
+    /// it simply arrived with the registry. That is the whole failure mode
+    /// mika#2593 exists to end, and no behavioural test sees it — the agent
+    /// works, it just carries a tool nobody weighed. A name in the roster that
+    /// the registry no longer serves is the mirror defect: this list would read
+    /// as an attestation of something that is gone.
+    ///
+    /// Same form as
+    /// [`mika1952_gated_tools_match_the_reflection_contract_constant`] above,
+    /// with one difference: the authority here is the **registry itself**, not
+    /// a source scan. `default_tools()` takes no arguments and `definitions()`
+    /// is public, so the real thing can be built and asked.
+    #[test]
+    fn mika2593_le_tableau_servi_a_mika_arch_est_un_roster_atteste() {
+        let registry = default_tools();
+        let served: HashSet<String> = registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .filter(|name| {
+                !crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS
+                    .iter()
+                    .any(|denied| denied.eq_ignore_ascii_case(name))
+            })
+            .collect();
+
+        let roster: HashSet<String> = MIKA_ARCH_SERVED_BUILTINS_FROM_DEFAULT_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        let mut unattested: Vec<&String> = served.difference(&roster).collect();
+        let mut vanished: Vec<&String> = roster.difference(&served).collect();
+        unattested.sort();
+        vanished.sort();
+
+        assert!(
+            unattested.is_empty() && vanished.is_empty(),
+            "mika#2593 — the builtins served to mika-arch must match \
+             MIKA_ARCH_SERVED_BUILTINS_FROM_DEFAULT_TOOLS, exactly.\n\
+             \n\
+             Served but NOT in the roster: {unattested:?}\n\
+             → mika-arch received a tool nobody weighed against the C1/C2/C3 criterion. \
+             Decide: if the architect needs it, add the name to the roster \
+             (crates/mika-agent/src/tools/mod.rs); if not, add it to \
+             MIKA_ARCH_DISABLED_TOOLS (crates/mika-agent/src/well_known_agents.rs).\n\
+             \n\
+             In the roster but NOT served: {vanished:?}\n\
+             → the roster attests a tool the registry no longer hands out. Either restore \
+             the registration in `default_tools()`, or drop the name from the roster."
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // mika#2627 V11 — the gated-tool list mirrors the testimony guard's callers
     // -----------------------------------------------------------------------
 
