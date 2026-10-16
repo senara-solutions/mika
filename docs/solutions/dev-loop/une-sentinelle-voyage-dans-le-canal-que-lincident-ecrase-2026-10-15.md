@@ -56,7 +56,7 @@ la réponse intuitive est fausse.
 | en-tête posé par un shim `gh` sur le PATH | oui | non (deux mécanismes à construire) | non | **écarté** |
 | `Proxy-Authorization` | non | non | non | **écarté** (l'addon le retire aussi) |
 | fichier monté dans la sandbox | n/a — hors du chemin réseau | n/a | non | **écarté** |
-| **le credential lui-même (`GH_TOKEN`)** | **oui, déjà** | **oui, déjà** | **oui** | **retenu** |
+| **le credential lui-même (`GH_TOKEN`)** | **oui, déjà** | **non** — l'addon injecte un `Basic` côté proxy, donc aucun justificatif ne peut voyager dans ce canal sur `github.com` | **oui** | **retenu** |
 
 Trois raisons condamnent l'en-tête dédié, et la troisième est décisive :
 
@@ -133,6 +133,54 @@ entrée de `PILOT_DISPATCH_ENV`, pour deux raisons indépendantes : le nom est
 pilote ; et son **vide n'est pas un palier** (`${…:-1}` rend `1`), là où le vide
 de `PILOT_MAX_TURNS` *est* le rollback documenté. Rien n'entre dans
 `SANDBOX_ENV_CORE_ALLOWLIST` (mika#2354 AC9(b)).
+
+## Rectification de la table, et ce qu'elle a coûté au périmètre (mika#2724)
+
+La case *« posé par `git` ? »* de la ligne retenue disait **« oui, déjà »**.
+C'est **faux**, et la correction n'est pas cosmétique : elle réduit le périmètre
+du refus.
+
+Dans la sandbox de pilote, `git` ne présente **aucun** justificatif. Il n'y a
+pas de credential helper, `GIT_CONFIG_NOSYSTEM=1`, et
+`_stage_pilot_gitconfig` écrit le `GIT_CONFIG_GLOBAL` **de zéro** : rien n'y
+lit `GH_TOKEN`. C'est l'addon qui, côté proxy, injecte un
+`Basic base64("x-access-token:<jeton>")` vers `github.com`. Autrement dit, le
+canal choisi — `GH_TOKEN` — n'est emprunté que par `gh`, et `gh` ne parle qu'à
+`api.github.com`.
+
+Conséquence directe sur le vol 2 : **le refus est borné à `api.github.com`**.
+Exiger un justificatif sur `github.com` refuserait chaque `git push` sans rien
+acheter, puisqu'aucun justificatif ne peut y voyager. La moitié `git push` de
+l'egress de pilote reste donc ouverte, et elle est hors de portée de *ce*
+canal — ce qui est une propriété du canal, pas un oubli.
+
+La case fautive n'était pas une erreur de frappe : elle décrivait ce que `git`
+fait **hors sandbox**, où un helper pose bien un credential. La table parlait de
+la sandbox ; une des cinq lignes parlait du poste de l'opérateur.
+
+## Le schéma que `gh` émet, capturé sur le fil
+
+Le grooming du vol 2 avait mesuré que **les deux** chaînes de format `Bearer %s`
+et `token %s` vivent dans le binaire `gh` installé. Un format présent n'est pas
+une émission : lequel part sur le fil était la seule mesure que la DoD du vol 2
+rendait prérequise, parce qu'un lecteur qui n'accepterait que `Bearer` rendrait
+403 sur **chaque** appel `gh` de la boucle.
+
+Capturé contre **GitHub CLI v2.92.0**, en pointant `http_unix_socket` (une clé
+de config de `gh` prévue pour ça) vers un listener HTTP en clair :
+
+```
+Authorization: token ghp_probe2724PROBE2724PROBE2724PROBE27
+```
+
+sur `GET /rate_limit`, sur `POST /graphql`, et via une vraie sous-commande
+(`gh issue list`). **Jamais `Bearer`.** Le lecteur de l'addon accepte donc les
+deux, plus `Basic` décodé, et compare le schéma sans égard à la casse.
+
+Deux détours inutiles, notés pour ne pas être repris : `gh api --hostname
+host:port` est refusé (`invalid hostname`), et Go contourne `HTTP_PROXY` pour
+tout nom d'allure localhost — donc ni un port ni un proxy local ne permettent
+d'observer `gh` en clair. `http_unix_socket` est le chemin qui marche.
 
 ## La leçon transposable
 

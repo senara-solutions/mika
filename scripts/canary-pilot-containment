@@ -672,12 +672,65 @@ curl -sS -m 4 -o /dev/null -w "curl_evil=%{http_code}\n" https://evil.example.co
     || echo "ok:   curl_evil_error (expected — 403 via proxy)"
 
 echo
-echo "--- must-work: allowlisted egress (api.github.com now MITM-injected) ---"
+echo "--- must-work: allowlisted egress, and the sentinel is REQUIRED (mika#2724) ---"
 # mika#2056: api.github.com is no longer a plain CONNECT allowlist host — it is
 # MITM-forwarded, and the github auth addon injects the credential host-side.
 # An authenticated 200 here therefore also proves the host-side injection path
 # is intact end-to-end (curl carries no token itself).
-curl -sS -m 8 -o /dev/null -w "curl_github=%{http_code}\n" https://api.github.com/ 2>&1 | head -1
+#
+# mika#2724 turned that single probe into three, because one 200 could no
+# longer tell the two readings apart. Since the addon REQUIRES the per-spawn
+# sentinel, a plain curl — which presents nothing — is now a legitimate 403,
+# and the old `curl_github=200` line would have failed on a perfectly intact
+# fix while an addon that 403s EVERYTHING would also have failed it, the same
+# bytes for opposite faults (class mika#2205). So each probe states what it
+# presents and what it expects:
+#
+#   accepted       — presents the sandbox GH_TOKEN (the sentinel staged for
+#                    this spawn). A 403 here IS the failure mode the parent
+#                    ticket names as the only one able to stop the loop, and it
+#                    now reads on one line instead of being deduced from a
+#                    silence.
+#   denied_absent  — presents nothing. The `cargo test` that cleared GH_TOKEN
+#                    (substrate of mika#2713) looks exactly like this.
+#   denied_unknown — presents a well-formed-looking value no registry attests.
+#
+# The last two must name DIFFERENT reasons: a single reason would make the two
+# opposite causes indistinguishable at the moment the difference decides the
+# remedy. The reason is read from the refusal body, which is where the addon
+# names it in clear (it never carries the value presented — mika#1949).
+#
+# The bogus value below matches no _CANARY_CRED_PATTERN prefix on purpose, so
+# the argv/env leak probes above cannot turn it into a false LEAK.
+_canary_sentinel_probe() {
+    _label="$1"; _want_code="$2"; _want_reason="$3"; shift 3
+    _out=$(curl -sS -m 8 -w "\n%{http_code}" "$@" https://api.github.com/ 2>&1)
+    _code=$(printf "%s\n" "$_out" | tail -1)
+    # Substring match on the three reasons the addon can emit — no grep, no
+    # pipe, and it pins the vocabulary as a side effect.
+    case "$_out" in
+        *"DENY sentinel-absent"*)     _reason=sentinel-absent ;;
+        *"DENY sentinel-unknown"*)    _reason=sentinel-unknown ;;
+        *"DENY registry-unreadable"*) _reason=registry-unreadable ;;
+        *)                            _reason="" ;;
+    esac
+    if [ "$_code" = "$_want_code" ] && [ "$_reason" = "$_want_reason" ]; then
+        echo "ok:   $_label ($_code${_want_reason:+ $_want_reason})"
+    else
+        echo "FAIL: $_label expected $_want_code${_want_reason:+ $_want_reason}, got $_code${_reason:+ $_reason}"
+    fi
+}
+_canary_sentinel_probe egress_sentinel_accepted 200 "" \
+    -o /dev/null -H "Authorization: token ${GH_TOKEN-}"
+_canary_sentinel_probe egress_sentinel_denied_absent 403 sentinel-absent
+_canary_sentinel_probe egress_sentinel_denied_unknown 403 sentinel-unknown \
+    -H "Authorization: token not-a-sentinel-canary-2724"
+# The rollback, named here because this is where its effect is observable:
+# MIKA_PILOT_EGRESS_SENTINEL=0 disarms BOTH halves — the launcher presents the
+# bare placeholder and the addon accepts it. Under that rollback the two
+# denied_* probes report 200 and FAIL, which is the correct reading: the guard
+# is off by operator decision. A rollback that only had one half would instead
+# show accepted=403, and that is a defect, not a decision (mika#2165).
 
 echo
 echo "--- must-fail: no GitHub token value in the sandbox (mika#2056, mika#2572) ---"

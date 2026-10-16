@@ -148,6 +148,93 @@ tok_file.unlink()
 mod._token_cache.update({"mtime": None, "value": None})
 results.append(("no source → None (fail-closed)", mod._read_token() is None))
 
+# 5. mika#2724 — the refusal is WIRED into requestheaders, not merely defined.
+#    This suite is the mika#2056 gate, and every assertion above it is on a
+#    PURE function: it would stay green on an addon whose enforcement had been
+#    deleted from requestheaders, injecting unconditionally again. The
+#    exhaustive contract — three reasons, their distinct bodies, the TTL purge,
+#    the DENY log that names without disclosing — lives in
+#    test_egress_sentinel_enforcement.sh. What is pinned HERE is the junction
+#    this suite is responsible for: api.github.com consults the sentinel before
+#    injecting, and github.com still does not (§ 2.1–2.3 — `git` presents no
+#    credential in the pilot sandbox, so requiring one there refuses pushes for
+#    nothing).
+class _Headers(dict):
+    """Case-insensitive, the slice of mitmproxy.http.Headers the addon uses."""
+
+    def get(self, key, default=None):
+        return dict.get(self, key.lower(), default)
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, key.lower(), value)
+
+    def pop(self, key, default=None):
+        return dict.pop(self, key.lower(), default)
+
+
+class _Response:
+    def __init__(self, status_code, content, headers):
+        self.status_code, self.content, self.headers = status_code, content, headers
+
+    @classmethod
+    def make(cls, status_code=200, content=b"", headers=None):
+        return cls(status_code, content, headers or {})
+
+
+class _Request:
+    def __init__(self, host, headers):
+        self.host, self.method, self.path, self.headers = host, "GET", "/", headers
+
+
+class _Flow:
+    def __init__(self, host, headers):
+        self.request, self.response = _Request(host, headers), None
+
+
+# Response was stubbed as `object` for the import; the addon resolves
+# http.Response at CALL time, so patching the module attribute now is enough.
+http_mod.Response = _Response
+
+os.environ["GH_TOKEN"] = fake_token
+mod._token_cache.update({"mtime": None, "value": None})
+registry = Path(home) / ".mika" / "pilot-egress-sentinels"
+registry.mkdir(parents=True, exist_ok=True)
+nonce = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+(registry / nonce).write_text("", encoding="utf-8")
+sentinel = f"proxy-managed-no-secret-{nonce}"
+
+import io  # noqa: E402 — the DENY line goes to stderr and must not pollute the report
+from contextlib import redirect_stderr  # noqa: E402
+
+
+def _drive(host, credential):
+    flow = _Flow(host, _Headers())
+    if credential is not None:
+        flow.request.headers["Authorization"] = credential
+    with redirect_stderr(io.StringIO()):
+        mod.requestheaders(flow)
+    return flow
+
+
+refused = _drive("api.github.com", None)
+results.append(("api.github.com with nothing presented → 403 (wired)",
+                refused.response is not None
+                and refused.response.status_code == 403
+                and b"sentinel-absent" in refused.response.content))
+results.append(("and no credential is injected on that refusal",
+                refused.request.headers.get("Authorization") is None))
+
+allowed = _drive("api.github.com", f"token {sentinel}")
+results.append(("api.github.com with the attested sentinel → the host Bearer",
+                allowed.response is None
+                and allowed.request.headers.get("Authorization")
+                == f"Bearer {fake_token}"))
+
+git_flow = _drive("github.com", None)
+results.append(("github.com is untouched by the requirement",
+                git_flow.response is None
+                and git_flow.request.headers.get("Authorization") == expected_basic))
+
 ok = all(v for _, v in results)
 for label, v in results:
     print(f"RESULT {'PASS' if v else 'FAIL'} {label}")
