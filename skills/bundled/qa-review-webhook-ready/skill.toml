@@ -1,0 +1,30 @@
+[skill]
+name = "qa-review-webhook-ready"
+description = "Webhook handler for pull_request.ready_for_review — dispatches autonomous qa-review when a draft PR is promoted to ready"
+version = "0.1.0"
+always_on = false
+dependencies = ["qa-review"]
+
+[triggers]
+# **Keywords cut to the measured semantics of the matcher, not to intuition.**
+# `crates/mika-agent/src/skills/matcher.rs` (`build_matcher_regex`) matches on
+# WORD BOUNDARIES, case-insensitively, against the lowercased message. Two
+# candidates were therefore rejected during grooming (mika#2212):
+#
+#   - `"ready for review"` (with spaces) fires on ordinary prose — "this PR is
+#     ready for review" is enough — and would activate this handler on
+#     unrelated conversational turns.
+#   - `"undraft"` appears in no text `format_event_text` produces; its only
+#     effect would be to open a conversational door nobody asked for.
+#
+# What remains are the two exact forms that stick to the first line the gateway
+# really emits (`github.rs`, `"pull_request"` arm):
+#   [GitHub] PR ready_for_review: senara-solutions/mika#<n> — <title> (branch: <b>)
+#
+# Activation is therefore STRUCTURAL — an engine regex match, not a judgement
+# the model makes. Same lever as `qa-review-webhook-success` (mika#1711), which
+# is empirically known to hold.
+keywords = [
+    "ready_for_review",
+    "PR ready_for_review",
+]

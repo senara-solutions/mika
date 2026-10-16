@@ -1711,6 +1711,20 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 // décide s'il est appelé, donc rien n'est posté tant que
                 // l'opérateur n'a pas déclaré l'endpoint.
                 std::sync::Arc::new(crate::milestone_manager::HttpLivenessSink::new()),
+                // mika#2698 vol 1 — d'où viennent les vols terminés à évaluer.
+                // Scopée à la base de l'agent par défaut pour la même raison que
+                // le ledger ci-dessus : la cadence est une tâche de processus,
+                // sans agent propre, et `AsyncDatabase` porte l'`agent_id` que la
+                // requête filtre. `None` quand l'agent par défaut est absent —
+                // une source manquante rend un rapport sans la section, jamais un
+                // cycle mort. Lecture seule : aucune autorité d'écriture ne passe
+                // par ce paramètre.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::flight_source::DbFlightSource::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::milestone_manager::FlightSource>
+                }),
             ),
             Ok(None) => {
                 info!(

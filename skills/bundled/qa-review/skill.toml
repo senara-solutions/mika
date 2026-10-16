@@ -105,7 +105,36 @@ timeout_secs = 30
 # Data Integrity exemption otherwise reads only a structured `"policy"` refusal.)
 # That is under one sentence. The second remediation is spent too: the next
 # addition shards.
-max_prompt_size = 81408
+#
+# **mika#2212 raised this number to the hard ceiling, and that is the last time
+# it can be raised.** The addition is one line: `pull_request.ready_for_review`
+# joined the trigger enumeration on line 5 (+33 bytes, prompt now **77 292**).
+# It is not decoration — the gateway has routed that action to mika-qa since
+# mika#1822, which added it to close exactly the class *« stranding every
+# wip-rescue-shaped PR without an autonomous review »*, and this prompt kept
+# enumerating only `opened` / `synchronize` / `review_requested`. mika#1822
+# changed the routing table and not the agent-side contract; nothing failed.
+# Measured cost: two PRs, three triggerings, zero fresh verdict, two manual
+# merges. The line is also the **T2 term** of the coherence guard that now
+# makes that divergence impossible to ship silently
+# (`crates/mika-gateway/src/github.rs`, `mod tests`,
+# `mika2212_every_pull_request_action_routed_to_qa_is_covered_by_a_handler`) —
+# so removing it reddens CI, by design.
+#
+# At the old 81 408 the gate (95 %) sat at 77 337: **45 bytes of headroom**, not
+# a shippable state for a `panic!`-gate. 81 920 is `MAX_PROMPT_SIZE_CEILING`
+# (`crates/mika-agent/src/skills/index.rs:27`, 80 KB), which
+# `effective_prompt_limit` applies through a `.min()` — declaring more has
+# **zero** effect. The gate moves to 77 824: **532 bytes of headroom.**
+#
+# **The raise remediation is now exhausted, in the literal sense.** This is the
+# ceiling; there is no number left to write. The next addition to this prompt
+# has only the two other options the gate names (`bundled_skills_load.rs`):
+# trim, or shard via `[dependencies]` — Step 1.6 remains the natural seam.
+# Sharding was declined here as out of scope: it is a refactor of the largest
+# prompt in the repo, unrelated to a routing defect, and not risk-free (a
+# handler nobody depends on is unreachable and silently mute — mika#2355).
+max_prompt_size = 81920
 # `qa-review-build-callback` est listé ici pour une raison précise et
 # contre-intuitive (mika#2355 B1). Ce skill déclare déjà `dependencies =
 # ["qa-review"]` — mais c'est une arête ENTRANTE, et `callback_safe_skills()`

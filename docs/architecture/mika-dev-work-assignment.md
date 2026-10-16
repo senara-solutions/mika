@@ -33,11 +33,13 @@ action.
 | `senara-solutions/mika-cloud` | ✅ | ✅ |
 | `senara-solutions/mika-skills` | ✅ | ✅ |
 | `senara-solutions/mika-platform` | ✅ | ✅ |
-| `senara-solutions/claude-pilot-py` | ✅ | ❌ |
+| `senara-solutions/claude-pilot` | ✅ | ❌ |
 | `senara-solutions/wizzard` | ✅ | ❌ |
 
 - **`INTERNAL_REPOS`** (`crates/mika-gateway/src/github.rs`) decides which
-  repositories **route** to mika-dev without a `github_repos` row.
+  repositories **route** to mika-dev without a `github_repos` row. It carries a
+  renamed repository's **current name only** — no alias (mika#2666): the list
+  authorizes, and GitHub only ever sends the current name.
 - **`DISPATCHABLE_REPOS`** (`crates/mika-agent/src/webhook_dispatch.rs`) decides
   where the loop may **dispatch**. The 2026-08-29 operator decision keeps
   `claude-pilot` and `control-monitor` spawn-CC-only; `wizzard` is a read-write
@@ -46,7 +48,7 @@ action.
 **The ownership list of AC1 is the second one**, and the reason is not
 conservatism. `surface_for_adoption` proposes an action — *create a task from this
 event and engage* — and `DISPATCHABLE_REPOS` is the list that answers whether the
-proposed action is **executable**. Surfacing `claude-pilot-py` would put a
+proposed action is **executable**. Surfacing `claude-pilot` would put a
 proposal in front of the operator that the mika#2046 tool-boundary gate refuses
 structurally. That repository therefore belongs to **AC4 (silent-stop)**, not to
 AC1.
@@ -139,7 +141,7 @@ expense.
 
 | ticket's case | real status | why |
 |---|---|---|
-| **1 — a cpp Dependabot QA-pass event should surface** | **AC4, not AC1** — it must stay silent, on two counts | `claude-pilot-py` is deliberately outside `DISPATCHABLE_REPOS` (2026-08-29 operator decision), so surfacing it would propose an unexecutable action. And the *Dependabot* half is already closed since mika#1729, more strongly than the ticket asks: on a dispatchable repo a task-less Dependabot PR **merges** through the `pass` path, with `pr_merge_with_gate` as the hard guard (see `self-dev-webhook-qa/system_prompt.md`, box *Task-less Dependabot PRs*). |
+| **1 — a cpp Dependabot QA-pass event should surface** | **AC4, not AC1** — it must stay silent, on two counts | `claude-pilot` is deliberately outside `DISPATCHABLE_REPOS` (2026-08-29 operator decision), so surfacing it would propose an unexecutable action. And the *Dependabot* half is already closed since mika#1729, more strongly than the ticket asks: on a dispatchable repo a task-less Dependabot PR **merges** through the `pass` path, with `pr_merge_with_gate` as the hard guard (see `self-dev-webhook-qa/system_prompt.md`, box *Task-less Dependabot PRs*). |
 | **2 — a CI success on an owned repo it did not dispatch** | **already covered**, no silence to lift | `ci_success_handler` handles a missing task without stopping: the `MergeReadySignal` is emitted with `task_id = "none"`. |
 | **3 — an event on an UNowned repo should still silent-stop** | **held, and now attributable** | Same arm as before; it now writes one `surface_for_adoption_skipped` INFO line naming the motif, so the silence can be told from a broken predicate. |
 
@@ -201,7 +203,7 @@ carries a task.
 (`find_active_task`: `pr_url` then branch) and **that** is where to look, not in
 the dedup window.
 
-**S4 — AC4 holds.** Zero surface on `claude-pilot-py` and `wizzard`.
+**S4 — AC4 holds.** Zero surface on `claude-pilot` and `wizzard`.
 *Halt 4 — one occurrence:* the predicate is reading `INTERNAL_REPOS` instead of
 `DISPATCHABLE_REPOS`. Disarm, fix the list being read — do not add a downstream
 filter.
@@ -228,7 +230,7 @@ nothing: a task-less CI failure must actually have happened since the deploy.
 
 ## 10. Out of scope, deliberately
 
-- **Widening `DISPATCHABLE_REPOS` to `claude-pilot-py`** — a 2026-08-29 operator
+- **Widening `DISPATCHABLE_REPOS` to `claude-pilot`** — a 2026-08-29 operator
   decision, not a predicate defect. A ticket that wants to reopen it must weigh
   it, not route around it with a surface.
 - **Auto-adoption** — explicitly deferred by AC3, "until we have enough n". The

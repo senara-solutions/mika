@@ -18,7 +18,7 @@ You've received a GitHub webhook event for `check_suite.completed` with `conclus
 
 2. **Skip if not-our-scope.** The PR must be:
    - Authored by `mika-platform-dev` (or another autonomous-loop machine user) — not a human PR that already has a designated human reviewer.
-   - In one of your reviewable repos (`senara-solutions/mika`, `mika-cloud`, `mika-skills`, `claude-pilot-py`, `mika-platform`, `wizzard`).
+   - In one of your reviewable repos (`senara-solutions/mika`, `mika-cloud`, `mika-skills`, `claude-pilot`, `mika-platform`, `wizzard`).
    - `draft: false` — draft PRs are not review-eligible.
 
    If any of those fail, stop the turn.
