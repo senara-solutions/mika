@@ -12627,14 +12627,14 @@ assert_eq "X1 contre-vacuité: le plafond SOUS le plancher l'est aussi" "oui" \
 # nombre plausible, présenté avec autorité, faux », la classe que l'ancre de
 # `_PLAN_SIZE_TOTAL_RE` a déjà dû fermer.
 
-assert_eq "V1: plafond 200 ⇒ borne 431, provenance resolved" "431|200|resolved|" \
+assert_eq "V1: plafond 200 ⇒ borne 429, provenance resolved" "429|200|resolved|" \
     "$(_t2693_bound_probe 200)"
-assert_eq "V1: plafond 150 ⇒ borne 243, provenance resolved" "243|150|resolved|" \
+assert_eq "V1: plafond 150 ⇒ borne 279, provenance resolved" "279|150|resolved|" \
     "$(_t2693_bound_probe 150)"
-assert_eq "V1: plafond 120 ⇒ borne 131 (troncature entière assumée)" "131|120|resolved|" \
+assert_eq "V1: plafond 120 ⇒ borne 189 (troncature entière assumée)" "189|120|resolved|" \
     "$(_t2693_bound_probe 120)"
 assert_eq "V1: plafond VIDE (rollback) ⇒ repli 150, provenance disarmed_fallback" \
-    "243|150|disarmed_fallback|" "$(_t2693_bound_probe __EMPTY__)"
+    "279|150|disarmed_fallback|" "$(_t2693_bound_probe __EMPTY__)"
 assert_eq "V1: plafond $T2707_FLOOR (= le plancher) ⇒ borne 0, jamais un négatif" \
     "0|$T2707_FLOOR|resolved|ceiling_below_pipeline_floor" \
     "$(_t2693_bound_probe "$T2707_FLOOR")"
@@ -12644,24 +12644,24 @@ assert_eq "V1: plafond $T2707_UNDER (sous le plancher) ⇒ borne 0, et la note l
 # Le repli n'est PAS 200 : ce 200 appartient au `maxTurns` amont de claude-pilot,
 # un composant qu'on ne possède pas, et un rollback est une posture d'incident.
 assert_not_contains "V1: le repli de budget désarmé ne vaut PAS la borne de 200 tours" \
-    "431" "$(_t2693_bound_probe __EMPTY__)"
+    "429" "$(_t2693_bound_probe __EMPTY__)"
 
 # --- V2 : AC3 — le MÊME plan donne deux bornes selon le label --------------
 #
 # ROUGE AVANT : rien ne dérivait de borne d'un plafond.
 
-assert_eq "V2 (AC3): sans loop-substrate ⇒ plafond 150, borne 243" "243|150|resolved" \
+assert_eq "V2 (AC3): sans loop-substrate ⇒ plafond 150, borne 279" "279|150|resolved" \
     "$(_t2693_chain_probe "p1-important,ready")"
-assert_eq "V2 (AC3): avec loop-substrate ⇒ plafond 200, borne 431" "431|200|resolved" \
+assert_eq "V2 (AC3): avec loop-substrate ⇒ plafond 200, borne 429" "429|200|resolved" \
     "$(_t2693_chain_probe "p1-important,ready,loop-substrate")"
 # Contrôle négatif PORTEUR : l'appariement de `_pilot_label_turn_ceiling` est
-# EXACT. Un glob de sous-chaîne à la manière de `_label_to_type` rendrait 431 —
+# EXACT. Un glob de sous-chaîne à la manière de `_label_to_type` rendrait 429 —
 # c'est-à-dire la borne large sur un ticket qui n'y a pas droit.
-assert_eq "V2: appariement exact — 'not-loop-substrate' ⇒ 243, jamais 431" "243|150|resolved" \
+assert_eq "V2: appariement exact — 'not-loop-substrate' ⇒ 279, jamais 429" "279|150|resolved" \
     "$(_t2693_chain_probe "not-loop-substrate")"
-assert_eq "V2: idem pour un suffixe — 'loop-substrate-v2' ⇒ 243" "243|150|resolved" \
+assert_eq "V2: idem pour un suffixe — 'loop-substrate-v2' ⇒ 279" "279|150|resolved" \
     "$(_t2693_chain_probe "loop-substrate-v2")"
-assert_eq "V2: aucun label ⇒ le défaut de flotte, donc 243" "243|150|resolved" \
+assert_eq "V2: aucun label ⇒ le défaut de flotte, donc 279" "279|150|resolved" \
     "$(_t2693_chain_probe "")"
 
 # --- V3 : co-location et non-impression (patron S11 / mika#2496) -----------
@@ -12713,6 +12713,48 @@ done
 assert_contains "V3: le site dit l'annulation des deux mises à l'échelle" \
     "ÉCRIT \`900\`, JAMAIS \`9\`" "$(sed -n '/^# mika#2693 — LA SECONDE BORNE/,/^_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=/p' "$DISPATCH_LIB")"
 
+# --- X2 : les exemples travaillés en prose sont tenus par le résolveur ------
+#
+# Le bloc de V3 porte DEUX exemples travaillés — `plafond 200 -> 143 × 900 / 300
+# = 429` et son jumeau à 150 — et c'est précisément ce qui le rend recalibrable
+# plutôt qu'un nombre nu. Mais rien ne les reliait au résolveur : un littéral de
+# prose SURVIT au recalibrage en mentant, et il mentirait au seul lecteur qui le
+# consulte — celui qui s'apprête à redéplacer une constante. C'est exactement la
+# classe de défaut qu'X1 ferme pour le plancher, du côté prose cette fois.
+#
+# ROUGE PAR MUTATION, consigné : remettre `= 431` sur la ligne du plafond 200
+# fait tirer la 3e assertion ; supprimer une des deux lignes fait tirer la 1re ;
+# écrire les deux au même nombre fait tirer la 2e.
+#
+# La boucle est un `for` sur une chaîne, PAS un `while read` sur un tube :
+# `assert_eq` incrémente les compteurs globaux `PASS`/`FAIL`, qu'un sous-shell de
+# tube jetterait en silence — la sonde compterait vert sans rien avoir compté.
+
+T2707_WORKED=$(sed -n '/^# mika#2693 — LA SECONDE BORNE/,/^_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=/p' "$DISPATCH_LIB" \
+    | sed -nE 's/^#[[:space:]]+plafond ([0-9]+) ->.*= ([0-9]+)$/\1:\2/p')
+
+# Contre-vacuité, deux fois : le bloc a bien livré DEUX exemples, et leurs deux
+# bornes sont distinctes. Sans la seconde, deux lignes rendant le même nombre
+# passeraient pour un couple de paliers alors qu'elles mesurent un seul bras.
+assert_eq "X2 contre-vacuité: exactement deux exemples travaillés sont extraits" "2" \
+    "$(printf '%s\n' "$T2707_WORKED" | grep -cE '^[0-9]+:[0-9]+$' || true)"
+assert_eq "X2 contre-vacuité: les deux bornes extraites sont distinctes" "2" \
+    "$(printf '%s\n' "$T2707_WORKED" | grep -oE ':[0-9]+$' | sort -u | grep -c . || true)"
+
+for t2707_pair in $T2707_WORKED; do
+    t2707_c="${t2707_pair%%:*}"
+    t2707_b="${t2707_pair##*:}"
+    assert_eq "X2: l'exemple travaillé du plafond $t2707_c égale ce que rend le résolveur" \
+        "$t2707_b" "$(_t2636_field 1 "$(_t2693_bound_probe "$t2707_c")")"
+done
+
+# Fire-Disposition (a) : ARMÉE, table d'exceptions DÉCLARÉE VIDE et assertée
+# telle (doctrine mika#2201). Une exception ici serait un exemple travaillé que
+# le résolveur contredit — c'est-à-dire exactement le mensonge que X2 ferme.
+T2707_PROSE_ALLOWLIST=()
+assert_eq "X2: table d'exceptions des exemples travaillés en prose — zero entries" \
+    "0" "${#T2707_PROSE_ALLOWLIST[@]}"
+
 # --- V5 : la règle injectée, sa récence, sa conditionnalité ----------------
 #
 # ROUGE AVANT : le gabarit ne portait qu'un seuil, et aucun plafond.
@@ -12741,29 +12783,34 @@ T2693_PILOT=$(_t2693_inject "dev-pilot" "200")
 # sondes de résolveur plus haut montrent que le calcul distingue les paliers ;
 # celles-ci montrent que la distinction ARRIVE AU GROOMEUR, ce qui est le seul
 # endroit où elle a un effet.
-assert_contains "V2 (AC3) × V5: à 200 tours la règle porte la borne 431" \
-    "431 lignes estimées" "$T2693_GROOM_200"
+assert_contains "V2 (AC3) × V5: à 200 tours la règle porte la borne 429" \
+    "429 lignes estimées" "$T2693_GROOM_200"
 assert_contains "V2 (AC3) × V5: et son plafond" \
     "plafond de CE ticket est de 200 tours" "$T2693_GROOM_200"
-assert_not_contains "V2 (AC3) × V5: à 200 tours elle ne porte PAS 243" \
-    "243 lignes estimées" "$T2693_GROOM_200"
-assert_contains "V2 (AC3) × V5: à 150 tours la règle porte la borne 243" \
-    "243 lignes estimées" "$T2693_GROOM_150"
+assert_not_contains "V2 (AC3) × V5: à 200 tours elle ne porte PAS 279" \
+    "279 lignes estimées" "$T2693_GROOM_200"
+assert_contains "V2 (AC3) × V5: à 150 tours la règle porte la borne 279" \
+    "279 lignes estimées" "$T2693_GROOM_150"
 assert_contains "V2 (AC3) × V5: et son plafond" \
     "plafond de CE ticket est de 150 tours" "$T2693_GROOM_150"
-assert_not_contains "V2 (AC3) × V5: à 150 tours elle ne porte PAS 431" \
-    "431 lignes estimées" "$T2693_GROOM_150"
+assert_not_contains "V2 (AC3) × V5: à 150 tours elle ne porte PAS 429" \
+    "429 lignes estimées" "$T2693_GROOM_150"
 
 # La DÉRIVATION est écrite, et sous la forme exacte que le format prescrit — pas
-# « / 2,0 » là où le format dit « / 2 ». Vue ROUGE à la sonde : la première
+# « / 3,0 » là où le format dit « / 3 ». Vue ROUGE à la sonde : la première
 # rédaction faisait diverger la forme donnée de la forme demandée, dès la
 # première ligne du § que le groomeur doit écrire.
 assert_contains "V5: la règle écrit la dérivation, pas seulement le nombre" \
-    "(200 − 35 − 50) × 7,5 / 2" "$T2693_GROOM_200"
+    "(200 − 27 − 30) × 9 / 3" "$T2693_GROOM_200"
 assert_contains "V5: idem au palier 150" \
-    "(150 − 35 − 50) × 7,5 / 2" "$T2693_GROOM_150"
-assert_not_contains "V5: un dixième nul ne s'écrit pas (« / 2 », jamais « / 2,0 »)" \
-    "/ 2,0" "$T2693_GROOM_200"
+    "(150 − 27 − 30) × 9 / 3" "$T2693_GROOM_150"
+assert_not_contains "V5: un dixième nul ne s'écrit pas (« / 3 », jamais « / 3,0 »)" \
+    "/ 3,0" "$T2693_GROOM_200"
+# Depuis le recalibrage de mika#2707 le DÉBIT a lui aussi un dixième nul (900 ⇒
+# « 9 »), ce qui n'était pas le cas de 750 ⇒ « 7,5 » : la moitié manquante de la
+# garde ci-dessus devient portante le jour où elle le devient.
+assert_not_contains "V5: idem côté débit (« × 9 », jamais « × 9,0 »)" \
+    "× 9,0" "$T2693_GROOM_200"
 # La borne par PR de mika#2636 est toujours là : les deux cohabitent, la règle
 # n'en a pas remplacé une par l'autre (AC4, moitié comportementale).
 assert_contains "V5 (AC4): la borne par PR de mika#2636 est toujours portée" \
@@ -13119,8 +13166,8 @@ assert_eq "V7-ter: le facteur est un multiple de 10 (rendu décimal exact)" "0" 
 
 # --- V7-quater : le format ne retape plus les quatre paramètres ------------
 #
-# Trouvé par la revue de code : le format prescrivait « (<plafond> − 35 − 50)
-# × 7,5 / 2 », c'est-à-dire un CINQUIÈME site de vérité que rien ne tenait.
+# Trouvé par la revue de code : le format prescrivait « (<plafond> − 27 − 30)
+# × 9 / 3 », c'est-à-dire un CINQUIÈME site de vérité que rien ne tenait.
 # `_PLAN_SIZE_FORMAT_SPEC` est interpolée à deux sites (S13-bis) et le second —
 # le finding synthétique du rattrapage — n'appelle jamais `_plan_size_rule` : là,
 # ces littéraux étaient la seule formule que le groomeur voyait.
@@ -13129,12 +13176,12 @@ for t2693_chev in '<orientation>' '<fin de pipeline>' '<débit>' '<facteur>'; do
         "$t2693_chev" "${_PLAN_SIZE_FORMAT_SPEC:-}"
 done
 assert_not_contains "V7-quater: le format ne retape pas orientation et fin de pipeline" \
-    '− 35 − 50' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+    '− 27 − 30' "${_PLAN_SIZE_FORMAT_SPEC:-}"
 assert_not_contains "V7-quater: le format ne retape pas débit et facteur" \
-    '7,5 / 2' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+    '9 / 3' "${_PLAN_SIZE_FORMAT_SPEC:-}"
 # Et la dérivation EN VALEUR reste bien celle que la règle rend, elle.
 assert_contains "V7-quater: la règle, elle, rend la dérivation en valeur" \
-    '(200 − 35 − 50) × 7,5 / 2' "$T2693_RULE_200"
+    '(200 − 27 − 30) × 9 / 3' "$T2693_RULE_200"
 
 # --- X1 : le plancher est dérivé -------------------------------------------
 #

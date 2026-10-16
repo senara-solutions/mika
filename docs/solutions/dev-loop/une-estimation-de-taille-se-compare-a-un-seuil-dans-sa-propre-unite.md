@@ -183,12 +183,16 @@ borne_estimée    = tours_de_travail × débit / facteur
 
 | paramètre | valeur | provenance |
 |---|---|---|
-| orientation | ~35 tours | premier `Edit` des trois vols : t39, t36, t32 — tout ce qui précède est lecture de plan, de ticket et de code |
-| fin de pipeline | ~50 tours | écart entre le dernier commit de travail et la mort (t171→201, t177→201, t136→151), majoré : les trois sont morts *dedans*, donc l'écart observé est un plancher, pas la durée réelle |
-| débit | ~7,5 lignes réelles/tour | 1 432 / (171−39), 1 160 / (177−36), 994 / (136−32) → 10,8 / 8,2 / 9,6, rabattu à 7,5 car les trois sont morts avant la fin |
-| facteur estimé → réel | 2 (prudent) | 1 432/832 = 1,7 ; 1 160/880 = 1,3 ; 994/443 = 2,2. L'intervalle 1,3–2,2 est pris à 2, pas à sa moyenne |
+| orientation | 27 tours | première mutation du corpus n=7 : t15, t23, t18, t17, t19, t15, t26 — tout ce qui précède est lecture de plan, de ticket et de code. 27 est pris **juste au-dessus** du max observé (26) |
+| fin de pipeline | 30 tours | écart entre la dernière mutation et le dernier tour : 17, 21, 33, 21, **117**, 19, 13. Le 117 est écarté comme aberrant (mika#2724, 197 tours sur un plafond de 200). 30 couvre 5 des 6 restants |
+| débit | 9 lignes réelles/tour | réel hors `docs/` divisé par les tours de travail : 12,1 / 33,2 / 24,8 / 14,5 / 15,4 / 12,8 (et 11,3 pour la reprise ✱). 9 est pris **sous** le min des six hors reprise |
+| facteur estimé → réel | 3 (prudent) | réel/estimé : 2,86 / 2,21 / 2,29 / 2,64 / 2,33 / 2,37 (et 4,05 pour la reprise ✱). 3 est pris **au-dessus** du max des six hors reprise |
 
-Soit **431** lignes estimées à un plafond de 200, et **243** à 150.
+Soit **429** lignes estimées à un plafond de 200, et **279** à 150.
+
+Les valeurs d'origine — 35 / 50 / 7,5 / 2, mesurées le 2026-10-14 sur n=3 vols
+**morts** — vivent dans la note datée en fin de document, avec le relevé qui les
+a remplacées.
 
 Les quatre paramètres vivent nommés à un seul site,
 `skills/bundled/_shared/dispatch-lib.sh`, juste au-dessus de
@@ -200,16 +204,22 @@ commentaire plutôt qu'un nombre nu.
 
 ### Arithmétique entière : les deux mises à l'échelle s'annulent
 
-`bash` n'a pas de flottants. 7,5 lignes/tour et un facteur de 2 se portent donc
-par deux entiers **dont le nom dit l'échelle** : `750` lignes pour `100` tours,
-et le facteur en pourcentage (`200`). Les deux mises à l'échelle s'annulent
+`bash` n'a pas de flottants. 9 lignes/tour et un facteur de 3 se portent donc
+par deux entiers **dont le nom dit l'échelle** : `900` lignes pour `100` tours,
+et le facteur en pourcentage (`300`). Les deux mises à l'échelle s'annulent
 (×1/100 puis ÷1/100), ce qui rend le calcul exact en **une seule** division :
 
 ```
-borne = (plafond − 35 − 50) × 750 / 200
-plafond 200 → 115 × 750 / 200 = 431
-plafond 150 →  65 × 750 / 200 = 243
+borne = (plafond − 27 − 30) × 900 / 300
+plafond 200 → 143 × 900 / 300 = 429
+plafond 150 →  93 × 900 / 300 = 279
 ```
+
+Ces deux exemples travaillés vivent aussi en commentaire dans `dispatch-lib.sh`,
+et là-bas une sonde les tient : **X2** extrait les deux lignes `plafond <c> → … =
+<b>` du bloc et compare chaque `<b>` à ce que rend le résolveur. Un littéral de
+prose survit au recalibrage **en mentant**, et il mentirait au seul lecteur qui
+le consulte — celui qui s'apprête à redéplacer une constante.
 
 **Qui recalibre le débit à 9 lignes/tour écrit `900`, jamais `9`.** L'annulation
 est dite au site précisément pour que le prochain recalibrage ne divise pas la
@@ -223,17 +233,35 @@ mesuré sur une course tronquée. La méthode :
 
 1. Par vol terminé — **mort ou non** —, relever le quadruplet : plafond, total
    estimé du plan, réel hors `docs/` par `git show --numstat`, et les trois tours
-   (premier `Edit`, dernier commit de travail, dernier tour).
-2. Les vols qui ont **fini** sont les seuls à donner une fin de pipeline et un
+   (première mutation, **dernière mutation**, dernier tour).
+2. **Le tour se compte sur `[cache] turn <N>`, jamais sur `[done] N turns`.**
+   C'est `[cache] turn` qui est l'unité du budget — celle que le plafond borne.
+   Le second compteur sur-compte de 7 à 24 % sur ce corpus, et un dénominateur
+   sur-compté gonfle l'orientation et rabote le débit, c'est-à-dire déplace les
+   quatre paramètres dans le sens où l'on croit être prudent.
+3. **L'origine de la queue est la dernière mutation, pas le dernier commit.** En
+   régime allégé (mika#2694) l'ordre est vérifier → commit → push → PR : la
+   vérification tombe *avant* le dernier commit, qui avale donc une part de la
+   queue qu'on prétend mesurer. On prend la dernière `Edit`/`Write` **hors
+   `pr-body.md` et `.pilot-scratch/`** — ces deux-là appartiennent à la queue,
+   pas au travail, et les compter comme travail la ferait disparaître.
+4. Les vols qui ont **fini** sont les seuls à donner une fin de pipeline et un
    débit non tronqués. Un corpus qui ne contient que des morts majore
    l'orientation et minore tout le reste.
-3. Recalculer les quatre paramètres sur le corpus entier, puis la borne. Comme
+5. **Écarter les reprises du débit et du facteur, jamais de l'orientation.** Un
+   vol qui reprend un plan déjà écrit un autre jour (plan daté d'avant le vol)
+   porte des lignes qu'il n'a pas toutes produites : son débit apparent et son
+   facteur estimé→réel sont tous deux faussés vers le haut. Son orientation et
+   sa queue, elles, sont de vraies mesures de CE vol. Marquer ces vols ✱ dans le
+   relevé, et dire quelle colonne les exclut.
+6. Recalculer les quatre paramètres sur le corpus entier, puis la borne. Comme
    au § précédent, **c'est la borne qui bouge**, jamais la mesure.
-4. Changer la constante au site unique. V4 tirera sur les deux prompts
+7. Changer la constante au site unique. V4 tirera sur les deux prompts
    architecte tant qu'ils n'ont pas suivi — c'est exactement son office, un
    `system_prompt.md` étant statique et incapable de lire une constante shell.
+   X2 tirera sur les deux exemples travaillés du commentaire.
 
-Le plancher est explicite dans le résolveur : un plafond ≤ 85 (= 35 + 50) donne
+Le plancher est explicite dans le résolveur : un plafond ≤ 57 (= 27 + 30) donne
 un nombre de tours de travail nul ou négatif, et la borne vaut alors **0**, avec
 la note `ceiling_below_pipeline_floor`. Jamais un négatif — « un nombre
 plausible, présenté avec autorité, faux » est la classe de défaut que l'ancre de
@@ -311,39 +339,69 @@ déjà groomé ne repasse par aucune porte de groom au dispatch suivant. Refuser
 ici gèlerait d'un coup tout `docs/plans/`. Détection permissive, décision
 stricte — la répartition des trois portes de mika#2636, inchangée.
 
-**Note datée, 2026-10-15 — relevé fait, `n = 0`, la constante n'a pas bougé.**
-Le corpus a été relevé le 2026-10-15 avec la sonde ci-dessus : **16** lignes
-`plan_size_estimate` ancrées, dont **zéro** portant `ceiling=` ou
-`per_flight_bound_loc=`. Toutes sont au format pré-mika#2701, à quatre champs.
-Le seuil de recalibrage de `_PLAN_SIZE_FLIGHT_TAIL_TURNS` est cinq vols
-post-#2695 ayant ouvert une PR ; `n = 0 < 5`, donc **aucune des quatre
-constantes n'a été touchée** et le suivi reste mika#2707.
+**Note datée, 2026-10-16 — `n = 7`, les quatre paramètres ont bougé.**
+La chaîne mika#2340 a tourné, et le corpus s'est rempli d'un coup. Relevé avec
+la sonde ancrée du § *L'instrument* : **7** lignes `plan_size_estimate` au
+format à sept champs, soit sept vols post-mika#2695 ayant ouvert une PR — le
+seuil de déclenchement était cinq.
 
-La cause est plus nette que « l'instrument est trop jeune » : **aucun binaire
-déployé ne l'embarque**. Porte 3 est née le 2026-10-15 et la chaîne mika#2340
-— *rebuild → seed → read* — n'a pas tourné depuis, donc les vols du jour
-exécutent un `dispatch-lib.sh` qui ignore les trois champs. **Le corpus ne
-commence à se remplir qu'au premier vol suivant un `make deploy`** : c'est la
-condition que la condition de déclenchement présuppose sans la dire.
+| ticket | PR | estimé | réel hors `docs/` | plafond | 1ʳᵉ mut. | dern. mut. | dern. tour | queue |
+|---|---|---|---|---|---|---|---|---|
+| mika#2700 | #2740 | 390 | 1 117 | 200 | 15 | 107 | 124 | 17 |
+| mika#2680 ✱ | #2705 | 345 | 1 398 | 200 | 23 | 147 | 168 | 21 |
+| mika#2739 | #2743 | 375 | 830 | 200 | 18 | 43 | 76 | 33 |
+| mika#2732 | #2741 | 184 | 422 | 150 | 17 | 34 | 55 | 21 |
+| mika#2724 | #2738 | 335 | 884 | 200 | 19 | 80 | 197 | **117** |
+| mika#2735 | #2744 | 258 | 600 | 200 | 15 | 54 | 73 | 19 |
+| mika#2715 | #2742 | 232 | 550 | 150 | 26 | 69 | 82 | 13 |
 
-La prémisse du ticket, elle, tient. Deux queues reconstruites à la main hors
-instrument — 18 tours (vol de mika#2701) et 10 tours (vol de mika#2697) — sont
-bien sous 50. Mais n=2 *est* le n=3 que la § ci-dessus refuse, et ces deux
-mesures sous-estiment même la queue : en régime allégé l'ordre est
-vérifier → commit → push → PR, donc la vérification tombe *avant* le dernier
-commit de travail que l'étape 1 prend pour origine. Contrôle de plausibilité,
-jamais une distribution.
+✱ reprise : le plan de mika#2680 est daté du 2026-10-14 et le vol du 2026-10-16.
+Les lignes qu'il livre ne sont pas toutes produites par ce vol, donc il est
+écarté du **débit** et du **facteur** — jamais de l'orientation ni de la queue,
+qui sont de vraies mesures de ce vol-là.
 
-Ce qui a bougé à la place : les **cinq** sondes à plafond de plancher du harnais
-dérivent désormais leur plafond de `orientation + fin de pipeline` au lieu de
-retaper `85` et `70`, et un détecteur armé (X1) refuse qu'un littéral y
-revienne. Cinq, et non les quatre recensées : la mutation de X1 en a découvert
-une qu'aucun inventaire ne portait. Le littéral n'était pas qu'un doublon : choisi juste *sous* l'ancien
-plancher, il passe *au-dessus* du nouveau dès que la queue baisse, et la sonde
-mesure alors le bras nominal du résolveur en se croyant sur le plancher — verte,
-pour la mauvaise raison. Le recalibrage du jour J ne touchera donc que les
-constantes, les deux prompts d'architecte et les assertions qui épinglent des
-**valeurs** (V1, V2, V4, V5) — jamais le plancher.
+**La jointure est ce qui fait le recalibrage.** La ligne `plan_size_estimate` ne
+donne que la moitié estimée du quadruplet — plafond, total estimé, borne,
+verdict. Les trois tours se lisent sur le `.log` du vol, et c'est en les
+appariant au `.stderr` par le chemin du plan qu'on obtient un point de mesure.
+
+**Trois paramètres serrent, un desserre.** Orientation 35 → 27 et fin de
+pipeline 50 → 30 **élargissent** la borne (moins de tours volés au travail) ;
+débit 7,5 → 9 l'élargit aussi ; facteur 2 → 3 la **resserre**, et c'est le seul
+des quatre qui va dans ce sens. Net : 431 → 429 à 200 tours, 243 → 279 à 150.
+La borne du palier 200 ne bouge pour ainsi dire pas ; celle du palier 150, qui
+mordait sur des plans de 250 lignes, se desserre de 15 %.
+
+**Le contrôle composite, et il tient 6/7 avant comme après.** La question qui
+compte n'est pas « chaque paramètre est-il juste » mais « la borne prédit-elle
+la survie ». Tours prédits = orientation + estimé × facteur / débit + queue,
+comparés au dernier tour réel : six des sept vols sont prédits au-dessus de ce
+qu'ils ont consommé, avec les anciens paramètres comme avec les nouveaux. Le
+septième est mika#2724 — 197 tours pour 169 prédits — et c'est exactement le vol
+dont la queue de 117 est écartée comme aberrante. Un recalibrage qui ne change
+pas le nombre de vols correctement prédits n'est pas un échec : il réduit la
+marge gaspillée sans acheter de mort.
+
+**La queue de 30 couvre 5 des 6, pas 6 sur 6.** Le max hors aberrant est 33
+(mika#2739). On retient 30 et on le dit, plutôt que de laisser croire à un
+majorant : ce que la borne garantit, c'est le composite ci-dessus, pas chaque
+colonne prise seule. Le jour où deux vols dépassent 30, c'est la queue qu'il
+faut rouvrir en premier.
+
+**Ce que la mesure a corrigé dans la méthode elle-même.** Trois points, tous
+reportés dans la § *Comment recalibrer* ci-dessus : le tour se compte sur
+`[cache] turn`, l'origine de la queue est la dernière mutation et non le dernier
+commit, et les reprises s'écartent du débit et du facteur seulement. Les trois
+vont dans le même sens — la méthode d'avant **sous-estimait** la queue, donc
+surestimait sa propre prudence.
+
+Le geste a tenu en un commit sur cinq sites, comme annoncé : les quatre
+constantes, les deux `system_prompt.md` d'architecte, les assertions de valeur
+du harnais (V1, V2, V5 — et **V7-quater**, un quatrième bloc que l'inventaire du
+ticket omettait), la sonde X2 nouvellement armée, et ce document. Les sondes de
+plancher, elles, n'ont pas été touchées : X1 les avait rendues dérivées la
+veille, et le plancher est passé de 85 à 57 sans qu'une seule assertion bouge —
+c'est exactement ce pour quoi X1 existe.
 
 ## Related
 
@@ -361,6 +419,8 @@ constantes, les deux prompts d'architecte et les assertions qui épinglent des
 - mika#2701 — porte 3, la mesure. Les quatre champs par vol de la ligne
   `plan_size_estimate`, tenus par les sondes W1 à W7 de `test-dispatch-lib.sh` ;
   le § *L'instrument* ci-dessus est son mode d'emploi.
-- mika#2707 — le recalibrage de `_PLAN_SIZE_FLIGHT_TAIL_TURNS` que cette mesure
-  rend possible. Ouvert, non actionnable tant que le corpus post-#2695 n'atteint
-  pas cinq vols ayant ouvert une PR.
+- mika#2707 — le recalibrage que cette mesure a rendu possible. **Fait le
+  2026-10-16 sur n=7** : 35/50/750/200 → 27/30/900/300, bornes 431/243 → 429/279,
+  plancher 85 → 57. La note datée ci-dessus porte le corpus, la méthode corrigée
+  et le contrôle composite ; la sonde X2 de `test-dispatch-lib.sh` tient
+  désormais les deux exemples travaillés du commentaire contre le résolveur.

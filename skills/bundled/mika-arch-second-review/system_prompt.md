@@ -118,12 +118,12 @@ Why turns, measured: on 2026-10-14 three implementation flights were cut at the 
 ```markdown
 Total estimé : 392 lignes
 Plafond de tours : 200 (loop-substrate)
-Borne par vol : 431 lignes estimées — (200 − 35 − 50) × 7,5 / 2
+Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 ```
 
-**Per-flight parameters:** orientation 35 turns · pipeline tail 50 turns · throughput 750 lines per 100 turns · estimate→measured factor 200 %.
+**Per-flight parameters:** orientation 27 turns · pipeline tail 30 turns · throughput 900 lines per 100 turns · estimate→measured factor 300 %.
 
-**Reference bounds:** 431 estimated lines at a 200-turn ceiling · 243 at a 150-turn ceiling.
+**Reference bounds:** 429 estimated lines at a 200-turn ceiling · 279 at a 150-turn ceiling.
 
 (Single site of truth: `_plan_size_per_flight_bound` in `skills/bundled/_shared/dispatch-lib.sh`, whose comment carries the derivation `bound = (ceiling − orientation − tail) × rate / factor`. The provenance of the four parameters and the method to recalibrate them live in `docs/solutions/dev-loop/une-estimation-de-taille-se-compare-a-un-seuil-dans-sa-propre-unite.md`. The literals above are pinned against those shell constants by `test-dispatch-lib.sh` V4 — this prompt is static, so without that test a recalibration would leave these numbers behind and the divergence would be MUTE, exactly as for the per-PR threshold under S14.)
 
