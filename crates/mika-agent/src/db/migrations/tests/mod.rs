@@ -19,6 +19,8 @@
 use super::*;
 use crate::db::tests::db;
 
+mod aucun_vacuum_au_demarrage;
+mod conversion_auto_vacuum;
 mod kg_schema;
 
 /// Rapatrié de `db::operational::tests` (mika#2321 D3) : `migrate_v38_to_v39`
