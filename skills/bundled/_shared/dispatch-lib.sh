@@ -764,23 +764,36 @@ _plan_size_max_loc() {
 # recalibrable, et c'est la raison d'être de ce bloc.
 #
 # ARITHMÉTIQUE ENTIÈRE, PAR MISE À L'ÉCHELLE DES CONSTANTES. `bash` n'a pas de
-# flottants, donc 7,5 lignes/tour et un facteur de 2 se portent par deux entiers
-# DONT LE NOM DIT L'ÉCHELLE : 750 lignes pour 100 tours, et un facteur en
+# flottants, donc 9 lignes/tour et un facteur de 3 se portent par deux entiers
+# DONT LE NOM DIT L'ÉCHELLE : 900 lignes pour 100 tours, et un facteur en
 # pourcentage. LES DEUX MISES À L'ÉCHELLE S'ANNULENT (×1/100 puis ÷1/100), et
 # c'est ce qui rend le calcul exact en UNE SEULE division :
 #
-#   borne = (plafond − 35 − 50) × 750 / 200
+#   borne = (plafond − 27 − 30) × 900 / 300
 #
-#   plafond 200 -> 115 × 750 / 200 = 431
-#   plafond 150 ->  65 × 750 / 200 = 243
+#   plafond 200 -> 143 × 900 / 300 = 429
+#   plafond 150 ->  93 × 900 / 300 = 279
 #
 # QUI RECALIBRE LE DÉBIT À 9 LIGNES/TOUR ÉCRIT `900`, JAMAIS `9` — l'annulation
 # est dite ici précisément pour que le prochain recalibrage ne divise pas la
 # borne par cent en croyant la corriger.
-_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=35
-_PLAN_SIZE_FLIGHT_TAIL_TURNS=50
-_PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS=750
-_PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT=200
+#
+# LES DEUX EXEMPLES TRAVAILLÉS CI-DESSUS SONT TENUS PAR LA SONDE X2 de
+# `test-dispatch-lib.sh` (mika#2707) : écrits en prose, rien ne les reliait au
+# résolveur, et un littéral de prose survit au recalibrage EN MENTANT — c'est la
+# classe de défaut qu'X1 a fermée pour le plancher. Qui change une constante ici
+# déplace les deux lignes du même geste, ou X2 tire.
+#
+# RECALIBRAGE DU 2026-10-16 (mika#2707), sur n = 7 vols post-mika#2695 ayant
+# ouvert une PR : 35 -> 27 (max du corpus), 50 -> 30 (max des 6 hors aberrant),
+# 750 -> 900 (sous le min des 6 hors reprise), 200 -> 300 (au-dessus de leur
+# max). Trois paramètres serraient, un desserrait ; le composite vérifié vaut
+# 6/7 avant comme après. Le relevé, sa méthode et son corpus vivent dans la
+# solution-doc nommée ci-dessus.
+_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=27
+_PLAN_SIZE_FLIGHT_TAIL_TURNS=30
+_PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS=900
+_PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT=300
 
 # `$1` = le plafond de tours DÉJÀ RÉSOLU (vide = budget désarmé).
 #
@@ -811,13 +824,16 @@ _PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT=200
 #      lieu de le taire. Un site qui oublierait l'argument tombe sur le même
 #      repli : l'oubli est fail-safe vers 150, jamais vers 200.
 #
-# PLANCHER : un plafond ≤ orientation + fin_de_pipeline (85) donne un nombre de
-# tours de travail nul ou négatif. La borne est alors 0, JAMAIS un négatif —
-# « un nombre plausible, présenté avec autorité, faux » est le défaut que
-# l'ancre de `_PLAN_SIZE_TOTAL_RE` a déjà dû fermer — et la note porte
+# PLANCHER : un plafond ≤ orientation + fin_de_pipeline (57 = 27 + 30) donne un
+# nombre de tours de travail nul ou négatif. La borne est alors 0, JAMAIS un
+# négatif — « un nombre plausible, présenté avec autorité, faux » est le défaut
+# que l'ancre de `_PLAN_SIZE_TOTAL_RE` a déjà dû fermer — et la note porte
 # `ceiling_below_pipeline_floor`, qui dit au groomeur que le plafond en vigueur
 # ne peut héberger AUCUNE implémentation et qu'il faut le remonter à
-# l'opérateur. Cas atteignable uniquement par un `PILOT_MAX_TURNS=70` délibéré.
+# l'opérateur. Cas atteignable uniquement par un `PILOT_MAX_TURNS=50` délibéré.
+# Ce plancher SUIT les deux constantes : il valait 85 avant le recalibrage du
+# 2026-10-16, et le harnais le dérive (`$T2707_FLOOR`, mika#2707 / X1) plutôt
+# que de le retaper — un littéral de test survit au recalibrage en mentant.
 _plan_size_per_flight_bound() {
     # ASSIGNE : _PLAN_SIZE_PER_FLIGHT_BOUND
     #           _PLAN_SIZE_PER_FLIGHT_CEILING
