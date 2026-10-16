@@ -444,7 +444,9 @@ impl Tool for CompleteTaskTool {
 mod tests {
     use super::*;
     use crate::db::NewTask;
+    use crate::live_pilot::{UNREADABLE_DB_ERROR, UNREADABLE_NO_START_TIME};
     use crate::test_utils::test_helpers::TestHarness;
+    use crate::tools::cancel_task::ALL_CANCEL_PILOT_GUARD_VERDICTS;
 
     async fn add_callback_task(harness: &TestHarness) -> String {
         harness
@@ -688,6 +690,207 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("required"));
+    }
+
+    // ───────────── mika#2739 — le classificateur pur, et ses issues ─────────────
+
+    fn alive() -> LivePilotVerdict {
+        LivePilotVerdict::Alive {
+            child_task_id: "a1b2c3d4-0000-0000-0000-000000000000".to_string(),
+            // `None` est une forme réelle : une ligne callback nommée
+            // directement n'a pas forcément de parent, et la garde n'en lit
+            // rien — ce qui est précisément pourquoi le champ n'a pas à être
+            // fabriqué.
+            parent_task_id: None,
+            pid: 4242,
+        }
+    }
+
+    /// **Les quatre issues du prédicat pur.**
+    ///
+    /// Chaque terme est exercé seul : une conjonction de termes fail-safe ne se
+    /// prouve pas en les neutralisant tous ensemble (leçon mika#2277).
+    #[test]
+    fn mika2739_les_issues_du_predicat() {
+        assert_eq!(
+            classify_complete_on_live_pilot(&alive()),
+            CompletePilotDecision::RefusedLivePilot {
+                owner_task_id: "a1b2c3d4-0000-0000-0000-000000000000".to_string(),
+                pid: 4242,
+            },
+            "pilote vif ⇒ refus : c'est le défaut mesuré"
+        );
+        assert_eq!(
+            classify_complete_on_live_pilot(&LivePilotVerdict::None),
+            CompletePilotDecision::AllowedNoPilot,
+            "aucun pilote ⇒ passe, et le dit (contrôle positif)"
+        );
+        for reason in [UNREADABLE_DB_ERROR, UNREADABLE_NO_START_TIME] {
+            assert_eq!(
+                classify_complete_on_live_pilot(&LivePilotVerdict::Unreadable { reason }),
+                CompletePilotDecision::RefusedUnreadable { reason },
+                "fail-CLOSED sur `{reason}` : l'asymétrie de coût décide, et elle est \
+                 inverse de celle de `live_pilot`"
+            );
+        }
+    }
+
+    /// Les quatre valeurs d'audit sont un **format de fil** : tout ce que la
+    /// garde produit est déclaré, et tout ce qui est déclaré est atteignable.
+    ///
+    /// Le registre est celui de `cancel_task`, **partagé** : c'est le `tool_name`
+    /// qui sépare les deux populations, jamais la valeur.
+    ///
+    /// Les deux directions. Sans la seconde, une valeur pourrait être déclarée,
+    /// groupée par un opérateur, et produite par rien — une colonne de zéros qui
+    /// se lit comme une population saine.
+    #[test]
+    fn mika2739_les_valeurs_daudit_sont_un_format_de_fil() {
+        let produced: Vec<&'static str> = [
+            classify_complete_on_live_pilot(&alive()),
+            classify_complete_on_live_pilot(&LivePilotVerdict::None),
+            classify_complete_on_live_pilot(&LivePilotVerdict::Unreadable {
+                reason: UNREADABLE_DB_ERROR,
+            }),
+            classify_complete_on_live_pilot(&LivePilotVerdict::Unreadable {
+                reason: UNREADABLE_NO_START_TIME,
+            }),
+        ]
+        .iter()
+        .map(|d| d.audit_value())
+        .collect();
+
+        for value in &produced {
+            assert!(
+                ALL_CANCEL_PILOT_GUARD_VERDICTS.contains(value),
+                "{value} est produit mais pas déclaré"
+            );
+        }
+        for declared in ALL_CANCEL_PILOT_GUARD_VERDICTS {
+            assert!(
+                produced.contains(declared),
+                "{declared} est déclaré mais inatteignable depuis cette garde — un \
+                 opérateur grouperait sur une valeur que rien n'écrit sous \
+                 {COMPLETE_TASK_PILOT_GUARD_AUDIT_TOOL}"
+            );
+        }
+        // Le contrôle positif écrit, lui aussi : sans lui, « zéro refus » et
+        // « la garde ne tourne pas » rendent les mêmes octets (mika#2205).
+        assert_eq!(
+            CompletePilotDecision::AllowedNoPilot.audit_value(),
+            AUDIT_ALLOWED_NO_PILOT
+        );
+        assert!(!CompletePilotDecision::AllowedNoPilot.refuses());
+    }
+
+    /// Les motifs du champ `error` sont un format de fil : ils atterrissent dans
+    /// `tool_calls.output`, où un opérateur les groupe.
+    #[test]
+    fn mika2739_les_motifs_derreur_sont_un_format_de_fil() {
+        let live = refusal_body(
+            &classify_complete_on_live_pilot(&alive()),
+            "task-0000-0000",
+            "long_running:run_claude_pilot",
+        );
+        let unreadable = refusal_body(
+            &classify_complete_on_live_pilot(&LivePilotVerdict::Unreadable {
+                reason: UNREADABLE_NO_START_TIME,
+            }),
+            "task-0000-0000",
+            "long_running:run_claude_pilot",
+        );
+
+        for (body, expected) in [
+            (&live, ERROR_COMPLETE_LIVE_PILOT),
+            (&unreadable, ERROR_COMPLETE_PILOT_UNREADABLE),
+        ] {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).expect("le corps du refus est du JSON structuré");
+            assert_eq!(
+                parsed["error"].as_str(),
+                Some(expected),
+                "motif d'erreur du corps : {body}"
+            );
+            assert_eq!(
+                parsed["task_label"].as_str(),
+                Some("long_running:run_claude_pilot"),
+                "AC1 : le refus nomme le libellé de la tâche"
+            );
+            assert!(
+                ALL_COMPLETE_TASK_PILOT_GUARD_ERRORS.contains(&expected),
+                "{expected} est produit mais pas déclaré"
+            );
+        }
+
+        // Le refus pour pilote vif porte le PID et la ligne qui porte le pgid.
+        let parsed: serde_json::Value = serde_json::from_str(&live).unwrap();
+        assert_eq!(parsed["pilot_pid"].as_u64(), Some(4242));
+        assert_eq!(
+            parsed["pilot_row"].as_str(),
+            Some("a1b2c3d4-0000-0000-0000-000000000000")
+        );
+
+        // Le passage ne compose rien.
+        assert!(
+            refusal_body(
+                &CompletePilotDecision::AllowedNoPilot,
+                "task-0000-0000",
+                "whatever"
+            )
+            .is_empty()
+        );
+    }
+
+    /// Le refus nomme sa levée, la **prémisse réfutée**, et **aucun
+    /// contournement**.
+    ///
+    /// `MIKA_DEV_IDENTITY` porte `shell-exec`, donc nommer dans le corps du
+    /// refus la commande ou l'outil qui termine la tâche donnerait au modèle le
+    /// gabarit du contournement — *un refus qui donne le gabarit est une fuite
+    /// avec une étape de plus* (doctrine mika#2520).
+    #[test]
+    fn mika2739_le_refus_ne_nomme_aucun_contournement() {
+        for decision in [
+            classify_complete_on_live_pilot(&alive()),
+            classify_complete_on_live_pilot(&LivePilotVerdict::Unreadable {
+                reason: UNREADABLE_DB_ERROR,
+            }),
+        ] {
+            let body = refusal_body(&decision, "task-0000-0000", "long_running:run_claude_pilot");
+            let lowered = body.to_ascii_lowercase();
+            for forbidden in [
+                "tasks complete",
+                "tasks cancel",
+                "run_shell",
+                "mika tasks",
+                "update_task_status",
+                "promote_deferred_callback",
+                "/tasks/",
+                "kill ",
+                "sigterm",
+            ] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "le corps du refus nomme un contournement (`{forbidden}`) : {body}"
+                );
+            }
+            assert!(
+                lowered.contains("operator"),
+                "le refus doit nommer à qui appartient la levée : {body}"
+            );
+        }
+
+        // Et le refus pour pilote vif nomme la prémisse qui a produit
+        // l'incident : un parent `completed` est l'état normal après un groom.
+        let live = refusal_body(
+            &classify_complete_on_live_pilot(&alive()),
+            "task-0000-0000",
+            "long_running:run_claude_pilot",
+        );
+        assert!(
+            live.contains("mika#1614"),
+            "le refus doit nommer la prémisse réfutée (D6) : {live}"
+        );
     }
 
     #[tokio::test]
