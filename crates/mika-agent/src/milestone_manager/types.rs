@@ -4,7 +4,7 @@
 //! composers over `gh` CLI output. See the module docstring in `mod.rs`
 //! for the full Phase 1 discipline.
 
-use super::pool::{PoolVerdict, ReadyTicket};
+use super::pool::{PoolCandidate, PoolVerdict, ReadyTicket};
 use serde::{Deserialize, Serialize};
 
 /// A GitHub milestone reference, e.g. `senara-solutions/mika#1799`.
@@ -160,6 +160,36 @@ pub struct MilestoneState {
     /// écrits avant ce champ.
     #[serde(default)]
     pub ready_pool: Vec<ReadyTicket>,
+    /// Les candidats au bassin qui **n'appartiennent pas** au milestone cible
+    /// (mika#2699 vol 2) — le « avant le reste » du point 1 suppose qu'il y ait
+    /// un reste.
+    ///
+    /// Lus par une cinquième lecture `gh` dépôt-large, pour la même raison que
+    /// [`Self::ready_pool`] : le bassin se tient à l'échelle du dépôt. Les
+    /// `sub_issues` du milestone cible en sont **retirées** à la composition —
+    /// elles arrivent déjà par [`Self::sub_issues`], et les transporter deux
+    /// fois alourdirait chaque blob du puits hors-ligne sans rien ajouter.
+    /// `assess_pool` déduplique quand même : c'est là que la correction se
+    /// décide, et une fonction pure ne doit pas dépendre de la prudence de son
+    /// appelant.
+    #[serde(default)]
+    pub outside_candidates: Vec<PoolCandidate>,
+    /// La lecture ci-dessus a-t-elle rempli sa page, donc potentiellement
+    /// laissé des candidats dehors ?
+    ///
+    /// `Option`, et non `bool` : `None` dit « la question n'a pas été posée »
+    /// (blob antérieur au champ, ou cycle qui n'a pas lu hors milestone), là où
+    /// `Some(false)` dit « posée, et la page n'était pas pleine ». Le motif est
+    /// celui de mika#2331 — un `false` par défaut affirmerait une mesure qui
+    /// n'a pas eu lieu.
+    ///
+    /// Sur `Some(true)`, [`Self::outside_candidates`] est **vide par
+    /// décision** : le motif de `scripts/pr-origin-report.sh` est de refuser
+    /// plutôt que de mal répondre, et un classement fait sur une page tronquée
+    /// recommanderait le meilleur des cent premiers en le présentant comme le
+    /// meilleur du dépôt. Le rapport le dit au lieu de le taire.
+    #[serde(default)]
+    pub outside_read_truncated: Option<bool>,
 }
 
 /// Severity classification for an assessment. Drives escalation routing.
