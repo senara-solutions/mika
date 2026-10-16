@@ -617,6 +617,94 @@ async fn read_optional_customer_config(
     })
 }
 
+/// Stop-topics in force for a team-child turn: its own, **union** the
+/// conversational parent's (mika#1926, decision A).
+///
+/// A « arrête sur X » is the user's will, not a private state of the agent that
+/// received it: the child's text flows back into the answer the user reads, so a
+/// child blind to X can re-serve it. `parent_agent_id` is a *fact* posed by the
+/// caller ([`TeamAgentParams::parent_agent_id`]); the policy is here.
+///
+/// Four properties, each of which undoes itself if guessed:
+///
+/// - **Same file, different scope.** There is one SQLite file per container, so
+///   the parent read is [`AsyncDatabase::with_agent`] — a clone sharing the inner
+///   `Arc` (no second connection, no second thread) — and never a cross-DB access.
+/// - **Fail-open under its OWN event name.** `stop_topic_parent_load_failed`, not
+///   the `stop_topic_load_failed` of [`load_agent_context`]: two populations under
+///   one name are not subtractable (mika#2205), and the grep that answers « is the
+///   inheritance reaching anybody? » must name the inheritance. A failed parent
+///   read degrades to the child's own rows.
+/// - **The filter is mandatory on the parent read too.** `search_preferences` is a
+///   substring `LIKE` over both `category` and `value`, and `_` is a SQLite
+///   single-char wildcard — the same two leaks
+///   [`prompt::filter_stop_topic_preferences`] exists for.
+/// - **The child wins a collision.** `preferences.category` is `COLLATE NOCASE`
+///   with `PRIMARY KEY (agent_id, category)`, so dedup is
+///   `eq_ignore_ascii_case`: `stop_topic_Web-Config` and `stop_topic_web-config`
+///   are one topic, and the row kept is the child's, which is the more specific
+///   declaration.
+async fn resolve_team_stop_topics(
+    db: &AsyncDatabase,
+    agent_name: &str,
+    parent_agent_id: Option<&str>,
+    own: Vec<crate::db::Preference>,
+) -> Vec<crate::db::Preference> {
+    // A delegation to oneself is already refused upstream (`delegate_task`), but
+    // the team engine can run the conversational agent as a member of its own
+    // team. Re-reading the same scope would double every row before dedup ate it
+    // again, and would say `inherited = N` for an inheritance that happened not
+    // to exist.
+    let parent = parent_agent_id.filter(|id| *id != db.agent_id());
+    let own_count = own.len();
+
+    let mut inherited = match parent {
+        Some(parent_id) => {
+            match db
+                .with_agent(parent_id)
+                .search_preferences(prompt::STOP_TOPIC_PREFIX)
+                .await
+            {
+                Ok(rows) => prompt::filter_stop_topic_preferences(rows),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        parent_agent_id = %parent_id,
+                        "stop_topic_parent_load_failed"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    inherited.retain(|p| {
+        !own.iter()
+            .any(|o| o.category.eq_ignore_ascii_case(&p.category))
+    });
+    let inherited_count = inherited.len();
+
+    let mut effective = own;
+    effective.extend(inherited);
+    effective.sort_by(|a, b| a.category.to_lowercase().cmp(&b.category.to_lowercase()));
+
+    // Emitted on EVERY branch, all-zero included: without this line « the child
+    // inherited nothing » and « nobody declared a parent » return identical bytes
+    // (mika#2205), and the absence of the line means an older binary (mika#2340),
+    // never an absence of inheritance. `parent_agent_id` is **absent** rather
+    // than `""` when no parent was declared — absent is not zero (mika#2331).
+    info!(
+        target: "mika::otel",
+        event = "team_stop_topic_inheritance",
+        agent = %agent_name,
+        parent_agent_id = parent,
+        own = own_count,
+        inherited = inherited_count,
+        effective = effective.len(),
+    );
+    effective
+}
+
 /// Last `tenant_language_resolved` couple this process announced, per agent.
 ///
 /// Deduplication, not gating: an identical repetition is silent, a **change** is
@@ -7135,6 +7223,19 @@ pub struct TeamAgentParams<'a> {
     /// When `Some`, the agent reuses this trace_id instead of generating a fresh one,
     /// enabling correlation of delegate agent events with the parent team run.
     pub trace_id: Option<String>,
+    /// `agent_id` of the **conversational** parent — the agent whose DB carries
+    /// the conversation the user is reading (mika#1926). This is
+    /// `team_db.agent_id()` on the team-engine paths and `ctx.db.agent_id()` on
+    /// the `delegate_task` path, **not** `TeamDefinition.team.orchestrator`:
+    /// that field names a team *member* (e.g. `"planner"`), which has no
+    /// `preferences` rows of the user's own.
+    ///
+    /// Carries a fact, not a policy: the decision of what to do with it lives in
+    /// [`resolve_team_stop_topics`], which reads the parent's `stop_topic_*`
+    /// preferences so a child cannot re-raise a subject the user asked the
+    /// parent to drop. `None` means "no parent declared" — the child then sees
+    /// its own rows only.
+    pub parent_agent_id: Option<&'a str>,
 }
 
 /// Run an agent within a team execution context.
@@ -7235,6 +7336,17 @@ async fn run_team_agent_inner_impl(
     // mika#2247 AC3 — same single read as the two sibling paths.
     let turn_utc = chrono::Utc::now();
     let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
+    // mika#1926 decision A — the child's own stop-topics, union the
+    // conversational parent's. `ctx.stopped_topics` alone was the pre-decision
+    // behaviour; the parent read is what makes « arrête sur X » hold across a
+    // delegation.
+    let stopped_topics = resolve_team_stop_topics(
+        params.db,
+        params.agent_name,
+        params.parent_agent_id,
+        ctx.stopped_topics,
+    )
+    .await;
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -7249,14 +7361,17 @@ async fn run_team_agent_inner_impl(
         telegram_configured: params.message_sender.is_some(),
         home_dir: Some(params.home_dir),
         callback_context: None,
-        stopped_topics: &ctx.stopped_topics,
+        stopped_topics: &stopped_topics,
         runtime_provider: team_runtime_provider,
         runtime_model: team_runtime_model,
         deployment: params.deployment,
         persona_profile: params.tier.persona_profile(),
-        // mika#2247 AC2 — the team child reads its OWN agent's declaration, the
-        // same rule mika#1926 settled for `stopped_topics`: `ctx` here is the
-        // child's context, not the orchestrator's.
+        // mika#2247 AC2 — the team child reads its OWN agent's declaration:
+        // `ctx` here is the child's context, not the parent's. Note this is NOT
+        // the rule mika#1926 settled for `stopped_topics` one field above —
+        // that axis propagates from the parent, this one does not. A stop-signal
+        // is the user's will; the register language is a tenant setting the
+        // child's own row already carries.
         tenant_language: ctx.language,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
@@ -18295,6 +18410,209 @@ fn prod(scope: HistoryScope) -> usize {
         assert_eq!(
             truncate_history_to_token_budget(&mut over, 100).truncated_messages,
             1
+        );
+    }
+
+    // ===========================================================================
+    // mika#1926 — a team child inherits the conversational parent's stop-topics
+    // ===========================================================================
+
+    const CHILD_AGENT: &str = "mika-1926-child";
+    const PARENT_AGENT: &str = "mika-1926-parent";
+
+    /// The system prompt of one real team-child turn, seeded with the child's own
+    /// and the parent's `stop_topic_*` rows.
+    ///
+    /// End-to-end by construction (AC3): it goes through `run_team_agent`, so a
+    /// regression in the field wiring, in the merge, or in the `<stopped-topics>`
+    /// rendering reddens it — none of which a unit test on the merge alone could
+    /// see.
+    ///
+    /// **The two agents share ONE handle, re-scoped with `with_agent`.** There is
+    /// one SQLite file per container, so the parent read is a different
+    /// `agent_id` on the same file. Two `Database::open_in_memory` calls would be
+    /// two distinct files: the parent's rows would be unreachable and the test
+    /// would pass for `parent: None` and fail for everything else, for a reason
+    /// that has nothing to do with the behaviour under test.
+    async fn team_turn_system_prompt(
+        parent: Option<&str>,
+        child_prefs: &[(&str, &str)],
+        parent_prefs: &[(&str, &str)],
+    ) -> String {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = AsyncDatabase::new_with_agent(
+            crate::db::Database::open_in_memory().unwrap(),
+            CHILD_AGENT,
+        );
+        // `preferences.agent_id` is an FK onto `agents(id)` — both ends must exist
+        // before either can carry a row.
+        db.register_agent(CHILD_AGENT, "child", "").await.unwrap();
+        db.register_agent(PARENT_AGENT, "parent", "").await.unwrap();
+        for (category, value) in child_prefs {
+            db.set_preference(category, value).await.unwrap();
+        }
+        let parent_db = db.with_agent(PARENT_AGENT);
+        for (category, value) in parent_prefs {
+            parent_db.set_preference(category, value).await.unwrap();
+        }
+
+        let session_id = "team-mika1926-child";
+        db.create_session_if_not_exists(session_id, CHILD_AGENT, "team", None)
+            .await
+            .unwrap();
+
+        // Three identical responses rather than one: an EndTurn post-condition
+        // guard may force a correction turn, and an exhausted mock sequence
+        // panics. The assertion reads `captured_requests()[0]` either way.
+        let mock = MockLlmProvider::builder()
+            .response(text_response("travail fait"))
+            .response(text_response("travail fait"))
+            .response(text_response("travail fait"))
+            .build();
+        let tools = crate::tools::ToolRegistry::new();
+        let skills = SkillRegistry::empty();
+        let home_dir = tempfile::tempdir().unwrap();
+        let skills_dirty = AtomicBool::new(false);
+        let params = TeamAgentParams {
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            db: &db,
+            llm: &mock,
+            tools: &tools,
+            skills: &skills,
+            home_dir: home_dir.path(),
+            task_message: "rédige la section",
+            team_context: "Tu fais partie d'une équipe.",
+            session_id,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: &skills_dirty,
+            settings: None,
+            mcp_manager: None,
+            agent_name: "child",
+            child_task_id: None,
+            message_sender: None,
+            trace_id: None,
+            parent_agent_id: parent,
+        };
+        run_team_agent(&params).await.expect("team turn");
+        mock.captured_requests()
+            .first()
+            .expect("the turn must have reached the provider")
+            .system
+            .clone()
+            .expect("a team turn always carries a system prompt")
+    }
+
+    /// W1 — the decision itself: a stop the user gave the parent reaches the
+    /// child's prompt.
+    #[tokio::test]
+    async fn mika1926_un_stop_du_parent_atteint_le_prompt_de_lenfant() {
+        let system = team_turn_system_prompt(
+            Some(PARENT_AGENT),
+            &[],
+            &[("stop_topic_vacances", "ne me reparle pas des vacances")],
+        )
+        .await;
+
+        assert!(
+            system.contains("<stopped-topics>"),
+            "no <stopped-topics> block: the parent's row did not reach the child.\n{system}"
+        );
+        assert!(
+            system.contains("vacances"),
+            "the block is there but the parent's topic is not in it.\n{system}"
+        );
+    }
+
+    /// W2 — the negative control, without which W1 proves nothing: the block
+    /// must be ABSENT when no parent is declared. A test that only ever sees the
+    /// positive case cannot tell inheritance from unconditional rendering.
+    #[tokio::test]
+    async fn mika1926_sans_parent_declare_lenfant_nherite_de_rien() {
+        let system = team_turn_system_prompt(
+            None,
+            &[],
+            &[("stop_topic_vacances", "ne me reparle pas des vacances")],
+        )
+        .await;
+
+        assert!(
+            !system.contains("<stopped-topics>"),
+            "the block rendered without a declared parent.\n{system}"
+        );
+        assert!(
+            !system.contains("vacances"),
+            "the parent's topic leaked without a declared parent.\n{system}"
+        );
+    }
+
+    /// W3 + W4 — the merge's three properties in one table: NOCASE dedup, the
+    /// child winning a collision, the case-insensitive order, and the
+    /// parent == child short-circuit.
+    #[tokio::test]
+    async fn mika1926_lunion_dedoublonne_en_nocase_et_lenfant_gagne() {
+        // `preferences.category` is COLLATE NOCASE with PRIMARY KEY
+        // (agent_id, category): `stop_topic_Web-Config` and
+        // `stop_topic_web-config` are ONE topic, declared on both sides with
+        // conflicting values.
+        let system = team_turn_system_prompt(
+            Some(PARENT_AGENT),
+            &[
+                ("stop_topic_Web-Config", "enfant"),
+                ("stop_topic_zebra", "enfant-zebra"),
+            ],
+            &[
+                ("stop_topic_web-config", "parent"),
+                ("stop_topic_alpha", "parent-alpha"),
+            ],
+        )
+        .await;
+
+        let block = system
+            .split_once("<stopped-topics>")
+            .expect("block present")
+            .1
+            .split_once("</stopped-topics>")
+            .expect("block closed")
+            .0;
+        assert_eq!(
+            block.lines().filter(|l| l.contains("stop_topic")).count(),
+            3,
+            "three topics, not four — the collision must collapse.\n{block}"
+        );
+        assert!(
+            block.contains("enfant") && !block.contains("parent\n"),
+            "the child's value must win the collision.\n{block}"
+        );
+        let (alpha, web, zebra) = (
+            block.find("alpha").expect("alpha"),
+            block.find("Web-Config").expect("Web-Config"),
+            block.find("zebra").expect("zebra"),
+        );
+        assert!(
+            alpha < web && web < zebra,
+            "order must be case-insensitive on `category`: alpha < Web-Config < zebra.\n{block}"
+        );
+
+        // W4 — the conversational agent can run as a member of its own team.
+        // Re-reading its own scope would double every row, so the short-circuit
+        // must leave exactly one line per topic.
+        let self_parent = team_turn_system_prompt(
+            Some(CHILD_AGENT),
+            &[("stop_topic_zebra", "enfant-zebra")],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            self_parent.matches("stop_topic_zebra").count(),
+            1,
+            "parent == child must not duplicate the row.\n{self_parent}"
         );
     }
 }
