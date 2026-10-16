@@ -202,6 +202,7 @@ pub mod evaluator;
 pub mod liveness;
 pub mod pool;
 pub mod reader;
+pub mod relief;
 pub mod reporter;
 pub mod sink_dir;
 pub mod spawn;
