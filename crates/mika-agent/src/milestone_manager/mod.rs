@@ -195,6 +195,42 @@
 //! le log de session pilote. Les deux sont du **vol 3**, nommé et chiffré dans
 //! `docs/plans/2026-10-15-001-feat-2698-manager-evalue-chaque-vol-vol-2-plan.md`
 //! § *Découpage du reliquat* ; le ticket reste ouvert jusque-là.
+//!
+//! ## Phase 2 (c) vol 1 — le manager nomme la relève (mika#2700)
+//!
+//! **Ce que le vol 1 ajoute :** [`relief`], qui nomme à chaque cycle les quatre
+//! prochains tickets à grommer derrière le bassin `ready`, dans l'ordre de tri
+//! du bassin, chacun avec son motif. C'est une **lecture de plus, pas une
+//! autorité de plus** : la relève dérive du verdict du bassin
+//! ([`pool::PoolVerdict::refusals`]), n'ajoute aucune lecture `gh`, et a
+//! exactement une destination — [`types::Assessment::relief`], que le
+//! [`Reporter`] rend dans sa section « Relève à grommer (mode ombre — aucun
+//! groom déclenché) ». C'est le *mode ombre* du point 3 du ticket, et il reste
+//! la destination par défaut.
+//!
+//! Trois conséquences qu'un éditeur futur doit connaître :
+//!
+//! - **L'idempotence (AC2) est structurelle, pas filtrée.** Un ticket déjà
+//!   groomé n'est pas un refus du bassin ; un ticket en cours de groom porte un
+//!   siège `dispatch:` qui l'a déjà sorti du compte. [`pool::assess_pool`] les a
+//!   écartés avant que la relève existe, donc dériver la relève de son verdict
+//!   est ce qui rend un second filtre **impossible** — et un second filtre
+//!   serait un second juge du même fait.
+//! - **L'ordre du bassin a un site unique**, [`pool::pool_sort_key`], extrait
+//!   par ce vol. La relève présente ses tickets « dans l'ordre du bassin » : une
+//!   deuxième écriture du triplet `(priorité, provenance, numéro)` ferait se
+//!   contredire deux listes du même rapport sans qu'aucune assertion de
+//!   comportement rougisse (doctrine du lecteur unique, mika#2201).
+//! - **Le vol 1 n'ouvre aucun chemin d'écriture, et n'en désarme aucun.**
+//!   `MIKA_MANAGER_GROOM_WRITE` n'y est **pas déclarée** — un interrupteur dont
+//!   la branche ON ne fait rien est un mensonge de surface, même raison qu'au
+//!   vol 1 de mika#2698. Le geste de groom est le **vol 2** : derrière cet
+//!   interrupteur, OFF par défaut, par la voie moteur existante (le groom passe
+//!   par mika-dev, jamais par un spawn), et il arrivera comme **exception
+//!   nommée** au scan de `no_dispatch_test.rs`, amendée dans le même commit que
+//!   ce paragraphe — jamais comme un assouplissement du scan. Les deux moitiés
+//!   de `mika2700_le_vol_1_nouvre_aucun_chemin_decriture` sont ce qui rougit ce
+//!   jour-là. Suivi sur `senara-solutions/mika#2700`.
 
 pub mod assessor;
 pub mod cadence;
@@ -230,12 +266,13 @@ pub use liveness::{
 };
 pub use pool::{
     Admission, AdmissionRefusal, CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand, PoolCandidate,
-    PoolDepth, PoolVerdict, ReadyTicket, RefusalReason, assess_pool,
+    PoolDepth, PoolVerdict, ReadyTicket, RefusalReason, assess_pool, pool_sort_key,
 };
 pub use reader::{
     GhRunner, OUTSIDE_READ_LIMIT, ProcessGhRunner, Reader, compose_from_gh_outputs,
     compose_outside_candidates, compose_ready_pool,
 };
+pub use relief::{RELIEF_SIZE, ReliefTicket, ReliefVerdict, name_relief};
 pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};
 pub use sink_dir::{
     ENV_OFFLINE_SINK_DIR, SinkDirSource, SinkEntry, SinkListing, list_sink_reports,
@@ -254,3 +291,121 @@ pub use verdict_poster::{
     ENV_EVALUATE_WRITE, MARKER_PREFIX, post_verdicts, render_verdict_comment, verdict_marker,
     write_is_armed,
 };
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    /// Les sources de **production** du module, fichier par fichier,
+    /// commentaires retirés.
+    ///
+    /// Plat, non récursif, et tronqué au premier `#[cfg(test)]` : les trois
+    /// reposent sur la même prémisse, que la Porte 1 tient déjà — aucun
+    /// répertoire `tests/` ne peut exister sous ce module
+    /// (`perimeter::tests::milestone_manager_has_no_nested_tests_directory`),
+    /// donc tout test du module est un `mod tests` en ligne, et la troncature
+    /// suffit à séparer production et tests (prémisse mika#2321).
+    ///
+    /// Les commentaires tombent parce que la prose *parle* de l'interrupteur du
+    /// vol 2 — le paragraphe de docstring juste au-dessus le nomme — et qu'une
+    /// mention n'est pas une déclaration. Même forme que
+    /// `mika2425_identity_context_history_has_a_single_reader` (motif mika#2050
+    /// signal S).
+    fn production_sans_commentaires() -> Vec<(String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/milestone_manager");
+        let mut out: Vec<(String, String)> = Vec::new();
+        for entry in fs::read_dir(dir).expect("le répertoire du module doit être lisible") {
+            let path = entry.expect("entrée de répertoire lisible").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let nom = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let src = fs::read_to_string(&path).expect("source du module lisible");
+            let production = src.split("#[cfg(test)]").next().unwrap_or_default();
+            let code = production
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push((nom, code));
+        }
+        out
+    }
+
+    /// Cas 16 — le vol 1 n'ouvre aucun chemin d'écriture : AC1 sous sa forme la
+    /// plus forte.
+    ///
+    /// L'AC1 demande « avec l'interrupteur OFF, aucun déclenchement de groom ».
+    /// Le vol 1 satisfait la forme **dégénérée** de cette garantie : il n'y a
+    /// pas d'interrupteur, donc pas de branche ON, donc aucun déclenchement
+    /// n'est possible. Deux moitiés le tiennent structurellement.
+    ///
+    /// **Moitié 1 — aucune exception du scan n'est attribuable à ce ticket.**
+    /// `no_dispatch_test.rs` couvre tout le répertoire et reste **intouché** par
+    /// ce vol : `relief.rs` et `reporter.rs` y sont donc soumis comme les
+    /// autres. La lecture est textuelle et non programmatique parce que
+    /// `EXEMPTED_OCCURRENCES` est privée à un module *frère* : la lire
+    /// demanderait de la passer `pub(super)`, c'est-à-dire de toucher le
+    /// fichier dont ce test affirme qu'il n'a pas bougé.
+    ///
+    /// L'assertion n'est pas « l'allowlist est vide » — elle ne l'est pas, et
+    /// n'avait pas à l'être : elle porte depuis mika#2698 vol 2 exactement une
+    /// entrée, épinglée à une par
+    /// `mika2698_lallowlist_ne_porte_que_le_geste_du_vol_2`. L'assertion est
+    /// « aucune exception attribuable à mika#2700 », ce qui est la même
+    /// propriété pour ce vol-ci, et ce qui rougit au vol 2.
+    ///
+    /// **Moitié 2 — l'interrupteur du vol 2 n'est pas déclaré.** Un
+    /// `pub const ENV_*` sans lecteur serait une promesse d'armement non tenue,
+    /// et il déclencherait `mika2267_every_manager_env_const_is_declared_in_env_example`
+    /// sans qu'aucun comportement ne le justifie.
+    #[test]
+    fn mika2700_le_vol_1_nouvre_aucun_chemin_decriture() {
+        let garde = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/milestone_manager/no_dispatch_test.rs"
+        ))
+        .expect("le garde structurel doit être lisible");
+        for jeton in ["relief.rs", "reporter.rs", "mika#2700"] {
+            assert!(
+                !garde.contains(jeton),
+                "aucune exception du scan n'est attribuable à mika#2700, et `{jeton}` en nomme \
+                 une. Si c'est le vol 2 qui arrive, l'exception s'inscrit AVEC son fichier, son \
+                 jeton et sa raison, et ce test change dans le même commit que le paragraphe du \
+                 docstring — jamais l'un sans l'autre."
+            );
+        }
+
+        let sources = production_sans_commentaires();
+        // Contrôle positif du lecteur : un scan qui ne trouve jamais rien et un
+        // module propre rendent les mêmes octets (classe mika#2205).
+        assert!(
+            sources
+                .iter()
+                .any(|(nom, code)| nom == "relief.rs" && code.contains("pub fn name_relief")),
+            "le lecteur doit voir la production de relief.rs — sinon « aucun déclarant » ne \
+             prouve rien. Lus : {:?}",
+            sources.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+
+        // Le besoin est épelé en deux morceaux pour que ce test ne se trouve pas
+        // lui-même si la troncature venait à ne plus l'exclure.
+        let interrupteur = concat!("MIKA_MANAGER_", "GROOM_WRITE");
+        let declarants: Vec<String> = sources
+            .into_iter()
+            .filter(|(_, code)| code.contains(interrupteur))
+            .map(|(nom, _)| nom)
+            .collect();
+        assert!(
+            declarants.is_empty(),
+            "le vol 1 ne déclare pas l'interrupteur du vol 2 — un interrupteur dont la branche \
+             ON ne fait rien est un mensonge de surface. Déclaré dans : {declarants:?}. Si c'est \
+             le vol 2 qui arrive, il arrive avec son `write_is_armed()`, sa table de vérité et \
+             son contrôle négatif, et ce test change dans le même commit."
+        );
+    }
+}
