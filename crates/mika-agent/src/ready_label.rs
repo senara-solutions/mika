@@ -96,6 +96,7 @@ use tracing::{info, warn};
 use mika_common::label_write::LabelWriteToken;
 
 use crate::async_db::AsyncDatabase;
+use crate::gh_process::{GhSubject, run_gh};
 
 /// Le label gouverné par ce module. Écrit **une seule fois** dans la crate, ici.
 pub(crate) const READY_LABEL: &str = "ready";
@@ -375,20 +376,18 @@ impl<'a> GhTimelineFetcher<'a> {
 #[async_trait::async_trait]
 impl TimelinePageFetcher for GhTimelineFetcher<'_> {
     async fn fetch(&self, repo: &str, issue: u64, page: u32) -> Result<String, String> {
-        let mut cmd = tokio::process::Command::new("gh");
-        cmd.args([
-            "api",
-            &format!(
-                "repos/{repo}/issues/{issue}/timeline?per_page={TIMELINE_PER_PAGE}&page={page}"
-            ),
-        ]);
-        cmd.env("GH_TOKEN", self.token);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        let output = cmd.output().await.map_err(|e| e.to_string())?;
+        let output = run_gh(
+            self.token,
+            GhSubject::Issue(issue),
+            &[
+                "api",
+                &format!(
+                    "repos/{repo}/issues/{issue}/timeline?per_page={TIMELINE_PER_PAGE}&page={page}"
+                ),
+            ],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -501,15 +500,9 @@ pub(crate) async fn machine_identities(token: &str) -> &'static MachineIdentitie
 
 /// Le login du compte auquel appartient le token courant.
 async fn gh_current_login(token: &str) -> Result<Option<String>, String> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(["api", "user", "-q", ".login"]);
-    cmd.env("GH_TOKEN", token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await.map_err(|e| e.to_string())?;
+    let output = run_gh(token, GhSubject::Repo, &["api", "user", "-q", ".login"])
+        .await
+        .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
