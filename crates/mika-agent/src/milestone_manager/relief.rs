@@ -190,7 +190,10 @@ mod tests {
             obtenus, attendus,
             "la relève est l'ensemble des refus du bassin, ni plus ni moins"
         );
-        assert_eq!(relief.beyond, 0, "trois refus tiennent dans les quatre noms");
+        assert_eq!(
+            relief.beyond, 0,
+            "trois refus tiennent dans les quatre noms"
+        );
     }
 
     /// Cas 2 — la relève suit l'ordre de tri du bassin : priorité, puis
