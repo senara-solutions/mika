@@ -301,6 +301,20 @@ pub struct Assessment {
     /// `[]` plutôt qu'en `null`.
     #[serde(default)]
     pub flight_verdicts: Vec<super::evaluator::FlightVerdict>,
+    /// La relève nommée de ce cycle — les prochains tickets à grommer derrière
+    /// le bassin (mika#2700 Phase 2 (c) vol 1).
+    ///
+    /// `Option` pour la même raison que `pool`, dont elle dérive : `None` dit
+    /// « la relève n'a pas été nommée » — blob écrit par un binaire antérieur
+    /// au champ. Une [`super::relief::ReliefVerdict`] par défaut dirait « rien
+    /// à grommer d'avance », ce qui est une *mesure* et non son absence (motif
+    /// mika#2331 : un null n'est jamais un 0).
+    ///
+    /// **Vol 1 : mode ombre.** Ce champ est la seule destination de la relève ;
+    /// elle entre dans le rapport et nulle part ailleurs. Aucun interrupteur,
+    /// aucun geste, aucun chemin d'écriture ne part de lui.
+    #[serde(default)]
+    pub relief: Option<super::relief::ReliefVerdict>,
 }
 
 /// Outcome of a single `run_manager_cycle` invocation.
@@ -385,6 +399,7 @@ mod tests {
             contention_events: vec![],
             pool: None,
             flight_verdicts: vec![],
+            relief: None,
         };
         let out = serde_json::to_string(&a).unwrap();
         assert!(
@@ -430,6 +445,7 @@ mod tests {
             contention_events: vec![],
             pool: None,
             flight_verdicts: vec![],
+            relief: None,
         };
         let out = serde_json::to_string(&a).unwrap();
         assert!(
@@ -474,6 +490,7 @@ mod tests {
             contention_events: vec![],
             flight_verdicts: vec![],
             pool: None,
+            relief: None,
         };
         let out = serde_json::to_string(&a).unwrap();
         assert!(
@@ -508,6 +525,59 @@ mod tests {
         assert!(
             out.contains(r#""turn_ceiling":null"#),
             "le plafond non instrumenté doit rester visible comme null — obtenu : {out}"
+        );
+    }
+
+    // -- mika#2700 Phase 2 (c) vol 1 : format fil de la relève --
+
+    /// Cas 10 — un blob de rapport écrit avant que `relief` existe se relit, et
+    /// le champ vaut `None`.
+    ///
+    /// Le puits hors-ligne tient de tels fichiers. Et l'aller-retour vérifie
+    /// l'autre moitié du contrat : `None` sort en `null`, jamais en objet vide
+    /// — « la relève n'a pas été nommée » et « il n'y a personne à grommer »
+    /// sont deux faits différents, et un `{}` les confondrait (motif
+    /// mika#2331 : un null n'est jamais un 0).
+    #[test]
+    fn mika2700_un_blob_sans_releve_se_relit_en_none() {
+        let a: Assessment = serde_json::from_str(&assessment_json_without_contention())
+            .expect("un JSON antérieur au champ doit encore se parser");
+        assert_eq!(
+            a.relief, None,
+            "champ absent ⇒ None, et surtout pas une relève vide par défaut"
+        );
+
+        let out = serde_json::to_string(&a).unwrap();
+        assert!(
+            out.contains(r#""relief":null"#),
+            "une relève non nommée se dit null — obtenu : {out}"
+        );
+        assert!(
+            !out.contains(r#""relief":{}"#),
+            "jamais un objet vide — obtenu : {out}"
+        );
+
+        // Et une relève **nommée** fait l'aller-retour sans perdre son rang
+        // absent ni son compte des restants.
+        let mut nommee = a.clone();
+        nommee.relief = Some(super::super::relief::ReliefVerdict {
+            next: vec![super::super::relief::ReliefTicket {
+                number: 2731,
+                origin: super::super::pool::CandidateOrigin::Outside,
+                priority_rank: None,
+                motive: super::super::pool::RefusalReason::NoGroomedPlan,
+            }],
+            beyond: 7,
+        });
+        let out = serde_json::to_string(&nommee).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Assessment>(&out).unwrap(),
+            nommee,
+            "aller-retour fidèle : le puits doit rester relisible par lui-même"
+        );
+        assert!(
+            out.contains(r#""priority_rank":null"#),
+            "un rang inconnu reste visible comme null — obtenu : {out}"
         );
     }
 

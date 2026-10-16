@@ -1621,6 +1621,7 @@ mod tests {
                 contention_events: vec![],
                 pool: None,
                 flight_verdicts: vec![],
+                relief: None,
             },
             generated_at: String::new(),
             cycle_kind: CycleKind::Event,

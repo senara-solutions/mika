@@ -735,6 +735,7 @@ mod tests {
             contention_events: vec![],
             pool: None,
             flight_verdicts: vec![],
+            relief: None,
         }
     }
 
