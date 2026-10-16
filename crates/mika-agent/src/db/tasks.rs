@@ -1981,33 +1981,57 @@ impl Database {
         Ok(row)
     }
 
-    /// Find implement-class parent self_dev tasks left `in_progress` whose
-    /// callback subtask delivered without producing a PR (#871).
+    /// Find parent self_dev tasks of the given `dispatch_class` left
+    /// `in_progress` whose callback subtask delivered without producing a PR
+    /// (#871, parameterised by class in mika#2750).
     ///
     /// A parent is "orphaned" when:
     /// - `status = 'in_progress'`, `source = 'self_dev'`, `trigger_type = 'manual'`
     /// - Its latest callback subtask is `status = 'delivered'`
-    /// - **The callback's** `dispatch_class = 'implement'` (or NULL — pre-v34 via COALESCE).
-    ///   The class is keyed off the child (per-dispatch) rather than the parent
-    ///   because reused parents (mika#920 pattern) carry stale class data from
-    ///   their original dispatch.
+    /// - **The callback's** `dispatch_class` equals `dispatch_class` (NULL reads
+    ///   as `'implement'` — pre-v34 via COALESCE). The class is keyed off the
+    ///   child (per-dispatch) rather than the parent because reused parents
+    ///   (mika#920 pattern) carry stale class data from their original dispatch.
     /// - The callback's `updated_at` is older than `grace_seconds` ago
     /// - Parent metadata does NOT contain `$.claude_pilot.pr_url`
     /// - No other active callback child exists (defers to #870's retry loop)
     ///
-    /// Groom-class callbacks (mika#1001) are NOT reaped here — their expected
-    /// artifact is a plan commit pushed to the branch, not a PR url. Groom-class
-    /// leak detection is a separate follow-up (mika#1118 Option B).
+    /// Three properties the SQL does not state (mika#2750 § 3 D1):
+    ///
+    /// - **The `COALESCE(..., 'implement')` is a property, not a residue.** A
+    ///   pre-v34 row carries a NULL `dispatch_class` and reads as `implement`,
+    ///   so a call with `'groom'` can **never** pick it up. Schema
+    ///   back-compatibility is preserved on the only side where it means
+    ///   something.
+    /// - **The `$.claude_pilot.pr_url IS NULL` predicate holds for both
+    ///   classes.** For `groom` it is not the artifact criterion (a groom's
+    ///   artifact is a plan commit, not a PR) — it is a belt. A reused parent
+    ///   (mika#920) already carrying a `pr_url` saw an `implement` dispatch
+    ///   succeed; the reaper has no business there.
+    /// - **No groom-specific artifact criterion is needed.** A successful groom
+    ///   re-dispatches the issue on the **same** parent (`create_task` is
+    ///   idempotent on `reference_url`), which creates a `pending` /
+    ///   `in_progress` sibling — and the `NOT EXISTS (active sibling)` clause
+    ///   already excludes it. Conversely, a groom that returns `GROOMED` with
+    ///   nobody picking the work back up is itself a leak: reaping it is
+    ///   correct, not accidental. "Callback delivered, no active sibling, grace
+    ///   elapsed" **is** the criterion, and it need not know the artifact's
+    ///   shape.
     ///
     /// **Coupled pair:** `find_completable_parent_tasks_on_pr_url` is the
     /// success-side sibling (mika#1162). Any filter change here (agent_id,
-    /// status, source, trigger_type, dispatch_class, sibling guard, grace
-    /// window) MUST be applied symmetrically there. The two queries differ
-    /// only on the `pr_url` predicate (`IS NULL` here vs `IS NOT NULL` there).
+    /// status, source, trigger_type, sibling guard, grace window) MUST be
+    /// applied symmetrically there. The two queries differ only on the
+    /// `pr_url` predicate (`IS NULL` here vs `IS NOT NULL` there) — and on the
+    /// class, which is **parameterised here, deliberately not there**: a groom
+    /// never produces a `pr_url`, so parameterising the success side would
+    /// create a `('groom')` call that can only ever return the empty set. See
+    /// mika#2750 § 3 D1.
     pub fn find_orphaned_parent_tasks(
         &self,
         agent_id: &str,
         grace_seconds: i64,
+        dispatch_class: &str,
     ) -> Result<Vec<OrphanedParentTask>> {
         let grace_modifier = format!("-{grace_seconds} seconds");
         let mut stmt = self.conn.prepare(
@@ -2019,7 +2043,7 @@ impl Database {
                AND parent.status = 'in_progress'
                AND parent.source = 'self_dev'
                AND parent.trigger_type = 'manual'
-               AND COALESCE(child.dispatch_class, 'implement') = 'implement'
+               AND COALESCE(child.dispatch_class, 'implement') = ?3
                AND child.trigger_type = 'callback'
                AND child.action_type = 'resume_agent'
                AND child.status = 'delivered'
@@ -2036,7 +2060,7 @@ impl Database {
              ORDER BY parent.id",
         )?;
         let rows = stmt
-            .query_map(params![agent_id, grace_modifier], |row| {
+            .query_map(params![agent_id, grace_modifier, dispatch_class], |row| {
                 Ok(OrphanedParentTask {
                     id: row.get(0)?,
                     agent_id: row.get(1)?,

@@ -411,7 +411,9 @@ fn test_find_orphaned_parent_tasks_failure_path() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].id, parent_id);
     assert_eq!(orphans[0].callback_task_id, child_id);
@@ -439,7 +441,9 @@ fn test_find_orphaned_parent_tasks_happy_path_pr_url_present() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert!(
         orphans.is_empty(),
         "parent with pr_url should not be reaped"
@@ -452,7 +456,9 @@ fn test_find_orphaned_parent_tasks_grace_period_not_elapsed() {
     let (_parent_id, _child_id) = create_orphaned_parent_setup(&db);
 
     // Child was just delivered (updated_at = now), well within 600s grace
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert!(
         orphans.is_empty(),
         "parent within grace period should not be reaped"
@@ -483,7 +489,9 @@ fn test_find_orphaned_parent_tasks_active_sibling_defers() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert!(
         orphans.is_empty(),
         "parent with active sibling callback should not be reaped"
@@ -526,17 +534,26 @@ fn test_find_orphaned_parent_tasks_excludes_other_agents() {
         .unwrap();
 
     // agent_b should see nothing
-    let orphans = db.find_orphaned_parent_tasks("agent_b", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("agent_b", 600, "implement")
+        .unwrap();
     assert!(orphans.is_empty());
 
     // agent_a should see the orphan
-    let orphans = db.find_orphaned_parent_tasks("agent_a", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("agent_a", 600, "implement")
+        .unwrap();
     assert_eq!(orphans.len(), 1);
 }
 
-/// mika#1118 v2 — groom-class CALLBACKS must NOT trigger reaping of their
-/// parent. The class is keyed off the child (per-dispatch) because reused
-/// parents (mika#920) carry stale class data.
+/// mika#1118 v2 — groom-class CALLBACKS must NOT be returned by the
+/// **implement** sweep. The class is keyed off the child (per-dispatch) because
+/// reused parents (mika#920) carry stale class data.
+///
+/// Since mika#2750 the class is a parameter, so "not reaped" here means "not
+/// reaped by this call" — the same row IS returned by the `'groom'` sweep. What
+/// this test pins is the disjointness of the two populations, which is what
+/// makes calling both in one tick safe.
 #[test]
 fn test_find_orphaned_parent_tasks_groom_class_not_reaped() {
     let db = db();
@@ -558,7 +575,9 @@ fn test_find_orphaned_parent_tasks_groom_class_not_reaped() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert!(
         orphans.is_empty(),
         "parent with groom-class callback should not be reaped — grooming produces plan commits, not PRs"
@@ -589,7 +608,9 @@ fn test_find_orphaned_parent_tasks_implement_class_still_reaped() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].id, parent_id);
     assert_eq!(orphans[0].callback_task_id, child_id);
@@ -626,7 +647,9 @@ fn test_find_orphaned_parent_tasks_null_dispatch_class_treated_as_implement() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert_eq!(
         orphans.len(),
         1,
@@ -661,7 +684,9 @@ fn test_find_orphaned_parent_tasks_stale_parent_class_doesnt_drive_reaping() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert!(
         orphans.is_empty(),
         "stale parent class must not override the fresh child class — v1 regression"
@@ -702,7 +727,9 @@ fn test_find_orphaned_parent_tasks_mixed_children_groom_and_null() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert_eq!(
         orphans.len(),
         1,
@@ -711,8 +738,11 @@ fn test_find_orphaned_parent_tasks_mixed_children_groom_and_null() {
     assert_eq!(orphans[0].id, parent_id);
 }
 
-/// mika#1126 — parent with ONLY groom-class children should NOT be reaped.
-/// Both children have dispatch_class='groom'; no implement-class child exists.
+/// mika#1126 — parent with ONLY groom-class children is not returned by the
+/// **implement** sweep. Both children have dispatch_class='groom'; no
+/// implement-class child exists. Since mika#2750 that parent is the `'groom'`
+/// sweep's population — see the note on
+/// `test_find_orphaned_parent_tasks_groom_class_not_reaped`.
 #[test]
 fn test_find_orphaned_parent_tasks_only_groom_children_not_reaped() {
     let db = db();
@@ -749,7 +779,9 @@ fn test_find_orphaned_parent_tasks_only_groom_children_not_reaped() {
         )
         .unwrap();
 
-    let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+    let orphans = db
+        .find_orphaned_parent_tasks("mika", 600, "implement")
+        .unwrap();
     assert!(
         orphans.is_empty(),
         "parent with only groom-class children should not be reaped"

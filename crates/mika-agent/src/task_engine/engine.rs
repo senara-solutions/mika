@@ -4281,7 +4281,7 @@ impl TaskEngine {
     async fn reap_orphaned_parent_tasks(&self) {
         let candidates = match self
             .db
-            .find_orphaned_parent_tasks(REAPER_GRACE_SECONDS)
+            .find_orphaned_parent_tasks(REAPER_GRACE_SECONDS, "implement")
             .await
         {
             Ok(c) => c,
