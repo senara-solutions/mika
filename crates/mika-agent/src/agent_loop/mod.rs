@@ -5500,6 +5500,7 @@ async fn run_agent_inner(
         provider,
         model,
         &resolved_context,
+        db.agent_id(),
         &effective_disabled,
         is_compact_provider,
     );
@@ -6796,6 +6797,7 @@ async fn run_silent_inner(
         provider,
         model,
         &no_context,
+        db.agent_id(),
         &ctx.identity.tools.disabled,
         false, // Silent mode: never compact (engine-driven triggers, not MikaModel targets)
     );
@@ -7603,6 +7605,7 @@ async fn run_team_agent_inner_impl(
         provider,
         model,
         &resolved_context,
+        params.db.agent_id(),
         &ctx.identity.tools.disabled,
         false, // Team mode: never compact (engine-driven, not MikaModel targets)
     );
@@ -8686,9 +8689,38 @@ fn has_successful_pr_review(summaries: &[ToolCallSummary]) -> bool {
 /// Future migration (when well-known agents move from denylist to allowlist
 /// for tools): extend this hook to handle both shapes — same call site,
 /// different predicate, no caller changes.
+///
+/// # Reading the event it emits (mika#2593)
+///
+/// `applied identity tool-visibility filter` carries both halves of the
+/// subtraction — `hidden_count` and `kept_count` — plus `kept_bytes`, the
+/// weight of what remains, and `agent`. Each of the three later fields answers
+/// a question the earlier shape could not:
+///
+/// - **`kept_count`** — `hidden_count` alone says how much was removed, never
+///   how much is left. A denylist that grows while the registry grows faster
+///   reads as progress on `hidden_count` and as a regression on the served
+///   array; only the pair separates them.
+/// - **`kept_bytes`** — the count is not the cost. Tool definitions differ by
+///   an order of magnitude in schema size, so nine names removed may be 1 KB or
+///   6 KB. Computed by [`tool_defs_byte_weight`], the *same* function
+///   `context_window_assembled.tool_defs_bytes` goes through, so the two
+///   numbers are comparable by construction rather than by coincidence —
+///   `kept_bytes` is that turn's `tool_defs_bytes` minus the skill tools added
+///   after this filter.
+/// - **`agent`** — `effective_disabled_tools` widens the list per *turn kind*
+///   (mika#2517 adds `create_task` on Webhook Fallthrough turns), so the same
+///   agent emits two different populations, and several agents emit on the same
+///   log. Without the field, a `jq` over this event averages across agents that
+///   share no denylist (mika#2205).
+///
+/// The emission stays inside `if removed > 0`: an agent with no denylist is not
+/// a filtered agent reading zero, and an event on every turn of every agent
+/// would drown the ones that mean something.
 pub(crate) fn apply_agent_tool_visibility(
     tool_defs: &mut Vec<mika_common::claude::ToolDefinition>,
     disabled: &[String],
+    agent: &str,
 ) {
     if disabled.is_empty() {
         return;
@@ -8709,11 +8741,31 @@ pub(crate) fn apply_agent_tool_visibility(
     let removed = removed_count - tool_defs.len();
     if removed > 0 {
         tracing::info!(
+            agent = %agent,
             hidden_count = removed,
             disabled_size = disabled.len(),
+            kept_count = tool_defs.len(),
+            kept_bytes = tool_defs_byte_weight(tool_defs),
             "applied identity tool-visibility filter"
         );
     }
+}
+
+/// The byte weight of a tool array, as the model is billed for it.
+///
+/// Single expression behind both readers — `tool_defs_bytes` on
+/// `context_window_assembled` (mika#2295) and `kept_bytes` on
+/// `applied identity tool-visibility filter` (mika#2593). They are read against
+/// each other by the operator weighing a cut, so "the same expression" must be
+/// a property of the code rather than a thing two call sites happen to agree
+/// on today.
+///
+/// A serialization failure reports `0` rather than refusing: these are
+/// observability fields, and no measurement is worth a turn.
+pub(crate) fn tool_defs_byte_weight(tool_defs: &[mika_common::claude::ToolDefinition]) -> usize {
+    serde_json::to_string(tool_defs)
+        .map(|s| s.len())
+        .unwrap_or(0)
 }
 
 /// The tools a **Webhook Fallthrough** turn must not be handed (mika#2517 U2).
@@ -8982,6 +9034,7 @@ fn inject_skills_and_resolve_tools(
     provider_name: &str,
     model_name: &str,
     resolved_context: &HashMap<String, context::ContextBlock>,
+    agent: &str,
     disabled_tools: &[String],
     is_compact_provider: bool,
 ) -> (
@@ -8993,7 +9046,7 @@ fn inject_skills_and_resolve_tools(
     let mut tool_defs = tools.definitions().to_vec();
     // Apply per-agent visibility filter BEFORE skill tools are added — this
     // is the named hook that future allowlist migration will reuse.
-    apply_agent_tool_visibility(&mut tool_defs, disabled_tools);
+    apply_agent_tool_visibility(&mut tool_defs, disabled_tools, agent);
 
     // Compact provider gate (mika#1491): filter tools to core-only allowlist
     // and skip all skill prompts + skill tools.
@@ -9227,9 +9280,7 @@ fn build_context_window_fields(
         message_count: history.len(),
         history_bytes: history_slice.iter().map(|m| m.content.len()).sum(),
         user_message_bytes,
-        tool_defs_bytes: serde_json::to_string(tool_defs)
-            .map(|s| s.len())
-            .unwrap_or(0),
+        tool_defs_bytes: tool_defs_byte_weight(tool_defs),
         distinct_sessions,
         history_scope: history_scope_label(scope),
         oldest_age_secs,
@@ -12543,6 +12594,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            "mika-test",
             &no_disabled,
             false,
         );
@@ -12601,6 +12653,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            "mika-test",
             &no_disabled,
             false,
         );
@@ -12633,7 +12686,7 @@ mod tests {
             "pr_merge_with_gate".to_string(),
             "update_core_memory".to_string(),
         ];
-        apply_agent_tool_visibility(&mut defs, &disabled);
+        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "search_memory");
     }
@@ -12646,7 +12699,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         }];
         let disabled: Vec<String> = vec![];
-        apply_agent_tool_visibility(&mut defs, &disabled);
+        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
         assert_eq!(
             defs.len(),
             1,
@@ -12662,8 +12715,65 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         }];
         let disabled = vec!["pr_merge_with_gate".to_string()];
-        apply_agent_tool_visibility(&mut defs, &disabled);
+        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
         assert!(defs.is_empty(), "filter must match case-insensitively");
+    }
+
+    /// mika#2593 — the two fields the filter reports about what it *kept*
+    /// describe the array **after** the filter, not before it.
+    ///
+    /// `hidden_count` alone cannot answer "how big is the array the model is
+    /// actually billed for?", which is the question a cut on `tool_defs_bytes`
+    /// is judged by. The drift this pins is the one that costs nothing to make
+    /// and everything to notice: computing either field before `retain`, where
+    /// both still look like plausible numbers and every behavioural assertion
+    /// in this file stays green. `kept_bytes` is therefore asserted by
+    /// **equality** with the post-filter serialization — not against a
+    /// threshold — and separately asserted to differ from the pre-filter
+    /// weight, which is what an equality alone could not distinguish.
+    #[test]
+    fn mika2593_le_filtre_atteste_le_compte_et_les_octets_restants() {
+        let mut defs = vec![
+            ToolDefinition {
+                name: "search_memory".to_string(),
+                description: "searches memory".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "list_tasks".to_string(),
+                description: "lists tasks — denied below".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "send_message".to_string(),
+                description: "sends a message".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let weight_before = tool_defs_byte_weight(&defs);
+
+        let disabled = vec!["list_tasks".to_string()];
+        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
+
+        // `kept_count` — the field reports `tool_defs.len()` after `retain`.
+        assert_eq!(
+            defs.len(),
+            2,
+            "three defs minus one denied leaves two; kept_count reports this length"
+        );
+
+        let weight_after = tool_defs_byte_weight(&defs);
+        assert_eq!(
+            weight_after,
+            serde_json::to_string(&defs).unwrap().len(),
+            "kept_bytes must be the serialized length of the array that survived the filter"
+        );
+        assert!(
+            weight_after < weight_before,
+            "kept_bytes ({weight_after}) must describe the filtered array, not the one the \
+             filter received ({weight_before}) — a field computed before `retain` would read \
+             equal here and would silently report the unfiltered cost as the served one"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -12864,6 +12974,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            "mika-test",
             &[],
             false,
         );
@@ -12892,6 +13003,7 @@ mod tests {
             "groq",
             "llama-3.3-70b-versatile",
             &no_ctx,
+            "mika-test",
             &[],
             false,
         );
@@ -12915,6 +13027,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            "mika-test",
             &[],
             false,
         );
@@ -12944,6 +13057,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            "mika-test",
             &[],
             false,
         );
@@ -12980,6 +13094,7 @@ mod tests {
             "anthropic",
             "claude-opus-4",
             &no_ctx,
+            "mika-test",
             &[],
             false,
         );
@@ -13008,6 +13123,7 @@ mod tests {
             "groq",
             "llama-3.3-70b-versatile",
             &no_ctx,
+            "mika-test",
             &[],
             false,
         );
@@ -13036,6 +13152,7 @@ mod tests {
             "openrouter",
             "anthropic/claude-sonnet-4",
             &no_ctx,
+            "mika-test",
             &[],
             false,
         );
@@ -16423,7 +16540,7 @@ mod tests {
             &[],
             "[GitHub] Issue labeled bug on senara-solutions/mika#999",
         );
-        apply_agent_tool_visibility(&mut defs, &disabled);
+        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
 
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(
@@ -16787,6 +16904,7 @@ mod tests {
             "mikamodel",
             "mika",
             &no_ctx,
+            "mika-test",
             &no_disabled,
             true, // compact provider
         );
@@ -16845,6 +16963,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            "mika-test",
             &no_disabled,
             false, // non-compact
         );
