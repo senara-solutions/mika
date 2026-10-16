@@ -108,11 +108,12 @@ jobs:
       - name: Handler crash-step naming + trap placement (mika#2532)
         run: make test-handler-crash-step
 
-      - name: Pilot sandbox secret-channel guards (mika#2039, mika#2716)
+      - name: Pilot sandbox secret-channel guards (mika#2039, mika#2716, mika#2724)
         run: |
           make test-sandbox-secret-argv
           make verify-no-secret-in-setenv
           make test-egress-sentinel-staging
+          make test-egress-sentinel-enforcement
 
       # mika#2578 again, same lesson as the step below: `make test-sandbox-gh-usable`
       # was local-only, so the guard that pins the VALUE `--setenv GH_TOKEN`
