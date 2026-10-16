@@ -14079,6 +14079,201 @@ T2545_RC=0
 bash -n "$DISPATCH_LIB" 2>/dev/null || T2545_RC=$?
 assert_eq "dispatch-lib.sh passe bash -n" "0" "$T2545_RC"
 
+# --- mika#2029 : un démon qui porte du code d'egress ne survit plus à son code
+
+echo ""
+echo "Test mika#2029: fraîcheur du démon helper — le code installé bat la vivacité"
+echo "------------------------------------------------------------"
+
+# `_daemon_freshness_probe <état> [lib]` — monte un VRAI porteur de port sur un
+# port éphémère, met l'état en place, rappelle `_ensure_pilot_helper`, et rend
+# ce que la garde en a fait :
+#
+#   rc=<n> token=<fresh|stale|stale_deferred|undecidable|none> launches=<n>
+#   first=<alive|dead> listening=<yes|no>
+#
+# `token=none` est l'état NOMINAL silencieux : `fresh` n'écrit rien (D5).
+#
+# Le second paramètre est le CROCHET DE CONTRE-VACUITÉ (V5) : pointé sur une
+# copie de `main`, l'état `stale` y rend `token=none launches=1 first=alive` —
+# le chemin « already alive » y retourne 0 en silence, sans jamais regarder
+# quelle version écoute. C'est la mesure qui dit que ce bloc n'est pas vide.
+_daemon_freshness_probe() {
+    local state="$1" lib="${2:-$DISPATCH_LIB}"
+    local tmp port bin addon ghaddon ca err rc token launches first listening p i
+
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/bin" "$tmp/pilotlogs" "$tmp/helperlog"
+    : > "$tmp/launches"
+
+    # Port éphémère, JAMAIS 8892 (R4) : la suite tourne sur l'hôte de
+    # l'opérateur et ne doit toucher aucun démon réel. Rien ici n'appelle
+    # `fuser -k` : la sonde tue par pid, et uniquement les pids que son propre
+    # faux démon a inscrits.
+    port=$(python3 -c '
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+')
+    bin="$tmp/bin/mitmdump"
+    addon="$tmp/bin/anthropic-addon.py"
+    ghaddon="$tmp/bin/github-addon.py"
+    ca="$tmp/bin/ca.pem"
+
+    # Un faux mitmdump qui ÉCOUTE VRAIMENT : la garde juge un porteur de port,
+    # pas un nom de processus. Il inscrit son propre pid — `exec` le conserve —
+    # pour que la sonde compte les lancements et sache si le premier porteur a
+    # bien été tué.
+    cat > "$bin" <<'FAKE_MITMDUMP'
+#!/bin/bash
+_port=""; _prev=""
+for _a in "$@"; do [ "$_prev" = "--listen-port" ] && _port="$_a"; _prev="$_a"; done
+echo "$$" >> "$(dirname "$0")/../launches"
+exec python3 -c '
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(5)
+time.sleep(120)
+' "$_port"
+FAKE_MITMDUMP
+    chmod +x "$bin"
+    printf '# anthropic addon\n' > "$addon"
+    printf '# github addon\n' > "$ghaddon"
+    printf '# ca\n' > "$ca"
+
+    # Le code est posé AVANT le lancement : c'est l'état nominal, et le contrôle
+    # négatif V1 en dépend. La seconde pleine met la comparaison de mtime hors de
+    # portée d'un `[ -nt ]` qui ne comparerait que les secondes.
+    sleep 1.1
+
+    err="$tmp/err"
+    (
+        # shellcheck disable=SC1090
+        source "$lib"
+        _PILOT_HELPER_BIN="$bin"
+        _PILOT_HELPER_PORT="$port"
+        _PILOT_HELPER_ADDON="$addon"
+        _PILOT_GH_HELPER_ADDON="$ghaddon"
+        _PILOT_HELPER_CA="$ca"
+        _PILOT_HELPER_LOG="$tmp/helperlog/helper.log"
+        PILOT_LOG_DIR="$tmp/pilotlogs"
+
+        _ensure_pilot_helper >/dev/null 2>&1 || true   # amorçage : le démon d'origine
+
+        # `make install` réécrit l'addon sous le démon déjà lancé.
+        case "$state" in
+            stale|deferred|undecidable) sleep 1.1; touch "$ghaddon" ;;
+        esac
+        [ "$state" = deferred ] && touch "$tmp/pilotlogs/frere.stderr"
+        if [ "$state" = undecidable ]; then
+            # Un porteur que la découverte ne rend pas. L'état de PÉREMPTION est
+            # identique à V2 : seule la lisibilité du porteur change, donc la
+            # sonde distingue bien `undecidable` de `stale`.
+            fuser() { return 1; }
+        fi
+
+        _ensure_pilot_helper >/dev/null 2>"$err"
+    ) && rc=0 || rc=$?
+
+    token=$(grep -oE -m1 'pilot_daemon_freshness\.[a-z_]+' "$err" 2>/dev/null || true)
+    token="${token#pilot_daemon_freshness.}"
+    [ -n "$token" ] || token=none
+    launches=$(wc -l < "$tmp/launches" | tr -d ' ')
+
+    p=$(head -1 "$tmp/launches" 2>/dev/null || true)
+    first=dead
+    i=0
+    while [ $i -lt 10 ]; do
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then first=alive; else first=dead; break; fi
+        sleep 0.05
+        i=$((i + 1))
+    done
+
+    listening=no
+    if python3 -c '
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1]))); s.close()
+except OSError:
+    sys.exit(1)
+' "$port" 2>/dev/null; then listening=yes; fi
+
+    while read -r p; do kill "$p" 2>/dev/null || true; done < "$tmp/launches"
+    rm -rf "$tmp"
+    printf 'rc=%s token=%s launches=%s first=%s listening=%s' \
+        "$rc" "$token" "$launches" "$first" "$listening"
+}
+
+# SKIP BRUYANT (mika#2149, troisième colonne) : sans `fuser`, la découverte du
+# porteur rend `undecidable` partout et les quatre sondes mesureraient le même
+# rien. Un bloc de porte qui n'a pas pu s'armer ne doit pas se lire comme un vert.
+if ! command -v fuser >/dev/null 2>&1; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2029 — 'fuser' introuvable : la garde de fraîcheur identifie"
+    echo "    le porteur du port par identité de socket et ne peut rien mesurer sans lui."
+    echo "    Remède : installer psmisc (Debian/Ubuntu) ou sys-process/psmisc (Gentoo)."
+else
+    # V1 — CONTRÔLE NÉGATIF, et contrôle de l'instrument : le comparateur est
+    # l'ordre des mtimes entre un fichier et `/proc/<pid>` (D2). Un `/proc/<pid>`
+    # dont le mtime ne serait PAS l'instant de démarrage rendrait cette ligne
+    # rouge — c'est le signal de bascule vers le repli nommé du plan
+    # (`/proc/<pid>/stat` champ 22 + `btime`), et la raison pour laquelle V1
+    # s'écrit en premier.
+    assert_eq "V1 contrôle négatif: code posé avant le démon ⇒ fresh, silencieux, aucun TERM" \
+        "rc=0 token=none launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe fresh)"
+
+    # V2 — CONTRÔLE POSITIF. Un addon réinstallé sous le démon : jeton `stale`,
+    # le porteur d'origine est mort, un nouveau démon écoute.
+    assert_eq "V2 contrôle positif: addon réinstallé ⇒ stale, porteur mort, démon relancé" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_daemon_freshness_probe stale)"
+
+    # V3 — DÉFÉRENCE (D4). Même état que V2, plus un `*.stderr` frais dans
+    # PILOT_LOG_DIR : tuer le mitmdump sous un pilote qui stream fabriquerait la
+    # classe de panne que mika#2029 existe pour éteindre. Aucun TERM, rc 0, et le
+    # prochain dispatch sans frère en vol relancera (auto-guérissant).
+    assert_eq "V3 déférence: pilote frère en vol ⇒ stale_deferred, aucun TERM" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe deferred)"
+
+    # V4 — INDÉCIDABLE. Le port est tenu, mais la découverte ne rend pas son
+    # porteur. « On ne sait pas » n'est pas « périmé » : aucun TERM, rc 0, et la
+    # ligne le dit plutôt que de laisser le silence passer pour un verdict.
+    assert_eq "V4 indécidable: porteur non identifiable ⇒ undecidable, aucun TERM" \
+        "rc=0 token=undecidable launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe undecidable)"
+
+    # V5 — CONTRE-VACUITÉ, constatée le 2026-10-16 et consignée dans la PR. Le
+    # crochet `lib` ci-dessus, pointé sur une copie de `main`
+    # (`git show origin/main:skills/bundled/_shared/dispatch-lib.sh`), rend sur
+    # l'état EXACT de V2 :
+    #
+    #     rc=0 token=none launches=1 first=alive listening=yes
+    #
+    # Aucun jeton, aucune relance, le porteur périmé sert encore. C'est la panne
+    # de mika#2029 reproduite à la demande, et la preuve que les quatre lignes
+    # ci-dessus mesurent le correctif plutôt que le décor. Non assertée en
+    # permanence : l'exécuter exigerait de lire une autre révision depuis la
+    # suite, donc un test vert hors réseau et rouge en archive détachée.
+fi
+
+# Le jeton `fresh` ne doit JAMAIS écrire de ligne : une ligne par dispatch sur
+# l'état nominal noierait les quatre autres. Le verdicteur en porte donc
+# exactement TROIS — `undecidable`, `stale_deferred`, `stale` — et le quatrième
+# (`stale_unstoppable`) vit chez l'arrêteur. Compté plutôt que cherché : un `0`
+# serait aussi ce que rendrait une extraction vide.
+T2029_VERDICT_BLOCK=$(awk '/^_pilot_daemon_freshness\(\)/,/^}$/' "$DISPATCH_LIB")
+assert_eq "mika#2029: le verdicteur écrit 3 lignes nommées, aucune pour \`fresh\`" \
+    "3 0" \
+    "$(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.' || true) $(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.fresh' || true)"
+
 # --- Summary ---
 
 echo ""

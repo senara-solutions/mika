@@ -1165,6 +1165,174 @@ _PILOT_GITCONFIG_SANDBOX="/run/mika-pilot-git/config"
 # unset of the vars is skipped so nothing points at a partial bundle. POSIX sh.
 _PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v; if [ -f $_PILOT_HELPER_CA_SANDBOX_PATH ]; then _sysca=''; for _c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem; do [ -f \"\$_c\" ] && { _sysca=\"\$_c\"; break; }; done; if [ -n \"\$_sysca\" ] && cat \"\$_sysca\" $_PILOT_HELPER_CA_SANDBOX_PATH > $_PILOT_COMBINED_CA_SANDBOX_PATH 2>/dev/null; then export GIT_SSL_CAINFO=$_PILOT_COMBINED_CA_SANDBOX_PATH CURL_CA_BUNDLE=$_PILOT_COMBINED_CA_SANDBOX_PATH SSL_CERT_FILE=$_PILOT_COMBINED_CA_SANDBOX_PATH REQUESTS_CA_BUNDLE=$_PILOT_COMBINED_CA_SANDBOX_PATH; else export GIT_SSL_CAINFO=$_PILOT_HELPER_CA_SANDBOX_PATH; fi; unset _sysca _c; fi"
 
+# --- mika#2029 : un démon qui porte du code d'egress ne survit plus à son code -
+#
+# Les deux lanceurs de démons hôtes de ce fichier demandent « quelqu'un
+# écoute-t-il ? » et jamais « quelle version écoute ? ». Un démon lancé une fois
+# sert indéfiniment, y compris après que `make install` a posé un code différent
+# à côté de lui — mesuré trois fois (2026-08-29, 2026-09-11, 2026-10-16 : un
+# `mitmdump` du 13 octobre portant des addons réinstallés le 16). L'écart le plus
+# coûteux qu'un dépôt puisse porter : le refus d'egress de mika#2724 et la
+# sentinelle de mika#2723 existent, leur CI est verte, et ils ne tournent pas.
+#
+# Ce vol pose le mécanisme et câble UN lanceur, celui du `mitmdump` (le démon
+# dont la péremption RETIRE un contrôle de confinement, et le seul des deux sans
+# geste opérateur : le relais a `--restart-relay` depuis mika#2049). Le câblage
+# du relais est le vol 3 — sa posture y est fail-closed, donc d'autres sondes.
+_PILOT_DAEMON_FRESH="fresh"
+_PILOT_DAEMON_STALE="stale"
+_PILOT_DAEMON_STALE_DEFERRED="stale_deferred"
+_PILOT_DAEMON_UNDECIDABLE="undecidable"
+_PILOT_DAEMON_STALE_UNSTOPPABLE="stale_unstoppable"
+
+# Le budget d'inactivité de claude-pilot (`idle_timeout`, watchdog cpp#170). Ce
+# n'est pas un nombre inventé : une session dont le `.stderr` est silencieux plus
+# longtemps est déjà en train d'être tuée par son propre garde-fou.
+_PILOT_DAEMON_SIBLING_WINDOW_SECONDS=300
+
+# Le pid qui SERT le port, jamais un pid dont la ligne de commande ressemble.
+# Même raison qu'au canary (`--restart-relay`, qui tue par identité de socket) :
+# `pgrep -f mitmdump` apparie aussi l'éditeur de l'opérateur, un grep, et ce
+# script lui-même.
+_pilot_daemon_holder_pid() {   # $1 = port TCP ; écrit le premier pid, ou rien
+    command -v fuser >/dev/null 2>&1 || return 1
+    local _out _pid
+    _out="$(fuser -n tcp "$1" 2>/dev/null)" || true
+    # R3 : `fuser` peut rendre plusieurs pids (un mitmdump qui a forké). On
+    # découpe et on prend le PREMIER CHAMP — jamais une concaténation, qui
+    # nommerait un processus qui n'existe pas. Les champs non numériques sont
+    # écartés plutôt que supposés absents (fuser suffixe certains usages).
+    for _pid in $_out; do
+        case "$_pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        printf '%s' "$_pid"
+        return 0
+    done
+    return 1
+}
+
+# Vrai dès qu'un fichier de code EXISTANT est plus récent que le démarrage du
+# processus ; écrit alors le chemin du premier trouvé. Un fichier absent est
+# SAUTÉ, pas compté : l'addon GitHub est facultatif par construction (son
+# absence est déjà nommée plus bas) et le compter ici rendrait un verdict de
+# péremption sur une cause qui n'en est pas une.
+#
+# D2 — le comparateur est l'ordre des mtimes, pas un condensé de contenu : pas
+# d'époque à parser, pas de `CLK_TCK`, pas de format de `ps` à lire. LE COÛT EST
+# ASSUMÉ : `make install` réécrit ces trois fichiers inconditionnellement
+# (Makefile, `cp`+`mv` par-dessus la cible), donc tout deploy produit un verdict
+# périmé, contenu identique ou non → UNE relance par démon et par deploy. C'est
+# l'action souhaitée dans la quasi-totalité des cas : un deploy est l'instant même
+# où l'on veut que le démon reprenne son code. Un comparateur par condensé serait
+# exact, demanderait un sceau écrit au lancement, et serait aveugle au seul démon
+# qui compte aujourd'hui — celui qui tourne depuis des jours et n'a rien scellé.
+_pilot_daemon_code_is_newer() {   # $1 = pid, $2.. = fichiers
+    local _pid="$1"
+    shift
+    # Pas de porteur lisible dans /proc (il vient de mourir, ou ce n'est pas
+    # Linux) : on ne sait pas, et « on ne sait pas » n'est pas « périmé ».
+    [ -d "/proc/$_pid" ] || return 1
+    local _f
+    for _f in "$@"; do
+        [ -e "$_f" ] || continue
+        if [ "$_f" -nt "/proc/$_pid" ]; then
+            printf '%s' "$_f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# D4 — un pilote frère vole-t-il ? Tuer le `mitmdump` sous un pilote qui stream,
+# c'est fabriquer la classe de panne que mika#2029 existe pour éteindre. Le
+# signal SUR-APPROXIME « un frère vole », et c'est le bon sens de l'erreur : il
+# diffère trop souvent, jamais trop peu. La déférence est auto-guérissante — le
+# prochain dispatch sans frère en vol relance.
+_pilot_sibling_pilot_in_flight() {
+    _pilot_log_dir; [ -d "$_PILOT_LOG_DIR" ] || return 1
+    _pilot_log_dir; [ -n "$(find "$_PILOT_LOG_DIR" -maxdepth 1 -name '*.stderr' \
+        -newermt "-${_PILOT_DAEMON_SIBLING_WINDOW_SECONDS} seconds" -print -quit 2>/dev/null)" ]
+}
+
+# Le verdict, et la ligne nommée qui va avec. N'AGIT PAS, ne refuse rien : il
+# écrit un des jetons sur stdout et laisse l'appelant décider. `fresh` est
+# silencieux — une ligne par dispatch sur l'état nominal noierait les autres, et
+# le nominal est déjà ce que ce fichier fait depuis toujours.
+#
+# D5 : chaque cause a son jeton, parce que chacune appelle un geste différent
+# (ou aucun). Précédent maison explicite : `binary_missing` vs `unreachable`
+# quelques dizaines de lignes plus haut.
+_pilot_daemon_freshness() {   # $1 = nom lisible, $2 = port, $3.. = fichiers de code
+    local _label="$1" _port="$2"
+    shift 2
+    local _pid _newer
+    if ! _pid="$(_pilot_daemon_holder_pid "$_port")"; then
+        printf '%s' "$_PILOT_DAEMON_UNDECIDABLE"
+        echo "dispatch-lib: pilot_daemon_freshness.undecidable $_label écoute sur $_port mais son porteur n'est pas identifiable (fuser absent ou port sans porteur) — démon conservé (mika#2029)" >&2
+        return 0
+    fi
+    if ! _newer="$(_pilot_daemon_code_is_newer "$_pid" "$@")"; then
+        printf '%s' "$_PILOT_DAEMON_FRESH"
+        return 0
+    fi
+    if _pilot_sibling_pilot_in_flight; then
+        printf '%s' "$_PILOT_DAEMON_STALE_DEFERRED"
+        echo "dispatch-lib: pilot_daemon_freshness.stale_deferred $_label (pid $_pid) est périmé mais un pilote frère vole — relance différée au prochain dispatch (mika#2029)" >&2
+        return 0
+    fi
+    printf '%s' "$_PILOT_DAEMON_STALE"
+    echo "dispatch-lib: pilot_daemon_freshness.stale $_label (pid $_pid) a démarré avant l'installation de $(basename "$_newer") — relance (mika#2029)" >&2
+    return 0
+}
+
+# Le port accepte-t-il une connexion ? Jumelle TCP de
+# `_pilot_egress_sock_connectable`, et comme elle le port passe par argv, jamais
+# interpolé dans la source python. Elle DOUBLE délibérément les deux sondes
+# inline de `_ensure_pilot_helper` : les refactorer élargirait le diff sur le seul
+# chemin que ce vol modifie vraiment, pour un gain cosmétique.
+_pilot_daemon_port_connectable() {   # $1 = port, $2 = timeout (défaut 0.25 s)
+    python3 -c '
+import socket, sys
+s = socket.socket()
+s.settimeout(float(sys.argv[2]))
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+    s.close()
+except OSError:
+    sys.exit(1)
+' "$1" "${2:-0.25}" 2>/dev/null
+}
+
+# L'arrêt, par identité d'endpoint. TERM au porteur du port, puis ATTENTE BORNÉE
+# de la libération : sans cette attente le lanceur rebind trop tôt, échoue sur
+# « address in use », et la relance laisse le trou qu'elle devait fermer.
+#
+# Pas de `KILL` après le `TERM` : un `mitmdump` qui ignore un TERM est un état
+# que personne n'a mesuré, et une escalade de signal se déciderait sur une
+# mesure, pas sur un plan.
+#
+# D6 — si le port répond toujours après la fenêtre, on N'INSISTE PAS et l'on rend
+# != 0 : l'appelant conserve l'ancien démon. Un démon périmé qui sert vaut mieux
+# qu'un port orphelin, parce que la posture héritée du lanceur laisserait partir
+# le pilote sans chaîne Anthropic du tout — c'est-à-dire exactement la panne que
+# ce ticket éteint.
+_pilot_daemon_restart_by_port() {   # $1 = port, $2 = nom lisible
+    local _port="$1" _label="$2"
+    command -v fuser >/dev/null 2>&1 || return 1
+    fuser -k -n tcp "$_port" 2>/dev/null || true
+    local _deadline=$((SECONDS + 3))
+    while [ "$SECONDS" -lt "$_deadline" ]; do
+        _pilot_daemon_port_connectable "$_port" || return 0
+        sleep 0.1
+    done
+    if _pilot_daemon_port_connectable "$_port"; then
+        echo "dispatch-lib: pilot_daemon_freshness.stale_unstoppable $_label tient toujours le port $_port 3s après un TERM — démon périmé conservé plutôt qu'un port orphelin (mika#2029)" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Idempotent helper daemon launcher for the anthropic api chain
 # (2026-08-05, Vincent-authorized). Chained from the front egress proxy
 # when a CONNECT to api.anthropic.com is seen.
@@ -1196,7 +1364,25 @@ try:
 except OSError:
     exit(1)
 " 2>/dev/null; then
-        return 0
+        # mika#2029 : la sonde de vivacité reste le juge de « quelqu'un
+        # écoute » ; le verdict de fraîcheur décide seulement SI L'ON RETOURNE
+        # ou si l'on retombe dans le lanceur déjà écrit. Il ne se pose qu'APRÈS
+        # les trois chemins d'erreur ci-dessus, donc il n'est jamais interrogé
+        # sur un fichier dont l'absence a déjà été nommée.
+        case "$(_pilot_daemon_freshness mitmdump "$_PILOT_HELPER_PORT" \
+                    "$_PILOT_HELPER_ADDON" "$_PILOT_GH_HELPER_ADDON" "$_PILOT_HELPER_BIN")" in
+            "$_PILOT_DAEMON_STALE")
+                # Pas de `return` : on retombe dans le lancement + la sonde de
+                # bind bornée ci-dessous, inchangés. Un helper qui ne revient
+                # pas produit donc la ligne `failed to bind` existante et la
+                # POSTURE HÉRITÉE du site d'appel (`_ensure_pilot_helper || true`
+                # dans _run_pilot_sandboxed) : le dispatch continue. C'est la
+                # même posture qu'un helper simplement mort — ce vol n'en
+                # invente pas une, et n'ajoute AUCUN chemin de refus.
+                _pilot_daemon_restart_by_port "$_PILOT_HELPER_PORT" mitmdump || return 0
+                ;;
+            *) return 0 ;;
+        esac
     fi
     mkdir -p "$(dirname "$_PILOT_HELPER_LOG")" 2>/dev/null || true
     # mika#2056: load the GitHub addon too, when present. mitmdump accepts
