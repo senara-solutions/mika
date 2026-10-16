@@ -5073,10 +5073,11 @@ impl Database {
         Ok((page_size * page_count) as u64)
     }
 
-    pub fn vacuum(&self) -> Result<()> {
-        self.conn.execute_batch("VACUUM;")?;
-        Ok(())
-    }
+    // `Database::vacuum` a été supprimée par mika#2735, et son absence est le
+    // livrable : une méthode sans appelant aurait été une entrée d'allowlist
+    // déguisée, que la garde structurelle de
+    // `db::migrations::tests::aucun_vacuum_au_demarrage` aurait dû exempter.
+    // Le compactage sous exclusivité explicite est le vol 2 du ticket.
 
     // ===== Dashboard Queries (unscoped, cross-agent) =====
 

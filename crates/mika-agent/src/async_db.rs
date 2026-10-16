@@ -2507,9 +2507,9 @@ impl AsyncDatabase {
         self.with_db(|db| db.schema_version()).await
     }
 
-    pub async fn vacuum(&self) -> Result<()> {
-        self.with_db(|db| db.vacuum()).await
-    }
+    // `AsyncDatabase::vacuum` a été supprimée par mika#2735 avec son pendant
+    // synchrone `Database::vacuum` ; le raisonnement est au site de ce dernier,
+    // dans la section « Utilities » de `db.rs`.
 
     // -- Customer Config --
 

@@ -430,28 +430,41 @@ impl Database {
     /// complète déjà employé en v28→v29 — même résultat, une douzaine de
     /// lignes de plus.
     ///
-    /// **Le `VACUUM` fait partie du livrable, et il est après le commit.**
+    /// **Le `VACUUM` a été retiré de cette migration le 2026-10-16 (mika#2735),
+    /// et il ne doit pas revenir.** Le raisonnement de mika#2658 reste vrai :
     /// `DROP COLUMN` réécrit les lignes mais rend les pages libérées à la
-    /// *freelist*, pas au système : sans `VACUUM` le fichier reste à 1 Go et
-    /// l'avertissement de démarrage continue de sonner — le correctif n'aurait
-    /// aucun effet observable. `VACUUM` ne peut pas s'exécuter dans une
-    /// transaction, donc il vient **après** `tx.commit()`. Cet ordre est
-    /// load-bearing : la v56 est estampillée avant le `VACUUM`, si bien qu'un
-    /// `VACUUM` en échec (disque plein — il lui faut jusqu'à ≈ 1 Go de
-    /// temporaire) laisse le schéma migré et ne fait **pas** rejouer la
-    /// migration au démarrage suivant. Un `VACUUM` en échec est donc un
-    /// `warn!`, pas une erreur de démarrage.
+    /// *freelist*, pas au système, donc sans compactage le fichier garde sa
+    /// taille. Ce qui a changé, c'est le prix de l'obtenir **ici**. Le
+    /// déploiement du 2026-10-16 a joué cette migration au démarrage de
+    /// mika-spirit ; `v56: vacuum complete` à 08:50:38Z, premier
+    /// `file is not a database` 25 s plus tard, et à 11:00Z `PRAGMA quick_check`
+    /// rendait 25 arbres abîmés — `tasks`, `sessions`, `messages`, `llm_calls`,
+    /// `tool_calls`, `audit_events`, `a2a_task_map` et leurs index — avec les
+    /// signatures `Bad ptr map entry` et `2nd reference to page`. Ces deux-là
+    /// nomment la *pointer map*, et c'est l'indice de ce que le `VACUUM` faisait
+    /// réellement : la base est née en `auto_vacuum=NONE`, `Database::open`
+    /// demande `PRAGMA auto_vacuum = INCREMENTAL` — une demande **inopérante**
+    /// jusqu'au prochain `VACUUM` —, si bien que ce `VACUUM` n'était pas un
+    /// compactage mais une **conversion de format** qui ajoute des pages de
+    /// pointer map au fichier. Rejouer la v56 *sans* `VACUUM` sur la sauvegarde
+    /// v55 prend 6 s et laisse `quick_check` à `ok`.
     ///
-    /// **Les deux lignes de log sont l'instrument de mesure d'AC1.**
-    /// L'implémentation tourne dans un worktree, pas sur la base de 1 Go :
-    /// elle ne peut pas mesurer le gain réel. Ce que la migration peut faire,
-    /// c'est le mesurer **au déploiement** et l'écrire — `db_size_bytes` avant
-    /// et après le `VACUUM`. Le gain sur la base réelle est alors un fait daté
-    /// dans le journal de l'opérateur, pas une mesure manuelle à refaire.
+    /// **Où l'espace est rendu, désormais.** Nulle part dans le chemin de
+    /// démarrage : plus aucun `VACUUM` n'y tourne, et c'est la garde (a) de
+    /// mika#2735, tenue structurellement par
+    /// `db::migrations::tests::aucun_vacuum_au_demarrage`. Le compactage devient
+    /// un geste d'opérateur, moteur arrêté — runbook dans
+    /// `docs/deployment.md` § *Migrations de schéma et réécritures de fichier*.
+    /// Une commande `mika db vacuum` sous exclusivité explicite est le vol 2 du
+    /// ticket ; elle n'existe pas encore.
     ///
-    /// **Coût nommé** : le premier démarrage après déploiement est plus long
-    /// d'une dizaine de secondes à une minute, une seule fois (au
-    /// franchissement v55→v56).
+    /// **Coût nommé, et il est permanent jusqu'au geste opérateur.** Le fichier
+    /// garde sa taille après la migration, donc l'avertissement
+    /// `database size exceeds threshold` de `startup_cleanup`
+    /// (`server/mod.rs`, seuil `DB_SIZE_WARN_BYTES`) continue de sonner **à
+    /// chaque démarrage** — ce n'est plus un signal transitoire qu'un `VACUUM`
+    /// éteint tout seul. C'est le prix assumé : un avertissement qui insiste
+    /// coûte l'attention de l'opérateur, un fichier abîmé coûte la base.
     fn migrate_v55_to_v56(&mut self) -> Result<()> {
         let version = self.schema_version()?;
         if version >= 56 {
@@ -497,22 +510,6 @@ impl Database {
         tx.commit()?;
 
         info!("v55→v56: search_content.embedding_json → embedding_dims (mika#2658)");
-
-        // Hors transaction, et après l'estampille : voir le doc-comment.
-        let before = self.db_size_bytes().unwrap_or(0);
-        info!(db_size_bytes = before, "v56: vacuum start (mika#2658)");
-        match self.conn.execute_batch("VACUUM;") {
-            Ok(()) => info!(
-                db_size_bytes_before = before,
-                db_size_bytes_after = self.db_size_bytes().unwrap_or(0),
-                "v56: vacuum complete (mika#2658)"
-            ),
-            Err(e) => warn!(
-                error = %e,
-                "v56: vacuum failed; schema is migrated, space will be reclaimed \
-                 at the next vacuum"
-            ),
-        }
 
         Ok(())
     }

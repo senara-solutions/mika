@@ -129,11 +129,18 @@ const WORKTREE_REAP_CRON: &str = "0 */10 * * * *";
 /// (`task_engine/engine.rs`, étape 5 de `startup_recovery`). × 1,5 ≈ 800 Mo.
 ///
 /// **Pourquoi il bouge.** Le 500 Mo d'origine était franchi *en permanence* :
-/// un seuil qu'on ne repasse jamais sous n'alerte sur rien. Si la ligne
-/// `v56: vacuum complete` du premier démarrage après déploiement donne un
-/// plancher qui s'écarte de plus de 20 % de 540 Mo, corriger ce nombre ici —
-/// la dérivation est écrite pour qu'il soit recalculable, pas pour qu'il soit
-/// cru.
+/// un seuil qu'on ne repasse jamais sous n'alerte sur rien.
+///
+/// **La dérivation est à recalculer, et mika#2735 dit pourquoi.** Les ≈ 475 Mo
+/// ne sont rendus au système que par un compactage, et il n'y en a plus aucun
+/// dans le chemin de démarrage depuis mika#2735 — la migration v56 ne fait plus
+/// que rendre les pages à la *freelist*. La ligne `v56: vacuum complete` qui
+/// devait donner le plancher mesuré n'existe plus. Donc ce seuil est franchi
+/// *en permanence* lui aussi, jusqu'au premier compactage opérateur (runbook :
+/// `docs/deployment.md` § *Migrations de schéma et réécritures de fichier*).
+/// Le plancher à comparer à 540 Mo est la taille **après** ce geste ; s'il s'en
+/// écarte de plus de 20 %, corriger ce nombre ici — la dérivation est écrite
+/// pour qu'il soit recalculable, pas pour qu'il soit cru.
 const DB_SIZE_WARN_BYTES: u64 = 800_000_000;
 
 /// Build the Axum router with all routes and middleware.
@@ -784,7 +791,7 @@ async fn init_agent(
     Ok(agent_state)
 }
 
-/// Run background startup cleanup tasks (pruning, vacuum, backfill).
+/// Run background startup cleanup tasks (pruning, compaction, backfill).
 ///
 /// These are slow operations moved out of the hot path. Runs concurrently with
 /// the main server after `ready` is set.
@@ -810,10 +817,21 @@ async fn startup_cleanup(db: AsyncDatabase, embedding_client: Option<EmbeddingCl
         .await
     {
         Ok(deleted) if deleted > 0 => {
+            // Ici se tenait un `db.vacuum()`, retiré par mika#2735. C'était le
+            // plus exposé des deux sites du chemin de démarrage : celui de la
+            // migration v56 tournait avant toute autre connexion, celui-ci
+            // tourne dans une tâche fire-and-forget lancée **après** `ready`,
+            // donc en concurrence avec tout le tick du moteur et avec une
+            // connexion par agent. Il n'était pas gardé par une version de
+            // schéma : il repartait à chaque démarrage dès que la compaction
+            // avait supprimé au moins une ligne.
+            //
+            // Conséquence assumée : l'espace que cette compaction libère reste
+            // dans la *freelist* du fichier jusqu'au compactage opérateur
+            // (runbook dans `docs/deployment.md`). SQLite le réutilisera pour
+            // les écritures suivantes ; il ne revient pas au système de
+            // fichiers.
             info!(deleted, "compacted old audit events");
-            if let Err(e) = db.vacuum().await {
-                warn!(error = %e, "failed to vacuum database");
-            }
         }
         Ok(_) => {}
         Err(e) => warn!(error = %e, "failed to compact old audit events"),
@@ -1852,7 +1870,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // 1. Register recurring tasks (heartbeat, reflection) if missing
     // 2. Run startup recovery (expire/recover in_progress, load heap)
     // 3. Spawn 1-second tick loop — collect JoinHandle for shutdown abort
-    // 4. Spawn background cleanup (pruning, vacuum, backfill) as a fire-and-forget task
+    // 4. Spawn background cleanup (pruning, compaction, backfill) as a fire-and-forget task
     let mut tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut total_tasks_loaded: usize = 0;
 
