@@ -4736,6 +4736,19 @@ ${RESULT}"
         fi
     fi
 
+    # mika#2729 — le détecteur de régression d'invocation de la fin de pipeline
+    # allégée par mika#2694. Trois propriétés de CE point précis :
+    #
+    #   * il est sur TOUTES les branches de sortie (JSON structuré, exit 0 non
+    #     structuré, exit non nul, refus de containment) — le motif mika#1615,
+    #     dont l'absence avait fait sauter toute la récupération post-vol sur les
+    #     branches B et C ;
+    #   * `RESULT` y est déjà composé, donc le paragraphe de régression s'ajoute
+    #     à un texte existant au lieu de l'écraser ;
+    #   * la ligne est AVANT les 10 Ko de logs et le `head -c 92000` ci-dessous,
+    #     qui coupe la FIN : elle survit donc à la troncature du callback.
+    _detect_lean_tail_regression
+
     # Append stderr tail for debugging context (last 10KB)
     if [ -s "$STDERR_FILE" ]; then
         STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" | _scrub_secrets_from_output)
@@ -4766,6 +4779,150 @@ _pilot_left_no_work() {
     [ "${PRE_RUN_HEAD:-}" = "${POST_RUN_HEAD:-}" ] || return 1
     [ -z "$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null)" ] || return 1
     return 0
+}
+
+# LA SIGNATURE D'INVOCATION DE LA FIN DE PIPELINE RETIRÉE (mika#2729).
+#
+# UN SEUL SITE DE VÉRITÉ. mika#2694 a retiré `ce-simplify-code` et
+# `ce-code-review` de la fin de pipeline des pilotes, et son essai borné (#2728)
+# a mesuré que le crochet tient : 0 invocation sur 45 transcripts post-consigne,
+# contrôle positif à 1 sur chacun des trois témoins pré-consigne. Ce que l'essai
+# ne fournit pas, c'est un moyen de s'en apercevoir le jour où ça repart — une
+# mise à jour du plugin, un `CLAUDE.md` tronqué par le cap de `claude_md_size`,
+# un vol dispatché autrement. Le mode de panne coûte un vol entier : trois vols
+# mesurés morts à 201/200 dans cette queue (#2683, #2654, mika#2693), aucun
+# n'ayant ouvert sa PR lui-même.
+#
+# Forme établie par `grep -oh` sur les trois témoins AVANT tout comptage
+# (§ III de docs/solutions/dev-loop/un-essai-dabsence-exige-un-controle-positif-sur-son-instrument.md) :
+#
+#     "name": "Skill", "input": {"skill": "compound-engineering:ce-simplify-code"
+#
+# Le motif en dérive avec UN SEUL degré de liberté ajouté, et les deux propriétés
+# que l'essai a mesurées sont traitées différemment — c'est délibéré :
+#
+#   * L'ANCRAGE EST EXIGÉ. Les trois clés doivent être adjacentes dans cet ordre.
+#     La sous-chaîne nue `compound-engineering:ce-simplify-code` apparaît dans le
+#     corps de mika#2694, dans le document de #2728, dans `CLAUDE.md` et dans le
+#     plan de ce ticket : un détecteur non ancré crie sur tout document qui PARLE
+#     du ticket. Mesuré — la session d'observation était dans la population
+#     observée.
+#   * L'ESPACEMENT EST NEUTRALISÉ. Au grooming de mika#2694,
+#     `grep '"skill":"compound-engineering:ce-simplify-code"'` (sans espaces) a
+#     rendu ZÉRO fichier sur 44 — un faux négatif complet qui se lisait exactement
+#     comme le résultat espéré. Épingler la forme espacée reconduirait le piège à
+#     l'identique le jour où le sérialiseur amont change : `jq -c` et
+#     `json.dumps(separators=(",", ":"))` produisent tous deux la forme compacte.
+#     Le motif accepte les deux, et un contrôle négatif de la suite l'épingle.
+#
+# Le piège 6 de #2728 (accents échappés en `\uXXXX`) est sans objet : la
+# signature est intégralement ASCII.
+#
+# L'accolade est écrite `[{]` et non `\{` : zéro antislash dans le motif, donc
+# les probes de mutation de la suite le réécrivent par un `sed` lisible au lieu
+# d'un échafaudage d'échappements — et un motif qu'on n'arrive pas à muter est un
+# motif dont on ne sait pas s'il est porteur.
+_LEAN_TAIL_SIG='"name"[[:space:]]*:[[:space:]]*"Skill"[[:space:]]*,[[:space:]]*"input"[[:space:]]*:[[:space:]]*[{][[:space:]]*"skill"[[:space:]]*:[[:space:]]*"compound-engineering:'
+
+# Compte les OCCURRENCES de la signature pour un skill, jamais les lignes.
+#
+# Une ligne de transcript porte toute une réponse LLM, donc deux invocations dans
+# le même tour tiennent sur une seule ligne et `grep -c` en compterait une. D'où
+# `-o` puis `wc -l`. Un seul site porte ce pipeline, pour que les deux moitiés du
+# motif ne puissent pas dériver.
+#
+# L'ANCRAGE EST COMPOSÉ ICI, ET IL A DEUX MORCEAUX : le préfixe des trois clés
+# (`$_LEAN_TAIL_SIG`) et le guillemet FERMANT ajouté derrière le nom du skill.
+# Mesuré en construisant la probe X1 de la suite : réduire le seul préfixe à la
+# sous-chaîne nue ne suffit pas à faire crier le détecteur sur une mention en
+# prose — le `"` final la refuse encore. Les deux morceaux sont donc porteurs, et
+# X1 mute CE site plutôt que la seule constante.
+#
+# $1 nom du skill  $2 chemin du transcript
+_lean_tail_count() {
+    grep -Eoh "${_LEAN_TAIL_SIG}$1\"" "$2" 2>/dev/null | wc -l | tr -d '[:space:]'
+}
+
+# Le détecteur de régression d'invocation (mika#2729).
+#
+# POURQUOI ICI, et pas en CI. Un `scripts/check-*.sh` n'a aucun transcript à lire
+# sur un runner : il porterait sur la CONSIGNE dans `CLAUDE.md`. Or un `CLAUDE.md`
+# intact et un plugin qui regonfle la fin de pipeline est précisément la
+# conjonction que ce ticket craint — ce lint-là serait vert ce jour-là. Un test
+# Rust sur un transcript-fixture ne mesure aucun vol réel : il mesure la fixture.
+# Une garde côté `qa-review` n'a pas le transcript sous la main — elle tourne sur
+# un webhook PR, dans un autre process, à un moment où le fichier est déjà ingéré
+# et supprimé. Cet emplacement est le seul qui observe le COMPORTEMENT.
+#
+# LE TRANSCRIPT EST GARANTI PRÉSENT ET COMPLET À CET INSTANT. Le JSONL n'est
+# ingéré puis supprimé par le moteur qu'une fois sa tâche sortie de
+# `pending`/`in_progress`, ce qui suit le trap EXIT de ce fichier (contrat écrit à
+# `crates/mika-agent/src/task_engine/engine.rs`, « Race safety (mika#1705
+# Risk 5) »). Et `claude-pilot` a rendu : `PILOT_EXIT` est déjà capturé, donc le
+# fichier n'est plus en cours d'écriture.
+#
+# LE CHEMIN EST DÉCLARÉ PAR SON PRODUCTEUR, JAMAIS RE-DÉRIVÉ. L'exécuteur injecte
+# `ANTHROPIC_LOG_FILE` dans l'env du handler, et la variable est dans
+# `_PILOT_SANDBOX_ENV_ALLOWLIST` : elle est lisible depuis ici, qui tourne hors du
+# bac à sable. On la lit TELLE QUELLE, sans dériver
+# `$HOME/.mika/data/pilot-transcripts/${LOG_ID}.jsonl` en rechange — un chemin
+# re-dérivé est la façon canonique de fabriquer un faux négatif muet.
+#
+# TROIS ÉTATS, JAMAIS UN SILENCE. `absent` n'est pas `0` (mika#2331). Sans
+# `lean_tail_unmeasured`, « le détecteur veille et ne trouve rien » et « le
+# détecteur ne regarde rien » seraient indistinguables — classe mika#2205,
+# appliquée à l'organe même que ce ticket livre.
+#
+# LE SINK N'EST PAS NÉGOCIABLE, ET CE N'EST PAS `>&2` SEUL. Le commentaire de
+# `_emit_pilot_budget_line` l'a déjà payé : cette garde tourne APRÈS le
+# lancement, donc hors de la redirection `2>"$STDERR_FILE"` du site de lancement,
+# et l'exécuteur ne lit le stderr propre de dispatch-lib que sur
+# `!status.success()`. Un dispatch implement RÉUSSIT : la ligne serait jetée sans
+# être lue. D'où `tee -a "$PERSISTENT_STDERR"`, comme `pilot_log_guard.missing`.
+# `lean_tail_regression` va EN PLUS dans `RESULT`, qui remonte dans le callback
+# donc chez mika-dev et chez l'opérateur ; `lean_tail_clean` n'y va PAS — une
+# ligne nominale sur chaque dispatch est du bruit dans le canal d'alerte, et le
+# stderr durable suffit à répondre à « l'instrument a-t-il regardé ce vol ? ».
+#
+# AUCUN PRÉDICAT SUR `SKILL`. La mesure est la même pour `dev-pilot` et
+# `dev-groom`, une invocation est anormale dans les deux cas, et l'exécuteur
+# n'injecte déjà `ANTHROPIC_LOG_FILE` que pour ces deux skills : le filtre existe
+# en amont, le redoubler ici serait un second site à garder en phase.
+#
+# AUCUN NOUVEAU COMMUTATEUR. La garde ne refuse rien, elle mesure et nomme.
+# `MIKA_LOG_PILOT_TRANSCRIPTS` gouverne déjà la disponibilité du transcript, et
+# son état « off » a son token.
+_detect_lean_tail_regression() {
+    local _transcript="${ANTHROPIC_LOG_FILE:-}"
+    local _sink="${PERSISTENT_STDERR:-/dev/null}"
+    mkdir -p "$(dirname "$_sink")" 2>/dev/null || true
+
+    if [ -z "$_transcript" ] || [ ! -r "$_transcript" ]; then
+        echo "dispatch-lib: lean_tail_unmeasured transcript=absent — ANTHROPIC_LOG_FILE non déclarée ou illisible ; l'absence d'invocation n'est PAS mesurée (mika#2729)" \
+            | tee -a "$_sink" >&2
+        return 0
+    fi
+
+    local _simplify _code_review
+    _simplify=$(_lean_tail_count "ce-simplify-code" "$_transcript")
+    _code_review=$(_lean_tail_count "ce-code-review" "$_transcript")
+
+    if [ "${_simplify:-0}" -gt 0 ] || [ "${_code_review:-0}" -gt 0 ]; then
+        echo "dispatch-lib: lean_tail_regression transcript=${_transcript} simplify=${_simplify} code_review=${_code_review} — un vol de pilote a réinvoqué la fin de pipeline retirée par mika#2694 (mika#2729)" \
+            | tee -a "$_sink" >&2
+        RESULT="${RESULT}
+
+LEAN TAIL REGRESSION (mika#2729) — ce vol a réinvoqué la fin de pipeline que
+mika#2694 avait retirée : ce-simplify-code x${_simplify}, ce-code-review
+x${_code_review}. Le plafond de tours ne les tient pas — trois vols mesurés morts
+à 201/200 dans cette queue (#2683, #2654, mika#2693), aucun n'ayant ouvert sa PR
+lui-même. Le crochet qui les retirait a lâché : plugin mis à jour, \`CLAUDE.md\`
+tronqué par le cap de \`claude_md_size\`, ou vol dispatché autrement.
+Transcript : ${_transcript}"
+    else
+        echo "dispatch-lib: lean_tail_clean transcript=${_transcript} simplify=0 code_review=0 (mika#2729)" \
+            | tee -a "$_sink" >&2
+    fi
 }
 
 # Did this cycle produce anything at all? (mika#1996)

@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-release-debuginfo test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-release-debuginfo test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -188,6 +188,7 @@ test-async-db-saturation: ## Run async DB channel saturation regression test (mi
 test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it into CI)
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
 	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
+	@bash skills/bundled/_shared/tests/test_lean_tail_regression.sh
 
 test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
@@ -213,6 +214,13 @@ test-handler-crash-step: ## Verify a long-running handler names the step it cras
 test-rescue-cause-token: ## Verify the rescue commit subject names its cause, derived from _halt_family (mika#2539)
 	@bash skills/bundled/_shared/tests/test_rescue_cause_token.sh
 	@bash skills/bundled/_shared/tests/test_rescue_commit_no_verify.sh
+
+# mika#2729 — ce target existe pour lancer la suite SEULE. Sa porte de merge,
+# elle, est la ligne ajoutée à `test-dispatch-lib` ci-dessus : ce que la suite
+# atteste vit dans `dispatch-lib.sh`, donc elle appartient à l'agrégat que le job
+# `Check` exécute déjà, et aucun nouveau step de `ci.yml` n'est dû.
+test-lean-tail-regression: ## Attest the lean-tail invocation detector — positive control, negative controls, mutation probes (mika#2729)
+	@bash skills/bundled/_shared/tests/test_lean_tail_regression.sh
 
 test-pilot-push-guard: ## Pin the PR-branch push guard and refuse unguarded push sites in skill handlers (mika#2520)
 	@bash skills/bundled/_shared/tests/test_pr_push_guard.sh
