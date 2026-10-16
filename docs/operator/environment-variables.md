@@ -3914,6 +3914,80 @@ Un fichier neuf dans `~/.mika/manager/sink/` n'apparaît qu'**à l'issue du prem
 - **Il ne valide pas une URL d'ingestion.** La garde sait reconnaître **un** endpoint, celui du battement, parce qu'il est nommé et que son défaut est mesuré. Toute autre URL qui répond 2xx en jetant le corps produirait le même silence, et aucune inspection statique ne peut le savoir. Ce qui le dira est la sonde 3 : un sink qui ne reçoit rien alors que `route_normal: http`.
 - **Il ne rattrape aucun des rapports perdus depuis le 27/09.** Le corps n'a jamais été conservé nulle part ; il n'y a rien à rejouer.
 
+### Le manager poste son verdict sur le ticket du vol (mika#2698, vol 2)
+
+- `MIKA_MANAGER_EVALUATE_WRITE` — l'unique interrupteur d'écriture du
+  `milestone_manager`, **OFF par défaut**. Armé par `1` ou `true` (insensible à
+  la casse, espaces tolérés) ; l'**absence est l'état normal**, pas un cas
+  d'erreur, et toute autre valeur laisse l'interrupteur fermé. Lecteur unique :
+  `verdict_poster::write_is_armed()` (doctrine mika#2201), consulté à un seul
+  site du cycle.
+
+  ```
+  MIKA_MANAGER_EVALUATE_WRITE=1
+  ```
+
+**Ce qu'il autorise, et rien de plus.** Un geste : `gh issue comment` sur le
+ticket d'un vol terminé, pour y poster le verdict que le rapport du manager
+porte déjà (même phrase, même fonction de rendu — `reporter::render_flight_verdict`
+est appelée par les deux, donc ils ne peuvent pas divergir). Ni `gh issue edit`,
+ni `gh pr comment`, ni une relecture de ce qui est déjà posté : le mandat est
+« un seul geste », et c'est une écriture.
+
+**Pourquoi c'est une exception nommée et pas un trou.** Le module porte un
+invariant LECTURE SEULE tenu structurellement par
+`milestone_manager/no_dispatch_test.rs`, qui refuse tout jeton de dispatch dans
+ses sources. L'allowlist de ce garde porte désormais **exactement une** entrée,
+épinglée au fichier (`verdict_poster.rs`) et au jeton (`gh issue comment`) près.
+Le posteur déclare son geste **à plat** (`const GESTE: &str = "gh issue comment"`)
+et en **dérive** son vecteur d'arguments : ce qui s'exécute est exactement ce que
+le garde voit. La forme éclatée `.args(["issue", "comment"])` échapperait au grep
+plat, et l'exception serait alors décorative.
+
+**Seuil d'ouverture — un geste opérateur, jamais une bascule automatique.** Le
+verdict ombre doit concorder avec le jugement de l'orchestrateur sur **10 vols
+consécutifs**, ou sur **7 jours** si ce délai arrive avant. Concorder veut dire :
+même verdict merge/non-merge et mêmes vols signalés. *Un désaccord se lit, il ne
+se moyenne pas.* Le rollback est le retrait de la variable — sans redéploiement.
+
+**L'idempotence est portée par le checkpoint, pas par GitHub.** Le champ
+`posted_flight_task_ids` de `MilestoneCheckpoint` retient les vols déjà postés
+(500 au plus, les plus récents), et le checkpoint est désormais sauvegardé quand
+le cycle **a posté** même sans avoir livré de rapport — sans quoi le rejeu du
+cycle reposterait. Dans ce cas les trois champs de cadence (`state_digest`,
+`last_delivered_at`, `last_observed_at`) sont **préservés** tels quels : une
+sauvegarde faite pour une autre raison ne doit pas avaler un `state_changed` en
+attente. Conséquences, nommées plutôt que silencieuses : perdre le fichier de
+checkpoint peut produire un **doublon** — jamais un verdict perdu — et le corps
+du commentaire porte un marqueur `<!-- mika-manager:verdict:<task-id> -->` pour
+qu'un doublon soit reconnaissable à l'œil.
+
+**Surfaces opérateur** (journal `$MIKA_SPIRIT_LOG_FILE`) :
+
+```
+# 1. Qu'a-t-on posté, sur quel ticket ?
+grep manager_verdict_posted "$MIKA_SPIRIT_LOG_FILE"
+
+# 2. Un verdict non postable — le ticket du vol n'a pas pu être identifié.
+#    (régime attendu avec l'interrupteur armé : rare)
+grep manager_verdict_not_postable "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Un `gh` qui refuse. Le vol n'est PAS marqué comme posté : le cycle
+#    suivant réessaiera. Un flot soutenu ici est un problème de jeton.
+grep manager_verdict_post_failed "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. CONTRÔLE POSITIF — le cycle tourne-t-il seulement ? Les trois greps
+#    ci-dessus sont muets avec l'interrupteur OFF, ce qui est le régime
+#    nominal et se lit exactement comme un manager mort (mika#2205).
+grep manager_cadence_start "$MIKA_SPIRIT_LOG_FILE"
+```
+
+**Ce que ce travail n'achète PAS.** Il n'ouvre pas l'interrupteur. Il ne lit
+aucun commentaire existant sur GitHub, donc il ne détecte pas un doublon né d'un
+checkpoint perdu — il le rend seulement reconnaissable. Et il ne ferme pas
+mika#2698 : la ligne `Turn ceiling: N` côté producteur et le tour du dernier
+commit restent dus (vol 3).
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
@@ -5287,12 +5361,21 @@ déploiement — et aujourd'hui, ce chemin est presque désert (ci-dessous).
 ### Ce que ce travail n'achète PAS
 
 - **Il ne prouve pas qu'un chemin moteur atteint `claude-pilot` aujourd'hui.**
-  `INTERNAL_REPOS` du gateway (`crates/mika-gateway/src/github.rs:265`) liste
-  encore `senara-solutions/claude-pilot-py` ; si les webhooks portent le nom
-  courant, ils ne routent plus vers `mika-dev`, et la prémisse R8 du plan
-  (« `merge_ready_handler` peut merger une PR claude-pilot ») est à **re-mesurer**.
-  Hors périmètre de la phase C, nommé ici. La garde tient sur les trois sites
-  quel que soit le routage, parce qu'elle est dans le type.
+  Ce constat portait d'abord sur `INTERNAL_REPOS` du gateway, qui listait encore
+  l'ancien nom ; **mika#2666 l'a migré** (`crates/mika-gateway/src/github.rs`,
+  nom courant, sans alias). Et la crainte qui l'accompagnait — « ils ne routent
+  plus vers `mika-dev` » — **était fausse en mono-locataire**, mesuré le
+  2026-10-07 : `is_internal_repo` n'est consulté que pour un dépôt sans ligne
+  `github_repos`, et avec `agent_base_url` posé le fallback rend **la même
+  route**. L'allowlist n'y changeait que le niveau du log (`info!` au lieu de
+  `debug!`) — d'où l'absence de ligne INFO depuis le 2026-07-07, qui ne montrait
+  aucune perte. Les événements claude-pilot atteignaient déjà les agents (review
+  de claude-pilot#281 le 2026-10-02, canal `github`). La prémisse R8 du plan
+  (« `merge_ready_handler` peut merger une PR claude-pilot ») ne dépend donc pas
+  du routage ; ce qui reste à mesurer est qu'une PR claude-pilot atteigne un
+  chemin de merge **moteur**, et ce chemin est presque désert (CC-spawns-only,
+  ci-dessus). La garde tient sur les trois sites quel que soit le routage, parce
+  qu'elle est dans le type.
 - **Il ne ré-enclenche pas le merge quand MPC pose le marqueur.** Aucun webhook
   ne relance la porte sur un commentaire : après le marqueur, le merge est un
   geste (MPC, ou Vincent — c'est déjà la doctrine pour claude-pilot,
@@ -8173,7 +8256,7 @@ Optional (signal d'adoption sur un travail non dispatché — mika#1745) :
 
   **Le défaut que ça ferme.** Un CI failure sur une PR ouverte d'un dépôt que la boucle a le droit de dispatcher, sans tâche mika correspondante, était écarté en silence : `ci_failure_handler` rendait `Passthrough { enrichment: None }` — le modèle recevait le texte brut du webhook, sans un mot du moteur, puis son prompt lui disait d'ignorer. Le signal est désormais **additif** : aucune tâche créée, aucun dispatch déclenché, aucun statut modifié, aucun processus signalé. `Passthrough`, jamais `Handled` (AC3).
 
-  **Le dépôt hors `DISPATCHABLE_REPOS` reste silencieux, quelle que soit la valeur** — `claude-pilot-py` et `wizzard` sont spawn-CC-only par la décision opérateur du 2026-08-29, donc y proposer une adoption proposerait une action que la porte mika#2046 refuse structurellement. C'est AC4, et c'est maintenant **attribuable** : la ligne `surface_for_adoption_skipped` nomme le motif.
+  **Le dépôt hors `DISPATCHABLE_REPOS` reste silencieux, quelle que soit la valeur** — `claude-pilot` et `wizzard` sont spawn-CC-only par la décision opérateur du 2026-08-29, donc y proposer une adoption proposerait une action que la porte mika#2046 refuse structurellement. C'est AC4, et c'est maintenant **attribuable** : la ligne `surface_for_adoption_skipped` nomme le motif.
 
   **Surfaces opérateur.** `grep surface_for_adoption "$MIKA_SPIRIT_LOG_FILE" | jq -c '{event, repo, pr_number, branch, head_sha, dedup_skipped, notified}'` — le grep est un **préfixe**, donc il rend le signal et ses frères de saut ensemble ; `.event` discrimine. SQL : `SELECT target_key, count(*) FROM audit_events WHERE tool_name = 'surface_for_adoption' GROUP BY 1 ORDER BY 2 DESC;` — exact parce que `surface_for_adoption` est **SOLE WRITER** de son nom (scan de source, allowlist livrée vide), et ce compte **est** la précondition explicite de la décision d'auto-adoption qu'AC3 diffère (« until we have enough n »).
 

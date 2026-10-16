@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod config_keys;
 pub mod db;
 pub mod evidence;
+pub mod flight_source;
 pub(crate) mod github_graphql;
 pub mod grooming_marker;
 pub mod image_disposition;

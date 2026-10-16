@@ -288,6 +288,19 @@ pub struct Assessment {
     /// rapport, et nulle part ailleurs.
     #[serde(default)]
     pub pool: Option<PoolVerdict>,
+    /// Verdicts des vols terminés observés pendant ce cycle (mika#2698).
+    ///
+    /// **Vol 1 : mode ombre — ce champ est la seule destination du verdict.**
+    /// Rien d'autre ne le consomme, et aucun chemin d'écriture ne part de lui.
+    /// Vide quand aucune [`super::evaluator::FlightSource`] n'est câblée, ce qui
+    /// rend le rapport identique à celui d'avant.
+    ///
+    /// `#[serde(default)]` pour les deux mêmes raisons que
+    /// `contention_events` : un blob de rapport écrit avant ce champ se
+    /// désérialise encore (le sink disque en garde), et la liste vide sort en
+    /// `[]` plutôt qu'en `null`.
+    #[serde(default)]
+    pub flight_verdicts: Vec<super::evaluator::FlightVerdict>,
 }
 
 /// Outcome of a single `run_manager_cycle` invocation.
@@ -371,6 +384,7 @@ mod tests {
             cross_cutting: vec![],
             contention_events: vec![],
             pool: None,
+            flight_verdicts: vec![],
         };
         let out = serde_json::to_string(&a).unwrap();
         assert!(
@@ -415,6 +429,7 @@ mod tests {
             cross_cutting: vec![],
             contention_events: vec![],
             pool: None,
+            flight_verdicts: vec![],
         };
         let out = serde_json::to_string(&a).unwrap();
         assert!(
@@ -427,6 +442,73 @@ mod tests {
         );
         let back: Assessment = serde_json::from_str(&out).unwrap();
         assert_eq!(back, a, "aller-retour fidèle");
+    }
+
+    // -- mika#2698: flight_verdicts, même contrat de fil --
+
+    /// Un blob de rapport écrit avant `flight_verdicts` doit encore se
+    /// désérialiser — le sink disque en garde, et une montée de version qui ne
+    /// sait plus lire son propre arriéré le perd.
+    #[test]
+    fn mika2698_assessment_serde_default_empty_flight_verdicts() {
+        let a: Assessment = serde_json::from_str(&assessment_json_without_contention())
+            .expect("un JSON d'avant le champ doit encore se lire");
+        assert!(
+            a.flight_verdicts.is_empty(),
+            "un champ absent se lit comme une liste vide, il n'échoue pas"
+        );
+    }
+
+    /// Et la liste vide sort en `[]`, jamais en `null` : un consommateur du
+    /// vol 2 doit pouvoir la typer `Vec<_>` et non `Option<Vec<_>>`.
+    #[test]
+    fn mika2698_assessment_serde_roundtrip_empty_flight_verdicts() {
+        let a = Assessment {
+            severity: Severity::Healthy,
+            recommendation: Recommendation {
+                next_sub_issue: None,
+                rationale: "nothing to do".into(),
+            },
+            alerts: vec![],
+            cross_cutting: vec![],
+            contention_events: vec![],
+            flight_verdicts: vec![],
+            pool: None,
+        };
+        let out = serde_json::to_string(&a).unwrap();
+        assert!(
+            out.contains(r#""flight_verdicts":[]"#),
+            "une liste vide doit sortir en [] — obtenu : {out}"
+        );
+        assert!(!out.contains(r#""flight_verdicts":null"#), "jamais null");
+    }
+
+    /// Et un verdict non vide fait l'aller-retour sans perdre les deux data que
+    /// le vol 1 laisse non instrumentées.
+    #[test]
+    fn mika2698_un_verdict_fait_laller_retour() {
+        use super::super::evaluator::{
+            DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
+        };
+        let v = FlightVerdict {
+            task_id: "t".into(),
+            issue_number: Some(2661),
+            issue: FlightIssue::Dead {
+                cause: DeathCause::CeilingReached,
+            },
+            turns_used: Some(200),
+            hit_ceiling: true,
+            turn_ceiling: None,
+            last_commit_turn: None,
+            recommendation: FlightRecommendation::Regroom,
+            completed_at: Some("2026-10-13T10:00:00Z".into()),
+        };
+        let out = serde_json::to_string(&v).unwrap();
+        assert_eq!(serde_json::from_str::<FlightVerdict>(&out).unwrap(), v);
+        assert!(
+            out.contains(r#""turn_ceiling":null"#),
+            "le plafond non instrumenté doit rester visible comme null — obtenu : {out}"
+        );
     }
 
     #[test]

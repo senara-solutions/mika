@@ -31,6 +31,7 @@ use super::cadence::{
     DeliveryError, DeliveryFailureKind, ManagerConfig, classify_delivery_auth,
     run_manager_cycle_with_auth,
 };
+use super::evaluator::FlightSource;
 use super::liveness::{LivenessEmitter, LivenessSink};
 use super::reader::{GhCommandError, GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
@@ -299,12 +300,19 @@ pub async fn manager_config_from_env(
 /// one every 6 hours. Injected exactly as `token_resolver` was, and for the same
 /// reason: production passes `HttpLivenessSink`, tests inject an in-memory sink.
 /// The beat is best-effort — it can neither fail a cycle nor stop the loop.
+///
+/// **mika#2698 — `flight_source`.** D'où viennent les vols terminés que le
+/// cycle évalue. Injectée comme les trois précédentes, et `None` est un état
+/// nominal : sans source, l'assessment ne porte aucun verdict, le rapport n'a
+/// pas la section, et le cycle est exactement celui d'avant mika#2698. La
+/// source n'a **aucune** autorité d'écriture — elle lit `tasks`, c'est tout.
 pub fn spawn_manager_cycle_task(
     mut cfg: ManagerConfig,
     cancel: CancellationToken,
     token_resolver: Arc<dyn TokenResolver>,
     auth_ledger: Option<Arc<dyn AuthBoundaryLedger>>,
     liveness_sink: Arc<dyn LivenessSink>,
+    flight_source: Option<Arc<dyn FlightSource>>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -464,7 +472,13 @@ pub fn spawn_manager_cycle_task(
             // `installation_token()`, we simply never asked for it again.
             refresh_cycle_token(&mut cfg, token_resolver.as_ref()).await;
 
-            match run_manager_cycle_with_auth(&cfg, auth_ledger.as_ref(), &pending_auth_notes).await
+            match run_manager_cycle_with_auth(
+                &cfg,
+                auth_ledger.as_ref(),
+                &pending_auth_notes,
+                flight_source.as_ref(),
+            )
+            .await
             {
                 Ok(outcome) => {
                     // A successful cycle proves auth works — close any open
@@ -2018,6 +2032,7 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
         )
         .expect("first spawn returns Some(handle)");
 
@@ -2483,6 +2498,7 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
         );
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
@@ -2494,6 +2510,7 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
         );
         assert!(
             second.is_none(),
@@ -2657,6 +2674,7 @@ mod tests {
             Arc::new(resolver),
             None,
             noop_liveness_sink(),
+            None,
         )
         .expect("spawn returns Some(handle)");
 

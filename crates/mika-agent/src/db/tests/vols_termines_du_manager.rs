@@ -1,0 +1,257 @@
+//! Ce que « les vols d'implémentation terminés depuis le cycle précédent »
+//! veut dire en SQL (mika#2698, vol 1).
+//!
+//! Le lecteur unique est
+//! [`crate::db::Database::list_finished_implement_flights`], et quatre de ses
+//! clauses sont des décisions, pas des détails :
+//!
+//! - **l'ensemble clos des variantes d'URL** (`issue_url_variants`), parce que
+//!   `reference_url` porte parfois `?phase=groom` — et parce qu'une égalité,
+//!   contrairement à un `LIKE` préfixe, ne confond pas `#2693` avec `#26930`
+//!   (le défaut que mika#2638 a dû réparer sur deux autres sites) ;
+//! - **`COALESCE(completed_at, updated_at)`** comme borne temporelle, parce
+//!   qu'un vol mort par `failed` peut n'avoir que son `updated_at` : avec
+//!   `completed_at > ?` seul, `NULL > '…'` rend `NULL`, et ce sont exactement
+//!   les vols morts — ceux de l'AC3 — qui disparaîtraient en silence ;
+//! - **le filtre de statut terminal en Rust**, pas en SQL, parce que la règle
+//!   « un statut inconnu n'est pas terminal » de `is_terminal_task_status` n'a
+//!   pas d'expression dans ce dialecte, et qu'une troisième copie de la liste
+//!   des statuts divergerait ;
+//! - **une liste d'URLs vide rend `vec![]`** avant toute requête : c'est le
+//!   contrôle négatif du détecteur. Un milestone sans sous-ticket ne doit pas
+//!   faire évaluer la table entière.
+
+use super::*;
+
+const REPO: &str = "senara-solutions/mika";
+
+/// Le ticket de référence, et son voisin numérique — `2693` est un préfixe de
+/// `26930`, et c'est tout l'intérêt de l'égalité.
+const TICKET: u32 = 2693;
+const VOISIN: u32 = 26930;
+
+fn issue_url(n: u32) -> String {
+    format!("https://github.com/{REPO}/issues/{n}")
+}
+
+/// Un vol d'implémentation portant `reference_url` : la topologie d'un dispatch
+/// `implement`, c'est-à-dire [`groom_parent`] avec sa classe corrigée.
+fn vol(agent_id: &str, reference_url: &str) -> NewTask {
+    NewTask {
+        dispatch_class: Some("implement".to_string()),
+        ..groom_parent(agent_id, reference_url)
+    }
+}
+
+/// Seede un vol **terminé par une PR** sur `reference_url`, et rend son id.
+fn seed_vol_termine(db: &Database, agent_id: &str, reference_url: &str) -> String {
+    let id = db
+        .create_task(&vol(agent_id, reference_url))
+        .expect("le vol doit être créé");
+    db.update_task_completed(&id, agent_id, Some("Outcome: PR_OPENED\nTurns: 83\n"))
+        .expect("la complétion doit réussir");
+    id
+}
+
+fn lire(db: &Database, since: Option<&str>) -> Vec<String> {
+    db.list_finished_implement_flights("mika", since, &[issue_url(TICKET)])
+        .expect("la lecture doit répondre")
+        .into_iter()
+        .map(|t| t.id)
+        .collect()
+}
+
+/// La variante `?phase=groom` est dans l'ensemble clos : un vol estampillé sous
+/// cette forme est bien vu depuis l'URL canonique.
+#[test]
+fn mika2698_la_variante_phase_groom_est_appariee() {
+    let db = db();
+    let id = seed_vol_termine(&db, "mika", &format!("{}?phase=groom", issue_url(TICKET)));
+    assert_eq!(lire(&db, None), vec![id]);
+}
+
+/// Le voisin numérique n'est pas apparié — avec son contrôle positif, sans quoi
+/// le test ne distinguerait pas « l'égalité délimite » de « la fixture
+/// n'enregistre rien ».
+#[test]
+fn mika2698_le_voisin_numerique_nest_pas_apparie() {
+    let db = db();
+    let voisin = seed_vol_termine(&db, "mika", &issue_url(VOISIN));
+    assert!(
+        lire(&db, None).is_empty(),
+        "le vol de #{VOISIN} a été lu comme un vol de #{TICKET}"
+    );
+
+    // Contrôle positif : la fixture est bien enregistrée, sous son ticket.
+    let vu = db
+        .list_finished_implement_flights("mika", None, &[issue_url(VOISIN)])
+        .expect("la lecture doit répondre");
+    assert_eq!(vu.len(), 1);
+    assert_eq!(vu[0].id, voisin);
+}
+
+/// **La clause porteuse.** Un vol mort par `failed` sans `completed_at` est vu,
+/// parce que la borne est `COALESCE(completed_at, updated_at)`. Avec
+/// `completed_at` seul, cette ligne rendrait `NULL` à la comparaison et
+/// sortirait du résultat — c'est-à-dire que les morts au plafond, le cas de
+/// l'AC3, seraient invisibles.
+#[test]
+fn mika2698_un_vol_mort_sans_completed_at_est_vu_par_le_coalesce() {
+    let db = db();
+    let id = db
+        .create_task(&vol("mika", &issue_url(TICKET)))
+        .expect("le vol doit être créé");
+    // `update_task_status` est un écrivain de production, et il n'écrit *pas*
+    // `completed_at` : c'est par ce chemin que la colonne reste `NULL` sur un
+    // vol pourtant terminé.
+    db.update_task_status(&id, "failed")
+        .expect("le passage en failed doit réussir");
+
+    let vu = db
+        .list_finished_implement_flights("mika", None, &[issue_url(TICKET)])
+        .expect("la lecture doit répondre");
+    assert_eq!(vu.len(), 1, "le vol mort sans `completed_at` doit être vu");
+    assert_eq!(vu[0].id, id);
+    assert!(
+        vu[0].completed_at.is_none(),
+        "la fixture doit bien porter `completed_at = NULL`, sinon ce test ne \
+         pose pas sa question"
+    );
+
+    // Et la borne temporelle le voit aussi : c'est `updated_at` qui décide.
+    let bound = crate::timestamp::now_minus(chrono::Duration::hours(1));
+    assert_eq!(
+        lire(&db, Some(&bound)),
+        vec![id.clone()],
+        "borné à une heure, le vol mort reste dans la fenêtre"
+    );
+}
+
+/// La borne `since` exclut un vol plus ancien : « depuis le cycle précédent »
+/// est une borne, pas une décoration.
+#[test]
+fn mika2698_la_borne_since_exclut_un_vol_plus_ancien() {
+    let db = db();
+    let ancien = seed_vol_termine(&db, "mika", &issue_url(TICKET));
+    db.backdate_task_completed_at(&ancien, 7_200)
+        .expect("le recul doit réussir");
+    db.backdate_task_updated_at(&ancien, 7_200)
+        .expect("le recul doit réussir");
+    let recent = seed_vol_termine(&db, "mika", &issue_url(TICKET));
+
+    assert_eq!(
+        lire(&db, None).len(),
+        2,
+        "sans borne, les deux vols sont lus — « depuis toujours », pas un silence"
+    );
+
+    let bound = crate::timestamp::now_minus(chrono::Duration::hours(1));
+    assert_eq!(
+        lire(&db, Some(&bound)),
+        vec![recent],
+        "borné à une heure, le vol de deux heures est dehors"
+    );
+}
+
+/// Un vol encore en vol n'est pas un vol terminé. Le filtre tourne en Rust
+/// (`is_terminal_task_status`), donc ce test est aussi ce qui dit que la
+/// projection l'applique bien.
+#[test]
+fn mika2698_un_vol_non_terminal_est_exclu() {
+    for statut in ["pending", "in_progress", "blocked"] {
+        let db = db();
+        let id = db
+            .create_task(&vol("mika", &issue_url(TICKET)))
+            .expect("le vol doit être créé");
+        db.update_task_status(&id, statut)
+            .expect("le changement de statut doit réussir");
+        assert!(
+            lire(&db, None).is_empty(),
+            "statut {statut:?} : un vol non terminal a été lu comme terminé"
+        );
+    }
+}
+
+/// Un vol de **grooming** n'est pas un vol d'implémentation ; une classe
+/// absente l'est, par le `COALESCE(dispatch_class, 'implement')` qui porte tout
+/// l'historique d'avant la v34.
+#[test]
+fn mika2698_le_grooming_est_exclu_et_la_classe_absente_vaut_implement() {
+    let db = db();
+    let groom = db
+        .create_task(&groom_parent("mika", &issue_url(TICKET)))
+        .expect("le groom doit être créé");
+    db.update_task_completed(&groom, "mika", Some("Verdict: GROOMED"))
+        .expect("la complétion doit réussir");
+    assert!(
+        lire(&db, None).is_empty(),
+        "un vol de grooming n'est pas un vol d'implémentation"
+    );
+
+    let sans_classe = db
+        .create_task(&NewTask {
+            dispatch_class: None,
+            ..groom_parent("mika", &issue_url(TICKET))
+        })
+        .expect("le vol sans classe doit être créé");
+    db.update_task_completed(&sans_classe, "mika", Some("Outcome: PR_OPENED"))
+        .expect("la complétion doit réussir");
+    assert_eq!(
+        lire(&db, None),
+        vec![sans_classe],
+        "une classe absente vaut `implement` (lignes d'avant la v34)"
+    );
+}
+
+/// La lecture est cantonnée à l'agent : le manager d'un agent ne lit pas les
+/// vols d'un autre.
+#[test]
+fn mika2698_la_lecture_est_cantonnee_a_lagent() {
+    let db = db();
+    // `tasks.agent_id` est une FK vers `agents(id)` : l'autre agent doit
+    // exister pour que sa ligne existe.
+    db.register_agent("mika-qa", "Mika QA", "/tmp/qa")
+        .expect("l'autre agent doit être enregistré");
+    let autre = seed_vol_termine(&db, "mika-qa", &issue_url(TICKET));
+    assert!(
+        lire(&db, None).is_empty(),
+        "le vol de `mika-qa` a été lu sous `mika`"
+    );
+
+    // Contrôle positif sur la fixture.
+    let vu = db
+        .list_finished_implement_flights("mika-qa", None, &[issue_url(TICKET)])
+        .expect("la lecture doit répondre");
+    assert_eq!(vu.len(), 1);
+    assert_eq!(vu[0].id, autre);
+}
+
+/// **Le contrôle négatif du détecteur.** Aucune URL ne peut pas vouloir dire
+/// « tous les vols » : sans cette borne, un milestone sans sous-ticket ferait
+/// évaluer la table entière — et un `IN ()` vide n'est même pas du SQL valide.
+#[test]
+fn mika2698_aucune_url_ne_rend_jamais_tous_les_vols() {
+    let db = db();
+    seed_vol_termine(&db, "mika", &issue_url(TICKET));
+    seed_vol_termine(&db, "mika", &issue_url(VOISIN));
+
+    let vu = db
+        .list_finished_implement_flights("mika", None, &[])
+        .expect("la lecture doit répondre, pas échouer sur un `IN ()` vide");
+    assert!(vu.is_empty(), "aucune URL ⇒ aucun vol, jamais tous");
+}
+
+/// L'ordre est chronologique croissant sur la borne qui a sélectionné la ligne
+/// — donc un rapport qui lit les vols dans l'ordre où ils ont fini.
+#[test]
+fn mika2698_les_vols_sortent_dans_lordre_chronologique() {
+    let db = db();
+    let vieux = seed_vol_termine(&db, "mika", &issue_url(TICKET));
+    db.backdate_task_completed_at(&vieux, 3_600)
+        .expect("le recul doit réussir");
+    db.backdate_task_updated_at(&vieux, 3_600)
+        .expect("le recul doit réussir");
+    let neuf = seed_vol_termine(&db, "mika", &issue_url(TICKET));
+
+    assert_eq!(lire(&db, None), vec![vieux, neuf]);
+}

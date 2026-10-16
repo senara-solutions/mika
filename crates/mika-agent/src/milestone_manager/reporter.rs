@@ -37,6 +37,7 @@
 //! reintroduce it. Do NOT reorder these four write_* calls in `Reporter::report`
 //! without an explicit Prime override captured in a follow-up plan.
 
+use super::evaluator::{DeathCause, FlightIssue, FlightRecommendation, FlightVerdict};
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
 use super::reader::priority_from_labels;
@@ -211,6 +212,27 @@ impl Reporter {
             }
         }
         writeln!(out).unwrap();
+
+        // Vols terminés (mika#2698, vol 1). Placée juste après « Next action »
+        // parce que c'est là que l'opérateur compare : la recommandation du
+        // manager pour la suite, et son verdict sur ce qui vient de finir, se
+        // lisent ensemble. Même règle de silence que les deux sections
+        // conditionnelles en fin de rapport — pas de ligne « (none) »
+        // permanente, qui apprendrait au lecteur à sauter la section.
+        //
+        // MODE OMBRE : cette section est la seule destination du verdict. Rien
+        // ici n'écrit sur la forge.
+        if !assessment.flight_verdicts.is_empty() {
+            writeln!(
+                out,
+                "### Vols terminés depuis le cycle précédent (mode ombre — aucune écriture)"
+            )
+            .unwrap();
+            for v in &assessment.flight_verdicts {
+                let _ = writeln!(out, "{}", render_flight_verdict(v));
+            }
+            writeln!(out).unwrap();
+        }
 
         // Silent-progress / drift alerts.
         writeln!(out, "### Silent-progress / drift alerts").unwrap();
@@ -583,6 +605,70 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
     }
 }
 
+// ---- mika#2698 vol 1 — une ligne par vol terminé --------------------------
+
+/// Un verdict de vol en une ligne de liste Markdown.
+///
+/// Forme : `- #<ticket> — <issue> — <tours> — <recommandation>`. Chacun des
+/// quatre segments dit explicitement quand il ne sait pas, parce qu'un segment
+/// manquant décale la lecture et qu'un `0` par défaut mentirait.
+pub fn render_flight_verdict(v: &FlightVerdict) -> String {
+    let ticket = match v.issue_number {
+        Some(n) => format!("#{n}"),
+        None => "(ticket inconnu)".to_string(),
+    };
+    format!(
+        "- {ticket} — {issue} — {turns} — {reco}",
+        issue = flight_issue_label(&v.issue),
+        turns = flight_turns_label(v),
+        reco = flight_recommendation_label(v.recommendation),
+    )
+}
+
+fn flight_issue_label(issue: &FlightIssue) -> String {
+    let pr = |number: &Option<u64>| match number {
+        Some(n) => format!("#{n}"),
+        None => "numéro inconnu".to_string(),
+    };
+    match issue {
+        FlightIssue::PrOpened { number, .. } => format!("PR ouverte ({})", pr(number)),
+        FlightIssue::RescuePr { number, .. } => format!("PR de sauvetage ({})", pr(number)),
+        FlightIssue::Dead { cause } => match cause {
+            DeathCause::CeilingReached => "mort au plafond (budget_exhausted)".to_string(),
+            DeathCause::Refusal => "mort — refus (STRUCTURAL VIOLATION)".to_string(),
+            DeathCause::PipelineFailure => "mort — panne de pipeline".to_string(),
+            DeathCause::LauncherDead => "mort — lanceur mort".to_string(),
+            DeathCause::Escalated => "mort — escalade".to_string(),
+            // La famille non classée se lit telle que le producteur l'a écrite.
+            DeathCause::Unknown(family) => format!("mort — cause non classée ({family})"),
+        },
+    }
+}
+
+/// Les tours, et ce qu'on sait du plafond.
+///
+/// `(plafond non instrumenté)` est dit à voix haute quand le vol n'a pas heurté
+/// la borne : sans cette mention, « 83 tours » se lirait comme « 83 tours sur un
+/// plafond que le manager connaît », ce qui est faux au vol 1. Quand la halte
+/// `budget_exhausted` a eu lieu, la mention tombe — l'issue dit déjà que la
+/// borne a été atteinte.
+fn flight_turns_label(v: &FlightVerdict) -> String {
+    match (v.turns_used, v.hit_ceiling) {
+        (Some(n), true) => format!("{n} tours"),
+        (Some(n), false) => format!("{n} tours (plafond non instrumenté)"),
+        (None, true) => "tours non lus".to_string(),
+        (None, false) => "tours non lus (plafond non instrumenté)".to_string(),
+    }
+}
+
+fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
+    match r {
+        FlightRecommendation::MergeCandidate => "merge-candidat",
+        FlightRecommendation::ManualResumption => "reprise à la main",
+        FlightRecommendation::Regroom => "re-groom",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,7 +734,202 @@ mod tests {
             cross_cutting: vec![],
             contention_events: vec![],
             pool: None,
+            flight_verdicts: vec![],
         }
+    }
+
+    // -- mika#2698 vol 1 : la section « Vols terminés », en mode ombre --
+
+    fn verdict(
+        issue_number: Option<u64>,
+        issue: FlightIssue,
+        turns_used: Option<u32>,
+        hit_ceiling: bool,
+        recommendation: FlightRecommendation,
+    ) -> FlightVerdict {
+        FlightVerdict {
+            task_id: "task-x".into(),
+            issue_number,
+            issue,
+            turns_used,
+            hit_ceiling,
+            turn_ceiling: None,
+            last_commit_turn: None,
+            recommendation,
+            completed_at: Some("2026-10-13T08:00:00Z".into()),
+        }
+    }
+
+    fn report_with_verdicts(verdicts: Vec<FlightVerdict>) -> String {
+        let mut a = empty_assessment();
+        a.flight_verdicts = verdicts;
+        Reporter::new().report(&state_with(vec![], ProgressCounts::default()), &a)
+    }
+
+    /// Les trois issues de l'AC3, telles qu'elles se lisent dans le rapport.
+    #[test]
+    fn mika2698_la_section_rend_les_trois_issues() {
+        let out = report_with_verdicts(vec![
+            verdict(
+                Some(2693),
+                FlightIssue::PrOpened {
+                    number: Some(2696),
+                    url: None,
+                },
+                Some(83),
+                false,
+                FlightRecommendation::MergeCandidate,
+            ),
+            verdict(
+                Some(2661),
+                FlightIssue::Dead {
+                    cause: DeathCause::CeilingReached,
+                },
+                Some(200),
+                true,
+                FlightRecommendation::Regroom,
+            ),
+            verdict(
+                Some(2655),
+                FlightIssue::RescuePr {
+                    number: Some(2690),
+                    url: None,
+                },
+                Some(141),
+                false,
+                FlightRecommendation::ManualResumption,
+            ),
+        ]);
+        assert!(
+            out.contains(
+                "### Vols terminés depuis le cycle précédent (mode ombre — aucune écriture)"
+            ),
+            "le titre doit dire le mode ombre. Obtenu :\n{out}"
+        );
+        assert!(
+            out.contains(
+                "- #2693 — PR ouverte (#2696) — 83 tours (plafond non instrumenté) — merge-candidat"
+            ),
+            "Obtenu :\n{out}"
+        );
+        assert!(
+            out.contains("- #2661 — mort au plafond (budget_exhausted) — 200 tours — re-groom"),
+            "Obtenu :\n{out}"
+        );
+        assert!(
+            out.contains(
+                "- #2655 — PR de sauvetage (#2690) — 141 tours (plafond non instrumenté) — reprise à la main"
+            ),
+            "Obtenu :\n{out}"
+        );
+    }
+
+    /// Jumeau anti-vacuité, même raison que `Dispatch contention` : sans vol
+    /// terminé la section est **absente**, pas rendue avec une ligne « (none) ».
+    /// Et le rapport doit être identique à celui d'avant mika#2698 — c'est ce
+    /// qui rend la source non câblée sans effet observable.
+    #[test]
+    fn mika2698_la_section_est_absente_sans_vol_termine() {
+        let out = report_with_verdicts(vec![]);
+        assert!(
+            !out.contains("Vols terminés"),
+            "silence quand il n'y a rien à dire. Obtenu :\n{out}"
+        );
+    }
+
+    /// La section se lit juste après « Next action » : c'est là que l'opérateur
+    /// compare la recommandation de suite et le verdict de ce qui vient de finir.
+    #[test]
+    fn mika2698_la_section_se_lit_juste_apres_next_action() {
+        let out = report_with_verdicts(vec![verdict(
+            Some(2693),
+            FlightIssue::PrOpened {
+                number: Some(2696),
+                url: None,
+            },
+            Some(83),
+            false,
+            FlightRecommendation::MergeCandidate,
+        )]);
+        let next = out.find("### Next action").expect("Next action présent");
+        let vols = out.find("### Vols terminés").expect("section présente");
+        let drift = out.find("### Silent-progress").expect("dérive présente");
+        assert!(
+            next < vols && vols < drift,
+            "ordre attendu : Next action → Vols terminés → dérive. Obtenu :\n{out}"
+        );
+    }
+
+    /// Aucun segment ne se tait : un verdict dont tout manque dit que tout
+    /// manque, plutôt que de rendre une ligne décalée ou un `0` inventé.
+    #[test]
+    fn mika2698_une_donnee_absente_se_dit_au_lieu_de_se_deviner() {
+        let out = report_with_verdicts(vec![verdict(
+            None,
+            FlightIssue::Dead {
+                cause: DeathCause::Unknown("PLAN_COMMITTED".into()),
+            },
+            None,
+            false,
+            FlightRecommendation::ManualResumption,
+        )]);
+        assert!(
+            out.contains(
+                "- (ticket inconnu) — mort — cause non classée (PLAN_COMMITTED) — \
+                 tours non lus (plafond non instrumenté) — reprise à la main"
+            ),
+            "Obtenu :\n{out}"
+        );
+        assert!(
+            !out.contains("— 0 tours"),
+            "une mesure absente ne devient jamais zéro (motif mika#2331). Obtenu :\n{out}"
+        );
+    }
+
+    /// Les six causes de mort et les trois recommandations ont chacune leur
+    /// libellé : un `match` muet rendrait deux causes distinctes identiques à
+    /// l'écran.
+    #[test]
+    fn mika2698_chaque_cause_et_chaque_recommandation_a_son_libelle() {
+        let causes = [
+            (
+                DeathCause::CeilingReached,
+                "mort au plafond (budget_exhausted)",
+            ),
+            (DeathCause::Refusal, "mort — refus (STRUCTURAL VIOLATION)"),
+            (DeathCause::PipelineFailure, "mort — panne de pipeline"),
+            (DeathCause::LauncherDead, "mort — lanceur mort"),
+            (DeathCause::Escalated, "mort — escalade"),
+            (
+                DeathCause::Unknown("zorglub".into()),
+                "mort — cause non classée (zorglub)",
+            ),
+        ];
+        for (cause, expected) in causes {
+            assert_eq!(flight_issue_label(&FlightIssue::Dead { cause }), expected);
+        }
+        let recos = [
+            (FlightRecommendation::MergeCandidate, "merge-candidat"),
+            (FlightRecommendation::ManualResumption, "reprise à la main"),
+            (FlightRecommendation::Regroom, "re-groom"),
+        ];
+        for (r, expected) in recos {
+            assert_eq!(flight_recommendation_label(r), expected);
+        }
+        assert_eq!(
+            flight_issue_label(&FlightIssue::PrOpened {
+                number: None,
+                url: None
+            }),
+            "PR ouverte (numéro inconnu)"
+        );
+        assert_eq!(
+            flight_issue_label(&FlightIssue::RescuePr {
+                number: None,
+                url: None
+            }),
+            "PR de sauvetage (numéro inconnu)"
+        );
     }
 
     // -- mika#1948 AC6: the Dispatch contention section --
