@@ -23,7 +23,7 @@ le substrat de mika#2713 (29 commentaires et un label sur un ticket **fermé**).
 Ce vol ajoute **un lecteur devant un canal déjà attesté**. Il ne construit pas le
 canal.
 
-## 2. Ce que la lecture du code — et une mesure — imposent au corps du ticket
+## 2. Ce que la lecture du code — et trois mesures — imposent au corps du ticket
 
 Le point 1 du ticket prescrit deux formes de lecture : « `Bearer <valeur>` sur
 `api.github.com` (`gh`) et `Basic <base64>` **décodé** sur `github.com` (`git`
@@ -42,23 +42,55 @@ fichier pointé est écrit **from scratch** par `_stage_pilot_gitconfig`
 later cannot drift into the sandbox » (l.1698-1700). La sandbox n'a ni `~/.ssh`,
 ni `GIT_ASKPASS` utilisable.
 
-Mesuré plutôt que supposé, contre un serveur local qui journalise les en-têtes et
-répond `401` avec un challenge `Basic` — la configuration exacte de la sandbox
-(`GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0`) :
+Mesuré plutôt que supposé, **au grooming** (2026-10-16) contre un serveur HTTP
+local qui journalise chaque en-tête reçu et répond `401` avec un challenge
+`WWW-Authenticate: Basic` — le challenge est la moitié qui compte : s'il existait
+une source de credential, `git` retenterait avec un `Authorization`. La
+configuration est celle de la sandbox, reproduite octet pour octet depuis
+`_stage_pilot_gitconfig` (`GIT_CONFIG_GLOBAL` = un `[url]` + un `[user]` et rien
+d'autre, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `HOME` neuf,
+`GH_*` / `GIT_ASKPASS` / `GIT_CONFIG_COUNT` retirés de l'environnement) :
 
 ```
-GET /…/info/refs?service=git-upload-pack
-  Host / User-Agent / Accept / Accept-Encoding / Accept-Language / Pragma / Git-Protocol
----
-GET /…/info/refs?service=git-upload-pack        ← la RETENTATIVE après le 401
-  Host / User-Agent / Accept / Accept-Encoding / Accept-Language / Pragma / Git-Protocol
----
-fatal: Authentication failed
+requests observed: 1
+  [1] /senara-solutions/mika.git/info/refs?service=git-upload-pack
+      header names: Accept, Accept-Encoding, Accept-Language,
+                    Git-Protocol, Host, Pragma, User-Agent
+      AUTHORIZATION PRESENT: False
+git exit=128
+fatal: could not read Username for 'http://127.0.0.1:…': terminal prompts disabled
 ```
 
-**Aucun `Authorization`, ni au premier coup ni après le challenge.** Un 401 ne
-sauve donc rien non plus : il n'y a aucun credential à présenter. Ce que l'addon
-réécrit aujourd'hui sur `github.com`, c'est une requête **nue**.
+**Aucun `Authorization` — et pas même une retentative.** Le résultat est plus
+net que « git ne présente rien » : au challenge `Basic`, `git` n'a aucune source
+à interroger, donc il abandonne sur `could not read Username` au lieu de
+réémettre. Une **seule** requête, nue. Un 401 renvoyé par l'addon ne sauverait
+donc rien non plus : il n'y a aucun second coup à attendre.
+
+**La méthode, pour que la mesure soit refaisable et non crue** : un
+`http.server` sur `127.0.0.1:0` qui log `dict(self.headers)` et répond 401 avec
+le challenge, puis un `git ls-remote` vers lui sous l'environnement ci-dessus.
+≈ 60 lignes de Python jetable. L'implémenteur n'a pas à la refaire ; il doit
+seulement ne pas la contredire sans la refaire.
+
+**Et la condition sous laquelle elle tient — à écrire, pas à taire.** La sandbox
+lit une seconde configuration que `_stage_pilot_gitconfig` ne contrôle pas :
+`$PARENT_GIT/config` est `--ro-bind` et git lit le config **du dépôt** à
+précédence **plus haute** que `GIT_CONFIG_GLOBAL`. `dispatch-lib.sh:1124-1130` le
+dit déjà en toutes lettres, et ajoute pourquoi le dire ainsi :
+
+> Today this repository's config carries none — checked, not assumed — […]
+> Stating the boundary precisely matters more than stating it flatteringly: the
+> flattering version of this comment is what let mika#2141 read as a decision
+> for a month.
+
+Vérifié au grooming à son tour : ni `credential.*`, ni `http.*.extraHeader`, ni
+`core.askPass` dans le config du dépôt parent ni dans celui du worktree. La
+propriété du § 2.1 est donc **vraie et conditionnée** : un `credential.helper`
+ajouté un jour au config du dépôt la retournerait. Le cas 8 du § 3.4 est ce qui
+la tient — il asserte que `github.com` n'est jamais refusé *quel que soit* le
+credential présenté, donc il reste vert même le jour où `git` se met à en
+présenter un.
 
 Conséquence directe : exiger la sentinelle sur `github.com` rend **403 tous les
 `git push` / `git fetch` de tous les pilotes**, dès le `make deploy`. C'est mot
@@ -102,10 +134,19 @@ présenter.
 
 **Rectification à porter dans la note de solution du vol 1.** La table des canaux
 de `docs/solutions/dev-loop/une-sentinelle-voyage-dans-le-canal-que-lincident-ecrase-2026-10-15.md`
-porte, sur la ligne retenue, la case « posé par `git` ? **oui, déjà** ». Elle est
-fausse — § 2.1. La corriger est un livrable de ce vol (§ 6, commit 4) : laissée
-telle quelle, elle rouvrirait la question à l'identique au prochain passage, ce
-que cette note existe précisément pour empêcher.
+porte, sur la ligne retenue (**l.59**, canal « le credential lui-même
+(`GH_TOKEN`) »), la case « posé par `git` ? **oui, déjà** ». Elle est fausse —
+§ 2.1 : `git` ne lit pas `GH_TOKEN` et ne présente rien. Ce qui voyage sur
+`github.com`, c'est le `Basic` que l'**addon** fabrique depuis le jeton de
+l'hôte (`_auth_header_for`, l.118) — posé par le proxy, jamais par le client.
+
+La corriger est un livrable de ce vol (§ 6, commit 4), et la correction porte la
+distinction plutôt que juste la case : « posé par `git` ? **non** — l'addon
+injecte un `Basic` côté proxy, donc aucun justificatif ne peut voyager dans ce
+canal sur `github.com` ». Laissée telle quelle, elle rouvrirait la question à
+l'identique au prochain passage, ce que cette note existe précisément pour
+empêcher — et elle le ferait avec le pire des résultats, puisque c'est la case
+qui ferait croire qu'exiger la sentinelle sur `github.com` est sans danger.
 
 ### 2.4 Ce qui reste ouvert, nommé plutôt que tu
 
@@ -145,11 +186,30 @@ schéma insensible à la casse** :
 | `Basic <b64>` | base64-décodé, puis **la partie après le premier `:`** | `curl -u`, une lib HTTP |
 
 Le schéma `token` n'est pas un confort : **le supposer absent est exactement
-l'erreur qui 403'rait tous les appels `gh`.** L'implémenteur **mesure** ce que le
-`gh` installé émet réellement — contre `lib-fake-egress-relay.sh` ou un serveur
-local — et le consigne dans le corps de PR. Accepter les trois schémas rend la
-mesure non bloquante, mais ne dispense pas de la faire : si `gh` émettait un
-quatrième schéma, le vol tuerait la boucle au premier dispatch.
+l'erreur qui 403'rait tous les appels `gh`.** Et ce n'est plus une hypothèse —
+mesuré au grooming sur le binaire **réellement installé** (`/usr/bin/gh`,
+43 Mo) :
+
+```
+$ grep -ao -E "(token|Bearer) %s" /usr/bin/gh | sort | uniq -c
+      1 Bearer %s
+      2 token %s
+```
+
+Les **deux** formats de header vivent dans le binaire, et `token %s` y est deux
+fois. Un lecteur qui n'accepterait que `Bearer` parierait donc contre le format
+le mieux représenté dans le client dont dépend toute la boucle.
+
+**Ce que cette mesure établit, et ce qu'elle n'établit pas.** Elle établit que
+les deux schémas sont des chemins vivants du client, donc qu'accepter les deux
+n'est pas défensif mais nécessaire. Elle n'établit **pas** lequel part sur le fil
+pour un appel donné : une chaîne de format n'est pas une capture. La confirmation
+sur le fil reste au DoD — elle est à faire une fois dans la session
+d'implémentation, où `gh` est invocable (il ne l'est pas sous la politique de la
+sandbox de grooming, qui refuse l'exec de `gh`). Mais elle n'est plus la seule
+défense : accepter les trois schémas fait que la mesure *confirme* au lieu de
+*décider*. Si `gh` émettait un quatrième schéma, le cas 2 de la suite CI
+rougirait avant le merge plutôt que le premier dispatch après.
 
 Un `Basic` mal formé (base64 invalide, UTF-8 invalide, pas de `:`) rend `None` —
 jamais une exception, jamais un `allow`. `Proxy-Authorization` est lu avec la
@@ -444,9 +504,16 @@ Chaque commit laisse l'arbre vert. Le plancher est le **commit 2**.
    `test-pilot-github-token-not-in-sandbox.sh`.
 4. `docs` — le § opérateur de mika#2716 (les trois motifs, la purge, le rollback
    des deux côtés, la halte réécrite), **la rectification de la case `git` de la
-   table de la note de solution** (§ 2.3), et la note du schéma `token` mesuré.
+   table de la note de solution** (l.59, § 2.3), et la capture du schéma émis par
+   `gh` ajoutée à la note : le grooming a établi que les deux formats vivent dans
+   le binaire (§ 3.1), le commit consigne lequel part sur le fil.
 
 Le ticket de suivi du § 2.4 est ouvert **avant** la PR et nommé dans son corps.
+
+**Une seule mesure est prérequise au commit 1**, et c'est la seule chose à faire
+avant d'écrire du code : la capture du schéma `gh` sur le fil (DoD). Les deux
+autres mesures du plan — `git` ne présente rien (§ 2.1), les deux formats vivent
+dans le binaire (§ 3.1) — sont **acquises au grooming** et ne sont pas à refaire.
 
 ## 7. Definition of Done
 
@@ -456,8 +523,13 @@ Le ticket de suivi du § 2.4 est ouvert **avant** la PR et nommé dans son corps
 - [ ] `api.github.com` : `Bearer`, `token` et `Basic` décodé d'une sentinelle
       enregistrée passent tous les trois, et l'`Authorization` sortant est celui
       de l'hôte.
-- [ ] Le schéma réellement émis par `gh` est **mesuré** et consigné dans le corps
-      de PR, pas supposé.
+- [ ] Le schéma émis par `gh` est **confirmé sur le fil** une fois (le grooming a
+      déjà établi que `token %s` et `Bearer %s` vivent tous deux dans le binaire,
+      § 3.1) et consigné dans le corps de PR. Si la capture révèle un schéma
+      qu'aucune des trois branches ne couvre, l'implémentation **s'arrête et
+      remonte** : c'est le seul fait capable de 403 toute la boucle.
+- [ ] `github.com` n'est refusé **quel que soit** le credential présenté — le
+      cas 8 ne suppose pas la mesure du § 2.1, il la rend inutile au garde.
 - [ ] La comparaison passe par `hmac.compare_digest`, jamais par `==`, et jamais
       par un lookup de la valeur présentée comme nom de fichier.
 - [ ] `github.com` est **inchangé** : aucun credential exigé, aucun 403 nouveau,
@@ -536,7 +608,7 @@ liste et que le ticket ne pouvait pas connaître.
 | # | risque | traitement |
 |---|---|---|
 | R1 | **Un bug d'injection 403 tous les appels légitimes et la boucle s'arrête sans diagnostic.** Le risque nommé par le ticket parent, et le seul qui puisse arrêter la boucle. | Quatre couches, indépendantes. (1) La coupure est bornée à `api.github.com` — `git push` ne peut pas être 403 (§ 2.3, AC8). (2) Le cas 1 et le cas 8 sont des positifs en CI : un addon qui refuse tout rougit **avant** le merge. (3) La sonde 1 du canari rougit après `make deploy`, sur une ligne, pas par un silence. (4) `MIKA_PILOT_EGRESS_SENTINEL=0` désarme des deux côtés, sans redéploiement. |
-| R2 | **`gh` n'émet pas `Bearer`.** Un lecteur qui n'accepte que `Bearer` 403 **tous** les appels `gh` — R1 par omission plutôt que par bug. | Trois schémas acceptés (`Bearer`, `token`, `Basic`), et le schéma réellement émis **mesuré** avant merge et consigné dans la PR (§ 3.1, DoD). Le cas 2 l'épingle. |
+| R2 | **`gh` n'émet pas `Bearer`.** Un lecteur qui n'accepte que `Bearer` 403 **tous** les appels `gh` — R1 par omission plutôt que par bug. | **Mesuré au grooming, plus supposé** : le binaire installé porte `token %s` (×2) *et* `Bearer %s` (×1) — § 3.1. Trois schémas acceptés, donc les deux chemins vivants du client passent. Le cas 2 l'épingle en CI. La capture sur le fil reste au DoD, mais elle confirme désormais au lieu de décider. |
 | R3 | **Registre illisible côté addon.** Refuser arrête la boucle ; autoriser annule le ticket. | **Refuser**, avec un motif propre, et rendre le refus survivable : le placeholder nu est accepté **par forme, sans lire le registre**, donc le rollback ne dépend pas du référentiel en panne (§ 3.2, AC6, AC9). C'est la décision que le ticket demande de poser explicitement. |
 | R4 | **La purge refuse un pilote vif.** Une entrée purgée sous un pilote long produit un `sentinel-unknown` qui ressemble à l'incident qu'on garde. | TTL à 72 h et non 24 ; purge **avant** le calcul de la liste rendue, jamais après un verdict ; entrées de 0 octet, donc le TTL généreux ne coûte rien. Cas 9. Et le motif `sentinel-unknown` nomme dans son corps la purge comme cause possible, pour que le remède soit lisible. |
 | R5 | **Un `cargo test` qui pose `GH_TOKEN=proxy-managed-no-secret` passe.** Le placeholder nu étant accepté par forme, un test qui tombe exactement sur cette valeur est autorisé. | Assumé, et c'est le prix du rollback complet exigé par le point 6. La valeur est publique et documentée depuis mika#2572 ; mais la signature mesurée de mika#2713 est `GH_TOKEN="fake-token"`, pas le placeholder. Fermer ce cas demanderait de retirer le rollback, ce que le ticket interdit explicitement. |
