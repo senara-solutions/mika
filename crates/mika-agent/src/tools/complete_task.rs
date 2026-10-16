@@ -607,7 +607,10 @@ mod tests {
         let ctx = harness.ctx();
 
         let output = CompleteTaskTool
-            .execute(serde_json::json!({"id": task_id, "result": "cleared"}), &ctx)
+            .execute(
+                serde_json::json!({"id": task_id, "result": "cleared"}),
+                &ctx,
+            )
             .await
             .unwrap();
 
