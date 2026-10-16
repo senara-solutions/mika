@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# measure-webhook-turn-cost — ce que coûtent les tours webhook, en une commande
+# (mika#2680, vol 2). Remplace les trois tuyaux de la sonde AC5, dont l'un lisait
+# `$MIKA_LOG_FILE`, variable qui n'existe nulle part dans ce dépôt. Le protocole
+# de la mesure et la halte qui refuse de conclure vivent dans
+# `docs/eval/mika-2680/README.md` ; cet en-tête ne garde que ce qui défend le
+# code adjacent (décision 7 du plan).
+#
+# CORPUS — `$MIKA_SPIRIT_LOG_FILE` (ou `--log-file`), jamais la base. La moitié
+# « payé » du registre n'écrit aucune ligne d'audit — choix délibéré du vol 1 —
+# et `turn_usage` est dégaté là où `llm_calls` dépend de `MIKA_STORE_LLM_CALLS`.
+#
+# TROIS ÉVÉNEMENTS, UN SEUL PASSAGE — le journal se mesure en gigaoctets :
+# `grep -F` narrow, `jq -R` ligne à ligne (une ligne non-JSON ne doit pas
+# emporter la mesure), projection TSV, agrégation séparée.
+#
+#   webhook_turn_charged{request_id, agent_id, trigger, text_touched,
+#                        candidate?, prefilter_enabled}   le tour a eu lieu
+#   webhook_prefilter_skipped{class, target, request_id}  le tour a été écarté
+#   turn_usage{trace_id, input_tokens, cache_read_tokens} ce qu'il a coûté
+#
+# JOINTURE — `webhook_turn_charged.request_id == turn_usage.trace_id` : deux
+# noms, une seule valeur (`req.request_id`). `input_tokens` et
+# `cache_read_tokens` sont des nombres NUS sur le fil, pas des Debug `?`-sigil
+# comme `response_chars` chez `measure-empty-turns` : rien à décoder ici.
+#
+# L'UNITÉ EST LE TOUR, LA VALEUR EST UNE SOMME. `emit_turn_usage` écrit une
+# ligne PAR ÉTAPE, plus une ligne de continuation (`step = u32::MAX`). Prendre
+# une ligne par tour sous-compterait d'un facteur égal au nombre d'étapes, et le
+# plus fort sur les tours les plus chers — ceux que la mesure poursuit.
+#
+# ABSENT N'EST NI ZÉRO NI "none" (motif mika#2331). `candidate` sort `null`
+# quand le champ était absent de la ligne ; un tour payé dont aucun `turn_usage`
+# ne porte le `trace_id` sort `input_tokens: null`, jamais `0`.
+#
+# LE CHAMP `target` DE L'ÉVÉNEMENT ÉCARTÉ est éclipsé par le `target` de
+# métadonnée de `tracing` : `flatten_event(true)` met les deux à la racine de la
+# ligne. Le lecteur ne le lit pas — la moitié écarts se compte par `class`.
+#
+# ÉPOQUE DU CHAMP — `field_epoch` est l'horodatage du plus ancien
+# `webhook_turn_charged` du CORPUS, levé AVANT `--since`, `--until` et
+# `--agent` : c'est une propriété du binaire déployé, pas de la fenêtre qu'on
+# lui demande. Levé après, il vaudrait toujours au moins `--since`, et un
+# drapeau qui ne sait dire que « oui » ne mesure rien. Quand la borne basse le
+# précède (`--since` absent compris : la fenêtre est alors ouverte vers le
+# passé), l'agrégat porte `window_precedes_field_epoch: true` et le seau des
+# `turn_usage` sans ligne payée est rendu `unattributed_undetermined` au lieu
+# d'`unattributed` : là, « pas de ligne payée » ne distingue pas un tour
+# Telegram d'un binaire antérieur au champ.
+#
+# DEUX CODES DE SORTIE — `exit 0` : le corpus a été lu ; zéro tour payé est un
+# RÉSULTAT. `exit 2` : rien n'a été mesuré (pas de fichier, illisible, `jq`
+# absent, borne mal formée, aucune ligne `webhook_turn_charged`, `--agent` sans
+# appariement). `unparseable_lines` NE CONJUGUE PAS cette décision : une seule
+# ligne illisible — quasi certaine sur un journal de 19 Go — rendrait sinon
+# `exit 2` inatteignable, et un scan inerte en silence se lirait exactement
+# comme un scan qui n'a rien trouvé (mika#2205).
+#
+# USAGE — bornes : `YYYY-MM-DD` (journée UTC entière) ou `YYYY-MM-DDTHH:MM:SSZ`.
+#   measure-webhook-turn-cost [--log-file F] [--agent A] [--since B] [--until B]
+#                             [--out turns.jsonl] [--summary summary.json]
+
+set -uo pipefail
+
+LOG_FILE="${MIKA_SPIRIT_LOG_FILE:-}"
+AGENT=""
+SINCE=""
+UNTIL=""
+OUT_FILE=""
+SUMMARY_FILE=""
+
+# La forme exacte de `scripts/pr-origin-report.sh::_norm_instant`, délibérément :
+# une fenêtre qui n'est pas celle qu'on a demandée est un mensonge d'instrument,
+# et deux lecteurs du dépôt qui refusent différemment sont deux règles à tenir.
+_norm_instant() {
+    local v="$1" bound="$2" out
+    case "$v" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+            if [ "$bound" = "until" ]; then out="${v}T23:59:59Z"; else out="${v}T00:00:00Z"; fi ;;
+        *) out="$v" ;;
+    esac
+    case "$out" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+        *)
+            printf "measure-webhook-turn-cost: --%s '%s' n'est ni YYYY-MM-DD ni un instant ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ). Refusé plutôt que de rendre une fenêtre qui n'est peut-être pas celle demandée — rien mesuré.\n" \
+                "$bound" "$v" >&2
+            return 2 ;;
+    esac
+    printf '%s' "$out"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --log-file) LOG_FILE="${2:-}"; shift 2 ;;
+        --agent)    AGENT="${2:-}"; shift 2 ;;
+        --since)    SINCE="$(_norm_instant "${2:-}" since)" || exit 2; shift 2 ;;
+        --until)    UNTIL="$(_norm_instant "${2:-}" until)" || exit 2; shift 2 ;;
+        --out)      OUT_FILE="${2:-}"; shift 2 ;;
+        --summary)  SUMMARY_FILE="${2:-}"; shift 2 ;;
+        -h|--help)  sed -n '2,61p' "$0"; exit 0 ;;
+        *) printf 'measure-webhook-turn-cost: argument inconnu : %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "$LOG_FILE" ]]; then
+    printf 'measure-webhook-turn-cost: aucun journal — passer --log-file ou définir MIKA_SPIRIT_LOG_FILE ; rien mesuré\n' >&2
+    exit 2
+fi
+if [[ ! -f "$LOG_FILE" || ! -r "$LOG_FILE" ]]; then
+    printf 'measure-webhook-turn-cost: fichier illisible : %s — rien mesuré\n' "$LOG_FILE" >&2
+    exit 2
+fi
+if ! command -v jq >/dev/null 2>&1; then
+    printf 'measure-webhook-turn-cost: jq est requis — rien mesuré\n' >&2
+    exit 2
+fi
+
+WORK="$(mktemp -d)" || exit 2
+trap 'rm -rf "$WORK"' EXIT
+
+: >"$WORK/charged"
+: >"$WORK/skipped"
+: >"$WORK/usage"
+: >"$WORK/epoch"
+: >"$WORK/unparseable"
+
+# -- le passage en flux --------------------------------------------------------
+#
+# L'ordre des bras est porteur : « pas un objet » se décide AVANT le filtre de
+# fenêtre et AVANT le filtre `--agent`, parce qu'une ligne illisible n'a ni
+# horodatage ni agent à qui l'attribuer. La comparaison de fenêtre est
+# lexicographique — le champ `timestamp` est ISO-8601 UTC à largeur fixe, donc
+# son ordre alphabétique EST son ordre chronologique. Une ligne sans horodatage
+# tombe hors d'une fenêtre bornée : le repli va vers le non-mesuré, jamais vers
+# l'attribué.
+
+grep -F -e 'webhook_turn_charged' -e 'webhook_prefilter_skipped' -e 'turn_usage' \
+    "$LOG_FILE" 2>/dev/null \
+    | jq -R -r --arg agent "$AGENT" --arg since "$SINCE" --arg until "$UNTIL" '
+        # `//` rend son alternative sur `false` autant que sur `null` : lu par
+        # `($o.text_touched? // null)`, un `false` du fil ressortirait ABSENT.
+        # Les deux champs booléens du registre sont précisément ceux dont le
+        # `false` porte la mesure (texte intact, interrupteur désarmé), donc la
+        # présence se demande à `has`, jamais à `//`.
+        def field($o; $n): (if ($o | has($n)) then $o[$n] else null end);
+
+        (try fromjson catch null) as $o
+        | if ($o | type) != "object" then "X"
+          else
+            (($o.event? // "") | tostring) as $ev
+            | ($o.timestamp? // null) as $ts
+            | if ($ev != "webhook_turn_charged"
+                  and $ev != "webhook_prefilter_skipped"
+                  and $ev != "turn_usage")                      then empty
+              else
+                # L époque du champ se lève AVANT la fenêtre et AVANT `--agent`.
+                # Calculée sur les seules lignes retenues, elle vaudrait toujours
+                # au moins `--since`, donc `window_precedes_field_epoch` serait
+                # vrai à chaque appel borné et `unattributed` inatteignable : un
+                # drapeau qui ne sait dire que « oui » ne mesure rien.
+                (if $ev == "webhook_turn_charged" and ($ts | type) == "string"
+                 then ("E\t" + $ts) else empty end),
+                (if   ($since != "" and (($ts // "") < $since))    then empty
+                 elif ($until != "" and (($ts // "") > $until))    then empty
+                 elif ($agent != "" and (($o.agent_id? // "") != $agent)) then empty
+                 elif $ev == "webhook_turn_charged" then
+                   ("C\t" + ({
+                       request_id:        field($o; "request_id"),
+                       agent_id:          field($o; "agent_id"),
+                       trigger:           field($o; "trigger"),
+                       text_touched:      field($o; "text_touched"),
+                       candidate:         field($o; "candidate"),
+                       prefilter_enabled: field($o; "prefilter_enabled"),
+                       timestamp:         $ts
+                     } | tojson))
+                 elif $ev == "webhook_prefilter_skipped" then
+                   ("S\t" + ({
+                       class:      field($o; "class"),
+                       request_id: field($o; "request_id"),
+                       agent_id:   field($o; "agent_id"),
+                       timestamp:  $ts
+                     } | tojson))
+                 else
+                   ("U\t" + ({
+                       trace_id:          field($o; "trace_id"),
+                       agent_id:          field($o; "agent_id"),
+                       input_tokens:      field($o; "input_tokens"),
+                       cache_read_tokens: field($o; "cache_read_tokens"),
+                       timestamp:         $ts
+                     } | tojson))
+                 end)
+              end
+          end
+      ' 2>/dev/null \
+    | awk -F'\t' -v C="$WORK/charged" -v S="$WORK/skipped" -v E="$WORK/epoch" \
+                 -v U="$WORK/usage" -v X="$WORK/unparseable" '
+        $1 == "X" { print "1" > X; next }
+        $1 == "E" { print $2 > E; next }
+        $1 == "C" { sub(/^C\t/, ""); print > C; next }
+        $1 == "S" { sub(/^S\t/, ""); print > S; next }
+        $1 == "U" { sub(/^U\t/, ""); print > U; next }
+      '
+
+CHARGED_LINES="$(grep -c . "$WORK/charged" 2>/dev/null || true)"
+CHARGED_LINES="${CHARGED_LINES:-0}"
+UNPARSEABLE="$(grep -c . "$WORK/unparseable" 2>/dev/null || true)"
+UNPARSEABLE="${UNPARSEABLE:-0}"
+
+# Le plus ancien `webhook_turn_charged` du CORPUS, bornes et `--agent` exclus :
+# l'époque est une propriété du binaire déployé, pas de la fenêtre qu'on lui
+# demande ni de l'agent qu'on regarde. Tri lexicographique en `LC_ALL=C` — le
+# champ est ISO-8601 UTC à largeur fixe, son ordre alphabétique EST son ordre
+# chronologique.
+FIELD_EPOCH="$(LC_ALL=C sort "$WORK/epoch" 2>/dev/null | head -n 1 || true)"
+
+# « Rien mesuré » se décide sur la présence d'une ligne `webhook_turn_charged`
+# SEULE. Le compte d'illisibles ride sur l'agrégat ; il n'entre pas dans cette
+# conjonction (voir l'en-tête).
+if [[ "$CHARGED_LINES" -eq 0 ]]; then
+    if [[ -n "$AGENT" ]]; then
+        printf 'measure-webhook-turn-cost: aucune ligne `webhook_turn_charged` pour %s dans %s (%s ligne(s) illisible(s)) — rien mesuré\n' \
+            "$AGENT" "$LOG_FILE" "$UNPARSEABLE" >&2
+    else
+        printf 'measure-webhook-turn-cost: aucune ligne `webhook_turn_charged` dans %s (%s ligne(s) illisible(s)) — rien mesuré\n' \
+            "$LOG_FILE" "$UNPARSEABLE" >&2
+    fi
+    exit 2
+fi
+
+# -- agrégation ----------------------------------------------------------------
+#
+# Slurpée, délibérément : ce que les trois fichiers portent est déjà borné par
+# `grep -F`, par la fenêtre et par `--agent`, trois ordres de grandeur sous le
+# journal dont ils sortent. `--slurpfile` rend `[]` sur un fichier vide, donc
+# chacune des trois moitiés peut manquer sans emporter les deux autres.
+
+aggregate() {
+    jq -n \
+        --arg logfile "$LOG_FILE" \
+        --arg agent "$AGENT" \
+        --arg since "$SINCE" \
+        --arg until "$UNTIL" \
+        --arg epoch "$FIELD_EPOCH" \
+        --argjson unparseable "$UNPARSEABLE" \
+        --slurpfile charged "$WORK/charged" \
+        --slurpfile skipped "$WORK/skipped" \
+        --slurpfile usage   "$WORK/usage" '
+
+    # Un champ absent ou non numérique ne contribue pas : il n est pas zéro, il
+    # n est pas mesuré. `add` sur une liste vide rend null, d où le repli.
+    def sum_num(f): ((map(f | select(type == "number")) | add) // 0);
+
+      ($charged | map(select((.request_id // "") != "")))                as $paid_lines
+    | (if $epoch == "" then null else $epoch end)                        as $field_epoch
+    | (($since == "") or ($field_epoch == null) or ($since < $field_epoch))
+                                                                         as $precedes
+    | ($usage
+       | map(select((.trace_id // "") != ""))
+       | group_by(.trace_id)
+       | map({ key:   .[0].trace_id,
+               value: { input_tokens:      sum_num(.input_tokens),
+                        cache_read_tokens: sum_num(.cache_read_tokens),
+                        llm_calls:         length } })
+       | from_entries)                                                   as $by_trace
+    | ($paid_lines
+       | group_by(.request_id)
+       | map(
+           .[0]                                     as $c
+         | ($by_trace[$c.request_id] // null)       as $u
+         | { request_id:        $c.request_id,
+             timestamp:         $c.timestamp,
+             agent_id:          $c.agent_id,
+             trigger:           $c.trigger,
+             text_touched:      $c.text_touched,
+             candidate:         $c.candidate,
+             prefilter_enabled: $c.prefilter_enabled,
+             input_tokens:      (if $u == null then null else $u.input_tokens end),
+             cache_read_tokens: (if $u == null then null else $u.cache_read_tokens end),
+             llm_calls:         (if $u == null then 0    else $u.llm_calls end) })
+       | sort_by(.timestamp // "9999-99-99"))                            as $turns
+    | ($turns | map(.request_id))                                        as $paid_ids
+    | ($by_trace | to_entries
+                 | map(.key as $k
+                       | select(($paid_ids | index($k)) == null)))       as $orphans
+    | { turns:             ($orphans | length),
+        input_tokens:      ($orphans | sum_num(.value.input_tokens)),
+        cache_read_tokens: ($orphans | sum_num(.value.cache_read_tokens)),
+        llm_calls:         ($orphans | sum_num(.value.llm_calls)),
+        trace_ids:         ($orphans | map(.key) | sort) }               as $bucket
+    | { turns: $turns,
+        summary:
+          ({ log_file:                    $logfile,
+             agent_filter:                (if $agent == "" then null else $agent end),
+             since:                       (if $since == "" then null else $since end),
+             until:                       (if $until == "" then null else $until end),
+             field_epoch:                 $field_epoch,
+             window_precedes_field_epoch: $precedes,
+             charged_lines:               ($charged | length),
+             skipped_lines:               ($skipped | length),
+             usage_lines:                 ($usage   | length),
+             unparseable_lines:           $unparseable,
+             paid_turns:                  ($turns | length),
+             paid_turns_without_usage:    ($turns | map(select(.input_tokens == null)) | length),
+             totals: { input_tokens:      ($turns | sum_num(.input_tokens)),
+                       cache_read_tokens: ($turns | sum_num(.cache_read_tokens)),
+                       llm_calls:         ($turns | sum_num(.llm_calls)) },
+             by_agent_trigger:
+               ($turns
+                | group_by([(.agent_id // "null"), (.trigger // "null")])
+                | map({ agent_id:          .[0].agent_id,
+                        trigger:           .[0].trigger,
+                        turns:             length,
+                        input_tokens:      sum_num(.input_tokens),
+                        cache_read_tokens: sum_num(.cache_read_tokens),
+                        llm_calls:         sum_num(.llm_calls) })
+                | sort_by(- .input_tokens)),
+             skipped_by_class:
+               ($skipped | group_by(.class // "null")
+                         | map({ key: (.[0].class // "null"), value: length })
+                         | from_entries) }
+           # Le seau change de NOM, pas de place : un lecteur qui cherche
+           # `unattributed` sur une fenêtre indéterminée ne doit pas trouver un
+           # chiffre qui ne veut pas dire ce qu il croit.
+           + { (if $precedes then "unattributed_undetermined" else "unattributed" end):
+                 $bucket }) }
+    '
+}
+
+RESULT="$(aggregate)" || {
+    printf 'measure-webhook-turn-cost: agrégation en échec — rien mesuré\n' >&2
+    exit 2
+}
+
+emit_turns()   { printf '%s' "$RESULT" | jq -c '.turns[]'; }
+emit_summary() { printf '%s' "$RESULT" | jq '.summary'; }
+
+if [[ -n "$OUT_FILE" ]]; then emit_turns >"$OUT_FILE"; else emit_turns; fi
+if [[ -n "$SUMMARY_FILE" ]]; then emit_summary >"$SUMMARY_FILE"; else emit_summary >&2; fi

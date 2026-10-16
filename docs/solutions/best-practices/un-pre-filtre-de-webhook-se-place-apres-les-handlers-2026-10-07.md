@@ -291,27 +291,25 @@ manque.
 
 ### La sonde des tours payés
 
-```sql
--- Ce que coûte chaque classe d'événement qui a gardé son tour.
--- `trigger` et `candidate` se lisent sur la ligne webhook_turn_charged
--- des journaux ; cette requête en est la moitié coût.
-SELECT l.agent_id, count(DISTINCT l.trace_id) AS tours, sum(l.input_tokens)
-  FROM llm_calls l
- WHERE l.created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-18 hours')
- GROUP BY 1 ORDER BY 3 DESC;
-```
-
 ```bash
-# La moitié taxonomie : un tour payé par ligne, avec sa classe.
-grep webhook_turn_charged "$MIKA_LOG_FILE" \
-  | jq -r '[.trigger, .text_touched, (.candidate // "-"), .prefilter_enabled] | @tsv' \
-  | sort | uniq -c | sort -rn
+# Une commande, les deux moitiés (mika#2680 vol 2).
+scripts/measure-webhook-turn-cost --since 2026-10-16T13:01:00Z --until <fin>
 ```
 
-**Les deux moitiés de la sonde AC5 se lisent ensemble.** Côté écarts, la requête
-de la phase 1 (`webhook_prefilter_skipped` groupée par classe) ; côté payés, les
-deux ci-dessus. La somme des deux est la population des événements webhook, et
-c'est la première fois qu'elle est close.
+`by_agent_trigger` est la moitié coût (tours × `input_tokens`, par agent ×
+déclencheur) et `skipped_by_class` la moitié écarts. La somme des deux est la
+population des événements webhook, et c'est la première fois qu'elle est close.
+
+**Cette sonde a remplacé trois tuyaux disjoints, et l'un d'eux était inerte.**
+Il lisait le journal sous un nom de variable amputé de son `SPIRIT_`, qui
+n'existe nulle part dans ce dépôt. `grep` sur une chaîne vide lit l'entrée
+standard, donc la sonde attendait indéfiniment ou rendait zéro ligne, et « zéro
+tour payé » se lisait comme un résultat. Deux des trois autres défauts qu'elle
+portait sont du même ordre : la moitié coût interrogeait `llm_calls`, dégaté par
+`MIKA_STORE_LLM_CALLS` là où `turn_usage` ne l'est pas, et le `//` de jq rend son
+alternative sur `false` autant que sur `null`, donc chaque `text_touched: false`
+— la valeur qui porte la mesure — ressortait absent. Le protocole complet,
+la fenêtre et la halte : `docs/eval/mika-2680/README.md`.
 
 **Halte.** `webhook_turn_charged` absent de tous les journaux alors que des
 `turn_usage` de canal `github` existent : **établir le déploiement avant de
