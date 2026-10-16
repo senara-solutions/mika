@@ -14,7 +14,7 @@ use crate::db::NewTask;
 use crate::task_state::Task;
 
 use super::cron::next_fire_for_recurring;
-use super::dispatcher::TaskDispatcher;
+use super::dispatcher::{TaskDispatcher, is_routable_trigger, routable_triggers_csv};
 use super::liveness::EngineHeartbeat;
 use super::pilot_transcript;
 use super::queue::QueuedTask;
@@ -793,6 +793,18 @@ pub struct TaskEngine {
     /// minute for ever. Once per process is enough: the condition is a setting,
     /// not an event.
     activity_not_recorded_warned: AtomicBool,
+    /// Task IDs already warned about as non-routable here (mika#2351, AC3).
+    ///
+    /// A recurrence the CLI engine declines to claim comes back on **every**
+    /// tick — that is the point: the row stays intact for the daemon. One WARN
+    /// per tick would be one per second for a `* * * * * *` cron, which is how
+    /// a readable signal becomes a log nobody greps. Once per `task_id` per
+    /// process, like [`Self::activity_not_recorded_warned`]: the condition is a
+    /// binary-version mismatch, not an event.
+    ///
+    /// A plain `HashSet` rather than a `Mutex`: every reader goes through
+    /// `&mut self` ([`Self::fire_task`]), so there is nothing to lock.
+    not_routable_warned: HashSet<String>,
 }
 
 impl TaskEngine {
@@ -809,6 +821,7 @@ impl TaskEngine {
             heartbeat: EngineHeartbeat::new(),
             started_at: std::time::Instant::now(),
             activity_not_recorded_warned: AtomicBool::new(false),
+            not_routable_warned: HashSet::new(),
         }
     }
 
@@ -4977,6 +4990,72 @@ impl TaskEngine {
         Some(task)
     }
 
+    /// Should this engine leave the task alone because it cannot route it
+    /// (mika#2351, AC1)?
+    ///
+    /// Only ever true on the **CLI** engine (`cli_mode: true`), which is the
+    /// secondary one: a `mika chat` TUI runs a full `TaskEngine` over the shared
+    /// DB (`mika-cli/src/commands/chat.rs`), and `claim_and_fire_task` is atomic
+    /// on `(id, agent_id, status IN ('pending','recurring_active'))`. The two
+    /// engines therefore race on every tick of every recurrence of the agent,
+    /// and whoever claims first fires. When a TUI older than the arm it lacks
+    /// won that race, it hit the catch-all and moved the row to `failed` — twice
+    /// in September 2026 (`fb425f89`, `9bc130d0`). The daemon, which is the
+    /// canonical engine, keeps the mika#2337 behavior: a trigger it cannot route
+    /// dies there, named, audited and stamped, so a genuine typo still fails
+    /// loudly instead of waiting in silence.
+    ///
+    /// Same shape as the mika#264 callback site: the CLI engine already leaves
+    /// undelivered callbacks to the consumer that owns them.
+    ///
+    /// **Skips only on positive proof of non-routability.** A failed re-read, an
+    /// unparsable `action_config`, an absent or non-string `trigger`, a
+    /// `skill_name` form — every one of those falls through to the existing
+    /// path. Guessing in the other direction would convert a readable death into
+    /// a recurrence that silently never runs, which is strictly worse: nothing
+    /// names it.
+    ///
+    /// The re-read is needed because [`QueuedTask`] carries `action_type` but not
+    /// `action_config` — the heap holds a schedule, not a payload.
+    async fn is_not_routable_here(&mut self, queued: &QueuedTask) -> bool {
+        if !self.dispatcher.cli_mode || queued.action_type != action_type::RUN_SKILL {
+            return false;
+        }
+
+        let Ok(Some(task)) = self.db.get_task(&queued.task_id).await else {
+            return false;
+        };
+        let Ok(config) = serde_json::from_str::<serde_json::Value>(&task.action_config) else {
+            return false;
+        };
+        // The `skill_name` form resolves through the skill registry, not through
+        // the trigger `match`. Out of scope for mika#2351, and its own question.
+        if config["skill_name"].as_str().is_some() {
+            return false;
+        }
+        let Some(trigger) = config["trigger"].as_str() else {
+            return false;
+        };
+        if is_routable_trigger(trigger) {
+            return false;
+        }
+
+        // AC3 — once per `task_id` per process. The row stays due, so it comes
+        // back on every tick; the condition being reported is a binary-version
+        // mismatch, which does not change between two ticks.
+        if self.not_routable_warned.insert(task.id.clone()) {
+            warn!(
+                event = "task_trigger_not_routable_here",
+                task_id = %task.id,
+                label = %task.label,
+                trigger = %trigger,
+                routable_triggers = %routable_triggers_csv(),
+                "this binary cannot route that trigger — leaving the task to the daemon, not claiming it"
+            );
+        }
+        true
+    }
+
     /// Mark the task `in_progress` in DB, then spawn a task to dispatch it.
     ///
     /// Dispatch runs in a spawned task so the engine lock is released immediately.
@@ -4984,6 +5063,15 @@ impl TaskEngine {
     /// 300s without blocking the tick loop.
     async fn fire_task(&mut self, queued: QueuedTask) {
         let task_id = queued.task_id.clone();
+
+        // mika#2351 — the CLI engine declines what it cannot route, **before**
+        // claiming it. Deliberately ahead of `claim_and_fire_task`: the claim is
+        // the irreversible step, since it stamps `fired_at` and moves the row out
+        // of `recurring_active`, and a row the daemon still owns must come out of
+        // this tick untouched.
+        if self.is_not_routable_here(&queued).await {
+            return;
+        }
 
         // Atomically claim the task and record fired_at in one DB round-trip
         match self.db.claim_and_fire_task(&task_id).await {
@@ -6356,6 +6444,168 @@ mod tests {
                 .unwrap(),
             0,
             "population CLI sans conduite associée : rien n'est instrumenté"
+        );
+    }
+
+    // -- capture tracing (même forme que `teams::engine::tests::capture`) --
+
+    struct CapturingLayer(
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    );
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V<'a>(&'a mut std::collections::HashMap<String, String>);
+            impl tracing::field::Visit for V<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+            }
+            let mut fields = std::collections::HashMap::new();
+            event.record(&mut V(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn capture_warns() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        (guard, events)
+    }
+
+    /// Les seules lignes de la classe mika#2351, filtrées sur leur champ `event`
+    /// — jamais sur le niveau ni sur le message, qu'un voisin pourrait partager.
+    #[allow(clippy::type_complexity)]
+    fn not_routable_events(
+        events: &std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    ) -> Vec<std::collections::HashMap<String, String>> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| {
+                f.get("event").map(String::as_str) == Some("task_trigger_not_routable_here")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// mika#2351 / AC3 — le WARN du saut est émis **une fois par `task_id` et
+    /// par processus**, pas une fois par tick.
+    ///
+    /// La ligne sautée reste due, par construction : c'est tout le propos du
+    /// correctif, elle attend le démon. Elle repasse donc par `fire_task` à
+    /// chaque tick, et sur un cron à la seconde cela ferait un WARN par seconde
+    /// pour une condition qui, elle, ne change pas — un décalage de version de
+    /// binaire.
+    ///
+    /// **La mesure est le nombre d'émissions, pas la taille du set.** Une
+    /// première version de ce test comptait `not_routable_warned.len()` après
+    /// deux passes : un `HashSet` vaut 1 dans les deux cas, donc l'assertion
+    /// était verte avec *et sans* la garde. Le set reste assuré ici — il est
+    /// l'instrument de la dédup — mais ce qui tranche est la capture `tracing`.
+    /// Vu rouge en retirant la garde `insert` : 2 émissions au lieu d'1.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2351_le_warn_du_saut_nest_emis_quune_fois_par_tache() {
+        let (_guard, events) = capture_warns();
+        let db = test_db();
+        let task_id = db
+            .create_task(NewTask {
+                action_type: "run_skill".to_string(),
+                action_config: r#"{"trigger":"zorglub"}"#.to_string(),
+                ..make_recurring_task("zorglub_scan", Some("* * * * * *"))
+            })
+            .await
+            .unwrap();
+        // L'état d'une récurrente due en production. `claim_and_fire_task`
+        // accepte `IN ('pending','recurring_active')`, donc les deux étaient
+        // réclamables : c'est bien le saut qui retient, pas le statut.
+        db.update_task_status(&task_id, "recurring_active")
+            .await
+            .unwrap();
+
+        let dispatcher = test_dispatcher_with(db.clone(), |_| {});
+        let dispatcher = Arc::new(TaskDispatcher {
+            cli_mode: true,
+            ..Arc::try_unwrap(dispatcher).ok().expect("un seul détenteur")
+        });
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let queued = QueuedTask {
+            task_id: task_id.clone(),
+            next_fire_at: crate::timestamp::now(),
+            trigger_type: "recurring".to_string(),
+            action_type: "run_skill".to_string(),
+            cron_expr: Some("* * * * * *".to_string()),
+        };
+
+        engine.fire_task(queued.clone()).await;
+        let after_first = not_routable_events(&events);
+        assert_eq!(
+            after_first.len(),
+            1,
+            "la première rencontre doit être dite — un saut muet rendrait une \
+             récurrence qui ne tourne jamais sans que rien ne le nomme"
+        );
+        // AC3 — les trois champs que le ticket exige nommément, plus l'inventaire
+        // qui donne la lecture « décalage de version » sans sortir de la ligne.
+        let fields = &after_first[0];
+        assert_eq!(
+            fields.get("task_id").map(String::as_str),
+            Some(&task_id[..])
+        );
+        assert_eq!(
+            fields.get("label").map(String::as_str),
+            Some("zorglub_scan")
+        );
+        assert_eq!(fields.get("trigger").map(String::as_str), Some("zorglub"));
+        assert_eq!(
+            fields.get("routable_triggers").map(String::as_str),
+            Some(&routable_triggers_csv()[..]),
+            "l'inventaire émis doit être celui de ce binaire"
+        );
+
+        engine.fire_task(queued).await;
+        assert_eq!(
+            not_routable_events(&events).len(),
+            1,
+            "la seconde passe sur la **même** tâche ne doit rien émettre : la \
+             condition est un décalage de version de binaire, pas un événement, \
+             et elle ne change pas entre deux ticks"
+        );
+        assert_eq!(
+            engine.not_routable_warned.len(),
+            1,
+            "le set est l'instrument de la dédup : une entrée pour la tâche vue"
+        );
+
+        // La ligne est restée intacte, sinon la seconde passe aurait mesuré un
+        // chemin différent du premier (AC1, redit ici au niveau unitaire).
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "recurring_active");
+        assert!(
+            task.fired_at.is_none(),
+            "aucune des deux passes n'a réclamé"
         );
     }
 

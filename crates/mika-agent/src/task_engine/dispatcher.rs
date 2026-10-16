@@ -120,8 +120,17 @@ pub struct BinaryAttribution {
     /// Quel processus a refusé.
     pub process_id: u32,
     /// `mika-spirit` ou `mika` — sépare le démon d'un `mika chat` qui tire les
-    /// mêmes lignes récurrentes de la même base (son `TaskEngine` est complet, et
-    /// `cli_mode` ne court-circuite jamais le dispatch `run_skill`).
+    /// mêmes lignes récurrentes de la même base (son `TaskEngine` est complet).
+    ///
+    /// **Depuis mika#2351, ce champ ne vaut plus `mika` sur cette ligne.** Le
+    /// moteur `cli_mode` teste la routabilité **avant** `claim_and_fire_task`
+    /// (`engine.rs::is_not_routable_here`) : un trigger qu'il ne sait pas router
+    /// n'est pas réclamé, donc il ne meurt pas là et n'émet pas cette ligne. Un
+    /// `process_name: "mika"` ici atteste désormais un binaire **antérieur** à ce
+    /// correctif — ce qui en fait, pour cette classe, une lecture plus forte
+    /// qu'avant et non plus faible. La phrase précédente (« `cli_mode` ne
+    /// court-circuite jamais le dispatch `run_skill` ») décrivait l'arbre
+    /// d'avant ; elle est fausse aujourd'hui.
     pub process_name: String,
     /// L'inventaire **de ce binaire**, à comparer au trigger refusé.
     pub routable_triggers: String,
