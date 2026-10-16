@@ -239,6 +239,98 @@ fn pr_review_calls(calls: &[Value]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Capture de journal (mika#2732) — même forme que
+// `test_context_scope_observability_2305.rs`
+// ---------------------------------------------------------------------------
+
+type Captured = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
+struct CapturingLayer {
+    events: Captured,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = HashMap::new();
+        let mut visitor = FieldVisitor(&mut fields);
+        event.record(&mut visitor);
+        let message = fields.remove("message").unwrap_or_default();
+        if let Ok(mut events) = self.events.lock() {
+            events.push((message, fields));
+        }
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+/// Un dispatcher gardé vivant pour tout le binaire de test, afin que le nôtre ne
+/// soit jamais le seul.
+///
+/// `tracing-core` bascule en mode « un seul dispatcher » dès qu'un unique
+/// dispatcher scopé est vivant ; dans ce mode un callsite enregistré pour la
+/// première fois calcule son intérêt depuis le défaut du **thread qui
+/// l'enregistre**. Le callsite de `qa_turn_ended_without_review` est frappé par
+/// les tours des autres tests de ce binaire, la plupart sur d'autres threads
+/// sans souscripteur : celui qui y arrive le premier pendant que notre capture
+/// est le seul dispatcher met en cache `Interest::never` pour tout le monde, et
+/// ce thread-ci ne voit alors plus rien. Un second dispatcher vivant maintient
+/// le registre en mode multi-dispatcher, où l'intérêt est dérivé de tous les
+/// dispatchers vivants et tranché par événement (mika#2646).
+fn keep_registry_multi_dispatcher() {
+    static KEEPER: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEPER.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
+fn capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+    use tracing_subscriber::layer::SubscriberExt;
+    keep_registry_multi_dispatcher();
+    let events: Captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(CapturingLayer {
+        events: Arc::clone(&events),
+    });
+    // Enregistrer notre dispatcher reconstruit tous les intérêts mis en cache
+    // contre les dispatchers vivants, ce qui efface un `never` caché avant nous.
+    let guard = tracing::subscriber::set_default(subscriber);
+    (guard, events)
+}
+
+/// Les lignes `qa_turn_ended_without_review` vues depuis le début de la capture.
+fn turn_ended_lines(events: &Captured) -> Vec<HashMap<String, String>> {
+    let captured = events.lock().expect("capture mutex");
+    captured
+        .iter()
+        .filter(|(_, f)| {
+            f.get("event").map(String::as_str)
+                == Some(mika_agent::qa_review_submission::TURN_ENDED_WITHOUT_REVIEW_EVENT)
+        })
+        .map(|(_, f)| f.clone())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // AC3a — le test nommé par le ticket
 // ---------------------------------------------------------------------------
 
@@ -390,10 +482,18 @@ async fn ac3b_un_tour_qui_poste_sa_revue_nest_pas_re_prompte() {
 /// tour doit **sortir**, pas boucler — le budget `intent_guard_retries` est à un
 /// coup, et un tour de revue qui bouclerait brûlerait les 20 pas du loop sur un
 /// défaut que la garde ne peut pas corriger seule. C'est la population que AC2
-/// (`qa_turn_ended_without_review`) rendra visible à l'opérateur ; AC2 est
-/// suivie à part, le complémentaire qui l'armera existe déjà
-/// (`qa_review_submission::submission_unmet_after_retry`).
+/// (`qa_turn_ended_without_review`) rend visible à l'opérateur, épinglée plus
+/// bas par `mika2732_…` ; le complémentaire qui l'arme est
+/// `qa_review_submission::submission_unmet_after_retry`.
+///
+/// `#[serial]` : ce tour frappe le **même callsite** que le test de capture
+/// mika#2732. Sans la sérialisation, ce test-ci peut enregistrer le callsite
+/// depuis un thread sans souscripteur pendant que la capture est le seul
+/// dispatcher vivant, et y cacher `Interest::never` pour tout le binaire — la
+/// capture voit alors zéro ligne, par intermittence (mika#2646). Le voisin doit
+/// porter l'attribut autant que le captureur : un seul des deux ne suffit pas.
 #[tokio::test]
+#[serial_test::serial]
 async fn ac1_le_re_prompt_est_a_un_coup_la_garde_ne_boucle_pas() {
     let (tools, gh_calls) = tools_with_recording_run_gh();
     let harness = EvalHarness::builder()
@@ -434,5 +534,117 @@ async fn ac1_le_re_prompt_est_a_un_coup_la_garde_ne_boucle_pas() {
         injections(&requests[3]),
         1,
         "une seule injection, même sur un tour qui ne se corrige pas"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC2 (mika#2732) — le tour muet le dit, le tour sain se tait
+// ---------------------------------------------------------------------------
+
+/// Les deux séquences voisines, **sous une seule capture**, parce que c'est la
+/// paire qui est le livrable.
+///
+/// Tour A est celui d'`ac1_…` : le re-prompt échoue aussi, rien n'est posté. Il
+/// doit produire la ligne. Tour B est celui d'`ac3b_…` : la revue est postée, à
+/// un argument près du précédent. Il ne doit rien produire. Un test qui
+/// n'asserterait que la présence passerait sur un `warn!` inconditionnel —
+/// c'est-à-dire sur un instrument qui crie à chaque tour de revue et qu'un
+/// opérateur apprend en une semaine à ne plus lire (motif mika#2272).
+///
+/// Le compte est **exactement un** sur les deux tours réunis, et les valeurs
+/// `repo`/`pr` sont assertées, pas seulement la présence des champs : c'est le
+/// contrôle de non-vacuité demandé par l'AC2.4(c) du ticket, porté ici par le
+/// couple dépôt/numéro puisque la tête part en vol 2.
+///
+/// **Pas de champ de tête, et c'est la décision D1/D2 du plan.** Le fil ne porte
+/// que la branche ; l'émettre s'appelle `branch` et demande d'étendre l'unique
+/// lecteur et ses trois appelants. Un champ `head` portant une branche se relit
+/// comme un SHA manquant (motif mika#2331), donc rien plutôt que faux : ce test
+/// n'asserte **pas** l'absence d'un champ futur, il n'en nomme aucun.
+///
+/// `#[serial]` : voir `ac1_…`, qui le porte pour la même raison (mika#2646).
+#[tokio::test]
+#[serial_test::serial]
+async fn mika2732_un_tour_de_revue_muet_emet_sa_ligne_et_le_tour_sain_non() {
+    let (_guard, events) = capture();
+
+    // --- Tour A : le re-prompt échoue aussi (séquence d'`ac1_…`). ---
+    let (tools_a, gh_a) = tools_with_recording_run_gh();
+    let harness_a = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("qa_pr_view", json!({"pr": 2704})),
+            tool_call_response(
+                "run_gh",
+                json!({"command": ["pr", "list", "--head", HEAD, "--json", "number"]}),
+            ),
+            text_response("Revue terminée : tout est vert.\n\nVERDICT: pass"),
+            text_response("Comme je le disais, VERDICT: pass"),
+        ])
+        .tools(tools_a)
+        .skills(qa_registry())
+        .build()
+        .await
+        .unwrap();
+    harness_a.run(&pr_synchronize_event()).await.unwrap();
+    assert_eq!(
+        pr_review_calls(&gh_a.lock().unwrap()),
+        0,
+        "le tour A doit vraiment ne rien soumettre, sinon il ne prouve rien"
+    );
+
+    let after_a = turn_ended_lines(&events);
+    assert_eq!(
+        after_a.len(),
+        1,
+        "le tour muet doit émettre exactement une ligne ; vu {after_a:?}"
+    );
+    let ligne = &after_a[0];
+    assert_eq!(
+        ligne.get("repo").map(String::as_str),
+        Some("senara-solutions/mika"),
+        "le dépôt vient du lecteur unique et doit porter sa valeur : {ligne:?}"
+    );
+    assert_eq!(
+        ligne.get("pr").map(String::as_str),
+        Some("2704"),
+        "le numéro de PR est la clé par laquelle l'opérateur retrouve le tour : {ligne:?}"
+    );
+    for champ in ["trace_id", "agent_id"] {
+        assert!(
+            ligne.get(champ).is_some_and(|v| !v.is_empty()),
+            "`{champ}` doit être renseigné — c'est par là qu'on rejoint la trace : {ligne:?}"
+        );
+    }
+
+    // --- Tour B : la revue est postée (séquence d'`ac3b_…`). ---
+    let (tools_b, gh_b) = tools_with_recording_run_gh();
+    let harness_b = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("qa_pr_view", json!({"pr": 2704})),
+            tool_call_response(
+                "run_gh",
+                json!({"command": ["pr", "review", "2704", "--approve", "--body",
+                    "## PLAN-AC VERIFICATION\n…\n\nVERDICT: pass"]}),
+            ),
+            text_response("Revue soumise.\n\nVERDICT: pass"),
+        ])
+        .tools(tools_b)
+        .skills(qa_registry())
+        .build()
+        .await
+        .unwrap();
+    harness_b.run(&pr_synchronize_event()).await.unwrap();
+    assert_eq!(
+        pr_review_calls(&gh_b.lock().unwrap()),
+        1,
+        "le tour B doit vraiment poster sa revue, sinon le contrôle négatif est vide"
+    );
+
+    let after_b = turn_ended_lines(&events);
+    assert_eq!(
+        after_b.len(),
+        1,
+        "le tour sain n'ajoute rien : toujours une seule ligne sur les deux tours ; \
+         vu {after_b:?}"
     );
 }

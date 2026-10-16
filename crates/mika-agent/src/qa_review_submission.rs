@@ -47,6 +47,8 @@
 
 use std::collections::HashSet;
 
+use tracing::warn;
+
 use crate::qa_build_callback::{self, BUILD_MIKA_TOOL, QA_REVIEW_SKILL};
 use crate::tool_execution::ToolCallSummary;
 
@@ -145,8 +147,8 @@ pub fn review_submission_satisfied(summaries: &[ToolCallSummary]) -> bool {
 /// **Complémentaire exact** de la garde : même conjonction, le terme de budget
 /// inversé. Là où la garde re-prompte (budget non consommé), ceci dit que le
 /// re-prompt a échoué **aussi** — la population de l'AC2 du ticket
-/// (`qa_turn_ended_without_review`), dont l'émetteur part en vol 2 parce que le
-/// SHA de tête n'est sur aucun fil (cf. `docs/plans/2026-10-16-001-…`, D6).
+/// (`qa_turn_ended_without_review`), dont l'émetteur est
+/// [`emit_turn_ended_without_review`] (mika#2732).
 ///
 /// Livré ici, et pas avec son consommateur, pour la raison que porte déjà
 /// [`crate::qa_build_callback::verdict_unmet_after_retry`] : le site « budget
@@ -161,6 +163,111 @@ pub fn submission_unmet_after_retry(
     summaries: &[ToolCallSummary],
 ) -> bool {
     due && retries.contains(REVIEW_SUBMISSION_LABEL) && !review_submission_satisfied(summaries)
+}
+
+/// Nom de l'événement opérateur (mika#2732, AC2.2).
+///
+/// Constante parce que trois lecteurs doivent citer la **même** chaîne :
+/// l'émetteur ci-dessous, la sonde du runbook (`grep` sur
+/// `~/.mika/logs/mika-spirit.log*`) et le test eval. Aucun recensement de noms
+/// d'événements n'existe dans ce crate ; la constante en tient lieu, à un site.
+pub const TURN_ENDED_WITHOUT_REVIEW_EVENT: &str = "qa_turn_ended_without_review";
+
+/// La décision d'émettre, **et** les champs de l'événement, à un seul site.
+///
+/// Rend `Some((repo, pr))` quand ce tour appartient à la population de
+/// [`submission_unmet_after_retry`] *et* que le message qui l'a ouvert est
+/// lisible par le lecteur unique de la grammaire de fil. `None` partout
+/// ailleurs.
+///
+/// Séparé de [`emit_turn_ended_without_review`] pour une raison de test : un
+/// émetteur qui rend `()` ne se teste qu'à travers une capture de log, donc le
+/// prédicat de population ne serait épinglé que par un test eval sériel. Ce
+/// découpage le rend assertable en test unitaire sans ouvrir un second site de
+/// la conjonction ni un second jeu de champs.
+fn turn_ended_without_review_fields<'a>(
+    due: bool,
+    retries: &HashSet<&'static str>,
+    summaries: &[ToolCallSummary],
+    user_input_text: &'a str,
+) -> Option<(&'a str, u64)> {
+    if !submission_unmet_after_retry(due, retries, summaries) {
+        return None;
+    }
+    // Pas de second extracteur de `[GitHub] PR …` : le lecteur unique
+    // (doctrine mika#2158), celui-là même dont `due` dérive par
+    // `is_review_triggering_event`. Les deux ne peuvent donc pas diverger sur
+    // ce qu'est un webhook de PR, et cette branche `None` est injoignable en
+    // pratique — la dire coûte moins cher que de poser une ligne sans PR.
+    let (_action, repo, pr) =
+        crate::server::webhook_queue_v2::parse_pr_action_event(user_input_text)?;
+    Some((repo, pr))
+}
+
+/// Un tour de revue a traversé la garde **et** son re-prompt sans rien
+/// soumettre : le dire, une fois, à l'opérateur (mika#2732, AC2.2).
+///
+/// Arme sur [`submission_unmet_after_retry`] — le complémentaire exact de la
+/// garde, et le **seul** site de cette conjonction. Hors population, rend `()`
+/// sans rien écrire. Une fonction et non trois `warn!` en ligne : les trois
+/// sorties EndTurn de `run_loop` veulent la même ligne, et trois copies d'un jeu
+/// de champs divergent aussi sûrement que trois copies d'une conjonction
+/// (leçon mika#2158).
+///
+/// # Les champs, et celui qui est absent
+///
+/// `repo` et `pr` sont lus par le **lecteur unique** de la grammaire de fil,
+/// [`crate::server::webhook_queue_v2::parse_pr_action_event`].
+///
+/// **Aucun champ de tête — pas vide, absent.** La tête part en vol 2
+/// (`Tracked in: senara-solutions/mika#2732`), et d'ici là un `branch = ""` ou
+/// un `branch = "unknown"` se relirait comme « la branche a été cherchée et
+/// n'existe pas », ce qui est faux : elle n'a pas été cherchée (motif
+/// mika#2331, *absent ≠ vide*). Quand elle arrivera, le champ s'appellera
+/// `branch` et **jamais** `head` : la gateway pose
+/// `[GitHub] PR {action}: {repo}#{number} — {title} (branch: {branch})`, donc
+/// la seule identité de tête sur le fil est la branche, et un champ nommé
+/// `head` qui contient une branche se relit comme un SHA manquant.
+///
+/// **Pas de requête `gh` pour obtenir le SHA**, et l'argument n'est pas le
+/// coût : une requête à l'instant de l'émission rend le head *maintenant*, pas
+/// celui que le tour a revu. L'incident fondateur de mika#2727 est précisément
+/// un déplacement de tête en cours de route (`4a216bf7` puis `3f2c3fa4`) : un
+/// SHA fraîchement requis nommerait une tête que le tour n'a jamais vue, avec
+/// l'allure d'une mesure (motif mika#2293). Si un SHA devient nécessaire, sa
+/// source correcte est ce que **le tour lui-même** a observé — la sortie de son
+/// `qa_pr_view`, ou le stamp `QA_REVIEW_PR_TARGET_KEY` de mika#2368.
+///
+/// # Où il est appelé, et où il ne l'est pas
+///
+/// Aux **trois** sorties EndTurn de `run_loop`, celles où le filet frère
+/// [`crate::qa_build_callback::verdict_unmet_after_retry`] est déjà posé. Les
+/// sorties **coupées** (deadline, plafond de pas) sont hors population et c'est
+/// une décision : AC2.2 nomme « un tour de revue dont le re-prompt a échoué »,
+/// et un tour coupé n'a jamais consommé ce re-prompt. Il est déjà couvert par
+/// `server::deadline_verdict` (mika#2276, mika#2289, mika#2515).
+pub fn emit_turn_ended_without_review(
+    due: bool,
+    retries: &HashSet<&'static str>,
+    summaries: &[ToolCallSummary],
+    user_input_text: &str,
+    trace_id: &str,
+    agent_id: &str,
+) {
+    let Some((repo, pr)) =
+        turn_ended_without_review_fields(due, retries, summaries, user_input_text)
+    else {
+        return;
+    };
+    warn!(
+        target: "mika::otel",
+        event = TURN_ENDED_WITHOUT_REVIEW_EVENT,
+        repo = %repo,
+        pr = pr,
+        trace_id = %trace_id,
+        agent_id = %agent_id,
+        "qa-review turn ended without a submitted review, after the re-prompt failed too"
+    );
 }
 
 /// Consigne du re-prompt : nomme l'outil, la ligne attendue, ce qui ne vaut pas
@@ -347,6 +454,63 @@ mod tests {
             true,
         )];
         assert!(!submission_unmet_after_retry(true, &retries, &posted));
+    }
+
+    #[test]
+    fn mika2732_lemetteur_ne_parle_que_de_sa_population_et_nomme_la_pr() {
+        let nothing: [ToolCallSummary; 0] = [];
+        let webhook = pr_event("synchronize");
+        let mut retries: HashSet<&'static str> = HashSet::new();
+
+        // Budget intact : c'est la garde qui re-prompte, pas l'émetteur.
+        assert_eq!(
+            turn_ended_without_review_fields(true, &retries, &nothing, &webhook),
+            None
+        );
+
+        retries.insert(REVIEW_SUBMISSION_LABEL);
+
+        // La population : le dépôt et la PR viennent du lecteur unique, et la
+        // valeur est assertée — pas seulement la présence d'un champ.
+        assert_eq!(
+            turn_ended_without_review_fields(true, &retries, &nothing, &webhook),
+            Some(("senara-solutions/mika", 2704))
+        );
+
+        // Hors population : pas un tour de revue.
+        assert_eq!(
+            turn_ended_without_review_fields(false, &retries, &nothing, &webhook),
+            None
+        );
+
+        // Revue finalement postée : le tour est sain, rien à dire.
+        let posted = [summary(
+            "run_gh",
+            r#"{"command":["pr","review","2704","--approve"]}"#,
+            true,
+        )];
+        assert_eq!(
+            turn_ended_without_review_fields(true, &retries, &posted, &webhook),
+            None
+        );
+
+        // Un `build_mika` lancé ouvre la réserve D3 : mika#2355 prend le relais
+        // sur le callback, donc pas de ligne ici non plus.
+        let dispatched = [summary(BUILD_MIKA_TOOL, r#"{"pr":2704}"#, true)];
+        assert_eq!(
+            turn_ended_without_review_fields(true, &retries, &dispatched, &webhook),
+            None
+        );
+    }
+
+    #[test]
+    fn mika2732_le_nom_de_levenement_est_celui_que_la_sonde_grep() {
+        // La sonde du runbook et le test eval citent cette chaîne littérale ;
+        // la renommer sans les suivre rendrait les deux muets en silence.
+        assert_eq!(
+            TURN_ENDED_WITHOUT_REVIEW_EVENT,
+            "qa_turn_ended_without_review"
+        );
     }
 
     #[test]

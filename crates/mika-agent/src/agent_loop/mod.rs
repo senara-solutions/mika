@@ -4295,6 +4295,18 @@ async fn run_loop(
                         flag.mark_unmet_after_retry();
                     }
 
+                    // mika#2732 — sortie 1/3 : le re-prompt de la garde
+                    // mika#2727 a échoué aussi, et le tour partirait en
+                    // silence. Le dire à l'opérateur.
+                    crate::qa_review_submission::emit_turn_ended_without_review(
+                        qa_review_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
                     apply_nudge_turn_end(tool_use_occurred);
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
@@ -4539,6 +4551,18 @@ async fn run_loop(
                         flag.mark_unmet_after_retry();
                     }
 
+                    // mika#2732 — sortie 2/3 : même ligne, même population. Un
+                    // EndTurn sec est la forme la plus probable d'un tour de
+                    // revue qui n'a rien soumis.
+                    crate::qa_review_submission::emit_turn_ended_without_review(
+                        qa_review_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
                     apply_nudge_turn_end(tool_use_occurred);
                     info!(step, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
@@ -4761,6 +4785,18 @@ async fn run_loop(
                     {
                         flag.mark_unmet_after_retry();
                     }
+
+                    // mika#2732 — sortie 3/3, sur la même population que le
+                    // bloc ci-dessus : un EndTurn forcé après un tour qui n'a
+                    // fait qu'outiller.
+                    crate::qa_review_submission::emit_turn_ended_without_review(
+                        qa_review_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
 
                     apply_nudge_turn_end(tool_use_occurred);
                     return Ok(LoopResult::Done {
