@@ -802,6 +802,9 @@ mod tests {
             progress: Default::default(),
             recent_activity: vec![],
             executor_healthy: None,
+            ready_pool: vec![],
+            outside_candidates: vec![],
+            outside_read_truncated: None,
         };
         assert_eq!(
             milestone_issue_urls(&state),

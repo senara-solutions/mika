@@ -11,6 +11,7 @@
 //! Silence threshold in JOURS drives the `AlertKind::Silence` alert (rule fires when
 //! `last_activity_at` is older than the threshold).
 
+use super::pool;
 use super::types::{
     Alert, AlertKind, Assessment, IssueState, MilestoneState, Recommendation, Severity, SubIssue,
 };
@@ -75,12 +76,31 @@ impl Assessor {
             // Phase 1 is read-only, so there is nothing to contend for yet.
             // Populated by the Phase 2 dispatch path (mika#1948).
             contention_events: Vec::new(),
+            // Le verdict du bassin `ready` (mika#2699 Phase 2 (a), vols 1 et 2).
+            // `assess_pool` reste pure : tout ce que l'assesseur fait ici est
+            // de lui passer les trois lectures et de poser le résultat. Toujours
+            // `Some` — un cycle qui arrive ici a lu le bassin, et `None` est
+            // réservé aux blobs antérieurs au champ.
+            pool: Some(pool::assess_pool(
+                &state.ready_pool,
+                &milestone_pool_candidates(state),
+                &state.outside_candidates,
+            )),
             // L'assesseur ne voit pas les vols : il ne lit que l'état du
             // milestone. Les verdicts sont posés par la cadence, qui tient la
             // `FlightSource` et la borne du cycle précédent (mika#2698).
             flight_verdicts: Vec::new(),
         }
     }
+}
+
+/// Les `sub_issues` du milestone cible, vues comme candidats au bassin.
+///
+/// Une projection et rien d'autre : la décision d'admission vit dans
+/// [`pool::assess_pool`], qui est pure. Elle est ici plutôt qu'au reader parce
+/// que `sub_issues` sert à tout le reste de l'assesseur sous sa forme complète.
+fn milestone_pool_candidates(state: &MilestoneState) -> Vec<pool::PoolCandidate> {
+    state.sub_issues.iter().map(Into::into).collect()
 }
 
 /// Detect blockers that point to a closed sub-issue in this same milestone —
@@ -313,6 +333,9 @@ mod tests {
                 subject: "#1801".into(),
             }],
             executor_healthy: None,
+            ready_pool: vec![],
+            outside_candidates: vec![],
+            outside_read_truncated: None,
         }
     }
 
@@ -633,5 +656,80 @@ mod tests {
         assert_eq!(a.severity, Severity::Attention);
         // Cross-cutting always empty in Phase 1.
         assert!(a.cross_cutting.is_empty());
+    }
+
+    /// Cas 14 (mika#2699) — l'assesseur passe les **trois** lectures à
+    /// `assess_pool` et pose le verdict, sans rien décider lui-même.
+    ///
+    /// Le fixture rend chaque oubli distinguable : le bassin contient un ticket
+    /// en vol (famine), le milestone un candidat groomé en p1, et le hors
+    /// milestone un candidat groomé en p1 lui aussi. Un assesseur qui aurait
+    /// oublié `state.ready_pool` donnerait une profondeur nulle ; un qui aurait
+    /// oublié `state.sub_issues` admettrait le seul candidat du dehors ; un qui
+    /// aurait oublié `state.outside_candidates` (le vol 1, littéralement)
+    /// admettrait le seul candidat du milestone. C'est pour ça que les trois
+    /// sont peuplées, et que les deux candidats partagent la même priorité :
+    /// seul le rang de provenance les sépare, donc l'ordre obtenu dit laquelle
+    /// des trois lectures a voyagé.
+    #[test]
+    fn mika2699_lassesseur_pose_le_verdict_du_bassin() {
+        let mut candidat = base_issue(1802);
+        candidat.plan_present = true;
+        candidat.priority_rank = Some(1);
+        let mut state = base_state(vec![candidat]);
+        state.ready_pool = vec![pool::ReadyTicket {
+            number: 2699,
+            labels: vec!["ready".into(), "dispatch:loop".into()],
+        }];
+        state.outside_candidates = vec![pool::PoolCandidate {
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(1),
+            plan_present: true,
+            labels: vec!["p1-important".into()],
+        }];
+
+        let a = Assessor::new(AssessorConfig {
+            silence_threshold_days: 90,
+        })
+        .assess(&state);
+
+        let verdict = a
+            .pool
+            .expect("un cycle qui a lu le bassin porte un verdict");
+        assert_eq!(
+            verdict.depth.ready_total, 1,
+            "le bassin lu est pris en compte"
+        );
+        assert_eq!(verdict.depth.in_flight, 1);
+        assert_eq!(verdict.band, pool::PoolBand::Starved);
+        assert_eq!(
+            verdict.admit,
+            vec![
+                pool::Admission {
+                    number: 1802,
+                    origin: pool::CandidateOrigin::Milestone,
+                },
+                pool::Admission {
+                    number: 1700,
+                    origin: pool::CandidateOrigin::Outside,
+                },
+            ],
+            "les deux ensembles sont candidats, le milestone d'abord à priorité égale"
+        );
+        // Et le verdict reste exactement ce que la fonction pure produit —
+        // l'assesseur n'ajoute ni ne retire rien.
+        assert_eq!(
+            verdict,
+            pool::assess_pool(
+                &state.ready_pool,
+                &state
+                    .sub_issues
+                    .iter()
+                    .map(pool::PoolCandidate::from)
+                    .collect::<Vec<_>>(),
+                &state.outside_candidates,
+            )
+        );
     }
 }

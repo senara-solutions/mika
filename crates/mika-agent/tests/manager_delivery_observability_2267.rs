@@ -150,6 +150,9 @@ fn base_state() -> MilestoneState {
             subject: "#1801".into(),
         }],
         executor_healthy: None,
+        ready_pool: vec![],
+        outside_candidates: vec![],
+        outside_read_truncated: None,
     }
 }
 

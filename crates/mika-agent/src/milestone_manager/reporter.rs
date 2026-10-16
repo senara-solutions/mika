@@ -38,6 +38,9 @@
 //! without an explicit Prime override captured in a follow-up plan.
 
 use super::evaluator::{DeathCause, FlightIssue, FlightRecommendation, FlightVerdict};
+use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
+use super::reader::OUTSIDE_READ_LIMIT;
+use super::reader::priority_from_labels;
 use super::types::{
     Alert, AlertKind, Assessment, CiState, IssueState, MilestoneState, Severity, SubIssue,
 };
@@ -307,8 +310,138 @@ impl Reporter {
             }
         }
 
+        // Bassin `ready` (mika#2699 Phase 2 (a) vol 1). Conditionnelle comme
+        // ses deux voisines, mais pour une autre raison : ici `None` veut dire
+        // « le bassin n'a pas été lu » (blob antérieur au champ), et une section
+        // qui s'afficherait quand même mentirait sur une mesure qui n'a pas eu
+        // lieu. Lue, elle s'affiche toujours — y compris en bande nominale, où
+        // la profondeur est précisément ce que l'opérateur vient vérifier.
+        //
+        // « mode ombre » est dans le TITRE, pas en note de bas de page : la
+        // ligne « À admettre » se lit comme un geste fait si rien ne dit le
+        // contraire au moment où l'œil tombe dessus.
+        if let Some(pool) = &assessment.pool {
+            writeln!(out).unwrap();
+            writeln!(out, "### Bassin ready (mode ombre — aucune écriture)").unwrap();
+            let _ = writeln!(
+                out,
+                "- Profondeur : {} ready, {} en vol, {} disponible — {} (cible {}–{})",
+                pool.depth.ready_total,
+                pool.depth.in_flight,
+                pool.depth.available,
+                band_label(&pool.band),
+                POOL_MIN,
+                POOL_MAX,
+            );
+            if !pool.admit.is_empty() {
+                let admit = pool
+                    .admit
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "#{}{}",
+                            a.number,
+                            candidate_suffix(state, a.number, a.origin)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "- À admettre : {admit}");
+            }
+            // Chaque refus est **nommé**, avec son motif (mika#2699 vol 2,
+            // point 2 du ticket). Le vol 1 rendait « Écartés : 1 candidat sans
+            // plan groomé » : l'opérateur apprenait qu'un filtre avait eu lieu
+            // sans apprendre sur quoi agir, alors que le geste correctif porte
+            // sur *ce* ticket-là. Un refus par ligne, parce qu'une énumération
+            // sur une seule ligne cesse d'être lisible dès le troisième.
+            for r in &pool.refusals {
+                let _ = writeln!(
+                    out,
+                    "- Refusé : #{}{} — {}",
+                    r.number,
+                    candidate_suffix(state, r.number, r.origin),
+                    r.reason.label(),
+                );
+            }
+            // La page pleine se dit, elle ne se tait pas. Un classement établi
+            // sur une lecture tronquée présenterait le meilleur des cent
+            // premiers comme le meilleur du dépôt — le motif de
+            // `scripts/pr-origin-report.sh` : refuser plutôt que mal répondre.
+            // La condition est sur `Some(true)` seul : `None` veut dire « pas
+            // mesuré » et ne justifie aucune ligne.
+            if state.outside_read_truncated == Some(true) {
+                let _ = writeln!(
+                    out,
+                    "- Lecture hors milestone tronquée à {OUTSIDE_READ_LIMIT} issues — aucun candidat hors milestone retenu ce cycle",
+                );
+            }
+        }
+
         out
     }
+}
+
+/// La bande, dite en français — le `Debug` de [`PoolBand`] n'est pas une
+/// surface opérateur.
+fn band_label(band: &PoolBand) -> &'static str {
+    match band {
+        PoolBand::Starved => "famine",
+        PoolBand::Nominal => "nominal",
+        PoolBand::Saturated => "saturé",
+    }
+}
+
+/// ` (p1-important, hors milestone)` — la priorité et la provenance d'un
+/// candidat, celles qui sont connues, vides si aucune.
+///
+/// [`Admission`] et [`AdmissionRefusal`] ne portent qu'un numéro et une
+/// provenance ; l'ordre d'`admit` encode déjà la priorité. Le suffixe la rend
+/// lisible sans que l'opérateur ait à faire confiance à l'ordre, et son absence
+/// dit « pas de label de priorité », ce qui est exactement le fait qui met ce
+/// ticket en dernier.
+///
+/// La provenance n'est dite que pour `Outside` : « hors milestone » est
+/// l'information, « dans le milestone » est le cas par défaut d'un rapport de
+/// milestone et le répéter sur chaque ligne noierait l'exception.
+fn candidate_suffix(state: &MilestoneState, number: u64, origin: CandidateOrigin) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(label) = priority_label(state, number) {
+        parts.push(label);
+    }
+    if origin == CandidateOrigin::Outside {
+        parts.push("hors milestone".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// Le **nom du label** de priorité d'un ticket, cherché dans les deux ensembles
+/// de candidats.
+///
+/// Les deux, parce qu'un candidat hors milestone cible n'est pas dans
+/// `sub_issues` : le chercher là seulement le rendrait sans priorité dans le
+/// rapport, donc impossible à arbitrer, exactement sur les tickets que le vol 2
+/// vient d'ajouter.
+///
+/// C'est le nom du label qui est rendu, pas le rang : `agent-core` vaut le rang
+/// 2 (voir [`priority_from_labels`]), donc l'écrire « p2 » serait faux.
+fn priority_label(state: &MilestoneState, number: u64) -> Option<String> {
+    let (rank, labels) = if let Some(sub) = state.sub_issues.iter().find(|s| s.number == number) {
+        (sub.priority_rank?, &sub.labels)
+    } else {
+        let cand = state
+            .outside_candidates
+            .iter()
+            .find(|c| c.number == number)?;
+        (cand.priority_rank?, &cand.labels)
+    };
+    labels
+        .iter()
+        .find(|l| priority_from_labels(std::slice::from_ref(l)) == Some(rank))
+        .cloned()
 }
 
 impl Default for Reporter {
@@ -539,9 +672,17 @@ fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::milestone_manager::pool::{PoolCandidate, ReadyTicket, assess_pool};
     use crate::milestone_manager::types::{
         ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
     };
+
+    /// Les candidats du milestone tels que l'assesseur les projette. Les tests
+    /// du rapporteur passent par ce helper plutôt que par un littéral, pour que
+    /// la projection sous test soit la même que celle en production.
+    fn milestone_cands(state: &MilestoneState) -> Vec<PoolCandidate> {
+        state.sub_issues.iter().map(PoolCandidate::from).collect()
+    }
 
     fn base_issue(n: u64) -> SubIssue {
         SubIssue {
@@ -576,6 +717,9 @@ mod tests {
             progress,
             recent_activity: vec![],
             executor_healthy: None,
+            ready_pool: vec![],
+            outside_candidates: vec![],
+            outside_read_truncated: None,
         }
     }
 
@@ -589,6 +733,7 @@ mod tests {
             alerts: vec![],
             cross_cutting: vec![],
             contention_events: vec![],
+            pool: None,
             flight_verdicts: vec![],
         }
     }
@@ -1217,5 +1362,259 @@ mod tests {
         // The name, never a value — there is no value to leak, and this is the
         // assertion that says so at the surface an operator actually reads.
         assert!(with.contains("token: MIKA_MANAGER_DELIVERY_TOKEN"));
+    }
+
+    // -- mika#2699 Phase 2 (a) vol 1 : la section « Bassin ready » -----------
+
+    /// Cas 15 — la section n'existe que si le bassin a été **lu**.
+    ///
+    /// `pool: None` ne veut pas dire « bassin vide » : il veut dire « pas de
+    /// mesure » (blob antérieur au champ). Une section qui s'afficherait quand
+    /// même mentirait sur une mesure qui n'a pas eu lieu.
+    #[test]
+    fn mika2699_la_section_nexiste_que_si_le_bassin_a_ete_lu() {
+        let state = state_with(vec![base_issue(1)], ProgressCounts::default());
+        let sans = Reporter::new().report(&state, &empty_assessment());
+        assert!(
+            !sans.contains("### Bassin ready"),
+            "pas de mesure ⇒ pas de section — obtenu :\n{sans}"
+        );
+
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&[], &[], &[]));
+        let avec = Reporter::new().report(&state, &a);
+        assert!(
+            avec.contains("### Bassin ready (mode ombre — aucune écriture)"),
+            "une mesure, même de bassin vide, se dit — obtenu :\n{avec}"
+        );
+    }
+
+    /// Cas 16 — « mode ombre » est dans le **titre**, et le rendu nominal ne
+    /// recommande rien.
+    ///
+    /// Le titre porte la mention parce que la ligne « À admettre » se lit comme
+    /// un geste fait si rien ne dit le contraire à l'endroit où l'œil tombe. Une
+    /// note en fin de section arriverait après la conclusion du lecteur.
+    #[test]
+    fn mika2699_le_mode_ombre_est_dans_le_titre_et_le_nominal_se_tait() {
+        let candidat = {
+            let mut c = base_issue(1802);
+            c.plan_present = true;
+            c.priority_rank = Some(1);
+            c
+        };
+        let state = state_with(vec![candidat], ProgressCounts::default());
+        let pool = vec![
+            ReadyTicket {
+                number: 10,
+                labels: vec!["ready".into()],
+            },
+            ReadyTicket {
+                number: 11,
+                labels: vec!["ready".into()],
+            },
+            ReadyTicket {
+                number: 12,
+                labels: vec!["ready".into()],
+            },
+        ];
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&pool, &milestone_cands(&state), &[]));
+        let out = Reporter::new().report(&state, &a);
+
+        let titre = "### Bassin ready (mode ombre — aucune écriture)";
+        assert!(out.contains(titre), "titre attendu dans :\n{out}");
+        assert!(
+            out.contains("3 ready, 0 en vol, 3 disponible — nominal (cible 2–4)"),
+            "la profondeur et la cible se disent en bande nominale :\n{out}"
+        );
+        assert!(
+            !out.contains("À admettre"),
+            "l'hystérésis est muette entre 2 et 4 :\n{out}"
+        );
+    }
+
+    /// Cas 17 — le rendu de famine nomme la profondeur, la cible 2–4, les
+    /// numéros admis dans l'ordre, et **chaque** refus par son numéro.
+    ///
+    /// Le fixture est l'état mesuré le 2026-10-15 : 2 `ready`, les deux en vol,
+    /// 0 disponible. La priorité rendue est le **nom du label**, pas le rang :
+    /// `agent-core` vaut le rang 2, donc l'écrire « p2 » serait faux.
+    ///
+    /// Le vol 2 a remplacé le compte (« Écartés : 1 candidat sans plan
+    /// groomé ») par une ligne par ticket. Un compte dit à l'opérateur qu'il y
+    /// a quelque chose à regarder sans dire quoi : il doit alors relire les
+    /// candidats à la main, c'est-à-dire refaire le filtre que le manager
+    /// vient de faire.
+    #[test]
+    fn mika2699_le_rendu_de_famine_nomme_profondeur_cible_et_admis() {
+        let subs = vec![
+            {
+                let mut c = base_issue(2711);
+                c.plan_present = true;
+                c.priority_rank = Some(1);
+                c.labels = vec!["p1-important".into()];
+                c
+            },
+            {
+                let mut c = base_issue(2708);
+                c.plan_present = true;
+                c.priority_rank = Some(3);
+                c.labels = vec!["p2-normal".into()];
+                c
+            },
+            {
+                let mut c = base_issue(2720);
+                c.plan_present = false;
+                c.priority_rank = Some(0);
+                c
+            },
+        ];
+        let state = state_with(subs, ProgressCounts::default());
+        let pool = vec![
+            ReadyTicket {
+                number: 2699,
+                labels: vec!["ready".into(), "dispatch:loop".into()],
+            },
+            ReadyTicket {
+                number: 2687,
+                labels: vec!["ready".into(), "dispatch:loop".into()],
+            },
+        ];
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&pool, &milestone_cands(&state), &[]));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(
+            out.contains("- Profondeur : 2 ready, 2 en vol, 0 disponible — famine (cible 2–4)"),
+            "la ligne de profondeur doit dire les trois chiffres et la cible :\n{out}"
+        );
+        assert!(
+            out.contains("- À admettre : #2711 (p1-important), #2708 (p2-normal)"),
+            "les admis, dans l'ordre, nommés par leur label de priorité :\n{out}"
+        );
+        assert!(
+            out.contains("- Refusé : #2720 — plan groomé absent"),
+            "le refus est nommé par ticket et motivé (mika#2699 vol 2) :\n{out}"
+        );
+        // Restreint à la section du bassin : #2720 y est nommé — mais comme
+        // refusé, jamais sur la ligne des admis.
+        let section = out
+            .split("### Bassin ready")
+            .nth(1)
+            .expect("la section du bassin doit être rendue");
+        let ligne_admis = section
+            .lines()
+            .find(|l| l.starts_with("- À admettre"))
+            .expect("la famine recommande");
+        assert!(
+            !ligne_admis.contains("#2720"),
+            "un candidat sans plan groomé n'est jamais nommé comme admis :\n{ligne_admis}"
+        );
+    }
+
+    // -- mika#2699 vol 2 : provenance, refus nommé, troncature ---------------
+
+    /// Cas 18 — la provenance n'est dite que pour le dehors, et la priorité
+    /// d'un candidat hors milestone se lit quand même.
+    ///
+    /// Deux choses se jouent ici. **Le suffixe `hors milestone`** : c'est
+    /// l'exception, donc c'est elle qui se dit ; marquer aussi « dans le
+    /// milestone » sur chaque ligne d'un rapport *de milestone* noierait
+    /// l'exception dans la redondance. **Le label de priorité** : il doit être
+    /// retrouvé dans `outside_candidates`, pas seulement dans `sub_issues` — le
+    /// chercher uniquement dans les sub-issues rendrait tout candidat du dehors
+    /// non-priorisé à l'affichage, alors que le tri, lui, l'a bien pris en
+    /// compte. Un rapport qui n'explique pas son propre ordre.
+    #[test]
+    fn mika2699_la_provenance_nest_dite_que_pour_le_dehors() {
+        let dedans = {
+            let mut c = base_issue(2711);
+            c.plan_present = true;
+            c.priority_rank = Some(1);
+            c.labels = vec!["p1-important".into()];
+            c
+        };
+        let mut state = state_with(vec![dedans], ProgressCounts::default());
+        state.outside_candidates = vec![PoolCandidate {
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(0),
+            plan_present: true,
+            labels: vec!["p0-critical".into()],
+        }];
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(
+            &[],
+            &milestone_cands(&state),
+            &state.outside_candidates,
+        ));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(
+            out.contains(
+                "- À admettre : #1700 (p0-critical, hors milestone), #2711 (p1-important)"
+            ),
+            "le p0 du dehors passe devant, et seul le dehors porte sa provenance :\n{out}"
+        );
+    }
+
+    /// Cas 19 — un refus hors milestone porte sa provenance lui aussi.
+    ///
+    /// Sans elle, l'opérateur lit « Refusé : #1700 — plan groomé absent » et
+    /// cherche #1700 dans la liste des sub-issues du rapport, où il n'est pas.
+    #[test]
+    fn mika2699_un_refus_hors_milestone_porte_sa_provenance() {
+        let mut state = state_with(vec![], ProgressCounts::default());
+        state.outside_candidates = vec![PoolCandidate {
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: None,
+            plan_present: false,
+            labels: vec![],
+        }];
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&[], &[], &state.outside_candidates));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(
+            out.contains("- Refusé : #1700 (hors milestone) — plan groomé absent"),
+            "provenance sans priorité : un seul segment entre parenthèses :\n{out}"
+        );
+    }
+
+    /// Cas 20 — une lecture tronquée se **déclare**, et l'ensemble hors
+    /// milestone est vide ce cycle-là.
+    ///
+    /// C'est le motif de `scripts/pr-origin-report.sh` : refuser plutôt que mal
+    /// répondre. Une page pleine ne dit pas « voici les candidats du dehors »,
+    /// elle dit « il y en avait peut-être d'autres, et peut-être des p0 ». Un
+    /// rapport qui admettrait le meilleur de la page lue affirmerait un ordre
+    /// qu'il n'a pas mesuré.
+    #[test]
+    fn mika2699_une_lecture_tronquee_se_declare() {
+        let mut state = state_with(vec![], ProgressCounts::default());
+        state.outside_read_truncated = Some(true);
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(&[], &[], &[]));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(
+            out.contains(
+                "- Lecture hors milestone tronquée à 100 issues — aucun candidat hors \
+                 milestone retenu ce cycle"
+            ),
+            "la troncature se dit, avec la borne demandée :\n{out}"
+        );
+
+        // Et `Some(false)` — la question posée, la page non pleine — ne dit
+        // rien : une ligne « lecture non tronquée » à chaque cycle serait du
+        // bruit qui finit par cacher la ligne qui compte.
+        state.outside_read_truncated = Some(false);
+        let nominal = Reporter::new().report(&state, &a);
+        assert!(
+            !nominal.contains("tronquée"),
+            "une lecture complète ne se commente pas :\n{nominal}"
+        );
     }
 }

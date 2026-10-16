@@ -9,12 +9,29 @@
 //! `crate::auto_pull::gh_list_open_issues` verbatim (env `GH_TOKEN`,
 //! `stdin::null`, `kill_on_drop(true)`). No new GitHub client dep.
 
+use super::pool::{PoolCandidate, ReadyTicket};
 use super::types::{
     CiState, IssueState, MilestoneRef, MilestoneState, ProgressCounts, RecentActivity, SubIssue,
 };
+use crate::webhook_dispatch::READY_LABEL;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Combien d'issues ouvertes la lecture **hors milestone cible** rapporte au
+/// plus (mika#2699, vol 2).
+///
+/// C'est la borne du `--limit` de la cinquième lecture `gh`, et c'est aussi le
+/// seuil de sa garde de troncature : une page pleine ne dit pas « voici les
+/// candidats », elle dit « il y en avait peut-être d'autres ». Le dépôt en porte
+/// aujourd'hui quelques centaines d'ouvertes, donc la page pleine est le cas
+/// nominal et non l'exception — raison pour laquelle la garde existe ici alors
+/// que [`compose_ready_pool`] s'en passe (son ensemble cible 2–4).
+///
+/// Public parce que le rapporteur l'épelle dans la ligne de troncature : le
+/// nombre que l'opérateur lit doit être celui que la lecture a demandé, jamais
+/// une copie qui peut dériver.
+pub const OUTSIDE_READ_LIMIT: usize = 100;
 
 /// Reader — owns the `gh` invocations and composes `MilestoneState`.
 ///
@@ -180,8 +197,165 @@ impl Reader {
             ])
             .await?;
 
-        compose_from_gh_outputs(milestone_ref, &milestone_json, &issues_json, &pr_json)
+        // 4. Le bassin `ready`, à l'échelle du **dépôt** (mika#2699). Pas de
+        //    `--milestone` ici, et c'est la décision : le webhook `ready`
+        //    dispatche sur tout le dépôt, donc un bassin compté sur les seules
+        //    issues du milestone serait sous-compté et la recommandation fausse
+        //    exactement le jour où elle compte.
+        let ready_json = runner
+            .run(&[
+                "issue",
+                "list",
+                "--repo",
+                &milestone_ref.repo,
+                "--state",
+                "open",
+                "--label",
+                READY_LABEL,
+                "--json",
+                "number,labels",
+                "--limit",
+                "100",
+            ])
+            .await?;
+
+        // 5. Les candidats **hors milestone cible** (mika#2699, vol 2).
+        //    Dépôt-large comme la lecture du bassin, et pour la même raison : le
+        //    2e critère de tri du point 1 (« dans le milestone cible, avant le
+        //    reste ») n'a de sens que s'il existe un « reste » à comparer.
+        //    L'exclusion du milestone cible se fait **côté client**, dans
+        //    `compose_outside_candidates` : la syntaxe de recherche GitHub
+        //    n'exclut un milestone que par son *titre*, qu'un opérateur peut
+        //    renommer entre deux cycles, alors que les numéros déjà lus en 2 sont
+        //    exacts.
+        let outside_json = runner
+            .run(&[
+                "issue",
+                "list",
+                "--repo",
+                &milestone_ref.repo,
+                "--state",
+                "open",
+                "--json",
+                "number,body,labels,state",
+                "--limit",
+                &OUTSIDE_READ_LIMIT.to_string(),
+            ])
+            .await?;
+
+        // `compose_from_gh_outputs` garde sa signature à quatre arguments : ni le
+        // bassin ni les candidats du dehors ne sont une propriété du milestone, et
+        // l'eval `manager_loop_resistance` l'appelle de l'extérieur. Les deux sont
+        // donc posés ici, après composition.
+        let mut state =
+            compose_from_gh_outputs(milestone_ref, &milestone_json, &issues_json, &pr_json)?;
+        state.ready_pool = compose_ready_pool(&ready_json)?;
+        let (outside, truncated) = compose_outside_candidates(&outside_json, &state.sub_issues)?;
+        state.outside_candidates = outside;
+        state.outside_read_truncated = Some(truncated);
+        Ok(state)
     }
+}
+
+/// Compose le bassin `ready` depuis la sortie de `gh issue list --json
+/// number,labels` — fonction **pure**, pendant de `compose_from_gh_outputs`
+/// pour la quatrième lecture (mika#2699).
+///
+/// Pas de garde de troncature au vol 1, et c'est délibéré : à `--limit 100`
+/// contre un bassin dont la cible est 2–4, une page pleine ne serait pas une
+/// troncature mais une pathologie qui se voit déjà dans la profondeur rapportée
+/// (« 100 ready » ne se lit pas comme un état sain). La garde devient utile au
+/// vol 3, où le nombre lu décide d'une écriture.
+pub fn compose_ready_pool(ready_json: &str) -> Result<Vec<ReadyTicket>> {
+    let issues: Vec<Value> = serde_json::from_str(ready_json)
+        .map_err(|e| anyhow!("failed to parse ready-pool json: {e}"))?;
+    Ok(issues
+        .iter()
+        .filter_map(|i| {
+            let number = i.get("number")?.as_u64()?;
+            Some(ReadyTicket {
+                number,
+                labels: extract_labels(i),
+            })
+        })
+        .collect())
+}
+
+/// Compose les candidats **hors milestone cible** depuis la sortie de
+/// `gh issue list --json number,body,labels,state` — fonction **pure**,
+/// pendant de [`compose_ready_pool`] pour la cinquième lecture (mika#2699,
+/// vol 2).
+///
+/// Rend `(candidats, tronqué)`. Trois décisions, chacune pour une raison que la
+/// forme seule ne dit pas :
+///
+/// 1. **Une page pleine vide l'ensemble.** À `--limit OUTSIDE_READ_LIMIT`
+///    contre un dépôt de plusieurs centaines d'ouvertes, la page pleine est le
+///    cas nominal. Rendre les candidats de cette page affirmerait un ordre non
+///    mesuré : le p0 qui devait passer devant est peut-être en page 2. Le motif
+///    est celui de `scripts/pr-origin-report.sh` — *refuser plutôt que mal
+///    répondre* — et il est ici le seul qui ne mente pas, puisque le tri du
+///    point 1 porte précisément sur un ordre global.
+/// 2. **Les `sub_issues` sont retirées ici.** Elles arrivent déjà par
+///    `MilestoneState::sub_issues`, et les porter deux fois alourdirait chaque
+///    blob du sink hors-ligne d'un doublon par ticket du milestone.
+///    [`super::pool::assess_pool`] déduplique quand même, pour sa propre
+///    correction : une fonction pure ne doit pas dépendre de la prudence de son
+///    appelant.
+/// 3. **La troncature est mesurée sur la page lue, pas sur le reste.** Le
+///    booléen rendu dit « la lecture a ramené une page pleine », avant
+///    l'exclusion des `sub_issues` — sinon un milestone de 100 tickets rendrait
+///    « non tronqué » sur une page pleine.
+pub fn compose_outside_candidates(
+    outside_json: &str,
+    subs: &[SubIssue],
+) -> Result<(Vec<PoolCandidate>, bool)> {
+    let issues: Vec<Value> = serde_json::from_str(outside_json)
+        .map_err(|e| anyhow!("failed to parse outside-candidates json: {e}"))?;
+    let truncated = issues.len() >= OUTSIDE_READ_LIMIT;
+    if truncated {
+        return Ok((Vec::new(), true));
+    }
+    let in_milestone: std::collections::HashSet<u64> = subs.iter().map(|s| s.number).collect();
+    let candidates = issues
+        .iter()
+        .filter_map(|i| {
+            let number = i.get("number")?.as_u64()?;
+            if in_milestone.contains(&number) {
+                return None;
+            }
+            let body = i.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            let labels = extract_labels(i);
+            let state = match i.get("state").and_then(|v| v.as_str()) {
+                Some(s) if s.eq_ignore_ascii_case("closed") => IssueState::Closed,
+                _ => IssueState::Open,
+            };
+            Some(PoolCandidate {
+                number,
+                state,
+                priority_rank: priority_from_labels(&labels),
+                plan_present: plan_callout_present(body),
+                labels,
+            })
+        })
+        .collect();
+    Ok((candidates, false))
+}
+
+/// Les noms de labels d'une issue telle que `gh issue list --json labels` la
+/// rend. Un seul site d'épellation du chemin `labels[].name`, partagé par les
+/// trois lectures d'issues (sub-issues du milestone, bassin `ready`, candidats
+/// hors milestone).
+fn extract_labels(issue: &Value) -> Vec<String> {
+    issue
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Priority ranks from label — pure function, easy to test.
@@ -443,15 +617,7 @@ pub fn compose_from_gh_outputs(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let labels: Vec<String> = issue
-            .get("labels")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let labels: Vec<String> = extract_labels(issue);
         let updated_at = issue
             .get("updatedAt")
             .and_then(|v| v.as_str())
@@ -553,6 +719,16 @@ pub fn compose_from_gh_outputs(
         progress,
         recent_activity,
         executor_healthy: None,
+        // Vide ici par construction : le bassin est une lecture dépôt-large que
+        // cette fonction ne reçoit pas. `Reader::read_with_runner` le pose après
+        // composition — voir `compose_ready_pool`.
+        ready_pool: Vec::new(),
+        // Idem pour les candidats hors milestone (mika#2699, vol 2) : dépôt-large
+        // eux aussi, posés après composition par `compose_outside_candidates`.
+        // `None` et non `Some(false)` : à ce point la question de la troncature
+        // n'a pas été posée (mika#2331).
+        outside_candidates: Vec::new(),
+        outside_read_truncated: None,
     })
 }
 
@@ -1046,11 +1222,23 @@ mod gh_arg_capture_tests {
     /// panics — the guard fails LOUD on an unmapped call. This docstring lives
     /// on the struct itself (not inside the match wildcard) so it surfaces at
     /// the most likely edit surface for the maintainer wiring the new call.
+    ///
+    /// **Extension performed twice (mika#2699).** The fourth and fifth calls
+    /// *are* `issue list`s, so routing on the first arg alone would have served
+    /// them `issues_json` in silence — a recorder that answers the wrong
+    /// question without failing. The `issue` arms therefore disambiguate on a
+    /// token each call site owns alone: `--label` for the ready pool,
+    /// `--milestone` for the sub-issues, and the exact `--json` field list for
+    /// the outside-candidate read. The trailing `issue` arm is an **error**, not
+    /// a default: a sixth `issue`-shaped call must extend this match on a token
+    /// of its own rather than inherit someone else's answer.
     struct RecordingGhRunner {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         milestone_json: String,
         issues_json: String,
         pr_json: String,
+        ready_json: String,
+        outside_json: String,
     }
 
     #[async_trait::async_trait]
@@ -1058,18 +1246,26 @@ mod gh_arg_capture_tests {
         async fn run(&self, args: &[&str]) -> Result<String> {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             self.calls.lock().unwrap().push(owned.clone());
-            // Route by the first arg — matches the three call sites in
-            // `Reader::read_with_runner`.
+            let has = |flag: &str| owned.iter().any(|a| a == flag);
+            let json_fields = owned
+                .windows(2)
+                .find(|w| w[0] == "--json")
+                .map(|w| w[1].clone())
+                .unwrap_or_default();
             match owned.first().map(String::as_str) {
                 Some("api") => Ok(self.milestone_json.clone()),
-                Some("issue") => Ok(self.issues_json.clone()),
+                Some("issue") if has("--label") => Ok(self.ready_json.clone()),
+                Some("issue") if has("--milestone") => Ok(self.issues_json.clone()),
+                Some("issue") if json_fields == "number,body,labels,state" => {
+                    Ok(self.outside_json.clone())
+                }
                 Some("pr") => Ok(self.pr_json.clone()),
-                // NOTE: extending `Reader::read_with_runner` with a fourth `gh`
+                // NOTE: extending `Reader::read_with_runner` with a sixth `gh`
                 // call (e.g., `gh auth status`, per-issue `gh issue view`) also
                 // requires extending this match — the guard covers only the
-                // three current call sites' arg contracts (mika#1933 testing F1).
+                // five current call sites' arg contracts (mika#1933 testing F1).
                 _ => Err(anyhow!(
-                    "RecordingGhRunner: unexpected first arg in {:?}",
+                    "RecordingGhRunner: unexpected call shape in {:?}",
                     owned
                 )),
             }
@@ -1086,6 +1282,8 @@ mod gh_arg_capture_tests {
             milestone_json: r#"{"title": "T", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null}"#.into(),
             issues_json: "[]".into(),
             pr_json: "[]".into(),
+            ready_json: "[]".into(),
+            outside_json: "[]".into(),
         };
         (calls, runner)
     }
@@ -1167,5 +1365,208 @@ mod gh_arg_capture_tests {
         // would render `closed (no linked PR)` in every case.
         assert_adjacent_pair(pr_call, "--state", "all");
         assert_adjacent_pair(pr_call, "--limit", "100");
+    }
+
+    // -- mika#2699 Phase 2 (a) vol 1 : la quatrième lecture --
+
+    /// Cas 9 — la lecture du bassin est **dépôt-large** et ciblée sur `ready`.
+    ///
+    /// Les deux assertions qui portent la décision : `--label ready` (c'est bien
+    /// le bassin qu'on lit) et **l'absence de `--milestone`** (le webhook `ready`
+    /// dispatche sur tout le dépôt, donc un bassin compté sur le seul milestone
+    /// serait sous-compté et la recommandation fausse le jour où elle compte).
+    /// `--state open` parce qu'un ticket `ready` fermé n'occupe aucun rail.
+    #[tokio::test]
+    async fn mika2699_la_lecture_du_bassin_est_depot_large_et_sur_ready() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner should succeed on canned JSON");
+
+        let calls = calls.lock().unwrap();
+        let ready_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue") && c.iter().any(|a| a == "--label")
+            })
+            .expect("l'appel du bassin ready doit être capturé");
+        assert_adjacent_pair(ready_call, "--label", "ready");
+        assert_adjacent_pair(ready_call, "--state", "open");
+        assert_adjacent_pair(ready_call, "--json", "number,labels");
+        assert_adjacent_pair(ready_call, "--limit", "100");
+        assert_adjacent_pair(ready_call, "--repo", "senara-solutions/mika");
+        assert!(
+            !ready_call.iter().any(|a| a == "--milestone"),
+            "le bassin est dépôt-large : aucun --milestone ici — {ready_call:?}"
+        );
+    }
+
+    /// Cas 10 — `compose_ready_pool` sur une sortie `gh` réelle, et sur `[]`.
+    ///
+    /// Le fixture est l'état mesuré le 2026-10-15 : deux issues `ready` ouvertes,
+    /// **les deux** portant `dispatch:loop`. Il porte aussi un label sans `name`
+    /// exploitable, pour que la lecture ne s'effondre pas sur une forme que la
+    /// forge peut rendre.
+    #[test]
+    fn mika2699_compose_ready_pool_lit_numeros_et_labels() {
+        let json = r#"[
+            {"number": 2699, "labels": [{"name":"ready"},{"name":"dispatch:loop"}]},
+            {"number": 2687, "labels": [{"name":"ready"},{"name":"dispatch:loop"},{"id":"x"}]}
+        ]"#;
+        let pool = compose_ready_pool(json).expect("une sortie gh valide doit se composer");
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].number, 2699);
+        assert_eq!(
+            pool[0].labels,
+            vec!["ready".to_string(), "dispatch:loop".to_string()]
+        );
+        assert!(
+            pool.iter().all(|t| t.holds_dispatch_seat()),
+            "les deux portaient un siège le 2026-10-15 — {pool:?}"
+        );
+        assert_eq!(
+            pool[1].labels.len(),
+            2,
+            "un label sans `name` est ignoré, il ne fait pas échouer la lecture"
+        );
+
+        let empty = compose_ready_pool("[]").expect("un bassin vide est une réponse valide");
+        assert!(
+            empty.is_empty(),
+            "`[]` donne un bassin vide, pas une erreur"
+        );
+    }
+
+    // -- mika#2699 vol 2 : la cinquième lecture --
+
+    /// Cas 11 — la lecture hors milestone est **dépôt-large** et n'ouvre aucune
+    /// autorité.
+    ///
+    /// L'assertion qui porte le sens est l'absence de `--milestone` : avec elle,
+    /// la cinquième lecture rendrait le même périmètre que la deuxième et le
+    /// « reste » du 2e critère de tri serait vide à chaque cycle — un vol 2 vert
+    /// qui ne mesure rien. L'absence de `--label` compte autant : filtrer sur
+    /// `ready` ne ramènerait que des tickets déjà dans le bassin.
+    #[tokio::test]
+    async fn mika2699_la_cinquieme_lecture_est_depot_large() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let calls = calls.lock().unwrap();
+        let outside_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue")
+                    && c.windows(2)
+                        .any(|w| w[0] == "--json" && w[1] == "number,body,labels,state")
+            })
+            .expect("l'appel des candidats hors milestone doit être capturé");
+        assert_adjacent_pair(outside_call, "--state", "open");
+        assert_adjacent_pair(outside_call, "--json", "number,body,labels,state");
+        assert_adjacent_pair(outside_call, "--limit", "100");
+        assert_adjacent_pair(outside_call, "--repo", "senara-solutions/mika");
+        assert!(
+            !outside_call.iter().any(|a| a == "--milestone"),
+            "sans cette absence, le « reste » serait vide à chaque cycle — {outside_call:?}"
+        );
+        assert!(
+            !outside_call.iter().any(|a| a == "--label"),
+            "filtrer sur `ready` ne ramènerait que le bassin — {outside_call:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            5,
+            "cinq lectures, pas une de plus : chaque appel `gh` est un coût par \
+             cycle — {calls:?}"
+        );
+    }
+
+    /// Cas 12 — le composeur dérive priorité et plan, et retire le milestone.
+    ///
+    /// Le fixture oppose les trois choses qu'un candidat du dehors doit porter
+    /// pour que le tri du point 1 soit juste : un rang venu des labels, un
+    /// `plan_present` venu du corps, et un état. Le ticket du milestone (#1802)
+    /// est dans la page lue par construction — la lecture est dépôt-large — et
+    /// doit en sortir.
+    #[test]
+    fn mika2699_compose_outside_candidates_derive_et_retire_le_milestone() {
+        let json = r#"[
+            {"number": 1700, "body": "> - **Plan:** docs/plans/x.md", "state": "OPEN",
+             "labels": [{"name":"p0-critical"}]},
+            {"number": 1701, "body": "pas de plan ici", "state": "OPEN", "labels": []},
+            {"number": 1802, "body": "> - **Plan:** docs/plans/y.md", "state": "OPEN",
+             "labels": [{"name":"p1-important"}]}
+        ]"#;
+        let subs = vec![SubIssue {
+            number: 1802,
+            title: "déjà dans sub_issues".into(),
+            state: IssueState::Open,
+            priority_rank: Some(1),
+            plan_present: true,
+            branch_present: false,
+            pr_number: None,
+            pr_state: None,
+            ci_state: CiState::None,
+            blockers: vec![],
+            updated_at: "2026-10-15T00:00:00Z".into(),
+            labels: vec!["p1-important".into()],
+        }];
+
+        let (cands, truncated) =
+            compose_outside_candidates(json, &subs).expect("une sortie gh valide se compose");
+        assert!(!truncated, "3 issues sur 100 : la page n'est pas pleine");
+        assert_eq!(
+            cands.iter().map(|c| c.number).collect::<Vec<_>>(),
+            vec![1700, 1701],
+            "le ticket du milestone sort, les autres restent — {cands:?}"
+        );
+        assert_eq!(
+            cands[0].priority_rank,
+            Some(0),
+            "p0-critical vaut le rang 0"
+        );
+        assert!(cands[0].plan_present, "le callout de plan est lu");
+        assert_eq!(cands[1].priority_rank, None, "aucun label ⇒ non priorisé");
+        assert!(!cands[1].plan_present);
+
+        let (vide, t) = compose_outside_candidates("[]", &subs).expect("`[]` est valide");
+        assert!(vide.is_empty());
+        assert!(!t, "une page vide n'est pas une page pleine");
+    }
+
+    /// Cas 13 — une page pleine vide l'ensemble et le **déclare**.
+    ///
+    /// C'est le contrôle négatif de la garde : sans elle, le manager
+    /// recommanderait le meilleur candidat de la page lue en affirmant un ordre
+    /// global qu'il n'a pas mesuré. Et le booléen porte sur la page **avant**
+    /// l'exclusion du milestone, sinon un milestone de cent tickets rendrait
+    /// « non tronqué » sur une page saturée.
+    #[test]
+    fn mika2699_une_page_pleine_vide_lensemble_et_se_declare() {
+        let page: Vec<String> = (1..=100)
+            .map(|n| format!(r#"{{"number": {n}, "body": "", "state": "OPEN", "labels": []}}"#))
+            .collect();
+        let json = format!("[{}]", page.join(","));
+
+        let (cands, truncated) =
+            compose_outside_candidates(&json, &[]).expect("une page pleine reste du JSON valide");
+        assert!(truncated, "100 issues à la borne 100 : page pleine");
+        assert!(
+            cands.is_empty(),
+            "refuser plutôt que mal répondre : aucun candidat retenu — {} retenus",
+            cands.len()
+        );
     }
 }

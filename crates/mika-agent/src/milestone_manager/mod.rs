@@ -48,6 +48,42 @@
 //! exec (Porte 2), and `INTERNAL_TOKEN` alignment (Porte 3). None of that surface is
 //! wired in this module.
 //!
+//! ### Phase 2 (a) vols 1 et 2 — le bassin `ready` est une LECTURE (mika#2699)
+//!
+//! [`pool`] juge la profondeur du bassin `ready` et **dit** quels tickets
+//! devraient y entrer, et lesquels sont refusés et pourquoi. C'est une lecture
+//! de plus, pas une autorité de plus : le verdict entre dans le rapport
+//! ([`Assessment::pool`]) et nulle part ailleurs. Le charter **LECTURE SEULE**
+//! ci-dessus reste entier, et les deux seuls effets sortants restent les deux
+//! déjà nommés.
+//!
+//! Trois conséquences qu'un éditeur futur doit connaître :
+//!
+//! - **Les quatrième et cinquième lectures `gh` sont dépôt-larges**, pas
+//!   limitées au milestone cible. Pour le bassin : le webhook `ready` dispatche
+//!   à l'échelle du dépôt, donc un bassin compté sur les seules `sub_issues`
+//!   serait sous-compté. Pour les candidats du dehors
+//!   ([`CandidateOrigin::Outside`]) : le 2e critère de tri du ticket — « dans le
+//!   milestone cible, **avant le reste** » — n'a de sens que s'il existe un
+//!   « reste » à comparer. Ce sont les deux seules lectures du module qui
+//!   sortent du périmètre du milestone ; elles restent des `issue list`, donc
+//!   elles ne touchent pas `no_dispatch_test.rs`.
+//! - **La priorité domine la provenance** dans le tri des admissions. Un p0 hors
+//!   milestone passe devant un p1 du milestone. Le pourquoi de cette lecture de
+//!   la phrase du ticket est dans le docstring de [`pool`], et c'est une
+//!   décision, pas un détail d'implémentation.
+//! - **Le geste d'écriture est le vol 3**, derrière `MIKA_MANAGER_POOL_WRITE`
+//!   (OFF par défaut), et il arrivera comme **exception nommée** au scan de
+//!   `no_dispatch_test.rs`, amendée dans le même commit que ce docstring —
+//!   jamais comme un assouplissement du scan.
+//!
+//! Reste du point 2 après le vol 2 : le **second motif de refus** — estimation
+//! au-delà de la borne par vol sans découpage — qui demande une lecture du plan
+//! par candidat et un portage en Rust du contrat de parse de
+//! `_plan_size_total_loc` (porte 3 de mika#2701). Mesuré au-delà de la borne par
+//! vol à lui seul, il est donc son propre vol ; [`pool`] porte le détail de
+//! l'estimation. Suivi sur `senara-solutions/mika#2699`.
+//!
 //! **Porte 1 discharge condition (mika#1947).** Dispatch authority is DECISION-CORE by
 //! construction, so the forge-gate perimeter classifier must fail-closed to
 //! `DecisionCore` on every path under `crates/mika-agent/src/milestone_manager/**`, at
@@ -164,6 +200,7 @@ pub mod assessor;
 pub mod cadence;
 pub mod evaluator;
 pub mod liveness;
+pub mod pool;
 pub mod reader;
 pub mod reporter;
 pub mod sink_dir;
@@ -190,7 +227,14 @@ pub use liveness::{
     LivenessEmitter, LivenessFailure, LivenessFailureClass, LivenessSink, REASON_DELIVERY_PREFIX,
     REASON_POLL_PREFIX, TransitionLine, liveness_reason,
 };
-pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs};
+pub use pool::{
+    Admission, AdmissionRefusal, CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand, PoolCandidate,
+    PoolDepth, PoolVerdict, ReadyTicket, RefusalReason, assess_pool,
+};
+pub use reader::{
+    GhRunner, OUTSIDE_READ_LIMIT, ProcessGhRunner, Reader, compose_from_gh_outputs,
+    compose_outside_candidates, compose_ready_pool,
+};
 pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};
 pub use sink_dir::{
     ENV_OFFLINE_SINK_DIR, SinkDirSource, SinkEntry, SinkListing, list_sink_reports,
