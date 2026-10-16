@@ -5052,6 +5052,17 @@ async fn execute_long_running(
 /// The subprocess runs with `kill_on_drop(false)` so it survives if the
 /// parent agent task ends. A monitor task records the PID and handles
 /// failure (non-zero exit → task marked failed).
+///
+/// # mika#2677 — le handle est rendu
+///
+/// Le `JoinHandle` du task de surveillance est retourné pour qu'un test puisse
+/// le **joindre** au lieu de deviner une échéance murale : les trois écritures
+/// observables (`set_task_handler_failure`, la ligne d'audit
+/// `pilot_launcher_health`, `record_launcher_recovery`) sont toutes `await`ées
+/// dans ce corps, et il n'y a aucun `tokio::spawn` imbriqué — donc le join est
+/// une barrière complète. Laisser tomber le handle **détache** (il n'annule
+/// pas), donc aucun appelant n'a à changer : les quatre sites de production le
+/// laissent tomber comme avant.
 pub(crate) fn spawn_long_running_exec(
     cmd_path: PathBuf,
     skill_dir: PathBuf,
@@ -5059,7 +5070,7 @@ pub(crate) fn spawn_long_running_exec(
     task_id: String,
     db: AsyncDatabase,
     github_token: Option<String>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut cmd = tokio::process::Command::new(&cmd_path);
         cmd.current_dir(&skill_dir)
@@ -5440,7 +5451,7 @@ pub(crate) fn spawn_long_running_exec(
         }
         // If success, the script called `mika ask --task-id` which completes the task.
         // If the script didn't call it, the task will eventually expire via timeout_at.
-    });
+    })
 }
 
 #[cfg(test)]
@@ -13245,6 +13256,86 @@ Harness ticket.
         );
     }
 
+    // ───────────────────────────────────────────────────────────────────────
+    // mika#2677 — la barrière des tests de handler long : un JOIN, pas une
+    // horloge
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Borne sur un **join**, jamais un budget de décantation (mika#2677).
+    ///
+    /// `SETTLE_MS` (4 s, retirée par ce ticket) était sur le chemin critique du
+    /// vert : sa valeur devait excéder la durée réelle, donc la charge du runner
+    /// avait une voix dans le verdict — c'est ce qui a rendu rouge deux fois en
+    /// CI un comportement correct. Ce budget-ci n'est atteignable que par un
+    /// sous-processus réellement pendu ; le chemin normal ne s'en approche
+    /// jamais. Il existe parce qu'un `handle.await` nu ferait pendre le binaire
+    /// de test jusqu'au timeout du job, ce qui est un rouge moins lisible qu'un
+    /// panic.
+    const HANDLER_JOIN_BUDGET_SECS: u64 = 60;
+
+    /// Joindre le task de surveillance de [`spawn_long_running_exec`].
+    ///
+    /// **C'est une barrière complète pour tout ce que ce task écrit** : les
+    /// trois écritures observables (`set_task_handler_failure`, la ligne
+    /// d'audit `pilot_launcher_health`, `record_launcher_recovery`) sont
+    /// `await`ées dans son corps, et il n'y a aucun `tokio::spawn` imbriqué
+    /// (`spawn_long_running_exec` porte le seul du fichier). *Un `tokio::spawn`
+    /// ajouté plus tard dans ce corps rouvrirait le trou en silence* — le join
+    /// retournerait avant l'écriture du task imbriqué. Si vous en ajoutez un,
+    /// l'écriture qu'il porte a besoin de son propre signal.
+    async fn join_handler_monitor(handle: tokio::task::JoinHandle<()>) {
+        join_handler_monitor_within(handle, Duration::from_secs(HANDLER_JOIN_BUDGET_SECS)).await;
+    }
+
+    /// Variante à budget explicite — elle existe pour que le refus de l'aide
+    /// soit **testable**, pas pour être appelée par les tests ordinaires.
+    async fn join_handler_monitor_within(handle: tokio::task::JoinHandle<()>, budget: Duration) {
+        tokio::time::timeout(budget, handle)
+            .await
+            .expect("mika#2677 — the handler's monitor task never finished: its subprocess is hung")
+            .expect("the handler's monitor task panicked");
+    }
+
+    /// **Anti-vacuité de la barrière elle-même.** Sans ce contrôle, une aide qui
+    /// avalerait son timeout rendrait les onze tests verts par défaut
+    /// d'observation — la classe mika#2205, déplacée d'un cran.
+    ///
+    /// Le sous-processus `sleep 5` survit au panic (`kill_on_drop(false)`, la
+    /// forme de production) et sort de lui-même ; le `tempdir` tombe avant, sans
+    /// conséquence puisque le handler ne lit plus rien.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "its subprocess is hung")]
+    async fn mika2677_la_barriere_refuse_un_handler_pendu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db =
+            AsyncDatabase::new_with_agent(crate::db::Database::open_in_memory().unwrap(), "mika");
+        let task = build_callback_task(
+            "mika".to_string(),
+            None,
+            "build_mika",
+            &serde_json::json!({}),
+            600,
+            "session-2677",
+            "trace-2677",
+            None,
+        );
+        let task_id = db.create_task(task).await.unwrap();
+
+        let script = tmp.path().join("handler.sh");
+        write_script(&script, "#!/bin/sh\nsleep 5\n");
+
+        let monitor = spawn_long_running_exec(
+            script,
+            tmp.path().to_path_buf(),
+            serde_json::json!({}),
+            task_id,
+            db.clone(),
+            None,
+        );
+
+        join_handler_monitor_within(monitor, Duration::from_millis(100)).await;
+    }
+
     // -----------------------------------------------------------------------
     // mika#2532 — the stderr of a failed long-running handler survives a
     // terminal task
@@ -13276,11 +13367,6 @@ Harness ticket.
         use crate::db::Database;
         use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
 
-        /// Long enough that a green run says something, short enough that a red
-        /// one does not hang CI. T1/T3/T5 land in well under 100 ms on this
-        /// harness; the margin is for a loaded machine.
-        const SETTLE_MS: u64 = 4_000;
-
         fn db() -> AsyncDatabase {
             AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
         }
@@ -13310,28 +13396,27 @@ Harness ticket.
             path
         }
 
-        /// Poll until `$.handler_failure` appears, or give up after
-        /// [`SETTLE_MS`]. Returns `None` when it never appeared — which is the
-        /// assertion the negative controls make, not a test failure per se.
-        async fn await_handler_failure(
+        /// Read `$.handler_failure` ONCE.
+        ///
+        /// Appelée **après** [`join_handler_monitor`] (mika#2677), donc le
+        /// `None` qu'elle rend est une **absence constatée** sur un task de
+        /// surveillance terminé — jamais un épuisement de budget. C'est
+        /// exactement ce dont T2 a besoin pour conclure : avant ce ticket, son
+        /// `is_none()` pouvait aussi bien signifier « le chemin n'a pas encore
+        /// tourné ».
+        async fn read_handler_failure(
             db: &AsyncDatabase,
             task_id: &str,
         ) -> Option<serde_json::Value> {
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            loop {
-                let task = db.get_task(task_id).await.unwrap().expect("row exists");
-                if let Some(raw) = task.metadata.as_deref()
-                    && let Ok(serde_json::Value::Object(map)) =
-                        serde_json::from_str::<serde_json::Value>(raw)
-                    && let Some(found) = map.get(HANDLER_FAILURE_METADATA_KEY)
-                {
-                    return Some(found.clone());
-                }
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            let task = db.get_task(task_id).await.unwrap().expect("row exists");
+            if let Some(raw) = task.metadata.as_deref()
+                && let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_str::<serde_json::Value>(raw)
+                && let Some(found) = map.get(HANDLER_FAILURE_METADATA_KEY)
+            {
+                return Some(found.clone());
             }
+            None
         }
 
         /// **T1 — the measured defect.** A handler that crashes *after* its EXIT
@@ -13355,7 +13440,7 @@ Harness ticket.
                 tmp.path(),
                 "echo \"ERROR: could not cd to /nope/mika\" >&2\nexit 1",
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13363,8 +13448,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id)
+            let failure = read_handler_failure(&db, &task_id)
                 .await
                 .expect("the cause of a pre-result crash must reach the row");
 
@@ -13409,7 +13495,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), "echo 'noise on stdout'\nexit 0");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13417,9 +13503,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert!(
-                await_handler_failure(&db, &task_id).await.is_none(),
+                read_handler_failure(&db, &task_id).await.is_none(),
                 "a successful handler must leave no `handler_failure`: a cause of \
                  failure invented on a healthy row is a lie of the same order as \
                  the silence being repaired"
@@ -13437,7 +13524,7 @@ Harness ticket.
             let task_id = callback_row(&db).await;
 
             let script = handler(tmp.path(), "echo boom >&2\nexit 3");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13445,8 +13532,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let failure = read_handler_failure(&db, &task_id).await.expect("written");
             assert_eq!(
                 failure.get("exit").and_then(|v| v.as_str()),
                 Some("Exit code: 3")
@@ -13478,7 +13566,7 @@ Harness ticket.
                 tmp.path(),
                 "echo 'auth failed for ghp_0123456789abcdefghij' >&2\nexit 1",
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13486,8 +13574,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let failure = read_handler_failure(&db, &task_id).await.expect("written");
             let stderr = failure.get("stderr").and_then(|v| v.as_str()).unwrap();
             assert!(
                 !stderr.contains("ghp_0123456789abcdefghij"),
@@ -13513,7 +13602,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), "exit 4");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13521,8 +13610,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let failure = read_handler_failure(&db, &task_id).await.expect("written");
             assert_eq!(
                 failure.get("exit").and_then(|v| v.as_str()),
                 Some("Exit code: 4")
@@ -13561,25 +13651,6 @@ Harness ticket.
         use crate::db::Database;
         use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
 
-        /// Same budget and same reasoning as its mika#2532 sibling: long enough
-        /// that a green run says something, short enough that a red one does not
-        /// hang CI.
-        const SETTLE_MS: u64 = 4_000;
-
-        /// Residual window the two negative controls leave between the barrier
-        /// ([`require_handler_failure`]) and their absence assertion.
-        ///
-        /// **It is NOT a settle delay** — the barrier has already established
-        /// that the failure path ran. It covers only the handful of instructions
-        /// between `set_task_handler_failure` returning and the
-        /// `if status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD)` block posting its
-        /// `log_audit_event`: both writes travel the same `AsyncDatabase`
-        /// channel, so they are ordered, but the spawned task yields at the
-        /// `await` in between and a loaded worker can be pre-empted there.
-        /// 250 ms is ~three orders of magnitude over the need and 16× cheaper
-        /// than the blind 4 s these controls used to sleep.
-        const NEGATIVE_CONTROL_MARGIN_MS: u64 = 250;
-
         fn db() -> AsyncDatabase {
             AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
         }
@@ -13612,6 +13683,11 @@ Harness ticket.
         ///
         /// The session key is the one the production site composes, so a change
         /// of that composition makes these tests red rather than silently blind.
+        ///
+        /// Depuis mika#2677 c'est le **seul** accès : l'ancien sondage
+        /// `await_launcher_health` a disparu avec son échéance murale. Chaque
+        /// appel vient **après** [`join_handler_monitor`], donc le `None` qu'il
+        /// rend est une absence constatée sur un task de surveillance terminé.
         async fn launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
             let session = format!("callback-{task_id}");
             db.get_audit_events(&session)
@@ -13620,21 +13696,6 @@ Harness ticket.
                 .iter()
                 .find(|e| e.tool_name == PILOT_LAUNCHER_HEALTH_TOOL)
                 .and_then(|row| row.after_value.clone())
-        }
-
-        /// Poll for the `pilot_launcher_health` row — the POSITIVE assertion
-        /// (T1). Returns `None` when none appeared within [`SETTLE_MS`].
-        async fn await_launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            loop {
-                if let Some(value) = launcher_health(db, task_id).await {
-                    return Some(value);
-                }
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
         }
 
         /// **Barrier for the two negative controls — it panics rather than
@@ -13650,29 +13711,37 @@ Harness ticket.
         /// observation**, which reads exactly like a control that looked (class
         /// mika#2205). A loaded CI runner is precisely where that happens, so the
         /// control meant to catch a false positive would be the first thing to
-        /// stop catching anything. Panicking on the budget turns that silence
-        /// into a red.
+        /// stop catching anything. Panicking turns that silence into a red.
+        ///
+        /// Depuis mika#2677 son corps est une **lecture unique** : l'attente est
+        /// déjà faite par [`join_handler_monitor`], que ses deux appelants
+        /// appellent juste avant. L'anti-vacuité reste entière — c'est elle qui
+        /// justifie cette aide — mais la cause nommée a changé de nature : ce
+        /// n'est plus « le chemin n'a pas tourné en 4 s » (un verdict que la
+        /// charge du runner pouvait rendre à tort), c'est « le task de
+        /// surveillance a joint sans avoir écrit `$.handler_failure` », une
+        /// absence constatée sur un task terminé.
         async fn require_handler_failure(db: &AsyncDatabase, task_id: &str) {
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            loop {
-                let task = db.get_task(task_id).await.unwrap().expect("row exists");
-                if let Some(raw) = task.metadata.as_deref()
-                    && let Ok(serde_json::Value::Object(map)) =
-                        serde_json::from_str::<serde_json::Value>(raw)
-                    && map.contains_key(HANDLER_FAILURE_METADATA_KEY)
-                {
-                    return;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "mika#2634 — the failure path never ran for task {task_id} within \
-                     {SETTLE_MS} ms: `$.{HANDLER_FAILURE_METADATA_KEY}` never appeared. This \
-                     control cannot conclude anything about the ABSENCE of a \
-                     `pilot_launcher_health` row until it has established that the handler \
-                     exited and the engine processed it."
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let task = db.get_task(task_id).await.unwrap().expect("row exists");
+            let written = task
+                .metadata
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| match value {
+                    serde_json::Value::Object(map) => {
+                        Some(map.contains_key(HANDLER_FAILURE_METADATA_KEY))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false);
+            assert!(
+                written,
+                "mika#2634 — the monitor task joined without having written \
+                 `$.{HANDLER_FAILURE_METADATA_KEY}` for task {task_id}, so the failure path \
+                 never ran. This control cannot conclude anything about the ABSENCE of a \
+                 `pilot_launcher_health` row until it has established that the handler \
+                 exited and the engine processed it."
+            );
         }
 
         /// **T1 — the measured defect, and this is the test to see RED before
@@ -13703,7 +13772,7 @@ Harness ticket.
                     "echo \"ModuleNotFoundError: No module named 'claude_pilot'\" >&2\nexit {EXIT_PILOT_LAUNCHER_DEAD}"
                 ),
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13711,9 +13780,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert_eq!(
-                await_launcher_health(&db, &task_id).await.as_deref(),
+                launcher_health(&db, &task_id).await.as_deref(),
                 Some(PILOT_LAUNCHER_DEAD_VALUE),
                 "mika#2634 AC1 — a launcher that did not start must be counted apart \
                  from a pilot that failed; without this row the class is drowned in \
@@ -13743,7 +13813,7 @@ Harness ticket.
                     log.display()
                 ),
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13751,11 +13821,11 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             // Establish that the failure path RAN before concluding on an
             // absence — see [`require_handler_failure`].
             require_handler_failure(&db, &task_id).await;
-            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
 
             assert_eq!(
                 launcher_health(&db, &task_id).await,
@@ -13789,7 +13859,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), "exit 78");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13797,9 +13867,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             require_handler_failure(&db, &task_id).await;
-            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
 
             assert_eq!(
                 launcher_health(&db, &task_id).await,
@@ -14178,7 +14248,7 @@ Harness ticket.
             let task_id = callback_row(&db).await;
 
             let script = handler(tmp.path(), "exit 0");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -14186,9 +14256,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert_eq!(
-                await_launcher_health(&db, &task_id).await.as_deref(),
+                launcher_health(&db, &task_id).await.as_deref(),
                 Some(PILOT_LAUNCHER_RECOVERED_VALUE),
                 "mika#2634 §16 — a dispatch that ran under a repaired launcher must \
                  record the transition, so the brake's own lifting is datable"
@@ -14214,7 +14285,7 @@ Harness ticket.
                 tmp.path(),
                 &format!("echo ran > {}\nexit 0", marker.display()),
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -14222,19 +14293,18 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             // Barrier: establish that the handler really ran before concluding
-            // anything about an absence.
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            while !marker.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the handler never ran within {SETTLE_MS} ms, so this control \
-                     cannot conclude on the ABSENCE of a recovery row"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
+            // anything about an absence. Depuis mika#2677 le join l'a déjà
+            // établi — le marqueur est écrit par le script avant son `exit 0`,
+            // que le task de surveillance a `wait()`é —, donc c'est une
+            // constatation, pas une attente.
+            assert!(
+                marker.exists(),
+                "the monitor task joined without the handler having written its marker, \
+                 so this control cannot conclude on the ABSENCE of a recovery row"
+            );
 
             assert_eq!(
                 launcher_health(&db, &task_id).await,
@@ -14261,7 +14331,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), &format!("exit {EXIT_PILOT_LAUNCHER_DEAD}"));
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -14269,9 +14339,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert_eq!(
-                await_launcher_health(&db, &task_id).await.as_deref(),
+                launcher_health(&db, &task_id).await.as_deref(),
                 Some(PILOT_LAUNCHER_DEAD_VALUE),
                 "a dispatch that died on the dedicated code must count as a DEATH; \
                  recording a recovery here would lift the brake on the very dispatch \
