@@ -4727,7 +4727,18 @@ assert_not_contains "U2: terminated classification carries no plan-lookup diagno
     "_find_issue_plan" "$CLASSIFY_WITH_GUARDRAIL"
 assert_not_contains "U2: terminated classification carries no convergence diagnosis" \
     "architect convergence" "$CLASSIFY_WITH_GUARDRAIL"
-assert_contains "U2: terminated classification points at the upstream stall lineage" \
+# mika#2029: this assertion TURNED, and that is the probe doing its job. Until
+# 2026-10-15 it required `mika#1901` — the auth lineage the delivered text named
+# as the cause. That lineage was refuted by measurement on 2026-08-29 (the very
+# sessions it described show `POST /v1/messages -> 200`, six candidate lineages
+# eliminated), and the cause was eventually traced upstream of this repo to
+# claude-pilot#177 (CLOSED 2026-09-11). A callback that names a dead lineage
+# costs more than a silent one: it sends the next reader into the wrong half of
+# the system. The pair below pins BOTH directions — the traced cause is named,
+# and the refuted one does not come back through an absent-minded restore.
+assert_contains "U2: terminated classification names the cause that was traced" \
+    "claude-pilot#177" "$CLASSIFY_WITH_GUARDRAIL"
+assert_not_contains "U2: and no longer points at the refuted auth lineage" \
     "mika#1901" "$CLASSIFY_WITH_GUARDRAIL"
 
 # R7: one Outcome line. The old path could stack two — _post_flight_recovery
@@ -5209,6 +5220,269 @@ assert_contains "T2-sink: the drift line reaches the persisted .stderr" \
 T2_SINK_KNOWN=$(_classify_sink_probe idle_timeout) || T2_SINK_KNOWN=""
 assert_not_contains "T2-sink (negative control): a known subtype writes nothing to either sink" \
     "halt_family.unknown" "$T2_SINK_KNOWN"
+
+# ============================================================================
+# mika#2029 — un pilote tué sans avoir produit se compte par son NOM
+#
+# Le trou mesuré : la branche `_terminated_empty` est la SEULE qui saute
+# `_post_flight_recovery`, donc la seule où aucun des deux sites de pose de la
+# ligne `PR:`/`NO_PR:` ne tourne. Le callback partait sans aucune des deux — 8/8
+# des kills depuis le 2026-09-04 — et le reaper (`engine.rs`
+# `reap_orphaned_parent_tasks`) retombait sur son défaut
+# `callback_delivered_without_pr_url`, motif qui confond « le pilote a été tué
+# avant de produire » avec « le callback est malformé ». Deux pannes, un seul
+# nom, aucune mesure possible.
+#
+# La justification est STRUCTURELLE et non statistique (D1) : le contrat total de
+# mika#2121 veut exactement une ligne par callback livré. Ce chemin en doit une
+# même si la classe s'éteignait demain — et elle n'est pas éteinte : zéro
+# `idle_timeout` en octobre sur 99 sessions, mais P(0)≈0,30 sous un taux
+# inchangé, donc l'extinction n'est pas établie.
+# ============================================================================
+
+echo ""
+echo "Test: le kill sans production porte un motif nommé (mika#2029)"
+echo "---------------------------------------------------------------"
+
+# V0 (anti-vacuité) — AVANT tout le reste. Une sonde qui regarde une fonction
+# disparue ou vide se lit exactement comme un arbre propre (classe mika#2205),
+# et tout ce qui suit serait vacuement vert sur une chaîne vide.
+T2029_REASON_FN=$(sed -n '/^_no_pr_reason_from_halt_subtype() {$/,/^}$/p' "$DISPATCH_LIB")
+assert_eq "V0 (anti-vacuité): _no_pr_reason_from_halt_subtype existe, corps non vide" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_REASON_FN" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# La branche `_terminated_empty` de `_run_claude_pilot`, extraite une fois. Elle
+# n'est pas appelable (il faut un vrai pilote et un vrai CLI), donc la sonde
+# comportementale ci-dessous REJOUE sa composition — et V3 épingle cette
+# composition au texte exact du site de production, pour que la réplication ne
+# puisse pas dériver en silence.
+#
+# L'extraction lit le FICHIER et non `declare -f` : le dé-parseur de bash rend
+# `fi;` avec un point-virgule, donc l'ancre de fin de plage ne matcherait pas et
+# la plage courrait jusqu'à la fin de la fonction — une sonde qui regarde trois
+# fois trop de texte sans le dire.
+T2029_BRANCH=$(sed -n '/^    if \[ "$_terminated_empty" = "1" \]; then$/,/^    fi$/p' "$DISPATCH_LIB")
+assert_eq "V0 (anti-vacuité): la branche _terminated_empty a bien été extraite" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_BRANCH" | grep -c .)" -gt 5 ]; then printf 'yes'; else printf 'no'; fi)"
+# La vue SANS commentaires, pour les scans de code. Les commentaires de la
+# branche citent `_resolve_halt_subtype` et `RESULT=$(_classify_terminated_session)`
+# par leur nom — un scan qui les compterait mesurerait sa propre prose.
+T2029_BRANCH_CODE=$(printf '%s\n' "$T2029_BRANCH" | grep -vE '^[[:space:]]*#')
+assert_eq "V0 (anti-vacuité): la vue sans commentaires garde le code des deux branches" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_BRANCH_CODE" | grep -c .)" -ge 8 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Le LECTEUR de la ligne, reproduit : `RE_NO_PR` dans dispatcher.rs est
+# `(?m)^NO_PR:\s+([a-z_]+)`. `[a-z_]+` est gourmand et NON ancré à droite,
+# exactement comme la regex Rust — donc une troncature ne se voit pas par un
+# échec, elle se voit par une capture plus COURTE que le motif posé. C'est
+# précisément ce que cette fonction rend observable.
+_t2029_re_no_pr_capture() {
+    printf '%s\n' "$1" | sed -n 's/^NO_PR:[[:space:]]\{1,\}\([a-z_]\{1,\}\).*/\1/p' | head -1
+}
+
+# La composition de la branche, rejouée sur un environnement injecté. Le
+# sous-type passe par `_resolve_halt_subtype` (D4) — les deux canaux, `.subtype`
+# structuré et scrape `[guardrail]`, sont donc couverts par la même sonde.
+_t2029_line_probe() {
+    local subtype="$1" guardrail_line="$2" seed="${3:-}"
+    local tmp log_id="probe-2029"
+    tmp=$(mktemp -d)
+    if [ -n "$guardrail_line" ]; then
+        printf '%s\n' "$guardrail_line" > "$tmp/${log_id}.stderr"
+    fi
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        STATUS="terminated"; TURNS=2; DURATION=1
+        SESSION_ID="0dab1700-5ca9-4145-87b0-6f618a047220"
+        LOG_ID="$log_id"; PILOT_LOG_DIR="$tmp"
+        STDERR_FILE=""; SUBTYPE="$subtype"
+        TERMINATION_REASON=""; API_ERROR_STATUS=""
+        RESULT="$seed"
+        _resolve_halt_subtype
+        _set_pr_status_line "NO_PR: $(_no_pr_reason_from_halt_subtype "${_HALT_SUBTYPE_RESOLVED:-}")"
+        printf '%s' "$RESULT"
+    )
+    rm -rf "$tmp"
+}
+
+# V1a — les quatre sous-types MESURÉS sur la fenêtre de 30 jours (578 sessions,
+# M2) : error_max_turns 30, stall_detected 6, idle_timeout 5, prompt_cache_dead 1.
+# Un par ligne, parce que le motif porte le sous-type et non la famille (D2) :
+# `budget_exhausted` confondrait error_max_turns avec error_max_budget_usd, et
+# `model_unproductive` confondrait stall_detected avec empty_response.
+for _t2029_st in error_max_turns stall_detected idle_timeout prompt_cache_dead; do
+    T2029_OUT=$(_t2029_line_probe "$_t2029_st" '') || T2029_OUT=""
+    assert_contains "V1a: $_t2029_st -> NO_PR: pilot_terminated_$_t2029_st" \
+        "NO_PR: pilot_terminated_$_t2029_st" "$T2029_OUT"
+    # V1b — le motif posé survit ENTIER à RE_NO_PR. Une capture plus courte
+    # serait un motif plausible, agrégeable, et faux.
+    assert_eq "V1b: RE_NO_PR consomme pilot_terminated_$_t2029_st en entier" \
+        "pilot_terminated_$_t2029_st" \
+        "$(_t2029_re_no_pr_capture "$(printf '%s\n' "$T2029_OUT" | grep '^NO_PR: ')")"
+done
+
+# V1a-bis — le second canal. Un résultat sans `.subtype` fait scraper la ligne
+# `[guardrail]` par `_resolve_halt_subtype` ; le motif doit suivre ce canal-là
+# aussi, sinon la population que mika#2149 (C-4) a rattrapée pour la bannière
+# repartirait en `unknown` pour le comptage.
+T2029_SCRAPED=$(_t2029_line_probe '' '[guardrail] idle_timeout: No meaningful progress for 300s') || T2029_SCRAPED=""
+assert_contains "V1a-bis: un halt arrivé par stderr est compté comme un halt structuré" \
+    "NO_PR: pilot_terminated_idle_timeout" "$T2029_SCRAPED"
+
+# V1c — la normalisation, et la troncature qu'elle empêche. Les sous-types
+# viennent d'un `Literal` Python amont que personne ici ne contrôle : la
+# correction est sur la FORME de ce qu'on pose, jamais sur une liste de valeurs.
+T2029_UPPER=$(_t2029_line_probe 'Error-Max-Turns' '') || T2029_UPPER=""
+assert_contains "V1c: Error-Max-Turns est normalisé, pas tronqué" \
+    "NO_PR: pilot_terminated_error_max_turns" "$T2029_UPPER"
+assert_eq "V1c: et RE_NO_PR en consomme la totalité" \
+    "pilot_terminated_error_max_turns" \
+    "$(_t2029_re_no_pr_capture "$(printf '%s\n' "$T2029_UPPER" | grep '^NO_PR: ')")"
+# La contre-mesure : SANS normalisation, le même sous-type arrive dans
+# `tasks.result` en `callback_no_pr_pilot_terminated_error`. Pas une erreur —
+# une mesure fausse. C'est ce que V1c achète.
+assert_eq "V1c (contre-mesure): le motif NON normalisé serait tronqué par RE_NO_PR" \
+    "pilot_terminated_error" \
+    "$(_t2029_re_no_pr_capture 'NO_PR: pilot_terminated_error-max-turns')"
+
+# V1d — aucune résolution est une résolution. La laisser produire
+# `pilot_terminated_` tendrait à RE_NO_PR une queue VIDE : le `+` ne matcherait
+# pas, la ligne serait ignorée, et le kill retomberait dans le générique que ce
+# livrable comble — un trou refermé par son propre correctif.
+T2029_NONE=$(_t2029_line_probe '' '') || T2029_NONE=""
+assert_contains "V1d: ni sous-type ni ligne [guardrail] -> pilot_terminated_unknown" \
+    "NO_PR: pilot_terminated_unknown" "$T2029_NONE"
+assert_eq "V1d: la queue n'est jamais vide (RE_NO_PR capture quelque chose)" \
+    "pilot_terminated_unknown" \
+    "$(_t2029_re_no_pr_capture "$(printf '%s\n' "$T2029_NONE" | grep '^NO_PR: ')")"
+
+# V1e — le contrat TOTAL de mika#2121 : exactement une ligne, et une seule des
+# deux formes. La graine porte une ligne `PR:` pour que le strip de
+# `_set_pr_status_line` soit mesuré et non supposé.
+T2029_SEEDED=$(_t2029_line_probe idle_timeout '' 'Outcome: PIPELINE_INCOMPLETE — x
+PR: https://github.com/senara-solutions/mika/pull/1') || T2029_SEEDED=""
+assert_eq "V1e: exactement une ligne NO_PR:" "1" \
+    "$(printf '%s\n' "$T2029_SEEDED" | grep -c '^NO_PR: ' || true)"
+assert_eq "V1e: et zéro ligne PR:" "0" \
+    "$(printf '%s\n' "$T2029_SEEDED" | grep -c '^PR: ' || true)"
+# Comptée seule, « exactement une ligne NO_PR: » est VERTE sur l'état d'avant le
+# correctif : une ligne `NO_PR: ` sans queue est toujours une ligne. C'est la
+# panne même que ce livrable ferme, et elle passerait ce comptage. Donc la ligne
+# est lue EN ENTIER, au texte.
+assert_eq "V1e (anti-vacuité): et cette ligne porte le motif en entier" \
+    "NO_PR: pilot_terminated_idle_timeout" \
+    "$(printf '%s\n' "$T2029_SEEDED" | grep '^NO_PR: ' || true)"
+assert_contains "V1e: le reste du RESULT est intact" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2029_SEEDED"
+
+# V1f (contre-vacuité) — la population qui a PRODUIT ne reçoit pas ce motif.
+# Elle passe par `_post_flight_recovery`, qui pose déjà sa propre ligne ; un
+# second motif ici la ferait compter deux fois, et le `banner` dirait d'une
+# branche porteuse de commits qu'aucune PR n'en est sortie faute de travail.
+# Sans cette assertion, V1a–V1e passeraient à l'identique sur un correctif qui
+# poserait la ligne pour TOUT le monde — le défaut que mika#1772 a fermé,
+# réintroduit par le correctif de mika#2029.
+assert_not_contains "V1f (contre-vacuité): le mode banner ne porte aucun pilot_terminated_*" \
+    "pilot_terminated_" "$CLASSIFY_BANNER"
+T2029_ELSE=$(printf '%s\n' "$T2029_BRANCH" | sed -n '/^    else$/,$p')
+assert_eq "V1f (contre-vacuité): la branche else a bien été extraite" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_ELSE" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+assert_contains "V1f (contre-vacuité): et c'est bien celle qui appelle la chaîne de reprise" \
+    "_post_flight_recovery" "$T2029_ELSE"
+assert_not_contains "V1f (contre-vacuité): la branche else ne compose aucun motif" \
+    "_no_pr_reason_from_halt_subtype" "$T2029_ELSE"
+# Un seul site de production compose ce motif. Le compte est fait hors
+# définition et hors commentaire — seuls les appels.
+assert_eq "V1f: _no_pr_reason_from_halt_subtype a exactement un appelant de production" "1" \
+    "$(grep -n '_no_pr_reason_from_halt_subtype' "$DISPATCH_LIB" \
+        | grep -v '_no_pr_reason_from_halt_subtype() {' \
+        | grep -vE ':[[:space:]]*#' | grep -c . || true)"
+
+# --- V2 : le diagnostic réfuté ne survit pas à sa réfutation ----------------
+#
+# La chaîne « rejet d'auth → stall SDK → idle_timeout 300s → mort au tour 1 »
+# était écrite à deux endroits : le commentaire au-dessus de
+# `_run_pilot_sandboxed` et le texte LIVRÉ à mika-dev en mode `full`. Elle a été
+# réfutée le 2026-08-29 (`POST /v1/messages -> 200` sur les sessions mêmes dont
+# elle parlait, six lignées éliminées), et la cause réelle vivait côté pilote
+# (claude-pilot#177, CLOSED 2026-09-11). Un diagnostic faux dans le texte livré
+# coûte plus qu'un silence : il oriente la lecture suivante vers la mauvaise
+# moitié du système.
+assert_eq "V2a: le diagnostic réfuté a disparu de dispatch-lib.sh" "0" \
+    "$(grep -c 'Anthropic 401' "$DISPATCH_LIB" || true)"
+# V2b (contre-vacuité, auto-nettoyante) — le détecteur de V2a est un `grep -c`
+# dont le succès est « rien trouvé » : il serait vert sur un fichier vide, sur un
+# chemin faux, et sur une suppression trop large. Le 401 GitHub de mika#2056
+# (`:1082`) est un 401 LÉGITIME et mesuré, sur un autre service ; il est la
+# frontière. S'il disparaît, V2a cesse de mesurer ce qu'il prétend et cette
+# ligne rougit le jour même.
+assert_contains "V2b (contre-vacuité): le 401 GitHub légitime de mika#2056 est intact" \
+    "401 on api.github.com" "$(cat "$DISPATCH_LIB")"
+# V2c — le texte livré nomme la cause réelle, il ne se contente pas de taire la
+# fausse (D7). Un opérateur qui lit ce callback doit pouvoir aller au bon ticket.
+T2029_FULL=$(_classify_probe '' 2 'idle_timeout' 'No meaningful progress for 300s' 'full') || T2029_FULL=""
+assert_contains "V2c: le mode full nomme la cause réelle (claude-pilot#177)" \
+    "claude-pilot#177" "$T2029_FULL"
+assert_contains "V2c: et renvoie l'opérateur à la ligne Halt class:" \
+    "The 'Halt class:' line above is what names it" "$T2029_FULL"
+assert_not_contains "V2c: le texte livré ne porte plus la chaîne réfutée" \
+    "SDK-stall chain" "$T2029_FULL"
+# V2c-bis — la phrase trouée. Le corps de `_classify_terminated_session` est un
+# `printf '%s' "…"` entre guillemets DOUBLES : un accent grave y est une
+# substitution de commande, pas une citation. Mesuré en écrivant ce correctif —
+# le premier jet livrait « The  line above is what names it », une phrase à trou,
+# et la commande inventée échouait sur un fd 2 déjà dirigé vers /dev/null
+# (mika#903), donc en silence. Un texte de diagnostic qui perd un mot est de la
+# même famille que le diagnostic faux que V2a retire : il oriente la lecture
+# suivante vers rien. Le scan est sur la FORME, au site, parce qu'une assertion
+# sur une phrase ne couvre que la phrase qu'elle cite.
+T2029_CLASSIFY_FN=$(sed -n '/^_classify_terminated_session() {$/,/^}$/p' "$DISPATCH_LIB")
+assert_eq "V2c-bis (anti-vacuité): _classify_terminated_session a bien été extraite" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_CLASSIFY_FN" | grep -c .)" -gt 20 ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "V2c-bis: aucun accent grave dans le texte livré (ce serait une substitution)" "0" \
+    "$(printf '%s\n' "$T2029_CLASSIFY_FN" | grep -vE '^[[:space:]]*#' | grep -c '`' || true)"
+
+# --- V3 : le sous-type vient du résolveur, pas d'un $SUBTYPE brut -----------
+#
+# Même forme que le scan mika#2539 (S4) et pour la même raison : un troisième
+# lecteur de `$SUBTYPE` ferait diverger le motif de la bannière sur la population
+# que le scrape `[guardrail]` rattrape — `Halt class: session_silent` dans le
+# callback et `callback_no_pr_pilot_terminated_unknown` dans `tasks.result`, deux
+# énoncés contradictoires sur une seule session, dont un dans la base.
+assert_contains "V3: la branche résout le sous-type par le résolveur unique" \
+    "_resolve_halt_subtype" "$T2029_BRANCH_CODE"
+assert_not_contains "V3: la branche ne lit aucun \$SUBTYPE brut" \
+    'SUBTYPE:-}' "$(printf '%s\n' "$T2029_BRANCH_CODE" | grep -v '_HALT_SUBTYPE_RESOLVED')"
+assert_contains "V3: elle pose la ligne par _set_pr_status_line (D5)" \
+    "_set_pr_status_line" "$T2029_BRANCH_CODE"
+# La composition EXACTE, au texte. C'est ce qui empêche la sonde
+# `_t2029_line_probe` ci-dessus — qui rejoue la branche faute de pouvoir
+# l'appeler — de mesurer une composition que la production n'utilise plus.
+assert_contains "V3: la composition rejouée par les sondes est celle du site de production" \
+    '_set_pr_status_line "NO_PR: $(_no_pr_reason_from_halt_subtype "${_HALT_SUBTYPE_RESOLVED:-}")"' \
+    "$T2029_BRANCH"
+# L'ORDRE compte, et pas qu'un peu : `RESULT=$(_classify_terminated_session)` est
+# une substitution de commande, donc un SOUS-SHELL. Le résolveur appelé APRÈS
+# aurait à re-scraper stderr ; appelé DEDANS, son mémo mourrait avec le
+# sous-shell. Appelé AVANT, le mémo est hérité — bannière et motif décrivent la
+# même résolution par construction, et stderr n'est lu qu'une fois.
+T2029_ORDER=$(printf '%s\n' "$T2029_BRANCH_CODE" \
+    | grep -nE '_resolve_halt_subtype|RESULT=\$\(_classify_terminated_session\)|_set_pr_status_line' \
+    | sed 's/:.*//' | tr '\n' ' ' | sed 's/ *$//')
+assert_eq "V3: résolution AVANT la substitution, pose APRÈS l'affectation de RESULT" "yes" \
+    "$(set -- $T2029_ORDER; if [ "$#" -eq 3 ] && [ "$1" -lt "$2" ] && [ "$2" -lt "$3" ]; then printf 'yes'; else printf 'no'; fi)"
+
+# --- V4 : herméticité de cette section (patron mika#2178 T9 / mika#2493) ----
+T2029_SECTION=$(sed -n '/^# mika#2029 — un pilote tué sans avoir produit se compte par son NOM/,/^# The caller must route on the measurement/p' "${BASH_SOURCE[0]}")
+assert_eq "Herméticité: l'extraction de la section mika#2029 a trouvé la section" \
+    "yes" "$(if [ -n "$T2029_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "Herméticité: aucune invocation de forge en tête de commande" \
+    "0" "$(printf '%s\n' "$T2029_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune invocation de forge en substitution" \
+    "0" "$(printf '%s\n' "$T2029_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune écriture hors mktemp (ni /var/log, ni le dépôt)" \
+    "0" "$(printf '%s\n' "$T2029_SECTION" | grep -cE '>[[:space:]]*"?(/var/log|\$SCRIPT_DIR|\$DISPATCH_LIB)' || true)"
 
 # The caller must route on the measurement, not on STATUS alone.
 assert_contains "the terminated branch is gated on _pilot_left_no_work" \
@@ -9738,16 +10012,30 @@ assert_eq "S2 (double sens): aucune entrée d'allowlist périmée" "" \
 # commit dirait `rescue no_halt_signal`, pour une même session, l'un des deux
 # gravé dans l'historique git pour toujours.
 #
+# Ce que ce scan compte est le nombre d'APPELANTS DU RÉSOLVEUR, pas un plafond de
+# consommateurs : un site de plus qui l'appelle est la conformité, un site de
+# plus qui lit `$SUBTYPE` à la main serait la panne. mika#2029 en a ajouté un
+# troisième — la branche `_terminated_empty` de `_run_claude_pilot`, qui compose
+# le motif `NO_PR: pilot_terminated_<sous-type>` — et il l'appelle AVANT la
+# substitution `RESULT=$(_classify_terminated_session)` : résolu ici, le mémo est
+# hérité par le sous-shell, donc le motif et la bannière décrivent la même
+# résolution par construction. La contrepartie `$SUBTYPE` de cette branche est
+# scannée par V3 dans le bloc mika#2029.
+#
 # Le compte est fait hors définition et hors commentaire — seuls les appels.
 T2539_RESOLVER_CALLS=$(grep -n '_resolve_halt_subtype' "$DISPATCH_LIB" \
     | grep -v '_resolve_halt_subtype() {' \
     | grep -vE ':[[:space:]]*#' | grep -c . || true)
-assert_eq "S4: _resolve_halt_subtype a exactement deux appelants de production" "2" \
+assert_eq "S4: _resolve_halt_subtype a exactement trois appelants de production" "3" \
     "$T2539_RESOLVER_CALLS"
-assert_contains "S4: l'un est la bannière du callback" \
+assert_contains "S4: le premier est la bannière du callback" \
     '_resolve_halt_subtype' "$(sed -n '/^_classify_terminated_session() {$/,/^}$/p' "$DISPATCH_LIB")"
-assert_contains "S4: l'autre est le compositeur du sujet de sauvetage" \
+assert_contains "S4: le deuxième est le compositeur du sujet de sauvetage" \
     '_resolve_halt_subtype' "$T2539_TOKEN_FN"
+assert_contains "S4: le troisième est la branche _terminated_empty (mika#2029)" \
+    '_resolve_halt_subtype' \
+    "$(sed -n '/^    if \[ "$_terminated_empty" = "1" \]; then$/,/^    fi$/p' "$DISPATCH_LIB" \
+        | grep -vE '^[[:space:]]*#')"
 
 # Le mémo est réinitialisé au site qui lit le sous-type d'une NOUVELLE session,
 # et pas chez l'un des deux appelants : « une session, une réponse » est ainsi

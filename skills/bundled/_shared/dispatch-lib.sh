@@ -2165,9 +2165,18 @@ Remedy: $_egress_remedy"
         # this alongside ANTHROPIC_BASE_URL routes ALL CC-internal traffic
         # through the /anthropic-proxy/* reverse-proxy path where host-side
         # OAuth injection lives. Without it, those internal calls fall through
-        # to HTTPS_PROXY CONNECT tunnels (carrying the sandbox placeholder key)
-        # → Anthropic 401 / SDK stall → guardrail idle_timeout 300s → pilot
-        # dies at Turns:1 with HEAD unchanged (n=6 dispatches observed).
+        # to HTTPS_PROXY CONNECT tunnels carrying the sandbox placeholder key,
+        # so they arrive at api.anthropic.com with no usable credential.
+        #
+        # What that costs has NOT been measured, and this comment used to claim
+        # it had been: the chain it asserted — auth rejection into an SDK stall
+        # into a turn-1 `idle_timeout` kill, "n=6 dispatches observed" — was
+        # REFUTED on 2026-08-29 (mika#2029). Those same sessions show
+        # `POST /v1/messages -> 200`, six candidate lineages were eliminated,
+        # and the stall cause that was eventually traced to its end lives in
+        # claude-pilot#177 (CLOSED 2026-09-11) — upstream of this variable and
+        # unaffected by it. The reason to set it is the canary below, which is
+        # a measurement; the deleted chain was a plausible story.
         # Found via `strings` on bundled claude binary; verified end-to-end
         # in canary (opus-4-8, stream-json, no --bare) → 1.7s clean completion.
         # γ (MITM CONNECT tunnels) filed as long-term robustness follow-up so
@@ -4842,7 +4851,27 @@ ${PILOT_OUTPUT_RAW}"
 
     if [ "$_terminated_empty" = "1" ]; then
         PILOT_SESSION_TERMINATED=1
+        # mika#2029 : résoudre le sous-type ICI, en commande, AVANT la
+        # substitution ci-dessous. `RESULT=$(_classify_terminated_session)` est un
+        # SOUS-SHELL : le mémo et le `_HALT_SUBTYPE_RESOLVED` qu'il publie
+        # mourraient avec lui — le piège que le commentaire de
+        # `_resolve_halt_subtype` nomme explicitement. Résolu ici, le mémo est
+        # HÉRITÉ par le sous-shell : la bannière `Halt class:` et le motif
+        # `NO_PR:` décrivent donc la même résolution par construction, et stderr
+        # n'est lu qu'une fois.
+        _resolve_halt_subtype
         RESULT=$(_classify_terminated_session)
+        # mika#2029 (D1, D5, D6) — ce chemin est le SEUL qui saute
+        # `_post_flight_recovery`, donc le seul où aucun des deux sites de pose
+        # ne tourne. Le callback partait sans ligne `PR:` ni `NO_PR:` — 8/8 des
+        # kills depuis le 2026-09-04 — et le reaper (`engine.rs`
+        # `reap_orphaned_parent_tasks`) écrivait son défaut
+        # `callback_delivered_without_pr_url`, motif qui confond ce kill avec un
+        # callback malformé. La justification est STRUCTURELLE, pas statistique :
+        # le contrat total de mika#2121 veut exactement une ligne par callback
+        # livré, donc ce chemin en doit une même si la classe s'éteignait demain.
+        # Posé après l'affectation de RESULT ci-dessus, qui écrase et n'ajoute pas.
+        _set_pr_status_line "NO_PR: $(_no_pr_reason_from_halt_subtype "${_HALT_SUBTYPE_RESOLVED:-}")"
     else
         _post_flight_recovery
         if [ "$_terminated_with_work" = "1" ]; then
@@ -5390,6 +5419,40 @@ _halt_hint_meaning() {
     esac
 }
 
+# Le motif `NO_PR:` d'un pilote tué par un garde-fou sans avoir produit (mika#2029).
+#
+# POURQUOI LE SOUS-TYPE ET NON LA FAMILLE (D2). `_halt_family` rend six familles
+# pour douze sous-types : `budget_exhausted` confond `error_max_turns` et
+# `error_max_budget_usd`, `model_unproductive` confond `stall_detected` et
+# `empty_response`. La distribution mesurée sur 578 sessions (30 jours, mika#2029
+# M2) sépare justement `error_max_turns` (30) de `stall_detected` (6) et de
+# `idle_timeout` (5) — trois remèdes différents. Un motif qui porte la famille
+# rendrait ces trois-là indiscernables dans `tasks.result`, c'est-à-dire
+# exactement la mesure que ce ticket existe pour rendre possible. Le prix est un
+# motif long (`callback_no_pr_pilot_terminated_error_max_turns`, 46 caractères) ;
+# la colonne est un TEXT libre, donc c'est un prix et non une limite.
+#
+# POURQUOI LA NORMALISATION (D3). Le lecteur de cette ligne est `RE_NO_PR` dans
+# `dispatcher.rs` : `(?m)^NO_PR:\s+([a-z_]+)`. Un caractère hors `[a-z_]` ne fait
+# pas échouer le parse — il le TRONQUE, et le motif tronqué ressemble à une
+# mesure. `Error-Max-Turns` arriverait dans `tasks.result` en
+# `callback_no_pr_pilot_terminated_error`, un motif plausible, agrégeable, et
+# faux. La normalisation rend cette classe impossible plutôt que de compter sur
+# ce que le producteur amont écrit : les sous-types viennent d'un `Literal`
+# Python (claude-pilot `types.py`) que personne ici ne contrôle.
+#
+# Une résolution VIDE est une résolution — « cette session n'a laissé aucun
+# signal de halte » — et elle a son propre motif. La laisser produire
+# `pilot_terminated_` tendrait à `RE_NO_PR` une queue vide : le `+` ne matcherait
+# pas, la ligne serait ignorée, et le kill retomberait dans le générique que ce
+# livrable comble.
+_no_pr_reason_from_halt_subtype() {
+    local s="${1:-}"
+    [ -n "$s" ] || { printf '%s' "pilot_terminated_unknown"; return 0; }
+    s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z_' '_')
+    printf '%s' "pilot_terminated_${s}"
+}
+
 # Resolve THE halt subtype of this session, once, for every consumer (mika#2539).
 #
 # WHY THIS IS A FUNCTION AND NOT A `$SUBTYPE` READ. Two sites now ask what halted
@@ -5539,7 +5602,7 @@ Duration: ${DURATION:-unknown}ms
 ${cause}
 ${halt_lines}
 
-HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. See the stall lineage on mika#1901 and the note above _run_pilot_sandboxed on the Anthropic 401 / SDK-stall chain that ends in exactly this shape.
+HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. The 'Halt class:' line above is what names it, and it is the only line here that does: this paragraph cannot tell you which kill this was. One stall cause has been traced to its end — claude-pilot#177 (CLOSED 2026-09-11), where the content_block_stop of a tool_use block closed the model-wait window its own tool result had just opened, leaving a turn 300s of budget instead of 900s. The auth lineage this text used to name was refuted by measurement on 2026-08-29 (mika#2029). The kill classes, and what each one rules out: docs/solutions/dev-loop/.
 
 Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
 }
