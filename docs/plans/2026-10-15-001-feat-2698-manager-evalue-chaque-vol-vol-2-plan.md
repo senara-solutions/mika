@@ -119,6 +119,13 @@ Un garde dont le succès est « rien trouvé » ne distingue pas « ça marche �
   `issue comment` — le contrôle négatif, sans lequel « zéro appel » serait
   satisfait par un posteur qui ne poste jamais.
 
+## Acceptance criteria
+
+Les deux critères de mika#2698 que ce vol porte (AC3 a été livré par le vol 1) :
+
+- AC1 (forme nominale) : avec l'interrupteur `MIKA_MANAGER_EVALUATE_WRITE` OFF, aucun appel d'écriture `gh`. Garantie structurelle par l'extension de `no_dispatch_test.rs`, avec un contrôle négatif (§ 5).
+- AC2 : avec l'interrupteur ON, un seul commentaire par vol, idempotent sur le rejeu du cycle (checkpoint `posted_flight_task_ids`).
+
 ## Contrat de vérification
 
 `cargo test -p mika-agent milestone_manager`, `cargo test -p mika-agent perimeter`,
