@@ -41,6 +41,7 @@ use super::evaluator::{DeathCause, FlightIssue, FlightRecommendation, FlightVerd
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
 use super::reader::priority_from_labels;
+use super::relief::RELIEF_SIZE;
 use super::types::{
     Alert, AlertKind, Assessment, CiState, IssueState, MilestoneState, Severity, SubIssue,
 };
@@ -377,6 +378,73 @@ impl Reporter {
             }
         }
 
+        // Relève à grommer (mika#2700 Phase 2 (c) vol 1). Derrière la section
+        // du bassin, parce que la relève se lit *derrière* le bassin : c'est
+        // l'ordre du ticket et l'ordre de la décision — ce qui attend n'a de
+        // sens qu'après ce qui entre.
+        //
+        // Deux conditions, pour deux faits distincts. `relief` à `None` veut
+        // dire « la relève n'a pas été nommée » (blob antérieur au champ) : une
+        // section affirmerait une mesure qui n'a pas eu lieu. `next` vide veut
+        // dire « rien à grommer d'avance » : une section vide inviterait à
+        // chercher une cause là où il n'y a rien.
+        //
+        // « mode ombre — aucun groom déclenché » est dans le TITRE, pas en note
+        // de bas de page : une liste de tickets « à grommer » se lit comme un
+        // geste fait si rien ne dit le contraire à l'instant où l'œil tombe
+        // dessus. Au vol 1, aucun interrupteur n'existe — la mention n'est pas
+        // une précaution, c'est le fait.
+        if let Some(relief) = &assessment.relief
+            && !relief.next.is_empty()
+        {
+            writeln!(out).unwrap();
+            writeln!(
+                out,
+                "### Relève à grommer (mode ombre — aucun groom déclenché)"
+            )
+            .unwrap();
+            // Le suffixe passe par `candidate_suffix` : priorité par son **nom
+            // de label** et mention `hors milestone`, exactement comme le
+            // bassin. Deux rendus de la même paire (numéro, provenance) dans un
+            // même rapport se contrediraient le jour où l'un change.
+            //
+            // Le motif est celui du bassin, par `RefusalReason::label()` : un
+            // libellé réécrit ici serait une seconde orthographe du même fait.
+            for t in &relief.next {
+                let _ = writeln!(
+                    out,
+                    "- #{}{} — à grommer : {}",
+                    t.number,
+                    candidate_suffix(state, t.number, t.origin),
+                    t.motive.label(),
+                );
+            }
+            // Le reste se **compte**, il ne s'énumère pas : au-delà de quatre,
+            // l'opérateur ne lit plus une consigne mais un inventaire. Taire ce
+            // compte ferait lire les quatre nommés comme la totalité de ce qui
+            // attend.
+            if relief.beyond > 0 {
+                let pluriel = if relief.beyond == 1 { "" } else { "s" };
+                let _ = writeln!(
+                    out,
+                    "- {} autre{pluriel} candidat{pluriel} au-delà des {RELIEF_SIZE} nommés",
+                    relief.beyond,
+                );
+            }
+            // La troncature se dit **ici aussi**. Sur `Some(true)`,
+            // `outside_candidates` est vide par décision : la relève est alors
+            // celle du milestone cible, pas celle du dépôt. Un opérateur qui
+            // lit quatre numéros sans cette ligne lirait « les 4 prochains du
+            // dépôt ». `Some(false)` et `None` ne justifient aucune ligne —
+            // « pas mesuré » n'est pas « mesuré non tronqué ».
+            if state.outside_read_truncated == Some(true) {
+                let _ = writeln!(
+                    out,
+                    "- Lecture hors milestone tronquée à {OUTSIDE_READ_LIMIT} issues — relève limitée au milestone cible",
+                );
+            }
+        }
+
         out
     }
 }
@@ -673,6 +741,7 @@ fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
 mod tests {
     use super::*;
     use crate::milestone_manager::pool::{PoolCandidate, ReadyTicket, assess_pool};
+    use crate::milestone_manager::relief::name_relief;
     use crate::milestone_manager::types::{
         ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
     };
@@ -735,6 +804,7 @@ mod tests {
             contention_events: vec![],
             pool: None,
             flight_verdicts: vec![],
+            relief: None,
         }
     }
 
@@ -1616,5 +1686,227 @@ mod tests {
             !nominal.contains("tronquée"),
             "une lecture complète ne se commente pas :\n{nominal}"
         );
+    }
+
+    // -- mika#2700 Phase 2 (c) vol 1 : la relève à grommer, en mode ombre ----
+
+    /// Le rapport d'un état, bassin **et** relève posés par la production.
+    ///
+    /// Jamais par un littéral : le rapporteur doit rendre ce que l'assesseur
+    /// produit, pas ce qu'un test imagine qu'il produit. Un fixture écrit à la
+    /// main resterait vert le jour où `name_relief` change d'ordre.
+    fn report_with_pool_and_relief(state: &MilestoneState) -> String {
+        let cands = milestone_cands(state);
+        let verdict = assess_pool(&state.ready_pool, &cands, &state.outside_candidates);
+        let relief = name_relief(&verdict, &cands, &state.outside_candidates);
+        let mut a = empty_assessment();
+        a.pool = Some(verdict);
+        a.relief = Some(relief);
+        Reporter::new().report(state, &a)
+    }
+
+    /// Cas 12 — chaque ticket de la relève est nommé, suffixé et motivé, dans
+    /// l'ordre du bassin, et le reste est **compté**.
+    ///
+    /// Cinq candidats sans plan groomé, quatre nommés. Le fixture couvre les
+    /// quatre formes de suffixe d'un seul coup : priorité + provenance
+    /// (`#2740`), priorité seule (`#2731`, `#2726`), aucune des deux (`#2744`)
+    /// — et `agent-core` est là pour que le rendu reste le **nom du label** et
+    /// jamais le rang (l'écrire « p2 » serait faux).
+    ///
+    /// Le cinquième, `#2750`, n'est pas nommé : il est compté. Taire ce compte
+    /// ferait lire les quatre comme la totalité de ce qui attend.
+    #[test]
+    fn mika2700_la_section_releve_nomme_chaque_ticket_avec_son_motif() {
+        let subs = vec![
+            {
+                let mut c = base_issue(2731);
+                c.priority_rank = Some(1);
+                c.labels = vec!["p1-important".into()];
+                c
+            },
+            {
+                let mut c = base_issue(2726);
+                c.priority_rank = Some(2);
+                c.labels = vec!["agent-core".into()];
+                c
+            },
+            base_issue(2744),
+        ];
+        let mut state = state_with(subs, ProgressCounts::default());
+        state.outside_candidates = vec![
+            PoolCandidate {
+                number: 2740,
+                state: IssueState::Open,
+                priority_rank: Some(0),
+                plan_present: false,
+                labels: vec!["p0-critical".into()],
+            },
+            PoolCandidate {
+                number: 2750,
+                state: IssueState::Open,
+                priority_rank: None,
+                plan_present: false,
+                labels: vec![],
+            },
+        ];
+        let out = report_with_pool_and_relief(&state);
+        let section = out
+            .split("### Relève à grommer")
+            .nth(1)
+            .expect("la section de la relève doit être rendue");
+
+        for attendu in [
+            "- #2740 (p0-critical, hors milestone) — à grommer : plan groomé absent",
+            "- #2731 (p1-important) — à grommer : plan groomé absent",
+            "- #2726 (agent-core) — à grommer : plan groomé absent",
+            "- #2744 — à grommer : plan groomé absent",
+        ] {
+            assert!(
+                section.contains(attendu),
+                "ligne attendue « {attendu} » dans :\n{section}"
+            );
+        }
+
+        // L'ordre du bassin : le p0 du dehors passe devant tout le milestone,
+        // puis la priorité, puis la provenance, puis le numéro.
+        let ordre: Vec<usize> = [2740, 2731, 2726, 2744]
+            .iter()
+            .map(|n| {
+                section
+                    .find(&format!("- #{n}"))
+                    .expect("chaque nommé doit être dans la section")
+            })
+            .collect();
+        assert!(
+            ordre.windows(2).all(|w| w[0] < w[1]),
+            "la relève se lit dans l'ordre de tri du bassin :\n{section}"
+        );
+
+        assert!(
+            !section.contains("#2750"),
+            "au-delà de quatre, un candidat est compté et non nommé :\n{section}"
+        );
+        assert_eq!(RELIEF_SIZE, 4, "la borne rendue est celle du module");
+        assert!(
+            section.contains("- 1 autre candidat au-delà des 4 nommés"),
+            "le reste se compte, au singulier quand il vaut un :\n{section}"
+        );
+    }
+
+    /// Cas 13 — pas de relève, pas de section. Deux absences, deux faits
+    /// distincts, et un contrôle négatif.
+    ///
+    /// `relief: None` veut dire « la relève n'a pas été nommée » (blob
+    /// antérieur au champ) : une section affirmerait une mesure qui n'a pas eu
+    /// lieu. `next` vide veut dire « rien à grommer d'avance » : une section
+    /// vide inviterait à chercher une cause là où il n'y a rien.
+    ///
+    /// Le troisième arme est ce qui sépare les deux premiers d'un rapporteur
+    /// qui ne rendrait jamais la section : sans lui, l'absence se lirait comme
+    /// une condition qui marche.
+    #[test]
+    fn mika2700_sans_releve_la_section_est_absente() {
+        let state = state_with(vec![base_issue(1)], ProgressCounts::default());
+
+        let sans_mesure = Reporter::new().report(&state, &empty_assessment());
+        assert!(
+            !sans_mesure.contains("### Relève à grommer"),
+            "pas de mesure ⇒ pas de section — obtenu :\n{sans_mesure}"
+        );
+
+        let mut a = empty_assessment();
+        let verdict = assess_pool(&[], &[], &[]);
+        a.relief = Some(name_relief(&verdict, &[], &[]));
+        a.pool = Some(verdict);
+        let mesure_vide = Reporter::new().report(&state, &a);
+        assert!(
+            !mesure_vide.contains("### Relève à grommer"),
+            "rien à grommer ⇒ pas de section — obtenu :\n{mesure_vide}"
+        );
+        assert!(
+            !mesure_vide.contains("au-delà des"),
+            "aucun reste à compter quand il n'y a aucun nommé :\n{mesure_vide}"
+        );
+
+        let avec = report_with_pool_and_relief(&state_with(
+            vec![base_issue(2731)],
+            ProgressCounts::default(),
+        ));
+        assert!(
+            avec.contains("### Relève à grommer"),
+            "contrôle négatif : un candidat à grommer et la section est là :\n{avec}"
+        );
+    }
+
+    /// Cas 14 — la relève se lit **derrière** le bassin, et « mode ombre »
+    /// est dans son titre.
+    ///
+    /// L'ordre est celui de la décision : ce qui attend n'a de sens qu'après ce
+    /// qui entre. Et le titre porte la mention parce qu'une liste de tickets
+    /// « à grommer » se lit comme un geste fait si rien ne dit le contraire à
+    /// l'endroit où l'œil tombe — une note en fin de section arriverait après
+    /// la conclusion du lecteur.
+    #[test]
+    fn mika2700_la_releve_se_lit_derriere_le_bassin_et_porte_le_mode_ombre_dans_son_titre() {
+        let state = state_with(vec![base_issue(2731)], ProgressCounts::default());
+        let out = report_with_pool_and_relief(&state);
+
+        assert!(
+            out.contains("### Relève à grommer (mode ombre — aucun groom déclenché)"),
+            "le mode ombre est dans le titre :\n{out}"
+        );
+        let bassin = out
+            .find("### Bassin ready")
+            .expect("la section du bassin doit être rendue");
+        let releve = out
+            .find("### Relève à grommer")
+            .expect("la section de la relève doit être rendue");
+        assert!(
+            bassin < releve,
+            "la relève se lit derrière le bassin :\n{out}"
+        );
+    }
+
+    /// Cas 15 — une lecture hors milestone tronquée borne la relève au
+    /// milestone cible, et le dit.
+    ///
+    /// Sur `Some(true)`, `outside_candidates` est vide par décision du lecteur :
+    /// la relève nommée est alors celle du milestone, pas celle du dépôt. Un
+    /// opérateur qui lit quatre numéros sans cette ligne lirait « les 4
+    /// prochains du dépôt » — un ordre que le cycle n'a pas mesuré.
+    ///
+    /// `Some(false)` est la question posée et la page non pleine ; `None` est
+    /// « pas mesuré ». Ni l'un ni l'autre ne justifie une ligne, et pour deux
+    /// raisons différentes qu'une même absence sert bien.
+    #[test]
+    fn mika2700_une_lecture_hors_milestone_tronquee_borne_la_releve_au_milestone() {
+        let mut state = state_with(vec![base_issue(2731)], ProgressCounts::default());
+        state.outside_read_truncated = Some(true);
+        let out = report_with_pool_and_relief(&state);
+        let section = out
+            .split("### Relève à grommer")
+            .nth(1)
+            .expect("la section de la relève doit être rendue");
+        assert!(
+            section.contains(
+                "- Lecture hors milestone tronquée à 100 issues — relève limitée au \
+                 milestone cible"
+            ),
+            "la troncature se dit dans la section de la relève aussi :\n{section}"
+        );
+
+        for muet in [Some(false), None] {
+            state.outside_read_truncated = muet;
+            let nominal = report_with_pool_and_relief(&state);
+            let section = nominal
+                .split("### Relève à grommer")
+                .nth(1)
+                .expect("la section de la relève doit être rendue");
+            assert!(
+                !section.contains("tronquée"),
+                "{muet:?} ne justifie aucune ligne de troncature :\n{section}"
+            );
+        }
     }
 }

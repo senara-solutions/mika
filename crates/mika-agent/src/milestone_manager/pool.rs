@@ -217,6 +217,26 @@ pub struct PoolVerdict {
     pub refusals: Vec<AdmissionRefusal>,
 }
 
+/// La clé de tri du bassin : `(priorité, provenance, numéro)` — **site unique**
+/// du dépôt (mika#2700 Phase 2 (c) vol 1).
+///
+/// Extraite parce qu'un second lecteur est arrivé : la relève nommée doit
+/// présenter les prochains tickets à grommer *dans l'ordre du bassin*, et une
+/// deuxième écriture du triplet est une divergence silencieuse — les deux
+/// listes se contrediraient dans le même rapport sans qu'aucune assertion de
+/// comportement rougisse (doctrine du lecteur unique, mika#2201).
+///
+/// `None` vaut `u8::MAX`, donc **en dernier** : l'absence de label de priorité
+/// n'est pas p0. La priorité domine la provenance — voir le docstring du module
+/// pour pourquoi l'ordre des deux critères est la décision et non un détail.
+pub fn pool_sort_key(
+    priority_rank: Option<u8>,
+    origin: CandidateOrigin,
+    number: u64,
+) -> (u8, u8, u64) {
+    (priority_rank.unwrap_or(u8::MAX), origin.rank(), number)
+}
+
 /// Juge le bassin et nomme les admissions comme les refus — fonction **pure**,
 /// sans E/S.
 ///
@@ -229,19 +249,19 @@ pub struct PoolVerdict {
 ///    disponibles le manager recommanderait un ticket à chaque cycle jusqu'à 4,
 ///    puis à nouveau dès qu'un vol démarre : un geste par cycle, soit exactement
 ///    le bruit que l'orchestrateur évite à la main.
-/// 3. **Le tri est `(priority_rank.unwrap_or(u8::MAX), origin.rank(), number)`.**
-///    La priorité domine la provenance — voir le docstring du module pour
-///    pourquoi l'ordre des deux critères est la décision et non un détail. Un
-///    ticket sans label de priorité passe **en dernier** : l'absence de priorité
-///    n'est pas p0.
+/// 3. **Le tri passe par [`pool_sort_key`]**, son site unique depuis
+///    mika#2700. La priorité domine la provenance — voir le docstring du module
+///    pour pourquoi l'ordre des deux critères est la décision et non un détail.
+///    Un ticket sans label de priorité passe **en dernier** : l'absence de
+///    priorité n'est pas p0.
 /// 4. **Un même numéro n'est jugé qu'une fois.** Les deux ensembles sont pris à
 ///    deux appels `gh` distincts et se recoupent par construction (une
 ///    `sub_issue` du milestone est aussi une issue ouverte du dépôt). Le premier
 ///    vu gagne, et les candidats du milestone sont parcourus d'abord — donc un
 ///    ticket du milestone n'est jamais étiqueté `Outside`.
-/// 5. **Les refus sont rendus hors famine aussi**, et triés
-///    `(origin.rank(), number)` pour que le rapport soit stable d'un cycle à
-///    l'autre quand rien n'a changé.
+/// 5. **Les refus sont rendus hors famine aussi**, et triés par la même clé,
+///    priorité absente, pour que le rapport soit stable d'un cycle à l'autre
+///    quand rien n'a changé.
 pub fn assess_pool(
     pool: &[ReadyTicket],
     milestone_candidates: &[PoolCandidate],
@@ -304,9 +324,13 @@ pub fn assess_pool(
             eligible.push((s, origin));
         }
     }
-    eligible
-        .sort_by_key(|(s, origin)| (s.priority_rank.unwrap_or(u8::MAX), origin.rank(), s.number));
-    refusals.sort_by_key(|r| (r.origin.rank(), r.number));
+    eligible.sort_by_key(|(s, origin)| pool_sort_key(s.priority_rank, *origin, s.number));
+    // Un `AdmissionRefusal` ne porte pas de rang de priorité — la décision de
+    // refus ne le consulte pas — donc il entre dans la clé en **absent**. Le
+    // premier terme est alors constant sur toute la liste et l'ordre obtenu est
+    // exactement l'ancien `(origin.rank(), number)` : les 17 tests du bassin
+    // sont le contrôle de non-régression de cette égalité.
+    refusals.sort_by_key(|r| pool_sort_key(None, r.origin, r.number));
 
     // `POOL_MAX - available` ne peut pas déborder : la bande famine impose
     // `available < POOL_MIN`, et `POOL_MIN <= POOL_MAX`.
@@ -822,6 +846,85 @@ mod tests {
             serde_json::from_str::<PoolVerdict>(blob_vol_1).is_err(),
             "`admit` a changé de forme au vol 2 : la relecture échoue, et le test \
              existe pour que ce fait soit nommé plutôt que découvert"
+        );
+    }
+
+    // -- mika#2700 Phase 2 (c) vol 1 : la clé de tri a un site unique --------
+
+    /// La clé de tri du bassin n'a qu'un site, et c'est [`pool_sort_key`].
+    ///
+    /// Deux moitiés, parce qu'aucune des deux ne voit la panne de l'autre.
+    /// **Le comportement** : la priorité domine la provenance, qui domine le
+    /// numéro, et une priorité absente passe en dernier. **Le balayage** :
+    /// `origin.rank()` ne s'appelle que là. Sans lui, la relève nommée pourrait
+    /// réécrire le triplet à son compte et présenter, dans le même rapport, un
+    /// ordre qui contredit celui du bassin — sans qu'aucune assertion de
+    /// comportement rougisse (doctrine du lecteur unique, mika#2201 ; classe
+    /// du marqueur silencieux, mika#2158).
+    ///
+    /// Le balayage lit le répertoire **à plat** : la porte 1 du `DecisionCore`
+    /// interdit un `tests/` imbriqué sous `milestone_manager/`, donc tout test
+    /// du module vit derrière un `#[cfg(test)]` de son propre fichier et la
+    /// troncature ci-dessous suffit (prémisse mika#2321).
+    #[test]
+    fn mika2700_la_cle_de_tri_du_bassin_a_un_site_unique() {
+        assert!(
+            pool_sort_key(Some(0), CandidateOrigin::Outside, u64::MAX)
+                < pool_sort_key(Some(1), CandidateOrigin::Milestone, 1),
+            "la priorité domine la provenance comme le numéro"
+        );
+        assert!(
+            pool_sort_key(Some(1), CandidateOrigin::Milestone, u64::MAX)
+                < pool_sort_key(Some(1), CandidateOrigin::Outside, 1),
+            "à priorité égale, le milestone passe avant le dehors"
+        );
+        assert!(
+            pool_sort_key(Some(1), CandidateOrigin::Milestone, 1)
+                < pool_sort_key(Some(1), CandidateOrigin::Milestone, 2),
+            "à priorité et provenance égales, le plus petit numéro passe devant"
+        );
+        assert!(
+            pool_sort_key(Some(u8::MAX - 1), CandidateOrigin::Outside, u64::MAX)
+                < pool_sort_key(None, CandidateOrigin::Milestone, 1),
+            "une priorité absente passe en dernier — l'absence n'est pas p0"
+        );
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/milestone_manager");
+        let mut sites: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("le répertoire du module doit être lisible") {
+            let path = entry.expect("entrée de répertoire lisible").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let src = std::fs::read_to_string(&path).expect("source du module lisible");
+            // La production seule : un test a le droit d'appeler la clé, et
+            // celui-ci l'appelle quatre fois juste au-dessus.
+            let production = src.split("#[cfg(test)]").next().unwrap_or_default();
+            for (i, line) in production.lines().enumerate() {
+                // La prose *sur* la clé n'est pas un appel : trois paragraphes
+                // en parlent au-dessus (forme du signal S, mika#2050).
+                let code = line.split("//").next().unwrap_or_default();
+                if code.contains(".rank()") {
+                    sites.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "`origin.rank()` ne doit s'appeler que dans `pool_sort_key` ; \
+             sites trouvés : {sites:?}. Un second site réécrit la clé de tri : \
+             route-le par `pool_sort_key` plutôt que d'allonger ce compte"
+        );
+        assert!(
+            sites[0].starts_with("pool.rs:"),
+            "le site unique vit dans `pool.rs` ; trouvé : {}",
+            sites[0]
         );
     }
 }

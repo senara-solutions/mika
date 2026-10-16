@@ -12,6 +12,7 @@
 //! `last_activity_at` is older than the threshold).
 
 use super::pool;
+use super::relief;
 use super::types::{
     Alert, AlertKind, Assessment, IssueState, MilestoneState, Recommendation, Severity, SubIssue,
 };
@@ -68,6 +69,26 @@ impl Assessor {
         let recommendation = pick_next_action(state, &alerts);
         let severity = classify_severity(state, &alerts);
 
+        // Les candidats du milestone sont projetés **une seule fois** : le
+        // bassin et la relève doivent juger la même lecture. Deux appels à
+        // `milestone_pool_candidates` seraient deux projections du même état —
+        // identiques aujourd'hui, et exactement le genre d'écart qu'aucune
+        // assertion ne verrait le jour où la projection cesse d'être pure.
+        let milestone_candidates = milestone_pool_candidates(state);
+        let pool_verdict = pool::assess_pool(
+            &state.ready_pool,
+            &milestone_candidates,
+            &state.outside_candidates,
+        );
+        // La relève dérive du verdict qu'on vient de poser, pas d'un second
+        // jugement du bassin (mika#2700 vol 1, décision 1). `relief::name_relief`
+        // est pure et ne refiltre rien.
+        let relief = relief::name_relief(
+            &pool_verdict,
+            &milestone_candidates,
+            &state.outside_candidates,
+        );
+
         Assessment {
             severity,
             recommendation,
@@ -81,15 +102,16 @@ impl Assessor {
             // de lui passer les trois lectures et de poser le résultat. Toujours
             // `Some` — un cycle qui arrive ici a lu le bassin, et `None` est
             // réservé aux blobs antérieurs au champ.
-            pool: Some(pool::assess_pool(
-                &state.ready_pool,
-                &milestone_pool_candidates(state),
-                &state.outside_candidates,
-            )),
+            pool: Some(pool_verdict),
             // L'assesseur ne voit pas les vols : il ne lit que l'état du
             // milestone. Les verdicts sont posés par la cadence, qui tient la
             // `FlightSource` et la borne du cycle précédent (mika#2698).
             flight_verdicts: Vec::new(),
+            // La relève du **même** bassin que celui posé juste au-dessus
+            // (mika#2700 Phase 2 (c) vol 1). Toujours `Some` pour la même
+            // raison que `pool` : un cycle qui arrive ici a lu le bassin, et
+            // `None` est réservé aux blobs antérieurs au champ.
+            relief: Some(relief),
         }
     }
 }
@@ -730,6 +752,75 @@ mod tests {
                     .collect::<Vec<_>>(),
                 &state.outside_candidates,
             )
+        );
+    }
+
+    /// Cas 11 (mika#2700) — l'assesseur pose la relève **du bassin qu'il vient
+    /// de poser**, pas celle d'un second jugement.
+    ///
+    /// C'est la seule propriété que ni `relief.rs` ni `pool.rs` ne peuvent
+    /// voir : un assesseur qui rappellerait `assess_pool` pour la relève
+    /// produirait aujourd'hui le même verdict, et l'écart n'apparaîtrait que le
+    /// jour où la projection des candidats cesse d'être pure — sans qu'aucune
+    /// assertion de comportement rougisse. L'égalité est donc écrite contre le
+    /// verdict **lu dans l'`Assessment`**, pas contre un verdict reconstruit.
+    ///
+    /// Le fixture rend l'oubli d'une lecture distinguable, comme celui du
+    /// cas 14 : un candidat du milestone et un du dehors, tous deux non
+    /// groomés, à priorité égale — seul le rang de provenance les sépare, donc
+    /// l'ordre obtenu dit laquelle des deux lectures a voyagé jusqu'à la relève.
+    #[test]
+    fn mika2700_lassesseur_pose_la_releve_du_meme_bassin_quil_a_pose() {
+        let mut a_grommer = base_issue(1802);
+        a_grommer.plan_present = false;
+        a_grommer.priority_rank = Some(1);
+        let mut state = base_state(vec![a_grommer]);
+        state.outside_candidates = vec![pool::PoolCandidate {
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(1),
+            plan_present: false,
+            labels: vec!["p1-important".into()],
+        }];
+
+        let a = Assessor::new(AssessorConfig {
+            silence_threshold_days: 90,
+        })
+        .assess(&state);
+
+        let verdict = a
+            .pool
+            .as_ref()
+            .expect("un cycle qui a lu le bassin porte un verdict");
+        let releve = a
+            .relief
+            .as_ref()
+            .expect("un cycle qui a nommé la relève la porte");
+
+        assert_eq!(
+            releve.next.iter().map(|t| t.number).collect::<Vec<_>>(),
+            vec![1802, 1700],
+            "les deux lectures nourrissent la relève, le milestone d'abord à \
+             priorité égale"
+        );
+        assert_eq!(
+            releve.next[0].priority_rank,
+            Some(1),
+            "le rang relu depuis les candidats voyage avec le ticket"
+        );
+        assert_eq!(
+            *releve,
+            relief::name_relief(
+                verdict,
+                &state
+                    .sub_issues
+                    .iter()
+                    .map(pool::PoolCandidate::from)
+                    .collect::<Vec<_>>(),
+                &state.outside_candidates,
+            ),
+            "la relève est exactement celle que la fonction pure tire du verdict \
+             posé — l'assesseur ne juge pas le bassin deux fois"
         );
     }
 }
