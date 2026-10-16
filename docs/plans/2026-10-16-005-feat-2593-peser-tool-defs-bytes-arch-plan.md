@@ -3,7 +3,7 @@
 **Ticket :** senara-solutions/mika#2593
 **Type :** feat (agent-core)
 **Suivi de :** mika#2474 § 9 (*Hors périmètre*)
-**Vol :** un seul — 223 lignes estimées sous la borne de 243 (§ *Taille estimée*)
+**Vol :** un seul — 231 lignes estimées sous la borne de 243 (§ *Taille estimée*)
 
 ---
 
@@ -97,25 +97,36 @@ Les 28 builtins : `update_core_memory`, `store_fact`, `search_memory`,
 
 ### 2.3 La mesure qui tranche, et elle est en dépôt
 
-Les trois prompts servis à mika-arch — `mika-arch-groom-ticket`,
-`mika-arch-second-review`, `mika-arch-groom-milestone` — ne nomment **que quatre
-outils** :
+Les trois prompts servis à mika-arch — `mika-arch-groom-ticket` (276 lignes),
+`mika-arch-second-review` (238), `mika-arch-groom-milestone` (128) — ne nomment
+**que quatre outils**. La mesure est reproductible telle quelle : l'alternance
+énumère les **vingt-neuf noms servis** du § 2.2, pas un échantillon, de sorte
+qu'un nom présent ne puisse pas échapper au filtre.
+
+```bash
+grep -ohE '\b(update_core_memory|store_fact|update_fact|search_memory|list_reminders\
+|promote_deferred_callback|get_task|send_message|list_skills|get_config|get_active_llm\
+|read_agent_file|list_agent_files|list_scheduled_tasks|list_tasks|check_task\
+|resolve_issue_order|query_knowledge_graph|query_timeline|get_session_messages\
+|list_audit_events|search_tool_history|record_served_content|check_already_served\
+|list_agents|list_teams|get_team_status|get_team_history|gh_read)\b' \
+  skills/bundled/mika-arch-*/system_prompt.md | sort | uniq -c
+```
+
+Relevé le 2026-10-16 sur `HEAD` :
 
 ```
-$ grep -c "" skills/bundled/mika-arch-groom-ticket/system_prompt.md
-276
-$ grep -ho "gh_read\|query_knowledge_graph\|store_fact\|update_core_memory\|list_tasks\|get_task\|…" \
-    skills/bundled/mika-arch-*/system_prompt.md | sort -u
-gh_read
-query_knowledge_graph
-store_fact
-update_core_memory
+     17 gh_read
+      6 query_knowledge_graph
+      2 store_fact
+      2 update_core_memory
 ```
 
 `gh_read` et `query_knowledge_graph` sont la lecture ; `store_fact` et
 `update_core_memory` sont la mémoire agent-scoped épinglée par #811. **Vingt-cinq
-des vingt-neuf outils servis ne sont nommés par aucune instruction du tour.** Ils
-sont là sur l'hypothèse que le modèle improvisera.
+des vingt-neuf outils servis ne sont nommés par aucune instruction du tour**, et
+**aucun des neuf noms que ce vol retire n'apparaît une seule fois**. Ils sont là
+sur l'hypothèse que le modèle improvisera.
 
 Cette mesure ne suffit **pas** à autoriser une coupe : le prompt système de base
 (`prompt.rs`) instruit l'usage d'outils génériquement, et un outil non nommé par
@@ -352,11 +363,20 @@ l'inverse de ce que l'extraction achète.
 ### D3 — le recensement à roster attesté (détecteur)
 
 `mika2593_le_tableau_servi_a_mika_arch_est_un_roster_atteste`, dans le `mod tests`
-de `crates/mika-agent/src/tools/mod.rs` — là où vit déjà le scanner
-`declared_tool_names` et son consommateur `mika1952_gated_tools_match_the_reflection_contract_constant`,
-dont la garde reprend la forme.
+de `crates/mika-agent/src/tools/mod.rs` — à côté de
+`mika1952_gated_tools_match_the_reflection_contract_constant`, dont il reprend la
+**forme** : une divergence attrapée dans les deux sens, sur une classe qu'aucun
+test comportemental ne voit.
 
-Elle construit `default_tools()`, retire les noms de `MIKA_ARCH_DISABLED_TOOLS`,
+Il n'en reprend **pas** le scanner `declared_tool_names` (`tools/mod.rs:1509`), et
+c'est ce qui le rend court : ce scanner existe parce que mika#1952 devait
+attribuer un appel à un fichier *source*. Ici l'autorité est le registre
+lui-même — `default_tools()` ne prend aucun argument et `definitions()`
+(`tools/mod.rs:1256`) est `pub` — donc le test lit ce qui est **construit**,
+jamais ce qui est écrit. Une lecture de source serait ici un détour qui pourrait
+diverger de l'objet qu'elle décrit.
+
+Il construit `default_tools()`, retire les noms de `MIKA_ARCH_DISABLED_TOOLS`,
 et assère l'**égalité ensembliste** avec un roster déclaré
 `MIKA_ARCH_SERVED_BUILTINS_FROM_DEFAULT_TOOLS` : **18 noms**. Le compte se
 dérive, il ne se devine pas — et il ne vaut pas 19, qui est le nombre d'une
@@ -395,22 +415,51 @@ restants sont `list_agents` (conservé, § 3.3) et `list_teams` /
 un. Après ce vol, la dénylist couvre donc 13 des 14 ; le seul outil de
 management encore servi à mika-arch est `list_agents`.
 
-### D4 — l'attestation d'octets sur l'événement existant
+### D4 — l'attestation d'octets sur l'événement existant, et le champ qui la rend lisible
 
-`apply_agent_tool_visibility` (`agent_loop/mod.rs:8710`) émet déjà
+`apply_agent_tool_visibility` (`agent_loop/mod.rs:8689`) émet déjà
 `applied identity tool-visibility filter` avec `hidden_count` et `disabled_size`.
-Deux champs s'y ajoutent, **sur l'événement existant plutôt que sous un nom
+**Trois** champs s'y ajoutent, **sur l'événement existant plutôt que sous un nom
 nouveau** :
 
 - `kept_count` — les outils restants ;
 - `kept_bytes` — `serde_json::to_string(&*tool_defs).map(|s| s.len()).unwrap_or(0)`,
   la même expression que `tool_defs_bytes` (`mod.rs:9230`), de sorte que les deux
-  nombres soient comparables par construction.
+  nombres soient comparables par construction ;
+- `agent` — **de qui** parle la ligne.
 
-Sans ces deux champs, un opérateur qui lit `tool_defs_bytes` après déploiement ne
-peut pas distinguer « la coupe a atterri » de « la coupe a atterri à moitié » :
-il lit un total, et un total ne se soustrait pas. Avec eux, la ligne est
-auto-suffisante — elle dit ce qui a été retiré **et** ce qui reste.
+Les deux premiers sont la mesure. Sans eux, un opérateur qui lit
+`tool_defs_bytes` après déploiement ne peut pas distinguer « la coupe a atterri »
+de « la coupe a atterri à moitié » : il lit un total, et un total ne se soustrait
+pas.
+
+**Le troisième est ce qui rend les deux premiers lisibles, et il manque
+aujourd'hui.** L'événement ne porte **aucun** identifiant d'agent :
+`apply_agent_tool_visibility` ne reçoit que `tool_defs` et `disabled`, et
+`inject_skills_and_resolve_tools` (`mod.rs:8978`) ne reçoit pas l'agent non plus.
+Or la ligne est émise pour **tout** agent dont la dénylist est non vide —
+mika-arch, mika-dev, mika-qa, mika-test — *et* sur tout tour Webhook
+Fallthrough de n'importe quel agent, puisque `effective_disabled_tools`
+(mika#2517) élargit la dénylist de `create_task` à ce moment-là et fait donc
+passer `removed > 0`. Une sonde `grep "tool-visibility"` rend aujourd'hui une
+population mêlée : c'est la classe mika#2205, *deux populations sous un nom ne se
+soustraient pas*, que ce plan invoque ailleurs et qui s'applique ici.
+
+On pourrait croire la valeur auto-identifiante — mika-arch est le seul agent dont
+la dénylist vaille 32 — mais c'est précisément une lecture qui ressemble à une
+réponse sans en être une : l'élargissement mika#2517 ajoute 1, donc un agent à 31
+émettrait aussi 32. Un discriminant qui dépend d'une coïncidence arithmétique
+n'est pas un discriminant.
+
+**Le coût, nommé plutôt que passé sous silence : deux signatures.**
+`apply_agent_tool_visibility` prend un `agent: &str` en troisième paramètre, et
+`inject_skills_and_resolve_tools` le reçoit pour le lui passer — soit **14 sites
+d'appel** à compléter (3 en production aux lignes 5496 / 6792 / 7599, 11 dans
+`mod tests`). Aux trois sites de production l'agent est déjà sous la main :
+`ctx.db.agent_id()` (`async_db.rs:130`, `&str`), la forme employée ailleurs dans
+le fichier. Le changement est mécanique — une ligne par site — mais il contredit
+la revendication « zéro signature changée » que portait la section *Taille
+estimée*, et celle-ci est corrigée en conséquence.
 
 Le point d'émission ne bouge pas : la ligne reste sous le `if removed > 0`, donc
 un agent sans dénylist ne paie rien et n'émet rien, comme aujourd'hui.
@@ -419,11 +468,19 @@ un agent sans dénylist ne paie rien et n'émet rien, comme aujourd'hui.
 
 `mika2593_le_filtre_atteste_le_compte_et_les_octets_restants`, dans le `mod tests`
 de `agent_loop/mod.rs`, à côté des trois
-`test_apply_agent_tool_visibility_*` existants. Il construit trois
-`ToolDefinition` dont un dénié et vérifie que `kept_count` vaut 2 et que
-`kept_bytes` égale la longueur de la sérialisation du vecteur **après** filtrage —
-l'égalité, pas un seuil, pour que le champ ne puisse pas dériver vers « avant
-filtrage » sans rougir.
+`test_apply_agent_tool_visibility_*` existants (lignes 12614, 12642, 12658). Il
+construit trois `ToolDefinition` dont un dénié et vérifie que `kept_count` vaut 2
+et que `kept_bytes` égale la longueur de la sérialisation du vecteur **après**
+filtrage — l'égalité, pas un seuil, pour que le champ ne puisse pas dériver vers
+« avant filtrage » sans rougir.
+
+Le champ `agent` n'est pas testable par la même assertion : `tracing::info!`
+n'expose pas ses champs au test. Ce qui l'est, et ce que le test épingle, est le
+**chemin par lequel il arrive** — la signature. Les quatre appels de test
+existants à `apply_agent_tool_visibility` passent désormais un nom d'agent, donc
+un futur refactor qui retirerait le paramètre ne compile plus. C'est une garde de
+type, pas d'assertion, et elle est dite comme telle : l'arbitre du *contenu* du
+champ reste la sonde P2 après déploiement.
 
 ---
 
@@ -499,11 +556,18 @@ précède le correctif (classe mika#2340), ce n'est pas une réconciliation qui 
 **P2 — le filtre a retiré ce qu'il devait, et le dit.**
 
 ```bash
-grep "tool-visibility" "$MIKA_SPIRIT_LOG_FILE" | jq -c '{hidden_count, kept_count, kept_bytes}'
+grep "tool-visibility" "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.agent == "mika-arch") | {hidden_count, kept_count, kept_bytes}'
 ```
 
 Attendu : `hidden_count` 23 → **32**, `kept_count` 28 → **19**, `kept_bytes` en
 baisse d'environ 4,6 Ko.
+
+Le `select(.agent == …)` est la moitié de la sonde, et il n'est possible que
+grâce au champ ajouté par D4 : la ligne est émise par tout agent à dénylist non
+vide et par tout tour Webhook Fallthrough (§ 5 D4), donc sans filtre elle rend
+une population mêlée. **Si `.agent` est absent de la sortie**, le binaire servi
+précède D4 (classe mika#2340) — ce n'est pas un agent sans nom.
 
 Le `kept_count` est celui du **registre global** au point de filtrage — 51
 builtins (37 de `default_tools()` + 14 de `management_tools_if_needed`) moins la
@@ -557,9 +621,11 @@ démarrage suivant — aucune migration, aucune donnée, aucun état à défaire
 ## 7. Ordre de commit
 
 Un seul commit. Les neuf entrées, leurs deux gardes, l'extraction en const des
-trois noms de #811, les deux champs et le test de ces champs ne sont pas
-séparables : D1 sans D2/D3 est une coupe sans critère vérifiable, D2/D3 sans D1
-sont deux tests rouges, et l'extraction seule est un refactor sans lecteur.
+trois noms de #811, les trois champs avec le threading qui les porte, et le test
+de ces champs ne sont pas séparables : D1 sans D2/D3 est une coupe sans critère
+vérifiable, D2/D3 sans D1 sont deux tests rouges, l'extraction seule est un
+refactor sans lecteur, et le threading seul est une signature élargie sans rien
+qui la lise.
 
 ```
 feat(agent): les lectures orphelines de mika-arch quittent le tableau servi — vol 1 (mika#2593)
@@ -589,7 +655,7 @@ recensement attesté arrête la croissance silencieuse sans changer le schéma.
 **Ce renvoi n'est pas nommé par une ligne `Tracked in:` dans ce plan, et c'est
 délibéré.** La règle mika#2693 exige le découpage en vols — et la ligne qui nomme
 la suite — quand le total dépasse la borne par vol ; ici il ne la dépasse pas
-(223 < 243), donc ce travail tient **en un seul vol** et le basculement est un
+(231 < 243), donc ce travail tient **en un seul vol** et le basculement est un
 hors-périmètre ordinaire, au même titre que les cinq autres de ce § 8. Une ligne
 `Tracked in:` pointant vers mika#2593 lui-même — c'est-à-dire vers le ticket
 qu'elle est censée prolonger — serait une référence circulaire : elle ressemble à
@@ -674,8 +740,11 @@ que de le supposer.
    doc-comment, ainsi que la raison pour laquelle 18 ≠ le `kept_count` de 19.
 5. `MIKA2593_CRITERION_EXCEPTIONS` existe, est **vide**, et porte son assertion
    auto-nettoyante.
-6. `applied identity tool-visibility filter` porte `kept_count` et `kept_bytes` ;
-   D5 épingle l'égalité de `kept_bytes` avec la sérialisation post-filtrage.
+6. `applied identity tool-visibility filter` porte `kept_count`, `kept_bytes` et
+   `agent` ; D5 épingle l'égalité de `kept_bytes` avec la sérialisation
+   post-filtrage, et la signature porte le chemin de `agent` (§ 5 D5). Les 14
+   sites d'appel de `inject_skills_and_resolve_tools` et les 4 de
+   `apply_agent_tool_visibility` compilent.
 7. V1 à V5 passent.
 8. `test_mika_arch_disabled_tools_excludes_agent_self_state` est vert, et son
    diff ne contient que l'extraction en const — aucun nom ajouté, retiré ou
@@ -709,14 +778,20 @@ l'arbitrage de capacité — et de la section *Contrat de vérification* ci-dess
   par du code** (D2), pas seulement affirmée en prose.
 - **AC4 — L'arbitrage de capacité respecte #811.** `send_message`,
   `update_core_memory`, `store_fact`, `update_fact` restent servis.
-  `test_mika_arch_disabled_tools_excludes_agent_self_state` est vert et son diff
-  est vide.
+  `test_mika_arch_disabled_tools_excludes_agent_self_state` est vert, et son diff
+  ne contient **que** l'extraction en const décrite au § 5 D2 — aucun nom ajouté,
+  retiré ou réécrit, assertion et message inchangés. Ce critère ne demande pas un
+  diff *vide* : l'extraction est ce qui empêche les trois noms d'être retapés une
+  seconde fois dans le même fichier (classe mika#2205), et la borne exacte de ce
+  qui est autorisé est V3.
 - **AC5 — La coupe n'est pas « au plus gros ».** Le plan nomme au moins un outil
   volumineux ou plausible qu'il **conserve** avec son motif — `list_agents`
   (§ 3.3) — et la famille d'instruments d'ancrage conservée par C3.
-- **AC6 — La coupe est observable.** `kept_count` et `kept_bytes` sur
-  l'événement existant, et P3 lit `tool_defs_bytes` — le champ même de la
-  précondition — comme arbitre du gain. Aucun nouveau nom d'événement n'est créé.
+- **AC6 — La coupe est observable, et attribuable.** `kept_count`, `kept_bytes`
+  **et `agent`** sur l'événement existant — le troisième parce que la ligne est
+  émise par plusieurs agents et qu'une mesure non attribuable n'est pas une
+  mesure (§ 5 D4). P3 lit `tool_defs_bytes` — le champ même de la précondition —
+  comme arbitre du gain. Aucun nouveau nom d'événement n'est créé.
 - **AC7 — Le gain cesse de s'éroder.** D3 rougit sur le prochain
   `register(...)` qui atteindrait mika-arch sans décision, dans les deux sens de
   divergence.
@@ -736,30 +811,37 @@ l'arbitrage de capacité — et de la section *Contrat de vérification* ci-dess
 | `crates/mika-agent/src/well_known_agents.rs` — D1 : 9 entrées + 2 sous-sections commentées + paragraphe de doc du critère | 52 |
 | `crates/mika-agent/src/well_known_agents.rs` — D2 : table `MIKA_ARCH_ORPHANED_READS`, garde C1, allowlist vide + assertion auto-nettoyante | 78 |
 | `crates/mika-agent/src/well_known_agents.rs` — D2 : extraction de `MIKA_ARCH_AGENT_SELF_STATE_TOOLS` + son doc-comment, et repointage du test #811 dessus | 5 |
-| `crates/mika-agent/src/tools/mod.rs` — D3 : roster attesté de 18 noms + recensement bidirectionnel + doc de sa borne | 48 |
-| `crates/mika-agent/src/agent_loop/mod.rs` — D4 : `kept_count` + `kept_bytes` sur l'événement existant | 12 |
-| `crates/mika-agent/src/agent_loop/mod.rs` — D5 : test de l'attestation d'octets | 28 |
+| `crates/mika-agent/src/tools/mod.rs` — D3 : roster attesté de 18 noms + recensement bidirectionnel + doc de sa borne | 30 |
+| `crates/mika-agent/src/agent_loop/mod.rs` — D4 : `kept_count` + `kept_bytes` + `agent` sur l'événement existant, les deux signatures et leurs 14 sites d'appel | 34 |
+| `crates/mika-agent/src/agent_loop/mod.rs` — D5 : test de l'attestation d'octets + les 4 appels de test complétés | 32 |
 
-Total estimé : 223 lignes
+Total estimé : 231 lignes
 Plafond de tours : 150 (défaut)
 Borne par vol : 243 lignes estimées — (150 − 35 − 50) × 7,5 / 2
 
-**Un seul vol, et voici pourquoi il tient.** 223 < 243, et 223 < 1000 : les deux
-bornes passent, la plus serrée (243) avec ~8 % de marge. Trois propriétés
+**Un seul vol, et voici pourquoi il tient.** 231 < 243, et 231 < 1000 : les deux
+bornes passent, la plus serrée (243) avec ~5 % de marge. Trois propriétés
 soutiennent l'estimation plutôt qu'un espoir :
 
-- **Aucun site nouveau.** Les livrables atterrissent dans trois fichiers qui
-  existent, sur des sites qui existent : une const (D1), deux `mod tests` déjà
-  peuplés (D2, D3, D5), et **deux champs** sur un `tracing::info!` déjà écrit
-  (D4). Zéro module créé, zéro signature changée, zéro migration. La seule
-  déclaration déplacée est l'extraction en const de D2, dont les trois noms sont
-  déjà écrits à la ligne `well_known_agents.rs:2083`.
+- **Aucun site nouveau, et une seule sorte de changement mécanique.** Les
+  livrables atterrissent dans trois fichiers qui existent, sur des sites qui
+  existent : une const (D1), deux `mod tests` déjà peuplés (D2, D3, D5), et
+  **trois champs** sur un `tracing::info!` déjà écrit (D4). Zéro module créé,
+  zéro migration. La seule déclaration déplacée est l'extraction en const de D2,
+  dont les trois noms sont déjà écrits à la ligne `well_known_agents.rs:2083`.
+  **Deux signatures changent** — celles de `apply_agent_tool_visibility` et de
+  `inject_skills_and_resolve_tools`, pour faire arriver le champ `agent` — ce qui
+  touche 18 sites d'appel à raison d'**une ligne chacun**, dont 15 en test. C'est
+  le poste le plus volumineux du vol et le moins risqué : il ne compile pas si
+  l'un est oublié, donc il ne peut pas être livré à moitié.
 - **Les deux détecteurs ont leur patron en dépôt.** D3 reprend la forme de
+  divergence bidirectionnelle de
   `mika1952_gated_tools_match_the_reflection_contract_constant`
-  (`tools/mod.rs:1550`), scanner `declared_tool_names` inclus — un patron suivi
-  coûte moins qu'un patron inventé. D5 se range à côté des trois
-  `test_apply_agent_tool_visibility_*` existants.
-- **La part de doc-comment est forte et son volume est connu.** ~75 des 223 lignes
+  (`tools/mod.rs:1550`) — **sans** son scanner `declared_tool_names`, puisque
+  `default_tools()` est appelable sans argument et `definitions()` est `pub`
+  (§ 5 D3) : c'est ce qui fait tomber son estimation de 48 à 30. D5 se range à
+  côté des trois `test_apply_agent_tool_visibility_*` existants.
+- **La part de doc-comment est forte et son volume est connu.** ~75 des 231 lignes
   sont du commentaire de déclaration (motif des deux sous-sections, critère,
   borne de D3), dont le contenu est déjà rédigé aux § 3.1 à § 3.3 de ce plan : il
   reste à le transcrire, pas à le trouver.
