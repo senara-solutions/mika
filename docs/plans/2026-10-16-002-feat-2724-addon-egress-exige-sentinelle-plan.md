@@ -132,6 +132,13 @@ donc aucun justificatif ne peut y voyager dans le canal que l'incident écrase :
 exiger là-bas, ce serait exiger un justificatif qu'aucun appel légitime ne peut
 présenter.
 
+**Cette décision réduit le périmètre que le point 1 du ticket prescrit, donc elle
+ne tient pas tant que le corps du ticket ne la porte pas.** Le § 2.5 nomme les
+trois éditions qui l'y inscrivent et l'edit-notice qui les date ; sans elles, ce
+paragraphe est un plan qui décide contre son propre contrat de version
+(`docs/architecture/review-guide.md` § *contract fidelity*, corps de #2724
+point 1).
+
 **Rectification à porter dans la note de solution du vol 1.** La table des canaux
 de `docs/solutions/dev-loop/une-sentinelle-voyage-dans-le-canal-que-lincident-ecrase-2026-10-15.md`
 porte, sur la ligne retenue (**l.59**, canal « le credential lui-même
@@ -159,6 +166,79 @@ mika#2713, qui est une **écriture d'API** (`gh issue comment`).
 Tracked in: un ticket de suivi ouvert **avant** la PR, nommé dans son corps
 (règle mika#2701), portant « fermer la moitié `git push` de l'egress de pilote,
 ou établir qu'elle est hors d'atteinte ».
+
+### 2.5 L'amendement du corps du ticket — le contrat de version avant le code
+
+Les § 2.1 à 2.4 décident un périmètre **plus étroit** que celui que le ticket
+prescrit. Le point 1 du corps de #2724 exige « `Bearer <valeur>` sur
+`api.github.com` (`gh`) **et** `Basic <base64>` décodé sur `github.com` (`git`
+via le credential helper) » ; le § 2.3 n'en livre que la première moitié.
+
+Tant que le corps n'est pas amendé, **c'est lui le contrat de version, pas ce
+plan**. Un lecteur du ticket — ou un prochain passage de grooming — lirait la
+moitié `github.com` comme due, et l'AC8 du § 8 comme une réduction unilatérale
+plutôt que comme un critère dérivé. La mesure du § 2.1 rend la prémisse du
+point 1 fausse ; elle ne met pas le corps à jour toute seule
+(`docs/architecture/review-guide.md` § *contract fidelity*).
+
+**Trois éditions, à la finalisation du grooming, en une seule passe
+`gh issue edit --body-file` suivie d'un commentaire d'edit-notice** — le patron
+*issue-as-versioned-contract*, déjà appliqué par
+`docs/plans/2026-05-06-002-feat-dev-handsoff-bundled-skill-v0-plan.md`
+§ *Phase 5 body-edit checklist* :
+
+1. **Point 1 — borner la lecture à `api.github.com`.** Remplacer les deux formes
+   prescrites par : « sur `api.github.com`, lire le credential présenté **avant**
+   de le retirer — `Bearer <v>`, `token <v>` (le schéma que `gh` émet, § 3.1 du
+   plan) et `Basic <base64>` décodé, les trois menant à la même comparaison. Sur
+   `github.com`, **aucune exigence** : l'injection inconditionnelle d'aujourd'hui
+   est conservée. »
+2. **Point 1, suite — y adjoindre la mesure qui motive la réduction**, pour que
+   la prémisse corrigée voyage avec le contrat et non seulement avec le plan :
+   « `git` ne présente aucun credential dans la sandbox du pilote — mesuré au
+   grooming (2026-10-16, § 2.1 du plan) : aucun en-tête `Authorization`, et pas
+   même une retentative au challenge `Basic`. Il n'existe donc pas de credential
+   helper à lire, et exiger la sentinelle sur `github.com` ferait 403 **tous**
+   les `git push` de pilote — soit mot pour mot le mode de défaillance que le
+   ticket parent nomme comme le seul capable d'arrêter la boucle. »
+3. **§ *Mode de défaillance* — y ajouter la contrepartie**, une ligne : la
+   coupure est bornée à `api.github.com`, et le non-refus de `github.com` est un
+   **critère testé** (AC8, cas 8 du § 3.4) plutôt qu'une conséquence espérée du
+   périmètre.
+
+**Le commentaire d'edit-notice** cite la session de grooming (passe 1 + passe 2),
+nomme F1 comme la finding qui l'a motivé, et résume la réduction de périmètre en
+une phrase — pour qu'un lecteur du ticket voie *que* le corps a bougé, *quand* et
+*pourquoi*, sans avoir à diffuser deux révisions.
+
+**Ce que cette révision ne peut pas faire elle-même, dit plutôt que tu.**
+`/mika-revise-plan` et `/mika-groom-plan-only` sont content-only par contrat :
+elles n'éditent ni le ticket, ni l'index, ni aucun fichier hors de ce plan.
+L'amendement est donc inscrit ici comme **livrable de la finalisation** — listé
+au § 6 parmi les actions antérieures à la PR, épinglé au DoD du § 7 et porté par
+l'AC11 du § 8. Jamais laissé à la mémoire de l'implémenteur : un amendement de
+contrat qui ne dépend que d'un souvenir est un amendement qui n'a pas lieu, et
+c'est exactement la divergence que F1 a relevée.
+
+**L'amendement est atteignable par l'implémenteur — vérifié au grooming, pas
+supposé.** Un AC que la permission-policy refuse n'est pas un critère, c'est un
+DoD qui ne peut pas se fermer. `gh issue edit` et `gh issue comment` sont
+**auto-approuvés en Tier 1** pour une session de pilote (`claude-pilot`
+`tier1.py`, frozenset `"issue": {"view", "list", "edit", "comment"}` ; le
+miroir per-spawn de `tools/mika_permission_policy/` porte la même ligne, donc le
+verdict ne dépend pas du mode). Seul `gh issue create` est refusé par
+`policies/permissions.yaml`, et il n'est pas requis ici. Deux formes sont
+néanmoins mortelles et à écrire telles quelles :
+
+- **L'ordre des arguments.** `gh issue edit 2724 --repo senara-solutions/mika
+  --body-file <f>` — le domaine et le verbe doivent être les deux premiers
+  tokens. `gh --repo X issue edit …` n'apparie pas le motif Tier 1, tombe en
+  relais et suspend la session sur une question.
+- **L'emplacement du corps.** Le fichier vit **sous le worktree**
+  (`.pilot-scratch/issue-2724-body.md`), jamais dans `/tmp` : l'écriture y est
+  refusée et `gh --body-file` ne trouve alors aucun fichier — la défaillance que
+  `dispatch-lib.sh` documente déjà pour les corps de PR (mika#2211, mika#2548).
+  Le brouillon est laissé en place, jamais supprimé.
 
 ## 3. Conception
 
@@ -486,6 +566,10 @@ Et ce n'est pas davantage la suite CI : sans elle, le vol livre une coupure
 fail-closed sur le chemin de la boucle, épinglée par un seul détecteur que le
 pipeline ne lance pas.
 
+**L'amendement du § 2.5 ne pèse sur aucune de ces lignes** : il porte sur le
+corps du ticket, hors de l'arbre. Il n'entre donc ni dans le total ni dans la
+marge, et la variable d'ajustement nommée ci-dessus reste la seule.
+
 ## 6. Ordre de commit, et son plancher
 
 Chaque commit laisse l'arbre vert. Le plancher est le **commit 2**.
@@ -508,7 +592,17 @@ Chaque commit laisse l'arbre vert. Le plancher est le **commit 2**.
    `gh` ajoutée à la note : le grooming a établi que les deux formats vivent dans
    le binaire (§ 3.1), le commit consigne lequel part sur le fil.
 
-Le ticket de suivi du § 2.4 est ouvert **avant** la PR et nommé dans son corps.
+**Deux actions précèdent la PR, et aucune n'est un commit de cet arbre :**
+
+- **L'amendement du corps de #2724** (§ 2.5) — les trois éditions en une passe
+  `gh issue edit --body-file`, puis le commentaire d'edit-notice. À la
+  finalisation du grooming, donc **avant** le commit 1 si le grooming et
+  l'implémentation sont deux sessions, et au plus tard avant l'ouverture de la PR
+  si elles n'en font qu'une. Le périmètre livré ne doit jamais être plus étroit
+  que le contrat affiché ; s'il l'est entre deux instants, le corps de PR dit
+  lequel des deux il suit.
+- **Le ticket de suivi du § 2.4**, ouvert **avant** la PR et nommé dans son corps
+  (règle mika#2701).
 
 **Une seule mesure est prérequise au commit 1**, et c'est la seule chose à faire
 avant d'écrire du code : la capture du schéma `gh` sur le fil (DoD). Les deux
@@ -551,6 +645,12 @@ dans le binaire (§ 3.1) — sont **acquises au grooming** et ne sont pas à ref
       `make verify-no-secret-in-setenv` passent.
 - [ ] La case « posé par `git` ? oui, déjà » de la note de solution du vol 1 est
       rectifiée.
+- [ ] **Le corps de #2724 porte les trois éditions du § 2.5** — point 1 borné à
+      `api.github.com` avec les trois schémas, la mesure du § 2.1 adjointe comme
+      justification, et la contrepartie au § *Mode de défaillance* — et un
+      commentaire d'edit-notice cite la session de grooming et nomme F1. Sans
+      cela, le périmètre livré est plus étroit que le contrat affiché et l'AC8
+      lit comme une réduction unilatérale.
 - [ ] `cargo clippy` et `scripts/verify-pipeline.sh origin/main` passent.
 - [ ] Le corps de PR porte la décision explicite sur le registre illisible (§ 3.2),
       la ligne `Tracked in:` du § 2.4, et
@@ -562,7 +662,8 @@ Le ticket ne porte pas de section `## Acceptance criteria` ; les critères
 ci-dessous sont dérivés de son § *Travail attendu* (points 1-7) et de son § *Mode
 de défaillance*. AC1-AC7 suivent les sept points du ticket ; AC8-AC10 couvrent les
 trois défaillances que la lecture du code et la mesure du § 2.1 ont ajoutées à la
-liste et que le ticket ne pouvait pas connaître.
+liste et que le ticket ne pouvait pas connaître ; **AC11 ferme l'écart que ces
+trois-là creusent entre le périmètre livré et le contrat affiché.**
 
 1. **AC1 — le credential présenté est lu avant d'être retiré.** Sur
    `api.github.com`, `Bearer <s>`, `token <s>` et `Basic base64("x:<s>")` avec `s`
@@ -593,7 +694,9 @@ liste et que le ticket ne pouvait pas connaître.
    reçoit un 403 que `origin/main` n'aurait pas produit, quel que soit le
    credential présenté ; `make test-sandbox-git-usable` passe. C'est le critère
    que le § 2.1 impose : sans lui, le vol tue tous les `git push` de pilote au
-   `make deploy`. (Cas 8.)
+   `make deploy`. **Il dérive du périmètre amendé du § 2.5, pas du point 1 du
+   ticket tel qu'écrit à l'ouverture** — AC11 est ce qui rend cette dérivation
+   licite plutôt qu'unilatérale. (Cas 8.)
 9. **AC9 — fail-closed écrit, et survivable.** Un registre illisible refuse, avec
    un motif qui lui est propre et distinct des deux autres ; l'asymétrie avec le
    fail-open du lanceur est **écrite dans le code**, pas seulement dans la PR.
@@ -602,6 +705,16 @@ liste et que le ticket ne pouvait pas connaître.
     est appelée par `ci.yml` dans le commit qui crée la suite, et elle rougit à la
     fois quand la coupure cesse de refuser **et** quand elle se met à refuser le
     chemin légitime. (§ 4.)
+11. **AC11 — le contrat de version reflète le périmètre livré.** Le corps de
+    #2724 porte les trois éditions du § 2.5 (point 1 borné à `api.github.com`
+    avec ses trois schémas, la mesure du § 2.1 adjointe, la contrepartie au
+    § *Mode de défaillance*), et un commentaire d'edit-notice cite la session de
+    grooming et nomme F1. Le critère est **vérifiable sur le ticket**, pas sur
+    l'arbre : il se lit en ouvrant #2724. Sans lui, AC8 et le § 10 livrent moins
+    que le point 1 ne promet, et le prochain lecteur du ticket rouvre la question
+    du périmètre `github.com` à l'identique — ce que la mesure du § 2.1 existe
+    précisément pour clore.
+    (`docs/architecture/review-guide.md` § *contract fidelity*.)
 
 ## 9. Risques et arbitrages
 
@@ -620,7 +733,9 @@ liste et que le ticket ne pouvait pas connaître.
 
 - **`github.com` / le chemin `git`.** § 2.1 à 2.4 : la coupure y serait un 403 sur
   tous les `git push` de pilote, et la dotation qui l'éviterait n'achèterait
-  aucune propriété. Le reste est nommé par le ticket de suivi du § 2.4.
+  aucune propriété. Le reste est nommé par le ticket de suivi du § 2.4. **Cette
+  exclusion n'est hors périmètre qu'une fois le corps du ticket amendé** (§ 2.5,
+  AC11) : jusque-là, le point 1 l'y inclut encore.
 - **L'egress Anthropic.** `ANTHROPIC_API_KEY` garde son placeholder statique. Le
   mode de défaillance de mika#2713 est propre à GitHub (écriture sur une forge).
 - **Le `cargo test` qui n'écrase pas `GH_TOKEN`.** Il hérite de la sentinelle,
@@ -651,7 +766,47 @@ liste et que le ticket ne pouvait pas connaître.
   `docs/solutions/dev-loop/une-sentinelle-voyage-dans-le-canal-que-lincident-ecrase-2026-10-15.md`
 - Surface opérateur à étendre : `docs/operator/environment-variables.md`
   § *La sandbox de pilote présente un justificatif d'egress (mika#2716)*
+- Fidélité au contrat (§ 2.5, AC11) : `docs/architecture/review-guide.md`
+  § *contract fidelity* ; patron d'amendement du corps de ticket :
+  `docs/plans/2026-05-06-002-feat-dev-handsoff-bundled-skill-v0-plan.md`
+  § *Phase 5 body-edit checklist*
 - Doctrines invoquées : mika#1949 (nommer, pas divulguer), mika#2165 (un
   interrupteur que son second lecteur n'honore pas est décoratif), mika#2205 (deux
   états qui rendent les mêmes octets), mika#2578 (une garde que le pipeline ne
   lance pas ne refuse rien), mika#2701 (le suivi est ouvert avant la PR)
+
+## Revision history
+
+- **rev 3 (2026-10-16)** — passe de grooming content-only : l'AC11 né en rev 2
+  exige un `gh issue edit` de l'implémenteur, et un AC que la permission-policy
+  refuserait serait un DoD qui ne peut pas se fermer. L'atteignabilité est donc
+  **mesurée** plutôt que supposée — `gh issue edit` et `gh issue comment` sont
+  auto-approuvés en Tier 1 pour une session de pilote, dans les deux modes de
+  policy, et seul `gh issue create` est refusé. Le § 2.5 porte le constat et les
+  deux formes mortelles qui le vident de son effet : l'ordre des arguments (le
+  domaine et le verbe en premier, sinon relais et session suspendue) et
+  l'emplacement du body-file (sous le worktree, jamais `/tmp`). Aucun AC ajouté
+  ni affaibli, aucune ligne de code touchée — le total du § 5 et la marge sont
+  inchangés.
+- **rev 2 (2026-10-16)** — adressé **F1** (BLOCKING, divergence contractuelle) en
+  inscrivant l'amendement du corps de #2724 comme livrable nommé plutôt qu'en
+  laissant le plan décider contre son contrat : nouveau **§ 2.5** (les trois
+  éditions du corps — point 1 borné à `api.github.com` avec ses trois schémas, la
+  mesure du § 2.1 adjointe comme justification, la contrepartie au § *Mode de
+  défaillance* — plus le commentaire d'edit-notice citant la session de grooming
+  et nommant F1, suivant le patron *issue-as-versioned-contract* de
+  `docs/plans/2026-05-06-002-feat-dev-handsoff-bundled-skill-v0-plan.md`) ;
+  renvoi depuis le **§ 2.3** à l'endroit même où la réduction de périmètre est
+  décidée ; l'amendement listé au **§ 6** parmi les deux actions antérieures à la
+  PR ; une case au **DoD (§ 7)** ; **AC11** au § 8, vérifiable sur le ticket et
+  non sur l'arbre, avec l'intro de la section mise à jour ; **AC8** dit désormais
+  qu'il dérive du périmètre amendé et qu'AC11 est ce qui rend la dérivation
+  licite ; **§ 5** note que l'amendement ne pèse sur aucune ligne de code (hors
+  arbre), donc ni sur le total ni sur la marge ; **§ 10** précise que l'exclusion
+  de `github.com` n'est hors périmètre qu'une fois le corps amendé ; **§ 11**
+  porte la citation `review-guide.md § contract fidelity`. Aucun AC affaibli.
+  **Ce que cette révision n'a pas fait, et pourquoi** : elle n'a pas édité le
+  ticket. `/mika-revise-plan` est content-only par contrat — ni `gh issue edit`,
+  ni fichier hors de ce plan. L'édition est donc portée par le § 2.5, le § 6, le
+  DoD et AC11 plutôt que par un souvenir, ce qui est la forme la plus forte que
+  ce contrat de révision permette.
