@@ -6510,4 +6510,57 @@ mod tests {
             "dans la population, et le tour a quand même eu lieu"
         );
     }
+
+    /// Le `trigger` se lit sur le texte d'AVANT les handlers — **au site
+    /// d'appel**, et pas seulement dans `trigger_class`.
+    ///
+    /// La classe (f) du ticket : une revue sans ligne `VERDICT:` lisible, que
+    /// le `verdict_handler` remplace par son pré-digest. Ce pré-digest ouvre
+    /// sur sa propre balise, et `trigger_class` ne lit QUE la première ligne :
+    /// calculé sur `req.text`, le `trigger` dirait `other` — le terme de repli
+    /// qu'AC3 réserve à l'attrape-tout du gateway. Le chiffrage de vol 2
+    /// verserait dans `other` une population `pr_review` entière, et c'est la
+    /// seule assertion de la branche qui bouge : la mutation a été jouée, les
+    /// dix autres tests mika#2680 sont restés verts.
+    ///
+    /// Les tests unitaires de `webhook_prefilter` épinglent la fonction pure ;
+    /// aucun d'eux ne peut voir QUEL texte le site d'appel lui passe.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_le_site_dappel_classe_le_texte_davant_les_handlers() {
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        let text = mika2675_review(
+            "commented",
+            "samidarko",
+            "Renomme cette fonction, puis relance.",
+        );
+        mika2675_run_on(&state, &text).await;
+
+        assert!(mock.calls_made() >= 1, "le tour doit avoir lieu");
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "une ligne de registre, et une seule");
+        assert_eq!(
+            charged[0].fields.get("text_touched").map(String::as_str),
+            Some("true"),
+            "contrôle positif : sans réécriture, l'assertion suivante ne prouve rien"
+        );
+        assert_eq!(
+            charged[0].fields.get("trigger").map(String::as_str),
+            Some("pr_review"),
+            "le registre classe l'original, jamais le pré-digest du handler"
+        );
+
+        // Garde de non-vacuité : la mutation n'est observable que parce que la
+        // forme substituée ouvre sur la balise du handler. Si le pré-digest
+        // reprenait un jour la première ligne de l'original, ce test passerait
+        // des deux côtés de la mutation — et se tairait là-dessus.
+        assert_eq!(
+            webhook_prefilter::trigger_class("<verdict_handler>\nautre chose").as_str(),
+            "other",
+            "la forme que le handler substitue ne classe pas en pr_review"
+        );
+    }
 }
