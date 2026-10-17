@@ -1143,14 +1143,17 @@ impl AsyncDatabase {
         Ok(delivered)
     }
 
-    /// Find orphaned parent self_dev tasks whose callback subtask delivered
-    /// without producing a PR. See [`Database::find_orphaned_parent_tasks`].
+    /// Find orphaned parent self_dev tasks of the given `dispatch_class` whose
+    /// callback subtask delivered without producing a PR (mika#2750 added the
+    /// class parameter). See [`Database::find_orphaned_parent_tasks`].
     pub async fn find_orphaned_parent_tasks(
         &self,
         grace_seconds: i64,
+        dispatch_class: &str,
     ) -> Result<Vec<crate::db::OrphanedParentTask>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.find_orphaned_parent_tasks(&a, grace_seconds))
+        let class = dispatch_class.to_string();
+        self.with_db(move |db| db.find_orphaned_parent_tasks(&a, grace_seconds, &class))
             .await
     }
 

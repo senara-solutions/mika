@@ -109,6 +109,34 @@ fn settle_action(liveness: &DispatchLiveness) -> SettleAction<'_> {
 /// queue clears within one tick-cycle after grace expires. See #871.
 const REAPER_GRACE_SECONDS: i64 = 600;
 
+/// `(classe balayée, motif d'échec par défaut, nom d'événement d'audit)` pour
+/// le reaper de parents orphelins (mika#2750).
+///
+/// Recensement **FERMÉ** : une classe absente d'ici n'est pas balayée — le
+/// lookup rend `None` et [`TaskEngine::reap_orphaned_parent_tasks`] sort avec
+/// un `warn!` plutôt qu'avec un motif de repli. Un fall-through écrirait un
+/// état terminal sous le nom d'une autre classe.
+///
+/// Les trois valeurs sont un **FORMAT DE FIL** : les opérateurs groupent
+/// dessus. La classe `implement` garde mot pour mot ses deux noms actuels —
+/// `tasks.result` et `audit_events.tool_name` sont lus par des requêtes
+/// d'opérateur existantes, et mika#2121 (KTD5) désigne ce site comme *sole
+/// production writer* de `callback_delivered_without_pr_url`. Épinglé par
+/// `la_classe_implement_garde_son_motif_mot_pour_mot`
+/// (`tests/eval/test_groom_parent_reap_2750.rs`).
+const REAPER_CLASS_DISPOSITIONS: [(&str, &str, &str); 2] = [
+    (
+        "implement",
+        "callback_delivered_without_pr_url",
+        "task_engine_reaper",
+    ),
+    (
+        "groom",
+        "groom_callback_delivered_without_redispatch",
+        "groom_parent_orphaned",
+    ),
+];
+
 /// Default grace window (seconds) before the childless-parent reaper transitions
 /// a self_dev issue parent left `in_progress` with **zero** callback children to
 /// `failed` (mika#1687). Deliberately far larger than [`REAPER_GRACE_SECONDS`]
@@ -1321,7 +1349,12 @@ impl TaskEngine {
             }
             // Reap parent self_dev tasks left in_progress after their callback
             // subtask delivered without producing a PR (#871).
-            self.reap_orphaned_parent_tasks().await;
+            self.reap_orphaned_parent_tasks("implement").await;
+            // mika#2750 — la seconde classe. Les deux populations sont disjointes
+            // par construction (le prédicat porte sur `child.dispatch_class`), donc
+            // cet ordre ne coûte rien et garde toute l'échelle de réparation
+            // lisible au même endroit.
+            self.reap_orphaned_parent_tasks("groom").await;
 
             // Auto-complete parent self_dev tasks left in_progress after their
             // callback subtask delivered WITH a PR url (mika#1162). Success-side
@@ -4276,17 +4309,39 @@ impl TaskEngine {
     /// `callback_delivered_without_pr_url` motif is preserved for producers that
     /// predate U1 (AC-G2). This method is the SOLE PRODUCTION WRITER of both
     /// motifs to `tasks.result` — a test in `dispatcher.rs` simulates the write,
-    /// so a grep finds two hits, but only this site runs in production. Any new
-    /// production writer must respect the groom-class filter.
-    async fn reap_orphaned_parent_tasks(&self) {
+    /// so a grep finds two hits, but only this site runs in production.
+    ///
+    /// mika#2750: the sweep takes its `dispatch_class`. The two populations are
+    /// disjoint by construction (the SQL predicate keys off
+    /// `child.dispatch_class`), so `tick()` calls this twice per scan — once per
+    /// class. The failure motif and the audit-event name both come from
+    /// [`REAPER_CLASS_DISPOSITIONS`]; a class absent from that closed table is
+    /// not swept at all, rather than swept under another class's name.
+    async fn reap_orphaned_parent_tasks(&self, dispatch_class: &str) {
+        let Some(&(_, default_fail_reason, audit_tool_name)) = REAPER_CLASS_DISPOSITIONS
+            .iter()
+            .find(|(class, _, _)| *class == dispatch_class)
+        else {
+            warn!(
+                dispatch_class,
+                "task_engine_reaper: no disposition for this class; refusing to sweep \
+                 (a fall-through would write a terminal state under another class's name)"
+            );
+            return;
+        };
+
         let candidates = match self
             .db
-            .find_orphaned_parent_tasks(REAPER_GRACE_SECONDS)
+            .find_orphaned_parent_tasks(REAPER_GRACE_SECONDS, dispatch_class)
             .await
         {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "task_engine_reaper: failed to query orphaned parents");
+                warn!(
+                    dispatch_class,
+                    error = %e,
+                    "task_engine_reaper: failed to query orphaned parents"
+                );
                 return;
             }
         };
@@ -4323,9 +4378,13 @@ impl TaskEngine {
             );
 
             // mika#1126 AC-3: defense-in-depth — re-check child dispatch_class
-            // at kill time. The SQL query should have excluded groom-class children,
-            // but if the class was NULL at query time and populated since, this
-            // guard catches the TOCTOU race (H2).
+            // at kill time. The SQL query should have excluded children of another
+            // class, but if the class was NULL at query time and populated since,
+            // this guard catches the TOCTOU race (H2). Since mika#2750 the
+            // comparison is against the class being swept, not the literal
+            // `"implement"`: the semantics are unchanged — "if at kill time every
+            // delivered callback child belongs to another class than the one I am
+            // sweeping, I abstain".
             if !children.is_empty() {
                 let delivered_callback_children: Vec<_> = children
                     .iter()
@@ -4337,16 +4396,17 @@ impl TaskEngine {
                     .collect();
 
                 if !delivered_callback_children.is_empty() {
-                    let all_non_implement = delivered_callback_children
-                        .iter()
-                        .all(|c| c.dispatch_class.as_deref().unwrap_or("implement") != "implement");
+                    let all_other_class = delivered_callback_children.iter().all(|c| {
+                        c.dispatch_class.as_deref().unwrap_or("implement") != dispatch_class
+                    });
 
-                    if all_non_implement {
+                    if all_other_class {
                         warn!(
                             parent_id = %parent.id,
+                            dispatch_class,
                             children = ?children,
                             "task_engine_reaper: race detected — all delivered callback \
-                             children are non-implement class at kill time; skipping \
+                             children belong to another class at kill time; skipping \
                              reap (mika#1126 guard)"
                         );
                         continue;
@@ -4361,23 +4421,33 @@ impl TaskEngine {
             // U1 — the generic `callback_delivered_without_pr_url` motif is written
             // verbatim (AC-G2 negative control). A failed child lookup also falls
             // back to the generic motif rather than skipping the reap.
-            let fail_reason = match self.db.get_task_unscoped(&parent.callback_task_id).await {
-                Ok(Some(child)) => child
-                    .result
-                    .as_deref()
-                    .and_then(super::dispatcher::parse_no_pr_reason)
-                    .map(|r| format!("callback_no_pr_{r}"))
-                    .unwrap_or_else(|| "callback_delivered_without_pr_url".to_string()),
-                Ok(None) => "callback_delivered_without_pr_url".to_string(),
-                Err(e) => {
-                    warn!(
-                        parent_id = %parent.id,
-                        callback_task_id = %parent.callback_task_id,
-                        error = %e,
-                        "task_engine_reaper: failed to load callback child result; \
-                         using generic motif"
-                    );
-                    "callback_delivered_without_pr_url".to_string()
+            //
+            // mika#2750: this enrichment stays conditioned on the `implement`
+            // class. A groom callback does not emit that anchored line, so
+            // calling the parser there would always return `None` and the groom
+            // motif would be the fallback of the *other* class. The groom motif
+            // is therefore fixed.
+            let fail_reason = if dispatch_class != "implement" {
+                default_fail_reason.to_string()
+            } else {
+                match self.db.get_task_unscoped(&parent.callback_task_id).await {
+                    Ok(Some(child)) => child
+                        .result
+                        .as_deref()
+                        .and_then(super::dispatcher::parse_no_pr_reason)
+                        .map(|r| format!("callback_no_pr_{r}"))
+                        .unwrap_or_else(|| default_fail_reason.to_string()),
+                    Ok(None) => default_fail_reason.to_string(),
+                    Err(e) => {
+                        warn!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            error = %e,
+                            "task_engine_reaper: failed to load callback child result; \
+                             using generic motif"
+                        );
+                        default_fail_reason.to_string()
+                    }
                 }
             };
 
@@ -4399,7 +4469,7 @@ impl TaskEngine {
                         .db
                         .log_audit_event(
                             &system_session,
-                            "task_engine_reaper",
+                            audit_tool_name,
                             &parent.id,
                             Some("in_progress"),
                             Some("failed"),
@@ -4447,7 +4517,7 @@ impl TaskEngine {
                         .db
                         .log_audit_event(
                             &system_session,
-                            "task_engine_reaper",
+                            audit_tool_name,
                             &parent.id,
                             Some("in_progress"),
                             None,
@@ -7417,7 +7487,7 @@ mod tests {
         let engine = TaskEngine::new(db.clone(), dispatcher);
 
         // Run both methods in the same tick (matching the production order).
-        engine.reap_orphaned_parent_tasks().await;
+        engine.reap_orphaned_parent_tasks("implement").await;
         engine.complete_parent_tasks_on_callback_success().await;
 
         let p_completer = db
