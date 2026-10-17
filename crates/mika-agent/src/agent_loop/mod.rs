@@ -1442,10 +1442,51 @@ async fn run_loop(
     // it travels by `&mut` rather than in `LoopResult`.
     delivery_log: &mut Vec<crate::evidence::guards::DeliveryRecord>,
 ) -> Result<LoopResult> {
+    // Capture the user's input text for persistence evaluation guard (#648).
+    // Extracted once before the loop starts so it always reflects the real user
+    // message, not synthetic messages injected by guards during re-prompts.
+    //
+    // mika#2757 — remonté ici depuis le bloc des compteurs de boucle, pour
+    // précéder `effective_required_tools` ci-dessous. Entre les deux lignes rien
+    // ne lit `request.messages` ni `effective_required_tools`, donc le
+    // déplacement n'a pas d'autre effet que de rendre la chaîne disponible plus
+    // tôt.
+    let user_input_text: String = request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, LlmRole::User))
+        .map(|m| match &m.content {
+            LlmContent::Text(t) => t.clone(),
+            LlmContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    LlmContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        })
+        .unwrap_or_default();
+
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
-    let effective_required_tools =
-        filter_available_required_tools(required_tools, tools, skill_tool_map, mcp_manager);
+    //
+    // mika#2757 — les deux derniers arguments sont ce qui interdit à ce calcul de
+    // contredire le tour. `enabled_tool_names` (#862) est le tableau d'outils
+    // *réellement servi* au modèle, après les quatre couches de retrait ; et
+    // `user_input_text` est le **même binding** que celui sur lequel les
+    // `INTENT_GUARDS` évaluent `is_unauthorized_webhook_dispatch` plus bas — ce
+    // partage est ce qui interdit aux deux couches de désigner deux tours
+    // différents.
+    let effective_required_tools = filter_available_required_tools(
+        required_tools,
+        tools,
+        skill_tool_map,
+        mcp_manager,
+        enabled_tool_names,
+        &user_input_text,
+    );
 
     // All registered tool names (builtins + skills + MCP) for prose-style tool call
     // detection (#569). Built once before the loop — the tool set is stable across
@@ -1543,26 +1584,6 @@ async fn run_loop(
     // former `webhook_zero_tools_retry_done` boolean and generalizes to all
     // intent guards in `INTENT_GUARDS`.
     let mut intent_guard_retries: HashSet<&'static str> = HashSet::new();
-    // Capture the user's input text for persistence evaluation guard (#648).
-    // Extracted once before the loop starts so it always reflects the real user
-    // message, not synthetic messages injected by guards during re-prompts.
-    let user_input_text: String = request
-        .messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, LlmRole::User))
-        .map(|m| match &m.content {
-            LlmContent::Text(t) => t.clone(),
-            LlmContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    LlmContentBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        })
-        .unwrap_or_default();
     // mika#2355 — is a QA verdict DUE on this turn? Conjunctive: the message
     // is a build callback AND `qa-review` is among the turn's skills. Computed
     // once, here, from the same `user_input_text` every other guard reads, so
@@ -8541,21 +8562,77 @@ fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool
     })
 }
 
-/// Filter required tools to only those available in the current tool set.
+/// Filter required tools to only those the turn can actually satisfy.
 ///
 /// Checks builtins (ToolRegistry), skill-defined tools, and MCP tools. Tools not found
 /// in any source are excluded with a warning — this prevents the required_tools gate from
 /// retrying for tools that can't possibly be called (e.g., stale config referencing a
 /// removed tool). See #516, #517.
+///
+/// ## Désarmement : une exigence que le tour rend impossible n'est pas une exigence (mika#2757)
+///
+/// Le 2026-10-17 ≈ 01:01Z, un tour webhook en fallthrough a reçu deux ordres
+/// contraires : `match_skills` avait armé `required_tools =
+/// ["run_claude_pilot_groom"]` sur un `groom` cité dans le corps du ticket,
+/// tandis que `webhook_no_unauthorized_dispatch` interdisait à cet outil même de
+/// réussir. Le modèle a pris le re-prompt `agent responded without calling
+/// required tools`, créé puis annulé trois tâches `Placeholder…`, et conclu à un
+/// `create_task` manquant — une fausse piste : le défaut était la contradiction.
+///
+/// **Le principe (plan § 2.1).** Une exigence que le tour lui-même rend
+/// impossible à satisfaire est une contradiction, et le moteur la désarme **en la
+/// nommant**. Trois raisons de retrait, dans cet ordre :
+///
+/// 1. **l'outil n'existe pas** — comportement d'origine, `WARN` inchangé
+///    (#516/#517) ;
+/// 2. **l'outil existe mais n'est pas servi sur ce tour** —
+///    `INFO event = "required_tool_disarmed", reason = "not_served"` ;
+/// 3. **l'outil est servi mais le tour interdit qu'il réussisse** — un outil de
+///    dispatch sur un message du domaine Webhook Fallthrough —
+///    `INFO event = "required_tool_disarmed", reason = "turn_forbids_dispatch"`.
+///
+/// **Les branches 1 et 2 ne sont pas redondantes**, et confondre les deux ferait
+/// lire une restriction normale comme une erreur de configuration. `served` est
+/// un sous-ensemble **strict** de ce que `tools.get()` connaît : la denylist
+/// d'identité, `FALLTHROUGH_WITHHELD_TOOLS` (mika#2517 U2),
+/// [`filter_ci_excluded_tools`] (mika#1324) et le filtre provider compact
+/// (mika#1491) retirent du tableau servi des outils que le registre possède
+/// toujours. Les deux messages ne disent donc pas la même chose — « corrige la
+/// config de la skill » contre « ce tour-ci ne sert pas cet outil ».
+///
+/// **`INFO`, et c'est une décision (§ 2.4).** Le désarmement est *nominal* sur ce
+/// domaine : il tirera des dizaines de fois par jour pour un comportement
+/// correct, et un `WARN` à ce volume est un `WARN` qu'on apprend à ignorer —
+/// la leçon des « 25+ documented misfires » de mika#1469. Le champ `reason`
+/// sépare les deux formes par `GROUP BY`. Le `WARN` de la branche 1 reste un
+/// `WARN` : celui-là accuse une configuration, pas un tour.
+///
+/// **Aucune capacité n'est retirée.** La valeur rendue n'est lue que par le
+/// re-prompt `required_tools` et par `has_terminal_required_tool_failure` ; rien
+/// d'autre ne la voit. L'outil reste dans le tableau servi quand il y était, le
+/// prompt de la skill reste injecté, et l'interdit de
+/// `webhook_no_unauthorized_dispatch` reste entier. Ce qui disparaît est
+/// l'injonction d'appeler — exactement la forme du geste de mika#2517 U3.
+///
+/// `served` est le tableau d'outils réellement servi au modèle (#862) et
+/// `turn_message` la chaîne sur laquelle les `INTENT_GUARDS` sont évalués ; voir
+/// le site d'appel pour ce que le partage de ce binding garantit.
 fn filter_available_required_tools(
     required: &HashSet<String>,
     tools: &ToolRegistry,
     skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
     mcp_manager: Option<&McpManager>,
+    served: &HashSet<String>,
+    turn_message: &str,
 ) -> HashSet<String> {
+    // mika#2757 — évalué une fois pour l'ensemble des exigences : le domaine est
+    // une propriété du tour, pas de l'outil.
+    let turn_forbids_dispatch = is_unauthorized_webhook_dispatch(turn_message);
+
     required
         .iter()
         .filter(|t| {
+            // Branche 1 — l'outil n'existe pas (#516/#517).
             let available = tools.get(t).is_some()
                 || skill_tool_map.contains_key(t.as_str())
                 || mcp_manager.is_some_and(|m| m.is_mcp_tool(t));
@@ -8565,8 +8642,34 @@ fn filter_available_required_tools(
                     "required_tools references unavailable tool — skipping enforcement \
                      (fix the skill's [constraints] required_tools config)"
                 );
+                return false;
             }
-            available
+
+            // Branche 2 — l'outil existe mais ce tour-ci ne le sert pas.
+            if !served.contains(t.as_str()) {
+                info!(
+                    event = "required_tool_disarmed",
+                    tool = %t,
+                    reason = "not_served",
+                    "required tool is not in this turn's served tool set — disarming the \
+                     requirement (mika#2757)"
+                );
+                return false;
+            }
+
+            // Branche 3 — l'outil est servi, mais le tour interdit qu'il réussisse.
+            if turn_forbids_dispatch && is_dispatch_tool(t) {
+                info!(
+                    event = "required_tool_disarmed",
+                    tool = %t,
+                    reason = "turn_forbids_dispatch",
+                    "this turn forbids dispatch (Webhook Fallthrough domain), so a dispatch \
+                     tool cannot be required — disarming the requirement (mika#2757)"
+                );
+                return false;
+            }
+
+            true
         })
         .cloned()
         .collect()
@@ -14228,12 +14331,25 @@ mod tests {
         registry
     }
 
+    /// mika#2757 — le tableau d'outils servi (`enabled_tool_names`, #862) pour un
+    /// cas qui ne mesure pas le désarmement : tout ce qui est exigé est servi.
+    fn served(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
     #[test]
     fn test_filter_available_required_tools_keeps_builtin() {
         let tools = make_registry_with_tool("run_gh");
         let required: HashSet<String> = ["run_gh".to_string()].into();
         let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        let filtered = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_gh"]),
+            "",
+        );
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains("run_gh"));
     }
@@ -14243,7 +14359,14 @@ mod tests {
         let tools = ToolRegistry::new();
         let required: HashSet<String> = ["run_shell".to_string(), "nonexistent".to_string()].into();
         let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        let filtered = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_shell", "nonexistent"]),
+            "",
+        );
         assert!(
             filtered.is_empty(),
             "unavailable tools should be filtered out"
@@ -14258,7 +14381,14 @@ mod tests {
         skill_map.insert("qa_pr_review".to_string(), &skill_tool);
 
         let required: HashSet<String> = ["qa_pr_review".to_string()].into();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        let filtered = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["qa_pr_review"]),
+            "",
+        );
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains("qa_pr_review"));
     }
@@ -14312,7 +14442,14 @@ mod tests {
         let tools = make_registry_with_tool("run_claude_pilot_groom");
         let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
 
-        let effective = filter_available_required_tools(&required, &tools, &skill_map, None);
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_claude_pilot_groom"]),
+            TICKET_2750_CLOSED_MSG,
+        );
 
         assert!(
             effective.is_empty(),
@@ -14344,7 +14481,14 @@ mod tests {
         let tools = make_registry_with_tool("run_claude_pilot_groom");
         let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
 
-        let effective = filter_available_required_tools(&required, &tools, &skill_map, None);
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_claude_pilot_groom"]),
+            HUMAN_MSG,
+        );
 
         assert_eq!(
             effective,
@@ -14359,7 +14503,14 @@ mod tests {
         let tools = make_registry_with_tool("run_gh");
         let required: HashSet<String> = ["run_gh".to_string(), "run_shell".to_string()].into();
         let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        let filtered = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_gh", "run_shell"]),
+            "",
+        );
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains("run_gh"));
         assert!(
