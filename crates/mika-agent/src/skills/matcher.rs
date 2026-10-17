@@ -112,11 +112,31 @@ pub struct MatchedSkill<'a> {
 /// `"[GitHub]"`) are anchored only on their word-char side, so punctuation-
 /// suffixed intent phrases still work.
 ///
+/// **Données citées (mika#2755).** Un texte d'événement GitHub **cite** le nom
+/// de la branche concernée ; ce n'est pas quelqu'un qui exprime une intention.
+/// Le 2026-10-16, un `check_suite` vert sur
+/// `fix/2750/dispatch-un-groom-ready-label-qui-crashe` a fait matcher le
+/// mot-clé `groom` de dev-groom **dans le slug** — les deux ancres `\b`
+/// ci-dessus y sont satisfaites, les voisins étant des traits d'union, donc
+/// mika#1878 ne pouvait rien y faire. Le `required_tools` du skill s'est armé,
+/// la boucle a re-promptée, et le modèle a fabriqué une tâche manuelle
+/// fantôme. Le message est donc passé par
+/// [`mika_common::github_event_format::mask_cited_branch`] **avant** toute
+/// évaluation de mot-clé.
+///
+/// Le masque vit **ici**, à la tête de cette fonction, et non chez les deux
+/// appelants (`run_agent`, `run_silent`) : les deux modes et tout futur
+/// troisième appelant en héritent sans avoir à s'en souvenir. Sa portée s'arrête
+/// à cette fonction — `context::resolve_contexts`,
+/// `review_filter::apply_review_filter`, les `INTENT_GUARDS` et le prompt lisent
+/// tous le message intact.
+///
 /// Each returned skill is annotated with a [`MatchReason`] indicating why it was
 /// included. If a skill is both `always_on` and has a keyword hit, the reason is
 /// `Keyword` (the more specific match wins). Dependencies are tagged `Dependency`.
 pub fn match_skills<'a>(skills: &'a [SkillEntry], user_message: &str) -> Vec<MatchedSkill<'a>> {
-    let message_lower = user_message.to_lowercase();
+    let intent = mika_common::github_event_format::mask_cited_branch(user_message);
+    let message_lower = intent.to_lowercase();
 
     // First pass: direct matches (always_on or keyword hit), tracking reason
     let mut matched_reasons: HashMap<usize, MatchReason> = HashMap::new();
