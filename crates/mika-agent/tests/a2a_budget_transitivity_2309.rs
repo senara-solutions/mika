@@ -38,11 +38,16 @@
 //! un **épinglage de ce plancher** — il rougit si quelqu'un retire le `.max()`,
 //! ce qui est une régression réelle et c'est le cas `mika2309_the_floor_lifts_a_client_below_the_envelope`
 //! ci-dessous — mais il ne peut pas découvrir une divergence, parce que la seule
-//! cascade que le client sache lire est celle de l'env du process. La cascade
-//! **per-agent** lui est invisible, et c'est là qu'une divergence existe
-//! aujourd'hui : voir le contrôle positif
-//! `mika2309_client_default_is_below_the_arch_envelope` dans
-//! `crates/mika-agent/src/well_known_agents.rs`.
+//! cascade que **ce test** pose est celle de l'env du process.
+//!
+//! Le périmètre déclaré ci-dessus est inchangé ; ce qui a changé est ailleurs.
+//! Jusqu'à mika#2759 la cascade **per-agent** (mika#2189) était invisible du
+//! client, et un contrôle positif auto-nettoyant épinglait cette divergence dans
+//! `crates/mika-agent/src/well_known_agents.rs`. Elle est tenue depuis, non pas
+//! ici mais **au moment de l'envoi** : le `budget_floor` de `mika-cli` demande
+//! l'enveloppe per-agent à l'attestation de spirit et la passe en troisième
+//! candidat à `resolve_send_timeout_with_floor`. Le successeur de ce contrôle est
+//! `mika2759_le_plancher_couvre_lenveloppe_de_mika_arch`, au même fichier.
 //!
 //! # Aucune valeur n'est recopiée
 //!

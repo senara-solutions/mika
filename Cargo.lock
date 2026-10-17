@@ -2289,6 +2289,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "url",
  "uuid",
  "yaml_serde",
 ]
