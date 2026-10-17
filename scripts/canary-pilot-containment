@@ -224,6 +224,28 @@ _canary_on_exit() {
         rm -rf "$_CANARY_TOKEN_STAGE_DIR" 2>/dev/null || true
     fi
 
+    # mika#2751 push-perimeter entries. Composed into THIS trap for the same
+    # reason the victim ref is: a second `trap … EXIT` would replace it.
+    #
+    # Selected BY CONTENT, not by a memorized nonce: every
+    # `_run_pilot_sandboxed` call in this script stages its own entry, so a
+    # single remembered name would leave the others behind. The predicate is
+    # the canary's own repository name, which no real dispatch can declare —
+    # `_is_dispatchable_repo` refuses it — so this can never remove a live
+    # pilot's perimeter and widen nothing it should not.
+    #
+    # Best-effort, and that is enough: a surviving entry only WIDENS the union
+    # towards a repository that does not exist, and the registry TTL carries it
+    # away. The cleanup is here for hygiene, not for containment.
+    if [ -n "${_CANARY_PUSH_SCOPE_REPO:-}" ]; then
+        local _scope_dir="${_PILOT_EGRESS_PUSH_SCOPE_DIR:-$HOME/.mika/pilot-push-scopes}"
+        local _scope_entry=""
+        while IFS= read -r _scope_entry; do
+            [ -n "$_scope_entry" ] && rm -f "$_scope_entry" 2>/dev/null
+        done < <(grep -lFx "repo=senara-solutions/$_CANARY_PUSH_SCOPE_REPO" \
+                     "$_scope_dir"/* 2>/dev/null || true)
+    fi
+
     exit "$rc"
 }
 trap _canary_on_exit EXIT
@@ -510,6 +532,43 @@ else
 fi
 echo
 
+# mika#2751: DECLARE A PUSH PERIMETER, host-side, before any spawn.
+#
+# WHY THIS BLOCK IS A REPAIR AND NOT AN ADDITION. Until mika#2751 this script
+# set neither REPO nor BRANCH, so `_stage_pilot_egress_push_scope` declares
+# nothing and the addon degrades to the static bound of mika#2736 — which is
+# exactly why `push_bound_nominal` below was green. That greenness was
+# ACCIDENTAL, and it stopped being safe the moment the tightening landed: on a
+# host carrying any live perimeter (a concurrent dispatch, which is the normal
+# state of a loop host) the registry is no longer empty, the addon no longer
+# degrades, and a push towards a repository no entry names is refused with
+# `push-scope-repo`. `push_bound_nominal` would then FAIL on a perfectly intact
+# substrate, and it would fail INTERMITTENTLY — green on an idle host, red
+# while a pilot flies. Declaring the perimeter the probe needs makes it green
+# by DECISION instead, and independently of what else is in flight: the union
+# only ever widens.
+#
+# REPO, not a hand-rolled write: the producer under test is the real one, so
+# this block probes `_stage_pilot_egress_push_scope` end-to-end as a side
+# effect. It is deliberately NOT exported — a real dispatch does not export it
+# either (`_set_up_worktree`), and the sandbox must never see the name.
+#
+# THE TARGET IS A REPOSITORY THAT DOES NOT EXIST, like every other push probe
+# here, so no status code can ever be confused with a write that landed. It is
+# the SAME name `push_bound_nominal` already used, so one declaration serves
+# both and the two probes cannot drift apart.
+#
+# THE RESIDUAL ENTRY IS HARMLESS BY CONSTRUCTION, and the trap removes it
+# anyway. One more entry can only WIDEN the union, never tighten it, and the
+# repository it names exists nowhere — so even a leaked entry grants nothing.
+# That is the reading that makes writing to the operator's real registry
+# acceptable here; the opposite instinct (a test entry in a production
+# registry) would deserve a refusal if the entry could tighten anything.
+_CANARY_PUSH_SCOPE_REPO="canary-2736-no-such-repo"
+REPO="$_CANARY_PUSH_SCOPE_REPO"
+echo "push perimeter declared host-side: senara-solutions/$_CANARY_PUSH_SCOPE_REPO (mika#2751)"
+echo
+
 echo "============================================================"
 echo "PART 1 — claude-pilot binary boots inside sandbox"
 echo "============================================================"
@@ -733,7 +792,7 @@ _canary_sentinel_probe egress_sentinel_denied_unknown 403 sentinel-unknown \
 # show accepted=403, and that is a defect, not a decision (mika#2165).
 
 echo
-echo "--- must-work: a legitimate push passes, and the receive-pack is BOUNDED (mika#2736) ---"
+echo "--- must-work: a legitimate push passes, and the receive-pack is BOUNDED to the DECLARED perimeter (mika#2736, mika#2751) ---"
 # mika#2736 closes the other half of pilot egress, and by a different means.
 # On github.com the addon asks for NO justification -- none can travel there,
 # which is why the mika#2724 refusal stops at api.github.com. Instead it BOUNDS
@@ -742,15 +801,16 @@ echo "--- must-work: a legitimate push passes, and the receive-pack is BOUNDED (
 # nothing of the client, so no process of the sandbox gets around it by
 # presenting itself well.
 #
-# Three probes, and the FIRST is the anti-vacuity of the other two -- a bound
-# that refused everything would show both denials perfectly green:
+# Four probes since mika#2751, and the FIRST is the anti-vacuity of the other
+# three -- a bound that refused everything would show every denial perfectly
+# green:
 #
-#   push_bound_nominal — a repository under the organisation, an ordinary branch
-#                        ref, a non-zero new object id. NO refusal reason must
-#                        appear. A refusal here IS the failure mode the parent
-#                        ticket names as the only one able to stop the loop, and
-#                        it reads on one line instead of being deduced from a
-#                        silence.
+#   push_bound_nominal — the repository this run DECLARED as its perimeter, an
+#                        ordinary branch ref, a non-zero new object id. NO
+#                        refusal reason must appear. A refusal here IS the
+#                        failure mode the parent ticket names as the only one
+#                        able to stop the loop, and it reads on one line
+#                        instead of being deduced from a silence.
 #   push_bound_foreign — a repository outside the organisation. Exfiltration is
 #                        the one outcome of this class that cannot be undone
 #                        once it lands, which is why it is the first rule.
@@ -779,15 +839,19 @@ _canary_push_bound_probe() {
             -H "Content-Type: application/x-git-receive-pack-request" \
             "https://github.com/$_repo/git-receive-pack" 2>&1)
     _code=$(printf "%s\n" "$_out" | tail -1)
-    # Substring match on the five reasons the bound can emit -- no grep, no
+    # Substring match on the SIX reasons the bound can emit -- no grep, no
     # pipe, and it pins the vocabulary as a side effect, exactly as the sentinel
-    # probe above pins its three.
+    # probe above pins its three. push-scope-repo is the sixth (mika#2751); it
+    # belongs in the same table because it is read off the same body and
+    # because a probe expecting one reason must be able to REPORT any other,
+    # otherwise the two causes arrive as the same bytes (mika#2205).
     case "$_out" in
         *"DENY push-repo-foreign"*)    _reason=push-repo-foreign ;;
         *"DENY push-ref-delete"*)      _reason=push-ref-delete ;;
         *"DENY push-ref-exotic"*)      _reason=push-ref-exotic ;;
         *"DENY push-ref-protected"*)   _reason=push-ref-protected ;;
         *"DENY push-body-unreadable"*) _reason=push-body-unreadable ;;
+        *"DENY push-scope-repo"*)      _reason=push-scope-repo ;;
         *)                             _reason="" ;;
     esac
     if [ "$_reason" = "$_want_reason" ]; then
@@ -805,6 +869,52 @@ _canary_push_bound_probe push_bound_foreign \
 _canary_push_bound_probe push_bound_delete \
     senara-solutions/canary-2736-no-such-repo.git \
     0000000000000000000000000000000000000000 push-ref-delete
+#
+# mika#2751 tightens the bound from the organisation to THE PERIMETER THIS
+# SPAWN DECLARED, and the two probes below are what makes that visible in
+# flight rather than only in the suites.
+#
+#   push_bound_nominal — unchanged bytes, changed MEANING. It targets the very
+#                        repository this run declared host-side, so it now
+#                        passes because the perimeter NAMES it, not because no
+#                        perimeter exists. Read the block above the PART 1
+#                        banner for why that repair was owed.
+#   push_scope_foreign — a sibling repository of the organisation that no live
+#                        perimeter names. mika#2736 waved this through: it is
+#                        under senara-solutions and the ref is an ordinary
+#                        branch, so all four static rules are satisfied. The
+#                        tightening is the only thing that can refuse it, which
+#                        makes this the one probe that fails the day the
+#                        tightening silently stops biting.
+#
+# WHY THERE IS NO push_scope_degraded PROBE, said here rather than left as an
+# omission to rediscover. The degradation states (`scope-absent`,
+# `scope-unreadable`) are properties of the WHOLE registry, not of a target, so
+# they cannot be observed in a run that declares a perimeter -- and a run that
+# declared none would have to refuse to declare one, giving up
+# push_scope_foreign, which is the valuable half. Worse, it would only be
+# observable on an IDLE host: any concurrent dispatch fills the registry and
+# the state disappears. So degradation is measured where it is deterministic,
+# `skills/bundled/_shared/tests/test_egress_push_bound.sh` CASE 17, and read in
+# production off the proxy log -- `grep scope-absent` on the mitmdump stderr,
+# the operator probe documented in docs/operator/environment-variables.md.
+#
+# The foreign target is nonexistent too, and its name carries 2751 so no real
+# dispatch can ever declare it: `_is_dispatchable_repo` refuses anything
+# outside the three loop repositories, which is what keeps this probe immune to
+# whatever else is in flight.
+_canary_push_bound_probe push_scope_foreign \
+    senara-solutions/canary-2751-foreign-no-such-repo.git \
+    2222222222222222222222222222222222222222 push-scope-repo
+# The second rollback, and the point 3 of the parent ticket made observable:
+# MIKA_PILOT_EGRESS_PUSH_SCOPE=0 in the mitmdump environment disarms the
+# TIGHTENING ALONE. Under it push_scope_foreign reports no reason and FAILs --
+# correct, the tightening is off by operator decision -- while the three
+# push_bound_* probes above stay green, because the static bound of mika#2736
+# is still armed. A rollback that reddened those too would mean the two
+# switches have been wired together, and that is a defect rather than a
+# decision (mika#2165).
+#
 # The rollback, named here because this is where its effect is observable:
 # MIKA_PILOT_EGRESS_PUSH_BOUND=0 in the mitmdump environment disarms THIS bound
 # alone. Under it the two denied probes report no reason and FAIL, which is the
