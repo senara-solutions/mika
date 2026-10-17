@@ -435,6 +435,12 @@ def _format_quota_headers(pairs: list[tuple[str, str]]) -> str:
 # `<hex-size>\r\n<data>\r\n` closed by `0\r\n<trailers?>\r\n`, and the literal
 # `0\r\n\r\n` can occur INSIDE chunk data — which here is arbitrary SSE JSON.
 # Hence a state machine, not an `in chunk`.
+#
+# Since mika#2758 the decoder below serves BOTH directions: the response relay
+# described above, and the uplink request body in
+# `_forward_chunked_request_body`. The grammar is the same and so is the rule
+# that governs it — an unprovable framing is never an end of body — so the
+# second direction reuses this decoder rather than growing a second one.
 # ---------------------------------------------------------------------------
 
 _FRAMING_UNDETERMINED = "undetermined"
@@ -558,6 +564,11 @@ class _ChunkedDecoder:
     not hexadecimal, a missing CRLF where one is required, or a size/trailer
     line longer than `cap` sets `failed`, and a failed decoder disarms the
     detection for the rest of the connection. It never guesses.
+
+    DIRECTION-AGNOSTIC: nothing here knows whether the bytes are a response or
+    a request. Both callers are deliberate — `_BodyFramingTap` on the response
+    (mika#2317) and `_forward_chunked_request_body` on the uplink request
+    (mika#2758) — and the second is a reuse, not a repurposing.
     """
 
     _SIZE = "size"
@@ -932,6 +943,55 @@ _CLIENT_HEADER_DROP_RE = re.compile(
     re.IGNORECASE,
 )
 
+_UPLINK_END_FRAMED = "framed"  # the end of the body was PROVEN
+_UPLINK_END_EOF = "eof"        # stopped on client EOF, nothing was proven
+
+
+async def _forward_chunked_request_body(reader, up_writer) -> str:
+    """Relay a `Transfer-Encoding: chunked` REQUEST body, client → upstream.
+
+    Mirror of `_relay_response_with_status_tap`'s framing discipline on the
+    other direction (mika#2758, follow-up to mika#2317). Two properties:
+
+    **Forward-then-decode.** Every read is written and drained upstream BEFORE
+    the decoder is consulted, so a decoder that fails cannot truncate the
+    request — it can only fail to spot an end. Same asymmetry as the response
+    tap, same reason.
+
+    **Unprovable is not an end.** On `failed` the decoder is disarmed for the
+    rest of the connection and the loop forwards verbatim to client EOF: the
+    behaviour this relay had before mika#2758, not a new one. A substring
+    search is never the fallback — that is the defect being removed.
+
+    Lives at module level rather than inline in `handle_anthropic_reverse_proxy`
+    because that handler reads the host credentials and opens a TLS connection
+    before it ever reaches this loop: extraction is what makes the framing
+    testable without a socket (`UplinkChunkedBodyTests`).
+    """
+    decoder = _ChunkedDecoder()
+    while True:
+        chunk = await reader.read(BUFFER_SIZE)
+        if not chunk:
+            return _UPLINK_END_EOF
+        up_writer.write(chunk)
+        await up_writer.drain()
+        if decoder is None:
+            continue
+        decoder.feed(chunk)
+        if decoder.failed:
+            # Once per connection: the disarming is what guarantees uniqueness.
+            # Deliberately NOT behind `_EGRESS_DEBUG` — that gate covers the
+            # benign high-frequency classes, and an unreadable request framing
+            # emitted by the client's own HTTP stack is neither. Without this
+            # line the anomaly is indistinguishable from upstream slowness.
+            decoder = None
+            _log(
+                "[anthropic-proxy] WARN unreadable uplink chunked framing — "
+                "relaying verbatim to client EOF (mika#2758)"
+            )
+        elif decoder.done:
+            return _UPLINK_END_FRAMED
+
 
 async def handle_anthropic_reverse_proxy(
     reader: asyncio.StreamReader,
@@ -1041,15 +1101,10 @@ async def handle_anthropic_reverse_proxy(
         await up_writer.drain()
         # Forward request body from client → upstream.
         if is_chunked:
-            # Stream chunked body verbatim until 0-length chunk terminator.
-            while True:
-                chunk = await reader.read(BUFFER_SIZE)
-                if not chunk:
-                    break
-                up_writer.write(chunk)
-                await up_writer.drain()
-                if b"0\r\n\r\n" in chunk:
-                    break
+            # Framing-decoded, not substring-searched (mika#2758). The verdict
+            # is not consumed here — the response relay follows unconditionally,
+            # as it did before; it exists for the tests and a future caller.
+            await _forward_chunked_request_body(reader, up_writer)
         elif content_length > 0:
             remaining = content_length
             while remaining > 0:
