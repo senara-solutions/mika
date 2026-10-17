@@ -37,6 +37,34 @@ Une fenêtre qui ne contient **aucune activité PR** ne vaut rien pour ce
 chiffrage : (g) porte sur les `check_suite` de branche de PR, (f) sur les
 `pr_review`. C'est précisément ce qui a invalidé la mesure 2.
 
+## 2 bis. Qui exécute cette commande — pas un pilote dispatché
+
+**Le bac à sable d'un pilote ne monte pas le journal.** Le § 3 lit
+`$MIKA_SPIRIT_LOG_FILE`, c'est-à-dire `/var/log/mika/server.log`
+(`packaging/systemd/mika-spirit.service`). Dans le namespace d'une session
+dispatchée, `/var/log/mika` **n'existe pas** : constaté le 2026-10-17 depuis le
+vol 3, `ls /var/log/mika/` rend `No such file or directory`.
+
+**La cause est une décision, pas un oubli.** Le jeu de binds de
+`skills/bundled/_shared/dispatch-lib.sh` monte `/var/log/claude-pilot`
+(`_pilot_log_bind_args`, mika#2165) et rien d'autre sous `/var/log`. Le
+commentaire de ce helper le dit en toutes lettres : « *this directory, never
+/var/log. /var/log/mika holds the egress-proxy log, an incident-diagnosis
+surface (mika#2041), and the pilot has no business writing there.* » Élargir le
+bind pour rendre la mesure 3 prenable depuis un pilote reviendrait à donner à
+chaque session dispatchée l'écriture sur une surface de diagnostic d'incident.
+Ce n'est pas un arbitrage que la mesure justifie.
+
+**La conséquence, et le seul endroit où elle ne se lit pas comme un résultat.**
+Lancée là, la commande ne se trompe pas : sans fichier lisible, l'instrument
+sort en `2`, et le § 6 dit que `2` signifie *rien n'a été mesuré* — jamais
+« zéro tour payé ». Le refus est donc explicite, et c'est tout ce que
+l'instrument peut faire. La mesure 3 est par construction **un geste
+opérateur**, ou une session hors bac à sable (hôte, ou tout contexte où
+`/var/log/mika/server.log` est lisible). Un vol dispatché ne peut ni l'exécuter
+ni la contourner ; il peut seulement porter la commande prête à coller, ce que
+fait le corps de PR du vol 3.
+
 ## 3. La commande
 
 ```bash
@@ -147,3 +175,53 @@ ne s'implémente pas : elle se pose à l'opérateur.
 - `crates/mika-agent/tests/fixtures/mika2680/` — trois corpus gelés et
   synthétiques. Ils ne sont pas échantillonnés sur le journal vivant : une suite
   qui le lirait changerait de verdict à mesure qu'il grossit.
+
+## 9. L'état des quatre classes, après le vol 3
+
+Le § 7 dit ce que le vol 3 *fait* de l'artefact. Le § 2 bis dit pourquoi
+l'artefact n'est pas à sa portée. Ce qui suit est donc l'état réel, classe par
+classe — et **les quatre raisons ne sont pas la même raison** : c'est tout
+l'intérêt du tableau.
+
+| classe | déclencheur | état après le vol 3 | ce qui décide de cet état |
+|---|---|---|---|
+| **(e)** `closed`/`merged` d'une PR sans tâche de boucle | `pr_closed` | **implémentée** (`pr_closed_no_loop_task`) | la mesure 3 ne pouvait pas changer son chiffre |
+| **(f)** `pr_review` sur une PR fermée au texte réécrit par le `verdict_handler` | `pr_review` + `text_touched: true` | **résidu renvoyé** | la mesure 3 le chiffrerait, et elle seule |
+| **(g)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **bloquée par la mesure** | la mesure 3 est sa condition d'existence |
+| **(h)** `issue_comment` / `issues_closed` sans tâche de boucle | `issue_comment`, `issues_closed` | **posée à l'opérateur** | aucune mesure ne la tranche |
+
+**(e) — pourquoi elle part sans l'artefact.** Le retrait que le § 7.1 prescrit
+(« après retrait de ce que `skipped_by_class` montre déjà écarté par (a)–(d) »)
+est, pour (e), **un seau vide par construction** : aucune des classes (a) à (d)
+ne regarde le déclencheur `pr_closed`. (a) et (b) sont des `check_suite`, (c) un
+`pr_review`, (d) un `issues labeled`. Le chiffre de (e) après retrait est donc
+égal à son chiffre avant retrait, et ce chiffre est déjà pris : n=2, 193 k puis
+279 k tokens d'entrée, sur deux fenêtres distinctes (mesures 1 et 2), par
+l'opérateur, à la main. La mesure 3 l'aurait confirmé ; elle ne le conditionnait
+pas. C'est la seule des quatre dont on peut dire cela.
+
+**(f) — renvoyée, pas refusée.** La classe (c), livrée en phase 2, couvre déjà
+le `pr_review` non actionnable sans tâche. Ce qui reste de (f) après (c) est le
+cas étroit où le texte a été **réécrit** et la PR est **fermée** — et ce résidu
+ne se lit nulle part ailleurs que dans l'agrégat, sur `text_touched: true`
+conjugué à un `trigger` de revue (§ 4). C'est précisément le champ que le vol 1
+a ajouté pour cela, et dont le `//` de jq masquait la valeur `false` avant le
+vol 2. Le résidu est donc **mesurable, et non mesuré** : il attend la commande
+du § 3, pas une décision.
+
+**(g) — la mesure n'est pas un confort, c'est sa condition.** Son plafond se
+superpose à ce que (b) écarte déjà : la mesure 2 le dit en toutes lettres,
+aucune `check_suite` de branche de PR n'avait été vue depuis le déploiement de
+`e14ace7f`, donc un chiffrage pris là aurait compté comme à filtrer ce que (b)
+écarte. Et la question du § 7.2 — *que fait mika-qa de ce tour ?* — porte sur un
+agent dont le fan-out est délibéré (mika#1711). Les deux termes manquent, et les
+deux sont dans l'artefact.
+
+**(h) — le plus gros volume, et le seul blocage qui ne soit pas un chiffre.**
+1,30 M tokens, 79 % de la fenêtre de la mesure 2 : le volume est établi. Ce qui
+manque n'est pas une mesure mais une **réponse** : le tour met à jour la mémoire
+et le fil de priorités, et savoir si ce travail survit sans tour LLM est un
+jugement sur ce que le tour fait, pas sur ce qu'il coûte. Le § 7 le tranche déjà
+en une phrase — *une classe dont le chiffre est significatif mais dont la
+question reste ouverte ne s'implémente pas : elle se pose à l'opérateur.* Elle
+est posée dans le corps de PR du vol 3.
