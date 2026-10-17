@@ -325,6 +325,18 @@ call_site          = "crates/mika-cli/src/commands/agents.rs"
 owner              = "@samidarko"
 
 [[sink]]
+id                 = "cli-spirit-budget-floor"
+destination        = "l'autorité de l'URL A2A visée, bornée au loopback par prédicat (localhost, 127.0.0.0/8, ::1)"
+destination_source = "config"
+class              = "internal"
+data               = "un GET sans corps vers /api/v1/agents/{nom}/budget, avec le jeton interne en Authorization ; le nom d'agent part dans le chemin et il vient de l'URL que l'appelant visait déjà"
+logged             = false
+client_site        = "crates/mika-cli/src/budget_floor.rs"
+call_site          = "crates/mika-cli/src/budget_floor.rs"
+owner              = "@samidarko"
+notes              = "mika#2759 — le plancher d'envoi per-agent. La destination n'est pas MIKA_SPIRIT_URL : elle est l'autorité de l'URL cible elle-même, parce que la question est « que fait tourner CE serveur pour CET agent ». `local_a2a_agent` est le prédicat qui la borne, et c'est l'inversion de celui de `tools/a2a_call.rs` : celui-là refuse le loopback (SSRF), celui-ci n'accepte rien d'autre. Une cible `--remote` ou une forme gateway à deux segments n'émet donc AUCUNE requête — tenu par `mika2759_une_cible_refusee_nemet_aucun_appel_et_un_jeton_absent_nen_supprime_aucun`, dont le compteur de hits est son propre contrôle d'anti-vacuité. `logged = false` : ni corps ni query ne sont journalisés, et il n'y a pas de corps ; les évènements `a2a_floor_*` ne portent que le nom d'agent et la cause de dégradation."
+
+[[sink]]
 id                 = "cli-spirit-tasks"
 destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
 destination_source = "config"
