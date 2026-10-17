@@ -480,9 +480,10 @@ _DENY_PUSH_OPAQUE = "push-body-unreadable"
 # So the verdict is "does SOME live entry declare this repository?", not "does
 # THIS spawn's entry". For the repository dimension that is cheap: a pilot has
 # exactly one possible `origin` (one parent `.git` is bind-mounted, § 2.3) and
-# concurrency is bounded by the dispatch slots, so the union holds ~3 repos and
-# is insensitive to the TTL. The BRANCH dimension is unbounded under the same
-# semantics, which is why it is a separate flight and not an omission.
+# `DISPATCHABLE_REPO_BASENAMES` holds four names, so the union can never exceed
+# four repos and is insensitive to the TTL. The BRANCH dimension is unbounded
+# under the same semantics, which is why it is a separate flight and not an
+# omission.
 #
 # DEGRADATION, not refusal, on every failure of this channel — the exact
 # opposite posture to the sentinel's, deliberately. The sentinel answers "is

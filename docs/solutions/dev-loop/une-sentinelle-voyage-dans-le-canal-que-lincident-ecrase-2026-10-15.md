@@ -62,9 +62,27 @@ la réponse intuitive est fausse.
 | fichier monté dans la sandbox | n/a — hors du chemin réseau | n/a | non | **écarté** |
 | **le credential lui-même (`GH_TOKEN`)** | **oui, déjà** | **non** — l'addon injecte un `Basic` côté proxy, donc aucun justificatif ne peut voyager dans ce canal sur `github.com` | **oui** | **retenu** |
 | **aucun canal — une borne sur ce que le proxy voit déjà** | n/a — **rien n'est demandé au client** | n/a — idem | **impossible** : il n'y a rien à écraser | **retenu pour `github.com`** (mika#2736) |
+| **un fichier hôte relu par requête** | n/a — **rien n'est demandé au client** ; la donnée ne traverse jamais la sandbox | n/a — idem | **impossible** : la sandbox n'a pas le chemin (`~/.mika` n'est pas dans les binds de bwrap) | **retenu pour le périmètre déclaré** (mika#2751) |
 
-**La dernière ligne manquait à cette table, et son absence est ce qui a fait
-paraître la question close.** Cinq lignes sur six demandent « quel canal porte
+**La septième ligne n'est pas un canal de justificatif, et c'est pour ça qu'elle
+est arrivée en dernier.** Elle ne porte rien *depuis* la sandbox : elle porte, de
+l'hôte vers l'addon, **ce que l'hôte sait déjà** du dispatch qu'il a lui-même
+choisi. Elle répond à une troisième question, qui n'est ni « quel canal porte le
+justificatif ? » ni « ce que le garde voit déjà suffit-il ? », mais :
+
+> **Ce que le garde voit déjà suffirait-il si on y ajoutait ce que l'hôte sait
+> déjà ?**
+
+Son verdict de la colonne « écrasé par le test ? » est le point entier : il est
+**impossible** par confinement, pas par chance. Un processus de la sandbox ne
+peut ni lire ni écrire ce fichier — c'est la même asymétrie hôte/sandbox dont
+mika#2724 tire sa sentinelle, utilisée cette fois non pour attester un appel
+mais pour **cadrer** ce qu'un appel peut viser. Le § mika#2751 ci-dessous
+développe, y compris ce que ce canal coûte quand le lecteur est un démon
+partagé.
+
+**La sixième ligne manquait à cette table, et son absence est ce qui a fait
+paraître la question close.** Cinq des sept lignes demandent « quel canal porte
 le justificatif ? ». Tant que la table ne contient que celles-là, un canal où
 *aucun* justificatif ne peut voyager se lit comme « hors d'atteinte ». La sixième
 pose une autre question — *ai-je besoin qu'on me dise quoi que ce soit ?* — et
@@ -284,6 +302,107 @@ que le ticket autorisait, pour une **sous-classe nommée**, avec la mesure qui l
 soutient — écrite ici et dans la surface opérateur, parce qu'une limite connue
 et tue est une surprise d'opérateur, tandis qu'une limite connue et écrite est
 un périmètre.
+
+## Le périmètre que l'hôte sait déjà, et ce qu'il coûte de le faire voyager (mika#2751)
+
+mika#2736 ferme la part **catégorique** de P3 : tout ce qui n'est pas une
+branche, et les deux branches d'intégration. Reste la part **relationnelle** —
+non pas « est-ce une branche ? » mais « est-ce **le** dépôt de **ce**
+dispatch ? ». Le vol 3 de cette surface la ferme pour la dimension dépôt, et la
+mesure qui l'ouvre tient en une phrase : **l'hôte connaît déjà la réponse,
+puisqu'il a choisi le dispatch.** `dispatch-lib.sh` résout le dépôt et la
+branche dans `_set_up_worktree`, bien avant de lancer la sandbox. Il n'y a donc
+rien à deviner, rien à décoder, et rien à demander au client : il n'y a qu'un
+problème de **transport** entre un producteur hôte et un lecteur hôte.
+
+### Un démon long-vivant et partagé n'a qu'un seul environnement, et c'est celui du premier dispatch
+
+C'est la leçon la plus transposable de ce vol, et elle a été mesurée avant
+d'écrire une ligne. La forme naturelle — « l'addon tourne dans un `mitmdump`
+lancé par l'hôte, donc passons-lui le périmètre par son environnement » — est
+celle que le corps du ticket suggérait, et elle est **fausse** :
+`_ensure_pilot_helper` rend 0 dès que le port du relais est vif. Le démon n'est
+donc **pas** relancé par dispatch : son environnement est celui du **premier**
+dispatch qui l'a démarré, et il le reste jusqu'au prochain redémarrage de la
+machine. Un périmètre passé par là serait celui d'un vol terminé depuis des
+heures, et la sonde serait verte.
+
+> **Une donnée per-spawn ne peut pas voyager dans l'environnement d'un processus
+> qui survit au spawn.** Elle doit voyager par quelque chose que le lecteur
+> **relit**, pas par quelque chose qu'il a hérité.
+
+D'où le canal retenu : un **fichier hôte relu à chaque requête**, une entrée par
+spawn sous `~/.mika/pilot-push-scopes/`. L'autorité vient de ce que l'hôte écrit
+et que `~/.mika` n'est pas dans les binds de bwrap — infalsifiable depuis la
+sandbox. Le même raisonnement condamne, au passage, l'idée d'étendre l'entrée de
+sentinelle du vol 1 : les deux données ont des postures de défaillance opposées
+(celle-là **refuse** sur registre illisible, celle-ci **dégrade**), des
+interrupteurs différents, et auront des durées de vie différentes. Un seul
+fichier pour les deux ferait porter à la plus tolérante la posture de la plus
+stricte.
+
+### Le lecteur partagé ne peut pas attribuer une requête à un spawn, donc le verdict porte sur l'UNION
+
+Le corollaire du § précédent, et le vrai prix de ce canal. Rien sur le fil ne
+dit **quel** pilote parle : le démon est partagé, et deux dispatches concurrents
+sortent par la même socket avec le même credential injecté. La question que
+l'addon peut poser n'est donc pas « l'entrée de *ce* spawn déclare-t-elle ce
+dépôt ? » mais « existe-t-il **une** entrée vive qui le déclare ? » — c'est-à-dire
+l'**union** des périmètres en vol.
+
+**Et le coût de cette approximation diffère par dimension.** C'est ce qui a
+découpé le travail en deux vols, et c'est le raisonnement à réemployer avant
+d'ajouter une dimension à un périmètre lu par union :
+
+| dimension | cardinalité de l'union | conséquence |
+|---|---|---|
+| **dépôt** | **bornée par quatre** — `_is_dispatchable_repo` refuse tout ce qui sort de `DISPATCHABLE_REPO_BASENAMES` (`mika`, `mika-cloud`, `mika-skills`, `mika-platform`) | le resserrement est **insensible au TTL** : une entrée résiduelle n'élargit l'union vers rien que le vol suivant n'aurait pu déclarer lui-même. Livrable seul |
+| **branche** | **non bornée** — chaque vol ajoute un nom | une entrée qui survit à son pilote laisse **sa branche** poussable par le suivant. Le resserrement vaut exactement ce que vaut la désinscription des entrées — donc ni plus ni moins que le cycle de vie, qui n'existe pas encore |
+
+D'où le découpage : la dimension dépôt est livrée par mika#2751, la dimension
+branche et le cycle de vie partent **ensemble** dans senara-solutions/mika#2766.
+Livrer `ref=` sans la désinscription donnerait un garde qui se desserre tout
+seul au fil de la journée, et dont la force dépendrait de l'heure — exactement
+la forme d'un garde dont on ne peut rien conclure.
+
+**Une propriété rassurante tombe de l'union, et il faut la nommer parce qu'elle
+gouverne la lecture des incidents : une entrée de plus ne peut qu'ÉLARGIR
+l'union, jamais la resserrer.** Donc une entrée résiduelle, parasite ou mal
+écrite ne peut pas **provoquer** un refus ; elle ne peut qu'en **manquer** un.
+C'est ce qui rend inoffensive l'entrée que `scripts/canary-pilot-containment`
+dépose à chaque passage, et ce qui dit à l'opérateur qu'un `push-scope-repo` sur
+un push légitime ne vient jamais du registre d'un voisin.
+
+### Un pilote n'a qu'un seul `origin` possible, et c'est ce qui rend la question décidable
+
+Le resserrement ne serait qu'une **politique** si un pilote avait plusieurs
+destinations légitimes : il faudrait alors arbitrer, et tout arbitrage finit par
+être desserré par le premier cas qui le gêne. Ce n'est pas le cas. Un seul
+`.git` parent est bind-monté dans la sandbox (bornes de mika#2141), donc la
+sandbox ne contient **qu'un** `origin`. Un push vers un dépôt frère de
+l'organisation n'est donc pas « rare » ou « à discuter » : il est **sans cause
+légitime possible**. C'est ce qui autorise un refus sec plutôt qu'un
+avertissement, et c'est la même forme de raisonnement que celle du vol 1 — on ne
+ferme bien que ce dont on peut dire, sans arbitrage, qu'il n'arrive jamais dans
+le régime nominal.
+
+### Le resserrement est subordonné par sa PLACE, pas par une relecture
+
+Point 2 du ticket : périmètre absent ou illisible ⇒ la borne statique continue
+de s'appliquer, jamais un `return` qui ouvre tout. La propriété est obtenue en
+appelant le resserrement **à l'intérieur de la branche `ALLOW`** de la borne
+statique, et nulle part ailleurs. Sa seule issue neuve est donc un refus de
+plus : il n'existe aucun chemin par lequel il transforme un refus en
+autorisation, et **aucun `return` de sa fonction ne peut ouvrir quoi que ce
+soit**. C'est une propriété de la **structure**, pas une invariante à revérifier
+à chaque lecture — et c'est pourquoi elle est écrite au site d'appel plutôt que
+confiée à la vigilance d'un relecteur.
+
+Le détail opérateur de cette moitié — registre, format `clé=valeur`, le sixième
+motif `push-scope-repo`, les deux jetons de dégradation et leurs remèdes
+distincts, la matrice des deux interrupteurs, la sonde `grep 'DEGRADE scope-'` —
+vit à l'entrée `MIKA_PILOT_EGRESS_PUSH_SCOPE` de
+`docs/operator/environment-variables.md`.
 
 ## Le schéma que `gh` émet, capturé sur le fil
 
