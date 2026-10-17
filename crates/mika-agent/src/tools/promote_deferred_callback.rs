@@ -84,16 +84,26 @@ pub(crate) const PROMOTE_REFUSAL_PREFIX: &str = "REFUS (webhook-pr-turn, mika#26
 /// Ce que la garde a décidé pour cet appel à `promote_deferred_callback`.
 ///
 /// Deux issues et pas trois : il n'y a **pas** de contrôle positif à l'intérieur
-/// du type, contrairement à `CancelPilotDecision::AllowedInPopulation`. La
-/// raison est que la sœur mika#2653 a un second terme (la vivacité d'un pilote),
-/// donc « la garde a tourné et a laissé passer » y est un état distinct de
-/// « la garde n'a pas tourné » et doit être compté séparément. Ici le seul terme
+/// du type, contrairement à [`crate::tools::cancel_task::CancelPilotDecision`]
+/// et à son `AllowedNoPilot`. La raison est que la sœur mika#2653 a un terme que
+/// cette garde n'a pas — la **vivacité d'un pilote** — donc « la garde a tourné
+/// et a laissé passer » y est un état qu'il faut compter. Ici le seul terme
 /// **est** la classe de tour : dans la population, la garde refuse toujours.
-/// Un `AllowedInPopulation` serait une valeur d'audit que rien n'écrit — une
+/// Une issue passante interne serait une valeur d'audit que rien n'écrit — une
 /// colonne de zéros qui se lit comme une population saine, soit exactement ce
 /// que la seconde direction de V6 refuse. Le contrôle positif de cette garde est
 /// donc **hors du type** : c'est AC9, qui montre un tour `[GitHub] Issue …` qui
 /// passe.
+///
+/// **Et la divergence s'est creusée avec mika#2763**, à noter pour qui
+/// comparerait les deux gardes aujourd'hui : `cancel_task` ne lit **plus du tout**
+/// la classe du tour (un pilote vif est un pilote vif dans tout tour, et son
+/// enum a perdu l'issue muette correspondante), tandis qu'ici la classe de tour
+/// **reste le seul terme** — et c'est voulu. Les deux gardes répondent à deux
+/// questions différentes : « du travail tourne-t-il sous cette tâche ? » là-bas,
+/// « cet événement m'autorise-t-il à toucher au plan de dispatch ? » ici. La
+/// seconde est intrinsèquement une question de classe de tour ; la première ne
+/// l'a jamais été.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForcePromoteTurnDecision {
     /// Hors tour webhook PR — **aucun corps, aucune ligne de journal, aucun

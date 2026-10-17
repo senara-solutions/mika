@@ -5797,12 +5797,19 @@ Raisonnement complet, les six rectifications et les deux scans structurels :
 `crates/mika-agent/CLAUDE.md` § *Un dispatch ouvert par un événement PR est borné à
 sa LIGNÉE*.
 
-### `cancel_task` n'annule pas un pilote vif depuis un tour webhook PR (mika#2653, phases A et B)
+### `cancel_task` n'annule pas un pilote vif, dans aucune classe de tour (mika#2653 phases A et B, mika#2763)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
 entrée est ici parce qu'elle est le second cas mesuré de la famille ci-dessus —
 même jour, même classe, et le plus coûteux des deux — et parce que l'opérateur
 qui lit un `cancel_task` refusé cherche dans ce voisinage.
+
+**Lire cette section dans l'ordre : mika#2653 l'a écrite pour la population des
+tours webhook PR, mika#2763 a supprimé ce terme.** Le prédicat ne lit plus la
+classe du tour ; tout ce qui suit décrit la garde telle qu'elle est, et le
+§ *mika#2763 — la garde devient inconditionnelle* ci-dessous dit ce qui a bougé
+et pourquoi. Les tables de recensement de mika#2653 restent telles quelles : ce
+sont des mesures datées, pas des descriptions de l'état courant.
 
 - **Le défaut, mesuré le 2026-10-02.** Trace
   `8ec6364c-be71-11f1-908b-e931f18d2c16` : un tour mika-dev ouvert par un
@@ -5865,28 +5872,35 @@ qui lit un `cancel_task` refusé cherche dans ce voisinage.
 
   | | faux `Alive` (refus à tort) | faux `None` (passage à tort) |
   |---|---|---|
-  | coût | **un appel d'outil refusé** dans un tour webhook | **71 tours jetés** (mesuré) |
+  | coût | **un appel d'outil refusé** dans un tour, quelle qu'en soit la classe | **71 tours jetés** (mesuré) ; **un groom de 4 min détruit** (mika#2763, 2026-10-17) |
   | visibilité | `tool_calls.output` + un WARN + une ligne d'audit | aucune ligne, le pilote meurt |
-  | boucle ? | **non** — un refus d'outil ne se rejoue pas tout seul, et aucune garde `required_tools` ne réclame `cancel_task` | oui — le défaut se rejoue à chaque webhook |
-  | geste opérateur | **intact sur ses trois chemins** (R5) | — |
+  | boucle ? | **non** — un refus d'outil ne se rejoue pas tout seul, et aucune garde `required_tools` ne réclame `cancel_task` | oui — le défaut se rejoue à chaque occurrence |
+  | geste opérateur | **intact sur ses deux chemins sans `ToolContext`** (R5 : CLI, HTTP) | — |
   | rattrapage | le modèle rend la main, le callback arrive de lui-même | aucun : le travail est détruit |
+
+  **L'asymétrie ne tient pas à la classe du tour** — c'est ce que mika#2763 a
+  constaté : elle tient à ce qu'un refus est réversible et qu'un kill ne l'est
+  pas. Ce qui vaut dans un tour webhook vaut dans un tour silencieux.
 
 - **Le coût de ce choix, nommé plutôt que découvert.** Une ligne portant un
   `process_id` **sans** `process_start_time` lisible ne pourra pas être annulée
-  depuis un tour webhook PR. C'est la population que mika#2335 compte sous
+  par un modèle, **dans aucune classe de tour** depuis mika#2763. C'est la
+  population que mika#2335 compte sous
   `unusable_child_count`, celle que le faucheur mika#2249 **décline** et que le
   watchdog #959 ne peut pas juger — donc le refus peut durer jusqu'à ce que
   `timeout_at` (panic-fallback 6 h) rende la ligne terminale. Borné, mesuré par sa
-  propre valeur d'audit, et l'opérateur garde ses trois chemins.
-  **L'arbitrage est local et ne se transporte pas.**
+  propre valeur d'audit, et l'opérateur garde ses deux chemins sans
+  `ToolContext`. **L'arbitrage est local et ne se transporte pas.**
 
 - **La garde est dans l'outil, jamais dans `cancel_task_and_kill`** — c'est ce qui
-  préserve les trois chemins opérateur **par construction** plutôt que par
-  prédicat. Placement : après la validation d'existence et de portée, **avant**
-  toute écriture de statut et tout signal. Le terme de classe de tour est **dans
-  le prédicat pur**, jamais une branche de l'appelant (forme mika#2649) : « hors
-  tour webhook PR, rien ne change » est ainsi une propriété de la fonction, avec
-  son propre test.
+  préserve les chemins opérateur **par construction** plutôt que par prédicat.
+  Placement : après la validation d'existence et de portée, **avant** toute
+  écriture de statut et tout signal. Le prédicat est **pur**, jamais une branche
+  de l'appelant (forme mika#2649) : ce que la fonction décide est une propriété
+  de la fonction, avec son propre test. Depuis mika#2763 il n'y a plus de terme
+  de classe de tour à y mettre — deux chemins opérateur restent hors garde
+  (CLI, HTTP), et c'est leur **absence de `ToolContext`** qui les en sort, pas un
+  prédicat.
 
 - **Le corps du refus nomme la levée sans donner de gabarit** (doctrine mika#2520
   / mika#2292) : le fait (un pilote travaille sous cette tâche, et quelle ligne
@@ -5897,7 +5911,49 @@ qui lit un `cancel_task` refusé cherche dans ce voisinage.
   gabarit du contournement. Épinglé par
   `mika2653_le_refus_ne_nomme_aucun_contournement`.
 
-#### AC4 — recensement : qui peut encore toucher un pilote vif depuis un tour webhook PR
+#### mika#2763 — la garde devient inconditionnelle
+
+**Le défaut, mesuré le 2026-10-17 à 07:59:38Z.** Un tour **silencieux** de
+mika-dev (`trigger=deferred_dispatch`), ouvert pour lancer le regroom de
+mika#2752, a trouvé la place groom tenue par le callback groom **vivant** de
+mika#2757, lancé à 07:55:25Z — **4 minutes**. Il l'a déclaré « stale (>1h, no
+output, no PR, no Plan callout) », l'a annulé, puis a promu son propre lanceur
+différé. Le « >1h » était l'âge du **parent** (06:41:38Z), seule date qu'il
+pouvait lire : `check_task` refuse les tâches non manuelles, donc l'âge du
+callback lui était structurellement inaccessible. mika#2757 est resté
+`in_progress` sans enfant actif.
+
+**Ce que la garde de mika#2653 ne couvrait pas, et pourquoi.** Son prédicat
+portait deux termes : `ctx.is_webhook_pr_event_turn` **et** la vivacité. Un tour
+silencieux pose ce booléen à `false` — comme les vingt sites de construction qui
+ne le calculent pas, seul `agent_loop/mod.rs` le dérive — donc la garde ne
+s'armait pas. **mika#2763 a retiré le terme de classe de tour** : le prédicat ne
+lit plus que la vivacité, et refuse dans tout tour qui traverse un
+`ToolContext`.
+
+**La borne de mika#2517 / mika#2573 restait exacte, et c'est ce qui l'a rendue
+trompeuse.** La population « webhook servi en silencieux » est bien vide ; le
+tour de l'incident n'en faisait pas partie — il n'était pas un webhook du tout.
+Le coût n'est pas venu du cas limite que la borne décrivait, il est venu du cas
+nominal. Leçon pour toute garde future : ce booléen borne ce qu'un **événement
+PR autorise** et rien d'autre. Une garde dont le faux-passage **détruit du
+travail** n'a pas sa place dessus (mika#2763 en a retiré une) ; une garde sur
+l'**étendue d'une autorisation** y a la sienne (mika#2654 en est une — section
+dédiée ci-dessous, et c'est désormais le **seul** lecteur production du
+booléen).
+
+**Un renommage d'événement, à connaître avant de grepper** (table de migration
+en fin de section) : le contrôle positif ne s'appelle plus
+`cancel_task_webhook_turn_allowed` — ce nom affirmait une population qui n'existe
+plus — mais `cancel_task_pilot_absent`. Les quatre `after_value` d'audit sont
+**inchangés**, `allowed_no_pilot` compris : ce sont le format de fil, et
+`complete_task` les importe (mika#2739).
+
+#### AC4 — recensement daté du 2026-10-03 : qui pouvait toucher un pilote vif depuis un tour webhook PR
+
+**Mesure, pas description de l'état courant.** La ligne `cancel_task` ci-dessous
+est fermée dans **toute** classe de tour depuis mika#2763 ; les autres lignes
+n'ont pas été remesurées.
 
 Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 `FALLTHROUGH_WITHHELD_TOOLS` ne s'y applique pas et `create_task` y est servi.
@@ -5916,7 +5972,8 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 refusé par le ticket, et pour la raison que mika#2484 a déjà dû écrire sur
 `run_gh` — une retenue casse un geste légitime que le prompt prescrit, ici
 l'annulation d'un dispatch réellement perdu. La retenue est **indisponible**, le
-refus **conditionnel** est la seule forme qui reste.
+refus **sur un fait vérifiable** est la seule forme qui reste — conditionné à la
+classe du tour en mika#2653, conditionné à la seule vivacité depuis mika#2763.
 
 #### Surfaces opérateur
 
@@ -5929,7 +5986,13 @@ grep cancel_task_live_pilot_blocked "$MIKA_SPIRIT_LOG_FILE" \
 grep cancel_task_pilot_unreadable "$MIKA_SPIRIT_LOG_FILE" | jq -c '{task_id, reason}'
 
 # 3. CONTRÔLE POSITIF — la garde tourne-t-elle seulement ?
-grep -c cancel_task_webhook_turn_allowed "$MIKA_SPIRIT_LOG_FILE"
+#    mika#2763 a renommé cet événement :
+#      avant : cancel_task_webhook_turn_allowed  (population « tour webhook PR »)
+#      après : cancel_task_pilot_absent          (le fait : aucun pilote sous la tâche)
+#    Un zéro sur l'ANCIEN nom ne dit plus rien ; un zéro sur le nouveau veut dire
+#    soit « la garde n'a jamais tourné », soit « le binaire servi est antérieur
+#    au correctif » (classe mika#2340) — c'est `mika --version` qui tranche.
+grep -c cancel_task_pilot_absent "$MIKA_SPIRIT_LOG_FILE"
 ```
 
 ```sql
@@ -5953,19 +6016,28 @@ SELECT created_at, session_id, substr(input, 1, 200)
 | `blocked_live_pilot` | WARN | **zéro** | chaque ligne est un pilote vif que le moteur n'a pas tué |
 | `blocked_db_unreadable` | WARN | **zéro** | la base ne répond pas — c'est **elle** qu'il faut lire, pas la disposition qu'il faut inverser |
 | `blocked_start_time_unreadable` | WARN | **zéro** | l'instance n'est pas prouvable (population `unusable_child_count`, mika#2335) |
-| `allowed_no_pilot` | INFO | **non vide, faible** | **le contrôle positif** : la garde tourne et laisse passer |
+| `allowed_no_pilot` | INFO | **non vide** — et **plus fourni depuis mika#2763** | **le contrôle positif** : la garde tourne et laisse passer. Événement journal `cancel_task_pilot_absent` (avant mika#2763 : `cancel_task_webhook_turn_allowed`) |
 | `cancel_task_pilot_guard_audit_failed` | WARN | **vide** | la ligne de journal est passée, l'audit non — le `GROUP BY` sous-compte à partir de là |
 
 **Le contrôle positif n'est pas décoratif.** Sans `allowed_no_pilot`, zéro ligne
-aurait **trois** causes indistinguables : aucun refus (sain), aucune annulation
-depuis un tour webhook (sain), binaire antérieur au correctif (classe mika#2340).
+aurait **trois** causes indistinguables : aucun refus (sain), aucun appel de
+`cancel_task` du tout (sain), binaire antérieur au correctif (classe mika#2340).
 *Une garde que personne n'a exercée se lit exactement comme une garde qui marche*
 (mika#2205).
 
-**Rien n'est audité hors population.** Une annulation sur un tour ordinaire
-n'écrit **aucune** ligne : ce serait l'essentiel du trafic, soit très exactement
-le churn que la doctrine mika#2131 borne. Écriture d'audit **fire-and-forget** :
-un échec d'audit ne doit jamais pouvoir changer un verdict d'annulation.
+**Le volume d'audit a changé avec mika#2763, et il faut le savoir avant de lire
+le `GROUP BY`.** La garde de mika#2653 n'écrivait que dans sa population : une
+annulation sur un tour ordinaire n'écrivait **aucune** ligne. Le terme de classe
+de tour ayant disparu, **tout** appel de `cancel_task` / `cancel_reminder` passé
+par l'outil écrit désormais exactement une ligne — un refus, ou
+`allowed_no_pilot`. Deux conséquences : le compte `allowed_no_pilot` **n'est pas
+comparable** de part et d'autre du déploiement (il change de population, pas de
+régime), et le churn que borne la doctrine mika#2131 est accepté ici parce que
+la ligne est désormais ce qui distingue « la garde a jugé » de « la garde n'a pas
+tourné » sur le chemin même de l'incident. Les deux chemins opérateur (CLI,
+HTTP) n'écrivent toujours rien : ils ne traversent aucun `ToolContext`. Écriture
+d'audit **fire-and-forget** : un échec d'audit ne doit jamais pouvoir changer un
+verdict d'annulation.
 
 #### Sondes post-déploiement, et leurs cinq haltes
 
@@ -5974,9 +6046,11 @@ un échec d'audit ne doit jamais pouvoir changer un verdict d'annulation.
 > conclusion (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte —
 > la base n'est pas montée dans le bac à sable de dispatch.
 
-**S1 — le défaut fondateur ne se rejoue pas** (premier tour webhook PR qui
-tente). Attendu : une ligne `blocked_live_pilot`, la tâche non terminale, le
-pilote toujours vivant, et son callback qui arrive ensuite normalement.
+**S1 — le défaut fondateur ne se rejoue pas** (premier tour qui tente, **quelle
+qu'en soit la classe** depuis mika#2763 — y compris un `deferred_dispatch`
+silencieux, qui est le tour de l'incident du 2026-10-17). Attendu : une ligne
+`blocked_live_pilot`, la tâche non terminale, le pilote toujours vivant, et son
+callback qui arrive ensuite normalement.
 *Halte 1 — aucune ligne alors qu'un pilote a été tué :* **ne pas élargir le
 prédicat par réflexe.** Lire d'abord le contrôle positif (commande 3) : zéro des
 deux ne prouve rien du tout (mika#2205). Établir ensuite **par quelle porte**
@@ -5994,13 +6068,21 @@ coût nommé ci-dessus qui se réalise. Vérifier que `timeout_at` finira par re
 la ligne terminale, et **ne pas** retirer le terme : le geste est opérateur, sur
 l'hôte.
 
-**S3 — contrôle négatif de bruit (7 jours).** Aucun refus sur un tour **hors**
-population, et en particulier aucun sur une annulation d'opérateur.
-*Halte 4 — une occurrence :* la garde mord hors de sa population, donc le terme
-de classe de tour est mal lu. **Désarmer d'abord** (revert de l'appel dans
-`CancelTaskTool::execute`), diagnostiquer ensuite — retirer à l'opérateur son
-geste d'annulation est pire que le défaut qu'on referme, puisque ce geste n'a pas
-de contournement.
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus alors qu'**aucun
+pilote ne tournait** sous la tâche, et **aucun refus servi à un opérateur**.
+Depuis mika#2763 la population de la garde est tout appel d'outil, donc la
+question n'est plus « mord-elle hors population ? » mais « son verdict de
+vivacité est-il juste ? ».
+*Halte 4 — un refus sur une tâche dont aucun process ne tournait :* le verdict
+de vivacité est faux, pas la disposition. Lire `cancel_task_live_pilot_blocked`
+(il porte `pid` et `owner_task_id`) et vérifier ce PID sur l'hôte. **Désarmer
+d'abord** (revert de l'appel dans `CancelTaskTool::execute`), diagnostiquer
+ensuite.
+*Halte 4bis — un opérateur reçoit un refus :* impossible par construction sur
+ses deux chemins, qui ne traversent aucun `ToolContext` (R5). Une occurrence veut
+dire qu'un troisième chemin a été ajouté depuis — c'est **lui** qu'il faut lire,
+et retirer à l'opérateur son geste d'annulation serait pire que le défaut
+refermé, puisque ce geste n'a pas de contournement.
 
 **S4 — la population hors périmètre (30 jours), et c'est la précondition des deux
 suivis de R6.**
@@ -6021,12 +6103,15 @@ n'emprunte pas cette route), pas une preuve que la route est fermée.
 
 **Halte transverse — les sondes muettes.** Zéro refus **et** zéro
 `allowed_no_pilot` ne prouve rien : il faut qu'un `cancel_task` ait été appelé
-depuis un tour webhook PR depuis le déploiement.
+par l'outil depuis le déploiement — n'importe quelle classe de tour suffit
+désormais, ce qui rend cette halte beaucoup plus facile à lever qu'avant
+mika#2763.
 
 #### Ce que ce travail n'achète PAS
 
 - **Il ne rend pas le modèle incapable de vouloir annuler un pilote.** Il rend
-  l'annulation impossible **par cet outil, dans cette classe de tour**. La
+  l'annulation impossible **par cet outil** — dans la seule classe de tour
+  webhook PR jusqu'à mika#2763, dans **toutes** depuis. La
   doctrine maison est *construis l'incapacité, ne promets pas la retenue*
   (mika#1991) ; elle est **partiellement** applicable ici — la capacité est bien
   retirée à `cancel_task` / `cancel_reminder`, et elle reste entière via
@@ -6045,12 +6130,22 @@ depuis un tour webhook PR depuis le déploiement.
 - **Il ne ferme pas `promote_deferred_callback`** (mika#2654) ni le cap implement
   (mika#2652) : trois tickets, trois termes, trois populations. **mika#2654 est
   fermé depuis**, par un terme de **classe de tour** et non de vivacité — refus
-  sur un tour `[GitHub] PR …` / `[GitHub] Check suite …` — et il lit le **même**
-  `ToolContext.is_webhook_pr_event_turn` que ce travail a posé, sans le modifier.
-  Le cap implement (mika#2652) reste ouvert.
-- **Il ne couvre pas un tour webhook servi en mode silencieux** — borne héritée
+  sur un tour `[GitHub] PR …` / `[GitHub] Check suite …` — et il lisait le
+  **même** `ToolContext.is_webhook_pr_event_turn` que ce travail a posé, sans le
+  modifier. Depuis mika#2763 il en est le **seul** lecteur production : la
+  divergence est délibérée, les deux gardes ne répondent pas à la même question
+  (« du travail tourne-t-il sous cette tâche ? » contre « cet événement
+  m'autorise-t-il à toucher au plan de dispatch ? »). Le cap implement
+  (mika#2652) reste ouvert.
+- **Il ne couvrait pas un tour webhook servi en mode silencieux** — borne héritée
   de mika#2517 / mika#2573, population mesurée vide (un tour silencieux a
-  `originating_message = None`).
+  `originating_message = None`). **Cette borne a été franchie le 2026-10-17, et
+  pas par un webhook** : le tour de l'incident était un `deferred_dispatch`
+  silencieux, qui ne sert aucun webhook du tout. La borne telle qu'écrite
+  **restait exacte**, et c'est précisément ce qui l'a rendue trompeuse : elle
+  décrivait un cas limite vide pendant que le coût venait du cas nominal — les
+  vingt sites de construction qui posent `false` parce qu'ils ne servent aucun
+  événement. mika#2763 a supprimé le terme plutôt que d'élargir la borne.
 - **AC6 est livré en phase B** : la traversée parent→enfant a un site unique,
   `live_pilot::resolve_task_pilot`, appelé par la garde (via
   `live_pilot_for_task`) et par `cancel_task_and_kill` ; le scan
@@ -6174,7 +6269,8 @@ SELECT s.channel_type, tc.success, count(*) FROM tool_calls tc
 
 **Il n'y a PAS de contrôle positif côté outil, et c'est une décision.**
 L'énumération `ForcePromoteTurnDecision` ne porte **aucune** variante
-`AllowedInPopulation` (la sœur mika#2653 en a une, `allowed_no_pilot`) : ici
+« autorisé » (la sœur mika#2653 en a une, `AllowedNoPilot` /
+`allowed_no_pilot`) : ici
 tout tour hors population est un tour ordinaire, soit l'essentiel du trafic de
 l'outil, et une valeur d'audit « autorisé » y serait une ligne par appel pour
 un verdict qui ne décide de rien — très exactement le churn que la doctrine

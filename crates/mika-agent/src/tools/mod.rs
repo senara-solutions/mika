@@ -198,9 +198,16 @@ pub struct ToolContext<'a> {
     /// site — mais ça touche les vingt-et-un sites de construction et les deux
     /// lecteurs, donc c'est un **suivi nommé**, pas ce ticket.
     ///
-    /// Lu par la garde de `CancelTaskTool::execute` (et donc, gratuitement, par
-    /// `cancel_reminder`, qui y délègue), qui refuse d'annuler une tâche dont un
-    /// pilote **vif** porte le travail.
+    /// Lu par la garde de `PromoteDeferredCallbackTool::execute` (mika#2654),
+    /// qui refuse à un tour webhook PR de forcer la promotion d'un lanceur
+    /// différé.
+    ///
+    /// **Et plus par `CancelTaskTool::execute`, depuis mika#2763.** Cette garde
+    /// l'a lu de mika#2653 à mika#2763 ; elle ne le lit plus, et le bord
+    /// documenté ci-dessous est la raison — un tour silencieux pose `false`, et
+    /// la garde ne tournait donc pas du tour par lequel un pilote groom vivant a
+    /// été tué le 2026-10-17. Un pilote vif est un pilote vif dans toute classe
+    /// de tour ; la question que ce booléen tranche est une autre question.
     ///
     /// # Un verdict, jamais une charge utile
     ///
@@ -220,6 +227,24 @@ pub struct ToolContext<'a> {
     /// d'équipe lit `TeamAgentParams`. **Un futur chemin servant un webhook en
     /// mode silencieux échapperait à cette garde** — borne héritée de
     /// mika#2517 / mika#2573, ni élargie ni modifiée, population mesurée vide.
+    ///
+    /// **Cette borne a été franchie, et pas par un webhook (mika#2763).** Le
+    /// 2026-10-17 un tour **silencieux** `deferred_dispatch` — qui n'est pas
+    /// « un webhook servi en mode silencieux », mais un tour ouvert par le
+    /// moteur de tâches — a appelé `cancel_task` sur un callback groom vivant de
+    /// 4 min et l'a tué, parce que ce booléen y vaut `false` et que la garde
+    /// mika#2653 était posée dessus. **La borne telle qu'elle est énoncée
+    /// ci-dessus reste exacte** (la population webhook-en-silencieux est bien
+    /// vide), et c'est précisément ce qui la rendait trompeuse : elle décrivait
+    /// le risque d'un chemin hypothétique, alors que le coût venait du cas
+    /// nominal — les vingt sites qui posent `false` parce qu'ils ne servent
+    /// aucun webhook du tout.
+    ///
+    /// La leçon, pour qui voudrait poser une garde **nouvelle** sur ce booléen :
+    /// il borne ce qu'un événement de PR **autorise**, et il ne borne rien
+    /// d'autre. Une garde dont le coût du faux passage est une destruction de
+    /// travail ne se pose pas dessus (mika#2763 en a retiré une) ; une garde
+    /// dont l'objet est l'étendue d'une autorisation, si (mika#2654 en est une).
     pub is_webhook_pr_event_turn: bool,
     /// Current LLM provider name (e.g., "anthropic", "openrouter").
     /// Used by builtin handlers that need to know the agent's active provider.
