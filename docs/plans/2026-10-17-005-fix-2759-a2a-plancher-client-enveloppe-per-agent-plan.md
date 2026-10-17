@@ -13,14 +13,14 @@ Le plancher `client >= total` posé par mika#2297 est résolu sur **l'environnem
 process** ; les enveloppes per-agent posées par mika#2189 vivent dans le
 `config.toml` **de l'agent**. Les deux ne se rencontrent jamais.
 
-Re-vérifié le 2026-10-17 sur `39e6df30` :
+Re-vérifié le 2026-10-17 sur `46fdf64d` (re-mesuré au grooming de ce vol) :
 
 - `crates/mika-a2a/src/client.rs:51` — `resolve_timeout_secs(a2a, total)` est
   **privée** et ne reçoit que deux lectures de `std::env` :
   `MIKA_A2A_TIMEOUT_SECS` et `MIKA_AGENT_TOTAL_TIMEOUT_SECS`. Jamais un fichier.
 - `crates/mika-agent/src/well_known_agents.rs:1659` — `MIKA_ARCH_CONFIG` porte
   `agent_total_timeout_secs = 900`.
-- `crates/mika-a2a/src/client.rs:63` — `A2aClient::new` appelle
+- `crates/mika-a2a/src/client.rs:78-80` — `A2aClient::new` appelle
   `resolve_send_timeout()` **à la construction**, avant que l'URL ne soit
   décomposée en agent.
 
@@ -54,11 +54,41 @@ Trois faits, mesurés pendant le grooming, qui resserrent le périmètre.
    cette cascade en disant qu'un quatrième devrait être une primitive partagée, pas
    une quatrième copie.
 
+Trois faits de plus, mesurés au re-grooming du 2026-10-17, qui **corrigent** ce que
+la première rédaction de ce plan tenait pour acquis. Chacun change un livrable.
+
+4. **Le périmètre du lint a2a ne couvrirait pas le nouveau module.**
+   `scripts/check-a2a-timeout-literals.sh:98-103` déclare un `PERIMETER` **fermé** de
+   quatre entrées : `crates/mika-a2a/src`, `crates/mika-cli/src/remote_ask.rs`,
+   `crates/mika-agent/src/tools/a2a_call.rs`, `crates/mika-common/src/llm`.
+   `crates/mika-cli/src/budget_floor.rs` n'en fait pas partie. La conformité de
+   `ATTESTATION_TIMEOUT_SECS` serait donc vraie mais **non vérifiée** — le lint
+   resterait vert parce qu'il ne regarde pas, ce qui est le faux vert que ce garde
+   existe pour refuser. Le commentaire du périmètre dit lui-même sa règle
+   d'appartenance : *« These are the files that actually carry an a2a exchange or the
+   LLM budget cascade behind it. »* Un module qui borne un `GET` et calcule le
+   plancher d'un envoi a2a en est un. **Le périmètre s'étend dans ce vol** (livrable 7).
+5. **Le token de l'attestation est déjà en portée, et l'endpoint l'accepte.**
+   `remote_ask.rs:473-475` — `send_message_to_agent` lit elle-même
+   `MIKA_INTERNAL_TOKEN` (`.filter(|t| !t.is_empty())`) avant de construire le client.
+   Et `crates/mika-agent/src/server/mod.rs:163,184` place `/agents/{id}/budget` sur les
+   **dashboard routes**, documentées *« read-only, accepts dashboard OR internal
+   token »*. L'attestation réutilise donc le token déjà lu : pas de second canal de
+   secret, pas d'appel à `commands::dashboard::auth_token()`, et rien de nouveau à
+   lire dans l'env. Un token absent devient un arbre de dégradation nommé de plus
+   (`status_401`), pas une erreur.
+6. **Les tests du `max` existent déjà et sont à étendre, pas à écrire.**
+   `client.rs:222-235`, `resolve_send_timeout_floors_the_client_budget_at_the_engine_total`,
+   couvre déjà les cinq cas à deux entrées sur le cœur pur. Le troisième candidat
+   s'ajoute à ce test existant ; le poste correspondant passe de 45 à 15 lignes
+   (§ Taille estimée).
+
 ### La contrainte qui tranche la question
 
 Le site le plus commode — faire lire l'enveloppe par `mika-cli` à l'endroit où
-`agent_name` est déjà en portée (`crates/mika-cli/src/commands/ask.rs:466-470`) —
-est **interdit structurellement**.
+`agent_name` est déjà en portée (`crates/mika-cli/src/commands/ask.rs:469-473`, où
+`spirit_endpoint` est assemblé en `{spirit_url()}/a2a/{agent_name}`) — est
+**interdit structurellement**.
 `crates/mika-cli/src/commands/agents.rs:1760`, `mika2457_the_cli_resolves_no_budget_locally`,
 est un scan de source sur tout le crate dont les aiguilles sont `BudgetProvenance`,
 `ModelProvenance`, `resolve_llm_budget_record`, `effective_budget`,
@@ -125,32 +155,49 @@ l'enveloppe changée. Les deux déplacements sont ce qui annule ses objections.
    chemin gateway et le chemin `--remote` tombent donc hors population par
    construction, sans appel réseau et sans ligne de log.
 
-3. **L'enveloppe est lue sur l'attestation, à la même origine que l'envoi.**
-   L'URL d'attestation est construite depuis l'URL cible elle-même
-   (`{scheme}://{authority}/api/v1/agents/{nom}/budget`), **pas** depuis un
+3. **L'enveloppe est lue sur l'attestation, à la même origine que l'envoi, avec le
+   token déjà en portée.** L'URL d'attestation est construite depuis l'URL cible
+   elle-même (`{scheme}://{authority}/api/v1/agents/{nom}/budget`), **pas** depuis un
    `spirit_url()` résolu de son côté : on interroge le serveur qu'on est sur le point
-   d'appeler, pas un homonyme. `GET` avec bearer `MIKA_INTERNAL_TOKEN`, budget court
-   nommé (`const ATTESTATION_TIMEOUT_SECS: u64 = 5`, jamais un littéral à un site
-   bornant). Le parseur est **pur et séparé du fetch** :
+   d'appeler, pas un homonyme. Le bearer est le `auth_token` que
+   `send_message_to_agent` **a déjà lu** (`remote_ask.rs:473-475`) — l'endpoint siège
+   sur les dashboard routes, qui acceptent le token interne (fait 5). Rien de neuf
+   n'est lu dans l'env, et aucun second canal de secret n'est ouvert : le plancher
+   s'authentifie auprès du serveur qu'il appelle avec la clé de cet appel-là.
+   Budget court nommé (`const ATTESTATION_TIMEOUT_SECS: u64 = 5`, jamais un littéral à
+   un site bornant). Le parseur est **pur et séparé du fetch** :
    `envelope_from_attestation(&serde_json::Value) -> Option<u64>` lit
    `budget.agent_total_timeout_secs` — ce que `handle_agent_budget`
-   (`crates/mika-agent/src/server/dashboard.rs:327`) sert réellement. Aucune aiguille
-   de `mika2457_…` n'est écrite : le module ne nomme ni `BudgetProvenance`, ni
-   `effective_budget`, ni `llm_timeout_budget`. Il lit un champ JSON d'un record que
-   spirit a figé à l'`init_agent`.
+   (`crates/mika-agent/src/server/dashboard.rs:327-345`) sert réellement, sous la clé
+   `budget`, aux côtés de `model_drift` qu'on ignore. Aucune aiguille de `mika2457_…`
+   n'est écrite : le module ne nomme ni `BudgetProvenance`, ni `effective_budget`, ni
+   `llm_timeout_budget`. Il lit un champ JSON d'un record que spirit a figé à
+   l'`init_agent`.
 
 4. **Le câblage est au seul site qui en a besoin, et ne change aucune signature.**
-   `send_message_to_agent` remplace son `A2aClient::new(url, token)` par
+   `send_message_to_agent` remplace son `A2aClient::new(url, token)`
+   (`remote_ask.rs:476`) par
    `A2aClient::with_timeout(url, token, resolve_send_timeout_with_floor(floor))`.
    Pas de septième paramètre positionnel, pas de point d'entrée jumeau, pas un seul
    des ~12 appelants (dont `tests/remote_ask_recovery.rs` et
    `tests/remote_ask_integration.rs`) à retoucher — et le plancher s'applique à tout
    appelant *futur* du chemin a2a local sans que personne ait à y penser.
 
+   **Contrainte de forme sur ce site, et elle est gardée.**
+   `mika1951_both_ask_doors_post_the_isolation_key_through_one_site`
+   (`remote_ask.rs:1766`) n'est pas un test de comportement : c'est un scan de source
+   qui découpe la production sur `"pub async fn send_message_to_agent("` puis sur le
+   `"\npub "` suivant, et exige que `build_send_params(` se trouve dans cette tranche —
+   et qu'il n'y ait **qu'un** appel en production. Le câblage s'insère donc *avant*
+   `build_send_params`, dans le corps, sans introduire de `pub ` en début de ligne
+   entre les deux et sans extraire l'envoi vers un helper. Dit autrement : le plancher
+   se calcule dans `send_message_to_agent`, il ne la découpe pas. Ce garde ne figure
+   pas dans le Verification Contract d'origine ; il y entre (V9).
+
 ### Dégradation, nommée plutôt que découverte
 
 Le CLI **rend** « non attesté » sans valeur quand il affiche un budget ; un transport,
-lui, a besoin d'un nombre. Les trois arbres de dégradation résolvent donc vers le
+lui, a besoin d'un nombre. Tous les arbres de dégradation résolvent donc vers le
 comportement d'aujourd'hui — `resolve_send_timeout()`, c'est-à-dire exactement la
 valeur servie avant ce changement — et le disent :
 
@@ -159,8 +206,17 @@ valeur servie avant ce changement — et le disent :
 | cible non loopback / pas `/a2a/{nom}` | aucun | `debug!` `a2a_floor_not_local` |
 | spirit injoignable | aucun | `warn!` `a2a_floor_unattested`, `cause = "unreachable"` |
 | 404 (agent non résolu sur ce serveur — `handle_agent_budget` ne résout pas en différé) | aucun | `warn!` idem, `cause = "status_404"` |
+| 401 (pas de token lisible, ou pas celui du serveur) | aucun | `warn!` idem, `cause = "status_401"` |
+| tout autre statut non-2xx | aucun | `warn!` idem, `cause = "status_<code>"` |
 | corps sans `budget.agent_total_timeout_secs` | aucun | `warn!` idem, `cause = "malformed"` |
 | attestation lue | `max(client résolu, enveloppe)` | `debug!` `a2a_floor_resolved` |
+
+Les trois statuts sont **un seul arbre** (`status_<code>`) et non trois branches : le
+code est porté dans le champ plutôt que dans le nom de l'événement, forme déjà retenue
+par `UnattestedCause::Status(u16)` (`commands/agents.rs`). Un token absent emprunte
+cette même branche — on envoie la requête sans en-tête `Authorization` et le serveur
+répond 401, plutôt que de court-circuiter : c'est le serveur qui décide si la clé lui
+convient, pas le client qui le devine.
 
 `attested_envelope_secs` est **absent** du champ, jamais `0`, quand rien n'a été
 attesté (motif mika#2331 : absent n'est pas zéro).
@@ -205,30 +261,44 @@ Chaque étape est verte seule.
 
 1. **`crates/mika-a2a/src/client.rs`** — `resolve_timeout_secs` publiée avec le
    doc-comment qui dit pourquoi (c'est le cœur pur, testable sans toucher à l'env
-   process) + `resolve_send_timeout_with_floor`. Tests du `max` à trois entrées :
-   enveloppe seule, env seule, les deux (la plus grande gagne), aucune (= comportement
-   d'aujourd'hui), enveloppe inférieure au défaut (ne rabaisse rien).
+   process) + `resolve_send_timeout_with_floor`. Le test existant
+   `resolve_send_timeout_floors_the_client_budget_at_the_engine_total`
+   (`client.rs:222-235`) est **étendu** au troisième candidat — il n'est pas remplacé :
+   enveloppe seule, enveloppe + env (la plus grande gagne), enveloppe inférieure au
+   défaut (ne rabaisse rien), `None` (= comportement d'aujourd'hui, déjà couvert).
 2. **`crates/mika-cli/Cargo.toml`** — `url.workspace = true` (déjà déclarée au
-   workspace, `url = "2"`).
-   **`crates/mika-cli/src/lib.rs`** — `pub mod budget_floor;`.
+   workspace à `url = "2"`, et déjà consommée par `mika-common`, `mika-agent`,
+   `mika-gateway` ; `reqwest` et `serde_json` sont déjà là).
+   **`crates/mika-cli/src/lib.rs`** — `pub mod budget_floor;` (quatrième module de la
+   surface lib, après `ask_message`, `remote_ask`, `supervision`).
    **`crates/mika-cli/src/budget_floor.rs`** — `local_a2a_agent`,
-   `envelope_from_attestation`, `attested_envelope_secs` (le seul fetch), les
-   événements. Tests **purs** du prédicat (loopback vs hôte distant, chemin à deux
-   segments, chemin sans `/a2a/`, schéma non http) et du parseur (champ présent,
-   absent, nul, type faux, corps d'erreur 404).
-3. **`crates/mika-cli/src/remote_ask.rs`** — le câblage. Le changement de
-   comportement runtime atterrit ici, et seulement ici.
+   `envelope_from_attestation`, `attested_envelope_secs` (le seul fetch, qui prend le
+   token en paramètre et ne lit pas l'env), les événements. Tests **purs** du prédicat
+   (loopback vs hôte distant, chemin à deux segments, chemin sans `/a2a/`, schéma non
+   http, IPv6 entre crochets, `/` final) et du parseur (champ présent, absent, nul,
+   type faux, corps d'erreur 404).
+3. **`crates/mika-cli/src/remote_ask.rs`** — le câblage, inséré avant
+   `build_send_params` et sans découper la fonction (contrainte mika#1951, § mécanisme
+   pièce 4). Le changement de comportement runtime atterrit ici, et seulement ici.
 4. **`crates/mika-cli/src/budget_floor.rs`** (tests) —
    `mika2759_le_plancher_a_un_seul_site` + son contrôle de non-vacuité.
 5. **`crates/mika-agent/src/well_known_agents.rs`** — retrait de
-   `mika2309_client_default_is_below_the_arch_envelope` et atterrissage de son
+   `mika2309_client_default_is_below_the_arch_envelope` (`:3435`) et atterrissage de son
    successeur `mika2759_le_plancher_couvre_lenveloppe_de_mika_arch` (voir
    § Fire-Disposition, point 4).
-6. **Docs** (hors compte) — un paragraphe dans `crates/mika-a2a/CLAUDE.md` (le
+6. **`scripts/check-a2a-timeout-literals.sh`** — `crates/mika-cli/src/budget_floor.rs`
+   entre au `PERIMETER` (fait 4), avec le commentaire d'appartenance des trois autres
+   entrées (`# a2a send-floor attestation`). Sans cette ligne, la conformité de
+   `ATTESTATION_TIMEOUT_SECS` est vraie et **non vérifiée** ; avec elle, V3 l'atteste.
+   `scripts/a2a-timeout-allowlist.txt` n'est **pas** touchée : ses 21 lignes sont
+   toutes des commentaires, elle porte **zéro entrée**, et c'est l'état voulu — « vide »
+   ici veut dire zéro entrée, pas fichier vide.
+7. **Docs** (hors compte) — un paragraphe dans `crates/mika-a2a/CLAUDE.md` (le
    plancher per-agent est tenu à l'envoi, par l'attestation, sur le chemin loopback
    seulement ; `tests/a2a_budget_transitivity_2309.rs` garde son périmètre déclaré et
-   ne change pas) et dans `crates/mika-cli/CLAUDE.md` (le module, le prédicat, les
-   quatre arbres).
+   ne change pas), dans `crates/mika-cli/CLAUDE.md` (le module, le prédicat, les
+   arbres) et la mention du périmètre élargi là où il est déjà décrit
+   (`crates/mika-a2a/CLAUDE.md` § policy gardée).
 
 ---
 
@@ -238,12 +308,14 @@ Chaque étape est verte seule.
 |---|---|---|
 | V1 | suite complète verte | `cargo test` |
 | V2 | le garde mika#2457 reste vert **et son allowlist reste vide** | `cargo test -p mika-cli mika2457` |
-| V3 | aucun littéral à un site bornant sur le chemin a2a, allowlist toujours vide des deux côtés | `scripts/check-a2a-timeout-literals.sh` |
+| V3 | aucun littéral à un site bornant sur le chemin a2a, **périmètre élargi au nouveau module**, allowlist toujours à zéro entrée des deux côtés | `scripts/check-a2a-timeout-literals.sh` |
+| V3b | le lint a2a n'est pas devenu vacueux en changeant de périmètre | `scripts/test-check-a2a-timeout-literals.sh` |
 | V4 | la transitivité mika#2309 est intacte | `cargo test -p mika-agent --test a2a_budget_transitivity_2309` |
 | V5 | le plancher couvre réellement l'enveloppe de mika-arch | `cargo test -p mika-agent mika2759` |
 | V6 | le scan « un seul site » voit quelque chose et refuse un second site | `cargo test -p mika-cli mika2759` |
 | V7 | lint + format | `cargo clippy --all-targets -- -D warnings` && `cargo fmt --check` |
 | V8 | pipeline | `scripts/verify-pipeline.sh origin/main` |
+| V9 | le câblage n'a pas découpé `send_message_to_agent` (garde mika#1951) | `cargo test -p mika-cli mika1951` |
 
 Preuve manuelle à joindre au corps de PR : la valeur résolue pour une cible
 `http://localhost:8080/a2a/mika-arch` avec l'attestation à 900 (**900 s**) et sans
@@ -265,7 +337,13 @@ l'ensemble des entrées du **même** `max`. Un opérateur qui veut un plafond st
 avait pas avant et n'en a pas après.
 
 Rien à migrer : aucune variable renommée, aucune clé de config ajoutée, aucun défaut
-changé. Un spirit qui n'expose pas l'endpoint (binaire antérieur à mika#2457) sert la
+changé. **Aucun prérequis d'authentification nouveau non plus** : la requête d'attestation
+porte le `MIKA_INTERNAL_TOKEN` que l'envoi lit déjà, et l'endpoint accepte ce token
+(dashboard routes, mika#2457). Un shell qui pouvait envoyer peut attester ; un shell
+sans token recevait déjà un 401 sur l'envoi et en reçoit un sur l'attestation, qui est
+fail-open.
+
+Un spirit qui n'expose pas l'endpoint (binaire antérieur à mika#2457) sert la
 valeur d'avant, avec un WARN qui la nomme.
 
 ---
@@ -302,14 +380,18 @@ valeur d'avant, avec un WARN qui la nomme.
   `resolve_send_timeout_with_floor` existe à côté de `resolve_send_timeout`, qui ne
   change pas de comportement.
 - `crates/mika-cli/src/budget_floor.rs` existe, avec son prédicat loopback fermé, son
-  parseur pur, son unique fetch, et ses quatre arbres (`not_local`, `unreachable`,
-  `status_<code>`, `malformed`) tous testés.
+  parseur pur, son unique fetch (token reçu en paramètre, pas lu dans l'env), et ses
+  quatre arbres (`not_local`, `unreachable`, `status_<code>`, `malformed`) tous testés.
+- `crates/mika-cli/src/budget_floor.rs` est **dans** le `PERIMETER` de
+  `scripts/check-a2a-timeout-literals.sh`, et le harnais anti-vacuité de ce lint est
+  vert.
 - `send_message_to_agent` pose le plancher ; aucune de ses signatures ni aucun de ses
-  ~12 appelants n'a changé.
+  ~12 appelants n'a changé, et le garde mika#1951 qui lit son corps est vert.
 - `mika2309_client_default_is_below_the_arch_envelope` est **retiré** avec sa cause,
   et son successeur mika#2759 est vert.
-- V1 à V8 passent. Les deux allowlists existantes (`scripts/a2a-timeout-allowlist.txt`,
-  `ALLOWED` de `mika2457_…`) sont **encore vides** : aucune exception demandée.
+- V1 à V9 passent. Les deux allowlists existantes (`scripts/a2a-timeout-allowlist.txt`,
+  `ALLOWED` de `mika2457_…`) portent **encore zéro entrée** : aucune exception demandée,
+  et le seul mouvement côté détecteurs est un **élargissement** de périmètre.
 - `crates/mika-a2a/CLAUDE.md` et `crates/mika-cli/CLAUDE.md` portent le mécanisme et
   le périmètre loopback.
 - Le corps de PR porte la note de migration et la preuve manuelle 900 / 600.
@@ -325,18 +407,22 @@ valeur d'avant, avec un WARN qui la nomme.
 2. **AC2 — rien ne baisse jamais.** Une enveloppe attestée *inférieure* au client
    résolu ne rabaisse pas le client : le résultat est un `max`, vérifié par un test
    dédié.
-3. **AC3 — l'absence d'attestation rend exactement la valeur d'avant.** Les quatre
-   arbres de dégradation résolvent vers `resolve_send_timeout()`, et chacun a son
-   test.
+3. **AC3 — l'absence d'attestation rend exactement la valeur d'avant.** Les arbres de
+   dégradation (`not_local`, `unreachable`, `status_<code>` — dont 404 et 401 —,
+   `malformed`) résolvent tous vers `resolve_send_timeout()`, et chacun a son test.
 4. **AC4 — une cible non loopback ne déclenche aucun appel réseau.** Le prédicat
    refuse avant tout `GET` ; un test l'atteste sur une URL gateway et sur une URL
    `--remote`.
 5. **AC5 — le CLI ne résout toujours aucun budget localement.**
    `mika2457_the_cli_resolves_no_budget_locally` est vert avec `ALLOWED` **vide** ;
    aucune de ses sept aiguilles n'apparaît en production dans le nouveau module.
-6. **AC6 — aucun budget littéral à un site bornant.**
-   `scripts/check-a2a-timeout-literals.sh` sort 0, et
-   `scripts/a2a-timeout-allowlist.txt` reste vide (comparée dans les deux sens).
+6. **AC6 — aucun budget littéral à un site bornant, et le nouveau module est DANS le
+   périmètre.** `crates/mika-cli/src/budget_floor.rs` figure au `PERIMETER` de
+   `scripts/check-a2a-timeout-literals.sh`, celui-ci sort 0,
+   `scripts/test-check-a2a-timeout-literals.sh` (anti-vacuité) sort 0, et
+   `scripts/a2a-timeout-allowlist.txt` porte toujours **zéro entrée** (comparée dans
+   les deux sens). Un plancher a2a borné par un fichier hors périmètre ne satisfait
+   pas ce critère, même si sa constante est conforme.
 7. **AC7 — l'exception mika#2309 est retirée avec sa cause.**
    `mika2309_client_default_is_below_the_arch_envelope` n'existe plus ; son successeur
    lit les deux mêmes données réelles (`MIKA_ARCH_CONFIG`, le résolveur) et affirme
@@ -351,6 +437,11 @@ valeur d'avant, avec un WARN qui la nomme.
 10. **AC10 — la garde B de mika#2309 est intacte.**
     `crates/mika-agent/tests/a2a_budget_transitivity_2309.rs` n'est pas modifié et
     reste vert : son périmètre déclaré (défauts + env du process) est toujours exact.
+11. **AC11 — le câblage n'a pas découpé la fonction d'envoi.**
+    `mika1951_both_ask_doors_post_the_isolation_key_through_one_site` est vert :
+    `build_send_params` a toujours exactement une définition et un appel de
+    production, et cet appel vit toujours dans la tranche de source qui commence à
+    `pub async fn send_message_to_agent(`.
 
 ---
 
@@ -390,43 +481,63 @@ n'est demandée parce que la direction a été choisie pour n'en avoir besoin d'
    d'échec que mika#1574 existe pour empêcher. Il est donc **retiré avec son ticket de
    suivi (celui-ci)** et remplacé par le point 3, qui épingle ce qui est désormais vrai
    et porteur. Il n'est **pas** ajusté.
-5. **Détecteurs existants, aucune exception demandée** —
-   `a2a-timeout-literal-lint` (A1 : aucun littéral au site bornant ; A2 : tout
-   `const … : Duration >= 60 s` est un `DEFAULT_*` adossé à un `MIKA_*`) reste vert
-   parce que `ATTESTATION_TIMEOUT_SECS` est un `u64` nommé à 5 s, donc ni littéral au
-   site bornant (A1 admet `from_secs(IDENT)`) ni concerné par A2.
+5. **Élargissement du périmètre d'un détecteur existant, et c'est la correction du
+   re-grooming.** `a2a-timeout-literal-lint` a deux règles (A1 : aucun littéral à un
+   site bornant ; A2 : tout `const … : Duration >= 60 s` est un `DEFAULT_*` adossé à un
+   `MIKA_*`) et un **périmètre fermé de quatre entrées** qui ne contient pas
+   `budget_floor.rs` (fait 4). `ATTESTATION_TIMEOUT_SECS` y est conforme deux fois —
+   `u64` nommé, donc A1 l'admet (`from_secs(IDENT)`) et A2 ne le concerne pas (ce n'est
+   pas un `const … : Duration`) — mais tant que le fichier est hors périmètre, cette
+   conformité n'est **pas mesurée**. Un garde vert parce qu'il ne regarde pas est
+   précisément ce que celui-ci refuse ailleurs. Le périmètre s'élargit donc d'une
+   entrée (livrable 6), ce qui **arme** le garde sur le nouveau module au lieu de lui
+   accorder une exemption tacite. Ce n'est pas une exception : c'est l'inverse d'une
+   exception, et V3b atteste que le garde élargi n'est pas devenu vacueux.
+6. **Détecteurs existants, aucune exception demandée** —
    `mika2457_the_cli_resolves_no_budget_locally` reste vert parce qu'aucune de ses sept
    aiguilles n'est écrite : le module lit un champ JSON attesté, il ne résout rien.
-   **Si l'une des deux rougit, l'implémentation s'arrête et remonte (option c)** — ces
-   deux allowlists ne s'ouvrent pas sous l'autorité de ce vol.
+   `mika1951_both_ask_doors_post_the_isolation_key_through_one_site` reste vert parce
+   que le câblage s'insère dans le corps de `send_message_to_agent` sans l'extraire ni
+   la découper (§ mécanisme pièce 4, V9).
+   **Si l'une des trois rougit, l'implémentation s'arrête et remonte (option c)** — ni
+   l'allowlist `mika2457_…`, ni `scripts/a2a-timeout-allowlist.txt`, ni la contrainte
+   mika#1951 ne s'ouvrent sous l'autorité de ce vol.
 
 ---
 
 ## Taille estimée
 
+Re-mesuré au re-grooming du 2026-10-17 : deux postes bougent. Les tests du `max`
+passent de 45 à 15 (le test existe, il est étendu — fait 6) ; le périmètre du lint
+ajoute 2 lignes (livrable 6).
+
 | livrable | lignes de code (hors `docs/`) |
 |---|---|
 | `crates/mika-a2a/src/client.rs` (cœur pur publié + `resolve_send_timeout_with_floor`) | 35 |
-| `crates/mika-a2a/src/client.rs` (tests du `max` à trois entrées) | 45 |
+| `crates/mika-a2a/src/client.rs` (extension du test du `max` au 3ᵉ candidat) | 15 |
 | `crates/mika-cli/src/budget_floor.rs` (prédicat, parseur, fetch, événements) | 95 |
 | `crates/mika-cli/src/budget_floor.rs` (tests purs : prédicat, parseur, arbres d'échec) | 85 |
 | `crates/mika-cli/src/budget_floor.rs` (scan « un seul site » + contrôle de non-vacuité) | 50 |
 | `crates/mika-cli/src/remote_ask.rs` (câblage dans `send_message_to_agent`) | 15 |
 | `crates/mika-cli/src/lib.rs` + `Cargo.toml` (déclarations) | 2 |
 | `crates/mika-agent/src/well_known_agents.rs` (retrait mika#2309 + successeur) | 35 |
+| `scripts/check-a2a-timeout-literals.sh` (une entrée de `PERIMETER` + son commentaire) | 2 |
 
-Total estimé : 362 lignes
+Total estimé : 334 lignes
 Plafond de tours : 200 (loop-substrate)
 Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 
-**Un seul vol, et voici pourquoi il tient.** 362 < 429 et 362 < 1000 : les deux bornes
-passent, la plus serrée avec ~67 lignes de marge. Le périmètre est fermé par
-construction — **un** module neuf, **quatre** fichiers touchés, aucune signature
+**Un seul vol, et voici pourquoi il tient.** 334 < 429 et 334 < 1000 : les deux bornes
+passent, la plus serrée avec ~95 lignes de marge. Le périmètre est fermé par
+construction — **un** module neuf, **six** fichiers touchés (`client.rs`,
+`remote_ask.rs`, `lib.rs`, `Cargo.toml`, `well_known_agents.rs`,
+`check-a2a-timeout-literals.sh`), aucune signature
 publique modifiée, donc **zéro** appelant à retoucher (c'est le gain principal de la
 dérivation depuis l'URL : les ~12 appelants de `send_message_to_agent`, dont deux
 fichiers de tests d'intégration, restent intacts). Aucune migration de schéma, aucun
-renommage, aucune réécriture de test existant sauf le retrait nommé du point 4 de la
-Fire-Disposition. Les deux postes qui auraient fait déborder ont été écartés
+renommage, aucune réécriture de test existant — le test du `max` est **étendu** et
+celui de mika#2309 est **retiré** avec sa cause (point 4 de la Fire-Disposition), ce
+qui est nommé, pas subi. Les deux postes qui auraient fait déborder ont été écartés
 délibérément et pour des raisons de justesse, pas de budget : un serveur HTTP stub
 (~60 lignes de harnais) est inutile dès lors que le parseur est séparé du fetch et
 testé purement, et un test de bout en bout de `send_message_to_agent` est
