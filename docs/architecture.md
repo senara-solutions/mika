@@ -222,7 +222,7 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `list_scheduled_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
 | `create_scheduled_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
 | `cancel_task` | Cancel a pending task by full UUID (36-char validation). | Tasks |
-| `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. | Tasks |
+| `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. **Refuses when a pilot is alive under the task** (mika#2739): liveness is read by `live_pilot::live_pilot_for_task`, the refusal names the PID and the row carrying the pgid, and an unreadable verdict refuses too (fail-closed). Audited under `complete_task_pilot_guard`, the pass included. The nominal delivery path (`POST /tasks/{id}/complete`) does not go through this tool and is unaffected. | Tasks |
 | `get_task` | Inspect a task by full UUID. Returns all fields including status, trigger_type, action_type, result, timeout_at. | Tasks |
 | `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
 | `create_skill` | Create a new custom skill with prompt snippets and tool definitions. | Skills |

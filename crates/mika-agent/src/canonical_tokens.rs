@@ -1817,6 +1817,145 @@ mod tests {
         );
     }
 
+    // ───── mika#2739 — la garde de complétion sur pilote vif ─────
+
+    /// **Livrée vide, et `mika2739_lallowlist_du_nom_daudit_est_vide` l'assert.**
+    ///
+    /// Zéro violation existante, et c'est **mesuré** plutôt que supposé : avant
+    /// le commit de la garde, `grep -rn 'complete_task_pilot_guard' crates/`
+    /// rendait **aucune** ligne. Le nom naît donc avec exactement un écrivain, et
+    /// il n'y a rien à excepter — ni de case où déposer la prochaine infraction
+    /// (mika#2323). Quand le scan tire, **on fait passer le site par la constante
+    /// partagée**, on ne l'allowliste pas (doctrine mika#2201).
+    const COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Contrôle de bonne foi du scan ci-dessous, et il est dû.**
+    ///
+    /// Le prédicat est **exact** plutôt qu'en sous-chaîne, et un prédicat
+    /// resserré doit montrer qu'il mord encore — sans quoi il devient inerte en
+    /// silence (mika#2103 / mika#2205). L'anti-vacuité du scan ne le dit pas :
+    /// elle vérifie que le **propriétaire** porte le nom, pas qu'un **étranger**
+    /// serait vu.
+    ///
+    /// Les contrôles négatifs sont les formes réellement présentes dans l'arbre :
+    /// le nom du **résidu**, qui a le nom d'audit pour **préfixe**, le nom d'audit
+    /// de la **garde sœur** (mika#2653), dont les quatre valeurs sont partagées et
+    /// qui ne doit surtout pas compter ici, et une mention en commentaire.
+    #[test]
+    fn mika2739_le_scan_du_nom_daudit_voit_un_second_site() {
+        let needle = format!("complete_task{}", "_pilot_guard");
+
+        assert!(
+            audit_name_literal_present(
+                &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
+                &needle
+            ),
+            "INVARIANT VIOLÉ : le prédicat ne voit plus un second écrivain de la \
+             ligne d'audit — le scan est devenu inerte et il se lirait exactement \
+             comme un arbre propre"
+        );
+
+        for benign in [
+            // Le nom du résidu, PRÉFIXÉ par le nom d'audit : c'est la forme qui
+            // ferait rougir une comparaison par sous-chaîne, et c'est une autre
+            // surface (le journal, pas `audit_events`).
+            format!("        warn!(event = \"{needle}_audit_failed\", error = %e);"),
+            // Le nom d'audit de la garde SŒUR : vocabulaire de verdicts partagé,
+            // `tool_name` distinct. C'est très exactement ce que ce scan compte.
+            "        \"cancel_task_pilot_guard\",".to_string(),
+            // Une mention en commentaire.
+            format!("    // le nom `{needle}` vit dans tools/complete_task.rs"),
+            // Un voisin de la même famille, autre nom.
+            "        warn!(event = \"complete_task_live_pilot_blocked\");".to_string(),
+        ] {
+            assert!(
+                !audit_name_literal_present(&benign, &needle),
+                "faux positif du scan sur une ligne qui n'écrit pas la ligne \
+                 d'audit : {benign}"
+            );
+        }
+    }
+
+    /// **mika#2739** — la propriété qui rend la sonde de déploiement exacte.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, la garde continuerait de refuser, et chaque assertion
+    /// de `tools::complete_task::tests::mika2739` resterait verte. Ce qui
+    /// deviendrait faux est le **compte** — et c'est lui que la sonde
+    /// post-déploiement lit (`SELECT after_value, count(*) … WHERE tool_name =
+    /// 'complete_task_pilot_guard' GROUP BY 1`) pour décider si la garde mord, si
+    /// l'illisible refuse à tort, et si le **contrôle positif** tourne. Ce
+    /// dernier est ce qui sépare « zéro refus » de « la garde ne tourne pas »
+    /// (classe mika#2205) ; un second site le rendrait insoustractible.
+    ///
+    /// # La comparaison est EXACTE, et pas en sous-chaîne
+    ///
+    /// Reprise mot pour mot de la correction mesurée par mika#2649, puis
+    /// mika#2634, puis mika#2653 et mika#2654 sur leurs propres scans jumeaux :
+    /// le nom du **résidu** de cette famille
+    /// (`complete_task_pilot_guard_audit_failed`) a le nom d'audit pour
+    /// **préfixe**, donc une comparaison par sous-chaîne le compterait comme un
+    /// second écrivain. Ce sont deux surfaces distinctes — l'une répond à
+    /// « combien de complétions la garde a-t-elle tranchées » (`audit_events`),
+    /// l'autre à « la ligne d'audit est-elle passée » (le journal) — et aucune
+    /// n'a à se taire pour que l'autre soit exacte.
+    #[test]
+    fn mika2739_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("complete_task{}", "_pilot_guard");
+        let owner = "crates/mika-agent/src/tools/complete_task.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2739 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2739 — le nom d'audit de la garde de complétion a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `tools::complete_task::COMPLETE_TASK_PILOT_GUARD_AUDIT_TOOL`. Ne PAS \
+             l'ajouter à COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS — le \
+             `GROUP BY` de la sonde n'est exact que tant qu'un seul site écrit ce \
+             nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de
+    /// `COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS`.
+    ///
+    /// **Nommée** plutôt que désignée par position : ce fichier a déjà vu la
+    /// phrase « l'allowlist ci-dessus » désigner une autre allowlist que celle
+    /// qu'elle assertait, le jour où un bloc s'est inséré entre les deux
+    /// (leçon mika#2496).
+    #[test]
+    fn mika2739_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     // ───── mika#2653 phase B — la vivacité d'un pilote a un lecteur unique ─────
 
     /// **Livrée vide, et le test plus bas l'assert.**

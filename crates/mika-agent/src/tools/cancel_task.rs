@@ -43,6 +43,21 @@ pub(crate) const AUDIT_ALLOWED_NO_PILOT: &str = "allowed_no_pilot";
 /// ce qu'un opérateur lit pour savoir ce qu'un `GROUP BY` peut rendre, et un
 /// registre qui n'existe que sous `cfg(test)` est un registre qu'un lecteur de
 /// ce fichier ne trouve pas.
+///
+/// # Un vocabulaire **partagé**, et ce qui sépare les populations (mika#2739)
+///
+/// Ces quatre valeurs sont aussi celles qu'écrit la garde de `complete_task`
+/// (mika#2739), qui les **importe** d'ici plutôt que de les redéclarer : les
+/// deux gardes posent la même question à [`live_pilot_for_task`] et obtiennent
+/// les mêmes quatre issues, donc deux orthographes d'un même verdict
+/// couperaient une population en deux sans le dire.
+///
+/// Ce qui sépare les deux populations n'est pas la valeur mais le **`tool_name`**
+/// sous lequel la ligne est écrite — `cancel_task_pilot_guard` ici,
+/// `complete_task_pilot_guard` là-bas. Un opérateur qui veut l'un des deux
+/// filtre sur `tool_name` ; un opérateur qui veut la vivacité toutes portes
+/// confondues groupe sur `after_value` sans filtrer. **Les deux lectures sont
+/// voulues**, et c'est précisément ce que le partage du vocabulaire achète.
 #[allow(dead_code)]
 pub(crate) const ALL_CANCEL_PILOT_GUARD_VERDICTS: &[&str] = &[
     AUDIT_BLOCKED_LIVE_PILOT,
@@ -128,7 +143,12 @@ impl CancelPilotDecision {
 /// causes est un **suivi** : elle rendrait ce `match` exhaustif et retirerait à
 /// la fois l'assertion et le repli, mais elle touche les deux appelants
 /// existants de mika#2279.
-fn unreadable_audit_value(reason: &str) -> &'static str {
+///
+/// `pub(crate)` depuis mika#2739 : la garde de `complete_task` traduit les mêmes
+/// deux causes vers les mêmes deux valeurs, et une seconde copie de ce `match`
+/// serait un second endroit où un troisième motif pourrait se compter en
+/// silence avec la cause base.
+pub(crate) fn unreadable_audit_value(reason: &str) -> &'static str {
     if reason == UNREADABLE_NO_START_TIME {
         AUDIT_BLOCKED_START_TIME_UNREADABLE
     } else {
