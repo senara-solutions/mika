@@ -499,6 +499,91 @@ mod tests {
         assert_eq!(dev_pilot.reason, MatchReason::Dependency);
     }
 
+    // -- mika#2755 : une branche citée n'est pas du texte d'intention --
+
+    /// Message du webhook fondateur de mika#2755, **mot pour mot**.
+    const MIKA2755_CHECK_SUITE_MESSAGE: &str = "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)";
+
+    /// La scène de mika#1251 ci-dessus, réutilisée telle quelle : c'est la
+    /// topologie réelle (self-dev always_on dépendant de dev-pilot et
+    /// dev-groom), donc le seul décor où la distinction Keyword / Dependency
+    /// veut dire quelque chose.
+    fn mika2755_self_dev_scene() -> Vec<SkillEntry> {
+        vec![
+            make_entry_with_deps(
+                "self-dev",
+                &["implement"],
+                true,
+                &["dev-pilot", "dev-groom"],
+            ),
+            make_entry("dev-pilot", &[], false),
+            make_entry("dev-groom", &["groom", "groom ticket"], false),
+        ]
+    }
+
+    #[test]
+    fn mika2755_a_groom_in_a_branch_slug_demotes_dev_groom_to_dependency() {
+        let skills = mika2755_self_dev_scene();
+
+        let matched = match_skills(&skills, MIKA2755_CHECK_SUITE_MESSAGE);
+
+        let dev_groom = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-groom")
+            .expect("dev-groom reste chargé par l'arête de dépendance de self-dev");
+        assert_eq!(
+            dev_groom.reason,
+            MatchReason::Dependency,
+            "le `groom` du slug ne doit pas valoir une intention : seul \
+             `MatchReason::Keyword` arme les `required_tools` (#463), et c'est \
+             cette promotion qui a produit le re-prompt de mika#2755"
+        );
+    }
+
+    #[test]
+    fn mika2755_a_human_groom_request_is_still_a_keyword_match() {
+        // Contre-épreuve : le chemin nominal du grooming manuel reste entier.
+        let skills = mika2755_self_dev_scene();
+
+        let matched = match_skills(&skills, "groom mika#2750");
+
+        let dev_groom = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-groom")
+            .expect("dev-groom doit matcher");
+        assert_eq!(
+            dev_groom.reason,
+            MatchReason::Keyword,
+            "un humain qui demande un groom exprime bien une intention"
+        );
+    }
+
+    #[test]
+    fn mika2755_the_mask_does_not_disarm_qa_review_on_a_pr_review_event() {
+        // La piste 2 du ticket — « n'appliquer les required_tools qu'aux
+        // messages humains » — aurait désarmé mika-qa sur ses propres
+        // webhooks. Ce vol ne masque que le slug : un `pull_request_review`
+        // n'en cite aucun, donc rien n'y bouge. C'est l'assertion qui
+        // distingue ce correctif de la piste large.
+        let skills = vec![make_entry("qa-review", &["review", "pr", "qa"], false)];
+
+        let matched = match_skills(
+            &skills,
+            "[GitHub] PR review (approved) on senara-solutions/mika#2754 (titre) by @mika-qa",
+        );
+
+        let qa_review = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "qa-review")
+            .expect("qa-review doit toujours matcher sur son propre webhook");
+        assert_eq!(
+            qa_review.reason,
+            MatchReason::Keyword,
+            "mika-qa n'est pas désarmé : ses mots-clés portent sur la forme du \
+             gabarit, pas sur une branche"
+        );
+    }
+
     #[test]
     fn test_disabled_mid_chain_breaks_subtree() {
         // A depends on B, B depends on C. B is disabled → C is NOT loaded.
