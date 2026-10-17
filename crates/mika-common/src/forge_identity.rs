@@ -80,6 +80,26 @@ pub const DISPATCHER_FORGE_LOGIN: &str = "mika-platform-dev";
 /// Préfixe de la ligne porteuse du signal merge-ready.
 pub const MERGE_READY_MARKER: &str = "MERGE-READY-SIGNAL:";
 
+/// Marqueur du champ branche **dans** la ligne ci-dessus. Forme complète :
+/// ` branch={branch}`, la valeur se lisant jusqu'à la prochaine espace.
+///
+/// # Pourquoi une constante pour un champ d'une grammaire à clés
+///
+/// Parce qu'un second lecteur est arrivé, et qu'il ne relit pas le signal : il
+/// le **masque**. `github_event_format::mask_cited_branch` vide tout slug de
+/// branche cité avant l'évaluation des mots-clés de skill, et cette ligne est
+/// la seconde façon dont ce pré-digest cite sa branche — l'extrait du ticket
+/// mika#2768 l'élidait derrière un `…`, si bien que le vol 2 du masque a
+/// d'abord été écrit pour la seule forme ` (branch: )` et laissait passer le
+/// `groom` de `fix/2762/rollback-reaper-groom` par ici.
+///
+/// [`parse_merge_ready_signal`] ne la lit **pas** : il découpe sur
+/// `split_once('=')` et compare `"branch"`, ce qui est le bon relecteur pour
+/// une grammaire à clés dont l'ordre est libre. La constante sert au masque,
+/// qui a besoin de la forme littérale ; `mika2768_le_signal_porte_le_marqueur`
+/// épingle l'accord entre les deux.
+pub const MERGE_READY_BRANCH_MARKER: &str = " branch=";
+
 /// Normalise un identifiant d'agent avant toute comparaison — même discipline
 /// que `permission_authority` (minuscules, bords rognés).
 fn normalize(agent_id: &str) -> String {
@@ -682,6 +702,33 @@ mod tests {
         };
         let rendered = signal.to_string();
         assert_eq!(parse_merge_ready_signal(&rendered), Some(signal));
+    }
+
+    /// Le masque de branche a besoin de la **forme littérale** du champ, là où
+    /// le relecteur se contente de la clé. Si le gabarit du signal change
+    /// (` branch:` ? `head_branch=` ?), c'est ici que ça rougit — pas dans
+    /// `mask_cited_branch`, qui continuerait à chercher une forme disparue et
+    /// laisserait passer le slug en silence.
+    #[test]
+    fn mika2768_le_signal_porte_le_marqueur() {
+        let rendered = MergeReadySignal {
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 2768,
+            head_sha: "abc123def".to_string(),
+            branch: "fix/2762/rollback-reaper-groom".to_string(),
+            task_id: "task-2765".to_string(),
+            reviewer_login: REVIEWER_FORGE_LOGIN.to_string(),
+        }
+        .to_string();
+
+        let at = rendered
+            .find(MERGE_READY_BRANCH_MARKER)
+            .expect("le signal ne porte plus le marqueur du champ branche");
+        // Et la valeur se lit bien jusqu'à la prochaine espace : c'est la règle
+        // de coupe que le masque applique.
+        let value = &rendered[at + MERGE_READY_BRANCH_MARKER.len()..];
+        let value = value.split_whitespace().next().expect("un champ non vide");
+        assert_eq!(value, "fix/2762/rollback-reaper-groom");
     }
 
     #[test]
