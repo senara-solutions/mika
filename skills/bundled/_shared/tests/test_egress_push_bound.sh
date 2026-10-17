@@ -88,6 +88,7 @@ import importlib.util
 import io
 import os
 import sys
+import time
 import types
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -946,6 +947,79 @@ del os.environ[BOUND_SWITCH]
 forget_scopes()
 
 print("")
+print("CASE 20 — a perimeter entry stops answering on its own (TTL, mika#2766)")
+# The addon half of the entry lifecycle. Unregistration at spawn end covers the
+# ordinary exit; a SIGKILLed dispatch runs NO trap, so an entry nothing removed
+# has to stop answering by itself. 12 h and not the sentinels' 72 h: that number
+# is calibrated on "can a flight still be read three days later?", this registry
+# answers "is this perimeter still in flight?", and a three-day-old entry never
+# is.
+declare_repos("mika")
+stale = time.time() - 13 * 3600
+os.utime(SCOPES / SCOPE_ENTRY_A, (stale, stale))
+addon._last_purge = {}  # the ten-minute throttle must not hide the purge here
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check_true("20.1 the entry past the TTL is gone",
+           not (SCOPES / SCOPE_ENTRY_A).exists())
+check("20.2 and the verdict falls back on the static bound, never a refusal",
+      200, status_of(flow))
+check("20.3 naming scope-absent — it was the only entry, so nothing is declared",
+      [f"[github-proxy] DEGRADE scope-absent POST {PUSH_PATH}"], degrades_in(err))
+# The other side of the boundary, which is the side that stops the loop: an
+# entry still INSIDE the TTL must keep authorising its repository. A TTL cut
+# "to look tidy" would 403 a live pilot, and this is where that reddens.
+declare_repos("mika")
+fresh = time.time() - 11 * 3600
+os.utime(SCOPES / SCOPE_ENTRY_A, (fresh, fresh))
+addon._last_purge = {}
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check_true("20.4 an entry INSIDE the TTL survives", (SCOPES / SCOPE_ENTRY_A).exists())
+check("20.5 and still authorises its repository", 200, status_of(flow))
+check("20.6 with nothing degraded — it really is still declared",
+      [], degrades_in(err))
+# The value itself, asserted so moving it is a deliberate act and not a drift.
+# 12 h is 2.7x the longest spawn measured over the 718 pilot transcripts on the
+# development host (max 4.40 h); 4 h would already be under it.
+check("20.7 the TTL is the value the derivation landed on, in seconds",
+      12 * 3600, addon._PUSH_SCOPE_TTL_SECONDS)
+check_true("20.8 and it is strictly shorter than the sentinels' — not one number",
+           addon._PUSH_SCOPE_TTL_SECONDS < addon._REGISTRY_TTL_SECONDS)
+
+print("")
+print("CASE 21 — the two registries age at their OWN rates, one request path")
+# The regression this reddens on is a SINGLE TTL. `_purge_registry` serves two
+# registries and used to hold the number itself, exactly as it used to hold one
+# global throttle (CASE 13 of the sentinel suite). One entry of the SAME age in
+# each, picked between the two TTLs — 13 h, past the perimeter's 12 h and well
+# inside the sentinels' 72 h — so neither a shared 12 h nor a shared 72 h can
+# read green here.
+declare_repos("mika")
+AGED_SENTINEL = "5555555555555555555555555555d00d"
+(REGISTRY / AGED_SENTINEL).write_text("", encoding="utf-8")
+same_age = time.time() - 13 * 3600
+os.utime(SCOPES / SCOPE_ENTRY_A, (same_age, same_age))
+os.utime(REGISTRY / AGED_SENTINEL, (same_age, same_age))
+addon._last_purge = {}
+# Two requests, because the two registries are read on two different paths: the
+# perimeter on a push to github.com, the sentinel registry on api.github.com.
+flow, _ = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("21.1 the push is served", 200, status_of(flow))
+flow, _ = run(API, "/rate_limit", cred=f"Bearer {SENTINEL}", method="GET")
+check("21.2 the api.github.com call with an attested sentinel is served too",
+      200, status_of(flow))
+check_true("21.3 the 13 h PERIMETER entry is purged (past its own 12 h)",
+           not (SCOPES / SCOPE_ENTRY_A).exists())
+check_true("21.4 the 13 h SENTINEL entry survives (well inside its own 72 h)",
+           (REGISTRY / AGED_SENTINEL).exists())
+check_true("21.5 and the nonce this whole suite runs on is untouched",
+           (REGISTRY / NONCE).exists())
+check_true("21.6 the two directories were throttled independently, by key",
+           {str(SCOPES), str(REGISTRY)} <= set(addon._last_purge))
+(REGISTRY / AGED_SENTINEL).unlink()
+addon._last_purge = {}
+forget_scopes()
+
+print("")
 print(f"TOTAL failures: {failures}")
 sys.exit(1 if failures else 0)
 PY
@@ -958,8 +1032,8 @@ cat "$PY_OUT"
 # floor). Both must be caught — an `exit 0` after three assertions reads
 # exactly like a clean tree (class mika#2205).
 asserted=$(grep -c '^RESULT ' "$PY_OUT" || true)
-rc=1; [ "${asserted:-0}" -ge 240 ] && rc=0
-assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 240)" "0" "$rc"
+rc=1; [ "${asserted:-0}" -ge 254 ] && rc=0
+assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 254)" "0" "$rc"
 assert_eq "every addon-level assertion passes" "0" "$py_rc"
 
 echo ""

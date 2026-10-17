@@ -174,10 +174,49 @@ _DENY_ABSENT = "sentinel-absent"
 _DENY_UNKNOWN = "sentinel-unknown"
 _DENY_REGISTRY = "registry-unreadable"
 
-# A registry entry outlives its pilot by at most three days. No env var: a TTL
-# an operator can set to zero is a registry an operator can empty by accident,
-# and the value is not the kind of thing a site needs to differ on.
+# A SENTINEL registry entry outlives its pilot by at most three days. No env
+# var: a TTL an operator can set to zero is a registry an operator can empty by
+# accident.
 _REGISTRY_TTL_SECONDS = 72 * 3600
+
+# mika#2766: the PERIMETER registry gets its OWN TTL, and the two values answer
+# different questions. 72 h is calibrated on "can a flight still be read three
+# days later?" (mika#2724). This registry answers "is this perimeter still in
+# flight?", and a three-day-old entry never is.
+#
+# THE ERROR IS ASYMMETRIC, and this is the whole reason the value is derived
+# rather than picked. `mitmdump` is shared between dispatches, so the reader's
+# verdict is the UNION of the live entries — and `_push_scope_verdict` only
+# degrades when the registry is empty or unreadable, never per entry. So with
+# two concurrent dispatches, purging the entry of a pilot that is STILL ALIVE
+# does not degrade to the static bound: the registry still holds its
+# neighbour's entry, so it is neither empty nor unreadable, and the live
+# pilot's legitimate push lands on `_DENY_SCOPE_REPO`.
+#
+#   too LONG  : an entry outlives a SIGKILLed pilot; the union stays bounded by
+#               the dispatchable repositories, so nothing new is reachable.
+#   too SHORT : a live pilot is 403'd while a neighbour holds the registry
+#               non-empty — the loop stops, and on an innocent pilot.
+#
+# The TTL is therefore a FLOOR on the longest spawn, never a housekeeping
+# bound one tightens to look tidy.
+#
+# THE MEASURE, so the next person to touch this reads a number and not an
+# adjective. There is no wall-clock timeout on a spawn anywhere in
+# `dispatch-lib.sh` (the only `timeout` in that file is the 15 s smoke test),
+# so the real bound is the turn ceiling — 200 turns for a `loop-substrate`
+# ticket. Measured over the 718 pilot transcripts on this host
+# (`~/.mika/data/pilot-transcripts`, one per spawn, last timestamp minus
+# first): median 11.9 min, p90 55.2 min, p99 1.89 h, LONGEST 4.40 h. 12 h is
+# 2.7x that longest spawn. 4 h would already be under it, which is the side
+# that stops the loop.
+#
+# No env var here either, and the reason is stronger than for its elder: by the
+# asymmetry above, a TTL an operator can set to zero is not a registry emptied
+# by accident, it is a 403 on every live pilot whose neighbour holds the
+# registry non-empty. The worst of the two imaginable switches.
+_PUSH_SCOPE_TTL_SECONDS = 12 * 3600
+
 _PURGE_MIN_INTERVAL_SECONDS = 600
 
 # One throttle PER directory, not one for the whole process. `_purge_registry`
@@ -312,8 +351,8 @@ def _presented_credential(headers) -> str | None:
     return None
 
 
-def _purge_registry(directory: Path) -> None:
-    """Drop entries older than the TTL, at most once every ten minutes.
+def _purge_registry(directory: Path, ttl_seconds: int) -> None:
+    """Drop entries older than `ttl_seconds`, at most once every ten minutes.
 
     Without this, one file accumulates per spawn forever. It runs BEFORE the
     returned list is computed and never after a verdict, so a purge can only
@@ -330,6 +369,14 @@ def _purge_registry(directory: Path) -> None:
     The throttle is keyed by the directory, never global: this addon purges
     more than one registry, and a global clock would let the first one purged
     in a ten-minute window keep every other one stale for the rest of it.
+
+    The TTL comes IN, for the second half of that same reason (mika#2766). The
+    throttle stopped being a module-level float once this function served two
+    registries; the TTL is the other coupling of the same shape, and the two
+    registries answer questions whose answers age differently
+    (`_REGISTRY_TTL_SECONDS` vs `_PUSH_SCOPE_TTL_SECONDS`). A `if directory ==
+    …` inside the purge would be one more reader for a datum the CALLER already
+    holds.
     """
     key = str(directory)
     now_mono = time.monotonic()
@@ -337,7 +384,7 @@ def _purge_registry(directory: Path) -> None:
     if last is not None and now_mono - last < _PURGE_MIN_INTERVAL_SECONDS:
         return
     _last_purge[key] = now_mono
-    cutoff = time.time() - _REGISTRY_TTL_SECONDS
+    cutoff = time.time() - ttl_seconds
     try:
         entries = list(os.scandir(directory))
     except OSError:
@@ -361,7 +408,7 @@ def _registry_nonces() -> frozenset[str] | None:
     wrong remedy on the day it matters (mika#2205).
     """
     directory = _registry_dir()
-    _purge_registry(directory)
+    _purge_registry(directory, _REGISTRY_TTL_SECONDS)
     try:
         with os.scandir(directory) as entries:
             return frozenset(entry.name for entry in entries if entry.is_file())
@@ -782,9 +829,10 @@ def _push_scope_dir() -> Path:
 
     A registry of its own, not a field added to the sentinel entry: the two data
     have opposite failure postures (that one refuses, this one degrades),
-    different switches, and will have different lifetimes. Resolved per call for
-    the same reason as `_registry_dir` — mitmdump is long-lived, and the staging
-    suites export HOME after sourcing the library.
+    different switches, and — since mika#2766 — different lifetimes
+    (`_PUSH_SCOPE_TTL_SECONDS` here, `_REGISTRY_TTL_SECONDS` there). Resolved per
+    call for the same reason as `_registry_dir` — mitmdump is long-lived, and the
+    staging suites export HOME after sourcing the library.
     """
     override = os.environ.get(_PUSH_SCOPE_DIR_ENV)
     if override:
@@ -813,7 +861,10 @@ def _push_scope_repos() -> frozenset[str] | None:
     comparison here would refuse a legitimate push on a capital letter.
     """
     directory = _push_scope_dir()
-    _purge_registry(directory)
+    # Its OWN TTL, shorter than the sentinel registry's: this one answers "is
+    # this perimeter still in flight?" (mika#2766). Passed in rather than read
+    # inside the purge, so the two registries never share one number.
+    _purge_registry(directory, _PUSH_SCOPE_TTL_SECONDS)
     try:
         entries = list(os.scandir(directory))
     except FileNotFoundError:
