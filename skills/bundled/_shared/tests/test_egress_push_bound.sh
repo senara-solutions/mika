@@ -273,6 +273,38 @@ def ctype_of(flow):
     return flow.response.headers.get("Content-Type") if flow.response else None
 
 
+def denies_in(err):
+    """The refusal lines of a capture, degradation lines excluded.
+
+    Until mika#2751 "nothing was refused" was asserted as `err.strip() == ""`,
+    because a refusal was the only thing the addon ever wrote. The declared-
+    perimeter tightening legitimately prints ONE `DEGRADE scope-…` line on an
+    allowed push when no perimeter is declared -- it is the operator probe of
+    § 3.6, and the canary asserts it in flight -- so the proxy stops standing
+    in for the predicate and the predicate is written out: a refusal is a DENY
+    line, and nothing else is. The degradation line itself is asserted by the
+    cases that own it, never merely tolerated here.
+    """
+    return [line for line in err.splitlines() if " DENY " in line]
+
+
+def degrades_in(err):
+    """The degradation lines of a capture — the other half of `denies_in`."""
+    return [line for line in err.splitlines() if " DEGRADE " in line]
+
+
+def noise_in(err):
+    """Lines that are neither a refusal nor a degradation.
+
+    Keeps the three assertions below as strong as the `err.strip() == ""` they
+    replace: an unexpected third kind of line still reddens.
+    """
+    return [
+        line for line in err.splitlines()
+        if line.strip() and " DENY " not in line and " DEGRADE " not in line
+    ]
+
+
 print("")
 print("CASE 1 — the nominal push of a pilot passes, credential injected")
 # The anti-vacuity of every other case: a bound that refused EVERYTHING would
@@ -281,7 +313,8 @@ flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
 check("1.1 not refused", 200, status_of(flow))
 check("1.2 the HOST credential goes out, Basic, as before this ticket",
       EXPECTED_BASIC, flow.request.headers.get("Authorization"))
-check("1.3 no DENY line", "", err.strip())
+check("1.3 no DENY line", [], denies_in(err))
+check("1.3b and no line of a third kind either", [], noise_in(err))
 # A non-create (old-sha real) is the ordinary case after the first push.
 flow, err = run(GIT, PUSH_PATH, body(cmd(SHA_A, SHA_B, BRANCH)))
 check("1.4 an update (both shas real) passes too", 200, status_of(flow))
@@ -308,7 +341,8 @@ flow, err = run(GIT, PUSH_PATH, FLUSH)
 check("2.1 the bare flush-pkt is allowed", 200, status_of(flow))
 check("2.2 and the credential is injected on it", EXPECTED_BASIC,
       flow.request.headers.get("Authorization"))
-check("2.3 no DENY line for the probe", "", err.strip())
+check("2.3 no DENY line for the probe", [], denies_in(err))
+check("2.3b and no line of a third kind either", [], noise_in(err))
 flow, _ = run(GIT, PUSH_PATH, b"")
 check("2.4 a zero-length body is not a refusal either", 200, status_of(flow))
 
@@ -320,7 +354,8 @@ big = body(cmd(ZERO, SHA_B, b"refs/heads/feat/9999/big"),
            pack=b"PACK\x00\x00\x00\x02" + os.urandom(400_000))
 flow, err = run(GIT, PUSH_PATH, big)
 check("3.1 a 400 KiB body with valid commands passes", 200, status_of(flow))
-check("3.2 no DENY line", "", err.strip())
+check("3.2 no DENY line", [], denies_in(err))
+check("3.2b and no line of a third kind either", [], noise_in(err))
 check_true("3.3 the case is non-vacuous (the body really is large)",
            len(big) > 300_000)
 
