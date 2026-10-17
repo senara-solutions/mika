@@ -7,7 +7,7 @@
 # the ADDON: it writes perimeter entries by hand and measures the verdict. It is
 # therefore completely blind to whether anything in the dispatch ever writes
 # one — a `_stage_pilot_egress_push_scope` that returned immediately would leave
-# all 268 of its assertions green, and every pilot would push under the static
+# all 288 of its assertions green, and every pilot would push under the static
 # bound alone while the suites claimed a tightening. This suite is the other
 # half of that correspondence: the producer really produces, and what it
 # produces is the shape the reader reads (`repo=senara-solutions/<repo>`).
@@ -36,7 +36,9 @@
 # WHAT IS NOT HERE, so nobody reads an omission into it. The per-directory
 # purge throttle and the two per-registry TTLs are Python and live with their
 # reader: `test_egress_sentinel_enforcement.sh` CASES 13-14 and
-# `test_egress_push_bound.sh` CASES 20-21. The verdicts themselves
+# `test_egress_push_bound.sh` CASES 20-23 — the last two of those hold the
+# CONSEQUENCE of the TTL (a perimeter purged under a live neighbour refuses a
+# legitimate push) and the two mika#2736 positives under it. The verdicts
 # (`push-scope-repo`, `scope-absent`, `scope-unreadable`, the switch matrix) are
 # `test_egress_push_bound.sh` CASES 13-19. This file asserts the WRITE, and
 # since mika#2766 the UNWRITE, and nothing else.
