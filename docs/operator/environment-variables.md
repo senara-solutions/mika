@@ -6688,6 +6688,216 @@ Optional (plan-callout predicate — mika#2120):
 Optional (auto-feeder ready-pool maintenance):
 - `MIKA_AUTO_FEEDER_MIN_READY` — Target size of the **pullable**-ready pool the auto-feeder (Phase 0 of `auto_pull_groomed_ticket`) keeps topped up (mika#1863, default `3`, clamp `[1, 10]`). The literal value `0` **disables** the feeder (Phase 0 returns early); missing/invalid falls back to `3` (WARN on invalid). Phase 0 runs **before** Phase 1 on each 10-min tick, sharing the same `gh issue list` / `gh pr list` fetches (zero added API load), so a promotion made by the feeder is pickable by the puller in the same tick. **Pullable-count, not raw `ready`-count, is the threshold signal (D2):** a `ready` ticket counts toward the pool only if it is actually dispatchable — no open closing PR, no in-flight self_dev task, not labelled `blocked`/`operator-review`. This is the founding-incident fix — the 2026-07-27→28 11 h idle had raw-count ≥ 1 (#1682 open-PR + #1646 in-flight) while pullable-count was 0. When the pool is under target, the feeder promotes up to `MIN_READY − pullable` groomed-and-dispatchable backlog tickets (`is_groomed` full canonical callout, not the loose `Plan:` substring — required by the #919 dispatch gate) ranked by real-label priority (`p0-critical` > `p1-important` > `agent-core` > `p2-normal` > `p3-nice-to-have`) then oldest-first. Emits `auto_feeder` audit events (`tool_name = "auto_feeder"`): `auto_feeder_promoted` per apply, `auto_feeder_skip` when the pool already meets target, and — when nothing is promotable — **one of the three cause names** below (mika#2161). **N+1 over-promotion bound (benign):** Phase 0 tops the pool to N, then Phase 1's `!ready` filter may promote one *additional* groomed ticket when the queue is idle → at most **N+1** ready tickets per tick. Intentional — the webhook dispatch drains the pool and the two phases have complementary intents (feeder = hold a buffer; Phase 1 = kick a dispatch when idle). **50-issue working-set cap:** the groomed-not-ready backlog the feeder ranks is capped at 50 (`FEEDER_WORKING_SET_CAP`); a dispatchable backlog exceeding 50 is itself a grooming-throughput signal, kept observable rather than silently absorbed — single-line raise if real operation ever warrants it. **That cap is NOT surfaced by `auto_feeder_no_backlog`**, contrary to what this entry and the constant's own doc-comment claimed until mika#2161: that event fires only when the candidate set is **empty**, i.e. exactly when there is no backlog to exceed the cap. A backlog of 80 promotable tickets truncates in silence and emits nothing; the surface AC9 names is pool sampling.
 
+### Un dispatch de groom forcé par une contrainte d'outil ne vise jamais un ticket sans `ready` (mika#2772)
+
+**`MIKA_FORCED_DISPATCH_CONSENT` — armé par défaut ; `0` ou `false` (insensible à
+la casse) désarme ; toute autre valeur, ou l'absence, arme.** Contrairement à ses
+trois voisines de famille ci-dessus, cette garde porte un levier, et la phrase qui
+va avec est celle-ci : **désarmer rend la boucle capable de groomer un ticket que
+personne n'a promu** — c'est le défaut mesuré ci-dessous rendu à l'identique, pas
+une tolérance de confort. Le levier existe pour qu'un faux positif qui gèlerait le
+grooming n'exige pas un redéploiement ; il ne se pose pas « le temps de voir ».
+
+- **Le défaut, mesuré le 2026-10-17 à 08:59:18Z.** Un `groom` dans le slug de
+  branche `fix/2762/rollback-reaper-groom` a matché le mot-clé de dev-groom, armé
+  son `required_tools`, et fait groomer **mika#2766** — un ticket sans label
+  `ready`, absent du bassin de dispatch : `create_task "Groom mika#2766"` puis
+  `run_claude_pilot_groom mika#2766`, **48 tours, 3,40 $**. Le tour de reprise a
+  ensuite tenté de dispatcher l'**implémentation** du même ticket non promu ;
+  seule l'occupation de la place `implement` l'a arrêté. Le consentement positif
+  du label `ready` (mika#841) a donc été contourné par une contrainte d'outil que
+  personne n'avait demandée.
+
+- **Le discriminant est la PROVENANCE du dispatch, jamais le label du ticket** —
+  et c'est la rectification centrale. Un gate « pas de `ready`, pas de groom »
+  casserait `/mika-groom-ticket` (mika#1173), dont la raison d'être est de groomer
+  des tickets non promus sur dispatch opérateur en texte libre. La question posée
+  est « ce dispatch a-t-il été **forcé** par `required_tools` plutôt que
+  demandé ? », une provenance que le moteur ne portait pas. Elle est née d'un
+  drapeau par tour, `LongRunningContext::tool_constraint_forced`, écrit à **un
+  seul site** : l'arm de re-prompt `required_tools` de `run_loop`, le seul endroit
+  du moteur qui dise au modèle « appelle cet outil ». Les deux autres arms du même
+  bloc *relâchent* la contrainte et ne l'écrivent pas — un drapeau posé par les
+  trois dirait « ce tour avait des outils requis », pas « ce tour a forcé un
+  outil », et refuserait des dispatchs que personne n'a exigés.
+
+- **La garde de lignée voisine ne pouvait pas la porter.**
+  `webhook_dispatch_target_mismatch` (mika#2649, même fichier, même frontière
+  d'outil) demande « une lignée relie-t-elle cette tâche à la cible de
+  l'événement ? » et ne sait rien du consentement du ticket visé. C'est elle qui a
+  refusé le dispatch de 09:13:21Z — **par accident de lignée, pas par
+  consentement.**
+
+- **Trois court-circuits à coût nul avant tout réseau, dans cet ordre :** la
+  classe (un `implement` forcé relève de l'axe de mika#2757 et sort de la
+  population **avant toute ligne de journal** — la sonde compte des dispatchs de
+  groom, pas des tours), le forçage, puis la demande, lue sur le texte d'intention
+  **masqué** par `mask_cited_branch` (mika#2755/#2768) : le texte qui a armé le
+  forçage portait justement un slug de branche.
+
+- **Un seul sujet, lu depuis le prompt de dispatch** et de nulle part ailleurs
+  (motif mika#2545). Un `reference_url` qui désignerait un autre ticket est
+  précisément l'accident de lignée par lequel le dispatch de 08:59 n'a *pas* été
+  refusé : le rouvrir ici rouvrirait le trou mesuré.
+
+- **Fail-closed, à l'inverse de la porte de siège qui le précède de quelques
+  lignes.** La porte de place (mika#2084 D2) est fail-**open** sur des labels
+  illisibles, et c'est le bon choix *là* : sa population est **tout** dispatch,
+  donc un faux positif arrête la boucle entière sur une panne d'API GitHub. Ici la
+  population est l'intersection « classe groom ∧ forcé ∧ non demandé », **vide en
+  régime nominal**. Un faux positif fait attendre un ticket que
+  `stuck_ready_reconcile` re-pousse ; un faux négatif est l'incident mesuré, 48
+  tours et 3,40 $ sur un ticket que personne n'avait promu. L'asymétrie est
+  inversée parce que la population l'est, et elle ne se transporte pas d'un gate à
+  l'autre.
+
+- **La population refusée est VIDE à la livraison, et c'est un résultat.**
+  mika#2768 a élargi `mask_cited_branch` à tout texte enveloppé ou enrichi : sans
+  slug cité dans le texte d'intention, `required_tools` ne s'arme plus sur un
+  événement de branche, donc **le dispatch non consenti n'a plus de producteur
+  connu**. Cette garde tient la **classe** ouverte pour le prochain producteur de
+  contrainte d'outil ; elle ne poursuit pas un incident en cours. C'est
+  exactement pourquoi elle écrit une ligne sur la branche saine : sans elle, « la
+  classe est vide » et « la garde n'est pas déployée » rendraient les mêmes
+  octets.
+
+- **Un refus nomme ses deux gestes de reprise**, dans son champ `recovery` :
+  reposer le label `ready` en **remove→add** (GitHub n'émet `labeled` que sur une
+  transition — mika#2323), ou groomer explicitement par
+  `mika ask --agent mika-dev "groom <owner/repo>#<n>"`, qui fait du dispatch une
+  demande et sort de la population. Un refus qui ne nomme pas sa levée est un
+  refus qu'on contourne au jugé.
+
+### Surfaces opérateur
+
+```bash
+# 1. La garde tourne-t-elle ? (régime attendu : NON VIDE dès le premier groom)
+grep forced_dispatch_consent "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.event == "forced_dispatch_consent")
+           | {verdict, forced, requested, subject, has_ready, trace_id}'
+
+# 2. A-t-elle mordu ? (régime attendu : VIDE — population résiduelle sans producteur)
+grep forced_dispatch_consent "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.event == "forced_dispatch_consent" and .forced == true)'
+
+# 3. CONTRÔLE NÉGATIF — l'audit a-t-il échoué ? (régime attendu : VIDE)
+grep forced_dispatch_consent_audit_failed "$MIKA_SPIRIT_LOG_FILE"
+```
+
+Le `select` sur `.event` de la commande 1 est **porteur** : `grep` est une
+sous-chaîne et rend aussi tout texte qu'un pilote écrirait *au sujet* du signal —
+classe mika#2050, mesurée sur le Signal S, et toute session qui groome ou
+implémente ce ticket recrée ce faux positif. Même raison pour la commande 2 : le
+`.forced == true` doit être lu dans le JSON, jamais par un `grep '"forced":true'`
+sur la prose.
+
+```sql
+-- La population du consentement. SOLE WRITER, donc ce compte est exact.
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'forced_dispatch_consent' GROUP BY 1 ORDER BY 2 DESC;
+
+-- Le détail des refus, avec le ticket visé
+SELECT target_key, created_at, reasoning FROM audit_events
+ WHERE tool_name = 'forced_dispatch_consent'
+   AND after_value LIKE 'forced_dispatch_%'
+ ORDER BY created_at DESC;
+```
+
+**Un seul nom de journal et un seul `tool_name` d'audit pour les neuf issues, le
+verdict en colonne** (mika#2323, motif `ready_label_outcome`) : une sonde
+opérateur qui doit connaître neuf noms est une sonde qu'on n'écrit pas.
+`target_key` porte le ticket visé, ou le littéral `<unresolved>` quand aucun
+numéro n'a pu être lu.
+
+| surface (`after_value`) | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `allowed_not_forced` | INFO | **non vide, dominant** | le tour n'a forcé aucun outil : le dispatch a été demandé par construction. **C'est le régime nominal de la boucle**, et le contrôle positif qui dit que la garde est déployée |
+| `allowed_requested` | INFO | **non vide, faible** | forcé, mais le texte d'intention masqué *est* une demande de groom — `/mika-groom-ticket` et mika#1173 intacts. Zéro ici **et** zéro refus ne prouve rien (mika#2205) |
+| `allowed_consented` | INFO | **non vide, faible** | forcé, non demandé, et le ticket porte `ready` : le consentement de mika#841 est là, le dispatch part |
+| `allowed_disarmed` | INFO | **vide** | `MIKA_FORCED_DISPATCH_CONSENT=0` est en vigueur. Le désarmement **émet quand même sa ligne** : un désarmement muet serait indiscernable d'une garde absente. Chaque ligne est une boucle capable de groomer un ticket que personne n'a promu |
+| `forced_dispatch_without_consent` | WARN | **vide** | **le refus nominal** : labels lus, `ready` absent — l'incident du 2026-10-17 rejoué et arrêté |
+| `forced_dispatch_subject_unresolved` | WARN | **vide** | aucun numéro de ticket résoluble depuis le prompt de dispatch. `subject` se rend `null`, jamais `""` : absent n'est pas zéro (mika#2331) |
+| `forced_dispatch_consent_no_token` | WARN | **vide** | pas de token GitHub : le consentement ne peut pas être **lu**, ce qui n'est pas « il n'y en a pas ». Si ce compte porte du trafic, c'est la résolution du token qu'il faut lire, pas le prédicat |
+| `forced_dispatch_consent_unverifiable` | WARN | **vide** | le lecteur de labels a répondu `Err(_)` — API GitHub en panne. Le fail-closed gèle ce chemin : voir la halte 2 ci-dessous **avant** d'inverser la disposition |
+| `forced_dispatch_subject_is_pull_request` | WARN | **vide** | la cible est une PR, pas un ticket : il n'existe aucun `ready` à lire, et un groom de PR n'est pas un flux déclaré |
+| `forced_dispatch_consent_audit_failed` | WARN | **vide** | le WARN est passé, l'audit non : le `GROUP BY` sous-compte à partir de là |
+
+### Sondes post-déploiement
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** : après `make deploy`,
+> établir que le `mika-spirit` qui tourne porte le correctif avant toute
+> conclusion (classe mika#2340). L'**absence** de la ligne
+> `forced_dispatch_consent` signifie un binaire antérieur à ce vol, **jamais** une
+> absence de dispatch forcé. Ce sont des **gestes d'opérateur** sur l'hôte — la
+> base n'est pas montée dans le bac à sable de dispatch.
+
+```bash
+# S1 — l'instrument est vivant (après make deploy, au premier dispatch de groom)
+grep -c 'forced_dispatch_consent' ~/.mika/logs/mika-spirit.log     # attendu : > 0
+
+# S2 — la classe est vide (régime attendu de la population résiduelle)
+grep 'forced_dispatch_consent' ~/.mika/logs/mika-spirit.log \
+  | grep -c '"forced":true'                                        # attendu : 0
+```
+
+**S1 — l'instrument est vivant (premier dispatch de groom après le déploiement).**
+Attendu : au moins une ligne, verdict `allowed_not_forced`.
+*Halte 1 — zéro ligne alors qu'un groom est parti :* **ne pas conclure que la
+classe est vide.** C'est la lecture que la ligne saine existe pour interdire :
+établir d'abord le déploiement (classe mika#2340), et seulement ensuite lire le
+régime.
+
+**S2 — la classe reste vide (30 jours).** Aucune ligne portant `"forced":true`.
+*Halte 2 — une occurrence avec `allowed_consented` :* nominal, un producteur de
+contrainte d'outil existe et le ticket était promu — rien à faire. *Avec un
+verdict de refus :* un producteur est **réapparu**. Lire le `trace_id`, remonter
+au tour, et nommer le producteur **avant** de toucher au prédicat : mika#2768 en a
+fermé un, un second n'a pas la même cause.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus sur un dispatch de groom
+qu'un opérateur a demandé en texte libre.
+*Halte 3 — une occurrence :* `is_grooming_intent_message` ne lit pas la demande
+comme on croit (il exige `groom` en tête de message, puis un espace ou une
+tabulation **obligatoire**). Réparer la lecture de l'intention, **ne pas** élargir
+vers le label du ticket — ce serait le gate `ready` aveugle que mika#1173 refuse.
+
+**S4 — la lecture des labels est saine (7 jours).**
+`forced_dispatch_consent_unverifiable` et `forced_dispatch_consent_no_token`
+restent vides.
+*Halte 4 — non vide :* le fail-closed gèle les dispatchs de groom forcés. Lire la
+résolution du token et l'API GitHub **avant** d'inverser la disposition —
+l'inverser rouvrirait le constat du 2026-10-17.
+
+**Halte transverse — les sondes muettes.** Zéro refus **et** zéro passage ne prouve
+rien : il faut qu'un dispatch de groom soit parti depuis le déploiement. *Une
+garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il n'élargit pas la garde à la classe `implement`.** Le tour de reprise du
+  constat a bien tenté un `implement` du même ticket non promu, et seule
+  l'occupation de la place l'a arrêté ; le fermer demande le prédicat de place,
+  pas celui-ci. La classe sort de la population **avant toute ligne de journal**,
+  donc la sonde ci-dessus ne dira jamais rien de cet axe — c'est explicite, pas un
+  trou.
+- **Il ne touche ni `validate_dispatch_readiness` ni ses 43 sites d'appel.** La
+  garde est une fonction **sœur**, appelée depuis le seul site où la provenance du
+  forçage est connue (`execute_skill_tool`), parce que le `LongRunningContext`
+  n'est pas dans la signature de cette chaîne — ses deux autres appelants moteur
+  n'en ont pas.
+- **Il ne rattrape pas l'incident du 2026-10-17.** Les 48 tours et les 3,40 $
+  restent dépensés, et **rien ne rétro-estampille** : fabriquer une ligne d'audit
+  datée d'un refus qu'on n'a pas observé est l'inverse de ce que ce travail
+  défend. La sonde est la **prochaine** occurrence.
+- **Il ne rend pas le modèle incapable de vouloir groomer un ticket non promu** :
+  il rend le dispatch impossible. La doctrine maison est *construis l'incapacité,
+  ne promets pas la retenue* (mika#1991), et elle est applicable ici — il y a une
+  capacité à retirer, et c'est elle qui est retirée.
+- **Il rend le champ lisible, pas surveillé.** Les seuls instruments sont les
+  greps et les requêtes ci-dessus, et **leur silence ne prouve rien tant que
+  personne ne les exécute.**
+
 ### L'alimenteur nomme la cause qu'il a mesurée (mika#2161)
 
 **Aucune variable d'environnement, aucune migration, aucun seuil déplacé.** Cette entrée est ici parce que l'opérateur qui lit `auto_feeder_no_backlog` et se demande s'il doit groomer davantage cherche dans ce voisinage.
