@@ -110,15 +110,22 @@ jobs:
 
       # mika#2578, une troisième fois : `make test-egress-push-bound` existait
       # dans le Makefile depuis mika#2736 et aucun fichier de `.github/` ne
-      # l'appelait, donc les treize cas de la borne `git-receive-pack`
+      # l'appelait, donc les douze cas de la borne `git-receive-pack`
       # gataient zéro PR. Un garde que le pipeline ne lance pas ne refuse rien.
-      - name: Pilot sandbox secret-channel guards (mika#2039, mika#2716, mika#2724, mika#2736)
+      # Les deux moitiés du resserrement de mika#2751 arrivent ensemble, et
+      # c'est délibéré : `test-egress-push-bound` mesure le LECTEUR (il écrit
+      # les entrées de périmètre à la main) et resterait vert si le lanceur
+      # n'en déclarait jamais aucune, `test-egress-push-scope-staging` mesure
+      # le PRODUCTEUR. Une seule des deux est une PR verte sous une borne
+      # statique qui se croit resserrée.
+      - name: Pilot sandbox secret-channel guards (mika#2039, mika#2716, mika#2724, mika#2736, mika#2751)
         run: |
           make test-sandbox-secret-argv
           make verify-no-secret-in-setenv
           make test-egress-sentinel-staging
           make test-egress-sentinel-enforcement
           make test-egress-push-bound
+          make test-egress-push-scope-staging
 
       # mika#2578 again, same lesson as the step below: `make test-sandbox-gh-usable`
       # was local-only, so the guard that pins the VALUE `--setenv GH_TOKEN`

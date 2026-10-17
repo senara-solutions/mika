@@ -1875,6 +1875,95 @@ _stage_pilot_egress_sentinel() {
     fi
 }
 
+# mika#2751: declare THE PERIMETER THIS SPAWN IS ENTITLED TO PUSH INTO, so the
+# addon's `git-receive-pack` bound can tighten from "any repository of
+# senara-solutions" (the static bound of mika#2736) to "the repository of THIS
+# dispatch". The producer is here; the only consumer is
+# `_push_scope_verdict` in scripts/mika-pilot-github-auth-addon.py.
+#
+# WHY A HOST FILE RE-READ PER REQUEST, AND NOT THE MITMDUMP ENVIRONMENT. The
+# obvious shape — export the repo into the helper's environment — is wrong, and
+# measurably so: `_ensure_pilot_helper` returns 0 as soon as the relay port
+# answers, so the `mitmdump` daemon is SHARED between dispatches and its
+# environment is the FIRST dispatch's, forever. A perimeter passed that way
+# would name the wrong repository for every spawn but one, silently, and in the
+# direction that widens. A file per spawn, re-read on each request, is the only
+# channel whose value tracks the spawn that wrote it.
+#
+# WHERE THE AUTHORITY COMES FROM. `~/.mika` is not among the sandbox binds
+# (`_pilot_gitdir_bind_args`), so nothing inside the sandbox can read or write
+# this registry: the perimeter is unforgeable from the inside. That is the same
+# host/sandbox asymmetry mika#2724 draws its sentinel from.
+#
+# A REGISTRY DIRECTORY, one entry per spawn, for the reason spelled out above
+# `_stage_pilot_egress_sentinel`: two concurrent pilots must both be valid at
+# the SAME instant. The reader therefore takes the UNION of the live entries —
+# "does some live perimeter name this repository?" — which is cheap for the
+# repo dimension (a pilot has exactly one possible `origin`) and is what defers
+# the branch dimension to its own flight.
+#
+# WRITTEN UNCONDITIONALLY. `MIKA_PILOT_EGRESS_PUSH_SCOPE` is read in exactly
+# one place in the repository — `_push_scope_enforced()` in the addon, where
+# the refusal lives. A second reader here is precisely how mika#2165 gets paid:
+# a switch whose two readers disagree is decorative. A repository name is not a
+# secret either, so there is nothing to withhold.
+#
+# NO `set +x` BRACKET, deliberately. The two neighbours above carry one because
+# they handle a credential and `_emit_callback` tails the xtrace back to the
+# caller. A repository name is not a credential; adding the bracket out of
+# symmetry would obscure why the others have it.
+#
+# Fail-OPEN on every failure, same posture as `_stage_pilot_gh_token` and
+# `_stage_pilot_egress_sentinel`: no perimeter declared means the static bound
+# of mika#2736 applies alone, which is the pre-ticket behaviour. A dispatch
+# never dies on a bookkeeping file — and the addon, on its side, degrades
+# rather than refuses when no perimeter is there to read.
+#
+# Path resolved AT CALL TIME, like the sentinel registry's and for the same
+# measured reason: the containment suites `export HOME` AFTER sourcing this
+# file, so a source-time default would freeze the operator's real registry and
+# `make test` would deposit live-looking perimeters in it.
+# Filled with the entry's nonce by _stage_pilot_egress_push_scope; empty means
+# no perimeter was declared and the static bound applies alone.
+_PILOT_EGRESS_PUSH_SCOPE_ENTRY=""
+_stage_pilot_egress_push_scope() {
+    _PILOT_EGRESS_PUSH_SCOPE_ENTRY=""
+
+    # Free-text mode and milestone mode reach the sandbox with no dispatch
+    # repository resolved. Declaring `senara-solutions/` alone would be a
+    # perimeter naming nothing, and an empty-valued `repo=` line would be
+    # worse: the reader would see a declared perimeter and refuse every push.
+    # Declare nothing instead, and say so.
+    if [ -z "${REPO:-}" ]; then
+        echo "dispatch-lib: no dispatch repository in scope — no push perimeter declared, the static git-receive-pack bound of mika#2736 applies alone (mika#2751)" >&2
+        return 0
+    fi
+
+    local _dir _nonce=""
+    _dir="${_PILOT_EGRESS_PUSH_SCOPE_DIR:-$HOME/.mika/pilot-push-scopes}"
+    _nonce=$(openssl rand -hex 16 2>/dev/null) || _nonce=""
+    [ -n "$_nonce" ] || \
+        _nonce=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
+    if [ "${#_nonce}" -ne 32 ]; then
+        echo "dispatch-lib: could not draw a push-perimeter entry name (no openssl, no /dev/urandom) — no push perimeter declared, the static bound of mika#2736 applies alone (mika#2751)" >&2
+        return 0
+    fi
+
+    # `clé=valeur` lines, one per dimension, so the branch dimension of the
+    # follow-up flight is a pure addition: the reader already ignores a key it
+    # does not know.
+    if ! ( umask 077
+           mkdir -p "$_dir" \
+               && chmod 0700 "$_dir" \
+               && printf 'repo=senara-solutions/%s\n' "$REPO" \
+                      > "$_dir/$_nonce" ) 2>/dev/null; then
+        echo "dispatch-lib: could not declare the push perimeter under $_dir — no push perimeter declared, the static bound of mika#2736 applies alone (mika#2751)" >&2
+        return 0
+    fi
+
+    _PILOT_EGRESS_PUSH_SCOPE_ENTRY="$_nonce"
+}
+
 # mika#2141: generate the sandbox's git configuration host-side.
 #
 # Three things must be written, and each was measured to be independently
@@ -2293,6 +2382,12 @@ Remedy: $_egress_remedy"
     # name would be staged AS the real token and 401 every pilot call. See the
     # ORDER IS LOAD-BEARING paragraph on _stage_pilot_egress_sentinel.
     _stage_pilot_egress_sentinel
+    # mika#2751: the perimeter this spawn may push into. The order relative to
+    # its two neighbours is NOT load-bearing — unlike the token/sentinel pair,
+    # whose inversion would stage the sentinel AS the real token (:1806-1815) —
+    # and it is said here so nobody invents a constraint by reading the
+    # symmetry. What matters is only that it runs before the sandbox does.
+    _stage_pilot_egress_push_scope
     _ensure_pilot_helper || true
 
     # Unconditional since mika#2049 — the `if _ensure_pilot_egress_proxy; then`
