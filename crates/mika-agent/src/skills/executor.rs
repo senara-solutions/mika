@@ -15241,4 +15241,231 @@ Harness ticket.
             );
         }
     }
+
+    // ---- mika#2772 : le drapeau de forçage a un écrivain et un lecteur ----
+    //
+    // Aucun test comportemental ne peut voir cette classe. Un second site
+    // d'écriture — typiquement un arm « on relâche la contrainte » qui poserait
+    // le drapeau par symétrie apparente — ne rend **aucune** décision fausse le
+    // jour où il est écrit : la garde continue de discriminer, les dix
+    // assertions ci-dessus restent vertes, et ce sont des dispatchs légitimes
+    // qui commencent à être refusés en production. C'est la classe
+    // `grooming_marker` (mika#2158), que seul un scan structurel voit.
+    mod mika2772_scan_du_drapeau {
+        use std::path::{Path, PathBuf};
+
+        /// **Livrée vide, et elle le reste.**
+        ///
+        /// Quand la garde tire, on **retire le site** ; on ne l'allowliste pas.
+        /// Une allowlist née vide est un emplacement où déposer la prochaine
+        /// infraction (doctrine mika#2201).
+        const FORCED_FLAG_ACCESS_ALLOWLIST: &[&str] = &[];
+
+        /// L'unique écrivain : l'arm de re-prompt `required_tools` de `run_loop`.
+        const WRITE_SITE: &str = "agent_loop/mod.rs";
+
+        /// L'unique lecteur : `validate_forced_dispatch_consent`.
+        const READ_SITE: &str = "skills/executor.rs";
+
+        /// Le nom du champ, assemblé par `concat!`.
+        ///
+        /// Le littéral est produit à la compilation, donc le nom cherché
+        /// n'apparaît nulle part dans le code **non commenté** de cette garde.
+        /// Écrit d'un bloc, il ferait de la garde son propre troisième site le
+        /// jour où la prémisse de masquage ci-dessous cesse d'être vraie — et
+        /// cette prémisse a déjà été fausse dans ce dépôt (mika#2335 F2a).
+        fn field() -> &'static str {
+            concat!("tool_constraint", "_forced")
+        }
+
+        /// La moitié production de chaque `.rs` sous `src/`, par chemin relatif.
+        ///
+        /// Le masquage est **obligatoire ici et non prudentiel** : le helper
+        /// `ctx_forced` du module voisin pose le drapeau, dans ce même fichier.
+        /// Un scan bâti sur le texte brut compterait donc deux accès dans
+        /// `skills/executor.rs` et serait rouge au jour de sa naissance,
+        /// c'est-à-dire désarmé le lendemain.
+        ///
+        /// [`crate::source_scan::is_test_source_path`] s'ajoute à `KTD3` plutôt
+        /// que de s'y substituer (mika#2335 F2a) : un module de test **extrait**
+        /// ne porte aucun littéral `#[cfg(test)]` — l'attribut reste sur la
+        /// déclaration `mod tests;` du parent — donc le masquage par région ne
+        /// le voit pas. Les deux sites déclarés sont hors de cette classe, la
+        /// double exclusion ne peut donc pas les cacher.
+        ///
+        /// Un fichier illisible **panique** plutôt que d'être sauté :
+        /// `ProductionScanner::production_of` le garantit, et l'anti-vacuité
+        /// ci-dessous compte les fichiers *après* le saut, donc ne le verrait pas.
+        fn production_sources() -> Vec<(String, String)> {
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+            let root: PathBuf = scanner.src_root().to_path_buf();
+            let mut out: Vec<(String, String)> = Vec::new();
+            scanner.for_each(|path: &Path, production: &str| {
+                if crate::source_scan::is_test_source_path(path) {
+                    return;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("chemin sous src/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, production.to_string()));
+            });
+            out
+        }
+
+        /// `(fichier, écritures, lectures)` — le prédicat pur, sans disque.
+        ///
+        /// Deux normalisations, chacune réparant un faux verdict mesuré :
+        ///
+        /// 1. **Commentaires retirés.** Les deux sites portent trois paragraphes
+        ///    de prose sur le champ, et le doc-comment de la déclaration nomme
+        ///    « un seul écrivain / un seul lecteur ». Une prose qui *décrit*
+        ///    l'accès n'en est pas un (forme du signal S, mika#2050).
+        ///
+        /// 2. **Blancs retirés — et c'est la correction porteuse.** Le vrai site
+        ///    d'écriture est reflowé par rustfmt sur deux lignes :
+        ///    `ctx.<champ>` puis `.store(true, …)`. Une aiguille littérale
+        ///    `<champ>.store(` ne le voit donc **pas** : la garde aurait rendu
+        ///    « zéro écrivain » et serait passée pour toujours. Le voisin
+        ///    `mika2305_the_scope_has_a_single_decisional_reader` paie ce piège
+        ///    en maintenant à la main des arms sur une ligne ; en densifiant la
+        ///    source on en est quitte, quel que soit le reflow futur.
+        ///
+        /// Le compte par fichier est ce qui rend l'anti-vacuité portante : sans
+        /// lui, un second `.store(` ajouté dans le fichier déjà déclaré écrivain
+        /// serait indistinguable du premier.
+        fn accesses(sources: &[(String, String)]) -> Vec<(String, usize, usize)> {
+            let field = field();
+            sources
+                .iter()
+                .filter_map(|(rel, src)| {
+                    if !src.contains(field) {
+                        return None;
+                    }
+                    let stripped = crate::source_scan::strip_comment_lines(src);
+                    let dense: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
+                    let writes = dense.matches(&format!("{field}.store(")).count();
+                    let reads = dense.matches(&format!("{field}.load(")).count();
+                    (writes + reads > 0).then(|| (rel.clone(), writes, reads))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn mika2772_le_drapeau_de_forcage_a_un_seul_ecrivain_et_un_seul_lecteur() {
+            let sources = production_sources();
+            assert!(
+                sources.len() > 200,
+                "le scan n'a énuméré que {} fichiers — un scan qui ne scanne rien \
+                 est un laissez-passer vide, pas un arbre propre",
+                sources.len()
+            );
+
+            let sites = accesses(&sources);
+
+            // ANTI-VACUITÉ, et elle porte sur la CARDINALITÉ. Un scan qui vise
+            // un nom mort (champ renommé, site déplacé) rend zéro infraction et
+            // se lit comme un arbre sain.
+            let writer = sites
+                .iter()
+                .find(|(rel, _, _)| rel == WRITE_SITE)
+                .map(|(_, w, r)| (*w, *r));
+            assert_eq!(
+                writer,
+                Some((1, 0)),
+                "l'écrivain déclaré doit porter exactement UNE écriture et AUCUNE \
+                 lecture ; vu {writer:?}. Zéro = la garde vise un nom mort ; plus \
+                 d'une = un second arm pose le drapeau. Sites vus : {sites:?}"
+            );
+
+            let reader = sites
+                .iter()
+                .find(|(rel, _, _)| rel == READ_SITE)
+                .map(|(_, w, r)| (*w, *r));
+            assert_eq!(
+                reader,
+                Some((0, 1)),
+                "le lecteur déclaré doit porter exactement UNE lecture et AUCUNE \
+                 écriture ; vu {reader:?}. Une écriture ici signifie que le \
+                 masquage des régions `cfg(test)` a cessé de couvrir le helper \
+                 du module voisin. Sites vus : {sites:?}"
+            );
+
+            let offenders: Vec<&String> = sites
+                .iter()
+                .filter(|(rel, _, _)| rel.as_str() != WRITE_SITE && rel.as_str() != READ_SITE)
+                .filter(|(rel, _, _)| !FORCED_FLAG_ACCESS_ALLOWLIST.contains(&rel.as_str()))
+                .map(|(rel, _, _)| rel)
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "accès au drapeau de forçage hors de ses deux sites, dans : {offenders:?}\n\
+                 \n\
+                 RÉSOLUTION : retirer le site. Une écriture de plus refuserait des \
+                 dispatchs que personne n'a exigés — le drapeau dirait « ce tour \
+                 avait des outils requis » et non « ce tour a forcé un outil ». \
+                 Ne PAS ajouter d'entrée à `FORCED_FLAG_ACCESS_ALLOWLIST` : on \
+                 retire, on n'allowliste pas (mika#2201)."
+            );
+
+            assert!(
+                FORCED_FLAG_ACCESS_ALLOWLIST.is_empty(),
+                "il n'y a rien à excepter : le drapeau a deux sites et ils sont \
+                 nommés. Une entrée ici est un consentement rouvert."
+            );
+        }
+
+        /// Contrôle de bonne foi : sans lui, « la garde décide » est
+        /// indistinguable de « la garde ne regarde rien ».
+        ///
+        /// Trois sources synthétiques, et la troisième assertion est celle qui
+        /// atteste la densification : elle rejoue le reflow rustfmt du vrai site
+        /// d'écriture et exige que le scan le compte quand même.
+        #[test]
+        fn mika2772_le_scan_du_drapeau_rougit_sur_un_second_site() {
+            let field = field();
+            let synthetic = vec![
+                (
+                    WRITE_SITE.to_string(),
+                    format!(
+                        "                if let Some(ctx) = c {{\n                    ctx.{field}\n                        .store(true, Ordering::Relaxed);\n                }}\n"
+                    ),
+                ),
+                (
+                    "skills/second_ecrivain.rs".to_string(),
+                    format!("    ctx.{field}.store(false, Ordering::Relaxed);\n"),
+                ),
+                (
+                    "prose.rs".to_string(),
+                    format!(
+                        "    /// On ne fait plus `{field}.store(` ici, et on ne\n    /// relit plus `{field}.load(` non plus.\n"
+                    ),
+                ),
+            ];
+
+            let sites = accesses(&synthetic);
+
+            assert!(
+                sites
+                    .iter()
+                    .any(|(rel, w, _)| rel == "skills/second_ecrivain.rs" && *w == 1),
+                "le scan doit accuser un second écrivain : {sites:?}"
+            );
+            assert!(
+                !sites.iter().any(|(rel, _, _)| rel == "prose.rs"),
+                "une prose qui DÉCRIT l'accès n'en est pas un (mika#2050) : {sites:?}"
+            );
+            assert_eq!(
+                sites
+                    .iter()
+                    .find(|(rel, _, _)| rel == WRITE_SITE)
+                    .map(|(_, w, _)| *w),
+                Some(1),
+                "une écriture reflowée par rustfmt sur deux lignes doit compter \
+                 pour une — c'est la forme EXACTE du vrai site : {sites:?}"
+            );
+        }
+    }
 }
