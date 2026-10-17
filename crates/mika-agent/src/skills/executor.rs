@@ -2684,6 +2684,419 @@ async fn report_event_target_binding(
     rejection
 }
 
+// ───────── mika#2772 — le consentement d'un dispatch de groom forcé ─────────
+
+/// Le `tool_name` d'audit et le nom de journal du consentement forcé — **un
+/// seul**, le verdict en colonne (mika#2323, motif `ready_label_outcome`).
+///
+/// Neuf issues, un nom : elles appartiennent au même site et à la même
+/// population, et une sonde opérateur qui doit connaître neuf noms est une sonde
+/// qu'on n'écrit pas. `grep -c 'forced_dispatch_consent'` répond « la garde
+/// tourne-t-elle » ; `grep '"forced":true'` répond « a-t-elle mordu ».
+pub(crate) const FORCED_CONSENT_EVENT: &str = "forced_dispatch_consent";
+
+/// Levier de désarmement opérateur. Armé par défaut ; `0` / `false` désarme.
+/// Documenté dans `docs/operator/environment-variables.md`.
+pub(crate) const FORCED_CONSENT_ENV: &str = "MIKA_FORCED_DISPATCH_CONSENT";
+
+/// Le dispatch n'a pas été forcé — il a été demandé par construction.
+pub(crate) const FORCED_CONSENT_NOT_FORCED: &str = "allowed_not_forced";
+/// Le tour portait une intention de grooming explicite (mika#1173).
+pub(crate) const FORCED_CONSENT_REQUESTED: &str = "allowed_requested";
+/// Le ticket visé porte `ready` : le consentement positif de mika#841 est là.
+pub(crate) const FORCED_CONSENT_CONSENTED: &str = "allowed_consented";
+/// L'opérateur a désarmé la garde.
+pub(crate) const FORCED_CONSENT_DISARMED: &str = "allowed_disarmed";
+/// Aucun numéro de ticket résoluble depuis le prompt de dispatch.
+pub(crate) const FORCED_CONSENT_SUBJECT_UNRESOLVED: &str = "forced_dispatch_subject_unresolved";
+/// Pas de token GitHub : le consentement ne peut pas être lu.
+pub(crate) const FORCED_CONSENT_NO_TOKEN: &str = "forced_dispatch_consent_no_token";
+/// Le lecteur de labels a répondu `Err(_)`.
+pub(crate) const FORCED_CONSENT_UNVERIFIABLE: &str = "forced_dispatch_consent_unverifiable";
+/// La cible est une pull request, pas un ticket.
+pub(crate) const FORCED_CONSENT_SUBJECT_IS_PR: &str = "forced_dispatch_subject_is_pull_request";
+/// Labels lus, `ready` absent — **le refus nominal**.
+pub(crate) const FORCED_CONSENT_WITHOUT_CONSENT: &str = "forced_dispatch_without_consent";
+
+/// Le verdict du gate de consentement (mika#2772).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForcedDispatchConsent {
+    /// Le dispatch peut partir.
+    Allowed,
+    /// Le dispatch est refusé ; la chaîne est le JSON rendu au modèle.
+    Refused(String),
+}
+
+/// Journalise et audite une décision de consentement forcé (D5 de mika#2772).
+///
+/// **Une ligne sur chaque dispatch de groom, y compris la branche saine**
+/// (mika#2293 — *un réglage qu'on ne peut pas observer n'est pas un réglage,
+/// c'est un espoir*). Sans producteur connu de contrainte d'outil depuis
+/// mika#2768, une garde silencieuse rendrait « la classe est vide »
+/// indiscernable de « la garde n'est pas déployée ». L'**absence** de la ligne
+/// signifie donc un binaire antérieur à ce vol (mika#2340), jamais une absence
+/// de dispatch forcé.
+///
+/// `subject` et `has_ready` sont des `Option` et se rendent `null` quand le
+/// sujet n'a pas été résolu ou les labels pas lus — jamais `""`, jamais `false`.
+/// Absent n'est pas zéro (mika#2331) : « pas de `ready` » et « on n'a pas pu
+/// regarder » sont deux verdicts différents et portent déjà deux noms distincts.
+/// C'est l'idiome du champ `event_number` de [`report_event_target_binding`].
+///
+/// Le niveau suit le **régime attendu** de chaque verdict : INFO sur les quatre
+/// passages, WARN sur les cinq refus — un WARN sur une population nominale est
+/// un WARN qu'on finit par museler.
+async fn report_forced_dispatch_consent(
+    ctx: &LongRunningContext,
+    verdict: &'static str,
+    forced: bool,
+    requested: bool,
+    subject: Option<&str>,
+    has_ready: Option<bool>,
+    refused: bool,
+) {
+    if refused {
+        warn!(
+            target: "mika::otel",
+            event = FORCED_CONSENT_EVENT,
+            forced = forced,
+            requested = requested,
+            verdict = verdict,
+            subject = subject,
+            has_ready = has_ready,
+            trace_id = %ctx.trace_id,
+            session_id = %ctx.session_id,
+            "tool-boundary: groom dispatch refused — forced by `required_tools` and the \
+             target's consent could not be established (mika#2772)"
+        );
+    } else {
+        info!(
+            target: "mika::otel",
+            event = FORCED_CONSENT_EVENT,
+            forced = forced,
+            requested = requested,
+            verdict = verdict,
+            subject = subject,
+            has_ready = has_ready,
+            trace_id = %ctx.trace_id,
+            session_id = %ctx.session_id,
+            "tool-boundary: groom dispatch consent checked (mika#2772)"
+        );
+    }
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            // Le session id atteint CETTE garde — contrairement à ses voisines
+            // de la même porte — et c'est le bon identifiant : le forçage est une
+            // propriété du TOUR, pas de la tâche.
+            &ctx.session_id,
+            FORCED_CONSENT_EVENT,
+            subject.unwrap_or("<unresolved>"),
+            None,
+            Some(verdict),
+            Some(&format!(
+                "forced={forced} requested={requested} verdict={verdict} subject={} \
+                 has_ready={}",
+                subject.unwrap_or("none"),
+                has_ready
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            )),
+            Some(&ctx.trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "forced_dispatch_consent_audit_failed",
+            verdict = verdict,
+            error = %e,
+            "failed to write the mika#2772 audit event (non-fatal)"
+        );
+    }
+}
+
+/// Un dispatch de groom forcé par `required_tools` ne vise jamais un ticket sans
+/// `ready` (mika#2772).
+///
+/// # Ce que la garde répare
+///
+/// Le 2026-10-17 à 08:59:18Z, un `groom` dans le slug de branche
+/// `fix/2762/rollback-reaper-groom` a matché le mot-clé de dev-groom, armé son
+/// `required_tools`, et fait groomer mika#2766 — un ticket sans `ready` et
+/// absent du bassin (48 tours, 3,40 $). Le tour de reprise a ensuite tenté de
+/// dispatcher l'**implémentation** du même ticket non promu ; seule l'occupation
+/// de la place `implement` l'a arrêté. Le consentement positif de mika#841 a
+/// donc été contourné par une contrainte d'outil que personne n'avait demandée.
+///
+/// # Une fonction **sœur**, pas un paramètre de plus
+///
+/// [`validate_dispatch_readiness`] a 43 sites d'appel dans ce fichier, dont ~39
+/// en tests ; un paramètre supplémentaire coûte 43 éditions mécaniques sans rien
+/// dire. Et surtout, le [`LongRunningContext`] n'est pas dans la signature de
+/// cette chaîne, précisément parce que ses deux autres appelants moteur n'en ont
+/// pas. Le seul site où la provenance du forçage est connue est
+/// [`execute_skill_tool`], où `ctx` est déjà en portée.
+///
+/// # Pré-hoc, et après le moins cher
+///
+/// Appelée **après** le verdict d'acceptation de [`validate_dispatch_readiness`]
+/// et **avant** tout spawn : `run_claude_pilot` crée un worktree et lance un
+/// process, et une garde post-hoc observerait la violation sans l'empêcher
+/// (mika#1646). Après, parce qu'elle paie un appel réseau et que le moins cher
+/// passe d'abord — l'idiome de mika#2649.
+///
+/// # Fail-closed, à l'inverse de la porte de place juste au-dessus
+///
+/// La porte de place (mika#2084 D2, ≈ `:3209`) est **fail-open** sur des labels
+/// illisibles, et c'est le bon choix *là* : sa population est **tout** dispatch,
+/// donc un faux positif arrête la boucle entière sur une panne d'API GitHub.
+/// Ici la population est l'intersection « classe groom ∧ forcé ∧ non demandé » —
+/// vide en régime nominal. Un faux positif y fait attendre un ticket que le
+/// réconciliateur `stuck_ready_reconcile` re-pousse ; un faux négatif est
+/// l'incident mesuré, 48 tours et 3,40 $ sur un ticket que personne n'a promu.
+/// L'asymétrie est inversée parce que la population l'est.
+///
+/// Un seul sujet, délibérément, lu depuis le **prompt de dispatch** — ce que
+/// `dispatch-lib.sh` lit lui-même pour bâtir le worktree. La question est « quel
+/// ticket ce dispatch va-t-il groomer », et la réponse est là. Un
+/// `reference_url` qui désignerait un autre ticket est précisément l'accident de
+/// lignée par lequel le dispatch de 08:59 n'a *pas* été refusé : le rouvrir ici
+/// rouvrirait le trou mesuré.
+pub(crate) async fn validate_forced_dispatch_consent(
+    ctx: &LongRunningContext,
+    github_token: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
+) -> ForcedDispatchConsent {
+    // (1) La classe, à coût nul — l'idiome exact du gate mika#2545 ci-dessous.
+    // Un `implement` forcé relève d'une autre question (mika#2757) et sort de la
+    // population avant toute ligne de journal : la sonde de D5 compte des
+    // dispatchs de groom, pas des tours.
+    let class = derive_dispatch_class(tool_input.and_then(extract_skill_from_input));
+    if class != "groom" {
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    let forced = ctx.tool_constraint_forced.load(Ordering::Relaxed);
+
+    // (2) « Demandé », lu sur le texte **masqué** — le point load-bearing de ce
+    // vol. Le texte qui a armé le forçage contenait `fix/2762/rollback-reaper-groom`.
+    // Le masque de mika#2755/#2768 retire tout slug cité avant qu'on lise une
+    // intention ; sans lui, le prédicat d'intention regarderait un slug et non
+    // une demande. `mika2772_le_texte_devenement_de_lincident_nest_pas_une_demande_de_groom`
+    // (`webhook_dispatch.rs`) tient les deux moitiés de cette décision.
+    let masked = ctx
+        .originating_message
+        .as_deref()
+        .map(mika_common::github_event_format::mask_cited_branch);
+    let intent = masked.as_deref();
+    let requested = intent.is_some_and(crate::webhook_dispatch::is_grooming_intent_message);
+
+    if !crate::webhook_dispatch::forced_dispatch_needs_consent(class, forced, intent) {
+        let verdict = if forced {
+            FORCED_CONSENT_REQUESTED
+        } else {
+            FORCED_CONSENT_NOT_FORCED
+        };
+        report_forced_dispatch_consent(ctx, verdict, forced, requested, None, None, false).await;
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    // Le levier opérateur. Il émet quand même sa ligne : un désarmement muet
+    // serait indiscernable d'une garde absente.
+    let armed = std::env::var(FORCED_CONSENT_ENV)
+        .map(|v| !(v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !armed {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_DISARMED,
+            forced,
+            requested,
+            None,
+            None,
+            false,
+        )
+        .await;
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    let refuse = |verdict: &'static str, subject: Option<String>, reason: String| {
+        serde_json::json!({
+            "error": verdict,
+            "session_id": ctx.session_id,
+            "subject": subject,
+            "reason": reason,
+            // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+            // jugé. Les deux gestes de reprise, nommés.
+            "recovery": "This dispatch was not requested — it was demanded by a tool \
+                         constraint this turn, and the ticket it targets has not been \
+                         promoted. Grooming a ticket nobody promoted is what mika#2772 \
+                         refuses. Either promote the ticket by posting the `ready` label \
+                         as remove→add (GitHub only emits `labeled` on a transition — \
+                         mika#2323), or groom it explicitly with \
+                         `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"`, which \
+                         carries a grooming intent and traverses this gate (mika#1173)."
+        })
+        .to_string()
+    };
+
+    // (3) Le sujet, depuis le prompt de dispatch seul.
+    let Some((repo_ref, number)) = tool_input
+        .and_then(|input| input.get("prompt"))
+        .and_then(|v| v.as_str())
+        .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+    else {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_SUBJECT_UNRESOLVED,
+            forced,
+            requested,
+            None,
+            None,
+            true,
+        )
+        .await;
+        return ForcedDispatchConsent::Refused(refuse(
+            FORCED_CONSENT_SUBJECT_UNRESOLVED,
+            None,
+            "The dispatch prompt names no readable `<repo>#<number>`, so the ticket whose \
+             consent would have to be proven cannot be identified. This gate refuses when \
+             it cannot read its proof: its population is empty in nominal operation, so a \
+             wrongful refusal costs a wait the stuck-ready reconciler re-drives, while a \
+             wrongful pass is the measured incident (mika#2772)."
+                .to_string(),
+        ));
+    };
+    let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+    let subject = format!("{owner_repo}#{number}");
+
+    // (4) Le token.
+    let Some(token) = github_token else {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_NO_TOKEN,
+            forced,
+            requested,
+            Some(&subject),
+            None,
+            true,
+        )
+        .await;
+        return ForcedDispatchConsent::Refused(refuse(
+            FORCED_CONSENT_NO_TOKEN,
+            Some(subject.clone()),
+            format!(
+                "No GitHub token reached this gate, so whether `{subject}` carries the \
+                 `ready` label could not be read. Fail-closed by the asymmetry written at \
+                 this site (mika#2772)."
+            ),
+        ));
+    };
+
+    let (subject_owner, subject_repo) = match owner_repo.split_once('/') {
+        Some(pair) => pair,
+        // `normalize_owner_repo` garantit le `/` ; l'arm existe pour que le
+        // compilateur n'ait pas à être cru sur parole.
+        None => (crate::webhook_dispatch::DEFAULT_DISPATCH_OWNER, "mika"),
+    };
+
+    // (5) Les labels — déjà le lecteur de la porte de place, déjà porteur de la
+    // distinction PR/issue dans son type de retour.
+    match crate::github_graphql::fetch_issue_labels_unless_pull_request(
+        token,
+        subject_owner,
+        subject_repo,
+        number,
+    )
+    .await
+    {
+        Ok(Some(labels)) if crate::webhook_dispatch::labels_carry_ready(&labels) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_CONSENTED,
+                forced,
+                requested,
+                Some(&subject),
+                Some(true),
+                false,
+            )
+            .await;
+            ForcedDispatchConsent::Allowed
+        }
+        Ok(Some(_)) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_WITHOUT_CONSENT,
+                forced,
+                requested,
+                Some(&subject),
+                Some(false),
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(refuse(
+                FORCED_CONSENT_WITHOUT_CONSENT,
+                Some(subject.clone()),
+                format!(
+                    "`{subject}` does not carry the `ready` label, and this groom dispatch \
+                     was forced by a `required_tools` constraint rather than requested. The \
+                     `ready` label is the canonical positive consent for autonomous \
+                     dispatch (mika#841); a tool constraint is not a promotion. On \
+                     2026-10-17 this exact shape groomed a ticket nobody had promoted for \
+                     48 turns and $3.40 (mika#2772)."
+                ),
+            ))
+        }
+        Ok(None) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_SUBJECT_IS_PR,
+                forced,
+                requested,
+                Some(&subject),
+                None,
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(refuse(
+                FORCED_CONSENT_SUBJECT_IS_PR,
+                Some(subject.clone()),
+                format!(
+                    "`{subject}` resolves to a pull request, not an issue. A PR's label set \
+                     never carries `ready`, so reading it as consent would be a confident \
+                     wrong answer in one direction or the other — and a forced groom whose \
+                     own target is a PR is not a shape this engine produces on purpose \
+                     (mika#2772)."
+                ),
+            ))
+        }
+        Err(e) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_UNVERIFIABLE,
+                forced,
+                requested,
+                Some(&subject),
+                None,
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(refuse(
+                FORCED_CONSENT_UNVERIFIABLE,
+                Some(subject.clone()),
+                format!(
+                    "Could not read the labels of `{subject}` ({e}), so its consent could \
+                     not be established. Unlike the seat gate on this same door — which is \
+                     fail-OPEN because its population is every dispatch — this gate refuses: \
+                     its population is empty in nominal operation, so the cost of a wrongful \
+                     refusal is a wait, convergent under `stuck_ready_reconcile` (mika#2772)."
+                ),
+            ))
+        }
+    }
+}
+
 /// Validate that a task is in a dispatchable state for long-running execution.
 ///
 /// Stricter than `validate_task()` (which also allows `blocked` for delegation).
@@ -4914,6 +5327,19 @@ async fn execute_long_running(
         Ok(status) => status,
         Err(err) => return ToolOutput::error(err),
     };
+
+    // mika#2772 — un dispatch de groom forcé par `required_tools` ne vise jamais
+    // un ticket sans `ready`. Fonction SŒUR de la garde ci-dessus, et non un
+    // paramètre de plus : c'est ici que la provenance du forçage est connue, et
+    // `validate_dispatch_readiness` a 43 sites d'appel. Après son verdict
+    // d'acceptation (le moins cher passe d'abord) et avant tout spawn (pré-hoc,
+    // jamais post-hoc — mika#1646).
+    if let ForcedDispatchConsent::Refused(rejection) =
+        validate_forced_dispatch_consent(ctx, github_token, Some(&input)).await
+    {
+        record_dispatch_rejection(&ctx.db, task_id, &rejection).await;
+        return ToolOutput::error(rejection);
+    }
 
     // Per-turn dispatch cap (#583): only one long-running dispatch per agent turn.
     // Check first without incrementing — the actual increment happens right before
