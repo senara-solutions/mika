@@ -76,15 +76,19 @@ Le ticket demandait au groom d'arbitrer un lint `check-test-suites-wired.sh`.
 **Arbitrage : la classe mérite d'être fermée, mais pas par la forme naïve, et
 pas dans ce vol.** La mesure faite ici le montre :
 
-| population (worktree, 2026-10-17) | compte |
-|---|---|
-| fichiers `test*.sh` (`skills/bundled/_shared/tests/` + `scripts/`) | 61 |
-| cibles `make …` invoquées par `ci.yml` | 15 |
-| suites invoquées par la cible locale `make test` | ≈ 45 |
-| occurrences de `make test` dans `.github/workflows/*.yml` | **0** |
+| population (worktree, 2026-10-17) | compte | commande de mesure |
+|---|---|---|
+| fichiers `test*.sh` (`skills/bundled/_shared/tests/` + `scripts/`) | 60 | `ls skills/bundled/_shared/tests/test*.sh scripts/test*.sh \| wc -l` |
+| cibles `make …` invoquées par `ci.yml` | 16 | `grep -oE 'make [a-z0-9-]+' .github/workflows/ci.yml \| sort -u \| wc -l` |
+| invocations dans le corps de la cible locale `make test` | 40 | `sed -n '/^test:/,/^$/p' Makefile \| grep -cE '^\s+@?bash'` |
+| occurrences de `make test` dans `.github/workflows/*.yml` | **0** | `grep -nE 'make test$\|make test ' .github/workflows/*.yml` |
 
-Un lint bidirectionnel naïf classerait ~45 suites en violation le jour de son
-atterrissage ; sa Fire-Disposition demanderait 45 exceptions nommées, soit
+Les commandes sont dans le tableau parce qu'un compte sans sa méthode n'est pas
+une mesure : c'est le chiffre du jour. Elles sont ce qui permettra à mika#2761 de
+constater la dérive de la population plutôt que de la ré-estimer.
+
+Un lint bidirectionnel naïf classerait ~40 suites en violation le jour de son
+atterrissage ; sa Fire-Disposition demanderait 40 exceptions nommées, soit
 précisément l'allowlist dont mika#2309 dit qu'elle est l'endroit où la
 régression passe inaperçue. Il y a une **décision de forme** à prendre avant
 l'implémentation (fermeture transitive ? registre déclaratif à la
@@ -158,14 +162,21 @@ vide est mesuré, pas supposé.**
 - **Violations existantes : zéro.** Les deux suites ont été exécutées dans ce
   worktree le 2026-10-17, chacune au vert :
   `bash skills/bundled/_shared/tests/test_egress_push_bound.sh` → 12 cas,
-  143 lignes `RESULT PASS`, zéro `RESULT FAIL` ;
+  143 lignes `RESULT PASS`, zéro `RESULT FAIL`, exit 0 ;
   `bash scripts/test-measure-webhook-turn-cost.sh` → « 7 passées, 0 échouées ».
   Aucune entrée d'exception n'est donc écrite, et aucune ne doit l'être.
+  **Piège de lecture, rencontré au grooming :** la dernière ligne de
+  `test_egress_push_bound.sh` affiche `Results: 2 passed, 0 failed` — c'est un
+  compteur de groupes de haut niveau, pas le compte d'assertions, et il ne
+  contredit pas les 143. Le signal à lire est l'exit code, plus
+  `grep -c 'RESULT FAIL'` ; qui lirait « 2 passed » comme le total conclurait à
+  tort que la suite est quasi vide et serait tenté de la juger non rentable à
+  câbler.
 - **Aucun livrable n'atterrit avec un interrupteur de désarmement.** Pas de
   `continue-on-error`, pas de `if:`, pas de `|| true`, pas de `#[ignore]`. Une
   étape CI qui ne peut pas faire rougir le job est le même objet que l'étape
   absente — c'est-à-dire l'état d'avant ce vol.
-- **L'arriéré de la classe n'est pas allowlisté ici, il est tracké.** Les ~45
+- **L'arriéré de la classe n'est pas allowlisté ici, il est tracké.** Les ~40
   autres suites que `ci.yml` n'appelle pas (§ 1.4) ne reçoivent ni exception ni
   verdict dans ce vol : elles sont l'objet de mika#2761. Les inscrire dans une
   allowlist de ce vol serait fabriquer précisément la liste dont mika#2309 dit
@@ -353,7 +364,7 @@ elle est un contrôle de l'état de la branche, pas du hunk.
 
 - Le lint de la classe (point 3 du ticket) — **Tracked in:
   senara-solutions/mika#2761** (§ 1.4).
-- Faire appeler `make test` par CI, ou réduire l'arriéré des ~45 suites
+- Faire appeler `make test` par CI, ou réduire l'arriéré des ~40 suites
   locales : même ticket.
 - Toute modification des deux suites ou de l'addon d'egress (§ 3).
 - La gestion du credential et de ses scopes : action opérateur.
@@ -406,10 +417,10 @@ contrat de vérification du § 4.
   accepté par la forge ; en cas de refus pour scope manquant, le vol s'arrête
   sans contournement, cite la ligne de refus verbatim dans son résultat, n'ouvre
   aucune PR et laisse le commit 1 en place sur la branche locale. *(V8, § 5)*
-- **AC7** — Le push-mesure du commit 1 n'a qu'une inconnue : le YAML a été
+- **AC6** — Le push-mesure du commit 1 n'a qu'une inconnue : le YAML a été
   validé et les deux cibles résolues localement avant de committer. *(V9, § 5
   étape 0)*
-- **AC6** — Le point 3 du ticket (lint de la classe) est arbitré et renvoyé à un
+- **AC7** — Le point 3 du ticket (lint de la classe) est arbitré et renvoyé à un
   ticket numéroté, nommé par une ligne `Tracked in:` du corps de PR. *(§ 1.4,
   mika#2761)*
 
