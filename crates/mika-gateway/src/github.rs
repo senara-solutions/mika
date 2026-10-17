@@ -2960,6 +2960,153 @@ mod tests {
         );
     }
 
+    /// mika#2755 — le producteur réel traversant le masque du consommateur.
+    ///
+    /// `mask_cited_branch` vit dans `mika-common` et s'épingle là-bas sur des
+    /// littéraux. Ce qu'un littéral ne peut pas voir : le jour où
+    /// `format_event_text` change de gabarit, le masque continue de passer ses
+    /// sept cas et ne masque plus rien de ce que le gateway émet vraiment. Ce
+    /// test-ci fait passer les sorties **réelles** du producteur par le
+    /// consommateur, sur les deux seuls gabarits qui citent une branche.
+    ///
+    /// Sa seconde moitié est auto-nettoyante : tout autre type d'événement
+    /// formaté doit ne contenir **aucun** [`BRANCH_MARKER`]. Un troisième
+    /// gabarit qui se met à citer une branche rend ce test rouge et se nomme —
+    /// sans quoi un nouveau slug entrerait dans le texte d'intention sans que
+    /// rien ne le dise, et c'est exactement le défaut de mika#2755.
+    #[test]
+    fn mika2755_le_masque_retire_le_slug_de_chaque_gabarit_qui_cite_une_branche() {
+        use mika_common::github_event_format as fmt;
+
+        // (1) `check_suite` — le gabarit du webhook fondateur, mot pour mot.
+        let mut event = mika2680_blank_event();
+        event.check_suite = Some(CheckSuite {
+            conclusion: Some("success".to_string()),
+            head_branch: Some("fix/2750/dispatch-un-groom-ready-label-qui-crashe".to_string()),
+        });
+        let text = format_event_text("check_suite", &event);
+        assert_eq!(
+            text,
+            "[GitHub] Check suite success on senara-solutions/mika \
+             (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)",
+            "le gabarit `check_suite` a dérivé — ce littéral EST le message du \
+             webhook du 2026-10-16 23:49Z, celui que le critère d'acceptation de \
+             mika#2755 épingle mot pour mot"
+        );
+        let masked = fmt::mask_cited_branch(&text);
+        assert_eq!(
+            masked, "[GitHub] Check suite success on senara-solutions/mika (branch: )",
+            "le masque doit retirer le slug cité et rien d'autre"
+        );
+        assert!(
+            !masked.contains("groom"),
+            "c'est ce `groom`-là, dans le slug, qui a fait matcher le mot-clé de \
+             dev-groom et armé `required_tools` : {masked:?}"
+        );
+
+        // (2) `pull_request` — le second site, et il porte une ligne d'URL
+        // après la branche : le masque doit la conserver intacte.
+        let mut event = mika2680_blank_event();
+        event.action = Some("opened".to_string());
+        event.pull_request = Some(GitHubPullRequest {
+            number: Some(2756),
+            title: Some("une branche citée n'est pas du texte d'intention".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2756".to_string()),
+            body: None,
+            head: Some(GitHubRef {
+                ref_name: Some("fix/2755/agent-le-mot-cl-groom-match-dans-un-nom".to_string()),
+            }),
+            merged: None,
+        });
+        let text = format_event_text("pull_request", &event);
+        let masked = fmt::mask_cited_branch(&text);
+        assert_eq!(
+            masked,
+            "[GitHub] PR opened: senara-solutions/mika#2756 — une branche citée \
+             n'est pas du texte d'intention (branch: )\n\
+             https://github.com/senara-solutions/mika/pull/2756",
+            "sur `pull_request` le masque s'arrête à la première ligne : l'URL de \
+             la ligne suivante traverse intacte"
+        );
+        assert!(
+            !masked.contains("groom"),
+            "le slug d'une branche de PR est du texte cité au même titre : {masked:?}"
+        );
+
+        // (3) La moitié auto-nettoyante — aucun autre gabarit ne cite de
+        // branche. `BRANCH_MARKER` est le seul motif que `mask_cited_branch`
+        // sait retirer ; un gabarit qui citerait une branche autrement lui
+        // échapperait en silence.
+        let mut sans_branche: Vec<(&str, String)> = Vec::new();
+
+        for action in ["opened", "closed", "assigned"] {
+            let mut event = mika2680_blank_event();
+            event.action = Some(action.to_string());
+            event.issue = mika2680_issue();
+            sans_branche.push(("issues", format_event_text("issues", &event)));
+        }
+
+        let mut event = mika2680_blank_event();
+        event.action = Some("labeled".to_string());
+        event.issue = mika2680_issue();
+        event.label = Some(GitHubLabel {
+            name: Some("ready".to_string()),
+        });
+        sans_branche.push(("issues.labeled", format_event_text("issues", &event)));
+
+        let mut event = mika2680_blank_event();
+        event.action = Some("created".to_string());
+        event.issue = mika2680_issue();
+        event.comment = Some(GitHubComment {
+            body: Some("une consigne".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/issues/2680#c1".to_string()),
+            user: Some(GitHubUser {
+                login: "samidarko".to_string(),
+                user_type: None,
+            }),
+        });
+        sans_branche.push(("issue_comment", format_event_text("issue_comment", &event)));
+
+        // `pull_request_review` porte une PR — donc une branche dans la
+        // charge utile — et ne la cite pourtant pas. C'est le cas qui rend
+        // cette moitié non vacante.
+        let mut event = mika2680_blank_event();
+        event.pull_request = mika2680_pr();
+        event.review = Some(GitHubReview {
+            state: Some("approved".to_string()),
+            body: None,
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2681#r1".to_string()),
+            user: Some(GitHubUser {
+                login: "mika-qa".to_string(),
+                user_type: None,
+            }),
+        });
+        sans_branche.push((
+            "pull_request_review",
+            format_event_text("pull_request_review", &event),
+        ));
+
+        let event = mika2680_blank_event();
+        sans_branche.push(("push", format_event_text("push", &event)));
+
+        assert_eq!(
+            sans_branche.len(),
+            7,
+            "la moitié auto-nettoyante doit couvrir des gabarits, pas zéro — \
+             si ce compte tombe, c'est la boucle qui est cassée, pas le gateway"
+        );
+        for (event_type, text) in &sans_branche {
+            assert!(
+                !text.contains(fmt::BRANCH_MARKER),
+                "le gabarit {event_type:?} s'est mis à citer une branche. Le slug \
+                 qu'il cite entre désormais dans l'évaluation des mots-clés de \
+                 `match_skills`, exactement comme le `check_suite` de mika#2755 : \
+                 relire `mask_cited_branch` (première ligne, parenthèse fermante) \
+                 avant d'ajouter ce gabarit ci-dessus. Texte : {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_format_event_text_issue_labeled_empty_label_name() {
         // Empty label name should fall back to generic format, not produce

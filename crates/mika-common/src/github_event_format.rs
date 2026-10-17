@@ -4,6 +4,8 @@
 //! producer and consumer is a contract violation; the cross-crate test in
 //! `mika-gateway::github::tests` enforces the contract at CI time.
 
+use std::borrow::Cow;
+
 /// Prefix emitted by `format_event_text` for `issues.labeled` events
 /// where the label name is `ready`. The trailing space is significant —
 /// the consumer parses `<repo>#<n>` immediately after the prefix.
@@ -161,3 +163,200 @@ pub const ISSUE_COMMENT_EVENT_PREFIX: &str = "[GitHub] New comment on ";
 /// d'où un préfixe qui s'arrête au point. Épingler `[GitHub] push: ` aurait
 /// décrit une forme que rien n'émet.
 pub const PUSH_EVENT_PREFIX: &str = "[GitHub] push.";
+
+// ---------------------------------------------------------------------------
+// Les données citées ne sont pas du texte d'intention (mika#2755)
+// ---------------------------------------------------------------------------
+
+/// Préfixe commun à **toutes** les formes que `format_event_text` émet — le
+/// dénominateur de la grammaire déclarée ci-dessus, bras attrape-tout inclus.
+///
+/// Son unique rôle : décider si un texte est un événement webhook **avant** d'y
+/// toucher. Il ne nomme aucun type d'événement et ne porte aucune décision de
+/// routage — pour cela, les préfixes spécifiques ci-dessus sont les seuls
+/// légitimes.
+///
+/// Producteur : `mika_gateway::github::format_event_text` (tous les bras).
+/// Consommateur : [`mask_cited_branch`].
+pub const GITHUB_EVENT_TEXT_PREFIX: &str = "[GitHub] ";
+
+/// Retire le slug de branche qu'un texte d'événement GitHub **cite**, en
+/// laissant le marqueur en place : `… (branch: feat/x)` devient `… (branch: )`.
+///
+/// # Pourquoi
+///
+/// Le 2026-10-16, un `check_suite` vert sur
+/// `fix/2750/dispatch-un-groom-ready-label-qui-crashe` a fait matcher le
+/// mot-clé `groom` de dev-groom **dans le slug de la branche** — les deux
+/// ancres `\b` de mika#1878 y sont satisfaites, les voisins étant des traits
+/// d'union. Le `required_tools` du skill s'est armé, la boucle a re-promptée,
+/// et le modèle a fabriqué une tâche manuelle fantôme (mika#2755). Un nom de
+/// branche est une **donnée citée** par le substrat, jamais une intention
+/// exprimée par quelqu'un.
+///
+/// # Contrat — trois refus, tous fail-safe
+///
+/// Renvoie `Cow::Borrowed(text)` **inchangé** quand :
+///
+/// 1. `text` ne commence pas par [`GITHUB_EVENT_TEXT_PREFIX`] — ce n'est pas un
+///    événement webhook, donc rien n'y est « cité » ;
+/// 2. la **première ligne** ne contient pas [`BRANCH_MARKER`] — aucune branche
+///    citée (`issue_comment`, `issues`, `pull_request_review`, `push`) ;
+/// 3. la première ligne ne finit pas par `)` — la forme attendue n'est pas là,
+///    et un masquage à l'aveugle couperait du texte au hasard.
+///
+/// # `find`, pas `rfind` — et c'est délibéré
+///
+/// La coupe part de la **première** occurrence du marqueur. Un titre de PR
+/// contenant ` (branch: ` fait donc manger le titre aussi. C'est le sens du
+/// fail-safe : masquer plus de données citées, jamais moins. Épinglé par
+/// `mask_cited_branch_eats_a_title_that_imitates_the_marker`, pour que ce soit
+/// une propriété choisie et non une surprise.
+///
+/// # Portée
+///
+/// Le texte masqué sert **uniquement** à l'évaluation des mots-clés de skill
+/// (`mika_agent::skills::matcher::match_skills`). `context::resolve_contexts`,
+/// `review_filter::apply_review_filter`, les `INTENT_GUARDS` et le prompt lisent
+/// tous `params.user_message` intact : le modèle voit la branche, c'est la
+/// *détection d'intention* qui ne la lit plus.
+pub fn mask_cited_branch(text: &str) -> Cow<'_, str> {
+    if !text.starts_with(GITHUB_EVENT_TEXT_PREFIX) {
+        return Cow::Borrowed(text);
+    }
+    // Même discipline « première ligne » que `webhook_prefilter::trigger_class` :
+    // le corps d'un ticket ou d'une review suit, et n'a rien à voir ici.
+    let head = text.lines().next().unwrap_or(text);
+    let Some(at) = head.find(BRANCH_MARKER) else {
+        return Cow::Borrowed(text);
+    };
+    if head.strip_suffix(')').is_none() {
+        return Cow::Borrowed(text);
+    }
+    // Offsets prouvés sur frontière de caractère : `find` en renvoie une, et
+    // `BRANCH_MARKER` comme `head` sont mesurés en octets sur `text` lui-même.
+    let kept = at + BRANCH_MARKER.len();
+    Cow::Owned(format!("{}){}", &text[..kept], &text[head.len()..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Message du webhook fondateur de mika#2755, **mot pour mot**.
+    const TICKET_MESSAGE: &str = "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)";
+
+    /// Seul assembleur de message de ce module (garde-fou du plan : sept cas,
+    /// **un** assembleur). Les quatre cas de refus portent leur littéral, qui
+    /// est précisément la forme qu'ils épinglent.
+    fn check_suite_text(branch: &str) -> String {
+        format!("[GitHub] Check suite success on senara-solutions/mika (branch: {branch})")
+    }
+
+    #[test]
+    fn mask_cited_branch_removes_the_slug_of_the_founding_webhook() {
+        let text = check_suite_text("fix/2750/dispatch-un-groom-ready-label-qui-crashe");
+        assert_eq!(
+            text, TICKET_MESSAGE,
+            "l'assembleur doit rendre le message du ticket mot pour mot"
+        );
+
+        let masked = mask_cited_branch(&text);
+
+        assert_eq!(
+            masked.as_ref(),
+            "[GitHub] Check suite success on senara-solutions/mika (branch: )",
+            "le marqueur reste, seul le slug part"
+        );
+        assert!(
+            !masked.contains("groom"),
+            "c'est le défaut même de mika#2755 : {masked}"
+        );
+    }
+
+    #[test]
+    fn mask_cited_branch_keeps_the_url_of_a_pull_request_event() {
+        let text = "[GitHub] PR opened: senara-solutions/mika#2754 — un groom orphelin (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)\nhttps://github.com/senara-solutions/mika/pull/2754";
+
+        let masked = mask_cited_branch(text);
+
+        assert_eq!(
+            masked.as_ref(),
+            "[GitHub] PR opened: senara-solutions/mika#2754 — un groom orphelin (branch: )\nhttps://github.com/senara-solutions/mika/pull/2754",
+            "la coupe est bornée à la première ligne : l'URL survit intacte"
+        );
+    }
+
+    #[test]
+    fn mask_cited_branch_refuses_a_human_message() {
+        // Refus 1 : pas de préfixe d'événement. Un humain a le droit d'écrire
+        // une phrase de cette forme, et son intention doit rester lisible.
+        let text = "groom mika#2750 (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)";
+
+        let masked = mask_cited_branch(text);
+
+        assert!(
+            matches!(masked, Cow::Borrowed(_)),
+            "un texte humain doit être emprunté inchangé"
+        );
+        assert_eq!(masked.as_ref(), text);
+    }
+
+    #[test]
+    fn mask_cited_branch_refuses_an_event_without_the_marker() {
+        // Refus 2 : un événement qui ne cite aucune branche.
+        let text = "[GitHub] New comment on senara-solutions/mika#2750 (un groom orphelin) by @samidarko\nhttps://example.invalid/c/1";
+
+        let masked = mask_cited_branch(text);
+
+        assert!(
+            matches!(masked, Cow::Borrowed(_)),
+            "sans BRANCH_MARKER il n'y a rien à masquer"
+        );
+        assert_eq!(masked.as_ref(), text);
+    }
+
+    #[test]
+    fn mask_cited_branch_refuses_a_first_line_not_closed_by_a_parenthesis() {
+        // Refus 3 : le marqueur est là, la forme attendue ne l'est pas.
+        let text = "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2750/groom";
+
+        let masked = mask_cited_branch(text);
+
+        assert!(
+            matches!(masked, Cow::Borrowed(_)),
+            "forme inattendue : on ne coupe pas à l'aveugle"
+        );
+        assert_eq!(masked.as_ref(), text);
+    }
+
+    #[test]
+    fn mask_cited_branch_eats_a_title_that_imitates_the_marker() {
+        // Le fail-safe de `find`, épinglé plutôt que subi : un titre de PR qui
+        // contient lui-même ` (branch: ` est mangé avec le slug. Masquer plus
+        // de données citées est le bon sens de l'erreur.
+        let text = "[GitHub] PR opened: senara-solutions/mika#2755 — lire (branch: x) comme une intention (branch: fix/2755/groom-dans-un-nom)\nhttps://example.invalid/pull/2755";
+
+        let masked = mask_cited_branch(text);
+
+        assert_eq!(
+            masked.as_ref(),
+            "[GitHub] PR opened: senara-solutions/mika#2755 — lire (branch: )\nhttps://example.invalid/pull/2755",
+            "la coupe part de la PREMIÈRE occurrence du marqueur"
+        );
+    }
+
+    #[test]
+    fn mask_cited_branch_survives_a_multi_byte_slug() {
+        // mika#764 : aucun offset ne doit tomber au milieu d'un caractère.
+        let text = check_suite_text("fix/2755/réparé-le-groom-à-côté-☕");
+
+        let masked = mask_cited_branch(&text);
+
+        assert_eq!(
+            masked.as_ref(),
+            "[GitHub] Check suite success on senara-solutions/mika (branch: )",
+            "slug multi-octets retiré sans coupe en milieu de caractère"
+        );
+    }
+}

@@ -369,7 +369,13 @@ DEPTH	B	crates/mika-agent/src/skills/builtin_handlers.rs::validate_review_depth_
 # either value changes a refusal boundary, not just a name in a log.
 # `READY_LABEL_DISPATCH_MARKER` is the `ready` instance of
 # `ISSUE_LABELED_EVENT_PREFIX`, and it is the one that carries a dispatch.
+# A THIRD one decides, since mika#2755: `GITHUB_EVENT_TEXT_PREFIX`, the common
+# denominator of every form above. It is the first of `mask_cited_branch`'s
+# three refusals, so it is what tells a webhook text from a human one before the
+# cited branch slug is removed from keyword evaluation. Widen its value and
+# human messages start being masked; narrow it and a webhook family stops being.
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::CHECK_SUITE_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::GITHUB_EVENT_TEXT_PREFIX	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_CLOSED_EVENT_PREFIX	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_COMMENT_EVENT_PREFIX	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_EVENT_PREFIX	exact:prefix

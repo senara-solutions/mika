@@ -13932,6 +13932,56 @@ mod tests {
         assert!(!required.contains("run_claude_pilot"));
     }
 
+    // -- mika#2755: une branche citée n'arme aucun required_tools --
+
+    /// Message du webhook fondateur de mika#2755, **mot pour mot**.
+    const MIKA2755_CHECK_SUITE_MESSAGE: &str = "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)";
+
+    #[test]
+    fn mika2755_a_cited_branch_arms_no_required_tools() {
+        // La scène du défaut, réduite à son os : un skill nommé `groom` —
+        // `make_skill_entry_with_constraints` en fait son propre mot-clé — qui
+        // exige `run_claude_pilot_groom`. Le slug de la branche contient
+        // `groom` entre deux traits d'union, donc les deux ancres `\b` de
+        // mika#1878 y sont satisfaites.
+        let groom = make_skill_entry_with_constraints(
+            "groom",
+            30,
+            &["run_claude_pilot_groom"],
+            &["run_claude_pilot_groom"],
+        );
+        let skills = vec![groom];
+
+        let matched = crate::skills::matcher::match_skills(&skills, MIKA2755_CHECK_SUITE_MESSAGE);
+        let required = collect_required_tools(&matched, MIKA2755_CHECK_SUITE_MESSAGE);
+
+        assert!(
+            required.is_empty(),
+            "un `check_suite` qui cite une branche ne doit armer aucun outil requis — \
+             c'est ce `required_tools` qui a produit le re-prompt et la tâche fantôme \
+             de mika#2755 ; obtenu : {required:?}"
+        );
+    }
+
+    #[test]
+    fn mika2755_a_human_groom_request_still_arms_the_tool() {
+        // Contre-épreuve : le chemin nominal reste entier. Sans elle, vider
+        // `required_tools` pour tout le monde passerait aussi.
+        let groom = make_skill_entry_with_constraints(
+            "groom",
+            30,
+            &["run_claude_pilot_groom"],
+            &["run_claude_pilot_groom"],
+        );
+        let skills = vec![groom];
+
+        let matched = crate::skills::matcher::match_skills(&skills, "groom mika#2750");
+        let required = collect_required_tools(&matched, "groom mika#2750");
+
+        assert_eq!(required.len(), 1, "obtenu : {required:?}");
+        assert!(required.contains("run_claude_pilot_groom"));
+    }
+
     // -- mika#2363: what the per-turn skill restriction does to the output
     //    contract (V4 / B2) --
 
