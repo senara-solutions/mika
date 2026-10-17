@@ -4,7 +4,7 @@
 // files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -728,6 +728,13 @@ pub struct LongRunningContext {
     /// continuation turns) where there is no fresh user input — those paths
     /// have already passed an upstream gate.
     pub originating_message: Option<String>,
+    /// A-t-on forcé une contrainte d'outil pendant CE tour ? (mika#2772)
+    ///
+    /// Écrit à un seul site — l'arm de re-prompt `required_tools` de `run_loop` —
+    /// et lu à un seul site, `validate_forced_dispatch_consent`. Le re-prompt est
+    /// le forçage : il n'existe aucun autre producteur de « l'outil doit être
+    /// appelé ». Un scan de source refuse un second site des deux côtés.
+    pub tool_constraint_forced: AtomicBool,
 }
 
 /// Validate that all required fields declared in a skill tool's input schema are
@@ -2675,6 +2682,419 @@ async fn report_event_target_binding(
     }
 
     rejection
+}
+
+// ───────── mika#2772 — le consentement d'un dispatch de groom forcé ─────────
+
+/// Le `tool_name` d'audit et le nom de journal du consentement forcé — **un
+/// seul**, le verdict en colonne (mika#2323, motif `ready_label_outcome`).
+///
+/// Neuf issues, un nom : elles appartiennent au même site et à la même
+/// population, et une sonde opérateur qui doit connaître neuf noms est une sonde
+/// qu'on n'écrit pas. `grep -c 'forced_dispatch_consent'` répond « la garde
+/// tourne-t-elle » ; `grep '"forced":true'` répond « a-t-elle mordu ».
+pub(crate) const FORCED_CONSENT_EVENT: &str = "forced_dispatch_consent";
+
+/// Levier de désarmement opérateur. Armé par défaut ; `0` / `false` désarme.
+/// Documenté dans `docs/operator/environment-variables.md`.
+pub(crate) const FORCED_CONSENT_ENV: &str = "MIKA_FORCED_DISPATCH_CONSENT";
+
+/// Le dispatch n'a pas été forcé — il a été demandé par construction.
+pub(crate) const FORCED_CONSENT_NOT_FORCED: &str = "allowed_not_forced";
+/// Le tour portait une intention de grooming explicite (mika#1173).
+pub(crate) const FORCED_CONSENT_REQUESTED: &str = "allowed_requested";
+/// Le ticket visé porte `ready` : le consentement positif de mika#841 est là.
+pub(crate) const FORCED_CONSENT_CONSENTED: &str = "allowed_consented";
+/// L'opérateur a désarmé la garde.
+pub(crate) const FORCED_CONSENT_DISARMED: &str = "allowed_disarmed";
+/// Aucun numéro de ticket résoluble depuis le prompt de dispatch.
+pub(crate) const FORCED_CONSENT_SUBJECT_UNRESOLVED: &str = "forced_dispatch_subject_unresolved";
+/// Pas de token GitHub : le consentement ne peut pas être lu.
+pub(crate) const FORCED_CONSENT_NO_TOKEN: &str = "forced_dispatch_consent_no_token";
+/// Le lecteur de labels a répondu `Err(_)`.
+pub(crate) const FORCED_CONSENT_UNVERIFIABLE: &str = "forced_dispatch_consent_unverifiable";
+/// La cible est une pull request, pas un ticket.
+pub(crate) const FORCED_CONSENT_SUBJECT_IS_PR: &str = "forced_dispatch_subject_is_pull_request";
+/// Labels lus, `ready` absent — **le refus nominal**.
+pub(crate) const FORCED_CONSENT_WITHOUT_CONSENT: &str = "forced_dispatch_without_consent";
+
+/// Le verdict du gate de consentement (mika#2772).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForcedDispatchConsent {
+    /// Le dispatch peut partir.
+    Allowed,
+    /// Le dispatch est refusé ; la chaîne est le JSON rendu au modèle.
+    Refused(String),
+}
+
+/// Journalise et audite une décision de consentement forcé (D5 de mika#2772).
+///
+/// **Une ligne sur chaque dispatch de groom, y compris la branche saine**
+/// (mika#2293 — *un réglage qu'on ne peut pas observer n'est pas un réglage,
+/// c'est un espoir*). Sans producteur connu de contrainte d'outil depuis
+/// mika#2768, une garde silencieuse rendrait « la classe est vide »
+/// indiscernable de « la garde n'est pas déployée ». L'**absence** de la ligne
+/// signifie donc un binaire antérieur à ce vol (mika#2340), jamais une absence
+/// de dispatch forcé.
+///
+/// `subject` et `has_ready` sont des `Option` et se rendent `null` quand le
+/// sujet n'a pas été résolu ou les labels pas lus — jamais `""`, jamais `false`.
+/// Absent n'est pas zéro (mika#2331) : « pas de `ready` » et « on n'a pas pu
+/// regarder » sont deux verdicts différents et portent déjà deux noms distincts.
+/// C'est l'idiome du champ `event_number` de [`report_event_target_binding`].
+///
+/// Le niveau suit le **régime attendu** de chaque verdict : INFO sur les quatre
+/// passages, WARN sur les cinq refus — un WARN sur une population nominale est
+/// un WARN qu'on finit par museler.
+async fn report_forced_dispatch_consent(
+    ctx: &LongRunningContext,
+    verdict: &'static str,
+    forced: bool,
+    requested: bool,
+    subject: Option<&str>,
+    has_ready: Option<bool>,
+    refused: bool,
+) {
+    if refused {
+        warn!(
+            target: "mika::otel",
+            event = FORCED_CONSENT_EVENT,
+            forced = forced,
+            requested = requested,
+            verdict = verdict,
+            subject = subject,
+            has_ready = has_ready,
+            trace_id = %ctx.trace_id,
+            session_id = %ctx.session_id,
+            "tool-boundary: groom dispatch refused — forced by `required_tools` and the \
+             target's consent could not be established (mika#2772)"
+        );
+    } else {
+        info!(
+            target: "mika::otel",
+            event = FORCED_CONSENT_EVENT,
+            forced = forced,
+            requested = requested,
+            verdict = verdict,
+            subject = subject,
+            has_ready = has_ready,
+            trace_id = %ctx.trace_id,
+            session_id = %ctx.session_id,
+            "tool-boundary: groom dispatch consent checked (mika#2772)"
+        );
+    }
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            // Le session id atteint CETTE garde — contrairement à ses voisines
+            // de la même porte — et c'est le bon identifiant : le forçage est une
+            // propriété du TOUR, pas de la tâche.
+            &ctx.session_id,
+            FORCED_CONSENT_EVENT,
+            subject.unwrap_or("<unresolved>"),
+            None,
+            Some(verdict),
+            Some(&format!(
+                "forced={forced} requested={requested} verdict={verdict} subject={} \
+                 has_ready={}",
+                subject.unwrap_or("none"),
+                has_ready
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            )),
+            Some(&ctx.trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "forced_dispatch_consent_audit_failed",
+            verdict = verdict,
+            error = %e,
+            "failed to write the mika#2772 audit event (non-fatal)"
+        );
+    }
+}
+
+/// Un dispatch de groom forcé par `required_tools` ne vise jamais un ticket sans
+/// `ready` (mika#2772).
+///
+/// # Ce que la garde répare
+///
+/// Le 2026-10-17 à 08:59:18Z, un `groom` dans le slug de branche
+/// `fix/2762/rollback-reaper-groom` a matché le mot-clé de dev-groom, armé son
+/// `required_tools`, et fait groomer mika#2766 — un ticket sans `ready` et
+/// absent du bassin (48 tours, 3,40 $). Le tour de reprise a ensuite tenté de
+/// dispatcher l'**implémentation** du même ticket non promu ; seule l'occupation
+/// de la place `implement` l'a arrêté. Le consentement positif de mika#841 a
+/// donc été contourné par une contrainte d'outil que personne n'avait demandée.
+///
+/// # Une fonction **sœur**, pas un paramètre de plus
+///
+/// [`validate_dispatch_readiness`] a 43 sites d'appel dans ce fichier, dont ~39
+/// en tests ; un paramètre supplémentaire coûte 43 éditions mécaniques sans rien
+/// dire. Et surtout, le [`LongRunningContext`] n'est pas dans la signature de
+/// cette chaîne, précisément parce que ses deux autres appelants moteur n'en ont
+/// pas. Le seul site où la provenance du forçage est connue est
+/// [`execute_skill_tool`], où `ctx` est déjà en portée.
+///
+/// # Pré-hoc, et après le moins cher
+///
+/// Appelée **après** le verdict d'acceptation de [`validate_dispatch_readiness`]
+/// et **avant** tout spawn : `run_claude_pilot` crée un worktree et lance un
+/// process, et une garde post-hoc observerait la violation sans l'empêcher
+/// (mika#1646). Après, parce qu'elle paie un appel réseau et que le moins cher
+/// passe d'abord — l'idiome de mika#2649.
+///
+/// # Fail-closed, à l'inverse de la porte de place juste au-dessus
+///
+/// La porte de place (mika#2084 D2, ≈ `:3209`) est **fail-open** sur des labels
+/// illisibles, et c'est le bon choix *là* : sa population est **tout** dispatch,
+/// donc un faux positif arrête la boucle entière sur une panne d'API GitHub.
+/// Ici la population est l'intersection « classe groom ∧ forcé ∧ non demandé » —
+/// vide en régime nominal. Un faux positif y fait attendre un ticket que le
+/// réconciliateur `stuck_ready_reconcile` re-pousse ; un faux négatif est
+/// l'incident mesuré, 48 tours et 3,40 $ sur un ticket que personne n'a promu.
+/// L'asymétrie est inversée parce que la population l'est.
+///
+/// Un seul sujet, délibérément, lu depuis le **prompt de dispatch** — ce que
+/// `dispatch-lib.sh` lit lui-même pour bâtir le worktree. La question est « quel
+/// ticket ce dispatch va-t-il groomer », et la réponse est là. Un
+/// `reference_url` qui désignerait un autre ticket est précisément l'accident de
+/// lignée par lequel le dispatch de 08:59 n'a *pas* été refusé : le rouvrir ici
+/// rouvrirait le trou mesuré.
+pub(crate) async fn validate_forced_dispatch_consent(
+    ctx: &LongRunningContext,
+    github_token: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
+) -> ForcedDispatchConsent {
+    // (1) La classe, à coût nul — l'idiome exact du gate mika#2545 ci-dessous.
+    // Un `implement` forcé relève d'une autre question (mika#2757) et sort de la
+    // population avant toute ligne de journal : la sonde de D5 compte des
+    // dispatchs de groom, pas des tours.
+    let class = derive_dispatch_class(tool_input.and_then(extract_skill_from_input));
+    if class != "groom" {
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    let forced = ctx.tool_constraint_forced.load(Ordering::Relaxed);
+
+    // (2) « Demandé », lu sur le texte **masqué** — le point load-bearing de ce
+    // vol. Le texte qui a armé le forçage contenait `fix/2762/rollback-reaper-groom`.
+    // Le masque de mika#2755/#2768 retire tout slug cité avant qu'on lise une
+    // intention ; sans lui, le prédicat d'intention regarderait un slug et non
+    // une demande. `mika2772_le_texte_devenement_de_lincident_nest_pas_une_demande_de_groom`
+    // (`webhook_dispatch.rs`) tient les deux moitiés de cette décision.
+    let masked = ctx
+        .originating_message
+        .as_deref()
+        .map(mika_common::github_event_format::mask_cited_branch);
+    let intent = masked.as_deref();
+    let requested = intent.is_some_and(crate::webhook_dispatch::is_grooming_intent_message);
+
+    if !crate::webhook_dispatch::forced_dispatch_needs_consent(class, forced, intent) {
+        let verdict = if forced {
+            FORCED_CONSENT_REQUESTED
+        } else {
+            FORCED_CONSENT_NOT_FORCED
+        };
+        report_forced_dispatch_consent(ctx, verdict, forced, requested, None, None, false).await;
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    // Le levier opérateur. Il émet quand même sa ligne : un désarmement muet
+    // serait indiscernable d'une garde absente.
+    let armed = std::env::var(FORCED_CONSENT_ENV)
+        .map(|v| !(v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !armed {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_DISARMED,
+            forced,
+            requested,
+            None,
+            None,
+            false,
+        )
+        .await;
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    let refuse = |verdict: &'static str, subject: Option<String>, reason: String| {
+        serde_json::json!({
+            "error": verdict,
+            "session_id": ctx.session_id,
+            "subject": subject,
+            "reason": reason,
+            // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+            // jugé. Les deux gestes de reprise, nommés.
+            "recovery": "This dispatch was not requested — it was demanded by a tool \
+                         constraint this turn, and the ticket it targets has not been \
+                         promoted. Grooming a ticket nobody promoted is what mika#2772 \
+                         refuses. Either promote the ticket by posting the `ready` label \
+                         as remove→add (GitHub only emits `labeled` on a transition — \
+                         mika#2323), or groom it explicitly with \
+                         `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"`, which \
+                         carries a grooming intent and traverses this gate (mika#1173)."
+        })
+        .to_string()
+    };
+
+    // (3) Le sujet, depuis le prompt de dispatch seul.
+    let Some((repo_ref, number)) = tool_input
+        .and_then(|input| input.get("prompt"))
+        .and_then(|v| v.as_str())
+        .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+    else {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_SUBJECT_UNRESOLVED,
+            forced,
+            requested,
+            None,
+            None,
+            true,
+        )
+        .await;
+        return ForcedDispatchConsent::Refused(refuse(
+            FORCED_CONSENT_SUBJECT_UNRESOLVED,
+            None,
+            "The dispatch prompt names no readable `<repo>#<number>`, so the ticket whose \
+             consent would have to be proven cannot be identified. This gate refuses when \
+             it cannot read its proof: its population is empty in nominal operation, so a \
+             wrongful refusal costs a wait the stuck-ready reconciler re-drives, while a \
+             wrongful pass is the measured incident (mika#2772)."
+                .to_string(),
+        ));
+    };
+    let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+    let subject = format!("{owner_repo}#{number}");
+
+    // (4) Le token.
+    let Some(token) = github_token else {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_NO_TOKEN,
+            forced,
+            requested,
+            Some(&subject),
+            None,
+            true,
+        )
+        .await;
+        return ForcedDispatchConsent::Refused(refuse(
+            FORCED_CONSENT_NO_TOKEN,
+            Some(subject.clone()),
+            format!(
+                "No GitHub token reached this gate, so whether `{subject}` carries the \
+                 `ready` label could not be read. Fail-closed by the asymmetry written at \
+                 this site (mika#2772)."
+            ),
+        ));
+    };
+
+    let (subject_owner, subject_repo) = match owner_repo.split_once('/') {
+        Some(pair) => pair,
+        // `normalize_owner_repo` garantit le `/` ; l'arm existe pour que le
+        // compilateur n'ait pas à être cru sur parole.
+        None => (crate::webhook_dispatch::DEFAULT_DISPATCH_OWNER, "mika"),
+    };
+
+    // (5) Les labels — déjà le lecteur de la porte de place, déjà porteur de la
+    // distinction PR/issue dans son type de retour.
+    match crate::github_graphql::fetch_issue_labels_unless_pull_request(
+        token,
+        subject_owner,
+        subject_repo,
+        number,
+    )
+    .await
+    {
+        Ok(Some(labels)) if crate::webhook_dispatch::labels_carry_ready(&labels) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_CONSENTED,
+                forced,
+                requested,
+                Some(&subject),
+                Some(true),
+                false,
+            )
+            .await;
+            ForcedDispatchConsent::Allowed
+        }
+        Ok(Some(_)) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_WITHOUT_CONSENT,
+                forced,
+                requested,
+                Some(&subject),
+                Some(false),
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(refuse(
+                FORCED_CONSENT_WITHOUT_CONSENT,
+                Some(subject.clone()),
+                format!(
+                    "`{subject}` does not carry the `ready` label, and this groom dispatch \
+                     was forced by a `required_tools` constraint rather than requested. The \
+                     `ready` label is the canonical positive consent for autonomous \
+                     dispatch (mika#841); a tool constraint is not a promotion. On \
+                     2026-10-17 this exact shape groomed a ticket nobody had promoted for \
+                     48 turns and $3.40 (mika#2772)."
+                ),
+            ))
+        }
+        Ok(None) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_SUBJECT_IS_PR,
+                forced,
+                requested,
+                Some(&subject),
+                None,
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(refuse(
+                FORCED_CONSENT_SUBJECT_IS_PR,
+                Some(subject.clone()),
+                format!(
+                    "`{subject}` resolves to a pull request, not an issue. A PR's label set \
+                     never carries `ready`, so reading it as consent would be a confident \
+                     wrong answer in one direction or the other — and a forced groom whose \
+                     own target is a PR is not a shape this engine produces on purpose \
+                     (mika#2772)."
+                ),
+            ))
+        }
+        Err(e) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_UNVERIFIABLE,
+                forced,
+                requested,
+                Some(&subject),
+                None,
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(refuse(
+                FORCED_CONSENT_UNVERIFIABLE,
+                Some(subject.clone()),
+                format!(
+                    "Could not read the labels of `{subject}` ({e}), so its consent could \
+                     not be established. Unlike the seat gate on this same door — which is \
+                     fail-OPEN because its population is every dispatch — this gate refuses: \
+                     its population is empty in nominal operation, so the cost of a wrongful \
+                     refusal is a wait, convergent under `stuck_ready_reconcile` (mika#2772)."
+                ),
+            ))
+        }
+    }
 }
 
 /// Validate that a task is in a dispatchable state for long-running execution.
@@ -4907,6 +5327,19 @@ async fn execute_long_running(
         Ok(status) => status,
         Err(err) => return ToolOutput::error(err),
     };
+
+    // mika#2772 — un dispatch de groom forcé par `required_tools` ne vise jamais
+    // un ticket sans `ready`. Fonction SŒUR de la garde ci-dessus, et non un
+    // paramètre de plus : c'est ici que la provenance du forçage est connue, et
+    // `validate_dispatch_readiness` a 43 sites d'appel. Après son verdict
+    // d'acceptation (le moins cher passe d'abord) et avant tout spawn (pré-hoc,
+    // jamais post-hoc — mika#1646).
+    if let ForcedDispatchConsent::Refused(rejection) =
+        validate_forced_dispatch_consent(ctx, github_token, Some(&input)).await
+    {
+        record_dispatch_rejection(&ctx.db, task_id, &rejection).await;
+        return ToolOutput::error(rejection);
+    }
 
     // Per-turn dispatch cap (#583): only one long-running dispatch per agent turn.
     // Check first without incrementing — the actual increment happens right before
@@ -7678,6 +8111,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7735,6 +8169,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7805,6 +8240,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
         let output = execute_skill_tool(
             &tool,
@@ -7853,6 +8289,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(1),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
         let output = execute_skill_tool(
             &tool,
@@ -7910,6 +8347,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7950,6 +8388,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -8128,6 +8567,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         }
     }
 
@@ -10130,6 +10570,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message,
+            tool_constraint_forced: AtomicBool::new(false),
         }
     }
 
@@ -14545,6 +14986,485 @@ Harness ticket.
             assert_eq!(
                 PILOT_LAUNCHER_BRAKED_ERROR, "pilot_launcher_braked",
                 "si ce nom bouge, `FILTER_LAUNCHER_BRAKED` doit bouger avec lui"
+            );
+        }
+    }
+
+    // ---- mika#2772 : le consentement d'un dispatch de groom forcé ----
+    //
+    // Un test par terme du prédicat, et le contrôle négatif de chacun : c'est la
+    // paire qui sépare « la garde discrimine » de « la garde refuse tout ».
+    //
+    // Les arms qui exigent une **vraie lecture de label** ne sont pas testés
+    // ici, pour la raison écrite au site : la lecture demande réseau + token. Ce
+    // sont les deux prédicats purs de `webhook_dispatch`
+    // (`forced_dispatch_needs_consent`, `labels_carry_ready`) qui portent la
+    // décision, et leurs tests qui les tiennent — c'est le partage, pas un trou.
+    //
+    // **Les SEPT portent `#[serial_test::serial]`, pas seulement celui qui pose
+    // la variable.** Le levier de désarmement est lu dans le process env, donc
+    // le test qui le pose empoisonne tout voisin qui atteint la même lecture —
+    // mesuré ici : `…_un_sujet_non_resolu_…` a rendu `Allowed` au premier
+    // passage, désarmé par un voisin. `#[serial]` ne sérialise que contre ses
+    // propres porteurs, donc annoter le seul poseur laisse la course entière
+    // ouverte (la moitié porteuse de mika#2646, et la leçon de mika#2073).
+    //
+    // Et sept suffisent — le reste du crate n'est pas une population de
+    // poisonnés, par **lecture** et non par prudence : la lecture du levier est
+    // placée APRÈS le court-circuit du forçage, et aucun autre test ne pose
+    // `tool_constraint_forced`. Un test de dispatch voisin n'atteint donc jamais
+    // `std::env::var(FORCED_CONSENT_ENV)`, quelle que soit la fenêtre.
+    mod mika2772_consentement_force {
+        use super::*;
+
+        /// Le texte d'événement **mesuré** du 2026-10-17 08:59:18Z : c'est le
+        /// `groom` dans le slug cité qui a armé la contrainte d'outil.
+        const INCIDENT_EVENT: &str = "[GitHub] Check suite success on senara-solutions/mika \
+                                      (branch: fix/2762/rollback-reaper-groom)";
+
+        /// Le ticket que le dispatch de 08:59 a groomé sans que personne l'ait
+        /// promu.
+        const INCIDENT_SUBJECT: &str = "mika#2766";
+
+        fn ctx_forced(msg: Option<&str>, forced: bool) -> LongRunningContext {
+            let db = crate::db::Database::open_in_memory().unwrap();
+            let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+            let ctx = make_lr_ctx_with_msg(async_db, msg.map(str::to_string));
+            ctx.tool_constraint_forced.store(forced, Ordering::Relaxed);
+            ctx
+        }
+
+        /// Le JSON de refus, décodé. Un refus qui ne se parse pas n'est pas
+        /// lisible par le modèle.
+        fn refusal(verdict: ForcedDispatchConsent) -> serde_json::Value {
+            match verdict {
+                ForcedDispatchConsent::Refused(json) => {
+                    serde_json::from_str(&json).unwrap_or_else(|e| {
+                        panic!("le refus doit être du JSON lisible : {e} — {json}")
+                    })
+                }
+                ForcedDispatchConsent::Allowed => {
+                    panic!("attendu un refus, la garde a laissé passer")
+                }
+            }
+        }
+
+        /// **Le refus nominal : la forme exacte de l'incident.**
+        ///
+        /// Un `groom` forcé par `required_tools`, sur un texte d'intention qui
+        /// n'est pas une demande de grooming, visant un ticket que rien n'a
+        /// promu. C'est le dispatch de 08:59:18Z — 48 tours, 3,40 $ — et il doit
+        /// être refusé **avant** tout spawn.
+        ///
+        /// Le verdict ici est `forced_dispatch_consent_no_token` et non le
+        /// nominal `forced_dispatch_without_consent`, parce que ce test ne donne
+        /// pas de token : il tient le **fail-closed**, qui est la propriété que
+        /// l'incident réclamait. Les deux arms sont des refus, et le refus est ce
+        /// qui comptait.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_force_et_non_demande_sur_ticket_sans_ready_est_refuse() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(
+                json["subject"].as_str(),
+                Some("senara-solutions/mika#2766"),
+                "le refus doit nommer le ticket visé, qualifié par son owner"
+            );
+
+            // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+            // jugé. Les deux gestes de reprise, chacun vérifié.
+            let recovery = json["recovery"].as_str().expect("un refus nomme sa levée");
+            assert!(
+                recovery.contains("`ready`"),
+                "la reprise doit nommer le label de promotion : {recovery}"
+            );
+            assert!(
+                recovery.contains("mika ask --agent mika-dev"),
+                "la reprise doit nommer le groom opérateur de mika#1173 : {recovery}"
+            );
+        }
+
+        /// **mika#1173 intact — T2b.**
+        ///
+        /// Le même ticket non promu, la même contrainte armée : seul le texte
+        /// d'intention change. `groom mika#2766` est une demande, et un groom
+        /// *demandé* sur un ticket non promu est la raison d'être de
+        /// `/mika-groom-ticket`. Sans ce contrôle, « la garde discrimine » serait
+        /// indistinguable de « la garde refuse tout ».
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_demande_sur_ticket_sans_ready_passe() {
+            let ctx = ctx_forced(Some("groom mika#2766"), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "un groom demandé en texte libre doit traverser cette porte (mika#1173)"
+            );
+        }
+
+        /// **T2a — le forçage est le prédicat, pas la classe.**
+        ///
+        /// Même texte d'événement, même ticket non promu, contrainte d'outil
+        /// **non** armée : le dispatch passe. C'est ce qui empêche la garde de
+        /// devenir le gate `ready` aveugle que le ticket refuse explicitement.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_non_force_passe() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), false);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "sans forçage il n'y a rien à consentir : le drapeau est le prédicat"
+            );
+        }
+
+        /// **T1 — l'axe de mika#2757 n'est pas le nôtre.**
+        ///
+        /// Un `implement` forcé sort de la population **avant toute ligne de
+        /// journal** : la sonde de D5 compte des dispatchs de groom, pas des
+        /// tours. L'élargissement à `implement` est nommé hors périmètre par le
+        /// plan ; ce test est ce qui rend l'élargissement visible le jour où
+        /// quelqu'un le tente.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_dispatch_implement_force_passe() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-pilot", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "la classe `implement` n'est pas dans la population de mika#2772"
+            );
+        }
+
+        /// **Fail-closed, verdict distinct : le sujet illisible.**
+        ///
+        /// Le prompt ne nomme aucun `<repo>#<number>`, donc le ticket dont il
+        /// faudrait prouver le consentement n'est pas identifiable. La garde
+        /// refuse quand elle ne peut pas lire sa preuve, et le dit **sous son
+        /// propre nom** — un refus qui emprunte le nom du refus nominal rend la
+        /// sonde de V6 illisible (mika#2205).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_sujet_non_resolu_est_refuse_sous_son_propre_nom() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", "groom the rollback reaper", "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(
+                json["error"].as_str(),
+                Some(FORCED_CONSENT_SUBJECT_UNRESOLVED)
+            );
+            assert!(
+                json["subject"].is_null(),
+                "un sujet non résolu se rend `null`, jamais `\"\"` : absent n'est pas \
+                 zéro (mika#2331) — vu {}",
+                json["subject"]
+            );
+        }
+
+        /// **Fail-closed, verdict distinct : le token absent.**
+        ///
+        /// Le sujet est lisible, mais aucun token n'a atteint la garde : le label
+        /// `ready` ne peut pas être lu. Cause distincte, nom distinct, et le
+        /// sujet est tout de même nommé — c'est ce qui sépare « on n'a pas pu
+        /// regarder » de « le prompt ne disait pas quoi regarder ».
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_token_absent_est_refuse_sous_son_propre_nom() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", "senara-solutions/mika#2766", "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(json["error"].as_str(), Some(FORCED_CONSENT_NO_TOKEN));
+            assert_eq!(
+                json["subject"].as_str(),
+                Some("senara-solutions/mika#2766"),
+                "le sujet est lu : c'est la lecture du label qui manque"
+            );
+            assert_ne!(
+                FORCED_CONSENT_NO_TOKEN, FORCED_CONSENT_SUBJECT_UNRESOLVED,
+                "deux causes sous un nom ne sont pas soustractibles (mika#2205)"
+            );
+        }
+
+        /// **Le levier opérateur rend `Allowed` — et il le dit.**
+        ///
+        /// `MIKA_FORCED_DISPATCH_CONSENT=0` désarme la garde, et la ligne
+        /// `forced_dispatch_consent` est émise quand même, avec le verdict
+        /// `allowed_disarmed` : un désarmement muet serait indiscernable d'une
+        /// garde absente (mika#2293).
+        ///
+        /// `#[serial_test::serial]` et non un prédicat pur, parce que le test
+        /// doit montrer que le **levier traverse la garde** et pas seulement
+        /// qu'une chaîne se parse. Le variable est process-wide : sa pose ne
+        /// serait pas sûre en parallèle, et aucun autre test de ce dépôt ne la
+        /// lit (`grep MIKA_FORCED_DISPATCH_CONSENT`). Le contrôle négatif est
+        /// dans le même test, après restauration : le refus doit revenir, sinon
+        /// c'est l'entrée qui passait, pas le levier qui désarmait.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_le_levier_de_desarmement_rend_allowed_et_le_dit() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            // SAFETY: test sérialisé, et cette variable n'a aucun autre lecteur
+            // dans le dépôt.
+            unsafe { std::env::set_var(FORCED_CONSENT_ENV, "0") };
+            let disarmed = validate_forced_dispatch_consent(&ctx, None, Some(&input)).await;
+            unsafe { std::env::remove_var(FORCED_CONSENT_ENV) };
+
+            assert_eq!(
+                disarmed,
+                ForcedDispatchConsent::Allowed,
+                "`{FORCED_CONSENT_ENV}=0` doit désarmer la garde"
+            );
+
+            assert!(
+                matches!(
+                    validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                    ForcedDispatchConsent::Refused(_)
+                ),
+                "armée par défaut : sans le levier, la même entrée est refusée — \
+                 sinon ce test mesure l'entrée et non le levier"
+            );
+        }
+    }
+
+    // ---- mika#2772 : le drapeau de forçage a un écrivain et un lecteur ----
+    //
+    // Aucun test comportemental ne peut voir cette classe. Un second site
+    // d'écriture — typiquement un arm « on relâche la contrainte » qui poserait
+    // le drapeau par symétrie apparente — ne rend **aucune** décision fausse le
+    // jour où il est écrit : la garde continue de discriminer, les dix
+    // assertions ci-dessus restent vertes, et ce sont des dispatchs légitimes
+    // qui commencent à être refusés en production. C'est la classe
+    // `grooming_marker` (mika#2158), que seul un scan structurel voit.
+    mod mika2772_scan_du_drapeau {
+        use std::path::{Path, PathBuf};
+
+        /// **Livrée vide, et elle le reste.**
+        ///
+        /// Quand la garde tire, on **retire le site** ; on ne l'allowliste pas.
+        /// Une allowlist née vide est un emplacement où déposer la prochaine
+        /// infraction (doctrine mika#2201).
+        const FORCED_FLAG_ACCESS_ALLOWLIST: &[&str] = &[];
+
+        /// L'unique écrivain : l'arm de re-prompt `required_tools` de `run_loop`.
+        const WRITE_SITE: &str = "agent_loop/mod.rs";
+
+        /// L'unique lecteur : `validate_forced_dispatch_consent`.
+        const READ_SITE: &str = "skills/executor.rs";
+
+        /// Le nom du champ, assemblé par `concat!`.
+        ///
+        /// Le littéral est produit à la compilation, donc le nom cherché
+        /// n'apparaît nulle part dans le code **non commenté** de cette garde.
+        /// Écrit d'un bloc, il ferait de la garde son propre troisième site le
+        /// jour où la prémisse de masquage ci-dessous cesse d'être vraie — et
+        /// cette prémisse a déjà été fausse dans ce dépôt (mika#2335 F2a).
+        fn field() -> &'static str {
+            concat!("tool_constraint", "_forced")
+        }
+
+        /// La moitié production de chaque `.rs` sous `src/`, par chemin relatif.
+        ///
+        /// Le masquage est **obligatoire ici et non prudentiel** : le helper
+        /// `ctx_forced` du module voisin pose le drapeau, dans ce même fichier.
+        /// Un scan bâti sur le texte brut compterait donc deux accès dans
+        /// `skills/executor.rs` et serait rouge au jour de sa naissance,
+        /// c'est-à-dire désarmé le lendemain.
+        ///
+        /// [`crate::source_scan::is_test_source_path`] s'ajoute à `KTD3` plutôt
+        /// que de s'y substituer (mika#2335 F2a) : un module de test **extrait**
+        /// ne porte aucun littéral `#[cfg(test)]` — l'attribut reste sur la
+        /// déclaration `mod tests;` du parent — donc le masquage par région ne
+        /// le voit pas. Les deux sites déclarés sont hors de cette classe, la
+        /// double exclusion ne peut donc pas les cacher.
+        ///
+        /// Un fichier illisible **panique** plutôt que d'être sauté :
+        /// `ProductionScanner::production_of` le garantit, et l'anti-vacuité
+        /// ci-dessous compte les fichiers *après* le saut, donc ne le verrait pas.
+        fn production_sources() -> Vec<(String, String)> {
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+            let root: PathBuf = scanner.src_root().to_path_buf();
+            let mut out: Vec<(String, String)> = Vec::new();
+            scanner.for_each(|path: &Path, production: &str| {
+                if crate::source_scan::is_test_source_path(path) {
+                    return;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("chemin sous src/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, production.to_string()));
+            });
+            out
+        }
+
+        /// `(fichier, écritures, lectures)` — le prédicat pur, sans disque.
+        ///
+        /// Deux normalisations, chacune réparant un faux verdict mesuré :
+        ///
+        /// 1. **Commentaires retirés.** Les deux sites portent trois paragraphes
+        ///    de prose sur le champ, et le doc-comment de la déclaration nomme
+        ///    « un seul écrivain / un seul lecteur ». Une prose qui *décrit*
+        ///    l'accès n'en est pas un (forme du signal S, mika#2050).
+        ///
+        /// 2. **Blancs retirés — et c'est la correction porteuse.** Le vrai site
+        ///    d'écriture est reflowé par rustfmt sur deux lignes :
+        ///    `ctx.<champ>` puis `.store(true, …)`. Une aiguille littérale
+        ///    `<champ>.store(` ne le voit donc **pas** : la garde aurait rendu
+        ///    « zéro écrivain » et serait passée pour toujours. Le voisin
+        ///    `mika2305_the_scope_has_a_single_decisional_reader` paie ce piège
+        ///    en maintenant à la main des arms sur une ligne ; en densifiant la
+        ///    source on en est quitte, quel que soit le reflow futur.
+        ///
+        /// Le compte par fichier est ce qui rend l'anti-vacuité portante : sans
+        /// lui, un second `.store(` ajouté dans le fichier déjà déclaré écrivain
+        /// serait indistinguable du premier.
+        fn accesses(sources: &[(String, String)]) -> Vec<(String, usize, usize)> {
+            let field = field();
+            sources
+                .iter()
+                .filter_map(|(rel, src)| {
+                    if !src.contains(field) {
+                        return None;
+                    }
+                    let stripped = crate::source_scan::strip_comment_lines(src);
+                    let dense: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
+                    let writes = dense.matches(&format!("{field}.store(")).count();
+                    let reads = dense.matches(&format!("{field}.load(")).count();
+                    (writes + reads > 0).then(|| (rel.clone(), writes, reads))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn mika2772_le_drapeau_de_forcage_a_un_seul_ecrivain_et_un_seul_lecteur() {
+            let sources = production_sources();
+            assert!(
+                sources.len() > 200,
+                "le scan n'a énuméré que {} fichiers — un scan qui ne scanne rien \
+                 est un laissez-passer vide, pas un arbre propre",
+                sources.len()
+            );
+
+            let sites = accesses(&sources);
+
+            // ANTI-VACUITÉ, et elle porte sur la CARDINALITÉ. Un scan qui vise
+            // un nom mort (champ renommé, site déplacé) rend zéro infraction et
+            // se lit comme un arbre sain.
+            let writer = sites
+                .iter()
+                .find(|(rel, _, _)| rel == WRITE_SITE)
+                .map(|(_, w, r)| (*w, *r));
+            assert_eq!(
+                writer,
+                Some((1, 0)),
+                "l'écrivain déclaré doit porter exactement UNE écriture et AUCUNE \
+                 lecture ; vu {writer:?}. Zéro = la garde vise un nom mort ; plus \
+                 d'une = un second arm pose le drapeau. Sites vus : {sites:?}"
+            );
+
+            let reader = sites
+                .iter()
+                .find(|(rel, _, _)| rel == READ_SITE)
+                .map(|(_, w, r)| (*w, *r));
+            assert_eq!(
+                reader,
+                Some((0, 1)),
+                "le lecteur déclaré doit porter exactement UNE lecture et AUCUNE \
+                 écriture ; vu {reader:?}. Une écriture ici signifie que le \
+                 masquage des régions `cfg(test)` a cessé de couvrir le helper \
+                 du module voisin. Sites vus : {sites:?}"
+            );
+
+            let offenders: Vec<&String> = sites
+                .iter()
+                .filter(|(rel, _, _)| rel.as_str() != WRITE_SITE && rel.as_str() != READ_SITE)
+                .filter(|(rel, _, _)| !FORCED_FLAG_ACCESS_ALLOWLIST.contains(&rel.as_str()))
+                .map(|(rel, _, _)| rel)
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "accès au drapeau de forçage hors de ses deux sites, dans : {offenders:?}\n\
+                 \n\
+                 RÉSOLUTION : retirer le site. Une écriture de plus refuserait des \
+                 dispatchs que personne n'a exigés — le drapeau dirait « ce tour \
+                 avait des outils requis » et non « ce tour a forcé un outil ». \
+                 Ne PAS ajouter d'entrée à `FORCED_FLAG_ACCESS_ALLOWLIST` : on \
+                 retire, on n'allowliste pas (mika#2201)."
+            );
+
+            assert!(
+                FORCED_FLAG_ACCESS_ALLOWLIST.is_empty(),
+                "il n'y a rien à excepter : le drapeau a deux sites et ils sont \
+                 nommés. Une entrée ici est un consentement rouvert."
+            );
+        }
+
+        /// Contrôle de bonne foi : sans lui, « la garde décide » est
+        /// indistinguable de « la garde ne regarde rien ».
+        ///
+        /// Trois sources synthétiques, et la troisième assertion est celle qui
+        /// atteste la densification : elle rejoue le reflow rustfmt du vrai site
+        /// d'écriture et exige que le scan le compte quand même.
+        #[test]
+        fn mika2772_le_scan_du_drapeau_rougit_sur_un_second_site() {
+            let field = field();
+            let synthetic = vec![
+                (
+                    WRITE_SITE.to_string(),
+                    format!(
+                        "                if let Some(ctx) = c {{\n                    ctx.{field}\n                        .store(true, Ordering::Relaxed);\n                }}\n"
+                    ),
+                ),
+                (
+                    "skills/second_ecrivain.rs".to_string(),
+                    format!("    ctx.{field}.store(false, Ordering::Relaxed);\n"),
+                ),
+                (
+                    "prose.rs".to_string(),
+                    format!(
+                        "    /// On ne fait plus `{field}.store(` ici, et on ne\n    /// relit plus `{field}.load(` non plus.\n"
+                    ),
+                ),
+            ];
+
+            let sites = accesses(&synthetic);
+
+            assert!(
+                sites
+                    .iter()
+                    .any(|(rel, w, _)| rel == "skills/second_ecrivain.rs" && *w == 1),
+                "le scan doit accuser un second écrivain : {sites:?}"
+            );
+            assert!(
+                !sites.iter().any(|(rel, _, _)| rel == "prose.rs"),
+                "une prose qui DÉCRIT l'accès n'en est pas un (mika#2050) : {sites:?}"
+            );
+            assert_eq!(
+                sites
+                    .iter()
+                    .find(|(rel, _, _)| rel == WRITE_SITE)
+                    .map(|(_, w, _)| *w),
+                Some(1),
+                "une écriture reflowée par rustfmt sur deux lignes doit compter \
+                 pour une — c'est la forme EXACTE du vrai site : {sites:?}"
             );
         }
     }
