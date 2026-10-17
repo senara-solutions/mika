@@ -283,6 +283,70 @@ pub(crate) fn is_grooming_intent_message(msg: &str) -> bool {
     )
 }
 
+/// Ce dispatch de groom doit-il prouver le consentement du ticket visé ?
+/// (mika#2772)
+///
+/// # Le prédicat n'est pas « le ticket a-t-il `ready` »
+///
+/// Le 2026-10-17 à 08:59:18Z, un `groom` dans le slug `fix/2762/rollback-reaper-groom`
+/// a matché le mot-clé de dev-groom, armé son `required_tools`, et fait groomer
+/// mika#2766 — un ticket sans `ready` et absent du bassin (48 tours, 3,40 $). Le
+/// consentement positif de mika#841 a donc été contourné par une contrainte
+/// d'outil que personne n'avait demandée.
+///
+/// Un gate `ready` aveugle refuserait pourtant un flux réel :
+/// `/mika-groom-ticket` groome légitimement des tickets non promus, sur dispatch
+/// opérateur en texte libre — c'est sa raison d'être (mika#1173). D'où les trois
+/// axes, et pas un seul :
+///
+/// - **la classe** : seul `groom` est concerné. Un `implement` forcé relève
+///   d'une autre question (hors périmètre de mika#2772, cf. § 7 du plan). La
+///   comparaison porte sur la sortie de
+///   `crate::skills::executor::derive_dispatch_class`.
+/// - **le forçage** : `forced` vient de `LongRunningContext::tool_constraint_forced`,
+///   écrit au seul site qui dise au modèle « appelle cet outil » — l'arm de
+///   re-prompt `required_tools` de `run_loop`.
+/// - **la demande** : une intention de grooming explicite rend le dispatch
+///   *demandé*, et le consentement du ticket n'est alors plus la bonne question.
+///
+/// # `intent` arrive **masqué**
+///
+/// L'appelant passe `originating_message` après
+/// `mika_common::github_event_format::mask_cited_branch` (mika#2755/#2768). Sans
+/// ce masque, le slug `fix/2762/rollback-reaper-groom` du texte de l'incident
+/// contient `groom` et un `starts_with` nu lirait l'événement de branche comme
+/// une demande de grooming — c'est-à-dire exactement l'incident, relu comme
+/// consentement. Un test nommé rougit si le masque disparaît du site d'appel.
+pub(crate) fn forced_dispatch_needs_consent(
+    dispatch_class: &str,
+    forced: bool,
+    intent: Option<&str>,
+) -> bool {
+    if dispatch_class != "groom" || !forced {
+        return false;
+    }
+    !intent.is_some_and(is_grooming_intent_message)
+}
+
+/// Ce jeu de labels porte-t-il le consentement positif ? (mika#2772)
+///
+/// Lit [`crate::ready_label::READY_LABEL`] — le label *gouverné*, celui dont
+/// mika#2315 fait de `ready_label.rs` l'écrivain unique — et non le
+/// [`READY_LABEL`] local de ce module, qui nomme le **déclencheur d'événement**
+/// lu par la file webhook. La question posée ici est celle du consentement de
+/// mika#841, pas celle du trigger : les deux constantes portent la même chaîne
+/// aujourd'hui, et c'est précisément pourquoi le site de lecture doit dire
+/// laquelle des deux il interroge.
+///
+/// Comparaison insensible à la casse et tolérante au blanc, comme
+/// [`label_read_by_loop`] : un `Ready` renvoyé par l'API est un consentement.
+pub(crate) fn labels_carry_ready(labels: &[String]) -> bool {
+    labels.iter().any(|l| {
+        l.trim()
+            .eq_ignore_ascii_case(crate::ready_label::READY_LABEL)
+    })
+}
+
 /// Owner applied to a bare `<repo>` reference. The loop only ever operates on
 /// `senara-solutions` repositories; a marker that omits the owner is a gateway
 /// short-form, not an invitation to guess another org.
@@ -2231,5 +2295,125 @@ mod tests {
                  constantes et doivent rendre le même verdict d'appartenance"
             );
         }
+    }
+
+    // ───────── mika#2772 — consentement d'un dispatch forcé ─────────
+
+    /// Le slug de l'incident du 2026-10-17 08:59:18Z. Il porte `groom`, et c'est
+    /// par son mot-clé que `required_tools` s'est armé.
+    const INCIDENT_SLUG: &str = "fix/2762/rollback-reaper-groom";
+
+    /// La matrice de `forced_dispatch_needs_consent` : `(classe, forcé, intention)`
+    /// → le consentement doit-il être prouvé ?
+    ///
+    /// Les trois `false` sont la raison pour laquelle ce n'est pas un gate `ready`
+    /// aveugle : T1 est l'axe de mika#2757 (hors périmètre), T2a le dispatch
+    /// ordinaire, T2b le groom opérateur en texte libre de mika#1173.
+    #[allow(clippy::type_complexity)]
+    const FORCED_CONSENT_MATRIX: &[(&str, bool, Option<&str>, bool, &str)] = &[
+        (
+            "implement",
+            true,
+            None,
+            false,
+            "T1 — un `implement` forcé n'est pas notre axe (mika#2757)",
+        ),
+        (
+            "groom",
+            false,
+            None,
+            false,
+            "T2a — un groom non forcé a été demandé par construction",
+        ),
+        (
+            "groom",
+            true,
+            Some("groom mika#2766"),
+            false,
+            "T2b — le groom opérateur en texte libre de mika#1173 reste permis",
+        ),
+        (
+            "groom",
+            true,
+            None,
+            true,
+            "forcé, et aucun texte d'intention : le consentement doit être prouvé",
+        ),
+    ];
+
+    #[test]
+    fn mika2772_la_matrice_du_consentement_force() {
+        for (class, forced, intent, expected, why) in FORCED_CONSENT_MATRIX {
+            assert_eq!(
+                forced_dispatch_needs_consent(class, *forced, *intent),
+                *expected,
+                "forced_dispatch_needs_consent({class:?}, {forced}, {intent:?}) — {why}"
+            );
+        }
+    }
+
+    /// Le texte d'événement de l'incident n'est **jamais** une demande de groom.
+    ///
+    /// C'est le cas qui pin le § 2.3 du plan : le site d'appel lit l'intention à
+    /// travers `mask_cited_branch` (mika#2755/#2768), et ce test tient les deux
+    /// moitiés de cette décision —
+    ///
+    /// 1. le masque retire bien le slug cité, donc le `groom` qu'il porte ne peut
+    ///    pas atteindre le prédicat d'intention ;
+    /// 2. le verdict est « consentement requis » sur le texte masqué.
+    ///
+    /// La troisième assertion est la lecture **nue**, et elle dit la vérité
+    /// mesurée plutôt que la crainte : `is_grooming_intent_message` est ancré sur
+    /// le DÉBUT du message, donc un slug au milieu d'un texte d'événement ne le
+    /// satisfait pas aujourd'hui, masque ou pas. Le masque est ici une cohérence,
+    /// pas le seul rempart. Ce que les trois ensemble refusent, c'est la dérive
+    /// réaliste : un `is_grooming_intent_message` élargi un jour en recherche de
+    /// sous-chaîne lirait l'incident comme son propre consentement.
+    #[test]
+    fn mika2772_le_texte_devenement_de_lincident_nest_pas_une_demande_de_groom() {
+        let brut = format!(
+            "[GitHub] Check suite success on senara-solutions/mika (branch: {INCIDENT_SLUG})"
+        );
+        let masque = mika_common::github_event_format::mask_cited_branch(&brut);
+
+        assert!(
+            !masque.contains(INCIDENT_SLUG),
+            "le masque doit retirer le slug cité, sinon le `groom` qu'il porte \
+             atteint le prédicat d'intention : {masque:?}"
+        );
+        assert!(
+            forced_dispatch_needs_consent("groom", true, Some(&masque)),
+            "un groom forcé par un événement de branche n'a pas été demandé — \
+             le consentement du ticket visé doit être prouvé"
+        );
+        assert!(
+            forced_dispatch_needs_consent("groom", true, Some(&brut)),
+            "même lu nu, un slug au milieu du texte ne demande pas un groom : \
+             `is_grooming_intent_message` est ancré sur le début du message. Si \
+             cette assertion rougit, le prédicat d'intention est devenu une \
+             recherche de sous-chaîne et désarme la garde dans l'incident exact \
+             qu'elle refuse"
+        );
+    }
+
+    #[test]
+    fn mika2772_labels_carry_ready_lit_le_consentement_positif() {
+        assert!(
+            labels_carry_ready(&["bug".to_string(), "ready".to_string()]),
+            "le label présent est le consentement de mika#841"
+        );
+        assert!(
+            !labels_carry_ready(&["bug".to_string(), "p1-important".to_string()]),
+            "aucun `ready` : pas de consentement"
+        );
+        assert!(
+            labels_carry_ready(&["  Ready ".to_string()]),
+            "la casse et le blanc viennent de l'API, pas de la décision"
+        );
+        assert!(!labels_carry_ready(&[]), "une liste vide ne consent à rien");
+        assert!(
+            !labels_carry_ready(&["ready-to-groom".to_string()]),
+            "la comparaison est sur le label entier, jamais un préfixe"
+        );
     }
 }
