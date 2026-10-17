@@ -14263,6 +14263,96 @@ mod tests {
         assert!(filtered.contains("qa_pr_review"));
     }
 
+    // -- mika#2757 — le test de l'AC : la chaîne complète --
+
+    /// Le message mesuré du 2026-10-17 ≈ 01:01Z, reconstitué sur la forme que
+    /// `mika_gateway::github::format_event_text` émet pour `issues.closed` :
+    /// préfixe, référence, tiret cadratin, titre, puis le corps cité.
+    ///
+    /// **Deux propriétés sont load-bearing, et seules elles.** Le préfixe
+    /// `[GitHub] Issue closed:` met le tour dans le domaine Fallthrough (ni
+    /// ready-label, ni PR, ni check-suite), donc
+    /// `webhook_no_unauthorized_dispatch` y interdit tout dispatch. Et le mot
+    /// `groom` est dans le **corps cité** — ni dans le titre, ni dans un slug de
+    /// branche : le masque du vol 1 (mika#2755,
+    /// `github_event_format::mask_cited_branch`) ne lit que le marqueur
+    /// `(branch: …)` de la première ligne, donc il ne le couvre pas. C'est
+    /// exactement la seconde occurrence que ce vol doit couvrir.
+    const TICKET_2750_CLOSED_MSG: &str = "[GitHub] Issue closed: senara-solutions/mika#2750 — un dispatch ready-label qui échoue\n\nLe dispatch auto-groom s'est interrompu avant d'ouvrir la session.\n";
+
+    /// mika#2757 — l'AC, de bout en bout :
+    /// `match_skills` → `collect_required_tools` → `filter_available_required_tools` → `∅`.
+    ///
+    /// La **première** assertion est ce qui donne sa valeur à la seconde : elle
+    /// situe le correctif. Le mot-clé s'arme toujours — ce vol désarme en aval,
+    /// il n'empêche pas de matcher, et ne touche donc pas au prompt que la skill
+    /// injecte.
+    #[test]
+    fn mika2757_un_tour_fallthrough_citant_groom_narme_aucune_exigence() {
+        // `make_skill_entry_with_constraints` pose `keywords = [name]`, donc une
+        // skill nommée « groom » reproduit le mot-clé de dev-groom sans ajouter
+        // un builder.
+        let skills = vec![make_skill_entry_with_constraints(
+            "groom",
+            30,
+            &[],
+            &["run_claude_pilot_groom"],
+        )];
+
+        let matched = crate::skills::matcher::match_skills(&skills, TICKET_2750_CLOSED_MSG);
+        let required = collect_required_tools(&matched, TICKET_2750_CLOSED_MSG);
+        assert_eq!(
+            required,
+            HashSet::from(["run_claude_pilot_groom".to_string()]),
+            "le mot-clé doit toujours s'armer : le vol désarme, il n'empêche pas de matcher"
+        );
+
+        // L'outil existe et il est servi — la contradiction n'est donc pas une
+        // absence d'outil, c'est le tour qui lui interdit de réussir.
+        let tools = make_registry_with_tool("run_claude_pilot_groom");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        let effective = filter_available_required_tools(&required, &tools, &skill_map, None);
+
+        assert!(
+            effective.is_empty(),
+            "un tour qui interdit le dispatch ne peut pas exiger un outil de dispatch — \
+             exigence effective restée : {effective:?}"
+        );
+    }
+
+    /// Le contrôle négatif humain de l'AC. Sans lui, le test ci-dessus passerait
+    /// aussi sur un désarmement qui désarme tout.
+    #[test]
+    fn mika2757_une_demande_humaine_de_grooming_arme_toujours_loutil() {
+        const HUMAN_MSG: &str = "groom mika#2750";
+
+        let skills = vec![make_skill_entry_with_constraints(
+            "groom",
+            30,
+            &[],
+            &["run_claude_pilot_groom"],
+        )];
+
+        let matched = crate::skills::matcher::match_skills(&skills, HUMAN_MSG);
+        let required = collect_required_tools(&matched, HUMAN_MSG);
+        assert_eq!(
+            required,
+            HashSet::from(["run_claude_pilot_groom".to_string()])
+        );
+
+        let tools = make_registry_with_tool("run_claude_pilot_groom");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        let effective = filter_available_required_tools(&required, &tools, &skill_map, None);
+
+        assert_eq!(
+            effective,
+            HashSet::from(["run_claude_pilot_groom".to_string()]),
+            "une vraie demande humaine doit garder son exigence intacte"
+        );
+    }
+
     #[test]
     fn test_filter_available_required_tools_mixed() {
         // Mix of available (builtin) and unavailable tools — only available kept
