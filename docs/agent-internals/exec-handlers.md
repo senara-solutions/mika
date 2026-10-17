@@ -550,12 +550,20 @@ Surfaces opérateur, régimes attendus, recensement AC4 et les cinq haltes :
 `CLAUDE.md` racine § *Un dispatch ouvert par un événement PR est borné à la lignée de
 cet événement*.
 
-### Une annulation depuis un tour webhook PR ne touche pas un pilote vif (mika#2653, phases A et B)
+### Une annulation ne touche pas un pilote vif, dans aucune classe de tour (mika#2653 phases A et B, mika#2763)
 
-`CancelTaskTool::execute` gagne un terme : dans un tour dont
-l'`originating_message` est un `[GitHub] PR …` ou un `[GitHub] Check suite …`,
-l'annulation d'une tâche dont un pilote est **vif** est refusée — avant toute
-écriture de statut et avant tout signal.
+`CancelTaskTool::execute` porte un terme : l'annulation d'une tâche dont un
+pilote est **vif** est refusée — avant toute écriture de statut et avant tout
+signal.
+
+**Lire cette section dans l'ordre.** mika#2653 a posé la garde pour la seule
+population des tours dont l'`originating_message` est un `[GitHub] PR …` ou un
+`[GitHub] Check suite …`. **mika#2763 a supprimé ce terme de population** : le
+prédicat ne lit plus que la vivacité, dans tout tour qui traverse un
+`ToolContext`. Ce qui suit est l'analyse de mika#2653, conservée parce que
+l'arbitrage de fail-safe et les quatre détecteurs n'ont pas bougé ; le
+§ *Conception* dit ce que mika#2763 a retiré, et le § *Ce que les tests
+attestent* pourquoi.
 
 **Second cas mesuré de la famille mika#2649**, le même jour, et le plus coûteux :
 trace `8ec6364c-be71-11f1-908b-e931f18d2c16`, 2026-10-02, un tour ouvert par une
@@ -680,30 +688,49 @@ commande**.
 
 #### Conception
 
+**Depuis mika#2763 la chaîne a un maillon de moins**, et c'est le correctif :
+
+`live_pilot::live_pilot_for_task` (le verdict, dans son module propriétaire) →
+`tools::cancel_task::classify_cancel_on_live_pilot` (le prédicat pur, **un seul
+paramètre**) → la garde.
+
+La chaîne de mika#2653 commençait par
 `webhook_dispatch::is_webhook_pr_event_domain` (pur) →
-`ToolContext.is_webhook_pr_event_turn` (cinquième booléen, calculé au **seul** site
-de conversation par **appel** du prédicat, `false` aux trois autres sites de
-production) → `live_pilot::live_pilot_for_task` (le verdict, dans son module
-propriétaire) → `tools::cancel_task::classify_cancel_on_live_pilot` (le prédicat
-pur) → la garde.
+`ToolContext.is_webhook_pr_event_turn` (cinquième booléen, calculé au **seul**
+site de conversation, `false` aux vingt autres sites de production), et ce
+premier terme est ce que mika#2763 a retiré. Le défaut qu'il a coûté : un tour
+`deferred_dispatch` **silencieux** pose ce booléen à `false`, donc la garde ne
+s'armait pas, et le 2026-10-17 à 07:59:38Z un tel tour a annulé un callback
+groom vivant de 4 minutes. Le booléen existe toujours ; `cancel_task` n'en est
+plus un lecteur, et `PromoteDeferredCallbackTool::execute` (mika#2654) en est
+désormais le seul en production.
 
-**Le terme de classe de tour est un PARAMÈTRE du prédicat pur**, jamais une
-branche de l'appelant — forme mika#2649 : « hors tour webhook PR, rien ne change »
-devient ainsi une propriété de la fonction, avec son propre test
-(`mika2653_hors_tour_webhook_pr_rien_ne_change`), plutôt qu'un `if` à lire.
+**Il n'y a plus de terme de classe de tour dans le prédicat, et il n'y a pas
+d'`if` de classe de tour au site d'appel non plus.** La forme mika#2649 (le
+terme dans le prédicat pur, jamais une branche de l'appelant) est respectée par
+une voie plus simple : il n'y a qu'un terme, la vivacité. Ce que la fonction
+décide reste une propriété de la fonction, épinglée par
+`mika2763_la_classe_du_tour_nentre_plus_dans_le_predicat`, qui assert que le
+verdict de refus est exactement `!matches!(verdict, LivePilotVerdict::None)`.
 
-**Quatre issues, `match` exhaustif sans bras `_ =>`** : `Allowed` (hors
-population — aucune ligne, aucun audit, doctrine mika#2131),
-`AllowedInPopulation` (le contrôle positif), `RefusedLivePilot`,
-`RefusedUnreadable`.
+**Trois issues, `match` exhaustif sans bras `_ =>`** : `AllowedNoPilot` (le
+contrôle positif — aucun pilote sous la tâche), `RefusedLivePilot`,
+`RefusedUnreadable`. mika#2653 en avait quatre : `Allowed` (hors population) et
+`AllowedInPopulation` ont fusionné, la population hors garde ayant disparu.
+`audit_value()` est devenue **totale** — plus d'`Option` — donc tout appel passé
+par l'outil écrit exactement une ligne d'audit. Les **quatre** `after_value`
+restent quatre : `RefusedUnreadable` en porte deux selon sa cause. Ce sont le
+format de fil, et `complete_task` les importe (mika#2739).
 
 **Placement :** après `AgentScopedTaskId::from_tool_context` et
 `validate_task_exists` (la tâche doit exister et appartenir à l'agent avant qu'on
 parle de son pilote), **avant** `cancel_task_and_kill` — donc avant toute écriture
 de statut et avant tout signal. **Dans l'outil, jamais dans
-`cancel_task_and_kill`** : c'est ce qui préserve les trois chemins opérateur par
-construction plutôt que par prédicat. Le verdict de vivacité n'est résolu que
-**dans la population**, donc le trafic hors population ne paie aucune requête.
+`cancel_task_and_kill`** : c'est ce qui préserve les deux chemins opérateur (CLI,
+HTTP) par construction plutôt que par prédicat — ils ne traversent aucun
+`ToolContext`. Le verdict de vivacité est désormais résolu à **chaque** appel de
+l'outil : une requête par annulation tentée, le prix nommé du retrait du
+pré-filtre.
 
 **L'arbitrage de fail-safe est fail-CLOSED**, l'inverse de la politique propre de
 `live_pilot` pour ses deux appelants existants (mika#2279, qui a délibérément
@@ -740,20 +767,30 @@ choix, sont dans la section racine.
   `error`, qui atterrissent dans `tool_calls.output`).
 - **4 — exclusivité des deux axes** (`webhook_dispatch.rs`), c'est AC5.
 - **5 — la garde d'exécution** : les unités de `classify_cancel_on_live_pilot`
-  avec leur **contrôle négatif hors population** (porteur : sans lui, « la garde
-  décide » est indistinguable de « la garde bloque tout »), plus
+  avec leur **contrôle négatif** — depuis mika#2763 ce n'est plus « hors
+  population », c'est `LivePilotVerdict::None` : sans lui, « la garde décide »
+  est indistinguable de « la garde bloque tout » —, plus
   `tests/eval/test_cancel_task_live_pilot_2653.rs` sur le chemin de production.
 
 #### Ce que les tests attestent, et ce qu'ils ne peuvent pas
 
-Les unités de `classify_cancel_on_live_pilot` restent **vertes** si le champ
-`is_webhook_pr_event_turn` n'est jamais calculé ou jamais lu — et c'est très
-exactement le mode de panne, puisque le booléen est posé à **un** site de
-production et que les dix-neuf autres le mettent à `false`. Seul le fichier eval
-ferme ça. **Vérifié par mutation à la livraison** : en remplaçant l'appel du
-prédicat par `false` au site de conversation, V6a / V6c / V6d rougissent et V6b
-(le contrôle négatif) reste vert — ce qui est la forme attendue et ce qui dit que
-le câblage n'est pas vide.
+**Le mode de panne de mika#2653 n'existe plus, parce que c'est lui qui s'est
+réalisé.** Ses unités restaient vertes si `is_webhook_pr_event_turn` n'était
+jamais calculé ni lu — et le prédicat ne le lisant plus du tout depuis
+mika#2763, cette classe de faux-vert est fermée par construction plutôt que par
+un test. *(Mesure historique, pour mémoire : à la livraison de mika#2653, en
+remplaçant l'appel du prédicat par `false` au site de conversation, V6a / V6c /
+V6d rougissaient et V6b restait vert.)*
+
+**Ce qu'un test unitaire ne peut toujours pas voir** : que le site d'appel
+appelle bel et bien la garde, et sur le bon chemin de tour. C'est le fichier eval
+qui le ferme, et depuis mika#2763 par le tour exact de l'incident — V7
+(`mika2763_un_tour_deferred_dispatch_nannule_pas_un_pilote_vif`) monte un
+`SilentTrigger::DeferredDispatch`, un callback groom à process **réellement
+vivant** rétrodaté de 4 minutes, et vérifie que l'annulation est refusée, que le
+process survit et que la tâche reste `pending`. **Vu rouge avant le correctif**,
+où il reproduisait l'incident : un test qu'on n'a jamais vu rouge n'atteste rien
+(motif `grooming_marker`, mika#2158).
 
 Le pilote des tests eval est un **processus enfant**, jamais celui du binaire de
 test, et la raison est porteuse : le contrôle négatif V6b **traverse**
@@ -876,13 +913,24 @@ atteignable.
 
 **Deux issues et pas trois, contrairement à la sœur.**
 `ForcePromoteTurnDecision { Allowed, RefusedWebhookPrTurn }` n'a **pas** de
-`AllowedInPopulation`. `CancelPilotDecision` en a un parce qu'elle porte un second
-terme — la vivacité d'un pilote — donc « la garde a tourné et a laissé passer » y
-est un état distinct qui doit être compté. Ici le seul terme **est** la classe de
-tour : dans la population, la garde refuse toujours, et un `AllowedInPopulation`
-serait une valeur d'audit que rien n'écrit — une colonne de zéros qui se lit comme
-une population saine. Le contrôle positif de cette garde vit donc **hors du type**,
-dans l'eval AC9 (un tour `[GitHub] Issue …` qui passe).
+variante « la garde a tourné et a laissé passer ». `CancelPilotDecision` en a une
+(`AllowedNoPilot`, nommée `AllowedInPopulation` avant mika#2763) parce qu'elle
+juge la **vivacité d'un pilote** — « aucun pilote sous la tâche » y est un état
+positif distinct qui doit être compté. Ici le seul terme **est** la classe de
+tour : dans la population, la garde refuse toujours, et une variante « autorisé
+dans la population » serait une valeur d'audit que rien n'écrit — une colonne de
+zéros qui se lit comme une population saine. Le contrôle positif de cette garde
+vit donc **hors du type**, dans l'eval AC9 (un tour `[GitHub] Issue …` qui passe).
+
+**Et la divergence s'est creusée avec mika#2763.** `cancel_task` ne lit plus la
+classe du tour du tout, tandis que l'unique terme de cette garde-ci *reste* la
+classe du tour — délibérément, parce que les deux gardes ne répondent pas à la
+même question : « du travail tourne-t-il sous cette tâche ? » contre « cet
+événement m'autorise-t-il à toucher au plan de dispatch ? ». La première porte
+sur un fait de l'hôte et son faux-passage **détruit du travail** ; la seconde
+porte sur l'étendue d'une autorisation et son faux-passage coûte un créneau mal
+attribué, que le moteur réattribue au scan suivant. Cet outil est depuis
+mika#2763 le **seul lecteur production** de `ToolContext.is_webhook_pr_event_turn`.
 
 **Placement :** **après** la validation de `dispatch_class` — une entrée malformée
 lit la même erreur qu'ailleurs, le refus ne la masque pas — et **avant**

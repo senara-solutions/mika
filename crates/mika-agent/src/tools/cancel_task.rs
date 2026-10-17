@@ -1007,14 +1007,16 @@ mod tests {
     /// pilote groom vif, et `cancel_task` appelé **hors** tour webhook PR.
     ///
     /// **Vu rouge avant le correctif** : posé sur le `cancel_task.rs` d'avant,
-    /// le `if ctx.is_webhook_pr_event_turn` du site d'appel écarte la garde,
+    /// où le site d'appel n'armait la garde que sur `ctx.is_webhook_pr_event_turn`,
     /// l'annulation part, `cancel_task_and_kill` SIGTERM le groupe et l'enfant
     /// meurt — c'est l'incident du 2026-10-17 07:59:38Z rejoué. Un test qu'on
     /// n'a jamais vu rouge n'atteste rien (motif `grooming_marker`, mika#2158).
     ///
     /// `harness.ctx()` pose `is_webhook_pr_event_turn: false`, comme les vingt
     /// sites de construction qui ne le calculent pas — dont le site silencieux,
-    /// celui du tour `deferred_dispatch` de l'incident.
+    /// celui du tour `deferred_dispatch` de l'incident. Depuis mika#2763 le
+    /// prédicat ne lit plus ce booléen du tout ; ce test garde la fixture hors
+    /// de l'ancienne population parce que c'est là que le défaut vivait.
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn mika2763_un_pilote_vif_est_refuse_hors_tour_webhook_pr() {
