@@ -1350,11 +1350,10 @@ impl TaskEngine {
             // Reap parent self_dev tasks left in_progress after their callback
             // subtask delivered without producing a PR (#871).
             self.reap_orphaned_parent_tasks("implement").await;
-            // mika#2750 — la seconde classe. Les deux populations sont disjointes
-            // par construction (le prédicat porte sur `child.dispatch_class`), donc
-            // cet ordre ne coûte rien et garde toute l'échelle de réparation
-            // lisible au même endroit.
-            self.reap_orphaned_parent_tasks("groom").await;
+            // mika#2762 — l'appel `reap_orphaned_parent_tasks("groom")` de mika#2750
+            // est retiré : il faisait échouer le parent d'un groom RÉUSSI quand la
+            // place implement était tenue (grâce satisfaite par un enfant livré plus
+            // ancien, lanceur `:deferred` compris). Le correctif complet le rétablit.
 
             // Auto-complete parent self_dev tasks left in_progress after their
             // callback subtask delivered WITH a PR url (mika#1162). Success-side
@@ -4313,11 +4312,17 @@ impl TaskEngine {
     ///
     /// mika#2750: the sweep takes its `dispatch_class`. The two populations are
     /// disjoint by construction (the SQL predicate keys off
-    /// `child.dispatch_class`), so `tick()` calls this twice per scan — once per
-    /// class. The failure motif and the audit-event name both come from
+    /// `child.dispatch_class`), so `tick()` can call this once per class per
+    /// scan. The failure motif and the audit-event name both come from
     /// [`REAPER_CLASS_DISPOSITIONS`]; a class absent from that closed table is
     /// not swept at all, rather than swept under another class's name.
-    async fn reap_orphaned_parent_tasks(&self, dispatch_class: &str) {
+    ///
+    /// mika#2762: `tick()` sweeps `implement` only until the groom predicate is
+    /// fixed. `pub` + `#[doc(hidden)]` only so the mika#2750 integration tests
+    /// keep pinning the `groom` sweep directly in the meantime; outside tests,
+    /// `tick()` is the sole caller.
+    #[doc(hidden)]
+    pub async fn reap_orphaned_parent_tasks(&self, dispatch_class: &str) {
         let Some(&(_, default_fail_reason, audit_tool_name)) = REAPER_CLASS_DISPOSITIONS
             .iter()
             .find(|(class, _, _)| *class == dispatch_class)

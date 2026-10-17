@@ -7,16 +7,17 @@
 //! 2026-10-16 sur mika#2736 (tâche `fef8cd36`, ~6 h, 36 lignes
 //! `auto_feeder_pool_in_flight` la listant sous `stuck` sans aucun remède).
 //!
-//! Chaque test traverse `TaskEngine::tick()` — jamais la faucheuse directement —
-//! parce que le câblage dans la branche `DB_SCAN_INTERVAL_TICKS` fait partie de
-//! ce qui doit rester vrai : une faucheuse correcte mais non appelée se lit
-//! exactement comme une faucheuse qui n'a rien trouvé.
+//! **Rollback mika#2762.** `tick()` ne balaie plus la classe `groom` : le
+//! prédicat faisait échouer le parent d'un groom *réussi* dès que la place
+//! implement était tenue. Les deux tests de la classe `groom` appellent donc
+//! `reap_orphaned_parent_tasks("groom")` **directement** — ils épinglent le
+//! balayage, plus son câblage. La classe `implement` traverse toujours
+//! `tick()`. Quand le correctif complet de mika#2762 rétablit l'appel groom
+//! dans le tick, ces deux tests repassent par `run_one_scan`.
 //!
-//! Recette de vérification par injection (obligatoire) : commenter la ligne
-//! `self.reap_orphaned_parent_tasks("groom").await;` dans `tick()` —
-//! `un_groom_dont_le_callback_a_delivre_quitte_in_progress` doit rougir, les deux
-//! autres rester verts. Restaurer, relancer, les trois repassent au vert. Un test
-//! qui ne rougit pas quand on retire ce qu'il mesure ne mesure rien.
+//! `mika2762_un_groom_reussi_pendant_quune_implementation_tient_la_place_garde_son_parent`
+//! épingle le cas mesuré, à travers `tick()` : rouge tant que le tick balaie
+//! `groom` avec le prédicat actuel.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -204,7 +205,7 @@ async fn un_groom_dont_le_callback_a_delivre_quitte_in_progress() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
-        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = TaskEngine::new(db.clone(), dispatcher);
 
         let parent = seed_groom_scene(&db, "groom", false).await;
 
@@ -216,7 +217,8 @@ async fn un_groom_dont_le_callback_a_delivre_quitte_in_progress() {
             "référence : aucun événement avant la passe"
         );
 
-        run_one_scan(&mut engine).await;
+        // mika#2762 : appel direct, le tick ne balaie plus `groom`.
+        engine.reap_orphaned_parent_tasks("groom").await;
 
         let row = db.get_task(&parent).await.unwrap().unwrap();
         assert_eq!(
@@ -254,11 +256,12 @@ async fn un_groom_dont_le_pilote_vit_encore_ne_bouge_pas() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
-        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = TaskEngine::new(db.clone(), dispatcher);
 
         let parent = seed_groom_scene(&db, "groom", true).await;
 
-        run_one_scan(&mut engine).await;
+        // mika#2762 : appel direct, le tick ne balaie plus `groom`.
+        engine.reap_orphaned_parent_tasks("groom").await;
 
         let row = db.get_task(&parent).await.unwrap().unwrap();
         assert_eq!(
@@ -316,4 +319,121 @@ async fn la_classe_implement_garde_son_motif_mot_pour_mot() {
     })
     .await
     .expect("la_classe_implement_garde_son_motif_mot_pour_mot timed out");
+}
+
+/// **Le cas mesuré de mika#2762** (mika#2752 à 07:37:20Z, mika#2751 à
+/// 07:55:20Z, le 2026-10-17). Un groom vient de livrer son callback avec
+/// succès ; la place implement est tenue par un autre ticket, donc aucun frère
+/// `pending`/`in_progress` n'existe encore. Le lanceur différé
+/// `long_running:run_claude_pilot:deferred` (classe `groom`, livré 11 min plus
+/// tôt quand il a lancé le groom) satisfaisait seul la grâce de 600 s.
+///
+/// Traverse `tick()` à dessein : c'est le câblage qui faisait le dégât. Rouge
+/// sur un tick qui balaie `groom` avec le prédicat de mika#2750, vert après le
+/// rollback — et doit le rester sous le correctif complet.
+#[tokio::test]
+async fn mika2762_un_groom_reussi_pendant_quune_implementation_tient_la_place_garde_son_parent() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let db = test_db().await;
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let groom_child = |parent_id: &str, label: &str| NewTask {
+            agent_id: AGENT_ID.to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 1,
+            label: label.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("eval-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        };
+
+        let parent = db
+            .create_task(NewTask {
+                agent_id: AGENT_ID.to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "suivi ready-label groom mika#2752".to_string(),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("eval-session".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("groom".to_string()),
+            })
+            .await
+            .expect("create ready-label parent");
+        db.update_task_status(&parent, "in_progress")
+            .await
+            .expect("set parent in_progress");
+
+        // T − 11 min : le lanceur différé, livré quand il a lancé le groom.
+        let launcher = db
+            .create_task(groom_child(
+                &parent,
+                "long_running:run_claude_pilot:deferred",
+            ))
+            .await
+            .expect("create deferred launcher");
+        db.update_task_status(&launcher, "delivered")
+            .await
+            .expect("set launcher delivered");
+        db.backdate_task_updated_at(&launcher, 11 * 60)
+            .await
+            .expect("backdate launcher updated_at");
+
+        // T : le callback du groom réussi, livré à l'instant.
+        let groom = db
+            .create_task(groom_child(&parent, "long_running:run_claude_pilot_groom"))
+            .await
+            .expect("create groom callback");
+        db.update_task_status(&groom, "delivered")
+            .await
+            .expect("set groom delivered");
+
+        run_one_scan(&mut engine).await;
+
+        let row = db.get_task(&parent).await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "in_progress",
+            "un groom qui vient de réussir garde son parent : le tour de reprise \
+             n'a pas encore écrit ses callouts (mika#2762)"
+        );
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_EVENT)
+                .await
+                .unwrap(),
+            0,
+            "aucune ligne `groom_parent_orphaned` pour un groom réussi"
+        );
+    })
+    .await
+    .expect("mika2762 timed out");
 }
