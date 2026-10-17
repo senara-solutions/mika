@@ -1,4 +1,4 @@
-//! Le seul site `Command::new("gh")` de la suite `auto_pull` (mika#2713).
+//! Le point de passage unique des spawns `gh` (mika#2713, puis mika#2715).
 //!
 //! # Pourquoi ce module existe
 //!
@@ -37,7 +37,33 @@
 //! `enact_stuck_ready_skip` n'écrit sa ligne d'audit *que si* le commentaire a
 //! été posté, donc `mika2361_the_reentry_comment_is_posted_once_per_abandonment`
 //! dépend d'un `gh` qui réussit.
+//!
+//! # Deux entrées, une seule propriété (mika#2715)
+//!
+//! La couture a **deux** entrées, parce que ses appelants ne lisent pas la même
+//! chose, pas parce qu'il y a deux façons de spawner :
+//!
+//! - [`run_gh`] rend un `io::Result<Output>` — la forme de `output().await`,
+//!   celle que lit la suite `auto_pull` ;
+//! - [`run_gh_tool`] rend un [`ToolOutput`] — la forme que lisent les handlers
+//!   de `skills::builtin_handlers`, et elle délègue la lecture à
+//!   `builtin_handlers::spawn_and_collect`.
+//!
+//! Cette seconde entrée existe parce que la prémisse de mika#2715 (« la couture
+//! rend le même `io::Result<Output>` ») est **fausse** pour ces sites : ils ne
+//! lisent pas la sortie avec `output()`, qui est non bornée, mais avec
+//! `spawn_and_collect`, qui plafonne à `MAX_OUTPUT_LEN`, compte les octets
+//! jetés, tique toutes les 30 s (#900) et préfixe `Exit code: N` — convention
+//! que `tool_execution::has_non_zero_exit_prefix` relit (mika#2237). Les router
+//! par `run_gh` aurait rendu la lecture non bornée : la régression de mika#1746
+//! réintroduite pour fermer une classe qui n'a jamais fui.
+//!
+//! Les deux entrées partagent le **même** double — `run_gh_tool` sous
+//! `#[cfg(test)]` délègue à `run_gh` — donc un seul `CALL_LOG`, un seul
+//! plancher, une seule table de `stdout` canné, et pas deux doubles libres de
+//! divergir.
 
+use crate::tools::ToolOutput;
 use std::process::Output;
 
 /// À quoi l'appel `gh` s'adresse.
@@ -51,15 +77,61 @@ pub(crate) enum GhSubject {
     Issue(u64),
     /// Une pull request, par son numéro.
     ///
-    /// Aucun des huit sites du périmètre de mika#2713 ne s'adresse à une PR
-    /// aujourd'hui ; la variante existe pour que les cinq sites hors périmètre
-    /// (mika#2715) n'aient pas à élargir l'énumération au moment de leur
-    /// conversion, et elle est exercée par les tests de ce module.
-    #[allow(dead_code)]
+    /// Aucun des huit sites du périmètre de mika#2713 ne s'y adressait ; depuis
+    /// mika#2715 elle est construite en production par [`gh_subject_from_argv`]
+    /// et par les trois sites convertis de `skills::builtin_handlers`. Elle
+    /// n'est **pas** gardée par le plancher de fixture : c'est l'issue que
+    /// l'incident a touchée, et une PR n'est pas une issue.
     Pr(u64),
     /// Le dépôt dans son ensemble : une liste, une comparaison de branches, un
     /// `gh api user`. Rien qu'un numéro de fixture puisse atteindre.
     Repo,
+}
+
+/// À quoi un `argv` de `gh` s'adresse, lu depuis l'`argv` lui-même (mika#2715).
+///
+/// `builtin_handlers::run_gh` sert des sous-commandes libres : il n'y a pas de
+/// champ d'entrée structuré où lire le sujet. La règle est volontairement
+/// courte — première position `issue` ou `pr`, puis le premier positionnel
+/// numérique — parce qu'un sujet deviné trop largement **arme** le plancher au
+/// mauvais endroit. Deux conséquences assumées :
+///
+/// - la boucle **s'arrête au premier jeton en `-`**, sinon
+///   `gh issue list --milestone 13` donnerait `Issue(13)` et paniquerait sous
+///   test alors qu'il ne s'adresse à aucune issue ;
+/// - `gh api /repos/o/r/issues/2636/comments` est classé [`GhSubject::Repo`] et
+///   **ne réveille pas** le plancher. Armer le plancher sur un chemin d'API
+///   demande un parseur d'URL, hors périmètre de ce vol ; la classe que le
+///   plancher ferme passe par `issue`/`pr`.
+pub(crate) fn gh_subject_from_argv(args: &[String]) -> GhSubject {
+    let mut it = args.iter();
+    let is_pr = match it.next().map(String::as_str) {
+        Some("issue") => false,
+        Some("pr") => true,
+        _ => return GhSubject::Repo,
+    };
+    for tok in it {
+        if tok.starts_with('-') {
+            break;
+        }
+        // `normalize_pr_identifier` est **le** normaliseur d'identifiant de PR
+        // du crate (mika#2237) : un second ici serait la divergence que
+        // mika#2158 a mesurée. Sur un jeton qui n'est pas une URL de PR il rend
+        // son entrée, donc la boucle continue.
+        let candidate = if is_pr {
+            crate::skills::builtin_handlers::normalize_pr_identifier(tok)
+        } else {
+            tok.as_str()
+        };
+        if let Ok(n) = candidate.parse::<u64>() {
+            return if is_pr {
+                GhSubject::Pr(n)
+            } else {
+                GhSubject::Issue(n)
+            };
+        }
+    }
+    GhSubject::Repo
 }
 
 /// Le boilerplate commun des huit sites, écrit une fois.
@@ -81,6 +153,44 @@ pub(crate) async fn run_gh(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
     cmd.output().await
+}
+
+/// La seconde entrée : le boilerplate des sites qui lisent un [`ToolOutput`].
+///
+/// Elle construit la `Command` — `GH_PROMPT_DISABLED=1`, scrub des `MIKA_*`,
+/// puis `GH_TOKEN` **après** le scrub (#380) — et **délègue** la lecture à
+/// `builtin_handlers::spawn_and_collect` plutôt que de la réimplémenter, pour
+/// les raisons du § *Deux entrées* du module.
+///
+/// `repo` est replié en `--repo <repo>` à la fin de l'`argv` quand il est
+/// `Some` — la forme qu'avaient les trois sites. `gh_read` le replie déjà
+/// par-opération dans `build_gh_read_command` et passe donc `None`.
+#[cfg(not(test))]
+pub(crate) async fn run_gh_tool(
+    token: Option<&str>,
+    _subject: GhSubject,
+    args: &[String],
+    repo: Option<&str>,
+) -> ToolOutput {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(args);
+    if let Some(repo) = repo {
+        cmd.arg("--repo").arg(repo);
+    }
+    cmd.env("GH_PROMPT_DISABLED", "1");
+    crate::skills::executor::scrub_mika_env_vars(&mut cmd);
+
+    // #380 — `scrub_mika_env_vars` retire `GH_TOKEN` (défense en profondeur
+    // contre une fuite de `.env`), donc le jeton de plateforme se réinjecte
+    // APRÈS le scrub. L'ordre est la propriété, pas un détail de style.
+    if let Some(token) = token {
+        // substrate-ok: an env() argument handed to a child process — it never
+        // enters a tool-result `content`, so no tier reads it.
+        cmd.env("GH_TOKEN", token);
+    }
+
+    crate::skills::builtin_handlers::spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?")
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +283,29 @@ pub(crate) async fn run_gh(
     })
 }
 
+/// Le double de la seconde entrée — **il délègue au premier**.
+///
+/// Déléguer plutôt que dupliquer : le journal, le plancher et la table
+/// d'overrides sont ceux de [`run_gh`], donc le plancher ne peut pas être armé
+/// d'un côté et muet de l'autre.
+#[cfg(test)]
+pub(crate) async fn run_gh_tool(
+    token: Option<&str>,
+    subject: GhSubject,
+    args: &[String],
+    repo: Option<&str>,
+) -> ToolOutput {
+    let mut argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Some(repo) = repo {
+        argv.push("--repo");
+        argv.push(repo);
+    }
+    let out = run_gh(token.unwrap_or(""), subject, &argv)
+        .await
+        .expect("le double ne fait aucune I/O : il ne peut pas échouer");
+    ToolOutput::success(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// `exit 0`, sans spawner quoi que ce soit.
 #[cfg(test)]
 fn canned_success() -> std::process::ExitStatus {
@@ -226,28 +359,27 @@ mod tests {
     // L3 — le scan structurel : qui garde le droit de spawner `gh` ?
     // -----------------------------------------------------------------------
 
-    /// Les sites `Command::new("gh")` que mika#2713 laisse **hors** de sa borne,
-    /// par fichier et par compte. Suivi de conversion : **mika#2715**.
+    /// Les sites `Command::new("gh")` encore hors de la couture, par fichier et
+    /// par compte. Suivi de conversion : **mika#2715, vol 2**.
     ///
-    /// Les cinq fonctions concernées, nommées parce qu'un compte ne se relit
+    /// Les deux fonctions concernées, nommées parce qu'un compte ne se relit
     /// pas :
     ///
-    /// - `skills/builtin_handlers.rs` — `gh_read`, `run_gh_pr_view_author_title`,
-    ///   `run_gh` (trois sites) ;
-    /// - `milestone_manager/reader.rs` — `GhRunner::run` (son propre trait, avec
-    ///   son double de test) ;
-    /// - `tools/pr_merge_with_gate.rs` — `run_gh_subprocess` (déjà un point de
-    ///   passage unique).
+    /// - `milestone_manager/reader.rs` — `GhRunner::run`. Elle a son propre
+    ///   trait et huit doubles de test, et `reader.rs:1152` porte une garde
+    ///   d'anti-vacuité qui en dépend : le trait **délègue**, il ne disparaît
+    ///   pas ;
+    /// - `tools/pr_merge_with_gate.rs` — `run_gh_subprocess`, déjà un point de
+    ///   passage unique, avec 26 appelants.
     ///
     /// Aucun n'est atteint par la suite `auto_pull`, et aucun n'a jamais fui.
+    /// Les trois sites de `skills/builtin_handlers.rs` que mika#2713 laissait
+    /// ici sont partis par [`super::run_gh_tool`] (mika#2715, vol 1).
     ///
     /// Le compte, plutôt qu'un numéro de ligne ou un nom de fonction : une ligne
     /// bouge au premier `cargo fmt` et un nom au premier renommage, alors que
-    /// « ce fichier porte exactement trois spawns » reste vrai et reste
-    /// vérifiable. Convertir **un seul** des trois sites de `builtin_handlers.rs`
-    /// fait donc rougir ce test (3 ≠ 2), ce qui est l'effet voulu.
+    /// « ce fichier porte exactement un spawn » reste vrai et reste vérifiable.
     const GH_SPAWN_ALLOWLIST: &[(&str, usize)] = &[
-        ("skills/builtin_handlers.rs", 3),
         ("milestone_manager/reader.rs", 1),
         ("tools/pr_merge_with_gate.rs", 1),
     ];
@@ -277,14 +409,14 @@ mod tests {
             .collect()
     }
 
-    /// AC2, moitié structurelle — **aucun** autre site ne peut spawner `gh`.
+    /// La carte réelle des spawns `gh` du crate, hors couture et hors sources
+    /// de test : `(fichier → compte, lignes fautives)`.
     ///
-    /// L'assertion est une **égalité** avec [`GH_SPAWN_ALLOWLIST`], pas une
-    /// inclusion : quand mika#2715 convertira un site, retirer son entrée
-    /// devient obligatoire, sinon ce test rougit en disant « entrée stale ».
-    /// L'allowlist se nettoie donc elle-même.
-    #[test]
-    fn mika2713_aucun_spawn_gh_hors_la_couture_et_son_allowlist() {
+    /// Isolée du test ci-dessous pour que le contrôle négatif de staleness
+    /// puisse la comparer à une allowlist volontairement périmée — sinon ce
+    /// contrôle porterait sur deux cartes fabriquées, et « l'égalité distingue
+    /// une entrée stale » resterait une tautologie.
+    fn observed_gh_spawn_map() -> (BTreeMap<String, usize>, Vec<String>) {
         let scanner =
             mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
         let src_root = scanner.src_root().to_path_buf();
@@ -314,15 +446,30 @@ mod tests {
             }
         });
 
+        (observed, offender_lines)
+    }
+
+    /// AC2, moitié structurelle — **aucun** autre site ne peut spawner `gh`.
+    ///
+    /// L'assertion est une **égalité** avec [`GH_SPAWN_ALLOWLIST`], pas une
+    /// inclusion : quand un vol convertit un site, retirer son entrée devient
+    /// obligatoire, sinon ce test rougit en disant « entrée stale ».
+    /// L'allowlist se nettoie donc elle-même — mika#2715 vol 1 vient d'en faire
+    /// l'usage, en retirant l'entrée des trois sites de `builtin_handlers.rs`.
+    #[test]
+    fn mika2713_aucun_spawn_gh_hors_la_couture_et_son_allowlist() {
+        let (observed, offender_lines) = observed_gh_spawn_map();
+
         // Non-vacuité : si le scan ne voyait plus rien du tout, l'égalité
         // ci-dessous serait satisfaite par une allowlist vide **et** par un
-        // scan cassé. Tant que mika#2715 n'a pas converti les cinq sites, il
-        // doit en rester.
+        // scan cassé. Tant que mika#2715 vol 2 n'a pas converti les deux sites
+        // restants, il doit en rester.
         assert!(
             !GH_SPAWN_ALLOWLIST.is_empty(),
-            "mika#2713 — l'allowlist est vide : si mika#2715 a bien converti \
-             les cinq sites, supprime cette assertion de non-vacuité en même \
-             temps. Sinon, le scan ne scanne plus rien."
+            "mika#2713 — l'allowlist est vide : si mika#2715 vol 2 a bien \
+             converti `reader.rs` et `pr_merge_with_gate.rs`, supprime cette \
+             assertion de non-vacuité en même temps. Sinon, le scan ne scanne \
+             plus rien."
         );
 
         let expected: BTreeMap<String, usize> = GH_SPAWN_ALLOWLIST
@@ -334,15 +481,53 @@ mod tests {
             observed,
             expected,
             "mika#2713 — la carte des sites `gh` spawnés a changé.\n\
-             Attendu (allowlist, suivi mika#2715) : {expected:?}\n\
+             Attendu (allowlist, suivi mika#2715 vol 2) : {expected:?}\n\
              Observé : {observed:?}\n\
              Sites vus :\n  {}\n\n\
-             Un site EN TROP : route-le par `gh_process::run_gh` — c'est la \
-             couture qui empêche un test d'atteindre la forge réelle (29 \
-             commentaires sur le #2636 fermé). N'ajoute pas d'entrée.\n\
+             Un site EN TROP : route-le par la couture — c'est elle qui \
+             empêche un test d'atteindre la forge réelle (29 commentaires sur \
+             le #2636 fermé). `gh_process::run_gh` si le site lit un \
+             `io::Result<Output>`, `gh_process::run_gh_tool` s'il lit un \
+             `ToolOutput` par `spawn_and_collect`. N'ajoute pas d'entrée.\n\
              Une entrée EN MOINS : le site a été converti, retire son entrée \
              de `GH_SPAWN_ALLOWLIST`.",
             offender_lines.join("\n  ")
+        );
+    }
+
+    /// AC2, contrôle négatif — une entrée **stale** ferait rougir le scan.
+    ///
+    /// C'est la propriété sur laquelle repose tout ce vol : l'entrée des trois
+    /// sites de `builtin_handlers.rs` *devait* partir en même temps que les
+    /// spawns, et rien d'autre que l'égalité ne l'exigeait. Le contrôle le
+    /// mesure sur la carte **réelle** du scan plutôt que sur deux cartes
+    /// fabriquées, et il montre au passage ce qu'une inclusion aurait laissé
+    /// passer.
+    #[test]
+    fn mika2715_une_entree_stale_de_l_allowlist_ferait_rougir_le_scan() {
+        let (observed, _) = observed_gh_spawn_map();
+
+        // L'allowlist telle qu'elle était avant ce vol : les deux entrées
+        // restantes, plus les trois sites qui viennent d'être convertis.
+        let mut stale: BTreeMap<String, usize> = GH_SPAWN_ALLOWLIST
+            .iter()
+            .map(|(p, n)| ((*p).to_string(), *n))
+            .collect();
+        stale.insert("skills/builtin_handlers.rs".to_string(), 3);
+
+        assert_ne!(
+            observed, stale,
+            "mika#2715 — le scan doit distinguer l'allowlist courante de \
+             l'allowlist d'avant la conversion. S'il ne le faisait pas, les \
+             trois sites de `builtin_handlers.rs` auraient pu rester inscrits \
+             après leur conversion, et l'allowlist aurait cessé de dire ce \
+             qu'elle prétend dire."
+        );
+        assert!(
+            observed.iter().all(|(k, v)| stale.get(k) == Some(v)),
+            "et une **inclusion** aurait été satisfaite par cette allowlist \
+             périmée : c'est exactement pourquoi l'assertion du scan est une \
+             égalité. Observé : {observed:?}"
         );
     }
 
@@ -489,14 +674,189 @@ mod tests {
         );
     }
 
-    /// La variante `Pr` existe pour mika#2715 et n'est pas gardée par le
-    /// plancher — une PR n'est pas une issue, et c'est l'issue que l'incident
-    /// a touchée. Pinné pour qu'une conversion future ne croie pas l'inverse.
+    /// La variante `Pr` n'est pas gardée par le plancher — une PR n'est pas une
+    /// issue, et c'est l'issue que l'incident a touchée. Pinné pour qu'une
+    /// conversion future ne croie pas l'inverse.
     #[tokio::test]
     async fn mika2713_le_plancher_garde_l_issue_pas_la_pr() {
         let out = run_gh("t", GhSubject::Pr(2636), &["pr", "view", "2636"])
             .await
             .expect("le double réussit");
         assert!(out.status.success());
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2715 vol 1 — la seconde entrée
+    // -----------------------------------------------------------------------
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// AC5 — le sujet se lit dans l'`argv`, et il se lit **court**.
+    ///
+    /// Le quatrième cas est le piège que la règle évite : `--milestone 13`
+    /// donnerait `Issue(13)` à une lecture naïve, et le plancher ferait
+    /// paniquer un test qui ne s'adresse à aucune issue.
+    #[test]
+    fn mika2715_le_sujet_se_lit_dans_l_argv() {
+        assert_eq!(
+            gh_subject_from_argv(&argv(&["issue", "view", "990123"])),
+            GhSubject::Issue(990_123)
+        );
+        assert_eq!(
+            gh_subject_from_argv(&argv(&["pr", "view", "https://github.com/o/r/pull/990124"])),
+            GhSubject::Pr(990_124),
+            "l'identifiant de PR passe par `normalize_pr_identifier`, pas par \
+             un second normaliseur"
+        );
+        assert_eq!(
+            gh_subject_from_argv(&argv(&["api", "/repos/o/r/issues/2636/comments"])),
+            GhSubject::Repo,
+            "un chemin d'API est classé `Repo` : concession assumée de ce vol, \
+             le plancher ne s'arme pas sur une URL"
+        );
+        assert_eq!(
+            gh_subject_from_argv(&argv(&["issue", "list", "--milestone", "13"])),
+            GhSubject::Repo,
+            "la lecture s'arrête au premier jeton en `-` : `13` est un numéro \
+             de jalon, pas d'issue"
+        );
+        assert_eq!(
+            gh_subject_from_argv(&argv(&["pr", "list"])),
+            GhSubject::Repo
+        );
+        assert_eq!(gh_subject_from_argv(&[]), GhSubject::Repo);
+    }
+
+    /// AC4 — le plancher est armé sur la seconde entrée **aussi**.
+    ///
+    /// C'est la propriété que la délégation achète : il n'y a qu'un plancher,
+    /// donc il ne peut pas être muet d'un côté.
+    #[tokio::test]
+    #[should_panic(expected = "2636")]
+    async fn mika2715_la_seconde_entree_refuse_le_numero_de_l_incident() {
+        let _ = run_gh_tool(
+            Some("t"),
+            GhSubject::Issue(2636),
+            &argv(&["issue", "comment", "2636"]),
+            None,
+        )
+        .await;
+    }
+
+    /// AC6 — **aucun vrai `gh` n'a répondu** par la seconde entrée non plus.
+    ///
+    /// Même argument que `mika2713_aucun_vrai_gh_ne_repond_sous_test` : la
+    /// sous-commande n'existe pas, donc un vrai `gh` rendrait un code non nul,
+    /// que `spawn_and_collect` préfixerait `Exit code:`.
+    #[tokio::test]
+    async fn mika2715_aucun_vrai_gh_ne_repond_par_la_seconde_entree() {
+        let out = run_gh_tool(
+            Some("t"),
+            GhSubject::Repo,
+            &argv(&["mika-2715-sous-commande-inexistante"]),
+            Some("senara-solutions/mika"),
+        )
+        .await;
+
+        assert!(
+            !out.is_error,
+            "le double ne peut pas échouer : {}",
+            out.content
+        );
+        assert_eq!(
+            out.content, "[]",
+            "le `content` est celui du double, pas celui d'un vrai `gh`"
+        );
+        assert!(
+            !crate::tool_execution::has_non_zero_exit_prefix(&out.content),
+            "mika#2237 — la sortie du double ne doit pas se lire comme un \
+             échec : `run_gh` l'utilise pour décider qu'une revue a atterri"
+        );
+
+        // Et le `--repo` est bien replié dans l'`argv` vu par la couture.
+        let vu = recorded_calls()
+            .into_iter()
+            .find(|c| c.args.starts_with("mika-2715-sous-commande-inexistante"))
+            .expect("la seconde entrée enregistre dans le MÊME journal");
+        assert_eq!(
+            vu.args,
+            "mika-2715-sous-commande-inexistante --repo senara-solutions/mika"
+        );
+    }
+
+    /// AC7 — le `stdout` canné est keyed par sujet, et les deux entrées lisent
+    /// la **même** table. Un test qui pose un override le voit par les deux.
+    #[tokio::test]
+    async fn mika2715_le_stdout_canne_est_partage_entre_les_deux_entrees() {
+        let n = FIXTURE_ISSUE_FLOOR + 204;
+        set_canned_stdout(GhSubject::Pr(n), b"{\"isDraft\":true}".to_vec());
+
+        let par_la_seconde = run_gh_tool(
+            Some("t"),
+            GhSubject::Pr(n),
+            &argv(&["pr", "view", &n.to_string()]),
+            None,
+        )
+        .await;
+        assert_eq!(par_la_seconde.content, "{\"isDraft\":true}");
+
+        let par_la_premiere = run_gh("t", GhSubject::Pr(n), &["pr", "view"])
+            .await
+            .expect("double");
+        assert_eq!(
+            par_la_premiere.stdout, b"{\"isDraft\":true}",
+            "une seule table d'overrides, lue par les deux entrées"
+        );
+    }
+
+    /// AC3 — la moitié production **délègue** la lecture, elle ne la réécrit
+    /// pas.
+    ///
+    /// Elle ne peut pas être exécutée ici (`#[cfg(not(test))]`), donc la
+    /// propriété se tient sur la source de ce fichier. Ce qu'on empêche est
+    /// précis : une seconde boucle de lecture, qui perdrait la borne
+    /// `MAX_OUTPUT_LEN` (mika#1746) ou le préfixe `Exit code:` (mika#2237).
+    #[test]
+    fn mika2715_la_moitie_production_delegue_a_spawn_and_collect() {
+        const SOURCE: &str = include_str!("gh_process.rs");
+        let marker = "#[cfg(not(test))]\npub(crate) async fn run_gh_tool(";
+        let start = SOURCE
+            .find(marker)
+            .expect("la moitié production de `run_gh_tool` doit exister ici");
+        let body = &SOURCE[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("la moitié production de `run_gh_tool` doit se fermer");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("spawn_and_collect(cmd,"),
+            "la moitié production doit confier la `Command` à \
+             `builtin_handlers::spawn_and_collect`. Vu :\n{body}"
+        );
+        for reimplemente in ["cmd.spawn()", ".output().await", "MAX_OUTPUT_LEN", ".take("] {
+            assert!(
+                !body.contains(reimplemente),
+                "la moitié production réimplémente la lecture (`{reimplemente}`) \
+                 au lieu de la déléguer : c'est la borne de mika#1746 qui se \
+                 perdrait. Vu :\n{body}"
+            );
+        }
+
+        // L'ordre de #380 : le jeton se réinjecte APRÈS le scrub qui le retire.
+        let scrub = body
+            .find("scrub_mika_env_vars")
+            .expect("le scrub des `MIKA_*` doit y être");
+        let jeton = body
+            .find("cmd.env(\"GH_TOKEN\"")
+            .expect("la réinjection du jeton doit y être");
+        assert!(
+            scrub < jeton,
+            "#380 — `GH_TOKEN` se pose APRÈS `scrub_mika_env_vars`, qui le \
+             retire en défense en profondeur. Inverser l'ordre rend le jeton \
+             absent du processus `gh`."
+        );
     }
 }

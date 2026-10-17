@@ -745,7 +745,14 @@ struct ReaderResult {
 ///
 /// Includes diagnostic instrumentation (#900): per-invocation progress ticker at
 /// 30-second intervals logging stdout/stderr byte counts, plus a completion summary.
-async fn spawn_and_collect(
+///
+/// `pub(crate)` depuis mika#2715 : `gh_process::run_gh_tool` — la couture par
+/// laquelle passent désormais les trois sites `gh` de ce fichier — construit la
+/// `Command` puis **délègue ici** la lecture. Elle reste dans ce fichier plutôt
+/// que de déménager dans la couture parce qu'elle sert aussi `git` et un
+/// troisième outil : la couture est un point de passage pour `gh`, pas le
+/// propriétaire du collecteur.
+pub(crate) async fn spawn_and_collect(
     mut cmd: tokio::process::Command,
     tool_name: &str,
     install_hint: &str,
@@ -1862,6 +1869,31 @@ fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
     }
 }
 
+/// À quoi une opération `gh_read` s'adresse (mika#2715).
+///
+/// Ici l'entrée est **structurée** — `op` + `target` — donc le sujet se lit
+/// dessus plutôt que dans l'`argv` : c'est plus sûr que
+/// `gh_process::gh_subject_from_argv`, qui ne sert que les sous-commandes
+/// libres de `run_gh`. Un `target` qui n'est pas un `u64` (une branche, un nom
+/// de label) n'est pas un numéro : il donne `Repo`.
+fn gh_read_subject(args: &GhReadArgs) -> crate::gh_process::GhSubject {
+    use crate::gh_process::GhSubject;
+    let num = args.target.as_deref().and_then(|t| {
+        if args.op == "pr_view" || args.op == "pr_diff" {
+            normalize_pr_identifier(t).parse::<u64>().ok()
+        } else {
+            t.parse::<u64>().ok()
+        }
+    });
+    match (args.op.as_str(), num) {
+        ("issue_view", Some(n)) => GhSubject::Issue(n),
+        ("pr_view" | "pr_diff", Some(n)) => GhSubject::Pr(n),
+        // `issue_list` et `file_view` s'adressent au dépôt, et un `target`
+        // non numérique est un filtre, pas un numéro.
+        _ => GhSubject::Repo,
+    }
+}
+
 /// Read-only GitHub CLI handler with structured errors.
 ///
 /// Input: `{"op": "issue_view", "target": "123", "repo": "owner/repo"}`
@@ -1878,20 +1910,13 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
     let start = std::time::Instant::now();
     let gh_cmd = build_gh_read_command(&args);
 
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(&gh_cmd);
-    // --repo is now per-op inside build_gh_read_command (file_view uses gh api
-    // which takes repo in the URL path, not as a --repo flag).
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    super::executor::scrub_mika_env_vars(&mut cmd);
-
-    if let Some(token) = ctx.github_token {
-        // substrate-ok: an env() argument handed to a child process — it never
-        // enters a tool-result `content`, so no tier reads it.
-        cmd.env("GH_TOKEN", token);
-    }
-
-    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    // mika#2715 — le spawn passe par la couture `gh_process`. `repo: None` :
+    // `--repo` est déjà replié par-opération dans `build_gh_read_command`
+    // (file_view passe par `gh api`, qui prend le dépôt dans le chemin d'URL et
+    // non en drapeau).
+    let output =
+        crate::gh_process::run_gh_tool(ctx.github_token, gh_read_subject(&args), &gh_cmd, None)
+            .await;
     let latency_ms = start.elapsed().as_millis();
 
     // Compute is_err FIRST so the audit log reflects the content-prefix
@@ -2964,20 +2989,17 @@ async fn fetch_pr_wip_rescue_view(
     repo: Option<&str>,
     ctx: &ToolContext<'_>,
 ) -> Option<PrWipRescueView> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(["pr", "view", pr_num, "--json", "isDraft,labels,commits"]);
-    if let Some(repo) = repo {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    super::executor::scrub_mika_env_vars(&mut cmd);
-    if let Some(token) = ctx.github_token {
-        // substrate-ok: an env() argument handed to a child process — it never
-        // enters a tool-result `content`, so no tier reads it.
-        cmd.env("GH_TOKEN", token);
-    }
-
-    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    let gh_args: Vec<String> = ["pr", "view", pr_num, "--json", "isDraft,labels,commits"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    // mika#2715 — sujet `Pr` quand le numéro se lit, `Repo` sinon (un nom de
+    // branche est un identifiant valide pour `gh pr view`, pas un numéro).
+    let subject = match normalize_pr_identifier(pr_num).parse::<u64>() {
+        Ok(n) => crate::gh_process::GhSubject::Pr(n),
+        Err(_) => crate::gh_process::GhSubject::Repo,
+    };
+    let output = crate::gh_process::run_gh_tool(ctx.github_token, subject, &gh_args, repo).await;
     if output.is_error
         || output.content.starts_with("Exit code:")
         || output.content.starts_with("Killed by signal:")
@@ -5333,29 +5355,14 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         );
     }
 
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(&gh_args.args);
-
-    if let Some(ref repo) = gh_args.repo {
-        cmd.arg("--repo").arg(repo);
-    }
-
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    super::executor::scrub_mika_env_vars(&mut cmd);
-
-    // Inject platform GitHub token for agent identity separation AFTER scrub.
-    // scrub_mika_env_vars removes GH_TOKEN (defense-in-depth against .env leak),
-    // so we must re-add the correct platform token here. See #380.
-    if let Some(token) = ctx.github_token {
-        // substrate-ok: an env() argument handed to a child process — it never
-        // enters a tool-result `content`, so no tier reads it.
-        cmd.env("GH_TOKEN", token);
-    }
-
     // Diagnostic instrumentation (#900): log the exact gh subcommand, env key set
     // (keys only, never values), and token presence for timeout forensics.
     // substrate-ok: env-var NAMES for a tracing field (keys only, never values) —
     // this array reaches the log, never a tool-result `content`.
+    //
+    // mika#2715 — l'événement reste **au site** et non dans la couture : il lit
+    // `ctx.session_id`/`ctx.github_token`, que `gh_process` ne connaît pas. Les
+    // clés qu'il nomme sont celles que la couture pose, dans l'ordre de #380.
     let env_keys_set: &[&str] = match ctx.github_token {
         Some(_) => &["GH_PROMPT_DISABLED", "GH_TOKEN"],
         None => &["GH_PROMPT_DISABLED"],
@@ -5369,7 +5376,16 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         "run_gh invocation"
     );
 
-    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    // mika#2715 — le spawn passe par la couture. Le sujet se lit dans l'`argv`,
+    // parce que `run_gh` sert des sous-commandes libres : il n'y a pas de champ
+    // d'entrée structuré où le lire.
+    let output = crate::gh_process::run_gh_tool(
+        ctx.github_token,
+        crate::gh_process::gh_subject_from_argv(&gh_args.args),
+        &gh_args.args,
+        gh_args.repo.as_deref(),
+    )
+    .await;
 
     // On success, record that a PR review was posted (both per-turn and session-scoped).
     //
