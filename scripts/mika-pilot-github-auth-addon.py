@@ -179,7 +179,15 @@ _DENY_REGISTRY = "registry-unreadable"
 # and the value is not the kind of thing a site needs to differ on.
 _REGISTRY_TTL_SECONDS = 72 * 3600
 _PURGE_MIN_INTERVAL_SECONDS = 600
-_last_purge: float | None = None
+
+# One throttle PER directory, not one for the whole process. `_purge_registry`
+# takes its directory as an argument, so a single global clock means the first
+# directory purged in a window starves every other one until the window closes
+# -- and the registry read on the next request is the starved one as often as
+# not. With a dict the throttle keeps its purpose (no scandir per request) and
+# loses the coupling between two registries that have nothing to do with each
+# other (mika#2751 § 2.5).
+_last_purge: dict[str, float] = {}
 
 # Three reasons, three bodies. Their causes are OPPOSITE — absent is the
 # `cargo test` that cleared GH_TOKEN (the mika#2713 substrate), unknown is an
@@ -318,12 +326,17 @@ def _purge_registry(directory: Path) -> None:
     propagated would read as an unreadable registry and refuse a legitimate
     pilot. The throttle uses a monotonic clock, so a host clock step cannot
     stall it forever.
+
+    The throttle is keyed by the directory, never global: this addon purges
+    more than one registry, and a global clock would let the first one purged
+    in a ten-minute window keep every other one stale for the rest of it.
     """
-    global _last_purge
+    key = str(directory)
     now_mono = time.monotonic()
-    if _last_purge is not None and now_mono - _last_purge < _PURGE_MIN_INTERVAL_SECONDS:
+    last = _last_purge.get(key)
+    if last is not None and now_mono - last < _PURGE_MIN_INTERVAL_SECONDS:
         return
-    _last_purge = now_mono
+    _last_purge[key] = now_mono
     cutoff = time.time() - _REGISTRY_TTL_SECONDS
     try:
         entries = list(os.scandir(directory))
