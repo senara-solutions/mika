@@ -139,6 +139,43 @@
 //! **Périmètre : les tours webhook.** L'émission n'a lieu que là où
 //! `original_github_text` est `Some`, c'est-à-dire `req.channel == "github"`.
 //! Telegram et les tours silencieux restent hors registre.
+//!
+//! # (e) `closed`/`merged` d'une PR sans tâche de boucle (mika#2680, vol 3)
+//!
+//! AC2 de mika#2675 excluait `closed`/`merged` du filtre **par principe**. Le
+//! ticket a demandé de le rouvrir avec preuve, et la preuve est venue : n=2,
+//! 193 k puis 279 k tokens d'entrée pour un tour déclenché par le merge d'une
+//! PR qui ne portait aucune tâche de boucle. (e) est la jumelle de (a) —
+//! déclencheur dans le texte, un seul terme d'état, fenêtre de texte la plus
+//! stricte.
+//!
+//! **Ce que (e) lit, et ce qu'elle refuse de relire.** Du texte : l'URL de la
+//! PR, par l'extracteur de `upstream_close_handler` — jamais une troisième
+//! copie du scanner, parce que cette URL est la clé de `pr_has_active_task` et
+//! que deux lectures qui dérivent, ce sont deux populations de tours qui ne se
+//! soustraient plus. De l'état : `pr_has_active_task` et rien d'autre. Pas
+//! `Merged:`, pas l'état forge, pas les refs de clôture : la vérité du merge et
+//! la clôture du ticket appartiennent aux handlers structurels, qui tournent
+//! **avant** cette porte — écarter le tour ne leur retire rien. Une URL
+//! inextractible ou une lecture en erreur rendent le tour (AC3).
+//!
+//! **Le coût accepté, nommé plutôt que passé sous silence.** Le tour
+//! `PR closed` ne faisait pas *rien* : comme tout tour, il pouvait écrire de la
+//! mémoire et toucher le fil de priorités. Trois raisons de l'accepter ici,
+//! quand la classe (h) du ticket le refuse : l'opérateur a rangé (e) du côté à
+//! implémenter à n=2 ; un merge de PR est rare et déjà entièrement tracé en
+//! base par `upstream_close_handler`, là où un `issue_comment` porte du texte
+//! humain neuf ; et le geste est réversible — `MIKA_WEBHOOK_PREFILTER` désarme
+//! le filtre entier, et chaque tour écarté écrit sa classe, donc
+//! `skipped_by_class` chiffrera (e) dès la première fenêtre mesurée et l'écart
+//! avec les 193 k / 279 k attendus sera lisible plutôt que perdu.
+//!
+//! **Pourquoi la mesure 3 ne la conditionne pas.** Le critère d'acceptation du
+//! ticket existe pour *soustraire ce qu'une classe déjà livrée écarte*. Aucune
+//! classe de (a) à (d) ne touche le déclencheur `pr_closed` : son
+//! `skipped_by_class` ne peut être qu'un seau vide, et une soustraction par zéro
+//! n'informe rien. (g) est au contraire bloquée par cette mesure, parce que son
+//! déclencheur est exactement celui que (b) traite.
 
 use tracing::{info, warn};
 
@@ -213,6 +250,10 @@ pub(crate) enum PrefilterClass {
     CiFailureSurfacedForAdoption,
     /// (c) `check_suite` rouge d'une PR dont la tâche n'est pas `in_progress`.
     CiFailureTaskNotInProgress,
+    /// (e) `closed` ou `merged` d'une PR sans tâche de boucle active
+    /// (mika#2680). Mesurée à n=2 : 193 k puis 279 k tokens d'entrée pour un
+    /// tour qui n'avait rien à décider.
+    PrClosedNoLoopTask,
 }
 
 impl PrefilterClass {
@@ -229,6 +270,7 @@ impl PrefilterClass {
             Self::CiFailureNoOpenPr => "ci_failure_no_open_pr",
             Self::CiFailureSurfacedForAdoption => "ci_failure_surfaced_for_adoption",
             Self::CiFailureTaskNotInProgress => "ci_failure_task_not_in_progress",
+            Self::PrClosedNoLoopTask => "pr_closed_no_loop_task",
         }
     }
 }
@@ -286,6 +328,13 @@ pub(crate) enum Candidate {
     /// (c) toute revue portant une ligne `VERDICT:`. Le verdict n'est
     /// écarté qu'au terme de [`decide`].
     ReviewVerdict(ReviewVerdictFacts),
+    /// (e) `closed` ou `merged` d'une PR dont l'URL est lisible (mika#2680).
+    /// L'URL est le seul champ : c'est la clé de `pr_has_active_task`, et
+    /// relire `Merged:` reviendrait à redériver une vérité qui appartient aux
+    /// handlers structurels. Écartée au terme de [`decide`].
+    PrClosedNoTask {
+        pr_url: String,
+    },
 }
 
 /// Fonction pure : classe le texte du gateway. `None` = hors population, le
@@ -331,6 +380,15 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
             pr_number: event.pr_number,
             pr_url,
         }));
+    }
+    if text.starts_with(PR_CLOSED_EVENT_PREFIX) {
+        // L'URL est l'unique terme de texte, et elle est obligatoire : un
+        // événement dont on ne sait pas de quelle PR il parle n'est pas un
+        // candidat, il est un tour (fail-safe, AC3 de mika#2675). Le gateway
+        // interpole `""` quand `html_url` manque, donc ce cas est une forme de
+        // production, pas une forme de synthèse.
+        return crate::server::upstream_close_handler::extract_pr_url(text)
+            .map(|pr_url| Candidate::PrClosedNoTask { pr_url });
     }
     match classify_event(text) {
         WebhookEventKind::IssueLabeled { repo, issue, label }
@@ -581,6 +639,7 @@ pub(crate) async fn decide(candidate: Candidate, state: &impl PrefilterState) ->
             target: format!("issue:{repo}#{issue}"),
         },
         Candidate::ReviewVerdict(facts) => decide_review_verdict(facts, state).await,
+        Candidate::PrClosedNoTask { pr_url } => decide_pr_closed(pr_url, state).await,
     }
 }
 
@@ -676,6 +735,24 @@ async fn decide_review_verdict(facts: ReviewVerdictFacts, state: &impl Prefilter
     Decision::Skip { class, target }
 }
 
+/// (e) : un seul terme d'état, `pr_has_active_task`, lu par la même porte que
+/// (c) revue. Rien d'autre n'est consulté — ni `Merged:` dans le texte, ni
+/// l'état forge, ni les refs de clôture : la clôture de ticket et la mémoire
+/// passent par les handlers structurels, qui tournent AVANT le pré-filtre et à
+/// qui écarter un tour ne retire rien. Une lecture en erreur laisse passer
+/// (AC3).
+async fn decide_pr_closed(pr_url: String, state: &impl PrefilterState) -> Decision {
+    let target = format!("pr_closed:{pr_url}");
+    match state.pr_has_active_task(&pr_url).await {
+        Ok(false) => Decision::Skip {
+            class: PrefilterClass::PrClosedNoLoopTask,
+            target,
+        },
+        Ok(true) => Decision::Llm,
+        Err(e) => state_unreadable("pr_has_active_task", &target, &e),
+    }
+}
+
 /// L'interrupteur est-il armé ? Lu à chaque événement.
 pub(crate) fn prefilter_enabled() -> bool {
     crate::qa_head_supersession::parse_switch(
@@ -712,9 +789,13 @@ impl Touched {
             Candidate::RedDefaultBranch { .. } | Candidate::RedPrBranch { .. } => {
                 self.outside_ci_failure_handler
             }
-            Candidate::GreenDefaultBranch { .. } | Candidate::InertLabel { .. } => {
-                self.by_any_handler
-            }
+            // (e) rejoint la fenêtre la plus stricte : la seule chose que (e)
+            // lit dans le texte est l'URL de la PR, donc tout handler qui a
+            // réécrit ce texte a pu réécrire la ligne qui porte la clé de
+            // `pr_has_active_task` (mika#2680).
+            Candidate::GreenDefaultBranch { .. }
+            | Candidate::InertLabel { .. }
+            | Candidate::PrClosedNoTask { .. } => self.by_any_handler,
         }
     }
 }
@@ -922,6 +1003,7 @@ impl Candidate {
             Self::RedPrBranch { .. } => "red_pr_branch",
             Self::InertLabel { .. } => "inert_label",
             Self::ReviewVerdict(_) => "review_verdict",
+            Self::PrClosedNoTask { .. } => "pr_closed_no_task",
         }
     }
 }
@@ -981,6 +1063,18 @@ pub(crate) mod tests {
 
     const GREEN_MAIN: &str = "[GitHub] Check suite success on senara-solutions/mika (branch: main)";
     const INERT: &str = "[GitHub] Issue labeled p1-important on senara-solutions/mika#2675 — fix(webhooks): pré-filtre\nhttps://github.com/senara-solutions/mika/issues/2675\nLabeled by: @samidarko";
+
+    /// (e) le gabarit réel du gateway pour `pull_request` (`github.rs`, bras
+    /// `pull_request`) : l'URL de la PR est en **deuxième** ligne, et `closed`
+    /// ajoute une troisième ligne `Merged: <bool>`. La classe (e) ne relit pas
+    /// ce booléen — `closed` et `merged` sont le même événement pour elle, et
+    /// la vérité du merge appartient aux handlers.
+    const PR_CLOSED: &str = "[GitHub] PR closed: senara-solutions/mika#2679 — fix(webhooks): x (branch: fix/2679/x)\nhttps://github.com/senara-solutions/mika/pull/2679\nMerged: true";
+    const PR_CLOSED_URL: &str = "https://github.com/senara-solutions/mika/pull/2679";
+    /// Même gabarit, `html_url` absent : le gateway interpole `""`, donc la
+    /// deuxième ligne est vide. Forme de production, pas forme de synthèse.
+    const PR_CLOSED_SANS_URL: &str =
+        "[GitHub] PR closed: senara-solutions/mika#2679 — t (branch: x)\n\nMerged: true";
 
     fn labeled(label: &str) -> String {
         format!("[GitHub] Issue labeled {label} on senara-solutions/mika#2675 — t\nhttps://x")
@@ -1224,6 +1318,10 @@ pub(crate) mod tests {
         assert_eq!(
             CI_FAILURE_NO_ACTION_TASK_NOT_IN_PROGRESS,
             "task_not_in_progress"
+        );
+        assert_eq!(
+            PrefilterClass::PrClosedNoLoopTask.as_str(),
+            "pr_closed_no_loop_task"
         );
     }
 
@@ -2089,6 +2187,7 @@ pub(crate) mod tests {
             (RED_MAIN, "red_default_branch"),
             (RED_PR, "red_pr_branch"),
             (INERT, "inert_label"),
+            (PR_CLOSED, "pr_closed_no_task"),
         ] {
             assert_eq!(classify(texte).unwrap().as_str(), nom, "{texte:?}");
         }
@@ -2101,11 +2200,13 @@ pub(crate) mod tests {
 
         // Hors population : aucun candidat, donc aucun champ à écrire. Chacun
         // de ces tours a pourtant un `trigger`, et c'est tout l'intérêt —
-        // `issue_comment` est 79 % de la fenêtre mesurée le 2026-10-08.
+        // `issue_comment` est 79 % de la fenêtre mesurée le 2026-10-08. Le
+        // `PR closed` sans URL en fait partie depuis mika#2680 : la classe (e)
+        // ne sait pas de quelle PR il parle, donc elle n'en est pas candidate.
         for texte in [
             "[GitHub] New comment on senara-solutions/mika#2654 (t) by @samidarko",
             "[GitHub] Issue closed: senara-solutions/mika#2294 — t",
-            "[GitHub] PR closed: senara-solutions/mika#2679 — t (branch: x)\nMerged: true",
+            PR_CLOSED_SANS_URL,
         ] {
             assert!(classify(texte).is_none(), "{texte:?}");
             assert_ne!(trigger_class(texte), TriggerClass::Other, "{texte:?}");
@@ -2137,5 +2238,120 @@ pub(crate) mod tests {
         assert_eq!(TriggerClass::IssueComment.as_str(), "issue_comment");
         assert_eq!(TriggerClass::Push.as_str(), "push");
         assert_eq!(TriggerClass::Other.as_str(), "other");
+    }
+
+    // ---- vol 3 — classe (e) : `PR closed` sans tâche de boucle -----------
+    //
+    // Les textes de cette section sont ceux que le gateway délivre réellement,
+    // URL en deuxième ligne et `Merged:` en troisième.
+
+    /// (e) terme de texte : l'URL de la PR, et elle seule. Le `Merged: true`
+    /// présent dans le gabarit n'est PAS lu — la vérité du merge appartient aux
+    /// handlers structurels, qui tournent avant cette porte.
+    #[test]
+    fn mika2680_e_classify_rend_lurl_de_la_pr() {
+        assert_eq!(
+            classify(PR_CLOSED),
+            Some(Candidate::PrClosedNoTask {
+                pr_url: PR_CLOSED_URL.into()
+            })
+        );
+    }
+
+    /// (e) sans URL extractible, l'événement n'est pas un candidat : on ne sait
+    /// pas de quelle PR il parle, donc le tour a lieu (fail-safe, AC3). Les
+    /// trois formes viennent du même extracteur
+    /// (`upstream_close_handler::extract_pr_url`) : ligne vide quand le gateway
+    /// interpole un `html_url` absent, mauvais segment, numéro manquant.
+    #[test]
+    fn mika2680_e_sans_url_extractible_le_tour_a_lieu() {
+        for texte in [
+            PR_CLOSED_SANS_URL,
+            "[GitHub] PR closed: senara-solutions/mika#2679 — t (branch: x)\nhttps://github.com/senara-solutions/mika/issues/2679\nMerged: true",
+            "[GitHub] PR closed: senara-solutions/mika#2679 — t (branch: x)\nhttps://github.com/senara-solutions/mika/pull/\nMerged: true",
+        ] {
+            assert_eq!(classify(texte), None, "{texte:?}");
+        }
+    }
+
+    /// (e) voisinage : `PR_OPENED_EVENT_PREFIX` et `PR_CLOSED_EVENT_PREFIX`
+    /// partagent leur tête `[GitHub] PR `, et un `PR opened` porte la même URL
+    /// en deuxième ligne. Il ne rend pas cette variante — ni aucune autre :
+    /// `PR opened` est 536 k tokens de la fenêtre mesurée, et il garde son tour.
+    #[test]
+    fn mika2680_e_un_pr_opened_ne_rend_pas_cette_variante() {
+        let ouvert = format!(
+            "{PR_OPENED_EVENT_PREFIX} senara-solutions/mika#2679 — t (branch: x)\n{PR_CLOSED_URL}"
+        );
+        assert!(ouvert.starts_with(PR_EVENT_PREFIX), "{ouvert:?}");
+        assert_eq!(classify(&ouvert), None, "{ouvert:?}");
+    }
+
+    /// (e) prend la fenêtre de texte la plus STRICTE, et le test le vérifie au
+    /// lieu de le supposer : avec `by_any_handler` seul armé et les trois autres
+    /// fenêtres à `false`, le candidat s'applique quand même — donc c'est bien
+    /// `by_any_handler` qu'il lit. Un texte réécrit par un handler a pu
+    /// réécrire la ligne qui porte la clé de `pr_has_active_task`.
+    #[test]
+    fn mika2680_e_tout_handler_qui_a_touche_le_texte_rend_le_tour() {
+        let c = classify(PR_CLOSED).unwrap();
+        let strict = Touched {
+            by_any_handler: true,
+            after_verdict_handler: false,
+            outside_ci_success_handler: false,
+            outside_ci_failure_handler: false,
+        };
+        assert!(strict.applies_to(&c), "{c:?}");
+        let intact = Touched {
+            by_any_handler: false,
+            after_verdict_handler: true,
+            outside_ci_success_handler: true,
+            outside_ci_failure_handler: true,
+        };
+        assert!(!intact.applies_to(&c), "{c:?}");
+    }
+
+    /// (e) terme d'état : `pr_has_active_task`, et lui seul. Le bouchon laisse
+    /// `pr_state`, `event_rows` et `holds` à `None` — ils paniquent s'ils sont
+    /// consultés, donc ce test tient aussi « (e) ne redérive rien ».
+    ///
+    /// Le contrôle négatif de la même graine est
+    /// [`mika2680_e_une_tache_active_garde_son_tour`] : la leçon mika#2277 est
+    /// qu'une batterie uniquement positive est satisfaite par un filtre qui
+    /// écarte tout.
+    #[tokio::test]
+    async fn mika2680_e_sans_tache_active_le_tour_est_ecarte() {
+        assert_eq!(
+            decide(classify(PR_CLOSED).unwrap(), &pr(Ok(false))).await,
+            Decision::Skip {
+                class: PrefilterClass::PrClosedNoLoopTask,
+                target: format!("pr_closed:{PR_CLOSED_URL}"),
+            }
+        );
+    }
+
+    /// Contrôle négatif de [`mika2680_e_sans_tache_active_le_tour_est_ecarte`] :
+    /// même texte, même bouchon, **seul l'état diffère**. Une tâche de boucle
+    /// active sur cette PR est exactement ce que le modèle doit prendre en
+    /// compte : le tour a lieu.
+    #[tokio::test]
+    async fn mika2680_e_une_tache_active_garde_son_tour() {
+        assert_eq!(
+            decide(classify(PR_CLOSED).unwrap(), &pr(Ok(true))).await,
+            Decision::Llm
+        );
+    }
+
+    /// (e) fail-safe (AC3 de mika#2675) : une lecture d'état en erreur rend le
+    /// tour. La raison est nommée dans le fil sous
+    /// `webhook_prefilter_state_unreadable` avec `what = "pr_has_active_task"` —
+    /// le nom de la porte consultée, pas celui de la classe, pour qu'un grep
+    /// d'opérateur distingue cette lecture de celle de (c) revue (`pr_task`).
+    #[tokio::test]
+    async fn mika2680_e_un_etat_illisible_rend_le_tour() {
+        assert_eq!(
+            decide(classify(PR_CLOSED).unwrap(), &pr(Err("db down"))).await,
+            Decision::Llm
+        );
     }
 }

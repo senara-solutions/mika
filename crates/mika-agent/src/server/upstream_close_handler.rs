@@ -418,7 +418,14 @@ fn extract_issue_url(text: &str) -> Option<String> {
 
 /// Extract the first GitHub PR URL from the webhook message text.
 /// Scans lines for `https://github.com/<owner>/<repo>/pull/<number>`.
-fn extract_pr_url(text: &str) -> Option<String> {
+///
+/// `pub(crate)` depuis mika#2680 : la classe (e) du pré-filtre webhook
+/// ([`crate::server::webhook_prefilter::classify`]) lit la même URL sur le même
+/// gabarit de gateway, et une quatrième copie de ce scanner serait une
+/// quatrième chance de divergence — c'est l'URL qui sert de clé à
+/// `pr_has_active_task`, donc deux lectures qui dérivent, ce sont deux
+/// populations de tours qui ne se soustraient plus.
+pub(crate) fn extract_pr_url(text: &str) -> Option<String> {
     extract_github_url_with_segment(text, "pull")
 }
 

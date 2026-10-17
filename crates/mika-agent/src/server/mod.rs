@@ -5832,8 +5832,12 @@ mod tests {
             format!("[GitHub] PR synchronize: {pr}"),
             format!("[GitHub] PR ready_for_review: {pr}"),
             format!("[GitHub] PR review_requested: {pr}\nRequested reviewer: @mika-platform-qa"),
-            format!("[GitHub] PR closed: {pr}\nMerged: false"),
-            format!("[GitHub] PR closed: {pr}\nMerged: true"),
+            // Les deux `PR closed` sont sortis de cette liste avec mika#2680 :
+            // AC2 de mika#2675 les tenait légitimes PAR PRINCIPE, la classe (e)
+            // les mesure à n=2 (193 k puis 279 k tokens pour un tour sans
+            // tâche). Ils ont leurs propres tests, de part et d'autre de la
+            // seule chose qui les sépare désormais — une tâche de boucle active
+            // (`mika2680_e_*`, plus bas).
             // Les `check_suite` ROUGES sur `main` sont sorties de cette liste
             // avec mika#2683 : elles ont leur propre classe, et leurs propres
             // tests (`mika2683_a_*`).
@@ -5867,6 +5871,40 @@ mod tests {
             "[GitHub] PR review (approved) on senara-solutions/mika#2680 (t) by @mika-platform-qa\nhttps://github.com/senara-solutions/mika/pull/2680#pullrequestreview-1\n\nVERDICT: pass",
         )
         .await;
+        assert!(mock.calls_made() >= 1);
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    // ---- mika#2680 vol 3 — classe (e) -------------------------------------
+    //
+    // Le chemin réel complet, là où les assertions inline de
+    // `webhook_prefilter` bouchonnent l'état : ici c'est `LiveState` qui lit
+    // `pr_has_active_task` en base. Les deux tests partagent leur texte et ne
+    // diffèrent que par la présence de la tâche.
+
+    const MIKA2680_PR_CLOSED: &str = "[GitHub] PR closed: senara-solutions/mika#2680 — fix(x): y (branch: fix/2675/x)\nhttps://github.com/senara-solutions/mika/pull/2680\nMerged: true";
+
+    /// (e) — `merged` sans tâche de boucle : zéro appel LLM, une ligne d'écart.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_e_pr_mergee_sans_tache_aucun_appel_llm() {
+        let (calls, skipped) = mika2675_run(MIKA2680_PR_CLOSED).await;
+        assert_eq!(calls, 0, "aucun tour");
+        assert_eq!(skipped, 1, "une ligne d'écart");
+    }
+
+    /// Contrôle négatif du précédent : même texte, et la tâche de boucle qui
+    /// porte cette PR. Le tour a lieu, aucune ligne d'écart.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_e_pr_mergee_avec_tache_le_tour_a_lieu() {
+        let (state, mock) = mika2675_state();
+        mika2675_seed_task(
+            &state,
+            r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/2680"}}"#,
+        )
+        .await;
+        mika2675_run_on(&state, MIKA2680_PR_CLOSED).await;
         assert!(mock.calls_made() >= 1);
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
     }

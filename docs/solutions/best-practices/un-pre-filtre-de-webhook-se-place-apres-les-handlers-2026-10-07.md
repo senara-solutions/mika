@@ -150,6 +150,22 @@ Phase 1 : (a) `check_suite` verte sur `main`, (d) label inerte.
 Phase 2 (livrée) : (c) `pr_review` non actionnable sans tâche. Phase 3 : (b) `check_suite` verte sur
 une PR déjà décidée et notifiée pour cette tête — le SHA n'est pas dans le texte
 du gateway ; la décision vit dans `ci_success_handler` après `find_open_pr`.
+Phase 4 (mika#2680) : vol 1 l'instrument, vol 2 le lecteur, vol 3 la classe
+**(e)** `closed`/`merged` d'une PR sans tâche de boucle.
+
+Les cinq classes en service, et le terme d'état que chacune lit :
+
+| classe | nom de fil (`skipped_by_class`) | déclencheur | le terme d'état lu |
+|---|---|---|---|
+| (a) | `green_check_suite_default_branch` | `check_suite` verte sur `main` | aucun — le texte suffit |
+| (b) | `green_check_suite_head_decided` | `check_suite` verte sur branche de PR | l'attestation `ci_success_handler_decision_core_hold` (4 termes) |
+| (c) | `verdict_*`, `ci_failure_*` | `pr_review` | `find_active_task_by_pr_url`, puis la forge en dernier |
+| (d) | `inert_label` | `issues labeled` | aucun — l'ensemble des labels lus est composé en code |
+| **(e)** | **`pr_closed_no_loop_task`** | **`PR closed` / `merged`** | **`pr_has_active_task`, et rien d'autre** |
+
+Ces noms sont des clés de `GROUP BY` dans toutes les sondes ci-dessous. Les
+renommer casse une population, jamais un test ; `mika2675_valeurs_daudit_format_de_fil`
+les épingle pour cette raison.
 
 ## Phase 3 : une décision n'est filtrable que si une trace l'atteste, tête et notification comprises
 
@@ -362,3 +378,81 @@ formes présentes, et **zéro** en local sur la suite complète — les 6 246 te
 étalent l'ordonnancement, un `cargo test -- mika2675 mika2680 mika2683` le
 concentre et sort les quatre à coup sûr. Une suite filtrée est donc un
 instrument, pas un raccourci.
+
+## Phase 4, vol 3 : la classe (e), et la propriété qui l'autorise
+
+AC2 de mika#2675 excluait `closed`/`merged` du filtre **par principe**. Le vol 3
+l'implémente comme classe **(e)** `pr_closed_no_loop_task`. Ce qui a changé n'est
+pas le chiffre — n=2, 193 k puis 279 k tokens d'entrée pour un tour déclenché par
+le merge d'une PR sans tâche de boucle — c'est la lecture de ce principe.
+
+**Le principe disait l'inverse de la propriété de ce module.** « Un `closed` peut
+avoir une suite » est vrai, et c'est précisément pourquoi écarter le **tour** ne
+coûte rien : la suite en question est le travail d'un handler, et le filtre vit
+*après* les handlers. Sur un `PR closed`, ce travail a un seul site —
+`upstream_close_handler::try_handle_upstream_close` (mika#1934 AC4), qui
+termine les lignes de suivi laissées `blocked`/`in_progress`. Il est
+**side-effect-only** par contrat : les trois autres bras de son `VerdictAction`
+sont des `unreachable!`, il n'enrichit jamais le texte, ne rend jamais `Handled`
+ni `Dispatched`. Quand la porte décide, ce nettoyage **a déjà eu lieu**.
+
+Généralisation, et c'est la phrase à retenir du module entier : **une classe
+exclue « parce que l'événement a une suite » demande qu'on nomme le site de cette
+suite, puis qu'on regarde s'il tourne avant la porte.** S'il tourne avant,
+l'exclusion protège un tour LLM, pas la suite. AC2 protégeait un tour.
+
+**Un terme de texte, un terme d'état, la fenêtre la plus stricte.** (e) est la
+jumelle de (a) par sa forme :
+
+- *texte* — l'URL de la PR, et elle seule. Lue par
+  `upstream_close_handler::extract_pr_url`, promu `pub(crate)` plutôt que
+  recopié : cette URL est la **clé** de `pr_has_active_task`, donc deux lectures
+  qui dérivent sont deux populations de tours qui ne se soustraient plus. C'est
+  le motif du § *La jointure* ci-dessus, appliqué à un extracteur.
+- *état* — `pr_has_active_task`, et rien d'autre. Pas la ligne `Merged:` que le
+  gateway ajoute, pas l'état forge, pas les refs de clôture : la vérité du merge
+  et la clôture du ticket appartiennent aux handlers structurels. Pour (e),
+  `closed` et `merged` sont le même événement. Relire ce booléen serait redériver
+  une vérité qui ne lui appartient pas.
+- *fenêtre* — `by_any_handler`, la plus stricte des quatre. Non par prudence
+  rituelle : la seule chose que (e) lit dans le texte est l'URL, donc **tout**
+  handler qui a réécrit ce texte a pu réécrire la ligne qui porte la clé.
+- *fail-safe (AC3)* — URL inextractible ou lecture en erreur ⇒ le tour a lieu,
+  sous `webhook_prefilter_state_unreadable` avec `what = "pr_has_active_task"`.
+  Ce `what` diffère du `pr_task` de (c) à dessein : deux lectures d'état, deux
+  noms, deux greps séparables.
+
+**Deux prémisses de tests existants ont été amendées, pas exceptées.** Les deux
+`PR closed` de `mika2675_evenements_legitimes_le_tour_a_lieu` encodaient AC2 et
+sont sortis de cette liste ; ils ont désormais leurs propres tests, de part et
+d'autre de la seule chose qui les sépare — une tâche de boucle active. Un test
+qui rougit parce qu'une décision a changé se réécrit avec la décision ; l'excepter
+aurait laissé dans la suite une assertion qui dit le contraire du code.
+
+Contrôle négatif aux deux niveaux (leçon mika#2277) : même texte, même bouchon,
+seul l'état diffère — en unitaire sur `decide`, et de bout en bout sur
+`LiveState`. Une batterie purement positive est satisfaite par un filtre qui
+écarte tout.
+
+Sonde de la classe (e) :
+
+```sql
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'webhook_prefilter_skipped'
+   AND after_value = 'pr_closed_no_loop_task';
+```
+
+**Halte.** Zéro écart ne prouve rien tant qu'une PR a été fermée ou mergée
+**sans** tâche de boucle active depuis le déploiement — un merge de PR est rare,
+et c'est le coût accepté de cette classe : la population est petite, donc la
+sonde est lente à parler. Le contrôle négatif est `grep
+webhook_prefilter_state_unreadable` avec `what = "pr_has_active_task"` : non vide
+en continu signifie que l'état n'est jamais lisible, donc que la classe est
+inerte et ne compte rien.
+
+**Ce que le vol 3 ne fait pas, et pourquoi chaque raison est différente.** (f) est
+un résidu renvoyé à la mesure, (g) est bloquée par elle, (h) est posée à
+l'opérateur. Le tableau des quatre raisons est au § 9 de
+`docs/eval/mika-2680/README.md` ; le § 2 bis du même fichier dit pourquoi aucune
+session dispatchée ne peut exécuter cette mesure — le journal n'est pas dans le
+jeu de binds du bac à sable, et c'est une décision de mika#2165, pas un oubli.
