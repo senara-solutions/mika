@@ -14989,4 +14989,256 @@ Harness ticket.
             );
         }
     }
+
+    // ---- mika#2772 : le consentement d'un dispatch de groom forcé ----
+    //
+    // Un test par terme du prédicat, et le contrôle négatif de chacun : c'est la
+    // paire qui sépare « la garde discrimine » de « la garde refuse tout ».
+    //
+    // Les arms qui exigent une **vraie lecture de label** ne sont pas testés
+    // ici, pour la raison écrite au site : la lecture demande réseau + token. Ce
+    // sont les deux prédicats purs de `webhook_dispatch`
+    // (`forced_dispatch_needs_consent`, `labels_carry_ready`) qui portent la
+    // décision, et leurs tests qui les tiennent — c'est le partage, pas un trou.
+    //
+    // **Les SEPT portent `#[serial_test::serial]`, pas seulement celui qui pose
+    // la variable.** Le levier de désarmement est lu dans le process env, donc
+    // le test qui le pose empoisonne tout voisin qui atteint la même lecture —
+    // mesuré ici : `…_un_sujet_non_resolu_…` a rendu `Allowed` au premier
+    // passage, désarmé par un voisin. `#[serial]` ne sérialise que contre ses
+    // propres porteurs, donc annoter le seul poseur laisse la course entière
+    // ouverte (la moitié porteuse de mika#2646, et la leçon de mika#2073).
+    //
+    // Et sept suffisent — le reste du crate n'est pas une population de
+    // poisonnés, par **lecture** et non par prudence : la lecture du levier est
+    // placée APRÈS le court-circuit du forçage, et aucun autre test ne pose
+    // `tool_constraint_forced`. Un test de dispatch voisin n'atteint donc jamais
+    // `std::env::var(FORCED_CONSENT_ENV)`, quelle que soit la fenêtre.
+    mod mika2772_consentement_force {
+        use super::*;
+
+        /// Le texte d'événement **mesuré** du 2026-10-17 08:59:18Z : c'est le
+        /// `groom` dans le slug cité qui a armé la contrainte d'outil.
+        const INCIDENT_EVENT: &str = "[GitHub] Check suite success on senara-solutions/mika \
+                                      (branch: fix/2762/rollback-reaper-groom)";
+
+        /// Le ticket que le dispatch de 08:59 a groomé sans que personne l'ait
+        /// promu.
+        const INCIDENT_SUBJECT: &str = "mika#2766";
+
+        fn ctx_forced(msg: Option<&str>, forced: bool) -> LongRunningContext {
+            let db = crate::db::Database::open_in_memory().unwrap();
+            let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+            let ctx = make_lr_ctx_with_msg(async_db, msg.map(str::to_string));
+            ctx.tool_constraint_forced.store(forced, Ordering::Relaxed);
+            ctx
+        }
+
+        /// Le JSON de refus, décodé. Un refus qui ne se parse pas n'est pas
+        /// lisible par le modèle.
+        fn refusal(verdict: ForcedDispatchConsent) -> serde_json::Value {
+            match verdict {
+                ForcedDispatchConsent::Refused(json) => {
+                    serde_json::from_str(&json).unwrap_or_else(|e| {
+                        panic!("le refus doit être du JSON lisible : {e} — {json}")
+                    })
+                }
+                ForcedDispatchConsent::Allowed => {
+                    panic!("attendu un refus, la garde a laissé passer")
+                }
+            }
+        }
+
+        /// **Le refus nominal : la forme exacte de l'incident.**
+        ///
+        /// Un `groom` forcé par `required_tools`, sur un texte d'intention qui
+        /// n'est pas une demande de grooming, visant un ticket que rien n'a
+        /// promu. C'est le dispatch de 08:59:18Z — 48 tours, 3,40 $ — et il doit
+        /// être refusé **avant** tout spawn.
+        ///
+        /// Le verdict ici est `forced_dispatch_consent_no_token` et non le
+        /// nominal `forced_dispatch_without_consent`, parce que ce test ne donne
+        /// pas de token : il tient le **fail-closed**, qui est la propriété que
+        /// l'incident réclamait. Les deux arms sont des refus, et le refus est ce
+        /// qui comptait.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_force_et_non_demande_sur_ticket_sans_ready_est_refuse() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(
+                json["subject"].as_str(),
+                Some("senara-solutions/mika#2766"),
+                "le refus doit nommer le ticket visé, qualifié par son owner"
+            );
+
+            // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+            // jugé. Les deux gestes de reprise, chacun vérifié.
+            let recovery = json["recovery"].as_str().expect("un refus nomme sa levée");
+            assert!(
+                recovery.contains("`ready`"),
+                "la reprise doit nommer le label de promotion : {recovery}"
+            );
+            assert!(
+                recovery.contains("mika ask --agent mika-dev"),
+                "la reprise doit nommer le groom opérateur de mika#1173 : {recovery}"
+            );
+        }
+
+        /// **mika#1173 intact — T2b.**
+        ///
+        /// Le même ticket non promu, la même contrainte armée : seul le texte
+        /// d'intention change. `groom mika#2766` est une demande, et un groom
+        /// *demandé* sur un ticket non promu est la raison d'être de
+        /// `/mika-groom-ticket`. Sans ce contrôle, « la garde discrimine » serait
+        /// indistinguable de « la garde refuse tout ».
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_demande_sur_ticket_sans_ready_passe() {
+            let ctx = ctx_forced(Some("groom mika#2766"), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "un groom demandé en texte libre doit traverser cette porte (mika#1173)"
+            );
+        }
+
+        /// **T2a — le forçage est le prédicat, pas la classe.**
+        ///
+        /// Même texte d'événement, même ticket non promu, contrainte d'outil
+        /// **non** armée : le dispatch passe. C'est ce qui empêche la garde de
+        /// devenir le gate `ready` aveugle que le ticket refuse explicitement.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_non_force_passe() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), false);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "sans forçage il n'y a rien à consentir : le drapeau est le prédicat"
+            );
+        }
+
+        /// **T1 — l'axe de mika#2757 n'est pas le nôtre.**
+        ///
+        /// Un `implement` forcé sort de la population **avant toute ligne de
+        /// journal** : la sonde de D5 compte des dispatchs de groom, pas des
+        /// tours. L'élargissement à `implement` est nommé hors périmètre par le
+        /// plan ; ce test est ce qui rend l'élargissement visible le jour où
+        /// quelqu'un le tente.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_dispatch_implement_force_passe() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-pilot", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "la classe `implement` n'est pas dans la population de mika#2772"
+            );
+        }
+
+        /// **Fail-closed, verdict distinct : le sujet illisible.**
+        ///
+        /// Le prompt ne nomme aucun `<repo>#<number>`, donc le ticket dont il
+        /// faudrait prouver le consentement n'est pas identifiable. La garde
+        /// refuse quand elle ne peut pas lire sa preuve, et le dit **sous son
+        /// propre nom** — un refus qui emprunte le nom du refus nominal rend la
+        /// sonde de V6 illisible (mika#2205).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_sujet_non_resolu_est_refuse_sous_son_propre_nom() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", "groom the rollback reaper", "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(
+                json["error"].as_str(),
+                Some(FORCED_CONSENT_SUBJECT_UNRESOLVED)
+            );
+            assert!(
+                json["subject"].is_null(),
+                "un sujet non résolu se rend `null`, jamais `\"\"` : absent n'est pas \
+                 zéro (mika#2331) — vu {}",
+                json["subject"]
+            );
+        }
+
+        /// **Fail-closed, verdict distinct : le token absent.**
+        ///
+        /// Le sujet est lisible, mais aucun token n'a atteint la garde : le label
+        /// `ready` ne peut pas être lu. Cause distincte, nom distinct, et le
+        /// sujet est tout de même nommé — c'est ce qui sépare « on n'a pas pu
+        /// regarder » de « le prompt ne disait pas quoi regarder ».
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_token_absent_est_refuse_sous_son_propre_nom() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", "senara-solutions/mika#2766", "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(json["error"].as_str(), Some(FORCED_CONSENT_NO_TOKEN));
+            assert_eq!(
+                json["subject"].as_str(),
+                Some("senara-solutions/mika#2766"),
+                "le sujet est lu : c'est la lecture du label qui manque"
+            );
+            assert_ne!(
+                FORCED_CONSENT_NO_TOKEN, FORCED_CONSENT_SUBJECT_UNRESOLVED,
+                "deux causes sous un nom ne sont pas soustractibles (mika#2205)"
+            );
+        }
+
+        /// **Le levier opérateur rend `Allowed` — et il le dit.**
+        ///
+        /// `MIKA_FORCED_DISPATCH_CONSENT=0` désarme la garde, et la ligne
+        /// `forced_dispatch_consent` est émise quand même, avec le verdict
+        /// `allowed_disarmed` : un désarmement muet serait indiscernable d'une
+        /// garde absente (mika#2293).
+        ///
+        /// `#[serial_test::serial]` et non un prédicat pur, parce que le test
+        /// doit montrer que le **levier traverse la garde** et pas seulement
+        /// qu'une chaîne se parse. Le variable est process-wide : sa pose ne
+        /// serait pas sûre en parallèle, et aucun autre test de ce dépôt ne la
+        /// lit (`grep MIKA_FORCED_DISPATCH_CONSENT`). Le contrôle négatif est
+        /// dans le même test, après restauration : le refus doit revenir, sinon
+        /// c'est l'entrée qui passait, pas le levier qui désarmait.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_le_levier_de_desarmement_rend_allowed_et_le_dit() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            // SAFETY: test sérialisé, et cette variable n'a aucun autre lecteur
+            // dans le dépôt.
+            unsafe { std::env::set_var(FORCED_CONSENT_ENV, "0") };
+            let disarmed = validate_forced_dispatch_consent(&ctx, None, Some(&input)).await;
+            unsafe { std::env::remove_var(FORCED_CONSENT_ENV) };
+
+            assert_eq!(
+                disarmed,
+                ForcedDispatchConsent::Allowed,
+                "`{FORCED_CONSENT_ENV}=0` doit désarmer la garde"
+            );
+
+            assert!(
+                matches!(
+                    validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                    ForcedDispatchConsent::Refused(_)
+                ),
+                "armée par défaut : sans le levier, la même entrée est refusée — \
+                 sinon ce test mesure l'entrée et non le levier"
+            );
+        }
+    }
 }
