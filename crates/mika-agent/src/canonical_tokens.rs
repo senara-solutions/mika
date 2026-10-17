@@ -2439,6 +2439,148 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2757 — un seul corps énumère la paire d'outils de dispatch.
+    //
+    // Voisin du garde mika#2517 ci-dessus, et sur son modèle exact : même
+    // corpus de scan, même anti-vacuité, même allowlist née vide. Les deux
+    // gardent le même domaine par deux bouts — celui-là la définition du
+    // domaine, celui-ci l'ensemble d'outils que le domaine retire.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Population mesurée après D2 : **zéro** site. Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction (mika#2323).
+    /// Quand le scan tire, on fait passer le site par
+    /// `webhook_dispatch::is_dispatch_tool` — on ne l'allowliste pas (doctrine
+    /// mika#2201).
+    const DISPATCH_PAIR_PREDICATE_ALLOWED: &[&str] = &[];
+
+    /// La forme du prédicat, **pas le littéral** — et c'est tout l'arbitrage.
+    ///
+    /// Le littéral nu `run_claude_pilot` apparaît dans dix-sept fichiers de
+    /// production pour des raisons parfaitement légitimes (libellés de tâches,
+    /// allowlists de skills, fixtures de calibration) : un scan sur le littéral
+    /// serait faux la plupart du temps, et son allowlist serait un alibi plutôt
+    /// qu'une exception. La forme `name == "run_claude_pilot"` n'est, elle,
+    /// écrite que par un site qui *décide* — et elle apparaissait sept fois avant
+    /// D2, toutes dans `agent_loop/mod.rs`, zéro après.
+    ///
+    /// Le guillemet fermant fait partie de l'aiguille : sans lui,
+    /// `name == "run_claude_pilot_groom"` serait accusé par lecture de préfixe,
+    /// et un garde qui rougit sur du code sain est un garde qu'on désarme.
+    ///
+    /// Composée à l'exécution par prudence. `production_sources_to_test_module`
+    /// coupe déjà ce module de test, donc ce fichier ne peut pas s'auto-accuser
+    /// aujourd'hui ; la composition fait que cela reste vrai si le corpus
+    /// s'élargit un jour.
+    fn dispatch_pair_predicate_needle() -> String {
+        format!("name == {q}run_claude_pilot{q}", q = '"')
+    }
+
+    /// Les lignes (1-indexées) de `src` qui posent la paire de dispatch à la main.
+    ///
+    /// **Extraite pour pouvoir être exercée sur une chaîne fabriquée.** Le scan
+    /// réel attend `∅`, et un détecteur dont le résultat attendu est le vide ne
+    /// se distingue pas d'un détecteur mort (mika#2103 / mika#2205) : le test
+    /// d'anti-vacuité plus bas est ce qui atteste que l'aiguille vise encore
+    /// quelque chose.
+    ///
+    /// Les lignes de commentaire sont écartées : de la prose *à propos* du
+    /// prédicat n'est pas un prédicat, et les doc-comments de ce ticket en
+    /// portent plusieurs paragraphes (la forme du Signal S, mika#2050).
+    fn dispatch_pair_predicate_sites(src: &str) -> Vec<usize> {
+        let needle = dispatch_pair_predicate_needle();
+        src.lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+            })
+            .filter(|(_, l)| l.contains(&needle))
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// **La paire d'outils de dispatch n'est énumérée qu'à un endroit
+    /// (mika#2757 D7).**
+    ///
+    /// Aucun test comportemental ne peut voir cette classe. Un huitième site qui
+    /// recopie la disjonction ne rend **aucune décision fausse le jour où il est
+    /// écrit** ; il diverge plus tard, en silence, avec toutes les assertions
+    /// vertes — et pour cette paire-là, diverger veut dire *une porte de dispatch
+    /// restée ouverte*. mika#1173 est le précédent exact : donner son propre
+    /// outil à dev-groom a obligé à visiter sept prédicats à la main, et un oubli
+    /// y aurait été invisible. La classe est celle de `grooming_marker`
+    /// (mika#2158).
+    #[test]
+    fn mika2757_the_dispatch_pair_has_a_single_enumeration() {
+        let mut offenders: Vec<(String, Vec<usize>)> = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if DISPATCH_PAIR_PREDICATE_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            let sites = dispatch_pair_predicate_sites(&content);
+            if !sites.is_empty() {
+                offenders.push((rel, sites));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2757 — la paire d'outils de dispatch est ré-énumérée à la main : \
+             {offenders:?}\n\n\
+             RÉSOLUTION : appeler `webhook_dispatch::is_dispatch_tool(name)` — le \
+             site de définition unique de la paire. Pour un `retain` qui a besoin \
+             de la liste elle-même, lire `webhook_dispatch::DISPATCH_TOOLS`. Ne PAS \
+             ajouter d'entrée à DISPATCH_PAIR_PREDICATE_ALLOWED : un second \
+             énumérateur ne rend aucune décision fausse le jour où il est écrit, il \
+             la rend fausse le jour où un troisième outil de dispatch apparaît."
+        );
+    }
+
+    /// L'anti-vacuité, et c'est un **livrable** plutôt qu'une précaution.
+    ///
+    /// Le scan ci-dessus attend le vide. Sans ce test, une aiguille qui ne vise
+    /// plus rien — parce que la forme du prédicat a changé, parce qu'un `rustfmt`
+    /// a cassé la ligne en deux — se lirait exactement comme un dépôt propre.
+    ///
+    /// L'extrait fabriqué porte aussi les deux formes que le détecteur doit
+    /// **refuser** : la citation en commentaire et la variante `_groom`.
+    #[test]
+    fn mika2757_the_dispatch_pair_scan_reddens_on_a_fabricated_site() {
+        let needle = dispatch_pair_predicate_needle();
+        let snippet = format!(
+            "// un commentaire qui cite s.{needle} et n'est pas un prédicat\n\
+             fn fabrique(s: &ToolCallSummary) -> bool {{\n\
+             \x20   s.{needle}\n\
+             \x20       || s.name == {q}run_claude_pilot_groom{q}\n\
+             }}\n",
+            q = '"'
+        );
+
+        assert_eq!(
+            dispatch_pair_predicate_sites(&snippet),
+            vec![3],
+            "le détecteur doit accuser la ligne 3 et elle seule : la ligne 1 est \
+             un commentaire, la ligne 4 porte la variante `_groom` que le \
+             guillemet fermant de l'aiguille exclut"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2757_the_dispatch_pair_allowlist_is_empty() {
+        assert!(
+            DISPATCH_PAIR_PREDICATE_ALLOWED.is_empty(),
+            "DISPATCH_PAIR_PREDICATE_ALLOWED est livrée vide et doit le rester : \
+             quand le scan tire, on fait passer le site par \
+             `webhook_dispatch::is_dispatch_tool`. Une allowlist née vide est un \
+             emplacement où déposer la prochaine infraction (mika#2323)."
+        );
+    }
+
     /// **Livrée vide, et le test plus bas l'assert.**
     const FALLTHROUGH_TURN_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
 
