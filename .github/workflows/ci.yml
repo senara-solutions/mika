@@ -108,6 +108,9 @@ jobs:
       - name: Handler crash-step naming + trap placement (mika#2532)
         run: make test-handler-crash-step
 
+      - name: Webhook-turn register reader — the turn is a SUM (mika#2680)
+        run: make test-measure-webhook-turn-cost
+
       # mika#2578, une troisième fois : `make test-egress-push-bound` existait
       # dans le Makefile depuis mika#2736 et aucun fichier de `.github/` ne
       # l'appelait, donc les douze cas de la borne `git-receive-pack`
