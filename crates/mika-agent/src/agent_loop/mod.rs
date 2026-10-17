@@ -2229,6 +2229,25 @@ async fn run_loop(
                                 // Fall through — let the response proceed to the next guard.
                             } else {
                                 required_tools_retry_done = true;
+                                // mika#2772 — ce re-prompt EST le forçage : il est le
+                                // seul site du moteur qui dise au modèle « appelle cet
+                                // outil ». Un dispatch qui part après lui dans le même
+                                // tour n'a pas été demandé, il a été exigé.
+                                //
+                                // Les deux arms au-dessus ne l'écrivent pas, et c'est
+                                // le cœur de la précision du drapeau : l'early-accept
+                                // `has_successful_pr_review` (#821) et l'accept
+                                // `has_terminal_required_tool_failure` (#516)
+                                // *relâchent* la contrainte, ils ne la forcent pas.
+                                //
+                                // `Relaxed` suffit : le drapeau est écrit et lu dans
+                                // le même tour, sur le même objet, et aucun ordre
+                                // inter-champ n'est à garantir — même raisonnement que
+                                // `dispatch_count`.
+                                if let Some(ctx) = long_running_ctx {
+                                    ctx.tool_constraint_forced
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 let missing_names: Vec<&str> =
                                     missing.iter().map(|s| s.as_str()).collect();
                                 warn!(
