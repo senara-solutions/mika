@@ -14519,6 +14519,150 @@ mod tests {
         );
     }
 
+    // -- mika#2757 — les cinq cas du désarmement, au site du désarmement --
+    //
+    // D6 (ci-dessus) mesure la chaîne entière, donc il ne peut pas dire *quelle*
+    // branche a retiré l'outil. Ces cinq cas interrogent la fonction seule, et
+    // c'est là que se lit la frontière : les deux premiers désarment, les trois
+    // derniers ne désarment pas, et chacun de ces trois-là est une raison
+    // différente de ne pas désarmer — un outil qui n'est pas de dispatch, un tour
+    // qui n'est pas dans le domaine, un tour où le dispatch est l'ordre même.
+
+    /// Cas 1 — la forme mesurée : un outil de dispatch servi, sur un tour du
+    /// domaine Fallthrough. Branche 3, `reason = "turn_forbids_dispatch"`.
+    #[test]
+    fn mika2757_cas1_un_outil_de_dispatch_est_desarme_sur_un_tour_fallthrough() {
+        let tools = make_registry_with_tool("run_claude_pilot_groom");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let required: HashSet<String> = ["run_claude_pilot_groom".to_string()].into();
+
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_claude_pilot_groom"]),
+            TICKET_2750_CLOSED_MSG,
+        );
+
+        assert!(
+            effective.is_empty(),
+            "l'outil est servi, mais ce tour interdit qu'il réussisse — \
+             exigence restée : {effective:?}"
+        );
+    }
+
+    /// Cas 2 — le contrôle négatif humain. Même outil, même registre, même
+    /// tableau servi : seul le message change, et il suffit à ne rien désarmer.
+    #[test]
+    fn mika2757_cas2_la_meme_exigence_survit_a_une_demande_humaine() {
+        let tools = make_registry_with_tool("run_claude_pilot_groom");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let required: HashSet<String> = ["run_claude_pilot_groom".to_string()].into();
+
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_claude_pilot_groom"]),
+            "groom mika#2750",
+        );
+
+        assert_eq!(
+            effective,
+            HashSet::from(["run_claude_pilot_groom".to_string()]),
+            "hors domaine webhook, le tour n'interdit rien"
+        );
+    }
+
+    /// Cas 3 — la branche 2, celle que la branche 1 ne peut pas voir : l'outil
+    /// **existe** dans le registre et n'est pourtant pas dans le tableau servi.
+    /// C'est la forme que produisent les quatre couches de retrait (denylist
+    /// d'identité, `FALLTHROUGH_WITHHELD_TOOLS`, `filter_ci_excluded_tools`,
+    /// filtre provider compact). `reason = "not_served"`, et ce n'est pas un
+    /// défaut de configuration.
+    #[test]
+    fn mika2757_cas3_un_outil_existant_mais_non_servi_est_desarme() {
+        let tools = make_registry_with_tool("create_task");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let required: HashSet<String> = ["create_task".to_string()].into();
+
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            // Le tour ne sert pas `create_task`, alors que le registre le connaît.
+            &served(&["run_gh"]),
+            TICKET_2750_CLOSED_MSG,
+        );
+
+        assert!(
+            effective.is_empty(),
+            "un outil absent du tableau servi ne peut pas être exigé — \
+             exigence restée : {effective:?}"
+        );
+    }
+
+    /// Cas 4 — un tour webhook qui n'exige **pas** d'outil de dispatch. Le
+    /// domaine n'entre même pas en jeu (`[GitHub] PR ` est territoire qa), mais
+    /// surtout : `qa_pr_view` et `run_gh` ne sont pas de la paire, donc la
+    /// branche 3 ne les regarde pas. Un désarmement qui les toucherait casserait
+    /// la revue de PR.
+    #[test]
+    fn mika2757_cas4_un_tour_de_revue_garde_ses_exigences_qa() {
+        let tools = ToolRegistry::new();
+        let qa_pr_view = make_resolved_skill_tool("qa_pr_view");
+        let run_gh = make_resolved_skill_tool("run_gh");
+        let mut skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        skill_map.insert("qa_pr_view".to_string(), &qa_pr_view);
+        skill_map.insert("run_gh".to_string(), &run_gh);
+
+        let required: HashSet<String> = ["qa_pr_view".to_string(), "run_gh".to_string()].into();
+
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["qa_pr_view", "run_gh"]),
+            "[GitHub] PR review (approved) on senara-solutions/mika#2756 — vol 1 de mika#2755",
+        );
+
+        assert_eq!(
+            effective, required,
+            "aucun des deux n'est un outil de dispatch"
+        );
+    }
+
+    /// Cas 5 — le tour où le dispatch est l'ordre même. Un `ready`-label sort du
+    /// domaine Fallthrough par construction
+    /// (`READY_LABEL_DISPATCH_MARKER`), donc `run_claude_pilot` y reste exigé.
+    /// Si ce cas rougissait, le désarmement aurait désarmé la boucle autonome
+    /// elle-même.
+    #[test]
+    fn mika2757_cas5_un_tour_ready_label_garde_son_exigence_de_dispatch() {
+        let tools = make_registry_with_tool("run_claude_pilot");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let required: HashSet<String> = ["run_claude_pilot".to_string()].into();
+
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            None,
+            &served(&["run_claude_pilot"]),
+            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 — un ticket prêt",
+        );
+
+        assert_eq!(
+            effective,
+            HashSet::from(["run_claude_pilot".to_string()]),
+            "sur un ready-label, le dispatch est l'ordre du tour, pas son interdit"
+        );
+    }
+
     // -- resolve_skill_llm_override tests (#463) --
 
     fn make_skill_entry_with_llm(
