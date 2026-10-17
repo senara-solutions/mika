@@ -201,6 +201,9 @@ measure-plan-header-coverage: ## Report which plan headers the mika#2038 refutat
 test-measure-empty-turns: ## Pin the axis-B emptiness predicate and its four negative controls (mika#1910)
 	@bash scripts/test-measure-empty-turns.sh
 
+test-measure-webhook-turn-cost: ## Pin the webhook-turn register reader: the turn is a SUM, plus six negative controls (mika#2680)
+	@bash scripts/test-measure-webhook-turn-cost.sh
+
 test-rescue-signal: ## Run the rescue-into-open-PR signal suite (mika#2151)
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
 
