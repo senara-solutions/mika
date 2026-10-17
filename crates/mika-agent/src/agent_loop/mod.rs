@@ -5931,6 +5931,7 @@ async fn run_agent_inner(
             trace_id: trace_id.to_string(),
             dispatch_count: std::sync::atomic::AtomicU32::new(0),
             originating_message: originating_msg,
+            tool_constraint_forced: AtomicBool::new(false),
         })
     };
     // Store loaded skills in session metadata for observability
@@ -7122,6 +7123,7 @@ async fn run_silent_inner(
             trace_id: trace_id.clone(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         })
     } else {
         None

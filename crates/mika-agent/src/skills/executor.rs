@@ -4,7 +4,7 @@
 // files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -728,6 +728,13 @@ pub struct LongRunningContext {
     /// continuation turns) where there is no fresh user input — those paths
     /// have already passed an upstream gate.
     pub originating_message: Option<String>,
+    /// A-t-on forcé une contrainte d'outil pendant CE tour ? (mika#2772)
+    ///
+    /// Écrit à un seul site — l'arm de re-prompt `required_tools` de `run_loop` —
+    /// et lu à un seul site, `validate_forced_dispatch_consent`. Le re-prompt est
+    /// le forçage : il n'existe aucun autre producteur de « l'outil doit être
+    /// appelé ». Un scan de source refuse un second site des deux côtés.
+    pub tool_constraint_forced: AtomicBool,
 }
 
 /// Validate that all required fields declared in a skill tool's input schema are
@@ -7678,6 +7685,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7735,6 +7743,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7805,6 +7814,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
         let output = execute_skill_tool(
             &tool,
@@ -7853,6 +7863,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(1),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
         let output = execute_skill_tool(
             &tool,
@@ -7910,6 +7921,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7950,6 +7962,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -8128,6 +8141,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         }
     }
 
@@ -10130,6 +10144,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message,
+            tool_constraint_forced: AtomicBool::new(false),
         }
     }
 
