@@ -3795,7 +3795,7 @@ async fn run_loop(
                         && ready_label_dispatch_trigger(&user_input_text)
                         && let Some(ref expected_location) = expected_hash_n
                         && let Some(mismatched) = all_tool_summaries.iter().find(|s| {
-                            (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+                            is_dispatch_tool(&s.name)
                                 && !s.input_summary.contains(expected_location.as_str())
                         })
                     {
@@ -10366,7 +10366,9 @@ const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[mika-engine] This callback t
 
 /// Re-export from `webhook_dispatch` module — single source of truth for the
 /// ready-label marker prefix (mika#933).
-use crate::webhook_dispatch::{READY_LABEL_DISPATCH_MARKER, is_unauthorized_webhook_dispatch};
+use crate::webhook_dispatch::{
+    DISPATCH_TOOLS, READY_LABEL_DISPATCH_MARKER, is_dispatch_tool, is_unauthorized_webhook_dispatch,
+};
 
 /// Triggers when a webhook turn was initiated by the ready-label dispatch
 /// marker.  Delegates to `webhook_dispatch::is_ready_label_dispatch_marker`
@@ -10405,9 +10407,7 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 /// #1173 — dev-groom owns its own tool (`run_claude_pilot_groom`); both names
 /// satisfy the dispatch contract.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+    summaries.iter().any(|s| is_dispatch_tool(&s.name))
 }
 
 /// #696, #1469 — Triggers on `[GitHub]` webhook turns that are potentially
@@ -10485,7 +10485,7 @@ fn webhook_no_unauthorized_dispatch_satisfied(summaries: &[ToolCallSummary]) -> 
     // unauthorized regardless of which claude-pilot tool was called.
     !summaries
         .iter()
-        .any(|s| (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom") && s.success)
+        .any(|s| is_dispatch_tool(&s.name) && s.success)
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -10582,9 +10582,7 @@ fn deferred_dispatch_trigger(msg: &str) -> bool {
 /// mika#1011 — Satisfied when `run_claude_pilot` has been attempted (success or failure).
 fn deferred_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
     // mika#1173: deferred replay may target either tool.
-    summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+    summaries.iter().any(|s| is_dispatch_tool(&s.name))
 }
 
 /// #870 — Returns `true` when BOTH `update_task_status` AND `send_message`
@@ -10646,9 +10644,7 @@ fn callback_milestone_advance_satisfied(
 ) -> bool {
     // Path A: any run_claude_pilot or run_claude_pilot_groom call advances the queue
     // (the latter is the milestone-cascade auto-groom path; mika#1173).
-    let has_advance = summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
+    let has_advance = summaries.iter().any(|s| is_dispatch_tool(&s.name));
 
     if has_advance {
         return true;
@@ -10708,9 +10704,7 @@ fn webhook_milestone_advance_satisfied(
     summaries: &[ToolCallSummary],
 ) -> bool {
     // Path A — reuse the same predicate as callback (#991).
-    let has_advance = summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
+    let has_advance = summaries.iter().any(|s| is_dispatch_tool(&s.name));
     if has_advance {
         return true;
     }
@@ -10755,16 +10749,20 @@ const WEBHOOK_MILESTONE_ADVANCE_CORRECTION: &str = "[mika-engine] This is a \
 /// `pub(crate)` so callers under `agent::run_agent_inner` can invoke it and
 /// inline `#[cfg(test)] mod tests` can unit-test the predicate + filter
 /// behavior without standing up the full agent loop.
+///
+/// Depuis mika#2757 la paire d'outils retirée n'est plus déclarée ici : elle est
+/// lue depuis [`crate::webhook_dispatch::DISPATCH_TOOLS`], le site unique que les
+/// sept prédicats de la paire partagent. La copie locale `CI_EXCLUDED_TOOLS`
+/// portait la même valeur et a disparu sans changer un octet de comportement.
 pub(crate) fn filter_ci_excluded_tools(
     user_message: &str,
     tools: &mut Vec<mika_common::claude::ToolDefinition>,
 ) {
-    const CI_EXCLUDED_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
     let is_ci_webhook = crate::server::ci_success_handler::parse_check_suite_success(user_message)
         .is_some()
         || crate::server::ci_failure_handler::parse_check_suite_failure(user_message).is_some();
     if is_ci_webhook {
-        tools.retain(|d| !CI_EXCLUDED_TOOLS.contains(&d.name.as_str()));
+        tools.retain(|d| !DISPATCH_TOOLS.contains(&d.name.as_str()));
     }
 }
 

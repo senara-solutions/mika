@@ -122,6 +122,48 @@ pub(crate) fn is_webhook_fallthrough_domain(msg: &str) -> bool {
     true
 }
 
+/// Les deux outils par lesquels un tour dispatche un pilote.
+///
+/// **Site de définition unique de la paire**, lu par les sept prédicats qui
+/// posaient jusqu'ici la même disjonction à la main (mika#2757 D2) :
+///
+///   1. le garde d'anti-fabrication d'argument de dispatch (#1313, inline dans
+///      `run_loop`) ;
+///   2. `ready_label_dispatch_satisfied` (#907/#996/#1089/#1173) ;
+///   3. `webhook_no_unauthorized_dispatch_satisfied` (#910/#1173) ;
+///   4. `deferred_dispatch_satisfied` (mika#1011/#1173) ;
+///   5. `callback_milestone_advance_satisfied`, chemin A (#991/#1173) ;
+///   6. `webhook_milestone_advance_satisfied`, chemin A (#1218) ;
+///   7. `filter_ci_excluded_tools`, qui portait sa propre copie locale
+///      `CI_EXCLUDED_TOOLS` (mika#1324) — supprimée par D2.
+///
+/// **Pourquoi un site unique.** mika#1173 a donné son propre outil à dev-groom
+/// et a dû, dans le même commit, ajouter `run_claude_pilot_groom` à chacun de
+/// ces prédicats ; un oubli y aurait été une porte de dispatch restée ouverte,
+/// verte à la compilation et verte aux tests. mika#2757 ajoute un huitième
+/// lecteur — le désarmement de `required_tools` — qui doit demander *exactement*
+/// la même paire que celle que le tour retire : si les deux listes divergent,
+/// la contradiction que ce ticket ferme se réouvre sans qu'une assertion bouge.
+/// La classe est celle de `grooming_marker` (mika#2158) : une regex recopiée
+/// dont le commentaire disait « Mirrors … » et qui a manqué deux élargissements.
+///
+/// **Ce qui n'est PAS un huitième site :** le garde d'anti-fabrication de
+/// verdict dev-groom (#1133/#1254, `agent_loop/mod.rs`) teste
+/// `s.name == "run_claude_pilot_groom" && s.success`. Il nomme **un** outil, pas
+/// la paire — son sujet est le verdict de grooming, qu'un `run_claude_pilot`
+/// ordinaire ne produit pas. Le convertir élargirait le garde.
+pub(crate) const DISPATCH_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
+
+/// True quand `name` est l'un des deux outils de dispatch de [`DISPATCH_TOOLS`].
+///
+/// La forme que les sept sites de D2 appellent : ils tiennent un nom d'outil
+/// (`ToolCallSummary::name`, `ToolDefinition::name`) et posent une question
+/// booléenne. Les rares lecteurs qui ont besoin de la liste elle-même — un
+/// `retain` sur un tableau d'outils — lisent [`DISPATCH_TOOLS`] directement.
+pub(crate) fn is_dispatch_tool(name: &str) -> bool {
+    DISPATCH_TOOLS.contains(&name)
+}
+
 /// True when `msg` is the turn `verdict_handler` hands to the LLM for a
 /// `hold[review]` with no active task (mika#2667 AC2).
 ///
@@ -1294,6 +1336,46 @@ mod tests {
         ] {
             assert_eq!(fallthrough_marker_class(msg), MARKER_CLASS_OTHER);
         }
+    }
+
+    /// mika#2757 D1 — la paire, dans les deux sens.
+    ///
+    /// La moitié négative seule serait aussi satisfaite par un prédicat qui
+    /// refuse tout ; la moitié positive est ce qui rend la suite non vacuous.
+    /// `run_claude_pilot_groom` est nommé explicitement parce que c'est l'outil
+    /// que mika#1173 a ajouté aux sept sites un par un, et celui que mika#2757
+    /// désarme.
+    #[test]
+    fn mika2757_la_paire_de_dispatch_est_exactement_deux_outils() {
+        assert!(is_dispatch_tool("run_claude_pilot"));
+        assert!(is_dispatch_tool("run_claude_pilot_groom"));
+        assert_eq!(DISPATCH_TOOLS.len(), 2);
+
+        for name in [
+            "create_task",
+            "update_task_status",
+            "send_message",
+            "deploy_mika",
+            "run_gh",
+            "run_claude",
+            "run_claude_pilot_",
+            "",
+        ] {
+            assert!(
+                !is_dispatch_tool(name),
+                "{name} n'est pas un outil de dispatch"
+            );
+        }
+    }
+
+    /// Le prédicat est une appartenance exacte, pas un préfixe : un futur
+    /// `run_claude_pilot_dry_run` ne doit pas hériter du désarmement sans qu'on
+    /// l'ait inscrit dans [`DISPATCH_TOOLS`].
+    #[test]
+    fn mika2757_le_predicat_nest_pas_un_prefixe() {
+        assert!(!is_dispatch_tool("run_claude_pilot_dry_run"));
+        assert!(!is_dispatch_tool("my_run_claude_pilot"));
+        assert!(!is_dispatch_tool("RUN_CLAUDE_PILOT"));
     }
 
     #[test]
