@@ -3101,8 +3101,12 @@ mod tests {
                 "le gabarit {event_type:?} s'est mis à citer une branche. Le slug \
                  qu'il cite entre désormais dans l'évaluation des mots-clés de \
                  `match_skills`, exactement comme le `check_suite` de mika#2755 : \
-                 relire `mask_cited_branch` (première ligne, parenthèse fermante) \
-                 avant d'ajouter ce gabarit ci-dessus. Texte : {text:?}"
+                 relire `mask_cited_branch` — il s'engage sur n'importe quelle \
+                 ligne d'événement ou enveloppe de gestionnaire, et vide chaque \
+                 occurrence de ses DEUX grammaires de citation (` (branch: )` \
+                 jusqu'au `)`, ` branch=` jusqu'à l'espace) — avant d'ajouter ce \
+                 gabarit ci-dessus. S'il en cite une troisième, c'est une passe \
+                 de plus à écrire là-bas. Texte : {text:?}"
             );
         }
     }

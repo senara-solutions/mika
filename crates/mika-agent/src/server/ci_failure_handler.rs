@@ -407,12 +407,7 @@ pub async fn try_handle_ci_failure(
             "CI failure but fix already in-flight — enriching passthrough"
         );
         return VerdictAction::Passthrough {
-            enrichment: Some(format!(
-                "[ci_failure_handler] CI {} on {}#{} (branch: {}). \
-                 A fix is already in-flight for task {}. Wait for the callback to finish \
-                 before taking further action.\n\n",
-                event.conclusion, event.repo, pr.number, event.branch, task.id
-            )),
+            enrichment: Some(format_inflight_enrichment(&event, pr.number, &task.id)),
         };
     }
 
@@ -762,6 +757,29 @@ async fn surface_for_adoption(
 /// primitive: there a replay cost the whole queue, here it costs a line.
 fn is_already_surfaced(recent_count: Result<i64, ()>) -> bool {
     matches!(recent_count, Ok(count) if count >= 1)
+}
+
+/// The enrichment for a failure whose fix is already in-flight.
+///
+/// Extracted from the middle of `handle_ci_failure`'s step 6 by mika#2768:
+/// a `format!` inside a `match` arm is only reachable through a full turn, so
+/// nothing could put **this** text through `mask_cited_branch` the way the
+/// founding incident's text went through it. The extraction is the condition of
+/// that testability, and nothing else about the path changed.
+///
+/// Like its two siblings below, it cites the branch — which is why it is one of
+/// the two chemin-3 producers mika#2768 pins against the mask.
+fn format_inflight_enrichment(
+    event: &CheckSuiteFailureEvent,
+    pr_number: u64,
+    task_id: &str,
+) -> String {
+    format!(
+        "[ci_failure_handler] CI {} on {}#{pr_number} (branch: {}). \
+         A fix is already in-flight for task {task_id}. Wait for the callback to finish \
+         before taking further action.\n\n",
+        event.conclusion, event.repo, event.branch
+    )
 }
 
 /// The enrichment the LLM reads, carrying AC2's four elements (a)–(d).
@@ -1908,16 +1926,72 @@ mod tests {
 
     #[test]
     fn in_flight_enrichment_avoids_completion_claim_words() {
-        // Simulate the enrichment text from the in-flight branch
-        let text = format!(
-            "[ci_failure_handler] CI {} on {}#{} (branch: {}). \
-             A fix is already in-flight for task {}. Wait for the callback to finish \
-             before taking further action.\n\n",
-            "failure", "senara-solutions/mika", 592, "feat/ci-fix", "task-123"
-        );
+        // Was a hand-copied simulation of the in-flight branch's `format!`, for
+        // want of anything callable; mika#2768 extracted the producer, so the
+        // test now reads the text that ships.
+        let text = format_inflight_enrichment(&sample_event(), 592, "task-123");
         assert!(
             !COMPLETION_CLAIM_RE.is_match(&text),
             "In-flight enrichment contains completion-claim trigger word: {text}"
         );
+    }
+
+    /// AC3 — le chemin 3 est couvert.
+    ///
+    /// Les deux producteurs d'enrichissement de ce fichier citent la branche sur
+    /// une ligne qui ne commence pas par `[GitHub] `, et l'enrichissement
+    /// **préfixe** le texte du tour (`handlers.rs`, bras
+    /// `Passthrough { enrichment: Some(e) }` : `req.text = format!("{e}{text}")`).
+    /// Deux conséquences que le vol 1 de mika#2755 ne voyait ni l'une ni
+    /// l'autre : le slug de la prose n'est sur aucune ligne `[GitHub] `, et la
+    /// ligne `[GitHub] ` de la passerelle n'est plus la première.
+    ///
+    /// La fixture porte le slug de l'incident fondateur, dont le mot-clé est
+    /// celui de dev-groom — sans lui le test serait vacant.
+    #[test]
+    fn mika2768_les_deux_producteurs_du_chemin_3_traversent_le_masque() {
+        let event = CheckSuiteFailureEvent {
+            repo: "senara-solutions/mika".to_string(),
+            branch: "fix/2762/rollback-reaper-groom".to_string(),
+            conclusion: "failure".to_string(),
+        };
+        // Le texte que la passerelle a produit, mot pour mot son gabarit
+        // (`mika-gateway/src/github.rs`, `check_suite`).
+        let gateway_text = "[GitHub] Check suite failure on senara-solutions/mika \
+                            (branch: fix/2762/rollback-reaper-groom)";
+
+        for enrichment in [
+            format_inflight_enrichment(&event, 2765, "task-2765"),
+            format_surface_enrichment(&event, 2765),
+        ] {
+            assert!(
+                enrichment.contains("groom"),
+                "la fixture ne cite plus le slug : le test serait vacant — {enrichment}"
+            );
+            let turn = format!("{enrichment}{gateway_text}");
+            let masked = mika_common::github_event_format::mask_cited_branch(&turn);
+
+            assert!(
+                !masked.contains("groom"),
+                "un slug cité survit au masque : {masked}"
+            );
+            // Les deux occurrences sont vidées, pas seulement celle de la ligne
+            // `[GitHub] ` : le marqueur reste, son contenu part.
+            assert_eq!(
+                masked.matches("(branch: )").count(),
+                2,
+                "les deux marqueurs ne sont pas vidés tous les deux : {masked}"
+            );
+            // La phrase qui suit le `)` de la prose survit intacte — c'est elle
+            // que le masque mangerait s'il coupait jusqu'au dernier `)`.
+            assert!(
+                masked.contains("Wait for the callback") || masked.contains("Proposed adoption"),
+                "le corps de l'enrichissement a été mangé : {masked}"
+            );
+            assert!(
+                masked.ends_with("(branch: )"),
+                "la fin du texte a été mangée : {masked}"
+            );
+        }
     }
 }

@@ -1165,6 +1165,52 @@ mod tests {
         );
     }
 
+    /// mika#2768 — le producteur réel du pré-digest traversant le masque.
+    ///
+    /// Un littéral épinglé dans `mika-common` ne voit pas le jour où **ce**
+    /// gabarit change : le masque continuerait de passer ses treize cas et ne
+    /// masquerait plus rien de ce que ce gestionnaire émet vraiment. C'est la
+    /// leçon du test cross-crate de mika#2755
+    /// (`mika-gateway/src/github.rs`), appliquée au producteur qui a produit
+    /// l'incident — le tour du 2026-10-17 08:59:18Z sur la PR mika#2765.
+    #[test]
+    fn mika2768_le_pre_digest_reel_ne_laisse_aucun_slug_cite_a_lintention() {
+        let event = CheckSuiteEvent {
+            repo: "senara-solutions/mika".to_string(),
+            branch: "fix/2762/rollback-reaper-groom".to_string(),
+        };
+        let signal = MergeReadySignal {
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 2765,
+            head_sha: "abc123def".to_string(),
+            branch: "fix/2762/rollback-reaper-groom".to_string(),
+            task_id: "task-2765".to_string(),
+            reviewer_login: "mika-platform-qa".to_string(),
+        };
+
+        let text = format_merge_ready_pre_digest(&event, &signal);
+        assert!(
+            text.contains("groom"),
+            "sans slug cité dans le pré-digest le test serait vacant : {text}"
+        );
+
+        let masked = mika_common::github_event_format::mask_cited_branch(&text);
+
+        assert!(
+            !masked.contains("groom"),
+            "le slug cité par CE producteur doit partir : c'est lui qui a armé \
+             `required_tools` de dev-groom le 2026-10-17 : {masked}"
+        );
+        assert!(
+            masked.contains("senara-solutions/mika#2765 (branch: )"),
+            "le marqueur reste, et la ligne d'événement garde sa forme : {masked}"
+        );
+        assert!(
+            masked.contains("Do NOT call pr_merge_with_gate"),
+            "la consigne que le LLM doit lire traverse intacte : {masked}"
+        );
+    }
+
     // ---- DECISION-CORE hold pre-digest tests (mika#1853) ----
 
     #[test]

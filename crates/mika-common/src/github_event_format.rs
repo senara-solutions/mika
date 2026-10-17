@@ -4,6 +4,7 @@
 //! producer and consumer is a contract violation; the cross-crate test in
 //! `mika-gateway::github::tests` enforces the contract at CI time.
 
+use crate::forge_identity::MERGE_READY_BRANCH_MARKER;
 use std::borrow::Cow;
 
 /// Prefix emitted by `format_event_text` for `issues.labeled` events
@@ -278,6 +279,25 @@ fn cites_a_github_event(text: &str) -> bool {
 ///    `mask_cited_branch_masks_every_run_and_keeps_the_title_between_them` —
 ///    sans ce test, un relecteur lirait une régression du vol 1.
 ///
+/// # Deux grammaires de citation, et pourquoi la seconde a failli être oubliée
+///
+/// Un pré-digest cite sa branche de **deux** façons, et le masque doit vider
+/// les deux :
+///
+/// | marqueur | fin de valeur | producteur |
+/// |---|---|---|
+/// | [`BRANCH_MARKER`] (` (branch: `) | le `)` de la ligne | `format_event_text` du gateway |
+/// | [`MERGE_READY_BRANCH_MARKER`] (` branch=`) | la prochaine espace | `MergeReadySignal` (ligne `MERGE-READY-SIGNAL:`) |
+///
+/// L'extrait du ticket mika#2768 élidait la ligne du signal derrière un `…`, si
+/// bien que ce vol 2 a d'abord été écrit pour la première forme seule. Le test
+/// de l'AC2 — celui qui fait produire le pré-digest par
+/// `format_merge_ready_pre_digest` au lieu de recopier un littéral — est ce qui
+/// a montré que le `groom` de `fix/2762/rollback-reaper-groom` sortait encore
+/// par la seconde, et donc que le correctif aurait été **inerte sur l'incident
+/// fondateur**. C'est l'argument du « producteur réel, pas un littéral », payé
+/// comptant.
+///
 /// # Contrat — deux refus, tous deux fail-safe
 ///
 /// Renvoie `Cow::Borrowed(text)` **inchangé** quand :
@@ -286,9 +306,9 @@ fn cites_a_github_event(text: &str) -> bool {
 ///    enveloppe de gestionnaire : rien n'y est « cité », et un message humain
 ///    est le seul canal par lequel un opérateur exprime une intention en texte
 ///    libre ;
-/// 2. aucune occurrence du marqueur n'était masquable — texte sans
-///    [`BRANCH_MARKER`] (`issue_comment`, `issues`, `pull_request_review`,
-///    `push`), ou occurrences toutes de forme inattendue.
+/// 2. aucune occurrence d'aucun des deux marqueurs n'était masquable — texte
+///    sans marqueur (`issue_comment`, `issues`, `pull_request_review`, `push`),
+///    valeurs déjà vides, ou occurrences toutes de forme inattendue.
 ///
 /// # Portée
 ///
@@ -301,31 +321,70 @@ pub fn mask_cited_branch(text: &str) -> Cow<'_, str> {
     if !cites_a_github_event(text) {
         return Cow::Borrowed(text);
     }
-    // Tous les offsets ci-dessous sont prouvés sur frontière de caractère
-    // (mika#764) : `find` en rend une, `BRANCH_MARKER.len()` ajouté à une
-    // position où le marqueur a matché en est une, et `')'` comme `'\n'` sont
-    // ASCII.
+    // Les deux passes sont indépendantes : chacune emprunte quand elle n'a rien
+    // trouvé, de sorte qu'un texte sans aucun slug masquable reste `Borrowed`.
+    match mask_marker(text, BRANCH_MARKER, ValueEnd::ClosingParen) {
+        Cow::Borrowed(_) => mask_marker(text, MERGE_READY_BRANCH_MARKER, ValueEnd::Whitespace),
+        Cow::Owned(once) => {
+            match mask_marker(&once, MERGE_READY_BRANCH_MARKER, ValueEnd::Whitespace) {
+                Cow::Borrowed(_) => Cow::Owned(once),
+                Cow::Owned(twice) => Cow::Owned(twice),
+            }
+        }
+    }
+}
+
+/// Où se termine la valeur citée, pour un marqueur donné.
+///
+/// Les deux formes ont la même borne haute — la fin de **leur** ligne — et
+/// diffèrent sur ce qui clôt la valeur à l'intérieur.
+#[derive(Debug, Clone, Copy)]
+enum ValueEnd {
+    /// `… (branch: {slug})` : la valeur va jusqu'au `)`. Son absence sur la
+    /// ligne est une forme inattendue, et l'occurrence est sautée.
+    ClosingParen,
+    /// `… branch={slug} task=…` : la valeur va jusqu'à la prochaine espace, ou
+    /// jusqu'au bout de la ligne quand le champ la termine. Il n'y a donc pas
+    /// de forme inattendue ici — seulement le cas « champ vide », sauté parce
+    /// qu'il n'a rien à masquer.
+    Whitespace,
+}
+
+/// Vide la valeur de chaque occurrence de `marker`, en laissant le marqueur.
+///
+/// Tous les offsets sont prouvés sur frontière de caractère (mika#764) : `find`
+/// en rend une, `marker.len()` ajouté à une position où le marqueur a matché en
+/// est une, `line.len()` est la frontière où `'\n'` a été trouvé, et `')'`,
+/// `'\n'` et les espaces ASCII le sont aussi. Un slug multi-octets ne peut donc
+/// pas être coupé en milieu de caractère.
+fn mask_marker<'a>(text: &'a str, marker: &str, value_end: ValueEnd) -> Cow<'a, str> {
     let mut out = String::new();
     let mut last = 0usize;
     let mut cursor = 0usize;
     let mut masked_any = false;
 
-    while let Some(rel) = text[cursor..].find(BRANCH_MARKER) {
-        let after = cursor + rel + BRANCH_MARKER.len();
+    while let Some(rel) = text[cursor..].find(marker) {
+        let after = cursor + rel + marker.len();
         // La coupe est bornée à la ligne de l'occurrence : la ligne suivante
         // (une URL de PR, la prose d'un enrichissement) n'a rien à voir ici.
         let line_end = text[after..].find('\n').map_or(text.len(), |nl| after + nl);
-        match text[after..line_end].find(')') {
-            Some(rel_close) => {
+        let line = &text[after..line_end];
+        let close = match value_end {
+            ValueEnd::ClosingParen => line.find(')'),
+            ValueEnd::Whitespace => Some(line.find(char::is_whitespace).unwrap_or(line.len())),
+        };
+        match close {
+            // Une valeur non vide : on la retire.
+            Some(rel_close) if rel_close > 0 => {
                 let close = after + rel_close;
                 out.push_str(&text[last..after]);
                 masked_any = true;
                 last = close;
                 cursor = close;
             }
-            // Forme inattendue : on ne coupe pas à l'aveugle, on passe à
-            // l'occurrence suivante.
-            None => cursor = after,
+            // Valeur déjà vide, ou forme inattendue : on ne coupe pas à
+            // l'aveugle et on passe à l'occurrence suivante.
+            _ => cursor = after,
         }
     }
 
