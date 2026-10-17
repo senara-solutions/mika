@@ -318,4 +318,83 @@ mod tests {
         );
         assert_eq!(envelope_from_attestation(&serde_json::Value::Null), None);
     }
+
+    /// The floored resolver has **one** call site in this crate, and it is
+    /// `remote_ask.rs`.
+    ///
+    /// The floor is a *per-exchange* decision: it depends on the URL, so a
+    /// second site would be a second place where an agent is derived from a URL
+    /// and an envelope asked for. The two would drift — one of them would keep
+    /// calling `A2aClient::new` and resolve 600 s against a 900 s envelope,
+    /// which is mika#2759 itself, re-created one caller over.
+    ///
+    /// **The exception is a *path*, not an allowlist entry.** `ALLOWED` ships
+    /// empty and must stay empty (the mika#2425 / mika#2457 form): when a second
+    /// site appears, the remedy is to route it through the one that exists, not
+    /// to list it here. An allowlist that stops being empty is the false green
+    /// this guard exists to refuse.
+    #[test]
+    fn mika2759_le_plancher_a_un_seul_site() {
+        const ALLOWED: &[&str] = &[];
+        const NEEDLE: &str = "resolve_send_timeout_with_floor";
+        const SITE: &str = "remote_ask.rs";
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+
+        let mut violations: Vec<String> = Vec::new();
+        scanner.for_each(|path, source| {
+            let rel = path
+                .strip_prefix(scanner.src_root())
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if rel == SITE || ALLOWED.contains(&rel.as_str()) {
+                return;
+            }
+            for (idx, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(NEEDLE) {
+                    violations.push(format!("{rel}:{} — {}", idx + 1, line.trim()));
+                }
+            }
+        });
+
+        assert!(
+            violations.is_empty(),
+            "mika#2759 : le plancher d'envoi per-agent doit se résoudre à un \
+             seul site ({SITE}). Site(s) supplémentaire(s) :\n{}\n\
+             Le remède est de router l'appel par le site existant, PAS d'ajouter \
+             une entrée à ALLOWED — qui doit rester vide.",
+            violations.join("\n")
+        );
+    }
+
+    /// ...and the scan that asserts it actually looked.
+    ///
+    /// A `for_each` over an empty file set passes the guard above in silence,
+    /// which is the decoration mika#2103 is about. Two conditions: the sweep
+    /// sees a plausible number of files, and it sees the one file the exception
+    /// names — a path exception for a file the scanner never visits protects
+    /// nothing.
+    #[test]
+    fn mika2759_le_scan_du_plancher_nest_pas_vide() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let files = scanner.files();
+
+        assert!(
+            files.len() > 10,
+            "mika#2759 : le scan du plancher est vide ou quasi vide \
+             ({} fichier(s)) — il ne protège rien.",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("remote_ask.rs")),
+            "mika#2759 : le scan ne voit pas remote_ask.rs, le fichier que \
+             l'exception de chemin nomme."
+        );
+    }
 }
