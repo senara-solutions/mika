@@ -147,7 +147,7 @@ ferme. Un seul mot ajouté à la ligne 4, à côté de `test-handler-crash-step`
 
 ## Fire-Disposition
 
-Le vol ne **écrit** aucun détecteur : il en **arme** deux, qui existent, sont
+Le vol n'**écrit** aucun détecteur : il en **arme** deux, qui existent, sont
 complets et sont verts. C'est la sortie de l'option (b) de mika#1574 — « livrer
 désarmé, plus un suivi tracké pour l'armer » — et ce vol EST ce suivi. Le gate
 s'applique donc pleinement, et la disposition retenue est :
@@ -208,6 +208,39 @@ vide est mesuré, pas supposé.**
 | V6 | le YAML reste valide et l'ordre des étapes est celui annoncé | le job `check` démarre et exécute les deux nouvelles étapes à leur place ; un YAML cassé échoue au parse avant le premier step |
 | V7 | la cible nouvellement appelée est `.PHONY` | D3 — `grep -n '^\.PHONY' Makefile` contient `test-measure-webhook-turn-cost` |
 | V8 | le push d'un hunk `.github/workflows/` est désormais accepté | le push du commit 1 (§ 5) — c'est la mesure, et son échec est un résultat, pas un incident à contourner |
+| V9 | le YAML est valide **avant** le push-mesure, et les deux cibles câblées existent | pré-contrôle local du § 5, avant le commit 1 — sans lui, V8 n'est pas une mesure propre |
+
+### V9 : pourquoi un pré-contrôle, alors que V6 couvre déjà le YAML
+
+Parce que V6 et V8 ne mesurent pas la même chose et que, dans l'ordre du § 5,
+V8 arrive le premier. Le commit 1 est poussé **pour apprendre** si la permission
+*Workflows: write* existe ; c'est la seule information que ce vol produit et que
+personne ne détient encore. Or `git push` ne distingue pas ses causes d'échec
+pour l'observateur pressé, et deux diagnostics très différents se présentent au
+même endroit :
+
+- un refus de la forge → le point 1 du ticket n'est pas acquis, le vol s'arrête ;
+- un YAML que le pilote a cassé → le vol continue, après correction.
+
+Pousser sans pré-contrôle laisse la possibilité d'un troisième cas, le pire :
+le push **réussit** (la permission est là, V8 est acquis) et le YAML est cassé,
+découvert bien plus tard au parse du job. La permission aurait alors été
+attestée par un commit qui casse `ci.yml` sur la branche. Trois commandes à coût
+nul suppriment l'ambiguïté avant qu'elle existe :
+
+```
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"
+make -n test-egress-push-bound
+make -n test-measure-webhook-turn-cost
+```
+
+`python3` + `PyYAML` sont présents dans ce worktree (vérifié le 2026-10-17) ;
+ni `actionlint` ni `yamllint` ne le sont, et ce vol n'en installe aucun — la
+charge utile de la vérification est « le fichier parse et les deux cibles se
+résolvent », pas un audit de schéma GitHub Actions. `make -n` résout la cible
+sans l'exécuter : il attrape la faute de frappe dans un nom de cible, qui est
+l'autre manière dont ces cinq lignes peuvent être fausses tout en ayant l'air
+justes.
 
 ### Les dépendances d'environnement sont attestées, pas supposées
 
@@ -243,6 +276,10 @@ sur un `mktemp -d`. `test-measure-webhook-turn-cost.sh` travaille dans
 
 C'est le seul point non trivial du vol, et il est dicté par le § 1.2.
 
+**Étape 0 — le pré-contrôle local (V9), avant de committer.** Les trois
+commandes du § 4 ci-dessus. Elles coûtent moins d'une seconde et elles sont ce
+qui fait du push suivant une mesure à une seule inconnue.
+
 **Commit 1 — `.github/workflows/ci.yml` seul (D1 + D2), poussé immédiatement.**
 
 La permission *Workflows: write* accordée le 2026-10-17 n'a jamais été exercée
@@ -266,6 +303,20 @@ fichier, ni ouvrir la PR sans le hunk, ni demander à l'opérateur de coller quo
 que ce soit. Le résultat du vol est alors : *le scope est toujours absent, le
 point 1 du ticket n'est pas acquis, rien d'autre n'a été tenté.*
 
+Deux précisions sur cet état d'arrêt, parce qu'un arrêt mal rapporté se lit
+comme un vol raté plutôt que comme la mesure qu'il est :
+
+- **Le RESULT cite la ligne de refus verbatim.** L'orchestrateur doit pouvoir
+  distinguer « la forge a refusé le scope » de n'importe quel autre échec de
+  push (réseau, divergence, protection de branche) sans relire le log. Le
+  verdict du vol porte donc le texte exact rendu par `git push`.
+- **Le commit 1 reste sur la branche locale, et aucune PR n'est ouverte.** Il ne
+  faut ni l'annuler, ni le reporter ailleurs : le hunk est correct et son seul
+  défaut est de ne pas pouvoir partir. Le vol signale explicitement cet état
+  (commits locaux, zéro PR) pour que le rattrapage post-flight ne le maquille pas
+  en draft-PR de rescousse — un draft nommé « contenu sauvé » dirait le contraire
+  de ce que le vol a mesuré.
+
 **Commit 2 — `Makefile` (D3).** Une fois le commit 1 poussé, donc une fois la
 permission attestée. Séparé parce qu'il n'a pas la même cause : D3 est une
 conséquence de D2 (une cible que CI appelle doit être `.PHONY`), pas un élément
@@ -276,6 +327,14 @@ du câblage lui-même, et un diff qui les distingue se relit en une seconde.
 `scripts/verify-pipeline.sh origin/main`, puis `gh pr create` avec le corps écrit
 dans `pr-body.md` à la racine du worktree (règle mika#2211).
 
+Une note sur cette fin de pipeline, utile à qui la verra rougir : **le diff du
+vol ne touche aucun crate.** Les trois fichiers candidats sont `ci.yml` et
+`Makefile`, et aucun n'entre dans une unité de compilation. Si `cargo clippy` ou
+`cargo test` rougit, la cause est dans `origin/main` ou dans l'environnement du
+runner, jamais dans ce diff — et le vol ne doit pas partir en chasse d'une
+régression Rust qu'il n'a pas pu produire. La fin de pipeline reste obligatoire :
+elle est un contrôle de l'état de la branche, pas du hunk.
+
 ---
 
 ## 6. Risques
@@ -284,7 +343,7 @@ dans `pr-body.md` à la racine du worktree (règle mika#2211).
 |---|---|---|
 | R1 | Le push du hunk `ci.yml` est encore refusé | § 5 : arrêt propre et explicite au commit 1, avant tout autre travail. Le coût du vol est alors de quelques tours, pas d'un pilote. |
 | R2 | Une suite verte en local rougit sur le runner | Dépendances attestées par des étapes déjà vertes du même job (§ 4). Si elle rougit malgré cela, la PR du vol le montre : c'est le job requis `check` qui l'exécute, et le verdict arrive sur la PR même. |
-| R3 | L'insertion casse le YAML (indentation) | Le job échoue au parse avant son premier step — un échec immédiat et sans ambiguïté, jamais un faux vert. L'indentation cible est celle des étapes voisines : six espaces avant `- name:`, huit avant `run:`. |
+| R3 | L'insertion casse le YAML (indentation) | Attrapé **avant le commit 1** par le pré-contrôle V9 (§ 5 étape 0), là où la correction coûte une seconde et ne brouille pas le push-mesure. Second filet derrière lui : le job échoue au parse avant son premier step — un échec immédiat et sans ambiguïté, jamais un faux vert. L'indentation cible est celle des étapes voisines : six espaces avant `- name:`, huit avant `run:`. |
 | R4 | Un conflit sur `ci.yml` avec une PR concurrente | Le fichier est touché par peu de PR ; en cas de conflit, le hunk de D2 se réinsère après l'étape mika#2532 et celui de D1 en queue du bloc secret-channel — l'ancrage est nommé, pas numérique. |
 | R5 | Le renommage d'étape casse une protection de branche référençant le nom | Les protections référencent le nom du **job** (`Check`), pas celui d'une étape. Aucune règle required-check ne porte un nom d'étape. |
 
@@ -312,9 +371,12 @@ dans `pr-body.md` à la racine du worktree (règle mika#2211).
 - [ ] `test-measure-webhook-turn-cost` figure dans la liste `.PHONY` du
       `Makefile`.
 - [ ] Aucune des deux étapes ne porte `continue-on-error`, `if:` ou `|| true`.
+- [ ] Le pré-contrôle local a tourné **avant** le commit 1 : le YAML parse et
+      les deux cibles se résolvent sous `make -n` (V9).
 - [ ] Le commit 1 (hunk `ci.yml` seul) a été poussé **avant** tout autre travail,
       et le corps de PR rapporte si le push a été accepté — c'est la mesure de la
-      permission *Workflows: write* (V8).
+      permission *Workflows: write* (V8). En cas de refus, le résultat du vol cite
+      la ligne de refus verbatim et aucune PR n'est ouverte.
 - [ ] Le job `check` de la PR est vert, et son log montre les deux nouvelles
       étapes exécutées.
 - [ ] `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`,
@@ -342,7 +404,11 @@ contrat de vérification du § 4.
 - **AC4** — `test-measure-webhook-turn-cost` est déclarée `.PHONY`. *(V7)*
 - **AC5** — Le push d'un hunk sous `.github/workflows/` depuis la sandbox est
   accepté par la forge ; en cas de refus pour scope manquant, le vol s'arrête
-  sans contournement et le dit dans son résultat. *(V8, § 5)*
+  sans contournement, cite la ligne de refus verbatim dans son résultat, n'ouvre
+  aucune PR et laisse le commit 1 en place sur la branche locale. *(V8, § 5)*
+- **AC7** — Le push-mesure du commit 1 n'a qu'une inconnue : le YAML a été
+  validé et les deux cibles résolues localement avant de committer. *(V9, § 5
+  étape 0)*
 - **AC6** — Le point 3 du ticket (lint de la classe) est arbitré et renvoyé à un
   ticket numéroté, nommé par une ligne `Tracked in:` du corps de PR. *(§ 1.4,
   mika#2761)*
