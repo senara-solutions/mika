@@ -24,6 +24,10 @@
 #   * CASE 3 — past the threshold the body goes out chunked, with the commands
 #     still at its head. The verdict therefore lives in `request` (body
 #     buffered) and not in `requestheaders` (body not there yet).
+# Both are RE-ASSERTED under every mechanism added to this surface rather than
+# inherited on trust: CASE 18 holds them under the declared perimeter of
+# mika#2751, CASE 23 under the TTL and the entry lifecycle of mika#2766, on both
+# sides of a purge.
 #
 # WHY IT DRIVES THE REAL HOOKS AND NOT ONLY THE PURE FUNCTIONS. A green,
 # unplugged verdict function is class mika#2205 — two states rendering the same
@@ -1020,6 +1024,100 @@ addon._last_purge = {}
 forget_scopes()
 
 print("")
+print("CASE 22 — a perimeter purged under a LIVE neighbour REFUSES a legitimate push")
+# THE CASE THE WHOLE FLIGHT TURNS ON, and the one that makes 12 h a verifiable
+# number instead of a decreed one.
+#
+# The degradation is NOT per entry: `_push_scope_verdict` falls back on the
+# static bound only when the registry as a whole is empty or unreadable. So the
+# two directions of a wrong TTL cost entirely different things.
+#
+#   TOO LONG  — an entry outlives a SIGKILLed pilot. The union stays bounded by
+#               the dispatchable repositories, so nothing new becomes reachable.
+#   TOO SHORT — a pilot that is STILL ALIVE has its entry purged while a
+#               neighbour keeps the registry non-empty. Its own legitimate push
+#               then lands on `push-scope-repo`: a 403 on innocent work, and the
+#               autonomous loop stops.
+#
+# This case asserts that CONSEQUENCE rather than the constant. A test on the
+# constant alone would stay green under any value; this one states what a value
+# too small does, which is why the number is a FLOOR on the longest spawn.
+declare_scopes(
+    (SCOPE_ENTRY_A, "repo=senara-solutions/mika\n"),            # still alive
+    (SCOPE_ENTRY_B, "repo=senara-solutions/mika-platform\n"),   # the neighbour
+)
+too_old = time.time() - 13 * 3600
+os.utime(SCOPES / SCOPE_ENTRY_A, (too_old, too_old))
+addon._last_purge = {}
+# The neighbour's own push, which is what triggers the purge pass.
+flow, err = run(GIT, SIBLING_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("22.1 the live neighbour's push passes", 200, status_of(flow))
+check_true("22.2 the case is not vacuous: the aged entry really was purged",
+           not (SCOPES / SCOPE_ENTRY_A).exists())
+check_true("22.3 and the neighbour's entry really did survive",
+           (SCOPES / SCOPE_ENTRY_B).exists())
+# Now the pilot whose entry was purged pushes. It is alive, its branch is fine,
+# its repository is in the organisation — and it is refused.
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("22.4 the live pilot whose entry was purged is REFUSED", 403, status_of(flow))
+check_true("22.5 by the scope motif, naming its own repository",
+           "push-scope-repo" in body_of(flow)
+           and "senara-solutions/mika" in body_of(flow))
+check("22.6 with exactly the scope DENY line, not a static motif",
+      [f"[github-proxy] DENY push-scope-repo POST {PUSH_PATH}"], denies_in(err))
+check("22.7 and it is a refusal, not a degradation — the neighbour held the "
+      "registry non-empty", [], degrades_in(err))
+# THE OTHER HALF OF THE ASYMMETRY, juxtaposed so the reasoning is on the page:
+# the very same purge, with NO neighbour, costs only a degradation. The
+# neighbour is what turns a purge into a 403.
+declare_scopes((SCOPE_ENTRY_A, "repo=senara-solutions/mika\n"))
+os.utime(SCOPES / SCOPE_ENTRY_A, (too_old, too_old))
+addon._last_purge = {}
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("22.8 the same purge, alone, only degrades", 200, status_of(flow))
+check("22.9 naming scope-absent", [f"[github-proxy] DEGRADE scope-absent POST {PUSH_PATH}"],
+      degrades_in(err))
+check("22.10 and refuses nothing", [], denies_in(err))
+
+print("")
+print("CASE 23 — the two mika#2736 positives are untouched by the lifecycle")
+# Point 4 of the ticket, carried forward one flight. A guard that 403s the probe
+# POST refuses every push large enough to be streamed, which is the only failure
+# mode able to stop the loop — so the two positives are re-asserted under each
+# new mechanism rather than inherited on trust. CASE 18 held them under the
+# perimeter; this holds them under the TTL, on both sides of a purge.
+declare_repos("mika")
+addon._last_purge = {}
+flow, err = run(GIT, PUSH_PATH, FLUSH)
+check("23.1 the 4-byte probe passes under a fresh perimeter", 200, status_of(flow))
+check("23.2 and carries the host credential", EXPECTED_BASIC,
+      flow.request.headers.get("Authorization"))
+big_ttl = body(cmd(ZERO, SHA_B, b"refs/heads/feat/2766/big"),
+               pack=b"PACK\x00\x00\x00\x02" + os.urandom(400_000))
+flow, err = run(GIT, PUSH_PATH, big_ttl)
+check("23.3 the 400 KiB chunked push passes too", 200, status_of(flow))
+check("23.4 with no refusal", [], denies_in(err))
+check_true("23.5 the case is non-vacuous (the body really is large)",
+           len(big_ttl) > 300_000)
+# And on the far side of a purge, where the verdict degrades: the probe and the
+# chunked push must pass there as well. A tightening whose end-of-life path
+# refused either would stop the loop hours after the dispatch that armed it.
+declare_repos("mika")
+os.utime(SCOPES / SCOPE_ENTRY_A, (too_old, too_old))
+addon._last_purge = {}
+flow, err = run(GIT, PUSH_PATH, FLUSH)
+check("23.6 the probe passes on the far side of a purge", 200, status_of(flow))
+check("23.7 and nothing is refused there either", [], denies_in(err))
+check_true("23.x the case is not vacuous: the probe itself drove the purge",
+           not (SCOPES / SCOPE_ENTRY_A).exists())
+flow, err = run(GIT, PUSH_PATH, big_ttl)
+check("23.8 so does the chunked push", 200, status_of(flow))
+check("23.9 and it still carries the host credential", EXPECTED_BASIC,
+      flow.request.headers.get("Authorization"))
+addon._last_purge = {}
+forget_scopes()
+
+print("")
 print(f"TOTAL failures: {failures}")
 sys.exit(1 if failures else 0)
 PY
@@ -1032,8 +1130,8 @@ cat "$PY_OUT"
 # floor). Both must be caught — an `exit 0` after three assertions reads
 # exactly like a clean tree (class mika#2205).
 asserted=$(grep -c '^RESULT ' "$PY_OUT" || true)
-rc=1; [ "${asserted:-0}" -ge 254 ] && rc=0
-assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 254)" "0" "$rc"
+rc=1; [ "${asserted:-0}" -ge 273 ] && rc=0
+assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 273)" "0" "$rc"
 assert_eq "every addon-level assertion passes" "0" "$py_rc"
 
 echo ""
