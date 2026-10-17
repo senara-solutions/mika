@@ -341,7 +341,7 @@ for name in (PURGED, KEPT_YOUNG):
 now = time.time()
 os.utime(REGISTRY / PURGED, (now - 73 * 3600, now - 73 * 3600))     # past 72 h
 os.utime(REGISTRY / KEPT_YOUNG, (now - 71 * 3600, now - 71 * 3600))  # inside 72 h
-addon._last_purge = None  # the 10-minute throttle must not hide the purge here
+addon._last_purge = {}  # the 10-minute throttle must not hide the purge here
 flow, _ = run(API, f"Bearer {SENTINEL}")
 check("9.1 the entry validated in this very call is never purged", 200, status_of(flow))
 check_true("9.2 the entry past the TTL is gone", not (REGISTRY / PURGED).exists())
@@ -358,7 +358,7 @@ flow, _ = run(API, f"Bearer {SENTINEL}")
 check("9.6 a second pass inside 10 minutes does not re-scan", 200, status_of(flow))
 check_true("9.7 so the newly-aged entry is still there (throttle honoured)",
            (REGISTRY / THROTTLED).exists())
-addon._last_purge = None
+addon._last_purge = {}
 
 print("")
 print("CASE 10 — the DENY log and the 403 bodies name, and never disclose")
@@ -416,6 +416,54 @@ check("12.2 and the token file stays the one staged host-side",
       f"Bearer {HOST_TOKEN}", flow.request.headers.get("Authorization"))
 
 print("")
+print("CASE 13 — the purge throttle is per directory, not per process (mika#2751)")
+# `_purge_registry` takes its directory as an ARGUMENT while the throttle used
+# to be a single module-level float. So the first directory purged in a
+# ten-minute window starved every other one for the rest of it, and which one
+# got starved depended only on request order. One registry today, two as soon
+# as a second one exists (the push-scope perimeter of mika#2751, read on the
+# same request path) — and a registry left stale is one whose expired entries
+# still answer.
+PURGE_A = Path(TMPROOT) / "purge-a"
+PURGE_B = Path(TMPROOT) / "purge-b"
+AGED = "3333333333333333333333333333f00d"
+stale = time.time() - 99 * 3600
+for directory in (PURGE_A, PURGE_B):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / NONCE).write_text("", encoding="utf-8")   # so the call validates
+    (directory / AGED).write_text("", encoding="utf-8")
+    os.utime(directory / AGED, (stale, stale))
+addon._last_purge = {}
+
+os.environ["_PILOT_EGRESS_SENTINEL_DIR"] = str(PURGE_A)
+flow, _ = run(API, f"Bearer {SENTINEL}")
+check("13.1 the call against the first registry is served", 200, status_of(flow))
+check_true("13.2 its aged entry is purged", not (PURGE_A / AGED).exists())
+
+# Same ten-minute window, a DIFFERENT directory. With a global throttle this is
+# where the second registry stayed stale.
+os.environ["_PILOT_EGRESS_SENTINEL_DIR"] = str(PURGE_B)
+flow, _ = run(API, f"Bearer {SENTINEL}")
+check("13.3 the call against the second registry is served", 200, status_of(flow))
+check_true("13.4 the second registry is purged too, in the same window",
+           not (PURGE_B / AGED).exists())
+
+# And the throttle is still a throttle: a second pass on a directory already
+# purged must NOT re-scan. Without this the fix could have been "purge always",
+# which is a scandir per request and no longer the thing being asserted.
+LATE = "4444444444444444444444444444beef"
+(PURGE_B / LATE).write_text("", encoding="utf-8")
+os.utime(PURGE_B / LATE, (stale, stale))
+flow, _ = run(API, f"Bearer {SENTINEL}")
+check("13.5 a second call on the same registry is served", 200, status_of(flow))
+check_true("13.6 and its newly-aged entry survives (the throttle still throttles)",
+           (PURGE_B / LATE).exists())
+check_true("13.7 the two directories are throttled independently, by key",
+           {str(PURGE_A), str(PURGE_B)} <= set(addon._last_purge))
+addon._last_purge = {}
+os.environ["_PILOT_EGRESS_SENTINEL_DIR"] = str(REGISTRY)
+
+print("")
 print(f"TOTAL failures: {failures}")
 sys.exit(1 if failures else 0)
 PY
@@ -428,8 +476,8 @@ cat "$PY_OUT"
 # floor). Both must be caught — an `exit 0` after three assertions reads
 # exactly like a clean tree (class mika#2205).
 asserted=$(grep -c '^RESULT ' "$PY_OUT" || true)
-rc=1; [ "${asserted:-0}" -ge 60 ] && rc=0
-assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 60)" "0" "$rc"
+rc=1; [ "${asserted:-0}" -ge 80 ] && rc=0
+assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 80)" "0" "$rc"
 assert_eq "every addon-level assertion passes" "0" "$py_rc"
 
 echo ""

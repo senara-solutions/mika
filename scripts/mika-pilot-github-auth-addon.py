@@ -179,7 +179,15 @@ _DENY_REGISTRY = "registry-unreadable"
 # and the value is not the kind of thing a site needs to differ on.
 _REGISTRY_TTL_SECONDS = 72 * 3600
 _PURGE_MIN_INTERVAL_SECONDS = 600
-_last_purge: float | None = None
+
+# One throttle PER directory, not one for the whole process. `_purge_registry`
+# takes its directory as an argument, so a single global clock means the first
+# directory purged in a window starves every other one until the window closes
+# -- and the registry read on the next request is the starved one as often as
+# not. With a dict the throttle keeps its purpose (no scandir per request) and
+# loses the coupling between two registries that have nothing to do with each
+# other (mika#2751 § 2.5).
+_last_purge: dict[str, float] = {}
 
 # Three reasons, three bodies. Their causes are OPPOSITE — absent is the
 # `cargo test` that cleared GH_TOKEN (the mika#2713 substrate), unknown is an
@@ -318,12 +326,17 @@ def _purge_registry(directory: Path) -> None:
     propagated would read as an unreadable registry and refuse a legitimate
     pilot. The throttle uses a monotonic clock, so a host clock step cannot
     stall it forever.
+
+    The throttle is keyed by the directory, never global: this addon purges
+    more than one registry, and a global clock would let the first one purged
+    in a ten-minute window keep every other one stale for the rest of it.
     """
-    global _last_purge
+    key = str(directory)
     now_mono = time.monotonic()
-    if _last_purge is not None and now_mono - _last_purge < _PURGE_MIN_INTERVAL_SECONDS:
+    last = _last_purge.get(key)
+    if last is not None and now_mono - last < _PURGE_MIN_INTERVAL_SECONDS:
         return
-    _last_purge = now_mono
+    _last_purge[key] = now_mono
     cutoff = time.time() - _REGISTRY_TTL_SECONDS
     try:
         entries = list(os.scandir(directory))
@@ -413,13 +426,15 @@ def _sentinel_verdict(presented: str | None) -> str:
 #     carries NO force flag, so a rewrite is byte-identical to an ordinary
 #     update unless the proxy holds the remote's prior ref state. Naming the
 #     limit is the deliverable; pretending to cover it would be worse than the
-#     gap. Tightening to the perimeter the SPAWN declared is the follow-up.
+#     gap. Tightening to the perimeter the SPAWN declared is mika#2751, below,
+#     and it changes nothing about P4: the targeted ref becomes the right one,
+#     the nature of the update stays invisible.
 # ---------------------------------------------------------------------------
 
-# The one repository path prefix a pilot may write to. Static, and this flight
-# holds to that deliberately: tightening to the repository AND branch the host
-# itself chose at spawn is strictly better, but needs the mika#2716 registry
-# entry extended — i.e. the launcher touched. That is the follow-up.
+# The one repository path prefix a pilot may write to. STATIC, and it stays:
+# mika#2751 tightens to the repository the host itself declared at spawn, but
+# SUBORDINATELY — see `_push_scope_verdict` below. This bound keeps applying
+# whenever no perimeter is declared or readable.
 _PUSH_ALLOWED_OWNER = "senara-solutions"
 
 # Whole-name match, never a substring: `refs/heads/feat/2736/main-bound` is
@@ -440,6 +455,67 @@ _DENY_REF_DELETE = "push-ref-delete"
 _DENY_REF_EXOTIC = "push-ref-exotic"
 _DENY_REF_PROTECTED = "push-ref-protected"
 _DENY_PUSH_OPAQUE = "push-body-unreadable"
+
+# ---------------------------------------------------------------------------
+# THE DECLARED PERIMETER (mika#2751, vol 2 of mika#2736)
+#
+# The bound above is static: it authorises `refs/heads/<anything>` under
+# `senara-solutions/<any repo>`. So a pilot dispatched on one ticket may still
+# push to mika-platform, mika-cloud, mika-skills — subclass P3 of the threat
+# model, its RELATIONAL half ("is this THE repository of THIS dispatch?" rather
+# than "is this a branch?").
+#
+# The perimeter travels by a HOST FILE RE-READ PER REQUEST, never by the
+# mitmdump environment. Measured, not assumed (§ 2.1 of the plan):
+# `_ensure_pilot_helper` returns 0 when the port is already alive, so the
+# daemon is shared across dispatches and its environment is the FIRST
+# dispatch's, forever. A perimeter passed by env would therefore name the wrong
+# repository for every spawn but one — silently, and in the widening direction.
+# `~/.mika` is not among the sandbox binds, so the registry is unforgeable from
+# inside the sandbox: the same host/sandbox asymmetry mika#2724 draws its
+# sentinel from.
+#
+# UNION SEMANTICS, imposed and not chosen (§ 2.2). One shared unix socket and
+# no credential on github.com means a request cannot be attributed to a spawn.
+# So the verdict is "does SOME live entry declare this repository?", not "does
+# THIS spawn's entry". For the repository dimension that is cheap: a pilot has
+# exactly one possible `origin` (one parent `.git` is bind-mounted, § 2.3) and
+# `DISPATCHABLE_REPO_BASENAMES` holds four names, so the union can never exceed
+# four repos and is insensitive to the TTL. The BRANCH dimension is unbounded
+# under the same semantics, which is why it is a separate flight and not an
+# omission.
+#
+# DEGRADATION, not refusal, on every failure of this channel — the exact
+# opposite posture to the sentinel's, deliberately. The sentinel answers "is
+# this the pilot?" and an unreadable registry means we no longer know, so it
+# refuses. This one answers "is it the right repository?" and an unreadable
+# registry means we never learned, so it falls back to the static bound. Two
+# contracts, two registries, two switches; collapsing them would make one datum
+# carry both (§ 3.2).
+# ---------------------------------------------------------------------------
+
+_DENY_SCOPE_REPO = "push-scope-repo"
+
+# Not a refusal: an ALLOW that says why the tightening did not apply. Two
+# distinct tokens for two OPPOSITE causes (mika#2205) — absent is a dispatch
+# that declared nothing (free-text mode, or a launcher that fail-opened),
+# unreadable is the host's own bookkeeping — and they name two different
+# remedies.
+_DEGRADE_SCOPE_ABSENT = "scope-absent"
+_DEGRADE_SCOPE_UNREADABLE = "scope-unreadable"
+_PUSH_SCOPE_DEGRADED = frozenset({_DEGRADE_SCOPE_ABSENT, _DEGRADE_SCOPE_UNREADABLE})
+
+# Its own switch, subordinate to `_PUSH_BOUND_SWITCH` and never a substitute
+# for it: point 3 of the ticket asks that the TIGHTENING be disarmable without
+# disarming the static bound. The converse is deliberately impossible — see
+# `_push_scope_verdict`.
+_PUSH_SCOPE_SWITCH = "MIKA_PILOT_EGRESS_PUSH_SCOPE"
+_PUSH_SCOPE_DIR_ENV = "_PILOT_EGRESS_PUSH_SCOPE_DIR"
+
+# `key=value` lines. This flight writes exactly one key. Unknown keys are
+# IGNORED on read, which makes the `ref=` of the branch flight a pure addition
+# with no migration and no second reader to update.
+_PUSH_SCOPE_REPO_KEY = "repo="
 
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 
@@ -510,12 +586,36 @@ _PUSH_DENY_BODIES = {
         "below; it is the reason a fail-closed bound is acceptable on the path of\n"
         "the autonomous loop.\n"
     ),
+    _DENY_SCOPE_REPO: (
+        "This push targets a repository the dispatch did not declare: {subject}\n"
+        "\n"
+        "It is inside the `" + _PUSH_ALLOWED_OWNER + "` organisation, so the\n"
+        "static bound let it through -- but no live entry of the host-side\n"
+        "perimeter registry names it. A pilot has exactly one possible `origin`\n"
+        "(one parent .git is bind-mounted into the sandbox), so a push to a\n"
+        "sibling repository of the organisation is never ordinary work.\n"
+        "\n"
+        "Remedy: check which repository the dispatch declared, host-side, by\n"
+        "listing ~/.mika/pilot-push-scopes/ (one file per live spawn, each a\n"
+        "`repo=` line). If the declared value is wrong, the fault is in the\n"
+        "launcher that wrote it; if the pushed value is wrong, look at the\n"
+        "`origin` URL of the worktree. The rollback below disarms this\n"
+        "tightening alone and leaves the organisation bound in place.\n"
+    ),
 }
+
+# Which ticket each motif belongs to. Named per motif rather than hardcoded,
+# so a refused operator lands on the flight that decided the refusal and not on
+# whichever one happened to write the formatting.
+_PUSH_DENY_TICKETS = {_DENY_SCOPE_REPO: "mika#2751"}
+_PUSH_DENY_DEFAULT_TICKET = "mika#2736"
 
 _PUSH_DENY_FOOTER = (
     "Rollback: " + _PUSH_BOUND_SWITCH + "=0 disarms THIS bound alone, in the\n"
     "environment of the mitmdump process. It leaves the api.github.com refusal\n"
     "of mika#2724 and the host-side credential injection of mika#2056 intact.\n"
+    + _PUSH_SCOPE_SWITCH + "=0 disarms the declared-perimeter tightening of\n"
+    "mika#2751 only, leaving the organisation bound above armed.\n"
 )
 
 
@@ -658,10 +758,127 @@ def _push_verdict(repo: str, commands: list[tuple[str, str, str]]) -> tuple[str,
     return _ALLOW, ""
 
 
+def _push_scope_enforced() -> bool:
+    """Is the declared-perimeter tightening armed in THIS process?
+
+    THE ONLY READER of `MIKA_PILOT_EGRESS_PUSH_SCOPE` in the whole repository,
+    and deliberately so: the refusal lives here, so the switch is read here and
+    nowhere else. The launcher writes the perimeter UNCONDITIONALLY — a
+    repository name is not a secret, and an entry nobody enforces does nothing.
+    A second reader is exactly how mika#2165 gets paid: a switch one of its two
+    readers ignores is decorative.
+
+    Same vocabulary and same default as the two switches above: unset or empty
+    means armed.
+    """
+    raw = os.environ.get(_PUSH_SCOPE_SWITCH)
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in _SWITCH_OFF
+
+
+def _push_scope_dir() -> Path:
+    """Where the host keeps one file per declared perimeter.
+
+    A registry of its own, not a field added to the sentinel entry: the two data
+    have opposite failure postures (that one refuses, this one degrades),
+    different switches, and will have different lifetimes. Resolved per call for
+    the same reason as `_registry_dir` — mitmdump is long-lived, and the staging
+    suites export HOME after sourcing the library.
+    """
+    override = os.environ.get(_PUSH_SCOPE_DIR_ENV)
+    if override:
+        return Path(override)
+    return Path.home() / ".mika" / "pilot-push-scopes"
+
+
+def _push_scope_repos() -> frozenset[str] | None:
+    """The repositories some live dispatch declares, or None if unreadable.
+
+    None — and ONLY None — means the registry could not be read at all:
+    directory absent, not a directory, any OSError. A registry that IS readable
+    but declares no `repo=` returns an empty frozenset, which is a DIFFERENT
+    state and lands on a different stderr token and a different remedy
+    (mika#2205). Both degrade to the static bound; conflating them would name
+    the wrong fault on the day it matters.
+
+    An entry that is individually unreadable is SKIPPED, never promoted to a
+    whole-registry failure: one spawn's bookkeeping going bad must not widen
+    nor narrow the verdict for its neighbours. Unknown keys are ignored, so the
+    branch flight's `ref=` is a pure addition.
+
+    Values are normalised the way `_receive_pack_repo` normalises the URL —
+    lowercased, `.git` suffix dropped — so the two forms meet already
+    comparable. GitHub is case-insensitive on `owner/repo`; a case-sensitive
+    comparison here would refuse a legitimate push on a capital letter.
+    """
+    directory = _push_scope_dir()
+    _purge_registry(directory)
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        # NO DIRECTORY AT ALL IS NOT A HOST FAULT, and this is the one place
+        # where this registry parts company with the sentinel's (where an
+        # absent directory IS unreadable). The launcher creates this one with
+        # the first perimeter it stages, so its absence means nothing was ever
+        # declared -- `scope-absent`, whose remedy is "find why the dispatch
+        # declared nothing". Calling it unreadable would send an operator
+        # looking at directory permissions for a launcher that never ran
+        # (mika#2205: naming the wrong remedy is the whole cost).
+        return frozenset()
+    except OSError:
+        # The path exists but cannot be scanned: a regular file where a
+        # directory belongs, EACCES, anything else. That IS host bookkeeping.
+        return None
+    repos: set[str] = set()
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            raw = Path(entry.path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(_PUSH_SCOPE_REPO_KEY):
+                continue
+            value = stripped[len(_PUSH_SCOPE_REPO_KEY):].strip().lower()
+            if value.endswith(".git"):
+                value = value[: -len(".git")]
+            if value:
+                repos.add(value)
+    return frozenset(repos)
+
+
+def _push_scope_verdict(repo: str) -> tuple[str, str]:
+    """`(_ALLOW, "")`, a degradation token, or `(_DENY_SCOPE_REPO, repo)`.
+
+    SUBORDINATE BY CONSTRUCTION. This function is only ever reached on a push
+    the static bound has ALREADY authorised, so its single new outcome is one
+    more refusal — there is no path by which it turns a refusal into an allow,
+    and no `return` of it can open anything. The property is structural, not a
+    thing to re-verify at each reading (§ 3.1 of the plan).
+
+    The degradation tokens are returned rather than logged here so the decision
+    stays pure and the caller owns every write to stderr.
+    """
+    if not _push_scope_enforced():
+        return _ALLOW, ""
+    declared = _push_scope_repos()
+    if declared is None:
+        return _DEGRADE_SCOPE_UNREADABLE, ""
+    if not declared:
+        return _DEGRADE_SCOPE_ABSENT, ""
+    if repo.strip().lower() in declared:
+        return _ALLOW, ""
+    return _DENY_SCOPE_REPO, repo
+
+
 def _push_deny_body(reason: str, subject: str) -> str:
     """The 403 body: the motif, the target, the remedy, and the rollback."""
+    ticket = _PUSH_DENY_TICKETS.get(reason, _PUSH_DENY_DEFAULT_TICKET)
     return (
-        f"mika-pilot-github-auth: DENY {reason} (mika#2736).\n"
+        f"mika-pilot-github-auth: DENY {reason} ({ticket}).\n"
         "\n"
         + _PUSH_DENY_BODIES[reason].format(subject=subject)
         + "\n"
@@ -724,7 +941,7 @@ def requestheaders(flow: http.HTTPFlow) -> None:
 
 
 def request(flow: http.HTTPFlow) -> None:
-    """Bound what a `git-receive-pack` may touch (mika#2736).
+    """Bound what a `git-receive-pack` may touch (mika#2736, mika#2751).
 
     WHY THIS HOOK AND NOT `requestheaders`, where the injection lives. The
     verdict needs the BODY: the repository is in the URL, but the ref commands
@@ -763,7 +980,27 @@ def request(flow: http.HTTPFlow) -> None:
     else:
         reason, subject = _push_verdict(repo, commands)
     if reason == _ALLOW:
-        return
+        # The declared-perimeter tightening (mika#2751) sits HERE and nowhere
+        # else: strictly under the static bound, reached only on a push
+        # mika#2736 already authorised. That placement is what makes point 2 of
+        # the ticket — an absent or unreadable perimeter must keep the static
+        # bound applying — true by construction rather than by vigilance.
+        scope, scope_subject = _push_scope_verdict(repo)
+        if scope in _PUSH_SCOPE_DEGRADED:
+            # An ALLOW that says why it did not tighten. Same line shape as the
+            # DENY tap, different verb: `grep scope-absent` on the mitmdump log
+            # is the operator probe, and a line per dispatch means the
+            # tightening never bites — the silent failure to watch for.
+            print(
+                f"[github-proxy] DEGRADE {scope} "
+                f"{flow.request.method} {flow.request.path}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        if scope == _ALLOW:
+            return
+        reason, subject = scope, scope_subject
     # The exact line shape of vol 2 — one motif more in an existing vocabulary
     # beats a second form of line to grep. The motif, the method and the path;
     # never the presented credential, never the host token, never a digest of
