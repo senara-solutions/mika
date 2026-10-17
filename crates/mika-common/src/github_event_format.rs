@@ -180,6 +180,64 @@ pub const PUSH_EVENT_PREFIX: &str = "[GitHub] push.";
 /// Consommateur : [`mask_cited_branch`].
 pub const GITHUB_EVENT_TEXT_PREFIX: &str = "[GitHub] ";
 
+/// Suffixe de l'identifiant d'une balise d'enveloppe de gestionnaire.
+///
+/// Déclaré ici plutôt qu'écrit en littéral dans
+/// [`is_handler_envelope_open_tag`] pour que la **forme** soit le seul critère :
+/// aucun nom de gestionnaire n'apparaît dans le code de production du prédicat.
+const HANDLER_ENVELOPE_TAG_SUFFIX: &str = "_handler";
+
+/// Cette ligne est-elle la balise **ouvrante** d'une enveloppe de gestionnaire ?
+///
+/// Reconnue **sur sa forme** — `<` + identifiant `[a-z0-9_]+` finissant par
+/// `_handler` + `>` — et jamais sur une liste de noms. C'est la doctrine de
+/// `landing-tokens-lint` (mika#1804) : la régression réaliste n'est pas de
+/// réécrire `<ci_success_handler>`, c'est d'ajouter un huitième gestionnaire et
+/// d'oublier la liste. Un espacement autour de la balise est toléré ; tout le
+/// reste est refusé, y compris la balise **fermante** (`/` n'est pas un
+/// caractère d'identifiant).
+///
+/// Consommateur : [`mask_cited_branch`], par son prédicat d'engagement.
+pub fn is_handler_envelope_open_tag(line: &str) -> bool {
+    let Some(inner) = line
+        .trim()
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let Some(stem) = inner.strip_suffix(HANDLER_ENVELOPE_TAG_SUFFIX) else {
+        return false;
+    };
+    // `<_handler>` n'est pas un identifiant de gestionnaire : il n'en nomme
+    // aucun.
+    !stem.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Ce texte cite-t-il un événement GitHub ? — prédicat d'**engagement** du
+/// masque (mika#2768).
+///
+/// Vrai si *au moins une* ligne commence par [`GITHUB_EVENT_TEXT_PREFIX`],
+/// **ou** si la première ligne est une balise ouvrante de gestionnaire
+/// ([`is_handler_envelope_open_tag`]).
+///
+/// La seconde clause est une **défense en profondeur**, pas le mécanisme
+/// principal : tous les pré-digests recensés portent aussi une ligne
+/// `[GitHub] `, donc c'est la clause par ligne qui décide pour eux. Elle couvre
+/// l'enveloppe qui citerait un slug en prose sans porter le gabarit, et son
+/// test dédié est ce qui l'empêche d'être du code mort.
+fn cites_a_github_event(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with(GITHUB_EVENT_TEXT_PREFIX))
+        || text
+            .lines()
+            .next()
+            .is_some_and(is_handler_envelope_open_tag)
+}
+
 /// Retire le slug de branche qu'un texte d'événement GitHub **cite**, en
 /// laissant le marqueur en place : `… (branch: feat/x)` devient `… (branch: )`.
 ///
@@ -194,24 +252,43 @@ pub const GITHUB_EVENT_TEXT_PREFIX: &str = "[GitHub] ";
 /// branche est une **donnée citée** par le substrat, jamais une intention
 /// exprimée par quelqu'un.
 ///
-/// # Contrat — trois refus, tous fail-safe
+/// # Ce que mika#2768 a changé — à lire avant de relire le vol 1
+///
+/// Le vol 1 n'engageait le masque que si la **première ligne** portait le
+/// gabarit, et ne coupait qu'**une** occurrence. Un pré-digest enveloppé
+/// (`<ci_success_handler>\n[GitHub] …`) échappait donc entier : le 2026-10-17 à
+/// 08:59:18Z, le `groom` du slug `fix/2762/rollback-reaper-groom` a armé
+/// `required_tools`, mika-dev a groomé mika#2766 — un ticket **sans** label
+/// `ready`, donc hors du consentement positif de mika#841 — et a failli en
+/// dispatcher l'implémentation. Trois propriétés documentées du vol 1 ont
+/// changé, et aucune n'est un accident :
+///
+/// 1. **L'engagement est par ligne, plus par première ligne.** Un texte dont
+///    *une* ligne commence par [`GITHUB_EVENT_TEXT_PREFIX`] est engagé, où que
+///    cette ligne soit : derrière une enveloppe de gestionnaire, derrière un
+///    enrichissement préfixé. Conséquence assumée : un humain qui **recopie**
+///    une ligne d'événement cite lui aussi une donnée, et son slug est masqué.
+/// 2. **Le refus de forme est par occurrence, plus global.** Une occurrence du
+///    marqueur sans `)` sur sa ligne est **sautée** — on ne coupe pas à
+///    l'aveugle — sans empêcher les autres d'être masquées.
+/// 3. **« `find`, pas `rfind` » a disparu, et avec elle « un titre qui imite le
+///    marqueur est mangé ».** Chaque occurrence étant traitée, tous les slugs
+///    partent *et* le texte entre eux survit. La raison fail-safe de manger le
+///    titre était qu'on ne savait couper qu'une fois. Épinglé par
+///    `mask_cited_branch_masks_every_run_and_keeps_the_title_between_them` —
+///    sans ce test, un relecteur lirait une régression du vol 1.
+///
+/// # Contrat — deux refus, tous deux fail-safe
 ///
 /// Renvoie `Cow::Borrowed(text)` **inchangé** quand :
 ///
-/// 1. `text` ne commence pas par [`GITHUB_EVENT_TEXT_PREFIX`] — ce n'est pas un
-///    événement webhook, donc rien n'y est « cité » ;
-/// 2. la **première ligne** ne contient pas [`BRANCH_MARKER`] — aucune branche
-///    citée (`issue_comment`, `issues`, `pull_request_review`, `push`) ;
-/// 3. la première ligne ne finit pas par `)` — la forme attendue n'est pas là,
-///    et un masquage à l'aveugle couperait du texte au hasard.
-///
-/// # `find`, pas `rfind` — et c'est délibéré
-///
-/// La coupe part de la **première** occurrence du marqueur. Un titre de PR
-/// contenant ` (branch: ` fait donc manger le titre aussi. C'est le sens du
-/// fail-safe : masquer plus de données citées, jamais moins. Épinglé par
-/// `mask_cited_branch_eats_a_title_that_imitates_the_marker`, pour que ce soit
-/// une propriété choisie et non une surprise.
+/// 1. [`cites_a_github_event`] est faux — aucune ligne d'événement, aucune
+///    enveloppe de gestionnaire : rien n'y est « cité », et un message humain
+///    est le seul canal par lequel un opérateur exprime une intention en texte
+///    libre ;
+/// 2. aucune occurrence du marqueur n'était masquable — texte sans
+///    [`BRANCH_MARKER`] (`issue_comment`, `issues`, `pull_request_review`,
+///    `push`), ou occurrences toutes de forme inattendue.
 ///
 /// # Portée
 ///
@@ -221,22 +298,42 @@ pub const GITHUB_EVENT_TEXT_PREFIX: &str = "[GitHub] ";
 /// tous `params.user_message` intact : le modèle voit la branche, c'est la
 /// *détection d'intention* qui ne la lit plus.
 pub fn mask_cited_branch(text: &str) -> Cow<'_, str> {
-    if !text.starts_with(GITHUB_EVENT_TEXT_PREFIX) {
+    if !cites_a_github_event(text) {
         return Cow::Borrowed(text);
     }
-    // Même discipline « première ligne » que `webhook_prefilter::trigger_class` :
-    // le corps d'un ticket ou d'une review suit, et n'a rien à voir ici.
-    let head = text.lines().next().unwrap_or(text);
-    let Some(at) = head.find(BRANCH_MARKER) else {
-        return Cow::Borrowed(text);
-    };
-    if head.strip_suffix(')').is_none() {
+    // Tous les offsets ci-dessous sont prouvés sur frontière de caractère
+    // (mika#764) : `find` en rend une, `BRANCH_MARKER.len()` ajouté à une
+    // position où le marqueur a matché en est une, et `')'` comme `'\n'` sont
+    // ASCII.
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut cursor = 0usize;
+    let mut masked_any = false;
+
+    while let Some(rel) = text[cursor..].find(BRANCH_MARKER) {
+        let after = cursor + rel + BRANCH_MARKER.len();
+        // La coupe est bornée à la ligne de l'occurrence : la ligne suivante
+        // (une URL de PR, la prose d'un enrichissement) n'a rien à voir ici.
+        let line_end = text[after..].find('\n').map_or(text.len(), |nl| after + nl);
+        match text[after..line_end].find(')') {
+            Some(rel_close) => {
+                let close = after + rel_close;
+                out.push_str(&text[last..after]);
+                masked_any = true;
+                last = close;
+                cursor = close;
+            }
+            // Forme inattendue : on ne coupe pas à l'aveugle, on passe à
+            // l'occurrence suivante.
+            None => cursor = after,
+        }
+    }
+
+    if !masked_any {
         return Cow::Borrowed(text);
     }
-    // Offsets prouvés sur frontière de caractère : `find` en renvoie une, et
-    // `BRANCH_MARKER` comme `head` sont mesurés en octets sur `text` lui-même.
-    let kept = at + BRANCH_MARKER.len();
-    Cow::Owned(format!("{}){}", &text[..kept], &text[head.len()..]))
+    out.push_str(&text[last..]);
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -331,19 +428,162 @@ mod tests {
     }
 
     #[test]
-    fn mask_cited_branch_eats_a_title_that_imitates_the_marker() {
-        // Le fail-safe de `find`, épinglé plutôt que subi : un titre de PR qui
-        // contient lui-même ` (branch: ` est mangé avec le slug. Masquer plus
-        // de données citées est le bon sens de l'erreur.
+    fn mask_cited_branch_masks_every_run_and_keeps_the_title_between_them() {
+        // Ce test épinglait l'inverse au vol 1 (mika#2755) : il s'appelait
+        // `…_eats_a_title_that_imitates_the_marker` et exigeait `… — lire
+        // (branch: )`, titre tronqué. Ce n'était pas une préférence, c'était la
+        // conséquence de ne savoir couper qu'UNE fois : manger le titre était le
+        // bon sens de l'erreur, puisque masquer plus de données citées vaut
+        // mieux que moins.
+        //
+        // Le masquage par occurrence (mika#2768) retire cette contrainte : tous
+        // les slugs partent ET le texte entre eux survit. Ce n'est donc pas une
+        // régression du vol 1, c'est sa propriété fail-safe devenue inutile.
         let text = "[GitHub] PR opened: senara-solutions/mika#2755 — lire (branch: x) comme une intention (branch: fix/2755/groom-dans-un-nom)\nhttps://example.invalid/pull/2755";
 
         let masked = mask_cited_branch(text);
 
         assert_eq!(
             masked.as_ref(),
-            "[GitHub] PR opened: senara-solutions/mika#2755 — lire (branch: )\nhttps://example.invalid/pull/2755",
-            "la coupe part de la PREMIÈRE occurrence du marqueur"
+            "[GitHub] PR opened: senara-solutions/mika#2755 — lire (branch: ) comme une intention (branch: )\nhttps://example.invalid/pull/2755",
+            "chaque occurrence est masquée, et le titre entre les deux survit"
         );
+    }
+
+    #[test]
+    fn mika2768_masks_the_slug_of_the_wrapped_pre_digest_word_for_word() {
+        // Le message reçu par le tour mika-dev du 2026-10-17 08:59:18Z, mot
+        // pour mika#2768. C'est le vol 1 qui le laissait passer entier : son
+        // `starts_with` portait sur la PREMIÈRE ligne, et celle-ci est la
+        // balise ouvrante du gestionnaire.
+        let text = "<ci_success_handler>\n\
+                    [GitHub] Check suite success on senara-solutions/mika#2765 (branch: fix/2762/rollback-reaper-groom)\n\
+                    CI checks all green + VERDICT: pass from @mika-platform-qa — every gate cleared for head abc123.\n\
+                    </ci_success_handler>";
+
+        let masked = mask_cited_branch(text);
+
+        assert!(
+            !masked.contains("groom"),
+            "c'est ce `groom`-là, dans le slug, qui a armé `required_tools` de \
+             dev-groom et fait groomer mika#2766 sans label `ready` : {masked}"
+        );
+        assert!(
+            masked.contains("senara-solutions/mika#2765 (branch: )"),
+            "le marqueur reste en place, seul le slug part : {masked}"
+        );
+        assert!(
+            masked.contains("</ci_success_handler>"),
+            "l'enveloppe traverse intacte : {masked}"
+        );
+    }
+
+    #[test]
+    fn mika2768_masks_a_prefixed_enrichment_without_eating_the_sentence() {
+        // Chemin 3 : un enrichissement de `Passthrough` cite le slug dans sa
+        // prose, puis le texte brut du webhook suit. La coupe doit s'arrêter au
+        // `)` — la phrase qui vient après porte la consigne que le modèle lit.
+        let text = "[ci_failure_handler] CI failure on senara-solutions/mika#2765 (branch: fix/2762/rollback-reaper-groom). \
+                    A fix is already in-flight for task t-42. Wait for the callback to finish before taking further action.\n\n\
+                    [GitHub] Check suite failure on senara-solutions/mika#2765 (branch: fix/2762/rollback-reaper-groom)";
+
+        let masked = mask_cited_branch(text);
+
+        assert!(
+            !masked.contains("groom"),
+            "les deux occurrences doivent partir, celle de la prose comme celle \
+             du gabarit : {masked}"
+        );
+        assert!(
+            masked.contains("(branch: ). A fix is already in-flight for task t-42."),
+            "la phrase qui suit le `)` survit intacte : {masked}"
+        );
+    }
+
+    #[test]
+    fn mika2768_masks_an_envelope_that_cites_a_slug_only_in_prose() {
+        // Le seul cas où la clause « enveloppe » décide seule : aucune ligne ne
+        // porte `[GitHub] `. Sans ce test, cette clause serait du code mort non
+        // testé (risque nommé au § 11 du plan).
+        let text = "<verdict_handler>\n\
+                    Le correctif en vol vise (branch: fix/2762/rollback-reaper-groom) et rien d'autre.\n\
+                    </verdict_handler>";
+
+        let masked = mask_cited_branch(text);
+
+        assert!(
+            !masked.contains("groom"),
+            "l'enveloppe engage le masque à elle seule : {masked}"
+        );
+        assert!(
+            masked.contains("vise (branch: ) et rien d'autre."),
+            "la prose autour du marqueur survit : {masked}"
+        );
+    }
+
+    #[test]
+    fn mika2768_skips_an_unclosed_occurrence_without_sparing_its_neighbour() {
+        // Le refus de forme du vol 1 était global : une occurrence sans `)`
+        // faisait refuser le texte ENTIER, donc laissait passer les slugs des
+        // autres occurrences. Il est désormais par occurrence.
+        let text = "[GitHub] PR opened: senara-solutions/mika#2766 (branch: fix/x/groom-un) — suite (branch: fix/y/groom-deux";
+
+        let masked = mask_cited_branch(text);
+
+        assert_eq!(
+            masked.as_ref(),
+            "[GitHub] PR opened: senara-solutions/mika#2766 (branch: ) — suite (branch: fix/y/groom-deux",
+            "la première occurrence est masquée ; la seconde, sans `)` sur sa \
+             ligne, est laissée intacte plutôt que coupée à l'aveugle"
+        );
+    }
+
+    #[test]
+    fn mika2768_borrows_an_engaged_text_with_nothing_maskable() {
+        // Discipline d'emprunt : engagé n'est pas masqué. Rien n'a bougé, donc
+        // rien n'est alloué.
+        let text = "<ci_failure_handler>\nAucune branche n'est citée ici.\n</ci_failure_handler>";
+
+        let masked = mask_cited_branch(text);
+
+        assert!(
+            matches!(masked, Cow::Borrowed(_)),
+            "aucune occurrence masquée : le texte doit être emprunté"
+        );
+        assert_eq!(masked.as_ref(), text);
+    }
+
+    #[test]
+    fn mika2768_the_envelope_is_recognised_by_shape_not_by_name() {
+        for tag in [
+            "<ci_success_handler>",
+            "<ci_failure_handler>",
+            "<verdict_handler>",
+            "<ready_label_handler>",
+            // Nom inventé : c'est lui qui prouve qu'aucune liste n'est tenue.
+            "<zorglub8_handler>",
+        ] {
+            assert!(
+                is_handler_envelope_open_tag(tag),
+                "forme valide refusée : {tag:?} — un huitième gestionnaire doit \
+                 être reconnu le jour où il est écrit, sans liste à tenir"
+            );
+        }
+
+        for not_a_tag in [
+            "<html>",
+            "</ci_success_handler>",
+            "<not-a-handler>",
+            "<_handler>",
+            "[GitHub] Check suite success on senara-solutions/mika (branch: x)",
+            "<ci_success_handler",
+            "<CiSuccessHandler>",
+        ] {
+            assert!(
+                !is_handler_envelope_open_tag(not_a_tag),
+                "forme invalide acceptée : {not_a_tag:?}"
+            );
+        }
     }
 
     #[test]
