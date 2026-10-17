@@ -5,5 +5,6 @@
 //! under `tests/`. Keep it minimal — most code stays binary-private.
 
 pub mod ask_message;
+pub mod budget_floor;
 pub mod remote_ask;
 pub mod supervision;
