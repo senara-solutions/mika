@@ -3389,50 +3389,41 @@ mod tests {
         }
     }
 
-    /// mika#2309 § Fire-Disposition surface 3 — **contrôle positif
-    /// auto-nettoyant** sur une divergence vivante, mesurée le 2026-09-18.
+    /// mika#2759 — le plancher d'envoi **couvre** l'enveloppe per-agent que ce
+    /// fichier déclare pour mika-arch.
     ///
-    /// # Le fait
+    /// # Ce qu'il remplace
     ///
-    /// `mika_a2a::client::resolve_timeout_secs` ne lit que
-    /// `MIKA_AGENT_TOTAL_TIMEOUT_SECS` dans l'env **du process** ; il ne lit
-    /// jamais le `config.toml` **per-agent**. Or `MIKA_ARCH_CONFIG` pose
-    /// `agent_total_timeout_secs = 900` (mika#2189). Sur un appel vers
-    /// mika-arch, le client résout donc son défaut (600 s) face à une enveloppe
-    /// de 900 s : le plancher `client >= total` de mika#2297 **n'est pas tenu**,
-    /// et le client abandonne une génération que le moteur a encore le droit de
-    /// finir — exactement le sinistre du 11/09 qui a motivé le passage de 300 à
-    /// 600.
+    /// Jusqu'ici ce site portait `mika2309_client_default_is_below_the_arch_envelope`,
+    /// un **contrôle positif auto-nettoyant** qui affirmait l'écart au lieu de le
+    /// taire : le défaut client (600 s) était strictement *sous* l'enveloppe
+    /// per-agent de mika-arch (900 s, mika#2189), donc le plancher
+    /// `client >= total` de mika#2297 n'était pas tenu et le client abandonnait
+    /// une génération que le moteur avait encore le droit de finir — le sinistre
+    /// du 11/09. Son propre message disait quoi faire le jour où il rougirait :
+    /// « la divergence est résolue et il doit être RETIRÉ avec son ticket de
+    /// suivi, pas ajusté ». mika#2759 **est** ce ticket de suivi, et ceci est ce
+    /// retrait (discipline mika#1574 : une exception part avec sa cause).
     ///
-    /// # Pourquoi un test qui *constate* au lieu de corriger
+    /// # Ce qu'il affirme à la place
     ///
-    /// Corriger revient à apprendre au client a2a à lire la cascade per-agent,
-    /// c'est-à-dire un changement de **comportement runtime** que mika#2309
-    /// s'interdit en tête (« substrat borné »). Et la forme même est la
-    /// question : le client ne connaît pas l'agent visé au moment où il résout
-    /// son budget. La doctrine (`docs/solutions/best-practices/fire-disposition-doctrine.md`)
-    /// nomme ce cas — la résolution de la violation préexistante *est* la
-    /// question de périmètre — et n'autorise pas à surfacer puis passer à autre
-    /// chose : d'où ce contrôle.
+    /// La même paire de valeurs réelles, avec l'assertion retournée dans le sens
+    /// que la correction rend vrai : l'enveloppe lue dans `MIKA_ARCH_CONFIG`,
+    /// passée au **noyau pur** du résolveur comme candidat `total`, ressort
+    /// couverte. C'est exactement ce que `budget_floor` obtient de l'attestation
+    /// de spirit puis passe à `resolve_send_timeout_with_floor` au moment de
+    /// l'envoi : l'enveloppe per-agent n'est plus une valeur que le client ignore,
+    /// c'est un troisième candidat au `max`.
     ///
-    /// # Ce qu'il fait rougir, et c'est le point
+    /// Il rougit si quelqu'un lève l'enveloppe de mika-arch **et** casse la
+    /// résolution par `max` — c'est-à-dire si le plancher redevient un plafond.
+    /// Le `max` étant total, aucune valeur d'enveloppe ne peut le faire rougir
+    /// seule : c'est la propriété, pas le chiffre, qui est épinglée ici.
     ///
-    /// Il lit les **deux valeurs réelles** et affirme l'écart. Il rougit donc le
-    /// jour où l'écart disparaît — valeurs alignées, ou client apprenant à lire
-    /// le per-agent — ce qui force à retirer l'exception au lieu de la laisser
-    /// survivre à sa cause.
-    ///
-    /// # Ticket de suivi
-    ///
-    /// La divergence est remontée dans son propre ticket (portée de lecture du
-    /// plancher mika#2297 face aux cascades per-agent de mika#2189) ; son corps
-    /// intégral est reproduit dans la description de la PR qui livre mika#2309,
-    /// et son numéro s'inscrit ici à son ouverture. **Ce qui est interdit à qui
-    /// lit ce test** : aligner `DEFAULT_TIMEOUT` sur 900, ou faire lire le
-    /// `config.toml` per-agent au client, de sa propre autorité. Les deux
-    /// changent un budget de production.
+    /// Il passe par le noyau pur `resolve_timeout_secs`, donc il ne touche pas à
+    /// l'environnement du process et n'a pas besoin de `#[serial]`.
     #[test]
-    fn mika2309_client_default_is_below_the_arch_envelope() {
+    fn mika2759_le_plancher_couvre_lenveloppe_de_mika_arch() {
         let config: toml::Value =
             toml::from_str(MIKA_ARCH_CONFIG).expect("MIKA_ARCH_CONFIG should be valid TOML");
         let arch_envelope = config["agent_total_timeout_secs"]
@@ -3440,15 +3431,17 @@ mod tests {
             .expect("mika-arch declares agent_total_timeout_secs")
             as u64;
 
-        let client_default = mika_a2a::client::DEFAULT_TIMEOUT.as_secs();
+        let resolved = mika_a2a::client::resolve_timeout_secs(None, Some(arch_envelope));
 
         assert!(
-            client_default < arch_envelope,
-            "mika#2309 surface 3 : l'écart mesuré entre le défaut client a2a \
-             ({client_default}s) et l'enveloppe per-agent de mika-arch \
-             ({arch_envelope}s) a disparu. Ce test est un contrôle positif \
-             auto-nettoyant : s'il rougit, la divergence est résolue et il doit \
-             être RETIRÉ avec son ticket de suivi, pas ajusté."
+            resolved >= arch_envelope,
+            "mika#2759 : le budget d'envoi résolu ({resolved}s) est sous \
+             l'enveloppe per-agent de mika-arch ({arch_envelope}s). Le plancher \
+             `client >= total` de mika#2297 n'est plus tenu pour un agent dont \
+             l'enveloppe est per-agent (mika#2189) : le client abandonnerait une \
+             génération que le moteur a encore le droit de finir. Le remède est \
+             dans `resolve_timeout_secs`, qui doit résoudre par `max` — PAS ici, \
+             et surtout pas en baissant l'enveloppe."
         );
     }
 
