@@ -271,6 +271,40 @@ socket ne tourne pas sous l'uid du relais. Revenir au binaire précédent
 (`--restart-relay` après réinstallation), puis établir lequel avant toute
 correction ; ne pas élargir le mode par réflexe.
 
+### 4.5 Un démon qui porte du code d'egress ne survit plus à son code (mika#2029)
+
+Mesuré trois fois (2026-08-29, 2026-09-11, 2026-10-16) : un démon lancé une fois
+sert indéfiniment, y compris après que `make install` a posé un code différent à
+côté de lui. Le 16 octobre, un `mitmdump` du 13 servait encore les addons que
+l'installation de 14:37Z avait remplacés — le refus d'egress de mika#2724 et la
+sentinelle de mika#2723 existaient, leur CI était verte, et ils ne tournaient
+pas. Depuis mika#2029, `_ensure_pilot_helper` ne demande plus seulement
+« quelqu'un écoute-t-il ? » : au dispatch suivant, il compare la date des
+fichiers de code (`mitmdump`, les deux addons) au démarrage de leur porteur, et
+le dit sur stderr sous le préfixe `dispatch-lib: pilot_daemon_freshness.`. Le
+geste réparateur est automatique — un `TERM` au porteur du port 8892 par
+identité de socket, jamais par nom de processus, puis la relance du lanceur
+existant. **Ce vol ne câble que le `mitmdump`** ; le relais garde ses gestes
+manuels du § 4.2 (vol 3, suivi dans senara-solutions/mika#2029).
+
+Cinq jetons, et ce que chacun vous demande. `fresh` est **silencieux** : il
+n'écrit rien, pour qu'une ligne par dispatch sur l'état nominal ne noie pas les
+autres. `stale` annonce la relance qui vient d'avoir lieu et nomme le fichier
+qui l'a déclenchée — rien à faire, c'est l'issue souhaitée, et attendez-vous à la
+voir une fois par démon après chaque `make install` (le `Makefile` réécrit ces
+fichiers inconditionnellement, contenu identique ou non : c'est un coût assumé,
+un deploy étant précisément l'instant où l'on veut que le démon reprenne son
+code). `stale_deferred` dit qu'un pilote frère vole — un `*.stderr` de moins de
+300 s dans `/var/log/claude-pilot` — et que la relance attend : **aucun geste**,
+le prochain dispatch sans frère en vol la fera. `undecidable` dit que le port est
+tenu mais que son porteur n'est pas identifiable (`fuser` absent, ou port sans
+porteur lisible) ; « on ne sait pas » n'est pas « périmé », le démon est conservé
+et **rien ne vous est demandé** — sauf si la ligne se répète à chaque dispatch,
+auquel cas installez `psmisc`. Seul `stale_unstoppable` appelle un regard : le
+porteur tient toujours le port 8892 trois secondes après un `TERM`, il n'y a pas
+d'escalade en `KILL`, et le démon périmé est conservé plutôt que de laisser un
+port orphelin — allez voir qui le tient (`fuser -v -n tcp 8892`).
+
 ## 5. Le canal d'alerte fonctionne-t-il ? — à faire AVANT l'incident
 
 **C'est la section dont l'absence coûte l'alerte entière**, et elle n'a de chance
