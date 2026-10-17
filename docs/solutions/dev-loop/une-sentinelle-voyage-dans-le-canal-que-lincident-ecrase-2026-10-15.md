@@ -11,6 +11,7 @@ symptoms:
   - "l'addon d'egress retire tout `Authorization` du client puis injecte le jeton de l'hôte : un appel légitime et un appel de test sont indiscernables"
   - "la forme proposée par le corps du ticket — un en-tête dédié `X-Mika-Egress-Sentinel` — n'est pas implémentable sans un shim `gh` sur le PATH"
   - "sur `github.com` aucun justificatif ne peut voyager, donc la moitié `git push` semble hors d'atteinte — alors que le proxy voit déjà le dépôt et les refs (mika#2736)"
+  - "une entrée de périmètre survit à son pilote, donc la force du garde dépend de l'heure ; et la purger trop tôt refuse le push d'un pilote vif sous un voisin vif (mika#2766)"
 root_cause: design_decision
 resolution_type: design_decision
 related_components:
@@ -25,6 +26,8 @@ tags:
   - attestation
   - fail-open
   - receive-pack
+  - entry-lifecycle
+  - ttl
 ticket: mika#2716
 ---
 
@@ -35,8 +38,9 @@ haltes) vit dans `docs/operator/environment-variables.md` § *La sandbox de pilo
 présente un justificatif d'egress, et l'addon l'exige — et ce qu'elle pousse est
 borné (mika#2716, mika#2724, mika#2736)*. Ce document garde seulement le
 raisonnement de **choix du canal**, qui se transpose à toute attestation posée
-devant un proxy qui réécrit les requêtes — et, depuis mika#2736, la question qui
-vient quand aucun canal ne convient.
+devant un proxy qui réécrit les requêtes — depuis mika#2736, la question qui
+vient quand aucun canal ne convient, et depuis mika#2766, comment se choisit la
+durée de vie de ce qui voyage dans ce canal.
 
 ## Le problème
 
@@ -357,13 +361,18 @@ d'ajouter une dimension à un périmètre lu par union :
 | dimension | cardinalité de l'union | conséquence |
 |---|---|---|
 | **dépôt** | **bornée par quatre** — `_is_dispatchable_repo` refuse tout ce qui sort de `DISPATCHABLE_REPO_BASENAMES` (`mika`, `mika-cloud`, `mika-skills`, `mika-platform`) | le resserrement est **insensible au TTL** : une entrée résiduelle n'élargit l'union vers rien que le vol suivant n'aurait pu déclarer lui-même. Livrable seul |
-| **branche** | **non bornée** — chaque vol ajoute un nom | une entrée qui survit à son pilote laisse **sa branche** poussable par le suivant. Le resserrement vaut exactement ce que vaut la désinscription des entrées — donc ni plus ni moins que le cycle de vie, qui n'existe pas encore |
+| **branche** | **non bornée** — chaque vol ajoute un nom | une entrée qui survit à son pilote laisse **sa branche** poussable par le suivant. Le resserrement vaut exactement ce que vaut la désinscription des entrées — donc ni plus ni moins que le cycle de vie |
 
-D'où le découpage : la dimension dépôt est livrée par mika#2751, la dimension
-branche et le cycle de vie partent **ensemble** dans senara-solutions/mika#2766.
-Livrer `ref=` sans la désinscription donnerait un garde qui se desserre tout
-seul au fil de la journée, et dont la force dépendrait de l'heure — exactement
-la forme d'un garde dont on ne peut rien conclure.
+**D'où l'ordre des vols, et c'est l'ordre que ce tableau impose.** La dimension
+dépôt est livrée par mika#2751, parce qu'elle est la seule des deux qui soit
+livrable **seule**. Le **cycle de vie** suit (mika#2766, § ci-dessous), et la
+dimension **branche** vient après lui (senara-solutions/mika#2776). L'ordre
+inverse — `ref=` d'abord — aurait donné un garde qui se desserre tout seul au
+fil de la journée, et dont la force dépendrait de l'heure : exactement la forme
+d'un garde dont on ne peut rien conclure. Un resserrement dont la valeur est
+conditionnée par un mécanisme qui n'existe pas encore attend ce mécanisme ; ce
+n'est pas une précaution de style, c'est que la mesure de sa force est
+indisponible avant.
 
 **Une propriété rassurante tombe de l'union, et il faut la nommer parce qu'elle
 gouverne la lecture des incidents : une entrée de plus ne peut qu'ÉLARGIR
@@ -371,7 +380,16 @@ l'union, jamais la resserrer.** Donc une entrée résiduelle, parasite ou mal
 écrite ne peut pas **provoquer** un refus ; elle ne peut qu'en **manquer** un.
 C'est ce qui rend inoffensive l'entrée que `scripts/canary-pilot-containment`
 dépose à chaque passage, et ce qui dit à l'opérateur qu'un `push-scope-repo` sur
-un push légitime ne vient jamais du registre d'un voisin.
+un push légitime ne vient jamais de la **présence** de l'entrée d'un voisin.
+
+**La symétrie s'arrête là, et c'est le point que le cycle de vie a dû traiter :
+une entrée de MOINS, elle, peut provoquer un refus.** Non par sa propre absence
+— un registre vide dégrade — mais parce que la dégradation porte sur le registre
+**entier**. Retirer l'entrée d'un pilote vif pendant qu'un voisin maintient le
+registre non vide ne le fait pas tomber dans la dégradation : il tombe dans le
+refus. Le voisin ne cause pas le 403, il **retire la porte de sortie** qui
+l'aurait évité. Les deux formes se lisent donc en sens opposés, et un opérateur
+qui ne tient que la première instruira le mauvais incident.
 
 ### Un pilote n'a qu'un seul `origin` possible, et c'est ce qui rend la question décidable
 
@@ -403,6 +421,94 @@ motif `push-scope-repo`, les deux jetons de dégradation et leurs remèdes
 distincts, la matrice des deux interrupteurs, la sonde `grep 'DEGRADE scope-'` —
 vit à l'entrée `MIKA_PILOT_EGRESS_PUSH_SCOPE` de
 `docs/operator/environment-variables.md`.
+
+## Une entrée de périmètre meurt avec son spawn, et son TTL est un PLANCHER (mika#2766)
+
+Le vol 3, et la moitié dont le § précédent disait qu'elle conditionne la
+suivante. Deux mécanismes, dont le second n'existe que parce que le premier ne
+peut pas tout couvrir :
+
+- **la désinscription**, à la fin du **spawn** — l'entrée a un nonce que le
+  lanceur tient déjà (`_PILOT_EGRESS_PUSH_SCOPE_ENTRY`) ;
+- **un TTL côté addon**, parce qu'un dispatch tué par `SIGKILL` n'exécute
+  **aucun trap**. Une entrée que rien n'a retirée doit cesser de répondre
+  d'elle-même.
+
+### À la fin du spawn et non du dispatch, parce qu'un nonce devient inconnaissable
+
+Le réflexe serait un `trap EXIT` au niveau du dispatch : un seul site, une seule
+ligne. Il serait **faux**, et la mesure qui le dit est que `_run_pilot_sandboxed`
+tourne **plus d'une fois** par dispatch — le pilote principal, puis les pilotes
+de révision, de section manquante, de taille de plan. Or
+`_stage_pilot_egress_push_scope` remet le nonce **à vide** à chaque entrée. Le
+nonce du spawn N est donc inconnaissable dès que le spawn N+1 stage : un trap de
+dispatch ne pourrait nettoyer que le **dernier**, en laissant tous les
+précédents, qui sont exactement ceux dont on voulait borner la durée de vie.
+
+D'où un **appel explicite** à la fin de `_run_pilot_sandboxed` plus un **filet**
+dans le trap de sortie — la forme de `_release_issue_seat` (mika#2155), et pour
+la même raison : bash n'a pas de trap à portée de fonction. L'appel est placé
+**après** la capture de `_sandbox_rc` (invariant mika#2039), donc le statut du
+pilote reste celui de la fonction : une désinscription ne peut pas changer le
+verdict d'un vol.
+
+La désinscription retire **sa propre entrée**, jamais un balayage et jamais le
+répertoire. Un voisin en vol n'est pas à elle — et le § suivant dit ce que
+coûterait l'inverse.
+
+### L'asymétrie des erreurs, qui est ce qui FIXE la valeur du TTL
+
+Le piège de ce TTL n'est pas qu'il soit difficile à choisir ; c'est qu'il se
+choisit sous une asymétrie totale, et qu'une lecture symétrique mène à une
+valeur trop petite. La dégradation de l'addon n'est **pas** par entrée :
+`_push_scope_verdict` ne se rabat sur la borne statique que si le registre
+**entier** est vide ou illisible.
+
+| direction | ce qu'elle coûte |
+|---|---|
+| **trop long** | une entrée survit à un pilote tué. L'union reste bornée par les dépôts dispatchables, donc **rien de neuf ne devient atteignable** : un relâchement borné, qu'aucun incident ne matérialise |
+| **trop court** | un pilote **encore vif** voit son entrée purgée tandis qu'un voisin maintient le registre non vide. Son push légitime tombe sur `push-scope-repo` : un **403 sur du travail innocent**, et la boucle autonome s'arrête |
+
+Les deux colonnes ne sont pas commensurables, donc la valeur ne se négocie pas
+entre elles : elle se choisit comme un **plancher sur le plus long spawn**.
+Mesuré sur les **718 transcripts de pilote** de l'hôte de développement —
+médiane **11,9 min**, p90 **55,2 min**, p99 **1,89 h**, **max 4,40 h**. La
+valeur retenue est **12 h**, soit **2,7×** ce maximum ; **4 h serait déjà sous
+lui**, et c'est la seule chose que la mesure interdit.
+
+Le TTL de **72 h** des sentinelles de mika#2724 ne convient pas, et pas pour une
+question de marge : il est calibré sur une **autre question**. « Un vol peut-il
+être relu trois jours après ? » n'est pas « ce périmètre est-il encore en vol ? »
+— et un périmètre de trois jours ne l'est jamais. Les deux registres passent par
+le **même** `_purge_registry`, qui reçoit donc le TTL **en paramètre**. Un seul
+nombre pour deux registres aurait été, à l'identique, le défaut du throttle
+partagé que mika#2751 avait déjà corrigé : la fonction sert deux appelants, donc
+tout ce qui dépend de l'appelant sort de la fonction.
+
+**Pas de variable d'environnement**, pour la même raison qu'au vol 1 : un délai
+qu'un opérateur peut mettre à zéro est un registre qu'il peut vider par
+accident. Le tableau ci-dessus dit exactement ce que coûte ce geste — et le
+remède d'urgence existe déjà ailleurs, `MIKA_PILOT_EGRESS_PUSH_SCOPE=0`, qui ne
+touche aucune entrée.
+
+### Ce que cette asymétrie rend testable, et qui est le cas le plus important du vol
+
+Un test sur la constante reste vert sous **n'importe quelle** valeur : il
+constate un nombre, il ne le justifie pas. Le cas qui rend 12 h vérifiable
+plutôt que décrété asserte la **conséquence** de la colonne « trop court » :
+entrée A vieillie au-delà du TTL (le pilote est vif) sous entrée B fraîche (le
+voisin) ⇒ le push de A est **refusé**, pas dégradé. Juxtaposé, dans le même cas,
+à la même purge **sans voisin** ⇒ une simple dégradation `scope-absent`. Les
+deux moitiés côte à côte mettent l'asymétrie sur la page, là où une prose seule
+l'aurait laissée à reconstruire. `test_egress_push_bound.sh` CASE 22.
+
+Ce que cela généralise est écrit au § *La troisième leçon* en fin de note.
+
+Le détail opérateur du cycle de vie — la sonde `ls ~/.mika/pilot-push-scopes/`
+et ce que chacun de ses quatre états veut dire, la dégradation nommée quand la
+désinscription échoue, et l'avertissement sur le vidage à la main sous un
+dispatch en vol — vit à la même entrée
+`MIKA_PILOT_EGRESS_PUSH_SCOPE` de `docs/operator/environment-variables.md`.
 
 ## Le schéma que `gh` émet, capturé sur le fil
 
@@ -466,3 +572,26 @@ une sous-classe reste réellement hors d'atteinte, **la nommer** (ici P4, le
 force-push) plutôt que de laisser le refus global en tenir lieu : une limite
 connue et écrite est un périmètre, une limite connue et tue est une surprise
 d'opérateur.
+
+### La troisième leçon, payée par mika#2766
+
+Les deux premières portent sur **où** poser un garde et sur **quand** conclure
+qu'il n'y a pas de place. La troisième porte sur la **valeur** qu'on met dedans :
+
+> **Quand les deux directions d'une erreur ne coûtent pas la même chose, le
+> nombre qui les sépare est un plancher ou un plafond — jamais un compromis.**
+
+Un TTL se lit spontanément comme un arbitrage entre « trop de résidu » et « trop
+de ménage », et un arbitrage se règle au milieu. Ici les deux directions sont
+**incommensurables** : trop long relâche d'une quantité bornée que rien ne
+matérialise ; trop court 403 un pilote innocent et arrête la boucle. Il n'y a
+donc pas de milieu à trouver — il y a une borne à mesurer, et une marge à
+prendre au-dessus d'elle. Le signe que le raisonnement est fait : la valeur
+retenue cite une **mesure** (ici le plus long spawn sur 718 transcripts) et dit
+ce qui serait **sous** la borne.
+
+Le corollaire sur les tests, qui est celui qu'on oublie : **un test sur la
+valeur reste vert sous n'importe quelle valeur.** Ce qui défend un plancher,
+c'est un cas qui asserte le **coût de la mauvaise direction** — ici qu'une
+entrée purgée sous un voisin vif refuse un push légitime. C'est la différence
+entre un nombre vérifiable et un nombre décrété.
