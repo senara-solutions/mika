@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-release-debuginfo test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-release-debuginfo test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -253,6 +253,9 @@ test-egress-sentinel-staging: ## Verify the per-spawn egress sentinel is drawn, 
 
 test-egress-sentinel-enforcement: ## Verify the addon REQUIRES the egress sentinel on api.github.com — three refusal reasons, a DENY log that never discloses, TTL purge, github.com untouched, and the operator rollback honoured addon-side (mika#2724)
 	@bash skills/bundled/_shared/tests/test_egress_sentinel_enforcement.sh
+
+test-egress-push-bound: ## Verify the addon BOUNDS a git-receive-pack on github.com — four refusal reasons plus the unreadable body, the 4-byte auth probe and the chunked push still passing, the fetch untouched, and the dedicated rollback honoured (mika#2736)
+	@bash skills/bundled/_shared/tests/test_egress_push_bound.sh
 
 test-egress-relay-socket-env: ## Verify the egress relay socket is 0600, reachable from a bwrap pilot, and that the relay starts from a minimal environment — negative control included
 	@bash skills/bundled/_shared/tests/test_egress_relay_socket_and_env.sh

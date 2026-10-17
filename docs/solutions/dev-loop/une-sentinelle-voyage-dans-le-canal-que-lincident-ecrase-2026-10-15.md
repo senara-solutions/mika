@@ -10,6 +10,7 @@ symptoms:
   - "un `cargo test` lancé depuis une sandbox de pilote écrit sur la forge réelle sous l'identité du moteur (substrat de mika#2713)"
   - "l'addon d'egress retire tout `Authorization` du client puis injecte le jeton de l'hôte : un appel légitime et un appel de test sont indiscernables"
   - "la forme proposée par le corps du ticket — un en-tête dédié `X-Mika-Egress-Sentinel` — n'est pas implémentable sans un shim `gh` sur le PATH"
+  - "sur `github.com` aucun justificatif ne peut voyager, donc la moitié `git push` semble hors d'atteinte — alors que le proxy voit déjà le dépôt et les refs (mika#2736)"
 root_cause: design_decision
 resolution_type: design_decision
 related_components:
@@ -23,16 +24,19 @@ tags:
   - threat-model
   - attestation
   - fail-open
+  - receive-pack
 ticket: mika#2716
 ---
 
 # Une sentinelle qui ne voyage pas dans le canal que l'incident écrase n'atteste rien
 
-Le détail opérateur (interrupteur, registre, les quatre états du canari, la
-halte) vit dans `docs/operator/environment-variables.md` § *La sandbox de pilote
-présente un justificatif d'egress (mika#2716)*. Ce document garde seulement le
+Le détail opérateur (interrupteurs, registre, motifs de refus, états du canari,
+haltes) vit dans `docs/operator/environment-variables.md` § *La sandbox de pilote
+présente un justificatif d'egress, et l'addon l'exige — et ce qu'elle pousse est
+borné (mika#2716, mika#2724, mika#2736)*. Ce document garde seulement le
 raisonnement de **choix du canal**, qui se transpose à toute attestation posée
-devant un proxy qui réécrit les requêtes.
+devant un proxy qui réécrit les requêtes — et, depuis mika#2736, la question qui
+vient quand aucun canal ne convient.
 
 ## Le problème
 
@@ -57,6 +61,14 @@ la réponse intuitive est fausse.
 | `Proxy-Authorization` | non | non | non | **écarté** (l'addon le retire aussi) |
 | fichier monté dans la sandbox | n/a — hors du chemin réseau | n/a | non | **écarté** |
 | **le credential lui-même (`GH_TOKEN`)** | **oui, déjà** | **non** — l'addon injecte un `Basic` côté proxy, donc aucun justificatif ne peut voyager dans ce canal sur `github.com` | **oui** | **retenu** |
+| **aucun canal — une borne sur ce que le proxy voit déjà** | n/a — **rien n'est demandé au client** | n/a — idem | **impossible** : il n'y a rien à écraser | **retenu pour `github.com`** (mika#2736) |
+
+**La dernière ligne manquait à cette table, et son absence est ce qui a fait
+paraître la question close.** Cinq lignes sur six demandent « quel canal porte
+le justificatif ? ». Tant que la table ne contient que celles-là, un canal où
+*aucun* justificatif ne peut voyager se lit comme « hors d'atteinte ». La sixième
+pose une autre question — *ai-je besoin qu'on me dise quoi que ce soit ?* — et
+sur `github.com` la réponse est non ; le § mika#2736 ci-dessous la développe.
 
 Trois raisons condamnent l'en-tête dédié, et la troisième est décisive :
 
@@ -151,12 +163,127 @@ canal choisi — `GH_TOKEN` — n'est emprunté que par `gh`, et `gh` ne parle q
 Conséquence directe sur le vol 2 : **le refus est borné à `api.github.com`**.
 Exiger un justificatif sur `github.com` refuserait chaque `git push` sans rien
 acheter, puisqu'aucun justificatif ne peut y voyager. La moitié `git push` de
-l'egress de pilote reste donc ouverte, et elle est hors de portée de *ce*
-canal — ce qui est une propriété du canal, pas un oubli.
+l'egress de pilote est donc hors de portée de *ce* canal — ce qui est une
+propriété du canal, pas un oubli.
+
+> **Elle n'est plus ouverte pour autant.** La version de 2026-10-16 de ce §
+> concluait « la moitié `git push` reste donc ouverte » ; mika#2736 a montré que
+> la conclusion ne suivait pas de la prémisse. Trois des quatre sous-classes de
+> menace sont fermées depuis, **sans justificatif**, par une borne sur ce que le
+> proxy voit déjà — § *Hors de portée de ce canal n'est pas hors d'atteinte*
+> ci-dessous.
 
 La case fautive n'était pas une erreur de frappe : elle décrivait ce que `git`
 fait **hors sandbox**, où un helper pose bien un credential. La table parlait de
 la sandbox ; une des cinq lignes parlait du poste de l'opérateur.
+
+## Hors de portée de *ce* canal n'est pas hors d'atteinte (mika#2736)
+
+Le § ci-dessus concluait, dans sa version du vol 2, « la moitié `git push` reste
+donc ouverte ». La prémisse est exacte — aucun justificatif ne voyage sur
+`github.com` — et la conclusion n'en suit pas. C'est la leçon que ce ticket
+ajoute à la note : **une table de canaux ne répond qu'à la question qu'elle
+pose.**
+
+### Le modèle de menace de cette moitié, séparément de celui de mika#2713
+
+Une écriture d'API et un `git push` ne coûtent pas la même chose et ne se
+réparent pas pareil, donc le premier travail a été de mesurer ce qu'un push
+arbitraire atteint **réellement**, compte tenu des bornes de mika#2141 (le bind
+du gitdir est déjà limité au worktree du pilote et aux refs sous son préfixe —
+mais ça borne un **système de fichiers**, et une destination de push est une
+**URL**).
+
+| sous-classe | ce qu'elle atteint | réparable ? |
+|---|---|---|
+| **P1** — push vers un dépôt tiers | exfiltration du code vers une forge qu'on ne contrôle pas | **non**. Une fois abouti, un push chez autrui ne se reprend pas. C'est la plus coûteuse, donc la première règle |
+| **P2** — suppression d'une ref | destruction d'une branche sur la forge | oui, par reflog côté serveur, mais avec une fenêtre et une intervention |
+| **P3** — écriture d'une ref hors périmètre (tag, `refs/*` arbitraire, `refs/heads/main`) | contenu laissé sur la forge que la vue des branches ne montre pas ; ou contournement de la pipeline par une écriture directe sur l'intégration | oui |
+| **P4** — force-push sur la ref du spawn | réécriture de l'historique — **la classe de l'incident fondateur mika#1318** | difficilement, et c'est la plus sournoise |
+
+**Trois sur quatre sont fermées par ce vol.** P4 ne l'est pas, pour une raison
+de protocole détaillée plus bas.
+
+### Le canal d'en-tête, réexaminé à son propre mérite — et mesuré
+
+`http.extraHeader` via `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` est le **seul**
+canal d'en-tête que `git` possède par environnement, et le vol 1 l'avait écarté
+dans le cadre d'une sentinelle commune aux deux clients. Réexaminé seul, il
+**fonctionne techniquement** : l'en-tête atteint bien le proxy. Il est écarté
+quand même, pour deux raisons indépendantes :
+
+1. **Il atteste la sandbox, pas le chemin.** C'est mot pour mot la raison 2 qui
+   condamnait le shim `gh` ci-dessus : un second processus du même environnement
+   lit `GIT_CONFIG_VALUE_n` et présente le même en-tête, parfaitement valide, en
+   poussant où il veut. Le justificatif distinguerait « dans la sandbox » de
+   « hors de la sandbox », quand la question est « le chemin légitime » contre
+   « un autre chemin de la même sandbox ».
+2. **La règle 2 de `scripts/verify-no-secret-in-setenv.sh` le refuse** par
+   ailleurs, indépendamment du mérite du canal.
+
+Une borne côté **bwrap**, dans le prolongement de mika#2141, a été écartée pour
+une impossibilité de catégorie : bwrap borne un système de fichiers ; une
+destination de push est une URL, qu'aucun bind ne contraint.
+
+### Ce que le proxy voit réellement d'un `git-receive-pack`
+
+C'est la mesure qui retourne la question. Le corps d'un push n'est pas opaque
+avant le packfile :
+
+```
+<4 hex len><old-sha> SP <new-sha> SP <refname> NUL <capabilities> LF
+<4 hex len><old-sha> SP <new-sha> SP <refname> LF
+0000
+PACK…
+```
+
+Le **dépôt** est dans l'URL (`/<owner>/<repo>.git/git-receive-pack`) et les
+**commandes de ref** sont en **clair** en tête du corps, avant le pack. Le proxy
+n'a donc besoin qu'on lui dise **rien** : il peut borner ce qu'il voit déjà. Et
+une borne sur ce qu'il voit déjà ne demande **aucune coopération du client** —
+donc aucun processus de la sandbox ne la contourne en se présentant bien. Sur
+cette moitié, c'est **strictement plus fort** qu'une sentinelle l'aurait été.
+
+### Les deux pièges qui 403'raient toute la boucle, mesurés avant d'écrire
+
+Les deux sont des conséquences du streaming, et les deux sont des cas
+**positifs** de la suite (`test_egress_push_bound.sh`, 143 assertions), jamais
+de la prose :
+
+- **La sonde d'authentification de 4 octets.** Avant de streamer un gros push,
+  `git` émet un POST dont le corps est un **flush-pkt nu** : aucune commande. Un
+  garde exigeant « au moins une commande » le refuserait, donc refuserait **tout
+  push assez gros pour être streamé** — et rien ne le dirait avant le premier
+  dispatch. Une liste de commandes **vide** et `None` sont donc deux états
+  distincts (classe mika#2205), le premier autorisé, le second refusé.
+- **Le verdict ne peut pas vivre dans `requestheaders`.** C'est là que vit
+  l'injection du credential, mais le corps n'y est pas encore. Passé le seuil,
+  le corps sort chunked **avec les commandes toujours en tête** : le verdict vit
+  donc dans `request`, et les deux hooks portent délibérément deux
+  préoccupations distinctes.
+
+### P4 — le force-push, hors d'atteinte côté proxy, et pourquoi
+
+`receive-pack` **ne porte aucun drapeau de force**. Le client envoie
+`<old-sha> <new-sha> <ref>` et rien d'autre ; c'est le **serveur** qui résout
+l'ancestralité et décide si la mise à jour est un fast-forward. La commande d'un
+push ordinaire et celle d'un force-push ont donc la **même forme**, et
+`--force-with-lease` renseigne `old-sha` aussi honnêtement qu'un push normal.
+
+Pour les distinguer, le proxy devrait **décoder le packfile en vol** et marcher
+le graphe, sur le chemin de la boucle, pour une décision à rendre avant de
+relayer. Hors de proportion avec la propriété achetée, et du code fragile placé
+exactement là où une panne arrête la boucle.
+
+P4 reste donc ouverte, et elle est gardée ailleurs, **plus faiblement** : le
+prompt de `dev-groom` interdit au pilote de groom tout `git push` en nommant
+mika#1318 — une consigne de prompt, pas un mécanisme ; et le site unique de push
+des dispatches de groom tourne **côté hôte**, hors de la sandbox et donc hors de
+portée de tout garde d'egress. C'est la moitié de réponse « hors d'atteinte »
+que le ticket autorisait, pour une **sous-classe nommée**, avec la mesure qui la
+soutient — écrite ici et dans la surface opérateur, parce qu'une limite connue
+et tue est une surprise d'opérateur, tandis qu'une limite connue et écrite est
+un périmètre.
 
 ## Le schéma que `gh` émet, capturé sur le fil
 
@@ -192,3 +319,31 @@ est le plus secret ». C'est :
 
 Poser l'attestation ailleurs produit un garde qui reste vert pendant l'incident
 même qu'il était censé nommer.
+
+### La seconde leçon, payée par mika#2736
+
+La première est une leçon sur le **choix** d'un canal. La seconde est sur ce
+qu'on conclut quand **aucun** canal ne convient :
+
+> **Avant de conclure « hors d'atteinte », demander : ai-je besoin qu'on me dise
+> quoi que ce soit ?**
+
+Une table de canaux ne répond qu'à la question qu'elle pose. Les cinq premières
+lignes de la table ci-dessus demandent toutes « quel canal porte le
+justificatif ? » — et sur `github.com` la réponse honnête est *aucun*. Écrire
+cela est exact ; en déduire que la moitié est hors d'atteinte est un saut, parce
+que la question suivante n'avait pas été posée : **ce que le garde voit déjà
+suffit-il ?**
+
+Ici il suffisait presque entièrement. Le dépôt est dans l'URL, les commandes de
+ref sont en clair en tête du corps, et trois des quatre sous-classes de menace
+se ferment sans qu'un mot soit demandé au client — avec en prime une propriété
+qu'un justificatif n'aurait pas eue, puisqu'il n'y a rien à se faire présenter
+par un processus qui se présente bien.
+
+Le réflexe à garder : quand la table des canaux est vide, ne pas clore —
+inventorier ce que le garde observe sans coopération, puis conclure. Et quand
+une sous-classe reste réellement hors d'atteinte, **la nommer** (ici P4, le
+force-push) plutôt que de laisser le refus global en tenir lieu : une limite
+connue et écrite est un périmètre, une limite connue et tue est une surprise
+d'opérateur.

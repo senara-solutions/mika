@@ -733,6 +733,96 @@ _canary_sentinel_probe egress_sentinel_denied_unknown 403 sentinel-unknown \
 # show accepted=403, and that is a defect, not a decision (mika#2165).
 
 echo
+echo "--- must-work: a legitimate push passes, and the receive-pack is BOUNDED (mika#2736) ---"
+# mika#2736 closes the other half of pilot egress, and by a different means.
+# On github.com the addon asks for NO justification -- none can travel there,
+# which is why the mika#2724 refusal stops at api.github.com. Instead it BOUNDS
+# what a git-receive-pack may touch, off what it already sees: the repository in
+# the URL, the ref commands in clear at the head of the body. A bound asks
+# nothing of the client, so no process of the sandbox gets around it by
+# presenting itself well.
+#
+# Three probes, and the FIRST is the anti-vacuity of the other two -- a bound
+# that refused everything would show both denials perfectly green:
+#
+#   push_bound_nominal — a repository under the organisation, an ordinary branch
+#                        ref, a non-zero new object id. NO refusal reason must
+#                        appear. A refusal here IS the failure mode the parent
+#                        ticket names as the only one able to stop the loop, and
+#                        it reads on one line instead of being deduced from a
+#                        silence.
+#   push_bound_foreign — a repository outside the organisation. Exfiltration is
+#                        the one outcome of this class that cannot be undone
+#                        once it lands, which is why it is the first rule.
+#   push_bound_delete  — an all-zero new object id, which is how the protocol
+#                        itself states a deletion. Read off the protocol, never
+#                        off a heuristic.
+#
+# EVERY target below is a repository that DOES NOT EXIST, deliberately: a status
+# code can then never be confused with a write that really landed. For the same
+# reason the assertion bears on the refusal REASON read from the body and never
+# on the status code -- GitHub answers 403 or 404 on a nonexistent repository
+# all by itself, and that answer would be indistinguishable from ours.
+#
+# The pkt-line length 0085 is 133 = 40 + 1 + 40 + 1 + 32 + 1 + 13 + 1 (the
+# command, then report-status); the flush-pkt 0000 closes the section. All three
+# probes reuse the same 32-character ref, so one constant serves them. It needs
+# no guard of its own: a wrong length leaves the addon unable to decode the
+# body, which reports push-body-unreadable and reddens push_bound_nominal. The
+# arithmetic is pinned in flight by the nominal probe.
+_canary_push_bound_probe() {
+    _label="$1"; _repo="$2"; _new="$3"; _want_reason="$4"
+    _old=1111111111111111111111111111111111111111
+    _pref=refs/heads/feat/9999/canary-2736
+    _out=$(printf "0085%s %s %s\000report-status\n0000" "$_old" "$_new" "$_pref" \
+        | curl -sS -m 10 -w "\n%{http_code}" --data-binary @- \
+            -H "Content-Type: application/x-git-receive-pack-request" \
+            "https://github.com/$_repo/git-receive-pack" 2>&1)
+    _code=$(printf "%s\n" "$_out" | tail -1)
+    # Substring match on the five reasons the bound can emit -- no grep, no
+    # pipe, and it pins the vocabulary as a side effect, exactly as the sentinel
+    # probe above pins its three.
+    case "$_out" in
+        *"DENY push-repo-foreign"*)    _reason=push-repo-foreign ;;
+        *"DENY push-ref-delete"*)      _reason=push-ref-delete ;;
+        *"DENY push-ref-exotic"*)      _reason=push-ref-exotic ;;
+        *"DENY push-ref-protected"*)   _reason=push-ref-protected ;;
+        *"DENY push-body-unreadable"*) _reason=push-body-unreadable ;;
+        *)                             _reason="" ;;
+    esac
+    if [ "$_reason" = "$_want_reason" ]; then
+        echo "ok:   $_label ($_code${_reason:+ $_reason})"
+    else
+        echo "FAIL: $_label expected ${_want_reason:-no refusal}, got ${_reason:-no refusal} (HTTP $_code)"
+    fi
+}
+_canary_push_bound_probe push_bound_nominal \
+    senara-solutions/canary-2736-no-such-repo.git \
+    2222222222222222222222222222222222222222 ""
+_canary_push_bound_probe push_bound_foreign \
+    not-senara-solutions/canary-2736-no-such-repo.git \
+    2222222222222222222222222222222222222222 push-repo-foreign
+_canary_push_bound_probe push_bound_delete \
+    senara-solutions/canary-2736-no-such-repo.git \
+    0000000000000000000000000000000000000000 push-ref-delete
+# The rollback, named here because this is where its effect is observable:
+# MIKA_PILOT_EGRESS_PUSH_BOUND=0 in the mitmdump environment disarms THIS bound
+# alone. Under it the two denied probes report no reason and FAIL, which is the
+# correct reading -- the bound is off by operator decision. The three
+# egress_sentinel_* probes above must stay green right through it; if they do
+# not, the two switches have been wired together, and that is a defect rather
+# than a decision (mika#2165).
+#
+# OUT OF REACH on this channel, named here rather than left to be rediscovered:
+# the force-push on the spawn ref -- the founding incident, mika#1318.
+# receive-pack states old, new and ref and carries NO force flag, so a rewrite
+# has the same form as an ordinary update; telling them apart would mean
+# decoding the packfile in flight and walking the graph, on the path of the
+# loop, before relaying. No probe here can close it. It is guarded elsewhere and
+# more weakly: by the dev-groom prompt, and by the fact that the groom push site
+# runs HOST-side, outside the sandbox and therefore outside the proxy entirely.
+
+echo
 echo "--- must-fail: no GitHub token value in the sandbox (mika#2056, mika#2572) ---"
 # mika#2056 inverted the old mika#2039 must-work check. The pilot no longer
 # holds any GitHub token inside the sandbox: git push and gh reach GitHub

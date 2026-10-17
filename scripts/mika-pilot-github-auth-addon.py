@@ -39,12 +39,23 @@ This addon does nothing for non-GitHub hosts — the Anthropic addon (loaded in
 the same mitmdump) owns api.anthropic.com, and every other CONNECT stays on the
 egress-proxy encrypted pass-through path.
 
-The refusal (mika#2724, vol 2 of mika#2716) is bounded to api.github.com. On
-github.com the injection stays unconditional, because `git` presents NO
-credential in the pilot sandbox (no credential helper, GIT_CONFIG_NOSYSTEM=1, a
+The JUSTIFICATION-based refusal (mika#2724, vol 2 of mika#2716) is bounded to
+api.github.com. On github.com no credential is DEMANDED, because `git` presents
+none in the pilot sandbox (no credential helper, GIT_CONFIG_NOSYSTEM=1, a
 gitconfig written from scratch) and GH_TOKEN's only sandbox reader is `gh`,
 which talks to api.github.com alone. Requiring a credential on a channel where
 none can travel would refuse every push and buy nothing.
+
+But github.com is not therefore unbounded (mika#2736). The measurement that
+closed the sentinel question also showed the proxy needs to be TOLD nothing: a
+`git-receive-pack` carries its repository in the URL and its ref commands in
+clear at the head of the body. So instead of a justification the addon applies a
+BOUND on what it already sees — four rules, in `request` below. A bound asks
+nothing of the client, which makes it strictly stronger on this half than a
+sentinel would have been: no process of the sandbox gets around it by presenting
+itself well. What stays out of reach is the force-push (receive-pack carries no
+force flag, so a non-fast-forward is indistinguishable from an ordinary update
+without the remote's prior ref state); it is a NAMED limit, not an oversight.
 """
 
 from __future__ import annotations
@@ -380,6 +391,284 @@ def _sentinel_verdict(presented: str | None) -> str:
     return _DENY_UNKNOWN
 
 
+# ---------------------------------------------------------------------------
+# mika#2736 — on github.com a `git-receive-pack` is BOUNDED, not questioned.
+#
+# WHY A BOUND AND NOT A SENTINEL. No channel can carry a justification that
+# attests the legitimate PATH rather than the sandbox: `http.extraHeader` via
+# GIT_CONFIG_KEY_n does reach the proxy, and a second process in the same
+# environment presents the very same valid header while pushing wherever it
+# likes. A bound on what the proxy ALREADY SEES — the repository in the URL,
+# the ref commands in clear at the head of the body — depends on no cooperation
+# from the client at all, so presenting itself well buys an attacker nothing.
+#
+# WHAT EACH RULE CLOSES, and the one thing it does not:
+#   * push-repo-foreign  — exfiltration to a third-party repository. Irreparable
+#     once it lands: a push to someone else's repo cannot be taken back.
+#   * push-ref-delete    — the destruction of a ref.
+#   * push-ref-exotic    — tags and arbitrary refs/*, which no pilot writes.
+#   * push-ref-protected — a write straight onto the integration branch.
+#   * The force-push on the spawn's own ref (the founding incident, mika#1318)
+#     stays OUT OF REACH here: receive-pack states `<old> <new> <ref>` and
+#     carries NO force flag, so a rewrite is byte-identical to an ordinary
+#     update unless the proxy holds the remote's prior ref state. Naming the
+#     limit is the deliverable; pretending to cover it would be worse than the
+#     gap. Tightening to the perimeter the SPAWN declared is the follow-up.
+# ---------------------------------------------------------------------------
+
+# The one repository path prefix a pilot may write to. Static, and this flight
+# holds to that deliberately: tightening to the repository AND branch the host
+# itself chose at spawn is strictly better, but needs the mika#2716 registry
+# entry extended — i.e. the launcher touched. That is the follow-up.
+_PUSH_ALLOWED_OWNER = "senara-solutions"
+
+# Whole-name match, never a substring: `refs/heads/feat/2736/main-bound` is
+# ordinary pilot work, and a bound that refused it would refuse real flights.
+_PUSH_PROTECTED_REFS = frozenset({"refs/heads/main", "refs/heads/master"})
+_PUSH_REF_PREFIX = "refs/heads/"
+
+_RECEIVE_PACK_SUFFIX = "/git-receive-pack"
+
+# Its own switch, NOT _SENTINEL_SWITCH. The two guards fail for unrelated
+# reasons — one on a host registry, one on a body too large to read — and an
+# operator disarming either must not disarm the other unknowingly (mika#2165:
+# one switch, and every reader of it honours it).
+_PUSH_BOUND_SWITCH = "MIKA_PILOT_EGRESS_PUSH_BOUND"
+
+_DENY_REPO_FOREIGN = "push-repo-foreign"
+_DENY_REF_DELETE = "push-ref-delete"
+_DENY_REF_EXOTIC = "push-ref-exotic"
+_DENY_REF_PROTECTED = "push-ref-protected"
+_DENY_PUSH_OPAQUE = "push-body-unreadable"
+
+_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
+
+# Five reasons, five bodies, and no body names another's motif — the remedies
+# are disjoint, so a shared body would make the difference undiagnosable at the
+# moment it decides what to do (mika#2205, the same reasoning as the three
+# sentinel bodies above). `{subject}` is the offending repository or ref: that
+# is CLIENT data, not a host secret, so naming it discloses nothing. mika#1949
+# forbids naming the JUSTIFICATION presented, never the target aimed at.
+_PUSH_DENY_BODIES = {
+    _DENY_REPO_FOREIGN: (
+        "This push targets a repository outside the perimeter: {subject}\n"
+        "\n"
+        "A pilot sandbox may write only under the `" + _PUSH_ALLOWED_OWNER + "`\n"
+        "organisation. A push landing in a third-party repository is the one\n"
+        "outcome of this class that cannot be undone afterwards, which is why it\n"
+        "is refused rather than merely logged.\n"
+        "\n"
+        "Remedy: check the `origin` URL of the worktree this push came from. The\n"
+        "dispatcher sets it; a rewritten remote is the case to look for.\n"
+    ),
+    _DENY_REF_DELETE: (
+        "This push DELETES a ref: {subject}\n"
+        "\n"
+        "A deletion is read off the protocol itself -- the command carries an\n"
+        "all-zero new object id -- and never off a heuristic. Nothing a pilot is\n"
+        "dispatched to do removes a ref on the forge.\n"
+        "\n"
+        "Remedy: if a branch really must go, delete it from the host, outside the\n"
+        "sandbox. Inside it, find what ran a `git push --delete` or a `:ref`\n"
+        "refspec.\n"
+    ),
+    _DENY_REF_EXOTIC: (
+        "This push writes a ref outside `" + _PUSH_REF_PREFIX + "`: {subject}\n"
+        "\n"
+        "A pilot pushes branches and nothing else. Tags, notes, and arbitrary\n"
+        "`refs/*` entries are write surfaces it never needs, and each of them is\n"
+        "a way to leave content on the forge that the ordinary branch view does\n"
+        "not show.\n"
+        "\n"
+        "Remedy: push the work as a branch under the dispatch prefix. A release\n"
+        "tag is an operator action, taken outside the sandbox.\n"
+    ),
+    _DENY_REF_PROTECTED: (
+        "This push writes straight onto an integration branch: {subject}\n"
+        "\n"
+        "Pilot work reaches the integration branch through a pull request and its\n"
+        "pipeline, never directly. This refusal is the structural half of that\n"
+        "rule: a convention nothing enforces is a convention one bad refspec\n"
+        "undoes.\n"
+        "\n"
+        "Remedy: push the dispatch branch and open a PR. If the branch name was\n"
+        "resolved from a variable, that variable is what to inspect.\n"
+    ),
+    _DENY_PUSH_OPAQUE: (
+        "The command section of this push could not be read, so what it touches\n"
+        "cannot be judged -- and it is refused rather than waved through.\n"
+        "\n"
+        "The likely cause is SIZE: mitmproxy streams a body past its threshold\n"
+        "(`stream_large_bodies=10m`) and the content is then simply not here to\n"
+        "inspect. A pilot pack is of the order of a kilobyte, so a push this\n"
+        "large is already the anomaly. A malformed pkt-line section lands here\n"
+        "too. Allowing on unreadability would hand anyone a trivial bypass:\n"
+        "grow the body.\n"
+        "\n"
+        "Remedy: look at what made the push this big -- a committed artifact, a\n"
+        "vendored tree, a binary. If the size is legitimate, use the rollback\n"
+        "below; it is the reason a fail-closed bound is acceptable on the path of\n"
+        "the autonomous loop.\n"
+    ),
+}
+
+_PUSH_DENY_FOOTER = (
+    "Rollback: " + _PUSH_BOUND_SWITCH + "=0 disarms THIS bound alone, in the\n"
+    "environment of the mitmdump process. It leaves the api.github.com refusal\n"
+    "of mika#2724 and the host-side credential injection of mika#2056 intact.\n"
+)
+
+
+def _push_bound_enforced() -> bool:
+    """Is the bound armed in THIS process?
+
+    Same vocabulary and same default as `_sentinel_enforced` — unset or empty
+    means armed — but a DIFFERENT variable, on purpose: see the note on
+    `_PUSH_BOUND_SWITCH`.
+    """
+    raw = os.environ.get(_PUSH_BOUND_SWITCH)
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in _SWITCH_OFF
+
+
+def _receive_pack_repo(path: str) -> str | None:
+    """`<owner>/<repo>` when this path is a push, None when it is not.
+
+    None means "not a push" and lets the request through untouched. That is the
+    whole non-regression surface of this ticket: `git-upload-pack` (the fetch),
+    `info/refs?service=git-receive-pack` (the advertisement, a GET), and every
+    other github.com path keep the behaviour they had before. The bound bears
+    on the only verb that WRITES — a fetch reads public data, destroys nothing
+    and exfiltrates nothing.
+
+    The query string is cut before matching, so the advertisement cannot be
+    mistaken for the push just because it names the service.
+    """
+    route = path.split("?", 1)[0]
+    if not route.endswith(_RECEIVE_PACK_SUFFIX):
+        return None
+    prefix = route[: -len(_RECEIVE_PACK_SUFFIX)]
+    parts = prefix.split("/")
+    # A smart-HTTP push path is exactly `/<owner>/<repo>[.git]/git-receive-pack`,
+    # so the split yields ['', owner, repo] and nothing else. Anything deeper or
+    # shallower is not a repository root and is not judged.
+    if len(parts) != 3 or parts[0] != "" or not parts[1] or not parts[2]:
+        return None
+    owner, repo = parts[1], parts[2]
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    if not repo:
+        return None
+    return f"{owner}/{repo}"
+
+
+def _parse_ref_command(payload: bytes) -> tuple[str, str, str] | None:
+    """One `<old> SP <new> SP <ref>` triplet, or None if the line is not one.
+
+    The capability list rides on the FIRST command only, after a NUL; it is cut
+    before parsing so the reader bears on the refname and never on whatever
+    capabilities git happens to negotiate (`side-band-64k`, `agent=…`,
+    `atomic`, …). Returning None on any other shape — a `shallow` line, a push
+    certificate, a truncated triplet — is deliberate: an unrecognised command
+    section is `push-body-unreadable`, which refuses with a diagnosis, rather
+    than an empty command list, which would allow.
+    """
+    line = payload.split(b"\x00", 1)[0].strip()
+    parts = line.split(b" ")
+    if len(parts) != 3:
+        return None
+    try:
+        old, new, ref = (part.decode("utf-8") for part in parts)
+    except UnicodeDecodeError:
+        return None
+    if not old or not new or not ref:
+        return None
+    return old, new, ref
+
+
+def _ref_commands(body: bytes | None) -> list[tuple[str, str, str]] | None:
+    """The ref commands at the head of a receive-pack body, or None.
+
+    AN EMPTY LIST AND None ARE TWO DIFFERENT STATES, and confusing them is the
+    one defect able to stop the autonomous loop. Before streaming a large push
+    git sends a 4-byte authentication probe: a bare flush-pkt, no command at
+    all. That is an empty list, and it MUST pass — a guard demanding "at least
+    one command" would refuse it and therefore refuse every push big enough to
+    be streamed, with nothing saying so before the first dispatch. None is a
+    body that exists but does not decode, or no body at all; § 3.3 of the plan
+    settles that case as a refusal.
+
+    Only the head is read. Past mitmproxy's streaming threshold the body goes
+    out chunked, and the commands stay in front of the pack — which is why this
+    runs in `request` (body buffered) and not in `requestheaders`.
+    """
+    if body is None:
+        return None
+    if body == b"":
+        # Zero bytes is the degenerate form of the same probe: nothing is being
+        # asked for, so there is nothing to refuse.
+        return []
+    commands: list[tuple[str, str, str]] = []
+    index, total = 0, len(body)
+    while True:
+        if index + 4 > total:
+            # The section ended without a flush-pkt: we never reached a point
+            # where the command list was complete, so we do not know it.
+            return None
+        header = body[index : index + 4]
+        if any(char not in _HEX_DIGITS for char in header):
+            return None
+        length = int(header, 16)
+        if length == 0:
+            return commands  # flush-pkt: the command section is over
+        if length < 4 or index + length > total:
+            return None
+        parsed = _parse_ref_command(body[index + 4 : index + length])
+        if parsed is None:
+            return None
+        commands.append(parsed)
+        index += length
+
+
+def _push_verdict(repo: str, commands: list[tuple[str, str, str]]) -> tuple[str, str]:
+    """`(_ALLOW, "")`, or `(motif, the repository or ref in cause)`.
+
+    Pure. The rules are independent, so the branch order carries no safety —
+    but the order of the REPORT matters: EVERY command is examined, and the
+    first violating one names both the motif and the subject. A bound that
+    judged only the first command would be defeated by a harmless command
+    placed in front of it.
+
+    The deletion test comes before the protected-branch test for diagnosis, not
+    for safety: a deletion of `refs/heads/main` is a deletion first, and that is
+    the remedy an operator needs named.
+    """
+    if repo.split("/", 1)[0].lower() != _PUSH_ALLOWED_OWNER:
+        return _DENY_REPO_FOREIGN, repo
+    for _old, new, ref in commands:
+        # An all-zero new object id IS the protocol's way of saying "delete";
+        # width-agnostic, so a sha256 repository reads the same as a sha1 one.
+        if new.strip("0") == "":
+            return _DENY_REF_DELETE, ref
+        if not ref.startswith(_PUSH_REF_PREFIX) or ref == _PUSH_REF_PREFIX:
+            return _DENY_REF_EXOTIC, ref
+        if ref in _PUSH_PROTECTED_REFS:
+            return _DENY_REF_PROTECTED, ref
+    return _ALLOW, ""
+
+
+def _push_deny_body(reason: str, subject: str) -> str:
+    """The 403 body: the motif, the target, the remedy, and the rollback."""
+    return (
+        f"mika-pilot-github-auth: DENY {reason} (mika#2736).\n"
+        "\n"
+        + _PUSH_DENY_BODIES[reason].format(subject=subject)
+        + "\n"
+        + _PUSH_DENY_FOOTER
+    )
+
+
 def requestheaders(flow: http.HTTPFlow) -> None:
     """Inject the GitHub credential as request headers first arrive.
 
@@ -403,10 +692,12 @@ def requestheaders(flow: http.HTTPFlow) -> None:
         return
     # The egress sentinel (mika#2724), on api.github.com only. Read the client
     # credential BEFORE the strip below destroys it, and refuse rather than
-    # inject when it is not one the host attests. github.com falls through
-    # untouched — see the module docstring: no credential can travel there in
-    # the pilot sandbox, so the requirement is bounded to the channel that
-    # carries one. The 503 above stays ahead of the verdict: a host with no
+    # inject when it is not one the host attests. github.com is asked for no
+    # justification — see the module docstring: none can travel there in the
+    # pilot sandbox, so the requirement is bounded to the channel that carries
+    # one. github.com is bounded differently, in `request` below, on what the
+    # proxy already sees (mika#2736).
+    # The 503 above stays ahead of the verdict: a host with no
     # token has nothing to protect, and the operator needs that diagnosis
     # first.
     if host == _API_HOST and _sentinel_enforced():
@@ -430,6 +721,69 @@ def requestheaders(flow: http.HTTPFlow) -> None:
     for header_name in ("authorization", "proxy-authorization"):
         flow.request.headers.pop(header_name, None)
     flow.request.headers["Authorization"] = _auth_header_for(host, token)
+
+
+def request(flow: http.HTTPFlow) -> None:
+    """Bound what a `git-receive-pack` may touch (mika#2736).
+
+    WHY THIS HOOK AND NOT `requestheaders`, where the injection lives. The
+    verdict needs the BODY: the repository is in the URL, but the ref commands
+    are in the first pkt-lines, and in `requestheaders` the body is not there
+    yet. So the two concerns deliberately sit in two hooks — inject as early as
+    possible, judge as soon as there is something to judge. Past mitmproxy's
+    streaming threshold the body goes out chunked with the commands still at its
+    head, which is exactly the case this placement handles and the earlier hook
+    could not.
+
+    A request `requestheaders` already answered is left alone, so the
+    api.github.com cut of mika#2724 is never re-judged and never double-logged.
+    """
+    if flow.response is not None:
+        return
+    # api.github.com has no receive-pack endpoint; the bound must not invent one
+    # there, and vol 2 already owns that host entirely.
+    if flow.request.host != _GIT_HOST:
+        return
+    if not _push_bound_enforced():
+        return
+    repo = _receive_pack_repo(flow.request.path)
+    if repo is None:
+        return
+    try:
+        content = flow.request.content
+    except Exception:  # noqa: BLE001 — see below
+        # mitmproxy raises here when the body was streamed or its encoding is
+        # broken. A reader that let this propagate would be a 500 on the loop's
+        # push path: louder than the 403 we chose, and undiagnosable. Treated as
+        # the same state as a None body, which it is.
+        content = None
+    commands = _ref_commands(content)
+    if commands is None:
+        reason, subject = _DENY_PUSH_OPAQUE, ""
+    else:
+        reason, subject = _push_verdict(repo, commands)
+    if reason == _ALLOW:
+        return
+    # The exact line shape of vol 2 — one motif more in an existing vocabulary
+    # beats a second form of line to grep. The motif, the method and the path;
+    # never the presented credential, never the host token, never a digest of
+    # either (mika#1949: a fingerprint is deferred disclosure).
+    print(
+        f"[github-proxy] DENY {reason} {flow.request.method} {flow.request.path}",
+        file=sys.stderr,
+        flush=True,
+    )
+    # Strip the credential `requestheaders` injected a moment ago. mitmproxy
+    # will not forward a short-circuited request, so this changes no observable
+    # behaviour today; it means the host credential is absent from a refused
+    # request by construction rather than by trust in that short-circuit.
+    for header_name in ("authorization", "proxy-authorization"):
+        flow.request.headers.pop(header_name, None)
+    flow.response = http.Response.make(
+        403,
+        _push_deny_body(reason, subject).encode("utf-8"),
+        {"Content-Type": "text/plain; charset=utf-8"},
+    )
 
 
 def responseheaders(flow: http.HTTPFlow) -> None:
