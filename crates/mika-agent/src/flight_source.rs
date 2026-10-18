@@ -53,7 +53,10 @@ impl FlightSource for DbFlightSource {
     ) -> Vec<FinishedFlight> {
         let rows = self
             .db
-            .list_finished_implement_flights(since.map(str::to_string), issue_urls.to_vec())
+            .list_finished_implement_flights_in_container(
+                since.map(str::to_string),
+                issue_urls.to_vec(),
+            )
             .await;
         match rows {
             Ok(tasks) => tasks.into_iter().map(task_to_finished_flight).collect(),
