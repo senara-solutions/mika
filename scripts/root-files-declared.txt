@@ -1,0 +1,50 @@
+# Les fichiers que ce dépôt suit à sa RACINE, un par ligne (mika#2760).
+#
+# Généré, jamais écrit de mémoire :
+#     git ls-files | grep -v '/' | LC_ALL=C sort
+#
+# `scripts/check-root-files.sh` confronte cette liste à `git ls-files` DANS LES
+# DEUX SENS, et le job `root-files-lint` de ci.yml le lance sur chaque PR :
+#   - un fichier suivi à la racine qui n'est pas déclaré ici → rouge ;
+#   - une ligne déclarée ici qui ne correspond à aucun fichier suivi → rouge.
+#
+# Donc : on ajoute la ligne DANS LE MÊME COMMIT que le fichier racine, et on la
+# retire dans le même commit que sa suppression. Ce n'est pas une allowlist
+# d'exceptions — c'est la déclaration du contenu légitime de la racine, la même
+# nature que `.github/labels.yml` pour les étiquettes. « On déclare, on
+# n'allowliste pas » (mika#2201) : il n'y a pas de second fichier d'exemptions.
+#
+# Ce que le garde existe pour refuser : un brouillon de travail de pilote
+# commité à la racine. Trois y ont vécu — `followup-issue.md`,
+# `followup-issue-body.md` et `groom-brief-mika-789-pass2.md`, ce dernier
+# pendant cinq mois — personne ne les lisait, et chaque nouveau worktree les
+# embarquait depuis `main`.
+#
+# Lignes vides et lignes `#` ignorées.
+.dockerignore
+.env.example
+.gitattributes
+.gitignore
+.node-version
+.release-please-manifest.json
+CHANGELOG.md
+CLAUDE.md
+CONCEPTS.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+Dockerfile.agent
+Dockerfile.gateway
+LICENSE
+Makefile
+README.md
+cliff.toml
+clippy.toml
+deny.toml
+docker-compose.yml
+install.sh
+lefthook.yml
+package-lock.json
+package.json
+release-please-config.json
+rust-toolchain.toml
