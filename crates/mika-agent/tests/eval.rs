@@ -156,6 +156,10 @@ mod eval {
     // est le chemin réellement exposé.
     mod test_mcp_secret_boundary_2281;
     mod test_merge_identity_2248;
+    // mika#2748 — le câblage de l'allowlist d'outils, vu sur le tableau que le
+    // modèle a réellement reçu : ni le prédicat (D8) ni le chargement TOML (D9)
+    // ne rougissent si les sites de production ne passent jamais le champ.
+    mod test_mika_arch_tool_allowlist_2748;
     // mika#2304 — le tour dit sous quel modèle il a tourné, et un modèle nommé
     // par l'appelant l'emporte sur la section `[llm]` d'une skill.
     mod test_model_attestation_2304;
