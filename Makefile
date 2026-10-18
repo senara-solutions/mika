@@ -160,6 +160,8 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_sandbox_gh_usable.sh
 	@bash skills/bundled/_shared/tests/test_egress_sentinel_staging.sh
 	@bash skills/bundled/_shared/tests/test_egress_sentinel_enforcement.sh
+	@bash skills/bundled/_shared/tests/test_egress_push_bound.sh
+	@bash skills/bundled/_shared/tests/test_egress_push_scope_staging.sh
 	@bash skills/bundled/_shared/tests/test_egress_relay_socket_and_env.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh
 	@bash scripts/verify-no-secret-in-setenv.sh

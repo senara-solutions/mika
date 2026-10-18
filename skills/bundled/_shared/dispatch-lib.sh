@@ -1964,6 +1964,69 @@ _stage_pilot_egress_push_scope() {
     _PILOT_EGRESS_PUSH_SCOPE_ENTRY="$_nonce"
 }
 
+# mika#2766: the other end of the entry's life.
+#
+# An entry that outlives its spawn leaves the union of live perimeters wider
+# than the set of spawns actually in flight. For the repo dimension that costs
+# little — the union is bounded by the three dispatchable repositories — but the
+# addon's TTL is a 12 h FLOOR on the longest spawn, so without this call a
+# perimeter stays declared for half a day after the pilot that owned it died.
+# The TTL is the backstop for a SIGKILLed dispatch, which runs no trap at all;
+# it is not the nominal path.
+#
+# AT SPAWN END, not at dispatch end, and that is the whole reason this is a
+# function and not a `trap EXIT` line. `_run_pilot_sandboxed` runs MORE THAN
+# ONCE per dispatch (implementation pilot, revise pilot, resumptions) and
+# `_stage_pilot_egress_push_scope` clears the nonce on entry, so spawn N's
+# entry name is unknowable the instant spawn N+1 starts staging. A
+# dispatch-level trap could only ever clean up the last one and would leak every
+# earlier spawn's perimeter for the TTL's duration.
+#
+# A function-scoped trap is not an option either: bash has no such thing, and a
+# `trap ... EXIT` set inside `_run_pilot_sandboxed` would clobber
+# `_dispatch_lib_exit_trap` for the whole shell. So the shape is the one
+# `_release_issue_seat` already uses (mika#2155): an explicit call on the
+# nominal path, plus a backstop line in the exit trap for the crash and cancel
+# paths. The nominal call lowers the flag, so the backstop is a measurable
+# no-op rather than a second deletion.
+#
+# ONLY ITS OWN ENTRY, never a sweep and never the directory. A sweep would be
+# a dispatch deleting a CONCURRENT dispatch's perimeter — and because
+# `_push_scope_verdict` degrades only when the registry is empty or unreadable
+# and never per entry, the victim would be 403'd on its legitimate push while
+# the neighbour kept the registry non-empty. Removing the directory would turn
+# `scope-absent` into a registry the next staging has to recreate, for nothing.
+#
+# Fail-OPEN like its producer, but the failure is the other way round: a
+# residual entry is a perimeter that stays declared, so the TTL is what collects
+# it. Nothing here is worth failing a dispatch over, and silence would leave an
+# operator with a registry growing for no stated reason — hence the stderr line.
+#
+# NO `set +x` BRACKET, for the reason given on the producer: an entry name is a
+# nonce, not a credential, and the symmetry would obscure why its neighbours
+# have one.
+_unstage_pilot_egress_push_scope() {
+    local _nonce="${_PILOT_EGRESS_PUSH_SCOPE_ENTRY:-}"
+    # Nothing declared (free-text mode, nonce draw failed, write failed), or
+    # already unregistered by the nominal path. Both are no-ops, and the second
+    # is what makes the exit-trap backstop free.
+    [ -n "$_nonce" ] || return 0
+
+    local _dir
+    _dir="${_PILOT_EGRESS_PUSH_SCOPE_DIR:-$HOME/.mika/pilot-push-scopes}"
+    if rm -f "$_dir/$_nonce" 2>/dev/null; then
+        _PILOT_EGRESS_PUSH_SCOPE_ENTRY=""
+        return 0
+    fi
+
+    # Cleared anyway: a second attempt on a path `rm -f` already refused would
+    # fail identically, and leaving the nonce up would make the exit trap repeat
+    # the same failing call and the same line.
+    _PILOT_EGRESS_PUSH_SCOPE_ENTRY=""
+    echo "dispatch-lib: could not unregister the push perimeter $_dir/$_nonce — it stays declared until the addon's TTL collects it, so this spawn's repository remains pushable for up to 12 h (mika#2766)" >&2
+    return 0
+}
+
 # mika#2141: generate the sandbox's git configuration host-side.
 #
 # Three things must be written, and each was measured to be independently
@@ -2730,6 +2793,15 @@ exec \"\$@\"" mika-pilot-sandbox "$@" || _sandbox_rc=$?
     for _cfd in ${secret_fds[@]+"${secret_fds[@]}"}; do
         exec {_cfd}<&-
     done
+
+    # mika#2766: the spawn is over, so its declared perimeter is over too. HERE
+    # and not in the exit trap, because this function runs more than once per
+    # dispatch and the nonce of the spawn that just ended is about to be
+    # overwritten by the next one's staging. AFTER the fd loop and BEFORE the
+    # return, for the mika#2039 reason stated above: `$?` must still be the one
+    # bwrap produced when `return` reads it, and `_sandbox_rc` is already
+    # captured, so nothing here can touch the status this function reports.
+    _unstage_pilot_egress_push_scope
     return "$_sandbox_rc"
 }
 
@@ -2859,6 +2931,13 @@ _dispatch_lib_exit_trap() {
     # there). Before the CALLBACK_SENT guard on purpose: the nominal path
     # returns early there, and a failed nominal release still needs this retry.
     _release_issue_seat "$REPO" "$ISSUE_NUM" || true
+    # mika#2766: crash/cancel backstop for the push perimeter, same shape and
+    # same reason as the line above. The nominal path already unregistered at
+    # spawn end and lowered the flag, so this is a no-op there. It catches only
+    # the dispatch that died between the sandbox returning and this trap — a
+    # SIGKILL gets neither, which is what the addon's TTL is for. Before the
+    # CALLBACK_SENT guard, like its neighbour, because that guard returns early.
+    _unstage_pilot_egress_push_scope || true
     # Cleanup fuzzy-match side-channel tmpfile (mika#1272)
     rm -f "${_DISPOSITION_FUZZY_FILE:-}" 2>/dev/null
     # Cleanup architect-stderr side-channel tmpfile (mika#2278)

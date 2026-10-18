@@ -464,6 +464,41 @@ addon._last_purge = {}
 os.environ["_PILOT_EGRESS_SENTINEL_DIR"] = str(REGISTRY)
 
 print("")
+print("CASE 14 — the 72 h TTL of THIS registry is unchanged (mika#2766)")
+# mika#2766 gave the perimeter registry of mika#2751 its own, much shorter TTL,
+# and `_purge_registry` now takes the number as an argument instead of holding
+# it. This is the neighbouring registry's suite, so this is the right place to
+# assert nobody moved ITS number in passing: the realistic regression is not a
+# rewritten constant but a swapped argument at one of the two call sites, and
+# that reads as 72 h becoming 12 h here.
+#
+# 13 h is the age that separates the two: past the perimeter's 12 h, well inside
+# this registry's 72 h. A sentinel of that age must still be here — a flight is
+# re-read hours after it ran, and a nonce purged under it is an `api.github.com`
+# 403 on a pilot that is simply slow.
+BETWEEN_TTLS = "6666666666666666666666666666ab1e"
+(REGISTRY / BETWEEN_TTLS).write_text("", encoding="utf-8")
+aged = time.time() - 13 * 3600
+os.utime(REGISTRY / BETWEEN_TTLS, (aged, aged))
+addon._last_purge = {}
+flow, _ = run(API, f"Bearer {SENTINEL}")
+check("14.1 the call is served", 200, status_of(flow))
+check_true("14.2 a 13 h sentinel is NOT purged — 72 h still governs here",
+           (REGISTRY / BETWEEN_TTLS).exists())
+flow, _ = run(API, f"Bearer {BARE}-{BETWEEN_TTLS}")
+check("14.3 and it is still a valid credential", 200, status_of(flow))
+check("14.4 the constant itself is unmoved", 72 * 3600, addon._REGISTRY_TTL_SECONDS)
+# The purge still takes the TTL from its CALLER, so a reader of this suite can
+# see that the two registries cannot share one number by construction.
+check_true("14.5 and it is strictly longer than the perimeter registry's",
+           addon._REGISTRY_TTL_SECONDS > addon._PUSH_SCOPE_TTL_SECONDS)
+check_true("14.6 `_purge_registry` takes the TTL in, it does not choose it",
+           "ttl_seconds" in addon._purge_registry.__code__.co_varnames[
+               : addon._purge_registry.__code__.co_argcount])
+(REGISTRY / BETWEEN_TTLS).unlink()
+addon._last_purge = {}
+
+print("")
 print(f"TOTAL failures: {failures}")
 sys.exit(1 if failures else 0)
 PY
@@ -476,8 +511,8 @@ cat "$PY_OUT"
 # floor). Both must be caught — an `exit 0` after three assertions reads
 # exactly like a clean tree (class mika#2205).
 asserted=$(grep -c '^RESULT ' "$PY_OUT" || true)
-rc=1; [ "${asserted:-0}" -ge 80 ] && rc=0
-assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 80)" "0" "$rc"
+rc=1; [ "${asserted:-0}" -ge 86 ] && rc=0
+assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 86)" "0" "$rc"
 assert_eq "every addon-level assertion passes" "0" "$py_rc"
 
 echo ""
