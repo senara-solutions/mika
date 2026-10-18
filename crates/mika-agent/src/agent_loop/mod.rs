@@ -13610,6 +13610,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // mika#2748 — the predicate handles both shapes, at one site
+    // -----------------------------------------------------------------------
+
+    /// The five states of `(disabled, allowed)`, in one table.
+    ///
+    /// Each row is a distinct behaviour, and two of them are the reason the
+    /// table exists rather than three separate tests:
+    ///
+    /// - **Row 4** pins the composition rule. `a` is written on *both* sides,
+    ///   and the denylist wins — that is what preserves the Webhook Fallthrough
+    ///   widening of mika#2517 on an allowlist agent (`effective_disabled_tools`
+    ///   adds `create_task` to the denylist for one turn, and the intersection
+    ///   must still be the answer). Were the allowlist to win instead, that
+    ///   widening would become a no-op for every allowlist agent, silently.
+    /// - **Row 5** is the **negative control of the three-state field**, and the
+    ///   only assertion in the repo that distinguishes `Some([])` from `None`.
+    ///   It is what goes red if a future editor "simplifies"
+    ///   `Option<Vec<String>>` into a plain `Vec<String>`: under that shape an
+    ///   agent admitting *no* builtin would be served *every* builtin, which is
+    ///   the worst possible direction for the error to take.
+    #[test]
+    fn mika2748_le_predicat_traite_les_cinq_etats_de_la_paire() {
+        fn def(name: &str) -> ToolDefinition {
+            ToolDefinition {
+                name: name.to_string(),
+                description: format!("{name} (mika#2748 fixture)"),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        // (case, disabled, allowed, expected survivors)
+        let cases: &[(&str, &[&str], Option<&[&str]>, &[&str])] = &[
+            (
+                "1 — neither shape: early return, array intact",
+                &[],
+                None,
+                &["a", "b", "c"],
+            ),
+            (
+                "2 — denylist only: prior behaviour",
+                &["b"],
+                None,
+                &["a", "c"],
+            ),
+            (
+                "3 — allowlist only: b and c are not admitted",
+                &[],
+                Some(&["a"]),
+                &["a"],
+            ),
+            (
+                "4 — both: intersection, and a name written twice loses",
+                &["a"],
+                Some(&["a", "b"]),
+                &["b"],
+            ),
+            (
+                "5 — Some([]) admits nothing: distinct from case 1",
+                &[],
+                Some(&[]),
+                &[],
+            ),
+        ];
+
+        for (label, disabled, allowed, expected) in cases {
+            let mut defs = vec![def("a"), def("b"), def("c")];
+            let disabled: Vec<String> = disabled.iter().map(|s| (*s).to_string()).collect();
+            let allowed: Option<Vec<String>> =
+                allowed.map(|l| l.iter().map(|s| (*s).to_string()).collect());
+
+            apply_agent_tool_visibility(&mut defs, &disabled, allowed.as_deref(), "mika-test-2748");
+
+            let survivors: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+            assert_eq!(
+                survivors, *expected,
+                "case {label}: served {survivors:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    /// Both shapes match case-insensitively, not just the denylist.
+    ///
+    /// The denylist half has had this pinned since mika#811
+    /// (`test_apply_agent_tool_visibility_case_insensitive`). An allowlist that
+    /// compared case-*sensitively* would fail in the direction that costs: a
+    /// roster entry whose case drifted from the registry would **remove** the
+    /// tool, not keep an extra one.
+    #[test]
+    fn mika2748_lallowlist_compare_sans_egard_a_la_casse() {
+        let mut defs = vec![ToolDefinition {
+            name: "Search_Memory".to_string(),
+            description: "case-mixed in the registry".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let allowed = vec!["search_memory".to_string()];
+        apply_agent_tool_visibility(&mut defs, &[], Some(&allowed), "mika-test-2748");
+        assert_eq!(
+            defs.len(),
+            1,
+            "an allowlist entry must admit a registry name that differs only in case"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // mika#1952 U4-a — `apply_reflection_evidence_contract`
     // -----------------------------------------------------------------------
 
