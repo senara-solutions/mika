@@ -3694,6 +3694,19 @@ mod tests {
                 .contains(&"pr_merge_with_gate".to_string())
         );
         assert!(identity.tools.disabled.contains(&"a2a_call".to_string()));
+        // mika#2748 — fidelity of the emission, not preservation of a value:
+        // `build_mika_arch_identity` writes both lists into one `[tools]` block,
+        // and a block that parses with `allowed` absent is the whole regression
+        // (the agent would silently run the denylist alone). Whether the names
+        // are the right ones is `mika2748_lallowlist_de_mika_arch_est_le_roster`.
+        assert_eq!(
+            identity
+                .tools
+                .allowed
+                .expect("rendered mika-arch identity must carry [tools].allowed")
+                .len(),
+            MIKA_ARCH_ALLOWED_TOOLS.len()
+        );
     }
 
     #[test]
@@ -4069,6 +4082,19 @@ mod tests {
         assert_eq!(allowlist.len(), 3);
     }
 
+    /// Reconciliation of an already-provisioned mika-arch, which is the only
+    /// path by which mika#2748's allowlist reaches an agent whose
+    /// `identity.toml` predates it.
+    ///
+    /// The pre-seeded document below carries `[tools]\ndisabled = []` and no
+    /// `allowed` — the shape every mika-arch on disk had before this ticket.
+    /// `write_default_if_missing` never rewrites an existing file, so without
+    /// `"tools.allowed"` in `CODE_OWNED_IDENTITY_SECTIONS` the declaration
+    /// would be inert for exactly the agents that already exist (class
+    /// mika#1833 / mika#2330): green tests, and a fleet still running the
+    /// denylist. The `tools.allowed` assertion is that class's test, and it
+    /// costs eight lines here instead of a file because this scenario already
+    /// existed for `[context.summary]`.
     #[test]
     fn test_reconcile_adds_mika_arch_missing_context_summary() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4098,6 +4124,21 @@ mod tests {
         assert!(
             !identity.context.summary.inject,
             "reconciler must set [context.summary].inject = false (mika#1009 leak protection)"
+        );
+        let allowed = identity.tools.allowed.unwrap_or_else(|| {
+            panic!(
+                "mika#2748 — reconciliation must add [tools].allowed to an agent provisioned \
+                 before the allowlist existed; absent means \"tools.allowed\" left \
+                 CODE_OWNED_IDENTITY_SECTIONS and the declaration is inert (class mika#1833)"
+            )
+        });
+        assert_eq!(
+            allowed,
+            MIKA_ARCH_ALLOWED_TOOLS
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect::<Vec<_>>(),
+            "mika#2748 — reconciled [tools].allowed must be the roster, in order"
         );
     }
 
