@@ -8,7 +8,7 @@ use mika_common::llm::{
     LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent,
     LlmRole, LlmStopReason, LlmToolDefinition, LlmToolResultBlock, LlmToolResultContent, LlmUsage,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -5720,6 +5720,22 @@ async fn run_agent_inner(
         &context_window_fields,
     );
 
+    // mika#2783 — the detail `tool_defs_bytes` throws away. The sum exists on the
+    // line above; what nobody could read is what ONE name costs, which is the only
+    // question mika#2748's allowlist of 19 names ever asks. Same array, same turn,
+    // and deliberately the SAME number for the total — `context_window_fields.tool_defs_bytes`
+    // rather than a second call to `tool_defs_byte_weight`, so the reconciliation
+    // below compares the census against what the neighbour actually published and
+    // not against a recomputation free to agree with itself.
+    emit_tool_defs_census(
+        &db.agent_id,
+        session_id,
+        trace_id,
+        "conversation",
+        &tool_defs_census(&skill_tool_defs),
+        context_window_fields.tool_defs_bytes,
+    );
+
     // mika#2474 — the tail of the brief-size distribution becomes a greppable,
     // countable population. `user_message_bytes` is the one component of an
     // architect brief that carries no ceiling: for a `mika ask … - < "$plan_path"`
@@ -9544,6 +9560,196 @@ fn emit_context_window_assembled(
         truncated_messages = fields.truncated_messages,
         truncated_bytes = fields.truncated_bytes,
         "context window assembled"
+    );
+}
+
+/// Log name of the per-tool census of the served tool array (mika#2783).
+///
+/// **SOLE WRITER**, held by
+/// `canonical_tokens::tests::mika2783_le_nom_de_levenement_a_un_seul_scribe`. A
+/// second site writing this name would publish a second `{name: bytes}` map for
+/// the same turn, and the two would be indistinguishable in the log — the
+/// mika#2205 class, one name over two populations, which is exactly what this
+/// instrument exists to prevent on `tool_defs_bytes`.
+const TOOL_DEFS_CENSUS_EVENT: &str = "tool_defs_census";
+
+/// What one served tool array costs, name by name (mika#2783).
+///
+/// `count` is the number of **definitions**, never `per_tool.len()`: a duplicated
+/// name collapses two entries into one map key, and it is `count` the framing
+/// arithmetic below is a function of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolDefsCensus {
+    /// `{tool name: bytes of its compact JSON serialization}`. A `BTreeMap`
+    /// rather than a `HashMap` so the logged line is stable across turns and two
+    /// readings are diffable; a non-served tool has **no key**, never a `0`
+    /// (mika#2331).
+    per_tool: BTreeMap<String, usize>,
+    /// Σ of the per-tool byte counts, before the array frame.
+    per_tool_sum: usize,
+    /// `tool_defs.len()` — the number of definitions served.
+    count: usize,
+    /// Names served more than once, with their occurrence count. Empty in the
+    /// nominal regime.
+    duplicates: Vec<(String, usize)>,
+}
+
+/// Weigh each definition of a served tool array (mika#2783).
+///
+/// Pure, so the equality `per_tool_sum + framing == tool_defs_bytes` is assertable
+/// without a subscriber, a database or a turn — which is where risk R1 of the plan
+/// shows up: a `cargo test` red, not a WARN in production.
+///
+/// A definition that fails to serialize weighs `0`, like
+/// [`tool_defs_byte_weight`]'s whole-array fallback. That is not a silent loss:
+/// `0` makes `per_tool_sum` fall short of the total and the reconciliation WARN
+/// fires, naming the delta.
+///
+/// A **duplicated** name is summed into one key rather than overwritten, so the
+/// equality holds by construction whatever the array contains; the duplication
+/// itself is reported separately by [`emit_tool_defs_census`].
+fn tool_defs_census(tool_defs: &[mika_common::claude::ToolDefinition]) -> ToolDefsCensus {
+    let mut per_tool: BTreeMap<String, usize> = BTreeMap::new();
+    let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_tool_sum = 0usize;
+
+    for def in tool_defs {
+        let bytes = serde_json::to_string(def).map(|s| s.len()).unwrap_or(0);
+        per_tool_sum += bytes;
+        *per_tool.entry(def.name.clone()).or_insert(0) += bytes;
+        *occurrences.entry(def.name.clone()).or_insert(0) += 1;
+    }
+
+    let duplicates = occurrences.into_iter().filter(|(_, n)| *n > 1).collect();
+
+    ToolDefsCensus {
+        per_tool,
+        per_tool_sum,
+        count: tool_defs.len(),
+        duplicates,
+    }
+}
+
+/// Bytes `serde_json` spends on the array frame itself, for `count` elements
+/// (mika#2783).
+///
+/// Compact serialization writes `[e₁,e₂,…,eₙ]`: two brackets plus `n − 1` commas.
+/// `[]` is therefore `2`, which is why the subtraction saturates — a count of `0`
+/// must not wrap to `usize::MAX` and turn an empty array into a mismatch.
+fn json_array_framing_bytes(count: usize) -> usize {
+    2 + count.saturating_sub(1)
+}
+
+/// Publish the per-tool census, and reconcile it against the total its neighbour
+/// published (mika#2783).
+///
+/// # Why a distinct event name rather than a field on `context_window_assembled`
+///
+/// It must grep alone (mika#2474, mika#2293): the census is read by someone
+/// arbitrating **one** name of mika#2748's allowlist of 19, and that reading is a
+/// `jq` over one event per turn, not a filter over the busiest line of the stream.
+/// A field on the neighbour would also widen a line every conversation turn
+/// already pays for, to serve a question asked a few times per allowlist change.
+///
+/// # Why one map and not one line per tool
+///
+/// ≈ 50 lines per turn per agent is the volume the ticket named; a single line
+/// carrying `{name: bytes}` answers the same question at 1/50th of the stream. And
+/// **not** "first assembly only" either: the served array is not constant per
+/// agent — matched skills vary by turn, the denylist widens on a Webhook
+/// Fallthrough (mika#2517), MCP tools come and go, and `filter_ci_excluded_tools`
+/// removes names on a CI prefix. A first-assembly-only emission would describe one
+/// turn and be read as describing the agent.
+///
+/// # Why INFO
+///
+/// A census of the nominal case fires on every turn by construction. A WARN on a
+/// nominal regime is what ends up muzzled (the `brief_size_alert_bytes` reasoning,
+/// `mika-common/CLAUDE.md`). The three WARNs below are the non-nominal arms, and
+/// they **add** to the INFO line, never replace it: the line is emitted on every
+/// branch, so its absence means a binary predating this change (mika#2340) and
+/// never an agent serving no tools.
+///
+/// # Why `tool_defs_bytes` rides along
+///
+/// So the reconciliation is checkable **from the log alone**, by one reader
+/// holding one line, instead of requiring a join against the sibling event of the
+/// same `trace_id`. It is the value the sibling published, passed in, not a second
+/// measurement of the same array.
+fn emit_tool_defs_census(
+    agent_id: &str,
+    session_id: &str,
+    trace_id: &str,
+    mode: &str,
+    census: &ToolDefsCensus,
+    tool_defs_bytes: usize,
+) {
+    // Two definitions under one name: the map holds their sum, so the equality
+    // below still holds, but `per_tool["x"]` no longer answers "what does x
+    // cost?" — it answers "what do the x's cost together". Expected regime: zero.
+    // Reachable: the MCP append at the top of the window assembly does not
+    // deduplicate against the builtin and skill names.
+    for (tool, occurrences) in &census.duplicates {
+        warn!(
+            event = "tool_defs_census_duplicate_name",
+            agent_id = %agent_id,
+            tool = %tool,
+            occurrences = *occurrences,
+            "two tool definitions share one name; the census sums them under one key (mika#2783)"
+        );
+    }
+
+    let framing_bytes = json_array_framing_bytes(census.count);
+    let reconciled = census.per_tool_sum + framing_bytes;
+    if reconciled != tool_defs_bytes {
+        // The mika#2205 class, caught in flight: the census and the total would
+        // be two populations under one reading. `delta` is signed because the
+        // sign is the diagnosis — short means a definition failed to serialize,
+        // long means the two sites no longer weigh the same array.
+        warn!(
+            event = "tool_defs_census_mismatch",
+            agent_id = %agent_id,
+            trace_id = %trace_id,
+            tool_defs_bytes = tool_defs_bytes,
+            per_tool_sum = census.per_tool_sum,
+            tool_defs_count = census.count,
+            framing_bytes = framing_bytes,
+            delta = reconciled as i64 - tool_defs_bytes as i64,
+            "per-tool census does not reconcile with tool_defs_bytes (mika#2783)"
+        );
+    }
+
+    // Same form as `emit_system_prompt_assembled`'s `per_skill_bytes`: a JSON
+    // object serialized into one field. Degradation is `"{}"` rather than an
+    // absent field, so `per_tool_bytes` is never missing — the field's *keys*
+    // carry the absence semantics, and a reader must not have to tell "no key for
+    // this tool" from "no map at all" without being told which happened.
+    let per_tool_json = match serde_json::to_string(&census.per_tool) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(
+                event = "tool_defs_census_unserializable",
+                agent_id = %agent_id,
+                error = %e,
+                tool_defs_count = census.count,
+                "per-tool census map could not be serialized; the field degrades to {{}} (mika#2783)"
+            );
+            "{}".to_string()
+        }
+    };
+
+    info!(
+        target: "mika::otel",
+        event = TOOL_DEFS_CENSUS_EVENT,
+        agent_id = %agent_id,
+        session_id = %session_id,
+        trace_id = %trace_id,
+        mode = %mode,
+        tool_defs_bytes = tool_defs_bytes,
+        tool_defs_count = census.count,
+        per_tool_sum = census.per_tool_sum,
+        per_tool_bytes = per_tool_json.as_str(),
+        "tool definitions censused per tool"
     );
 }
 
