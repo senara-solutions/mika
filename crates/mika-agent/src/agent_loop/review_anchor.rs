@@ -241,10 +241,19 @@ pub(crate) fn verify_review_anchors(
     // Keep the anchor's *content*, not its label. The declared prefix (`A1:`) is the marker
     // that identifies the line, never part of the quote — counting it toward
     // `min_quote_chars` would let a longer prefix buy a shorter quote.
+    //
+    // Leading `*` are skipped before the prefix is looked for (mika#2786): a reviewer who
+    // writes the label in bold (`**A1:** "…"`) has still written an anchor line. Measured on
+    // mika#2762's third withheld pass (2026-10-18, session `8c9da828`): every label was bold,
+    // so the guard saw `NoAnchorLine`; replayed with the label recognized, the response
+    // carried three verbatim quotes at three disjoint regions of the brief. This tolerance is
+    // on *finding* the line only. The `**` left after the prefix goes through
+    // [`normalize_for_anchor_match`] like any other emphasis marker, so the quote is held to
+    // exactly the same verbatim test as an unbolded one.
     let anchor_lines: Vec<&str> = body_lines(text, required_suffix_lines)
         .into_iter()
         .filter_map(|line| {
-            let trimmed = line.trim_start();
+            let trimmed = line.trim_start().trim_start_matches('*');
             prefixes
                 .iter()
                 .find_map(|p| trimmed.strip_prefix(p.as_str()))
@@ -382,6 +391,38 @@ mod tests {
                     \n\
                     Disposition: READY\n";
         assert_eq!(verify(text), AnchorVerdict::Satisfied);
+    }
+
+    /// mika#2786 — the shape of mika#2762's third withheld pass: every label in bold. Until
+    /// this fix the guard saw no anchor line at all.
+    #[test]
+    fn mika2786_bold_labels_are_anchor_lines() {
+        let text = "**A1:** le plan propose bien de « re-résoudre le token avant chaque cycle du manager » — correct.\n\
+                    **A2:** sur « l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ? » — oui.\n\
+                    **A3:** « Je n'ai pas fixé N pour le seuil de détection des échecs » — 30 minutes.\n\
+                    \n\
+                    Disposition: READY\n";
+        assert_eq!(verify(text), AnchorVerdict::Satisfied);
+    }
+
+    /// mika#2786 — the negative control of the tolerance: it finds the line, it does not
+    /// relax the quote. A bold anchor that paraphrases the brief, or quotes another document,
+    /// is refused exactly as an unbolded one is.
+    #[test]
+    fn mika2786_a_bold_label_does_not_relax_the_verbatim_test() {
+        let text = "**A1:** le plan propose bien de « re-résoudre le token avant chaque cycle du manager » — correct.\n\
+                    **A2:** sur « l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ? » — oui.\n\
+                    **A3:** Le reaper groom introduit par mika#2750 (PR mika#2754) fait échouer le parent.\n\
+                    \n\
+                    Disposition: READY\n";
+        assert_eq!(
+            verify(text),
+            AnchorVerdict::Missing {
+                anchors_found: 3,
+                anchors_valid: 2,
+                reason: AnchorMissReason::QuoteNotInBrief,
+            }
+        );
     }
 
     #[test]

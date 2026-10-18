@@ -1617,3 +1617,50 @@ fn test_migrate_v46_to_v47_new_columns_round_trip() {
         Some(r#"{"phase":"first_decompose"}"#)
     );
 }
+
+// ---------------------------------------------------------------------------
+// mika#2786 — `recent_groom_results_for_issue`, la profondeur derrière mika#2545
+// ---------------------------------------------------------------------------
+
+/// Plus récent d'abord, borné par `limit`, et limité aux callbacks de CE ticket :
+/// le frein compte une série, donc l'ordre est sa grammaire.
+#[test]
+fn mika2786_recent_groom_results_are_newest_first_and_bounded() {
+    let db = db();
+    let (parent_id, oldest) =
+        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    set_created_at(&db, &oldest, "2026-10-18T18:00:00Z");
+    for (at, result) in [
+        ("2026-10-18T18:10:00Z", "middle"),
+        ("2026-10-18T18:20:00Z", "newest"),
+    ] {
+        let id = db
+            .create_task(&groom_callback("mika", &parent_id, "groom"))
+            .unwrap();
+        assert!(db.update_task_completed(&id, "mika", Some(result)).unwrap());
+        set_created_at(&db, &id, at);
+    }
+    // Un autre ticket ne doit pas entrer dans la série.
+    completed_groom_pair(
+        &db,
+        "mika",
+        "https://github.com/senara-solutions/mika/issues/999",
+        "other ticket",
+    );
+
+    let rows = db
+        .recent_groom_results_for_issue("mika", GROOM_ISSUE_URL, 2)
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![Some("newest".to_string()), Some("middle".to_string())]
+    );
+    let all = db
+        .recent_groom_results_for_issue("mika", GROOM_ISSUE_URL, 10)
+        .unwrap();
+    assert_eq!(
+        all.len(),
+        3,
+        "le ticket voisin est hors de la série : {all:?}"
+    );
+}

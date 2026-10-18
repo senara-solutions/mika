@@ -1769,6 +1769,20 @@ impl AsyncDatabase {
             .await
     }
 
+    /// The `result` of the `limit` most recent terminal groom callbacks for an
+    /// issue, newest first (mika#2786). See
+    /// [`crate::db::Database::recent_groom_results_for_issue`].
+    pub async fn recent_groom_results_for_issue(
+        &self,
+        issue_url: &str,
+        limit: usize,
+    ) -> Result<Vec<Option<String>>> {
+        let a = self.agent_id.clone();
+        let u = issue_url.to_owned();
+        self.with_db(move |db| db.recent_groom_results_for_issue(&a, &u, limit))
+            .await
+    }
+
     /// Count pending deferred-dispatch callbacks for this agent (mika#1011).
     pub async fn count_pending_deferred_callbacks(&self) -> Result<i64> {
         let a = self.agent_id.clone();

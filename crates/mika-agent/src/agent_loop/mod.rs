@@ -8391,6 +8391,12 @@ const TERMINAL_DISPOSITIONS: &[&str] = &[
 /// `skills/bundled/_shared/dispatch-lib.sh`; `test-dispatch-lib.sh` compares the two.
 const REVIEW_ANCHOR_ENGINE_FINDING_MARKER: &str = "(BLOCKING) [mika-engine] review-anchor:";
 
+/// The same marker, for the anchor brake in `skills::executor` (mika#2786), which counts
+/// withheld attestations by this fragment on the groom callback's `Engine reason:` line. An
+/// alias rather than a widened visibility: `test-dispatch-lib.sh` reads the declaration above
+/// with a one-line `grep`, and a longer declaration would wrap under rustfmt and blind it.
+pub(crate) const REVIEW_ANCHOR_WITHHELD_MARKER: &str = REVIEW_ANCHOR_ENGINE_FINDING_MARKER;
+
 /// The `ESCALATE` line of the same family as a declared disposition line
 /// (`Disposition: READY` → `Disposition: ESCALATE`, `Verdict: GROOMED` → `Verdict: ESCALATE`).
 fn escalate_line_of_family(disposition_line: &str) -> Option<String> {

@@ -4432,6 +4432,45 @@ impl Database {
         Ok(row)
     }
 
+    /// The `result` of the `limit` most recent terminal groom callbacks for an
+    /// issue, newest first (mika#2786).
+    ///
+    /// Same join, same filter and same order as
+    /// [`Self::latest_groom_verdict_for_issue`], deliberately: the anchor brake
+    /// and the mika#2545 gate must agree on what "the groom callbacks of this
+    /// ticket" are. What differs is the depth. mika#2545 reads one row; the brake
+    /// needs the run of rows behind it, because a deferred launcher
+    /// (`long_running:run_claude_pilot:deferred`, "deferred dispatch slot freed")
+    /// is a groom callback too and lands on top of the verdict it follows —
+    /// measured on mika#2762, 2026-10-18 18:20:02Z. The grammar of each row is
+    /// the caller's business; this returns the column verbatim.
+    pub fn recent_groom_results_for_issue(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+        limit: usize,
+    ) -> Result<Vec<Option<String>>> {
+        let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
+        let mut stmt = self.conn.prepare(
+            "SELECT child.result FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE child.agent_id = ?1
+               AND child.trigger_type = 'callback'
+               AND child.dispatch_class = 'groom'
+               AND child.status IN ('completed', 'delivered')
+               AND parent.reference_url IN (?2, ?3)
+             ORDER BY child.created_at DESC, child.id DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![agent_id, exact_url, legacy_groom_url, limit as i64],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Count pending callback tasks for a given team run with depth > 1.
     /// Used to detect grandchild long-running tasks spawned during a team run.
     pub fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {
