@@ -96,14 +96,28 @@ pub const DEFERRED_LAUNCHER_LIKE_PATTERN: &str = "%:deferred";
 
 Un **suffixe**, pas la constante exacte, parce que le producteur du label est susceptible
 de se spécialiser par classe (`…_groom:deferred`) et qu'un lanceur différé d'un autre nom
-rouvrirait le trou en silence. Le lien entre les deux est **asserté**, pas espéré :
+rouvrirait le trou en silence. Le lien entre les deux est **asserté**, pas espéré — dans un
+`#[test]`, sibling de `test_deferred_dispatch_label_string_drift_guard` (mika#1124,
+`dispatcher.rs:7380`) et posé à côté de lui :
 
 ```rust
-// Garde de dérive, sibling de celui de mika#1124 (`dispatcher.rs:7380`).
-assert!(DEFERRED_DISPATCH_LABEL.ends_with(":deferred"),
+/// Garde de dérive mika#2762 : la constante exacte doit rester couverte par le
+/// motif `LIKE` que le SQL du reaper utilise pour l'exclure.
+#[test]
+fn test_deferred_launcher_like_pattern_couvre_le_label() {
+    let suffixe = DEFERRED_LAUNCHER_LIKE_PATTERN.trim_start_matches('%');
+    assert!(
+        DEFERRED_DISPATCH_LABEL.ends_with(suffixe),
         "DEFERRED_DISPATCH_LABEL ne matche plus DEFERRED_LAUNCHER_LIKE_PATTERN — \
-         répare le prédicat SQL de mika#2762, n'excepte pas le label");
+         répare le prédicat SQL de mika#2762, n'excepte pas le label"
+    );
+}
 ```
+
+Un `#[test]` et non un `const { assert!(…) }` : `str::ends_with` n'est pas une `const fn`,
+donc la vérification ne peut pas être au build. Le suffixe est **dérivé** du motif
+(`trim_start_matches('%')`) plutôt que retapé, sinon la garde elle-même peut dériver du
+prédicat qu'elle protège et rester verte sur une valeur périmée.
 
 ### D2 — `find_orphaned_parent_tasks` : ancrage sur `MAX`, lanceurs différés exclus
 
@@ -355,16 +369,17 @@ sont dérivés de sa section **Correctif attendu** et du § 4 de ce plan.
 | `crates/mika-agent/src/db/tasks.rs` — D2 (SQL + doc-comment amendé) | 70 |
 | `crates/mika-agent/src/db/tasks.rs` — D3 (sibling de succès symétrisé) | 30 |
 | `crates/mika-agent/src/task_state/tasks.rs` — champ `last_callback_at` + doc | 12 |
-| `crates/mika-agent/src/agent_loop/mod.rs` — D1 (prédicat + garde de dérive) | 25 |
+| `crates/mika-agent/src/agent_loop/mod.rs` — D1 (prédicat) | 10 |
+| `crates/mika-agent/src/task_engine/dispatcher.rs` — D1 (`#[test]` de dérive) | 20 |
 | `crates/mika-agent/src/task_engine/engine.rs` — D4 (appel, visibilité, garde AC-3, champ d'audit) | 40 |
 | tests (`crates/mika-agent/src/db/tests/reapers.rs`) | 155 |
 | tests (`crates/mika-agent/tests/eval/test_groom_parent_reap_2750.rs`) | 40 |
 
-Total estimé : 372 lignes
+Total estimé : 377 lignes
 Plafond de tours : 200 (`loop-substrate`)
 Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 
-**Un seul vol, et voici pourquoi il tient.** 372 sous la borne de 429 et très loin du seuil
+**Un seul vol, et voici pourquoi il tient.** 377 sous la borne de 429 et très loin du seuil
 de 1000 par PR. Trois raisons concrètes : (a) le test du cas mesuré **existe déjà** et n'est
 pas à écrire — il est à rendre significatif, ce qui coûte une ligne d'appel dans `tick()` ;
 (b) les deux requêtes de la paire couplée reçoivent le **même** diff de trois clauses, donc
