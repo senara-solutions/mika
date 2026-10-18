@@ -1794,6 +1794,9 @@ mod tests {
     fn un_vol_sur_1802() -> crate::milestone_manager::evaluator::FinishedFlight {
         crate::milestone_manager::evaluator::FinishedFlight {
             task_id: "task-1802".into(),
+            // Pas l'agent par défaut du processus : un vol d'implement est une
+            // tâche du dispatcheur (mika#2792).
+            agent_id: "mika-dev".into(),
             status: "completed".into(),
             result: Some(
                 "Outcome: PR_OPENED\nTurns: 83\nPR: https://github.com/senara-solutions/mika/pull/2002\n"

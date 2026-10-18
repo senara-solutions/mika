@@ -128,6 +128,17 @@ pub struct FlightVerdict {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FinishedFlight {
     pub task_id: String,
+    /// L'agent **propriétaire** de la ligne lue — une septième donnée, portée
+    /// pour la seule observabilité (mika#2792), et l'exception assumée à la
+    /// minceur décrite ci-dessus.
+    ///
+    /// Aucun chemin de verdict ne la lit : [`evaluate_flight`] ne la touche pas,
+    /// et [`FlightVerdict`] ne la porte pas. Elle existe parce que la requête
+    /// n'est **plus** scopée à un agent, donc « quels agents possèdent les vols
+    /// trouvés » est devenu une mesure, et c'est la mesure qui distingue « aucun
+    /// vol » de « mauvaise base ». La déclarer serait inutile ; la mesurer est le
+    /// correctif.
+    pub agent_id: String,
     pub status: String,
     pub result: Option<String>,
     /// JSON brut de `tasks.metadata` ; `claude_pilot` est lu là-dedans.
@@ -392,6 +403,7 @@ mod tests {
     fn fixture_pr_opened() -> FinishedFlight {
         FinishedFlight {
             task_id: "task-pr".to_string(),
+            agent_id: "mika-dev".to_string(),
             status: "completed".to_string(),
             result: Some(
                 "Session: 5b6f13dc\n\
@@ -415,6 +427,7 @@ mod tests {
     fn fixture_rescue_pr() -> FinishedFlight {
         FinishedFlight {
             task_id: "task-rescue".to_string(),
+            agent_id: "mika-dev".to_string(),
             status: "failed".to_string(),
             result: Some(
                 "PIPELINE FAILURE: dirty worktree with zero commits\n\
@@ -435,6 +448,7 @@ mod tests {
     fn fixture_dead_at_ceiling() -> FinishedFlight {
         FinishedFlight {
             task_id: "task-ceiling".to_string(),
+            agent_id: "mika-dev".to_string(),
             status: "failed".to_string(),
             result: Some(
                 "PIPELINE FAILURE: pilot halted\n\
