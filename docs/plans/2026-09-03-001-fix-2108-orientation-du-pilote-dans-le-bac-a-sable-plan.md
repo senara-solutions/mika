@@ -214,7 +214,7 @@ sonde qui ne montre que des absences ne distingue pas « correctement confiné �
 
 ---
 
-## Critères d'acceptation
+## Acceptance criteria — critères d'acceptation
 
 **AC1 — Le recensement est écrit et reproductible.** Un document sous
 `docs/solutions/` porte les tableaux M1 et M2, la commande exacte qui les produit,
