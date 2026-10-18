@@ -2143,6 +2143,23 @@ pub(crate) const GROOM_ESCALATE_REFUSED_EVENT: &str = "groom_escalate_redispatch
 /// dont il est le pendant d'échec.
 pub(crate) const GROOM_ESCALATE_MARKER: &str = "Outcome: ESCALATE";
 
+/// Ce qui fait d'une ligne de `result` une **disposition** plutôt qu'un
+/// événement de plomberie (mika#2795).
+///
+/// Le préfixe de l'enveloppe de callback, dont [`GROOM_ESCALATE_MARKER`] est une
+/// valeur particulière. Un callback de groom terminal qui ne porte **aucune**
+/// ligne commençant par ce préfixe n'a rendu aucun verdict : le lanceur différé
+/// promu par `promote_next_deferred_callback_for_class` en est un
+/// (`result = "deferred dispatch slot freed"`), et sur mika#2762 il a masqué
+/// l'`ESCALATE` posé sept minutes plus tôt parce que le lecteur retenait la
+/// ligne la plus récente sans regarder si elle disait quoi que ce soit.
+///
+/// Même ancrage que le marqueur : `starts_with` sur une **ligne**, jamais un
+/// `contains` sur le texte. La prose d'un pilote cite ces en-têtes en parlant du
+/// mécanisme — c'est le faux positif mesuré sur le Signal S (mika#2050) et les
+/// 651 fausses détections d'`instr` (mika#2105).
+pub(crate) const GROOM_OUTCOME_LINE_PREFIX: &str = "Outcome: ";
+
 /// Le champ `verdict` du refus mika#2545 : un **format de fil**.
 ///
 /// Il atterrit dans `audit_events.after_value` **et** dans le JSON écrit sur
@@ -2167,6 +2184,31 @@ pub const ALL_GROOM_ESCALATE_VERDICTS: &[&str] = &[
     GROOM_ESCALATE_VERDICT_ESCALATED,
     GROOM_ESCALATE_VERDICT_UNREADABLE,
 ];
+
+/// Le troisième mot du champ `verdict` de la **sonde** mika#2795 — et
+/// délibérément **pas** une entrée d'[`ALL_GROOM_ESCALATE_VERDICTS`].
+///
+/// Cette table-là énumère les motifs de **refus**, tels qu'ils atterrissent dans
+/// `audit_events.after_value` et dans le JSON de `tasks.result` ; sa cardinalité
+/// de 2 est un format de fil, assertée par
+/// `mika2545_the_two_refusal_verdicts_are_a_wire_format`. Le cas nominal n'est
+/// pas un refus et n'a jamais rien écrit là. Il a besoin d'un nom quand même,
+/// parce que la sonde ci-dessous parle sur **toutes** ses branches, y compris
+/// celle où rien n'est refusé : une sonde muette dans le cas sain ne distingue
+/// pas « lu, rien à signaler » de « jamais passé ici » (mika#2205).
+pub(crate) const GROOM_VERDICT_NOT_ESCALATED: &str = "not_escalated";
+
+/// La sonde de la sélection de ligne (mika#2795).
+///
+/// Émise à **chaque** lecture du verdict, y compris quand `skipped_neutral`
+/// vaut zéro. Le contrôle positif est le point : le défaut de mika#2762 était
+/// invisible parce que « le dernier groom n'a pas escaladé » et « le dernier
+/// callback ne disait rien » rendaient les mêmes octets. La ligne porte le
+/// compteur, donc elle rend la population des sauts **comptable** ; son absence
+/// signifie un binaire antérieur à ce correctif (classe mika#2340), jamais zéro
+/// saut (classe mika#2331), et un réglage qu'on ne peut pas observer n'est pas
+/// un réglage (mika#2293).
+pub(crate) const GROOM_VERDICT_SELECTED_EVENT: &str = "groom_verdict_selected";
 
 /// Est-ce que le dernier grooming de ce ticket a rendu un verdict de halte ?
 /// (mika#2545)
@@ -2221,20 +2263,126 @@ pub(crate) fn groom_escalate_verdict(result: Option<String>) -> GroomVerdictStat
     }
 }
 
+/// Ce `result` porte-t-il une ligne de disposition ? (mika#2795)
+///
+/// **Fonction pure**, ancrée sur la ligne — voir [`GROOM_OUTCOME_LINE_PREFIX`]
+/// pour la raison de l'ancrage. Elle ne dit pas *quelle* disposition : c'est
+/// [`groom_escalate_verdict`] qui tranche, et elle n'est appelée que sur une
+/// ligne dont celle-ci a déjà dit qu'elle en portait une.
+pub(crate) fn carries_groom_outcome_line(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with(GROOM_OUTCOME_LINE_PREFIX))
+}
+
+/// Le résultat de la sélection de ligne : l'état **et** de quoi le rendre
+/// observable (mika#2795).
+///
+/// Les deux compteurs ne sont pas de la décoration : `rows_examined` dit la
+/// taille de la population que la jointure a bornée, `skipped_neutral` dit
+/// combien de ces lignes ne portaient aucune disposition. Sans eux, un verdict
+/// `not_escalated` ne distingue pas « le dernier groom a vraiment convergé » de
+/// « on a marché sur trois lignes de plomberie et il n'y avait rien derrière ».
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroomVerdictSelection {
+    /// L'état retenu, à rendre au site de la garde.
+    pub(crate) state: GroomVerdictState,
+    /// Combien de callbacks terminaux ont été sautés faute de ligne de
+    /// disposition.
+    pub(crate) skipped_neutral: usize,
+    /// La taille de la liste rendue par la base, avant toute sélection.
+    pub(crate) rows_examined: usize,
+}
+
+/// La sélection de ligne, **du plus récent au plus ancien** (mika#2795).
+///
+/// **Fonction pure**, testable aux bornes sans base. Quatre cas et pas un
+/// cinquième, dans cet ordre de lecture :
+///
+/// 1. `Some(text)` **sans** ligne de disposition → on **saute**, et on compte le
+///    saut. C'est le lanceur différé, et c'est tout le correctif.
+/// 2. `None` (colonne `result` NULL) → on **s'arrête**, `Unreadable`. Ce cas
+///    ressemble à un saut et n'en est **délibérément pas un** : sauter une
+///    anomalie, ce serait laisser passer un re-dispatch sur une preuve qu'on
+///    n'a pas pu lire, donc rouvrir le trou par l'autre bout. Fail-closed.
+/// 3. `Some(text)` **avec** une ligne de disposition → on **s'arrête**, et on
+///    délègue à [`groom_escalate_verdict`], inchangée : la grammaire du marqueur
+///    reste à un seul site.
+/// 4. Liste vide, ou épuisée par des sauts → [`GroomVerdictState::NotEscalated`].
+///    Le cas nominal du tout premier grooming, et aussi celui d'un ticket dont
+///    tous les callbacks de groom sont de la plomberie.
+///
+/// Le tri vient du SQL (`created_at DESC, id DESC`) et **pas** d'un filtre SQL :
+/// une ligne écartée par la base serait invisible à `skipped_neutral`, donc le
+/// compteur mesurerait zéro sur exactement la population qu'il existe pour voir
+/// (doctrine mika#2590).
+pub(crate) fn groom_verdict_from_rows(rows: Vec<Option<String>>) -> GroomVerdictSelection {
+    let rows_examined = rows.len();
+    let mut skipped_neutral = 0usize;
+
+    for row in rows {
+        match row {
+            // Cas 1 — de la plomberie, pas un verdict.
+            Some(text) if !carries_groom_outcome_line(&text) => skipped_neutral += 1,
+            // Cas 2 et 3 — la première ligne qui tranche, tranche.
+            decisive => {
+                return GroomVerdictSelection {
+                    state: groom_escalate_verdict(decisive),
+                    skipped_neutral,
+                    rows_examined,
+                };
+            }
+        }
+    }
+
+    // Cas 4.
+    GroomVerdictSelection {
+        state: GroomVerdictState::NotEscalated,
+        skipped_neutral,
+        rows_examined,
+    }
+}
+
 /// Le lecteur **unique** du verdict de groom pour la garde mika#2545 : de l'URL
 /// d'issue à l'état, base comprise.
 ///
-/// `Ok(None)` de la base — aucun callback de groom terminal — est traduit en
-/// [`GroomVerdictState::NotEscalated`] **ici et non dans la fonction pure** :
-/// c'est le cas nominal du tout premier grooming, et le fondre avec le `result`
-/// NULL le ferait tomber en `Unreadable`, donc en refus, donc aucun ticket ne
-/// pourrait plus être groomé.
+/// Une liste vide — aucun callback de groom terminal — est traduite en
+/// [`GroomVerdictState::NotEscalated`] par [`groom_verdict_from_rows`] et non
+/// par [`groom_escalate_verdict`] : c'est le cas nominal du tout premier
+/// grooming, et le fondre avec le `result` NULL le ferait tomber en
+/// `Unreadable`, donc en refus, donc aucun ticket ne pourrait plus être groomé.
+///
+/// La signature n'a pas bougé (mika#2795) : le site de la garde appelle la même
+/// fonction et fait le même `match` exhaustif. Ce qui a changé est derrière —
+/// la base rend désormais **toutes** les lignes et la sélection se fait ici,
+/// parce que la plus récente n'est pas toujours celle qui dit quelque chose.
 pub(crate) async fn groom_verdict_state(db: &AsyncDatabase, issue_url: &str) -> GroomVerdictState {
-    match db.latest_groom_verdict_for_issue(issue_url).await {
-        Ok(None) => GroomVerdictState::NotEscalated,
-        Ok(Some(result)) => groom_escalate_verdict(result),
-        Err(e) => GroomVerdictState::Unreadable(format!("DB error: {e}")),
-    }
+    let rows = match db.groom_callback_results_newest_first(issue_url).await {
+        Ok(rows) => rows,
+        Err(e) => return GroomVerdictState::Unreadable(format!("DB error: {e}")),
+    };
+
+    let selection = groom_verdict_from_rows(rows);
+    let verdict = match &selection.state {
+        GroomVerdictState::Escalated => GROOM_ESCALATE_VERDICT_ESCALATED,
+        GroomVerdictState::Unreadable(_) => GROOM_ESCALATE_VERDICT_UNREADABLE,
+        GroomVerdictState::NotEscalated => GROOM_VERDICT_NOT_ESCALATED,
+    };
+
+    // Sur TOUTES les branches, y compris `skipped_neutral == 0` : le contrôle
+    // positif est ce qui rend la population des sauts comptable, et son absence
+    // dit « binaire antérieur », jamais « aucun saut ».
+    info!(
+        target: "mika::otel",
+        event = GROOM_VERDICT_SELECTED_EVENT,
+        issue_url = issue_url,
+        rows_examined = selection.rows_examined,
+        skipped_neutral = selection.skipped_neutral,
+        verdict = verdict,
+        "mika#2795 — groom verdict selected from the terminal groom callbacks, \
+         newest first, skipping those that carry no disposition line"
+    );
+
+    selection.state
 }
 
 /// The grooming gate, from the issue body to the verdict (mika#2310 D1).
