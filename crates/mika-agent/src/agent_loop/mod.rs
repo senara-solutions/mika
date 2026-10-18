@@ -13640,8 +13640,13 @@ mod tests {
             }
         }
 
-        // (case, disabled, allowed, expected survivors)
-        let cases: &[(&str, &[&str], Option<&[&str]>, &[&str])] = &[
+        /// `(case label, disabled, allowed, expected survivors)`.
+        ///
+        /// Named so the table reads as a table. The `Option` is the whole point
+        /// of row 5 and must not be flattened away to shorten the signature.
+        type Case<'a> = (&'a str, &'a [&'a str], Option<&'a [&'a str]>, &'a [&'a str]);
+
+        let cases: &[Case<'_>] = &[
             (
                 "1 — neither shape: early return, array intact",
                 &[],
