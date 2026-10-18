@@ -1078,6 +1078,27 @@ pub(crate) fn completed_groom_pair(
     (parent_id, callback_id)
 }
 
+/// Force `created_at` sur une row pour rendre l'ordre chronologique
+/// observable : les timestamps ISO-8601 sont à la seconde, donc deux rows
+/// créées dans le même test les partagent et l'ordre retomberait sur le
+/// départage `id DESC`, un UUID v4 — arbitraire.
+///
+/// `pub(crate)` depuis mika#2795 : les tests de `skills::executor` montent la
+/// même fixture chronologique (le lanceur différé posé *après* l'ESCALATE), et
+/// `Database::conn` est privé à `crate::db` — un module frère ne le voit pas.
+/// Une seule orthographe du geste, atteinte d'ici par `use super::*` et de
+/// là-bas par `crate::db::tests::set_created_at`.
+pub(crate) fn set_created_at(db: &Database, task_id: &str, created_at: &str) {
+    let n = db
+        .conn
+        .execute(
+            "UPDATE tasks SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, created_at],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "la row de test doit exister");
+}
+
 /// mika#2310 — harnais isolé pour la porte mika#1620 / mika#2287 (cas 4 et 8,
 /// niveau prédicat). Le chemin de module `db::tests::harnais_porte` est ce que
 /// le critère de sortie du ticket interroge

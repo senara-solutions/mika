@@ -1311,7 +1311,8 @@ fn test_groom_cross_check_parent_only_legacy_shape_returns_false() {
 }
 
 // ---------------------------------------------------------------------------
-// mika#2545 — `latest_groom_verdict_for_issue`, sœur de la précédente
+// mika#2545 — `groom_callback_results_newest_first`, sœur de la précédente
+// (renommée et élargie par mika#2795 : la liste entière, plus `LIMIT 1`)
 // ---------------------------------------------------------------------------
 
 /// Le `result` d'un groom qui a escaladé, tel que `_escalate_groom` l'écrit
@@ -1323,29 +1324,15 @@ const GROOM_CALLBACK_ESCALATE: &str = "claude-pilot completed (status: done).\n\
      \n\
      Outcome: ESCALATE — first-pass";
 
-/// Force `created_at` sur une row pour rendre l'ordre chronologique
-/// observable : les timestamps ISO-8601 sont à la seconde, donc deux rows
-/// créées dans le même test les partagent.
-fn set_created_at(db: &Database, task_id: &str, created_at: &str) {
-    let n = db
-        .conn
-        .execute(
-            "UPDATE tasks SET created_at = ?2 WHERE id = ?1",
-            rusqlite::params![task_id, created_at],
-        )
-        .unwrap();
-    assert_eq!(n, 1, "la row de test doit exister");
-}
-
 #[test]
-fn mika2545_no_groom_callback_returns_none() {
+fn mika2545_no_groom_callback_returns_an_empty_list() {
     let db = db();
     assert!(
-        db.latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
+        db.groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
             .unwrap()
-            .is_none(),
-        "aucun groom terminal ⇒ `None`, le cas nominal d'un premier grooming — \
-         que l'appelant lit « jamais escaladé », jamais « illisible »"
+            .is_empty(),
+        "aucun groom terminal ⇒ liste vide, le cas nominal d'un premier grooming \
+         — que l'appelant lit « jamais escaladé », jamais « illisible »"
     );
 }
 
@@ -1353,11 +1340,11 @@ fn mika2545_no_groom_callback_returns_none() {
 fn mika2545_an_escalated_groom_is_returned_verbatim() {
     let db = db();
     completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_ESCALATE);
-    let result = db
-        .latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
-        .unwrap()
-        .expect("une row existe")
-        .expect("son result est renseigné");
+    let rows = db
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
+        .unwrap();
+    assert_eq!(rows.len(), 1, "une seule row de groom terminale");
+    let result = rows[0].clone().expect("son result est renseigné");
     assert!(
         result.contains("Outcome: ESCALATE — first-pass"),
         "le `result` est rendu VERBATIM — la grammaire du marqueur est l'affaire \
@@ -1387,11 +1374,10 @@ fn mika2545_an_escalate_followed_by_a_groomed_reads_not_escalated() {
     );
     set_created_at(&db, &groomed_id, "2026-09-27T09:00:00Z");
 
-    let result = db
-        .latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
-        .unwrap()
-        .expect("une row existe")
-        .expect("son result est renseigné");
+    let rows = db
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
+        .unwrap();
+    let result = rows[0].clone().expect("son result est renseigné");
     assert!(
         result.contains("Outcome: PLAN_GROOMED"),
         "le dernier groom est le re-grooming réussi : {result}"
@@ -1399,6 +1385,15 @@ fn mika2545_an_escalate_followed_by_a_groomed_reads_not_escalated() {
     assert!(
         !result.contains("Outcome: ESCALATE"),
         "et l'escalade antérieure ne doit pas survivre au tri : {result}"
+    );
+    // La liste porte les deux, et l'escalade est DERRIÈRE : l'ordre est la
+    // propriété, l'oubli de la ligne ancienne n'en est pas une (mika#2795).
+    assert_eq!(rows.len(), 2, "les deux callbacks sont rendus");
+    assert!(
+        rows[1]
+            .as_deref()
+            .is_some_and(|r| r.contains("Outcome: ESCALATE")),
+        "l'escalade antérieure est en seconde position : {rows:?}"
     );
 }
 
@@ -1421,11 +1416,10 @@ fn mika2545_a_groomed_followed_by_an_escalate_reads_escalated() {
     );
     set_created_at(&db, &escalated_id, "2026-09-26T13:06:14Z");
 
-    let result = db
-        .latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
-        .unwrap()
-        .expect("une row existe")
-        .expect("son result est renseigné");
+    let rows = db
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
+        .unwrap();
+    let result = rows[0].clone().expect("son result est renseigné");
     assert!(
         result.contains("Outcome: ESCALATE"),
         "le dernier groom est l'escalade : {result}"
@@ -1444,19 +1438,21 @@ fn mika2545_the_legacy_phase_suffix_on_the_parent_is_recognised() {
         crate::task_state::tasks::GROOM_PHASE_SUFFIX
     );
     completed_groom_pair(&db, "mika", &suffixed, GROOM_CALLBACK_ESCALATE);
-    let result = db
-        .latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
-        .unwrap()
-        .expect("une row existe sous l'URL suffixée")
-        .expect("son result est renseigné");
+    let rows = db
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
+        .unwrap();
+    assert_eq!(rows.len(), 1, "une row existe sous l'URL suffixée");
+    let result = rows[0].clone().expect("son result est renseigné");
     assert!(result.contains("Outcome: ESCALATE"));
 }
 
-/// Un callback terminal dont la colonne `result` est NULL : les deux niveaux
-/// d'`Option` disent deux choses différentes, et cette row-là est le seul
-/// producteur de `Some(None)`.
+/// Un callback terminal dont la colonne `result` est NULL : une row **présente**
+/// qui ne porte rien. Depuis mika#2795 la distinction se lit sur la longueur de
+/// la liste plutôt que sur un second niveau d'`Option`, et elle reste
+/// load-bearing — « une row NULL » et « aucune row » appellent deux
+/// dispositions opposées chez l'appelant (refus vs cas nominal).
 #[test]
-fn mika2545_a_terminal_callback_with_a_null_result_is_some_none() {
+fn mika2545_a_terminal_callback_with_a_null_result_is_a_none_element() {
     let db = db();
     let parent_id = db
         .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
@@ -1469,12 +1465,12 @@ fn mika2545_a_terminal_callback_with_a_null_result_is_some_none() {
             .unwrap()
     );
 
-    let outer = db
-        .latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
+    let rows = db
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
         .unwrap();
-    assert!(outer.is_some(), "la row existe");
+    assert_eq!(rows.len(), 1, "la row existe");
     assert!(
-        outer.unwrap().is_none(),
+        rows[0].is_none(),
         "son `result` est NULL — à distinguer de « aucune row », qui est le cas \
          nominal d'un premier grooming"
     );
@@ -1488,9 +1484,9 @@ fn mika2545_another_agents_escalation_is_not_ours() {
     db.register_agent("other-agent", "Other", "").unwrap();
     completed_groom_pair(&db, "other-agent", GROOM_ISSUE_URL, GROOM_CALLBACK_ESCALATE);
     assert!(
-        db.latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
+        db.groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
 }
 
@@ -1508,9 +1504,9 @@ fn mika2545_a_non_terminal_groom_callback_is_not_a_verdict() {
         .unwrap();
     db.update_task_status(&callback_id, "in_progress").unwrap();
     assert!(
-        db.latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
+        db.groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
 }
 
@@ -1531,9 +1527,9 @@ fn mika2545_an_implement_callback_is_not_a_groom_verdict() {
             .unwrap()
     );
     assert!(
-        db.latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
+        db.groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
 }
 
@@ -1557,15 +1553,65 @@ fn mika2545_two_callbacks_in_the_same_second_answer_deterministically() {
     set_created_at(&db, &second_id, "2026-09-26T13:06:14Z");
 
     let a = db
-        .latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
         .unwrap();
     let b = db
-        .latest_groom_verdict_for_issue("mika", GROOM_ISSUE_URL)
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
         .unwrap();
     assert_eq!(
         a, b,
         "l'égalité des deux lectures est la propriété : sans le `id DESC` la \
          réponse dépendrait de l'ordre de balayage de SQLite"
+    );
+}
+
+/// **D1 de mika#2795 — la couche DB rend la row neutre, elle ne la filtre pas.**
+///
+/// Le lanceur différé (`promote_next_deferred_callback_for_class`) est un
+/// callback terminal `dispatch_class='groom'`, et son `result` ne porte aucune
+/// ligne `Outcome:`. C'est la row qui, sur mika#2762, a masqué l'escalade posée
+/// sept minutes plus tôt.
+///
+/// Ce test-ci pin la moitié **base** du correctif, et il est délibérément
+/// l'opposé d'un filtre : les deux rows remontent, dans l'ordre, et c'est
+/// `groom_verdict_from_rows` qui décide. Un pré-filtre SQL rendrait ce test vert
+/// avec une seule row — et rendrait `skipped_neutral` structurellement nul sur
+/// exactement la population qu'il existe pour compter (doctrine mika#2590).
+#[test]
+fn mika2795_la_couche_db_rend_la_row_neutre() {
+    let db = db();
+    let (parent_id, escalated_id) =
+        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_ESCALATE);
+    set_created_at(&db, &escalated_id, "2026-10-18T18:13:00Z");
+
+    // Le lanceur différé promu, APRÈS l'escalade, sous le même parent.
+    let launcher_id = db
+        .create_task(&groom_callback("mika", &parent_id, "groom"))
+        .unwrap();
+    assert!(
+        db.update_task_completed(&launcher_id, "mika", Some("deferred dispatch slot freed"))
+            .unwrap()
+    );
+    set_created_at(&db, &launcher_id, "2026-10-18T18:20:02Z");
+
+    let rows = db
+        .groom_callback_results_newest_first("mika", GROOM_ISSUE_URL)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "les DEUX rows remontent : la sélection n'est pas en SQL — {rows:?}"
+    );
+    assert_eq!(
+        rows[0].as_deref(),
+        Some("deferred dispatch slot freed"),
+        "la plus récente est le lanceur différé, et elle ne dit rien"
+    );
+    assert!(
+        rows[1]
+            .as_deref()
+            .is_some_and(|r| r.contains("Outcome: ESCALATE")),
+        "l'escalade est derrière, lisible, et c'est tout l'enjeu : {rows:?}"
     );
 }
 
