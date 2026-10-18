@@ -214,9 +214,58 @@ a recensé ~30 gardes structurelles avant d'en replier 13 sur une aide canonique
 que mika#2107 n'a pas faite. Le suivi, s'il s'ouvre, s'ouvre avec ce recensement
 et une décision explicite sur le discriminant, pas avec un scan écrit d'abord.
 
+### Livrée depuis — mika#2761, 2026-10-18
+
+La garde de famille existe : `scripts/check-suite-wiring.sh`, job CI
+`suite-wiring-lint`. Elle a été livrée par la méthode que la section ci-dessus
+annonçait, dans cet ordre : **le recensement annoté d'abord, le prédicat
+ensuite**.
+
+Le discriminant pressenti ici — « ce script a-t-il besoin du monde
+extérieur ? » — est devenu le **vocabulaire de la colonne `mode`** de
+`scripts/suite-wiring.tsv` : `operator` (réseau, jeton, service vivant, pid, ou
+instrument de mesure délibéré) ou `unwired` (tourne hors-ligne, et rien ne le
+lance — c'est l'arriéré). La question que le scan ne sait pas poser reste posée
+à l'humain, qui remplit le champ ; la machine ne vérifie que la **forme** — mode
+dans le vocabulaire fermé, raison non vide, ticket cité. C'est la discipline de
+la colonne `tolérance` de `scripts/canonical-tokens.tsv`.
+
+Ce qui ferme le piège de l'allowlist que cette section identifiait comme
+l'obstacle, ce n'est pas la bonne volonté : c'est que le registre ne déclare que
+le **résidu**, et que le lint rougit (`[D2]`) sur une entrée dont la suite est
+devenue atteignable. Le geste qui rend une exception inutile est le geste qui la
+fait échouer, donc une entrée ne peut pas survivre à sa raison.
+
+Mesure refaite le 2026-10-18 sur `0170f5cd`, avec une définition plus large que
+celle de 2026-09-28 (les deux racines `scripts/` et `skills/bundled/_shared/`,
+les cinq préfixes `test-` `test_` `check-` `verify-` `measure-`, et
+l'atteignabilité par fermeture transitive du `Makefile` et non par citation
+directe) :
+
+| population | compte |
+|---|---|
+| suites sur disque (`\|D\|`) | 94 |
+| atteintes par un workflow, directement ou via `make` (`\|C\|`) | 67 |
+| résidu déclaré (`\|R\|`) | 27 — dont **25 `unwired`**, 2 `operator` |
+
+Deux corrections à la lecture ci-dessus, et aucune ne déplace sa conclusion :
+
+- **Les quatre harnais nommés dans le tableau sont tous encore non câblés** au
+  2026-10-18, trois semaines plus tard. Ils sont désormais les quatre premières
+  lignes citables de l'arriéré, et non plus une observation sans tenue.
+- **« Les quinze `scripts/check-*.sh` sont en revanche tous câblés » n'est plus
+  vrai.** `check-release-debuginfo.sh` et son harnais sont sur disque, ont une
+  cible `make`, et aucun workflow ne la nomme — exactement la situation de
+  `check-cta-primitives.sh`, « la seule exception de sa famille, ce qui est
+  précisément pourquoi personne ne l'a cherchée ». Une famille propre à une date
+  ne reste pas propre : c'est l'argument de la garde structurelle, pas de
+  l'inventaire.
+
 ## Quand l'appliquer
 
-- À l'écriture de tout script de garde : le câblage est dans le même diff.
+- À l'écriture de tout script de garde : le câblage est dans le même diff. Ce
+  n'est plus une consigne mais un refus — `suite-wiring-lint` rougit sur la
+  suite qu'aucun workflow n'atteint et que le registre ne déclare pas.
 - En revue d'un PR qui ajoute un détecteur : chercher le job CI dans le diff
   avant de lire le prédicat. Un prédicat parfait non câblé vaut zéro ; un
   prédicat imparfait câblé se corrige.

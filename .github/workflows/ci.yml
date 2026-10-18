@@ -436,6 +436,25 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-root-files.sh
 
+  suite-wiring-lint:
+    name: Suite Wiring Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # A suite on disk that no workflow reaches refuses nothing: it passes
+      # review, it passes CI by construction, and the defect it was written to
+      # catch lands in production. mika#2578 once, mika#2752 twice; the doctrine
+      # existed from the first occurrence and nothing enforced it. This step is
+      # also the lint's own wiring — it is the first subject of its own rule.
+      - name: Reject a suite neither reached by CI nor declared (mika#2761)
+        run: bash scripts/check-suite-wiring.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # dispatch-seats-lint above (mika#2103). The anti-vacuity suite is what
+      # makes the four directions D1–D4 more than an intention: each is seen red
+      # on a fixture tree AND green once the fixture is repaired.
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-suite-wiring.sh
+
   issue-annotation-guard-lint:
     name: Issue Annotation Guard Lint
     runs-on: ubuntu-22.04
