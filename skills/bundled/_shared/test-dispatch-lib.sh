@@ -2152,6 +2152,150 @@ else
     echo "  ✗ Scaffold-only worktree: $RESULT_B"
 fi
 
+# Test F (mika#2760): les brouillons de corps de ticket à la racine du worktree.
+#
+# Deux fichiers sont entrés sur `main` par ces sites de récupération même, et
+# leurs messages de commit le disent : `b99c6219` (`wip(mika#2317)`) a commité
+# `followup-issue-body.md`, `50e98793` (`wip(mika#2309)`) a commité
+# `followup-issue.md`. Un corps de ticket écrit pour `gh issue create
+# --body-file` n'est pas du contenu de pilote : personne ne le lit, et chaque
+# worktree l'embarque depuis main une fois qu'il y est.
+#
+# CE CAS EXERCE LE TABLEAU RÉEL, jamais un littéral recopié. Les cas A, C et E
+# ci-dessus codent leur pathspec en dur : ils testent leur propre copie et
+# resteraient verts si `dispatch-lib.sh` perdait l'entrée. Ici la définition est
+# chargée depuis le fichier — une ligne unique, auto-contenue, extraite par
+# ancrage en colonne zéro (le même ancrage que `RESCUE_EXCLUDE_DEF` plus bas).
+# Le fichier entier n'est pas sourcé : cela exécuterait son setup top-level.
+_eval_real_rescue_pathspec() {
+    local def
+    def=$(grep -E '^RESCUE_EXCLUDE_PATHSPEC=\(' "$DISPATCH_LIB" | head -1)
+    if [ -z "$def" ]; then
+        echo "FAIL: no \`RESCUE_EXCLUDE_PATHSPEC=(\` line found in dispatch-lib.sh"
+        return 1
+    fi
+    eval "$def"
+}
+
+# Pose le dépôt fixture partagé par F et G : trois brouillons à la racine, et
+# trois chemins qui sont du contenu de pilote et doivent rester indexés.
+_mk_pilot_draft_fixture() {
+    local dir="$1"
+    git -C "$dir" init -q
+    git -C "$dir" commit --allow-empty -m "initial" -q
+
+    # Les trois formes de brouillon — ne doivent PAS être indexées.
+    echo "## Constat" > "$dir/followup-issue.md"
+    echo "## Constat" > "$dir/followup-issue-body.md"
+    echo "# brief seconde passe" > "$dir/groom-brief-mika-999-pass2.md"
+
+    # Du contenu de pilote — doit être indexé.
+    mkdir -p "$dir/src" "$dir/docs/plans" "$dir/sub"
+    echo "fn main() {}" > "$dir/src/new_feature.rs"
+    echo "# plan" > "$dir/docs/plans/2026-10-18-001-x-plan.md"
+    # L'exclusion est ancrée à la racine (d'où `:(exclude,glob)` et non `:!`) :
+    # un homonyme sous un répertoire est du contenu, et le reste.
+    echo "# nested" > "$dir/sub/followup-issue.md"
+}
+
+test_auto_rescue_excludes_pilot_draft_bodies() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    _mk_pilot_draft_fixture "$test_dir"
+    _eval_real_rescue_pathspec || return 1
+
+    git -C "$test_dir" add -A -- "${RESCUE_EXCLUDE_PATHSPEC[@]}" 2>/dev/null
+
+    local staged
+    staged=$(git -C "$test_dir" diff --cached --name-only)
+
+    local draft
+    for draft in followup-issue.md followup-issue-body.md groom-brief-mika-999-pass2.md; do
+        if grep -qxF -- "$draft" <<<"$staged"; then
+            echo "FAIL: $draft was staged (mika#2760)"
+            return 1
+        fi
+    done
+
+    local kept
+    for kept in src/new_feature.rs docs/plans/2026-10-18-001-x-plan.md sub/followup-issue.md; do
+        if ! grep -qxF -- "$kept" <<<"$staged"; then
+            echo "FAIL: pilot content $kept was not staged"
+            return 1
+        fi
+    done
+
+    echo "PASS"
+}
+
+# `|| true` : sans lui, `set -e` tue la suite sur l'assignation dès que la
+# fonction rend non-zéro, et la branche ✗ — avec son diagnostic — n'est jamais
+# atteinte. La branche FAIL compte, et la fin de suite sort 1.
+RESULT_F=$(test_auto_rescue_excludes_pilot_draft_bodies 2>/dev/null) || true
+if [ "$RESULT_F" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Root draft bodies excluded, nested namesake kept (mika#2760)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Root draft body exclusion: $RESULT_F"
+fi
+
+# Test G (mika#2760): le contrôle négatif, qui est ce qui donne sa valeur à F.
+# Le même fixture, re-stagé avec le tableau PRIVÉ des deux nouvelles entrées :
+# les trois brouillons doivent alors être indexés. Sans ce cas, F passerait
+# aussi si l'exclusion venait d'un `.gitignore`, d'un `core.excludesFile` de la
+# machine, ou de rien du tout — et la suite dirait vert sur un tableau vide.
+test_auto_rescue_draft_exclusion_is_not_accidental() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    _mk_pilot_draft_fixture "$test_dir"
+    _eval_real_rescue_pathspec || return 1
+
+    local filtered=() entry
+    for entry in "${RESCUE_EXCLUDE_PATHSPEC[@]}"; do
+        case "$entry" in
+            *followup-issue*|*groom-brief-*) continue ;;
+        esac
+        filtered+=("$entry")
+    done
+
+    # Le filtre doit avoir retiré exactement les deux entrées de mika#2760 :
+    # sinon ce cas passerait sur un tableau qui ne les a jamais portées.
+    local removed=$(( ${#RESCUE_EXCLUDE_PATHSPEC[@]} - ${#filtered[@]} ))
+    if [ "$removed" -ne 2 ]; then
+        echo "FAIL: expected 2 draft-body entries in RESCUE_EXCLUDE_PATHSPEC, removed $removed"
+        return 1
+    fi
+
+    git -C "$test_dir" add -A -- "${filtered[@]}" 2>/dev/null
+
+    local staged
+    staged=$(git -C "$test_dir" diff --cached --name-only)
+
+    local draft
+    for draft in followup-issue.md followup-issue-body.md groom-brief-mika-999-pass2.md; do
+        if ! grep -qxF -- "$draft" <<<"$staged"; then
+            echo "FAIL: $draft was NOT staged without its exclusion — F passes for another reason"
+            return 1
+        fi
+    done
+
+    echo "PASS"
+}
+
+RESULT_G=$(test_auto_rescue_draft_exclusion_is_not_accidental 2>/dev/null) || true
+if [ "$RESULT_G" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Without the two entries the drafts ARE staged (mika#2760 negative control)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Draft exclusion negative control: $RESULT_G"
+fi
+
 # Test C: Structural — dispatch-lib uses pathspec exclusion (not bare git add -A)
 # mika#2031 moved the rescue body out of _post_flight_recovery into
 # _rescue_dirty_worktree(), so the extraction anchors on the function rather than
@@ -2169,6 +2313,15 @@ assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/commands/" \
     ":!.claude/commands/" "$RESCUE_EXCLUDE_DEF"
 assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/claude-pilot.json" \
     ":!.claude/claude-pilot.json" "$RESCUE_EXCLUDE_DEF"
+# mika#2760 : la FORME, que les cas F/G seuls ne distinguent pas. `:!motif*.md`
+# et `:(exclude,glob)motif*.md` excluent tous deux le fichier racine ; seul
+# `sub/followup-issue.md` les sépare, parce que sans la magie `glob` git applique
+# `fnmatch` sans `FNM_PATHNAME` et le `*` traverse les `/`. C'est ce que F
+# mesure, et ce que ces deux lignes rendent lisible dans un nom de test.
+assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :(exclude,glob)followup-issue*.md (mika#2760)" \
+    ":(exclude,glob)followup-issue*.md" "$RESCUE_EXCLUDE_DEF"
+assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :(exclude,glob)groom-brief-*.md (mika#2760)" \
+    ":(exclude,glob)groom-brief-*.md" "$RESCUE_EXCLUDE_DEF"
 assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
 assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
 

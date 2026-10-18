@@ -6034,12 +6034,40 @@ ${_files}"
 #                                  leak (mika#1552 founding incident).
 #   - .claude/*.local.*            general guard for the .env-class of
 #                                  operator-machine-specific Claude-local files.
+#   - followup-issue*.md           a follow-up ticket body the pilot wrote for
+#     (root only)                  `gh issue create --body-file` and never
+#                                  filed. TWO of them reached `main` through
+#                                  THESE VERY SITES, and the commit messages say
+#                                  so: `b99c6219` (`wip(mika#2317): trailing
+#                                  content after pilot end_turn`) carried
+#                                  `followup-issue-body.md`, `50e98793`
+#                                  (`wip(mika#2309): impl staged by post-flight
+#                                  recovery`) carried `followup-issue.md`
+#                                  (mika#2760).
+#   - groom-brief-*.md            an architect-pass groom brief. The groom
+#     (root only)                  commands prescribe writing it under `/tmp`,
+#                                  which the sandbox permission-policy refuses
+#                                  (mika#2211), so the pilot falls back to the
+#                                  worktree root. `4dcb2c65` (2026-05-19) shipped
+#                                  `groom-brief-mika-789-pass2.md` that way and
+#                                  it sat on `main` for five months
+#                                  (mika#2760; prescriptions tracked in
+#                                  senara-solutions/mika-platform#207).
 # None of them is pilot-authored content.
+#
+# WHY THE LAST TWO ARE `:(exclude,glob)` AND NOT `:!`. Measured 2026-10-18: with
+# no `glob` magic, git applies `fnmatch` WITHOUT `FNM_PATHNAME`, so the `*`
+# traverses `/` and `:!followup-issue*.md` also swallows a whole directory named
+# `followup-issue-*` — pilot content, silently dropped. `glob` anchors the
+# pattern to a single path segment, which is the root-only exclusion this asks
+# for; a nested `sub/followup-issue.md` stays staged. Mixing the two forms in one
+# invocation was measured green (pathspec magic is per-entry, not global), so the
+# four historical entries above are left exactly as they are.
 #
 # A fifth copy would diverge — that is exactly the drift class that produced
 # mika#2348's T1: the mika#1383 block says "Same exclusion pattern as mika#1282",
 # which is true of this pathspec and was false of the formatting beside it.
-RESCUE_EXCLUDE_PATHSPEC=(':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*')
+RESCUE_EXCLUDE_PATHSPEC=(':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' ':(exclude,glob)followup-issue*.md' ':(exclude,glob)groom-brief-*.md')
 
 # Format the staged Rust and re-stage it, for a caller that is about to commit
 # (mika#1336, extracted and generalized by mika#2348 D2).
