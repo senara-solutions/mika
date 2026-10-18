@@ -127,14 +127,50 @@ run_audit_args() {
     printf '%s|%s' "$rc" "$out"
 }
 
-# Every PATH entry that does not hold an executable `jq`, so the audit's
-# `command -v jq` fails and its grep fallback is genuinely visited. Without
-# this the fallback predicate stays unexecuted, which is the exact condition
-# under which the two field-check predicates drift apart.
-path_without_jq() {
-    local dir out="" IFS=':'
-    for dir in $PATH; do
-        [ -x "$dir/jq" ] && continue
+# A PATH under which `command -v jq` fails and NOTHING ELSE changes, so the
+# audit's `grep -F` fallback is genuinely visited. Without this the fallback
+# predicate stays unexecuted, which is the exact condition under which the two
+# field-check predicates drift apart.
+#
+# Stripping the jq-bearing directories is the only mechanism that works: bash's
+# PATH search skips a non-executable or dangling `jq` shim and goes on to find
+# the real one, so shadowing cannot hide it. But a bare strip is not a regime —
+# it is a different experiment. On a distribution where `jq` lives in
+# `/usr/bin`, removing that directory also takes `grep`, `sed`, `sort` and
+# `date`, and the audit dies at 127 having reached no branch at all. Measured:
+# green on a Gentoo workstation, red on ubuntu-22.04 (mika#2788, CI run
+# 39171808290) — the harness said the fallback was pinned when nothing had run.
+#
+# So each stripped directory is REPLACED, in its own position, by a shim that
+# symlinks its whole contents except `jq`. The regime then differs from the
+# nominal one in exactly one tool. Both halves of that claim are asserted at
+# the call site rather than trusted.
+# $1: the PATH value to transform (default: the live PATH).
+# $2: the shim directory's basename, so a caller can build an independent one.
+nojq_path() {
+    local source_path="${1:-$PATH}" shim="$TMPROOT/${2:-nojq-bin}"
+    local dir entry out="" replaced=0
+    local -a path_dirs links
+    mkdir -p "$shim"
+    IFS=':' read -ra path_dirs <<< "$source_path"
+    for dir in ${path_dirs[@]+"${path_dirs[@]}"}; do
+        [ -n "$dir" ] || continue
+        if [ -x "$dir/jq" ]; then
+            links=()
+            for entry in "$dir"/*; do
+                [ "${entry##*/}" = "jq" ] && continue
+                [ -e "$entry" ] || continue
+                links+=("$entry")
+            done
+            # -f because a merged-usr system lists the same directory twice
+            # (/bin and /usr/bin): the second pass must overwrite, not fail.
+            [ "${#links[@]}" -gt 0 ] && ln -sf "${links[@]}" "$shim/" 2>/dev/null
+            if [ "$replaced" = "0" ]; then
+                out+="${out:+:}$shim"
+                replaced=1
+            fi
+            continue
+        fi
         out+="${out:+:}$dir"
     done
     printf '%s' "$out"
@@ -329,7 +365,63 @@ assert_exit "A6 (jq regime) forbidden url on a config event: rc=1" "1" "$R"
 assert_mentions "A6 (jq regime) names the forbidden field" '"url"' "$R"
 assert_mentions "A6 (jq regime) reports a Layer 1 leak" "LEAK (Layer 1)" "$R"
 
-NOJQ_PATH=$(path_without_jq)
+NOJQ_PATH=$(nojq_path)
+# The regime is asserted BEFORE it is used, in both directions. A PATH that
+# still resolved `jq` would make the rc=1 below pass while testing the branch it
+# was meant to avoid; a PATH that lost `grep` would make the audit die at 127
+# having reached no branch at all — and the second is what CI actually did.
+assert_true "A6 the no-jq regime hides jq" \
+    "$( ( PATH="$NOJQ_PATH"; command -v jq >/dev/null 2>&1 ) && echo 0 || echo 1)" \
+    "jq still resolves under the stripped PATH, so the fallback branch is not the one being exercised"
+nojq_toolchain_intact=1
+for needed_tool in grep sed sort date head cat wc tr mkdir dirname mv; do
+    ( PATH="$NOJQ_PATH"; command -v "$needed_tool" >/dev/null 2>&1 ) \
+        || nojq_toolchain_intact="missing:$needed_tool"
+done
+assert_true "A6 the no-jq regime keeps every other tool the audit needs" \
+    "$nojq_toolchain_intact" \
+    "the shim lost a tool ($nojq_toolchain_intact): the audit would die at 127
+  instead of reaching its fallback, and the assertions below would be
+  measuring an abort rather than a branch."
+
+# The two assertions above pass on a host where SOME jq-free directory happens
+# to carry grep — which is this workstation (/bin is a real directory holding
+# grep and no jq) and is why the bare strip looked correct here. On a merged-usr
+# host every directory carrying grep carries jq too, both PATH entries are
+# stripped together, and the strip leaves nothing at all: ubuntu-22.04, where
+# the first attempt at this harness went red having measured no branch. So the
+# regime is also built from a PATH reduced to a jq-bearing directory ALONE —
+# the merged-usr shape — and that is a property of the shim, not of the host.
+jq_bearing_dir=$(dirname "$(command -v jq)")
+MERGED_USR_PATH=$(nojq_path "$jq_bearing_dir" "nojq-merged-usr")
+# The property is "the shim preserves everything the stripped directory HELD",
+# never "the shim provides tool X": which of the audit's tools live in jq's
+# directory is a packaging decision of the distribution (here /usr/bin carries
+# grep and sed but not date, which lives in /bin). Asserting the former is a
+# property of the shim; asserting the latter would be a property of the host.
+merged_usr_intact=1
+merged_usr_checked=0
+for needed_tool in grep sed sort date head cat wc tr mkdir dirname mv; do
+    [ -x "$jq_bearing_dir/$needed_tool" ] || continue
+    merged_usr_checked=$((merged_usr_checked + 1))
+    ( PATH="$MERGED_USR_PATH"; command -v "$needed_tool" >/dev/null 2>&1 ) \
+        || merged_usr_intact="dropped:$needed_tool"
+done
+assert_true "A6 anti-vacuity — jq's directory holds some of the audit's tools" \
+    "$([ "$merged_usr_checked" -ge 2 ] && echo 1 || echo 0)" \
+    "only $merged_usr_checked of the audit's tools live in $jq_bearing_dir, so the
+  assertion below would be checking nothing. Name the tools the audit really
+  uses before concluding the shim is sound."
+assert_true "A6 the regime survives a merged-usr layout (jq's own dir, alone)" \
+    "$merged_usr_intact" \
+    "built from $jq_bearing_dir alone, the shim $merged_usr_intact — a tool that
+  directory DID hold no longer resolves. This is the ubuntu-22.04 shape, where
+  every directory carrying grep carries jq too. A bare PATH strip fails it by
+  construction; if this is red, the shim stopped replacing what it removes."
+assert_true "A6 the merged-usr regime still hides jq" \
+    "$( ( PATH="$MERGED_USR_PATH"; command -v jq >/dev/null 2>&1 ) && echo 0 || echo 1)" \
+    "jq resolves under $MERGED_USR_PATH — the shim copied the one file it must not"
+
 R=$(run_audit "$LEAKY_LOG" "$NO_DB" "$ATT" "$NOJQ_PATH")
 assert_exit "A6 (grep fallback) forbidden url on a config event: rc=1" "1" "$R"
 assert_mentions "A6 (grep fallback) names the forbidden field" '"url"' "$R"
