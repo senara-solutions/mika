@@ -1,6 +1,6 @@
 # fix(loop-substrate) — vol 3 : le contrôle de fraîcheur des démons couvre le proxy egress
 
-- **Ticket :** senara-solutions/mika#2780 (`bug`, `p2-normal`, `infrastructure`, `ready`, `dispatch:loop`, `loop-substrate`)
+- **Ticket :** senara-solutions/mika#2780 (`bug`, `p1-important`, `infrastructure`, `ready`, `dispatch:loop`, `loop-substrate`)
 - **Branche :** `fix/2780/dispatch-le-contr-le-de-fra-cheur-des-d` (repartie de `main`, `0/0` contre `origin/main` au moment du groom)
 - **Date :** 2026-10-18
 - **Vol :** 3 sur 3 de la lignée mika#2029. **Prédécesseurs :** `2026-10-15-002-fix-2029-le-kill-sans-production-se-compte-par-son-nom-plan.md` (vol 1, mergé par #2720) et `2026-10-16-003-fix-2029-un-demon-ne-survit-plus-a-son-code-plan.md` (vol 2, mergé par #2746, commit `474c6b0a`). Le vol 2 a explicitement renvoyé ce livrable : « UN seul lanceur est câblé : le `mitmdump`. Le relais est le vol 3. »
@@ -67,36 +67,52 @@ avec le commentaire qui dit pourquoi ce n'est pas `pkill -f`. La forme existe
 donc déjà dans le dépôt pour ce socket précis.
 
 **M8 — Le harnais de fraîcheur existe et il est déjà câblé en CI.**
-`test-dispatch-lib.sh:14135-14336` porte `_daemon_freshness_probe` et les sondes
-V1–V4 ; `.github/workflows/ci.yml:85` appelle `make test-dispatch-lib`. L'exigence
-mika#2578 (« un détecteur qu'aucun workflow ne lance ne refuse rien ») est donc
-satisfaite **par placement** : les cas de ce vol atterrissent dans ce fichier et
-rien n'est à câbler.
+`skills/bundled/_shared/test-dispatch-lib.sh:14135-14334` (fin du fichier, qui en
+compte 14334) porte `_daemon_freshness_probe` (`:14148`) et les quatre sondes
+V1–V4 (`:14277`, `:14283`, `:14291`, `:14298`), suivies de l'assertion
+`T2029_VERDICT_BLOCK` (`:14319`). `.github/workflows/ci.yml:85` appelle
+`make test-dispatch-lib`, et le `Makefile:193` le résout en
+`bash skills/bundled/_shared/test-dispatch-lib.sh`. L'exigence mika#2578 (« un
+détecteur qu'aucun workflow ne lance ne refuse rien ») est donc satisfaite **par
+placement** : les cas de ce vol atterrissent dans ce fichier et rien n'est à
+câbler.
+
+> **Le chemin, en entier, parce qu'il trompe.** La suite est sous
+> `skills/bundled/_shared/`, **à côté** de `dispatch-lib.sh` — et non sous
+> `scripts/`, où vivent `test-pilot-egress-proxy-status.py` et les autres
+> harnais du dépôt. Une recherche sur `scripts/test-dispatch-lib.sh` ne rend
+> rien (constaté dans cette session de groom). Les deux fichiers de ce vol sont
+> donc dans le **même** répertoire.
 
 ### Les quatre mesures faites aujourd'hui pour ce groom
 
 Le ticket laisse au groom le choix de la forme d'identification du porteur du
-socket, en demandant qu'elle soit **mesurée**. Elle l'est — quatre sondes sous
-`.pilot-scratch/sockprobe/`, exécutées dans cette session de grooming :
+socket, en demandant qu'elle soit **mesurée**. Elle l'est — sondes sous
+`.pilot-scratch/sockprobe/`, **ré-exécutées dans cette session de groom** (le
+répertoire repart vide à chaque préparation de worktree, donc la trace qui fait
+foi est la sortie recopiée ci-dessous, jamais le répertoire ; les pids diffèrent
+d'un passage à l'autre, les verdicts non) :
 
 **S1 — `fuser <chemin-de-socket-unix>` rend le pid du porteur, dans la même
-forme que `fuser -n tcp <port>`.** Écouteur `AF_UNIX` réel, pid de vérité 339 :
+forme que `fuser -n tcp <port>`.** Écouteur `AF_UNIX` réel, pid de vérité 318 :
 
 ```
-fuser: rc=0 stdout='   339' stderr='/tmp/mika-sockprobe-2780.sock:\n'
+fuser: rc=0 stdout='   318' stderr='/tmp/sockprobe-2780-93dy4s9t/probe.sock:\n'
+holder_pids=['318']  S1_holder_found=yes
 ```
 
 Pids sur **stdout**, libellé sur **stderr**, espaces de tête — exactement ce que
 la boucle de découpage de `_pilot_daemon_holder_pid` consomme déjà. Un repli par
-`/proc/net/unix` + scan de `/proc/*/fd` rend le même pid (`['339']`) mais coûte
-une soixantaine de lignes de python pour un gain nul : **il n'est pas retenu**.
+`/proc/net/unix` + scan de `/proc/*/fd` rend le même pid mais coûte une
+soixantaine de lignes de python pour un gain nul : **il n'est pas retenu**.
 
 **S2 — `fuser` n'apparie QUE le porteur, pas les clients connectés.** Écouteur
-362, client connecté 363, sonde 355 :
+318, client réellement connecté 319, sonde 311 :
 
 ```
-server_pid=362 client_pid=363 self_pid=355
-fuser: rc=0 stdout='   362'
+server_pid=318 client_pid=319 self_pid=311
+fuser: rc=0 stdout='   318'
+S2_client_absent=yes  S2_self_absent=yes
 ```
 
 C'est la mesure qui rend la forme sûre : un client apparié aurait fait comparer
@@ -106,10 +122,18 @@ autre inode, pas celui qui est lié au chemin.
 
 **S3 — Un porteur hors du namespace PID courant rend `rc=1` et rien, donc
 `undecidable`.** Mesuré sur le socket de **production** depuis le bac à sable de
-ce groom : `sock_exists=True`, `fuser: rc=1 stdout=''`, `holder_pids=[]`. Le cas
-`undecidable` du point 2 du ticket n'est donc pas théorique, et la dégradation
-exigée (démon conservé, ligne de log) est la bonne. Le lanceur, lui, tourne sur
-l'**hôte**, où le porteur est visible.
+ce groom :
+
+```
+sock_exists=True is_socket=True connectable=yes
+fuser: rc=1 stdout='' stderr=''   holder_pids=[]
+```
+
+La conjonction est ce qui compte : le socket **est servi** (`connectable=yes`,
+donc un porteur vit) et son porteur est **invisible** d'ici. Le cas `undecidable`
+du point 2 du ticket n'est donc pas théorique, et la dégradation exigée (démon
+conservé, ligne de log) est la bonne. Le lanceur, lui, tourne sur l'**hôte**, où
+le porteur est visible.
 
 **S4 — Après la mort du porteur, la sonde de connectabilité dit bien
 « libéré ».** Le chemin survit au `TERM` (`path_exists=True`,
@@ -297,8 +321,11 @@ Trois propriétés, chacune portant une conséquence :
 
 ### C5 — Le harnais de test, jumeau et non partagé
 
-`_relay_freshness_probe <état>` dans `test-dispatch-lib.sh`, calqué sur
-`_daemon_freshness_probe` et placé juste après lui :
+`_relay_freshness_probe <état>` dans
+`skills/bundled/_shared/test-dispatch-lib.sh` (M8 : le chemin, pas `scripts/`),
+calqué sur `_daemon_freshness_probe` (`:14148`) et placé après le bloc V1–V4,
+c'est-à-dire **après** l'assertion `T2029_VERDICT_BLOCK` (`:14319`) qui clôt
+aujourd'hui le fichier :
 
 - un faux relais exécutable qui inscrit son pid puis `exec python3` un écouteur
   `AF_UNIX` sur le chemin reçu en argument (le vrai lanceur passe `--host-unix
@@ -361,7 +388,9 @@ Un seul commit : la règle et ses cas atterrissent ensemble (mika#2578).
 8. **C6** — exécuter le contrôle de contre-vacuité contre `origin/main`, consigner
    le résultat dans le commentaire et dans le corps de PR.
 9. **Doc** — § 4.5 de `docs/operator/pilot-egress-relay.md` (voir ci-dessous).
-10. `bash -n` sur les deux fichiers, `make test-dispatch-lib`,
+10. `bash -n` sur les deux fichiers touchés — `skills/bundled/_shared/dispatch-lib.sh`
+    et `skills/bundled/_shared/test-dispatch-lib.sh`, voisins dans le même
+    répertoire (M8) — puis `make test-dispatch-lib` et
     `scripts/verify-pipeline.sh origin/main`.
 
 ### La doc, précisément
@@ -484,8 +513,9 @@ par pid, et seulement les pids que son propre faux démon a inscrits.
 4. Un porteur non identifiable laisse le démon en place et écrit
    `undecidable`.
 5. Aucun chemin de refus de dispatch nouveau n'est ajouté (V-G).
-6. Les trois sondes R1–R3 sont dans `test-dispatch-lib.sh`, dans le même commit
-   que la règle, et CI les lance déjà (M8).
+6. Les trois sondes R1–R3 sont dans
+   `skills/bundled/_shared/test-dispatch-lib.sh`, dans le même commit que la
+   règle, et CI les lance déjà (M8).
 7. V1–V4 du `mitmdump` restent vertes.
 8. Le § 4.5 de `docs/operator/pilot-egress-relay.md` décrit les deux porteurs, et
    la phrase « ce vol ne câble que le `mitmdump` » a disparu.
