@@ -18276,6 +18276,151 @@ mod tests {
     }
 
     // ===========================================================================
+    // mika#2783 — the per-tool census, and the equality that makes it one
+    // population with `tool_defs_bytes` rather than two
+    // ===========================================================================
+
+    /// **The load-bearing equality, on the REAL registry.**
+    ///
+    /// `tool_defs_bytes` and the census must measure one array, not two
+    /// populations under one reading (class mika#2205). A synthetic fixture proves
+    /// the arithmetic; only the registry proves it against the definitions
+    /// production actually serves — the same authority reason
+    /// `tools::tests::mika2593_le_tableau_servi_a_mika_arch_est_un_roster_atteste`
+    /// reads `default_tools()` rather than a hand-written list.
+    #[test]
+    fn mika2783_la_somme_par_outil_plus_le_cadrage_egale_le_total() {
+        let registry = crate::tools::default_tools();
+        let defs = registry.definitions();
+        let census = tool_defs_census(defs);
+
+        assert_eq!(
+            census.per_tool_sum + json_array_framing_bytes(census.count),
+            tool_defs_byte_weight(defs),
+            "the census and tool_defs_bytes disagree on the real registry"
+        );
+        // Anti-vacuity: an empty registry would make the equality hold at 2 == 2
+        // and assert nothing about any tool.
+        assert!(census.count > 1, "the real registry serves no tools");
+        assert_eq!(census.per_tool.len(), census.count, "duplicate tool name");
+    }
+
+    /// The same equality on a three-definition array — **this is the test that
+    /// makes risk R1 of the plan a red `cargo test` instead of a WARN in
+    /// production.** Three is the smallest count that exercises more than one
+    /// comma.
+    #[test]
+    fn mika2783_la_somme_par_outil_plus_le_cadrage_egale_le_total_sur_un_tableau_synthetique_de_trois_definitions()
+     {
+        let defs = vec![tool_def("send_message"), tool_def("run_gh"), tool_def("x")];
+        let census = tool_defs_census(&defs);
+
+        assert_eq!(census.count, 3);
+        assert_eq!(json_array_framing_bytes(3), 4, "two brackets, two commas");
+        assert_eq!(
+            census.per_tool_sum + json_array_framing_bytes(census.count),
+            tool_defs_byte_weight(&defs)
+        );
+    }
+
+    /// An empty array is `[]` — two bytes of frame and nothing else, and the
+    /// saturating subtraction is what stops `0 - 1` wrapping to `usize::MAX`.
+    ///
+    /// The map is **empty**, which is the `{}` the event degrades to and never a
+    /// set of zeroed keys: no tool was served, so no tool has a cost.
+    #[test]
+    fn mika2783_un_tableau_vide_rend_une_carte_vide_et_un_cadrage_de_deux() {
+        let census = tool_defs_census(&[]);
+
+        assert_eq!(census.count, 0);
+        assert!(census.per_tool.is_empty());
+        assert_eq!(census.per_tool_sum, 0);
+        assert_eq!(json_array_framing_bytes(0), 2);
+        assert_eq!(
+            census.per_tool_sum + json_array_framing_bytes(census.count),
+            tool_defs_byte_weight(&[]),
+            "`[]` is two bytes"
+        );
+    }
+
+    /// One definition carries no comma — the `n − 1` term at its boundary.
+    #[test]
+    fn mika2783_une_definition_unique_na_pas_de_virgule() {
+        let defs = vec![tool_def("send_message")];
+        let census = tool_defs_census(&defs);
+
+        assert_eq!(json_array_framing_bytes(1), 2);
+        assert_eq!(
+            census.per_tool_sum + json_array_framing_bytes(census.count),
+            tool_defs_byte_weight(&defs)
+        );
+    }
+
+    /// **Absent is never zero (mika#2331).** A tool the turn did not serve has no
+    /// key at all; a `0` would read as "served, and free", which is the one
+    /// reading that would make the instrument lie to the arbitration it exists
+    /// for.
+    #[test]
+    fn mika2783_un_outil_non_servi_na_pas_de_cle() {
+        let census = tool_defs_census(&[tool_def("send_message")]);
+
+        assert!(census.per_tool.contains_key("send_message"));
+        assert!(
+            !census.per_tool.contains_key("run_gh"),
+            "a non-served tool must have no key, not a zero"
+        );
+        assert_eq!(census.per_tool.get("run_gh"), None);
+    }
+
+    /// Two definitions under one name are **summed**, so the equality holds
+    /// whatever the array contains, and the duplication is reported rather than
+    /// swallowed.
+    ///
+    /// Reachable: the MCP append at the window-assembly site does not deduplicate
+    /// against the builtin and skill names. Note `count` stays at the number of
+    /// *definitions* — `per_tool.len()` would be `1` here, and the framing
+    /// arithmetic is a function of the former.
+    #[test]
+    fn mika2783_un_nom_en_doublon_est_somme_et_legalite_tient() {
+        let defs = vec![tool_def("run_gh"), tool_def("run_gh")];
+        let census = tool_defs_census(&defs);
+
+        assert_eq!(census.count, 2);
+        assert_eq!(census.per_tool.len(), 1);
+        assert_eq!(census.duplicates, vec![("run_gh".to_string(), 2)]);
+        assert_eq!(
+            census.per_tool["run_gh"], census.per_tool_sum,
+            "the two occurrences are summed under one key"
+        );
+        assert_eq!(
+            census.per_tool_sum + json_array_framing_bytes(census.count),
+            tool_defs_byte_weight(&defs)
+        );
+    }
+
+    /// The map is ordered, because the line is read by eye and diffed between two
+    /// turns. A `HashMap` would reshuffle the field on every emission and make two
+    /// readings of an unchanged array look like a change.
+    #[test]
+    fn mika2783_la_carte_est_ordonnee() {
+        let defs = vec![tool_def("zeta"), tool_def("alpha"), tool_def("mid")];
+        let census = tool_defs_census(&defs);
+
+        let keys: Vec<&str> = census.per_tool.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["alpha", "mid", "zeta"]);
+
+        // And the serialized form an operator reads carries that same order.
+        let json = serde_json::to_string(&census.per_tool).unwrap();
+        let alpha = json.find("alpha").unwrap();
+        let mid = json.find("mid").unwrap();
+        let zeta = json.find("zeta").unwrap();
+        assert!(
+            alpha < mid && mid < zeta,
+            "serialized map is unordered: {json}"
+        );
+    }
+
+    // ===========================================================================
     // mika#2305 — the scope travels with the count it explains
     // ===========================================================================
 

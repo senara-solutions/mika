@@ -4139,6 +4139,74 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2783 — un seul scribe du nom du recensement par outil.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le nom du recensement par outil a un seul écrivain.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second site écrivant `tool_defs_census` publierait une **seconde** carte
+    /// `{nom: octets}` pour le même tour, et les deux lignes seraient
+    /// indiscernables dans le journal : un nom, deux populations — exactement la
+    /// classe mika#2205 que cet instrument existe pour fermer sur
+    /// `tool_defs_bytes`. Le jour où il est écrit, il ne rend **aucune décision
+    /// fausse** et toutes les assertions restent vertes ; ce qu'il casse est le
+    /// `jq` de l'arbitrage, plus tard, en silence.
+    ///
+    /// # Disposition : halt-and-surface, et **aucune liste d'exception**
+    ///
+    /// Il n'y a pas de constante où déposer la prochaine infraction, et c'est
+    /// délibéré (doctrine mika#2201 / mika#2323 : une allowlist née vide est un
+    /// endroit où déposer la suite). Population pré-existante : **zéro, mesurée**
+    /// — le nom est neuf. Quand le scan tire, on fait passer le site par
+    /// `agent_loop::TOOL_DEFS_CENSUS_EVENT` ou on le retire.
+    #[test]
+    fn mika2783_le_nom_de_levenement_a_un_seul_scribe() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("tool_defs{}", "_census");
+        let owner = "crates/mika-agent/src/agent_loop/mod.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme un
+        // scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2783 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2783 — le nom du recensement par outil a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `agent_loop::TOOL_DEFS_CENSUS_EVENT`, ou le retirer. Il n'y a PAS de \
+             liste d'exception à élargir : deux cartes `{{nom: octets}}` pour un \
+             même tour sont un nom pour deux populations (mika#2205), ce que cet \
+             instrument existe précisément pour fermer."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2161 — chacun des trois noms de cause a UNE fonction écrivante.
     // ─────────────────────────────────────────────────────────────────────
 
