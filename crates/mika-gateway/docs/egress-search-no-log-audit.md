@@ -63,14 +63,44 @@ production code of `egress_search/*.rs`:
   lines the Q4 CapturingLayer test enforces the field-shape of.
 
 The runtime audit (`scripts/audit-egress-no-log.sh`) then confirms live
-behavior:
+behavior. It knows **five** `search_*` event names, in two classes
+(mika#2788):
 
-- Only `search_requested` / `search_egress` `event` names appear on
-  `search_*` lines in the gateway log file.
-- Neither event carries any of the forbidden field names (`query`,
-  `tenant_id`, `tenant_hash`, `user_id`, `chat_id`, `customer_id`,
-  `api_key`, `retry_after`, `url`) — using `jq` when available, falling
-  back to grep otherwise.
+| class | names | emitted |
+|---|---|---|
+| **flow** (`AUDIT_FLOW_EVENTS`) | `search_requested`, `search_egress` | once per request |
+| **configuration** (`AUDIT_CONFIG_EVENTS`) | `search_upstream_resolved`, `search_upstream_key_without_selector`, `search_required_unrecognized_value` | once per gateway startup (mika#2407, operator surface — `crates/mika-gateway/CLAUDE.md` § Search Substrate) |
+
+- Only those five `event` names appear on `search_*` lines in the gateway
+  log file. Any other is a discipline break, and the diagnostic names the
+  array to declare it in.
+- **No declared event, of either class, carries any of the forbidden field
+  names** (`query`, `tenant_id`, `tenant_hash`, `user_id`, `chat_id`,
+  `customer_id`, `api_key`, `retry_after`, `url`) — using `jq` when
+  available, falling back to grep otherwise. The two classes are not two
+  policies: the class decides what gets *printed* and what the leak
+  diagnostic *says*, never whether the fields are audited. A configuration
+  event carrying a `url` is a leak at exactly the same title as a flow
+  event carrying one.
+
+The build-time lint's own `ALLOWED_EVENT_NAMES` stays at the **two** flow
+names, and that is not a divergence: its scope is `egress_search/*.rs`, the
+flow module, where the Q4 per-request field discipline is the right rule.
+The three configuration events are emitted from `main.rs` and `settings.rs`,
+outside that scope.
+
+**The list derives from its producer.** `audit-egress-no-log.sh
+--known-events` prints the declared names as `<name><TAB>flow|config`, and
+`scripts/test-audit-egress-no-log.sh` (CI job `egress-no-log-lint`, Makefile
+target `verify-egress-no-log`) compares that output against every
+`event = "search_…"` site under `crates/mika-gateway/src/` — **both ways**,
+on the model of `scripts/check-dispatch-seats-declared.sh`. A name emitted
+and not declared is red at the commit that adds it; a name declared that no
+site emits any more is red too. This is the mika#2788 defect closed at its
+class: mika#2407 added three legitimate events, the list stayed at two, and
+for a month the audit reported a sanctioned startup event as
+`LEAK (Layer 1)` — blocking the mika#1806 milestone close and teaching its
+operator to ignore a rc=1.
 
 The Q4 CapturingLayer test
 (`egress_search::tests::log_assertion_no_tenant_no_query_no_forbidden_fields`)

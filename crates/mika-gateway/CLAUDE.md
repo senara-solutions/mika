@@ -343,6 +343,17 @@ the repairing gesture is the opposite of the obvious one, add the **selector**.
 `search_required_unrecognized_value` (WARN) — names the value between quotes so a
 stray space is visible (mika#2220).
 
+**These three names are declared in the E4 runtime audit, and CI refuses a
+fourth that is not** (mika#2788). `scripts/audit-egress-no-log.sh` carries them in
+`AUDIT_CONFIG_EVENTS` — accepted as *names*, and submitted to the same
+forbidden-field check as the two flow events, so a configuration event carrying
+`url` or `api_key` is a leak at the same title. The link to this crate is
+mechanical: `scripts/test-audit-egress-no-log.sh` (job `egress-no-log-lint`)
+compares the audit's `--known-events` output against every
+`event = "search_…"` site under `src/`, **both ways**. Adding a `search_*`
+event here without declaring it there reddens CI at that commit; it used not to,
+which is why the audit spent a month calling `search_upstream_resolved` a leak.
+
 **Post-rotation probe, with its halts.**
 
 ```bash
