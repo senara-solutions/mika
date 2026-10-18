@@ -8,13 +8,19 @@
 
 ---
 
-**Disposition de ce plan : halte-et-remontée.** Il ne décrit aucune
-implémentation, parce que la mesure du § 2 établit que les cinq composants dont
-les sept critères d'acceptation dépendent sont absents du dépôt ou hors de son
-périmètre — dont l'espace d'adressage de sortie, refusé par Vincent le jour même
-de ce grooming. La décision qui reste est une décision de propriétaire, pas
-d'architecte : le § 5 la nomme, en donne les deux dispositions candidates et
-recommande l'une des deux sans la prendre.
+**Disposition de ce plan : D1 — fermer mika#1721 comme périmé.** Il ne décrit
+aucune implémentation, parce que la mesure du § 2 établit que les cinq composants
+dont les sept critères d'acceptation dépendent sont absents du dépôt ou hors de
+son périmètre — dont l'espace d'adressage de sortie, refusé par Vincent le jour
+même de ce grooming. Le § 5 instruit les deux dispositions candidates et **tranche
+pour D1** : 0 des 7 critères atteignables, hôte supprimé par mika#1193, substrat
+d'adressage renvoyé au chantier du bus par la fermeture du jumeau mika#1720.
+Ce qui reste à Vincent est l'**exécution** de l'acte — fermer le ticket et écrire
+le commentaire de clôture qui nomme où la chose revient (§ 5, D1) — et non le
+choix de la disposition : un plan qui a fait toute la mesure et formulé la
+recommandation ne livre pas de valeur en s'arrêtant un cran avant la conclusion
+(`docs/architecture/review-guide.md` § YAGNI). La fermeture est révocable à bas
+prix (§ 9).
 
 ---
 
@@ -312,7 +318,7 @@ du ticket.
    **Ce que cela change, et ce que cela ne change pas.** Cela renforce la clause
    « ce que la fermeture ne perd pas » de D1 (§ 5) : la part doctrinale du ticket
    est déjà tenue ailleurs, par un document design-locked, donc la fermer ne la
-   perd pas. Cela ne renverse **pas** la recommandation : la doctrine ratifie la
+   perd pas. Cela ne renverse **pas** la disposition : la doctrine ratifie la
    *posture*, jamais l'*hôte*, et c'est l'hôte qui manque (§ 2.1). Un ticket dont
    la posture est doctrine et dont l'hôte est supprimé reste un ticket en avance
    sur son substrat.
@@ -347,38 +353,60 @@ avec le chantier du bus, où elle a sa place ».
    une citation vérifiable (§ 2.1 à § 2.5).
 2. Les sept critères d'acceptation sont transcrits verbatim et chacun reçoit son
    état d'atteignabilité mesuré (§ 6).
-3. La décision restante est nommée, attribuée à son propriétaire, et présentée
-   avec ses deux dispositions candidates et leurs conséquences (§ 5).
-4. Aucun hôte de substitution n'est choisi à la place du propriétaire (§ 3).
+3. Les deux dispositions candidates sont instruites avec leurs conséquences, et
+   **la disposition est prise : D1** (§ 5).
+4. Aucun hôte de substitution n'est choisi à la place du propriétaire (§ 3) — et
+   la raison de ne pas en choisir est une mesure, pas une préférence.
 
-**DoD de l'implémentation** — **indéfinie, et c'est le constat central de ce
-plan.** Elle ne peut pas être écrite : chacune des sept conditions de sortie du
-ticket se lie à un composant absent ou hors périmètre. Il n'y a pas ici une
-décision de conception qu'un architecte pourrait trancher par citation de
-principe ; il y a une décision de propriétaire sur le **sort du ticket**. C'est
-la branche 2 de l'*Unresolved-Decision Gate* : « unresolved decisions AND they
-genuinely require operator judgment outside architect authority ».
+**DoD de l'implémentation** — **il n'y en a pas, et c'est le constat central de
+ce plan.** Aucune ligne de code n'est due : chacune des sept conditions de sortie
+du ticket se lie à un composant absent ou hors périmètre (§ 6, bilan 0/7). La
+seule suite est l'exécution de D1 — fermer mika#1721 et écrire le commentaire de
+clôture.
+
+**Pourquoi ce plan ne relève plus de l'*Unresolved-Decision Gate* branche 2.**
+Une révision antérieure classait le sort du ticket comme « décision de
+propriétaire hors autorité d'architecte » et s'arrêtait là. C'était un transfert
+de coût : la mesure était complète, la recommandation formulée et argumentée, et
+il ne restait qu'à l'énoncer. Le plan tranche donc (§ 5), au titre de
+`docs/architecture/review-guide.md` § YAGNI — un plan qui mesure sans décider ne
+livre pas de valeur implémentable — et de § Single Responsibility : la
+responsabilité d'un plan de grooming est de produire une disposition, pas de
+déplacer l'arbitrage d'un cran. Ce qui reste au propriétaire est un **acte**
+(fermer, commenter), révocable par une réouverture (§ 9), non un arbitrage.
 
 ---
 
-## 5. La décision à remonter, et sa recommandation
+## 5. La disposition, et pourquoi c'est celle-là
 
-**La décision, en une phrase :** mika#1721 doit-il être fermé comme périmé — même
+**La question, en une phrase :** mika#1721 doit-il être fermé comme périmé — même
 disposition et même cause que son jumeau mika#1720, fermé il y a quelques heures
 — ou son périmètre doit-il être réduit à la seule part qui survit, le
 pré-enregistrement ?
 
-Elle appartient à Vincent. Elle n'appartient pas à l'architecte : trancher
-suppose de dire si un chantier reste voulu, pas de comparer deux conceptions.
+**Réponse : D1 — fermeture comme périmé.** C'est la disposition de ce plan, pas
+une option parmi deux. Les deux candidates sont instruites ci-dessous parce que
+D2 a un attrait réel qu'il serait malhonnête de taire ; mais l'instruire n'est pas
+laisser la question ouverte, et la trancher ici est le travail de ce plan
+(`docs/architecture/review-guide.md` § YAGNI).
 
-### D1 — Fermer mika#1721 comme périmé *(recommandée)*
+**Ce qui appartient encore à Vincent, et ce qui ne lui appartient plus.** L'acte
+— fermer le ticket, écrire le commentaire de clôture qui nomme où la chose
+revient — lui appartient : c'est une écriture sur un ticket, et le commentaire
+porte un cap (« tout classificateur de routage futur doit satisfaire ce
+pré-enregistrement »). Le **choix** de la disposition ne lui est plus remonté : il
+est déterminé par la mesure du § 2, et le remonter reviendrait à lui demander de
+refaire une lecture déjà faite. Si la lecture est fausse, le point de contestation
+est une citation du § 2, pas une préférence de cap.
+
+### D1 — Fermer mika#1721 comme périmé *(disposition retenue)*
 
 Le motif est celui de mika#1720, et il s'applique terme pour terme : parent fermé,
 siège déménagé, substrat d'adressage renvoyé au chantier du bus. S'y ajoute une
 cause que le jumeau n'avait pas — l'hôte du livrable a été **supprimé** par
 mika#1193, et supprimé pour le précédent même dont ce ticket s'échappe.
 
-**Pourquoi je la recommande.** Les cinq composants sont absents ; sept critères
+**Pourquoi c'est elle.** Les cinq composants sont absents ; sept critères
 sur sept sont inatteignables ; et la défaillance que le classificateur devait
 corriger a entre-temps reçu une garde déterministe (§ 2.5), ce qui érode la
 proposition de valeur indépendamment du problème d'hébergement. Le ticket n'est
@@ -398,7 +426,7 @@ pré-enregistrement de référence que tout classificateur de routage futur doit
 satisfaire avant d'être promu. Coût : un commentaire. C'est la raison pour
 laquelle D1 n'exige pas D2 pour être sûre.
 
-### D2 — Réduire le périmètre au seul pré-enregistrement
+### D2 — Réduire le périmètre au seul pré-enregistrement *(non retenue)*
 
 Ne garder que ce qui ne dépend d'aucun des cinq composants : un ADR sous
 `docs/adr/` portant (a) l'argument d'échappement à mika#1161 dans sa forme
@@ -410,7 +438,7 @@ corpus. Le code est renvoyé à un ticket d'ère-bus.
 parce qu'elle est enregistrée *avant* que le premier label soit écrit, et un ADR
 survit mieux qu'un corps de ticket fermé.
 
-**Ce qu'elle coûte, et pourquoi je ne la recommande pas en premier :** elle ne
+**Ce qu'elle coûte, et pourquoi elle n'est pas retenue :** elle ne
 satisfait **aucun** des sept critères à la lettre (AC1 exige le commentaire
 « adjacent to the classifier implementation », AC5 des « constants in the
 classifier code », AC7 un drapeau de configuration — tous présupposent le
@@ -421,10 +449,12 @@ contourne pas la décision de Vincent, elle en demande une seconde.
 
 ### Ce que ce plan ne fait pas
 
-Il ne choisit pas entre D1 et D2, et il n'écrit ni l'ADR de D2 ni le commentaire
-de fermeture de D1. Les deux sont des actes de cap. Un plan de grooming qui les
-exécuterait sur sa propre autorité fabriquerait la décision qu'il est censé
-remonter.
+Il choisit — D1 — mais il **n'exécute pas** : il ne ferme pas le ticket et
+n'écrit pas le commentaire de clôture. La distinction est celle du § 4 : décider
+la disposition est le travail du plan ; écrire sur le ticket, et y poser le cap
+« ce pré-enregistrement est la barre de tout classificateur de routage futur »,
+est un acte d'écriture qui appartient à Vincent. Et il n'écrit pas l'ADR de D2,
+puisque D2 n'est pas retenue.
 
 ---
 
@@ -463,7 +493,8 @@ de ce plan, et ils sont sans objet sous la mesure du § 2.
   → **Première moitié atteinte** : les cinq seuils sont dans ce document (§ 1).
   **Seconde moitié inatteignable** : il n'y a pas de « classifier code » où
   poser les constantes (§ 2.1). C'est le seul critère dont une moitié survit, et
-  c'est l'objet de la disposition D2.
+  c'était l'attrait de D2 — non retenue (§ 5), sa part utile étant préservée par
+  le commentaire de clôture de D1.
 - **AC6** — « Corpus audit-log schema records eventually-correct-destination as a
   separate field, adjudicated by orchestrator-CC (or its successor) at the time
   the corrected destination is known. »
@@ -475,27 +506,29 @@ de ce plan, et ils sont sans objet sous la mesure du § 2.
   n'y en a aucun.
 
 **Bilan : 0 des 7 critères atteignables, 1 à moitié.** C'est ce bilan, et non une
-préférence de conception, qui produit la disposition halte-et-remontée.
+préférence de conception, qui produit la disposition D1.
 
 **Critères d'acceptation de ce plan en tant que livrable de grooming** — ils sont
 les quatre points du DoD de grooming (§ 4) et sont vérifiables par relecture :
 chaque pièce mesurée porte une citation `fichier:ligne` ou un état de ticket
-horodaté ; aucune disposition n'est choisie à la place du propriétaire.
+horodaté ; une disposition est prise et son motif est traçable à une mesure ;
+aucun hôte de substitution n'est choisi à la place du propriétaire.
 
 ---
 
 ## 7. Taille estimée
 
-Ce plan ne livre aucun code. Les deux dispositions candidates du § 5 ne
-produisent, elles non plus, aucune ligne hors `docs/` : D1 est une fermeture de
-ticket plus un commentaire, D2 est un fichier sous `docs/adr/` — exclu du compte
-par la règle elle-même (« hors `docs/` »).
+Ce plan ne livre aucun code. La disposition retenue au § 5 — D1 — n'en produit
+pas davantage : c'est une fermeture de ticket plus un commentaire. La candidate
+écartée, D2, n'aurait produit qu'un fichier sous `docs/adr/`, exclu du compte par
+la règle elle-même (« hors `docs/` ») ; elle est portée en ligne pour que le
+compte reste lisible si la disposition était contestée.
 
 | livrable | lignes de code (hors `docs/`) |
 |---|---|
 | ce plan (`docs/plans/2026-10-18-002-…-plan.md`) — exclu du compte, `docs/` | 0 |
-| D1 — fermeture de mika#1721 + commentaire de clôture | 0 |
-| D2 — ADR de pré-enregistrement sous `docs/adr/` — exclu du compte, `docs/` | 0 |
+| **D1 (retenue)** — fermeture de mika#1721 + commentaire de clôture | 0 |
+| D2 (non retenue) — ADR de pré-enregistrement sous `docs/adr/` — exclu du compte, `docs/` | 0 |
 
 Total estimé : 0 lignes
 Plafond de tours : 150 (défaut)
@@ -506,8 +539,8 @@ discuter : il n'y a pas de découpage à faire, parce qu'il n'y a pas de volume.
 risque que la règle mika#2636 et la borne mika#2693 adressent — un vol qui meurt
 au plafond de tours avant la fin de pipeline — est structurellement absent ici.
 Aucune ligne `Tracked in:` n'est due : le travail n'est pas reporté à un vol 2, il
-est **remonté** au propriétaire, et le § 2.2 nomme déjà le chantier où la forme
-d'adressage revient si la réponse est D1.
+est **écarté** par la disposition D1, et le § 2.2 nomme déjà le chantier où la
+forme d'adressage revient.
 
 ---
 
@@ -542,24 +575,28 @@ dis-le explicitement dans la section plutôt que d'inventer une disposition : le
 gate est alors N/A et cette phrase est ce qui le rend lisible. » Le titre est
 donc là pour être lu par la machine ; son contenu ne revendique rien.
 
-**Ne pas confondre avec la disposition de ce plan.** L'en-tête annonce
-« halte-et-remontée », et l'option (c) de ce gate porte le même nom : ce sont deux
-choses différentes. L'option (c) décrirait ce qu'un détecteur livré fait en
-s'allumant sur des **données existantes**. La disposition de l'en-tête porte sur
-le **sort du ticket** (§ 5), au titre de l'*Unresolved-Decision Gate* branche 2.
-Aucun détecteur n'étant livré, l'option (c) n'est pas choisie — elle est hors
-objet.
+**Ne pas confondre avec la disposition de ce plan.** L'option (c) de ce gate
+s'appelle « halte-et-remontée » ; la disposition de ce plan est « D1 — fermeture
+comme périmé » (§ 5). Ce sont deux objets distincts, et la révision 2 a retiré de
+l'en-tête le mot qui invitait à les confondre. L'option (c) décrirait ce qu'un
+**détecteur livré** fait en s'allumant sur des données existantes ; la disposition
+de l'en-tête porte sur le **sort du ticket**. Aucun détecteur n'étant livré,
+l'option (c) n'est pas choisie — elle est hors objet.
 
 ---
 
 ## 9. Risques et arbitrages
 
-**Le risque de se tromper sur la fermeture.** Si Vincent veut le classificateur,
-D1 coûte la réouverture d'un ticket — bon marché, et le corps est préservé. Si
-l'on avait au contraire planifié une implémentation, le coût eût été un vol de
-pilote entier contre cinq composants absents, mort non pas au plafond de tours
-mais au premier `cargo build` sur un `mika-relay` inexistant. L'asymétrie est
-nette et elle pointe vers la remontée.
+**Le risque de se tromper sur la fermeture — et pourquoi il autorise de
+trancher.** Si Vincent veut le classificateur, D1 coûte la réouverture d'un
+ticket — bon marché, et le corps est préservé. Si l'on avait au contraire
+planifié une implémentation, le coût eût été un vol de pilote entier contre cinq
+composants absents, mort non pas au plafond de tours mais au premier
+`cargo build` sur un `mika-relay` inexistant. C'est cette asymétrie qui rend la
+décision prenable par ce plan plutôt que remontable : une disposition dont
+l'erreur se répare par un `gh issue reopen` n'a pas besoin d'un arbitrage de
+propriétaire pour être énoncée, et la lui remonter coûterait plus cher que de se
+tromper.
 
 **Le risque de redondance avec mika#1720.** Faible et assumé : ce plan ne
 re-litige pas la fermeture du jumeau, il mesure ce qu'elle implique pour celui-ci.
@@ -588,8 +625,10 @@ renforcer le constat.
   scope »). À ouvrir séparément ; ce plan ne le fait pas, pour ne pas mêler une
   correction de documentation à une remontée de cap.
 - **Reconstruire `mika-relay`.** § 3.
-- **Écrire l'ADR de D2 ou le commentaire de clôture de D1.** § 5, dernier
-  paragraphe : ce sont des actes de cap.
+- **Exécuter D1 : fermer mika#1721 et écrire le commentaire de clôture.** § 5,
+  dernier paragraphe. La disposition est prise par ce plan ; l'écriture sur le
+  ticket, et le cap qu'elle pose, appartiennent à Vincent.
+- **Écrire l'ADR de D2.** Sans objet : D2 n'est pas retenue (§ 5).
 - **Le chantier du bus `gentux`** et la forme d'adressage `org.<org>.app.<agent>.<session>`
   — renvoyés là par la fermeture de mika#1720, et c'est leur place.
 
@@ -626,3 +665,31 @@ lise pas comme des chemins de production (§ 2.1) :
 **Commandes semées (non suivies par ce dépôt).**
 `.claude/commands/mika-ask-prime.md:7` · `.claude/commands/cm.md:1-11` ·
 `.claude/commands/mpc-inbox.md`.
+
+**Principes de revue cités.** `docs/architecture/review-guide.md` § YAGNI (§ 1,
+§ 4, § 5) · § Single Responsibility (§ 4).
+
+---
+
+## Revision history
+
+- **rev 2 (2026-10-18)** : addressed F1 (BLOCKING — « Disposition finale déléguée
+  au lieu d'être prise ») en prenant la disposition. Le plan tranche désormais
+  pour **D1 — fermeture comme périmé** au lieu de présenter deux candidates et de
+  renvoyer le choix à Vincent. Neuf sites révisés en conséquence : l'en-tête
+  (disposition annoncée « D1 » et non plus « halte-et-remontée »), le § 4 (DoD
+  point 3 réécrit, et un paragraphe qui nomme pourquoi ce plan ne relève plus de
+  l'*Unresolved-Decision Gate* branche 2 — citation
+  `docs/architecture/review-guide.md` § YAGNI + § Single Responsibility,
+  conservée depuis la citation du finding), le § 5 (titre, réponse explicite,
+  et séparation entre le **choix** — pris ici — et l'**acte** d'écriture sur le
+  ticket, qui reste à Vincent ; D1 marquée *retenue*, D2 marquée *non retenue*),
+  le § 6 (bilan et AC du grooming), le § 7 (table et clause `Tracked in:`), le
+  § 9 (l'asymétrie de coût de la réouverture est ce qui **autorise** de trancher
+  plutôt que de remonter), le § 10 (l'exécution de D1 est le hors-périmètre, non
+  le choix de D1), le § 2.6 point 3 (« ne renverse pas la *disposition* », et non
+  plus « la recommandation ») et le § 8 (la clause anti-confusion ne cite plus un
+  en-tête « halte-et-remontée » qui n'existe plus ; le gate reste **N/A**, aucun
+  détecteur n'étant livré). Aucun critère d'acceptation du ticket n'est affaibli :
+  le bilan reste 0/7 atteignables, 1 à moitié, et aucune mesure du § 2 — ni
+  aucune de ses citations — n'a été touchée.
