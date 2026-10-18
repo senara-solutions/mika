@@ -1992,9 +1992,41 @@ impl Database {
     ///   as `'implement'` — pre-v34 via COALESCE). The class is keyed off the
     ///   child (per-dispatch) rather than the parent because reused parents
     ///   (mika#920 pattern) carry stale class data from their original dispatch.
-    /// - The callback's `updated_at` is older than `grace_seconds` ago
+    /// - The callback is **not** a deferred launcher (`label NOT LIKE
+    ///   '%:deferred'`, mika#2762)
+    /// - **The most recent** retained callback's `updated_at` is older than
+    ///   `grace_seconds` ago (`HAVING MAX(...)`, mika#2762)
     /// - Parent metadata does NOT contain `$.claude_pilot.pr_url`
     /// - No other active callback child exists (defers to #870's retry loop)
+    ///
+    /// Three properties of the mika#2762 grace the SQL does not state:
+    ///
+    /// - **`MAX` covers only the children the `WHERE` retained** — class-scoped
+    ///   and non-deferred. The two clauses are not redundant: the `WHERE`
+    ///   decides *which deliveries can anchor*, the `HAVING` decides *which one
+    ///   does*. Writing the grace as a per-row `WHERE child.updated_at < …`
+    ///   **alongside** the `HAVING` reproduces the measured defect exactly: the
+    ///   `WHERE` would discard the recent delivery before aggregation and `MAX`
+    ///   would only ever see the old ones. The grace is a property of the
+    ///   population, never of a line. Shape modelled on
+    ///   [`Self::find_settleable_dispatch_parents`].
+    /// - **`NOT LIKE '%:deferred'` excludes an anchor both too *old* and too
+    ///   *recent*.** The measured case was the old side: the launcher
+    ///   `long_running:run_claude_pilot:deferred` (class `groom`,
+    ///   `trigger_type='callback'`, `action_type='resume_agent'`), delivered
+    ///   11 min before the groom it launched, satisfied the grace on its own
+    ///   and the parent of a *successful* groom was failed one second after its
+    ///   callback landed (mika#2752 at 07:37:20Z, mika#2751 at 07:55:20Z, on
+    ///   2026-10-17). The symmetric case is just as wrong: a launcher delivered
+    ///   *within* the grace would hold back a parent whose real callback has
+    ///   long since delivered. The clause is more **just** in both directions,
+    ///   not merely more permissive.
+    /// - **`callback_task_id` is NOT the anchor.** It stays `MIN(child.id)` —
+    ///   the identity the caller resolves the `NO_PR:` motif from — while
+    ///   `last_callback_at` carries `MAX(child.updated_at)`, the instant the
+    ///   grace was measured against. Two different children in the general
+    ///   case; reading the first as the second is how the engine's log would
+    ///   lie about what the reaper saw.
     ///
     /// Three properties the SQL does not state (mika#2750 § 3 D1):
     ///
@@ -2036,7 +2068,8 @@ impl Database {
         let grace_modifier = format!("-{grace_seconds} seconds");
         let mut stmt = self.conn.prepare(
             "SELECT parent.id, parent.agent_id, parent.created_at,
-                    MIN(child.id) AS callback_task_id
+                    MIN(child.id) AS callback_task_id,
+                    MAX(child.updated_at) AS last_callback_at
              FROM tasks parent
              JOIN tasks child ON parent.id = child.parent_task_id
              WHERE parent.agent_id = ?1
@@ -2047,7 +2080,7 @@ impl Database {
                AND child.trigger_type = 'callback'
                AND child.action_type = 'resume_agent'
                AND child.status = 'delivered'
-               AND child.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND child.label NOT LIKE '%:deferred'
                AND (parent.metadata IS NULL
                     OR json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NULL)
                AND NOT EXISTS (
@@ -2057,6 +2090,7 @@ impl Database {
                    AND sibling.status IN ('pending', 'in_progress')
                )
              GROUP BY parent.id
+             HAVING MAX(child.updated_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
              ORDER BY parent.id",
         )?;
         let rows = stmt
@@ -2066,6 +2100,7 @@ impl Database {
                     agent_id: row.get(1)?,
                     created_at: row.get(2)?,
                     callback_task_id: row.get(3)?,
+                    last_callback_at: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2425,12 +2460,26 @@ impl Database {
     /// - Parent is `status='in_progress'`, `source='self_dev'`, `trigger_type='manual'`
     /// - Its latest callback subtask is `status='delivered'`
     /// - **The callback's** `dispatch_class='implement'` (or NULL — pre-v34 via COALESCE)
-    /// - The callback's `updated_at` is older than `grace_seconds` ago
+    /// - The callback is **not** a deferred launcher (`label NOT LIKE
+    ///   '%:deferred'`, mika#2762)
+    /// - **The most recent** retained callback's `updated_at` is older than
+    ///   `grace_seconds` ago (`HAVING MAX(...)`, mika#2762)
     /// - Parent metadata HAS a non-empty `$.claude_pilot.pr_url`
     /// - No other active callback child exists (mirrors the reaper's guard)
     ///
     /// Groom-class callbacks (mika#1001) cannot trip this path because they
     /// never emit `PR:` lines — the `dispatch_class` filter is defense-in-depth.
+    ///
+    /// mika#2762 applies the **same** two-clause grace shape as the reaper, by
+    /// the Coupled-pair contract on [`Self::find_orphaned_parent_tasks`]: the
+    /// per-row `WHERE child.updated_at < …` is *replaced* by
+    /// `HAVING MAX(child.updated_at) < …`, and a deferred launcher no longer
+    /// anchors anything. Nothing measured bit here — the implement side always
+    /// ends with a sibling or a `pr_url` — but a grace whose shape differs
+    /// between the two halves is an asymmetry the next reader has to re-derive,
+    /// and that contract exists precisely to forbid it. `CompletableParentTask`
+    /// deliberately gains **no** `last_callback_at` field: no caller reads it
+    /// here, and a `SELECT` nobody consumes is a dead one.
     ///
     /// SOLE WRITER warning: this method is the only DB query that selects
     /// candidates for the `parent_completed_from_callback` audit transition.
@@ -2454,7 +2503,7 @@ impl Database {
                AND child.trigger_type = 'callback'
                AND child.action_type = 'resume_agent'
                AND child.status = 'delivered'
-               AND child.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND child.label NOT LIKE '%:deferred'
                AND json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NOT NULL
                AND json_extract(parent.metadata, '$.claude_pilot.pr_url') != ''
                AND NOT EXISTS (
@@ -2464,6 +2513,7 @@ impl Database {
                    AND sibling.status IN ('pending', 'in_progress')
                )
              GROUP BY parent.id
+             HAVING MAX(child.updated_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
              ORDER BY parent.id",
         )?;
         let rows = stmt

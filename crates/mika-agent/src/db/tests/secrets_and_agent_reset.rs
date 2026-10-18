@@ -1005,6 +1005,29 @@ fn test_has_active_callback_tasks_excluding_ignores_deferred_wrappers() {
     );
 }
 
+/// Garde de dérive mika#2762 : le label produit doit rester dans la portée du
+/// suffixe `%:deferred` que le SQL du reaper utilise pour l'exclure comme ancre.
+///
+/// `%:deferred` est un suffix-anchor **strict** — pinné comme tel par
+/// `test_has_active_callback_tasks_excluding_ignores_deferred_wrappers`
+/// (mika#1163) juste au-dessus, où l'échappement d'un `:deferred:retry` est
+/// inoffensif parce que le prédicat y *cible*. Ici le prédicat *protège* : un
+/// lanceur différé hors portée est promu ancre de grâce et détruit un vol de
+/// groom (le défaut mesuré, mika#2752 et mika#2751 le 2026-10-17).
+///
+/// Écrit comme `#[test]` et non comme `const assert!` parce que
+/// `str::ends_with` n'est pas une `const fn`.
+#[test]
+fn mika2762_le_label_differe_reste_dans_la_portee_du_suffixe_du_reaper() {
+    assert!(
+        crate::agent_loop::DEFERRED_DISPATCH_LABEL.ends_with(":deferred"),
+        "DEFERRED_DISPATCH_LABEL = {:?} sort de la portée de `%:deferred` — \
+         répare le prédicat SQL du reaper (9 sites), n'excepte pas le label : \
+         hors portée, il redevient ancre de grâce",
+        crate::agent_loop::DEFERRED_DISPATCH_LABEL
+    );
+}
+
 /// mika#1070 — Regression test: AgentBusy recovery keeps callback in
 /// 'completed' status so dispatch_undelivered_callbacks can find it.
 /// The old behavior reset to 'pending', which stranded the callback.

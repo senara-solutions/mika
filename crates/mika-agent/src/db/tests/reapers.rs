@@ -788,6 +788,193 @@ fn test_find_orphaned_parent_tasks_only_groom_children_not_reaped() {
     );
 }
 
+// -- mika#2762 : la grâce s'ancre sur la DERNIÈRE livraison, et un lanceur
+//    différé n'ancre rien --
+
+/// Sème un enfant callback `delivered` de la classe `groom` sous `parent_id`,
+/// avec le label donné et `updated_at` reculé de `age_secs`.
+///
+/// Le label est le terme que la clause `NOT LIKE '%:deferred'` lit, et l'âge
+/// celui que `MAX(child.updated_at)` agrège : les deux axes des cinq cas
+/// ci-dessous.
+fn seed_groom_callback(db: &Database, parent_id: &str, label: &str, age_secs: i64) -> String {
+    let mut child = callback_task("mika");
+    child.parent_task_id = Some(parent_id.to_string());
+    child.label = label.to_string();
+    child.dispatch_class = Some("groom".to_string());
+    let child_id = db.create_task(&child).unwrap();
+    assert!(
+        db.update_task_completed(&child_id, "mika", Some("done"))
+            .unwrap()
+    );
+    assert!(db.mark_task_delivered(&child_id).unwrap());
+    db.conn
+        .execute(
+            "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2) WHERE id = ?1",
+            params![child_id, format!("-{age_secs} seconds")],
+        )
+        .unwrap();
+    child_id
+}
+
+/// **Le cas mesuré** (mika#2752 à 07:37:20Z, mika#2751 à 07:55:20Z, le
+/// 2026-10-17). Le lanceur différé `long_running:run_claude_pilot:deferred`,
+/// livré 11 min plus tôt quand il a lancé le groom, satisfaisait seul la grâce
+/// de 600 s ; le callback du groom réussi venait d'atterrir. Aucun frère actif
+/// (la place implement était tenue par mika#2680, donc le dispatch suivant
+/// n'était pas encore émis).
+#[test]
+fn mika2762_un_lanceur_differe_nancre_pas_la_grace() {
+    let db = db();
+    // Le parent du helper arrive avec un enfant de classe NULL ⇒ `implement` :
+    // hors de la population du balayage `groom`, donc inoffensif ici.
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    seed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot:deferred",
+        11 * 60,
+    );
+    seed_groom_callback(&db, &parent_id, "long_running:run_claude_pilot_groom", 1);
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert!(
+        orphans.is_empty(),
+        "le lanceur différé ne doit pas ancrer la grâce : le groom vient de \
+         livrer avec succès, son parent reste in_progress"
+    );
+}
+
+/// Contrôle négatif du cas ci-dessus, sur le seul terme du label : un lanceur
+/// différé **seul**, vieux de bien plus que la grâce, ne rend aucun candidat.
+///
+/// Sans ce cas, la version qui exclut le lanceur et celle qui se contente du
+/// `MAX` renvoient la même chose sur le cas mesuré — ce test les sépare.
+#[test]
+fn mika2762_un_lanceur_differe_seul_ne_rend_aucun_candidat() {
+    let db = db();
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    seed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot:deferred",
+        11 * 60,
+    );
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert!(
+        orphans.is_empty(),
+        "un lanceur différé n'est pas un callback de groom : seul, il ne \
+         constitue pas une population à faucher"
+    );
+}
+
+/// La forme positive : deux callbacks de groom réels, le plus récent au-delà
+/// de la grâce. Le parent est candidat, et `last_callback_at` porte la
+/// **dernière** livraison — pas la première, pas celle de `callback_task_id`.
+///
+/// Le groom en deux passes a toujours un enfant de passe 1 ancien ; c'est cette
+/// scène, avec la passe 2 également sortie de grâce.
+#[test]
+fn mika2762_la_grace_sancre_sur_le_dernier_callback() {
+    let db = db();
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    seed_groom_callback(&db, &parent_id, "long_running:run_claude_pilot_groom", 1400);
+    let recent = seed_groom_callback(&db, &parent_id, "long_running:run_claude_pilot_groom", 700);
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "les deux passes ont dépassé la grâce : le parent est candidat"
+    );
+    assert_eq!(orphans[0].id, parent_id);
+
+    let recent_row = db.get_task_unscoped(&recent).unwrap().unwrap();
+    assert_eq!(
+        orphans[0].last_callback_at, recent_row.updated_at,
+        "`last_callback_at` est MAX(child.updated_at) — la livraison la plus \
+         récente, celle contre laquelle la grâce a été mesurée"
+    );
+}
+
+/// Le `NOT LIKE` est plus **juste** dans les deux sens, pas seulement plus
+/// permissif : un lanceur différé livré *dans* la grâce ne doit pas épargner un
+/// parent dont le vrai callback a livré depuis longtemps.
+///
+/// Sans l'exclusion, le `MAX` prendrait le lanceur récent et ce parent-là
+/// fuirait indéfiniment — le défaut d'origine de mika#2750 rouvert par son
+/// propre correctif.
+#[test]
+fn mika2762_un_lanceur_differe_recent_ne_masque_pas_un_vrai_orphelin() {
+    let db = db();
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    let real = seed_groom_callback(&db, &parent_id, "long_running:run_claude_pilot_groom", 700);
+    seed_groom_callback(&db, &parent_id, "long_running:run_claude_pilot:deferred", 1);
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "un lanceur différé récent n'ancre rien non plus : le vrai callback \
+         reste hors grâce, le parent est candidat"
+    );
+    assert_eq!(orphans[0].id, parent_id);
+
+    let real_row = db.get_task_unscoped(&real).unwrap().unwrap();
+    assert_eq!(
+        orphans[0].last_callback_at, real_row.updated_at,
+        "l'ancre est le vrai callback, pas le lanceur livré à l'instant"
+    );
+}
+
+/// Symétrie du couple (mika#1162) : la voie de succès porte la même grâce et la
+/// même exclusion. Rien de mesuré n'a mordu là — la voie implement finit
+/// toujours par un frère ou un `pr_url` — mais le contrat de couple interdit
+/// que la forme diverge entre les deux moitiés.
+#[test]
+fn mika2762_la_voie_de_succes_sancre_pareil() {
+    let db = db();
+    let (parent_id, implement_child) =
+        create_completable_parent_setup(&db, "https://github.com/senara-solutions/mika/pull/2762");
+
+    // Le vrai callback implement, hors grâce.
+    db.conn
+        .execute(
+            "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+            params![implement_child],
+        )
+        .unwrap();
+
+    // Un lanceur différé de classe implement, livré à l'instant. Sans
+    // l'exclusion il deviendrait l'ancre et le parent cesserait d'être
+    // complétable.
+    let mut launcher = callback_task("mika");
+    launcher.parent_task_id = Some(parent_id.clone());
+    launcher.label = "long_running:run_claude_pilot:deferred".to_string();
+    let launcher_id = db.create_task(&launcher).unwrap();
+    assert!(
+        db.update_task_completed(&launcher_id, "mika", Some("done"))
+            .unwrap()
+    );
+    assert!(db.mark_task_delivered(&launcher_id).unwrap());
+
+    let completable = db
+        .find_completable_parent_tasks_on_pr_url("mika", 600)
+        .unwrap();
+    assert_eq!(
+        completable.len(),
+        1,
+        "la voie de succès ancre sur le dernier callback non différé, comme la \
+         faucheuse (contrat de couple mika#1162)"
+    );
+    assert_eq!(completable[0].id, parent_id);
+}
+
 #[test]
 fn test_find_dispatch_children_with_pid_ignores_pidless_children() {
     let db = db();

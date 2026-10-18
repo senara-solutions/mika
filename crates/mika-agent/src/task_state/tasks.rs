@@ -446,12 +446,22 @@ pub struct BackgroundTaskCounts {
 
 /// A parent self_dev task left `in_progress` after its callback subtask
 /// delivered without producing a PR. Used by the task engine reaper (#871).
+///
+/// `last_callback_at` is `MAX(child.updated_at)` over the callbacks the query
+/// retained (class-scoped, non-deferred) — the instant the grace was actually
+/// measured against (mika#2762), modelled on
+/// [`SettleableDispatchParent::last_child_at`]. It is **not**
+/// `callback_task_id`'s own timestamp: that field stays `MIN(child.id)`, the
+/// identity the `NO_PR:` motif is resolved from, and the two name different
+/// children as soon as a parent has more than one delivered callback. Carried
+/// for the `task_engine_reaper.evaluated` line; no decision reads it.
 #[derive(Debug, Clone)]
 pub struct OrphanedParentTask {
     pub id: String,
     pub agent_id: String,
     pub callback_task_id: String,
     pub created_at: String,
+    pub last_callback_at: String,
 }
 
 /// A `manual` tracking row whose dispatch is over: every callback child has
