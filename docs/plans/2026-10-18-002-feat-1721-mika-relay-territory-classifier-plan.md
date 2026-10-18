@@ -52,6 +52,16 @@ Le § 2 les mesure une par une.
 
 ## 2. Mesures — exécutées au grooming, pas déduites
 
+> **Attestation de re-vérification (passe du 2026-10-18).** Chaque citation de ce
+> § a été réexécutée : les cinq états de ticket (`gh issue view` sur #1720, #1641,
+> #1719, #1193, #1161), les deux déclarations de `well_known_agents.rs`, la
+> migration v39→v40, `CURRENT_SCHEMA_VERSION = 56`, l'absence du répertoire
+> `skills/bundled/permission-policy`, l'absence de tout fichier `gentux*`, et le
+> grep `publish_allow`. Aucune n'a bougé. Les deux ajouts que cette passe a
+> produits — la ventilation des 25 occurrences de `mika-relay` dans `crates/`
+> (§ 2.1) et le protocole design-locked du § 2.6 point 3 — vont l'un dans le sens
+> du constat, l'autre dans le sens du ticket, et les deux sont dits comme tels.
+
 ### 2.1 L'agent hôte n'existe plus : il a été retiré, et pour cette raison-là
 
 `mika-relay` n'est pas « inactif » ou « à recâbler ». Il a été **supprimé**, et
@@ -75,7 +85,27 @@ s'échapper.
 - `docs/agent-internals/exec-handlers.md:1117` l'écrit sans ambiguïté :
   `MIKA_RELAY_IDENTITY` « exists nowhere in `crates/` and is dropped ».
 - Le ticket de retrait : mika#1193, *« retire mika-relay agent +
-  permission-policy skill + config refs (mika#1188 Phase C) »*, fermé.
+  permission-policy skill + config refs (mika#1188 Phase C) »*, fermé
+  **COMPLETED** le 2026-05-30.
+
+**Le grep que ferait un relecteur rend 25 occurrences, et aucune n'est un chemin
+de production.** Il faut le dire ici, parce que `grep -rn mika-relay crates/`
+est exactement la vérification qu'on lance pour contredire ce § — et son volume
+seul pourrait se lire comme une preuve d'existence. Leur répartition, mesurée :
+
+| site | occ. | nature |
+|---|---|---|
+| `crates/mika-agent/src/db/migrations.rs` | 12 | **la migration de suppression elle-même** (v39→v40) |
+| `crates/mika-agent/src/db/tests/task_messages_and_groom.rs` | 5 | fixture de test — `register_agent("mika-relay", …)`, un id d'agent arbitraire |
+| `crates/mika-agent/src/server/budget_guard.rs` | 3 | fixtures sous `#[cfg(test)] mod tests` (`:170`) |
+| `crates/mika-cli/src/cli.rs` | 2 | fixtures sous `#[cfg(test)]` (`:1459`) — test d'analyse d'arguments |
+| `crates/mika-agent/docs/configuration.md` | 2 | un exemple illustratif (`:270`) et une **confirmation** (`:484`) |
+| `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md` | 1 | doc design-locked — voir § 2.6, point 3 |
+
+Zéro constante d'identité, zéro entrée dans `WELL_KNOWN_AGENTS`, zéro compétence
+empaquetée, zéro chemin de code atteignable à l'exécution. Et `configuration.md:484`
+dit la conclusion de ce § avec les mots du dépôt : « mika-prime / mika-relay are
+**not well-known agents at all**, so they have [no entry] ».
 
 **La cause du retrait est le motif que ce ticket rejoue.**
 `docs/solutions/architecture-patterns/deterministic-policy-file-replaces-relay-llm-2026-05-18.md`
@@ -89,11 +119,22 @@ a pas survécu : **la phase C l'a démonté**. Greffer un second domaine de
 décision sur `mika-relay` n'est pas « réutiliser un agent existant », c'est le
 **ressusciter**, ce que le ticket ne demande nulle part et ne chiffre pas.
 
-**Un résidu documentaire, et c'est lui qui rend le titre du ticket encore
-plausible.** `CLAUDE.md:313` liste toujours
-« `MIKA_RELAY_IDENTITY` (1 skill) — only `permission-policy` ». Les deux moitiés
-de cette ligne sont fausses depuis mika#1193. C'est une ligne périmée à corriger,
-pas une preuve d'existence — et elle est hors du périmètre de ce ticket.
+**Le résidu documentaire est ce qui rend le titre du ticket encore plausible, et
+il tient en trois lignes de `CLAUDE.md`** — pas une :
+
+- `:313` — « `MIKA_RELAY_IDENTITY` (1 skill) — only `permission-policy` ». Les
+  deux moitiés sont fausses depuis mika#1193.
+- `:272` — `permission-policy/` dans le diagramme de l'arbre `skills/bundled/`.
+  Le répertoire n'existe pas (`ls` : *No such file or directory*).
+- `:250` — `permission-policy` cité en exemple de compétence engine-coupled.
+
+**Et le dépôt sait déjà que c'est périmé.** `docs/agent-internals/exec-handlers.md:1117`
+non seulement constate que `MIKA_RELAY_IDENTITY` « exists nowhere in `crates/`
+and is dropped », mais nomme la staleness et la diffère explicitement : « § *Skills
+System* still names it (**pre-existing staleness, out of scope**) ». Ces trois
+lignes ne sont donc pas une preuve d'existence contredite par ce plan — elles sont
+une dette documentaire déjà identifiée et déjà renvoyée, par un document du dépôt,
+avant ce grooming. Elles restent hors du périmètre de ce ticket (§ 9).
 
 ### 2.2 L'espace d'adresses de sortie a été refusé le jour même de ce grooming
 
@@ -130,7 +171,11 @@ gated by the existing bearing-circle (Prime's `publish_allow` row per bus design
 - Le commit cité, `c45a360`, n'est pas une révision de ce dépôt :
   `fatal: ambiguous argument 'c45a360': unknown revision or path not in the working tree`.
 - `publish_allow` / `subscribe_allow` : **zéro occurrence**, tous fichiers, tous
-  langages, hors `target/`.
+  langages, hors `target/` — **sauf ce plan lui-même**, qui cite les deux noms
+  ici. Le grep de vérification rend donc les lignes de ce fichier et rien d'autre ;
+  en l'excluant (`--exclude-dir=docs`), il rend vide. Je le précise pour que le
+  relecteur qui relance la commande ne lise pas ses propres citations comme une
+  contradiction.
 
 La référence d'architecture porteuse du ticket est donc **illisible depuis un
 worktree de `mika`**, et le mécanisme de garde sur lequel repose la protection du
@@ -228,8 +273,9 @@ n'est un rung. `CLAUDE.md` l'énonce comme règle : « un ticket opené sur
 
 ### 2.6 Ce que la mesure ne retire pas au ticket
 
-Deux choses tiennent, et il faut le dire parce qu'elles pèsent sur la décision du
-§ 5.
+Trois choses tiennent, et il faut le dire parce qu'elles pèsent sur la décision
+du § 5. La troisième a été trouvée en vérifiant le § 2.1, et elle va dans le sens
+du ticket.
 
 1. **Le verrou de séquencement est levé.** mika#1719 est fermé. La *Sequencing
    note* du ticket n'est plus un obstacle — ce n'est simplement plus le seul
@@ -242,6 +288,34 @@ Deux choses tiennent, et il faut le dire parce qu'elles pèsent sur la décision
    et elle resterait le bon cadre pour n'importe quel classificateur de routage
    futur. C'est la seule part du ticket qui survit à la disparition de son hôte —
    et c'est précisément sur elle que porte la disposition D2 du § 5.
+3. **L'invariant 1 du ticket est devenu doctrine du dépôt trois jours après son
+   ouverture — et il y est ratifié, pas seulement proposé.** Le ticket a été
+   ouvert le 2026-07-03 à 10:15 UTC. Le 2026-07-06 à 17:00 CEST,
+   `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md` est
+   **design-locked sur ratification de Vincent** (mika#1733, sous-chantier C de
+   mika#1727 — *wrapper-doctrine*, encore OPEN). Sa § *Where this rule is enforced
+   structurally* range « any decision produced by the **mika-relay /
+   permission-policy skill**, mika-arch verdicts, mika-qa acceptance judgments »
+   dans la catégorie **« LLM classifier decisions (NEVER final-at-wire) »**, avec
+   la formule : « These have a documented false-deny failure class ; **they
+   inform, they do not structurally block.** »
+
+   C'est l'invariant 1 de ce ticket — « Classifier LABELS, does not DELIVER » —
+   énoncé comme règle générale du dépôt, séparant les gardes déterministes
+   *pre-classifier* (tier1, validation de chemin, denylist d'identité, veto
+   structurel par regex) des décisions de classificateur, qui informent. La
+   posture « declawed » du ticket n'est donc pas une concession qu'il fait pour
+   désarmer l'objection mika#1161 : c'est la seule posture que ce dépôt autorise
+   à un classificateur LLM, quel qu'il soit, et elle a été ratifiée
+   indépendamment, dans un autre chantier.
+
+   **Ce que cela change, et ce que cela ne change pas.** Cela renforce la clause
+   « ce que la fermeture ne perd pas » de D1 (§ 5) : la part doctrinale du ticket
+   est déjà tenue ailleurs, par un document design-locked, donc la fermer ne la
+   perd pas. Cela ne renverse **pas** la recommandation : la doctrine ratifie la
+   *posture*, jamais l'*hôte*, et c'est l'hôte qui manque (§ 2.1). Un ticket dont
+   la posture est doctrine et dont l'hôte est supprimé reste un ticket en avance
+   sur son substrat.
 
 ---
 
@@ -313,7 +387,10 @@ explicitement reprogrammé pour le chantier du bus.
 
 **Ce que la fermeture ne perd pas, et comment le garantir à bas prix.** Le corps
 du ticket reste lisible après fermeture : l'argument d'asymétrie de coût et la
-table de promotion y demeurent intacts. Si l'inquiétude est qu'un ticket d'ère-bus
+table de promotion y demeurent intacts. Et sa part la plus structurante —
+l'invariant 1, « classifier LABELS, does not DELIVER » — ne dépend plus du tout de
+ce ticket : elle est portée par un document design-locked et ratifié
+(§ 2.6, point 3), donc la fermeture ne peut pas la perdre. Si l'inquiétude est qu'un ticket d'ère-bus
 rouvre la question à une barre plus basse, le remède est le même que celui que
 mika#1720 a employé pour préserver la forme d'adressage : **un commentaire de
 fermeture qui nomme où la chose revient**, et qui désigne mika#1721 comme le
@@ -467,9 +544,12 @@ renforcer le constat.
 
 ## 9. Hors périmètre, délibérément
 
-- **Corriger `CLAUDE.md:313`** (la ligne `MIKA_RELAY_IDENTITY` périmée depuis
-  mika#1193, § 2.1). Réel, trivial, et étranger à ce ticket — à ouvrir
-  séparément.
+- **Corriger les trois lignes périmées de `CLAUDE.md`** (`:250`, `:272`, `:313` —
+  `permission-policy` et `MIKA_RELAY_IDENTITY`, périmées depuis mika#1193, § 2.1).
+  Réel, trivial, étranger à ce ticket — et **déjà renvoyé** par
+  `docs/agent-internals/exec-handlers.md:1117` (« pre-existing staleness, out of
+  scope »). À ouvrir séparément ; ce plan ne le fait pas, pour ne pas mêler une
+  correction de documentation à une remontée de cap.
 - **Reconstruire `mika-relay`.** § 3.
 - **Écrire l'ADR de D2 ou le commentaire de clôture de D1.** § 5, dernier
   paragraphe : ce sont des actes de cap.
@@ -480,21 +560,31 @@ renforcer le constat.
 
 ## 10. Référence
 
-**Tickets.** mika#1721 (celui-ci, OPEN) · mika#1720 Ticket A (CLOSED NOT_PLANNED,
-2026-10-18T17:55:07Z) · mika#1641 parent (CLOSED) · mika#1719 verrou de
-séquencement (CLOSED, levé) · mika#1161 dérive de 14 % · mika#1188 et mika#1193
-(phases du retrait du relais) · mika#1727 (doctrine d'enveloppe) · mika#1415
-(semis des commandes de worktree).
+**Tickets.** mika#1721 (celui-ci, OPEN, ouvert 2026-07-03T10:15:16Z) · mika#1720
+Ticket A (CLOSED NOT_PLANNED, 2026-10-18T17:55:07Z) · mika#1641 parent (CLOSED
+COMPLETED, 2026-07-01) · mika#1719 verrou de séquencement (CLOSED COMPLETED,
+2026-09-30 — levé) · mika#1161 dérive de 14 % (CLOSED, 2026-05-18) · mika#1188 et
+mika#1193 (phases du retrait du relais ; #1193 CLOSED COMPLETED 2026-05-30) ·
+mika#1727 (doctrine d'enveloppe, **OPEN**) · mika#1733 (sous-chantier C de #1727,
+CLOSED 2026-07-13 — le protocole design-locked du § 2.6) · mika#1415 (semis des
+commandes de worktree).
 
 **Code.** `crates/mika-agent/src/well_known_agents.rs:567` et `:910` ·
 `crates/mika-agent/src/db/migrations.rs:3775-3828` ·
 `crates/mika-agent/src/db.rs:35` · `crates/mika-agent/src/milestone_manager/`.
+Fixtures de test portant la chaîne `mika-relay`, nommées pour qu'un grep ne les
+lise pas comme des chemins de production (§ 2.1) :
+`crates/mika-agent/src/server/budget_guard.rs:170` (`#[cfg(test)]`) ·
+`crates/mika-cli/src/cli.rs:1459` (`#[cfg(test)]`) ·
+`crates/mika-agent/src/db/tests/task_messages_and_groom.rs:959`.
 
 **Documents.** `docs/solutions/architecture-patterns/deterministic-policy-file-replaces-relay-llm-2026-05-18.md` ·
+`crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md:96` (design-locked,
+§ 2.6 point 3) · `crates/mika-agent/docs/configuration.md:484` et `docs/configuration.md:484` ·
 `docs/agent-internals/exec-handlers.md:1117` ·
 `docs/agent-internals/milestone-manager-phase-1.md:6` ·
 `docs/design/control-monitor-scope-decision.md:60-66` ·
-`docs/adr/001-axum-http-server-architecture.md:30` · `CLAUDE.md:313`.
+`docs/adr/001-axum-http-server-architecture.md:30` · `CLAUDE.md:250`, `:272`, `:313`.
 
 **Commandes semées (non suivies par ce dépôt).**
 `.claude/commands/mika-ask-prime.md:7` · `.claude/commands/cm.md:1-11` ·
