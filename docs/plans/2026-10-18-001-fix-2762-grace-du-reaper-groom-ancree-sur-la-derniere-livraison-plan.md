@@ -83,63 +83,97 @@ la grâce, pas le critère.
 
 ## 3. Les livrables, site par site
 
-### D1 — Le prédicat « ce n'est pas un lanceur différé », un seul site
+### D1 — Le prédicat « ce n'est pas un lanceur différé » : appliquer la convention du fichier
 
-Un `const` à côté de `DEFERRED_DISPATCH_LABEL` (`agent_loop/mod.rs:6391`, valeur
-`long_running:run_claude_pilot:deferred`) :
+**Correction de fond par rapport aux passes précédentes de ce plan**, qui annonçaient « la
+première forme `LIKE` du fichier » et créaient une constante pour la porter. Les deux sont
+faux, et c'est vérifiable d'un `grep` : `db/tasks.rs` porte **déjà huit** clauses
+`label NOT LIKE '%:deferred'`, écrites **inline dans le SQL** —
+
+| ligne | fonction | ticket |
+|---|---|---|
+| 3699 | `has_active_callback_tasks_excluding` | mika#1163 |
+| 3743 | `count_active_callback_tasks_excluding` | mika#2160 |
+| 4278 | `has_non_deferred_active_callback_child` | — |
+| 4569 | `has_any_active_callback` | mika#1070 |
+| 4593 | `has_any_active_callback_for_class` | — |
+| 4631 | `count_active_callbacks_for_class` | — |
+| 4672 | `force_promote_deferred_for_class` | — |
+| 4711 | `find_active_callback_for_class` | — |
+
+Ce vol **n'introduit donc aucune forme** : il applique la convention établie du fichier à la
+neuvième requête qui en a besoin. Trois conséquences, et chacune simplifie le vol :
+
+1. **Pas de constante nouvelle, et pas de paramètre lié.** Les huit sites écrivent le motif
+   littéral dans la chaîne SQL. Un `DEFERRED_LAUNCHER_LIKE_PATTERN` + un `?4` ne produirait
+   pas « un seul site » du prédicat — il produirait un **neuvième dialecte** à côté de huit
+   littéraux inchangés. Le neuvième site s'écrit comme ses huit voisines :
+   `AND child.label NOT LIKE '%:deferred'`. C'est l'inverse du réflexe DRY, et c'est le bon
+   arbitrage ici : la duplication existe déjà en huit exemplaires, et un dialecte de plus
+   coûte plus cher à lire qu'un littéral de plus.
+2. **`has_non_deferred_active_callback_child` (4278) porte déjà le nom de la sémantique
+   visée.** Elle n'est pas réutilisable telle quelle (elle interroge les enfants *actifs*
+   d'un parent, là où le reaper a besoin des *livrés* dans un `JOIN` agrégé), mais elle est
+   le précédent de **nommage** : « non-differé » est déjà un concept nommé du fichier.
+3. **La garde de dérive reste, et son énoncé change.** Elle n'a plus de constante à relier à
+   une autre ; elle doit relier `DEFERRED_DISPATCH_LABEL` au **suffixe** que le SQL écrit.
+
+#### La vraie asymétrie n'est pas « égalité vs `LIKE` » : elle est dans la portée du suffixe
+
+`db/tasks.rs` référence aussi `DEFERRED_DISPATCH_LABEL` par **égalité exacte** à dix
+endroits (1934, 1975, 2732, 2831, 2927, 3000, 3158, 3196, 3234, 3261 — pas cinq, comme les
+passes précédentes l'écrivaient). Toutes dans des fonctions qui **ciblent** le lanceur
+différé pour agir sur lui (`mark_deferred_wrapper_noop`,
+`count_promoted_undelivered_wrappers`, `find_live_deferred_wrapper_child`,
+`summarize_deferred_wrappers_of_parent`, `cancel_deferred_wrappers_of_parent`, …). Cette
+asymétrie cibler/exclure est réelle et tient — un prédicat qui cible peut rater sans
+dommage, un prédicat qui protège ne doit pas — mais elle est **déjà tranchée** par mika#1070
+et mika#1163, et elle n'est pas la question ouverte de ce vol.
+
+La question ouverte est ailleurs, et un test existant la pose explicitement.
+`test_has_active_callback_tasks_excluding_ignores_deferred_wrappers`
+(`db/tests/secrets_and_agent_reset.rs:943-974`) épingle que `%:deferred` est un
+**suffix-anchor strict** : un label `long_running:run_claude_pilot:deferred:retry`
+**n'est pas** exclu, et son commentaire dit que c'est **voulu** — *« a refactor that shifts
+the suffix convention has to update the SQL clause deliberately »*.
+
+Pour les prédicats de slot, cet échappement est inoffensif : un wrapper exotique compte
+comme dispatch actif, donc le garde est conservateur dans le bon sens. **Pour le reaper, il
+est exactement le défaut de ce ticket** : un lanceur différé qui échappe au `NOT LIKE` est
+**promu ancre de grâce** et détruit un vol de groom. Ce vol hérite donc d'un prédicat dont
+la portée a été calibrée pour un autre usage, et c'est ce que la garde doit surveiller —
+non pas « la constante matche-t-elle le motif », mais « le producteur du label est-il
+toujours dans la portée du suffixe que le reaper lui applique ».
 
 ```rust
-/// Motif SQL (`LIKE`) des **lanceurs différés** — les enfants callback qui ne
-/// disent rien de l'état d'un dispatch (mika#2762).
-pub const DEFERRED_LAUNCHER_LIKE_PATTERN: &str = "%:deferred";
-```
-
-Un **suffixe**, pas la constante exacte, parce que le producteur du label est susceptible
-de se spécialiser par classe (`…_groom:deferred`) et qu'un lanceur différé d'un autre nom
-rouvrirait le trou en silence. Le lien entre les deux est **asserté**, pas espéré — dans un
-`#[test]`, sibling de `test_deferred_dispatch_label_string_drift_guard` (mika#1124,
-`dispatcher.rs:7385`) et posé à côté de lui :
-
-```rust
-/// Garde de dérive mika#2762 : la constante exacte doit rester couverte par le
-/// motif `LIKE` que le SQL du reaper utilise pour l'exclure.
+/// Garde de dérive mika#2762 : le label produit doit rester dans la portée du
+/// suffixe `%:deferred` que le SQL du reaper utilise pour l'exclure comme ancre.
+///
+/// `%:deferred` est un suffix-anchor **strict** — pinné comme tel par
+/// `test_has_active_callback_tasks_excluding_ignores_deferred_wrappers`
+/// (mika#1163), où l'échappement d'un `:deferred:retry` est inoffensif parce que
+/// le prédicat y *cible*. Ici le prédicat *protège* : un lanceur différé hors
+/// portée est promu ancre de grâce et détruit un vol de groom (le défaut mesuré).
 #[test]
-fn test_deferred_launcher_like_pattern_couvre_le_label() {
-    let suffixe = DEFERRED_LAUNCHER_LIKE_PATTERN.trim_start_matches('%');
+fn mika2762_le_label_differe_reste_dans_la_portee_du_suffixe_du_reaper() {
     assert!(
-        DEFERRED_DISPATCH_LABEL.ends_with(suffixe),
-        "DEFERRED_DISPATCH_LABEL ne matche plus DEFERRED_LAUNCHER_LIKE_PATTERN — \
-         répare le prédicat SQL de mika#2762, n'excepte pas le label"
+        DEFERRED_DISPATCH_LABEL.ends_with(":deferred"),
+        "DEFERRED_DISPATCH_LABEL = {DEFERRED_DISPATCH_LABEL:?} sort de la portée de \
+         `%:deferred` — répare le prédicat SQL du reaper (9 sites, § 3/D1), \
+         n'excepte pas le label : hors portée, il redevient ancre de grâce"
     );
 }
 ```
 
-Un `#[test]` et non un `const { assert!(…) }` : `str::ends_with` n'est pas une `const fn`,
-donc la vérification ne peut pas être au build. Le suffixe est **dérivé** du motif
-(`trim_start_matches('%')`) plutôt que retapé, sinon la garde elle-même peut dériver du
-prédicat qu'elle protège et rester verte sur une valeur périmée.
+Un `#[test]` et non un `const { assert!(…) }` : `str::ends_with` n'est pas une `const fn`.
+Il va **à côté du test mika#1163 qui pose la convention de suffixe**
+(`db/tests/secrets_and_agent_reset.rs`), pas près de
+`test_deferred_dispatch_label_string_drift_guard` (`dispatcher.rs:7385`) comme les passes
+précédentes le proposaient : c'est au site de la convention qu'un lecteur qui l'élargit
+passera, et c'est là que la garde doit lui tomber dessus.
 
-#### Pourquoi un `LIKE` ici alors que ses cinq voisines du même fichier matchent par égalité
-
-`db/tasks.rs` référence **déjà** `DEFERRED_DISPATCH_LABEL` à cinq endroits (lignes 1934,
-1975, 2732, 2831, 2927) et tous les cinq écrivent `label = ?` avec la constante **exacte**.
-Ce vol introduit la première forme `LIKE` du fichier. L'asymétrie est délibérée et porte sur
-la **direction** du prédicat, pas sur un goût :
-
-- Les cinq voisines **ciblent** le lanceur différé — elles le cherchent pour agir sur lui
-  (le marquer, le compter vivant, en trouver un suivant). Un label spécialisé qui échappe à
-  leur égalité les rend **inertes** : elles ne trouvent rien et ne font rien. Un faux négatif
-  y est un non-événement.
-- Le reaper l'**exclut** — il le reconnaît pour ne *pas* le compter comme ancre. Un label
-  spécialisé qui échappe à son prédicat est **promu ancre de grâce** et détruit un vol de
-  groom. Un faux négatif y est exactement le défaut de ce ticket.
-
-Un prédicat qui cible peut rater sans dommage ; un prédicat qui protège ne doit pas. D'où
-l'égalité d'un côté et le suffixe de l'autre. Ne pas « harmoniser » les cinq voisines sur le
-`LIKE` au passage : hors périmètre (§ 7), et leur égalité exacte est correcte pour ce
-qu'elles font. La garde de dérive ci-dessus est précisément ce qui tient les deux formes
-ensemble : le jour où le label se spécialise, elle rougit au lieu de laisser le trou se
-rouvrir en silence.
+Ne pas « harmoniser » les dix voisines par égalité sur le `LIKE`, ni refactorer les huit
+littéraux vers une constante : hors périmètre (§ 7).
 
 ### D2 — `find_orphaned_parent_tasks` : ancrage sur `MAX`, lanceurs différés exclus
 
@@ -157,7 +191,7 @@ WHERE parent.agent_id = ?1
   AND child.trigger_type = 'callback'
   AND child.action_type  = 'resume_agent'
   AND child.status       = 'delivered'
-  AND child.label NOT LIKE ?4            -- mika#2762 : un lanceur différé n'ancre rien
+  AND child.label NOT LIKE '%:deferred'  -- mika#2762 : un lanceur différé n'ancre rien
   AND (parent.metadata IS NULL
        OR json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NULL)
   AND NOT EXISTS (
@@ -225,6 +259,21 @@ Dans `engine.rs` :
    lanceur différé ne compte pas parmi les `delivered_callback_children` que le garde
    examine. Sinon les deux lectures de « qu'est-ce qu'un callback de dispatch » divergent
    dans la même fonction.
+
+   **Coût réel : une clause dans un filtre, aucun champ à ajouter.**
+   `ReaperChildSnapshot` porte **déjà** `label: String` (`task_state/tasks.rs:738`) et
+   `get_reaper_child_snapshot` (`db/tasks.rs:3272`) le sélectionne déjà. Le filtre reçoit
+   `&& !c.label.ends_with(":deferred")` et rien d'autre.
+
+   **Un cas limite à nommer, sinon il se lit comme un trou.** Si le seul callback
+   `delivered` d'un parent est un `:deferred`, le filtre vide
+   `delivered_callback_children`, le `if !…is_empty()` ne tient plus et le garde cesse de
+   protéger — le reaper tuerait. **Ce cas est inatteignable depuis la requête :** le
+   `NOT LIKE` de D2 vide alors le `JOIN`, donc ce parent n'entre jamais dans la population
+   que le garde examine (épinglé par
+   `mika2762_un_lanceur_differe_seul_ne_rend_aucun_candidat`, D5). Le garde est une
+   défense en profondeur sur une population que D2 a déjà filtrée, pas une seconde porte
+   d'entrée. Le dire dans le commentaire du garde.
 4. **Porter `last_callback_at` sur la ligne `task_engine_reaper.evaluated`** (ligne 4375).
    C'est ce qui rend l'ancrage *lisible* : l'opérateur voit sur quoi la grâce a été ancrée et
    peut constater que ce n'est pas un `:deferred`. Sans ce champ, un futur faux positif de
@@ -263,8 +312,8 @@ Dans `engine.rs` :
 
 ## Fire-Disposition
 
-Ce plan livre des détecteurs (D5 : cinq tests DB ; D1 : une assertion de dérive de
-constante). **Option (a) — exception nommée en allowlist, allowlist vide et épinglée vide.**
+Ce plan livre des détecteurs (D5 : cinq tests DB ; D1 : une assertion de portée de suffixe).
+**Option (a) — exception nommée en allowlist, allowlist vide et épinglée vide.**
 
 Détail d'implémentation : il n'y a **aucune violation préexistante à excepter**, et c'est
 vérifiable plutôt que postulé. Les deux cas mesurés du ticket (mika#2752 à 07:37:20Z,
@@ -274,10 +323,12 @@ commit qu'eux (§ 5, commit 1), donc ils sont verts à l'atterrissage sans excep
 sorte. Aucun fichier d'allowlist n'est créé : une allowlist vide dans ce vol serait un
 fichier mort.
 
-L'assertion de dérive de D1 est l'unique détecteur qui peut rougir plus tard. Quand elle
-rougit, la consigne est écrite dans son message : **réparer le prédicat SQL, jamais excepter
-le label** — un lanceur différé qui échappe au `NOT LIKE` rouvre exactement le défaut de ce
-ticket.
+L'assertion de portée de D1 est l'unique détecteur qui peut rougir plus tard. Quand elle
+rougit, la consigne est écrite dans son message : **réparer le prédicat SQL aux neuf sites,
+jamais excepter le label** — un lanceur différé hors de la portée du `NOT LIKE` rouvre
+exactement le défaut de ce ticket. Elle est verte à l'atterrissage
+(`"long_running:run_claude_pilot:deferred".ends_with(":deferred")`), donc elle n'arrive pas
+désarmée.
 
 ## 4. Contrat de vérification
 
@@ -332,10 +383,21 @@ ticket.
   qu'une implémentation tient la place demande un critère d'artefact de groom (« les
   callouts sont écrits ») que `tasks` ne porte pas : un livrable d'une autre nature.
   Recommandé en ticket séparé ; ce vol le laisse en l'état documenté, où il ne détruit rien.
-- **Les cinq sites `label = DEFERRED_DISPATCH_LABEL` de `db/tasks.rs`** (1934, 1975, 2732,
-  2831, 2927) ne sont **pas** convertis au motif `LIKE`. Leur égalité exacte est correcte
-  pour un prédicat qui *cible* le lanceur différé ; la raison complète est au § 3/D1.
-  Les toucher élargirait le vol sans fermer quoi que ce soit.
+- **Les dix sites `label = DEFERRED_DISPATCH_LABEL` de `db/tasks.rs`** (1934, 1975, 2732,
+  2831, 2927, 3000, 3158, 3196, 3234, 3261) ne sont **pas** convertis au motif `LIKE`. Leur
+  égalité exacte est correcte pour un prédicat qui *cible* le lanceur différé ; la raison
+  complète est au § 3/D1. Les toucher élargirait le vol sans fermer quoi que ce soit.
+- **Les huit littéraux `NOT LIKE '%:deferred'` existants** (3699, 3743, 4278, 4569, 4593,
+  4631, 4672, 4711) ne sont **pas** refactorés vers une constante partagée. Ce serait un
+  refactor de huit signatures de requête pour un gain de lisibilité, dans un vol dont le
+  plancher est un correctif de production ; et le passage du littéral inline au paramètre
+  lié change la forme des huit `params![…]`. Candidat légitime pour un ticket de dette
+  séparé, cité ici pour qu'il ne se présente pas comme une découverte.
+- **La portée du suffixe `%:deferred` n'est pas élargie.** Un label `:deferred:retry`
+  échappe aux neuf prédicats, et ce vol ne change pas ça — il ajoute seulement la garde qui
+  rougit si le producteur sort de la portée (§ 3/D1). Élargir le motif toucherait les huit
+  prédicats de slot existants, dont mika#1163 a délibérément calibré la portée : hors
+  périmètre, et à instruire sur son propre ticket si le besoin apparaît.
 - **`REAPER_GRACE_SECONDS`** (600 s) n'est pas touché. Le défaut est l'ancre, pas la durée ;
   rallonger la grâce masquerait le symptôme sans corriger le prédicat.
 - **Les deux autres balayages** (`find_childless_parent_tasks` mika#1687,
@@ -349,9 +411,11 @@ ticket.
 - [ ] `find_orphaned_parent_tasks` ancre la grâce sur `MAX(child.updated_at)` en `HAVING`,
       et la clause `WHERE child.updated_at < …` a **disparu**.
 - [ ] Les enfants dont le `label` matche `%:deferred` sont exclus du JOIN des deux requêtes
-      de la paire couplée, via un prédicat déclaré en un seul site.
-- [ ] `DEFERRED_DISPATCH_LABEL` est assertée conforme au motif, avec le message qui dit quoi
-      réparer.
+      de la paire couplée, par un littéral inline **de la même forme que les huit voisines**
+      du fichier — aucune constante ni paramètre lié nouveau n'est introduit.
+- [ ] `DEFERRED_DISPATCH_LABEL` est assertée **dans la portée du suffixe** `%:deferred`, par
+      un test posé à côté de celui de mika#1163 qui fixe cette convention, avec le message
+      qui dit quoi réparer.
 - [ ] `OrphanedParentTask.last_callback_at` existe et sort sur
       `task_engine_reaper.evaluated`.
 - [ ] `tick()` appelle à nouveau `reap_orphaned_parent_tasks("groom")`, et la méthode n'est
@@ -402,21 +466,24 @@ sont dérivés de sa section **Correctif attendu** et du § 4 de ce plan.
 | `crates/mika-agent/src/db/tasks.rs` — D2 (SQL + doc-comment amendé) | 70 |
 | `crates/mika-agent/src/db/tasks.rs` — D3 (sibling de succès symétrisé) | 30 |
 | `crates/mika-agent/src/task_state/tasks.rs` — champ `last_callback_at` + doc | 12 |
-| `crates/mika-agent/src/agent_loop/mod.rs` — D1 (prédicat) | 10 |
-| `crates/mika-agent/src/task_engine/dispatcher.rs` — D1 (`#[test]` de dérive) | 20 |
+| `crates/mika-agent/src/db/tests/secrets_and_agent_reset.rs` — D1 (`#[test]` de portée) | 20 |
 | `crates/mika-agent/src/task_engine/engine.rs` — D4 (appel, visibilité, garde AC-3, champ d'audit) | 40 |
 | tests (`crates/mika-agent/src/db/tests/reapers.rs`) | 155 |
 | tests (`crates/mika-agent/tests/eval/test_groom_parent_reap_2750.rs`) | 40 |
 
-Total estimé : 377 lignes
+Total estimé : 367 lignes
 Plafond de tours : 200 (`loop-substrate`)
 Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 
-**Un seul vol, et voici pourquoi il tient.** 377 sous la borne de 429 et très loin du seuil
-de 1000 par PR. Trois raisons concrètes : (a) le test du cas mesuré **existe déjà** et n'est
-pas à écrire — il est à rendre significatif, ce qui coûte une ligne d'appel dans `tick()` ;
-(b) les deux requêtes de la paire couplée reçoivent le **même** diff de trois clauses, donc
-D3 est une copie et non une conception ; (c) la forme SQL cible est déjà écrite dans ce même
-fichier (`find_settleable_dispatch_parents`, mika#2405) avec son doc-comment justificatif —
-il n'y a pas de forme à inventer. Les 155 lignes de tests DB sont le plus gros poste et
-suivent le gabarit des onze tests voisins du même fichier.
+**Un seul vol, et voici pourquoi il tient.** 367 sous la borne de 429 et très loin du seuil
+de 1000 par PR. Quatre raisons concrètes : (a) le test du cas mesuré **existe déjà** et
+n'est pas à écrire — il est à rendre significatif, ce qui coûte une ligne d'appel dans
+`tick()` ; (b) les deux requêtes de la paire couplée reçoivent le **même** diff de trois
+clauses, donc D3 est une copie et non une conception ; (c) la forme SQL cible est déjà
+écrite dans ce même fichier (`find_settleable_dispatch_parents`, mika#2405) avec son
+doc-comment justificatif — il n'y a pas de forme à inventer ; (d) le prédicat `:deferred`
+est déjà écrit **huit fois** dans le fichier et `ReaperChildSnapshot.label` existe déjà
+(§ 3/D1, § 3/D4.3), donc D1 et D4.3 sont des applications de l'existant et non des
+constructions — c'est ce qui a fait tomber l'estimation de 377 à 367 entre deux passes de
+grooming. Les 155 lignes de tests DB restent le plus gros poste et suivent le gabarit des
+onze tests voisins du même fichier.
