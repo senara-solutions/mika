@@ -259,10 +259,10 @@ test-egress-sentinel-staging: ## Verify the per-spawn egress sentinel is drawn, 
 test-egress-sentinel-enforcement: ## Verify the addon REQUIRES the egress sentinel on api.github.com — three refusal reasons, a DENY log that never discloses, TTL purge, github.com untouched, and the operator rollback honoured addon-side (mika#2724)
 	@bash skills/bundled/_shared/tests/test_egress_sentinel_enforcement.sh
 
-test-egress-push-bound: ## Verify the addon BOUNDS a git-receive-pack on github.com — four refusal reasons plus the unreadable body, the 4-byte auth probe and the chunked push still passing, the fetch untouched, and the dedicated rollback honoured (mika#2736)
+test-egress-push-bound: ## Verify the addon BOUNDS a git-receive-pack on github.com — seven refusal reasons, the declared perimeter's repository AND branch dimensions, the 4-byte auth probe and the chunked push still passing, the fetch untouched, and the dedicated rollback honoured (mika#2736, mika#2751, mika#2776)
 	@bash skills/bundled/_shared/tests/test_egress_push_bound.sh
 
-test-egress-push-scope-staging: ## Verify the launcher DECLARES the spawn's push perimeter host-side — one 0600 entry per spawn under a 0700 registry, the shape the addon reads, no reader of the switch, fail-open and call-time path included (mika#2751)
+test-egress-push-scope-staging: ## Verify the launcher DECLARES the spawn's push perimeter host-side — repository AND branch coupled in one 0600 entry per spawn under a 0700 registry, the shape the addon reads, no reader of the switch, fail-open and call-time path included (mika#2751, mika#2776)
 	@bash skills/bundled/_shared/tests/test_egress_push_scope_staging.sh
 
 test-egress-relay-socket-env: ## Verify the egress relay socket is 0600, reachable from a bwrap pilot, and that the relay starts from a minimal environment — negative control included

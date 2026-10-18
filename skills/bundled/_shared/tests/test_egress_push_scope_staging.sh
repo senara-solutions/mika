@@ -7,10 +7,18 @@
 # the ADDON: it writes perimeter entries by hand and measures the verdict. It is
 # therefore completely blind to whether anything in the dispatch ever writes
 # one — a `_stage_pilot_egress_push_scope` that returned immediately would leave
-# all 288 of its assertions green, and every pilot would push under the static
+# all 404 of its assertions green, and every pilot would push under the static
 # bound alone while the suites claimed a tightening. This suite is the other
 # half of that correspondence: the producer really produces, and what it
-# produces is the shape the reader reads (`repo=senara-solutions/<repo>`).
+# produces is the shape the reader reads — since mika#2776 BOTH dimensions, in
+# one entry: `repo=senara-solutions/<repo>` and `ref=refs/heads/<branch>`.
+#
+# WHY BOTH LINES IN ONE ENTRY, and why this file is where that is measured. The
+# reader unions the live entries BY ENTRY, reading each as the couple
+# (repository, branch). A producer that split one spawn's two dimensions across
+# two entries would authorise the cross product — repository of entry A with
+# branch of entry B — and the reader suite could not tell: it writes its own
+# fixtures. CASE 13 is the only place the coupling of the write is asserted.
 #
 # WHERE THE STAGING LIVES, because it decides the shape of case 3.
 # `_stage_pilot_egress_push_scope` is called INSIDE `_run_pilot_sandboxed`,
@@ -40,8 +48,10 @@
 # CONSEQUENCE of the TTL (a perimeter purged under a live neighbour refuses a
 # legitimate push) and the two mika#2736 positives under it. The verdicts
 # (`push-scope-repo`, `scope-absent`, `scope-unreadable`, the switch matrix) are
-# `test_egress_push_bound.sh` CASES 13-19. This file asserts the WRITE, and
-# since mika#2766 the UNWRITE, and nothing else.
+# `test_egress_push_bound.sh` CASES 13-19, and the branch dimension's own
+# verdicts (`push-scope-ref`, `scope-ref-absent`, the non-crossing of the union)
+# are its CASES 24-26. This file asserts the WRITE, and since mika#2766 the
+# UNWRITE, and nothing else.
 #
 # Run: bash skills/bundled/_shared/tests/test_egress_push_scope_staging.sh
 # Expected: all assertions pass, exit 0. Needs no bwrap and no gh; cases 5 and
@@ -136,6 +146,17 @@ registry_for() {
     printf '%s' "$d"
 }
 entries_in() { ls -1 "$1" 2>/dev/null | wc -l | tr -d ' '; }
+lines_in() { wc -l < "$1" | tr -d ' '; }
+
+# mika#2776 — the NOMINAL state of a dispatch, set here rather than per case so
+# every case below measures the post-deploy entry and not a degraded one. A
+# plain global, deliberately: that is exactly how the real launcher leaves it
+# (one assignment, in `_set_up_worktree`, without `local`), and a `BRANCH=x
+# _stage_...` prefix would not reach the producer two frames down in CASE 3.
+NOMINAL_BRANCH="feat/2776/infra-borner-le-git-receive-pack-la"
+BRANCH="$NOMINAL_BRANCH"
+# What a nominal entry says, as `$(cat …)` renders it — no trailing newline.
+scope_entry() { printf 'repo=senara-solutions/%s\nref=refs/heads/%s' "$1" "$BRANCH"; }
 
 echo ""
 echo "CASE 1 — the dispatch repository is really declared, in the shape the addon reads"
@@ -151,11 +172,11 @@ assert_eq "exactly one perimeter is declared" "1" "$(entries_in "$R1")"
 E1="$R1/$_PILOT_EGRESS_PUSH_SCOPE_ENTRY"
 rc=0; [ -f "$E1" ] || rc=1
 assert_eq "the memorized nonce IS the file on disk" "0" "$rc"
-# The reader (`_push_scope_repos`) splits on lines and takes the `repo=` key.
-# Owner-qualified, lowercase, no `.git` suffix: `_receive_pack_repo` strips
-# `.git` on its side, so the two forms meet normalized.
-assert_eq "the content is the owner-qualified repository, one line" \
-    "repo=senara-solutions/mika" "$(cat "$E1")"
+# The reader (`_push_scope_entries`) splits on lines and takes the `repo=` and
+# `ref=` keys. Owner-qualified, lowercase, no `.git` suffix: `_receive_pack_repo`
+# strips `.git` on its side, so the two forms meet normalized.
+assert_eq "the content is the owner-qualified repository and the dispatch ref" \
+    "$(scope_entry mika)" "$(cat "$E1")"
 rc=0; grep -q '\.git' "$E1" && rc=1
 assert_eq "no .git suffix — the reader strips it on its side, not here" "0" "$rc"
 
@@ -174,9 +195,9 @@ assert_eq "the second spawn declares a second entry, not an overwrite" "2" "$(en
 rc=0; [ "$E1" != "$E2" ] || rc=1
 assert_eq "the two spawns draw DIFFERENT entry names" "0" "$rc"
 assert_eq "the first spawn's perimeter is still on disk" \
-    "repo=senara-solutions/mika" "$(cat "$E1")"
+    "$(scope_entry mika)" "$(cat "$E1")"
 assert_eq "the second spawn's perimeter names ITS repository" \
-    "repo=senara-solutions/mika-platform" "$(cat "$E2")"
+    "$(scope_entry mika-platform)" "$(cat "$E2")"
 assert_eq "the registry directory is 0700" "700" "$(stat -c '%a' "$R1")"
 assert_eq "each entry is 0600" "600" "$(stat -c '%a' "$E1")"
 
@@ -196,8 +217,8 @@ assert_eq "bwrap was really called (the capture is not stale)" "0" "$([ -s "$CAP
 # spawn path declares one", CASE 8 owns "and it goes away".
 assert_eq "the spawn declared its perimeter, in the sandbox's own window" "1" "$(cat "$SPAWN_ENTRY_COUNT")"
 assert_match "the launcher held its nonce while the sandbox ran" "$NONCE_RE" "$(cat "$SPAWN_ENTRY_NAME")"
-assert_eq "and it names the dispatch repository" \
-    "repo=senara-solutions/mika" "$(cat "$SPAWN_ENTRY_BODY")"
+assert_eq "and it names the dispatch repository AND its branch" \
+    "$(scope_entry mika)" "$(cat "$SPAWN_ENTRY_BODY")"
 # Host-only state. Were the registry bind-mounted or its path exported, an
 # in-sandbox process could widen its own perimeter and the tightening would
 # attest the forgery. `~/.mika` is not among `_pilot_gitdir_bind_args` — this
@@ -289,8 +310,8 @@ _PILOT_EGRESS_PUSH_SCOPE_DIR="$R6"
 REPO="mika"
 MIKA_PILOT_EGRESS_PUSH_SCOPE=0 _stage_pilot_egress_push_scope
 assert_eq "switch off: the launcher declares the perimeter anyway" "1" "$(entries_in "$R6")"
-assert_eq "switch off: and declares it unchanged" \
-    "repo=senara-solutions/mika" "$(cat "$R6/$_PILOT_EGRESS_PUSH_SCOPE_ENTRY")"
+assert_eq "switch off: and declares it unchanged, both dimensions" \
+    "$(scope_entry mika)" "$(cat "$R6/$_PILOT_EGRESS_PUSH_SCOPE_ENTRY")"
 # The structural half of the same statement: the name may appear in the prose
 # that explains the single-reader decision, and nowhere else. A `case` on it, a
 # `${MIKA_PILOT_EGRESS_PUSH_SCOPE:-1}`, an `export` — any of those is a second
@@ -324,7 +345,7 @@ rc=0; [ -d "$R7_DEFAULT" ] || rc=1
 assert_eq "no override: it lands under the CURRENT \$HOME, not a frozen one" "0" "$rc"
 assert_eq "no override: exactly that one declaration is there" "1" "$(entries_in "$R7_DEFAULT")"
 assert_eq "no override: and it is this declaration, under this HOME" \
-    "repo=senara-solutions/mika" "$(cat "$R7_DEFAULT/$_PILOT_EGRESS_PUSH_SCOPE_ENTRY")"
+    "$(scope_entry mika)" "$(cat "$R7_DEFAULT/$_PILOT_EGRESS_PUSH_SCOPE_ENTRY")"
 
 echo ""
 echo "CASE 8 — the entry dies with its spawn, and the nonce is dropped with it"
@@ -358,17 +379,25 @@ echo ""
 echo "CASE 9 — a LIVE neighbour's perimeter survives: only its own entry goes"
 echo "-----------------------------------------------------------------------"
 # THE CASE THAT MAKES THE UNION SEMANTICS SAFE, and the reason this is not a
-# sweep. `_push_scope_verdict` degrades only when the whole registry is empty or
-# unreadable, never per entry: a dispatch that cleared its neighbour's perimeter
-# would leave the registry non-empty, so the victim's legitimate push would land
-# on `push-scope-repo` — a 403 on an innocent live pilot, the one failure mode
-# able to stop the loop.
+# sweep. `_push_scope_verdict` never degrades because a particular entry is
+# missing — it degrades when the registry as a whole is empty or unreadable, or
+# when the couples the repository selected declare no branch at all. A dispatch
+# that cleared its neighbour's perimeter would leave the registry non-empty and
+# the surviving couples naming another repository, so the victim's legitimate
+# push would land on `push-scope-repo` — a 403 on an innocent live pilot, the
+# one failure mode able to stop the loop.
 R9=$(registry_for case9)
 _PILOT_EGRESS_PUSH_SCOPE_DIR="$R9"
 REPO="mika-platform"
+# The neighbour carries ITS OWN branch, since mika#2776: a producer that rebuilt
+# an entry from the CURRENT spawn's variables while passing by would be visible
+# here and nowhere else.
+BRANCH="fix/9999/un-autre-ticket"
 _stage_pilot_egress_push_scope
 NEIGHBOUR="$_PILOT_EGRESS_PUSH_SCOPE_ENTRY"
+NEIGHBOUR_BODY="$(scope_entry mika-platform)"
 REPO="mika"
+BRANCH="$NOMINAL_BRANCH"
 _stage_pilot_egress_push_scope
 MINE="$_PILOT_EGRESS_PUSH_SCOPE_ENTRY"
 assert_eq "precondition: two concurrent perimeters are declared" "2" "$(entries_in "$R9")"
@@ -378,8 +407,8 @@ rc=0; [ -e "$R9/$MINE" ] && rc=1
 assert_eq "and it is MINE" "0" "$rc"
 rc=0; [ -e "$R9/$NEIGHBOUR" ] || rc=1
 assert_eq "the live neighbour's entry is untouched" "0" "$rc"
-assert_eq "its content too — nothing was rewritten in passing" \
-    "repo=senara-solutions/mika-platform" "$(cat "$R9/$NEIGHBOUR")"
+assert_eq "its content too — its own branch, nothing rewritten in passing" \
+    "$NEIGHBOUR_BODY" "$(cat "$R9/$NEIGHBOUR")"
 
 echo ""
 echo "CASE 10 — two successive spawns leak NOTHING, measured on the real path"
@@ -475,14 +504,116 @@ rc=0; [ -d "$R12" ] || rc=1
 assert_eq "the registry directory is still there" "0" "$rc"
 
 echo ""
+echo "CASE 13 — the BRANCH dimension is declared, coupled into the same entry"
+echo "-----------------------------------------------------------------------"
+# mika#2776. The reader unions the live entries BY ENTRY, reading each as the
+# couple (repository, branch), so the two dimensions of ONE spawn must land in
+# ONE entry: split across two, the reader would authorise the cross product —
+# this spawn's repository with the neighbour's branch — which is the very
+# scenario the ticket is about. That coupling is asserted here and nowhere else;
+# the reader suite writes its own fixtures and is blind to it.
+R13=$(registry_for case13)
+_PILOT_EGRESS_PUSH_SCOPE_DIR="$R13"
+REPO="mika"
+# Mixed case on purpose: git refs ARE case-sensitive, so the reader compares
+# them exactly (unlike `repo=`, which it lowercases because GitHub is
+# case-insensitive on `owner/repo`). A producer that lowercased here would
+# refuse every push of a dispatch whose branch carries a capital.
+BRANCH="feat/2776/Dimension-Branche"
+_stage_pilot_egress_push_scope
+rc13=$?
+N13="$_PILOT_EGRESS_PUSH_SCOPE_ENTRY"
+E13="$R13/$N13"
+assert_eq "the staging returns 0" "0" "$rc13"
+assert_eq "both dimensions live in ONE entry, not two" "1" "$(entries_in "$R13")"
+assert_eq "the entry carries exactly two lines" "2" "$(lines_in "$E13")"
+assert_eq "line 1 is the repository dimension" \
+    "repo=senara-solutions/mika" "$(sed -n 1p "$E13")"
+assert_eq "line 2 is the branch dimension, fully qualified" \
+    "ref=refs/heads/feat/2776/Dimension-Branche" "$(sed -n 2p "$E13")"
+assert_eq "the branch name keeps its case — lowercasing it would be a loosening" \
+    "$(scope_entry mika)" "$(cat "$E13")"
+rc=0; grep -q 'refs/heads/refs/' "$E13" && rc=1
+assert_eq "no doubled refs/heads/ prefix" "0" "$rc"
+rc=0; grep -q 'ref=.*\.git' "$E13" && rc=1
+assert_eq "no .git on the ref either" "0" "$rc"
+BRANCH="$NOMINAL_BRANCH"
+
+echo ""
+echo "CASE 14 — no branch, or a branch that is not a branch name: the line is not written"
+echo "-----------------------------------------------------------------------------------"
+# TWO CAUSES, TWO SENTENCES, and in both the entry stays VALID with `repo=`
+# alone — the reader degrades on `scope-ref-absent` rather than refusing
+# (`test_egress_push_bound.sh` CASE 25). An empty-valued `ref=` would be
+# strictly worse than its absence: the reader would see a declared branch,
+# compare every push against the empty string, and 403 all of them.
+R14=$(registry_for case14)
+_PILOT_EGRESS_PUSH_SCOPE_DIR="$R14"
+REPO="mika"
+BRANCH=""
+ERR14="$TMPROOT/case14.stderr"
+_stage_pilot_egress_push_scope 2>"$ERR14"
+rc14=$?
+N14="$_PILOT_EGRESS_PUSH_SCOPE_ENTRY"
+assert_eq "empty BRANCH: the staging still returns 0 (dispatch continues)" "0" "$rc14"
+assert_match "empty BRANCH: the entry is declared all the same" "$NONCE_RE" "$N14"
+assert_eq "empty BRANCH: it carries the repository line, and only it" \
+    "repo=senara-solutions/mika" "$(cat "$R14/$N14")"
+assert_eq "empty BRANCH: one line — no empty-valued ref= was written" "1" "$(lines_in "$R14/$N14")"
+err14=$(cat "$ERR14")
+assert_contains "empty BRANCH: stderr names what is missing" "no dispatch branch in scope" "$err14"
+assert_contains "empty BRANCH: stderr names the dimension that is lost" "branch dimension does not apply" "$err14"
+assert_contains "empty BRANCH: stderr names the ticket" "mika#2776" "$err14"
+# AND THE REPOSITORY DIMENSION IS UNHARMED: a degradation on one dimension must
+# not cost the other, or free-text dispatch would silently lose the tightening
+# mika#2751 already paid for.
+rc=0; grep -q '^repo=senara-solutions/mika$' "$R14/$N14" || rc=1
+assert_eq "empty BRANCH: the repository dimension still bites" "0" "$rc"
+
+# THE CONTAINMENT HALF, and the reason the shape is checked before the write
+# rather than trusted. `BRANCH` is derived from an issue title; a newline in it
+# would inject a second line into the entry, and a `repo=` line injected that
+# way WIDENS the perimeter this function exists to narrow. The measurement is on
+# the entry's LINE COUNT, because that is what an injection changes.
+R14B=$(registry_for case14b)
+_PILOT_EGRESS_PUSH_SCOPE_DIR="$R14B"
+BRANCH=$'feat/2776/ok\nrepo=senara-solutions/mika-cloud'
+ERR14B="$TMPROOT/case14b.stderr"
+_stage_pilot_egress_push_scope 2>"$ERR14B"
+N14B="$_PILOT_EGRESS_PUSH_SCOPE_ENTRY"
+assert_eq "hostile BRANCH: the entry carries ONE line — nothing was injected" "1" "$(lines_in "$R14B/$N14B")"
+assert_eq "hostile BRANCH: and it declares exactly one repository" "1" \
+    "$(grep -c '^repo=' "$R14B/$N14B")"
+assert_eq "hostile BRANCH: the smuggled repository is nowhere in the entry" "0" \
+    "$(grep -c 'mika-cloud' "$R14B/$N14B")"
+assert_contains "hostile BRANCH: stderr says the name is not a branch name" \
+    "not a plain branch name" "$(cat "$ERR14B")"
+# A `refs/` prefix is its own sentence: the value is plausibly shaped, it is
+# just already qualified, and `refs/heads/refs/heads/x` would silently never
+# match. Not a security statement — a legibility one (class mika#2205).
+R14C=$(registry_for case14c)
+_PILOT_EGRESS_PUSH_SCOPE_DIR="$R14C"
+BRANCH="refs/heads/feat/2776/deja-qualifie"
+ERR14C="$TMPROOT/case14c.stderr"
+_stage_pilot_egress_push_scope 2>"$ERR14C"
+N14C="$_PILOT_EGRESS_PUSH_SCOPE_ENTRY"
+assert_eq "refs/ prefix: no ref= line, the repository line alone" \
+    "repo=senara-solutions/mika" "$(cat "$R14C/$N14C")"
+assert_contains "refs/ prefix: stderr names THAT cause, not the other two" \
+    "already carries a refs/ prefix" "$(cat "$ERR14C")"
+rc=0; [ "$(cat "$ERR14C")" = "$(cat "$ERR14")" ] && rc=1
+assert_eq "the three branch degradations do not arrive in the same bytes" "0" "$rc"
+BRANCH="$NOMINAL_BRANCH"
+
+echo ""
 echo "===================================================="
 echo "Results: $PASS passed, $FAIL failed"
 echo "===================================================="
 # Anti-vacuity floor: the suite must really carry its cases. A `source` that
 # dies early, a stub that swallows a case, or a producer renamed out from under
 # the file would otherwise print "0 passed, 0 failed" and exit 0.
-if [ "$PASS" -lt 68 ]; then
-    echo "FAIL: only $PASS assertions ran — the suite lost cases (floor: 68)"
+if [ "$PASS" -lt 95 ]; then
+    echo "FAIL: only $PASS assertions ran — the suite lost cases (floor: 95)"
     exit 1
 fi
 [ "$FAIL" -eq 0 ] || exit 1
