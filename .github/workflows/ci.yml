@@ -597,6 +597,8 @@ jobs:
         run: bash scripts/verify-egress-no-log.sh
       - name: Pin the egress no-log guard's negative behaviour (mika#2054)
         run: bash scripts/test-verify-egress-no-log.sh
+      - name: Pin the egress audit's declared search_* event list (mika#2788)
+        run: bash scripts/test-audit-egress-no-log.sh
 
   egress-manifest-lint:
     name: Egress Manifest Lint
