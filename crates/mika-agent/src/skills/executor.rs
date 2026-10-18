@@ -2247,6 +2247,17 @@ pub(crate) const GROOM_ANCHOR_BRAKE_ERROR: &str = "dispatch_groom_anchor_brake";
 /// Un seul site l'écrit : ce module, dans [`validate_dispatch_readiness`].
 pub(crate) const GROOM_ANCHOR_BRAKE_EVENT: &str = "groom_anchor_withheld_brake";
 
+/// `audit_events.tool_name` de la **levée** du frein mika#2786 : une demande
+/// explicite de l'opérateur qui traverse un frein armé. Un seul site l'écrit.
+///
+/// La ligne n'est pas qu'une trace : c'est la **borne** de la série. Le frein ne
+/// compte que les retenues postérieures à la dernière levée du ticket. Sans elle,
+/// la levée ne survivrait pas à la file différée : quand la place de groom est
+/// prise, le dispatch demandé est garé en lanceur différé, et son rejeu part d'un
+/// tour silencieux sans `originating_message` (`SilentTrigger::DeferredDispatch`),
+/// qui relirait les mêmes retenues.
+pub(crate) const GROOM_ANCHOR_BRAKE_LIFTED_EVENT: &str = "groom_anchor_brake_lifted";
+
 /// Levier opérateur : le nombre de retenues consécutives au-delà duquel le frein
 /// mord. `0` désarme, comme `MIKA_AUTO_PULL_MAX_REDRIVES`.
 pub(crate) const GROOM_ANCHOR_BRAKE_ENV: &str = "MIKA_GROOM_ANCHOR_BRAKE_MAX";
@@ -2298,7 +2309,9 @@ pub(crate) fn parse_groom_anchor_brake_max(raw: Option<&str>) -> usize {
 ///   différé (« deferred dispatch slot freed ») en est le cas mesuré, posé entre
 ///   deux retenues de mika#2762 à 18:20:02Z. Le compter comme une rupture aurait
 ///   lu une série de 2 là où il y en avait 3 — c'est la même ligne qui, en tête de
-///   requête, a caché l'ESCALATE au gate mika#2545.
+///   requête, a caché l'ESCALATE au gate mika#2545 (mika#2795). Le lecteur en
+///   base exclut désormais ces lanceurs à la source ; la règle reste ici pour
+///   toute autre ligne sans verdict.
 ///
 /// Les deux prédicats sont ancrés en début de ligne : la prose d'un pilote peut
 /// citer le marqueur au milieu d'une phrase (motif mika#2050).
@@ -2317,6 +2330,27 @@ pub(crate) fn anchor_withheld_streak(results: &[Option<String>]) -> usize {
         }
     }
     streak
+}
+
+/// Les `result` des callbacks de groom postérieurs à la dernière levée du frein
+/// (mika#2786), du plus récent au plus ancien. `rows` vient de
+/// [`AsyncDatabase::recent_groom_results_for_issue`], `lifted_at` de la dernière
+/// ligne [`GROOM_ANCHOR_BRAKE_LIFTED_EVENT`] du ticket.
+///
+/// Comparaison **stricte**, à la seconde (format ISO fixe, donc l'ordre
+/// lexicographique est chronologique). Le callback du dispatch levé naît dans le
+/// même appel d'outil que la ligne de levée, donc souvent dans la même seconde :
+/// il n'est pas compté, et une nouvelle série après une levée demande une
+/// retenue de plus. Le sens inverse (`>=`) compterait une retenue antérieure
+/// écrite dans la même seconde que la levée, et la levée ne lèverait rien.
+pub(crate) fn groom_results_since_lift(
+    rows: Vec<(String, Option<String>)>,
+    lifted_at: Option<&str>,
+) -> Vec<Option<String>> {
+    rows.into_iter()
+        .take_while(|(at, _)| lifted_at.is_none_or(|lift| at.as_str() > lift))
+        .map(|(_, result)| result)
+        .collect()
 }
 
 /// The grooming gate, from the issue body to the verdict (mika#2310 D1).
@@ -3561,11 +3595,25 @@ pub(crate) async fn validate_dispatch_readiness(
             .is_some_and(|m| crate::webhook_dispatch::is_grooming_intent_message(&m));
         let max =
             parse_groom_anchor_brake_max(std::env::var(GROOM_ANCHOR_BRAKE_ENV).ok().as_deref());
-        if !requested && max > 0 {
+        if max > 0 {
             let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
             let issue_url = format!("https://github.com/{owner_repo}/issues/{number}");
-            // Neutral rows do not count toward the limit, so read a margin past it.
-            match db.recent_groom_results_for_issue(&issue_url, max * 4).await {
+            let target_key = format!("{owner_repo}#{number}");
+            // The series is bounded by the last lift: withholdings older than an
+            // operator's explicit `groom` no longer count. Neutral rows do not
+            // count toward the limit, so read a margin past it.
+            let history = async {
+                let lifted_at = db
+                    .latest_audit_event_for_target(GROOM_ANCHOR_BRAKE_LIFTED_EVENT, &target_key, "")
+                    .await?
+                    .map(|(_, _, created_at)| created_at);
+                let rows = db
+                    .recent_groom_results_for_issue(&issue_url, max.saturating_mul(2))
+                    .await?;
+                anyhow::Ok(groom_results_since_lift(rows, lifted_at.as_deref()))
+            }
+            .await;
+            match history {
                 Err(e) => warn!(
                     event = "groom_anchor_brake_unreadable",
                     task_id = task_id,
@@ -3576,7 +3624,37 @@ pub(crate) async fn validate_dispatch_readiness(
                 ),
                 Ok(results) => {
                     let streak = anchor_withheld_streak(&results);
-                    if streak >= max {
+                    if streak >= max && requested {
+                        // The lift, written where it happens, so that the deferred
+                        // replay of this very dispatch finds it.
+                        info!(
+                            event = GROOM_ANCHOR_BRAKE_LIFTED_EVENT,
+                            task_id = task_id,
+                            repo = %owner_repo,
+                            issue = number,
+                            withheld_in_a_row = streak,
+                            "tool-boundary: anchor brake lifted by an explicit groom request (mika#2786)"
+                        );
+                        if let Err(e) = db
+                            .log_audit_event(
+                                task_id,
+                                GROOM_ANCHOR_BRAKE_LIFTED_EVENT,
+                                &target_key,
+                                None,
+                                Some(&streak.to_string()),
+                                Some(&format!("issue={target_key} withheld_in_a_row={streak}")),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(
+                                event = "groom_anchor_brake_lift_audit_failed",
+                                error = %e,
+                                "failed to write the mika#2786 lift row; a deferred replay of \
+                                 this dispatch will be braked again (non-fatal)"
+                            );
+                        }
+                    } else if streak >= max {
                         let rejection = serde_json::json!({
                             "error": GROOM_ANCHOR_BRAKE_ERROR,
                             "task_id": task_id,
@@ -3607,7 +3685,7 @@ pub(crate) async fn validate_dispatch_readiness(
                             .log_audit_event(
                                 task_id,
                                 GROOM_ANCHOR_BRAKE_EVENT,
-                                &format!("{owner_repo}#{number}"),
+                                &target_key,
                                 None,
                                 Some(&streak.to_string()),
                                 Some(&format!(
@@ -13315,7 +13393,7 @@ Harness ticket.
         }
 
         /// **Contrôle négatif de la levée.** La demande explicite de l'opérateur
-        /// traverse le frein.
+        /// traverse le frein, et la levée est écrite.
         #[tokio::test]
         async fn mika2786_an_operator_groom_request_lifts_the_brake() {
             let (db, parent_id) = seeded(WITHHELD, 3);
@@ -13323,6 +13401,68 @@ Harness ticket.
                 assert!(!rejection.contains(GROOM_ANCHOR_BRAKE_ERROR), "{rejection}");
             }
             assert_eq!(audit_rows(&db).await, 0);
+            assert_eq!(
+                db.count_audit_events_by_tool_name(GROOM_ANCHOR_BRAKE_LIFTED_EVENT)
+                    .await
+                    .unwrap(),
+                1,
+                "la levée laisse sa trace, qui borne la série"
+            );
+        }
+
+        /// La forme que la revue a trouvée : la demande est garée en lanceur
+        /// différé parce que la place est prise, et son rejeu part d'un tour
+        /// silencieux **sans** `originating_message`. La levée doit y survivre.
+        #[tokio::test]
+        async fn mika2786_the_lift_survives_the_deferred_replay() {
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            let _ = dispatch(&db, &parent_id, Some("groom mika issue#123")).await;
+            if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                assert!(
+                    !rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                    "le rejeu différé d'une demande levée ne doit pas être freiné : {rejection}"
+                );
+            }
+            assert_eq!(audit_rows(&db).await, 0);
+        }
+
+        // --- La borne de levée ------------------------------------------------------
+
+        fn row(at: &str, result: &str) -> (String, Option<String>) {
+            (at.to_string(), Some(result.to_string()))
+        }
+
+        #[test]
+        fn mika2786_withholdings_before_the_lift_no_longer_count() {
+            let rows = vec![
+                row("2026-10-18T19:30:00Z", WITHHELD),
+                row("2026-10-18T19:00:00Z", WITHHELD),
+                row("2026-10-18T18:30:00Z", WITHHELD),
+            ];
+            let kept = groom_results_since_lift(rows, Some("2026-10-18T19:10:00Z"));
+            assert_eq!(anchor_withheld_streak(&kept), 1);
+        }
+
+        /// Une nouvelle série après la levée freine de nouveau.
+        #[test]
+        fn mika2786_a_new_series_after_the_lift_brakes_again() {
+            let rows = vec![
+                row("2026-10-18T21:00:00Z", WITHHELD),
+                row("2026-10-18T20:30:00Z", WITHHELD),
+                row("2026-10-18T20:00:00Z", WITHHELD),
+                row("2026-10-18T18:30:00Z", WITHHELD),
+            ];
+            let kept = groom_results_since_lift(rows, Some("2026-10-18T19:10:00Z"));
+            assert_eq!(anchor_withheld_streak(&kept), 3);
+        }
+
+        #[test]
+        fn mika2786_without_a_lift_every_row_counts() {
+            let rows = vec![
+                row("2026-10-18T19:00:00Z", WITHHELD),
+                row("2026-10-18T18:00:00Z", WITHHELD),
+            ];
+            assert_eq!(groom_results_since_lift(rows, None).len(), 2);
         }
     }
 

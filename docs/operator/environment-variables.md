@@ -6922,6 +6922,17 @@ groom **automatique** de ce ticket est refusé à la frontière d'outil
   intention de grooming explicite traverse le frein. **Reposer `ready` ne le lève
   pas**, parce que le moteur ne distingue pas le `ready` de l'opérateur de celui
   que mika-dev repose. Un groom qui converge remet la série à zéro.
+- **La levée est écrite, et elle borne la série.** Une demande explicite qui
+  traverse un frein armé écrit une ligne `groom_anchor_brake_lifted` (INFO + audit,
+  `target_key` = `owner/repo#n`). Le frein ne compte ensuite que les retenues
+  postérieures à la dernière levée. C'est ce qui fait survivre la levée à la file
+  différée : si la place de groom est prise, la demande est garée en lanceur
+  différé, et son rejeu part d'un tour silencieux sans message d'origine. Une
+  nouvelle série de trois retenues après la levée freine de nouveau.
+- **La levée est large au tour.** Elle porte sur le tour qui contient la demande,
+  pas sur le ticket qu'elle nomme : un `groom mika#100` dont le tour dispatche un
+  groom de mika#2762 lève le frein de mika#2762. C'est le même choix que
+  mika#2484, et la ligne de levée nomme le ticket réellement levé.
 - **Ce que le frein ne fait pas.** Il ne pose ni label ni commentaire. Le ticket
   garde `ready`, la Phase 2 le re-drive, chaque re-drive est refusé sans pilote, et
   le budget de mika#2020 finit par le garer derrière `operator-review` avec un
@@ -6934,6 +6945,7 @@ groom **automatique** de ce ticket est refusé à la frontière d'outil
 | `groom_anchor_withheld_brake` (journal) | WARN | un dispatch de groom refusé ; champs `issue`, `withheld_in_a_row`, `max` |
 | `audit_events.tool_name = 'groom_anchor_withheld_brake'` | — | même population ; `target_key` = `owner/repo#n`, `after_value` = la série |
 | `dispatch_groom_anchor_brake` dans `tasks.result` | — | le JSON de refus rendu au modèle |
+| `groom_anchor_brake_lifted` (journal + audit) | INFO | une levée par l'opérateur ; `after_value` = la série levée |
 
 Sonde : `SELECT target_key, count(*) FROM audit_events WHERE tool_name =
 'groom_anchor_withheld_brake' GROUP BY 1;`. Avant `make deploy`, son silence veut

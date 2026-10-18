@@ -4432,40 +4432,45 @@ impl Database {
         Ok(row)
     }
 
-    /// The `result` of the `limit` most recent terminal groom callbacks for an
-    /// issue, newest first (mika#2786).
+    /// `(created_at, result)` of the `limit` most recent terminal groom callbacks
+    /// for an issue, newest first (mika#2786).
     ///
-    /// Same join, same filter and same order as
-    /// [`Self::latest_groom_verdict_for_issue`], deliberately: the anchor brake
-    /// and the mika#2545 gate must agree on what "the groom callbacks of this
-    /// ticket" are. What differs is the depth. mika#2545 reads one row; the brake
-    /// needs the run of rows behind it, because a deferred launcher
-    /// (`long_running:run_claude_pilot:deferred`, "deferred dispatch slot freed")
-    /// is a groom callback too and lands on top of the verdict it follows —
-    /// measured on mika#2762, 2026-10-18 18:20:02Z. The grammar of each row is
-    /// the caller's business; this returns the column verbatim.
+    /// Same join and same order as [`Self::latest_groom_verdict_for_issue`], so
+    /// the anchor brake and the mika#2545 gate agree on what "the groom
+    /// callbacks of this ticket" are, with **one deliberate difference**: deferred
+    /// launchers (`long_running:run_claude_pilot:deferred`, result "deferred
+    /// dispatch slot freed") are left out at the source. They are groom callbacks
+    /// that carry no verdict, and a parent can pile up ten of them
+    /// (`dispatcher.rs`, mika#861/#1124): read in a fixed window of rows, they
+    /// would push the withholdings the brake counts out of the window. One of
+    /// them sat on top of an ESCALATE on mika#2762, 2026-10-18 18:20:02Z. The
+    /// grammar of each `result` is the caller's business; it comes back verbatim.
     pub fn recent_groom_results_for_issue(
         &self,
         agent_id: &str,
         issue_url: &str,
         limit: usize,
-    ) -> Result<Vec<Option<String>>> {
+    ) -> Result<Vec<(String, Option<String>)>> {
         let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
         let mut stmt = self.conn.prepare(
-            "SELECT child.result FROM tasks child
+            "SELECT child.created_at, child.result FROM tasks child
              JOIN tasks parent ON child.parent_task_id = parent.id
              WHERE child.agent_id = ?1
                AND child.trigger_type = 'callback'
                AND child.dispatch_class = 'groom'
                AND child.status IN ('completed', 'delivered')
+               AND child.label NOT LIKE '%:deferred%'
                AND parent.reference_url IN (?2, ?3)
              ORDER BY child.created_at DESC, child.id DESC
              LIMIT ?4",
         )?;
+        // A negative LIMIT is "no limit" to SQLite; never let a huge `usize`
+        // wrap into one.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = stmt
             .query_map(
-                params![agent_id, exact_url, legacy_groom_url, limit as i64],
-                |row| row.get::<_, Option<String>>(0),
+                params![agent_id, exact_url, legacy_groom_url, limit],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)

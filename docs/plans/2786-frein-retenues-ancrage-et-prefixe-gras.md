@@ -95,6 +95,13 @@ qui n'est pas une demande explicite de l'opérateur est refusé, sur une ligne n
 - **Fail-open sur base illisible**, avec une ligne WARN nommée. Le frein borne une
   dépense ; ce n'est pas un gate de sûreté. Un terme qu'on ne peut pas lire n'est
   pas satisfait (motif mika#2277), donc il ne mord pas.
+- **La levée est écrite et borne la série** (ajout de la revue). Une demande
+  explicite qui traverse un frein armé écrit `groom_anchor_brake_lifted` ; le frein
+  ne compte que les retenues postérieures à la dernière levée. Sans cela, la levée
+  se perdrait dans la file différée : le rejeu d'un dispatch garé part d'un tour
+  silencieux sans `originating_message`. Les lanceurs différés sont exclus du
+  lecteur à la source, pour qu'une pile de wrappers ne pousse pas les retenues
+  hors de la fenêtre lue.
 - **Pas de label, pas de commentaire posé par ce gate.** Le ticket garde `ready` ; la
   Phase 2 continue de le re-driver, chaque re-drive est refusé ici sans pilote, et au
   troisième le budget de mika#2020 l'abandonne avec `operator-review`, `ready` retiré

@@ -1653,7 +1653,16 @@ fn mika2786_recent_groom_results_are_newest_first_and_bounded() {
         .unwrap();
     assert_eq!(
         rows,
-        vec![Some("newest".to_string()), Some("middle".to_string())]
+        vec![
+            (
+                "2026-10-18T18:20:00Z".to_string(),
+                Some("newest".to_string())
+            ),
+            (
+                "2026-10-18T18:10:00Z".to_string(),
+                Some("middle".to_string())
+            ),
+        ]
     );
     let all = db
         .recent_groom_results_for_issue("mika", GROOM_ISSUE_URL, 10)
@@ -1663,4 +1672,39 @@ fn mika2786_recent_groom_results_are_newest_first_and_bounded() {
         3,
         "le ticket voisin est hors de la série : {all:?}"
     );
+}
+
+/// Les lanceurs différés sont exclus à la source : sans cela, une pile de dix
+/// wrappers pousse les retenues hors d'une fenêtre de lignes (revue mika#2786).
+#[test]
+fn mika2786_deferred_launchers_are_left_out_of_the_series() {
+    let db = db();
+    let (parent_id, verdict) =
+        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    set_created_at(&db, &verdict, "2026-10-18T18:00:00Z");
+    let mut deferred = groom_callback("mika", &parent_id, "groom");
+    deferred.label = "long_running:run_claude_pilot:deferred".to_string();
+    let id = db.create_task(&deferred).unwrap();
+    assert!(
+        db.update_task_completed(&id, "mika", Some("deferred dispatch slot freed"))
+            .unwrap()
+    );
+    set_created_at(&db, &id, "2026-10-18T18:20:00Z");
+
+    let rows = db
+        .recent_groom_results_for_issue("mika", GROOM_ISSUE_URL, 10)
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some(GROOM_CALLBACK_PLAN_GROOMED));
+}
+
+/// Une limite démesurée ne devient pas un `LIMIT` négatif (« pas de limite »).
+#[test]
+fn mika2786_a_huge_limit_does_not_wrap() {
+    let db = db();
+    completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    let rows = db
+        .recent_groom_results_for_issue("mika", GROOM_ISSUE_URL, usize::MAX)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }
