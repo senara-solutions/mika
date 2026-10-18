@@ -98,7 +98,7 @@ Un **suffixe**, pas la constante exacte, parce que le producteur du label est su
 de se spécialiser par classe (`…_groom:deferred`) et qu'un lanceur différé d'un autre nom
 rouvrirait le trou en silence. Le lien entre les deux est **asserté**, pas espéré — dans un
 `#[test]`, sibling de `test_deferred_dispatch_label_string_drift_guard` (mika#1124,
-`dispatcher.rs:7380`) et posé à côté de lui :
+`dispatcher.rs:7385`) et posé à côté de lui :
 
 ```rust
 /// Garde de dérive mika#2762 : la constante exacte doit rester couverte par le
@@ -118,6 +118,28 @@ Un `#[test]` et non un `const { assert!(…) }` : `str::ends_with` n'est pas une
 donc la vérification ne peut pas être au build. Le suffixe est **dérivé** du motif
 (`trim_start_matches('%')`) plutôt que retapé, sinon la garde elle-même peut dériver du
 prédicat qu'elle protège et rester verte sur une valeur périmée.
+
+#### Pourquoi un `LIKE` ici alors que ses cinq voisines du même fichier matchent par égalité
+
+`db/tasks.rs` référence **déjà** `DEFERRED_DISPATCH_LABEL` à cinq endroits (lignes 1934,
+1975, 2732, 2831, 2927) et tous les cinq écrivent `label = ?` avec la constante **exacte**.
+Ce vol introduit la première forme `LIKE` du fichier. L'asymétrie est délibérée et porte sur
+la **direction** du prédicat, pas sur un goût :
+
+- Les cinq voisines **ciblent** le lanceur différé — elles le cherchent pour agir sur lui
+  (le marquer, le compter vivant, en trouver un suivant). Un label spécialisé qui échappe à
+  leur égalité les rend **inertes** : elles ne trouvent rien et ne font rien. Un faux négatif
+  y est un non-événement.
+- Le reaper l'**exclut** — il le reconnaît pour ne *pas* le compter comme ancre. Un label
+  spécialisé qui échappe à son prédicat est **promu ancre de grâce** et détruit un vol de
+  groom. Un faux négatif y est exactement le défaut de ce ticket.
+
+Un prédicat qui cible peut rater sans dommage ; un prédicat qui protège ne doit pas. D'où
+l'égalité d'un côté et le suffixe de l'autre. Ne pas « harmoniser » les cinq voisines sur le
+`LIKE` au passage : hors périmètre (§ 7), et leur égalité exacte est correcte pour ce
+qu'elles font. La garde de dérive ci-dessus est précisément ce qui tient les deux formes
+ensemble : le jour où le label se spécialise, elle rougit au lieu de laisser le trou se
+rouvrir en silence.
 
 ### D2 — `find_orphaned_parent_tasks` : ancrage sur `MAX`, lanceurs différés exclus
 
@@ -173,9 +195,16 @@ Le doc-comment de `find_orphaned_parent_tasks` porte un **contrat explicite** :
 > sibling guard, **grace window**) MUST be applied symmetrically there.
 
 La fenêtre de grâce change : `find_completable_parent_tasks_on_pr_url` (`tasks.rs:2437`)
-reçoit donc le **même** `NOT LIKE` et le **même** `HAVING MAX(...)`, à l'identique. La
-classe y reste littérale (`'implement'`) — c'est la seule asymétrie déclarée de la paire, et
-elle ne bouge pas.
+reçoit donc le **même** `NOT LIKE` et le **même** `HAVING MAX(...)`, à l'identique — c'est
+bien sa clause `WHERE child.updated_at < …` (ligne 2457) qui **disparaît**, pas un `HAVING`
+qui s'y ajoute. La classe y reste littérale (`'implement'`) — c'est la seule asymétrie
+déclarée de la paire, et elle ne bouge pas.
+
+**Ce qui ne la traverse pas :** `CompletableParentTask` ne reçoit **pas** de champ
+`last_callback_at`. La symétrie du contrat porte sur les **filtres**, pas sur la forme de
+sortie, et le champ n'existe en D2 que pour alimenter la ligne `task_engine_reaper.evaluated`
+(D4.4) — la voie de succès n'a pas d'équivalent à instrumenter. Ajouter le champ ici serait
+un `SELECT` mort. Le dire, sinon l'implémenteur l'ajoute par symétrie réflexe.
 
 Effet sur cette voie : un parent portant un `pr_url` dont le dernier callback implement
 non-differé vient de livrer est complété un tour plus tard. Un **retard**, pas une perte ;
@@ -303,6 +332,10 @@ ticket.
   qu'une implémentation tient la place demande un critère d'artefact de groom (« les
   callouts sont écrits ») que `tasks` ne porte pas : un livrable d'une autre nature.
   Recommandé en ticket séparé ; ce vol le laisse en l'état documenté, où il ne détruit rien.
+- **Les cinq sites `label = DEFERRED_DISPATCH_LABEL` de `db/tasks.rs`** (1934, 1975, 2732,
+  2831, 2927) ne sont **pas** convertis au motif `LIKE`. Leur égalité exacte est correcte
+  pour un prédicat qui *cible* le lanceur différé ; la raison complète est au § 3/D1.
+  Les toucher élargirait le vol sans fermer quoi que ce soit.
 - **`REAPER_GRACE_SECONDS`** (600 s) n'est pas touché. Le défaut est l'ancre, pas la durée ;
   rallonger la grâce masquerait le symptôme sans corriger le prédicat.
 - **Les deux autres balayages** (`find_childless_parent_tasks` mika#1687,
