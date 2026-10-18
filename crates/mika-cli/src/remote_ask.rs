@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use mika_a2a::client::{A2aClient, RECOVERY_TIMEOUT};
+use mika_a2a::client::{A2aClient, RECOVERY_TIMEOUT, resolve_send_timeout_with_floor};
 use mika_a2a::error::TransportFailure;
 pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
@@ -473,7 +473,17 @@ pub async fn send_message_to_agent(
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
-    let client = A2aClient::new(url, auth_token.clone());
+    // The send budget is resolved *here*, not in `A2aClient::new`, because the
+    // agent is only knowable from the URL (mika#2759). A local target's spirit
+    // attests the per-agent envelope of mika#2189; anything else attests
+    // nothing, and `resolve_send_timeout_with_floor(None)` is byte-for-byte the
+    // budget `A2aClient::new` would have resolved.
+    let floor = crate::budget_floor::attested_envelope_secs(url, auth_token.as_deref()).await;
+    let client = A2aClient::with_timeout(
+        url,
+        auth_token.clone(),
+        resolve_send_timeout_with_floor(floor),
+    );
 
     // The caller's own handle on this exchange. Minted before the send so it
     // survives the send failing: the task id is server-side and comes back only

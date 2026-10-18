@@ -257,6 +257,67 @@ untouched — a follow-up ticket, with a measurement as its precondition.
 
 **Remote mode (R1 ascension architecture, 2026-06-09):** `--remote <URL>` or `MIKA_REMOTE_AGENT_URL` env (flag wins) puts `mika ask` in remote mode — the in-process agent loop is bypassed and the prompt is dispatched to a cloud Mika agent via the gateway's A2A proxy (e.g., `https://gw.example.com/a2a/{customer_id}/{agent}`). Auth uses `MIKA_INTERNAL_TOKEN` as a bearer header (existing gateway internal-token contract). The remote `Task` response is rendered to stdout: text parts emitted verbatim, file parts as `[file: <name>]`, data parts as `[data]`. Errors surface single-line prefixes by `A2aError` variant — `remote error:` (JSON-RPC error) and, for a transport failure, a sentence naming both what failed and what became of the work (mika#2036). The transport half distinguishes unreachable / timed out (naming the budget spent) / HTTP status / unreadable / interrupted; the second half reports whether the answer was reclaimed, is still being generated ("Retry"), was never started, or could not be looked up — and names the `context_id` to query with `tasks/get`. **A generated answer is no longer lost:** when the exchange fails after the request landed, `mika ask` re-reads the task by the `context_id` it minted before sending, and returns the response the server already produced. Conflicts with `--team`. JSON mode adds `metadata.remote_task_id` under `--verbose`; text mode appends a `remote_task_id: <id>` trailer under `--verbose`. Remote mode does not write to the local `~/.mika/data/mika.db` — session state lives on the cloud agent. Implementation: `src/remote_ask.rs` (lib-exposed for integration tests), wired in `src/main.rs` Ask branch.
 
+### `budget_floor` — le budget d'envoi est résolu au moment de l'envoi (mika#2759)
+
+`src/budget_floor.rs` répond à une seule question, pour un seul appelant :
+*quelle enveloppe per-agent l'agent visé par cette URL fait-il tourner ?* La
+réponse devient le troisième candidat du `max` de
+`mika_a2a::client::resolve_send_timeout_with_floor`, appelé à l'unique site
+`remote_ask.rs::send_message_to_agent` — que **les deux portes** de `mika ask`
+traversent (la porte locale par `commands/ask.rs`, la porte `--remote` par
+`run_remote`).
+
+Le plancher `client >= total` de mika#2297 était résolu sur l'environnement du
+**process** ; les enveloppes de mika#2189 vivent dans le `config.toml` de
+**l'agent**. Sur un appel vers mika-arch le client résolvait donc 600 s face à
+une enveloppe de 900, et abandonnait une génération que le moteur avait encore le
+droit de finir. Le raisonnement complet (pourquoi à l'envoi, pourquoi un seul
+site, pourquoi par attestation) est dans `crates/mika-a2a/CLAUDE.md`
+§ *Client transport policy*. Ce qu'un éditeur de ce crate doit savoir :
+
+- **Le prédicat de cible est fermé, et c'est l'inverse de celui de `a2a_call`.**
+  `local_a2a_agent(url)` rend `Some(nom)` pour `http`/`https` + hôte **loopback**
+  (`localhost`, `127.0.0.0/8`, `::1`) + chemin `/a2a/{nom}` à **un seul**
+  segment après `a2a` (un `/` final est accepté). Tout le reste rend `None`.
+  `a2a_call` *refuse* le loopback (SSRF) ; ici on n'accepte **que** lui, parce
+  que le spirit de la cible est la seule autorité sur l'enveloppe de cette cible.
+  Un `/a2a/{customer}/{agent}` de gateway n'est donc jamais interrogé : deux
+  segments, `None`.
+- **Rien n'est résolu localement** (doctrine mika#2457). L'enveloppe est lue dans
+  `GET /api/v1/agents/{id}/budget` — l'URL d'attestation est bâtie sur
+  l'autorité de **l'URL visée**, pas sur une adresse de spirit résolue ici —
+  champ `budget.agent_total_timeout_secs`. Lire le `config.toml` d'ici rendrait
+  un chiffre qui n'est pas celui en vigueur. Le jeton est un **paramètre**, pas
+  une lecture d'environnement, et son absence n'est pas court-circuitée : la
+  requête part sans `Authorization`, le serveur répond `401`, et la cause est
+  nommée — sinon « ton shell n'a pas de jeton » se tairait comme « le daemon est
+  à terre ».
+- **Absent n'est pas zéro** (motif mika#2331). Les quatre populations de `None`
+  sont nommées séparément, parce qu'elles ne demandent pas le même geste :
+
+  | événement | niveau | lecture |
+  |---|---|---|
+  | `a2a_floor_not_local` | DEBUG | cible non-loopback — nominal sur `--remote` |
+  | `a2a_floor_unattested` + `cause = unreachable` | WARN | le daemon ne répond pas |
+  | `a2a_floor_unattested` + `cause = status_<code>` | WARN | 401/403 (mauvais jeton), 404 (agent non servi) |
+  | `a2a_floor_unattested` + `cause = malformed` | WARN | un 2xx que ce miroir ne sait pas lire — écart de version |
+  | `a2a_floor_resolved` | DEBUG | l'enveloppe est entrée au `max` |
+
+  Dans tous les cas de `None`, `resolve_send_timeout_with_floor(None)` rend
+  **octet pour octet** le budget que `A2aClient::new` aurait résolu : le plancher
+  ne peut que relever, jamais plafonner.
+- **`ATTESTATION_TIMEOUT_SECS = 5`** borne la demande d'attestation, et n'est
+  délibérément **pas** un `const … : Duration` (hors population de la règle A2 du
+  lint a2a). Le fichier est **dans** le `PERIMETER` de
+  `scripts/check-a2a-timeout-literals.sh` depuis mika#2759 : sans cette entrée sa
+  conformité était vraie et non vérifiée.
+- **Un second site est refusé, pas listé.** `mika2759_le_plancher_a_un_seul_site`
+  balaie la moitié production du crate avec un `ALLOWED` **vide** (forme
+  mika#2425 / mika#2457), doublé de `mika2759_le_scan_du_plancher_nest_pas_vide`
+  qui atteste que le balayage a réellement vu `remote_ask.rs`. Quand il rougit, le
+  remède est de router le nouvel appelant par celui qui existe (doctrine
+  mika#2201), jamais d'ajouter une ligne.
+
 ## TUI Features
 
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
