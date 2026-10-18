@@ -483,6 +483,75 @@ pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
     "promote_deferred_callback",
 ];
 
+/// The builtin tools mika-arch is **allowed** to see (mika#2748).
+///
+/// # Why an allowlist replaces the denylist as the decision record
+///
+/// [`MIKA_ARCH_DISABLED_TOOLS`] is a real cut, but a *re-erodable* one: it is
+/// obtained by **adding** names, so the next `register(...)` in `default_tools()`
+/// hands the architect a definition nobody decided it should have. mika#2593's
+/// attestation guard made that growth loud, not impossible — an implementer who
+/// read the guard's message and added the name to the roster had satisfied the
+/// guard without deciding anything.
+///
+/// Under an allowlist the default changes sign: a new builtin reaches mika-arch
+/// only if someone writes its name **here**. This constant *is* the decision
+/// register — grep-visible, one name per line, read in a diff — and that is what
+/// replaced the guard rather than a test that recomputes
+/// `allowlist == registry − denylist` (which would put the denylist back as the
+/// source of truth, re-erodable by the same door).
+///
+/// # Where the nineteen come from
+///
+/// Eighteen are everything `default_tools()` still served mika-arch after
+/// mika#2593, transcribed from the roster that guard attested. The nineteenth is
+/// **`list_agents`**, the sole survivor of the fourteen tools of
+/// `management_tools_if_needed()` — thirteen are denied, and this one is kept on
+/// purpose (topology self-knowledge, mika#740; reopening it is mika#2593 § 8 (c),
+/// a question about #740 rather than about size). It is named here, in the
+/// doc-comment, rather than split into a second constant: one more site of truth
+/// for one element would be paid at every reading.
+///
+/// Nineteen is exactly the `kept_count` the filter logs, and that is not a
+/// coincidence to be relied on — it is the invariant this vol preserved, so
+/// `tool_defs_bytes` is expected **strictly unchanged** after the switch.
+///
+/// # Hard bound — builtins only
+///
+/// The filter runs before skill and MCP tools are appended, so this list does
+/// not govern them. `gh_read` — mika-arch's most-used tool — is served without
+/// appearing here. Writing it here would be an **inert entry that reads as an
+/// authorisation**, and assertion A of
+/// `mika2748_lallowlist_de_mika_arch_est_le_roster` refuses any name that is not
+/// a declared builtin precisely so that cannot happen quietly.
+pub const MIKA_ARCH_ALLOWED_TOOLS: &[&str] = &[
+    // Memory and facts (#811 constitutive — the agent must be able to learn)
+    "update_core_memory",
+    "store_fact",
+    "search_memory",
+    "update_fact",
+    // Communication (#811 constitutive — without it the agent cannot answer)
+    "send_message",
+    // Self-knowledge (#740)
+    "list_skills",
+    "get_config",
+    "get_active_llm",
+    "read_agent_file",
+    "list_agent_files",
+    "list_agents",
+    // Grounding reads (#1331)
+    "query_timeline",
+    "get_session_messages",
+    "list_audit_events",
+    "search_tool_history",
+    // Review work
+    "resolve_issue_order",
+    "query_knowledge_graph",
+    // Content-serve ledger (mika#1867)
+    "record_served_content",
+    "check_already_served",
+];
+
 /// mika-arch's static skill allowlist. Held as a `pub const` (rather than only
 /// inline in `build_mika_arch_identity`) so the `verify-bundled-skills` gate
 /// (mika#1575) can read it without constructing a full `Settings` — mika-arch's
@@ -524,8 +593,16 @@ fn build_mika_arch_identity(settings: &Settings) -> Result<String, String> {
         roots_block.push_str(&format!("  \"{s}\",\n"));
     }
 
+    // Both shapes, in the same section (mika#2748). The allowlist is what
+    // decides; the denylist subtracts on top and keeps mika#2593's reasoning
+    // readable. `mika2748_lallowlist_de_mika_arch_est_le_roster` asserts their
+    // intersection is empty, so neither overrides the other in practice.
     let mut tools_block = String::from("disabled = [\n");
     for tool in MIKA_ARCH_DISABLED_TOOLS {
+        tools_block.push_str(&format!("  \"{tool}\",\n"));
+    }
+    tools_block.push_str("]\nallowed = [\n");
+    for tool in MIKA_ARCH_ALLOWED_TOOLS {
         tools_block.push_str(&format!("  \"{tool}\",\n"));
     }
     tools_block.push(']');
@@ -634,6 +711,15 @@ pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] = &[
     "skills.allow_authoring",
     "skills.nudge_enabled",
     "tools.disabled",
+    // mika#2748, and code-owned for exactly the reason its `context.history`
+    // sibling below spells out: `write_default_if_missing` never rewrites an
+    // existing `identity.toml`, so without this entry mika-arch — provisioned
+    // long before this vol — would never see the allowlist and would keep
+    // running under the denylist alone, with a green test suite over the top.
+    // That is the inert-declaration class of mika#1833 (`[kg]`) / mika#2330
+    // (`[context.history]`), and probe P4 of the plan reads the disk to confirm
+    // it did not happen.
+    "tools.allowed",
     "context.summary",
     // mika#2295. Listed here for the same reason as its `context.summary`
     // sibling: the window bounds are a property of the role, not an operator
@@ -1802,17 +1888,30 @@ mod tests {
         assert!(err.contains("relative path"));
     }
 
+    /// # Why this reads the parsed list instead of grepping the document
+    ///
+    /// Until mika#2748 the `[tools]` section held one list, so a substring
+    /// search over the whole document was a faithful proxy for "absent from the
+    /// denylist". With `allowed` beside `disabled` the proxy lies in **both**
+    /// directions: `update_core_memory` is now a name the document carries, and
+    /// a name moved from `allowed` into `disabled` would keep every `contains`
+    /// below green. The assertions are therefore on the named list, which is
+    /// what they always meant.
     #[test]
     fn test_mika_arch_identity_has_tools_disabled_block() {
         let toml = build_mika_arch_identity(&test_settings_with_kg_roots()).unwrap();
         assert!(toml.contains("[tools]"));
-        assert!(toml.contains("\"pr_merge_with_gate\""));
-        assert!(toml.contains("\"a2a_call\""));
+        let identity: crate::prompt::Identity =
+            toml::from_str(&toml).expect("rendered identity should parse");
+        let disabled = &identity.tools.disabled;
+
+        assert!(disabled.iter().any(|t| t == "pr_merge_with_gate"));
+        assert!(disabled.iter().any(|t| t == "a2a_call"));
         // Memory writes are NOT denied — agent-scoped self-state, not platform side-effect.
         // See review-guide.md § Orthogonality (commit 2bba6223).
-        assert!(!toml.contains("\"update_core_memory\""));
+        assert!(!disabled.iter().any(|t| t == "update_core_memory"));
         // send_message must NOT be in the disabled list (constitutive of being an agent)
-        assert!(!toml.contains("\"send_message\""));
+        assert!(!disabled.iter().any(|t| t == "send_message"));
     }
 
     #[test]
