@@ -134,7 +134,7 @@ and is dropped », mais nomme la staleness et la diffère explicitement : « § 
 System* still names it (**pre-existing staleness, out of scope**) ». Ces trois
 lignes ne sont donc pas une preuve d'existence contredite par ce plan — elles sont
 une dette documentaire déjà identifiée et déjà renvoyée, par un document du dépôt,
-avant ce grooming. Elles restent hors du périmètre de ce ticket (§ 9).
+avant ce grooming. Elles restent hors du périmètre de ce ticket (§ 10).
 
 ### 2.2 L'espace d'adresses de sortie a été refusé le jour même de ce grooming
 
@@ -509,13 +509,50 @@ Aucune ligne `Tracked in:` n'est due : le travail n'est pas reporté à un vol 2
 est **remonté** au propriétaire, et le § 2.2 nomme déjà le chantier où la forme
 d'adressage revient si la réponse est D1.
 
-**Fire-Disposition : sans objet.** Ce plan ne livre aucun détecteur — ni test, ni
-assertion, ni règle de lint, ni garde CI, ni validateur. La section n'est donc pas
-requise (gate N/A, mika#2306) et n'est pas inventée.
+---
+
+## 8. Fire-Disposition
+
+**Sans objet — aucun détecteur n'est livré, et c'est dit ici plutôt qu'une
+disposition inventée.**
+
+Ce plan ne livre aucune ligne de code (§ 7, total 0), donc a fortiori aucun
+livrable de classe détecteur : ni test, ni assertion, ni règle de lint, ni garde
+CI, ni validateur de schéma, ni scan structurel, ni garde EndTurn. Le gate
+mika#2306 / mika#1574 est donc **N/A** — branche 3 de l'arbre de décision de
+l'architecte (`skills/bundled/mika-arch-groom-ticket/system_prompt.md:88` :
+« Plan has no detector-class deliverables ⇒ gate is N/A (does not influence
+disposition) ») — et aucune des trois options canoniques (a) allowlist nommée,
+(b) livrer désarmé, (c) halte-et-remontée n'est choisie, parce qu'il n'y a rien
+à disposer.
+
+**Pourquoi la section existe quand même, alors que la règle dit de ne pas
+l'inventer.** La règle de grooming dispense de la section un plan sans détecteur,
+et l'architecte la classe N/A sans qu'elle influence sa disposition. Mais le
+backstop structurel de `dispatch-lib` (`_fd_retry_if_section_still_missing`,
+`skills/bundled/_shared/dispatch-lib.sh:8968`) s'arme sur une conjonction dont le
+premier terme est un `grep -qF 'Fire-Disposition'` **sur le findings-file de
+première passe** — un substring, pas « l'architecte a réclamé la section ». Des
+findings qui mentionnent le gate ne serait-ce que pour le déclarer N/A satisfont
+ce terme ; un plan sans titre `## Fire-Disposition` satisfait le second, et le
+revise est relancé pour rien (le défaut nommé à `dispatch-lib.sh:4047`). Cette
+section est la forme que `dispatch-lib.sh:9007-9010` prescrit elle-même pour ce
+cas : « Si — et seulement si — le plan ne livre réellement AUCUN détecteur […]
+dis-le explicitement dans la section plutôt que d'inventer une disposition : le
+gate est alors N/A et cette phrase est ce qui le rend lisible. » Le titre est
+donc là pour être lu par la machine ; son contenu ne revendique rien.
+
+**Ne pas confondre avec la disposition de ce plan.** L'en-tête annonce
+« halte-et-remontée », et l'option (c) de ce gate porte le même nom : ce sont deux
+choses différentes. L'option (c) décrirait ce qu'un détecteur livré fait en
+s'allumant sur des **données existantes**. La disposition de l'en-tête porte sur
+le **sort du ticket** (§ 5), au titre de l'*Unresolved-Decision Gate* branche 2.
+Aucun détecteur n'étant livré, l'option (c) n'est pas choisie — elle est hors
+objet.
 
 ---
 
-## 8. Risques et arbitrages
+## 9. Risques et arbitrages
 
 **Le risque de se tromper sur la fermeture.** Si Vincent veut le classificateur,
 D1 coûte la réouverture d'un ticket — bon marché, et le corps est préservé. Si
@@ -542,7 +579,7 @@ renforcer le constat.
 
 ---
 
-## 9. Hors périmètre, délibérément
+## 10. Hors périmètre, délibérément
 
 - **Corriger les trois lignes périmées de `CLAUDE.md`** (`:250`, `:272`, `:313` —
   `permission-policy` et `MIKA_RELAY_IDENTITY`, périmées depuis mika#1193, § 2.1).
@@ -558,7 +595,7 @@ renforcer le constat.
 
 ---
 
-## 10. Référence
+## 11. Référence
 
 **Tickets.** mika#1721 (celui-ci, OPEN, ouvert 2026-07-03T10:15:16Z) · mika#1720
 Ticket A (CLOSED NOT_PLANNED, 2026-10-18T17:55:07Z) · mika#1641 parent (CLOSED
