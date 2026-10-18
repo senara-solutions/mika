@@ -7,17 +7,8 @@
 //! 2026-10-16 sur mika#2736 (tâche `fef8cd36`, ~6 h, 36 lignes
 //! `auto_feeder_pool_in_flight` la listant sous `stuck` sans aucun remède).
 //!
-//! **Rollback mika#2762.** `tick()` ne balaie plus la classe `groom` : le
-//! prédicat faisait échouer le parent d'un groom *réussi* dès que la place
-//! implement était tenue. Les deux tests de la classe `groom` appellent donc
-//! `reap_orphaned_parent_tasks("groom")` **directement** — ils épinglent le
-//! balayage, plus son câblage. La classe `implement` traverse toujours
-//! `tick()`. Quand le correctif complet de mika#2762 rétablit l'appel groom
-//! dans le tick, ces deux tests repassent par `run_one_scan`.
-//!
 //! `mika2762_un_groom_reussi_pendant_quune_implementation_tient_la_place_garde_son_parent`
-//! épingle le cas mesuré, à travers `tick()` : rouge tant que le tick balaie
-//! `groom` avec le prédicat actuel.
+//! épingle le cas mesuré, à travers `tick()`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -205,7 +196,7 @@ async fn un_groom_dont_le_callback_a_delivre_quitte_in_progress() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         let parent = seed_groom_scene(&db, "groom", false).await;
 
@@ -217,8 +208,7 @@ async fn un_groom_dont_le_callback_a_delivre_quitte_in_progress() {
             "référence : aucun événement avant la passe"
         );
 
-        // mika#2762 : appel direct, le tick ne balaie plus `groom`.
-        engine.reap_orphaned_parent_tasks("groom").await;
+        run_one_scan(&mut engine).await;
 
         let row = db.get_task(&parent).await.unwrap().unwrap();
         assert_eq!(
@@ -256,12 +246,11 @@ async fn un_groom_dont_le_pilote_vit_encore_ne_bouge_pas() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         let parent = seed_groom_scene(&db, "groom", true).await;
 
-        // mika#2762 : appel direct, le tick ne balaie plus `groom`.
-        engine.reap_orphaned_parent_tasks("groom").await;
+        run_one_scan(&mut engine).await;
 
         let row = db.get_task(&parent).await.unwrap().unwrap();
         assert_eq!(
