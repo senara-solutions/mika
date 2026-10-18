@@ -4,8 +4,9 @@
 //! composers over `gh` CLI output. See the module docstring in `mod.rs`
 //! for the full Phase 1 discipline.
 
-use super::pool::{PoolCandidate, PoolVerdict, ReadyTicket};
+use super::pool::{PlanSizeReading, PoolCandidate, PoolVerdict, ReadyTicket};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A GitHub milestone reference, e.g. `senara-solutions/mika#1799`.
 ///
@@ -190,6 +191,23 @@ pub struct MilestoneState {
     /// meilleur du dépôt. Le rapport le dit au lieu de le taire.
     #[serde(default)]
     pub outside_read_truncated: Option<bool>,
+    /// La taille annoncée par le plan de chaque candidat pressenti, lue à la
+    /// forge au ref de **sa** branche (mika#2699 vol 3).
+    ///
+    /// Indexée par numéro d'issue, et **creuse par construction** : seuls les
+    /// candidats que [`super::pool::numbers_needing_size`] a désignés sont lus,
+    /// au plus [`super::pool::PLAN_SIZE_READ_MAX`] par cycle. Un candidat absent
+    /// de la table n'est pas « de taille nulle » — il n'a pas été mesuré, et
+    /// [`super::pool::UnreadCause::NotMeasured`] est ce que l'évaluation lui
+    /// attribue. Le motif est celui de mika#2331 : un défaut à `0` affirmerait
+    /// une mesure qui n'a pas eu lieu, et ici il admettrait le ticket que la
+    /// borne devait refuser.
+    ///
+    /// `BTreeMap` et non `HashMap` : le blob du puits hors-ligne se relit en
+    /// diff, donc son ordre de sérialisation doit être le même d'un cycle à
+    /// l'autre.
+    #[serde(default)]
+    pub plan_sizes: BTreeMap<u64, PlanSizeReading>,
 }
 
 /// Severity classification for an assessment. Drives escalation routing.

@@ -9,14 +9,17 @@
 //! `crate::auto_pull::gh_list_open_issues` verbatim (env `GH_TOKEN`,
 //! `stdin::null`, `kill_on_drop(true)`). No new GitHub client dep.
 
-use super::pool::{PoolCandidate, ReadyTicket};
+use super::plan_size;
+use super::pool::{PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause};
 use super::types::{
     CiState, IssueState, MilestoneRef, MilestoneState, ProgressCounts, RecentActivity, SubIssue,
 };
+use crate::auto_pull::extract_branch_name;
+use crate::plan_callout::{FenceHandling, plan_callout};
 use crate::webhook_dispatch::READY_LABEL;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Combien d'issues ouvertes la lecture **hors milestone cible** rapporte au
 /// plus (mika#2699, vol 2).
@@ -253,7 +256,132 @@ impl Reader {
         let (outside, truncated) = compose_outside_candidates(&outside_json, &state.sub_issues)?;
         state.outside_candidates = outside;
         state.outside_read_truncated = Some(truncated);
+
+        // 6. La taille annoncée par le plan de chaque candidat pressenti
+        //    (mika#2699 vol 3). N+1 lectures, donc bornées deux fois : par
+        //    `numbers_needing_size`, qui n'en désigne que
+        //    `PLAN_SIZE_READ_MAX`, et par le filtre d'admission lui-même, qui
+        //    ne retient que les candidats déjà recevables sur la forme. Un
+        //    ticket sans plan groomé est refusé avant d'avoir coûté un appel.
+        //
+        //    Qui est candidat se décide **au même endroit** qu'au jugement :
+        //    `assessor::milestone_pool_candidates` sur l'état qu'on vient de
+        //    composer, puis `pool::numbers_needing_size`. Rejouer le filtre ici
+        //    rendrait les deux réponses identiques aujourd'hui et muettes le
+        //    jour où l'une des deux change.
+        let milestone_candidates = super::assessor::milestone_pool_candidates(&state);
+        let wanted = super::pool::numbers_needing_size(
+            &state.ready_pool,
+            &milestone_candidates,
+            &state.outside_candidates,
+        );
+        if !wanted.is_empty() {
+            let bodies = compose_candidate_bodies(&issues_json, &outside_json)?;
+            state.plan_sizes = read_plan_sizes(runner, &milestone_ref.repo, &wanted, &bodies).await;
+        }
         Ok(state)
+    }
+}
+
+/// Le corps de chaque issue lue à ce cycle, indexé par numéro — fonction
+/// **pure** (mika#2699 vol 3).
+///
+/// Les deux sorties `gh` déjà en main portent `body` ; rien n'est relu à la
+/// forge pour le retrouver. Le milestone est parcouru en second et **écrase**
+/// le dehors sur un numéro présent dans les deux : c'est la même précédence
+/// que celle de [`super::pool::assess_pool`], qui juge un tel ticket
+/// `Milestone`.
+pub fn compose_candidate_bodies(
+    issues_json: &str,
+    outside_json: &str,
+) -> Result<HashMap<u64, String>> {
+    let mut bodies = HashMap::new();
+    for (json, what) in [(outside_json, "outside"), (issues_json, "milestone")] {
+        let issues: Vec<Value> = serde_json::from_str(json)
+            .map_err(|e| anyhow!("failed to parse {what} json for bodies: {e}"))?;
+        for i in issues {
+            let Some(number) = i.get("number").and_then(Value::as_u64) else {
+                continue;
+            };
+            let body = i.get("body").and_then(Value::as_str).unwrap_or_default();
+            bodies.insert(number, body.to_string());
+        }
+    }
+    Ok(bodies)
+}
+
+/// Lit le plan de chaque candidat désigné, **au ref de sa branche**, et le
+/// réduit au jeton de taille que l'admission consultera (mika#2699 vol 3).
+///
+/// **Pourquoi au ref de la branche et non sur `main`.** Le plan d'un ticket
+/// groomé est commité sur la branche du ticket ; sur `main` il n'existe
+/// généralement pas encore. Lire `main` répondrait « plan introuvable » pour
+/// tout candidat correctement groomé — c'est-à-dire exactement pour ceux que la
+/// borne doit juger.
+///
+/// **Un échec ne refuse pas et ne se tait pas.** Chaque branche d'échec porte sa
+/// propre cause ([`super::pool::UnreadCause`]), parce que les remèdes sont
+/// opposés : un callout manquant se corrige sur le ticket, un `404` au ref se
+/// corrige en poussant la branche. Les confondre serait la classe mika#2205.
+/// Aucune des deux n'est une estimation « au-delà de la borne », donc aucune ne
+/// produit le refus — le rapport les nomme à la place.
+///
+/// **Rien n'est propagé en `Err`.** Un plan illisible est un fait sur *un*
+/// candidat ; faire échouer le cycle entier pour lui priverait l'opérateur du
+/// rapport sur tous les autres.
+async fn read_plan_sizes<R: GhRunner>(
+    runner: &R,
+    repo: &str,
+    wanted: &[u64],
+    bodies: &HashMap<u64, String>,
+) -> BTreeMap<u64, PlanSizeReading> {
+    let mut out = BTreeMap::new();
+    for number in wanted {
+        out.insert(
+            *number,
+            read_one_plan_size(runner, repo, *number, bodies).await,
+        );
+    }
+    out
+}
+
+async fn read_one_plan_size<R: GhRunner>(
+    runner: &R,
+    repo: &str,
+    number: u64,
+    bodies: &HashMap<u64, String>,
+) -> PlanSizeReading {
+    let Some(body) = bodies.get(&number) else {
+        return PlanSizeReading::Unread(UnreadCause::NoCallout);
+    };
+    // Les deux lecteurs stricts du dépôt, réutilisés tels quels : `plan_callout`
+    // rend un chemin **relatif à la racine du sous-dépôt** (son premier segment
+    // est retiré), qui est précisément ce que `/contents/` attend. Les
+    // tolérances larges de `plan_callout_present` ne conviendraient pas ici —
+    // elles répondent « il y a un callout », pas « voici le chemin ».
+    let Some(callout) = plan_callout(body, FenceHandling::Strip) else {
+        return PlanSizeReading::Unread(UnreadCause::NoCallout);
+    };
+    let Some(branch) = extract_branch_name(body) else {
+        return PlanSizeReading::Unread(UnreadCause::NoCallout);
+    };
+    let path = format!(
+        "/repos/{repo}/contents/{}?ref={}",
+        callout.normalized, branch
+    );
+    // `Accept: …raw` rend le fichier tel quel plutôt que l'enveloppe JSON
+    // base64 : un décodage de moins, et le contrat de parse porté du bash
+    // travaille sur le texte du plan.
+    match runner
+        .run(&["api", &path, "-H", "Accept: application/vnd.github.raw"])
+        .await
+    {
+        Ok(plan) => match plan_size::plan_size_total_loc(&plan) {
+            plan_size::PlanSizeTotal::Total(n) => PlanSizeReading::Measured(n),
+            plan_size::PlanSizeTotal::SectionAbsent => PlanSizeReading::SectionAbsent,
+            plan_size::PlanSizeTotal::Unparsable => PlanSizeReading::Unparsable,
+        },
+        Err(_) => PlanSizeReading::Unread(UnreadCause::FetchFailed),
     }
 }
 
@@ -729,6 +857,10 @@ pub fn compose_from_gh_outputs(
         // n'a pas été posée (mika#2331).
         outside_candidates: Vec::new(),
         outside_read_truncated: None,
+        // Idem pour les tailles de plan (mika#2699, vol 3) : elles dépendent du
+        // bassin et du dehors, qu'on n'a pas ici. Vide, donc « non mesuré » pour
+        // chaque candidat — jamais « de taille nulle ».
+        plan_sizes: BTreeMap::new(),
     })
 }
 
@@ -1232,6 +1364,12 @@ mod gh_arg_capture_tests {
     /// the outside-candidate read. The trailing `issue` arm is an **error**, not
     /// a default: a sixth `issue`-shaped call must extend this match on a token
     /// of its own rather than inherit someone else's answer.
+    ///
+    /// **Extension performed a third time (mika#2699 vol 3).** The sixth call is
+    /// an `api`, like the first. Both `api` arms now discriminate on the path
+    /// (`/milestones/` vs `/contents/`), and neither is a fallback — a seventh
+    /// `api`-shaped call lands on the error arm rather than being served the
+    /// milestone metadata.
     struct RecordingGhRunner {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         milestone_json: String,
@@ -1239,6 +1377,15 @@ mod gh_arg_capture_tests {
         pr_json: String,
         ready_json: String,
         outside_json: String,
+        /// Le texte servi à la **sixième** lecture (mika#2699 vol 3), ou `None`
+        /// pour simuler le `404` au ref de la branche.
+        ///
+        /// Même raison que pour les arms `issue` ci-dessus, un cran plus loin :
+        /// la sixième lecture est elle aussi un `api`, donc l'arm `api` nu lui
+        /// aurait servi les métadonnées du milestone — un plan sans section de
+        /// taille, donc `SectionAbsent`, donc un test vert qui ne prouve rien.
+        /// Les deux arms `api` discriminent sur le chemin.
+        plan_text: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1247,13 +1394,18 @@ mod gh_arg_capture_tests {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             self.calls.lock().unwrap().push(owned.clone());
             let has = |flag: &str| owned.iter().any(|a| a == flag);
+            let path = owned.get(1).cloned().unwrap_or_default();
             let json_fields = owned
                 .windows(2)
                 .find(|w| w[0] == "--json")
                 .map(|w| w[1].clone())
                 .unwrap_or_default();
             match owned.first().map(String::as_str) {
-                Some("api") => Ok(self.milestone_json.clone()),
+                Some("api") if path.contains("/contents/") => self
+                    .plan_text
+                    .clone()
+                    .ok_or_else(|| anyhow!("RecordingGhRunner: 404 au ref de la branche")),
+                Some("api") if path.contains("/milestones/") => Ok(self.milestone_json.clone()),
                 Some("issue") if has("--label") => Ok(self.ready_json.clone()),
                 Some("issue") if has("--milestone") => Ok(self.issues_json.clone()),
                 Some("issue") if json_fields == "number,body,labels,state" => {
@@ -1284,6 +1436,7 @@ mod gh_arg_capture_tests {
             pr_json: "[]".into(),
             ready_json: "[]".into(),
             outside_json: "[]".into(),
+            plan_text: None,
         };
         (calls, runner)
     }
@@ -1568,5 +1721,179 @@ mod gh_arg_capture_tests {
             "refuser plutôt que mal répondre : aucun candidat retenu — {} retenus",
             cands.len()
         );
+    }
+
+    // -- mika#2699 vol 3 : la sixième lecture, le plan au ref de sa branche --
+
+    /// Un corps d'issue groomée : les deux callouts que la sixième lecture
+    /// épelle, et rien d'autre. `\n` littéraux — c'est du JSON.
+    const CORPS_GROOME: &str = "> - **Branch:** `feat/1700/x`\\n\
+         > - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md` \
+         (committed on branch @ `abc1234`)";
+
+    const PLAN_DE_500: &str = "# Plan\n\n## Taille estimée\n\nTotal estimé : 500 lignes\n";
+
+    fn outside_json_un_candidat(corps: &str) -> String {
+        format!(
+            r#"[{{"number": 1700, "body": "{corps}", "state": "OPEN",
+                 "labels": [{{"name": "p0-critical"}}]}}]"#
+        )
+    }
+
+    /// Cas 14 — la sixième lecture épelle `/contents/<chemin>?ref=<branche>`, et
+    /// son total atterrit dans l'état.
+    ///
+    /// Trois décisions tiennent dans cet argv, et chacune est invisible depuis
+    /// `pool.rs`. **`?ref=<branche>`** : le plan d'un ticket groomé est commité
+    /// sur *sa* branche — lire `main` répondrait « introuvable » pour tout
+    /// candidat correctement groomé, c'est-à-dire exactement ceux que la borne
+    /// doit juger. **Le chemin normalisé** : `plan_callout` retire le segment de
+    /// tête (`mika/…`), qui est le préfixe du dépôt dans le monorepo et n'existe
+    /// pas à l'intérieur du sous-dépôt que `/contents/` adresse. **`Accept:
+    /// …raw`** : sans lui la forge rend une enveloppe JSON base64, et le contrat
+    /// de parse porté du bash travaillerait sur du base64 — `SectionAbsent` sur
+    /// tous les plans du monde, silencieusement.
+    #[tokio::test]
+    async fn mika2699_la_sixieme_lecture_lit_le_plan_au_ref_de_sa_branche() {
+        let (calls, mut runner) = build_recorder();
+        runner.outside_json = outside_json_un_candidat(CORPS_GROOME);
+        runner.plan_text = Some(PLAN_DE_500.into());
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("la lecture doit aboutir");
+
+        let calls = calls.lock().unwrap();
+        let plan_call = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a.contains("/contents/")))
+            .expect("la sixième lecture doit être capturée");
+        assert_eq!(
+            plan_call,
+            &[
+                "api",
+                "/repos/senara-solutions/mika/contents/\
+                 docs/plans/2026-10-01-001-feat-1700-x-plan.md?ref=feat/1700/x",
+                "-H",
+                "Accept: application/vnd.github.raw",
+            ]
+        );
+        assert_eq!(
+            state.plan_sizes.get(&1700),
+            Some(&PlanSizeReading::Measured(500)),
+            "le total lu entre dans l'état, mesuré : {:?}",
+            state.plan_sizes
+        );
+    }
+
+    /// Cas 15 — un `404` au ref se nomme, et ne se confond pas avec un plan non
+    /// dimensionné.
+    ///
+    /// Contrôle négatif du cas précédent **et** séparation de deux populations
+    /// dont les remèdes sont opposés (classe mika#2205) : un plan introuvable se
+    /// corrige en poussant la branche, un plan sans section de taille en
+    /// l'éditant. Confondre les deux enverrait l'opérateur au mauvais endroit —
+    /// et confondre l'un ou l'autre avec « au-delà de la borne » refuserait un
+    /// ticket que personne n'a mesuré.
+    #[tokio::test]
+    async fn mika2699_un_plan_introuvable_au_ref_se_nomme_et_ne_refuse_pas() {
+        let (_calls, mut runner) = build_recorder();
+        runner.outside_json = outside_json_un_candidat(CORPS_GROOME);
+        runner.plan_text = None; // le `404`
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("un plan introuvable ne fait pas échouer le cycle");
+
+        assert_eq!(
+            state.plan_sizes.get(&1700),
+            Some(&PlanSizeReading::Unread(UnreadCause::FetchFailed)),
+            "la cause dit quel geste corrige : {:?}",
+            state.plan_sizes
+        );
+    }
+
+    /// Cas 16 — un candidat sans callout de branche ne coûte aucun appel.
+    ///
+    /// Le ticket porte bien un callout de plan — `plan_callout_present` le voit,
+    /// donc il passe le filtre d'admission du vol 2 — mais pas de quoi désigner
+    /// un ref. La lecture ne part pas : il n'y a pas d'adresse à lire, et un
+    /// appel au hasard sur `main` répondrait pour un autre fichier que celui du
+    /// ticket.
+    #[tokio::test]
+    async fn mika2699_sans_callout_de_branche_aucun_appel_ne_part() {
+        let (calls, mut runner) = build_recorder();
+        runner.outside_json = outside_json_un_candidat(
+            "> - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md` \
+             (committed on branch @ `abc1234`)",
+        );
+        runner.plan_text = Some(PLAN_DE_500.into());
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("la lecture doit aboutir");
+
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.iter().any(|a| a.contains("/contents/"))),
+            "aucune lecture de plan sans ref à lire"
+        );
+        assert_eq!(
+            state.plan_sizes.get(&1700),
+            Some(&PlanSizeReading::Unread(UnreadCause::NoCallout)),
+            "et le fait est dit, pas tu : {:?}",
+            state.plan_sizes
+        );
+    }
+
+    /// Cas 17 — sur un numéro présent dans les deux lectures, le milestone
+    /// gagne.
+    ///
+    /// Même précédence qu'à l'admission, où un tel ticket est jugé `Milestone` :
+    /// deux réponses divergentes à « d'où vient #42 » feraient lire le plan d'un
+    /// ticket au ref annoncé par l'autre. Le corps hors milestone est ici
+    /// délibérément **mieux formé** que celui du milestone — si la précédence
+    /// s'inversait, le test verrait un callout là où il en attend zéro.
+    #[test]
+    fn mika2699_sur_un_numero_commun_le_corps_du_milestone_gagne() {
+        let milestone = r#"[{"number": 42, "body": "du milestone"}]"#;
+        let dehors = format!(r#"[{{"number": 42, "body": "{CORPS_GROOME}"}}]"#);
+
+        let bodies = compose_candidate_bodies(milestone, &dehors).expect("deux JSON valides");
+        assert_eq!(
+            bodies.get(&42).map(String::as_str),
+            Some("du milestone"),
+            "le milestone écrase le dehors"
+        );
+    }
+
+    /// Cas 18 — un corps absent de la sortie `gh` est un `NoCallout`, pas un
+    /// panic ni un zéro.
+    ///
+    /// `compose_candidate_bodies` ne promet rien sur un numéro : `gh` peut
+    /// rendre une issue sans champ `body`. Le vide résultant n'a ni callout ni
+    /// branche, donc la même cause que le cas 16 — et surtout aucune taille, ce
+    /// qu'un `0` par défaut aurait rendu comme « tient largement la borne »
+    /// (motif mika#2331).
+    #[test]
+    fn mika2699_une_issue_sans_champ_body_rend_une_chaine_vide() {
+        let bodies = compose_candidate_bodies(r#"[{"number": 42}]"#, "[]")
+            .expect("un body absent reste du JSON valide");
+        assert_eq!(bodies.get(&42).map(String::as_str), Some(""));
     }
 }

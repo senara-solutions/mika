@@ -126,7 +126,7 @@ fn rank_of(
 mod tests {
     use super::*;
     use crate::milestone_manager::pool::{
-        AdmissionRefusal, PoolBand, PoolDepth, ReadyTicket, assess_pool,
+        AdmissionRefusal, PoolBand, PoolDepth, ReadyTicket, assess_pool_sans_tailles,
     };
     use crate::milestone_manager::types::IssueState;
 
@@ -179,7 +179,7 @@ mod tests {
             cand(2732, Some(2), false, &[]),
         ];
         let outside = vec![cand(2740, Some(2), false, &[])];
-        let v = assess_pool(&[], &milestone, &outside);
+        let v = assess_pool_sans_tailles(&[], &milestone, &outside);
         let relief = name_relief(&v, &milestone, &outside);
 
         let mut attendus: Vec<u64> = v.refusals.iter().map(|r| r.number).collect();
@@ -210,7 +210,7 @@ mod tests {
             cand(2700, Some(1), false, &[]),
             cand(2600, Some(0), false, &[]),
         ];
-        let v = assess_pool(&[], &milestone, &outside);
+        let v = assess_pool_sans_tailles(&[], &milestone, &outside);
         let relief = name_relief(&v, &milestone, &outside);
 
         assert_eq!(
@@ -237,7 +237,7 @@ mod tests {
             cand(2810, Some(1), true, &[]),  // plan groomé présent
             cand(2811, Some(1), false, &[]), // à grommer
         ];
-        let v = assess_pool(&[], &milestone, &[]);
+        let v = assess_pool_sans_tailles(&[], &milestone, &[]);
         let relief = name_relief(&v, &milestone, &[]);
 
         assert_eq!(
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn mika2700_un_ticket_en_cours_de_groom_nest_pas_releve() {
         let en_vol = vec![cand(2820, Some(1), false, &["dispatch:groom"])];
-        let v = assess_pool(&[], &en_vol, &[]);
+        let v = assess_pool_sans_tailles(&[], &en_vol, &[]);
         let relief = name_relief(&v, &en_vol, &[]);
         assert!(
             relief.next.is_empty() && relief.beyond == 0,
@@ -264,7 +264,7 @@ mod tests {
         );
 
         let libre = vec![cand(2820, Some(1), false, &[])];
-        let v = assess_pool(&[], &libre, &[]);
+        let v = assess_pool_sans_tailles(&[], &libre, &[]);
         let relief = name_relief(&v, &libre, &[]);
         assert_eq!(
             numbers(&relief),
@@ -280,7 +280,7 @@ mod tests {
         let milestone: Vec<PoolCandidate> = (0..11)
             .map(|i| cand(2900 + i, Some(1), false, &[]))
             .collect();
-        let v = assess_pool(&[], &milestone, &[]);
+        let v = assess_pool_sans_tailles(&[], &milestone, &[]);
         let relief = name_relief(&v, &milestone, &[]);
 
         assert_eq!(
@@ -334,7 +334,7 @@ mod tests {
             labels: vec!["ready".into()],
         }];
         let milestone = vec![cand(3100, Some(1), true, &[])];
-        let v = assess_pool(&pool, &milestone, &[]);
+        let v = assess_pool_sans_tailles(&pool, &milestone, &[]);
         assert!(v.refusals.is_empty(), "prémisse du cas : aucun refus");
 
         let relief = name_relief(&v, &milestone, &[]);
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn mika2700_le_motif_est_celui_du_bassin() {
         let milestone = vec![cand(3200, Some(1), false, &[])];
-        let v = assess_pool(&[], &milestone, &[]);
+        let v = assess_pool_sans_tailles(&[], &milestone, &[]);
         let relief = name_relief(&v, &milestone, &[]);
 
         assert_eq!(

@@ -1,6 +1,6 @@
 //! Pool — le bassin `ready` : sa profondeur, sa bande, et qui devrait y entrer.
 //!
-//! **LECTURE SEULE.** mika#2699 Phase 2 (a), vols 1 et 2 : le manager *voit* le
+//! **LECTURE SEULE.** mika#2699 Phase 2 (a), vols 1 à 3 : le manager *voit* le
 //! bassin et *dit* qui devrait y entrer, et pourquoi il refuse les autres. Il ne
 //! pose aucun label, ne rattache aucun milestone, ne déclare aucun
 //! interrupteur. `assess_pool` est une fonction pure sans E/S ; le verdict entre
@@ -29,24 +29,46 @@
 //! l'inverse — milestone d'abord, priorité ensuite — ferait tenir un p0 critique
 //! derrière un p2 de confort, ce que l'orchestrateur ne fait pas à la main.
 //!
+//! # Le second motif de refus mesure, et il refuse — là où le bash ne refuse pas
+//!
+//! Le vol 3 ajoute [`RefusalReason::EstimateOverFlightBound`] : un candidat dont
+//! le plan annonce plus de lignes que la borne par vol de **son** plafond de
+//! tours n'est pas recommandé. La taille vient du plan lu au ref de la branche
+//! du candidat, et le contrat de lecture est celui de [`super::plan_size`].
+//!
+//! Le gate 3 de `dispatch-lib.sh` fait le même calcul et **ne refuse rien**, ce
+//! qui n'est pas une incohérence mais la conséquence de l'endroit où chacun se
+//! tient. Le bash juge au **dispatch**, sur une file déjà groomée dont aucun
+//! plan ne repasse par une porte de groom : y refuser gèlerait d'un coup tout
+//! `docs/plans/`. Le manager juge à l'**admission**, en amont, sur un ticket qui
+//! n'est pas encore `ready` — le refus y est réversible d'un découpage de plan,
+//! et le ticket demande explicitement qu'il ait lieu (« n'est jamais
+//! recommandé. Le rapport dit pourquoi »).
+//!
+//! **Seul un total mesuré strictement au-dessus de la borne refuse.** Un plan
+//! sans section de taille, un total illisible, un plan non lu : aucun n'est une
+//! estimation « au-delà », donc aucun n'est ce refus-là. Ils ne sont pas non
+//! plus tus — [`PlanSizeReading`] les distingue et le rapport les nomme, parce
+//! qu'admettre en silence sous une taille jamais mesurée serait présenter une
+//! absence de mesure comme un `under_bound` (*un `null` n'est jamais un `0`*,
+//! mika#2331).
+//!
 //! # Ce que ce module ne dit pas encore
 //!
-//! [`RefusalReason`] ne porte qu'un motif, `NoGroomedPlan`. Le second motif que
-//! le point 2 du ticket nomme — *estimation au-delà de la borne par vol sans
-//! découpage* — demande une lecture du plan **par candidat** au ref de sa
-//! branche (`gh api /repos/…/contents/<chemin>?ref=<branche>`) et un portage en
-//! Rust du contrat de parse à trois jetons de `_plan_size_total_loc`
-//! (`skills/bundled/_shared/dispatch-lib.sh`, porte 3 de mika#2701). Mesuré à
-//! ≈ 150–270 lignes estimées de plus, ce qui porte ce vol au-delà de la borne
-//! par vol de 431 lignes ; il est donc le vol suivant, et ce paragraphe est
-//! l'endroit où un éditeur futur le retrouve. L'enum existe déjà sous forme
-//! d'enum pour que l'ajout du motif soit un variant et non une refonte du
-//! rapport.
+//! Le **vol 4** : `MIKA_MANAGER_POOL_WRITE`, OFF par défaut, et le geste groupé
+//! en un — poser `ready` et rattacher au milestone cible, jamais de retrait de
+//! `ready` pendant un vol. Il portera AC1 (interrupteur OFF ⇒ aucune écriture,
+//! garantie structurelle plus contrôle négatif) et AC3 (interrupteur ON ⇒ une
+//! seule mutation par décision, idempotente). L'exception à
+//! `no_dispatch_test.rs` arrivera **dans le même commit** que le geste, nommée
+//! au fichier et au jeton près, jamais comme un relâchement du gabarit — qui
+//! reste à ce vol inchangé octet pour octet.
 
+use super::plan_size;
 use super::types::{IssueState, SubIssue};
 use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Ce qu'il faut savoir d'un ticket pour décider s'il entre au bassin — et rien
 /// de plus.
@@ -156,6 +178,89 @@ pub enum PoolBand {
     Saturated,
 }
 
+/// Nombre maximal de plans lus à la forge par cycle (mika#2699 vol 3).
+///
+/// Chaque lecture est un appel `gh api` de plus, et la liste des candidats
+/// recevables peut compter quelques dizaines de tickets sur ce dépôt : sans
+/// borne, le coût du cycle suivrait la taille du dépôt plutôt que celle de la
+/// décision. La borne porte sur les candidats **dans l'ordre du bassin**, donc
+/// elle mesure d'abord ceux qui peuvent entrer.
+///
+/// `3 × POOL_MAX`, et pas `POOL_MAX` : une admission refusée pour dépassement
+/// laisse la place à la suivante, donc mesurer quatre candidats pour quatre
+/// places rendrait un bassin plus creux que nécessaire le jour où deux d'entre
+/// eux dépassent. Au-delà, la taille est *non mesurée* et le rapport le dit —
+/// jamais « sous la borne » par défaut.
+pub const PLAN_SIZE_READ_MAX: usize = 3 * POOL_MAX;
+
+/// Ce que le manager sait de la taille estimée d'un candidat.
+///
+/// Les trois premières variantes sont les trois jetons de
+/// [`plan_size::PlanSizeTotal`] ; la quatrième est la cause que le bash n'a pas,
+/// parce que là-bas le plan est un fichier local déjà validé et qu'ici c'est une
+/// lecture distante. Les replier sur `absent` ferait lire « ce plan n'est pas
+/// dimensionné » là où le fait est « nous n'avons pas réussi à le lire » — deux
+/// remèdes opposés sous un seul mot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanSizeReading {
+    /// Le total annoncé par la section `## Taille estimée` du plan.
+    Measured(u64),
+    /// Le plan a été lu ; il ne porte pas de section de taille.
+    SectionAbsent,
+    /// La section est là, sa ligne `Total estimé :` non.
+    Unparsable,
+    /// Le plan n'a pas été lu — et la cause est dite.
+    Unread(UnreadCause),
+}
+
+/// Pourquoi le plan d'un candidat n'a pas été lu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadCause {
+    /// Le corps ne porte pas, sous leur forme stricte, le callout `Plan:` et le
+    /// callout `Branch:` qu'il faut pour savoir *quel fichier* lire *où*.
+    ///
+    /// Distinct de [`RefusalReason::NoGroomedPlan`], et pas par excès de
+    /// prudence : `plan_present` vient d'un lecteur **lâche** (quatrième
+    /// tolérance de [`crate::plan_callout`]), donc un corps peut passer le
+    /// prédicat d'admission sans livrer de chemin au lecteur strict.
+    NoCallout,
+    /// La forge n'a pas rendu le plan à ce ref — branche disparue, plan absent
+    /// de la branche, appel en échec.
+    FetchFailed,
+    /// La lecture n'a pas été tentée : candidat au-delà de
+    /// [`PLAN_SIZE_READ_MAX`], ou verdict d'un cycle antérieur au champ.
+    NotMeasured,
+}
+
+impl PlanSizeReading {
+    /// Le défaut de désérialisation : *pas mesuré*, jamais un nombre.
+    fn default_unread() -> Self {
+        PlanSizeReading::Unread(UnreadCause::NotMeasured)
+    }
+
+    /// Le motif, pour l'opérateur, quand la taille n'est **pas** un nombre.
+    ///
+    /// `None` sur [`Self::Measured`] : une taille mesurée sous la borne n'a rien
+    /// à signaler, et une ligne par admission conforme serait du bruit qui finit
+    /// par cacher celle qui compte.
+    pub fn unmeasured_label(self) -> Option<&'static str> {
+        match self {
+            PlanSizeReading::Measured(_) => None,
+            PlanSizeReading::SectionAbsent => Some("section « Taille estimée » absente du plan"),
+            PlanSizeReading::Unparsable => Some("total du plan illisible"),
+            PlanSizeReading::Unread(UnreadCause::NoCallout) => {
+                Some("callout de plan ou de branche absent")
+            }
+            PlanSizeReading::Unread(UnreadCause::FetchFailed) => {
+                Some("plan introuvable au ref de sa branche")
+            }
+            PlanSizeReading::Unread(UnreadCause::NotMeasured) => Some("taille non mesurée"),
+        }
+    }
+}
+
 /// Un ticket que le manager recommande de faire entrer dans le bassin.
 ///
 /// Porte sa provenance parce que le rapport doit la dire : « #2708 (p2-normal,
@@ -165,27 +270,51 @@ pub enum PoolBand {
 pub struct Admission {
     pub number: u64,
     pub origin: CandidateOrigin,
+    /// Ce que vaut sa taille estimée — porté sur l'admission, pas seulement sur
+    /// le refus (mika#2699 vol 3).
+    ///
+    /// Sans ce champ, « admis » couvrirait indifféremment « mesuré sous la
+    /// borne » et « jamais mesuré », et le second se lirait comme le premier.
+    /// `#[serde(default)]` pour la raison des autres champs du vol : le puits
+    /// hors-ligne tient des blobs écrits avant lui.
+    #[serde(default = "PlanSizeReading::default_unread")]
+    pub size: PlanSizeReading,
 }
 
 /// Pourquoi un candidat n'est pas recommandé.
 ///
-/// Un `enum` plutôt qu'un message : le second motif du point 2 du ticket
-/// (estimation au-delà de la borne par vol sans découpage) arrive au vol
-/// suivant, et doit arriver comme un variant — voir le docstring du module pour
-/// ce qu'il coûte et pourquoi il n'est pas ici.
+/// Un `enum` plutôt qu'un message, et le vol 3 est ce que cette forme achetait :
+/// le second motif du point 2 du ticket arrive comme un **variant**, pas comme
+/// une refonte du rapport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalReason {
     /// Aucun callout `Plan: docs/plans/…` dans le corps du ticket.
     NoGroomedPlan,
+    /// Le plan annonce plus de lignes que la borne par vol de ce ticket, et ne
+    /// se découpe pas — second motif du point 2 (mika#2699 vol 3).
+    ///
+    /// Les deux nombres voyagent avec le motif : « au-delà de la borne » sans
+    /// eux ne dit pas de combien découper, et le geste correctif est
+    /// précisément un découpage chiffré.
+    EstimateOverFlightBound { total_loc: u64, bound_loc: u32 },
 }
 
 impl RefusalReason {
     /// Le motif, dit à l'opérateur. Vit ici et non dans le rapport pour qu'un
-    /// variant neuf ne puisse pas être rendu sans libellé.
-    pub fn label(self) -> &'static str {
+    /// variant neuf ne puisse pas être rendu sans libellé — y compris quand le
+    /// libellé porte des nombres, auquel cas il est **composé ici** plutôt
+    /// qu'épelé une seconde fois par le rapporteur.
+    pub fn label(self) -> String {
         match self {
-            RefusalReason::NoGroomedPlan => "plan groomé absent",
+            RefusalReason::NoGroomedPlan => "plan groomé absent".to_string(),
+            RefusalReason::EstimateOverFlightBound {
+                total_loc,
+                bound_loc,
+            } => format!(
+                "estimation {total_loc} lignes au-delà de la borne par vol ({bound_loc}) \
+                 — à découper"
+            ),
         }
     }
 }
@@ -262,10 +391,19 @@ pub fn pool_sort_key(
 /// 5. **Les refus sont rendus hors famine aussi**, et triés par la même clé,
 ///    priorité absente, pour que le rapport soit stable d'un cycle à l'autre
 ///    quand rien n'a changé.
+/// 6. **Une taille non mesurée n'admet pas en silence et ne refuse pas non
+///    plus** (vol 3). Seul un total strictement au-dessus de la borne refuse ;
+///    les trois autres lectures passent, en portant leur cause sur l'admission
+///    pour que le rapport la dise. Voir le docstring du module.
+///
+/// `sizes` est indexé par numéro d'issue ; un candidat absent de la table vaut
+/// [`UnreadCause::NotMeasured`]. C'est l'appelant qui décide combien de plans il
+/// va chercher ([`numbers_needing_size`]) — cette fonction reste pure.
 pub fn assess_pool(
     pool: &[ReadyTicket],
     milestone_candidates: &[PoolCandidate],
     outside_candidates: &[PoolCandidate],
+    sizes: &BTreeMap<u64, PlanSizeReading>,
 ) -> PoolVerdict {
     let ready_total = pool.len();
     let in_flight = pool.iter().filter(|t| t.holds_dispatch_seat()).count();
@@ -279,6 +417,113 @@ pub fn assess_pool(
         PoolBand::Saturated
     };
 
+    let (eligible, mut refusals) =
+        well_formed_candidates(pool, milestone_candidates, outside_candidates);
+
+    // Le second motif, appliqué dans l'ordre du bassin : un candidat dont le
+    // plan annonce plus que la borne par vol de SON plafond quitte la liste des
+    // recevables pour celle des refusés. La borne est par ticket et non de
+    // flotte — un `loop-substrate` tient 429 lignes là où un ticket nu en tient
+    // 279, et les comparer à la même borne refuserait le premier à tort.
+    let mut admissible: Vec<(&PoolCandidate, CandidateOrigin, PlanSizeReading)> = Vec::new();
+    for (s, origin) in eligible {
+        let bound = plan_size::per_flight_bound(plan_size::turn_ceiling_for_labels(&s.labels));
+        let size = sizes
+            .get(&s.number)
+            .copied()
+            .unwrap_or(PlanSizeReading::Unread(UnreadCause::NotMeasured));
+        match size {
+            // `>` et non `>=` : un plan qui tient exactement la borne la tient.
+            PlanSizeReading::Measured(total) if total > u64::from(bound) => {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::EstimateOverFlightBound {
+                        total_loc: total,
+                        bound_loc: bound,
+                    },
+                });
+            }
+            _ => admissible.push((s, origin, size)),
+        }
+    }
+
+    // Un `AdmissionRefusal` ne porte pas de rang de priorité — la décision de
+    // refus ne le consulte pas — donc il entre dans la clé en **absent**. Le
+    // premier terme est alors constant sur toute la liste et l'ordre obtenu est
+    // exactement l'ancien `(origin.rank(), number)` : les tests du bassin sont
+    // le contrôle de non-régression de cette égalité. Le tri a lieu **après**
+    // les refus du vol 3, sans quoi ils s'empileraient derrière ceux du vol 2
+    // dans l'ordre d'arrivée.
+    refusals.sort_by_key(|r| pool_sort_key(None, r.origin, r.number));
+
+    // `POOL_MAX - available` ne peut pas déborder : la bande famine impose
+    // `available < POOL_MIN`, et `POOL_MIN <= POOL_MAX`.
+    let admit: Vec<Admission> = match band {
+        PoolBand::Starved => admissible
+            .iter()
+            .take(POOL_MAX - available)
+            .map(|(s, origin, size)| Admission {
+                number: s.number,
+                origin: *origin,
+                size: *size,
+            })
+            .collect(),
+        PoolBand::Nominal | PoolBand::Saturated => Vec::new(),
+    };
+
+    PoolVerdict {
+        depth: PoolDepth {
+            ready_total,
+            in_flight,
+            available,
+        },
+        band,
+        admit,
+        refusals,
+    }
+}
+
+/// Les candidats dont le plan mérite une lecture à la forge, dans l'ordre du
+/// bassin et bornés par [`PLAN_SIZE_READ_MAX`] (mika#2699 vol 3).
+///
+/// Rendue **publique et séparée** parce que l'appelant qui paie les appels `gh`
+/// n'est pas celui qui juge : [`super::reader`] va chercher les plans,
+/// [`assess_pool`] reste pure. Les deux passent par
+/// [`well_formed_candidates`], donc ils ne peuvent pas diverger sur qui est un
+/// candidat — une seconde écriture du filtre serait deux réponses à la même
+/// question dans le même cycle.
+///
+/// La liste est bornée **après** le tri, jamais avant : borner d'abord
+/// mesurerait les plus petits numéros plutôt que les plus prioritaires.
+pub fn numbers_needing_size(
+    pool: &[ReadyTicket],
+    milestone_candidates: &[PoolCandidate],
+    outside_candidates: &[PoolCandidate],
+) -> Vec<u64> {
+    let (eligible, _) = well_formed_candidates(pool, milestone_candidates, outside_candidates);
+    eligible
+        .iter()
+        .take(PLAN_SIZE_READ_MAX)
+        .map(|(s, _)| s.number)
+        .collect()
+}
+
+/// Les candidats recevables **sur la forme du ticket seule**, triés, et les
+/// refus que cette seule lecture suffit à nommer.
+///
+/// Site unique du filtre d'admission, partagé par [`assess_pool`] et
+/// [`numbers_needing_size`]. Ce qui est décidé ici ne consulte aucune lecture
+/// distante : c'est précisément ce qui permet d'appeler cette fonction *avant*
+/// d'aller chercher les plans.
+fn well_formed_candidates<'a>(
+    pool: &[ReadyTicket],
+    milestone_candidates: &'a [PoolCandidate],
+    outside_candidates: &'a [PoolCandidate],
+) -> (
+    Vec<(&'a PoolCandidate, CandidateOrigin)>,
+    Vec<AdmissionRefusal>,
+) {
     // Deux lectures distinctes peuvent dire « ce ticket est déjà `ready` » : le
     // bassin dépôt-large et les labels de la sub-issue. Elles sont prises à deux
     // appels `gh` différents, donc elles peuvent diverger d'un cycle ; on écarte
@@ -325,37 +570,7 @@ pub fn assess_pool(
         }
     }
     eligible.sort_by_key(|(s, origin)| pool_sort_key(s.priority_rank, *origin, s.number));
-    // Un `AdmissionRefusal` ne porte pas de rang de priorité — la décision de
-    // refus ne le consulte pas — donc il entre dans la clé en **absent**. Le
-    // premier terme est alors constant sur toute la liste et l'ordre obtenu est
-    // exactement l'ancien `(origin.rank(), number)` : les 17 tests du bassin
-    // sont le contrôle de non-régression de cette égalité.
-    refusals.sort_by_key(|r| pool_sort_key(None, r.origin, r.number));
-
-    // `POOL_MAX - available` ne peut pas déborder : la bande famine impose
-    // `available < POOL_MIN`, et `POOL_MIN <= POOL_MAX`.
-    let admit: Vec<Admission> = match band {
-        PoolBand::Starved => eligible
-            .iter()
-            .take(POOL_MAX - available)
-            .map(|(s, origin)| Admission {
-                number: s.number,
-                origin: *origin,
-            })
-            .collect(),
-        PoolBand::Nominal | PoolBand::Saturated => Vec::new(),
-    };
-
-    PoolVerdict {
-        depth: PoolDepth {
-            ready_total,
-            in_flight,
-            available,
-        },
-        band,
-        admit,
-        refusals,
-    }
+    (eligible, refusals)
 }
 
 /// Un label de la famille `dispatch:` est-il posé ? Voir
@@ -374,6 +589,30 @@ fn labels_carry_ready(labels: &[String]) -> bool {
     labels
         .iter()
         .any(|l| l.trim().eq_ignore_ascii_case(READY_LABEL))
+}
+
+/// [`assess_pool`] avec **aucune taille mesurée** — double de test partagé par
+/// les trois modules qui jugent un verdict de bassin (mika#2699 vol 3).
+///
+/// Les tests des vols 1 et 2 portent sur la profondeur, le tri, la provenance
+/// et le refus « plan groomé absent » ; aucun ne parle de taille. Leur passer
+/// une table vide est donc la lecture fidèle de ce qu'ils mesurent, et le nom
+/// le dit plutôt que de le cacher derrière un `&BTreeMap::new()` recopié
+/// trente fois. **Ce que ce double ne doit pas devenir** : le chemin par
+/// défaut. Les tests du vol 3 appellent [`assess_pool`] directement, avec une
+/// table peuplée — sans quoi la borne ne serait exercée nulle part.
+#[cfg(test)]
+pub(super) fn assess_pool_sans_tailles(
+    pool: &[ReadyTicket],
+    milestone_candidates: &[PoolCandidate],
+    outside_candidates: &[PoolCandidate],
+) -> PoolVerdict {
+    assess_pool(
+        pool,
+        milestone_candidates,
+        outside_candidates,
+        &BTreeMap::new(),
+    )
 }
 
 #[cfg(test)]
@@ -416,6 +655,21 @@ mod tests {
         v.admit.iter().map(|a| a.number).collect()
     }
 
+    /// L'admission telle que la rendent les cas des vols 1 et 2 : taille **non
+    /// mesurée**, puisqu'ils passent par [`assess_pool_sans_tailles`].
+    fn admis(number: u64, origin: CandidateOrigin) -> Admission {
+        Admission {
+            number,
+            origin,
+            size: PlanSizeReading::Unread(UnreadCause::NotMeasured),
+        }
+    }
+
+    /// Une table de tailles, pour les cas du vol 3.
+    fn tailles(entries: &[(u64, PlanSizeReading)]) -> BTreeMap<u64, PlanSizeReading> {
+        entries.iter().copied().collect()
+    }
+
     /// Cas 1 — les bandes, au littéral de « entre 2 et 4 ».
     #[test]
     fn mika2699_les_bandes_disent_entre_2_et_4() {
@@ -427,7 +681,7 @@ mod tests {
             (4, PoolBand::Nominal),
             (5, PoolBand::Saturated),
         ] {
-            let v = assess_pool(&pool_of(n, 0), &[], &[]);
+            let v = assess_pool_sans_tailles(&pool_of(n, 0), &[], &[]);
             assert_eq!(
                 v.band, expected,
                 "{n} disponibles doivent donner {expected:?}, obtenu {:?}",
@@ -443,7 +697,7 @@ mod tests {
     /// « 3, nominal ».
     #[test]
     fn mika2699_un_ready_en_vol_nest_pas_du_rail_disponible() {
-        let v = assess_pool(&pool_of(3, 2), &[], &[]);
+        let v = assess_pool_sans_tailles(&pool_of(3, 2), &[], &[]);
         assert_eq!(v.depth.ready_total, 3);
         assert_eq!(v.depth.in_flight, 2);
         assert_eq!(v.depth.available, 1);
@@ -461,7 +715,7 @@ mod tests {
             ready(2, &["ready", "Dispatch:SSC"]),
             ready(3, &["ready"]),
         ];
-        let v = assess_pool(&pool, &[], &[]);
+        let v = assess_pool_sans_tailles(&pool, &[], &[]);
         assert_eq!(v.depth.in_flight, 2, "les deux sièges comptent: {:?}", v);
         assert_eq!(v.depth.available, 1);
     }
@@ -472,14 +726,14 @@ mod tests {
     fn mika2699_lhysteresis_ne_parle_quen_famine() {
         let candidates: Vec<PoolCandidate> = (1..=6).map(|n| cand(n, Some(1), true, &[])).collect();
 
-        let nominal = assess_pool(&pool_of(3, 0), &candidates, &[]);
+        let nominal = assess_pool_sans_tailles(&pool_of(3, 0), &candidates, &[]);
         assert!(
             nominal.admit.is_empty(),
             "à 3 disponibles, rien à recommander: {:?}",
             nominal.admit
         );
 
-        let starved = assess_pool(&pool_of(1, 0), &candidates, &[]);
+        let starved = assess_pool_sans_tailles(&pool_of(1, 0), &candidates, &[]);
         assert_eq!(
             starved.admit.len(),
             POOL_MAX - 1,
@@ -500,7 +754,7 @@ mod tests {
             cand(20, Some(1), true, &[]),
             cand(10, Some(0), true, &[]),
         ];
-        let v = assess_pool(&pool_of(0, 0), &candidates, &[]);
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &candidates, &[]);
         assert_eq!(
             admitted(&v),
             vec![10, 20, 30, 40],
@@ -524,7 +778,7 @@ mod tests {
             cand(11, Some(0), false, &[]),
             cand(12, Some(2), true, &[]),
         ];
-        let v = assess_pool(&pool_of(0, 0), &candidates, &[]);
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &candidates, &[]);
         assert_eq!(admitted(&v), vec![12], "seul le candidat groomé entre");
         assert_eq!(
             v.refusals,
@@ -560,7 +814,7 @@ mod tests {
             closed,
             cand(14, Some(2), true, &[]),
         ];
-        let v = assess_pool(&pool, &candidates, &[]);
+        let v = assess_pool_sans_tailles(&pool, &candidates, &[]);
         assert_eq!(
             admitted(&v),
             vec![14],
@@ -578,7 +832,7 @@ mod tests {
     /// panique (et surtout pas de soustraction qui déborde).
     #[test]
     fn mika2699_bassin_vide_sans_candidat_ne_panique_pas() {
-        let v = assess_pool(&[], &[], &[]);
+        let v = assess_pool_sans_tailles(&[], &[], &[]);
         assert_eq!(v.depth.available, 0);
         assert_eq!(v.band, PoolBand::Starved);
         assert!(v.admit.is_empty());
@@ -591,18 +845,12 @@ mod tests {
     fn mika2699_a_priorite_egale_le_milestone_passe_avant_le_reste() {
         let inside = vec![cand(90, Some(1), true, &[])];
         let outside = vec![cand(20, Some(1), true, &[])];
-        let v = assess_pool(&pool_of(0, 0), &inside, &outside);
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &inside, &outside);
         assert_eq!(
             v.admit,
             vec![
-                Admission {
-                    number: 90,
-                    origin: CandidateOrigin::Milestone,
-                },
-                Admission {
-                    number: 20,
-                    origin: CandidateOrigin::Outside,
-                },
+                admis(90, CandidateOrigin::Milestone),
+                admis(20, CandidateOrigin::Outside),
             ],
             "le #90 du milestone précède le #20 hors milestone malgré son numéro plus grand"
         );
@@ -616,7 +864,7 @@ mod tests {
     fn mika2699_un_p0_hors_milestone_passe_devant_un_p1_du_milestone() {
         let inside = vec![cand(90, Some(1), true, &[])];
         let outside = vec![cand(91, Some(0), true, &[])];
-        let v = assess_pool(&pool_of(0, 0), &inside, &outside);
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &inside, &outside);
         assert_eq!(
             admitted(&v),
             vec![91, 90],
@@ -639,7 +887,7 @@ mod tests {
             closed,
             cand(24, Some(2), true, &[]),
         ];
-        let v = assess_pool(&pool_of(0, 0), &[], &outside);
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &[], &outside);
         assert_eq!(
             admitted(&v),
             vec![24],
@@ -667,17 +915,14 @@ mod tests {
         let shared = cand(90, Some(1), true, &[]);
         // Le **même** candidat dans les deux ensembles, par `from_ref` plutôt que
         // par `clone` : c'est précisément le recoupement que le test décrit.
-        let v = assess_pool(
+        let v = assess_pool_sans_tailles(
             &pool_of(0, 0),
             std::slice::from_ref(&shared),
             std::slice::from_ref(&shared),
         );
         assert_eq!(
             v.admit,
-            vec![Admission {
-                number: 90,
-                origin: CandidateOrigin::Milestone,
-            }],
+            vec![admis(90, CandidateOrigin::Milestone)],
             "une seule admission, provenance milestone: {:?}",
             v.admit
         );
@@ -692,7 +937,7 @@ mod tests {
         let shared = cand(50, Some(0), false, &[]);
         let inside = vec![cand(60, Some(0), false, &[]), shared.clone()];
         let outside = vec![cand(30, Some(0), false, &[]), shared];
-        let v = assess_pool(&pool_of(3, 0), &inside, &outside);
+        let v = assess_pool_sans_tailles(&pool_of(3, 0), &inside, &outside);
         assert_eq!(
             v.refusals,
             vec![
@@ -724,7 +969,7 @@ mod tests {
     #[test]
     fn mika2699_un_refus_est_dit_meme_quand_le_bassin_est_plein() {
         let inside = vec![cand(60, Some(0), false, &[])];
-        let v = assess_pool(&pool_of(4, 0), &inside, &[]);
+        let v = assess_pool_sans_tailles(&pool_of(4, 0), &inside, &[]);
         assert_eq!(v.band, PoolBand::Nominal);
         assert!(v.admit.is_empty(), "rien à admettre hors famine");
         assert_eq!(
@@ -797,11 +1042,10 @@ mod tests {
         assert!(v.refusals.is_empty(), "champ absent ⇒ vide, pas d'erreur");
         assert_eq!(
             v.admit,
-            vec![Admission {
-                number: 1700,
-                origin: CandidateOrigin::Outside
-            }],
-            "la provenance se lit depuis le fil, pas seulement depuis le rendu"
+            vec![admis(1700, CandidateOrigin::Outside)],
+            "la provenance se lit depuis le fil, pas seulement depuis le rendu ; \
+             et une admission du vol 2, sans champ `size`, se relit en « non \
+             mesurée » — jamais en taille nulle (mika#2699 vol 3, motif mika#2331)"
         );
         let out = serde_json::to_string(&v).unwrap();
         assert_eq!(
@@ -846,6 +1090,244 @@ mod tests {
             serde_json::from_str::<PoolVerdict>(blob_vol_1).is_err(),
             "`admit` a changé de forme au vol 2 : la relecture échoue, et le test \
              existe pour que ce fait soit nommé plutôt que découvert"
+        );
+    }
+
+    // -- mika#2699 vol 3 : la borne par vol, second motif de refus -----------
+
+    /// Cas 19 — un plan au-delà de la borne de **son** plafond est refusé, et le
+    /// refus porte les deux nombres.
+    ///
+    /// Les deux nombres, parce qu'un « estimation au-delà de la borne » sans
+    /// chiffres n'indique pas de geste : découper en deux ou en cinq ne se
+    /// décide pas sans savoir de combien on dépasse.
+    #[test]
+    fn mika2699_une_estimation_au_dela_de_la_borne_refuse_et_dit_les_deux_nombres() {
+        let candidats = vec![cand(90, Some(1), true, &[])];
+        // Plafond par défaut 150 ⇒ borne 279. 500 est au-delà.
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[(90, PlanSizeReading::Measured(500))]),
+        );
+        assert!(
+            v.admit.is_empty(),
+            "un plan de 500 lignes ne passe pas une borne de 279 : {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 90,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::EstimateOverFlightBound {
+                    total_loc: 500,
+                    bound_loc: 279,
+                },
+            }],
+        );
+        assert_eq!(
+            v.refusals[0].reason.label(),
+            "estimation 500 lignes au-delà de la borne par vol (279) — à découper",
+            "l'opérateur lit de combien il dépasse, pas seulement qu'il dépasse"
+        );
+    }
+
+    /// Cas 20 — un plan qui tient **exactement** la borne la tient.
+    ///
+    /// Le ticket dit « au-delà de la borne », pas « à la borne ». Un `>=` ici
+    /// refuserait le plan dimensionné *pour* ce plafond — c'est-à-dire celui que
+    /// le grooming a correctement découpé — et la correction serait de le
+    /// découper encore, sans raison.
+    #[test]
+    fn mika2699_un_plan_qui_tient_exactement_la_borne_la_tient() {
+        let candidats = vec![cand(90, Some(1), true, &[])];
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[(90, PlanSizeReading::Measured(279))]),
+        );
+        assert_eq!(
+            v.admit,
+            vec![Admission {
+                number: 90,
+                origin: CandidateOrigin::Milestone,
+                size: PlanSizeReading::Measured(279),
+            }],
+            "279 est la borne du plafond par défaut, donc elle est tenue"
+        );
+        assert!(v.refusals.is_empty());
+    }
+
+    /// Cas 21 — la borne est celle du plafond **du candidat**, pas une borne de
+    /// flotte.
+    ///
+    /// Un `loop-substrate` porte un plafond de 200 tours (mika#2542) donc une
+    /// borne de 429. Juger les deux candidats à la même borne refuserait le
+    /// premier à tort — et c'est le seul test qui voit cette erreur-là : avec une
+    /// borne unique, les deux tickets ci-dessous rendraient le même verdict pour
+    /// la mauvaise raison si l'un des deux manquait.
+    #[test]
+    fn mika2699_la_borne_est_celle_du_plafond_du_candidat() {
+        let candidats = vec![
+            cand(90, Some(1), true, &["loop-substrate"]),
+            cand(91, Some(1), true, &[]),
+        ];
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[
+                (90, PlanSizeReading::Measured(400)),
+                (91, PlanSizeReading::Measured(400)),
+            ]),
+        );
+        assert_eq!(
+            admitted(&v),
+            vec![90],
+            "400 tient sous la borne 429 d'un `loop-substrate`, pas sous les 279 d'un ticket nu"
+        );
+        assert_eq!(
+            v.refusals.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![91],
+        );
+        assert!(matches!(
+            v.refusals[0].reason,
+            RefusalReason::EstimateOverFlightBound { bound_loc: 279, .. }
+        ));
+    }
+
+    /// Cas 22 — aucune des trois lectures non mesurées ne refuse, et aucune ne
+    /// se tait.
+    ///
+    /// C'est le cœur du vol 3. « Plan sans section de taille » n'est pas « plan
+    /// au-delà de la borne » : refuser dessus inventerait un motif que la
+    /// mesure ne porte pas. Mais admettre en silence ferait lire « À admettre »
+    /// comme « borne vérifiée », qui est précisément ce que le point 2 promet.
+    /// La sortie est donc l'admission **plus** la cause, que le rapporteur
+    /// rendra.
+    #[test]
+    fn mika2699_une_taille_non_mesuree_nadmet_pas_en_silence_et_ne_refuse_pas() {
+        let candidats = vec![
+            cand(90, Some(1), true, &[]),
+            cand(91, Some(1), true, &[]),
+            cand(92, Some(1), true, &[]),
+            cand(93, Some(1), true, &[]),
+        ];
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[
+                (90, PlanSizeReading::SectionAbsent),
+                (91, PlanSizeReading::Unparsable),
+                (92, PlanSizeReading::Unread(UnreadCause::FetchFailed)),
+                // #93 est absent de la table : non mesuré par omission.
+            ]),
+        );
+        assert!(
+            v.refusals.is_empty(),
+            "aucune de ces lectures n'est une estimation « au-delà » : {:?}",
+            v.refusals
+        );
+        assert_eq!(
+            v.admit.iter().map(|a| a.size).collect::<Vec<_>>(),
+            vec![
+                PlanSizeReading::SectionAbsent,
+                PlanSizeReading::Unparsable,
+                PlanSizeReading::Unread(UnreadCause::FetchFailed),
+                PlanSizeReading::Unread(UnreadCause::NotMeasured),
+            ],
+            "chaque cause voyage avec son admission ; un candidat absent de la \
+             table est « non mesuré », jamais de taille nulle (mika#2331)"
+        );
+        for a in &v.admit {
+            assert!(
+                a.size.unmeasured_label().is_some(),
+                "le rapport doit pouvoir nommer chacune : {:?}",
+                a.size
+            );
+        }
+    }
+
+    /// Cas 23 — les plans à lire sont ceux de l'admission, dans l'ordre du
+    /// bassin et bornés.
+    ///
+    /// Deux propriétés qu'aucune autre assertion ne voit. **L'ordre** : la liste
+    /// est tronquée après le tri, donc une borne atteinte garde les plus
+    /// prioritaires et non les plus petits numéros. **Le filtre** : un ticket
+    /// sans plan groomé est déjà refusé, donc ne coûte aucun appel `gh` — c'est
+    /// ce qui tient le coût de la lecture par candidat.
+    #[test]
+    fn mika2699_les_plans_a_lire_sont_ceux_de_ladmission_tries_et_bornes() {
+        let mut candidats: Vec<PoolCandidate> = (0..PLAN_SIZE_READ_MAX as u64 + 3)
+            // Numéros décroissants à priorité croissante : si la borne était
+            // appliquée avant le tri, la liste commencerait par les numéros
+            // hauts et ce test le verrait.
+            .map(|i| cand(900 - i, Some((i % 3) as u8), true, &[]))
+            .collect();
+        candidats.push(cand(50, Some(0), false, &[]));
+
+        let wanted = numbers_needing_size(&pool_of(0, 0), &candidats, &[]);
+        assert_eq!(
+            wanted.len(),
+            PLAN_SIZE_READ_MAX,
+            "la liste est bornée par `PLAN_SIZE_READ_MAX`"
+        );
+        assert!(
+            !wanted.contains(&50),
+            "#50 n'a pas de plan groomé : il est refusé avant d'avoir coûté une lecture"
+        );
+        let attendu: Vec<u64> = {
+            let (eligible, _) = well_formed_candidates(&pool_of(0, 0), &candidats, &[]);
+            eligible
+                .iter()
+                .take(PLAN_SIZE_READ_MAX)
+                .map(|(c, _)| c.number)
+                .collect()
+        };
+        assert_eq!(wanted, attendu, "l'ordre est celui du bassin");
+        // #886 est le plus petit numéro de l'ensemble, et il est p2 : le
+        // premier à lire est #888, le plus petit numéro **parmi les p0**.
+        assert_eq!(
+            wanted[0], 888,
+            "le premier à lire est le p0 de plus petit numéro, pas le plus petit numéro"
+        );
+    }
+
+    /// Cas 24 — le filtre d'admission a **un site**, partagé par le jugement et
+    /// par la désignation des plans à lire.
+    ///
+    /// Les deux réponses sont identiques aujourd'hui ; ce qu'elles ne doivent
+    /// pas devenir, c'est deux écritures du même filtre qui divergent en silence
+    /// — le manager irait alors lire le plan d'un ticket qu'il ne jugera pas, et
+    /// jugerait sans taille un ticket dont le plan était lisible (doctrine du
+    /// lecteur unique, mika#2201).
+    #[test]
+    fn mika2699_le_filtre_dadmission_a_un_site_partage() {
+        let candidats = vec![
+            cand(90, Some(1), true, &[]),
+            cand(91, Some(0), true, &[]),
+            cand(92, None, false, &[]),
+            cand(93, Some(2), true, &["ready"]),
+        ];
+        let outside = vec![cand(20, Some(0), true, &[])];
+        let pool = pool_of(0, 0);
+
+        let wanted = numbers_needing_size(&pool, &candidats, &outside);
+        // Le même état jugé : l'ordre des admissions, bande famine, est le
+        // préfixe de l'ordre des lectures.
+        let v = assess_pool(&pool, &candidats, &outside, &BTreeMap::new());
+        assert_eq!(
+            admitted(&v),
+            wanted[..v.admit.len()].to_vec(),
+            "ce qui est admis est le préfixe de ce qui a été désigné à la lecture"
+        );
+        assert!(
+            !wanted.contains(&93),
+            "un ticket déjà `ready` n'est pas un candidat, donc pas une lecture"
         );
     }
 

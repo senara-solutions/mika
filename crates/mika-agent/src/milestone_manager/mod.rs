@@ -236,6 +236,7 @@ pub mod assessor;
 pub mod cadence;
 pub mod evaluator;
 pub mod liveness;
+pub mod plan_size;
 pub mod pool;
 pub mod reader;
 pub mod relief;
@@ -265,8 +266,9 @@ pub use liveness::{
     REASON_POLL_PREFIX, TransitionLine, liveness_reason,
 };
 pub use pool::{
-    Admission, AdmissionRefusal, CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand, PoolCandidate,
-    PoolDepth, PoolVerdict, ReadyTicket, RefusalReason, assess_pool, pool_sort_key,
+    Admission, AdmissionRefusal, CandidateOrigin, PLAN_SIZE_READ_MAX, POOL_MAX, POOL_MIN,
+    PlanSizeReading, PoolBand, PoolCandidate, PoolDepth, PoolVerdict, ReadyTicket, RefusalReason,
+    UnreadCause, assess_pool, numbers_needing_size, pool_sort_key,
 };
 pub use reader::{
     GhRunner, OUTSIDE_READ_LIMIT, ProcessGhRunner, Reader, compose_from_gh_outputs,

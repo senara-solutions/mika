@@ -1006,6 +1006,7 @@ mod tests {
             ready_pool: vec![],
             outside_candidates: vec![],
             outside_read_truncated: None,
+            plan_sizes: Default::default(),
         }
     }
 
