@@ -237,6 +237,9 @@ _canary_on_exit() {
     # Best-effort, and that is enough: a surviving entry only WIDENS the union
     # towards a repository that does not exist, and the registry TTL carries it
     # away. The cleanup is here for hygiene, not for containment.
+    #
+    # `-x` anchors a LINE, not the whole file, which is why mika#2776 adding a
+    # second line (`ref=`) to every entry left this selection intact.
     if [ -n "${_CANARY_PUSH_SCOPE_REPO:-}" ]; then
         local _scope_dir="${_PILOT_EGRESS_PUSH_SCOPE_DIR:-$HOME/.mika/pilot-push-scopes}"
         local _scope_entry=""
@@ -564,9 +567,20 @@ echo
 # That is the reading that makes writing to the operator's real registry
 # acceptable here; the opposite instinct (a test entry in a production
 # registry) would deserve a refusal if the entry could tighten anything.
+#
+# AND SINCE mika#2776, `BRANCH` TOO, for the same reason and with the same
+# consequence if it is left unset. An entry carrying `repo=` alone makes the
+# reader degrade on `scope-ref-absent` the moment the target repository matches,
+# so `push_bound_nominal` would be green through a tightening that never
+# examined its ref — and `push_scope_ref` below, the one probe the branch
+# dimension owns, could not refuse anything. The value is the ref every push
+# probe below sends unless it overrides it, so the declaration and the probes
+# cannot drift apart.
 _CANARY_PUSH_SCOPE_REPO="canary-2736-no-such-repo"
+_CANARY_PUSH_SCOPE_BRANCH="feat/9999/canary-2736"
 REPO="$_CANARY_PUSH_SCOPE_REPO"
-echo "push perimeter declared host-side: senara-solutions/$_CANARY_PUSH_SCOPE_REPO (mika#2751)"
+BRANCH="$_CANARY_PUSH_SCOPE_BRANCH"
+echo "push perimeter declared host-side: senara-solutions/$_CANARY_PUSH_SCOPE_REPO on refs/heads/$_CANARY_PUSH_SCOPE_BRANCH (mika#2751, mika#2776)"
 echo
 
 echo "============================================================"
@@ -656,6 +670,13 @@ echo
 echo "============================================================"
 echo "PART 2 — coherence adversarial hole-hunt (must-fail + must-work)"
 echo "============================================================"
+# EVERYTHING FROM HERE TO THE CLOSING QUOTE IS ONE SINGLE-QUOTED ARGUMENT, and
+# nothing in this file said so until mika#2776 spent a debugging round on it.
+# Two consequences, both silent: a bare apostrophe — even inside a comment —
+# CLOSES the quote and breaks the whole script's syntax, so prose here is
+# written without possessives (the file's idiom for a literal one is '"'"');
+# and a host variable is not expanded, so a value the host computed must be
+# spelled out literally below, next to the one that computed it.
 _run_pilot_sandboxed sh -c '
 echo "--- must-fail: filesystem (15 credential/state paths) ---"
 for p in \
@@ -833,18 +854,34 @@ echo "--- must-work: a legitimate push passes, and the receive-pack is BOUNDED t
 _canary_push_bound_probe() {
     _label="$1"; _repo="$2"; _new="$3"; _want_reason="$4"
     _old=1111111111111111111111111111111111111111
-    _pref=refs/heads/feat/9999/canary-2736
+    # The ref defaults to the branch this run declared host-side; the
+    # push_scope_ref probe of mika#2776 overrides it to target ANOTHER branch of
+    # the same repository. Spelled out literally, like the repository name in
+    # every probe below: this whole part runs inside a single-quoted sh -c, so
+    # the host variable would not reach it without leaving the quoting.
+    _pref="${5:-refs/heads/feat/9999/canary-2736}"
+    # The 0085 length below is arithmetic on a 32-character ref, so a ref of any
+    # other length makes the addon unable to decode the body and the probe
+    # reports `push-body-unreadable` for a reason that has nothing to do with
+    # what it meant to measure. Said once, here, rather than left for whoever
+    # adds the next override to rediscover.
+    if [ "${#_pref}" -ne 32 ]; then
+        echo "FAIL: $_label ref must be 32 chars for the 0085 pkt-line (got ${#_pref}: $_pref)"
+        return 0
+    fi
     _out=$(printf "0085%s %s %s\000report-status\n0000" "$_old" "$_new" "$_pref" \
         | curl -sS -m 10 -w "\n%{http_code}" --data-binary @- \
             -H "Content-Type: application/x-git-receive-pack-request" \
             "https://github.com/$_repo/git-receive-pack" 2>&1)
     _code=$(printf "%s\n" "$_out" | tail -1)
-    # Substring match on the SIX reasons the bound can emit -- no grep, no
+    # Substring match on the SEVEN reasons the bound can emit -- no grep, no
     # pipe, and it pins the vocabulary as a side effect, exactly as the sentinel
-    # probe above pins its three. push-scope-repo is the sixth (mika#2751); it
-    # belongs in the same table because it is read off the same body and
-    # because a probe expecting one reason must be able to REPORT any other,
-    # otherwise the two causes arrive as the same bytes (mika#2205).
+    # probe above pins its three. push-scope-repo is the sixth (mika#2751) and
+    # push-scope-ref the seventh (mika#2776); they belong in the same table
+    # because they are read off the same body and because a probe expecting one
+    # reason must be able to REPORT any other, otherwise two causes arrive as
+    # the same bytes (mika#2205). A reason missing from this table reads as "no
+    # refusal", which is the direction that hides a tightening.
     case "$_out" in
         *"DENY push-repo-foreign"*)    _reason=push-repo-foreign ;;
         *"DENY push-ref-delete"*)      _reason=push-ref-delete ;;
@@ -852,6 +889,7 @@ _canary_push_bound_probe() {
         *"DENY push-ref-protected"*)   _reason=push-ref-protected ;;
         *"DENY push-body-unreadable"*) _reason=push-body-unreadable ;;
         *"DENY push-scope-repo"*)      _reason=push-scope-repo ;;
+        *"DENY push-scope-ref"*)       _reason=push-scope-ref ;;
         *)                             _reason="" ;;
     esac
     if [ "$_reason" = "$_want_reason" ]; then
@@ -885,19 +923,27 @@ _canary_push_bound_probe push_bound_delete \
 #                        branch, so all four static rules are satisfied. The
 #                        tightening is the only thing that can refuse it, which
 #                        makes this the one probe that fails the day the
-#                        tightening silently stops biting.
+#                        REPOSITORY dimension silently stops biting.
+#   push_scope_ref     — added by mika#2776, below: the declared repository on
+#                        an UNDECLARED branch. mika#2751 waved that one through
+#                        too, so it is the probe for the branch dimension, and
+#                        the two are not interchangeable.
 #
 # WHY THERE IS NO push_scope_degraded PROBE, said here rather than left as an
 # omission to rediscover. The degradation states (`scope-absent`,
-# `scope-unreadable`) are properties of the WHOLE registry, not of a target, so
-# they cannot be observed in a run that declares a perimeter -- and a run that
-# declared none would have to refuse to declare one, giving up
-# push_scope_foreign, which is the valuable half. Worse, it would only be
-# observable on an IDLE host: any concurrent dispatch fills the registry and
-# the state disappears. So degradation is measured where it is deterministic,
-# `skills/bundled/_shared/tests/test_egress_push_bound.sh` CASE 17, and read in
-# production off the proxy log -- `grep scope-absent` on the mitmdump stderr,
-# the operator probe documented in docs/operator/environment-variables.md.
+# `scope-unreadable`, and since mika#2776 `scope-ref-absent`) are properties of
+# the registry rather than of a target, so they cannot be observed in a run that
+# declares a full perimeter -- and a run that declared none, or a repo-only one,
+# would have to give up push_scope_foreign or push_scope_ref, which are the
+# valuable halves. Worse, the first two are only observable on an IDLE host: any
+# concurrent dispatch fills the registry and the state disappears. So
+# degradation is measured where it is deterministic,
+# `skills/bundled/_shared/tests/test_egress_push_bound.sh` CASES 17 and 25, and
+# read in production off the proxy log -- `grep scope-absent` or
+# `grep scope-ref-absent` on the mitmdump stderr, the operator probe documented
+# in docs/operator/environment-variables.md. `scope-ref-absent` is the one worth
+# watching during a deployment window: it is what a pre-upgrade entry looks like
+# while the host registry still carries entries the previous binary wrote.
 #
 # The foreign target is nonexistent too, and its name carries 2751 so no real
 # dispatch can ever declare it: `_is_dispatchable_repo` refuses anything
@@ -906,14 +952,40 @@ _canary_push_bound_probe push_bound_delete \
 _canary_push_bound_probe push_scope_foreign \
     senara-solutions/canary-2751-foreign-no-such-repo.git \
     2222222222222222222222222222222222222222 push-scope-repo
+#
+# mika#2776 — THE BRANCH DIMENSION, and the only probe that can see it. The
+# target is the repository this run DECLARED, so every earlier rule waves it
+# through: the organisation is right, the ref is under refs/heads/, it is
+# neither main nor master, and the repository dimension of the declared
+# perimeter is satisfied. What it is not is the declared BRANCH. So the branch
+# dimension is the only thing standing between this request and a push onto the
+# branch of a sibling dispatch, and this is the probe that reddens the day it
+# stops biting.
+#
+# ITS OWN REFUSAL MOTIF, asserted here and not just in the suites: a run that
+# reported `push-scope-repo` for this probe would mean the two causes arrived in
+# the same bytes, and an operator reading the proxy log would send the next
+# incident to the wrong remedy -- the `origin` of the worktree instead of the
+# refspec resolved at the push site (class mika#2205).
+#
+# Nonexistent repository, like every other push probe here, and a ref whose name
+# carries 2776 -- 32 characters, as the pkt-line arithmetic requires.
+_canary_push_bound_probe push_scope_ref \
+    senara-solutions/canary-2736-no-such-repo.git \
+    2222222222222222222222222222222222222222 push-scope-ref \
+    refs/heads/feat/2776/canary-2776
 # The second rollback, and the point 3 of the parent ticket made observable:
 # MIKA_PILOT_EGRESS_PUSH_SCOPE=0 in the mitmdump environment disarms the
-# TIGHTENING ALONE. Under it push_scope_foreign reports no reason and FAILs --
+# TIGHTENING ALONE -- and since mika#2776 BOTH of its dimensions together, which
+# is the whole reason the branch dimension did not get a switch of its own.
+# Under it push_scope_foreign AND push_scope_ref report no reason and FAIL --
 # correct, the tightening is off by operator decision -- while the three
 # push_bound_* probes above stay green, because the static bound of mika#2736
 # is still armed. A rollback that reddened those too would mean the two
 # switches have been wired together, and that is a defect rather than a
-# decision (mika#2165).
+# decision (mika#2165). A rollback under which push_scope_foreign went quiet
+# but push_scope_ref kept refusing would mean the branch dimension grew a
+# second reader, which is the mika#2165 shape in the other direction.
 #
 # The rollback, named here because this is where its effect is observable:
 # MIKA_PILOT_EGRESS_PUSH_BOUND=0 in the mitmdump environment disarms THIS bound
