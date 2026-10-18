@@ -5679,6 +5679,7 @@ async fn run_agent_inner(
         &resolved_context,
         db.agent_id(),
         &effective_disabled,
+        ctx.identity.tools.allowed.as_deref(),
         is_compact_provider,
     );
     // mika#2517 U4 — the measurement AND the positive control, in one line.
@@ -6997,6 +6998,7 @@ async fn run_silent_inner(
         &no_context,
         db.agent_id(),
         &ctx.identity.tools.disabled,
+        ctx.identity.tools.allowed.as_deref(),
         false, // Silent mode: never compact (engine-driven triggers, not MikaModel targets)
     );
 
@@ -7818,6 +7820,7 @@ async fn run_team_agent_inner_impl(
         &resolved_context,
         params.db.agent_id(),
         &ctx.identity.tools.disabled,
+        ctx.identity.tools.allowed.as_deref(),
         false, // Team mode: never compact (engine-driven, not MikaModel targets)
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
@@ -9113,20 +9116,48 @@ fn has_successful_pr_review(summaries: &[ToolCallSummary]) -> bool {
 /// `provider_name` and `model_name` select variant-specific prompts when available.
 /// Two-level fallback for prompts: model-specific > root.
 /// Three-level fallback for timeouts: model > provider > root.
-/// Filter built-in tool definitions against an agent's identity-driven denylist.
+/// Filter built-in tool definitions against an agent's identity-driven tool
+/// visibility — **both** shapes, at one site (mika#2748).
 ///
 /// Applied at the LLM-presentation layer (this function is called inside
 /// `inject_skills_and_resolve_tools`), before the tool array reaches the
-/// LLM API call. Disabled tools are *not* presented to the model — the
+/// LLM API call. Filtered-out tools are *not* presented to the model — the
 /// model never sees them, cannot call them, cannot be prompt-injected into
 /// trying. The shared `Arc<ToolRegistry>` is unchanged.
 ///
-/// `disabled` is the agent's `Identity.tools.disabled` list, sourced from
-/// `identity.toml` `[tools].disabled` at agent context load time.
+/// `disabled` is the agent's `Identity.tools.disabled` denylist and `allowed`
+/// its `Identity.tools.allowed` allowlist, both sourced from `identity.toml`
+/// `[tools]` at agent context load time.
 ///
-/// Future migration (when well-known agents move from denylist to allowlist
-/// for tools): extend this hook to handle both shapes — same call site,
-/// different predicate, no caller changes.
+/// # The predicate, and why it is an intersection
+///
+/// ```text
+/// keep(d) ⇔ (allowed.is_none() || allowed contains d.name) && !(disabled contains d.name)
+/// ```
+///
+/// - **`Option` carries the three states.** `None` is "no allowlist, prior
+///   behaviour"; `Some([])` is "admit no builtin at all"; `Some([…])` is the
+///   explicit roster. The early return covers `None` *and* an empty denylist,
+///   never `Some([])` — an agent admitting nothing must be served nothing.
+/// - **The denylist subtracts on top of the allowlist.** This is what preserves
+///   the Webhook Fallthrough widening of mika#2517 (`FALLTHROUGH_WITHHELD_TOOLS`
+///   via `effective_disabled_tools`) with zero change here: that turn adds
+///   `create_task` to the *effective* denylist, and the intersection stays the
+///   right answer even on an allowlist agent.
+/// - **Order does not matter** (it is an intersection), but a name written on
+///   both sides is a decision written twice, not a contradiction to arbitrate in
+///   silence. For mika-arch that case is asserted away by
+///   `mika2748_lallowlist_de_mika_arch_est_le_roster` (assertion C).
+///
+/// # Hard bound — this governs builtins only
+///
+/// The call site is **before** skill tools and MCP tools are appended, so
+/// neither list reaches them. `gh_read` — mika-arch's most-used tool — is served
+/// without being named in `allowed`, and that is deliberate: naming a skill tool
+/// there would be an inert entry that *reads* as an authorisation, and the day
+/// this application point moved, the agent would lose its main tool in silence.
+/// Same invariant as the "`[tools].disabled` cannot deny an MCP tool" caveat
+/// already written in `docs/mcp.md` and `docs/architecture.md`.
 ///
 /// # Reading the event it emits (mika#2593)
 ///
@@ -9152,36 +9183,72 @@ fn has_successful_pr_review(summaries: &[ToolCallSummary]) -> bool {
 ///   log. Without the field, a `jq` over this event averages across agents that
 ///   share no denylist (mika#2205).
 ///
+/// Two more fields answer the question mika#2748 raised (mika#2293 — a setting
+/// that cannot be observed is not a setting):
+///
+/// - **`filter_shape`** ∈ `{"denylist", "allowlist", "both"}` — the shape that
+///   produced this line. Seeding an allowlist from exactly what the denylist
+///   leaves standing moves **no** number: `hidden_count`, `kept_count` and
+///   `kept_bytes` are all expected to be unchanged, so without this field
+///   "the switch is served" and "the binary is the old one" emit identical
+///   bytes (class mika#2340 / mika#2205). Its **absence** reads as a binary
+///   predating mika#2748, never as "no allowlist".
+/// - **`allowed_size`** — the allowlist's length, emitted beside
+///   `disabled_size` and **absent** (not `0`) when `allowed` is `None`:
+///   absent ≠ zero (mika#2331). `0` is a real, distinct state — `Some([])`.
+///
 /// The emission stays inside `if removed > 0`: an agent with no denylist is not
 /// a filtered agent reading zero, and an event on every turn of every agent
-/// would drown the ones that mean something.
+/// would drown the ones that mean something. An allowlist that removes nothing
+/// (allowlist = whole registry) is possible but is not the served case; leaving
+/// it silent stays consistent with the denylist half.
 pub(crate) fn apply_agent_tool_visibility(
     tool_defs: &mut Vec<mika_common::claude::ToolDefinition>,
     disabled: &[String],
+    allowed: Option<&[String]>,
     agent: &str,
 ) {
-    if disabled.is_empty() {
+    if disabled.is_empty() && allowed.is_none() {
         return;
     }
     let removed_count = tool_defs.len();
     tool_defs.retain(|d| {
-        let blocked = disabled
+        let admitted =
+            allowed.is_none_or(|list| list.iter().any(|name| name.eq_ignore_ascii_case(&d.name)));
+        let denied = disabled
             .iter()
             .any(|name| name.eq_ignore_ascii_case(&d.name));
-        if blocked {
+        let keep = admitted && !denied;
+        if !keep {
             tracing::debug!(
                 tool = %d.name,
-                "tool hidden from agent's LLM tool array (identity [tools].disabled)"
+                reason = if denied { "denylist" } else { "not in allowlist" },
+                "tool hidden from agent's LLM tool array (identity [tools])"
             );
         }
-        !blocked
+        keep
     });
     let removed = removed_count - tool_defs.len();
     if removed > 0 {
+        let filter_shape = match (disabled.is_empty(), allowed.is_some()) {
+            (false, true) => "both",
+            (false, false) => "denylist",
+            (true, true) => "allowlist",
+            // Unreachable: the early return above covers it.
+            (true, false) => "none",
+        };
         tracing::info!(
             agent = %agent,
             hidden_count = removed,
             disabled_size = disabled.len(),
+            // Absent rather than `0` when there is no allowlist (mika#2331):
+            // `0` is a real, distinct state (`Some([])`). One call, not the
+            // two-arm `match` of `webhook_prefilter.rs` — `Value for Option<T>`
+            // records *nothing* on `None`, so the key is omitted. What that
+            // site's comment warns against is the `?` sigil, which would go
+            // through `Debug` and write the string `"None"`.
+            allowed_size = allowed.map(<[String]>::len),
+            filter_shape = filter_shape,
             kept_count = tool_defs.len(),
             kept_bytes = tool_defs_byte_weight(tool_defs),
             "applied identity tool-visibility filter"
@@ -9474,6 +9541,7 @@ fn inject_skills_and_resolve_tools(
     resolved_context: &HashMap<String, context::ContextBlock>,
     agent: &str,
     disabled_tools: &[String],
+    allowed_tools: Option<&[String]>,
     is_compact_provider: bool,
 ) -> (
     Vec<mika_common::claude::ToolDefinition>,
@@ -9482,9 +9550,10 @@ fn inject_skills_and_resolve_tools(
 ) {
     // Always include ALL builtin tools
     let mut tool_defs = tools.definitions().to_vec();
-    // Apply per-agent visibility filter BEFORE skill tools are added — this
-    // is the named hook that future allowlist migration will reuse.
-    apply_agent_tool_visibility(&mut tool_defs, disabled_tools, agent);
+    // Apply per-agent visibility filter BEFORE skill tools are added — the one
+    // hook both shapes go through (mika#2748), and the reason the allowlist
+    // governs builtins only: skill and MCP tools are appended below.
+    apply_agent_tool_visibility(&mut tool_defs, disabled_tools, allowed_tools, agent);
 
     // Compact provider gate (mika#1491): filter tools to core-only allowlist
     // and skip all skill prompts + skill tools.
@@ -13358,6 +13427,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &no_disabled,
+            None,
             false,
         );
 
@@ -13417,6 +13487,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &no_disabled,
+            None,
             false,
         );
 
@@ -13448,7 +13519,7 @@ mod tests {
             "pr_merge_with_gate".to_string(),
             "update_core_memory".to_string(),
         ];
-        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
+        apply_agent_tool_visibility(&mut defs, &disabled, None, "mika-test");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "search_memory");
     }
@@ -13461,7 +13532,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         }];
         let disabled: Vec<String> = vec![];
-        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
+        apply_agent_tool_visibility(&mut defs, &disabled, None, "mika-test");
         assert_eq!(
             defs.len(),
             1,
@@ -13477,7 +13548,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         }];
         let disabled = vec!["pr_merge_with_gate".to_string()];
-        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
+        apply_agent_tool_visibility(&mut defs, &disabled, None, "mika-test");
         assert!(defs.is_empty(), "filter must match case-insensitively");
     }
 
@@ -13515,7 +13586,7 @@ mod tests {
         let weight_before = tool_defs_byte_weight(&defs);
 
         let disabled = vec!["list_tasks".to_string()];
-        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
+        apply_agent_tool_visibility(&mut defs, &disabled, None, "mika-test");
 
         // `kept_count` — the field reports `tool_defs.len()` after `retain`.
         assert_eq!(
@@ -13738,6 +13809,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &[],
+            None,
             false,
         );
 
@@ -13767,6 +13839,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &[],
+            None,
             false,
         );
 
@@ -13791,6 +13864,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &[],
+            None,
             false,
         );
 
@@ -13821,6 +13895,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &[],
+            None,
             false,
         );
 
@@ -13858,6 +13933,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &[],
+            None,
             false,
         );
 
@@ -13887,6 +13963,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &[],
+            None,
             false,
         );
 
@@ -13916,6 +13993,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &[],
+            None,
             false,
         );
 
@@ -17634,7 +17712,7 @@ mod tests {
             &[],
             "[GitHub] Issue labeled bug on senara-solutions/mika#999",
         );
-        apply_agent_tool_visibility(&mut defs, &disabled, "mika-test");
+        apply_agent_tool_visibility(&mut defs, &disabled, None, "mika-test");
 
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(
@@ -18000,6 +18078,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &no_disabled,
+            None,
             true, // compact provider
         );
 
@@ -18059,6 +18138,7 @@ mod tests {
             &no_ctx,
             "mika-test",
             &no_disabled,
+            None,
             false, // non-compact
         );
 
