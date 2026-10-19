@@ -1599,6 +1599,65 @@ async fn list_prs(repo: &str, token: &str) -> Result<Vec<PrSnapshot>, String> {
     serde_json::from_str(trimmed).map_err(|e| format!("parse gh pr list ({repo}): {e}"))
 }
 
+/// L'appel **étroit** de mika#2808 : branche → « au moins une revue soumise ».
+///
+/// # Pourquoi un second appel plutôt qu'un champ de plus sur le premier
+///
+/// Mesuré le 2026-10-19 sur `senara-solutions/mika` :
+///
+/// | appel | poids | durée |
+/// |---|---|---|
+/// | celui du faucheur (`--state all`, six champs) | 73 Ko | 2,1 s |
+/// | le même, augmenté de `latestReviews` | 1,21 Mo | 7,05 s |
+/// | celui-ci (`--state open`, trois champs) | 57 Ko | **0,79 s** |
+///
+/// Greffer le champ sur [`list_prs`] mettrait cinq secondes de plus sur le
+/// **chemin critique du faucheur**, qui décide des retraits de worktrees et
+/// dont l'échec saute le dépôt entier. Ce second appel est en dehors : son
+/// échec dégrade la fenêtre, il ne saute rien.
+///
+/// `--state open` suffit : une PR close n'a plus de QA à attendre, et son
+/// worktree sort par un autre motif.
+async fn list_open_pr_reviews(repo: &str, token: &str) -> Result<HashMap<String, bool>, String> {
+    let limit = LIST_LIMIT.to_string();
+    let out = gh(
+        &[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+            "number,headRefName,latestReviews",
+            "--limit",
+            &limit,
+        ],
+        token,
+    )
+    .await?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let prs: Vec<PrReviewsSnapshot> = serde_json::from_str(trimmed)
+        .map_err(|e| format!("parse gh pr list latestReviews ({repo}): {e}"))?;
+
+    let mut reviewed: HashMap<String, bool> = HashMap::new();
+    for pr in prs {
+        let has_verdict = pr.latest_reviews.iter().any(ReviewSnapshot::is_submitted);
+        // Deux PR ouvertes sur la même branche : **une seule revue suffit** à
+        // attester qu'un verdict est tombé sur ce travail. Un `insert` écraserait
+        // le `true` d'une PR par le `false` de sa voisine selon l'ordre rendu par
+        // `gh` — une décision dépendante du tri.
+        reviewed
+            .entry(pr.head_ref_name)
+            .and_modify(|v| *v |= has_verdict)
+            .or_insert(has_verdict);
+    }
+    Ok(reviewed)
+}
+
 // ---------------------------------------------------------------------------
 // La disposition (U3)
 // ---------------------------------------------------------------------------
@@ -1971,6 +2030,33 @@ pub async fn reap_terminal_worktrees(
         // échappe à ce tick. Transitoire (≤ 10 min), borné, et fermer ce cas
         // demanderait de pousser un refus synthétique pour un worktree que rien
         // ne refuse — une ligne d'audit fausse.
+        //
+        // mika#2808 — l'appel étroit qui dit quelles branches portent déjà un
+        // verdict. **Payé seulement quand le bras va s'en servir** : un bras
+        // désarmé ou à budget épuisé n'achète pas 0,79 s de latence pour une
+        // carte que personne ne lira. Un échec dégrade vers une carte vide —
+        // toutes les PR ouvertes retombent sur `Unknown`, donc sur la fenêtre
+        // de quatre heures — et ne saute **pas** le dépôt, contrairement à
+        // `list_prs`.
+        let reviewed_branches = if purge_cfg.enabled && purge_budget > 0 {
+            match list_open_pr_reviews(&repo, github_token).await {
+                Ok(map) => map,
+                Err(e) => {
+                    warn!(
+                        event = "target_purge_reviews_unreadable",
+                        repo = %repo,
+                        error = %e,
+                        trace_id,
+                        "target_purge: liste des revues illisible — toutes les PR \
+                         ouvertes retombent sur la fenêtre pleine"
+                    );
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
         purge_stale_target_dirs(
             db,
             session_id,
@@ -1981,6 +2067,7 @@ pub async fn reap_terminal_worktrees(
             &live,
             now,
             &purge_cfg,
+            &reviewed_branches,
             &mut purge_budget,
             &mut purge_stats,
         )
@@ -3417,6 +3504,7 @@ const PURGE_ENABLED_ENV: &str = "MIKA_TARGET_PURGE";
 const PURGE_DISPOSITION_ENV: &str = "MIKA_TARGET_PURGE_DISPOSITION";
 const PURGE_IDLE_ENV: &str = "MIKA_TARGET_PURGE_IDLE_SECS";
 const PURGE_MAX_PER_TICK_ENV: &str = "MIKA_TARGET_PURGE_MAX_PER_TICK";
+const PURGE_CONSUMER_DONE_IDLE_ENV: &str = "MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS";
 
 /// Quatre heures, bornées des deux côtés.
 ///
@@ -3430,6 +3518,29 @@ const PURGE_IDLE_DEFAULT_SECS: i64 = 14_400;
 /// au faucheur le sien, ou l'inverse. Un `remove_dir_all` de 40 Go est une
 /// tempête d'E/S — ce cap est ce qui l'étale, même raison que chez mika#2420.
 const PURGE_MAX_PER_TICK_DEFAULT: usize = 2;
+
+/// Quinze minutes — la fenêtre appliquée quand le dernier consommateur a fini
+/// ([`ConsumerState::Done`], mika#2808).
+///
+/// # Pourquoi pas zéro
+///
+/// La correction est tenue par P3 et P5, jamais par la fenêtre : un processus
+/// vivant dans le worktree ou un `cargo` tenant le verrou refusent quelle que
+/// soit sa valeur. Ce que la fenêtre protège est le **cache d'une boucle encore
+/// active**, et il reste deux délais réels après un `gh pr review` réussi :
+/// la fin du tour de la QA elle-même (`update_task_status`, `send_message`), et
+/// le trajet du webhook `pull_request_review.submitted` jusqu'à l'itération
+/// dispatchée qui recompilera. Quinze minutes couvrent les deux — et quand
+/// l'itération arrive, c'est **P3** qui la protège, pas la fenêtre.
+///
+/// # Pourquoi pas plus
+///
+/// Le ticket mesure ~5 points de `/data` par heure sur neuf `target/` de 22 à
+/// 47 Go. Avec le cron de dix minutes, cette valeur rend une latence réelle de
+/// l'ordre de 25 minutes au lieu de 4 h 10. Raccourcir le cron a été refusé :
+/// il ferait payer la découverte à tous les dépôts deux fois plus souvent pour
+/// gagner cinq minutes sur un seul bras.
+const PURGE_CONSUMER_DONE_IDLE_DEFAULT_SECS: i64 = 900;
 
 /// Profondeur de la marche de mtime (P4).
 ///
@@ -3446,6 +3557,14 @@ pub struct TargetPurgeConfig {
     pub enabled: bool,
     pub disposition: Disposition,
     pub idle_secs: i64,
+    /// La fenêtre appliquée **à la place** de [`Self::idle_secs`] quand le
+    /// dernier consommateur du répertoire a fini (mika#2808).
+    ///
+    /// Jamais un remplacement d'`idle_secs` : les deux coexistent, et le choix
+    /// est **par candidat**. Un seul réglage obligerait à raccourcir la fenêtre
+    /// de toute la population pour servir le cas répondable — exactement ce que
+    /// la note de `MIKA_TARGET_PURGE_IDLE_SECS` refuse.
+    pub consumer_done_idle_secs: i64,
     /// Plafond d'écritures par tick. **Lu par l'appelant, jamais par le
     /// prédicat** — leçon mika#2347.
     pub max_per_tick: usize,
@@ -3457,6 +3576,7 @@ impl Default for TargetPurgeConfig {
             enabled: true,
             disposition: Disposition::Armed,
             idle_secs: PURGE_IDLE_DEFAULT_SECS,
+            consumer_done_idle_secs: PURGE_CONSUMER_DONE_IDLE_DEFAULT_SECS,
             max_per_tick: PURGE_MAX_PER_TICK_DEFAULT,
         }
     }
@@ -3493,6 +3613,11 @@ fn purge_config_from_env() -> TargetPurgeConfig {
             std::env::var(PURGE_IDLE_ENV).ok().as_deref(),
             PURGE_IDLE_DEFAULT_SECS,
             PURGE_IDLE_ENV,
+        ),
+        consumer_done_idle_secs: parse_positive_i64(
+            std::env::var(PURGE_CONSUMER_DONE_IDLE_ENV).ok().as_deref(),
+            PURGE_CONSUMER_DONE_IDLE_DEFAULT_SECS,
+            PURGE_CONSUMER_DONE_IDLE_ENV,
         ),
         max_per_tick: parse_positive_usize(
             std::env::var(PURGE_MAX_PER_TICK_ENV).ok().as_deref(),
@@ -3563,6 +3688,21 @@ pub struct TargetPurgeCandidate {
     /// (motif `RESOLUTION_BRANCH`, mika#2518 ; `ready_label_outcome`,
     /// mika#2323).
     pub keep_reason: &'static str,
+    /// L'état du dernier consommateur qui a choisi la fenêtre (mika#2808) —
+    /// [`ConsumerState::as_str`].
+    ///
+    /// Un **champ additif**, pour les mêmes raisons que `keep_reason` : il rend
+    /// la population raccourcie comptable séparément
+    /// (`jq 'select(.consumer_state == "done")'`) sans fractionner
+    /// `tool_name`.
+    pub consumer_state: &'static str,
+    /// La fenêtre réellement appliquée à ce candidat, en secondes.
+    ///
+    /// Portée pour que la ligne dise **sur quelle borne** la décision a été
+    /// prise : sans elle, `idle_secs = 1200` se lit comme une violation de la
+    /// fenêtre de quatre heures au lieu d'une application de celle de quinze
+    /// minutes.
+    pub window_secs: i64,
 }
 
 /// Un répertoire de build conservé, et le motif nommé qui l'a conservé.
@@ -3636,12 +3776,26 @@ pub struct TargetPurgeSelection {
 /// différentes : aucun répertoire découvert ⇒ `no_target_dir` (il n'y a rien à
 /// purger), un répertoire sans état ⇒ `mtime_unreadable` (on n'a pas pu lire).
 ///
+/// # La fenêtre de P4 est par candidat (mika#2808)
+///
+/// `consumer` dit, **par worktree**, ce que l'état du dépôt sait de son dernier
+/// consommateur. Un [`ConsumerState::Done`] applique
+/// `cfg.consumer_done_idle_secs` ; tout le reste applique `cfg.idle_secs`. Une
+/// entrée **absente vaut [`ConsumerState::Unknown`]** — même invariant
+/// fail-safe que `states`, et c'est ce qui fait qu'un appel `gh` en échec
+/// dégrade vers la fenêtre pleine plutôt que vers rien.
+///
+/// Ce paramètre ne porte **aucune garde** : il ne peut qu'allonger ou
+/// raccourcir P4, jamais faire passer un worktree que P1, P2, P3 ou P5
+/// refusent. C'est ce qui donne l'AC3 par héritage.
+///
 /// Invariant : **un terme illisible conserve ; il n'existe aucune exception.**
 pub fn screen_target_purges(
     reaper_refusals: &[ReapRefusal],
     live: &LiveCwds,
     build_dirs: &HashMap<String, Vec<String>>,
     states: &HashMap<String, TargetState>,
+    consumer: &HashMap<String, ConsumerState>,
     cfg: &TargetPurgeConfig,
 ) -> TargetPurgeSelection {
     let mut out = TargetPurgeSelection::default();
@@ -3702,6 +3856,15 @@ pub fn screen_target_purges(
             continue;
         }
 
+        // mika#2808 — la fenêtre de P4, choisie une fois par worktree : l'état
+        // du dernier consommateur est une propriété de la PR, pas d'un cache.
+        // Une absence vaut `Unknown`, donc la fenêtre pleine.
+        let consumer_state = consumer.get(&refusal.path).copied().unwrap_or_default();
+        let window_secs = match consumer_state {
+            ConsumerState::Done => cfg.consumer_done_idle_secs,
+            ConsumerState::Pending | ConsumerState::Unknown => cfg.idle_secs,
+        };
+
         for dir in dirs {
             let push_dir_refusal = |out: &mut TargetPurgeSelection, reason: &'static str| {
                 out.refusals.push(TargetPurgeRefusal {
@@ -3736,7 +3899,7 @@ pub fn screen_target_purges(
                 push_dir_refusal(&mut out, PURGE_REASON_MTIME_UNREADABLE);
                 continue;
             };
-            if idle_secs < cfg.idle_secs {
+            if idle_secs < window_secs {
                 push_dir_refusal(&mut out, PURGE_REASON_RECENTLY_ACTIVE);
                 continue;
             }
@@ -3747,6 +3910,8 @@ pub fn screen_target_purges(
                 branch: refusal.branch.clone(),
                 idle_secs,
                 keep_reason: refusal.reason,
+                consumer_state: consumer_state.as_str(),
+                window_secs,
             });
         }
     }
@@ -3813,10 +3978,11 @@ pub fn select_target_purges(
     live: &LiveCwds,
     build_dirs: &HashMap<String, Vec<String>>,
     states: &HashMap<String, TargetState>,
+    consumer: &HashMap<String, ConsumerState>,
     probes: &HashMap<String, LockProbe>,
     cfg: &TargetPurgeConfig,
 ) -> TargetPurgeSelection {
-    let screened = screen_target_purges(reaper_refusals, live, build_dirs, states, cfg);
+    let screened = screen_target_purges(reaper_refusals, live, build_dirs, states, consumer, cfg);
     let mut final_pass = apply_lock_probes(screened.candidates, probes);
     let mut refusals = screened.refusals;
     refusals.append(&mut final_pass.refusals);
@@ -4458,6 +4624,11 @@ struct TargetPurgeStats {
 /// - l'index des PR — nécessaire au `pr_number` de la surface opérateur. Depuis
 ///   mika#2518 il porte aussi la population détachée.
 /// - le budget — **celui de la purge**, distinct de celui du faucheur.
+///
+/// `reviewed_branches` (mika#2808) rend, par branche, « au moins une revue
+/// soumise ». Une carte **vide** est l'état dégradé nominal : elle fait de
+/// chaque `pr_open` un [`ConsumerState::Unknown`], donc rend la fenêtre de
+/// quatre heures à tout le monde.
 #[allow(clippy::too_many_arguments)]
 async fn purge_stale_target_dirs(
     db: &AsyncDatabase,
@@ -4469,6 +4640,7 @@ async fn purge_stale_target_dirs(
     live: &LiveCwds,
     now: DateTime<Utc>,
     cfg: &TargetPurgeConfig,
+    reviewed_branches: &HashMap<String, bool>,
     budget: &mut usize,
     stats: &mut TargetPurgeStats,
 ) {
@@ -4507,7 +4679,30 @@ async fn purge_stale_target_dirs(
         build_dirs.insert(refusal.path.clone(), dirs);
     }
 
-    let screened = screen_target_purges(&reaper_refusals, live, &build_dirs, &states, cfg);
+    // mika#2808 — l'état du dernier consommateur, **une entrée par worktree**,
+    // construite ici parce que c'est le seul point où le motif de conservation,
+    // l'index des PR et la carte des revues sont vivants ensemble.
+    //
+    // `has_pr` vient de `prs`, déjà en main : le contrôle de cohérence de
+    // `consumer_state_for` ne coûte aucun appel.
+    let mut consumer: HashMap<String, ConsumerState> = HashMap::new();
+    for refusal in &reaper_refusals {
+        if !is_purge_eligible_reason(refusal.reason) {
+            continue;
+        }
+        let branch = refusal.branch.as_deref();
+        let has_pr = branch.and_then(|b| prs.by_branch(b)).is_some();
+        // Un worktree détaché n'a pas de branche : la question des revues ne se
+        // pose pas sur lui, et `None` vaut `Unknown` dans la table.
+        let branch_reviewed = branch.and_then(|b| reviewed_branches.get(b).copied());
+        consumer.insert(
+            refusal.path.clone(),
+            consumer_state_for(refusal.reason, has_pr, branch_reviewed),
+        );
+    }
+
+    let screened =
+        screen_target_purges(&reaper_refusals, live, &build_dirs, &states, &consumer, cfg);
     for refusal in &screened.refusals {
         stats.refused += 1;
         record_purge_refusal(db, session_id, refusal, now, trace_id).await;
@@ -4657,6 +4852,11 @@ async fn purge_stale_target_dirs(
             // mika#2619 AC4 — le motif de conservation du faucheur, pour que la
             // population élargie se compte séparément.
             keep_reason = candidate.keep_reason,
+            // mika#2808 AC1 — l'état qui a choisi la fenêtre, et la fenêtre
+            // elle-même : `jq 'select(.consumer_state == "done")'` est la sonde
+            // de post-déploiement.
+            consumer_state = candidate.consumer_state,
+            window_secs = candidate.window_secs,
             bytes_reclaimed = size.bytes,
             bytes_reclaimed_truncated = size.truncated,
             disposition = cfg.disposition.as_str(),
@@ -4716,12 +4916,15 @@ async fn record_purged(
     trace_id: &str,
 ) {
     let reasoning = format!(
-        "pr={} branch={} keep_reason={} idle_secs={} bytes_reclaimed={} truncated={} disposition={}",
+        "pr={} branch={} keep_reason={} consumer_state={} window_secs={} idle_secs={} \
+         bytes_reclaimed={} truncated={} disposition={}",
         pr_number
             .map(|n| n.to_string())
             .unwrap_or_else(|| "null".to_string()),
         candidate.branch.as_deref().unwrap_or("(detached)"),
         candidate.keep_reason,
+        candidate.consumer_state,
+        candidate.window_secs,
         candidate.idle_secs,
         size.bytes
             .map(|b| b.to_string())
@@ -6807,6 +7010,9 @@ branch refs/heads/fix/live/x
             live,
             &purge_dirs(wt),
             &purge_states(wt, state),
+            // Carte vide ⇒ `Unknown` ⇒ fenêtre pleine : le prédicat historique,
+            // inchangé (mika#2808).
+            &HashMap::new(),
             &HashMap::from([(target, probe)]),
             &TargetPurgeConfig::default(),
         )
@@ -6842,6 +7048,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -7009,6 +7216,7 @@ branch refs/heads/fix/live/x
             &[pr_open_refusal(&wt, "fix/2497/x")],
             &no_processes(),
             &purge_dirs(&wt),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &TargetPurgeConfig::default(),
@@ -7239,6 +7447,7 @@ branch refs/heads/fix/live/x
                     idle_secs: Some(PURGE_IDLE_DEFAULT_SECS + 600),
                 },
             ),
+            &HashMap::new(),
             &free_lock(&target_dir_of(&dehors.to_string_lossy())),
             &TargetPurgeConfig::default(),
         );
@@ -7319,6 +7528,7 @@ branch refs/heads/fix/live/x
                 disposition: Disposition::Observe,
                 ..TargetPurgeConfig::default()
             },
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -7372,6 +7582,7 @@ branch refs/heads/fix/live/x
                 enabled: false,
                 ..TargetPurgeConfig::default()
             },
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -7449,6 +7660,7 @@ branch refs/heads/fix/live/x
                     idle_secs: Some(PURGE_IDLE_DEFAULT_SECS + 600),
                 },
             ),
+            &HashMap::new(),
             &TargetPurgeConfig::default(),
         );
         let purged: Vec<&str> = purge
@@ -7489,6 +7701,7 @@ branch refs/heads/fix/live/x
                     idle_secs: Some(PURGE_IDLE_DEFAULT_SECS + 600),
                 },
             ),
+            &HashMap::new(),
             &TargetPurgeConfig::default(),
         );
         assert_eq!(
@@ -8013,6 +8226,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -8124,6 +8338,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -8203,6 +8418,7 @@ branch refs/heads/fix/live/x
                 disposition: Disposition::Observe,
                 ..TargetPurgeConfig::default()
             },
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -8241,6 +8457,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -8534,6 +8751,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -8587,6 +8805,7 @@ branch refs/heads/fix/live/x
                         idle_secs: Some(99_999),
                     },
                 ),
+                &HashMap::new(),
                 &free_lock(&target_dir_of(&path)),
                 &TargetPurgeConfig::default(),
             )
@@ -8647,6 +8866,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -9782,6 +10002,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -9832,6 +10053,7 @@ branch refs/heads/fix/live/x
                         idle_secs: Some(PURGE_IDLE_DEFAULT_SECS + 600),
                     },
                 )]),
+                &HashMap::new(),
                 &HashMap::from([(flat[0].clone(), LockProbe::Held)]),
                 &TargetPurgeConfig::default(),
             );
@@ -10040,6 +10262,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -10192,6 +10415,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -10340,6 +10564,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -10363,6 +10588,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -10573,6 +10799,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -10630,6 +10857,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -10671,6 +10899,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             &HashMap::from([(path.clone(), vec![])]),
             &HashMap::new(),
+            &HashMap::new(),
             &TargetPurgeConfig::default(),
         );
         assert_eq!(purge_reasons(&selection), vec![PURGE_REASON_NO_TARGET_DIR]);
@@ -10684,6 +10913,7 @@ branch refs/heads/fix/live/x
             &[refusal_with(&wt, "fix/2619/x", REASON_PR_OPEN)],
             &live,
             &dirs,
+            &HashMap::new(),
             &HashMap::new(),
             &TargetPurgeConfig::default(),
         );
@@ -10717,6 +10947,7 @@ branch refs/heads/fix/live/x
                 &no_processes(),
                 now(),
                 &TargetPurgeConfig::default(),
+                &HashMap::new(),
                 &mut budget,
                 &mut stats,
             )
@@ -11055,6 +11286,7 @@ branch refs/heads/fix/live/x
             &LiveCwds::Enumerated(vec![wt.join(".pilot-scratch/ac6/a")]),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
@@ -11130,6 +11362,7 @@ branch refs/heads/fix/live/x
             &no_processes(),
             now(),
             &TargetPurgeConfig::default(),
+            &HashMap::new(),
             &mut budget,
             &mut stats,
         )
