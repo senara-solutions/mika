@@ -4410,9 +4410,10 @@ impl Database {
         ))
     }
 
-    /// The `result` of the **most recent** terminal groom callback for a GitHub
-    /// issue (mika#2545). Sister of [`Self::has_completed_groom_for_issue`]: same
-    /// join, same agent scoping, same tolerance for the legacy
+    /// The `result` of **every** terminal groom callback for a GitHub issue,
+    /// **newest first** (mika#2545, reshaped by mika#2795). Sister of
+    /// [`Self::has_completed_groom_for_issue`]: same join, same agent scoping,
+    /// same tolerance for the legacy
     /// [`crate::task_state::tasks::GROOM_PHASE_SUFFIX`] on the parent's URL.
     ///
     /// # Why the LAST groom, never "does an ESCALATE exist"
@@ -4421,7 +4422,31 @@ impl Database {
     /// a question about the current state, not about history. A ticket escalated
     /// and then re-groomed successfully must become dispatchable again; an
     /// `EXISTS`-shaped predicate would block it for ever and turn a brake into a
-    /// wall. Hence `ORDER BY … LIMIT 1` rather than a `COUNT`.
+    /// wall. Hence an **ordered** list the caller walks until it finds the first
+    /// row that actually carries a verdict, rather than a `COUNT`.
+    ///
+    /// # Why the list is returned whole, and not pre-filtered (mika#2795)
+    ///
+    /// Until mika#2795 this method carried `LIMIT 1` and returned that single
+    /// row. The row it returned was not always a groom *verdict*: the deferred
+    /// launcher promoted by `promote_next_deferred_callback_for_class` is a
+    /// terminal `dispatch_class='groom'` callback too, and its `result` is
+    /// `deferred dispatch slot freed` — no `Outcome:` line at all. On mika#2762
+    /// (2026-10-18) one such row, written at 18:20:02, masked an `ESCALATE` from
+    /// 18:13; the gate let the re-dispatch through and it cost a groom pilot
+    /// plus an architect pass. Seven minutes later, the same gate refused.
+    ///
+    /// So the row selection moved to the caller —
+    /// `skills::executor::groom_verdict_from_rows` — and the **whole** ordered
+    /// list comes back. The skip is deliberately **not** an SQL `WHERE` on the
+    /// marker: doctrine mika#2590 on the sister above, *a line discarded by SQL
+    /// is invisible to the verdict*, and here it would also be uncountable —
+    /// the `skipped_neutral` field of the `groom_verdict_selected` probe exists
+    /// precisely to say how many neutral rows were walked over, and a pre-filter
+    /// would make it read zero on the exact population it was added to see.
+    /// Cardinality does not argue for one either: the join already bounds the
+    /// result to a handful of rows per issue (`dispatch_class='groom'` +
+    /// terminal status + the parent's URL).
     ///
     /// # Why `created_at DESC, id DESC`
     ///
@@ -4434,52 +4459,62 @@ impl Database {
     /// inside the same second — which the ISO-8601 second-resolution timestamps
     /// make representable — and deliberately not more than that: `tasks.id` is a
     /// UUID v4, so the tiebreak is reproducible, **never chronological**. Named
-    /// rather than implied, because the difference matters if the population
-    /// ever stops being empty: two terminal groom callbacks under one parent
-    /// inside one second is unreachable today (a groom dispatch runs for
-    /// minutes, and its class cap is 1 — `max_concurrent_for_class`), so the
-    /// tiebreak only ever has to stop the answer depending on SQLite's scan
-    /// order. Should that change, the fix is a monotonic discriminator, not a
-    /// second sort key.
+    /// rather than implied, because the difference matters now that the
+    /// population is no longer capped at one row: the deferred launcher and the
+    /// verdict it hid can be born inside the same second, and the walk's answer
+    /// must not depend on SQLite's scan order. Should the order ever need to
+    /// mean more than *reproducible*, the fix is a monotonic discriminator, not
+    /// a second sort key.
     ///
-    /// # Two levels of `Option`, and they say different things
+    /// # The `Option` inside the `Vec`
     ///
-    /// - `Ok(None)` — **no** terminal groom callback for this issue. The nominal
-    ///   shape of a ticket about to be groomed for the first time; the caller
-    ///   reads it as "never escalated".
-    /// - `Ok(Some(None))` — a callback exists and its `result` column is NULL.
-    ///   Anomalous (the completion write path always carries a result), and the
-    ///   caller reads it as *unreadable* rather than guessing a verdict.
-    /// - `Ok(Some(Some(text)))` — the callback's `result`, verbatim. The verdict
-    ///   is derived from it by the pure function
-    ///   `skills::executor::groom_escalate_verdict`, never here: this method
-    ///   returns a fact, the marker's grammar is the caller's business.
+    /// One element per terminal groom callback, in `created_at DESC, id DESC`
+    /// order. `Some(text)` is that callback's `result` verbatim; `None` is a
+    /// `result` column that is NULL — anomalous (the completion write path
+    /// always carries a result), and the caller reads it as *unreadable* rather
+    /// than guessing a verdict or skipping it. An **empty** `Vec` means no
+    /// terminal groom callback for this issue at all: the nominal shape of a
+    /// ticket about to be groomed for the first time, which the caller reads as
+    /// "never escalated".
+    ///
+    /// The marker's grammar stays the caller's business — this method returns
+    /// facts, and `skills::executor::groom_escalate_verdict` turns the one
+    /// selected row into a verdict.
+    ///
+    /// # Why the sister did not move
+    ///
+    /// [`Self::has_completed_groom_for_issue`] already returns no row at all:
+    /// it collects the same join with `query_map` and decides in Rust, and its
+    /// `GroomConvergence` aggregation reads *every* row by construction — a
+    /// neutral launcher row contributes `Absent` and is outvoted by any real
+    /// marker. It answers *"has a groom converged here?"*, which no single row
+    /// can mask, so mika#2795 leaves it byte for byte intact. Its shape is this
+    /// method's model, not its co-defendant.
     ///
     /// Read-only. An `Err` is a DB failure and the caller refuses (fail-closed,
     /// like `has_completed_groom_for_issue` on the same gate).
-    pub fn latest_groom_verdict_for_issue(
+    pub fn groom_callback_results_newest_first(
         &self,
         agent_id: &str,
         issue_url: &str,
-    ) -> Result<Option<Option<String>>> {
+    ) -> Result<Vec<Option<String>>> {
         let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
-        let row: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "SELECT child.result FROM tasks child
-                 JOIN tasks parent ON child.parent_task_id = parent.id
-                 WHERE child.agent_id = ?1
-                   AND child.trigger_type = 'callback'
-                   AND child.dispatch_class = 'groom'
-                   AND child.status IN ('completed', 'delivered')
-                   AND parent.reference_url IN (?2, ?3)
-                 ORDER BY child.created_at DESC, child.id DESC
-                 LIMIT 1",
-                params![agent_id, exact_url, legacy_groom_url],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
-        Ok(row)
+        let mut stmt = self.conn.prepare(
+            "SELECT child.result FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE child.agent_id = ?1
+               AND child.trigger_type = 'callback'
+               AND child.dispatch_class = 'groom'
+               AND child.status IN ('completed', 'delivered')
+               AND parent.reference_url IN (?2, ?3)
+             ORDER BY child.created_at DESC, child.id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, exact_url, legacy_groom_url], |row| {
+                row.get::<_, Option<String>>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// `(created_at, result)` of the `limit` most recent terminal groom callbacks

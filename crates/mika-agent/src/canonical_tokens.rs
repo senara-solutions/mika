@@ -5693,7 +5693,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             "mika#2638 — seulement {population_in} comparaison(s) `{colonne} IN (…)` \
              vue(s), attendu au moins 5 : les deux sondes de vol, le nettoyage de \
              mika#1934, et les deux lecteurs de verdict de groom \
-             (`has_completed_groom_for_issue`, `latest_groom_verdict_for_issue`).\n\n\
+             (`has_completed_groom_for_issue`, `groom_callback_results_newest_first`).\n\n\
              DEUX LECTURES, et la seconde est la plus probable : soit une requête \
              protégée a disparu, soit ce seuil est à zéro marge et vous venez de \
              REFORMATER un littéral SQL. Ce compte se fait LIGNE PAR LIGNE : une \
@@ -5769,8 +5769,9 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// n'enlève aucun appelant et n'en ajoute aucun, donc le compte ne bouge
     /// pas. Mesuré sur ce ticket même — la première version de ce scan était
     /// **verte** avec deux bypasses dans l'arbre
-    /// (`has_completed_groom_for_issue` et `latest_groom_verdict_for_issue`
-    /// faisaient `format!("{}{}", issue_url, GROOM_PHASE_SUFFIX)` puis
+    /// (`has_completed_groom_for_issue` et le lecteur du dernier verdict —
+    /// depuis mika#2795 `groom_callback_results_newest_first` — faisaient
+    /// `format!("{}{}", issue_url, GROOM_PHASE_SUFFIX)` puis
     /// `IN (?2, ?3)`), c'est-à-dire exactement l'état que son propre message de
     /// RÉSOLUTION demandait au lecteur d'aller chercher. Une garde dont le
     /// prédicat ne peut pas atteindre la faute qu'elle nomme est une

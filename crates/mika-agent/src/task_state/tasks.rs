@@ -313,7 +313,7 @@ pub fn strip_groom_phase_suffix(reference_url: &str) -> &str {
 /// | `Database::find_dispatch_children_for_issue_url` | « un pilote est-il vif pour ce ticket ? » — lecteur unique de [`crate::live_pilot`] (mika#2279) |
 /// | `Database::find_active_tracking_rows_by_reference_url_and_variants` | « quelles lignes de suivi nettoyer ? » (mika#1934) |
 /// | `Database::has_completed_groom_for_issue` | « ce ticket a-t-il un groom convergé ? » (mika#1620 / mika#2287) |
-/// | `Database::latest_groom_verdict_for_issue` | « quel est son dernier verdict de groom ? » |
+/// | `Database::groom_callback_results_newest_first` | « quels sont ses callbacks de groom, du plus récent au plus ancien ? » (mika#2795) |
 ///
 /// Les **trois derniers étaient déjà délimités** et sont réécrits à travers ce
 /// helper **sans changement de comportement** : leur sortie est octet pour

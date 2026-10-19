@@ -2143,6 +2143,23 @@ pub(crate) const GROOM_ESCALATE_REFUSED_EVENT: &str = "groom_escalate_redispatch
 /// dont il est le pendant d'échec.
 pub(crate) const GROOM_ESCALATE_MARKER: &str = "Outcome: ESCALATE";
 
+/// Ce qui fait d'une ligne de `result` une **disposition** plutôt qu'un
+/// événement de plomberie (mika#2795).
+///
+/// Le préfixe de l'enveloppe de callback, dont [`GROOM_ESCALATE_MARKER`] est une
+/// valeur particulière. Un callback de groom terminal qui ne porte **aucune**
+/// ligne commençant par ce préfixe n'a rendu aucun verdict : le lanceur différé
+/// promu par `promote_next_deferred_callback_for_class` en est un
+/// (`result = "deferred dispatch slot freed"`), et sur mika#2762 il a masqué
+/// l'`ESCALATE` posé sept minutes plus tôt parce que le lecteur retenait la
+/// ligne la plus récente sans regarder si elle disait quoi que ce soit.
+///
+/// Même ancrage que le marqueur : `starts_with` sur une **ligne**, jamais un
+/// `contains` sur le texte. La prose d'un pilote cite ces en-têtes en parlant du
+/// mécanisme — c'est le faux positif mesuré sur le Signal S (mika#2050) et les
+/// 651 fausses détections d'`instr` (mika#2105).
+pub(crate) const GROOM_OUTCOME_LINE_PREFIX: &str = "Outcome: ";
+
 /// Le champ `verdict` du refus mika#2545 : un **format de fil**.
 ///
 /// Il atterrit dans `audit_events.after_value` **et** dans le JSON écrit sur
@@ -2167,6 +2184,31 @@ pub const ALL_GROOM_ESCALATE_VERDICTS: &[&str] = &[
     GROOM_ESCALATE_VERDICT_ESCALATED,
     GROOM_ESCALATE_VERDICT_UNREADABLE,
 ];
+
+/// Le troisième mot du champ `verdict` de la **sonde** mika#2795 — et
+/// délibérément **pas** une entrée d'[`ALL_GROOM_ESCALATE_VERDICTS`].
+///
+/// Cette table-là énumère les motifs de **refus**, tels qu'ils atterrissent dans
+/// `audit_events.after_value` et dans le JSON de `tasks.result` ; sa cardinalité
+/// de 2 est un format de fil, assertée par
+/// `mika2545_the_two_refusal_verdicts_are_a_wire_format`. Le cas nominal n'est
+/// pas un refus et n'a jamais rien écrit là. Il a besoin d'un nom quand même,
+/// parce que la sonde ci-dessous parle sur **toutes** ses branches, y compris
+/// celle où rien n'est refusé : une sonde muette dans le cas sain ne distingue
+/// pas « lu, rien à signaler » de « jamais passé ici » (mika#2205).
+pub(crate) const GROOM_VERDICT_NOT_ESCALATED: &str = "not_escalated";
+
+/// La sonde de la sélection de ligne (mika#2795).
+///
+/// Émise à **chaque** lecture du verdict, y compris quand `skipped_neutral`
+/// vaut zéro. Le contrôle positif est le point : le défaut de mika#2762 était
+/// invisible parce que « le dernier groom n'a pas escaladé » et « le dernier
+/// callback ne disait rien » rendaient les mêmes octets. La ligne porte le
+/// compteur, donc elle rend la population des sauts **comptable** ; son absence
+/// signifie un binaire antérieur à ce correctif (classe mika#2340), jamais zéro
+/// saut (classe mika#2331), et un réglage qu'on ne peut pas observer n'est pas
+/// un réglage (mika#2293).
+pub(crate) const GROOM_VERDICT_SELECTED_EVENT: &str = "groom_verdict_selected";
 
 /// Est-ce que le dernier grooming de ce ticket a rendu un verdict de halte ?
 /// (mika#2545)
@@ -2221,20 +2263,126 @@ pub(crate) fn groom_escalate_verdict(result: Option<String>) -> GroomVerdictStat
     }
 }
 
+/// Ce `result` porte-t-il une ligne de disposition ? (mika#2795)
+///
+/// **Fonction pure**, ancrée sur la ligne — voir [`GROOM_OUTCOME_LINE_PREFIX`]
+/// pour la raison de l'ancrage. Elle ne dit pas *quelle* disposition : c'est
+/// [`groom_escalate_verdict`] qui tranche, et elle n'est appelée que sur une
+/// ligne dont celle-ci a déjà dit qu'elle en portait une.
+pub(crate) fn carries_groom_outcome_line(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with(GROOM_OUTCOME_LINE_PREFIX))
+}
+
+/// Le résultat de la sélection de ligne : l'état **et** de quoi le rendre
+/// observable (mika#2795).
+///
+/// Les deux compteurs ne sont pas de la décoration : `rows_examined` dit la
+/// taille de la population que la jointure a bornée, `skipped_neutral` dit
+/// combien de ces lignes ne portaient aucune disposition. Sans eux, un verdict
+/// `not_escalated` ne distingue pas « le dernier groom a vraiment convergé » de
+/// « on a marché sur trois lignes de plomberie et il n'y avait rien derrière ».
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroomVerdictSelection {
+    /// L'état retenu, à rendre au site de la garde.
+    pub(crate) state: GroomVerdictState,
+    /// Combien de callbacks terminaux ont été sautés faute de ligne de
+    /// disposition.
+    pub(crate) skipped_neutral: usize,
+    /// La taille de la liste rendue par la base, avant toute sélection.
+    pub(crate) rows_examined: usize,
+}
+
+/// La sélection de ligne, **du plus récent au plus ancien** (mika#2795).
+///
+/// **Fonction pure**, testable aux bornes sans base. Quatre cas et pas un
+/// cinquième, dans cet ordre de lecture :
+///
+/// 1. `Some(text)` **sans** ligne de disposition → on **saute**, et on compte le
+///    saut. C'est le lanceur différé, et c'est tout le correctif.
+/// 2. `None` (colonne `result` NULL) → on **s'arrête**, `Unreadable`. Ce cas
+///    ressemble à un saut et n'en est **délibérément pas un** : sauter une
+///    anomalie, ce serait laisser passer un re-dispatch sur une preuve qu'on
+///    n'a pas pu lire, donc rouvrir le trou par l'autre bout. Fail-closed.
+/// 3. `Some(text)` **avec** une ligne de disposition → on **s'arrête**, et on
+///    délègue à [`groom_escalate_verdict`], inchangée : la grammaire du marqueur
+///    reste à un seul site.
+/// 4. Liste vide, ou épuisée par des sauts → [`GroomVerdictState::NotEscalated`].
+///    Le cas nominal du tout premier grooming, et aussi celui d'un ticket dont
+///    tous les callbacks de groom sont de la plomberie.
+///
+/// Le tri vient du SQL (`created_at DESC, id DESC`) et **pas** d'un filtre SQL :
+/// une ligne écartée par la base serait invisible à `skipped_neutral`, donc le
+/// compteur mesurerait zéro sur exactement la population qu'il existe pour voir
+/// (doctrine mika#2590).
+pub(crate) fn groom_verdict_from_rows(rows: Vec<Option<String>>) -> GroomVerdictSelection {
+    let rows_examined = rows.len();
+    let mut skipped_neutral = 0usize;
+
+    for row in rows {
+        match row {
+            // Cas 1 — de la plomberie, pas un verdict.
+            Some(text) if !carries_groom_outcome_line(&text) => skipped_neutral += 1,
+            // Cas 2 et 3 — la première ligne qui tranche, tranche.
+            decisive => {
+                return GroomVerdictSelection {
+                    state: groom_escalate_verdict(decisive),
+                    skipped_neutral,
+                    rows_examined,
+                };
+            }
+        }
+    }
+
+    // Cas 4.
+    GroomVerdictSelection {
+        state: GroomVerdictState::NotEscalated,
+        skipped_neutral,
+        rows_examined,
+    }
+}
+
 /// Le lecteur **unique** du verdict de groom pour la garde mika#2545 : de l'URL
 /// d'issue à l'état, base comprise.
 ///
-/// `Ok(None)` de la base — aucun callback de groom terminal — est traduit en
-/// [`GroomVerdictState::NotEscalated`] **ici et non dans la fonction pure** :
-/// c'est le cas nominal du tout premier grooming, et le fondre avec le `result`
-/// NULL le ferait tomber en `Unreadable`, donc en refus, donc aucun ticket ne
-/// pourrait plus être groomé.
+/// Une liste vide — aucun callback de groom terminal — est traduite en
+/// [`GroomVerdictState::NotEscalated`] par [`groom_verdict_from_rows`] et non
+/// par [`groom_escalate_verdict`] : c'est le cas nominal du tout premier
+/// grooming, et le fondre avec le `result` NULL le ferait tomber en
+/// `Unreadable`, donc en refus, donc aucun ticket ne pourrait plus être groomé.
+///
+/// La signature n'a pas bougé (mika#2795) : le site de la garde appelle la même
+/// fonction et fait le même `match` exhaustif. Ce qui a changé est derrière —
+/// la base rend désormais **toutes** les lignes et la sélection se fait ici,
+/// parce que la plus récente n'est pas toujours celle qui dit quelque chose.
 pub(crate) async fn groom_verdict_state(db: &AsyncDatabase, issue_url: &str) -> GroomVerdictState {
-    match db.latest_groom_verdict_for_issue(issue_url).await {
-        Ok(None) => GroomVerdictState::NotEscalated,
-        Ok(Some(result)) => groom_escalate_verdict(result),
-        Err(e) => GroomVerdictState::Unreadable(format!("DB error: {e}")),
-    }
+    let rows = match db.groom_callback_results_newest_first(issue_url).await {
+        Ok(rows) => rows,
+        Err(e) => return GroomVerdictState::Unreadable(format!("DB error: {e}")),
+    };
+
+    let selection = groom_verdict_from_rows(rows);
+    let verdict = match &selection.state {
+        GroomVerdictState::Escalated => GROOM_ESCALATE_VERDICT_ESCALATED,
+        GroomVerdictState::Unreadable(_) => GROOM_ESCALATE_VERDICT_UNREADABLE,
+        GroomVerdictState::NotEscalated => GROOM_VERDICT_NOT_ESCALATED,
+    };
+
+    // Sur TOUTES les branches, y compris `skipped_neutral == 0` : le contrôle
+    // positif est ce qui rend la population des sauts comptable, et son absence
+    // dit « binaire antérieur », jamais « aucun saut ».
+    info!(
+        target: "mika::otel",
+        event = GROOM_VERDICT_SELECTED_EVENT,
+        issue_url = issue_url,
+        rows_examined = selection.rows_examined,
+        skipped_neutral = selection.skipped_neutral,
+        verdict = verdict,
+        "mika#2795 — groom verdict selected from the terminal groom callbacks, \
+         newest first, skipping those that carry no disposition line"
+    );
+
+    selection.state
 }
 
 // ───────── mika#2786 — le frein sur les retenues d'ancrage ─────────
@@ -10759,7 +10907,16 @@ mod tests {
     }
 
     /// Bypass via skill: `dev-groom` is fresh grooming, not implementation re-run.
+    ///
+    /// `#[serial_test::serial]` depuis mika#2795, et pour une raison qui n'est
+    /// pas la sienne : ce test traverse tout le gate, donc atteint le callsite
+    /// `groom_verdict_selected` de `groom_verdict_state`. S'il y arrive le
+    /// premier sans abonné, il éteint ce callsite **globalement** et la capture
+    /// de `mod mika2545_escalate_terminal` ne voit plus rien (mika#2646). Le
+    /// raisonnement complet, et la clôture par lecture de la population, sont au
+    /// § *La sonde* de ce module-là.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_open_pr_guard_bypasses_dev_groom_skill() {
         let db = crate::db::Database::open_in_memory().unwrap();
         let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
@@ -13469,7 +13626,7 @@ Harness ticket.
     mod mika2545_escalate_terminal {
         use super::*;
         use crate::async_db::AsyncDatabase;
-        use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent};
+        use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent, set_created_at};
 
         /// Le `result` que `_escalate_groom` écrit depuis mika#2545.
         const ESCALATED: &str = "claude-pilot completed (status: done).\n\
@@ -13477,6 +13634,13 @@ Harness ticket.
              Verdict: ESCALATE — human review required.\n\
              \n\
              Outcome: ESCALATE — first-pass";
+
+        /// Le `result` que `promote_next_deferred_callback_for_class` écrit sur
+        /// le lanceur différé promu. C'est un callback terminal
+        /// `dispatch_class='groom'` lui aussi, et il ne porte **aucune** ligne
+        /// `Outcome:` — la ligne de 18:20:02 qui a masqué l'`ESCALATE` de 18:13
+        /// sur mika#2762.
+        const DEFERRED_LAUNCHER: &str = "deferred dispatch slot freed";
 
         fn dispatch_input(skill: &str, prompt: &str) -> serde_json::Value {
             serde_json::json!({ "skill": skill, "prompt": prompt, "task_id": "t-2545" })
@@ -13551,6 +13715,141 @@ Harness ticket.
             );
         }
 
+        // --- La sélection de ligne (mika#2795) --------------------------------
+        //
+        // Quatre cas, et pas un cinquième. Un test par cas, plus l'ancrage du
+        // prédicat et le contrôle qui dit que les lignes ANCIENNES ne votent
+        // pas : c'est la propriété mika#2545 (« le DERNIER groom », jamais « un
+        // ESCALATE existe-t-il ») qui doit survivre au saut.
+
+        /// Des `result` présents, du plus récent au plus ancien.
+        fn rows(results: &[&str]) -> Vec<Option<String>> {
+            results.iter().map(|r| Some((*r).to_string())).collect()
+        }
+
+        /// **Cas 1 — le défaut de mika#2762, au niveau du prédicat.** La row du
+        /// lanceur est en tête et ne dit rien ; l'`ESCALATE` derrière elle est
+        /// le verdict, et le saut est **compté**.
+        #[test]
+        fn mika2795_une_row_neutre_ne_masque_plus_lescalate_derriere() {
+            let selection = groom_verdict_from_rows(rows(&[DEFERRED_LAUNCHER, ESCALATED]));
+            assert_eq!(selection.state, GroomVerdictState::Escalated);
+            assert_eq!(
+                selection.skipped_neutral, 1,
+                "la population sautée est ce que la sonde existe pour mesurer"
+            );
+            assert_eq!(selection.rows_examined, 2);
+        }
+
+        /// **Cas 2 — et le `None` n'est délibérément PAS un saut.** Une colonne
+        /// `result` NULL sur un callback terminal est une anomalie, pas de la
+        /// plomberie : la sauter laisserait passer un re-dispatch sur une preuve
+        /// illisible, donc rouvrirait le trou par l'autre bout. Elle arrête la
+        /// marche, fail-closed, et les sauts déjà faits restent comptés.
+        #[test]
+        fn mika2795_un_result_null_arrete_la_marche_en_illisible() {
+            let selection = groom_verdict_from_rows(vec![
+                Some(DEFERRED_LAUNCHER.to_string()),
+                None,
+                Some(ESCALATED.to_string()),
+            ]);
+            assert!(
+                matches!(selection.state, GroomVerdictState::Unreadable(_)),
+                "attendu fail-closed, obtenu {:?}",
+                selection.state
+            );
+            assert_eq!(selection.skipped_neutral, 1);
+            assert_eq!(
+                selection.rows_examined, 3,
+                "le compteur porte la liste REÇUE, pas la portion parcourue — \
+                 c'est ce qui rend « 3 lues, 1 sautée » soustractible"
+            );
+        }
+
+        /// **Cas 3 — la liste vide.** Le premier grooming d'un ticket, le cas le
+        /// plus fréquent de la flotte : aucun groom n'a escaladé.
+        #[test]
+        fn mika2795_une_liste_vide_na_pas_escalade() {
+            let selection = groom_verdict_from_rows(Vec::new());
+            assert_eq!(selection.state, GroomVerdictState::NotEscalated);
+            assert_eq!(selection.skipped_neutral, 0);
+            assert_eq!(selection.rows_examined, 0);
+        }
+
+        /// **Cas 4 — la liste épuisée.** Que des lignes de plomberie : personne
+        /// n'a rendu de disposition, donc personne n'a escaladé. À distinguer du
+        /// cas 2 : ici tout est lisible, il n'y a simplement pas de verdict.
+        #[test]
+        fn mika2795_des_rows_neutres_seules_nont_pas_escalade() {
+            let selection = groom_verdict_from_rows(rows(&[DEFERRED_LAUNCHER, DEFERRED_LAUNCHER]));
+            assert_eq!(selection.state, GroomVerdictState::NotEscalated);
+            assert_eq!(selection.skipped_neutral, 2);
+            assert_eq!(selection.rows_examined, 2);
+        }
+
+        /// **mika#2545 intact : le DERNIER groom, jamais « un ESCALATE
+        /// existe-t-il ».** Une escalade suivie d'un grooming convergé se lit
+        /// `NotEscalated` — le saut ne transforme pas le lecteur en `EXISTS`,
+        /// sinon un ticket ayant escaladé une fois ne pourrait plus jamais être
+        /// groomé.
+        #[test]
+        fn mika2795_la_premiere_row_decisive_tranche_et_les_anciennes_ne_votent_pas() {
+            let selection = groom_verdict_from_rows(rows(&[
+                "claude-pilot completed.\nOutcome: PLAN_GROOMED",
+                ESCALATED,
+            ]));
+            assert_eq!(selection.state, GroomVerdictState::NotEscalated);
+            assert_eq!(
+                selection.skipped_neutral, 0,
+                "une row décisive n'est pas un saut"
+            );
+            assert_eq!(selection.rows_examined, 2);
+
+            // Et le frein reste un frein avec un lanceur différé posé entre les
+            // deux : la marche s'arrête sur la première ligne qui dit quelque
+            // chose, donc intercaler une row neutre derrière elle ne déplace
+            // aucun verdict. Le `rows_examined` monte, parce qu'il porte la
+            // liste reçue et non la portion parcourue.
+            let intercale = groom_verdict_from_rows(rows(&[
+                "claude-pilot completed.\nOutcome: PLAN_GROOMED",
+                DEFERRED_LAUNCHER,
+                ESCALATED,
+            ]));
+            assert_eq!(intercale.state, GroomVerdictState::NotEscalated);
+            assert_eq!(intercale.skipped_neutral, 0);
+            assert_eq!(intercale.rows_examined, 3);
+        }
+
+        /// **L'ancrage du prédicat de saut.** `carries_groom_outcome_line` est
+        /// `lines().any(starts_with)` et jamais un `contains` : la prose d'un
+        /// pilote cite ces en-têtes en parlant du mécanisme — le faux positif
+        /// mesuré sur le Signal S (mika#2050) et sur les 651 détections d'`instr`
+        /// (mika#2105). Une telle row doit être **sautée**, pas lue comme un
+        /// verdict.
+        #[test]
+        fn mika2795_le_predicat_de_saut_est_ancre_sur_la_ligne() {
+            let quoted = "deferred dispatch slot freed\n\
+                 The plan explains that `Outcome: ESCALATE` is now terminal.";
+            assert!(
+                !carries_groom_outcome_line(quoted),
+                "une mention indentée est de la prose, pas une disposition"
+            );
+            assert!(
+                carries_groom_outcome_line("claude-pilot completed.\nOutcome: PLAN_GROOMED"),
+                "contrôle de bonne foi : la vraie disposition est reconnue"
+            );
+            assert!(
+                !carries_groom_outcome_line(DEFERRED_LAUNCHER),
+                "le lanceur différé ne porte aucune ligne de disposition"
+            );
+
+            // Et le saut suit le prédicat : la row citante est sautée, celle qui
+            // suit tranche.
+            let selection = groom_verdict_from_rows(rows(&[quoted, ESCALATED]));
+            assert_eq!(selection.state, GroomVerdictState::Escalated);
+            assert_eq!(selection.skipped_neutral, 1);
+        }
+
         // --- La porte ---------------------------------------------------------
 
         /// Monte la forme que la production écrit : un parent `in_progress`
@@ -13571,9 +13870,123 @@ Harness ticket.
             (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
         }
 
+        /// Frère de [`seeded`] pour mika#2795 : **N** callbacks de groom
+        /// terminaux sous un seul parent, `results[0]` étant le **plus récent**
+        /// — l'ordre dans lequel le lecteur les rend.
+        ///
+        /// `created_at` est forcé plutôt que subi. Les timestamps sont à la
+        /// seconde, donc deux rows créées dans le même test la partagent et
+        /// l'ordre retomberait sur le départage `id DESC` du lecteur, c'est-à-dire
+        /// sur un UUID v4 : arbitraire. Or la fixture de mika#2762 **est** un
+        /// ordre — le lanceur posé *après* l'escalade — et une fixture d'ordre ne
+        /// peut pas reposer sur un hasard.
+        fn seeded_rows(results: &[&str]) -> (AsyncDatabase, String) {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            for (rank, result) in results.iter().enumerate() {
+                let callback_id = sync
+                    .create_task(&groom_callback("mika", &parent_id, "groom"))
+                    .unwrap();
+                assert!(
+                    sync.update_task_completed(&callback_id, "mika", Some(result))
+                        .unwrap()
+                );
+                set_created_at(
+                    &sync,
+                    &callback_id,
+                    &format!("2026-10-18T18:{:02}:00Z", 59 - rank),
+                );
+            }
+            (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        // --- La sonde (mika#2795) ---------------------------------------------
+        //
+        // Même forme que `task_engine::engine::tests` et `teams::engine::tests`.
+        // L'installation passe par `test_helpers::install_capturing_subscriber`,
+        // le site unique permis par mika#2646.
+        //
+        // **`#[serial_test::serial]` porte sur les SEPT tests qui atteignent le
+        // callsite, pas seulement sur les deux qui capturent** — la moitié
+        // porteuse de mika#2646. Un callsite `tracing` ne s'enregistre qu'à sa
+        // *première* atteinte, et son `Interest` est alors décidé par le défaut
+        // du thread qui l'enregistre : un voisin qui y arrive en premier sans
+        // abonné l'éteint **globalement**, y compris pour un abonné déjà
+        // installé sur un autre thread. Et `#[serial]` ne sérialise que contre
+        // ses propres porteurs, donc annoter les seuls capturants laisserait la
+        // course entière ouverte (défaut fondateur : PR #2643).
+        //
+        // La population est close par **lecture**, pas par prudence : le
+        // callsite vit dans `groom_verdict_state`, dont l'unique appelant est le
+        // terme 3 de `validate_dispatch_readiness`, atteint seulement quand
+        // `originating_message` est absent ET que la compétence dérive en
+        // `groom` (seul `dev-groom`, cf. `derive_dispatch_class`) ET que le
+        // prompt porte une référence lisible. Six tests de ce module satisfont
+        // les trois, plus `test_open_pr_guard_bypasses_dev_groom_skill` dans le
+        // module parent — annoté là-bas pour cette raison. Tous les autres
+        // appelants du gate passent un `originating_message` (dont
+        // `ready_label_handler`) ou refusent avant (le frein mika#2634).
+
+        type CapturedEvents =
+            std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+        struct CapturingLayer(CapturedEvents);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut std::collections::HashMap<String, String>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut fields = std::collections::HashMap::new();
+                event.record(&mut V(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        fn capture_events() -> (tracing::subscriber::DefaultGuard, CapturedEvents) {
+            use tracing_subscriber::layer::SubscriberExt;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+            let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            (guard, events)
+        }
+
+        /// La ligne de la sonde, filtrée sur son champ `event` — jamais sur le
+        /// niveau ni sur le message, qu'un voisin pourrait partager.
+        fn selected_probe(
+            events: &CapturedEvents,
+        ) -> Option<std::collections::HashMap<String, String>> {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|f| f.get("event").map(String::as_str) == Some(GROOM_VERDICT_SELECTED_EVENT))
+                .cloned()
+        }
+
         /// **Le rouge du défaut.** Le re-dispatch automatique du groom — un tour
         /// de callback, donc sans `originating_message` — est refusé à la porte.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_an_automatic_groom_redispatch_is_refused() {
             let (db, parent_id) = seeded(ESCALATED);
             let rejection = validate_dispatch_readiness(
@@ -13684,6 +14097,7 @@ Harness ticket.
         /// convergé) traverse. Sans lui, « la garde refuse un ESCALATE » ne se
         /// distingue pas de « la garde refuse tout groom ».
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_a_converged_groom_traverses_the_gate() {
             let (db, parent_id) = seeded("claude-pilot completed.\nOutcome: PLAN_GROOMED");
             let outcome = validate_dispatch_readiness(
@@ -13708,6 +14122,7 @@ Harness ticket.
         /// traverse aussi. C'est le cas le plus fréquent de la flotte, et le
         /// confondre avec « illisible » refuserait tout grooming.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_a_first_ever_groom_traverses_the_gate() {
             let sync = db();
             let parent_id = sync
@@ -13738,6 +14153,7 @@ Harness ticket.
         /// faire passer pour une escalade — les deux appellent la même
         /// disposition et deux lectures opérateur différentes.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_an_unreadable_verdict_is_refused_and_says_so() {
             let sync = db();
             let parent_id = sync
@@ -13776,6 +14192,7 @@ Harness ticket.
         /// chaque replay, brûlant un wrapper par tour sur un ticket qui ne peut
         /// pas partir. La preuve est l'absence de row `:deferred` après le refus.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_the_refusal_precedes_any_deferred_wrapper() {
             let (db, parent_id) = seeded(ESCALATED);
             let _ = validate_dispatch_readiness(
@@ -13798,6 +14215,7 @@ Harness ticket.
         /// Et le refus laisse sa trace sur `tasks.result`, la surface que
         /// `mika tasks get` et le dashboard lisent (#1108).
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_the_refusal_is_recorded_on_the_task() {
             let (db, parent_id) = seeded(ESCALATED);
             let _ = validate_dispatch_readiness(
@@ -13813,6 +14231,137 @@ Harness ticket.
             let task = db.get_task(&parent_id).await.unwrap().unwrap();
             let result = task.result.expect("le refus est écrit sur la tâche");
             assert!(result.contains(GROOM_ESCALATED_ERROR), "{result}");
+        }
+
+        // --- mika#2795 : le bout-en-bout du défaut de mika#2762 ---------------
+
+        /// **La reproduction de 18:30:55 (D2).** Deux callbacks de groom
+        /// terminaux sous le même parent : l'`ESCALATE` de 18:13, puis le
+        /// lanceur différé promu à 18:20:02. Le re-dispatch automatique de
+        /// 18:30:55 est **passé** — il a coûté un pilote de groom (1,24 $) et un
+        /// tour d'architecte — parce que le lecteur rendait la tête de liste et
+        /// que la tête de liste ne disait rien.
+        ///
+        /// Ce test atterrit **rouge sur le HEAD d'avant la pièce 4** : sans le
+        /// saut, la row du lanceur se lit « le dernier groom n'a pas escaladé »
+        /// et `validate_dispatch_readiness` rend `Ok`. C'est la démonstration
+        /// que le détecteur atteint la faute qu'il nomme (classe mika#2638 D5).
+        ///
+        /// Il porte aussi la **preuve manuelle** attachée au corps de la PR : la
+        /// ligne `groom_verdict_selected` avec `rows_examined: 2`,
+        /// `skipped_neutral: 1`, `verdict: "escalated"`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2795_le_lanceur_differe_ne_masque_plus_un_escalate() {
+            let (_guard, events) = capture_events();
+            let (db, parent_id) = seeded_rows(&[DEFERRED_LAUNCHER, ESCALATED]);
+
+            let rejection = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err(
+                "l'ESCALATE est terminal — le lanceur différé posé après lui ne \
+                 le masque plus",
+            );
+
+            assert!(rejection.contains(GROOM_ESCALATED_ERROR), "{rejection}");
+            let body: serde_json::Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(
+                body["verdict"], "escalated",
+                "le refus dit « escaladé » et non « illisible » : la row sautée \
+                 n'est pas une anomalie, c'est de la plomberie : {rejection}"
+            );
+
+            let probe = selected_probe(&events).expect(
+                "la sonde est le seul endroit où « sauté » se distingue de \
+                 « rien à sauter »",
+            );
+            assert_eq!(probe.get("rows_examined").map(String::as_str), Some("2"));
+            assert_eq!(
+                probe.get("skipped_neutral").map(String::as_str),
+                Some("1"),
+                "exactement la ligne de 18:20:02, et une seule : {probe:?}"
+            );
+            assert_eq!(
+                probe.get("verdict").map(String::as_str),
+                Some("escalated"),
+                "{probe:?}"
+            );
+        }
+
+        /// **Le contrôle négatif d'AC2.** Un lanceur différé **seul** — aucun
+        /// verdict derrière lui — ne refuse rien. Sans ce contrôle, un tri qui
+        /// refuserait *tout* passerait AC1 : la paire est ce qui sépare « saute
+        /// les neutres » de « refuse tout ». Et le cas est réel : la file
+        /// mika#1011 promeut un lanceur sur un ticket dont le grooming n'a
+        /// jamais tourné.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2795_une_row_neutre_seule_ne_refuse_rien() {
+            let (db, parent_id) = seeded_rows(&[DEFERRED_LAUNCHER]);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "une ligne de plomberie n'est pas un verdict d'escalade : \
+                     {rejection}"
+                ),
+            }
+        }
+
+        /// **Le contrôle positif de la sonde (AC5).** La ligne est émise sur
+        /// **toutes** les branches, y compris celle où rien n'a été sauté. Une
+        /// sonde qui ne parle que quand quelque chose est sauté rend « rien
+        /// sauté » indistinguable de « pas de sonde » — et c'est précisément
+        /// cette ambiguïté qui a rendu le défaut de mika#2762 invisible pendant
+        /// qu'il coûtait un pilote (classes mika#2205 / mika#2340 / mika#2293 /
+        /// mika#2331).
+        ///
+        /// Ce test rougit le jour où quelqu'un met l'`info!` sous un
+        /// `if selection.skipped_neutral > 0`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2795_la_sonde_porte_le_compteur_meme_a_zero() {
+            let (_guard, events) = capture_events();
+            let (db, _parent_id) = seeded_rows(&["claude-pilot completed.\nOutcome: PLAN_GROOMED"]);
+
+            let verdict = groom_verdict_state(&db, GROOM_ISSUE_URL).await;
+            assert_eq!(verdict, GroomVerdictState::NotEscalated);
+
+            let probe = selected_probe(&events)
+                .expect("la sonde parle AUSSI quand elle n'a rien sauté — c'est son objet");
+            assert_eq!(
+                probe.get("skipped_neutral").map(String::as_str),
+                Some("0"),
+                "zéro est une mesure ; l'absence de ligne n'en est pas une : {probe:?}"
+            );
+            assert_eq!(probe.get("rows_examined").map(String::as_str), Some("1"));
+            assert_eq!(
+                probe.get("verdict").map(String::as_str),
+                Some(GROOM_VERDICT_NOT_ESCALATED),
+                "le cas nominal a son propre mot, distinct des deux motifs de \
+                 refus du format de fil : {probe:?}"
+            );
+            assert_eq!(
+                probe.get("issue_url").map(String::as_str),
+                Some(GROOM_ISSUE_URL),
+                "la ligne nomme le ticket, sinon elle n'est pas joignable à un \
+                 incident : {probe:?}"
+            );
         }
     }
 
