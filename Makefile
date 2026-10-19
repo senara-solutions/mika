@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-measure-webhook-turn-cost test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-pilot-phase2b-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-push-scope-staging test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-pilot-instruction-paths check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-root-files check-release-debuginfo check-suite-wiring test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-measure-webhook-turn-cost test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-pilot-phase2b-argv test-demote-pipeline-failure test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-push-scope-staging test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-pilot-instruction-paths check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-root-files check-release-debuginfo check-suite-wiring test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -156,6 +156,7 @@ test: ## Run all tests
 	@bash scripts/test-pr-origin-report.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
 	@bash skills/bundled/_shared/tests/test_pilot_phase2b_argv.sh
+	@bash skills/bundled/_shared/tests/test_demote_pipeline_failure.sh
 	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_gh_usable.sh
@@ -252,6 +253,9 @@ test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbo
 
 test-pilot-phase2b-argv: ## Verify the Phase 2b entrypoint passes the pilot argv as positional parameters (mika#2077)
 	@bash skills/bundled/_shared/tests/test_pilot_phase2b_argv.sh
+
+test-demote-pipeline-failure: ## Verify a stale PIPELINE FAILURE block is demoted, never decapitated (mika#2077)
+	@bash skills/bundled/_shared/tests/test_demote_pipeline_failure.sh
 
 test-github-token-not-in-sandbox: ## Verify the GitHub token is host-reachable but sandbox-absent (mika#2056)
 	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
