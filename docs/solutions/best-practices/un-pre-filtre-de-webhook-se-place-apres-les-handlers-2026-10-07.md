@@ -144,6 +144,22 @@ Contrôle négatif : `grep webhook_prefilter_state_unreadable` avec
 `what = "pr_state"` — non vide en continu signifie que la forge n'est jamais
 lisible (jeton), donc que le terme « PR fermée » est inerte et ne compte rien.
 
+**Ce que cette règle N'exclut PAS, et qui a été lu à l'envers trois fois**
+(mika#2680, vol 4). Le corps de mika#2680 pose une classe (f) — `pr_review` sur
+une PR fermée dont le `verdict_handler` a réécrit le texte — en supposant que
+*« la règle « texte intact après handler » de la phase 2 exclut ce cas »*. Elle
+ne l'exclut pas, et c'est exactement ce que le paragraphe ci-dessus dit :
+`text_after_verdict` est pris **après** que le `verdict_handler` a rendu, donc sa
+réécriture est **dans** la fenêtre et n'entre pas dans la comparaison. Seul un
+handler **ultérieur** garde le tour. Les deux formes que le ticket cite —
+`CIRCUIT BREAKER TRIPPED` et `verdict_classification_failed` à valeur illisible —
+sont par conséquent déjà écartées par (c), sous `verdict_pr_closed` et
+`verdict_unreadable`. Il n'y a pas de classe (f) à écrire. Le constat est gelé
+par `mika2680_f_le_pr_review_reecrit_est_deja_ecarte` (quatre assertions, dont un
+contrôle négatif de même graine) plutôt que par cette prose, parce qu'un handler
+intercalé entre le `verdict_handler` et le pré-filtre le rendrait faux en
+silence : le test rougit, le paragraphe ne saurait pas.
+
 ## Découpage
 
 Phase 1 : (a) `check_suite` verte sur `main`, (d) label inerte.
@@ -151,21 +167,41 @@ Phase 2 (livrée) : (c) `pr_review` non actionnable sans tâche. Phase 3 : (b) `
 une PR déjà décidée et notifiée pour cette tête — le SHA n'est pas dans le texte
 du gateway ; la décision vit dans `ci_success_handler` après `find_open_pr`.
 Phase 4 (mika#2680) : vol 1 l'instrument, vol 2 le lecteur, vol 3 la classe
-**(e)** `closed`/`merged` d'une PR sans tâche de boucle.
+**(e)** `closed`/`merged` d'une PR sans tâche de boucle, vol 4 le **terme de
+relâche** — pourquoi un tour a eu lieu.
 
-Les cinq classes en service, et le terme d'état que chacune lit :
+Les cinq classes en service, le terme d'état que chacune lit, et le terme de
+relâche qu'elle rend quand elle **ne** filtre pas :
 
-| classe | nom de fil (`skipped_by_class`) | déclencheur | le terme d'état lu |
-|---|---|---|---|
-| (a) | `green_check_suite_default_branch` | `check_suite` verte sur `main` | aucun — le texte suffit |
-| (b) | `green_check_suite_head_decided` | `check_suite` verte sur branche de PR | l'attestation `ci_success_handler_decision_core_hold` (4 termes) |
-| (c) | `verdict_*`, `ci_failure_*` | `pr_review` | `find_active_task_by_pr_url`, puis la forge en dernier |
-| (d) | `inert_label` | `issues labeled` | aucun — l'ensemble des labels lus est composé en code |
-| **(e)** | **`pr_closed_no_loop_task`** | **`PR closed` / `merged`** | **`pr_has_active_task`, et rien d'autre** |
+| classe | nom de fil (`skipped_by_class`) | déclencheur | le terme d'état lu | terme de relâche (`charged_by_release`) |
+|---|---|---|---|---|
+| (a) | `green_check_suite_default_branch` | `check_suite` verte sur `main` | `branch_has_active_task` (une tâche de boucle sur la branche) | `branch_task_active`, `state_unreadable` |
+| (b) | `green_check_suite_head_decided` | `check_suite` verte sur branche de PR | l'attestation `ci_success_handler_decision_core_hold` (4 termes) | `no_decision_attested`, `head_not_previously_decided`, `state_unreadable` |
+| (c) | `verdict_*`, `ci_failure_*` | `pr_review` | `find_active_task_by_pr_url`, puis la forge en dernier | `pr_task_active`, `pr_open`, `no_terminal_trace`, `state_unreadable` |
+| (d) | `inert_label` | `issues labeled` | aucun — l'ensemble des labels lus est composé en code | **aucun** — un label inerte est toujours écarté |
+| **(e)** | **`pr_closed_no_loop_task`** | **`PR closed` / `merged`** | **`pr_has_active_task`, et rien d'autre** | **`pr_task_active`, `state_unreadable`** |
+
+**La cinquième colonne est la lecture réciproque de la deuxième, pas sa
+paraphrase.** `skipped_by_class` nomme ce qu'une porte a reconnu ;
+`charged_by_release` nomme la porte qui a relâché. Les deux taxonomies ne se
+dérivent pas l'une de l'autre, et c'est pour cela qu'il y a deux seaux dans
+l'agrégat : une classe peut relâcher par plusieurs termes, et un même terme —
+`state_unreadable` au premier chef — traverse quatre classes sur cinq.
+
+Trois termes n'ont **pas** de ligne dans ce tableau, parce qu'ils sont rendus
+avant qu'aucune classe soit décidée : `switch_disarmed` (le coupe-circuit est
+baissé), `not_classified` (l'événement est hors population) et `text_touched`
+(un handler a réécrit le texte, donc le tour lui appartient). La case vide de
+(d) n'est pas un oubli : `decide` ne rend jamais de relâche pour un
+`Candidate::InertLabel`, et c'est l'absence de bras `Decision::Llm` sur ce
+chemin qui le garantit — pas une convention.
 
 Ces noms sont des clés de `GROUP BY` dans toutes les sondes ci-dessous. Les
 renommer casse une population, jamais un test ; `mika2675_valeurs_daudit_format_de_fil`
-les épingle pour cette raison.
+les épingle pour cette raison. Le côté relâche est épinglé par
+`mika2680_la_relache_atteint_chacun_de_ses_dix_termes`, et son exhaustivité est
+tenue par un `match` sans bras `_` : un onzième terme ne compile pas tant qu'il
+n'a pas son cas.
 
 ## Phase 3 : une décision n'est filtrable que si une trace l'atteste, tête et notification comprises
 

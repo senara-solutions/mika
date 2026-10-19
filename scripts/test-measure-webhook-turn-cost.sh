@@ -2,6 +2,9 @@
 #
 # Harnais anti-vacuité de scripts/measure-webhook-turn-cost (mika#2680, vol 2).
 #
+# Le § 3 a été ajouté par le vol 4 (mika#2680) pour le terme de relâche : même
+# discipline, ses deux moitiés sur deux corpora gelés distincts.
+#
 # POURQUOI UN CONTRÔLE POSITIF ET SIX NÉGATIFS, ET PAS AUTRE CHOSE. Une batterie
 # qui ne porte que des négatifs est satisfaite par un lecteur qui ne rend jamais
 # rien ; une batterie qui ne porte que le positif est satisfaite par un lecteur
@@ -46,6 +49,8 @@ FIXTURES="$REPO_ROOT/crates/mika-agent/tests/fixtures/mika2680"
 CORPUS="$FIXTURES/register_corpus.jsonl"
 NO_CHARGED="$FIXTURES/no_charged_corpus.jsonl"
 UNPARSEABLE_ONLY="$FIXTURES/unparseable_only_corpus.jsonl"
+RELEASE="$FIXTURES/release_corpus.jsonl"
+RELEASE_ABSENT="$FIXTURES/release_absent_corpus.jsonl"
 
 # Le scratch reste DANS le worktree (`target/` est gitignoré) : la
 # permission-policy du dispatch refuse toute écriture hors worktree, et une
@@ -133,6 +138,31 @@ RC6=$?
 eq "N6 — une ligne illisible est comptée et n'autorise pas un exit 0" \
    "2|oui" \
    "$RC6|$(case "$ERR" in *'(1 ligne(s) illisible(s))'*) echo oui ;; *) echo "non : $ERR" ;; esac)"
+
+# ---------------------------------------------------------------------------
+printf -- '\n-- 3. le terme de relâche : un seau par terme, l'"'"'absence nommée\n'
+# ---------------------------------------------------------------------------
+# P2 — le positif. Deux tours payés par deux portes différentes font DEUX seaux
+# de 1, pas un seau de 2 : un agrégat qui fusionnerait les termes serait vert
+# sur une batterie purement négative, et ne saurait plus dire quelle porte
+# relâche le coût — la seule question que ce champ sert à poser.
+MEASURE --log-file "$RELEASE" --out "$WORK/rel-turns.jsonl" \
+        --summary "$WORK/rel-summary.json" >/dev/null 2>&1
+eq "P2 — deux release distincts font deux seaux de 1" \
+   '{"head_not_previously_decided":1,"pr_open":1}|head_not_previously_decided' \
+   "$(jq -cS '.charged_by_release' "$WORK/rel-summary.json")|$(champ "$WORK/rel-turns.jsonl" req-rel-1 release)"
+
+# N7 — le négatif, sur son propre corpus gelé (leçon mika#2277 : une entrée par
+# confusion). Une ligne écrite par un binaire d'AVANT le champ n'a pas de
+# `release` ; elle tombe dans `absent_pre_field` et la ligne du tour garde
+# `null`. Un seau littéralement nommé `null` — ce que `group_by(.release)` sans
+# repli produirait — se lirait comme un terme de relâche qui n'existe pas
+# (motif mika#2331), sur la colonne même qui doit dire ce qui reste à filtrer.
+MEASURE --log-file "$RELEASE_ABSENT" --out "$WORK/abs-turns.jsonl" \
+        --summary "$WORK/abs-summary.json" >/dev/null 2>&1
+eq "N7 — un release absent est nommé absent_pre_field, jamais un seau null" \
+   '{"absent_pre_field":1}|null|false' \
+   "$(jq -cS '.charged_by_release' "$WORK/abs-summary.json")|$(champ "$WORK/abs-turns.jsonl" req-pre-field-1 release)|$(jq -r '.charged_by_release | has("null")' "$WORK/abs-summary.json")"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passées, %d échouées\n\n' "$PASS" "$FAIL"
