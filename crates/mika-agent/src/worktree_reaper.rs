@@ -784,6 +784,60 @@ impl PrSnapshot {
     }
 }
 
+/// Une revue de PR — la **seule** chose que mika#2808 lit de `latestReviews`.
+///
+/// # Le corps est jeté à la désérialisation, et c'est le point
+///
+/// `gh pr list --json latestReviews` rend pour chaque revue son `body` entier.
+/// Mesuré le 2026-10-19 sur `senara-solutions/mika` : l'appel du faucheur
+/// (`--state all`, six champs) pèse 73 Ko / 2,1 s, le même appel augmenté de
+/// `latestReviews` pèse 1,21 Mo / 7,05 s. Ne déclarer que `state` fait tomber
+/// le corps **au parsing**, au lieu de le porter jusqu'à une décision qui n'en
+/// veut pas.
+///
+/// # `#[serde(default)]` — la doctrine additive R-4
+///
+/// Même asymétrie que [`PrSnapshot::head_ref_oid`] et pour la même raison : ce
+/// champ **enrichit** la purge, et un champ additif ne doit pas pouvoir
+/// éteindre la fonction qu'il enrichit. Sans `default`, une revue rendue sans
+/// `state` ferait échouer tout le parsing de l'appel, donc rendrait la carte
+/// vide pour le dépôt entier — ce qui conserve, mais sur une panne muette
+/// plutôt que sur une lecture.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReviewSnapshot {
+    /// `APPROVED` | `CHANGES_REQUESTED` | `COMMENTED` | `DISMISSED` | `PENDING`.
+    #[serde(default)]
+    pub state: String,
+}
+
+impl ReviewSnapshot {
+    /// Une revue **soumise** : un état non vide et distinct de `PENDING`.
+    ///
+    /// `COMMENTED` compte, et c'est porteur : mika-qa poste ses verdicts
+    /// bloquants en `gh pr review --comment`, ce qui laisse `reviewDecision` à
+    /// `REVIEW_REQUIRED` — seul `latestReviews` les voit. Exiger `APPROVED`
+    /// rendrait le bras aveugle à la moitié des verdicts.
+    ///
+    /// Une revue `PENDING` est un brouillon que son auteur n'a pas envoyé, et un
+    /// état vide (champ absent, R-4) n'atteste rien. Ni l'une ni l'autre ne dit
+    /// « la QA a rendu son verdict », donc ni l'une ni l'autre ne raccourcit la
+    /// fenêtre : l'inconnu conserve.
+    pub fn is_submitted(&self) -> bool {
+        !self.state.trim().is_empty() && !self.state.eq_ignore_ascii_case("PENDING")
+    }
+}
+
+/// La réponse d'une entrée de `gh pr list --json number,headRefName,latestReviews`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrReviewsSnapshot {
+    #[serde(rename = "headRefName")]
+    pub head_ref_name: String,
+    /// Absent ⇒ aucune revue, ce qui est l'état nominal d'une PR fraîche — et
+    /// non une illisibilité. R-4 à nouveau.
+    #[serde(rename = "latestReviews", default)]
+    pub latest_reviews: Vec<ReviewSnapshot>,
+}
+
 /// Les PR d'un dépôt, indexées par les **deux** clés de résolution.
 ///
 /// Un struct plutôt qu'un sixième paramètre à [`screen_worktrees`] : les deux
@@ -3186,6 +3240,134 @@ pub const PURGE_INELIGIBLE_REASONS: &[&str] = &[
 /// un troisième site qui comparerait le motif à la main.
 pub fn is_purge_eligible_reason(reason: &str) -> bool {
     PURGE_ELIGIBLE_REASONS.contains(&reason)
+}
+
+/// Ce que l'état du dépôt dit du **dernier consommateur** d'un répertoire de
+/// build (mika#2808).
+///
+/// # Le dernier consommateur n'est pas le pilote
+///
+/// C'est le build QA (`long_running:build_mika`) que la revue lance *après*
+/// l'ouverture de la PR, et contre le `<worktree>/target/release/mika` duquel
+/// elle vérifie les AC comportementaux (`skills/bundled/qa-review`). Purger à
+/// la sortie du pilote obligerait la QA à tout recompiler ; le point
+/// d'accroche est donc le **verdict**, et la fin de vol sans PR.
+///
+/// # Un état lu, jamais un signal émis
+///
+/// Un signal shell aurait un trou exactement sur le « quelle qu'en soit la
+/// raison » de l'AC2 : le post-vol de `dispatch-lib` ne s'exécute pas quand le
+/// pgid du pilote est tué (mika#2263). Et deux écrivains pour une même garde
+/// sont une classe de divergence (mika#2158). Cet état se relit à chaque tick,
+/// des mêmes sources que le reste du bras.
+///
+/// **Cet état ne porte aucune garde.** Il choisit une **fenêtre** d'inactivité,
+/// rien d'autre : P1 à P5 décident seuls, inchangés. Un worktree habité est
+/// refusé par P3 quelle que soit sa valeur ici.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConsumerState {
+    /// Le dernier consommateur a fini — la QA a rendu son verdict, ou il n'y a
+    /// aucune PR donc aucune QA à attendre. **Fenêtre courte.**
+    Done,
+    /// Une PR est ouverte et ne porte aucune revue soumise : un build QA peut
+    /// être en vol. **Fenêtre pleine.**
+    Pending,
+    /// La question n'est pas répondable, ou sa réponse est illisible.
+    /// **Défaut**, et fenêtre pleine — un terme illisible conserve.
+    #[default]
+    Unknown,
+}
+
+impl ConsumerState {
+    /// Le libellé porté par la ligne INFO et par la ligne d'audit.
+    ///
+    /// Un **champ**, jamais un second `tool_name` : les retraits sont faits par
+    /// le même bras, sous la même conjonction de cinq termes. Créer un second
+    /// nom tronquerait en silence `SELECT … WHERE tool_name = 'target_purged'`,
+    /// une requête publiée — même raisonnement que `keep_reason` (mika#2619).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConsumerState::Done => "done",
+            ConsumerState::Pending => "pending",
+            ConsumerState::Unknown => "unknown",
+        }
+    }
+}
+
+/// Les motifs de conservation du faucheur pour lesquels « le dernier
+/// consommateur a-t-il fini ? » **a une réponse**.
+///
+/// - [`REASON_PR_OPEN`] — une PR existe, donc la QA est le consommateur, donc
+///   son verdict est la réponse.
+/// - [`REASON_PR_UNKNOWN`] — aucune PR pour cette branche, donc aucune QA ne
+///   viendra : c'est la fin de vol sans PR de l'AC2.
+/// - [`REASON_DETACHED_HEAD_PR_UNKNOWN`] — aucune PR à ce SHA, idem.
+pub const CONSUMER_ANSWERABLE_REASONS: &[&str] = &[
+    REASON_PR_OPEN,
+    REASON_PR_UNKNOWN,
+    REASON_DETACHED_HEAD_PR_UNKNOWN,
+];
+
+/// Les motifs pour lesquels la question **n'a pas** de réponse — donc
+/// [`ConsumerState::Unknown`], donc la fenêtre de quatre heures, inchangée.
+///
+/// - [`REASON_DETACHED_HEAD`] — le SHA est inexploitable, donc aucune clé ne
+///   rattache ce worktree à une PR : on ne sait pas qui le consomme.
+/// - [`REASON_DIRTY`] / [`REASON_UNPUSHED_COMMITS`] /
+///   [`REASON_WORK_STATE_UNREADABLE`] — le worktree porte du travail que
+///   personne n'a encore publié ; aucun verdict ne parle de lui.
+/// - [`REASON_PR_CLOSED_AT_UNREADABLE`] — un terme du faucheur est déjà
+///   illisible sur ce worktree ; en raccourcir la fenêtre serait décider plus
+///   vite sur moins d'information.
+/// - [`REASON_TOO_YOUNG`] — la PR vient d'être close ; le faucheur le retirera
+///   en entier, et raccourcir ne gagnerait rien contre ce délai.
+pub const CONSUMER_UNANSWERABLE_REASONS: &[&str] = &[
+    REASON_DETACHED_HEAD,
+    REASON_DIRTY,
+    REASON_UNPUSHED_COMMITS,
+    REASON_WORK_STATE_UNREADABLE,
+    REASON_PR_CLOSED_AT_UNREADABLE,
+    REASON_TOO_YOUNG,
+];
+
+/// La table de décision de mika#2808 — **pure** : aucun réseau, aucun disque.
+///
+/// | motif de conservation | `branch_reviewed` | état |
+/// |---|---|---|
+/// | `pr_open` | `Some(true)` — au moins une revue soumise | [`ConsumerState::Done`] |
+/// | `pr_open` | `Some(false)` | [`ConsumerState::Pending`] |
+/// | `pr_open` | `None` — liste de revues illisible | [`ConsumerState::Unknown`] |
+/// | `pr_unknown`, `detached_head_pr_unknown` | — | `Done`, **sauf** si `has_pr` |
+/// | les six autres motifs éligibles | — | [`ConsumerState::Unknown`] |
+///
+/// # Pourquoi `has_pr` n'est pas redondant
+///
+/// Sur `pr_unknown`, le faucheur a conclu « aucune PR pour cette branche » plus
+/// tôt dans le même tick. Si l'index en montre une maintenant, les deux
+/// lectures se contredisent : l'état est **incohérent**, donc inconnu, donc on
+/// conserve. Le contrôle coûte un `HashMap::get` et ferme la seule façon dont
+/// la branche AC2 pourrait raccourcir la fenêtre d'un worktree dont une QA
+/// s'occupe.
+pub fn consumer_state_for(
+    reason: &str,
+    has_pr: bool,
+    branch_reviewed: Option<bool>,
+) -> ConsumerState {
+    match reason {
+        REASON_PR_OPEN => match branch_reviewed {
+            Some(true) => ConsumerState::Done,
+            Some(false) => ConsumerState::Pending,
+            None => ConsumerState::Unknown,
+        },
+        REASON_PR_UNKNOWN | REASON_DETACHED_HEAD_PR_UNKNOWN => {
+            if has_pr {
+                ConsumerState::Unknown
+            } else {
+                ConsumerState::Done
+            }
+        }
+        _ => ConsumerState::Unknown,
+    }
 }
 
 /// `audit_events.tool_name` (et event tracing) d'une purge **effective**.
@@ -9722,6 +9904,104 @@ branch refs/heads/fix/live/x
         {
             assert!(seen.insert(*reason), "motif dupliqué: {reason}");
         }
+    }
+
+    // -- mika#2808 : l'état du dernier consommateur --------------------------
+
+    /// **U5 / AC5** — les deux listes de mika#2808 couvrent
+    /// [`PURGE_ELIGIBLE_REASONS`] **exactement une fois chacun**.
+    ///
+    /// Détecteur structurel de la même famille que
+    /// [`tests::mika2619_la_partition_des_motifs_est_exacte`], et pour la même
+    /// raison : un motif éligible ajouté demain tomberait sinon dans le `_ =>`
+    /// de [`consumer_state_for`] sans que personne décide s'il mérite une
+    /// fenêtre courte. Le défaut devient « pas de décision, pas de build »
+    /// plutôt que « fenêtre pleine par oubli ».
+    ///
+    /// La non-vacuité est porteuse : deux listes vides satisferaient une
+    /// partition qui ne classe rien.
+    #[test]
+    fn mika2808_la_partition_des_motifs_est_exacte() {
+        assert!(
+            !CONSUMER_ANSWERABLE_REASONS.is_empty() && !CONSUMER_UNANSWERABLE_REASONS.is_empty(),
+            "non-vacuité : deux listes vides satisferaient la partition en ne \
+             classant rien"
+        );
+
+        for reason in PURGE_ELIGIBLE_REASONS {
+            let answerable = CONSUMER_ANSWERABLE_REASONS.contains(reason);
+            let unanswerable = CONSUMER_UNANSWERABLE_REASONS.contains(reason);
+            assert!(
+                answerable ^ unanswerable,
+                "`{reason}` doit être dans **exactement une** des deux listes \
+                 (répondable: {answerable}, non répondable: {unanswerable}) — un \
+                 motif non classé est un motif dont personne n'a décidé s'il \
+                 mérite la fenêtre courte"
+            );
+        }
+
+        // Et réciproquement : une faute de frappe dans l'une des listes
+        // satisferait la boucle ci-dessus en laissant un motif réel non classé.
+        for reason in CONSUMER_ANSWERABLE_REASONS
+            .iter()
+            .chain(CONSUMER_UNANSWERABLE_REASONS)
+        {
+            assert!(
+                PURGE_ELIGIBLE_REASONS.contains(reason),
+                "`{reason}` n'est pas un motif de purge éligible"
+            );
+        }
+
+        // Le classement et la table doivent dire la même chose : un motif
+        // déclaré non répondable qui rendrait autre chose qu'`Unknown`, ou un
+        // motif déclaré répondable qui ne rendrait jamais rien d'autre, feraient
+        // de la partition une décoration.
+        for reason in CONSUMER_UNANSWERABLE_REASONS {
+            assert_eq!(
+                consumer_state_for(reason, false, Some(true)),
+                ConsumerState::Unknown,
+                "`{reason}` est déclaré non répondable : la table doit conserver"
+            );
+        }
+        for reason in CONSUMER_ANSWERABLE_REASONS {
+            assert_eq!(
+                consumer_state_for(reason, false, Some(true)),
+                ConsumerState::Done,
+                "`{reason}` est déclaré répondable : la table doit pouvoir rendre \
+                 `Done`"
+            );
+        }
+    }
+
+    /// **U7 / AC6 / R-4** — une PR rendue **sans** `latestReviews` se
+    /// désérialise, et compte comme « aucune revue ».
+    ///
+    /// C'est la doctrine additive : sans `#[serde(default)]`, l'absence du champ
+    /// ferait échouer le parsing de tout l'appel, donc rendrait la carte vide
+    /// pour le dépôt entier. La dégradation serait fail-safe *par accident* —
+    /// et muette.
+    #[test]
+    fn mika2808_le_champ_de_revues_absent_ne_casse_pas_le_parsing() {
+        let parsed: Vec<PrReviewsSnapshot> =
+            serde_json::from_str(r#"[{"number":1,"headRefName":"fix/2808/x"}]"#)
+                .expect("une PR sans `latestReviews` doit se désérialiser");
+        assert_eq!(parsed[0].head_ref_name, "fix/2808/x");
+        assert!(parsed[0].latest_reviews.is_empty());
+
+        // Et une revue sans `state` n'atteste rien : elle se parse, et elle ne
+        // compte pas comme soumise.
+        let parsed: Vec<PrReviewsSnapshot> = serde_json::from_str(
+            r#"[{"headRefName":"fix/2808/y","latestReviews":[{},{"state":"PENDING"},
+                 {"state":"COMMENTED"}]}]"#,
+        )
+        .expect("une revue sans `state` doit se désérialiser");
+        let reviews = &parsed[0].latest_reviews;
+        assert!(!reviews[0].is_submitted(), "un état absent n'atteste rien");
+        assert!(!reviews[1].is_submitted(), "`PENDING` est un brouillon");
+        assert!(
+            reviews[2].is_submitted(),
+            "`COMMENTED` est le verdict bloquant de mika-qa — il doit compter"
+        );
     }
 
     // -- V4 : `dirty` traverse réellement la PRODUCTION ----------------------
