@@ -229,6 +229,7 @@ async fn spawn_agent_worker(
     if task_engine::heartbeat_enabled_for_agent(&ctx.home_dir).await {
         task_engine::ensure_recurring_task(
             &ctx.async_db,
+            &ctx.home_dir,
             "heartbeat",
             "0 0 * * * *",
             r#"{"trigger":"heartbeat"}"#,
@@ -244,6 +245,7 @@ async fn spawn_agent_worker(
     if let Some(cron) = task_engine::reflection_cron_for_agent(&ctx.home_dir, &ctx.async_db).await {
         task_engine::ensure_recurring_task(
             &ctx.async_db,
+            &ctx.home_dir,
             "reflection",
             &cron,
             r#"{"trigger":"reflection"}"#,

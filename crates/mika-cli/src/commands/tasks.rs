@@ -193,7 +193,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
             }
         }
         Some(TaskCommand::Rearm { label }) => {
-            match mika_agent::task_engine::rearm_recurring_task(db, &label).await {
+            match mika_agent::task_engine::rearm_recurring_task(db, &ctx.home_dir, &label).await {
                 Ok(outcome) => {
                     println!(
                         "\n  Re-armed recurring task \"{}\" (trigger {}, cron {}).\n  \
