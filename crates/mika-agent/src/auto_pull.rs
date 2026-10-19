@@ -1322,6 +1322,15 @@ impl ExclusionPhase {
 // of one filter would split it in half without saying so.
 
 /// An open PR already closes this ticket.
+///
+/// **La valeur est historique et le filtre est plus large que son nom depuis
+/// mika#2822** : il exclut désormais tout ticket qu'une PR ouverte porte, que
+/// le lien passe par `closingIssuesReferences` ou par la branche de tête. La
+/// chaîne reste `"open_pr_closing"` parce qu'elle est du **format de fil** —
+/// persistée dans le ledger d'exclusion et épinglée par un `assert_eq!` plus
+/// bas. La renommer rendrait non sommables les agrégats opérateur d'avant et
+/// d'après : une même population sous deux noms successifs ne s'additionne pas
+/// (miroir de mika#2205).
 const FILTER_OPEN_PR: &str = "open_pr_closing";
 /// A self_dev task is in flight for this ticket.
 const FILTER_IN_FLIGHT: &str = "in_flight_self_dev";
@@ -2580,13 +2589,118 @@ async fn gh_list_open_issues(github_token: &str) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
-/// List open PR closing-issue references via `gh pr list` (mika#1517).
+/// Ce que la réponse `gh pr list` apprend sur les tickets en vol (mika#2822).
 ///
-/// Returns the set of issue numbers that have at least one open PR closing
-/// them. Powered by GitHub's `closingIssuesReferences` field — populated when
-/// a PR body contains `Closes #N` (or equivalent keyword) or the PR is
-/// manually linked to an issue. Issues not so linked are absent from the set.
-async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u64>> {
+/// Les compteurs sont **par PR**, jamais par numéro : une PR dont les deux
+/// sources donnent le même `N` compte en [`via_closing`](Self::via_closing),
+/// ce qui garde [`via_branch_only`](Self::via_branch_only) exactement égal à la
+/// population que mika#2822 ajoute au filtre.
+pub(crate) struct OpenPrLinkage {
+    /// L'ensemble que les trois phases consomment : union des deux sources.
+    pub numbers: HashSet<u64>,
+    /// Entrées lues dans la réponse, malformées comprises.
+    pub prs: usize,
+    /// PR ayant au moins un `closingIssuesReferences` — la source historique.
+    pub via_closing: usize,
+    /// PR que **seule** la branche relie à un ticket — la population des 8 vols
+    /// à vide du 2026-10-19. C'est le champ qui dit si mika#2822 sert.
+    pub via_branch_only: usize,
+    /// PR dont la branche n'a donné aucun numéro : hors grammaire
+    /// `<type>/<N>/<slug>` (`dependabot/…`, `main`) ou `headRefName` illisible.
+    /// Les deux causes sont comptées ensemble faute d'un cinquième compteur que
+    /// personne ne lirait — `gh pr list --json headRefName` rend toujours le
+    /// champ, donc en pratique ce compteur ne voit que des branches.
+    pub nonconforming_branches: usize,
+}
+
+/// Les tickets qu'une réponse `gh pr list` déclare en vol (mika#2822).
+///
+/// Séparé de l'appel au sous-processus, comme [`parse_compare_payload`], pour
+/// que tout le chemin de décision soit testable sur une charge figée, sans
+/// réseau : avant ce découpage, aucun test ne pouvait atteindre ce parsing.
+///
+/// **Deux sources, unies** :
+///
+/// 1. `closingIssuesReferences` — l'historique (mika#1517), peuplé par un
+///    mot-clé de fermeture (`Closes #N`) ou un lien manuel ;
+/// 2. `headRefName` — lu par [`crate::worktree_reaper::issue_number_from_branch`],
+///    le lecteur **unique** de la grammaire `<type>/<N>/<slug>`. Appel, pas
+///    copie : une troisième extraction serait la classe mika#2158 à son
+///    quatrième tour.
+///
+/// La deuxième existe parce que la première ne peut pas voir une PR de vol
+/// partiel : son ticket doit rester ouvert pour le vol suivant, donc son corps
+/// dit `Refs #N` et `closingIssuesReferences` reste vide. Le 2026-10-19 entre
+/// 00:00Z et 06:00Z, cet angle mort a coûté 7 vols d'implémentation à vide
+/// (11 à 27 tours, 1,0 $ à 2,6 $ chacun).
+///
+/// Une troisième source — un scan de `#N` sur le corps — est **refusée**, pas
+/// différée : les corps de PR de ce dépôt citent des tickets en doctrine autant
+/// qu'en périmètre (« la classe mika#2158 », « suivi de mika#1517 »), et
+/// l'asymétrie des coûts est inverse de celle du reste du filtre — un faux
+/// négatif coûte un vol à vide, réparable au tick suivant ; un faux positif
+/// retire un ticket du dispatch tant que la PR citante reste ouverte, en
+/// silence.
+///
+/// **Deux niveaux d'échec, et leur asymétrie est délibérée** — celle que
+/// [`parse_compare_payload`] tient déjà pour son champ `files` :
+///
+/// - **JSON global illisible** ⇒ `Err`, et l'appelant garde son fail-open à
+///   l'identique, donc le comportement d'avant le correctif.
+/// - **Une entrée malformée** ⇒ cette PR ne contribue simplement pas par la
+///   branche ; `closingIssuesReferences` continue et les autres PR gardent
+///   leurs exclusions. Faire échouer le lot sur une entrée ferait perdre tout
+///   le filtre pour une PR : le fail-open global est trop grossier pour servir
+///   de traitement d'erreur par entrée.
+pub(crate) fn parse_open_pr_issue_numbers(stdout: &str) -> Result<OpenPrLinkage> {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(stdout)?;
+
+    let mut linkage = OpenPrLinkage {
+        numbers: HashSet::new(),
+        prs: raw.len(),
+        via_closing: 0,
+        via_branch_only: 0,
+        nonconforming_branches: 0,
+    };
+
+    for pr in raw {
+        let mut closing = false;
+        if let Some(refs) = pr["closingIssuesReferences"].as_array() {
+            for ref_obj in refs {
+                if let Some(n) = ref_obj["number"].as_u64() {
+                    linkage.numbers.insert(n);
+                    closing = true;
+                }
+            }
+        }
+        if closing {
+            linkage.via_closing += 1;
+        }
+
+        match pr["headRefName"]
+            .as_str()
+            .and_then(crate::worktree_reaper::issue_number_from_branch)
+        {
+            Some(n) => {
+                linkage.numbers.insert(n);
+                if !closing {
+                    linkage.via_branch_only += 1;
+                }
+            }
+            None => linkage.nonconforming_branches += 1,
+        }
+    }
+
+    Ok(linkage)
+}
+
+/// List the issue numbers an open PR is in flight for, via `gh pr list`
+/// (mika#1517, élargi par mika#2822).
+///
+/// Le parsing — et donc toute la décision — vit dans
+/// [`parse_open_pr_issue_numbers`], qui porte les deux sources et leur
+/// raison. Cette fonction ne fait que l'appel et la sonde.
+async fn gh_list_open_pr_issue_numbers(github_token: &str) -> Result<HashSet<u64>> {
     let output = run_gh(
         github_token,
         GhSubject::Repo,
@@ -2598,7 +2712,7 @@ async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u6
             "--state",
             "open",
             "--json",
-            "number,closingIssuesReferences",
+            "number,closingIssuesReferences,headRefName",
             "--limit",
             "100",
         ],
@@ -2610,19 +2724,24 @@ async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u6
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
+    let linkage = parse_open_pr_issue_numbers(&stdout)?;
 
-    let mut closed_issue_numbers = HashSet::new();
-    for pr in raw {
-        if let Some(refs) = pr["closingIssuesReferences"].as_array() {
-            for ref_obj in refs {
-                if let Some(n) = ref_obj["number"].as_u64() {
-                    closed_issue_numbers.insert(n);
-                }
-            }
-        }
-    }
-    Ok(closed_issue_numbers)
+    // Une ligne par tick, sur **toutes** les branches y compris celle où
+    // `via_branch_only == 0` : le census de pool émet déjà `open_pr`, mais ce
+    // nombre est muet sur la provenance — avant comme après mika#2822 il dirait
+    // la même chose. Son absence du journal signifie un binaire antérieur à ce
+    // correctif (classe mika#2340), jamais « aucune PR dans ce cas ».
+    info!(
+        event = "auto_pull_open_pr_set_resolved",
+        prs = linkage.prs,
+        via_closing = linkage.via_closing,
+        via_branch_only = linkage.via_branch_only,
+        nonconforming_branches = linkage.nonconforming_branches,
+        total = linkage.numbers.len(),
+        "auto_pull: l'ensemble « a une PR ouverte » est résolu sur deux sources"
+    );
+
+    Ok(linkage.numbers)
 }
 
 /// Apply a label to a GitHub issue.
@@ -3518,7 +3637,11 @@ pub async fn auto_pull_groomed_ticket(
 
     // Fetch open-PR closing-issue refs once (mika#1517). Both phases consume it.
     // Fail-open: an empty set preserves pre-fix behavior on infra glitches.
-    let open_pr_issue_numbers = match gh_list_open_pr_closing_issues(github_token).await {
+    // Ce que ce fail-open abandonne depuis mika#2822 : les **deux** sources de
+    // l'ensemble — `closingIssuesReferences` et le numéro porté par la branche
+    // de tête — donc un tick qui tombe ici re-dispatche aussi les tickets dont
+    // une PR de vol partiel est ouverte.
+    let open_pr_issue_numbers = match gh_list_open_pr_issue_numbers(github_token).await {
         Ok(set) => set,
         Err(e) => {
             warn!(error = %e, "auto_pull: failed to list open PR closing-issue refs; proceeding without filter");
@@ -10371,5 +10494,160 @@ This ticket has been GROOMED and is ready.
              chemin : l'appel est reparti vers la forge réelle. Appels vus \
              pour #{n} : {mine:?}"
         );
+    }
+
+    // ── mika#2822 : une PR ouverte compte, quelle que soit la forme de son lien ──
+
+    /// Une réponse `gh pr list` figée, reproduisant les deux PR réelles du
+    /// 2026-10-19 plus les contrôles.
+    ///
+    /// Les deux premières entrées sont le constat de mika#2822 : #2812 ne porte
+    /// que `Refs #2680` (donc `closingIssuesReferences` vide) et #2813 n'a
+    /// aucune référence (donc le champ est **absent**, pas vide) — les deux
+    /// formes que GitHub rend, et les deux que la source historique ne voit pas.
+    /// Les trois suivantes sont les contrôles : une branche hors grammaire, une
+    /// PR que la source historique relie déjà, et une branche hors grammaire
+    /// dont la source historique relie quand même le ticket.
+    const OPEN_PR_LIST_FIXTURE: &str = r#"[
+      {
+        "number": 2812,
+        "closingIssuesReferences": [],
+        "headRefName": "feat/2680/terme-de-relache"
+      },
+      {
+        "number": 2813,
+        "headRefName": "feat/1381/la-fenetre-de-transmission"
+      },
+      {
+        "number": 1,
+        "closingIssuesReferences": [],
+        "headRefName": "dependabot/cargo/serde-1.0.2"
+      },
+      {
+        "number": 2,
+        "closingIssuesReferences": [{"number": 606}],
+        "headRefName": "fix/606/x"
+      },
+      {
+        "number": 3,
+        "closingIssuesReferences": [{"number": 9}],
+        "headRefName": "main"
+      }
+    ]"#;
+
+    /// AC1 — la PR du vol 4 de mika#2680, `Refs #2680` et rien d'autre.
+    #[test]
+    fn mika2822_une_pr_en_refs_seul_compte_par_sa_branche() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert!(
+            linkage.numbers.contains(&2680),
+            "mika#2822 AC1 — #2812 est ouverte sur `feat/2680/…` et ne porte \
+             que `Refs #2680`. Si 2680 n'entre pas dans l'ensemble, le ticket \
+             reste re-dispatchable tant qu'il garde `ready` : c'est le défaut \
+             qui a coûté 6 vols à vide le 2026-10-19."
+        );
+    }
+
+    /// AC2 — la PR du vol 1/2 de mika#1381, aucune référence nulle part.
+    #[test]
+    fn mika2822_une_pr_sans_aucune_reference_compte_par_sa_branche() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert!(
+            linkage.numbers.contains(&1381),
+            "mika#2822 AC2 — #2813 n'a pas même le champ \
+             `closingIssuesReferences` ; seule sa branche `feat/1381/…` relie \
+             la PR au ticket."
+        );
+    }
+
+    /// AC3 — une branche hors grammaire n'alimente rien.
+    ///
+    /// L'assertion est une **égalité stricte** de l'ensemble, et c'est
+    /// délibéré : un `!contains(&1)` laisserait passer un numéro inventé
+    /// ailleurs dans `dependabot/cargo/serde-1.0.2` (`1`, `0`, `2`), c'est-à-dire
+    /// exactement ce que `issue_number_from_branch` refuse de faire (B3.2,
+    /// mika#2482). Seule l'égalité dit « rien d'autre n'est entré ».
+    #[test]
+    fn mika2822_une_branche_hors_convention_najoute_rien() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        let expected: HashSet<u64> = [2680, 1381, 606, 9].into_iter().collect();
+        assert_eq!(
+            linkage.numbers, expected,
+            "mika#2822 AC3 — `dependabot/cargo/serde-1.0.2` a `cargo` en \
+             deuxième segment, donc aucun numéro. L'AC est tenu par la \
+             réutilisation de `issue_number_from_branch`, pas par une clause \
+             spéciale `dependabot`."
+        );
+        assert_eq!(
+            linkage.nonconforming_branches, 2,
+            "les deux branches hors grammaire de la fixture sont \
+             `dependabot/cargo/serde-1.0.2` et `main`"
+        );
+    }
+
+    /// Non-régression de mika#1517 : la source historique garde ses deux cas,
+    /// dont celui où la branche ne suit pas la grammaire.
+    #[test]
+    fn mika2822_la_source_historique_est_intacte() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert!(
+            linkage.numbers.contains(&606),
+            "mika#1517 — #2 déclare `Closes #606`"
+        );
+        assert!(
+            linkage.numbers.contains(&9),
+            "une branche non conforme ne **retire** rien : #3 est sur `main`, \
+             mais sa source historique relie 9. Élargir le filtre ne doit pas \
+             le rétrécir ailleurs."
+        );
+    }
+
+    /// AC4, sa moitié testable sans réseau.
+    ///
+    /// Le fail-open du site d'appel n'est atteignable que si le parseur rend
+    /// bien une `Err` sur un JSON global illisible — et une erreur ne doit pas
+    /// dégénérer en ensemble partiel, qui serait pris pour une vérité.
+    #[test]
+    fn mika2822_un_json_illisible_rend_une_erreur() {
+        assert!(parse_open_pr_issue_numbers("ceci n'est pas du JSON").is_err());
+        assert!(
+            parse_open_pr_issue_numbers("{}").is_err(),
+            "la réponse de `gh pr list` est un tableau ; un objet n'en est pas un"
+        );
+        // Contre-épreuve : une entrée malformée, elle, ne fait pas échouer le
+        // lot — les 99 autres PR gardent leurs exclusions.
+        let linkage = parse_open_pr_issue_numbers(
+            r#"[{"number": 7}, {"number": 8, "headRefName": "fix/42/x"}]"#,
+        )
+        .expect("une entrée sans branche ne fait pas échouer le lot");
+        assert_eq!(linkage.numbers, [42].into_iter().collect::<HashSet<u64>>());
+    }
+
+    /// La provenance est comptée **par PR**, pas par numéro.
+    ///
+    /// C'est l'assertion qui lie le code aux 8 vols du constat : seule
+    /// `via_branch_only == 2` dit que la source ajoutée par mika#2822 voit
+    /// exactement #2812 et #2813. C'est aussi la seule qui rougirait si un
+    /// futur refactor recomptait par numéro.
+    #[test]
+    fn mika2822_la_provenance_est_comptee_par_pr() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert_eq!(linkage.prs, 5, "cinq entrées dans la fixture");
+        assert_eq!(
+            linkage.via_closing, 2,
+            "#2 et #3 — et #2 compte ici plutôt qu'en `via_branch_only` bien \
+             que sa branche donne le même 606 : la source historique suffisait"
+        );
+        assert_eq!(
+            linkage.via_branch_only, 2,
+            "#2812 et #2813 — la population que mika#2822 ajoute au filtre"
+        );
+        assert_eq!(linkage.nonconforming_branches, 2, "#1 et #3");
+        assert_eq!(linkage.numbers.len(), 4, "2680, 1381, 606, 9");
     }
 }
