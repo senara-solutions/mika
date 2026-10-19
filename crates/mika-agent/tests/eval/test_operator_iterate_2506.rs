@@ -327,9 +327,10 @@ async fn run_nominal(db: &AsyncDatabase, skills: &SkillRegistry, context: &str) 
 /// Les clés de l'`input` de dispatch dont la valeur est **frappée par le moteur**
 /// et ne dérive en rien de la requête de l'opérateur.
 ///
-/// mika#2796 : exclues du contrôle négatif, parce qu'un UUID v4 porte ~16
+/// mika#2796 : exclues du contrôle négatif, parce qu'un UUID v4 porte ~20
 /// chiffres décimaux répartis en segments, et qu'une sous-chaîne décimale de 4
-/// chiffres donnée y tombe environ **une fois sur 700**. Le CI requis de la PR
+/// chiffres donnée y tombe environ **une fois sur 4 400** (15 fenêtres
+/// utiles × 16⁻⁴ : les segments 3 et 4 commencent par `4` et `[89ab]`). Le CI requis de la PR
 /// mika#2787 (run 39160328822, 2026-10-18) a rougi sur
 /// `task_id = "fcc4cf43-9b62-4b0d-8281-06046a7f2504"` alors que l'`input` était
 /// correct — le prédicat d'alors lisait la chaîne entière.
@@ -433,6 +434,15 @@ async fn le_nombre_qui_voyage_est_le_numero_d_issue() {
     );
     assert_eq!(input["skill"].as_str(), Some("dev-pilot"));
     assert_eq!(input["task_id"].as_str(), Some(task_id.as_str()));
+    // L'égalité ci-dessus compare deux sorties du même `create_task` : elle ne
+    // prouve pas que la valeur est frappée par le moteur. C'est la prémisse de
+    // l'exclusion de `CLES_NON_DERIVEES_DE_LA_REQUETE` (mika#2796), donc elle
+    // est vérifiée ici plutôt que supposée.
+    assert!(
+        uuid::Uuid::parse_str(&task_id).is_ok(),
+        "le `task_id` exclu du contrôle négatif doit être un UUID frappé par le \
+         moteur, pas une valeur dérivée de la requête : {task_id}"
+    );
     assert_eq!(
         input["iteration_context"].as_str(),
         Some("rebase puis corrige le lint SIGPIPE"),
@@ -442,7 +452,7 @@ async fn le_nombre_qui_voyage_est_le_numero_d_issue() {
 
     // Contrôle négatif : aucun champ DÉRIVÉ DE LA REQUÊTE ne porte le numéro de
     // PR. Le `task_id` est exclu (mika#2796) — son UUID n'a aucun rapport avec
-    // la requête, et sa valeur est vérifiée exactement trois assertions plus
+    // la requête, et sa valeur est vérifiée exactement deux assertions plus
     // haut.
     let porteurs = champs_portant_le_nombre(&input, "2504");
     assert!(

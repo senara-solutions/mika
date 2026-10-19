@@ -45,18 +45,21 @@ le texte de l'opérateur. Le `task_id`, un UUID v4 frappé par
 `Database::create_task` sans aucun rapport avec la requête, se terminait par
 `…7f2504`.
 
-Un UUID v4 porte 32 chiffres hexadécimaux, dont environ 16 décimaux, répartis en
-segments. La probabilité qu'une sous-chaîne décimale donnée de 4 chiffres y
-apparaisse est de l'ordre de **1 sur 700 par run**. Sur un dépôt qui relance la
-CI à chaque push de plusieurs PR par jour, cela fait un rouge tous les quelques
-jours. Ce rouge ne dit rien de la PR qu'il bloque, et il coûte une relance plus un
+Un UUID v4 porte 32 chiffres hexadécimaux, dont environ 20 décimaux, répartis en
+cinq segments. Une sous-chaîne de 4 chiffres ne franchit pas un tiret, ce qui
+laisse 17 fenêtres. Les segments 3 et 4 commencent par un chiffre fixe (`4`) ou
+contraint (`[89ab]`), ce qui retire encore deux fenêtres pour un nombre comme
+`2504`. La probabilité est donc de 15 × 16⁻⁴, soit environ **1 sur 4 400 par
+run**. Un échantillon de 2 000 000 d'UUID v4 donne 1 sur ~4 500. C'est rare
+pour une PR et certain pour un dépôt qui relance la CI à chaque push, et le run
+39160328822 l'a rencontré. Ce rouge ne dit rien de la PR qu'il bloque, et il coûte une relance plus un
 tour d'agent pour établir qu'il ne dit rien.
 
 Ce n'est pas « un flake » au sens d'une course ou d'un réseau lent. Le défaut est
 **déterministe dans le prédicat**. Le prédicat s'applique à une partie de la
 valeur qui ne peut pas, par construction, transporter ce qu'il cherche. Et cette
-partie était déjà pinnée exactement trois lignes plus haut
-(`assert_eq!(input["task_id"], task_id)`).
+partie était déjà pinnée exactement quelques lignes plus haut
+(`assert_eq!(input["task_id"].as_str(), Some(task_id.as_str()))`).
 
 ## La règle
 
@@ -79,10 +82,12 @@ Trois propriétés, chacune porteuse (`champs_portant_le_nombre` dans
    balayé, y compris un cinquième champ ajouté demain au `json!` de production.
    Une liste d'inclusion (`prompt` + `iteration_context`) cesserait de couvrir le
    nouveau champ sans rougir, ce qui est la forme que mika#2309 condamne.
-2. **Le champ exclu est pinné ailleurs, exactement.** L'exclusion ne dissimule
-   aucune fuite parce que la valeur de `task_id` est vérifiée au byte par un
-   `assert_eq!`. Exclure un champ qui n'est vérifié nulle part, c'est retirer de
-   la couverture.
+2. **Le champ exclu est pinné ailleurs, exactement, et sa nature est vérifiée.**
+   La valeur de `task_id` est vérifiée au byte par un `assert_eq!`. Cette
+   égalité compare deux sorties du même `create_task`, donc elle ne prouve pas à
+   elle seule que la valeur est aléatoire. Un `Uuid::parse_str` la complète : la
+   prémisse de l'exclusion est vérifiée et non supposée. Exclure un champ qui
+   n'est vérifié nulle part, c'est retirer de la couverture.
 3. **L'exclusion ne peut pas devenir muette.** Le prédicat asserte
    `contains_key` sur chaque clé exclue. Si `task_id` est renommée en production,
    l'exclusion ne désigne plus rien, le balayage reviendrait sur l'UUID et le
