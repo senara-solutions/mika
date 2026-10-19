@@ -159,7 +159,8 @@ jobs:
       # PRESENT so the assertions actually execute. A green job does not tell
       # the two apart: read the log and check each of these four prints a
       # non-zero assertion count and not `⊘ skipped`.
-      - name: The rescue leaves a formatted tree (precondition: cargo fmt) (mika#2348)
+      # Precondition: `cargo fmt` on PATH.
+      - name: The rescue leaves a formatted tree (mika#2348)
         run: bash skills/bundled/_shared/tests/test_rescue_fmt_clean.sh
       # 0600 relay socket, minimal relay launch environment, and reachability
       # from a real bwrap pilot — the third point is the one the canary cannot
