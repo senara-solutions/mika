@@ -5520,6 +5520,83 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
         );
     }
 
+    // ──────── mika#2811 — le nom du champ de cause de groom, en phase ────────
+
+    /// **Livrée vide, et `mika2811_lallowlist_de_parite_est_livree_vide`
+    /// l'assert.** Même contrat que `ARCHITECT_UNREADABLE_WIRE_EXCEPTIONS`.
+    const GROOM_CAUSE_WIRE_EXCEPTIONS: &[&str] = &[];
+
+    /// **Le nom du champ de provenance ne diverge pas entre le Rust et le shell
+    /// (mika#2811 D5).**
+    ///
+    /// Le motif a DEUX moitiés : `ready_label_handler` pose le champ dans
+    /// l'entrée de dispatch sous le nom de
+    /// `executor::INTERNAL_GROOM_CAUSE_FIELD`, et `_parse_input_json` de
+    /// `dispatch-lib.sh` le lit sous le nom de sa propre déclaration
+    /// `GROOM_FORCE_CAUSE_FIELD`. Un seul littéral doit rester en phase, et
+    /// c'est celui-là — les **valeurs** (`markers_without_proof`,
+    /// `proof_unreadable`) ne servent qu'à la ligne de journal du shell, qui ne
+    /// décide que sur la présence.
+    ///
+    /// Ici la divergence est pire que « population vide en silence » (le risque
+    /// que le modèle mika#2641 nomme) : le shell ne lirait **jamais** de cause,
+    /// donc la porte de mika#2012 resterait armée, donc `already_groomed`
+    /// reviendrait — et la boucle du § 1.1 de mika#2811 avec elle, avec tous les
+    /// tests comportementaux des deux côtés verts, chacun correct dans son
+    /// propre monde.
+    #[test]
+    fn mika2811_le_nom_du_champ_de_cause_est_synchronise_shell_a_rust() {
+        use crate::skills::executor::INTERNAL_GROOM_CAUSE_FIELD;
+
+        let rel = "skills/bundled/_shared/dispatch-lib.sh";
+        if GROOM_CAUSE_WIRE_EXCEPTIONS.contains(&rel) {
+            return;
+        }
+        let shell = repo_root()
+            .join("skills")
+            .join("bundled")
+            .join("_shared")
+            .join("dispatch-lib.sh");
+        // Un shell illisible ÉCHOUE plutôt que de rendre une comparaison vide :
+        // un scan qui ne lit rien se lit comme un scan d'accord.
+        let src = std::fs::read_to_string(&shell).unwrap_or_else(|e| {
+            panic!(
+                "mika#2811 — {rel} doit être lisible pour que ce scan vérifie quelque chose : {e}"
+            )
+        });
+
+        // Le lecteur shell déclare le nom par une affectation en colonne 0.
+        // C'est la forme que `test-dispatch-lib.sh` épingle aussi comme site de
+        // définition unique.
+        let expect = format!("GROOM_FORCE_CAUSE_FIELD=\"{INTERNAL_GROOM_CAUSE_FIELD}\"");
+        assert!(
+            src.lines().any(|l| l == expect),
+            "mika#2811 — le nom du champ de provenance a divergé : le Rust pose \
+             `{INTERNAL_GROOM_CAUSE_FIELD}` et {rel} ne porte pas la ligne \
+             `{expect}`.\n\n\
+             RÉSOLUTION : réaligner les deux littéraux. Ne JAMAIS élargir le \
+             lecteur shell à une seconde orthographe, et ne JAMAIS ajouter le \
+             fichier shell à GROOM_CAUSE_WIRE_EXCEPTIONS — ce serait rendre le \
+             scan vert en cessant de regarder la moitié qu'il existe pour \
+             confronter (mika#2201). Un champ que le shell ne lit pas laisse la \
+             porte de mika#2012 armée et ramène `already_groomed` suivi d'un \
+             re-drive."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2811_lallowlist_de_parite_est_livree_vide() {
+        assert!(
+            GROOM_CAUSE_WIRE_EXCEPTIONS.is_empty(),
+            "GROOM_CAUSE_WIRE_EXCEPTIONS est livrée vide et doit le rester : le \
+             littéral est créé par mika#2811 avec exactement un site de \
+             déclaration de chaque côté, donc aucune violation préexistante \
+             n'est possible. Excepter le fichier shell rendrait le scan vert en \
+             cessant de regarder la moitié qu'il confronte (mika#2201)."
+        );
+    }
+
     // ───────────────── mika#2638 — `reference_url` délimitée ─────────────────
 
     /// Les lignes `reference_url` + `LIKE` que le scan D4 tolère, avec leur
