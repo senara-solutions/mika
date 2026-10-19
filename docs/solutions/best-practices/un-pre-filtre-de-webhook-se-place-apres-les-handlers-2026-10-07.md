@@ -168,7 +168,8 @@ une PR déjà décidée et notifiée pour cette tête — le SHA n'est pas dans 
 du gateway ; la décision vit dans `ci_success_handler` après `find_open_pr`.
 Phase 4 (mika#2680) : vol 1 l'instrument, vol 2 le lecteur, vol 3 la classe
 **(e)** `closed`/`merged` d'une PR sans tâche de boucle, vol 4 le **terme de
-relâche** — pourquoi un tour a eu lieu.
+relâche** — pourquoi un tour a eu lieu — vol 5 le **croisement** des deux
+taxonomies, qui met ce terme au grain où une classe se décide.
 
 Les cinq classes en service, le terme d'état que chacune lit, et le terme de
 relâche qu'elle rend quand elle **ne** filtre pas :
@@ -187,6 +188,16 @@ paraphrase.** `skipped_by_class` nomme ce qu'une porte a reconnu ;
 dérivent pas l'une de l'autre, et c'est pour cela qu'il y a deux seaux dans
 l'agrégat : une classe peut relâcher par plusieurs termes, et un même terme —
 `state_unreadable` au premier chef — traverse quatre classes sur cinq.
+
+**Mais une ligne de ce tableau ne se décide pas au grain où les deux seaux plats
+la chiffrent.** Les deux comptent sur une fenêtre entière, tous agents confondus :
+`{head_not_previously_decided: 7}` ne dit pas si ces sept tours sont de `mika-qa`
+ou de `mika-dev`, ni ce qu'ils ont coûté — et la ligne (b) ci-dessus se décide
+par agent, un fan-out délibéré (mika#1711) n'ayant pas la même valeur des deux
+côtés. Le vol 5 de mika#2680 ajoute donc les deux seaux **croisés**,
+`by_agent_trigger_release` (avec le coût en tokens, pas seulement le compte de
+tours) et `skipped_by_agent_class`, sans toucher d'un octet les deux plats :
+`docs/eval/mika-2680/README.md` § 4.
 
 Trois termes n'ont **pas** de ligne dans ce tableau, parce qu'ils sont rendus
 avant qu'aucune classe soit décidée : `switch_disarmed` (le coupe-circuit est

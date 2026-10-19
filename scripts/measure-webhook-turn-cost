@@ -42,6 +42,31 @@
 # absent de la ligne tombe dans `absent_pre_field` — un binaire d'avant le
 # champ — et jamais dans un seau qui se lirait comme un terme nommé ainsi.
 #
+# ELLES NE SE DÉRIVENT PAS, MAIS ELLES SE CROISENT — ET C'EST LE CROISEMENT QUI
+# PORTE LA DÉCISION (mika#2680, vol 5). D'où un troisième et un quatrième seau,
+# `by_agent_trigger_release` et `skipped_by_agent_class`, qui ne REMPLACENT ni
+# l'un ni l'autre des deux premiers : les deux seaux plats répondent à une
+# question qui reste posée — « combien de tours une panne de lecture a-t-elle
+# coûtés sur toute la fenêtre » n'a pas besoin du grain fin — et les seaux
+# croisés répondent à une troisième, que ni l'un ni l'autre ne pose : quelle
+# porte a relâché, DANS QUELLE CELLULE, pour combien. `charged_by_release` est
+# plat : un seau par terme, agrégé sur tous les agents et tous les
+# déclencheurs ; `by_agent_trigger` ne porte aucune ventilation par terme. Leurs
+# deux axes ne se coupent pas, donc une soustraction « plafond d'une cellule
+# moins ce qu'une porte y revendique » n'était pas lisible sur l'agrégat — elle
+# se dérivait à la main, par un `jq` ad hoc sur le JSONL, c'est-à-dire par le
+# rattachement humain que ce lecteur était venu lever.
+#
+# L'UNITÉ DU SEAU PAYÉ EST LE TOKEN, PAS LE TOUR. `charged_by_release` compte
+# des tours ; `by_agent_trigger_release` porte les trois valeurs de coût de son
+# voisin `by_agent_trigger`, dans son ordre et trié comme lui. La mesure chiffre
+# en tokens d'entrée de bout en bout, et un plafond en tokens moins un
+# soustrahend en tours n'est pas une soustraction : c'est une comparaison de
+# deux unités. Le seau ÉCARTÉ, lui, ne porte qu'un compte — et sa clé s'appelle
+# `skipped`, pas `turns` : un tour écarté n'a pas eu lieu, donc il n'a aucun
+# coût à porter, et lui en inventer un ferait entrer dans le tableau un coût que
+# personne n'a payé.
+#
 # LE CHAMP `target` DE L'ÉVÉNEMENT ÉCARTÉ est éclipsé par le `target` de
 # métadonnée de `tracing` : `flatten_event(true)` met les deux à la racine de la
 # ligne. Le lecteur ne le lit pas — la moitié écarts se compte par `class`.
@@ -330,10 +355,78 @@ aggregate() {
                         cache_read_tokens: sum_num(.cache_read_tokens),
                         llm_calls:         sum_num(.llm_calls) })
                 | sort_by(- .input_tokens)),
+             # Le raffinement d un cran de son voisin du dessus : la cellule
+             # exacte sur laquelle une décision de classe se prend (mika#2680,
+             # vol 5). `charged_by_release` est PLAT — un seau par terme, agrégé
+             # sur tous les agents et tous les déclencheurs — et
+             # `by_agent_trigger` ne porte aucune ventilation par terme. Les deux
+             # opérandes de la soustraction que (g) demande sont donc sur deux
+             # axes qui ne se coupent pas : rien dans l agrégat ne disait
+             # combien des relâches `head_not_previously_decided` appartenaient
+             # à la cellule `mika-qa` × `check_suite_pr_branch`, la seule dont
+             # (g) parle. Le per-tour la portait déjà, mais à la main, par un
+             # `jq` ad hoc — le rattachement humain que le vol 1 était venu
+             # lever.
+             #
+             # L UNITÉ EST LE TOKEN, PAS LE TOUR. `sum_num` et les trois valeurs
+             # de coût du voisin, dans son ordre et trié comme lui : tout ce
+             # ticket chiffre en tokens d entrée, et un plafond en tokens moins
+             # un soustrahend en tours n est pas une soustraction, c est une
+             # comparaison de deux unités. Copier le `value: length` du seau plat
+             # rendrait un agrégat qui a l air complet, qui passe toute
+             # assertion de comptes, et sur lequel (g) reste indécidable.
+             #
+             # TROIS CLÉS, ET DEUX REPLIS DIFFÉRENTS. Le repli `absent_pre_field`
+             # est dans la clé de groupement ET dans la projection, comme sur le
+             # seau plat : dans la clé seule, deux lignes sans `release`
+             # grouperaient ensemble et la projection rendrait `null` — le bon
+             # compte sous un nom faux (motif mika#2331). `agent_id` et `trigger`
+             # gardent le `"null"` du voisin : l absence du champ `release` est
+             # « un binaire d avant le vol 4 », l absence d `agent_id` est une
+             # ligne sans agent. Deux absences différentes, qu un repli partagé
+             # confondrait.
+             by_agent_trigger_release:
+               ($turns
+                | group_by([(.agent_id // "null"), (.trigger // "null"),
+                            (.release  // "absent_pre_field")])
+                | map({ agent_id:          .[0].agent_id,
+                        trigger:           .[0].trigger,
+                        release:           (.[0].release // "absent_pre_field"),
+                        turns:             length,
+                        input_tokens:      sum_num(.input_tokens),
+                        cache_read_tokens: sum_num(.cache_read_tokens),
+                        llm_calls:         sum_num(.llm_calls) })
+                | sort_by(- .input_tokens)),
              skipped_by_class:
                ($skipped | group_by(.class // "null")
                          | map({ key: (.[0].class // "null"), value: length })
                          | from_entries),
+             # La même ventilation sur la moitié écartée, et ce n est pas une
+             # symétrie cosmétique : c est la vérification de la prémisse de (g)
+             # (mika#2680, vol 5). (g) est une assertion sur mika-qa, et (b)
+             # décide PAR AGENT — chaque agent a sa propre base et son propre
+             # audit, et `head_decided_and_notified` se lit dans l audit de CET
+             # agent. Un `skipped_by_class.green_check_suite_head_decided` de 7
+             # peut donc être 7 écarts côté mika-dev et ZÉRO côté mika-qa,
+             # auquel cas (b) ne couvre rien du côté qui intéresse (g) et le net
+             # de (g) égale son plafond ; un 7 réparti 4/3 dit l inverse. Les
+             # deux lectures mènent à deux décisions différentes, et le seau plat
+             # ne les distingue pas. L `agent_id` était déjà sur le fil et déjà
+             # projeté ; seul l agrégat le jetait.
+             #
+             # UN COMPTE, ET AUCUNE VALEUR DE COÛT — la clé s appelle `skipped`,
+             # pas `turns`. Un tour écarté n a pas eu lieu : il n a aucun coût en
+             # tokens à porter, et lui en inventer un ferait entrer dans le
+             # tableau un coût que personne n a payé. Réutiliser `turns`
+             # inviterait en plus la soustraction d une population évitée à une
+             # population payée, que le § 4 du protocole interdit.
+             skipped_by_agent_class:
+               ($skipped
+                | group_by([(.agent_id // "null"), (.class // "null")])
+                | map({ agent_id: .[0].agent_id,
+                        class:    (.[0].class // "null"),
+                        skipped:  length })
+                | sort_by(- .skipped)),
              # L autre moitié : POURQUOI chaque tour payé l a été. `//` est sûr
              # ici et seulement ici — `release` est une chaîne non vide ou rien,
              # donc l alternative ne peut pas avaler un `false` ni un `0` comme

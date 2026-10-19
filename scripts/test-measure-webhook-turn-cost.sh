@@ -5,6 +5,17 @@
 # Le § 3 a été ajouté par le vol 4 (mika#2680) pour le terme de relâche : même
 # discipline, ses deux moitiés sur deux corpora gelés distincts.
 #
+# Le § 4 a été ajouté par le vol 5 (mika#2680) pour le croisement des deux
+# taxonomies. Ses quatre assertions partagent UN corpus, et c'est la propriété
+# de ce corpus qui l'autorise : il est construit pour que les deux seaux plats
+# soient ambigus — un `{head_not_previously_decided: 2}` et un
+# `{green_check_suite_head_decided: 2}` qui ne disent ni de quelle cellule ni de
+# quel agent ils parlent — et pour que les deux seaux croisés lèvent chacune de
+# ces ambiguïtés séparément. Ce n'est donc pas le corpus que mika#2277 proscrit,
+# celui qui neutraliserait plusieurs gardes fail-safe d'un coup : chaque
+# assertion y tient une confusion distincte, sur une propriété que les trois
+# autres ne touchent pas.
+#
 # POURQUOI UN CONTRÔLE POSITIF ET SIX NÉGATIFS, ET PAS AUTRE CHOSE. Une batterie
 # qui ne porte que des négatifs est satisfaite par un lecteur qui ne rend jamais
 # rien ; une batterie qui ne porte que le positif est satisfaite par un lecteur
@@ -51,6 +62,7 @@ NO_CHARGED="$FIXTURES/no_charged_corpus.jsonl"
 UNPARSEABLE_ONLY="$FIXTURES/unparseable_only_corpus.jsonl"
 RELEASE="$FIXTURES/release_corpus.jsonl"
 RELEASE_ABSENT="$FIXTURES/release_absent_corpus.jsonl"
+CROSS_TAB="$FIXTURES/cross_tab_corpus.jsonl"
 
 # Le scratch reste DANS le worktree (`target/` est gitignoré) : la
 # permission-policy du dispatch refuse toute écriture hors worktree, et une
@@ -163,6 +175,89 @@ MEASURE --log-file "$RELEASE_ABSENT" --out "$WORK/abs-turns.jsonl" \
 eq "N7 — un release absent est nommé absent_pre_field, jamais un seau null" \
    '{"absent_pre_field":1}|null|false' \
    "$(jq -cS '.charged_by_release' "$WORK/abs-summary.json")|$(champ "$WORK/abs-turns.jsonl" req-pre-field-1 release)|$(jq -r '.charged_by_release | has("null")' "$WORK/abs-summary.json")"
+
+# ---------------------------------------------------------------------------
+printf -- '\n-- 4. croiser les deux taxonomies : la cellule, et son coût\n'
+# ---------------------------------------------------------------------------
+# Un seul corpus pour les quatre, et c'est sa PROPRIÉTÉ qui le permet : il est
+# construit pour que les deux seaux plats soient AMBIGUS et les deux seaux
+# croisés ne le soient pas. `charged_by_release` y rend
+# `{head_not_previously_decided: 2}` et `skipped_by_class`
+# `{green_check_suite_head_decided: 2}` — deux chiffres qui ne disent pas de
+# quelle cellule ni de quel agent ils parlent. Chaque assertion ci-dessous tient
+# une confusion distincte sur cette même entrée (leçon mika#2277 : une entrée
+# par confusion, pas un corpus qui les neutralise toutes d'un coup).
+MEASURE --log-file "$CROSS_TAB" --out "$WORK/xtab-turns.jsonl" \
+        --summary "$WORK/xtab-summary.json" >/dev/null 2>&1
+
+# Une cellule du seau croisé, désignée par ses trois clés. « cellule absente »
+# plutôt qu'un champ vide : un croisement à deux clés ne rendrait pas une
+# cellule à la valeur fausse, il ne rendrait AUCUNE cellule, et les deux cas se
+# diagnostiquent différemment.
+cellule() {
+    jq -r --arg a "$1" --arg t "$2" --arg r "$3" '
+        [.by_agent_trigger_release[]?
+         | select(.agent_id == $a and .trigger == $t and .release == $r)]
+        | if length == 0 then "cellule absente"
+          else "\(.[0].turns):\(.[0].input_tokens):\(.[0].cache_read_tokens):\(.[0].llm_calls)"
+          end' "$WORK/xtab-summary.json"
+}
+
+# P3 — le positif, et il porte DEUX propriétés que rien d'autre ne porte.
+#
+# (a) L'UNITÉ EST LE TOKEN, PAS LE TOUR. La forme la plus naturelle à écrire —
+# copier le `value: length` du seau plat juste au-dessus — rendrait un agrégat
+# qui a l'air complet et sur lequel (g) reste indécidable : tout ce ticket
+# chiffre en tokens d'entrée (193 k, 279 k, 741 k, 1,30 M), et un plafond en
+# tokens moins un soustrahend en tours n'est pas une soustraction mais une
+# comparaison de deux unités. Les deux cellules portent ici le MÊME compte de
+# tours (1) pour des coûts de 900 et 120 : un lecteur qui n'émettrait que des
+# comptes est indistinguable d'un lecteur correct sur un contrôle de comptes, et
+# devient rouge ici.
+#
+# (b) LE CROISEMENT EST SUR TROIS CLÉS. Les deux cellules ne diffèrent que par
+# l'agent — même trigger, même terme de relâche. Un croisement sur
+# `[trigger, release]` les fusionnerait en une cellule de 2 ; un croisement sur
+# `[agent_id, trigger]` n'aurait pas de champ `release` et ne rendrait aucune
+# cellule. Les deux mutations sont rouges sur cette ligne.
+eq "P3 — deux cellules d'un même release, comptes égaux et coûts en tokens distincts" \
+   "1:900:150:3|1:120:0:2" \
+   "$(cellule mika-qa check_suite_pr_branch head_not_previously_decided)|$(cellule mika-dev check_suite_pr_branch head_not_previously_decided)"
+
+# N8 — motif mika#2331, sur l'axe du nouveau seau. Le repli doit être dans la
+# clé de GROUPEMENT **et** dans la projection. Posé dans la clé seule, deux
+# lignes sans `release` grouperaient bien ensemble mais la projection rendrait
+# `null` : le seau porterait le bon compte sous un nom faux. L'assertion tient
+# les deux moitiés — la cellule nommée existe, et aucune cellule de l'axe ne
+# vaut `null`.
+eq "N8 — un release absent fait une cellule absent_pre_field, jamais une cellule null" \
+   "1:60:0:1|false" \
+   "$(cellule mika-qa issue_comment absent_pre_field)|$(jq -r '[.by_agent_trigger_release[]?.release] | any(. == null)' "$WORK/xtab-summary.json")"
+
+# N9 — le négatif qui compte le plus : CROISER N'EST PAS REMPLACER. Les trois
+# seaux antérieurs répondent à des questions qui restent posées — « combien de
+# tours une panne de lecture a-t-elle coûtés sur toute la fenêtre » se lit sur le
+# plat et n'a pas besoin du grain fin — et deux assertions de ce harnais (N3, P2,
+# N7) portent sur leur forme. Une fusion déguisée en ajout serait réécrire une
+# preuve au lieu d'en ajouter une. Assérable par littéraux parce que les trois
+# seaux sont des fonctions pures du même corpus gelé : rien ici ne se compare à
+# une exécution antérieure.
+eq "N9 — by_agent_trigger, charged_by_release et skipped_by_class sont inchangés" \
+   'mika-qa/check_suite_pr_branch=1:900:150:3 mika-dev/check_suite_pr_branch=1:120:0:2 mika-qa/issue_comment=1:60:0:1|{"absent_pre_field":1,"head_not_previously_decided":2}|{"green_check_suite_head_decided":2}' \
+   "$(jq -r '[.by_agent_trigger[] | "\(.agent_id)/\(.trigger)=\(.turns):\(.input_tokens):\(.cache_read_tokens):\(.llm_calls)"] | join(" ")' "$WORK/xtab-summary.json")|$(jq -cS '.charged_by_release' "$WORK/xtab-summary.json")|$(jq -cS '.skipped_by_class' "$WORK/xtab-summary.json")"
+
+# N10 — la moitié écartée, et la symétrie qu'il ne faut PAS faire. (g) est une
+# assertion sur mika-qa, et (b) décide par agent : un
+# `skipped_by_class.green_check_suite_head_decided` de 2 peut être 2 écarts côté
+# mika-dev et ZÉRO côté mika-qa, auquel cas (b) ne couvre rien du côté qui
+# intéresse (g). Les deux lectures mènent à deux décisions différentes.
+# Et le seau croisé ne porte AUCUNE valeur de coût : un tour écarté n'a pas eu
+# lieu, donc il n'a aucun coût en tokens à porter, et lui en inventer un ferait
+# entrer dans le tableau un coût que personne n'a payé — la somme même que le
+# § 4 du protocole interdit.
+eq "N10 — skipped_by_agent_class sépare deux agents de même classe, sans clé de coût" \
+   "mika-dev=1,mika-qa=1|agent_id,class,skipped" \
+   "$(jq -r '[.skipped_by_agent_class[]? | select(.class == "green_check_suite_head_decided") | "\(.agent_id)=\(.skipped)"] | sort | join(",")' "$WORK/xtab-summary.json")|$(jq -r '[.skipped_by_agent_class[]? | keys] | flatten | unique | join(",")' "$WORK/xtab-summary.json")"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passées, %d échouées\n\n' "$PASS" "$FAIL"
