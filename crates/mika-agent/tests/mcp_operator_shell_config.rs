@@ -42,6 +42,7 @@ fn stdio_server(command: &str) -> McpServerConfig {
         url: None,
         headers: None,
         enabled: true,
+        data_grade: Default::default(),
     }
 }
 
@@ -192,6 +193,7 @@ fn headers_roundtrip_through_operator_shell() {
         url: Some("https://api.example.com/mcp".to_string()),
         headers: Some(headers),
         enabled: true,
+        data_grade: Default::default(),
     };
     server.headers = server.headers.take();
     config.mcp_servers.insert("api".to_string(), server);

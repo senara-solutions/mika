@@ -205,13 +205,29 @@ once per `ToolDispatchCtx` construction from the same matched-skill list as
    (reads `skill_data_grades` at execute-time from the current registry
    snapshot) and closes this window.
 
-2. **Dynamic MCP registration (forward-compatible).** MCP servers can
-   register tools at runtime post-startup. Phase 2 ran once at server init;
-   a dynamically-registered MCP tool whose "skill" (the MCP server's
-   manifest) declares `data_grade = "testimony"` would not be caught by the
-   startup ban but is caught by the execute-time Layer 4 lookup. Present-day
-   MCP integration does not carry `data_grade` on MCP-server manifests, but
-   the Layer 4 shape is forward-compatible; this is the extension surface.
+2. **MCP-registered tools — in force since mika#1959.** MCP servers register
+   tools at runtime post-startup; Phase 2 ran once at server init, so the
+   startup ban never sees them. They are caught by the execute-time Layer 4
+   lookup, because the map is **seeded** with them: an MCP server's manifest
+   entry (`mcp-servers.json`) carries `data_grade` (absent ⇒ `operational`, the load-bearing
+   default), `mcp::mcp_tool_data_grades` joins it to each namespaced tool, and
+   `agent_loop::seed_mcp_data_grades` inserts the result into
+   `skill_data_grades` at each of the two sites that publish
+   `mcp.tool_definitions()` to the model. The map is keyed by the
+   Claude-facing tool name, which an MCP tool has (`mcp__<server>__<tool>`),
+   so seeding was sufficient: **`execute_tool`'s body was not modified by
+   mika#1959**, and the empty diff on that function is the proof that the
+   forward-compatible shape this paragraph used to promise was real.
+
+   The silent/callback/heartbeat path receives `None` in place of the manager
+   and is out of population by construction. The pairing between publication
+   and seeding is held structurally by
+   `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`
+   (allowlist shipped empty).
+
+   **Residue, named rather than implied:** a testimony MCP tool stays
+   *published* in `tool_definitions()`, so the model can still **propose** it
+   — only the call is refused. See § *Vigilance surface*.
 
 3. **Registry mutation via `mika skills` DB overrides.** `skill_overrides`
    DB rows can re-enable a skill after Phase 2 ran (mika#682 transient
@@ -228,6 +244,10 @@ Structural bans (refused pre-handler, no side effects):
   `q` restricted to app-created markers (Layer 3).
 - **Any skill-registered tool** whose owning skill declares
   `data_grade = "testimony"` (Layers 2 + 4).
+- **Any MCP-registered tool** whose server declares
+  `"data_grade": "testimony"` in `mcp-servers.json` (Layer 4 only — there is no
+  registry-eviction equivalent on the MCP side; mika#1959). The call is
+  refused before `McpManager::call_tool`, so no remote request is issued.
 
 Bans in the doctrine but not (yet) reachable through today's tool surface:
 
@@ -287,6 +307,23 @@ tool, new builtin, dedicated Gmail-only skill, OAuth wrapper — MUST either:
 If a future change does NEITHER, the only remaining defense is Layer 1 (the
 prompt) — the fragile layer the doctrine explicitly distrusts. **This is
 the single axis of vigilance for every future testimony-adjacent change.**
+
+**Option 1 now reaches MCP servers too (mika#1959)**: a server declares
+`"data_grade": "testimony"` in `mcp-servers.json` and Layer 4 fires on every one of its
+tools. Absence of the field reads `operational`, which is the load-bearing
+default — a manifest that forgets to declare its grade cannot accidentally
+acquire a testimony privilege; the explicit consent `"data_grade": "testimony"`
+is what means *refusal*, never permission.
+
+**What that does NOT buy, on this same axis (mika#2814).** Layer 4 refuses the
+**call**, not the **publication**. A testimony MCP tool stays in
+`tool_definitions()`, so the model can still *propose* it — and the doctrine
+forbids proposing as much as accessing. On the skills side that half is held
+structurally by Layer 2, which **evicts** the tool from the registry so it is
+never published; there is no Layer-2 equivalent on the MCP side. The partial net
+is the EndTurn guard 5h (`testimony_access_proposal`, mika#1960 phase 2 /
+mika#2627), which reads the outgoing text — a layer-1.5 net on the wording, not
+a structural door. Tracked in mika#2814.
 
 ### Applied hardening (closed after mika#1798)
 
@@ -353,8 +390,11 @@ the single axis of vigilance for every future testimony-adjacent change.**
 ### Known bypass classes (out of scope for mika#1798, tracked separately)
 
 The four-layer defense covers the `run_gws` builtin surface + any future
-tool that declares `data_grade = "testimony"`. With the `shell-exec` class
-closed above, it still does NOT cover:
+tool that declares `data_grade = "testimony"`, skill-registered or
+MCP-registered. With the `shell-exec` class closed above and the
+**MCP-registered** class closed by mika#1959 (§ *Layer 4* point 2 — its
+*propose*-side residue is tracked as mika#2814 in § *Vigilance surface*), it
+still does NOT cover:
 
 - **Raw-HTTP API surfaces** — a direct
   `curl -X POST https://gmail.googleapis.com/...` reaches testimony data
@@ -367,12 +407,6 @@ closed above, it still does NOT cover:
   should introduce a `SkillRegistry::load_for_agent(dir, identity,
   overrides)` wrapper that atomically returns a fully-phased registry so
   the ban cannot be forgotten.
-- **MCP-registered testimony tools** — the L4 lookup map
-  (`skill_data_grades`) is built from `skill_tools`, which excludes
-  MCP-registered tools. An MCP server that registers a `gmail_fetch` or
-  `mcp__gmail__*` tool reaches Gmail with zero doctrine layer firing.
-  Forward-compat requires MCP manifests to gain a `data_grade` field AND
-  the MCP dispatch site to consult the same map.
 - **Propose surface via `send_message`** (named by mika#1960 phase 2,
   **closed by mika#2627**) — the EndTurn guard 5h reads the turn's final
   assistant text only, so a proposal delivered through `send_message` (the
@@ -407,9 +441,29 @@ closed above, it still does NOT cover:
     `execute_tool` (top-of-function testimony check).
   - Manifest field: `crates/mika-agent/src/skills/manifest.rs` §
     `DataGrade` enum + `SkillInfo.data_grade`.
+  - MCP manifest field: `crates/mika-agent/src/mcp/config.rs` §
+    `McpServerConfig.data_grade` (mika#1959). Operator-facing reference:
+    `docs/mcp.md` § *Déclarer le grade d'un serveur MCP*.
+  - MCP → L4 seeding: `crates/mika-agent/src/mcp/mod.rs` §
+    `mcp_tool_data_grades` + `McpManager::tool_data_grades`, consumed by
+    `crates/mika-agent/src/agent_loop/mod.rs` § `seed_mcp_data_grades` at the
+    two sites that publish `mcp.tool_definitions()`.
 
 ## Change log
 
+- **2026-10-19** — mika#1959: the MCP dispatch tier came under Layer 4. An MCP
+  server manifest carries `data_grade` (absent ⇒ `operational`), joined to each
+  namespaced tool and **seeded** into the existing `skill_data_grades` map at
+  the two publication sites. `execute_tool`'s body is unchanged — only its
+  doc-comment, which asserted the opposite. Moved **MCP-registered testimony
+  tools** out of § Known bypass classes; added the MCP row to § Ban list (v1).
+  **Correction to this document and to the ticket body:** mika#1959 named three
+  grades (`testimony | evidence | reference`) and a default of `reference`;
+  `DataGrade` as shipped by PR#1956 is **binary** (`operational` / `testimony`),
+  so `reference` reads `operational` here and no third variant was created
+  (plan decision D1). An unknown grade string is a **parse failure**, never a
+  guessed default. The *propose* half is **not** closed — see § *Vigilance
+  surface*, tracked as mika#2814.
 - **2026-10-01** — mika#1960 phase 2: the *propose* surface gained a structural
   half. EndTurn guard **5h** (`testimony_access_proposal`) is armed, with its
   single-retry budget, its `_uncorrected` residue event and a regression eval

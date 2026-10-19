@@ -62,14 +62,28 @@ pub(crate) struct ToolDispatchCtx<'a> {
     /// where Phase-2 eviction is incomplete but the execute-time gate still
     /// fires.
     ///
-    /// **MCP note (aspirational, not enforced today):** dynamically-registered
-    /// MCP tools reach `execute_tool` via the third dispatch tier (`mcp.call_tool`)
-    /// and are NOT keyed in `skill_data_grades` because they are not
-    /// `skill_tools`. The map's shape is forward-compatible: when MCP manifests
-    /// gain a `data_grade` field and MCP tools are seeded into this map, the
-    /// L4 predicate will fire on them without any change to `execute_tool`.
-    /// Until then, MCP-registered testimony tools bypass L4 and must be gated
-    /// at MCP manifest ingestion — the vigilance-surface entry documented in
+    /// **MCP tools are in this map, and in force since mika#1959.**
+    /// They reach `execute_tool` via the third dispatch tier (`mcp.call_tool`)
+    /// and are not `skill_tools`, so `build_skill_data_grades` does not see
+    /// them — F5 of the mika#1798 adversarial review. The map is keyed by the
+    /// Claude-facing tool name, which an MCP tool has
+    /// (`mcp__<server>__<tool>`), so the fix was to **seed** it rather than to
+    /// add a second predicate: `McpServerConfig.data_grade` is joined onto each
+    /// namespaced tool by `mcp::mcp_tool_data_grades`, exposed as
+    /// `McpManager::tool_data_grades()`, and inserted here by
+    /// `agent_loop::seed_mcp_data_grades` at each of the two sites that publish
+    /// `mcp.tool_definitions()` to the model. **`execute_tool` was not modified**
+    /// — the forward-compatible shape this comment used to promise was real,
+    /// and the empty diff on that function is the proof.
+    ///
+    /// Silent/callback/heartbeat mode receives `None` in place of the manager
+    /// and is out of population by construction, not by omission; the pairing
+    /// is held by the structural guard
+    /// `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`.
+    ///
+    /// **Residue, not closed:** a testimony MCP tool is still *published* in
+    /// `tool_definitions()`, so the model can still propose it — only the call
+    /// is refused. See § *Vigilance surface* of
     /// `crates/mika-agent/docs/non-transit-data-grade.md`.
     pub(crate) skill_data_grades: HashMap<String, crate::skills::manifest::DataGrade>,
 }
@@ -487,8 +501,14 @@ const TOOL_TESTIMONY_GRADE_FORBIDDEN: &str = r#"{"error":"testimony_grade_forbid
 /// dispatch fires, `dispatch.skill_data_grades` is consulted. If the tool's
 /// owning skill declared `data_grade = "testimony"`, the call is rejected
 /// with `TOOL_TESTIMONY_GRADE_FORBIDDEN` before reaching the handler. This
-/// closes the hot-reload race window, dynamic MCP registration (forward-
-/// compatible), and DB-override paths that Phase-2 eviction cannot cover.
+/// closes the hot-reload race window, dynamic MCP registration (in force
+/// since mika#1959 — see `skill_data_grades`), and DB-override paths that
+/// Phase-2 eviction cannot cover.
+///
+/// **This function's body is unchanged by mika#1959.** The MCP tier was brought
+/// under L4 by seeding `skill_data_grades`, not by a second predicate here;
+/// only this parenthetical moved, because it asserted the opposite of what now
+/// happens.
 async fn execute_tool(
     dispatch: &ToolDispatchCtx<'_>,
     name: &str,
@@ -671,6 +691,104 @@ mod tests {
         assert!(
             !matches!(grades.get("web_search"), Some(&DataGrade::Testimony)),
             "Layer 4 predicate must not classify web_search as Testimony"
+        );
+    }
+
+    // -- mika#1959 : la troisième tier MCP sous la garde L4 --
+
+    /// Outil MCP de référence des deux tests ci-dessous, et son serveur.
+    const OUTIL_MCP: &str = "mcp__journal-perso__read_entry";
+    const SERVEUR_MCP: &str = "journal-perso";
+
+    /// Manager MCP sans connexion qui route `OUTIL_MCP`, au grade demandé.
+    fn manager_mcp(grade: DataGrade) -> McpManager {
+        let mut routage = HashMap::new();
+        routage.insert(
+            OUTIL_MCP.to_string(),
+            (SERVEUR_MCP.to_string(), "read_entry".to_string()),
+        );
+        let mut grades = HashMap::new();
+        grades.insert(OUTIL_MCP.to_string(), grade);
+        McpManager::sans_connexion_pour_tests(routage, grades)
+    }
+
+    /// La phrase que rend `McpManager::call_tool` quand il est atteint sur un
+    /// serveur non connecté. C'est le témoin d'atteinte du troisième étage.
+    fn temoin_call_tool_atteint() -> String {
+        format!("MCP server '{SERVEUR_MCP}' is not connected.")
+    }
+
+    #[tokio::test]
+    async fn mika1959_un_outil_mcp_testimony_est_refuse_avant_call_tool() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+        let ctx = harness.ctx();
+        let tools = ToolRegistry::new();
+        let skill_tools: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let timeouts: HashMap<String, u64> = HashMap::new();
+        let mcp = manager_mcp(DataGrade::Testimony);
+
+        // La map L4 telle que `agent_loop::seed_mcp_data_grades` la produit.
+        let dispatch = ToolDispatchCtx {
+            tools: &tools,
+            skill_tools: &skill_tools,
+            ctx: &ctx,
+            skill_timeout: 30,
+            skill_tool_timeouts: &timeouts,
+            mcp_manager: Some(&mcp),
+            long_running_ctx: None,
+            skill_data_grades: mcp.tool_data_grades().clone(),
+        };
+
+        let sortie = execute_tool(&dispatch, OUTIL_MCP, serde_json::json!({})).await;
+
+        assert!(sortie.is_error, "un outil testimony doit être refusé");
+        assert_eq!(
+            sortie.content, TOOL_TESTIMONY_GRADE_FORBIDDEN,
+            "le corps de refus doit être celui de la garde L4"
+        );
+        // Le témoin d'atteinte : son absence est la preuve qu'aucun appel
+        // distant n'a été tenté. Le contrôle positif ci-dessous montre que
+        // cette phrase sort bel et bien quand `call_tool` est atteint.
+        assert!(
+            !sortie.content.contains(&temoin_call_tool_atteint()),
+            "la garde doit refuser AVANT le troisième étage, pas après"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1959_le_meme_outil_en_operational_nest_pas_refuse_par_l4() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+        let ctx = harness.ctx();
+        let tools = ToolRegistry::new();
+        let skill_tools: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let timeouts: HashMap<String, u64> = HashMap::new();
+        let mcp = manager_mcp(DataGrade::Operational);
+
+        let dispatch = ToolDispatchCtx {
+            tools: &tools,
+            skill_tools: &skill_tools,
+            ctx: &ctx,
+            skill_timeout: 30,
+            skill_tool_timeouts: &timeouts,
+            mcp_manager: Some(&mcp),
+            long_running_ctx: None,
+            skill_data_grades: mcp.tool_data_grades().clone(),
+        };
+
+        let sortie = execute_tool(&dispatch, OUTIL_MCP, serde_json::json!({})).await;
+
+        assert_ne!(
+            sortie.content, TOOL_TESTIMONY_GRADE_FORBIDDEN,
+            "L4 ne doit pas refuser un outil MCP operational"
+        );
+        // Contrôle positif de la paire : le dispatch a poursuivi jusqu'au
+        // troisième étage et `call_tool` a répondu. Sans cette assertion, le
+        // test ci-dessus pourrait être vert sur un chemin qui n'atteint jamais
+        // `call_tool` pour une raison étrangère au grade.
+        assert_eq!(
+            sortie.content,
+            temoin_call_tool_atteint(),
+            "le dispatch doit atteindre McpManager::call_tool"
         );
     }
 }

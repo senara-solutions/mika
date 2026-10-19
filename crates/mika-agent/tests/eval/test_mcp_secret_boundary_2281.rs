@@ -106,6 +106,9 @@ async fn connect_probe_server() -> McpManager {
             url: None,
             headers: None,
             enabled: true,
+            // mika#1959 — ce test porte sur la frontière des secrets, pas sur le
+            // grade : le défaut est le seul choix qui ne change rien ici.
+            data_grade: Default::default(),
         },
     );
 

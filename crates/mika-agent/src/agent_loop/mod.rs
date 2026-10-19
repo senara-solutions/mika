@@ -5700,7 +5700,9 @@ async fn run_agent_inner(
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     // mika#1798 Layer 4: build the per-tool data_grade lookup alongside the
     // tool map so both stay consistent under the same last-write-wins rule.
-    let skill_data_grades = build_skill_data_grades(&matched_entries);
+    // mika#1959 — ensemencé plus bas avec les grades des outils MCP, au site
+    // même qui les publie au modèle.
+    let mut skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     // mika#2276 M1 (conversation mode) — 1 of the 3 fan-out sites.
     let skill_tool_timeouts = build_skill_tool_timeouts(&matched_entries, provider, model);
@@ -5742,6 +5744,8 @@ async fn run_agent_inner(
     if let Some(mcp) = params.mcp_manager {
         skill_tool_defs.extend_from_slice(mcp.tool_definitions());
     }
+    // mika#1959 — les outils MCP publiés juste au-dessus entrent dans la map L4.
+    seed_mcp_data_grades(&mut skill_data_grades, params.mcp_manager);
 
     // mika#1324 — Structural tool filter for CI webhook events. Extracted to a
     // helper so the predicate + filter are unit-testable without standing up the
@@ -7819,7 +7823,9 @@ async fn run_team_agent_inner_impl(
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     // mika#1798 Layer 4: build the per-tool data_grade lookup alongside the
     // tool map so both stay consistent under the same last-write-wins rule.
-    let skill_data_grades = build_skill_data_grades(&matched_entries);
+    // mika#1959 — ensemencé plus bas avec les grades des outils MCP, au site
+    // même qui les publie au modèle.
+    let mut skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     // mika#2276 M1 (team mode) — 3 of the 3 fan-out sites.
     let skill_tool_timeouts = build_skill_tool_timeouts(&matched_entries, provider, model);
@@ -7834,6 +7840,8 @@ async fn run_team_agent_inner_impl(
     if let Some(mcp) = params.mcp_manager {
         skill_tool_defs.extend_from_slice(mcp.tool_definitions());
     }
+    // mika#1959 — les outils MCP publiés juste au-dessus entrent dans la map L4.
+    seed_mcp_data_grades(&mut skill_data_grades, params.mcp_manager);
 
     // #862 — Turn-start snapshot of enabled tool names (team mode).
     let enabled_tool_names: HashSet<String> =
@@ -8131,6 +8139,39 @@ fn build_skill_data_grades(
         }
     }
     map
+}
+
+/// Ensemence la map L4 avec les grades des outils MCP (mika#1959, F5 de mika#1798).
+///
+/// Les outils MCP ne sont pas des `skill_tools`, donc `build_skill_data_grades`
+/// ne les voit pas et L4 ne tirait jamais sur eux. La map est indexée par nom
+/// d'outil Claude-facing, ce qu'un outil MCP possède (`mcp__<serveur>__<outil>`),
+/// donc l'ensemencement suffit : `execute_tool` n'est pas modifié.
+///
+/// À appeler partout où `mcp.tool_definitions()` est publié au modèle — et
+/// seulement là. Le mode silencieux reçoit `None` en place du manager, il est
+/// hors population par construction. Appariement tenu par la garde
+/// `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`.
+///
+/// Collision : rien n'empêche une skill de déclarer un outil `mcp__<s>__<t>`
+/// (le préfixe n'est réservé qu'à la résolution des `required_tools`). Sur une
+/// collision, **le grade le plus strict l'emporte** : un `Testimony` déjà posé
+/// par la skill n'est jamais rabattu à `Operational` par un serveur MCP qui n'a
+/// rien déclaré — sinon l'étage skills du dispatch, qui passe avant l'étage
+/// MCP, exécuterait l'outil testimony sans refus L4.
+fn seed_mcp_data_grades(
+    grades: &mut HashMap<String, crate::skills::manifest::DataGrade>,
+    mcp: Option<&McpManager>,
+) {
+    use crate::skills::manifest::DataGrade;
+    if let Some(mcp) = mcp {
+        for (tool, grade) in mcp.tool_data_grades() {
+            let entree = grades.entry(tool.clone()).or_insert(*grade);
+            if *grade == DataGrade::Testimony {
+                *entree = DataGrade::Testimony;
+            }
+        }
+    }
 }
 
 /// Build a lookup map from tool name → ResolvedSkillTool for matched skills.
@@ -19678,6 +19719,305 @@ fn prod(scope: HistoryScope) -> usize {
             identity_history_reader_sites(prod, trailing).len(),
             1,
             "only a line that STARTS with a comment marker is prose"
+        );
+    }
+
+    // -- mika#1959 : publier des outils MCP et ensemencer L4 vont ensemble ----
+
+    /// Sites de production exemptés de
+    /// [`mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`].
+    ///
+    /// **Livrée vide, et la résolution quand la garde tire est d'ENSEMENCER le
+    /// site, jamais d'ajouter une entrée ici.** Même contrat que
+    /// `CONTEXT_HISTORY_READERS_ALLOWED` ci-dessus : une liste née vide est un
+    /// emplacement pour le prochain oubli, donc sa vacuité est elle-même
+    /// asservie. Si une exception était un jour justifiée, l'entrée doit nommer
+    /// son ticket de suite (`mika#NNNN`), ce que l'assertion auto-nettoyante de
+    /// la garde impose.
+    const ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT: &[&str] = &[];
+
+    /// Lignes de source retenues par un balayage, en `(ligne 1-based, texte)`.
+    type LignesRetenues = Vec<(usize, String)>;
+
+    /// Lignes de production qui **publient** les outils MCP au modèle, et
+    /// lignes qui **ensemencent** la map L4, en `(ligne 1-based, texte)`.
+    ///
+    /// L'aiguille de publication est `extend_from_slice(mcp.tool_definitions())`
+    /// — la forme qui verse les définitions dans le lot envoyé au modèle — et
+    /// non `tool_definitions()` nue : deux sites la lisent pour tout autre
+    /// chose (la collecte de noms à `:1502`, la projection KG de
+    /// `domain_builder`), et les balayer dedans rendrait la garde inutilisable
+    /// sur les fichiers qui ont le droit de lire l'inventaire sans le publier.
+    ///
+    /// L'aiguille d'ensemencement exclut la **définition** de la fonction
+    /// (`fn seed_mcp_data_grades(`) : la déclarer n'est pas l'appeler, et la
+    /// compter ferait passer la garde au vert avec zéro appel.
+    ///
+    /// Les deux exclusions de [`identity_history_reader_sites`] se composent
+    /// identiquement : un fichier dont le **chemin** est du test n'a pas de
+    /// moitié production (mika#2321), et partout ailleurs les régions de test
+    /// sont **masquées** plutôt que tronquées (mika#2398) — ce qui est
+    /// porteur ici, puisque les deux aiguilles figurent en clair dans les
+    /// fixtures du contrôle négatif ci-dessous, dans ce même fichier.
+    fn sites_publication_et_ensemencement_mcp(
+        path: &std::path::Path,
+        src: &str,
+    ) -> (LignesRetenues, LignesRetenues) {
+        if crate::source_scan::is_test_source_path(path) {
+            return (Vec::new(), Vec::new());
+        }
+        let masque = mika_common::source_guard::mask_test_regions(src);
+        let lignes: LignesRetenues = masque
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line.trim().to_string()))
+            .filter(|(_, line)| !line.starts_with("//") && !line.starts_with('*'))
+            .collect();
+        let publications = lignes
+            .iter()
+            .filter(|(_, line)| line.contains("extend_from_slice(mcp.tool_definitions())"))
+            .cloned()
+            .collect();
+        let ensemencements = lignes
+            .iter()
+            .filter(|(_, line)| {
+                line.contains("seed_mcp_data_grades(") && !line.contains("fn seed_mcp_data_grades(")
+            })
+            .cloned()
+            .collect();
+        (publications, ensemencements)
+    }
+
+    /// **mika#1959** — tout site qui publie des outils MCP au modèle ensemence
+    /// aussi la map L4, et il y en a exactement deux.
+    ///
+    /// C'est l'appariement qui porte la correction de F5. La garde L4 de
+    /// `tool_execution::dispatch::execute_tool` est indexée par nom d'outil
+    /// Claude-facing ; un outil MCP n'y entre que parce que
+    /// [`seed_mcp_data_grades`] l'y met. Un troisième site de publication
+    /// ajouté sans ensemencement rouvrirait le contournement **exactement**
+    /// comme avant mika#1959 — silencieusement, avec tous les tests
+    /// comportementaux au vert, puisque chaque moitié est individuellement
+    /// plausible : la publication marche, et la map est simplement vide pour
+    /// ces outils. C'est la classe que `grooming_marker` a dû fermer une fois
+    /// (mika#2158).
+    ///
+    /// Le site silencieux/callback/heartbeat (`run_silent_agent`) est **hors
+    /// population par construction** : il ne publie pas les outils MCP et
+    /// reçoit `None` en place du manager. Il n'apparaît donc dans aucun des
+    /// deux comptes, et c'est pourquoi le nombre attendu est deux et non trois.
+    #[test]
+    fn mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4() {
+        assert!(
+            ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT
+                .iter()
+                .all(|entry| entry.contains("mika#")),
+            "mika#1959 — chaque entrée de ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT doit \
+             nommer le ticket de suite qui la retirera. Une exemption que personne ne \
+             possède est la façon dont une garde cesse de garder. Liste actuelle : \
+             {ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT:?}"
+        );
+        assert!(
+            ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT.is_empty(),
+            "mika#1959 — ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT est livrée vide : les deux \
+             sites de publication sont ensemencés par ce ticket même. Une entrée ici est un \
+             outil MCP publié hors garde L4 ; ensemencez le site au lieu de l'exempter. \
+             Liste actuelle : {ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT:?}"
+        );
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut publications: Vec<String> = Vec::new();
+        let mut ensemencements: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT
+                .iter()
+                .any(|allowed| rel.contains(allowed))
+            {
+                return;
+            }
+            let (pubs, seeds) = sites_publication_et_ensemencement_mcp(path, production);
+            for (line, text) in pubs {
+                publications.push(format!("{rel}:{line}: {text}"));
+            }
+            for (line, text) in seeds {
+                ensemencements.push(format!("{rel}:{line}: {text}"));
+            }
+        });
+
+        assert_eq!(
+            publications.len(),
+            ensemencements.len(),
+            "mika#1959 — chaque site publiant `mcp.tool_definitions()` au modèle doit \
+             appeler `seed_mcp_data_grades`. Publications ({}) :\n{}\n\nEnsemencements \
+             ({}) :\n{}\n\nSi vous venez d'ajouter un site de publication, ensemencez-le \
+             — ne l'allowlistez pas : un outil MCP testimony publié sans grade dans la \
+             map L4 est le contournement F5 de mika#1798, et rien de visible ne casse.",
+            publications.len(),
+            publications.join("\n"),
+            ensemencements.len(),
+            ensemencements.join("\n")
+        );
+        assert_eq!(
+            publications.len(),
+            2,
+            "mika#1959 — exactement deux sites publient les outils MCP au modèle : la \
+             conversation et l'agent d'équipe. Le mode silencieux est hors population \
+             (il reçoit `None`). Trouvés :\n{}",
+            publications.join("\n")
+        );
+    }
+
+    /// **mika#1959** — `seed_mcp_data_grades` verse les grades MCP dans la map
+    /// L4 sans toucher aux entrées des skills, ne rabat jamais un `Testimony`
+    /// sur collision de nom, et `None` (mode silencieux) laisse la map intacte.
+    ///
+    /// La garde d'appariement ci-dessus prouve que l'appel est **présent** à
+    /// chaque site ; ce test prouve qu'il **fait** ce que la garde L4 attend.
+    /// Un corps vidé laisserait la garde verte et rouvrirait F5.
+    #[test]
+    fn mika1959_lensemencement_verse_les_grades_mcp_sans_ecraser_les_skills() {
+        use crate::skills::manifest::DataGrade;
+
+        let outil_mcp = "mcp__journal-perso__read_entry";
+        let mcp = McpManager::sans_connexion_pour_tests(
+            HashMap::from([(
+                outil_mcp.to_string(),
+                ("journal-perso".to_string(), "read_entry".to_string()),
+            )]),
+            HashMap::from([(outil_mcp.to_string(), DataGrade::Testimony)]),
+        );
+        let map_skills = || HashMap::from([("web_search".to_string(), DataGrade::Operational)]);
+
+        let mut grades = map_skills();
+        seed_mcp_data_grades(&mut grades, Some(&mcp));
+        assert_eq!(
+            grades.get(outil_mcp),
+            Some(&DataGrade::Testimony),
+            "l'outil MCP doit entrer dans la map L4 avec le grade de son serveur"
+        );
+        assert_eq!(
+            grades.get("web_search"),
+            Some(&DataGrade::Operational),
+            "l'ensemencement MCP ne doit pas toucher aux entrées des skills"
+        );
+        assert_eq!(grades.len(), 2);
+
+        // Collision : un outil de skill testimony au nom namespacé MCP n'est
+        // pas rabattu par un serveur qui n'a rien déclaré.
+        let operational = McpManager::sans_connexion_pour_tests(
+            HashMap::from([(
+                outil_mcp.to_string(),
+                ("journal-perso".to_string(), "read_entry".to_string()),
+            )]),
+            HashMap::from([(outil_mcp.to_string(), DataGrade::Operational)]),
+        );
+        let mut grades = HashMap::from([(outil_mcp.to_string(), DataGrade::Testimony)]);
+        seed_mcp_data_grades(&mut grades, Some(&operational));
+        assert_eq!(
+            grades.get(outil_mcp),
+            Some(&DataGrade::Testimony),
+            "sur collision, le grade le plus strict l'emporte — un serveur MCP \
+             muet ne rabat jamais un `Testimony` de skill"
+        );
+
+        let mut grades = map_skills();
+        seed_mcp_data_grades(&mut grades, None);
+        assert_eq!(
+            grades,
+            map_skills(),
+            "sans manager (mode silencieux), la map reste celle des skills"
+        );
+    }
+
+    /// **Contrôle négatif de bonne foi** pour la garde d'appariement.
+    ///
+    /// La garde ci-dessus pourrait être verte parce qu'elle ne regarde rien —
+    /// `0 == 0` est le mode de défaillance qu'elle existe pour rendre visible,
+    /// et son assertion de cardinalité ne couvre que la moitié publication. On
+    /// montre donc que le prédicat **rougit** sur un site de publication non
+    /// ensemencé, et qu'il reste muet sur les formes qui nomment l'une ou
+    /// l'autre aiguille sans la constituer.
+    #[test]
+    fn mika1959_la_garde_dappariement_rougit_sur_un_site_non_ensemence() {
+        let prod = std::path::Path::new("src/ailleurs.rs");
+
+        // Un troisième site de publication, sans ensemencement : le défaut.
+        let non_ensemence = "fn troisieme_site(mcp: &McpManager, defs: &mut Vec<ToolDefinition>) {\n    \
+             defs.extend_from_slice(mcp.tool_definitions());\n}\n";
+        let (pubs, seeds) = sites_publication_et_ensemencement_mcp(prod, non_ensemence);
+        assert_eq!(
+            pubs.len(),
+            1,
+            "le prédicat doit voir le site de publication"
+        );
+        assert!(
+            seeds.is_empty(),
+            "et ne doit voir aucun ensemencement — c'est l'écart que la garde signale"
+        );
+
+        // Le même site, ensemencé : l'appariement est rétabli.
+        let ensemence = "fn troisieme_site(mcp: &McpManager, defs: &mut Vec<ToolDefinition>, g: &mut HashMap<String, DataGrade>) {\n    \
+             defs.extend_from_slice(mcp.tool_definitions());\n    \
+             seed_mcp_data_grades(g, Some(mcp));\n}\n";
+        let (pubs, seeds) = sites_publication_et_ensemencement_mcp(prod, ensemence);
+        assert_eq!(pubs.len(), seeds.len(), "l'appariement doit être rétabli");
+        assert_eq!(pubs.len(), 1);
+
+        // 1. Lire l'inventaire sans le publier n'est pas une publication —
+        //    la collecte de noms et la projection KG vivent de cette forme.
+        let lecture_nue = "let noms = mcp.tool_definitions().iter().map(|d| d.name.clone());\n\
+             for def in mcp.tool_definitions() { projette(def); }\n";
+        let (pubs, _) = sites_publication_et_ensemencement_mcp(prod, lecture_nue);
+        assert!(
+            pubs.is_empty(),
+            "lire `tool_definitions()` n'est pas le publier au modèle"
+        );
+
+        // 2. Déclarer la fonction d'ensemencement n'est pas l'appeler.
+        let definition = "fn seed_mcp_data_grades(g: &mut HashMap<String, DataGrade>, mcp: Option<&McpManager>) {}\n";
+        let (_, seeds) = sites_publication_et_ensemencement_mcp(prod, definition);
+        assert!(
+            seeds.is_empty(),
+            "la définition n'est pas un appel — la compter rendrait la garde verte à zéro appel"
+        );
+
+        // 3. La prose qui nomme les deux aiguilles ne lit ni n'écrit rien.
+        let prose = "\
+// Appeler `seed_mcp_data_grades(` partout où `extend_from_slice(mcp.tool_definitions())` publie.
+/// `seed_mcp_data_grades(&mut grades, mcp)` apparie la publication et la map L4.
+ * `extend_from_slice(mcp.tool_definitions())` est le site de publication.
+";
+        let (pubs, seeds) = sites_publication_et_ensemencement_mcp(prod, prose);
+        assert!(
+            pubs.is_empty() && seeds.is_empty(),
+            "un commentaire ne publie pas et n'ensemence pas — prédicat non ancré, \
+             classe mika#2050 Signal S"
+        );
+
+        // 4. Une région de test est masquée avant le balayage : c'est ce qui
+        //    rend les fixtures ci-dessus écrivables dans ce fichier même.
+        let dans_les_tests = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    \
+             defs.extend_from_slice(mcp.tool_definitions());\n}\n";
+        let (pubs, _) = sites_publication_et_ensemencement_mcp(prod, dans_les_tests);
+        assert!(
+            pubs.is_empty(),
+            "mika#2398 — les régions de test sont masquées"
+        );
+
+        // 5. Un fichier dont le chemin est du test n'a pas de moitié production.
+        let chemin_test = std::path::Path::new("src/db/tests/harnais.rs");
+        let (pubs, _) = sites_publication_et_ensemencement_mcp(chemin_test, non_ensemence);
+        assert!(
+            pubs.is_empty(),
+            "mika#2321 — un fichier sous `tests/` est du test quel qu'en soit le contenu"
         );
     }
 
