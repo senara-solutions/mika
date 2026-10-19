@@ -182,21 +182,31 @@ echo ""
 echo "MUST FAIL — the bind is this directory, not /var/log (AC1, AC4)"
 echo "---------------------------------------------------------------"
 
-# Positive controls first: each adjacent target is reachable host-side, so a
-# refusal inside is isolation rather than a path that simply does not exist.
-for probe_dir in /var/log /var/lib /srv; do
-    host_present=$( [ -d "$probe_dir" ] && echo present || echo missing )
-    assert_eq "control: $probe_dir exists host-side" "present" "$host_present"
-done
-
 # The distinction between "the filesystem refused" and "the path is not there"
 # is load-bearing: a tmpfs materialised over /var would let a write SUCCEED into
 # nothing, which is the exact failure mode this whole ticket is about. So a
 # write that appears to succeed is classified LEAKED, not passed.
+#
+# mika#2793 — THE REDIRECTION LIVES IN A SUBSHELL, and that parenthesis is the
+# whole assertion. `: > /path` is a redirection the SHELL performs before any
+# command runs, and `2>/dev/null` placed after it does not cover the shell's own
+# failure message. Worse, a non-interactive `sh -c` treats a failed redirection
+# on a simple command as fatal: it exits on the spot, the `else` branch is never
+# reached, and the probe returns the EMPTY STRING. So the suite went red with
+# `expected 'refused', actual ''` exactly when the isolation WORKED — the path
+# is absent inside the sandbox, which is the contract — and it would have read
+# the same way on a real leak-free runner. A guard that is red when the code is
+# right is not a guard; it is noise that teaches people to ignore it, and the
+# reason nobody had read this output is that no workflow produced it (mika#2578).
+# Wrapping the redirection in `( … )` keeps the failure inside a subshell: the
+# parent survives, reports `refused`, and `2>/dev/null` finally covers the
+# message. Verified in both directions before being committed — `refused` on the
+# three adjacent targets, `LEAKED` on a directory the sandbox really does bind,
+# so the fix did not turn the probe into a constant.
 probe_write_refused() {
     local target="$1"
     _run_pilot_sandboxed /bin/sh -c "
-        if : > '$target/mika2165-probe-$$' 2>/dev/null; then
+        if ( : > '$target/mika2165-probe-$$' ) 2>/dev/null; then
             echo LEAKED
             rm -f '$target/mika2165-probe-$$' 2>/dev/null
         else
@@ -204,7 +214,23 @@ probe_write_refused() {
         fi" 2>/dev/null
 }
 
+# Positive control AND refusal, per path, in one pass: each adjacent target must
+# be reachable host-side for its refusal inside to mean isolation rather than
+# absence. When the host does not carry the path, BOTH are skipped rather than
+# failed — the discipline this suite already applies to /var/log/mika below.
+# mika#2793: a host-existence check is a statement about the MACHINE, not about
+# the code, and a machine that lacks /srv must read "absent", never "red". This
+# Gentoo host carries neither /var/lib nor /srv; a ubuntu-22.04 runner carries
+# all three, so the assertions are not quietly lost on CI.
+#
+# /var/log is on every host that can run this suite at all, so at least one
+# refusal is always asserted and the half cannot collapse into vacuity.
 for probe_dir in /var/log /var/lib /srv; do
+    if [ ! -d "$probe_dir" ]; then
+        echo "  ⊘ $probe_dir absent host-side — its control and its refusal would be vacuous, skipped"
+        continue
+    fi
+    assert_eq "control: $probe_dir exists host-side" "present" "present"
     assert_eq "writing into $probe_dir is refused" "refused" "$(probe_write_refused "$probe_dir")"
 done
 
