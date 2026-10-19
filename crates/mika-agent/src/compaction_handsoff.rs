@@ -50,8 +50,43 @@
 //! 50 — 7 messages de marge. Le prédicat n'est pas déplacé en fin de tour,
 //! parce qu'un avertissement posté après le tour arriverait après la
 //! condensation qu'il annonce.
+//!
+//! # Vol 2 (mika#2805) — la relecture, et pourquoi elle n'est pas indexée sur la session
+//!
+//! Le vol 1 s'arrête au témoignage. Le vol 2 ferme le cycle : la déposition
+//! écrite avant la condensation est **servie au successeur** après elle, une
+//! fois, et le successeur est libre de la contredire.
+//!
+//! Le déclencheur est *la condensation passée*, pas le premier tour de session
+//! (D2 du plan de vol 2) :
+//!
+//! - **la cérémonie et le rituel sont mutuellement exclusifs par
+//!   construction**, et c'est ce qui empêche l'auteur de se relire lui-même. La
+//!   cérémonie rend de 43 à 50 messages ; la compaction tire au-dessus de 50 et
+//!   ramène le compte à `CONTEXT_WINDOW` = 20. Entre l'écriture et la
+//!   condensation, le rituel est donc *structurellement* éteint — aucun second
+//!   mécanisme n'est nécessaire pour exclure l'auteur ;
+//! - **un agent singleton n'a jamais de second « premier tour de session »**
+//!   (`[session].singleton`, mika#1401) : la session canonique accumule tout
+//!   l'historique et son `ended_at` reste `NULL`. Un déclencheur indexé sur la
+//!   session ne tirerait jamais pour la population qui accumule le plus ;
+//! - **servir la déposition pendant que son sujet est encore dans la fenêtre,
+//!   c'est servir une copie redondante.**
+//!
+//! Aucun point d'injection « premier boot » n'est donc écrit : un bloc servi
+//! exactement une fois est servi au **premier tour éligible**, et le premier
+//! tour éligible *est* le premier boot. Coût nommé : une session qui s'arrête
+//! entre 43 et 51 messages sans jamais compacter ne sert jamais sa déposition —
+//! rien n'est perdu, son sujet est intact.
+//!
+//! La marque de relecture est [`crate::read_receipt`], posée par [`resolve`] et
+//! par lui seul : « résoudre » et « consommer » sont une seule opération, et lui
+//! donner deux implémentations serait lui donner deux réponses. Réarmement
+//! opérateur : `rm {agent_home}/handsoffs/.<nom>.read`.
 
-use tracing::warn;
+use std::path::Path;
+
+use tracing::{info, warn};
 
 use crate::compaction::COMPACTION_THRESHOLD;
 
@@ -113,6 +148,182 @@ pub(crate) fn resolve_threshold_pct(raw: Option<&str>) -> u32 {
 /// `42 × 100 = 4200` ne l'est pas.
 pub fn ceremony_due(message_count: usize, pct: u32) -> bool {
     message_count * 100 >= pct as usize * COMPACTION_THRESHOLD
+}
+
+/// Le répertoire des dépositions de compaction, relatif à l'agent home.
+///
+/// **Au pluriel, et l'écart d'une lettre est un invariant** (D5 du vol 2). La
+/// compétence bundled `dev-handsoff` écrit `handsoff/<TODAY>[-<slug>].md` — au
+/// **singulier** : deux familles d'artefacts, deux répertoires. Un futur éditeur
+/// corrigera la « coquille » ; c'est pourquoi le filtre porte aussi sur le
+/// suffixe (voir [`SUFFIX`]), et non sur le répertoire seul.
+pub const DIR: &str = "handsoffs";
+
+/// Le suffixe qui fait d'un fichier une déposition de compaction.
+///
+/// Le nom complet est `handsoffs/<YYYY-MM-DD-HHMM>-compaction-handsoff.md`,
+/// établi par le bloc de cérémonie du vol 1.
+///
+/// Conséquence gratuite de ce filtre : un fichier de réponse
+/// (`…-compaction-handsoff-response.md`) ne finit pas par ce suffixe, donc n'est
+/// pas une déposition, donc **aucune exclusion explicite n'est nécessaire** —
+/// là où mika#2807 avait besoin d'un `RESPONSE_INFIX` parce que ses lettres et
+/// ses réponses partagent leur suffixe. Ici la forme du nom paie le refus.
+pub const SUFFIX: &str = "-compaction-handsoff.md";
+
+/// Une déposition non relue, et le dossier où le successeur peut répondre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHandsoff {
+    /// `handsoffs/<YYYY-MM-DD-HHMM>-compaction-handsoff.md`, relatif à l'agent
+    /// home.
+    pub path: String,
+    /// `handsoffs/<même stem>-response.md` — le dépôt au dossier, si l'instance
+    /// choisit d'en faire un (D6 : **rien ne le réclame**).
+    ///
+    /// Dérivé du nom de la déposition, jamais de l'horloge du tour, qui
+    /// donnerait un nom sans lien avec son objet.
+    pub response_path: String,
+}
+
+/// Ce que le plafond de contexte porte à ce tour, et qui est un **ou exclusif**
+/// (D3 du vol 2).
+///
+/// Les deux bras sont mutuellement exclusifs *par construction* et non par
+/// arbitrage : le bras `Handsoff` ne se calcule que lorsque `imminent` vaut
+/// `None`, c'est-à-dire lorsque la condensation est passée (voir [`resolve`] et
+/// la section « Vol 2 » du doc-module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ceremony {
+    /// La fenêtre approche sa condensation — témoigne (vol 1, mika#1748).
+    Imminent { message_count: usize },
+    /// La condensation est passée et une déposition non relue attend —
+    /// éprouve-la.
+    Handsoff(PendingHandsoff),
+}
+
+/// Le chemin de réponse d'une déposition, dérivé de son propre nom.
+///
+/// Opère sur [`str::strip_suffix`], jamais sur des octets :
+/// `scripts/check-byte-slices.sh` refuse le découpage d'octets sur `&str`, et un
+/// chemin de déposition est composé depuis un nom de fichier sur disque.
+pub fn response_path(handsoff_rel: &str) -> String {
+    match handsoff_rel.strip_suffix(".md") {
+        Some(stem) => format!("{stem}-response.md"),
+        None => format!("{handsoff_rel}-response.md"),
+    }
+}
+
+/// Ce nom est-il celui d'une déposition de compaction ?
+///
+/// L'inégalité stricte sur la longueur écarte un fichier nommé *exactement*
+/// comme le suffixe : il n'aurait pas d'instant, donc pas de place dans le tri.
+fn is_handsoff(name: &str) -> bool {
+    name.len() > SUFFIX.len() && name.ends_with(SUFFIX)
+}
+
+/// Les noms de dépositions présents, du plus récent au plus ancien.
+///
+/// Un `YYYY-MM-DD-HHMM` à largeur fixe trie chronologiquement : l'ordre
+/// lexicographique décroissant **est** l'ordre chronologique inverse, donc
+/// aucune `mtime` n'est lue et aucune date n'est parsée (D7). mika#2807 devait
+/// lire la `mtime` de son signal parce que son nom ne porte pas d'instant ; ici
+/// le nom le porte.
+///
+/// Rend l'erreur plutôt que de la traiter : l'appelant distingue l'absence
+/// nominale du répertoire (le cas de presque tous les agents de la flotte) d'un
+/// répertoire réellement illisible, qui se dit.
+async fn scan(agent_home: &Path) -> std::io::Result<Vec<String>> {
+    let mut entries = tokio::fs::read_dir(agent_home.join(DIR)).await?;
+    let mut names: Vec<String> = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_handsoff(&name) {
+            names.push(name);
+        }
+    }
+    names.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(names)
+}
+
+/// La déposition la plus récente que cet agent n'a pas encore relue.
+///
+/// `None` est le régime nominal. **Ne rend jamais d'erreur** — un `handsoffs/`
+/// illisible rend `None` sous WARN `compaction_handsoff_scan_failed` : le rituel
+/// est sauté, jamais le tour, même régime que le `compaction_handsoff_count_failed`
+/// du vol 1.
+///
+/// Ne pose **aucun** reçu : la consommation appartient à [`resolve`].
+///
+/// Dégradation nommée : N dépositions non relues donnent N tours éligibles, la
+/// plus récente d'abord, une par tour. Borné, visible, et sa seule cause
+/// réaliste est un reçu retiré à la main — c'est-à-dire le geste de réarmement
+/// du doc-module, qui demande précisément ça.
+pub async fn unread(agent_home: &Path, agent: &str) -> Option<PendingHandsoff> {
+    let names = match scan(agent_home).await {
+        Ok(names) => names,
+        Err(e) => {
+            // `NotFound` est le cas de presque tous les agents de la flotte :
+            // un `ENOENT` par tour n'est pas un incident et ne se dit pas.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    target: "mika::otel",
+                    event = "compaction_handsoff_scan_failed",
+                    agent = %agent,
+                    error = %e,
+                    "répertoire de dépositions illisible — le rituel est sauté, pas le tour"
+                );
+            }
+            return None;
+        }
+    };
+
+    for name in names {
+        let path = format!("{DIR}/{name}");
+        if crate::read_receipt::is_read(agent_home, &path).await {
+            continue;
+        }
+        return Some(PendingHandsoff {
+            response_path: response_path(&path),
+            path,
+        });
+    }
+
+    None
+}
+
+/// Que porte le plafond de contexte à ce tour — et consomme-le s'il y a lieu.
+///
+/// Site **unique** d'appel, depuis le corps conversationnel (D8). Deux sites qui
+/// posent le reçu seraient deux endroits où l'usage unique peut être mangé.
+///
+/// - `imminent = Some(n)` ⇒ [`Ceremony::Imminent`], et **aucun reçu n'est
+///   touché** : le tour qui témoigne ne se relit pas lui-même ;
+/// - sinon, la déposition non relue la plus récente est servie, son reçu est
+///   posé, la sonde est émise ;
+/// - sinon `None`, et le régime nominal est **muet** — discipline de contrôle
+///   négatif du vol 1. L'absence de `compaction_handsoff_served` après un
+///   `make deploy` signifie un binaire plus ancien (classe mika#2340), jamais un
+///   prédicat muet.
+///
+/// `agent` ne sert qu'aux sondes : sans lui, un WARN de flotte ne dit pas de
+/// quel agent il parle, et le `agent_home` d'un `TempDir` de test ne le dirait
+/// pas davantage.
+pub async fn resolve(imminent: Option<usize>, agent_home: &Path, agent: &str) -> Option<Ceremony> {
+    if let Some(message_count) = imminent {
+        return Some(Ceremony::Imminent { message_count });
+    }
+
+    let handsoff = unread(agent_home, agent).await?;
+    crate::read_receipt::mark_read(agent_home, &handsoff.path).await;
+    info!(
+        target: "mika::otel",
+        event = "compaction_handsoff_served",
+        agent = %agent,
+        handsoff = %handsoff.path,
+        response = %handsoff.response_path,
+        "déposition de compaction servie au successeur — reçu posé"
+    );
+    Some(Ceremony::Handsoff(handsoff))
 }
 
 #[cfg(test)]
@@ -275,6 +486,213 @@ mod tests {
         assert!(
             !output.contains("compaction_handsoff_threshold_invalid"),
             "aucun avertissement sur un réglage valide : {output}"
+        );
+    }
+
+    // ----- Vol 2 (mika#2805) : la relecture -----
+
+    /// Pose une déposition dans `handsoffs/` et rend son chemin relatif.
+    async fn poser(home: &Path, name: &str) -> String {
+        let dir = home.join(DIR);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(name), "déposition\n")
+            .await
+            .unwrap();
+        format!("{DIR}/{name}")
+    }
+
+    /// Combien d'entrées dans `handsoffs/` — un reçu posé en est une.
+    async fn entrees(home: &Path) -> usize {
+        let mut entries = tokio::fs::read_dir(home.join(DIR)).await.unwrap();
+        let mut n = 0;
+        while entries.next_entry().await.unwrap().is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    /// V1 — le chemin de réponse est dérivé du nom de la déposition, jamais de
+    /// l'horloge du tour.
+    #[test]
+    fn mika2805_v1_le_chemin_de_reponse_derive_du_nom() {
+        assert_eq!(
+            response_path("handsoffs/2026-10-19-1240-compaction-handsoff.md"),
+            "handsoffs/2026-10-19-1240-compaction-handsoff-response.md"
+        );
+        assert_eq!(
+            response_path("handsoffs/sans-extension"),
+            "handsoffs/sans-extension-response.md",
+            "sans `.md`, le suffixe s'ajoute — la dérivation ne s'abandonne pas"
+        );
+    }
+
+    /// V2 — le filtre de suffixe, épinglé dans les **deux** sens (D5).
+    #[test]
+    fn mika2805_v2_le_filtre_de_suffixe_epingle_les_deux_sens() {
+        assert!(is_handsoff("2026-10-19-1240-compaction-handsoff.md"));
+
+        // L'artefact de fin de run de `dev-handsoff` — répertoire `handsoff/`,
+        // au singulier, nom sans suffixe. Fusionner les deux répertoires ne le
+        // ferait toujours pas servir comme déposition de compaction.
+        assert!(!is_handsoff("2026-10-19.md"));
+        assert!(!is_handsoff("2026-10-19-mon-slug.md"));
+
+        // Une réponse n'est pas une déposition, et c'est gratuit.
+        assert!(!is_handsoff(
+            "2026-10-19-1240-compaction-handsoff-response.md"
+        ));
+
+        // Le suffixe nu ne porte pas d'instant, donc pas de place dans le tri.
+        assert!(!is_handsoff(SUFFIX));
+    }
+
+    /// V3 — la plus récente non relue, du plus récent au plus ancien, sans
+    /// jamais lire une `mtime`.
+    #[tokio::test]
+    async fn mika2805_v3_la_plus_recente_non_relue_est_servie() {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = home.path();
+        let vieille = poser(h, "2026-10-17-0900-compaction-handsoff.md").await;
+        let moyenne = poser(h, "2026-10-18-1500-compaction-handsoff.md").await;
+        let recente = poser(h, "2026-10-19-1240-compaction-handsoff.md").await;
+
+        assert_eq!(unread(h, "mika-dev").await.unwrap().path, recente);
+
+        crate::read_receipt::mark_read(h, &recente).await;
+        assert_eq!(
+            unread(h, "mika-dev").await.unwrap().path,
+            moyenne,
+            "la plus récente est relue — la suivante prend son tour"
+        );
+
+        crate::read_receipt::mark_read(h, &moyenne).await;
+        crate::read_receipt::mark_read(h, &vieille).await;
+        assert!(
+            unread(h, "mika-dev").await.is_none(),
+            "toutes relues ⇒ plus rien à servir"
+        );
+    }
+
+    /// V3 — `resolve` consomme, et le bras `Imminent` ne touche aucun reçu.
+    ///
+    /// C'est le gate D2 au niveau unitaire : le tour qui témoigne ne peut pas se
+    /// faire servir sa propre déposition.
+    #[tokio::test]
+    async fn mika2805_v3_resolve_consomme_et_imminent_ne_consomme_rien() {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = home.path();
+        let depot = poser(h, "2026-10-19-1240-compaction-handsoff.md").await;
+
+        assert_eq!(
+            resolve(Some(43), h, "mika-dev").await,
+            Some(Ceremony::Imminent { message_count: 43 })
+        );
+        assert!(
+            !crate::read_receipt::is_read(h, &depot).await,
+            "l'auteur ne se relit pas lui-même : aucun reçu sur le bras Imminent"
+        );
+
+        let Some(Ceremony::Handsoff(servie)) = resolve(None, h, "mika-dev").await else {
+            panic!("la condensation passée, la déposition non relue est servie");
+        };
+        assert_eq!(servie.path, depot);
+        assert_eq!(
+            servie.response_path,
+            "handsoffs/2026-10-19-1240-compaction-handsoff-response.md"
+        );
+        assert!(
+            crate::read_receipt::is_read(h, &depot).await,
+            "servie ⇒ reçu posé, dans la même opération"
+        );
+
+        // AC2 — un handsoff déjà servi ne se re-sert pas au tour suivant.
+        assert_eq!(resolve(None, h, "mika-dev").await, None);
+    }
+
+    /// V4 — **contrôle négatif** : rien à servir ⇒ `None` et **zéro reçu posé**.
+    #[tokio::test]
+    async fn mika2805_v4_controle_negatif_aucun_recu_sans_deposition() {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = home.path();
+
+        // `handsoffs/` absent — le cas de presque tous les agents de la flotte.
+        assert!(resolve(None, h, "mika-dev").await.is_none());
+        assert!(
+            !h.join(DIR).exists(),
+            "aucun reçu posé, donc aucun répertoire créé par le rituel"
+        );
+
+        // Présent, et peuplé de ce que le filtre refuse.
+        poser(h, "2026-10-19.md").await;
+        poser(h, "2026-10-19-1240-compaction-handsoff-response.md").await;
+        assert!(resolve(None, h, "mika-dev").await.is_none());
+        assert_eq!(
+            entrees(h).await,
+            2,
+            "ni reçu ni déposition inventée sur un répertoire sans déposition"
+        );
+    }
+
+    /// V4 — un `handsoffs/` illisible **se dit**, et nomme l'agent.
+    ///
+    /// La panne est fabriquée en posant un **fichier** à la place du
+    /// répertoire : `read_dir` rend alors `ENOTDIR`, jamais `NotFound`. Un
+    /// `chmod 000` serait sans effet sous un uid 0, que la sandbox de dispatch
+    /// peut porter ; celui-ci tient pour tout utilisateur.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2805_v4_un_repertoire_illisible_se_dit() {
+        let (subscriber, buf) = capturing_subscriber();
+        let home = tempfile::TempDir::new().unwrap();
+        tokio::fs::write(home.path().join(DIR), "pas un répertoire")
+            .await
+            .unwrap();
+
+        {
+            let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            assert!(
+                resolve(None, home.path(), "mika-dev").await.is_none(),
+                "le rituel est sauté, jamais le tour"
+            );
+        }
+
+        let binding = buf.lock().unwrap();
+        let output = String::from_utf8_lossy(&binding);
+        assert!(
+            output.contains("compaction_handsoff_scan_failed"),
+            "le WARN doit porter son nom d'événement : {output}"
+        );
+        assert!(
+            output.contains("mika-dev"),
+            "le WARN doit nommer l'agent, sans quoi un log de flotte ne dit pas \
+             de qui il parle : {output}"
+        );
+    }
+
+    /// Le régime nominal est **muet** — contrôle négatif des deux sondes du
+    /// vol 2, sans lequel les assertions ci-dessus passeraient sur un log
+    /// inconditionnel.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2805_v4_le_regime_nominal_du_rituel_est_muet() {
+        let (subscriber, buf) = capturing_subscriber();
+        let home = tempfile::TempDir::new().unwrap();
+
+        {
+            let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            assert!(resolve(None, home.path(), "mika-dev").await.is_none());
+            assert!(resolve(Some(43), home.path(), "mika-dev").await.is_some());
+        }
+
+        let binding = buf.lock().unwrap();
+        let output = String::from_utf8_lossy(&binding);
+        assert!(
+            !output.contains("compaction_handsoff_scan_failed"),
+            "l'absence nominale de `handsoffs/` n'est pas un incident : {output}"
+        );
+        assert!(
+            !output.contains("compaction_handsoff_served"),
+            "rien n'a été servi, donc rien ne le dit : {output}"
         );
     }
 }
