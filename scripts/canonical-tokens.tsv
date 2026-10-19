@@ -166,6 +166,31 @@ GROOMED	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
 ITERATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
 READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
 
+# mika#2194 vol 3 — le lecteur Rust du tier 2, DÉCLARÉ AVANT D'AVOIR UN
+# APPELANT. C'est volontaire et c'est la moitié « tests dorés » de la méthode
+# strangler du ticket : `arch_paraphrase::paraphrase` porte les deux tables de
+# paraphrase transcrites littéralement de `_parse_disposition_fuzzy` et
+# `_parse_verdict_fuzzy`, et les deux lecteurs sont exercés sur UN corpus doré
+# commun (`crates/mika-agent/tests/fixtures/arch_paraphrase_texts/`). Rien ne
+# bascule : le bash reste le lecteur de production, et ces lignes disent que le
+# jeton a désormais DEUX sites de match dans l'arbre, pas que le second sert.
+#
+# Classe A pour la même raison que les huit lignes ci-dessus, et avec les mêmes
+# octets : le match est en sous-chaîne, insensible à la casse, sur une liste de
+# tournures. B1 interdit de resserrer une tolérance pendant la migration, donc
+# le portage porte la tolérance telle quelle — c'est précisément ce que le
+# corpus épingle, classe `substring-fp` en tête.
+#
+# Une seule fonction pour les deux passes, là où le bash en a deux : la passe
+# est un paramètre (`ArchPass`), pas un site. Le site est donc nommé une fois
+# par jeton. `GROOMED` ne vit que dans la table de la seconde passe et `ITERATE`
+# que dans celle de la première — la même asymétrie que le bash, qui est ici
+# dans les données et non dans le code.
+ESCALATE	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+GROOMED	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+ITERATE	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+READY	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+
 # ═══ Class B — STRICT readers. The lint's perimeter.
 #
 # Produced by `canonical-tokens-survey.sh --tsv`, compared both ways. Re-run the

@@ -1,0 +1,78 @@
+# Corpus doré du tier 2 de paraphrase (mika#2194, vol 3).
+#
+# UN corpus, DEUX lecteurs, UN fichier d'attendus. Les deux lecteurs sont :
+#   - bash : skills/bundled/_shared/test-dispatch-lib.sh, bloc « mika#2194 —
+#     parité du tier 2 de paraphrase », qui appelle _parse_disposition_fuzzy /
+#     _parse_verdict_fuzzy, les lecteurs de PRODUCTION ;
+#   - Rust : crates/mika-agent/tests/arch_paraphrase_parity.rs, qui appelle
+#     crates/mika-agent/src/arch_paraphrase.rs::paraphrase, qui n'a AUCUN
+#     appelant de production.
+# Les deux lisent CE fichier. Un attendu modifié d'un seul côté redevient rouge
+# de l'autre : c'est tout le dispositif.
+#
+# Cinq colonnes séparées par des TABULATIONS :
+#
+#   1. fichier   le corps, relatif à ce répertoire
+#   2. pass      « first » (_parse_disposition_fuzzy) ou « second » (_parse_verdict_fuzzy)
+#   3. token     READY | ITERATE | ESCALATE | GROOMED, ou « - » si aucun match
+#   4. fragment  le texte matché TEL QU'IL EST ÉCRIT dans le corps (casse comprise
+#                — grep -o rend l'entrée, pas le motif), ou « - » si aucun match
+#   5. classe    nominal | substring-fp | french-inert | multiline
+#
+# UNE COLONNE VIDE PORTE « - », JAMAIS RIEN. `IFS=$'\t' read` fusionne deux
+# tabulations consécutives : une colonne vide y disparaît et toutes les suivantes
+# se décalent d'un cran, en silence — alors que le `split('\t')` du Rust ne le
+# fait pas. Les deux lecteurs liraient alors des choses différentes du même octet.
+#
+# Un même fichier peut porter DEUX lignes, une par passe : les deux tables sont
+# distinctes et un corps peut être inerte pour l'une et parlant pour l'autre.
+#
+# Les quatre classes, et ce que chacune mesure (§ 3 du plan) :
+#
+#   nominal        la paraphrase que le tier 2 existe pour attraper. Inclut deux
+#                  corps de PRIORITÉ, qui matchent plusieurs classes à la fois et
+#                  épinglent ESCALATE > ITERATE > READY et ESCALATE > GROOMED.
+#   substring-fp   le match est en SOUS-CHAÎNE : « fundamentally sound » est lu
+#                  ESCALATE, « the dispatcher » est lu READY. Ce n'est pas un bug
+#                  à corriger ici — B1 interdit de resserrer une tolérance pendant
+#                  la migration. Le fragment de ces lignes est volontairement
+#                  AU MILIEU d'un mot : le lecteur Rust ÉCHOUE si l'un d'eux se
+#                  met à matcher sur une frontière de mot, parce que cela voudrait
+#                  dire que quelqu'un a resserré le lecteur sans toucher au bash.
+#   french-inert   le tier 2 est quasi inerte sur le français : les deux tables
+#                  sont entièrement en anglais et les réponses de mika-arch sont
+#                  en français. C'est le cas MODAL en production. Le lecteur Rust
+#                  ÉCHOUE si l'une de ces lignes se met à rendre un token.
+#   multiline      grep est orienté ligne : « human\nreview » ne matche PAS le motif
+#                  « human review ». Un `contains` sur le texte entier ne matcherait
+#                  pas davantage (aucun motif ne porte de `\n`) : ce que ces lignes
+#                  épinglent est l'ABSENCE DE NORMALISATION DES BLANCS avant le match.
+#                  Un `replace('\n', " ")` glissé par un portage serviable les ferait
+#                  matcher là où le bash les laisse passer. Le lecteur Rust ÉCHOUE si
+#                  l'une de ces lignes se met à matcher.
+#
+# Les trois « ÉCHOUE si » ci-dessus sont des assertions AUTO-NETTOYANTES : le jour
+# où l'exception cesse, le test devient rouge et force la mise à jour du corpus
+# plutôt que de laisser une classe vide passer pour une classe satisfaite.
+
+nominal-first-ready.md	first	READY	Ship it	nominal
+nominal-first-iterate.md	first	ITERATE	revise	nominal
+nominal-first-escalate.md	first	ESCALATE	human review	nominal
+nominal-first-priority.md	first	ESCALATE	human review	nominal
+
+nominal-second-groomed.md	second	GROOMED	No remaining concerns	nominal
+nominal-second-escalate.md	second	ESCALATE	cannot approve	nominal
+nominal-second-priority.md	second	ESCALATE	cannot approve	nominal
+
+substring-fp-fundamental.md	first	ESCALATE	fundamental	substring-fp
+substring-fp-dispatch.md	first	READY	dispatch	substring-fp
+substring-fp-revise.md	first	ITERATE	revise	substring-fp
+substring-fp-proceed.md	first	READY	proceed	substring-fp
+substring-fp-second-groomed.md	second	GROOMED	groomed	substring-fp
+
+french-inert-2641.md	first	-	-	french-inert
+french-inert-2641.md	second	-	-	french-inert
+french-inert-seconde-passe.md	second	-	-	french-inert
+
+multiline-first-human-review.md	first	-	-	multiline
+multiline-second-cannot-approve.md	second	-	-	multiline
