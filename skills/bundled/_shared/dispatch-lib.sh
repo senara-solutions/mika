@@ -1191,10 +1191,16 @@ _PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\"
 # coûteux qu'un dépôt puisse porter : le refus d'egress de mika#2724 et la
 # sentinelle de mika#2723 existent, leur CI est verte, et ils ne tournent pas.
 #
-# Ce vol pose le mécanisme et câble UN lanceur, celui du `mitmdump` (le démon
-# dont la péremption RETIRE un contrôle de confinement, et le seul des deux sans
-# geste opérateur : le relais a `--restart-relay` depuis mika#2049). Le câblage
-# du relais est le vol 3 — sa posture y est fail-closed, donc d'autres sondes.
+# Le vol 2 a posé le mécanisme et câblé UN lanceur, celui du `mitmdump`. Le vol 3
+# (mika#2780) câble le second, le relais d'egress — mesuré une fois de plus le
+# 2026-10-18, où un `scripts/mika-pilot-egress-proxy` corrigé par mika#2778 était
+# installé mais pas servi, et où il a fallu un `TERM` manuel par pid.
+#
+# LA CLÉ DU VERDICTEUR EST DONC UN ENDPOINT TYPÉ, `tcp:<port>` | `unix:<chemin>`,
+# et non plus un port : le relais écoute sur un socket unix. D1 — un seul
+# verdicteur plutôt qu'une fonction sœur, parce que deux verdicteurs
+# dupliqueraient les trois lignes de log nommées que `T2029_VERDICT_BLOCK`
+# compte, et les deux copies divergeraient le jour où l'une est touchée.
 _PILOT_DAEMON_FRESH="fresh"
 _PILOT_DAEMON_STALE="stale"
 _PILOT_DAEMON_STALE_DEFERRED="stale_deferred"
@@ -1206,14 +1212,37 @@ _PILOT_DAEMON_STALE_UNSTOPPABLE="stale_unstoppable"
 # longtemps est déjà en train d'être tuée par son propre garde-fou.
 _PILOT_DAEMON_SIBLING_WINDOW_SECONDS=300
 
-# Le pid qui SERT le port, jamais un pid dont la ligne de commande ressemble.
+# Le pid qui SERT l'endpoint, jamais un pid dont la ligne de commande ressemble.
 # Même raison qu'au canary (`--restart-relay`, qui tue par identité de socket) :
 # `pgrep -f mitmdump` apparie aussi l'éditeur de l'opérateur, un grep, et ce
 # script lui-même.
-_pilot_daemon_holder_pid() {   # $1 = port TCP ; écrit le premier pid, ou rien
+#
+# S1 (mesure du groom de mika#2780, trois exécutions concordantes) — `fuser
+# <chemin-de-socket-unix>` rend le pid du porteur dans la MÊME forme que
+# `fuser -n tcp <port>` : pids sur stdout, libellé sur stderr, espaces de tête.
+# La boucle de découpage ci-dessous n'a donc rien à apprendre du cas unix.
+#
+# S2 — `fuser` n'apparie QUE le porteur, jamais un client connecté : le client
+# détient un socket anonyme d'un autre inode, pas celui qui est lié au chemin.
+# C'est la mesure qui rend la forme sûre, parce qu'un client apparié ferait
+# comparer le mtime du mauvais `/proc/<pid>` et ferait viser un PILOTE par le
+# `TERM` de l'arrêteur.
+#
+# Le découpage porte sur le PREMIER `:` (`%%:*` / `#*:`), donc un chemin de
+# socket qui en contiendrait un passe quand même.
+_pilot_daemon_holder_pid() {   # $1 = `tcp:<port>` | `unix:<chemin>` ; écrit le premier pid, ou rien
     command -v fuser >/dev/null 2>&1 || return 1
-    local _out _pid
-    _out="$(fuser -n tcp "$1" 2>/dev/null)" || true
+    local _kind="${1%%:*}" _ref="${1#*:}" _out _pid
+    case "$_kind" in
+        tcp)  _out="$(fuser -n tcp "$_ref" 2>/dev/null)" || true ;;
+        unix) _out="$(fuser "$_ref" 2>/dev/null)" || true ;;
+        # D2 — un endpoint mal typé rend « porteur non identifiable », donc
+        # `undecidable` chez le verdicteur : démon conservé, ligne de log. Un
+        # `case` sans branche par défaut rendrait `fresh` EN SILENCE sur une
+        # faute de frappe, c'est-à-dire la panne de ce ticket réintroduite par
+        # son propre correctif.
+        *)    return 1 ;;
+    esac
     # R3 : `fuser` peut rendre plusieurs pids (un mitmdump qui a forké). On
     # découpe et on prend le PREMIER CHAMP — jamais une concaténation, qui
     # nommerait un processus qui n'existe pas. Les champs non numériques sont
@@ -1279,13 +1308,13 @@ _pilot_sibling_pilot_in_flight() {
 # D5 : chaque cause a son jeton, parce que chacune appelle un geste différent
 # (ou aucun). Précédent maison explicite : `binary_missing` vs `unreachable`
 # quelques dizaines de lignes plus haut.
-_pilot_daemon_freshness() {   # $1 = nom lisible, $2 = port, $3.. = fichiers de code
-    local _label="$1" _port="$2"
+_pilot_daemon_freshness() {   # $1 = nom lisible, $2 = endpoint typé, $3.. = fichiers de code
+    local _label="$1" _endpoint="$2"
     shift 2
     local _pid _newer
-    if ! _pid="$(_pilot_daemon_holder_pid "$_port")"; then
+    if ! _pid="$(_pilot_daemon_holder_pid "$_endpoint")"; then
         printf '%s' "$_PILOT_DAEMON_UNDECIDABLE"
-        echo "dispatch-lib: pilot_daemon_freshness.undecidable $_label écoute sur $_port mais son porteur n'est pas identifiable (fuser absent ou port sans porteur) — démon conservé (mika#2029)" >&2
+        echo "dispatch-lib: pilot_daemon_freshness.undecidable $_label écoute sur $_endpoint mais son porteur n'est pas identifiable (fuser absent, endpoint sans porteur lisible, ou endpoint mal typé) — démon conservé (mika#2029)" >&2
         return 0
     fi
     if ! _newer="$(_pilot_daemon_code_is_newer "$_pid" "$@")"; then
@@ -1320,7 +1349,23 @@ except OSError:
 ' "$1" "${2:-0.25}" 2>/dev/null
 }
 
-# L'arrêt, par identité d'endpoint. TERM au porteur du port, puis ATTENTE BORNÉE
+# C2 — l'aiguilleur des deux sondes de connectabilité, sur la même clé typée que
+# la découverte du porteur. Les deux sondes existent déjà et ne sont pas
+# touchées.
+#
+# `_pilot_egress_sock_connectable` est définie PLUS BAS dans ce fichier : en
+# bash une fonction est résolue à l'appel et non à la définition, donc la
+# référence avant définition est légale. Dit ici pour qu'un relecteur ne la lise
+# pas à l'envers, comme un appel à une fonction manquante.
+_pilot_daemon_endpoint_connectable() {   # $1 = endpoint typé, $2 = timeout (défaut 0.25 s)
+    case "${1%%:*}" in
+        tcp)  _pilot_daemon_port_connectable "${1#*:}" "${2:-0.25}" ;;
+        unix) _pilot_egress_sock_connectable "${1#*:}" "${2:-0.25}" ;;
+        *)    return 1 ;;   # D2, même raison qu'à la découverte du porteur
+    esac
+}
+
+# L'arrêt, par identité d'endpoint. TERM au porteur de l'endpoint, puis ATTENTE BORNÉE
 # de la libération : sans cette attente le lanceur rebind trop tôt, échoue sur
 # « address in use », et la relance laisse le trou qu'elle devait fermer.
 #
@@ -1328,22 +1373,35 @@ except OSError:
 # que personne n'a mesuré, et une escalade de signal se déciderait sur une
 # mesure, pas sur un plan.
 #
-# D6 — si le port répond toujours après la fenêtre, on N'INSISTE PAS et l'on rend
-# != 0 : l'appelant conserve l'ancien démon. Un démon périmé qui sert vaut mieux
-# qu'un port orphelin, parce que la posture héritée du lanceur laisserait partir
-# le pilote sans chaîne Anthropic du tout — c'est-à-dire exactement la panne que
-# ce ticket éteint.
-_pilot_daemon_restart_by_port() {   # $1 = port, $2 = nom lisible
-    local _port="$1" _label="$2"
+# D6 — si l'endpoint répond toujours après la fenêtre, on N'INSISTE PAS et l'on
+# rend != 0 : l'appelant conserve l'ancien démon. Un démon périmé qui sert vaut
+# mieux qu'un endpoint orphelin, parce que la posture héritée du lanceur
+# laisserait partir le pilote sans chaîne Anthropic du tout — c'est-à-dire
+# exactement la panne que ce ticket éteint.
+#
+# S4 (mika#2780) — sur un socket unix, l'attente termine bien : le chemin survit
+# au `TERM` mais `connect()` échoue aussitôt en `ECONNREFUSED`, donc la sonde
+# conclut à la mort du porteur au lieu de tourner jusqu'à sa fenêtre pleine.
+# C'est précisément ce qu'un test sur `[ -S ]` ne saurait pas faire (mika#2041).
+_pilot_daemon_restart_by_endpoint() {   # $1 = endpoint typé, $2 = nom lisible
+    local _endpoint="$1" _label="$2"
+    local _kind="${_endpoint%%:*}" _ref="${_endpoint#*:}"
     command -v fuser >/dev/null 2>&1 || return 1
-    fuser -k -n tcp "$_port" 2>/dev/null || true
+    case "$_kind" in
+        tcp)  fuser -k -n tcp "$_ref" 2>/dev/null || true ;;
+        # M7 — la forme que `scripts/canary-pilot-containment --restart-relay`
+        # emploie déjà pour ce socket précis, et pour la même raison qu'elle y
+        # est commentée : tuer par identité de socket, jamais par `pkill -f`.
+        unix) fuser -k "$_ref" 2>/dev/null || true ;;
+        *)    return 1 ;;   # D2
+    esac
     local _deadline=$((SECONDS + 3))
     while [ "$SECONDS" -lt "$_deadline" ]; do
-        _pilot_daemon_port_connectable "$_port" || return 0
+        _pilot_daemon_endpoint_connectable "$_endpoint" || return 0
         sleep 0.1
     done
-    if _pilot_daemon_port_connectable "$_port"; then
-        echo "dispatch-lib: pilot_daemon_freshness.stale_unstoppable $_label tient toujours le port $_port 3s après un TERM — démon périmé conservé plutôt qu'un port orphelin (mika#2029)" >&2
+    if _pilot_daemon_endpoint_connectable "$_endpoint"; then
+        echo "dispatch-lib: pilot_daemon_freshness.stale_unstoppable $_label tient toujours $_endpoint 3s après un TERM — démon périmé conservé plutôt qu'un endpoint orphelin (mika#2029)" >&2
         return 1
     fi
     return 0
@@ -1385,7 +1443,7 @@ except OSError:
         # ou si l'on retombe dans le lanceur déjà écrit. Il ne se pose qu'APRÈS
         # les trois chemins d'erreur ci-dessus, donc il n'est jamais interrogé
         # sur un fichier dont l'absence a déjà été nommée.
-        case "$(_pilot_daemon_freshness mitmdump "$_PILOT_HELPER_PORT" \
+        case "$(_pilot_daemon_freshness mitmdump "tcp:$_PILOT_HELPER_PORT" \
                     "$_PILOT_HELPER_ADDON" "$_PILOT_GH_HELPER_ADDON" "$_PILOT_HELPER_BIN")" in
             "$_PILOT_DAEMON_STALE")
                 # Pas de `return` : on retombe dans le lancement + la sonde de
@@ -1395,7 +1453,7 @@ except OSError:
                 # dans _run_pilot_sandboxed) : le dispatch continue. C'est la
                 # même posture qu'un helper simplement mort — ce vol n'en
                 # invente pas une, et n'ajoute AUCUN chemin de refus.
-                _pilot_daemon_restart_by_port "$_PILOT_HELPER_PORT" mitmdump || return 0
+                _pilot_daemon_restart_by_endpoint "tcp:$_PILOT_HELPER_PORT" mitmdump || return 0
                 ;;
             *) return 0 ;;
         esac
@@ -1519,7 +1577,39 @@ _ensure_pilot_egress_proxy() {
     fi
     # Liveness probe: is anyone actually listening?
     if _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK"; then
-        return 0  # already alive
+        # mika#2780 : la sonde de vivacité reste le juge de « quelqu'un
+        # écoute » ; le verdict de fraîcheur décide seulement SI L'ON RETOURNE
+        # ou si l'on retombe dans le lanceur déjà écrit. Même placement que pour
+        # le `mitmdump` : APRÈS le contrôle `[ ! -x "$_PILOT_EGRESS_PROXY_BIN" ]`
+        # ci-dessus, donc la fraîcheur n'est jamais interrogée sur un binaire
+        # dont l'absence a déjà été nommée.
+        #
+        # D3 — UN SEUL fichier de code. Le relais n'importe que la bibliothèque
+        # standard et ne forke pas (mesuré au groom). Le seul autre fichier
+        # qu'il ouvre, `~/.claude/.credentials.json`, est une DONNÉE : il est
+        # réécrit à chaque rafraîchissement de jeton OAuth, donc le compter
+        # relancerait le relais — et couperait les tunnels CONNECT en vol — à un
+        # rythme sans rapport avec une version de code.
+        case "$(_pilot_daemon_freshness pilot-egress-proxy \
+                    "unix:$_PILOT_EGRESS_SOCK" "$_PILOT_EGRESS_PROXY_BIN")" in
+            "$_PILOT_DAEMON_STALE")
+                # `|| return 0` ET `_PILOT_EGRESS_ABORT` LAISSÉ VIDE : c'est la
+                # différence qui compte avec le `mitmdump`. Ici un `return 1`
+                # serait un REFUS DE DISPATCH (posture fail-closed de mika#2049),
+                # et un démon périmé qui sert ne justifie pas de refuser.
+                #
+                # Pas de `return` sur le chemin nominal : on retombe dans le
+                # lancement + la sonde de bind bornée ci-dessous, inchangés. Un
+                # relais qui ne revient pas produit donc la ligne
+                # `pilot_egress_guard.unreachable` existante et le refus qui
+                # existait déjà pour un relais mort. Ce vol n'invente aucune
+                # posture et n'ajoute AUCUN chemin de refus ; il rend seulement
+                # un chemin existant atteignable par une cause nouvelle.
+                _pilot_daemon_restart_by_endpoint \
+                    "unix:$_PILOT_EGRESS_SOCK" pilot-egress-proxy || return 0
+                ;;
+            *) return 0 ;;   # already alive
+        esac
     fi
     # Launch as detached daemon. Log to /var/log/mika/ if writable, else to
     # /tmp -- never to stderr, whatever the previous comment here claimed.

@@ -14474,6 +14474,188 @@ assert_eq "mika#2029: le verdicteur écrit 3 lignes nommées, aucune pour \`fres
     "3 0" \
     "$(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.' || true) $(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.fresh' || true)"
 
+# --- mika#2780 : la fraîcheur couvre le SECOND porteur, le relais d'egress ----
+
+echo ""
+echo "Test mika#2780: fraîcheur du relais d'egress — le code installé bat la vivacité"
+echo "------------------------------------------------------------"
+
+# `_relay_freshness_probe <état> [lib]` — jumeau de `_daemon_freshness_probe`,
+# pour l'autre porteur : il monte un VRAI porteur de SOCKET UNIX dans un
+# `mktemp -d`, met l'état en place, rappelle `_ensure_pilot_egress_proxy`, et
+# rend ce que la garde en a fait, dans la même ligne de mesure :
+#
+#   rc=<n> token=<fresh|stale|stale_deferred|undecidable|none> launches=<n>
+#   first=<alive|dead> listening=<yes|no>
+#
+# `token=none` est l'état NOMINAL silencieux : `fresh` n'écrit rien (D5).
+#
+# POURQUOI UN JUMEAU ET NON UN HARNAIS BIMODAL. Rendre `_daemon_freshness_probe`
+# bimodal demanderait de paramétrer son faux démon, ses variables de lanceur, la
+# fonction appelée et sa sonde finale — un refactor dont le chemin `mitmdump`
+# est hors périmètre de ce ticket, et dont la casse se lirait comme une
+# régression du vol 2.
+#
+# Le second paramètre est le CROCHET DE CONTRE-VACUITÉ (R4 ci-dessous), de même
+# rôle que celui de V5.
+_relay_freshness_probe() {
+    local state="$1" lib="${2:-$DISPATCH_LIB}"
+    local tmp sock bin err rc token launches first listening p i
+
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/bin" "$tmp/pilotlogs" "$tmp/relaylog"
+    : > "$tmp/launches"
+
+    # Le socket vit dans le `mktemp -d`, JAMAIS `/tmp/mika-pilot-egress.sock` :
+    # c'est le socket de production de l'hôte de l'opérateur, et l'arrêteur tue
+    # par identité de socket. Même règle que le port éphémère côté mitmdump (R4
+    # du vol 2).
+    sock="$tmp/egress.sock"
+    bin="$tmp/bin/mika-pilot-egress-proxy"
+
+    # Un faux relais qui ÉCOUTE VRAIMENT sur AF_UNIX : la garde juge un porteur
+    # de socket, pas un nom de processus. Il inscrit son propre pid — `exec` le
+    # conserve — pour que la sonde compte les lancements et sache si le premier
+    # porteur a bien été tué. Le vrai lanceur passe `--host-unix --socket
+    # <chemin>`, et `env -i` ne lui laisse que la liste blanche (dont `PATH`).
+    #
+    # Il délie le chemin avant `bind()`, comme le vrai relais : un socket unix
+    # survit à la mort de son porteur, et un `bind()` nu y rendrait EADDRINUSE
+    # (mesure S4). Sans cette ligne, R2 échouerait sur le décor et non sur la
+    # règle.
+    cat > "$bin" <<'FAKE_RELAY'
+#!/bin/bash
+_sock=""; _prev=""
+for _a in "$@"; do [ "$_prev" = "--socket" ] && _sock="$_a"; _prev="$_a"; done
+echo "$$" >> "$(dirname "$0")/../launches"
+exec python3 -c '
+import os, socket, sys, time
+p = sys.argv[1]
+try:
+    os.unlink(p)
+except FileNotFoundError:
+    pass
+s = socket.socket(socket.AF_UNIX)
+s.bind(p)
+s.listen(5)
+time.sleep(120)
+' "$_sock"
+FAKE_RELAY
+    chmod +x "$bin"
+
+    # Le code est posé AVANT le lancement : c'est l'état nominal, et le contrôle
+    # négatif R1 en dépend. La seconde pleine met la comparaison de mtime hors de
+    # portée d'un `[ -nt ]` qui ne comparerait que les secondes.
+    sleep 1.1
+
+    err="$tmp/err"
+    (
+        # shellcheck disable=SC1090
+        source "$lib"
+        _PILOT_EGRESS_PROXY_BIN="$bin"
+        _PILOT_EGRESS_SOCK="$sock"
+        MIKA_PILOT_EGRESS_LOG_DIR="$tmp/relaylog"
+        PILOT_LOG_DIR="$tmp/pilotlogs"
+
+        _ensure_pilot_egress_proxy >/dev/null 2>&1 || true   # amorçage
+
+        # `make install` réécrit le binaire sous le démon déjà lancé — c'est
+        # littéralement l'occurrence du 2026-10-18 (mika#2778).
+        case "$state" in
+            stale|deferred) sleep 1.1; touch "$bin" ;;
+        esac
+        [ "$state" = deferred ] && touch "$tmp/pilotlogs/frere.stderr"
+
+        _ensure_pilot_egress_proxy >/dev/null 2>"$err"
+    ) && rc=0 || rc=$?
+
+    token=$(grep -oE -m1 'pilot_daemon_freshness\.[a-z_]+' "$err" 2>/dev/null || true)
+    token="${token#pilot_daemon_freshness.}"
+    [ -n "$token" ] || token=none
+    launches=$(wc -l < "$tmp/launches" | tr -d ' ')
+
+    p=$(head -1 "$tmp/launches" 2>/dev/null || true)
+    first=dead
+    i=0
+    while [ $i -lt 10 ]; do
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then first=alive; else first=dead; break; fi
+        sleep 0.05
+        i=$((i + 1))
+    done
+
+    listening=no
+    if python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(1)
+try:
+    s.connect(sys.argv[1]); s.close()
+except OSError:
+    sys.exit(1)
+' "$sock" 2>/dev/null; then listening=yes; fi
+
+    while read -r p; do kill "$p" 2>/dev/null || true; done < "$tmp/launches"
+    rm -rf "$tmp"
+    printf 'rc=%s token=%s launches=%s first=%s listening=%s' \
+        "$rc" "$token" "$launches" "$first" "$listening"
+}
+
+# SKIP BRUYANT (mika#2149, troisième colonne), pour la même raison que le bloc
+# jumeau : sans `fuser`, la découverte du porteur rend `undecidable` partout et
+# les trois sondes mesureraient le même rien.
+if ! command -v fuser >/dev/null 2>&1; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2780 — 'fuser' introuvable : la garde de fraîcheur identifie"
+    echo "    le porteur du socket par identité de socket et ne peut rien mesurer sans lui."
+    echo "    Remède : installer psmisc (Debian/Ubuntu) ou sys-process/psmisc (Gentoo)."
+else
+    # R1 — CONTRÔLE NÉGATIF, et assertion auto-nettoyante du détecteur
+    # (Fire-Disposition). Sans elle, un prédicat qui déraperait vers « toujours
+    # périmé » serait un redémarreur permanent déguisé en garde : il couperait
+    # les tunnels CONNECT de chaque dispatch, et sur CE porteur-ci une relance
+    # ratée refuse le dispatch (posture fail-closed de mika#2049).
+    assert_eq "R1 contrôle négatif: code posé avant le relais ⇒ fresh, silencieux, aucun TERM" \
+        "rc=0 token=none launches=1 first=alive listening=yes" \
+        "$(_relay_freshness_probe fresh)"
+
+    # R2 — CONTRÔLE POSITIF, le cas du ticket. Binaire réinstallé sous le relais
+    # déjà lancé : jeton `stale`, le porteur d'origine est mort, un nouveau
+    # relais écoute. C'est l'occurrence du 2026-10-18 réparée automatiquement, là
+    # où il avait fallu un `TERM` manuel par pid.
+    assert_eq "R2 contrôle positif: binaire réinstallé ⇒ stale, porteur mort, relais relancé" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_relay_freshness_probe stale)"
+
+    # R3 — DÉFÉRENCE (D4). Même état que R2, plus un `*.stderr` frais dans
+    # PILOT_LOG_DIR. Tuer le relais sous un pilote qui stream couperait ses
+    # tunnels CONNECT en vol — la classe de panne que mika#2029 existe pour
+    # éteindre. Aucun TERM, rc 0, et le prochain dispatch sans frère en vol
+    # relancera (auto-guérissant).
+    assert_eq "R3 déférence: pilote frère en vol ⇒ stale_deferred, aucun TERM" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_relay_freshness_probe deferred)"
+
+    # R4 — CONTRE-VACUITÉ, constatée et consignée dans la PR. Le crochet `lib`
+    # ci-dessus, pointé sur une copie de `main`
+    # (`git show origin/main:skills/bundled/_shared/dispatch-lib.sh`), rend sur
+    # l'état EXACT de R2 :
+    #
+    #     rc=0 token=none launches=1 first=alive listening=yes
+    #
+    # Aucun jeton, aucune relance, le porteur périmé sert encore : le chemin
+    # « already alive » y retourne 0 sans jamais regarder quelle version écoute.
+    # C'est la panne de ce ticket reproduite à la demande, et la preuve que les
+    # trois lignes ci-dessus mesurent le correctif plutôt que le décor. Non
+    # assertée en permanence, pour la même raison que V5 : l'exécuter exigerait
+    # de lire une autre révision depuis la suite, donc un test vert hors réseau
+    # et rouge en archive détachée.
+    #
+    # Le quatrième état du verdicteur, `undecidable`, n'a pas de sonde ici : il
+    # est une propriété du VERDICTEUR PARTAGÉ, déjà tenue par V4, et sa
+    # conséquence côté relais est identique (conservation, `return 0`).
+    :
+fi
+
 # --- Summary ---
 
 echo ""

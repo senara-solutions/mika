@@ -226,6 +226,12 @@ une sonde applicative de bout en bout sur le chemin critique de chaque dispatch,
 dont le coût et le taux de faux positifs ne sont pas mesurés — hors périmètre de
 mika#2049, ticket de suivi.
 
+**Ce qu'il reste à faire à la main, depuis mika#2780.** Le relais *wedgé* est
+désormais le seul cas pour lequel ce geste est dû : un relais wedgé **répond**, et
+son code peut être parfaitement à jour, donc le contrôle de fraîcheur du § 4.5 ne
+le voit pas. En revanche, relancer le relais après un `make install` n'est plus
+un geste : le prochain dispatch sans pilote frère en vol s'en charge.
+
 ### 4.3 Vérifier
 
 ```bash
@@ -273,19 +279,36 @@ correction ; ne pas élargir le mode par réflexe.
 
 ### 4.5 Un démon qui porte du code d'egress ne survit plus à son code (mika#2029)
 
-Mesuré trois fois (2026-08-29, 2026-09-11, 2026-10-16) : un démon lancé une fois
-sert indéfiniment, y compris après que `make install` a posé un code différent à
-côté de lui. Le 16 octobre, un `mitmdump` du 13 servait encore les addons que
-l'installation de 14:37Z avait remplacés — le refus d'egress de mika#2724 et la
-sentinelle de mika#2723 existaient, leur CI était verte, et ils ne tournaient
-pas. Depuis mika#2029, `_ensure_pilot_helper` ne demande plus seulement
-« quelqu'un écoute-t-il ? » : au dispatch suivant, il compare la date des
-fichiers de code (`mitmdump`, les deux addons) au démarrage de leur porteur, et
-le dit sur stderr sous le préfixe `dispatch-lib: pilot_daemon_freshness.`. Le
-geste réparateur est automatique — un `TERM` au porteur du port 8892 par
-identité de socket, jamais par nom de processus, puis la relance du lanceur
-existant. **Ce vol ne câble que le `mitmdump`** ; le relais garde ses gestes
-manuels du § 4.2 (vol 3, suivi dans senara-solutions/mika#2029).
+Mesuré quatre fois (2026-08-29, 2026-09-11, 2026-10-16, 2026-10-18) : un démon
+lancé une fois sert indéfiniment, y compris après que `make install` a posé un
+code différent à côté de lui. Le 16 octobre, un `mitmdump` du 13 servait encore
+les addons que l'installation de 14:37Z avait remplacés — le refus d'egress de
+mika#2724 et la sentinelle de mika#2723 existaient, leur CI était verte, et ils
+ne tournaient pas. Le 18 octobre, c'est le **relais** qui a montré la même
+classe : mika#2778 ne corrigeait que `scripts/mika-pilot-egress-proxy`, le
+binaire installé était bien le nouveau, et le relais en service — démarré à
+16:26:35Z, donc avant l'install — servait encore l'ancien ; il a fallu un `TERM`
+manuel par pid.
+
+Depuis mika#2029 (`mitmdump`) et mika#2780 (le relais), **les deux lanceurs de
+démons** de `dispatch-lib.sh` ne demandent plus seulement « quelqu'un
+écoute-t-il ? » : au dispatch suivant, chacun compare la date de ses fichiers de
+code au démarrage de leur porteur, et le dit sur stderr sous le préfixe
+`dispatch-lib: pilot_daemon_freshness.`. Le geste réparateur est automatique — un
+`TERM` au porteur, **par identité d'endpoint et jamais par nom de processus**,
+puis la relance du lanceur existant.
+
+| démon | libellé dans les lignes de log | endpoint | fichiers de code comparés |
+|---|---|---|---|
+| le MITM Anthropic | `mitmdump` | `tcp:8892` | le binaire `mitmdump` et ses **deux** addons |
+| le relais d'egress | `pilot-egress-proxy` | `unix:/tmp/mika-pilot-egress.sock` | le binaire `mika-pilot-egress-proxy`, **et lui seul** |
+
+Le relais ne compte qu'un fichier parce qu'il n'importe que la bibliothèque
+standard et ne forke pas. Le seul autre fichier qu'il ouvre,
+`~/.claude/.credentials.json`, est **délibérément exclu** : c'est une donnée,
+réécrite à chaque rafraîchissement de jeton OAuth, donc la compter relancerait le
+relais plusieurs fois par jour — en coupant les tunnels CONNECT en vol — pour une
+raison qui n'a aucun rapport avec une version de code.
 
 Cinq jetons, et ce que chacun vous demande. `fresh` est **silencieux** : il
 n'écrit rien, pour qu'une ligne par dispatch sur l'état nominal ne noie pas les
@@ -296,14 +319,28 @@ fichiers inconditionnellement, contenu identique ou non : c'est un coût assumé
 un deploy étant précisément l'instant où l'on veut que le démon reprenne son
 code). `stale_deferred` dit qu'un pilote frère vole — un `*.stderr` de moins de
 300 s dans `/var/log/claude-pilot` — et que la relance attend : **aucun geste**,
-le prochain dispatch sans frère en vol la fera. `undecidable` dit que le port est
-tenu mais que son porteur n'est pas identifiable (`fuser` absent, ou port sans
-porteur lisible) ; « on ne sait pas » n'est pas « périmé », le démon est conservé
+le prochain dispatch sans frère en vol la fera. `undecidable` dit que l'endpoint
+est tenu mais que son porteur n'est pas identifiable (`fuser` absent, endpoint
+sans porteur lisible, ou lanceur appelé depuis un namespace PID qui ne voit pas
+le porteur) ; « on ne sait pas » n'est pas « périmé », le démon est conservé
 et **rien ne vous est demandé** — sauf si la ligne se répète à chaque dispatch,
 auquel cas installez `psmisc`. Seul `stale_unstoppable` appelle un regard : le
-porteur tient toujours le port 8892 trois secondes après un `TERM`, il n'y a pas
+porteur tient toujours son endpoint trois secondes après un `TERM`, il n'y a pas
 d'escalade en `KILL`, et le démon périmé est conservé plutôt que de laisser un
-port orphelin — allez voir qui le tient (`fuser -v -n tcp 8892`).
+endpoint orphelin — allez voir qui le tient, avec
+`fuser -v -n tcp 8892` pour le `mitmdump` et
+`fuser -v /tmp/mika-pilot-egress.sock` pour le relais.
+
+**La conséquence propre au relais, à connaître avant de la lire en incident.** Sa
+posture est fail-closed (§ 1) alors que celle du `mitmdump` ne l'est pas. Un
+`stale` sur le relais tue donc un démon **qui servait** : si la relance qui suit
+ne bind pas, elle se lit en `pilot_egress_guard.unreachable` et **le dispatch est
+refusé**. Le remède est celui du § 4.2, déjà écrit. Trois bornes rendent ce
+chemin étroit, et aucune n'est nouvelle : la déférence (`stale_deferred` — aucun
+`TERM` sous un pilote frère en vol), `stale_unstoppable` (le démon est conservé
+si l'endpoint répond encore après 3 s), et le fait que la relance passe par le
+lanceur déjà en service — un relais incapable de binder aujourd'hui ne
+survivrait pas davantage à son prochain démarrage.
 
 ## 5. Le canal d'alerte fonctionne-t-il ? — à faire AVANT l'incident
 
