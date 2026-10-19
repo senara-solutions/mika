@@ -528,6 +528,70 @@ jobs:
       - name: The harness of verify-pipeline.sh, the script every flight ends on (mika#861)
         run: bash scripts/verify-pipeline-test.sh
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # The other half of the mika#2793 catch-up: the guards of the plumbing EVERY
+  # flight of the autonomous loop goes through — WIP rescue, push/rebase retry,
+  # the seat stamped on a dispatched issue, the gate before a PR is published,
+  # transcript redaction. When one of these breaks, a pilot is wedged and the
+  # operator reads the suite's output to find out why; it is precisely the code
+  # that most needs a launcher, and it had none.
+  #
+  # The split from `offline-script-suites` above follows the root (`scripts/` vs
+  # `skills/bundled/_shared/`), which is also a split of nature: repository
+  # tooling on one side, dispatch plumbing on the other. Two parallel hosted
+  # jobs add nothing to the critical path.
+  #
+  # None of these touches the network, a token, cargo or bwrap. The seven that
+  # build git fixtures declare their own `user.email`/`user.name` on the fixture
+  # repo; the four others never commit — checked, because inheriting the host's
+  # global identity is the exact non-hermeticity mika#2793 had to repair in
+  # scripts/verify-pipeline-test.sh.
+  # ───────────────────────────────────────────────────────────────────────────
+  dispatch-lib-offline-suites:
+    name: Dispatch-lib Offline Suites
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # The redaction applied to pilot transcripts before they are written. Its
+      # header gave the bare `bash` invocation as the only way to run it.
+      - name: Redaction applied to pilot transcripts before they are written (mika#903)
+        run: bash skills/bundled/_shared/test-trace-redaction.sh
+      # The gate dispatch-lib applies before it publishes a PR. `gh` is faked.
+      - name: The gate applied before a PR is published (mika#1941)
+        run: bash skills/bundled/_shared/tests/test_finalize_pr_gate.sh
+      # The refusal of a force-push from a dispatch worktree.
+      - name: A force-push from a dispatch worktree is refused (mika#1318)
+        run: bash skills/bundled/_shared/tests/test_force_push_guard.sh
+      # The token grammar of `_parse_disposition` — a pure function over
+      # strings. Nothing in this repository is cheaper to run in CI.
+      - name: The token grammar of _parse_disposition (mika#1272)
+        run: bash skills/bundled/_shared/tests/test_parse_disposition.sh
+      # The push/rebase retry loop, against local repositories.
+      - name: The push/rebase retry loop (mika#1857)
+        run: bash skills/bundled/_shared/tests/test_push_with_rebase_retry.sh
+      # The cause token the WIP rescue stamps on the draft it opens.
+      - name: The cause token stamped on a rescue draft (mika#2539)
+        run: bash skills/bundled/_shared/tests/test_rescue_cause_token.sh
+      # A rescue draft never carries a `Closes` line: a rescued WIP must not
+      # close the ticket it failed to finish.
+      - name: A rescue draft carries no Closes line (mika#2157)
+        run: bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
+      # The rescue commit does not silently bypass the hooks.
+      - name: The rescue commit does not bypass the hooks (mika#1685)
+        run: bash skills/bundled/_shared/tests/test_rescue_commit_no_verify.sh
+      # .pilot-scratch/ never reaches a published commit — the invariant every
+      # dispatch rule about scratch files rests on.
+      - name: .pilot-scratch never reaches a published commit (mika#1282)
+        run: bash skills/bundled/_shared/tests/test_rescue_scratch_not_published.sh
+      # The two invariants of worktree command seeding: never overwrite a
+      # command the branch tracks, never dirty `git status`. Their breach was
+      # the dirty-worktree cause behind mika#1414.
+      - name: The two invariants of worktree command seeding (mika#1415)
+        run: bash skills/bundled/_shared/tests/test_seed_worktree_slash_commands.sh
+      # The seat stamped on a dispatched issue. `gh` is faked.
+      - name: The seat stamped on a dispatched issue (mika#2155)
+        run: bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
+
   issue-annotation-guard-lint:
     name: Issue Annotation Guard Lint
     runs-on: ubuntu-22.04
