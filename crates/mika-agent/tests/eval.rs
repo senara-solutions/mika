@@ -252,6 +252,12 @@ mod eval {
     // et une mort par trigger inconnu ne gèle plus la récurrence 24 h.
     mod test_recurring_trigger_wiring_2337;
 
+    // mika#2456 — `enabled = false` niveau-agent éteint les récurrentes : la
+    // porte mord, annule la ligne préexistante, ne ressuscite pas, reste
+    // réversible, et `mika tasks rearm` refuse nommément. Avec son contrôle
+    // négatif à un octet d'écart.
+    mod test_agent_disabled_recurring_gate_2456;
+
     // La porte de mika#2277 : le prédicat de kill est une conjonction sur les
     // trois surfaces du pilote. Contrôle positif + N1..N4, même suite.
     mod test_kg_zero_budget_1833;
