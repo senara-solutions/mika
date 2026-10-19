@@ -5614,6 +5614,7 @@ inject = false
             core_memory: &[],
             is_onboarding: false,
             compaction_imminent: Some(43),
+            pending_transmission: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5657,6 +5658,7 @@ inject = false
             core_memory: &[],
             is_onboarding: false,
             compaction_imminent: None,
+            pending_transmission: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5696,6 +5698,7 @@ inject = false
             core_memory: &[],
             is_onboarding: false,
             compaction_imminent: Some(43),
+            pending_transmission: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5940,6 +5943,7 @@ inject = false
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
             pending_transmission: pending,
+            compaction_imminent: None,
         }
     }
 
