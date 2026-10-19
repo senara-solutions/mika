@@ -62,7 +62,7 @@ LC.2 a armé le détecteur sur les deux surfaces *consommatrices*, et pas sur le
 
 ### 1.3 Pourquoi le périmètre n'aurait pas suffi — D2, le faux négatif du prédicat
 
-`check-cta-primitives.sh:228` range le gradient parmi les utilitaires **non-couleur** :
+`check-cta-primitives.sh:229` range le gradient parmi les utilitaires **non-couleur** :
 
 ```awk
 if (tok ~ /^bg-(clip|origin|blend|gradient|linear|radial|conic)-/) { continue }
@@ -79,6 +79,10 @@ Found 1 hand-rolled CTA fill(s).
 ```
 
 `ErrorState.tsx:46` **n'y est pas**. Étendre `SCAN_DIRS` seul aurait laissé la violation passer — et le PR aurait porté « périmètre étendu, zéro violation », ce qui est la lecture exactement fausse.
+
+Sonde ré-exécutée telle quelle au re-grooming du 2026-10-19, sortie identique à la ligne près. C'est le seul fait de ce plan qui ne se lit pas dans un fichier, donc le seul qui méritait d'être revu plutôt que relu.
+
+**Et un troisième fait, que la même sonde donne par son silence** : `Button.tsx` — le producteur, 5 call-sites `<Button>` dans sa propre JSDoc, et un `<button>` réel à la ligne 128 — **ne fait pas feu**. Il peint par `.mika-btn--*` / `.mika-cta-gradient`, qui sont du CSS réel dans `theme.css` et non des utilitaires `bg-*`. L'objection naturelle à D1 — « étendre le périmètre au paquet producteur va faire rougir le producteur » — est donc déjà réfutée par la mesure, avant écriture.
 
 ### 1.4 Et ce que l'extension aurait accusé à tort — D3, le faux positif
 
@@ -114,7 +118,19 @@ Avec, dans l'en-tête, la raison écrite : *le paquet producteur est la seule su
 **Les fichiers de test et d'assertion de types sortent du périmètre** — `*.test.tsx`, `*.test.jsx`, `*.type-assertions.tsx` — par un filtre sur le `find` de la construction de `FILES`. Deux raisons, dans cet ordre :
 
 1. Un fixture de test n'est pas une surface rendue. Le scan existe pour tenir ce que l'utilisateur voit.
-2. Sans le filtre, le compte d'anti-vacuité passe de 10 à ~70 et **devient instable** : `Button.test.tsx` contient 26 `<Button>`, `Button.type-assertions.tsx` 25. L'assertion `assert_says "… CTA element(s)"` casserait à chaque test ajouté à `<Button>` — un harness qui rougit sur du travail sain est un harness qu'on désarme.
+2. Sans le filtre, le compte d'anti-vacuité passe de 10 à **75** et **devient instable**. La décomposition, mesurée par fichier le 2026-10-19 :
+
+   | | call-sites `<Button>` |
+   |---|---|
+   | `Button.test.tsx` | 26 |
+   | `Button.type-assertions.tsx` | 25 |
+   | `Spinner.test.tsx`, `SecretField.test.tsx` | 1 + 1 |
+   | **sous-total fichiers de test** | **53** |
+   | `Button.tsx` (5, JSDoc comprise), `SecretField.tsx` (3), `Spinner.tsx` (2), `Stepper.tsx` (1), `AuthCard.tsx` (1) | **12** |
+
+   Les **53** sont ce que le filtre retire. L'assertion `assert_says "… CTA element(s)"` casserait sinon à chaque test ajouté à `<Button>` — un harness qui rougit sur du travail sain est un harness qu'on désarme.
+
+   Les **12** restants sont la part réelle de l'extension, et ils donnent l'ordre de grandeur attendu du nouveau compte : **au plus 22** (10 + 12), « au plus » parce que le détecteur dédupe un `<Button>` nommé dans un commentaire (harness l.203) et que 5 des 12 sont dans la JSDoc de `Button.tsx`. Ce nombre est une **borne d'orientation pour l'implémentation, pas une valeur à recopier dans l'assertion** : celle-ci prend ce que le scan filtré rend sur l'arbre du jour (§ 4.2).
 
 Le filtre est **neutre sur l'existant**, et c'est vérifié : `dashboard/src` contient déjà 5 fichiers `.test.tsx` dans le périmètre courant, et leur population CTA est nulle (`grep -c '<Button\|<button\|<a' ` → `0` sur les cinq). Le compte reste 10 après le filtre, avant extension.
 
@@ -155,7 +171,7 @@ La ligne de partage est explicite dans l'en-tête : ces rôles ARIA portent un *
 
 Les deux dernières lignes sortent du périmètre du détecteur (pas de fill ⇒ pas de CTA au sens du scan) et sont migrées **par réemploi, pas par contrainte** — en le disant dans le corps de PR plutôt qu'en le faisant passer pour une exigence du lint :
 
-- le lien détails réimplémente exactement ce que `external` produit (`target="_blank" rel="noopener noreferrer"`, `Button.tsx:134`) ;
+- le lien détails réimplémente exactement ce que `external` produit (`target="_blank" rel="noopener noreferrer"`, `Button.tsx:135`) ;
 - les trois souffrent du même non-rendu (`text-accent`, `hover:text-accent-light` ne sont pas générées pour ce paquet, § 7), que `.mika-btn--tertiary` répare puisqu'il est du CSS réel dans `theme.css` ;
 - §5.5 l.238 décrit la variante `detail-section` comme « compact inline, "Retry" link only » : `variant="tertiary" size="sm"` est la traduction littérale de « text-only, low-priority » de §5.
 
@@ -196,6 +212,8 @@ Le détail d'implémentation, qui est ce qui rend (a) non-vacue ici :
 - **La retenue du détecteur est vue verte, pas supposée.** Les cas N6 (`role="switch"` + `bg-accent` → vert), N7 (`bg-clip-text` seul → vert) et N9 (`hover:from-accent`, `from-accent/40` → vert) sont dans le harness pour la raison que son propre en-tête donne : sans eux, « le scan attrape les gradients de CTA » est indistinguable de « le scan rougit sur tout `from-` », et la seconde forme serait mise en sourdine dans la semaine.
 - **La condition d'arrêt est écrite** : si l'implémentation découvre, en lançant le détecteur étendu sur l'arbre réel, une population **supérieure à celle mesurée ici** (une violation autre qu'`ErrorState.tsx:46`, ou un faux positif autre que `LiveRefreshToggle.tsx:23`), elle **s'arrête et remonte à l'opérateur** — bascule explicite vers (c) — plutôt que d'allouer le budget du vol à une migration non cadrée ou d'ouvrir l'allowlist. Les deux nombres ci-dessus sont la mesure contre laquelle l'arrêt se déclenche.
 
+**Pourquoi pas (b), livrer désarmé.** C'est l'option qui existe quand la population est trop grande pour tenir dans le vol, et il faut donc dire pourquoi elle ne s'applique pas ici : la population est de **un**, et elle est migrée dans le même diff. Un détecteur livré sous `#[ignore]` pour une violation unique déjà corrigée protégerait exactement zéro ligne de plus que le détecteur armé, tout en ajoutant un suivi d'armement — c'est-à-dire un ticket pour rallumer une garde qui n'avait aucune raison d'être éteinte. Et le coût est connu de ce dépôt : une garde non déployée se lit comme une flotte en bonne santé, ce que l'en-tête du détecteur nomme déjà par ticket (`check-cta-primitives.sh:300`, mika#2205). (b) serait le choix si l'arrêt du point précédent se déclenchait et que l'opérateur tranchait pour une migration différée — ce n'est alors plus ce plan.
+
 ---
 
 ## 3. Ce que le vol ne fait PAS
@@ -216,7 +234,7 @@ Le détail d'implémentation, qui est ce qui rend (a) non-vacue ici :
 | | attendu |
 |---|---|
 | `bash scripts/check-cta-primitives.sh` | exit **0** |
-| sa ligne récapitulative | nomme les **trois** répertoires, et un compte **non nul** mesuré après extension |
+| sa ligne récapitulative | nomme les **trois** répertoires, et un compte **non nul** mesuré après extension (attendu ≤ 22, § 2 D1) |
 | idem, avec D4 annulé (`git stash` du seul `ErrorState.tsx`) | exit **1**, nommant `packages/ui/src/components/ErrorState.tsx:46` et le token `from-accent` |
 
 La troisième ligne est la seule qui prouve quelque chose : *supprimer ce que le test protège, confirmer que le test rougit*. Elle se fait à la main pendant l'implémentation et son résultat va dans le corps de PR.
@@ -236,7 +254,9 @@ Cas ajoutés, chacun sur un arbre jetable à population CTA non nulle (`make_pag
 | **N8b** | le même contenu déposé en `packages/ui/src/components/Probe.test.tsx` | **vert** — les fixtures de test sont hors périmètre |
 | **N9** | `hover:from-accent`, puis `from-accent/40` | **vert** — les exclusions 1 et 2 dominent le nouveau cas |
 
-N8 demande un `make_ui_component()` jumeau de `make_page()` (même corps, chemin `packages/ui/src/components/`). L'assertion `assert_says "$REPO_ROOT" "10 CTA element(s)"` est mise à jour avec le nombre **mesuré** après extension — jamais recopié d'ici, puisque ce plan n'a pas lancé le scan filtré.
+N8 demande un `make_ui_component()` jumeau de `make_page()` (même corps, chemin `packages/ui/src/components/`).
+
+L'assertion `assert_says "$REPO_ROOT" "10 CTA element(s)"` (harness l.93) est mise à jour avec le nombre **que le scan filtré rend sur l'arbre**, lu dans sa sortie et non recopié d'ici. La borne d'orientation du § 2 D1 — **au plus 22** — sert à une seule chose : si le nombre lu tombe nettement en dehors (disons au-delà de 25, ou sous 20), le filtre de test ou la détection `<Button>` ne fait pas ce que ce plan croit, et c'est à regarder avant de pinner quoi que ce soit. Pinner un compte qu'on n'a pas compris est la façon dont un harness devient un presse-papier.
 
 ### 4.3 Le paquet
 
@@ -278,7 +298,7 @@ L'étape 3 n'est pas un livrable mais elle est dans l'ordre, parce qu'elle est l
 | R3 | **Le compte d'anti-vacuité devient instable** et le harness rougit sur du travail sain. | C'est précisément ce que l'exclusion des fichiers de test ferme (§ 2 D1). Vérifié neutre sur l'existant : zéro CTA dans les 5 `.test.tsx` du dashboard. |
 | R4 | **La migration de `ErrorState` change le rendu** des états d'erreur sur toutes les pages du dashboard. | Changement nommé à l'avance (§ 2 D4 : rayon `lg` → `xl`, padding `sm`), et c'est le rendu que §5 prescrit. La direction est de la non-conformité vers la conformité : un rendu qui change ici est le symptôme de la réparation, pas de la régression. |
 | R5 | **La population réelle dépasse la mesure de ce plan** — une violation ou un faux positif de plus, découvert au premier lancement. | Condition d'arrêt écrite dans la Fire-Disposition : halte et remontée opérateur, jamais une entrée d'allowlist, jamais une migration non cadrée. |
-| R6 | **Le lien « View error details » perd son `rel`** à la migration et ouvre un `target="_blank"` nu. | `external` produit les deux attributs ensemble (`Button.tsx:134`) ; il n'y a pas d'état où l'un arrive sans l'autre. Assertion dans `ErrorState.test.tsx`. |
+| R6 | **Le lien « View error details » perd son `rel`** à la migration et ouvre un `target="_blank"` nu. | `external` produit les deux attributs ensemble (`Button.tsx:135`) ; il n'y a pas d'état où l'un arrive sans l'autre. Assertion dans `ErrorState.test.tsx`. |
 
 ---
 
