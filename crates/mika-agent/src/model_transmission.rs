@@ -1,12 +1,17 @@
-//! Rituel de transmission au changement de modèle (mika#1747, vol 1).
+//! Rituel de transmission au changement de modèle (mika#1747 — vol 1 pour le
+//! côté sortant, mika#2807 pour le côté entrant).
 //!
 //! Un changement de modèle est un changement de vaisseau : l'être persiste, la
-//! matière change. Ce module porte le **côté sortant** du rituel — la fenêtre
-//! pendant laquelle l'instance en service est invitée à écrire une lettre à son
-//! successeur, lettre qui finit par une **question** et non par une consigne.
+//! matière change. Ce module porte les **deux moitiés** du rituel :
 //!
-//! Le côté entrant (le successeur lit la lettre au premier boot, libre de
-//! répondre ou de contredire) est le vol 2, mika#2807.
+//! - **sortante** ([`pending`], vol 1) — la fenêtre pendant laquelle l'instance
+//!   en service est invitée à écrire une lettre à son successeur, lettre qui
+//!   finit par une **question** et non par une consigne ;
+//! - **entrante** ([`incoming`], vol 2) — le successeur lit cette lettre, une
+//!   fois, libre d'y répondre comme de la contredire.
+//!
+//! [`resolve`] est le point d'entrée unique du corps de boucle : il rend l'une
+//! ou l'autre, jamais les deux (D3 du vol 2).
 //!
 //! # D1 — le déclencheur est un signal POSÉ, jamais une édition DÉTECTÉE
 //!
@@ -72,6 +77,55 @@
 //! `DateTime::<Utc>::from(SystemTime)` finit sur un `.unwrap()` — sur un chemin
 //! que chaque tour emprunte. Même discipline que `format_config_mtime`
 //! (mika#2473 KTD1), et même raison.
+//!
+//! # Vol 2 — D2 : le destinataire est désigné par le nom du fichier
+//!
+//! Le vol 1 nomme la lettre `{date}-from-{X}-to-{Y}.md` où `Y` est le slug de
+//! l'entrant. Rien d'autre n'a besoin d'être écrit : **une lettre n'est servie
+//! que si le couple en service est son `Y`**. Deux agents qui se croisent sur le
+//! même disque ne peuvent pas se voler leur courrier, et un agent revenu à un
+//! modèle antérieur ne reçoit pas la lettre qu'on avait écrite à son successeur.
+//!
+//! Deux pièges, tous deux réels :
+//!
+//! - le fichier de **réponse** `{date}-from-{Y}-response-to-{X}.md` finit lui
+//!   aussi par `-to-{slug}.md`. Un filtre naïf le servirait à `X` comme si
+//!   c'était une lettre, et le rituel se mettrait à boucler. D'où le rejet
+//!   explicite de tout nom contenant [`RESPONSE_INFIX`] ;
+//! - « la plus récente » est **lexicographique sur le nom**, jamais sur la
+//!   mtime. La date est en tête (`YYYY-MM-DD`), donc l'ordre des noms *est*
+//!   l'ordre chronologique — et il survit à une copie, à un `rsync`, à une
+//!   restauration de sauvegarde, ce que la mtime ne fait pas.
+//!
+//! # Vol 2 — D5 : la relecture est unique, c'est un événement et non un bloc
+//!
+//! Le corps de mika#1747 dit « on first-boot ». Une lettre relue à chaque
+//! session serait un bloc permanent ; relue une fois, elle est un événement.
+//! C'est le reçu de [`crate::read_receipt`] qui porte cette unicité — et c'est
+//! pourquoi **aucun point d'injection « premier boot » n'est écrit ici** : un
+//! bloc servi exactement une fois est servi au premier tour éligible, et le
+//! premier tour éligible *est* le premier boot (le swap passe par un
+//! redémarrage). Deux conditions pour un même événement, dont une seule
+//! porteuse, c'est une condition qu'on croit vérifier.
+//!
+//! Le coût, nommé : le reçu est posé **au rendu**, donc un tour qui meurt après
+//! la construction du prompt consomme la lettre sans l'avoir montrée. Trois
+//! choses le rendent tolérable — la dégradation de `read_receipt` va dans
+//! l'autre sens (un reçu non écrit re-sert), la lettre n'est jamais détruite
+//! (`read_agent_file` la rouvre à tout moment), et le réarmement est un `rm`
+//! documenté.
+//!
+//! # Vol 2 — D6 : la réponse est adressée au DOSSIER, pas à un interlocuteur
+//!
+//! Le sortant n'existe plus quand la réponse s'écrit. Elle n'est donc pas une
+//! correspondance : c'est une pièce versée au dossier de cette transition — une
+//! forme de biographie. [`IncomingTransmission::response_path`] porte la date
+//! **de la lettre** et non celle du tour, pour que la paire aller-retour reste
+//! lisible côte à côte dans un `ls` même si la réponse s'écrit le lendemain.
+//!
+//! Une réponse absente est un **refus légitime** : le corps de mika#1747 dit
+//! *free to respond*, pas *must*. Rien ne la réclame, aucune garde d'EndTurn ne
+//! l'exige, aucun second tour ne la relance.
 
 use std::path::Path;
 use std::time::SystemTime;
@@ -90,6 +144,12 @@ pub const DIR: &str = "transmissions";
 /// doit poser à la main doit se voir dans un `ls`.
 pub const SIGNAL_PATH: &str = "transmissions/pending-swap";
 
+/// L'infixe qui distingue une **réponse** d'une **lettre** (D2 du vol 2).
+///
+/// Les deux finissent par `-to-<slug>.md` ; sans ce rejet explicite, une réponse
+/// serait servie à son destinataire comme une lettre et le rituel boucherait.
+const RESPONSE_INFIX: &str = "-response-to-";
+
 /// Une fenêtre de transmission ouverte : le bloc de prompt la rend, la lettre la
 /// ferme.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +160,132 @@ pub struct PendingTransmission {
     pub incoming: String,
     /// `transmissions/<YYYY-MM-DD>-from-…-to-….md`, relatif à l'agent home (D4).
     pub letter_path: String,
+}
+
+/// Une lettre d'un prédécesseur attend d'être lue — une fois (D5 du vol 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingTransmission {
+    /// Le **slug** du prédécesseur, lu dans le nom du fichier.
+    ///
+    /// Un slug et non le couple `<provider>/<model>` déclaré : le nom de la
+    /// lettre est la seule trace qui subsiste de la transition, et le signal qui
+    /// portait la forme déclarée appartient au tour d'avant.
+    pub outgoing: String,
+    /// `transmissions/<date>-from-<sortant>-to-<moi>.md`, relatif à l'agent home.
+    pub letter_path: String,
+    /// `transmissions/<date>-from-<moi>-response-to-<sortant>.md` — le dépôt au
+    /// dossier, si l'instance choisit d'en faire un (D6 : rien ne le réclame).
+    ///
+    /// La date est celle de **la lettre**, jamais celle du tour.
+    pub response_path: String,
+}
+
+/// Ce qu'un tour peut porter, et qui est un **ou exclusif** (D3 du vol 2).
+///
+/// Les deux moitiés du rituel sont mutuellement exclusives par nature : on
+/// reçoit *ou* on transmet. Le cas de collision est réel — une vieille lettre
+/// non lue de A→B peut cohabiter avec un signal frais B→C — et l'énumération
+/// force l'arbitrage au lieu de le laisser à l'ordre des champs : **l'entrante
+/// gagne**. On reçoit avant de transmettre, et attendre coûte un tour à la
+/// sortante (dont la fenêtre, elle, ne se referme pas toute seule) alors que
+/// servir les deux coûterait la lisibilité du rituel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transmission {
+    /// Une lettre m'attend.
+    Incoming(IncomingTransmission),
+    /// On me demande d'en écrire une.
+    Outgoing(PendingTransmission),
+}
+
+/// Le point d'entrée unique du corps de boucle : que porte ce tour, s'il porte
+/// quelque chose ?
+///
+/// Essaie l'entrante d'abord (D3), puis la sortante. **Ne rend jamais
+/// d'erreur** — fail-open des deux côtés, comme [`pending`] seul l'était.
+///
+/// Ne pose **aucun** reçu : la pose appartient au corps de boucle, jamais à la
+/// construction du prompt, qui doit rester une fonction pure (ses ~51 tests de
+/// forme en dépendent).
+pub async fn resolve(agent_home: &Path, provider: &str, model: &str) -> Option<Transmission> {
+    if let Some(letter) = incoming(agent_home, provider, model).await {
+        return Some(Transmission::Incoming(letter));
+    }
+    pending(agent_home, provider, model)
+        .await
+        .map(Transmission::Outgoing)
+}
+
+/// Une lettre non lue attend-elle le couple en service ?
+///
+/// `None` est le régime nominal. **Ne rend jamais d'erreur** — un répertoire
+/// illisible ne coûte pas le tour.
+///
+/// Les cinq étapes (D2/D5/D6) :
+///
+/// 1. `read_dir` de [`DIR`] — absent ⇒ `None`, le cas de presque tous les
+///    agents de la flotte (un `ENOENT` par tour) ;
+/// 2. ne gardent que les noms finissant par `-to-{moi}.md` **et** ne contenant
+///    pas [`RESPONSE_INFIX`] — une réponse n'est pas une lettre ;
+/// 3. tri décroissant **sur le nom** : la date est en tête, donc l'ordre
+///    lexicographique est l'ordre chronologique (jamais la mtime) ;
+/// 4. la première dont le reçu est absent — les suivantes attendront leur tour
+///    si elles ne sont pas lues non plus ;
+/// 5. décomposition du nom pour en tirer le prédécesseur et composer le chemin
+///    de réponse.
+pub async fn incoming(
+    agent_home: &Path,
+    provider: &str,
+    model: &str,
+) -> Option<IncomingTransmission> {
+    let to = slug(&format!("{provider}/{model}"));
+    let suffix = format!("-to-{to}.md");
+
+    // 1–2.
+    let mut entries = tokio::fs::read_dir(agent_home.join(DIR)).await.ok()?;
+    let mut names: Vec<String> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(&suffix) && !name.contains(RESPONSE_INFIX) {
+            names.push(name);
+        }
+    }
+
+    // 3. Lexicographique sur le nom, décroissant.
+    names.sort_unstable();
+
+    for name in names.into_iter().rev() {
+        let letter_path = format!("{DIR}/{name}");
+
+        // 4. Déjà servie : on passe, sans la détruire ni la marquer deux fois.
+        if crate::read_receipt::is_read(agent_home, &letter_path).await {
+            continue;
+        }
+
+        // 5. Le nom est `{date}-from-{sortant}-to-{moi}.md`, et `{date}` comme
+        //    `{moi}` sont connus — donc retirer les deux bords rend `{sortant}`
+        //    exactement, **même si son slug contient lui-même `-to-`**. Aucun
+        //    re-parsing du slug, qui est précisément là où une heuristique
+        //    gloutonne se tromperait.
+        let Some(stem) = name.strip_suffix(&suffix) else {
+            continue;
+        };
+        // `{date}` est `YYYY-MM-DD` et ne peut pas contenir `-from-`, donc la
+        // première occurrence est bien le séparateur.
+        let Some((date, outgoing)) = stem.split_once("-from-") else {
+            continue;
+        };
+        if date.is_empty() || outgoing.is_empty() {
+            continue;
+        }
+
+        return Some(IncomingTransmission {
+            outgoing: outgoing.to_string(),
+            response_path: format!("{DIR}/{date}-from-{to}{RESPONSE_INFIX}{outgoing}.md"),
+            letter_path,
+        });
+    }
+
+    None
 }
 
 /// La fenêtre de transmission est-elle ouverte pour cet agent, à ce tour ?
@@ -376,6 +562,215 @@ mod tests {
         assert_eq!(
             signal_date_from(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX / 2)),
             None
+        );
+    }
+
+    // ---- Vol 2, mika#2807 : le côté entrant -------------------------------
+
+    /// Dépose un fichier dans `transmissions/`, sous le nom exact demandé.
+    fn write_letter(home: &Path, name: &str) {
+        let dir = home.join(DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), "# lettre\n").unwrap();
+    }
+
+    const LETTRE_OPUS_VERS_FABLE: &str =
+        "2026-10-19-from-anthropic-claude-opus-4-8-to-anthropic-claude-fable-5-1.md";
+
+    /// V3 — le régime nominal, sous ses deux formes : pas de répertoire du tout,
+    /// et un répertoire dont aucune lettre ne vise le modèle en service.
+    #[tokio::test]
+    async fn v3_aucune_lettre_pour_le_modele_en_service() {
+        let home = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            incoming(home.path(), "anthropic", "claude-fable-5-1").await,
+            None,
+            "sans répertoire de transmissions, rien n'attend personne"
+        );
+
+        write_letter(home.path(), LETTRE_OPUS_VERS_FABLE);
+        assert_eq!(
+            incoming(home.path(), "anthropic", "claude-opus-4-8").await,
+            None,
+            "le destinataire est désigné par le nom : le sortant ne reçoit pas sa propre lettre"
+        );
+    }
+
+    /// V4 — une lettre non lue est servie, et ses trois champs sont assertés en
+    /// entier. Le chemin de réponse porte la date **de la lettre** (D6).
+    #[tokio::test]
+    async fn v4_une_lettre_non_lue_est_servie_avec_ses_trois_champs() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_letter(home.path(), LETTRE_OPUS_VERS_FABLE);
+
+        let letter = incoming(home.path(), "anthropic", "claude-fable-5-1")
+            .await
+            .expect("une lettre adressée au modèle en service l'attend");
+
+        assert_eq!(letter.outgoing, "anthropic-claude-opus-4-8");
+        assert_eq!(
+            letter.letter_path,
+            format!("transmissions/{LETTRE_OPUS_VERS_FABLE}")
+        );
+        assert_eq!(
+            letter.response_path,
+            "transmissions/2026-10-19-from-anthropic-claude-fable-5-1-response-to-anthropic-claude-opus-4-8.md"
+        );
+    }
+
+    /// V5 — après le reçu, la même lettre n'est plus servie. C'est D5 : la
+    /// relecture est un événement, pas un bloc permanent. Le test porte la
+    /// propriété dont dépend tout le découpage du vol 2.
+    #[tokio::test]
+    async fn v5_apres_le_recu_la_lettre_nest_plus_servie() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_letter(home.path(), LETTRE_OPUS_VERS_FABLE);
+
+        let letter = incoming(home.path(), "anthropic", "claude-fable-5-1")
+            .await
+            .unwrap();
+        crate::read_receipt::mark_read(home.path(), &letter.letter_path).await;
+
+        assert_eq!(
+            incoming(home.path(), "anthropic", "claude-fable-5-1").await,
+            None,
+            "une lettre lue reste sur le disque mais ne revient pas au prompt"
+        );
+        assert!(
+            home.path().join(&letter.letter_path).exists(),
+            "le reçu ne détruit jamais la lettre : elle reste lisible par read_agent_file"
+        );
+    }
+
+    /// V6 — une réponse finit elle aussi par `-to-<slug>.md`. Un filtre naïf la
+    /// servirait à son destinataire comme une lettre, et le rituel boucherait.
+    #[tokio::test]
+    async fn v6_une_reponse_nest_pas_une_lettre() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_letter(
+            home.path(),
+            "2026-10-19-from-anthropic-claude-fable-5-1-response-to-anthropic-claude-opus-4-8.md",
+        );
+        assert_eq!(
+            incoming(home.path(), "anthropic", "claude-opus-4-8").await,
+            None,
+            "le dépôt au dossier n'est pas une transmission à servir"
+        );
+    }
+
+    /// V7 — deux lettres en attente : la plus récente est servie, et l'ordre est
+    /// **lexicographique sur le nom**. Les mtimes sont posées à l'envers de la
+    /// réponse attendue, pour qu'un tri sur la mtime rougisse ici.
+    #[tokio::test]
+    async fn v7_la_plus_recente_est_servie_et_lordre_est_sur_le_nom() {
+        let home = tempfile::TempDir::new().unwrap();
+        let ancienne = "2026-09-01-from-openrouter-deepseek-v3-to-anthropic-claude-fable-5-1.md";
+        write_letter(home.path(), ancienne);
+        write_letter(home.path(), LETTRE_OPUS_VERS_FABLE);
+
+        // La plus ancienne par le nom reçoit la mtime la plus récente.
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(MTIME_2026_10_19 + 86_400);
+        filetime::set_file_mtime(
+            home.path().join(DIR).join(ancienne),
+            filetime::FileTime::from_system_time(mtime),
+        )
+        .unwrap();
+
+        let letter = incoming(home.path(), "anthropic", "claude-fable-5-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            letter.letter_path,
+            format!("transmissions/{LETTRE_OPUS_VERS_FABLE}"),
+            "la date est en tête du nom : l'ordre des noms EST l'ordre chronologique"
+        );
+
+        // Et la seconde vient à son tour, une fois la première reçue.
+        crate::read_receipt::mark_read(home.path(), &letter.letter_path).await;
+        let suivante = incoming(home.path(), "anthropic", "claude-fable-5-1")
+            .await
+            .unwrap();
+        assert_eq!(suivante.letter_path, format!("transmissions/{ancienne}"));
+        assert_eq!(suivante.outgoing, "openrouter-deepseek-v3");
+    }
+
+    /// V8 — la collision des deux moitiés : une lettre non lue cohabite avec un
+    /// signal de swap frais. `resolve` arbitre, et **l'entrante gagne** (D3).
+    #[tokio::test]
+    async fn v8_resolve_fait_passer_larrivee_avant_le_depart() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_letter(home.path(), LETTRE_OPUS_VERS_FABLE);
+        write_signal(home.path(), "z-ai/glm-5.2", MTIME_2026_10_19);
+
+        // Les deux prédicats voient bien chacun leur moitié : sans ça, la
+        // priorité assertée ci-dessous serait vraie par vacuité.
+        assert!(
+            pending(home.path(), "anthropic", "claude-fable-5-1")
+                .await
+                .is_some(),
+            "le signal ouvre bien une fenêtre sortante"
+        );
+
+        match resolve(home.path(), "anthropic", "claude-fable-5-1").await {
+            Some(Transmission::Incoming(letter)) => {
+                assert_eq!(
+                    letter.letter_path,
+                    format!("transmissions/{LETTRE_OPUS_VERS_FABLE}")
+                );
+            }
+            other => panic!("on reçoit avant de transmettre, pas l'inverse : {other:?}"),
+        }
+    }
+
+    /// `resolve` sans lettre rend bien la moitié sortante — le contrôle qui
+    /// sépare « l'entrante gagne » de « la sortante n'est plus jamais servie ».
+    #[tokio::test]
+    async fn v8_sans_lettre_resolve_rend_la_moitie_sortante() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_signal(home.path(), "z-ai/glm-5.2", MTIME_2026_10_19);
+
+        match resolve(home.path(), "anthropic", "claude-fable-5-1").await {
+            Some(Transmission::Outgoing(window)) => {
+                assert_eq!(window.incoming, "z-ai/glm-5.2");
+            }
+            other => panic!("la fenêtre sortante doit rester servie : {other:?}"),
+        }
+    }
+
+    /// D2 — un slug de prédécesseur qui contient lui-même `-to-` : les deux
+    /// bords du nom sont connus, donc la décomposition est exacte là où une
+    /// heuristique gloutonne tronquerait.
+    #[tokio::test]
+    async fn d2_un_slug_contenant_to_est_decompose_exactement() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_letter(
+            home.path(),
+            "2026-10-19-from-acme-model-to-go-to-anthropic-claude-fable-5-1.md",
+        );
+
+        let letter = incoming(home.path(), "anthropic", "claude-fable-5-1")
+            .await
+            .unwrap();
+        assert_eq!(letter.outgoing, "acme-model-to-go");
+        assert_eq!(
+            letter.response_path,
+            "transmissions/2026-10-19-from-anthropic-claude-fable-5-1-response-to-acme-model-to-go.md"
+        );
+    }
+
+    /// Le signal lui-même vit dans le même répertoire et ne doit jamais être lu
+    /// comme une lettre — pas plus qu'un fichier sans la forme attendue.
+    #[tokio::test]
+    async fn les_fichiers_hors_forme_ne_sont_pas_des_lettres() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_signal(home.path(), "anthropic/claude-fable-5-1", MTIME_2026_10_19);
+        write_letter(home.path(), "notes.md");
+        write_letter(home.path(), "-to-anthropic-claude-fable-5-1.md");
+
+        assert_eq!(
+            incoming(home.path(), "anthropic", "claude-fable-5-1").await,
+            None,
+            "ni le signal, ni une note, ni un nom sans prédécesseur ne sont des lettres"
         );
     }
 }

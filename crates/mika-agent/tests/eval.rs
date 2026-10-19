@@ -352,4 +352,9 @@ mod eval {
     // Fenêtre de transmission au changement de modèle : le signal posé atteint
     // le prompt conversationnel, et son contrôle négatif (mika#1747 vol 1)
     mod test_model_transmission_1747;
+
+    // La moitié entrante du même rituel : la lettre du prédécesseur atteint le
+    // prompt, une seule fois — le second tour sur la même graine ne la rend
+    // plus (mika#2807 vol 2)
+    mod test_incoming_transmission_2807;
 }
