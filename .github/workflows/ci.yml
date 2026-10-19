@@ -141,6 +141,19 @@ jobs:
       - name: Phase 2b entrypoint passes the pilot argv positionally (mika#2077)
         run: make test-pilot-phase2b-argv
 
+      # mika#2077 (reprise de mika#2032) — le chemin GROOMED de dispatch-lib
+      # retirait la ligne `PIPELINE FAILURE:` d'un bloc d'échec de plusieurs
+      # lignes, livrant `Session:`, `Halt class:` et le paragraphe orphelins :
+      # un diagnostic tronqué exactement quand il compte, et sur le chemin de
+      # SUCCÈS du grooming, donc sur tout groom convergé. La suite mesure la
+      # démotion sur les messages réels du fichier et porte sa propre
+      # anti-vacuité (deux copies régressées, comptes d'échecs exacts). Câblée
+      # ICI parce que mika#2578 et mika#2752 l'ont enseigné : un garde que le
+      # pipeline ne lance pas passe la revue, passe le CI par construction, et
+      # laisse partir le défaut. Ni bwrap, ni réseau, ni token.
+      - name: A stale PIPELINE FAILURE block is demoted, not decapitated (mika#2077)
+        run: make test-demote-pipeline-failure
+
       # mika#2578 again, same lesson as the step below: `make test-sandbox-gh-usable`
       # was local-only, so the guard that pins the VALUE `--setenv GH_TOKEN`
       # carries — now the egress sentinel (mika#2716) — gated nothing on a PR.
