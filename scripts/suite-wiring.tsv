@@ -1,0 +1,99 @@
+# Suites deliberately outside CI, their mode, their reason, their ticket.
+# mika#2761. ONE source of truth, ONE reader: scripts/check-suite-wiring.sh.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE RULE THIS FILE ENCODES
+#
+#   A test suite that lives in the tree must be REACHABLE from a workflow, or
+#   be DECLARED here with a mode, a reason and a ticket. There is no third
+#   state, and the empty state — present on disk, absent from CI, absent from
+#   here — is what the lint refuses.
+#
+# This file holds the RESIDUE, not the census. The 70-odd suites CI does reach
+# are not listed: for those the tree is already the source of truth — a workflow
+# names them. Declaring them would create a second site to maintain for a fact
+# already proven, and a registry you must edit on every CI rewiring is a
+# registry that drifts. That is precisely the class of mika#2092, self-inflicted.
+# `scripts/canonical-tokens.tsv` declares *all* its tokens because nothing else
+# in the tree states a reader's tolerance; here CI *is* the source for "is it
+# wired". The declarative principle applies to the ambiguous remainder only.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# `mode` IS A WIRE FORMAT, validated against a closed vocabulary
+#
+#   operator   the suite needs the outside world — network, a token, a live
+#              service, a pid — or it is a deliberate measuring instrument.
+#              Legitimately not a CI gate.
+#   unwired    the suite runs offline, and nothing runs it. THE BACKLOG.
+#              `grep -c unwired scripts/suite-wiring.tsv` is its size.
+#
+# A third state exists and is NEVER written here: a wired suite. Its proof is
+# the workflow that names it, and the lint goes RED on an entry for a suite CI
+# reaches — so an entry cannot outlive its reason. The gesture that makes an
+# exception pointless (wiring the suite) is the gesture that makes it fail.
+#
+# The operator/unwired frontier is the discriminant of mika#1801: *does this
+# script need the outside world?* That document states the machine cannot ask
+# that question. So it does not: the HUMAN decides by filling the field, the
+# MACHINE checks the form — mode in the vocabulary, reason non-empty, ticket
+# present. Same discipline as the `tolérance` column of canonical-tokens.tsv.
+#
+# "Needs bwrap" is NOT "needs the outside world". ci.yml:133-149 already runs
+# two real-sandbox suites on a hosted runner, on the stated ground that each
+# "skips cleanly when bwrap is absent, so it is safe on a hosted runner". A
+# suite that degrades to a skip is wirable; calling it `operator` would hide a
+# backlog entry behind a word.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# POSITIVE POPULATION CONTROL (mika#2205, layer 2 of the mika#1801 taxonomy)
+#
+# The lint must not go green by looking at nothing. Measured 2026-10-18 on
+# `0170f5cd`: 112 `*.sh`/`*.py` files under `scripts/` and
+# `skills/bundled/_shared/`, of which 94 carry a suite prefix. The floor below
+# leaves ~10% of room for legitimate deletions and catches a collapse of the
+# enumeration — a renamed root, a changed prefix convention, a broken glob.
+# Lowering it is allowed; doing so silently is not: say why in the commit.
+#
+# min-population: 85
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMAT: four TAB-separated columns, no header row.
+#
+#   path      repo-relative, exactly as the tree spells it
+#   mode      operator | unwired
+#   reason    why, in human words. An empty reason is the allowlist mika#2309
+#             condemns: it says "skip me" and carries nothing else.
+#   ticket    at least one `mika#<n>` — the ticket that gives the reason its
+#             meaning. For `operator`, the one that established the deliberate
+#             character. For `unwired`, the one that established the SUITE:
+#             what it protects is what its absence from CI costs. The wiring of
+#             the whole `unwired` column is tracked collectively by mika#2793,
+#             whose work list is this file read through `grep unwired`.
+#
+scripts/measure-plan-header-coverage.sh	operator	Deliberate instrument, never a gate — Makefile:200 and CLAUDE.md both say so in those words. It reports a coverage ratio over the plan corpus; there is no threshold to fail on, and inventing one here would turn a measurement into a gate nobody chose.	mika#2606
+scripts/verify-dependabot-topology.sh	operator	Reads three real repositories through `gh api`, so it needs a cross-repo token CI does not carry. Its offline half is scripts/test-verify-dependabot-topology.sh, which fakes `gh` and replays both states.	mika#1997
+scripts/check-release-debuginfo.sh	unwired	The guard refusing a release profile that ships debuginfo. Runs offline in seconds, and `make check-release-debuginfo` already exists — no workflow calls the target.	mika#1719
+scripts/test-check-release-debuginfo.sh	unwired	Anti-vacuity harness of the guard above. Both halves sit on disk and neither one runs: the mika#2578 shape exactly, guard and proof-of-guard together.	mika#1719
+scripts/test-dispatch-symmetry.sh	unwired	Pins that dev-pilot and dev-groom differ only by their entry slash command — the load-bearing invariant of the mika#893 factorisation. Pure structural diff over two tracked files, zero outside world. Sits in `make test`, which no workflow calls.	mika#893
+scripts/test-measure-empty-turns.sh	unwired	Keeps the empty-turn measurement from counting the guardrails constant as the event. Offline, fixture-driven, and its own header names the `make` target nothing invokes.	mika#1910
+scripts/test-measure-pilot-cycle-emptiness.sh	unwired	Same class one measure over: the anchor must be derived from the producer, never reverse-engineered from a log, or 2349 of 2352 sessions read as silent. Offline.	mika#1950
+scripts/test-mika-groom-milestone.sh	unwired	Checks the mika-arch-groom-milestone bundle's scaffold and its five registration sites in well_known_agents.rs. Reads tracked files only.	mika#879
+scripts/test-smoke-search-substrate.sh	unwired	Holds AC4 of the search smoke — a 404 `search_upstream_not_configured` must exit non-zero. Its own header states it was built to run in CI with no gateway, no database, no token and no upstream request. Unwired anyway.	mika#2407
+scripts/test-smoke-webhook-chain.sh	unwired	Pins the webhook-chain probe's decision table AND its silence on a healthy chain. Two throwaway `python3 -m http.server` stand-ins; every curl call stays on loopback.	mika#2135
+scripts/test-verify-dependabot-topology.sh	unwired	The offline half of the operator entry above: it fakes `gh` and replays both topology states. Nothing runs it, so the operator script's own logic is unguarded.	mika#1997
+scripts/verify-pipeline-test.sh	unwired	Harness of verify-pipeline.sh, the script every flight is required to end on. mika#2516 is what its absence from CI has already cost once.	mika#861
+skills/bundled/_shared/test-trace-redaction.sh	unwired	Pins the redaction applied to pilot transcripts before they are written. Offline, fixture-driven, and its header gives the bare `bash` invocation as the only way to run it.	mika#903
+skills/bundled/_shared/tests/test_egress_relay_socket_and_env.sh	unwired	0600 relay socket, minimal relay launch environment, and reachability from a real bwrap pilot — point 3 is the one the canary cannot give. Skips cleanly when bwrap is absent, the precondition ci.yml:138 already accepts.	mika#2578
+skills/bundled/_shared/tests/test_finalize_pr_gate.sh	unwired	Pins the gate dispatch-lib applies before it publishes a PR. Offline; `gh` is faked.	mika#1941
+skills/bundled/_shared/tests/test_force_push_guard.sh	unwired	Pins the refusal of a force-push from a dispatch worktree. Offline, local git fixtures.	mika#1318
+skills/bundled/_shared/tests/test_parse_disposition.sh	unwired	Pins the token grammar of `_parse_disposition`. A pure function over strings — nothing is cheaper to run in CI.	mika#1272
+skills/bundled/_shared/tests/test_push_with_rebase_retry.sh	unwired	Pins the push/rebase retry loop against local repositories. Offline.	mika#1857
+skills/bundled/_shared/tests/test_rescue_cause_token.sh	unwired	Pins the cause token the WIP rescue stamps on the draft it opens. `make test-rescue-cause-token` exists and names this file; no workflow names the target.	mika#2539
+skills/bundled/_shared/tests/test_rescue_closes_guard.sh	unwired	Pins that a rescue draft never carries a `Closes` line — a rescued WIP must not close the ticket it failed to finish. Offline, local git fixtures.	mika#2157
+skills/bundled/_shared/tests/test_rescue_commit_no_verify.sh	unwired	Pins that the rescue commit does not silently bypass the hooks. Named by `make test-rescue-cause-token`, a target no workflow calls.	mika#1685
+skills/bundled/_shared/tests/test_rescue_fmt_clean.sh	unwired	Pins that the rescue leaves a formatted tree rather than a diff the next flight must clean. Offline.	mika#2348
+skills/bundled/_shared/tests/test_rescue_scratch_not_published.sh	unwired	Pins that .pilot-scratch/ never reaches a published commit — the invariant every dispatch rule about scratch files rests on. Offline.	mika#1282
+skills/bundled/_shared/tests/test_sandbox_git_usable.sh	unwired	git usable inside the pilot sandbox, plus the containment that bounds it. Builds its own worktrees and skips cleanly when bwrap is absent or the root is not a repository.	mika#2141
+skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh	unwired	The pilot's session-log directory is writable from inside the sandbox while the incident-diagnosis surface stays out. Skips cleanly without bwrap, and skips its two /var/log/mika assertions when the host lacks that path.	mika#2165
+skills/bundled/_shared/tests/test_seed_worktree_slash_commands.sh	unwired	Pins the two invariants of worktree command seeding: never overwrite a command the branch tracks, never dirty `git status`. Their breach was the dirty-worktree cause behind mika#1414. Offline.	mika#1415
+skills/bundled/_shared/tests/test_stamp_issue_seat.sh	unwired	Pins the seat stamped on a dispatched issue. Offline; `gh` is faked. Sits in `make test` and in a `make` target no workflow calls.	mika#2155
