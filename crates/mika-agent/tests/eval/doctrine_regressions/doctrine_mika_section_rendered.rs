@@ -298,6 +298,7 @@ fn test_ac1_silent_prompt_carries_the_doctrine_section() {
         deployment: Deployment::Cloud,
         persona_profile: PersonaProfile::Family,
         tenant_language: None,
+        compaction_imminent: None,
     };
 
     let out = prompt::build_silent_prompt(&ctx);

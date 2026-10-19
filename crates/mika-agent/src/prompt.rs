@@ -2749,6 +2749,27 @@ pub struct SilentPromptContext<'a> {
     /// opens in the wrong language is exactly as wrong as a conversational turn,
     /// and the compacted history hands it to the next one.
     pub tenant_language: Option<TenantLanguage>,
+    /// Le compte de messages, quand la fenêtre approche sa condensation
+    /// (mika#1748 vol 1, câblé ici par mika#2805 AC5).
+    ///
+    /// **`Option<usize>` et non `Option<&Ceremony>`, et c'est là que vit le
+    /// refus** (D4 du vol 2) : cette surface rend la cérémonie du vol 1, jamais
+    /// le rituel de relecture. Ce n'est pas un relecteur qui tient cette
+    /// frontière, c'est le compilateur — le bras `Handsoff` n'a pas de
+    /// représentation ici.
+    ///
+    /// Pourquoi les deux moitiés reçoivent des réponses opposées : la cérémonie
+    /// est **répétable** et le dit dans son propre texte, donc la rendre sur un
+    /// tour de callback ne coûte rien et peut servir — une boucle autonome
+    /// longue porte du résidu elle aussi. Le rituel, lui, est un événement
+    /// consommé par un reçu : servi deux fois, c'est une fois de trop, et deux
+    /// sites de consommation seraient deux endroits où l'usage unique peut être
+    /// mangé.
+    ///
+    /// Coût nommé : un agent dont *tous* les tours sont silencieux accumule des
+    /// dépositions non relues au lieu de les lire. Rien n'est perdu — aucun reçu
+    /// n'est posé, et cela se lit entièrement dans un `ls handsoffs/`.
+    pub compaction_imminent: Option<usize>,
 }
 
 /// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets
@@ -2853,6 +2874,15 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
             writeln!(prompt, "- {cat}: {val}").unwrap();
         }
         prompt.push_str("</stopped-topics>\n\n");
+    }
+
+    // Cérémonie de handsoff au plafond de contexte (mika#1748 vol 1, câblée ici
+    // par mika#2805 AC5). La **cérémonie seule** : le rituel de relecture n'a
+    // pas de représentation sur cette surface, et c'est le type du champ qui le
+    // tient (D4). La fonction appelée est celle du vol 1, inchangée — un second
+    // rendu de bloc serait une seconde forme à maintenir.
+    if let Some(message_count) = ctx.compaction_imminent {
+        write_compaction_imminent_section(&mut prompt, message_count);
     }
 
     // Pending commitments
@@ -3595,6 +3625,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
 
@@ -3733,6 +3764,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3766,6 +3798,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3807,6 +3840,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3982,6 +4016,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4014,6 +4049,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4410,6 +4446,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4440,6 +4477,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4470,6 +4508,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4643,6 +4682,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4676,6 +4716,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4753,6 +4794,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4791,6 +4833,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4827,6 +4870,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -6020,6 +6064,87 @@ inject = false
         );
     }
 
+    /// Contexte silencieux des deux tests AC5 — **même graine**, le compte de
+    /// messages seul distingue V8 de son contrôle négatif. C'est ce qui sépare
+    /// « le bloc est rendu au franchissement » de « le bloc est rendu
+    /// inconditionnellement ».
+    fn mika2805_silent_ctx<'a>(
+        identity: &'a Identity,
+        compaction_imminent: Option<usize>,
+    ) -> SilentPromptContext<'a> {
+        SilentPromptContext {
+            soul_content: "",
+            identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+            compaction_imminent,
+        }
+    }
+
+    /// V8 (AC5) — `build_silent_prompt` rend la cérémonie du vol 1. Un tour de
+    /// callback dans une boucle autonome longue porte du résidu lui aussi, et
+    /// la cérémonie se dit répétable dans son propre texte : la rendre ici ne
+    /// coûte rien et peut servir.
+    #[test]
+    fn mika2805_v8_le_prompt_silencieux_rend_la_ceremonie() {
+        let identity = test_identity();
+        let ctx = mika2805_silent_ctx(&identity, Some(43));
+        let prompt = build_silent_prompt(&ctx);
+
+        assert!(
+            prompt.contains("<compaction-imminent messages=\"43\" window=\"50\">"),
+            "la surface silencieuse rend le bloc du vol 1 tel quel : {prompt}"
+        );
+        assert!(prompt.contains("</compaction-imminent>"));
+        // La forme est celle du vol 1 — une seconde forme serait une seconde
+        // forme à maintenir, donc c'est bien `write_compaction_imminent_section`
+        // qui est appelée et non un rendu jumeau.
+        assert!(prompt.contains("testimony, not transmission"));
+        assert!(prompt.contains("primed_from_handsoff"));
+        assert!(prompt.contains("handsoffs/<YYYY-MM-DD-HHMM>-compaction-handsoff.md"));
+    }
+
+    /// V9 — **contrôle négatif AC5** : même graine, `None` ⇒ pas de bloc. Et
+    /// sur les deux graines, le prompt silencieux ne contient **jamais** le
+    /// rituel de relecture : le type du champ l'interdit (D4), cette assertion
+    /// le dit — un type ne se lit pas dans une revue de diff.
+    #[test]
+    fn mika2805_v9_controle_negatif_et_absence_du_rituel() {
+        let identity = test_identity();
+
+        let sous_le_seuil = build_silent_prompt(&mika2805_silent_ctx(&identity, None));
+        assert!(
+            !sous_le_seuil.contains("compaction-imminent"),
+            "aucun bloc sous le seuil : {sous_le_seuil}"
+        );
+        assert!(!sous_le_seuil.contains("Context Ceiling"));
+
+        let au_franchissement = build_silent_prompt(&mika2805_silent_ctx(&identity, Some(43)));
+        for prompt in [&sous_le_seuil, &au_franchissement] {
+            assert!(
+                !prompt.contains("<compaction-handsoff"),
+                "le rituel de relecture n'a pas de représentation ici : {prompt}"
+            );
+            assert!(!prompt.contains("Post-Compaction — Handsoff Review"));
+        }
+    }
+
     // ==================================================================
     // Stop-topic tests (mika#1813)
     //
@@ -6074,6 +6199,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
         assert!(
@@ -6119,6 +6245,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // Check for block-unique prose (silent-mode block description) — the
@@ -6167,6 +6294,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // The literal `<script>` fragment inside the category value must be
@@ -6606,6 +6734,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // AC1 (state): the specific stopped topic Al refused is present.
@@ -6671,6 +6800,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // Both blocks present.
@@ -7086,6 +7216,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Family,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
         assert!(
@@ -7238,6 +7369,7 @@ inject = false
             deployment: Deployment::Cloud,
             persona_profile: PersonaProfile::Family,
             tenant_language: Some(TenantLanguage::French),
+            compaction_imminent: None,
         };
         assert!(
             build_silent_prompt(&ctx)
@@ -7492,6 +7624,7 @@ inject = false
             deployment: Deployment::Cloud,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
 
@@ -7981,6 +8114,7 @@ inject = false
             deployment: Deployment::Cloud,
             persona_profile: persona,
             tenant_language: None,
+            compaction_imminent: None,
         }
     }
 
@@ -8171,6 +8305,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            compaction_imminent: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // Silent mode carries the same ground-truth block as conversation
@@ -8626,6 +8761,7 @@ inject = false
             deployment: Deployment::Cloud,
             persona_profile: persona,
             tenant_language: None,
+            compaction_imminent: None,
         }
     }
 }

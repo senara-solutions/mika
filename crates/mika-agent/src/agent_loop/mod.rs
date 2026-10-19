@@ -6952,6 +6952,11 @@ async fn run_silent_inner(
         // mika#2247 AC2 — a proactive turn opens the exchange, so it is the one
         // that most needs to know which language to open it in (R3b).
         tenant_language: ctx.language,
+        // mika#2805 AC5 — le prédicat est déjà calculé une fois, au seul site
+        // légal (`load_agent_context`) ; il ne manquait que le fil jusqu'ici.
+        // La **cérémonie seule** : le rituel de relecture n'a pas de
+        // représentation sur cette surface, et le type du champ le tient (D4).
+        compaction_imminent: ctx.compaction_imminent,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
