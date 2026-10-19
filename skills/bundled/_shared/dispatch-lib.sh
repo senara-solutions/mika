@@ -8827,9 +8827,13 @@ Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
         return
     fi
     # Tier 1a — canonical first-pass shape
+    # `|| true` on tiers 1a and 1b: no match is a normal path, and grep reports it
+    # with exit 1. Under errexit + pipefail that status kills the caller whenever
+    # the function runs outside a `$(...)` (e.g. as a pipeline element), before
+    # tier 1b or tier 2 is reached.
     result=$(printf '%s' "$text" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
         | grep -oE '(READY|ITERATE|ESCALATE)' \
-        | head -1)
+        | head -1) || true
     if [ -n "$result" ]; then
         echo "$result"
         return
@@ -8838,7 +8842,7 @@ Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
     local verdict_keyword
     verdict_keyword=$(printf '%s' "$text" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
         | grep -oE '(GROOMED|ESCALATE)' \
-        | head -1)
+        | head -1) || true
     case "$verdict_keyword" in
         GROOMED)
             echo "_parse_disposition: tier 1b accepted Verdict: GROOMED → READY (mika#1421 v3 session-carry-over tolerance)" >&2

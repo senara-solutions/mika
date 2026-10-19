@@ -248,17 +248,20 @@ assert_eq "Disposition: ESCALATE on second-pass carry-over → ESCALATE" "ESCALA
 
 # Disposition: ITERATE is NOT mapped — spec §4.5 R11 forbids a third-pass, so
 # ITERATE at second-pass falls through to Tier 2 fuzzy. On the fixture below
-# the fuzzy tier catches "human review" and returns ESCALATE.
-result=$(printf 'Findings require another iteration but need human review.\n\nDisposition: ITERATE' | _parse_verdict 2>/dev/null)
+# the fuzzy tier catches "human review needed" (the literal _parse_verdict_fuzzy
+# pattern) and returns ESCALATE.
+result=$(printf 'Findings require another iteration; human review needed.\n\nDisposition: ITERATE' | _parse_verdict 2>/dev/null)
 assert_eq "Disposition: ITERATE does not map to GROOMED — falls through" "ESCALATE" "$result"
 
 # Tier 1a (Verdict: GROOMED) still wins when both keywords are present
 result=$(printf 'Disposition: READY\n\nVerdict: ESCALATE' | _parse_verdict 2>/dev/null)
 assert_eq "tier 1a wins over tier 1b when both Verdict: and Disposition: present" "ESCALATE" "$result"
 
-# Bare "READY" alone (no Disposition: prefix) does NOT trigger tier 1b
+# Bare "READY" alone (no Disposition: prefix) does NOT trigger tier 1b. The
+# fixture matches no tier-2 pattern either, so the result is empty — GROOMED
+# here would be exactly the tier-1b mapping this case rules out.
 result=$(printf 'The plan appears READY overall.' | _parse_verdict 2>/dev/null)
-assert_eq "bare READY (no Disposition: prefix) does not trigger tier 1b" "GROOMED" "$result"
+assert_eq "bare READY (no Disposition: prefix) does not trigger tier 1b" "" "$result"
 
 # ============================================================================
 # _parse_verdict — tier 2 (fuzzy)
