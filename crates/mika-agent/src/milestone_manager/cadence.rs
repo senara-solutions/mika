@@ -25,6 +25,7 @@ use super::{
     evaluator::{
         FinishedFlight, FlightSource, FlightVerdict, evaluate_flights, milestone_issue_urls,
     },
+    pool_writer::{admit_pool_tickets, pool_write_is_armed},
     reader::{GhRunner, ProcessGhRunner, Reader},
     reporter::Reporter,
     types::{Assessment, CycleOutcome, MilestoneRef, MilestoneState, Severity},
@@ -725,6 +726,74 @@ async fn post_flight_verdicts(
     .await
 }
 
+/// Le second geste d'écriture du cycle (mika#2699 vol 4) — et le seul endroit
+/// du cycle qui consulte `MIKA_MANAGER_POOL_WRITE`.
+///
+/// Trois refus précèdent le geste, et chacun se **dit**. Sans eux, « le cycle
+/// n'a rien écrit » et « le cycle n'avait rien à écrire » rendraient les mêmes
+/// octets (classe mika#2205). La branche à zéro admission est de loin la plus
+/// fréquente — hors famine le bassin n'admet personne — et c'est précisément
+/// elle qui atteste que le geste est câblé et vivant ; son absence des journaux
+/// signifie un binaire antérieur à ce vol (classe mika#2340), jamais un bassin
+/// calme.
+///
+/// L'ordre des trois refus est une décision : le verdict d'abord, l'admission
+/// ensuite, l'exécutant en dernier. Interroger `gh_runner` en premier ferait
+/// crier `no_runner` à chaque cycle d'un conteneur sans exécutant, y compris
+/// quand il n'y avait rien à poser ; dans cet ordre, `no_runner` ne se dit que
+/// lorsqu'une décision existait et que rien ne pouvait la porter.
+///
+/// Le titre du milestone vient de l'**état lu**, jamais de `cfg.target` :
+/// `--milestone` résout par titre et [`MilestoneRef`] ne porte qu'un numéro.
+///
+/// Rend les numéros effectivement posés. Aucun champ de checkpoint ne les
+/// retient, et c'est une propriété plutôt qu'un oubli : un label posé est lu
+/// par le filtre de candidats de [`super::pool`], donc le cycle suivant ne
+/// propose plus le ticket. L'idempotence est structurelle là où celle du vol 2
+/// de mika#2698 devait être portée par `posted_flight_task_ids`.
+async fn write_pool_admissions(
+    cfg: &ManagerConfig,
+    ctx: &CycleContext<'_>,
+    state: &MilestoneState,
+    assessment: &Assessment,
+) -> Vec<u64> {
+    let Some(verdict) = assessment.pool.as_ref() else {
+        info!(
+            target: "mika::milestone_manager",
+            event = "manager_pool_not_admitted",
+            reason = "no_pool_verdict",
+        );
+        return Vec::new();
+    };
+    if verdict.admit.is_empty() {
+        info!(
+            target: "mika::milestone_manager",
+            event = "manager_pool_not_admitted",
+            reason = "no_admission",
+            candidates = 0,
+            band = ?verdict.band,
+        );
+        return Vec::new();
+    }
+    let Some(runner) = ctx.gh_runner else {
+        info!(
+            target: "mika::milestone_manager",
+            event = "manager_pool_not_admitted",
+            reason = "no_runner",
+            candidates = verdict.admit.len(),
+        );
+        return Vec::new();
+    };
+    admit_pool_tickets(
+        pool_write_is_armed(),
+        runner,
+        &cfg.target.repo,
+        &state.title,
+        &verdict.admit,
+    )
+    .await
+}
+
 /// La liste des vols postés que le prochain checkpoint portera : l'ancienne,
 /// plus les nouveaux, bornée aux plus récents.
 fn merge_posted(previous: &[String], newly: &[String]) -> Vec<String> {
@@ -784,6 +853,13 @@ pub async fn run_manager_cycle_in(
     assessment.flight_verdicts = flight_verdicts;
     let newly_posted =
         post_flight_verdicts(cfg, ctx, &assessment.flight_verdicts, checkpoint.as_ref()).await;
+    // mika#2699 vol 4 — le geste du bassin. Le verdict qu'il consulte est déjà
+    // sur l'assessment : `Assessor::assess` le pose, la cadence ne le calcule
+    // pas. Ce que l'appel rend — les numéros effectivement posés — n'a pas
+    // encore de destination : le rapport ne les nommera qu'au vol 5, et aucun
+    // champ de checkpoint n'en a besoin. Lié plutôt que jeté pour que ce vol-là
+    // soit l'ajout d'une ligne et non une reprise du site.
+    let _admitted = write_pool_admissions(cfg, ctx, &state, &assessment).await;
     let severity = assessment.severity.clone();
     let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
 
@@ -1071,6 +1147,7 @@ pub async fn run_manager_cycle_with_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::milestone_manager::pool_writer::ENV_POOL_WRITE;
     use crate::milestone_manager::types::{
         CiState, IssueState, MilestoneRef, ProgressCounts, RecentActivity, SubIssue,
     };
@@ -2529,5 +2606,213 @@ mod tests {
         .unwrap();
 
         assert!(lire_checkpoint(&cfg).posted_flight_task_ids.is_empty());
+    }
+
+    // -- mika#2699 vol 4 : le geste du bassin, câblé au cycle ----------------
+
+    /// Arme l'interrupteur du bassin pour la durée du test, et le désarme à la
+    /// sortie **même en cas de panique**, pour la raison d'[`InterrupteurArme`].
+    ///
+    /// Un second garde plutôt qu'un paramètre au premier : les deux
+    /// interrupteurs sont indépendants, et un garde qui poserait les deux
+    /// rendrait intestable le cas — celui de tous les tests ci-dessous — où
+    /// l'évaluation est fermée et le bassin ouvert.
+    struct BassinArme;
+
+    impl BassinArme {
+        fn poser() -> Self {
+            // SAFETY: single-threaded via serial_test.
+            unsafe { std::env::set_var(ENV_POOL_WRITE, "1") };
+            Self
+        }
+    }
+
+    impl Drop for BassinArme {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded via serial_test.
+            unsafe { std::env::remove_var(ENV_POOL_WRITE) };
+        }
+    }
+
+    /// Le verdict du bassin que le cycle a livré dans son rapport.
+    ///
+    /// Les tests ci-dessous le lisent pour prouver que leur assertion sur `gh`
+    /// porte sur la bonne cause : « aucun appel » ne vaut rien si le cycle
+    /// n'avait de toute façon personne à admettre.
+    fn verdict_du_bassin(rec: &RecordingDeliverer) -> crate::milestone_manager::pool::PoolVerdict {
+        let calls = rec.calls.lock().unwrap();
+        calls
+            .last()
+            .expect("le cycle a livré un rapport")
+            .2
+            .assessment
+            .pool
+            .clone()
+            .expect("l'assesseur pose toujours le verdict du bassin")
+    }
+
+    /// **AC1 au niveau du cycle.** L'exécutant est câblé, le verdict admet un
+    /// ticket, et l'interrupteur du bassin est à son état par défaut : aucun
+    /// appel `gh`.
+    ///
+    /// L'assertion sur le verdict est la moitié qui compte : sans elle, ce test
+    /// resterait vert le jour où `base_state()` cesse d'être en famine, et il
+    /// certifierait l'absence d'écriture d'un cycle qui n'avait rien à écrire.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2699_interrupteur_off_le_cycle_nadmet_personne() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let gh = RecordingGh::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+
+        run_manager_cycle_in(
+            &cfg,
+            base_state(),
+            &CycleContext::new(&rec, now).with_gh_runner(Some(&gh)),
+        )
+        .await
+        .unwrap();
+
+        let verdict = verdict_du_bassin(&rec);
+        assert_eq!(
+            verdict.admit.iter().map(|a| a.number).collect::<Vec<_>>(),
+            vec![1802],
+            "le cycle avait bien une décision en main : {verdict:?}"
+        );
+        assert!(
+            gh.appels.lock().unwrap().is_empty(),
+            "AC1 : aucune écriture gh avec `MIKA_MANAGER_POOL_WRITE` fermé, vu : {:?}",
+            gh.appels.lock().unwrap()
+        );
+    }
+
+    /// Le **contrôle négatif** de l'AC1 et la première moitié de l'AC3, au
+    /// niveau du cycle : armé, le même cycle émet **exactement un** appel, et
+    /// c'est le geste groupé — le label et le milestone dans la même mutation.
+    ///
+    /// Sans ce test, « zéro appel » ci-dessus serait aussi satisfait par un
+    /// câblage absent (classe mika#2205) : le geste existe depuis le commit
+    /// précédent, mais rien ne prouvait que le cycle l'atteignait.
+    ///
+    /// Le titre asserté est `"LC"`, celui de l'**état lu** — pas le numéro de
+    /// `cfg.target`. C'est ce qui rougirait si quelqu'un rebranchait l'argument
+    /// sur `MilestoneRef`, que `--milestone` ne sait pas résoudre.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2699_interrupteur_on_le_cycle_admet_en_un_seul_geste_groupe() {
+        let _bassin = BassinArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let gh = RecordingGh::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+
+        run_manager_cycle_in(
+            &cfg,
+            base_state(),
+            &CycleContext::new(&rec, now).with_gh_runner(Some(&gh)),
+        )
+        .await
+        .unwrap();
+
+        let appels = gh.appels.lock().unwrap().clone();
+        assert_eq!(
+            appels.len(),
+            1,
+            "une seule mutation pour une décision : {appels:?}"
+        );
+        assert_eq!(
+            appels[0],
+            vec![
+                "issue",
+                "edit",
+                "1802",
+                "--repo",
+                "senara-solutions/mika",
+                "--add-label",
+                "ready",
+                "--milestone",
+                "LC",
+            ],
+            "le geste groupé, et le milestone résolu par titre"
+        );
+    }
+
+    /// Armé, un candidat **refusé** n'est pas écrit : le geste suit la décision
+    /// du bassin, pas l'interrupteur.
+    ///
+    /// La famine est la même qu'au test précédent — seul `plan_present` change.
+    /// C'est le chemin par lequel les deux motifs de refus des vols 2 et 3
+    /// protègent le dépôt une fois l'interrupteur ouvert, et le seul test qui le
+    /// montre de bout en bout.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2699_arme_un_candidat_refuse_nest_pas_ecrit() {
+        let _bassin = BassinArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let gh = RecordingGh::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(
+            &cfg,
+            state,
+            &CycleContext::new(&rec, now).with_gh_runner(Some(&gh)),
+        )
+        .await
+        .unwrap();
+
+        let verdict = verdict_du_bassin(&rec);
+        assert!(
+            verdict.admit.is_empty(),
+            "rien à admettre : {:?}",
+            verdict.admit
+        );
+        assert_eq!(
+            verdict
+                .refusals
+                .iter()
+                .map(|r| r.number)
+                .collect::<Vec<_>>(),
+            vec![1802],
+            "et le refus est nommé, pas silencieux : {verdict:?}"
+        );
+        assert!(
+            gh.appels.lock().unwrap().is_empty(),
+            "l'interrupteur ouvert n'écrit pas un ticket refusé, vu : {:?}",
+            gh.appels.lock().unwrap()
+        );
+    }
+
+    /// Armé mais sans exécutant câblé, rien n'est écrit — et le cycle ne casse
+    /// pas pour autant. C'est l'état de tout conteneur qui n'a pas de `gh`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2699_arme_sans_executeur_le_cycle_aboutit_quand_meme() {
+        let _bassin = BassinArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+
+        let outcome = run_manager_cycle_in(&cfg, base_state(), &CycleContext::new(&rec, now))
+            .await
+            .unwrap();
+
+        assert!(outcome.delivered, "le premier cycle livre toujours");
+        assert_eq!(
+            verdict_du_bassin(&rec)
+                .admit
+                .iter()
+                .map(|a| a.number)
+                .collect::<Vec<_>>(),
+            vec![1802],
+            "la décision est prise et dite, seule l'écriture manque d'exécutant"
+        );
     }
 }

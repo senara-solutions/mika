@@ -59,29 +59,38 @@ const FORBIDDEN_TOKENS: &[&str] = &[
 /// Files exempt from the grep — this test file itself contains the tokens as literals.
 const EXEMPT_FILES: &[&str] = &["no_dispatch_test.rs"];
 
-/// Exceptions **nommées**, par `(fichier, jeton, raison)`. Le vol 2 de
-/// mika#2698 y a inscrit **exactement une** ligne, et c'est la seule que ce
-/// module aura jamais tant que le ticket décrit un seul geste.
+/// Exceptions **nommées**, par `(fichier, jeton, raison)`. Deux lignes : le vol 2
+/// de mika#2698 a inscrit la première, le vol 4 de mika#2699 la seconde. Une par
+/// geste d'écriture que la Phase 2 du manager a reçu par un ticket, et aucune
+/// autre — un troisième geste est un troisième ticket, avec son propre seuil
+/// d'ouverture.
 ///
 /// Une exception par *fichier et par jeton*, jamais par fichier seul : exempter
 /// un fichier entier rendrait ses autres jetons invisibles, ce qui est
 /// précisément la façon dont un garde structurel meurt sans bruit. La propriété
 /// est tenue par `mika2698_une_exception_ne_couvre_quun_seul_jeton_du_fichier`
 /// — `verdict_poster.rs` reste donc interdit sur `gh pr merge`, `gh issue edit`
-/// et les dix-neuf autres.
+/// et les dix-neuf autres, et `pool_writer.rs` l'est sur `gh issue comment`.
 ///
-/// **Ce que l'exception coûte, et ce qui le paie.** Le grep ne protège plus ce
-/// couple, donc l'AC1 ne repose plus sur lui seul. Trois choses le portent
-/// ensemble : l'épinglage ci-dessous (au fichier et au jeton près), la table de
-/// vérité de l'interrupteur, et le test de comportement `armed == false` ⇒ zéro
-/// appel — avec son contrôle négatif `armed == true` ⇒ exactement un appel, sans
-/// lequel « zéro appel » serait aussi satisfait par un posteur mort. Tous dans
-/// `verdict_poster.rs`.
-const EXEMPTED_OCCURRENCES: &[(&str, &str, &str)] = &[(
-    "verdict_poster.rs",
-    "gh issue comment",
-    "mika#2698 vol 2 — le seul geste d'écriture autorisé, derrière MIKA_MANAGER_EVALUATE_WRITE",
-)];
+/// **Ce que chaque exception coûte, et ce qui le paie.** Le grep ne protège plus
+/// le couple nommé, donc l'AC1 du ticket concerné ne repose plus sur lui seul.
+/// Trois choses le portent ensemble, **dans le fichier exempté** : l'épinglage
+/// ci-dessous (au fichier et au jeton près), la table de vérité de
+/// l'interrupteur, et le test de comportement `armed == false` ⇒ zéro appel —
+/// avec son contrôle négatif `armed == true` ⇒ exactement un appel, sans lequel
+/// « zéro appel » serait aussi satisfait par un poseur mort.
+const EXEMPTED_OCCURRENCES: &[(&str, &str, &str)] = &[
+    (
+        "verdict_poster.rs",
+        "gh issue comment",
+        "mika#2698 vol 2 — le seul geste d'écriture autorisé, derrière MIKA_MANAGER_EVALUATE_WRITE",
+    ),
+    (
+        "pool_writer.rs",
+        "gh issue edit",
+        "mika#2699 vol 4 — pose `ready` + rattache au milestone cible en un geste groupé, derrière MIKA_MANAGER_POOL_WRITE",
+    ),
+];
 
 #[test]
 fn no_dispatch_scaffolding_in_milestone_manager() {
@@ -117,41 +126,91 @@ fn no_dispatch_scaffolding_in_milestone_manager() {
     }
 }
 
-/// mika#2698 vol 2 — l'allowlist porte **une** exception, et pas une de plus.
+/// mika#2699 vol 4 — l'allowlist porte **les deux** gestes, et pas un de plus.
 ///
-/// Ce test n'est pas une tautologie : il est le **prix** du geste d'écriture.
-/// Le ticket autorise exactement un geste derrière
-/// `MIKA_MANAGER_EVALUATE_WRITE`, et c'est ici qu'il se déclare — avec son
-/// fichier, son jeton et sa raison. Le vol 1 exigeait que cette assertion
-/// change « EN MÊME TEMPS que la branche ON de `MIKA_MANAGER_EVALUATE_WRITE` et
-/// que le docstring du module » : elle l'a fait, dans le commit qui a créé
-/// `verdict_poster.rs`.
+/// Ce test n'est pas une tautologie : il est le **prix** des gestes d'écriture.
+/// Chacun des deux tickets autorise exactement un geste derrière son propre
+/// interrupteur, et c'est ici qu'ils se déclarent — avec leur fichier, leur
+/// jeton et leur raison. Le vol 1 de mika#2698 exigeait que cette assertion
+/// change « EN MÊME TEMPS que la branche ON de l'interrupteur et que le
+/// docstring du module » : elle l'a fait deux fois, dans le commit qui a créé
+/// `verdict_poster.rs` puis dans celui qui a créé `pool_writer.rs`.
 ///
-/// Ce qui rougit maintenant : une deuxième entrée, un autre fichier, ou un
-/// autre jeton. Aucun des trois ne se justifie par ce ticket — un deuxième
-/// geste d'écriture est un autre ticket, avec son propre seuil d'ouverture.
+/// Ce qui rougit : une troisième entrée, un autre fichier, un autre jeton. Aucun
+/// des trois ne se justifie par ces deux tickets — un geste d'écriture de plus
+/// est un ticket de plus, avec son propre seuil d'ouverture.
+///
+/// **Et ce qui rougit aussi, le jour où une exception devient inutile.** La
+/// dernière boucle vérifie que chaque couple exempté existe *encore* : le
+/// fichier est là, et sa source hors commentaires contient *vraiment* le jeton.
+/// Une exception qu'un refactor a vidée de son geste cesserait autrement d'être
+/// une décision pour devenir un trou permanent dans le grep, sans que rien ne le
+/// dise (motif mika#2309 : une dérogation doit expirer par le geste même qui la
+/// rend inutile). Le scan est fait sur la source **privée de commentaires**,
+/// parce qu'une prose qui cite le jeton n'est pas un geste (mika#2050, signal S).
 #[test]
-fn mika2698_lallowlist_ne_porte_que_le_geste_du_vol_2() {
+fn mika2699_lallowlist_porte_les_deux_gestes_et_pas_un_de_plus() {
     assert_eq!(
         EXEMPTED_OCCURRENCES.len(),
-        1,
-        "mika#2698 n'autorise qu'un seul geste d'écriture : l'allowlist doit porter exactement \
-         une entrée. Une écriture de plus est un autre ticket, avec son propre seuil \
-         d'ouverture : {EXEMPTED_OCCURRENCES:?}"
+        2,
+        "la Phase 2 du manager n'a reçu que deux gestes d'écriture : l'allowlist doit porter \
+         exactement deux entrées. Une écriture de plus est un autre ticket, avec son propre \
+         seuil d'ouverture : {EXEMPTED_OCCURRENCES:?}"
     );
+
     let (fichier, jeton, raison) = EXEMPTED_OCCURRENCES[0];
     assert_eq!(
         fichier, "verdict_poster.rs",
-        "l'exception nomme le fichier qui porte la branche ON de l'interrupteur, et lui seul"
+        "la première exception nomme le fichier qui porte la branche ON de l'interrupteur \
+         d'évaluation, et lui seul"
     );
     assert_eq!(
         jeton, "gh issue comment",
-        "le seul jeton que le ticket autorise — ni `gh issue edit`, ni `gh pr comment`"
+        "le seul jeton que mika#2698 autorise — ni `gh issue edit`, ni `gh pr comment`"
     );
     assert!(
         raison.contains("mika#2698") && raison.contains("MIKA_MANAGER_EVALUATE_WRITE"),
         "la raison doit nommer le ticket et l'interrupteur : {raison}"
     );
+
+    let (fichier, jeton, raison) = EXEMPTED_OCCURRENCES[1];
+    assert_eq!(
+        fichier, "pool_writer.rs",
+        "la seconde exception nomme le fichier qui porte la branche ON de l'interrupteur du \
+         bassin, et lui seul"
+    );
+    assert_eq!(
+        jeton, "gh issue edit",
+        "le seul jeton que mika#2699 autorise — le geste groupé, ni `gh api -X PATCH`, ni \
+         `gh issue comment`"
+    );
+    assert!(
+        raison.contains("mika#2699") && raison.contains("MIKA_MANAGER_POOL_WRITE"),
+        "la raison doit nommer le ticket et l'interrupteur : {raison}"
+    );
+
+    // Auto-nettoyage : une exception dont le geste a disparu doit rougir.
+    let module_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("milestone_manager");
+    for (fichier, jeton, _) in EXEMPTED_OCCURRENCES {
+        let chemin = module_dir.join(fichier);
+        let source = fs::read_to_string(&chemin).unwrap_or_else(|e| {
+            panic!(
+                "l'exception nomme {fichier}, que ce module ne porte pas (ou plus) : {e}. \
+                 Une dérogation sans site est un trou permanent dans le grep — retirez-la."
+            )
+        });
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source.as_str(), |(avant, _)| avant);
+        assert!(
+            strip_line_comments(production).contains(jeton),
+            "l'exception `({fichier}, {jeton})` ne couvre plus aucun geste : la production de \
+             {fichier} ne contient pas `{jeton}` hors commentaires. Le geste a été retiré ou \
+             réécrit — retirez l'exception dans le même commit (motif mika#2309)."
+        );
+    }
 }
 
 /// Le contrôle négatif du garde : sur une source **fautive**, le scan rougit.
