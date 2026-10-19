@@ -14,6 +14,7 @@ pub mod calibration;
 pub mod canonical_tokens;
 pub(crate) mod check_link;
 pub mod compaction;
+pub mod compaction_handsoff;
 pub mod config_keys;
 pub mod db;
 pub mod evidence;
