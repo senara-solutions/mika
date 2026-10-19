@@ -239,14 +239,24 @@ fn max_redrives() -> i64 {
 /// distribution instead of from this paragraph.
 /// The label the promotion gate applies when it refuses (mika#2123).
 ///
-/// **Not `operator-review`, and that is a measured constraint, not a style
-/// choice.** `operator-review` does not exist: it is absent from
-/// `gh label list` and undeclared in `.github/labels.yml` — verified
-/// 2026-09-01, alongside the control that `ready` (`labels.yml:102`) and
-/// `operator-gated` (`:106`) *are* declared, so the file is the source of
-/// truth. `blocked`, the module's other exclusion label, is equally absent.
+/// **Not `operator-review`, and that was a measured constraint, not a style
+/// choice.** On 2026-09-01, when this gate was written, `operator-review` did
+/// not exist: absent from `gh label list`, undeclared in `.github/labels.yml` —
+/// verified alongside the control that `ready` and `operator-gated` *were*
+/// declared, so the file was the source of truth and not the instrument lying.
+/// `blocked`, the module's other exclusion label, was equally absent.
 ///
-/// The consequence is in production, 48 times in `server.log`:
+/// **Both have been declared since** — `46eeef98` (PR #2128, the same day) added
+/// them. So the sentence above is history, not today's registry: do not read it
+/// as a reason `operator-review` is unusable *now*. What makes the choice of
+/// `operator-gated` still right is the paragraph below on its description, not
+/// the absence. And what keeps all three names declared is no longer a
+/// verification someone remembers to redo, but
+/// [`tests::test_exclusion_labels_are_declared_in_labels_yml`] (mika#2790),
+/// which reads the registry on every build.
+///
+/// The consequence, when the name was undeclared, is in production 48 times in
+/// `server.log`:
 ///
 /// ```text
 /// gh issue edit --add-label failed for #2117:
@@ -273,7 +283,7 @@ fn max_redrives() -> i64 {
 ///    own refusals would first have to re-evaluate tickets its own exclusion
 ///    forbids it to look at.
 /// 2. **The machine cannot tell its label from the operator's.** The declared
-///    description (`.github/labels.yml:106`) is *"Groomed work requiring
+///    description (`.github/labels.yml`) is *"Groomed work requiring
 ///    operator-host-time. Distinct from parked/blocked. No ready label."* — a
 ///    legitimate operator gesture. A gate that removed it would silently un-gate
 ///    work a human gated: exactly the fault mika#2140 fixes, a reader assuming
