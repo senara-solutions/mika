@@ -5538,6 +5538,13 @@ async fn run_agent_inner(
         }
         None => {}
     }
+    // mika#2805 commit 2/6 — le champ porte un enum à deux bras depuis ce
+    // commit ; le site de `compaction_handsoff::resolve` arrive au commit 4.
+    // D'ici là le bras du vol 1 est composé ici, pour que le comportement de
+    // mika#1748 reste intact à chaque commit de la chaîne.
+    let ceremony = ctx
+        .compaction_imminent
+        .map(|message_count| crate::compaction_handsoff::Ceremony::Imminent { message_count });
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -5573,7 +5580,7 @@ async fn run_agent_inner(
         // ci-dessous : `build_compact_system_prompt` ignore le champ (D6), et
         // c'est une propriété de ce builder-là, pas de ce littéral — un test
         // (`mika1748_le_builder_compact_ne_rend_pas_le_bloc`) la tient.
-        compaction_imminent: ctx.compaction_imminent,
+        compaction_imminent: ceremony.as_ref(),
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
