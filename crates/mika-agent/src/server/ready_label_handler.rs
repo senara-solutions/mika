@@ -538,22 +538,121 @@ pub(crate) fn route_for(
         // preuve manquante** ; routé `implement`, il part se faire refuser
         // `dispatch_grooming_not_verified` à l'étape 9d, sans aucune issue.
         //
-        // Ce n'est PAS une garantie de convergence, et la nuance est la limite
-        // nommée en D4 : si le plan résout encore sur la branche de dispatch,
-        // le dev-groom répond `already_groomed` (mika#2012) et ne frappe
-        // **aucune** preuve — le ticket repassera au tour suivant. Cette
-        // population-là est bornée ailleurs, par le budget de re-drive de
-        // mika#2020, au même endroit qu'avant ce ticket. Ce que le routage
-        // achète est le cas où le plan n'est plus sur la branche : là le groom
-        // converge et frappe la preuve, là où l'ancien chemin ne le pouvait
-        // jamais. Coût assumé du changement : la tentative consomme désormais
-        // un subprocess et le slot `groom`, là où l'étape 9d la refusait à bon
-        // marché.
+        // La population est désormais FERMÉE (mika#2811). La limite que
+        // mika#2484 nommait ici — si le plan résout encore sur la branche de
+        // dispatch, le dev-groom s'auto-skippe (mika#2012) et ne frappe
+        // **aucune** preuve, donc le ticket repasse au tour suivant — était la
+        // boucle du § 1.1 de mika#2811 : cinq tâches de deux minutes sur
+        // #1381 et #1959, jusqu'à épuisement du budget de re-drive. Elle est
+        // close par [`groom_cause_for`] : la provenance du refus part dans
+        // l'entrée de dispatch et désarme cet auto-skip, pour ce dispatch-là
+        // seulement. Le budget de mika#2020 ne borne plus que l'échec de
+        // **convergence** (architecte ESCALATE), qui est un travail réel avec
+        // findings préservés, pas un skip qui ne produit rien. Coût assumé du
+        // changement : la tentative consomme un subprocess et le slot `groom`,
+        // là où l'étape 9d la refusait à bon marché.
         | GroomedState::MarkersWithoutProof
         // Preuve illisible : au routage, la direction sûre est le travail le
         // moins dangereux, pas le plus avancé (R4).
         | GroomedState::ProofUnreadable(_) => ("run_claude_pilot_groom", "dev-groom", "groom"),
     }
+}
+
+/// La cause transmise au groom quand le routage y envoie faute de preuve
+/// (mika#2811). Valeur de fil : lue par `dispatch-lib.sh` pour sa ligne de
+/// journal, jamais par le Rust.
+pub(crate) const GROOM_CAUSE_MARKERS_WITHOUT_PROOF: &str = "markers_without_proof";
+
+/// La seconde cause, délibérément distincte de sa voisine (mika#2811 § 2.4).
+///
+/// Même direction, autre nom : « la base n'a pas répondu » et « la base a
+/// répondu qu'il n'y a pas de preuve » sont deux populations de signes opposés,
+/// déjà séparées côté audit par [`READY_LABEL_MARKERS_WITHOUT_PROOF_TOOL`] et
+/// [`READY_LABEL_GROOM_PROOF_UNREADABLE_TOOL`]. Les fondre en un booléen
+/// rendrait la ligne de journal du gate incomptable et ferait lire une panne de
+/// base comme la population nominale du ticket (classe mika#2205).
+pub(crate) const GROOM_CAUSE_PROOF_UNREADABLE: &str = "proof_unreadable";
+
+/// Pourquoi ce groom a-t-il été demandé — `None` quand la question ne se pose
+/// pas (mika#2811).
+///
+/// Le shell ne décide que sur la **présence** ; il n'a aucune disposition par
+/// valeur. La valeur ne sert qu'à sa ligne de journal, et c'est le **nom du
+/// champ** — pas ces valeurs — que le scan de parité de `canonical_tokens`
+/// tient en phase entre les deux moitiés.
+///
+/// # `match` exhaustif, aucun bras `_ =>`
+///
+/// Même contrat que [`route_for`], et le même scan le tient : un cinquième
+/// [`crate::skills::executor::GroomedState`] doit faire rougir le compilateur
+/// ici, pas hériter en silence d'un `None` qui laisserait la porte de mika#2012
+/// armée sur une cause neuve.
+pub(crate) fn groom_cause_for(
+    state: &crate::skills::executor::GroomedState,
+) -> Option<&'static str> {
+    use crate::skills::executor::GroomedState;
+    match state {
+        // Le routage va en `implement` : la porte du groom n'est jamais
+        // atteinte, donc il n'y a rien à désarmer.
+        GroomedState::Groomed => None,
+        // **Délibérément `None`.** Un premier grooming n'a aucun plan sur la
+        // branche, donc la porte de mika#2012 ne tire pas, et la désarmer là
+        // n'achèterait rien tout en élargissant la population du forçage à tout
+        // le nominal. Le forçage ne couvre que les deux états que mika#2484 a
+        // ajoutés.
+        GroomedState::MarkersMissing(_) => None,
+        // La population mesurée du § 1.1 de mika#2811.
+        GroomedState::MarkersWithoutProof => Some(GROOM_CAUSE_MARKERS_WITHOUT_PROOF),
+        // Même direction, autre nom (§ 2.4). Régime attendu **vide** : une
+        // occurrence non nulle est une panne de base, pas un succès du
+        // correctif.
+        GroomedState::ProofUnreadable(_) => Some(GROOM_CAUSE_PROOF_UNREADABLE),
+    }
+}
+
+/// L'entrée de dispatch que le LLM aurait fournie, plus la provenance que lui
+/// ne peut pas connaître (mika#2811).
+///
+/// Extraite du corps du handler pour la même raison que [`route_for`] : le JSON
+/// était construit en ligne au milieu de ≈ 1100 lignes, donc intestable.
+///
+/// `prompt` est la référence **nue** `<repo>#<num>` (PAS qualifiée par
+/// l'owner) — le parseur de worktree-setup de `dispatch-lib` n'accepte que la
+/// forme nue que documentent les schémas d'outils ; un prompt qualifié route
+/// silencieusement le dispatch en mode texte libre sans worktree (mika#1593).
+/// `task_id` est le parent pré-créé.
+///
+/// # Sans cause, la clé est ABSENTE — jamais `""`, jamais `null`
+///
+/// Absent n'est pas zéro (mika#2331), et ici la distinction est load-bearing
+/// deux fois. Le `jq -r '… // empty'` du shell rendrait la même chaîne vide
+/// dans les deux cas, mais cette entrée est **persistée** par
+/// `build_callback_task` et relue par un opérateur en forensique : une clé
+/// présente et vide y dirait « le moteur a considéré le forçage et l'a
+/// refusé », ce qui est faux pour un dispatch `implement`.
+fn dispatch_input_for(
+    target_skill: &str,
+    repo_name: &str,
+    number: u64,
+    task_id: &str,
+    groom_cause: Option<&str>,
+) -> serde_json::Value {
+    let mut input = serde_json::json!({
+        "skill": target_skill,
+        "prompt": format!("{repo_name}#{number}"),
+        "task_id": task_id,
+    });
+
+    if let Some(cause) = groom_cause
+        && let Some(map) = input.as_object_mut()
+    {
+        map.insert(
+            crate::skills::executor::INTERNAL_GROOM_CAUSE_FIELD.to_string(),
+            serde_json::json!(cause),
+        );
+    }
+
+    input
 }
 
 /// La ligne que le routage doit écrire pour cet état, ou `None` quand il doit
@@ -1497,17 +1596,15 @@ where
         }
     };
 
-    // 9c. The dispatch input the LLM would have provided. `prompt` is the bare
-    //     `<repo>#<num>` reference (NOT owner-qualified) — dispatch-lib's
-    //     worktree-setup parser only accepts the bare form the tool schemas
-    //     document; an owner-qualified prompt silently routes the dispatch into
-    //     no-worktree free-text mode (mika#1593). `task_id` is the pre-created
-    //     parent.
-    let dispatch_input = serde_json::json!({
-        "skill": target_skill,
-        "prompt": format!("{}#{}", location.repo_name(), location.number),
-        "task_id": task_id,
-    });
+    // 9c. The dispatch input the LLM would have provided, plus the provenance
+    //     it could not know (mika#2811).
+    let dispatch_input = dispatch_input_for(
+        target_skill,
+        &location.repo_name(),
+        location.number,
+        &task_id,
+        groom_cause_for(&groomed_state),
+    );
 
     // 9d. Re-use the existing dispatch-readiness gate (slot availability,
     //     grooming markers, blockedBy). `originating_message = text` (the raw
@@ -3356,7 +3453,11 @@ mod tests {
                 None => src,
             };
             let bodies = crate::source_scan::fn_bodies(production);
-            for f in ["route_for", "routing_note"] {
+            // mika#2811 — `groom_cause_for` est la troisième sœur, et c'est
+            // celle dont un `_ =>` serait le plus coûteux : un cinquième état
+            // y hériterait d'un `None`, donc d'une porte mika#2012 restée
+            // armée sur une cause neuve, en silence.
+            for f in ["route_for", "routing_note", "groom_cause_for"] {
                 let (_, body) = bodies
                     .iter()
                     .find(|(name, _)| name == f)
@@ -3368,6 +3469,189 @@ mod tests {
                      RÉSOLUTION : énumérer le nouvel état, jamais l'absorber."
                 );
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2811 — un refus faute de preuve en base désarme l'auto-skip du
+    // groom, et seulement lui.
+    //
+    // # Rouge-avant
+    //
+    // Recette d'injection : rendre `None` pour `MarkersWithoutProof` dans
+    // `groom_cause_for` — le test 1 rougit, les deux contrôles négatifs
+    // restent verts. Insérer la clé inconditionnellement dans
+    // `dispatch_input_for` (avec `""` pour l'absence de cause) — le test 5
+    // rougit, et c'est exactement ce qui distingue « absent » de « vide »
+    // (mika#2331). Déclarer le champ dans le `tools.json` de dev-groom — le
+    // test 7 rougit, et aucun autre : c'est la classe qu'aucune assertion
+    // comportementale ne peut voir.
+    // ---------------------------------------------------------------------
+
+    mod mika2811 {
+        use super::*;
+        use crate::skills::executor::GroomedState;
+        use crate::skills::executor::INTERNAL_GROOM_CAUSE_FIELD;
+
+        const REPO: &str = "mika";
+        const ISSUE: u64 = 2811;
+        const TASK: &str = "15383984-a3e7-41bf-ac6f-630ba9a89d63";
+
+        /// **Test 1 — des callouts sans preuve forcent la passe de groom.**
+        ///
+        /// La population mesurée du § 1.1 : #1381 et #1959, trois callouts dans
+        /// le corps, aucune preuve en base.
+        #[test]
+        fn mika2811_des_callouts_sans_preuve_forcent_la_passe_de_groom() {
+            assert_eq!(
+                groom_cause_for(&GroomedState::MarkersWithoutProof),
+                Some(GROOM_CAUSE_MARKERS_WITHOUT_PROOF),
+                "le refus de la porte de dispatch doit voyager jusqu'au groom — \
+                 sans cause, l'auto-skip `already_groomed` de mika#2012 reste \
+                 armé et la boucle du § 1.1 revient"
+            );
+            assert_eq!(GROOM_CAUSE_MARKERS_WITHOUT_PROOF, "markers_without_proof");
+        }
+
+        /// **Test 2 — une preuve illisible force sous son propre nom.**
+        ///
+        /// Même direction, valeur **distincte** : deux populations de signes
+        /// opposés sous un seul nom ne sont pas soustractibles (mika#2205).
+        #[test]
+        fn mika2811_une_preuve_illisible_force_sous_son_propre_nom() {
+            assert_eq!(
+                groom_cause_for(&GroomedState::ProofUnreadable("db down".to_string())),
+                Some(GROOM_CAUSE_PROOF_UNREADABLE),
+                "une base en panne force aussi, mais se compte à part"
+            );
+            assert_ne!(
+                GROOM_CAUSE_PROOF_UNREADABLE, GROOM_CAUSE_MARKERS_WITHOUT_PROOF,
+                "fondre les deux causes ferait lire une panne de base comme la \
+                 population nominale du ticket (classe mika#2205)"
+            );
+        }
+
+        /// **Test 3 / contrôle négatif — un ticket groomé ne porte aucune cause.**
+        #[test]
+        fn mika2811_un_ticket_groome_ne_porte_aucune_cause() {
+            assert_eq!(
+                groom_cause_for(&GroomedState::Groomed),
+                None,
+                "le routage va en `implement` : la porte du groom n'est jamais \
+                 atteinte, donc il n'y a rien à désarmer"
+            );
+        }
+
+        /// **Test 4 / contrôle négatif — un premier grooming ne porte aucune cause.**
+        ///
+        /// La porte de mika#2012 reste armée sur le nominal : un premier
+        /// grooming n'a aucun plan sur la branche, donc elle ne tire pas de
+        /// toute façon, et la désarmer là élargirait le forçage à tout le
+        /// nominal pour rien (§ D1).
+        #[test]
+        fn mika2811_un_premier_grooming_ne_porte_aucune_cause() {
+            assert_eq!(
+                groom_cause_for(&GroomedState::MarkersMissing(vec!["Plan:"])),
+                None,
+                "le forçage ne couvre que les deux états que mika#2484 a ajoutés"
+            );
+        }
+
+        /// **Test 5 — la clé est ABSENTE du JSON quand il n'y a pas de cause.**
+        ///
+        /// `is_none()`, pas `== ""` : l'entrée est persistée par
+        /// `build_callback_task` et relue en forensique ; une clé présente et
+        /// vide y dirait « le moteur a considéré le forçage et l'a refusé »
+        /// (mika#2331).
+        #[test]
+        fn mika2811_la_cle_de_cause_est_absente_du_json_quand_il_ny_a_pas_de_cause() {
+            let sans = dispatch_input_for("dev-pilot", REPO, ISSUE, TASK, None);
+            assert!(
+                sans.get(INTERNAL_GROOM_CAUSE_FIELD).is_none(),
+                "absent n'est pas vide (mika#2331) : {sans}"
+            );
+
+            let avec = dispatch_input_for(
+                "dev-groom",
+                REPO,
+                ISSUE,
+                TASK,
+                Some(GROOM_CAUSE_MARKERS_WITHOUT_PROOF),
+            );
+            assert_eq!(
+                avec.get(INTERNAL_GROOM_CAUSE_FIELD)
+                    .and_then(|v| v.as_str()),
+                Some(GROOM_CAUSE_MARKERS_WITHOUT_PROOF),
+                "avec cause, la clé porte la valeur de fil que le shell journalise"
+            );
+        }
+
+        /// **Test 6 — les trois champs historiques du JSON sont inchangés.**
+        ///
+        /// À l'octet près, avec et sans cause. `prompt` reste la référence
+        /// **nue** : une forme qualifiée par l'owner route silencieusement en
+        /// mode texte libre sans worktree (mika#1593).
+        #[test]
+        fn mika2811_les_trois_champs_historiques_du_json_sont_inchanges() {
+            for cause in [None, Some(GROOM_CAUSE_PROOF_UNREADABLE)] {
+                let input = dispatch_input_for("dev-groom", REPO, ISSUE, TASK, cause);
+                assert_eq!(
+                    input.get("skill").and_then(|v| v.as_str()),
+                    Some("dev-groom")
+                );
+                assert_eq!(
+                    input.get("prompt").and_then(|v| v.as_str()),
+                    Some("mika#2811"),
+                    "la référence reste NUE — pas d'owner (mika#1593)"
+                );
+                assert_eq!(input.get("task_id").and_then(|v| v.as_str()), Some(TASK));
+
+                let keys = input.as_object().expect("objet JSON").len();
+                assert_eq!(
+                    keys,
+                    if cause.is_some() { 4 } else { 3 },
+                    "la provenance s'ajoute, elle ne remplace rien : {input}"
+                );
+            }
+        }
+
+        /// **Test 7 / structurel — le champ de cause n'est PAS déclaré dans le
+        /// `tools.json` de dev-groom.**
+        ///
+        /// C'est le test de l'**omission**, et aucune assertion
+        /// comportementale ne peut le remplacer : le jour où le champ est
+        /// ajouté au schéma, tout reste vert et un LLM gagne le pouvoir de
+        /// désarmer la porte de mika#2012 sur n'importe quel ticket — or cette
+        /// porte existe contre une boucle qu'un LLM a produite. L'omission de
+        /// la surface d'outil EST le refus (mika#2425).
+        #[test]
+        fn mika2811_le_champ_de_cause_nest_pas_declare_dans_le_tools_json_de_dev_groom() {
+            let rel = "skills/bundled/dev-groom/tools.json";
+            // Racine du dépôt depuis `crates/mika-agent`, même idiome que les
+            // scans de `canonical_tokens`.
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("skills")
+                .join("bundled")
+                .join("dev-groom")
+                .join("tools.json");
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{rel} doit être lisible — un scan qui ne lit rien se lit \
+                     comme un scan d'accord : {e}"
+                )
+            });
+            assert!(
+                !src.contains(INTERNAL_GROOM_CAUSE_FIELD),
+                "{rel} déclare `{INTERNAL_GROOM_CAUSE_FIELD}` : un LLM peut \
+                 désormais forger le désarmement de la porte de mika#2012 sur \
+                 n'importe quel ticket.\n\n\
+                 RÉSOLUTION : retirer le champ du schéma. La justesse repose sur \
+                 le mode `additionalProperties` permissif, comme pour \
+                 `__internal_deferred_dispatch` — ce champ est posé par le \
+                 moteur, jamais par un tour LLM (mika#2425)."
+            );
         }
     }
 }
