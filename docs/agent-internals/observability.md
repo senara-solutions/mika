@@ -107,6 +107,150 @@ a threshold, and its silence proves nothing until someone runs the probes. Confi
 the four commands, the reading table and the four halts: root `CLAUDE.md`
 § *Optional (brief-size alert threshold — mika#2474)*.
 
+### `tool_defs_bytes` is a total; the arbitration is name by name (mika#2783)
+
+`tool_defs_census` — an INFO event (`target: "mika::otel"`) emitted at the
+**single** production site where a conversation window is assembled (`agent_loop`,
+immediately after `context_window_assembled`, before `report_brief_size_overrun`),
+on the **same** `&skill_tool_defs`. It carries `per_tool_bytes`, a JSON
+`{name: bytes}` map, plus `tool_defs_bytes`, `tool_defs_count`, `per_tool_sum`
+and the four correlation fields (`agent_id`, `session_id`, `trace_id`, `mode`).
+
+**What was missing, and who needs it.** `context_window_assembled` already carried
+`tool_defs_bytes` since mika#2295 — *a total*. mika#2593 had to transport its
+proportion from the source instead, a JSON serialization done by hand at
+implementation time (4 252 bytes for nine definitions, 899 for
+`promote_deferred_callback` alone), stated as a **prediction**, with the total
+remaining the only post-deploy arbiter. That was tolerable because mika#2593's
+criterion was *structural* — C1 ∧ C2 ∧ C3, "is this reading orphaned?" — and a
+structural question is not weighed. **mika#2748 arbitrates name by name**:
+`MIKA_ARCH_ALLOWED_TOOLS` is a list of 19 names, and every future request to add a
+twentieth is a budget question asked about **one** tool. The only answer available
+was "the total moved by so much after deploying", which arrives too late to decide
+and mixes the added name's contribution with every other variation of the same
+turn. The sum existed; the detail was thrown away.
+
+**Why a distinct event rather than a field on the sibling.** It must grep alone
+(the `brief_size_overrun` reasoning above, and `llm_budget_resolved`'s, mika#2293):
+the census is read by someone arbitrating one name, and that reading is a `jq` over
+one event per turn, not a filter over the busiest line of the stream. A field on
+the neighbour would also widen a line every conversation turn already pays for, to
+serve a question asked a few times per allowlist change.
+
+**Why one map and not one line per tool, and not "first assembly only" either.**
+≈ 50 lines per turn per agent is the volume the ticket named; one line carrying
+`{name: bytes}` answers the same question at 1/50th of the stream. The
+first-assembly form is refused by a fact of the code: **the served array is not
+constant per agent.** Matched skills vary by turn, the denylist widens on a Webhook
+Fallthrough (mika#2517), MCP tools come and go, and `filter_ci_excluded_tools`
+removes names on a CI prefix. A first-assembly-only emission would describe one
+turn and be read as describing the agent. Form precedent is one function away:
+`emit_system_prompt_assembled`'s `per_skill_bytes`, the same shape for the other
+half of the brief.
+
+**Why INFO.** A census of the nominal case fires on every turn by construction, and
+a WARN on a nominal regime is what ends up muzzled (`brief_size_alert_bytes`, same
+arbitration). The three WARNs below are the non-nominal arms and they **add** to
+the INFO line, never replace it.
+
+**The equality is the ticket's arbiter**, and it is asserted rather than assumed:
+
+```
+per_tool_sum + json_array_framing_bytes(tool_defs_count) == tool_defs_bytes
+json_array_framing_bytes(n) == 2 + max(n - 1, 0)
+```
+
+`serde_json` compact-serializes `[e₁,e₂,…,eₙ]`: two brackets plus `n − 1` commas,
+hence the saturating subtraction — `[]` is `2`, and a count of `0` must not wrap to
+`usize::MAX`. The total passed in is **the value the sibling published**
+(`context_window_fields.tool_defs_bytes`), not a second call to
+`tool_defs_byte_weight`: a recomputation would be free to agree with itself. A
+divergence emits `tool_defs_census_mismatch` (WARN) with a **signed** `delta`,
+because the sign is the diagnosis — short means a definition failed to serialize
+(one weighs `0`), long means the two sites no longer weigh the same array. Without
+the equality the census and `tool_defs_bytes` would be two populations under one
+reading (class mika#2205), which is exactly what this instrument exists to close.
+
+**Duplicate names are summed, and said.** The MCP append at the assembly site does
+not deduplicate against the builtin and skill names, so two definitions can share
+one name. The map holds their **sum** under one key, so the equality holds by
+construction whatever the array contains; `tool_defs_census_duplicate_name` (WARN,
+with `tool` and `occurrences`) reports the collapse, because `per_tool["x"]` then
+answers "what do the x's cost together" rather than "what does x cost". Note
+`tool_defs_count` is `tool_defs.len()`, **never** `per_tool.len()` — the framing
+arithmetic is a function of the former.
+
+**Absent is never zero — at three distinct levels, and they are not the same
+reading:**
+
+| what is absent | what it means | how it is held |
+|---|---|---|
+| **a key** of `per_tool_bytes` | that tool **was not served** to this agent on this turn | property of the map: a tool absent from the array has no entry. Never `0` (mika#2331) |
+| **the whole line** | the binary in service **predates** this change | the emission is unconditional and ungated (mika#2340) |
+| **the `per_tool_bytes` field** | never happens | it degrades to `"{}"` at worst — an empty array is `{}` with `tool_defs_count = 0`, never a mute line |
+
+The pair `(per_tool_bytes = "{}", tool_defs_count = n)` therefore separates a
+genuinely empty array (`n = 0`) from a serialization failure (`n > 0`), and the
+latter carries its own WARN, `tool_defs_census_unserializable`.
+
+**SOLE WRITER** of `tool_defs_census`, held by
+`canonical_tokens::tests::mika2783_le_nom_de_levenement_a_un_seul_scribe` — a
+source scan over all of `crates/`, needle composed at runtime so the guard file
+does not denounce itself, comment lines stripped, with its anti-vacuity assertion.
+**No exception list, and no constant in which to open one** (doctrine mika#2201 /
+mika#2323: an allowlist born empty is a place to deposit the next infraction);
+pre-existing population is zero, measured. A second writer would publish a second
+`{name: bytes}` map for the same turn, indistinguishable in the log. When it fires,
+route the site through `agent_loop::TOOL_DEFS_CENSUS_EVENT` or remove it.
+
+**Scope: conversation mode, which is where the magnitude is.**
+`emit_context_window_assembled` has **one** caller; the silent and team paths do
+not build `ContextWindowFields` and therefore never compute `tool_defs_bytes`. The
+`mode` field travels anyway, so a future extension to the other two modes needs no
+schema change. The architect passes — the ticket's driving population — are
+conversation turns (`_arch_ask` → `mika ask`), so the scope covers the need.
+
+**What this does NOT buy.** No tool is removed, no array is bounded, nothing is
+refused, and nothing is retro-filled: turns already served will never have their
+line. It makes one name's cost **readable**, not **watched** — the probes below are
+what make it true, and the instrument is not live until `make deploy`.
+
+**Post-deploy probes**, all on `$MIKA_SPIRIT_LOG_FILE`:
+
+```bash
+# P1 — the instrument exists. No line ⇒ the binary predates the change
+#      (mika#2340), NEVER "no tool served".
+grep tool_defs_census "$MIKA_SPIRIT_LOG_FILE" | tail -1 \
+  | jq '{agent_id, mode, tool_defs_count, per_tool_sum, tool_defs_bytes}'
+
+# P2 — the equality holds in production. THE arbiter. Expected: empty.
+grep tool_defs_census "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.tool_defs_bytes
+      != (.per_tool_sum + 2 + (if .tool_defs_count > 0 then .tool_defs_count - 1 else 0 end)))
+      | {agent_id, trace_id, tool_defs_bytes, per_tool_sum, tool_defs_count}'
+# …and its positive control, which says the probe is looking at something:
+grep -c tool_defs_census_mismatch "$MIKA_SPIRIT_LOG_FILE"    # expected: 0
+grep -c '"event":"tool_defs_census"' "$MIKA_SPIRIT_LOG_FILE" # expected: > 0
+
+# P3 — the question this ticket exists for: what does ONE name cost?
+grep tool_defs_census "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.agent_id == "mika-arch") | .per_tool_bytes | fromjson
+           | to_entries[] | "\(.value)\t\(.key)"' \
+  | sort -rn | uniq | head -20
+
+# P4 — negative control: absent is not zero. Expected: false on mika-arch
+#      (promote_deferred_callback is in MIKA_ARCH_DISABLED_TOOLS, mika#2593),
+#      and true on an agent that receives it (mika-dev). The PAIR is what
+#      separates "not served" from "mute instrument".
+grep tool_defs_census "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.agent_id == "mika-arch") | .per_tool_bytes | fromjson
+           | {promote_deferred_callback: (has("promote_deferred_callback"))}' | tail -1
+
+# P5 — no duplicate name. Non-zero ⇒ an MCP server serves a name already taken;
+#      the equality still holds, but that name's value aggregates two definitions.
+grep -c tool_defs_census_duplicate_name "$MIKA_SPIRIT_LOG_FILE"   # expected: 0
+```
+
 **Session lifecycle:** Silent dispatcher variants call `end_session()` after completion. CLI commands call `end_session()` on all exit paths. `startup_recovery()` prunes old sessions via `prune_old_sessions()`.
 
 ### Guard Fabrication Telemetry (#953)
