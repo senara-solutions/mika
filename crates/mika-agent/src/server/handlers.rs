@@ -2015,11 +2015,14 @@ pub(super) async fn run_agent_for_message(
     // tous leurs effets, AVANT le tour LLM. Un événement sans suite possible
     // ne paie aucun appel modèle ; tout le reste passe comme avant.
     //
-    // mika#2680 — et quand le tour a lieu, il est NOMMÉ. Le `&&` d'origine
-    // court-circuitait, si bien que la branche « payé » n'existait pas comme
-    // bloc : d'où la liaison du booléen plutôt qu'un test en ligne. Les deux
-    // sites lisent le même `touched` et le même `enabled`, et le registre lit
-    // `original` — le texte d'AVANT les handlers — jamais `req.text`.
+    // mika#2680 — et quand le tour a lieu, il est NOMMÉ, puis dit POURQUOI. Le
+    // `Gate` que la porte rend porte le terme de relâche ; il n'est ni
+    // re-dérivé ici, ni reconstruit depuis `touched`, parce que seule la porte
+    // sait laquelle de ses dix sorties a été prise. D'où un `match` sans bras
+    // par défaut plutôt qu'un booléen : un onzième terme ne compile pas sans
+    // être transporté jusqu'ici. Les deux bras lisent le même `touched` et le
+    // même `enabled`, et le registre lit `original` — le texte d'AVANT les
+    // handlers — jamais `req.text`.
     if let Some(original) = &original_github_text {
         let touched = super::webhook_prefilter::Touched {
             by_any_handler: req.text != *original,
@@ -2032,7 +2035,7 @@ pub(super) async fn run_agent_for_message(
                 .is_none_or(|(before, after)| before != original || req.text != *after),
         };
         let enabled = super::webhook_prefilter::prefilter_enabled();
-        let skipped = super::webhook_prefilter::skip_turn(
+        match super::webhook_prefilter::skip_turn(
             &a.db,
             &super::webhook_prefilter::LiveState {
                 db: &a.db,
@@ -2044,17 +2047,20 @@ pub(super) async fn run_agent_for_message(
             &req.request_id,
             enabled,
         )
-        .await;
-        if skipped {
-            return;
+        .await
+        {
+            super::webhook_prefilter::Gate::Skipped => return,
+            super::webhook_prefilter::Gate::Charged(release) => {
+                super::webhook_prefilter::emit_turn_charged(
+                    a.db.agent_id(),
+                    original,
+                    touched,
+                    &req.request_id,
+                    enabled,
+                    release,
+                );
+            }
         }
-        super::webhook_prefilter::emit_turn_charged(
-            a.db.agent_id(),
-            original,
-            touched,
-            &req.request_id,
-            enabled,
-        );
     }
 
     let params = agent::AgentParams {

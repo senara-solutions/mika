@@ -176,6 +176,64 @@
 //! `skipped_by_class` ne peut être qu'un seau vide, et une soustraction par zéro
 //! n'informe rien. (g) est au contraire bloquée par cette mesure, parce que son
 //! déclencheur est exactement celui que (b) traite.
+//!
+//! # Le terme de relâche (mika#2680, vol 4)
+//!
+//! Le registre du vol 1 nomme ce qu'un tour ÉTAIT — `trigger`, `text_touched`,
+//! `candidate`, `prefilter_enabled` — et jamais POURQUOI il a eu lieu. Ce vol
+//! ajoute le terme direct : [`Release`], dix valeurs, une par porte qui relâche
+//! un tour. Il ne décide rien — aucun tour de plus n'est écarté, aucun de moins
+//! — et c'est ce qui le rend livrable quand (f) et (g) ne le sont pas : le
+//! terme se lit dans le flot de contrôle de [`skip_turn`] et de [`decide`], qui
+//! est devant les yeux, pas dans une mesure.
+//!
+//! **Un champ, pas une conjugaison.** `release` porte UNE valeur par tour
+//! facturé. Laisser le lecteur conjuguer les champs existants était l'autre
+//! option, et le § 5.2 du protocole de mesure la refuse : une population lue
+//! par conjonction de deux champs est une population qu'on compte mal un jour.
+//! L'agrégat groupe par un champ ou ne groupe pas. Le champ est transporté, pas
+//! redérivé : [`Gate::Charged`] le remonte de la porte qui a relâché jusqu'à
+//! [`emit_turn_charged`], d'où un `match` sans bras par défaut au site d'appel
+//! — un onzième terme ne compile pas sans être transporté.
+//!
+//! **Trois choix de forme.** [`Release::StateUnreadable`] est UN terme et pas
+//! cinq : le prédicat en échec est déjà nommé à l'octet près par le `warn!` de
+//! [`state_unreadable`] (champ `what`), et le dupliquer dans la valeur de
+//! relâche multiplierait la cardinalité du seau par cinq pour rien.
+//! [`Release::SwitchDisarmed`] existe bien qu'il redouble `prefilter_enabled:
+//! false` — le redoublement est le but, une fenêtre partiellement désarmée doit
+//! se lire dans le même tableau que le reste. Et [`Candidate::InertLabel`] n'a
+//! **pas** de terme, parce que `decide` ne le relâche jamais : une valeur pour
+//! un chemin inatteignable est une valeur qu'un lecteur cherchera un jour.
+//!
+//! **L'absence est nommée.** Une ligne `webhook_turn_charged` écrite par un
+//! binaire antérieur à ce vol ne porte pas `release` ; l'agrégat du lecteur la
+//! range sous `absent_pre_field`, jamais sous `null`, `unknown` ni `"none"`
+//! (motif mika#2331, déjà tenu par `candidate`). Le seau dit la raison de
+//! l'absence, donc aucun second drapeau de halte n'est ajouté au § 5 du
+//! protocole : une fenêtre entièrement antérieure au déploiement se lit à 100 %
+//! dans ce seau.
+//!
+//! **Ce que ce terme tranche, et que `text_touched` ne tranchait pas.** Le
+//! corps de mika#2680 dit de sa classe (f) — un `pr_review` sur une PR fermée
+//! dont le `verdict_handler` a réécrit le texte — que *« la règle "texte intact
+//! après handler" de la phase 2 exclut ce cas »*. **C'est faux sur le code
+//! servi**, et la prémisse a été re-dérivée trois fois le 2026-10-19, au prix
+//! d'un dispatch chacune. [`Touched::applies_to`] ne lit, pour une revue, que
+//! `after_verdict_handler`, calculé au site d'appel comme « un handler a touché
+//! le texte DEPUIS l'instantané pris après le `verdict_handler` » : la
+//! réécriture du `verdict_handler` est donc DANS la fenêtre, et seul un handler
+//! ultérieur garde le tour. Les deux formes que le corps cite sont déjà
+//! écartées par (c) — `CIRCUIT BREAKER TRIPPED` par
+//! [`PrefilterClass::VerdictPrClosed`], `verdict_classification_failed` à
+//! valeur illisible par [`PrefilterClass::VerdictUnreadable`] —, ce que
+//! `mika2680_f_le_pr_review_reecrit_est_deja_ecarte` fige en assertions plutôt
+//! qu'en prose. Quatre chemins peuvent donc expliquer les 192 k mesurés, et
+//! `release` est exactement ce qui les sépare : `not_classified` (une revue
+//! sans ligne `VERDICT:`, donc une question AC2 posée à l'opérateur),
+//! `pr_task_active` (une tâche vit), `state_unreadable` (la forge était
+//! illisible), `text_touched` (un handler ultérieur parle). Quatre réponses,
+//! quatre suites différentes, dont trois ne sont pas des filtres.
 
 use tracing::{info, warn};
 
@@ -586,10 +644,84 @@ fn pr_prefix(head: &str) -> Option<&str> {
     head.rfind('@').map(|i| &head[..=i])
 }
 
+/// POURQUOI le tour a lieu : le terme de relâche (mika#2680, vol 4).
+///
+/// Un terme par porte qui relâche un tour, et le registre en porte exactement
+/// un. Les trois premiers sont rendus par [`skip_turn`] lui-même, avant toute
+/// consultation d'état ; les sept autres par [`decide`] et ses quatre
+/// décideurs. Un onzième site de relâche ne compile pas sans son terme : c'est
+/// la propriété que ce type achète, et la raison de ne pas s'être contenté
+/// d'une chaîne au site d'émission.
+///
+/// Ce n'est pas la taxonomie inverse de [`PrefilterClass`] : une classe nomme
+/// l'événement écarté, un terme nomme la porte qui n'a pas écarté. Les deux
+/// vivent côte à côte sur deux moitiés du registre, et aucun des deux ne se
+/// dérive de l'autre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// Interrupteur désarmé : `skip_turn` rend la main sans rien classer.
+    ///
+    /// Double délibérément `prefilter_enabled: false`, déjà sur la ligne. Le
+    /// registre doit pouvoir se lire sur la seule colonne `release` — une
+    /// jointure mentale entre deux champs est ce qu'un terme achète.
+    SwitchDisarmed,
+    /// `classify` n'a rien reconnu : l'événement n'est d'aucune population
+    /// candidate. Le gros du trafic, et le dénominateur de toute mesure de
+    /// couverture.
+    NotClassified,
+    /// Un handler a touché le texte dans la fenêtre que la classe exige
+    /// (`Touched::applies_to`). Fail-safe de la phase 2 : le tour a lieu parce
+    /// que le texte n'est plus celui que la classe sait lire.
+    TextTouched,
+    /// (a) `branch_has_active_task` → `Ok(true)` : une tâche vit sur la
+    /// branche, son état est à prendre en compte (`decide_default_branch`).
+    BranchTaskActive,
+    /// (c) revue et (e) `PR closed` : `pr_has_active_task` → `Ok(true)`. Deux
+    /// sites, un seul terme — c'est le même prédicat sur la même clé, et les
+    /// distinguer ferait porter au registre la structure du code plutôt que
+    /// celle de la décision.
+    PrTaskActive,
+    /// (c) revue : la PR est `Open` côté forge, aucun des trois termes lus dans
+    /// le texte n'a mordu (`decide_review_verdict`).
+    PrOpen,
+    /// (c) CI rouge : l'audit de cet événement ne porte aucune trace terminale
+    /// que `ci_failure_no_action_class` reconnaisse (`decide_ci_failure_no_action`).
+    NoTerminalTrace,
+    /// (b) : aucune ligne DECISION-CORE dans l'audit de cet événement, donc
+    /// aucune tête à comparer (`decide_head_decided`, premier retour).
+    NoDecisionAttested,
+    /// (b) : la tête de cet événement n'a pas d'attestation antérieure — c'est
+    /// son premier traitement (`head_decided_and_notified` → `None`).
+    HeadNotPreviouslyDecided,
+    /// Un état est illisible : le tour a lieu (AC3). **UN** terme pour les cinq
+    /// appels de [`state_unreadable`], parce que le champ `what` du `warn!`
+    /// nomme déjà le prédicat qui a échoué — en faire cinq termes dupliquerait
+    /// cette information dans le registre, où la question est « combien de
+    /// tours une panne de lecture a-t-elle coûtés », jamais « laquelle ».
+    StateUnreadable,
+}
+
+impl Release {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SwitchDisarmed => "switch_disarmed",
+            Self::NotClassified => "not_classified",
+            Self::TextTouched => "text_touched",
+            Self::BranchTaskActive => "branch_task_active",
+            Self::PrTaskActive => "pr_task_active",
+            Self::PrOpen => "pr_open",
+            Self::NoTerminalTrace => "no_terminal_trace",
+            Self::NoDecisionAttested => "no_decision_attested",
+            Self::HeadNotPreviouslyDecided => "head_not_previously_decided",
+            Self::StateUnreadable => "state_unreadable",
+        }
+    }
+}
+
 /// L'issue de la décision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
-    Llm,
+    Llm(Release),
     Skip {
         class: PrefilterClass,
         target: String,
@@ -604,7 +736,7 @@ fn state_unreadable(what: &str, target: &str, e: &anyhow::Error) -> Decision {
         error = %e,
         "pré-filtre : état illisible — le tour a lieu (fail-safe)"
     );
-    Decision::Llm
+    Decision::Llm(Release::StateUnreadable)
 }
 
 /// Décide un candidat. Toute erreur de recherche laisse passer (AC3).
@@ -655,7 +787,7 @@ async fn decide_default_branch(
     let target = branch_key(repo, branch);
     match state.branch_has_active_task(branch).await {
         Ok(false) => Decision::Skip { class, target },
-        Ok(true) => Decision::Llm,
+        Ok(true) => Decision::Llm(Release::BranchTaskActive),
         Err(e) => state_unreadable("branch_task", &target, &e),
     }
 }
@@ -676,7 +808,7 @@ async fn decide_ci_failure_no_action(
     };
     match ci_failure_no_action_class(&this_event) {
         Some(class) => Decision::Skip { class, target },
-        None => Decision::Llm,
+        None => Decision::Llm(Release::NoTerminalTrace),
     }
 }
 
@@ -694,7 +826,7 @@ async fn decide_head_decided(repo: &str, branch: &str, state: &impl PrefilterSta
         .find(|r| r.tool == DECISION_CORE_HOLD_TOOL)
         .and_then(|r| pr_prefix(&r.target))
     else {
-        return Decision::Llm;
+        return Decision::Llm(Release::NoDecisionAttested);
     };
     let prior = match state.decision_core_holds(prefix).await {
         Ok(rows) => rows,
@@ -705,7 +837,7 @@ async fn decide_head_decided(repo: &str, branch: &str, state: &impl PrefilterSta
             class: PrefilterClass::GreenCheckSuiteHeadDecided,
             target: format!("check_suite:{}", head.strip_prefix("pr:").unwrap_or(&head)),
         },
-        None => Decision::Llm,
+        None => Decision::Llm(Release::HeadNotPreviouslyDecided),
     }
 }
 
@@ -716,7 +848,7 @@ async fn decide_review_verdict(facts: ReviewVerdictFacts, state: &impl Prefilter
     let target = format!("pr_review:{}#{}", facts.repo, facts.pr_number);
     match state.pr_has_active_task(&facts.pr_url).await {
         Ok(false) => {}
-        Ok(true) => return Decision::Llm,
+        Ok(true) => return Decision::Llm(Release::PrTaskActive),
         Err(e) => return state_unreadable("pr_task", &target, &e),
     }
     let class = if facts.hold_tracked {
@@ -728,7 +860,7 @@ async fn decide_review_verdict(facts: ReviewVerdictFacts, state: &impl Prefilter
     } else {
         match state.pr_state(&facts.repo, facts.pr_number).await {
             Ok(PrForgeState::Closed | PrForgeState::Merged) => PrefilterClass::VerdictPrClosed,
-            Ok(PrForgeState::Open) => return Decision::Llm,
+            Ok(PrForgeState::Open) => return Decision::Llm(Release::PrOpen),
             Err(e) => return state_unreadable("pr_state", &target, &e),
         }
     };
@@ -748,7 +880,7 @@ async fn decide_pr_closed(pr_url: String, state: &impl PrefilterState) -> Decisi
             class: PrefilterClass::PrClosedNoLoopTask,
             target,
         },
-        Ok(true) => Decision::Llm,
+        Ok(true) => Decision::Llm(Release::PrTaskActive),
         Err(e) => state_unreadable("pr_has_active_task", &target, &e),
     }
 }
@@ -800,8 +932,21 @@ impl Touched {
     }
 }
 
-/// La porte. Rend `true` quand le tour LLM est écarté ; une ligne `info!` et
-/// une ligne d'audit nommées sont alors écrites.
+/// Ce que la porte a fait de ce tour : écarté, ou relâché pour un motif nommé.
+///
+/// Remplace le `bool` d'origine. Un booléen rendait indicible la moitié
+/// intéressante — « le tour a lieu » était un `false` sans cause, et le motif
+/// n'existait qu'au moment de la décision, à l'intérieur de cette fonction,
+/// d'où il ne ressortait pas. Le type le fait ressortir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    Skipped,
+    Charged(Release),
+}
+
+/// La porte. Rend [`Gate::Skipped`] quand le tour LLM est écarté — une ligne
+/// `info!` et une ligne d'audit nommées sont alors écrites ; sinon
+/// [`Gate::Charged`] avec le terme de la porte qui a relâché (mika#2680).
 pub(crate) async fn skip_turn(
     db: &AsyncDatabase,
     state: &impl PrefilterState,
@@ -809,18 +954,19 @@ pub(crate) async fn skip_turn(
     touched: Touched,
     request_id: &str,
     enabled: bool,
-) -> bool {
+) -> Gate {
     if !enabled {
-        return false;
+        return Gate::Charged(Release::SwitchDisarmed);
     }
     let Some(candidate) = classify(original_text) else {
-        return false;
+        return Gate::Charged(Release::NotClassified);
     };
     if touched.applies_to(&candidate) {
-        return false;
+        return Gate::Charged(Release::TextTouched);
     }
-    let Decision::Skip { class, target } = decide(candidate, state).await else {
-        return false;
+    let (class, target) = match decide(candidate, state).await {
+        Decision::Llm(release) => return Gate::Charged(release),
+        Decision::Skip { class, target } => (class, target),
     };
 
     info!(
@@ -850,7 +996,7 @@ pub(crate) async fn skip_turn(
             "événement écarté mais ligne d'audit non écrite"
         );
     }
-    true
+    Gate::Skipped
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,15 +1161,22 @@ impl Candidate {
 /// classe correctement un événement qu'un handler a réécrit. Aucune ligne
 /// d'audit n'est écrite ici, et la ligne n'est gatée par rien : voir la
 /// section « Le registre des tours webhook » en tête de module.
+///
+/// `release` ne se dérive pas ici : il vient du [`Gate::Charged`] que
+/// [`skip_turn`] vient de rendre, seul endroit où la porte qui a relâché est
+/// connue. Le reconstruire depuis `original_text` et `touched` le ferait
+/// divergir de la vraie porte au premier décideur qui change d'ordre.
 pub(crate) fn emit_turn_charged(
     agent_id: &str,
     original_text: &str,
     touched: Touched,
     request_id: &str,
     enabled: bool,
+    release: Release,
 ) {
     let trigger = trigger_class(original_text).as_str();
     let text_touched = touched.by_any_handler;
+    let release = release.as_str();
 
     // Deux bras pour un seul champ de différence, parce que `candidate` doit
     // pouvoir MANQUER. Un `?candidate` sur un `Option` écrirait la chaîne
@@ -1042,6 +1195,7 @@ pub(crate) fn emit_turn_charged(
             text_touched,
             candidate = candidate.as_str(),
             prefilter_enabled = enabled,
+            release,
             "tour webhook facturé — le tour a lieu (mika#2680)"
         ),
         None => info!(
@@ -1052,6 +1206,7 @@ pub(crate) fn emit_turn_charged(
             trigger,
             text_touched,
             prefilter_enabled = enabled,
+            release,
             "tour webhook facturé — le tour a lieu (mika#2680)"
         ),
     }
@@ -1232,9 +1387,15 @@ pub(crate) mod tests {
                 target: "check_suite:senara-solutions/mika@main".into()
             }
         );
-        assert_eq!(decide(c(), &branch(Ok(true))).await, Decision::Llm);
+        assert_eq!(
+            decide(c(), &branch(Ok(true))).await,
+            Decision::Llm(Release::BranchTaskActive)
+        );
         // AC3 : base illisible ⇒ le tour a lieu.
-        assert_eq!(decide(c(), &branch(Err("db down"))).await, Decision::Llm);
+        assert_eq!(
+            decide(c(), &branch(Err("db down"))).await,
+            Decision::Llm(Release::StateUnreadable)
+        );
     }
 
     #[tokio::test]
@@ -1460,14 +1621,23 @@ pub(crate) mod tests {
     async fn mika2675_c_controles_negatifs() {
         let actionable = || classify(&review("approved", QA, "VERDICT: pass")).unwrap();
         let block = || classify(&review("changes_requested", QA, "VERDICT: block[ac]")).unwrap();
-        for forge in [Ok(PrForgeState::Open), Err("gh 401")] {
+        // Les deux relâches de cette porte sont nommées SÉPARÉMENT : une PR
+        // ouverte et une forge illisible rendent toutes deux le tour, mais la
+        // première est un verdict à traiter et la seconde une panne de lecture.
+        // Les confondre rendrait un `gh` cassé indistinguable d'un flux de
+        // revues normal, sur la colonne même qui sert à décider s'il reste du
+        // coût à filtrer (mika#2680).
+        for (forge, release) in [
+            (Ok(PrForgeState::Open), Release::PrOpen),
+            (Err("gh 401"), Release::StateUnreadable),
+        ] {
             for c in [actionable(), block()] {
                 let state = Stub {
                     pr_task: Some(Ok(false)),
                     pr_state: Some(forge),
                     ..Stub::default()
                 };
-                assert_eq!(decide(c, &state).await, Decision::Llm, "{forge:?}");
+                assert_eq!(decide(c, &state).await, Decision::Llm(release), "{forge:?}");
             }
         }
         // Tâche active : même un verdict non actionnable passe, sans forge.
@@ -1478,11 +1648,18 @@ pub(crate) mod tests {
             ("VERDICT: peut-être", QA),
         ] {
             let c = classify(&review("approved", author, body)).unwrap();
-            assert_eq!(decide(c, &pr(Ok(true))).await, Decision::Llm, "{body}");
+            assert_eq!(
+                decide(c, &pr(Ok(true))).await,
+                Decision::Llm(Release::PrTaskActive),
+                "{body}"
+            );
         }
         // AC3 : base illisible.
         let c = classify(&review("commented", QA, "VERDICT: hold[review]")).unwrap();
-        assert_eq!(decide(c, &pr(Err("db down"))).await, Decision::Llm);
+        assert_eq!(
+            decide(c, &pr(Err("db down"))).await,
+            Decision::Llm(Release::StateUnreadable)
+        );
     }
 
     #[test]
@@ -1711,7 +1888,7 @@ pub(crate) mod tests {
         let c = classify(GREEN_PR).unwrap();
         assert_eq!(
             decide(c, &rows(Ok(vec![processed(HEAD_A, "rid-now")]), None)).await,
-            Decision::Llm
+            Decision::Llm(Release::NoDecisionAttested)
         );
     }
 
@@ -1722,11 +1899,11 @@ pub(crate) mod tests {
         let c = || classify(GREEN_PR).unwrap();
         assert_eq!(
             decide(c(), &rows(Err("db down"), None)).await,
-            Decision::Llm
+            Decision::Llm(Release::StateUnreadable)
         );
         assert_eq!(
             decide(c(), &rows(Ok(this_event), Some(Err("db down")))).await,
-            Decision::Llm
+            Decision::Llm(Release::StateUnreadable)
         );
     }
 
@@ -1818,9 +1995,15 @@ pub(crate) mod tests {
         // Une tâche active sur `main` est un état que le modèle doit prendre en
         // compte — la porte est strictement plus conservatrice que l'étape 2 du
         // handler, qui skippe inconditionnellement.
-        assert_eq!(decide(c(), &branch(Ok(true))).await, Decision::Llm);
+        assert_eq!(
+            decide(c(), &branch(Ok(true))).await,
+            Decision::Llm(Release::BranchTaskActive)
+        );
         // AC3 : base illisible ⇒ le tour a lieu.
-        assert_eq!(decide(c(), &branch(Err("db down"))).await, Decision::Llm);
+        assert_eq!(
+            decide(c(), &branch(Err("db down"))).await,
+            Decision::Llm(Release::StateUnreadable)
+        );
     }
 
     fn no_action(motive: &str) -> AuditFact {
@@ -1926,10 +2109,13 @@ pub(crate) mod tests {
                 target: "check_suite:senara-solutions/mika@dependabot/cargo/x".into(),
             }
         );
-        assert_eq!(decide(c(), &rows(Ok(vec![]), None)).await, Decision::Llm);
+        assert_eq!(
+            decide(c(), &rows(Ok(vec![]), None)).await,
+            Decision::Llm(Release::NoTerminalTrace)
+        );
         assert_eq!(
             decide(c(), &rows(Err("db down"), None)).await,
-            Decision::Llm
+            Decision::Llm(Release::StateUnreadable)
         );
     }
 
@@ -2338,7 +2524,7 @@ pub(crate) mod tests {
     async fn mika2680_e_une_tache_active_garde_son_tour() {
         assert_eq!(
             decide(classify(PR_CLOSED).unwrap(), &pr(Ok(true))).await,
-            Decision::Llm
+            Decision::Llm(Release::PrTaskActive)
         );
     }
 
@@ -2351,7 +2537,217 @@ pub(crate) mod tests {
     async fn mika2680_e_un_etat_illisible_rend_le_tour() {
         assert_eq!(
             decide(classify(PR_CLOSED).unwrap(), &pr(Err("db down"))).await,
-            Decision::Llm
+            Decision::Llm(Release::StateUnreadable)
+        );
+    }
+
+    // ---- vol 4 — le terme de relâche (mika#2680) -------------------------
+
+    /// Le cas qui atteint chaque terme de relâche, et le `match` qui tient
+    /// l'exhaustivité.
+    ///
+    /// Chaque bouchon n'ouvre **que** la porte que son terme traverse : les
+    /// trois premiers reçoivent `Stub::default()`, qui panique à toute
+    /// recherche d'état. C'est ainsi que « rendu AVANT `decide` » est prouvé et
+    /// non supposé — un garde déplacé après la décision ferait paniquer le cas
+    /// au lieu de le rendre vert autrement.
+    fn cas_de_relache(terme: Release) -> (String, Stub, Touched, bool) {
+        let intact = Touched {
+            by_any_handler: false,
+            after_verdict_handler: false,
+            outside_ci_success_handler: false,
+            outside_ci_failure_handler: false,
+        };
+        let touche = Touched {
+            by_any_handler: true,
+            ..intact
+        };
+        // Pas de bras `_` : ajouter un onzième terme ne compile pas tant qu'il
+        // n'a pas son cas ici (DoD 8).
+        match terme {
+            Release::SwitchDisarmed => (GREEN_MAIN.into(), Stub::default(), intact, false),
+            Release::NotClassified => ("bonjour".into(), Stub::default(), intact, true),
+            Release::TextTouched => (GREEN_MAIN.into(), Stub::default(), touche, true),
+            Release::BranchTaskActive => (GREEN_MAIN.into(), branch(Ok(true)), intact, true),
+            Release::PrTaskActive => (
+                review("commented", QA, "VERDICT: hold[review]"),
+                pr(Ok(true)),
+                intact,
+                true,
+            ),
+            Release::PrOpen => (
+                review("approved", QA, "VERDICT: pass"),
+                Stub {
+                    pr_task: Some(Ok(false)),
+                    pr_state: Some(Ok(PrForgeState::Open)),
+                    ..Stub::default()
+                },
+                intact,
+                true,
+            ),
+            Release::NoTerminalTrace => (RED_PR.into(), rows(Ok(vec![]), None), intact, true),
+            // Aucune ligne `decision_core_hold` sur CET événement : la seconde
+            // lecture n'a pas lieu, et `holds: None` le prouve en paniquant.
+            Release::NoDecisionAttested => (
+                GREEN_PR.into(),
+                rows(Ok(vec![processed(HEAD_A, "rid-now")]), None),
+                intact,
+                true,
+            ),
+            // Une attestation existe, mais sur une AUTRE tête de la même PR.
+            Release::HeadNotPreviouslyDecided => (
+                GREEN_PR.into(),
+                rows(
+                    Ok(vec![
+                        processed(HEAD_A, "rid-now"),
+                        hold(HEAD_A, "notified", "rid-now"),
+                    ]),
+                    Some(Ok(vec![hold(HEAD_B, "notified", "rid-before")])),
+                ),
+                intact,
+                true,
+            ),
+            Release::StateUnreadable => (GREEN_MAIN.into(), branch(Err("db down")), intact, true),
+        }
+    }
+
+    /// Terme par terme (DoD 8) : chacun des dix termes de relâche est atteint
+    /// par la PORTE elle-même — `skip_turn`, pas `decide` — parce que trois
+    /// d'entre eux sont rendus **avant** `decide` et qu'un test sur `decide`
+    /// seul ne les verrait jamais.
+    ///
+    /// L'exhaustivité est tenue par le `match` de [`cas_de_relache`], qui n'a
+    /// pas de bras par défaut : un onzième terme ne COMPILE pas tant qu'il n'a
+    /// pas son cas. Le voisin
+    /// [`mika2680_la_taxonomie_atteint_chacun_de_ses_douze_termes`] compte ses
+    /// termes après coup, et ce comptage a une faiblesse que celui-ci n'a pas :
+    /// il ne sait rien de l'énumération, donc une variante ajoutée sans cas le
+    /// laisse vert.
+    ///
+    /// La base est réelle et vide : les dix termes rendent tous **avant** la
+    /// ligne d'audit, donc rien n'y est écrit — `skip_turn` n'en demande une
+    /// que pour l'`agent_id` de sa ligne `info!`.
+    #[tokio::test]
+    async fn mika2680_la_relache_atteint_chacun_de_ses_dix_termes() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+
+        for terme in [
+            Release::SwitchDisarmed,
+            Release::NotClassified,
+            Release::TextTouched,
+            Release::BranchTaskActive,
+            Release::PrTaskActive,
+            Release::PrOpen,
+            Release::NoTerminalTrace,
+            Release::NoDecisionAttested,
+            Release::HeadNotPreviouslyDecided,
+            Release::StateUnreadable,
+        ] {
+            let (texte, state, touched, enabled) = cas_de_relache(terme);
+            assert_eq!(
+                skip_turn(&db, &state, &texte, touched, "rid-now", enabled).await,
+                Gate::Charged(terme),
+                "{terme:?}"
+            );
+        }
+    }
+
+    /// (f) est **déjà écartée** par (c) pour les deux formes que le corps de
+    /// mika#2680 cite, et ce test le figent en assertions plutôt qu'en prose :
+    /// la prémisse *« la règle "texte intact après handler" exclut ce cas »* a
+    /// été re-dérivée trois fois le 2026-10-19, au prix d'un dispatch chacune.
+    ///
+    /// Ce qu'elle manque : `Touched::applies_to` ne lit, pour une revue, que
+    /// `after_verdict_handler` — « un handler a touché le texte DEPUIS
+    /// l'instantané pris après le `verdict_handler` ». La réécriture du
+    /// `verdict_handler` est donc DANS la fenêtre ; seul un handler ultérieur
+    /// garde le tour.
+    #[tokio::test]
+    async fn mika2680_f_le_pr_review_reecrit_est_deja_ecarte() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let cible = "pr_review:senara-solutions/mika#2680";
+
+        // 1. Le disjoncteur (`CIRCUIT BREAKER TRIPPED`) : le corps de revue
+        //    porte un `VERDICT: block[*]` — aucun des trois termes de texte ne
+        //    mord — et la PR est mergée. (c) écarte.
+        let disjoncteur = review("commented", QA, "VERDICT: block[security]");
+        assert_eq!(
+            decide(
+                classify(&disjoncteur).unwrap(),
+                &Stub {
+                    pr_task: Some(Ok(false)),
+                    pr_state: Some(Ok(PrForgeState::Merged)),
+                    ..Stub::default()
+                }
+            )
+            .await,
+            Decision::Skip {
+                class: PrefilterClass::VerdictPrClosed,
+                target: cible.into(),
+            }
+        );
+        // Et la réécriture du `verdict_handler` ne rend pas ce tour : le
+        // candidat ne lit que `after_verdict_handler`, qu'elle laisse à `false`.
+        assert!(
+            !Touched {
+                by_any_handler: true,
+                after_verdict_handler: false,
+                outside_ci_success_handler: true,
+                outside_ci_failure_handler: true,
+            }
+            .applies_to(&classify(&disjoncteur).unwrap())
+        );
+
+        // 2. `verdict_classification_failed` à ligne `VERDICT:` présente mais
+        //    valeur non reconnue : `facts.unreadable` écarte SANS consulter la
+        //    forge. Le bouchon le prouve — `pr_state: None` panique s'il est lu.
+        let illisible = review("commented", QA, "VERDICT: peut-être");
+        assert_eq!(
+            decide(classify(&illisible).unwrap(), &pr(Ok(false))).await,
+            Decision::Skip {
+                class: PrefilterClass::VerdictUnreadable,
+                target: cible.into(),
+            }
+        );
+
+        // 3. La revue **sans aucune** ligne `VERDICT:` : hors population, donc
+        //    relâche `not_classified`. C'est le seul résidu de (f) qui soit une
+        //    décision de filtre, et elle épingle **AC2 de mika#2675** : une
+        //    revue sans verdict est la forme d'une consigne d'opérateur, et
+        //    l'identité GitHub de l'opérateur est partagée. Renverser cette
+        //    assertion accepte qu'un « ouvre un ticket de suivi pour X » écrit
+        //    en revue ne soit jamais lu, et la perte est silencieuse — c'est
+        //    une décision opérateur, pas un refactor.
+        let consigne = review("commented", QA, "Merci d'ouvrir un ticket de suivi pour X.");
+        assert!(classify(&consigne).is_none());
+        let intact = Touched {
+            by_any_handler: false,
+            after_verdict_handler: false,
+            outside_ci_success_handler: false,
+            outside_ci_failure_handler: false,
+        };
+        assert_eq!(
+            skip_turn(&db, &Stub::default(), &consigne, intact, "rid-now", true).await,
+            Gate::Charged(Release::NotClassified)
+        );
+
+        // 4. Contrôle négatif de la même graine (leçon mika#2277) : les mêmes
+        //    textes, **seul l'état diffère**. Une tâche de boucle vivante sur
+        //    cette PR garde le tour — une batterie purement positive serait
+        //    satisfaite par un filtre qui écarte tout.
+        for texte in [&disjoncteur, &illisible] {
+            assert_eq!(
+                decide(classify(texte).unwrap(), &pr(Ok(true))).await,
+                Decision::Llm(Release::PrTaskActive),
+                "{texte:?}"
+            );
+        }
+        // La consigne, elle, reste hors population quel que soit l'état : son
+        // terme ne dépend d'aucune porte, et c'est ce qui la distingue des deux
+        // autres — le chemin A du § *Décision 2* n'est pas B.
+        assert_eq!(
+            skip_turn(&db, &pr(Ok(true)), &consigne, intact, "rid-now", true).await,
+            Gate::Charged(Release::NotClassified)
         );
     }
 }

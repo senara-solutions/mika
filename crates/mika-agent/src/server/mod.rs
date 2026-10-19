@@ -5774,6 +5774,7 @@ mod tests {
     /// atteignable sans jeton GitHub.
     #[tokio::test]
     async fn mika2675_texte_touche_par_un_handler_le_tour_a_lieu() {
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let live = webhook_prefilter::LiveState {
@@ -5782,13 +5783,17 @@ mod tests {
             request_id: "r",
         };
         for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
-            assert!(
-                !webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(true), "r", true)
-                    .await
+            assert_eq!(
+                webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(true), "r", true)
+                    .await,
+                Gate::Charged(Release::TextTouched),
+                "{text}"
             );
-            assert!(
+            assert_eq!(
                 webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(false), "r", true)
-                    .await
+                    .await,
+                Gate::Skipped,
+                "{text}"
             );
         }
     }
@@ -5805,6 +5810,7 @@ mod tests {
     /// AC4 — désarmé, rien n'est filtré.
     #[tokio::test]
     async fn mika2675_interrupteur_desarme_rien_nest_filtre() {
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let live = webhook_prefilter::LiveState {
@@ -5818,16 +5824,11 @@ mod tests {
             "VERDICT: hold[review]",
         );
         for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL, hold.as_str()] {
-            assert!(
-                !webhook_prefilter::skip_turn(
-                    &db,
-                    &live,
-                    text,
-                    mika2675_touched(false),
-                    "r",
-                    false
-                )
-                .await
+            assert_eq!(
+                webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(false), "r", false)
+                    .await,
+                Gate::Charged(Release::SwitchDisarmed),
+                "{text}"
             );
         }
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
@@ -6012,15 +6013,15 @@ mod tests {
     /// PR fermée ou mergée écarte, ouverte ou illisible laisse passer.
     #[tokio::test]
     async fn mika2675_c_etat_de_forge_sur_la_porte() {
-        use webhook_prefilter::{PrForgeState, tests::Stub};
+        use webhook_prefilter::{Gate, PrForgeState, Release, tests::Stub};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let text = mika2675_review("approved", MIKA2675_QA, "VERDICT: pass");
-        for (forge, skipped) in [
-            (Ok(PrForgeState::Merged), true),
-            (Ok(PrForgeState::Closed), true),
-            (Ok(PrForgeState::Open), false),
-            (Err("gh 401"), false),
+        for (forge, gate) in [
+            (Ok(PrForgeState::Merged), Gate::Skipped),
+            (Ok(PrForgeState::Closed), Gate::Skipped),
+            (Ok(PrForgeState::Open), Gate::Charged(Release::PrOpen)),
+            (Err("gh 401"), Gate::Charged(Release::StateUnreadable)),
         ] {
             let stub = Stub {
                 pr_task: Some(Ok(false)),
@@ -6030,7 +6031,7 @@ mod tests {
             let got =
                 webhook_prefilter::skip_turn(&db, &stub, &text, mika2675_touched(false), "r", true)
                     .await;
-            assert_eq!(got, skipped, "{forge:?}");
+            assert_eq!(got, gate, "{forge:?}");
         }
         let rows = db
             .get_audit_event_rows_by_tool_name(webhook_prefilter::PREFILTER_SKIPPED_TOOL)
@@ -6043,6 +6044,7 @@ mod tests {
     /// touche garde le tour ; le `verdict_handler` lui-même, non.
     #[tokio::test]
     async fn mika2675_c_texte_touche_apres_le_verdict_handler() {
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let live = webhook_prefilter::LiveState {
@@ -6057,8 +6059,14 @@ mod tests {
             outside_ci_success_handler: true,
             outside_ci_failure_handler: true,
         };
-        assert!(!webhook_prefilter::skip_turn(&db, &live, &text, touched(true), "r", true).await);
-        assert!(webhook_prefilter::skip_turn(&db, &live, &text, touched(false), "r", true).await);
+        assert_eq!(
+            webhook_prefilter::skip_turn(&db, &live, &text, touched(true), "r", true).await,
+            Gate::Charged(Release::TextTouched)
+        );
+        assert_eq!(
+            webhook_prefilter::skip_turn(&db, &live, &text, touched(false), "r", true).await,
+            Gate::Skipped
+        );
     }
 
     // ---- mika#2675 phase 3 — classe (b) -----------------------------------
@@ -6168,6 +6176,7 @@ mod tests {
     #[tokio::test]
     async fn mika2675_b_porte_texte_interrupteur_et_audit_illisible() {
         use webhook_prefilter::tests::{GREEN_PR, HEAD_A, Stub, hold};
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let decided = || Stub {
@@ -6181,10 +6190,20 @@ mod tests {
             outside_ci_success_handler: o,
             outside_ci_failure_handler: true,
         };
-        for (stub, touched, enabled, skipped) in [
-            (decided(), outside(false), true, true),
-            (decided(), outside(true), true, false),
-            (decided(), outside(false), false, false),
+        for (stub, touched, enabled, gate) in [
+            (decided(), outside(false), true, Gate::Skipped),
+            (
+                decided(),
+                outside(true),
+                true,
+                Gate::Charged(Release::TextTouched),
+            ),
+            (
+                decided(),
+                outside(false),
+                false,
+                Gate::Charged(Release::SwitchDisarmed),
+            ),
             (
                 Stub {
                     event_rows: Some(Err("db down")),
@@ -6192,12 +6211,12 @@ mod tests {
                 },
                 outside(false),
                 true,
-                false,
+                Gate::Charged(Release::StateUnreadable),
             ),
         ] {
             let got =
                 webhook_prefilter::skip_turn(&db, &stub, GREEN_PR, touched, "r", enabled).await;
-            assert_eq!(got, skipped, "{touched:?} / enabled={enabled}");
+            assert_eq!(got, gate, "{touched:?} / enabled={enabled}");
         }
     }
 

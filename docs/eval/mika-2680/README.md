@@ -91,13 +91,35 @@ L'agrégat porte deux populations qui ne se soustraient pas l'une de l'autre :
 | moitié | champ | ce qu'elle dit |
 |---|---|---|
 | payée | `by_agent_trigger` | les tours qui ont **eu lieu**, par agent × déclencheur, avec leur coût |
+| payée | `charged_by_release` | **pourquoi** chacun a eu lieu, par terme de relâche (dix valeurs, vol 4) |
 | écartée | `skipped_by_class` | les tours que le pré-filtre a **évités**, par classe |
+
+**Les deux taxonomies ne se dérivent pas l'une de l'autre**, et c'est pour cela
+qu'il y a deux seaux. `skipped_by_class` nomme ce qu'une porte a reconnu ;
+`charged_by_release` nomme la porte qui a relâché. Un même `trigger` se répartit
+sur plusieurs termes de relâche, et un même terme traverse plusieurs
+déclencheurs.
 
 **Ce que le registre décide.** La moitié payée chiffre chaque classe candidate
 par son `trigger` : (e) est `pr_closed`, (g) est `check_suite_pr_branch` côté
-`mika-qa`, (h) est `issue_comment` et `issues_closed`. (f) se lit sur
-`text_touched: true` conjugué à un `trigger` de revue. Ces chiffres-là sont des
+`mika-qa`, (h) est `issue_comment` et `issues_closed`. Ces chiffres-là sont des
 mesures.
+
+**(f) ne se lit PAS sur `text_touched`, et ce document l'a dit à tort** jusqu'au
+vol 4. `text_touched` est `Touched::by_any_handler`, c'est-à-dire
+`req.text != original` : il est vrai pour une revue sans ligne `VERDICT:` comme
+pour une revue qu'un handler ultérieur a touchée, et vrai aussi dès que le
+`verdict_handler` a réécrit sans qu'aucun handler ultérieur n'intervienne. Le
+champ n'y sépare pas les chemins, il les agrège — un chiffre pris là ne
+désignerait aucune décision. C'est `charged_by_release` qui les sépare : voir la
+ligne **(f)** du § 9.
+
+**Le seau d'absence.** Une ligne `webhook_turn_charged` écrite par un binaire
+antérieur au vol 4 ne porte pas `release` ; elle est comptée sous
+`absent_pre_field`, jamais sous `null` ni `unknown`. Une fenêtre entièrement
+antérieure au déploiement se lit donc à 100 % dans ce seau, et c'est pourquoi le
+§ 5 ne gagne **pas** une troisième condition de halte pour ce champ-ci : le seau
+dit déjà la raison de sa propre absence.
 
 **Ce que le registre ne fait que majorer.** Un tour payé n'est pas un tour
 *inutile*. `by_agent_trigger` donne le **plafond** de ce qu'une classe pourrait
@@ -172,21 +194,22 @@ ne s'implémente pas : elle se pose à l'opérateur.
   poser** : le jeton de dispatch n'a pas le scope `workflow`, donc la branche du
   vol 2 ne peut pas porter `.github/workflows/ci.yml` — l'étape et son
   emplacement exact sont dans le corps de la PR du vol 2.
-- `crates/mika-agent/tests/fixtures/mika2680/` — trois corpus gelés et
-  synthétiques. Ils ne sont pas échantillonnés sur le journal vivant : une suite
-  qui le lirait changerait de verdict à mesure qu'il grossit.
+- `crates/mika-agent/tests/fixtures/mika2680/` — cinq corpus gelés et
+  synthétiques (trois du vol 2, deux ajoutés par le vol 4 pour le terme de
+  relâche). Ils ne sont pas échantillonnés sur le journal vivant : une suite qui
+  le lirait changerait de verdict à mesure qu'il grossit.
 
-## 9. L'état des quatre classes, après le vol 3
+## 9. L'état des quatre classes, après les vols 3 et 4
 
 Le § 7 dit ce que le vol 3 *fait* de l'artefact. Le § 2 bis dit pourquoi
 l'artefact n'est pas à sa portée. Ce qui suit est donc l'état réel, classe par
 classe — et **les quatre raisons ne sont pas la même raison** : c'est tout
 l'intérêt du tableau.
 
-| classe | déclencheur | état après le vol 3 | ce qui décide de cet état |
+| classe | déclencheur | état après les vols 3 et 4 | ce qui décide de cet état |
 |---|---|---|---|
 | **(e)** `closed`/`merged` d'une PR sans tâche de boucle | `pr_closed` | **implémentée** (`pr_closed_no_loop_task`) | la mesure 3 ne pouvait pas changer son chiffre |
-| **(f)** `pr_review` sur une PR fermée au texte réécrit par le `verdict_handler` | `pr_review` + `text_touched: true` | **résidu renvoyé** | la mesure 3 le chiffrerait, et elle seule |
+| **(f)** `pr_review` sur une PR fermée au texte réécrit par le `verdict_handler` | `pr_review` + `charged_by_release` | **couverte par (c) pour les deux formes citées** ; résidu = une décision AC2 et trois chemins non-filtres | le code servi, relu — pas une mesure |
 | **(g)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **bloquée par la mesure** | la mesure 3 est sa condition d'existence |
 | **(h)** `issue_comment` / `issues_closed` sans tâche de boucle | `issue_comment`, `issues_closed` | **posée à l'opérateur** | aucune mesure ne la tranche |
 
@@ -200,14 +223,36 @@ ne regarde le déclencheur `pr_closed`. (a) et (b) sont des `check_suite`, (c) u
 l'opérateur, à la main. La mesure 3 l'aurait confirmé ; elle ne le conditionnait
 pas. C'est la seule des quatre dont on peut dire cela.
 
-**(f) — renvoyée, pas refusée.** La classe (c), livrée en phase 2, couvre déjà
-le `pr_review` non actionnable sans tâche. Ce qui reste de (f) après (c) est le
-cas étroit où le texte a été **réécrit** et la PR est **fermée** — et ce résidu
-ne se lit nulle part ailleurs que dans l'agrégat, sur `text_touched: true`
-conjugué à un `trigger` de revue (§ 4). C'est précisément le champ que le vol 1
-a ajouté pour cela, et dont le `//` de jq masquait la valeur `false` avant le
-vol 2. Le résidu est donc **mesurable, et non mesuré** : il attend la commande
-du § 3, pas une décision.
+**(f) — sa prémisse était fausse, et le vol 4 l'a vérifiée sur le code servi.**
+Le ticket pose (f) sur l'idée que *« la règle « texte intact après handler » de
+la phase 2 exclut ce cas »*. Elle ne l'exclut pas. `after_verdict_handler` — la
+fenêtre que `Touched::applies_to` consulte pour un `Candidate::ReviewVerdict` —
+est calculée au site d'appel comme `text_after_verdict.as_ref().is_none_or(|t|
+req.text != *t)`, et `text_after_verdict` est pris **après** que le
+`verdict_handler` a rendu. La réécriture du `verdict_handler` est donc **dans**
+la fenêtre : seul un handler **ultérieur** garde le tour. Les deux formes que le
+constat cite nommément sont par conséquent déjà écartées par la classe (c) —
+`CIRCUIT BREAKER TRIPPED` par `verdict_pr_closed`, `verdict_classification_failed`
+par `verdict_unreadable` — et les quatre assertions de
+`mika2680_f_le_pr_review_reecrit_est_deja_ecarte` gèlent ce constat dans la
+suite, de sorte qu'un futur handler intercalé le fasse rougir au lieu de le
+rouvrir.
+
+Ce qui reste n'est pas un résidu mesurable mais **quatre chemins de nature
+différente**, que `charged_by_release` sépare et qu'aucune conjonction de champs
+ne séparait :
+
+| terme de relâche | ce que c'est | ce qu'il faudrait pour agir |
+|---|---|---|
+| `not_classified` | une revue **hors population** : pas de ligne `VERDICT:`, donc hors du périmètre de (c) — typiquement une consigne opérateur en prose | une **décision AC2** (mika#2675) : élargir la population au `pr_review` sans verdict, ou pas |
+| `pr_task_active` | une tâche de boucle vit sur la PR | rien : le tour est légitime |
+| `state_unreadable` | la forge ou la base n'a pas répondu | rien : fail-safe vers le LLM, par construction |
+| `text_touched` | un handler **ultérieur** a réécrit | rien : la règle de la phase 2 fait son travail |
+
+Trois de ces quatre chemins **ne sont pas des filtres** : les toucher reviendrait
+à retirer un garde fail-safe. Le quatrième est une question, pas un chiffre — et
+c'est pourquoi (f) ne passe pas de « renvoyée » à « implémentée » mais de
+« renvoyée » à **tranchée** : il n'y a pas de classe (f) à écrire.
 
 **(g) — la mesure n'est pas un confort, c'est sa condition.** Son plafond se
 superpose à ce que (b) écarte déjà : la mesure 2 le dit en toutes lettres,
@@ -216,6 +261,18 @@ aucune `check_suite` de branche de PR n'avait été vue depuis le déploiement d
 écarte. Et la question du § 7.2 — *que fait mika-qa de ce tour ?* — porte sur un
 agent dont le fan-out est délibéré (mika#1711). Les deux termes manquent, et les
 deux sont dans l'artefact.
+
+**Ce que le vol 4 change pour (g) : la soustraction devient lisible.** Avant lui,
+`by_agent_trigger` donnait le plafond de (g) — les `check_suite_pr_branch` payées
+côté mika-qa — et rien ne disait lesquelles (b) aurait écartées si elle avait vu
+la tête. `charged_by_release` le dit, parce que c'est exactement ce que (b)
+décide : un `check_suite` vert de branche de PR relâché sous
+`head_not_previously_decided` est un **premier** traitement de cette tête, que
+(b) ne prétend pas couvrir ; un relâché sous `no_decision_attested` ou
+`text_touched` est passé devant (b) pour une autre raison, nommée. Le chiffre
+de (g) après retrait n'est donc plus une estimation mais une soustraction :
+plafond moins les seaux que (b) revendique. La mesure 3 reste sa condition — le
+vol 4 lui fournit l'opérande qui manquait, il ne la remplace pas.
 
 **(h) — le plus gros volume, et le seul blocage qui ne soit pas un chiffre.**
 1,30 M tokens, 79 % de la fenêtre de la mesure 2 : le volume est établi. Ce qui
