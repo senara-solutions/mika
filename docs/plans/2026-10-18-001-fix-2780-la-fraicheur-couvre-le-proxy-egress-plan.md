@@ -1,8 +1,8 @@
 # fix(loop-substrate) — vol 3 : le contrôle de fraîcheur des démons couvre le proxy egress
 
 - **Ticket :** senara-solutions/mika#2780 (`bug`, `p1-important`, `infrastructure`, `ready`, `dispatch:loop`, `loop-substrate`)
-- **Branche :** `fix/2780/dispatch-le-contr-le-de-fra-cheur-des-d` (repartie de `main`, `0/0` contre `origin/main` au moment du groom)
-- **Date :** 2026-10-18
+- **Branche :** `fix/2780/dispatch-le-contr-le-de-fra-cheur-des-d` (repartie de `main`, `2/0` contre `origin/main` au moment de ce re-groom — les deux commits en avance sont les passes de grooming précédentes, aucun code)
+- **Date :** 2026-10-18, **re-groomé le 2026-10-19** : les faits M1–M8 et les mesures S1–S4 sont ré-établis contre le code de ce jour. Le harnais de test a gagné 153 lignes entre-temps (14334 → 14487) et **le placement des sondes du § C5 en était faussé** — voir le § « Ce que le re-groom du 2026-10-19 a corrigé ».
 - **Vol :** 3 sur 3 de la lignée mika#2029. **Prédécesseurs :** `2026-10-15-002-fix-2029-le-kill-sans-production-se-compte-par-son-nom-plan.md` (vol 1, mergé par #2720) et `2026-10-16-003-fix-2029-un-demon-ne-survit-plus-a-son-code-plan.md` (vol 2, mergé par #2746, commit `474c6b0a`). Le vol 2 a explicitement renvoyé ce livrable : « UN seul lanceur est câblé : le `mitmdump`. Le relais est le vol 3. »
 - **Lignée :** mika#2041 (le socket orphelin qui satisfait `[ -S ]`) → mika#2049 (la posture *fail-closed* du relais) → mika#2051 (le pid comme jointure) → mika#2029 vols 1–2 (le mécanisme de fraîcheur) → **ce vol** (le second porteur) → mika#2778 (l'occurrence qui l'a rendu visible)
 
@@ -67,38 +67,56 @@ avec le commentaire qui dit pourquoi ce n'est pas `pkill -f`. La forme existe
 donc déjà dans le dépôt pour ce socket précis.
 
 **M8 — Le harnais de fraîcheur existe et il est déjà câblé en CI.**
-`skills/bundled/_shared/test-dispatch-lib.sh:14135-14334` (fin du fichier, qui en
-compte 14334) porte `_daemon_freshness_probe` (`:14148`) et les quatre sondes
-V1–V4 (`:14277`, `:14283`, `:14291`, `:14298`), suivies de l'assertion
-`T2029_VERDICT_BLOCK` (`:14319`). `.github/workflows/ci.yml:85` appelle
-`make test-dispatch-lib`, et le `Makefile:193` le résout en
+`skills/bundled/_shared/test-dispatch-lib.sh` compte **14487** lignes, et le bloc
+mika#2029 y occupe `:14282-14475` : titre de section (`:14282`),
+`_daemon_freshness_probe` (`:14301`), garde `command -v fuser` du `SKIP` bruyant
+(`:14416`), les quatre sondes V1–V4 (`assert_eq` à `:14428`, `:14434`, `:14442`,
+`:14449`), le commentaire de contre-vacuité V5 (`:14453-14466`), puis l'assertion
+`T2029_VERDICT_BLOCK` (`:14472-14475`). `.github/workflows/ci.yml:85` appelle
+`make test-dispatch-lib`, et le `Makefile:195` le résout en
 `bash skills/bundled/_shared/test-dispatch-lib.sh`. L'exigence mika#2578 (« un
 détecteur qu'aucun workflow ne lance ne refuse rien ») est donc satisfaite **par
 placement** : les cas de ce vol atterrissent dans ce fichier et rien n'est à
 câbler.
 
+> **Le bloc mika#2029 ne clôt PAS le fichier, et c'est ce qui décide du
+> placement.** À `:14477` commence `# --- Summary ---`, qui imprime
+> `Results: $PASS passed, $FAIL failed` puis `exit 1` sur échec et `exit 0`
+> sinon (`:14477-14487`). Une sonde posée *après* ce bloc ne serait jamais
+> comptée dans le décompte imprimé, et une sonde posée après le `exit` ne
+> tournerait pas du tout — c'est-à-dire un détecteur qui ne s'arme pas, donc le
+> défaut même que mika#2578 refuse. **Les trois sondes de ce vol atterrissent
+> entre `:14475` (dernière ligne de l'assertion `T2029_VERDICT_BLOCK`) et
+> `:14477` (`# --- Summary ---`).** Les deux passes de grooming précédentes
+> situaient le placement « après l'assertion, qui clôt aujourd'hui le fichier » :
+> c'était déjà imprécis et la croissance du fichier l'a rendu faux. Le repère
+> défendable n'est pas un numéro de ligne mais une **borne nommée** — avant
+> `# --- Summary ---` —, et c'est sous cette forme que l'implémentation doit le
+> lire, parce que ce fichier grandit de plusieurs dizaines de lignes par semaine.
+
 > **Le chemin, en entier, parce qu'il trompe.** La suite est sous
 > `skills/bundled/_shared/`, **à côté** de `dispatch-lib.sh` — et non sous
 > `scripts/`, où vivent `test-pilot-egress-proxy-status.py` et les autres
 > harnais du dépôt. Une recherche sur `scripts/test-dispatch-lib.sh` ne rend
-> rien (constaté dans cette session de groom). Les deux fichiers de ce vol sont
-> donc dans le **même** répertoire.
+> rien (re-constaté le 2026-10-19). Les deux fichiers de ce vol sont donc dans
+> le **même** répertoire.
 
 ### Les quatre mesures faites aujourd'hui pour ce groom
 
 Le ticket laisse au groom le choix de la forme d'identification du porteur du
 socket, en demandant qu'elle soit **mesurée**. Elle l'est — sondes sous
-`.pilot-scratch/sockprobe/`, **ré-exécutées dans cette session de groom** (le
-répertoire repart vide à chaque préparation de worktree, donc la trace qui fait
-foi est la sortie recopiée ci-dessous, jamais le répertoire ; les pids diffèrent
-d'un passage à l'autre, les verdicts non) :
+`.pilot-scratch/sockprobe/`, **ré-exécutées le 2026-10-19 dans cette session de
+re-groom** (le répertoire repart vide à chaque préparation de worktree, donc la
+trace qui fait foi est la sortie recopiée ci-dessous, jamais le répertoire ; les
+pids diffèrent d'un passage à l'autre, les verdicts non — c'est la troisième
+exécution concordante).
 
 **S1 — `fuser <chemin-de-socket-unix>` rend le pid du porteur, dans la même
-forme que `fuser -n tcp <port>`.** Écouteur `AF_UNIX` réel, pid de vérité 318 :
+forme que `fuser -n tcp <port>`.** Écouteur `AF_UNIX` réel, pid de vérité 324 :
 
 ```
-fuser: rc=0 stdout='   318' stderr='/tmp/sockprobe-2780-93dy4s9t/probe.sock:\n'
-holder_pids=['318']  S1_holder_found=yes
+fuser: rc=0 stdout='   324' stderr='/tmp/sockprobe-2780-t5twr6by/probe.sock:\n'
+holder_pids=['324']  S1_holder_found=yes
 ```
 
 Pids sur **stdout**, libellé sur **stderr**, espaces de tête — exactement ce que
@@ -107,11 +125,12 @@ la boucle de découpage de `_pilot_daemon_holder_pid` consomme déjà. Un repli 
 soixantaine de lignes de python pour un gain nul : **il n'est pas retenu**.
 
 **S2 — `fuser` n'apparie QUE le porteur, pas les clients connectés.** Écouteur
-318, client réellement connecté 319, sonde 311 :
+324, client réellement connecté 325 (connexion **établie et tenue**, pas un
+`connect()` refermé), sonde 317 :
 
 ```
-server_pid=318 client_pid=319 self_pid=311
-fuser: rc=0 stdout='   318'
+server_pid=324 client_pid=325 self_pid=317
+fuser: rc=0 stdout='   324'
 S2_client_absent=yes  S2_self_absent=yes
 ```
 
@@ -140,15 +159,21 @@ le porteur est visible.
 `is_socket=True`) mais `connect()` échoue `ECONNREFUSED` :
 
 ```
+before_TERM: connectable=yes
 after_TERM: path_exists=True is_socket=True connectable=no(111)
 rebind_without_unlink=ERR errno=98 [Errno 98] Address already in use
 ```
 
 L'attente bornée de la libération fonctionne donc telle quelle sur un socket
-unix. La seconde ligne est la raison pour laquelle le lanceur n'a rien à changer :
-le proxy délie lui-même un socket orphelin avant `bind()`
-(`mika-pilot-egress-proxy:1384-1396`) et le délie aussi dans son handler
-`SIGTERM` (`:1416-1462`).
+unix : la sonde conclut sur `ECONNREFUSED` dès la mort du porteur, au lieu de
+tourner jusqu'à sa fenêtre pleine comme le ferait un test sur `[ -S ]` (la panne
+de mika#2041, qui est précisément un socket orphelin satisfaisant `[ -S ]`). La
+troisième ligne est la raison pour laquelle le lanceur n'a rien à changer : le
+chemin survivant refuserait un `bind()` nu (`EADDRINUSE`), mais le proxy délie
+lui-même un socket orphelin avant `bind()`
+(`mika-pilot-egress-proxy:1380-1396`, avec le refus explicite de délier un
+non-socket à `:1392`) et le délie aussi dans son handler `SIGTERM`
+(`:1416-1462`).
 
 ---
 
@@ -323,9 +348,16 @@ Trois propriétés, chacune portant une conséquence :
 
 `_relay_freshness_probe <état>` dans
 `skills/bundled/_shared/test-dispatch-lib.sh` (M8 : le chemin, pas `scripts/`),
-calqué sur `_daemon_freshness_probe` (`:14148`) et placé après le bloc V1–V4,
-c'est-à-dire **après** l'assertion `T2029_VERDICT_BLOCK` (`:14319`) qui clôt
-aujourd'hui le fichier :
+calqué sur `_daemon_freshness_probe` (`:14301`).
+
+**Le placement, par borne nommée et non par numéro de ligne** (M8) : après
+l'assertion `T2029_VERDICT_BLOCK` et **avant la ligne `# --- Summary ---`**. Ce
+fichier grandit de plusieurs dizaines de lignes par semaine — il est passé de
+14334 à 14487 lignes entre le groom du 18 et celui du 19 —, donc tout repère
+chiffré est périmé à l'implémentation. La borne est ce qui doit être cherché, et
+la conséquence de la manquer est nommée : une sonde après le bloc Summary n'est
+pas comptée dans le décompte imprimé, et une sonde après son `exit` ne tourne
+pas. Le contenu :
 
 - un faux relais exécutable qui inscrit son pid puis `exec python3` un écouteur
   `AF_UNIX` sur le chemin reçu en argument (le vrai lanceur passe `--host-unix
@@ -384,10 +416,18 @@ Un seul commit : la règle et ses cas atterrissent ensemble (mika#2578).
    `make test-dispatch-lib` — les sondes V1–V4 du `mitmdump` doivent rester
    vertes. Si l'une rougit ici, le refactor D1 est en cause et rien d'autre.
 6. **C4** — le câblage du relais.
-7. **C5** — `_relay_freshness_probe` et les trois sondes R1–R3.
+7. **C5** — `_relay_freshness_probe` et les trois sondes R1–R3, posées **avant la
+   ligne `# --- Summary ---`** du harnais et après l'assertion
+   `T2029_VERDICT_BLOCK`. Cherche la borne par son texte, jamais par un numéro de
+   ligne (M8 : le fichier a bougé de 153 lignes en un jour). **Contrôle du
+   placement, à faire tout de suite :** le `Results:` imprimé par
+   `make test-dispatch-lib` doit monter de **exactement 3** assertions passées.
+   S'il ne bouge pas, les sondes sont tombées derrière le Summary et ne s'arment
+   pas — c'est la seule façon pour ce vol de livrer un détecteur muet.
 8. **C6** — exécuter le contrôle de contre-vacuité contre `origin/main`, consigner
    le résultat dans le commentaire et dans le corps de PR.
-9. **Doc** — § 4.5 de `docs/operator/pilot-egress-relay.md` (voir ci-dessous).
+9. **Doc** — § 4.5 de `docs/operator/pilot-egress-relay.md` (`:274`, voir
+   ci-dessous).
 10. `bash -n` sur les deux fichiers touchés — `skills/bundled/_shared/dispatch-lib.sh`
     et `skills/bundled/_shared/test-dispatch-lib.sh`, voisins dans le même
     répertoire (M8) — puis `make test-dispatch-lib` et
@@ -427,6 +467,7 @@ modifications :
 | V-F | Les sondes mesurent le correctif et non le décor | contrôle de contre-vacuité C6 contre `origin/main` : `token=none launches=1` sur l'état de R2 |
 | V-G | Aucun chemin de refus nouveau n'est ajouté | lecture : le seul `return 1` nouveau est celui de l'arrêteur, consommé par `|| return 0` ; `_PILOT_EGRESS_ABORT` n'est assigné sur aucun chemin nouveau |
 | V-H | Le fichier parse | `bash -n` sur `dispatch-lib.sh` et `test-dispatch-lib.sh` (la première est déjà assertée dans la suite) |
+| V-I | Les trois sondes **s'arment** — elles ne sont pas tombées derrière le bloc `Summary` | le `Results: <n> passed` de `make test-dispatch-lib` monte de exactement 3 par rapport à `origin/main` (étape 7) |
 
 ---
 
@@ -451,7 +492,10 @@ depuis plus de 300 s — est déjà en train d'être tué par son propre watchdo
 (`idle_timeout`, cpp#170), ce qui est la justification de la fenêtre au vol 2. Le
 proxy, lui, unwind proprement sur `SIGTERM` même avec un tunnel établi
 (`server.close()` et non `wait_closed()`, mesuré et commenté à
-`mika-pilot-egress-proxy:1437-1449`).
+`mika-pilot-egress-proxy:1440-1447`, dont le commentaire nomme la raison :
+depuis CPython 3.12.1, `wait_closed()` bloque jusqu'à la fermeture de chaque
+client vivant, donc un `SIGTERM` sous un tunnel établi ne rendrait jamais la
+main).
 
 **R3 — Le refactor D1 traverse le chemin `mitmdump`, hors périmètre.** Mitigé par
 M4 (un seul appelant par fonction, tous dans ce fichier) et par l'étape 5, qui
@@ -502,6 +546,43 @@ par pid, et seulement les pids que son propre faux démon a inscrits.
 
 ---
 
+## Ce que le re-groom du 2026-10-19 a corrigé
+
+Ce plan a été groomé le 2026-10-18 (deux passes), puis **re-dispatché**. Tous ses
+faits ont été ré-établis contre le code du 19 ; la branche est à `2/0` contre
+`origin/main` et ne porte aucun code. Ce qui a changé :
+
+**Une correction de substance — le placement des sondes (C5, M8).** Les deux
+passes du 18 situaient le harnais « après l'assertion `T2029_VERDICT_BLOCK`, qui
+clôt aujourd'hui le fichier ». Elle ne le clôt pas : un bloc
+`# --- Summary ---` la suit, qui imprime le décompte puis sort. Suivie à la
+lettre, cette instruction faisait poser trois détecteurs derrière le point de
+sortie du harnais — un vol dont le livrable *est* un détecteur aurait livré un
+détecteur muet. Le plan borne désormais le placement par un **texte** et non par
+un numéro, et V-I le mesure (le décompte imprimé monte de exactement 3).
+
+**Des ancres rafraîchies.** `test-dispatch-lib.sh` est passé de 14334 à 14487
+lignes entre les deux grooms, donc chacun de ses numéros de ligne était faux :
+`_daemon_freshness_probe` `:14148` → `:14301`, V1–V4 `:14277…` → `:14428…`,
+`T2029_VERDICT_BLOCK` `:14319` → `:14472`, `Makefile:193` → `:195`. Les ancres de
+`mika-pilot-egress-proxy` ont glissé de deux à trois lignes
+(`:1437-1449` → `:1440-1447`, `:1384-1396` → `:1380-1396`). **Celles de
+`dispatch-lib.sh` n'ont pas bougé** — les onze citées en M1–M4 sont exactes au
+19, de même que `canary-pilot-containment:320-323` (M7) et le § 4.5 de la doc
+(`:274`, phrase à retirer `:287`).
+
+**Les quatre mesures ré-exécutées.** S1–S4 sont rejouées dans la session du 19 et
+concordent pour la troisième fois ; seuls les pids diffèrent, aucun verdict. Les
+sondes vivent sous `.pilot-scratch/sockprobe/` et le répertoire repart vide à
+chaque préparation de worktree : la trace qui fait foi est la sortie recopiée
+dans ce plan, jamais le répertoire.
+
+**Ce qui n'a PAS changé :** les sept décisions D1–D7, la conception C1–C6 hors
+placement, les cinq risques, la Fire-Disposition et l'estimation de taille. Les
+mesures qui les fondent tiennent toutes.
+
+---
+
 ## Definition of Done
 
 1. `_pilot_daemon_freshness` est interrogé par **les deux** lanceurs de démons de
@@ -515,7 +596,9 @@ par pid, et seulement les pids que son propre faux démon a inscrits.
 5. Aucun chemin de refus de dispatch nouveau n'est ajouté (V-G).
 6. Les trois sondes R1–R3 sont dans
    `skills/bundled/_shared/test-dispatch-lib.sh`, dans le même commit que la
-   règle, et CI les lance déjà (M8).
+   règle, et CI les lance déjà (M8) — **posées avant le bloc `# --- Summary ---`,
+   et le décompte imprimé par `make test-dispatch-lib` monte de exactement 3**
+   (V-I : une sonde derrière le point de sortie du harnais ne s'arme pas).
 7. V1–V4 du `mitmdump` restent vertes.
 8. Le § 4.5 de `docs/operator/pilot-egress-relay.md` décrit les deux porteurs, et
    la phrase « ce vol ne câble que le `mitmdump` » a disparu.
