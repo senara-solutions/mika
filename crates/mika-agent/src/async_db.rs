@@ -1890,17 +1890,23 @@ impl AsyncDatabase {
     }
 
     /// Les vols d'implémentation terminés sur un ensemble de tickets (mika#2698).
-    /// Voir [`crate::db::Database::list_finished_implement_flights`] pour la
-    /// borne temporelle, l'ensemble clos des variantes d'URL et le filtre de
-    /// statut terminal.
-    pub async fn list_finished_implement_flights(
+    /// Voir [`crate::db::Database::list_finished_implement_flights_in_container`]
+    /// pour la borne temporelle, l'ensemble clos des variantes d'URL et le
+    /// filtre de statut terminal.
+    ///
+    /// **La seule méthode de ce fichier qui ne lit pas `self.agent_id`**, et
+    /// c'est le correctif de mika#2792 : ce handle ne sert que de **connexion**
+    /// — le conteneur n'a qu'une base — et l'`agent_id` qu'il porte n'entre pas
+    /// dans la requête. Le réintroduire re-scoperait la lecture sur l'agent
+    /// qu'un appelant a emprunté par commodité, qui n'est pas celui chez qui
+    /// vivent les vols.
+    pub async fn list_finished_implement_flights_in_container(
         &self,
         since: Option<String>,
         issue_urls: Vec<String>,
     ) -> Result<Vec<Task>> {
-        let id = self.agent_id.clone();
         self.with_db(move |db| {
-            db.list_finished_implement_flights(&id, since.as_deref(), &issue_urls)
+            db.list_finished_implement_flights_in_container(since.as_deref(), &issue_urls)
         })
         .await
     }

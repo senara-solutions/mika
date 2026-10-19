@@ -4929,11 +4929,25 @@ impl Database {
     /// « un statut inconnu n'est pas terminal » ne se lit pas (même raison,
     /// nommée au même endroit, que `find_dispatch_children_for_issue_url`).
     ///
-    /// `agent_id` est dans la requête comme dans toute autre méthode de tâche :
-    /// un manager ne voit que les vols de son propre agent.
-    pub fn list_finished_implement_flights(
+    /// **Le scope est le conteneur, pas un agent** (mika#2792) — et c'est ce que
+    /// le nom de la méthode dit. Il n'y a pas d'`agent_id` dans la requête,
+    /// parce que **le manager n'a pas d'agent** : la cadence est une tâche de
+    /// processus. La version mika#2698 filtrait sur l'`agent_id` du handle qu'on
+    /// lui avait emprunté pour obtenir une connexion — sur gentux l'agent par
+    /// défaut, alors que les vols d'implement sont des tâches de `mika-dev`. La
+    /// requête interrogeait donc un agent sans aucun vol et rendait zéro ligne,
+    /// indiscernable de « aucun vol terminé » : 43 vols en quatre jours, aucun
+    /// verdict.
+    ///
+    /// Lever le filtre ne traverse aucune frontière : `init_agent` ouvre une
+    /// base **unique** par conteneur (`home::container_db_path`), donc le scope
+    /// par `agent_id` y est purement logique, et un conteneur est un client
+    /// (topologie « one container per customer »). Le filtre porteur reste
+    /// `reference_url IN (…)` — les sous-issues du milestone que le manager
+    /// surveille déjà : la lecture **coïncide** désormais avec sa surveillance,
+    /// elle ne l'élargit pas.
+    pub fn list_finished_implement_flights_in_container(
         &self,
-        agent_id: &str,
         since: Option<&str>,
         issue_urls: &[String],
     ) -> Result<Vec<Task>> {
@@ -4945,23 +4959,20 @@ impl Database {
             .flat_map(|u| crate::task_state::tasks::issue_url_variants(u))
             .collect();
         let placeholders: String = (0..variants.len())
-            .map(|i| format!("?{}", i + 3))
+            .map(|i| format!("?{}", i + 2))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
             "SELECT {} FROM tasks
-             WHERE agent_id = ?1
-               AND COALESCE(dispatch_class, 'implement') = 'implement'
+             WHERE COALESCE(dispatch_class, 'implement') = 'implement'
                AND reference_url IN ({placeholders})
-               AND COALESCE(completed_at, updated_at) > ?2
+               AND COALESCE(completed_at, updated_at) > ?1
              ORDER BY COALESCE(completed_at, updated_at) ASC",
             Self::TASK_COLUMNS,
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-            Box::new(agent_id.to_string()),
-            Box::new(since.unwrap_or("").to_string()),
-        ];
+        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(since.unwrap_or("").to_string())];
         for v in &variants {
             bind.push(Box::new(v.clone()));
         }

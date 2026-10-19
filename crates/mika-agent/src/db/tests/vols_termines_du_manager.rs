@@ -2,9 +2,13 @@
 //! veut dire en SQL (mika#2698, vol 1).
 //!
 //! Le lecteur unique est
-//! [`crate::db::Database::list_finished_implement_flights`], et quatre de ses
-//! clauses sont des décisions, pas des détails :
+//! [`crate::db::Database::list_finished_implement_flights_in_container`], et
+//! cinq de ses clauses sont des décisions, pas des détails :
 //!
+//! - **l'absence de clause `agent_id`** (mika#2792) : le manager n'a pas
+//!   d'agent, et filtrer sur celui du handle emprunté pour la connexion est
+//!   exactement ce qui a rendu l'évaluateur inerte pendant quatre jours. Le
+//!   scope est le conteneur, qui n'a qu'une base ;
 //! - **l'ensemble clos des variantes d'URL** (`issue_url_variants`), parce que
 //!   `reference_url` porte parfois `?phase=groom` — et parce qu'une égalité,
 //!   contrairement à un `LIKE` préfixe, ne confond pas `#2693` avec `#26930`
@@ -53,12 +57,27 @@ fn seed_vol_termine(db: &Database, agent_id: &str, reference_url: &str) -> Strin
     id
 }
 
+/// Lit les vols du ticket de référence. **Plus d'agent à passer** (mika#2792) :
+/// c'est le conteneur qui est interrogé, et l'absence de ce paramètre est la
+/// forme même du correctif.
 fn lire(db: &Database, since: Option<&str>) -> Vec<String> {
-    db.list_finished_implement_flights("mika", since, &[issue_url(TICKET)])
+    lire_sur(db, since, &[issue_url(TICKET)])
+}
+
+/// Idem, sur une liste d'URLs choisie par l'appelant.
+fn lire_sur(db: &Database, since: Option<&str>, urls: &[String]) -> Vec<String> {
+    db.list_finished_implement_flights_in_container(since, urls)
         .expect("la lecture doit répondre")
         .into_iter()
         .map(|t| t.id)
         .collect()
+}
+
+/// Enregistre un agent pour que ses lignes de `tasks` puissent exister :
+/// `tasks.agent_id` est une FK vers `agents(id)`.
+fn enregistrer(db: &Database, agent_id: &str) {
+    db.register_agent(agent_id, agent_id, &format!("/tmp/{agent_id}"))
+        .expect("l'agent doit être enregistré");
 }
 
 /// La variante `?phase=groom` est dans l'ensemble clos : un vol estampillé sous
@@ -83,11 +102,7 @@ fn mika2698_le_voisin_numerique_nest_pas_apparie() {
     );
 
     // Contrôle positif : la fixture est bien enregistrée, sous son ticket.
-    let vu = db
-        .list_finished_implement_flights("mika", None, &[issue_url(VOISIN)])
-        .expect("la lecture doit répondre");
-    assert_eq!(vu.len(), 1);
-    assert_eq!(vu[0].id, voisin);
+    assert_eq!(lire_sur(&db, None, &[issue_url(VOISIN)]), vec![voisin]);
 }
 
 /// **La clause porteuse.** Un vol mort par `failed` sans `completed_at` est vu,
@@ -108,7 +123,7 @@ fn mika2698_un_vol_mort_sans_completed_at_est_vu_par_le_coalesce() {
         .expect("le passage en failed doit réussir");
 
     let vu = db
-        .list_finished_implement_flights("mika", None, &[issue_url(TICKET)])
+        .list_finished_implement_flights_in_container(None, &[issue_url(TICKET)])
         .expect("la lecture doit répondre");
     assert_eq!(vu.len(), 1, "le vol mort sans `completed_at` doit être vu");
     assert_eq!(vu[0].id, id);
@@ -203,27 +218,73 @@ fn mika2698_le_grooming_est_exclu_et_la_classe_absente_vaut_implement() {
     );
 }
 
-/// La lecture est cantonnée à l'agent : le manager d'un agent ne lit pas les
-/// vols d'un autre.
+/// **L'assertion renversée, et pourquoi** (mika#2792).
+///
+/// Ce test s'appelait `mika2698_la_lecture_est_cantonnee_a_lagent` et exigeait
+/// l'inverse : qu'un vol de `mika-qa` soit **invisible** depuis un handle
+/// `mika`. C'est ce cantonnement qui a rendu l'évaluateur de vols inerte —
+/// quatre jours, 43 vols, aucun verdict — parce que le manager n'a pas d'agent
+/// et interrogeait celui qu'il avait emprunté pour obtenir une connexion.
+///
+/// Le test n'a pas été supprimé : il est **retourné**, pour qu'un lecteur de
+/// l'historique trouve la trace du renversement plutôt qu'un trou. Ce qui porte
+/// désormais la délimitation est l'URL d'issue, et c'est
+/// [`mika2792_un_vol_hors_milestone_nest_pas_trouve_meme_sous_un_autre_agent`]
+/// qui l'exige.
 #[test]
-fn mika2698_la_lecture_est_cantonnee_a_lagent() {
+fn mika2792_la_lecture_nest_plus_cantonnee_a_lagent() {
     let db = db();
-    // `tasks.agent_id` est une FK vers `agents(id)` : l'autre agent doit
-    // exister pour que sa ligne existe.
-    db.register_agent("mika-qa", "Mika QA", "/tmp/qa")
-        .expect("l'autre agent doit être enregistré");
-    let autre = seed_vol_termine(&db, "mika-qa", &issue_url(TICKET));
-    assert!(
-        lire(&db, None).is_empty(),
-        "le vol de `mika-qa` a été lu sous `mika`"
+    enregistrer(&db, "mika-qa");
+    enregistrer(&db, "mika-dev");
+
+    let qa = seed_vol_termine(&db, "mika-qa", &issue_url(TICKET));
+    let dev = seed_vol_termine(&db, "mika-dev", &issue_url(TICKET));
+
+    let vu = lire(&db, None);
+    assert_eq!(
+        vu.len(),
+        2,
+        "deux vols sous deux agents distincts : les deux sont rendus, obtenu {vu:?}"
+    );
+    assert!(vu.contains(&qa) && vu.contains(&dev));
+}
+
+/// **Le contrôle positif que la suite de mika#2698 n'avait pas.** Un vol semé
+/// sous un `agent_id` qui n'est pas celui du handle par défaut doit être trouvé.
+/// C'est la forme exacte de la production : les vols d'implement sont des tâches
+/// de `mika-dev`, le handle emprunté par la cadence est celui de l'agent par
+/// défaut du processus.
+#[test]
+fn mika2792_un_vol_seme_sous_un_autre_agent_est_trouve() {
+    let db = db();
+    enregistrer(&db, "mika-dev");
+    let id = seed_vol_termine(&db, "mika-dev", &issue_url(TICKET));
+    assert_eq!(
+        lire(&db, None),
+        vec![id],
+        "le vol de `mika-dev` doit être trouvé — c'est là que vivent les vols"
+    );
+}
+
+/// **Le contrôle négatif.** Lever le filtre agent n'a pas levé la délimitation :
+/// un vol sur une URL hors de la liste reste invisible, y compris quand il
+/// appartient à un autre agent. Le filtre porteur est bien l'URL d'issue.
+#[test]
+fn mika2792_un_vol_hors_milestone_nest_pas_trouve_meme_sous_un_autre_agent() {
+    let db = db();
+    enregistrer(&db, "mika-dev");
+    let dehors = seed_vol_termine(&db, "mika-dev", &issue_url(VOISIN));
+    let dedans = seed_vol_termine(&db, "mika-dev", &issue_url(TICKET));
+
+    assert_eq!(
+        lire(&db, None),
+        vec![dedans],
+        "seul le vol du ticket interrogé sort, même sous un autre agent"
     );
 
-    // Contrôle positif sur la fixture.
-    let vu = db
-        .list_finished_implement_flights("mika-qa", None, &[issue_url(TICKET)])
-        .expect("la lecture doit répondre");
-    assert_eq!(vu.len(), 1);
-    assert_eq!(vu[0].id, autre);
+    // Contrôle positif sur la fixture écartée : elle existe bien, et c'est son
+    // URL — non son agent — qui l'a tenue dehors.
+    assert_eq!(lire_sur(&db, None, &[issue_url(VOISIN)]), vec![dehors]);
 }
 
 /// **Le contrôle négatif du détecteur.** Aucune URL ne peut pas vouloir dire
@@ -236,7 +297,7 @@ fn mika2698_aucune_url_ne_rend_jamais_tous_les_vols() {
     seed_vol_termine(&db, "mika", &issue_url(VOISIN));
 
     let vu = db
-        .list_finished_implement_flights("mika", None, &[])
+        .list_finished_implement_flights_in_container(None, &[])
         .expect("la lecture doit répondre, pas échouer sur un `IN ()` vide");
     assert!(vu.is_empty(), "aucune URL ⇒ aucun vol, jamais tous");
 }

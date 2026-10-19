@@ -1749,13 +1749,25 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 // l'opérateur n'a pas déclaré l'endpoint.
                 std::sync::Arc::new(crate::milestone_manager::HttpLivenessSink::new()),
                 // mika#2698 vol 1 — d'où viennent les vols terminés à évaluer.
-                // Scopée à la base de l'agent par défaut pour la même raison que
-                // le ledger ci-dessus : la cadence est une tâche de processus,
-                // sans agent propre, et `AsyncDatabase` porte l'`agent_id` que la
-                // requête filtre. `None` quand l'agent par défaut est absent —
-                // une source manquante rend un rapport sans la section, jamais un
-                // cycle mort. Lecture seule : aucune autorité d'écriture ne passe
-                // par ce paramètre.
+                //
+                // `agents.get(&default_agent)` fournit une **connexion**, et
+                // rien d'autre : le conteneur n'a qu'une base
+                // (`home::container_db_path`), et depuis mika#2792 la requête ne
+                // filtre plus sur l'`agent_id` que ce handle porte — son lecteur
+                // est `list_finished_implement_flights_in_container`, dont le nom
+                // dit le scope. Ce commentaire affirmait l'inverse, et c'est
+                // l'affirmation qui portait le défaut : sur gentux l'agent par
+                // défaut est `mika-test`, les vols d'implement sont des tâches de
+                // `mika-dev`, donc la source interrogeait un agent sans aucun vol
+                // et rendait zéro ligne — quarante-trois vols en quatre jours,
+                // aucun verdict, un vide indiscernable de « aucun vol terminé ».
+                // Le périmètre de lecture, c'est `issue_urls` : les sous-tickets
+                // du milestone que le manager surveille déjà.
+                //
+                // `None` quand l'agent par défaut est absent — une source
+                // manquante rend un rapport sans la section, jamais un cycle
+                // mort. Lecture seule : aucune autorité d'écriture ne passe par
+                // ce paramètre.
                 agents.get(&default_agent).map(|entry| {
                     std::sync::Arc::new(crate::flight_source::DbFlightSource::new(
                         entry.value().db.clone(),
