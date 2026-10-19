@@ -2459,6 +2459,83 @@ _pilot_gitdir_bind_args() {
     return 0
 }
 
+# --- mika#2077 (reprise de mika#2057) : le corps du script d'entrypoint 2b ----
+#
+# Émet sur stdout le script que `$sandbox_entrypoint_prefix -c` exécute en
+# PID 1 du sandbox Phase 2b. Ne lit que des globales déjà résolues au moment de
+# l'appel (`_PILOT_SECRET_PROLOGUE`, `_PILOT_EGRESS_PROXY_BIN`,
+# `_PILOT_EGRESS_TCP_PORT`, `_PILOT_EGRESS_SOCK`).
+#
+# Trois choses à savoir avant de défaire quoi que ce soit ici.
+#
+#   1. L'ARGV NE TRAVERSE PLUS PAR RE-CITATION. Avant mika#2077, le site d'appel
+#      faisait `quoted_argv=$(printf ' %q' "$@")` et interpolait le résultat dans
+#      ce corps. `printf '%q'` est un builtin BASH et sa sortie est du BASH :
+#      pour tout argument portant un caractère non imprimable — saut de ligne,
+#      tabulation, \r — il émet la forme ANSI-C `$'...'`, que `dash` ne sait pas
+#      lire (il y voit l'expansion de la variable vide `$` suivie d'une chaîne
+#      entre apostrophes). Rien ne garantit que `$sandbox_entrypoint_prefix` soit
+#      bash. Le pilote démarrait alors avec un argument DIFFÉRENT de celui qui
+#      lui était destiné, sans aucun marqueur qui le nomme, et la session se
+#      diagnostiquait comme une dérive du modèle. L'argv passe donc en
+#      paramètres positionnels, exactement comme Phase 2a le fait depuis
+#      toujours (voir le commentaire du repli plus bas, qui dit déjà en toutes
+#      lettres que l'absence de seconde couche de citation est une propriété
+#      recherchée). Réintroduire une couche de citation ici EST le défaut
+#      mika#2057.
+#
+#   2. `exec` EST INTERDIT EN POSITION FINALE, et c'est là que la symétrie avec
+#      Phase 2a s'arrête. Le script installe `trap ... EXIT` pour tuer le shim
+#      d'egress ; un `exec "$@"` remplacerait l'image du shell et le trap ne
+#      tournerait jamais — le shim survivrait au pilote. D'où `"$@"` nu suivi
+#      d'une propagation explicite du statut : `exit N` déclenche le trap PUIS
+#      sort avec N, et le `kill` du trap n'écrase pas le statut. Le contrat « le
+#      statut de sortie de `_run_pilot_sandboxed` est celui du pilote » (tenu
+#      par `_sandbox_rc` plus bas) est préservé.
+#
+#   3. `echo` ET NON `printf`. La suite mika#2039
+#      (tests/test_sandbox_no_secret_in_argv.sh) refuse tout `printf` étendu dans
+#      la trace xtrace de la dispatch, parce que c'est par là qu'un secret
+#      sortait d'une substitution de processus. Les appels de fonction n'ajoutent
+#      pas de niveau à la trace, mais les substitutions de commandes oui : un
+#      `printf` ici s'y afficherait en `++ printf` et ferait rougir cette garde.
+#      Le corps émis ne contient aucun antislash et ne commence par aucune
+#      option, donc `echo` est sans ambiguïté.
+#
+# L'extraction elle-même n'est pas cosmétique : tant que ce corps n'existait que
+# comme littéral à l'intérieur de l'appel `bwrap`, aucun test hors-ligne ne
+# pouvait l'exécuter, et la seule assertion possible était un grep sur le source
+# — une mesure de la forme du code, jamais de son comportement. Extrait, il
+# tourne sous un `sh -c` nu et « l'argv traverse intact » devient une mesure
+# (tests/test_pilot_phase2b_argv.sh, PART A).
+_pilot_phase2b_entrypoint_script() {
+    echo "
+$_PILOT_SECRET_PROLOGUE
+python3 '$_PILOT_EGRESS_PROXY_BIN' --sandbox-tcp $_PILOT_EGRESS_TCP_PORT --socket '$_PILOT_EGRESS_SOCK' >&2 &
+_shim_pid=\$!
+# Bounded wait for shim to listen (max ~1s).
+_i=0
+while [ \$_i -lt 20 ]; do
+    if python3 -c 'import socket
+s=socket.socket()
+s.settimeout(0.1)
+try:
+    s.connect((\"127.0.0.1\", $_PILOT_EGRESS_TCP_PORT))
+    s.close()
+except Exception:
+    exit(1)' 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+    _i=\$((_i + 1))
+done
+trap 'kill \$_shim_pid 2>/dev/null' EXIT
+\"\$@\"
+_rc=\$?
+exit \$_rc
+"
+}
+
 _run_pilot_sandboxed() {
     # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
     # or direct-exec otherwise. Preserves stdin/stdout/stderr semantics.
@@ -2786,10 +2863,12 @@ Remedy: $_egress_remedy"
     # coherence audit 2026-08-04).
     local _sandbox_rc=0
     if [ -n "$sandbox_entrypoint_prefix" ]; then
-        # Phase 2b mode: quote the original argv so the sh -c can re-exec it
-        # verbatim. Uses `printf '%q'` for shell-safe re-quoting.
-        local quoted_argv
-        quoted_argv=$(printf ' %q' "$@")
+        # Phase 2b mode. Le corps du script est une fonction depuis mika#2077,
+        # pour qu'il soit exécutable — et donc mesurable — hors bwrap, et l'argv
+        # du pilote y entre en PARAMÈTRES POSITIONNELS. Aucune couche de
+        # citation n'est ajoutée ici : voir
+        # `_pilot_phase2b_entrypoint_script` pour les trois raisons qui
+        # l'interdisent.
         bwrap \
             --as-pid-1 \
             --unshare-user \
@@ -2838,29 +2917,8 @@ Remedy: $_egress_remedy"
             "${net_setenv_args[@]}" \
             ${secret_args[@]+"${secret_args[@]}"} \
             --chdir "$WORKTREE_DIR" \
-            -- "$sandbox_entrypoint_prefix" -c "
-$_PILOT_SECRET_PROLOGUE
-python3 '$_PILOT_EGRESS_PROXY_BIN' --sandbox-tcp $_PILOT_EGRESS_TCP_PORT --socket '$_PILOT_EGRESS_SOCK' >&2 &
-_shim_pid=\$!
-# Bounded wait for shim to listen (max ~1s).
-_i=0
-while [ \$_i -lt 20 ]; do
-    if python3 -c 'import socket
-s=socket.socket()
-s.settimeout(0.1)
-try:
-    s.connect((\"127.0.0.1\", $_PILOT_EGRESS_TCP_PORT))
-    s.close()
-except Exception:
-    exit(1)' 2>/dev/null; then
-        break
-    fi
-    sleep 0.05
-    _i=\$((_i + 1))
-done
-trap 'kill \$_shim_pid 2>/dev/null' EXIT
-$quoted_argv
-" || _sandbox_rc=$?
+            -- "$sandbox_entrypoint_prefix" -c "$(_pilot_phase2b_entrypoint_script)" \
+               mika-pilot-sandbox "$@" || _sandbox_rc=$?
     else
         # Phase 2a fallback: fs cut only, network unrestricted.
         #

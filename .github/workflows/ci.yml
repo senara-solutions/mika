@@ -130,6 +130,17 @@ jobs:
           make test-egress-push-bound
           make test-egress-push-scope-staging
 
+      # mika#2077 (reprise de mika#2057) — l'entrypoint Phase 2b sérialisait
+      # l'argv du pilote avec `printf '%q'`, un builtin bash dont la sortie
+      # ANSI-C `$'...'` n'est pas lue par dash, et rien ne garantit que le shell
+      # d'entrypoint soit bash : un argument multi-ligne arrivait silencieusement
+      # DIFFÉRENT au pilote. La suite mesure la traversée octet pour octet hors
+      # bwrap, et compte les deux sites. Elle est câblée ICI parce que mika#2578
+      # l'a enseigné trois fois : un garde que le pipeline ne lance pas passe la
+      # revue, passe le CI par construction, et laisse partir le défaut.
+      - name: Phase 2b entrypoint passes the pilot argv positionally (mika#2077)
+        run: make test-pilot-phase2b-argv
+
       # mika#2578 again, same lesson as the step below: `make test-sandbox-gh-usable`
       # was local-only, so the guard that pins the VALUE `--setenv GH_TOKEN`
       # carries — now the egress sentinel (mika#2716) — gated nothing on a PR.

@@ -399,17 +399,17 @@ assert_eq "trace file contains no credential-shaped value" "1" "$rc"
 # callback — but `++ printf %s <value>` from an untraced-suppressed process
 # substitution would not be, and that is what reaches the caller.
 #
-# mika#2049 — with Phase 2b now the default, the traced call also re-quotes the
-# PAYLOAD argv (`quoted_argv=$(printf ' %q' "$@")`), which traces as
-# `++ printf ' %q' /bin/true`. That line carries the payload, never a secret
-# (the argv channel is audited above), so it alone is excluded — exactly, so
-# any other expanded printf still fails the assertion.
-# Here-string, not a pipe (mika#2055/#2432: `producer | grep -q` SIGPIPEs).
-# The `-n` guard matters: an empty here-string is one empty line, which
-# `grep -v` would count as an offending printf.
+# mika#2049 excluded exactly one line here — `++ printf ' %q' /bin/true` — because
+# Phase 2b re-quoted the PAYLOAD argv with `quoted_argv=$(printf ' %q' "$@")`.
+# mika#2077 removed that re-quoting: the argv travels in positional parameters,
+# so the excluded line has no producer left and the exclusion is gone with it.
+# NOTHING is excluded here any more — ANY `++ printf` fails. Which makes this
+# assertion a second guard on the mika#2057 defect: putting a `$(printf ...)`
+# back on the entrypoint path reddens it here as well as in
+# tests/test_pilot_phase2b_argv.sh.
 _printf_lines=$(grep -E -- '\+\+ printf' "$TRACE" || true)
 rc=1
-[ -n "$_printf_lines" ] && grep -vqxF -- "++ printf ' %q' /bin/true" <<<"$_printf_lines" && rc=0
+[ -n "$_printf_lines" ] && rc=0
 assert_eq "trace carries no expanded process-substitution printf" "1" "$rc"
 
 rc=1; grep -q 'sentinel-after-sandbox-call' "$TRACE" && rc=0
@@ -615,10 +615,12 @@ else
     _PILOT_SANDBOX_SECRET_ALLOWLIST=("${_SAVED_ALLOWLIST[@]}")
 
     # Phase 2b is the branch every real dispatch takes when the egress proxy is
-    # up, and its entrypoint is a materially different string — the prologue is
-    # concatenated with the shim launch and a printf '%q'-quoted argv. Running
-    # it for real is the only way a quoting fault in that composition surfaces
-    # before production.
+    # up, and its entrypoint is a materially different script — the prologue is
+    # concatenated with the shim launch, its bounded wait and the EXIT trap that
+    # reaps it. Since mika#2077 the argv is NOT part of that composition: it
+    # enters in positional parameters, and tests/test_pilot_phase2b_argv.sh
+    # measures its traversal octet for octet. What stays worth running for real
+    # here is the composition itself, under bwrap.
     if [ -x "$_PILOT_EGRESS_PROXY_BIN" ] && [ -S "$_PILOT_EGRESS_SOCK" ]; then
         MOCK_EGRESS_RC=0
         got_2b=$(MIKA_TEST_SECRET="$FAKE_TOKEN" _run_pilot_sandboxed \
