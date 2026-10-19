@@ -5411,6 +5411,34 @@ async fn run_agent_inner(
     // would let the two disagree about what "evening" means.
     let turn_utc = chrono::Utc::now();
     let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
+    // mika#1747 vol 1 — le site UNIQUE de la fenêtre de transmission, et il est
+    // ici par nécessité, pas par commodité : `load_agent_context` ci-dessus est
+    // l'entonnoir habituel, mais il ne reçoit que `(db, home_dir)` et ne voit
+    // pas `llm` — il ne peut donc pas répondre « quel modèle suis-je », qui est
+    // la moitié sortante de la transition (D2). Le couple consommé est celui de
+    // `runtime_provider` / `runtime_model` au-dessus : même source que
+    // `ToolContext` et `get_active_llm`, donc le bloc ne peut pas annoncer une
+    // transition depuis un modèle que le process ne sert pas.
+    //
+    // Fail-open par construction : `pending` ne rend pas de `Result`, un signal
+    // illisible ferme la fenêtre et ne coûte pas le tour.
+    let pending_transmission =
+        crate::model_transmission::pending(params.home_dir, runtime_provider, runtime_model).await;
+    if let Some(transmission) = &pending_transmission {
+        // Sur la branche `Some` SEULEMENT : la question que cet instrument
+        // règle est « la cérémonie a-t-elle été proposée ? », pas « le prédicat
+        // tourne-t-il ? » — une ligne par tour et par agent sur la branche
+        // nominale noierait la seule qui compte.
+        info!(
+            target: "mika::otel",
+            event = "model_transmission_window_open",
+            agent = %db.agent_id(),
+            outgoing = %transmission.outgoing,
+            incoming = %transmission.incoming,
+            letter_path = %transmission.letter_path,
+            "fenêtre de transmission ouverte — la lettre au successeur est demandée à ce tour"
+        );
+    }
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -5437,7 +5465,7 @@ async fn run_agent_inner(
         // mika#2247 AC2 — `None` renders no line at all, which is today's
         // behaviour for every agent that declares nothing.
         tenant_language: ctx.language,
-        pending_transmission: None,
+        pending_transmission: pending_transmission.as_ref(),
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -7557,6 +7585,10 @@ async fn run_team_agent_inner_impl(
         // is the user's will; the register language is a tenant setting the
         // child's own row already carries.
         tenant_language: ctx.language,
+        // mika#1747 vol 1 — `None` ici, et c'est une décision (D6). Un enfant
+        // d'équipe est un tour de travail qui vit le temps d'une délégation ;
+        // la lettre au successeur est le témoignage d'une tenure, que porte
+        // l'instance conversationnelle. Le vol 1 n'ouvre la fenêtre que là.
         pending_transmission: None,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();

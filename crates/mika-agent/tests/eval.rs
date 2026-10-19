@@ -341,4 +341,8 @@ mod eval {
 
     // Compact provider gate: MikaModel request shape regression (mika#1491)
     mod test_compact_provider_gate;
+
+    // Fenêtre de transmission au changement de modèle : le signal posé atteint
+    // le prompt conversationnel, et son contrôle négatif (mika#1747 vol 1)
+    mod test_model_transmission_1747;
 }
