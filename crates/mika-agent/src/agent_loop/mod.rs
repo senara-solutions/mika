@@ -5437,6 +5437,7 @@ async fn run_agent_inner(
         // mika#2247 AC2 — `None` renders no line at all, which is today's
         // behaviour for every agent that declares nothing.
         tenant_language: ctx.language,
+        pending_transmission: None,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -7556,6 +7557,7 @@ async fn run_team_agent_inner_impl(
         // is the user's will; the register language is a tenant setting the
         // child's own row already carries.
         tenant_language: ctx.language,
+        pending_transmission: None,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {

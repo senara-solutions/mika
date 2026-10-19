@@ -81,6 +81,7 @@ fn make_ctx<'a>(identity: &'a Identity, persona: PersonaProfile) -> PromptContex
         deployment: Deployment::Cloud,
         persona_profile: persona,
         tenant_language: None,
+        pending_transmission: None,
     }
 }
 
