@@ -3059,6 +3059,33 @@ ${RESULT}"
     set -e
 }
 
+# ===========================================================================
+# mika#2811 — la provenance d'un refus de dispatch est un FORMAT DE FIL
+# ===========================================================================
+#
+# Ce nom de champ a DEUX moitiés : `ready_label_handler` le pose dans l'entrée
+# de dispatch sous `executor::INTERNAL_GROOM_CAUSE_FIELD`, `_parse_input_json`
+# le lit ici. Une divergence ne casse rien le jour où elle est écrite — le
+# moteur continue de poser, le shell continue de ne rien trouver, et le
+# désarmement devient inopérant EN SILENCE : la porte de mika#2012 reste armée,
+# `already_groomed` revient, et le reconciler re-drive. C'est exactement la
+# boucle du § 1.1 de mika#2811, avec tous les tests comportementaux des deux
+# côtés verts.
+#
+# D'où une constante nommée de chaque côté et un scan de synchronisation
+# shell ↔ Rust (`canonical_tokens::tests::mika2811_le_nom_du_champ_de_cause_est_synchronise_shell_a_rust`),
+# qui exige cette ligne-ci à l'octet près, en colonne 0. Site de définition
+# UNIQUE côté shell : la lecture passe par la constante, jamais par le littéral
+# retapé.
+#
+# Le préfixe `__internal_` marque le champ comme moteur-interne : le
+# `tools.json` de dev-groom NE le déclare PAS, et un test Rust lit le fichier
+# pour le tenir. Un LLM qui pourrait poser ce champ désarmerait la porte de
+# mika#2012 sur n'importe quel ticket — or cette porte existe contre une boucle
+# qu'un LLM a produite (mika#2425 : l'omission de la surface d'outil EST le
+# refus).
+GROOM_FORCE_CAUSE_FIELD="__internal_groom_cause"
+
 _parse_input_json() {
     # Read input JSON from stdin
     INPUT=$(cat)
@@ -3066,6 +3093,15 @@ _parse_input_json() {
     # Parse callback fields injected by the long-running executor
     TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.__mika_task_id // empty')
     AGENT=$(printf '%s\n' "$INPUT" | jq -r '.__mika_agent // empty')
+
+    # mika#2811 — la provenance du refus de la porte de dispatch, posée par le
+    # moteur et par lui seul. Lue PAR LA CONSTANTE (`--arg f`), jamais par le
+    # littéral retapé : c'est ce qui fait du scan de parité un scan à un seul
+    # site de chaque côté. Absente sur tout dispatch que le moteur n'a pas routé
+    # au groom faute de preuve, et sur tout `run_claude_pilot_groom` ouvert par
+    # un tour LLM — le flux opérateur de mika#1173 garde son comportement,
+    # porte de mika#2012 comprise.
+    GROOM_FORCE_CAUSE=$(printf '%s\n' "$INPUT" | jq -r --arg f "$GROOM_FORCE_CAUSE_FIELD" '.[$f] // empty')
 
     if [ -z "$TASK_ID" ]; then
         echo "Error: no __mika_task_id in input (not running as long-running handler?)" >&2
@@ -4530,7 +4566,58 @@ _set_up_worktree() {
         # on a foreseeable condition is wrapped as HANDLER CRASH by the EXIT
         # trap; mika-dev then reads a crash envelope and idles (7 h stall,
         # 2026-05-06). This is a foreseeable condition, so it exits 0.
-        if [ "$SKILL" = "dev-groom" ]; then
+        # --- Désarmement: ce groom EST le refus de la porte de dispatch (mika#2811) ---
+        #
+        # Deux portes jugeaient la même question — « ce ticket est-il groomé ? »
+        # — sur deux sources différentes : la porte de dispatch lit la BASE
+        # (preuve `Outcome: PLAN_GROOMED`, mika#1620/#2287), l'auto-skip
+        # ci-dessous lit le CORPS (les trois callouts). Quand elles divergent,
+        # aucune des deux ne fait le travail : mesuré le 2026-10-19 sur #1381 et
+        # #1959, cinq tâches `already_groomed` de deux minutes jusqu'à épuiser
+        # le budget de re-drive de mika#2020. Le correctif de mika#2484 avait
+        # déplacé la boucle sans la fermer.
+        #
+        # Une seule source de vérité pour la question qui a causé le refus : la
+        # base. Quand le moteur a routé ici PARCE QUE la preuve manque, la
+        # réponse du corps est non pertinente et l'auto-skip ne s'applique pas.
+        #
+        # La provenance est TRANSMISE, jamais recalculée (motif mika#2026) : le
+        # Rust la connaît à l'étape 5, le shell ne peut pas et ne doit pas
+        # devenir un troisième lecteur de l'état de grooming (mika#2158).
+        #
+        # Ce que le désarmement borne : il vaut pour CE dispatch seulement. La
+        # passe réelle qui suit frappe la preuve (`_iterate_groom_loop`, bras
+        # GROOMED, via `_set_outcome_line`), donc l'état change et le tour
+        # suivant n'a plus de cause à transmettre. Le texte de cet appel n'est
+        # PAS recopié ici : la cardinalité U3c de mika#2590 compte les sites par
+        # littéral sur le fichier entier, donc une prose qui reproduit l'appel se
+        # lit comme un second site d'estampille. L'objection
+        # « re-grooming would stack a second body callout » de la note voisine
+        # ne s'applique pas ici : `_write_canonical_callout` est idempotent
+        # depuis mika#1271.
+        #
+        # Testé avant `_committed_plan_on_branch` à dessein : « ce groom a-t-il
+        # été forcé ? » est à coût nul, la mesure du plan coûte du git.
+        if [ "$SKILL" = "dev-groom" ] && [ -n "$GROOM_FORCE_CAUSE" ]; then
+            # Un TROISIÈME nom, distinct de `dispatch_gate_groom_refused` et de
+            # `dispatch_gate_groom_allowed_stale_callout` : chacun a sa
+            # population, et réutiliser un nom rendrait celle-ci insoustractible
+            # (mika#2012 U4, qui a créé le second pour cette raison exacte).
+            # Émise sur le chemin SAIN, parce qu'un désarmement qu'on ne peut
+            # pas observer n'est pas un désarmement, c'est un espoir
+            # (mika#2293). Porte `cause=` pour que le `grep` sépare la
+            # population nominale (`markers_without_proof`) de la panne de base
+            # (`proof_unreadable`, régime attendu VIDE) — deux populations sous
+            # un seul nom ne sont pas soustractibles (mika#2205).
+            #
+            # mika#2590 U5b — cette note ne CITE PAS le marqueur de convergence
+            # en toutes lettres. La porte prouvait le grooming par une
+            # sous-chaîne, donc le texte qui disait « ceci n'est pas une preuve »
+            # EST devenu la preuve (2026-09-29, offset 651). Le lecteur Rust est
+            # ancré depuis, mais la défense en profondeur reste, tenue par une
+            # assertion de `test-dispatch-lib.sh`.
+            echo "dispatch_gate_groom_forced_no_proof: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} cause=${GROOM_FORCE_CAUSE} — the engine routed here because the grooming proof is absent from the database; the body-callout auto-skip is disarmed for this dispatch so a real pass can mint it (mika#2811)" >&2
+        elif [ "$SKILL" = "dev-groom" ]; then
             local existing_plan plan_provenance
             if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM"); then
                 # mika#2034: say what was measured. The old wording asserted
