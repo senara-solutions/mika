@@ -1,6 +1,13 @@
 # Plan — feat(mcp): manifest data_grade field — L4 forward-compat bypass gap
 
-**Status:** DRAFT
+> **PÉRIMÉ — remplacé le 2026-10-19 par `docs/plans/2026-10-19-001-feat-1959-mcp-manifest-data-grade-plan.md` (rev 2).**
+> Ne pas implémenter ce plan. Trois de ses prémisses sont fausses contre `main` : PR#1956 est mergée (sa section
+> *Dependency on PR#1956* et les chemins Path A/Path B sont sans objet), l'enum `DataGrade` livré n'a que **deux**
+> variantes (`Operational` / `Testimony`) et non les trois du corps du ticket, et la conception prescrite par le dépôt
+> est d'**ensemencer** `skill_data_grades` plutôt que d'ajouter une branche MCP dans `execute_tool` comme le fait son
+> § 3. Conservé comme archive du premier grooming ; le détail des écarts est dans la rev 2, § *Ce que le re-groom a changé*.
+
+**Status:** SUPERSEDED (rev 1)
 **Date:** 2026-08-23
 **Ticket:** mika#1959
 **Owner:** mika-orchestrator (Vincent + Claude Code, co-creators)
