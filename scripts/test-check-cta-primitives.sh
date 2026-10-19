@@ -296,6 +296,30 @@ d="$(make_page_with_button '      <button className="px-4 py-2 bg-gradient-to-r 
 assert_exit "$d" 0 "N9: a translucent gradient stop is not a fill (exclusion 1)"
 rm -rf "$d"
 
+# ── 5j. N7b — gradient TEXT on the very tags the scan evaluates. N7 puts it on
+#       an <h1>, which the scan never looks at; the realistic case is a landing
+#       link whose label is clipped to the gradient. `bg-clip-text` paints the
+#       glyphs, not a fill, so it stays exclusion 3 whatever its stops say.
+d="$(make_page_with_button '      <a href="/x" className="bg-clip-text text-transparent bg-gradient-to-r from-accent to-accent-light">Docs</a>
+      <button className="bg-clip-text text-transparent bg-linear-to-br from-accent to-accent-light">x</button>')"
+assert_exit "$d" 0 "N7b: gradient text on an <a> or a <button> is not a fill"
+rm -rf "$d"
+
+# ── 5k. N9b — exclusion 3 stays dominant over the stop, as it does over the
+#        solid fill: a stop that names no colour or a surface tier paints no CTA
+#        (a fade-out sheen on a ghost button is the realistic shape).
+d="$(make_page_with_button '      <button className="bg-gradient-to-r from-transparent via-white/10 to-transparent">x</button>
+      <button className="bg-gradient-to-b from-surface-container to-bg">y</button>')"
+assert_exit "$d" 0 "N9b: from-transparent and surface-tier stops are not fills (exclusion 3)"
+rm -rf "$d"
+
+# ── 5l. N5c — a stop POSITION is not a colour stop. `from-10%` must not be the
+#        token reported; the colour stop after it is.
+d="$(make_page_with_button '      <button className="bg-gradient-to-r from-10% from-accent to-accent-light">Go</button>')"
+assert_exit "$d" 1 "N5c: a gradient with a positioned stop is still a fill"
+assert_says "$d" "painting from-accent" "N5c: the colour stop is reported, not the position"
+rm -rf "$d"
+
 # ── 6. The rule is SHAPE, not a denylist of the ten measured classes. This is the
 #      realistic regression: nobody retypes `bg-green-600`, they write a colour
 #      that looked close enough on a new button.

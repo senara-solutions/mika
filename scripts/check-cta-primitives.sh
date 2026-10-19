@@ -108,9 +108,12 @@
 #   word `bg-gradient-to-r`: the stop is what names the colour that stopped
 #   tracking §2, and it is the string a reader will search the file for.
 #
-#   Exclusions 1 and 2 stay dominant over it — `from-accent/40` is still
-#   translucent, `hover:from-accent` is still variant-prefixed, and `bg-clip-text`
-#   on its own is still nothing. `bg-radial-*` / `bg-conic-*` stay unconditionally
+#   Exclusions 1, 2 and 3 stay dominant over it — `from-accent/40` is still
+#   translucent, `hover:from-accent` is still variant-prefixed, a stop that names
+#   no colour or a surface tier (`from-transparent`, `from-surface-container`)
+#   still paints no CTA, and `bg-clip-text` — alone, or clipping a gradient to the
+#   glyphs of a link or button — is still nothing. A stop position (`from-10%`)
+#   is skipped so the colour stop after it is the one reported. `bg-radial-*` / `bg-conic-*` stay unconditionally
 #   excluded: their population here is zero and mika#1799 scoped them out
 #   deliberately rather than ship a shape no fixture has watched go red.
 #
@@ -305,6 +308,12 @@ SCAN_OUTPUT="$(printf '%s\n' "$FILES" | while IFS= read -r f; do
                     gradient = "yes"
                     break
                 }
+                # Gradient TEXT paints no fill: an unprefixed `bg-clip-text` on
+                # the same tag clips the gradient to the glyphs, so the tag is
+                # still exclusion 3 whatever its stops say (fixture N7b).
+                if (gradient != "" && tag ~ /(^|[^:A-Za-z0-9_-])bg-clip-text([^A-Za-z0-9_-]|$)/) {
+                    gradient = ""
+                }
                 if (gradient != "") {
                     sscan = tag
                     while (match(sscan, /from-[A-Za-z0-9_.,%#()\[\]\/-]+/)) {
@@ -315,6 +324,14 @@ SCAN_OUTPUT="$(printf '%s\n' "$FILES" | while IFS= read -r f; do
                         # variant-prefixed, `from-accent/40` is translucent.
                         if (sbefore ~ /[:A-Za-z0-9_-]/) { continue }
                         if (stop ~ /\//) { continue }
+                        # Exclusion 3, mirrored from the solid pass below: a
+                        # stop that names no colour, or a surface tier, paints no
+                        # CTA. A stop POSITION (`from-10%`) is not a colour stop
+                        # at all — skip it so the colour stop after it is the one
+                        # reported.
+                        if (stop ~ /^from-(transparent|inherit|current|none)$/) { continue }
+                        if (stop ~ /^from-(bg|bg-card|card|background|surface)(-[a-z-]+)?$/) { continue }
+                        if (stop ~ /^from-[0-9.]+%$/) { continue }
                         printf "V\t%s:%d\t%s\t%s\n", fname, startline, stop, elem
                         break
                     }
