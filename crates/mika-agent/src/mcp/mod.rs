@@ -17,6 +17,7 @@ use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::TokioChildProcess;
 use tracing::{info, warn};
 
+use crate::skills::manifest::DataGrade;
 use crate::tools::{ImageData, ToolOutput};
 use config::{McpConfig, McpServerConfig, McpTransport};
 
@@ -47,6 +48,35 @@ pub struct McpManager {
     tool_definitions: Vec<ToolDefinition>,
     /// Maps namespaced tool name -> (server_name, original_tool_name).
     tool_routing: HashMap<String, (String, String)>,
+    /// Grade par nom d'outil namespacé, dérivé du `data_grade` de son serveur
+    /// (mika#1959). Consommé par la garde L4 de `tool_execution::dispatch` via
+    /// l'ensemencement de `skill_data_grades` dans `agent_loop` — pas par
+    /// `call_tool`, qui ne refuse rien.
+    tool_data_grades: HashMap<String, DataGrade>,
+}
+
+/// Joint le `data_grade` de chaque serveur à chacun de ses outils namespacés.
+///
+/// Libre et pure pour être testable : `connect_all` ouvre de vraies connexions,
+/// aucun test unitaire ne l'atteint (décision D4 du plan mika#1959). Un outil
+/// dont le serveur a disparu de la config retombe sur le défaut de l'enum —
+/// cas inatteignable depuis `connect_all` (le routage est bâti depuis cette
+/// même config), couvert parce que la signature le permet.
+pub(crate) fn mcp_tool_data_grades(
+    config: &McpConfig,
+    tool_routing: &HashMap<String, (String, String)>,
+) -> HashMap<String, DataGrade> {
+    tool_routing
+        .iter()
+        .map(|(namespaced, (server, _tool))| {
+            let grade = config
+                .mcp_servers
+                .get(server)
+                .map(|cfg| cfg.data_grade)
+                .unwrap_or_default();
+            (namespaced.clone(), grade)
+        })
+        .collect()
 }
 
 impl McpManager {
@@ -136,16 +166,49 @@ impl McpManager {
             );
         }
 
+        let tool_data_grades = mcp_tool_data_grades(config, &tool_routing);
+
         Self {
             connections,
             tool_definitions,
             tool_routing,
+            tool_data_grades,
         }
     }
 
     /// Get tool definitions for all connected MCP servers.
     pub fn tool_definitions(&self) -> &[ToolDefinition] {
         &self.tool_definitions
+    }
+
+    /// Grade par outil namespacé, pour l'ensemencement de la map L4.
+    pub fn tool_data_grades(&self) -> &HashMap<String, DataGrade> {
+        &self.tool_data_grades
+    }
+
+    /// Manager sans aucune connexion, routage et grades fournis (mika#1959).
+    ///
+    /// Pour les tests d'autres modules du crate : `connect_all` ouvre de vraies
+    /// connexions, qu'aucun test unitaire ne peut obtenir. `connections` reste
+    /// vide, donc `is_mcp_tool` répond **vrai** et `call_tool` rend
+    /// « MCP server '<serveur>' is not connected. ».
+    ///
+    /// C'est précisément ce qui rend le test de refus L4 décisif plutôt que
+    /// tautologique : cette phrase est la preuve que `call_tool` a été atteint,
+    /// donc son absence est la preuve qu'il ne l'a pas été. Un manager à `None`
+    /// ne prouverait rien — le troisième étage du dispatch serait sauté de
+    /// toute façon.
+    #[cfg(test)]
+    pub(crate) fn sans_connexion_pour_tests(
+        tool_routing: HashMap<String, (String, String)>,
+        tool_data_grades: HashMap<String, DataGrade>,
+    ) -> Self {
+        Self {
+            connections: HashMap::new(),
+            tool_definitions: Vec::new(),
+            tool_routing,
+            tool_data_grades,
+        }
     }
 
     /// Check if a tool name belongs to an MCP server.
@@ -428,6 +491,7 @@ mod tests {
             connections: HashMap::new(),
             tool_definitions: Vec::new(),
             tool_routing: HashMap::new(),
+            tool_data_grades: HashMap::new(),
         }
     }
 
@@ -552,6 +616,7 @@ mod tests {
                 url: None,
                 headers: None,
                 enabled: false,
+                data_grade: DataGrade::default(),
             },
         );
         let manager = McpManager::connect_all(&config).await;
@@ -572,6 +637,7 @@ mod tests {
                 url: None,
                 headers: None,
                 enabled: true,
+                data_grade: DataGrade::default(),
             },
         );
         let manager = McpManager::connect_all(&config).await;
@@ -586,5 +652,108 @@ mod tests {
             .await;
         assert!(output.is_error);
         assert!(output.content.contains("Unknown MCP tool"));
+    }
+
+    // -- mika#1959 : la population des grades par outil ---------------------
+
+    /// Un routage à la main, de la forme que `connect_all` produit.
+    fn routage(entrees: &[(&str, &str)]) -> HashMap<String, (String, String)> {
+        entrees
+            .iter()
+            .map(|(serveur, outil)| {
+                (
+                    mcp_tool_name(serveur, outil),
+                    (serveur.to_string(), outil.to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// AC2 — chaque outil porte le grade **déclaré** par son serveur.
+    ///
+    /// La logique sous assertion est la fonction pure `mcp_tool_data_grades`
+    /// (décision D4) : `connect_all` ouvre de vraies connexions stdio/HTTP,
+    /// donc un test qui remplirait la map à la main n'assurerait rien de la
+    /// jointure config × routage qui est tout le travail de ce ticket.
+    #[test]
+    fn mika1959_chaque_outil_porte_le_grade_de_son_serveur() {
+        let json = r#"{
+            "mcpServers": {
+                "journal-perso": {
+                    "transport": "stdio",
+                    "command": "npx",
+                    "data_grade": "testimony"
+                },
+                "wikipedia": {
+                    "transport": "http",
+                    "url": "https://mcp.wikipedia.org/",
+                    "data_grade": "operational"
+                }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        let routing = routage(&[
+            ("journal-perso", "read_entry"),
+            ("journal-perso", "search"),
+            ("wikipedia", "lookup"),
+        ]);
+
+        let grades = mcp_tool_data_grades(&config, &routing);
+
+        assert_eq!(
+            grades.len(),
+            3,
+            "chaque outil du routage doit avoir une entrée : la map L4 est \
+             indexée par nom d'outil, un outil sans entrée est un outil hors garde"
+        );
+        assert_eq!(
+            grades["mcp__journal-perso__read_entry"],
+            DataGrade::Testimony,
+            "le grade doit venir du serveur qui route l'outil, pas d'une constante"
+        );
+        assert_eq!(
+            grades["mcp__journal-perso__search"],
+            DataGrade::Testimony,
+            "deux outils d'un même serveur testimony portent tous deux son grade"
+        );
+        assert_eq!(
+            grades["mcp__wikipedia__lookup"],
+            DataGrade::Operational,
+            "un serveur operational du même manifeste ne doit pas être contaminé"
+        );
+    }
+
+    /// AC2 — un serveur sans champ donne `Operational`, et un serveur absent de
+    /// la config retombe sur le même défaut.
+    ///
+    /// Le second cas est inatteignable depuis `connect_all` (le routage y est
+    /// bâti depuis cette même config) ; il est couvert parce que la signature
+    /// de la fonction pure le permet, et parce que le `unwrap_or_default()` qui
+    /// le traite est exactement la ligne qu'un futur `unwrap()` remplacerait.
+    #[test]
+    fn mika1959_un_serveur_sans_champ_ou_absent_vaut_operational() {
+        let json = r#"{
+            "mcpServers": {
+                "serveur-quelconque": {
+                    "transport": "stdio",
+                    "command": "some-mcp"
+                }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        let routing = routage(&[("serveur-quelconque", "do_thing"), ("fantome", "do_thing")]);
+
+        let grades = mcp_tool_data_grades(&config, &routing);
+
+        assert_eq!(
+            grades["mcp__serveur-quelconque__do_thing"],
+            DataGrade::Operational,
+            "champ absent ⇒ défaut sûr : le serveur tourne, L4 ne tire pas"
+        );
+        assert_eq!(
+            grades["mcp__fantome__do_thing"],
+            DataGrade::Operational,
+            "serveur hors config ⇒ défaut de l'enum, jamais un panic"
+        );
     }
 }

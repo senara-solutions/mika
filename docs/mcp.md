@@ -202,7 +202,66 @@ MCP **générique** et vaut pour tout serveur présent et futur.
 
 ---
 
-## 5. Sonde 1Password Environments — verdict du 2026-09-20 : `BLOQUÉ-AMONT`
+## 5. Déclarer le grade d'un serveur MCP
+
+Chaque entrée de `mcp-servers.json` — le fichier opérateur-global résolu par la
+chaîne du § 1 — accepte un champ `data_grade` :
+
+- `"operational"` — **défaut quand le champ est absent.** Le serveur fonctionne
+  normalement.
+- `"testimony"` — données personnelles, confessionnelles, de confiance
+  déléguée (doctrine non-transit, mika#1798). **Déclaration explicite exigée.**
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "enabled": true
+    },
+    "journal-perso": {
+      "command": "/usr/local/bin/journal-mcp",
+      "args": [],
+      "enabled": true,
+      "data_grade": "testimony"
+    }
+  }
+}
+```
+
+Les outils d'un serveur déclaré `testimony` sont **refusés** par la garde L4 à
+l'exécution (`mcp__journal-perso__*` ci-dessus), avant tout appel distant : le
+serveur ne voit pas la requête. Un opérateur qui veut réellement une surface
+testimony doit la déclarer *et* accepter que Mika refuse d'appeler ces outils —
+**la valeur de la déclaration est la traçabilité, pas la permission.**
+
+Le défaut est porteur dans ce sens : un manifeste qui oublie de déclarer son
+grade ne peut pas acquérir par accident un privilège testimony. C'est le
+consentement explicite qui vaut refus.
+
+Le grade vaut pour **tous** les outils du serveur. La granularité par outil est
+une affaire de v2 ; aucun serveur v1 connu n'expose des outils de grades mêlés.
+
+**Un grade inconnu fait échouer le chargement de la configuration** — y compris
+`"reference"`, nommé dans le corps de mika#1959 mais absent de l'enum livré
+(`DataGrade` est binaire ; `reference` se lit `operational`). Un grade n'est
+jamais deviné : un manifeste illisible arrête le démarrage plutôt que de
+tourner sous un grade supposé.
+
+**Ce que la déclaration ne fait pas :** l'outil reste **visible du modèle**, qui
+peut le mentionner ou le proposer. Seul l'appel est refusé. La non-publication
+est suivie séparément (mika#2814).
+
+**Sonde.** Un refus émet une ligne `warn!` :
+
+```bash
+grep 'tool_testimony_ban' "$MIKA_SPIRIT_LOG_FILE"
+```
+
+---
+
+## 6. Sonde 1Password Environments — verdict du 2026-09-20 : `BLOQUÉ-AMONT`
 
 mika#2281 demandait qu'un agent Mika puisse lister ses Environments 1Password
 et monter un `.env`. La sonde s'arrête à sa première question.
@@ -309,7 +368,7 @@ La sonde reprend alors à Q2, telle qu'écrite dans le plan
 
 ---
 
-## 6. Limites connues du client MCP
+## 7. Limites connues du client MCP
 
 Réelles, mesurées, et non corrigées ici — chacune a son ticket de suivi :
 

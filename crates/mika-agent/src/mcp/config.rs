@@ -22,6 +22,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::skills::manifest::DataGrade;
+
 /// Top-level MCP configuration, loaded from `mcp.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -52,6 +54,24 @@ pub struct McpServerConfig {
     /// Whether this server is enabled (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Grade des données exposées par les outils de ce serveur (mika#1959,
+    /// doctrine non-transit mika#1798).
+    ///
+    /// Absent ⇒ `DataGrade::Operational` par le `#[default]` de l'enum : c'est
+    /// la porte porteuse. Un manifeste qui oublie de déclarer son grade ne peut
+    /// pas acquérir par accident un privilège testimony ; il faut le consentement
+    /// explicite `"data_grade": "testimony"` — qui vaut refus de L4, pas
+    /// permission (voir la doc opérateur).
+    ///
+    /// Valeurs : `"operational"` (défaut) | `"testimony"`. Le `reference` du
+    /// corps de mika#1959 se lit `operational` ici — l'enum livré par PR#1956
+    /// est binaire (décision D1 du plan).
+    ///
+    /// Le grade vaut pour **tous** les outils du serveur. La granularité par
+    /// outil est une affaire de v2 : aucun serveur v1 connu n'expose des outils
+    /// de grades mêlés.
+    #[serde(default)]
+    pub data_grade: DataGrade,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -77,6 +97,7 @@ impl std::fmt::Debug for McpServerConfig {
             s.field("headers", &self.headers);
         }
         s.field("enabled", &self.enabled);
+        s.field("data_grade", &self.data_grade);
         s.finish()
     }
 }
@@ -389,6 +410,7 @@ mod tests {
             url: None,
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("test").is_err());
     }
@@ -403,6 +425,7 @@ mod tests {
             url: None,
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("test").is_err());
     }
@@ -417,6 +440,7 @@ mod tests {
             url: None,
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("test").is_ok());
     }
@@ -431,6 +455,7 @@ mod tests {
             url: Some("http://localhost:8000/mcp".to_string()),
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("test").is_ok());
     }
@@ -456,6 +481,7 @@ mod tests {
                 url: None,
                 headers: None,
                 enabled: true,
+                data_grade: DataGrade::default(),
             },
         );
         config.save(tmp.path()).unwrap();
@@ -475,6 +501,7 @@ mod tests {
             url: None,
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("my__server").is_err());
     }
@@ -489,6 +516,7 @@ mod tests {
             url: None,
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("MyServer").is_err());
     }
@@ -503,6 +531,7 @@ mod tests {
             url: None,
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("my-server_1").is_ok());
     }
@@ -517,6 +546,7 @@ mod tests {
             url: Some("ftp://evil.com/mcp".to_string()),
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("test").is_err());
     }
@@ -531,6 +561,7 @@ mod tests {
             url: Some("https://mcp.example.com/v1".to_string()),
             headers: None,
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         assert!(cfg.validate("test").is_ok());
     }
@@ -603,6 +634,7 @@ mod tests {
                 "Bearer secret-token".to_string(),
             )])),
             enabled: true,
+            data_grade: DataGrade::default(),
         };
         let debug_output = format!("{:?}", cfg);
         assert!(debug_output.contains("[REDACTED]"));
@@ -631,6 +663,7 @@ mod tests {
                     "Bearer tok".to_string(),
                 )])),
                 enabled: true,
+                data_grade: DataGrade::default(),
             },
         );
         config.save(tmp.path()).unwrap();
@@ -748,5 +781,85 @@ mod tests {
             config.mcp_servers.is_empty(),
             "startup path must fall through to empty config on malformed JSON"
         );
+    }
+
+    // -- mika#1959 : le grade de données du manifeste MCP --------------------
+
+    /// AC1 — un manifeste sans `data_grade` vaut `Operational`.
+    ///
+    /// C'est la porte porteuse de tout le ticket : la population modale des
+    /// `mcp.json` installés ne porte pas le champ, et aucun de ces serveurs ne
+    /// doit acquérir par accident le privilège testimony — qui, du côté L4,
+    /// vaut **refus**. Un défaut inversé ferait refuser toute la flotte.
+    #[test]
+    fn mika1959_un_manifeste_sans_grade_vaut_operational() {
+        let json = r#"{
+            "mcpServers": {
+                "serveur-quelconque": {
+                    "transport": "stdio",
+                    "command": "some-mcp"
+                }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.mcp_servers["serveur-quelconque"].data_grade,
+            DataGrade::Operational,
+            "mika#1959 — champ absent ⇒ `Operational`. Un défaut `Testimony` \
+             refuserait tous les serveurs installés avant ce ticket."
+        );
+    }
+
+    /// AC1 — les deux variantes se déclarent explicitement et se relisent.
+    #[test]
+    fn mika1959_les_deux_variantes_se_declarent_explicitement() {
+        let json = r#"{
+            "mcpServers": {
+                "journal-perso": {
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@exemple/mcp-journal"],
+                    "data_grade": "testimony"
+                },
+                "wikipedia": {
+                    "transport": "http",
+                    "url": "https://mcp.wikipedia.org/",
+                    "data_grade": "operational"
+                }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.mcp_servers["journal-perso"].data_grade,
+            DataGrade::Testimony
+        );
+        assert_eq!(
+            config.mcp_servers["wikipedia"].data_grade,
+            DataGrade::Operational
+        );
+    }
+
+    /// AC1 — un grade hors enum fait **échouer** le chargement, `"reference"`
+    /// nommément.
+    ///
+    /// `"reference"` est le cas nommé parce que le *Scope* du corps de mika#1959
+    /// écrit `testimony | evidence | reference` : un opérateur qui suit le
+    /// ticket plutôt que la doc opérateur écrira exactement cette valeur. La
+    /// décision D1 du plan la lit `operational` — et le refus est bruyant, pas
+    /// silencieux : **un grade n'est jamais deviné.**
+    #[test]
+    fn mika1959_un_grade_inconnu_dont_reference_fait_echouer_le_parse() {
+        for grade in ["reference", "evidence", "Testimony", "secret"] {
+            let json = format!(
+                r#"{{"mcpServers": {{"s": {{"transport": "stdio", "command": "x", "data_grade": "{grade}"}}}}}}"#
+            );
+            let parsed: Result<McpConfig, _> = serde_json::from_str(&json);
+            assert!(
+                parsed.is_err(),
+                "mika#1959 — `data_grade = \"{grade}\"` doit faire échouer le chargement de \
+                 mcp.json, pas retomber en silence sur un défaut. Un grade deviné est \
+                 exactement ce que la doctrine non-transit (mika#1798) refuse."
+            );
+        }
     }
 }
