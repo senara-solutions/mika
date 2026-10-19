@@ -148,6 +148,37 @@ jobs:
       - name: GitHub token host-reachable / sandbox-absent (mika#2056, mika#2578)
         run: make test-github-token-not-in-sandbox
 
+      # mika#2793 — the last four of the twenty-five. They land HERE, and not in
+      # one of the two hosted jobs added for this ticket, because this is the
+      # only runner that carries both `cargo` and a real `bwrap`, next to the
+      # two real-sandbox suites above. Anywhere else they would be green by
+      # PERMANENT SKIP — decorative, which is the mika#2103 defect one layer up.
+      # Each degrades to a clean skip rather than a failure when its
+      # precondition is missing, the property ci.yml already accepts for the two
+      # steps above; here the point is the opposite, that the precondition is
+      # PRESENT so the assertions actually execute. A green job does not tell
+      # the two apart: read the log and check each of these four prints a
+      # non-zero assertion count and not `⊘ skipped`.
+      - name: The rescue leaves a formatted tree (precondition: cargo fmt) (mika#2348)
+        run: bash skills/bundled/_shared/tests/test_rescue_fmt_clean.sh
+      # 0600 relay socket, minimal relay launch environment, and reachability
+      # from a real bwrap pilot — the third point is the one the canary cannot
+      # give. Precondition: a real bwrap.
+      - name: Relay socket, relay env, and reachability from a real sandbox (mika#2578)
+        run: bash skills/bundled/_shared/tests/test_egress_relay_socket_and_env.sh
+      # git usable inside the pilot sandbox, plus the containment that bounds
+      # it. Preconditions: a real bwrap AND a root it can add a worktree to —
+      # it skips in a nested dispatch worktree, which is why its state had to be
+      # established on the runner rather than locally (mika#2793).
+      - name: git usable inside the pilot sandbox, and still contained (mika#2141)
+        run: bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
+      # The pilot's session-log directory is writable from inside the sandbox
+      # while the incident-diagnosis surface stays out. Was red 11/5 until
+      # mika#2793: its refusal probe died on a failed redirection instead of
+      # reporting `refused`, so it went red precisely when the isolation worked.
+      - name: The session-log bind, and what stays outside it (mika#2165)
+        run: bash skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
