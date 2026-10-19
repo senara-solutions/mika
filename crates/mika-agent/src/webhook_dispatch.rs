@@ -522,6 +522,16 @@ pub(crate) fn dispatchable_repos_display() -> String {
 /// `operator-gated` is here for the reason mika#2123 gave it to the feeder: it
 /// is what makes a promotion refusal *persist*, and `.github/labels.yml`
 /// already promised "No ready label" for it.
+///
+/// **Every name in this list must stay declared in `.github/labels.yml`**, and
+/// `auto_pull::tests::test_exclusion_labels_are_declared_in_labels_yml`
+/// (mika#2790) is what makes that true rather than hoped-for. It iterates on
+/// *this constant*, so a label added here is guarded by the same edit — but a
+/// label added here and *not* declared in the registry turns that test red, by
+/// design: the sync runs with `delete-other-labels: true`, so an undeclared
+/// name is deleted from the repo and from every ticket carrying it, with no
+/// `unlabeled` event and no log, and this exclusion silently stops excluding
+/// (class mika#2127, 48 occurrences in production).
 pub(crate) const OPERATOR_HELD_LABELS: &[&str] = &["blocked", "operator-review", "operator-gated"];
 
 /// The operator-held label carried by `labels`, if any (mika#2263).

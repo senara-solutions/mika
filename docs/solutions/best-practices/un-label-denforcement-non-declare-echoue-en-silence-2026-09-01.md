@@ -74,24 +74,57 @@ parce que le format du fichier a changé se lit exactement comme un label absent
 
 ```rust
 #[test]
-fn test_refusal_label_is_declared_in_labels_yml() {
+fn test_exclusion_labels_are_declared_in_labels_yml() {
     let yml = include_str!("../../../.github/labels.yml");
-    let declared = |name: &str| yml.contains(&format!("- name: {name}"));
+    // Ancré sur le nom entier, tolérant au nom cité (`"dispatch:loop"`).
+    let declared = |name: &str| {
+        yml.lines().any(|line| {
+            line.strip_prefix("- name: ")
+                .map(str::trim)
+                .is_some_and(|d| d == name || d.trim_matches('"') == name)
+        })
+    };
 
-    assert!(declared("ready"));                                  // contrôle positif
-    assert!(!declared("a-label-nobody-has-ever-declared"));       // contrôle négatif
-    assert!(declared(REFUSAL_LABEL));                             // l'assertion
+    assert!(declared("ready"));                                  // positif, nu
+    assert!(declared("dispatch:loop"));                          // positif, cité
+    assert!(!declared("a-label-nobody-has-ever-declared"));      // négatif
+    assert!(!declared("block"));                                 // négatif d'ancrage
+
+    let mut guarded = vec![(REFUSAL_LABEL, "…"), (ABANDON_LABEL, "…")];
+    for label in crate::webhook_dispatch::OPERATOR_HELD_LABELS { // la liste du code,
+        guarded.push((label, "…"));                              // pas une copie
+    }
+    // un seul panic qui nomme chaque label manquant ET chaque site qui l'emploie
 }
 ```
 
-Le test coûte quatre lignes et ferme la classe entière : n'importe quel label
-d'enforcement ajouté plus tard sans déclaration casse la CI au lieu de casser la
-production six semaines après.
+Nommé `test_refusal_label_is_declared_in_labels_yml` jusqu'à mika#2790, quand il
+ne gardait que `REFUSAL_LABEL`.
+
+**La garde lit la liste que le code lit, elle n'en tient pas une copie**
+(mika#2790). Elle itère sur `OPERATOR_HELD_LABELS`, si bien qu'un label ajouté à
+l'exclusion est couvert le jour où il atterrit. Une liste recopiée dans le test le
+couvrirait le jour où quelqu'un y repense.
+
+**Ce qu'elle ferme, exactement.** La classe est fermée pour les labels
+**atteignables depuis une constante** : `REFUSAL_LABEL`, `ABANDON_LABEL` et les
+membres de `OPERATOR_HELD_LABELS`. Un littéral en dur au site d'emploi reste hors
+de portée. C'est pourquoi le `"operator-review"` d'`abandon_stuck_ready` est
+devenu `ABANDON_LABEL` dans le même geste : un label que le test ne peut pas lire
+est un label qu'il ne garde pas. Un label d'enforcement ajouté plus tard **par une
+constante** sans déclaration casse la CI au lieu de casser la production six
+semaines après.
+
+**Le prédicat est lui-même un détecteur.** Le `contains("- name: {name}")`
+d'origine rendait `true` pour `block` tant que `blocked` était déclaré, et `false`
+pour tout nom cité. Le jour où `blocked` est entré dans l'ensemble gardé, ces deux
+trous sont devenus réels. Les quatre contrôles du prédicat (deux positifs, deux
+négatifs) sont ce qui rougit si ce durcissement se perd.
 
 ## Les deux corollaires
 
 **Choisissez un label qui existe déjà quand il en existe un.** `operator-gated`
-était déclaré (`.github/labels.yml:106`) avec la description *« Groomed work
+était déclaré (`.github/labels.yml`) avec la description *« Groomed work
 requiring operator-host-time. Distinct from parked/blocked. No ready label. »* —
 littéralement l'état qu'un refus de promotion crée. Le réutiliser fait marcher la
 porte le jour du déploiement, sans dépendre d'une synchro de labels.

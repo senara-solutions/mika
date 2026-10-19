@@ -239,14 +239,24 @@ fn max_redrives() -> i64 {
 /// distribution instead of from this paragraph.
 /// The label the promotion gate applies when it refuses (mika#2123).
 ///
-/// **Not `operator-review`, and that is a measured constraint, not a style
-/// choice.** `operator-review` does not exist: it is absent from
-/// `gh label list` and undeclared in `.github/labels.yml` — verified
-/// 2026-09-01, alongside the control that `ready` (`labels.yml:102`) and
-/// `operator-gated` (`:106`) *are* declared, so the file is the source of
-/// truth. `blocked`, the module's other exclusion label, is equally absent.
+/// **Not `operator-review`, and that was a measured constraint, not a style
+/// choice.** On 2026-09-01, when this gate was written, `operator-review` did
+/// not exist: absent from `gh label list`, undeclared in `.github/labels.yml` —
+/// verified alongside the control that `ready` and `operator-gated` *were*
+/// declared, so the file was the source of truth and not the instrument lying.
+/// `blocked`, the module's other exclusion label, was equally absent.
 ///
-/// The consequence is in production, 48 times in `server.log`:
+/// **Both have been declared since** — `46eeef98` (PR #2128, the same day) added
+/// them. So the sentence above is history, not today's registry: do not read it
+/// as a reason `operator-review` is unusable *now*. What makes the choice of
+/// `operator-gated` still right is the paragraph below on its description, not
+/// the absence. And what keeps all three names declared is no longer a
+/// verification someone remembers to redo, but
+/// [`tests::test_exclusion_labels_are_declared_in_labels_yml`] (mika#2790),
+/// which reads the registry on every build.
+///
+/// The consequence, when the name was undeclared, is in production 48 times in
+/// `server.log`:
 ///
 /// ```text
 /// gh issue edit --add-label failed for #2117:
@@ -273,7 +283,7 @@ fn max_redrives() -> i64 {
 ///    own refusals would first have to re-evaluate tickets its own exclusion
 ///    forbids it to look at.
 /// 2. **The machine cannot tell its label from the operator's.** The declared
-///    description (`.github/labels.yml:106`) is *"Groomed work requiring
+///    description (`.github/labels.yml`) is *"Groomed work requiring
 ///    operator-host-time. Distinct from parked/blocked. No ready label."* — a
 ///    legitimate operator gesture. A gate that removed it would silently un-gate
 ///    work a human gated: exactly the fault mika#2140 fixes, a reader assuming
@@ -295,6 +305,23 @@ fn max_redrives() -> i64 {
 /// — a different reason with a different, legitimate remedy, not the same lift
 /// to redo.
 const REFUSAL_LABEL: &str = "operator-gated";
+
+/// Le label que l'abandon de re-drive pose (mika#2020 R8, constante depuis
+/// mika#2790).
+///
+/// Distinct de [`REFUSAL_LABEL`] : celui-ci marque *« l'auto-pull a renoncé, un
+/// humain doit regarder »*, celui-là *« la porte de promotion a refusé »*. Les
+/// deux sont dans [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`], donc les
+/// deux excluent le ticket des trois phases.
+///
+/// Constante et non littéral parce que son apposition **conditionne** l'abandon :
+/// [`abandon_stuck_ready`] fait `return` quand elle échoue, et elle échoue si
+/// `.github/labels.yml` ne déclare pas ce nom — c'est la classe mika#2127, 48
+/// fois en production. La garde est
+/// [`tests::test_exclusion_labels_are_declared_in_labels_yml`], et elle lit
+/// cette constante : un test qui recopierait le nom garderait sa copie, pas le
+/// nom que le code emploie.
+const ABANDON_LABEL: &str = "operator-review";
 
 const MAX_BEHIND_DEFAULT: i64 = 50;
 
@@ -3199,9 +3226,9 @@ impl AbandonReason {
             "## Auto-pull : re-drive abandonné pour #{issue_number}\n\n\
              **Raison.** {}\n\n\
              **Ce qu'il faudrait pour passer.** Pour remettre ce ticket en jeu : {}, \
-             puis retire son label de tenue — `operator-review` (posé ci-dessus), ou \
+             puis retire son label de tenue — `{ABANDON_LABEL}` (posé ci-dessus), ou \
              `blocked` / `operator-gated` si le ticket en porte un.\n\n\
-             Le label `ready` a été retiré et `operator-review` posé — l'auto-pull ne \
+             Le label `ready` a été retiré et `{ABANDON_LABEL}` posé — l'auto-pull ne \
              re-drivera plus ce ticket tant qu'il porte un label de tenue. Reposer `ready` \
              par-dessus ne lève rien. Retirer le label de tenue remet son compteur de \
              re-drives à zéro.\n\n\
@@ -3241,8 +3268,8 @@ async fn abandon_stuck_ready(
     // gesture, and the budget would reset — a fresh loop every N re-drives.
     // Aborting instead is convergent: the counter is still past the budget, so
     // the next tick simply retries the abandonment.
-    if let Err(e) = gh_apply_label(label_auth, issue_number, "operator-review").await {
-        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
+    if let Err(e) = gh_apply_label(label_auth, issue_number, ABANDON_LABEL).await {
+        warn!(error = %e, issue = issue_number, label = ABANDON_LABEL, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
         if let Err(e2) = db
             .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
             .await
@@ -5800,30 +5827,128 @@ mod tests {
         assert!(json["changed_files_count"].is_null());
     }
 
-    /// The label the gate applies must actually exist.
+    /// Tout label que ce module pose, et tout label de tenue par lequel la boucle
+    /// exclut un ticket ([`crate::webhook_dispatch::OPERATOR_HELD_LABELS`]), doit
+    /// être déclaré dans `.github/labels.yml`. Les labels de siège `dispatch:*`
+    /// ont leur propre garde, dans les deux sens
+    /// (`scripts/check-dispatch-seats-declared.sh`, mika#2092).
     ///
-    /// This is mika#2123's own correction, made structural. `operator-review` is
-    /// referenced a dozen times in this module and declared nowhere; 48
-    /// production lines say `'operator-review' not found`. Prose cannot prevent
-    /// the next instance — reading the declaration file can.
+    /// **La classe de défaut.** `label-sync` tourne avec
+    /// `delete-other-labels: true` : un nom que le code emploie mais que ce
+    /// fichier ne déclare pas est supprimé du dépôt **et de chaque ticket qui le
+    /// portait**, sans événement `unlabeled` et sans ligne de journal. C'est
+    /// mika#2127, 48 lignes `'operator-review' not found` en production, chacune
+    /// un [`abandon_stuck_ready`] qui n'a rien abandonné. La prose ne peut pas
+    /// empêcher la récidive — lire le fichier de déclaration, oui.
+    ///
+    /// **Pourquoi l'itération se fait sur la constante.**
+    /// [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`] grandit (trois membres
+    /// aujourd'hui, un quatrième un jour). Une liste recopiée ici garderait sa
+    /// copie et non la liste que le code lit : le label ajouté serait couvert le
+    /// jour où quelqu'un y repense, pas le jour où il atterrit. Même idiome que
+    /// [`mika2361_each_held_label_names_itself`].
+    ///
+    /// **Pourquoi le prédicat est durci.** Un prédicat qui rend `true` à tort est
+    /// la seule manière dont cette garde peut mentir. Le `contains("- name:
+    /// {name}")` nu de mika#2123 avait deux trous, tous deux rendus concrets par
+    /// l'entrée de `blocked` dans l'ensemble gardé : non ancré à droite (il rend
+    /// `true` pour `block` tant que `blocked` est déclaré, donc il resterait vert
+    /// au retrait de `blocked` au profit d'un `blocked-*`) et aveugle aux noms
+    /// cités (`labels.yml` met entre guillemets tout nom portant un `:`). Les
+    /// quatre contrôles ci-dessous — deux positifs, deux négatifs — sont ce qui
+    /// rougit le jour où ce durcissement se perd.
+    ///
+    /// **Portée.** Ce détecteur lit exactement trois constantes :
+    /// [`REFUSAL_LABEL`], [`ABANDON_LABEL`] et les membres de
+    /// `OPERATOR_HELD_LABELS`. Il ne garde pas « tout label apparaissant dans
+    /// l'arbre » — un littéral en dur reste hors de sa portée, d'où `ABANDON_LABEL`.
+    ///
+    /// Nommé `test_refusal_label_is_declared_in_labels_yml` jusqu'à mika#2790,
+    /// quand il a cessé de ne garder qu'un seul littéral.
     #[test]
-    fn test_refusal_label_is_declared_in_labels_yml() {
+    fn test_exclusion_labels_are_declared_in_labels_yml() {
         let yml = include_str!("../../../.github/labels.yml");
-        let declared = |name: &str| yml.contains(&format!("- name: {name}"));
 
-        // Positive control: the guard can see a label that IS declared.
+        // Ancré à droite sur la fin de ligne, et tolérant au nom cité :
+        // `labels.yml` entoure de guillemets tout nom portant un `:`
+        // (`"dispatch:loop"`). Un `contains("- name: {name}")` nu rendrait `true`
+        // pour `block` tant que `blocked` est déclaré, et `false` pour tout nom
+        // cité — les deux contrôlés ci-dessous.
+        let declared = |name: &str| {
+            yml.lines().any(|line| {
+                line.strip_prefix("- name: ")
+                    .map(str::trim)
+                    .is_some_and(|d| d == name || d.trim_matches('"') == name)
+            })
+        };
+
+        // -- contrôles du prédicat --
+        // Positif, forme nue.
         assert!(declared("ready"), "labels.yml must declare `ready`");
-        // Negative control: the guard can see a label that is NOT declared. A
-        // check that answers `true` for everything proves nothing.
+        // Positif, forme citée : sans lui, le durcissement n'est pas couvert.
+        assert!(
+            declared("dispatch:loop"),
+            "the predicate must see a quoted entry; labels.yml quotes every name \
+             carrying a `:`"
+        );
+        // Négatif : un prédicat qui répond `true` à tout ne prouve rien.
         assert!(
             !declared("a-label-nobody-has-ever-declared"),
             "the guard must be able to detect an undeclared label"
         );
-
+        // Négatif d'ancrage : `blocked` est déclaré, `block` ne l'est pas. Un
+        // prédicat non ancré resterait vert au retrait de `blocked` au profit
+        // d'un `blocked-*`.
         assert!(
-            declared(REFUSAL_LABEL),
-            "the promotion gate applies `{REFUSAL_LABEL}`, which .github/labels.yml does not \
-             declare — the refusal would fail exactly as `operator-review` does today"
+            !declared("block"),
+            "the predicate must anchor on the whole name, not on a prefix of it"
+        );
+
+        // -- l'ensemble gardé : chaque entrée nomme son site d'emploi --
+        let mut guarded: Vec<(&str, &str)> = vec![
+            (REFUSAL_LABEL, "auto_pull::refuse_promotion (REFUSAL_LABEL)"),
+            (
+                ABANDON_LABEL,
+                "auto_pull::abandon_stuck_ready (ABANDON_LABEL)",
+            ),
+        ];
+        // Itération sur la constante, jamais sur une liste recopiée : un label
+        // ajouté à OPERATOR_HELD_LABELS est couvert le jour où il atterrit, pas
+        // le jour où quelqu'un y repense (même idiome que
+        // `mika2361_each_held_label_names_itself`).
+        for label in crate::webhook_dispatch::OPERATOR_HELD_LABELS {
+            guarded.push((
+                label,
+                "webhook_dispatch::OPERATOR_HELD_LABELS — lu par operator_held_label \
+                 et label_read_by_loop (exclusion des trois phases)",
+            ));
+        }
+
+        // Contrôle positif de l'itération : une constante vide rendrait la boucle
+        // vacante et la garde verte pour rien.
+        assert!(
+            !crate::webhook_dispatch::OPERATOR_HELD_LABELS.is_empty(),
+            "OPERATOR_HELD_LABELS must be non-empty, or the loop above guards nothing"
+        );
+
+        // Un seul panic, portant TOUS les sites : `operator-review` est employé
+        // par deux d'entre eux, et un opérateur qui le retire de labels.yml doit
+        // lire les deux, pas le premier.
+        let offenders: Vec<String> = guarded
+            .iter()
+            .filter(|(label, _)| !declared(label))
+            .map(|(label, site)| format!("  `{label}` — employé par {site}"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`.github/labels.yml` ne déclare pas {} des labels que le code pose ou \
+             lit. `label-sync` tourne avec `delete-other-labels: true` : le label \
+             est supprimé du dépôt ET de chaque ticket qui le portait, sans \
+             événement ni journal, et le site ci-dessous échoue en silence \
+             (classe mika#2127, 48 occurrences en production). Déclare-le dans \
+             `.github/labels.yml` :\n{}",
+            offenders.len(),
+            offenders.join("\n")
         );
     }
 
