@@ -1887,6 +1887,207 @@ assert_contains "the already_groomed note names the gesture that works" \
     'remove the plan from the branch AND the grooming callouts from the issue body' \
     "$SETUP_WT_SRC"
 
+# ============================================================================
+# mika#2811 — quand le refus de la porte de dispatch EST la raison du groom
+# ============================================================================
+#
+# § 1.1 du ticket : deux portes jugeaient la même question — « ce ticket est-il
+# groomé ? » — sur deux sources différentes. La porte de dispatch lit la BASE
+# (preuve `Outcome: PLAN_GROOMED`, mika#1620/#2287) ; l'auto-skip assertionné
+# ci-dessus lit le CORPS (les trois callouts). Quand elles divergent, aucune des
+# deux ne fait le travail : cinq tâches `already_groomed` de deux minutes sur
+# #1381 et #1959 le 2026-10-19, jusqu'à épuiser le budget de re-drive de
+# mika#2020. Le correctif de mika#2484 avait déplacé la boucle sans la fermer.
+#
+# Le moteur transmet désormais la provenance du refus (`ready_label_handler`,
+# champ moteur-interne lu ici), et ce dispatch-là seulement désarme l'auto-skip.
+# La provenance est TRANSMISE, jamais recalculée (motif mika#2026) : le shell ne
+# doit pas devenir un troisième lecteur de l'état de grooming (mika#2158).
+#
+# LE CROISEMENT CONTRACTUEL DE LA LIGNE 1708 RESTE VRAI, et n'a pas à être
+# assoupli : « si la garde refuse pour `already_groomed`, alors le Rust doit
+# dire groomé. » Le désarmement ne rend la garde permissive dans AUCUN des cas
+# qu'elle refusait pour eux-mêmes ; il lui retire seulement ceux où le moteur a
+# déjà constaté l'absence de preuve — et dans ceux-là le Rust ne dit justement
+# PAS groomé (c'est `MarkersWithoutProof` ou `ProofUnreadable` qui a produit la
+# cause). L'implication tient donc avec un antécédent strictement plus petit.
+# C'est écrit ici, et assertionné plus bas par la position du RESULT dans la
+# chaîne, pour que le prochain lecteur n'aille pas « corriger » le test de la
+# ligne 1726.
+
+# --- (a) le lecteur d'entrée lit le champ PAR LA CONSTANTE -------------------
+#
+# `|| true` : sous `set -e`, `declare -f` sur une fonction renommée tue la suite
+# avant que l'anti-vacuité puisse dire quoi (même raison qu'à la ligne 1821).
+PARSE_SRC_2811=$(declare -f _parse_input_json || true)
+assert_contains "mika#2811 (anti-vacuité): le lecteur d'entrée existe toujours" \
+    '_parse_input_json (' "$PARSE_SRC_2811"
+assert_contains "mika#2811: la cause est lue par la constante, via --arg" \
+    '--arg f "$GROOM_FORCE_CAUSE_FIELD"' "$PARSE_SRC_2811"
+assert_not_contains "mika#2811: le nom du champ n'est pas retapé dans le lecteur" \
+    '__internal_groom_cause' "$PARSE_SRC_2811"
+
+# Le site de définition est UNIQUE et en colonne 0 — la forme exacte que le scan
+# de parité Rust lit (`canonical_tokens::tests::mika2811_le_nom_du_champ_de_cause_est_synchronise_shell_a_rust`).
+# COMPTÉ, pas seulement cherché : une seconde déclaration ailleurs laisserait le
+# scan vert tout en donnant deux vérités au même nom.
+assert_eq "mika#2811: le nom du champ a exactement un site de définition, en colonne 0" \
+    "1" "$(grep -c '^GROOM_FORCE_CAUSE_FIELD="__internal_groom_cause"$' "$DISPATCH_LIB" || true)"
+assert_eq "mika#2811: et le littéral n'apparaît nulle part ailleurs dans la lib" \
+    "1" "$(grep -oF -- '__internal_groom_cause' "$DISPATCH_LIB" | wc -l | tr -d '[:space:]')"
+
+# --- (b) comportemental, les deux sens : la lecture du champ -----------------
+_t2811_cause_probe() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _parse_input_json <<<"$1"
+        printf '%s' "${GROOM_FORCE_CAUSE:-}"
+    )
+}
+assert_eq "mika#2811: une cause posée par le moteur arrive dans GROOM_FORCE_CAUSE" \
+    "markers_without_proof" \
+    "$(_t2811_cause_probe '{"__mika_task_id":"t-2811","skill":"dev-groom","prompt":"mika#2811","__internal_groom_cause":"markers_without_proof"}' 2>/dev/null)"
+assert_eq "mika#2811: la panne de base arrive sous son propre nom" \
+    "proof_unreadable" \
+    "$(_t2811_cause_probe '{"__mika_task_id":"t-2811","skill":"dev-groom","prompt":"mika#2811","__internal_groom_cause":"proof_unreadable"}' 2>/dev/null)"
+# Contrôle négatif : sans la clé, la variable est VIDE — pas « absente lue comme
+# une cause ». C'est ce vide qui laisse la porte de mika#2012 armée sur tout
+# dispatch que le moteur n'a pas routé ici faute de preuve (flux opérateur
+# mika#1173 compris).
+assert_eq "mika#2811 (contrôle négatif): sans la clé, aucune cause n'est inventée" \
+    "" \
+    "$(_t2811_cause_probe '{"__mika_task_id":"t-2811","skill":"dev-groom","prompt":"mika#2811"}' 2>/dev/null)"
+
+# --- (c) la chaîne du gate : ordre, noms, et la note qui ne cite rien --------
+#
+# Aucun test comportemental ne peut atteindre la chaîne depuis `_set_up_worktree`
+# lui-même : elle vit après `gh issue view` et avant `worktree add`, donc hors
+# d'un dispatch complet. La région est extraite du fichier réel (même idiome que
+# mika#2590 U8f(c), vers la ligne 10474), et l'anti-vacuité passe D'ABORD — un
+# scan qui ne regarde rien rend les mêmes octets qu'un arbre propre (mika#2205).
+T2811_GATE_CHAIN=$(sed -n '/^        if \[ "\$SKILL" = "dev-groom" \] && \[ -n "\$GROOM_FORCE_CAUSE" \]/,/^        fi$/p' "$DISPATCH_LIB")
+assert_eq "mika#2811 (bonne foi): la chaîne du gate a été extraite" \
+    "yes" "$(if [ -n "$T2811_GATE_CHAIN" ]; then printf 'yes'; else printf 'no'; fi)"
+
+T2811_SHORTCIRCUIT_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- '-n "$GROOM_FORCE_CAUSE"' | head -1 | cut -d: -f1)
+T2811_PLANGATE_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- '_committed_plan_on_branch "$SUB_REPO_DIR"' | head -1 | cut -d: -f1)
+T2811_AUTOSKIP_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- '"reason":"already_groomed"' | head -1 | cut -d: -f1)
+T2811_ELIF_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- 'elif [ "$SKILL" = "dev-groom" ]; then' | head -1 | cut -d: -f1)
+# « Ce groom a-t-il été forcé ? » est à coût nul ; mesurer le plan coûte du git.
+assert_eq "mika#2811: le court-circuit de cause est AVANT la mesure git du plan" \
+    "yes" "$([ "${T2811_SHORTCIRCUIT_LN:-0}" -gt 0 ] && [ "${T2811_PLANGATE_LN:-0}" -gt 0 ] && [ "$T2811_SHORTCIRCUIT_LN" -lt "$T2811_PLANGATE_LN" ] && printf 'yes' || printf 'non (cause=%s plan=%s)' "${T2811_SHORTCIRCUIT_LN:-?}" "${T2811_PLANGATE_LN:-?}")"
+# L'implication de la ligne 1708, dite structurellement : le RESULT
+# `already_groomed` ne vit QUE dans le bras atteint sans cause.
+assert_eq "mika#2811: le RESULT already_groomed vit APRÈS le elif, donc hors du bras forcé" \
+    "yes" "$([ "${T2811_ELIF_LN:-0}" -gt 0 ] && [ "${T2811_AUTOSKIP_LN:-0}" -gt 0 ] && [ "$T2811_ELIF_LN" -lt "$T2811_AUTOSKIP_LN" ] && printf 'yes' || printf 'non (elif=%s skip=%s)' "${T2811_ELIF_LN:-?}" "${T2811_AUTOSKIP_LN:-?}")"
+
+# Le bras de forçage, isolé, pour juger la ligne qu'il émet et elle seule — le
+# commentaire voisin NOMME les deux autres signaux (à dessein), donc une
+# assertion sur la région entière serait vraie pour la mauvaise raison.
+T2811_FORCED_ECHO=$(printf '%s\n' "$T2811_GATE_CHAIN" | sed -n '1,/^        elif \[ "\$SKILL" = "dev-groom" \]; then$/p' | grep -F 'echo "dispatch_gate_' || true)
+assert_eq "mika#2811 (bonne foi): le bras forcé émet exactement une ligne de signal" \
+    "1" "$(printf '%s\n' "$T2811_FORCED_ECHO" | grep -c . || true)"
+# Un TROISIÈME nom : chaque population a le sien, et réutiliser un nom la rend
+# insoustractible (mika#2012 U4, qui a créé le second pour cette raison).
+assert_contains "mika#2811: le désarmement a son propre nom de signal" \
+    'dispatch_gate_groom_forced_no_proof:' "$T2811_FORCED_ECHO"
+assert_not_contains "mika#2811: ce n'est pas le signal de refus réutilisé" \
+    'dispatch_gate_groom_refused' "$T2811_FORCED_ECHO"
+assert_not_contains "mika#2811: ni celui du callout périmé" \
+    'dispatch_gate_groom_allowed_stale_callout' "$T2811_FORCED_ECHO"
+# `cause=` pour que le grep sépare la population nominale
+# (`markers_without_proof`) de la panne de base (`proof_unreadable`, régime
+# attendu VIDE) — deux populations sous un nom ne sont pas soustractibles
+# (mika#2205).
+assert_contains "mika#2811: le signal porte la cause, pas seulement le fait" \
+    'cause=${GROOM_FORCE_CAUSE}' "$T2811_FORCED_ECHO"
+# mika#2590 U5b : la porte prouvait le grooming par une sous-chaîne, donc le
+# texte qui disait « ceci n'est pas une preuve » EST devenu la preuve
+# (2026-09-29, offset 651). Le lecteur Rust est ancré depuis ; ceci est la
+# défense en profondeur, reportée sur le texte neuf.
+assert_not_contains "mika#2811 (mika#2590 U5b): la note de forçage ne cite pas le marqueur" \
+    'Outcome: PLAN_GROOMED' "$T2811_FORCED_ECHO"
+# Contrôle négatif de l'assertion elle-même : sur une fixture qui cite le jeton,
+# le prédicat DOIT accuser.
+T2811_MARKER_FIXTURE='            echo "dispatch_gate_groom_forced_no_proof: … no Outcome: PLAN_GROOMED exists in the database …" >&2'
+assert_eq "mika#2811 (contrôle négatif): le prédicat accuse une note qui cite le jeton" \
+    "1" "$(printf '%s\n' "$T2811_MARKER_FIXTURE" | grep -c -F 'Outcome: PLAN_GROOMED' || true)"
+
+# --- (d) comportemental, les deux sens : la disposition de la chaîne ---------
+#
+# La chaîne extraite est EXÉCUTÉE, pas paraphrasée : elle est enveloppée dans une
+# fonction et sourcée, les quatre appels qu'elle fait sont bouchonnés, et
+# `_deliver_callback` rend le RESULT au lieu de l'envoyer. Un futur éditeur du
+# gate change donc ce que ce test exécute, et non seulement ce qu'il lit.
+_t2811_gate_probe() {
+    local wrapper
+    wrapper=$(mktemp)
+    {
+        printf '_t2811_gate_arm() {\n'
+        printf '%s\n' "$T2811_GATE_CHAIN"
+        printf '}\n'
+    } > "$wrapper"
+    (
+        _committed_plan_on_branch() { printf '%s\n' "docs/plans/2026-08-14-001-ancien-plan.md"; }
+        _plan_provenance() { printf 'committed on the branch'; }
+        _extract_plan_path() { printf 'docs/plans/2026-08-14-001-ancien-plan.md'; }
+        _deliver_callback() { printf '%s' "$RESULT"; }
+        SKILL="dev-groom"
+        REPO="mika"
+        ISSUE_NUM="2811"
+        BRANCH="fix/2811/probe"
+        SUB_REPO_DIR="/nonexistent"
+        ISSUE_BODY='> - **Plan:** `docs/plans/2026-08-14-001-ancien-plan.md`'
+        RESULT=""
+        GROOM_FORCE_CAUSE="$1"
+        # shellcheck disable=SC1090
+        source "$wrapper"
+        _t2811_gate_arm
+    )
+    rm -f "$wrapper"
+}
+# Sens 1 — cause posée : la chaîne ne produit AUCUN `already_groomed`. C'est la
+# boucle du ticket, fermée : le dispatch continue vers une passe réelle qui
+# frappera la preuve, au lieu de rendre un skip de deux minutes.
+T2811_FORCED_OUT=$(_t2811_gate_probe "markers_without_proof" 2>/dev/null)
+T2811_FORCED_ERR=$(_t2811_gate_probe "markers_without_proof" 2>&1 >/dev/null)
+assert_eq "mika#2811 (comportemental): cause posée ⇒ aucun RESULT already_groomed" \
+    "0" "$(printf '%s\n' "$T2811_FORCED_OUT" | grep -c -F 'already_groomed' || true)"
+assert_contains "mika#2811 (comportemental): cause posée ⇒ le désarmement est DIT, sur stderr" \
+    'dispatch_gate_groom_forced_no_proof: repo=mika issue=2811' "$T2811_FORCED_ERR"
+assert_contains "mika#2811 (comportemental): et la ligne nomme la cause en vigueur" \
+    'cause=markers_without_proof' "$T2811_FORCED_ERR"
+# Sens 2 — cause absente : la porte de mika#2012 est INCHANGÉE. Si elle ne
+# refusait plus ici, le désarmement serait devenu une désactivation.
+T2811_PLAIN_OUT=$(_t2811_gate_probe "" 2>/dev/null)
+assert_eq "mika#2811 (contrôle négatif): cause absente ⇒ la porte de mika#2012 refuse comme avant" \
+    "auto_skipped|already_groomed" \
+    "$(printf '%s' "$T2811_PLAIN_OUT" | jq -r '[.status, .reason] | join("|")' 2>/dev/null || printf 'illisible')"
+assert_eq "mika#2811 (contrôle négatif): et le RESULT nomme toujours le plan mesuré" \
+    "docs/plans/2026-08-14-001-ancien-plan.md" \
+    "$(printf '%s' "$T2811_PLAIN_OUT" | jq -r '.plan' 2>/dev/null || printf 'illisible')"
+assert_contains "mika#2811 (contrôle négatif): et le geste de remède est intact" \
+    'remove the plan from the branch AND the grooming callouts from the issue body' \
+    "$T2811_PLAIN_OUT"
+
+# --- (e) le texte du remède : l'ORDRE des deux routes est le correctif -------
+#
+# Ce bras ne se lit plus que sans provenance de refus — donc sur un groom
+# demandé par un tour LLM (mika#1173). Pour tout ce qui passe par la boucle, le
+# retrait à la main du plan et des callouts est devenu du travail opérateur pour
+# rien : y repasser suffit. Le geste reste nommé, en SECOND, parce qu'il marche
+# toujours et qu'il est la seule issue hors boucle. C'est pourquoi l'assertion
+# porte sur l'ordre et pas seulement sur la présence.
+T2811_NOTE=$(printf '%s' "$T2811_PLAIN_OUT" | jq -r '.note' 2>/dev/null || printf 'illisible')
+assert_contains "mika#2811: la note nomme le retour par la boucle" \
+    'Cheapest route back: hand the ticket to the loop' "$T2811_NOTE"
+assert_contains "mika#2811: et dit que la passe forcée frappe la preuve, plan en place" \
+    'mints the proof with the plan left exactly where it is' "$T2811_NOTE"
+T2811_NOTE_HEAD="${T2811_NOTE%%remove the plan from the branch AND*}"
+assert_eq "mika#2811: la route de boucle est nommée AVANT le geste à la main" \
+    "1" "$(printf '%s' "$T2811_NOTE_HEAD" | grep -c -F 'Cheapest route back' || true)"
+
 # --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
 
 echo ""
