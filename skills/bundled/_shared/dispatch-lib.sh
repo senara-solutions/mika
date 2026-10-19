@@ -3078,6 +3078,72 @@ _set_outcome_line() {
 ${1}"
 }
 
+# mika#2077 (reprise de mika#2032) — un `PIPELINE FAILURE` périmé est DÉMOTÉ,
+# jamais décapité. Filtre pur stdin → stdout.
+#
+# LE DÉFAUT. Le site qui appelle cette fonction (chemin GROOMED de
+# `_iterate_groom_loop`) faisait `sed '/^PIPELINE FAILURE:/d'`. Les messages
+# d'échec de ce fichier sont des BLOCS de plusieurs lignes dont une seule porte
+# le marqueur : `_classify_terminated_session` en mode `full` écrit la tête, puis
+# `Session:`, `Turns:`, `Duration:`, `Halt:`, `Halt class:`, `Retry hint:` et un
+# paragraphe. `sed` retirait la tête et laissait tout le corps, orphelin — un
+# `Halt class:` sans halte, un `Session:` sans session morte. Le diagnostic
+# arrivait tronqué exactement quand il comptait.
+#
+# POURQUOI DÉMOTER PLUTÔT QUE SUPPRIMER PLUS LARGE. Le `sed` n'existait pas pour
+# faire disparaître la prose : le marqueur `PIPELINE FAILURE:` met le callback
+# dans la population retryable, lue par
+# `milestone_manager::evaluator::dead_cause_of`. Sur un groom qui a convergé ce
+# marqueur est FAUX — mais l'échec qu'il introduisait, lui, a bien eu lieu. Ce
+# qui doit disparaître est donc le marqueur, pas l'événement. Le lecteur voit
+# alors qu'un échec a été posé PUIS dépassé, là où la suppression l'effaçait.
+# La forme n'est pas inventée ici : le même chemin dev-groom porte déjà
+# « Demoted from PIPELINE FAILURE to advisory note (mika#1303) », pour le même
+# motif — un fait réel dont le marqueur était faux.
+#
+# La frontière « supprimer jusqu'à la prochaine ligne vide », premier remède
+# proposé par mika#2032, est MESURÉE FAUSSE sur les messages réels : dans tous
+# les blocs concernés la première ligne vide suit IMMÉDIATEMENT le marqueur, donc
+# ce strip retirerait la tête ET le séparateur, collant `Session:` au texte qui
+# précède. Strictement pire que le `sed`.
+#
+# `PIPELINE FAILURE:` DOIT DISPARAÎTRE DE LA LIGNE, pas seulement de sa tête :
+# `evaluator.rs` lit en `contains`, non ancré. Une démotion qui garderait le
+# marqueur en milieu de ligne reconduirait la forme « ancrée à l'écriture, non
+# ancrée à la lecture » que mika#2590 a fermée sur `Outcome:`.
+#
+# L'ANCRAGE EN ENTRÉE EST CONSERVÉ, lui. Une ligne portant `PIPELINE FAILURE:`
+# ailleurs qu'en tête — la prose d'un plan, un extrait de log cité dans un
+# diagnostic — n'est pas touchée : c'est le comportement du `sed` d'origine, et
+# le périmètre de ce vol est le résidu orphelin, pas l'ancrage.
+#
+# TOUS les marqueurs ancrés sont démotés, pas seulement le premier : un `RESULT`
+# peut porter deux blocs d'échec (le post-flight de `_run_claude_pilot`, puis la
+# validation de plan).
+#
+# `awk` et non `sed`: le remplacement est posé par `index`/`substr` sur des
+# chaînes littérales, donc ni le marqueur ni le texte démoté ne sont relus comme
+# motif ou comme remplacement — la même raison qui a mis `awk` au site
+# `_outcome_line` de `_guard_empty_cycle_output`. `LC_ALL=C` pour que `index` et
+# `substr` comptent des OCTETS : toute autre ligne doit passer octet pour octet,
+# y compris une prose accentuée.
+#
+# Les deux littéraux s'arrêtent au `:` — sans l'espace qui le suit dans tous les
+# messages réels. C'est délibéré : l'ancrage reconnu devient bit pour bit celui
+# du `sed` d'origine (`/^PIPELINE FAILURE:/`), donc la démotion ne peut pas
+# RÉTRÉCIR la population que le site traitait, et une ligne du jour où un
+# producteur oublierait l'espace ne repartirait pas avec son marqueur intact.
+# L'espace de la ligne réelle est porté par le reste de la ligne et survit tel
+# quel, ce qui rend la tête démotée identique à celle que le plan donne.
+_DEMOTED_PIPELINE_FAILURE_PREFIX='Superseded (grooming converged, mika#2077):'
+_demote_pipeline_failure_markers() {
+    LC_ALL=C awk -v marker='PIPELINE FAILURE:' \
+                 -v repl="$_DEMOTED_PIPELINE_FAILURE_PREFIX" '
+        index($0, marker) == 1 { print repl substr($0, length(marker) + 1); next }
+        { print }
+    '
+}
+
 # mika#2634 — the exit code under which the pre-flight stamps "the LAUNCHER did
 # not start", as opposed to "a pilot failed".
 #
@@ -12442,9 +12508,18 @@ ${RESULT}"
             # "Outcome: PLAN_COMMITTED"; on re-dispatch the plan validation block
             # may have already set PIPELINE_INCOMPLETE (e.g., plan created on a
             # prior day), making the old sed a no-op. The canonical callout was
-            # written and the grooming is complete — strip any stale PIPELINE
+            # written and the grooming is complete — demote any stale PIPELINE
             # FAILURE markers and set the authoritative outcome.
-            RESULT=$(printf '%s' "$RESULT" | sed '/^PIPELINE FAILURE:/d')
+            #
+            # mika#2077 (reprise de mika#2032) : DÉMOTION et non suppression. Le
+            # `sed '/^PIPELINE FAILURE:/d'` qui était ici retirait la ligne du
+            # marqueur et laissait le reste du bloc — `Session:`, `Turns:`,
+            # `Halt class:` — orphelin, sans tête. Ce qui est faux sur un groom
+            # convergé est le marqueur retryable, pas l'événement qu'il
+            # introduisait ; la fonction retire donc la chaîne que
+            # `milestone_manager::evaluator::dead_cause_of` lit, et conserve la
+            # prose sous une tête qui dit « posé, puis dépassé ».
+            RESULT=$(printf '%s' "$RESULT" | _demote_pipeline_failure_markers)
             # mika#2590 U5a — la ligne est posée par `_set_outcome_line`, jamais
             # plus par un `sed` non ancré doublé d'un filet non ancré.
             #
@@ -12461,8 +12536,10 @@ ${RESULT}"
             # `_set_outcome_line` (mika#2492) rend « exactement une ligne
             # `Outcome:` ancrée » vraie PAR CONSTRUCTION, là où le couple ne la
             # rendait vraie que par coïncidence d'ordonnancement. Le filet
-            # disparaît avec lui : il n'a plus rien à rattraper. Le strip des
-            # `PIPELINE FAILURE:` périmés au-dessus est conservé.
+            # disparaît avec lui : il n'a plus rien à rattraper. Le traitement
+            # des `PIPELINE FAILURE:` périmés au-dessus est conservé — c'est une
+            # démotion depuis mika#2077, et elle ne touche aucune ligne
+            # `^Outcome: `, donc cet appel reste le seul auteur de celle-ci.
             _set_outcome_line "Outcome: PLAN_GROOMED"
         elif grep -qE '^Outcome: ESCALATE' <<<"$RESULT"; then
             # mika#2545 — an ESCALATE is already fully stamped by its producer
