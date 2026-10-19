@@ -92,13 +92,42 @@ L'agrégat porte deux populations qui ne se soustraient pas l'une de l'autre :
 |---|---|---|
 | payée | `by_agent_trigger` | les tours qui ont **eu lieu**, par agent × déclencheur, avec leur coût |
 | payée | `charged_by_release` | **pourquoi** chacun a eu lieu, par terme de relâche (dix valeurs, vol 4) |
+| payée | `by_agent_trigger_release` | les deux à la fois : agent × déclencheur × terme de relâche, **avec le coût en tokens** (vol 5) |
 | écartée | `skipped_by_class` | les tours que le pré-filtre a **évités**, par classe |
+| écartée | `skipped_by_agent_class` | la même population, **par agent** × classe (vol 5) |
 
 **Les deux taxonomies ne se dérivent pas l'une de l'autre**, et c'est pour cela
 qu'il y a deux seaux. `skipped_by_class` nomme ce qu'une porte a reconnu ;
 `charged_by_release` nomme la porte qui a relâché. Un même `trigger` se répartit
 sur plusieurs termes de relâche, et un même terme traverse plusieurs
 déclencheurs.
+
+**Elles ne se dérivent pas, mais elles se croisent — et c'est le croisement qui
+porte la décision.** Jusqu'au vol 4, les deux opérandes de la soustraction de la
+classe (g) vivaient sur deux axes qui ne se rencontraient pas :
+`charged_by_release` donnait le terme de relâche sans l'agent et sans le coût,
+`by_agent_trigger` donnait l'agent et le coût sans le terme. Répondre à *« que
+coûtent les `check_suite` verts de branche de PR, côté `mika-qa`, dont la tête
+n'avait pas encore été décidée ? »* demandait un `jq` ad hoc sur le fichier de
+tours — exactement la pièce rapportée humaine que le registre du vol 1 existait
+pour supprimer. Les deux seaux croisés du vol 5 la rendent lisible sur le seul
+agrégat : `by_agent_trigger_release` pour la moitié payée,
+`skipped_by_agent_class` pour la moitié écartée.
+
+Ils **ne remplacent ni l'un ni l'autre** des deux seaux plats, et ne les
+modifient pas d'un octet. Un seau plat répond à une question de fenêtre — *« sur
+quels termes cette fenêtre a-t-elle relâché ? »* — et c'est la lecture des § 5 et
+§ 6. Un seau croisé répond à une question de décision, qui se pose toujours au
+grain d'une cellule.
+
+**L'unité du seau payé est le token, pas le tour.** `charged_by_release` compte
+des tours ; `by_agent_trigger_release` porte les trois valeurs de coût de son
+voisin `by_agent_trigger` — `input_tokens`, `cache_read_tokens`, `llm_calls` —
+et il est trié comme lui, par `input_tokens` décroissant. Un croisement qui ne
+porterait que `turns` aurait l'air complet et laisserait (g) indécidable : deux
+cellules à un tour chacune peuvent valoir 900 tokens et 120. Le seau écarté, lui,
+n'a pas de clé de coût du tout et porte `skipped` — un tour évité n'a consommé
+aucun token, et lui en prêter un serait inventer un chiffre.
 
 **Ce que le registre décide.** La moitié payée chiffre chaque classe candidate
 par son `trigger` : (e) est `pr_closed`, (g) est `check_suite_pr_branch` côté
@@ -119,7 +148,14 @@ antérieur au vol 4 ne porte pas `release` ; elle est comptée sous
 `absent_pre_field`, jamais sous `null` ni `unknown`. Une fenêtre entièrement
 antérieure au déploiement se lit donc à 100 % dans ce seau, et c'est pourquoi le
 § 5 ne gagne **pas** une troisième condition de halte pour ce champ-ci : le seau
-dit déjà la raison de sa propre absence.
+dit déjà la raison de sa propre absence. `by_agent_trigger_release` applique la
+même règle, et il l'applique **aux deux endroits** : le repli
+`absent_pre_field` est dans la clé de groupement *et* dans la projection de la
+cellule. Dans la clé seule, la cellule aurait le bon compte sous un faux nom
+(`release: null`) ; dans la projection seule, deux populations se
+mélangeraient. C'est le motif mika#2331 — *absent n'est ni zéro ni « none »* — et
+l'assertion **N8** du § 4 de `scripts/test-measure-webhook-turn-cost.sh` le
+tient en vérifiant les deux moitiés à la fois.
 
 **Ce que le registre ne fait que majorer.** Un tour payé n'est pas un tour
 *inutile*. `by_agent_trigger` donne le **plafond** de ce qu'une classe pourrait
@@ -186,31 +222,45 @@ ne s'implémente pas : elle se pose à l'opérateur.
 ## 8. L'instrument lui-même
 
 - `scripts/measure-webhook-turn-cost` — le lecteur. `--help` imprime son en-tête.
-- `scripts/test-measure-webhook-turn-cost.sh` — son harnais : un contrôle positif
-  (l'unité est le tour, la valeur est une **somme** sur toutes les lignes
-  `turn_usage` de la trace, continuation `step = u32::MAX` comprise) et six
-  contrôles négatifs, chacun sur sa propre entrée. `make
-  test-measure-webhook-turn-cost`. **L'étape CI qui appelle cette cible reste à
-  poser** : le jeton de dispatch n'a pas le scope `workflow`, donc la branche du
-  vol 2 ne peut pas porter `.github/workflows/ci.yml` — l'étape et son
-  emplacement exact sont dans le corps de la PR du vol 2.
-- `crates/mika-agent/tests/fixtures/mika2680/` — cinq corpus gelés et
+- `scripts/test-measure-webhook-turn-cost.sh` — son harnais : treize assertions,
+  trois contrôles positifs et dix négatifs, chacun sur sa propre entrée. Le
+  premier positif tient l'unité (le tour, et la valeur est une **somme** sur
+  toutes les lignes `turn_usage` de la trace, continuation `step = u32::MAX`
+  comprise) ; les deux autres tiennent le terme de relâche (§ 3 du harnais,
+  vol 4) et le croisement des deux taxonomies (§ 4, vol 5). `make
+  test-measure-webhook-turn-cost`. **L'étape CI qui appelle cette cible est
+  posée** — `.github/workflows/ci.yml` l. 111-112, *« Webhook-turn register
+  reader — the turn is a SUM (mika#2680) »*, par `8ac93d62` (mika#2752) ; le
+  jeton d'un pilote dispatché n'a pas le scope `workflow`, donc elle a été posée
+  hors de la boucle, et c'est ce qui en faisait un hors-périmètre des vols 2 et
+  3. **Et c'est aussi pourquoi cette cible n'est PAS dans
+  `scripts/suite-wiring.tsv`** : ce registre ne porte que le résidu — les suites
+  qu'aucun workflow n'atteint — et sa comparaison est bidirectionnelle depuis
+  mika#2761, donc une entrée pour une suite que la CI atteint **fait rougir**
+  `check-suite-wiring`.
+- `crates/mika-agent/tests/fixtures/mika2680/` — six corpus gelés et
   synthétiques (trois du vol 2, deux ajoutés par le vol 4 pour le terme de
-  relâche). Ils ne sont pas échantillonnés sur le journal vivant : une suite qui
-  le lirait changerait de verdict à mesure qu'il grossit.
+  relâche, un par le vol 5 pour le croisement). Ils ne sont pas échantillonnés
+  sur le journal vivant : une suite qui le lirait changerait de verdict à mesure
+  qu'il grossit. Le corpus du vol 5, `cross_tab_corpus.jsonl`, est construit pour
+  que **les deux seaux plats y soient ambigus** — un `{head_not_previously_decided:
+  2}` et un `{green_check_suite_head_decided: 2}` qui ne disent ni de quelle
+  cellule ni de quel agent ils parlent — et pour que les deux seaux croisés
+  lèvent chacune de ces ambiguïtés : c'est cette propriété, et non une économie
+  de fichiers, qui autorise ses quatre assertions à partager une entrée.
 
-## 9. L'état des quatre classes, après les vols 3 et 4
+## 9. L'état des quatre classes, après les vols 3 à 5
 
 Le § 7 dit ce que le vol 3 *fait* de l'artefact. Le § 2 bis dit pourquoi
 l'artefact n'est pas à sa portée. Ce qui suit est donc l'état réel, classe par
 classe — et **les quatre raisons ne sont pas la même raison** : c'est tout
 l'intérêt du tableau.
 
-| classe | déclencheur | état après les vols 3 et 4 | ce qui décide de cet état |
+| classe | déclencheur | état après les vols 3 à 5 | ce qui décide de cet état |
 |---|---|---|---|
 | **(e)** `closed`/`merged` d'une PR sans tâche de boucle | `pr_closed` | **implémentée** (`pr_closed_no_loop_task`) | la mesure 3 ne pouvait pas changer son chiffre |
 | **(f)** `pr_review` sur une PR fermée au texte réécrit par le `verdict_handler` | `pr_review` + `charged_by_release` | **couverte par (c) pour les deux formes citées** ; résidu = une décision AC2 et trois chemins non-filtres | le code servi, relu — pas une mesure |
-| **(g)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **bloquée par la mesure** | la mesure 3 est sa condition d'existence |
+| **(g)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **bloquée par la mesure** ; sa soustraction est lisible sur l'agrégat depuis le vol 5 | la mesure 3 est sa condition d'existence |
 | **(h)** `issue_comment` / `issues_closed` sans tâche de boucle | `issue_comment`, `issues_closed` | **posée à l'opérateur** | aucune mesure ne la tranche |
 
 **(e) — pourquoi elle part sans l'artefact.** Le retrait que le § 7.1 prescrit
@@ -262,17 +312,30 @@ aucune `check_suite` de branche de PR n'avait été vue depuis le déploiement d
 agent dont le fan-out est délibéré (mika#1711). Les deux termes manquent, et les
 deux sont dans l'artefact.
 
-**Ce que le vol 4 change pour (g) : la soustraction devient lisible.** Avant lui,
+**Ce que le vol 4 change pour (g) : la soustraction devient nommable.** Avant lui,
 `by_agent_trigger` donnait le plafond de (g) — les `check_suite_pr_branch` payées
 côté mika-qa — et rien ne disait lesquelles (b) aurait écartées si elle avait vu
-la tête. `charged_by_release` le dit, parce que c'est exactement ce que (b)
+la tête. Le terme de relâche le nomme, parce que c'est exactement ce que (b)
 décide : un `check_suite` vert de branche de PR relâché sous
 `head_not_previously_decided` est un **premier** traitement de cette tête, que
 (b) ne prétend pas couvrir ; un relâché sous `no_decision_attested` ou
 `text_touched` est passé devant (b) pour une autre raison, nommée. Le chiffre
 de (g) après retrait n'est donc plus une estimation mais une soustraction :
-plafond moins les seaux que (b) revendique. La mesure 3 reste sa condition — le
-vol 4 lui fournit l'opérande qui manquait, il ne la remplace pas.
+plafond moins les seaux que (b) revendique.
+
+**Ce que le vol 5 change : elle devient lisible au grain où elle se décide.** Le
+vol 4 avait livré le terme ; il ne l'avait pas livré *au bon grain*, et ce
+document a écrit à tort que « `charged_by_release` le dit ». Il le dit au grain
+de la **fenêtre** — `{head_not_previously_decided: 7}`, tous agents et tous
+déclencheurs confondus, en comptes de tours et sans coût. Or (g) se décide au
+grain d'une **cellule** : un agent, un déclencheur, un terme. Les deux opérandes
+de sa soustraction vivaient donc sur deux axes qui ne se rencontraient pas, et
+les croiser demandait un `jq` à la main sur le fichier de tours. Depuis le
+vol 5, `by_agent_trigger_release` est cette cellule, avec son coût en tokens :
+la ligne `mika-qa × check_suite_pr_branch × head_not_previously_decided` **est**
+la réponse, lue sur le seul agrégat. La mesure 3 reste la condition de (g) — les
+vols 4 et 5 lui fournissent l'opérande qui manquait et le grain où le lire, ils
+ne la remplacent pas.
 
 **(h) — le plus gros volume, et le seul blocage qui ne soit pas un chiffre.**
 1,30 M tokens, 79 % de la fenêtre de la mesure 2 : le volume est établi. Ce qui
