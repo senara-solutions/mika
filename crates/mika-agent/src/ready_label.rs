@@ -73,7 +73,7 @@
 //! STOP opérateur.
 //!
 //! C'est l'**inverse** du fail-open retenu ailleurs dans `auto_pull`
-//! (`gh_list_open_pr_closing_issues` échoue en ensemble vide « to preserve
+//! (`gh_list_open_pr_issue_numbers` échoue en ensemble vide « to preserve
 //! pre-fix behavior on infra glitches »). Diverger ici est délibéré : ce
 //! fail-open-là élargit un filtre dont l'échec fait *rater* une exclusion ;
 //! celui-ci gouverne une écriture dont l'échec fait *agir*.
