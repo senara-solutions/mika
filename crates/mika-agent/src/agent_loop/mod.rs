@@ -4099,8 +4099,11 @@ async fn run_loop(
                             anchors_found,
                             anchors_valid,
                             reason,
+                            per_anchor,
                         } = verdict
                         {
+                            let (accepted_labels, refused_labels) =
+                                anchor_label_fields(&per_anchor);
                             if !review_anchor_retry_done {
                                 review_anchor_retry_done = true;
                                 let correlation_id = format!(
@@ -4123,6 +4126,10 @@ async fn run_loop(
                                     anchors_found,
                                     anchors_valid,
                                     miss_reason = ?reason,
+                                    // mika#2794's denominator carries which lines failed, so
+                                    // the before/after measurement can be read per label.
+                                    refused_labels = %refused_labels,
+                                    accepted_labels = %accepted_labels,
                                     event = "guard.review_anchor",
                                     "Review-anchor guard: non-terminal disposition without \
                                      a verifiable attestation — re-prompting (#2037)"
@@ -4144,6 +4151,7 @@ async fn run_loop(
                                          `[output] required_review_anchor_prefixes` \
                                          contract.\n\n\
                                          What blocked it: {}.\n\n\
+                                         {}\
                                          A disposition keyword is not an attestation. To \
                                          return READY (or Verdict: GROOMED), the message \
                                          body must carry at least {} anchor lines starting \
@@ -4157,6 +4165,13 @@ async fn run_loop(
                                          review it now and then answer. If the plan genuinely \
                                          has concerns, return ITERATE with an F-list instead.",
                                         reason.describe(),
+                                        // mika#2794 — which anchor failed, between the reason
+                                        // and the contract recap. Empty when the matcher
+                                        // reported no per-line fate, so the message is then
+                                        // character for character its pre-mika#2794 form.
+                                        format_anchor_diagnosis(&per_anchor)
+                                            .map(|d| format!("{d}\n\n"))
+                                            .unwrap_or_default(),
                                         review_anchor.min_count,
                                         review_anchor.prefixes.join(", "),
                                         review_anchor.min_quote_chars,
@@ -4205,6 +4220,11 @@ async fn run_loop(
                                 anchors_found,
                                 anchors_valid,
                                 miss_reason = ?reason,
+                                // mika#2794's numerator. Same two fields as the denominator
+                                // above: a withhold is read against the re-prompt that
+                                // preceded it, label by label.
+                                refused_labels = %refused_labels,
+                                accepted_labels = %accepted_labels,
                                 emitted,
                                 event = "guard.review_anchor_withheld",
                                 "Review-anchor guard: attestation still absent after the \
@@ -8553,6 +8573,108 @@ fn escalate_unattested_disposition(
     ))
 }
 
+/// The two log fields of mika#2794's instrument: the accepted and refused labels, `,`-joined.
+///
+/// **An empty set is an empty string, never an absent field.** The ratio the ticket asks for —
+/// withholds after re-prompt over re-prompts — is read by pairing `guard.review_anchor` with
+/// `guard.review_anchor_withheld`, so a field that disappears when nothing was refused would
+/// read as "no refusal" where the truth is "pre-mika#2794 binary" (mika#2340, mika#2331).
+fn anchor_label_fields(per_anchor: &[review_anchor::AnchorOutcome]) -> (String, String) {
+    let join = |refused: bool| {
+        per_anchor
+            .iter()
+            .filter(|outcome| outcome.refused.is_some() == refused)
+            .map(|outcome| outcome.label.trim_end_matches(':'))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    (join(false), join(true))
+}
+
+/// How many refused anchor lines the corrective re-prompt names.
+///
+/// The measured shape refuses one of three (mika#2794); three is already the contract's whole
+/// anchor budget, and a re-prompt that enumerates ten lines is a wall the model skims.
+const MAX_DIAGNOSED_ANCHORS: usize = 3;
+
+/// Name the anchor lines that failed, for the corrective re-prompt (mika#2794).
+///
+/// The guard already told the model *what* condition it missed — `reason.describe()` — and
+/// mika#2794 measured that this is not enough: across three replayed 2026-10-18 sessions the
+/// refused anchor was one of three and, in two of them, always the first, and session
+/// `a7f1ccad` returned that same faulty anchor three times in a row. The reason alone names a
+/// class; this paragraph names the line.
+///
+/// Three parts, and each one is there for a reason the others do not cover:
+///
+/// - **The accepted anchors, by name.** A model told only "one anchor does not quote the brief"
+///   rewrites all three. Naming the two that passed is what makes the correction local.
+/// - **The refused anchors, one per line**, with the start of what they said and why it was
+///   blocked, bounded by [`MAX_DIAGNOSED_ANCHORS`].
+/// - **Where a wrong quote comes from**, said as a likelihood and gated on
+///   `QuoteNotInBrief`. The engine does **not** know which document the line came from — it
+///   holds the brief and the response, nothing else — so the sentence is phrased as the usual
+///   cause and never as an established fact (grounding rule). Deterministic attribution would
+///   need access to the turn's tool outputs and is deliberately out of scope. The gate matters
+///   as much as the wording: saying "you quoted another document" to a response whose anchors
+///   all landed on the *same region of the right brief* would send exactly the wrong fix.
+///
+/// `None` when the list is empty — the two early returns of [`review_anchor::verify_review_anchors`]
+/// report no per-line fate, and the re-prompt then falls back word for word on the form it had
+/// before mika#2794.
+fn format_anchor_diagnosis(per_anchor: &[review_anchor::AnchorOutcome]) -> Option<String> {
+    if per_anchor.is_empty() {
+        return None;
+    }
+
+    let label_of =
+        |outcome: &review_anchor::AnchorOutcome| outcome.label.trim_end_matches(':').to_string();
+    let accepted: Vec<String> = per_anchor
+        .iter()
+        .filter(|outcome| outcome.refused.is_none())
+        .map(label_of)
+        .collect();
+    let refused: Vec<&review_anchor::AnchorOutcome> = per_anchor
+        .iter()
+        .filter(|outcome| outcome.refused.is_some())
+        .collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if !accepted.is_empty() {
+        parts.push(format!(
+            "Anchors accepted: {} — keep them exactly as written; do not rewrite them.",
+            accepted.join(", ")
+        ));
+    }
+    if !refused.is_empty() {
+        let mut lines = vec!["Anchors refused:".to_string()];
+        for outcome in refused.iter().take(MAX_DIAGNOSED_ANCHORS) {
+            let reason = outcome
+                .refused
+                .map(review_anchor::AnchorMissReason::describe)
+                .unwrap_or_default();
+            lines.push(format!(
+                "{} \"{}\" — refused: {reason}",
+                outcome.label, outcome.excerpt
+            ));
+        }
+        parts.push(lines.join("\n"));
+    }
+    if refused
+        .iter()
+        .any(|outcome| outcome.refused == Some(review_anchor::AnchorMissReason::QuoteNotInBrief))
+    {
+        parts.push(
+            "A quote that is absent from the brief usually comes from a document you read with \
+             a tool — a ticket body, a file, a page — and not from the brief message of this \
+             turn. Quote the brief itself: the message that asked you for this review."
+                .to_string(),
+        );
+    }
+
+    Some(parts.join("\n\n"))
+}
+
 /// Withhold an unattested disposition from the final text (mika#2037).
 ///
 /// Replaces the disposition line with `DISPOSITION_WITHHELD_MARKER` and leaves the rest of
@@ -11989,6 +12111,142 @@ mod tests {
                 assert!(!finding.contains(&req), "{finding} carries {req}");
             }
         }
+    }
+
+    // ===========================================================================
+    // mika#2794 — the corrective re-prompt names the faulty anchor
+    // ===========================================================================
+
+    fn outcome(
+        label: &str,
+        excerpt: &str,
+        refused: Option<review_anchor::AnchorMissReason>,
+    ) -> review_anchor::AnchorOutcome {
+        review_anchor::AnchorOutcome {
+            label: label.to_string(),
+            excerpt: excerpt.to_string(),
+            refused,
+        }
+    }
+
+    /// The measured shape of mika#2794: `A1` quotes the ticket body, `A2` and `A3` quote the
+    /// brief. The diagnosis must name all three — the refused one so it is rewritten, the two
+    /// accepted so they are **not** — and say where a wrong quote usually comes from.
+    #[test]
+    fn mika2794_the_diagnosis_names_the_refused_anchor_and_the_accepted_ones() {
+        let per_anchor = vec![
+            outcome(
+                "A1:",
+                "Le reaper groom introduit par mika#2750 (PR mika#2754)…",
+                Some(review_anchor::AnchorMissReason::QuoteNotInBrief),
+            ),
+            outcome("A2:", "sur l'exhaustivité du tracé", None),
+            outcome("A3:", "Je n'ai pas fixé N pour le seuil", None),
+        ];
+        let diagnosis = format_anchor_diagnosis(&per_anchor).expect("a non-empty list diagnoses");
+
+        assert!(
+            diagnosis.contains("Anchors accepted: A2, A3"),
+            "the accepted anchors are named so the correction stays local: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("do not rewrite them"),
+            "naming them is useless without the instruction to keep them: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains(
+                "A1: \"Le reaper groom introduit par mika#2750 (PR mika#2754)…\" — refused:"
+            ),
+            "the refused anchor is named by label AND by what it said: {diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("A2: \"") && !diagnosis.contains("A3: \""),
+            "an accepted anchor is listed, never quoted back as a failure: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("a document you read with a tool"),
+            "the measured cause — a tool-read document, not this turn's brief: {diagnosis}"
+        );
+    }
+
+    /// Negative control of the origin sentence, and the reason it is gated. Anchors that all
+    /// quote the **same region of the right brief** have not quoted another document; telling
+    /// the model it did would send it looking for a brief it already quoted.
+    #[test]
+    fn mika2794_an_overlap_refusal_does_not_blame_another_document() {
+        let per_anchor = vec![
+            outcome("A1:", "re-résoudre le token avant chaque cycle", None),
+            outcome(
+                "A2:",
+                "re-résoudre le token avant chaque cycle",
+                Some(review_anchor::AnchorMissReason::OverlappingRegions),
+            ),
+        ];
+        let diagnosis = format_anchor_diagnosis(&per_anchor).expect("a non-empty list diagnoses");
+
+        assert!(diagnosis.contains("Anchors accepted: A1"), "{diagnosis}");
+        assert!(diagnosis.contains("A2: \"re-résoudre"), "{diagnosis}");
+        assert!(
+            !diagnosis.contains("a document you read with a tool"),
+            "the origin sentence is gated on QuoteNotInBrief: {diagnosis}"
+        );
+    }
+
+    /// The other negative control: the matcher's two early returns report no per-line fate, and
+    /// the corrective re-prompt must then be character for character its pre-mika#2794 self.
+    /// `None` is the whole mechanism — the insertion point is a `{}` filled with `""`.
+    #[test]
+    fn mika2794_an_empty_fate_list_leaves_the_reprompt_untouched() {
+        assert_eq!(format_anchor_diagnosis(&[]), None);
+    }
+
+    /// The paragraph is bounded. Five refused anchors name three — a wall of ten lines is a
+    /// wall the model skims, and the measured shape refuses one of three.
+    #[test]
+    fn mika2794_the_diagnosis_names_at_most_three_refused_anchors() {
+        let per_anchor: Vec<review_anchor::AnchorOutcome> = (1..=5)
+            .map(|n| {
+                outcome(
+                    &format!("A{n}:"),
+                    "une ligne qui ne cite pas le brief",
+                    Some(review_anchor::AnchorMissReason::QuoteNotInBrief),
+                )
+            })
+            .collect();
+        let diagnosis = format_anchor_diagnosis(&per_anchor).expect("a non-empty list diagnoses");
+
+        let named = (1..=5)
+            .filter(|n| diagnosis.contains(&format!("A{n}: \"")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named,
+            vec![1, 2, 3],
+            "the first MAX_DIAGNOSED_ANCHORS in body order, and only those: {diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("Anchors accepted:"),
+            "nothing was accepted, so nothing is claimed to have been: {diagnosis}"
+        );
+    }
+
+    /// The instrument's two fields (mika#2794 D3). Empty is an empty string, never an absent
+    /// field: absence means a binary older than this change, not an absence of refusal.
+    #[test]
+    fn mika2794_the_label_fields_are_empty_strings_not_absent() {
+        let (accepted, refused) = anchor_label_fields(&[
+            outcome(
+                "A1:",
+                "x",
+                Some(review_anchor::AnchorMissReason::QuoteNotInBrief),
+            ),
+            outcome("A2:", "y", None),
+            outcome("A3:", "z", None),
+        ]);
+        assert_eq!(refused, "A1");
+        assert_eq!(accepted, "A2,A3");
+
+        let (accepted, refused) = anchor_label_fields(&[]);
+        assert_eq!((accepted.as_str(), refused.as_str()), ("", ""));
     }
 
     // ===========================================================================

@@ -30,6 +30,32 @@
 //! The matcher is deliberately regex-free. mika#864 established the precedent for this family
 //! ("regex is a footgun — silent failure to fire when pattern is malformed"), and a guard that
 //! silently stops firing is the defect class being closed here, not an acceptable cost.
+//!
+//! ## The verdict says *which* line failed (mika#2794)
+//!
+//! [`AnchorVerdict::Missing`] carries `per_anchor: Vec<AnchorOutcome>` — one entry per anchor
+//! line found in the body, in body order, each with its prefix, the start of what it said and
+//! whether it was refused. **Nothing in the decision reads it**: the counters and the
+//! [`AnchorMissReason`] still decide alone, and the two early returns carry an empty list. It
+//! exists for the corrective re-prompt, which `agent_loop::format_anchor_diagnosis` builds
+//! from it.
+//!
+//! The measurement that asked for it. After mika#2786 (frein à trois retenues, tolérance
+//! `**A1:**`), an offline replay of this matcher over the real 2026-10-18 briefs
+//! (`messages`) and responses (`llm_calls`) of three mika-arch grooming sessions gave
+//! `49ffa230` 3 anchors found / 2 valid before *and* after the re-prompt, `a7f1ccad` the same
+//! 3 / 2 on each of three responses, `f167ff53` 3 / 1 then 3 / 0: **one anchor of three was
+//! refused, and in two of the three sessions it was the first** — a quote of the opening
+//! sentence of the ticket body read with `gh_read`, not of the turn's brief message. The
+//! re-prompt named the `miss_reason` and not the line, and `a7f1ccad` returned the same faulty
+//! anchor three times. Naming the class was not enough; naming the line is what `per_anchor`
+//! makes possible.
+//!
+//! What this did **not** change, deliberately: the guard stays fail-closed, the comparison
+//! stays verbatim against the brief, and `verify_review_anchors` returns the same decision on
+//! the same input as before mika#2794. Whether a model obeys a re-prompt that names the line
+//! is not something an offline test can measure — the before/after is read from the logs, per
+//! the protocol in `docs/agent-internals/agent-loop.md`.
 
 /// Why an attestation was rejected. Carried into the corrective re-prompt so the model is told
 /// which condition it missed rather than the whole contract again.
@@ -71,17 +97,54 @@ impl AnchorMissReason {
     }
 }
 
+/// How many characters of an anchor line the verdict carries back to the caller.
+///
+/// Counted in **chars**, never bytes. The briefs this guard runs on are French markdown and a
+/// multi-byte codepoint inside the first 72 characters is the ordinary case, where `&line[..72]`
+/// panics — see `scripts/check-byte-slices.sh`. Long enough that the model recognizes which of
+/// its own three lines is named, short enough that naming three of them stays a paragraph.
+const ANCHOR_EXCERPT_CHARS: usize = 72;
+
+/// One anchor line's fate, in body order.
+///
+/// Four things a future editor needs, because each undoes itself if guessed:
+///
+/// - **`Satisfied` carries none of this.** A response that passed needs no diagnosis; the list
+///   exists to tell a refused response *which* of its lines failed.
+/// - **It does not derive from the counters.** `anchors_found` and `anchors_valid` are two
+///   integers; which line produced which is not recoverable from them, and that is exactly the
+///   information mika#2794 measured missing — `a7f1ccad` returned the same faulty anchor three
+///   times because the corrective re-prompt named the reason and not the line.
+/// - **The two early returns yield an empty list** (`NoAnchorLine`, and an empty normalized
+///   brief): there is no per-line fate to report. The re-prompt falls back word for word on its
+///   pre-mika#2794 form there.
+/// - **`refused: None` is the only positive statement.** An accepted line is named so the
+///   re-prompt can tell the model to keep it; everything else carries why it was blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnchorOutcome {
+    /// The declared prefix that identified the line (`A1:`) — never the `**` the model may have
+    /// wrapped it in (mika#2786 strips those before the prefix is looked for).
+    pub(crate) label: String,
+    /// Start of the line's normalized content, truncated to [`ANCHOR_EXCERPT_CHARS`]. A `…` is
+    /// appended only when the line was longer, so the excerpt never claims an elision that did
+    /// not happen.
+    pub(crate) excerpt: String,
+    /// `None` when the line claimed a region of the brief; else what blocked it.
+    pub(crate) refused: Option<AnchorMissReason>,
+}
+
 /// Outcome of verifying a response against the review-anchor contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AnchorVerdict {
     /// The response carries a valid attestation.
     Satisfied,
     /// The response does not. `anchors_found` counts prefixed lines; `anchors_valid` counts
-    /// those that survived every check.
+    /// those that survived every check; `per_anchor` says which line is which.
     Missing {
         anchors_found: usize,
         anchors_valid: usize,
         reason: AnchorMissReason,
+        per_anchor: Vec<AnchorOutcome>,
     },
 }
 
@@ -128,6 +191,18 @@ fn normalize_for_anchor_match(text: &str) -> String {
         })
         .collect();
     unmarked.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The head of an already-normalized anchor line, for [`AnchorOutcome::excerpt`].
+///
+/// Char-indexed, and the `…` is appended only when something was actually dropped: an excerpt
+/// that advertises an elision it did not make would have the model hunt for a longer line.
+fn anchor_excerpt(normalized_line: &str) -> String {
+    let mut excerpt: String = normalized_line.chars().take(ANCHOR_EXCERPT_CHARS).collect();
+    if normalized_line.chars().count() > ANCHOR_EXCERPT_CHARS {
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 /// The message body, up to (exclusive of) the disposition-line landmark.
@@ -250,13 +325,18 @@ pub(crate) fn verify_review_anchors(
     // on *finding* the line only. The `**` left after the prefix goes through
     // [`normalize_for_anchor_match`] like any other emphasis marker, so the quote is held to
     // exactly the same verbatim test as an unbolded one.
-    let anchor_lines: Vec<&str> = body_lines(text, required_suffix_lines)
+    //
+    // The prefix is kept *alongside* the content, not discarded: it is the name the corrective
+    // re-prompt calls the line by (mika#2794). It still does not enter the quote.
+    let anchor_lines: Vec<(&str, &str)> = body_lines(text, required_suffix_lines)
         .into_iter()
         .filter_map(|line| {
             let trimmed = line.trim_start().trim_start_matches('*');
-            prefixes
-                .iter()
-                .find_map(|p| trimmed.strip_prefix(p.as_str()))
+            prefixes.iter().find_map(|p| {
+                trimmed
+                    .strip_prefix(p.as_str())
+                    .map(|rest| (p.as_str(), rest))
+            })
         })
         .collect();
 
@@ -266,6 +346,7 @@ pub(crate) fn verify_review_anchors(
             anchors_found: 0,
             anchors_valid: 0,
             reason: AnchorMissReason::NoAnchorLine,
+            per_anchor: Vec::new(),
         };
     }
 
@@ -276,6 +357,7 @@ pub(crate) fn verify_review_anchors(
             anchors_found,
             anchors_valid: 0,
             reason: AnchorMissReason::QuoteNotInBrief,
+            per_anchor: Vec::new(),
         };
     }
 
@@ -284,31 +366,55 @@ pub(crate) fn verify_review_anchors(
     let mut overlapping = 0usize;
     let mut claimed: Vec<std::ops::Range<usize>> = Vec::new();
     let mut seen_lines: Vec<String> = Vec::new();
+    let mut per_anchor: Vec<AnchorOutcome> = Vec::with_capacity(anchors_found);
 
-    for line in &anchor_lines {
+    for &(label, line) in &anchor_lines {
         let normalized_line = normalize_for_anchor_match(line);
+        let excerpt = anchor_excerpt(&normalized_line);
         // A repeated anchor line is one read of the brief, however many times it is pasted.
         // Region disjointness alone does not catch this: a single line longer than
         // `2 * min_quote_chars` yields non-overlapping windows, so copying one long sentence
         // three times would otherwise satisfy a contract that exists to require three reads.
         if seen_lines.contains(&normalized_line) {
             overlapping += 1;
+            per_anchor.push(AnchorOutcome {
+                label: label.to_string(),
+                excerpt,
+                refused: Some(AnchorMissReason::OverlappingRegions),
+            });
             continue;
         }
         seen_lines.push(normalized_line.clone());
-        match find_brief_quote_range(
+        let refused = match find_brief_quote_range(
             &normalized_line,
             &normalized_brief,
             min_quote_chars,
             &claimed,
         ) {
-            QuoteSearch::Found(range) => claimed.push(range),
+            QuoteSearch::Found(range) => {
+                claimed.push(range);
+                None
+            }
             // The line quotes the brief only where an earlier anchor already did. Three
             // anchors must mean three reads of the brief, not one line copied three times.
-            QuoteSearch::OnlyClaimedRegions => overlapping += 1,
-            QuoteSearch::TooShort => too_short += 1,
-            QuoteSearch::NoQuote => not_in_brief += 1,
-        }
+            QuoteSearch::OnlyClaimedRegions => {
+                overlapping += 1;
+                Some(AnchorMissReason::OverlappingRegions)
+            }
+            QuoteSearch::TooShort => {
+                too_short += 1;
+                Some(AnchorMissReason::QuoteTooShort)
+            }
+            QuoteSearch::NoQuote => {
+                not_in_brief += 1;
+                Some(AnchorMissReason::QuoteNotInBrief)
+            }
+        };
+        per_anchor.push(AnchorOutcome {
+            label: label.to_string(),
+            excerpt,
+            refused,
+        });
     }
 
     let anchors_valid = claimed.len();
@@ -332,6 +438,7 @@ pub(crate) fn verify_review_anchors(
         anchors_found,
         anchors_valid,
         reason,
+        per_anchor,
     }
 }
 
@@ -366,6 +473,16 @@ mod tests {
         verify_review_anchors(text, &brief(), &prefixes(), &suffix_lines(), 3, 40)
     }
 
+    /// The per-line fates projected onto what a caller reads them for: which label, and whether
+    /// it was refused. Expectations stay off the excerpt, which has its own tests — hand-counting
+    /// 72 characters of French in every assertion would measure the arithmetic, not the matcher.
+    fn fates(per_anchor: &[AnchorOutcome]) -> Vec<(&str, Option<AnchorMissReason>)> {
+        per_anchor
+            .iter()
+            .map(|outcome| (outcome.label.as_str(), outcome.refused))
+            .collect()
+    }
+
     /// The measured response from mika#2037, verbatim.
     const STUB_2037: &str = "Préférence stockée — le pattern de re-résolution par cycle et le seuil N=3 pour mika#2013.\n\nDisposition: READY\n";
 
@@ -378,6 +495,8 @@ mod tests {
                 anchors_found: 0,
                 anchors_valid: 0,
                 reason: AnchorMissReason::NoAnchorLine,
+                // No line to report a fate for. The re-prompt falls back on its generic form.
+                per_anchor: Vec::new(),
             },
             "the founding incident must not pass the guard built to catch it"
         );
@@ -415,14 +534,27 @@ mod tests {
                     **A3:** Le reaper groom introduit par mika#2750 (PR mika#2754) fait échouer le parent.\n\
                     \n\
                     Disposition: READY\n";
-        assert_eq!(
-            verify(text),
+        match verify(text) {
             AnchorVerdict::Missing {
-                anchors_found: 3,
-                anchors_valid: 2,
-                reason: AnchorMissReason::QuoteNotInBrief,
+                anchors_found,
+                anchors_valid,
+                reason,
+                per_anchor,
+            } => {
+                assert_eq!((anchors_found, anchors_valid), (3, 2));
+                assert_eq!(reason, AnchorMissReason::QuoteNotInBrief);
+                assert_eq!(
+                    fates(&per_anchor),
+                    vec![
+                        ("A1:", None),
+                        ("A2:", None),
+                        ("A3:", Some(AnchorMissReason::QuoteNotInBrief)),
+                    ],
+                    "the label must be the declared prefix, never the `**` around it"
+                );
             }
-        );
+            other => panic!("expected not-in-brief rejection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -500,10 +632,16 @@ mod tests {
                 anchors_found,
                 anchors_valid,
                 reason,
+                per_anchor,
             } => {
                 assert_eq!(anchors_found, 2);
                 assert_eq!(anchors_valid, 2);
                 assert_eq!(reason, AnchorMissReason::TooFewAnchors);
+                assert_eq!(
+                    fates(&per_anchor),
+                    vec![("A1:", None), ("A2:", None)],
+                    "both lines were accepted — the contract failed on the count, not on them"
+                );
             }
             other => panic!("expected too-few rejection, got {other:?}"),
         }
@@ -534,6 +672,161 @@ mod tests {
                     Disposition: READY\n";
         let verdict = verify_review_anchors(text, "", &prefixes(), &suffix_lines(), 3, 40);
         assert!(!verdict.is_satisfied(), "empty brief must fail closed");
+    }
+
+    /// mika#2794 — the fate list does not derive from the counters, so the counters must derive
+    /// from it. Checked on every branch the verification loop can take: a drift between the two
+    /// would have the corrective re-prompt name a line the verdict never refused.
+    #[test]
+    fn mika2794_the_fate_list_agrees_with_the_counters_on_every_loop_branch() {
+        let two_valid = "A1: le plan propose bien de « re-résoudre le token avant chaque cycle du manager » — correct.\n\
+                         A2: sur « l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ? » — oui.\n";
+        let same_region = "re-résoudre le token avant chaque cycle du manager de milestones";
+        let cases = vec![
+            ("too few", format!("{two_valid}\nDisposition: READY\n")),
+            (
+                "not in brief",
+                format!(
+                    "{two_valid}A3: cette phrase n'apparaît nulle part dans le brief soumis à la revue.\n\nDisposition: READY\n"
+                ),
+            ),
+            (
+                "overlapping",
+                format!(
+                    "A1: {same_region}\nA2: {same_region}\nA3: {same_region}\n\nDisposition: READY\n"
+                ),
+            ),
+            ("too short", "A1: court\n\nDisposition: READY\n".to_string()),
+        ];
+        for (name, text) in cases {
+            match verify(&text) {
+                AnchorVerdict::Missing {
+                    anchors_found,
+                    anchors_valid,
+                    per_anchor,
+                    ..
+                } => {
+                    assert_eq!(
+                        per_anchor.len(),
+                        anchors_found,
+                        "{name}: one fate per prefixed line, in body order"
+                    );
+                    assert_eq!(
+                        per_anchor.iter().filter(|o| o.refused.is_none()).count(),
+                        anchors_valid,
+                        "{name}: an accepted line is exactly one that claimed a region"
+                    );
+                }
+                other => panic!("{name}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// mika#2794 — the two early returns carry no per-line fate, by construction: no quote was
+    /// attempted, so no line has one. The diagnosis paragraph is then absent and the corrective
+    /// re-prompt is word for word its pre-mika#2794 self.
+    #[test]
+    fn mika2794_the_early_returns_carry_no_per_line_fate() {
+        match verify(STUB_2037) {
+            AnchorVerdict::Missing { per_anchor, .. } => {
+                assert!(per_anchor.is_empty(), "no anchor line, no fate to report")
+            }
+            other => panic!("expected the founding refusal, got {other:?}"),
+        }
+
+        let text = "A1: une ligne d'ancrage suffisamment longue pour franchir le seuil de citation.\n\
+                    A2: une deuxième ligne d'ancrage suffisamment longue pour franchir ce seuil.\n\
+                    A3: une troisième ligne d'ancrage suffisamment longue pour franchir ce seuil.\n\
+                    \n\
+                    Disposition: READY\n";
+        match verify_review_anchors(text, "", &prefixes(), &suffix_lines(), 3, 40) {
+            AnchorVerdict::Missing {
+                anchors_found,
+                per_anchor,
+                ..
+            } => {
+                assert_eq!(
+                    anchors_found, 3,
+                    "the lines were found before the brief was read"
+                );
+                assert!(
+                    per_anchor.is_empty(),
+                    "an empty brief grounds nothing — no line can be said to have failed on its own"
+                );
+            }
+            other => panic!("expected the empty-brief refusal, got {other:?}"),
+        }
+    }
+
+    /// mika#2794 — the excerpt is cut in **characters**, and advertises an elision only when it
+    /// made one. `é` is the whole point: a French brief puts a multi-byte codepoint well inside
+    /// the first 72 characters, where byte slicing panics (`scripts/check-byte-slices.sh`).
+    #[test]
+    fn mika2794_the_excerpt_is_cut_in_chars_and_marks_only_a_real_elision() {
+        let excerpt_of =
+            |content: &str| match verify(&format!("A1: {content}\n\nDisposition: READY\n")) {
+                AnchorVerdict::Missing { per_anchor, .. } => {
+                    per_anchor.first().expect("one anchor line").excerpt.clone()
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            };
+
+        let over = excerpt_of(&"é".repeat(ANCHOR_EXCERPT_CHARS + 10));
+        assert_eq!(over.chars().count(), ANCHOR_EXCERPT_CHARS + 1);
+        assert!(over.ends_with('…'), "a real elision is marked: {over:?}");
+
+        let exactly = excerpt_of(&"é".repeat(ANCHOR_EXCERPT_CHARS));
+        assert_eq!(exactly.chars().count(), ANCHOR_EXCERPT_CHARS);
+        assert!(
+            !exactly.ends_with('…'),
+            "nothing was dropped at the ceiling, so nothing is marked: {exactly:?}"
+        );
+    }
+
+    /// mika#2794, the measured shape (sessions `49ffa230` and `a7f1ccad`, 2026-10-18): `A1`
+    /// quotes the opening sentence of the ticket body read by `gh_read`, `A2` and `A3` quote the
+    /// turn's brief verbatim at disjoint regions. Three anchors found, two valid — and the
+    /// verdict now says it is the **first** one that failed, which is the single piece of
+    /// information the corrective re-prompt had no way to name. `a7f1ccad` returned the same
+    /// faulty anchor three times.
+    #[test]
+    fn mika2794_the_measured_shape_names_the_first_anchor() {
+        let text = "A1: Le reaper groom introduit par mika#2750 (PR mika#2754) fait échouer le parent avant la relance.\n\
+                    A2: sur « l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ? » — oui.\n\
+                    A3: « Je n'ai pas fixé N pour le seuil de détection des échecs » — je propose 30 minutes.\n\
+                    \n\
+                    Disposition: READY\n";
+        match verify(text) {
+            AnchorVerdict::Missing {
+                anchors_found,
+                anchors_valid,
+                reason,
+                per_anchor,
+            } => {
+                assert_eq!(
+                    (anchors_found, anchors_valid),
+                    (3, 2),
+                    "the shape replayed offline on the real 2026-10-18 passes"
+                );
+                assert_eq!(reason, AnchorMissReason::QuoteNotInBrief);
+                assert_eq!(
+                    fates(&per_anchor),
+                    vec![
+                        ("A1:", Some(AnchorMissReason::QuoteNotInBrief)),
+                        ("A2:", None),
+                        ("A3:", None),
+                    ]
+                );
+                assert!(
+                    per_anchor[0]
+                        .excerpt
+                        .starts_with("Le reaper groom introduit par mika#2750"),
+                    "the excerpt must open on the faulty line itself, got {:?}",
+                    per_anchor[0].excerpt
+                );
+            }
+            other => panic!("expected the measured refusal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -797,9 +1090,19 @@ Disposition: READY\n";
                 anchors_found,
                 anchors_valid,
                 reason,
+                per_anchor,
             } => {
                 assert_eq!((anchors_found, anchors_valid), (3, 2));
                 assert_eq!(reason, AnchorMissReason::QuoteNotInBrief);
+                assert_eq!(
+                    fates(&per_anchor),
+                    vec![
+                        ("A1:", Some(AnchorMissReason::QuoteNotInBrief)),
+                        ("A2:", None),
+                        ("A3:", None),
+                    ],
+                    "the dropped `, lui,` is on the FIRST line — the information mika#2794 adds"
+                );
             }
             other => panic!("expected not-in-brief rejection, got {other:?}"),
         }
@@ -820,9 +1123,19 @@ Disposition: READY\n";
                 anchors_found,
                 anchors_valid,
                 reason,
+                per_anchor,
             } => {
                 assert_eq!((anchors_found, anchors_valid), (3, 0));
                 assert_eq!(reason, AnchorMissReason::QuoteNotInBrief);
+                assert_eq!(
+                    fates(&per_anchor),
+                    vec![
+                        ("A1:", Some(AnchorMissReason::QuoteNotInBrief)),
+                        ("A2:", Some(AnchorMissReason::QuoteNotInBrief)),
+                        ("A3:", Some(AnchorMissReason::QuoteNotInBrief)),
+                    ],
+                    "a wrong-brief attestation refuses every line, and says so line by line"
+                );
             }
             other => panic!("expected not-in-brief rejection, got {other:?}"),
         }
@@ -1146,6 +1459,7 @@ mod matrix {
                 anchors_found,
                 anchors_valid,
                 reason,
+                ..
             } => {
                 assert_eq!(anchors_found, 3, "three prefixed lines were emitted");
                 assert_eq!(

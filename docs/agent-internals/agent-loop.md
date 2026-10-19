@@ -435,6 +435,70 @@ Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guar
 8. **Required-suffix-line guard (#864):** Manifest-driven guard for skill-declared output contracts. Skills opt in via `[output] required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]` in `skill.toml`. `collect_required_suffix_lines()` unions lines from `Keyword` and `AlwaysOn` matched skills (not `Dependency`). The guard scans the assistant's last 3 non-empty lines (after `trim()`) for an exact match to any entry; missing match rejects EndTurn once with a corrective re-prompt naming the accept-set. Standalone retry flag `required_suffix_line_retry_done`. Position: after persistence-eval — other guards' rejections take precedence. Silent mode passes empty `required_suffix_lines` (no enforcement). Currently opted-in: `mika-arch-second-review` (GROOMED/ESCALATE) and `mika-arch-groom-ticket` (READY/ITERATE/ESCALATE). Structural counterpart for the verdict-ghosting failure mode in mika#788.
 9. **Required-finding-list guard (#901):** Manifest-driven guard for skill-declared F-list emission contracts. Skills opt in via `[output] required_finding_list_prefixes = ["F1:", "F2:", ..., "F10:"]` in `skill.toml`. `collect_required_finding_list_prefixes()` unions prefixes from `Keyword` and `AlwaysOn` matched skills (not `Dependency`). The guard fires only on terminal dispositions (ITERATE/ESCALATE/Verdict: ESCALATE) — `is_terminal_disposition()` checks the last 3 non-empty lines against both the skill's `required_suffix_lines` and a `TERMINAL_DISPOSITIONS` constant. Scan range: message start up to (exclusive of) the first line matching any `required_suffix_lines` entry. At least one line in the scan range must start with a declared prefix (via `starts_with`, no regex). Missing match rejects EndTurn once. Standalone retry flag `required_finding_list_retry_done`. Position: immediately after #864 suffix-line guard. Silent mode passes empty `required_finding_list_prefixes` (no enforcement). Currently opted-in: `mika-arch-groom-ticket` and `mika-arch-second-review`. Structural counterpart for the conditional-disclosure-evasion failure class (N=8 incidents, mika#901).
 
+### Review-anchor guard — measuring the corrective re-prompt (mika#2794)
+
+The review-anchor guard (mika#2037, label `REVIEW_ANCHOR_GUARD_LABEL`) refuses a
+non-terminal disposition — `Disposition: READY`, `Verdict: GROOMED` — whose body carries no
+attestation: anchor lines quoting the reviewed brief verbatim at disjoint regions. The
+predicate lives in `agent_loop::review_anchor`, whose module doc-comment carries the design;
+the refusal is fail-closed and, since mika#2338, fail-visible (the disposition becomes an
+`ESCALATE` of its own family, preceded by an engine finding line).
+
+**Since mika#2794 the corrective re-prompt names the anchor that failed.** The verdict carries
+`per_anchor: Vec<AnchorOutcome>` — label, excerpt, refusal — and
+`agent_loop::format_anchor_diagnosis` turns it into the paragraph the model reads: the accepted
+anchors by name (so the correction is local rather than a rewrite of all three), the refused
+ones with the start of what they said, and — gated on `QuoteNotInBrief` — the usual cause,
+stated as a likelihood: a quote absent from the brief generally comes from a document read with
+a tool, not from the brief message of the turn. **Nothing in the decision reads `per_anchor`**:
+the counters and the miss reason still decide alone, so the guard's refusal path is unchanged.
+
+**Whether the model obeys is a bet, and these two journal lines are the instrument that judges
+it.** The ticket's acceptance measure is *the number of withholds after a re-prompt over the
+number of re-prompts*, and the two existing lines already are exactly that ratio — one per
+re-prompt, one per withhold:
+
+| line | level | cardinality |
+|---|---|---|
+| `event = "guard.review_anchor"` | WARN | one per corrective re-prompt (**denominator**) |
+| `event = "guard.review_anchor_withheld"` | ERROR | one per withhold after the re-prompt (**numerator**) |
+
+Both gained the same two fields: **`refused_labels`** and **`accepted_labels`**, labels joined
+by `,` because a `tracing` field carries one scalar. That is what makes the measurement readable
+*per anchor class* — the ticket's thesis is "it is always the first one", and only this field
+confirms or refutes it in production.
+
+Three reading rules:
+
+- **Empty is an empty string, never an absent field.** The **absence** of either field means a
+  binary older than this change (class mika#2340), never "no anchor was refused" (mika#2331).
+- **No third probe.** A new line would be a second producer of the same number; the cardinality
+  of the two existing ones *is* the ratio (mika#2205).
+- **The instrument is not live before `make deploy`** — the journal is written by the binary
+  being served, not by the checkout.
+
+Protocol, read on `$MIKA_SPIRIT_LOG_FILE` (`/var/log/mika/server.log`):
+
+```sh
+jq -r 'select(.event == "guard.review_anchor" or .event == "guard.review_anchor_withheld")
+       | [.timestamp, .event, .refused_labels, .accepted_labels, .miss_reason] | @tsv' \
+  < /var/log/mika/server.log
+```
+
+**The "before" measurement is already acquired** — the offline replay of the matcher over the
+real briefs and responses of three mika-arch grooming sessions, window 2026-10-18: **3 withholds
+on 3 re-prompts, a ratio of 1.0**, and the refused anchor was the first one in 2 of the 3
+sessions (`49ffa230`, `a7f1ccad`; `f167ff53` went 3 valid of 1 then of 0). Session `a7f1ccad`
+returned the same faulty anchor three times under a re-prompt that named the class and not the
+line.
+
+The **decision** in the light of the "after" measurement — keep, reinforce, or move to
+deterministic attribution (searching the refused excerpt in the turn's `tool_result` blocks, so
+the sentence can say *"your A1 quotes the output of `gh_read`"* instead of supposing it) — is an
+operator gesture over a deployment window. mika#2794 does not take it and opens no ticket for
+it: a ticket opened on an unmeasured hypothesis is precisely what mika#2786 declined to do for
+this lead.
+
 ### Deterministic Context Injection
 
 Skills with `[context.*]` sections have their data pre-fetched by the engine before the LLM turn. `resolve_contexts()` dispatches to engine-owned handlers by `context_type`, deduplicates across skills, and returns `ContextBlock`s. `apply_context_replacements()` performs single-pass `{{key}}` template substitution on skill prompts (injection-safe — replaced content is never re-scanned). If a `required = true` context fails, the declaring skill is excluded from the turn; if `required = false`, a sentinel message replaces the placeholder. Known types: `gh_pr_diff`. Module: `skills/context.rs`.

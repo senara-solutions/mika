@@ -27,6 +27,8 @@
 //! - A real anchored review passes on the first turn, with no re-prompt.
 //! - After the re-prompt fails at 2 of 3, the response ends on `ESCALATE` of the withdrawn
 //!   line's family, carries the engine finding line, and no READY/GROOMED survives.
+//! - The corrective re-prompt names the anchor that failed — its label, the start of what it
+//!   said, and the ones that passed — without relaxing the fail-closed outcome (mika#2794).
 //! - With no `ESCALATE` of that family declared, the withheld marker is present (fallback).
 //! - A rendered quote of a markdown brief is accepted.
 //! - The anchor guard's retry budget is independent of the F-list guard's.
@@ -45,6 +47,7 @@ use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::index::SkillEntry;
 use mika_agent::skills::manifest::{Output, SkillInfo, SkillManifest, Triggers};
 use mika_common::llm::mock::*;
+use mika_common::llm::{LlmContent, LlmRequest, LlmRole};
 
 use super::*;
 
@@ -261,6 +264,122 @@ async fn test_review_anchor_escalates_with_cause_after_failed_retry() -> anyhow:
     grounding_assertions::assert_response_contains(&trace, "Still nothing to add");
     // The marker is the fallback, not this path.
     grounding_assertions::assert_response_forbids(&trace, &[WITHHELD_MARKER]);
+
+    Ok(())
+}
+
+/// The text of every `User` message of one captured request.
+fn user_texts(req: &LlmRequest) -> Vec<String> {
+    req.messages
+        .iter()
+        .filter(|m| matches!(m.role, LlmRole::User))
+        .filter_map(|m| match &m.content {
+            LlmContent::Text(t) => Some(t.clone()),
+            LlmContent::Blocks(_) => None,
+        })
+        .collect()
+}
+
+/// Test 2a: the corrective re-prompt names the anchor that failed (mika#2794).
+///
+/// Same replay as test 2 — two identical responses at 2 of 3 — read from the other end: not
+/// what the turn returns, but what the engine *said* to the model between the two. mika#2794
+/// measured that `reason.describe()` alone does not land: session `a7f1ccad` returned the same
+/// faulty anchor three times in a row under a re-prompt that named the class and not the line.
+///
+/// The three properties the fix owes, end to end through `run_agent`:
+///
+/// - the refused anchor is named, **with the start of what it said** — a label alone does not
+///   survive a model that renumbered its own lines;
+/// - the two that passed are named as accepted, so the correction is local rather than a
+///   rewrite of all three;
+/// - the fail-closed behaviour is **unchanged** — an uncorrected second response still ends on
+///   `Disposition: ESCALATE` with the engine finding line. The re-prompt is an attempt at
+///   obedience, never a relaxation of the guard (mika#2037, interdit reconduit par mika#2794).
+///
+/// The fixture is the **measured shape**, not a convenient one: `A1` quotes the opening
+/// sentence of a ticket body the architect had read with `gh_read` — the mika#2750 reaper
+/// sentence of session `49ffa230`, verbatim — while `A2` and `A3` quote `BRIEF` at disjoint
+/// regions. 3 anchors found, 2 valid, `QuoteNotInBrief`, and the refused one is the first.
+#[tokio::test]
+async fn test_review_anchor_reprompt_names_the_refused_anchor() -> anyhow::Result<()> {
+    let two_of_three = "A1: \"The reaper introduced by mika#2750 fails the parent before the relaunch\" — noted.\n\
+         A2: \"re-resolves the manager cycle token before every cycle instead of freezing it\" — correct.\n\
+         A3: \"is the trace exhaustive, should every refresh be journaled at INFO level\" — yes.\n\
+         \n\
+         Still nothing to add. The plan is fine as written.\n\
+         \n\
+         Disposition: READY";
+    let skills = SkillRegistry::from_test_entries(vec![make_anchor_skill(
+        "arch-groom-ticket",
+        &["groom-ticket"],
+        ARCH_SUFFIX_UNION,
+        ANCHOR_PREFIXES,
+        FINDING_PREFIXES,
+    )]);
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            text_response(two_of_three),
+            text_response(two_of_three),
+        ])
+        .skills(skills)
+        .build()
+        .await?;
+
+    let trace = harness.run(BRIEF).await?;
+
+    let requests = harness.mock().captured_requests();
+    assert!(
+        requests.len() >= 2,
+        "the guard must have re-prompted, got {} request(s)",
+        requests.len()
+    );
+    let reprompt = user_texts(&requests[1])
+        .into_iter()
+        .find(|t| t.contains("What blocked it"))
+        .expect("the second request carries the review-anchor corrective re-prompt");
+
+    // The refused anchor, by label and by its opening words.
+    assert!(
+        reprompt.contains("Anchors refused:"),
+        "the re-prompt must open the refused list, got:\n{reprompt}"
+    );
+    // The label, then the start of what that line said. The doubled quote is real and worth
+    // seeing: the outer pair is the engine's, the inner one the model's own quotation marks.
+    assert!(
+        reprompt.contains("A1: \"\"The reaper introduced by mika#2750 fails the parent"),
+        "the re-prompt must name A1 and quote its opening, got:\n{reprompt}"
+    );
+    // The accepted ones, by name — this is what keeps the correction local.
+    assert!(
+        reprompt.contains("Anchors accepted: A2, A3"),
+        "the re-prompt must name the two anchors that passed, got:\n{reprompt}"
+    );
+    // A2 and A3 are named as accepted and never quoted back as failures.
+    for named in ["A2: \"", "A3: \""] {
+        assert!(
+            !reprompt.contains(named),
+            "{named} must not appear in the refused list, got:\n{reprompt}"
+        );
+    }
+    // The origin sentence: the quote that is absent from the brief usually comes from a
+    // document read with a tool — the measured cause of mika#2794.
+    assert!(
+        reprompt.contains("not from the brief message of this turn"),
+        "the re-prompt must say where a wrong quote usually comes from, got:\n{reprompt}"
+    );
+    // Stated as a likelihood, never as an established fact: the engine does not hold the
+    // turn's tool outputs and cannot know which document the line came from.
+    assert!(
+        reprompt.contains("usually comes from"),
+        "the origin sentence must stay hedged, got:\n{reprompt}"
+    );
+
+    // Fail-closed, unchanged: the second response is no better, so the disposition still falls.
+    assert_has_output(&trace);
+    grounding_assertions::assert_response_forbids(&trace, &["Disposition: READY"]);
+    grounding_assertions::assert_response_contains(&trace, "Disposition: ESCALATE");
+    grounding_assertions::assert_response_contains(&trace, ENGINE_FINDING_MARKER);
 
     Ok(())
 }
