@@ -162,6 +162,12 @@ jobs:
       # Precondition: `cargo fmt` on PATH.
       - name: The rescue leaves a formatted tree (mika#2348)
         run: bash skills/bundled/_shared/tests/test_rescue_fmt_clean.sh
+      # The same suite with no `rustup default` and an empty HOME — this
+      # runner's own state, reproduced so it holds on any machine. The fixture
+      # crate sits outside rust-toolchain.toml; red here means the suite went
+      # back to relying on a default toolchain (mika#2826).
+      - name: The rescue fmt suite without a default toolchain (mika#2826)
+        run: bash skills/bundled/_shared/tests/test_rescue_fmt_clean_without_default_toolchain.sh
       # 0600 relay socket, minimal relay launch environment, and reachability
       # from a real bwrap pilot — the third point is the one the canary cannot
       # give. Precondition: a real bwrap.

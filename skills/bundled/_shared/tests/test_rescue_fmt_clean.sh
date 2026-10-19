@@ -88,6 +88,17 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 0
 fi
 
+# The fixture crate lives under ${TMPDIR:-/tmp}, outside this repo's
+# `rust-toolchain.toml`, so rustup falls back to the default toolchain there —
+# and the CI runner has none (rustup installed with `--default-toolchain none`,
+# toolchain active only through the override). Every `cargo fmt` in the fixture
+# then failed with "rustup could not choose a version of cargo to run" (mika#2826).
+# Pin the repo's own toolchain for the whole suite; a caller's explicit choice wins.
+if [ -z "${RUSTUP_TOOLCHAIN:-}" ] && command -v rustup >/dev/null 2>&1; then
+    _repo_toolchain="$(cd "$SCRIPT_DIR" && rustup show active-toolchain 2>/dev/null | awk 'NR == 1 { print $1 }')"
+    [ -n "$_repo_toolchain" ] && export RUSTUP_TOOLCHAIN="$_repo_toolchain"
+fi
+
 # Unformatted on purpose: extra spaces, no spacing around `->`, body on the
 # signature line. `cargo fmt --all -- --check` rejects this shape.
 UNFORMATTED_RS='pub fn  add( a:i32 ,b:i32 )->i32{a+b}'
