@@ -68,6 +68,13 @@ mod eval {
     // course).
     mod test_ci_success_fanout_2260;
     mod test_completion_claim_guard;
+
+    // mika#1748 — la cérémonie de handsoff au plafond de contexte, lue dans le
+    // prompt système que le modèle a reçu, avec son contrôle négatif à un
+    // message près. Les tests unitaires du prédicat et du builder resteraient
+    // verts si l'entonnoir ne comptait jamais les messages.
+    mod test_compaction_handsoff_1748;
+
     mod test_context_summary_inject;
 
     // mika#2305 — the scope that decided the window is emitted next to the count

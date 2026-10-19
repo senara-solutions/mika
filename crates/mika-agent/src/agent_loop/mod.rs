@@ -503,6 +503,15 @@ struct AgentContext {
     /// error here must not block the turn; the `<stopped-topics>` block simply
     /// stays empty.
     stopped_topics: Vec<crate::db::Preference>,
+    /// Le compte de messages, quand la fenêtre approche sa condensation
+    /// (mika#1748). `Some(n)` **est** le franchissement : le prédicat a déjà été
+    /// évalué ici, et `prompt::build_system_prompt` n'a plus qu'à rendre. `None`
+    /// couvre les trois cas où rien ne doit être rendu — sous le seuil, lecture
+    /// en échec, ou boucle sans destinataire pour la cérémonie.
+    ///
+    /// Lu fail-open comme ses voisins : un défaut de comptage ne coûte jamais le
+    /// tour, il rend seulement la cérémonie muette pour ce tour-là.
+    compaction_imminent: Option<usize>,
 }
 
 async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<AgentContext> {
@@ -582,6 +591,48 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
             Vec::new()
         }
     };
+    // mika#1748 — le prédicat de cérémonie, posé ici et nulle part ailleurs.
+    // `load_agent_context` est l'entonnoir des trois boucles (conversation,
+    // silencieuse, équipe) : un prédicat posé dans un corps de boucle serait
+    // aveugle aux deux autres, exactement la raison que le détecteur mika#2473
+    // au sommet de cette fonction porte déjà.
+    //
+    // Fail-open, comme `stopped_topics` juste au-dessus : une erreur de comptage
+    // laisse le champ à `None` sous un WARN qui la nomme. Un défaut de comptage
+    // ne coûte jamais le tour — au pire la cérémonie reste muette ce tour-ci, et
+    // le prédicat la rendra au suivant (elle est répétée à chaque tour au-dessus
+    // du seuil, pas déclenchée une fois).
+    let threshold_pct = crate::compaction_handsoff::threshold_pct();
+    let compaction_imminent = match db.count_messages().await {
+        Ok(total) if crate::compaction_handsoff::ceremony_due(total, threshold_pct) => {
+            // Sur la branche de franchissement **seulement** : au régime nominal
+            // cette ligne tomberait à chaque tour de chaque agent, et un
+            // instrument qui parle tout le temps ne dit plus rien. Le pendant
+            // négatif — « le seuil n'est pas franchi » — se lit à l'absence de
+            // ligne pour un agent dont on connaît le compte.
+            info!(
+                target: "mika::otel",
+                event = "compaction_handsoff_due",
+                agent = db.agent_id(),
+                messages = total,
+                threshold_pct,
+                window = crate::compaction::COMPACTION_THRESHOLD,
+                "plafond de contexte approché — la cérémonie de handsoff est posée au prompt"
+            );
+            Some(total)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            warn!(
+                target: "mika::otel",
+                event = "compaction_handsoff_count_failed",
+                agent = db.agent_id(),
+                error = %e,
+                "comptage de messages indisponible — la cérémonie de handsoff reste muette ce tour-ci"
+            );
+            None
+        }
+    };
     Ok(AgentContext {
         soul_content,
         identity,
@@ -591,6 +642,7 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
         db_history_scope,
         db_history_max_tokens,
         stopped_topics,
+        compaction_imminent,
     })
 }
 
@@ -5466,8 +5518,15 @@ async fn run_agent_inner(
         // behaviour for every agent that declares nothing.
         tenant_language: ctx.language,
         pending_transmission: pending_transmission.as_ref(),
-        // mika#1748 — alimenté au commit suivant depuis `ctx`.
-        compaction_imminent: None,
+        // mika#1748 — le prédicat a été évalué une fois, dans
+        // `load_agent_context` ; ici on ne fait que le porter. Le champ reste
+        // `None` quand le seuil n'est pas franchi, et le bloc ne rend rien.
+        //
+        // Noter qu'il est porté même sur la branche `is_compact_provider`
+        // ci-dessous : `build_compact_system_prompt` ignore le champ (D6), et
+        // c'est une propriété de ce builder-là, pas de ce littéral — un test
+        // (`mika1748_le_builder_compact_ne_rend_pas_le_bloc`) la tient.
+        compaction_imminent: ctx.compaction_imminent,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
