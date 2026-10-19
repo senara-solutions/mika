@@ -75,6 +75,13 @@ mod eval {
     // verts si l'entonnoir ne comptait jamais les messages.
     mod test_compaction_handsoff_1748;
 
+    // mika#2805 — le vol 2 du même entonnoir : la déposition est servie au
+    // successeur, le reçu est posé dans le tour servi, et le second tour ne la
+    // ressert pas. Le troisième test est le contrôle négatif de la porte D2 —
+    // le déclencheur est la condensation passée, jamais la présence d'un
+    // fichier.
+    mod test_compaction_handsoff_ritual_2805;
+
     mod test_context_summary_inject;
 
     // mika#2305 — the scope that decided the window is emitted next to the count
