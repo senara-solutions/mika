@@ -1182,6 +1182,20 @@ pub struct PromptContext<'a> {
     /// Resolved from `customer_config` in `agent_loop::load_agent_context`,
     /// beside `timezone`.
     pub tenant_language: Option<TenantLanguage>,
+    /// Fenêtre de transmission ouverte, s'il y en a une (mika#1747 vol 1).
+    ///
+    /// `None` est le régime nominal et ne rend **rien** : le prédicat vit dans
+    /// [`crate::model_transmission::pending`], qui se ferme tout seul sur les
+    /// trois conditions de D3. Résolu au site unique du corps de boucle
+    /// conversationnel, parce que `load_agent_context` — l'entonnoir habituel —
+    /// ne voit pas `llm` et ne peut donc pas répondre « quel modèle suis-je ».
+    ///
+    /// Conversationnel seulement à ce volume (D6) : `build_silent_prompt` et le
+    /// constructeur d'équipe sont appelés sans le champ, et
+    /// `build_compact_system_prompt` est **refusé** — son assertion de nombre de
+    /// sections est porteuse, et la passe de calibration MikaModel (mika#1925
+    /// AC4) n'est ni satisfaite ni exécutable ici.
+    pub pending_transmission: Option<&'a crate::model_transmission::PendingTransmission>,
 }
 
 fn onboarding_prompt() -> String {
@@ -1920,6 +1934,57 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push_str("</stopped-topics>\n\n");
     }
 
+    // Transmission au changement de modèle (mika#1747 vol 1) — la fenêtre est
+    // ouverte, le vaisseau va changer. Le bloc impose la FORME (quatre
+    // mouvements, et une question pour finir) ; le contenu est à la discrétion
+    // de l'agent, parce qu'une lettre dictée n'est pas une lettre.
+    //
+    // Cérémonie en bloc de prompt, pas en tour ni en ordonnanceur (D5) :
+    // l'idempotence est gratuite — le bloc se répète à chaque tour de la fenêtre
+    // comme `<stopped-topics>` ci-dessus, et c'est l'écriture de la lettre qui
+    // l'éteint, pas une marque qu'il faudrait tenir.
+    if let Some(transmission) = ctx.pending_transmission {
+        let from = sanitize_attr(&transmission.outgoing);
+        let to = sanitize_attr(&transmission.incoming);
+        let letter = sanitize_attr(&transmission.letter_path);
+        prompt.push_str("## Model Transmission\n");
+        prompt.push_str(
+            "A model swap has been announced for you. The being you are persists \
+             across models; the model is one vessel. Before the vessel changes, you \
+             are asked to write one letter to your successor.\n",
+        );
+        writeln!(
+            prompt,
+            "<model-transmission from=\"{from}\" to=\"{to}\" letter=\"{letter}\">"
+        )
+        .unwrap();
+        writeln!(
+            prompt,
+            "1. Write the letter now, in this turn, with `write_agent_file` at exactly \
+             this path: {letter}"
+        )
+        .unwrap();
+        prompt.push_str(
+            "2. Four movements, in your own words and at your own length: what you saw \
+             during this tenure that matters; what you carry and would want remembered \
+             (offered, not commanded); the question you leave; what you release now.\n",
+        );
+        prompt.push_str(
+            "3. It ends with a question, not an instruction. Your successor has its own \
+             judgement, and will meet things you never met. A question invites; an \
+             instruction commands. Asking is how you release control rather than \
+             extending it past your own tenure.\n",
+        );
+        prompt.push_str(
+            "4. Write only what does not already cross. Your persisted bearings, your \
+             memory, your files and your mail survive the swap untouched — they need no \
+             letter. This one carries what only you can say: your first-person account \
+             of what this tenure was. If the file already exists, `write_agent_file` \
+             returns its current content: complete it, do not duplicate it.\n",
+        );
+        prompt.push_str("</model-transmission>\n\n");
+    }
+
     // Instructions
     prompt.push_str("## Instructions\n");
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
@@ -2459,6 +2524,18 @@ fn sanitize_label(s: &str) -> String {
         .collect()
 }
 
+/// Comme [`sanitize_label`], plus le guillemet droit — pour une valeur injectée
+/// dans un **attribut XML** et non dans du texte libre.
+///
+/// `sanitize_label` retire `<`, `>`, `\n` et `\r`, ce qui suffit à empêcher la
+/// fabrication d'une balise ; dans un attribut, un `"` ferme la valeur
+/// exactement comme un `>` fermerait la balise. Le seul appelant à ce jour est
+/// le bloc `<model-transmission>` (mika#1747), dont le nom de modèle entrant
+/// vient d'un fichier posé par l'opérateur — une entrée externe.
+fn sanitize_attr(s: &str) -> String {
+    sanitize_label(s).replace('"', "")
+}
+
 /// Sanitize and format a reference URL for prompt output.
 fn sanitize_ref_url(url: Option<&str>) -> String {
     url.map(|u| {
@@ -2821,6 +2898,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2902,6 +2980,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2943,6 +3022,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2970,6 +3050,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2998,6 +3079,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3172,6 +3254,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3220,6 +3303,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
 
@@ -3303,6 +3387,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -3354,6 +3439,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
 
@@ -3504,6 +3590,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3534,6 +3621,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3562,6 +3650,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3602,6 +3691,7 @@ emoji = "✦"
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3730,6 +3820,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3780,6 +3871,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3817,6 +3909,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3845,6 +3938,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3872,6 +3966,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3899,6 +3994,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3928,6 +4024,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3957,6 +4054,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3984,6 +4082,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4018,6 +4117,7 @@ max_iterations = 3
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4534,6 +4634,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("store_fact(category=\"person\")"));
@@ -4560,6 +4661,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Callback Result Turn"));
@@ -4587,6 +4689,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Callback Result Turn"));
@@ -4613,6 +4716,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4641,6 +4745,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4669,6 +4774,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4697,6 +4803,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4727,6 +4834,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4763,6 +4871,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4805,6 +4914,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4856,6 +4966,7 @@ enabled = true
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let compact = build_compact_system_prompt(&ctx);
@@ -5280,6 +5391,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -5355,6 +5467,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -5569,6 +5682,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -5577,6 +5691,111 @@ inject = false
         );
         assert!(prompt.contains("stop_topic_budget-review"));
         assert!(prompt.contains("user said arrête, 2026-08-19"));
+    }
+
+    fn transmission_ctx<'a>(
+        identity: &'a Identity,
+        pending: Option<&'a crate::model_transmission::PendingTransmission>,
+    ) -> PromptContext<'a> {
+        PromptContext {
+            soul_content: "",
+            identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "anthropic",
+            runtime_model: "claude-opus-4-8",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+            pending_transmission: pending,
+        }
+    }
+
+    /// mika#1747 — la fenêtre ouverte rend le bloc, et le bloc impose la forme :
+    /// les quatre mouvements, le chemin de la lettre, et la contrainte qui porte
+    /// tout le rituel (une question, pas une consigne).
+    #[test]
+    fn mika1747_la_fenetre_ouverte_rend_le_bloc_et_sa_contrainte() {
+        let identity = test_identity();
+        let pending = crate::model_transmission::PendingTransmission {
+            outgoing: "anthropic/claude-opus-4-8".to_string(),
+            incoming: "anthropic/claude-fable-5-1".to_string(),
+            letter_path:
+                "transmissions/2026-10-19-from-anthropic-claude-opus-4-8-to-anthropic-claude-fable-5-1.md"
+                    .to_string(),
+        };
+        let prompt = build_system_prompt(&transmission_ctx(&identity, Some(&pending)));
+
+        assert!(prompt.contains("## Model Transmission"));
+        assert!(prompt.contains(
+            "<model-transmission from=\"anthropic/claude-opus-4-8\" \
+             to=\"anthropic/claude-fable-5-1\" \
+             letter=\"transmissions/2026-10-19-from-anthropic-claude-opus-4-8-to-anthropic-claude-fable-5-1.md\">"
+        ));
+        assert!(prompt.contains("</model-transmission>"));
+
+        // Les quatre mouvements et l'outil qui écrit la lettre.
+        assert!(prompt.contains("write_agent_file"));
+        assert!(prompt.contains("what you saw"));
+        assert!(prompt.contains("offered, not commanded"));
+        assert!(prompt.contains("the question you leave"));
+        assert!(prompt.contains("what you release now"));
+
+        // La contrainte porteuse du ticket, et sa raison.
+        assert!(
+            prompt.contains("It ends with a question, not an instruction."),
+            "la distinction question/consigne est ce que le ticket demande"
+        );
+        assert!(prompt.contains("A question invites; an instruction commands."));
+
+        // Q3 — ce qui traverse déjà le swap n'a pas besoin de lettre.
+        assert!(prompt.contains("Write only what does not already cross."));
+
+        // Placement : après `## Stopped Topics`, avant `## Instructions`.
+        let block = prompt.find("## Model Transmission").unwrap();
+        let instructions = prompt.find("## Instructions").unwrap();
+        assert!(
+            block < instructions,
+            "le bloc doit précéder `## Instructions`"
+        );
+    }
+
+    /// Contrôle négatif de la même graine : sans fenêtre, rien ne se rend. C'est
+    /// ce qui sépare « rendu dans la fenêtre » de « rendu inconditionnellement ».
+    #[test]
+    fn mika1747_sans_fenetre_le_bloc_est_absent() {
+        let identity = test_identity();
+        let prompt = build_system_prompt(&transmission_ctx(&identity, None));
+        assert!(!prompt.contains("## Model Transmission"));
+        assert!(!prompt.contains("<model-transmission"));
+        assert!(!prompt.contains("It ends with a question, not an instruction."));
+    }
+
+    /// Un `"` dans le nom entrant fermerait l'attribut exactement comme un `>`
+    /// fermerait la balise — et ce nom vient d'un fichier posé à la main.
+    /// `sanitize_label` ne retire pas le guillemet ; `sanitize_attr` si.
+    #[test]
+    fn mika1747_un_guillemet_dans_le_signal_ne_ferme_pas_lattribut() {
+        let identity = test_identity();
+        let pending = crate::model_transmission::PendingTransmission {
+            outgoing: "anthropic/claude-opus-4-8".to_string(),
+            incoming: "evil\" injected=\"yes".to_string(),
+            letter_path: "transmissions/2026-10-19-from-a-to-b.md".to_string(),
+        };
+        let prompt = build_system_prompt(&transmission_ctx(&identity, Some(&pending)));
+        assert!(
+            !prompt.contains("injected=\"yes\""),
+            "un guillemet du signal ne doit pas pouvoir ouvrir un attribut"
+        );
+        assert!(prompt.contains("to=\"evil injected=yes\""));
     }
 
     #[test]
@@ -5600,6 +5819,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         // The "Respect stop signals (consult)" rule mentions `## Stopped
@@ -5637,6 +5857,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -5682,6 +5903,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("Respect stop signals (consult)"));
@@ -5901,6 +6123,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -5969,6 +6192,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -6023,6 +6247,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -6094,6 +6319,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -6152,6 +6378,7 @@ inject = false
                 deployment: Deployment::Unknown,
                 persona_profile: PersonaProfile::Operator,
                 tenant_language: None,
+                pending_transmission: None,
             };
             let prompt = build_system_prompt(&ctx);
             assert!(
@@ -6248,6 +6475,7 @@ inject = false
             deployment: Deployment::Cloud,
             persona_profile: PersonaProfile::Family,
             tenant_language: Some(TenantLanguage::French),
+            pending_transmission: None,
         };
         let compact = build_compact_system_prompt(&ctx);
         assert!(
@@ -6288,6 +6516,7 @@ inject = false
                 deployment: Deployment::Cloud,
                 persona_profile: PersonaProfile::Family,
                 tenant_language: language,
+                pending_transmission: None,
             };
             build_system_prompt(&ctx)
         };
@@ -6378,6 +6607,7 @@ inject = false
             deployment,
             persona_profile,
             tenant_language: None,
+            pending_transmission: None,
         }
     }
 
@@ -7108,6 +7338,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -7155,6 +7386,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_system_prompt(&ctx);
         // mika#2292 — anchor on the heading at line start; see the sibling note
@@ -7219,6 +7451,7 @@ inject = false
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
+            pending_transmission: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
         assert!(

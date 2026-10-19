@@ -31,6 +31,7 @@ pub mod memory;
 pub mod merge_gate_rerun;
 pub mod messaging;
 pub mod milestone_manager;
+pub mod model_transmission;
 pub mod operational;
 pub mod panic_hook;
 pub mod perimeter;
