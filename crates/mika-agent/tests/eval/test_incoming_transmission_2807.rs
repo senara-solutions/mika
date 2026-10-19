@@ -34,8 +34,7 @@ fn pose_letter(home: &std::path::Path, name: &str) {
 /// Le nom qu'un vol 1 servi par `claude-opus-4-8` produit pour un successeur
 /// `claude-fable-5-1` — composé par `model_transmission::pending`, asserté
 /// caractère par caractère par son test unitaire V2.
-const LETTRE: &str =
-    "2026-10-19-from-anthropic-claude-opus-4-8-to-anthropic-claude-fable-5-1.md";
+const LETTRE: &str = "2026-10-19-from-anthropic-claude-opus-4-8-to-anthropic-claude-fable-5-1.md";
 
 /// V9 — la lettre posée atteint le prompt système du tour, avec son chemin de
 /// lecture, son chemin de dépôt, et les deux libertés.
