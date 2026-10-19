@@ -6898,6 +6898,59 @@ garde que personne n'a exercée se lit exactement comme une garde qui marche*
   greps et les requêtes ci-dessus, et **leur silence ne prouve rien tant que
   personne ne les exécute.**
 
+### Un groom retenu trois fois d'affilée par la garde d'ancrage n'est plus relancé automatiquement (mika#2786)
+
+**`MIKA_GROOM_ANCHOR_BRAKE_MAX` — défaut `3` ; `0` désarme ; vide ou illisible
+retombe sur `3` (WARN sur illisible).** Le nombre de retenues consécutives de la
+garde d'ancrage (mika#2037) sur un même ticket à partir duquel tout dispatch de
+groom **automatique** de ce ticket est refusé à la frontière d'outil
+(`validate_dispatch_readiness`).
+
+- **Ce qui compte.** Un callback de groom terminal dont le `result` porte une ligne
+  `Engine reason: … (BLOCKING) [mika-engine] review-anchor: …` est une retenue.
+  Un callback qui porte une ligne `Outcome: …` sans retenue (`PLAN_GROOMED`, un
+  ESCALATE d'architecte, `PIPELINE_INCOMPLETE`) **arrête** la série. Un callback
+  sans ligne `Outcome:` (le lanceur différé, « deferred dispatch slot freed ») est
+  **neutre**.
+- **Pourquoi un frein ici.** Le 2026-10-18, mika#2762 a été retenu trois fois de
+  suite. Deux des trois relances venaient de mika-dev lui-même, qui relisait le
+  callback d'ESCALATE comme un succès. Le budget de re-drive de mika#2020 ne
+  compte que les re-drives de la Phase 2, et le gate mika#2545 laisse passer tout
+  tour qui porte un message. La frontière d'outil est le seul site que tous ces
+  chemins traversent.
+- **La levée.** `mika ask --agent mika-dev "groom <owner/repo>#<n>"` : une
+  intention de grooming explicite traverse le frein. **Reposer `ready` ne le lève
+  pas**, parce que le moteur ne distingue pas le `ready` de l'opérateur de celui
+  que mika-dev repose. Un groom qui converge remet la série à zéro.
+- **La levée est écrite, et elle borne la série.** Une demande explicite qui
+  traverse un frein armé écrit une ligne `groom_anchor_brake_lifted` (INFO + audit,
+  `target_key` = `owner/repo#n`). Le frein ne compte ensuite que les retenues
+  postérieures à la dernière levée. C'est ce qui fait survivre la levée à la file
+  différée : si la place de groom est prise, la demande est garée en lanceur
+  différé, et son rejeu part d'un tour silencieux sans message d'origine. Une
+  nouvelle série de trois retenues après la levée freine de nouveau.
+- **La levée est large au tour.** Elle porte sur le tour qui contient la demande,
+  pas sur le ticket qu'elle nomme : un `groom mika#100` dont le tour dispatche un
+  groom de mika#2762 lève le frein de mika#2762. C'est le même choix que
+  mika#2484, et la ligne de levée nomme le ticket réellement levé.
+- **Ce que le frein ne fait pas.** Il ne pose ni label ni commentaire. Le ticket
+  garde `ready`, la Phase 2 le re-drive, chaque re-drive est refusé sans pilote, et
+  le budget de mika#2020 finit par le garer derrière `operator-review` avec un
+  commentaire.
+- **Base illisible : il ne freine pas**, et le dit sous
+  `groom_anchor_brake_unreadable` (WARN).
+
+| surface | niveau | lecture |
+|---|---|---|
+| `groom_anchor_withheld_brake` (journal) | WARN | un dispatch de groom refusé ; champs `issue`, `withheld_in_a_row`, `max` |
+| `audit_events.tool_name = 'groom_anchor_withheld_brake'` | — | même population ; `target_key` = `owner/repo#n`, `after_value` = la série |
+| `dispatch_groom_anchor_brake` dans `tasks.result` | — | le JSON de refus rendu au modèle |
+| `groom_anchor_brake_lifted` (journal + audit) | INFO | une levée par l'opérateur ; `after_value` = la série levée |
+
+Sonde : `SELECT target_key, count(*) FROM audit_events WHERE tool_name =
+'groom_anchor_withheld_brake' GROUP BY 1;`. Avant `make deploy`, son silence veut
+dire « binaire antérieur », pas « aucune boucle ».
+
 ### L'alimenteur nomme la cause qu'il a mesurée (mika#2161)
 
 **Aucune variable d'environnement, aucune migration, aucun seuil déplacé.** Cette entrée est ici parce que l'opérateur qui lit `auto_feeder_no_backlog` et se demande s'il doit groomer davantage cherche dans ce voisinage.

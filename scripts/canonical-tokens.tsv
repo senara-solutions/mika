@@ -294,6 +294,9 @@ REAPED_PILOT_SILENT_STALL	B	crates/mika-agent/src/task_engine/process_kill.rs::C
 REVIEW-ANCHOR-MISSING	B	crates/mika-agent/src/agent_loop/mod.rs::DISPOSITION_WITHHELD_MARKER	exact:line-anchored
 BLOCKING	B	crates/mika-agent/src/agent_loop/mod.rs::REVIEW_ANCHOR_ENGINE_FINDING_MARKER	exact:line-anchored
 BLOCKING	B	skills/bundled/_shared/dispatch-lib.sh::_engine_escalation_line	exact:line-anchored
+# mika#2786 — the anchor brake counts withholdings by the same marker, read with
+# `contains` on a line already anchored by the `Engine reason: ` prefix.
+BLOCKING	B	crates/mika-agent/src/skills/executor.rs::anchor_withheld_streak	exact:literal
 
 # ── Architect decision marker (mika#1262), read off written architect text.
 DECISION NEEDED	B	crates/mika-agent/src/operational/write.rs::RE	exact:literal
