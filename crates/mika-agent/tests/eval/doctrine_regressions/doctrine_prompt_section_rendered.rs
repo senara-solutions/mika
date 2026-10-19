@@ -53,6 +53,7 @@ fn make_ctx<'a>(soul_content: &'a str, identity: &'a Identity) -> PromptContext<
         identity,
         core_memory: &[],
         is_onboarding: false,
+        compaction_imminent: None,
         current_utc: Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap(),
         timezone: None,
         global_home_dir: None,

@@ -5466,6 +5466,8 @@ async fn run_agent_inner(
         // behaviour for every agent that declares nothing.
         tenant_language: ctx.language,
         pending_transmission: pending_transmission.as_ref(),
+        // mika#1748 — alimenté au commit suivant depuis `ctx`.
+        compaction_imminent: None,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -7590,6 +7592,13 @@ async fn run_team_agent_inner_impl(
         // la lettre au successeur est le témoignage d'une tenure, que porte
         // l'instance conversationnelle. Le vol 1 n'ouvre la fenêtre que là.
         pending_transmission: None,
+        // mika#1748 D6 — `None`, et c'est une décision, pas un oubli. La
+        // boucle d'équipe est une troisième boucle, aussi distincte de la
+        // conversation que la silencieuse : un enfant d'équipe tourne dans son
+        // propre périmètre de messages, et la cérémonie n'a pas de
+        // destinataire là-bas (le successeur qui relit au premier boot est le
+        // vol 2, senara-solutions/mika#2805). Le vol 1 livre une boucle.
+        compaction_imminent: None,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {

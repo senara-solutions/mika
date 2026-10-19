@@ -67,6 +67,7 @@ fn make_ctx<'a>(identity: &'a Identity, persona: PersonaProfile) -> PromptContex
         identity,
         core_memory: &[],
         is_onboarding: false,
+        compaction_imminent: None,
         current_utc: Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 0).unwrap(),
         timezone: None,
         global_home_dir: None,
