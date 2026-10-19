@@ -141,6 +141,20 @@ jobs:
       - name: Phase 2b entrypoint passes the pilot argv positionally (mika#2077)
         run: make test-pilot-phase2b-argv
 
+      # mika#2108 — le bac à sable ne monte que le worktree, mais depuis
+      # mika#2178 le corps du ticket et ses commentaires arrivent VERBATIM dans
+      # le prompt, chemins hôte compris : quatre séances mesurées ont dépensé
+      # leurs premiers tours à chercher un checkout jamais monté, puis sont
+      # allées vers la forme large qui tue la session (cpp#128). La suite tient
+      # la POSITION du bloc d'orientation — après la réassignation
+      # ITERATION_CTX, avant l'injection du contexte du ticket — parce qu'un
+      # avertissement qui SUIT les chemins console au lieu d'inoculer, et elle
+      # porte son anti-vacuité (copie régressée où l'ordre est inversé).
+      # Câblée ICI parce que mika#2578 l'a enseigné : un garde que le pipeline
+      # ne lance pas refuse rien. Ni bwrap, ni réseau, ni token.
+      - name: The pilot is situated before it reads the ticket's host paths (mika#2108)
+        run: make test-pilot-orientation-block
+
       # mika#2077 (reprise de mika#2032) — le chemin GROOMED de dispatch-lib
       # retirait la ligne `PIPELINE FAILURE:` d'un bloc d'échec de plusieurs
       # lignes, livrant `Session:`, `Halt class:` et le paragraphe orphelins :
