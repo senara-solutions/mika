@@ -7115,6 +7115,7 @@ Optional (purge du `target/` d'un worktree vif — mika#2497):
 - `MIKA_TARGET_PURGE` — kill-switch, **défaut armé**. `0`/`false`/`off`/`no` désarment sans redéploiement ; absent, vide ou **non reconnu** laissent armé, avec un WARN nommant la valeur entre guillemets — un désarmement par coquille sur un frein de disque serait la panne silencieuse que tout ceci ferme. Désarmé, le bras n'écrit **rien** : il ne « refuse » pas, il n'existe pas ce tick.
 - `MIKA_TARGET_PURGE_DISPOSITION` — `armed` (défaut) | `observe`. En observation le bras mesure, journalise et **ne supprime rien** (`target_purge_would_dispose`, jamais `target_purged`). Patron mika#2249 : *la détection est inconditionnelle, seule la disposition est gatée* — et la correction de mika#2469 est prise d'emblée plutôt qu'après coup.
 - `MIKA_TARGET_PURGE_IDLE_SECS` — fenêtre P4, **défaut `14400` (4 h)**, bornée des deux côtés : en dessous, une boucle QA → CI-fix active enchaîne en minutes et se ferait purger son cache entre deux itérations ; au-dessus, la fenêtre nocturne de 8 h qui a produit l'incident cesse d'être mordue.
+- `MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS` — **fenêtre P4 courte, défaut `900` (15 min)**, appliquée **au seul candidat dont le dernier consommateur a fini** (mika#2808, § *La fenêtre de P4 est choisie par candidat* ci-dessous). `MIKA_TARGET_PURGE_IDLE_SECS` reste la fenêtre de tous les autres, **inchangée à 4 h**. Pourquoi pas zéro : P3 et P5 tiennent la correction, mais une boucle QA → CI-fix peut enchaîner en minutes et cette marge protège son cache ; pourquoi pas plus : au-delà on reperd l'écart avec les 4 h qui est tout l'objet. Même parse à trois paliers que les autres clés numériques.
 - `MIKA_TARGET_PURGE_MAX_PER_TICK` — **défaut `2`**, budget **distinct** de celui du faucheur (un budget partagé ferait manger au faucheur le sien, ou l'inverse). Un `remove_dir_all` de 40 Go est une tempête d'E/S : ce cap est ce qui l'étale. Les trois clés numériques suivent le parse maison à trois paliers, et le `0` **ne désarme pas** — c'est le rôle du kill-switch.
 - **Disposition propre, sentinelle STOP PARTAGÉE.** Disposition propre parce que les deux létalités diffèrent d'un ordre de grandeur : coupler forcerait l'opérateur à régler les deux sur la plus prudente, et donc à perdre la purge dès qu'il veut observer le faucheur. Sentinelle **partagée** (`~/.mika/state/worktree-reap-stop`, mika#2329) parce que la décision d'urgence est **la même** — « arrête ce qui supprime dans les worktrees ». Le court-circuit existant est en tête de tick, donc il couvre le nouveau bras sans une ligne.
 - **Livré armé, et l'argument est celui de l'asymétrie.** mika#2420 a shippé armé en s'appuyant sur mika#2272 (*« zéro était l'absence de mesure, pas la présence de prudence »*) ; l'argument est plus fort ici, le pire cas d'un faux positif étant un rebuild et non une perte. Ce qui paie la prudence est nommé et concret : les cinq termes fail-safe, la garde directe P5, le mode observe, la sentinelle partagée, le kill-switch — **et la sonde S0, qui prescrit de commencer en `observe`**.
@@ -7287,6 +7288,11 @@ d'autre du déploiement, cherche dans ce voisinage.
   que le suivi `rename`-avant-suppression s'ouvre, avec ce compte comme
   précondition. Ne pas raccourcir `MIKA_TARGET_PURGE_IDLE_SECS` par réflexe —
   ce serait purger le cache de travail en cours pour un problème de course.
+  **Toujours vrai après mika#2808 :** cette valeur est restée à `14400`. Ce
+  ticket n'a pas raccourci la fenêtre, il en a ajouté une **seconde**
+  (`MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS`) qui ne s'applique qu'au candidat
+  dont le dernier consommateur a fini. Un candidat sans verdict QA — c'est-à-dire
+  exactement celui dont un build pourrait démarrer — garde ses quatre heures.
   **S6 — contrôle négatif du zéro :** un compte **nul** ne prouve **pas** que le
   défaut n'existait pas ; il faut qu'un `cargo` démarre pile dans la fenêtre, et
   celle du premier candidat d'un tick est de l'ordre de 2 s (`measure_tree_size`
@@ -7736,6 +7742,135 @@ P3, P4 ou P5 a lu vrai alors qu'il était faux. La fenêtre résiduelle du verro
   claude-pilot** — suivi déjà nommé par mika#2548, sans rapport avec ce code.
 - **Le vocabulaire du faucheur** (`ALL_REFUSAL_REASONS`) — aucun motif ajouté,
   retiré ni renommé. Seule leur **classification** est nouvelle.
+
+### La fenêtre de P4 est choisie par candidat, sur l'état du dernier consommateur (mika#2808)
+
+**Une variable nouvelle, `MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS`
+(défaut `900`), et aucune valeur existante déplacée.**
+`MIKA_TARGET_PURGE_IDLE_SECS` reste à `14400`.
+
+- **Le défaut que ça ferme, mesuré.** 2026-10-19 à 00:00Z : `/data` monté de
+  27 % à 42 % en trois heures, **aucun pilote en vol**. `.claude/worktrees`
+  pesait 268 Go sur 35 worktrees, dont neuf `target/` de 22 à 47 Go — la quasi
+  totalité. Un `cargo clean` à la main sur ces neuf a ramené `/data` à 14 %.
+  Le mécanisme de mika#2497 n'a **rien** récupéré, et c'est conforme : sa
+  fenêtre de 4 h rattrape l'accumulation lente, pas un rythme de plusieurs vols
+  par jour compilant chacun 20 à 50 Go dans un worktree neuf. Les spawns
+  appliquent déjà « `cargo clean` au push » ; les pilotes de la boucle, non.
+
+- **Le point d'accroche est le VERDICT QA, pas la sortie du pilote.** Le dernier
+  consommateur du `target/` d'un worktree de pilote est le build QA
+  (`long_running:build_mika`) qui suit l'ouverture de la PR. Purger à la sortie
+  du pilote obligerait la QA à tout recompiler — on échangerait du disque contre
+  de la latence de boucle sur le chemin **nominal**, ce que mika#2497 avait déjà
+  refusé.
+
+- **C'est un ÉTAT LU, jamais un signal ÉMIS, et les deux raisons sont des
+  incidents passés.** Un signal émis par `dispatch-lib.sh` ne part pas quand le
+  pgid du pilote est tué (mika#2263), et deux écrivains pour une même garde est
+  la classe de divergence de mika#2158. Le bras **lit** donc, à chaque tick, une
+  liste de revues déjà publiée (`gh pr list --json
+  number,headRefName,latestReviews`), et en dérive un état par candidat.
+
+- **`COMMENTED` compte comme un verdict soumis.** mika-qa poste ses verdicts
+  bloquants en `gh pr review --comment`, ce qui laisse `reviewDecision` à
+  `REVIEW_REQUIRED` : seul `latestReviews` les voit. Exiger `APPROVED` rendrait
+  le bras aveugle à la moitié des verdicts. Seul `PENDING` — un brouillon — et
+  un état absent ne comptent pas.
+
+- **La table, et elle est fail-safe dans les deux sens.**
+
+  | motif de conservation | état du consommateur | fenêtre |
+  |---|---|---|
+  | `pr_open` **avec** ≥ 1 revue soumise | `done` | `900 s` |
+  | `pr_open` **sans** revue soumise | `pending` | `14400 s` |
+  | `pr_unknown` / `detached_head_pr_unknown`, aucune PR dans l'index | `done` | `900 s` |
+  | `pr_unknown` / `detached_head_pr_unknown`, mais l'index montre une PR | `unknown` | `14400 s` |
+  | les six autres motifs éligibles | `unknown` | `14400 s` |
+  | liste de revues illisible, ou `branch` absente | `unknown` | `14400 s` |
+
+  La quatrième ligne est une **contradiction entre deux lectures** du même tick
+  (le faucheur a dit « pas de PR », l'index en montre une) : elle conserve. Un
+  terme illisible conserve — la doctrine des cinq termes de mika#2497 est
+  inchangée, et **P1, P2, P3 et P5 ne sont pas touchés** : seule la valeur
+  comparée en P4 devient fonction du candidat.
+
+#### Surfaces opérateur
+
+- `MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS` — ci-dessus, § `MIKA_TARGET_PURGE`.
+- Les lignes `target_purged` / `target_purge_would_dispose` portent deux champs
+  **additifs** : `consumer_state` (`done` | `pending` | `unknown`) et
+  `window_secs` (la fenêtre réellement appliquée). Ils sont des **champs**,
+  jamais un second `tool_name` : la population reste soustractible et les
+  requêtes publiées existantes sont inchangées.
+- `target_purge_reviews_unreadable` (WARN, par dépôt et par tick) — l'appel `gh`
+  a échoué ; **toutes** les PR ouvertes de ce dépôt retombent sur la fenêtre
+  pleine ce tick-là.
+
+#### Sonde post-déploiement
+
+> Gestes d'opérateur sur l'hôte : la base n'est pas montée dans le bac à sable
+> de dispatch, donc aucun pilote n'exécute ceci.
+
+**S0 — commencer en `observe`, un tick.** Poser
+`MIKA_TARGET_PURGE_DISPOSITION=observe`, lire `target_purge_would_dispose` et
+vérifier que les `consumer_state = "done"` correspondent bien à des PR dont la
+QA a rendu son verdict. **Puis armer.**
+
+```sql
+-- La population purgée sur 24 h
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'target_purged'
+   AND created_at >= datetime('now', '-1 day');
+```
+
+```bash
+# Quelle fenêtre a servi, et pourquoi
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.consumer_state == "done")
+           | {worktree_path, branch, pr_number, consumer_state, window_secs, idle_secs}'
+
+# CONTRÔLE POSITIF — la lecture des revues aboutit-elle seulement ?
+grep -c target_purge_reviews_unreadable "$MIKA_SPIRIT_LOG_FILE"   # attendu : 0
+```
+
+**Halte — `consumer_state = "unknown"` domine alors que des PR sont ouvertes et
+revues.** Ne **pas** élargir la table : lire d'abord le contrôle positif
+ci-dessus. Un `target_purge_reviews_unreadable` non nul dit que l'appel échoue
+(jeton, quota, réseau) et que le bras est fail-safe inerte — ce qui se lit
+exactement comme un disque sain (classe mika#2205).
+
+#### Les coûts acceptés, nommés
+
+1. **Un verdict bloquant peut coûter une recompilation à froid.** mika-qa rend
+   `CHANGES_REQUESTED`, le `target/` est purgé 15 min plus tard, et l'itération
+   CI-fix qui suit repart d'un cache vide. C'est le prix du choix de l'accroche,
+   et il est borné à du temps de rebuild.
+2. **La latence est de ≈ 15 à 25 min, pas « dès que ».** Le bras tourne sur le
+   cron `0 */10 * * * *` de `worktree_reap` : au verdict s'ajoutent la fenêtre
+   de 900 s puis l'attente du tick suivant. **Raccourcir le cron de 10 à 5 min a
+   été refusé** — ce serait doubler la fréquence de tout le tick (faucheur
+   compris) pour gagner cinq minutes sur un problème de disque qui se compte en
+   heures.
+3. **Un appel `gh` de plus par dépôt et par tick.** Mesuré le 2026-10-19 :
+   57 Ko / 0,79 s, hors du chemin critique du faucheur. L'appel du faucheur
+   (73 Ko / 2,1 s) est **laissé tel quel** : y ajouter `latestReviews` le faisait
+   passer à 1,21 Mo / 7,05 s.
+4. **La fenêtre de 4 h est intacte.** Rien de ce travail ne purge plus tôt un
+   candidat dont le consommateur n'a pas fini.
+
+#### Hors périmètre, délibérément
+
+- **Raccourcir le cron de `worktree_reap`** — coût 2 ci-dessus.
+- **Un signal émis par `dispatch-lib.sh`** — mika#2263 et mika#2158.
+- **Les cinq termes de mika#2497** — P1, P2, P3 et P5 inchangés ; P4 garde son
+  prédicat, seule la borne comparée devient fonction du candidat.
+- **Un troisième index dans `PrIndex`** — sa documentation affirme que ses index
+  sont construits de la même liste au même instant par un **site unique** ; un
+  index issu d'un second appel `gh` falsifierait cet invariant. La carte est un
+  paramètre séparé.
+- **`scripts/mika-platform-worktree-cleanup`** (mika#2497, pression disque) —
+  mécanisme complémentaire, conservé tel quel.
 
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 
