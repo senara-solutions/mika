@@ -9,9 +9,9 @@
 #   state, and the empty state — present on disk, absent from CI, absent from
 #   here — is what the lint refuses.
 #
-# This file holds the RESIDUE, not the census. The 70-odd suites CI does reach
-# are not listed: for those the tree is already the source of truth — a workflow
-# names them. Declaring them would create a second site to maintain for a fact
+# This file holds the RESIDUE, not the census. The suites CI does reach — 99 of
+# 101 as of 2026-10-19 — are not listed: for those the tree is already the
+# source of truth, a workflow names them. Declaring them would create a second site to maintain for a fact
 # already proven, and a registry you must edit on every CI rewiring is a
 # registry that drifts. That is precisely the class of mika#2092, self-inflicted.
 # `scripts/canonical-tokens.tsv` declares *all* its tokens because nothing else
@@ -24,8 +24,11 @@
 #   operator   the suite needs the outside world — network, a token, a live
 #              service, a pid — or it is a deliberate measuring instrument.
 #              Legitimately not a CI gate.
-#   unwired    the suite runs offline, and nothing runs it. THE BACKLOG.
-#              `grep -c unwired scripts/suite-wiring.tsv` is its size.
+#   unwired    the suite runs offline, and nothing runs it. THE BACKLOG —
+#              EMPTY since 2026-10-19: mika#2793 wired all 25 of them.
+#              Its size is the `unwired=<n>` field of the lint's own report
+#              line, NOT `grep -c unwired`: that also counts this header's
+#              mentions of the word, so it can never read zero.
 #
 # A third state exists and is NEVER written here: a wired suite. Its proof is
 # the workflow that names it, and the lint goes RED on an entry for a suite CI
@@ -66,9 +69,12 @@
 #   ticket    at least one `mika#<n>` — the ticket that gives the reason its
 #             meaning. For `operator`, the one that established the deliberate
 #             character. For `unwired`, the one that established the SUITE:
-#             what it protects is what its absence from CI costs. The wiring of
-#             the whole `unwired` column is tracked collectively by mika#2793,
-#             whose work list is this file read through `grep unwired`.
+#             what it protects is what its absence from CI costs. A new
+#             `unwired` line is a backlog entry you are OPENING, not a note on
+#             the side: mika#2793 closed the previous one by wiring all 25, so
+#             the next one carries its own Fire-Disposition ticket, named here.
+#             Writing a line without one re-creates, by hand, the invisible
+#             backlog this registry exists to make countable.
 #
 scripts/measure-plan-header-coverage.sh	operator	Deliberate instrument, never a gate — Makefile:200 and CLAUDE.md both say so in those words. It reports a coverage ratio over the plan corpus; there is no threshold to fail on, and inventing one here would turn a measurement into a gate nobody chose.	mika#2606
 scripts/verify-dependabot-topology.sh	operator	Reads three real repositories through `gh api`, so it needs a cross-repo token CI does not carry. Its offline half is scripts/test-verify-dependabot-topology.sh, which fakes `gh` and replays both states.	mika#1997
