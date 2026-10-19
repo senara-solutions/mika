@@ -455,6 +455,79 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-suite-wiring.sh
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # The guards of the repository's own tooling — written, reviewed, merged, and
+  # then left without a launcher. mika#2761 delivered the REFUSAL (the job
+  # above); this job is the catch-up (mika#2793). Every suite below runs offline
+  # in seconds: no cargo, no bwrap, no network, no token. They were not outside
+  # CI for a reason — nobody had wired them, and nothing said so out loud until
+  # the registry made the backlog countable.
+  #
+  # Three of them were ALREADY RED when this job was written, and one was not
+  # hermetic. That is what mika#2578 costs in practice: a guard the pipeline
+  # does not run refuses nothing, and while it refuses nothing it rots with no
+  # witness. One step per suite, deliberately: the step name is what a reader of
+  # the Checks page sees when a suite goes red, and a grouped `run: |` block
+  # makes "which one" invisible without opening the log.
+  # ───────────────────────────────────────────────────────────────────────────
+  offline-script-suites:
+    name: Offline Script Suites
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # Guard + proof-of-guard, in that order, through the existing `make`
+      # target: the target already encodes the ordering, and duplicating it in
+      # YAML would create a second site of truth for it. mika#1801 wrote that
+      # "the fifteen scripts/check-*.sh are all wired"; this pair is why that
+      # sentence stopped being true — the exact situation of check-cta-primitives.sh,
+      # "the only exception in its family, which is precisely why nobody looked
+      # for it".
+      - name: Release profile keeps the line tables a wedged binary needs (mika#1719)
+        run: make check-release-debuginfo
+      # The load-bearing invariant of the mika#893 factorisation: dev-pilot and
+      # dev-groom differ only by their entry slash command. Pure structural diff
+      # over two tracked files.
+      - name: dev-pilot and dev-groom differ only by their entry command (mika#893)
+        run: bash scripts/test-dispatch-symmetry.sh
+      # Keeps the empty-turn measurement from counting the guardrails constant
+      # as the event.
+      - name: The empty-turn measure does not count the guardrails as the event (mika#1910)
+        run: bash scripts/test-measure-empty-turns.sh
+      # Same class one measure over: the anchor must be derived from the
+      # producer, never reverse-engineered from a log, or 2349 of 2352 sessions
+      # read as silent. This suite was red on `0170f5cd` — the measured script
+      # was committed 100644 while the suite requires 100755 (mika#2793).
+      - name: The cycle-emptiness anchor comes from the producer (mika#1950)
+        run: bash scripts/test-measure-pilot-cycle-emptiness.sh
+      # The mika-arch-groom-milestone bundle's scaffold and its registration
+      # sites. Also red on `0170f5cd`: it asserted a per-skill LLM override site
+      # that mika#949 removed eleven months ago.
+      - name: The groom-milestone bundle and its registration sites (mika#879)
+        run: bash scripts/test-mika-groom-milestone.sh
+      # AC4 of the search smoke — a 404 `search_upstream_not_configured` must
+      # exit non-zero. Its own header states it was built to run in CI with no
+      # gateway, no database, no token and no upstream request; it was unwired
+      # anyway, which is the mika#2578 shape at its purest.
+      - name: A search upstream that answers 404 is not a healthy smoke (mika#2407)
+        run: bash scripts/test-smoke-search-substrate.sh
+      # The webhook-chain probe's decision table AND its silence on a healthy
+      # chain. Two throwaway `python3 -m http.server` stand-ins; every curl call
+      # stays on loopback.
+      - name: The webhook-chain probe's decision table and its silence (mika#2135)
+        run: bash scripts/test-smoke-webhook-chain.sh
+      # The offline half of the `operator` entry that stays in the registry: it
+      # fakes `gh` and replays both topology states, so the operator script's own
+      # logic is guarded even though the operator script itself cannot be.
+      - name: The dependabot topology verifier's own logic, with gh faked (mika#1997)
+        run: bash scripts/test-verify-dependabot-topology.sh
+      # The harness of the script every flight is required to end on. mika#2516
+      # is what its absence from CI has already cost once: a guard announced
+      # inside verify-pipeline.sh, never delivered, and nobody saw it. It was
+      # also non-hermetic until mika#2793 — 29 commits on an inherited git
+      # identity, which would have failed on this very runner.
+      - name: The harness of verify-pipeline.sh, the script every flight ends on (mika#861)
+        run: bash scripts/verify-pipeline-test.sh
+
   issue-annotation-guard-lint:
     name: Issue Annotation Guard Lint
     runs-on: ubuntu-22.04
