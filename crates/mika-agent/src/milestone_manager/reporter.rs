@@ -349,6 +349,25 @@ impl Reporter {
                     .join(", ");
                 let _ = writeln!(out, "- À admettre : {admit}");
             }
+            // Une admission dont la taille n'a pas été **mesurée** se dit
+            // (mika#2699 vol 3). La borne par vol ne l'a pas jugée : elle n'a
+            // pas de total à comparer. Taire le fait ferait lire « À admettre »
+            // comme « borne vérifiée », qui est précisément ce que le point 2
+            // du ticket promet — et l'opérateur n'aurait aucun moyen de
+            // distinguer un plan dimensionné d'un plan dont personne n'a lu la
+            // taille. Chaque cause porte son propre libellé : le geste
+            // correctif n'est pas le même pour un plan sans section de taille
+            // et pour une branche absente d'`origin`.
+            for a in &pool.admit {
+                if let Some(motif) = a.size.unmeasured_label() {
+                    let _ = writeln!(
+                        out,
+                        "- Taille non vérifiée : #{}{} — {motif}",
+                        a.number,
+                        candidate_suffix(state, a.number, a.origin),
+                    );
+                }
+            }
             // Chaque refus est **nommé**, avec son motif (mika#2699 vol 2,
             // point 2 du ticket). Le vol 1 rendait « Écartés : 1 candidat sans
             // plan groomé » : l'opérateur apprenait qu'un filtre avait eu lieu
@@ -740,7 +759,10 @@ fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::milestone_manager::pool::{PoolCandidate, ReadyTicket, assess_pool};
+    use crate::milestone_manager::pool::{
+        PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause, assess_pool,
+        assess_pool_sans_tailles,
+    };
     use crate::milestone_manager::relief::name_relief;
     use crate::milestone_manager::types::{
         ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
@@ -789,6 +811,7 @@ mod tests {
             ready_pool: vec![],
             outside_candidates: vec![],
             outside_read_truncated: None,
+            plan_sizes: Default::default(),
         }
     }
 
@@ -1451,7 +1474,7 @@ mod tests {
         );
 
         let mut a = empty_assessment();
-        a.pool = Some(assess_pool(&[], &[], &[]));
+        a.pool = Some(assess_pool_sans_tailles(&[], &[], &[]));
         let avec = Reporter::new().report(&state, &a);
         assert!(
             avec.contains("### Bassin ready (mode ombre — aucune écriture)"),
@@ -1489,7 +1512,11 @@ mod tests {
             },
         ];
         let mut a = empty_assessment();
-        a.pool = Some(assess_pool(&pool, &milestone_cands(&state), &[]));
+        a.pool = Some(assess_pool_sans_tailles(
+            &pool,
+            &milestone_cands(&state),
+            &[],
+        ));
         let out = Reporter::new().report(&state, &a);
 
         let titre = "### Bassin ready (mode ombre — aucune écriture)";
@@ -1552,7 +1579,11 @@ mod tests {
             },
         ];
         let mut a = empty_assessment();
-        a.pool = Some(assess_pool(&pool, &milestone_cands(&state), &[]));
+        a.pool = Some(assess_pool_sans_tailles(
+            &pool,
+            &milestone_cands(&state),
+            &[],
+        ));
         let out = Reporter::new().report(&state, &a);
 
         assert!(
@@ -1614,7 +1645,7 @@ mod tests {
             labels: vec!["p0-critical".into()],
         }];
         let mut a = empty_assessment();
-        a.pool = Some(assess_pool(
+        a.pool = Some(assess_pool_sans_tailles(
             &[],
             &milestone_cands(&state),
             &state.outside_candidates,
@@ -1644,12 +1675,133 @@ mod tests {
             labels: vec![],
         }];
         let mut a = empty_assessment();
-        a.pool = Some(assess_pool(&[], &[], &state.outside_candidates));
+        a.pool = Some(assess_pool_sans_tailles(
+            &[],
+            &[],
+            &state.outside_candidates,
+        ));
         let out = Reporter::new().report(&state, &a);
 
         assert!(
             out.contains("- Refusé : #1700 (hors milestone) — plan groomé absent"),
             "provenance sans priorité : un seul segment entre parenthèses :\n{out}"
+        );
+    }
+
+    /// Cas 19 bis (mika#2699 vol 3) — le second motif de refus arrive dans le
+    /// rapport avec ses deux nombres, et sans avoir rien refondu.
+    ///
+    /// `RefusalReason` était déjà un `enum` pour cette raison : le rapporteur
+    /// n'épelle aucun libellé, il appelle `label()`. Ce test vaut donc autant
+    /// pour le motif que pour cette propriété — s'il faut toucher au rapporteur
+    /// pour ajouter un troisième motif, c'est que quelqu'un a recopié un texte
+    /// ici.
+    #[test]
+    fn mika2699_le_refus_par_la_borne_entre_dans_le_rapport_avec_ses_nombres() {
+        let mut state = state_with(vec![], ProgressCounts::default());
+        state.outside_candidates = vec![PoolCandidate {
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(0),
+            plan_present: true,
+            labels: vec!["p0-critical".into()],
+        }];
+        state.plan_sizes = [(1700, PlanSizeReading::Measured(900))]
+            .into_iter()
+            .collect();
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(
+            &[],
+            &[],
+            &state.outside_candidates,
+            &state.plan_sizes,
+        ));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(
+            out.contains(
+                "- Refusé : #1700 (p0-critical, hors milestone) — estimation 900 lignes \
+                 au-delà de la borne par vol (279) — à découper"
+            ),
+            "le motif de la borne porte les deux nombres et la provenance :\n{out}"
+        );
+    }
+
+    /// Cas 19 ter (mika#2699 vol 3) — une admission dont la taille n'a pas été
+    /// mesurée est **nommée**, avec sa cause.
+    ///
+    /// Sans cette ligne, « À admettre : #1700 » se lit comme « borne vérifiée »,
+    /// puisque c'est ce que le point 2 du ticket promet. L'opérateur n'aurait
+    /// aucun moyen de distinguer un plan dimensionné d'un plan dont personne n'a
+    /// pu lire la taille — et c'est précisément le seuil d'ouverture du vol 4
+    /// (« aucun `ready` mal formé admis en ombre ») qui deviendrait invérifiable.
+    #[test]
+    fn mika2699_une_admission_de_taille_non_mesuree_est_nommee() {
+        let mut state = state_with(vec![], ProgressCounts::default());
+        state.outside_candidates = vec![PoolCandidate {
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(0),
+            plan_present: true,
+            labels: vec!["p0-critical".into()],
+        }];
+        state.plan_sizes = [(1700, PlanSizeReading::Unread(UnreadCause::FetchFailed))]
+            .into_iter()
+            .collect();
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(
+            &[],
+            &[],
+            &state.outside_candidates,
+            &state.plan_sizes,
+        ));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(
+            out.contains("- À admettre : #1700 (p0-critical, hors milestone)"),
+            "la lecture ratée ne refuse pas :\n{out}"
+        );
+        assert!(
+            out.contains(
+                "- Taille non vérifiée : #1700 (p0-critical, hors milestone) — \
+                 plan introuvable au ref de sa branche"
+            ),
+            "…mais elle ne se tait pas, et la cause dit quel geste la corrige :\n{out}"
+        );
+    }
+
+    /// Cas 19 quater (mika#2699 vol 3) — une taille **mesurée** sous la borne ne
+    /// produit aucune ligne.
+    ///
+    /// Contrôle négatif du cas précédent : une ligne « Taille non vérifiée »
+    /// rendue sur chaque admission aurait rendu le cas ci-dessus vert sans rien
+    /// garantir, et aurait appris à l'opérateur à ignorer la ligne.
+    #[test]
+    fn mika2699_une_taille_mesuree_sous_la_borne_ne_dit_rien() {
+        let mut state = state_with(vec![], ProgressCounts::default());
+        state.outside_candidates = vec![PoolCandidate {
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(0),
+            plan_present: true,
+            labels: vec!["p0-critical".into()],
+        }];
+        state.plan_sizes = [(1700, PlanSizeReading::Measured(120))]
+            .into_iter()
+            .collect();
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool(
+            &[],
+            &[],
+            &state.outside_candidates,
+            &state.plan_sizes,
+        ));
+        let out = Reporter::new().report(&state, &a);
+
+        assert!(out.contains("- À admettre : #1700 (p0-critical, hors milestone)"));
+        assert!(
+            !out.contains("Taille non vérifiée"),
+            "un plan mesuré et sous la borne n'a rien à signaler :\n{out}"
         );
     }
 
@@ -1666,7 +1818,7 @@ mod tests {
         let mut state = state_with(vec![], ProgressCounts::default());
         state.outside_read_truncated = Some(true);
         let mut a = empty_assessment();
-        a.pool = Some(assess_pool(&[], &[], &[]));
+        a.pool = Some(assess_pool_sans_tailles(&[], &[], &[]));
         let out = Reporter::new().report(&state, &a);
 
         assert!(
@@ -1697,7 +1849,8 @@ mod tests {
     /// main resterait vert le jour où `name_relief` change d'ordre.
     fn report_with_pool_and_relief(state: &MilestoneState) -> String {
         let cands = milestone_cands(state);
-        let verdict = assess_pool(&state.ready_pool, &cands, &state.outside_candidates);
+        let verdict =
+            assess_pool_sans_tailles(&state.ready_pool, &cands, &state.outside_candidates);
         let relief = name_relief(&verdict, &cands, &state.outside_candidates);
         let mut a = empty_assessment();
         a.pool = Some(verdict);
@@ -1816,7 +1969,7 @@ mod tests {
         );
 
         let mut a = empty_assessment();
-        let verdict = assess_pool(&[], &[], &[]);
+        let verdict = assess_pool_sans_tailles(&[], &[], &[]);
         a.relief = Some(name_relief(&verdict, &[], &[]));
         a.pool = Some(verdict);
         let mesure_vide = Reporter::new().report(&state, &a);

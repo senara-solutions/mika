@@ -79,6 +79,7 @@ impl Assessor {
             &state.ready_pool,
             &milestone_candidates,
             &state.outside_candidates,
+            &state.plan_sizes,
         );
         // La relève dérive du verdict qu'on vient de poser, pas d'un second
         // jugement du bassin (mika#2700 vol 1, décision 1). `relief::name_relief`
@@ -97,7 +98,7 @@ impl Assessor {
             // Phase 1 is read-only, so there is nothing to contend for yet.
             // Populated by the Phase 2 dispatch path (mika#1948).
             contention_events: Vec::new(),
-            // Le verdict du bassin `ready` (mika#2699 Phase 2 (a), vols 1 et 2).
+            // Le verdict du bassin `ready` (mika#2699 Phase 2 (a), vols 1 à 3).
             // `assess_pool` reste pure : tout ce que l'assesseur fait ici est
             // de lui passer les trois lectures et de poser le résultat. Toujours
             // `Some` — un cycle qui arrive ici a lu le bassin, et `None` est
@@ -121,7 +122,13 @@ impl Assessor {
 /// Une projection et rien d'autre : la décision d'admission vit dans
 /// [`pool::assess_pool`], qui est pure. Elle est ici plutôt qu'au reader parce
 /// que `sub_issues` sert à tout le reste de l'assesseur sous sa forme complète.
-fn milestone_pool_candidates(state: &MilestoneState) -> Vec<pool::PoolCandidate> {
+///
+/// `pub(super)` depuis mika#2699 vol 3 : le reader doit désigner les candidats
+/// dont il ira lire le plan, et il doit les désigner **sur la même projection**
+/// que celle que l'assesseur jugera au cycle suivant. Une seconde projection
+/// écrite au reader serait identique aujourd'hui et muette le jour où celle-ci
+/// change — exactement l'écart que le commentaire ci-dessus refuse déjà.
+pub(super) fn milestone_pool_candidates(state: &MilestoneState) -> Vec<pool::PoolCandidate> {
     state.sub_issues.iter().map(Into::into).collect()
 }
 
@@ -358,6 +365,7 @@ mod tests {
             ready_pool: vec![],
             outside_candidates: vec![],
             outside_read_truncated: None,
+            plan_sizes: Default::default(),
         }
     }
 
@@ -731,10 +739,12 @@ mod tests {
                 pool::Admission {
                     number: 1802,
                     origin: pool::CandidateOrigin::Milestone,
+                    size: pool::PlanSizeReading::Unread(pool::UnreadCause::NotMeasured),
                 },
                 pool::Admission {
                     number: 1700,
                     origin: pool::CandidateOrigin::Outside,
+                    size: pool::PlanSizeReading::Unread(pool::UnreadCause::NotMeasured),
                 },
             ],
             "les deux ensembles sont candidats, le milestone d'abord à priorité égale"
@@ -751,6 +761,7 @@ mod tests {
                     .map(pool::PoolCandidate::from)
                     .collect::<Vec<_>>(),
                 &state.outside_candidates,
+                &state.plan_sizes,
             )
         );
     }
