@@ -5704,8 +5704,11 @@ mod tests {
         assert!(json["changed_files_count"].is_null());
     }
 
-    /// Tout label que ce module pose, et tout label par lequel la boucle exclut
-    /// un ticket, doit être déclaré dans `.github/labels.yml`.
+    /// Tout label que ce module pose, et tout label de tenue par lequel la boucle
+    /// exclut un ticket ([`crate::webhook_dispatch::OPERATOR_HELD_LABELS`]), doit
+    /// être déclaré dans `.github/labels.yml`. Les labels de siège `dispatch:*`
+    /// ont leur propre garde, dans les deux sens
+    /// (`scripts/check-dispatch-seats-declared.sh`, mika#2092).
     ///
     /// **La classe de défaut.** `label-sync` tourne avec
     /// `delete-other-labels: true` : un nom que le code emploie mais que ce
