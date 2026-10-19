@@ -276,8 +276,46 @@ def declare_scopes(*entries):
     os.environ[SCOPE_DIR_ENV] = str(SCOPES)
 
 
+def declare_couples(*couples):
+    """One entry per `(repository, ref)` couple — the shape the launcher writes.
+
+    A COUPLE PER ENTRY and never two independent lists, because that is what the
+    reader reads (mika#2776): the repository selects which entries may speak,
+    and only the refs of THOSE entries are allowed. CASE 26 is what makes the
+    distinction visible; this helper is what lets it be written.
+    """
+    names = (SCOPE_ENTRY_A, SCOPE_ENTRY_B, SCOPE_ENTRY_C)
+    declare_scopes(*[
+        (name, f"repo=senara-solutions/{repo}\nref={ref}\n")
+        for name, (repo, ref) in zip(names, couples)
+    ])
+
+
 def declare_repos(*repos):
-    """One entry per repository, the shape the launcher writes."""
+    """One entry per repository, each declaring the branch this suite pushes.
+
+    THE NOMINAL SHAPE SINCE mika#2776: two lines, both dimensions declared. The
+    branch is `BRANCH` — the ref every case below pushes — so a case written for
+    the repository dimension keeps meaning exactly what it meant, and the
+    cases that exercise the branch dimension aim somewhere else on purpose.
+    """
+    declare_repos_as(BRANCH.decode("ascii"), *repos)
+
+
+def declare_repos_as(ref, *repos):
+    """`declare_repos`, for a declared branch that is not this suite's."""
+    declare_couples(*[(repo, ref) for repo in repos])
+
+
+def declare_repos_without_ref(*repos):
+    """The PRE-mika#2776 shape: a `repo=` line and nothing else.
+
+    Not a legacy fixture to retire — the NORMAL state for one window. The host
+    registry survives a deployment, so after the binary that writes `ref=` lands,
+    every entry already in flight was written by the previous one. CASE 25 is
+    what asserts that such an entry stays valid instead of being read as a
+    declaration of the empty branch, which would refuse every push.
+    """
     names = (SCOPE_ENTRY_A, SCOPE_ENTRY_B, SCOPE_ENTRY_C)
     declare_scopes(*[
         (name, f"repo=senara-solutions/{repo}\n")
@@ -604,6 +642,19 @@ bodies = {
     "push-body-unreadable": opaque_body,
 }
 check("11.1 five bodies were really captured", 5, len(bodies))
+# The five captured here are the five of vol 1. The motif TABLE carries two
+# more, one per perimeter dimension, and they are captured where they are
+# produced (CASE 15 and CASE 24). Asserting the table's size here is what makes
+# "seven motifs, seven bodies" a property of the code: an eighth motif added
+# with a copied body would otherwise pass every loop below untouched.
+check("11.2 the motif table carries exactly the seven reasons", 7,
+      len(addon._PUSH_DENY_BODIES))
+raw_bodies = sorted(addon._PUSH_DENY_BODIES)
+for i, left in enumerate(raw_bodies):
+    for right in raw_bodies[i + 1:]:
+        check_true(
+            f"11.w the table's {left} != {right}",
+            addon._PUSH_DENY_BODIES[left] != addon._PUSH_DENY_BODIES[right])
 names = sorted(bodies)
 for i, left in enumerate(names):
     for right in names[i + 1:]:
@@ -781,14 +832,17 @@ check("16.5 a third, undeclared one is refused", 403, status_of(flow))
 check_true("16.6 with the scope motif, naming IT",
            "push-scope-repo" in body_of(flow)
            and "senara-solutions/mika-cloud" in body_of(flow))
-# One entry may carry several keys, and a future flight adds `ref=`: unknown
-# keys are IGNORED on read, which is what makes that addition pure.
+# One entry carries several keys, in any order, and an unknown one is IGNORED
+# on read — which is exactly what made `ref=` a pure addition when mika#2776
+# landed, and what will make the next key one too. The `future-key=` line is
+# the standing proof of that property: it must never be replaced by a key the
+# reader has since learned, or the assertion silently stops asserting anything.
 declare_scopes((SCOPE_ENTRY_A,
-                "ref=refs/heads/feat/2751/whatever\n"
+                f"ref={BRANCH.decode('ascii')}\n"
                 "repo=senara-solutions/mika\n"
                 "future-key=whatever the next flight writes\n"))
 flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
-check("16.7 unknown keys are ignored, the repo= line still authorises",
+check("16.7 unknown keys are ignored, the known lines still authorise",
       200, status_of(flow))
 check("16.8 and the entry is not treated as unreadable", [], degrades_in(err))
 
@@ -859,7 +913,7 @@ check("18.3 with no refusal and no degradation",
 flow, err = run(GIT, PUSH_PATH, b"")
 check("18.4 a zero-length body is not a refusal either", 200, status_of(flow))
 check("18.5 and logs no refusal", [], denies_in(err))
-big_armed = body(cmd(ZERO, SHA_B, b"refs/heads/feat/2751/big"),
+big_armed = body(cmd(ZERO, SHA_B, BRANCH),
                  pack=b"PACK\x00\x00\x00\x02" + os.urandom(400_000))
 flow, err = run(GIT, PUSH_PATH, big_armed)
 check("18.6 a 400 KiB chunked push passes with the tightening armed",
@@ -873,6 +927,23 @@ flow, _ = run(GIT, SIBLING_PATH, FLUSH)
 check("18.9 the same probe to an undeclared repository IS refused",
       403, status_of(flow))
 check_true("18.10 with the scope motif", "push-scope-repo" in body_of(flow))
+# THE BRANCH DIMENSION IS ARMED THROUGHOUT THE SIX POSITIVES ABOVE, and this is
+# what says so (mika#2776). `declare_repos` declares `ref=` as well as `repo=`,
+# so 18.1 to 18.8 are not the branch dimension sleeping — a push to ANOTHER
+# branch of the same declared repository is refused in the same breath.
+flow, _ = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, b"refs/heads/fix/9999/autre")))
+check("18.11 an undeclared BRANCH of the declared repository IS refused",
+      403, status_of(flow))
+check_true("18.12 with the branch motif, not the repository one",
+           "push-scope-ref" in body_of(flow)
+           and "push-scope-repo" not in body_of(flow))
+# And the probe keeps passing right after that refusal: the tightening did not
+# learn to refuse probes by being made to refuse a branch.
+flow, err = run(GIT, PUSH_PATH, FLUSH)
+check("18.13 the probe still passes with the branch dimension biting",
+      200, status_of(flow))
+check("18.14 with no refusal and no degradation",
+      ([], []), (denies_in(err), degrades_in(err)))
 
 print("")
 print("CASE 19 — the switch matrix, and the subordination AS A DECISION")
@@ -932,6 +1003,33 @@ for value in ("1", "", "yes", "garbage"):
     flow, _ = run(GIT, SIBLING_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
     check(f"19.w `{value}` leaves the tightening ARMED (default is armed)",
           403, status_of(flow))
+# THE BRANCH DIMENSION RIDES THE SAME SWITCH (point 3 of mika#2776). Not a
+# second matrix: the SAME four rows, re-read on a push whose repository is
+# declared and whose BRANCH is not. A row that answered differently here would
+# mean the two dimensions had drifted onto two breakers, which is the recourse
+# bigger than the problem the ticket refuses.
+OTHER_BRANCH = b"refs/heads/fix/9999/un-autre-ticket"
+for bound, scope, want, label in (
+    ("1", "1", 403, "both armed: the tightening refuses the foreign branch"),
+    ("1", "0", 200, "tightening off: exactly mika#2736, the branch passes"),
+    ("0", "1", 200, "bound off: the tightening lives UNDER it, so nothing"),
+    ("0", "0", 200, "both off: nothing"),
+):
+    os.environ[BOUND_SWITCH] = bound
+    os.environ[SCOPE_SWITCH] = scope
+    flow, _ = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, OTHER_BRANCH)))
+    check(f"19.v ({bound}, {scope}) {label}", want, status_of(flow))
+# And the switch NAMES, read off the addon rather than off this file: two push
+# switches and no third one. A third name is how a surface stops being
+# understood, and the assertion is on the code so adding one reddens here.
+push_switches = sorted(
+    value for name, value in vars(addon).items()
+    if name.endswith("_SWITCH") and isinstance(value, str) and "PUSH" in value
+)
+check("19.u the addon carries exactly two push switches, no third name",
+      ["MIKA_PILOT_EGRESS_PUSH_BOUND", "MIKA_PILOT_EGRESS_PUSH_SCOPE"],
+      push_switches)
+os.environ[BOUND_SWITCH] = "1"
 # ORTHOGONALITY ACROSS GUARDS (class mika#2165), which is where it is real.
 os.environ[SCOPE_SWITCH] = "0"
 flow, err = run(API, "/graphql", method="POST")
@@ -1042,9 +1140,9 @@ print("CASE 22 — a perimeter purged under a LIVE neighbour REFUSES a legitimat
 # This case asserts that CONSEQUENCE rather than the constant. A test on the
 # constant alone would stay green under any value; this one states what a value
 # too small does, which is why the number is a FLOOR on the longest spawn.
-declare_scopes(
-    (SCOPE_ENTRY_A, "repo=senara-solutions/mika\n"),            # still alive
-    (SCOPE_ENTRY_B, "repo=senara-solutions/mika-platform\n"),   # the neighbour
+declare_couples(
+    ("mika", BRANCH.decode("ascii")),           # the pilot that is still alive
+    ("mika-platform", BRANCH.decode("ascii")),  # the neighbour
 )
 too_old = time.time() - 13 * 3600
 os.utime(SCOPES / SCOPE_ENTRY_A, (too_old, too_old))
@@ -1070,7 +1168,7 @@ check("22.7 and it is a refusal, not a degradation — the neighbour held the "
 # THE OTHER HALF OF THE ASYMMETRY, juxtaposed so the reasoning is on the page:
 # the very same purge, with NO neighbour, costs only a degradation. The
 # neighbour is what turns a purge into a 403.
-declare_scopes((SCOPE_ENTRY_A, "repo=senara-solutions/mika\n"))
+declare_repos("mika")
 os.utime(SCOPES / SCOPE_ENTRY_A, (too_old, too_old))
 addon._last_purge = {}
 flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
@@ -1092,7 +1190,7 @@ flow, err = run(GIT, PUSH_PATH, FLUSH)
 check("23.1 the 4-byte probe passes under a fresh perimeter", 200, status_of(flow))
 check("23.2 and carries the host credential", EXPECTED_BASIC,
       flow.request.headers.get("Authorization"))
-big_ttl = body(cmd(ZERO, SHA_B, b"refs/heads/feat/2766/big"),
+big_ttl = body(cmd(ZERO, SHA_B, BRANCH),
                pack=b"PACK\x00\x00\x00\x02" + os.urandom(400_000))
 flow, err = run(GIT, PUSH_PATH, big_ttl)
 check("23.3 the 400 KiB chunked push passes too", 200, status_of(flow))
@@ -1117,6 +1215,245 @@ check("23.9 and it still carries the host credential", EXPECTED_BASIC,
 addon._last_purge = {}
 forget_scopes()
 
+# ===========================================================================
+# mika#2776 — the BRANCH dimension of the declared perimeter, vol 4
+#
+# What the three cases below close: a pilot dispatched on one ticket could push
+# to `refs/heads/fix/9999/un-autre-ticket` — ANOTHER in-flight dispatch's
+# branch of the SAME repository. Every static rule of mika#2736 is satisfied
+# (the organisation is right, the ref is under refs/heads/, it is neither main
+# nor master) and the declared perimeter judged the repository alone, so
+# nothing stood in the way. Subclass P3 of the threat model, its last open
+# part.
+#
+# CASE 26 is the one that cannot be deduced from the other two: it is the only
+# place where the union being BY ENTRY rather than BY DIMENSION is observable.
+# ===========================================================================
+
+print("")
+print("CASE 24 — another branch of the declared repository: 403 push-scope-ref")
+declare_repos("mika")
+OTHER = b"refs/heads/fix/9999/un-autre-ticket"
+# The anti-vacuity first, as in CASE 14: a branch dimension that refused every
+# ref would read green on every refusal below and redden only here.
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("24.1 the DECLARED branch passes", 200, status_of(flow))
+check("24.2 and still carries the HOST credential", EXPECTED_BASIC,
+      flow.request.headers.get("Authorization"))
+check("24.3 with nothing refused and nothing degraded",
+      ([], []), (denies_in(err), degrades_in(err)))
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, OTHER)))
+check("24.4 another branch of the SAME repository is refused", 403, status_of(flow))
+ref_body = body_of(flow)
+check_true("24.5 the body names the motif in clear", "push-scope-ref" in ref_body)
+check_true("24.6 it names the REF aimed at (client data, not a secret)",
+           "refs/heads/fix/9999/un-autre-ticket" in ref_body)
+check_true("24.7 it names the flight that decided the refusal",
+           "mika#2776" in ref_body)
+check_true("24.8 it names the rollback switch, and the one it does NOT disarm",
+           SCOPE_SWITCH in ref_body and "MIKA_PILOT_EGRESS_PUSH_BOUND" in ref_body)
+check_true("24.9 it names the registry to list, host-side",
+           "pilot-push-scopes" in ref_body)
+check("24.10 exactly one DENY line, naming motif, method and path",
+      [f"[github-proxy] DENY push-scope-ref POST {PUSH_PATH}"], denies_in(err))
+check("24.11 and no degradation line alongside it", [], degrades_in(err))
+check("24.12 the refusal is a text/plain body like the six others",
+      "text/plain; charset=utf-8", ctype_of(flow))
+check_true("24.13 the host credential is stripped from the refused request",
+           flow.request.headers.get("Authorization") is None)
+# THE SEVENTH BODY, and the reason this case exists at all rather than one more
+# subject on `push-scope-repo` (class mika#2205, point 1 of the ticket): the two
+# remedies are DISJOINT — one sends the operator to the worktree's `origin`, the
+# other to the refspec the push resolved — so the two causes must not arrive in
+# the same bytes.
+for other_name, other in (("push-repo-foreign", foreign_body),
+                          ("push-ref-delete", delete_body),
+                          ("push-ref-protected", protected_body),
+                          ("push-ref-exotic", exotic_body),
+                          ("push-body-unreadable", opaque_body),
+                          ("push-scope-repo", scope_body)):
+    check_true(f"24.x push-scope-ref != {other_name}", ref_body != other)
+    check_true(f"24.x push-scope-ref does not name {other_name}",
+               other_name not in ref_body)
+    check_true(f"24.x {other_name} does not name push-scope-ref",
+               "push-scope-ref" not in other)
+check_true("24.14 it carries a remedy, not just a label", len(ref_body) >= 80)
+check_true("24.15 and it points at the REFSPEC, not at the remote — the "
+           "remedy the repository motif already owns",
+           "refspec" in ref_body.lower())
+# Several commands, ONE of them out of perimeter: the refusal names THAT one.
+# A bound judging only the first command is defeated by a harmless command
+# placed in front of it — the same reasoning as CASE 8, under the new motif.
+flow, err = run(GIT, PUSH_PATH,
+                body(cmd(ZERO, SHA_A, BRANCH), cmd(ZERO, SHA_B, OTHER)))
+check("24.16 a multi-command push with one foreign branch is refused",
+      403, status_of(flow))
+check_true("24.17 and the body names THAT branch, not the legitimate one",
+           "refs/heads/fix/9999/un-autre-ticket" in body_of(flow)
+           and BRANCH.decode("ascii") not in body_of(flow))
+# REF CASE IS SIGNIFICANT, and the asymmetry with the repository is deliberate:
+# GitHub is case-insensitive on `owner/repo` (CASE 14.5), git is case-SENSITIVE
+# on refs. `refs/heads/Feat/...` and `refs/heads/feat/...` are two different
+# branches, so lowercasing here would be a LOOSENING of the bound. The prefix
+# keeps its own case on purpose — upper-casing it too would land on
+# `push-ref-exotic` and the case would assert the static bound instead.
+SHOUTED = b"refs/heads/" + BRANCH[len("refs/heads/"):].upper()
+flow, _ = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, SHOUTED)))
+check("24.18 a ref differing only in case is NOT the declared branch",
+      403, status_of(flow))
+check_true("24.19 and it is the branch motif that says so",
+           "push-scope-ref" in body_of(flow))
+# The static bound still bites underneath, exactly as under the repository
+# dimension: no path turns a mika#2736 refusal into an allow.
+flow, _ = run(GIT, PUSH_PATH, body(cmd(SHA_A, SHA_B, b"refs/heads/main")))
+check("24.20 in-perimeter, refs/heads/main is STILL refused", 403, status_of(flow))
+check_true("24.21 by the STATIC motif, not the branch one",
+           "push-ref-protected" in body_of(flow))
+# mika#1949: naming the TARGET is not disclosure; naming the presented
+# justification, or any digest of it, would be.
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, OTHER)),
+                cred=f"Bearer {SENTINEL}")
+combined = err + body_of(flow)
+check_true("24.22 the host token appears nowhere", HOST_TOKEN not in combined)
+check_true("24.23 the presented value appears nowhere", SENTINEL not in combined)
+check_true("24.24 nor its nonce alone", NONCE not in combined)
+for algo in ("md5", "sha1", "sha256"):
+    for label, secret in (("host token", HOST_TOKEN), ("presented value", SENTINEL)):
+        digest = hashlib.new(algo, secret.encode()).hexdigest()
+        check_true(f"24.x no {algo} fingerprint of the {label}",
+                   digest not in combined and digest[:12] not in combined)
+
+print("")
+print("CASE 25 — an entry with NO ref= stays valid (point 2 of the ticket)")
+# NOT a legacy fixture: the NORMAL state for one window. The host registry
+# survives a deployment, so the instant the binary that writes `ref=` lands,
+# every entry already in flight was written by the previous one. Reading such an
+# entry as a declaration of the EMPTY branch would refuse every push of a live
+# pilot — the degradation posture of this channel exists for exactly this.
+declare_repos_without_ref("mika")
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("25.1 the push of a pre-upgrade entry's pilot passes", 200, status_of(flow))
+check("25.2 and still carries the HOST credential", EXPECTED_BASIC,
+      flow.request.headers.get("Authorization"))
+check("25.3 nothing is refused", [], denies_in(err))
+check("25.4 exactly one degradation line, naming the absent dimension",
+      [f"[github-proxy] DEGRADE scope-ref-absent POST {PUSH_PATH}"],
+      degrades_in(err))
+check("25.5 and no other line at all", [], noise_in(err))
+check_true("25.6 the operator probe really greps", "scope-ref-absent" in err)
+# A ref= line present with an EMPTY value reads as absent, and must: an empty
+# declared branch is the one value that would refuse everything.
+declare_scopes((SCOPE_ENTRY_A, "repo=senara-solutions/mika\nref=\n"))
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("25.7 an EMPTY ref= value reads as absent, never as the empty branch",
+      200, status_of(flow))
+check("25.8 and lands on the same degradation", ["scope-ref-absent"],
+      [line.split()[2] for line in degrades_in(err)])
+# THE THREE TOKENS ARE PAIRWISE DISTINCT, and that is the whole point of a third
+# one (mika#2205): three opposite causes, three remedies. `scope-absent` says
+# the dispatch declared nothing, `scope-unreadable` says the host's own
+# bookkeeping is broken, `scope-ref-absent` says a live entry predates this
+# dimension — and the last is not a fault at all.
+tokens = (addon._DEGRADE_SCOPE_ABSENT, addon._DEGRADE_SCOPE_UNREADABLE,
+          addon._DEGRADE_SCOPE_REF_ABSENT)
+check("25.9 three degradation tokens, pairwise distinct", 3, len(set(tokens)))
+check_true("25.10 and all three are recognised as degradations by the caller",
+           set(tokens) == set(addon._PUSH_SCOPE_DEGRADED))
+# THE DEPLOYMENT WINDOW ITSELF, which is the state this whole case exists for:
+# ONE entry written before the upgrade and ONE written after, on the SAME
+# repository, both in flight. The branch dimension degrades — it does not apply
+# to the half it can read and give up on the other. Skipping the ref-less entry
+# and judging against the fresh one alone would 403 the pre-upgrade pilot's
+# legitimate push, which is a 403 on innocent work and the one failure mode able
+# to stop the loop. Fail-open on this channel is not a convenience; it is what
+# makes the window a narrowing instead of an outage.
+declare_scopes(
+    (SCOPE_ENTRY_A, "repo=senara-solutions/mika\n"),                 # pre-upgrade
+    (SCOPE_ENTRY_B, f"repo=senara-solutions/mika\nref={BRANCH.decode('ascii')}\n"),
+)
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, OTHER)))
+check("25.11 a ref-less NEIGHBOUR on the same repository degrades, "
+      "it does not refuse", 200, status_of(flow))
+check("25.12 naming scope-ref-absent",
+      [f"[github-proxy] DEGRADE scope-ref-absent POST {PUSH_PATH}"],
+      degrades_in(err))
+check("25.13 and refuses nothing", [], denies_in(err))
+# The REPOSITORY dimension keeps biting under a ref-less entry: the degradation
+# gives up the branch and nothing else. An entry that disarmed the whole
+# tightening would make the deployment window a hole rather than a narrowing.
+declare_repos_without_ref("mika")
+flow, err = run(GIT, SIBLING_PATH, body(cmd(ZERO, SHA_A, BRANCH)))
+check("25.14 an undeclared REPOSITORY is still refused", 403, status_of(flow))
+check_true("25.15 by the repository motif", "push-scope-repo" in body_of(flow))
+check("25.16 and the degradation is not logged alongside the refusal",
+      [], degrades_in(err))
+# The static bound too, and the two positives of mika#2736 under this mechanism
+# as under every other (point 4): never inherited on trust.
+flow, _ = run(GIT, PUSH_PATH, body(cmd(SHA_A, SHA_B, b"refs/heads/main")))
+check("25.17 refs/heads/main is still refused", 403, status_of(flow))
+check_true("25.18 by the static motif", "push-ref-protected" in body_of(flow))
+flow, err = run(GIT, PUSH_PATH, FLUSH)
+check("25.19 the 4-byte probe passes under a ref-less entry", 200, status_of(flow))
+check("25.20 and does NOT degrade — there is no ref to judge",
+      [], degrades_in(err))
+big_refless = body(cmd(ZERO, SHA_B, BRANCH),
+                   pack=b"PACK\x00\x00\x00\x02" + os.urandom(400_000))
+flow, err = run(GIT, PUSH_PATH, big_refless)
+check("25.21 and the 400 KiB chunked push passes too", 200, status_of(flow))
+check("25.22 with no refusal", [], denies_in(err))
+check_true("25.23 the case is non-vacuous (the body really is large)",
+           len(big_refless) > 300_000)
+
+print("")
+print("CASE 26 — two live entries do NOT cross: the union is by ENTRY")
+# THE CASE THE WHOLE DESIGN TURNS ON, and the only one where a per-dimension
+# union is distinguishable from a per-entry one. With `(mika, feat/A)` and
+# `(mika-platform, fix/B)` both in flight, a flat union — all declared repos on
+# one side, all declared refs on the other — authorises the CROSS PRODUCT, and
+# `mika → fix/B` satisfies both sets. That is the ticket's exact scenario,
+# reopened by the shape of the reader, and it becomes reachable the moment a
+# SECOND dispatch is in flight: the ordinary state of this host, not an edge.
+FEAT_A = "refs/heads/feat/2776/dimension-a"
+FIX_B = "refs/heads/fix/9999/un-autre-ticket-b"
+declare_couples(("mika", FEAT_A), ("mika-platform", FIX_B))
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, FEAT_A.encode())))
+check("26.1 the first couple passes on its OWN branch", 200, status_of(flow))
+check("26.2 with nothing refused and nothing degraded",
+      ([], []), (denies_in(err), degrades_in(err)))
+flow, err = run(GIT, SIBLING_PATH, body(cmd(ZERO, SHA_A, FIX_B.encode())))
+check("26.3 the second couple passes on its own branch too", 200, status_of(flow))
+check("26.4 with nothing refused either", [], denies_in(err))
+# The cross product, refused twice over — once in each direction, because a
+# reader that paired by position rather than by entry would let exactly one of
+# the two through and look right.
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, FIX_B.encode())))
+check("26.5 the repository of A with the branch of B is REFUSED",
+      403, status_of(flow))
+check_true("26.6 by the branch motif, naming the branch of B",
+           "push-scope-ref" in body_of(flow) and FIX_B in body_of(flow))
+check("26.7 and exactly one DENY line",
+      [f"[github-proxy] DENY push-scope-ref POST {PUSH_PATH}"], denies_in(err))
+flow, _ = run(GIT, SIBLING_PATH, body(cmd(ZERO, SHA_A, FEAT_A.encode())))
+check("26.8 and the repository of B with the branch of A, symmetrically",
+      403, status_of(flow))
+check_true("26.9 also by the branch motif", "push-scope-ref" in body_of(flow))
+# A repository declared TWICE, by two spawns on two branches: both branches
+# pass, which is the union doing its job. The entries are read as a LIST and not
+# as a mapping, so a second dispatch on the same repository never shadows the
+# first — that shadowing would 403 a live pilot.
+declare_couples(("mika", FEAT_A), ("mika", FIX_B))
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, FEAT_A.encode())))
+check("26.10 the first of two spawns on one repository passes", 200, status_of(flow))
+flow, err = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, FIX_B.encode())))
+check("26.11 and so does the second — no entry shadows the other",
+      200, status_of(flow))
+check("26.12 with nothing refused", [], denies_in(err))
+flow, _ = run(GIT, PUSH_PATH, body(cmd(ZERO, SHA_A, b"refs/heads/feat/0000/third")))
+check("26.13 while a third, undeclared branch is still refused",
+      403, status_of(flow))
+check_true("26.14 by the branch motif", "push-scope-ref" in body_of(flow))
+forget_scopes()
+
 print("")
 print(f"TOTAL failures: {failures}")
 sys.exit(1 if failures else 0)
@@ -1130,8 +1467,8 @@ cat "$PY_OUT"
 # floor). Both must be caught — an `exit 0` after three assertions reads
 # exactly like a clean tree (class mika#2205).
 asserted=$(grep -c '^RESULT ' "$PY_OUT" || true)
-rc=1; [ "${asserted:-0}" -ge 273 ] && rc=0
-assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 273)" "0" "$rc"
+rc=1; [ "${asserted:-0}" -ge 404 ] && rc=0
+assert_eq "anti-vacuity: the python half really asserted ($asserted assertions >= 404)" "0" "$rc"
 assert_eq "every addon-level assertion passes" "0" "$py_rc"
 
 echo ""

@@ -12,6 +12,8 @@ symptoms:
   - "la forme proposée par le corps du ticket — un en-tête dédié `X-Mika-Egress-Sentinel` — n'est pas implémentable sans un shim `gh` sur le PATH"
   - "sur `github.com` aucun justificatif ne peut voyager, donc la moitié `git push` semble hors d'atteinte — alors que le proxy voit déjà le dépôt et les refs (mika#2736)"
   - "une entrée de périmètre survit à son pilote, donc la force du garde dépend de l'heure ; et la purger trop tôt refuse le push d'un pilote vif sous un voisin vif (mika#2766)"
+  - "un pilote pousse sur la branche d'un autre dispatch du même dépôt : les quatre règles statiques sont satisfaites et le périmètre déclaré ne juge que le dépôt (mika#2776)"
+  - "sur deux dimensions, « l'union des périmètres en vol » a deux lectures — par dimension elle autorise le produit cartésien et se lit resserrée sans rien resserrer (mika#2776)"
 root_cause: design_decision
 resolution_type: design_decision
 related_components:
@@ -28,6 +30,7 @@ tags:
   - receive-pack
   - entry-lifecycle
   - ttl
+  - scope-dimensions
 ticket: mika#2716
 ---
 
@@ -39,8 +42,9 @@ présente un justificatif d'egress, et l'addon l'exige — et ce qu'elle pousse 
 borné (mika#2716, mika#2724, mika#2736)*. Ce document garde seulement le
 raisonnement de **choix du canal**, qui se transpose à toute attestation posée
 devant un proxy qui réécrit les requêtes — depuis mika#2736, la question qui
-vient quand aucun canal ne convient, et depuis mika#2766, comment se choisit la
-durée de vie de ce qui voyage dans ce canal.
+vient quand aucun canal ne convient, depuis mika#2766, comment se choisit la
+durée de vie de ce qui voyage dans ce canal, et depuis mika#2776, ce qu'on doit
+redire d'une union de déclarations dès qu'elle porte sur **deux** dimensions.
 
 ## Le problème
 
@@ -365,14 +369,20 @@ d'ajouter une dimension à un périmètre lu par union :
 
 **D'où l'ordre des vols, et c'est l'ordre que ce tableau impose.** La dimension
 dépôt est livrée par mika#2751, parce qu'elle est la seule des deux qui soit
-livrable **seule**. Le **cycle de vie** suit (mika#2766, § ci-dessous), et la
-dimension **branche** vient après lui (senara-solutions/mika#2776). L'ordre
-inverse — `ref=` d'abord — aurait donné un garde qui se desserre tout seul au
-fil de la journée, et dont la force dépendrait de l'heure : exactement la forme
-d'un garde dont on ne peut rien conclure. Un resserrement dont la valeur est
-conditionnée par un mécanisme qui n'existe pas encore attend ce mécanisme ; ce
-n'est pas une précaution de style, c'est que la mesure de sa force est
-indisponible avant.
+livrable **seule**. Le **cycle de vie** a suivi (mika#2766, § ci-dessous), et la
+dimension **branche** est arrivée après lui (mika#2776, § *La dimension branche*
+plus bas). L'ordre inverse — `ref=` d'abord — aurait donné un garde qui se
+desserre tout seul au fil de la journée, et dont la force dépendrait de l'heure :
+exactement la forme d'un garde dont on ne peut rien conclure. Un resserrement
+dont la valeur est conditionnée par un mécanisme qui n'existe pas encore attend
+ce mécanisme ; ce n'est pas une précaution de style, c'est que la mesure de sa
+force est indisponible avant.
+
+**Et ce tableau ne dit pas tout de l'union, ce qu'on n'a vu qu'en ajoutant la
+seconde dimension.** Il compare la **cardinalité** de l'union par dimension, et
+c'est ce qui a ordonné les vols. Mais sur deux dimensions la phrase « le verdict
+porte sur l'union des périmètres en vol » cesse d'avoir **un** sens — elle en a
+deux, et un seul est juste. C'est le § *L'union porte sur les entrées* du vol 4.
 
 **Une propriété rassurante tombe de l'union, et il faut la nommer parce qu'elle
 gouverne la lecture des incidents : une entrée de plus ne peut qu'ÉLARGIR
@@ -417,10 +427,11 @@ soit**. C'est une propriété de la **structure**, pas une invariante à revéri
 confiée à la vigilance d'un relecteur.
 
 Le détail opérateur de cette moitié — registre, format `clé=valeur`, le sixième
-motif `push-scope-repo`, les deux jetons de dégradation et leurs remèdes
-distincts, la matrice des deux interrupteurs, la sonde `grep 'DEGRADE scope-'` —
-vit à l'entrée `MIKA_PILOT_EGRESS_PUSH_SCOPE` de
-`docs/operator/environment-variables.md`.
+motif `push-scope-repo`, ses jetons de dégradation et leurs remèdes distincts,
+la matrice des deux interrupteurs, la sonde `grep 'DEGRADE scope-'` — vit à
+l'entrée `MIKA_PILOT_EGRESS_PUSH_SCOPE` de
+`docs/operator/environment-variables.md`, où le vol 4 a ajouté le septième motif
+et le troisième jeton.
 
 ## Une entrée de périmètre meurt avec son spawn, et son TTL est un PLANCHER (mika#2766)
 
@@ -510,6 +521,228 @@ désinscription échoue, et l'avertissement sur le vidage à la main sous un
 dispatch en vol — vit à la même entrée
 `MIKA_PILOT_EGRESS_PUSH_SCOPE` de `docs/operator/environment-variables.md`.
 
+## La dimension branche, et ce qu'ajouter une seconde dimension a appris (mika#2776)
+
+Le vol 4, qui ferme la sous-classe P3. Avant lui, un pilote dispatché sur
+`feat/2766/…` pouvait pousser sur `refs/heads/fix/9999/un-autre-ticket` — la
+branche d'un **autre** dispatch du même dépôt, éventuellement en vol — sans que
+rien ne s'y oppose : le dépôt est celui que l'hôte a déclaré pour lui, la ref est
+bien sous `refs/heads/`, et ce n'est ni `main` ni `master`. Les quatre règles
+statiques de mika#2736 sont satisfaites, et le périmètre déclaré ne jugeait que
+le dépôt.
+
+Le mécanisme est une addition pure : une seconde ligne `ref=refs/heads/<branche
+du dispatch>` dans l'entrée, un septième motif `push-scope-ref`, et un troisième
+jeton de dégradation `scope-ref-absent`. Rien n'a été retiré ni déplacé. Ce qui
+suit est ce qu'on n'apprend qu'en ajoutant une **seconde** dimension à un
+périmètre déjà en service.
+
+### L'union porte sur les ENTRÉES, pas sur les dimensions — et sur une seule dimension la question ne se pose pas
+
+Le fait le moins évident de ce vol, et celui qui décide la conception. Le § *Le
+lecteur partagé ne peut pas attribuer une requête à un spawn* établit que le
+verdict porte sur l'**union des périmètres en vol**. Sur une seule dimension,
+cette phrase est sans ambiguïté. Sur deux, elle se lit de deux façons, et elles
+ne valent pas la même chose.
+
+Deux dispatches concurrents, A sur `mika` / `feat/2776/branche`, B sur
+`mika-platform` / `fix/9999/autre` :
+
+| lecture | ce qu'elle autorise | verdict sur un push `mika` → `refs/heads/fix/9999/autre` |
+|---|---|---|
+| **par dimension** — union plate, `{mika, mika-platform} × {feat/2776/branche, fix/9999/autre}` | 4 couples, dont **2 que personne n'a déclarés** | **ALLOW** |
+| **par entrée** — une entrée *est* un couple | 2 couples, exactement ceux déclarés | **DENY `push-scope-ref`** |
+
+La lecture par dimension laisse donc ouvert **exactement le scénario que le vol
+devait fermer**, dès qu'un second dispatch existe — c'est-à-dire dans l'état
+normal d'un hôte de boucle. Elle ne resserrerait que l'hôte à un seul dispatch,
+qui est le cas où le resserrement importe le moins. Elle se lit « resserré » et
+ne resserre rien.
+
+Le coût de la lecture juste est de **trois lignes** : le lecteur fait déjà un
+seul balayage du répertoire, il suffit qu'il rende des couples au lieu de deux
+ensembles plats (`_push_scope_repos()` → `_push_scope_entries()`, rendant
+`list[tuple[str, str | None]]`). Il n'y avait donc pas d'arbitrage, il y avait
+une lecture juste et une lecture fausse.
+
+**Et ça impose une propriété au producteur, pas seulement au lecteur.** Les deux
+lignes doivent voyager dans la **même** entrée, écrites par la **même**
+redirection. Un lanceur qui éclaterait les deux dimensions d'un spawn sur deux
+entrées rouvrirait le produit cartésien depuis l'autre bout, avec un lecteur
+parfaitement correct. C'est `test_egress_push_scope_staging.sh` CASE 13 qui
+l'asserte, et c'est le seul endroit qui le fait.
+
+> **La leçon à réemployer : « l'union des déclarations vives » n'est une
+> spécification que sur UNE dimension.** Dès la seconde, il faut dire si l'objet
+> unionné est la dimension ou le tuple — et l'assertion qui défend la réponse
+> n'est pas un test sur la structure de données, c'est le cas du croisement
+> (CASE 26). Le jour où quelqu'un remet une union plate « pour simplifier », un
+> test de structure le laisse passer et le cas du croisement rougit avec le
+> scénario.
+
+### Pourquoi la dimension branche remet en jeu la sonde de 4 octets, alors que la dimension dépôt ne le pouvait pas
+
+Le vol 1 avait identifié le seul mode de défaillance capable d'**arrêter la
+boucle** : un garde qui 403 le POST de sonde d'authentification de 4 octets
+refuse du même coup tout push assez gros pour être streamé. Les deux cas
+positifs qui l'épinglent voyagent donc sous chaque mécanisme ajouté à cette
+surface, jamais hérités sur parole.
+
+Pour la dimension **dépôt**, ce n'était qu'une discipline : le dépôt vient de
+l'**URL**, donc le resserrement ne distingue structurellement pas une sonde d'un
+push, et il n'y avait rien à craindre. Pour la dimension **branche**, la
+propriété tombe : les refs viennent du **corps**, et une sonde d'authentification
+n'en porte aucune. La liste de refs d'une sonde est **vide**.
+
+Un verdict formulé comme « au moins une ref du push est dans le périmètre »
+refuserait donc la liste vide, donc la sonde, donc tout push streamé. D'où
+l'ordre des lignes du verdict, qui n'est pas cosmétique :
+
+```python
+if not declared:                        return _DENY_SCOPE_REPO, repo
+if not refs:                            return _ALLOW, ""   # la sonde de 4 octets
+if any(ref is None for ref in declared): return _DEGRADE_SCOPE_REF_ABSENT, ""
+```
+
+`if not refs` passe **avant tout jugement de branche**, et c'est la seule ligne
+de ce verdict dont l'inversion arrête la boucle autonome.
+
+> **La leçon : une propriété « structurellement impossible à violer » l'est par
+> rapport à UN mécanisme, pas à une surface.** Le vol 2 pouvait démontrer que son
+> resserrement ne touchait pas les sondes ; le vol 4, sur la même surface et avec
+> le même interrupteur, ne pouvait plus. Ce qui rendait la démonstration valide
+> était « le datum vient de l'URL » — et c'est précisément ce qui a changé.
+> D'où la règle de forme qui a tenu les quatre vols : les deux positifs sont
+> réassertés **sous chaque mécanisme**, et le vol qui les hérite est le vol qui
+> les perd.
+
+### Un `ref=` à valeur vide serait pire que son absence
+
+`BRANCH` est vide en dispatch free-text et en dispatch de milestone, exactement
+là où `REPO` l'est. La tentation est d'écrire la ligne quand même. Elle est
+fausse dans la direction qui compte : le lecteur verrait une branche **déclarée**,
+ne la retrouverait dans aucun push, et refuserait **tout** push de ce dispatch —
+un 403 sur le travail légitime, le mode de défaillance qui arrête la boucle.
+
+La ligne n'est donc pas écrite du tout, l'entrée reste **valide** avec son
+`repo=` seul, et la dimension dépôt mord toujours. Deux corollaires :
+
+- le lecteur traite une ligne `ref=` **à valeur vide** comme **absente** (`None`),
+  et non comme une ref nommée « » : la posture fail-open du canal, appliquée à une
+  entrée qu'un producteur futur écrirait mal ;
+- un `BRANCH` déjà préfixé `refs/` tombe dans la même catégorie —
+  `ref=refs/heads/refs/heads/…` ne nomme aucune ref existante, donc refuse tout.
+  Même conséquence que la valeur vide, même remède : ne pas écrire la ligne.
+
+**Et un troisième cas, qui n'est pas une dégradation mais un garde.** Le format
+est `clé=valeur` **par ligne**. Un `BRANCH` portant un saut de ligne injecte donc
+une ligne dans le registre — c'est-à-dire permet d'écrire un `repo=` arbitraire,
+donc d'**élargir** le périmètre par le canal censé le resserrer. C'est de la
+classe accident (`scripts/derive-branch-name` est l'unique producteur et rend un
+slug), et elle se ferme pour une ligne de `case` : un nom hors
+`[A-Za-z0-9._/-]` ne produit aucune ligne. Un garde qui s'écrit en une ligne et
+qui ferme un desserrement n'a pas d'arbitrage à subir. `CASE 14` du producteur
+l'asserte sur le **nombre de lignes** de l'entrée, pas sur une sous-chaîne —
+chercher l'absence d'une sous-chaîne dans un fichier qu'on vient d'écrire ne dit
+rien de ce qui s'y est ajouté ailleurs.
+
+Les trois cas écrivent **trois phrases différentes** sur le `stderr` du dispatch,
+et aucune n'est celle de `REPO` vide : celle-là dit « aucun périmètre déclaré »,
+ces trois-là disent « périmètre déclaré, une dimension sur deux ». Quatre états,
+quatre messages (classe mika#2205).
+
+### Une entrée sans `ref=` est l'état NOMINAL pendant une fenêtre, pas une anomalie
+
+Le registre de l'hôte survit au `make deploy`. Une entrée écrite par le binaire
+précédent est donc là, légitimement, le temps que les spawns en vol se terminent
+— au plus tard 12 h, par le TTL du vol 3. Le lecteur ne la refuse pas et ne la
+jette pas : `ref is None` ⇒ aucun resserrement de branche.
+
+Ce qui devait être écrit, c'est l'**observabilité** de cet état. Sans elle, « le
+resserrement de branche ne mord jamais » et « il mord » rendent les mêmes octets :
+des pushes qui passent, et zéro ligne. D'où le troisième jeton, et trois causes
+**opposées** pour trois remèdes : `scope-unreadable` envoie l'opérateur sur la
+comptabilité de l'hôte, `scope-absent` sur le lanceur qui n'a rien déclaré,
+`scope-ref-absent` sur la **fenêtre de déploiement** — dont le remède nominal est
+« attendre », c'est-à-dire aucun remède, ce qu'il faut savoir **avant** de
+chercher.
+
+Le jeton n'est émis que s'il y a au moins une ref à juger, sans quoi chaque sonde
+de 4 octets porterait une ligne de dégradation.
+
+**Et c'est la raison pour laquelle la forme rétrocompatible vit dans la RÈGLE et
+jamais dans une allowlist.** Une exception nommée pour « entrée sans `ref=` »
+serait stale par construction : elle réapparaît à chaque déploiement. Le registre
+étant éphémère, il n'existait d'ailleurs aucun corpus à faire entrer par la
+bande — mesuré avant déploiement plutôt qu'espéré.
+
+### La comparaison des refs est sensible à la casse, et la symétrie avec le dépôt serait un desserrement
+
+`repo=` est normalisé comme l'URL l'est — minuscules, suffixe `.git` retiré —
+parce que GitHub est insensible à la casse sur `owner/repo` et qu'une comparaison
+sensible refuserait un push légitime sur une majuscule.
+
+`ref=` ne l'est **pas**. Git est sensible à la casse sur les refs :
+`refs/heads/feat/2776/Dimension` et `refs/heads/feat/2776/dimension` sont deux
+branches. Minusculiser ici ferait de deux refs distinctes une seule — un
+**desserrement** déguisé en symétrie avec le voisin de la ligne du dessus.
+
+L'arbitrage que ça assume : un dispatch dont la branche changerait **en cours de
+vol** verrait son push refusé. Accepté, parce que `BRANCH` est dérivé une seule
+fois par `_set_up_worktree` et que le spawn qui pousse est celui qui a déclaré —
+le cas demanderait un changement de branche **à l'intérieur** du spawn, ce
+qu'aucun chemin de dispatch ne fait. Le remède, s'il survenait, est le rollback
+nommé, pas un assouplissement de la comparaison.
+
+### La réparation du canari, qui est la même que celle du vol 2 et pour la même raison
+
+Le canari assignait `REPO` depuis le vol 2 mais **pas** `BRANCH`, et la ref que
+ses sondes poussent était codée en dur. Une fois `ref=` armé, son entrée ne
+portait donc pas de `ref=`, le lecteur dégradait, et `push_bound_nominal` restait
+**vert par accident** — mot pour mot le défaut que le bloc mika#2751 du canari
+décrivait déjà pour la dimension dépôt.
+
+La gravité n'est pas la ligne nominale : c'est qu'**aucune** sonde en vol du
+resserrement de branche n'aurait existé. Les deux suites sont hors ligne par
+construction (`mitmproxy` n'est pas une dépendance de test de ce dépôt, mesuré au
+vol 1), donc l'absence de sonde ici est une absence **totale**, pas une
+redondance en moins. Le jour où la dimension branche cesse silencieusement de
+mordre, rien ne l'aurait dit.
+
+Le canari déclare donc `BRANCH` à la ref que ses sondes poussent — ce qui rend sa
+nominale verte **par décision** — et porte une sonde `push_scope_ref` : le dépôt
+qu'il a déclaré, sur une branche qu'il n'a pas déclarée. Les quatre règles
+statiques sont satisfaites, la dimension dépôt aussi, donc la dimension branche
+est la **seule** chose qui peut la refuser. Sa ref porte `2776` pour la même
+raison que le dépôt du vol 2 portait `2751` : aucun dispatch réel ne peut la
+déclarer. Et `push-scope-ref` entre dans la table des motifs reconnus du canari,
+parce qu'une sonde qui attend un motif doit pouvoir **rapporter** n'importe quel
+autre — un motif absent de la table se lit « aucun refus », et c'est la direction
+qui cache un resserrement tombé.
+
+### Un seul interrupteur pour les deux dimensions, et c'est une décision
+
+`MIKA_PILOT_EGRESS_PUSH_SCOPE=0` rend mika#2736 **exactement** : les deux
+dimensions tombent ensemble. Un troisième nom sur cette surface serait un recours
+plus gros que le problème — un opérateur qui veut « rendre mika#2736 » cherche un
+interrupteur, pas une matrice. Et un interrupteur par dimension signifierait deux
+lecteurs, qui divergeront le jour où ça compte (classe mika#2165). Le lanceur
+reste à **zéro lecteur** de celui-ci, compté structurellement par le CASE 6 du
+producteur ; la ligne `ref=` est donc écrite **inconditionnellement**, pour la
+même raison que `repo=` : un nom de branche n'est pas un secret.
+
+### Ce que ce vol ne ferme pas, et qui reste vrai mot pour mot
+
+Le § *P4 — le force-push* ci-dessus n'est pas affecté. Resserrer la branche change
+la **ref visée**, jamais la **nature** de la mise à jour : `receive-pack` ne porte
+aucun drapeau de force, et la ref devenant la bonne ne rend pas visible qu'elle
+est réécrite. P4 reste hors d'atteinte côté proxy pour une raison de protocole.
+
+Le détail opérateur de cette moitié — le septième motif et son remède distinct, le
+troisième jeton, les trois dégradations de branche du lanceur et la cinquième
+ligne de la table du canari — vit à l'entrée `MIKA_PILOT_EGRESS_PUSH_SCOPE` de
+`docs/operator/environment-variables.md`.
+
 ## Le schéma que `gh` émet, capturé sur le fil
 
 Le grooming du vol 2 avait mesuré que **les deux** chaînes de format `Bearer %s`
@@ -595,3 +828,33 @@ valeur reste vert sous n'importe quelle valeur.** Ce qui défend un plancher,
 c'est un cas qui asserte le **coût de la mauvaise direction** — ici qu'une
 entrée purgée sous un voisin vif refuse un push légitime. C'est la différence
 entre un nombre vérifiable et un nombre décrété.
+
+### La quatrième leçon, payée par mika#2776
+
+Les trois premières portent sur **où** poser un garde, sur **quand** conclure
+qu'il n'y a pas de place, et sur la **valeur** qu'on met dedans. La quatrième
+porte sur ce qui arrive à une spécification quand on lui **ajoute une
+dimension** :
+
+> **Une spécification qui agrège (« l'union des déclarations vives ») n'a de sens
+> univoque que sur UNE dimension. À la seconde, elle en a deux — et la lecture
+> qui agrège par dimension autorise le produit cartésien, donc se lit resserrée
+> sans resserrer.**
+
+Rien dans la phrase ne change quand la seconde dimension arrive, et c'est tout
+le piège : elle reste littéralement vraie, elle cesse d'être une
+spécification. La relire comme déjà tranchée est le réflexe à casser. Deux
+corollaires, mesurés ici :
+
+- **la réponse contraint le producteur autant que le lecteur.** Un lecteur qui
+  unionne correctement des tuples est désarmé par un producteur qui éclate les
+  dimensions d'un même objet sur deux déclarations. La propriété « les deux
+  lignes dans la même entrée » est donc du contrat, pas de la mise en forme — et
+  elle veut son propre cas (§ *L'union porte sur les entrées*) ;
+- **une propriété démontrée « structurellement impossible à violer » l'est par
+  rapport à un mécanisme, jamais à une surface.** Le vol 2 pouvait prouver que
+  son resserrement ne touchait pas les sondes d'authentification, parce que son
+  datum venait de l'URL. Le vol 4, même surface et même interrupteur, ne pouvait
+  plus : le sien vient du corps, qu'une sonde n'a pas. D'où la règle qui a tenu
+  les quatre vols — les cas positifs critiques sont **réassertés sous chaque
+  mécanisme**, et le vol qui les hérite sur parole est celui qui les perd.

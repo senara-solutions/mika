@@ -504,7 +504,8 @@ _DENY_REF_PROTECTED = "push-ref-protected"
 _DENY_PUSH_OPAQUE = "push-body-unreadable"
 
 # ---------------------------------------------------------------------------
-# THE DECLARED PERIMETER (mika#2751, vol 2 of mika#2736)
+# THE DECLARED PERIMETER (mika#2751 for the repository, mika#2776 for the branch
+# — vols 2 and 4 of mika#2736)
 #
 # The bound above is static: it authorises `refs/heads/<anything>` under
 # `senara-solutions/<any repo>`. So a pilot dispatched on one ticket may still
@@ -528,9 +529,19 @@ _DENY_PUSH_OPAQUE = "push-body-unreadable"
 # THIS spawn's entry". For the repository dimension that is cheap: a pilot has
 # exactly one possible `origin` (one parent `.git` is bind-mounted, § 2.3) and
 # `DISPATCHABLE_REPO_BASENAMES` holds four names, so the union can never exceed
-# four repos and is insensitive to the TTL. The BRANCH dimension is unbounded
-# under the same semantics, which is why it is a separate flight and not an
-# omission.
+# four repos and is insensitive to the TTL.
+#
+# THE UNION IS BY ENTRY, NOT BY DIMENSION (mika#2776). The branch dimension
+# makes that distinction load-bearing where the repository dimension alone could
+# not show it. A per-dimension union — the set of all declared repos, the set of
+# all declared refs, judged independently — would authorise the CROSS PRODUCT:
+# with `(mika, feat/A)` and `(mika-platform, fix/B)` both in flight, a push of
+# `mika → fix/B` satisfies both sets and lands, which is the exact scenario the
+# ticket opens on. So an entry is read as a COUPLE, the repository selects which
+# couples may speak, and only the refs of THOSE couples are allowed. The union
+# over branches is still unbounded in cardinality — one more name per live
+# dispatch — which is why the branch dimension was worth nothing until the
+# entries learned to die with their spawn (mika#2766), and why it ships after.
 #
 # DEGRADATION, not refusal, on every failure of this channel — the exact
 # opposite posture to the sentinel's, deliberately. The sentinel answers "is
@@ -543,30 +554,47 @@ _DENY_PUSH_OPAQUE = "push-body-unreadable"
 
 _DENY_SCOPE_REPO = "push-scope-repo"
 
-# Not a refusal: an ALLOW that says why the tightening did not apply. Two
-# distinct tokens for two OPPOSITE causes (mika#2205) — absent is a dispatch
+# The branch dimension's own motif, distinct from the repository's by
+# requirement and not by taste (mika#2205, point 1 of mika#2776): the two
+# refusals have DISJOINT remedies — one sends the operator to the worktree's
+# `origin`, the other to the refspec the push resolved — so arriving in the same
+# bytes would make them undiagnosable at the moment they decide what to do.
+_DENY_SCOPE_REF = "push-scope-ref"
+
+# Not a refusal: an ALLOW that says why the tightening did not apply. Three
+# distinct tokens for three OPPOSITE causes (mika#2205) — absent is a dispatch
 # that declared nothing (free-text mode, or a launcher that fail-opened),
-# unreadable is the host's own bookkeeping — and they name two different
-# remedies.
+# unreadable is the host's own bookkeeping, ref-absent is a live entry written
+# by a binary that predates the branch dimension — and they name three
+# different remedies. The third one in particular must NOT read as a fault: the
+# host registry survives a deployment, so an entry without `ref=` is the normal
+# state for one window after the upgrade (point 2 of mika#2776), and the only
+# correct response is to keep applying the repository dimension and say so.
 _DEGRADE_SCOPE_ABSENT = "scope-absent"
 _DEGRADE_SCOPE_UNREADABLE = "scope-unreadable"
-_PUSH_SCOPE_DEGRADED = frozenset({_DEGRADE_SCOPE_ABSENT, _DEGRADE_SCOPE_UNREADABLE})
+_DEGRADE_SCOPE_REF_ABSENT = "scope-ref-absent"
+_PUSH_SCOPE_DEGRADED = frozenset(
+    {_DEGRADE_SCOPE_ABSENT, _DEGRADE_SCOPE_UNREADABLE, _DEGRADE_SCOPE_REF_ABSENT}
+)
 
 # Its own switch, subordinate to `_PUSH_BOUND_SWITCH` and never a substitute
 # for it: point 3 of the ticket asks that the TIGHTENING be disarmable without
 # disarming the static bound. The converse is deliberately impossible — see
-# `_push_scope_verdict`.
+# `_push_scope_verdict`. ONE switch for the WHOLE tightening, both dimensions
+# together: point 3 of mika#2776 refuses a third name on this surface, because
+# a recourse bigger than the problem is how a surface stops being understood.
 _PUSH_SCOPE_SWITCH = "MIKA_PILOT_EGRESS_PUSH_SCOPE"
 _PUSH_SCOPE_DIR_ENV = "_PILOT_EGRESS_PUSH_SCOPE_DIR"
 
-# `key=value` lines. This flight writes exactly one key. Unknown keys are
-# IGNORED on read, which makes the `ref=` of the branch flight a pure addition
-# with no migration and no second reader to update.
+# `key=value` lines, two keys today. Unknown keys are IGNORED on read, which is
+# what made `ref=` a pure addition when the branch dimension landed: no
+# migration, no format version, and no second reader to update.
 _PUSH_SCOPE_REPO_KEY = "repo="
+_PUSH_SCOPE_REF_KEY = "ref="
 
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 
-# Five reasons, five bodies, and no body names another's motif — the remedies
+# Seven reasons, seven bodies, and no body names another's motif — the remedies
 # are disjoint, so a shared body would make the difference undiagnosable at the
 # moment it decides what to do (mika#2205, the same reasoning as the three
 # sentinel bodies above). `{subject}` is the offending repository or ref: that
@@ -649,12 +677,36 @@ _PUSH_DENY_BODIES = {
         "`origin` URL of the worktree. The rollback below disarms this\n"
         "tightening alone and leaves the organisation bound in place.\n"
     ),
+    _DENY_SCOPE_REF: (
+        "This push targets a branch the dispatch did not declare: {subject}\n"
+        "\n"
+        "The REPOSITORY is one the dispatch declared, so the repository\n"
+        "dimension of the perimeter let it through -- but no live entry naming\n"
+        "that repository declares this ref. The case this closes is a push onto\n"
+        "ANOTHER in-flight dispatch's branch of the same repository: the\n"
+        "organisation is right, the ref is an ordinary branch under\n"
+        "`" + _PUSH_REF_PREFIX + "`, and it is neither `main` nor `master`, so\n"
+        "every static rule is satisfied and only the declared branch can refuse\n"
+        "it.\n"
+        "\n"
+        "Remedy: this is a REFSPEC fault, not a remote fault -- look at what\n"
+        "resolved the branch name at the push site, not at the `origin` URL.\n"
+        "Check which branch the dispatch declared, host-side, by listing\n"
+        "~/.mika/pilot-push-scopes/ (one file per live spawn, each a `repo=`\n"
+        "line and, since mika#2776, a `ref=` line). An entry with no `ref=` at\n"
+        "all declares no branch and cannot produce this refusal: it degrades to\n"
+        "the repository dimension instead. The rollback below disarms this\n"
+        "tightening alone and leaves the organisation bound in place.\n"
+    ),
 }
 
 # Which ticket each motif belongs to. Named per motif rather than hardcoded,
 # so a refused operator lands on the flight that decided the refusal and not on
 # whichever one happened to write the formatting.
-_PUSH_DENY_TICKETS = {_DENY_SCOPE_REPO: "mika#2751"}
+_PUSH_DENY_TICKETS = {
+    _DENY_SCOPE_REPO: "mika#2751",
+    _DENY_SCOPE_REF: "mika#2776",
+}
 _PUSH_DENY_DEFAULT_TICKET = "mika#2736"
 
 _PUSH_DENY_FOOTER = (
@@ -662,7 +714,11 @@ _PUSH_DENY_FOOTER = (
     "environment of the mitmdump process. It leaves the api.github.com refusal\n"
     "of mika#2724 and the host-side credential injection of mika#2056 intact.\n"
     + _PUSH_SCOPE_SWITCH + "=0 disarms the declared-perimeter tightening of\n"
-    "mika#2751 only, leaving the organisation bound above armed.\n"
+    "mika#2751 only, leaving the organisation bound above armed. It disarms\n"
+    "BOTH of its dimensions together -- the repository and the branch of\n"
+    "mika#2776 -- because the perimeter is one rule read from one registry, and\n"
+    "a second switch on this surface would be a recourse bigger than the\n"
+    "problem.\n"
 )
 
 
@@ -840,25 +896,42 @@ def _push_scope_dir() -> Path:
     return Path.home() / ".mika" / "pilot-push-scopes"
 
 
-def _push_scope_repos() -> frozenset[str] | None:
-    """The repositories some live dispatch declares, or None if unreadable.
+def _push_scope_entries() -> list[tuple[str, str | None]] | None:
+    """The `(repository, ref)` couples live dispatches declare, or None.
+
+    ONE COUPLE PER ENTRY, never two independent sets (mika#2776). A flat
+    per-dimension union would authorise the cross product — see THE UNION IS BY
+    ENTRY above — so the pairing is the whole point of the return type, and a
+    list rather than a set because two spawns on the same couple are not an
+    error to deduplicate away.
 
     None — and ONLY None — means the registry could not be read at all:
     directory absent, not a directory, any OSError. A registry that IS readable
-    but declares no `repo=` returns an empty frozenset, which is a DIFFERENT
-    state and lands on a different stderr token and a different remedy
-    (mika#2205). Both degrade to the static bound; conflating them would name
-    the wrong fault on the day it matters.
+    but declares no `repo=` returns an empty list, which is a DIFFERENT state
+    and lands on a different stderr token and a different remedy (mika#2205).
+    Both degrade to the static bound; conflating them would name the wrong fault
+    on the day it matters.
 
     An entry that is individually unreadable is SKIPPED, never promoted to a
     whole-registry failure: one spawn's bookkeeping going bad must not widen
-    nor narrow the verdict for its neighbours. Unknown keys are ignored, so the
-    branch flight's `ref=` is a pure addition.
+    nor narrow the verdict for its neighbours. Unknown keys are ignored, so a
+    future key stays a pure addition the way `ref=` was.
 
-    Values are normalised the way `_receive_pack_repo` normalises the URL —
-    lowercased, `.git` suffix dropped — so the two forms meet already
+    An entry with NO `repo=` yields no couple at all: the repository is what
+    selects which couples may speak, so a ref with no repository could only ever
+    widen. An entry whose `ref=` is absent — or present with an empty value,
+    which reads the same — yields `None` in second position, and that is a
+    DECLARATION OF NOTHING rather than a declaration of the empty branch: the
+    host registry survives a deployment, so a pre-upgrade entry is the normal
+    state for one window (point 2 of mika#2776).
+
+    The repository is normalised the way `_receive_pack_repo` normalises the
+    URL — lowercased, `.git` suffix dropped — so the two forms meet already
     comparable. GitHub is case-insensitive on `owner/repo`; a case-sensitive
-    comparison here would refuse a legitimate push on a capital letter.
+    comparison there would refuse a legitimate push on a capital letter. The
+    ref is NOT normalised, and that asymmetry is deliberate: git refs are
+    case-sensitive, `refs/heads/Feat/X` and `refs/heads/feat/X` are two
+    different branches, so lowercasing here would be a LOOSENING of the bound.
     """
     directory = _push_scope_dir()
     # Its OWN TTL, shorter than the sentinel registry's: this one answers "is
@@ -881,7 +954,7 @@ def _push_scope_repos() -> frozenset[str] | None:
         # The path exists but cannot be scanned: a regular file where a
         # directory belongs, EACCES, anything else. That IS host bookkeeping.
         return None
-    repos: set[str] = set()
+    couples: list[tuple[str, str | None]] = []
     for entry in entries:
         try:
             if not entry.is_file():
@@ -889,40 +962,78 @@ def _push_scope_repos() -> frozenset[str] | None:
             raw = Path(entry.path).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        declared_repo = ""
+        declared_ref: str | None = None
         for line in raw.splitlines():
             stripped = line.strip()
-            if not stripped.startswith(_PUSH_SCOPE_REPO_KEY):
-                continue
-            value = stripped[len(_PUSH_SCOPE_REPO_KEY):].strip().lower()
-            if value.endswith(".git"):
-                value = value[: -len(".git")]
-            if value:
-                repos.add(value)
-    return frozenset(repos)
+            if stripped.startswith(_PUSH_SCOPE_REPO_KEY):
+                value = stripped[len(_PUSH_SCOPE_REPO_KEY):].strip().lower()
+                if value.endswith(".git"):
+                    value = value[: -len(".git")]
+                if value:
+                    declared_repo = value
+            elif stripped.startswith(_PUSH_SCOPE_REF_KEY):
+                # Case preserved: see the docstring on why lowercasing a ref
+                # would loosen the bound rather than normalise it.
+                value = stripped[len(_PUSH_SCOPE_REF_KEY):].strip()
+                if value:
+                    declared_ref = value
+        if declared_repo:
+            couples.append((declared_repo, declared_ref))
+    return couples
 
 
-def _push_scope_verdict(repo: str) -> tuple[str, str]:
-    """`(_ALLOW, "")`, a degradation token, or `(_DENY_SCOPE_REPO, repo)`.
+def _push_scope_verdict(repo: str, refs: list[str]) -> tuple[str, str]:
+    """`(_ALLOW, "")`, a degradation token, or a `push-scope-*` refusal.
 
     SUBORDINATE BY CONSTRUCTION. This function is only ever reached on a push
-    the static bound has ALREADY authorised, so its single new outcome is one
-    more refusal — there is no path by which it turns a refusal into an allow,
-    and no `return` of it can open anything. The property is structural, not a
+    the static bound has ALREADY authorised, so its only new outcomes are
+    refusals — there is no path by which it turns a refusal into an allow, and
+    no `return` of it can open anything. The property is structural, not a
     thing to re-verify at each reading (§ 3.1 of the plan).
+
+    TWO DIMENSIONS, READ IN ORDER, and the order is the one that can be
+    diagnosed. The repository is judged first because it is what SELECTS the
+    couples whose ref may speak; only then is the branch judged, against the
+    refs of those couples alone. So a push to an undeclared repository reports
+    `push-scope-repo` even when its ref is also wrong, which is the right
+    reading: the remedy is the remote, and the refspec question does not arise
+    until the remote is right.
+
+    An empty `refs` returns ALLOW rather than refusing: the 4-byte
+    authentication probe that precedes every streamed push carries NO command
+    section, and a bound that 403s it refuses every push large enough to be
+    streamed — the one failure mode able to stop the loop (point 4 of the
+    ticket, asserted at CASE 18 and CASE 24).
 
     The degradation tokens are returned rather than logged here so the decision
     stays pure and the caller owns every write to stderr.
     """
     if not _push_scope_enforced():
         return _ALLOW, ""
-    declared = _push_scope_repos()
-    if declared is None:
+    entries = _push_scope_entries()
+    if entries is None:
         return _DEGRADE_SCOPE_UNREADABLE, ""
-    if not declared:
+    if not entries:
         return _DEGRADE_SCOPE_ABSENT, ""
-    if repo.strip().lower() in declared:
+    declared = [ref for (name, ref) in entries if name == repo.strip().lower()]
+    if not declared:
+        return _DENY_SCOPE_REPO, repo
+    if not refs:
         return _ALLOW, ""
-    return _DENY_SCOPE_REPO, repo
+    if any(ref is None for ref in declared):
+        # At least one live entry naming this repository declares no branch, so
+        # the branch dimension cannot be applied WITHOUT risking the refusal of
+        # a legitimate push: that entry is the pre-upgrade state, and what it
+        # would have declared is unknown rather than empty. Degrade to the
+        # repository dimension — which has already passed — and say so on one
+        # greppable line.
+        return _DEGRADE_SCOPE_REF_ABSENT, ""
+    allowed = set(declared)
+    for ref in refs:
+        if ref.strip() not in allowed:
+            return _DENY_SCOPE_REF, ref
+    return _ALLOW, ""
 
 
 def _push_deny_body(reason: str, subject: str) -> str:
@@ -1031,12 +1142,19 @@ def request(flow: http.HTTPFlow) -> None:
     else:
         reason, subject = _push_verdict(repo, commands)
     if reason == _ALLOW:
-        # The declared-perimeter tightening (mika#2751) sits HERE and nowhere
-        # else: strictly under the static bound, reached only on a push
-        # mika#2736 already authorised. That placement is what makes point 2 of
-        # the ticket — an absent or unreadable perimeter must keep the static
-        # bound applying — true by construction rather than by vigilance.
-        scope, scope_subject = _push_scope_verdict(repo)
+        # The declared-perimeter tightening (mika#2751 for the repository,
+        # mika#2776 for the branch) sits HERE and nowhere else: strictly under
+        # the static bound, reached only on a push mika#2736 already authorised.
+        # That placement is what makes point 2 of the ticket — an absent or
+        # unreadable perimeter must keep the static bound applying — true by
+        # construction rather than by vigilance.
+        #
+        # `commands` is non-None on this branch (an unreadable body landed on
+        # `_DENY_PUSH_OPAQUE` above and never reaches here), so the ref list is
+        # read off the protocol the static bound already decoded — the same
+        # triplets, no second parse to keep in agreement with the first.
+        refs = [ref for _old, _new, ref in commands]
+        scope, scope_subject = _push_scope_verdict(repo, refs)
         if scope in _PUSH_SCOPE_DEGRADED:
             # An ALLOW that says why it did not tighten. Same line shape as the
             # DENY tap, different verb: `grep scope-absent` on the mitmdump log

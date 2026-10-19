@@ -1875,11 +1875,12 @@ _stage_pilot_egress_sentinel() {
     fi
 }
 
-# mika#2751: declare THE PERIMETER THIS SPAWN IS ENTITLED TO PUSH INTO, so the
-# addon's `git-receive-pack` bound can tighten from "any repository of
-# senara-solutions" (the static bound of mika#2736) to "the repository of THIS
-# dispatch". The producer is here; the only consumer is
-# `_push_scope_verdict` in scripts/mika-pilot-github-auth-addon.py.
+# mika#2751, then mika#2776: declare THE PERIMETER THIS SPAWN IS ENTITLED TO
+# PUSH INTO, so the addon's `git-receive-pack` bound can tighten from "any
+# repository of senara-solutions" (the static bound of mika#2736) to "the
+# repository AND THE BRANCH of THIS dispatch". The producer is here; the only
+# consumer is `_push_scope_verdict` in
+# scripts/mika-pilot-github-auth-addon.py.
 #
 # WHY A HOST FILE RE-READ PER REQUEST, AND NOT THE MITMDUMP ENVIRONMENT. The
 # obvious shape — export the repo into the helper's environment — is wrong, and
@@ -1897,10 +1898,15 @@ _stage_pilot_egress_sentinel() {
 #
 # A REGISTRY DIRECTORY, one entry per spawn, for the reason spelled out above
 # `_stage_pilot_egress_sentinel`: two concurrent pilots must both be valid at
-# the SAME instant. The reader therefore takes the UNION of the live entries —
-# "does some live perimeter name this repository?" — which is cheap for the
-# repo dimension (a pilot has exactly one possible `origin`) and is what defers
-# the branch dimension to its own flight.
+# the SAME instant. The reader therefore takes the UNION of the live entries,
+# and since mika#2776 that union is BY ENTRY, not by dimension: an entry is
+# read as the COUPLE (repository, branch) this spawn declared, the repository
+# selects which couples may speak, and only the refs of THOSE couples are
+# allowed. Which is why the two lines below must be written TOGETHER, into the
+# SAME entry. Splitting one spawn's perimeter across two entries would
+# authorise the cross product — repository of entry A with branch of entry B —
+# and reopen mika#2776's exact scenario as soon as a second dispatch is in
+# flight.
 #
 # WRITTEN UNCONDITIONALLY. `MIKA_PILOT_EGRESS_PUSH_SCOPE` is read in exactly
 # one place in the repository — `_push_scope_enforced()` in the addon, where
@@ -1949,14 +1955,57 @@ _stage_pilot_egress_push_scope() {
         return 0
     fi
 
-    # `clé=valeur` lines, one per dimension, so the branch dimension of the
-    # follow-up flight is a pure addition: the reader already ignores a key it
-    # does not know.
+    # THE BRANCH DIMENSION (mika#2776). `BRANCH` is global here, and that is
+    # measured rather than assumed: it is assigned in exactly one place in this
+    # file — `_set_up_worktree`, without `local` — and that runs before
+    # `_run_claude_pilot`, hence before this call.
+    #
+    # Three outcomes, three different sentences, because they are three
+    # different facts about the spawn and an operator reading `stderr` must be
+    # able to tell them apart (class mika#2205):
+    #
+    #  - a branch in scope and plainly shaped: the dimension is declared;
+    #  - no branch at all (free-text and milestone dispatch, exactly where
+    #    `REPO` is empty too): the line is NOT written. An empty-valued `ref=`
+    #    would be strictly worse than its absence — the reader would see a
+    #    declared branch, compare every push against the empty string, and
+    #    refuse all of them. The entry stays valid with `repo=` alone, and the
+    #    addon degrades on `scope-ref-absent` instead of refusing;
+    #  - a branch whose name is not a plain branch name: the line is not
+    #    written EITHER, and this one is a containment rule, not politeness. A
+    #    newline in `BRANCH` would inject a second line into the entry; a
+    #    `repo=` line injected that way would WIDEN the perimeter this very
+    #    function exists to narrow. So the shape is checked before the write,
+    #    and a name that fails it costs the branch dimension rather than the
+    #    repository one.
+    local _ref=""
+    if [ -z "${BRANCH:-}" ]; then
+        echo "dispatch-lib: no dispatch branch in scope — push perimeter declared for the repository only, the branch dimension does not apply to this spawn (mika#2776)" >&2
+    else
+        case "$BRANCH" in
+            refs/*)
+                echo "dispatch-lib: dispatch branch name already carries a refs/ prefix — push perimeter declared for the repository only, the branch dimension does not apply to this spawn (mika#2776)" >&2
+                ;;
+            *[!A-Za-z0-9._/-]*)
+                echo "dispatch-lib: dispatch branch name is not a plain branch name — push perimeter declared for the repository only, the branch dimension does not apply to this spawn (mika#2776)" >&2
+                ;;
+            *)
+                _ref="refs/heads/$BRANCH"
+                ;;
+        esac
+    fi
+
+    # `clé=valeur` lines, one per dimension, written into the SAME entry by the
+    # SAME redirection — see the union paragraph above for why that matters.
+    # The reader ignores any key it does not know, so a key added by a later
+    # flight stays a pure addition; a DIMENSION added by a later flight does
+    # not, which is what mika#2776 had to pay for here.
     if ! ( umask 077
            mkdir -p "$_dir" \
                && chmod 0700 "$_dir" \
-               && printf 'repo=senara-solutions/%s\n' "$REPO" \
-                      > "$_dir/$_nonce" ) 2>/dev/null; then
+               && { printf 'repo=senara-solutions/%s\n' "$REPO"
+                    [ -z "$_ref" ] || printf 'ref=%s\n' "$_ref"
+                  } > "$_dir/$_nonce" ) 2>/dev/null; then
         echo "dispatch-lib: could not declare the push perimeter under $_dir — no push perimeter declared, the static bound of mika#2736 applies alone (mika#2751)" >&2
         return 0
     fi
