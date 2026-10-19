@@ -14857,6 +14857,120 @@ else
     :
 fi
 
+echo ""
+echo "Test: mika#2194 — parité du tier 2 de paraphrase sur le corpus doré"
+echo "-------------------------------------------------------------------"
+
+# UN corpus, DEUX lecteurs, UN fichier d'attendus (mika#2194, vol 3).
+#
+# Le bloc ci-dessous fait passer le corpus par _parse_disposition_fuzzy et
+# _parse_verdict_fuzzy — les lecteurs de PRODUCTION, inchangés par ce vol. Le
+# jumeau Rust, crates/mika-agent/tests/arch_paraphrase_parity.rs, fait passer le
+# MÊME corpus et le MÊME fichier d'attendus par mika_agent::arch_paraphrase, qui
+# n'a aucun appelant. Un attendu modifié d'un seul côté redevient rouge de
+# l'autre : c'est tout le dispositif, et c'est la seule fenêtre où la parité est
+# une preuve — après la bascule du vol suivant, le bash appellera le Rust, et un
+# lecteur comparé à lui-même est toujours d'accord avec lui-même.
+#
+# Rien à ajouter à scripts/suite-wiring.tsv : ce fichier est atteint par
+# `make test-dispatch-lib`, que ci.yml:85 nomme.
+
+M3_CORPUS="$SCRIPT_DIR/../../../crates/mika-agent/tests/fixtures/arch_paraphrase_texts"
+M3_TSV="$M3_CORPUS/expectations.tsv"
+
+# Anti-vacuité 1/3 — un lecteur qui ne lit aucun attendu est vert sur zéro cas.
+assert_eq "mika#2194 (anti-vacuité 1/3): le corpus d'attendus du tier 2 existe" "yes" \
+    "$(if [ -f "$M3_TSV" ]; then printf 'yes'; else printf 'no'; fi)"
+
+M3_DECLARED=0
+if [ -f "$M3_TSV" ]; then
+    M3_DECLARED=$(grep -cv '^[[:space:]]*\(#\|$\)' "$M3_TSV" || true)
+fi
+# Anti-vacuité 2/3 — un corpus sans ligne ne prouve rien non plus.
+assert_eq "mika#2194 (anti-vacuité 2/3): le corpus du tier 2 n'est pas vide" "yes" \
+    "$(if [ "$M3_DECLARED" -gt 0 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Sentinelle de sourcing — le sourcing dominant de cette suite est
+# `source "$DISPATCH_LIB" 2>/dev/null || true` (ligne 720) : il AVALE son échec.
+# Sans cette assertion, une dispatch-lib devenue insourçable rendrait ce bloc
+# muet et vert, parce que chaque appel de fonction inexistante échouerait de la
+# même façon que le corpus l'attend pour les classes inertes.
+assert_eq "mika#2194 (sentinelle): les deux lecteurs fuzzy sont définis après le sourcing" "yes" \
+    "$(if declare -f _parse_disposition_fuzzy >/dev/null 2>&1 \
+          && declare -f _parse_verdict_fuzzy >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
+
+if [ "$M3_DECLARED" -gt 0 ] \
+    && declare -f _parse_disposition_fuzzy >/dev/null 2>&1 \
+    && declare -f _parse_verdict_fuzzy >/dev/null 2>&1; then
+
+    M3_CASES=0
+    M3_BAD=0
+    M3_ERR=$(mktemp)
+
+    while IFS=$'\t' read -r m3_file m3_pass m3_token m3_frag m3_class; do
+        case "$m3_file" in ''|'#'*) continue ;; esac
+        [ -n "${m3_pass:-}" ] || continue
+
+        # Anti-vacuité 3/3 — un attendu qui désigne un corps absent est un
+        # ÉCHEC, pas un saut : une ligne qui ne désigne rien ment avec
+        # l'autorité d'un inventaire.
+        m3_body_file="$M3_CORPUS/$m3_file"
+        if [ ! -f "$m3_body_file" ]; then
+            echo "    ✗ $m3_file — corps introuvable (anti-vacuité 3/3)"
+            M3_BAD=$((M3_BAD + 1)); continue
+        fi
+        m3_body=$(cat "$m3_body_file")
+        M3_CASES=$((M3_CASES + 1))
+
+        : >"$M3_ERR"
+        case "$m3_pass" in
+            first)
+                m3_got=$(printf '%s' "$m3_body" | _parse_disposition_fuzzy 2>"$M3_ERR")
+                ;;
+            second)
+                m3_got=$(printf '%s' "$m3_body" | _parse_verdict_fuzzy 2>"$M3_ERR")
+                ;;
+            *)
+                echo "    ✗ $m3_file — passe hors format de fil : '$m3_pass'"
+                M3_BAD=$((M3_BAD + 1)); continue
+                ;;
+        esac
+
+        # Le fragment est la seconde moitié du contrat : le bash écrit sur
+        # stderr le texte MATCHÉ (grep -o rend l'entrée, casse comprise), pas le
+        # motif. Un lecteur qui rendrait le motif serait d'accord sur le jeton
+        # et faux dès qu'un corps capitalise son match.
+        m3_got_frag=$(sed -n "s/^.*(matched: '\(.*\)')\$/\1/p" "$M3_ERR" | head -1)
+
+        # Une colonne vide porte « - », jamais rien (voir l'en-tête du TSV).
+        m3_exp_token="$m3_token"
+        m3_exp_frag="$m3_frag"
+        if [ "$m3_exp_token" = "-" ]; then m3_exp_token=""; fi
+        if [ "$m3_exp_frag" = "-" ]; then m3_exp_frag=""; fi
+
+        if [ "$m3_got" != "$m3_exp_token" ]; then
+            echo "    ✗ $m3_file ($m3_pass) — jeton : attendu '${m3_exp_token:--}', obtenu '${m3_got:--}'"
+            M3_BAD=$((M3_BAD + 1))
+        elif [ "$m3_got_frag" != "$m3_exp_frag" ]; then
+            echo "    ✗ $m3_file ($m3_pass) — fragment : attendu '${m3_exp_frag:--}', obtenu '${m3_got_frag:--}'"
+            M3_BAD=$((M3_BAD + 1))
+        fi
+    done < "$M3_TSV"
+
+    rm -f "$M3_ERR"
+
+    assert_eq "mika#2194: parité du tier 2 sur le corpus doré (aucun écart)" \
+        "0" "$M3_BAD"
+
+    # Le compte de cas EST une assertion, pas un affichage : un `echo` ne
+    # rougit pas, et c'est précisément le mode de panne que l'anti-vacuité vise.
+    assert_eq "mika#2194: le lecteur bash nomme son compte de cas du tier 2 (non nul)" "yes" \
+        "$(if [ "$M3_CASES" -gt 0 ]; then printf 'yes'; else printf 'no'; fi)"
+    assert_eq "mika#2194: le lecteur bash exerce toutes les lignes déclarées du tier 2" \
+        "$M3_DECLARED" "$M3_CASES"
+    echo "    → mika#2194 tier 2 : $M3_CASES cas exercés (lecteur bash)"
+fi
+
 # --- Summary ---
 
 echo ""

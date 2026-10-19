@@ -331,6 +331,51 @@ prédicat aurait changé une tolérance ; borner le canal est strictement plus s
 l'état d'avant, où l'un des deux lecteurs rendait un chemin absurde et l'autre un
 chemin tronqué, sans que personne l'ait mesuré.
 
+### La même forme appliquée au tier 2 (vol 3), et les trois classes qu'elle mesure
+
+Le vol 3 de mika#2194 réplique cette forme sur le **tier 2 de paraphrase** —
+`_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` — et **rien ne bascule** : le
+bash reste le lecteur de production, le lecteur Rust (`arch_paraphrase::paraphrase`)
+n'a **aucun appelant**. C'est la moitié « TESTS DORÉS » de la clause de méthode du
+ticket, posée avant la phase 3 plutôt que pendant.
+
+Ce que le corpus ajoute à la forme de la phase 1 : **cinq** colonnes
+(`fichier · passe · token · fragment · classe`) au lieu de six, parce que la
+comparaison porte sur deux sorties (le jeton **et** le fragment matché) et non sur
+une politique de fences ; la règle du `-`-jamais-vide est reprise telle quelle, pour
+la raison d'IFS déjà mesurée ; un même corps peut porter **deux** lignes, une par
+passe, les deux tables étant distinctes. 16 corps, 17 lignes.
+
+La colonne `classe` porte les trois exceptions déclarées, et chacune est une
+**assertion auto-nettoyante côté Rust** — le jour où l'exception cesse, le test
+devient rouge et force la mise à jour du corpus, au lieu de laisser une classe vide
+passer pour une classe satisfaite. Chacune a été vérifiée par un contrôle négatif
+(la mutation posée, le rouge observé, la mutation retirée) :
+
+| classe | ce qu'elle épingle | contrôle négatif mesuré |
+|---|---|---|
+| `substring-fp` | le match est en **sous-chaîne** : « fundamentally sound » est lu `ESCALATE`, « the dispatcher » est lu `READY`. Ce n'est pas un défaut à corriger ici — **B1** interdit de resserrer une tolérance pendant la migration | élargir le match aux frontières de mot ⇒ `fundamentally` matche désormais sur une frontière |
+| `french-inert` | le tier 2 est **quasi inerte sur le français** — les deux tables sont entièrement en anglais, les réponses de mika-arch sont en français. C'est le cas **modal en production** (mika#2641) | ajouter `"plan"` à la table READY ⇒ le corps français rend désormais `READY` |
+| `multiline` | l'**absence de normalisation des blancs** avant le match | normaliser `\n` → ` ` avant de matcher ⇒ « human\nreview » matche désormais |
+
+**Correction de doctrine sur la troisième, parce que la formulation naturelle est
+fausse.** On écrit spontanément que `grep` est orienté ligne « donc un `contains`
+sur le texte entier matcherait là où `grep` ne matche pas ». Il n'en est rien :
+**aucun motif des deux tables ne contient `\n`**, donc un `contains` sur le texte
+entier rend exactement le même ensemble qu'une itération ligne à ligne. Ce que ces
+lignes attrapent est le portage *serviable* — le `replace('\n', " ")` ou le
+`split_whitespace().join(" ")` qu'un portage ajoute pour « harmoniser », et que B1
+refuse nommément.
+
+**Une déviation de signature, délibérée et mesurée.** Le plan prévoyait que le
+lecteur rende le motif (`&'static str`). Il rend le **texte matché dans l'entrée**
+(`&'a str`), parce que `grep -oi` côté bash rend l'entrée et non le motif : un
+fragment `Ship it` dans le corps est rendu `Ship it`, pas `ship it`. Mesuré par
+contrôle négatif côté bash (minuscule l'attendu d'une ligne ⇒ rouge nommant les deux
+casses). Le test de parité le vérifie structurellement : il **exige que le fragment
+rendu soit une tranche du corps** (comparaison de pointeurs), ce qu'un retour du
+motif ne peut pas satisfaire.
+
 ---
 
 ## 5. Le scan anti-copie : un inventaire fermé, devenu un ZÉRO en phase 2
@@ -435,13 +480,37 @@ raison d'être de ces deux scans.
 |---|---|---|---|
 | **1** | `_extract_plan_path` → Rust, de bout en bout, **plus cette doctrine** | — | **livrée** (mika#2194) |
 | **2** | les deux autres lecteurs du même jeton : `_committed_plan_on_branch`, `_set_up_worktree` — **plus la décision sur le quatrième** | phase 1 mergée | **livrée** (mika#2608) |
-| 3 | `_parse_disposition` / `_parse_verdict` | décider ce que devient le canal de retour par fichier (`$_DISPOSITION_FUZZY_FILE`) | ticket à ouvrir |
+| **vol 3** | le **corpus doré** du tier 2 de paraphrase et son lecteur Rust **sans appelant** — la moitié « tests dorés » de la phase 3, **sans bascule** | phase 2 mergée | **livré** (mika#2194 vol 3) |
+| 3 | `_parse_disposition` / `_parse_verdict` → **bascule** | décider ce que devient le canal de retour par fichier (`$_DISPOSITION_FUZZY_FILE`) — **inchangée** ; le corpus, lui, n'en est plus une : le vol 3 l'a posé | ticket à ouvrir |
 | 4 | la glue d'orchestration (bwrap / git / gh / trap / worktree / callback) → Python | un maillon dont la nature est de la **glue** et non une décision | ticket à ouvrir |
 
-**Ni la phase 3 ni la phase 4 n'est ouverte par la phase 2**, et c'est délibéré,
-pour la même raison que la phase 1 l'avait écrit : les ouvrir avant qu'une mesure
-les demande serait instruire sans mesure. Leurs préconditions ci-dessus sont
-inchangées.
+**Ni la phase 3 ni la phase 4 n'est ouverte**, et c'est délibéré, pour la même
+raison que la phase 1 l'avait écrit : les ouvrir avant qu'une mesure les demande
+serait instruire sans mesure. Leurs préconditions ci-dessus sont inchangées — et le
+vol 3 n'en lève aucune, ce qui est exactement son périmètre.
+
+### Ce que le vol 3 change pour la phase 3, et ce qu'il ne change pas
+
+**Il retire une inconnue, il ne tranche aucune décision.** Le tier 2 avait zéro
+entrée commune entre ses deux futurs lecteurs — la configuration que le § 4 décrit
+comme « celle dans laquelle une divergence ne peut pas être vue ». Elle est fermée :
+17 cas, deux lecteurs, **zéro écart à la première exécution**. La phase 3 n'aura
+donc pas à établir la parité du tier 2 ; elle aura à décider du **canal**.
+
+**Le coût de ce vol est une ligne de plus à l'inventaire des jetons, dite plutôt que
+découverte.** Les quatre jetons `READY` / `ITERATE` / `ESCALATE` / `GROOMED` ont
+désormais **deux** sites de match dans l'arbre, et `scripts/canonical-tokens.tsv`
+déclare le second (classe A, `arch_paraphrase.rs::paraphrase`) alors qu'il n'a aucun
+appelant. C'est une duplication **temporaire et déclarée**, pas une infraction au
+§ 5 : le scan anti-copie de la phase 1 était lui aussi un inventaire fermé **avant**
+de devenir un zéro, et pour la même raison — un lint rouge le jour où il naît se
+fait désarmer. Le zéro ici est la phase 3, pas le vol 3.
+
+**Ce qui doit rester vrai jusque-là :** les deux corps `_parse_disposition_fuzzy` et
+`_parse_verdict_fuzzy` sont une **transcription littérale** de l'autre côté. Le vol 3
+ne touche pas une ligne de `dispatch-lib.sh`. Un futur maillon qui édite l'une des
+deux tables sans éditer l'autre rougit sur le corpus commun — c'est tout le
+dispositif, et c'est ce qui le rend utile entre maintenant et la bascule.
 
 ### Ce que la phase 2 a établi sur le maillon migrable, et qui sert aux suivantes
 
@@ -508,11 +577,23 @@ migration est un arbitrage de **tolérance**, pas un portage.
 
 ### L'ordre de grandeur, pour que la phase 4 ne soit pas sous-estimée
 
-`dispatch-lib.sh` au 2026-09-30 : **551 330 octets, 9 757 lignes, 119 fonctions**
-(le ticket parent, écrit le 2026-09-05, mesurait « ≈ 300 Ko » : le fichier a
-**presque doublé en 25 jours**). Les fonctions dont le nom et le corps sont des
-prédicats purs totalisent de l'ordre de **1 600 lignes sur 9 757**. Les ~84 %
-restants sont de la **glue** : bwrap, git, gh, traps, worktree, callback.
+| mesure | octets | lignes | fonctions |
+|---|---|---|---|
+| ticket parent, 2026-09-05 | ≈ 300 000 | — | — |
+| phase 1, 2026-09-30 | 551 330 | 9 757 | 119 |
+| **vol 3, 2026-10-19** | **741 823** | **12 844** | **146** |
+
+**Le fichier a crû de ~35 % en 19 jours, et de ~2,5× en 44 jours** — pendant que
+deux phases de la migration étaient livrées. C'est la mesure qui compte pour
+dimensionner la phase 4, et elle va dans le sens inverse de l'intuition qu'une
+migration en cours fait rétrécir sa source.
+
+La part des prédicats purs mesurée à la phase 1 — de l'ordre de **1 600 lignes sur
+9 757**, les ~84 % restants étant de la **glue** (bwrap, git, gh, traps, worktree,
+callback) — **n'a pas été re-mesurée** au 2026-10-19 : le vol 3 n'a pas eu à la
+connaître, et l'extrapoler serait donner à une estimation l'autorité d'un comptage.
+Ce qui est mesuré ci-dessus est le volume ; la répartition reste celle de la
+phase 1, avec sa date.
 
 « Glue → Python » reste la direction du ticket parent, et c'est la **phase 4**. Le
 dire ici évite qu'un futur maillon s'y croie autorisé par le précédent de la

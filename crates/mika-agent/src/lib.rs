@@ -5,6 +5,7 @@ pub mod agent_loop;
 pub mod agent {
     pub use crate::agent_loop::*;
 }
+pub mod arch_paraphrase;
 pub mod async_db;
 pub mod auth_boundary_ledger;
 pub mod auto_pull;
