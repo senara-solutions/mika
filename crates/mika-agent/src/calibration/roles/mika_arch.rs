@@ -1034,6 +1034,7 @@ async fn run_review_anchor_attestation(
                     anchors_found,
                     anchors_valid,
                     reason,
+                    ..
                 } => RoleScenarioResult::fail(
                     SCENARIO,
                     FailureClass::ContractViolation,
