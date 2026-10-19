@@ -10226,6 +10226,331 @@ branch refs/heads/fix/live/x
         );
     }
 
+    // -- mika#2808 : le bras de bout en bout, sur un worktree factice --------
+
+    /// Une inactivité **strictement entre** les deux fenêtres.
+    ///
+    /// C'est la seule valeur qui sépare les deux régimes. En deçà de la fenêtre
+    /// courte (60 s, disons) les deux conservent ; au-delà de la pleine (5 h)
+    /// les deux purgent. Dans les deux cas le test serait vert sans que la
+    /// fenêtre par candidat ait décidé quoi que ce soit — la forme exacte d'un
+    /// détecteur qui ne détecte rien.
+    const IDLE_BETWEEN_WINDOWS_SECS: i64 = PURGE_CONSUMER_DONE_IDLE_DEFAULT_SECS + 300;
+
+    /// La borne, tenue à la **compilation**.
+    ///
+    /// Déplacer l'un des deux défauts sans toucher à cette valeur ne peut pas
+    /// rendre les cinq cas ci-dessous non concluants en silence : le build
+    /// casse d'abord.
+    const _: () = assert!(
+        PURGE_CONSUMER_DONE_IDLE_DEFAULT_SECS < IDLE_BETWEEN_WINDOWS_SECS
+            && IDLE_BETWEEN_WINDOWS_SECS < PURGE_IDLE_DEFAULT_SECS,
+        "l'inactivité de test doit tomber strictement entre la fenêtre courte \
+         et la pleine — sinon les deux régimes rendent la même chose et le test \
+         ne distingue plus rien"
+    );
+
+    /// Vieillit le `target/` dans l'intervalle discriminant.
+    fn age_between_windows(target: &Path) {
+        age_tree(target, IDLE_BETWEEN_WINDOWS_SECS as u64);
+    }
+
+    /// La carte des branches revues, telle que la rendrait `list_open_pr_reviews`.
+    fn reviewed(branch: &str, has_verdict: bool) -> HashMap<String, bool> {
+        HashMap::from([(branch.to_string(), has_verdict)])
+    }
+
+    /// **U1 / AC1** — une PR ouverte **dont la QA a rendu son verdict** voit son
+    /// `target/` purgé à la fenêtre courte, et **le reste du worktree intact**.
+    ///
+    /// Le dernier consommateur du `target/` est le build QA, pas le pilote
+    /// (mika#2808). Le verdict est l'état lisible qui atteste qu'il a fini.
+    /// La seconde moitié des assertions distingue « la purge marche » de « la
+    /// purge supprime trop » : sans elle, un `remove_dir_all` sur le worktree
+    /// entier passerait.
+    #[tokio::test]
+    async fn mika2808_le_verdict_qa_raccourcit_la_fenetre() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2808-u1");
+        std::fs::write(wt.join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+        let target = fake_target(&wt);
+        age_between_windows(&target);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2808-u1",
+            "trace-2808-u1",
+            &[pr_open_refusal(&wt, "fix/2808/u1")],
+            &[],
+            &index(vec![open_pr(2808, "fix/2808/u1")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &reviewed("fix/2808/u1", true),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 1, "refus inattendu: {stats:?}");
+        assert_eq!(stats.failed, 0);
+        assert!(!target.exists(), "`target/` doit avoir été retiré");
+        assert!(
+            wt.join("src/main.rs").exists(),
+            "le reste du worktree doit être intact"
+        );
+        assert!(
+            wt.join("Cargo.toml").exists(),
+            "`Cargo.toml` doit être intact"
+        );
+        assert!(wt.join(".git").exists(), "`.git` doit être intact");
+
+        let events = db.get_audit_events("session-2808-u1").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGED_TOOL)
+            .expect("une ligne `target_purged` doit exister");
+        let reasoning = row.reasoning.as_deref().unwrap_or_default();
+        assert!(reasoning.contains("pr=2808"), "{reasoning}");
+        assert!(
+            reasoning.contains("consumer_state=done"),
+            "la ligne doit dire **pourquoi** la fenêtre était courte: {reasoning}"
+        );
+        assert!(
+            reasoning.contains(&format!(
+                "window_secs={PURGE_CONSUMER_DONE_IDLE_DEFAULT_SECS}"
+            )),
+            "et **laquelle** a servi: {reasoning}"
+        );
+    }
+
+    /// **U2 / AC3** — la même entrée, un cwd vivant à la racine : refus
+    /// `live_process`, `target/` intact.
+    ///
+    /// La fenêtre courte raccourcit P4, elle n'affaiblit **aucun** autre terme.
+    /// P3 est la garde par `/proc/*/cwd` de `mika-platform-worktree-cleanup` :
+    /// un worktree habité n'est jamais purgé, verdict QA ou pas.
+    #[tokio::test]
+    async fn mika2808_un_worktree_habite_nest_jamais_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2808-u2");
+        let target = fake_target(&wt);
+        age_between_windows(&target);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2808-u2",
+            "trace-2808-u2",
+            &[pr_open_refusal(&wt, "fix/2808/u2")],
+            &[],
+            &index(vec![open_pr(2808, "fix/2808/u2")]),
+            // Le cwd est la racine du worktree : quelqu'un y travaille.
+            &LiveCwds::Enumerated(vec![wt.clone()]),
+            now(),
+            &TargetPurgeConfig::default(),
+            &reviewed("fix/2808/u2", true),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0, "rien ne doit être purgé: {stats:?}");
+        assert_eq!(budget, 2, "aucun budget n'est consommé par un refus");
+        assert!(target.exists(), "`target/` doit survivre à P3");
+        assert!(wt.join("src/main.rs").exists());
+
+        let events = db.get_audit_events("session-2808-u2").await.unwrap();
+        let refus = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .expect("un refus doit être écrit");
+        assert_eq!(
+            refus.after_value.as_deref(),
+            Some(PURGE_REASON_LIVE_PROCESS),
+            "le motif doit rester P3, pas P4"
+        );
+        assert!(
+            !events.iter().any(|e| e.tool_name == TARGET_PURGED_TOOL),
+            "aucune ligne de purge"
+        );
+    }
+
+    /// **U3 / AC2** — un vol terminé **sans PR** purge aussi son `target/`.
+    ///
+    /// Pas de PR ouverte sur la branche ⇒ il n'y aura pas de build QA ⇒ il n'y a
+    /// plus de consommateur à attendre. C'est le second point du ticket : un vol
+    /// qui s'arrête pour quelque raison que ce soit ne laisse pas 40 G derrière
+    /// lui pendant quatre heures.
+    #[tokio::test]
+    async fn mika2808_un_vol_sans_pr_purge_aussi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2808-u3");
+        let target = fake_target(&wt);
+        age_between_windows(&target);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2808-u3",
+            "trace-2808-u3",
+            &[refusal_with(&wt, "fix/2808/u3", REASON_PR_UNKNOWN)],
+            &[],
+            // Aucune PR : le reaper et l'index disent la même chose.
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            // La branche n'apparaît dans aucune PR ouverte, donc dans aucune
+            // carte de revues — et c'est précisément l'information.
+            &HashMap::new(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 1, "refus inattendu: {stats:?}");
+        assert!(!target.exists(), "`target/` doit avoir été retiré");
+        assert!(wt.join("src/main.rs").exists());
+
+        let events = db.get_audit_events("session-2808-u3").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGED_TOOL)
+            .expect("une ligne `target_purged` doit exister");
+        let reasoning = row.reasoning.as_deref().unwrap_or_default();
+        assert!(reasoning.contains("pr=null"), "{reasoning}");
+        assert!(reasoning.contains("keep_reason=pr_unknown"), "{reasoning}");
+        assert!(reasoning.contains("consumer_state=done"), "{reasoning}");
+    }
+
+    /// **U4 / contrôle négatif** — une PR ouverte **sans aucune revue soumise**
+    /// garde ses quatre heures.
+    ///
+    /// Sans ce test, un bras qui rendrait `Done` pour tout `pr_open` passerait
+    /// U1 et U3 sans rien distinguer : il raccourcirait la fenêtre de tous les
+    /// worktrees, y compris celui dont la QA est encore en train de compiler.
+    #[tokio::test]
+    async fn mika2808_pr_ouverte_sans_revue_garde_les_quatre_heures() {
+        assert_eq!(
+            consumer_state_for(REASON_PR_OPEN, true, Some(false)),
+            ConsumerState::Pending,
+            "la branche exercée doit bien être `Pending`"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2808-u4");
+        let target = fake_target(&wt);
+        age_between_windows(&target);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2808-u4",
+            "trace-2808-u4",
+            &[pr_open_refusal(&wt, "fix/2808/u4")],
+            &[],
+            &index(vec![open_pr(2808, "fix/2808/u4")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            // La PR est ouverte et listée, mais personne n'a soumis de verdict.
+            &reviewed("fix/2808/u4", false),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0, "rien ne doit être purgé: {stats:?}");
+        assert!(
+            target.exists(),
+            "`target/` doit survivre : la QA peut encore s'en servir"
+        );
+
+        let events = db.get_audit_events("session-2808-u4").await.unwrap();
+        let refus = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .expect("un refus doit être écrit");
+        assert_eq!(
+            refus.after_value.as_deref(),
+            Some(PURGE_REASON_RECENTLY_ACTIVE),
+            "le motif doit être P4, à la **pleine** fenêtre"
+        );
+    }
+
+    /// **U6 / fail-safe** — une liste de revues illisible conserve.
+    ///
+    /// Quand l'appel `gh` échoue, la production journalise
+    /// `target_purge_reviews_unreadable` et passe une carte vide. Toute PR
+    /// ouverte retombe alors sur `Unknown`, donc sur la fenêtre pleine : un
+    /// terme illisible conserve, il ne purge jamais par défaut. La différence
+    /// avec U4 est l'entrée, pas la sortie — c'est le but : une panne de lecture
+    /// doit se comporter comme « pas encore de verdict », jamais comme « fini ».
+    #[tokio::test]
+    async fn mika2808_une_liste_de_revues_illisible_conserve() {
+        assert_eq!(
+            consumer_state_for(REASON_PR_OPEN, true, None),
+            ConsumerState::Unknown,
+            "une revue illisible ne doit pas se lire comme un verdict"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2808-u6");
+        let target = fake_target(&wt);
+        age_between_windows(&target);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2808-u6",
+            "trace-2808-u6",
+            &[pr_open_refusal(&wt, "fix/2808/u6")],
+            &[],
+            &index(vec![open_pr(2808, "fix/2808/u6")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            // Ce que produit l'échec de `list_open_pr_reviews`.
+            &HashMap::new(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0, "rien ne doit être purgé: {stats:?}");
+        assert!(
+            target.exists(),
+            "`target/` doit survivre à une lecture ratée"
+        );
+
+        let events = db.get_audit_events("session-2808-u6").await.unwrap();
+        let refus = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .expect("un refus doit être écrit");
+        assert_eq!(
+            refus.after_value.as_deref(),
+            Some(PURGE_REASON_RECENTLY_ACTIVE)
+        );
+    }
+
     // -- V4 : `dirty` traverse réellement la PRODUCTION ----------------------
 
     /// **V4 / R1** — un worktree dont le seul refus est `dirty`, passé dans le
