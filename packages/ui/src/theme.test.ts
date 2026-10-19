@@ -79,9 +79,10 @@ const canonicalTokens: Array<[name: string, hex: string, source: string]> = [
   ['--color-tertiary', '#f6f9ff', 'tertiary'],
   ['--color-surface-tint', '#ada3ff', 'surface_tint'],
   ['--color-inverse-surface', '#f9f9fd', 'inverse_surface'],
-  // Error triad — §2 canonical (§5.5 line 270 contradiction surfaced to Vincent
-  // in the PR body as operator-owned rulebook follow-up).
-  ['--color-error', '#ff6e84', 'error (§2 canonical, adopted over §5.5 #ef4444)'],
+  // Error triad — §2 canonical, and §5.5 line 270 now says the same thing:
+  // `76a8b0de` (PR #1976) closed the contradiction this comment used to carry
+  // as an open operator follow-up. One hex, both sections, nothing pending.
+  ['--color-error', '#ff6e84', 'error (§2 and §5.5, reconciled by #1976)'],
   ['--color-error-dim', '#d73357', 'error_dim'],
   ['--color-error-container', '#a70138', 'error_container'],
 ]
@@ -106,7 +107,10 @@ const bannedLegacyHexValues: Array<[hex: string, wasFor: string]> = [
   ['#1e2130', 'legacy surface-container-high — replaced by canonical #1d2024'],
   ['#e8ecf2', 'legacy heading — replaced by canonical on_surface #e8e8ec'],
   ['#a0a8b8', 'legacy muted — replaced by canonical on_surface_variant #aaabaf'],
-  ['#ef4444', '§5.5 error hex — resolved to §2 canonical #ff6e84 in theme'],
+  // Kept, and the entry outlives its contradiction on purpose: #1976 removed
+  // #ef4444 from the rulebook, which makes it a hex that *was* canonical and is
+  // no longer — the kind a consumer retypes from memory rather than reads.
+  ['#ef4444', 'former §5.5 error hex — removed from the rulebook by #1976'],
 ]
 
 /**

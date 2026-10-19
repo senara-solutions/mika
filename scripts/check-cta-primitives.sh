@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# CI lint: no hand-rolled CTA in `dashboard/src` or `site/src` (mika#1801, LC.2).
+# CI lint: no hand-rolled CTA in `dashboard/src`, `site/src` or `packages/ui/src`
+# (mika#1801, LC.2; perimeter and predicate extended by mika#1799).
 #
 # THE PROPERTY: every call-to-action on every surface is rendered by
 #   `<Button>` from `@samidarko/ui`. A `<button>` or `<a href>` that paints its
@@ -41,8 +42,26 @@
 #         className="..."
 #       >
 #
+# WHY THE PERIMETER INCLUDES THE PRODUCER PACKAGE (mika#1799 D1). LC.2 armed this
+#   scan on the two *consuming* surfaces and not on `packages/ui/src`, the package
+#   that defines `<Button>`. That is the natural choice while migrating ten CTAs
+#   out of consumers — and it is also the one place the primitive could contradict
+#   itself with nothing to say so. It did: `ErrorState.tsx:46` shipped a
+#   hand-rolled gradient button inside the package whose whole job is to make that
+#   impossible, and the rulebook (§5.5 l.272) names *that* button as the place of
+#   its own visual signature.
+#
+#   TEST AND TYPE-ASSERTION FILES ARE OUT OF THE PERIMETER — `*.test.tsx`,
+#   `*.test.jsx`, `*.type-assertions.tsx`. Two reasons, in this order. A fixture is
+#   not a rendered surface, and this scan exists to hold what a user sees. And
+#   without the filter the anti-vacuity count below swings by 53 call sites
+#   (`Button.test.tsx` holds 26, `Button.type-assertions.tsx` 25) and then moves
+#   on every test added to `<Button>` — a harness that goes red on healthy work is
+#   a harness somebody disarms. Measured neutral on the pre-existing perimeter:
+#   the five `.test.tsx` under `dashboard/src` hold zero CTA elements.
+#
 # WHY THE PREDICATE IS "SOLID FILL", AND WHAT THAT DELIBERATELY LEAVES OUT.
-#   A CTA is defined by the fill it paints at rest. Three exclusions, each
+#   A CTA is defined by the fill it paints at rest. Four exclusions, each
 #   costing a false negative rather than buying a false positive:
 #
 #     1. Translucent backgrounds (`bg-accent/10`, `bg-white/[0.03]`) are out.
@@ -55,9 +74,51 @@
 #        only on hover would pass, which is implausible enough to accept.
 #     3. Surface tokens (`bg-bg-card`, `bg-surface-container`) are out. A control
 #        painted at a surface tier is a card-like affordance, not a CTA.
+#     4. A SELECTED-STATE ROLE is out, whatever it paints (mika#1799 D3).
+#        `role="switch"`, `checkbox`, `radio`, `tab`, `menuitemcheckbox`,
+#        `menuitemradio`. These ARIA roles carry a selected state (`aria-checked`,
+#        `aria-selected`), and such a control paints its background to say WHICH
+#        STATE IT IS IN, not to call to action. The population measured on the
+#        three surfaces is one — `LiveRefreshToggle.tsx`'s switch track, itself a
+#        canonical primitive of this package — and the distinction it needs is not
+#        in the fill, so no fill-shaped predicate could ever have made it.
+#        `role="button"` and `role="link"` are emphatically NOT on the list: those
+#        are CTAs that gave themselves an explicit role, and the scan must keep
+#        seeing them. Written as a closed list of roles rather than as
+#        `# LiveRefreshToggle exception`, because the realistic regression is not
+#        somebody rewriting that toggle — it is somebody writing the next
+#        `role="tab"` with its active tab in `bg-accent`.
 #
 #   Exclusion 1 is the one that matters: a false positive here costs a blocked PR
 #   and is settled by muting the lint, which is the failure mode to close first.
+#   Exclusion 4 exists for the same reason, paid in advance.
+#
+# ...AND WHY A GRADIENT IS A FILL AFTER ALL (mika#1799 D2). Exclusion 3 lumps
+#   `bg-gradient-*` / `bg-linear-*` in with `bg-clip-text`, `bg-origin-border` and
+#   `bg-blend-multiply` — utilities that genuinely paint nothing. For three of
+#   them that is permanently true. For the gradient it is true only while it has
+#   no stops: `bg-gradient-to-r` ACCOMPANIED BY a `from-*` stop paints the single
+#   most CTA fill there is — it is literally the texture §2 prescribes for a
+#   primary. The exclusion was born of a founding state that says so in its own
+#   words (line 12 above): "Ten CTAs … none of them a gradient". The case did not
+#   exist, so it fell into the neighbouring bucket and stayed there.
+#
+#   So a gradient utility leaves the exclusion the moment the same tag carries a
+#   colour stop, and THE TOKEN REPORTED IS THE STOP (`from-accent`), never the
+#   word `bg-gradient-to-r`: the stop is what names the colour that stopped
+#   tracking §2, and it is the string a reader will search the file for.
+#
+#   Exclusions 1 and 2 stay dominant over it — `from-accent/40` is still
+#   translucent, `hover:from-accent` is still variant-prefixed, and `bg-clip-text`
+#   on its own is still nothing. `bg-radial-*` / `bg-conic-*` stay unconditionally
+#   excluded: their population here is zero and mika#1799 scoped them out
+#   deliberately rather than ship a shape no fixture has watched go red.
+#
+#   The false positive this rule naturally invites is text in a gradient
+#   (`bg-clip-text text-transparent` + stops), banal on a landing page. Measured
+#   at zero occurrences across the three surfaces before the rule was written, and
+#   held green by fixture N7 — because a scan whose restraint nobody has watched is
+#   indistinguishable from a scan that fires on every `from-`.
 #
 # WHY THE RULE IS "NO SOLID FILL" AND NOT "NOT THESE TEN CLASSES". Same reasoning
 #   as `check-landing-tokens.sh`: the realistic regression is nobody retyping
@@ -84,14 +145,18 @@ DEFAULT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCAN_ROOT="${1:-$DEFAULT_ROOT}"
 ALLOWLIST="${2:-$DEFAULT_ROOT/scripts/cta-primitives-allowlist.txt}"
 
-SCAN_DIRS="dashboard/src site/src"
+SCAN_DIRS="dashboard/src site/src packages/ui/src"
 
-# ── Build the file list.
+# ── Build the file list. Test and type-assertion files are excluded: a fixture is
+# not a rendered surface, and leaving them in makes the anti-vacuity count below
+# move on every test added to `<Button>` (header § WHY THE PERIMETER…).
 FILES=""
 for d in $SCAN_DIRS; do
     if [[ -d "$SCAN_ROOT/$d" ]]; then
         FILES="$FILES
-$(find "$SCAN_ROOT/$d" -type f \( -name '*.tsx' -o -name '*.jsx' \) | sort)"
+$(find "$SCAN_ROOT/$d" -type f \( -name '*.tsx' -o -name '*.jsx' \) \
+    ! -name '*.test.tsx' ! -name '*.test.jsx' ! -name '*.type-assertions.tsx' \
+    | sort)"
     fi
 done
 FILES="$(printf '%s\n' "$FILES" | grep . || true)"
@@ -163,6 +228,18 @@ SCAN_OUTPUT="$(printf '%s\n' "$FILES" | while IFS= read -r f; do
             }
             total = pos
 
+            # Exclusion 4 (mika#1799 D3). A dynamic regex rather than a literal,
+            # so the single quote can be written as "\047" — this whole awk
+            # program is a single-quoted shell string. The leading boundary keeps
+            # `data-role=` out, the trailing one keeps `role="tabpanel"` and
+            # `role="switcher"` out, and the loose run between `=` and the role
+            # word admits `role={"switch"}` and `role = "switch"` alike. A
+            # computed role (`role={x ? "switch" : "button"}`) does NOT match, so
+            # it stays in the population — the conservative direction.
+            STATE_ROLE = "[^A-Za-z0-9_-]role[ \t]*=[ \t]*[^A-Za-z0-9_]*" \
+                "(menuitemcheckbox|menuitemradio|checkbox|switch|radio|tab)" \
+                "[^A-Za-z0-9_-]"
+
             buttons = 0
             i = 1
             while (i <= total) {
@@ -205,6 +282,42 @@ SCAN_OUTPUT="$(printf '%s\n' "$FILES" | while IFS= read -r f; do
                     else if (ch == "}")  { if (depth > 0) depth-- }
                     else if (ch == ">" && depth == 0) { break }
                     j++
+                }
+
+                # ── Exclusion 4: a selected-state role carries state, not an
+                # action, and leaves the population whatever it paints.
+                if (tag ~ STATE_ROLE) { i = j + 1; continue }
+
+                # ── A gradient utility paints nothing by itself — which is why
+                # exclusion 3 below still skips it — but paints the signature
+                # texture of §2 as soon as the same tag carries a colour stop.
+                # Reported by its STOP, the token that names the colour
+                # (mika#1799 D2). No apostrophe anywhere in this program: it is
+                # one single-quoted shell string (see the "\047" note above).
+                gradient = ""
+                gscan = tag
+                while (match(gscan, /bg-(gradient|linear)-[A-Za-z0-9_.,%#()\[\]-]+/)) {
+                    gbefore = (RSTART > 1) ? substr(gscan, RSTART - 1, 1) : " "
+                    gscan = substr(gscan, RSTART + RLENGTH)
+                    # Exclusion 2 — `hover:bg-gradient-to-r` — and the tail of a
+                    # longer identifier.
+                    if (gbefore ~ /[:A-Za-z0-9_-]/) { continue }
+                    gradient = "yes"
+                    break
+                }
+                if (gradient != "") {
+                    sscan = tag
+                    while (match(sscan, /from-[A-Za-z0-9_.,%#()\[\]\/-]+/)) {
+                        stop = substr(sscan, RSTART, RLENGTH)
+                        sbefore = (RSTART > 1) ? substr(sscan, RSTART - 1, 1) : " "
+                        sscan = substr(sscan, RSTART + RLENGTH)
+                        # Exclusions 2 and 1 stay dominant: `hover:from-accent` is
+                        # variant-prefixed, `from-accent/40` is translucent.
+                        if (sbefore ~ /[:A-Za-z0-9_-]/) { continue }
+                        if (stop ~ /\//) { continue }
+                        printf "V\t%s:%d\t%s\t%s\n", fname, startline, stop, elem
+                        break
+                    }
                 }
 
                 # ── Evaluate the tag for a solid background fill.
@@ -304,10 +417,11 @@ CTA_COUNT=$((BUTTON_COUNT + RAW_COUNT))
 if [[ "$CTA_COUNT" -eq 0 ]]; then
     echo "ERROR: scanned $FILE_COUNT file(s) and found ZERO CTA elements." >&2
     echo "" >&2
-    echo "Ten CTAs are known to exist across dashboard/src and site/src, and after" >&2
-    echo "migration they are still ten CTAs — rendered by <Button> instead of by hand." >&2
-    echo "Zero means this scan is no longer looking at them: check the perimeter" >&2
-    echo "($SCAN_DIRS), the file extensions, and the <Button> detection." >&2
+    echo "CTAs are known to exist across dashboard/src, site/src and packages/ui/src," >&2
+    echo "and after migration they are still CTAs — rendered by <Button> instead of by" >&2
+    echo "hand. Zero means this scan is no longer looking at them: check the perimeter" >&2
+    echo "($SCAN_DIRS), the file extensions, the test-file" >&2
+    echo "filter, and the <Button> detection." >&2
     exit 3
 fi
 
