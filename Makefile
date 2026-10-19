@@ -168,6 +168,7 @@ test: ## Run all tests
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 	@bash scripts/verify-egress-no-log.sh
 	@bash scripts/test-verify-egress-no-log.sh
+	@bash scripts/test-audit-egress-no-log.sh
 	@bash scripts/verify-egress-manifest.sh
 	@bash scripts/test-verify-egress-manifest.sh
 	@bash scripts/test-dispatch-symmetry.sh
@@ -292,9 +293,10 @@ verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --s
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 
-verify-egress-no-log: ## Enforce no-log discipline on the egress substrate + pin the guard's negative behaviour (mika#1810 E4 / mika#2054)
+verify-egress-no-log: ## Enforce no-log discipline on the egress substrate + pin the guard's negative behaviour + the runtime audit's declared event list (mika#1810 E4 / mika#2054 / mika#2788)
 	@bash scripts/verify-egress-no-log.sh
 	@bash scripts/test-verify-egress-no-log.sh
+	@bash scripts/test-audit-egress-no-log.sh
 
 verify-egress-manifest: ## Enforce manifest<->code lockstep on outbound sinks + pin the guard's four directions (mika#2408)
 	@bash scripts/verify-egress-manifest.sh --report
