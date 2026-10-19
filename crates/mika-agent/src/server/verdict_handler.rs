@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
-use crate::messaging::MessageSender;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::perimeter::{self, Classification};
 use crate::skills::SkillRegistry;
 use crate::task_state::merge_metadata;
@@ -1370,7 +1370,7 @@ async fn handle_block_ac(
 
         // Notify operator
         if let Some(sender) = message_sender {
-            send_notification(
+            send_notification_p0(
                 sender,
                 &format!(
                     "PR #{} on {} — block[ac] retry limit ({}) reached from @{}. \
@@ -1657,7 +1657,7 @@ async fn handle_block_ci(
         }
 
         if let Some(sender) = message_sender {
-            send_notification(
+            send_notification_p0(
                 sender,
                 &format!(
                     "PR #{} on {} — block[ci] retry limit ({}) reached from @{}. \
@@ -1865,7 +1865,7 @@ async fn handle_escalate(
 
     // Notify operator
     if let Some(sender) = message_sender {
-        send_notification(
+        send_notification_p0(
             sender,
             &format!(
                 "PR #{} on {} — VERDICT: block[{reason}] from @{}. \
@@ -2343,7 +2343,7 @@ async fn pr_circuit_breaker_check(
     }
 
     if let Some(sender) = message_sender {
-        send_notification(
+        send_notification_p0(
             sender,
             &format!(
                 "PR #{} on {} — circuit breaker tripped after {} blocking-verdict observations \
@@ -2631,7 +2631,7 @@ async fn check_identical_diff_circuit_breaker(
 
         // Notify operator
         if let Some(sender) = message_sender {
-            send_notification(
+            send_notification_p0(
                 sender,
                 &format!(
                     "PR #{} on {} — identical-diff circuit breaker fired ({verdict_class}). \
@@ -2696,17 +2696,49 @@ fn truncate_body_for_log(body: &str) -> &str {
 }
 
 /// Send a notification via the message sender, absorbing errors.
+///
+/// Routine tier (`P2`) — the chat the operator may mute. For the breakage
+/// class, call [`send_notification_p0`] (mika#1381).
 async fn send_notification(sender: &Arc<dyn MessageSender>, message: &str) {
-    match sender.send(message).await {
+    report_notification_outcome(sender.send(message).await, NotificationSeverity::P2);
+}
+
+/// Send an operator notification of the `P0` tier — « the loop is dead, a human
+/// must step in » (mika#1381). Routed to `MIKA_OPERATOR_ESCALATION_CHAT_ID` when
+/// one is configured, and to the normal chat with a named WARN when not.
+///
+/// Deliberately a **second** helper rather than a `severity` parameter on
+/// `send_notification`: vol 1 of mika#1381 keeps the ten P2 callsites textually
+/// unchanged, so a reviewer's diff shows only the sites whose routing moved. The
+/// merge into one helper carrying an explicit severity is vol 2.
+async fn send_notification_p0(sender: &Arc<dyn MessageSender>, message: &str) {
+    report_notification_outcome(
+        sender
+            .send_with_severity(message, NotificationSeverity::P0)
+            .await,
+        NotificationSeverity::P0,
+    );
+}
+
+/// Shared outcome handling for both tiers — one copy, so the two helpers above
+/// cannot drift in what they log.
+fn report_notification_outcome(
+    outcome: anyhow::Result<crate::messaging::SendOutcome>,
+    severity: NotificationSeverity,
+) {
+    match outcome {
         Ok(crate::messaging::SendOutcome::Delivered) => {}
         Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-            warn!(reason = %reason, "Verdict handler notification delivery failed");
+            warn!(reason = %reason, severity = severity.as_str(), "Verdict handler notification delivery failed");
         }
         Ok(crate::messaging::SendOutcome::NoChannel) => {
-            warn!("Verdict handler notification skipped — no reply channel (chat_id=0)");
+            warn!(
+                severity = severity.as_str(),
+                "Verdict handler notification skipped — no reply channel (chat_id=0)"
+            );
         }
         Err(e) => {
-            warn!(error = %e, "Failed to send verdict handler notification");
+            warn!(error = %e, severity = severity.as_str(), "Failed to send verdict handler notification");
         }
     }
 }

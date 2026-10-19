@@ -64,7 +64,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
-use crate::messaging::MessageSender;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     CheckClassification, classify_checks, run_gh_checks, run_gh_subprocess,
@@ -448,7 +448,7 @@ pub async fn try_handle_ci_failure(
                  Escalating for manual intervention. Task: {}",
                 event.conclusion, event.repo, pr.number, event.branch, MAX_CI_FIX_COUNT, task.id
             );
-            send_notification(sender, &notification).await;
+            send_notification_p0(sender, &notification).await;
         }
 
         return VerdictAction::Handled {
@@ -1057,17 +1057,45 @@ async fn fetch_job_log(check_link: &str, repo: &str, token: &str) -> Option<Stri
 // Notification helper
 // ---------------------------------------------------------------------------
 
+/// Routine tier (`P2`) — the chat the operator may mute. For the breakage class,
+/// call [`send_notification_p0`] (mika#1381).
 async fn send_notification(sender: &Arc<dyn MessageSender>, message: &str) {
-    match sender.send(message).await {
+    report_notification_outcome(sender.send(message).await, NotificationSeverity::P2);
+}
+
+/// Send an operator notification of the `P0` tier (mika#1381) — here, CI fix
+/// attempts exhausted: the loop has stopped making progress on its own.
+///
+/// A **second** helper rather than a `severity` parameter, so vol 1 leaves the
+/// two P2 callsites textually unchanged; the merge is vol 2.
+async fn send_notification_p0(sender: &Arc<dyn MessageSender>, message: &str) {
+    report_notification_outcome(
+        sender
+            .send_with_severity(message, NotificationSeverity::P0)
+            .await,
+        NotificationSeverity::P0,
+    );
+}
+
+/// Shared outcome handling for both tiers — one copy, so the two helpers above
+/// cannot drift in what they log.
+fn report_notification_outcome(
+    outcome: anyhow::Result<crate::messaging::SendOutcome>,
+    severity: NotificationSeverity,
+) {
+    match outcome {
         Ok(crate::messaging::SendOutcome::Delivered) => {}
         Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-            warn!(reason = %reason, "CI failure handler notification delivery failed");
+            warn!(reason = %reason, severity = severity.as_str(), "CI failure handler notification delivery failed");
         }
         Ok(crate::messaging::SendOutcome::NoChannel) => {
-            warn!("CI failure handler notification skipped — no reply channel (chat_id=0)");
+            warn!(
+                severity = severity.as_str(),
+                "CI failure handler notification skipped — no reply channel (chat_id=0)"
+            );
         }
         Err(e) => {
-            warn!(error = %e, "Failed to send CI failure handler notification");
+            warn!(error = %e, severity = severity.as_str(), "Failed to send CI failure handler notification");
         }
     }
 }

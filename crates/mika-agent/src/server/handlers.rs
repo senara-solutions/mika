@@ -1737,7 +1737,10 @@ pub(super) async fn run_agent_for_message(
         Some(a.db.agent_id().to_string()),
         None,
         a.settings.customer_id.clone(),
-    );
+    )
+    // The rail that carries operator notifications — arm the P0 surface on it
+    // (mika#1381). `None` here is the single-channel deployment, not an error.
+    .with_escalation_chat_id(a.settings.operator_escalation_chat_id);
     let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
     // mika#2675 — le texte tel que le gateway l'a délivré, avant que les

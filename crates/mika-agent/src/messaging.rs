@@ -25,6 +25,56 @@ pub enum SendOutcome {
     NoChannel,
 }
 
+/// Severity tier of an operator notification (mika#1381).
+///
+/// There is exactly one question this axis answers: *must this line cross a
+/// mute?* Two variants, therefore — a `P1` without a distinct destination would
+/// only be a third name for the normal chat.
+///
+/// - `P0` — « the machine is broken or stalled, a human must step in ».
+///   Routed to the escalation chat when one is configured.
+/// - `P2` — everything else, including nominal hand-backs where the machine did
+///   its job. Routed to the normal chat, which the operator may mute.
+///
+/// The P0 surface stays **low-volume by construction**: a "never-muted" surface
+/// receiving seventeen classes of message is a surface that will be muted. See
+/// `docs/plans/2026-10-19-001-feat-1381-notifications-severity-tiered-operator-plan.md`
+/// § *Classification des 17 sites* for the per-site arbitration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationSeverity {
+    /// Breakage or stall requiring operator intervention.
+    P0,
+    /// Routine acknowledgement — the machine is working.
+    P2,
+}
+
+impl NotificationSeverity {
+    /// Stable token for structured log fields.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::P0 => "p0",
+            Self::P2 => "p2",
+        }
+    }
+}
+
+/// Which surface a notification resolved to (mika#1381).
+///
+/// This is the discriminant the routing tests assert and the fallback WARN
+/// reads — the resolved `chat_id` alone cannot distinguish "the escalation chat
+/// happens to equal the normal chat" from "there is no escalation chat".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// The normal chat, as every notification used before mika#1381.
+    Normal,
+    /// The dedicated escalation chat.
+    Escalation,
+    /// A P0 that found no usable escalation chat and fell back to the normal
+    /// one. Always paired with the `operator_escalation_chat_unset` WARN — a
+    /// silent fallback is the "alarm into the void" this work exists to close.
+    EscalationUnsetFallback,
+}
+
 /// Trait for sending outbound messages to the user.
 /// CLI mode uses the fallback in send_message tool; HTTP mode will POST to the gateway.
 ///
@@ -40,6 +90,20 @@ pub enum SendOutcome {
 #[async_trait]
 pub trait MessageSender: Send + Sync {
     async fn send(&self, text: &str) -> Result<SendOutcome>;
+
+    /// Send carrying an explicit operator severity (mika#1381).
+    ///
+    /// **Default: the severity is ignored.** A rail with no second channel
+    /// (`NoopSender`, the CLI rail, every test double) keeps exactly its
+    /// current behaviour and needs no edit. Only `GatewayMessageSender`
+    /// overrides this.
+    async fn send_with_severity(
+        &self,
+        text: &str,
+        _severity: NotificationSeverity,
+    ) -> Result<SendOutcome> {
+        self.send(text).await
+    }
 }
 
 /// Sends outbound messages by POSTing to the gateway's /send endpoint.
@@ -64,6 +128,14 @@ pub struct GatewayMessageSender {
     /// (CLI/dev, single-bot deployments), the field is omitted and the gateway
     /// falls back to its global single-bot path — no behavioral change.
     customer_id: Option<String>,
+    /// Dedicated escalation chat for `P0` notifications (mika#1381), from
+    /// `MIKA_OPERATOR_ESCALATION_CHAT_ID` → `Settings.operator_escalation_chat_id`.
+    ///
+    /// `None` is the nominal state (a deployment with a single channel): a P0
+    /// then falls back to the normal chat with a named WARN. Armed via
+    /// [`GatewayMessageSender::with_escalation_chat_id`], never through
+    /// `new()` — see that method for why.
+    escalation_chat_id: Option<i64>,
 }
 
 impl GatewayMessageSender {
@@ -91,6 +163,48 @@ impl GatewayMessageSender {
             agent_name,
             chat_id,
             customer_id,
+            escalation_chat_id: None,
+        }
+    }
+
+    /// Arm the second channel for `P0` notifications (mika#1381). Chainable
+    /// behind `new()` so that the constructor's arity — and its 16 callsites,
+    /// 10 of which are tests — does not move for a field only 2 of them care
+    /// about.
+    ///
+    /// Chained rather than a `builder()` entry point for a second, structural
+    /// reason: `qa_head_supersession.rs` scans the literal
+    /// `"GatewayMessageSender::new("` inside `run_agent_for_message` and
+    /// asserts it follows `skip_superseded_review_turn(`. A chained builder
+    /// leaves that literal in place; a `GatewayMessageSender::builder()` entry
+    /// point would redden `mika2671_b2_la_garde_de_revue_precede_le_tour` with
+    /// an error message that does not explain why.
+    pub fn with_escalation_chat_id(mut self, chat_id: Option<i64>) -> Self {
+        self.escalation_chat_id = chat_id;
+        self
+    }
+
+    /// Resolve which chat a notification of this severity goes to (mika#1381).
+    ///
+    /// Pure past the already-resolved `normal_chat_id`, so routing is testable
+    /// without an HTTP server — the same property `resolve_chat_id` and
+    /// `build_payload` already have.
+    ///
+    /// `Some(0)` is refused as a route: `chat_id == 0` is the documented
+    /// "no reply channel" sentinel that `send()` short-circuits on before any
+    /// POST (mika#650/#1090), so an escalation chat set to `0` would swallow
+    /// every P0 silently — the exact failure mode mika#1381 closes.
+    fn resolve_notification_target(
+        &self,
+        severity: NotificationSeverity,
+        normal_chat_id: i64,
+    ) -> (i64, TargetKind) {
+        match severity {
+            NotificationSeverity::P2 => (normal_chat_id, TargetKind::Normal),
+            NotificationSeverity::P0 => match self.escalation_chat_id {
+                Some(id) if id != 0 => (id, TargetKind::Escalation),
+                _ => (normal_chat_id, TargetKind::EscalationUnsetFallback),
+            },
         }
     }
 
@@ -172,8 +286,40 @@ impl GatewayMessageSender {
 
 #[async_trait]
 impl MessageSender for GatewayMessageSender {
+    /// Delegates to [`Self::send_with_severity`] with `P2` (mika#1381).
+    ///
+    /// This direction — and not the reverse — is what guarantees the two paths
+    /// cannot drift: there is exactly one copy of the resolve/payload/retry/
+    /// failed_sends sequence, and `P2` resolves to the same chat `send()`
+    /// always used.
     async fn send(&self, text: &str) -> Result<SendOutcome> {
-        let chat_id = self.resolve_chat_id().await?;
+        self.send_with_severity(text, NotificationSeverity::P2)
+            .await
+    }
+
+    async fn send_with_severity(
+        &self,
+        text: &str,
+        severity: NotificationSeverity,
+    ) -> Result<SendOutcome> {
+        let normal_chat_id = self.resolve_chat_id().await?;
+        let (chat_id, target) = self.resolve_notification_target(severity, normal_chat_id);
+
+        // A P0 that found no escalation chat must never fall back in silence —
+        // that is the "alarm into the void" this work exists to close. One named
+        // WARN, greppable, carrying the chat it fell back to.
+        if target == TargetKind::EscalationUnsetFallback {
+            warn!(
+                event = "operator_escalation_chat_unset",
+                agent_name = ?self.agent_name,
+                request_id = ?self.request_id,
+                severity = severity.as_str(),
+                fallback_chat_id = chat_id,
+                "operator_escalation_chat_unset: P0 notification falls back to the \
+                 normal chat — set MIKA_OPERATOR_ESCALATION_CHAT_ID to a non-zero \
+                 chat so breakage alarms survive a mute"
+            );
+        }
 
         // chat_id == 0 is the documented sentinel for "no reply channel" (GitHub
         // webhooks, non-Telegram sessions). Short-circuit before the HTTP POST —
@@ -186,6 +332,7 @@ impl MessageSender for GatewayMessageSender {
                 agent_name = ?self.agent_name,
                 request_id = ?self.request_id,
                 message_text = %truncate_for_log(text, 500),
+                severity = severity.as_str(),
                 "send_message_nochannel: message lost — chat_id=0, no reply channel available"
             );
             return Ok(SendOutcome::NoChannel);
@@ -195,6 +342,8 @@ impl MessageSender for GatewayMessageSender {
             agent_name = ?self.agent_name,
             chat_id,
             text_len = text.len(),
+            severity = severity.as_str(),
+            target = ?target,
             "GatewayMessageSender: sending outbound message"
         );
 
@@ -590,5 +739,114 @@ mod tests {
     #[test]
     fn test_truncate_for_log_zero_limit() {
         assert_eq!(truncate_for_log("hello", 0), "");
+    }
+
+    // --- severity-tiered operator notifications (mika#1381) ---
+    //
+    // The routing decision is asserted on `resolve_notification_target`, not
+    // through `send()`: the selector is pure past the already-resolved normal
+    // chat, so these four cases need no HTTP server and no gateway — the same
+    // property `resolve_chat_id` and `build_payload` are tested on above.
+
+    /// Fixture carrying only what the selector reads. `chat_id` is the explicit
+    /// override so `resolve_chat_id` is deterministic, even though these tests
+    /// pass the normal chat in directly.
+    fn sender_with_escalation(escalation: Option<i64>) -> GatewayMessageSender {
+        let harness = TestHarness::with_agent("severity-agent");
+        GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("severity-agent".to_string()),
+            Some(111),
+            None,
+        )
+        .with_escalation_chat_id(escalation)
+    }
+
+    /// AC2 — a `P0` leaves for the escalation chat when one is armed.
+    #[test]
+    fn mika1381_un_p0_part_sur_le_chat_descalade() {
+        let sender = sender_with_escalation(Some(222));
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P0, 111),
+            (222, TargetKind::Escalation),
+            "un P0 doit quitter le chat normal pour le chat d'escalade"
+        );
+    }
+
+    /// AC3 — a `P2` ignores the escalation chat even when one is armed. This is
+    /// the half that makes the mute usable: a P2 routed to the never-muted
+    /// surface would re-create the problem on the other side.
+    #[test]
+    fn mika1381_un_p2_ignore_le_chat_descalade() {
+        let sender = sender_with_escalation(Some(222));
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P2, 111),
+            (111, TargetKind::Normal),
+            "un P2 reste sur le chat normal, chat d'escalade armé ou non"
+        );
+    }
+
+    /// AC4 — a `P0` with no escalation chat falls back to the normal chat and is
+    /// marked as such. Deliberately a fallback and not a drop: a deployment with
+    /// a single channel is the nominal state (D4), and losing the alarm would be
+    /// worse than delivering it to a chat the operator may have muted.
+    #[test]
+    fn mika1381_un_p0_sans_chat_descalade_retombe_sur_le_chat_normal() {
+        let sender = sender_with_escalation(None);
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P0, 111),
+            (111, TargetKind::EscalationUnsetFallback),
+            "sans second canal, le P0 retombe sur le chat normal — et le dit"
+        );
+    }
+
+    /// AC5 — `Some(0)` is refused as a route. `chat_id == 0` is the documented
+    /// "no reply channel" sentinel `send()` short-circuits on, so honouring it
+    /// as an escalation chat would swallow every P0 in silence.
+    #[test]
+    fn mika1381_un_chat_descalade_a_zero_est_refuse_comme_route() {
+        let sender = sender_with_escalation(Some(0));
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P0, 111),
+            (111, TargetKind::EscalationUnsetFallback),
+            "Some(0) vaut « pas de chat d'escalade », jamais « route vers 0 »"
+        );
+    }
+
+    /// AC6 — the trait's default method ignores the severity and delegates to
+    /// `send`. This is what lets every rail without a second channel (the CLI,
+    /// `NoopSender`, ~24 `impl MessageSender` blocks across `src/` and
+    /// `tests/eval/`) stay untouched by mika#1381.
+    #[tokio::test]
+    async fn mika1381_le_defaut_du_trait_ignore_la_severite() {
+        /// Records what reached `send`, so the test asserts delegation rather
+        /// than merely a successful outcome.
+        struct RecordingSender(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl MessageSender for RecordingSender {
+            async fn send(&self, text: &str) -> Result<SendOutcome> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(SendOutcome::Delivered)
+            }
+        }
+
+        let sender = RecordingSender(std::sync::Mutex::new(Vec::new()));
+        for severity in [NotificationSeverity::P0, NotificationSeverity::P2] {
+            assert_eq!(
+                sender.send_with_severity("alarme", severity).await.unwrap(),
+                SendOutcome::Delivered
+            );
+        }
+
+        assert_eq!(
+            *sender.0.lock().unwrap(),
+            vec!["alarme".to_string(), "alarme".to_string()],
+            "le défaut du trait passe le texte à send(), quelle que soit la sévérité"
+        );
     }
 }

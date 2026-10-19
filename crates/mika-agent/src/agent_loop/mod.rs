@@ -34,7 +34,7 @@ use crate::evidence::guards::{
     undelivered_send_correction, undelivered_sends,
 };
 use crate::mcp::McpManager;
-use crate::messaging::MessageSender;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::post_condition::{GuardDecision, POST_CONDITION_GUARDS};
 use crate::prompt;
 use crate::skills::SkillRegistry;
@@ -4257,7 +4257,13 @@ async fn run_loop(
                                  label.",
                                 tool_ctx.trace_id
                             );
-                            let _ = sender.send(&notification).await;
+                            // The flagship P0 of mika#1381: the `ready` label is
+                            // gone and dispatch never ran, so the loop is dead and
+                            // no further webhook will say so. This is the one line
+                            // that must cross a mute.
+                            let _ = sender
+                                .send_with_severity(&notification, NotificationSeverity::P0)
+                                .await;
                         }
                     }
 
