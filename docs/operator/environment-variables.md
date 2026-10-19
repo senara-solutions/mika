@@ -8719,6 +8719,75 @@ mika#2340) : **établir le déploiement avant toute conclusion sur les valeurs.*
   tenant Telegram (l'unité y est le *chat*, ni la session ni l'agent) —
   **suivi**, précondition : la sonde S2.
 
+### La cérémonie de handsoff au plafond de contexte (mika#1748)
+
+**Une variable, et elle est ici** parce que l'opérateur qui cherche « comment la
+fenêtre de conversation se comporte en approchant sa limite » cherche dans le
+voisinage de la section précédente, qui règle la même fenêtre.
+
+Optional (cérémonie de témoignage avant compaction — mika#1748) :
+- `MIKA_COMPACTION_HANDSOFF_THRESHOLD_PCT` — pourcentage de
+  `compaction::COMPACTION_THRESHOLD` (50 messages) au-delà duquel l'agent se voit
+  demander d'écrire un témoignage avant la condensation. Défaut **85** →
+  franchissement à **43 messages**. Bornes **1..=100** inclusives.
+
+  **Le seuil est en MESSAGES, pas en tokens**, et c'est le fond du réglage :
+  `count_messages()` comparé à `COMPACTION_THRESHOLD` est la grandeur sur
+  laquelle le substrat décide réellement de condenser. Un pourcentage de tokens
+  serait un second instrument mesurant une autre grandeur que celle qui déclenche
+  l'événement qu'il prétend précéder — il pourrait rester sous son seuil au
+  moment où la compaction tire, ou tirer trois fois sans qu'elle approche.
+
+  **Trois paliers.** Absent ou vide → défaut, silencieusement (c'est la forme
+  nominale de toute installation). Hors `1..=100` ou non numérique → **défaut
+  plus un WARN** `compaction_handsoff_threshold_invalid`, nommant la valeur
+  reçue, le défaut appliqué et la variable : *un réglage qu'on ne peut pas
+  observer n'est pas un réglage, c'est un espoir* (mika#2293). **`0` est refusé
+  comme toute autre valeur hors bornes** — il signifierait « cérémonie dès le
+  premier message », ce que personne ne demande, et l'interpréter comme
+  « désarmé » installerait deux lectures pour une même valeur. Il n'y a pas de
+  sentinelle de désarmement sur cet axe dans ce vol.
+
+  **Lue à chaque tour**, directement depuis l'environnement (même geste que
+  `db::dispatch_slot_lease_ttl_secs()`), donc un changement prend effet au tour
+  suivant sans redémarrage — mais il n'y a **pas de réglage par agent** : la
+  population de fait est l'ensemble des agents conversationnels, et un
+  `config.toml` de plus à réconcilier répondrait à un besoin que personne n'a
+  mesuré.
+
+- **Surfaces opérateur** (`$MIKA_SPIRIT_LOG_FILE`, toutes sur
+  `target: "mika::otel"`) :
+
+```bash
+# 1. Quels agents approchent leur plafond, et à quel compte ?
+grep compaction_handsoff_due "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent, messages, threshold_pct, window}'
+
+# 2. Le comptage a-t-il échoué quelque part ? (fail-open : le tour continue)
+grep compaction_handsoff_count_failed "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Une valeur de seuil a-t-elle été refusée ?
+grep compaction_handsoff_threshold_invalid "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. Le témoignage a-t-il été écrit ?
+ls -1 ~/.mika/agents/<nom>/handsoffs/
+```
+
+- **`compaction_handsoff_due` n'est PAS émis au régime nominal, et c'est voulu.**
+  Au-dessous du seuil cette ligne tomberait à chaque tour de chaque agent, et un
+  instrument qui parle tout le temps ne dit plus rien. Le pendant négatif — « le
+  seuil n'est pas franchi » — se lit à l'**absence** de ligne pour un agent dont
+  on connaît le compte de messages. Son absence peut aussi vouloir dire
+  « binaire antérieur à mika#1748 » (classe mika#2340) : l'instrument n'est pas
+  vivant avant un `make deploy`.
+- **Halte de lecture.** Sonde 1 verte et sonde 4 vide ⇒ le défaut est dans
+  l'obéissance au bloc de prompt, **pas** dans la détection. Ne pas déplacer le
+  seuil : c'est la cérémonie qu'il faut regarder, pas le détecteur.
+- **Ce que ce vol n'achète PAS** : le successeur ne lit pas encore le témoignage
+  à son premier démarrage (AC5), et la boucle silencieuse ne rend pas le bloc —
+  **suivi** à `senara-solutions/mika#2805`. Raisonnement complet, tables de
+  lecture et gardes de résidu : `docs/architecture/compaction-handsoff.md`.
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)

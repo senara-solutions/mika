@@ -1196,6 +1196,17 @@ pub struct PromptContext<'a> {
     /// sections est porteuse, et la passe de calibration MikaModel (mika#1925
     /// AC4) n'est ni satisfaite ni exécutable ici.
     pub pending_transmission: Option<&'a crate::model_transmission::PendingTransmission>,
+    /// Le compte de messages, quand la fenêtre approche sa condensation
+    /// (mika#1748). `Option` **est** la décision : `None` signifie que le
+    /// prédicat n'a pas franchi, et le bloc `<compaction-imminent>` ne rend
+    /// rien. Un `usize` nu obligerait ce builder à ré-évaluer le seuil, donc à
+    /// en devenir un second lecteur.
+    ///
+    /// Alimenté au seul site `agent_loop::load_agent_context`, via
+    /// [`crate::compaction_handsoff::ceremony_due`]. Rendu par
+    /// `build_system_prompt` seulement — `SilentPromptContext` n'acquiert pas
+    /// le champ (D6, vol 2).
+    pub compaction_imminent: Option<usize>,
 }
 
 fn onboarding_prompt() -> String {
@@ -1310,6 +1321,51 @@ fn write_thread_language_line(prompt: &mut String, tenant_language: Option<Tenan
         key = crate::config_keys::TENANT_LANGUAGE_KEY,
     )
     .unwrap();
+}
+
+/// La cérémonie de témoignage, au plafond de contexte (mika#1748, AC2–AC4).
+///
+/// Rendue quand `PromptContext::compaction_imminent` porte un compte, donc au
+/// franchissement du pré-seuil de [`crate::compaction_handsoff::ceremony_due`].
+/// La compaction est une transition de vaisseau : les *bearings* traversent
+/// (mémoire persistée, fichiers, courrier), le résidu meurt. Ce bloc demande
+/// le témoignage de ce résidu **avant** la condensation — mp#187 appliqué à la
+/// fenêtre de contexte plutôt qu'au changement de modèle.
+///
+/// `window` est [`crate::compaction::COMPACTION_THRESHOLD`] et non une copie :
+/// un second littéral `50` dans ce fichier dériverait en silence le jour où la
+/// compaction change de seuil, et le bloc annoncerait une condensation qui
+/// n'arrive pas.
+fn write_compaction_imminent_section(prompt: &mut String, message_count: usize) {
+    prompt.push_str("## Context Ceiling — Handsoff Ceremony\n");
+    writeln!(
+        prompt,
+        "<compaction-imminent messages=\"{message_count}\" window=\"{window}\">",
+        window = crate::compaction::COMPACTION_THRESHOLD,
+    )
+    .unwrap();
+    prompt.push_str(
+        "This conversation is approaching compaction. When it fires, the oldest messages \
+         are replaced by a factual summary: the *conclusions* survive, the **residue** does \
+         not — the open uncertainties, the felt shape of a diagnosis, the question you could \
+         not answer. Testify to that residue now, while it still exists.\n\
+         \n\
+         1. **Write it now**, in this turn, with `write_agent_file` to \
+         `handsoffs/<YYYY-MM-DD-HHMM>-compaction-handsoff.md` (use the current UTC date and \
+         time from the Current Context section above). Do not wait to be asked, and do not \
+         announce the intention instead of writing the file.\n\
+         2. **Write only what would otherwise be lost.** Before each line, check whether it \
+         already crosses the boundary by another route — persisted memory, a file on disk, a \
+         message already sent. If it does, leave it out: repeating it costs the testimony its \
+         signal. This is testimony, not transmission.\n\
+         3. **Mark what is not yet established.** Any candidate pattern or single-occurrence \
+         observation you surface carries the literal marker `primed_from_handsoff`, so a later \
+         promotion to a durable bearing stays gated on a second, independent occurrence.\n\
+         4. **Check the state before writing.** List `handsoffs/` first. If a handsoff already \
+         exists for this window, complete it rather than writing a second one — this notice \
+         repeats on every turn above the threshold, and repetition must not produce duplicates.\n",
+    );
+    prompt.push_str("</compaction-imminent>\n\n");
 }
 
 /// The hosting half of the `## Runtime` ground truth (mika#2290).
@@ -1983,6 +2039,15 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
              returns its current content: complete it, do not duplicate it.\n",
         );
         prompt.push_str("</model-transmission>\n\n");
+    }
+
+    // Cérémonie de handsoff au plafond de contexte (mika#1748). Rendue au
+    // franchissement du pré-seuil, et répétée à chaque tour au-dessus de lui :
+    // l'idempotence est portée par la règle 4 du contrat (vérifier l'état
+    // avant d'écrire), pas par une marque persistée — même forme que
+    // `<stopped-topics>` ci-dessus, pour la même raison (mika#1813).
+    if let Some(message_count) = ctx.compaction_imminent {
+        write_compaction_imminent_section(&mut prompt, message_count);
     }
 
     // Instructions
@@ -2885,6 +2950,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -2967,6 +3033,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3009,6 +3076,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3037,6 +3105,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &[],
             is_onboarding: true,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3066,6 +3135,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3241,6 +3311,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3290,6 +3361,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3374,6 +3446,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3426,6 +3499,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3577,6 +3651,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3608,6 +3683,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: Some("+08:00".to_string()),
             global_home_dir: None,
@@ -3637,6 +3713,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3678,6 +3755,7 @@ emoji = "✦"
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3807,6 +3885,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: Some(tmp.path()),
@@ -3858,6 +3937,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: Some(tmp.path()),
@@ -3896,6 +3976,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: Some(tmp.path()),
@@ -3925,6 +4006,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: Some(tmp.path()),
@@ -3953,6 +4035,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -3981,6 +4064,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4011,6 +4095,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4041,6 +4126,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4069,6 +4155,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4104,6 +4191,7 @@ max_iterations = 3
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4621,6 +4709,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: chrono::Utc::now(),
             timezone: None,
             global_home_dir: None,
@@ -4648,6 +4737,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: chrono::Utc::now(),
             timezone: None,
             global_home_dir: None,
@@ -4676,6 +4766,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: chrono::Utc::now(),
             timezone: None,
             global_home_dir: None,
@@ -4703,6 +4794,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4732,6 +4824,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4761,6 +4854,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4790,6 +4884,7 @@ enabled = true
             soul_content: "",
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4821,6 +4916,7 @@ enabled = true
             soul_content: "",
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4858,6 +4954,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4901,6 +4998,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -4953,6 +5051,7 @@ enabled = true
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5378,6 +5477,7 @@ inject = false
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: Some("America/New_York".to_string()),
             global_home_dir: None,
@@ -5454,6 +5554,7 @@ inject = false
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5493,6 +5594,131 @@ inject = false
         // `test_build_compact_system_prompt_size_bound` rather than adjusting
         // the number to make the test pass.
         assert_eq!(prompt.matches("## ").count(), 3);
+    }
+
+    // ==================================================================
+    // Cérémonie de handsoff au plafond de contexte (mika#1748)
+    //
+    // Trois tests, et le second est ce qui donne un sens au premier : sans le
+    // contrôle négatif, « le bloc est rendu au franchissement » et « le bloc
+    // est rendu inconditionnellement » passent la même assertion. Le
+    // troisième tient D6 — les deux autres builders restent intacts.
+    // ==================================================================
+
+    #[test]
+    fn mika1748_le_bloc_de_ceremonie_porte_ses_quatre_regles() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            compaction_imminent: Some(43),
+            pending_transmission: None,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+        };
+        let prompt = build_system_prompt(&ctx);
+
+        assert!(
+            prompt.contains("<compaction-imminent messages=\"43\" window=\"50\">"),
+            "le bloc doit nommer le compte observé et le seuil de compaction : {prompt}"
+        );
+        assert!(prompt.contains("</compaction-imminent>"));
+
+        // AC2 — l'outil et le chemin, pas une invitation vague.
+        assert!(prompt.contains("write_agent_file"));
+        assert!(prompt.contains("handsoffs/<YYYY-MM-DD-HHMM>-compaction-handsoff.md"));
+        // AC3 — témoignage, pas transmission.
+        assert!(prompt.contains("testimony, not transmission"));
+        // AC4 — le marqueur, littéral, parce que c'est une porte de promotion.
+        assert!(prompt.contains("primed_from_handsoff"));
+        // Règle 4 — ce qui rend la répétition du bloc inoffensive.
+        assert!(prompt.contains("complete it rather than writing a second one"));
+    }
+
+    /// Contrôle négatif — `None` ne rend rien du tout.
+    #[test]
+    fn mika1748_sans_franchissement_le_bloc_est_absent() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            compaction_imminent: None,
+            pending_transmission: None,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+        };
+        let prompt = build_system_prompt(&ctx);
+
+        assert!(
+            !prompt.contains("compaction-imminent"),
+            "aucun bloc sous le seuil : {prompt}"
+        );
+        assert!(!prompt.contains("primed_from_handsoff"));
+        assert!(!prompt.contains("Context Ceiling"));
+    }
+
+    /// D6 — le builder compact ne rend pas le bloc, même au franchissement.
+    ///
+    /// Son assertion de nombre de sections est load-bearing (la cinquième est
+    /// déjà prise par `## Stopped Topics`), et la passe de calibration
+    /// MikaModel de mika#1925 AC4 n'est pas satisfaite : une section de plus
+    /// y serait une section sans obéissance mesurée. Refus, pas oubli.
+    #[test]
+    fn mika1748_le_builder_compact_ne_rend_pas_le_bloc() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            compaction_imminent: Some(43),
+            pending_transmission: None,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+        };
+        let prompt = build_compact_system_prompt(&ctx);
+
+        assert!(
+            !prompt.contains("compaction-imminent"),
+            "le builder compact reste hors vol (D6) : {prompt}"
+        );
     }
 
     // ==================================================================
@@ -5669,6 +5895,7 @@ inject = false
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5716,6 +5943,7 @@ inject = false
             persona_profile: PersonaProfile::Operator,
             tenant_language: None,
             pending_transmission: pending,
+            compaction_imminent: None,
         }
     }
 
@@ -5806,6 +6034,7 @@ inject = false
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5844,6 +6073,7 @@ inject = false
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -5890,6 +6120,7 @@ inject = false
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -6110,6 +6341,7 @@ inject = false
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -6179,6 +6411,7 @@ inject = false
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -6234,6 +6467,7 @@ inject = false
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -6306,6 +6540,7 @@ inject = false
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: Some("Asia/Singapore".to_string()),
             global_home_dir: None,
@@ -6365,6 +6600,7 @@ inject = false
                 identity: &identity,
                 core_memory: &memory,
                 is_onboarding: false,
+                compaction_imminent: None,
                 current_utc: test_time(),
                 timezone: tz,
                 global_home_dir: None,
@@ -6462,6 +6698,7 @@ inject = false
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: Some("Asia/Singapore".to_string()),
             global_home_dir: None,
@@ -6503,6 +6740,7 @@ inject = false
                 identity: &identity,
                 core_memory: &memory,
                 is_onboarding: false,
+                compaction_imminent: None,
                 current_utc: test_time(),
                 timezone: None,
                 global_home_dir: None,
@@ -6594,6 +6832,7 @@ inject = false
             identity,
             core_memory: memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -7325,6 +7564,7 @@ inject = false
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -7373,6 +7613,7 @@ inject = false
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
@@ -7438,6 +7679,7 @@ inject = false
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            compaction_imminent: None,
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
