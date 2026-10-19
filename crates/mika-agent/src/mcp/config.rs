@@ -70,6 +70,24 @@ pub struct McpServerConfig {
     /// Le grade vaut pour **tous** les outils du serveur. La granularité par
     /// outil est une affaire de v2 : aucun serveur v1 connu n'expose des outils
     /// de grades mêlés.
+    ///
+    /// Depuis mika#2814, un grade `testimony` ferme les **deux** moitiés de la
+    /// doctrine : les outils du serveur ne sont jamais publiés au modèle
+    /// (`mcp::retain_publiables`, L2) *et* un appel halluciné est refusé avant
+    /// `call_tool` (L4). Avant, seule la seconde mordait.
+    ///
+    /// **Résidu connu, et non fermé ici : une clé mal orthographiée vaut
+    /// `operational` sans rien dire.** `"dataGrade": "testimony"` dans l'entrée
+    /// d'un serveur se lit comme une clé inconnue — `serde` l'ignore, le
+    /// `#[serde(default)]` ci-dessous rend `Operational`, et le serveur publie
+    /// ses outils comme si rien n'avait été déclaré. C'est le mode de panne
+    /// exact que le défaut porteur rend *sûr par accident* (on ne gagne pas le
+    /// privilège testimony) et *dangereux par intention* (on croit l'avoir
+    /// refusé). Le remède est un avertissement au chargement sur toute clé
+    /// inconnue d'une entrée de serveur — pas un refus, parce qu'un `mcp.json`
+    /// écrit pour un autre client porte légitimement des clés que Mika ignore.
+    /// Nommé par la revue de PR #2816. Tracked in: senara-solutions/mika#2814
+    /// (vol 2).
     #[serde(default)]
     pub data_grade: DataGrade,
 }

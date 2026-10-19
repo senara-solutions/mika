@@ -139,7 +139,13 @@ Regression coverage: `tests/eval/doctrine_regressions/testimony_access_proposal_
 prescribed refusals) plus the thirteen predicate controls in
 `evidence::guards::tests::mika1960_*`.
 
-### Layer 2 — Skill registry ban (`crates/mika-agent/src/skills/mod.rs`)
+### Layer 2 — Non-publication: registry eviction + MCP tool filter
+
+**What this layer buys, in one sentence:** the model never sees the name, so it
+cannot *propose* the tool — which the doctrine forbids at the same level as
+accessing it. Layers 3 and 4 refuse an access; this one removes the offer.
+
+#### Skill side — registry eviction (`crates/mika-agent/src/skills/mod.rs`)
 
 `SkillRegistry::apply_testimony_grade_ban()` runs as Phase 2 (after
 `apply_identity_allowlist` Phase -1 and `apply_overrides` Phase 0/1, before
@@ -162,6 +168,42 @@ whose owning skill declares testimony. Does NOT cover the incumbent
 `run_gws` Gmail path, which is intentionally untagged at the skill level
 (so Calendar stays operational — the ban lives inside the tool handler
 where the granularity is; see Layer 3).
+
+#### MCP side — publication filter (`crates/mika-agent/src/mcp/mod.rs`, mika#2814)
+
+`mcp::retain_publiables(tool_definitions, tool_data_grades)` runs inside
+`McpManager::connect_all`, between the grade join and the manager's
+construction. Any namespaced tool whose server declares
+`"data_grade": "testimony"` is dropped from `tool_definitions()`, so it never
+reaches the model's tool list. One WARN line per removal
+(`event = "mcp_tool_testimony_unpublished"`, fields `tool`, `server`,
+`doctrine`), because without it "that server is not connected" and "its tools
+are banned" render the same bytes (class mika#2205).
+
+Four properties, each of which undoes itself if guessed:
+
+- **`connect_all`, not the two publication sites.** The two *non-publishing*
+  readers of `tool_definitions()` are proposal vectors too: `agent_loop`'s
+  `available_tool_names` turns a prose mention into a real call (#569), and
+  `kg::domain_builder` writes one `tool:*` entity per definition, re-proposable
+  through `query_knowledge_graph` a turn later. A manager that never carries
+  the definition closes all four readers at once; filtering at publication
+  would close two.
+- **Only the definitions are amputated.** `tool_routing` and
+  `tool_data_grades` keep the full inventory, so Layer 4 still answers
+  `TOOL_TESTIMONY_GRADE_FORBIDDEN` rather than "unknown tool" on a hallucinated
+  call. **Do not "simplify" by also pruning the routing** — that swaps a
+  doctrine for a typo in the only message an operator will read.
+- **A definition absent from the grade map is published.** The default is to
+  publish, not to censor: a hole in the map is a construction error, and a
+  silent censorship is the worst possible rendering of one.
+- **It consumes the same map Layer 4 reads**, never a second pass over
+  `config.mcp_servers`. Two reads of one fact can diverge.
+
+The manager's startup line carries `discovered`, `published` and `unpublished`
+— the last one **written even at zero**, because absent is not zero (mika#2331)
+and the line's absence means a binary older than mika#2814 (mika#2340), never
+"nothing was banned".
 
 ### Layer 3 — Per-tool subcommand ban (`crates/mika-agent/src/skills/builtin_handlers.rs`)
 
@@ -225,9 +267,15 @@ once per `ToolDispatchCtx` construction from the same matched-skill list as
    `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`
    (allowlist shipped empty).
 
-   **Residue, named rather than implied:** a testimony MCP tool stays
-   *published* in `tool_definitions()`, so the model can still **propose** it
-   — only the call is refused. See § *Vigilance surface*.
+   **The residue this paragraph used to name is closed (mika#2814).** A
+   testimony MCP tool is no longer *published* either: `connect_all` filters it
+   out of `tool_definitions()` through `mcp::retain_publiables`, so the model
+   never sees the name and cannot propose it. Layer 4 stays the last door, not
+   the only one — **`tool_routing` and `tool_data_grades` keep the full
+   inventory on purpose**, so a hallucinated call on an unpublished name is
+   refused as `TOOL_TESTIMONY_GRADE_FORBIDDEN` and not as "unknown tool". The
+   two renderings are not equivalent: the second would read as a typo where
+   there is a doctrine. See § *Layer 2* for the publication half.
 
 3. **Registry mutation via `mika skills` DB overrides.** `skill_overrides`
    DB rows can re-enable a skill after Phase 2 ran (mika#682 transient
@@ -245,9 +293,11 @@ Structural bans (refused pre-handler, no side effects):
 - **Any skill-registered tool** whose owning skill declares
   `data_grade = "testimony"` (Layers 2 + 4).
 - **Any MCP-registered tool** whose server declares
-  `"data_grade": "testimony"` in `mcp-servers.json` (Layer 4 only — there is no
-  registry-eviction equivalent on the MCP side; mika#1959). The call is
-  refused before `McpManager::call_tool`, so no remote request is issued.
+  `"data_grade": "testimony"` in `mcp-servers.json` (Layers 2 + 4 — the
+  publication half was added by mika#2814, the call half by mika#1959). The
+  tool is never published to the model, so it cannot be proposed; and if a
+  hallucinated call reaches dispatch anyway, it is refused before
+  `McpManager::call_tool`, so no remote request is issued.
 
 Bans in the doctrine but not (yet) reachable through today's tool surface:
 
@@ -308,22 +358,39 @@ If a future change does NEITHER, the only remaining defense is Layer 1 (the
 prompt) — the fragile layer the doctrine explicitly distrusts. **This is
 the single axis of vigilance for every future testimony-adjacent change.**
 
-**Option 1 now reaches MCP servers too (mika#1959)**: a server declares
-`"data_grade": "testimony"` in `mcp-servers.json` and Layer 4 fires on every one of its
-tools. Absence of the field reads `operational`, which is the load-bearing
+**Option 1 now reaches MCP servers too (mika#1959, mika#2814)**: a server
+declares `"data_grade": "testimony"` in `mcp-servers.json` and Layers 2 **and** 4
+fire on every one of its tools — never published, and refused if called anyway.
+Absence of the field reads `operational`, which is the load-bearing
 default — a manifest that forgets to declare its grade cannot accidentally
 acquire a testimony privilege; the explicit consent `"data_grade": "testimony"`
 is what means *refusal*, never permission.
 
-**What that does NOT buy, on this same axis (mika#2814).** Layer 4 refuses the
-**call**, not the **publication**. A testimony MCP tool stays in
-`tool_definitions()`, so the model can still *propose* it — and the doctrine
-forbids proposing as much as accessing. On the skills side that half is held
-structurally by Layer 2, which **evicts** the tool from the registry so it is
-never published; there is no Layer-2 equivalent on the MCP side. The partial net
-is the EndTurn guard 5h (`testimony_access_proposal`, mika#1960 phase 2 /
-mika#2627), which reads the outgoing text — a layer-1.5 net on the wording, not
-a structural door. Tracked in mika#2814.
+**And it now buys the publication half too (mika#2814).** mika#1959 refused the
+**call**, not the **publication**: a testimony MCP tool stayed in
+`tool_definitions()`, so the model could still *propose* it — and the doctrine
+forbids proposing as much as accessing. That half is closed: `connect_all`
+filters those tools out before the manager carries them (§ *Layer 2 — MCP side*),
+so MCP and skills are now held by the same two layers rather than by one each.
+
+The EndTurn guard 5h (`testimony_access_proposal`, mika#1960 phase 2 /
+mika#2627), which reads the outgoing text, **remains** — but it is now a net
+under a structural door rather than the only thing under the hole. It is still
+what catches a proposal the model verbalises from memory, from a prose mention,
+or from any surface this doctrine does not enumerate, and a layer-1.5 net on the
+wording is exactly what it should be for those.
+
+**What this does NOT buy, and where it is tracked (mika#2814, vol 2).** The
+pairing guard `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`
+compares *strings*: a publication written differently keeps it green. The remedy
+is **chosen** — a single helper that publishes and seeds together, so that the
+pairing becomes a property of the call rather than of its spelling — and
+deliberately **not implemented in this commit** (the filter lives in
+`connect_all`, so no publication site moved and the guard had nothing to catch
+here; moving both sites is its own change, with its own red to measure).
+Likewise, a misspelled key in an `mcp.json` server entry (`dataGrade` instead of
+`data_grade`) still reads `operational` without saying anything, and should warn
+at load. Tracked in: senara-solutions/mika#2814 (vol 2).
 
 ### Applied hardening (closed after mika#1798)
 
@@ -392,9 +459,9 @@ a structural door. Tracked in mika#2814.
 The four-layer defense covers the `run_gws` builtin surface + any future
 tool that declares `data_grade = "testimony"`, skill-registered or
 MCP-registered. With the `shell-exec` class closed above and the
-**MCP-registered** class closed by mika#1959 (§ *Layer 4* point 2 — its
-*propose*-side residue is tracked as mika#2814 in § *Vigilance surface*), it
-still does NOT cover:
+**MCP-registered** class closed on **both** halves — the call by mika#1959
+(§ *Layer 4* point 2), the publication by mika#2814 (§ *Layer 2 — MCP side*) —
+it still does NOT cover:
 
 - **Raw-HTTP API surfaces** — a direct
   `curl -X POST https://gmail.googleapis.com/...` reaches testimony data
@@ -448,9 +515,33 @@ still does NOT cover:
     `mcp_tool_data_grades` + `McpManager::tool_data_grades`, consumed by
     `crates/mika-agent/src/agent_loop/mod.rs` § `seed_mcp_data_grades` at the
     two sites that publish `mcp.tool_definitions()`.
+  - MCP publication filter (Layer 2): `crates/mika-agent/src/mcp/mod.rs` §
+    `retain_publiables`, called by `McpManager::connect_all` (mika#2814). It
+    consumes the **same** map `mcp_tool_data_grades` builds for L4 — one source
+    of truth for the grade, two doors. Tests: `mcp::tests::mika2814_*` (four
+    unit) + `tests/eval/test_mcp_testimony_non_publication_2814.rs` (the
+    absence measured on the bytes submitted to the model, with its positive
+    control).
 
 ## Change log
 
+- **2026-10-19** — mika#2814: the MCP tier gained its **Layer-2** half, closing
+  mika#1959's decision D5. `McpManager::connect_all` runs the discovered
+  definitions through `mcp::retain_publiables`, which drops every tool whose
+  server declares `testimony` — so the model never receives them and cannot
+  propose them. Only the **definitions** are amputated: `tool_routing` and
+  `tool_data_grades` keep the full inventory, so a hallucinated call still lands
+  on `TOOL_TESTIMONY_GRADE_FORBIDDEN` (Layer 4) rather than on "unknown tool".
+  One WARN per removed tool (`mcp_tool_testimony_unpublished`) plus
+  `discovered` / `published` / `unpublished` on `"MCP manager initialized"`,
+  the last written **even at zero** — without them a banned server and an
+  unreachable one return the same bytes (class mika#2205). mika#1959's pairing
+  guard needed no code change: the filter sits in `connect_all`, so neither
+  publication site moved and both seedings stayed — measured under injection,
+  not assumed (`todos/2814-injection-verification.md` § Cas 4). **Still open
+  under this ticket (vol 2):** the single publish+seed helper that would make
+  the pairing a property of the call rather than of its spelling, and the
+  load-time warning on an unknown key in an `mcp.json` server entry.
 - **2026-10-19** — mika#1959: the MCP dispatch tier came under Layer 4. An MCP
   server manifest carries `data_grade` (absent ⇒ `operational`), joined to each
   namespaced tool and **seeded** into the existing `skill_data_grades` map at
@@ -462,8 +553,8 @@ still does NOT cover:
   `DataGrade` as shipped by PR#1956 is **binary** (`operational` / `testimony`),
   so `reference` reads `operational` here and no third variant was created
   (plan decision D1). An unknown grade string is a **parse failure**, never a
-  guessed default. The *propose* half is **not** closed — see § *Vigilance
-  surface*, tracked as mika#2814.
+  guessed default. The *propose* half was **not** closed by this entry — it was
+  tracked as mika#2814 and closed by the entry above, on the same day.
 - **2026-10-01** — mika#1960 phase 2: the *propose* surface gained a structural
   half. EndTurn guard **5h** (`testimony_access_proposal`) is armed, with its
   single-retry budget, its `_uncorrected` residue event and a regression eval
