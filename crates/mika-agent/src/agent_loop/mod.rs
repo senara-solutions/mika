@@ -5538,13 +5538,31 @@ async fn run_agent_inner(
         }
         None => {}
     }
-    // mika#2805 commit 2/6 — le champ porte un enum à deux bras depuis ce
-    // commit ; le site de `compaction_handsoff::resolve` arrive au commit 4.
-    // D'ici là le bras du vol 1 est composé ici, pour que le comportement de
-    // mika#1748 reste intact à chaque commit de la chaîne.
-    let ceremony = ctx
-        .compaction_imminent
-        .map(|message_count| crate::compaction_handsoff::Ceremony::Imminent { message_count });
+    // mika#2805 — le site UNIQUE du rituel post-compaction, et il résout **en
+    // même temps** qu'il consomme (D8) : « quelle déposition servir » et « elle
+    // est servie » sont une seule opération, et lui donner deux implémentations
+    // serait lui donner deux réponses.
+    //
+    // Ici et nulle part ailleurs, pour la même raison que le reçu existe : le
+    // rituel est un événement à usage unique, donc un second site de
+    // consommation serait un second endroit où cet usage unique peut être
+    // mangé. La surface silencieuse reçoit la cérémonie seule (AC5), et c'est
+    // le type de son champ qui le tient.
+    //
+    // L'argument `agent` est un **écart déclaré** au plan, qui écrit
+    // `resolve(imminent, home_dir)` : la sonde et le WARN portent tous deux
+    // `agent`, et le dériver du dernier segment de `home_dir` donnerait le nom
+    // aléatoire d'un `TempDir` en test — exactement le proxy que D2 condamne.
+    // `db.agent_id()` est la source que le vol 1 consomme déjà.
+    //
+    // Fail-open par construction : `resolve` ne rend pas de `Result`, un
+    // répertoire illisible saute le rituel et ne coûte pas le tour.
+    let ceremony = crate::compaction_handsoff::resolve(
+        ctx.compaction_imminent,
+        params.home_dir,
+        db.agent_id(),
+    )
+    .await;
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
