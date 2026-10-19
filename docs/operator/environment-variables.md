@@ -3988,6 +3988,116 @@ checkpoint perdu — il le rend seulement reconnaissable. Et il ne ferme pas
 mika#2698 : la ligne `Turn ceiling: N` côté producteur et le tour du dernier
 commit restent dus (vol 3).
 
+### Le manager fait entrer un ticket au bassin `ready` (mika#2699, vol 4)
+
+- `MIKA_MANAGER_POOL_WRITE` — le **second** interrupteur d'écriture du
+  `milestone_manager`, **OFF par défaut**, et indépendant de
+  `MIKA_MANAGER_EVALUATE_WRITE` ci-dessus. Armé par `1` ou `true` (insensible à
+  la casse, espaces tolérés) ; l'**absence est l'état normal**, pas un cas
+  d'erreur, et toute autre valeur laisse l'interrupteur fermé. Lecteur unique :
+  `pool_writer::pool_write_is_armed()` (doctrine mika#2201), consulté à un seul
+  site du cycle.
+
+  ```
+  MIKA_MANAGER_POOL_WRITE=1
+  ```
+
+**Ce qu'il autorise, et rien de plus.** Un geste **groupé** par ticket admis :
+
+```
+gh issue edit <n> --repo <dépôt> --add-label ready --milestone "<titre>"
+```
+
+Les deux mutations du point 3 du ticket dans le **même appel**, pour qu'un échec
+ne laisse jamais la moitié d'une décision. **Jamais un retrait** : aucun
+`--remove*` n'est composé, et c'est asserté sur l'argv réellement émis. Le
+milestone est désigné par son **titre** — `--milestone` ne résout pas un
+numéro — et ce titre vient de l'état lu au cycle, jamais de la configuration.
+
+**Le geste suit la décision, pas l'interrupteur.** `pool_writer` n'écrit que ce
+que `PoolVerdict::admit` nomme, et cette liste est vide hors famine. Les deux
+motifs de refus des vols 2 et 3 — plan groomé absent, estimation au-delà de la
+borne par vol — protègent donc le dépôt une fois l'interrupteur ouvert, sans
+qu'une ligne du poseur les reprenne.
+
+**Pourquoi c'est une exception nommée et pas un trou.** L'allowlist de
+`milestone_manager/no_dispatch_test.rs` porte désormais **exactement deux**
+entrées, une par ticket, épinglées au fichier et au jeton près —
+(`verdict_poster.rs`, `gh issue comment`) et (`pool_writer.rs`,
+`gh issue edit`). Le poseur déclare son geste **à plat**
+(`const GESTE: &str = "gh issue edit"`) et en **dérive** son vecteur
+d'arguments : ce qui s'exécute est exactement ce que le garde voit. Et chaque
+dérogation est **auto-nettoyante** : le test vérifie que le fichier existe
+encore et que sa source *hors commentaires* porte vraiment le jeton, sans quoi
+il rougit en demandant le retrait de l'entrée (motif mika#2309). Une dérogation
+qu'un refactor vide de son geste cesserait sinon d'être une décision pour
+devenir un trou permanent dans le grep.
+
+**L'idempotence est structurelle, et aucun champ de checkpoint ne la porte.**
+Un label `ready` posé est relu au cycle suivant par le filtre de candidats du
+bassin, qui écarte tout ticket déjà `ready` — le ticket n'est donc plus proposé.
+C'est la différence avec le vol 2 de mika#2698, dont l'idempotence devait être
+portée par `posted_flight_task_ids` : un commentaire n'est pas visible du
+prédicat qui l'a décidé, un label l'est.
+
+**Seuil d'ouverture — un geste opérateur, jamais une bascule automatique.** Il
+faut que `MIKA_MANAGER_EVALUATE_WRITE` soit déjà ouvert, **et** qu'aucun `ready`
+mal formé n'ait été admis en ombre — ce que le refus nommé par ticket du vol 2
+rend précisément lisible. Le rollback est le retrait de la variable, sans
+redéploiement.
+
+**Deux choses à trancher AVANT d'ouvrir, nommées plutôt que tues :**
+
+1. **Le park n'est pas consulté** (mika#2315). `ready_label.rs` est l'applicateur
+   gouverné du label `ready` et son `apply_ready` consulte le park (le STOP
+   opérateur) ; `pool_writer` est un **cinquième applicateur** qui ne le consulte
+   pas. Son garde est *nominal* (`gh_apply_label` / `add_label_to_issue`) et ne
+   rougit donc pas ici. Router par `apply_ready` a été envisagé et écarté : cette
+   fonction ne pose que le label, le rattachement au milestone deviendrait une
+   **seconde** mutation, et l'AC3 demande une seule mutation par décision.
+   L'interrupteur fermé garantit qu'aucune écriture non parkée n'a lieu avant
+   l'ouverture ; l'ouvrir demande de trancher l'interaction des deux.
+2. **Le jeton n'a peut-être pas `issues: write`** (mika#2228). `ProcessGhRunner`
+   écrit avec le `GH_TOKEN` ambiant, et le PAT résolu a été **mesuré** le
+   2026-09-07 comme authentifiant sans porter `issues: write` (34 refus
+   `--add-label`). Le chemin d'échec est déjà tenu par ticket — le ticket n'est
+   pas compté comme posé et un WARN le nomme — donc c'est une exposition du jour
+   de l'ouverture, pas un défaut de correction. À vérifier avant d'armer.
+
+**Surfaces opérateur** (journal `$MIKA_SPIRIT_LOG_FILE`) :
+
+```
+# 1. Qu'a-t-on fait entrer, sur quel ticket, dans quel milestone ?
+grep manager_pool_admitted "$MIKA_SPIRIT_LOG_FILE"
+
+# 2. Pourquoi rien n'est entré. `reason` prend cinq valeurs :
+#      no_pool_verdict        — un blob antérieur au champ (jamais en nominal)
+#      no_admission           — le bassin n'admet personne : le régime NOMINAL
+#      no_runner              — une décision existait, aucun `gh` câblé
+#      disarmed               — l'interrupteur est fermé : le régime par défaut
+#      empty_milestone_title  — le milestone lu n'a pas de titre
+grep manager_pool_not_admitted "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Un `gh` qui refuse. Le ticket n'est PAS compté comme posé ; le cycle
+#    suivant le reproposera. Un flot soutenu ici est un problème de jeton
+#    (voir le point 2 du seuil d'ouverture ci-dessus).
+grep manager_pool_admit_failed "$MIKA_SPIRIT_LOG_FILE"
+```
+
+La sonde 2 est son **propre contrôle positif** : elle est émise sur *toutes* les
+branches, y compris celle à zéro admission, donc « le geste tourne et n'a rien à
+faire » et « le geste n'est pas câblé » ne rendent pas les mêmes octets (classe
+mika#2205). Son **absence** du journal signifie un binaire antérieur à ce vol
+(classe mika#2340), jamais un bassin calme — et l'instrument n'est vivant
+qu'après `make deploy`.
+
+**Ce que ce travail n'achète PAS.** Il n'ouvre pas l'interrupteur. Il ne consulte
+pas le park (point 1 ci-dessus). Il ne relit aucun label existant sur GitHub : la
+non-répétition vient du filtre de candidats, pas d'une vérification. Et il ne
+ferme pas mika#2699 — la seconde moitié de l'AC3 (idempotence inter-cycle
+épinglée par un test de verdict rejoué) et le rapport nommant ce qui a été posé
+restent dus au vol 5.
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 

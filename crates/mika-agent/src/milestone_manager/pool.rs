@@ -1,12 +1,11 @@
 //! Pool — le bassin `ready` : sa profondeur, sa bande, et qui devrait y entrer.
 //!
-//! **LECTURE SEULE.** mika#2699 Phase 2 (a), vols 1 à 3 : le manager *voit* le
-//! bassin et *dit* qui devrait y entrer, et pourquoi il refuse les autres. Il ne
-//! pose aucun label, ne rattache aucun milestone, ne déclare aucun
-//! interrupteur. `assess_pool` est une fonction pure sans E/S ; le verdict entre
-//! dans le rapport et nulle part ailleurs. L'écriture
-//! (`MIKA_MANAGER_POOL_WRITE` et le geste groupé) reste à venir, avec son
-//! exception nommée à `no_dispatch_test.rs`.
+//! **LECTURE SEULE**, et ce module le reste au vol 4. mika#2699 Phase 2 (a) :
+//! le manager *voit* le bassin et *dit* qui devrait y entrer, et pourquoi il
+//! refuse les autres. Il ne pose aucun label, ne rattache aucun milestone, ne
+//! déclare aucun interrupteur. `assess_pool` est une fonction pure sans E/S.
+//! Depuis le vol 4 le verdict a une seconde destination, et une seule :
+//! [`super::pool_writer`] — voir § *Ce que ce module ne fait pas* en bas.
 //!
 //! # Le bassin n'est pas une propriété du milestone cible
 //!
@@ -53,16 +52,27 @@
 //! absence de mesure comme un `under_bound` (*un `null` n'est jamais un `0`*,
 //! mika#2331).
 //!
-//! # Ce que ce module ne dit pas encore
+//! # Ce que ce module ne fait pas
 //!
-//! Le **vol 4** : `MIKA_MANAGER_POOL_WRITE`, OFF par défaut, et le geste groupé
-//! en un — poser `ready` et rattacher au milestone cible, jamais de retrait de
-//! `ready` pendant un vol. Il portera AC1 (interrupteur OFF ⇒ aucune écriture,
-//! garantie structurelle plus contrôle négatif) et AC3 (interrupteur ON ⇒ une
-//! seule mutation par décision, idempotente). L'exception à
-//! `no_dispatch_test.rs` arrivera **dans le même commit** que le geste, nommée
-//! au fichier et au jeton près, jamais comme un relâchement du gabarit — qui
-//! reste à ce vol inchangé octet pour octet.
+//! L'écriture. Le vol 4 l'a livrée, et délibérément **pas ici** : `assess_pool`
+//! doit rester pure pour que le verdict se teste sans exécutant, et le grep plat
+//! de `no_dispatch_test.rs` doit pouvoir nommer **un seul** fichier en
+//! exception. Le geste vit donc dans [`super::pool_writer`] —
+//! `MIKA_MANAGER_POOL_WRITE`, OFF par défaut, et les deux mutations en un seul
+//! `gh issue edit` : poser `ready` et rattacher au milestone cible, jamais un
+//! retrait. L'exception nommée à `no_dispatch_test.rs` est arrivée dans le même
+//! commit que ce geste, au fichier et au jeton près, jamais comme un
+//! relâchement du gabarit.
+//!
+//! Ce module reste pourtant le lieu de la **décision**, et c'est ce qui tient le
+//! poseur court : il n'écrit que ce que [`PoolVerdict::admit`] nomme. Les deux
+//! motifs de refus des vols 2 et 3 protègent donc le dépôt une fois
+//! l'interrupteur ouvert, sans qu'une ligne du poseur les reprenne.
+//!
+//! Reste au **vol 5** : la seconde moitié de l'AC3 — l'idempotence inter-cycle
+//! épinglée par un test de verdict rejoué, là où elle n'est aujourd'hui qu'une
+//! propriété du filtre de candidats ci-dessous — et le rapport nommant ce qui a
+//! été réellement posé. Suivi sur `senara-solutions/mika#2699`.
 
 use super::plan_size;
 use super::types::{IssueState, SubIssue};
