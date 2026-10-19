@@ -3,7 +3,8 @@
 #
 # This script verifies:
 # 1. The skill scaffold exists and has valid structure
-# 2. The skill is registered in well_known_agents.rs (all 4 allowlist sites + LLM override)
+# 2. The skill is registered in well_known_agents.rs (allowlist sites; the LLM
+#    override site was removed by mika#949 — see the note at that assertion)
 # 3. The sequencing record template exists and has required sections
 # 4. The compatibility report exists
 # 5. Build.rs discovers the skill (cargo build succeeds — verified externally)
@@ -69,9 +70,16 @@ check_grep "MIKA_DEV disabled_skills includes skill" 'mika-arch-groom-milestone'
 # Site 4: mika-arch identity allowlist
 check_grep "mika-arch identity allowlist includes skill" 'mika-arch-groom-milestone.*mika-arch-second-review' "$WKA"
 
-# LLM override
-check_grep "LLM override for groom-milestone" 'skill_name: "mika-arch-groom-milestone"' "$WKA"
-check_grep "LLM override uses opus-4-7" 'mika-arch-groom-milestone' "$WKA"
+# LLM override: NO LONGER ASSERTED, and the absence is the point.
+# `6ccb79c4` — fix(mika-arch): always_on=true + remove per-skill LLM overrides
+# (mika#949) — removed the per-skill override mechanism deliberately. The four
+# well-known agent specs carry `llm_overrides: &[]` today (well_known_agents.rs
+# :88, :109, :305, :361), so there is no site left to assert: the two assertions
+# that lived here looked for `skill_name: "mika-arch-groom-milestone"` and went
+# red on a producer that no longer has that shape. Realigned on its producer
+# (mika#2793), not weakened — should an override reappear for one agent and not
+# the others, mika#1190 (no model swap without a passing calibration) is the rule
+# that applies, not a grep in this file.
 
 # MIKA_ARCH_SOUL update
 check_grep "MIKA_ARCH_SOUL mentions milestone" 'milestone-scoped reviews' "$WKA"
