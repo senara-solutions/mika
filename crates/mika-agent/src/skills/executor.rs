@@ -1877,14 +1877,34 @@ fn groom_provenance_verdict(
             // … the handler dispatches dev-pilot and lands here again » — c'est
             // exactement ce que le routage corrigé ne fait plus. Seule cette
             // phrase change ; le reste du payload est inchangé à l'octet près.
-            "recovery": "Groom through the autonomous loop: dispatch dev-groom via \
-                         'mika ask --agent mika-dev \"groom <typed-ref>\"'. Re-applying \
-                         the `ready` label also works since mika#2484 — markers without \
-                         proof now route to dev-groom, not dev-pilot. Either way, if the \
-                         plan already resolves on the dispatch branch (hand-groomed \
-                         ticket), dev-groom answers `already_groomed` and mints no proof \
-                         — remove the plan from the branch first so a fresh loop groom \
-                         can run.",
+            //
+            // mika#2811 — TROISIÈME strate, même mécanique : la dernière phrase
+            // du remède de mika#2484 (« dev-groom answers `already_groomed` and
+            // mints no proof — remove the plan from the branch first ») est à
+            // son tour devenue fausse SUR LE CHEMIN DE LA BOUCLE. Quand c'est
+            // CE refus-ci qui a routé au groom, la provenance part dans l'entrée
+            // de dispatch et désarme l'auto-skip du corps : la passe est réelle
+            // et frappe la preuve. Le geste prescrit — retirer le plan de la
+            // branche — était donc devenu du travail opérateur pour rien, et
+            // c'est précisément la boucle que le ticket ferme.
+            //
+            // La population résiduelle n'est pas « en général » : c'est le groom
+            // demandé par un TOUR LLM (`run_claude_pilot_groom`, flux opérateur
+            // mika#1173), qui ne porte aucune provenance de refus — la porte de
+            // mika#2012 y reste armée, délibérément, et `already_groomed` y est
+            // encore la réponse. Le remède nomme cette population-là, et elle
+            // seule.
+            "recovery": "Groom through the autonomous loop: re-apply the `ready` label, or \
+                         dispatch dev-groom via 'mika ask --agent mika-dev \"groom \
+                         <typed-ref>\"'. Since mika#2484 markers without proof route to \
+                         dev-groom, not dev-pilot, and since mika#2811 that routing \
+                         carries the reason for the refusal, so the groom runs a real pass \
+                         and mints the proof even when the plan already resolves on the \
+                         dispatch branch — nothing to remove by hand first. The one route \
+                         where a hand-groomed ticket still answers `already_groomed` is a \
+                         groom asked by an LLM turn (run_claude_pilot_groom), which carries \
+                         no refusal provenance: there, remove the plan from the branch \
+                         first, or let the loop route it instead.",
             "reason": format!(
                 "Cannot dispatch dev-pilot on ticket #{number}: grooming markers are \
                  present in the issue body but no completed autonomous groom task was \
@@ -12075,6 +12095,26 @@ Discussion: this one was a single-pass GROOMED case, unlike the others.
         assert!(
             !recovery.contains("MIKA_DISPATCH_BYPASS_GROOMING_CHECK"),
             "the removed bypass must not be offered as recovery"
+        );
+
+        // mika#2811 — l'`already_groomed` nommé ci-dessus doit l'être pour la
+        // population QUI L'OBTIENT ENCORE, le groom demandé par un tour LLM, et
+        // non comme la fatalité du chemin de boucle : ce chemin-là porte
+        // désormais la provenance du refus et frappe la preuve. Sans cette
+        // paire, le texte peut redevenir « retirez le plan de la branche
+        // d'abord » — du travail opérateur pour rien, et la boucle de mika#2811
+        // réécrite en prose.
+        assert!(
+            recovery.contains("run_claude_pilot_groom"),
+            "the residual auto-skip population must be NAMED, not implied: {recovery}"
+        );
+        assert!(
+            recovery.contains("mika#2811"),
+            "the recovery must cite the ticket that made the loop path mint proof: {recovery}"
+        );
+        assert!(
+            recovery.contains("nothing to remove by hand first"),
+            "the loop path must no longer prescribe removing the plan: {recovery}"
         );
     }
 

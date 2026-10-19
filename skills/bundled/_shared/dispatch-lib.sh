@@ -4646,7 +4646,17 @@ _set_up_worktree() {
                 # celle-ci est une défense en profondeur, et elle est tenue par
                 # une assertion de `test-dispatch-lib.sh` — sans quoi un futur
                 # éditeur recopie la phrase depuis ce commentaire même.
-                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate refuses it with dispatch_grooming_not_verified unless a completed groom callback carries a convergence verdict, and this skip mints none. To make the ticket dispatchable, remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
+                #
+                # mika#2811 — et le GESTE prescrit n'est plus le premier.
+                # Ce bras ne se lit plus que sans provenance de refus, donc sur
+                # un groom demandé par un tour LLM (flux opérateur mika#1173).
+                # Le chemin de boucle, lui, porte désormais la cause et désarme
+                # cet auto-skip : y repasser suffit, et le retrait à la main du
+                # plan et des callouts est devenu du travail opérateur pour
+                # rien. Il reste nommé en second, parce qu'il marche toujours et
+                # qu'il est la seule issue si l'on ne veut pas rendre le ticket
+                # à la boucle. L'ordre des deux phrases EST le correctif.
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate refuses it with dispatch_grooming_not_verified unless a completed groom callback carries a convergence verdict, and this skip mints none. Cheapest route back: hand the ticket to the loop (re-apply the ready label). Since mika#2811 the dispatch gate refusal travels to dev-groom carrying its reason, which disarms this very auto-skip, so the groom runs a real pass and mints the proof with the plan left exactly where it is. By hand also works, and is the only route if you keep the ticket out of the loop: remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0
