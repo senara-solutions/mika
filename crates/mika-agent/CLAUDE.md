@@ -389,6 +389,15 @@ Agents that need to reason across multiple repositories can specify an array of 
 
 **Per-agent identity.toml recipe (mika-arch):**
 
+> **Chemins hôte, pas navigation (mika#2108).** Les six chemins ci-dessous décrivent la
+> configuration d'un agent qui tourne **côté hôte** ; ce ne sont pas des adresses à suivre.
+> Ils ne sont pas résolvables depuis un bac à sable de pilote : la racine du workspace hôte
+> n'y est pas montée, et depuis mika#2146 ce qui y est visible est un squelette de points de
+> montage.
+> C'est la seule exemption déclarée dans `scripts/check-pilot-instruction-paths.sh`, ancrée
+> sur la forme exacte de ces lignes de tableau TOML — tout autre chemin hôte ajouté à ce
+> fichier déclenche la garde.
+
 ```toml
 name = "mika-arch"
 emoji = "A"

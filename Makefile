@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-measure-webhook-turn-cost test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-push-scope-staging test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-root-files check-release-debuginfo check-suite-wiring test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-measure-webhook-turn-cost test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-push-scope-staging test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-pilot-instruction-paths check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-root-files check-release-debuginfo check-suite-wiring test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -186,6 +186,8 @@ test: ## Run all tests
 	@bash scripts/test-check-root-files.sh
 	@bash scripts/check-issue-comment-patch-guard.sh
 	@bash scripts/test-annotate-issue-token-comment.sh
+	@bash scripts/check-pilot-instruction-paths.sh
+	@bash scripts/test-check-pilot-instruction-paths.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
 	@python3 -B scripts/test-pilot-egress-keepalive.py
 
@@ -342,6 +344,10 @@ check-suite-wiring: ## Reject a suite on disk that no workflow reaches and the r
 
 test-verify-npm-publish: ## Exercise the post-publish verification hors réseau — AC1 (visible au 6e essai) et AC2 (jamais visible) (mika#2566)
 	@bash scripts/test-verify-npm-publish.sh
+
+check-pilot-instruction-paths: ## Reject host-workspace paths in the surface a pilot loads without asking + pin the guard's negative behaviour (mika#2108)
+	@bash scripts/check-pilot-instruction-paths.sh
+	@bash scripts/test-check-pilot-instruction-paths.sh
 
 verify-no-sigpipe-grep: ## Reject `printf|echo | grep -q` under pipefail (SIGPIPE trap, mika#2055)
 	@bash scripts/verify-no-sigpipe-grep.sh
