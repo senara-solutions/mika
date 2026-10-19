@@ -235,11 +235,13 @@ SCAN_OUTPUT="$(printf '%s\n' "$FILES" | while IFS= read -r f; do
             # so the single quote can be written as "\047" — this whole awk
             # program is a single-quoted shell string. The leading boundary keeps
             # `data-role=` out, the trailing one keeps `role="tabpanel"` and
-            # `role="switcher"` out, and the loose run between `=` and the role
-            # word admits `role={"switch"}` and `role = "switch"` alike. A
-            # computed role (`role={x ? "switch" : "button"}`) does NOT match, so
-            # it stays in the population — the conservative direction.
-            STATE_ROLE = "[^A-Za-z0-9_-]role[ \t]*=[ \t]*[^A-Za-z0-9_]*" \
+            # `role="switcher"` out, and between `=` and the role word only an
+            # optional `{` and a QUOTE are admitted: `role={"switch"}` and
+            # `role = "switch"` match, a comparison (`role === "tab"` inside a
+            # `cn(...)`) and a prose `title="role=tab"` do not. A computed role
+            # (`role={x ? "switch" : "button"}`) does NOT match either, so it
+            # stays in the population — the conservative direction.
+            STATE_ROLE = "[^A-Za-z0-9_-]role[ \t]*=[ \t]*[{]?[ \t]*[\"\047`]" \
                 "(menuitemcheckbox|menuitemradio|checkbox|switch|radio|tab)" \
                 "[^A-Za-z0-9_-]"
 

@@ -119,11 +119,12 @@ make_allowlist() {
 #         14
 #
 #      `packages/ui/src` holds 15 non-test `<Button` occurrences by raw grep and
-#      contributes only 4, because ELEVEN of them are in JSDoc — all 5 of
-#      `Button.tsx`, both of `Spinner.tsx`, 2 of `SecretField.tsx`, and one each in
-#      `AuthCard.tsx` and `Stepper.tsx`. Comments are not code (section 8 below
-#      pins that), so a primitive documenting its own call sites does not inflate
-#      this number. The other 53 raw occurrences live in `Button.test.tsx` (26),
+#      contributes only 4. TEN are in comments — 4 in `Button.tsx`'s JSDoc, both
+#      of `Spinner.tsx`, 2 of `SecretField.tsx` (one JSDoc, one JSX comment), and
+#      one each in `AuthCard.tsx` and `Stepper.tsx`; comments are not code
+#      (section 8 below pins that). The ELEVENTH is `Record<ButtonSize` at
+#      `Button.tsx:85`, a type, which the identifier boundary rejects. So a
+#      primitive documenting its own call sites does not inflate this number. The other 53 raw occurrences live in `Button.test.tsx` (26),
 #      `Button.type-assertions.tsx` (25), `Spinner.test.tsx` and
 #      `SecretField.test.tsx`: those are what the perimeter filter removes, and
 #      what would otherwise move this assertion on every test added to <Button>.
@@ -254,6 +255,16 @@ rm -rf "$d"
 #        which is the form that would quietly let the next CTA through.
 d="$(make_page_with_button '      <button role="button" className="px-4 py-2 rounded-lg bg-accent text-white">Promote</button>')"
 assert_exit "$d" 1 "N6b: role=\"button\" is not a state role"
+rm -rf "$d"
+
+# ── 5f''. N6c — the role must be a quoted LITERAL. A real CTA whose class list
+#         merely compares a role (`role === "tab"`) or whose title mentions one
+#         must stay in the population: otherwise exclusion 4 is an escape hatch
+#         anyone can open by accident.
+d="$(make_page_with_button '      <button className={cn("px-4 bg-accent", role === "tab" && "ring")}>Go</button>
+      <button title="role=tab" className="px-4 bg-accent">Go</button>')"
+assert_exit "$d" 1 "N6c: a role comparison or a prose mention does not exempt a CTA"
+assert_says "$d" "Found 2 hand-rolled" "N6c: both tags stay in the population"
 rm -rf "$d"
 
 # ── 5g. N7 — the gradient rule's natural false positive is TEXT in a gradient
