@@ -48,14 +48,16 @@
 //! exec (Porte 2), and `INTERNAL_TOKEN` alignment (Porte 3). None of that surface is
 //! wired in this module.
 //!
-//! ### Phase 2 (a) vols 1 et 2 — le bassin `ready` est une LECTURE (mika#2699)
+//! ### Phase 2 (a) — le bassin `ready` est une LECTURE, et **un** geste armé (mika#2699)
 //!
 //! [`pool`] juge la profondeur du bassin `ready` et **dit** quels tickets
-//! devraient y entrer, et lesquels sont refusés et pourquoi. C'est une lecture
-//! de plus, pas une autorité de plus : le verdict entre dans le rapport
-//! ([`Assessment::pool`]) et nulle part ailleurs. Le charter **LECTURE SEULE**
-//! ci-dessus reste entier, et les deux seuls effets sortants restent les deux
-//! déjà nommés.
+//! devraient y entrer, et lesquels sont refusés et pourquoi. C'est une lecture :
+//! le verdict entre dans le rapport ([`Assessment::pool`]) et nulle part
+//! ailleurs. [`pool_writer`] est ce qui peut en **faire** quelque chose, et
+//! seulement quand `MIKA_MANAGER_POOL_WRITE` est armé — OFF par défaut, et
+//! l'ouverture est un geste opérateur, pas un défaut de configuration. Le
+//! charter **LECTURE SEULE** ci-dessus se lit donc désormais avec deux
+//! exceptions nommées, l'une par ticket, et pas une de plus.
 //!
 //! Trois conséquences qu'un éditeur futur doit connaître :
 //!
@@ -72,17 +74,21 @@
 //!   milestone passe devant un p1 du milestone. Le pourquoi de cette lecture de
 //!   la phrase du ticket est dans le docstring de [`pool`], et c'est une
 //!   décision, pas un détail d'implémentation.
-//! - **Le geste d'écriture est le vol 3**, derrière `MIKA_MANAGER_POOL_WRITE`
-//!   (OFF par défaut), et il arrivera comme **exception nommée** au scan de
-//!   `no_dispatch_test.rs`, amendée dans le même commit que ce docstring —
-//!   jamais comme un assouplissement du scan.
+//! - **Le geste d'écriture est le vol 4** ([`pool_writer`]), derrière
+//!   `MIKA_MANAGER_POOL_WRITE` (OFF par défaut). Il est arrivé comme **exception
+//!   nommée** au scan de `no_dispatch_test.rs` — un seul jeton, `gh issue edit`,
+//!   dans le même commit que ce docstring — jamais comme un assouplissement du
+//!   scan. Les deux mutations du ticket sont **un** appel : poser `ready` et
+//!   rattacher au milestone cible ensemble, pour qu'un échec ne laisse jamais la
+//!   moitié d'une décision.
 //!
-//! Reste du point 2 après le vol 2 : le **second motif de refus** — estimation
-//! au-delà de la borne par vol sans découpage — qui demande une lecture du plan
-//! par candidat et un portage en Rust du contrat de parse de
-//! `_plan_size_total_loc` (porte 3 de mika#2701). Mesuré au-delà de la borne par
-//! vol à lui seul, il est donc son propre vol ; [`pool`] porte le détail de
-//! l'estimation. Suivi sur `senara-solutions/mika#2699`.
+//! Ce que la Phase 2 (a) ne porte pas encore, et qui est suivi sur
+//! `senara-solutions/mika#2699` : la **seconde moitié de l'AC3** — l'idempotence
+//! inter-cycle épinglée par un test de verdict rejoué. Elle est *structurelle*
+//! aujourd'hui (un label posé est lu par le filtre de candidats de [`pool`], donc
+//! le cycle suivant ne propose plus le ticket), et c'est précisément ce qu'un
+//! test doit mesurer plutôt qu'un champ de checkpoint doive garantir. Le rapport
+//! ne nomme pas encore ce qui a été réellement posé.
 //!
 //! **Porte 1 discharge condition (mika#1947).** Dispatch authority is DECISION-CORE by
 //! construction, so the forge-gate perimeter classifier must fail-closed to
@@ -238,6 +244,7 @@ pub mod evaluator;
 pub mod liveness;
 pub mod plan_size;
 pub mod pool;
+pub mod pool_writer;
 pub mod reader;
 pub mod relief;
 pub mod reporter;
@@ -270,6 +277,7 @@ pub use pool::{
     PlanSizeReading, PoolBand, PoolCandidate, PoolDepth, PoolVerdict, ReadyTicket, RefusalReason,
     UnreadCause, assess_pool, numbers_needing_size, pool_sort_key,
 };
+pub use pool_writer::{ENV_POOL_WRITE, admit_pool_tickets, pool_write_is_armed};
 pub use reader::{
     GhRunner, OUTSIDE_READ_LIMIT, ProcessGhRunner, Reader, compose_from_gh_outputs,
     compose_outside_candidates, compose_ready_pool,
