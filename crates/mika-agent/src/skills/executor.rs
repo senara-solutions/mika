@@ -4306,6 +4306,24 @@ pub(crate) async fn validate_dispatch_readiness(
 /// `additionalProperties` mode (see plan Anchor F).
 pub(crate) const INTERNAL_DEFERRED_DISPATCH_FIELD: &str = "__internal_deferred_dispatch";
 
+/// Engine-internal sentinel field name (mika#2811).
+///
+/// Posé dans l'entrée de dispatch par `ready_label_handler` quand le routage
+/// envoie au groom faute de preuve en base, et lu par `dispatch-lib.sh` pour
+/// désarmer le seul auto-skip `already_groomed` de mika#2012.
+///
+/// # Le `tools.json` de dev-groom NE DOIT PAS le déclarer
+///
+/// Un LLM qui pourrait poser ce champ désarmerait la porte de mika#2012 sur
+/// n'importe quel ticket — or cette porte existe contre une boucle qu'un LLM a
+/// produite. L'omission de la surface d'outil EST le refus (mika#2425) ; la
+/// justesse repose sur le mode `additionalProperties` permissif, comme pour
+/// [`INTERNAL_DEFERRED_DISPATCH_FIELD`]. Épinglé des deux côtés par
+/// `canonical_tokens` (parité du littéral avec la déclaration
+/// `GROOM_FORCE_CAUSE_FIELD` du shell) et par un test de lecture de
+/// `skills/bundled/dev-groom/tools.json`.
+pub(crate) const INTERNAL_GROOM_CAUSE_FIELD: &str = "__internal_groom_cause";
+
 /// Build the `dispatch_task_has_open_pr` rejection (mika#920) if all guard
 /// conditions are met, otherwise return `None` to allow dispatch.
 ///
