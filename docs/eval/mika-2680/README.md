@@ -1,11 +1,15 @@
 # Mesure 3 — ce que coûtent les tours webhook, après le vol 1 (mika#2680)
 
 Ce répertoire porte le **protocole** de la troisième mesure du § *Critère
-d'acceptation de la mesure* de mika#2680, et accueillera son **artefact**. Le
-vol 2 livre l'instrument (`scripts/measure-webhook-turn-cost`) et ce protocole ;
-**le vol 3 exécute la mesure, écrit l'artefact, puis implémente ce qu'elle
-confirme.** Aucune classe de pré-filtre — ni (e), ni (f), ni (g), ni (h) — n'est
-implémentée par le vol 2 : chiffrer d'abord, décider ensuite.
+d'acceptation de la mesure* de mika#2680, et son **artefact** :
+`summary-2026-10-19T0602Z-1630Z.json`, pris le 2026-10-19 par l'orchestrateur
+hors bac à sable — le § 2 bis dit pourquoi ce ne pouvait pas être un vol
+dispatché — et commité par le vol 6. L'instrument qui le produit
+(`scripts/measure-webhook-turn-cost`) et ce protocole viennent du vol 2.
+
+Ni ce protocole ni cet instrument n'implémentent de classe de pré-filtre :
+chiffrer d'abord, décider ensuite. L'état classe par classe — ce que la mesure a
+tranché et ce qui reste à l'opérateur — est au § 9.
 
 ## 1. Pourquoi une troisième mesure
 
@@ -64,6 +68,20 @@ opérateur**, ou une session hors bac à sable (hôte, ou tout contexte où
 `/var/log/mika/server.log` est lisible). Un vol dispatché ne peut ni l'exécuter
 ni la contourner ; il peut seulement porter la commande prête à coller, ce que
 fait le corps de PR du vol 3.
+
+**Et c'est ainsi qu'elle a été prise — ce qui précède est désormais un
+historique.** La mesure 3 existe : le **2026-10-19**, par **l'orchestrateur**,
+hors bac à sable, sur le journal servi, avec la commande du § 3 appliquée à la
+fenêtre `06:02Z–16:30Z`. Son agrégat est dans ce répertoire,
+`summary-2026-10-19T0602Z-1630Z.json`, et le § 9 en tire l'état de la classe (g).
+Le raisonnement ci-dessus ne devient pas caduc pour autant : il dit pourquoi
+aucun des vols dispatchés ne pouvait la prendre — trois d'entre eux l'ont
+redécouvert à leurs frais les 2026-10-19 00:26Z, 00:52Z et 01:03Z — et pourquoi
+le prochain ne le pourra pas davantage. Le mur est double : au bind manquant
+s'ajoute la permission-policy de la session dispatchée, qui refuse
+`scripts/measure-webhook-turn-cost` en amont (`no matching policy rule — denied
+by default`). Élargir le bind ne lèverait que le premier, et la mesure ne
+justifie toujours pas de l'élargir.
 
 ## 3. La commande
 
@@ -249,18 +267,21 @@ ne s'implémente pas : elle se pose à l'opérateur.
   lèvent chacune de ces ambiguïtés : c'est cette propriété, et non une économie
   de fichiers, qui autorise ses quatre assertions à partager une entrée.
 
-## 9. L'état des quatre classes, après les vols 3 à 5
+## 9. L'état des quatre classes, après les vols 3 à 6
 
-Le § 7 dit ce que le vol 3 *fait* de l'artefact. Le § 2 bis dit pourquoi
-l'artefact n'est pas à sa portée. Ce qui suit est donc l'état réel, classe par
-classe — et **les quatre raisons ne sont pas la même raison** : c'est tout
-l'intérêt du tableau.
+Le § 7 dit ce qu'un vol *fait* de l'artefact. Le § 2 bis dit pourquoi aucun vol
+dispatché ne pouvait le produire, et qui l'a produit. Ce qui suit est l'état
+réel, classe par classe — et **les quatre raisons ne sont pas la même raison** :
+(e) implémentée, parce qu'aucune mesure ne conditionnait son chiffre ; (f)
+tranchée par le code servi seul, sa prémisse étant fausse ; (g) **chiffrée puis
+réfutée** — le seul cas où la mesure a parlé et où cela n'a pas suffi ; (h)
+posée sans qu'aucune mesure ne la tranche. C'est tout l'intérêt du tableau.
 
-| classe | déclencheur | état après les vols 3 à 5 | ce qui décide de cet état |
+| classe | déclencheur | état après les vols 3 à 6 | ce qui décide de cet état |
 |---|---|---|---|
 | **(e)** `closed`/`merged` d'une PR sans tâche de boucle | `pr_closed` | **implémentée** (`pr_closed_no_loop_task`) | la mesure 3 ne pouvait pas changer son chiffre |
 | **(f)** `pr_review` sur une PR fermée au texte réécrit par le `verdict_handler` | `pr_review` + `charged_by_release` | **couverte par (c) pour les deux formes citées** ; résidu = une décision AC2 et trois chemins non-filtres | le code servi, relu — pas une mesure |
-| **(g)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **bloquée par la mesure** ; sa soustraction est lisible sur l'agrégat depuis le vol 5 | la mesure 3 est sa condition d'existence |
+| **(g)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **tranchée** — chiffrée (36 tours, 10 687 327 tokens : le plafond entier, la soustraction de (b) étant vide) et sa prémisse réfutée ; **aucun filtre écrit**, successeur (g′) posé à l'opérateur | la mesure 3 a donné le chiffre ; le code servi, relu, a réfuté la question |
 | **(h)** `issue_comment` / `issues_closed` sans tâche de boucle | `issue_comment`, `issues_closed` | **posée à l'opérateur** | aucune mesure ne la tranche |
 
 **(e) — pourquoi elle part sans l'artefact.** Le retrait que le § 7.1 prescrit
@@ -304,15 +325,128 @@ Trois de ces quatre chemins **ne sont pas des filtres** : les toucher reviendrai
 c'est pourquoi (f) ne passe pas de « renvoyée » à « implémentée » mais de
 « renvoyée » à **tranchée** : il n'y a pas de classe (f) à écrire.
 
-**(g) — la mesure n'est pas un confort, c'est sa condition.** Son plafond se
-superpose à ce que (b) écarte déjà : la mesure 2 le dit en toutes lettres,
-aucune `check_suite` de branche de PR n'avait été vue depuis le déploiement de
-`e14ace7f`, donc un chiffrage pris là aurait compté comme à filtrer ce que (b)
-écarte. Et la question du § 7.2 — *que fait mika-qa de ce tour ?* — porte sur un
-agent dont le fan-out est délibéré (mika#1711). Les deux termes manquent, et les
-deux sont dans l'artefact.
+**(g) — chiffrée, puis réfutée : la mesure a parlé, et elle n'a pas suffi.** Les
+deux termes qui lui manquaient sont arrivés, mais de deux sources différentes —
+le chiffre de l'agrégat, la question du code servi — et ils ne pointent pas dans
+le même sens.
 
-**Ce que le vol 4 change pour (g) : la soustraction devient nommable.** Avant lui,
+*Le chiffre d'abord, et pourquoi c'en est un.* La mesure 3 porte sur la fenêtre
+`2026-10-19 06:02Z–16:30Z` (10 h 28, activité PR présente). Le § 6 est attesté
+par l'agrégat lui-même — `paid_turns: 244`, `paid_turns_without_usage: 0`,
+`unparseable_lines: 0` : le corpus a été lu, et ses seaux sont des résultats.
+
+Les deux haltes du § 5 ne se lèvent pas de la même façon, et la seconde demande
+une précision que ce document doit à son lecteur. La première est **dans**
+l'agrégat : `window_precedes_field_epoch: false`, la borne basse suivant le
+premier `webhook_turn_charged` porteur d'un terme de relâche. La seconde ne
+l'est pas — `prefilter_enabled` est écrit **par tour**, dans le `turns-*.jsonl`
+que ce vol ne commite pas, et l'agrégat n'en porte aucun seau. Ce que l'agrégat
+établit est plus faible, et c'est tout ce qu'on peut lui faire dire : le
+pré-filtre était **armé et actif** sur la fenêtre, puisqu'il y a écarté 150
+tours répartis sur sept classes (`skipped_by_class`). Un pré-filtre désarmé
+n'écarte rien. Cela ne prouve pas qu'aucun tour isolé n'ait été servi désarmé ;
+affirmer le contraire demanderait le fichier de tours, dont la commande du § 3
+régénère à l'identique les 244 lignes. La cellule `mika-qa ×
+check_suite_pr_branch` vaut
+**36 tours, 10 687 327 tokens d'entrée** (7 163 735 en cache) et 202 appels LLM,
+soit **16,31 % des 65 507 602 tokens d'entrée de la fenêtre**.
+
+*La soustraction que le § 7.1 prescrit est vide, et ce n'est pas un hasard de
+fenêtre.* La ligne `mika-qa × check_suite_pr_branch × head_not_previously_decided`
+**n'existe pas** dans `by_agent_trigger_release` : la cellule est à 36/36 en
+`no_decision_attested`. Côté écarté, `skipped_by_agent_class` n'attribue le seul
+`green_check_suite_head_decided` de la fenêtre qu'à mika-dev, pour un tour. (b)
+ne revendique donc rien côté relecteur, et le plafond de (g) tient entier. La
+cause est structurelle, et se relit en trois pas sur l'arbre servi :
+
+1. `decide_head_decided`
+   (`crates/mika-agent/src/server/webhook_prefilter.rs:818-840`) a besoin d'une
+   ligne d'audit `DECISION_CORE_HOLD_TOOL` **pour cet événement** afin d'obtenir
+   le préfixe de PR ; sans elle, elle rend
+   `Decision::Llm(Release::NoDecisionAttested)` (l. 826-829) sans même lire les
+   attestations de la PR.
+2. Cette ligne ne s'écrit qu'à
+   `crates/mika-agent/src/server/ci_success_handler.rs:628`, soit **après** la
+   porte d'entrée de mika#2260, dont le commentaire ne laisse pas de place au
+   doute : *« la porte précède donc **tout** : le `evaluating` ci-dessous,
+   l'exigence de token, le dedup, et toute ligne d'audit »*.
+3. mika-qa n'est pas l'acteur de merge — la porte refuse sur
+   `!owns_merge_transition(agent_id)` — donc il n'atteint jamais ce site.
+   **(b) ne peut pas même regarder sa tête.**
+
+Le terme de relâche ne décrit donc pas ici un cas limite : il décrit le seul
+chemin possible.
+
+*La prémisse ensuite, et elle est fausse.* Le ticket pose (g) sur l'idée que le
+relecteur reçoit le fan-out *« sans qu'aucun verdict n'en dépende directement »*.
+Le code servi dit l'inverse, et il le dit par écrit. La porte rend
+`Passthrough { enrichment: None }` **et non** `Handled`, en nommant le
+consommateur qu'elle protège : *« le tour du relecteur doit voir l'**événement
+brut**, que `qa-review-webhook-success` attend pour corréler la PR »*
+(`ci_success_handler.rs:209-213`). Cette skill est bundled et allowlistée sur
+mika-qa (`crates/mika-agent/src/well_known_agents.rs:323`, recensée en `:2731`) ;
+son prompt porte l'ordre inverse d'un tour vide (*« CRITICAL: DO NOT end your
+turn without acting. This is a CI-green notification that unblocks review. »*) ;
+et son incident fondateur est mesuré, pas supposé — avant mika#1711, mika-qa ne
+recevait aucun signal de CI verte, d'où *« a 14-hour dead qa window on
+2026-07-01 during which multiple autonomous-loop PRs landed READY+GREEN with
+zero qa attempts »*. Ce tour est **l'unique porte d'entrée autonome de
+`qa-review` sur CI vert** : l'écarter rouvrirait exactement cette fenêtre morte.
+Le ticket met d'ailleurs ce travail hors périmètre — *« Le tour de revue QA
+lui-même : légitime. »*
+
+*Ce que l'agrégat ne peut pas dire, et c'est là que ça s'arrête.* Le registre
+porte `trigger`, `release`, `candidate`, `text_touched`, `prefilter_enabled` et
+le coût ; il **ne porte pas ce que le tour a fait**. Or le chemin de
+`qa-review-webhook-success` compte six étapes, dont quatre sont des arrêts —
+aucune PR ouverte sur la tête, hors périmètre (auteur non-boucle, brouillon),
+déjà revue à ce SHA, verdict déjà enregistré — et une est la revue elle-même.
+Les 36 tours mélangent les deux populations, et l'agrégat ne les sépare pas. Son
+seul indice est le coût moyen : **5,6 appels LLM par tour**, contre 12,5 pour
+`mika-qa × pr_opened` et 13,8 pour `mika-qa × pr_other`. Une décomposition tient
+l'arithmétique — treize revues complètes à ~13 appels plus vingt-trois arrêts
+précoces à ~1,5 donne 203,5 pour 202 observés — mais elle repose sur un coût par
+forme que le registre n'atteste pas, et une autre la tient aussi bien. C'est une
+vraisemblance, pas un compte. Le § 7.3 n'admet que les classes dont la réponse
+au § 7.2 est « rien, ou rien qui nécessite un tour LLM » ; ici la réponse est
+**« parfois tout, parfois rien »**, dans une proportion inconnue. La phrase du
+§ 7 s'applique telle quelle : *une classe dont le chiffre est significatif mais
+dont la question reste ouverte ne s'implémente pas : elle se pose à
+l'opérateur.* **Aucun filtre de classe (g) n'est écrit.**
+
+*Le successeur (g′) est nommé et borné.* Ce qui serait filtrable, ce ne sont pas
+les 36 tours : ce sont les **arrêts précoces**. Leur prédicat est à portée
+technique — le pré-filtre appelle déjà la forge, `PrefilterState::pr_state` fait
+un `gh pr view <n> --json state` pour la classe (c). L'obstacle est ailleurs, en
+trois arbitrages dont aucun n'est à la main d'un pilote :
+
+1. **Le coût que la porte de mika#2260 venait de retirer.** Elle chiffre ce
+   qu'elle a supprimé — *« cinq appels `gh` sous le PAT du relecteur »* — et le
+   commentaire de son unique ligne d'audit ajoute que connaître le numéro de PR
+   *« coûterait le premier appel `gh`, c'est-à-dire l'effet de bord que cette
+   porte retire »*. Un filtre (g′) les remettrait, au même endroit, sous le même
+   jeton.
+2. **Un garde de prompt qui descend dans le Rust.** Les arrêts 2 à 4 vivent dans
+   `skills/bundled/qa-review-webhook-success/system_prompt.md`, dont l'étape 4
+   désigne le `commit_id` de la revue GitHub comme source de vérité du dedup
+   (*« Do not add a separate task-metadata flag »*). Les porter en code servi
+   crée deux sites de vérité à tenir alignés.
+3. **La posture fail-open (AC3 de mika#2675).** Une lecture de forge en erreur
+   doit laisser passer le tour, et le taux de `Release::StateUnreadable` sur ce
+   chemin n'est pas mesuré : un filtre dont la moitié des passages est un
+   fail-open paie ses appels `gh` sans rien écarter.
+
+Et sa taille reste inconnue : l'agrégat donne le plafond (36 tours), jamais la
+part qui serait effectivement écartée. **Mesurer (g′) demande un champ que le
+registre ne porte pas — ce que le tour a fait — donc un vol d'instrument avant
+tout vol de filtre.** (g) rejoint ainsi (h) : chiffre significatif, question
+ouverte, posée à l'opérateur. Mais sa question est désormais nommée, et c'est la
+différence.
+
+**Ce que les vols 4 et 5 avaient livré reste exact**, et c'est ce qui a rendu la
+soustraction ci-dessus lisible plutôt que devinée.
+
+*Le vol 4 : la soustraction devient nommable.* Avant lui,
 `by_agent_trigger` donnait le plafond de (g) — les `check_suite_pr_branch` payées
 côté mika-qa — et rien ne disait lesquelles (b) aurait écartées si elle avait vu
 la tête. Le terme de relâche le nomme, parce que c'est exactement ce que (b)
@@ -323,7 +457,7 @@ décide : un `check_suite` vert de branche de PR relâché sous
 de (g) après retrait n'est donc plus une estimation mais une soustraction :
 plafond moins les seaux que (b) revendique.
 
-**Ce que le vol 5 change : elle devient lisible au grain où elle se décide.** Le
+*Le vol 5 : elle devient lisible au grain où elle se décide.* Le
 vol 4 avait livré le terme ; il ne l'avait pas livré *au bon grain*, et ce
 document a écrit à tort que « `charged_by_release` le dit ». Il le dit au grain
 de la **fenêtre** — `{head_not_previously_decided: 7}`, tous agents et tous
@@ -333,9 +467,14 @@ de sa soustraction vivaient donc sur deux axes qui ne se rencontraient pas, et
 les croiser demandait un `jq` à la main sur le fichier de tours. Depuis le
 vol 5, `by_agent_trigger_release` est cette cellule, avec son coût en tokens :
 la ligne `mika-qa × check_suite_pr_branch × head_not_previously_decided` **est**
-la réponse, lue sur le seul agrégat. La mesure 3 reste la condition de (g) — les
-vols 4 et 5 lui fournissent l'opérande qui manquait et le grain où le lire, ils
-ne la remplacent pas.
+la réponse, lue sur le seul agrégat.
+
+Et c'est précisément ce qui a permis au vol 6 de conclure : sur l'agrégat de la
+mesure 3, **cette ligne n'existe pas**. Sans le grain du vol 5, l'absence
+n'aurait pas été lisible comme une absence — `charged_by_release` au grain de la
+fenêtre porte bien un `head_not_previously_decided`, mais il est à mika-dev. Les
+deux vols ne remplaçaient pas la mesure ; ils ont rendu son silence
+interprétable.
 
 **(h) — le plus gros volume, et le seul blocage qui ne soit pas un chiffre.**
 1,30 M tokens, 79 % de la fenêtre de la mesure 2 : le volume est établi. Ce qui
