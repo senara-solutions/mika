@@ -246,8 +246,11 @@ une affaire de v2 ; aucun serveur v1 connu n'expose des outils de grades mêlés
 **Un grade inconnu fait échouer le chargement de la configuration** — y compris
 `"reference"`, nommé dans le corps de mika#1959 mais absent de l'enum livré
 (`DataGrade` est binaire ; `reference` se lit `operational`). Un grade n'est
-jamais deviné : un manifeste illisible arrête le démarrage plutôt que de
-tourner sous un grade supposé.
+jamais deviné. Au démarrage, le chargement est *fail-open* (mika#1764) : un
+fichier illisible émet un `warn!` (`operator-shell MCP config failed to load`)
+et Mika démarre **sans aucun serveur MCP** — aucun ne tourne sous un grade
+supposé, mais tous disparaissent, pas seulement le serveur fautif. `mika
+validate` rend l'erreur de parse en diagnostic `Fail`.
 
 **Ce que la déclaration ne fait pas :** l'outil reste **visible du modèle**, qui
 peut le mentionner ou le proposer. Seul l'appel est refusé. La non-publication

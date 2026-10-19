@@ -7988,16 +7988,23 @@ fn build_skill_data_grades(
 /// hors population par construction. Appariement tenu par la garde
 /// `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`.
 ///
-/// Collision : un outil MCP et un outil de skill de même nom sont impossibles —
-/// le préfixe `mcp__` est réservé. L'insertion est donc sans écrasement en
-/// pratique, et last-write-wins comme le reste de la map si elle le devenait.
+/// Collision : rien n'empêche une skill de déclarer un outil `mcp__<s>__<t>`
+/// (le préfixe n'est réservé qu'à la résolution des `required_tools`). Sur une
+/// collision, **le grade le plus strict l'emporte** : un `Testimony` déjà posé
+/// par la skill n'est jamais rabattu à `Operational` par un serveur MCP qui n'a
+/// rien déclaré — sinon l'étage skills du dispatch, qui passe avant l'étage
+/// MCP, exécuterait l'outil testimony sans refus L4.
 fn seed_mcp_data_grades(
     grades: &mut HashMap<String, crate::skills::manifest::DataGrade>,
     mcp: Option<&McpManager>,
 ) {
+    use crate::skills::manifest::DataGrade;
     if let Some(mcp) = mcp {
         for (tool, grade) in mcp.tool_data_grades() {
-            grades.insert(tool.clone(), *grade);
+            let entree = grades.entry(tool.clone()).or_insert(*grade);
+            if *grade == DataGrade::Testimony {
+                *entree = DataGrade::Testimony;
+            }
         }
     }
 }
@@ -19066,6 +19073,13 @@ fn prod(scope: HistoryScope) -> usize {
              possède est la façon dont une garde cesse de garder. Liste actuelle : \
              {ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT:?}"
         );
+        assert!(
+            ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT.is_empty(),
+            "mika#1959 — ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT est livrée vide : les deux \
+             sites de publication sont ensemencés par ce ticket même. Une entrée ici est un \
+             outil MCP publié hors garde L4 ; ensemencez le site au lieu de l'exempter. \
+             Liste actuelle : {ALLOWLIST_PUBLICATION_SANS_ENSEMENCEMENT:?}"
+        );
 
         let scanner =
             mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
@@ -19114,6 +19128,68 @@ fn prod(scope: HistoryScope) -> usize {
              conversation et l'agent d'équipe. Le mode silencieux est hors population \
              (il reçoit `None`). Trouvés :\n{}",
             publications.join("\n")
+        );
+    }
+
+    /// **mika#1959** — `seed_mcp_data_grades` verse les grades MCP dans la map
+    /// L4 sans toucher aux entrées des skills, ne rabat jamais un `Testimony`
+    /// sur collision de nom, et `None` (mode silencieux) laisse la map intacte.
+    ///
+    /// La garde d'appariement ci-dessus prouve que l'appel est **présent** à
+    /// chaque site ; ce test prouve qu'il **fait** ce que la garde L4 attend.
+    /// Un corps vidé laisserait la garde verte et rouvrirait F5.
+    #[test]
+    fn mika1959_lensemencement_verse_les_grades_mcp_sans_ecraser_les_skills() {
+        use crate::skills::manifest::DataGrade;
+
+        let outil_mcp = "mcp__journal-perso__read_entry";
+        let mcp = McpManager::sans_connexion_pour_tests(
+            HashMap::from([(
+                outil_mcp.to_string(),
+                ("journal-perso".to_string(), "read_entry".to_string()),
+            )]),
+            HashMap::from([(outil_mcp.to_string(), DataGrade::Testimony)]),
+        );
+        let map_skills = || HashMap::from([("web_search".to_string(), DataGrade::Operational)]);
+
+        let mut grades = map_skills();
+        seed_mcp_data_grades(&mut grades, Some(&mcp));
+        assert_eq!(
+            grades.get(outil_mcp),
+            Some(&DataGrade::Testimony),
+            "l'outil MCP doit entrer dans la map L4 avec le grade de son serveur"
+        );
+        assert_eq!(
+            grades.get("web_search"),
+            Some(&DataGrade::Operational),
+            "l'ensemencement MCP ne doit pas toucher aux entrées des skills"
+        );
+        assert_eq!(grades.len(), 2);
+
+        // Collision : un outil de skill testimony au nom namespacé MCP n'est
+        // pas rabattu par un serveur qui n'a rien déclaré.
+        let operational = McpManager::sans_connexion_pour_tests(
+            HashMap::from([(
+                outil_mcp.to_string(),
+                ("journal-perso".to_string(), "read_entry".to_string()),
+            )]),
+            HashMap::from([(outil_mcp.to_string(), DataGrade::Operational)]),
+        );
+        let mut grades = HashMap::from([(outil_mcp.to_string(), DataGrade::Testimony)]);
+        seed_mcp_data_grades(&mut grades, Some(&operational));
+        assert_eq!(
+            grades.get(outil_mcp),
+            Some(&DataGrade::Testimony),
+            "sur collision, le grade le plus strict l'emporte — un serveur MCP \
+             muet ne rabat jamais un `Testimony` de skill"
+        );
+
+        let mut grades = map_skills();
+        seed_mcp_data_grades(&mut grades, None);
+        assert_eq!(
+            grades,
+            map_skills(),
+            "sans manager (mode silencieux), la map reste celle des skills"
         );
     }
 
