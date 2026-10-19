@@ -5483,33 +5483,60 @@ async fn run_agent_inner(
     // would let the two disagree about what "evening" means.
     let turn_utc = chrono::Utc::now();
     let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
-    // mika#1747 vol 1 — le site UNIQUE de la fenêtre de transmission, et il est
-    // ici par nécessité, pas par commodité : `load_agent_context` ci-dessus est
-    // l'entonnoir habituel, mais il ne reçoit que `(db, home_dir)` et ne voit
-    // pas `llm` — il ne peut donc pas répondre « quel modèle suis-je », qui est
-    // la moitié sortante de la transition (D2). Le couple consommé est celui de
+    // mika#1747 — le site UNIQUE des deux moitiés du rituel de transmission, et
+    // il est ici par nécessité, pas par commodité : `load_agent_context`
+    // ci-dessus est l'entonnoir habituel, mais il ne reçoit que
+    // `(db, home_dir)` et ne voit pas `llm` — il ne peut donc pas répondre
+    // « quel modèle suis-je », qui désigne le sortant d'un côté (D2 du vol 1) et
+    // le destinataire de l'autre (D2 du vol 2). Le couple consommé est celui de
     // `runtime_provider` / `runtime_model` au-dessus : même source que
     // `ToolContext` et `get_active_llm`, donc le bloc ne peut pas annoncer une
-    // transition depuis un modèle que le process ne sert pas.
+    // transition depuis un modèle que le process ne sert pas, ni servir le
+    // courrier d'un autre.
     //
-    // Fail-open par construction : `pending` ne rend pas de `Result`, un signal
-    // illisible ferme la fenêtre et ne coûte pas le tour.
+    // Fail-open par construction : `resolve` ne rend pas de `Result`, un signal
+    // ou un répertoire illisible ferme la fenêtre et ne coûte pas le tour.
     let pending_transmission =
-        crate::model_transmission::pending(params.home_dir, runtime_provider, runtime_model).await;
-    if let Some(transmission) = &pending_transmission {
-        // Sur la branche `Some` SEULEMENT : la question que cet instrument
-        // règle est « la cérémonie a-t-elle été proposée ? », pas « le prédicat
-        // tourne-t-il ? » — une ligne par tour et par agent sur la branche
-        // nominale noierait la seule qui compte.
-        info!(
-            target: "mika::otel",
-            event = "model_transmission_window_open",
-            agent = %db.agent_id(),
-            outgoing = %transmission.outgoing,
-            incoming = %transmission.incoming,
-            letter_path = %transmission.letter_path,
-            "fenêtre de transmission ouverte — la lettre au successeur est demandée à ce tour"
-        );
+        crate::model_transmission::resolve(params.home_dir, runtime_provider, runtime_model).await;
+    match &pending_transmission {
+        // Chaque sonde est sur sa branche `Some` SEULEMENT : la question que cet
+        // instrument règle est « la cérémonie a-t-elle eu lieu ? », pas « le
+        // prédicat tourne-t-il ? » — une ligne par tour et par agent sur la
+        // branche nominale noierait la seule qui compte.
+        Some(crate::model_transmission::Transmission::Outgoing(transmission)) => {
+            info!(
+                target: "mika::otel",
+                event = "model_transmission_window_open",
+                agent = %db.agent_id(),
+                outgoing = %transmission.outgoing,
+                incoming = %transmission.incoming,
+                letter_path = %transmission.letter_path,
+                "fenêtre de transmission ouverte — la lettre au successeur est demandée à ce tour"
+            );
+        }
+        // mika#2807 D5 — le reçu est posé ICI, au tour qui rend le bloc, et
+        // jamais dans `prompt.rs` : la construction du prompt est une fonction
+        // pure et ses ~51 tests de forme en dépendent. C'est ce qui fait de la
+        // relecture un **événement** et non un bloc permanent.
+        //
+        // Pose avant la sonde, pour que `receipt_written` dise ce qui s'est
+        // réellement passé et non ce qu'on allait tenter.
+        Some(crate::model_transmission::Transmission::Incoming(letter)) => {
+            crate::read_receipt::mark_read(params.home_dir, &letter.letter_path).await;
+            let receipt_written =
+                crate::read_receipt::is_read(params.home_dir, &letter.letter_path).await;
+            info!(
+                target: "mika::otel",
+                event = "incoming_transmission_served",
+                agent = %db.agent_id(),
+                outgoing = %letter.outgoing,
+                letter_path = %letter.letter_path,
+                response_path = %letter.response_path,
+                receipt_written,
+                "lettre du prédécesseur servie à ce tour — une seule fois, le reçu la referme"
+            );
+        }
+        None => {}
     }
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
