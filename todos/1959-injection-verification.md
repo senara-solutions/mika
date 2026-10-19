@@ -232,6 +232,27 @@ test result: ok. 9 passed; 0 failed
 Le détail de la suite complète (workspace, clippy, lints dépôt,
 `scripts/verify-pipeline.sh`) est dans le corps de la PR.
 
+## Ajout post-sauvetage — collision de nom dans `seed_mcp_data_grades`
+
+La revue (`/ce:review`, sécurité + adversarial) a relevé que l'insertion
+last-write-wins pouvait rabattre un `Testimony` posé par une skill déclarant un
+outil `mcp__<s>__<t>` — le préfixe n'est réservé qu'à la résolution des
+`required_tools`, rien n'empêche cette collision. Correctif : le grade le plus
+strict l'emporte. Test : `mika1959_lensemencement_verse_les_grades_mcp_sans_ecraser_les_skills`.
+
+**Inversion** — le corps redevient `grades.insert(tool.clone(), *grade);`.
+
+**Mesure :**
+
+```
+assertion `left == right` failed: sur collision, le grade le plus strict l'emporte — un serveur MCP muet ne rabat jamais un `Testimony` de skill
+  left: Some(Operational)
+ right: Some(Testimony)
+test result: FAILED. 0 passed; 1 failed
+```
+
+Restauré, vert (`1 passed`).
+
 ## Refs
 
 - Parent : mika#1798 (bake de l'invariant non-transit)
