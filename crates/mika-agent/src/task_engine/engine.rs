@@ -1350,10 +1350,10 @@ impl TaskEngine {
             // Reap parent self_dev tasks left in_progress after their callback
             // subtask delivered without producing a PR (#871).
             self.reap_orphaned_parent_tasks("implement").await;
-            // mika#2762 — l'appel `reap_orphaned_parent_tasks("groom")` de mika#2750
-            // est retiré : il faisait échouer le parent d'un groom RÉUSSI quand la
-            // place implement était tenue (grâce satisfaite par un enfant livré plus
-            // ancien, lanceur `:deferred` compris). Le correctif complet le rétablit.
+            // mika#2750 : même balayage pour la classe `groom`. Les deux
+            // populations sont disjointes par construction (le prédicat porte sur
+            // `child.dispatch_class`), donc deux appels par passe.
+            self.reap_orphaned_parent_tasks("groom").await;
 
             // Auto-complete parent self_dev tasks left in_progress after their
             // callback subtask delivered WITH a PR url (mika#1162). Success-side
@@ -4317,12 +4317,11 @@ impl TaskEngine {
     /// [`REAPER_CLASS_DISPOSITIONS`]; a class absent from that closed table is
     /// not swept at all, rather than swept under another class's name.
     ///
-    /// mika#2762: `tick()` sweeps `implement` only until the groom predicate is
-    /// fixed. `pub` + `#[doc(hidden)]` only so the mika#2750 integration tests
-    /// keep pinning the `groom` sweep directly in the meantime; outside tests,
-    /// `tick()` is the sole caller.
-    #[doc(hidden)]
-    pub async fn reap_orphaned_parent_tasks(&self, dispatch_class: &str) {
+    /// mika#2762: the grace is anchored on `MAX(child.updated_at)` over the
+    /// **non-deferred** callbacks of the swept class, so a groom that has just
+    /// delivered successfully no longer loses its parent while the implement
+    /// slot is held. `tick()` sweeps both classes again, and is the sole caller.
+    async fn reap_orphaned_parent_tasks(&self, dispatch_class: &str) {
         let Some(&(_, default_fail_reason, audit_tool_name)) = REAPER_CLASS_DISPOSITIONS
             .iter()
             .find(|(class, _, _)| *class == dispatch_class)
@@ -4377,6 +4376,13 @@ impl TaskEngine {
                 parent_status = "in_progress",
                 parent_source = "self_dev",
                 callback_task_id = %parent.callback_task_id,
+                // mika#2762: the instant the grace was measured against —
+                // `MAX(child.updated_at)` over the retained callbacks, which is
+                // NOT `callback_task_id`'s timestamp as soon as the parent has
+                // more than one delivered callback. Without this field, "the
+                // grace was satisfied by the launcher" and "the grace was
+                // satisfied by the real callback" print identical bytes.
+                last_callback_at = %parent.last_callback_at,
                 children_count = children.len(),
                 children = ?children,
                 "task_engine_reaper.evaluated"
@@ -4390,6 +4396,16 @@ impl TaskEngine {
             // `"implement"`: the semantics are unchanged — "if at kill time every
             // delivered callback child belongs to another class than the one I am
             // sweeping, I abstain".
+            //
+            // mika#2762: the guard reads the same population as the SQL, so it
+            // skips deferred launchers too. Alignment, not a new rule — a
+            // launcher is not a callback of the dispatch it launched, on either
+            // side. The edge case this makes unreachable rather than handled: a
+            // parent whose ONLY delivered callback is `:deferred` never enters
+            // the population, because D2's `NOT LIKE` empties the JOIN for it;
+            // so the guard can never see an all-deferred list and conclude
+            // "another class". Keeping the two filters in step is what keeps
+            // that true after the next edit to either one.
             if !children.is_empty() {
                 let delivered_callback_children: Vec<_> = children
                     .iter()
@@ -4397,6 +4413,7 @@ impl TaskEngine {
                         c.trigger_type == "callback"
                             && c.action_type == "resume_agent"
                             && c.status == "delivered"
+                            && !c.label.ends_with(":deferred")
                     })
                     .collect();
 
