@@ -36,11 +36,13 @@
   --color-surface-tint: #ada3ff;
   --color-inverse-surface: #f9f9fd;
 
-  /* Rulebook §2 canonical error triad.
-     §5.5 line 270 references #ef4444 (contradiction with §2's #ff6e84).
-     Implementation adopts §2 (canonical Full Token Reference table). Rulebook
-     doc-side reconciliation surfaced to Vincent as operator follow-up per
-     `mika/CLAUDE.md § docs/design` (rulebook is Vincent-owned direct-commit). */
+  /* Rulebook §2 canonical error triad. The §5.5-vs-§2 contradiction this block
+     used to describe as live is **closed**: `76a8b0de` (PR #1976) reconciled
+     §5.5 line 270 to #ff6e84, so the rulebook now names one error hex in both
+     sections and the implementation below agrees with it. #ef4444 appears
+     nowhere in `docs/design/luminescent-core.md` any more — it stays banned by
+     `theme.test.ts § bannedLegacyHexValues` because a value that was once
+     canonical is exactly the one a consumer retypes from memory. */
   --color-error: #ff6e84;
   --color-error-dim: #d73357;
   --color-error-container: #a70138;
