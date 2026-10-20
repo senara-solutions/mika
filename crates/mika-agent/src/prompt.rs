@@ -1151,8 +1151,9 @@ impl FailClosedCause {
 /// Fail-closed `Identity` for an agent whose `identity.toml` could not be read
 /// (absent or unreadable — mika#2027, any agent) or failed to parse (mika#811,
 /// well-known agents). Sentinel allowlist matches no real skill (evicts all
-/// bundled skills); denylist contains every mutational built-in tool to prevent
-/// the agent from acting until the operator fixes the file.
+/// bundled skills); the tool allowlist is **empty**, so no built-in tool is
+/// published to the model at all. The agent answers; it emits nothing, until
+/// the operator repairs the file.
 ///
 /// # Why the posture line is emitted HERE and not at the call sites (mika#2784 D1)
 ///
@@ -1182,30 +1183,69 @@ impl FailClosedCause {
 /// line's *absence* ambiguous (never happened, or smothered? — mika#2331), and
 /// the nominal regime emits **zero** lines, so the volume is a function of a
 /// present defect, which is the correct behaviour.
+///
+/// # Pourquoi aucun builtin, pas même `send_message` (mika#2853, Q1)
+///
+/// Décision de Vincent du 2026-10-20, sur bearing Prime, en commentaire de
+/// mika#2784 : `allowed = Some(vec![])`. La raison n'est pas une somme de
+/// dangers outil par outil, c'est une question d'autorité. **Une identité
+/// malformée ne dit rien de fiable sur ce que l'agent devrait pouvoir faire** —
+/// le fichier qui déclare son périmètre est précisément celui qu'on n'a pas pu
+/// lire. Choisir ici une liste non vide, c'est inventer un périmètre à la place
+/// d'un document absent.
+///
+/// L'objection qu'on attendrait — « un agent muet ne peut pas prévenir qu'il va
+/// mal » — est répondue par la couche au-dessus, pas par l'agent : la ligne
+/// `agent_fail_closed_posture` ci-dessous nomme l'agent, la cause et le fichier,
+/// et c'est elle que l'opérateur lit. *La posture se signale ; l'agent se tait.*
+/// Faire porter l'alerte par un `send_message` du dégradé serait confier le
+/// signal à la partie du système dont on vient d'établir qu'on ne sait plus ce
+/// qu'elle est.
+///
+/// Et il n'y a **aucune exemption par catégorie d'agent** (Q2) : un fichier
+/// disparu ne permet plus d'attester ce qu'est l'agent, quel que soit son
+/// propriétaire. Un agent personnel est couvert comme un agent bien connu. La
+/// contrepartie de ce resserrement est la réparabilité — « ferme dur, répare
+/// vite » — d'où les champs `agent` et `path` de la ligne, épinglés par
+/// [`tests::mika2784_un_fichier_absent_nomme_la_posture_et_sa_cause`].
+///
+/// Ce que cela remplace, parce que le commentaire qui vivait ici affirmait
+/// l'inverse : jusqu'au 2026-10-20 ce champ valait `None`, au motif qu'une
+/// allowlist retirerait des outils à un agent *au pire moment*, celui d'une
+/// faute de provisionnement. C'est vrai, et c'est désormais l'effet voulu. La
+/// mesure qui a tranché : sous `None`, dix-huit builtins atteignaient encore un
+/// agent dit « fail-closed » — les trois écritures de mémoire agent-scoped
+/// comprises — la dénylist `MIKA_ARCH_DISABLED_TOOLS` ne refusant que les outils
+/// mutationnels de plateforme. « Fail-closed » décrivait une posture qui
+/// publiait dix-huit outils.
+///
+/// La dénylist, elle, **reste** et n'est pas redondante : elle est la ligne de
+/// défense qui ne dépend pas de ce champ, et elle gouverne mika-arch en régime
+/// nominal, où l'allowlist n'est pas vide.
 fn fail_closed_identity(agent: &str, path: &Path, cause: FailClosedCause) -> Identity {
     let tools = ToolsIdentityConfig {
         disabled: crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        // Deliberately `None`, not mika-arch's allowlist (mika#2748,
-        // Decision 4). This path serves **every** agent whose
-        // `identity.toml` is absent, unreadable or malformed — including
-        // `mika` herself on a mis-provisioned host, and including
-        // transiently (mika#2027). Writing an allowlist here would take
-        // tools away from an agent on a provisioning fault, i.e. at the
-        // worst possible moment. Tightening it to an allowlist is a
-        // fleet-wide decision with its own follow-up ticket (mika#2784
-        // morceau 2, gated on two doctrine questions); the denylist
-        // above already denies every mutational builtin.
-        allowed: None,
+        // Vide, et non `None` : l'agent déclare la liste de ce qu'il peut
+        // faire, et elle ne contient rien. `None` dirait « cet agent ne
+        // déclare pas d'allowlist », donc tout ce que la dénylist n'a pas
+        // refusé — dix-huit outils, mesurés. Décision du 2026-10-20 (Vincent,
+        // bearing Prime, commentaire sur mika#2784, questions 1 et 2) ; le
+        // raisonnement, l'objection qu'elle écarte et ce qu'elle remplace sont
+        // dans le doc-comment de cette fonction, section « Pourquoi aucun
+        // builtin ».
+        allowed: Some(vec![]),
     };
 
     // `tools_allowlist` is read off the value just built rather than written as
-    // a literal, so the day mika#2784 morceau 2 sets `Some(...)` the **same
-    // grep says whether the tightening is in force in the binary being
-    // served**. Without it, "morceau 2 is deployed" and "morceau 2 is written
-    // but the binary predates it" return identical bytes (class mika#2340).
+    // a literal, so the **same grep says whether the tightening is in force in
+    // the binary being served**. It reads `present` since mika#2853; reading
+    // `absent` today therefore does not mean "the posture is permissive by
+    // design", it means **the binary answering is older than this change**
+    // (class mika#2340). Without the derivation, the two would return identical
+    // bytes.
     tracing::error!(
         event = "agent_fail_closed_posture",
         agent = %agent,
@@ -1213,10 +1253,12 @@ fn fail_closed_identity(agent: &str, path: &Path, cause: FailClosedCause) -> Ide
         path = %path.display(),
         tools_allowlist = if tools.allowed.is_some() { "present" } else { "absent" },
         "agent is running in FAIL-CLOSED posture: all skills evicted (sentinel \
-         allowlist), every mutational builtin denied, summary injection off. \
-         This is an incident, not an information — the agent acts on nothing \
-         until its identity.toml is repaired. Remediation depends on `cause`: \
-         see docs/operator/agent-identity-reprovision.md"
+         allowlist), NO built-in tool published to the model at all (empty \
+         allowlist — `send_message` included, mika#2853), summary injection \
+         off. This is an incident, not an information — the agent answers and \
+         emits nothing until its identity.toml is repaired, and it cannot \
+         report its own state: this line is the report. Remediation depends on \
+         `cause`: see docs/operator/agent-identity-reprovision.md"
     );
 
     Identity {
@@ -3624,13 +3666,24 @@ emoji = "✦"
     /// Le TOML le plus court qui ne parse pas : `name` est un `String`.
     const TOML_INVALIDE: &str = "name = 42\n";
 
-    /// mika#2784 V1 — un fichier absent **nomme la posture** et sa cause.
+    /// mika#2784 V1 — un fichier absent **nomme la posture**, sa cause, l'agent
+    /// et le fichier.
     ///
     /// Avant ce vol, cet état n'émettait que `identity_toml_absent`, qui décrit
     /// la *lecture du fichier*. Aucun grep ne répondait à « cet agent
     /// tourne-t-il en posture dégradée ? » — et c'est la question 3 du ticket,
     /// celle qui passe en premier : resserrer une posture qu'on ne voit pas
     /// rend l'incident suivant plus difficile à lire (mika#2293).
+    ///
+    /// **Le couple agent + chemin est la contrepartie de la question 2
+    /// (mika#2853).** Le 2026-10-20, Vincent a tranché que le fail-closed
+    /// couvre aussi les agents utilisateurs, sans exemption par catégorie — un
+    /// resserrement dont le coût est qu'un agent personnel peut se retrouver
+    /// muet sur une faute de provisionnement. La contrepartie exigée est
+    /// nommément celle-ci : « ferme dur, répare vite », donc la ligne doit
+    /// porter *quel* agent et *quel* fichier réparer. Un opérateur qui lit
+    /// « un agent est en posture dégradée » sans ces deux champs doit aller les
+    /// chercher, et c'est pendant ce temps-là que l'agent ne fait rien.
     #[test]
     #[serial_test::serial]
     fn mika2784_un_fichier_absent_nomme_la_posture_et_sa_cause() {
@@ -3653,6 +3706,18 @@ emoji = "✦"
             journal.contains("vincent-perso"),
             "la ligne doit nommer l'agent, sans quoi une flotte en incident est \
              un seul comptage : {journal}"
+        );
+        let fichier_attendu = home.join("identity.toml");
+        assert!(
+            journal.contains(&fichier_attendu.display().to_string()),
+            "la ligne doit nommer le fichier À RÉPARER, pas seulement l'agent : \
+             c'est la contrepartie que la question 2 de mika#2853 exige du \
+             resserrement (« ferme dur, répare vite », 2026-10-20). Le nom de \
+             l'agent seul laisse l'opérateur déduire un chemin — or le home d'un \
+             agent dépend de la provision, et c'est précisément une faute de \
+             provision qu'on est en train de lire. Attendu : \
+             {} — journal : {journal}",
+            fichier_attendu.display()
         );
         assert!(
             !journal.contains(r#"cause="parse_error""#)
@@ -3769,36 +3834,49 @@ emoji = "✦"
         );
     }
 
-    /// mika#2784 V6 — la posture ne déclare **aucune** allowlist d'outils, et
-    /// la ligne le dit.
+    /// mika#2853 V6 — la posture déclare une allowlist **vide**, et la ligne le
+    /// dit.
     ///
-    /// Les deux moitiés sont indissociables. L'assertion sur `allowed == None`
-    /// épingle le périmètre de ce vol : le morceau 1 rend la posture
-    /// observable, il ne la resserre pas. Le champ `tools_allowlist` est
-    /// **dérivé** de `allowed.is_some()`, donc le jour où le morceau 2 posera
-    /// `Some(...)`, le même grep dira si le resserrement est en force **dans le
-    /// binaire servi** — sans quoi « morceau 2 déployé » et « morceau 2 écrit
-    /// mais binaire antérieur » rendent des octets identiques (mika#2340).
+    /// Les deux moitiés sont indissociables. `Some(vec![])` n'est pas `None`
+    /// avec une étape de plus : c'est l'inverse exact. `None` signifie *cet
+    /// agent ne déclare pas d'allowlist*, donc le prédicat d'admission admet
+    /// tout ce que la dénylist n'a pas refusé ; `Some(vec![])` signifie *cet
+    /// agent déclare la liste de ce qu'il peut faire, et elle est vide*. C'est
+    /// la décision du 2026-10-20 (Vincent, bearing Prime, commentaire sur
+    /// mika#2784, question 1) : aucun builtin en fail-closed, pas même
+    /// `send_message`.
+    ///
+    /// Le champ `tools_allowlist` est **dérivé** de `allowed.is_some()` et
+    /// jamais écrit en littéral, ce qui en fait la mesure du binaire **servi**
+    /// et non du dépôt : lire `absent` aujourd'hui ne veut pas dire « la posture
+    /// est permissive », cela veut dire « le binaire interrogé est antérieur à
+    /// ce vol » (classe mika#2340). Sans le dérivé, les deux rendraient des
+    /// octets identiques.
     #[test]
     #[serial_test::serial]
-    fn mika2784_la_posture_ne_declare_aucune_allowlist_doutils() {
+    fn mika2853_la_posture_declare_une_allowlist_vide() {
         let tmp = tempfile::tempdir().unwrap();
         let home = home_dagent(&tmp, "vincent-perso");
 
         let (identity, journal) = journal_de_chargement(&home);
 
         assert_eq!(
-            identity.tools.allowed, None,
-            "le morceau 1 de mika#2784 est l'observabilité SEULE. Poser une \
-             allowlist ici est le morceau 2, et sa condition préalable est une \
-             décision écrite de Vincent sur la question 1 (un agent fail-closed \
-             garde-t-il `send_message` ?) et la question 2 (le fichier absent \
-             couvre TOUS les agents depuis mika#2027, y compris un agent \
-             personnel). Si cette assertion rougit sans ces deux décisions, le \
-             resserrement a été fait sans qu'on l'ait tranché."
+            identity.tools.allowed,
+            Some(vec![]),
+            "la posture fail-closed doit déclarer une allowlist VIDE, et non \
+             l'absence d'allowlist. Les deux conditions de levée de ce \
+             resserrement ont été tranchées le 2026-10-20 par Vincent, sur \
+             bearing Prime, en commentaire de mika#2784 : question 1 — aucun \
+             builtin, `send_message` compris, parce qu'une identité malformée ne \
+             dit rien de fiable sur ce que l'agent devrait pouvoir faire ; \
+             question 2 — aucune exemption par catégorie d'agent. Si cette \
+             assertion rougit avec `None`, quelqu'un a rouvert le resserrement \
+             sans renverser ces deux décisions ; si elle rougit avec une liste \
+             non vide, l'exception qui y a été écrite doit porter sa propre \
+             décision datée."
         );
         assert!(
-            journal.contains(r#"tools_allowlist="absent""#),
+            journal.contains(r#"tools_allowlist="present""#),
             "le champ doit dire l'état réel du champ `allowed`, pas une \
              constante : {journal}"
         );
@@ -3884,6 +3962,16 @@ emoji = "✦"
     /// exception, and discriminating here would reopen the "which agent is
     /// supposed to have a file?" ambiguity the universal rule closes.
     ///
+    /// **Depuis mika#2853, cette universalité porte aussi l'allowlist
+    /// d'outils.** C'est la question 2, tranchée le 2026-10-20 : un fichier
+    /// disparu ne permet plus d'attester ce qu'est l'agent, quel que soit son
+    /// propriétaire, donc il n'y a pas d'exemption par catégorie. L'assertion
+    /// sur `tools.allowed` est ici et non seulement dans
+    /// [`mika2853_la_posture_declare_une_allowlist_vide`] parce que ce
+    /// test-là passerait inchangé si le resserrement était gardé derrière un
+    /// `find_well_known_agent(...).is_some()` — sa prémisse n'interroge pas la
+    /// catégorie de son agent, celui-ci si.
+    ///
     /// `#[serial_test::serial]` — voisin du callsite capturé (mika#2646).
     #[test]
     #[serial_test::serial]
@@ -3901,6 +3989,17 @@ emoji = "✦"
         assert_eq!(
             identity.skills.allowlist,
             Some(vec![FAIL_CLOSED_SKILL_SENTINEL.to_string()])
+        );
+        assert_eq!(
+            identity.tools.allowed,
+            Some(vec![]),
+            "l'universalité de la posture inclut désormais l'allowlist d'outils \
+             (mika#2853, question 2, 2026-10-20) : un agent utilisateur à \
+             fichier absent reçoit zéro builtin, comme un agent bien connu. Si \
+             cette assertion rougit seule — celle de \
+             `mika2853_la_posture_declare_une_allowlist_vide` restant verte — le \
+             resserrement a été gardé derrière une exemption par catégorie, que \
+             la décision exclut explicitement."
         );
     }
 
