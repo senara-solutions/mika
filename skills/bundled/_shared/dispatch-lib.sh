@@ -9270,6 +9270,111 @@ _trail_read() {
     [ -r "$trail_file" ] && cat "$trail_file"
 }
 
+# mika#2077 — la halte de la session de REVISE, sur UNE SEULE LIGNE.
+#
+# LE DÉFAUT QU'ELLE FERME. `_launch_revise_pilot` n'avait qu'un prédicat — le
+# sha256 du plan — et une seule phrase pour trois causes : un modèle qui a
+# conclu sans rien changer, une session tuée par un garde-fou, un pilote jamais
+# lancé. La garantie d'honnêteté de terminaison que PR#2028 a posée s'arrêtait
+# au pilote principal ; R5 du plan de mika#1772 l'avait borné là et consigné le
+# reste comme trou. Ici, un kill était rapporté comme un refus du modèle.
+#
+# CONTRAINTE (i) — AUCUNE ÉCRITURE DANS LES GLOBALES DE SESSION. `_resolve_halt_subtype`
+# ne prend pas d'argument : il LIT des globales qui portent la session du pilote
+# PRINCIPAL, et ces globales ont des lecteurs EN AVAL de `_iterate_groom_loop` —
+# `_signal_rescue_into_open_pr` écrit `- Session pilote : <SESSION_ID>` dans un
+# commentaire de PR, et les deux `_escalate_groom` du bras ITERATE tirent APRÈS
+# ce lancement-ci. Un `SESSION_ID` écrasé ferait poster la session du revise
+# comme provenance des commits du filet. D'où DEUX protections superposées :
+#   * cette fonction est appelée en SUBSTITUTION DE COMMANDE (un sous-shell), et
+#   * les entrées sont des `local` du cadre, donc la portée dynamique les rend
+#     visibles au résolveur sans qu'aucune globale soit touchée, même si un
+#     futur appelant l'invoquait comme une commande.
+#
+# CONTRAINTE (i-bis) — LE MÉMO S'HÉRITE, ET C'EST LE PIÈGE INVERSE.
+# `_resolve_halt_subtype` est mémoïsé et son garde est `+x` : une résolution vide
+# EST une résolution. Un sous-shell hérite de ce mémo, posé par le post-flight du
+# pilote principal. Sans le `unset` ci-dessous, cette fonction rendrait la halte
+# du pilote PRINCIPAL comme halte du pilote de revise — une fausse attribution
+# PIRE que celle d'avant, parce qu'elle est précise, donc crédible. Le `unset`
+# n'est pas une hygiène, c'est la correction ; V13 vérifie qu'en l'ôtant la
+# mesure rougit. Pour la même raison `STDERR_FILE` et `LOG_ID` sont reliés aux
+# fichiers du REVISE : sans quoi le repli par scrape de la ligne `[guardrail]`
+# lirait le stderr du pilote principal.
+#
+# `local` SUR LE MÉMO : JAMAIS. En bash, `unset` sur une variable déclarée
+# `local` dans le même cadre retire la locale et RÉVÈLE la globale héritée —
+# c'est-à-dire exactement la valeur du pilote principal qu'on veut neutraliser.
+# Le sous-shell de la substitution est ce qui contient l'`unset` ; la portée
+# locale le retournerait contre lui-même.
+#
+# AUCUNE TABLE N'EST RECOPIÉE. Le vocabulaire de halte garde son site de vérité
+# unique (`_halt_family`), lu par appel. Ce qui est réutilisé est la
+# CLASSIFICATION, pas la PRÉSENTATION : la sortie de `_classify_terminated_session`
+# est un bloc multi-ligne ouvert par le marqueur retryable, donc inutilisable
+# pour ce consommateur-ci (voir `_publish_revise_diagnosis`).
+#
+# Args: $1 = subtype, $2 = termination_reason, $3 = api_error_status,
+#       $4 = stderr file OF THE REVISE SESSION, $5 = its log id
+# Prints: one line naming subtype, detail, halt class and hint.
+_classify_revise_halt() {
+    # Les cinq entrées du résolveur, en `local` — voir la contrainte (i).
+    local SUBTYPE="${1:-}" TERMINATION_REASON="${2:-}" API_ERROR_STATUS="${3:-}" \
+        STDERR_FILE="${4:-}" LOG_ID="${5:-}"
+    # Contrainte (i-bis). Non `local`, délibérément : voir l'en-tête.
+    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE
+    _resolve_halt_subtype
+
+    local _rv_subtype="${_HALT_SUBTYPE_RESOLVED:-}"
+    local _rv_row _rv_rest _rv_family _rv_hint
+    _rv_row=$(_halt_family "$_rv_subtype")
+    _rv_family="${_rv_row%%|*}"
+    _rv_rest="${_rv_row#*|}"
+    _rv_hint="${_rv_rest%%|*}"
+
+    # Une résolution vide EST une résolution, et elle se dit. Le repli de
+    # `_resolve_halt_subtype` est fail-open (« stderr only enriches ») : la
+    # distinction `terminated` / conclu vient du `status`, jamais d'ici, donc un
+    # stderr muet dégrade le texte et ne perd pas le verdict.
+    local _rv_named="$_rv_subtype"
+    [ -n "$_rv_named" ] || _rv_named="cause not recorded (no subtype on the result, no guardrail line in its stderr)"
+
+    # La classe est nommée en MINUSCULES et en milieu de ligne. `Halt class:` est
+    # lu ANCRÉ par `line_value` (evaluator.rs:357-363, `starts_with` par ligne),
+    # donc une mention en milieu de ligne y est inerte ; elle est quand même
+    # mise en minuscules pour qu'aucun futur lecteur non ancré n'ait de prise.
+    # CE QUE CETTE FONCTION NE DIT PAS : ce que la halte implique pour le PLAN.
+    # Les deux appelants en tirent des conclusions opposées — plan inchangé
+    # (« tué, donc pas révisé ») et plan changé malgré la halte (R7) — donc la
+    # phrase de conséquence appartient au site, pas à la table. L'y mettre
+    # rendrait l'un des deux messages faux au mot près.
+    printf '%s' "the revise session was HALTED, not concluded: subtype ${_rv_named}${API_ERROR_STATUS:+ (HTTP ${API_ERROR_STATUS})}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}; halt class ${_rv_family}, hint ${_rv_hint} (${_rv_hint:+$(_halt_hint_meaning "$_rv_hint")})"
+}
+
+# mika#2077 — l'unique écrivain de `REVISE_PILOT_HALT_DIAGNOSIS`, et le seul
+# endroit où les deux propriétés de correction du diagnostic sont tenues.
+#
+# UNE SEULE LIGNE, PAR CORRECTION ET NON PAR STYLE. Le diagnostic finit dans
+# `GROOM_LOOP_FAILURE_REASON`, que `dispatch_claude_pilot` interpole dans un
+# REMPLACEMENT `sed` (`s/Outcome: .*/…/`). L'échappement de ce site couvre `\`,
+# `/` et `&` — PAS le saut de ligne. Un motif multi-ligne donne
+# `unterminated 's' command`, `sed` n'écrit rien, la substitution de commande
+# rend une chaîne vide et TOUT le corps du `RESULT` est perdu, pilote compris.
+# Deux des quatre sources de ce texte sont nativement multi-ligne :
+# `$_PILOT_SANDBOX_REFUSAL` (motif + remède) et `termination_reason`, qui vient
+# d'un producteur amont que personne ici ne contrôle.
+#
+# ET SANS LE MARQUEUR RETRYABLE. `evaluator.rs:305` lit `PIPELINE FAILURE:` en
+# `contains`, NON ancré — la forme que le vol 2 de ce même parapluie vient de
+# fermer sur le chemin GROOMED. La tête est donc démotée plutôt que supprimée :
+# même doctrine, le diagnostic reste entier.
+_publish_revise_diagnosis() {
+    REVISE_PILOT_HALT_DIAGNOSIS=$(printf '%s' "$1" \
+        | tr '\n\r\t' '   ' \
+        | sed 's/PIPELINE FAILURE:/pipeline failure (demoted, mika#2077):/g' \
+        | sed 's/  */ /g; s/^ *//; s/ *$//')
+}
+
 _launch_revise_pilot() {
     # Phase D companion (mika#1271) — launch claude-pilot for content-only plan
     # revision against architect findings. Entry command: /mika-revise-plan
@@ -9298,21 +9403,34 @@ _launch_revise_pilot() {
     # Un compteur commun ferait du premier un désarmement silencieux du second.
     _PLAN_SIZE_REVISE_RETRIED=0
 
+    # mika#2077 — le diagnostic d'échec de CE lancement, remis à zéro à chaque
+    # entrée (même doctrine que les deux compteurs ci-dessus : la terminaison se
+    # lit sans dérouler le flot de contrôle). Globale à dessein. Elle est posée
+    # sur CHACUN des `return 1`, les quatre gardes d'entrée comprises — qui
+    # sortaient jusqu'ici sans rien publier, donc l'appelant n'avait que sa
+    # propre phrase de contenu à offrir à l'opérateur. Un `return 0` la laisse
+    # vide : c'est un diagnostic d'ÉCHEC, et un vide est lisible comme tel.
+    REVISE_PILOT_HALT_DIAGNOSIS=""
+
     local findings_file="$1"
     [ -r "$findings_file" ] || {
-        echo "WARN: _launch_revise_pilot: findings file not readable: $findings_file" >&2
+        _publish_revise_diagnosis "the revise pilot was never launched: its findings file is not readable ($findings_file). Nothing about the plan or the model can be concluded from this."
+        echo "WARN: _launch_revise_pilot: $REVISE_PILOT_HALT_DIAGNOSIS" >&2
         return 1
     }
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
-        echo "WARN: _launch_revise_pilot: WORKTREE_DIR missing" >&2; return 1; }
+        _publish_revise_diagnosis "the revise pilot was never launched: WORKTREE_DIR is unset or not a directory. Nothing about the plan or the model can be concluded from this."
+        echo "WARN: _launch_revise_pilot: $REVISE_PILOT_HALT_DIAGNOSIS" >&2; return 1; }
     [ -n "$ISSUE_NUM" ] || {
-        echo "WARN: _launch_revise_pilot: ISSUE_NUM unset" >&2; return 1; }
+        _publish_revise_diagnosis "the revise pilot was never launched: ISSUE_NUM is unset, so no plan could be located. Nothing about the plan or the model can be concluded from this."
+        echo "WARN: _launch_revise_pilot: $REVISE_PILOT_HALT_DIAGNOSIS" >&2; return 1; }
 
     # Locate the plan file via _find_issue_plan (mika#1421 — filename pattern
     # with content-fallback for date-prefix slug-tail filenames).
     local plan_path
     plan_path=$(_find_issue_plan) || {
-        echo "WARN: _launch_revise_pilot: no plan file to revise" >&2; return 1; }
+        _publish_revise_diagnosis "the revise pilot was never launched: no plan file was found for $REPO#$ISSUE_NUM. Nothing about the plan or the model can be concluded from this."
+        echo "WARN: _launch_revise_pilot: $REVISE_PILOT_HALT_DIAGNOSIS" >&2; return 1; }
 
     # sha256 before revise (detection mechanism; mtime is too coarse).
     local pre_hash; pre_hash=$(sha256sum "$plan_path" | cut -d' ' -f1)
@@ -9336,9 +9454,53 @@ _launch_revise_pilot() {
 
     # sha256 after revise
     local post_hash; post_hash=$(sha256sum "$plan_path" | cut -d' ' -f1)
-    rm -f "$revise_stdout" "$revise_stderr"
+
+    # mika#2077 — LIRE la sortie du pilote AVANT de la détruire. Les deux
+    # captures `mktemp` ci-dessus étaient supprimées sans avoir jamais été
+    # ouvertes, et le sha256 du plan était le SEUL prédicat : trois populations
+    # — le modèle a conclu sans rien changer, la session a été tuée, le pilote
+    # n'a jamais existé — rendues par une phrase unique qui n'est vraie que de
+    # la première.
+    #
+    # LA FORME EST CELLE DU POST-FLIGHT PRINCIPAL (`:5473-5474`), délibérément
+    # recopiée et non factorisée : factoriser toucherait la seule garantie
+    # d'honnêteté de terminaison que ce vol ne doit pas déranger. La duplication
+    # est ÉPINGLÉE à la place — une assertion exige que les deux sites portent
+    # la forme identique, donc une dérive rougit au lieu de vieillir. Le `grep`
+    # est nécessaire : `--verbose` fait précéder le résultat structuré de lignes
+    # de trace, donc `jq` sur le fichier entier échouerait.
+    local revise_raw revise_json
+    revise_raw=$(cat "$revise_stdout" 2>/dev/null)
+    revise_json=$(printf '%s\n' "$revise_raw" | grep -m1 '^{' || true)
+
+    local revise_status revise_subtype revise_reason revise_api_status
+    local revise_session revise_turns revise_duration
+    revise_status=$(printf '%s\n' "$revise_json" | jq -r '.status // empty' 2>/dev/null)
+    revise_subtype=$(printf '%s\n' "$revise_json" | jq -r '.subtype // empty' 2>/dev/null)
+    revise_reason=$(printf '%s\n' "$revise_json" | jq -r '.termination_reason // empty' 2>/dev/null)
+    revise_api_status=$(printf '%s\n' "$revise_json" | jq -r '.api_error_status // empty' 2>/dev/null)
+    revise_session=$(printf '%s\n' "$revise_json" | jq -r '.session_id // empty' 2>/dev/null)
+    revise_turns=$(printf '%s\n' "$revise_json" | jq -r '.turns // empty' 2>/dev/null)
+    revise_duration=$(printf '%s\n' "$revise_json" | jq -r '.duration_ms // empty' 2>/dev/null)
+
+    # Toutes des `local` — contrainte (i). Les globales homonymes portent la
+    # session du pilote PRINCIPAL et ont des lecteurs en aval de
+    # `_iterate_groom_loop` ; voir l'en-tête de `_classify_revise_halt`.
+    local revise_provenance=""
+    [ -n "$revise_session" ] && revise_provenance=" [revise session ${revise_session}${revise_turns:+, ${revise_turns} turns}${revise_duration:+, ${revise_duration}ms}]"
 
     if [ "$pre_hash" != "$post_hash" ]; then
+        # mika#2077 (R7) — une session tuée QUI A QUAND MÊME ÉCRIT le plan est
+        # l'analogue du `_terminated_with_work` principal (`:5613-5622`) : le
+        # fait se dit, et rien d'autre ne change. `return 0`, la boucle enchaîne
+        # sur la seconde passe. Le plan a été révisé par une session incomplète
+        # — c'est un fait à dire au second relecteur, pas une porte à fermer.
+        # La ligne part sur stderr AVANT le `rm -f`, parce que la
+        # classification a besoin du stderr du revise (et de lui seul).
+        if [ "$revise_status" = "terminated" ]; then
+            echo "WARN: _launch_revise_pilot: the plan WAS revised, but $(_classify_revise_halt "$revise_subtype" "$revise_reason" "$revise_api_status" "$revise_stderr" "$revise_log_id") — the second pass will read a plan written by an incomplete session.${revise_provenance}" >&2
+        fi
+        rm -f "$revise_stdout" "$revise_stderr"
         echo "_launch_revise_pilot: plan revised (sha changed from ${pre_hash:0:12} to ${post_hash:0:12})" >&2
         _fd_retry_if_section_still_missing "$findings_file" "$plan_path"
         # mika#2636 — second rattrapage, à la suite du premier. L'ORDRE est
@@ -9350,10 +9512,41 @@ _launch_revise_pilot() {
         # découvert.
         _plan_size_retry_if_section_still_missing "$findings_file" "$plan_path"
         return 0
-    else
-        echo "WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)" >&2
-        return 1
     fi
+
+    # mika#2077 — LES TROIS POPULATIONS, séparées. Le sha256 n'a pas bougé ;
+    # reste à dire POURQUOI, et les trois réponses envoient l'opérateur à trois
+    # endroits différents. L'ordre des bras est celui de la certitude
+    # décroissante : un `exit 78` est un fait du substrat, un `terminated` est
+    # un fait du résultat structuré, le reste est le résidu — et c'est seulement
+    # sur ce résidu que la phrase d'origine est vraie.
+    local revise_diag
+    if [ "$revise_exit" -eq 78 ]; then
+        # `_run_pilot_sandboxed` a refusé de construire le sandbox : AUCUN
+        # processus pilote n'a existé. Le motif est déjà composé, remède inclus,
+        # par les trois sites de `_PILOT_SANDBOX_REFUSAL` (`:2584`, `:2594`,
+        # `:2636`) ; il est multi-ligne, et c'est `_publish_revise_diagnosis`
+        # qui tient la propriété « une seule ligne ».
+        revise_diag="the revise pilot was NEVER LAUNCHED — containment refusal (exit 78), so the plan is unchanged for a reason that is neither the plan's nor the model's: ${_PILOT_SANDBOX_REFUSAL:-the sandbox could not be built safely; see the revise stderr log}"
+    elif [ "$revise_status" = "terminated" ]; then
+        # L'appel est en SUBSTITUTION DE COMMANDE — contrainte (i) : c'est le
+        # sous-shell qui contient le `unset` du mémo et les liaisons des cinq
+        # entrées du résolveur. Et il tire AVANT le `rm -f` ci-dessous, parce
+        # que le repli par scrape de la ligne `[guardrail]` a besoin du stderr
+        # du revise, qui est ce fichier-là et pas un autre.
+        revise_diag="$(_classify_revise_halt "$revise_subtype" "$revise_reason" "$revise_api_status" "$revise_stderr" "$revise_log_id") — the plan was NOT revised because the session was KILLED, not because the model declined to revise it. Read the revise log, not the architect findings."
+    else
+        # Le résidu, et la seule population dont la phrase d'origine était
+        # vraie. Elle est gardée MOT POUR MOT, parce que c'est ici qu'elle
+        # devient enfin une affirmation de contenu exacte : la session a conclu,
+        # et elle a laissé le plan identique à l'octet.
+        revise_diag="plan unchanged after revise pilot (exit=$revise_exit, status=${revise_status:-none}): the session CONCLUDED and left $plan_path byte-identical, so the model did decline to revise it. The architect findings and the plan are where to look."
+    fi
+
+    rm -f "$revise_stdout" "$revise_stderr"
+    _publish_revise_diagnosis "${revise_diag}${revise_provenance}"
+    echo "WARN: _launch_revise_pilot: $REVISE_PILOT_HALT_DIAGNOSIS" >&2
+    return 1
 }
 
 # mika#2306 — le rattrapage Fire-Disposition, greffé sur la branche `sha256`
@@ -10357,8 +10550,24 @@ ${content2}"
 
             # Launch revise pilot with the findings as @-file payload. Pilot
             # revises plan on disk; we detect via sha256.
+            # mika#2077 — le motif vient du LANCEUR, pas d'ici. La phrase
+            # d'avant — « revise pilot did not converge » — était une
+            # AFFIRMATION DE CONTENU, et elle était fausse sur deux des trois
+            # populations : une session tuée par un garde-fou et un pilote
+            # jamais lancé n'ont rien refusé de réviser. Pire, « did not
+            # converge » est le vocabulaire que l'enveloppe `PIPELINE FAILURE:`
+            # de `:12602` réemploie, ce qui la rendait doublement plausible et
+            # donc doublement coûteuse à mettre en doute : l'opérateur qui la
+            # lisait ouvrait les findings de l'architecte et le plan, quand la
+            # cause était en amont du pilote.
+            #
+            # `_groom_warn` reste l'unique écrivain de
+            # `GROOM_LOOP_FAILURE_REASON` (« recording and warning in one
+            # act ») : `_launch_revise_pilot` publie un DIAGNOSTIC, ce site en
+            # fait un motif d'échec de boucle. Le repli nomme la fonction
+            # plutôt que de deviner une cause.
             _launch_revise_pilot "$findings_file" || {
-                _groom_warn "revise pilot did not converge — preserving $findings_file for forensics"
+                _groom_warn "${REVISE_PILOT_HALT_DIAGNOSIS:-_launch_revise_pilot returned non-zero without publishing a diagnosis} — preserving $findings_file for forensics"
                 return 1
             }
 

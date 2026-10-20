@@ -10376,11 +10376,19 @@ assert_eq "S2 (double sens): aucune entrée d'allowlist périmée" "" \
 # résolution par construction. La contrepartie `$SUBTYPE` de cette branche est
 # scannée par V3 dans le bloc mika#2029.
 #
+# mika#2077 en a ajouté un QUATRIÈME — `_classify_revise_halt`, qui classe la
+# halte de la session de REVISE. Il est l'exacte conformité que ce scan décrit :
+# il APPELLE le résolveur au lieu de relire `$SUBTYPE` à la main. Sa particularité
+# est inverse de celle de mika#2029 : il est appelé en SUBSTITUTION DE COMMANDE
+# et commence par `unset` le mémo, précisément pour ne PAS hériter de la
+# résolution du pilote principal — ici, une session, une réponse signifie deux
+# sessions, deux réponses. V5/V6 du bloc mika#2077 mesurent les deux sens.
+#
 # Le compte est fait hors définition et hors commentaire — seuls les appels.
 T2539_RESOLVER_CALLS=$(grep -n '_resolve_halt_subtype' "$DISPATCH_LIB" \
     | grep -v '_resolve_halt_subtype() {' \
     | grep -vE ':[[:space:]]*#' | grep -c . || true)
-assert_eq "S4: _resolve_halt_subtype a exactement trois appelants de production" "3" \
+assert_eq "S4: _resolve_halt_subtype a exactement quatre appelants de production" "4" \
     "$T2539_RESOLVER_CALLS"
 assert_contains "S4: le premier est la bannière du callback" \
     '_resolve_halt_subtype' "$(sed -n '/^_classify_terminated_session() {$/,/^}$/p' "$DISPATCH_LIB")"
@@ -10390,12 +10398,25 @@ assert_contains "S4: le troisième est la branche _terminated_empty (mika#2029)"
     '_resolve_halt_subtype' \
     "$(sed -n '/^    if \[ "$_terminated_empty" = "1" \]; then$/,/^    fi$/p' "$DISPATCH_LIB" \
         | grep -vE '^[[:space:]]*#')"
+assert_contains "S4: le quatrième est le classeur de la halte de revise (mika#2077)" \
+    '_resolve_halt_subtype' \
+    "$(sed -n '/^_classify_revise_halt() {$/,/^}$/p' "$DISPATCH_LIB")"
 
 # Le mémo est réinitialisé au site qui lit le sous-type d'une NOUVELLE session,
 # et pas chez l'un des deux appelants : « une session, une réponse » est ainsi
 # une propriété de la construction et non de la mémoire du prochain éditeur.
-assert_eq "S4: le mémo est réinitialisé exactement une fois, au site de SUBTYPE" "1" \
+#
+# mika#2077 — ils sont DEUX depuis que deux sessions distinctes sont classées
+# dans le même processus. Le compte reste exact et chaque site reste adossé à la
+# lecture d'un sous-type : `:5503` au `SUBTYPE=` du pilote principal, celui de
+# `_classify_revise_halt` au `SUBTYPE` local de la session de revise. Un
+# troisième site serait de nouveau une réinitialisation sans session neuve à
+# lire — c'est-à-dire la perte de la propriété, pas son renforcement.
+assert_eq "S4: le mémo est réinitialisé exactement deux fois, aux deux sites de SUBTYPE" "2" \
     "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$DISPATCH_LIB")"
+assert_contains "S4: la seconde réinitialisation est celle de la session de revise" \
+    'unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE' \
+    "$(sed -n '/^_classify_revise_halt() {$/,/^}$/p' "$DISPATCH_LIB")"
 
 # S5 — dispatch-lib parse toujours.
 T2539_RC=0
@@ -14970,6 +14991,476 @@ if [ "$M3_DECLARED" -gt 0 ] \
         "$M3_DECLARED" "$M3_CASES"
     echo "    → mika#2194 tier 2 : $M3_CASES cas exercés (lecteur bash)"
 fi
+
+# ============================================================================
+# mika#2077 — l'honnêteté de terminaison du pilote de REVISE (V1–V15)
+# ============================================================================
+#
+# LE DÉFAUT MESURÉ. `_launch_revise_pilot` supprimait ses deux captures `mktemp`
+# sans jamais les ouvrir, et son unique prédicat était le sha256 du plan. Trois
+# populations s'effondraient donc dans une phrase unique — `WARN: plan unchanged
+# after revise pilot (exit=N)` — qui n'est vraie que de la première :
+#   1. le modèle a conclu et n'a rien changé ;
+#   2. `status: terminated` — la session a été TUÉE par un garde-fou ;
+#   3. `exit 78` — `_run_pilot_sandboxed` a refusé de bâtir le sandbox, donc
+#      aucun pilote n'a jamais existé.
+# Le site appelant aggravait : `_groom_warn "revise pilot did not converge"` est
+# une AFFIRMATION DE CONTENU, fausse sur (2) et (3), et bâtie dans le même
+# vocabulaire que l'enveloppe `PIPELINE FAILURE: grooming did not converge` —
+# donc doublement plausible, donc doublement coûteuse à mettre en doute. Un
+# opérateur qui la lisait ouvrait les findings de l'architecte et le plan ; la
+# cause était en amont du pilote.
+#
+# CE QUE CES QUINZE MESURES TIENNENT. V1–V10 passent par une SONDE
+# COMPORTEMENTALE calquée sur `_t2306_revise_probe` : la VRAIE
+# `_launch_revise_pilot` s'exécute, seul `_run_pilot_sandboxed` est redéfini
+# dans le sous-shell. Le stub écrit son JSON sur stdout — que la fonction
+# redirige déjà vers `$revise_stdout` — et sa ligne `[guardrail]` sur stderr,
+# donc c'est la fonction réelle qui capture, lit et classe. V11–V12 sont
+# structurelles (pas de recopie de table, forme d'extraction épinglée), V13–V14
+# sont l'anti-vacuité à DEUX copies régressées, V15 les préconditions.
+#
+# POURQUOI DEUX COPIES ET PAS UNE. Les deux défauts sont indépendants : retirer
+# le `unset` du mémo laisse les trois bras en place (seule V6 bascule), et
+# restaurer les messages d'origine laisse le mémo correct (V6 reste verte). Une
+# seule copie donnerait un vert sur la moitié non couverte — la leçon que le
+# vol 2 de ce même parapluie a dû écrire sur son propre `sed`.
+
+echo ""
+echo "Test: mika#2077 — honnêteté de terminaison du pilote de revise (V1–V15)"
+echo "------------------------------------------------------------------------"
+
+# --- Outillage de section ----------------------------------------------------
+
+# > 500 octets : `_find_issue_plan` filtre les plans plus courts (mika#1033).
+# Un fixture sous le seuil fait rendre « no plan file to revise », c'est-à-dire
+# un vert qui n'a rien exercé — le premier défaut qu'a eu la sonde mika#2306.
+# Le header nomme le ticket, sans quoi le tier 1 réfuterait le candidat.
+_t2077_write_plan() {
+    {
+        printf '# mika#2077 — plan de sonde\n\n**Ticket:** mika issue#2077\n\n## Probleme\n\n'
+        printf 'Corps de remplissage pour franchir le filtre des 500 octets applique par\n'
+        printf '_find_issue_plan a tous ses tiers de decouverte. Ce texte ne porte aucune\n'
+        printf 'signification pour la sonde : seule compte sa longueur, et le fait que la\n'
+        printf 'sonde ne le mute PAS, pour que pre_hash == post_hash et que la branche\n'
+        printf "d'echec — celle qui porte les trois populations — soit atteinte.\n\n"
+        printf 'Le seuil existe pour ecarter les fichiers-fantomes et les ebauches vides ;\n'
+        printf "il s'applique identiquement aux trois tiers, donc un plan trop court est\n"
+        printf 'invisible quelle que soit la façon dont il est nomme.\n\n'
+        printf '## Implementation Units\n\nU1 — un livrable quelconque.\n\n'
+        printf '## Acceptance criteria\n\nAC1 — la sonde tourne.\n'
+    } > "$1"
+}
+
+# La sonde. Un seul lancement par scénario : le rc transite par la sortie
+# étiquetée plutôt que par une seconde passe, parce que rejouer la fonction avec
+# un pilote inerte donnerait `pre_hash == post_hash` et un rc sans rapport.
+#
+# $1 = bibliothèque à sourcer (l'originale, ou une copie régressée)
+# $2 = `.status` du JSON rendu    ("" ⇒ champ vide)
+# $3 = `.subtype`                 ("" ⇒ absent, donc repli par scrape)
+# $4 = `.termination_reason`
+# $5 = `.api_error_status`
+# $6 = code de sortie du pilote simulé (78 ⇒ refus de containment, sans JSON)
+# $7 = mutate|keep — le pilote simulé modifie-t-il le plan ?
+# $8 = ligne `[guardrail] …` écrite sur le stderr DU REVISE ("" ⇒ aucune)
+# $9 = valeur pré-posée dans `_HALT_SUBTYPE_RESOLVED` ("" ⇒ mémo absent)
+#
+# Rend un rapport à lignes étiquetées :
+#   RC=<rc>   DIAG=<la globale publiée>   GLOBALS=<les six globales de session>
+#   STDERR_BEGIN puis le stderr de la fonction, tel quel.
+_t2077_probe() {
+    local lib="$1" st="$2" sub="$3" reason="$4" api="$5"
+    local rc_want="$6" mut="$7" guard="$8" memo="$9"
+    local root wt plan out
+    root=$(mktemp -d "${TMPDIR:-/tmp}/mika2077-probe-XXXXXX")
+    wt="$root/.claude/worktrees/fix-2077-probe/mika"
+    mkdir -p "$wt/docs/plans" "$wt/.iterate"
+    plan="$wt/docs/plans/2026-10-19-007-fix-2077-sonde-plan.md"
+    _t2077_write_plan "$plan"
+
+    # Findings NEUTRES : ni `Fire-Disposition` ni `Taille estimée`, sinon les
+    # deux rattrapages bornés de mika#2306 et mika#2636 tirent sur la branche de
+    # succès et relancent le pilote simulé — une mesure parasite.
+    printf 'F1 [BLOQUANT] — U2 laisse le choix de la structure de donnees a\n' \
+        > "$wt/.iterate/findings-1.md"
+    printf "l'implementeur. Tranche-le dans le plan.\n\nDisposition: ITERATE\n" \
+        >> "$wt/.iterate/findings-1.md"
+
+    # Le stderr du pilote PRINCIPAL, porteur d'une AUTRE halte. `STDERR_FILE`
+    # pointe dessus avant l'appel : une classification du revise qui le lirait
+    # rendrait `error_max_turns`, c'est-à-dire la halte de la mauvaise session.
+    printf '[guardrail] error_max_turns: the MAIN pilot halt, not this one\n' \
+        > "$root/main.stderr"
+
+    out=$(
+        # shellcheck disable=SC1090
+        source "$lib" 2>/dev/null || true
+        # Neutralisation RÉELLE : seul le lancement du pilote est shadowé, tout
+        # le reste de `_launch_revise_pilot` s'exécute tel quel. C'est la seule
+        # façon de prouver que la classification vient de la fonction.
+        _run_pilot_sandboxed() {
+            [ -z "$guard" ] || printf '%s\n' "$guard" >&2
+            if [ "$rc_want" -eq 78 ]; then
+                # Motif DÉLIBÉRÉMENT multi-ligne : les deux vrais le sont
+                # (`Cause:` / `Remedy:`), et c'est la propriété « une seule
+                # ligne » du diagnostic qui est en jeu — un saut de ligne dans
+                # `GROOM_LOOP_FAILURE_REASON` fait rendre `unterminated 's'
+                # command` au `sed` de `:12595` et perd TOUT le corps du RESULT.
+                _PILOT_SANDBOX_REFUSAL="probe refusal motive: the sandbox could not be built.
+Remedy: this motive is multi-line on purpose."
+                return 78
+            fi
+            # Une ligne de trace AVANT le JSON : `--verbose` en produit, donc
+            # `jq` sur le fichier entier échouerait. C'est ce que le
+            # `grep -m1 '^{'` existe pour franchir.
+            printf 'claude-pilot: verbose trace line, not JSON\n'
+            printf '{"status":"%s","subtype":"%s","termination_reason":"%s","api_error_status":"%s","session_id":"revise-sess-2077","turns":7,"duration_ms":4242}\n' \
+                "$st" "$sub" "$reason" "$api"
+            [ "$mut" != "mutate" ] || printf '\n<!-- revised by the probe -->\n' >> "$plan"
+            return "$rc_want"
+        }
+        # Les six globales du pilote PRINCIPAL, pré-posées à des sentinelles.
+        # V5 les relit octet pour octet après l'appel.
+        SESSION_ID="main-sess-KEEPME"; SUBTYPE="main_subtype_KEEPME"
+        STATUS="main_status_KEEPME";   TURNS="99"; DURATION="123456"
+        TERMINATION_REASON="main reason KEEPME"
+        STDERR_FILE="$root/main.stderr"; LOG_ID="t2077-main"
+        [ -z "$memo" ] || _HALT_SUBTYPE_RESOLVED="$memo"
+        # Résidu d'une entrée antérieure : la remise à zéro à l'entrée est une
+        # exigence (R4), donc elle se mesure plutôt qu'elle ne se suppose.
+        REVISE_PILOT_HALT_DIAGNOSIS="stale-from-a-previous-entry"
+        WORKTREE_DIR="$wt"; ISSUE_NUM="2077"; REPO="mika"; CWD_ARGS="--cwd $wt"
+        set +e
+        # APPELER COMME LE SITE DE PRODUCTION APPELLE — `|| rc=$?`, pas un
+        # `set +e` suivi de `$?`. `_launch_revise_pilot` RÉTABLIT `set -e` dès
+        # la sortie du pilote (`dispatch-lib.sh:9380`, posture de ce fichier que
+        # les handlers sourcent sous `set -e`), donc un `set +e` posé par la
+        # sonde est défait par la fonction elle-même et son `return 1` tue le
+        # sous-shell AVANT les `printf` du rapport. Mesuré : rapport vide sur les
+        # cinq scénarios `keep` — exactement ceux qui rendent non-zéro, donc
+        # exactement la population que ce défaut concerne — pendant que le seul
+        # `mutate`, qui rend 0, passait. Une sonde muette sur la branche d'échec
+        # rend V13/V14 comptables d'échecs par vacuité : elles mesuraient
+        # `V1 V2 V3 V4 V5` au lieu de `V6`. Le `set +e` qui suit l'appel
+        # reprend la posture de la sonde, que la fonction vient de changer.
+        local _rc=0
+        _launch_revise_pilot "$wt/.iterate/findings-1.md" 2>"$root/err" >/dev/null \
+            || _rc=$?
+        set +e
+        printf 'RC=%s\n' "$_rc"
+        printf 'DIAG=%s\n' "$REVISE_PILOT_HALT_DIAGNOSIS"
+        printf 'GLOBALS=%s|%s|%s|%s|%s|%s\n' "$SESSION_ID" "$SUBTYPE" "$STATUS" \
+            "$TURNS" "$DURATION" "$TERMINATION_REASON"
+        printf 'STDERR_BEGIN\n'
+        cat "$root/err"
+    )
+    printf '%s' "$out"
+    rm -rf "$root"
+}
+
+# Les quatre gardes d'entrée, rejouées une par une. Elles sortaient toutes en
+# `return 1` sans rien publier, donc l'appelant n'avait que sa propre phrase de
+# contenu à offrir — sur une population où le pilote n'avait même pas démarré.
+# $1 = bibliothèque, $2 = unreadable|worktree|issue|plan
+_t2077_guard() {
+    local lib="$1" which="$2" root wt findings out
+    root=$(mktemp -d "${TMPDIR:-/tmp}/mika2077-guard-XXXXXX")
+    wt="$root/wt"; mkdir -p "$wt/docs/plans" "$wt/.iterate"
+    findings="$wt/.iterate/findings-1.md"
+    printf 'F1 — rien de particulier.\n\nDisposition: ITERATE\n' > "$findings"
+    # `plan` est la seule garde qui laisse `docs/plans` vide : les trois autres
+    # tirent avant que `_find_issue_plan` ne soit appelée.
+    [ "$which" = "unreadable" ] && findings="$root/absent/findings-1.md"
+    out=$(
+        # shellcheck disable=SC1090
+        source "$lib" 2>/dev/null || true
+        _run_pilot_sandboxed() {
+            printf 'the guard should have fired long before this\n'; return 0; }
+        REVISE_PILOT_HALT_DIAGNOSIS="stale-from-a-previous-entry"
+        WORKTREE_DIR="$wt"; ISSUE_NUM="2077"; REPO="mika"; LOG_ID="t2077g"
+        CWD_ARGS="--cwd $wt"
+        case "$which" in
+            worktree) WORKTREE_DIR="$root/absent-worktree" ;;
+            issue)    ISSUE_NUM="" ;;
+        esac
+        set +e
+        # Même forme que `_t2077_probe` et pour la même raison : l'appel se fait
+        # en `|| rc=$?`, comme le site de production.
+        local _rc=0
+        _launch_revise_pilot "$findings" >/dev/null 2>&1 || _rc=$?
+        set +e
+        printf 'RC=%s\nDIAG=%s\n' "$_rc" "$REVISE_PILOT_HALT_DIAGNOSIS"
+    )
+    printf '%s' "$out"
+    rm -rf "$root"
+}
+
+_t2077_f()   { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+_t2077_err() { printf '%s\n' "$1" | sed -n '/^STDERR_BEGIN$/,$p' | tail -n +2; }
+_t2077_yn()  { if grep -qF -- "$2" <<<"$1"; then printf 'yes'; else printf 'no'; fi; }
+_t2077_row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; }
+
+T2077_GLOBALS_KEPT="main-sess-KEEPME|main_subtype_KEEPME|main_status_KEEPME|99|123456|main reason KEEPME"
+
+# `_t2077_measure <lib>` rend des quadruplets `ID<TAB>libellé<TAB>attendu<TAB>mesuré`.
+#
+# Pourquoi cette forme plutôt que des `assert_*` en ligne : les copies régressées
+# doivent être ÉVALUÉES, pas réassertées — V13/V14 ont besoin de l'ENSEMBLE EXACT
+# des identifiants qui basculent, et le réobtenir en relançant 1700 assertions
+# trois fois serait illisible autant que lent. Ici la même mesure sert aux trois
+# bibliothèques : vertes pour l'originale, comptées pour les copies.
+_t2077_measure() {
+    local lib="$1"
+    local r_term r_concl r_78 r_work r_scrape r_memo
+    local d_term d_concl d_78 d_memo e_work rep_term rep_concl
+    local g body subs leaks sub
+
+    # (1) tuée par un garde-fou, plan inchangé — la population (2) du défaut
+    r_term=$(_t2077_probe "$lib" terminated idle_timeout "no output for 900s" "" 1 keep "" "")
+    # (2) conclue sans réviser — la seule population dont la phrase était vraie
+    r_concl=$(_t2077_probe "$lib" success "" "" "" 0 keep "" "")
+    # (3) refus de containment — aucun pilote n'a existé
+    r_78=$(_t2077_probe "$lib" "" "" "" "" 78 keep "" "")
+    # (4) tuée MAIS ayant quand même écrit le plan (R7)
+    r_work=$(_t2077_probe "$lib" terminated stall_detected "12 turns without a tool call" "" 1 mutate "" "")
+    # (5) tuée sans `.subtype` : le repli doit scraper le stderr DU REVISE
+    r_scrape=$(_t2077_probe "$lib" terminated "" "" "" 1 keep \
+        '[guardrail] idle_timeout: scraped from the revise stderr' "")
+    # (6) mémo du pilote principal pré-posé : la contrainte (i-bis)
+    r_memo=$(_t2077_probe "$lib" terminated idle_timeout "no output for 900s" "" 1 keep "" error_max_turns)
+
+    d_term=$(_t2077_f DIAG "$r_term");   d_concl=$(_t2077_f DIAG "$r_concl")
+    d_78=$(_t2077_f DIAG "$r_78");       d_memo=$(_t2077_f DIAG "$r_memo")
+    e_work=$(_t2077_err "$r_work")
+    # Le RAPPORT = diagnostic + stderr. V2 et V3 portent sur lui et non sur le
+    # seul diagnostic : une copie qui ne publie RIEN ferait passer « le
+    # diagnostic ne contient pas `plan unchanged` » par vacuité, et l'assertion
+    # serait verte sur le défaut même qu'elle existe pour nommer.
+    rep_term="$d_term
+$(_t2077_err "$r_term")"
+    rep_concl="$d_concl
+$(_t2077_err "$r_concl")"
+
+    # --- V1 : une session `terminated` est un échec DE SESSION ---------------
+    _t2077_row V1 "une session tuée est nommée par son sous-type" \
+        yes "$(_t2077_yn "$d_term" idle_timeout)"
+    _t2077_row V1 "…et par sa classe de halte, issue de _halt_family" \
+        yes "$(_t2077_yn "$d_term" session_silent)"
+    _t2077_row V1 "…et l'indice de re-run voyage avec elle" \
+        yes "$(_t2077_yn "$d_term" investigate)"
+    _t2077_row V1 "sans .subtype, le repli scrape le stderr DU REVISE" \
+        yes "$(_t2077_yn "$(_t2077_f DIAG "$r_scrape")" idle_timeout)"
+    _t2077_row V1 "…et jamais celui du pilote principal" \
+        no "$(_t2077_yn "$(_t2077_f DIAG "$r_scrape")" error_max_turns)"
+
+    # --- V2 : …et ne se présente plus comme un refus du modèle --------------
+    _t2077_row V2 "le rapport d'une session tuée ne dit plus « plan unchanged »" \
+        no "$(_t2077_yn "$rep_term" 'plan unchanged')"
+    _t2077_row V2 "…il dit que la session a été TUÉE" \
+        yes "$(_t2077_yn "$rep_term" KILLED)"
+    _t2077_row V2 "…et il envoie l'opérateur au log, pas aux findings" \
+        yes "$(_t2077_yn "$rep_term" 'Read the revise log')"
+
+    # --- V3 : une session conclue garde la phrase de contenu ----------------
+    # Elle est gardée MOT POUR MOT parce que c'est ici, et ici seulement,
+    # qu'elle est vraie. C'est aussi pourquoi V3 reste verte sur la copie B.
+    _t2077_row V3 "une session conclue garde « plan unchanged after revise pilot »" \
+        yes "$(_t2077_yn "$rep_concl" 'plan unchanged after revise pilot')"
+    _t2077_row V3 "…et ne porte aucune classe de halte" \
+        no "$(_t2077_yn "$rep_concl" 'halt class')"
+
+    # --- V4 : un exit 78 est un pilote JAMAIS lancé -------------------------
+    _t2077_row V4 "un exit 78 dit que le pilote n'a JAMAIS été lancé" \
+        yes "$(_t2077_yn "$d_78" 'NEVER LAUNCHED')"
+    _t2077_row V4 "…et porte le motif de refus de containment" \
+        yes "$(_t2077_yn "$d_78" 'probe refusal motive')"
+    _t2077_row V4 "…sans classe de halte, qu'aucune session ne pourrait porter" \
+        no "$(_t2077_yn "$d_78" 'halt class')"
+
+    # --- V5 : aucune fuite VERS les globales (contrainte i) -----------------
+    _t2077_row V5 "les six globales du pilote principal sont intactes (halte)" \
+        "$T2077_GLOBALS_KEPT" "$(_t2077_f GLOBALS "$r_term")"
+    _t2077_row V5 "…aussi sur la branche de succès" \
+        "$T2077_GLOBALS_KEPT" "$(_t2077_f GLOBALS "$r_work")"
+    _t2077_row V5 "…aussi sur un refus de containment" \
+        "$T2077_GLOBALS_KEPT" "$(_t2077_f GLOBALS "$r_78")"
+
+    # --- V6 : aucune fuite DEPUIS le mémo (contrainte i-bis) ----------------
+    # Mesures NÉGATIVES à dessein : une copie qui ne publie rien doit rester
+    # verte ici, sinon la copie B échouerait sur V6 et le compte exact de V13
+    # cesserait de distinguer les deux défauts.
+    _t2077_row V6 "un mémo hérité ne traverse pas (sous-type)" \
+        no "$(_t2077_yn "$d_memo" error_max_turns)"
+    _t2077_row V6 "un mémo hérité ne traverse pas (classe)" \
+        no "$(_t2077_yn "$d_memo" budget_exhausted)"
+
+    # --- V7 : une seule ligne, et pas le marqueur retryable -----------------
+    _t2077_row V7 "le diagnostic d'une halte ne porte aucun saut de ligne" \
+        0 "$(printf '%s' "$d_term" | wc -l | tr -d ' ')"
+    _t2077_row V7 "celui d'un refus multi-ligne non plus" \
+        0 "$(printf '%s' "$d_78" | wc -l | tr -d ' ')"
+    _t2077_row V7 "celui d'une session conclue non plus" \
+        0 "$(printf '%s' "$d_concl" | wc -l | tr -d ' ')"
+    _t2077_row V7 "aucun des quatre ne porte le marqueur retryable" \
+        0 "$(printf '%s\n%s\n%s\n%s\n' "$d_term" "$d_concl" "$d_78" "$d_memo" \
+            | grep -cF 'PIPELINE FAILURE:' || true)"
+
+    # --- V8 : les quatre gardes d'entrée publient ---------------------------
+    for g in unreadable worktree issue plan; do
+        local gr gd
+        gr=$(_t2077_guard "$lib" "$g")
+        gd=$(_t2077_f DIAG "$gr")
+        _t2077_row V8 "la garde « $g » rend 1" 1 "$(_t2077_f RC "$gr")"
+        _t2077_row V8 "la garde « $g » publie un diagnostic non vide" \
+            non-vide "$(if [ -n "$gd" ]; then printf 'non-vide'; else printf 'vide'; fi)"
+        _t2077_row V8 "la garde « $g » dit que le pilote n'a jamais été lancé" \
+            yes "$(_t2077_yn "$gd" 'never launched')"
+    done
+    _t2077_row V8 "la globale est remise à zéro à l'entrée (aucun résidu après un succès)" \
+        "" "$(_t2077_f DIAG "$r_work")"
+
+    # --- V9 : le site appelant reporte le diagnostic ------------------------
+    _t2077_row V9 "le bras ITERATE lit REVISE_PILOT_HALT_DIAGNOSIS" \
+        yes "$(_t2077_yn "$(grep -A 3 -F '_launch_revise_pilot "$findings_file" || {' "$lib")" \
+            'REVISE_PILOT_HALT_DIAGNOSIS')"
+    _t2077_row V9 "la phrase de contenu nue a disparu de _groom_warn" \
+        0 "$(grep -cF '_groom_warn "revise pilot did not converge' "$lib" || true)"
+
+    # --- V10 : un terminated AVEC travail ne bloque rien (R7) ---------------
+    _t2077_row V10 "une session tuée qui a quand même révisé rend 0" \
+        0 "$(_t2077_f RC "$r_work")"
+    _t2077_row V10 "…et dit sa halte sur stderr" \
+        yes "$(_t2077_yn "$e_work" stall_detected)"
+    _t2077_row V10 "…en nommant que le plan A ÉTÉ révisé" \
+        yes "$(_t2077_yn "$e_work" 'plan WAS revised')"
+    _t2077_row V10 "…sans publier de diagnostic d'échec" \
+        "" "$(_t2077_f DIAG "$r_work")"
+
+    # --- V11 : la table de haltes n'est pas recopiée ------------------------
+    # La population de sous-types est DÉRIVÉE du `case` de `_halt_family` —
+    # jamais réécrite ici — donc un treizième sous-type amont entre dans le scan
+    # sans qu'on y touche. Même patron que T2539 S2.
+    body=$(sed -n '/^_classify_revise_halt() {$/,/^}$/p' "$lib")
+    subs=$(sed -n '/^_halt_family() {$/,/^}$/p' "$lib" \
+        | grep -oE '^        [a-z][a-z0-9_]*\)' | tr -d ' )' | sort -u)
+    _t2077_row V11 "le scan a bien trouvé la table amont (≥ 12 sous-types)" \
+        yes "$(if [ "$(printf '%s\n' "$subs" | grep -c . || true)" -ge 12 ]; then printf 'yes'; else printf 'no'; fi)"
+    _t2077_row V11 "le classeur de revise ne définit aucun sous-type littéral" \
+        yes "$(if [ -n "$body" ]; then printf 'yes'; else printf 'no'; fi)"
+    leaks=""
+    for sub in $subs; do
+        grep -qF -- "$sub" <<<"$body" && leaks="${leaks}${sub} "
+    done
+    _t2077_row V11 "aucun sous-type recopié dans _classify_revise_halt" \
+        "" "$(printf '%s' "$leaks" | sed 's/ *$//')"
+
+    # --- V12 : la forme d'extraction JSON est épinglée ----------------------
+    # Non factorisée à dessein : factoriser toucherait le post-flight du pilote
+    # principal, seule garantie d'honnêteté que ce vol ne doit pas déranger. La
+    # duplication est donc ÉPINGLÉE — une dérive rougit au lieu de vieillir.
+    _t2077_row V12 "trois sites extraient le premier objet JSON" \
+        3 "$(grep -cF "grep -m1 '^{'" "$lib" || true)"
+    _t2077_row V12 "les trois portent une forme identique à la variable près" \
+        1 "$(grep -F "grep -m1 '^{'" "$lib" \
+            | sed -E 's/^[[:space:]]*[A-Za-z_]+=/VAR=/; s/"\$[A-Za-z_]+"/"$VAR"/' \
+            | sort -u | grep -c . || true)"
+}
+
+# --- Les mesures, sur la bibliothèque réelle --------------------------------
+
+T2077_ROWS=$(_t2077_measure "$DISPATCH_LIB")
+while IFS=$'\t' read -r _t2077_id _t2077_label _t2077_exp _t2077_act; do
+    [ -n "$_t2077_id" ] || continue
+    assert_eq "$_t2077_id: $_t2077_label" "$_t2077_exp" "$_t2077_act"
+done <<<"$T2077_ROWS"
+
+# V15 — préconditions. La sonde ne lance aucun pilote réel : ni bwrap, ni
+# réseau, ni token. Les deux scans sont sur le TEXTE de cette section, donc un
+# futur ajout qui appellerait la forge rougirait ici.
+T2077_SECTION=$(sed -n "/^# mika#2077 — l'honnêteté de terminaison du pilote de REVISE/,\$p" "${BASH_SOURCE[0]}")
+assert_eq "V15: l'extraction de la section mika#2077 a trouvé la section" "yes" \
+    "$(if [ -n "$T2077_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "V15: aucune invocation de forge, de réseau ou de bwrap en tête de commande" "0" \
+    "$(printf '%s\n' "$T2077_SECTION" | grep -cE '^[[:space:]]*(gh|curl|wget|bwrap)[[:space:]]' || true)"
+assert_eq "V15: ni en substitution" "0" \
+    "$(printf '%s\n' "$T2077_SECTION" | grep -cE '\$\((gh|curl|wget|bwrap)[[:space:]]' || true)"
+# La provenance du diagnostic est celle du pilote SIMULÉ : `revise-sess-2077`
+# n'existe nulle part ailleurs, donc aucun pilote réel n'a été joint.
+assert_contains "V15: la provenance mesurée est celle du pilote simulé" \
+    "revise-sess-2077" \
+    "$(_t2077_f DIAG "$(_t2077_probe "$DISPATCH_LIB" terminated idle_timeout "no output for 900s" "" 1 keep "" "")")"
+
+# --- V13 / V14 : anti-vacuité, deux copies régressées -----------------------
+
+T2077_REGROOT=$(mktemp -d "${TMPDIR:-/tmp}/mika2077-regressed-XXXXXX")
+T2077_COPY_A="$T2077_REGROOT/copy-a-no-memo-unset.sh"
+T2077_COPY_B="$T2077_REGROOT/copy-b-original-messages.sh"
+
+# Copie A — le `unset` du mémo retiré de `_classify_revise_halt`, et de là seul.
+# La classification reste entière : seule la contenance du mémo disparaît, donc
+# le classeur rend la halte du pilote PRINCIPAL comme halte du revise. C'est la
+# fausse attribution PIRE que celle d'avant — précise, donc crédible.
+awk '
+    /^_classify_revise_halt\(\) \{$/ { inside = 1 }
+    inside && /^}$/                  { inside = 0 }
+    inside && /^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$/ { next }
+    { print }
+' "$DISPATCH_LIB" > "$T2077_COPY_A"
+
+# Copie B — les deux messages d'origine restaurés : la phrase unique de
+# `_launch_revise_pilot` (sans aucune publication) et l'affirmation de contenu
+# du site appelant. Le mémo reste correct, donc V6 reste verte : c'est
+# exactement pourquoi une seule copie ne suffirait pas.
+awk '
+    /_groom_warn "\$\{REVISE_PILOT_HALT_DIAGNOSIS:-/ {
+        print "                _groom_warn \"revise pilot did not converge — preserving $findings_file for forensics\""
+        next
+    }
+    /# mika#2077 — LES TROIS POPULATIONS/ { skip = 1; next }
+    skip == 1 && /^    rm -f "\$revise_stdout" "\$revise_stderr"$/ {
+        print
+        print "    echo \"WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)\" >&2"
+        print "    return 1"
+        skip = 2
+        next
+    }
+    skip == 2 && /^}$/ { print; skip = 0; next }
+    skip { next }
+    { print }
+' "$DISPATCH_LIB" > "$T2077_COPY_B"
+
+# Préalables — une copie qui ne diffère pas, ou qui ne parse pas, rendrait
+# l'anti-vacuité elle-même vacante : le compte d'échecs serait celui de
+# l'original, ou celui d'une bibliothèque qui ne se source pas du tout.
+T2077_RC_A=0; bash -n "$T2077_COPY_A" 2>/dev/null || T2077_RC_A=$?
+T2077_RC_B=0; bash -n "$T2077_COPY_B" 2>/dev/null || T2077_RC_B=$?
+assert_eq "V13 (préalable): la copie A passe bash -n" "0" "$T2077_RC_A"
+assert_eq "V14 (préalable): la copie B passe bash -n" "0" "$T2077_RC_B"
+assert_eq "V13 (préalable): la copie A a perdu exactement un unset du mémo" "1" \
+    "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$T2077_COPY_A" || true)"
+assert_eq "V13 (préalable): la copie A garde la classification intacte" "1" \
+    "$(grep -c '^_classify_revise_halt() {$' "$T2077_COPY_A" || true)"
+assert_eq "V14 (préalable): la copie B a retrouvé la phrase unique d'origine" "1" \
+    "$(grep -cF 'plan unchanged after revise pilot (exit=$revise_exit)" >&2' "$T2077_COPY_B" || true)"
+assert_eq "V14 (préalable): la copie B a retrouvé l'affirmation de contenu de l'appelant" "1" \
+    "$(grep -cF '_groom_warn "revise pilot did not converge' "$T2077_COPY_B" || true)"
+assert_eq "V14 (préalable): la copie B garde le unset du mémo aux deux sites" "2" \
+    "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$T2077_COPY_B" || true)"
+
+# L'ENSEMBLE EXACT des identifiants qui basculent — pas un « au moins une a
+# rougi ». Un compte exact est ce qui distingue une anti-vacuité d'une
+# incantation : il dit aussi quelles mesures ne couvrent PAS ce défaut-là.
+_t2077_failing_ids() {
+    _t2077_measure "$1" | awk -F'\t' '$3 != $4 { print $1 }' | sort -u \
+        | tr '\n' ' ' | sed 's/ *$//'
+}
+assert_eq "V13 (anti-vacuité A): sans le unset du mémo, V6 échoue — et elle seule" \
+    "V6" "$(_t2077_failing_ids "$T2077_COPY_A")"
+assert_eq "V14 (anti-vacuité B): avec les messages d'origine, V1 V2 V4 V9 échouent — et elles seules" \
+    "V1 V2 V4 V9" "$(_t2077_failing_ids "$T2077_COPY_B")"
+
+rm -rf "$T2077_REGROOT"
 
 # --- Summary ---
 
