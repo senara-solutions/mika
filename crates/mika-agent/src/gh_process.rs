@@ -228,6 +228,21 @@ static CANNED_STDOUT: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<GhSubjectKey, Vec<u8>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Échec canné par sujet **et par motif d'`argv`** (mika#2839).
+///
+/// Le motif, et non le seul sujet : un test qui veut mesurer ce que fait un
+/// appelant quand une **écriture** est refusée porte souvent deux appels sur la
+/// même issue — lire le corps, puis l'écrire — dont un seul doit échouer. Un
+/// échec posé sur le sujet entier rendrait la lecture illisible et le test
+/// mesurerait l'autre branche sans le dire.
+///
+/// Keyed par sujet pour la même raison que [`CANNED_STDOUT`] : la suite tourne
+/// en parallèle dans un seul processus (mika#2713 D4).
+#[cfg(test)]
+static CANNED_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<GhSubjectKey, (String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Forme hachable de [`GhSubject`], pour la table d'overrides.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -268,6 +283,25 @@ pub(crate) async fn run_gh(
             subject,
             args: args.clone(),
         });
+
+    // L'échec canné passe **avant** le `stdout` : un appel refusé ne rend pas
+    // de charge, et l'appelant lit son `stderr`.
+    let failure = {
+        let table = CANNED_FAILURES
+            .lock()
+            .expect("la table d'échecs cannés `gh` doit être lisible");
+        table
+            .get(&subject_key(subject))
+            .filter(|(needle, _)| args.contains(needle.as_str()))
+            .map(|(_, stderr)| stderr.clone())
+    };
+    if let Some(stderr) = failure {
+        return Ok(Output {
+            status: canned_failure(),
+            stdout: Vec::new(),
+            stderr: stderr.into_bytes(),
+        });
+    }
 
     let stdout = CANNED_STDOUT
         .lock()
@@ -313,6 +347,17 @@ fn canned_success() -> std::process::ExitStatus {
     std::process::ExitStatus::from_raw(0)
 }
 
+/// `exit 1`, sans spawner quoi que ce soit — la forme qu'un `gh` refusé rend.
+///
+/// `1 << 8` et non `1` : `from_raw` prend le *wait status* de `waitpid`, dont le
+/// code de sortie occupe les bits hauts. `from_raw(1)` décrirait un processus
+/// tué par le signal 1, dont `.code()` rend `None`.
+#[cfg(test)]
+fn canned_failure() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(1 << 8)
+}
+
 /// Les appels `gh` que le double a vus depuis le début du processus.
 ///
 /// Process-global : un test filtre sur **son** numéro de fixture, ce qui le
@@ -332,6 +377,23 @@ pub(crate) fn set_canned_stdout(subject: GhSubject, stdout: impl Into<Vec<u8>>) 
         .lock()
         .expect("la table d'overrides `gh` doit être lisible")
         .insert(subject_key(subject), stdout.into());
+}
+
+/// Fabrique l'échec que le double rendra pour ce sujet, sur les appels dont
+/// l'`argv` joint contient `argv_needle` (mika#2839).
+///
+/// Les autres appels du même sujet continuent de réussir : c'est la propriété
+/// qui rend testable « la lecture a répondu, l'écriture a été refusée ».
+#[cfg(test)]
+pub(crate) fn set_canned_failure(
+    subject: GhSubject,
+    argv_needle: impl Into<String>,
+    stderr: impl Into<String>,
+) {
+    CANNED_FAILURES
+        .lock()
+        .expect("la table d'échecs cannés `gh` doit être lisible")
+        .insert(subject_key(subject), (argv_needle.into(), stderr.into()));
 }
 
 /// Le plancher d'AC3, à appeler par un test qui pose un numéro de fixture.
