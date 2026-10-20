@@ -380,17 +380,36 @@ what catches a proposal the model verbalises from memory, from a prose mention,
 or from any surface this doctrine does not enumerate, and a layer-1.5 net on the
 wording is exactly what it should be for those.
 
-**What this does NOT buy, and where it is tracked (mika#2814, vol 2).** The
-pairing guard `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`
-compares *strings*: a publication written differently keeps it green. The remedy
-is **chosen** — a single helper that publishes and seeds together, so that the
-pairing becomes a property of the call rather than of its spelling — and
-deliberately **not implemented in this commit** (the filter lives in
-`connect_all`, so no publication site moved and the guard had nothing to catch
-here; moving both sites is its own change, with its own red to measure).
-Likewise, a misspelled key in an `mcp.json` server entry (`dataGrade` instead of
-`data_grade`) still reads `operational` without saying anything, and should warn
-at load. Tracked in: senara-solutions/mika#2814 (vol 2).
+**The pairing guard no longer compares strings — DELIVERED by mika#2814, vol 2.**
+It used to: `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`
+matched the text `extend_from_slice(mcp.tool_definitions())` against the text
+`seed_mcp_data_grades(`, so a publication written any other way — a loop, a
+`chain`, an intermediate `clone()` — kept it green while reopening F5. Both
+publication sites now go through one free function, `publier_outils_mcp`
+(`agent_loop/mod.rs`), which publishes **and** seeds in a single call; there is
+no call that does only one half. Its guard,
+`mika2814_publier_des_outils_mcp_passe_par_le_helper_qui_ensemence`, asserts the
+call count, the absence of any production read of `tool_definitions()` outside
+the helper's body and outside the two declared non-publishing readers
+(`LECTEURS_NON_PUBLIANTS_MCP` — name collection and the KG projection, each
+carrying the reason for its right, and neither owing a follow-up ticket), and
+that every declared entry still corresponds to a line the scan finds. The red of
+all three was measured rather than reasoned:
+`todos/2814-vol2-rouge-mesure.md`.
+
+That write-up also **corrects a claim this section used to rest on.** A
+publication site that does not seed was described as costing observability only —
+an unknown-tool answer instead of a ban. Measured, it is worse: `tool_routing` is
+intact, `is_mcp_tool` answers true without consulting the L4 map, and
+`call_tool` departs. An unseeded site lets the remote call go for any name
+obtained outside the published inventory — hallucination, a prose mention,
+history from before the server connected, a conversation summary. That is the
+whole of F5, which is what the single call protects.
+
+**What this still does NOT buy, and where it is tracked.** A misspelled key in an
+`mcp.json` server entry (`dataGrade` instead of `data_grade`) still reads
+`operational` without saying anything, and should warn at load — a warning, not a
+refusal. Tracked in: senara-solutions/mika#2814 (vol 3).
 
 ### Applied hardening (closed after mika#1798)
 
