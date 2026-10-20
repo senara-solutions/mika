@@ -5837,6 +5837,80 @@ mod tests {
         );
     }
 
+    /// **V4c** — la fenêtre de déduplication, aux trois instants qui la
+    /// définissent.
+    ///
+    /// Le troisième cas est porteur : sans lui, la sonde ne distingue pas
+    /// « dédupliqué » de « écrit une seule fois puis plus jamais » — deux
+    /// comportements dont seul le premier borne le bruit **sans perdre le
+    /// signal**. Une déduplication sans horizon rendrait la dernière ligne
+    /// indatable.
+    ///
+    /// L'`Instant` est un **paramètre** des deux fonctions, et non un
+    /// `Instant::now()` interne : c'est la seule raison pour laquelle une
+    /// fenêtre de 24 h se teste sans attendre 24 h.
+    ///
+    /// **Le cap de 10 000 n'est délibérément pas testé en remplissant la
+    /// table.** `seen.clear()` est un effet de bord sur un `static` partagé : une
+    /// sonde qui le déclencherait viderait la table de déduplication des tests
+    /// parallèles et les rendrait flaky. Le cap est tenu par sa **lecture** — la
+    /// constante, le `>=`, le WARN qui nomme `cap` — et ce refus est écrit ici
+    /// pour qu'il ne se relise pas comme un oubli.
+    #[test]
+    fn mika2456_v4c_the_refusal_is_deduplicated_on_a_24h_window() {
+        // Clé unique — cf. le commentaire de section ci-dessus.
+        let key = (
+            "mika2843-v4c-agent".to_string(),
+            "v4c-dedup-window".to_string(),
+        );
+        let t0 = std::time::Instant::now();
+
+        assert!(
+            recurring_gate_audit_is_due(&key, t0),
+            "une clé jamais vue est due"
+        );
+        mark_recurring_gate_audited(key.clone(), t0);
+
+        let t1 = t0 + std::time::Duration::from_secs(23 * 60 * 60);
+        assert!(
+            !recurring_gate_audit_is_due(&key, t1),
+            "mika#2843 — un second refus dans la fenêtre ne doit RIEN écrire : \
+             sinon une récurrente à la minute écrirait ≈ 1 440 lignes par jour \
+             pour un seul agent désactivé, et « régime attendu : zéro ligne » \
+             deviendrait illisible"
+        );
+
+        let t2 = t0 + RECURRING_GATE_AUDIT_REFRESH + std::time::Duration::from_secs(1);
+        assert!(
+            recurring_gate_audit_is_due(&key, t2),
+            "au-delà de la fenêtre la ligne doit revenir : une déduplication \
+             sans horizon rendrait la dernière ligne indatable — une ligne dont \
+             la date suggère l'actualité en portant un fait périmé est pire que \
+             pas de ligne"
+        );
+    }
+
+    /// Consulter n'est pas marquer, et les deux gestes sont séparés pour ça.
+    ///
+    /// L'appelant marque **après** que `log_audit_event` a atterri. Si consulter
+    /// marquait, un échec transitoire d'écriture coûterait la ligne de cette row
+    /// **pour la vie du processus** — c'est-à-dire exactement le silence que
+    /// cette surface existe pour supprimer.
+    #[test]
+    fn mika2456_consulting_does_not_mark() {
+        // Clé unique — cf. le commentaire de section ci-dessus.
+        let key = (
+            "mika2843-consult-agent".to_string(),
+            "v4c-consult-only".to_string(),
+        );
+        let now = std::time::Instant::now();
+        assert!(recurring_gate_audit_is_due(&key, now));
+        assert!(
+            recurring_gate_audit_is_due(&key, now),
+            "une consultation ne pose aucune marque"
+        );
+    }
+
     // ---- mika#2329 — STOP global à chaud -----------------------------------
 
     /// Arme le STOP en posant le fichier sentinelle sous le home global donné.
