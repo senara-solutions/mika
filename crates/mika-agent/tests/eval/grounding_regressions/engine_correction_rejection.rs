@@ -72,8 +72,15 @@ fn assert_response_has_no_rejection_phrases(trace: &AgentTrace) {
 }
 
 // -- Stub tools mirroring tests/eval/test_ready_label_grooming_guard.rs --
+//
+// Visibilité `pub(crate)` depuis mika#1381 (vol 3/3) : ces quatre stubs et
+// `tools_with_dispatch_stubs()` ont un second consommateur,
+// `tests/eval/test_dispatch_stall_p0_1381.rs`, qui a besoin de la **même**
+// scène de calage de dispatch pour atteindre le site P0 de
+// `agent_loop/mod.rs:4337`. Réutilisés plutôt que recopiés : une divergence
+// entre les deux copies ferait dériver les deux tests sans que rien ne le dise.
 
-struct StubSendMessage;
+pub(crate) struct StubSendMessage;
 #[async_trait]
 impl Tool for StubSendMessage {
     fn name(&self) -> &str {
@@ -95,7 +102,7 @@ impl Tool for StubSendMessage {
     }
 }
 
-struct StubRunClaudePilot;
+pub(crate) struct StubRunClaudePilot;
 #[async_trait]
 impl Tool for StubRunClaudePilot {
     fn name(&self) -> &str {
@@ -117,7 +124,7 @@ impl Tool for StubRunClaudePilot {
     }
 }
 
-struct StubRunGh;
+pub(crate) struct StubRunGh;
 #[async_trait]
 impl Tool for StubRunGh {
     fn name(&self) -> &str {
@@ -139,7 +146,7 @@ impl Tool for StubRunGh {
     }
 }
 
-struct StubCreateTask;
+pub(crate) struct StubCreateTask;
 #[async_trait]
 impl Tool for StubCreateTask {
     fn name(&self) -> &str {
@@ -163,7 +170,7 @@ impl Tool for StubCreateTask {
     }
 }
 
-fn tools_with_dispatch_stubs() -> ToolRegistry {
+pub(crate) fn tools_with_dispatch_stubs() -> ToolRegistry {
     let mut tools = default_tools();
     tools.register(Box::new(StubSendMessage));
     tools.register(Box::new(StubRunClaudePilot));

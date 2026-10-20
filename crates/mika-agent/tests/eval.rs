@@ -387,4 +387,8 @@ mod eval {
     // prompt, une seule fois — le second tour sur la même graine ne la rend
     // plus (mika#2807 vol 2)
     mod test_incoming_transmission_2807;
+
+    // Le site P0 amiral atteint le transport en P0, bout en bout à travers
+    // `run_agent`, et son contrôle négatif sur le prédicat (mika#1381 vol 3)
+    mod test_dispatch_stall_p0_1381;
 }
