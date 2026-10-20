@@ -3182,6 +3182,10 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::layer::SubscriberExt;
+
     use super::*;
 
     fn test_identity() -> Identity {
@@ -3525,10 +3529,260 @@ emoji = "✦"
         assert_eq!(identity.emoji, "🕶");
     }
 
+    // --- Observabilité de la posture fail-closed (mika#2784, morceau 1) ---
+    //
+    // Tout ce bloc capture `tracing`. L'unique site d'installation permis est
+    // `test_utils::test_helpers::install_capturing_subscriber` (mika#2646,
+    // tenu par un scan de source à allowlist vide) ; et `#[serial_test::serial]`
+    // porte aussi sur les **voisins** qui ne font qu'atteindre le callsite
+    // capturé — `test_load_identity_keeps_display_defaults_if_missing` et les
+    // quatre `mika2027_*` ci-dessous —, qui est la moitié portante du
+    // dispositif.
+
+    /// Un abonné qui écrit dans un tampon mémoire, pour **lire** la ligne de
+    /// posture plutôt que de la supposer. Idiome de `compaction_handsoff`.
+    fn capturing_subscriber() -> (impl tracing::Subscriber + Send + Sync, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = buf.clone();
+
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(move || WriterHandle(writer.clone()))
+            .with_ansi(false)
+            .with_target(true);
+
+        (tracing_subscriber::registry().with(layer), buf)
+    }
+
+    struct WriterHandle(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WriterHandle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Charge une identité sous abonné capturant et rend le texte journalisé.
+    ///
+    /// L'abonné est déposé avant le retour : lire le tampon pendant que le
+    /// `DefaultGuard` vit laisserait la capture ouverte sur les assertions.
+    fn journal_de_chargement(home_dir: &Path) -> (Identity, String) {
+        let (subscriber, buf) = capturing_subscriber();
+
+        let identity = {
+            let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            load_identity(home_dir)
+        };
+
+        let binding = buf.lock().unwrap();
+        (identity, String::from_utf8_lossy(&binding).to_string())
+    }
+
+    /// Un home d'agent nommé, sous un tempdir — le nom de l'agent est le
+    /// dernier composant du chemin (`agent_name_from_home`), donc un
+    /// `TempDir` nu ne peut nommer personne.
+    fn home_dagent(tmp: &tempfile::TempDir, nom: &str) -> PathBuf {
+        let home = tmp.path().join("agents").join(nom);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    /// Le TOML le plus court qui ne parse pas : `name` est un `String`.
+    const TOML_INVALIDE: &str = "name = 42\n";
+
+    /// mika#2784 V1 — un fichier absent **nomme la posture** et sa cause.
+    ///
+    /// Avant ce vol, cet état n'émettait que `identity_toml_absent`, qui décrit
+    /// la *lecture du fichier*. Aucun grep ne répondait à « cet agent
+    /// tourne-t-il en posture dégradée ? » — et c'est la question 3 du ticket,
+    /// celle qui passe en premier : resserrer une posture qu'on ne voit pas
+    /// rend l'incident suivant plus difficile à lire (mika#2293).
+    #[test]
+    #[serial_test::serial]
+    fn mika2784_un_fichier_absent_nomme_la_posture_et_sa_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_dagent(&tmp, "vincent-perso");
+
+        let (_identity, journal) = journal_de_chargement(&home);
+
+        assert!(
+            journal.contains("agent_fail_closed_posture"),
+            "la posture servie doit porter son propre nom d'événement, distinct \
+             des trois noms qui décrivent l'état du fichier : {journal}"
+        );
+        assert!(
+            journal.contains(r#"cause="missing_file""#),
+            "sans `cause`, les trois entrées du chemin fail-closed vivent sous un \
+             seul nom et ne sont pas soustractibles (mika#2205) : {journal}"
+        );
+        assert!(
+            journal.contains("vincent-perso"),
+            "la ligne doit nommer l'agent, sans quoi une flotte en incident est \
+             un seul comptage : {journal}"
+        );
+        assert!(
+            !journal.contains(r#"cause="parse_error""#)
+                && !journal.contains(r#"cause="unreadable""#),
+            "une seule cause par posture servie : {journal}"
+        );
+    }
+
+    /// mika#2784 V3 — un TOML invalide sur un agent **bien connu** porte
+    /// `parse_error`, et la ligne amont dit quelle posture elle a produite.
+    ///
+    /// `identity_toml_malformed` couvre deux issues opposées — fail-closed pour
+    /// un agent bien connu, `Identity::default()` (donc *tout* permis) pour un
+    /// agent utilisateur. Le champ `posture` est ce qui rend les deux
+    /// populations soustractibles sans soustraire deux greps (D5).
+    #[test]
+    #[serial_test::serial]
+    fn mika2784_un_toml_invalide_sur_agent_bien_connu_porte_parse_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_dagent(&tmp, "mika-dev");
+        assert!(
+            crate::well_known_agents::find_well_known_agent("mika-dev").is_some(),
+            "la fixture doit nommer un agent bien connu pour que le test veuille \
+             dire quelque chose"
+        );
+        std::fs::write(home.join("identity.toml"), TOML_INVALIDE).unwrap();
+
+        let (identity, journal) = journal_de_chargement(&home);
+
+        assert_eq!(
+            identity.skills.allowlist,
+            Some(vec![FAIL_CLOSED_SKILL_SENTINEL.to_string()]),
+            "prémisse du test : cette branche sert bien la posture fail-closed"
+        );
+        assert!(
+            journal.contains("agent_fail_closed_posture"),
+            "la troisième cause est servie par le chemin #811 et doit se dire \
+             comme les deux autres : {journal}"
+        );
+        assert!(
+            journal.contains(r#"cause="parse_error""#),
+            "un fichier illisible et un fichier invalide ont des remèdes \
+             différents (runbook § 3 vs § 4) : {journal}"
+        );
+        assert!(
+            journal.contains(r#"posture="fail_closed""#),
+            "`identity_toml_malformed` doit dire laquelle de ses deux issues il \
+             décrit (D5) : {journal}"
+        );
+    }
+
+    /// mika#2784 V4 — **contrôle négatif** : le régime nominal est muet.
+    ///
+    /// Sans lui, les assertions ci-dessus seraient satisfaites par une ligne
+    /// émise à chaque chargement, y compris sain — ce qui ferait de
+    /// `agent_fail_closed_posture` un bruit de fond au lieu d'un signal, et
+    /// d'un `grep` un comptage de redémarrages.
+    #[test]
+    #[serial_test::serial]
+    fn mika2784_le_regime_nominal_est_muet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_dagent(&tmp, "mika-dev");
+        std::fs::write(
+            home.join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )
+        .unwrap();
+
+        let (identity, journal) = journal_de_chargement(&home);
+
+        assert_eq!(identity.name, "Mika", "prémisse : le fichier a bien parsé");
+        assert!(
+            !journal.contains("agent_fail_closed_posture"),
+            "un agent sain ne tourne pas en posture fail-closed, et la ligne ne \
+             doit donc pas paraître : {journal}"
+        );
+    }
+
+    /// mika#2784 V5 — **second contrôle négatif**, sur l'autre axe : un agent
+    /// *utilisateur* au TOML invalide n'est pas fail-closed, et la ligne de
+    /// posture ne paraît pas pour lui.
+    ///
+    /// C'est l'asymétrie que mika#811 a posée délibérément et que mika#2027 n'a
+    /// pas étendue au chemin malformé. Un test qui ne regarderait que les
+    /// agents bien connus resterait vert si la ligne se mettait à paraître ici,
+    /// c'est-à-dire si elle annonçait une posture que personne ne sert.
+    #[test]
+    #[serial_test::serial]
+    fn mika2784_un_agent_utilisateur_au_toml_invalide_nest_pas_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_dagent(&tmp, "vincent-perso");
+        assert!(
+            crate::well_known_agents::find_well_known_agent("vincent-perso").is_none(),
+            "la fixture doit nommer un agent utilisateur"
+        );
+        std::fs::write(home.join("identity.toml"), TOML_INVALIDE).unwrap();
+
+        let (identity, journal) = journal_de_chargement(&home);
+
+        assert_eq!(
+            identity.skills.allowlist, None,
+            "prémisse du test : cette branche sert `Identity::default()`, pas la \
+             posture fail-closed"
+        );
+        assert!(
+            !journal.contains("agent_fail_closed_posture"),
+            "aucune posture fail-closed n'est servie ici — l'annoncer serait \
+             pire que le silence d'avant : {journal}"
+        );
+        assert!(
+            journal.contains(r#"posture="default_fallback""#),
+            "l'issue permissive doit se dire : c'est elle, et non la fail-closed, \
+             qu'un opérateur doit pouvoir compter (D5) : {journal}"
+        );
+    }
+
+    /// mika#2784 V6 — la posture ne déclare **aucune** allowlist d'outils, et
+    /// la ligne le dit.
+    ///
+    /// Les deux moitiés sont indissociables. L'assertion sur `allowed == None`
+    /// épingle le périmètre de ce vol : le morceau 1 rend la posture
+    /// observable, il ne la resserre pas. Le champ `tools_allowlist` est
+    /// **dérivé** de `allowed.is_some()`, donc le jour où le morceau 2 posera
+    /// `Some(...)`, le même grep dira si le resserrement est en force **dans le
+    /// binaire servi** — sans quoi « morceau 2 déployé » et « morceau 2 écrit
+    /// mais binaire antérieur » rendent des octets identiques (mika#2340).
+    #[test]
+    #[serial_test::serial]
+    fn mika2784_la_posture_ne_declare_aucune_allowlist_doutils() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_dagent(&tmp, "vincent-perso");
+
+        let (identity, journal) = journal_de_chargement(&home);
+
+        assert_eq!(
+            identity.tools.allowed, None,
+            "le morceau 1 de mika#2784 est l'observabilité SEULE. Poser une \
+             allowlist ici est le morceau 2, et sa condition préalable est une \
+             décision écrite de Vincent sur la question 1 (un agent fail-closed \
+             garde-t-il `send_message` ?) et la question 2 (le fichier absent \
+             couvre TOUS les agents depuis mika#2027, y compris un agent \
+             personnel). Si cette assertion rougit sans ces deux décisions, le \
+             resserrement a été fait sans qu'on l'ait tranché."
+        );
+        assert!(
+            journal.contains(r#"tools_allowlist="absent""#),
+            "le champ doit dire l'état réel du champ `allowed`, pas une \
+             constante : {journal}"
+        );
+    }
+
     /// A missing `identity.toml` keeps the *display* identity (name/emoji) so
     /// listing surfaces still read sensibly — what it does NOT keep is the
     /// permissive allowlist. See the fail-closed tests below.
+    ///
+    /// `#[serial_test::serial]` parce que ce test atteint le callsite capturé
+    /// par les tests `mika2784_*` ci-dessus : la sérialisation des **voisins**
+    /// est la moitié portante du dispositif (mika#2646).
     #[test]
+    #[serial_test::serial]
     fn test_load_identity_keeps_display_defaults_if_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let identity = load_identity(tmp.path());
@@ -3543,7 +3797,10 @@ emoji = "✦"
     /// i.e. every bundled skill active, `shell-exec` / `git-ops` / `github` /
     /// `tmux` included. Deleting an agent's identity file *widened* it.
     /// GREEN after: the same fail-closed sentinel the malformed path uses.
+    ///
+    /// `#[serial_test::serial]` — voisin du callsite capturé (mika#2646).
     #[test]
+    #[serial_test::serial]
     fn mika2027_absent_identity_toml_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!tmp.path().join("identity.toml").exists());
@@ -3596,7 +3853,10 @@ emoji = "✦"
     /// agent (not in `WELL_KNOWN_AGENTS`) gets the same sentinel: AC1 admits no
     /// exception, and discriminating here would reopen the "which agent is
     /// supposed to have a file?" ambiguity the universal rule closes.
+    ///
+    /// `#[serial_test::serial]` — voisin du callsite capturé (mika#2646).
     #[test]
+    #[serial_test::serial]
     fn mika2027_absent_identity_toml_fails_closed_for_user_defined_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_home = tmp.path().join("agents").join("vincent-perso");
@@ -3617,7 +3877,10 @@ emoji = "✦"
     /// The async loader is the one the server, task engine and agent loop
     /// actually call. A fix that only landed on the sync path would leave the
     /// running daemon permissive.
+    ///
+    /// `#[serial_test::serial]` — voisin du callsite capturé (mika#2646).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2027_absent_identity_toml_fails_closed_on_the_async_path() {
         let tmp = tempfile::tempdir().unwrap();
 
@@ -3633,8 +3896,13 @@ emoji = "✦"
     /// A present-but-unreadable file is a different fault from an absent one
     /// (mika#2027 AC2) — but it fails closed just the same. Only the log event
     /// discriminates, because only the remediation differs.
+    ///
+    /// mika#2784 V2 adds the `cause="unreadable"` half **without touching** the
+    /// assertion above: the posture is the same, so what the ticket asks for is
+    /// a third cause on the posture line, not a third posture.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn mika2027_unreadable_identity_toml_also_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3649,12 +3917,26 @@ emoji = "✦"
             return;
         }
 
-        let identity = load_identity(tmp.path());
+        let (identity, journal) = journal_de_chargement(tmp.path());
 
         assert_eq!(
             identity.skills.allowlist,
             Some(vec![FAIL_CLOSED_SKILL_SENTINEL.to_string()]),
             "an unreadable identity.toml must not read as 'everything permitted' either"
+        );
+
+        // mika#2784 V2 — la cause, ajoutée et non substituée.
+        assert!(
+            journal.contains("agent_fail_closed_posture"),
+            "la posture servie sur un fichier illisible doit se dire : {journal}"
+        );
+        assert!(
+            journal.contains(r#"cause="unreadable""#),
+            "`unreadable` est une cause à part entière : la replier sur \
+             `missing_file` commettrait, dans le nom même introduit pour le \
+             réparer, le défaut mika#2205 qu'il répare — le remède diverge \
+             (runbook § 4 : corriger les permissions, ne PAS réécrire le \
+             fichier) : {journal}"
         );
     }
 
