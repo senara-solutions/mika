@@ -1035,7 +1035,7 @@ fn agent_name_from_home(home_dir: &Path) -> &str {
 fn unreadable_identity_fail_closed(home_dir: &Path, path: &Path, err: &std::io::Error) -> Identity {
     let agent_name = agent_name_from_home(home_dir);
 
-    if err.kind() == std::io::ErrorKind::NotFound {
+    let cause = if err.kind() == std::io::ErrorKind::NotFound {
         tracing::error!(
             event = "identity_toml_absent",
             agent = %agent_name,
@@ -1046,6 +1046,7 @@ fn unreadable_identity_fail_closed(home_dir: &Path, path: &Path, err: &std::io::
              runs on an uninitialized home. Re-provision it from the agent's tier \
              template — see docs/operator/agent-identity-reprovision.md"
         );
+        FailClosedCause::MissingFile
     } else {
         tracing::error!(
             event = "identity_toml_unreadable",
@@ -1057,9 +1058,10 @@ fn unreadable_identity_fail_closed(home_dir: &Path, path: &Path, err: &std::io::
              I/O fault, not a missing file: fix the file's readability rather than \
              re-provisioning it. See docs/operator/agent-identity-reprovision.md"
         );
-    }
+        FailClosedCause::Unreadable
+    };
 
-    fail_closed_identity()
+    fail_closed_identity(agent_name, path, cause)
 }
 
 fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) -> Identity {
@@ -1082,27 +1084,66 @@ fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) ->
             let is_well_known =
                 crate::well_known_agents::find_well_known_agent(agent_name).is_some();
 
+            // `posture` discriminates the two opposite outcomes this ONE event
+            // name carries (mika#2784 D5): the well-known branch serves the
+            // fail-closed posture, the user branch serves `Identity::default()`
+            // — i.e. every builtin and every skill. Same event, because the
+            // event describes the *state of the file* and is correct for both;
+            // the field is what makes the two populations subtractable without
+            // the operator having to subtract two greps (mika#2205).
             if is_well_known {
                 tracing::error!(
                     event = "identity_toml_malformed",
                     agent = %agent_name,
                     path = %path.display(),
                     error = %parse_err,
+                    posture = "fail_closed",
                     "well-known agent identity.toml is malformed — failing CLOSED \
                      (all skills evicted, all mutational tools denied) until the \
                      operator fixes it"
                 );
-                fail_closed_identity()
+                fail_closed_identity(agent_name, path, FailClosedCause::ParseError)
             } else {
                 tracing::error!(
                     event = "identity_toml_malformed",
                     agent = %agent_name,
                     path = %path.display(),
                     error = %parse_err,
+                    posture = "default_fallback",
                     "agent identity.toml is malformed — falling back to defaults"
                 );
                 Identity::default()
             }
+        }
+    }
+}
+
+/// Why a fail-closed posture was served — **three** causes, not two.
+///
+/// mika#2784 names `parse_error | missing_file`; the path has three real
+/// entries. Folding `unreadable` into `missing_file` would commit, in the very
+/// name introduced to repair it, the mika#2205 defect it repairs: two
+/// populations under one name are not subtractable. The two remediations
+/// diverge, and `docs/operator/agent-identity-reprovision.md` already says so —
+/// § 3 (absent → re-provision from the tier template) against § 4 (unreadable →
+/// fix the permissions, do **not** overwrite the file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailClosedCause {
+    /// `ErrorKind::NotFound` — the file does not exist.
+    MissingFile,
+    /// Present but unreadable (permissions, I/O).
+    Unreadable,
+    /// Readable but not valid TOML, or failing `[skills]` validation.
+    ParseError,
+}
+
+impl FailClosedCause {
+    /// The wire form carried by the `cause` field of the posture line.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingFile => "missing_file",
+            Self::Unreadable => "unreadable",
+            Self::ParseError => "parse_error",
         }
     }
 }
@@ -1112,7 +1153,72 @@ fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) ->
 /// well-known agents). Sentinel allowlist matches no real skill (evicts all
 /// bundled skills); denylist contains every mutational built-in tool to prevent
 /// the agent from acting until the operator fixes the file.
-fn fail_closed_identity() -> Identity {
+///
+/// # Why the posture line is emitted HERE and not at the call sites (mika#2784 D1)
+///
+/// The ticket asks for a line « au moment où la posture est **servie** ». This
+/// function is that moment, and a call site is not: the three existing events
+/// (`identity_toml_absent`, `identity_toml_unreadable`,
+/// `identity_toml_malformed`) describe the *state of the file*, never the
+/// *posture served* — one of them covers two opposite postures. Emitting here
+/// buys two properties no call site can: a fourth future caller **cannot**
+/// forget the line, because the signature forces it to name its cause; and the
+/// line is emitted exactly once per posture served, never twice, never zero
+/// times.
+///
+/// This is also why no structural "single site" guard accompanies this change.
+/// The house idiom would be a source scan (mika#2425 / mika#1833 shape), but the
+/// compiler holds the stronger invariant here: this function is private to the
+/// module and takes a **non-`Option`** [`FailClosedCause`], so a call site
+/// without a cause does not compile.
+///
+/// # Why one line per LOAD, with no deduplication (mika#2784 D4)
+///
+/// `load_identity` / `load_identity_async` have ~25 callers, so the posture is
+/// re-loaded every turn and the line follows. No `OnceLock`, no counter: the
+/// posture is a property of the **load**, not of the process — `mika agents
+/// reprovision` repairs the file with no restart, and a once-per-process line
+/// would stay true after the repair. A deduplication would also make the
+/// line's *absence* ambiguous (never happened, or smothered? — mika#2331), and
+/// the nominal regime emits **zero** lines, so the volume is a function of a
+/// present defect, which is the correct behaviour.
+fn fail_closed_identity(agent: &str, path: &Path, cause: FailClosedCause) -> Identity {
+    let tools = ToolsIdentityConfig {
+        disabled: crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        // Deliberately `None`, not mika-arch's allowlist (mika#2748,
+        // Decision 4). This path serves **every** agent whose
+        // `identity.toml` is absent, unreadable or malformed — including
+        // `mika` herself on a mis-provisioned host, and including
+        // transiently (mika#2027). Writing an allowlist here would take
+        // tools away from an agent on a provisioning fault, i.e. at the
+        // worst possible moment. Tightening it to an allowlist is a
+        // fleet-wide decision with its own follow-up ticket (mika#2784
+        // morceau 2, gated on two doctrine questions); the denylist
+        // above already denies every mutational builtin.
+        allowed: None,
+    };
+
+    // `tools_allowlist` is read off the value just built rather than written as
+    // a literal, so the day mika#2784 morceau 2 sets `Some(...)` the **same
+    // grep says whether the tightening is in force in the binary being
+    // served**. Without it, "morceau 2 is deployed" and "morceau 2 is written
+    // but the binary predates it" return identical bytes (class mika#2340).
+    tracing::error!(
+        event = "agent_fail_closed_posture",
+        agent = %agent,
+        cause = cause.as_str(),
+        path = %path.display(),
+        tools_allowlist = if tools.allowed.is_some() { "present" } else { "absent" },
+        "agent is running in FAIL-CLOSED posture: all skills evicted (sentinel \
+         allowlist), every mutational builtin denied, summary injection off. \
+         This is an incident, not an information — the agent acts on nothing \
+         until its identity.toml is repaired. Remediation depends on `cause`: \
+         see docs/operator/agent-identity-reprovision.md"
+    );
+
     Identity {
         name: default_name(),
         emoji: default_emoji(),
@@ -1130,22 +1236,7 @@ fn fail_closed_identity() -> Identity {
             nudge_enabled: None,
             nudge_interval: None,
         },
-        tools: ToolsIdentityConfig {
-            disabled: crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            // Deliberately `None`, not mika-arch's allowlist (mika#2748,
-            // Decision 4). This path serves **every** agent whose
-            // `identity.toml` is absent, unreadable or malformed — including
-            // `mika` herself on a mis-provisioned host, and including
-            // transiently (mika#2027). Writing an allowlist here would take
-            // tools away from an agent on a provisioning fault, i.e. at the
-            // worst possible moment. Tightening it to an allowlist is a
-            // fleet-wide decision with its own follow-up ticket; the denylist
-            // above already denies every mutational builtin.
-            allowed: None,
-        },
+        tools,
         // Fail-closed must enforce inject=false so a malformed identity.toml
         // cannot re-enable summary injection (mika#1009 leak protection).
         context: ContextIdentityConfig {
