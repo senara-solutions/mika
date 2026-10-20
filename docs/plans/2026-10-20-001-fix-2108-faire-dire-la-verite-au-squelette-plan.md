@@ -19,6 +19,20 @@ de la veille (`0d11df56`) ; celui de septembre du 2026-09-03 (`7b4ec10a`). Un jo
 plan du précédent, et cela a suffi à déplacer **deux** de ses prémisses — l'une par un merge
 intervenu entre-temps, l'autre parce que ce qui était *déduit* est désormais *sondé*.
 
+> **Seconde passe de re-mesurage, même jour, `origin/main` inchangé à `059652e9`.** Elle n'a
+> rien trouvé à redire à D1-D7 : chacune a été re-sondée et chacune tient (relevés dans le
+> texte). Elle a trouvé **une prémisse manquante**, portée ci-dessous en **D8** : le vol fait
+> rougir une suite voisine déjà câblée en CI, sur quatre assertions. Elle a aussi corrigé une
+> ancre de D7 (`_pilot_gitdir_bind_args` : 2275, et non 2239). D8 ajoute un livrable (U6),
+> déplace l'ordre de commit et resserre la marge sous la borne par vol — c'est pourquoi elle
+> est portée au plan plutôt que laissée au pilote à découvrir à son premier `make`.
+>
+> Verts de référence mesurés aujourd'hui, qui sont la base de comparaison du vol :
+> `test_sandbox_no_secret_in_argv.sh` **37 passed / 0 failed**,
+> `test_pilot_orientation_block.sh` **25 passed / 0 failed**,
+> `test_sandbox_git_usable.sh` **`⊘ skipped — could not create the probe worktree`** (D5,
+> confirmé au mot près).
+
 ### D1 — Le câblage CI que ce vol devait porter est **déjà livré**
 
 C'est la divergence qui commande le périmètre. Le vol 1 nommait, en P5, un troisième
@@ -169,11 +183,54 @@ aide de navigation mesurée le 2026-10-20 sur `059652e9`.
 | invariant | fonction | ligne au 10-20 |
 |---|---|---|
 | les deux sites `bwrap` | `_run_pilot_sandboxed` | 2872 (Phase 2b), 2935 (Phase 2a) |
-| le canal `--ro-bind-data` et son fd | idem, bloc `secret_args` | 2841-2856 ; fermeture 2989-2992 |
-| binds du gitdir, matérialisation des intermédiaires | `_pilot_gitdir_bind_args` | 2239 |
+| le canal `--ro-bind-data` et son fd | idem, bloc `secret_args` | 2841-2850 ; fermeture 2989-2992 |
+| binds du gitdir, matérialisation des intermédiaires | `_pilot_gitdir_bind_args` | **2275** |
+| ordre dans le bloc 2b : gitdir → log → secrets | `_run_pilot_sandboxed` | 2896, 2914, 2918 |
 | texte d'orientation du vol 1 | `_pilot_orientation_rule` | 4281 |
 | injection du vol 1 | `_set_up_worktree` | 5304 |
 | les deux globales | `dispatch_claude_pilot` | 4817-4819, 12546 |
+| destination du canal de secrets | `_PILOT_SECRET_DIR_SANDBOX` | 1130 |
+
+### D8 — Le vol fait rougir `test_sandbox_no_secret_in_argv.sh`, et elle tourne en CI
+
+Prémisse absente des trois plans antérieurs. C'est la divergence qui coûte le plus cher si on
+la laisse au pilote : elle se découvre à son premier `make`, après que U1 et U2 soient écrits.
+
+`--ro-bind-data` n'est pas un mécanisme libre. Le canal de secrets de mika#2039 en est
+aujourd'hui **le seul usage**, et six prédicats de `test_sandbox_no_secret_in_argv.sh` tiennent
+ce canal en reconnaissant le **littéral** `--ro-bind-data` dans l'argv capturé. Ils sont donc
+tous adossés à une prémisse implicite — *« tout `--ro-bind-data` est un secret »* — que ce vol
+rend fausse, parce qu'il réutilise délibérément le même mécanisme pour autre chose.
+
+La suite est lancée par `make test-sandbox-secret-argv` à **`.github/workflows/ci.yml:126`**,
+et rend **37 passed / 0 failed** aujourd'hui. Mesuré, site par site :
+
+| site | prédicat tel qu'écrit | effet du vol 2 |
+|---|---|---|
+| `:457-458` | `bd_count == 2` — un compte **exact** | 2 → 4 : **rouge** |
+| `:485-486` | token non défini → `arg_index == -1` | le marqueur est émis quand même : **rouge** |
+| `:552-553` | allowlist vide → `arg_index == -1` | idem : **rouge** |
+| `:340-348` | `--perms 0600` précède immédiatement `arg_index` | `arg_index` rend la **première** occurrence, donc le marqueur — qui n'a pas `--perms 0600` devant, et ne doit pas en avoir : **rouge** |
+| `:352-370` | `arg_index` vient après `--tmpfs /run` | mesure le marqueur : verdict **fortuit**, ce qui est pire qu'un rouge |
+| `:241-250` | `secret_destinations()` extrait la destination de **chaque** triple | sur-compte les destinations du marqueur comme destinations de secrets |
+
+Les quatre premiers rougissent ; les deux derniers se mettent à mesurer autre chose que leur
+objet. Et `scripts/canary-pilot-containment:528-529` compte le même littéral pour annoncer
+`INFO: <n> secret file channel(s) declared` — il rapporterait **quatre** canaux de secrets là
+où il y en a deux. Ce n'est pas une assertion : il ne rougit pas, il **dit faux en silence**.
+
+**Aucun de ces prédicats n'est à faire taire.** Ils affirment une propriété vraie et voulue :
+le canal de secrets est audité, `0600`, et niché sous le tmpfs `/run`. Le défaut n'est pas dans
+ce qu'ils affirment, il est dans **ce sur quoi ils le lisent** — et c'est la doctrine que ce
+dépôt a déjà écrite pour le même motif : *le prédicat porte sur le site qui porte l'invariant,
+jamais sur la valeur ni sur le littéral* (mika#2309, `a2a-timeout-literal-lint`).
+
+**La position d'injection n'est pas le remède, et il faut le dire pour qu'on ne l'essaie pas.**
+Injecter le marqueur **après** `secret_args` (2918) au lieu de juste après les binds du gitdir
+(2896) sauverait les deux prédicats qui dépendent de `arg_index` — et laisserait les trois
+rouges de compte intacts. Pire, il créerait un couplage invisible : un futur réordonnancement
+des binds rougirait un test de secrets sans rapport apparent avec lui. L'ordre reste contraint
+par le recouvrement (U2), pas par la santé d'une suite voisine.
 
 ---
 
@@ -349,18 +406,63 @@ la CI du PR, et c'est tout ce que la Definition of Done peut exiger du pilote.
 
 ### U5 — Aucun câblage
 
-Les deux suites sont déjà atteintes par `ci.yml` (lignes 156 et 219) et par la cible
-agrégée. **Aucune ligne de `Makefile`, aucune ligne de `ci.yml`, aucune entrée de
+Les **trois** suites que ce vol touche sont déjà atteintes par `ci.yml` — lignes 156
+(orientation), 219 (git-usable) et 126 (secrets, via `make test-sandbox-secret-argv`) — et par
+la cible agrégée. **Aucune ligne de `Makefile`, aucune ligne de `ci.yml`, aucune entrée de
 `scripts/suite-wiring.tsv`.** C'est D1 : le travail a été fait par mika#2793, et le constater
 est moins cher que de le refaire.
+
+Le canari (`scripts/canary-pilot-containment`) n'est pas câblé en CI et ne le devient pas :
+c'est une sonde post-déploiement (Hors périmètre). U6 y corrige une ligne d'`INFO` parce
+qu'elle deviendrait fausse, pas pour l'enrôler dans le pipeline.
+
+### U6 — Re-spécifier le canal de secrets par sa **destination**, non par son littéral
+
+De D8. Six prédicats de `test_sandbox_no_secret_in_argv.sh` lisent le canal de secrets sur le
+littéral `--ro-bind-data`. Ce vol en fait un mécanisme à deux usages, donc le littéral cesse
+d'être un discriminant. Le discriminant existe déjà et il est nommé :
+`_PILOT_SECRET_DIR_SANDBOX` (`/run/mika-pilot-secrets`, ligne 1130).
+
+Le geste est **un seul**, et les six sites en héritent : la suite se dote d'un accesseur
+`secret_channel_index()` / `secret_channel_count()` qui ne retient un triple
+`--ro-bind-data <fd> <dest>` que si `<dest>` est sous `$_PILOT_SECRET_DIR_SANDBOX`. Les six
+prédicats passent de `arg_index '--ro-bind-data'` et `grep -c` à cet accesseur.
+`secret_destinations()` reçoit le même filtre — elle extrait déjà la destination de chaque
+triple, il ne lui manque que la condition.
+
+Ce que cela change pour chaque prédicat, et ce que cela ne change pas :
+
+- `bd_count` redevient **exact à 2** et le reste — il compte désormais les canaux de secrets,
+  qui sont bien deux, au lieu des `--ro-bind-data` de l'argv, qui sont quatre ;
+- les deux `== -1` redeviennent vrais et **gagnent en force** : ils affirment l'absence du
+  canal de secrets, ce qui est leur objet, et non l'absence du mécanisme ;
+- `--perms 0600` et l'ordre après `--tmpfs /run` portent de nouveau sur le triple qu'ils
+  visent. Les deux prédicats cessent d'être fortuits ;
+- **aucune assertion n'est relâchée, retirée ni réécrite dans son fond.** Les 37 assertions
+  restent 37, et le ticket d'origine de chacune (mika#2039, mika#2572, mika#2716) garde la
+  propriété qu'il a posée. C'est une re-spécification du *lecteur*, pas du *prédicat*.
+
+**Et l'anti-vacuité de cette re-spécification est obligatoire**, parce qu'un filtre est
+exactement le genre de geste qui rend un test vert en le vidant : un accesseur qui ne
+reconnaîtrait plus rien ferait passer `bd_count == 2` à `0 == 2` (rouge, donc visible) mais
+ferait passer les deux `== -1` à verts **pour la mauvaise raison**. Le vol ajoute donc une
+assertion qui exige que l'accesseur **trouve** les deux canaux de secrets dans le cas nominal
+— le contrôle positif sans lequel les deux assertions d'absence sont vides. La suite porte
+déjà ce raisonnement pour un autre de ses prédicats (le commentaire de `secret_destinations` :
+« counting raw occurrences would over-count »), ce vol l'étend au filtre qu'il introduit.
+
+Enfin, `scripts/canary-pilot-containment:528-529` reçoit le même discriminant, pour une ligne :
+son `INFO` annonce un nombre de canaux de secrets, et il doit continuer de dire vrai. C'est de
+l'instrumentation, pas une assertion — raison de plus pour la corriger dans le même vol, un
+instrument qui ment ne rougit jamais pour le signaler.
 
 ---
 
 ## Fire-Disposition
 
-Ce vol livre des détecteurs : les six assertions de U3 et les assertions MUST WORK / MUST
-FAIL de U4. Disposition retenue : **(a) exception nommée en allowlist — avec une population
-d'exceptions vide à l'atterrissage.**
+Ce vol livre des détecteurs : les six assertions de U3, les assertions MUST WORK / MUST FAIL
+de U4, et le contrôle positif du filtre de U6. Disposition retenue : **(a) exception nommée en
+allowlist — avec une population d'exceptions vide à l'atterrissage.**
 
 Le détail, parce que « vide » doit être mesuré et non supposé :
 
@@ -384,6 +486,15 @@ Le détail, parce que « vide » doit être mesuré et non supposé :
   le runner au premier push. C'est un détecteur dont le *lieu* d'exécution est la CI, ce qui
   est le cas de tous les gardes de ce dépôt — la seule différence est que le pilote ne peut
   pas le pré-vérifier localement, et le plan le dit plutôt que de le laisser découvrir.
+
+- **D8 n'est pas une population d'exceptions, et la distinction porte.** Six prédicats
+  existants voient leur prémisse invalidée par ce vol. Il serait faux de les traiter comme des
+  violations à exempter : une exemption dirait *« ce site a le droit de violer la règle »*,
+  alors que la règle qu'ils portent — le canal de secrets est audité, `0600`, sous `/run` —
+  reste **entièrement vraie et entièrement exigée** après le vol. Ce qui change est le
+  discriminant qui identifie le canal. U6 répare le lecteur ; il ne crée aucune exemption, et
+  les 37 assertions restent 37. Une allowlist aurait ici l'effet exactement inverse de celui
+  recherché : elle aurait éteint six gardes vivants au lieu de les remettre en phase.
 
 Les détecteurs atterrissent donc **armés**, sans `#[ignore]`, sans suivi d'armement, et sans
 halte opérateur.
@@ -425,9 +536,20 @@ une copie régressée où l'injection n'est que sur un site, **échouent**. Une 
 démontre pas sa propre capacité d'échec ne compte pas comme livrée.
 
 **AC7 — Aucun câblage n'est ajouté, et la lint bidirectionnelle reste verte.** Le diff ne
-touche ni `Makefile`, ni `.github/workflows/ci.yml`, ni `scripts/suite-wiring.tsv` : les deux
-suites étendues y sont déjà. `bash scripts/check-suite-wiring.sh` continue de rendre
+touche ni `Makefile`, ni `.github/workflows/ci.yml`, ni `scripts/suite-wiring.tsv` : les trois
+suites touchées y sont déjà. `bash scripts/check-suite-wiring.sh` continue de rendre
 `unwired=0`.
+
+**AC8 — La suite des secrets reste verte, et ses prédicats portent de nouveau sur leur
+objet.** `make test-sandbox-secret-argv` rend **37 passed / 0 failed** après le vol — le même
+compte qu'avant, parce qu'aucune assertion n'est retirée ni relâchée. Les six prédicats de D8
+identifient le canal de secrets par sa **destination** sous `_PILOT_SECRET_DIR_SANDBOX`, et
+non par le littéral `--ro-bind-data` : vérifié en ce que `bd_count` vaut toujours `2` alors que
+l'argv porte quatre `--ro-bind-data`, ce qui est précisément la mesure qui distingue un
+prédicat réparé d'un prédicat éteint. Le filtre porte son **contrôle positif** : une assertion
+exige qu'il trouve les deux canaux de secrets dans le cas nominal, sans quoi les deux
+assertions d'absence seraient vertes à vide. `scripts/canary-pilot-containment` annonce `2` et
+non `4` canaux de secrets.
 
 ---
 
@@ -438,10 +560,15 @@ suites étendues y sont déjà. `bash scripts/check-suite-wiring.sh` continue de
 - `bash skills/bundled/_shared/tests/test_pilot_orientation_block.sh` rend `0` en local, ses
   **cinq** parties passent, et PART E porte son anti-vacuité.
 - `bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh` rend `0` en local. **Un
-  `⊘ skipped` est le résultat attendu depuis un worktree de dispatche** (D5) : il ne vaut pas
-  preuve, et la vérification de cette suite est la CI du PR. Le corps de PR le dit.
+  `⊘ skipped — could not create the probe worktree` est le résultat attendu depuis un worktree
+  de dispatche** (D5, mesuré au mot près aujourd'hui) : il ne vaut pas preuve, et la
+  vérification de cette suite est la CI du PR. Le corps de PR le dit.
+- `make test-sandbox-secret-argv` rend **37 passed / 0 failed** — le compte d'avant le vol
+  (AC8). Cette suite n'a aucune précondition de `bwrap` réel : elle est **entièrement
+  vérifiable en vol**, et c'est le garde-fou que le pilote doit lancer après U2 et après U6.
 - `make check-pilot-instruction-paths`, `make check-suite-wiring`,
-  `make test-dispatch-symmetry` et `make lint` restent verts.
+  `make test-dispatch-symmetry`, `make verify-no-secret-in-setenv` et `make lint` restent
+  verts.
 - `scripts/verify-pipeline.sh origin/main` passe.
 - Le corps de PR nomme le vol 2, ce que D1 a rendu inutile, et le fait que la moitié
   `bwrap`-réelle est vérifiée par la CI et non en vol.
@@ -452,16 +579,28 @@ suites étendues y sont déjà. `bash scripts/check-suite-wiring.sh` continue de
 
 1. **U1** — la fonction seule. Rien ne l'appelle encore ; le dépôt est fonctionnel et aucun
    argument `bwrap` n'a changé.
-2. **U2** — l'injection sur les deux sites et la fermeture des fds. C'est le commit qui
-   change le namespace du pilote.
-3. **U3** — PART E, verte dès son arrivée puisque U2 la précède.
-4. **U4** — le contrôle négatif réel. En dernier parce qu'il mesure l'état final du jeu
+2. **U6** — la re-spécification du lecteur, **avant** que l'argv change. Cette position n'est
+   pas une préférence, elle est la seule qui laisse le dépôt vert à chaque commit : U2 ajoute
+   deux `--ro-bind-data`, et tout commit où U2 précède U6 laisse derrière lui un `main`
+   intermédiaire dont le job `ci.yml:126` est rouge.
+   Et U6 est **vérifiable isolément** : tant que le canal de secrets est le seul usage du
+   mécanisme, un filtre par destination rend exactement ce que rendait le littéral. La suite
+   doit donc afficher **37 passed / 0 failed avant comme après ce commit** — c'est un refactor
+   à comportement constant, et c'est la mesure qui prouve que le filtre reconnaît bien ce
+   qu'il doit reconnaître, avant qu'il n'ait à discriminer quoi que ce soit.
+3. **U2** — l'injection sur les deux sites et la fermeture des fds. C'est le commit qui
+   change le namespace du pilote, et le premier où le filtre de U6 discrimine réellement :
+   `bd_count` reste `2` alors que l'argv porte désormais quatre `--ro-bind-data` (AC8).
+4. **U3** — PART E, verte dès son arrivée puisque U2 la précède.
+5. **U4** — le contrôle négatif réel. En dernier parce qu'il mesure l'état final du jeu
    d'arguments.
 
-Plancher du vol : U1 + U2 + U3 + U4. Retirer **U4** livrerait un élargissement d'arguments
-`bwrap` sans son contrôle négatif — ce que le commentaire opérateur du 2026-09-03 interdit
-explicitement, et ce que l'AC6 du vol 1 a transféré ici. Retirer **U3** livrerait l'asymétrie
-non gardée de D6, dans un fichier qui a pris 7 644 lignes depuis le plan de septembre.
+Plancher du vol : U1 + U6 + U2 + U3 + U4 — les cinq, et aucun n'est retranchable.
+Retirer **U6** livre un job CI requis rouge, ce qui n'est pas un vol dégradé mais un vol qui
+ne merge pas. Retirer **U4** livrerait un élargissement d'arguments `bwrap` sans son contrôle
+négatif — ce que le commentaire opérateur du 2026-09-03 interdit explicitement, et ce que
+l'AC6 du vol 1 a transféré ici. Retirer **U3** livrerait l'asymétrie non gardée de D6, dans un
+fichier qui a pris 7 644 lignes depuis le plan de septembre.
 
 ---
 
@@ -518,9 +657,23 @@ entre, et le contenu du fichier n'y figure pas (c'est tout l'objet de `--ro-bind
 argument qui ne dit rien, et parce que le jour où un bind de répertoire arrivera sur ce
 chemin, l'ordre déciderait silencieusement lequel gagne.
 
+**Ce vol fait de `--ro-bind-data` un mécanisme à deux usages, et c'est irréversible.** Jusqu'à
+lui, le canal de secrets en était le seul consommateur, et cette unicité était devenue un
+discriminant tacite sur lequel six prédicats s'étaient adossés (D8). U6 remplace le tacite par
+l'explicite — la destination sous `_PILOT_SECRET_DIR_SANDBOX` — et c'est le bon geste, mais il
+ne protège pas le **troisième** usage à venir : un futur auteur qui ajoutera un
+`--ro-bind-data` sous `/run/mika-pilot-secrets/` pour autre chose qu'un secret ferait de
+nouveau mentir ces prédicats. Rien dans ce vol ne l'en empêche, et il serait malhonnête de
+prétendre qu'un commentaire y suffit. Ce que le vol laisse derrière lui est un discriminant
+**nommé** au lieu d'un discriminant **supposé**, ce qui rend le prochain faux positif lisible
+plutôt que mystérieux. Un garde structurel sur ce point serait un ticket à lui seul, et ce
+plan ne le réclame pas.
+
 **Ancres.** Re-mesurées aujourd'hui (D7), mais `dispatch-lib.sh` a doublé en un mois. Les
 ancres de ce plan sont des **fonctions** ; les numéros valent pour `059652e9` et pour lui
-seul.
+seul. Les deux passes de re-mesurage du 2026-10-20 ont trouvé **une** ancre fausse sur neuf
+(`_pilot_gitdir_bind_args`), ce qui est le taux auquel il faut s'attendre et la raison pour
+laquelle les invariants sont nommés par leur fonction.
 
 **Ce plan ne prétend pas que le pilote livrera.** Il retire une friction du chemin ; il ne
 mesure pas ce qui se trouve après elle.
@@ -535,13 +688,32 @@ mesure pas ce qui se trouve après elle.
 | `skills/bundled/_shared/dispatch-lib.sh` — injection sur les deux sites + fds + commentaire de symétrie | 24 |
 | `skills/bundled/_shared/tests/test_pilot_orientation_block.sh` — PART E (E1-E5 + anti-vacuité) | 62 |
 | `skills/bundled/_shared/tests/test_sandbox_git_usable.sh` — contrôle négatif réel (MUST WORK + MUST FAIL re-mesurées) | 46 |
+| `skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh` — U6 : accesseur par destination, filtre de `secret_destinations`, 6 sites migrés, contrôle positif | 40 |
+| `scripts/canary-pilot-containment` — U6 : le même discriminant sur la ligne d'`INFO` | 2 |
 | `Makefile` + `.github/workflows/ci.yml` + `scripts/suite-wiring.tsv` | 0 |
 
-Total estimé : 194 lignes
+Total estimé : 236 lignes
 Plafond de tours : 150 (défaut)
 Borne par vol : 279 lignes estimées — (150 − 27 − 30) × 9 / 3
 
 Le vol tient sous la borne, et voici pourquoi il tient plutôt que de simplement passer.
+
+**La marge a été entamée par D8, et il faut la lire pour ce qu'elle est : 43 lignes, contre 85
+avant la seconde passe de re-mesurage.** Ce n'est pas un dépassement, et ce n'est pas non plus
+du confort. Deux raisons de ne pas découper malgré ce resserrement, et elles sont de nature
+différente :
+
+1. **U6 n'est pas découpable hors de ce vol.** C'est la contrainte dure. U6 répare le lecteur
+   que U2 casse ; un vol qui livrerait U2 sans U6 laisse `ci.yml:126` rouge et ne merge pas,
+   et un vol qui livrerait U6 seul serait un refactor à comportement constant sans raison
+   d'être — invérifiable dans son objet, puisque rien ne discriminerait encore. Les deux
+   appartiennent au même vol par construction, pas par commodité.
+2. **U6 est du travail à faible coût en tours, et c'est ce que la borne mesure.** Un accesseur
+   et six sites d'appel à migrer dans une suite dont les 37 assertions sont déjà vertes et
+   déjà lançables en vol : le pilote mesure son résultat par `make test-sandbox-secret-argv`,
+   en une commande, autant de fois qu'il veut. Pas d'échafaudage, pas de `bwrap`, pas de
+   câblage, pas de précondition. C'est la forme de travail la moins chère en tours à volume
+   égal — et la borne est en tours, pas en lignes (mika#2693).
 
 **La ligne à zéro est le gain du re-mesurage.** Le vol 1 prévoyait ici un câblage `Makefile`
 + `ci.yml` et le retrait d'une entrée de registre ; mika#2793 les a livrés (D1). Mieux : les
