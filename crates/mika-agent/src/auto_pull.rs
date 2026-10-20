@@ -1171,8 +1171,22 @@ pub fn classify_promotion(
                 detail: "staleness_unavailable",
             };
         }
-        StalenessMeasurement::BranchAbsent { .. }
-        | StalenessMeasurement::BranchDeletedByMerge { .. } => {
+        // mika#2837 — absente d'`origin` **parce que** le merge de sa PR l'a
+        // supprimée. Le plan annoncé comme commité sur la branche est sur
+        // `main`, donc le pilote dispatché ici l'y trouve : le callout est
+        // périmé, le plan ne l'est pas. Le détail est distinct de
+        // `branch_absent_on_origin` (AC1) pour qu'un opérateur compte les deux
+        // populations séparément — c'est ce que le refus unique rendait
+        // impossible.
+        StalenessMeasurement::BranchDeletedByMerge { .. } => {
+            return PromotionGate::Promote {
+                detail: "branch_deleted_by_merged_pr",
+            };
+        }
+        // Inchangé, et c'est AC2 : aucune PR mergée ne porte la branche, ou la
+        // forge n'a pas pu le dire. Le message d'alors est juste, et on ne
+        // promeut pas sur une absence de preuve (AC3).
+        StalenessMeasurement::BranchAbsent { .. } => {
             return PromotionGate::Refuse(RefusalReason::BranchAbsent {
                 branch: branch.unwrap_or("<unknown>").to_string(),
             });
@@ -1341,10 +1355,34 @@ fn staleness_audit_json(
         StalenessMeasurement::NoBranchCallout => "no_branch_callout",
         StalenessMeasurement::Unavailable => "unavailable",
     };
+    // mika#2837 — deux dimensions brutes, pas un booléen dérivé (Signal O,
+    // mika#2331) : le numéro de la PR qui a supprimé la branche, et ce que la
+    // sonde a répondu. `measurement` seul ne suffit pas — `branch_absent`
+    // couvre la branche orpheline *et* la sonde en panne, et confondre les deux
+    // fait lire une panne de la forge comme une population.
+    //
+    // `null`, jamais `0` ni `""` : hors du chemin d'absence la sonde n'a pas
+    // tourné, et une valeur par défaut s'agrégerait comme une mesure.
+    let merged_pr: Option<u64> = match measurement {
+        StalenessMeasurement::BranchDeletedByMerge { pr } => Some(*pr),
+        _ => None,
+    };
+    let merged_pr_probe: Option<&'static str> = match measurement {
+        StalenessMeasurement::BranchDeletedByMerge { .. } => Some("carried"),
+        StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::NotCarried,
+        } => Some("not_carried"),
+        StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::Unreadable,
+        } => Some("unreadable"),
+        _ => None,
+    };
     serde_json::json!({
         "issue": issue_number,
         "branch": branch,
         "measurement": measurement_slug,
+        "merged_pr": merged_pr,
+        "merged_pr_probe": merged_pr_probe,
         "behind_by": behind_by,
         "ahead_by": ahead_by,
         "status": status,
@@ -11064,6 +11102,126 @@ This ticket has been GROOMED and is ready.
                 .map(|e| e.number),
             Some(11)
         );
+    }
+
+    /// La partition des trois sondes, en table nommée (AC1/AC2/AC3).
+    ///
+    /// C'est le test du correctif : une seule des trois réponses de la forge
+    /// promeut, et le refus des deux autres est celui d'aujourd'hui — même
+    /// variante, même slug, même message. Un refus dont le texte aurait bougé
+    /// serait une régression d'AC2 que la variante seule ne verrait pas.
+    #[test]
+    fn mika2837_la_partition_des_trois_sondes() {
+        let refusal = PromotionGate::Refuse(RefusalReason::BranchAbsent {
+            branch: BRANCH_2680.to_string(),
+        });
+        let cases: Vec<(&str, Result<Option<MergedPrEvidence>>, PromotionGate)> = vec![
+            (
+                "AC1 — portée par une PR mergée : le callout est périmé, pas le plan",
+                Ok(Some(MergedPrEvidence {
+                    number: 2834,
+                    merged_at: "2026-10-20T06:10:45Z".to_string(),
+                })),
+                PromotionGate::Promote {
+                    detail: "branch_deleted_by_merged_pr",
+                },
+            ),
+            (
+                "AC2 — aucune PR mergée ne la porte : le refus d'aujourd'hui",
+                Ok(None),
+                refusal.clone(),
+            ),
+            (
+                "AC3 — la forge n'a pas pu répondre : le refus, sans promotion \
+                 sur une absence de preuve",
+                Err(anyhow!("gh pr list failed: HTTP 502")),
+                refusal.clone(),
+            ),
+        ];
+
+        for (label, probe, expected) in cases {
+            let decision =
+                classify_promotion(&classify_absent_branch(probe), Some(BRANCH_2680), 50);
+            assert_eq!(decision, expected, "{label}");
+            if let PromotionGate::Refuse(r) = &decision {
+                assert_eq!(r.slug(), "branch_absent_on_origin", "{label}");
+                assert!(
+                    r.reason(2680).contains("n'existe pas sur `origin`"),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// Le journal d'audit par mesure, en table **totale** (AC1).
+    ///
+    /// Six lignes pour cinq variantes, et le `match` de `row` est exhaustif :
+    /// une sixième variante de [`StalenessMeasurement`] ne compilera pas sans sa
+    /// ligne ici. C'est la garde qui empêche la table de devenir un
+    /// sous-ensemble silencieux de l'énumération.
+    ///
+    /// `merged_pr` est `null` — jamais `0` — partout où aucune PR ne porte la
+    /// branche, et `merged_pr_probe` est `null` hors du chemin d'absence : un
+    /// `0` ou un `""` se lirait comme une valeur mesurée (motif mika#2331).
+    #[test]
+    fn mika2837_laudit_par_mesure_table_complete() {
+        fn row(m: &StalenessMeasurement) -> (&'static str, Option<u64>, Option<&'static str>) {
+            match m {
+                StalenessMeasurement::Measured(_) => ("measured", None, None),
+                StalenessMeasurement::NoBranchCallout => ("no_branch_callout", None, None),
+                StalenessMeasurement::Unavailable => ("unavailable", None, None),
+                StalenessMeasurement::BranchAbsent {
+                    probe: AbsenceProbe::NotCarried,
+                } => ("branch_absent", None, Some("not_carried")),
+                StalenessMeasurement::BranchAbsent {
+                    probe: AbsenceProbe::Unreadable,
+                } => ("branch_absent", None, Some("unreadable")),
+                StalenessMeasurement::BranchDeletedByMerge { pr } => {
+                    ("branch_deleted_by_merge", Some(*pr), Some("carried"))
+                }
+            }
+        }
+
+        let inputs = [
+            measured(3, 1, "behind"),
+            StalenessMeasurement::NoBranchCallout,
+            StalenessMeasurement::Unavailable,
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            },
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::Unreadable,
+            },
+            StalenessMeasurement::BranchDeletedByMerge { pr: 2834 },
+        ];
+
+        for m in inputs {
+            let (slug, merged_pr, probe) = row(&m);
+            let decision = classify_promotion(&m, Some(BRANCH_2680), 50);
+            let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
+                2837,
+                Some(BRANCH_2680),
+                &m,
+                &decision,
+                50,
+            ))
+            .expect("l'audit est du JSON valide");
+            assert_eq!(json["measurement"], slug, "mesure {m:?}");
+            match merged_pr {
+                Some(n) => assert_eq!(json["merged_pr"], n, "mesure {m:?}"),
+                None => assert!(
+                    json["merged_pr"].is_null(),
+                    "`null`, jamais `0` : aucune PR ne porte {m:?}"
+                ),
+            }
+            match probe {
+                Some(p) => assert_eq!(json["merged_pr_probe"], p, "mesure {m:?}"),
+                None => assert!(
+                    json["merged_pr_probe"].is_null(),
+                    "hors du chemin d'absence, la sonde n'a pas tourné : {m:?}"
+                ),
+            }
+        }
     }
 
     /// AC3 — on ne promeut pas sur une absence de preuve.
