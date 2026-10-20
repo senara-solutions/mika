@@ -1138,6 +1138,33 @@ pub struct Settings {
     #[serde(default)]
     pub surface_for_adoption: Option<String>,
 
+    /// Dedicated Telegram chat for `P0` operator notifications (mika#1381) —
+    /// « la boucle est morte », the class a human must act on.
+    ///
+    /// Env override: `MIKA_OPERATOR_ESCALATION_CHAT_ID`. The `MIKA_` prefix is
+    /// correct for the same reason as `surface_for_adoption` above: the value is
+    /// read by **mika-spirit** through the config-rs `MIKA_` cascade, whose
+    /// process env nothing clears.
+    ///
+    /// **A second surface rather than a flag**, because the problem it closes is
+    /// a mute: the operator mutes the chat carrying seventeen routine acks a day
+    /// and loses the breakage alarm with it. A "bypass-mute" bit cannot be
+    /// expressed on the Telegram side; a structurally distinct chat can, and the
+    /// operator keeps the mute.
+    ///
+    /// `None` is the nominal state — a single-channel deployment. A `P0` then
+    /// falls back to the normal chat with the `operator_escalation_chat_unset`
+    /// WARN, never dropped (D4). `Some(0)` is **refused as a route** for the
+    /// same reason: `chat_id == 0` is the documented "no reply channel" sentinel
+    /// that `GatewayMessageSender::send` short-circuits on (mika#650/#1090), so
+    /// honouring it here would swallow every P0 in silence.
+    ///
+    /// `Option<i64>` and not `Option<u64>`: a Telegram group chat id is
+    /// negative. Only two of the sixteen `GatewayMessageSender::new` callsites
+    /// arm it — see `with_escalation_chat_id`.
+    #[serde(default)]
+    pub operator_escalation_chat_id: Option<i64>,
+
     /// First backoff step after a failed callback delivery, in seconds
     /// (mika#2179). Doubles per attempt up to
     /// [`Self::callback_delivery_backoff_max_secs`].
@@ -2744,6 +2771,7 @@ impl Settings {
             pilot_cost_alert_usd: None,
             brief_size_alert_bytes: None,
             surface_for_adoption: None,
+            operator_escalation_chat_id: None,
             callback_delivery_backoff_base_secs: None,
             callback_delivery_backoff_max_secs: None,
             kg_docs_root: None,
@@ -2894,6 +2922,13 @@ impl std::fmt::Debug for Settings {
                 &self.permission_hold_timeout_secs,
             )
             .field("home_dir", &self.home_dir)
+            // In clear: a chat id is a routing destination, not a credential
+            // (mika#1381). Redacting it would hide the one value an operator
+            // debugging "my P0 went nowhere" needs to read.
+            .field(
+                "operator_escalation_chat_id",
+                &self.operator_escalation_chat_id,
+            )
             .finish()
     }
 }

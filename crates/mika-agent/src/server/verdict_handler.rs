@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
-use crate::messaging::MessageSender;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::perimeter::{self, Classification};
 use crate::skills::SkillRegistry;
 use crate::task_state::merge_metadata;
@@ -1370,7 +1370,7 @@ async fn handle_block_ac(
 
         // Notify operator
         if let Some(sender) = message_sender {
-            send_notification(
+            send_notification_p0(
                 sender,
                 &format!(
                     "PR #{} on {} — block[ac] retry limit ({}) reached from @{}. \
@@ -1657,7 +1657,7 @@ async fn handle_block_ci(
         }
 
         if let Some(sender) = message_sender {
-            send_notification(
+            send_notification_p0(
                 sender,
                 &format!(
                     "PR #{} on {} — block[ci] retry limit ({}) reached from @{}. \
@@ -1865,7 +1865,7 @@ async fn handle_escalate(
 
     // Notify operator
     if let Some(sender) = message_sender {
-        send_notification(
+        send_notification_p0(
             sender,
             &format!(
                 "PR #{} on {} — VERDICT: block[{reason}] from @{}. \
@@ -2343,7 +2343,7 @@ async fn pr_circuit_breaker_check(
     }
 
     if let Some(sender) = message_sender {
-        send_notification(
+        send_notification_p0(
             sender,
             &format!(
                 "PR #{} on {} — circuit breaker tripped after {} blocking-verdict observations \
@@ -2631,7 +2631,7 @@ async fn check_identical_diff_circuit_breaker(
 
         // Notify operator
         if let Some(sender) = message_sender {
-            send_notification(
+            send_notification_p0(
                 sender,
                 &format!(
                     "PR #{} on {} — identical-diff circuit breaker fired ({verdict_class}). \
@@ -2696,17 +2696,49 @@ fn truncate_body_for_log(body: &str) -> &str {
 }
 
 /// Send a notification via the message sender, absorbing errors.
+///
+/// Routine tier (`P2`) — the chat the operator may mute. For the breakage
+/// class, call [`send_notification_p0`] (mika#1381).
 async fn send_notification(sender: &Arc<dyn MessageSender>, message: &str) {
-    match sender.send(message).await {
+    report_notification_outcome(sender.send(message).await, NotificationSeverity::P2);
+}
+
+/// Send an operator notification of the `P0` tier — « the loop is dead, a human
+/// must step in » (mika#1381). Routed to `MIKA_OPERATOR_ESCALATION_CHAT_ID` when
+/// one is configured, and to the normal chat with a named WARN when not.
+///
+/// Deliberately a **second** helper rather than a `severity` parameter on
+/// `send_notification`: vol 1 of mika#1381 keeps the ten P2 callsites textually
+/// unchanged, so a reviewer's diff shows only the sites whose routing moved. The
+/// merge into one helper carrying an explicit severity is vol 2.
+async fn send_notification_p0(sender: &Arc<dyn MessageSender>, message: &str) {
+    report_notification_outcome(
+        sender
+            .send_with_severity(message, NotificationSeverity::P0)
+            .await,
+        NotificationSeverity::P0,
+    );
+}
+
+/// Shared outcome handling for both tiers — one copy, so the two helpers above
+/// cannot drift in what they log.
+fn report_notification_outcome(
+    outcome: anyhow::Result<crate::messaging::SendOutcome>,
+    severity: NotificationSeverity,
+) {
+    match outcome {
         Ok(crate::messaging::SendOutcome::Delivered) => {}
         Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-            warn!(reason = %reason, "Verdict handler notification delivery failed");
+            warn!(reason = %reason, severity = severity.as_str(), "Verdict handler notification delivery failed");
         }
         Ok(crate::messaging::SendOutcome::NoChannel) => {
-            warn!("Verdict handler notification skipped — no reply channel (chat_id=0)");
+            warn!(
+                severity = severity.as_str(),
+                "Verdict handler notification skipped — no reply channel (chat_id=0)"
+            );
         }
         Err(e) => {
-            warn!(error = %e, "Failed to send verdict handler notification");
+            warn!(error = %e, severity = severity.as_str(), "Failed to send verdict handler notification");
         }
     }
 }
@@ -4979,5 +5011,161 @@ mod mika2667_tests {
                 "{err}"
             );
         }
+    }
+}
+
+/// Tests négatifs de mika#1381 — ce que la frontière `MessageSender` ne doit
+/// **jamais** observer. Module séparé, comme `mika2667_tests`, pour que ses
+/// imports nomment exactement la surface sous test.
+#[cfg(test)]
+mod mika1381_tests {
+    use super::{MessageSender, NotificationSeverity, send_notification, send_notification_p0};
+    use anyhow::Result;
+    use std::sync::Arc;
+
+    // --- l'état interdit --------------------------------------------------
+    //
+    // L'état interdit que ce changement peut réintroduire n'est pas « le P0 ne
+    // part pas ». C'est **« le P0 part, et arrive sur la surface mutable »** :
+    // un `Delivered` honnête vers le chat normal. Le code d'avant ce changement
+    // faisait exactement cela sur les cinq sites de rupture de ce fichier, et
+    // c'est pourquoi aucune assertion d'issue réussie ne peut tenir
+    // l'invariant — il faut observer la **sévérité** au passage de la
+    // frontière, pas le résultat de l'envoi.
+
+    /// Sentinelle enregistrée quand une notification franchit la frontière par
+    /// l'entrée **sans axe de sévérité**, `MessageSender::send`. Sur un vrai
+    /// `GatewayMessageSender` cet appel délègue à `send_with_severity(.., P2)`
+    /// et se route donc vers le chat normal — celui que l'opérateur peut muter.
+    const SEVERITE_ABSENTE: &str = "aucune-severite";
+
+    /// Un double qui enregistre la sévérité portée par chaque notification au
+    /// passage de la frontière `MessageSender`.
+    ///
+    /// Surcharger les **deux** entrées est ce qui rend l'observation possible :
+    /// le défaut du trait `send_with_severity` délègue à `send` et *perd* la
+    /// sévérité, donc un double qui ne surcharge que `send` ne peut pas
+    /// distinguer un P0 d'un P2 — il enregistrerait les deux à l'identique et
+    /// le test passerait au vert sur l'état interdit.
+    #[derive(Default)]
+    struct SeverityRecordingSender {
+        franchissements: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl SeverityRecordingSender {
+        fn observe(&self) -> Vec<(String, String)> {
+            self.franchissements.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageSender for SeverityRecordingSender {
+        async fn send(&self, text: &str) -> Result<crate::messaging::SendOutcome> {
+            self.franchissements
+                .lock()
+                .unwrap()
+                .push((text.to_string(), SEVERITE_ABSENTE.to_string()));
+            Ok(crate::messaging::SendOutcome::Delivered)
+        }
+
+        async fn send_with_severity(
+            &self,
+            text: &str,
+            severity: NotificationSeverity,
+        ) -> Result<crate::messaging::SendOutcome> {
+            self.franchissements
+                .lock()
+                .unwrap()
+                .push((text.to_string(), severity.as_str().to_string()));
+            Ok(crate::messaging::SendOutcome::Delivered)
+        }
+    }
+
+    /// **Test négatif (règle 13).** État interdit :
+    /// `send_notification_p0` → la frontière observe autre chose que `P0`.
+    ///
+    /// Deux façons d'y tomber, et les deux sont assertées séparément parce
+    /// qu'elles ont des causes distinctes : l'aide repasse par
+    /// `MessageSender::send` (le code d'avant ce changement, textuellement), ou
+    /// elle franchit la frontière étiquetée `P2` (une inversion de sévérité).
+    /// Les deux ramènent l'alarme « la boucle est morte » sur le chat que
+    /// l'opérateur mute pour couper le bruit des accusés de réception — le
+    /// diagnostic #4 de *Loop Trustworthiness*, l'alarme dans le vide.
+    ///
+    /// Ce que ce test **n'**assertionne **pas**, délibérément : que l'envoi
+    /// réussisse. Le pré-correctif rendait déjà `Delivered`.
+    #[tokio::test]
+    async fn mika1381_un_p0_de_handler_natteint_jamais_la_surface_mutable() {
+        let temoin = Arc::new(SeverityRecordingSender::default());
+        let sender: Arc<dyn MessageSender> = temoin.clone();
+
+        // La forme verbatim du site `verdict_handler.rs` ~:1868 — `VERDICT:
+        // block[security]`, classe P0 nommée par mika#1381.
+        send_notification_p0(
+            &sender,
+            "PR #2813 on senara-solutions/mika — VERDICT: block[security] from @mika-qa. \
+             NO auto-dispatch. Manual intervention required.",
+        )
+        .await;
+
+        let observe = temoin.observe();
+        assert_eq!(
+            observe.len(),
+            1,
+            "le P0 doit franchir la frontière exactement une fois"
+        );
+        let (_, severite) = &observe[0];
+
+        assert_ne!(
+            severite, SEVERITE_ABSENTE,
+            "état interdit : le P0 est passé par MessageSender::send, l'entrée sans axe de \
+             sévérité que GatewayMessageSender résout vers le chat normal — l'alarme est \
+             redevenue mutable (c'est le code d'avant mika#1381)"
+        );
+        assert_ne!(
+            severite,
+            NotificationSeverity::P2.as_str(),
+            "état interdit : le P0 a franchi la frontière étiqueté P2 — il se route vers le \
+             chat normal, et couper le bruit des accusés de réception recoupe l'alarme"
+        );
+    }
+
+    /// **Test négatif (règle 13), moitié symétrique.** État interdit :
+    /// `send_notification` → la frontière observe `P0`.
+    ///
+    /// Cette direction n'a pas de précédent pré-correctif, mais c'est la panne
+    /// sans laquelle la séparation en deux paliers ne vaut rien : une surface
+    /// « jamais mutée » qui reçoit les dix-sept classes est une surface qui
+    /// finira mutée — et les deux paliers se taisent alors ensemble. Les dix
+    /// sites P2 textuellement inchangés (AC8) sont la discipline ; ceci est
+    /// l'assertion qui la tient quand quelqu'un « harmonisera » les deux aides.
+    #[tokio::test]
+    async fn mika1381_un_p2_de_handler_nescalade_jamais() {
+        let temoin = Arc::new(SeverityRecordingSender::default());
+        let sender: Arc<dyn MessageSender> = temoin.clone();
+
+        // La forme d'un des dix sites P2 — un accusé de réception où la machine
+        // a fait son travail.
+        send_notification(
+            &sender,
+            "PR #2813 on senara-solutions/mika — VERDICT: pass from @mika-qa. Merging.",
+        )
+        .await;
+
+        let observe = temoin.observe();
+        assert_eq!(
+            observe.len(),
+            1,
+            "le P2 doit franchir la frontière exactement une fois"
+        );
+        let (_, severite) = &observe[0];
+
+        assert_ne!(
+            severite,
+            NotificationSeverity::P0.as_str(),
+            "état interdit : un accusé de réception routine a franchi la frontière étiqueté \
+             P0 — il atterrit sur la surface jamais mutée, qui finira mutée, et les deux \
+             paliers se taisent ensemble"
+        );
     }
 }

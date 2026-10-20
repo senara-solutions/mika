@@ -8956,6 +8956,78 @@ Optional (signal d'adoption sur un travail non dispatché — mika#1745) :
 
   **Sondes et haltes, la doctrine complète, et le tableau des trois cas de vérification du ticket avec leur statut rectifié** : `docs/architecture/mika-dev-work-assignment.md`. Deux points à connaître avant d'y aller : **S2 (dimensionnement, 30 j) n'était pas disponible à l'implémenteur** — `~/.mika/data/mika.db` n'est pas lisible depuis le bac à sable de dispatch, donc le volume réel est **inconnu à la livraison** ; et si ce compte porte du trafic nominal, ce n'est pas le prédicat qui est trop large, **c'est le résultat que le ticket cherchait** (noter le compte, désarmer la notification pour garder la mesure sans le bruit).
 
+### Le P0 passe par un second chat, et un chat d'escalade absent le dit (mika#1381)
+
+Optional (routage par sévérité des notifications opérateur — mika#1381, vol 1) :
+- `operator_escalation_chat_id` (`config.toml`) / `MIKA_OPERATOR_ESCALATION_CHAT_ID` — le chat Telegram dédié aux notifications **P0**, « la boucle est morte, un humain doit intervenir ». **Défaut : absent**, c'est-à-dire un déploiement à canal unique. `Option<i64>` et non `u64` : un identifiant de groupe Telegram est **négatif**.
+
+**Un second canal plutôt qu'un drapeau, et c'est tout l'arbitrage.** Le défaut que ce
+travail ferme est un **mute** : le chat qui porte dix-sept accusés de réception de
+routine par jour finit mis en sourdine, et l'alarme de panne part avec. Un bit
+« contourne la sourdine » n'est pas exprimable côté Telegram ; un chat
+structurellement distinct l'est, et l'opérateur **garde** sa sourdine. Deux paliers
+seulement — `P0` et `P2` — parce qu'un `P1` sans destination propre ne serait qu'un
+troisième nom du chat normal.
+
+**La surface P0 reste à bas volume par construction**, et ce n'est pas une
+préférence : une surface « jamais mise en sourdine » qui reçoit dix-sept classes de
+message est une surface qui sera mise en sourdine. Vol 1 y route **7 sites** sur 17 —
+les cinq disjoncteurs et limites de reprise de `verdict_handler.rs`, l'épuisement des
+tentatives de correction CI de `ci_failure_handler.rs`, et le site phare
+`agent_loop/mod.rs` (le label `ready` retiré sans que le dispatch aboutisse : aucun
+webhook ultérieur ne le dira). Les 10 sites P2 sont **textuellement inchangés**.
+
+**Absent n'est pas une erreur, et ne perd rien.** Un `P0` sans chat d'escalade
+**retombe sur le chat normal** et l'écrit sous un nom :
+
+```
+grep operator_escalation_chat_unset "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_name, request_id, severity, fallback_chat_id}'
+```
+
+Retomber plutôt que jeter est la décision D4 : sur ce chemin il n'y a **pas** de
+sink hors-ligne (contrairement à `milestone_manager`), donc un `P0` refusé serait un
+`P0` perdu — exactement l'« alarme dans le vide » du diagnostic #4. Un silence
+retombé sans le dire serait le même défaut sous un autre nom ; d'où le WARN, sur
+**chaque** occurrence.
+
+**`0` est refusé comme route.** `chat_id == 0` est le sentinelle documenté « aucun
+canal de réponse » sur lequel `GatewayMessageSender::send` court-circuite avant tout
+POST (mika#650/#1090). Un chat d'escalade réglé à `0` avalerait donc **chaque** P0 en
+silence : la valeur vaut « pas de chat d'escalade », jamais « route vers 0 », et le
+WARN ci-dessus part. Corollaire utile dans l'autre sens : un `P0` dont le chat normal
+vaut `0` (session webhook GitHub) **part quand même** si un chat d'escalade est armé —
+le routage précède le court-circuit, et c'est précisément le cas que le diagnostic #4
+décrivait.
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `operator_escalation_chat_unset` | **vide** une fois la variable posée | si non vide, la valeur n'a pas été lue par le processus qui sert l'agent |
+| `operator_escalation_chat_unset`, variable **non** posée | non vide, à chaque P0 | nominal sur un déploiement à canal unique — le signal n'est pas perdu, il est sur le chat normal |
+| `send_message_nochannel`, `severity = "p0"` | **vide** | un P0 arrivé sur `chat_id = 0` : aucun canal, ni normal ni d'escalade. L'alarme est perdue — c'est le seul cas qui l'est |
+
+**Sonde post-déploiement (R7/AC6) — la livraison effective n'est pas prouvée par le
+code.** Le vérifier demande un P0 réel sur l'installation réelle :
+
+1. Poser `MIKA_OPERATOR_ESCALATION_CHAT_ID=<id>` et `make deploy` (la valeur est lue
+   par **mika-spirit** via la cascade `MIKA_`, donc un redémarrage est requis).
+2. `grep operator_escalation_chat_id "$MIKA_SPIRIT_LOG_FILE"` ou le `Debug` de
+   `Settings` — l'identifiant y figure **en clair**, c'est une destination de routage
+   et non un secret : le masquer cacherait la seule valeur qu'un opérateur qui
+   débogue « mon P0 n'est parti nulle part » a besoin de lire.
+3. Mettre le chat normal en sourdine, provoquer un P0 (le plus court : retirer le
+   label `ready` d'un ticket dont le dispatch échoue), et constater la notification
+   sur le chat d'escalade.
+
+**Haltes.** *(a)* L'étape 3 arrive sur le chat normal → la valeur n'est pas en force :
+lire l'étape 2 avant de toucher au code. *(b)* `operator_escalation_chat_unset` part
+alors que la variable est posée → le rail qui a émis n'est pas armé ; les deux seuls
+sites armés sont `server/handlers.rs` (rail conversationnel) et `server/mod.rs`
+(rail du moteur de tâches) — `flush_failed_sends` ne l'est **délibérément pas**, il
+rejoue des envois dont la destination est déjà figée. *(c)* Rien n'arrive nulle part
+et `send_message_nochannel` porte `severity = "p0"` → l'agent n'a aucun canal du
+tout ; la variable n'y changera rien, c'est `chat_id` qu'il faut configurer.
+
 ### Lire un hang LLM « 420 s sans octet » (mika#2331)
 
 - **Ce que la mesure a déplacé, deux fois.** Le ticket demandait un retry 1× sur échec transport, d'abord dans `_arch_ask`, puis « au client LLM moteur ». La lecture du code le déplace une troisième fois : **ce retry existe déjà** sur le rail qui porte 100 % des hangs listés (glm-5.3/OpenRouter, glm-5.3/Z.AI, kimi/OpenRouter passent tous par `OpenAiCompatibleProvider`). `LlmError::Transport` y est retryable **sans condition** depuis mika#2015, et `LlmTimeoutBudget::max_attempts` borne la chaîne à **2** pour la géométrie de flotte 120/300. Le correctif principal demandé ne peut donc pas être la cause du groom perdu. **Et 420 s n'est un multiple d'aucun budget du code** : 120/300 donne ≈240 s, 240/900 ≈721 s, 120/900 ≈483 s. Le nombre n'est expliqué par aucune guillotine connue — ce qui invalide symétriquement les deux remèdes proposés tant qu'on ne sait pas si la chaîne a tourné une ou quatre fois.

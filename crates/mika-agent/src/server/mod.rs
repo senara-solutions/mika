@@ -664,7 +664,10 @@ async fn init_agent(
         Some(agent_name.to_string()),
         None,
         agent_settings.customer_id.clone(),
-    );
+    )
+    // The task-engine rail carries the dispatch-stall P0 (`agent_loop`), so it
+    // must know the escalation chat too (mika#1381).
+    .with_escalation_chat_id(agent_settings.operator_escalation_chat_id);
     let engine_sender: Arc<dyn MessageSender> = Arc::new(engine_sender);
 
     let skills_dirty = Arc::new(AtomicBool::new(false));
