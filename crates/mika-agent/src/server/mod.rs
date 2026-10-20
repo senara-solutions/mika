@@ -6945,8 +6945,8 @@ mod tests {
     /// n'aurait aucune chance de correspondre.
     const MIKA2854_COMMENT: &str = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2854#issuecomment-123\n\nlève operator-gated sur #2784, je valide le vol";
 
-    /// L'autre moitié de (h) — AC4 : un `issues` `closed` sans tâche suit la
-    /// même règle, sur le même ticket.
+    /// L'autre moitié de (h) — AC4, livrée au vol 2 : dans ce vol-ci elle est
+    /// hors population, URL comprise.
     const MIKA2854_ISSUE_CLOSED: &str = "[GitHub] Issue closed: senara-solutions/mika#2854 — t\nhttps://github.com/senara-solutions/mika/issues/2854";
 
     /// Le même état que [`mika2675_state`], dont la séquence de réponses est
@@ -7166,33 +7166,37 @@ mod tests {
         );
     }
 
-    /// AC4 — un `issues` `closed` sans tâche suit la même règle, et sa ligne
-    /// d'audit le dit sous SA clé.
+    /// Hors périmètre de ce vol — un `issues` `closed` garde son tour, même
+    /// armée, même sous un bouchon qui noterait tout.
     ///
-    /// Les deux moitiés de (h) partagent leur décideur ; ce qui les distingue
-    /// est la clé d'audit, qui doit rester distincte pour qu'un `GROUP BY` du
-    /// vol 2 puisse les séparer. Un préfixe partagé rendrait le chiffrage
-    /// aveugle à laquelle des deux porte l'économie.
+    /// La moitié fermeture de (h) (AC4) est au vol 2 : `upstream_close_handler`
+    /// tourne avant la porte et termine les lignes de suivi du ticket fermé,
+    /// donc la garde AC7 y lirait un état déjà nettoyé. Ce test épingle que le
+    /// vol 1 ne la livre pas en douce : aucun appel de triage ne précède le
+    /// tour, aucune note, et la relâche reste `not_classified`.
     #[tokio::test]
     #[serial_test::serial]
-    async fn mika2854_ac4_un_issue_closed_suit_la_meme_regle() {
+    async fn mika2854_un_issue_closed_garde_son_tour_dans_ce_vol() {
         mika2680_warm_callsites().await;
         let _env = Mika2854EnvGuard::set("1");
+        let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
         mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
 
-        assert_eq!(mock.calls_made(), 1, "le triage seul est payé");
+        assert!(mock.calls_made() >= 1, "le tour complet a lieu");
+        assert!(mika2854_skipped_rows(&state).await.is_empty());
 
-        let ecartees = mika2854_skipped_rows(&state).await;
-        assert_eq!(ecartees.len(), 1);
-        assert_eq!(
-            ecartees[0].after_value.as_deref(),
-            Some(webhook_prefilter::PrefilterClass::CommentTriagedNote.as_str())
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "aucune note : la moitié fermeture n'est pas triée dans ce vol"
         );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
         assert_eq!(
-            ecartees[0].target_key,
-            format!("issue_closed:{MIKA2854_ISSUE_URL}"),
-            "AC4 — la même règle, sous sa propre clé"
+            charged[0].fields.get("release").map(String::as_str),
+            Some("not_classified")
         );
     }
 

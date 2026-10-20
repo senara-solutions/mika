@@ -369,28 +369,26 @@ pub(crate) struct ReviewVerdictFacts {
     pub(crate) unreadable: bool,
 }
 
-/// Laquelle des deux moitiés de la classe (h) a ouvert le tour (mika#2854).
+/// Laquelle des moitiés de la classe (h) a ouvert le tour (mika#2854).
 ///
-/// Les deux suivent la même règle (AC4) et portent la même classe de filtre :
-/// ce terme n'existe donc pas pour brancher, mais pour **séparer les deux
-/// populations dans l'audit**. « 60 % d'escalade sur (h) » n'est pas une
-/// mesure si les commentaires et les fermetures y sont additionnés — deux
-/// populations sous un seul nom ne se soustraient pas (mika#2205).
+/// Ce terme n'existe pas pour brancher, mais pour **séparer les populations
+/// dans l'audit** : « 60 % d'escalade sur (h) » n'est pas une mesure si les
+/// commentaires et les fermetures y sont additionnés — deux populations sous
+/// un seul nom ne se soustraient pas (mika#2205). Ce vol n'en livre qu'une ;
+/// la moitié `issues` `closed` (AC4) arrive au vol 2, avec une lecture de
+/// l'état d'AVANT `upstream_close_handler` (voir [`classify`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TriageHalf {
     /// `issue_comment` : du texte humain neuf, la moitié chiffrée par mika#2680.
     Comment,
-    /// `issues` `closed` : la fermeture d'un ticket que la boucle ne suit pas.
-    IssueClosed,
 }
 
 impl TriageHalf {
     /// Le préfixe de la cible d'audit. Pas un `as_str` de classe : c'est la
-    /// clé de regroupement qui sépare les deux moitiés.
+    /// clé de regroupement qui sépare les moitiés.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Comment => "issue_comment",
-            Self::IssueClosed => "issue_closed",
         }
     }
 }
@@ -507,10 +505,10 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
             .map(|pr_url| Candidate::PrClosedNoTask { pr_url });
     }
     // (d) reste AVANT (h), et les deux populations sont disjointes **par
-    // construction**, non par cet ordre : (h) n'accepte que les deux termes
-    // `IssueComment` et `IssueClosed`, et `trigger_class` teste
-    // `ISSUE_LABELED_EVENT_PREFIX` avant `ISSUE_EVENT_PREFIX`, donc un
-    // `Issue labeled ` ne peut jamais rendre l'un d'eux. La disjonction est
+    // construction**, non par cet ordre : (h) n'accepte que le terme
+    // `IssueComment`, et `trigger_class` teste `ISSUE_LABELED_EVENT_PREFIX`
+    // avant `ISSUE_EVENT_PREFIX`, donc un `Issue labeled ` ne peut jamais le
+    // rendre. La disjonction est
     // épinglée par `mika2854_h_ne_touche_pas_la_population_de_d` plutôt que
     // laissée à la lecture : ce qu'un `_ =>` protège se perd en silence le jour
     // où quelqu'un y ajoute un bras.
@@ -536,9 +534,14 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
     // PR (`/pull/N#issuecomment-…`) il prendrait la première URL d'issue
     // citée dans le CORPS — un autre ticket, lu comme sans tâche, et un
     // commentaire de PR qui entre dans (h) alors que § D4 l'en exclut.
+    //
+    // **La moitié `issues` `closed` n'est pas dans ce vol** (§ Périmètre du
+    // plan, AC4 au vol 2), et elle ne peut pas y entrer telle quelle :
+    // `upstream_close_handler` tourne AVANT la porte et termine les lignes de
+    // suivi du ticket fermé, donc `issue_has_active_task` y lirait un état
+    // déjà nettoyé — AC7 serait aveugle précisément sur un ticket en vol.
     let half = match trigger_class(text) {
         TriggerClass::IssueComment => TriageHalf::Comment,
-        TriggerClass::IssueClosed => TriageHalf::IssueClosed,
         _ => return None,
     };
     let subject_line = text.lines().nth(1)?;
@@ -2639,7 +2642,6 @@ pub(crate) mod tests {
             (INERT, "inert_label"),
             (PR_CLOSED, "pr_closed_no_task"),
             (COMMENT_2854, "human_text_no_task"),
-            (ISSUE_CLOSED_2854, "human_text_no_task"),
         ] {
             assert_eq!(classify(texte).unwrap().as_str(), nom, "{texte:?}");
         }
@@ -2659,12 +2661,14 @@ pub(crate) mod tests {
         // sans ligne d'URL, aucune clé à donner à
         // `has_active_self_dev_task_for_issue`, donc aucun moyen de savoir si
         // le ticket porte une tâche de boucle — et AC7 interdit de deviner. Ce
-        // sont les mêmes gabarits que `COMMENT_2854` et `ISSUE_CLOSED_2854`
-        // ci-dessus, à la ligne d'URL près : la paire est le contrôle négatif
-        // de la classe.
+        // sont les mêmes gabarits que `COMMENT_2854` ci-dessus, à la ligne
+        // d'URL près : la paire est le contrôle négatif de la classe. Et
+        // `ISSUE_CLOSED_2854`, URL comprise, reste hors population tant que
+        // sa moitié n'est pas livrée (vol 2) — voir [`classify`].
         for texte in [
             "[GitHub] New comment on senara-solutions/mika#2654 (t) by @samidarko",
             "[GitHub] Issue closed: senara-solutions/mika#2294 — t",
+            ISSUE_CLOSED_2854,
             PR_CLOSED_SANS_URL,
         ] {
             assert!(classify(texte).is_none(), "{texte:?}");
@@ -3086,10 +3090,10 @@ pub(crate) mod tests {
 
     /// La moitié `issue_comment`, fragment compris, portant un ORDRE.
     const COMMENT_2854: &str = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2854#issuecomment-123\n\nlève operator-gated sur #2784, je valide le vol";
-    /// La moitié `issues` `closed`, même ticket, sans fragment (le gateway n'en
-    /// met pas sur une fermeture).
+    /// La moitié `issues` `closed`, même ticket : hors population dans ce vol
+    /// (AC4 au vol 2), URL comprise.
     const ISSUE_CLOSED_2854: &str = "[GitHub] Issue closed: senara-solutions/mika#2854 — t\nhttps://github.com/senara-solutions/mika/issues/2854";
-    /// La clé d'état que les deux moitiés doivent rendre, fragment retiré.
+    /// La clé d'état que la moitié commentaire doit rendre, fragment retiré.
     const ISSUE_URL_2854: &str = "https://github.com/senara-solutions/mika/issues/2854";
 
     /// Restaure `MIKA_WEBHOOK_COMMENT_TRIAGE` à sa valeur d'entrée.
@@ -3159,21 +3163,13 @@ pub(crate) mod tests {
     /// **tout** commentaire passerait pour « sans tâche de boucle » et (h)
     /// écarterait des tickets en vol. C'est l'inverse exact d'AC7.
     #[test]
-    fn mika2854_h_classify_rend_les_deux_moities_sans_le_fragment() {
+    fn mika2854_h_classify_rend_la_moitie_commentaire_sans_le_fragment() {
         assert_eq!(
             classify(COMMENT_2854),
             Some(Candidate::HumanTextNoTask {
                 issue_url: ISSUE_URL_2854.into(),
                 half: TriageHalf::Comment,
                 text: COMMENT_2854.into(),
-            })
-        );
-        assert_eq!(
-            classify(ISSUE_CLOSED_2854),
-            Some(Candidate::HumanTextNoTask {
-                issue_url: ISSUE_URL_2854.into(),
-                half: TriageHalf::IssueClosed,
-                text: ISSUE_CLOSED_2854.into(),
             })
         );
     }
@@ -3242,7 +3238,7 @@ pub(crate) mod tests {
     #[serial_test::serial]
     async fn mika2854_h_une_tache_de_boucle_vivante_garde_le_tour_sans_triage() {
         let _garde = TriageEnvGuard::set(true);
-        for texte in [COMMENT_2854, ISSUE_CLOSED_2854] {
+        for texte in [COMMENT_2854] {
             assert_eq!(
                 decide(classify(texte).unwrap(), &triage_stub(Some(Ok(true)), None)).await,
                 Decision::Llm(Release::IssueTaskActive),
@@ -3284,24 +3280,6 @@ pub(crate) mod tests {
                 class: PrefilterClass::CommentTriagedNote,
                 target: format!("issue_comment:{ISSUE_URL_2854}"),
                 note: "accusé de réception".into(),
-            }
-        );
-
-        // La cible porte la moitié, pour que l'audit reste soustractible : deux
-        // populations sous un même nom ne se soustraient pas (mika#2205).
-        assert_eq!(
-            decide(
-                classify(ISSUE_CLOSED_2854).unwrap(),
-                &triage_stub(
-                    Some(Ok(false)),
-                    Some(Ok(TriageVerdict::Note("fermeture de suivi".into())))
-                )
-            )
-            .await,
-            Decision::SkipWithNote {
-                class: PrefilterClass::CommentTriagedNote,
-                target: format!("issue_closed:{ISSUE_URL_2854}"),
-                note: "fermeture de suivi".into(),
             }
         );
     }
@@ -3370,7 +3348,7 @@ pub(crate) mod tests {
         let _garde = TriageEnvGuard::set(false);
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
 
-        for texte in [COMMENT_2854, ISSUE_CLOSED_2854] {
+        for texte in [COMMENT_2854] {
             assert_eq!(
                 skip_turn(&db, &Stub::default(), texte, intacte(), "rid-now", true).await,
                 Gate::Charged(Release::TriageDisarmed),
