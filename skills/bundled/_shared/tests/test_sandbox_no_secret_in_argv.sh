@@ -225,26 +225,87 @@ assert_setenv_channel_closed() {
     assert_eq "$label" "" "$unexpected"
 }
 
-# Index (0-based) of the first occurrence of an exact argument, or -1.
-arg_index() {
-    local needle="$1" i=0 a
-    while IFS= read -r a; do
-        if [ "$a" = "$needle" ]; then echo "$i"; return 0; fi
-        i=$((i + 1))
-    done < <(captured_args)
-    echo "-1"
+# mika#2108 (vol 2): THE SECRET CHANNEL IS IDENTIFIED BY ITS DESTINATION, NEVER
+# BY THE `--ro-bind-data` LITERAL.
+#
+# `--ro-bind-data` was a sufficient discriminant for exactly as long as the
+# secret channel was its only user. mika#2108 gives the mechanism a second use —
+# a `README-SANDBOX` materialised at the two mount-skeleton locations that answer
+# falsely — and from that moment the literal names a MECHANISM, not a CHANNEL.
+# Six predicates of this suite read it; left as they were, three would be false
+# (an exact count of 2 against four occurrences) and three would be FORTUITOUS:
+# `--perms 0600 immediately precedes` and `comes after --tmpfs /run` would be
+# measured on whichever triple happens to come first in the argv, and the two
+# `== -1` absence checks would assert the absence of the mechanism instead of
+# the absence of the channel — a green that no longer means what it says.
+#
+# The discriminant already exists and is already named: `$_PILOT_SECRET_DIR_SANDBOX`.
+# It is read from dispatch-lib, not retyped here, so a move of that directory
+# moves the reader with it. This is the mika#2309 doctrine: the predicate belongs
+# on the site that carries the invariant, never on the value or the literal.
+#
+# Nothing below is relaxed by this. Each predicate keeps its ticket of origin
+# (mika#2039, mika#2572, mika#2716) and the property that ticket pinned; only the
+# READER changes. And because a filter is exactly the kind of gesture that turns
+# a test green by emptying it, Test 8 carries its POSITIVE CONTROL: the filter
+# must FIND the two secret channels in the nominal case, and distinguish them
+# from the raw count. Without it, both `== -1` assertions would be green at
+# vacuum the day the accessor stopped recognising anything.
+secret_channel_indices() {
+    local -a a=()
+    local x i
+    while IFS= read -r x; do a+=("$x"); done < <(captured_args)
+    for ((i = 0; i < ${#a[@]}; i++)); do
+        if [ "${a[$i]}" = "--ro-bind-data" ] && [ $((i + 2)) -lt ${#a[@]} ]; then
+            case "${a[$((i + 2))]}" in
+                "$_PILOT_SECRET_DIR_SANDBOX"/*) printf '%s\n' "$i" ;;
+            esac
+        fi
+    done
 }
 
-# Destinations of each `--ro-bind-data <fd> <dest>` triple. Counting raw
+# Index (0-based) of the FIRST secret channel's `--ro-bind-data`, or -1.
+#
+# It replaces a generic `arg_index <exact argument>` helper, which is DELETED
+# rather than left standing: it was used only on this literal, and a generic
+# first-exact-match reader sitting next to `--ro-bind-data` is an invitation to
+# re-measure the mechanism and call it the channel — the defect this accessor
+# exists to end. Reads the whole list rather than piping to `head -1`: an early-closed
+# pipe takes SIGPIPE and, under this suite's `pipefail`, 141 would become the
+# value of the substitution (scripts/verify-no-sigpipe-grep.sh, mika#2055).
+secret_channel_index() {
+    local -a idx=()
+    local i
+    while IFS= read -r i; do idx+=("$i"); done < <(secret_channel_indices)
+    if [ "${#idx[@]}" -eq 0 ]; then
+        printf '%s\n' "-1"
+    else
+        printf '%s\n' "${idx[0]}"
+    fi
+}
+
+# How many secret channels the argv carries. Replaces `grep -c -- '--ro-bind-data'`,
+# which since mika#2108 counts the mechanism's every user.
+secret_channel_count() {
+    local -a idx=()
+    local i
+    while IFS= read -r i; do idx+=("$i"); done < <(secret_channel_indices)
+    printf '%s\n' "${#idx[@]}"
+}
+
+# Destinations of each SECRET `--ro-bind-data <fd> <dest>` triple. Counting raw
 # occurrences of the secret directory would over-count: the entrypoint
-# prologue string legitimately names that directory too.
+# prologue string legitimately names that directory too. Same filter as
+# `secret_channel_indices` above, and for the same reason.
 secret_destinations() {
     local -a a=()
     local x i
     while IFS= read -r x; do a+=("$x"); done < <(captured_args)
     for ((i = 0; i < ${#a[@]}; i++)); do
         if [ "${a[$i]}" = "--ro-bind-data" ] && [ $((i + 2)) -lt ${#a[@]} ]; then
-            printf '%s\n' "${a[$((i + 2))]}"
+            case "${a[$((i + 2))]}" in
+                "$_PILOT_SECRET_DIR_SANDBOX"/*) printf '%s\n' "${a[$((i + 2))]}" ;;
+            esac
         fi
     done
 }
@@ -304,8 +365,8 @@ run_sandboxed /bin/true >/dev/null
 rc=1; captured_has_credential && rc=0
 assert_eq "2b: argv contains no credential-shaped value" "1" "$rc"
 
-rc=1; [ "$(arg_index '--ro-bind-data')" != "-1" ] && rc=0
-assert_true "2b: argv carries --ro-bind-data (secret channel present)" "$rc"
+rc=1; [ "$(secret_channel_index)" != "-1" ] && rc=0
+assert_true "2b: argv carries a secret file channel under \$_PILOT_SECRET_DIR_SANDBOX" "$rc"
 assert_setenv_channel_closed "2b: no unaudited name travels by --setenv"
 
 # The Phase 2b entrypoint is a multi-line `sh -c` script that also launches the
@@ -337,7 +398,7 @@ echo "Test: secret file is created 0600"
 echo "----------------------------------"
 
 run_sandboxed /bin/true >/dev/null
-bd_idx=$(arg_index '--ro-bind-data')
+bd_idx=$(secret_channel_index)
 perms_ok=1
 if [ "$bd_idx" != "-1" ] && [ "$bd_idx" -ge 2 ]; then
     mapfile -t ARGS < <(captured_args)
@@ -345,7 +406,7 @@ if [ "$bd_idx" != "-1" ] && [ "$bd_idx" -ge 2 ]; then
         perms_ok=0
     fi
 fi
-assert_true "--perms 0600 immediately precedes --ro-bind-data" "$perms_ok"
+assert_true "--perms 0600 immediately precedes the secret channel" "$perms_ok"
 
 # ============================================================================
 # Test 4: secret destination is bound AFTER --tmpfs /run
@@ -367,7 +428,7 @@ order_ok=1
 if [ "$run_tmpfs_idx" != "-1" ] && [ "$bd_idx" != "-1" ] && [ "$bd_idx" -gt "$run_tmpfs_idx" ]; then
     order_ok=0
 fi
-assert_true "--ro-bind-data comes after --tmpfs /run" "$order_ok"
+assert_true "the secret channel comes after --tmpfs /run" "$order_ok"
 
 # ============================================================================
 # Test 5: the xtrace channel carries no credential, and survives the call
@@ -454,8 +515,23 @@ export MIKA_TEST_SECOND_SECRET="$SECOND_TOKEN"
 
 run_sandboxed /bin/true >/dev/null
 
-bd_count=$(captured_args | grep -c -- '--ro-bind-data' || true)
-assert_eq "two --ro-bind-data arguments emitted" "2" "$bd_count"
+bd_count=$(secret_channel_count)
+assert_eq "two secret file channels emitted" "2" "$bd_count"
+
+# POSITIVE CONTROL of the mika#2108 destination filter, and it is not optional.
+# An accessor that stopped recognising anything would make the assertion above
+# fail loudly (`0` against `2`), but it would make the two `== -1` absence
+# assertions below — Test 9 and Test 10b — green FOR THE WRONG REASON: they
+# would be asserting that a broken reader finds nothing, not that no secret
+# channel exists. So the filter must be shown FINDING what it is meant to find,
+# and shown to be a sub-selection of the mechanism rather than a rename of it.
+# The second number is the whole point of the re-specification: before mika#2108
+# the two counts are equal (2 of 2), after it they diverge (2 of 4), and the
+# divergence is what distinguishes a repaired predicate from an extinguished one.
+bd_raw=$(captured_args | grep -c -- '--ro-bind-data' || true)
+positive_ok=1
+if [ "$bd_count" -eq 2 ] && [ "$bd_raw" -ge "$bd_count" ]; then positive_ok=0; fi
+assert_true "positive control: the filter finds both secret channels, and never more than the argv carries ($bd_count of $bd_raw --ro-bind-data) (mika#2108)" "$positive_ok"
 
 dest_count=$(secret_destinations | sort -u | wc -l | tr -d ' ')
 assert_eq "two distinct secret destinations emitted" "2" "$dest_count"
@@ -482,8 +558,8 @@ rc=0
 ( unset MIKA_TEST_SECRET; _run_pilot_sandboxed /bin/true ) >/dev/null 2>&1 || rc=$?
 assert_eq "unset token: invocation succeeds" "0" "$rc"
 
-bd_idx_unset=$(arg_index '--ro-bind-data')
-assert_eq "unset token: no --ro-bind-data emitted" "-1" "$bd_idx_unset"
+bd_idx_unset=$(secret_channel_index)
+assert_eq "unset token: no secret file channel emitted" "-1" "$bd_idx_unset"
 
 # ============================================================================
 # Test 10: non-secret passthrough is untouched
@@ -549,8 +625,8 @@ assert_eq "every --setenv GH_TOKEN carries an egress sentinel, never the parent 
 rc=1; grep -qzx -- "/run/mika-pilot-secrets/GH_TOKEN" "$CAPTURE" && rc=0
 assert_eq "no /run/mika-pilot-secrets/GH_TOKEN file channel is created" "1" "$rc"
 
-bd_idx_prod=$(arg_index '--ro-bind-data')
-assert_eq "empty allowlist emits no --ro-bind-data secret channel" "-1" "$bd_idx_prod"
+bd_idx_prod=$(secret_channel_index)
+assert_eq "empty allowlist emits no secret file channel" "-1" "$bd_idx_prod"
 
 _PILOT_SANDBOX_SECRET_ALLOWLIST=("${_SAVED_ALLOWLIST[@]}")
 
