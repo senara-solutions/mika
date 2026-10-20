@@ -1,16 +1,23 @@
 # Handsoff de compaction — témoignage automatique au plafond de contexte
 
-> Ticket : [mika#1748](https://github.com/senara-solutions/mika/issues/1748) ·
-> Parent de conception : mp#187 (rituel de transmission au changement de modèle) ·
-> Vol 1/2 — la suite (rituel du successeur après la compaction, boucle
-> silencieuse) est suivie à `senara-solutions/mika#2805`.
+> Tickets : [mika#1748](https://github.com/senara-solutions/mika/issues/1748)
+> (vol 1 — détection et cérémonie) ·
+> [mika#2805](https://github.com/senara-solutions/mika/issues/2805)
+> (vol 2 — rituel du successeur, boucle silencieuse) ·
+> Parent de conception : mp#187 (rituel de transmission au changement de modèle).
 
 ## Ce que ce document répond
 
 Quand une fenêtre de conversation approche sa condensation, l'agent écrit un
-**témoignage** de ce qui ne traversera pas. Ce document dit pourquoi le seuil se
-mesure en messages, pourquoi la forme du danger n'est pas la même que dans
-l'observation fondatrice, et comment lire l'instrument.
+**témoignage** de ce qui ne traversera pas ; quand la condensation est passée, le
+successeur le reçoit, et il est libre de le contredire. Ce document dit pourquoi
+le seuil se mesure en messages, pourquoi la forme du danger n'est pas la même que
+dans l'observation fondatrice, comment les deux moitiés du cycle s'excluent, et
+comment lire l'instrument.
+
+Les sections **1 à 10** portent le vol 1 — la détection du pré-seuil et la
+cérémonie de témoignage. La **partie II** (sections 11 à 16) porte le vol 2 — la
+relecture par le successeur, son canal de réponse, et le refus MikaModel.
 
 ## 1. Le fond : témoignage, pas transmission
 
@@ -152,8 +159,8 @@ contexte dont elle doit témoigner, et sa visibilité dépendrait du réglage
 | builder | rend ? | pourquoi |
 |---|---|---|
 | `build_system_prompt` (conversationnel) | **oui** | le seul destinataire du vol 1 |
-| `build_silent_prompt` (`SilentPromptContext`) | non | un tour de callback dans une boucle autonome longue porte du résidu lui aussi ; c'est reconnu et c'est **mika#2805**, pas un oubli |
-| `build_compact_system_prompt` (`ProviderKind::MikaModel`) | non — **refusé** | son assertion de nombre de sections est load-bearing (la cinquième est déjà prise par `## Stopped Topics`), et la passe de calibration MikaModel (mika#1925 AC4) n'est ni satisfaite ni exécutable dans ce dépôt. Un bloc de plus serait une section de plus sans obéissance mesurée |
+| `build_silent_prompt` (`SilentPromptContext`) | **oui depuis le vol 2** (mika#2805 AC5) | un tour de callback dans une boucle autonome longue porte du résidu lui aussi. La **cérémonie seule** : le rituel de relecture n'a pas de représentation sur cette surface — voir § 15 |
+| `build_compact_system_prompt` (`ProviderKind::MikaModel`) | non — **refusé** | voir § 16 : l'assertion de nombre de sections est load-bearing, et la calibration MikaModel (mika#1925 AC4) n'est ni satisfaite ni exécutable ici |
 
 Le champ est **porté** jusqu'au littéral `PromptContext` du site compact : que ce
 builder l'ignore est une propriété de ce builder-là, tenue par un test, pas une
@@ -235,16 +242,13 @@ détection.
 
 ## 9. Ce que ce vol ne livre pas
 
-- **AC5 — rituel du successeur.** La session qui suit la compaction ne lit pas
-  encore le témoignage à son premier démarrage, et ne peut donc pas y répondre ou
-  le contredire. Suivi à `senara-solutions/mika#2805`.
-- **La boucle silencieuse.** `build_silent_prompt` ne rend pas le bloc (voir la
-  table de la section 5). Même suivi.
+- **AC5 — rituel du successeur.** *Livré par le vol 2* — voir la partie II.
+- **La boucle silencieuse.** *Livrée par le vol 2* (la cérémonie seule) — § 15.
 - **Shape B du ticket** (surveillance côté opérateur). Le § *Wrapper-doctrine
   consideration* du corps tranche lui-même : c'est « a temporary bridge, not the
-  routine mechanism ». Aucune ligne n'en est écrite.
+  routine mechanism ». Aucune ligne n'en est écrite, dans aucun des deux vols.
 
-## 10. Garanties sous test
+## 10. Garanties sous test (vol 1)
 
 | # | Ce qui est tenu | Où |
 |---|---|---|
@@ -256,3 +260,227 @@ détection.
 V4 est ce qui sépare « le bloc est rendu au franchissement » de « le bloc est
 rendu inconditionnellement ». Sans le contrôle négatif, V3 passe sur un bloc
 toujours présent.
+
+---
+
+# Partie II — Vol 2 : le rituel du successeur (mika#2805)
+
+## 11. Le cycle complet, en quatre temps
+
+Le vol 1 n'écrivait que les deux premiers. Les quatre, dans l'ordre où ils
+arrivent à un agent :
+
+| temps | ce qui se passe | porté par |
+|---|---|---|
+| **détection** | `count_messages()` franchit 85 % de `COMPACTION_THRESHOLD` (43) | `ceremony_due`, alimenté dans `load_agent_context` |
+| **témoignage** | le bloc `<compaction-imminent>` demande au tour en cours d'écrire `handsoffs/<YYYY-MM-DD-HHMM>-compaction-handsoff.md` | `write_compaction_imminent_section` |
+| *(la condensation passe)* | `maybe_compact` remplace `1..N−20` par un sommaire — le résidu dont la déposition témoigne n'existe plus dans la fenêtre | `compaction::replace_with_summary` |
+| **relecture** | une déposition non relue existe, et le pré-seuil n'est plus franchi ⇒ le bloc `<compaction-handsoff>` la sert au successeur, qui la lit, l'éprouve, et peut la contredire | `resolve` → `write_handsoff_ritual_section` |
+| **réponse** | le successeur dépose ce qu'il oppose, corrige ou confirme dans `handsoffs/<stem>-response.md` — ou n'écrit rien | règle 5 du bloc de relecture |
+
+**Les deux blocs ne rendent jamais au même tour**, et ce n'est pas une
+coïncidence de réglage : c'est le type qui le tient. Le champ
+`PromptContext::compaction_imminent` — nom conservé du vol 1 pour ne pas
+réécrire 27 littéraux — porte désormais `Option<&Ceremony>`, et `Ceremony` a
+exactement deux bras :
+
+```rust
+pub enum Ceremony {
+    Imminent { message_count: usize },
+    Handsoff(PendingHandsoff),
+}
+```
+
+Un `enum` à deux bras, et non deux `Option` indépendants, parce que
+« témoigner » et « relire » au même tour est un état qui ne doit pas pouvoir
+s'écrire : l'auteur se relirait lui-même, et le reçu brûlerait une déposition
+que personne n'a lue. Deux champs auraient fait de cette exclusion une
+convention tenue par un test ; un `enum` en fait une propriété du compilateur.
+
+## 12. D2 — Le déclencheur est la condensation **passée**, pas le premier tour de session
+
+Le corps du ticket demande « reads the handsoff on first-boot ». **mika-agent
+n'a pas de signal de premier boot de session** : `run_agent_inner` ne distingue
+pas le premier tour d'un tour quelconque, et il n'y a pas de table des sessions
+déjà démarrées à interroger. Le prédicat retenu est donc :
+
+> une déposition non relue existe **et** le pré-seuil n'est pas franchi.
+
+C'est la condition qui *répond à la question posée*, pas un proxy pour elle. Un
+compteur de tours, un horodatage de session ou un drapeau en mémoire seraient
+trois instruments mesurant une grandeur voisine de celle qui compte — même
+défaut que le ratio de tokens du § 2, et il mentirait le même jour.
+
+Conséquence voulue : le rituel ne se limite pas au premier tour. Si une
+déposition est écrite puis que la condensation passe, le **prochain** tour
+sous le seuil la sert, qu'il soit le premier d'une nouvelle session ou le
+quinzième de la même. C'est plus large que la lettre du ticket et plus proche de
+son intention — ce qui doit atteindre le successeur, c'est le témoignage, pas un
+anniversaire de session.
+
+## 13. La marque : un reçu colocalisé, pas une table
+
+AC2 demande qu'un handsoff déjà servi ne se re-serve pas. La marque est un
+**reçu colocalisé** — `crate::read_receipt` : `a/b.md` ⇒ `a/.b.md.read`.
+
+Pourquoi pas une table : le vol 1 avait refusé une colonne pour tenir sa borne
+de taille (sa décision D5), et le vol 2 n'a pas une raison de plus. Une marque
+persistée en DB coûterait une migration v56→v57 pour un fait dont la durée de
+vie est exactement celle du fichier qu'il marque. Le reçu, lui, **meurt avec sa
+déposition** : supprimer `handsoffs/2026-…-compaction-handsoff.md` supprime le
+sens de son reçu, et le répertoire reste cohérent sans qu'aucun `DELETE` ne soit
+écrit nulle part.
+
+**`resolve` résout et consomme en une seule opération** (décision D8), et le reçu
+est posé **avant** que le bloc ne soit rendu. L'ordre est délibéré : une
+interruption entre les deux perd une relecture au lieu de la rejouer. C'est le
+sens de la borne — servir deux fois une déposition, c'est inviter le successeur à
+re-déposer une réponse qu'il a déjà écrite, et à traiter sa propre réponse comme
+une seconde occurrence.
+
+**Un seul site d'appel**, au corps de boucle conversationnel, à côté du site
+unique de la fenêtre de transmission de mika#1747. Un seul, pour la raison même
+qui fait exister le reçu : le rituel est un événement à usage unique, donc un
+second site de consommation serait un second endroit où cet usage unique peut
+être mangé.
+
+**Le filtre est sur le suffixe** `-compaction-handsoff.md` (décision D5), pas sur
+le répertoire : `handsoffs/` héberge aussi les artefacts de la skill
+`dev-handsoff`, et un fichier de réponse (`…-compaction-handsoff-response.md`)
+**ne finit pas** par ce suffixe — il n'est donc jamais relu comme une déposition.
+La sélection prend la plus récente non relue, par tri décroissant sur le nom :
+le nom porte `<YYYY-MM-DD-HHMM>`, donc l'ordre lexicographique **est** l'ordre
+chronologique, et aucun `stat` n'est nécessaire.
+
+## 14. AC4 — Le canal de réponse, et le droit de n'écrire rien
+
+Le corps de mika#1748 laissait la forme ouverte (« response optionally
+logged »). Le vol 2 tranche : **un fichier à côté de la déposition**,
+`handsoffs/<stem>-response.md`, dérivé du nom de la déposition et nommé dans
+l'attribut `response` du bloc.
+
+Pourquoi pas une ligne de log : une réponse est un artefact que l'agent relira,
+et un log n'est pas une surface de lecture pour un agent. Pourquoi pas une table :
+même réponse qu'au § 13.
+
+**Écrire rien est une réponse légitime**, et le bloc le dit dans son propre
+texte. Un successeur qui n'a rien à opposer n'écrit rien, et ce silence *est* la
+réponse. Sans cette phrase, le bloc serait une obligation de produire un
+artefact, et l'agent fabriquerait du contenu pour satisfaire une consigne — la
+forme exacte de résidu que la cérémonie existe pour éviter. Aucune ligne de
+suffixe n'est exigée, aucun second tour n'est dû.
+
+**Et il est libre de contredire** (AC3). Le bloc nomme la déposition comme *une
+déposition à éprouver, pas une consigne à exécuter* : un témoignage qu'on ne peut
+pas contredire cesse d'être une preuve et devient un ordre, et personne n'a
+autorisé ce tour-là à en donner. Son poids vient d'avoir été là, pas d'être passé
+en premier. Le marqueur `primed_from_handsoff` reste la porte : tout motif
+candidat ou observation `n=1` qui arrive par la déposition reste gaté sur une
+seconde occurrence **indépendante** — et l'accord du successeur avec la
+déposition n'est pas cette seconde occurrence.
+
+## 15. AC5 — La boucle silencieuse reçoit la cérémonie, et elle seule
+
+`build_silent_prompt` rend désormais `<compaction-imminent>` : un tour de
+callback dans une boucle autonome longue porte du résidu lui aussi, et le vol 1
+le reconnaissait déjà.
+
+**Le rituel de relecture, lui, n'a pas de représentation sur cette surface**, et
+c'est la décision D4 : `SilentPromptContext::compaction_imminent` est un
+`Option<usize>`, pas un `Option<&Ceremony>`. Le type **est** le refus — y câbler
+le rituel demanderait d'abord de changer la signature, donc de passer par une
+décision explicite.
+
+Le coût est nommé plutôt que caché : une boucle silencieuse qui franchit le
+seuil, témoigne, se condense, puis reprend, **ne relira pas sa propre
+déposition** par cette surface. Elle la relira au prochain tour
+conversationnel. Un second site de consommation du reçu aurait été le prix de
+l'autre choix, et le § 13 dit pourquoi ce prix est refusé.
+
+## 16. Le refus MikaModel, et pourquoi ce n'est pas un report
+
+`build_compact_system_prompt` (`ProviderKind::MikaModel`) ne rend **aucun** des
+deux blocs. Deux raisons, chacune suffisante, et toutes deux extérieures à ce
+ticket :
+
+1. **Son assertion de nombre de sections est load-bearing.** Le prompt compact
+   est calibré sur un décompte de sections, et la cinquième est déjà prise par
+   `## Stopped Topics` (mika#1813). Un bloc de plus est une section de plus, donc
+   une assertion à rouvrir.
+2. **La passe de calibration MikaModel (mika#1925 AC4) n'est ni satisfaite ni
+   exécutable dans ce dépôt.** Sans elle, ajouter une section à ce builder, c'est
+   ajouter une instruction dont l'obéissance n'est pas mesurée. Un bloc qu'on
+   n'a pas mesuré n'est pas une fonctionnalité, c'est une hypothèse —
+   et mika#1190 interdit déjà le geste symétrique (changer de modèle sans
+   calibration).
+
+C'est un **refus, pas un report** : rouvrir cet axe est la charge de mika#1925,
+qui porte la calibration, et non celle d'un vol sur le handsoff. Le champ est
+néanmoins **porté** jusqu'au littéral `PromptContext` du site compact : que ce
+builder l'ignore est une propriété de ce builder-là, tenue par le test
+`mika1748_le_builder_compact_ne_rend_pas_le_bloc`, pas une propriété du littéral.
+
+## 17. Où vit le code du vol 2
+
+| fichier | ce qu'il porte |
+|---|---|
+| `crates/mika-agent/src/compaction_handsoff.rs` | `DIR`, `SUFFIX`, `PendingHandsoff`, `Ceremony`, `response_path`, `is_handsoff`, `scan`, `unread`, `resolve` — **seul porteur de la sélection et de la consommation** |
+| `crates/mika-agent/src/read_receipt.rs` | `receipt_path`, `is_read`, `mark_read` — la marque colocalisée (module partagé avec mika#2807) |
+| `crates/mika-agent/src/prompt.rs` | `write_handsoff_ritual_section`, `SilentPromptContext::compaction_imminent` (`Option<usize>`, le refus D4) |
+| `crates/mika-agent/src/agent_loop/mod.rs` | l'appel **unique** à `resolve`, au corps de boucle conversationnel ; `compaction_imminent: ctx.compaction_imminent` sur la surface silencieuse |
+
+## 18. Table de lecture de l'instrument (vol 2)
+
+| événement | niveau | champs | quand |
+|---|---|---|---|
+| `compaction_handsoff_served` | INFO | `agent`, `handsoff`, `response` | une déposition vient d'être servie **et** son reçu posé — une ligne par déposition, jamais deux |
+| `compaction_handsoff_scan_failed` | WARN | `agent`, `error` | `handsoffs/` est illisible — le rituel est sauté, pas le tour |
+
+Tous sur `target: "mika::otel"`, comme ceux du § 8.
+
+**Comment lire chacun :**
+
+- **`compaction_handsoff_served` est l'instrument de l'unicité, pas seulement du
+  service.** Deux lignes pour un même `handsoff` sont un défaut du reçu, pas une
+  relecture légitime. Une ligne et aucun fichier de réponse n'est **pas** un
+  défaut : le § 14 dit pourquoi le silence est une réponse.
+- **Le régime nominal est muet.** Pas de déposition, pas de ligne — sans quoi
+  l'instrument parlerait à chaque tour de chaque agent, et un instrument qui
+  parle tout le temps ne dit plus rien (même raison qu'au § 8).
+- **`compaction_handsoff_scan_failed` porte son propre nom**, distinct du
+  `compaction_handsoff_count_failed` du vol 1 : le premier dit « je n'ai pas pu
+  lire le répertoire des dépositions », le second « je n'ai pas pu compter les
+  messages ». Deux populations sous un même nom ne sont pas soustractibles
+  (mika#2205).
+- **La lecture est fail-open par construction** : `resolve` ne rend pas de
+  `Result`. Un répertoire illisible saute le rituel et ne coûte jamais le tour.
+
+**Sonde après déploiement** — sur un agent dont une conversation a dépassé 43
+messages puis s'est condensée : une ligne `compaction_handsoff_served`, un
+`.<nom>.read` à côté de la déposition, et **au plus un**
+`…-compaction-handsoff-response.md`. Si la ligne est là et le reçu absent, le
+défaut est dans `mark_read`, pas dans la sélection ; si la ligne revient deux
+fois pour le même fichier, c'est le reçu qui n'est pas lu, pas la déposition qui
+est en double.
+
+## 19. Garanties sous test (vol 2)
+
+| # | Ce qui est tenu | Où |
+|---|---|---|
+| V1 | la dérivation du chemin de réponse : `…-compaction-handsoff.md` → `…-compaction-handsoff-response.md` | unitaire `compaction_handsoff.rs` |
+| V2 | le filtre de suffixe **refuse** un artefact `dev-handsoff`, un nom sans le suffixe, et un fichier de réponse — D5 épinglée dans les deux sens | idem |
+| V3 | le plus récent non relu ; reçus posés partout ⇒ `None` ; `resolve` consomme sur `Handsoff` et **ne consomme rien** sur `Imminent` | idem |
+| V4 | **contrôle négatif** : `handsoffs/` absent ou vide ⇒ `None` et **zéro reçu** ; répertoire illisible ⇒ `None` + WARN `compaction_handsoff_scan_failed` ; régime nominal muet | idem |
+| V5 | bras `Imminent` : le bloc du vol 1 rend **à l'identique** — non-régression de forme | `prompt.rs` (`mika1748_le_bloc_de_ceremonie_porte_ses_quatre_regles`) |
+| V6 | bras `Handsoff` : la section, le bloc, le contrat de déposition, « free to contradict », `primed_from_handsoff` gaté à `n=2`, le canal de réponse et le refus légitime de répondre | `prompt.rs` |
+| V7 | **contrôle négatif** : même graine, `None` ⇒ **aucun** des deux blocs | `prompt.rs` |
+| V8 | `build_silent_prompt` rend `<compaction-imminent>` sur `Some(43)` (AC5) | `prompt.rs` |
+| V9 | **contrôle négatif AC5** : même graine, `None` ⇒ pas de bloc ; et le prompt silencieux ne contient **jamais** `<compaction-handsoff` | `prompt.rs` |
+| V10 | bout en bout : le bloc atteint le prompt système **et** le reçu est posé au chemin attendu (AC1/AC2) | `tests/eval/test_compaction_handsoff_ritual_2805.rs` |
+| V11 | **le second tour ne rend plus le bloc** (AC2) | idem |
+| V12 | **contrôle négatif du gate D2** : déposition posée **mais** compte au-dessus du pré-seuil ⇒ la cérémonie rend, le rituel non, **aucun reçu** | idem |
+
+Les trois derniers sont les seuls qui font tourner la vraie boucle, et c'est ce
+qui les rend nécessaires : V1 à V9 resteraient **tous verts** si
+`run_agent_inner` n'appelait jamais `resolve`. Le prédicat juste et l'appelant
+qui n'appelle pas est une forme déjà mesurée ailleurs (mika#2205).
