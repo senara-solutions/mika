@@ -52,12 +52,15 @@ un opérateur peut recopier son fichier à la main d'un rang à l'autre.
 1. **Un serveur écrit dans `~/.config/mika/mcp-servers.json` est chargé pour
    TOUS les agents** — `init_agent` le lit pour chacun, mika de production
    inclus. Il n'y a pas de « le donner à un seul agent » par fichier.
-2. **`[tools].disabled` de l'`identity.toml` ne peut pas le refuser.** Les
-   définitions d'outils MCP sont ajoutées par un `extend_from_slice` **après**
-   `apply_agent_tool_visibility`, qui s'exécute à l'intérieur
-   d'`inject_skills_and_resolve_tools`. Le denylist per-agent ne les voit donc
-   jamais. Le même ordre fait que les outils MCP échappent aussi au gate
-   compact-provider.
+2. **Ni `[tools].disabled` ni `[tools].allowed` de l'`identity.toml` ne peuvent
+   le refuser.** Les définitions d'outils MCP sont ajoutées par un
+   `extend_from_slice` **après** `apply_agent_tool_visibility`, qui s'exécute à
+   l'intérieur d'`inject_skills_and_resolve_tools`. Le filtre per-agent ne les
+   voit donc jamais — et le basculement vers l'allowlist (mika#2748) ne change
+   rien à cette borne : l'allowlist gouverne les **builtins**, pas le tableau
+   assemblé. Un outil MCP atteint l'agent sans être nommé nulle part, exactement
+   comme un outil de skill (`gh_read`). Le même ordre fait que les outils MCP
+   échappent aussi au gate compact-provider.
 3. **Il n'existe aucun allowlist/denylist per-agent des serveurs ni des outils
    MCP.** Ce n'est pas un réglage oublié : c'est une capacité absente.
 
@@ -378,7 +381,7 @@ Réelles, mesurées, et non corrigées ici — chacune a son ticket de suivi :
 | Limite | Effet |
 |---|---|
 | Pas de scoping per-agent des serveurs | Un serveur est visible de tous les agents (§ 1) |
-| Outils MCP ajoutés après `apply_agent_tool_visibility` | `[tools].disabled` ne peut pas les refuser ; le gate compact-provider ne les voit pas non plus |
+| Outils MCP ajoutés après `apply_agent_tool_visibility` | Ni `[tools].disabled` ni `[tools].allowed` (mika#2748) ne peuvent les refuser — le filtre gouverne les builtins, pas le tableau assemblé ; le gate compact-provider ne les voit pas non plus |
 | `mika mcp add` n'expose pas `--env` | Toute variable nécessaire impose d'éditer le JSON à la main |
 | Pas d'arrêt gracieux côté serveur | `McpManager::shutdown()` n'est appelé que par `mika chat` ; mika-spirit s'en remet à `kill_on_drop` |
 | Pas de timeout sur `tools/list` | Seul le handshake est borné (30 s) ; un serveur qui accepte puis se tait sur la découverte bloque l'initialisation de l'agent |

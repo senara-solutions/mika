@@ -596,23 +596,46 @@ pub struct SessionIdentityConfig {
 
 /// Tool visibility config from the `[tools]` block in identity.toml.
 ///
-/// Used by well-known agents (mika-arch, etc.) to deny specific built-in tools
-/// at the LLM-presentation layer. Listed tool names are filtered out of the tool
-/// array sent to the model — the model never sees them, cannot call them, and
-/// cannot be prompt-injected into trying. Defense-in-depth for read-only agents.
+/// Used by well-known agents (mika-arch, etc.) to govern which built-in tools
+/// reach the LLM-presentation layer. Filtered-out tool names never appear in the
+/// tool array sent to the model — the model cannot call them and cannot be
+/// prompt-injected into trying. Defense-in-depth for read-only agents.
+///
+/// **Two shapes, both honoured at one site.** `disabled` is the denylist;
+/// `allowed` is the allowlist added by mika#2748. They compose as an
+/// intersection: a definition survives when the allowlist admits it (or there is
+/// no allowlist) *and* the denylist does not deny it. The denylist subtracts on
+/// top, which is what preserves the Webhook Fallthrough widening of mika#2517
+/// on an allowlist agent.
 ///
 /// Filter is applied in `agent::apply_agent_tool_visibility()` after the registry
 /// is materialized for the API call. The shared `Arc<ToolRegistry>` is unchanged.
 ///
-/// Future migration: when well-known agents move from denylist to allowlist for
-/// tools (mirroring the skill allowlist), add a sibling `allowlist` field here
-/// and update `apply_agent_tool_visibility` to handle both.
+/// **Hard bound — builtins only.** The filter runs *before* skill tools and MCP
+/// tools are appended, so neither list governs them: `gh_read` reaches mika-arch
+/// without being named in `allowed`, and writing it there would be an inert entry
+/// that *reads* as an authorisation. Same invariant as the already-documented
+/// "`[tools].disabled` cannot deny an MCP tool" caveat.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ToolsIdentityConfig {
     /// Tool names that must not appear in this agent's LLM tool array.
-    /// Empty = all registry tools visible (current default).
+    /// Empty = no name is denied (current default).
     #[serde(default)]
     pub disabled: Vec<String>,
+    /// Builtin tool names this agent is allowed to see. Three states, and the
+    /// `Option` is what carries the third:
+    ///
+    /// - `None` — no allowlist; every registry tool the denylist leaves standing
+    ///   is visible (the behaviour of every agent before mika#2748).
+    /// - `Some([])` — no builtin at all is visible.
+    /// - `Some([…])` — the explicit roster, and nothing else.
+    ///
+    /// With a bare `Vec`, `Some([])` and `None` would be the same bytes: an agent
+    /// asking for nothing would be served everything.
+    ///
+    /// Governs **builtins only** — see the hard bound on the type's doc-comment.
+    #[serde(default)]
+    pub allowed: Option<Vec<String>>,
 }
 
 /// Per-agent context-injection config from `[context]` section of `identity.toml`.
@@ -1084,6 +1107,16 @@ fn fail_closed_identity() -> Identity {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            // Deliberately `None`, not mika-arch's allowlist (mika#2748,
+            // Decision 4). This path serves **every** agent whose
+            // `identity.toml` is absent, unreadable or malformed — including
+            // `mika` herself on a mis-provisioned host, and including
+            // transiently (mika#2027). Writing an allowlist here would take
+            // tools away from an agent on a provisioning fault, i.e. at the
+            // worst possible moment. Tightening it to an allowlist is a
+            // fleet-wide decision with its own follow-up ticket; the denylist
+            // above already denies every mutational builtin.
+            allowed: None,
         },
         // Fail-closed must enforce inject=false so a malformed identity.toml
         // cannot re-enable summary injection (mika#1009 leak protection).

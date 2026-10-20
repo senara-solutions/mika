@@ -426,10 +426,13 @@ from the first of these that resolves: `MIKA_MCP_CONFIG`,
 then `./mcp-servers.json` (which emits a warning). The legacy per-agent
 `{agent_home}/mcp.json` is migrated once to that path and is no longer read.
 
-A server written there is loaded for **every** agent, and an agent's
-`[tools].disabled` denylist cannot refuse it — MCP tool definitions are appended
-after the per-agent visibility filter runs. Isolation is procedural today; see
-[mcp.md § 3](mcp.md).
+A server written there is loaded for **every** agent, and neither half of an
+agent's `[tools]` section can refuse it — not the `disabled` denylist, not the
+`allowed` allowlist added by mika#2748 — because MCP tool definitions are
+appended after the per-agent visibility filter runs. The allowlist governs the
+**builtins** that reach the filter, not the array finally served, so switching
+to it makes the builtin roster permanent without narrowing this gap by a byte.
+Isolation is procedural today; see [mcp.md § 3](mcp.md).
 
 The format is unchanged (Claude Desktop convention, written with `0600`
 permissions to protect secrets):
