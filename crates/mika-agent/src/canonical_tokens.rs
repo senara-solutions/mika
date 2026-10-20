@@ -2062,6 +2062,234 @@ mod tests {
         );
     }
 
+    // ───── mika#2850 — la porte de section reflection est registration-only ─────
+
+    /// Les sites de production qui lisent la porte de section `reflection`, et
+    /// ce que chacun y fait.
+    ///
+    /// **C'est un périmètre, pas une liste d'exemptions**, et la distinction
+    /// n'est pas rhétorique : le scan plus bas exige que chaque entrée soit
+    /// **trouvée** (anti-vacuité), donc en retirer une ne relâche rien — ça
+    /// rend le scan rouge. L'allowlist, elle, est
+    /// [`REFLECTION_GATE_READER_ALLOWED`], et elle est vide.
+    ///
+    /// Le recensement naît à **deux** entrées parce que la proposition attestée
+    /// est *« tous les lecteurs sont à l'enregistrement »*, pas *« il y a un
+    /// lecteur »*. Précédents de la même forme :
+    /// [`HEARTBEAT_GATE_REGISTRATION_SITES`] (mika#2847) et
+    /// `TESTIMONY_PREDICATE_READERS` (mika#2627).
+    const REFLECTION_GATE_REGISTRATION_SITES: &[&str] = &[
+        // Démarrage du démon, par agent : la boucle qui enregistre les
+        // récurrentes intégrées de chaque agent chargé.
+        "crates/mika-agent/src/server/mod.rs",
+        // Démarrage du TUI, agent courant : la même paire, pour le seul agent
+        // de la session.
+        "crates/mika-cli/src/commands/chat.rs",
+    ];
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est mesuré : les trois hits de l'aiguille
+    /// dans l'arbre sont la **définition**
+    /// (`task_engine/mod.rs:909`, écartée par le filtre `fn …(` de
+    /// [`reads_section_gate`]) et exactement les **deux** lecteurs recensés
+    /// ci-dessus. Aucun hit dans `dispatcher.rs`, donc aucun lecteur au tir. Il
+    /// n'y a donc rien à excepter, ni de case où déposer la prochaine
+    /// infraction (mika#2323).
+    ///
+    /// Quand le scan tire, **on route la lecture par un site d'enregistrement
+    /// existant**, on n'ajoute pas d'entrée (doctrine mika#2201) : un lecteur
+    /// au **tir** retournerait précisément la propriété que ce scan atteste, et
+    /// l'allowlister serait documenter sa propre perte.
+    const REFLECTION_GATE_READER_ALLOWED: &[&str] = &[];
+
+    /// **D2.** Aucun lecteur de la porte de section `reflection` hors du
+    /// recensement.
+    ///
+    /// Même proposition que `mika2847_la_porte_de_section_na_que_des_lecteurs_denregistrement`,
+    /// un label plus loin : rien ne rougissait si cette porte-ci cessait d'être
+    /// registration-only. Un lecteur au tir laisserait la ligne récurrente
+    /// **posée** en base — elle tire, le dispatch démarre, et la décision
+    /// d'abandon arrive après que les tours LLM ont été brûlés.
+    #[test]
+    fn mika2850_la_porte_de_section_reflection_na_que_des_lecteurs_denregistrement() {
+        // Composée à l'exécution pour que CE fichier ne se dénonce pas lui-même
+        // (mika#2496, même geste que les scans voisins).
+        let needle = format!("reflection_cron_for{}agent", "_");
+        let readers: Vec<String> = section_gate_reader_sites(&needle)
+            .into_iter()
+            .filter(|r| !REFLECTION_GATE_READER_ALLOWED.contains(&r.as_str()))
+            .collect();
+
+        // Anti-vacuité D'ABORD : un scan qui ne trouve personne se lit
+        // exactement comme un scan propre (mika#2103 / mika#2205).
+        for expected in REFLECTION_GATE_REGISTRATION_SITES {
+            assert!(
+                readers.iter().any(|r| r == expected),
+                "mika#2850 — la porte de section `reflection` n'est lue nulle part dans \
+                 {expected} : ce scan vise un nom mort, il ne vérifie rien. Lecteurs \
+                 trouvés : {readers:?}"
+            );
+        }
+
+        let strangers: Vec<&String> = readers
+            .iter()
+            .filter(|r| !REFLECTION_GATE_REGISTRATION_SITES.contains(&r.as_str()))
+            .collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2850 — la porte de section `reflection` a un lecteur hors des sites \
+             d'enregistrement : {strangers:?}\n\n\
+             RÉSOLUTION : router cette lecture par un site d'enregistrement existant. \
+             Ne PAS l'ajouter à REFLECTION_GATE_READER_ALLOWED (mika#2201) — un lecteur \
+             au tir retourne la propriété que ce scan atteste, et l'allowlister la \
+             documenterait au lieu de la tenir. Un lecteur d'enregistrement NOUVEAU et \
+             légitime (une troisième porte d'entrée du substrat) se déclare dans \
+             REFLECTION_GATE_REGISTRATION_SITES, avec sa raison, et doit satisfaire \
+             mika2850_chaque_lecteur_recense_annule_a_lenregistrement. Si la décision \
+             doit vraiment vivre au tir, c'est la propriété de mika#2456 vol 5 qui \
+             tombe : ça se remonte."
+        );
+    }
+
+    /// **D3.** Chaque lecteur recensé lit *auprès* de la paire
+    /// enregistrement/annulation — c'est ce qui fait du recensement une
+    /// attestation du geste et pas d'un répertoire.
+    #[test]
+    fn mika2850_chaque_lecteur_recense_annule_a_lenregistrement() {
+        let needle = format!("reflection_cron_for{}agent", "_");
+        // Guillemets compris : le prédicat corrèle ce littéral à la ligne de
+        // l'appel d'annulation. Composé à l'exécution, même raison que l'aiguille.
+        let label = format!("\"re{}\"", "flection");
+
+        let mut seen = 0usize;
+        for (rel, content) in production_sources() {
+            if !REFLECTION_GATE_REGISTRATION_SITES.contains(&rel.as_str()) {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                section_gate_reads_at_registration(&content, &needle, &label),
+                "mika#2850 — {rel} lit la porte de section `reflection` hors du geste \
+                 d'enregistrement : aucune fenêtre de 25 lignes décommentées autour de \
+                 la lecture ne porte à la fois `ensure_recurring_task` et une ligne \
+                 `cancel_recurring_task_by_label(\"reflection\"`. La porte n'est plus \
+                 registration-only.\n\n\
+                 RÉSOLUTION : ramener la lecture auprès de la paire \
+                 enregistrement/annulation — PAS élargir la fenêtre."
+            );
+        }
+
+        // Anti-vacuité du parcours lui-même : un recensement dont aucune entrée
+        // ne correspond à un fichier scanné rendrait cette boucle vide.
+        assert_eq!(
+            seen,
+            REFLECTION_GATE_REGISTRATION_SITES.len(),
+            "mika#2850 — {seen} site(s) recensé(s) retrouvé(s) sur {} : une entrée du \
+             recensement ne désigne plus un fichier de production scanné, et la boucle \
+             ci-dessus n'a mesuré qu'une partie du périmètre",
+            REFLECTION_GATE_REGISTRATION_SITES.len()
+        );
+    }
+
+    /// **D4 — le contrôle de bonne foi du *paramètre de label*, et il est dû.**
+    ///
+    /// L'axe de l'**adjacence** est déjà attesté par
+    /// `mika2847_le_predicat_dadjacence_voit_une_lecture_hors_enregistrement`,
+    /// et ce vol ne le recopie pas (mika#2653). L'axe du **label** est neuf :
+    /// il naît avec la paramétrisation, et c'est précisément celui qu'une
+    /// fenêtre contaminée par la porte voisine rend non portant. Deux axes
+    /// distincts, deux contrôles — pas un doublon.
+    ///
+    /// La négative n°1 est la **régression réelle de l'arbre** : supprimer la
+    /// branche `else` d'annulation de `reflection` alors que celle de
+    /// `heartbeat` est trois lignes plus haut. Un prédicat qui ignorerait son
+    /// argument — ou qui chercherait ses termes indépendamment — la rendrait
+    /// verte. Un paramètre qu'aucun test ne peut faire rougir n'est pas un
+    /// paramètre.
+    #[test]
+    fn mika2850_le_predicat_honore_son_parametre_de_label() {
+        let needle = format!("reflection_cron_for{}agent", "_");
+        let label = format!("\"re{}\"", "flection");
+        // La porte VOISINE, celle qui contamine la fenêtre. Composée elle aussi,
+        // pour que ce fichier ne se dénonce pas côté `heartbeat` non plus.
+        let neighbour = format!("\"heart{}\"", "beat");
+
+        // Négative n°1 — mauvais label. La branche `else` de `reflection` a
+        // disparu ; celle de `heartbeat` est juste au-dessus, et le littéral
+        // "reflection" est présent comme argument de label d'ensure_recurring_task.
+        // C'est la forme sur laquelle un prédicat non corrélé rendait `true`.
+        let wrong_label = [
+            format!(
+                "}} else if let Err(e) = db.cancel_recurring_task_by_label({neighbour}).await {{"
+            ),
+            "    warn!(error = %e, \"failed to cancel stale heartbeat task\");".to_string(),
+            "}".to_string(),
+            format!("if let Some(cron) = task_engine::{needle}(&home_dir, &db).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            format!("        &db, &home_dir, {label}, &cron, CONFIG,"),
+            "    ).await;".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            !section_gate_reads_at_registration(&wrong_label, &needle, &label),
+            "INVARIANT VIOLÉ : le prédicat se satisfait de l'annulation de la porte \
+             VOISINE. Son paramètre de label ne porte rien, et \
+             mika2850_chaque_lecteur_recense_annule_a_lenregistrement resterait vert \
+             sur un arbre où `reflection` n'annule plus rien — la régression la plus \
+             probable des deux sites, puisque les deux blocs y sont collés."
+        );
+
+        // Négative n°2 — aucune annulation du tout.
+        let no_cancel = [
+            format!("if let Some(cron) = task_engine::{needle}(&home_dir, &db).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            format!("        &db, &home_dir, {label}, &cron, CONFIG,"),
+            "    ).await;".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            !section_gate_reads_at_registration(&no_cancel, &needle, &label),
+            "INVARIANT VIOLÉ : le prédicat accepte une lecture dont la branche `else` \
+             n'annule rien — la ligne récurrente resterait armée après que la porte \
+             s'est fermée"
+        );
+
+        // Positive — la forme réelle des deux sites recensés. Sans ce volet, un
+        // prédicat trop serré rendrait D3 rouge sur un arbre conforme et le
+        // test ne le dirait pas.
+        let real_form = [
+            format!("if let Some(cron) = task_engine::{needle}(&home_dir, &db).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            format!("        &db, &home_dir, {label}, &cron, CONFIG,"),
+            "    ).await;".to_string(),
+            format!("}} else if let Err(e) = db.cancel_recurring_task_by_label({label}).await {{"),
+            "    warn!(error = %e, \"failed to cancel stale reflection task\");".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            section_gate_reads_at_registration(&real_form, &needle, &label),
+            "le prédicat refuse la forme réelle des deux sites recensés : il est trop \
+             serré, et mika2850_chaque_lecteur_recense_annule_a_lenregistrement \
+             rougirait sur un arbre conforme"
+        );
+    }
+
+    /// **D5** — le pendant auto-nettoyant de l'allowlist des lecteurs.
+    #[test]
+    fn mika2850_lallowlist_des_lecteurs_reflection_est_livree_vide() {
+        assert!(
+            REFLECTION_GATE_READER_ALLOWED.is_empty(),
+            "REFLECTION_GATE_READER_ALLOWED est livrée vide et doit le rester : quand \
+             le scan tire, on route la lecture par un site d'enregistrement. Une \
+             allowlist née vide est un emplacement où déposer la prochaine infraction \
+             (mika#2323)."
+        );
+    }
+
     // ─────────────── mika#2653 — la garde d'annulation sur pilote vif ───────────────
 
     /// **Livrée vide, et le test plus bas l'assert.**
