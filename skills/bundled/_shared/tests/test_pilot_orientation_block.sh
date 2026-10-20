@@ -17,7 +17,7 @@
 # après que le pilote a lu les `ls` littéraux — il console au lieu d'inoculer. La
 # fenêtre voulue est donc assertée comme un ORDRE, jamais déduite d'une présence.
 #
-# QUATRE PARTIES, et pourquoi il en faut quatre.
+# CINQ PARTIES. Les quatre premières tiennent le vol 1 ; PART E tient le vol 2.
 #   PART A  comportemental. `_pilot_orientation_rule` est une fonction, donc elle
 #           s'EXÉCUTE hors bwrap : « le bloc nomme la racine réelle » est une
 #           mesure et non une affirmation. La borne de 12 lignes est mesurée sur
@@ -32,7 +32,16 @@
 #           (mika#2548, dispatch), sinon dans un mktemp (CI, checkout propre).
 #   PART D  préconditions, mesurées sur la suite ELLE-MÊME. Ni bwrap, ni réseau,
 #           ni token : c'est ce qui la rend câblable sur un runner hébergé par
-#           construction, et ce qui distingue ce vol du vol 2.
+#           construction. PART E n'en ajoute aucune : elle lit le source et
+#           appelle une fonction, elle ne lance pas de bac à sable.
+#   PART E  le `README-SANDBOX` du squelette (vol 2). Structurel : l'injection
+#           est sur les DEUX blocs de `_run_pilot_sandboxed`, après le gitdir,
+#           par un compte EXACT de deux. Comportemental : globales absentes ou
+#           vides → tableau vide sans message ; `SUB_REPO_DIR` = `PLATFORM_DIR`
+#           → une seule destination. Anti-vacuité : la symétrie relancée sur une
+#           copie à un seul site, qui doit échouer. Le contrôle négatif réel —
+#           ce que le pilote VOIT dans le namespace — est dans
+#           test_sandbox_git_usable.sh, qui demande un vrai bac à sable.
 #
 # Run: bash skills/bundled/_shared/tests/test_pilot_orientation_block.sh
 # Expected: all assertions pass, exit 0.
@@ -283,6 +292,146 @@ assert_eq "C2: l'injection est toujours présente une fois, mais mal placée" \
 # ferait échouer C1 par accident, pour une cause qui n'est pas l'ordre.
 rc=1; bash -n "$REGRESSED" 2>/dev/null && rc=0
 assert_true "C3: la copie régressée est du bash valide (l'échec vient de l'ordre)" "$rc"
+
+# ============================================================================
+# PART E — le README du squelette : deux sites, symétriques, et muet hors chaîne
+# ============================================================================
+echo ""
+echo "PART E — le README-SANDBOX atterrit sur les DEUX blocs, et se tait hors chaîne"
+echo "------------------------------------------------------------------------------"
+
+# Le vol 2 (mika#2108) matérialise un `README-SANDBOX` aux deux emplacements du
+# squelette de montage qui répondent faux. L'argument doit être sur les DEUX
+# blocs de `_run_pilot_sandboxed` : posé sur un seul, le bac à sable dit la
+# vérité en Phase 2b et ment en Phase 2a — le repli, qui ne tourne qu'un jour de
+# panne, donc un défaut que l'usage ne montre jamais. Rien dans le langage ne
+# garde cette symétrie : ces assertions la tiennent.
+#
+# Les bornes des blocs sont des ancres UNIQUES, vérifiées par `line_of` comme
+# celles de B1 : l'ouverture du bloc 2b, le commentaire d'ouverture du bloc 2a,
+# et la ligne d'entrypoint qui clôt le 2a.
+A_2B_OPEN='if [ -n "$sandbox_entrypoint_prefix" ]; then'
+A_2A_OPEN='# Phase 2a fallback: fs cut only, network unrestricted.'
+A_2A_END='exec \"\$@\"" mika-pilot-sandbox "$@"'
+A_README='${_PILOT_README_BIND_ARGS[@]+"${_PILOT_README_BIND_ARGS[@]}"}'
+A_GITDIR='${_PILOT_GITDIR_BIND_ARGS[@]+"${_PILOT_GITDIR_BIND_ARGS[@]}"}'
+
+# Rend `ok`, ou `ko:<diagnostic>`, pour UN bloc borné par deux ancres. Deux
+# exigences, sur les seules lignes de code du bloc : l'injection y est présente
+# EXACTEMENT une fois, et elle vient APRÈS les binds du gitdir — `b[w]rap`
+# applique les montages dans l'ordre de l'argv, et un bind de répertoire posé
+# après recouvrirait le fichier matérialisé avant lui.
+readme_site_verdict() {
+    local file="$1" from_anchor="$2" to_anchor="$3" lf lt block n lr lg
+    lf=$(line_of "$file" "$from_anchor") || { printf 'ko:from-%s' "$lf"; return 0; }
+    lt=$(line_of "$file" "$to_anchor") || { printf 'ko:to-%s' "$lt"; return 0; }
+    if [ "$lf" -ge "$lt" ]; then
+        printf 'ko:bornes-inversees(%s>=%s)' "$lf" "$lt"; return 0
+    fi
+    block=$(sed -n "${lf},${lt}p" "$file" | grep -vE '^[[:space:]]*#' || true)
+    n=$(grep -cF -- "$A_README" <<<"$block" || true)
+    if [ "$n" -ne 1 ]; then
+        printf 'ko:injection-%s' "$n"; return 0
+    fi
+    lr=$(grep -nF -- "$A_README" <<<"$block" | cut -d: -f1)
+    lg=$(grep -nF -- "$A_GITDIR" <<<"$block" | head -1 | cut -d: -f1)
+    if [ -z "$lg" ] || [ "$lg" -ge "$lr" ]; then
+        printf 'ko:avant-gitdir(gitdir=%s readme=%s)' "${lg:-absent}" "$lr"; return 0
+    fi
+    printf 'ok'
+}
+
+readme_site_count() {
+    code_lines "$1" | grep -cF -- "$A_README" || true
+}
+
+assert_eq "E1: le bloc Phase 2b porte l'injection, une fois, après le gitdir" \
+    "ok" "$(readme_site_verdict "$DISPATCH_LIB" "$A_2B_OPEN" "$A_2A_OPEN")"
+assert_eq "E2: le bloc Phase 2a porte l'injection, une fois, après le gitdir" \
+    "ok" "$(readme_site_verdict "$DISPATCH_LIB" "$A_2A_OPEN" "$A_2A_END")"
+
+# E3 — compte EXACT, pour la raison de B2 : « au moins un » laisserait passer
+# l'asymétrie que E1/E2 visent, et un troisième site ajouté demain doit venir se
+# déclarer ici.
+assert_eq "E3: exactement deux sites d'injection dans le fichier" \
+    "2" "$(readme_site_count "$DISPATCH_LIB")"
+
+# E4/E5 — comportementaux : la fonction est APPELÉE, dans un sous-shell sous
+# `set -u` (hérité de la suite), et ce qui sort est lu sur le tableau qu'elle
+# peuple. Rien ne touche le disque hors du fichier de stderr : les destinations
+# sont fictives, et `--ro-bind-data` ne les crée pas ici, il les nomme.
+#
+# Sortie : `rc=<rc> bd=<n> dests=<d1;d2> vides=<n> stderr=<octets>`. Le marqueur
+# `__unset__` distingue une globale NON DÉFINIE d'une globale VIDE — les deux
+# chemins de silence que l'AC4 nomme.
+E_ERR="$SCRATCH/part-e-stderr"
+# shellcheck disable=SC2034  # globales lues par la fonction de dispatch-lib appelée
+readme_probe() {
+    (
+        unset PLATFORM_DIR SUB_REPO_DIR
+        [ "$1" = __unset__ ] || PLATFORM_DIR="$1"
+        [ "$2" = __unset__ ] || SUB_REPO_DIR="$2"
+        WORKTREE_DIR="$WT_A"
+        _pilot_sandbox_readme_args 2>"$E_ERR"
+        local rc=$? i bd=0 vides=0 dests=""
+        for ((i = 0; i < ${#_PILOT_README_BIND_ARGS[@]}; i++)); do
+            [ "${_PILOT_README_BIND_ARGS[$i]}" = "--ro-bind-data" ] || continue
+            bd=$((bd + 1))
+            local d="${_PILOT_README_BIND_ARGS[$((i + 2))]:-}"
+            case "$d" in ''|/README-SANDBOX) vides=$((vides + 1)) ;; esac
+            dests="${dests:+$dests;}$d"
+        done
+        printf 'rc=%s bd=%s dests=%s vides=%s stderr=%s' \
+            "$rc" "$bd" "$dests" "$vides" "$(wc -c <"$E_ERR" | tr -d ' ')"
+    )
+}
+
+# Contrôle positif d'abord : sans lui, les trois silences ci-dessous seraient
+# indiscernables d'une fonction qui n'émet jamais rien.
+assert_eq "E4 contrôle: globales définies et distinctes → deux destinations nommées" \
+    "rc=0 bd=2 dests=$HOST_A/README-SANDBOX;$CHK_A/README-SANDBOX vides=0 stderr=0" \
+    "$(readme_probe "$HOST_A" "$CHK_A")"
+
+assert_eq "E4a: globales non définies → tableau vide, rc 0, aucun message" \
+    "rc=0 bd=0 dests= vides=0 stderr=0" "$(readme_probe __unset__ __unset__)"
+assert_eq "E4b: PLATFORM_DIR vide → tableau vide, jamais une destination vide" \
+    "rc=0 bd=0 dests= vides=0 stderr=0" "$(readme_probe "" "$CHK_A")"
+assert_eq "E4c: SUB_REPO_DIR non définie → tableau vide, rc 0, aucun message" \
+    "rc=0 bd=0 dests= vides=0 stderr=0" "$(readme_probe "$HOST_A" __unset__)"
+
+# E5 — dispatche sur le méta-dépôt : `SUB_REPO_DIR` EST `PLATFORM_DIR`, et deux
+# arguments nommeraient la même destination.
+assert_eq "E5: SUB_REPO_DIR = PLATFORM_DIR → une seule destination" \
+    "rc=0 bd=1 dests=$HOST_A/README-SANDBOX vides=0 stderr=0" \
+    "$(readme_probe "$HOST_A" "$HOST_A")"
+
+# Anti-vacuité — même forme que PART C : E1-E3 relancées sur une copie où
+# l'injection n'est plus que sur UN site (retirée du bloc 2a), qui doit ÉCHOUER.
+# La copie vit dans le même `$SCRATCH` que celle de PART C (mika#2548).
+E_REGRESSED="$SCRATCH/dispatch-lib-readme-one-site.sh"
+E_2A_FROM=$(line_of "$DISPATCH_LIB" "$A_2A_OPEN")
+E_DROP=$(grep -nF -- "$A_README" "$DISPATCH_LIB" | cut -d: -f1 \
+    | awk -v from="$E_2A_FROM" '$1 > from { print; exit }')
+if [ -n "$E_DROP" ]; then
+    sed "${E_DROP}d" "$DISPATCH_LIB" > "$E_REGRESSED"
+else
+    cp "$DISPATCH_LIB" "$E_REGRESSED"
+fi
+
+rc=1; ! cmp -s "$DISPATCH_LIB" "$E_REGRESSED" && rc=0
+assert_true "E6.0: la copie à un seul site diffère de l'original (régression effective)" "$rc"
+
+rc=1; bash -n "$E_REGRESSED" 2>/dev/null && rc=0
+assert_true "E6.1: la copie à un seul site est du bash valide" "$rc"
+
+# Le site 2b est intact : la régression est CIBLÉE, et l'échec de E6.3 ne peut
+# pas venir d'une copie qui aurait tout perdu.
+assert_eq "E6.2: E1 reste vraie sur la copie (le site 2b est intact)" \
+    "ok" "$(readme_site_verdict "$E_REGRESSED" "$A_2B_OPEN" "$A_2A_OPEN")"
+assert_eq "E6.3: E2 ÉCHOUE sur la copie à un seul site" \
+    "ko:injection-0" "$(readme_site_verdict "$E_REGRESSED" "$A_2A_OPEN" "$A_2A_END")"
+assert_eq "E6.4: E3 ÉCHOUE sur la copie à un seul site (compte 1, pas 2)" \
+    "1" "$(readme_site_count "$E_REGRESSED")"
 
 # ============================================================================
 echo ""

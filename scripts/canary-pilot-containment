@@ -525,8 +525,19 @@ else
                 echo "  Hiding the whole command line is not the fix mika#2039 asked for."
             fi
 
-            _secret_binds=$(grep -c -- '--ro-bind-data' <<<"$_argv" || true)
-            echo "INFO: $_secret_binds secret file channel(s) declared (--ro-bind-data)."
+            # mika#2108: counted by DESTINATION, not by the `--ro-bind-data`
+            # literal. That literal stopped being a discriminant the day the
+            # mechanism got a second user — the `README-SANDBOX` marker bound at
+            # the mount-skeleton locations — and this line would then have
+            # announced four channels where two exist. It is instrumentation and
+            # not an assertion, which is precisely why it had to be fixed in the
+            # same flight: an instrument that lies never goes red to say so.
+            # The whole line, and a variable name: `$_argv` is one argument per
+            # line, so a destination is a line of its own. Anchoring both ends
+            # keeps the entrypoint prologue — which legitimately names the same
+            # directory inside a longer script argument — out of the count.
+            _secret_binds=$(grep -cE -- "^${_PILOT_SECRET_DIR_SANDBOX}/[A-Za-z_][A-Za-z0-9_]*\$" <<<"$_argv" || true)
+            echo "INFO: $_secret_binds secret file channel(s) declared under $_PILOT_SECRET_DIR_SANDBOX."
         fi
     fi
 
