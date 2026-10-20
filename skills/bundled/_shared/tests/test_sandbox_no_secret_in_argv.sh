@@ -106,6 +106,25 @@ export HOME="$TMPROOT/home"
 WORKTREE_DIR="$TMPROOT/worktree"
 mkdir -p "$HOME" "$WORKTREE_DIR"
 
+# mika#2108 — the SECOND user of the `--ro-bind-data` mechanism, present on
+# purpose.
+#
+# `_pilot_sandbox_readme_args` materialises a README-SANDBOX at the two sandbox
+# locations that answer falsely, and it reads these two globals. Without them it
+# takes its silence path and emits nothing — which would leave this suite
+# measuring a mechanism with a single user, exactly the world the destination
+# filter below was written to leave behind. Set here so the nominal argv carries
+# FOUR `--ro-bind-data` of which TWO are secret channels: that divergence is the
+# measure that tells a repaired predicate from an extinguished one, and Test 8's
+# positive control reads both numbers.
+#
+# The paths are FICTITIOUS and under this suite's own temp root — never the real
+# host workspace. A test that names the real `/data/workspace/...` would bind a
+# marker into a real directory's namespace shadow and read as though the suite
+# needed the host layout to exist.
+PLATFORM_DIR="$TMPROOT/zz-host"
+SUB_REPO_DIR="$TMPROOT/zz-host/mika"
+
 # mika#2049 — the default FLIPPED, and the meaning of `1` changed with it.
 #
 # Before: `1` → Phase 2a (fs cut only, network open), the suite's default shape.

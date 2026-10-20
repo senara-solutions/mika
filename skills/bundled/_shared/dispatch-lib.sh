@@ -2495,8 +2495,23 @@ _pilot_gitdir_bind_args() {
 # Le fd suit le motif du canal de secrets et pour ses raisons déjà écrites :
 # alloué par bash (`{var}<`, donc >= 10, structurellement hors du fd 9 de
 # `BASH_XTRACEFD`) et refermé par l'appelant APRÈS la capture de `_sandbox_rc`.
-# Le contenu n'étant pas un secret, la suppression de `xtrace` n'est PAS faite
-# ici — l'ajouter ferait croire à un secret là où il n'y en a pas.
+#
+# LE CONTENU ARRIVE PAR UN HERE-STRING, PAS PAR UNE SUBSTITUTION DE PROCESSUS,
+# et ce n'est pas une préférence de style. `dispatch_claude_pilot` tourne sous
+# `set -x` avec `BASH_XTRACEFD` sur `$TRACE_FILE`, et `xtrace` EXPAND les
+# substitutions de processus : `exec {fd}< <(printf '%s\n' …)` écrirait
+# `++ printf '%s\n' $'…'` — le texte entier, sur une ligne — dans un canal de
+# diagnostic que `_emit_callback` renvoie à l'appelant. `xtrace` ne trace en
+# revanche pas les redirections, donc le here-string rend `+ exec` et rien de
+# plus. Garde de forme en place depuis mika#2049/mika#2057 : Test 5 de
+# tests/test_sandbox_no_secret_in_argv.sh refuse TOUTE ligne `++ printf` dans la
+# trace, sans exception — et c'est elle qui a attrapé la substitution de
+# processus ici avant qu'elle ne parte.
+#
+# Le here-string ne suffit pas à lui seul : la substitution de COMMANDE qui
+# compose le texte est expandue sur le même mode. Ce producteur-là est traité
+# chez l'appelant, qui brackète l'appel, et la raison y est écrite — elle n'est
+# pas celle du canal de secrets.
 #
 # LE SILENCE EST LA SEULE ISSUE QUAND LES GLOBALES MANQUENT. `PLATFORM_DIR` et
 # `SUB_REPO_DIR` naissent dans `dispatch_claude_pilot`, pas dans
@@ -2555,7 +2570,7 @@ $(_pilot_orientation_rule "$_work_root" "$_host_root" "$_repo_checkout")"
         # le même descripteur. Même précaution que `_sfd` dans le canal de
         # secrets.
         unset _rfd
-        exec {_rfd}< <(printf '%s\n' "$_content")
+        exec {_rfd}<<<"$_content"
         _PILOT_README_BIND_ARGS+=(--ro-bind-data "$_rfd" "$_dest")
         _PILOT_README_FDS+=("$_rfd")
     done
@@ -2958,6 +2973,35 @@ Remedy: $_egress_remedy"
     if [ "$_xtrace_was_on" -eq 1 ]; then
         set -x
     fi
+
+    # mika#2108 (vol 2): le marqueur du squelette de montage. APRÈS les refus
+    # ci-dessus et non avec les autres tableaux de binds, pour la raison du
+    # canal de secrets : chaque appel ouvre des descripteurs, et un refus posté
+    # entre l'ouverture et la boucle de fermeture les laisserait derrière lui.
+    #
+    # SOUS SON PROPRE BRACKET `xtrace`, ET PAS POUR LA RAISON DU CANAL DE
+    # SECRETS. Le contenu n'est pas un secret ; ce qui est en jeu est la FORME de
+    # la trace. `xtrace` expand les substitutions de commande, donc le
+    # `$(_pilot_orientation_rule …)` qui compose le texte y écrit
+    # `++ printf '%s\n' $'…'` — les douze lignes d'amorçage sur une ligne, deux
+    # fois par dispatche — dans un canal de diagnostic que `_emit_callback`
+    # renvoie à l'appelant. La garde de forme de mika#2049/mika#2057 (Test 5 de
+    # tests/test_sandbox_no_secret_in_argv.sh) refuse TOUTE ligne `++ printf`
+    # sans exception, et c'est elle qui a attrapé ce geste avant qu'il ne parte.
+    # Son absence d'exceptions est le dispositif : y inscrire ce producteur-ci
+    # ouvrirait l'allowlist que mika#2309 condamne, et la prochaine entrée serait
+    # une vraie fuite. Le bracket est donc du côté du producteur. Il est séparé
+    # de celui du canal de secrets pour que ce commentaire porte sa raison
+    # propre ; il réutilise `$_xtrace_was_on`, qui décrit toujours l'état
+    # antérieur puisque rien entre les deux ne touche à `xtrace`.
+    local -a _PILOT_README_BIND_ARGS=()
+    local -a _PILOT_README_FDS=()
+    { set +x; } 2>/dev/null
+    _pilot_sandbox_readme_args
+    if [ "$_xtrace_was_on" -eq 1 ]; then
+        set -x
+    fi
+
     # HOME bind property: EACH bind-in HOME must not carry any credential
     # or session token. Enforced by narrow subpaths per family — never bind
     # a whole family directory (~/.claude, ~/.local, ~/.mika) because those
@@ -2965,6 +3009,17 @@ Remedy: $_egress_remedy"
     # share/uv/credentials/ / .env respectively. Adding a new bind requires
     # confirming its subtree carries no cred-shaped file (see
     # coherence audit 2026-08-04).
+    #
+    # L'INVARIANT DE SYMÉTRIE DES DEUX BLOCS CI-DESSOUS, et sa conséquence
+    # (mika#2108, vol 2). La portion « binds » des deux argv doit rester
+    # identique : les deux blocs divergent légitimement en aval
+    # (`net_bwrap_args`, `net_setenv_args`, l'entrypoint), mais pas sur ce qui
+    # est monté. Un argument posé sur un seul site produit un bac à sable qui
+    # dit la vérité en Phase 2b et MENT en Phase 2a — un défaut invisible à
+    # l'usage, puisque Phase 2a est le repli et ne tourne qu'un jour de panne.
+    # Rien dans le langage ne garde cette symétrie ; c'est PART E de
+    # tests/test_pilot_orientation_block.sh qui la tient, par un compte EXACT de
+    # deux sites d'injection et non par une présence.
     local _sandbox_rc=0
     if [ -n "$sandbox_entrypoint_prefix" ]; then
         # Phase 2b mode. Le corps du script est une fonction depuis mika#2077,
@@ -2998,6 +3053,7 @@ Remedy: $_egress_remedy"
             --tmpfs /home \
             --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
             ${_PILOT_GITDIR_BIND_ARGS[@]+"${_PILOT_GITDIR_BIND_ARGS[@]}"} \
+            ${_PILOT_README_BIND_ARGS[@]+"${_PILOT_README_BIND_ARGS[@]}"} \
             --ro-bind "$_PILOT_GITCONFIG_HOST" "$_PILOT_GITCONFIG_SANDBOX" \
             --setenv GIT_CONFIG_GLOBAL "$_PILOT_GITCONFIG_SANDBOX" \
             --setenv GIT_CONFIG_NOSYSTEM "1" \
@@ -3061,6 +3117,7 @@ Remedy: $_egress_remedy"
             --tmpfs /home \
             --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
             ${_PILOT_GITDIR_BIND_ARGS[@]+"${_PILOT_GITDIR_BIND_ARGS[@]}"} \
+            ${_PILOT_README_BIND_ARGS[@]+"${_PILOT_README_BIND_ARGS[@]}"} \
             --ro-bind "$_PILOT_GITCONFIG_HOST" "$_PILOT_GITCONFIG_SANDBOX" \
             --setenv GIT_CONFIG_GLOBAL "$_PILOT_GITCONFIG_SANDBOX" \
             --setenv GIT_CONFIG_NOSYSTEM "1" \
@@ -3090,8 +3147,14 @@ exec \"\$@\"" mika-pilot-sandbox "$@" || _sandbox_rc=$?
     # actually produced. The order matters — closing first would overwrite
     # `$?` and break the invariant that the pilot's exit status is this
     # function's exit status.
+    #
+    # mika#2108 (vol 2): the README descriptors ride the SAME loop, and they are
+    # here rather than in a second loop of their own for that same written
+    # reason — `_sandbox_rc` is already captured, so nothing in this loop can
+    # touch the status this function reports. A separate loop placed above the
+    # capture would.
     local _cfd
-    for _cfd in ${secret_fds[@]+"${secret_fds[@]}"}; do
+    for _cfd in ${secret_fds[@]+"${secret_fds[@]}"} ${_PILOT_README_FDS[@]+"${_PILOT_README_FDS[@]}"}; do
         exec {_cfd}<&-
     done
 
