@@ -5747,6 +5747,96 @@ mod tests {
         );
     }
 
+    // ---- mika#2843 (vol 3) — la surface d'audit du filet -------------------
+    //
+    // **Chaque sonde de cette section prend un `label` UNIQUE, et ce n'est pas
+    // une coquetterie.** `RECURRING_GATE_AUDIT_SEEN` est un `static` partagé par
+    // tout le binaire de test : depuis le vol 3, le V4 du vol 2
+    // (`mika2456_le_filet_refuse_une_recurrente_dun_agent_desactive`, agent
+    // `"mika"`, label `"heartbeat"`) écrit lui aussi une ligne, sous la clé
+    // `("mika", "heartbeat")`. Deux sondes qui partageraient une clé se
+    // dédupliqueraient l'une l'autre et liraient `0` ou `1` **selon l'ordre
+    // d'exécution**. « Simplifier » vers un label partagé réintroduit ce flake
+    // sans rien faire rougir sur le coup.
+
+    /// **V4-bis** — le refus écrit **sa ligne d'audit**. Le vol 2 ne tenait V4
+    /// que par le booléen rendu et par le WARN ; c'est cette sonde qui rend la
+    /// requête opérateur du § *Audit Log* non vide.
+    ///
+    /// Modèle : les sondes de ligne d'audit de mika#2496 — appeler la fonction,
+    /// puis lire `count_audit_events_by_tool_name` et `get_audit_events`.
+    /// **Aucun `TaskEngine`** : le filet est une fonction, et le harnais inline
+    /// du vol 2 suffit.
+    #[tokio::test]
+    async fn mika2456_v4bis_le_refus_ecrit_sa_ligne_daudit() {
+        let home = home_with_enabled(false);
+        let db = test_db();
+        // Label unique — cf. le commentaire de section ci-dessus.
+        let task = seeded_task(
+            &db,
+            "v4bis-gate-audit",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher = test_dispatcher_with_homes(
+            db.clone(),
+            home.path().to_path_buf(),
+            no_stop_home().to_path_buf(),
+        );
+
+        // Le contrat du vol 2 reste tenu : le verdict est toujours le booléen.
+        assert!(
+            dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "mika#2456 — le filet doit toujours refuser ; la ligne d'audit \
+             s'ajoute à ce contrat, elle ne le remplace pas"
+        );
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(RECURRING_GATE_AUDIT_TOOL_NAME)
+                .await
+                .unwrap(),
+            1,
+            "mika#2843 — un refus doit écrire exactement une ligne sous \
+             `tool_name = 'agent_recurring_gate'` : c'est la population que le \
+             `GROUP BY` de la requête opérateur compte"
+        );
+
+        let events = db
+            .get_audit_events(RECURRING_GATE_AUDIT_SESSION_ID)
+            .await
+            .unwrap();
+        // La session est un sentinel fixe (C1) : c'est sous elle que la
+        // population se lit, et un `session_id` par tâche l'aurait rendue
+        // introuvable.
+        assert_eq!(
+            events.len(),
+            1,
+            "la ligne doit être lisible sous le sentinel de session, pas sous \
+             une session par tâche"
+        );
+        let row = &events[0];
+        assert_eq!(row.tool_name, RECURRING_GATE_AUDIT_TOOL_NAME);
+        assert_eq!(
+            row.target_key, "mika@v4bis-gate-audit",
+            "`target_key` = `<agent_id>@<label>`, et son `agent_id` vient de \
+             `self.db.agent_id()` — la même source que le WARN (C2, R-9)"
+        );
+        assert_eq!(row.after_value.as_deref(), Some("refused_agent_disabled"));
+        assert_eq!(
+            row.before_value, None,
+            "le filet ne mute rien (mika#2156) : il n'y a aucun état antérieur \
+             à nommer"
+        );
+        let reasoning = row.reasoning.as_deref().unwrap_or("");
+        assert!(
+            reasoning.contains(&format!("task_id={}", task.id)),
+            "l'id de tâche est une DONNÉE portée par `reasoning`, pas une clé \
+             de regroupement (C1) ; lu : {reasoning}"
+        );
+    }
+
     // ---- mika#2329 — STOP global à chaud -----------------------------------
 
     /// Arme le STOP en posant le fichier sentinelle sous le home global donné.
