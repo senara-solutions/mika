@@ -1657,6 +1657,107 @@ mod tests {
         );
     }
 
+    // ───────── mika#2843 — l'écrivain unique de la surface d'audit du filet ─────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est **mesuré** et non espéré : le seul
+    /// site de production portant le littéral exact `agent_recurring_gate` est
+    /// la déclaration de la constante dans `dispatcher.rs`. Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction (mika#2323).
+    /// Quand le scan tire, **on route l'écriture par le propriétaire**, on ne
+    /// l'allowliste pas (doctrine mika#2201).
+    const RECURRING_GATE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// La propriété qui rend le `GROUP BY target_key, after_value` de la requête
+    /// opérateur de mika#2843 exact.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, le filet continuerait de refuser, et V4-bis comme V4c
+    /// resteraient vertes. Ce qui deviendrait faux est le **compte** — et c'est
+    /// lui que la requête du § *Audit Log* lit pour répondre à « combien de
+    /// lignes échappent à la porte à l'enregistrement ». Un compte qui mélange
+    /// deux mécanismes ne compte plus une population.
+    ///
+    /// Le second écrivain réaliste est nommé : le refus à l'**enregistrement**
+    /// (vol 1), à qui l'on voudrait « la même ligne ». Il n'en écrit
+    /// délibérément aucune — il est borné par la cadence des redémarrages là où
+    /// le tir ne l'est pas.
+    ///
+    /// # La comparaison est EXACTE, et c'est ce qui rend l'allowlist livrable vide
+    ///
+    /// [`audit_name_literal_present`] teste `lit.trim() == needle`. Deux
+    /// littéraux existants **contiennent** la sous-chaîne `agent_recurring_gate`
+    /// sans être des écritures de cette ligne : `AGENT_RECURRING_GATE_RESOLVED_EVENT`
+    /// (`task_engine/mod.rs`, un nom d'événement de journal **suffixé**) et le
+    /// sentinel de session `agent-recurring-gate` (mika#2843 C1, en tirets là où
+    /// le `tool_name` est en tirets bas). Avec un prédicat en `contains`, ce scan
+    /// serait **rouge au premier jour** et son allowlist naîtrait à deux entrées
+    /// — c'est-à-dire exactement ce que mika#2323 refuse, et un lint rouge à la
+    /// naissance se fait désarmer. Avec l'égalité exacte, le seul site trouvé est
+    /// la déclaration de la constante.
+    ///
+    /// # Pas de nouveau contrôle de bonne foi
+    ///
+    /// [`audit_name_literal_present`] en a déjà un,
+    /// `mika2634_the_sole_writer_scan_still_catches_a_second_site`, qui couvre
+    /// ses trois formes bénignes dont un nom d'événement de journal préfixé par
+    /// le nom d'audit. Le prédicat est **partagé**, donc son attestation l'est
+    /// aussi ; en recopier une troisième serait la duplication que mika#2653
+    /// condamne.
+    #[test]
+    fn mika2456_the_gate_audit_name_has_exactly_one_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même
+        // (mika#2496, même geste que le scan mika#2634 voisin).
+        let needle = format!("agent_recurring{}gate", "_");
+        let owner = "crates/mika-agent/src/task_engine/dispatcher.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if RECURRING_GATE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2843 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2843 — le nom d'audit du filet récurrent a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : router cette écriture par le propriétaire \
+             (`refuse_recurring_fire_if_agent_disabled`), ou lui donner son \
+             propre `tool_name`. Ne PAS l'ajouter à \
+             RECURRING_GATE_SOLE_WRITER_EXCEPTIONS — le `GROUP BY` de la requête \
+             opérateur ne compte une seule population que tant qu'un seul site \
+             l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2456_lallowlist_du_scan_dagent_recurring_gate_est_livree_vide() {
+        assert!(
+            RECURRING_GATE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "RECURRING_GATE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on route l'écriture par le \
+             propriétaire. Une allowlist née vide est un emplacement où déposer \
+             la prochaine infraction (mika#2323)."
+        );
+    }
+
     // ─────────────── mika#2653 — la garde d'annulation sur pilote vif ───────────────
 
     /// **Livrée vide, et le test plus bas l'assert.**

@@ -108,6 +108,128 @@ pub fn is_routable_trigger(trigger: &str) -> bool {
 /// cours d'exécution**.
 pub(crate) const RECURRING_FIRE_REFUSED_EVENT: &str = "recurring_fire_refused_agent_disabled";
 
+/// `audit_events.tool_name` de la surface d'audit du filet (mika#2843, vol 3).
+///
+/// **SOLE WRITER :** [`TaskDispatcher::refuse_recurring_fire_if_agent_disabled`],
+/// sur sa branche de refus et nulle part ailleurs. Le refus à
+/// l'**enregistrement** (vol 1, `ensure_recurring_task_with_policy`) n'écrit
+/// délibérément **aucune** ligne d'audit : il est borné par la cadence des
+/// redémarrages là où le tir ne l'est pas, et sa ligne de journal suffit.
+///
+/// C'est cette propriété d'écrivain unique qui rend la requête opérateur
+/// lisible :
+///
+/// ```sql
+/// SELECT target_key, after_value, count(*)
+/// FROM audit_events
+/// WHERE tool_name = 'agent_recurring_gate'
+/// GROUP BY 1, 2;
+/// ```
+///
+/// Son résultat est **exactement** la population des lignes qui échappent à la
+/// porte, et non un mélange de deux mécanismes. Tenu par
+/// `mika2456_the_gate_audit_name_has_exactly_one_writer`
+/// (`canonical_tokens.rs`), dont l'allowlist est livrée vide.
+pub(crate) const RECURRING_GATE_AUDIT_TOOL_NAME: &str = "agent_recurring_gate";
+
+/// La session sous laquelle la ligne d'audit du filet se lit (mika#2843, C1).
+///
+/// **Un sentinel fixe, pas un identifiant par tâche.** Un `session_id` qui
+/// porterait l'id de tâche rendrait `get_audit_events(session_id)` inutilisable :
+/// il n'existerait plus de session sous laquelle lire la **population**. Le
+/// précédent est `auth_boundary`, documenté dans `crates/mika-agent/CLAUDE.md`
+/// § *Audit Log* en ces termes — *« `session_id` : `auth-boundary` — a boundary
+/// failure belongs to no conversation »*. Un refus de porte n'appartient à
+/// aucune conversation non plus.
+///
+/// L'id de tâche reste porté par `reasoning` (`task_id=<n>`), où il est une
+/// **donnée** et non une clé de regroupement.
+///
+/// Noter la graphie : ce littéral est en **tirets**, le `tool_name` ci-dessus en
+/// tirets **bas**. Deux littéraux distincts, et le scan SOLE WRITER compare de
+/// façon **exacte** — c'est ce qui lui permet de naître avec une allowlist vide.
+pub(crate) const RECURRING_GATE_AUDIT_SESSION_ID: &str = "agent-recurring-gate";
+
+/// Quelle fraîcheur un refus `(agent_id, label)` déjà annoncé peut perdre avant
+/// d'être réécrit (mika#2843).
+///
+/// Sans fenêtre, une récurrente à la minute écrirait ≈ 1 440 lignes
+/// `audit_events` **par jour** pour un seul agent désactivé : un état stable se
+/// lirait comme du trafic, et « régime attendu : zéro ligne » deviendrait
+/// illisible. Avec elle, le zéro se lit à la bonne granularité — zéro
+/// **population**, une ligne par ligne fautive et par jour, et non une par
+/// cadence.
+const RECURRING_GATE_AUDIT_REFRESH: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Plafond de la table de déduplication. La population réelle est
+/// (agents × labels), une poignée au plus : l'atteindre signifie que quelque
+/// chose engendre des clés distinctes sans borne. Vider coûte une ligne
+/// redondante par refus vivant — bon marché et honnête ; l'alternative est une
+/// table qui croît pour la vie du processus.
+const RECURRING_GATE_AUDIT_SEEN_CAP: usize = 10_000;
+
+/// Quand chaque `(agent_id, label)` a été annoncé pour la dernière fois **par ce
+/// processus**.
+///
+/// Transcription de `auto_pull.rs::EXCLUSION_AUDIT_SEEN` (mika#2131), avec ses
+/// trois propriétés que la transcription seule perdrait :
+///
+/// - **L'état est en mémoire, donc perdu au redémarrage — par conception.** Le
+///   premier refus après un restart réécrit une ligne, et c'est voulu : un
+///   restart est une information, et un processus neuf re-photographie l'état
+///   qu'il trouve. Un état persisté ferait porter à la base le souvenir d'un
+///   processus mort.
+/// - **Consulter n'est pas marquer.** [`recurring_gate_audit_is_due`] et
+///   [`mark_recurring_gate_audited`] sont deux gestes séparés, et c'est la
+///   propriété que `mika2456_consulting_does_not_mark` tient. Elle existe pour
+///   qu'un échec transitoire de `log_audit_event` ne coûte qu'un réessai à la
+///   cadence suivante, jamais la ligne de cette row pour la vie du processus.
+/// - **Fail-open sur mutex empoisonné.** Reprendre l'état par
+///   `into_inner()` est un **choix** : le seul état porté est « déjà écrit », et
+///   *un audit qui ne peut pas se dédupliquer écrit plutôt que de refuser le
+///   refus*.
+static RECURRING_GATE_AUDIT_SEEN: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// `true` quand ce `(agent_id, label)` n'est pas enregistré, ou l'a été il y a
+/// plus de [`RECURRING_GATE_AUDIT_REFRESH`].
+///
+/// **Ne marque rien.** Le `now` est un **paramètre** et non un
+/// `Instant::now()` interne : c'est ce qui rend la fenêtre de 24 h testable sans
+/// attendre 24 h (`mika2456_v4c_the_refusal_is_deduplicated_on_a_24h_window`).
+fn recurring_gate_audit_is_due(key: &(String, String), now: std::time::Instant) -> bool {
+    let seen = RECURRING_GATE_AUDIT_SEEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match seen.get(key) {
+        Some(&written_at) => now.duration_since(written_at) >= RECURRING_GATE_AUDIT_REFRESH,
+        None => true,
+    }
+}
+
+/// Enregistre que le WARN et la ligne d'audit de `key` ont été écrits à `now`.
+///
+/// **L'appelant marque après que l'écriture a atterri**, jamais avant : marquer
+/// avant, c'est perdre silencieusement la ligne et taire le refus 24 h. La forme
+/// qui le porte est le `Ok(()) => mark…` du site d'appel, et une inversion de
+/// ces deux lignes ne ferait rougir rien d'autre que cette phrase.
+fn mark_recurring_gate_audited(key: (String, String), now: std::time::Instant) {
+    let mut seen = RECURRING_GATE_AUDIT_SEEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= RECURRING_GATE_AUDIT_SEEN_CAP {
+        warn!(
+            cap = RECURRING_GATE_AUDIT_SEEN_CAP,
+            "agent_recurring_gate: la table de déduplication a atteint son \
+             plafond ; vidage"
+        );
+        seen.clear();
+    }
+    seen.insert(key, now);
+}
+
 /// Qui refuse, et qu'est-ce qu'il sait router (mika#2446 R-1).
 ///
 /// Les cinq champs qu'une ligne de mort par trigger inconnu doit porter pour
@@ -740,6 +862,30 @@ impl TaskDispatcher {
     /// d'un agent désactivé passent, parce que `enabled = false` à la racine
     /// nomme les **récurrentes** et pas l'agent entier. Ce qui le prouve est le
     /// contrôle négatif de la branche (b) de V5.
+    ///
+    /// # Deux surfaces, **un** prédicat (mika#2843, R-9 du plan amont)
+    ///
+    /// Le WARN et la ligne [`RECURRING_GATE_AUDIT_TOOL_NAME`] partent sous le
+    /// même `if recurring_gate_audit_is_due(…)`, et leur `agent_id` sort de la
+    /// même source (`self.db.agent_id()`). C'est ce qui rend le journal et la
+    /// table **soustractibles** : un WARN et une ligne d'audit qui nommeraient
+    /// des agents différents ne seraient pas comparables, et le
+    /// `GROUP BY target_key` de la requête opérateur compterait une population
+    /// que le journal ne sait pas désigner.
+    ///
+    /// # Changement de contrat du WARN, à dire fort (mika#2843, C3)
+    ///
+    /// Le WARN était **inconditionnel** jusqu'au vol 3. Il est désormais
+    /// dédupliqué sur la même fenêtre de 24 h que la ligne d'audit, donc :
+    ///
+    /// > **l'absence de `recurring_fire_refused_agent_disabled` dans les logs
+    /// > signifie « déjà annoncé dans les 24 h », et non « aucun refus ».**
+    ///
+    /// L'alternative — garder le WARN inconditionnel — est refusée : elle
+    /// rendrait ≈ 1 440 lignes de journal par jour et par agent désactivé, et
+    /// ferait du journal et de la table deux populations non soustractibles
+    /// (classe mika#2205). La phrase ci-dessus vit aussi dans
+    /// `crates/mika-agent/CLAUDE.md` § *Audit Log*, où un opérateur la lit.
     async fn refuse_recurring_fire_if_agent_disabled(&self, task: &Task) -> bool {
         if task.trigger_type != super::types::trigger_type::RECURRING {
             return false;
@@ -747,16 +893,50 @@ impl TaskDispatcher {
         if super::agent_recurring_tasks_enabled(&self.home_dir, self.db.agent_id()).await {
             return false;
         }
-        warn!(
-            target: "mika::otel",
-            event = RECURRING_FIRE_REFUSED_EVENT,
-            agent_id = %self.db.agent_id(),
-            label = %task.label,
-            trigger_type = %task.trigger_type,
-            "mika#2456: agent carries `enabled = false` — recurring fire refused \
-             at the last gate before an LLM turn. The row is left as it is: this \
-             agent will fire again the tick after `enabled` goes back to true"
-        );
+        // C2 — une seule source d'`agent_id` pour la clé de déduplication, pour
+        // le `target_key` et pour le WARN.
+        let agent_id = self.db.agent_id().to_string();
+        let key = (agent_id.clone(), task.label.clone());
+        let now = std::time::Instant::now();
+        if recurring_gate_audit_is_due(&key, now) {
+            warn!(
+                target: "mika::otel",
+                event = RECURRING_FIRE_REFUSED_EVENT,
+                agent_id = %agent_id,
+                label = %task.label,
+                trigger_type = %task.trigger_type,
+                "mika#2456: agent carries `enabled = false` — recurring fire refused \
+                 at the last gate before an LLM turn. The row is left as it is: this \
+                 agent will fire again the tick after `enabled` goes back to true"
+            );
+            match self
+                .db
+                .log_audit_event(
+                    RECURRING_GATE_AUDIT_SESSION_ID,
+                    RECURRING_GATE_AUDIT_TOOL_NAME,
+                    &format!("{agent_id}@{}", task.label),
+                    None,
+                    Some("refused_agent_disabled"),
+                    Some(&format!("task_id={}", task.id)),
+                    None,
+                )
+                .await
+            {
+                // On marque **après** que l'écriture a atterri. Marquer avant,
+                // c'est perdre silencieusement la ligne et taire le refus 24 h.
+                Ok(()) => mark_recurring_gate_audited(key, now),
+                Err(e) => warn!(
+                    target: "mika::otel",
+                    task_id = %task.id,
+                    error = %e,
+                    "mika#2843: échec d'écriture de la ligne d'audit \
+                     agent_recurring_gate — le refus reste un refus"
+                ),
+            }
+        }
+        // Rendu **hors** du `match` : une écriture d'audit en échec ne change
+        // pas le verdict du filet. Même forme que le *fire-and-forget* d'
+        // `AuthBoundaryLedger`, et même raison — un audit ne décide rien.
         true
     }
 
@@ -5564,6 +5744,170 @@ mod tests {
             "…et la porte de section, elle, dit bien non : sans cette seconde \
              assertion, un `[heartbeat]` ignoré de bout en bout rendrait la \
              première verte"
+        );
+    }
+
+    // ---- mika#2843 (vol 3) — la surface d'audit du filet -------------------
+    //
+    // **Chaque sonde de cette section prend un `label` UNIQUE, et ce n'est pas
+    // une coquetterie.** `RECURRING_GATE_AUDIT_SEEN` est un `static` partagé par
+    // tout le binaire de test : depuis le vol 3, le V4 du vol 2
+    // (`mika2456_le_filet_refuse_une_recurrente_dun_agent_desactive`, agent
+    // `"mika"`, label `"heartbeat"`) écrit lui aussi une ligne, sous la clé
+    // `("mika", "heartbeat")`. Deux sondes qui partageraient une clé se
+    // dédupliqueraient l'une l'autre et liraient `0` ou `1` **selon l'ordre
+    // d'exécution**. « Simplifier » vers un label partagé réintroduit ce flake
+    // sans rien faire rougir sur le coup.
+
+    /// **V4-bis** — le refus écrit **sa ligne d'audit**. Le vol 2 ne tenait V4
+    /// que par le booléen rendu et par le WARN ; c'est cette sonde qui rend la
+    /// requête opérateur du § *Audit Log* non vide.
+    ///
+    /// Modèle : les sondes de ligne d'audit de mika#2496 — appeler la fonction,
+    /// puis lire `count_audit_events_by_tool_name` et `get_audit_events`.
+    /// **Aucun `TaskEngine`** : le filet est une fonction, et le harnais inline
+    /// du vol 2 suffit.
+    #[tokio::test]
+    async fn mika2456_v4bis_le_refus_ecrit_sa_ligne_daudit() {
+        let home = home_with_enabled(false);
+        let db = test_db();
+        // Label unique — cf. le commentaire de section ci-dessus.
+        let task = seeded_task(
+            &db,
+            "v4bis-gate-audit",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher = test_dispatcher_with_homes(
+            db.clone(),
+            home.path().to_path_buf(),
+            no_stop_home().to_path_buf(),
+        );
+
+        // Le contrat du vol 2 reste tenu : le verdict est toujours le booléen.
+        assert!(
+            dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "mika#2456 — le filet doit toujours refuser ; la ligne d'audit \
+             s'ajoute à ce contrat, elle ne le remplace pas"
+        );
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(RECURRING_GATE_AUDIT_TOOL_NAME)
+                .await
+                .unwrap(),
+            1,
+            "mika#2843 — un refus doit écrire exactement une ligne sous \
+             `tool_name = 'agent_recurring_gate'` : c'est la population que le \
+             `GROUP BY` de la requête opérateur compte"
+        );
+
+        let events = db
+            .get_audit_events(RECURRING_GATE_AUDIT_SESSION_ID)
+            .await
+            .unwrap();
+        // La session est un sentinel fixe (C1) : c'est sous elle que la
+        // population se lit, et un `session_id` par tâche l'aurait rendue
+        // introuvable.
+        assert_eq!(
+            events.len(),
+            1,
+            "la ligne doit être lisible sous le sentinel de session, pas sous \
+             une session par tâche"
+        );
+        let row = &events[0];
+        assert_eq!(row.tool_name, RECURRING_GATE_AUDIT_TOOL_NAME);
+        assert_eq!(
+            row.target_key, "mika@v4bis-gate-audit",
+            "`target_key` = `<agent_id>@<label>`, et son `agent_id` vient de \
+             `self.db.agent_id()` — la même source que le WARN (C2, R-9)"
+        );
+        assert_eq!(row.after_value.as_deref(), Some("refused_agent_disabled"));
+        assert_eq!(
+            row.before_value, None,
+            "le filet ne mute rien (mika#2156) : il n'y a aucun état antérieur \
+             à nommer"
+        );
+        let reasoning = row.reasoning.as_deref().unwrap_or("");
+        assert!(
+            reasoning.contains(&format!("task_id={}", task.id)),
+            "l'id de tâche est une DONNÉE portée par `reasoning`, pas une clé \
+             de regroupement (C1) ; lu : {reasoning}"
+        );
+    }
+
+    /// **V4c** — la fenêtre de déduplication, aux trois instants qui la
+    /// définissent.
+    ///
+    /// Le troisième cas est porteur : sans lui, la sonde ne distingue pas
+    /// « dédupliqué » de « écrit une seule fois puis plus jamais » — deux
+    /// comportements dont seul le premier borne le bruit **sans perdre le
+    /// signal**. Une déduplication sans horizon rendrait la dernière ligne
+    /// indatable.
+    ///
+    /// L'`Instant` est un **paramètre** des deux fonctions, et non un
+    /// `Instant::now()` interne : c'est la seule raison pour laquelle une
+    /// fenêtre de 24 h se teste sans attendre 24 h.
+    ///
+    /// **Le cap de 10 000 n'est délibérément pas testé en remplissant la
+    /// table.** `seen.clear()` est un effet de bord sur un `static` partagé : une
+    /// sonde qui le déclencherait viderait la table de déduplication des tests
+    /// parallèles et les rendrait flaky. Le cap est tenu par sa **lecture** — la
+    /// constante, le `>=`, le WARN qui nomme `cap` — et ce refus est écrit ici
+    /// pour qu'il ne se relise pas comme un oubli.
+    #[test]
+    fn mika2456_v4c_the_refusal_is_deduplicated_on_a_24h_window() {
+        // Clé unique — cf. le commentaire de section ci-dessus.
+        let key = (
+            "mika2843-v4c-agent".to_string(),
+            "v4c-dedup-window".to_string(),
+        );
+        let t0 = std::time::Instant::now();
+
+        assert!(
+            recurring_gate_audit_is_due(&key, t0),
+            "une clé jamais vue est due"
+        );
+        mark_recurring_gate_audited(key.clone(), t0);
+
+        let t1 = t0 + std::time::Duration::from_secs(23 * 60 * 60);
+        assert!(
+            !recurring_gate_audit_is_due(&key, t1),
+            "mika#2843 — un second refus dans la fenêtre ne doit RIEN écrire : \
+             sinon une récurrente à la minute écrirait ≈ 1 440 lignes par jour \
+             pour un seul agent désactivé, et « régime attendu : zéro ligne » \
+             deviendrait illisible"
+        );
+
+        let t2 = t0 + RECURRING_GATE_AUDIT_REFRESH + std::time::Duration::from_secs(1);
+        assert!(
+            recurring_gate_audit_is_due(&key, t2),
+            "au-delà de la fenêtre la ligne doit revenir : une déduplication \
+             sans horizon rendrait la dernière ligne indatable — une ligne dont \
+             la date suggère l'actualité en portant un fait périmé est pire que \
+             pas de ligne"
+        );
+    }
+
+    /// Consulter n'est pas marquer, et les deux gestes sont séparés pour ça.
+    ///
+    /// L'appelant marque **après** que `log_audit_event` a atterri. Si consulter
+    /// marquait, un échec transitoire d'écriture coûterait la ligne de cette row
+    /// **pour la vie du processus** — c'est-à-dire exactement le silence que
+    /// cette surface existe pour supprimer.
+    #[test]
+    fn mika2456_consulting_does_not_mark() {
+        // Clé unique — cf. le commentaire de section ci-dessus.
+        let key = (
+            "mika2843-consult-agent".to_string(),
+            "v4c-consult-only".to_string(),
+        );
+        let now = std::time::Instant::now();
+        assert!(recurring_gate_audit_is_due(&key, now));
+        assert!(
+            recurring_gate_audit_is_due(&key, now),
+            "une consultation ne pose aucune marque"
         );
     }
 
