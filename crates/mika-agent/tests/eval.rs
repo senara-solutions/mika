@@ -155,6 +155,11 @@ mod eval {
     // positif montre qu'elle traverse bel et bien par le canal FICHIER, qui
     // est le chemin réellement exposé.
     mod test_mcp_secret_boundary_2281;
+    // mika#2814 — l'équivalent L2 côté MCP : un outil dont le serveur déclare
+    // `testimony` n'est jamais PUBLIÉ au modèle, qui ne peut donc plus le
+    // proposer. Mesuré sur les octets soumis, avec le contrôle positif
+    // `operational` qui montre que les mêmes noms traversent sans le grade.
+    mod test_mcp_testimony_non_publication_2814;
     mod test_merge_identity_2248;
     // mika#2304 — le tour dit sous quel modèle il a tourné, et un modèle nommé
     // par l'appelant l'emporte sur la section `[llm]` d'une skill.

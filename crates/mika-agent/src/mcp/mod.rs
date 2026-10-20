@@ -79,6 +79,67 @@ pub(crate) fn mcp_tool_data_grades(
         .collect()
 }
 
+/// Le segment serveur d'un nom d'outil namespacé, pour la journalisation.
+///
+/// Dérivé du **nom**, jamais d'un second parcours de `config.mcp_servers` : le
+/// nom porte déjà le serveur (`mcp__{serveur}__{outil}`), et deux lectures du
+/// même fait peuvent divergir. `split_once` plutôt qu'un découpage d'octets —
+/// `scripts/check-byte-slices.sh` refuse le second, et un nom de serveur peut
+/// porter des caractères multi-octets.
+fn serveur_du_nom_namespace(namespaced: &str) -> Option<&str> {
+    let (serveur, _outil) = namespaced.strip_prefix(MCP_PREFIX)?.split_once(MCP_SEP)?;
+    (!serveur.is_empty()).then_some(serveur)
+}
+
+/// Retire du lot **publié au modèle** tout outil dont le serveur déclare
+/// `data_grade = "testimony"` (mika#2814) — l'équivalent L2 de
+/// `SkillRegistry::apply_testimony_grade_ban` du côté MCP.
+///
+/// La doctrine non-transit (mika#1798) interdit de *proposer* autant que
+/// d'*accéder* : mika#1959 a mis l'appel sous garde L4, mais l'outil restait
+/// dans `tool_definitions()`, donc dans le lot envoyé au modèle, qui pouvait
+/// encore l'offrir. Cette fonction ferme cette moitié.
+///
+/// Trois propriétés que la signature porte à dessein :
+///
+/// - **Seules les définitions sont amputées.** `tool_routing` et
+///   `tool_data_grades` gardent l'inventaire complet, pour qu'un appel
+///   halluciné sur un nom non publié soit refusé comme
+///   `TOOL_TESTIMONY_GRADE_FORBIDDEN` et non comme « outil inconnu ». Le refus
+///   L4 reste donc la dernière porte, pas la seule.
+/// - **Une définition absente de la map est publiée.** Le défaut est de
+///   publier, pas de censurer : un trou dans la map est une erreur de
+///   construction, et une censure muette serait le pire rendu possible.
+/// - **Libre et pure**, parce que `connect_all` ouvre de vraies connexions
+///   qu'aucun test unitaire n'atteint (même raison que `mcp_tool_data_grades`).
+///
+/// Journalise une ligne par outil retiré : sans elle, « ce serveur n'est pas
+/// connecté » et « ses outils sont bannis » rendent les mêmes octets
+/// (classe mika#2205).
+pub(crate) fn retain_publiables(
+    tool_definitions: Vec<ToolDefinition>,
+    tool_data_grades: &HashMap<String, DataGrade>,
+) -> Vec<ToolDefinition> {
+    tool_definitions
+        .into_iter()
+        .filter(|def| {
+            if tool_data_grades.get(&def.name) != Some(&DataGrade::Testimony) {
+                return true;
+            }
+            warn!(
+                event = "mcp_tool_testimony_unpublished",
+                tool = %def.name,
+                server = serveur_du_nom_namespace(&def.name).unwrap_or("<non namespacé>"),
+                doctrine = "mika#1798",
+                "outil MCP dont le serveur déclare data_grade = \"testimony\" : \
+                 retiré du lot publié au modèle, qui ne peut donc plus le proposer. \
+                 L'appel reste refusé par la garde L4 (mika#1959)."
+            );
+            false
+        })
+        .collect()
+}
+
 impl McpManager {
     /// Connect to all enabled MCP servers from config.
     ///
@@ -158,15 +219,26 @@ impl McpManager {
             }
         }
 
+        let tool_data_grades = mcp_tool_data_grades(config, &tool_routing);
+
+        // mika#2814 — la non-publication des outils testimony, consommant la
+        // même map que la garde L4, jamais une seconde lecture de la config.
+        let discovered = tool_definitions.len();
+        let tool_definitions = retain_publiables(tool_definitions, &tool_data_grades);
+        let published = tool_definitions.len();
+
         if !connections.is_empty() {
             info!(
                 servers = connections.len(),
-                tools = tool_definitions.len(),
+                discovered,
+                published,
+                // Écrit même à zéro : absent ne vaut pas zéro (mika#2331), et
+                // l'absence de la ligne signifie un binaire antérieur à
+                // mika#2814 (mika#2340), jamais « rien n'a été banni ».
+                unpublished = discovered - published,
                 "MCP manager initialized"
             );
         }
-
-        let tool_data_grades = mcp_tool_data_grades(config, &tool_routing);
 
         Self {
             connections,
@@ -754,6 +826,150 @@ mod tests {
             grades["mcp__fantome__do_thing"],
             DataGrade::Operational,
             "serveur hors config ⇒ défaut de l'enum, jamais un panic"
+        );
+    }
+
+    // -- mika#2814 : la non-publication des outils testimony ----------------
+
+    /// Des définitions d'outils de la forme que `connect_all` produit.
+    fn definitions(entrees: &[(&str, &str)]) -> Vec<ToolDefinition> {
+        entrees
+            .iter()
+            .map(|(serveur, outil)| ToolDefinition {
+                name: mcp_tool_name(serveur, outil),
+                description: format!("[MCP: {serveur}] {outil}"),
+                input_schema: serde_json::json!({ "type": "object" }),
+            })
+            .collect()
+    }
+
+    /// Les noms publiés, dans l'ordre où le filtre les rend.
+    fn noms(defs: &[ToolDefinition]) -> Vec<&str> {
+        defs.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    /// AC1 — un serveur testimony et un serveur operational dans la **même**
+    /// table : seuls les outils du premier disparaissent.
+    ///
+    /// Les deux grades dans un seul appel, parce qu'un filtre qui vide tout et
+    /// un filtre qui lit le grade rendent le même résultat sur une table
+    /// mono-grade. C'est la cohabitation qui distingue les deux.
+    #[test]
+    fn mika2814_seuls_les_outils_testimony_sont_depublies() {
+        let defs = definitions(&[
+            ("journal-perso", "read_entry"),
+            ("journal-perso", "search"),
+            ("wikipedia", "lookup"),
+        ]);
+        let grades = HashMap::from([
+            (
+                mcp_tool_name("journal-perso", "read_entry"),
+                DataGrade::Testimony,
+            ),
+            (
+                mcp_tool_name("journal-perso", "search"),
+                DataGrade::Testimony,
+            ),
+            (mcp_tool_name("wikipedia", "lookup"), DataGrade::Operational),
+        ]);
+
+        let publies = retain_publiables(defs, &grades);
+
+        assert_eq!(
+            noms(&publies),
+            vec!["mcp__wikipedia__lookup"],
+            "les deux outils du serveur testimony doivent être retirés et celui \
+             du serveur operational conservé — un filtre aveugle au grade rendrait \
+             soit les trois, soit aucun"
+        );
+    }
+
+    /// AC1 — une définition **absente** de la map des grades est **publiée**.
+    ///
+    /// Le défaut est de publier, pas de censurer : un trou dans la map est une
+    /// erreur de construction, et la censurer en silence serait le pire rendu
+    /// possible — un outil disparu sans qu'aucune ligne ne le dise. Ce cas est
+    /// inatteignable depuis `connect_all` (définitions et grades y sont bâtis
+    /// depuis le même routage) ; il est couvert parce que la signature le
+    /// permet, et parce que le `!= Some(&Testimony)` qui le traite est
+    /// exactement la ligne qu'un futur `== Some(&Operational)` inverserait.
+    #[test]
+    fn mika2814_une_definition_hors_map_est_publiee() {
+        let defs = definitions(&[("fantome", "do_thing"), ("journal-perso", "read_entry")]);
+        let grades = HashMap::from([(
+            mcp_tool_name("journal-perso", "read_entry"),
+            DataGrade::Testimony,
+        )]);
+
+        let publies = retain_publiables(defs, &grades);
+
+        assert_eq!(
+            noms(&publies),
+            vec!["mcp__fantome__do_thing"],
+            "un outil sans entrée dans la map doit rester publié : le défaut de \
+             ce filtre est de publier"
+        );
+    }
+
+    /// AC3 — le filtre n'ampute **que** les définitions : le routage et la map
+    /// des grades gardent l'inventaire complet.
+    ///
+    /// C'est ce qui rend le refus L4 de mika#1959 décisif plutôt qu'un hasard :
+    /// un appel halluciné sur un nom non publié est refusé comme
+    /// `TOOL_TESTIMONY_GRADE_FORBIDDEN`, et non comme « outil inconnu ». Les
+    /// deux rendus ne se valent pas — le second ferait croire à une faute de
+    /// frappe là où il y a une doctrine.
+    #[test]
+    fn mika2814_le_routage_et_les_grades_ne_sont_pas_amputes() {
+        let outil = mcp_tool_name("journal-perso", "read_entry");
+        let grades = HashMap::from([(outil.clone(), DataGrade::Testimony)]);
+
+        let publies = retain_publiables(definitions(&[("journal-perso", "read_entry")]), &grades);
+        assert!(
+            publies.is_empty(),
+            "l'outil testimony doit être dépublié, or : {:?}",
+            noms(&publies)
+        );
+
+        let manager = McpManager::sans_connexion_pour_tests(
+            routage(&[("journal-perso", "read_entry")]),
+            grades,
+        );
+        assert!(
+            manager.is_mcp_tool(&outil),
+            "{outil} doit rester routable : sans lui, le dispatch rendrait \
+             « outil inconnu » au lieu du refus L4"
+        );
+        assert_eq!(
+            manager.tool_data_grades().get(&outil),
+            Some(&DataGrade::Testimony),
+            "{outil} doit garder son grade dans la map que L4 consomme"
+        );
+    }
+
+    /// Contrôle de bonne foi — une table sans aucun testimony ressort
+    /// **inchangée**, dans le même ordre.
+    ///
+    /// Sans lui, un filtre dégénéré rendant `vec![]` passerait les trois
+    /// assertions ci-dessus : chacune mesure une absence, et l'absence est
+    /// aussi ce que rend un instrument qui ne mesure rien.
+    #[test]
+    fn mika2814_controle_une_table_sans_testimony_ressort_intacte() {
+        let entrees = [("wikipedia", "lookup"), ("github", "list_issues")];
+        let grades: HashMap<String, DataGrade> = entrees
+            .iter()
+            .map(|(s, o)| (mcp_tool_name(s, o), DataGrade::Operational))
+            .collect();
+        let avant = definitions(&entrees);
+        let noms_avant: Vec<String> = avant.iter().map(|d| d.name.clone()).collect();
+
+        let publies = retain_publiables(avant, &grades);
+
+        assert_eq!(
+            noms(&publies),
+            noms_avant.iter().map(String::as_str).collect::<Vec<_>>(),
+            "aucun grade testimony ⇒ aucune dépublication, et l'ordre préservé \
+             (c'est l'ordre dans lequel le modèle reçoit les outils)"
         );
     }
 }

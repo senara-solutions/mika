@@ -8153,6 +8153,39 @@ fn build_skill_data_grades(
 /// hors population par construction. Appariement tenu par la garde
 /// `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`.
 ///
+/// # Le remède à la faiblesse de cette garde est **choisi** (mika#2814, vol 2)
+///
+/// Cette garde compare des **chaînes** : elle cherche le texte
+/// `extend_from_slice(mcp.tool_definitions())` et le texte
+/// `seed_mcp_data_grades(`. Une publication écrite autrement — une boucle, un
+/// `chain`, un `clone()` intermédiaire, un helper local — la laisse verte tout
+/// en rouvrant le contournement. La revue de PR #2816 a proposé deux remèdes ;
+/// mika#2814 tranche pour le premier, et la raison du refus du second est la
+/// même que celle de la faiblesse qu'on corrige :
+///
+/// - **Retenu — un helper unique qui publie *et* ensemence**, de signature
+///   `publier_outils_mcp(&mut Vec<ToolDefinition>, &mut HashMap<String, DataGrade>,
+///   Option<&McpManager>)`, appelé en lieu et place de la paire aux deux sites.
+///   L'appariement devient alors une propriété de l'**appel** — on ne peut pas
+///   publier sans ensemencer, parce qu'il n'existe plus d'appel qui ne fasse
+///   qu'une moitié — et la garde se réduit à compter les appels d'une fonction,
+///   ce qu'un renommage casse bruyamment au lieu de silencieusement.
+/// - **Écarté — une garde qui vérifie fonction par fonction** (pour chaque
+///   fonction contenant une publication, exiger un ensemencement dans la même
+///   fonction). Elle resterait une garde **textuelle sur la publication**,
+///   c'est-à-dire exactement la fragilité à corriger, avec un périmètre plus
+///   large : elle cesserait de mordre sur toute forme de publication qu'elle ne
+///   reconnaît pas, et sa surface de faux négatifs grandirait avec le nombre de
+///   façons d'écrire une publication.
+///
+/// **Non implémenté dans ce commit**, délibérément : mika#2814 filtre dans
+/// `McpManager::connect_all`, donc aucun des deux sites n'a bougé et la garde
+/// n'avait rien à rattraper ici (mesuré, § Cas 4 de
+/// `todos/2814-injection-verification.md`). Déplacer les deux sites est un
+/// changement à soi, avec son propre rouge à mesurer — et une refonte livrée
+/// sans son rouge est précisément ce que cette garde existe pour empêcher.
+/// Tracked in: senara-solutions/mika#2814 (vol 2).
+///
 /// Collision : rien n'empêche une skill de déclarer un outil `mcp__<s>__<t>`
 /// (le préfixe n'est réservé qu'à la résolution des `required_tools`). Sur une
 /// collision, **le grade le plus strict l'emporte** : un `Testimony` déjà posé
@@ -19806,6 +19839,21 @@ fn prod(scope: HistoryScope) -> usize {
     /// population par construction** : il ne publie pas les outils MCP et
     /// reçoit `None` en place du manager. Il n'apparaît donc dans aucun des
     /// deux comptes, et c'est pourquoi le nombre attendu est deux et non trois.
+    ///
+    /// **mika#2814 — l'inventaire que ces deux sites publient est désormais
+    /// pré-filtré.** `McpManager::connect_all` passe les définitions découvertes
+    /// par [`crate::mcp::retain_publiables`], qui retire celles dont le serveur
+    /// déclare `data_grade = "testimony"` (la moitié L2 de la doctrine
+    /// mika#1798). Le filtre est **en amont** des deux sites, donc aucun n'a
+    /// bougé, les deux ensemencements restent, et le `== 2` ci-dessous reste
+    /// exact — ce que l'injection « passe-plat » de
+    /// `todos/2814-injection-verification.md` § Cas 4 a mesuré plutôt que
+    /// supposé. Ce qu'il faut en retenir en relisant cette garde : ce qu'elle
+    /// apparie, c'est la publication du lot **publiable** avec l'ensemencement
+    /// de la map L4, et cette map garde l'inventaire **complet** (grades et
+    /// routage ne sont pas amputés), pour qu'un appel halluciné sur un nom non
+    /// publié tombe sur `TOOL_TESTIMONY_GRADE_FORBIDDEN` et non sur « outil
+    /// inconnu ».
     #[test]
     fn mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4() {
         assert!(
