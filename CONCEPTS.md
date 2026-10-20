@@ -92,6 +92,12 @@ On exit it attests that the shared resource did not move, and the verdict is thr
 
 The maximum number of agent turns a dispatched pilot may take before the SDK ends the run, resolved per dispatch by a fixed-order cascade and announced on the dispatch's forensic log with the source that decided it. The explicit rollback (the setting present but empty or zero) sits above everything and passes no ceiling at all; a ticket label listed in the ceiling table comes next and raises the ceiling for that class of ticket (the `loop-substrate` class today); the host-wide setting comes after it; the in-code default comes last. The order is load-bearing: a host that sets the fleet-wide value would otherwise shadow every label, so the label wins over the host setting, and only the rollback or removing the label bounds a labelled ticket lower. A ceiling label must be declared in the repository's label registry, or label-sync deletes it and the raised ceiling silently applies to nobody.
 
+### Flight floor
+
+Aliases: plancher du vol.
+
+The set of a plan's implementation units that the plan declares non-truncatable: a flight that ships fewer than all of them is not a degraded flight but an incomplete one, and must not merge as-is. Plans order their commits so that the detectors guarding a change land after the change they measure, which means a pilot stopped by its turn ceiling loses exactly the detectors and leaves a branch that still looks whole. A missing detector cannot turn a run red, so a green pipeline says nothing about whether the floor was reached; the only check is to set the floor against what the branch actually commits, unit by unit and file by file.
+
 ### Pilot scratch
 
 The one directory a dispatched pilot is told to build throwaway material in — fixtures, test copies, files extracted from another revision — inside its own worktree, prepared by the dispatcher before the pilot starts. It is hidden from version control, so nothing left in it ever reads as unfinished work or reaches a commit, and it is emptied each time the worktree is prepared, so every session starts from a clean one.
