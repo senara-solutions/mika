@@ -5396,6 +5396,177 @@ mod tests {
         }
     }
 
+    // ---- mika#2456 (vol 2) — le filet au tir -------------------------------
+    //
+    // Le témoin du refus est **la valeur de retour du filet**, assertée
+    // directement. Pas un tir observé, pas une ligne d'audit : le filet ne mute
+    // rien, et faire porter la preuve par un effet de bord qu'il n'a pas le
+    // droit d'avoir obligerait à lui en donner un.
+
+    /// Un foyer d'agent dont l'`identity.toml` porte exactement `body`.
+    fn agent_home(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("foyer d'agent temporaire");
+        std::fs::write(dir.path().join("identity.toml"), body).expect("écrire identity.toml");
+        dir
+    }
+
+    /// La graine de V4 et de V5, à un octet près. Les deux foyers sortent de la
+    /// **même** fonction pour que l'écart mesuré soit celui de la clé et non
+    /// celui de deux montages qui auraient divergé.
+    fn home_with_enabled(enabled: bool) -> tempfile::TempDir {
+        agent_home(&format!(
+            "name = \"mika\"\nemoji = \"🧪\"\nenabled = {enabled}\n"
+        ))
+    }
+
+    /// Une ligne posée en base puis relue : les ~35 champs de [`Task`] ne se
+    /// construisent pas à la main (même geste que `curator_task`).
+    ///
+    /// `trigger_type` est un paramètre parce que c'est le **seul** champ qui
+    /// sépare V4 de la branche (b) de V5 — la graine est commune, et la
+    /// différence mesurée est celle du champ.
+    async fn seeded_task(db: &AsyncDatabase, label: &str, trigger_type: &str) -> crate::db::Task {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: trigger_type.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "run_skill".to_string(),
+                action_config: format!(r#"{{"trigger":"{label}"}}"#),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .expect("poser la ligne de la sonde");
+        db.get_task(&id).await.unwrap().expect("task must exist")
+    }
+
+    /// **V4** — une récurrente d'un agent dont la racine porte `enabled = false`
+    /// est refusée au tir. C'est la population que la porte à l'enregistrement
+    /// ne voit pas : la ligne est déjà là.
+    #[tokio::test]
+    async fn mika2456_le_filet_refuse_une_recurrente_dun_agent_desactive() {
+        let home = home_with_enabled(false);
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "mika#2456 — `enabled = false` à la racine doit refuser le tir \
+             d'une récurrente, quelle que soit la date de naissance de la ligne"
+        );
+    }
+
+    /// **V5 (a)** — contrôle négatif sur la clé : même graine, `enabled = true`,
+    /// et le filet laisse passer. Sans lui, V4 passerait aussi sur un filet qui
+    /// refuse tout.
+    #[tokio::test]
+    async fn mika2456_le_filet_laisse_passer_une_recurrente_dun_agent_active() {
+        let home = home_with_enabled(true);
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            !dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "un agent activé tire ses récurrentes normalement — sinon le filet \
+             ne mesure pas `enabled` mais sa propre présence"
+        );
+    }
+
+    /// **V5 (b)** — contrôle négatif sur le `trigger_type` : même `enabled =
+    /// false`, mais un rappel (`time`) passe. `enabled = false` à la racine
+    /// nomme les récurrentes, pas l'agent entier — et c'est très exactement le
+    /// défaut que le `if false &&` de la wip produisait.
+    #[tokio::test]
+    async fn mika2456_le_filet_ne_touche_pas_un_rappel_dun_agent_desactive() {
+        let home = home_with_enabled(false);
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::TIME,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            !dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "mika#2456 R-3 — un `trigger_type` non récurrent n'est pas du \
+             ressort de cette porte, même sur un agent désactivé"
+        );
+    }
+
+    /// **V6** — le filet n'usurpe pas la décision d'une porte de section.
+    /// Racine `enabled = true` **et** `[heartbeat] enabled = false` : le filet
+    /// rend `false`, et c'est `heartbeat_enabled_for_agent` qui éteint le
+    /// heartbeat. Les deux clés coexistent ; confondre leurs portées ferait de
+    /// chaque `[section] enabled = false` un agent éteint.
+    #[tokio::test]
+    async fn mika2456_le_filet_laisse_la_porte_de_section_decider() {
+        let home = agent_home(
+            "name = \"mika\"\nemoji = \"🧪\"\nenabled = true\n\n[heartbeat]\nenabled = false\n",
+        );
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            !dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "le filet lit la clé racine seule — `[heartbeat] enabled = false` \
+             n'est pas son affaire"
+        );
+        assert!(
+            !crate::task_engine::heartbeat_enabled_for_agent(home.path()).await,
+            "…et la porte de section, elle, dit bien non : sans cette seconde \
+             assertion, un `[heartbeat]` ignoré de bout en bout rendrait la \
+             première verte"
+        );
+    }
+
     // ---- mika#2329 — STOP global à chaud -----------------------------------
 
     /// Arme le STOP en posant le fichier sentinelle sous le home global donné.
