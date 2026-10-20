@@ -3536,8 +3536,10 @@ emoji = "✦"
     // tenu par un scan de source à allowlist vide) ; et `#[serial_test::serial]`
     // porte aussi sur les **voisins** qui ne font qu'atteindre le callsite
     // capturé — `test_load_identity_keeps_display_defaults_if_missing` et les
-    // quatre `mika2027_*` ci-dessous —, qui est la moitié portante du
-    // dispositif.
+    // quatre `mika2027_*` ci-dessous. Elle ne suffit pourtant pas ici, parce que
+    // les poisonneurs de CE callsite ne sont pas énumérables : voir le
+    // chargement à blanc de `journal_de_chargement`, qui est ce qui rend la
+    // capture déterministe.
 
     /// Un abonné qui écrit dans un tampon mémoire, pour **lire** la ligne de
     /// posture plutôt que de la supposer. Idiome de `compaction_handsoff`.
@@ -3570,7 +3572,35 @@ emoji = "✦"
     ///
     /// L'abonné est déposé avant le retour : lire le tampon pendant que le
     /// `DefaultGuard` vit laisserait la capture ouverte sur les assertions.
+    ///
+    /// # Le chargement à blanc n'est pas un réchauffement décoratif
+    ///
+    /// `#[serial_test::serial]` ne sérialise que contre ses propres porteurs, et
+    /// ici la liste des **poisonneurs** n'est pas énumérable : `load_identity` a
+    /// ~25 appelants de production, dont `build_system_prompt` lui-même, qui
+    /// l'appelle pour **chaque agent voisin** du home — donc à peu près
+    /// n'importe quel test de ce binaire atteint l'un de ces cinq callsites, et
+    /// un test futur écrit ailleurs dans la crate en devient un sans le savoir.
+    /// Mesuré : `cargo test -p mika-agent --lib` perd la course sur la branche
+    /// `default_fallback` là où `--lib prompt::tests` la gagne.
+    ///
+    /// La fenêtre que mika#2646 décrit est celle d'un callsite **jamais encore
+    /// enregistré** : le premier thread à l'atteindre décide son `Interest`, et
+    /// s'il n'a pas d'abonné c'est `never`, globalement. Un empoisonnement
+    /// **antérieur** à l'installation, lui, est réparé par `set_default` —
+    /// `install_capturing_subscriber` rebuild le cache, et le rebuild recalcule
+    /// tous les callsites **déjà enregistrés** sous tous les dispatchers
+    /// enregistrés, dont le nôtre.
+    ///
+    /// D'où ce chargement à blanc : il atteint les cinq callsites **avant**
+    /// l'installation, donc ils sont enregistrés quand le rebuild passe, donc
+    /// plus aucune première-atteinte concurrente ne peut les éteindre. La course
+    /// n'est pas retentée, elle est rendue impossible — ce qui est la seule
+    /// forme acceptable ici, un test qui dépend d'un ordre d'ordonnancement
+    /// étant un test qui rougira un jour sur du code juste.
     fn journal_de_chargement(home_dir: &Path) -> (Identity, String) {
+        let _ = load_identity(home_dir);
+
         let (subscriber, buf) = capturing_subscriber();
 
         let identity = {
