@@ -27,6 +27,12 @@
 //!    outcome promotes. A gate that refuses whenever GitHub hiccups would close
 //!    the loop as effectively as the wedge it exists to remove.
 //!
+//!    **Une exception, et elle est nommée** (mika#2837) : la sonde « une PR
+//!    mergée porte-t-elle cette branche absente ? » refuse quand elle ne peut
+//!    pas répondre. Elle ne rétrécit pourtant rien — sans elle, ce ticket était
+//!    refusé de toute façon. Elle *élargit* le chemin d'acceptation, et
+//!    seulement sur une preuve.
+//!
 //! ## The `wip(...)` disposition (AC5)
 //!
 //! A stale branch carrying more than its plan commit — partial work from a
@@ -3121,6 +3127,80 @@ async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasure
     }
 }
 
+/// La sonde « une PR mergée porte-t-elle cette branche ? » (mika#2837).
+///
+/// Toute la décision vit dans [`parse_merged_pr_for_branch`] ; cette fonction
+/// ne fait que l'appel et les deux sondes de journal.
+///
+/// **`--state all`, pas `--state merged`.** Le discriminant « mergée » doit
+/// vivre dans notre code, là où un test l'atteint sur une charge figée.
+/// Délégué au filtre de la forge, le contrôle négatif d'AC4 — une PR fermée
+/// sans merge — ne serait vérifiable que contre le réseau.
+///
+/// **Les deux sondes sont émises ici**, et non dans
+/// [`classify_absent_branch`], qui est pure et le reste : une fonction pure qui
+/// journalise émet une ligne par test qui l'appelle, et le journal cesse d'être
+/// une trace de production.
+async fn gh_merged_pr_for_branch(
+    github_token: &str,
+    issue_number: u64,
+    branch: &str,
+) -> Result<Option<MergedPrEvidence>> {
+    let probe: Result<Option<MergedPrEvidence>> = async {
+        let output = run_gh(
+            github_token,
+            GhSubject::Repo,
+            &[
+                "pr",
+                "list",
+                "--repo",
+                DEFAULT_REPO,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,headRefName",
+                "--limit",
+                "30",
+            ],
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("gh pr list --head {branch} failed: {stderr}"));
+        }
+        parse_merged_pr_for_branch(&String::from_utf8_lossy(&output.stdout), branch)
+    }
+    .await;
+
+    match &probe {
+        Ok(Some(evidence)) => info!(
+            event = "auto_pull_branch_deleted_by_merge",
+            issue = issue_number,
+            branch,
+            pr = evidence.number,
+            merged_at = %evidence.merged_at,
+            "auto_pull: le merge de cette PR a supprimé la branche du callout ; \
+             son plan est sur `main`, donc pas de gate"
+        ),
+        // Rien sur « aucune PR mergée » : le refus se journalise déjà par son
+        // audit et se commente sur la forge. Une ligne de plus ne dirait que ce
+        // que `merged_pr_probe` porte.
+        Ok(None) => {}
+        Err(error) => warn!(
+            event = "auto_pull_merged_pr_probe_unreadable",
+            issue = issue_number,
+            branch,
+            error = %error,
+            "auto_pull: la sonde « une PR mergée porte-t-elle cette branche ? » \
+             n'a pas pu répondre ; le ticket reste au gate (AC3)"
+        ),
+    }
+
+    probe
+}
+
 /// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
 /// promoted; on `false` the ticket has already been handed to the operator.
 ///
@@ -3148,6 +3228,17 @@ async fn promotion_gate_allows(
     let measurement = match branch.as_deref() {
         Some(b) => gh_compare_branch(github_token, b).await,
         None => StalenessMeasurement::NoBranchCallout,
+    };
+    // mika#2837 — « absente d'`origin` » n'est pas encore une décision : on
+    // demande *pourquoi*. Un second appel, et seulement sur cette branche-là du
+    // match : le cas courant d'un ticket à plusieurs vols est le plus bénin des
+    // deux — le merge du vol précédent a supprimé la branche, et son plan est
+    // sur `main`. Le refuser coûtait un tour d'opérateur par vol.
+    let measurement = match (measurement, branch.as_deref()) {
+        (StalenessMeasurement::BranchAbsent { .. }, Some(b)) => {
+            classify_absent_branch(gh_merged_pr_for_branch(github_token, issue.number, b).await)
+        }
+        (m, _) => m,
     };
     let threshold = max_behind();
     let decision = classify_promotion(&measurement, branch.as_deref(), threshold);
