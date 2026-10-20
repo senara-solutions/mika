@@ -565,6 +565,17 @@ regenerate it**: bootstrap only runs on an uninitialized home. A fail-closed
 start also empties the agent's `skills/` directory of its bundled-skill symlinks
 (re-materialized on the first valid start).
 
+Those three names describe the *state of the file*. Since mika#2784 the
+**posture** says itself too, on its own name: `agent_fail_closed_posture`
+(ERROR), once per identity load, carrying `agent`, `cause`
+(`missing_file` | `unreadable` | `parse_error`), `path`, and `tools_allowlist`
+(`absent` | `present` — `absent` today; the tightening is a separate,
+doctrine-gated change). `identity_toml_malformed` additionally carries
+`posture` (`fail_closed` | `default_fallback`), because that one name covers
+both the well-known-agent fail-closed outcome and the user-defined-agent
+permissive fallback. The posture line's **absence** means a binary that predates
+mika#2784, not a healthy agent.
+
 The supported re-provisioning gesture is **`mika agents reprovision <agent>`**
 (mika#2230), which re-applies the authoritative `identity.toml` **and** `soul.md`
 — both, because a tier has two axes since mika#2023 and the boot-time tier guard
