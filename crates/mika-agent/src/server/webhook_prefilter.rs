@@ -527,14 +527,22 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
     // L'URL d'issue est obligatoire, et son absence rend le chemin
     // d'aujourd'hui : elle est la clé de `issue_has_active_task`, donc sans
     // elle on ne peut pas savoir si un ticket est en vol, et AC7 refuse de
-    // deviner. Un `issue_comment` sur une PR n'en porte pas non plus
-    // (`extract_issue_url` ignore le segment `/pull/`), et il garde son tour.
+    // deviner.
+    //
+    // **La clé se lit sur la ligne 2 du gabarit, et nulle part ailleurs.** Le
+    // gateway y pose l'URL du sujet (`github.rs` : `{comment_url}` pour un
+    // commentaire, `{url}` pour une fermeture) ; le scanner
+    // d'`extract_issue_url` parcourt tout le texte, donc sur un commentaire de
+    // PR (`/pull/N#issuecomment-…`) il prendrait la première URL d'issue
+    // citée dans le CORPS — un autre ticket, lu comme sans tâche, et un
+    // commentaire de PR qui entre dans (h) alors que § D4 l'en exclut.
     let half = match trigger_class(text) {
         TriggerClass::IssueComment => TriageHalf::Comment,
         TriggerClass::IssueClosed => TriageHalf::IssueClosed,
         _ => return None,
     };
-    crate::server::upstream_close_handler::extract_issue_url(text).map(|issue_url| {
+    let subject_line = text.lines().nth(1)?;
+    crate::server::upstream_close_handler::extract_issue_url(subject_line).map(|issue_url| {
         Candidate::HumanTextNoTask {
             issue_url,
             half,
@@ -3200,6 +3208,27 @@ pub(crate) mod tests {
         let sur_une_pr = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/pull/2854#issuecomment-123\n\nlève operator-gated";
         assert_eq!(trigger_class(sur_une_pr), TriggerClass::IssueComment);
         assert!(classify(sur_une_pr).is_none());
+
+        // Le piège du scanner : un commentaire de PR dont le CORPS cite une
+        // issue. La clé ne vient que de la ligne 2 ; sinon ce commentaire
+        // entrerait dans (h) sous la clé d'un autre ticket.
+        let pr_citant_une_issue = format!(
+            "{sur_une_pr}\nvoir https://github.com/senara-solutions/mika/issues/1\nhttps://github.com/senara-solutions/mika/issues/1"
+        );
+        assert!(classify(&pr_citant_une_issue).is_none());
+
+        // Contrôle positif : le même corps sous un commentaire d'ISSUE garde la
+        // clé de la ligne 2, pas celle du corps.
+        assert_eq!(
+            classify(&format!(
+                "{COMMENT_2854}\nhttps://github.com/senara-solutions/mika/issues/1"
+            )),
+            Some(Candidate::HumanTextNoTask {
+                issue_url: ISSUE_URL_2854.into(),
+                half: TriageHalf::Comment,
+                text: format!("{COMMENT_2854}\nhttps://github.com/senara-solutions/mika/issues/1"),
+            })
+        );
     }
 
     /// AC7 — un ticket **avec** tâche de boucle garde le tour, et le triage
