@@ -6,6 +6,7 @@ pub mod check_suite_dedup;
 pub mod checkpoint;
 pub mod ci_failure_handler;
 pub mod ci_success_handler;
+pub(crate) mod comment_triage;
 pub mod dashboard;
 pub mod dashboard_dev_runs;
 pub mod deadline_verdict;
