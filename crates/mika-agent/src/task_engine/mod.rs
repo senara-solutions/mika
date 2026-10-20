@@ -60,6 +60,51 @@ pub(crate) const RECURRING_REGISTRATION_RETRIED_EVENT: &str = "recurring_registr
 /// prochain redémarrage.
 pub(crate) const RECURRING_REGISTRATION_FAILED_EVENT: &str = "recurring_registration_failed";
 
+/// Événement de journal (INFO) : la porte récurrente niveau-agent a été
+/// résolue (mika#2456).
+///
+/// **Régime attendu : NON VIDE, à chaque résolution, les DEUX branches.** La
+/// branche saine l'émet aussi, et c'est le point : sans elle, « la porte dit
+/// oui » et « la porte n'a pas été consultée » rendent des octets identiques,
+/// et un agent désactivé qui tire quand même ne se distingue pas d'un agent
+/// activé — la classe mika#2205. Les champs portent `enabled` **et** `source`
+/// (`identity` ou `default`), parce qu'un `true` par défaut et un `true` écrit
+/// à la main ne se diagnostiquent pas pareil (mika#2331 : absent ≠ zéro).
+///
+/// Délibérément **sans déduplication** en vol 1 : une ligne par appel, soit
+/// ~7 lignes par agent par démarrage. Le dédoublonnage coûterait un
+/// `OnceLock<Mutex<HashSet>>` pour économiser du bruit qu'on veut lire.
+pub(crate) const AGENT_RECURRING_GATE_RESOLVED_EVENT: &str = "agent_recurring_gate_resolved";
+
+/// Événement de journal (INFO) : un enregistrement récurrent a été refusé
+/// parce que l'agent porte `enabled = false` (mika#2456).
+///
+/// **Régime attendu : VIDE sur un agent activé, NON VIDE sur un agent
+/// désactivé.** INFO et non WARN : ce refus est le réglage qui fonctionne, pas
+/// un incident. C'est la ligne qui répond à « pourquoi mika-test n'a-t-il plus
+/// de heartbeat ? » sans qu'il faille deviner.
+pub(crate) const RECURRING_REGISTRATION_REFUSED_EVENT: &str =
+    "recurring_registration_refused_agent_disabled";
+
+/// Événement de journal (INFO) : l'annulation posée par la porte a abouti
+/// après réessai sous contention SQLite (mika#2456).
+///
+/// **Nom distinct de [`RECURRING_REGISTRATION_RETRIED_EVENT`] délibérément.**
+/// Les deux populations — un enregistrement rejoué, une annulation rejouée —
+/// ne sont pas soustractibles sous un nom commun : c'est exactement la classe
+/// mika#2205, que ce dépôt a payée quatre fois.
+pub(crate) const RECURRING_GATE_CANCEL_RETRIED_EVENT: &str = "recurring_gate_cancel_retried";
+
+/// Événement de journal (ERROR) : la porte n'a pas pu annuler la ligne
+/// existante, le budget de réessai épuisé (mika#2456).
+///
+/// **Régime attendu : VIDE.** ERROR parce que la conséquence n'est pas
+/// rattrapable au prochain tick : la ligne reste `recurring_active` et tire —
+/// c'est-à-dire que la porte a dit non et que le coût continue. Le refus est
+/// journalisé juste avant, donc une ligne de refus sans ligne d'échec signifie
+/// que l'annulation a pris.
+pub(crate) const RECURRING_GATE_CANCEL_FAILED_EVENT: &str = "recurring_gate_cancel_failed";
+
 /// Trois tentatives, entrecoupées de 250 ms puis 1000 ms (mika#2601).
 ///
 /// **Chaque tentative porte déjà les 5 s de `busy_timeout` de la connexion**
@@ -224,17 +269,27 @@ where
 /// keep blocking through the mika#1742 refuse-to-zombie guard — only the
 /// deliberate `cancelled` state is cleared here.
 ///
-/// **Depuis mika#2601 l'enregistrement réessaie sous contention SQLite.** La
-/// signature publique est inchangée, donc les huit sites d'appel ont un diff
-/// nul : le ticket porte sur le réessai, pas sur la forme des appelants.
+/// **Depuis mika#2601 l'enregistrement réessaie sous contention SQLite.**
+///
+/// **Depuis mika#2456 `home_dir` est dans la signature, et ce n'est pas un
+/// confort.** La porte récurrente niveau-agent se lit dans l'`identity.toml`
+/// de l'agent, donc il faut son foyer pour l'évaluer ; le passer en paramètre
+/// plutôt que le déduire fait du compilateur le gardien de la propriété R-3 —
+/// un site d'enregistrement qui échapperait à la porte ne compile pas. Un
+/// appelant qui passerait le foyer d'un *autre* agent est le seul échappement
+/// résiduel, et il est nommé ici plutôt que tu : le `db` et le `home_dir`
+/// viennent du même `AgentState` sur les sept sites du serveur, du même
+/// `DbContext` sur les trois sites CLI.
 pub async fn ensure_recurring_task(
     db: &AsyncDatabase,
+    home_dir: &Path,
     label: &str,
     cron_expr: &str,
     action_config: &str,
 ) {
     let _ = ensure_recurring_task_with_policy(
         db,
+        home_dir,
         label,
         cron_expr,
         action_config,
@@ -253,13 +308,38 @@ pub async fn ensure_recurring_task(
 /// `INSERT OR IGNORE`, en autocommit, **l'écriture en dernier**, donc un échec
 /// laisse la base intacte ; `update_recurring_task_cron` est un `UPDATE` vers
 /// une valeur fixe.
+///
+/// **La porte mika#2456 est en tête de cette fonction, AVANT `retry_on_busy`.**
+/// C'est la position qui compte : la placer dans [`ensure_recurring_task`]
+/// laisserait les appels directs à cette variante — les tests, et tout appelant
+/// futur qui voudrait son propre budget — enregistrer sans porte. Avant le
+/// réessai, parce qu'un agent désactivé ne doit pas consommer de budget de
+/// contention pour une écriture qu'on va refuser.
 pub(crate) async fn ensure_recurring_task_with_policy(
     db: &AsyncDatabase,
+    home_dir: &Path,
     label: &str,
     cron_expr: &str,
     action_config: &str,
     policy: &RecurringRetryPolicy,
 ) -> Result<(), RegistrationFailure> {
+    if !agent_recurring_tasks_enabled(home_dir, db.agent_id()).await {
+        info!(
+            target: "mika::otel",
+            event = RECURRING_REGISTRATION_REFUSED_EVENT,
+            agent_id = %db.agent_id(),
+            label,
+            "mika#2456: agent carries `enabled = false` — recurring task not \
+             registered, and any pre-existing row for this label is cancelled"
+        );
+        cancel_recurring_task_for_disabled_agent(db, label, policy).await;
+        // `Ok` et non `Err` : un refus de porte n'est pas un enregistrement
+        // perdu. `RegistrationFailure` dit « rien ne tirera ce label et il
+        // faudrait s'en inquiéter » ; ici rien ne tire *parce que c'est le
+        // réglage demandé*. Les confondre ferait de la porte un incident.
+        return Ok(());
+    }
+
     let outcome = retry_on_busy(policy, || {
         register_recurring_task_once(db, label, cron_expr, action_config)
     })
@@ -299,6 +379,62 @@ pub(crate) async fn ensure_recurring_task_with_policy(
                 busy,
                 error,
             })
+        }
+    }
+}
+
+/// La porte a refusé : annuler la ligne qui existait déjà, en réessayant sous
+/// contention SQLite (mika#2456).
+///
+/// **L'annulation réessaie, et c'est dissymétrique avec rien.** Un
+/// enregistrement perdu sous contention se rattrape au prochain démarrage ;
+/// une annulation perdue laisse la ligne `recurring_active` et elle **tire** —
+/// c'est-à-dire que la porte a dit non et que le coût que ce ticket mesure
+/// continue de courir. Le cas qui rend le réessai nécessaire est précisément
+/// celui de mika#2601 : un démarrage à plusieurs agents où un pic de verrou
+/// prend la première tentative.
+///
+/// Réutilise le budget déjà passé par l'appelant plutôt qu'un second réglage :
+/// un agent désactivé n'a pas de raison d'avoir une patience différente d'un
+/// agent activé.
+///
+/// Sans valeur de retour : l'appelant n'a rien à décider de l'issue — il refuse
+/// l'enregistrement dans les deux cas. Ce que l'issue change est ce qui est
+/// *dit*, et c'est dit ici.
+async fn cancel_recurring_task_for_disabled_agent(
+    db: &AsyncDatabase,
+    label: &str,
+    policy: &RecurringRetryPolicy,
+) {
+    match retry_on_busy(policy, || db.cancel_recurring_task_by_label(label)).await {
+        Ok(report) => {
+            if report.attempts > 1 {
+                info!(
+                    target: "mika::otel",
+                    event = RECURRING_GATE_CANCEL_RETRIED_EVENT,
+                    agent_id = %db.agent_id(),
+                    label,
+                    attempts = report.attempts,
+                    waited_ms = report.waited.as_millis() as u64,
+                    "mika#2456: gate cancellation succeeded after retrying under \
+                     SQLite contention"
+                );
+            }
+        }
+        Err((report, busy, error)) => {
+            error!(
+                target: "mika::otel",
+                event = RECURRING_GATE_CANCEL_FAILED_EVENT,
+                agent_id = %db.agent_id(),
+                label,
+                attempts = report.attempts,
+                waited_ms = report.waited.as_millis() as u64,
+                busy,
+                error = %error,
+                "mika#2456: gate refused this label but could NOT cancel its \
+                 existing row — the row stays active and WILL fire on a \
+                 disabled agent"
+            );
         }
     }
 }
@@ -482,6 +618,21 @@ pub enum RearmError {
         git_hash: String,
         routable_triggers: String,
     },
+    /// mika#2456 — l'agent porte `enabled = false`. Ré-armer ne produirait
+    /// qu'un enregistrement que la porte annulerait dans la seconde.
+    ///
+    /// **Un refus, pas un ré-armement annulé.** Les deux laissent la base dans
+    /// le même état ; ils ne laissent pas l'opérateur dans le même. Un
+    /// ré-armement qui « réussit » puis disparaît renvoie `NotRegistered`, dont
+    /// le message envoie lire un WARN mika#1742 qui n'existe pas — il ferait
+    /// chercher un défaut là où il y a un réglage. Ce bras-ci nomme la clé et
+    /// le fichier à éditer.
+    #[error(
+        "refusing to re-arm `{label}`: agent `{agent_id}` carries `enabled = false` in its \
+         identity.toml, so the recurring gate would cancel the re-registration immediately \
+         (mika#2456). Set `enabled = true` (or remove the key) and restart first."
+    )]
+    AgentDisabled { agent_id: String, label: String },
     /// La ligne morte n'a pas de `cron_expr` : l'opérateur ne doit pas en
     /// retaper un, donc la commande refuse plutôt que d'en inventer un.
     #[error("recurring task `{label}` (task {task_id}) has no cron_expr to re-register with")]
@@ -531,8 +682,16 @@ pub struct RearmOutcome {
 /// **Refusé : une exemption automatique au second décès.** Ce serait désarmer
 /// mika#1742 pour toute la classe. Le ré-armement est un acte explicite,
 /// imputable, et chaque décès postérieur retrouve un veto armé.
+///
+/// **`home_dir` depuis mika#2456 :** le pas 5 passe par
+/// [`ensure_recurring_task`], qui porte désormais la porte niveau-agent — donc
+/// cette fonction doit pouvoir l'évaluer, et le fait **avant** le pas 3. Un
+/// ré-armement sur agent désactivé serait sinon tracé et marqué avant d'être
+/// annulé : un audit qui dit « ré-armé » pour une récurrente qui ne tirera
+/// jamais.
 pub async fn rearm_recurring_task(
     db: &AsyncDatabase,
+    home_dir: &Path,
     label: &str,
 ) -> Result<RearmOutcome, RearmError> {
     if db.get_recurring_task_cron(label).await?.is_some() {
@@ -595,6 +754,23 @@ pub async fn rearm_recurring_task(
         });
     }
 
+    // mika#2456 — au même rang que la routabilité : avant la trace et avant le
+    // marqueur, parce qu'un refus ne doit laisser aucune des deux.
+    if !agent_recurring_tasks_enabled(home_dir, db.agent_id()).await {
+        warn!(
+            target: "mika::otel",
+            event = "recurring_operator_rearm_refused",
+            label = %target.label,
+            trigger = %trigger,
+            reason = "agent_disabled",
+            "mika#2456: rearm refused — agent carries `enabled = false`"
+        );
+        return Err(RearmError::AgentDisabled {
+            agent_id: db.agent_id.clone(),
+            label: target.label.clone(),
+        });
+    }
+
     let cron_expr = target
         .cron_expr
         .clone()
@@ -628,7 +804,14 @@ pub async fn rearm_recurring_task(
 
     let rows_marked = db.mark_recurring_operator_rearm(&target.label).await?;
 
-    ensure_recurring_task(db, &target.label, &cron_expr, &target.action_config).await;
+    ensure_recurring_task(
+        db,
+        home_dir,
+        &target.label,
+        &cron_expr,
+        &target.action_config,
+    )
+    .await;
 
     if db.get_recurring_task_cron(&target.label).await?.is_none() {
         return Err(RearmError::NotRegistered {
@@ -655,6 +838,38 @@ pub async fn rearm_recurring_task(
         dead_status: target.status,
         rows_marked,
     })
+}
+
+/// La porte récurrente niveau-agent : cet agent a-t-il le droit de porter des
+/// tâches récurrentes (mika#2456) ?
+///
+/// Lit `enabled` à la racine de `identity.toml` — la clé niveau-agent, pas une
+/// sous-clé par feature comme `[heartbeat] enabled`. Les deux coexistent et ne
+/// se remplacent pas : celle-ci coupe **toutes** les récurrentes de l'agent,
+/// celle-là en coupe une.
+///
+/// **Une identity.toml absente, illisible ou malformée rend `true`** (R-4), via
+/// les chemins de repli de [`crate::prompt::load_identity_async`]. L'inverse
+/// ferait d'une lecture transitoirement ratée un arrêt du substrat, et ce
+/// serait un arrêt muet : la porte est soustractive, seul un `false` écrit
+/// éteint quelque chose (mika#2023 — une absence n'échoue pas fermé).
+///
+/// Annonce sa résolution sur les **deux** branches
+/// ([`AGENT_RECURRING_GATE_RESOLVED_EVENT`]) : c'est ce qui rend la porte
+/// observable plutôt que devinable.
+pub(crate) async fn agent_recurring_tasks_enabled(home_dir: &Path, agent_id: &str) -> bool {
+    let (enabled, source) = crate::prompt::load_identity_async(home_dir)
+        .await
+        .recurring_tasks_enabled();
+    info!(
+        target: "mika::otel",
+        event = AGENT_RECURRING_GATE_RESOLVED_EVENT,
+        agent_id,
+        enabled,
+        source,
+        "mika#2456: agent-level recurring gate resolved"
+    );
+    enabled
 }
 
 /// Check if heartbeat is enabled for the agent from identity.toml config.
@@ -718,6 +933,14 @@ mod tests {
         AsyncDatabase::new(Database::open_in_memory().unwrap())
     }
 
+    /// Un foyer d'agent sans `identity.toml` : la porte mika#2456 y résout
+    /// `(true, "default")`, donc ces tests mesurent ce qu'ils mesuraient avant
+    /// la porte. Le `TempDir` doit rester vivant le temps du test — d'où le
+    /// retour par valeur plutôt qu'un `PathBuf`.
+    fn test_home() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     async fn statuses_for(db: &AsyncDatabase, label: &str) -> Vec<String> {
         db.get_tasks_by_status(vec![
             "recurring_active".to_string(),
@@ -748,9 +971,10 @@ mod tests {
     #[tokio::test]
     async fn knob_off_then_on_reregisters_the_feeder() {
         let db = test_async_db();
+        let home = test_home();
 
         // Boot 1 — knob absent : le feeder s'inscrit.
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
         assert_eq!(
             statuses_for(&db, FEEDER_LABEL).await,
             vec!["recurring_active".to_string()],
@@ -768,7 +992,7 @@ mod tests {
         );
 
         // Boot 3 — knob retiré : le feeder doit revenir.
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
 
         let statuses = statuses_for(&db, FEEDER_LABEL).await;
         assert!(
@@ -784,7 +1008,8 @@ mod tests {
     #[tokio::test]
     async fn recent_failed_still_blocks_reregistration() {
         let db = test_async_db();
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        let home = test_home();
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
 
         let label = FEEDER_LABEL.to_string();
         db.with_db(move |d| {
@@ -799,7 +1024,7 @@ mod tests {
         .await
         .unwrap();
 
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
 
         let statuses = statuses_for(&db, FEEDER_LABEL).await;
         assert_eq!(
@@ -818,8 +1043,14 @@ mod tests {
 
     /// Inscrit `label` puis le fait mourir `failed` dans la fenêtre de grâce,
     /// de cause quelconque (non marquée) — l'état qui arme le veto mika#1742.
-    async fn kill_in_window(db: &AsyncDatabase, label: &str, cron: &str, config: &str) {
-        ensure_recurring_task(db, label, cron, config).await;
+    async fn kill_in_window(
+        db: &AsyncDatabase,
+        home_dir: &Path,
+        label: &str,
+        cron: &str,
+        config: &str,
+    ) {
+        ensure_recurring_task(db, home_dir, label, cron, config).await;
         let label = label.to_string();
         db.with_db(move |d| {
             d.conn.execute(
@@ -839,16 +1070,17 @@ mod tests {
     #[tokio::test]
     async fn mika2446_rearm_revives_a_dead_recurrence_and_traces_the_act() {
         let db = test_async_db();
-        kill_in_window(&db, REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
+        let home = test_home();
+        kill_in_window(&db, home.path(), REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
 
         // Précondition : le chemin nominal (redémarrage) est refusé par le veto.
-        ensure_recurring_task(&db, REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
         assert_eq!(
             statuses_for(&db, REAP_LABEL).await,
             vec!["failed".to_string()]
         );
 
-        let outcome = rearm_recurring_task(&db, REAP_LABEL)
+        let outcome = rearm_recurring_task(&db, home.path(), REAP_LABEL)
             .await
             .expect("un trigger routable doit être ré-armé");
         assert_eq!(outcome.label, REAP_LABEL);
@@ -885,9 +1117,17 @@ mod tests {
     #[tokio::test]
     async fn mika2446_rearm_refuses_a_trigger_this_binary_cannot_route() {
         let db = test_async_db();
-        kill_in_window(&db, "zorglub_scan", REAP_CRON, r#"{"trigger":"zorglub"}"#).await;
+        let home = test_home();
+        kill_in_window(
+            &db,
+            home.path(),
+            "zorglub_scan",
+            REAP_CRON,
+            r#"{"trigger":"zorglub"}"#,
+        )
+        .await;
 
-        let err = rearm_recurring_task(&db, "zorglub_scan")
+        let err = rearm_recurring_task(&db, home.path(), "zorglub_scan")
             .await
             .expect_err("un trigger non routable doit être refusé");
         match &err {
@@ -920,7 +1160,14 @@ mod tests {
             "un refus ne trace pas d'acte"
         );
         // Aucun marqueur posé : le chemin nominal reste refusé par le veto.
-        ensure_recurring_task(&db, "zorglub_scan", REAP_CRON, r#"{"trigger":"zorglub"}"#).await;
+        ensure_recurring_task(
+            &db,
+            home.path(),
+            "zorglub_scan",
+            REAP_CRON,
+            r#"{"trigger":"zorglub"}"#,
+        )
+        .await;
         assert_eq!(
             statuses_for(&db, "zorglub_scan").await,
             vec!["failed".to_string()]
@@ -1139,6 +1386,7 @@ mod tests {
         let (ra, rb) = tokio::join!(
             ensure_recurring_task_with_policy(
                 &db_a,
+                dir.path(),
                 FEEDER_LABEL,
                 FEEDER_CRON,
                 FEEDER_CONFIG,
@@ -1146,6 +1394,7 @@ mod tests {
             ),
             ensure_recurring_task_with_policy(
                 &db_b,
+                dir.path(),
                 FEEDER_LABEL,
                 FEEDER_CRON,
                 FEEDER_CONFIG,
@@ -1192,6 +1441,7 @@ mod tests {
         let blocker = hold_write_lock(path.clone(), Duration::from_millis(600));
         let res = ensure_recurring_task_with_policy(
             &db,
+            dir.path(),
             FEEDER_LABEL,
             FEEDER_CRON,
             FEEDER_CONFIG,
@@ -1218,15 +1468,16 @@ mod tests {
     #[tokio::test]
     async fn mika2446_rearm_refuses_unknown_and_already_armed_labels() {
         let db = test_async_db();
+        let home = test_home();
         assert!(matches!(
-            rearm_recurring_task(&db, REAP_LABEL).await,
+            rearm_recurring_task(&db, home.path(), REAP_LABEL).await,
             Err(RearmError::NoDeadRow { .. })
         ));
         assert!(statuses_for(&db, REAP_LABEL).await.is_empty());
 
-        ensure_recurring_task(&db, REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
         assert!(matches!(
-            rearm_recurring_task(&db, REAP_LABEL).await,
+            rearm_recurring_task(&db, home.path(), REAP_LABEL).await,
             Err(RearmError::AlreadyArmed { .. })
         ));
     }

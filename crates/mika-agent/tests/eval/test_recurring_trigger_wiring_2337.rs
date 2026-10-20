@@ -336,10 +336,11 @@ fn registered_triggers() -> BTreeMap<String, String> {
                 .unwrap_or_else(|| panic!("{rel}: appel à ensure_recurring_task non refermé"));
             assert_eq!(
                 args.len(),
-                4,
-                "{rel}: ensure_recurring_task prend 4 arguments ; la garde lit le \
-                 4e (`action_config`). Si la signature a changé, c'est ici qu'il \
-                 faut la suivre — pas dans une exemption."
+                5,
+                "{rel}: ensure_recurring_task prend 5 arguments depuis mika#2456 \
+                 (`home_dir` en 2e) ; la garde lit le 5e (`action_config`). Si la \
+                 signature a changé, c'est ici qu'il faut la suivre — pas dans une \
+                 exemption."
             );
 
             // mika#2446 — une seule exception, nommée : le ré-armement
@@ -350,20 +351,20 @@ fn registered_triggers() -> BTreeMap<String, String> {
             // lui-même gardé égal au `match` (D-1). L'exception ne vaut que si
             // ce test PRÉCÈDE l'appel dans le corps de `rearm_recurring_task` ;
             // toute autre forme retombe dans la halte ci-dessous.
-            if string_literal_content(&args[3]).is_none()
+            if string_literal_content(&args[4]).is_none()
                 && operator_rearm_site_is_routability_gated(&rel, src, idx)
             {
                 continue;
             }
 
-            let literal = string_literal_content(&args[3]).unwrap_or_else(|| {
+            let literal = string_literal_content(&args[4]).unwrap_or_else(|| {
                 panic!(
                     "{rel}: l'`action_config` de cet enregistrement n'est pas un \
                      littéral ({}), donc la garde ne peut pas lire le trigger qu'il \
                      déclare. Halte : une récurrence dont le destinataire est \
                      illisible est exactement l'incident mika#2337, et sa résolution \
                      est une décision de périmètre, pas un geste de poseur.",
-                    args[3]
+                    args[4]
                 )
             });
 
@@ -578,6 +579,14 @@ fn test_db() -> AsyncDatabase {
     AsyncDatabase::new_with_agent(db, AGENT_ID)
 }
 
+/// Un foyer d'agent sans `identity.toml` : la porte récurrente niveau-agent
+/// (mika#2456) y résout `(true, "default")`, donc ces sondes mesurent le
+/// câblage des triggers et rien d'autre. Un agent désactivé a ses propres
+/// sondes, dans `test_agent_disabled_recurring_gate_2456.rs`.
+fn test_home() -> tempfile::TempDir {
+    tempfile::tempdir().expect("foyer d'agent temporaire")
+}
+
 /// Dispatcher hermétique. `github_token` et `github_app` sont **tous deux**
 /// `None` : `resolve_periodic_scan_token` rend alors `None` et
 /// `dispatch_qa_review_reconcile` retourne `Ok(())` avant tout appel à `gh`.
@@ -688,7 +697,15 @@ async fn fire_recurring_with(
     dispatcher: Arc<TaskDispatcher>,
     settled: impl Fn(&mika_agent::db::Task) -> bool,
 ) -> String {
-    mika_agent::task_engine::ensure_recurring_task(db, label, "* * * * * *", action_config).await;
+    let home = test_home();
+    mika_agent::task_engine::ensure_recurring_task(
+        db,
+        home.path(),
+        label,
+        "* * * * * *",
+        action_config,
+    )
+    .await;
 
     let id = db
         .get_tasks_by_status(vec!["recurring_active".to_string()])
@@ -927,8 +944,10 @@ async fn mika2351_le_moteur_cli_ne_reclame_pas_un_trigger_inconnu() {
 
     // La ligne non routable est inscrite **avant** le tir et son état est
     // capturé : c'est son invariance, champ par champ, qui est mesurée.
+    let home = test_home();
     mika_agent::task_engine::ensure_recurring_task(
         &db,
+        home.path(),
         "zorglub_scan",
         "* * * * * *",
         r#"{"trigger":"zorglub"}"#,

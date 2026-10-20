@@ -50,6 +50,7 @@ fn make_identity() -> Identity {
     Identity {
         name: "Mika".to_string(),
         emoji: "M".to_string(),
+        enabled: None,
         reflection: None,
         heartbeat: None,
         kg: KgIdentityConfig::default(),

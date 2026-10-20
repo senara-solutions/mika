@@ -866,6 +866,13 @@ pub struct Identity {
     pub name: String,
     #[serde(default = "default_emoji")]
     pub emoji: String,
+    /// Porte niveau-agent : `false` éteint les tâches récurrentes de cet agent
+    /// (mika#2456). `Option` plutôt que `bool`, pour que l'absence de la clé
+    /// reste distinguable d'un `true` écrit à la main — c'est la provenance que
+    /// `recurring_tasks_enabled` annonce, et sans elle une absence serait
+    /// illisible dans la trace (mika#2331 : absent ≠ zéro).
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub reflection: Option<ReflectionConfig>,
     #[serde(default)]
@@ -897,6 +904,7 @@ impl Default for Identity {
         Self {
             name: default_name(),
             emoji: default_emoji(),
+            enabled: None,
             reflection: None,
             heartbeat: None,
             kg: KgIdentityConfig::default(),
@@ -905,6 +913,21 @@ impl Default for Identity {
             context: ContextIdentityConfig::default(),
             session: SessionIdentityConfig::default(),
             curator: None,
+        }
+    }
+}
+
+impl Identity {
+    /// `(en vigueur, provenance)` pour la porte récurrente niveau-agent (mika#2456).
+    ///
+    /// L'absence de la clé vaut `true` : la porte est strictement soustractive,
+    /// seul un `enabled = false` écrit éteint quelque chose. La provenance est
+    /// rendue avec la valeur parce qu'un `true` par défaut et un `true` écrit à
+    /// la main ne se diagnostiquent pas pareil (mika#2293).
+    pub fn recurring_tasks_enabled(&self) -> (bool, &'static str) {
+        match self.enabled {
+            Some(v) => (v, "identity"),
+            None => (true, "default"),
         }
     }
 }
@@ -1093,6 +1116,11 @@ fn fail_closed_identity() -> Identity {
     Identity {
         name: default_name(),
         emoji: default_emoji(),
+        // Délibérément `None`, donc récurrentes autorisées (mika#2456, R-4).
+        // Ce que fail-closed protège est la *permission* ; une identity.toml
+        // illisible ne doit pas éteindre les récurrentes d'un agent sain, sinon
+        // une lecture transitoirement ratée arrête le substrat sans le dire.
+        enabled: None,
         reflection: None,
         heartbeat: None,
         kg: KgIdentityConfig::default(),
@@ -3069,6 +3097,7 @@ mod tests {
         Identity {
             name: "Mika".to_string(),
             emoji: "✦".to_string(),
+            enabled: None,
             reflection: None,
             heartbeat: None,
             kg: KgIdentityConfig::default(),
@@ -3296,6 +3325,7 @@ emoji = "✦"
         let identity = Identity {
             name: "TestBot".to_string(),
             emoji: "🤖".to_string(),
+            enabled: None,
             reflection: None,
             heartbeat: None,
             kg: KgIdentityConfig::default(),
