@@ -214,23 +214,30 @@ pub(crate) struct RegistrationFailure {
 /// délibérément : c'est ce qui rend « une erreur non-busy n'est pas rejouée »
 /// une propriété de cette fonction, testable sans base, plutôt qu'une
 /// conséquence de ce que son appelant veut bien lui passer.
-async fn retry_on_busy<F, Fut>(
+///
+/// Générique sur la valeur de succès `T` (mika#2456) : une opération qui rend
+/// un compte le remonte intact à travers la boucle, et le rapport de réessai
+/// voyage à côté plutôt qu'à sa place.
+async fn retry_on_busy<T, F, Fut>(
     policy: &RecurringRetryPolicy,
     mut op: F,
-) -> Result<RetryReport, (RetryReport, bool, anyhow::Error)>
+) -> Result<(T, RetryReport), (RetryReport, bool, anyhow::Error)>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<()>>,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     let mut waited = Duration::ZERO;
     let mut attempt: u32 = 1;
     loop {
         match op().await {
-            Ok(()) => {
-                return Ok(RetryReport {
-                    attempts: attempt,
-                    waited,
-                });
+            Ok(value) => {
+                return Ok((
+                    value,
+                    RetryReport {
+                        attempts: attempt,
+                        waited,
+                    },
+                ));
             }
             Err(e) => {
                 let busy = crate::db::is_sqlite_busy(&e);
@@ -324,15 +331,21 @@ pub(crate) async fn ensure_recurring_task_with_policy(
     policy: &RecurringRetryPolicy,
 ) -> Result<(), RegistrationFailure> {
     if !agent_recurring_tasks_enabled(home_dir, db.agent_id()).await {
+        // L'annulation d'abord, le log ensuite : c'est ce qui permet au log de
+        // porter le compte de lignes réellement retirées (mika#2456) au lieu
+        // d'annoncer une annulation qu'il n'a pas encore vue.
+        let cancelled = cancel_recurring_task_for_disabled_agent(db, label, policy).await;
         info!(
             target: "mika::otel",
             event = RECURRING_REGISTRATION_REFUSED_EVENT,
             agent_id = %db.agent_id(),
             label,
+            cancelled,
             "mika#2456: agent carries `enabled = false` — recurring task not \
-             registered, and any pre-existing row for this label is cancelled"
+             registered. `cancelled` is how many pre-existing rows for this \
+             label were retired; a zero means none was live — unless \
+             recurring_gate_cancel_failed says the cancel itself did not land"
         );
-        cancel_recurring_task_for_disabled_agent(db, label, policy).await;
         // `Ok` et non `Err` : un refus de porte n'est pas un enregistrement
         // perdu. `RegistrationFailure` dit « rien ne tirera ce label et il
         // faudrait s'en inquiéter » ; ici rien ne tire *parce que c'est le
@@ -346,7 +359,7 @@ pub(crate) async fn ensure_recurring_task_with_policy(
     .await;
 
     match outcome {
-        Ok(report) => {
+        Ok(((), report)) => {
             if report.attempts > 1 {
                 info!(
                     event = RECURRING_REGISTRATION_RETRIED_EVENT,
@@ -398,16 +411,18 @@ pub(crate) async fn ensure_recurring_task_with_policy(
 /// un agent désactivé n'a pas de raison d'avoir une patience différente d'un
 /// agent activé.
 ///
-/// Sans valeur de retour : l'appelant n'a rien à décider de l'issue — il refuse
-/// l'enregistrement dans les deux cas. Ce que l'issue change est ce qui est
-/// *dit*, et c'est dit ici.
+/// Rend **le nombre de lignes réellement passées en `cancelled`** (mika#2456),
+/// et `0` quand l'annulation n'a pas abouti. L'appelant n'a rien à en décider —
+/// il refuse l'enregistrement dans les deux cas — mais il le *dit* : un zéro et
+/// un deux ne décrivent pas le même état du planificateur, et le compte est la
+/// seule chose qui les distingue dans les logs (mika#2293).
 async fn cancel_recurring_task_for_disabled_agent(
     db: &AsyncDatabase,
     label: &str,
     policy: &RecurringRetryPolicy,
-) {
+) -> usize {
     match retry_on_busy(policy, || db.cancel_recurring_task_by_label(label)).await {
-        Ok(report) => {
+        Ok((cancelled, report)) => {
             if report.attempts > 1 {
                 info!(
                     target: "mika::otel",
@@ -416,10 +431,12 @@ async fn cancel_recurring_task_for_disabled_agent(
                     label,
                     attempts = report.attempts,
                     waited_ms = report.waited.as_millis() as u64,
+                    cancelled,
                     "mika#2456: gate cancellation succeeded after retrying under \
                      SQLite contention"
                 );
             }
+            cancelled
         }
         Err((report, busy, error)) => {
             error!(
@@ -435,6 +452,10 @@ async fn cancel_recurring_task_for_disabled_agent(
                  existing row — the row stays active and WILL fire on a \
                  disabled agent"
             );
+            // Rien n'a été retiré : zéro est ici un fait, et c'est la ligne
+            // d'erreur ci-dessus qui dit qu'il ne vaut pas « aucune ligne ne
+            // tirait » (mika#2331).
+            0
         }
     }
 }
@@ -1215,14 +1236,20 @@ mod tests {
         let policy = RecurringRetryPolicy::production();
         let calls = std::cell::Cell::new(0u32);
 
-        let report = retry_on_busy(&policy, || {
+        // La valeur de succès est un compte quelconque : depuis mika#2456 la
+        // boucle est générique sur `T`, et ce test est le seul endroit sans
+        // base où l'on peut voir la valeur de la tentative **qui a réussi**
+        // ressortir intacte — un `Cell` capturé hors du futur aurait rendu
+        // celle de la dernière tentative, réussie ou non.
+        let (cancelled, report) = retry_on_busy(&policy, || {
             calls.set(calls.get() + 1);
             let n = calls.get();
-            async move { if n < 2 { Err(busy_err()) } else { Ok(()) } }
+            async move { if n < 2 { Err(busy_err()) } else { Ok(7usize) } }
         })
         .await
         .expect("la deuxième tentative aboutit");
 
+        assert_eq!(cancelled, 7, "la valeur rendue est celle du `Ok` obtenu");
         assert_eq!(calls.get(), 2, "exactement deux tentatives");
         assert_eq!(report.attempts, 2);
         assert_eq!(
@@ -1241,7 +1268,7 @@ mod tests {
 
         let (report, busy, _err) = retry_on_busy(&policy, || {
             calls.set(calls.get() + 1);
-            async move { Err(not_busy_err()) }
+            async move { Err::<(), _>(not_busy_err()) }
         })
         .await
         .expect_err("une erreur non-busy est rendue telle quelle");
@@ -1261,7 +1288,7 @@ mod tests {
 
         let (report, busy, _err) = retry_on_busy(&policy, || {
             calls.set(calls.get() + 1);
-            async move { Err(busy_err()) }
+            async move { Err::<(), _>(busy_err()) }
         })
         .await
         .expect_err("trois tentatives busy épuisent le budget");
@@ -1285,7 +1312,7 @@ mod tests {
 
         let (report, busy, _err) = retry_on_busy(&policy, || {
             calls.set(calls.get() + 1);
-            async move { Err(busy_err()) }
+            async move { Err::<(), _>(busy_err()) }
         })
         .await
         .expect_err("aucun réessai disponible");
