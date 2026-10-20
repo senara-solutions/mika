@@ -97,6 +97,17 @@ pub fn is_routable_trigger(trigger: &str) -> bool {
     ROUTABLE_TRIGGERS.contains(&trigger)
 }
 
+/// Un tir récurrent a été refusé au dernier point de passage parce que l'agent
+/// porte `enabled = false` à la racine de son `identity.toml` (mika#2456, vol 2).
+///
+/// **En régime attendu, cet événement n'est jamais émis** — la porte à
+/// l'enregistrement (mika#2456 vol 1) a déjà retiré les lignes. Son zéro est
+/// donc l'assertion que la porte amont tient, comme pour le filet du dispatcher
+/// de mika#2337. Il se lève pour les deux populations que la porte ne voit pas :
+/// les lignes nées **avant** son déploiement, et les bascules d'`enabled` **en
+/// cours d'exécution**.
+pub(crate) const RECURRING_FIRE_REFUSED_EVENT: &str = "recurring_fire_refused_agent_disabled";
+
 /// Qui refuse, et qu'est-ce qu'il sait router (mika#2446 R-1).
 ///
 /// Les cinq champs qu'une ligne de mort par trigger inconnu doit porter pour
@@ -705,6 +716,50 @@ impl TaskDispatcher {
         Ok(())
     }
 
+    /// Le filet au tir de la porte récurrente niveau-agent (mika#2456, vol 2) :
+    /// ce tir est-il refusé parce que l'agent porte `enabled = false` à la
+    /// racine de son `identity.toml` ?
+    ///
+    /// **Pourquoi un filet en plus de la porte.** La porte à l'enregistrement
+    /// est un invariant sur l'historique des écritures : elle tient pour toute
+    /// ligne née après son déploiement, sur un `enabled` lu à ce moment-là. Le
+    /// filet est un invariant sur l'**état courant**, et il couvre les deux
+    /// populations que la porte ne peut pas voir — les lignes plus vieilles
+    /// qu'elle, et un `enabled` basculé depuis. En régime attendu il ne lève
+    /// rien, et ce zéro est l'assertion que la porte amont tient.
+    ///
+    /// **Ne mute rien.** Pas d'annulation de la ligne, pas de réécriture de
+    /// statut : la décision du filet est lisible dans son journal et dans ce
+    /// qui *n'a pas* eu lieu. Un filet qui corrigerait la base effacerait la
+    /// preuve de son propre déclenchement (mika#2156), et la remise en marche
+    /// d'un agent réactivé demanderait alors un ré-armement explicite plutôt
+    /// qu'un simple tick.
+    ///
+    /// **Seules les récurrentes.** La garde sur `trigger_type` est
+    /// inconditionnelle : un rappel (`time`), un callback ou une tâche manuelle
+    /// d'un agent désactivé passent, parce que `enabled = false` à la racine
+    /// nomme les **récurrentes** et pas l'agent entier. Ce qui le prouve est le
+    /// contrôle négatif de la branche (b) de V5.
+    async fn refuse_recurring_fire_if_agent_disabled(&self, task: &Task) -> bool {
+        if task.trigger_type != super::types::trigger_type::RECURRING {
+            return false;
+        }
+        if super::agent_recurring_tasks_enabled(&self.home_dir, self.db.agent_id()).await {
+            return false;
+        }
+        warn!(
+            target: "mika::otel",
+            event = RECURRING_FIRE_REFUSED_EVENT,
+            agent_id = %self.db.agent_id(),
+            label = %task.label,
+            trigger_type = %task.trigger_type,
+            "mika#2456: agent carries `enabled = false` — recurring fire refused \
+             at the last gate before an LLM turn. The row is left as it is: this \
+             agent will fire again the tick after `enabled` goes back to true"
+        );
+        true
+    }
+
     /// Run a background silent agent for proactive tasks.
     ///
     /// Supports two modes via `action_config`:
@@ -715,6 +770,18 @@ impl TaskDispatcher {
         task: &Task,
         config: &serde_json::Value,
     ) -> Result<(), DispatchError> {
+        // mika#2456 (vol 2) — le filet, avant toute route : c'est le dernier
+        // point de passage commun aux deux branches ci-dessous, et donc le
+        // dernier avant qu'un tour de LLM ne soit consommé.
+        //
+        // `Ok(())` et non `Err` : un refus de porte n'est pas un tir raté. Les
+        // variantes de `DispatchError` disent « ce tir aurait dû aboutir » et
+        // alimentent les comptes d'incident ; ici rien ne tire *parce que c'est
+        // le réglage demandé*.
+        if self.refuse_recurring_fire_if_agent_disabled(task).await {
+            return Ok(());
+        }
+
         // Check for arbitrary skill_name first
         if let Some(skill_name) = config["skill_name"].as_str() {
             return self.dispatch_skill_by_name(task, skill_name, config).await;
