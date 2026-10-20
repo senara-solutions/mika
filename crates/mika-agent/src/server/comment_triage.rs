@@ -441,4 +441,52 @@ mod tests {
             note_description("https://github.com/senara-solutions/mika/issues/2680")
         );
     }
+
+    /// AC3, moitié transport : une panne du fournisseur remonte en `Err`, donc
+    /// le tour complet chez l'appelant. Le texte servi porte un ordre
+    /// d'opérateur — c'est exactement celui qu'une note perdrait.
+    #[tokio::test]
+    async fn mika2854_une_panne_de_transport_ne_rend_jamais_une_note() {
+        let llm = mika_common::llm::mock::MockLlmProvider::builder()
+            .error(mika_common::llm::LlmError::Transport(
+                "connexion refusée".to_string(),
+            ))
+            .build();
+
+        let erreur = run_triage(&llm, "lève operator-gated sur #2784, je valide")
+            .await
+            .expect_err("AC3 — une panne doit rendre Err, jamais un verdict");
+
+        assert!(
+            erreur.to_string().contains("appel de triage en échec"),
+            "l'erreur doit nommer l'appel : {erreur}"
+        );
+        assert_eq!(llm.calls_made(), 1, "un seul appel, sans retry local");
+    }
+
+    /// AC3, moitié expiration : le plafond de 20 s rend `Err` et ne laisse
+    /// aucune place à un verdict tardif. Horloge virtuelle (`pause`/`advance`),
+    /// donc le test ne dort pas — sinon personne ne le garderait au vert.
+    #[tokio::test(start_paused = true)]
+    async fn mika2854_une_expiration_ne_rend_jamais_une_note() {
+        let llm = mika_common::llm::mock::MockLlmProvider::builder()
+            .response(mika_common::llm::mock::MockResponse::Delayed {
+                // Au-delà du plafond, mais d'une seule seconde : ce qui est
+                // asserté est la borne, pas une marge confortable.
+                sleep_ms: (TRIAGE_TIMEOUT_SECS + 1) * 1_000,
+                inner: Box::new(mika_common::llm::mock::text_response("NOTE: rien à voir")),
+            })
+            .build();
+
+        let erreur = run_triage(&llm, "ferme #2854, il est livré")
+            .await
+            .expect_err("AC3 — une expiration doit rendre Err, jamais la note tardive");
+
+        assert!(
+            erreur
+                .to_string()
+                .contains(&format!("triage expiré après {TRIAGE_TIMEOUT_SECS} s")),
+            "l'erreur doit nommer l'expiration et son plafond : {erreur}"
+        );
+    }
 }

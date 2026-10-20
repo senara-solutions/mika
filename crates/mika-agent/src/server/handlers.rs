@@ -2044,6 +2044,11 @@ pub(super) async fn run_agent_for_message(
                 db: &a.db,
                 github_token: prefilter_github_token.as_deref(),
                 request_id: &req.request_id,
+                // (h) mika#2854 : le fournisseur de l'agent lui-même, le même
+                // que le tour complet aurait utilisé. Pas de modèle dédié —
+                // un second modèle est un second gabarit à calibrer
+                // (mika#1190), pour un brin de 160 tokens sans outils.
+                llm: Some(a.llm.as_ref()),
             },
             original,
             touched,

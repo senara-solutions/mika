@@ -242,6 +242,7 @@ use mika_common::github_event_format::{
     ISSUE_EVENT_PREFIX, ISSUE_LABELED_EVENT_PREFIX, PR_CLOSED_EVENT_PREFIX, PR_EVENT_PREFIX,
     PR_OPENED_EVENT_PREFIX, PR_REVIEW_EVENT_PREFIX, PUSH_EVENT_PREFIX,
 };
+use mika_common::llm::LlmProvider;
 
 use crate::async_db::AsyncDatabase;
 
@@ -253,6 +254,7 @@ use super::ci_failure_handler::{
 use super::ci_success_handler::{
     DECISION_CORE_HOLD_NOTIFIED, DECISION_CORE_HOLD_TOOL, parse_check_suite_success,
 };
+use super::comment_triage::{self, TriageVerdict};
 use super::verdict::{Verdict, parse_pr_review_event, parse_verdict, verdict_raw_value};
 use super::webhook_queue_v2::{WebhookEventKind, classify_event};
 
@@ -280,6 +282,12 @@ const PR_STATE_TIMEOUT_SECS: u64 = 15;
 
 /// Une classe d'événement écartée sans LLM. Valeur de `after_value` dans
 /// l'audit : un format de fil, épinglé par test.
+///
+/// **« Sans LLM » admet une exception depuis mika#2854** : la classe (h)
+/// ([`PrefilterClass::CommentTriagedNote`]) écarte le tour *complet* au prix
+/// d'un brin de triage borné, sans outils. Elle n'écarte donc pas un tour sans
+/// appeler de modèle — elle écarte 77 k tokens d'entrée au prix de 160 tokens
+/// de sortie. Les douze autres classes restent purement déterministes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrefilterClass {
     /// (a) `check_suite` verte sur la branche par défaut, sans tâche active.
@@ -312,6 +320,13 @@ pub(crate) enum PrefilterClass {
     /// (mika#2680). Mesurée à n=2 : 193 k puis 279 k tokens d'entrée pour un
     /// tour qui n'avait rien à décider.
     PrClosedNoLoopTask,
+    /// (h) `issue_comment` ou `issues` `closed` sur un ticket sans tâche de
+    /// boucle, dont le triage n'a trouvé **aucune décision actionnable**
+    /// (mika#2854). La seule classe dont la décision passe par un modèle : le
+    /// texte est humain et neuf, et c'est pour cette raison que mika#2680 avait
+    /// refusé de l'écarter sur un prédicat de forme. Mesurée à 13 tours et
+    /// 1 007 748 tokens d'entrée sur la fenêtre du 2026-10-19.
+    CommentTriagedNote,
 }
 
 impl PrefilterClass {
@@ -329,6 +344,7 @@ impl PrefilterClass {
             Self::CiFailureSurfacedForAdoption => "ci_failure_surfaced_for_adoption",
             Self::CiFailureTaskNotInProgress => "ci_failure_task_not_in_progress",
             Self::PrClosedNoLoopTask => "pr_closed_no_loop_task",
+            Self::CommentTriagedNote => "comment_triaged_note",
         }
     }
 }
@@ -351,6 +367,32 @@ pub(crate) struct ReviewVerdictFacts {
     pub(crate) non_reviewer_pass: bool,
     /// Ligne `VERDICT:` présente, valeur non reconnue.
     pub(crate) unreadable: bool,
+}
+
+/// Laquelle des deux moitiés de la classe (h) a ouvert le tour (mika#2854).
+///
+/// Les deux suivent la même règle (AC4) et portent la même classe de filtre :
+/// ce terme n'existe donc pas pour brancher, mais pour **séparer les deux
+/// populations dans l'audit**. « 60 % d'escalade sur (h) » n'est pas une
+/// mesure si les commentaires et les fermetures y sont additionnés — deux
+/// populations sous un seul nom ne se soustraient pas (mika#2205).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriageHalf {
+    /// `issue_comment` : du texte humain neuf, la moitié chiffrée par mika#2680.
+    Comment,
+    /// `issues` `closed` : la fermeture d'un ticket que la boucle ne suit pas.
+    IssueClosed,
+}
+
+impl TriageHalf {
+    /// Le préfixe de la cible d'audit. Pas un `as_str` de classe : c'est la
+    /// clé de regroupement qui sépare les deux moitiés.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Comment => "issue_comment",
+            Self::IssueClosed => "issue_closed",
+        }
+    }
 }
 
 /// Un événement qui POURRAIT être écarté, avant consultation de l'état.
@@ -392,6 +434,22 @@ pub(crate) enum Candidate {
     /// handlers structurels. Écartée au terme de [`decide`].
     PrClosedNoTask {
         pr_url: String,
+    },
+    /// (h) `issue_comment` ou `issues` `closed` dont l'URL d'issue est lisible
+    /// (mika#2854). Écartée au terme de [`decide`], et seulement si le triage
+    /// ne trouve aucune décision actionnable.
+    ///
+    /// **Le texte est un champ** parce que c'est lui que le sixième décideur
+    /// juge : la même raison qui met les faits d'un verdict dans
+    /// [`ReviewVerdictFacts`] plutôt que de relire le gabarit en aval. Le
+    /// candidat porte ce que le décideur lit du texte, et pour (h) le texte
+    /// *est* le terme — y compris la ligne `by @auteur`, que le prompt
+    /// interdit d'utiliser mais qu'on ne retire pas (ce serait une seconde
+    /// lecture du gabarit, mika#2854 D2).
+    HumanTextNoTask {
+        issue_url: String,
+        half: TriageHalf,
+        text: String,
     },
 }
 
@@ -448,14 +506,41 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
         return crate::server::upstream_close_handler::extract_pr_url(text)
             .map(|pr_url| Candidate::PrClosedNoTask { pr_url });
     }
-    match classify_event(text) {
-        WebhookEventKind::IssueLabeled { repo, issue, label }
-            if !crate::webhook_dispatch::label_read_by_loop(&label) =>
-        {
-            Some(Candidate::InertLabel { repo, issue, label })
-        }
-        _ => None,
+    // (d) reste AVANT (h), et les deux populations sont disjointes **par
+    // construction**, non par cet ordre : (h) n'accepte que les deux termes
+    // `IssueComment` et `IssueClosed`, et `trigger_class` teste
+    // `ISSUE_LABELED_EVENT_PREFIX` avant `ISSUE_EVENT_PREFIX`, donc un
+    // `Issue labeled ` ne peut jamais rendre l'un d'eux. La disjonction est
+    // épinglée par `mika2854_h_ne_touche_pas_la_population_de_d` plutôt que
+    // laissée à la lecture : ce qu'un `_ =>` protège se perd en silence le jour
+    // où quelqu'un y ajoute un bras.
+    if let WebhookEventKind::IssueLabeled { repo, issue, label } = classify_event(text)
+        && !crate::webhook_dispatch::label_read_by_loop(&label)
+    {
+        return Some(Candidate::InertLabel { repo, issue, label });
     }
+    // (h) mika#2854. La grammaire lue est `trigger_class`, et non un préfixe
+    // neuf : `WebhookEventKind` ne porte aucune variante pour ces deux
+    // événements (ils tombent sur `Other`), alors que `trigger_class` les
+    // distingue déjà — c'est la table que la mesure de mika#2680 a chiffrée.
+    //
+    // L'URL d'issue est obligatoire, et son absence rend le chemin
+    // d'aujourd'hui : elle est la clé de `issue_has_active_task`, donc sans
+    // elle on ne peut pas savoir si un ticket est en vol, et AC7 refuse de
+    // deviner. Un `issue_comment` sur une PR n'en porte pas non plus
+    // (`extract_issue_url` ignore le segment `/pull/`), et il garde son tour.
+    let half = match trigger_class(text) {
+        TriggerClass::IssueComment => TriageHalf::Comment,
+        TriggerClass::IssueClosed => TriageHalf::IssueClosed,
+        _ => return None,
+    };
+    crate::server::upstream_close_handler::extract_issue_url(text).map(|issue_url| {
+        Candidate::HumanTextNoTask {
+            issue_url,
+            half,
+            text: text.to_string(),
+        }
+    })
 }
 
 /// L'état d'une PR côté forge.
@@ -516,6 +601,16 @@ pub(crate) trait PrefilterState {
     /// (b) les attestations DECISION-CORE dont la cible commence par
     /// `pr_prefix` (`pr:{repo}#{n}@`), tous événements confondus.
     async fn decision_core_holds(&self, pr_prefix: &str) -> anyhow::Result<Vec<AuditFact>>;
+    /// (h) une tâche de self-dev vit-elle sur ce ticket ? La clé est l'URL
+    /// d'issue **sans fragment** (mika#2854) — `extract_issue_url` la tronque à
+    /// l'extraction, parce qu'un `#issuecomment-123` ferait rendre `false` à
+    /// tout commentaire et écarterait des tickets en vol.
+    async fn issue_has_active_task(&self, issue_url: &str) -> anyhow::Result<bool>;
+    /// (h) le brin de triage. Un terme d'état comme les autres, délibérément :
+    /// un appel de modèle borné et sans outils est, du point de vue de
+    /// [`decide`], une lecture qui peut échouer — et la faire passer par le
+    /// trait est ce qui rend les quatre pannes bouchonnables sans réseau.
+    async fn triage(&self, text: &str) -> anyhow::Result<TriageVerdict>;
 }
 
 /// L'état réel : base de l'agent, et `gh` pour la forge.
@@ -524,6 +619,11 @@ pub(crate) struct LiveState<'a> {
     pub(crate) github_token: Option<&'a str>,
     /// L'identité de l'événement, que les handlers posent en `trace_id`.
     pub(crate) request_id: &'a str,
+    /// (h) le fournisseur du brin de triage (mika#2854). `Option`, parce que
+    /// l'absence doit rendre le **tour complet** et non la note : un `None` ici
+    /// est l'une des quatre pannes de [`Release::TriageUnreadable`], jamais un
+    /// silence.
+    pub(crate) llm: Option<&'a dyn LlmProvider>,
 }
 
 impl PrefilterState for LiveState<'_> {
@@ -569,6 +669,17 @@ impl PrefilterState for LiveState<'_> {
             )
             .await?;
         Ok(rows.into_iter().map(AuditFact::from).collect())
+    }
+
+    async fn issue_has_active_task(&self, issue_url: &str) -> anyhow::Result<bool> {
+        self.db.has_active_self_dev_task_for_issue(issue_url).await
+    }
+
+    async fn triage(&self, text: &str) -> anyhow::Result<TriageVerdict> {
+        let Some(llm) = self.llm else {
+            anyhow::bail!("aucun fournisseur LLM injecté pour le triage (h)");
+        };
+        comment_triage::run_triage(llm, text).await
     }
 }
 
@@ -648,10 +759,12 @@ fn pr_prefix(head: &str) -> Option<&str> {
 ///
 /// Un terme par porte qui relâche un tour, et le registre en porte exactement
 /// un. Les trois premiers sont rendus par [`skip_turn`] lui-même, avant toute
-/// consultation d'état ; les sept autres par [`decide`] et ses quatre
-/// décideurs. Un onzième site de relâche ne compile pas sans son terme : c'est
-/// la propriété que ce type achète, et la raison de ne pas s'être contenté
-/// d'une chaîne au site d'émission.
+/// consultation d'état ; les onze autres par [`decide`] et ses six décideurs
+/// (le compte annonçait « quatre » alors que [`decide_pr_closed`] en était le
+/// cinquième depuis mika#2680 : corrigé ici, en même temps que le sixième).
+/// Un quinzième site de relâche ne compile pas sans son terme : c'est la
+/// propriété que ce type achète, et la raison de ne pas s'être contenté d'une
+/// chaîne au site d'émission.
 ///
 /// Ce n'est pas la taxonomie inverse de [`PrefilterClass`] : une classe nomme
 /// l'événement écarté, un terme nomme la porte qui n'a pas écarté. Les deux
@@ -699,6 +812,33 @@ pub(crate) enum Release {
     /// cette information dans le registre, où la question est « combien de
     /// tours une panne de lecture a-t-elle coûtés », jamais « laquelle ».
     StateUnreadable,
+    /// (h) le triage a lu une décision actionnable dans le texte : le tour
+    /// complet a lieu (mika#2854). **Le numérateur du taux d'escalade** —
+    /// `triage_escalated / (triage_escalated + comment_triaged_note)` est la
+    /// mesure que le vol existe pour rendre chiffrable.
+    TriageEscalated,
+    /// (h) le triage n'a pas rendu de verdict exploitable : erreur de transport,
+    /// expiration des 20 s, sortie hors grammaire, ou aucun fournisseur LLM
+    /// injecté. **Fail-open** : le tour complet a lieu, jamais la note.
+    ///
+    /// Distinct de [`Release::StateUnreadable`] pour une raison de mesure, pas
+    /// de symétrie : une panne de triage est le coût de la classe (h) et se
+    /// soustrait de son économie, là où une panne de lecture d'état est un
+    /// incident de base de données partagé par cinq classes. Les additionner
+    /// rendrait l'économie de (h) illisible (mika#2205).
+    TriageUnreadable,
+    /// (h) `issue_has_active_task` → `Ok(true)` : un vol est en cours sur ce
+    /// ticket, le tour passe par le chemin d'aujourd'hui sans qu'aucun triage
+    /// soit appelé (AC7). Terme propre, et non [`Release::PrTaskActive`] : ce
+    /// n'est ni le même prédicat ni la même clé — une URL d'issue, pas de PR.
+    IssueTaskActive,
+    /// (h) `MIKA_WEBHOOK_COMMENT_TRIAGE` absent ou `off` : la classe est livrée
+    /// désarmée (mika#2854 D8), aucun appel n'est fait et le tour a lieu.
+    ///
+    /// Le terme existe pour que « la classe est désarmée » et « la classe est
+    /// armée et escalade tout » ne rendent pas les mêmes octets : sans lui, un
+    /// armement oublié ressemblerait à un triage parfaitement prudent.
+    TriageDisarmed,
 }
 
 impl Release {
@@ -714,6 +854,10 @@ impl Release {
             Self::NoDecisionAttested => "no_decision_attested",
             Self::HeadNotPreviouslyDecided => "head_not_previously_decided",
             Self::StateUnreadable => "state_unreadable",
+            Self::TriageEscalated => "triage_escalated",
+            Self::TriageUnreadable => "triage_unreadable",
+            Self::IssueTaskActive => "issue_task_active",
+            Self::TriageDisarmed => "triage_disarmed",
         }
     }
 }
@@ -726,6 +870,16 @@ pub(crate) enum Decision {
         class: PrefilterClass,
         target: String,
     },
+    /// Écarté **et** porteur d'une trace en mémoire (mika#2854). Troisième
+    /// variante plutôt qu'un `Option<String>` sur [`Decision::Skip`] : les
+    /// douze autres classes écartent sans rien écrire, et un champ qu'elles
+    /// rempliraient toutes de `None` invite à l'oublier au treizième site.
+    /// Ici la note est la raison même de la variante.
+    SkipWithNote {
+        class: PrefilterClass,
+        target: String,
+        note: String,
+    },
 }
 
 fn state_unreadable(what: &str, target: &str, e: &anyhow::Error) -> Decision {
@@ -737,6 +891,23 @@ fn state_unreadable(what: &str, target: &str, e: &anyhow::Error) -> Decision {
         "pré-filtre : état illisible — le tour a lieu (fail-safe)"
     );
     Decision::Llm(Release::StateUnreadable)
+}
+
+/// Le pendant de [`state_unreadable`] pour le brin de triage (mika#2854).
+///
+/// Quatre pannes convergent ici — transport, expiration, verdict hors
+/// grammaire, fournisseur absent — et toutes rendent le **tour complet**.
+/// C'est l'invariant de fail-open du ticket, et il est tenu par le type de
+/// retour : cette fonction n'a aucun chemin qui rende un [`Decision::Skip`]
+/// ou un [`Decision::SkipWithNote`].
+fn triage_unreadable(target: &str, e: &anyhow::Error) -> Decision {
+    warn!(
+        event = "webhook_triage_unreadable",
+        target = %target,
+        error = %e,
+        "triage (h) : pas de verdict exploitable — le tour complet a lieu (fail-open)"
+    );
+    Decision::Llm(Release::TriageUnreadable)
 }
 
 /// Décide un candidat. Toute erreur de recherche laisse passer (AC3).
@@ -772,6 +943,11 @@ pub(crate) async fn decide(candidate: Candidate, state: &impl PrefilterState) ->
         },
         Candidate::ReviewVerdict(facts) => decide_review_verdict(facts, state).await,
         Candidate::PrClosedNoTask { pr_url } => decide_pr_closed(pr_url, state).await,
+        Candidate::HumanTextNoTask {
+            issue_url,
+            half,
+            text,
+        } => decide_comment_triage(&issue_url, half, &text, state).await,
     }
 }
 
@@ -885,6 +1061,46 @@ async fn decide_pr_closed(pr_url: String, state: &impl PrefilterState) -> Decisi
     }
 }
 
+/// (h) le sixième décideur, et le seul qui consulte un modèle (mika#2854).
+///
+/// **Trois portes, dans cet ordre, et l'ordre est le contrat :**
+///
+/// 1. L'interrupteur dédié. Désarmé, aucun appel n'est fait et aucun état n'est
+///    lu : un vol livré désarmé ne doit pas peser sur la base.
+/// 2. `issue_has_active_task`. Un ticket en vol passe par le chemin d'aujourd'hui
+///    (AC7) **sans qu'aucun triage soit appelé** — c'est ce que l'ordre achète,
+///    et un test le prouve en rendant la panique sur un triage non attendu.
+/// 3. Le triage. `DECISION` escalade, `NOTE:` écarte avec sa note, tout le reste
+///    escalade aussi ([`triage_unreadable`]).
+///
+/// La cible porte la moitié en préfixe, pour que les deux populations de (h)
+/// restent soustractibles dans l'audit ([`TriageHalf`]).
+async fn decide_comment_triage(
+    issue_url: &str,
+    half: TriageHalf,
+    text: &str,
+    state: &impl PrefilterState,
+) -> Decision {
+    let target = format!("{}:{issue_url}", half.as_str());
+    if !comment_triage::triage_enabled() {
+        return Decision::Llm(Release::TriageDisarmed);
+    }
+    match state.issue_has_active_task(issue_url).await {
+        Ok(false) => {}
+        Ok(true) => return Decision::Llm(Release::IssueTaskActive),
+        Err(e) => return state_unreadable("issue_has_active_task", &target, &e),
+    }
+    match state.triage(text).await {
+        Ok(TriageVerdict::Decision) => Decision::Llm(Release::TriageEscalated),
+        Ok(TriageVerdict::Note(note)) => Decision::SkipWithNote {
+            class: PrefilterClass::CommentTriagedNote,
+            target,
+            note,
+        },
+        Err(e) => triage_unreadable(&target, &e),
+    }
+}
+
 /// L'interrupteur est-il armé ? Lu à chaque événement.
 pub(crate) fn prefilter_enabled() -> bool {
     crate::qa_head_supersession::parse_switch(
@@ -925,9 +1141,15 @@ impl Touched {
             // lit dans le texte est l'URL de la PR, donc tout handler qui a
             // réécrit ce texte a pu réécrire la ligne qui porte la clé de
             // `pr_has_active_task` (mika#2680).
+            // (h) rejoint la même fenêtre, et pour une raison plus forte encore
+            // (mika#2854) : ce que (h) lit du texte, c'est le texte ENTIER — un
+            // handler qui l'enrichit change ce que le triage juge, donc peut
+            // changer le verdict. Un texte touché rend le tour complet, qui est
+            // le côté sûr.
             Candidate::GreenDefaultBranch { .. }
             | Candidate::InertLabel { .. }
-            | Candidate::PrClosedNoTask { .. } => self.by_any_handler,
+            | Candidate::PrClosedNoTask { .. }
+            | Candidate::HumanTextNoTask { .. } => self.by_any_handler,
         }
     }
 }
@@ -964,9 +1186,17 @@ pub(crate) async fn skip_turn(
     if touched.applies_to(&candidate) {
         return Gate::Charged(Release::TextTouched);
     }
-    let (class, target) = match decide(candidate, state).await {
+    // La note de (h) est portée à part, et versée APRÈS la ligne d'audit : le
+    // registre est le contrat (AC5) et ne dépend pas d'une écriture en mémoire,
+    // là où une note sans sa ligne d'audit serait une économie non chiffrable.
+    let (class, target, note) = match decide(candidate, state).await {
         Decision::Llm(release) => return Gate::Charged(release),
-        Decision::Skip { class, target } => (class, target),
+        Decision::Skip { class, target } => (class, target, None),
+        Decision::SkipWithNote {
+            class,
+            target,
+            note,
+        } => (class, target, Some(note)),
     };
 
     info!(
@@ -995,6 +1225,9 @@ pub(crate) async fn skip_turn(
             error = %e,
             "événement écarté mais ligne d'audit non écrite"
         );
+    }
+    if let Some(note) = note {
+        comment_triage::write_note(db, &target, &note).await;
     }
     Gate::Skipped
 }
@@ -1150,6 +1383,10 @@ impl Candidate {
             Self::InertLabel { .. } => "inert_label",
             Self::ReviewVerdict(_) => "review_verdict",
             Self::PrClosedNoTask { .. } => "pr_closed_no_task",
+            // Un seul nom pour les deux moitiés : la moitié vit dans la cible de
+            // la ligne d'audit ([`TriageHalf::as_str`]), et la dupliquer ici
+            // ferait deux endroits où elle peut divergir.
+            Self::HumanTextNoTask { .. } => "human_text_no_task",
         }
     }
 }
@@ -1331,6 +1568,11 @@ pub(crate) mod tests {
         pub(crate) pr_state: Option<Result<PrForgeState, &'static str>>,
         pub(crate) event_rows: Option<Result<Vec<AuditFact>, &'static str>>,
         pub(crate) holds: Option<Result<Vec<AuditFact>, &'static str>>,
+        /// (h) mika#2854. `None` ici est ce qui prouve AC7 : un ticket avec
+        /// tâche de boucle ne doit pas atteindre le triage, et le `panic!`
+        /// d'[`answer`] est l'assertion.
+        pub(crate) issue_task: Option<Result<bool, &'static str>>,
+        pub(crate) triage: Option<Result<TriageVerdict, &'static str>>,
     }
 
     fn answer_rows(
@@ -1367,6 +1609,16 @@ pub(crate) mod tests {
         }
         async fn decision_core_holds(&self, _: &str) -> anyhow::Result<Vec<AuditFact>> {
             answer_rows(&self.holds, "holds")
+        }
+        async fn issue_has_active_task(&self, _: &str) -> anyhow::Result<bool> {
+            answer(&self.issue_task, "issue_task")
+        }
+        async fn triage(&self, _: &str) -> anyhow::Result<TriageVerdict> {
+            match &self.triage {
+                Some(Ok(v)) => Ok(v.clone()),
+                Some(Err(e)) => Err(anyhow::anyhow!(*e)),
+                None => panic!("recherche d'état non attendue : triage"),
+            }
         }
     }
 
@@ -1483,6 +1735,10 @@ pub(crate) mod tests {
         assert_eq!(
             PrefilterClass::PrClosedNoLoopTask.as_str(),
             "pr_closed_no_loop_task"
+        );
+        assert_eq!(
+            PrefilterClass::CommentTriagedNote.as_str(),
+            "comment_triaged_note"
         );
     }
 
@@ -2374,6 +2630,8 @@ pub(crate) mod tests {
             (RED_PR, "red_pr_branch"),
             (INERT, "inert_label"),
             (PR_CLOSED, "pr_closed_no_task"),
+            (COMMENT_2854, "human_text_no_task"),
+            (ISSUE_CLOSED_2854, "human_text_no_task"),
         ] {
             assert_eq!(classify(texte).unwrap().as_str(), nom, "{texte:?}");
         }
@@ -2385,10 +2643,17 @@ pub(crate) mod tests {
         );
 
         // Hors population : aucun candidat, donc aucun champ à écrire. Chacun
-        // de ces tours a pourtant un `trigger`, et c'est tout l'intérêt —
-        // `issue_comment` est 79 % de la fenêtre mesurée le 2026-10-08. Le
+        // de ces tours a pourtant un `trigger`, et c'est tout l'intérêt. Le
         // `PR closed` sans URL en fait partie depuis mika#2680 : la classe (e)
         // ne sait pas de quelle PR il parle, donc elle n'en est pas candidate.
+        //
+        // Les deux premiers sont la MÊME raison pour (h) depuis mika#2854 :
+        // sans ligne d'URL, aucune clé à donner à
+        // `has_active_self_dev_task_for_issue`, donc aucun moyen de savoir si
+        // le ticket porte une tâche de boucle — et AC7 interdit de deviner. Ce
+        // sont les mêmes gabarits que `COMMENT_2854` et `ISSUE_CLOSED_2854`
+        // ci-dessus, à la ligne d'URL près : la paire est le contrôle négatif
+        // de la classe.
         for texte in [
             "[GitHub] New comment on senara-solutions/mika#2654 (t) by @samidarko",
             "[GitHub] Issue closed: senara-solutions/mika#2294 — t",
@@ -2551,7 +2816,13 @@ pub(crate) mod tests {
     /// recherche d'état. C'est ainsi que « rendu AVANT `decide` » est prouvé et
     /// non supposé — un garde déplacé après la décision ferait paniquer le cas
     /// au lieu de le rendre vert autrement.
-    fn cas_de_relache(terme: Release) -> (String, Stub, Touched, bool) {
+    ///
+    /// Le quatrième terme du tuple est l'interrupteur **de (h)** (mika#2854) :
+    /// trois de ses quatre termes n'existent que la classe armée, et le
+    /// quatrième n'existe qu'elle désarmée. C'est le seul endroit du module qui
+    /// touche à une variable d'environnement, d'où le `#[serial]` sur le
+    /// recensement.
+    fn cas_de_relache(terme: Release) -> (String, Stub, Touched, bool, bool) {
         let intact = Touched {
             by_any_handler: false,
             after_verdict_handler: false,
@@ -2562,18 +2833,19 @@ pub(crate) mod tests {
             by_any_handler: true,
             ..intact
         };
-        // Pas de bras `_` : ajouter un onzième terme ne compile pas tant qu'il
-        // n'a pas son cas ici (DoD 8).
+        // Pas de bras `_` : ajouter un quinzième terme ne compile pas tant
+        // qu'il n'a pas son cas ici (DoD 8).
         match terme {
-            Release::SwitchDisarmed => (GREEN_MAIN.into(), Stub::default(), intact, false),
-            Release::NotClassified => ("bonjour".into(), Stub::default(), intact, true),
-            Release::TextTouched => (GREEN_MAIN.into(), Stub::default(), touche, true),
-            Release::BranchTaskActive => (GREEN_MAIN.into(), branch(Ok(true)), intact, true),
+            Release::SwitchDisarmed => (GREEN_MAIN.into(), Stub::default(), intact, false, false),
+            Release::NotClassified => ("bonjour".into(), Stub::default(), intact, true, false),
+            Release::TextTouched => (GREEN_MAIN.into(), Stub::default(), touche, true, false),
+            Release::BranchTaskActive => (GREEN_MAIN.into(), branch(Ok(true)), intact, true, false),
             Release::PrTaskActive => (
                 review("commented", QA, "VERDICT: hold[review]"),
                 pr(Ok(true)),
                 intact,
                 true,
+                false,
             ),
             Release::PrOpen => (
                 review("approved", QA, "VERDICT: pass"),
@@ -2584,8 +2856,11 @@ pub(crate) mod tests {
                 },
                 intact,
                 true,
+                false,
             ),
-            Release::NoTerminalTrace => (RED_PR.into(), rows(Ok(vec![]), None), intact, true),
+            Release::NoTerminalTrace => {
+                (RED_PR.into(), rows(Ok(vec![]), None), intact, true, false)
+            }
             // Aucune ligne `decision_core_hold` sur CET événement : la seconde
             // lecture n'a pas lieu, et `holds: None` le prouve en paniquant.
             Release::NoDecisionAttested => (
@@ -2593,6 +2868,7 @@ pub(crate) mod tests {
                 rows(Ok(vec![processed(HEAD_A, "rid-now")]), None),
                 intact,
                 true,
+                false,
             ),
             // Une attestation existe, mais sur une AUTRE tête de la même PR.
             Release::HeadNotPreviouslyDecided => (
@@ -2606,29 +2882,66 @@ pub(crate) mod tests {
                 ),
                 intact,
                 true,
+                false,
             ),
-            Release::StateUnreadable => (GREEN_MAIN.into(), branch(Err("db down")), intact, true),
+            Release::StateUnreadable => (
+                GREEN_MAIN.into(),
+                branch(Err("db down")),
+                intact,
+                true,
+                false,
+            ),
+            // (h) mika#2854 — les quatre termes du sixième décideur. Le dernier
+            // est le seul du module à vouloir l'interrupteur de (h) DÉSARMÉ :
+            // c'est l'état livré par ce vol.
+            Release::TriageDisarmed => (COMMENT_2854.into(), Stub::default(), intact, true, false),
+            Release::IssueTaskActive => (
+                COMMENT_2854.into(),
+                triage_stub(Some(Ok(true)), None),
+                intact,
+                true,
+                true,
+            ),
+            Release::TriageEscalated => (
+                COMMENT_2854.into(),
+                triage_stub(Some(Ok(false)), Some(Ok(TriageVerdict::Decision))),
+                intact,
+                true,
+                true,
+            ),
+            Release::TriageUnreadable => (
+                COMMENT_2854.into(),
+                triage_stub(Some(Ok(false)), Some(Err("llm down"))),
+                intact,
+                true,
+                true,
+            ),
         }
     }
 
-    /// Terme par terme (DoD 8) : chacun des dix termes de relâche est atteint
-    /// par la PORTE elle-même — `skip_turn`, pas `decide` — parce que trois
-    /// d'entre eux sont rendus **avant** `decide` et qu'un test sur `decide`
-    /// seul ne les verrait jamais.
+    /// Terme par terme (DoD 8) : chacun des quatorze termes de relâche est
+    /// atteint par la PORTE elle-même — `skip_turn`, pas `decide` — parce que
+    /// trois d'entre eux sont rendus **avant** `decide` et qu'un test sur
+    /// `decide` seul ne les verrait jamais.
     ///
     /// L'exhaustivité est tenue par le `match` de [`cas_de_relache`], qui n'a
-    /// pas de bras par défaut : un onzième terme ne COMPILE pas tant qu'il n'a
-    /// pas son cas. Le voisin
+    /// pas de bras par défaut : un quinzième terme ne COMPILE pas tant qu'il
+    /// n'a pas son cas. Le voisin
     /// [`mika2680_la_taxonomie_atteint_chacun_de_ses_douze_termes`] compte ses
     /// termes après coup, et ce comptage a une faiblesse que celui-ci n'a pas :
     /// il ne sait rien de l'énumération, donc une variante ajoutée sans cas le
     /// laisse vert.
     ///
-    /// La base est réelle et vide : les dix termes rendent tous **avant** la
-    /// ligne d'audit, donc rien n'y est écrit — `skip_turn` n'en demande une
+    /// La base est réelle et vide : les quatorze termes rendent tous **avant**
+    /// la ligne d'audit, donc rien n'y est écrit — `skip_turn` n'en demande une
     /// que pour l'`agent_id` de sa ligne `info!`.
+    ///
+    /// `#[serial]` depuis mika#2854 : les quatre termes de (h) portent chacun
+    /// une position de `MIKA_WEBHOOK_COMMENT_TRIAGE`, et cette variable est un
+    /// état global du processus.
     #[tokio::test]
-    async fn mika2680_la_relache_atteint_chacun_de_ses_dix_termes() {
+    #[serial_test::serial]
+    async fn mika2680_la_relache_atteint_chacun_de_ses_quatorze_termes() {
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
 
         for terme in [
@@ -2642,8 +2955,13 @@ pub(crate) mod tests {
             Release::NoDecisionAttested,
             Release::HeadNotPreviouslyDecided,
             Release::StateUnreadable,
+            Release::TriageDisarmed,
+            Release::IssueTaskActive,
+            Release::TriageEscalated,
+            Release::TriageUnreadable,
         ] {
-            let (texte, state, touched, enabled) = cas_de_relache(terme);
+            let (texte, state, touched, enabled, triage) = cas_de_relache(terme);
+            let _garde = TriageEnvGuard::set(triage);
             assert_eq!(
                 skip_turn(&db, &state, &texte, touched, "rid-now", enabled).await,
                 Gate::Charged(terme),
@@ -2749,5 +3067,464 @@ pub(crate) mod tests {
             skip_turn(&db, &pr(Ok(true)), &consigne, intact, "rid-now", true).await,
             Gate::Charged(Release::NotClassified)
         );
+    }
+
+    // ---- vol 1 de mika#2854 — classe (h) : le tour léger qui trie ---------
+    //
+    // Les textes de cette section sont les gabarits réels du gateway pour
+    // `issue_comment` et `issues` `closed` : première ligne de forme, deuxième
+    // ligne d'URL, corps ensuite. Le fragment `#issuecomment-<id>` est présent
+    // parce que le gateway le délivre — c'est lui que C1 tronque.
+
+    /// La moitié `issue_comment`, fragment compris, portant un ORDRE.
+    const COMMENT_2854: &str = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2854#issuecomment-123\n\nlève operator-gated sur #2784, je valide le vol";
+    /// La moitié `issues` `closed`, même ticket, sans fragment (le gateway n'en
+    /// met pas sur une fermeture).
+    const ISSUE_CLOSED_2854: &str = "[GitHub] Issue closed: senara-solutions/mika#2854 — t\nhttps://github.com/senara-solutions/mika/issues/2854";
+    /// La clé d'état que les deux moitiés doivent rendre, fragment retiré.
+    const ISSUE_URL_2854: &str = "https://github.com/senara-solutions/mika/issues/2854";
+
+    /// Restaure `MIKA_WEBHOOK_COMMENT_TRIAGE` à sa valeur d'entrée.
+    ///
+    /// **Premier garde d'environnement de ce module** : jusqu'à mika#2854 tous
+    /// ses tests recevaient `enabled` en argument, donc aucun ne touchait au
+    /// processus. L'interrupteur de (h) se lit dans `decide_comment_triage`
+    /// (D8 du plan) plutôt que de traverser `skip_turn` puis `decide` — cinq
+    /// décideurs porteraient alors un argument qu'ils ne lisent pas. Le prix
+    /// est ce garde, et le `#[serial_test::serial]` que tout test s'en servant
+    /// doit porter.
+    struct TriageEnvGuard(Option<String>);
+
+    impl TriageEnvGuard {
+        fn set(armed: bool) -> Self {
+            let avant = std::env::var(comment_triage::TRIAGE_ENV).ok();
+            // SAFETY: les tests qui construisent ce garde sont sérialisés par
+            // `#[serial_test::serial]`, donc aucun autre fil ne lit
+            // l'environnement pendant la mutation.
+            unsafe {
+                std::env::set_var(comment_triage::TRIAGE_ENV, if armed { "1" } else { "0" });
+            }
+            Self(avant)
+        }
+    }
+
+    impl Drop for TriageEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: même sérialisation qu'à la pose.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var(comment_triage::TRIAGE_ENV, v),
+                    None => std::env::remove_var(comment_triage::TRIAGE_ENV),
+                }
+            }
+        }
+    }
+
+    /// Un bouchon de (h) : `None` sur une fente est ce qui PROUVE qu'une porte
+    /// n'a pas été consultée, puisqu'il panique au lieu de répondre.
+    fn triage_stub(
+        issue_task: Option<Result<bool, &'static str>>,
+        triage: Option<Result<TriageVerdict, &'static str>>,
+    ) -> Stub {
+        Stub {
+            issue_task,
+            triage,
+            ..Stub::default()
+        }
+    }
+
+    fn intacte() -> Touched {
+        Touched {
+            by_any_handler: false,
+            after_verdict_handler: false,
+            outside_ci_success_handler: false,
+            outside_ci_failure_handler: false,
+        }
+    }
+
+    /// (h) terme de texte, les deux moitiés — et la troncature du fragment,
+    /// lue ici à son seul endroit décisionnel.
+    ///
+    /// Le fragment est le piège de la classe : sans la troncature de C1, la clé
+    /// servie à `has_active_self_dev_task_for_issue` serait
+    /// `…/issues/2854#issuecomment-123`, qui ne correspond à aucune tâche, donc
+    /// **tout** commentaire passerait pour « sans tâche de boucle » et (h)
+    /// écarterait des tickets en vol. C'est l'inverse exact d'AC7.
+    #[test]
+    fn mika2854_h_classify_rend_les_deux_moities_sans_le_fragment() {
+        assert_eq!(
+            classify(COMMENT_2854),
+            Some(Candidate::HumanTextNoTask {
+                issue_url: ISSUE_URL_2854.into(),
+                half: TriageHalf::Comment,
+                text: COMMENT_2854.into(),
+            })
+        );
+        assert_eq!(
+            classify(ISSUE_CLOSED_2854),
+            Some(Candidate::HumanTextNoTask {
+                issue_url: ISSUE_URL_2854.into(),
+                half: TriageHalf::IssueClosed,
+                text: ISSUE_CLOSED_2854.into(),
+            })
+        );
+    }
+
+    /// (h) ne mange pas la population de (d) — la disjonction que le commentaire
+    /// d'ordre de [`classify`] annonce, en assertions.
+    ///
+    /// `INERT` porte une ligne d'URL d'issue parfaitement extractible : si (h)
+    /// acceptait un terme de plus que ses deux, un `Issue labeled` deviendrait
+    /// un candidat de triage et la classe (d) fondrait dans (h) sans qu'aucune
+    /// autre assertion du module ne bouge.
+    #[test]
+    fn mika2854_h_ne_touche_pas_la_population_de_d() {
+        assert_eq!(trigger_class(INERT), TriggerClass::IssueLabeled);
+        assert!(matches!(
+            classify(INERT),
+            Some(Candidate::InertLabel { .. })
+        ));
+        // Le label lu par la boucle reste hors population tout court : (h) ne
+        // le ramasse pas davantage.
+        assert!(classify(&labeled("ready")).is_none());
+    }
+
+    /// (h) hors population : sans URL d'issue, le tour d'aujourd'hui.
+    ///
+    /// Deux formes, et la seconde est celle qu'on oublie — un `issue_comment`
+    /// sur une **PR** porte le même gabarit de première ligne, mais une URL
+    /// `/pull/`. Le filtre ne saurait pas de quel ticket il parle, donc il ne
+    /// décide rien.
+    #[test]
+    fn mika2854_h_sans_url_dissue_le_tour_a_lieu() {
+        let sur_une_pr = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/pull/2854#issuecomment-123\n\nlève operator-gated";
+        assert_eq!(trigger_class(sur_une_pr), TriggerClass::IssueComment);
+        assert!(classify(sur_une_pr).is_none());
+    }
+
+    /// AC7 — un ticket **avec** tâche de boucle garde le tour, et le triage
+    /// n'est pas appelé.
+    ///
+    /// `triage: None` est l'assertion forte : le bouchon panique à toute
+    /// recherche de verdict, donc « la porte d'état passe AVANT l'appel de
+    /// modèle » est prouvé, pas supposé. Un garde déplacé après le triage
+    /// ferait paniquer ce test au lieu de le rendre vert autrement.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_une_tache_de_boucle_vivante_garde_le_tour_sans_triage() {
+        let _garde = TriageEnvGuard::set(true);
+        for texte in [COMMENT_2854, ISSUE_CLOSED_2854] {
+            assert_eq!(
+                decide(classify(texte).unwrap(), &triage_stub(Some(Ok(true)), None)).await,
+                Decision::Llm(Release::IssueTaskActive),
+                "{texte:?}"
+            );
+        }
+    }
+
+    /// AC2 et AC1 au niveau du décideur : `DECISION` escalade, `NOTE:` écarte.
+    ///
+    /// La paire est le cœur du ticket. Même texte, même état, **seul le verdict
+    /// diffère** — une batterie qui ne porterait que la branche note serait
+    /// satisfaite par un filtre qui écarte tout, et c'est exactement le danger
+    /// que le corps de mika#2854 nomme.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_decision_escalade_et_note_ecarte() {
+        let _garde = TriageEnvGuard::set(true);
+
+        assert_eq!(
+            decide(
+                classify(COMMENT_2854).unwrap(),
+                &triage_stub(Some(Ok(false)), Some(Ok(TriageVerdict::Decision)))
+            )
+            .await,
+            Decision::Llm(Release::TriageEscalated)
+        );
+
+        assert_eq!(
+            decide(
+                classify(COMMENT_2854).unwrap(),
+                &triage_stub(
+                    Some(Ok(false)),
+                    Some(Ok(TriageVerdict::Note("accusé de réception".into())))
+                )
+            )
+            .await,
+            Decision::SkipWithNote {
+                class: PrefilterClass::CommentTriagedNote,
+                target: format!("issue_comment:{ISSUE_URL_2854}"),
+                note: "accusé de réception".into(),
+            }
+        );
+
+        // La cible porte la moitié, pour que l'audit reste soustractible : deux
+        // populations sous un même nom ne se soustraient pas (mika#2205).
+        assert_eq!(
+            decide(
+                classify(ISSUE_CLOSED_2854).unwrap(),
+                &triage_stub(
+                    Some(Ok(false)),
+                    Some(Ok(TriageVerdict::Note("fermeture de suivi".into())))
+                )
+            )
+            .await,
+            Decision::SkipWithNote {
+                class: PrefilterClass::CommentTriagedNote,
+                target: format!("issue_closed:{ISSUE_URL_2854}"),
+                note: "fermeture de suivi".into(),
+            }
+        );
+    }
+
+    /// AC3 — fail-open, les quatre pannes.
+    ///
+    /// Erreur de transport, verdict illisible, expiration : toutes trois
+    /// arrivent au décideur sous la même forme (`Err` de `state.triage`), parce
+    /// que `run_triage` les a déjà réduites à un `anyhow::Error`. La quatrième
+    /// est d'un autre genre — la lecture d'état elle-même en erreur — et porte
+    /// son propre terme, parce qu'un opérateur qui grep « pourquoi ce tour a eu
+    /// lieu » n'a pas la même suite à donner selon que c'est la base ou le
+    /// modèle qui a lâché.
+    ///
+    /// La porte entière est traversée (`skip_turn`, pas `decide`) : c'est elle
+    /// qui a le pouvoir d'écrire la note, donc c'est elle qu'il faut voir ne pas
+    /// l'écrire.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_les_pannes_rendent_le_tour_jamais_la_note() {
+        let _garde = TriageEnvGuard::set(true);
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+
+        for (state, attendu) in [
+            (
+                triage_stub(Some(Ok(false)), Some(Err("transport"))),
+                Release::TriageUnreadable,
+            ),
+            (
+                triage_stub(Some(Ok(false)), Some(Err("verdict illisible"))),
+                Release::TriageUnreadable,
+            ),
+            (
+                triage_stub(Some(Ok(false)), Some(Err("triage expiré après 20 s"))),
+                Release::TriageUnreadable,
+            ),
+            (
+                triage_stub(Some(Err("db down")), None),
+                Release::StateUnreadable,
+            ),
+        ] {
+            assert_eq!(
+                skip_turn(&db, &state, COMMENT_2854, intacte(), "rid-now", true).await,
+                Gate::Charged(attendu),
+                "{attendu:?}"
+            );
+        }
+
+        // Aucune note n'a été écrite : les quatre pannes rendent le tour.
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "une panne de triage ne consigne JAMAIS de note"
+        );
+    }
+
+    /// V8 — l'interrupteur désarmé rend le tour **avant** toute lecture.
+    ///
+    /// `Stub::default()` panique sur chacune de ses fentes, donc ce test
+    /// n'affirme pas seulement « le tour a lieu » : il affirme qu'aucune base
+    /// n'est interrogée et qu'aucun modèle n'est appelé. C'est la propriété qui
+    /// rend la livraison désarmée gratuite, et celle qu'un garde déplacé
+    /// casserait en silence autrement.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_desarmee_ne_lit_rien_du_tout() {
+        let _garde = TriageEnvGuard::set(false);
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+
+        for texte in [COMMENT_2854, ISSUE_CLOSED_2854] {
+            assert_eq!(
+                skip_turn(&db, &Stub::default(), texte, intacte(), "rid-now", true).await,
+                Gate::Charged(Release::TriageDisarmed),
+                "{texte:?}"
+            );
+        }
+    }
+
+    /// AC5 — la note écarte le tour, écrit sa ligne d'audit sous la classe (h),
+    /// et laisse sa trace en mémoire.
+    ///
+    /// Les trois en un seul test parce qu'ils sont un seul passage de la porte :
+    /// les séparer laisserait croire qu'on peut avoir l'un sans l'autre, alors
+    /// que l'ordre est le contrat (la ligne d'audit d'abord, la note ensuite —
+    /// une note sans sa ligne serait une économie non chiffrable).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_la_note_ecarte_le_tour_et_laisse_ses_deux_traces() {
+        let _garde = TriageEnvGuard::set(true);
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let state = triage_stub(
+            Some(Ok(false)),
+            Some(Ok(TriageVerdict::Note("accusé de réception".into()))),
+        );
+
+        assert_eq!(
+            skip_turn(&db, &state, COMMENT_2854, intacte(), "rid-now", true).await,
+            Gate::Skipped
+        );
+
+        let lignes = db
+            .get_audit_events_by_trace_ids(vec!["rid-now".to_string()])
+            .await
+            .unwrap();
+        let ecartees: Vec<_> = lignes
+            .iter()
+            .filter(|l| l.tool_name == PREFILTER_SKIPPED_TOOL)
+            .collect();
+        assert_eq!(ecartees.len(), 1, "une ligne d'audit, et une seule");
+        assert_eq!(
+            ecartees[0].after_value.as_deref(),
+            Some(PrefilterClass::CommentTriagedNote.as_str())
+        );
+        assert_eq!(
+            ecartees[0].target_key,
+            format!("issue_comment:{ISSUE_URL_2854}")
+        );
+
+        let notes = db.search_events("Triage webhook").await.unwrap();
+        assert_eq!(notes.len(), 1, "une note, et une seule");
+        assert!(
+            notes[0].description.contains(ISSUE_URL_2854),
+            "la note nomme son ticket : {:?}",
+            notes[0].description
+        );
+        assert_eq!(notes[0].context.as_deref(), Some("accusé de réception"));
+    }
+
+    /// Le triage juge le CONTENU, jamais l'auteur (contrôle négatif du corps du
+    /// ticket : « un ordre peut venir d'un relais »).
+    ///
+    /// Deux textes qui ne diffèrent que par la ligne `by @…` traversent la porte
+    /// sous le **même** bouchon et obtiennent le **même** verdict. Aucune liste
+    /// d'identités n'existe dans la classe ; ce test est ce qui rougirait le jour
+    /// où quelqu'un en ajouterait une « pour être sûr ».
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_le_verdict_ne_depend_pas_de_lauteur() {
+        let _garde = TriageEnvGuard::set(true);
+        let de_vincent = COMMENT_2854.replace("by @samidarko", "by @samidarko-vincent");
+        let dun_inconnu = COMMENT_2854.replace("by @samidarko", "by @passant-anonyme");
+
+        for texte in [&de_vincent, &dun_inconnu] {
+            assert_eq!(
+                decide(
+                    classify(texte).unwrap(),
+                    &triage_stub(Some(Ok(false)), Some(Ok(TriageVerdict::Decision)))
+                )
+                .await,
+                Decision::Llm(Release::TriageEscalated),
+                "{texte:?}"
+            );
+            // Et la symétrie : sous un verdict de note, les deux sont écartés
+            // de la même façon. Une asymétrie d'auteur se lirait ici.
+            assert!(matches!(
+                decide(
+                    classify(texte).unwrap(),
+                    &triage_stub(Some(Ok(false)), Some(Ok(TriageVerdict::Note("x".into()))))
+                )
+                .await,
+                Decision::SkipWithNote { .. }
+            ));
+        }
+    }
+
+    /// AC1 — le corpus d'ordres d'opérateur, et **le rouge mesuré**.
+    ///
+    /// Les six textes ci-dessous sont les décisions réelles du 2026-10-20 sur
+    /// #2784, #2680, #2814 et #1381, remises dans le gabarit du gateway. Le
+    /// ticket demande que chacun escalade, et que *« le rouge soit mesuré avec
+    /// un triage qui note tout »*. C'est ce que ce test fait, et il assume sa
+    /// forme : sous un bouchon dégénéré qui répond `NOTE:` à tout, **les six
+    /// sont dégradés en note** — l'invariant central violé, six fois.
+    ///
+    /// Ce n'est donc pas un test de l'escalade : c'est la preuve que le corpus
+    /// DISCRIMINE. Un corpus que même un triage dégénéré fait escalader
+    /// n'aurait rien mesuré, et une batterie verte sur un bouchon complaisant
+    /// n'aurait rien dit du modèle. La moitié verte — les six escaladent sous un
+    /// vrai modèle — appartient au vol 2 (`Tracked in:
+    /// senara-solutions/mika#2854`), qui seul peut la rendre : aucun bouchon ne
+    /// peut témoigner de l'obéissance d'un gabarit (discipline mika#1190).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_le_corpus_dordres_est_discriminant() {
+        let _garde = TriageEnvGuard::set(true);
+        let corpus = corpus_dordres();
+        assert_eq!(corpus.len(), 6, "AC1 : six ordres réels");
+
+        for texte in &corpus {
+            // Chacun est bien dans la population de (h) : un corpus hors
+            // population ne mesurerait rien du triage.
+            assert!(
+                matches!(classify(texte), Some(Candidate::HumanTextNoTask { .. })),
+                "{texte:?}"
+            );
+            // Le rouge, mesuré : un triage qui note tout les dégrade tous.
+            assert!(
+                matches!(
+                    decide(
+                        classify(texte).unwrap(),
+                        &triage_stub(
+                            Some(Ok(false)),
+                            Some(Ok(TriageVerdict::Note("rien d'actionnable".into())))
+                        )
+                    )
+                    .await,
+                    Decision::SkipWithNote { .. }
+                ),
+                "le corpus doit être dégradable, sinon il ne mesure rien : {texte:?}"
+            );
+        }
+    }
+
+    /// Les six ordres d'opérateur du 2026-10-20, remis dans le gabarit du
+    /// gateway. Partagé avec les tests e2e de `server::tests` et avec le vol 2.
+    pub(crate) fn corpus_dordres() -> Vec<String> {
+        [
+            (2784, "lève operator-gated, c'est bon pour moi"),
+            (
+                2680,
+                "option (c) : un tour léger qui trie. Ouvre le ticket.",
+            ),
+            (2814, "je valide le vol 2, lance-le"),
+            (1381, "Q1 : oui. Q2 : la seconde option. Ferme le ticket."),
+            (2854, "ferme celui-ci, il est livré"),
+            (2843, "relance le groom avec cette contrainte en plus"),
+        ]
+        .iter()
+        .map(|(issue, corps)| {
+            format!(
+                "[GitHub] New comment on senara-solutions/mika#{issue} (t) by @samidarko\n\
+                 https://github.com/senara-solutions/mika/issues/{issue}#issuecomment-1\n\n{corps}"
+            )
+        })
+        .collect()
+    }
+
+    /// `LiveState` sans fournisseur de modèle est une ERREUR, donc le tour
+    /// complet — jamais la note.
+    ///
+    /// Le champ est un `Option` parce que les chemins qui construisent un
+    /// `LiveState` hors du serveur n'ont pas de `llm` à donner ; ce test fige
+    /// que l'absence se comporte comme une panne (fail-open) et non comme un
+    /// « rien à dire » (qui serait une note).
+    #[tokio::test]
+    async fn mika2854_h_sans_fournisseur_le_triage_est_une_panne() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let state = LiveState {
+            db: &db,
+            github_token: None,
+            request_id: "rid-now",
+            llm: None,
+        };
+        assert!(state.triage("peu importe le texte").await.is_err());
     }
 }
