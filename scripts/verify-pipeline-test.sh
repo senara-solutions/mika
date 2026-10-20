@@ -26,6 +26,13 @@ setup_test_repo() {
   TEST_DIR=$(mktemp -d)
   cd "$TEST_DIR"
   git init --initial-branch main -q
+  # Declare the fixture repo's git identity (mika#2793). Without it the 29
+  # `git commit` calls below inherit the machine's global config: green on a
+  # developer box, `Author identity unknown` on a fresh hosted runner. The
+  # identity goes on the FIXTURE repo, never `--global`: a suite that needs the
+  # host configured a certain way measures the host as much as the code.
+  git config user.email "verify-pipeline-test@mika.invalid"
+  git config user.name "verify-pipeline-test"
   mkdir -p scripts
   # Copy the verify script into the test repo
   cp "$VERIFY_SCRIPT" scripts/verify-pipeline.sh

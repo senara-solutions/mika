@@ -21,6 +21,7 @@ tags:
   - remede-local
   - faux-vert
   - mika-1801
+  - mika-2793
 ---
 
 # Une garde que rien n'invoque se lit exactement comme un arbre propre
@@ -261,6 +262,51 @@ Deux corrections à la lecture ci-dessus, et aucune ne déplace sa conclusion :
   ne reste pas propre : c'est l'argument de la garde structurelle, pas de
   l'inventaire.
 
+### Câblée depuis — mika#2793, 2026-10-19 : et quatre des 25 étaient rouges
+
+mika#2793 est la Fire-Disposition de l'arriéré que mika#2761 avait mesuré. Les
+25 `unwired` sont câblées, chaque ligne retirée du registre dans le même commit
+que son câblage (le lint l'y force), **les quatre harnais nommés par le tableau
+ci-dessus en premier**. La colonne est vide : `unwired=0` dans la ligne de
+rapport du lint. Le recensement du 2026-09-28 est clos.
+
+Mais le fait qui vaut d'être écrit n'est pas la fermeture. C'est que **quatre
+des 25 ne passaient pas au premier lancement** — et qu'aucune n'avait été
+touchée depuis son écriture :
+
+| suite | ce que son premier lancement a dit |
+|---|---|
+| `test_sandbox_log_dir_bound.sh` | 11/5. Son probe faisait `if : > "$chemin"` dans le sandbox : la redirection est exécutée par le shell avant toute commande, un `sh -c` non interactif quitte sur place quand elle échoue, et la branche `else` n'était jamais atteinte. **Le garde rougissait exactement quand l'isolation fonctionnait** — un chemin non bindé est le contrat qu'il garde |
+| `test-mika-groom-milestone.sh` | 24/1. Deux assertions cherchaient un `llm_overrides` par skill que `6ccb79c4` (mika#949) avait supprimé. Le garde avait **perdu son sujet** : plus aucun site à asserter, donc un rouge permanent sur un producteur réaligné |
+| `verify-pipeline-test.sh` | 29/0 ici, et `Author identity unknown` sur un runner neuf : ses 29 `git commit` de fixture héritaient de la config globale de la machine |
+| `test-measure-pilot-cycle-emptiness.sh` | une assertion sur le bit `+x` d'un script que le dépôt déclarait `100644` |
+
+Deux de ces quatre rougissaient sur du code **juste**, et deux auraient rougi
+chez le premier lecteur. Dans les deux cas le résultat est le même : la première
+personne à lancer la suite n'aurait pas lu un défaut, elle aurait lu du bruit —
+et aurait appris à ignorer sa sortie.
+
+Donc la couche 0 de la table n'est pas « la garde ne refuse rien ». C'est
+**« la garde cesse de pouvoir refuser, et personne ne l'apprend »**. Un garde
+non câblé ne se conserve pas en attendant son job CI : il dérive avec le code
+qu'il observe, et trois semaines ont suffi pour deux de ces quatre. La fenêtre
+où le câbler coûte une strophe de workflow se referme sur une fenêtre où il
+coûte un diagnostic.
+
+Et un corollaire direct contre la phrase du § *Contexte* : « lancés à la main,
+ils font exactement ce qu'ils annoncent » n'est **pas** une preuve de
+câblabilité. `verify-pipeline-test.sh` le montre dans l'autre sens — vert sur un
+poste de développeur, rouge sur un runner neuf. Un lancement à la main mesure la
+machine autant que le code ; seul un runner neuf sépare les deux.
+
+Une dernière propriété, celle qui rend le compte honnête : aucune des 25 n'a été
+basculée en `operator` et aucune n'a été supprimée. « Needs bwrap » n'est pas
+« needs the outside world » — quatre suites à précondition d'environnement sont
+allées dans le job `check`, le seul runner qui porte un `bwrap` réel, parce
+qu'ailleurs elles auraient été vertes **par skip permanent**, c'est-à-dire
+décoratives une couche plus haut. Un job vert ne distingue pas « 15 assertions
+passées » de « ⊘ skipped », donc le câblage ne vaut que lu dans le log.
+
 ## Quand l'appliquer
 
 - À l'écriture de tout script de garde : le câblage est dans le même diff. Ce
@@ -271,6 +317,10 @@ Deux corrections à la lecture ci-dessus, et aucune ne déplace sa conclusion :
   prédicat imparfait câblé se corrige.
 - À la troisième récurrence d'une classe que le dépôt croit gardée : vérifier
   que la garde **tourne** avant de suspecter son prédicat.
+- Au câblage d'une garde restée sans runner : prévoir qu'elle soit rouge, et
+  mesurer avant de conclure. Quatre des 25 de mika#2793 l'étaient, dont deux sur
+  du code juste. Un rouge au premier lancement n'accuse pas le code — il dit
+  seulement que la garde a dérivé sans témoin.
 - À l'écriture d'une garde qui protège une propriété d'une autre garde :
   se demander si la propriété vaut pour une famille, et si oui, recenser la
   famille — sans quoi le remède ne dépassera pas son premier membre.
