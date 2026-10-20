@@ -309,6 +309,50 @@ pub(crate) async fn write_note(db: &AsyncDatabase, target: &str, note: &str) {
     }
 }
 
+/// Pose `MIKA_WEBHOOK_COMMENT_TRIAGE` le temps d'un test et la restaure au
+/// `Drop`, pour qu'un `panic!` d'assertion ne la laisse pas fuir sur le test
+/// suivant. **Le seul garde de cette variable** : les tests de ce module, du
+/// pré-filtre et de bout en bout (`server::tests`) passent tous par lui.
+///
+/// L'interrupteur se lit dans `decide_comment_triage` (§ D8 du plan) plutôt
+/// que de traverser `skip_turn` puis `decide` — cinq décideurs porteraient
+/// alors un argument qu'ils ne lisent pas. Le prix est ce garde, et le
+/// `#[serial_test::serial]` que tout test s'en servant doit porter.
+#[cfg(test)]
+pub(crate) struct TriageEnvGuard(Option<String>);
+
+#[cfg(test)]
+impl TriageEnvGuard {
+    /// `None` retire la variable : la ligne « absente » de la table de vérité.
+    pub(crate) fn set(value: Option<&str>) -> Self {
+        let previous = std::env::var(TRIAGE_ENV).ok();
+        // SAFETY: les tests qui construisent ce garde sont sérialisés par
+        // `#[serial_test::serial]`, donc aucun autre fil ne lit
+        // l'environnement pendant la mutation.
+        match value {
+            Some(v) => unsafe { std::env::set_var(TRIAGE_ENV, v) },
+            None => unsafe { std::env::remove_var(TRIAGE_ENV) },
+        }
+        Self(previous)
+    }
+
+    /// Armé (`1`) ou désarmé (`0`).
+    pub(crate) fn armed(armed: bool) -> Self {
+        Self::set(Some(if armed { "1" } else { "0" }))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TriageEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: même sérialisation qu'à la pose.
+        match self.0.take() {
+            Some(v) => unsafe { std::env::set_var(TRIAGE_ENV, v) },
+            None => unsafe { std::env::remove_var(TRIAGE_ENV) },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,30 +426,6 @@ mod tests {
                 !TRIAGE_SYSTEM_PROMPT.contains(identite),
                 "§ D2 — aucune liste d'identités dans le prompt, or il nomme {identite}"
             );
-        }
-    }
-
-    /// Restaure la variable au `Drop`, pour qu'un `panic!` d'assertion ne la
-    /// laisse pas fuir sur le test suivant.
-    struct TriageEnvGuard(Option<String>);
-
-    impl TriageEnvGuard {
-        fn set(value: Option<&str>) -> Self {
-            let previous = std::env::var(TRIAGE_ENV).ok();
-            match value {
-                Some(v) => unsafe { std::env::set_var(TRIAGE_ENV, v) },
-                None => unsafe { std::env::remove_var(TRIAGE_ENV) },
-            }
-            Self(previous)
-        }
-    }
-
-    impl Drop for TriageEnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => unsafe { std::env::set_var(TRIAGE_ENV, v) },
-                None => unsafe { std::env::remove_var(TRIAGE_ENV) },
-            }
         }
     }
 

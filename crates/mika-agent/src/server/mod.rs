@@ -6912,31 +6912,6 @@ mod tests {
     // avec le `LiveState` de production et son `llm: Some(…)`.
     // ---------------------------------------------------------------------
 
-    /// Pose `MIKA_WEBHOOK_COMMENT_TRIAGE` le temps d'un test, restauré par
-    /// `Drop` — même forme et même raison que [`Mika2680EnvGuard`], sur
-    /// l'interrupteur dédié de (h). Les deux peuvent cohabiter : `#[serial]`
-    /// est ce qui empêche un voisin de les lire pendant qu'ils sont posés.
-    struct Mika2854EnvGuard(Option<String>);
-
-    impl Mika2854EnvGuard {
-        fn set(value: &str) -> Self {
-            let previous = std::env::var(comment_triage::TRIAGE_ENV).ok();
-            unsafe { std::env::set_var(comment_triage::TRIAGE_ENV, value) };
-            Self(previous)
-        }
-    }
-
-    impl Drop for Mika2854EnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(previous) => unsafe {
-                    std::env::set_var(comment_triage::TRIAGE_ENV, previous)
-                },
-                None => unsafe { std::env::remove_var(comment_triage::TRIAGE_ENV) },
-            }
-        }
-    }
-
     const MIKA2854_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/2854";
 
     /// Un commentaire d'opérateur sur un ticket sans tâche de boucle, avec le
@@ -7028,7 +7003,7 @@ mod tests {
     #[serial_test::serial]
     async fn mika2854_v1_une_note_ecarte_le_tour_de_bout_en_bout() {
         mika2680_warm_callsites().await;
-        let _env = Mika2854EnvGuard::set("1");
+        let _env = comment_triage::TriageEnvGuard::armed(true);
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2854_state("NOTE: accusé de réception, rien à décider");
         mika2675_run_on(&state, MIKA2854_COMMENT).await;
@@ -7094,7 +7069,7 @@ mod tests {
     #[serial_test::serial]
     async fn mika2854_v2_une_decision_escalade_vers_le_tour_complet() {
         mika2680_warm_callsites().await;
-        let _env = Mika2854EnvGuard::set("1");
+        let _env = comment_triage::TriageEnvGuard::armed(true);
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2854_state("DECISION");
         mika2675_run_on(&state, MIKA2854_COMMENT).await;
@@ -7138,7 +7113,7 @@ mod tests {
     #[serial_test::serial]
     async fn mika2854_un_verdict_illisible_rend_le_tour_complet() {
         mika2680_warm_callsites().await;
-        let _env = Mika2854EnvGuard::set("1");
+        let _env = comment_triage::TriageEnvGuard::armed(true);
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2854_state("Voici mon analyse : c'est une note.");
         mika2675_run_on(&state, MIKA2854_COMMENT).await;
@@ -7178,7 +7153,7 @@ mod tests {
     #[serial_test::serial]
     async fn mika2854_un_issue_closed_garde_son_tour_dans_ce_vol() {
         mika2680_warm_callsites().await;
-        let _env = Mika2854EnvGuard::set("1");
+        let _env = comment_triage::TriageEnvGuard::armed(true);
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
         mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
@@ -7213,7 +7188,7 @@ mod tests {
     #[serial_test::serial]
     async fn mika2854_v9_une_relivraison_ne_double_pas_la_note() {
         mika2680_warm_callsites().await;
-        let _env = Mika2854EnvGuard::set("1");
+        let _env = comment_triage::TriageEnvGuard::armed(true);
         let (state, mock) = mika2854_state("NOTE: accusé de réception");
         // La seconde livraison consomme la réponse n° 2 : elle doit être un
         // `NOTE:` aussi, sinon ce test mesurerait un changement de verdict.
@@ -7257,7 +7232,7 @@ mod tests {
     #[serial_test::serial]
     async fn mika2854_v8_desarmee_la_classe_ne_lit_rien() {
         mika2680_warm_callsites().await;
-        let _env = Mika2854EnvGuard::set("0");
+        let _env = comment_triage::TriageEnvGuard::armed(false);
         let (_guard, events) = mika2680_capture();
         // Si le triage était consulté, il obtiendrait une note — donc ce
         // bouchon est ce qui rend l'assertion non vacante : un tour qui a lieu
@@ -7292,7 +7267,7 @@ mod tests {
     #[serial_test::serial]
     async fn mika2854_ac7_une_tache_de_boucle_vivante_garde_le_chemin_dhier() {
         mika2680_warm_callsites().await;
-        let _env = Mika2854EnvGuard::set("1");
+        let _env = comment_triage::TriageEnvGuard::armed(true);
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2854_state("NOTE: accusé de réception");
         mika2854_seed_issue_task(&state, MIKA2854_ISSUE_URL).await;

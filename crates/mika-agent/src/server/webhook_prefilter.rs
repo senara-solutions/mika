@@ -2973,7 +2973,7 @@ pub(crate) mod tests {
             Release::TriageUnreadable,
         ] {
             let (texte, state, touched, enabled, triage) = cas_de_relache(terme);
-            let _garde = TriageEnvGuard::set(triage);
+            let _garde = comment_triage::TriageEnvGuard::armed(triage);
             assert_eq!(
                 skip_turn(&db, &state, &texte, touched, "rid-now", enabled).await,
                 Gate::Charged(terme),
@@ -3096,42 +3096,6 @@ pub(crate) mod tests {
     /// La clé d'état que la moitié commentaire doit rendre, fragment retiré.
     const ISSUE_URL_2854: &str = "https://github.com/senara-solutions/mika/issues/2854";
 
-    /// Restaure `MIKA_WEBHOOK_COMMENT_TRIAGE` à sa valeur d'entrée.
-    ///
-    /// **Premier garde d'environnement de ce module** : jusqu'à mika#2854 tous
-    /// ses tests recevaient `enabled` en argument, donc aucun ne touchait au
-    /// processus. L'interrupteur de (h) se lit dans `decide_comment_triage`
-    /// (D8 du plan) plutôt que de traverser `skip_turn` puis `decide` — cinq
-    /// décideurs porteraient alors un argument qu'ils ne lisent pas. Le prix
-    /// est ce garde, et le `#[serial_test::serial]` que tout test s'en servant
-    /// doit porter.
-    struct TriageEnvGuard(Option<String>);
-
-    impl TriageEnvGuard {
-        fn set(armed: bool) -> Self {
-            let avant = std::env::var(comment_triage::TRIAGE_ENV).ok();
-            // SAFETY: les tests qui construisent ce garde sont sérialisés par
-            // `#[serial_test::serial]`, donc aucun autre fil ne lit
-            // l'environnement pendant la mutation.
-            unsafe {
-                std::env::set_var(comment_triage::TRIAGE_ENV, if armed { "1" } else { "0" });
-            }
-            Self(avant)
-        }
-    }
-
-    impl Drop for TriageEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: même sérialisation qu'à la pose.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var(comment_triage::TRIAGE_ENV, v),
-                    None => std::env::remove_var(comment_triage::TRIAGE_ENV),
-                }
-            }
-        }
-    }
-
     /// Un bouchon de (h) : `None` sur une fente est ce qui PROUVE qu'une porte
     /// n'a pas été consultée, puisqu'il panique au lieu de répondre.
     fn triage_stub(
@@ -3250,7 +3214,7 @@ pub(crate) mod tests {
         };
         assert!(!fenetres_etroites.applies_to(&c), "{c:?}");
 
-        let _garde = TriageEnvGuard::set(true);
+        let _garde = comment_triage::TriageEnvGuard::armed(true);
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
         assert_eq!(
             skip_turn(&db, &Stub::default(), COMMENT_2854, strict, "rid-now", true).await,
@@ -3268,7 +3232,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2854_h_une_tache_de_boucle_vivante_garde_le_tour_sans_triage() {
-        let _garde = TriageEnvGuard::set(true);
+        let _garde = comment_triage::TriageEnvGuard::armed(true);
         for texte in [COMMENT_2854] {
             assert_eq!(
                 decide(classify(texte).unwrap(), &triage_stub(Some(Ok(true)), None)).await,
@@ -3287,7 +3251,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2854_h_decision_escalade_et_note_ecarte() {
-        let _garde = TriageEnvGuard::set(true);
+        let _garde = comment_triage::TriageEnvGuard::armed(true);
 
         assert_eq!(
             decide(
@@ -3331,7 +3295,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2854_h_les_pannes_rendent_le_tour_jamais_la_note() {
-        let _garde = TriageEnvGuard::set(true);
+        let _garde = comment_triage::TriageEnvGuard::armed(true);
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
 
         for (state, attendu) in [
@@ -3376,7 +3340,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2854_h_desarmee_ne_lit_rien_du_tout() {
-        let _garde = TriageEnvGuard::set(false);
+        let _garde = comment_triage::TriageEnvGuard::armed(false);
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
 
         for texte in [COMMENT_2854] {
@@ -3398,7 +3362,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2854_h_la_note_ecarte_le_tour_et_laisse_ses_deux_traces() {
-        let _garde = TriageEnvGuard::set(true);
+        let _garde = comment_triage::TriageEnvGuard::armed(true);
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
         let state = triage_stub(
             Some(Ok(false)),
@@ -3448,7 +3412,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2854_h_le_verdict_ne_depend_pas_de_lauteur() {
-        let _garde = TriageEnvGuard::set(true);
+        let _garde = comment_triage::TriageEnvGuard::armed(true);
         let de_vincent = COMMENT_2854.replace("by @samidarko", "by @samidarko-vincent");
         let dun_inconnu = COMMENT_2854.replace("by @samidarko", "by @passant-anonyme");
 
@@ -3494,7 +3458,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2854_h_le_corpus_dordres_est_discriminant() {
-        let _garde = TriageEnvGuard::set(true);
+        let _garde = comment_triage::TriageEnvGuard::armed(true);
         let corpus = corpus_dordres();
         assert_eq!(corpus.len(), 6, "AC1 : six ordres réels");
 
