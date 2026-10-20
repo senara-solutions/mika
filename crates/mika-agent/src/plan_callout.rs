@@ -243,6 +243,120 @@ fn normalize(raw: &str) -> String {
     }
 }
 
+/// Réécrit le callout périmé d'un corps d'issue en une ligne « Plan antérieur »,
+/// ou rend `None` si ce corps n'en porte pas (mika#2839).
+///
+/// # Pourquoi ce transform vit ici
+///
+/// mika#2194 fait de ce module le site **unique** du motif du callout, tenu par
+/// [`tests::mika2194_aucun_motif_de_callout_hors_de_ce_module`] dont l'allowlist
+/// est livrée vide et le reste. Un réécriveur ailleurs porterait le motif
+/// ailleurs ; la réponse à un scan structurel est de router le site, pas de
+/// l'exempter (mika#2201/#2323). La composition de la ligne de remplacement est
+/// dans cette fonction pour la même raison : ce qu'on écrit dans un callout
+/// relève du même vocabulaire que ce qu'on y lit.
+///
+/// # Line-wise, et sur le corps *original*
+///
+/// [`strip_fenced_blocks`] **supprime** des lignes : un offset trouvé sur son
+/// résultat ne se remappe pas sur le corps d'entrée. Le parcours suit donc
+/// l'état de fence ligne à ligne sur le corps original, et ne considère une
+/// ligne de callout que hors fence — un callout *cité* dans un bloc de code
+/// n'est pas réécrit. Le repli de `strip_fenced_blocks` est reproduit à
+/// l'identique : une fence laissée ouverte ne masque rien, de sorte que la vue
+/// de ce transform et celle de `plan_callout(_, Strip)` ne puissent pas
+/// divergir — l'appelant compare sur la seconde (mika#2839 R9) et agit par la
+/// première.
+///
+/// # Le **run** entier, pas la seule ligne `Plan`
+///
+/// `_write_canonical_callout` écrit trois lignes `> - ` contiguës — `Branch`,
+/// `Plan`, `Grooming history`. Remplacer la seule ligne `Plan` laisserait
+/// `Branch` en place, donc `auto_pull::extract_branch_name` rendrait toujours la
+/// branche morte, donc la sonde `gh pr list --head` serait **encore repayée à
+/// chaque pull** : la conséquence que mika#2839 existe pour supprimer. Le
+/// transform étend donc l'intervalle sur le run contigu de lignes `> - `, quel
+/// qu'en soit le nombre — un bloc écrit à la main sur quatre lignes est couvert.
+///
+/// Elle ne vérifie **pas** que la ligne `Branch` du run nomme `branch` : c'est
+/// l'affaire de l'appelant, qui tient la comparaison de fraîcheur.
+///
+/// # L'idempotence est structurelle
+///
+/// Agir exige une ligne `> - **Plan:** …` ; après une réécriture elle n'existe
+/// plus, donc un second passage rend `None` par construction. Aucun marqueur
+/// « déjà réécrit » n'est ajouté au corps, et la prose produite a un écrivain et
+/// zéro lecteur — rien ne peut dériver de son orthographe.
+pub fn rewrite_callout_as_prior_plan(body: &str, branch: &str, merged_pr: u64) -> Option<String> {
+    // `split_inclusive` et non `lines()` : les terminateurs sont conservés, donc
+    // le texte autour du run est reproduit à l'octet près (`\r\n` compris) et un
+    // corps sans saut de ligne final n'en gagne pas un.
+    let lines: Vec<&str> = body.split_inclusive('\n').collect();
+
+    let mut fenced = vec![false; lines.len()];
+    let mut open: Option<char> = None;
+    for (i, line) in lines.iter().enumerate() {
+        match (open, fence_marker(line)) {
+            (None, Some(c)) => {
+                open = Some(c);
+                fenced[i] = true;
+            }
+            (Some(c), Some(m)) if m == c => {
+                fenced[i] = true;
+                open = None;
+            }
+            _ => fenced[i] = open.is_some(),
+        }
+    }
+    // Fence non fermée : le repli de `strip_fenced_blocks`, à l'identique.
+    if open.is_some() {
+        fenced.iter_mut().for_each(|f| *f = false);
+    }
+
+    let (at, plan) = lines.iter().enumerate().find_map(|(i, line)| {
+        (!fenced[i])
+            .then(|| callout_re().captures(line))
+            .flatten()
+            .map(|c| (i, c[1].to_string()))
+    })?;
+
+    let in_run = |i: usize| !fenced[i] && lines[i].starts_with("> - ");
+    let mut start = at;
+    while start > 0 && in_run(start - 1) {
+        start -= 1;
+    }
+    let mut end = at;
+    while end + 1 < lines.len() && in_run(end + 1) {
+        end += 1;
+    }
+
+    let mut out = String::with_capacity(body.len() + PRIOR_PLAN_LINE_BUDGET);
+    lines[..start].iter().for_each(|l| out.push_str(l));
+    // Les trois faits de la ligne sont les trois faits **mesurés** : le chemin lu
+    // dans le callout remplacé, la branche sur laquelle la mesure a porté, le
+    // numéro de PR rendu par la sonde. Rien n'y affirme que le plan existe à ce
+    // chemin sur `main` — la sonde a mesuré une suppression de branche, pas la
+    // présence d'un fichier.
+    out.push_str(&format!(
+        "> Plan antérieur : `{plan}` — la branche `{branch}` qui le portait a été \
+         supprimée par le merge de #{merged_pr} dans `main`. Callout réécrit par la \
+         porte d'auto-pull (mika#2839)."
+    ));
+    if lines[end].ends_with("\r\n") {
+        out.push_str("\r\n");
+    } else if lines[end].ends_with('\n') {
+        out.push('\n');
+    }
+    lines[end + 1..].iter().for_each(|l| out.push_str(l));
+    Some(out)
+}
+
+/// Réserve d'allocation pour la ligne de prose de [`rewrite_callout_as_prior_plan`].
+///
+/// Un budget, pas une borne : la ligne porte un chemin et une branche de
+/// longueur libre, et `String` réalloue sans drame si elle le dépasse.
+const PRIOR_PLAN_LINE_BUDGET: usize = 256;
+
 /// Le marqueur de fence d'une ligne (```` ``` ```` ou `~~~`), ou rien.
 fn fence_marker(line: &str) -> Option<char> {
     let trimmed = line.trim_start();
@@ -413,6 +527,123 @@ mod tests {
         let body = "> - **Plan:** `docs/plans/x-plan.md";
         assert!(plan_callout(body, FenceHandling::Keep).is_none());
         assert!(plan_callout(body, FenceHandling::Strip).is_none());
+    }
+
+    // ───────── Réécriture en « Plan antérieur » (mika#2839) ─────────
+
+    const DEAD_BRANCH: &str = "chore/2108/orienter-le-pilote-avant-le-corps";
+    const PLAN_2108: &str =
+        "docs/plans/2026-10-19-006-fix-2108-orienter-le-pilote-avant-le-corps-du-ticket-plan.md";
+
+    /// Le corps canonique : les trois lignes que `_write_canonical_callout`
+    /// écrit, puis de la prose.
+    const CANONICAL: &str = concat!(
+        "> - **Branch:** `chore/2108/orienter-le-pilote-avant-le-corps`\n",
+        "> - **Plan:** `docs/plans/2026-10-19-006-fix-2108-orienter-le-pilote-avant-le-corps-du-ticket-plan.md` (committed on branch @ `3cbeec04`)\n",
+        "> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: bcbf52ea\n",
+        "\n",
+        "## Le résidu\n",
+        "\n",
+        "Un paragraphe, avec un `backtick` et une > citation.\n",
+    );
+
+    const CANONICAL_REWRITTEN: &str = concat!(
+        "> Plan antérieur : `docs/plans/2026-10-19-006-fix-2108-orienter-le-pilote-avant-le-corps-du-ticket-plan.md` — la branche `chore/2108/orienter-le-pilote-avant-le-corps` qui le portait a été supprimée par le merge de #2834 dans `main`. Callout réécrit par la porte d'auto-pull (mika#2839).\n",
+        "\n",
+        "## Le résidu\n",
+        "\n",
+        "Un paragraphe, avec un `backtick` et une > citation.\n",
+    );
+
+    /// AC1 — le run de trois lignes devient **une** ligne de prose, et tout le
+    /// reste du corps est reproduit à l'octet près.
+    #[test]
+    fn mika2839_le_run_entier_devient_une_ligne_de_prose() {
+        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834)
+            .expect("le corps canonique doit être réécrit");
+        assert_eq!(out, CANONICAL_REWRITTEN);
+    }
+
+    /// AC2 — l'idempotence est structurelle : la sortie ne porte plus de ligne
+    /// `Plan`, donc un second passage ne trouve rien. Aucun marqueur
+    /// « déjà réécrit » n'a été ajouté — la seule différence est le remplacement.
+    #[test]
+    fn mika2839_un_second_passage_rend_none_sans_marqueur() {
+        let once =
+            rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834).expect("1er passage");
+        assert!(rewrite_callout_as_prior_plan(&once, DEAD_BRANCH, 2834).is_none());
+    }
+
+    /// AC3 — un corps dont le seul callout vit dans un bloc clôturé n'est pas
+    /// touché. C'est `Strip` appliqué sans remappage d'offset (R2).
+    #[test]
+    fn mika2839_un_callout_cite_dans_une_fence_nest_pas_reecrit() {
+        let body = "prose\n```\n> - **Plan:** `docs/plans/x-plan.md`\n```\nfin\n";
+        assert!(rewrite_callout_as_prior_plan(body, DEAD_BRANCH, 2834).is_none());
+    }
+
+    /// Un corps sans aucune ligne de callout rend `None`.
+    #[test]
+    fn mika2839_sans_callout_rien_nest_reecrit() {
+        assert!(
+            rewrite_callout_as_prior_plan("## Titre\n\ndu texte.\n", DEAD_BRANCH, 2834).is_none()
+        );
+    }
+
+    /// Le risque nommé par le plan : un bloc non canonique, écrit à la main sur
+    /// quatre lignes. Le transform agit sur le run contigu qu'il trouve, quel
+    /// qu'en soit le nombre de lignes.
+    #[test]
+    fn mika2839_un_run_non_canonique_de_quatre_lignes_est_remplace_entier() {
+        let body = concat!(
+            "> - **Issue:** senara-solutions/mika#2108\n",
+            "> - **Branch:** `chore/2108/orienter-le-pilote-avant-le-corps`\n",
+            "> - **Plan:** `docs/plans/x-plan.md`\n",
+            "> - **Grooming history:** GROOMED\n",
+            "\n",
+            "suite\n",
+        );
+        let out = rewrite_callout_as_prior_plan(body, DEAD_BRANCH, 2834).expect("réécrit");
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("> - ")).count(),
+            0,
+            "aucune ligne du run ne doit survivre : {out}"
+        );
+        assert!(
+            out.ends_with("\n\nsuite\n"),
+            "la suite est préservée : {out}"
+        );
+    }
+
+    /// V2 / AC4 — la chaîne de conséquences de R8, telle qu'elle est.
+    ///
+    /// **Un écart assumé avec la lettre de V2/AC4**, qui demandent
+    /// `extract_plan_path` → `Some` sur la sortie. C'est impossible, et
+    /// l'impossibilité est portée par R5 : `extract_plan_path` **est** le
+    /// lecteur strict ancré de ce module, donc le faire rendre `Some` exigerait
+    /// de laisser la ligne `> - **Plan:**` en place, donc d'annuler
+    /// l'idempotence structurelle de R5 *et* de laisser `extract_branch_name`
+    /// rendre la branche morte (R3). La justification que V2 et AC4 donnent
+    /// eux-mêmes — « le substring `docs/plans/` subsiste », « et
+    /// `check_grooming_markers` le voit toujours comme portant un plan » — est
+    /// celle du lecteur **lâche**, pas du strict ; c'est elle qui est assertée
+    /// ici, avec la chute du strict qui tarit la sonde.
+    #[test]
+    fn mika2839_la_sortie_tarit_le_lecteur_strict_et_garde_le_lache() {
+        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834).expect("réécrit");
+        assert!(
+            plan_callout(&out, FenceHandling::Strip).is_none(),
+            "le lecteur strict ne doit plus rien voir — c'est ce qui fait tomber \
+             `extract_branch_name` et donc la sonde `gh pr list --head`"
+        );
+        assert!(
+            !out.contains("> - **Branch:**"),
+            "la ligne `Branch` doit avoir disparu avec le run (R3)"
+        );
+        assert!(
+            out.contains(PLAN_2108) && out.contains("docs/plans/"),
+            "le substring non ancré que lit `check_grooming_markers` subsiste"
+        );
     }
 
     /// Un seul motif dans l'arbre de production : la garde structurelle de

@@ -3201,6 +3201,333 @@ async fn gh_merged_pr_for_branch(
     probe
 }
 
+// ───── Réécriture du callout d'une branche morte (mika#2839) ─────
+
+/// Le corps **frais** d'une issue, relu juste avant d'être écrit (R9).
+///
+/// `gh issue view --json body -q .body`, et non l'`issue.body` que la boucle
+/// porte déjà : entre la mesure et l'écriture il y a deux appels réseau, et le
+/// grooming écrit ce même bloc par `_write_canonical_callout`. La relecture est
+/// ce qui rend possible le comparer-puis-écrire de [`rewrite_dead_callout`].
+///
+/// `jq -r` termine sa sortie par un `\n` qui n'est pas dans le corps : il est
+/// retiré, et lui seul, pour que la comparaison de R9 porte exactement sur les
+/// octets que GitHub a rendus.
+async fn gh_issue_body(github_token: &str, issue_number: u64) -> Result<String> {
+    let output = run_gh(
+        github_token,
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "view",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--json",
+            "body",
+            "-q",
+            ".body",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh issue view --json body failed for #{}: {}",
+            issue_number,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(body.strip_suffix('\n').unwrap_or(&body).to_string())
+}
+
+/// Écrire le corps d'une issue (mika#2839). Mirrors [`gh_apply_label`]'s shape.
+///
+/// Prend un [`LabelWriteToken`] pour la raison de mika#2228, et elle pèse plus
+/// lourd ici qu'ailleurs : c'est la **première** écriture de corps d'issue de ce
+/// module. Un corps écrit sous le token de lecture ne manquerait pas d'une
+/// permission en silence — il remplacerait le ticket par une page d'erreur
+/// d'autorisation.
+///
+/// `--body` **inline** et non `--body-file` : [`run_gh`] ferme l'entrée standard
+/// (`Stdio::null()`), un fichier intermédiaire demanderait une écriture hors
+/// worktree, et [`gh_comment_issue`] a déjà le précédent sur ce même seam.
+async fn gh_edit_issue_body(
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    body: &str,
+) -> Result<()> {
+    let output = run_gh(
+        label_auth.token(),
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "edit",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--body",
+            body,
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Même asymétrie que `gh_apply_label` : le refus de permission sous
+        // identité App a son nom là-bas, l'appelant garde le sien ici.
+        label_auth.report_write_failure("auto_pull", issue_number, "body", &stderr);
+        return Err(anyhow!(
+            "gh issue edit --body failed for #{}: {}",
+            issue_number,
+            stderr
+        ));
+    }
+    Ok(())
+}
+
+/// `audit_events.target_key` de la réécriture de callout (mika#2839 R7).
+const CALLOUT_REWRITE_TARGET_KEY: &str = "auto_pull_callout_rewrite";
+
+/// Dire ce que la réécriture a fait — une ligne d'audit et une sonde, sur
+/// **toutes** les branches (R7).
+///
+/// `cause` est `None` sur le chemin nominal et rend `null` dans le JSON, jamais
+/// `""` ni `"none"` : absent n'est pas zéro (mika#2331). La sonde du chemin
+/// nominal est INFO et non `debug!`, parce que son absence doit pouvoir se
+/// distinguer de « ce n'est jamais arrivé » : sans elle, un binaire antérieur à
+/// ce vol et une population vide rendent les mêmes octets (mika#2340).
+///
+/// Le vocabulaire de `cause` est **clos** — `body_changed`, `body_unreadable`,
+/// `write_refused` — pour la raison de mika#2205 : deux populations sous un même
+/// nom ne se soustraient pas, et trois orthographes d'une même panne ne se
+/// comptent pas.
+#[allow(clippy::too_many_arguments)]
+async fn note_callout_rewrite(
+    db: &AsyncDatabase,
+    issue_number: u64,
+    branch: &str,
+    plan: Option<&str>,
+    merged_pr: u64,
+    cause: Option<&str>,
+    token_source: &str,
+    phase: &str,
+    trace_id: &str,
+    session_id: &str,
+) {
+    let outcome = if cause.is_none() {
+        "rewritten"
+    } else {
+        "abandoned"
+    };
+    let after = serde_json::json!({
+        "issue": issue_number,
+        "branch": branch,
+        "plan": plan,
+        "merged_pr": merged_pr,
+        "outcome": outcome,
+        "cause": cause,
+        "token_source": token_source,
+    })
+    .to_string();
+
+    match cause {
+        None => info!(
+            event = "auto_pull_callout_rewritten",
+            issue = issue_number,
+            branch,
+            plan = ?plan,
+            merged_pr,
+            phase,
+            "auto_pull: le callout d'une branche supprimée par un merge est réécrit \
+             en « Plan antérieur » (mika#2839)"
+        ),
+        Some(cause) => warn!(
+            event = "auto_pull_callout_rewrite_abandoned",
+            issue = issue_number,
+            branch,
+            plan = ?plan,
+            merged_pr,
+            cause,
+            phase,
+            "auto_pull: le callout n'a pas été réécrit ; le ticket est promu \
+             quand même (mika#2839 R6)"
+        ),
+    }
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "auto_pull",
+            CALLOUT_REWRITE_TARGET_KEY,
+            None,
+            Some(&after),
+            Some(phase),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            issue = issue_number,
+            "auto_pull: failed to write callout-rewrite audit event"
+        );
+    }
+}
+
+/// Réécrire le callout d'une branche que le merge de sa PR a supprimée
+/// (mika#2839 R6/R9).
+///
+/// Appelée depuis l'arm `BranchDeletedByMerge` de [`promotion_gate_allows`],
+/// **après** la ligne d'audit de mika#2837, et sans pouvoir changer le verdict :
+/// tous les écarts et toutes les pannes sortent par
+/// `auto_pull_callout_rewrite_abandoned` avec leur `cause` et rendent `Ok(())`.
+/// Ce que ce vol ferme est le résidu de mika#2837 — la sonde
+/// `gh pr list --head` repayée à *chaque* pull pour reconstruire une réponse qui
+/// ne changera plus, et un lecteur humain renvoyé à une branche qui n'existe
+/// pas.
+///
+/// **Comparer-puis-écrire sur une relecture, et ce n'est pas un CAS.** GitHub
+/// n'offre aucune écriture conditionnelle sur un corps d'issue. On relit, on
+/// vérifie que le corps frais nomme toujours la même branche morte *et* le même
+/// plan, puis on écrit. La fenêtre qui reste est celle entre la relecture et
+/// l'écriture ; ce qu'on y perdrait est un dispatch de grooming, à comparer au
+/// tour d'opérateur par vol que mika#2837 vient de supprimer.
+///
+/// L'autre écrivain de ce bloc est `_write_canonical_callout`, au grooming. Les
+/// deux ne sont pas ordonnés, et c'est exactement l'objection que mika#2837
+/// avait posée : R9 est la réponse — celui qui perd la course ne détruit pas
+/// l'écriture de l'autre, il l'abandonne et le dit.
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_dead_callout(
+    db: &AsyncDatabase,
+    github_token: &str,
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    measured_body: &str,
+    branch: &str,
+    merged_pr: u64,
+    phase: &str,
+    trace_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    let token_source = label_auth.source().as_str();
+    let measured_plan = extract_plan_path(measured_body);
+    // Les cinq appels à `note_callout_rewrite` sont épelés en entier plutôt que
+    // repliés dans une fermeture : une fermeture rendant un futur qui emprunte
+    // ses propres captures ne s'exprime pas dans le système de types ici, et la
+    // contourner coûterait plus de machinerie que la répétition n'en coûte.
+    let plan = measured_plan.as_deref();
+
+    let fresh = match gh_issue_body(github_token, issue_number).await {
+        Ok(body) => body,
+        Err(e) => {
+            debug!(
+                error = %e,
+                issue = issue_number,
+                "auto_pull: relecture du corps impossible avant réécriture du callout"
+            );
+            note_callout_rewrite(
+                db,
+                issue_number,
+                branch,
+                plan,
+                merged_pr,
+                Some("body_unreadable"),
+                token_source,
+                phase,
+                trace_id,
+                session_id,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    // R9 — on n'écrit que si le corps frais nomme TOUJOURS la même branche morte
+    // et le même plan. Un corps qui a bougé depuis la mesure (le grooming a
+    // republié le callout, un humain l'a corrigé à la main) n'est plus celui
+    // qu'on a mesuré : l'écrire effacerait l'écriture de l'autre.
+    let fresh_plan = extract_plan_path(&fresh);
+    let same_branch = extract_branch_name(&fresh).as_deref() == Some(branch);
+    if !same_branch || fresh_plan.is_none() || fresh_plan != measured_plan {
+        note_callout_rewrite(
+            db,
+            issue_number,
+            branch,
+            plan,
+            merged_pr,
+            Some("body_changed"),
+            token_source,
+            phase,
+            trace_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // `None` est inatteignable ici : R9 vient de vérifier que le corps frais
+    // porte un callout lisible par le lecteur strict, qui est exactement celui
+    // que ce transform cherche. Replié sur `body_changed` plutôt que dépilé —
+    // un `expect` tuerait la tick pour une réécriture facultative, et le
+    // vocabulaire de `cause` est clos.
+    let Some(rewritten) =
+        crate::plan_callout::rewrite_callout_as_prior_plan(&fresh, branch, merged_pr)
+    else {
+        note_callout_rewrite(
+            db,
+            issue_number,
+            branch,
+            plan,
+            merged_pr,
+            Some("body_changed"),
+            token_source,
+            phase,
+            trace_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    };
+
+    if let Err(e) = gh_edit_issue_body(label_auth, issue_number, &rewritten).await {
+        debug!(
+            error = %e,
+            issue = issue_number,
+            "auto_pull: écriture du corps refusée ; le callout reste périmé"
+        );
+        note_callout_rewrite(
+            db,
+            issue_number,
+            branch,
+            plan,
+            merged_pr,
+            Some("write_refused"),
+            token_source,
+            phase,
+            trace_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    }
+
+    note_callout_rewrite(
+        db,
+        issue_number,
+        branch,
+        plan,
+        merged_pr,
+        None,
+        token_source,
+        phase,
+        trace_id,
+        session_id,
+    )
+    .await;
+    Ok(())
+}
+
 /// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
 /// promoted; on `false` the ticket has already been handed to the operator.
 ///
@@ -3267,6 +3594,40 @@ async fn promotion_gate_allows(
         .await
     {
         warn!(error = %e, issue = issue.number, "auto_pull: failed to write staleness audit event");
+    }
+
+    // mika#2839 — la mesure vient de dire que la branche du callout a été
+    // supprimée par le merge de sa PR : le callout est périmé, le plan ne l'est
+    // pas. On le réécrit ici, et seulement ici, parce que c'est le seul endroit
+    // où cette réponse est déjà payée. L'écriture ne peut pas coûter le verdict
+    // que mika#2837 vient de rendre — voir [`rewrite_dead_callout`].
+    if let (StalenessMeasurement::BranchDeletedByMerge { pr }, Some(b)) =
+        (&measurement, branch.as_deref())
+    {
+        let rewrite = rewrite_dead_callout(
+            db,
+            github_token,
+            label_auth,
+            issue.number,
+            &issue.body,
+            b,
+            *pr,
+            phase,
+            trace_id,
+            session_id,
+        )
+        .await;
+        if let Err(e) = rewrite {
+            // Inatteignable par construction : la fonction nomme ses écarts par
+            // leur `cause` et rend toujours `Ok(())`. La branche existe pour que
+            // le verdict reste hors de portée si un futur éditeur lui donnait
+            // une erreur à remonter.
+            warn!(
+                error = %e,
+                issue = issue.number,
+                "auto_pull: la réécriture du callout a remonté une erreur"
+            );
+        }
     }
 
     match decision {
@@ -10894,6 +11255,288 @@ This ticket has been GROOMED and is ready.
              Un journal vide ici veut dire que la couture n'est plus sur ce \
              chemin : l'appel est reparti vers la forge réelle. Appels vus \
              pour #{n} : {mine:?}"
+        );
+    }
+
+    // ── mika#2839 : le callout d'une branche morte est réécrit ──
+
+    /// Le corps d'un ticket dont la branche a été supprimée par le merge de sa
+    /// PR — trois lignes `> - `, la forme exacte que `dispatch-lib` écrit.
+    const DEAD_CALLOUT_BODY: &str = r#"## Le résidu
+
+Un ticket à plusieurs vols.
+
+> - **Branch:** `chore/2839/auto-pull-r-crire-le-callout-d-une`
+> - **Plan:** `docs/plans/2026-10-20-002-chore-2839-x.md` (committed on branch @ 3cbeec04)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: bcbf52ea"#;
+
+    const DEAD_CALLOUT_BRANCH: &str = "chore/2839/auto-pull-r-crire-le-callout-d-une";
+    const DEAD_CALLOUT_MERGED_PR: u64 = 2840;
+
+    /// Les lignes d'audit de réécriture de callout d'une session.
+    async fn callout_rewrite_rows(db: &AsyncDatabase, session: &str) -> Vec<String> {
+        db.get_audit_events(session)
+            .await
+            .expect("read audit events")
+            .into_iter()
+            .filter(|e| e.target_key == CALLOUT_REWRITE_TARGET_KEY)
+            .filter_map(|e| e.after_value)
+            .collect()
+    }
+
+    /// Les appels `gh` que le double a vus pour **cette** issue (le journal est
+    /// process-global : le filtre est ce qui rend le test parallèle-sûr, D4).
+    fn gh_calls_for(n: u64) -> Vec<String> {
+        crate::gh_process::recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(n))
+            .map(|c| c.args)
+            .collect()
+    }
+
+    /// Un `LabelWriteToken` de test, source `pat` — la valeur que `token_source`
+    /// doit porter dans la ligne d'audit (R7).
+    fn fake_label_auth() -> mika_common::label_write::LabelWriteToken {
+        mika_common::label_write::LabelWriteToken::new(
+            "fake-token".to_string(),
+            mika_common::label_write::LabelWriteTokenSource::Pat,
+        )
+    }
+
+    fn in_memory_db() -> AsyncDatabase {
+        AsyncDatabase::new_with_agent(
+            crate::db::Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        )
+    }
+
+    /// **V3 nominal — le corps écrit est la sortie du transform.**
+    ///
+    /// Pas « un corps qui contient la prose » : *la* sortie, celle que les tests
+    /// de `plan_callout` figent à l'octet (AC1). Ce que ce test ajoute est le
+    /// câblage — relire frais, transformer, écrire sur la bonne issue.
+    #[tokio::test]
+    async fn mika2839_le_chemin_nominal_ecrit_la_sortie_du_transform() {
+        let db = in_memory_db();
+        // Bande 990_3xx : les 990_2xx sont celles des contrôles du double
+        // lui-même (`gh_process`), et le journal d'appels est process-global —
+        // deux tests sur le même numéro se lisent mutuellement (mika#2713 D4).
+        let n = 990_301u64;
+        crate::gh_process::assert_fixture_issue(n);
+        // Le `\n` final est celui que `jq -r` ajoute : le lecteur doit le
+        // retirer, sans quoi la comparaison de R9 porterait sur d'autres octets
+        // que ceux que GitHub a rendus.
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{DEAD_CALLOUT_BODY}\n"),
+        );
+
+        let outcome = rewrite_dead_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_MERGED_PR,
+            "phase1",
+            "trace",
+            "session-2839-nominal",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — la réécriture ne remonte rien");
+
+        let expected = crate::plan_callout::rewrite_callout_as_prior_plan(
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_MERGED_PR,
+        )
+        .expect("le transform doit réécrire ce corps");
+
+        let edits: Vec<String> = gh_calls_for(n)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "exactement un `issue edit` sur #{n} ; vu : {edits:?}"
+        );
+        assert!(
+            edits[0].contains(&expected),
+            "le corps écrit doit être la sortie du transform.\nattendu : \
+             {expected:?}\nargv vu : {:?}",
+            edits[0]
+        );
+
+        let rows = callout_rewrite_rows(&db, "session-2839-nominal").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "une ligne d'audit par passage ; vu : {rows:?}"
+        );
+        for needle in [
+            "\"outcome\":\"rewritten\"",
+            "\"cause\":null",
+            "\"token_source\":\"pat\"",
+            "\"merged_pr\":2840",
+            "\"plan\":\"docs/plans/2026-10-20-002-chore-2839-x.md\"",
+        ] {
+            assert!(
+                rows[0].contains(needle),
+                "la ligne d'audit doit porter {needle} ; vu : {}",
+                rows[0]
+            );
+        }
+    }
+
+    /// **V3 — un corps frais nommant une AUTRE branche n'est pas écrasé.**
+    ///
+    /// C'est la course avec `_write_canonical_callout` que mika#2837 avait posée
+    /// en objection : celui qui la perd abandonne et le dit, il ne détruit pas
+    /// l'écriture de l'autre.
+    #[tokio::test]
+    async fn mika2839_un_corps_frais_dune_autre_branche_nest_pas_ecrase() {
+        let db = in_memory_db();
+        let n = 990_302u64;
+        crate::gh_process::assert_fixture_issue(n);
+        let regroomed = DEAD_CALLOUT_BODY.replace(DEAD_CALLOUT_BRANCH, "chore/2839/un-second-vol");
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{regroomed}\n"),
+        );
+
+        let outcome = rewrite_dead_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_MERGED_PR,
+            "phase1",
+            "trace",
+            "session-2839-autre-branche",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — l'abandon ne remonte rien");
+
+        let edits: Vec<String> = gh_calls_for(n)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert!(
+            edits.is_empty(),
+            "R9 — aucune écriture quand le corps frais a changé ; vu : {edits:?}"
+        );
+
+        let rows = callout_rewrite_rows(&db, "session-2839-autre-branche").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "l'abandon est audité lui aussi ; vu : {rows:?}"
+        );
+        assert!(
+            rows[0].contains("\"outcome\":\"abandoned\"")
+                && rows[0].contains("\"cause\":\"body_changed\""),
+            "l'abandon doit se nommer `body_changed` ; vu : {}",
+            rows[0]
+        );
+    }
+
+    /// **V3 — un corps frais sans callout n'est pas réécrit.**
+    ///
+    /// La `cause` est `body_changed` et non une quatrième : le vocabulaire est
+    /// clos, et ce corps-là *a* changé — il ne porte plus ce qu'on a mesuré.
+    #[tokio::test]
+    async fn mika2839_un_corps_frais_sans_callout_nest_pas_reecrit() {
+        let db = in_memory_db();
+        let n = 990_303u64;
+        crate::gh_process::assert_fixture_issue(n);
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            "Le callout a été retiré à la main.\n",
+        );
+
+        let outcome = rewrite_dead_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_MERGED_PR,
+            "phase1",
+            "trace",
+            "session-2839-sans-callout",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — l'abandon ne remonte rien");
+
+        assert!(
+            !gh_calls_for(n).iter().any(|a| a.contains("issue edit")),
+            "aucune écriture sur un corps qui ne porte plus de callout"
+        );
+        let rows = callout_rewrite_rows(&db, "session-2839-sans-callout").await;
+        assert_eq!(rows.len(), 1, "vu : {rows:?}");
+        assert!(
+            rows[0].contains("\"cause\":\"body_changed\""),
+            "vu : {}",
+            rows[0]
+        );
+    }
+
+    /// **V3 — une écriture refusée rend `Ok(())` et se nomme `write_refused`.**
+    ///
+    /// Le refus est injecté sur l'`argv` de l'écriture et non sur le sujet : la
+    /// relecture doit réussir, sans quoi ce test mesurerait `body_unreadable`
+    /// en croyant mesurer le refus (c'est la raison d'être de
+    /// `set_canned_failure`, mika#2839).
+    #[tokio::test]
+    async fn mika2839_une_ecriture_refusee_rend_ok_et_se_nomme() {
+        let db = in_memory_db();
+        let n = 990_304u64;
+        crate::gh_process::assert_fixture_issue(n);
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{DEAD_CALLOUT_BODY}\n"),
+        );
+        crate::gh_process::set_canned_failure(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue edit",
+            "gh: Resource not accessible by integration (HTTP 403)",
+        );
+
+        let outcome = rewrite_dead_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_MERGED_PR,
+            "phase1",
+            "trace",
+            "session-2839-refus",
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "R6 — un refus d'écriture ne peut pas coûter le verdict de mika#2837"
+        );
+
+        assert!(
+            gh_calls_for(n).iter().any(|a| a.contains("issue edit")),
+            "l'écriture doit avoir été tentée : sans tentative, ce test \
+             mesurerait un autre chemin"
+        );
+        let rows = callout_rewrite_rows(&db, "session-2839-refus").await;
+        assert_eq!(rows.len(), 1, "vu : {rows:?}");
+        assert!(
+            rows[0].contains("\"outcome\":\"abandoned\"")
+                && rows[0].contains("\"cause\":\"write_refused\""),
+            "vu : {}",
+            rows[0]
         );
     }
 
