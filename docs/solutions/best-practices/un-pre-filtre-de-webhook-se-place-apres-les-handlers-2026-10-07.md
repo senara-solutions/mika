@@ -6,12 +6,14 @@ module: crates/mika-agent/src/server
 problem_type: best_practice
 component: agent-core
 severity: medium
-tags: [webhooks, llm-cost, prefilter, observability, mika-2675, mika-2680]
+tags: [webhooks, llm-cost, prefilter, observability, mika-2675, mika-2680, mika-2854]
+last_updated: 2026-10-20
 applies_when:
   - "Vouloir écarter un événement webhook sans tour LLM"
   - "Ajouter une garde qui court-circuite run_agent_for_message"
   - "Mesurer les tours LLM « à vide » par classe d'événement"
   - "Chiffrer ce que coûte une classe d'événement AVANT d'écrire son filtre"
+  - "Ajouter une classe dont le terme d'état doit voir une tâche EN VOL, ou dont le texte porte un corps humain"
 ---
 
 # Un pré-filtre de webhook se place après les handlers déterministes, pas avant
@@ -503,3 +505,85 @@ l'opérateur. Le tableau des quatre raisons est au § 9 de
 `docs/eval/mika-2680/README.md` ; le § 2 bis du même fichier dit pourquoi aucune
 session dispatchée ne peut exécuter cette mesure — le journal n'est pas dans le
 jeu de binds du bac à sable, et c'est une décision de mika#2165, pas un oubli.
+
+## La classe (h) : un tour léger qui trie, et deux pièges que la revue a trouvés (mika#2854, vol 1)
+
+(h) est le premier décideur qui consulte un modèle : un `issue_comment` sur un
+ticket sans tâche de boucle passe par un brin de triage borné et sans outils
+(`crates/mika-agent/src/server/comment_triage.rs`). `DECISION` rend le tour, `NOTE:` l'écarte et
+consigne une note en mémoire, et toute panne fail-open vers le tour. Elle est
+livrée **désarmée** (`MIKA_WEBHOOK_COMMENT_TRIAGE`, défaut `off`) jusqu'au
+corpus réel du vol 2. La branche sauvée du pilote passait toute la suite, et ses
+dix lignes de contrat de vérification étaient vertes. La revue a pourtant trouvé
+deux défauts que la forme de la classe (e) avait masqués.
+
+**1. « Le nettoyage a déjà eu lieu » rend (e) sûre, et rend aveugle un terme
+d'état qui doit voir une tâche en vol.** Le § précédent l'établit pour (e) :
+`try_handle_upstream_close` (`handlers.rs:1994`) tourne avant la porte
+(`skip_turn`, `handlers.rs:2041`). Il termine donc les lignes de suivi
+`blocked`/`in_progress` avant que la porte décide, et écarter le tour ne coûte
+rien. Le wip étendait (h) à `issues closed` avec la garde AC7, « un ticket en
+vol garde son tour », lue par `issue_has_active_task`. Ce prédicat compte les
+lignes `self_dev` `pending`/`in_progress` de même `reference_url`
+(`crates/mika-agent/src/db/tasks.rs:1748`). Le handler, lui, termine les lignes
+`manual`/`none` `blocked`/`in_progress` de même `reference_url` (`:1231`). Les
+deux populations se recouvrent : une ligne de suivi `self_dev` en vol est
+comptée par l'un et terminée par l'autre, **avant** que le premier la lise. La
+garde peut donc être aveugle précisément sur le ticket qu'elle protège, et un
+`NOTE:` y écarterait le tour. La revue l'a établi par lecture. Le recouvrement
+réel en production n'est pas mesuré, et il n'a pas besoin de l'être : une
+garde qui *peut* lire l'état d'après suffit à refuser la classe. La même propriété d'ordre
+a deux signes : elle innocente un filtre qui écarte une **suite**, et elle
+trompe un filtre qui lit un **état**. Règle : avant d'écrire le terme d'état
+d'une classe, nommer les handlers qui tournent avant la porte sur la même
+population, et ce qu'ils **mutent**. S'ils mutent ce que le terme lit, il faut
+lire l'état d'avant, ou la classe n'entre pas. La moitié fermeture de (h) est
+renvoyée au vol 2 avec cette précondition. Un test e2e épingle qu'une
+fermeture, interrupteur armé et bouchon qui note tout, garde son tour en
+`not_classified`.
+
+**2. Un extracteur promu change de frontière de confiance quand le gabarit
+porte un corps humain.** (e) a promu `extract_pr_url` plutôt que de le recopier
+(§ *La jointure* : une seule lecture de la clé). (h) a fait de même avec
+`extract_issue_url` (`upstream_close_handler.rs:430`). Le scanner partagé
+`extract_github_url_with_segment` (`:450`) rend la **première** ligne de tout le
+texte qui a la forme `https://github.com/<o>/<r>/issues/<n>`. Sur une fermeture,
+le texte n'a pas de corps libre. Un commentaire, lui, en a un
+(`github.rs:487` : `…by @{commenter}\n{comment_url}\n\n{body}`). Sur un
+commentaire de **PR**, la ligne 2 est `/pull/N#issuecomment-…`, donc le scanner
+la saute et prend la première URL d'issue citée **dans le corps**. Le
+commentaire de PR, que le plan excluait de (h), y entrait alors sous la clé
+d'un autre ticket, lu comme sans tâche. La correction lit la clé sur la seule
+ligne du sujet (`webhook_prefilter.rs:547`, `text.lines().nth(1)`). Règle :
+partager un extracteur garde la clé cohérente, mais pas sa frontière. Dès qu'un
+gabarit admet du texte qu'un tiers écrit, la clé se lit à une **position**
+fixée par le gabarit, jamais par un balayage. Le test d'un commentaire de PR
+qui cite une issue reste hors population, et son contrôle positif (le même
+corps sous un commentaire d'issue garde la clé de la ligne 2) rougit quand on
+rebranche le balayage.
+
+**Ce que le stub dégénéré prouve, et ce qu'il ne prouve pas.** Le contrat du
+vol pose un contrôle de sensibilité : le corpus d'ordres réels, repassé à un
+bouchon « toujours `NOTE:` », doit basculer en note. Le test assère bien la
+bascule. Mais le bouchon ignore le texte, donc la bascule prouve que le
+**routage** dépend du verdict, jamais que le verdict dépend du texte. Le contrôle
+d'indépendance à l'auteur a la même limite. Ces tests tiennent la plomberie. La
+moitié qui dit quelque chose du modèle, le corpus réel sous vrai modèle, est au
+vol 2. Aucun bouchon ne peut en témoigner (discipline mika#1190).
+
+Sonde de la classe (h), une fois armée :
+
+```sql
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'webhook_prefilter_skipped'
+   AND after_value = 'comment_triaged_note';
+```
+
+Ses relâches sur `webhook_turn_charged` sont `triage_escalated`,
+`triage_unreadable` (fail-open), `issue_task_active` (AC7, aucun appel de
+triage) et `triage_disarmed` (l'état livré). Taux d'escalade =
+`triage_escalated / (triage_escalated + comment_triaged_note)`. **Halte** :
+désarmée, la sonde rend zéro par construction. Le contrôle positif est la
+présence de `release = triage_disarmed` sur les commentaires d'issue : son
+absence signifie un binaire antérieur au vol (classe mika#2340), jamais une
+classe inerte.
