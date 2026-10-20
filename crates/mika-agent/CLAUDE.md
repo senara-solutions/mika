@@ -644,6 +644,71 @@ GROUP BY 1, 2;
 Rotation procedure for all four tokens (and the deliberate 401/403 divergence
 between mika and cm): `mika-platform/docs/operator/token-rotation-procedure.md`.
 
+### `tool_name = 'agent_recurring_gate'` — récurrentes refusées au tir (mika#2456, vol 3 / mika#2843)
+
+Le filet au tir de la porte récurrente niveau-agent refuse une récurrente dont
+l'agent porte `enabled = false` à la racine de son `identity.toml`. Il couvre les
+deux populations que la porte à l'**enregistrement** (vol 1) ne voit pas : les
+lignes nées **avant** son déploiement, et les bascules d'`enabled` **à chaud**.
+En régime attendu ces lignes sont à **zéro** — et ce zéro est l'assertion que la
+porte amont tient.
+
+**Row shape** (écrite uniquement par
+`TaskDispatcher::refuse_recurring_fire_if_agent_disabled`,
+`task_engine/dispatcher.rs`) :
+
+| column | value |
+|---|---|
+| `tool_name` | `agent_recurring_gate` (`RECURRING_GATE_AUDIT_TOOL_NAME`) |
+| `session_id` | `agent-recurring-gate` (`RECURRING_GATE_AUDIT_SESSION_ID`) — un refus de porte n'appartient à aucune conversation, même raison qu'`auth-boundary` ci-dessus |
+| `target_key` | `<agent_id>@<label>` — l'`agent_id` vient de `self.db.agent_id()`, la **même** source que le WARN, pour que journal et table se soustraient |
+| `after_value` | `refused_agent_disabled` |
+| `reasoning` | `task_id=<n>` — l'id de tâche est une **donnée**, jamais une clé de regroupement |
+| `before_value` | toujours `NULL` — le filet ne mute rien (mika#2156), il n'y a aucun état antérieur à nommer |
+
+**Operator query:**
+
+```sql
+SELECT target_key, after_value, count(*)
+FROM audit_events
+WHERE tool_name = 'agent_recurring_gate'
+GROUP BY 1, 2;
+```
+
+Son résultat est **exactement** la population des lignes qui échappent à la porte
+à l'enregistrement, et non un mélange de deux mécanismes : le refus à
+l'enregistrement n'écrit délibérément aucune ligne d'audit (il est borné par la
+cadence des redémarrages là où le tir ne l'est pas), et l'écrivain unique est
+tenu par `mika2456_the_gate_audit_name_has_exactly_one_writer`
+(`canonical_tokens.rs`), dont l'allowlist est livrée vide.
+
+**Deux propriétés, toutes deux load-bearing :**
+
+- **Fire-and-forget.** Une écriture d'audit en échec ne change pas le verdict du
+  filet : la fonction rend `true` hors du `match`, le refus reste un refus, et
+  un WARN nomme l'échec. Même forme et même raison qu'`AuthBoundaryLedger` —
+  un audit ne décide rien.
+- **Déduplication 24 h, en mémoire, perdue au redémarrage.**
+  `RECURRING_GATE_AUDIT_REFRESH` borne une écriture par `(agent_id, label)` et
+  par jour ; sans elle une récurrente à la minute écrirait ≈ 1 440 lignes par
+  jour pour un seul agent désactivé. L'état vit dans un `static` du processus :
+  **le premier refus après un redémarrage réécrit une ligne**, et c'est voulu —
+  un restart est une information, et un processus neuf re-photographie l'état
+  qu'il trouve.
+
+**Changement de contrat du WARN, à lire avant d'interpréter un log (mika#2843
+C3).** Le WARN `recurring_fire_refused_agent_disabled` était inconditionnel
+jusqu'au vol 3 ; il part désormais sous le **même prédicat** que la ligne
+d'audit. Donc :
+
+> l'absence de `recurring_fire_refused_agent_disabled` dans les logs signifie
+> **« déjà annoncé dans les 24 h »**, et non « aucun refus ».
+
+Pour la question « y a-t-il des refus », c'est la table qu'on lit, pas le
+journal. Garder le WARN inconditionnel était l'alternative, refusée : elle
+aurait fait du journal et de la table deux populations non soustractibles
+(classe mika#2205).
+
 ## Timestamps
 
 All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). The `crate::timestamp` module provides centralized helpers: `now()`, `format()`, `parse()`, `now_plus()`, `now_minus()`. Fixed-width UTC format ensures correct lexicographic ordering.
