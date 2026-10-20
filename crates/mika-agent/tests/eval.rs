@@ -134,6 +134,14 @@ mod eval {
     // Frère de `test_deadline_verdict_2276`, sur la branche `Err` de `run_agent`.
     mod test_error_verdict_2289;
 
+    // mika#2784 — ce qu'un agent fail-closed reçoit réellement comme outils.
+    // Les unités de `prompt::fail_closed_identity` lisent les champs de la
+    // structure ; elles resteraient vertes si la posture n'était jamais
+    // consultée au moment de publier le tableau. Frère de
+    // `test_mika_arch_tool_allowlist_2748` sur la posture dégradée, contrôle
+    // négatif compris.
+    mod test_fail_closed_tool_surface_2784;
+
     // mika#2750 — la faucheuse de parents orphelins balaie aussi la classe
     // `groom` : le contrôle positif (un groom orphelin atteint un état terminal
     // nommé), le contrôle négatif (pilote vivant ⇒ rien ne bouge) et la

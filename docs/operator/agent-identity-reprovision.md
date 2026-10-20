@@ -36,6 +36,37 @@ Each line carries `agent` and `path`, so the offending agent and file are named.
 > not the one its identity file was meant to define — normally no skills at all,
 > and in the single case described in § 5, all of them.
 
+**Since mika#2784 there is a fourth name, and it answers a different question.**
+The three above describe the *state of the file*; none of them says that an
+agent is **running** in fail-closed posture — and one of them (`malformed`)
+covers two opposite outcomes. The posture itself now says so, once per identity
+load:
+
+```sh
+grep agent_fail_closed_posture "$MIKA_SPIRIT_LOG_FILE"
+```
+
+| Field | Values | Reading |
+|---|---|---|
+| `agent` | agent name | which agent is degraded |
+| `cause` | `missing_file` \| `unreadable` \| `parse_error` | **which remediation**: § 3, § 4, § 5 respectively |
+| `path` | the file | what to repair |
+| `tools_allowlist` | `absent` \| `present` | whether the posture declares a tool allowlist. `absent` today — the tightening is mika#2784 morceau 2 and is not shipped |
+
+Three rules for reading it:
+
+- **One line per identity load, no deduplication.** `load_identity` runs every
+  turn, so a degraded agent produces a line per turn. The volume is a function
+  of a present defect; it drops to zero the moment the file is repaired, with no
+  restart.
+- **`identity_toml_malformed` now carries a `posture` field** —
+  `fail_closed` for a well-known agent, `default_fallback` for a user-defined
+  one (the § 5 asymmetry). Grep that field rather than subtracting two greps.
+- **The absence of `agent_fail_closed_posture` means an older binary**, not a
+  healthy fleet, until a `make deploy` from mika#2784 or later has run. The
+  three names above predate it and are unchanged, so they remain the signal on
+  a binary that does not emit the fourth.
+
 For a well-known agent (`mika-dev`, `mika-qa`, `mika-arch`, `mika-test`) also
 check for the neighbouring reconciliation signal, which fires from the same
 cause and is easy to mistake for an unrelated warning:
