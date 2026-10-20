@@ -468,3 +468,136 @@ async fn mika2456_la_porte_ne_touche_que_les_recurrentes() {
          label — son prédicat est `trigger_type = 'recurring'`"
     );
 }
+
+// ───────── V-compte — l'annulation rend ce qu'elle a réellement retiré ─────────
+
+/// Pose une ligne de ce `trigger_type` sous `LABEL`, la porte au statut demandé,
+/// et rend son id.
+///
+/// `status` est appliqué **après** l'insertion parce que `create_task` n'écrit
+/// pas la colonne — elle prend son `DEFAULT 'pending'`.
+async fn seed_row(db: &AsyncDatabase, trigger_type: &str, status: Option<&str>) -> String {
+    let id = db
+        .create_task(NewTask {
+            agent_id: AGENT_ID.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: LABEL.to_string(),
+            trigger_type: trigger_type.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "run_skill".to_string(),
+            action_config: CONFIG.to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        })
+        .await
+        .expect("poser la ligne de la sonde");
+    if let Some(status) = status {
+        db.update_task_status(&id, status)
+            .await
+            .expect("porter la ligne au statut de la graine");
+    }
+    id
+}
+
+/// **V-compte (mika#2456, vol 2).** Le compte rendu par l'annulation est le
+/// nombre de lignes **réellement** passées en `cancelled` — pas le nombre de
+/// lignes portant le label, et pas un succès booléen déguisé rendant 1.
+///
+/// **Pourquoi la graine a cette forme-là, et pas « deux récurrentes vivantes ».**
+/// Le contrat de vérification du plan demandait deux récurrentes vivantes du
+/// même label ; le schéma les interdit. `idx_tasks_unique_recurring` est un
+/// index UNIQUE partiel sur `(agent_id, label COLLATE NOCASE)` qui exclut
+/// `cancelled | failed | expired | delivered` — un second `pending` lève
+/// `UNIQUE constraint failed` à l'insertion (mesuré). La multiplicité est donc
+/// atteignable sur **un seul** statut, et c'est une asymétrie entre deux listes
+/// qui ne se recouvrent pas :
+///
+/// | statut | hors de l'index unique | atteint par le prédicat d'annulation |
+/// |---|---|---|
+/// | `pending` | non (il occupe le créneau) | oui |
+/// | `delivered` | **oui** | **oui** |
+/// | `expired` / `failed` / `cancelled` | oui | non (terminaux exclus) |
+/// | `completed` | non | non |
+///
+/// `delivered` est la seule case doublement cochée, donc la seule qui peut
+/// cohabiter avec la ligne vivante **et** être retirée par le même UPDATE. Un
+/// état atteignable en production, pas un artefact : rien ne nettoie une
+/// récurrente livrée, et c'est bien un schedule que l'annulation retire.
+///
+/// Les trois populations que la graine sépare : les deux lignes retirables
+/// (comptées), une récurrente déjà morte (non comptée — le prédicat exclut les
+/// terminaux), un rappel du **même** label (non compté — le prédicat est sur
+/// `trigger_type = 'recurring'`). Un compte de 4 dirait « j'ai retiré quatre
+/// schedules » là où deux seulement en étaient.
+///
+/// Le second appel, à 0, est le revers : sans lui, une implémentation qui
+/// rendrait le nombre de lignes portant le label passerait la première
+/// assertion.
+#[tokio::test]
+async fn mika2456_le_compte_dannulation_est_celui_des_lignes_reellement_retirees() {
+    let db = test_db().await;
+
+    // Ordre imposé par l'index : les lignes qui en sortent s'insèrent et se
+    // déplacent d'abord, la ligne vivante prend le créneau en dernier.
+    let already_dead = seed_row(&db, "recurring", Some("expired")).await;
+    seed_row(&db, "recurring", Some("delivered")).await;
+    seed_row(&db, "recurring", None).await;
+    let reminder = seed_row(&db, "time", None).await;
+
+    let cancelled = db
+        .cancel_recurring_task_by_label(LABEL)
+        .await
+        .expect("annuler les récurrentes du label");
+    assert_eq!(
+        cancelled, 2,
+        "mika#2456 — deux lignes retirables et deux seulement : la morte et le \
+         rappel ne sont pas des schedules que cette annulation a retirés"
+    );
+
+    let again = db
+        .cancel_recurring_task_by_label(LABEL)
+        .await
+        .expect("annuler une seconde fois");
+    assert_eq!(
+        again, 0,
+        "le second appel ne retire rien — le compte est celui de l'acte, pas \
+         celui des lignes qui portent le label"
+    );
+
+    let already_dead = db
+        .get_task(&already_dead)
+        .await
+        .expect("relire la récurrente déjà morte")
+        .expect("elle doit exister")
+        .status;
+    assert_eq!(
+        already_dead, "expired",
+        "la morte n'a pas été réécrite en `cancelled` : c'est ce qui rend le 2 \
+         lisible comme « deux retirées » et non « trois moins une »"
+    );
+
+    let reminder = db
+        .get_task(&reminder)
+        .await
+        .expect("relire le rappel")
+        .expect("le rappel doit exister")
+        .status;
+    assert_eq!(
+        reminder, "pending",
+        "et le rappel du même label est resté vivant : le prédicat compte des \
+         récurrentes, pas des lignes"
+    );
+}

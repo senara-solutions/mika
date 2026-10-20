@@ -1297,6 +1297,126 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2456 — la clé racine `enabled` reste opérateur-owned.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Il n'y a rien à excuser à la livraison : `CODE_OWNED_IDENTITY_SECTIONS`
+    /// ne nomme pas `enabled`, et son propre doc-comment déclare la clé
+    /// opérateur-owned. **Quand ce scan tire, on retire l'entrée** ; on ne
+    /// l'excepte pas (doctrine mika#2201) — un site qu'on ne veut pas armer est
+    /// un site à supprimer.
+    const IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS: &[&str] = &[];
+
+    /// **`enabled` n'entre pas dans les sections code-owned (mika#2456 R-7).**
+    ///
+    /// `enabled = false` à la racine d'un `identity.toml` est une **décision
+    /// d'opérateur** : c'est ce qui éteint les récurrentes d'un agent, et la
+    /// porte comme le filet de mika#2456 n'ont de sens que si personne ne la
+    /// réécrit sous l'opérateur. Faire entrer `enabled` dans
+    /// `CODE_OWNED_IDENTITY_SECTIONS` ferait exactement cela : le réconciliateur
+    /// remplacerait la valeur du disque par celle du spec au démarrage suivant,
+    /// et un agent délibérément éteint se rallumerait tout seul — sans ligne de
+    /// journal attribuable à qui que ce soit.
+    ///
+    /// *Aucun test comportemental ne peut voir cette classe :* l'entrée ajoutée
+    /// ne rend aucune assertion fausse le jour où elle est écrite. Elle ne mord
+    /// qu'au démarrage d'un agent dont le disque contredit le spec — c'est-à-dire
+    /// chez un opérateur, après le merge. C'est aussi la classe
+    /// d'inertie-renversée de mika#1833 (`[kg]`) et mika#2330
+    /// (`[context.history]`), prise du bon côté : là il s'agissait d'une
+    /// déclaration qui ne mordait pas, ici d'une qui mordrait trop.
+    ///
+    /// L'aiguille est composée à l'exécution pour que CE fichier ne se dénonce
+    /// pas lui-même (motif mika#2496).
+    #[test]
+    fn mika2456_la_cle_enabled_reste_operateur_owned() {
+        let owner = "crates/mika-agent/src/well_known_agents.rs";
+        let const_needle = format!("CODE_OWNED_IDENTITY{}", "_SECTIONS: &[&str] = &[");
+        let gate_key = format!("enab{}", "led");
+        let dotted_prefix = format!("{gate_key}.");
+
+        let mut declaring = Vec::new();
+        let mut owner_entries: Vec<String> = Vec::new();
+        let mut offenders: Vec<String> = Vec::new();
+
+        for (rel, content) in production_sources() {
+            if IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let Some(start) = content.find(&const_needle) else {
+                continue;
+            };
+            declaring.push(rel.clone());
+
+            let rest = &content[start + const_needle.len()..];
+            let block = &rest[..rest.find("];").unwrap_or(rest.len())];
+
+            for line in block.lines() {
+                // Les commentaires du bloc citent les sections par leur nom :
+                // les lire comme des entrées ferait rougir ce scan sur de la
+                // prose, et on l'aurait désarmé le lendemain.
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                    continue;
+                }
+                for lit in string_literals(line) {
+                    if rel == owner {
+                        owner_entries.push(lit.clone());
+                    }
+                    if lit == gate_key || lit.starts_with(&dotted_prefix) {
+                        offenders.push(format!("{rel} → \"{lit}\""));
+                    }
+                }
+            }
+        }
+
+        // ── Anti-vacuité : un scan qui ne trouve pas sa cible se lit exactement
+        // comme un scan propre (mika#2103 / mika#2205). Deux conditions, parce
+        // que trouver le fichier ne prouve pas qu'on a su lire son bloc.
+        assert!(
+            declaring.iter().any(|d| d == owner),
+            "mika#2456 — la constante des sections code-owned est introuvable \
+             dans {owner} : ce scan vise un nom mort, il ne vérifie rien.\n\
+             Cause la plus probable : la constante a été renommée ou déplacée, \
+             ou un marqueur de module de test est apparu plus haut dans le \
+             fichier et `production_sources` l'a tronqué avant la cible."
+        );
+        assert!(
+            owner_entries.iter().any(|e| e.contains('.')),
+            "mika#2456 — le bloc de la constante a été trouvé mais n'a produit \
+             aucune entrée pointée (`skills.allowlist`, `context.summary`, …) : \
+             le parse du bloc a échoué, et un scan qui ne lit rien n'interdit \
+             rien.\nEntrées lues : {owner_entries:?}"
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2456 R-7 — la clé racine `{gate_key}` est déclarée code-owned : \
+             {offenders:?}\n\n\
+             RÉSOLUTION : retirer l'entrée. `{gate_key}` est la décision par \
+             laquelle un opérateur éteint les récurrentes d'un agent ; \
+             code-owned, le réconciliateur la réécrit depuis le spec au \
+             démarrage suivant et rallume l'agent sans que personne l'ait \
+             demandé. Ne PAS l'ajouter à \
+             IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS — un site qu'on ne veut \
+             pas armer est un site à supprimer (doctrine mika#2201)."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2456_lallowlist_du_scan_enabled_est_livree_vide() {
+        assert!(
+            IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS.is_empty(),
+            "IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS est livrée vide et doit \
+             le rester : une allowlist née vide est un tiroir où déposer la \
+             prochaine infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2496 — le nom d'audit du dépassement de coût a un écrivain.
     // ─────────────────────────────────────────────────────────────────────
 
