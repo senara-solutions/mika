@@ -448,7 +448,7 @@ pub async fn try_handle_ci_failure(
                  Escalating for manual intervention. Task: {}",
                 event.conclusion, event.repo, pr.number, event.branch, MAX_CI_FIX_COUNT, task.id
             );
-            send_notification_p0(sender, &notification).await;
+            send_notification(sender, NotificationSeverity::P0, &notification).await;
         }
 
         return VerdictAction::Handled {
@@ -539,7 +539,7 @@ pub async fn try_handle_ci_failure(
              (attempt {new_count}/{}). Task: {}",
             event.conclusion, event.repo, pr.number, event.branch, MAX_CI_FIX_COUNT, task.id
         );
-        send_notification(sender, &notification).await;
+        send_notification(sender, NotificationSeverity::P2, &notification).await;
     }
 
     info!(
@@ -719,6 +719,7 @@ async fn surface_for_adoption(
     if armed && let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P2,
             &format_surface_notification(event, pr.number, pr_url),
         )
         .await;
@@ -1057,28 +1058,28 @@ async fn fetch_job_log(check_link: &str, repo: &str, token: &str) -> Option<Stri
 // Notification helper
 // ---------------------------------------------------------------------------
 
-/// Routine tier (`P2`) — the chat the operator may mute. For the breakage class,
-/// call [`send_notification_p0`] (mika#1381).
-async fn send_notification(sender: &Arc<dyn MessageSender>, message: &str) {
-    report_notification_outcome(sender.send(message).await, NotificationSeverity::P2);
-}
-
-/// Send an operator notification of the `P0` tier (mika#1381) — here, CI fix
-/// attempts exhausted: the loop has stopped making progress on its own.
+/// Send an operator notification, absorbing errors — the **only** way out of
+/// this module towards the operator (mika#1381 vol 2).
 ///
-/// A **second** helper rather than a `severity` parameter, so vol 1 leaves the
-/// two P2 callsites textually unchanged; the merge is vol 2.
-async fn send_notification_p0(sender: &Arc<dyn MessageSender>, message: &str) {
-    report_notification_outcome(
-        sender
-            .send_with_severity(message, NotificationSeverity::P0)
-            .await,
-        NotificationSeverity::P0,
-    );
+/// `severity` is a parameter, not a choice of helper, and it has no default: a
+/// new notification site cannot compile without naming its tier. `P0` — "the
+/// loop is dead, a human must step in" — is routed to
+/// `MIKA_OPERATOR_ESCALATION_CHAT_ID` when one is configured, and to the normal
+/// chat with a named WARN when not; `P2` goes to the chat the operator may mute.
+///
+/// It sits in **second** position because thirteen of the sixteen sites pass a
+/// multi-line `format!`: at the tail of such a call the tier would be a line a
+/// reviewer scrolls past, here it reads on the line that opens the call.
+async fn send_notification(
+    sender: &Arc<dyn MessageSender>,
+    severity: NotificationSeverity,
+    message: &str,
+) {
+    report_notification_outcome(sender.send_with_severity(message, severity).await, severity);
 }
 
-/// Shared outcome handling for both tiers — one copy, so the two helpers above
-/// cannot drift in what they log.
+/// Shared outcome handling for both tiers — one copy, so what gets logged cannot
+/// drift from one tier to the other.
 fn report_notification_outcome(
     outcome: anyhow::Result<crate::messaging::SendOutcome>,
     severity: NotificationSeverity,
@@ -1458,17 +1459,43 @@ mod tests {
         AsyncDatabase::new(db)
     }
 
+    /// Sentinelle enregistrée quand une notification franchit la frontière par
+    /// l'entrée **sans axe de sévérité**, `MessageSender::send`.
+    ///
+    /// Depuis la fusion des deux aides (mika#1381 vol 2), `send_notification`
+    /// n'appelle plus jamais `send` : cette valeur observée est donc le témoin
+    /// d'une **fuite de sévérité** — un chemin qui l'a perdue en route — et non
+    /// un échafaudage de test. Sur un vrai `GatewayMessageSender`, `send`
+    /// délègue à `send_with_severity(.., P2)` et route vers le chat que
+    /// l'opérateur peut muter.
+    const SEVERITE_ABSENTE: &str = "aucune-severite";
+
     /// A sender that records what it was asked to deliver. `NoopSender` cannot
     /// serve here: T6 has to tell "the notification was withheld" from "no
     /// notification was attempted", and a sender that answers `Delivered` to
     /// everything makes those two indistinguishable.
+    ///
+    /// Surcharge les **deux** entrées du trait, et stocke la paire
+    /// `(texte, sévérité)`. `messages()` reste la projection sur le texte, à
+    /// l'identique : dix assertions de T1 à T8 l'appellent, et changer sa
+    /// signature les ferait rougir sans rapport avec la sévérité (mika#1381
+    /// vol 2, D7). La sévérité se lit par `observe()`.
     #[derive(Default)]
     struct RecordingSender {
-        sent: std::sync::Mutex<Vec<String>>,
+        sent: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl RecordingSender {
         fn messages(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(texte, _)| texte.clone())
+                .collect()
+        }
+
+        fn observe(&self) -> Vec<(String, String)> {
             self.sent.lock().unwrap().clone()
         }
     }
@@ -1476,7 +1503,22 @@ mod tests {
     #[async_trait::async_trait]
     impl MessageSender for RecordingSender {
         async fn send(&self, text: &str) -> Result<crate::messaging::SendOutcome> {
-            self.sent.lock().unwrap().push(text.to_string());
+            self.sent
+                .lock()
+                .unwrap()
+                .push((text.to_string(), SEVERITE_ABSENTE.to_string()));
+            Ok(crate::messaging::SendOutcome::Delivered)
+        }
+
+        async fn send_with_severity(
+            &self,
+            text: &str,
+            severity: NotificationSeverity,
+        ) -> Result<crate::messaging::SendOutcome> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((text.to_string(), severity.as_str().to_string()));
             Ok(crate::messaging::SendOutcome::Delivered)
         }
     }
@@ -1553,6 +1595,61 @@ mod tests {
             "a signal that does not name its lifting gesture is one you learn to \
              ignore: {}",
             sent[0]
+        );
+    }
+
+    /// **Le seul des seize sites attesté à son point d'appel réel** (mika#1381
+    /// vol 2, AC6). D4 ferme le niveau de l'aide ; ceci ferme un site.
+    ///
+    /// Contrôle négatif de premier intérêt : un accusé de routine — « du travail
+    /// non adopté traîne » — **ne monte pas** en P0, donc ne pollue pas la
+    /// surface jamais-muette. Une surface qui reçoit les dix-sept classes de
+    /// message est une surface qui finira mutée (règle R6 du vol 1), et les deux
+    /// paliers se taisent alors ensemble.
+    ///
+    /// **Borne de couverture déclarée**, pour que l'absence ne se devine pas :
+    /// les sites P0 de ce fichier et de `verdict_handler.rs` sont hors d'atteinte
+    /// d'un test unitaire — `try_handle_ci_failure` exige un `github_token` et
+    /// émet de vrais appels API en amont de son site P0, et `verdict_handler`
+    /// n'a aucun point d'entrée testé. Le site de calage
+    /// `agent_loop/mod.rs:4337` est attesté au vol 3.
+    #[tokio::test]
+    async fn mika1381_un_accuse_de_surface_natteint_pas_la_surface_jamais_muette() {
+        let db = surface_db().await;
+        let recorder = Arc::new(RecordingSender::default());
+        let sender: Arc<dyn MessageSender> = recorder.clone();
+
+        surface_for_adoption(
+            &db,
+            &surface_event(DISPATCHABLE),
+            &pr_info("abc123"),
+            "https://github.com/senara-solutions/mika/pull/1745",
+            Some(&sender),
+            SURFACE_SESSION,
+            "trace-1381",
+            &armed_settings(),
+        )
+        .await;
+
+        let observe = recorder.observe();
+        assert_eq!(
+            observe.len(),
+            1,
+            "le chemin qui notifie doit franchir la frontière exactement une fois"
+        );
+        let (texte, severite) = &observe[0];
+        assert!(
+            texte.contains("Unadopted work"),
+            "c'est bien la notification du site :720 qui est observée : {texte}"
+        );
+
+        assert_eq!(
+            severite,
+            NotificationSeverity::P2.as_str(),
+            "le site passe sa sévérité jusqu'à la frontière : attendu P2, observé \
+             {severite}. `{SEVERITE_ABSENTE}` signifierait que l'aide est repassée \
+             par `MessageSender::send` et a perdu la sévérité en route ; `p0` que \
+             l'accusé de routine escalade sur la surface jamais-muette"
         );
     }
 
