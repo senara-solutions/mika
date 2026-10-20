@@ -1758,6 +1758,260 @@ mod tests {
         );
     }
 
+    // ───── mika#2847 — la porte de section heartbeat est registration-only ─────
+
+    /// Les sites de production qui lisent la porte de section `heartbeat`, et
+    /// ce que chacun y fait.
+    ///
+    /// **C'est un périmètre, pas une liste d'exemptions**, et la distinction
+    /// n'est pas rhétorique : le scan plus bas exige que chaque entrée soit
+    /// **trouvée** (anti-vacuité), donc en retirer une ne relâche rien — ça
+    /// rend le scan rouge. L'allowlist, elle, est [`HEARTBEAT_GATE_READER_ALLOWED`],
+    /// et elle est vide.
+    const HEARTBEAT_GATE_REGISTRATION_SITES: &[&str] = &[
+        // Démarrage du démon, par agent : la boucle qui enregistre les
+        // récurrentes intégrées de chaque agent chargé.
+        "crates/mika-agent/src/server/mod.rs",
+        // Démarrage du TUI, agent courant : la même paire, pour le seul agent
+        // de la session.
+        "crates/mika-cli/src/commands/chat.rs",
+    ];
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est mesuré : les seuls lecteurs de
+    /// production sont les deux sites recensés ci-dessus. Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction (mika#2323).
+    /// Quand le scan tire, **on route la lecture par un site d'enregistrement
+    /// existant**, on n'ajoute pas d'entrée (doctrine mika#2201) : un lecteur
+    /// au **tir** retournerait précisément la propriété que ce scan atteste, et
+    /// l'allowlister serait documenter sa propre perte.
+    const HEARTBEAT_GATE_READER_ALLOWED: &[&str] = &[];
+
+    /// Cette ligne **lit**-elle la porte, par opposition à celle qui la définit ?
+    ///
+    /// La définition vit dans la partie production de `task_engine/mod.rs`
+    /// (définition à `:898`, premier `#[cfg(test)]` à `:944`), donc la
+    /// troncature de [`production_sources`] ne l'enlève pas : ce filtre est
+    /// nécessaire, pas décoratif. Paramétré par l'aiguille plutôt qu'écrit en
+    /// dur, pour que le suivi `reflection` le reprenne tel quel (mika#2653).
+    fn reads_section_gate(line: &str, needle: &str) -> bool {
+        line.contains(needle) && !line.contains(&format!("fn {needle}("))
+    }
+
+    /// Les fichiers de production qui lisent la porte de section `heartbeat`.
+    fn heartbeat_gate_reader_sites() -> Vec<String> {
+        // Composée à l'exécution pour que CE fichier ne se dénonce pas lui-même
+        // (mika#2496, même geste que les scans voisins).
+        let needle = format!("heartbeat_enabled_for{}agent", "_");
+        let mut readers = Vec::new();
+        for (rel, content) in production_sources() {
+            let reads = crate::source_scan::strip_comment_lines(&content)
+                .lines()
+                .any(|line| reads_section_gate(line, &needle));
+            if reads {
+                readers.push(rel);
+            }
+        }
+        readers
+    }
+
+    /// Chaque lecture de la porte est-elle **adjacente au geste
+    /// d'enregistrement** ?
+    ///
+    /// Pour chaque hit de l'aiguille dans le texte décommenté, une fenêtre de
+    /// 25 lignes doit porter les trois termes de la paire d'enregistrement :
+    /// `ensure_recurring_task` (la branche qui enregistre),
+    /// `cancel_recurring_task_by_label(` (la branche `else` qui annule) et le
+    /// label **entre guillemets**. Les guillemets ne sont pas décoratifs :
+    /// l'aiguille elle-même contient `heartbeat`, donc un terme non quoté
+    /// serait satisfait par la ligne de lecture et ne mesurerait rien.
+    ///
+    /// # Pourquoi ce prédicat existe en plus du recensement
+    ///
+    /// Un recensement de **fichiers** ne dit rien du **geste**. Un lecteur
+    /// déplacé dans la boucle de tick de `server/mod.rs` resterait vert au
+    /// recensement — même fichier, même entrée. Ce que « registration-only »
+    /// affirme est une **conjonction locale**, et c'est elle que ce prédicat
+    /// mesure.
+    ///
+    /// La fenêtre vaut 25 parce que les distances réelles sont de 9 lignes
+    /// (`server/mod.rs` 1906→1915) et 11 lignes (`chat.rs` 229→240) : large
+    /// sans être molle, et plus serrée encore sur le texte décommenté puisque
+    /// [`crate::source_scan::strip_comment_lines`] **supprime** les lignes de
+    /// commentaire au lieu de les vider.
+    fn heartbeat_gate_reads_at_registration(content: &str, needle: &str) -> bool {
+        const WINDOW: usize = 25;
+        // Composé à l'exécution, même raison que l'aiguille.
+        let label = format!("\"heart{}\"", "beat");
+        let stripped = crate::source_scan::strip_comment_lines(content);
+        let lines: Vec<&str> = stripped.lines().collect();
+
+        // « Personne ne lit » ne s'atteste pas comme « tout le monde lit au bon
+        // endroit » : sans lecture du tout, le prédicat rend `false` (mika#2103).
+        let mut saw_read = false;
+        for (i, line) in lines.iter().enumerate() {
+            if !reads_section_gate(line, needle) {
+                continue;
+            }
+            saw_read = true;
+            let lo = i.saturating_sub(WINDOW);
+            let hi = (i + WINDOW + 1).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            let registers = window.contains("ensure_recurring_task")
+                && window.contains("cancel_recurring_task_by_label(")
+                && window.contains(label.as_str());
+            if !registers {
+                return false;
+            }
+        }
+        saw_read
+    }
+
+    /// **D2.** Aucun lecteur de la porte de section hors du recensement.
+    ///
+    /// C'est la propriété que la sonde V6 du vol 2
+    /// (`mika2456_le_filet_laisse_la_porte_de_section_decider`) ne tient pas :
+    /// elle atteste le comportement du **filet**, pas l'unicité du lecteur, et
+    /// un lecteur ajouté au tir la laisserait verte. `dispatcher.rs` n'est pas
+    /// au recensement, donc ce volet-ci rougit.
+    ///
+    /// Aucune assertion séparée sur `dispatcher.rs` n'est livrée : elle serait
+    /// exactement redondante avec le volet « étrangers », et une garde
+    /// redondante se fait supprimer par le premier qui la relit.
+    #[test]
+    fn mika2847_la_porte_de_section_na_que_des_lecteurs_denregistrement() {
+        let readers: Vec<String> = heartbeat_gate_reader_sites()
+            .into_iter()
+            .filter(|r| !HEARTBEAT_GATE_READER_ALLOWED.contains(&r.as_str()))
+            .collect();
+
+        // Anti-vacuité D'ABORD : un scan qui ne trouve personne se lit
+        // exactement comme un scan propre (mika#2103 / mika#2205).
+        for expected in HEARTBEAT_GATE_REGISTRATION_SITES {
+            assert!(
+                readers.iter().any(|r| r == expected),
+                "mika#2847 — la porte de section `heartbeat` n'est lue nulle part dans \
+                 {expected} : ce scan vise un nom mort, il ne vérifie rien. Lecteurs \
+                 trouvés : {readers:?}"
+            );
+        }
+
+        let strangers: Vec<&String> = readers
+            .iter()
+            .filter(|r| !HEARTBEAT_GATE_REGISTRATION_SITES.contains(&r.as_str()))
+            .collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2847 — la porte de section `heartbeat` a un lecteur hors des sites \
+             d'enregistrement : {strangers:?}\n\n\
+             RÉSOLUTION : router cette lecture par un site d'enregistrement existant. \
+             Ne PAS l'ajouter à HEARTBEAT_GATE_READER_ALLOWED (mika#2201) — un lecteur \
+             au tir retourne la propriété que ce scan atteste, et l'allowlister la \
+             documenterait au lieu de la tenir. Si la décision doit vraiment vivre au \
+             tir, c'est la propriété de mika#2456 vol 4 qui tombe : ça se remonte."
+        );
+    }
+
+    /// **D3.** Chaque lecteur recensé lit *auprès* de la paire
+    /// enregistrement/annulation — c'est ce qui fait du recensement une
+    /// attestation du geste et pas d'un répertoire.
+    #[test]
+    fn mika2847_chaque_lecteur_recense_annule_a_lenregistrement() {
+        let needle = format!("heartbeat_enabled_for{}agent", "_");
+
+        let mut seen = 0usize;
+        for (rel, content) in production_sources() {
+            if !HEARTBEAT_GATE_REGISTRATION_SITES.contains(&rel.as_str()) {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                heartbeat_gate_reads_at_registration(&content, &needle),
+                "mika#2847 — {rel} lit la porte de section `heartbeat` hors du geste \
+                 d'enregistrement : aucune fenêtre de 25 lignes décommentées autour de \
+                 la lecture ne porte à la fois `ensure_recurring_task`, \
+                 `cancel_recurring_task_by_label(` et le label. La porte n'est plus \
+                 registration-only.\n\n\
+                 RÉSOLUTION : ramener la lecture auprès de la paire \
+                 enregistrement/annulation."
+            );
+        }
+
+        // Anti-vacuité du parcours lui-même : un recensement dont aucune entrée
+        // ne correspond à un fichier scanné rendrait cette boucle vide.
+        assert_eq!(
+            seen,
+            HEARTBEAT_GATE_REGISTRATION_SITES.len(),
+            "mika#2847 — {seen} site(s) recensé(s) retrouvé(s) sur {} : une entrée du \
+             recensement ne désigne plus un fichier de production scanné, et la boucle \
+             ci-dessus n'a mesuré qu'une partie du périmètre",
+            HEARTBEAT_GATE_REGISTRATION_SITES.len()
+        );
+    }
+
+    /// **D4 — contrôle de bonne foi du prédicat d'adjacence, et il est dû.**
+    ///
+    /// [`heartbeat_gate_reads_at_registration`] est un prédicat **neuf** :
+    /// contrairement aux scans SOLE-WRITER voisins, il ne peut pas emprunter
+    /// l'attestation d'un prédicat partagé
+    /// ([`audit_name_literal_present`], attesté par
+    /// `mika2634_the_sole_writer_scan_still_catches_a_second_site`). Un
+    /// prédicat d'adjacence non attesté est la forme qui devient inerte en
+    /// silence, et l'anti-vacuité de D3 ne le dit pas : elle vérifie que les
+    /// **propriétaires** passent, pas qu'un **étranger** serait vu.
+    #[test]
+    fn mika2847_le_predicat_dadjacence_voit_une_lecture_hors_enregistrement() {
+        let needle = format!("heartbeat_enabled_for{}agent", "_");
+
+        // Négative — la lecture a migré au tir : la fenêtre ne porte aucune des
+        // deux branches d'enregistrement. C'est la régression que D3 doit voir.
+        let at_fire = [
+            "for due in due_tasks {".to_string(),
+            format!("    if !task_engine::{needle}(&home_dir).await {{"),
+            "        continue;".to_string(),
+            "    }".to_string(),
+            "    dispatch_heartbeat(&db, &due).await;".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            !heartbeat_gate_reads_at_registration(&at_fire, &needle),
+            "INVARIANT VIOLÉ : le prédicat ne voit plus une lecture au tir — il est \
+             devenu inerte et D3 se lirait exactement comme une porte registration-only"
+        );
+
+        // Positive — la forme réelle des deux sites recensés.
+        let at_registration = [
+            format!("if task_engine::{needle}(&home_dir).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            "        &db, &home_dir, \"heartbeat\", HEARTBEAT_CRON, CONFIG,".to_string(),
+            "    ).await;".to_string(),
+            "} else if let Err(e) = db.cancel_recurring_task_by_label(\"heartbeat\").await {"
+                .to_string(),
+            "    warn!(error = %e, \"failed to cancel stale heartbeat task\");".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            heartbeat_gate_reads_at_registration(&at_registration, &needle),
+            "le prédicat refuse la forme réelle des deux sites recensés : il est trop \
+             serré, et D3 rougirait sur un arbre conforme"
+        );
+    }
+
+    /// **D5** — le pendant auto-nettoyant de l'allowlist des lecteurs.
+    #[test]
+    fn mika2847_lallowlist_des_lecteurs_est_livree_vide() {
+        assert!(
+            HEARTBEAT_GATE_READER_ALLOWED.is_empty(),
+            "HEARTBEAT_GATE_READER_ALLOWED est livrée vide et doit le rester : quand \
+             le scan tire, on route la lecture par un site d'enregistrement. Une \
+             allowlist née vide est un emplacement où déposer la prochaine infraction \
+             (mika#2323)."
+        );
+    }
+
     // ─────────────── mika#2653 — la garde d'annulation sur pilote vif ───────────────
 
     /// **Livrée vide, et le test plus bas l'assert.**

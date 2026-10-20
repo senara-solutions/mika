@@ -34,6 +34,13 @@
 //! - **V9** — `mika tasks rearm` sur un agent désactivé rend
 //!   `RearmError::AgentDisabled` — **pas** `NotRegistered` — et n'écrit ni
 //!   ligne d'audit ni marqueur de ré-armement.
+//! - **V8** (mika#2847, vol 4) — la porte de **section** `heartbeat`, qui n'est
+//!   pas celle d'au-dessus : `[heartbeat] enabled = false` coupe *une*
+//!   récurrente là où `enabled = false` à la racine coupe *toutes* celles de
+//!   l'agent. Sous la clé de section, `heartbeat_enabled_for_agent` rend
+//!   `false` et `cancel_recurring_task_by_label("heartbeat")` fait passer la
+//!   ligne préexistante à `cancelled`. **V8-bis** est son contrôle négatif —
+//!   pas de section `[heartbeat]`, résolution `true`, enregistrement nominal.
 //!
 //! **Hors périmètre de ce vol, et c'est dit plutôt que tu.** Ces sondes portent
 //! sur l'**enregistrement**. Le filet au **tir** (une ligne déjà posée, que la
@@ -43,7 +50,9 @@
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, NewTask, RECURRING_OPERATOR_REARM_PATH};
-use mika_agent::task_engine::{RearmError, ensure_recurring_task, rearm_recurring_task};
+use mika_agent::task_engine::{
+    RearmError, ensure_recurring_task, heartbeat_enabled_for_agent, rearm_recurring_task,
+};
 
 const AGENT_ID: &str = "mika-test";
 const LABEL: &str = "curator_review";
@@ -78,6 +87,18 @@ fn agent_home(body: &str) -> tempfile::TempDir {
 fn home_with_enabled(enabled: bool) -> tempfile::TempDir {
     agent_home(&format!(
         "name = \"mika-test\"\nemoji = \"🧪\"\nenabled = {enabled}\n"
+    ))
+}
+
+/// La graine de V8, sur le modèle exact de [`home_with_enabled`] : la clé de
+/// **section** `[heartbeat] enabled`, et non la clé racine.
+///
+/// La racine est laissée absente, donc la porte niveau-agent résout `true` par
+/// défaut (V7) : l'écart que V8 mesure est bien celui de la section, pas une
+/// seconde porte qui aurait mordu la première.
+fn home_with_heartbeat(enabled: bool) -> tempfile::TempDir {
+    agent_home(&format!(
+        "name = \"mika-test\"\nemoji = \"🧪\"\n\n[heartbeat]\nenabled = {enabled}\n"
     ))
 }
 
@@ -599,5 +620,109 @@ async fn mika2456_le_compte_dannulation_est_celui_des_lignes_reellement_retirees
         reminder, "pending",
         "et le rappel du même label est resté vivant : le prédicat compte des \
          récurrentes, pas des lignes"
+    );
+}
+
+// ──── V8 — la porte de SECTION heartbeat, à l'enregistrement (mika#2847) ────
+
+const HEARTBEAT_LABEL: &str = "heartbeat";
+const HEARTBEAT_CRON: &str = "0 0 * * * *";
+const HEARTBEAT_CONFIG: &str = r#"{"trigger":"heartbeat"}"#;
+
+/// **V8 (mika#2847).** Sous `[heartbeat] enabled = false`, la porte de section
+/// résout `false` et l'annulation fait passer la ligne `recurring_active`
+/// préexistante à `cancelled`.
+///
+/// Les deux moitiés comptent. Refuser l'enregistrement sans annuler la ligne
+/// existante laisse tirer exactement ce que mika#2456 a mesuré : un heartbeat
+/// qui brûle des tours LLM parce que la ligne est *déjà* là.
+///
+/// La composition est rejouée **à la main** parce que son propriétaire est la
+/// boucle de démarrage de `server/mod.rs:1906`, qui n'est pas appelable depuis
+/// un test. Que ce fichier-là compose bien cette paire — et qu'il soit le seul,
+/// avec `chat.rs`, à lire la porte — vit en source dans
+/// `canonical_tokens::tests::mika2847_*`.
+#[tokio::test]
+async fn mika2847_la_porte_de_section_eteinte_annule_la_ligne_preexistante() {
+    let db = test_db().await;
+
+    // Boot 1 — section présente et activée : la récurrente s'inscrit.
+    let on = home_with_heartbeat(true);
+    ensure_recurring_task(
+        &db,
+        on.path(),
+        HEARTBEAT_LABEL,
+        HEARTBEAT_CRON,
+        HEARTBEAT_CONFIG,
+    )
+    .await;
+    assert_eq!(
+        statuses_for(&db, HEARTBEAT_LABEL).await,
+        vec!["recurring_active".to_string()],
+        "précondition : la ligne active doit exister avant que la porte de section agisse"
+    );
+
+    // Boot 2 — l'opérateur a posé `[heartbeat] enabled = false`.
+    let off = home_with_heartbeat(false);
+    assert!(
+        !heartbeat_enabled_for_agent(off.path()).await,
+        "`[heartbeat] enabled = false` doit résoudre `false` : sans ça la branche \
+         d'annulation n'est jamais prise et le reste de cette sonde ne mesure rien"
+    );
+    let cancelled = db
+        .cancel_recurring_task_by_label(HEARTBEAT_LABEL)
+        .await
+        .expect("annuler la récurrente heartbeat");
+
+    assert_eq!(
+        cancelled, 1,
+        "une ligne retirable et une seule : le compte est celui de l'acte (vol 2)"
+    );
+    let statuses = statuses_for(&db, HEARTBEAT_LABEL).await;
+    assert_eq!(
+        statuses,
+        vec!["cancelled".to_string()],
+        "la ligne préexistante doit passer à `cancelled` — statuts observés : {statuses:?}"
+    );
+    assert!(
+        db.get_recurring_task_cron(HEARTBEAT_LABEL)
+            .await
+            .expect("lire le cron")
+            .is_none(),
+        "aucun heartbeat ne doit rester armé sous la section éteinte"
+    );
+}
+
+/// **V8-bis, contrôle négatif.** `identity.toml` sans section `[heartbeat]` :
+/// résolution `true` — le défaut de `default_heartbeat_enabled`
+/// (`prompt.rs:437`) — et `ensure_recurring_task` enregistre normalement.
+///
+/// Sans ce volet, un défaut qui casserait tout enregistrement rendrait V8 vert.
+/// C'est la paire qui mesure. Et l'absence de section *est* le cas nominal de
+/// la flotte, donc une régression ici éteindrait le heartbeat partout.
+#[tokio::test]
+async fn mika2847_controle_negatif_sans_section_heartbeat_lenregistrement_est_nominal() {
+    let db = test_db().await;
+    let no_section = agent_home("name = \"mika-test\"\nemoji = \"🧪\"\n");
+
+    assert!(
+        heartbeat_enabled_for_agent(no_section.path()).await,
+        "une section `[heartbeat]` absente vaut `true` : la porte de section est \
+         soustractive, seul un `false` écrit éteint quelque chose (mika#2023)"
+    );
+
+    ensure_recurring_task(
+        &db,
+        no_section.path(),
+        HEARTBEAT_LABEL,
+        HEARTBEAT_CRON,
+        HEARTBEAT_CONFIG,
+    )
+    .await;
+
+    assert_eq!(
+        statuses_for(&db, HEARTBEAT_LABEL).await,
+        vec!["recurring_active".to_string()],
+        "la flotte sans la section doit continuer d'enregistrer son heartbeat"
     );
 }
