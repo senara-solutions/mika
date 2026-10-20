@@ -556,8 +556,13 @@ section: use the two `customer_config` keys below.
 **`[context.summary]` behavior:** `inject = false` (Axis 4) is a load-prevention gate — `db.load_conversation_summary()` is never called and the summary is not available to any downstream code path. `max_tokens` (Axis 3) is mode-conditional — it only fires on silent-mode turns (when `SilentTrigger` is present). Axis 4 always wins: when `inject = false`, the `max_tokens` field is never evaluated. See `crates/mika-agent/CLAUDE.md` for implementation details.
 
 **Missing, unreadable, or malformed file:** a missing `identity.toml` makes the
-agent start **fail-closed** — zero skills, every mutational built-in tool denied
-(mika#2027). Absence never means "everything permitted". The three faults are
+agent start **fail-closed** — zero skills, and since mika#2853 **no built-in
+tool at all** (`tools.allowed = Some([])`, `send_message` included; mika#2027 for
+the universality of the path). The agent answers; it emits nothing, and it cannot
+report its own state — the `agent_fail_closed_posture` line below is the report.
+This covers user-defined agents exactly like well-known ones: there is no
+exemption by category, decided 2026-10-20 on mika#2784. Absence never means
+"everything permitted". The three faults are
 logged under distinct event names (`identity_toml_absent`,
 `identity_toml_unreadable`, `identity_toml_malformed`) because they need
 different remediations. Note that **deleting the file and restarting does not
@@ -569,8 +574,10 @@ Those three names describe the *state of the file*. Since mika#2784 the
 **posture** says itself too, on its own name: `agent_fail_closed_posture`
 (ERROR), once per identity load, carrying `agent`, `cause`
 (`missing_file` | `unreadable` | `parse_error`), `path`, and `tools_allowlist`
-(`absent` | `present` — `absent` today; the tightening is a separate,
-doctrine-gated change). `identity_toml_malformed` additionally carries
+(`absent` | `present` — **`present` since mika#2853**, read off
+`tools.allowed.is_some()` rather than written as a literal, so `absent` means the
+binary answering predates the tightening, not that the posture is permissive).
+`identity_toml_malformed` additionally carries
 `posture` (`fail_closed` | `default_fallback`), because that one name covers
 both the well-known-agent fail-closed outcome and the user-defined-agent
 permissive fallback. The posture line's **absence** means a binary that predates
