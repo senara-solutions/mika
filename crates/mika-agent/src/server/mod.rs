@@ -33,6 +33,7 @@ pub mod verdict_handler;
 pub(crate) mod webhook_prefilter;
 pub mod webhook_queue;
 pub mod webhook_queue_v2;
+pub(crate) mod webhook_turn_outcome;
 
 use crate::kg::config::KgAgentConfig;
 use anyhow::{Context as _, Result, anyhow};
@@ -6723,6 +6724,105 @@ mod tests {
             webhook_prefilter::trigger_class("<verdict_handler>\nautre chose").as_str(),
             "other",
             "la forme que le handler substitue ne classe pas en pr_review"
+        );
+    }
+
+    // ---- mika#2855 vol d'instrument — le second terme du registre ----------
+    //
+    // Les tests unitaires de `webhook_turn_outcome` épinglent la lecture du
+    // marqueur ; celui d'ici lit la ligne telle qu'un tour RÉEL l'émet, sur le
+    // chemin complet `run_agent_for_message`. C'est la seule forme qui peut
+    // établir que le texte que le moteur a produit atteint le parseur : un
+    // appel direct à `parse_attestation` serait vert même si le site d'émission
+    // passait `None`.
+    //
+    // Aucun nouveau harnais : la capture, le réchauffage des callsites et le
+    // `#[serial]` sont ceux de mika#2680 juste au-dessus, pour la raison qui
+    // les a fait naître (l'`Interest` d'un callsite est figé par le premier
+    // thread qui l'atteint).
+
+    /// Un état dont le modèle rend `final_text` à chaque appel.
+    ///
+    /// L'attestation est un fait du **texte du modèle**, et `mika2675_state`
+    /// câble un mock qui dit « Noted. » — donc qui n'atteste rien. Un test bâti
+    /// sur lui n'aurait pu asserter que le repli `outcome_absent`, lequel est
+    /// aussi ce que rend un parseur cassé de bout en bout.
+    fn mika2855_state_repondant(final_text: &str) -> AppState {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+        let (state, _) = mika2675_state();
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses((0..8).map(|_| text_response(final_text)).collect())
+                .build(),
+        );
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .llm = mock;
+        }
+        state
+    }
+
+    /// AC1 — un tour webhook qui a lieu émet la ligne d'ISSUE, elle porte ses
+    /// trois champs, et son `request_id` est celui de la ligne d'ENTRÉE du même
+    /// tour.
+    ///
+    /// La jointure par `request_id` est tout le dispositif : la ligne d'entrée
+    /// porte le coût et la `release`, celle de sortie porte l'issue, et c'est
+    /// leur rapprochement qui permet de chiffrer les arrêts par numéro. Deux
+    /// moitiés qu'on ne peut pas joindre ne mesurent rien.
+    ///
+    /// `agent_id` est asserté parce que
+    /// `scripts/measure-webhook-turn-cost:204` filtre **chaque** ligne du
+    /// corpus sur `--agent` : une ligne de sortie sans ce champ est écartée par
+    /// le lecteur, donc muette, sans que rien ne le dise.
+    ///
+    /// `outcome` est asserté sur une valeur ATTESTÉE, et non sur le repli :
+    /// `outcome_absent` est aussi ce que rendrait un site d'émission qui ne
+    /// passerait jamais le texte du tour. La valeur nommée est le contrôle de
+    /// non-vacuité du chemin complet.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2855_la_ligne_dissue_se_joint_a_la_ligne_dentree() {
+        mika2680_warm_callsites().await;
+        let (_guard, events) = mika2680_capture();
+        let state = mika2855_state_repondant("Dispatched the review.\n\nWebhook-Outcome: review");
+        mika2675_run_on(&state, MIKA2680_COMMENT).await;
+
+        assert_eq!(
+            mika2675_skipped_rows(&state).await,
+            0,
+            "le tour a bien lieu"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "contrôle positif : la ligne d'entrée");
+        let outcome = mika2680_events_named(
+            &events,
+            super::webhook_turn_outcome::WEBHOOK_TURN_OUTCOME_EVENT,
+        );
+        assert_eq!(outcome.len(), 1, "une ligne d'issue, et une seule");
+
+        let request_id = outcome[0].fields.get("request_id").expect("request_id");
+        assert!(
+            !request_id.is_empty(),
+            "une jointure sur du vide n'en est pas une"
+        );
+        assert_eq!(
+            Some(request_id),
+            charged[0].fields.get("request_id"),
+            "AC1 — les deux moitiés du registre portent le même tour"
+        );
+        assert_eq!(
+            outcome[0].fields.get("agent_id").map(String::as_str),
+            Some("mika"),
+            "le lecteur filtre chaque ligne sur l'agent"
+        );
+        assert_eq!(
+            outcome[0].fields.get("outcome").map(String::as_str),
+            Some("review"),
+            "AC1 — l'issue attestée par le modèle traverse jusqu'à la ligne"
         );
     }
 }
