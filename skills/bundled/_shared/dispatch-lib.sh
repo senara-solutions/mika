@@ -2459,6 +2459,110 @@ _pilot_gitdir_bind_args() {
     return 0
 }
 
+# --- mika#2108 (vol 2) : faire dire la vérité au squelette de montage --------
+#
+# LE DÉFAUT QU'ELLE VISE, sondé et non déduit. Depuis mika#2146 les binds du
+# gitdir matérialisent leurs répertoires intermédiaires, donc le bac à sable ne
+# rend plus `ENOENT` sur la racine hôte : il rend un squelette. Une sonde réelle
+# rend quatre lignes, et ce sont elles qui mentent :
+#
+#     --- <racine hôte> ---            drwx------ .claude
+#                                      drwx------ <dépôt>
+#     --- <racine hôte>/<dépôt> ---    drwx------ .git     ← et rien d'autre
+#
+# C'est la forme exacte d'un dépôt dont le checkout aurait disparu. Un chemin
+# absent ne répond pas ; ce squelette RÉPOND, et sa réponse est fausse — les
+# deux séances `2b74a8c6` et `9f144402` ont terminé en réclamant de « rétablir
+# le dépôt git backing du worktree ». Elles n'ont pas halluciné : elles ont lu
+# le squelette et en ont tiré l'inférence raisonnable. Un `README-SANDBOX` aux
+# deux emplacements qui mentent répond à l'orientation au lieu de la laisser
+# muette, sans exposer quoi que ce soit.
+#
+# POURQUOI `--ro-bind-data` ET NON `--ro-bind`, alors que le fichier offre les
+# deux précédents. `--ro-bind` d'un fichier staged hôte (c'est
+# `_PILOT_GITCONFIG_HOST`) donne une sonde opérateur, mais une source manquante
+# fait `bwrap: Can't find source path` — un ABORT DE LANCEMENT sans explication,
+# la classe que `_PILOT_GITDIR_BIND_ABORT` traite avec trois gardes. Pour le
+# gitconfig cet arbitrage est juste : sans identité de committer le pilote ne
+# livre rien, donc échouer fermé est la bonne issue. ICI IL S'INVERSE, parce que
+# l'enjeu s'inverse : un fichier purement informatif ne doit JAMAIS pouvoir
+# empêcher un pilote de démarrer. `--ro-bind-data` lit le contenu sur un
+# descripteur et le matérialise dans le namespace — aucune source sur disque,
+# donc rien à stager, rien à nettoyer, et rien qui puisse manquer. La dépendance
+# `bubblewrap >= 0.5.0` est déjà payée par le canal de secrets (mika#2039) : ce
+# geste n'ajoute aucune exigence de version.
+#
+# Le fd suit le motif du canal de secrets et pour ses raisons déjà écrites :
+# alloué par bash (`{var}<`, donc >= 10, structurellement hors du fd 9 de
+# `BASH_XTRACEFD`) et refermé par l'appelant APRÈS la capture de `_sandbox_rc`.
+# Le contenu n'étant pas un secret, la suppression de `xtrace` n'est PAS faite
+# ici — l'ajouter ferait croire à un secret là où il n'y en a pas.
+#
+# LE SILENCE EST LA SEULE ISSUE QUAND LES GLOBALES MANQUENT. `PLATFORM_DIR` et
+# `SUB_REPO_DIR` naissent dans `dispatch_claude_pilot`, pas dans
+# `_run_pilot_sandboxed` : un appel hors de cette chaîne (la suite de tests
+# mika#2039, un appel direct) ne les porte pas. Elles sont donc lues en
+# `${VAR:-}`, jamais nues — les suites tournent sous `set -u` — et l'absence
+# rend un TABLEAU VIDE, pas un argument sur une destination vide. Un pilote
+# lancé hors chaîne perd son marqueur et RIEN D'AUTRE : ni abort, ni message.
+# C'est le même arbitrage que ci-dessus poussé à son terme : ce fichier est de
+# l'information, et l'information ne refuse pas le service.
+#
+# LE TEXTE A UN SITE UNIQUE. Le contenu est la sortie de la fonction d'amorçage
+# du vol 1, précédée d'une seule ligne disant pourquoi ce fichier est lu. Les
+# quatre faits qu'elle énonce sont exactement ceux dont un lecteur du squelette
+# a besoin ; les réécrire produirait deux textes à maintenir, et la racine hôte
+# cesserait d'être DÉRIVÉE. Même forme que le motif `## Fire-Disposition` de
+# mika#2544 : un texte, deux canaux (le prompt, le namespace), aucune copie.
+#
+# DÉDUP OBLIGATOIRE. Quand la dispatche porte sur le méta-dépôt lui-même,
+# `SUB_REPO_DIR` EST `PLATFORM_DIR` : les deux arguments nommeraient la même
+# destination, et `bwrap` appliquant en ordre, le second recouvrirait le premier.
+# Pas fatal, mais c'est un argument qui ne dit rien sur un chemin déjà couvert.
+# Un seul est émis dans ce cas, et c'est asserté (PART E de
+# tests/test_pilot_orientation_block.sh).
+_pilot_sandbox_readme_args() {
+    _PILOT_README_BIND_ARGS=()
+    _PILOT_README_FDS=()
+
+    local _host_root="${PLATFORM_DIR:-}"
+    local _repo_checkout="${SUB_REPO_DIR:-}"
+    local _work_root="${WORKTREE_DIR:-}"
+
+    if [ -z "$_host_root" ] || [ -z "$_repo_checkout" ]; then
+        return 0
+    fi
+
+    # La racine de travail passe par une locale et non par la globale : la suite
+    # du vol 1 compte EXACTEMENT un site d'injection du bloc d'amorçage dans le
+    # prompt, et ce compte est sa garde d'ordre. Ce site-ci n'injecte pas dans le
+    # prompt — il écrit dans le namespace — donc il ne doit pas se présenter à
+    # cette mesure comme un second site de prompt.
+    local _content
+    _content="Tu lis ceci parce que tu as cherché un checkout, un worktree ou un dépôt à cet endroit. Ce répertoire n'est pas le workspace de l'hôte : c'est un squelette de points de montage, et son contenu ne dit rien de ce qui existe dehors.
+
+$(_pilot_orientation_rule "$_work_root" "$_host_root" "$_repo_checkout")"
+
+    local -a _dests=("$_host_root/README-SANDBOX")
+    if [ "$_repo_checkout" != "$_host_root" ]; then
+        _dests+=("$_repo_checkout/README-SANDBOX")
+    fi
+
+    local _dest _rfd
+    for _dest in "${_dests[@]}"; do
+        # `unset` à chaque tour : `exec {var}<` réutilise la valeur en place si
+        # elle nomme déjà un fd valide, et les deux destinations finiraient sur
+        # le même descripteur. Même précaution que `_sfd` dans le canal de
+        # secrets.
+        unset _rfd
+        exec {_rfd}< <(printf '%s\n' "$_content")
+        _PILOT_README_BIND_ARGS+=(--ro-bind-data "$_rfd" "$_dest")
+        _PILOT_README_FDS+=("$_rfd")
+    done
+
+    return 0
+}
+
 # --- mika#2077 (reprise de mika#2057) : le corps du script d'entrypoint 2b ----
 #
 # Émet sur stdout le script que `$sandbox_entrypoint_prefix -c` exécute en
