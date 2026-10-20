@@ -4242,6 +4242,58 @@ brouillon, c'est le laisser en place. Ne bâtis pas de fixture dans \`/tmp\` : \
 Seule exception : \`pr-body.md\` à la racine n'est pas un brouillon — la règle mika#2211 ci-dessus reste entière
 (écris-le à la racine, puis un simple \`rm pr-body.md\` après \`gh pr create\`, jamais \`rm -rf\`)."
 
+# mika#2108 — où le pilote EST, dit avant qu'il lise les chemins hôte du ticket.
+#
+# LE DÉFAUT QU'ELLE VISE. Le bac à sable `bwrap` part d'une racine vide et ne
+# monte que le worktree et le strict minimum de son gitdir (mika#2141/#2146) : le
+# workspace de l'hôte n'y est pas. Or depuis mika#2178 le corps du ticket et ses
+# commentaires sont une surface CHARGÉE AUTOMATIQUEMENT, transportée VERBATIM —
+# et pour mika#2108 lui-même ce sont 16 lignes citant la racine hôte, dont
+# plusieurs sous forme de commandes `ls` et `find` littérales. Les quatre séances
+# mesurées (09fee003, 115fdc83, 01934aee, ef378451) ont dépensé leurs premiers
+# tours à chercher un checkout jamais monté — toutes erreurs redirigées, donc le
+# modèle lit du silence et conclut « pas ici, cherchons ailleurs » — puis sont
+# allées vers la forme large qui tue la session (cpp#128).
+#
+# POURQUOI UNE FONCTION ET NON UNE CONSTANTE. Elle nomme la racine de travail
+# RÉELLE, que seule la dispatche connaît : « ta racine est ICI » vaut mieux que
+# « tu as une racine ». Racine hôte et checkout cité sont DÉRIVÉS des globales,
+# jamais écrits en dur — la consigne « étendre par propriété » que porte déjà
+# `scripts/check-pilot-instruction-paths.sh` : un workspace frère ailleurs est le
+# même défaut sous une autre orthographe (AC7).
+#
+# POURQUOI AVANT LE CORPS DU TICKET, et pas en queue comme ses quatre voisines.
+# mika#2211, #2548, #2306 et #2636 prescrivent un GESTE de fin de parcours : pour
+# elles la récence est le bon levier, d'où leur place en queue. Celle-ci ne
+# prescrit aucun geste — elle CORRIGE LA LECTURE du texte qui suit. Placée après
+# `CONTEXTE DU TICKET` elle console le pilote d'avoir déjà lu les `ls` littéraux ;
+# placée avant, elle l'inocule. Le site d'injection nomme la fenêtre et ses deux
+# bornes.
+#
+# Bornée à 12 lignes, et c'est un critère d'acceptation (AC3) et non un goût : le
+# bloc entre en concurrence d'attention dans un prompt qui porte déjà cinq
+# injections et jusqu'à 16 KiB de contexte de ticket.
+#
+# Ce qu'elle N'EST PAS : une fermeture de classe. C'est du prompt, donc ça réduit
+# un taux — même limite que `DENIED_BASH_PATTERNS_HINT` porte dans sa propre
+# note. Le marqueur dans le squelette (vol 2) répond au geste qui a lieu quand
+# même ; les deux couvrent le raisonnement et le geste, aucun ne suffit seul.
+_pilot_orientation_rule() {
+    local _work_root="$1" _host_root="$2" _repo_checkout="$3"
+
+    printf '%s\n' "RÈGLE DE DISPATCH (mika#2108) — où tu es, et ce que tu ne peux pas atteindre.
+Ta racine de travail est \`${_work_root}\` — c'est DÉJÀ ton répertoire courant, et un relatif y suffit.
+Le workspace de l'hôte n'est PAS monté dans ton bac à sable. Sous \`${_host_root}\` tu ne vois qu'un
+squelette de points de montage, dont la liste au premier niveau est IDENTIQUE à celle de l'hôte : ne la
+lis pas comme une preuve que le reste est là. Le checkout du dépôt n'y est pas — sous
+\`${_repo_checkout}\` tu ne trouveras aucun fichier du dépôt, seulement son \`.git\`. Les autres
+worktrees et les autres sous-dépôts n'y sont pas non plus, et aucun \`ls\`, \`find\` ou \`cat\` ne les y
+fera apparaître : les chercher ne coûte que des tours.
+Un chemin sous \`${_host_root}\` cité par le corps du ticket ou par un commentaire est de la
+DESCRIPTION, pas une instruction de navigation : ne le rejoue pas tel quel. Ce qu'il décrit se lit sous
+ta racine de travail."
+}
+
 # mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
 # de grooming.
 #
@@ -5229,6 +5281,27 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
             ITERATION_CTX=$(printf '%s' "$ITERATION_CTX" | head -c 4096)
             PROMPT=$(printf '%s#%s\n\nITERATION CONTEXT:\n%s' "$REPO" "$ISSUE_NUM" "$ITERATION_CTX")
         fi
+
+        # --- mika#2108 : le pilote est SITUÉ avant de lire le corps du ticket ---
+        #
+        # La fenêtre est étroite et chacune de ses deux bornes porte sa
+        # conséquence nommée :
+        #
+        #  - APRÈS le branchement ITERATION_CTX ci-dessus. Ce branchement
+        #    RÉASSIGNE PROMPT depuis zéro au lieu d'y appendre (invariant 1 de
+        #    mika#2178, juste en dessous) : injecter avant lui perd le bloc en
+        #    SILENCE à chaque itération.
+        #  - AVANT l'injection de TICKET_CONTEXT ci-dessous. C'est toute la
+        #    fonction du bloc : les chemins hôte du ticket arrivent là, et un
+        #    avertissement qui les suit CONSOLE au lieu d'inoculer. Déplacer
+        #    cette ligne après elles fait rougir
+        #    tests/test_pilot_orientation_block.sh (AC2 via AC4).
+        #
+        # Inconditionnelle : tout pilote de tout dépôt court dans le même bac à
+        # sable, groomeur comme implémenteur. La PREMIÈRE LIGNE de PROMPT reste
+        # exactement `<repo>#<num>` — on appende à un PROMPT qui commence déjà
+        # par la référence (contrat mika#138, invariant 2 ci-dessous).
+        PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$(_pilot_orientation_rule "$WORKTREE_DIR" "$PLATFORM_DIR" "$SUB_REPO_DIR")")
 
         # --- mika#2178: the ticket text reaches the pilot ---
         #
