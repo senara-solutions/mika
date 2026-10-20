@@ -406,10 +406,40 @@ obtained outside the published inventory — hallucination, a prose mention,
 history from before the server connected, a conversation summary. That is the
 whole of F5, which is what the single call protects.
 
-**What this still does NOT buy, and where it is tracked.** A misspelled key in an
-`mcp.json` server entry (`dataGrade` instead of `data_grade`) still reads
-`operational` without saying anything, and should warn at load — a warning, not a
-refusal. Tracked in: senara-solutions/mika#2814 (vol 3).
+**A misspelled key now warns at load — mika#2814 (vol 3).** A key `serde` does
+not recognize in an `mcp.json` server entry (`dataGrade` instead of
+`data_grade`) is still discarded in silence by `serde` itself, and
+`data_grade` still takes its default: the operator who wrote a refusal still
+gets a permission. What changed is that nobody has to guess. Deserialization in
+production goes through one constructor, `McpConfig::depuis_json`
+(`mcp/config.rs`) — both `load` and `load_operator_shell` call it — which parses
+to a `serde_json::Value`, audits the keys of each `mcpServers.<name>` entry
+against `KNOWN_SERVER_KEYS`, then deserializes. Each unknown key emits
+`WARN mcp_config_unknown_server_key` naming the source file, the server, the key
+and the eight recognized ones, plus a `suggestion` when normalization — lowercase,
+`_` and `-` stripped — matches a known key, which is what catches `dataGrade`,
+`DATA-GRADE` and `datagrade`. The field is **absent** rather than empty when
+nothing matches (mika#2331). Every load also emits
+`INFO mcp_config_keys_audited` with `servers` and `unknown_keys`, on the healthy
+branch included, so a true `unknown_keys: 0` and a binary that predates this fix
+do not render the same bytes (class mika#2340).
+
+It is a warning and never a refusal: `deny_unknown_fields` stays rejected,
+because an `mcp.json` written for another MCP host legitimately carries keys Mika
+ignores, and the fail-open of mika#1764 must hold. The audit decides nothing and
+rewrites no value — it tells. `KNOWN_SERVER_KEYS` is a literal, since `serde`
+exposes no field names at runtime; what keeps it from drifting is
+`mika2814_les_cles_connues_egalent_les_champs_serialises`, a bidirectional
+round-trip against the actually-serialized keys, so the gesture that makes an
+entry pointless is the one that makes it expire (mika#2309).
+
+**What this still does NOT buy, and where it is tracked.** The scope is
+`mcpServers.<name>` entries only. A typo on the top-level key itself
+(`"mcpServer"`) yields an empty config and says nothing here — it is visible at
+first use, when no server is connected, and is deliberately out of scope. And
+`filter_available_required_tools` — the function that decides which required
+tools a skill sees as available — is still not pinned against the L2 filter.
+Tracked in: senara-solutions/mika#2814 (vol 4).
 
 ### Applied hardening (closed after mika#1798)
 
