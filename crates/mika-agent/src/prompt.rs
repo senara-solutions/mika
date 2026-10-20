@@ -3941,18 +3941,36 @@ emoji = "✦"
             assert!(disabled.contains(tool), "{tool} must be denied fail-closed");
         }
 
-        // And what it deliberately does NOT deny, written down so nobody reads
-        // "fail-closed" as "inert": #811 keeps the agent-scoped memory writes,
-        // counting them as constitutive of being an agent rather than platform
-        // side effects. A neutered agent can still write core memory, which is
-        // re-injected into every later system prompt. Whether the fail-closed
-        // path wants a stricter list than mika-arch's steady-state one is open —
-        // the two share this constant, so tightening it here tightens mika-arch.
-        for still_allowed in ["update_core_memory", "store_fact", "update_fact"] {
+        // And what this constant deliberately does NOT name. #811 left the
+        // agent-scoped memory writes out of it, counting them as constitutive
+        // of being an agent rather than platform side effects — a judgement
+        // about *mika-arch in steady state*, which shares this constant, and
+        // which mika#2853 did not revisit.
+        //
+        // **Do not read these three names as "served to a fail-closed agent".**
+        // They were, until 2026-10-20; they no longer are. The allowlist above
+        // is `Some(vec![])`, and the allowlist governs: on an empty one the
+        // admission predicate admits nothing, so a degraded agent is published
+        // zero tools and cannot write core memory either. What this loop still
+        // measures is the **denylist's** perimeter, one layer down — the line of
+        // defence that does not depend on the allowlist field, and the only one
+        // in force for mika-arch, whose allowlist is not empty. The question
+        // this paragraph used to leave open (does the fail-closed path want a
+        // stricter list than mika-arch's?) is closed, and the answer was not a
+        // stricter denylist: it was an empty allowlist, which costs mika-arch
+        // nothing.
+        //
+        // The behavioural half — that zero tool reaches the model — cannot be
+        // asserted here: this test reads a struct, and a field nobody consults
+        // is indistinguishable from a working filter. It lives in
+        // `tests/eval/test_fail_closed_tool_surface_2784.rs`, on a real turn.
+        for absent_de_la_denylist in ["update_core_memory", "store_fact", "update_fact"] {
             assert!(
-                !disabled.contains(still_allowed),
-                "{still_allowed} is expected to remain allowed; if that changed \
-                 deliberately, update this assertion and the paragraph above it"
+                !disabled.contains(absent_de_la_denylist),
+                "{absent_de_la_denylist} is expected to be absent from the \
+                 DENYLIST (it is withheld from the model by the empty allowlist \
+                 instead, mika#2853); if that changed deliberately, update this \
+                 assertion and the paragraph above it"
             );
         }
     }
