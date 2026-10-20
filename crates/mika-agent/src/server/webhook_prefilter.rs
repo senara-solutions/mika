@@ -3227,6 +3227,37 @@ pub(crate) mod tests {
         );
     }
 
+    /// (h) lit le texte ENTIER, donc la fenêtre stricte : tout handler qui l'a
+    /// touché rend le tour, et seulement lui. Même forme que
+    /// [`mika2680_e_tout_handler_qui_a_touche_le_texte_rend_le_tour`] ; la
+    /// seconde moitié traverse la porte armée sous un bouchon qui panique à
+    /// toute lecture, donc le texte touché rend le tour AVANT l'état et le
+    /// triage.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_h_tout_handler_qui_a_touche_le_texte_rend_le_tour() {
+        let c = classify(COMMENT_2854).unwrap();
+        let strict = Touched {
+            by_any_handler: true,
+            ..intacte()
+        };
+        assert!(strict.applies_to(&c), "{c:?}");
+        let fenetres_etroites = Touched {
+            by_any_handler: false,
+            after_verdict_handler: true,
+            outside_ci_success_handler: true,
+            outside_ci_failure_handler: true,
+        };
+        assert!(!fenetres_etroites.applies_to(&c), "{c:?}");
+
+        let _garde = TriageEnvGuard::set(true);
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        assert_eq!(
+            skip_turn(&db, &Stub::default(), COMMENT_2854, strict, "rid-now", true).await,
+            Gate::Charged(Release::TextTouched)
+        );
+    }
+
     /// AC7 — un ticket **avec** tâche de boucle garde le tour, et le triage
     /// n'est pas appelé.
     ///
