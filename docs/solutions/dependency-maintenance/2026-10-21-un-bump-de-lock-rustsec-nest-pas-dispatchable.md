@@ -196,3 +196,5 @@ d'un job échoue, les étapes suivantes n'ont pas tourné, et leurs échecs ne s
 pas encore visibles.** Ne jamais lire « AC2 reste vert » comme une
 non-régression quand l'étape qui la mesure n'a pas tourné : c'est une
 **première** vérification, et elle peut découvrir une matière hors périmètre.
+
+> **Suite (2026-10-21) :** les trois montées du § « Quoi faire » ont été faites par un spawn MPC hors bac à sable ; la lecture de `patched` (`>=1.0.10`, aucune `0.26.x`, toutes les `sqlx-core` 0.8.x sur `webpki-roots ^0.26`) place le quatrième nœud en branche B3 : RUSTSEC-2026-0381 reste sur `webpki-roots 0.26.11`.
