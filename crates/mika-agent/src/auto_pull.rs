@@ -721,22 +721,52 @@ fn format_named_files(files: &[String]) -> String {
 
 /// The outcome of trying to measure a branch (mika#2123 U1).
 ///
-/// Four outcomes, not two, because "I could not measure" and "I measured zero"
+/// Five outcomes, not two, because "I could not measure" and "I measured zero"
 /// are different facts and collapsing them is how a gate starts lying. A `404`
 /// in particular is **not** a distance of zero — it says the branch named in
 /// the callout is not on the remote at all.
+///
+/// Et « absente d'`origin` » n'est pas **un** fait mais deux (mika#2837) : le
+/// merge de sa PR l'a supprimée — son plan est alors sur `main`, le callout est
+/// périmé et pas le plan — ou bien aucune PR mergée ne la porte, et le plan
+/// annoncé n'existe nulle part. Les deux se mesurent `404` à l'identique ; seul
+/// le second justifie le gate, et refuser les deux a coûté un tour d'opérateur
+/// par vol sur chaque ticket à plusieurs vols (4 refus sur 2 tickets, chacun
+/// dans les dix minutes du merge qui avait supprimé la branche).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StalenessMeasurement {
     /// The compare endpoint answered.
     Measured(BranchStaleness),
-    /// The compare endpoint returned `404`: the branch is absent from origin.
-    BranchAbsent,
+    /// Absente d'`origin`, et la sonde « une PR mergée la porte-t-elle ? » n'a
+    /// pas promu — soit elle a répondu « aucune », soit elle n'a pas pu
+    /// répondre. Le refus est le même dans les deux cas ; `probe` dit lequel.
+    BranchAbsent { probe: AbsenceProbe },
+    /// Absente parce que le merge de sa PR l'a supprimée (mika#2837).
+    BranchDeletedByMerge { pr: u64 },
     /// The issue body carries no `> - **Branch:**` callout, so there is nothing
     /// to measure. Not an error — Phase 2 reconciles ungroomed tickets too.
     NoBranchCallout,
     /// The call failed for any other reason (network, rate limit, auth). The
     /// gate has no opinion, and says so rather than inventing one.
     Unavailable,
+}
+
+/// Pourquoi la sonde « une PR mergée porte-t-elle cette branche ? » n'a pas
+/// promu (mika#2837).
+///
+/// Les deux variantes refusent, et identiquement : celle-ci ne décide rien,
+/// elle **nomme**. Et il faut qu'elle nomme, parce qu'une sonde en panne et une
+/// branche réellement orpheline produisent la même ligne de refus — sans ce
+/// champ, une panne de la forge se lirait comme une population de branches
+/// orphelines, et c'est la classe mika#2013. `Unreadable` est la population
+/// qu'un opérateur doit pouvoir compter seule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsenceProbe {
+    /// La forge a répondu : aucune PR mergée ne porte cette branche.
+    NotCarried,
+    /// La forge n'a pas pu répondre — processus, statut non nul, ou charge
+    /// illisible. On ne promeut pas sur une absence de preuve (AC3).
+    Unreadable,
 }
 
 /// Why the gate refused to promote a ticket (mika#2123 R3).
@@ -1008,6 +1038,111 @@ pub fn parse_compare_payload(stdout: &str) -> Result<BranchStaleness> {
     })
 }
 
+/// Une PR mergée dont la tête est la branche du callout (mika#2837).
+///
+/// `merged_at` est porté en plus du numéro bien qu'aucune décision ne le lise :
+/// c'est lui qui date la suppression de la branche, donc la seule valeur qui
+/// permette de relier un refus évité au merge qui l'avait causé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedPrEvidence {
+    pub number: u64,
+    pub merged_at: String,
+}
+
+/// La charge de `gh pr list` sur une branche, lue comme une preuve de merge
+/// (mika#2837).
+///
+/// Split de l'appel subprocess pour la raison de [`parse_compare_payload`] :
+/// toute la décision se teste alors contre des charges figées, sans réseau.
+///
+/// **Trois conditions par entrée, toutes nécessaires :**
+///
+/// 1. `mergedAt` non nul — un `state: "CLOSED"` sans merge ne porte rien, et ce
+///    n'est pas un cas d'école : il arrive **en tête** de la charge réelle de
+///    #2680 (AC4) ;
+/// 2. `headRefName` égal à la branche demandée — `--head` est un filtre de la
+///    forge, pas une garantie que notre code peut lire ;
+/// 3. `baseRefName == "main"` — une PR mergée dans une branche de feature ne met
+///    pas le plan sur `main`, et `main` est d'où un pilote dispatché repartirait.
+///
+/// L'entrée retenue est celle de `mergedAt` **maximal**, comparé par
+/// [`crate::timestamp::parse`] et jamais comme deux chaînes : l'ordre de
+/// `gh pr list` n'est pas contractuel, et un `+00:00` RFC 3339 se compare
+/// lexicographiquement avant un `…Z` plus ancien.
+///
+/// **Deux niveaux d'échec, et leur asymétrie est délibérée** — celle que
+/// [`parse_open_pr_issue_numbers`] argumente longuement (l. 2672-2681), reprise
+/// par référence plutôt que recopiée : JSON global illisible ⇒ `Err`, donc le
+/// refus d'AC3 ; une entrée malformée ne prouve rien et les autres continuent.
+/// `Ok(None)` est par conséquent « la forge a répondu : aucune PR mergée ne
+/// porte cette branche », jamais « je n'ai pas pu lire ».
+pub fn parse_merged_pr_for_branch(stdout: &str, branch: &str) -> Result<Option<MergedPrEvidence>> {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(stdout)?;
+
+    let mut best: Option<(chrono::DateTime<chrono::Utc>, MergedPrEvidence)> = None;
+    for pr in raw {
+        let (Some(merged_at), Some(head), Some(base), Some(number)) = (
+            pr["mergedAt"].as_str(),
+            pr["headRefName"].as_str(),
+            pr["baseRefName"].as_str(),
+            pr["number"].as_u64(),
+        ) else {
+            continue;
+        };
+        if head != branch || base != "main" {
+            continue;
+        }
+        let Ok(at) = crate::timestamp::parse(merged_at) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(previous, _)| at > *previous) {
+            best = Some((
+                at,
+                MergedPrEvidence {
+                    number,
+                    merged_at: merged_at.to_string(),
+                },
+            ));
+        }
+    }
+
+    Ok(best.map(|(_, evidence)| evidence))
+}
+
+/// Ce que vaut une branche absente d'`origin`, une fois la sonde rendue
+/// (mika#2837 AC1/AC2/AC3).
+///
+/// Prend la sonde **par valeur** : cette fonction est le seul lecteur de ce
+/// `Result`, et le prendre par référence obligerait chaque appelant à le garder
+/// vivant pour rien.
+///
+/// `Err` et `Ok(None)` restent fusionnés sous **un** refus mais sous **deux**
+/// noms. Les deux moitiés de cette fusion sont volontaires et aucune n'est un
+/// reste à nettoyer :
+///
+/// - fusionnées parce que la décision est la même — on ne promeut pas sur une
+///   absence de preuve (AC3). **Ne pas « harmoniser » le bras `Err` avec ses
+///   voisins de [`classify_promotion`]**, où toute mesure manquante promeut : ici
+///   l'inversion est l'AC, et le jour où `Err` promeut, AC3 tombe en silence ;
+/// - nommées parce qu'un opérateur doit pouvoir compter `Unreadable` seul, pour
+///   la raison qu'[`AbsenceProbe`] porte.
+///
+/// Point d'extension : une troisième raison de ne pas promouvoir s'ajoute comme
+/// variante d'[`AbsenceProbe`], pas comme nouvelle signature.
+pub fn classify_absent_branch(probe: Result<Option<MergedPrEvidence>>) -> StalenessMeasurement {
+    match probe {
+        Ok(Some(evidence)) => StalenessMeasurement::BranchDeletedByMerge {
+            pr: evidence.number,
+        },
+        Ok(None) => StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::NotCarried,
+        },
+        Err(_) => StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::Unreadable,
+        },
+    }
+}
+
 /// The whole promotion decision for one ticket. Pure — every input is already
 /// resolved (mika#2123 U2/U3).
 ///
@@ -1036,7 +1171,8 @@ pub fn classify_promotion(
                 detail: "staleness_unavailable",
             };
         }
-        StalenessMeasurement::BranchAbsent => {
+        StalenessMeasurement::BranchAbsent { .. }
+        | StalenessMeasurement::BranchDeletedByMerge { .. } => {
             return PromotionGate::Refuse(RefusalReason::BranchAbsent {
                 branch: branch.unwrap_or("<unknown>").to_string(),
             });
@@ -1200,7 +1336,8 @@ fn staleness_audit_json(
     };
     let measurement_slug = match measurement {
         StalenessMeasurement::Measured(_) => "measured",
-        StalenessMeasurement::BranchAbsent => "branch_absent",
+        StalenessMeasurement::BranchAbsent { .. } => "branch_absent",
+        StalenessMeasurement::BranchDeletedByMerge { .. } => "branch_deleted_by_merge",
         StalenessMeasurement::NoBranchCallout => "no_branch_callout",
         StalenessMeasurement::Unavailable => "unavailable",
     };
@@ -2924,7 +3061,14 @@ async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasure
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
-            return StalenessMeasurement::BranchAbsent;
+            // L'absence **non sondée** : à cet instant la question « une PR
+            // mergée la porte-t-elle ? » (mika#2837) n'a pas été posée, et
+            // [`promotion_gate_allows`] remplace cette valeur par celle de
+            // [`classify_absent_branch`] avant toute décision. `NotCarried` est
+            // le seul des deux noms qui ne prétende pas à une lecture en erreur.
+            return StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            };
         }
         warn!(branch, stderr = %stderr, "auto_pull: gh api compare failed");
         return StalenessMeasurement::Unavailable;
@@ -5400,7 +5544,10 @@ mod tests {
     /// there either.
     #[test]
     fn test_promotion_gate_absent_branch_is_its_own_outcome() {
-        match classify_promotion(&StalenessMeasurement::BranchAbsent, Some("feat/gone"), 50) {
+        let absent = StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::NotCarried,
+        };
+        match classify_promotion(&absent, Some("feat/gone"), 50) {
             PromotionGate::Refuse(r @ RefusalReason::BranchAbsent { .. }) => {
                 assert_eq!(r.slug(), "branch_absent_on_origin");
                 assert!(r.reason(42).contains("n'existe pas sur `origin`"));
@@ -10774,5 +10921,168 @@ This ticket has been GROOMED and is ready.
         );
         assert_eq!(linkage.nonconforming_branches, 2, "#1 et #3");
         assert_eq!(linkage.numbers.len(), 4, "2680, 1381, 606, 9");
+    }
+
+    // ───────────── mika#2837 — une branche supprimée par un merge ─────────────
+
+    const BRANCH_2108: &str = "fix/2108/p1-dispatch-lib-le-bac-sable-ne-monte";
+    const BRANCH_2680: &str = "feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur";
+
+    /// Sortie réelle, figée le 2026-10-20 :
+    /// `gh pr list --repo senara-solutions/mika --head fix/2108/… --state all
+    /// --json number,state,mergedAt,baseRefName,headRefName --limit 30`.
+    ///
+    /// C'est la charge du refus du 2026-10-20T06:20:08Z sur #2108 — celui qui a
+    /// suivi de dix minutes le merge de #2834. Deux merges, pas un : la branche
+    /// avait déjà servi un vol antérieur, et c'est ce qui rend l'argmax
+    /// nécessaire plutôt que décoratif.
+    const MERGED_PR_LIST_2108: &str = r#"[
+      {"baseRefName":"main","headRefName":"fix/2108/p1-dispatch-lib-le-bac-sable-ne-monte","mergedAt":"2026-10-20T06:10:45Z","number":2834,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"fix/2108/p1-dispatch-lib-le-bac-sable-ne-monte","mergedAt":"2026-10-19T06:15:38Z","number":2791,"state":"MERGED"}
+    ]"#;
+
+    /// Sortie réelle, figée le 2026-10-20, même commande sur la branche de
+    /// #2680 — les trois refus du constat.
+    ///
+    /// Son intérêt est en tête de liste : l'entrée `[0]` est #2833, **fermée
+    /// sans merge**. La forge la rend d'abord, et un parseur qui lirait la
+    /// première entrée promouvrait sur une PR qui n'a rien mis sur `main`.
+    const MERGED_PR_LIST_2680: &str = r#"[
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":null,"number":2833,"state":"CLOSED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-19T16:27:54Z","number":2829,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-19T05:27:37Z","number":2812,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-17T09:14:05Z","number":2764,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-17T06:26:44Z","number":2747,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-16T12:11:01Z","number":2705,"state":"MERGED"}
+    ]"#;
+
+    /// Le parseur sur les deux charges réelles du constat (AC1).
+    #[test]
+    fn mika2837_le_parseur_sur_les_deux_charges_reelles() {
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2108, BRANCH_2108).unwrap(),
+            Some(MergedPrEvidence {
+                number: 2834,
+                merged_at: "2026-10-20T06:10:45Z".to_string(),
+            }),
+            "le plus récent des deux merges, pas le premier venu : c'est #2834 \
+             qui a supprimé la branche dix minutes avant le refus"
+        );
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2680, BRANCH_2680)
+                .unwrap()
+                .map(|e| e.number),
+            Some(2829),
+            "et ce, bien que l'entrée [0] soit #2833, fermée sans merge"
+        );
+    }
+
+    /// AC4 — le contrôle négatif. Une PR fermée sans merge ne porte pas la
+    /// branche, donc le refus d'aujourd'hui tient, message compris.
+    ///
+    /// L'entrée est celle de `[0]` de [`MERGED_PR_LIST_2680`], seule : c'est
+    /// exactement l'état qu'aurait eu la branche si le vol 4 de #2680 avait été
+    /// abandonné au lieu d'être mergé.
+    #[test]
+    fn mika2837_une_pr_fermee_sans_merge_ne_porte_pas_la_branche() {
+        let closed_only = r#"[
+          {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":null,"number":2833,"state":"CLOSED"}
+        ]"#;
+        let probe = parse_merged_pr_for_branch(closed_only, BRANCH_2680);
+        assert_eq!(
+            probe.as_ref().unwrap(),
+            &None,
+            "`mergedAt: null` — la forge a répondu, et sa réponse est « aucune »"
+        );
+        assert_eq!(
+            classify_absent_branch(probe),
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            }
+        );
+        match classify_promotion(
+            &StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            },
+            Some(BRANCH_2680),
+            50,
+        ) {
+            PromotionGate::Refuse(r @ RefusalReason::BranchAbsent { .. }) => {
+                assert_eq!(r.slug(), "branch_absent_on_origin");
+                assert!(r.reason(2680).contains("n'existe pas sur `origin`"));
+            }
+            other => panic!("AC4 attend le refus d'aujourd'hui, obtenu {other:?}"),
+        }
+    }
+
+    /// Les trois conditions par entrée, chacune par son contre-exemple — plus
+    /// l'asymétrie par entrée et l'indépendance de l'argmax à l'ordre.
+    #[test]
+    fn mika2837_les_trois_conditions_sont_necessaires() {
+        let into_feature = r#"[{"number":1,"state":"MERGED","mergedAt":"2026-10-20T06:10:45Z",
+          "baseRefName":"feat/parent","headRefName":"fix/2108/x"}]"#;
+        assert_eq!(
+            parse_merged_pr_for_branch(into_feature, "fix/2108/x").unwrap(),
+            None,
+            "mergée dans une branche de feature : le plan n'est pas sur `main`, \
+             et `main` est d'où le pilote repartirait"
+        );
+
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2108, BRANCH_2680).unwrap(),
+            None,
+            "`--head` est un filtre de la forge ; la condition se vérifie ici"
+        );
+
+        // Une entrée malformée ne prouve rien — et ne fait pas perdre les
+        // autres. Deux formes : le champ qui manque, et le `mergedAt` qui ne se
+        // parse pas. La seconde est la seule qui pourrait être prise pour un
+        // merge si on ne lisait que la non-nullité.
+        let mixed = r#"[
+          {"state":"MERGED","mergedAt":"2026-10-20T06:10:45Z","baseRefName":"main","headRefName":"fix/2108/x"},
+          {"number":2,"state":"MERGED","mergedAt":"hier","baseRefName":"main","headRefName":"fix/2108/x"},
+          {"number":3,"state":"MERGED","mergedAt":"2026-10-18T10:00:00Z","baseRefName":"main","headRefName":"fix/2108/x"}
+        ]"#;
+        assert_eq!(
+            parse_merged_pr_for_branch(mixed, "fix/2108/x")
+                .unwrap()
+                .map(|e| e.number),
+            Some(3),
+            "l'entrée sans `number` et celle au `mergedAt` illisible sont \
+             ignorées ; la troisième garde sa preuve"
+        );
+
+        // L'argmax ne doit rien devoir à l'ordre de `gh pr list`, qui n'est pas
+        // contractuel : la même paire dans les deux sens rend le même numéro.
+        let ascending = r#"[
+          {"number":10,"state":"MERGED","mergedAt":"2026-10-18T10:00:00Z","baseRefName":"main","headRefName":"fix/2108/x"},
+          {"number":11,"state":"MERGED","mergedAt":"2026-10-20T06:10:45Z","baseRefName":"main","headRefName":"fix/2108/x"}
+        ]"#;
+        assert_eq!(
+            parse_merged_pr_for_branch(ascending, "fix/2108/x")
+                .unwrap()
+                .map(|e| e.number),
+            Some(11)
+        );
+    }
+
+    /// AC3 — on ne promeut pas sur une absence de preuve.
+    ///
+    /// La charge illisible rend une `Err`, jamais un `Ok(None)` : confondre les
+    /// deux ferait d'une panne de la forge une promotion.
+    #[test]
+    fn mika2837_un_json_illisible_est_une_erreur_jamais_une_absence() {
+        assert!(parse_merged_pr_for_branch("ceci n'est pas du JSON", BRANCH_2108).is_err());
+        assert!(
+            parse_merged_pr_for_branch("{}", BRANCH_2108).is_err(),
+            "la réponse de `gh pr list` est un tableau ; un objet n'en est pas un"
+        );
+        assert_eq!(
+            classify_absent_branch(Err(anyhow!("gh pr list failed: HTTP 502"))),
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::Unreadable,
+            },
+            "AC3 — le refus, et sous un nom qui se compte seul"
+        );
     }
 }
