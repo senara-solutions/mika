@@ -231,6 +231,15 @@ Pas de `fn notify_fabrication_detected(...)`. Trois raisons :
   formes pour le même geste à deux cents lignes d'écart, c'est la divergence qu'une relecture
   future paierait.
 
+*Amendement à la revue (finding P2) :* l'appel direct est conservé, mais il est **différé**.
+Six gardes en aval de la branche peuvent encore refuser la clôture après la récidive, et une P0
+envoyée au constat porterait alors sur une réponse qui n'est jamais sortie. La notification est
+mise de côté (`pending_fabrication_p0`) et envoyée au point d'acceptation de l'`EndTurn`, juste
+avant la télémétrie #953, après revérification de la revendication sur le texte accepté. Le
+`warn!` reste au constat. Le test positif d'origine passait lui-même par ce défaut : la relance
+de persistance `store_fact` reprenait la main après la récidive. Tests ajoutés ou corrigés : voir
+l'en-tête de `test_fabrication_detected_p0_2867.rs` (recette R5).
+
 ### D6 — Un verrou par tour : l'opérateur est réveillé une fois, pas une fois par pas
 
 La branche vit dans la boucle de pas de `run_loop`. Un autre garde qui re-prompte au même pas fait

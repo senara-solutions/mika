@@ -9040,10 +9040,25 @@ telle quelle — avant mika#2867, en silence. Désormais :
 | moitié | état livré | effet |
 |---|---|---|
 | `warn!` `guard.assert_grounded_uncorrected` (cible `mika::otel`) | **armé**, inconditionnel | une ligne par tour au plus, champs `trace_id`, `agent_id`, `session_id`, `step`, `resource_type`, `resource_ref`, `claim`, `label` |
-| notification à l'opérateur via `send_with_severity(…, P0)` | **désarmé** | avec la porte ouverte, part sur `MIKA_OPERATOR_ESCALATION_CHAT_ID` (voir l'entrée mika#1381 ci-dessus), texte préfixé `Fabrication detected (uncorrected)` |
+| notification à l'opérateur via `send_with_severity(…, P0)` | **désarmé** | avec la porte ouverte, part par le routage P0 de mika#1381 (entrée ci-dessus), texte préfixé `Fabrication detected (uncorrected)` |
 
 La première prise (le garde tire, l'agent se corrige) ne produit **ni** l'une **ni**
 l'autre : c'est le travail nominal du garde, pas un incident.
+
+**Le `warn!` est écrit au constat, la notification à la sortie.** D'autres gardes, en
+aval de celle-ci, peuvent encore refuser la clôture après la récidive. La notification
+n'est donc envoyée qu'au moment où l'`EndTurn` est accepté, et seulement si le texte
+accepté porte encore une revendication non ancrée. Une récidive suivie d'une clôture
+corrigée produit donc une ligne de sonde 1 **sans** notification. Ce n'est pas une
+porte qui fuit.
+
+**Où la notification arrive, et où elle ne peut pas partir.** En P0, le transport vise
+`MIKA_OPERATOR_ESCALATION_CHAT_ID`. **Si cette variable est absente, il retombe sur le
+chat normal de l'agent**, avec le WARN `operator_escalation_chat_unset` : sur un
+tenant, c'est le chat de l'utilisateur final, qui recevrait un message d'opérateur.
+Les tours sans transport sortant n'envoient rien, porte ouverte ou non : le mode
+équipe, l'A2A et `investigate` construisent leur contexte avec `message_sender: None`.
+La porte est résolue sur ces chemins, mais rien ne peut en sortir, et rien ne le dit.
 
 **Pourquoi désarmé.** La fréquence réelle de la récidive n'a pas été mesurée sur le
 trafic : une classe P0 qui tirerait à chaque re-prompt d'ancrage rendrait la surface
@@ -9073,9 +9088,11 @@ binaire postérieur à mika#2867, est le résultat attendu, pas une panne.
 
 #### Condition d'armement
 
-Armer (`MIKA_FABRICATION_P0_NOTIFY=true`, puis redémarrer) **seulement** après au moins
-7 jours de relevé des deux sondes, et seulement si la colonne 1 tient sous un seuil
-que ce relevé rend défendable pour une surface jamais muette. Ce relevé et la décision
+Armer (`MIKA_FABRICATION_P0_NOTIFY=true`, puis redémarrer) **seulement** sur un
+déploiement où `MIKA_OPERATOR_ESCALATION_CHAT_ID` est posé (sinon, voir ci-dessus :
+la P0 part chez l'utilisateur), après au moins 7 jours de relevé des deux sondes, et
+seulement si la colonne 1 tient sous un seuil que ce relevé rend défendable pour une
+surface jamais muette. Ce relevé et la décision
 sont portés par le ticket de suivi d'armement nommé dans le corps de la PR de mika#2867.
 Les six autres sites `_uncorrected` de la famille ne sont **pas** rattachés à cette
 classe : c'est un second suivi, une décision par site.
