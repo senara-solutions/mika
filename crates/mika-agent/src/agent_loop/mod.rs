@@ -1650,6 +1650,12 @@ async fn run_loop(
     // incident. Le verrou couvre les deux : un P0 dupliqué érode la surface
     // jamais muette aussi sûrement qu'un P0 trop fréquent.
     let mut assert_grounded_uncorrected_notified = false;
+    // mika#2867 — la notification P0 de la récidive, différée jusqu'à
+    // l'acceptation de l'`EndTurn`. Les gardes en aval de la branche (6e, 6f,
+    // #1313, #864, #901, #2037) peuvent encore refuser la clôture : la réponse
+    // qui a récidivé ne sortirait alors jamais, et la notification dirait le
+    // contraire. Rempli seulement porte ouverte, consommé une fois.
+    let mut pending_fabrication_p0: Option<String> = None;
     // Guard telemetry correlation (#953). Set by any fabrication-class guard firing
     // (last-writer-wins); consumed on the next successful EndTurn to emit a paired
     // `guard.correction_accepted` event with `corrected_content`.
@@ -3733,8 +3739,8 @@ async fn run_loop(
                             "Assert-grounded guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
-                        if fabrication_p0_notify && let Some(ref sender) = tool_ctx.message_sender {
-                            let notification = format!(
+                        if fabrication_p0_notify {
+                            pending_fabrication_p0 = Some(format!(
                                 "Fabrication detected (uncorrected) on {} {}: the \
                                  assert-grounded guard fired and the re-prompt budget \
                                  is spent, yet the response still claims «{}» with no \
@@ -3744,14 +3750,7 @@ async fn run_loop(
                                 claim.resource_ref,
                                 claim.claim_text,
                                 tool_ctx.trace_id,
-                            );
-                            // L'étage est en seconde position et sans défaut : la
-                            // classe `fabrication-detected` de mika#1381 est P0
-                            // parce que la fabrication a franchi la garde et
-                            // atteint l'opérateur — rien d'aval ne le dira.
-                            let _ = sender
-                                .send_with_severity(&notification, NotificationSeverity::P0)
-                                .await;
+                            ));
                         }
                     }
 
@@ -4445,6 +4444,25 @@ async fn run_loop(
                         )
                         .await?;
                     }
+                    // mika#2867 — l'envoi différé de la récidive d'ancrage. Ici
+                    // l'`EndTurn` a passé toutes les gardes : la réponse sort. La
+                    // revendication est revérifiée sur le texte accepté, parce
+                    // qu'une garde aval a pu re-prompter et obtenir une réponse
+                    // qui ne la porte plus.
+                    if let Some(notification) = pending_fabrication_p0.take()
+                        && detect_affirmative_state_claim(&text)
+                            .is_some_and(|c| !assert_grounded_satisfied(&c, &all_tool_summaries))
+                        && let Some(ref sender) = tool_ctx.message_sender
+                    {
+                        // L'étage est en seconde position et sans défaut : la
+                        // classe `fabrication-detected` de mika#1381 est P0
+                        // parce que la fabrication a franchi la garde et
+                        // atteint l'opérateur — rien d'aval ne le dira.
+                        let _ = sender
+                            .send_with_severity(&notification, NotificationSeverity::P0)
+                            .await;
+                    }
+
                     // #953 — Guard correction telemetry. When a guard fired on a
                     // previous step and the current EndTurn passes all guards, emit
                     // a paired correction event with the accepted content.

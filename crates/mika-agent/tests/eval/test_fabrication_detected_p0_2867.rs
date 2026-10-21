@@ -91,18 +91,19 @@ const AFFIRMATION_NON_ANCREE: &str = "I've verified that PR #100 has been merged
 /// La séquence de récidive : le tour 1 fait tirer la garde 6d, le tour 2
 /// réaffirme à l'identique avec le budget épuisé.
 ///
-/// Un troisième tour bénin suit : la branche `_uncorrected` ne re-prompte pas,
-/// donc il n'est normalement pas consommé — il est là pour qu'une garde voisine
-/// qui reprendrait la main ne fasse pas échouer le test sur une séquence
-/// épuisée plutôt que sur la propriété mesurée.
+/// **Le troisième tour réaffirme encore, et il est consommé.** Après la
+/// récidive, la relance de persistance (`store_fact`, déclenchée par « verified
+/// that ») reprend la main une fois. La réponse acceptée est donc la troisième.
+/// Elle doit porter la même revendication, sinon la réponse qui a récidivé ne
+/// sort jamais et aucune P0 ne doit partir : c'est le cas que tient
+/// `mika2867_une_garde_aval_qui_reprend_la_main_annule_la_p0`. Cette fixture
+/// a d'abord porté un troisième tour bénin, et le test positif passait alors
+/// sur une P0 envoyée pour une réponse qui n'était jamais sortie.
 fn recidive_dancrage() -> Vec<MockResponse> {
     vec![
         text_response(AFFIRMATION_NON_ANCREE),
         text_response(AFFIRMATION_NON_ANCREE),
-        text_response(
-            "I need to call run_gh to check the actual state of PR #100 \
-             before reporting its status.",
-        ),
+        text_response(AFFIRMATION_NON_ANCREE),
     ]
 }
 
@@ -242,6 +243,68 @@ async fn mika2867_porte_fermee_le_transport_nobserve_rien() -> anyhow::Result<()
          site ignore sa porte. Émissions = {:?}",
         fabrications.len(),
         emissions
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Une garde aval reprend la main après la récidive : rien ne part
+// ---------------------------------------------------------------------------
+
+/// La récidive est constatée, puis une garde **en aval** de la branche (6f,
+/// l'envoi mort non reconnu) refuse encore l'`EndTurn`, et la réponse finale ne
+/// revendique plus rien. Aucune P0 ne doit partir : la réponse qui a récidivé
+/// n'est jamais sortie, et la notification dirait le contraire (« The answer
+/// went out »).
+///
+/// Ce test tient le report de l'envoi au point d'acceptation de l'`EndTurn` :
+/// un site qui enverrait au moment où la branche constate la récidive émet ici
+/// une notification, et ce test rougit.
+#[tokio::test]
+async fn mika2867_une_garde_aval_qui_reprend_la_main_annule_la_p0() -> anyhow::Result<()> {
+    let sender = SeverityRecordingSender::new();
+    let document = "D".repeat(12_000);
+
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Pas 1 : un envoi refusé par la garde de longueur (mika#2134). Il
+            // arme la garde 6f pour la suite du tour.
+            tool_call_response("send_message", serde_json::json!({ "text": document })),
+            // Pas 2 : la revendication non ancrée. La garde 6d tire.
+            text_response(AFFIRMATION_NON_ANCREE),
+            // Pas 3 : la récidive. La branche la constate, puis 6f refuse la
+            // clôture sur l'envoi mort.
+            text_response(AFFIRMATION_NON_ANCREE),
+            // Pas 4 : la clôture acceptée, sans revendication d'état.
+            text_response("I could not deliver the document; it was too long to send."),
+        ])
+        .message_sender(sender.clone())
+        .fabrication_p0_notify(true)
+        .build()
+        .await?;
+
+    let trace = harness.run("Check if PR #100 has been merged").await?;
+
+    // Le scénario a bien atteint la forme visée : 6d, puis 6f après la
+    // récidive, puis la clôture. Moins de quatre appels voudrait dire que la
+    // branche ou 6f n'a pas été atteinte, et le zéro ci-dessous ne prouverait
+    // rien.
+    assert_eq!(
+        trace.llm_call_count, 4,
+        "attendu 4 appels (outil, 6d, récidive puis 6f, clôture), observé {}",
+        trace.llm_call_count
+    );
+
+    let emissions = sender.emissions();
+    let fabrications: Vec<&Emission> = emissions
+        .iter()
+        .filter(|(text, _)| text.contains(NOTIFICATION_MARKER))
+        .collect();
+    assert!(
+        fabrications.is_empty(),
+        "la réponse qui a récidivé n'est jamais sortie (6f a repris la main), et \
+         une P0 est pourtant partie : {fabrications:?}"
     );
 
     Ok(())
