@@ -136,6 +136,14 @@ Which *engine* owns a ticket while it is being written on: the autonomous loop, 
 
 The loop's own `dispatch:loop` label, stamped by dispatch-lib when it takes a ticket and released before the callback that lets the next dispatch start, with the exit trap as crash/cancel backstop. A live claim, not a provenance: between two dispatches an unclaimed ticket reads as unlabelled, and a human seat may take it. Stale only when a run died without its trap; the next dispatch on that ticket reads it as already owned, does not re-stamp, and releases it on its own way out.
 
+## Operator notifications
+
+### Severity tier
+
+The urgency a notification to the operator declares, which decides where it lands: the top tier means *the loop is dead and a human must step in*, and is routed to a surface the operator is not expected to mute when one is configured (otherwise to the ordinary chat, with a warning), while the routine tier goes to the ordinary chat. The discipline is that every notification site names its tier explicitly, through a helper that has no default, so that "forgot to classify it" is not a state a site can reach; a tierless send path still exists underneath and falls to the routine tier.
+
+A site that sends without a tier still delivers — to the ordinary chat — and reports success, so a lost tier produces no error anywhere; it is caught only by observing, at the transport, which tier actually arrived. Whether a notification *went out* is a separate fact from which tier it named: a count of notifications sent must be taken from the delivery outcome, never from the fact that a send was attempted.
+
 ## Flagged ambiguities
 
 - *Guard* had been used for both a structural CI check and an in-process runtime assertion. In this glossary **structural guard** names the CI-enforced kind; a runtime assertion is not one.
