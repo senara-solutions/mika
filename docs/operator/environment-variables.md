@@ -9028,6 +9028,58 @@ rejoue des envois dont la destination est déjà figée. *(c)* Rien n'arrive nul
 et `send_message_nochannel` porte `severity = "p0"` → l'agent n'a aucun canal du
 tout ; la variable n'y changera rien, c'est `chat_id` qu'il faut configurer.
 
+### La récidive d'ancrage se nomme, et sa notification P0 est livrée désarmée (mika#2867)
+
+Optional (classe `fabrication-detected` de mika#1381) :
+- `fabrication_p0_notify` (`config.toml`) / `MIKA_FABRICATION_P0_NOTIFY` — arme la notification **P0** de la récidive du garde `assert_grounded` (#1331). **Défaut : `false`.** Résolue aux trois points d'entrée de `run_loop` (conversation, silencieux, équipe) par `is_some_and` : un appelant sans `Settings` laisse la porte **fermée**. Délibérément absente de `SETTABLE_CONFIG_KEYS` : un agent ne peut pas l'armer depuis une conversation. Lisible par `mika config get fabrication_p0_notify`. Lue au démarrage, comme le reste de `Settings` : l'armer demande un redémarrage, pas un déploiement.
+
+**Ce qui est armé, et ce qui ne l'est pas.** Le garde accorde **un** re-prompt. Si la
+seconde réponse réaffirme un état système qu'aucun appel d'outil n'ancre, elle part
+telle quelle — avant mika#2867, en silence. Désormais :
+
+| moitié | état livré | effet |
+|---|---|---|
+| `warn!` `guard.assert_grounded_uncorrected` (cible `mika::otel`) | **armé**, inconditionnel | une ligne par tour au plus, champs `trace_id`, `agent_id`, `session_id`, `step`, `resource_type`, `resource_ref`, `claim`, `label` |
+| notification à l'opérateur via `send_with_severity(…, P0)` | **désarmé** | avec la porte ouverte, part sur `MIKA_OPERATOR_ESCALATION_CHAT_ID` (voir l'entrée mika#1381 ci-dessus), texte préfixé `Fabrication detected (uncorrected)` |
+
+La première prise (le garde tire, l'agent se corrige) ne produit **ni** l'une **ni**
+l'autre : c'est le travail nominal du garde, pas un incident.
+
+**Pourquoi désarmé.** La fréquence réelle de la récidive n'a pas été mesurée sur le
+trafic : une classe P0 qui tirerait à chaque re-prompt d'ancrage rendrait la surface
+jamais muette muette en pratique (« alarm-into-void », mika#1381). Le `warn!` **est**
+l'instrument de cette mesure.
+
+#### Sondes de comptage
+
+```sh
+# 1. La récidive, par jour (la population que l'armement enverrait en P0)
+grep guard.assert_grounded_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.assert_grounded_uncorrected") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# 2. CONTRÔLE POSITIF — la première prise, par jour (instrumentée depuis #953)
+grep guard.assert_grounded "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.assert_grounded") | .timestamp' \
+  | cut -c1-10 | uniq -c
+```
+
+Le `select` sur `.event` est porteur : le `grep` de la sonde 2 est une sous-chaîne et
+rend aussi les lignes de la sonde 1. La colonne 1 est un sous-ensemble de la colonne 2.
+Une sonde 2 vide sur plusieurs jours de trafic veut dire que le garde ne tire pas,
+**ou** que le binaire servi est antérieur à #953 : dans ce cas, la sonde 1 vide ne
+prouve rien. Une sonde 1 sans aucune ligne alors que la sonde 2 en a beaucoup, sur un
+binaire postérieur à mika#2867, est le résultat attendu, pas une panne.
+
+#### Condition d'armement
+
+Armer (`MIKA_FABRICATION_P0_NOTIFY=true`, puis redémarrer) **seulement** après au moins
+7 jours de relevé des deux sondes, et seulement si la colonne 1 tient sous un seuil
+que ce relevé rend défendable pour une surface jamais muette. Ce relevé et la décision
+sont portés par le ticket de suivi d'armement nommé dans le corps de la PR de mika#2867.
+Les six autres sites `_uncorrected` de la famille ne sont **pas** rattachés à cette
+classe : c'est un second suivi, une décision par site.
+
 ### Lire un hang LLM « 420 s sans octet » (mika#2331)
 
 - **Ce que la mesure a déplacé, deux fois.** Le ticket demandait un retry 1× sur échec transport, d'abord dans `_arch_ask`, puis « au client LLM moteur ». La lecture du code le déplace une troisième fois : **ce retry existe déjà** sur le rail qui porte 100 % des hangs listés (glm-5.3/OpenRouter, glm-5.3/Z.AI, kimi/OpenRouter passent tous par `OpenAiCompatibleProvider`). `LlmError::Transport` y est retryable **sans condition** depuis mika#2015, et `LlmTimeoutBudget::max_attempts` borne la chaîne à **2** pour la géométrie de flotte 120/300. Le correctif principal demandé ne peut donc pas être la cause du groom perdu. **Et 420 s n'est un multiple d'aucun budget du code** : 120/300 donne ≈240 s, 240/900 ≈721 s, 120/900 ≈483 s. Le nombre n'est expliqué par aucune guillotine connue — ce qui invalide symétriquement les deux remèdes proposés tant qu'on ne sait pas si la chaîne a tourné une ou quatre fois.
