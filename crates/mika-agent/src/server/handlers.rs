@@ -2126,6 +2126,33 @@ pub(super) async fn run_agent_for_message(
     let run = agent::run_agent(&params).await;
     post_verdict_if_turn_did_not_conclude(state, a, conclusion_of(&run), &req, &session_id).await;
 
+    // mika#2855 — le second terme du registre des tours webhook. UN SEUL SITE,
+    // et il voit les deux branches : sur `Err` il n'existe aucun `AgentOutput`,
+    // donc aucun texte, donc `outcome_absent` — un tour mort n'a rien attesté,
+    // et c'est vrai. Émettre dans les deux bras du `match` donnerait deux
+    // écrivains pour une ligne, et le prochain éditeur qui ajoute un bras en
+    // oublierait un.
+    //
+    // Après `run_agent`, donc structurellement incapable d'influer sur le
+    // pré-filtre (AC5) : la porte a rendu son `Gate` cent lignes plus haut.
+    // Avant l'envoi sur le canal, comme le filet ci-dessus et pour la même
+    // raison — ce qui est mesuré ne doit pas dépendre de la réussite d'une
+    // délivrance, et un tour webhook est `NoChannel` de toute façon.
+    //
+    // Le périmètre est le même que celui de la ligne d'entrée, donc les deux
+    // moitiés du registre portent sur la même population : c'est la condition
+    // pour que la jointure par `request_id` soit complète. Le texte n'est PAS
+    // nettoyé du marqueur — il n'est délivré à personne, et un strip serait une
+    // mutation du texte que le filet mika#2276 et `undelivered_send_line`
+    // lisent juste après.
+    if original_github_text.is_some() {
+        super::webhook_turn_outcome::emit_turn_outcome(
+            a.db.agent_id(),
+            &req.request_id,
+            run.as_ref().ok().and_then(|o| o.text.as_deref()),
+        );
+    }
+
     match run {
         Ok(mut output) => {
             // mika#2136 — l'aveu que le moteur écrit lui-même. Placé ici, dans

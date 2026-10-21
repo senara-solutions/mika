@@ -345,3 +345,105 @@ jugement sur ce que le tour fait, pas sur ce qu'il coûte. Le § 7 le tranche d�
 en une phrase — *une classe dont le chiffre est significatif mais dont la
 question reste ouverte ne s'implémente pas : elle se pose à l'opérateur.* Elle
 est posée dans le corps de PR du vol 3.
+
+## 10. (g′) — l'axe `outcome`, et ce que la prochaine fenêtre chiffrera (mika#2855)
+
+Le § 9 laisse (g) **bloquée par la mesure**, et nomme les deux termes qui
+manquent. Le vol 5 a livré le premier : la cellule `mika-qa ×
+check_suite_pr_branch × head_not_previously_decided` donne le plafond, au grain
+où (g) se décide. Le second — *que fait mika-qa de ce tour ?* — ne se lisait
+nulle part : le registre dit qu'un tour a eu lieu, ce qu'il a coûté et sous quel
+terme la porte l'a relâché, jamais **ce qu'il a fait**. Or dans (g) seuls les
+arrêts précoces du skill `qa-review-webhook-success` seraient filtrables, et leur
+nombre était inconnu.
+
+**mika#2855 est le vol d'instrument qui ouvre cet axe. Il n'écarte aucun tour.**
+
+### L'axe existe : une seconde ligne, jointe par `request_id`
+
+`webhook_turn_charged` est émise **avant** le tour — son message dit « le tour a
+lieu » — donc elle ne peut structurellement pas porter une issue qui n'existe pas
+encore. Le vol 1 de mika#2855 ajoute un **second terme du registre**, émis en fin
+de tour :
+
+| | événement | émis | porte |
+|---|---|---|---|
+| entrée | `webhook_turn_charged` | avant `run_agent` | `agent_id`, `request_id`, `trigger`, `release`, `candidate`, `text_touched`, `prefilter_enabled` |
+| sortie | `webhook_turn_outcome` | après `run_agent` | `agent_id`, `request_id`, `outcome` |
+
+Les deux moitiés portent le **même périmètre** — tout tour webhook GitHub
+facturé — et le même `request_id`, qui est la clé de jointure. `release` et
+`outcome` sont par conséquent orthogonaux par construction : un tour relâché sous
+`state_unreadable` porte aussi son issue, et le croisement des deux axes est ce
+que la réserve de Mika Prime (AC3 de mika#2855) demande de pouvoir lire.
+
+**`outcome` est attesté par le modèle, jamais déduit de la trace d'outils.** Le
+prompt du skill impose une ligne finale `Webhook-Outcome: <valeur>` sur chaque
+issue, les arrêts compris ; le moteur lit la **dernière** occurrence du marqueur
+et la valide contre un contrat fermé de six termes. Une déduction était
+impossible : les arrêts 1 et 2 laissent la même trace d'outils, et 3 et 4 aussi
+— deux populations sous un nom, non soustractibles (classe mika#2205). Deux
+termes supplémentaires nomment les défauts de l'attestation elle-même :
+
+| valeur | ce qu'elle dit |
+|---|---|
+| `stop_no_open_pr` | arrêt 1 — aucune PR ouverte sur la tête du `check_suite` |
+| `stop_out_of_scope` | arrêt 2 — repo, auteur ou état de PR hors périmètre |
+| `stop_already_reviewed_sha` | arrêt 3 — une revue de mika-qa porte déjà ce `commit_id` |
+| `stop_verdict_recorded` | arrêt 4 — un verdict d'autorité est déjà sur la tête |
+| `review` | le skill `qa-review` a été appelé |
+| `review_failed` | la revue n'a pas pu se faire ; opérateur notifié, tâche `blocked` |
+| `outcome_absent` | **le tour n'a rien attesté** — jamais un arrêt deviné |
+| `outcome_unreadable` | une ligne était là, sa valeur est hors contrat |
+
+`outcome_absent` et `outcome_unreadable` ne sont atteignables par **aucun** texte
+du modèle : ce sont des termes du moteur, et c'est une propriété du type (deux
+énumérations, une pour ce que le modèle peut écrire, une pour ce qui part sur le
+fil). Un tour qui n'atteste rien coûte quand même ses tokens ; il ne dit
+simplement plus ce qu'ils ont acheté.
+
+### Comment il se lira, une fois le vol 2 livré
+
+Le vol 1 met la ligne dans le journal. `scripts/measure-webhook-turn-cost` ne la
+joint **pas encore** : aujourd'hui elle se lit au `grep`, et la jointure
+automatique est le vol 2 (seau `by_agent_trigger_release_outcome`, tours sans
+ligne de sortie comptés à part sans être perdus ni fusionnés, corpus gelé mêlant
+`state_unreadable` et un arrêt propre). C'est la même séquence que mika#2680 a
+elle-même suivie — vol 1 le registre, vol 2 le lecteur.
+
+**Ce que la prochaine fenêtre chiffrera (AC6 de mika#2855) :** sur la cellule
+`mika-qa × check_suite_pr_branch` — 36 tours, 10 687 327 tokens d'entrée, 16,31 %
+de la fenêtre mesurée — la **part des arrêts par numéro**. Soit, pour chacune des
+quatre valeurs `stop_*` : son compte de tours et son coût en tokens, à retrancher
+du plafond que le vol 5 a rendu lisible. Les tours sous `review` ne sont pas des
+candidats au filtrage : ils sont l'unique entrée autonome de la revue QA sur CI
+vert, et la porte mika#2260 les préserve exprès. Les tours sous `outcome_absent`
+ne sont candidats à **rien** : ils sont la mesure de la fiabilité de
+l'attestation, et c'est leur taux qui décidera s'il faut armer la garde
+`[output].required_suffix_lines` (EndTurn #864) — délibérément non armée par le
+vol 1, parce qu'une re-sollicitation est un appel LLM supplémentaire sur le tour
+même que l'instrument mesure.
+
+### Contrôle positif — l'absence de la ligne est un binaire, pas une issue
+
+**Une fenêtre antérieure au déploiement ne porte aucune ligne
+`webhook_turn_outcome`, et cela ne veut pas dire que ses tours n'ont pas eu
+d'issue.** C'est le motif mika#2340, et il est plus tranchant ici que pour
+`release` : le champ `release` manquant se lit sous `absent_pre_field` parce que
+la ligne existe et qu'il suffit de regarder dedans ; ici c'est la **ligne entière**
+qui manque. Un lecteur qui compterait ces tours sous `outcome_absent` écraserait
+deux populations de sens opposé — *« le modèle n'a pas attesté »* et *« le binaire
+servi ne sait pas demander »*. D'où le compte à part du vol 2, et d'où cette
+sonde :
+
+```sh
+grep -F webhook_turn_outcome "$MIKA_SPIRIT_LOG_FILE" | head
+```
+
+Elle doit rendre une ligne après le premier `check_suite` vert servi à mika-qa
+**par un binaire postérieur à `make deploy`**. `skills/bundled/` est lu au
+**build** (`build.rs` → `BUNDLED_SKILL_MANIFESTS`), puis ensemencé
+(`seed_bundled_skills_if_needed`), puis lu au tour suivant : la ligne du prompt
+n'existe pour aucun agent avant ce rebuild. Un silence de la sonde se lit donc
+dans cet ordre — d'abord *quel binaire tourne*, ensuite seulement *ce que les
+tours ont attesté*.
