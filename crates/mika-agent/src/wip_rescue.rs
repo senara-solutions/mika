@@ -3880,15 +3880,18 @@ mod tests {
     ///
     /// Les agents du moteur d'équipes portent délibérément
     /// `message_sender: None`, et le CLI aussi : l'absence de rail est un état
-    /// légitime, pas une panique. Ce que ce test tient, c'est l'absence de
-    /// perte silencieuse côté appelant ; le WARN
+    /// légitime, pas une panique. Le WARN
     /// `recovery_runbook_notification_unroutable` est la trace, et il existe
     /// parce que sans lui « aucun bail » et « un bail sans rail » rendent des
-    /// octets identiques (classe mika#2205).
+    /// octets identiques (classe mika#2205). Le test l'observe dans les octets
+    /// rendus : sans assertion, supprimer le WARN le laisserait vert.
+    ///
+    /// Le contrôle négatif est dans le même test : un skip sans rail ne doit
+    /// pas émettre la ligne, sinon elle ne nommerait plus un bail.
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2866_un_bail_sans_rail_est_nomme() {
-        notify_if_bailed(
+        let journal = journal_de(
             None,
             5150,
             &ChainOutcome::Bailed {
@@ -3897,6 +3900,36 @@ mod tests {
             },
         )
         .await;
+        let lignes: Vec<&str> = journal
+            .lines()
+            .filter(|l| l.contains("recovery_runbook_notification_unroutable"))
+            .collect();
+        assert_eq!(
+            lignes.len(),
+            1,
+            "un bail sans rail doit émettre exactement un \
+             `recovery_runbook_notification_unroutable` ; journal : {journal:?}"
+        );
+        assert!(
+            lignes[0].contains("WARN") && lignes[0].contains("pr_number=5150"),
+            "la ligne doit être un WARN portant la PR ; ligne : {:?}",
+            lignes[0]
+        );
+        assert!(
+            !journal.contains("recovery_runbook_notified"),
+            "sans rail, rien n'est parti ; journal : {journal:?}"
+        );
+
+        let journal = journal_de(
+            None,
+            5150,
+            &ChainOutcome::Skipped("no checkout".to_string()),
+        )
+        .await;
+        assert!(
+            !journal.contains("recovery_runbook_notification_unroutable"),
+            "un skip n'est pas un bail et ne doit rien nommer ; journal : {journal:?}"
+        );
     }
 
     /// AC6 — `recovery_runbook_notified` ne compte qu'un P0 **délivré**.
