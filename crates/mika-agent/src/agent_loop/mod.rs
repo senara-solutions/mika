@@ -1477,6 +1477,21 @@ async fn run_loop(
     qa_verdict_unmet: Option<&crate::qa_build_callback::VerdictSignal>,
     store_llm_calls: bool,
     store_tool_calls: bool,
+    // mika#2867 — la porte de la classe `fabrication-detected`. `false` par
+    // défaut et résolue chez les trois appelants depuis `Settings`
+    // (`fabrication_p0_notify`) : un `Settings` absent laisse la porte fermée,
+    // donc un appelant qui n'en a pas n'arme rien.
+    //
+    // Un paramètre sur le modèle de `store_llm_calls` plutôt qu'un champ de
+    // `ToolContext` : c'est un fait de *tour* lu par un seul garde, pas une
+    // capacité dont les outils ont besoin — et `ToolContext` compte une
+    // vingtaine de sites de construction que cela ferait tous bouger.
+    //
+    // Elle ne garde que la *notification*. La détection et le `warn!` de
+    // récidive sont armés inconditionnellement : ce `warn!` est l'instrument de
+    // comptage qui doit précéder l'armement (mika#1574, et le diagnostic
+    // « alarm-into-void » de mika#1381).
+    fabrication_p0_notify: bool,
     prompt_variant: Option<&str>,
     internal: bool,
     deadline: Instant,
@@ -1627,6 +1642,14 @@ async fn run_loop(
     // mika#2037 — review-anchor guard. Independent of the flags above: an F-list
     // re-prompt must not consume the anchor guard's single corrective attempt.
     let mut review_anchor_retry_done = false;
+    // mika#2867 — la récidive d'ancrage a été observée une fois sur ce tour.
+    // Même forme que les verrous ci-dessus, et pour la même raison : la branche
+    // `assert_grounded_uncorrected` est évaluée à chaque `EndTurn`, et un tour
+    // qui repasse par là (une autre garde ayant repris la main entre-temps)
+    // émettrait un second `warn!` et une seconde notification pour un seul
+    // incident. Le verrou couvre les deux : un P0 dupliqué érode la surface
+    // jamais muette aussi sûrement qu'un P0 trop fréquent.
+    let mut assert_grounded_uncorrected_notified = false;
     // Guard telemetry correlation (#953). Set by any fabrication-class guard firing
     // (last-writer-wins); consumed on the next successful EndTurn to emit a paired
     // `guard.correction_accepted` event with `corrected_content`.
@@ -3660,6 +3683,76 @@ async fn run_loop(
                             )),
                         });
                         continue;
+                    }
+
+                    // mika#2867 — le résidu du budget de 6d, nommé, et le
+                    // premier site d'émission de la classe `fabrication-detected`
+                    // de mika#1381.
+                    //
+                    // **Ce que le prédicat dit.** `intent_guard_retries` contient
+                    // déjà le label, donc la garde ci-dessus a tiré sur ce tour et
+                    // son unique re-prompt est dépensé ; le détecteur est rejoué,
+                    // donc la *seconde* réponse affirme encore un état que rien
+                    // n'ancre. C'est la récidive, pas la première prise — une
+                    // garde qui tire et corrige fait son travail nominal, et le
+                    // ticket le pose en préalable : le prédicat devait être *la
+                    // fabrication qui survit à la garde*. La première prise est
+                    // structurellement inatteignable ici : `continue` plus haut.
+                    //
+                    // **Pas de second re-prompt.** La famille mika#953 accorde un
+                    // budget de un, et une garde qui en divergerait deviendrait
+                    // celle qu'on relit pour comprendre pourquoi. La réponse sort ;
+                    // ce que ce bloc ajoute, c'est qu'elle ne sort plus en silence.
+                    //
+                    // **Le `warn!` est armé, la notification non.** Le `warn!` est
+                    // l'instrument qui mesure la fréquence réelle de la récidive,
+                    // et cette mesure doit précéder l'armement : une classe P0 qui
+                    // tirerait sur chaque re-prompt d'ancrage rendrait
+                    // `MIKA_OPERATOR_ESCALATION_CHAT_ID` muette en pratique, le
+                    // diagnostic « alarm-into-void » de mika#1381 vu par l'autre
+                    // bout. Porte : `MIKA_FABRICATION_P0_NOTIFY`, défaut `false`
+                    // (mika#1574, option (b) — livrer désarmé).
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)
+                        && !assert_grounded_uncorrected_notified
+                        && let Some(claim) = detect_affirmative_state_claim(&text)
+                        && !assert_grounded_satisfied(&claim, &all_tool_summaries)
+                    {
+                        assert_grounded_uncorrected_notified = true;
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            resource_type = claim.resource_type,
+                            resource_ref = %claim.resource_ref,
+                            claim = %claim.claim_text,
+                            label = mode.label(),
+                            event = "guard.assert_grounded_uncorrected",
+                            "Assert-grounded guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                        if fabrication_p0_notify && let Some(ref sender) = tool_ctx.message_sender {
+                            let notification = format!(
+                                "Fabrication detected (uncorrected) on {} {}: the \
+                                 assert-grounded guard fired and the re-prompt budget \
+                                 is spent, yet the response still claims «{}» with no \
+                                 grounding tool call this turn. The answer went out. \
+                                 Investigate trace_id {} in /var/log/mika/server.log.",
+                                claim.resource_type,
+                                claim.resource_ref,
+                                claim.claim_text,
+                                tool_ctx.trace_id,
+                            );
+                            // L'étage est en seconde position et sans défaut : la
+                            // classe `fabrication-detected` de mika#1381 est P0
+                            // parce que la fabrication a franchi la garde et
+                            // atteint l'opérateur — rien d'aval ne le dira.
+                            let _ = sender
+                                .send_with_severity(&notification, NotificationSeverity::P0)
+                                .await;
+                        }
                     }
 
                     // #1645 — Cross-artifact equivalence-claim guard
@@ -6195,6 +6288,10 @@ async fn run_agent_inner(
 
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+    // mika#2867 — `is_some_and`, pas `is_none_or` comme les deux lignes
+    // ci-dessus : leur défaut est « activé », celui-ci est « désarmé ». Un
+    // appelant sans `Settings` n'arme aucune classe P0.
+    let fabrication_p0 = params.settings.is_some_and(|s| s.fabrication_p0_notify);
     let is_verdict_producer = has_verdict_producer_skill(params.skills.skills());
     // mika#2355 — the turn's skill set, for the QA build-callback verdict guard.
     let loaded_skill_names = skill_names_of(&matched_entries);
@@ -6242,6 +6339,7 @@ async fn run_agent_inner(
         None,
         store_llm,
         store_tools,
+        fabrication_p0,
         prompt_variant.as_deref(),
         params.internal,
         deadline,
@@ -7275,6 +7373,9 @@ async fn run_silent_inner(
     let no_required_tools = HashSet::new();
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+    // mika#2867 — voir la note du point de résolution conversationnel :
+    // `is_some_and`, parce que le défaut de cette porte est « fermée ».
+    let fabrication_p0 = params.settings.is_some_and(|s| s.fabrication_p0_notify);
     let trigger_label = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reflection => "reflection",
@@ -7390,6 +7491,7 @@ async fn run_silent_inner(
         Some(&verdict_signal), // mika#2368: le seul mode où le filet a une population
         store_llm,
         store_tools,
+        fabrication_p0,
         prompt_variant.as_deref(),
         false, // silent mode messages are never internal
         deadline,
@@ -7978,6 +8080,9 @@ async fn run_team_agent_inner_impl(
     let mode = LoopMode::Team;
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+    // mika#2867 — voir la note du point de résolution conversationnel :
+    // `is_some_and`, parce que le défaut de cette porte est « fermée ».
+    let fabrication_p0 = params.settings.is_some_and(|s| s.fabrication_p0_notify);
 
     // Prelude deadline check (mika#848 F3b).
     if Instant::now() >= deadline {
@@ -8027,6 +8132,7 @@ async fn run_team_agent_inner_impl(
         None,                              // mika#2368 : pas de callback de build en mode équipe
         store_llm,
         store_tools,
+        fabrication_p0,
         prompt_variant.as_deref(),
         false, // team mode messages are never internal
         deadline,
