@@ -6929,8 +6929,12 @@ mod tests {
     /// n'aurait aucune chance de correspondre.
     const MIKA2854_COMMENT: &str = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2854#issuecomment-123\n\nlève operator-gated sur #2784, je valide le vol";
 
-    /// L'autre moitié de (h) — AC4, livrée au vol 2 : dans ce vol-ci elle est
-    /// hors population, URL comprise.
+    /// L'autre moitié de (h) — AC4, livrée par ce vol : la fermeture du même
+    /// ticket, **URL en ligne 2 comprise**.
+    ///
+    /// Cette URL est ce qui la fait entrer en population : une fermeture sans
+    /// elle reste hors population (§ D15 du plan), pour la même raison que la
+    /// moitié commentaire — aucune clé d'état n'en est extractible.
     const MIKA2854_ISSUE_CLOSED: &str = "[GitHub] Issue closed: senara-solutions/mika#2854 — t\nhttps://github.com/senara-solutions/mika/issues/2854";
 
     /// Le même état que [`mika2675_state`], dont la séquence de réponses est
@@ -7150,19 +7154,135 @@ mod tests {
         );
     }
 
-    /// Hors périmètre de ce vol — un `issues` `closed` garde son tour, même
-    /// armée, même sous un bouchon qui noterait tout.
+    /// V7 — AC4 de bout en bout : une fermeture sur un ticket **sans** tâche de
+    /// boucle est triée comme un commentaire, et la note écarte le tour.
     ///
-    /// La moitié fermeture de (h) (AC4) est au vol 2 : `upstream_close_handler`
-    /// tourne avant la porte et termine les lignes de suivi du ticket fermé,
-    /// donc la garde AC7 y lirait un état déjà nettoyé. Ce test épingle que le
-    /// vol 1 ne la livre pas en douce : aucun appel de triage ne précède le
-    /// tour, aucune note, et la relâche reste `not_classified`.
+    /// `calls_made() == 1` est l'économie : le triage a parlé et le tour complet
+    /// ne s'est pas ouvert. C'est ce test qui remplace le contrôle de vol 1
+    /// (« une fermeture garde son tour, la moitié n'est pas livrée en douce ») —
+    /// la livraison l'a périmé, et le laisser vert aurait voulu dire qu'AC4
+    /// n'était pas câblée.
+    ///
+    /// La cible est `issue_closed:<url>` : c'est la seconde moitié de V2, lue
+    /// là où le vol la produit vraiment. Sans elle, les deux moitiés de (h)
+    /// seraient indiscernables dans le registre (mika#2205).
     #[tokio::test]
     #[serial_test::serial]
-    async fn mika2854_un_issue_closed_garde_son_tour_dans_ce_vol() {
+    async fn mika2854_v7_une_fermeture_sans_tache_est_triee_de_bout_en_bout() {
         mika2680_warm_callsites().await;
         let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
+        mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
+
+        assert_eq!(
+            mock.calls_made(),
+            1,
+            "V7 — le triage seul est payé, le tour complet ne s'ouvre pas"
+        );
+
+        let ecartees = mika2854_skipped_rows(&state).await;
+        assert_eq!(ecartees.len(), 1, "une ligne d'audit, et une seule");
+        assert_eq!(
+            ecartees[0].after_value.as_deref(),
+            Some(webhook_prefilter::PrefilterClass::CommentTriagedNote.as_str()),
+            "AC5 — la ligne porte la classe (h) et la branche prise"
+        );
+        assert_eq!(
+            ecartees[0].target_key,
+            format!("issue_closed:{MIKA2854_ISSUE_URL}"),
+            "V2 — la cible nomme la moitié FERMETURE, pas `issue_comment`"
+        );
+
+        // L'audit et le registre disent la même branche : écartée ici, donc
+        // aucune ligne de facturation. Les deux ensemble séparent « écarté »
+        // de « écarté après avoir payé ».
+        assert!(
+            mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT)
+                .is_empty(),
+            "un tour écarté par (h) n'émet aucune ligne de registre"
+        );
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        let notes = db.search_events("Triage webhook").await.unwrap();
+        assert_eq!(notes.len(), 1, "une note en mémoire, et une seule");
+        assert!(
+            notes[0].description.contains(MIKA2854_ISSUE_URL),
+            "la note nomme son ticket : {:?}",
+            notes[0].description
+        );
+        assert_eq!(
+            notes[0].context.as_deref(),
+            Some("ticket livré, rien à décider"),
+            "le texte du verdict vit dans le contexte, pas dans la clé"
+        );
+    }
+
+    /// V6 — **AC7 avant le nettoyage** : une fermeture sur un ticket qui porte
+    /// une tâche de boucle vivante garde le tour complet.
+    ///
+    /// C'est le test du point dur du ticket, et le seul qui puisse le voir.
+    /// `upstream_close_handler::try_handle_upstream_close` tourne **avant** la
+    /// porte et marque terminales les lignes de suivi du ticket qu'on ferme ;
+    /// une garde AC7 qui lirait l'état depuis la porte lirait donc l'état
+    /// d'**après** ce nettoyage — `false` — et trierait un ticket qui a une
+    /// tâche vivante. L'instantané est pris bien plus tôt, juste après
+    /// `original_github_text`, et c'est ce que ces quatre assertions mesurent.
+    ///
+    /// Il rougit si quelqu'un déplace la capture après le handler, et il rougit
+    /// aussi si on l'approche « juste avant » lui : un handler inséré entre les
+    /// deux rouvrirait la classe en silence.
+    ///
+    /// Le bouchon est le contrôle de non-vacuité : il noterait tout si on
+    /// l'interrogeait, donc un tour complet ici ne peut pas venir d'un verdict
+    /// d'escalade. Et la tâche est semée par `reference_url` — c'est la clé que
+    /// lit `find_active_self_dev_task_for_issue`, et une tâche semée sans elle
+    /// laisserait le test vert pour la mauvaise raison.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v6_ac7_la_fermeture_lit_letat_davant_le_nettoyage() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
+        mika2854_seed_issue_task(&state, MIKA2854_ISSUE_URL).await;
+        mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
+
+        assert!(mock.calls_made() >= 1, "AC7 — le tour d'aujourd'hui a lieu");
+        assert!(
+            mika2854_skipped_rows(&state).await.is_empty(),
+            "AC7 — aucun écart : le ticket a une tâche vivante"
+        );
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "AC7 — aucune note : le triage n'a pas été consulté"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("issue_task_active"),
+            "la relâche dit AC7, et non le désarmement, l'escalade ou \
+             l'instantané absent — c'est ce qui rougit si la capture a glissé \
+             après `upstream_close_handler`"
+        );
+    }
+
+    /// V8, moitié e2e — désarmée, la fermeture ne lit rien et garde son tour.
+    ///
+    /// La moitié unité (`webhook_prefilter`) assère que l'instantané rend
+    /// `Disarmed`, donc qu'aucune lecture de base n'a lieu. Celle-ci assère ce
+    /// que le tour en fait : `triage_disarmed`, pas `closure_snapshot_absent`.
+    /// Les deux termes sont distincts exprès — un désarmement et un câblage
+    /// cassé rendent tous deux le tour complet, et seul le nom les sépare.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v8_desarmee_la_fermeture_ne_lit_rien() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(false);
         let (_guard, events) = mika2680_capture();
         let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
         mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
@@ -7173,14 +7293,16 @@ mod tests {
         let db = state.agents.get("mika").unwrap().value().db.clone();
         assert!(
             db.search_events("Triage webhook").await.unwrap().is_empty(),
-            "aucune note : la moitié fermeture n'est pas triée dans ce vol"
+            "V8 — désarmée, la classe n'écrit aucune note"
         );
 
         let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
         assert_eq!(charged.len(), 1);
         assert_eq!(
             charged[0].fields.get("release").map(String::as_str),
-            Some("not_classified")
+            Some("triage_disarmed"),
+            "le désarmement porte son propre nom, jamais celui de l'instantané \
+             absent"
         );
     }
 
