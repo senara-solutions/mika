@@ -68,12 +68,12 @@ use super::harness::EvalHarness;
 
 /// Une émission observée au transport : le texte, et l'étage **tel qu'il est
 /// arrivé**.
-type Emission = (String, Option<NotificationSeverity>);
+pub(crate) type Emission = (String, Option<NotificationSeverity>);
 
 /// La sentinelle de fuite. Un site qui appelle `send()` au lieu de
 /// `send_with_severity()` n'échoue pas — il arrive ici sans étage. Nommer
 /// l'absence, c'est ce qui permet de l'assertionner.
-const SEVERITE_ABSENTE: Option<NotificationSeverity> = None;
+pub(crate) const SEVERITE_ABSENTE: Option<NotificationSeverity> = None;
 
 /// Le marqueur de dispatch ready-label, forme que
 /// `webhook_dispatch::is_ready_label_dispatch_marker` reconnaît et dont
@@ -94,18 +94,29 @@ const NOTIFICATION_MARKER: &str = "Ready-label dispatch stalled";
 /// type est `#[cfg(test)]` à l'intérieur du crate source, donc inatteignable
 /// depuis le binaire de test `eval`. C'est le motif qui est réutilisé, pas le
 /// type.
-struct SeverityRecordingSender {
+///
+/// **Second consommateur, depuis le vol 4 :
+/// `tests/eval/test_p2_ack_suppression_1381.rs`**, qui observe l'autre moitié de
+/// la même propriété — l'absence d'émission sur le domaine Webhook Fallthrough,
+/// et l'étage absent d'un accusé passé par l'outil `send_message`. `pub(crate)`
+/// est à lui : la sentinelle `SEVERITE_ABSENTE` et la double surcharge sont ce
+/// qui rend la fuite observable, et une seconde copie de ce double dériverait de
+/// celle-ci sans que rien ne le dise (classe `grooming_marker`, mika#2158). Le
+/// refus du `#[cfg(test)]` du crate source ci-dessus n'est **pas** inversé : il
+/// reste inatteignable ; c'est ce fichier-ci qui est devenu le site unique du
+/// motif pour le binaire `eval`.
+pub(crate) struct SeverityRecordingSender {
     emissions: Mutex<Vec<Emission>>,
 }
 
 impl SeverityRecordingSender {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             emissions: Mutex::new(Vec::new()),
         })
     }
 
-    fn emissions(&self) -> Vec<Emission> {
+    pub(crate) fn emissions(&self) -> Vec<Emission> {
         self.emissions.lock().unwrap().clone()
     }
 }
