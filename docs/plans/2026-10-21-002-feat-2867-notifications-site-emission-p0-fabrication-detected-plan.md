@@ -129,6 +129,19 @@ Trois propriétés, toutes portées par le prédicat et non par un commentaire :
   peut pas atteindre cette branche : au tour 1 le label n'est pas encore inséré, et le garde lui-même
   fait `continue`. C'est la soustraction que le point 2 du ticket demande, et elle est
   structurelle, pas un seuil réglé à la main.
+
+  **Amendement à l'implémentation : ce terme est redondant, il est gardé en défense en
+  profondeur.** Preuve, `agent_loop/mod.rs:3639-3684`. La garde 6d et cette branche sont deux `if`
+  frères, adjacents, dans le même bloc, donc sous la même condition englobante. La garde porte
+  `EndTurn ∧ ¬contains ∧ claim(text) ∧ ¬satisfied(claim, summaries)`. Sans le terme, la branche
+  porte `EndTurn ∧ ¬notified ∧ claim(text) ∧ ¬satisfied(claim, summaries)`.
+  `detect_affirmative_state_claim` et `assert_grounded_satisfied` (`evidence/guards.rs:270`, `:345`)
+  sont purs : regex sur `&str` et lecture d'une slice. Si la branche était évaluée avec `¬contains`
+  et ses autres conjoints vrais, la garde aurait tiré sur le même texte et fait `continue`. Toute
+  évaluation atteignable de la branche a donc déjà `contains`. Aucun contrôle ne peut pincer ce
+  terme, et aucun n'est fabriqué : la recette (iii) du risque R1 a été jouée et reste verte. Le
+  terme reste écrit, parce qu'il rend la propriété locale et qu'il tiendra le jour où la garde
+  cessera d'être immédiatement au-dessus.
 - La ré-exécution de `detect_affirmative_state_claim` + `assert_grounded_satisfied` ⇒ la seconde
   réponse viole **encore**. Un agent qui a honoré la correction ne produit rien.
 - Pas de second re-prompt. La famille accorde un re-prompt ; un garde qui divergerait sur ce point
@@ -232,6 +245,10 @@ rougirait sur un scénario à deux pas.
 
 ### D7 — Ce que l'opérateur lit, et par où
 
+*Amendement à l'implémentation :* mika-spirit journalise en `flatten_event(true)`
+(`mika-common/src/logging.rs:409`), donc le champ est `.event` à la racine et pas `.fields.event`.
+Les sondes ci-dessous sont corrigées, comme dans `docs/operator/environment-variables.md`.
+
 Un seul `warn!`, cible `mika::otel`, champs sur le modèle de `:2843-2856` : `trace_id`, `agent_id`,
 `session_id`, `step`, `resource_type`, `resource_ref`, `claim`, `label = mode.label()`,
 `event = "guard.assert_grounded_uncorrected"`.
@@ -239,14 +256,14 @@ Un seul `warn!`, cible `mika::otel`, champs sur le modèle de `:2843-2856` : `tr
 La sonde de comptage, documentée dans `docs/operator/environment-variables.md` :
 
 ```sh
-jq -r 'select(.fields.event == "guard.assert_grounded_uncorrected") | .timestamp' \
+jq -r 'select(.event == "guard.assert_grounded_uncorrected") | .timestamp' \
   < "$MIKA_SPIRIT_LOG_FILE" | cut -c1-10 | uniq -c
 ```
 
 À comparer à la population de la première prise, qui est déjà instrumentée :
 
 ```sh
-jq -r 'select(.fields.event == "guard.assert_grounded") | .timestamp' \
+jq -r 'select(.event == "guard.assert_grounded") | .timestamp' \
   < "$MIKA_SPIRIT_LOG_FILE" | cut -c1-10 | uniq -c
 ```
 
@@ -426,10 +443,11 @@ reste à 269, sous la borne.
   `mika2867_porte_fermee_le_transport_nobserve_rien` passe. Même fixture de récidive, porte laissée
   à son défaut, `trace.llm_call_count > 1` vérifié (sans quoi le contrôle serait vert pour la
   mauvaise raison), et **zéro** émission au transport. C'est l'attestation du Fire-Disposition (b).
-- **AC6** — la première prise ne notifie pas, et c'est le prédicat qui le garantit : la branche
-  exige `intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)`, que le tour 1 ne peut pas
-  satisfaire. Vérifié par lecture du prédicat et par AC4(a) — un site qui notifierait sur la
-  première prise produirait **deux** émissions et ferait rougir AC4(d).
+- **AC6** — la première prise ne notifie pas. Deux mécanismes le garantissent : le `continue`
+  de la garde 6d, qui précède la branche, et le terme
+  `intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)`, redondant sur tout chemin atteignable
+  (preuve au D1). Vérifié par lecture. Aucun test ne peut le faire rougir, et la recette (iii) le
+  confirme.
 - **AC7** — un seul `warn!` par récidive, cible `mika::otel`,
   `event = "guard.assert_grounded_uncorrected"`, portant `trace_id`, `agent_id`, `session_id`,
   `step`, `resource_type`, `resource_ref`, `claim`, `label`. Le verrou du D6 le borne ;
@@ -475,6 +493,11 @@ l'identique après chacune, et la sortie d'échec recopiée verbatim dans le cor
 rouge sur la sentinelle ; (iii) `intent_guard_retries.contains(...)` retiré du prédicat ⇒ AC4(d)
 rouge sur une seconde émission (c'est aussi le contrôle de l'AC6). C'est la discipline du vol 3 de
 mika#1381, dont l'en-tête porte les trois recettes.
+
+*Résultat à l'implémentation :* (i) et (ii) rougissent comme prévu. (iii) **reste vert** : le
+terme est redondant (preuve au D1), et la prévision ci-dessus était fausse. Une recette (iv)
+a été ajoutée pour pincer le site lui-même : `&& false` en tête du prédicat ⇒ AC4(d) rouge,
+`observé 0`. L'en-tête du test porte ce qui a été observé.
 
 **R2 — le tour 2 du harnais pourrait ne pas rejouer la violation.** `detect_affirmative_state_claim`
 a ses propres heuristiques ; une réponse de tour 2 mal choisie peut ne plus matcher, et le test
