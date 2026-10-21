@@ -1760,9 +1760,11 @@ pub(super) async fn run_agent_for_message(
     // nettoyage : un handler inséré entre les deux rouvrirait la classe en
     // silence. Elle ne lit rien quand le texte n'est pas une fermeture de (h),
     // et rien non plus quand le triage est désarmé.
-    let closure_snapshot =
-        super::webhook_prefilter::snapshot_closure_task_state(original_github_text.as_deref(), &a.db)
-            .await;
+    let closure_snapshot = super::webhook_prefilter::snapshot_closure_task_state(
+        original_github_text.as_deref(),
+        &a.db,
+    )
+    .await;
     // mika#2675 phase 2 — le texte juste après le `verdict_handler` et le jeton
     // qu'il a résolu : la classe (c) exige un texte intact APRÈS lui, et lit
     // l'état de la PR côté forge avec le même jeton.
