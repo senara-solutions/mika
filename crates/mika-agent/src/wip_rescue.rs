@@ -738,24 +738,31 @@ enum ChainOutcome {
 /// enveloppe qui remplirait l'étage rendraient l'état interdit atteignable à
 /// nouveau. Les deux aides existantes ne sont délibérément pas promues en
 /// fonction partagée : une extraction serait une refonte du rail.
+///
+/// Rend `true` seulement quand le transport a rendu `Delivered`. L'appelant
+/// en a besoin : le compteur `recovery_runbook_notified` répond à *la
+/// notification est-elle partie ?*, et il ne peut le faire que s'il sait
+/// distinguer un envoi délivré d'un envoi échoué (voir [`notify_if_bailed`]).
 async fn send_notification(
     sender: &Arc<dyn MessageSender>,
     severity: NotificationSeverity,
     message: &str,
-) {
-    report_notification_outcome(sender.send_with_severity(message, severity).await, severity);
+) -> bool {
+    report_notification_outcome(sender.send_with_severity(message, severity).await, severity)
 }
 
 /// Issue d'envoi, traitée en un seul endroit — ce qui est journalisé ne peut
 /// pas dériver d'un étage à l'autre. Un P0 non délivré ne se taît pas.
+/// Rend `true` pour `Delivered` et `false` pour les trois autres issues.
 fn report_notification_outcome(
     outcome: anyhow::Result<crate::messaging::SendOutcome>,
     severity: NotificationSeverity,
-) {
+) -> bool {
     match outcome {
-        Ok(crate::messaging::SendOutcome::Delivered) => {}
+        Ok(crate::messaging::SendOutcome::Delivered) => true,
         Ok(crate::messaging::SendOutcome::Failed { reason }) => {
             warn!(reason = %reason, severity = severity.as_str(), class = RECOVERY_RUNBOOK_CLASS, "wip_rescue notification delivery failed");
+            false
         }
         Ok(crate::messaging::SendOutcome::NoChannel) => {
             warn!(
@@ -763,9 +770,11 @@ fn report_notification_outcome(
                 class = RECOVERY_RUNBOOK_CLASS,
                 "wip_rescue notification skipped — no reply channel (chat_id=0)"
             );
+            false
         }
         Err(e) => {
             warn!(error = %e, severity = severity.as_str(), class = RECOVERY_RUNBOOK_CLASS, "Failed to send wip_rescue notification");
+            false
         }
     }
 }
@@ -839,15 +848,21 @@ async fn notify_if_bailed(
          Runbook : {RECOVERY_RUNBOOK_COMMAND}"
     );
 
-    send_notification(sender, NotificationSeverity::P0, &message).await;
-
-    info!(
-        pr_number,
-        class = RECOVERY_RUNBOOK_CLASS,
-        severity = NotificationSeverity::P0.as_str(),
-        parked,
-        "recovery_runbook_notified"
-    );
+    // Le compteur ne part que sur un envoi délivré. Sans cette garde, un P0
+    // revenu `Failed`, `NoChannel` ou `Err` compterait comme parti : les comptes
+    // `recovery_runbook_notified` et `wip_rescue_bail_to_human` resteraient
+    // égaux alors que personne n'a été réveillé, et leur écart, qui est le
+    // signal (voir [`RECOVERY_RUNBOOK_CLASS`]), ne pourrait jamais apparaître.
+    // L'échec garde son propre WARN, émis par [`report_notification_outcome`].
+    if send_notification(sender, NotificationSeverity::P0, &message).await {
+        info!(
+            pr_number,
+            class = RECOVERY_RUNBOOK_CLASS,
+            severity = NotificationSeverity::P0.as_str(),
+            parked,
+            "recovery_runbook_notified"
+        );
+    }
 }
 
 /// Scan open `wip-rescue` draft PRs and resume the oldest eligible one.
@@ -3561,14 +3576,25 @@ mod tests {
     /// Ne pas remplacer par le `SeverityRecordingSender` de
     /// `verdict_handler.rs` : ce type est `#[cfg(test)]` dans son module, donc
     /// inatteignable d'ici. C'est le motif qui est repris, pas le type.
+    ///
+    /// `issue` est ce que le transport rend : `None` vaut `Delivered`, et
+    /// `Some(..)` permet d'exercer les envois qui reviennent sans avoir été
+    /// délivrés.
     #[derive(Default)]
     struct SeverityRecordingSender {
         franchissements: std::sync::Mutex<Vec<(String, String)>>,
+        issue: Option<crate::messaging::SendOutcome>,
     }
 
     impl SeverityRecordingSender {
         fn observe(&self) -> Vec<(String, String)> {
             self.franchissements.lock().unwrap().clone()
+        }
+
+        fn issue(&self) -> crate::messaging::SendOutcome {
+            self.issue
+                .clone()
+                .unwrap_or(crate::messaging::SendOutcome::Delivered)
         }
     }
 
@@ -3582,7 +3608,7 @@ mod tests {
                 .push((text.to_string(), SEVERITE_ABSENTE.to_string()));
             // Le garde est relâché avant le retour : jamais tenu à travers un
             // point d'await (clippy::sig_drop, #1724).
-            Ok(crate::messaging::SendOutcome::Delivered)
+            Ok(self.issue())
         }
 
         async fn send_with_severity(
@@ -3594,15 +3620,88 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((text.to_string(), severity.as_str().to_string()));
-            Ok(crate::messaging::SendOutcome::Delivered)
+            Ok(self.issue())
         }
     }
 
     /// Le double, et la vue `dyn` que le site attend.
     fn double_de_transport() -> (Arc<SeverityRecordingSender>, Arc<dyn MessageSender>) {
-        let double = Arc::new(SeverityRecordingSender::default());
+        rail_sur(SeverityRecordingSender::default())
+    }
+
+    /// Un double dont le transport rend `Failed` : l'envoi a franchi la porte,
+    /// mais personne n'a été réveillé.
+    fn double_qui_echoue() -> (Arc<SeverityRecordingSender>, Arc<dyn MessageSender>) {
+        rail_sur(SeverityRecordingSender {
+            issue: Some(crate::messaging::SendOutcome::Failed {
+                reason: "gateway 502".to_string(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn rail_sur(
+        double: SeverityRecordingSender,
+    ) -> (Arc<SeverityRecordingSender>, Arc<dyn MessageSender>) {
+        let double = Arc::new(double);
         let rail: Arc<dyn MessageSender> = double.clone();
         (double, rail)
+    }
+
+    /// Un `MakeWriter` qui accumule dans un tampon partagé les octets qu'un
+    /// souscripteur `fmt` écrirait — motif de `milestone_manager/cadence.rs`.
+    /// Les assertions portent sur les octets rendus, donc sur ce que
+    /// l'opérateur lit.
+    #[derive(Clone, Default)]
+    struct TamponPartage {
+        inner: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for TamponPartage {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TamponPartage {
+        type Writer = TamponPartage;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Les lignes de journal qu'émet un appel de [`notify_if_bailed`].
+    ///
+    /// L'abonné passe par `install_capturing_subscriber`, site d'installation
+    /// unique du crate (mika#2646). **Tout test de ce module qui atteint les
+    /// callsites de [`notify_if_bailed`] porte `#[serial_test::serial]`**, ceux
+    /// qui capturent comme ceux qui ne capturent pas : un voisin qui enregistre
+    /// le callsite sans abonné en éteint l'`Interest` globalement, et la
+    /// capture rendrait zéro.
+    async fn journal_de(
+        sender: Option<&Arc<dyn MessageSender>>,
+        pr_number: u64,
+        outcome: &ChainOutcome,
+    ) -> String {
+        use tracing_subscriber::layer::SubscriberExt;
+        let tampon = TamponPartage::default();
+        let souscripteur = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(tampon.clone())
+                .with_ansi(false)
+                .without_time(),
+        );
+        {
+            let _garde =
+                crate::test_utils::test_helpers::install_capturing_subscriber(souscripteur);
+            notify_if_bailed(sender, pr_number, outcome).await;
+        }
+        let octets = tampon.inner.lock().unwrap().clone();
+        String::from_utf8_lossy(&octets).into_owned()
     }
 
     /// AC2/AC4 — un bail réveille l'opérateur, et l'étage observé **vaut**
@@ -3613,6 +3712,7 @@ mod tests {
     /// sentinelle et rougit, et un `P2` rend `"p2"` et rougit aussi. Une seule
     /// assertion couvre les deux régressions.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2866_un_bail_reveille_loperateur_au_palier_p0() {
         let (double, rail) = double_de_transport();
 
@@ -3671,6 +3771,7 @@ mod tests {
     /// autres issues de chaîne. Sans eux, un site qui notifierait à **chaque**
     /// tique passerait le test positif.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2866_une_reprise_ne_reveille_personne() {
         let (double, rail) = double_de_transport();
 
@@ -3692,6 +3793,7 @@ mod tests {
     /// AC3 — un park n'est pas un bail (mika#2286) : rien ne va mal, et
     /// l'exclusion se lève d'elle-même.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2866_un_park_ne_reveille_personne() {
         let (double, rail) = double_de_transport();
 
@@ -3707,6 +3809,7 @@ mod tests {
 
     /// AC3 — un skip n'a touché à rien : il n'y a pas d'état à récupérer.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2866_un_skip_ne_reveille_personne() {
         let (double, rail) = double_de_transport();
 
@@ -3731,6 +3834,7 @@ mod tests {
     /// trouvera pas quand `parked == false` ; le message le dit plutôt que de
     /// lui laisser croire à une erreur de sa part.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2866_un_label_non_pose_est_dit_dans_le_message() {
         let (double, rail) = double_de_transport();
 
@@ -3782,6 +3886,7 @@ mod tests {
     /// parce que sans lui « aucun bail » et « un bail sans rail » rendent des
     /// octets identiques (classe mika#2205).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2866_un_bail_sans_rail_est_nomme() {
         notify_if_bailed(
             None,
@@ -3792,5 +3897,67 @@ mod tests {
             },
         )
         .await;
+    }
+
+    /// AC6 — `recovery_runbook_notified` ne compte qu'un P0 **délivré**.
+    ///
+    /// Le compteur répond à *la notification est-elle partie ?*, et son écart
+    /// avec `wip_rescue_bail_to_human` est le signal d'un bail qui n'a réveillé
+    /// personne. Un envoi revenu `Failed` qui compterait quand même rendrait
+    /// cet écart inobservable (classe mika#2205). Le contrôle positif est dans
+    /// le même test : sans lui, une capture muette passerait le négatif.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_un_p0_non_delivre_ne_compte_pas_comme_notifie() {
+        let bail = ChainOutcome::Bailed {
+            reason: "rebase conflict".to_string(),
+            parked: true,
+        };
+
+        // Positif : délivré, le compteur part.
+        let (_double, rail) = double_de_transport();
+        let journal = journal_de(Some(&rail), 4242, &bail).await;
+        assert!(
+            journal.contains("recovery_runbook_notified"),
+            "un P0 délivré doit émettre `recovery_runbook_notified` ; journal : {journal:?}"
+        );
+
+        // Négatif : le transport a été franchi, mais l'envoi a échoué.
+        let (double, rail) = double_qui_echoue();
+        let journal = journal_de(Some(&rail), 4242, &bail).await;
+        assert_eq!(
+            double.observe().len(),
+            1,
+            "l'envoi a bien été tenté une fois"
+        );
+        assert!(
+            !journal.contains("recovery_runbook_notified"),
+            "un P0 revenu `Failed` ne doit pas compter comme notifié ; journal : {journal:?}"
+        );
+        assert!(
+            journal.contains("wip_rescue notification delivery failed"),
+            "l'échec de livraison doit garder son propre WARN ; journal : {journal:?}"
+        );
+    }
+
+    /// AC6 — les quatre issues de transport, une par une : seul `Delivered`
+    /// rend `true`.
+    #[test]
+    #[serial_test::serial]
+    fn mika2866_seul_delivered_compte_comme_delivre() {
+        use crate::messaging::SendOutcome;
+        let p0 = NotificationSeverity::P0;
+        assert!(report_notification_outcome(Ok(SendOutcome::Delivered), p0));
+        assert!(!report_notification_outcome(
+            Ok(SendOutcome::Failed {
+                reason: "gateway 502".to_string()
+            }),
+            p0
+        ));
+        assert!(!report_notification_outcome(Ok(SendOutcome::NoChannel), p0));
+        assert!(!report_notification_outcome(
+            Err(anyhow::anyhow!("chat_id resolution failed")),
+            p0
+        ));
     }
 }
