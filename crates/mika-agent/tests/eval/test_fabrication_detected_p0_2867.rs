@@ -170,10 +170,16 @@ async fn mika2867_la_recidive_dancrage_part_en_p0_sur_la_surface_jamais_muette()
     );
 
     // AC4(g) — la notification nomme la ressource sur laquelle la fabrication
-    // porte, sans quoi l'opérateur reçoit une alarme qu'il ne peut pas suivre.
+    // porte et le `trace_id` du tour, sans quoi l'opérateur reçoit une alarme
+    // qu'il ne peut pas suivre jusqu'au log.
     assert!(
         texte.contains("#100"),
         "la notification ne nomme pas la ressource affirmée ; texte : {texte:?}"
+    );
+    assert!(
+        texte.contains(&harness.trace_id),
+        "la notification ne nomme pas le trace_id du tour ({}) ; texte : {texte:?}",
+        harness.trace_id
     );
 
     Ok(())
