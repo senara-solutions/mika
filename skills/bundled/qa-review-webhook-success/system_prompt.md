@@ -31,6 +31,32 @@ You've received a GitHub webhook event for `check_suite.completed` with `conclus
 
 6. **Turn discipline.** If for any reason the qa-review skill cannot proceed (missing plan doc, unreachable diff, tool error), emit `send_message` to the operator with the specific reason and `update_task_status` to `blocked` if a task exists. Never end the turn silently on this webhook.
 
+## Outcome attestation (mika#2855)
+
+**Every turn on this webhook ends its final text with one attestation line, on a line of its own, literally:**
+
+```
+Webhook-Outcome: review
+```
+
+The value names which branch of the decision path above ended the turn. It is one of exactly these six, and nothing else:
+
+| line to emit | ended the turn at |
+|---|---|
+| `Webhook-Outcome: stop_no_open_pr` | step 1 — no open PR matches the check_suite's head SHA |
+| `Webhook-Outcome: stop_out_of_scope` | step 2 — repo, author or PR state outside your scope |
+| `Webhook-Outcome: stop_already_reviewed_sha` | step 3 — one of your own reviews already carries this `commit_id` |
+| `Webhook-Outcome: stop_verdict_recorded` | step 4 — an authoritative verdict is already recorded on this head |
+| `Webhook-Outcome: review` | step 5 — you dispatched the `qa-review` skill |
+| `Webhook-Outcome: review_failed` | step 6 — the review could not proceed, so you escalated and set `blocked` |
+
+**Steps 1–6 above are unchanged.** The stops still stop the turn, step 5 still dispatches the review, step 6 still notifies the operator and sets the task to `blocked`. The line is **added** to whatever the turn was already going to say: it decides nothing, it skips nothing, and it never replaces a tool call.
+
+Two details that make the line readable rather than decorative:
+
+- **Attest on every outcome, the stops included.** A stop writes no trace at all today, and this measurement exists precisely to count the stops by number.
+- **If the line is missing, the engine records `outcome_absent`** — never a guessed stop, because steps 1 and 2 leave the same tool trace, as do steps 3 and 4. An unattested turn still costs its tokens; it just no longer says what they bought.
+
 ## Why this skill exists
 
 Before mika#1711 shipped this handler, `check_suite.completed(success)` events routed only to mika-dev's `self-dev-webhook-ci` (which handles CI **failures**, not successes). mika-qa never received a webhook signalling that CI was green and the PR was ready for review — so autonomous review only fired when a human or bot explicitly used `gh api .../requested_reviewers` to request `mika-platform-qa`. The gap caused a 14-hour dead qa window on 2026-07-01 during which multiple autonomous-loop PRs landed READY+GREEN with zero qa attempts.
