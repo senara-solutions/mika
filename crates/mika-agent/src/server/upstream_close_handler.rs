@@ -412,8 +412,25 @@ async fn cleanup_rows_for_issue_url(
 
 /// Extract the first GitHub issue URL from the webhook message text.
 /// Scans lines for `https://github.com/<owner>/<repo>/issues/<number>`.
-fn extract_issue_url(text: &str) -> Option<String> {
-    extract_github_url_with_segment(text, "issues")
+///
+/// `pub(crate)` depuis mika#2854, pour la raison exacte qui a ouvert
+/// [`extract_pr_url`] à mika#2680 : la classe (h) du pré-filtre webhook
+/// ([`crate::server::webhook_prefilter::classify`]) lit la même URL sur le même
+/// gabarit de gateway, et c'est elle qui sert de clé à
+/// `has_active_self_dev_task_for_issue`. Deux lectures qui dérivent, ce sont
+/// deux populations de tours qui ne se soustraient plus.
+///
+/// **Le fragment est tronqué ici, une seule fois.** Un `issue_comment` porte
+/// `…/issues/2854#issuecomment-123` : le scanner partagé rend la ligne trimée
+/// telle quelle, fragment compris, alors que la clé de tâche est l'URL **sans**
+/// fragment. Sans cette troncature, le terme d'état rendrait `false` sur tout
+/// commentaire et la classe (h) écarterait des tickets en vol. La troncature
+/// est faite ici et non dans le scanner partagé : (e) lit une URL de PR sur un
+/// gabarit qui n'en porte pas, et son comportement reste intact.
+pub(crate) fn extract_issue_url(text: &str) -> Option<String> {
+    let url = extract_github_url_with_segment(text, "issues")?;
+    let base = url.split_once('#').map_or(url.as_str(), |(base, _)| base);
+    Some(base.to_string())
 }
 
 /// Extract the first GitHub PR URL from the webhook message text.
@@ -481,6 +498,30 @@ mod tests {
         assert_eq!(
             extract_issue_url(text),
             Some("https://github.com/senara-solutions/mika/issues/1574".to_string())
+        );
+    }
+
+    /// mika#2854 — le gabarit d'un `issue_comment` porte un fragment
+    /// `#issuecomment-<id>`, et la clé de `has_active_self_dev_task_for_issue`
+    /// est l'URL sans fragment. Sans cette troncature, le terme d'état rend
+    /// `false` sur tout commentaire et la classe (h) écarte des tickets en vol.
+    #[test]
+    fn mika2854_extract_issue_url_tronque_le_fragment_du_commentaire() {
+        let text = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2854#issuecomment-123\n\nfais-le";
+        assert_eq!(
+            extract_issue_url(text),
+            Some("https://github.com/senara-solutions/mika/issues/2854".to_string())
+        );
+    }
+
+    /// Le contrôle de l'absence de fragment : la ligne sans `#` traverse
+    /// inchangée, donc la troncature ne coûte rien au gabarit d'`issues closed`.
+    #[test]
+    fn mika2854_extract_issue_url_sans_fragment_est_inchangee() {
+        let text = "https://github.com/senara-solutions/mika/issues/2854";
+        assert_eq!(
+            extract_issue_url(text),
+            Some("https://github.com/senara-solutions/mika/issues/2854".to_string())
         );
     }
 
