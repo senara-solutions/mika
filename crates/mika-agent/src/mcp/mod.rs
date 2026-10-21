@@ -86,7 +86,11 @@ pub(crate) fn mcp_tool_data_grades(
 /// même fait peuvent divergir. `split_once` plutôt qu'un découpage d'octets —
 /// `scripts/check-byte-slices.sh` refuse le second, et un nom de serveur peut
 /// porter des caractères multi-octets.
-fn serveur_du_nom_namespace(namespaced: &str) -> Option<&str> {
+///
+/// `pub(crate)` depuis mika#2814 vol 4 : `agent_loop` en a besoin pour le champ
+/// `server` du `WARN` de désarmement, et pour la même raison qu'ici — dériver le
+/// serveur du nom plutôt que d'ouvrir un second parcours de la config.
+pub(crate) fn serveur_du_nom_namespace(namespaced: &str) -> Option<&str> {
     let (serveur, _outil) = namespaced.strip_prefix(MCP_PREFIX)?.split_once(MCP_SEP)?;
     (!serveur.is_empty()).then_some(serveur)
 }
@@ -286,6 +290,26 @@ impl McpManager {
     /// Check if a tool name belongs to an MCP server.
     pub fn is_mcp_tool(&self, name: &str) -> bool {
         self.tool_routing.contains_key(name)
+    }
+
+    /// Cet outil MCP est-il banni par la doctrine non-transit — c'est-à-dire son
+    /// serveur déclare-t-il `data_grade = "testimony"` (mika#2814 vol 4) ?
+    ///
+    /// **Un outil absent de la map n'est pas banni.** `None ⇒ false` : le défaut
+    /// est de publier, pas de censurer, exactement ce que
+    /// [`retain_publiables`] écrit pour la même map. Un trou dans la map est
+    /// une erreur de construction, et une censure muette en serait le pire
+    /// rendu.
+    ///
+    /// **Le prédicat vit sur le manager, et pas au site de lecture.** La map
+    /// est déjà publique ([`McpManager::tool_data_grades`]), donc un appelant
+    /// pourrait écrire la comparaison lui-même. Deux raisons de ne pas le
+    /// laisser faire : « cet outil est-il banni ? » se pose alors dans le même
+    /// vocabulaire que [`retain_publiables`], et une comparaison de
+    /// [`DataGrade`] recopiée ailleurs serait un second endroit à mettre à jour
+    /// le jour où un troisième grade apparaît.
+    pub fn is_testimony_tool(&self, name: &str) -> bool {
+        self.tool_data_grades.get(name) == Some(&DataGrade::Testimony)
     }
 
     /// Check if any MCP servers are connected.
