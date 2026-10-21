@@ -49,6 +49,8 @@
 //! Un test de sévérité qui n'a jamais été rouge n'atteste rien. Chaque
 //! injection a été jouée sur un état commité vert, puis le site restauré par
 //! `git checkout`. Ce qui suit est ce qui a été observé, pas ce qui était prévu.
+//! Toutes ont été rejouées après le report de l'envoi au point d'acceptation de
+//! l'`EndTurn` : R1 et R2 visent l'appel différé, R4 le prédicat de la branche.
 //!
 //! **R1 — l'étage dégradé.** `NotificationSeverity::P0` → `::P2` au site ⇒
 //! rouge sur AC4(f), `observé Some(P2)`.
@@ -57,6 +59,10 @@
 //! au transport SANS étage ».
 //! **R4 — le site retiré.** `&& false` en tête du prédicat de la branche ⇒
 //! rouge sur AC4(d), `observé 0`.
+//! **R5 — l'envoi sans revérification.** La revérification de la revendication
+//! sur le texte accepté retirée ⇒ rouge sur
+//! `mika2867_une_garde_aval_qui_reprend_la_main_annule_la_p0`, « une P0 est
+//! pourtant partie ».
 //!
 //! **R3 — `intent_guard_retries.contains(…)` retiré — reste VERT, et c'est
 //! attendu.** Le terme est redondant sur tout chemin atteignable : la garde 6d,
