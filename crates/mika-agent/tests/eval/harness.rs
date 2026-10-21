@@ -291,6 +291,7 @@ pub struct EvalHarnessBuilder {
     internal: bool,
     family_tier: bool,
     deployment: mika_common::home::Deployment,
+    fabrication_p0_notify: bool,
     provider_name: Option<String>,
     model_name: Option<String>,
     supports_vision: Option<bool>,
@@ -322,6 +323,7 @@ impl Default for EvalHarnessBuilder {
             internal: false,
             family_tier: false,
             deployment: mika_common::home::Deployment::Unknown,
+            fabrication_p0_notify: false,
             provider_name: None,
             model_name: None,
             supports_vision: None,
@@ -430,6 +432,20 @@ impl EvalHarnessBuilder {
     /// exercise the exemption, `Cloud` to exercise the declared-cloud answer.
     pub fn deployment(mut self, deployment: mika_common::home::Deployment) -> Self {
         self.deployment = deployment;
+        self
+    }
+
+    /// Arm the `fabrication-detected` P0 notification (mika#2867). Default:
+    /// `false` — the shipped default, and the one the closed-gate control
+    /// asserts: with the gate shut the transport must observe nothing, so a
+    /// test that forgot to call this would pass for the wrong reason.
+    ///
+    /// Mutates the `Settings::test_defaults()` the harness builds, rather than
+    /// threading a fourth argument: the gate is resolved from `Settings` at the
+    /// three `run_loop` entry points, so arming it anywhere else would exercise
+    /// a path production does not have.
+    pub fn fabrication_p0_notify(mut self, armed: bool) -> Self {
+        self.fabrication_p0_notify = armed;
         self
     }
 
@@ -618,7 +634,11 @@ impl EvalHarnessBuilder {
 
         let trace_id = uuid::Uuid::new_v4().as_simple().to_string();
 
-        let settings = Settings::test_defaults();
+        let mut settings = Settings::test_defaults();
+        // mika#2867 — la porte vit dans `Settings` en production ; le harness la
+        // pose au même endroit pour que le test traverse le même chemin de
+        // résolution (`is_some_and` aux trois points d'entrée de `run_loop`).
+        settings.fabrication_p0_notify = self.fabrication_p0_notify;
 
         Ok(EvalHarness {
             db: async_db,

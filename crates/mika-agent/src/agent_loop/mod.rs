@@ -3713,7 +3713,6 @@ async fn run_loop(
                     // bout. Porte : `MIKA_FABRICATION_P0_NOTIFY`, défaut `false`
                     // (mika#1574, option (b) — livrer désarmé).
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
-                        && intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)
                         && !assert_grounded_uncorrected_notified
                         && let Some(claim) = detect_affirmative_state_claim(&text)
                         && !assert_grounded_satisfied(&claim, &all_tool_summaries)
