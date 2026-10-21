@@ -347,6 +347,15 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Log full LLM request/response bodies at debug level (default: false)",
     },
+    // -- Fabrication-class P0 notification (mika#2867) --
+    ConfigKeyInfo {
+        key: "fabrication_p0_notify",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_FABRICATION_P0_NOTIFY"),
+        secret: false,
+        description: "Notify the operator (P0) when a fabrication-class guard's \
+                      re-prompt budget is exhausted and the claim persists (default: false)",
+    },
     // -- Env backend (.env secrets) --
     ConfigKeyInfo {
         key: "openai_api_key",
@@ -561,6 +570,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
         "dashboard_enabled" => Some(settings.dashboard_enabled.to_string()),
+        "fabrication_p0_notify" => Some(settings.fabrication_p0_notify.to_string()),
 
         // Per-provider: Anthropic
         "anthropic_model" => settings.anthropic_model.clone(),
@@ -1239,6 +1249,23 @@ pub struct Settings {
     /// lands (mika#1262). Default: false.
     #[serde(default)]
     pub operational_partner: bool,
+
+    /// Arm the `fabrication-detected` P0 notification (mika#2867). When a
+    /// fabrication-class guard has already spent its single re-prompt and the
+    /// claim persists, the engine always writes the `*_uncorrected` WARN; it
+    /// notifies the operator on the never-mute surface only when this is true.
+    ///
+    /// Ships **disarmed** on purpose (Fire-Disposition, mika#1574): the per-day
+    /// firing rate of the `assert_grounded` guard on real traffic is not yet
+    /// measured, and a P0 class that fires on every grounding re-prompt would
+    /// make `MIKA_OPERATOR_ESCALATION_CHAT_ID` mute in practice — the
+    /// "alarm-into-void" failure mika#1381 names. The WARN is the counting
+    /// instrument; arming is a separate decision, taken with the count in hand.
+    ///
+    /// Deliberately absent from `SETTABLE_CONFIG_KEYS` (like
+    /// `operational_partner`): it is an operator decision, not an agent one.
+    #[serde(default)]
+    pub fabrication_p0_notify: bool,
 
     /// Global permission-decision authority (mika#1733 AC3, AC8). Compile-time
     /// default is [`DecisionAuthority::Strict`]. Per-tenant / per-agent scopes
@@ -2777,6 +2804,7 @@ impl Settings {
             kg_docs_root: None,
             kg_docs_roots: None,
             operational_partner: false,
+            fabrication_p0_notify: false,
             decision_authority: DecisionAuthority::Strict,
             permission_hold_timeout_secs: DEFAULT_PERMISSION_HOLD_TIMEOUT_SECS,
             webhook_queue_max_depth: None,
@@ -2916,6 +2944,7 @@ impl std::fmt::Debug for Settings {
             .field("kg_docs_root", &self.kg_docs_root)
             .field("kg_docs_roots", &self.kg_docs_roots)
             .field("operational_partner", &self.operational_partner)
+            .field("fabrication_p0_notify", &self.fabrication_p0_notify)
             .field("decision_authority", &self.decision_authority)
             .field(
                 "permission_hold_timeout_secs",

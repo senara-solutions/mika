@@ -397,4 +397,10 @@ mod eval {
     // un accusé passé par l'outil `send_message` arrive sans étage — donc la
     // suppression est une propriété du garde, jamais du routage (mika#1381 vol 4)
     mod test_p2_ack_suppression_1381;
+
+    // La classe `fabrication-detected` de mika#1381 a enfin un site, et il est
+    // attesté au transport : la récidive de la garde `assert_grounded` part en
+    // P0 porte ouverte, et rien ne part porte fermée — le défaut livré
+    // (mika#2867)
+    mod test_fabrication_detected_p0_2867;
 }

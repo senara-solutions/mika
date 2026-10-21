@@ -105,6 +105,13 @@ const NOTIFICATION_MARKER: &str = "Ready-label dispatch stalled";
 /// refus du `#[cfg(test)]` du crate source ci-dessus n'est **pas** inversé : il
 /// reste inatteignable ; c'est ce fichier-ci qui est devenu le site unique du
 /// motif pour le binaire `eval`.
+///
+/// **Troisième consommateur, depuis mika#2867** :
+/// `test_fabrication_detected_p0_2867.rs` atteste au transport le site de la
+/// classe `fabrication-detected` (la récidive de la garde `assert_grounded`).
+/// Le double est donc `pub(crate)` plutôt que privé — un second double serait
+/// un second comportement libre de diverger sur l'exacte question que ces
+/// tests existent pour trancher : par quelle porte l'émission est passée.
 pub(crate) struct SeverityRecordingSender {
     emissions: Mutex<Vec<Emission>>,
 }
