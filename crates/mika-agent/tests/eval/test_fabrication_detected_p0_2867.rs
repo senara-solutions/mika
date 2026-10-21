@@ -44,20 +44,27 @@
 //! Site attesté : la branche `guard.assert_grounded_uncorrected` de
 //! `agent_loop/mod.rs`, juste après la garde 6d.
 //!
-//! # Recettes de rouge-avant (AC10)
+//! # Recettes de rouge-avant (plan R1)
 //!
-//! Un test de sévérité qui n'a jamais été rouge n'atteste rien. Les trois
-//! injections ci-dessous ont été exécutées, le site de production restauré à
-//! l'identique après chacune, et la sortie d'échec est recopiée verbatim dans
-//! le corps de la PR.
+//! Un test de sévérité qui n'a jamais été rouge n'atteste rien. Chaque
+//! injection a été jouée sur un état commité vert, puis le site restauré par
+//! `git checkout`. Ce qui suit est ce qui a été observé, pas ce qui était prévu.
 //!
-//! **R1 — l'étage dégradé.** `NotificationSeverity::P0` → `::P2` au site.
+//! **R1 — l'étage dégradé.** `NotificationSeverity::P0` → `::P2` au site ⇒
+//! rouge sur AC4(f), `observé Some(P2)`.
 //! **R2 — la fuite silencieuse.** L'appel remplacé par
-//! `sender.send(&notification)` : cette forme **compile**, c'est exactement la
-//! régression que le corps par défaut rend indolore.
-//! **R3 — le prédicat relâché.** `intent_guard_retries.contains(…)` retiré du
-//! prédicat : la branche tire alors sur la **première** prise, et le test voit
-//! deux émissions là où un incident n'en vaut qu'une.
+//! `sender.send(&notification)`, qui **compile** ⇒ rouge sur AC4(e), « arrivée
+//! au transport SANS étage ».
+//! **R4 — le site retiré.** `&& false` en tête du prédicat de la branche ⇒
+//! rouge sur AC4(d), `observé 0`.
+//!
+//! **R3 — `intent_guard_retries.contains(…)` retiré — reste VERT, et c'est
+//! attendu.** Le terme est redondant sur tout chemin atteignable : la garde 6d,
+//! juste au-dessus et dans le même bloc, porte les mêmes conjoints à
+//! `!contains` près et fait `continue` quand elle tire. Une évaluation de la
+//! branche sans le label impliquerait donc que la garde aurait tiré sur le même
+//! texte, avec des prédicats purs. Aucun contrôle ne peut pincer ce terme. Il
+//! est gardé en défense en profondeur, et la preuve est dans le plan (D1).
 
 use mika_agent::messaging::NotificationSeverity;
 use mika_common::llm::mock::*;
@@ -137,9 +144,10 @@ async fn mika2867_la_recidive_dancrage_part_en_p0_sur_la_surface_jamais_muette()
         .filter(|(text, _)| text.contains(NOTIFICATION_MARKER))
         .collect();
 
-    // AC4(d) — exactement une notification. Le verrou par tour
-    // (`assert_grounded_uncorrected_notified`) tient, et le prédicat ne tire
-    // pas sur la première prise : deux émissions signaleraient l'un ou l'autre.
+    // AC4(d) — exactement une notification. Zéro signalerait un site retiré
+    // (R4) ; deux, un verrou par tour (`assert_grounded_uncorrected_notified`)
+    // cassé. La première prise ne peut pas en produire une : la garde 6d fait
+    // `continue` avant la branche (voir l'en-tête, R3).
     assert_eq!(
         fabrications.len(),
         1,
