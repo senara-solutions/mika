@@ -16,6 +16,16 @@
 # assertion y tient une confusion distincte, sur une propriété que les trois
 # autres ne touchent pas.
 #
+# Le § 5 a été ajouté par le vol 2/2 de mika#2855 pour le SECOND TERME du
+# registre — la ligne de sortie, jointe par `request_id`. Ses corpus vivent
+# sous `tests/fixtures/mika2855/`, et pas parmi les six de `mika2680/` : ceux-là
+# sont gelés et pinnés par les § 1 à 4, et un septième déposé au milieu
+# inviterait la prochaine édition à l'étendre plutôt qu'à en ajouter un.
+#
+# LA DISCIPLINE ANNONCÉE : 4 POSITIFS + 16 NÉGATIFS, et le compte au pied de la
+# sortie doit le dire. Un compte annoncé qui ne correspond plus est la première
+# chose qu'un relecteur croit, et la dernière qu'il vérifie.
+#
 # POURQUOI UN CONTRÔLE POSITIF ET SIX NÉGATIFS, ET PAS AUTRE CHOSE. Une batterie
 # qui ne porte que des négatifs est satisfaite par un lecteur qui ne rend jamais
 # rien ; une batterie qui ne porte que le positif est satisfaite par un lecteur
@@ -63,6 +73,15 @@ UNPARSEABLE_ONLY="$FIXTURES/unparseable_only_corpus.jsonl"
 RELEASE="$FIXTURES/release_corpus.jsonl"
 RELEASE_ABSENT="$FIXTURES/release_absent_corpus.jsonl"
 CROSS_TAB="$FIXTURES/cross_tab_corpus.jsonl"
+
+# Les corpus du vol 2/2 de mika#2855 vivent sous leur propre répertoire : les
+# six corpus de `mika2680/` sont gelés et pinnés par les § 1 à 4, et un corpus
+# du second terme déposé parmi eux inviterait la prochaine édition à l'étendre
+# au lieu d'en ajouter un. Un répertoire par vol, une variable par répertoire.
+FIXTURES_2855="$REPO_ROOT/crates/mika-agent/tests/fixtures/mika2855"
+OUTCOME="$FIXTURES_2855/outcome_corpus.jsonl"
+OUTCOME_ABSENT="$FIXTURES_2855/outcome_absent_corpus.jsonl"
+OUTCOME_ONLY="$FIXTURES_2855/outcome_only_corpus.jsonl"
 
 # Le scratch reste DANS le worktree (`target/` est gitignoré) : la
 # permission-policy du dispatch refuse toute écriture hors worktree, et une
@@ -258,6 +277,135 @@ eq "N9 — by_agent_trigger, charged_by_release et skipped_by_class sont inchang
 eq "N10 — skipped_by_agent_class sépare deux agents de même classe, sans clé de coût" \
    "mika-dev=1,mika-qa=1|agent_id,class,skipped" \
    "$(jq -r '[.skipped_by_agent_class[]? | select(.class == "green_check_suite_head_decided") | "\(.agent_id)=\(.skipped)"] | sort | join(",")' "$WORK/xtab-summary.json")|$(jq -r '[.skipped_by_agent_class[]? | keys] | flatten | unique | join(",")' "$WORK/xtab-summary.json")"
+
+# ---------------------------------------------------------------------------
+printf -- '\n-- 5. le second terme du registre : ce que le tour a FAIT\n'
+# ---------------------------------------------------------------------------
+# Le § 5 a été ajouté par le vol 2/2 de mika#2855 pour la jointure du terme de
+# sortie. Il copie la structure du § 4 — un corpus principal construit pour que
+# les seaux à trois clés soient AMBIGUS et le seau à quatre ne le soit pas — et
+# en sort pour les deux confusions que ce corpus-là ne peut pas porter :
+# `outcome_absent` contre `outcome_line_absent` (N12) demande deux tours
+# IDENTIQUES sur les trois autres clés, et « des lignes de sortie seules »
+# (N16) demande un corpus sans aucune ligne d'entrée. Une entrée par confusion
+# (leçon mika#2277), jamais un corpus qui les neutraliserait toutes d'un coup.
+
+MEASURE --log-file "$OUTCOME" --out "$WORK/outcome-turns.jsonl" \
+        --summary "$WORK/outcome-summary.json" >/dev/null 2>&1
+
+# La cellule du croisé à QUATRE clés. Copie de `cellule()` ci-dessus, avec la
+# clé d'issue en plus et le fichier de résumé en premier argument : le § 5 lit
+# trois résumés différents (le corpus principal, celui des absences, celui que
+# `--agent` filtre), là où le § 4 n'en lit qu'un. Même convention de diagnostic
+# — « cellule absente » plutôt qu'un champ vide, parce qu'un croisement resté à
+# trois clés ne rend pas une cellule fausse : il n'en rend AUCUNE.
+cellule_issue() {
+    jq -r --arg a "$2" --arg t "$3" --arg r "$4" --arg o "$5" '
+        [.by_agent_trigger_release_outcome[]?
+         | select(.agent_id == $a and .trigger == $t
+                  and .release == $r and .outcome == $o)]
+        | if length == 0 then "cellule absente"
+          else "\(.[0].turns):\(.[0].input_tokens):\(.[0].cache_read_tokens):\(.[0].llm_calls)"
+          end' "$1"
+}
+
+# P4 — le positif du vol, et il porte LA RÉSERVE DE PRIME (AC3). Les deux
+# cellules sont du même agent et du même déclencheur ; ce qui les sépare est
+# qu'un tour a été relâché par une panne de lecture (`state_unreadable`) et
+# l'autre arrêté proprement sur un SHA déjà revu. Avant ce vol, la seconde
+# moitié de cette phrase n'était pas dans l'agrégat : le registre disait que le
+# tour avait eu lieu, jamais ce qu'il avait fait, et le filtrage de (g′) se
+# décide exactement là.
+#
+# Comme P3, les deux cellules portent le MÊME compte de tours (1) pour des
+# coûts de 900 et 120 : un croisement qui ne porterait que `turns` — la forme
+# la plus naturelle à écrire, copiée du seau plat — est indistinguable d'un
+# croisement correct sur un contrôle de comptes, et devient rouge ici.
+eq "P4 — state_unreadable se distingue d'un arrêt propre, en tokens" \
+   "1:900:150:3|1:120:0:2" \
+   "$(cellule_issue "$WORK/outcome-summary.json" mika-qa check_suite_pr_branch state_unreadable review)|$(cellule_issue "$WORK/outcome-summary.json" mika-qa check_suite_pr_branch head_not_previously_decided stop_already_reviewed_sha)"
+
+# N11 — QUATRE CLÉS, PAS TROIS. `req-o-qa-sha` et `req-o-qa-nopr` sont
+# identiques sur l'agent, le déclencheur ET le terme de relâche : seule l'issue
+# les sépare. Un croisement resté sur `[agent, trigger, release]` ne rendrait
+# donc pas une cellule absente — il rendrait UNE cellule de 2 tours / 420
+# tokens, un chiffre juste pour une question qu'on n'a pas posée. L'assertion
+# tient les deux moitiés : les deux cellules existent séparément, et aucune
+# cellule du croisé ne porte la somme des deux.
+eq "N11 — deux issues sous un même release font deux cellules, jamais leur somme" \
+   "1:120:0:2|1:300:20:2|false" \
+   "$(cellule_issue "$WORK/outcome-summary.json" mika-qa check_suite_pr_branch head_not_previously_decided stop_already_reviewed_sha)|$(cellule_issue "$WORK/outcome-summary.json" mika-qa check_suite_pr_branch head_not_previously_decided stop_no_open_pr)|$(jq -r '[.by_agent_trigger_release_outcome[]?.input_tokens] | any(. == 420)' "$WORK/outcome-summary.json")"
+
+# N12 — LES DEUX ABSENCES NE SONT PAS LA MÊME, et rien dans le corpus principal
+# ne peut le montrer : il faut deux tours identiques sur les trois autres clés,
+# dont l'un a une ligne de sortie où le modèle n'a rien attesté
+# (`outcome_absent`, une valeur du contrat émise par le MOTEUR) et l'autre
+# aucune ligne du tout (`outcome_line_absent`, un régime du déploiement —
+# motif mika#2340, un binaire d'avant le vol 1 n'en émet aucune pour TOUS ses
+# tours). Les confondre ferait lire « le modèle n'atteste presque jamais » sur
+# une fenêtre à cheval sur un déploiement.
+#
+# Quatre moitiés dans une seule assertion, parce qu'elles tiennent une seule
+# propriété : le repli est dans la clé de groupement ET dans la projection, et
+# la ligne per-tour ne porte PAS le nom du seau. Posé dans la clé seule, le
+# seau aurait le bon compte sous un nom `null` ; posé sur la ligne per-tour,
+# un tour sans ligne de sortie serait indiscernable d'un tour dont le modèle
+# aurait attesté ce mot (motif mika#2331).
+MEASURE --log-file "$OUTCOME_ABSENT" --out "$WORK/absent-turns.jsonl" \
+        --summary "$WORK/absent-summary.json" >/dev/null 2>&1
+eq "N12 — outcome_absent (le moteur) n'est pas outcome_line_absent (le journal)" \
+   '{"outcome_absent":1,"outcome_line_absent":1}|1:200:0:1|false|outcome_absent/null' \
+   "$(jq -cS '.charged_by_outcome' "$WORK/absent-summary.json")|$(cellule_issue "$WORK/absent-summary.json" mika-qa check_suite_pr_branch head_not_previously_decided outcome_line_absent)|$(jq -r '[.by_agent_trigger_release_outcome[]?.outcome] | any(. == null)' "$WORK/absent-summary.json")|$(champ "$WORK/absent-turns.jsonl" req-a-attested outcome)/$(champ "$WORK/absent-turns.jsonl" req-a-noline outcome)"
+
+# N13 — CROISER N'EST PAS REMPLACER, sur le corpus neuf. Les trois seaux
+# antérieurs répondent à des questions qui restent posées : « combien cette
+# porte a-t-elle coûté dans cette cellule » n'a pas besoin du grain de l'issue,
+# et le seau à quatre clés éclate la réponse en autant de lignes que le modèle
+# a d'issues. La cellule de 2 tours / 420 tokens que N11 refuse de voir sur le
+# croisé doit donc être EXACTEMENT ce que `by_agent_trigger_release` rend ici :
+# les deux assertions se lisent ensemble, et une fusion déguisée en ajout les
+# rendrait contradictoires.
+eq "N13 — by_agent_trigger, by_agent_trigger_release et charged_by_release sont inchangés" \
+   'mika-qa/check_suite_pr_branch=3:1320:170:7 mika-dev/check_suite_pr_branch=1:60:0:1|mika-qa/state_unreadable=1:900 mika-qa/head_not_previously_decided=2:420 mika-dev/head_not_previously_decided=1:60|{"head_not_previously_decided":3,"state_unreadable":1}' \
+   "$(jq -r '[.by_agent_trigger[] | "\(.agent_id)/\(.trigger)=\(.turns):\(.input_tokens):\(.cache_read_tokens):\(.llm_calls)"] | join(" ")' "$WORK/outcome-summary.json")|$(jq -r '[.by_agent_trigger_release[] | "\(.agent_id)/\(.release)=\(.turns):\(.input_tokens)"] | join(" ")' "$WORK/outcome-summary.json")|$(jq -cS '.charged_by_release' "$WORK/outcome-summary.json")"
+
+# N14 — LES TROIS COMPTES DE LIGNE, ET L'ÉTANCHÉITÉ DE L'AXE. Le corpus porte
+# cinq lignes de sortie : trois qui se joignent, une sans `request_id`
+# (inutilisable — elle quitte la jointure mais reste COMPTÉE, sans quoi une
+# ligne qui disparaît sans trace ferait lire « le modèle n'a pas attesté » là
+# où la vérité est « le lecteur n'a pas su lire ») et une orpheline, dont le
+# `request_id` n'a aucun tour payé.
+#
+# L'orpheline porte `stop_out_of_scope` — délibérément la seule valeur du
+# contrat qu'aucun tour payé ne porte. Une fuite de la jointure (un `//` mal
+# placé, une orpheline recollée au mauvais tour) ne se verrait pas sur des
+# comptes, qui resteraient justes : elle se voit ici, par PRÉSENCE DE CLÉ dans
+# `charged_by_outcome`.
+eq "N14 — cinq lignes, une inutilisable, une orpheline, et aucune fuite dans l'axe" \
+   "5|1|1|false" \
+   "$(jq -r '.outcome_lines' "$WORK/outcome-summary.json")|$(jq -r '.outcome_lines_unusable' "$WORK/outcome-summary.json")|$(jq -r '.outcome_lines_orphan' "$WORK/outcome-summary.json")|$(jq -r '.charged_by_outcome | has("stop_out_of_scope")' "$WORK/outcome-summary.json")"
+
+# N15 — `agent_id` SUR LA LIGNE DE SORTIE EST UNE CONDITION DE CORRECTION, pas
+# un ornement. Le filtre `--agent` du passage en flux s'applique à CHAQUE ligne
+# du corpus, pas aux seules lignes d'entrée : un émetteur qui omettrait ce
+# champ ferait tomber toutes les lignes de sortie au filtre, et toute mesure
+# ciblée — c'est-à-dire toute mesure de (g′), qui porte sur mika-qa — rendrait
+# un `outcome_line_absent` universel. Vert sur les comptes, et faux.
+MEASURE --log-file "$OUTCOME" --agent mika-qa --out "$WORK/qa-turns.jsonl" \
+        --summary "$WORK/qa-summary.json" >/dev/null 2>&1
+eq "N15 — sous --agent, les trois cellules attestées gardent leur issue" \
+   "state_unreadable/review=900 head_not_previously_decided/stop_no_open_pr=300 head_not_previously_decided/stop_already_reviewed_sha=120|false" \
+   "$(jq -r '[.by_agent_trigger_release_outcome[] | "\(.release)/\(.outcome)=\(.input_tokens)"] | join(" ")' "$WORK/qa-summary.json")|$(jq -r '[.by_agent_trigger_release_outcome[]?.outcome] | any(. == "outcome_line_absent")' "$WORK/qa-summary.json")"
+
+# N16 — UNE LIGNE DE SORTIE N'EST PAS UNE LIGNE D'ENTRÉE. « Rien mesuré » reste
+# décidé sur `webhook_turn_charged` SEUL : un corpus qui ne porte que des
+# lignes de sortie n'a aucun tour payé, donc rien à chiffrer. Les laisser
+# conjuguer la décision rendrait `exit 0` sur un agrégat à zéro tour, qui se
+# lirait comme « la fenêtre n'a rien coûté » — un scan inerte en silence qui se
+# lit comme un scan qui n'a rien trouvé (classe mika#2205), la confusion même
+# que N4 tient sur l'autre moitié du registre.
+MEASURE --log-file "$OUTCOME_ONLY" >/dev/null 2>&1
+eq "N16 — un corpus de lignes de sortie seules sort 2" "2" "$?"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passées, %d échouées\n\n' "$PASS" "$FAIL"
