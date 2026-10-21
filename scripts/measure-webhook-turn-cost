@@ -10,7 +10,7 @@
 # « payé » du registre n'écrit aucune ligne d'audit — choix délibéré du vol 1 —
 # et `turn_usage` est dégaté là où `llm_calls` dépend de `MIKA_STORE_LLM_CALLS`.
 #
-# TROIS ÉVÉNEMENTS, UN SEUL PASSAGE — le journal se mesure en gigaoctets :
+# QUATRE ÉVÉNEMENTS, UN SEUL PASSAGE — le journal se mesure en gigaoctets :
 # `grep -F` narrow, `jq -R` ligne à ligne (une ligne non-JSON ne doit pas
 # emporter la mesure), projection TSV, agrégation séparée.
 #
@@ -18,11 +18,22 @@
 #                   candidate?, prefilter_enabled, release} le tour a eu lieu
 #   webhook_prefilter_skipped{class, target, request_id}  le tour a été écarté
 #   turn_usage{trace_id, input_tokens, cache_read_tokens} ce qu'il a coûté
+#   webhook_turn_outcome{request_id, agent_id, outcome}   ce qu'il a FAIT
 #
 # JOINTURE — `webhook_turn_charged.request_id == turn_usage.trace_id` : deux
 # noms, une seule valeur (`req.request_id`). `input_tokens` et
 # `cache_read_tokens` sont des nombres NUS sur le fil, pas des Debug `?`-sigil
 # comme `response_chars` chez `measure-empty-turns` : rien à décoder ici.
+#
+# LE REGISTRE A DEUX TERMES, ET LE SECOND SE JOINT PAR `request_id`
+# (mika#2855). `webhook_turn_charged` est émise AVANT le tour : son message dit
+# « le tour a lieu », donc elle ne peut pas porter l'issue. `webhook_turn_outcome`
+# est émise APRÈS, et porte ce que le modèle a ATTESTÉ en fin de tour — jamais ce
+# que le moteur aurait deviné d'une trace d'outils, qui ne saurait pas nommer
+# lequel des quatre arrêts a joué. La jointure est sur `request_id` des deux
+# côtés ; la ligne de sortie porte aussi `agent_id`, parce que `--agent` filtre
+# CHAQUE ligne du corpus et qu'une ligne de sortie sans agent disparaîtrait de
+# toute mesure ciblée.
 #
 # L'UNITÉ EST LE TOUR, LA VALEUR EST UNE SOMME. `emit_turn_usage` écrit une
 # ligne PAR ÉTAPE, plus une ligne de continuation (`step = u32::MAX`). Prendre
@@ -32,6 +43,19 @@
 # ABSENT N'EST NI ZÉRO NI "none" (motif mika#2331). `candidate` sort `null`
 # quand le champ était absent de la ligne ; un tour payé dont aucun `turn_usage`
 # ne porte le `trace_id` sort `input_tokens: null`, jamais `0`.
+#
+# TROIS ABSENCES, TROIS NOMS, ET AUCUNE NE S'AJOUTE AUX AUTRES (mika#2855).
+#   `outcome_absent`      — le MOTEUR : la ligne de sortie existe, et le modèle
+#                           n'y a rien attesté. C'est une valeur du contrat,
+#                           émise par `webhook_turn_outcome.rs`, pas une lacune.
+#   `outcome_line_absent` — le LECTEUR : aucune ligne de sortie ne porte ce
+#                           `request_id`. Motif mika#2340 — un binaire d'avant
+#                           le déploiement du vol 1 n'en émet aucune, pour tous
+#                           ses tours à la fois.
+#   `absent_pre_field`    — le LECTEUR, sur l'autre axe : la ligne d'ENTRÉE
+#                           n'avait pas de `release` (binaire d'avant le vol 4).
+# Les sommer, c'est additionner un régime binaire du déploiement à une mesure
+# du comportement du modèle — deux populations sous un nom (classe mika#2205).
 #
 # DEUX TAXONOMIES, DEUX SEAUX, ET AUCUNE NE SE DÉRIVE DE L'AUTRE (mika#2680,
 # vol 4). `skipped_by_class` compte les événements ÉCARTÉS par classe ;
@@ -160,6 +184,7 @@ trap 'rm -rf "$WORK"' EXIT
 : >"$WORK/charged"
 : >"$WORK/skipped"
 : >"$WORK/usage"
+: >"$WORK/outcome"
 : >"$WORK/epoch"
 : >"$WORK/unparseable"
 
@@ -174,6 +199,7 @@ trap 'rm -rf "$WORK"' EXIT
 # l'attribué.
 
 grep -F -e 'webhook_turn_charged' -e 'webhook_prefilter_skipped' -e 'turn_usage' \
+        -e 'webhook_turn_outcome' \
     "$LOG_FILE" 2>/dev/null \
     | jq -R -r --arg agent "$AGENT" --arg since "$SINCE" --arg until "$UNTIL" '
         # `//` rend son alternative sur `false` autant que sur `null` : lu par
@@ -190,6 +216,7 @@ grep -F -e 'webhook_turn_charged' -e 'webhook_prefilter_skipped' -e 'turn_usage'
             | ($o.timestamp? // null) as $ts
             | if ($ev != "webhook_turn_charged"
                   and $ev != "webhook_prefilter_skipped"
+                  and $ev != "webhook_turn_outcome"
                   and $ev != "turn_usage")                      then empty
               else
                 # L époque du champ se lève AVANT la fenêtre et AVANT `--agent`.
@@ -220,6 +247,21 @@ grep -F -e 'webhook_turn_charged' -e 'webhook_prefilter_skipped' -e 'turn_usage'
                        agent_id:   field($o; "agent_id"),
                        timestamp:  $ts
                      } | tojson))
+                 # Le second terme du registre (mika#2855). Il ne nourrit PAS
+                 # `field_epoch` : l époque du champ est celle du terme d ENTRÉE,
+                 # la seule dont `unattributed` dépend, et la mêler au terme de
+                 # sortie ferait reculer l époque du vol 4 sur celle du vol 1.
+                 # `agent_id` est sur la projection parce que le filtre `--agent`
+                 # trois lignes plus haut s applique à CHAQUE ligne du corpus :
+                 # sans lui, toute mesure ciblée perdrait ses lignes de sortie et
+                 # rendrait un `outcome_line_absent` universel — vert, et faux.
+                 elif $ev == "webhook_turn_outcome" then
+                   ("O\t" + ({
+                       request_id: field($o; "request_id"),
+                       agent_id:   field($o; "agent_id"),
+                       outcome:    field($o; "outcome"),
+                       timestamp:  $ts
+                     } | tojson))
                  else
                    ("U\t" + ({
                        trace_id:          field($o; "trace_id"),
@@ -233,11 +275,12 @@ grep -F -e 'webhook_turn_charged' -e 'webhook_prefilter_skipped' -e 'turn_usage'
           end
       ' 2>/dev/null \
     | awk -F'\t' -v C="$WORK/charged" -v S="$WORK/skipped" -v E="$WORK/epoch" \
-                 -v U="$WORK/usage" -v X="$WORK/unparseable" '
+                 -v U="$WORK/usage" -v X="$WORK/unparseable" -v O="$WORK/outcome" '
         $1 == "X" { print "1" > X; next }
         $1 == "E" { print $2 > E; next }
         $1 == "C" { sub(/^C\t/, ""); print > C; next }
         $1 == "S" { sub(/^S\t/, ""); print > S; next }
+        $1 == "O" { sub(/^O\t/, ""); print > O; next }
         $1 == "U" { sub(/^U\t/, ""); print > U; next }
       '
 
@@ -255,7 +298,10 @@ FIELD_EPOCH="$(LC_ALL=C sort "$WORK/epoch" 2>/dev/null | head -n 1 || true)"
 
 # « Rien mesuré » se décide sur la présence d'une ligne `webhook_turn_charged`
 # SEULE. Le compte d'illisibles ride sur l'agrégat ; il n'entre pas dans cette
-# conjonction (voir l'en-tête).
+# conjonction (voir l'en-tête). Les lignes `webhook_turn_outcome` non plus : un
+# corpus qui n'en porterait QUE serait un corpus sans aucun tour payé, donc sans
+# rien à mesurer — les laisser conjuguer la décision rendrait `exit 0` sur un
+# agrégat à zéro tour, qui se lirait comme « la fenêtre n'a rien coûté ».
 if [[ "$CHARGED_LINES" -eq 0 ]]; then
     if [[ -n "$AGENT" ]]; then
         printf 'measure-webhook-turn-cost: aucune ligne `webhook_turn_charged` pour %s dans %s (%s ligne(s) illisible(s)) — rien mesuré\n' \
@@ -284,7 +330,8 @@ aggregate() {
         --argjson unparseable "$UNPARSEABLE" \
         --slurpfile charged "$WORK/charged" \
         --slurpfile skipped "$WORK/skipped" \
-        --slurpfile usage   "$WORK/usage" '
+        --slurpfile usage   "$WORK/usage" \
+        --slurpfile outcome "$WORK/outcome" '
 
     # Un champ absent ou non numérique ne contribue pas : il n est pas zéro, il
     # n est pas mesuré. `add` sur une liste vide rend null, d où le repli.
@@ -302,6 +349,22 @@ aggregate() {
                         cache_read_tokens: sum_num(.cache_read_tokens),
                         llm_calls:         length } })
        | from_entries)                                                   as $by_trace
+    # Le second terme, indexé par `request_id` (mika#2855). Une ligne de sortie
+    # sans `request_id` ne peut se joindre à rien, et une sans `outcome` ne
+    # porte rien à joindre : les deux quittent la jointure — mais elles restent
+    # COMPTÉES par `outcome_lines_unusable`, parce qu une ligne qui disparaît
+    # sans trace fait lire « le modèle n a pas attesté » là où la vérité est
+    # « le lecteur n a pas su lire » (classe mika#2205).
+    #
+    # Le dernier doublon gagne, et ce n est pas asserté. Le site d émission est
+    # unique (`handlers.rs`, après `run_agent`), donc deux lignes pour un même
+    # `request_id` ne devraient pas exister ; si elles existent, c est un défaut
+    # de l émetteur, qu une halte du lecteur ne réparerait pas et qu un
+    # `exit 2` sur la fenêtre entière punirait au mauvais endroit.
+    | ($outcome
+       | map(select(((.request_id // "") != "") and ((.outcome // "") != "")))
+       | map({ key: .request_id, value: .outcome })
+       | from_entries)                                                   as $by_outcome
     | ($paid_lines
        | group_by(.request_id)
        | map(
@@ -315,6 +378,12 @@ aggregate() {
              candidate:         $c.candidate,
              prefilter_enabled: $c.prefilter_enabled,
              release:           $c.release,
+             # `null`, jamais `"none"` ni `"outcome_line_absent"` : sur le
+             # per-tour, l absence de jointure est une ABSENCE, et le nom du
+             # seau d absence appartient à l agrégat, pas à la ligne. Une ligne
+             # qui porterait `"outcome_line_absent"` serait indiscernable d une
+             # ligne dont le modèle aurait attesté ce mot (motif mika#2331).
+             outcome:           ($by_outcome[$c.request_id] // null),
              input_tokens:      (if $u == null then null else $u.input_tokens end),
              cache_read_tokens: (if $u == null then null else $u.cache_read_tokens end),
              llm_calls:         (if $u == null then 0    else $u.llm_calls end) })
@@ -339,6 +408,25 @@ aggregate() {
              charged_lines:               ($charged | length),
              skipped_lines:               ($skipped | length),
              usage_lines:                 ($usage   | length),
+             # Trois comptes de LIGNES, et aucune valeur de coût (mika#2855).
+             # `outcome_lines` est la population brute ; `..._unusable` celles
+             # qu aucune jointure ne peut atteindre (pas de `request_id`, ou pas
+             # d `outcome`) ; `..._orphan` celles qui se lisent mais dont le
+             # `request_id` n a aucun tour payé dans la fenêtre — un tour payé
+             # avant `--since` dont la sortie tombe dedans, ou un `request_id`
+             # que personne n a facturé. Les trois disent la santé du JOURNAL,
+             # pas celle des tours : leur donner des tokens ferait entrer dans
+             # le tableau un coût qu aucun tour payé ne porte.
+             outcome_lines:               ($outcome | length),
+             outcome_lines_unusable:
+               ($outcome
+                | map(select(((.request_id // "") == "") or ((.outcome // "") == "")))
+                | length),
+             outcome_lines_orphan:
+               ($outcome
+                | map(select(((.request_id // "") != "") and ((.outcome // "") != "")))
+                | map(.request_id as $r | select(($paid_ids | index($r)) == null))
+                | length),
              unparseable_lines:           $unparseable,
              paid_turns:                  ($turns | length),
              paid_turns_without_usage:    ($turns | map(select(.input_tokens == null)) | length),
@@ -397,6 +485,43 @@ aggregate() {
                         cache_read_tokens: sum_num(.cache_read_tokens),
                         llm_calls:         sum_num(.llm_calls) })
                 | sort_by(- .input_tokens)),
+             # LE CROISEMENT QUI PORTE LA RÉSERVE DE PRIME (mika#2855, AC3).
+             # Un cran de plus que son voisin du dessus, et c est ce cran-là qui
+             # tranche : dans la cellule `mika-qa` × `check_suite_pr_branch`, un
+             # tour relâché par `state_unreadable` et un tour arrêté proprement
+             # sur `stop_already_reviewed_sha` se confondaient sous le même
+             # `head_not_previously_decided`… ou se séparaient sous deux termes
+             # de relâche sans qu on sache lequel des QUATRE arrêts a joué. Le
+             # premier axe dit pourquoi la porte a laissé passer, le second ce
+             # que le tour a fait une fois passé : il faut les deux pour chiffrer
+             # la part filtrable de (g′).
+             #
+             # IL NE REMPLACE RIEN. `by_agent_trigger_release` reste : « combien
+             # cette porte a-t-elle coûté dans cette cellule » n a pas besoin du
+             # grain de l issue, et un seau à quatre clés éclate la réponse en
+             # autant de lignes que le modèle a d issues.
+             #
+             # LE REPLI EST DANS LA CLÉ DE GROUPEMENT **ET** DANS LA PROJECTION,
+             # pour les deux axes d absence. Dans la clé seule, les tours sans
+             # ligne de sortie grouperaient bien ensemble et la projection
+             # rendrait `null` : le bon compte sous un nom faux (motif
+             # mika#2331). Et `outcome_line_absent` n est pas `outcome_absent` —
+             # le premier est un régime du déploiement, le second une valeur
+             # attestée du contrat. L unité est le TOKEN, comme chez le voisin.
+             by_agent_trigger_release_outcome:
+               ($turns
+                | group_by([(.agent_id // "null"), (.trigger // "null"),
+                            (.release  // "absent_pre_field"),
+                            (.outcome  // "outcome_line_absent")])
+                | map({ agent_id:          .[0].agent_id,
+                        trigger:           .[0].trigger,
+                        release:           (.[0].release // "absent_pre_field"),
+                        outcome:           (.[0].outcome // "outcome_line_absent"),
+                        turns:             length,
+                        input_tokens:      sum_num(.input_tokens),
+                        cache_read_tokens: sum_num(.cache_read_tokens),
+                        llm_calls:         sum_num(.llm_calls) })
+                | sort_by(- .input_tokens)),
              skipped_by_class:
                ($skipped | group_by(.class // "null")
                          | map({ key: (.[0].class // "null"), value: length })
@@ -437,6 +562,24 @@ aggregate() {
              charged_by_release:
                ($turns | group_by(.release // "absent_pre_field")
                        | map({ key:   (.[0].release // "absent_pre_field"),
+                               value: length })
+                       | from_entries),
+             # Et le plat du troisième axe : CE QUE chaque tour payé a fait
+             # (mika#2855). `//` est sûr ici pour la même raison que chez son
+             # voisin — `outcome` est une chaîne non vide ou rien. Le seau ne
+             # porte qu un compte de tours : ce que l issue a coûté se lit dans
+             # `by_agent_trigger_release_outcome`, en tokens, et le dupliquer
+             # ici inviterait à sommer deux axes qui ne se somment pas.
+             #
+             # `outcome_line_absent` EST UNE CLÉ DU SEAU, et c est exprès. Une
+             # fenêtre à cheval sur le déploiement du vol 1 la porte non nulle,
+             # et le § 10 du protocole en fait une HALTE : le dénominateur des
+             # parts se prend sur les attestés, jamais sur attestés + sans
+             # ligne. La cacher rendrait un seau qui a l air complet sur une
+             # fenêtre où il ne l est pas.
+             charged_by_outcome:
+               ($turns | group_by(.outcome // "outcome_line_absent")
+                       | map({ key:   (.[0].outcome // "outcome_line_absent"),
                                value: length })
                        | from_entries) }
            # Le seau change de NOM, pas de place : un lecteur qui cherche

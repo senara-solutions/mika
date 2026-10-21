@@ -93,6 +93,8 @@ L'agrégat porte deux populations qui ne se soustraient pas l'une de l'autre :
 | payée | `by_agent_trigger` | les tours qui ont **eu lieu**, par agent × déclencheur, avec leur coût |
 | payée | `charged_by_release` | **pourquoi** chacun a eu lieu, par terme de relâche (dix valeurs, vol 4) |
 | payée | `by_agent_trigger_release` | les deux à la fois : agent × déclencheur × terme de relâche, **avec le coût en tokens** (vol 5) |
+| payée | `charged_by_outcome` | **ce que** chaque tour a fait, par issue attestée (huit valeurs, mika#2855) |
+| payée | `by_agent_trigger_release_outcome` | les quatre clés : agent × déclencheur × relâche × issue, **avec le coût en tokens** (mika#2855) |
 | écartée | `skipped_by_class` | les tours que le pré-filtre a **évités**, par classe |
 | écartée | `skipped_by_agent_class` | la même population, **par agent** × classe (vol 5) |
 
@@ -156,6 +158,32 @@ cellule. Dans la clé seule, la cellule aurait le bon compte sous un faux nom
 mélangeraient. C'est le motif mika#2331 — *absent n'est ni zéro ni « none »* — et
 l'assertion **N8** du § 4 de `scripts/test-measure-webhook-turn-cost.sh` le
 tient en vérifiant les deux moitiés à la fois.
+
+**Trois absences, trois noms, et aucune ne s'ajoute aux autres** (mika#2855).
+L'axe de l'issue en apporte une seconde, et elle ne dit pas la même chose que
+la première :
+
+| nom | qui le dit | ce qu'il dit |
+|---|---|---|
+| `absent_pre_field` | le lecteur | la ligne d'**entrée** n'avait pas de `release` — binaire d'avant le vol 4 |
+| `outcome_absent` | le **moteur** | la ligne de sortie est là, et le modèle n'y a rien attesté — c'est une valeur du contrat |
+| `outcome_line_absent` | le lecteur | aucune ligne de **sortie** ne porte ce `request_id` — binaire d'avant mika#2855 (motif mika#2340) |
+
+Les deux dernières se ressemblent et mesurent des choses opposées :
+`outcome_absent` est une mesure du **comportement du modèle** — son taux décide
+s'il faut armer `[output].required_suffix_lines` — tandis que
+`outcome_line_absent` est un fait de **déploiement**, vrai pour tous les tours
+d'un binaire à la fois. Les sommer donnerait deux populations sous un nom
+(classe mika#2205) et ferait lire « le modèle n'atteste presque jamais » sur
+une fenêtre à cheval sur un `make deploy`. Elles ont chacune leur clé dans
+`charged_by_outcome`, et l'assertion **N12** du § 5 du harnais les tient
+séparées sur un corpus où les deux tours sont par ailleurs identiques. Sur la
+ligne par tour, l'absence de jointure reste `null` : nommer le seau est le
+travail de l'agrégat, pas celui de la ligne. Trois compteurs de lignes
+accompagnent l'axe — `outcome_lines`, `outcome_lines_unusable` (ni
+`request_id` ni `outcome` exploitable) et `outcome_lines_orphan` (un
+`request_id` qu'aucun tour payé de la fenêtre ne porte) : ils disent la santé
+du **journal**, pas celle des tours, et ne portent donc aucune valeur de coût.
 
 **Ce que le registre ne fait que majorer.** Un tour payé n'est pas un tour
 *inutile*. `by_agent_trigger` donne le **plafond** de ce qu'une classe pourrait
@@ -402,14 +430,44 @@ du modèle : ce sont des termes du moteur, et c'est une propriété du type (deu
 fil). Un tour qui n'atteste rien coûte quand même ses tokens ; il ne dit
 simplement plus ce qu'ils ont acheté.
 
-### Comment il se lira, une fois le vol 2 livré
+### Comment il se lit (vol 2 livré)
 
-Le vol 1 met la ligne dans le journal. `scripts/measure-webhook-turn-cost` ne la
-joint **pas encore** : aujourd'hui elle se lit au `grep`, et la jointure
-automatique est le vol 2 (seau `by_agent_trigger_release_outcome`, tours sans
-ligne de sortie comptés à part sans être perdus ni fusionnés, corpus gelé mêlant
-`state_unreadable` et un arrêt propre). C'est la même séquence que mika#2680 a
-elle-même suivie — vol 1 le registre, vol 2 le lecteur.
+`scripts/measure-webhook-turn-cost` joint la ligne de sortie par `request_id`.
+Deux temps : l'agrégat, puis la lecture de la cellule.
+
+```sh
+scripts/measure-webhook-turn-cost \
+    --log-file "$MIKA_SPIRIT_LOG_FILE" \
+    --agent mika-qa \
+    --since 2026-MM-DD --until 2026-MM-DD \
+    --summary docs/eval/mika-2680/summary-gprime-<fenêtre>.json
+```
+
+```sh
+jq '[.by_agent_trigger_release_outcome[]
+     | select(.agent_id == "mika-qa" and .trigger == "check_suite_pr_branch")]
+    | { "attestés":   (map(select(.outcome != "outcome_line_absent")) | map(.turns) | add // 0),
+        "sans_ligne": (map(select(.outcome == "outcome_line_absent")) | map(.turns) | add // 0),
+        "par_issue":  (map(select(.outcome != "outcome_line_absent"))
+                       | map({ (.outcome): { tours: .turns, tokens: .input_tokens } })
+                       | add) }' \
+   docs/eval/mika-2680/summary-gprime-<fenêtre>.json
+```
+
+L'axe de l'issue ne remplace rien : `by_agent_trigger_release` garde le plafond
+de la cellule au grain du vol 5, et `charged_by_outcome` donne le plat — un
+compte de tours par issue, sur toute la fenêtre et tous les agents.
+
+**Troisième règle de halte, propre à cet axe.** Les deux premières sont au § 4.
+Celle-ci : **une cellule dont `outcome_line_absent` est non nul mêle deux
+régimes binaires** — des tours servis par un binaire qui demande l'attestation,
+et des tours servis par un binaire qui ne la demande pas. La part des arrêts
+n'y est pas calculable : le dénominateur est `attestés`, **jamais**
+`attestés + sans_ligne`, et une part écrite sur le second serait diluée par un
+fait de déploiement qui n'a rien à voir avec ce que le modèle fait. Le remède
+n'est pas une correction, c'est une **fenêtre** : remonter `--since` au premier
+`webhook_turn_outcome` du journal, et refaire la mesure. Tant que `sans_ligne`
+n'est pas nul, on écrit la valeur brute et on ne conclut pas.
 
 **Ce que la prochaine fenêtre chiffrera (AC6 de mika#2855) :** sur la cellule
 `mika-qa × check_suite_pr_branch` — 36 tours, 10 687 327 tokens d'entrée, 16,31 %
