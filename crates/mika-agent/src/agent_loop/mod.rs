@@ -8996,6 +8996,103 @@ fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool
     })
 }
 
+/// Pourquoi une exigence `required_tools` est retirée du lot (mika#2814 vol 4).
+///
+/// **L'enum ne porte aucune méthode de conversion, et c'est la décision.** Les
+/// littéraux `reason = "not_served"`, `reason = "turn_forbids_dispatch"` et
+/// `reason = "mcp_testimony_banned"` restent écrits dans leurs bras respectifs
+/// du `match` de journalisation de [`filter_available_required_tools`]. Un
+/// `as_str()` ferait exister chaque chaîne deux fois — dans la méthode et dans
+/// l'attente d'un test — ou ferait épingler la méthode au lieu de la décision.
+/// Ici la chaîne existe une fois, à son seul site d'émission, et **la variante
+/// est le contrat** que les tests lisent.
+///
+/// C'est aussi ce qui rend la propriété testable du tout : la branche
+/// `NonServi` et la branche `BanTestimony` retirent le **même** outil, donc
+/// rendent le **même** `HashSet`. Aucune assertion sur la valeur rendue par
+/// [`filter_available_required_tools`] ne peut les distinguer, et le dépôt n'a
+/// pas de harnais de capture `tracing` (aucun `tracing-test`, aucun
+/// `TestWriter` dans l'arbre).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RaisonDesarmement {
+    /// L'outil n'existe dans aucune source — registre, skills, MCP (#516/#517).
+    Inexistant,
+    /// Son serveur MCP déclare `data_grade = "testimony"` (mika#1798/mika#2814).
+    BanTestimony,
+    /// Il existe, mais ce tour-ci ne le sert pas (mika#2757).
+    NonServi,
+    /// Il est servi, mais le tour interdit qu'il réussisse (mika#2757).
+    TourInterditDispatch,
+}
+
+/// La décision de désarmement, **pure** et sans journalisation.
+///
+/// Seul consommateur : [`filter_available_required_tools`], qui `match` sur le
+/// résultat pour journaliser puis filtrer. La séparation existe pour que les
+/// tests interrogent la fonction qui **décide** plutôt que la fonction qui
+/// **journalise** — une assertion sur des lignes de log capturées épinglerait
+/// la formulation, une assertion sur la variante épingle la propriété (voir
+/// [`RaisonDesarmement`]).
+///
+/// ## L'ordre des branches est load-bearing, et c'est la propriété du vol
+///
+/// **1** l'outil n'existe pas → **2** son serveur déclare `testimony` → **3**
+/// le tour ne le sert pas → **4** le tour interdit le dispatch.
+///
+/// Ce n'est pas une préférence de lisibilité. Un outil MCP testimony **n'est
+/// jamais servi** — `mcp::retain_publiables` l'a retiré du lot publié, donc de
+/// `enabled_tool_names`, bâti sur `skill_tool_defs` — si bien qu'une branche
+/// `BanTestimony` posée **après** `NonServi` serait inatteignable à 100 %, pour
+/// toujours, **avec tous les tests verts**. C'est
+/// `mika2814_un_outil_mcp_testimony_non_servi_est_desarme_sous_le_ban` qui
+/// l'empêche : il mesure l'état *testimony **et** non servi*, le seul que la
+/// production produise, et il rougit sur l'ordre inverse (rouge constaté avant
+/// le câblage : `left: Some(NonServi)`, `right: Some(BanTestimony)`).
+///
+/// `BanTestimony` se pose **après** `Inexistant` parce qu'un outil qui n'existe
+/// pas n'a pas de grade, et parce que la branche 1 accuse une configuration de
+/// skill cassée — un diagnostic plus élémentaire, qui doit rester premier.
+///
+/// `turn_forbids_dispatch` entre en `bool` **déjà calculé**, et non en `&str` :
+/// `is_unauthorized_webhook_dispatch` est évalué une fois pour l'ensemble des
+/// exigences (mika#2757 — « le domaine est une propriété du tour, pas de
+/// l'outil »), et faire entrer `turn_message` ici inviterait à le réévaluer par
+/// outil.
+fn raison_de_desarmement(
+    outil: &str,
+    tools: &ToolRegistry,
+    skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
+    mcp_manager: Option<&McpManager>,
+    served: &HashSet<String>,
+    turn_forbids_dispatch: bool,
+) -> Option<RaisonDesarmement> {
+    // Branche 1 — l'outil n'existe pas (#516/#517).
+    let available = tools.get(outil).is_some()
+        || skill_tool_map.contains_key(outil)
+        || mcp_manager.is_some_and(|m| m.is_mcp_tool(outil));
+    if !available {
+        return Some(RaisonDesarmement::Inexistant);
+    }
+
+    // Branche 2 — son serveur déclare `testimony`. AVANT `NonServi`, sans quoi
+    // cette branche est morte : voir le doc-comment ci-dessus.
+    if mcp_manager.is_some_and(|m| m.is_testimony_tool(outil)) {
+        return Some(RaisonDesarmement::BanTestimony);
+    }
+
+    // Branche 3 — l'outil existe mais ce tour-ci ne le sert pas.
+    if !served.contains(outil) {
+        return Some(RaisonDesarmement::NonServi);
+    }
+
+    // Branche 4 — l'outil est servi, mais le tour interdit qu'il réussisse.
+    if turn_forbids_dispatch && is_dispatch_tool(outil) {
+        return Some(RaisonDesarmement::TourInterditDispatch);
+    }
+
+    None
+}
+
 /// Filter required tools to only those the turn can actually satisfy.
 ///
 /// Checks builtins (ToolRegistry), skill-defined tools, and MCP tools. Tools not found
@@ -9015,15 +9112,26 @@ fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool
 ///
 /// **Le principe (plan § 2.1).** Une exigence que le tour lui-même rend
 /// impossible à satisfaire est une contradiction, et le moteur la désarme **en la
-/// nommant**. Trois raisons de retrait, dans cet ordre :
+/// nommant**. Quatre raisons de retrait, dans cet ordre :
 ///
 /// 1. **l'outil n'existe pas** — comportement d'origine, `WARN` inchangé
 ///    (#516/#517) ;
-/// 2. **l'outil existe mais n'est pas servi sur ce tour** —
+/// 2. **son serveur MCP déclare `data_grade = "testimony"`** — la doctrine
+///    non-transit interdit l'accès *et la proposition d'accès* (mika#1798) —
+///    `WARN event = "required_tool_disarmed", reason = "mcp_testimony_banned"`
+///    (mika#2814 vol 4) ;
+/// 3. **l'outil existe mais n'est pas servi sur ce tour** —
 ///    `INFO event = "required_tool_disarmed", reason = "not_served"` ;
-/// 3. **l'outil est servi mais le tour interdit qu'il réussisse** — un outil de
+/// 4. **l'outil est servi mais le tour interdit qu'il réussisse** — un outil de
 ///    dispatch sur un message du domaine Webhook Fallthrough —
 ///    `INFO event = "required_tool_disarmed", reason = "turn_forbids_dispatch"`.
+///
+/// **Cet ordre est la propriété, pas une préférence de lecture.** Un outil MCP
+/// testimony n'est jamais servi — [`crate::mcp::retain_publiables`] l'a retiré du lot
+/// publié — si bien que la branche 2 posée **après** la branche 3 serait
+/// inatteignable à 100 %, pour toujours, avec tous les tests verts. La décision
+/// vit dans [`raison_de_desarmement`], qui porte le détail ; ce `match`-ci ne
+/// fait que la journaliser.
 ///
 /// **Les branches 1 et 2 ne sont pas redondantes**, et confondre les deux ferait
 /// lire une restriction normale comme une erreur de configuration. `served` est
@@ -9040,6 +9148,14 @@ fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool
 /// la leçon des « 25+ documented misfires » de mika#1469. Le champ `reason`
 /// sépare les deux formes par `GROUP BY`. Le `WARN` de la branche 1 reste un
 /// `WARN` : celui-là accuse une configuration, pas un tour.
+///
+/// **La branche 2 est un `WARN`, et pour la raison inverse (mika#2814 vol 4).**
+/// Sa population est *mesurément vide* aujourd'hui : les onze déclarations
+/// `required_tools` de `skills/bundled/` ne portent aucun préfixe `mcp__`. Elle
+/// ne tirera donc pas des dizaines de fois par jour — elle ne tirera pas du
+/// tout, et le jour où elle tire, une skill exige nommément un outil que la
+/// doctrine bannit. C'est une configuration à corriger, comme la branche 1, pas
+/// un tour qui restreint.
 ///
 /// **Aucune capacité n'est retirée.** La valeur rendue n'est lue que par le
 /// re-prompt `required_tools` et par `has_terminal_required_tool_failure` ; rien
@@ -9066,44 +9182,65 @@ fn filter_available_required_tools(
     required
         .iter()
         .filter(|t| {
-            // Branche 1 — l'outil n'existe pas (#516/#517).
-            let available = tools.get(t).is_some()
-                || skill_tool_map.contains_key(t.as_str())
-                || mcp_manager.is_some_and(|m| m.is_mcp_tool(t));
-            if !available {
-                warn!(
-                    tool = %t,
-                    "required_tools references unavailable tool — skipping enforcement \
-                     (fix the skill's [constraints] required_tools config)"
-                );
-                return false;
-            }
+            match raison_de_desarmement(
+                t,
+                tools,
+                skill_tool_map,
+                mcp_manager,
+                served,
+                turn_forbids_dispatch,
+            ) {
+                // Branche 1 — l'outil n'existe pas (#516/#517).
+                Some(RaisonDesarmement::Inexistant) => {
+                    warn!(
+                        tool = %t,
+                        "required_tools references unavailable tool — skipping enforcement \
+                         (fix the skill's [constraints] required_tools config)"
+                    );
+                    false
+                }
 
-            // Branche 2 — l'outil existe mais ce tour-ci ne le sert pas.
-            if !served.contains(t.as_str()) {
-                info!(
-                    event = "required_tool_disarmed",
-                    tool = %t,
-                    reason = "not_served",
-                    "required tool is not in this turn's served tool set — disarming the \
-                     requirement (mika#2757)"
-                );
-                return false;
-            }
+                // Branche 2 — son serveur MCP déclare `testimony` (mika#2814 vol 4).
+                Some(RaisonDesarmement::BanTestimony) => {
+                    warn!(
+                        event = "required_tool_disarmed",
+                        tool = %t,
+                        server = crate::mcp::serveur_du_nom_namespace(t).unwrap_or("?"),
+                        reason = "mcp_testimony_banned",
+                        "required tool belongs to an MCP server declaring \
+                         data_grade = \"testimony\" — the non-transit doctrine forbids \
+                         accessing it and forbids proposing to (mika#1798), so it cannot be \
+                         required — disarming the requirement (mika#2814)"
+                    );
+                    false
+                }
 
-            // Branche 3 — l'outil est servi, mais le tour interdit qu'il réussisse.
-            if turn_forbids_dispatch && is_dispatch_tool(t) {
-                info!(
-                    event = "required_tool_disarmed",
-                    tool = %t,
-                    reason = "turn_forbids_dispatch",
-                    "this turn forbids dispatch (Webhook Fallthrough domain), so a dispatch \
-                     tool cannot be required — disarming the requirement (mika#2757)"
-                );
-                return false;
-            }
+                // Branche 3 — l'outil existe mais ce tour-ci ne le sert pas.
+                Some(RaisonDesarmement::NonServi) => {
+                    info!(
+                        event = "required_tool_disarmed",
+                        tool = %t,
+                        reason = "not_served",
+                        "required tool is not in this turn's served tool set — disarming the \
+                         requirement (mika#2757)"
+                    );
+                    false
+                }
 
-            true
+                // Branche 4 — l'outil est servi, mais le tour interdit qu'il réussisse.
+                Some(RaisonDesarmement::TourInterditDispatch) => {
+                    info!(
+                        event = "required_tool_disarmed",
+                        tool = %t,
+                        reason = "turn_forbids_dispatch",
+                        "this turn forbids dispatch (Webhook Fallthrough domain), so a dispatch \
+                         tool cannot be required — disarming the requirement (mika#2757)"
+                    );
+                    false
+                }
+
+                None => true,
+            }
         })
         .cloned()
         .collect()
@@ -15604,6 +15741,232 @@ mod tests {
             effective,
             HashSet::from(["run_claude_pilot".to_string()]),
             "sur un ready-label, le dispatch est l'ordre du tour, pas son interdit"
+        );
+    }
+
+    // -- raison_de_desarmement tests (mika#2814 vol 4) --
+
+    /// Manager MCP sans connexion portant un seul outil namespacé au grade
+    /// donné — le harnais des sept cas ci-dessous.
+    fn mcp_avec_outil(outil: &str, grade: crate::skills::manifest::DataGrade) -> McpManager {
+        let (serveur, nom) = outil
+            .strip_prefix("mcp__")
+            .and_then(|r| r.split_once("__"))
+            .expect("un nom d'outil MCP namespacé");
+        McpManager::sans_connexion_pour_tests(
+            HashMap::from([(outil.to_string(), (serveur.to_string(), nom.to_string()))]),
+            HashMap::from([(outil.to_string(), grade)]),
+        )
+    }
+
+    /// **Cas 1 — le cœur de l'AC, et l'épinglage de l'ordre des branches.**
+    ///
+    /// Un outil MCP testimony n'est **jamais** servi : `retain_publiables`
+    /// (vol 1) l'a retiré du lot publié, donc de `enabled_tool_names`. Cet état
+    /// — *testimony **et** non servi* — est donc le seul que la production
+    /// produise, et c'est exactement celui sur lequel une branche
+    /// `BanTestimony` posée **après** `NonServi` serait inatteignable à 100 %,
+    /// pour toujours, avec tous les tests verts.
+    ///
+    /// Ce test est ce qui l'empêche : il rougit sur l'ordre faux.
+    #[test]
+    fn mika2814_un_outil_mcp_testimony_non_servi_est_desarme_sous_le_ban() {
+        use crate::skills::manifest::DataGrade;
+
+        let outil = "mcp__journal-perso__read_entry";
+        let mcp = mcp_avec_outil(outil, DataGrade::Testimony);
+        let tools = ToolRegistry::new();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        assert_eq!(
+            raison_de_desarmement(outil, &tools, &skill_map, Some(&mcp), &served(&[]), false),
+            Some(RaisonDesarmement::BanTestimony),
+            "la raison doit nommer le ban doctrinal, pas `NonServi` — deux populations \
+             sous les mêmes octets est la classe mika#2205, et une branche testimony \
+             posée après `NonServi` est inatteignable par construction (plan D3)"
+        );
+    }
+
+    /// **Cas 2 — l'état que la production ne produit pas, et qui tient quand
+    /// même.** Si un jour `retain_publiables` cesse de retirer l'outil, ou si un
+    /// troisième site publie sans filtrer, l'outil testimony arrive *servi* ici.
+    /// La réponse doit être la même : le ban ne dépend pas du tableau servi. Sans
+    /// ce cas, la seule garantie serait un effet de bord du vol 1.
+    #[test]
+    fn mika2814_un_outil_mcp_testimony_servi_reste_desarme_sous_le_ban() {
+        use crate::skills::manifest::DataGrade;
+
+        let outil = "mcp__journal-perso__read_entry";
+        let mcp = mcp_avec_outil(outil, DataGrade::Testimony);
+        let tools = ToolRegistry::new();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        assert_eq!(
+            raison_de_desarmement(
+                outil,
+                &tools,
+                &skill_map,
+                Some(&mcp),
+                &served(&[outil]),
+                false
+            ),
+            Some(RaisonDesarmement::BanTestimony),
+            "le ban est une propriété du grade du serveur, pas du tableau servi"
+        );
+    }
+
+    /// **Cas 3 — le contrôle négatif du grade.** Même outil MCP, même manager,
+    /// même tableau servi : seul `data_grade` change, et l'exigence survit
+    /// intacte. C'est ce cas qui interdit à la branche 2 de bannir *tout* outil
+    /// MCP, et il est la moitié du couple auto-nettoyant de la Fire-Disposition
+    /// avec le cas 4.
+    #[test]
+    fn mika2814_un_outil_mcp_operational_servi_nest_pas_desarme() {
+        use crate::skills::manifest::DataGrade;
+
+        let outil = "mcp__calendrier__list_events";
+        let mcp = mcp_avec_outil(outil, DataGrade::Operational);
+        let tools = ToolRegistry::new();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        assert_eq!(
+            raison_de_desarmement(
+                outil,
+                &tools,
+                &skill_map,
+                Some(&mcp),
+                &served(&[outil]),
+                false
+            ),
+            None,
+            "un outil MCP `operational` servi est une exigence satisfaisable — c'est \
+             exactement ce que le refus de la garde proposée par le vol 3 protège (plan D7)"
+        );
+    }
+
+    /// **Cas 4 — l'autre moitié du couple.** Outil MCP `operational` mais non
+    /// servi : la raison doit rester `NonServi`. Le ban ne se substitue pas à la
+    /// branche 3 pour les outils MCP en général.
+    #[test]
+    fn mika2814_un_outil_mcp_operational_non_servi_est_desarme_comme_non_servi() {
+        use crate::skills::manifest::DataGrade;
+
+        let outil = "mcp__calendrier__list_events";
+        let mcp = mcp_avec_outil(outil, DataGrade::Operational);
+        let tools = ToolRegistry::new();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        assert_eq!(
+            raison_de_desarmement(outil, &tools, &skill_map, Some(&mcp), &served(&[]), false),
+            Some(RaisonDesarmement::NonServi),
+            "un outil MCP non banni et non servi relève de la branche 3, pas de la 2"
+        );
+    }
+
+    /// **Cas 5 — la branche 1 garde sa préséance.** Aucun manager, registre vide,
+    /// skill map vide : l'outil n'existe nulle part, et c'est `Inexistant` qui
+    /// répond — pas `NonServi`, bien qu'il ne soit pas servi non plus. C'est ce
+    /// qui épingle que `BanTestimony` se pose **après** la branche 1 : un outil
+    /// qui n'existe pas n'a pas de grade.
+    #[test]
+    fn mika2814_un_outil_inexistant_reste_desarme_comme_inexistant() {
+        let tools = ToolRegistry::new();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        assert_eq!(
+            raison_de_desarmement(
+                "mcp__journal-perso__read_entry",
+                &tools,
+                &skill_map,
+                None,
+                &served(&[]),
+                false
+            ),
+            Some(RaisonDesarmement::Inexistant),
+            "sans manager MCP, un nom namespacé n'existe pas plus qu'un autre — la \
+             branche 1 reste première, et son `WARN` accuse la config de la skill"
+        );
+    }
+
+    /// **Cas 6 — la branche 4 est inchangée.** Un outil de dispatch servi, sur un
+    /// tour dont le domaine interdit le dispatch : `TourInterditDispatch`. Le
+    /// `bool` entre déjà calculé (mika#2757 — le domaine est une propriété du
+    /// tour), et l'insertion de la branche 2 ne l'a pas déplacé.
+    #[test]
+    fn mika2814_un_outil_de_dispatch_reste_desarme_par_le_tour() {
+        let tools = make_registry_with_tool("run_claude_pilot_groom");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        assert_eq!(
+            raison_de_desarmement(
+                "run_claude_pilot_groom",
+                &tools,
+                &skill_map,
+                None,
+                &served(&["run_claude_pilot_groom"]),
+                true
+            ),
+            Some(RaisonDesarmement::TourInterditDispatch),
+            "la branche du tour reste la dernière, et elle répond toujours"
+        );
+    }
+
+    /// **Cas 7 — le contrôle négatif global.** Un builtin servi sur un tour
+    /// neutre : rien ne désarme. Sans ce cas, une fonction qui rendrait
+    /// `Some(_)` pour tout serait verte sur les six autres.
+    #[test]
+    fn mika2814_un_builtin_servi_sur_un_tour_neutre_nest_pas_desarme() {
+        let tools = make_registry_with_tool("create_task");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+
+        assert_eq!(
+            raison_de_desarmement(
+                "create_task",
+                &tools,
+                &skill_map,
+                None,
+                &served(&["create_task"]),
+                false
+            ),
+            None,
+            "un builtin servi hors domaine interdit est une exigence tenable"
+        );
+    }
+
+    /// **Le cas bout en bout (livrable 6).** Les sept cas ci-dessus interrogent
+    /// la fonction qui *décide* ; celui-ci interroge la fonction qui *filtre*,
+    /// pour que le câblage du `match` soit lui aussi tenu — un bras qui rendrait
+    /// `true` au lieu de `false` passerait les sept et échouerait ici.
+    ///
+    /// Les deux exigences voyagent **ensemble**, parce qu'un lot vide et un lot
+    /// correctement amputé ne doivent pas rendre les mêmes octets : le builtin
+    /// survivant est ce qui distingue « le ban a retiré l'outil testimony » de
+    /// « le filtre a tout retiré ».
+    #[test]
+    fn mika2814_le_filtre_ampute_lexigence_testimony_et_garde_le_builtin() {
+        use crate::skills::manifest::DataGrade;
+
+        let outil_testimony = "mcp__journal-perso__read_entry";
+        let mcp = mcp_avec_outil(outil_testimony, DataGrade::Testimony);
+        let tools = make_registry_with_tool("create_task");
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let required: HashSet<String> =
+            [outil_testimony.to_string(), "create_task".to_string()].into();
+
+        let effective = filter_available_required_tools(
+            &required,
+            &tools,
+            &skill_map,
+            Some(&mcp),
+            &served(&["create_task"]),
+            "classe les notes de la semaine",
+        );
+
+        assert_eq!(
+            effective,
+            HashSet::from(["create_task".to_string()]),
+            "l'exigence testimony doit disparaître du lot effectif et le builtin y rester \
+             — un lot vide dirait autre chose (classe mika#2205)"
         );
     }
 

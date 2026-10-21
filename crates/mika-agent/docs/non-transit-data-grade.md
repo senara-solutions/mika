@@ -433,13 +433,12 @@ exposes no field names at runtime; what keeps it from drifting is
 round-trip against the actually-serialized keys, so the gesture that makes an
 entry pointless is the one that makes it expire (mika#2309).
 
-**What this still does NOT buy, and where it is tracked.** The scope is
-`mcpServers.<name>` entries only. A typo on the top-level key itself
-(`"mcpServer"`) yields an empty config and says nothing here — it is visible at
-first use, when no server is connected, and is deliberately out of scope. And
-`filter_available_required_tools` — the function that decides which required
-tools a skill sees as available — is still not pinned against the L2 filter.
-Tracked in: senara-solutions/mika#2814 (vol 4).
+**What this still does NOT buy.** The scope is `mcpServers.<name>` entries only.
+A typo on the top-level key itself (`"mcpServer"`) yields an empty config and
+says nothing here — it is visible at first use, when no server is connected, and
+is deliberately out of scope. `filter_available_required_tools` — the function
+that decides which required tools a skill sees as available — **is** pinned
+against the ban since mika#2814 vol 4: see the disarmament branch below.
 
 ### Applied hardening (closed after mika#1798)
 
@@ -562,8 +561,25 @@ it still does NOT cover:
     `docs/mcp.md` § *Déclarer le grade d'un serveur MCP*.
   - MCP → L4 seeding: `crates/mika-agent/src/mcp/mod.rs` §
     `mcp_tool_data_grades` + `McpManager::tool_data_grades`, consumed by
-    `crates/mika-agent/src/agent_loop/mod.rs` § `seed_mcp_data_grades` at the
-    two sites that publish `mcp.tool_definitions()`.
+    `crates/mika-agent/src/agent_loop/mod.rs` § `seed_mcp_data_grades`. Since
+    mika#2814 vol 2 the two publication sites no longer call it directly: they
+    call `publier_outils_mcp`, the one helper that publishes **and** seeds in a
+    single gesture, so the pairing is a property of the call rather than of its
+    spelling. The inventory guard
+    (`mika2814_publier_des_outils_mcp_passe_par_le_helper_qui_ensemence`) is what
+    refuses a publication written around it.
+  - MCP → required-tools disarmament (mika#2814 vol 4):
+    `crates/mika-agent/src/agent_loop/mod.rs` § `raison_de_desarmement`, branch
+    `RaisonDesarmement::BanTestimony`, logged by
+    `filter_available_required_tools` as
+    `WARN event = "required_tool_disarmed", reason = "mcp_testimony_banned"` with
+    `tool` + `server`. The predicate is `McpManager::is_testimony_tool`, reading
+    the same `tool_data_grades` map as the two doors above — a third consumer,
+    still one source of truth. The branch sits **before** `NonServi` on purpose:
+    a testimony tool is never served (L2 removed it), so the branch placed after
+    would be unreachable forever with every test green. Tests:
+    `agent_loop::tests::mika2814_*` (seven unit cases on the pure decision + one
+    end-to-end through the filter).
   - MCP publication filter (Layer 2): `crates/mika-agent/src/mcp/mod.rs` §
     `retain_publiables`, called by `McpManager::connect_all` (mika#2814). It
     consumes the **same** map `mcp_tool_data_grades` builds for L4 — one source
@@ -574,6 +590,37 @@ it still does NOT cover:
 
 ## Change log
 
+- **2026-10-21** — mika#2814 (vol 4, **closing the ticket**): the disarmament of
+  a `required_tools` entry now **names the ban**. A required MCP tool whose
+  server declares `testimony` is removed under
+  `reason = "mcp_testimony_banned"` instead of `not_served` — the branch sits
+  before `NonServi`, which is the whole property: L2 (vol 1) already removed the
+  tool from the published set, hence from the served set, so a testimony branch
+  placed *after* `NonServi` would be unreachable at 100 %, forever, with every
+  test green. Measured red before wiring (`Some(NonServi)` where
+  `Some(BanTestimony)` was due), which is what makes the order a pinned property
+  rather than a writing preference.
+  The decision moved into `raison_de_desarmement`, pure and log-free, returning
+  a `RaisonDesarmement` variant — because `NonServi` and `BanTestimony` remove
+  the *same* tool and therefore return the *same* `HashSet`, so no assertion on
+  the filter's output can tell them apart, and this repository has no `tracing`
+  capture harness. The enum deliberately carries **no** `as_str()`: each
+  `reason` literal stays written at its single emission site, and tests assert
+  variants. New predicate `McpManager::is_testimony_tool` (absent from the map ⇒
+  **not** banned: the default is to publish, not to censor silently); `server`
+  on the WARN comes from `mcp::serveur_du_nom_namespace`, promoted to
+  `pub(crate)` — the one word this flight changed in vols 1–3.
+  It is a **WARN** and not an INFO, for the inverse of mika#2757's reason: the
+  population is *measurably empty* today (none of the eleven `required_tools`
+  declarations under `skills/bundled/` carries an `mcp__` prefix), so it will not
+  fire dozens of times a day, and the day it fires a skill names a tool the
+  doctrine bans. Vol 3's proposed guard — refusing any `mcp__*` in
+  `required_tools` — is **refused, not deferred**: it would ban legitimate
+  `operational` MCP tools, and this flight's cases 3 and 4 are what keep the ban
+  from widening to all MCP tools.
+  This closes the two residues the vol-1 entry below left open: the single
+  publish+seed helper (`publier_outils_mcp`, vol 2, PR #2845) and the load-time
+  unknown-key warning on `mcp.json` server entries (vol 3, PR #2852).
 - **2026-10-19** — mika#2814: the MCP tier gained its **Layer-2** half, closing
   mika#1959's decision D5. `McpManager::connect_all` runs the discovered
   definitions through `mcp::retain_publiables`, which drops every tool whose
