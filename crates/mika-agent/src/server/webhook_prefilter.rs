@@ -374,21 +374,65 @@ pub(crate) struct ReviewVerdictFacts {
 /// Ce terme n'existe pas pour brancher, mais pour **séparer les populations
 /// dans l'audit** : « 60 % d'escalade sur (h) » n'est pas une mesure si les
 /// commentaires et les fermetures y sont additionnés — deux populations sous
-/// un seul nom ne se soustraient pas (mika#2205). Ce vol n'en livre qu'une ;
-/// la moitié `issues` `closed` (AC4) arrive au vol 2, avec une lecture de
-/// l'état d'AVANT `upstream_close_handler` (voir [`classify`]).
+/// un seul nom ne se soustraient pas (mika#2205). Il sépare aussi deux
+/// chemins de lecture, et c'est la raison d'AC4 :
+/// les deux moitiés ne lisent pas l'état du ticket au même endroit — la
+/// fermeture le lit AVANT `upstream_close_handler` (voir
+/// [`snapshot_closure_task_state`]), le commentaire le lit dans la porte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TriageHalf {
     /// `issue_comment` : du texte humain neuf, la moitié chiffrée par mika#2680.
     Comment,
+    /// `issues` `closed` (mika#2854 AC4) : la moitié dont l'état du ticket se
+    /// lit sur un instantané d'avant le nettoyage, et non en direct.
+    IssueClosed,
 }
 
 impl TriageHalf {
     /// Le préfixe de la cible d'audit. Pas un `as_str` de classe : c'est la
     /// clé de regroupement qui sépare les moitiés.
+    ///
+    /// `"issue_closed"` est déjà l'orthographe de [`TriggerClass::IssueClosed`] :
+    /// les deux axes nomment la même moitié du même nom, donc un `GROUP BY`
+    /// croisé reste lisible.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Comment => "issue_comment",
+            Self::IssueClosed => "issue_closed",
+        }
+    }
+}
+
+/// L'état du ticket lu AVANT `upstream_close_handler` (mika#2854 AC4).
+///
+/// Quatre variantes et non un `Option<bool>` : « pas une fermeture », « triage
+/// désarmé » et « lecture en échec » sont trois causes de non-lecture qu'un
+/// `None` fusionnerait, et dont deux sont des défauts de câblage tandis que la
+/// troisième est le régime nominal. Classe mika#2205.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClosureSnapshot {
+    /// Le texte n'est pas une fermeture de (h) : le terme n'a pas de sujet.
+    NotAClosure,
+    /// Le triage est désarmé — aucun état n'est lu. Tient la promesse § D8 du
+    /// vol 1 : « désarmé, aucun appel n'est fait et aucun état n'est lu ».
+    Disarmed,
+    /// L'état du ticket avant le nettoyage.
+    Read(bool),
+    /// La lecture a échoué, et l'erreur est nommée.
+    Unreadable(String),
+}
+
+impl ClosureSnapshot {
+    /// Le nom de la variante, pour le champ `what` du WARN de
+    /// [`snapshot_absent`]. Les deux absences ne doivent pas rendre les mêmes
+    /// octets : « ce texte n'était pas une fermeture » et « la classe était
+    /// désarmée » appellent deux enquêtes différentes (mika#2205).
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAClosure => "not_a_closure",
+            Self::Disarmed => "disarmed",
+            Self::Read(_) => "read",
+            Self::Unreadable(_) => "unreadable",
         }
     }
 }
@@ -554,6 +598,57 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
     })
 }
 
+/// Prendre l'instantané de la moitié fermeture, AVANT `upstream_close_handler`
+/// (mika#2854 AC4).
+///
+/// # Pourquoi cette fonction existe, et pourquoi elle est appelée si tôt
+///
+/// `upstream_close_handler::try_handle_upstream_close` tourne à
+/// `handlers.rs:1994`, donc **avant** la porte du pré-filtre, et marque
+/// terminales les lignes de suivi du ticket qui vient de se fermer. Lire l'état
+/// du ticket *dans* la porte lirait donc l'état d'APRÈS ce nettoyage : la garde
+/// AC7 rendrait `false` exactement sur les tickets en vol, c'est-à-dire qu'elle
+/// serait aveugle là où elle sert. L'appel se fait pour cette raison juste après
+/// que `original_github_text` a été pris (`handlers.rs:1749`), au plus tôt, et
+/// non « juste avant la l. 1994 » — un handler inséré entre les deux rouvrirait
+/// la classe en silence.
+///
+/// # La clé vient de `classify`, pas d'une seconde orthographe
+///
+/// [`classify`] est une fonction pure sur une `&str` : l'appeler une seconde
+/// fois par webhook de fermeture ne coûte rien, et **c'est ce qui garantit par
+/// construction que la clé lue ici est la clé que le décideur lira**. La
+/// troncature du fragment vit à un seul endroit, l'extraction ; la recopier ici
+/// serait la seconde chance de divergence que mika#2854 § D6 a fermée.
+///
+/// L'ordre des deux gardes est voulu : la classification d'abord — gratuite, et
+/// c'est elle qui décide si la question a un sujet — le désarmement ensuite. Un
+/// [`ClosureSnapshot::Disarmed`] n'est donc rendu que pour un texte qui
+/// *aurait* été trié.
+pub(crate) async fn snapshot_closure_task_state(
+    original: Option<&str>,
+    db: &AsyncDatabase,
+) -> ClosureSnapshot {
+    let Some(text) = original else {
+        return ClosureSnapshot::NotAClosure;
+    };
+    let Some(Candidate::HumanTextNoTask {
+        issue_url,
+        half: TriageHalf::IssueClosed,
+        ..
+    }) = classify(text)
+    else {
+        return ClosureSnapshot::NotAClosure;
+    };
+    if !prefilter_enabled() || !comment_triage::triage_enabled() {
+        return ClosureSnapshot::Disarmed;
+    }
+    match db.has_active_self_dev_task_for_issue(&issue_url).await {
+        Ok(v) => ClosureSnapshot::Read(v),
+        Err(e) => ClosureSnapshot::Unreadable(e.to_string()),
+    }
+}
+
 /// L'état d'une PR côté forge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrForgeState {
@@ -617,6 +712,17 @@ pub(crate) trait PrefilterState {
     /// l'extraction, parce qu'un `#issuecomment-123` ferait rendre `false` à
     /// tout commentaire et écarterait des tickets en vol.
     async fn issue_has_active_task(&self, issue_url: &str) -> anyhow::Result<bool>;
+    /// (h) la moitié fermeture : l'état du ticket tel qu'il était AVANT
+    /// `upstream_close_handler` (mika#2854 AC4). Pas d'`issue_url` en argument
+    /// et pas d'`async` : la lecture a DÉJÀ eu lieu, dans `handlers.rs`, avant
+    /// le nettoyage. Ce terme ne fait que la rendre — ce qui rend « lire en
+    /// direct sur une fermeture » non représentable.
+    ///
+    /// Un `async fn closure_has_active_task(&self, url: &str)` aurait eu
+    /// exactement la même forme qu'[`Self::issue_has_active_task`] et se serait
+    /// laissé implémenter par une lecture live sans qu'aucun test ne rougisse.
+    /// La signature est ce qui interdit la faute.
+    fn closure_task_snapshot(&self) -> &ClosureSnapshot;
     /// (h) le brin de triage. Un terme d'état comme les autres, délibérément :
     /// un appel de modèle borné et sans outils est, du point de vue de
     /// [`decide`], une lecture qui peut échouer — et la faire passer par le
@@ -635,6 +741,14 @@ pub(crate) struct LiveState<'a> {
     /// est l'une des quatre pannes de [`Release::TriageUnreadable`], jamais un
     /// silence.
     pub(crate) llm: Option<&'a dyn LlmProvider>,
+    /// (h) l'instantané pris AVANT `upstream_close_handler` (mika#2854 AC4).
+    ///
+    /// Une **référence** et non une valeur : le champ transporte une lecture
+    /// déjà faite, et un `LiveState` construit sans elle n'a rien à inventer —
+    /// il prête `&ClosureSnapshot::NotAClosure`, que le décideur nomme sous sa
+    /// propre relâche plutôt que de le confondre avec « ce ticket n'a pas de
+    /// tâche ».
+    pub(crate) closure_snapshot: &'a ClosureSnapshot,
 }
 
 impl PrefilterState for LiveState<'_> {
@@ -684,6 +798,10 @@ impl PrefilterState for LiveState<'_> {
 
     async fn issue_has_active_task(&self, issue_url: &str) -> anyhow::Result<bool> {
         self.db.has_active_self_dev_task_for_issue(issue_url).await
+    }
+
+    fn closure_task_snapshot(&self) -> &ClosureSnapshot {
+        self.closure_snapshot
     }
 
     async fn triage(&self, text: &str) -> anyhow::Result<TriageVerdict> {
@@ -1584,6 +1702,11 @@ pub(crate) mod tests {
         /// d'[`answer`] est l'assertion.
         pub(crate) issue_task: Option<Result<bool, &'static str>>,
         pub(crate) triage: Option<Result<TriageVerdict, &'static str>>,
+        /// (h) moitié fermeture, mika#2854 AC4. Même convention que les autres
+        /// fentes : `None` veut dire « l'instantané ne doit pas être consulté »
+        /// et panique s'il l'est — c'est ce qui prouve que la moitié
+        /// commentaire ne passe pas par ce chemin.
+        pub(crate) closure_snapshot: Option<ClosureSnapshot>,
     }
 
     fn answer_rows(
@@ -1630,6 +1753,11 @@ pub(crate) mod tests {
                 Some(Err(e)) => Err(anyhow::anyhow!(*e)),
                 None => panic!("recherche d'état non attendue : triage"),
             }
+        }
+        fn closure_task_snapshot(&self) -> &ClosureSnapshot {
+            self.closure_snapshot
+                .as_ref()
+                .unwrap_or_else(|| panic!("recherche d'état non attendue : closure_snapshot"))
         }
     }
 
@@ -3526,6 +3654,7 @@ pub(crate) mod tests {
             github_token: None,
             request_id: "rid-now",
             llm: None,
+            closure_snapshot: &ClosureSnapshot::NotAClosure,
         };
         assert!(state.triage("peu importe le texte").await.is_err());
     }

@@ -5797,6 +5797,9 @@ mod tests {
             // existe depuis mika#2854, et `None` s'y comporte comme une panne
             // (fail-open), jamais comme une note.
             llm: None,
+            // Idem : aucun n'est une fermeture, donc l'instantané d'AC4 n'a
+            // pas de sujet.
+            closure_snapshot: &webhook_prefilter::ClosureSnapshot::NotAClosure,
         };
         for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
             assert_eq!(
@@ -5837,6 +5840,9 @@ mod tests {
             // existe depuis mika#2854, et `None` s'y comporte comme une panne
             // (fail-open), jamais comme une note.
             llm: None,
+            // Idem : aucun n'est une fermeture, donc l'instantané d'AC4 n'a
+            // pas de sujet.
+            closure_snapshot: &webhook_prefilter::ClosureSnapshot::NotAClosure,
         };
         let hold = webhook_prefilter::tests::review(
             "commented",
@@ -6075,6 +6081,9 @@ mod tests {
             // existe depuis mika#2854, et `None` s'y comporte comme une panne
             // (fail-open), jamais comme une note.
             llm: None,
+            // Idem : aucun n'est une fermeture, donc l'instantané d'AC4 n'a
+            // pas de sujet.
+            closure_snapshot: &webhook_prefilter::ClosureSnapshot::NotAClosure,
         };
         let text = mika2675_review("commented", MIKA2675_QA, "VERDICT: hold[review]");
         let touched = |after| webhook_prefilter::Touched {

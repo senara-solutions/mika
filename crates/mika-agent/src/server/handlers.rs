@@ -1747,6 +1747,22 @@ pub(super) async fn run_agent_for_message(
     // handlers ne le remplacent ou l'enrichissent : le pré-filtre classe ce
     // texte-là, et ne filtre que si aucun handler n'y a touché.
     let original_github_text = (req.channel == "github").then(|| req.text.clone());
+    // mika#2854 AC4 — l'état du ticket AVANT `upstream_close_handler`.
+    //
+    // Ce handler tourne plus bas (`try_handle_upstream_close`) et marque
+    // terminales les lignes de suivi du ticket qu'il vient de voir fermé. La
+    // porte du pré-filtre, elle, tourne APRÈS lui : une lecture faite là-bas
+    // lirait l'état d'après le nettoyage, et la garde AC7 — « un ticket avec
+    // tâche de boucle garde son tour complet » — serait aveugle exactement sur
+    // la population qu'elle protège.
+    //
+    // La capture est donc ici, au plus tôt, et non « juste avant » le site de
+    // nettoyage : un handler inséré entre les deux rouvrirait la classe en
+    // silence. Elle ne lit rien quand le texte n'est pas une fermeture de (h),
+    // et rien non plus quand le triage est désarmé.
+    let closure_snapshot =
+        super::webhook_prefilter::snapshot_closure_task_state(original_github_text.as_deref(), &a.db)
+            .await;
     // mika#2675 phase 2 — le texte juste après le `verdict_handler` et le jeton
     // qu'il a résolu : la classe (c) exige un texte intact APRÈS lui, et lit
     // l'état de la PR côté forge avec le même jeton.
@@ -2049,6 +2065,9 @@ pub(super) async fn run_agent_for_message(
                 // un second modèle est un second gabarit à calibrer
                 // (mika#1190), pour un brin de 160 tokens sans outils.
                 llm: Some(a.llm.as_ref()),
+                // (h) mika#2854 AC4 — la lecture a DÉJÀ eu lieu, bien avant
+                // `upstream_close_handler` ; la porte ne fait que la consulter.
+                closure_snapshot: &closure_snapshot,
             },
             original,
             touched,
