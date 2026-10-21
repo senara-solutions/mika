@@ -391,4 +391,10 @@ mod eval {
     // Le site P0 amiral atteint le transport en P0, bout en bout à travers
     // `run_agent`, et son contrôle négatif sur le prédicat (mika#1381 vol 3)
     mod test_dispatch_stall_p0_1381;
+
+    // L'autre moitié de la même propriété : sur le domaine Webhook Fallthrough
+    // l'accusé P2 ne part à personne, la garde reste armée hors du domaine, et
+    // un accusé passé par l'outil `send_message` arrive sans étage — donc la
+    // suppression est une propriété du garde, jamais du routage (mika#1381 vol 4)
+    mod test_p2_ack_suppression_1381;
 }
