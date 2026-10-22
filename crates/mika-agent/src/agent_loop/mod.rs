@@ -2911,14 +2911,23 @@ async fn run_loop(
                                     "Fabrication detected (uncorrected) on deployment \
                                      locality: the false local-hosting guard fired and \
                                      the re-prompt budget is spent, yet the response \
-                                     still asserts «{} {}» while the runtime deployment \
-                                     is {:?}. The answer went out, and the tenant was \
-                                     told their data stays on their machine. Investigate \
-                                     trace_id {} in /var/log/mika/server.log.",
-                                    hosting.subject,
-                                    hosting.assertion,
-                                    tool_ctx.deployment,
-                                    tool_ctx.trace_id,
+                                     still asserts «{assertion} … {subject}» while the \
+                                     runtime deployment is {deployment:?}. The answer \
+                                     went out, and the tenant was told their data stays \
+                                     on their machine. Investigate trace_id {trace_id} \
+                                     in /var/log/mika/server.log.",
+                                    // Assertion puis localité, dans l'ordre où la
+                                    // garde les a appariées — les deux couches sont
+                                    // capturées séparément, et les rendre dans
+                                    // l'ordre inverse donnait « en local je tourne »
+                                    // à l'opérateur. L'ellipse dit le trou : les
+                                    // deux fragments ne sont pas contigus dans la
+                                    // phrase, ils sont à moins de `CLAIM_GAP_MAX`
+                                    // l'un de l'autre.
+                                    assertion = hosting.assertion,
+                                    subject = hosting.subject,
+                                    deployment = tool_ctx.deployment,
+                                    trace_id = tool_ctx.trace_id,
                                 ),
                                 site: PendingFabricationP0Site::FalseLocalHosting,
                             });

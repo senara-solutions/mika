@@ -56,7 +56,47 @@
 //!
 //! # Recettes de rouge-avant (plan R1)
 //!
-//! RECETTES_PLACEHOLDER
+//! Les trois tests sont passés **verts du premier coup**, ce qui n'atteste
+//! rien. Chaque injection ci-dessous a donc été jouée sur l'arbre, le test
+//! lancé, puis le site restauré par `git checkout`. Ce qui suit est ce qui a
+//! été observé, pas ce qui était prévu.
+//!
+//! **R1 — l'étage dégradé.** `NotificationSeverity::P0` → `::P2` au site
+//! d'acceptation ⇒ rouge sur AC6(f), `observé Some(P2)`.
+//!
+//! **R2 — la fuite silencieuse.** L'appel remplacé par
+//! `sender.send(&pending.message)`, qui **compile** ⇒ rouge sur AC6(e),
+//! « arrivée au transport SANS étage ». C'est la régression que rien d'autre
+//! qu'une assertion au transport ne peut voir.
+//!
+//! **R3 — le site retiré.** `if false && …` en tête du dépôt de 5d ⇒ rouge sur
+//! AC6(d), `observé 0`.
+//!
+//! **R4 — la porte ignorée.** `fabrication_p0_notify &&` retiré du dépôt ⇒
+//! rouge sur `mika2872_porte_fermee_le_transport_nobserve_rien`, « le site
+//! ignore sa porte », avec l'émission observée en `Some(P0)`.
+//!
+//! **R5 — le refactor défait, et c'est la recette qui le justifie.** Le
+//! prédicat de revérification recâblé en dur sur
+//! `detect_affirmative_state_claim` + `assert_grounded_satisfied`, comme avant
+//! ce vol ⇒ **les trois tests de mika#2867 restent verts** et le test positif
+//! ci-dessus rougit à `observé 0` : la P0 déposée par 5d est supprimée par le
+//! prédicat de l'autre site, sur un texte qui porte pourtant toujours la fausse
+//! revendication. Sans cette recette, « le créneau est typé » serait une
+//! affirmation sans contrôle.
+//!
+//! **R6 — le verrou de CLASSE retiré : reste VERT, et le site est donc livré
+//! non attesté.** `pending_fabrication_p0.is_none()` retiré du dépôt de 5d ⇒
+//! les six tests de la classe restent verts. La raison est dans les fixtures :
+//! aucun des six ne produit **deux** violations de la classe dans un même tour,
+//! donc le second écrivain n'existe nulle part et le verrou n'a rien à
+//! empêcher. Ce que `is_none()` garantit — une seule P0 par tour pour toute la
+//! classe, le premier écrivain de la chaîne gagnant — est tenu par le compilateur
+//! et par relecture, pas par ce fichier. **Le fixture de collision (un tour qui
+//! viole 5d *et* `assert_grounded`) appartient au vol 2** avec le site 2
+//! (`unactioned_frequency_promise`), parce qu'il n'a de sens qu'avec un
+//! troisième site qui rend la collision ordinaire. Écrit ici plutôt que dans
+//! le plan : c'est le fichier de test qui doit dire ce qu'il ne tient pas.
 
 use mika_agent::messaging::NotificationSeverity;
 use mika_common::llm::mock::*;
