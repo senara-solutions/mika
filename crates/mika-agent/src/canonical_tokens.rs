@@ -7046,4 +7046,207 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              plutôt que d'en écrire une TROISIÈME copie."
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2854 AC4 — l'état du ticket a DEUX lecteurs sous `src/server/`,
+    // et pas un troisième.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Les deux lecteurs légitimes de l'état du ticket sous `src/server/`
+    /// (mika#2854 AC4), nommés par chemin ET par symbole.
+    ///
+    /// Ils ne sont pas des **exceptions** — ils sont la *définition* du
+    /// recensement, et c'est pourquoi l'assertion est une **égalité** et non un
+    /// `<=`. Les deux moitiés de la classe (h) lisent le même état par deux
+    /// chemins qui ne sont pas interchangeables :
+    ///
+    /// - `issue_has_active_task` lit **live**, depuis la porte. C'est correct
+    ///   pour un `issue_comment` : rien n'a nettoyé les lignes de suivi.
+    /// - `snapshot_closure_task_state` lit **tôt**, juste après
+    ///   `original_github_text` dans `handlers.rs`, parce que
+    ///   `upstream_close_handler::try_handle_upstream_close` tourne AVANT la
+    ///   porte et marque terminales les lignes du ticket qu'on ferme.
+    ///
+    /// Le défaut que cette garde attrape est donc précis : **une lecture live
+    /// rajoutée sur le chemin de la fermeture**. Elle rendrait `false` pour un
+    /// ticket qui a une tâche vivante, trierait un tour qu'AC7 protège, et
+    /// toutes les assertions comportementales du vol resteraient vertes — la
+    /// classe `grooming_marker` de mika#2158, qu'aucun test de comportement ne
+    /// voit.
+    ///
+    /// **Il n'y a aucune allowlist d'exceptions, pas même vide.** La population
+    /// pré-existante est de zéro (mesurée : `grep -rn
+    /// has_active_self_dev_task_for_issue crates/` ne rend sous `src/server/`
+    /// que les deux sites ci-dessus et trois doc-comments), donc il n'y a rien
+    /// à excepter — et une allowlist née vide est un emplacement où déposer la
+    /// prochaine infraction (mika#2323). C'est l'égalité qui fige cet état.
+    const CLOSURE_TASK_READER_CENSUS: &[(&str, &str)] = &[
+        (
+            "crates/mika-agent/src/server/webhook_prefilter.rs",
+            "issue_has_active_task",
+        ),
+        (
+            "crates/mika-agent/src/server/webhook_prefilter.rs",
+            "snapshot_closure_task_state",
+        ),
+    ];
+
+    /// Les fonctions de production qui **appellent** le lecteur d'état du
+    /// ticket, par leur nom.
+    ///
+    /// Le prédicat est lexical et en trois termes, chacun porteur :
+    /// (1) hors commentaire, via [`crate::source_scan::strip_comment_lines`] —
+    /// la prose *sur* ce lecteur n'est pas une lecture, et elle est abondante :
+    /// `upstream_close_handler.rs` le nomme deux fois en doc-comment pour
+    /// expliquer précisément la divergence de clé que ce vol évite (la classe du
+    /// faux positif du Signal S, mika#2050) ; (2) portant le nom de la méthode ;
+    /// (3) **sans `fn `** — ce qui écarte la ligne de **définition** sans avoir
+    /// à exempter son fichier, une exemption de fichier aveuglant aussi tout
+    /// appel qu'il viendrait à contenir.
+    ///
+    /// Le nom est composé à l'exécution pour que ce fichier ne se dénonce pas
+    /// lui-même s'il venait un jour sous le périmètre du scan (forme mika#2484).
+    ///
+    /// Pas de retour en portée de module, délibérément : la méthode est `async`,
+    /// donc tout site d'appel vit dans une `fn`. Un `const` ne peut pas la
+    /// nommer.
+    fn closure_task_reader_sites(content: &str) -> Vec<String> {
+        let needle = format!("has_active_self_dev{}", "_task_for_issue");
+        let mut current = String::from("<module scope>");
+        let mut out: Vec<String> = Vec::new();
+
+        let stripped = crate::source_scan::strip_comment_lines(content);
+        for line in stripped.lines() {
+            let trimmed = line.trim_start();
+            // `fn ` à n'importe quelle position, borné à gauche par une
+            // frontière de mot pour que `some_fn (` et `impl Fn(` ne comptent
+            // pas — même terme que `enclosing_fns_writing`.
+            if let Some(i) = trimmed.find("fn ")
+                && (i == 0 || trimmed.as_bytes()[i - 1] == b' ')
+            {
+                current = trimmed[i + 3..]
+                    .split(['(', '<', ' '])
+                    .next()
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+            }
+            if trimmed.contains(needle.as_str()) && !trimmed.contains("fn ") {
+                out.push(current.clone());
+            }
+        }
+
+        out
+    }
+
+    /// **V9 — l'état du ticket a exactement les deux lecteurs recensés sous
+    /// `src/server/`.**
+    ///
+    /// L'égalité rougit dans les deux sens, et les deux comptent : sur un
+    /// **troisième** lecteur (le défaut à attraper) comme sur la **disparition**
+    /// ou le renommage d'un des deux (le recensement devenu stale). Un seuil
+    /// `<=` laisserait passer le second cas en silence, et c'est exactement ce
+    /// qui rend une allowlist éternelle.
+    #[test]
+    fn mika2854_letat_du_ticket_a_deux_lecteurs_sous_le_serveur() {
+        let mut trouves: Vec<(String, String)> = Vec::new();
+        for (rel, content) in production_sources() {
+            if !rel.contains("/src/server/") {
+                continue;
+            }
+            for f in closure_task_reader_sites(&content) {
+                trouves.push((rel.clone(), f));
+            }
+        }
+        trouves.sort();
+
+        let mut attendus: Vec<(String, String)> = CLOSURE_TASK_READER_CENSUS
+            .iter()
+            .map(|(rel, f)| ((*rel).to_string(), (*f).to_string()))
+            .collect();
+        attendus.sort();
+
+        assert_eq!(
+            trouves, attendus,
+            "mika#2854 AC4 — le recensement des lecteurs de l'état du ticket \
+             sous `src/server/` doit être EXACT.\n\n\
+             Un lecteur de TROP : c'est très probablement une lecture live \
+             rajoutée sur le chemin de la fermeture. Elle lit l'état d'APRÈS \
+             `upstream_close_handler`, donc `false` sur un ticket qui a une \
+             tâche vivante, donc elle trie un tour qu'AC7 protège — et aucune \
+             assertion de comportement ne le voit. RÉSOLUTION : router le site \
+             par `closure_task_snapshot`, ne pas l'ajouter au recensement \
+             (doctrine mika#2201).\n\n\
+             Un lecteur qui MANQUE : un des deux a été renommé ou supprimé, et \
+             ce scan viserait désormais un nom mort."
+        );
+
+        // Anti-vacuité : le nom cherché doit encore exister là où il est
+        // DÉFINI. Sans ce terme, un renommage amont rendrait le scan vert pour
+        // la pire des raisons — il ne regarderait plus rien.
+        let proprietaire =
+            std::fs::read_to_string(repo_root().join("crates/mika-agent/src/async_db.rs"))
+                .expect("async_db.rs lisible");
+        assert!(
+            proprietaire.contains("pub async fn has_active_self_dev_task_for_issue("),
+            "mika#2854 — `AsyncDatabase::has_active_self_dev_task_for_issue` a \
+             disparu ou changé de nom : ce scan vise un nom mort"
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne regarde rien — très exactement le
+    /// mode de panne qu'il existe pour rendre visible. On le montre donc rougir
+    /// sur un **troisième** site synthétique, et rester muet sur les trois
+    /// formes qui nomment le lecteur sans l'appeler.
+    #[test]
+    fn mika2854_le_scan_rougit_sur_un_troisieme_lecteur() {
+        let fautif = "\
+impl LiveState<'_> {
+    async fn issue_has_active_task(&self, u: &str) -> anyhow::Result<bool> {
+        self.db.has_active_self_dev_task_for_issue(u).await
+    }
+}
+
+async fn un_troisieme_lecteur(db: &AsyncDatabase, u: &str) -> bool {
+    db.has_active_self_dev_task_for_issue(u).await.unwrap_or(false)
+}
+";
+        assert_eq!(
+            closure_task_reader_sites(fautif),
+            vec![
+                "issue_has_active_task".to_string(),
+                "un_troisieme_lecteur".to_string()
+            ],
+            "le scan doit voir le lecteur légitime ET le troisième site, chacun \
+             sous le nom de sa fonction englobante — sans quoi le message \
+             d'échec ne dirait pas OÙ retirer la lecture"
+        );
+
+        // 1. La prose d'un doc-comment — la forme réelle de
+        //    `upstream_close_handler.rs:420`.
+        let prose = "/// la clé de `has_active_self_dev_task_for_issue` doit \
+                     coïncider.\n";
+        assert!(
+            closure_task_reader_sites(prose).is_empty(),
+            "nommer le lecteur dans un commentaire n'est pas l'appeler"
+        );
+
+        // 2. Un commentaire de bloc, et une ligne de continuation.
+        let bloc = "/* has_active_self_dev_task_for_issue */\n \
+                    * has_active_self_dev_task_for_issue\n";
+        assert!(
+            closure_task_reader_sites(bloc).is_empty(),
+            "un commentaire de bloc n'est pas un appel"
+        );
+
+        // 3. La DÉFINITION elle-même — c'est ce qui dispense d'exempter
+        //    `async_db.rs`, une exemption de fichier aveuglant aussi tout appel
+        //    qu'il viendrait à contenir.
+        let definition = "    pub async fn has_active_self_dev_task_for_issue(\n";
+        assert!(
+            closure_task_reader_sites(definition).is_empty(),
+            "la ligne de définition n'est pas un site d'appel"
+        );
+    }
 }
