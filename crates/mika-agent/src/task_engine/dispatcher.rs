@@ -2341,6 +2341,12 @@ impl TaskDispatcher {
             &label_auth,
             &trace_id,
             &session_id,
+            // Le rail de notification opérateur (mika#2866) : un bail du démon
+            // part en P0 sous la classe `recovery-runbook`. C'est le même
+            // `message_sender` que le rail du calage de dispatch, construit
+            // avec `with_escalation_chat_id` par `server/mod.rs` — donc il
+            // atteint déjà la surface jamais muette, rien à câbler ici.
+            self.message_sender.as_ref(),
         )
         .await;
 

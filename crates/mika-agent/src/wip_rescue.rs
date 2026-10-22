@@ -11,6 +11,8 @@
 //!    ├─ parked marker (and body not `yes`)? → skip          ── mika#2286
 //!    ├─ HELD? (≥1 ConvertToDraftEvent on the timeline) → skip ─ mika#2597
 //!    └─ oldest survivor → resume_chain:
+//!        │  (un `Bailed` réveille l'opérateur en P0, classe
+//!        │   `recovery-runbook` — mika#2866, voir plus bas)
 //!        └─ RESCUE_DEPTH gate  (bail-to-human at max)       ── F2
 //!           └─ git ≥ 2.38 guard (bail: git-too-old-for-dry-run) ── F3
 //!              └─ dry-run rebase (merge-tree, non-mutating)  ── AC2
@@ -55,6 +57,23 @@
 //!   every line of the spirit log is written twice, so the raw greps read
 //!   double.) The draft is preserved; a human decides. No further auto-attempts
 //!   (AC3).
+//! - **Un bail réveille l'opérateur, en P0 (mika#2866).** Jusqu'alors les seuls
+//!   signaux d'un bail étaient un label GitHub, un commentaire sur la PR et un
+//!   `wip_rescue_bail_to_human` en WARN — c'est-à-dire l'alarme dans le vide
+//!   (diagnostic #4 de *Loop Trustworthiness*) : personne n'est réveillé par une
+//!   ligne de journal. Le bail est désormais le site d'émission de la classe
+//!   **`recovery-runbook`**, émise au palier [`NotificationSeverity::P0`], donc
+//!   routée vers `MIKA_OPERATOR_ESCALATION_CHAT_ID` — la surface que l'opérateur
+//!   n'est pas censé muter. Le site est [`notify_if_bailed`], et il nomme le
+//!   runbook à dérouler (`/mika-rescue-drafts-process`).
+//!
+//!   **Le marqueur durable EST la population de cette classe.** La question
+//!   « combien de P0 `recovery-runbook` cette semaine ? » se répond exactement
+//!   par les lignes `audit_events` de `tool_name = 'wip_rescue_bailed'`
+//!   ([`BAILED_MARKER_TOOL`]) — écrivain unique, une ligne par PR, écrite avant
+//!   tout appel réseau. Aucune table, aucune ligne d'audit et aucune variable
+//!   d'environnement n'ont été ajoutées pour cette classe : voir
+//!   [`RECOVERY_RUNBOOK_CLASS`] pour la requête opérateur.
 //! - **Perimeter gate is authoritative (AC4/AC5), and a DECISION-CORE draft is
 //!   only un-drafted once verified (mika#2286).** Every draft — even a one-line
 //!   diff — is classified by the mika#1831 perimeter classifier
@@ -95,11 +114,13 @@
 //! (drafts are left untouched, `wip_rescue_skipped` emitted).
 
 use crate::async_db::AsyncDatabase;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::perimeter::{self, Classification};
 use crate::tools::pr_merge_with_gate::run_gh_subprocess;
 use mika_common::label_write::LabelWriteToken;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -151,6 +172,53 @@ const BAILED_MARKER_TOOL: &str = "wip_rescue_bailed";
 /// difference: nothing clears a bail, whereas `rescue-pipeline-verified: yes`
 /// in the body makes this marker stop excluding (see [`select_eligible`]).
 const PARKED_MARKER_TOOL: &str = "wip_rescue_parked_unverified";
+
+/// Nom de la classe de notification P0 que ce module émet (mika#2866).
+///
+/// mika#1381 nomme quatre classes P0 à router vers la surface jamais muette ;
+/// `recovery-runbook` est celle qui n'avait aucun site d'émission. Le site est
+/// [`notify_if_bailed`], et l'événement qui ouvre la classe est un bail de
+/// [`bail_to_human`] : terminal par construction, le runbook à dérouler existe
+/// déjà (`/mika-rescue-drafts-process`), et jusqu'ici les seuls signaux étaient
+/// un label GitHub, un commentaire sur la PR et un WARN qui ne réveille
+/// personne.
+///
+/// **La population de la classe est déjà en table, et c'est pourquoi ce vol
+/// n'en ouvre aucune.** « Combien de P0 `recovery-runbook` cette semaine ? » se
+/// répond exactement par les lignes du marqueur durable de bail
+/// ([`BAILED_MARKER_TOOL`]) :
+///
+/// ```sql
+/// SELECT target_key, count(*)
+/// FROM audit_events
+/// WHERE tool_name = 'wip_rescue_bailed'
+/// GROUP BY 1;
+/// ```
+///
+/// Écrivain unique `mark_bailed`, une ligne par PR, écrite **avant** tout appel
+/// réseau — donc une ligne même quand GitHub est injoignable. La déduplication
+/// est gratuite : ce même marqueur est le filtre d'éligibilité de
+/// [`select_eligible`], donc un second bail sur la même PR n'est pas
+/// atteignable. Aucune fenêtre de rafraîchissement ni verrou en mémoire, à la
+/// différence d'`agent_recurring_gate` (mika#2456 vol 3) dont la cadence
+/// n'était pas bornée.
+///
+/// Le journal porte le compteur, pas la population : `recovery_runbook_notified`
+/// (INFO) répond à *la notification est-elle partie ?* et se soustrait de
+/// `wip_rescue_bail_to_human` (WARN), qui répond à *le démon a-t-il bailé ?*.
+/// En régime nominal les deux comptes sont égaux et **leur écart est le
+/// signal** — un seul nom pour les deux faits le rendrait inobservable (classe
+/// mika#2205). Aucune ligne `audit_events` n'est ajoutée pour cette classe :
+/// ce serait une seconde population pour un même fait.
+///
+/// Privée au module par décision (mika#2866 D7) : un seul site l'écrit, et une
+/// constante publique inviterait un second émetteur sans que personne arbitre
+/// la soustractibilité pour lui.
+const RECOVERY_RUNBOOK_CLASS: &str = "recovery-runbook";
+
+/// Le runbook que la notification nomme — la commande que l'opérateur déroule
+/// pour traiter les brouillons rendus à la main.
+const RECOVERY_RUNBOOK_COMMAND: &str = "/mika-rescue-drafts-process";
 
 /// Lower bound for the per-PR marker lookups ([`BAILED_MARKER_TOOL`],
 /// [`PARKED_MARKER_TOOL`]). Neither is a burst dedup, so the window is the whole
@@ -645,18 +713,176 @@ enum ChainOutcome {
     Skipped(String),
 }
 
+// ---------------------------------------------------------------------------
+// Notification opérateur — classe `recovery-runbook` (mika#2866)
+// ---------------------------------------------------------------------------
+
+/// Envoie une notification opérateur en absorbant les erreurs — la **seule**
+/// sortie de ce module vers l'opérateur (mika#2866, forme de
+/// `verdict_handler.rs:2722` et de `ci_failure_handler.rs`).
+///
+/// `severity` est un paramètre, pas un choix d'aide, et il n'a **pas de
+/// défaut** : un nouveau site de notification dans ce module ne compile pas
+/// sans nommer son étage, donc « oublié de classifier » n'est pas un état
+/// atteignable et aucun relecteur n'a à l'attraper. `P0` — *la boucle est
+/// morte, un humain doit intervenir* — est routé vers
+/// `MIKA_OPERATOR_ESCALATION_CHAT_ID` quand il est configuré, et vers le chat
+/// normal avec un WARN nommé quand il ne l'est pas.
+///
+/// Il est en **seconde** position parce que le message est un `format!`
+/// multi-lignes : en queue d'un tel appel, l'étage serait une ligne qu'un
+/// relecteur survole ; ici il se lit sur la ligne qui ouvre l'appel.
+///
+/// **Une seule aide par module, par doctrine** (`crates/mika-agent/CLAUDE.md`
+/// § *MessageSender Trait*). Une seconde aide, un argument par défaut ou une
+/// enveloppe qui remplirait l'étage rendraient l'état interdit atteignable à
+/// nouveau. Les deux aides existantes ne sont délibérément pas promues en
+/// fonction partagée : une extraction serait une refonte du rail.
+///
+/// Rend `true` seulement quand le transport a rendu `Delivered`. L'appelant
+/// en a besoin : le compteur `recovery_runbook_notified` répond à *la
+/// notification est-elle partie ?*, et il ne peut le faire que s'il sait
+/// distinguer un envoi délivré d'un envoi échoué (voir [`notify_if_bailed`]).
+async fn send_notification(
+    sender: &Arc<dyn MessageSender>,
+    severity: NotificationSeverity,
+    message: &str,
+) -> bool {
+    report_notification_outcome(sender.send_with_severity(message, severity).await, severity)
+}
+
+/// Issue d'envoi, traitée en un seul endroit — ce qui est journalisé ne peut
+/// pas dériver d'un étage à l'autre. Un P0 non délivré ne se taît pas.
+/// Rend `true` pour `Delivered` et `false` pour les trois autres issues.
+fn report_notification_outcome(
+    outcome: anyhow::Result<crate::messaging::SendOutcome>,
+    severity: NotificationSeverity,
+) -> bool {
+    match outcome {
+        Ok(crate::messaging::SendOutcome::Delivered) => true,
+        Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+            warn!(reason = %reason, severity = severity.as_str(), class = RECOVERY_RUNBOOK_CLASS, "wip_rescue notification delivery failed");
+            false
+        }
+        Ok(crate::messaging::SendOutcome::NoChannel) => {
+            warn!(
+                severity = severity.as_str(),
+                class = RECOVERY_RUNBOOK_CLASS,
+                "wip_rescue notification skipped — no reply channel (chat_id=0)"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(error = %e, severity = severity.as_str(), class = RECOVERY_RUNBOOK_CLASS, "Failed to send wip_rescue notification");
+            false
+        }
+    }
+}
+
+/// Le site d'émission de la classe [`RECOVERY_RUNBOOK_CLASS`] : un bail réveille
+/// l'opérateur, en P0 (mika#2866).
+///
+/// Prend une **valeur** [`ChainOutcome`] déjà construite, et c'est ce qui rend
+/// le site attestable sans réseau : la chaîne de sauvetage entière exige `gh`,
+/// un `git` réel et un checkout, alors que l'étage qui part au transport se
+/// vérifie ici sur un littéral. La production du `Bailed` lui-même est couverte
+/// par les trois tests de bail existants.
+///
+/// Le `match` est **exhaustif**, sans bras `_` : un cinquième état d'issue de
+/// chaîne ne compilera pas sans que son auteur décide s'il réveille
+/// l'opérateur.
+async fn notify_if_bailed(
+    sender: Option<&Arc<dyn MessageSender>>,
+    pr_number: u64,
+    outcome: &ChainOutcome,
+) {
+    let (reason, parked) = match outcome {
+        ChainOutcome::Bailed { reason, parked } => (reason, *parked),
+        // Une reprise est le chemin heureux : la PR est sortie de brouillon et
+        // part en qa-review. Aucun runbook n'est dû.
+        ChainOutcome::Resumed(_) => return,
+        // Un park n'est pas un bail (mika#2286) : rien ne va mal, la classe
+        // demande seulement une vérification qui n'a pas eu lieu, et
+        // l'exclusion se lève d'elle-même dès que le marqueur lit `yes`.
+        // Réveiller l'opérateur ici, c'est le réveiller sur un état qui se
+        // répare sans lui.
+        ChainOutcome::ParkedUnverified => return,
+        // Un skip ne touche pas le brouillon : la tique n'a rien tenté (pas de
+        // checkout local, par exemple). Il n'y a pas d'état à récupérer.
+        ChainOutcome::Skipped(_) => return,
+    };
+
+    let Some(sender) = sender else {
+        // D5 — un rail absent est nommé, jamais silencieux. Sans cette ligne,
+        // « aucun bail » et « un bail dont la notification n'avait aucun rail »
+        // rendent des octets identiques (classe mika#2205), et c'est exactement
+        // le défaut que ce vol ferme. Les agents du moteur d'équipes portent
+        // délibérément `message_sender: None`, et le CLI aussi : l'absence de
+        // rail est un état légitime, pas une panique.
+        warn!(
+            pr_number,
+            class = RECOVERY_RUNBOOK_CLASS,
+            reason = %reason,
+            "recovery_runbook_notification_unroutable"
+        );
+        return;
+    };
+
+    let label_line = if parked {
+        format!("Label `{HUMAN_REVIEW_LABEL}` : posé")
+    } else {
+        format!("Label `{HUMAN_REVIEW_LABEL}` : NON POSÉ (l'écriture GitHub a échoué)")
+    };
+
+    // Le commentaire déjà posé sur la PR par `bail_to_human` n'est pas dupliqué :
+    // il porte le détail, la notification porte le réveil.
+    let message = format!(
+        "🚨 {RECOVERY_RUNBOOK_CLASS} — wip-rescue a rendu la main\n\
+         \n\
+         PR #{pr_number} — le démon d'auto-reprise a bailé vers un humain. \
+         Terminal : plus aucune automatisation ne touchera ce brouillon (mika#2199).\n\
+         \n\
+         Raison : {reason}\n\
+         {label_line}\n\
+         \n\
+         Runbook : {RECOVERY_RUNBOOK_COMMAND}"
+    );
+
+    // Le compteur ne part que sur un envoi délivré. Sans cette garde, un P0
+    // revenu `Failed`, `NoChannel` ou `Err` compterait comme parti : les comptes
+    // `recovery_runbook_notified` et `wip_rescue_bail_to_human` resteraient
+    // égaux alors que personne n'a été réveillé, et leur écart, qui est le
+    // signal (voir [`RECOVERY_RUNBOOK_CLASS`]), ne pourrait jamais apparaître.
+    // L'échec garde son propre WARN, émis par [`report_notification_outcome`].
+    if send_notification(sender, NotificationSeverity::P0, &message).await {
+        info!(
+            pr_number,
+            class = RECOVERY_RUNBOOK_CLASS,
+            severity = NotificationSeverity::P0.as_str(),
+            parked,
+            "recovery_runbook_notified"
+        );
+    }
+}
+
 /// Scan open `wip-rescue` draft PRs and resume the oldest eligible one.
 ///
 /// Returns `Some(1)` when a draft was un-drafted, `Some(0)` when a draft was
 /// examined but bailed/skipped, `None` when nothing was eligible or the scan
 /// could not run. Processes at most one draft per invocation (AC6 concurrency
 /// cap = 1); excess drafts wait for the next scan tick.
+///
+/// `sender` est le rail de notification opérateur (mika#2866) : un bail part en
+/// P0 sous la classe [`RECOVERY_RUNBOOK_CLASS`] par [`notify_if_bailed`].
+/// `Option` et non `&Arc` parce que les agents du moteur d'équipes portent
+/// délibérément `message_sender: None`, et le CLI aussi.
 pub async fn auto_resume_wip_rescue_drafts(
     db: &AsyncDatabase,
     github_token: &str,
     label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
+    sender: Option<&Arc<dyn MessageSender>>,
 ) -> Option<usize> {
     let drafts = match list_wip_rescue_drafts(github_token).await {
         Ok(d) => d,
@@ -687,7 +913,7 @@ pub async fn auto_resume_wip_rescue_drafts(
         return None;
     };
 
-    match resume_chain(
+    let outcome = resume_chain(
         db,
         github_token,
         label_auth,
@@ -696,8 +922,15 @@ pub async fn auto_resume_wip_rescue_drafts(
         &pr,
         age_secs,
     )
-    .await
-    {
+    .await;
+
+    // L'issue est capturée **avant** le `match` par étage, pour que le site
+    // d'émission reçoive une valeur : c'est ce qui le rend testable sans
+    // réseau, et c'est ce qui laisse le type de retour et les quatre bras
+    // ci-dessous strictement inchangés (mika#2866 D2).
+    notify_if_bailed(sender, pr.number, &outcome).await;
+
+    match outcome {
         ChainOutcome::Resumed(route) => {
             info!(
                 pr_number = pr.number,
@@ -3280,5 +3513,484 @@ mod tests {
             body.contains("\"open\""),
             "…and `--state open`, the other half of the same premise"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2866 — la classe `recovery-runbook` a un site, et il part en P0
+    // -----------------------------------------------------------------------
+    //
+    // Ce que ces tests tiennent, et qu'aucune assertion d'issue ne peut tenir :
+    // `MessageSender::send_with_severity` a un **corps par défaut** qui délègue
+    // à `self.send(text)`, et `GatewayMessageSender::send` délègue de son côté
+    // à `send_with_severity(.., P2)`. Un site qui retomberait sur `send()`
+    // compile, rend `Delivered`, et atterrit sur le chat que l'opérateur peut
+    // muter — la P0 devient une P-rien, sans aucune erreur. D'où le double
+    // ci-dessous, qui surcharge **les deux** entrées du trait et marque tout
+    // passage par `send()` de la sentinelle [`SEVERITE_ABSENTE`] : la fuite est
+    // un témoin, pas un silence (motif `verdict_handler.rs § mika1381_tests` et
+    // `tests/eval/test_dispatch_stall_p0_1381.rs`).
+    //
+    // # Recette de rouge-avant (mika#2866 AC10)
+    //
+    // Un test de sévérité qui n'a jamais été rouge n'atteste rien. Les deux
+    // injections ci-dessous ont été exécutées sur le site de production, celui-ci
+    // restauré à l'identique après chacune, et la sortie d'échec est recopiée
+    // verbatim.
+    //
+    // **R1 — la fuite silencieuse.** Dans [`send_notification`],
+    // `sender.send_with_severity(message, severity)` remplacé par
+    // `sender.send(message)`. Cette forme **compile** : c'est exactement la
+    // régression que le corps par défaut rend indolore. Rougit
+    // `mika2866_un_bail_reveille_loperateur_au_palier_p0` :
+    //
+    // ```text
+    // assertion `left == right` failed: le bail doit partir en P0 (surface
+    // jamais muette) ; observé "aucune-severite" — une sévérité absente
+    // signifie que le site est passé par `MessageSender::send`, dont le corps
+    // par défaut de `send_with_severity` perd l'étage en silence
+    //   left: "aucune-severite"
+    //  right: "p0"
+    // ```
+    //
+    // **R2 — l'étage dégradé.** Dans [`notify_if_bailed`],
+    // `NotificationSeverity::P0` remplacé par `::P2`. Rougit le même test :
+    //
+    // ```text
+    // assertion `left == right` failed: le bail doit partir en P0 (surface
+    // jamais muette) ; observé "p2" — une sévérité absente signifie que le site
+    // est passé par `MessageSender::send`, dont le corps par défaut de
+    // `send_with_severity` perd l'étage en silence
+    //   left: "p2"
+    //  right: "p0"
+    // ```
+
+    /// La sentinelle de fuite. Un site qui appelle `send()` au lieu de
+    /// `send_with_severity()` n'échoue pas — il arrive au transport sans étage.
+    /// Nommer l'absence est ce qui permet de l'assertionner, et de le faire sur
+    /// une **valeur** plutôt que sur une inégalité.
+    const SEVERITE_ABSENTE: &str = "aucune-severite";
+
+    /// Enregistre chaque franchissement du transport **et par quelle porte il
+    /// est passé**.
+    ///
+    /// Ne pas remplacer par le `SeverityRecordingSender` de
+    /// `verdict_handler.rs` : ce type est `#[cfg(test)]` dans son module, donc
+    /// inatteignable d'ici. C'est le motif qui est repris, pas le type.
+    ///
+    /// `issue` est ce que le transport rend : `None` vaut `Delivered`, et
+    /// `Some(..)` permet d'exercer les envois qui reviennent sans avoir été
+    /// délivrés.
+    #[derive(Default)]
+    struct SeverityRecordingSender {
+        franchissements: std::sync::Mutex<Vec<(String, String)>>,
+        issue: Option<crate::messaging::SendOutcome>,
+    }
+
+    impl SeverityRecordingSender {
+        fn observe(&self) -> Vec<(String, String)> {
+            self.franchissements.lock().unwrap().clone()
+        }
+
+        fn issue(&self) -> crate::messaging::SendOutcome {
+            self.issue
+                .clone()
+                .unwrap_or(crate::messaging::SendOutcome::Delivered)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageSender for SeverityRecordingSender {
+        /// La porte sans étage. Tout ce qui arrive ici est un témoin de fuite.
+        async fn send(&self, text: &str) -> anyhow::Result<crate::messaging::SendOutcome> {
+            self.franchissements
+                .lock()
+                .unwrap()
+                .push((text.to_string(), SEVERITE_ABSENTE.to_string()));
+            // Le garde est relâché avant le retour : jamais tenu à travers un
+            // point d'await (clippy::sig_drop, #1724).
+            Ok(self.issue())
+        }
+
+        async fn send_with_severity(
+            &self,
+            text: &str,
+            severity: NotificationSeverity,
+        ) -> anyhow::Result<crate::messaging::SendOutcome> {
+            self.franchissements
+                .lock()
+                .unwrap()
+                .push((text.to_string(), severity.as_str().to_string()));
+            Ok(self.issue())
+        }
+    }
+
+    /// Le double, et la vue `dyn` que le site attend.
+    fn double_de_transport() -> (Arc<SeverityRecordingSender>, Arc<dyn MessageSender>) {
+        rail_sur(SeverityRecordingSender::default())
+    }
+
+    /// Un double dont le transport rend `Failed` : l'envoi a franchi la porte,
+    /// mais personne n'a été réveillé.
+    fn double_qui_echoue() -> (Arc<SeverityRecordingSender>, Arc<dyn MessageSender>) {
+        rail_sur(SeverityRecordingSender {
+            issue: Some(crate::messaging::SendOutcome::Failed {
+                reason: "gateway 502".to_string(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn rail_sur(
+        double: SeverityRecordingSender,
+    ) -> (Arc<SeverityRecordingSender>, Arc<dyn MessageSender>) {
+        let double = Arc::new(double);
+        let rail: Arc<dyn MessageSender> = double.clone();
+        (double, rail)
+    }
+
+    /// Un `MakeWriter` qui accumule dans un tampon partagé les octets qu'un
+    /// souscripteur `fmt` écrirait — motif de `milestone_manager/cadence.rs`.
+    /// Les assertions portent sur les octets rendus, donc sur ce que
+    /// l'opérateur lit.
+    #[derive(Clone, Default)]
+    struct TamponPartage {
+        inner: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for TamponPartage {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TamponPartage {
+        type Writer = TamponPartage;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Les lignes de journal qu'émet un appel de [`notify_if_bailed`].
+    ///
+    /// L'abonné passe par `install_capturing_subscriber`, site d'installation
+    /// unique du crate (mika#2646). **Tout test de ce module qui atteint les
+    /// callsites de [`notify_if_bailed`] porte `#[serial_test::serial]`**, ceux
+    /// qui capturent comme ceux qui ne capturent pas : un voisin qui enregistre
+    /// le callsite sans abonné en éteint l'`Interest` globalement, et la
+    /// capture rendrait zéro.
+    async fn journal_de(
+        sender: Option<&Arc<dyn MessageSender>>,
+        pr_number: u64,
+        outcome: &ChainOutcome,
+    ) -> String {
+        use tracing_subscriber::layer::SubscriberExt;
+        let tampon = TamponPartage::default();
+        let souscripteur = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(tampon.clone())
+                .with_ansi(false)
+                .without_time(),
+        );
+        {
+            let _garde =
+                crate::test_utils::test_helpers::install_capturing_subscriber(souscripteur);
+            notify_if_bailed(sender, pr_number, outcome).await;
+        }
+        let octets = tampon.inner.lock().unwrap().clone();
+        String::from_utf8_lossy(&octets).into_owned()
+    }
+
+    /// AC2/AC4 — un bail réveille l'opérateur, et l'étage observé **vaut**
+    /// `"p0"`.
+    ///
+    /// L'assertion est sur la valeur et non sur deux `!=` : seule
+    /// `send_with_severity` rend `"p0"`, donc un passage par `send()` rend la
+    /// sentinelle et rougit, et un `P2` rend `"p2"` et rougit aussi. Une seule
+    /// assertion couvre les deux régressions.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_un_bail_reveille_loperateur_au_palier_p0() {
+        let (double, rail) = double_de_transport();
+
+        notify_if_bailed(
+            Some(&rail),
+            4242,
+            &ChainOutcome::Bailed {
+                reason: "rebase conflict on src/lib.rs".to_string(),
+                parked: true,
+            },
+        )
+        .await;
+
+        let franchissements = double.observe();
+        assert_eq!(
+            franchissements.len(),
+            1,
+            "attendu exactement un franchissement du transport pour un bail, \
+             observé {} ; franchissements = {franchissements:?}",
+            franchissements.len()
+        );
+
+        let (texte, severite) = &franchissements[0];
+        assert_eq!(
+            severite,
+            NotificationSeverity::P0.as_str(),
+            "le bail doit partir en P0 (surface jamais muette) ; observé \
+             {severite:?} — une sévérité absente signifie que le site est passé \
+             par `MessageSender::send`, dont le corps par défaut de \
+             `send_with_severity` perd l'étage en silence"
+        );
+
+        // AC5 — le message nomme le runbook, la PR et la raison.
+        assert!(
+            texte.contains(RECOVERY_RUNBOOK_COMMAND),
+            "la notification doit nommer le runbook à dérouler ; texte : {texte:?}"
+        );
+        assert!(
+            texte.contains("#4242"),
+            "la notification doit nommer la PR ; texte : {texte:?}"
+        );
+        assert!(
+            texte.contains("rebase conflict on src/lib.rs"),
+            "la notification doit porter la raison du bail ; texte : {texte:?}"
+        );
+        assert!(
+            texte.contains(RECOVERY_RUNBOOK_CLASS),
+            "la notification doit nommer sa classe ; texte : {texte:?}"
+        );
+    }
+
+    /// AC3 — une reprise ne réveille personne.
+    ///
+    /// Les trois contrôles négatifs qui suivent sont la forme exécutable de la
+    /// soustractibilité : la classe `recovery-runbook` se soustrait des trois
+    /// autres issues de chaîne. Sans eux, un site qui notifierait à **chaque**
+    /// tique passerait le test positif.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_une_reprise_ne_reveille_personne() {
+        let (double, rail) = double_de_transport();
+
+        notify_if_bailed(
+            Some(&rail),
+            7,
+            &ChainOutcome::Resumed(UndraftRoute::Mechanical),
+        )
+        .await;
+
+        let franchissements = double.observe();
+        assert!(
+            franchissements.is_empty(),
+            "une reprise est le chemin heureux : aucun runbook n'est dû et le \
+             transport ne devait rien observer ; franchissements = {franchissements:?}"
+        );
+    }
+
+    /// AC3 — un park n'est pas un bail (mika#2286) : rien ne va mal, et
+    /// l'exclusion se lève d'elle-même.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_un_park_ne_reveille_personne() {
+        let (double, rail) = double_de_transport();
+
+        notify_if_bailed(Some(&rail), 8, &ChainOutcome::ParkedUnverified).await;
+
+        let franchissements = double.observe();
+        assert!(
+            franchissements.is_empty(),
+            "un park demande une vérification, pas un runbook ; \
+             franchissements = {franchissements:?}"
+        );
+    }
+
+    /// AC3 — un skip n'a touché à rien : il n'y a pas d'état à récupérer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_un_skip_ne_reveille_personne() {
+        let (double, rail) = double_de_transport();
+
+        notify_if_bailed(
+            Some(&rail),
+            9,
+            &ChainOutcome::Skipped("no local checkout".to_string()),
+        )
+        .await;
+
+        let franchissements = double.observe();
+        assert!(
+            franchissements.is_empty(),
+            "un skip ne touche pas le brouillon ; \
+             franchissements = {franchissements:?}"
+        );
+    }
+
+    /// AC9 (D4) — un label qui n'a pas atterri est **dit**, pas ravalé.
+    ///
+    /// Un opérateur qui part chercher `human-review-required` sur GitHub ne le
+    /// trouvera pas quand `parked == false` ; le message le dit plutôt que de
+    /// lui laisser croire à une erreur de sa part.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_un_label_non_pose_est_dit_dans_le_message() {
+        let (double, rail) = double_de_transport();
+
+        notify_if_bailed(
+            Some(&rail),
+            1312,
+            &ChainOutcome::Bailed {
+                reason: "clippy failed".to_string(),
+                parked: false,
+            },
+        )
+        .await;
+
+        let franchissements = double.observe();
+        assert_eq!(franchissements.len(), 1, "un bail notifie une fois");
+        let (texte, _) = &franchissements[0];
+        assert!(
+            texte.contains("NON POSÉ"),
+            "un bail qui n'a pas pu parquer la PR doit le dire dans la \
+             notification ; texte : {texte:?}"
+        );
+
+        // Et le contraire tient aussi : `parked: true` ne porte pas la mention.
+        let (double, rail) = double_de_transport();
+        notify_if_bailed(
+            Some(&rail),
+            1312,
+            &ChainOutcome::Bailed {
+                reason: "clippy failed".to_string(),
+                parked: true,
+            },
+        )
+        .await;
+        let (texte, _) = &double.observe()[0];
+        assert!(
+            !texte.contains("NON POSÉ"),
+            "un label posé ne doit pas être annoncé comme manquant ; \
+             texte : {texte:?}"
+        );
+    }
+
+    /// AC6 (D5) — un bail sans rail rend la main, et il est **nommé**.
+    ///
+    /// Les agents du moteur d'équipes portent délibérément
+    /// `message_sender: None`, et le CLI aussi : l'absence de rail est un état
+    /// légitime, pas une panique. Le WARN
+    /// `recovery_runbook_notification_unroutable` est la trace, et il existe
+    /// parce que sans lui « aucun bail » et « un bail sans rail » rendent des
+    /// octets identiques (classe mika#2205). Le test l'observe dans les octets
+    /// rendus : sans assertion, supprimer le WARN le laisserait vert.
+    ///
+    /// Le contrôle négatif est dans le même test : un skip sans rail ne doit
+    /// pas émettre la ligne, sinon elle ne nommerait plus un bail.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_un_bail_sans_rail_est_nomme() {
+        let journal = journal_de(
+            None,
+            5150,
+            &ChainOutcome::Bailed {
+                reason: "push rejected".to_string(),
+                parked: true,
+            },
+        )
+        .await;
+        let lignes: Vec<&str> = journal
+            .lines()
+            .filter(|l| l.contains("recovery_runbook_notification_unroutable"))
+            .collect();
+        assert_eq!(
+            lignes.len(),
+            1,
+            "un bail sans rail doit émettre exactement un \
+             `recovery_runbook_notification_unroutable` ; journal : {journal:?}"
+        );
+        assert!(
+            lignes[0].contains("WARN") && lignes[0].contains("pr_number=5150"),
+            "la ligne doit être un WARN portant la PR ; ligne : {:?}",
+            lignes[0]
+        );
+        assert!(
+            !journal.contains("recovery_runbook_notified"),
+            "sans rail, rien n'est parti ; journal : {journal:?}"
+        );
+
+        let journal = journal_de(
+            None,
+            5150,
+            &ChainOutcome::Skipped("no checkout".to_string()),
+        )
+        .await;
+        assert!(
+            !journal.contains("recovery_runbook_notification_unroutable"),
+            "un skip n'est pas un bail et ne doit rien nommer ; journal : {journal:?}"
+        );
+    }
+
+    /// AC6 — `recovery_runbook_notified` ne compte qu'un P0 **délivré**.
+    ///
+    /// Le compteur répond à *la notification est-elle partie ?*, et son écart
+    /// avec `wip_rescue_bail_to_human` est le signal d'un bail qui n'a réveillé
+    /// personne. Un envoi revenu `Failed` qui compterait quand même rendrait
+    /// cet écart inobservable (classe mika#2205). Le contrôle positif est dans
+    /// le même test : sans lui, une capture muette passerait le négatif.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2866_un_p0_non_delivre_ne_compte_pas_comme_notifie() {
+        let bail = ChainOutcome::Bailed {
+            reason: "rebase conflict".to_string(),
+            parked: true,
+        };
+
+        // Positif : délivré, le compteur part.
+        let (_double, rail) = double_de_transport();
+        let journal = journal_de(Some(&rail), 4242, &bail).await;
+        assert!(
+            journal.contains("recovery_runbook_notified"),
+            "un P0 délivré doit émettre `recovery_runbook_notified` ; journal : {journal:?}"
+        );
+
+        // Négatif : le transport a été franchi, mais l'envoi a échoué.
+        let (double, rail) = double_qui_echoue();
+        let journal = journal_de(Some(&rail), 4242, &bail).await;
+        assert_eq!(
+            double.observe().len(),
+            1,
+            "l'envoi a bien été tenté une fois"
+        );
+        assert!(
+            !journal.contains("recovery_runbook_notified"),
+            "un P0 revenu `Failed` ne doit pas compter comme notifié ; journal : {journal:?}"
+        );
+        assert!(
+            journal.contains("wip_rescue notification delivery failed"),
+            "l'échec de livraison doit garder son propre WARN ; journal : {journal:?}"
+        );
+    }
+
+    /// AC6 — les quatre issues de transport, une par une : seul `Delivered`
+    /// rend `true`.
+    #[test]
+    #[serial_test::serial]
+    fn mika2866_seul_delivered_compte_comme_delivre() {
+        use crate::messaging::SendOutcome;
+        let p0 = NotificationSeverity::P0;
+        assert!(report_notification_outcome(Ok(SendOutcome::Delivered), p0));
+        assert!(!report_notification_outcome(
+            Ok(SendOutcome::Failed {
+                reason: "gateway 502".to_string()
+            }),
+            p0
+        ));
+        assert!(!report_notification_outcome(Ok(SendOutcome::NoChannel), p0));
+        assert!(!report_notification_outcome(
+            Err(anyhow::anyhow!("chat_id resolution failed")),
+            p0
+        ));
     }
 }
