@@ -1646,6 +1646,16 @@ pub(crate) fn emit_turn_charged(
 pub(crate) mod tests {
     use super::*;
 
+    /// AC1 **sous vrai modèle** (mika#2854, vol 3/3) : le corpus réel joué
+    /// contre un vrai fournisseur, derrière `#[ignore]` +
+    /// `MIKA_EVAL_TRIAGE_PROVIDERS`.
+    ///
+    /// Enfant de ce module, et non voisin sous `tests/` du crate : il pilote le
+    /// `decide` privé à travers le `PrefilterState` `pub(crate)`, que seule une
+    /// éval intra-caisse atteint. Un enfant voit les items privés de son
+    /// ancêtre ; un voisin non (même idiome que `db/tests/`, mika#2321).
+    mod ac1_vrai_modele_2854;
+
     const GREEN_MAIN: &str = "[GitHub] Check suite success on senara-solutions/mika (branch: main)";
     const INERT: &str = "[GitHub] Issue labeled p1-important on senara-solutions/mika#2675 — fix(webhooks): pré-filtre\nhttps://github.com/senara-solutions/mika/issues/2675\nLabeled by: @samidarko";
 
