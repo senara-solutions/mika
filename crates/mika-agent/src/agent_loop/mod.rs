@@ -21,9 +21,9 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
-    DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
-    RESPONSE_LANGUAGE_DRIFT_LABEL, TESTIMONY_ACCESS_PROPOSAL_LABEL, TIME_OF_DAY_GREETING_LABEL,
-    TestimonyProposalChannel, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
+    DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL, PendingFabricationP0,
+    PendingFabricationP0Site, RESPONSE_LANGUAGE_DRIFT_LABEL, TESTIMONY_ACCESS_PROPOSAL_LABEL,
+    TIME_OF_DAY_GREETING_LABEL, TestimonyProposalChannel, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
     UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
     asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
@@ -1655,7 +1655,14 @@ async fn run_loop(
     // #1313, #864, #901, #2037) peuvent encore refuser la clôture : la réponse
     // qui a récidivé ne sortirait alors jamais, et la notification dirait le
     // contraire. Rempli seulement porte ouverte, consommé une fois.
-    let mut pending_fabrication_p0: Option<String> = None;
+    //
+    // mika#2872 — le créneau porte désormais SON SITE avec elle. Un seul
+    // créneau pour toute la classe `fabrication-detected`, donc une seule P0
+    // par tour quel que soit le nombre de sites qui récidivent (le coût est
+    // nommé sur `PendingFabricationP0Site`), et la revérification à
+    // l'acceptation rejoue le prédicat *du site qui a déposé* plutôt qu'un
+    // prédicat câblé en dur.
+    let mut pending_fabrication_p0: Option<PendingFabricationP0> = None;
     // Guard telemetry correlation (#953). Set by any fabrication-class guard firing
     // (last-writer-wins); consumed on the next successful EndTurn to emit a paired
     // `guard.correction_accepted` event with `corrected_content`.
@@ -2884,6 +2891,38 @@ async fn run_loop(
                             "False local-hosting claim guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
+                        // mika#2872 — ce site est RATTACHÉ à la classe P0
+                        // `fabrication-detected`. Par le critère D1 : « je tourne
+                        // en local sur ta machine » affirme un état du
+                        // déploiement qu'aucun résultat d'outil de ce tour ne
+                        // porte — et que `tool_ctx.deployment` contredit. Le
+                        // tenant vient d'être rassuré sur la confidentialité de
+                        // ce qu'il écrit, sur la foi d'une affirmation fausse
+                        // qu'aucun aval ne corrigera : c'est la forme même du
+                        // réveil d'opérateur que mika#1381 a réservé à P0.
+                        //
+                        // Porte désarmée par défaut (`fabrication_p0_notify`,
+                        // mika#1574 option (b)) et verrou de classe
+                        // (`is_none()`) : une seule P0 par tour pour toute la
+                        // classe, le premier écrivain de la chaîne gagne.
+                        if fabrication_p0_notify && pending_fabrication_p0.is_none() {
+                            pending_fabrication_p0 = Some(PendingFabricationP0 {
+                                message: format!(
+                                    "Fabrication detected (uncorrected) on deployment \
+                                     locality: the false local-hosting guard fired and \
+                                     the re-prompt budget is spent, yet the response \
+                                     still asserts «{} {}» while the runtime deployment \
+                                     is {:?}. The answer went out, and the tenant was \
+                                     told their data stays on their machine. Investigate \
+                                     trace_id {} in /var/log/mika/server.log.",
+                                    hosting.subject,
+                                    hosting.assertion,
+                                    tool_ctx.deployment,
+                                    tool_ctx.trace_id,
+                                ),
+                                site: PendingFabricationP0Site::FalseLocalHosting,
+                            });
+                        }
                     }
 
                     // 5e. Unactioned frequency-promise guard (mika#2358) — refuse
@@ -3739,18 +3778,26 @@ async fn run_loop(
                             "Assert-grounded guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
-                        if fabrication_p0_notify {
-                            pending_fabrication_p0 = Some(format!(
-                                "Fabrication detected (uncorrected) on {} {}: the \
-                                 assert-grounded guard fired and the re-prompt budget \
-                                 is spent, yet the response still claims «{}» with no \
-                                 grounding tool call this turn. The answer went out. \
-                                 Investigate trace_id {} in /var/log/mika/server.log.",
-                                claim.resource_type,
-                                claim.resource_ref,
-                                claim.claim_text,
-                                tool_ctx.trace_id,
-                            ));
+                        // mika#2872 — `pending_fabrication_p0.is_none()` est le
+                        // verrou de CLASSE, distinct du verrou de site juste
+                        // au-dessus (`assert_grounded_uncorrected_notified`) :
+                        // celui-là borne les `EndTurn` successifs de CE site,
+                        // celui-ci borne la classe entière à une P0 par tour.
+                        if fabrication_p0_notify && pending_fabrication_p0.is_none() {
+                            pending_fabrication_p0 = Some(PendingFabricationP0 {
+                                message: format!(
+                                    "Fabrication detected (uncorrected) on {} {}: the \
+                                     assert-grounded guard fired and the re-prompt budget \
+                                     is spent, yet the response still claims «{}» with no \
+                                     grounding tool call this turn. The answer went out. \
+                                     Investigate trace_id {} in /var/log/mika/server.log.",
+                                    claim.resource_type,
+                                    claim.resource_ref,
+                                    claim.claim_text,
+                                    tool_ctx.trace_id,
+                                ),
+                                site: PendingFabricationP0Site::AssertGrounded,
+                            });
                         }
                     }
 
@@ -4444,14 +4491,24 @@ async fn run_loop(
                         )
                         .await?;
                     }
-                    // mika#2867 — l'envoi différé de la récidive d'ancrage. Ici
-                    // l'`EndTurn` a passé toutes les gardes : la réponse sort. La
-                    // revendication est revérifiée sur le texte accepté, parce
-                    // qu'une garde aval a pu re-prompter et obtenir une réponse
-                    // qui ne la porte plus.
-                    if let Some(notification) = pending_fabrication_p0.take()
-                        && detect_affirmative_state_claim(&text)
-                            .is_some_and(|c| !assert_grounded_satisfied(&c, &all_tool_summaries))
+                    // mika#2867 — l'envoi différé de la classe
+                    // `fabrication-detected`. Ici l'`EndTurn` a passé toutes les
+                    // gardes : la réponse sort. La violation est revérifiée sur
+                    // le texte accepté, parce qu'une garde aval a pu re-prompter
+                    // et obtenir une réponse qui ne la porte plus.
+                    //
+                    // mika#2872 — le prédicat de revérification vient du SITE qui
+                    // a déposé, pas de ce site-ci. Câblé en dur, il revérifiait
+                    // tout dépôt avec le prédicat d'`assert_grounded` : un
+                    // message posé par `false_local_hosting_claim` serait
+                    // supprimé sur un texte qui porte pourtant toujours la fausse
+                    // revendication de localité.
+                    if let Some(pending) = pending_fabrication_p0.take()
+                        && pending.site.still_violated(
+                            &text,
+                            &all_tool_summaries,
+                            tool_ctx.deployment,
+                        )
                         && let Some(ref sender) = tool_ctx.message_sender
                     {
                         // L'étage est en seconde position et sans défaut : la
@@ -4459,7 +4516,7 @@ async fn run_loop(
                         // parce que la fabrication a franchi la garde et
                         // atteint l'opérateur — rien d'aval ne le dira.
                         let _ = sender
-                            .send_with_severity(&notification, NotificationSeverity::P0)
+                            .send_with_severity(&pending.message, NotificationSeverity::P0)
                             .await;
                     }
 
