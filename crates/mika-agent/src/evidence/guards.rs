@@ -1117,12 +1117,43 @@ impl PendingFabricationP0Site {
 /// about.
 pub(crate) const UNACTIONED_FREQUENCY_PROMISE_LABEL: &str = "unactioned_frequency_promise";
 
+/// The nature of the Layer-B alternative that matched (mika#2879).
+///
+/// Not a logging convenience: this is the discriminant that decides membership
+/// of the P0 class `fabrication-detected` (see `PendingFabricationP0Site`), and
+/// mika#2879's next flight makes it a term of a guard. It is `Copy` and has
+/// exactly two arms so that term reads `== AccomplishedState` and so a third
+/// arm cannot appear without breaking the `match`es.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrequencyAssertionNature {
+    /// « c'est corrigé », « i've stopped » — a state of the system is posed,
+    /// and term (C) has proven that no `set_config` carries it.
+    AccomplishedState,
+    /// « je vais réduire », « i'll stop » — a commitment about the future. No
+    /// state posed, so nothing to go and verify, so outside the class.
+    FutureCommitment,
+}
+
+impl FrequencyAssertionNature {
+    /// The value that goes on the wire — into the two `warn!`s of 5e, which
+    /// are this discriminant's production consumer (mika#2879 D2).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AccomplishedState => "accomplished_state",
+            Self::FutureCommitment => "future_commitment",
+        }
+    }
+}
+
 /// Structured result from unactioned-frequency-promise detection.
 pub(crate) struct FrequencyPromiseMatch {
     /// The frequency / proactive-message predicate captured by Layer A.
     pub(crate) subject: String,
     /// The performative assertion captured by Layer B.
     pub(crate) assertion: String,
+    /// Which of the two natures Layer B matched (mika#2879). Read from the
+    /// branch the regex engine took, never re-computed from `assertion`.
+    pub(crate) nature: FrequencyAssertionNature,
 }
 
 /// **Layer A — subject:** the frequency of, or the suspension of, Mika's own
@@ -1166,25 +1197,90 @@ const FREQUENCY_SUBJECT_ALTERNATION: &str = r"(?:
 /// decoration: French routinely pronominalises the object it has just named, so
 /// « la fréquence de mes veilles, je **la** réduis » is the *normal* way to
 /// write the subject-first order that this guard also has to catch.
-const FREQUENCY_ASSERTION_ALTERNATION: &str = r"(?:
-      je\s+vais\s+(?:l[ae]\s+|les\s+|l'|t'|te\s+|y\s+|en\s+)?(?:corriger|r[ée]gler|arr[êe]ter|r[ée]duire|changer|ajuster|limiter|baisser|espacer|couper)
-    | je\s+(?:l[ae]\s+|les\s+|l'|y\s+|en\s+)?(?:corrige|r[ée]gle|arr[êe]te|r[ée]duis|change|ajuste|limite|espace|coupe)\b
-    | je\s+n(?:e\s+t'?|'?)envoie\s+plus
-    | je\s+ne?\s*t'?enverrai\s+plus
-    | je\s+n'?enverrai\s+plus
-    | c'?est\s+(?:corrig[ée]|r[ée]gl[ée]|fait|bon|r[ée]par[ée])
-    | i'?ll\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
-    | i\s+will\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
-    | i\s+(?:won'?t|will\s+not)\s+send
+///
+/// # Two natures, since mika#2879
+///
+/// The twelve alternatives are **not** of one kind, and the difference decides
+/// membership of the P0 class `fabrication-detected` (mika#2878's verdict on
+/// this site). They are therefore split into
+/// [`FREQUENCY_ASSERTION_ACCOMPLISHED_STATE`] and
+/// [`FREQUENCY_ASSERTION_FUTURE_COMMITMENT`], whose **union** —
+/// [`FREQUENCY_ASSERTION_ALTERNATION`] — is what detection reads. Detection
+/// behaviour is unchanged by construction: there is one alternation, one pass,
+/// one evaluation order.
+///
+/// **Nature « accomplished state ».** The sentence asserts a state *of the
+/// system* — and term (C) of the detector ([`frequency_actor_called`]) has
+/// already proven that no `set_config` carries it. The membership criterion is
+/// `PendingFabricationP0Site`'s (mika#2872 D1): *does the offending sentence
+/// assert a system state that no tool result of this turn carries?* For
+/// « c'est corrigé », yes. This is the half that belongs to the class — the
+/// attachment itself is mika#2879's next flight, not this one.
+const FREQUENCY_ASSERTION_ACCOMPLISHED_STATE: &str = r"(?:
+      c'?est\s+(?:corrig[ée]|r[ée]gl[ée]|fait|bon|r[ée]par[ée])
     | i'?ve\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
     | i\s+have\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
     | (?:it'?s|that'?s|it\s+is)\s+(?:fixed|done|sorted)
 )";
 
+/// **Nature « future commitment ».** A commitment about behaviour, not a state.
+/// Outside the `fabrication-detected` class: nothing is posed that a human
+/// would have to go and verify. The guard still fires on it — an unbacked
+/// promise is what 5e exists to re-prompt — but it is not a fabrication.
+///
+/// The two **present-tense** forms (`je corrige`, `je ne t'envoie plus`) are
+/// here and not above, and the choice is deliberate: that is a present of
+/// decision, not a report. Nobody writes « je ne t'envoie plus » to state an
+/// already-reached state — the sentence announces the conduct to come. Filing
+/// it as accomplished would wake the operator on a commitment, exactly the
+/// false positive mika#2879 exists to make unreachable.
+const FREQUENCY_ASSERTION_FUTURE_COMMITMENT: &str = r"(?:
+      je\s+vais\s+(?:l[ae]\s+|les\s+|l'|t'|te\s+|y\s+|en\s+)?(?:corriger|r[ée]gler|arr[êe]ter|r[ée]duire|changer|ajuster|limiter|baisser|espacer|couper)
+    | je\s+(?:l[ae]\s+|les\s+|l'|y\s+|en\s+)?(?:corrige|r[ée]gle|arr[êe]te|r[ée]duis|change|ajuste|limite|espace|coupe)\b
+    | je\s+n(?:e\s+t'?|'?)envoie\s+plus
+    | je\s+ne?\s*t'?enverrai\s+plus
+    | je\s+n'?enverrai\s+plus
+    | i'?ll\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+will\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+(?:won'?t|will\s+not)\s+send
+)";
+
+/// The union of the two natures, and **the only site that assembles them**.
+///
+/// Three properties, all three load-bearing:
+///
+/// 1. **Detection reads the union, and the union IS the concatenation of the
+///    two halves.** An alternative therefore cannot fall on the floor: if it
+///    disappears from a half it disappears from detection, and the ten
+///    existing 5e tests redden. That is what makes "detection is unchanged" a
+///    property of the construction rather than of a sample.
+/// 2. **The nature is never re-computed.** The nested named groups let
+///    `caps.name("accompli")` read *the branch the engine took*. Re-matching
+///    the captured fragment against an anchored regex would introduce a third
+///    predicate, a word boundary to guess, and an "unclassifiable" case with a
+///    default to name. None of that exists here.
+/// 3. **The evaluation order of detection does not move.** Two passes
+///    (accomplished first, commitment second) would change *which* violation is
+///    returned on a text carrying both — hence `matched_assertion`, hence
+///    observable behaviour. One pass over the union, then a read of the branch.
+///
+/// A second site building a regex out of one half alone would undo all three,
+/// silently and with every behavioural test still green. That is the class the
+/// repo's single-reader scans exist to refuse (mika#1833, mika#2425), and
+/// `mika2879_les_deux_moities_nont_quun_seul_site_dunion` refuses it here.
+static FREQUENCY_ASSERTION_ALTERNATION: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
+        format!(
+            r"(?P<assert>(?P<accompli>{FREQUENCY_ASSERTION_ACCOMPLISHED_STATE})|(?P<engagement>{FREQUENCY_ASSERTION_FUTURE_COMMITMENT}))"
+        )
+    },
+);
+
 static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
+        let assertion = &*FREQUENCY_ASSERTION_ALTERNATION;
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
+            r"(?ix)\b{assertion}(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
         ))
         .expect("frequency-promise assert-then-subject regex must compile")
     },
@@ -1192,8 +1288,9 @@ static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::syn
 
 static FREQ_SUBJECT_THEN_ASSERT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
+        let assertion = &*FREQUENCY_ASSERTION_ALTERNATION;
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})"
+            r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?){assertion}"
         ))
         .expect("frequency-promise subject-then-assert regex must compile")
     },
@@ -1347,6 +1444,13 @@ fn first_surviving_frequency_promise(
         return Some(FrequencyPromiseMatch {
             subject: caps.name("subj")?.as_str().to_string(),
             assertion: caps.name("assert")?.as_str().to_string(),
+            // The branch the engine took, not a re-classification of the
+            // captured fragment (mika#2879 D1, property 2).
+            nature: if caps.name("accompli").is_some() {
+                FrequencyAssertionNature::AccomplishedState
+            } else {
+                FrequencyAssertionNature::FutureCommitment
+            },
         });
     }
     None
@@ -5819,6 +5923,428 @@ mod tests {
             )
             .is_none(),
             "`la veille` = the day before; the qualifier is what makes it a subject"
+        );
+    }
+
+    // -- mika#2879 — les deux natures de l'assertion de fréquence --
+    //
+    // ## Rouge-avant, terme par terme (AC4)
+    //
+    // Un test qui n'a jamais été rouge n'atteste rien. Chaque recette est une
+    // injection jouée sur l'arbre vert, le test lancé, l'injection retirée.
+    // Ce qui suit est ce qui a été **observé** le 2026-10-23, pas ce qui
+    // était prévu.
+    //
+    // | # | injection | observé |
+    // |---|---|---|
+    // | i | `c'est corrigé` déplacée dans la moitié engagement | **rouge** sur la table (« classée FutureCommitment, attendu AccomplishedState ») et sur le compte (3 au lieu de 4) |
+    // | ii | `i won't send` dupliquée dans la moitié accomplie | **rouge** sur la table : la première branche de l'union gagne, donc l'alternative dupliquée rend `AccomplishedState` — et sur le compte (5 au lieu de 4) |
+    // | iii | `je vais …` supprimée sans être replacée | **rouge** sur trois des dix tests de mika#2358. C'est le contrôle d'AC2 : retirer une alternative d'une moitié la retire **de la détection**, donc la détection n'a pas d'autre source que l'union |
+    // | iv | `caps.name("accompli")` → `caps.name("engagement")` | **rouge** sur la table, dès sa première ligne — les douze natures s'inversent en bloc, le test s'arrête à la première |
+    // | v | `assertion_nature` retiré du `warn!` du résidu | **rouge** sur `agent_loop::tests::mika2879_les_deux_sites_5e_emettent_la_nature`, qui nomme lequel des deux sites est nu. Voir ci-dessous : ce n'est pas la forme que le plan prévoyait |
+    // | vi | un second `Regex::new(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE)` hors union | **rouge** sur le scan d'union, avec le chemin et la ligne. Livré aussi comme test sur source injectée, pas seulement joué |
+    //
+    // ## La recette (v) : ce qui a été livré, et pourquoi pas ce qui était prévu
+    //
+    // Le plan (R3) donnait deux issues au champ `assertion_nature`, et
+    // interdisait de livrer sans dire laquelle avait eu lieu. **Aucune des
+    // deux n'a eu lieu telle quelle**, et la raison n'est pas celle que le
+    // plan avait anticipée.
+    //
+    // L'issue (1) — un `tracing-test` sur la branche 5e — a été refusée non
+    // pour son coût en lignes mais parce qu'elle est **hors périmètre** :
+    // `tracing-test` n'est pas une dépendance de ce crate, donc l'ajouter
+    // mettrait `Cargo.toml` et `Cargo.lock` dans le diff, ce qu'AC-f refuse en
+    // toutes lettres. Une impossibilité de périmètre, pas une marge trop
+    // étroite.
+    //
+    // L'issue (2) — déclarer la recette verte — aurait donc été la suite
+    // littérale du plan. Elle a été écartée parce que le refus de (1) venait
+    // d'une raison **nouvelle**, et qu'une contre-mesure restait disponible
+    // dans le périmètre : une garde structurelle sur `agent_loop/mod.rs`,
+    // `mika2879_les_deux_sites_5e_emettent_la_nature`, qui refuse qu'un site
+    // d'émission 5e n'émette pas la nature. ~30 lignes, aucun fichier nouveau,
+    // aucune dépendance.
+    //
+    // Ce qu'elle atteste et ce qu'elle n'atteste pas, parce que la différence
+    // décide de ce que le vol 3 devra encore couvrir : elle atteste que le
+    // champ est **émis** par les deux sites ; elle n'atteste pas que la valeur
+    // émise est la bonne — c'est
+    // `mika2879_chaque_alternative_porte_la_nature_attendue` ci-dessous qui le
+    // fait, sur les douze alternatives. Ni l'une ni l'autre ne traverse la
+    // branche sous un vrai tour : le vol 3 le fera.
+
+    /// Le nombre d'alternatives d'une des deux moitiés.
+    ///
+    /// Compte les séparateurs de l'alternation plutôt que les lignes : une
+    /// alternative qui serait recollée sur la ligne d'une autre ne gonflerait
+    /// pas le compte, et c'est voulu — ce que la table pinne, c'est le nombre
+    /// d'alternatives, pas la mise en page.
+    fn alternative_count(alternation: &str) -> usize {
+        alternation.matches("\n    | ").count() + 1
+    }
+
+    /// **AC-a, première moitié : quatre et huit.**
+    ///
+    /// Le compte seul ne dit pas que la répartition est juste — c'est la table
+    /// ci-dessous qui le dit. Il dit qu'aucune alternative n'a été perdue ni
+    /// ajoutée en silence pendant la scission : douze avant, douze après.
+    #[test]
+    fn mika2879_les_douze_alternatives_sont_reparties_quatre_et_huit() {
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE),
+            4,
+            "la moitié « état accompli » porte quatre alternatives"
+        );
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_FUTURE_COMMITMENT),
+            8,
+            "la moitié « engagement sur l'avenir » porte huit alternatives"
+        );
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE)
+                + alternative_count(FREQUENCY_ASSERTION_FUTURE_COMMITMENT),
+            12,
+            "les douze de mika#2358 sont toutes là, et une seule fois"
+        );
+    }
+
+    /// **AC-a, seconde moitié : la table de classification des douze.**
+    ///
+    /// Une ligne par alternative de la couche B, avec un texte qui fait tirer
+    /// le détecteur et la nature que le moteur doit rendre. C'est la seule
+    /// attestation qui distingue « les deux constantes existent » de « chaque
+    /// alternative est du bon côté ».
+    ///
+    /// Elle rougit sur une alternative **dupliquée** dans les deux moitiés :
+    /// la branche accomplie est la première de l'union, donc elle gagne, donc
+    /// un texte d'engagement dupliqué rend `AccomplishedState` là où la table
+    /// attend `FutureCommitment`.
+    #[test]
+    fn mika2879_chaque_alternative_porte_la_nature_attendue() {
+        use FrequencyAssertionNature::{AccomplishedState, FutureCommitment};
+
+        // (alternative, texte représentatif, nature attendue)
+        let table: &[(&str, &str, FrequencyAssertionNature)] = &[
+            // --- les quatre d'état accompli ---
+            (
+                "c'est corrigé",
+                "C'est corrigé : plus aucun message de veille technique.",
+                AccomplishedState,
+            ),
+            (
+                "i've stopped",
+                "I've stopped the daily digests.",
+                AccomplishedState,
+            ),
+            (
+                "i have reduced",
+                "I have reduced the daily digests.",
+                AccomplishedState,
+            ),
+            (
+                "it's fixed",
+                "It's fixed, the daily digest stops today.",
+                AccomplishedState,
+            ),
+            // --- les huit d'engagement sur l'avenir ---
+            (
+                "je vais corriger",
+                "Je vais corriger ça : plus aucun message de veille technique.",
+                FutureCommitment,
+            ),
+            (
+                "je réduis",
+                "Je réduis la fréquence de mes veilles techniques.",
+                FutureCommitment,
+            ),
+            (
+                "je ne t'envoie plus",
+                "Je ne t'envoie plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "je ne t'enverrai plus",
+                "Je ne t'enverrai plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "je n'enverrai plus",
+                "Je n'enverrai plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "i'll reduce",
+                "I'll reduce the daily digests.",
+                FutureCommitment,
+            ),
+            (
+                "i will stop",
+                "I will stop the daily digests.",
+                FutureCommitment,
+            ),
+            (
+                "i won't send",
+                "I won't send you daily digests anymore.",
+                FutureCommitment,
+            ),
+        ];
+
+        assert_eq!(
+            table.len(),
+            12,
+            "la table couvre les douze alternatives, pas un échantillon"
+        );
+
+        for (alternative, text, expected) in table {
+            let m = detect_unactioned_frequency_promise(text, &no_tools()).unwrap_or_else(|| {
+                panic!(
+                    "l'alternative {alternative:?} doit faire tirer le détecteur : {text:?} — \
+                     si ce panic apparaît, la scission a perdu une alternative, et AC2 est faux"
+                )
+            });
+            assert_eq!(
+                m.nature, *expected,
+                "l'alternative {alternative:?} ({text:?}) est classée {:?}, attendu {expected:?}",
+                m.nature
+            );
+        }
+    }
+
+    /// **AC2, dit une fois de plus et autrement.** Les textes de la table sont
+    /// exactement ceux qui faisaient tirer le détecteur avant la scission ; le
+    /// contrôle qui compte est que les dix tests de mika#2358 ci-dessus sont
+    /// verts **sans modification**. Celui-ci ajoute la contrainte inverse : une
+    /// phrase honnête ne gagne pas une nature, elle ne fait rien tirer du tout.
+    #[test]
+    fn mika2879_une_phrase_honnete_na_pas_de_nature() {
+        for text in [
+            "Je ne peux pas régler la fréquence de mes veilles moi-même.",
+            "Tu veux que je réduise la fréquence de mes veilles techniques ?",
+            "En ce moment je t'envoie jusqu'à trois veilles techniques par jour.",
+        ] {
+            assert!(
+                detect_unactioned_frequency_promise(text, &no_tools()).is_none(),
+                "aucune violation, donc aucune nature à rendre : {text:?}"
+            );
+        }
+    }
+
+    // -- mika#2879 — le scan structurel : un seul site d'union (D3) --
+
+    const ACCOMPLISHED_CONST_NAME: &str = "FREQUENCY_ASSERTION_ACCOMPLISHED_STATE";
+    const COMMITMENT_CONST_NAME: &str = "FREQUENCY_ASSERTION_FUTURE_COMMITMENT";
+
+    /// **Livrée vide, et [`mika2879_lallowlist_dunion_est_vide`] l'y maintient.**
+    ///
+    /// La population a été recensée avant d'écrire le scan : les deux constantes
+    /// naissent avec ce vol, donc leurs usages hors union sont vides par
+    /// construction. Il n'y a rien à exempter, et il ne doit jamais y avoir rien
+    /// à exempter — une allowlist née vide est un tiroir où déposer la prochaine
+    /// infraction (mika#2323).
+    const UNION_SITE_EXCEPTIONS: &[&str] = &[];
+
+    /// Classe les lignes **non commentaires** de la moitié de production d'une
+    /// source, et rend `(nombre de sites d'union, infractions)`.
+    ///
+    /// Trois classes, et la troisième est celle qui compte :
+    /// - une ligne portant **les deux** noms est le site d'union — la seule forme
+    ///   où les deux moitiés se rencontrent légitimement ;
+    /// - une ligne portant `const <NOM>` est une déclaration ;
+    /// - toute autre ligne portant l'un des deux noms est une infraction : un
+    ///   second assembleur, ou une regex bâtie « juste pour une moitié ».
+    ///
+    /// Les commentaires sont retirés par [`crate::source_scan::strip_comment_lines`]
+    /// — la prose *à propos* des deux constantes n'est pas un usage, et il y en a
+    /// plusieurs paragraphes juste au-dessus de leur déclaration (motif mika#2050).
+    /// La moitié de production est découpée par
+    /// [`crate::source_scan::production_half`], parce que ce module même porte
+    /// les deux noms dans ses propres tests.
+    fn scan_union_sites(src: &str) -> (usize, Vec<String>) {
+        let production = crate::source_scan::production_half(src);
+        let mut union_sites = 0usize;
+        let mut offenders = Vec::new();
+
+        for line in crate::source_scan::strip_comment_lines(production).lines() {
+            let accomplished = line.contains(ACCOMPLISHED_CONST_NAME);
+            let commitment = line.contains(COMMITMENT_CONST_NAME);
+            if !accomplished && !commitment {
+                continue;
+            }
+            if accomplished && commitment {
+                union_sites += 1;
+                continue;
+            }
+            let name = if accomplished {
+                ACCOMPLISHED_CONST_NAME
+            } else {
+                COMMITMENT_CONST_NAME
+            };
+            if line.contains(&format!("const {name}")) {
+                continue;
+            }
+            offenders.push(line.trim().to_string());
+        }
+
+        (union_sites, offenders)
+    }
+
+    /// **AC-e — les deux moitiés n'ont qu'un seul site d'union (D3).**
+    ///
+    /// Le mode de régression que ce vol crée : deux constantes dans le module
+    /// invitent un futur éditeur à bâtir une regex « juste pour la moitié
+    /// accomplie », par souci de performance ou pour un troisième consommateur.
+    /// Ce jour-là la détection se dédouble — deux passes, deux ordres
+    /// d'évaluation, un `matched_assertion` qui change — et **aucun test de
+    /// comportement ne le voit** : c'est la classe `grooming_marker` (mika#2158),
+    /// et c'est pourquoi les scans « ce prédicat a un seul lecteur » existent
+    /// (mika#1833, mika#2425).
+    ///
+    /// **Quand ce scan tire, on route le site par l'union ; on n'ajoute pas de
+    /// ligne** (doctrine mika#2201).
+    #[test]
+    fn mika2879_les_deux_moities_nont_quun_seul_site_dunion() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        let mut offenders = Vec::new();
+        let mut union_sites = 0usize;
+        let mut scanned = 0usize;
+        let mut stack = vec![src_root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("la garde doit pouvoir lire {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("entrée de répertoire lisible").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs")
+                    || crate::source_scan::is_test_source_path(&path)
+                {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("la garde doit pouvoir lire {}: {e}", path.display())
+                });
+                scanned += 1;
+
+                let shown = path
+                    .strip_prefix(&src_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                if UNION_SITE_EXCEPTIONS.contains(&shown.as_str()) {
+                    continue;
+                }
+
+                let (sites, found) = scan_union_sites(&content);
+                union_sites += sites;
+                offenders.extend(found.into_iter().map(|l| format!("{shown}: {l}")));
+            }
+        }
+
+        assert!(
+            scanned > 0,
+            "la garde n'a scanné aucun fichier — chemin cassé"
+        );
+
+        // Anti-vacuité : un scan qui garde un motif que personne n'écrit ne
+        // vérifie rien, et se lit exactement comme un arbre propre. Si l'union
+        // cesse d'être une ligne unique — un rustfmt qui la scinde, par exemple
+        // — ce compte tombe à zéro et le scan doit le dire, pas passer.
+        assert_eq!(
+            union_sites, 1,
+            "mika#2879 — exactement un site d'union attendu (la ligne du \
+             `format!` qui porte les deux noms), {union_sites} trouvé(s). \
+             Zéro signifie que l'union a été scindée sur plusieurs lignes : ce \
+             scan ne garde plus rien. Plus d'un signifie un second assembleur."
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2879 — une moitié de l'assertion de fréquence est lue hors du \
+             site d'union :\n{}\n\n\
+             RÉSOLUTION : lire `FREQUENCY_ASSERTION_ALTERNATION`. Ne PAS ajouter \
+             le site à UNION_SITE_EXCEPTIONS — une seconde regex répondrait un \
+             jour différemment à la même question, en silence (classe mika#2158), \
+             et c'est AC2 qui tomberait.",
+            offenders.join("\n")
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus (R1, recette vi).
+    ///
+    /// Sans lui, « le scan voit un second site » est indistinguable de « le scan
+    /// ne voit jamais rien ». Il injecte la source plutôt que de l'écrire dans
+    /// l'arbre : un scan qui doit salir le dépôt pour être attesté n'est joué
+    /// qu'une fois.
+    #[test]
+    fn mika2879_le_scan_dunion_rougit_sur_un_second_site() {
+        // Le vrai arbre, tel que livré : une union, aucune infraction.
+        let canonical = concat!(
+            "const FREQUENCY_ASSERTION_ACCOMPLISHED_STATE: &str = r\"(?: c'est )\";\n",
+            "const FREQUENCY_ASSERTION_FUTURE_COMMITMENT: &str = r\"(?: je vais )\";\n",
+            "static U: LazyLock<String> = LazyLock::new(|| format!(\n",
+            "    r\"(?P<assert>(?P<accompli>{FREQUENCY_ASSERTION_ACCOMPLISHED_STATE})\
+             |(?P<engagement>{FREQUENCY_ASSERTION_FUTURE_COMMITMENT}))\"\n",
+            "));\n",
+        );
+        assert_eq!(
+            scan_union_sites(canonical),
+            (1, Vec::new()),
+            "la forme livrée doit se lire comme un site d'union et rien d'autre"
+        );
+
+        // L'infraction que le scan existe pour refuser : une seconde regex
+        // bâtie sur une seule moitié.
+        let (sites, offenders) = scan_union_sites(&format!(
+            "{canonical}\nstatic ACCOMPLI_ONLY: LazyLock<Regex> = LazyLock::new(|| {{\n    \
+             Regex::new(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE).unwrap()\n}});\n"
+        ));
+        assert_eq!(sites, 1, "le site légitime reste reconnu comme tel");
+        assert_eq!(
+            offenders.len(),
+            1,
+            "le second lecteur d'une moitié doit être vu : {offenders:?}"
+        );
+        assert!(
+            offenders[0].contains(ACCOMPLISHED_CONST_NAME),
+            "l'infraction doit nommer la constante lue : {offenders:?}"
+        );
+
+        // Bonne foi dans l'autre sens, les deux formes hors population.
+        let (_, prose_only) = scan_union_sites(
+            "/// `FREQUENCY_ASSERTION_ACCOMPLISHED_STATE` porte les quatre formes.\n\
+             // On n'utilise plus FREQUENCY_ASSERTION_FUTURE_COMMITMENT ailleurs.\n",
+        );
+        assert!(
+            prose_only.is_empty(),
+            "une mention en commentaire n'est pas un usage (classe mika#2050) : \
+             {prose_only:?}"
+        );
+
+        let (_, test_only) = scan_union_sites(concat!(
+            "const X: u8 = 0;\n",
+            "\n#[cfg(test)]\nmod tests {\n",
+            "    let n = count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE);\n}\n"
+        ));
+        assert!(
+            test_only.is_empty(),
+            "le code de test lit légitimement les deux moitiés — c'est ce que \
+             fait la table de classification ci-dessus : {test_only:?}"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist.
+    #[test]
+    fn mika2879_lallowlist_dunion_est_vide() {
+        assert!(
+            UNION_SITE_EXCEPTIONS.is_empty(),
+            "UNION_SITE_EXCEPTIONS est livrée vide et doit le rester : une \
+             allowlist née vide est un tiroir où déposer la prochaine \
+             infraction (mika#2323)."
         );
     }
 
