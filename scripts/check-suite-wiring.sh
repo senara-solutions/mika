@@ -63,10 +63,9 @@
 #   D entirely (`scripts/deploy-info-test.sh` is today's one such file, and it
 #   IS reachable). The population floor below catches a collapse of the
 #   convention, never a single escapee.
-#   Third limit: a workflow is a workflow. `release-pr.yml` is
-#   `workflow_dispatch`-only (mika#2048) and `eval-calibration.yml` is manual;
-#   a suite named only by one of those counts as reached here. No suite is in
-#   that state today either.
+#   Third limit: a workflow is a workflow. `eval-calibration.yml` is manual;
+#   a suite named only by it counts as reached here. No suite is in that state
+#   today either.
 #
 # THE TWO HOPS.
 #   H1  a `.github/workflows/*.yml` names the suite's repo-relative path

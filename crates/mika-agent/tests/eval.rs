@@ -100,6 +100,13 @@ mod eval {
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;
 
+    // mika#2884 — la ligne d'attribution porte la taille du prompt système
+    // (AC1), et c'est la même valeur que celle du voisin qui la rapportait déjà
+    // (AC2). Un unitaire sur l'émetteur resterait vert si le site d'appel
+    // passait `0` ou la longueur d'un autre `String` : seul un tour réel, lu sur
+    // l'événement émis ET sur la requête capturée, relie les deux bouts.
+    mod test_context_window_system_prompt_bytes_2884;
+
     // mika#1951 — the per-call isolation lever, on both cross-session channels,
     // with a negative control for each. The neighbours above cover the
     // identity-declared scope; this one covers a caller narrowing one turn.
