@@ -89,6 +89,39 @@ impl ContextBlock {
     }
 }
 
+/// Pourquoi la résolution d'un contexte de skill n'a pas rendu de bloc.
+///
+/// Les deux variantes séparent deux événements de natures opposées que le type
+/// `anyhow::Error` confondait (mika#2885) : une entrée absente du message est un
+/// fonctionnement normal sur un contexte optionnel, un échec de résolution est
+/// un incident. Le site de log de [`resolve_contexts`] est le seul lecteur de
+/// cette distinction, et il la lit par [`Self::is_missing_input`], jamais par le
+/// texte du message.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextResolutionError {
+    /// Le message du tour ne contient pas ce que le résolveur cherche.
+    ///
+    /// Aucun appel réseau n'a eu lieu : le résolveur s'est arrêté à l'entrée.
+    #[error("{0}")]
+    MissingInput(String),
+
+    /// La résolution a réellement échoué — appel `gh` ou réseau en échec,
+    /// réponse illisible, type de contexte inconnu.
+    ///
+    /// C'est la variante que `?` produit sur n'importe quelle `anyhow::Error`,
+    /// donc **le défaut d'un résolveur qui ne classe rien** : un oubli de
+    /// classification reste bruyant.
+    #[error("{0}")]
+    Failed(#[from] anyhow::Error),
+}
+
+impl ContextResolutionError {
+    /// `true` quand le message du tour ne portait pas l'entrée du résolveur.
+    pub fn is_missing_input(&self) -> bool {
+        matches!(self, Self::MissingInput(_))
+    }
+}
+
 /// Resolve context requirements for matched skills.
 ///
 /// For each matched skill with `[context]` declarations, dispatches to the appropriate
@@ -160,7 +193,10 @@ pub async fn resolve_contexts(
             "gh_pr_diff" => resolve_gh_pr_diff(message, github_token).await,
             _ => {
                 tracing::warn!(context_type = context_type.as_str(), "unknown context type");
-                Err(anyhow::anyhow!("unknown context type: {}", context_type))
+                Err(ContextResolutionError::Failed(anyhow::anyhow!(
+                    "unknown context type: {}",
+                    context_type
+                )))
             }
         };
 
@@ -176,13 +212,29 @@ pub async fn resolve_contexts(
                 resolved.insert(key.clone(), content);
             }
             Err(err) => {
-                tracing::warn!(
-                    key = key.as_str(),
-                    context_type = context_type.as_str(),
-                    error = %err,
-                    required = required,
-                    "context resolution failed"
-                );
+                // mika#2885 — une absence d'entrée sur un contexte OPTIONNEL est un
+                // fonctionnement normal : la sentinelle est insérée juste en dessous et le
+                // tour se déroule. Elle part en `debug!`, sous son propre littéral.
+                // Tout le reste — vrai échec, ou contexte requis — garde le `warn!` avec
+                // le même message et les mêmes champs : les greps opérateur portent sur
+                // ce littéral.
+                if !*required && err.is_missing_input() {
+                    tracing::debug!(
+                        key = key.as_str(),
+                        context_type = context_type.as_str(),
+                        error = %err,
+                        required = required,
+                        "optional context has no input in message"
+                    );
+                } else {
+                    tracing::warn!(
+                        key = key.as_str(),
+                        context_type = context_type.as_str(),
+                        error = %err,
+                        required = required,
+                        "context resolution failed"
+                    );
+                }
                 if *required {
                     exclude_indices.extend(skill_indices);
                 } else {
@@ -254,9 +306,17 @@ pub fn extract_pr_url(message: &str) -> Option<(String, String, u64)> {
 }
 
 /// Resolve a `gh_pr_diff` context requirement.
-async fn resolve_gh_pr_diff(message: &str, github_token: Option<&str>) -> Result<ContextBlock> {
-    let (owner, repo, number) =
-        extract_pr_url(message).context("no GitHub PR URL found in message")?;
+async fn resolve_gh_pr_diff(
+    message: &str,
+    github_token: Option<&str>,
+) -> Result<ContextBlock, ContextResolutionError> {
+    // mika#2885 — l'extraction d'URL est la SEULE étape de ce résolveur qui lit
+    // le message du tour : son échec est une absence d'entrée, pas un incident.
+    // Tout ce qui suit passe par `?` sur une `anyhow::Error`, donc par
+    // `ContextResolutionError::Failed`, donc reste bruyant.
+    let (owner, repo, number) = extract_pr_url(message).ok_or_else(|| {
+        ContextResolutionError::MissingInput("no GitHub PR URL found in message".to_string())
+    })?;
 
     let diff = fetch_pr_diff(&owner, &repo, number, github_token).await?;
 
@@ -739,5 +799,318 @@ mod tests {
         let diff = "diff --git a/file.rs b/file.rs\n+line\n";
         let result = truncate_diff(diff, 100);
         assert_eq!(result.context_type, "gh_pr_diff");
+    }
+
+    // ---- mika#2885 — un contexte optionnel sans entrée part en `debug!` -----
+    //
+    // Le livrable sous test est la DÉCISION du site de log de
+    // `resolve_contexts` : quel niveau, quel littéral et quels champs pour
+    // chacune des deux natures d'échec que le type `anyhow::Error` confondait.
+    // Les 565 WARN mesurés le 2026-10-23 sur `/var/log/mika/server.log` étaient
+    // tous la même absence d'entrée sur un contexte optionnel.
+    //
+    // La capture retient le NIVEAU en plus du message et des champs — ce
+    // qu'aucun harnais existant ne fait (`Mika2680Layer` de `server/mod.rs` et
+    // ses jumeaux de `tests/eval/` ne gardent que message et champs), parce que
+    // le niveau EST l'objet du ticket.
+    //
+    // `install_capturing_subscriber` est le seul site d'installation permis
+    // (mika#2646) ; la capture se pose par `set_default`, donc par thread, et
+    // l'`Interest` d'un callsite est figé par le PREMIER thread qui l'atteint.
+    // D'où `#[serial_test::serial]` sur chacun des trois capturants et le tour
+    // de chauffe joué AVANT l'installation : c'est la moitié porteuse du
+    // dispositif, pas une précaution.
+
+    /// Type de contexte qu'aucun résolveur ne connaît : le bras `_ =>` de
+    /// `resolve_contexts` en fait un vrai échec, sans réseau ni appel `gh`.
+    /// C'est ainsi qu'AC2 est atteint sans couture d'injection d'URL.
+    const MIKA2885_UNKNOWN_TYPE: &str = "zorglub-2885";
+
+    /// Message de tour qui ne porte aucune URL de PR — le cas des 565 WARN.
+    const MIKA2885_NO_URL: &str = "review the plan please";
+
+    #[derive(Debug, Clone)]
+    struct Mika2885Event {
+        level: tracing::Level,
+        fields: HashMap<String, String>,
+    }
+
+    struct Mika2885Layer {
+        events: std::sync::Arc<std::sync::Mutex<Vec<Mika2885Event>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Mika2885Layer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            let mut visitor = Mika2885Visitor(&mut fields);
+            event.record(&mut visitor);
+            if let Ok(mut events) = self.events.lock() {
+                events.push(Mika2885Event {
+                    level: *event.metadata().level(),
+                    fields,
+                });
+            }
+        }
+    }
+
+    struct Mika2885Visitor<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for Mika2885Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn mika2885_capture() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<Mika2885Event>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Mika2885Layer {
+            events: std::sync::Arc::clone(&events),
+        });
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        (guard, events)
+    }
+
+    /// Les événements dont le littéral de message est exactement `message`.
+    ///
+    /// Le filtre porte sur le littéral, jamais sur « il existe un WARN » : le
+    /// bras du type inconnu émet AUSSI son propre `warn!("unknown context
+    /// type")`, antérieur et inchangé par ce ticket.
+    fn mika2885_events_with_message(
+        events: &std::sync::Arc<std::sync::Mutex<Vec<Mika2885Event>>>,
+        message: &str,
+    ) -> Vec<Mika2885Event> {
+        events
+            .lock()
+            .expect("la capture mika#2885 n'est jamais empoisonnée")
+            .iter()
+            .filter(|e| e.fields.get("message").map(String::as_str) == Some(message))
+            .cloned()
+            .collect()
+    }
+
+    /// Atteint les callsites du site de log **avant** toute installation
+    /// d'abonné, pour que `rebuild_interest_cache()` ait quelque chose à
+    /// réévaluer : elle ne peut rien faire pour un callsite enregistré plus
+    /// tard (mika#2646/mika#2680).
+    ///
+    /// Les deux appels couvrent les deux branches du site — absence d'entrée et
+    /// vrai échec — plus le `warn!("unknown context type")` du bras `_ =>`.
+    async fn mika2885_warm_callsites() {
+        let missing_input = mika2885_entry("pr_diff", "gh_pr_diff", false);
+        let _ = resolve_contexts(&[&missing_input], MIKA2885_NO_URL, None).await;
+        let real_failure = mika2885_entry("pr_diff", MIKA2885_UNKNOWN_TYPE, false);
+        let _ = resolve_contexts(&[&real_failure], MIKA2885_NO_URL, None).await;
+    }
+
+    /// Un `SkillEntry` portant une seule exigence `[context.<key>]`.
+    ///
+    /// Le manifeste se désérialise d'un `skill.toml` minimal : seuls
+    /// `[skill].name` et `[skill].description` sont sans `#[serde(default)]`,
+    /// donc six lignes de TOML remplacent un littéral de quatorze champs.
+    fn mika2885_entry(key: &str, context_type: &str, required: bool) -> SkillEntry {
+        let manifest: crate::skills::manifest::SkillManifest = toml::from_str(&format!(
+            "[skill]\n\
+             name = \"mika2885\"\n\
+             description = \"fixture mika#2885\"\n\
+             \n\
+             [context.{key}]\n\
+             type = \"{context_type}\"\n\
+             required = {required}\n"
+        ))
+        .expect("le fixture de manifeste mika#2885 se désérialise");
+
+        SkillEntry {
+            manifest,
+            dir: std::path::PathBuf::from("/skills/mika2885"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_overrides: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
+            model_overrides: HashMap::new(),
+        }
+    }
+
+    /// AC1 — un contexte optionnel `gh_pr_diff` sur un message sans URL de PR
+    /// ne produit aucun WARN, et la sentinelle est toujours insérée.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2885_une_absence_dentree_sur_contexte_optionnel_ne_produit_aucun_warn() {
+        mika2885_warm_callsites().await;
+        let (_guard, events) = mika2885_capture();
+
+        let entry = mika2885_entry("pr_diff", "gh_pr_diff", false);
+        let (resolved, exclude_indices) = resolve_contexts(&[&entry], MIKA2885_NO_URL, None).await;
+
+        assert!(
+            mika2885_events_with_message(&events, "context resolution failed").is_empty(),
+            "AC1 — aucun « context resolution failed » ne doit être émis, événements capturés : {:?}",
+            events.lock().unwrap()
+        );
+
+        let debug_events =
+            mika2885_events_with_message(&events, "optional context has no input in message");
+        assert_eq!(
+            debug_events.len(),
+            1,
+            "AC1 — l'absence d'entrée doit être dite une fois sous son propre littéral, \
+             événements capturés : {:?}",
+            events.lock().unwrap()
+        );
+        let event = &debug_events[0];
+        assert_eq!(
+            event.level,
+            tracing::Level::DEBUG,
+            "AC1 — niveau du littéral"
+        );
+        assert_eq!(event.fields.get("key").map(String::as_str), Some("pr_diff"));
+        assert_eq!(
+            event.fields.get("context_type").map(String::as_str),
+            Some("gh_pr_diff")
+        );
+        assert_eq!(
+            event.fields.get("error").map(String::as_str),
+            Some("no GitHub PR URL found in message"),
+            "AC1 — le champ `error` reste octet pour octet celui du WARN d'origine"
+        );
+        assert_eq!(
+            event.fields.get("required").map(String::as_str),
+            Some("false")
+        );
+
+        assert!(
+            resolved
+                .get("pr_diff")
+                .is_some_and(|block| block.content.starts_with("(Context unavailable:")),
+            "AC1 — la sentinelle est toujours insérée : {resolved:?}"
+        );
+        assert!(
+            exclude_indices.is_empty(),
+            "AC1 — un contexte optionnel n'exclut aucun skill : {exclude_indices:?}"
+        );
+    }
+
+    /// AC2 — un contexte optionnel dont la résolution échoue réellement produit
+    /// toujours le WARN.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2885_un_vrai_echec_sur_contexte_optionnel_produit_toujours_le_warn() {
+        mika2885_warm_callsites().await;
+        let (_guard, events) = mika2885_capture();
+
+        let entry = mika2885_entry("pr_diff", MIKA2885_UNKNOWN_TYPE, false);
+        let (resolved, exclude_indices) = resolve_contexts(&[&entry], MIKA2885_NO_URL, None).await;
+
+        let warns = mika2885_events_with_message(&events, "context resolution failed");
+        assert_eq!(
+            warns.len(),
+            1,
+            "AC2 — un vrai échec garde son WARN, événements capturés : {:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(warns[0].level, tracing::Level::WARN, "AC2 — niveau du WARN");
+        assert_eq!(
+            warns[0].fields.get("required").map(String::as_str),
+            Some("false"),
+            "AC2 — le cas sous test est bien un contexte OPTIONNEL"
+        );
+        assert!(
+            mika2885_events_with_message(&events, "optional context has no input in message")
+                .is_empty(),
+            "AC2 — un vrai échec n'est pas une absence d'entrée"
+        );
+
+        assert!(
+            resolved
+                .get("pr_diff")
+                .is_some_and(|block| block.content.starts_with("(Context unavailable:")),
+            "AC2 — la sentinelle est toujours insérée : {resolved:?}"
+        );
+        assert!(exclude_indices.is_empty(), "AC2 — aucun skill exclu");
+    }
+
+    /// AC3 — un contexte requis qui échoue, quelle qu'en soit la raison,
+    /// produit toujours le WARN et exclut ses skills.
+    ///
+    /// Les deux raisons sont jouées dans la MÊME capture : une absence d'entrée
+    /// requise, et un vrai échec requis. C'est la paire qui sépare « le niveau
+    /// suit la nature de l'erreur » de « le niveau suit le caractère requis ».
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2885_un_contexte_requis_qui_echoue_produit_le_warn_et_exclut_ses_skills() {
+        mika2885_warm_callsites().await;
+        let (_guard, events) = mika2885_capture();
+
+        for context_type in ["gh_pr_diff", MIKA2885_UNKNOWN_TYPE] {
+            let entry = mika2885_entry("pr_diff", context_type, true);
+            let (resolved, exclude_indices) =
+                resolve_contexts(&[&entry], MIKA2885_NO_URL, None).await;
+            assert!(
+                resolved.is_empty(),
+                "AC3 — un contexte requis n'insère pas de sentinelle ({context_type}) : {resolved:?}"
+            );
+            assert_eq!(
+                exclude_indices,
+                vec![0],
+                "AC3 — un contexte requis exclut ses skills ({context_type})"
+            );
+        }
+
+        let warns = mika2885_events_with_message(&events, "context resolution failed");
+        assert_eq!(
+            warns.len(),
+            2,
+            "AC3 — les deux raisons gardent leur WARN, événements capturés : {:?}",
+            events.lock().unwrap()
+        );
+        for warn in &warns {
+            assert_eq!(warn.level, tracing::Level::WARN, "AC3 — niveau du WARN");
+            assert_eq!(
+                warn.fields.get("required").map(String::as_str),
+                Some("true"),
+                "AC3 — le champ `required` reste dans le WARN"
+            );
+        }
+        assert!(
+            mika2885_events_with_message(&events, "optional context has no input in message")
+                .is_empty(),
+            "AC3 — le littéral `debug!` ne porte que sur les contextes optionnels"
+        );
+    }
+
+    /// Le défaut de la conversion est la variante BRUYANTE.
+    ///
+    /// `#[from] anyhow::Error` fait de `Failed` ce que `?` produit sur
+    /// n'importe quelle erreur non classée : un résolveur qui oublie de classer
+    /// son absence d'entrée garde son WARN, il ne la fait pas taire. C'est
+    /// pourquoi la distinction est portée par le type et non par le texte du
+    /// message.
+    #[test]
+    fn mika2885_une_erreur_anyhow_non_classee_nest_pas_une_absence_dentree() {
+        assert!(
+            !ContextResolutionError::from(anyhow::anyhow!("boom")).is_missing_input(),
+            "une `anyhow::Error` non classée doit rester un vrai échec"
+        );
+        assert!(
+            ContextResolutionError::MissingInput("x".to_string()).is_missing_input(),
+            "seule la variante déclarée est une absence d'entrée"
+        );
     }
 }

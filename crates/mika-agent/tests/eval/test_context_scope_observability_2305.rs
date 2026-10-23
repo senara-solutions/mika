@@ -41,6 +41,12 @@ use super::harness::EvalHarness;
 /// interest cache of `tracing-core` 0.1.36. Migrating the five existing
 /// duplicates into a shared `tests/eval/tracing_capture.rs` is the right gesture
 /// and deserves its own ticket; it is not this one's.
+///
+/// A **third consumer** since mika#2884,
+/// `test_context_window_system_prompt_bytes_2884.rs`, which reads the very same
+/// `context_window_assembled` event this file reads. Each new consumer
+/// strengthens the case for that shared module without being the right place to
+/// execute it.
 pub(crate) type Captured = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
 
 struct CapturingLayer {

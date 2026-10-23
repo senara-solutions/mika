@@ -4951,11 +4951,21 @@ impl Database {
     /// `reference_url IN (…)` — les sous-issues du milestone que le manager
     /// surveille déjà : la lecture **coïncide** désormais avec sa surveillance,
     /// elle ne l'élargit pas.
+    ///
+    /// **Deux requêtes, et la seconde est la raison de mika#2886.** La ligne
+    /// que l'URL du ticket trouve est la **parente** `ready-label: …#N` : elle
+    /// porte le ticket et les tours, son `result` est vide. L'issue du pilote —
+    /// `Outcome: PR_OPENED — <url>` — vit sur l'**enfant**
+    /// `long_running:run_claude_pilot`, dont le `reference_url` est NULL. La
+    /// seconde requête va la chercher, pour toutes les parentes à la fois (une
+    /// requête par vol serait un N+1 sur le chemin du cycle), et le résultat
+    /// est rendu dans [`FinishedFlightRow`] — deux champs parce que les deux
+    /// données viennent de deux lignes.
     pub fn list_finished_implement_flights_in_container(
         &self,
         since: Option<&str>,
         issue_urls: &[String],
-    ) -> Result<Vec<Task>> {
+    ) -> Result<Vec<FinishedFlightRow>> {
         if issue_urls.is_empty() {
             return Ok(vec![]);
         }
@@ -4985,9 +4995,113 @@ impl Database {
         let rows: Vec<Task> = stmt
             .query_map(refs.as_slice(), Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(rows
+        let flights: Vec<Task> = rows
             .into_iter()
             .filter(|t| crate::task_state::tasks::is_terminal_task_status(&t.status))
+            .collect();
+        if flights.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Requête 2 — les enfants de ces mêmes parentes. La jointure et les
+        // liaisons sont celles de `find_dispatch_children_for_issue_url` ; le
+        // `WHERE` est celui de la requête 1, déplacé sur `parent`, donc **zéro
+        // paramètre de plus** : les mêmes `refs` servent les deux.
+        //
+        // `TASK_COLUMNS` est une liste **sans préfixe de table** — la requête 1
+        // n'en a pas besoin. Ici, `child.` est obligatoire : `parent` porte les
+        // mêmes trente-deux colonnes, et `row_to_task` les lit par **position**.
+        //
+        // Pas de garde `json_valid` : contrairement à
+        // `find_dispatch_children_for_issue_url`, cette requête n'évalue aucun
+        // `json_extract` — elle ne lit pas de JSON en SQL, donc elle n'a rien à
+        // protéger d'un `metadata` non-JSON.
+        let child_columns: String = Self::TASK_COLUMNS
+            .split(',')
+            .map(|c| format!("child.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql_enfants = format!(
+            "SELECT {child_columns}
+             FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE COALESCE(parent.dispatch_class, 'implement') = 'implement'
+               AND parent.reference_url IN ({placeholders})
+               AND COALESCE(parent.completed_at, parent.updated_at) > ?1"
+        );
+        let mut stmt = self.conn.prepare(&sql_enfants)?;
+        let enfants: Vec<Task> = stmt
+            .query_map(refs.as_slice(), Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+
+        /// La clé de récence d'un enfant : le même `COALESCE` que la borne
+        /// temporelle, et l'`id` pour trancher une égalité à la seconde (les
+        /// horodatages sont au format `%Y-%m-%dT%H:%M:%SZ`).
+        fn recence(t: &Task) -> (&str, &str) {
+            (
+                t.completed_at.as_deref().unwrap_or(t.updated_at.as_str()),
+                t.id.as_str(),
+            )
+        }
+
+        // Les trois filtres vivent en **Rust**, jamais en SQL.
+        //
+        // - **population** : `is_pilot_dispatch_label` est le lecteur unique de
+        //   la liste des labels de pilote. La recopier dans une clause `IN`
+        //   serait une seconde source de vérité, et `long_running:build_mika`
+        //   s'y glisserait au premier élargissement.
+        // - **vivacité** : `is_terminal_task_status`, même raison que la
+        //   requête 1 ci-dessus — sa règle « un statut inconnu n'est pas
+        //   terminal » ne se lit pas dans un `IN` SQL.
+        // - **contenu** : un `result` présent **et** non vide. Un enfant
+        //   terminé sans texte ne dit rien, et le dire quand même écraserait un
+        //   enfant antérieur qui, lui, parlait.
+        let mut derniers: std::collections::HashMap<String, Task> =
+            std::collections::HashMap::new();
+        for enfant in enfants {
+            if !crate::task_engine::engine::is_pilot_dispatch_label(&enfant.label) {
+                continue;
+            }
+            if !crate::task_state::tasks::is_terminal_task_status(&enfant.status) {
+                continue;
+            }
+            if enfant.result.as_deref().unwrap_or("").is_empty() {
+                continue;
+            }
+            let Some(parente_id) = enfant.parent_task_id.clone() else {
+                continue;
+            };
+            match derniers.get(&parente_id) {
+                Some(tenant) if recence(tenant) >= recence(&enfant) => {}
+                _ => {
+                    derniers.insert(parente_id, enfant);
+                }
+            }
+        }
+
+        // L'ordre rendu reste celui de la requête 1 — `COALESCE(…) ASC` sur les
+        // parentes. La seconde requête enrichit, elle ne réordonne pas.
+        Ok(flights
+            .into_iter()
+            .map(|flight| FinishedFlightRow {
+                pilot_result: derniers.remove(&flight.id).and_then(|e| e.result),
+                flight,
+            })
             .collect())
     }
+}
+
+/// Un vol terminé, et l'issue que son pilote a écrite (mika#2886).
+///
+/// Les deux champs viennent de **deux lignes différentes** : `flight` est la
+/// tâche qui porte l'URL du ticket (la parente `ready-label:`), `pilot_result`
+/// est le `result` du dernier enfant pilote terminé. C'est la topologie que
+/// `build_callback_task` produit, et la raison d'être de ce type : un `Task`
+/// dont le `result` aurait été écrasé ne dirait pas d'où il vient.
+#[derive(Debug, Clone)]
+pub struct FinishedFlightRow {
+    pub flight: crate::task_state::tasks::Task,
+    /// `None` quand le vol n'a aucun enfant pilote terminé portant un
+    /// `result` — jamais une chaîne vide (motif mika#2331 : absent ≠ vide).
+    pub pilot_result: Option<String>,
 }

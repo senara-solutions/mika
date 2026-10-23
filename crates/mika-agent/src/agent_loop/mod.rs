@@ -6095,6 +6095,11 @@ async fn run_agent_inner(
         trace_id,
         "conversation",
         &context_window_fields,
+        // mika#2884 — the same expression `report_brief_size_overrun` is handed
+        // a few lines below, deliberately: the two calls must be comparable at a
+        // glance, and the comment there on why `system.len()` is in scope covers
+        // both.
+        system.len(),
     );
 
     // mika#2783 — the detail `tool_defs_bytes` throws away. The sum exists on the
@@ -10352,12 +10357,43 @@ fn truncate_history_to_token_budget(
 /// | `session` | `> 1` | **halt**: the filter is not filtering; the leak is under `rebuild_context`, not in the setting |
 /// | `agent` | `> 1` | the mika#2305 defect, back: the setting never reached the disk (mika#2330 class) |
 /// | `agent` | `1` | permissive scope, thin window by accident — true today, false tomorrow |
+///
+/// # Why `system_prompt_bytes` is the fourth component (mika#2884)
+///
+/// The three byte counts above decompose the *conversation* half of the window;
+/// the heaviest component, and the only one a change to the **repository** moves
+/// without any conversation changing (the 825 KB `CLAUDE.md` of 2026-10-13), was
+/// the one missing. Reading what filled a window therefore meant joining this
+/// line to `system_prompt_assembled` (which carries the same value under the
+/// name `total_bytes`) or to `turn_usage` by `trace_id`. What the field buys is
+/// **one line carrying every component** — not a measurement that did not exist,
+/// and not a second source of truth: it is the same value, at the same instant,
+/// on the line that needs it (`report_brief_size_overrun`'s § *Why
+/// `system_prompt_bytes` rides along*, mika#2474, three lines below the sole
+/// caller of this function).
+///
+/// It arrives as a **parameter** rather than in [`ContextWindowFields`] because
+/// `build_context_window_fields` does not compute it and cannot: the system
+/// prompt is assembled by another path entirely, so widening that pure function
+/// would only make it a conduit for a value it does not produce — and would move
+/// the ~14 unit call sites that construct the struct for a value none of them has
+/// any business producing. Same positional shape as `report_brief_size_overrun`,
+/// fed by the same `system.len()` expression, so the two calls are literally
+/// comparable in a diff.
+///
+/// The value is emitted **without a sigil**, on a bare `usize`: here the system
+/// prompt is a `String` in hand, so "a measurement that did not happen" is
+/// unreachable and the mika#2331 motif (*absent is never zero*) holds by
+/// construction. `turn_usage` — emitted from a path where the prompt may be
+/// absent — keeps its `Option<i64>` and its `?`. Both forms are right where they
+/// are.
 fn emit_context_window_assembled(
     agent_id: &str,
     session_id: &str,
     trace_id: &str,
     mode: &str,
     fields: &ContextWindowFields,
+    system_prompt_bytes: usize,
 ) {
     info!(
         target: "mika::otel",
@@ -10370,6 +10406,9 @@ fn emit_context_window_assembled(
         history_bytes = fields.history_bytes,
         user_message_bytes = fields.user_message_bytes,
         tool_defs_bytes = fields.tool_defs_bytes,
+        // mika#2884 — the fourth component of the window, next to the other
+        // three rather than at the end of the list: the four are read together.
+        system_prompt_bytes = system_prompt_bytes,
         distinct_sessions = fields.distinct_sessions,
         history_scope = fields.history_scope,
         oldest_age_secs = fields.oldest_age_secs,

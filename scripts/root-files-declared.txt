@@ -26,7 +26,6 @@
 .gitattributes
 .gitignore
 .node-version
-.release-please-manifest.json
 CHANGELOG.md
 CLAUDE.md
 CONCEPTS.md
@@ -46,5 +45,4 @@ install.sh
 lefthook.yml
 package-lock.json
 package.json
-release-please-config.json
 rust-toolchain.toml

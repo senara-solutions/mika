@@ -130,6 +130,72 @@ Operator surfaces (`manager_delivery_resolved.liveness_url_set`,
 `manager_liveness_failed`, `manager_liveness_recovered`), expected regimes, the four
 probes and their halts: root `CLAUDE.md` § *Optional (battement de vivacité du manager)*.
 
+### Un vol est deux lignes de `tasks` (mika#2886)
+
+L'évaluateur de vols (`milestone_manager/evaluator.rs`, mika#2698) classe l'issue
+d'un vol de pilote en lisant une ligne `Outcome: <valeur> — <url>` dans le
+`result` de la tâche. **Cette ligne ne vit pas sur la ligne que l'URL du ticket
+désigne.**
+
+| ligne de `tasks` | label | `reference_url` | `result` | ce qu'elle porte |
+|---|---|---|---|---|
+| parente | `ready-label: <owner/repo>#<n>` | l'URL de l'issue | **vide** | l'agent, les tours (métadonnées), la borne temporelle |
+| enfant | `long_running:run_claude_pilot` | **NULL** | `Outcome: PR_OPENED — …/pull/<n>` | l'issue du vol |
+
+C'est la topologie que `skills::executor::build_callback_task` produit, et elle
+n'est pas réconciliable en aval : `try_extract_callback_metadata` ne remonte dans
+la parente que des **champs nommés** de métadonnées, jamais le texte du `result`.
+
+**La mesure.** `Database::list_finished_implement_flights_in_container` ne lisait
+que la parente. `classify_issue` ne voyait donc jamais de ligne `Outcome:` et
+rendait `DeathCause::Unknown("no_outcome_line")` → `ManualResumption`. Entre le
+redémarrage f14e69d9 (2026-10-19 06:00:32Z) et le 2026-10-23, le puits a produit
+**531 verdicts, tous identiques** : *« mort — cause non classée
+(no_outcome_line) — reprise à la main »*. Le rapport de 08:04:26Z classait ainsi
+le vol de #2875 « mort, 121 tours » — ce vol avait ouvert #2881, mergée à
+08:01:18Z. Un instrument constant ne mesure rien, et c'est ce qui rendait le
+compte de concordance de mika#2698 vol 2 (`MIKA_MANAGER_EVALUATE_WRITE`)
+impossible : sa précondition est une concordance, pas une constante.
+
+**Le correctif.** La lecture fait une **seconde requête** dans la même fermeture
+`with_db` — la jointure de `find_dispatch_children_for_issue_url`, avec le
+`WHERE` de la requête 1 déplacé sur `parent`, donc zéro paramètre de liaison de
+plus et une requête pour tous les vols du cycle. Elle rend des
+`FinishedFlightRow { flight, pilot_result }` : deux champs parce que les deux
+données viennent de deux lignes. Écraser le `result` du `Task` rendu aurait
+produit un type qui ment sur sa provenance. `pilot_result` est `None` — jamais
+`Some("")` — quand aucun enfant ne parle (motif mika#2331), et la projection de
+`flight_source.rs` est `pilot_result.or(flight.result)` : l'enfant d'abord, la
+parente en repli pour le vol mort avant d'avoir produit un enfant.
+
+Trois filtres, **tous en Rust et jamais en SQL**, pour la même raison que le
+filtre de statut terminal de la requête 1 : la population
+(`is_pilot_dispatch_label`, son lecteur unique — une clause `IN` recopiant les
+labels serait une seconde source de vérité, et `long_running:build_mika` s'y
+glisserait au premier élargissement), la vivacité (`is_terminal_task_status`) et
+le contenu (un `result` présent **et** non vide, sans quoi un enfant muet
+écraserait un enfant antérieur qui, lui, parlait). Le « dernier » enfant est
+tranché sur `COALESCE(completed_at, updated_at)` puis sur l'`id`, sur l'ensemble
+**déjà filtré** — un `ORDER BY … LIMIT 1` en SQL aurait choisi avant les filtres,
+donc parfois un enfant muet.
+
+**Aucune ligne de `evaluator.rs` n'a changé.** Le verdict ne change pas ; c'est
+ce qu'il lit qui change. Les tests de mika#2792 semaient un vol dont la ligne
+portant l'URL du ticket portait **aussi** l'`Outcome:` — la forme que la
+production ne produit pas. C'est la leçon transférable : un test qui sème sa
+fixture par le chemin le plus court sème une topologie, et celle-là n'était pas
+la bonne. L'AC1 de mika#2886
+(`flight_source::mika2886_la_forme_reelle_rend_un_verdict_de_pr_ouverte`) sème
+désormais les deux lignes par les écrivains de production.
+
+**Sonde post-déploiement.** `mika milestone reports --latest`, sur le premier
+rapport du puits qui suit l'atterrissage d'un vol : un vol dont la PR est ouverte
+ne doit plus être classé « mort ». **Halte** — un rapport encore constant en
+`no_outcome_line` après un `make deploy` signifie que le binaire servi précède le
+correctif (classe mika#2340), pas que la cause est ailleurs. Le compte de
+concordance de mika#2698 vol 2 **repart de zéro** au redémarrage qui charge ce
+correctif : les 531 verdicts antérieurs ne sont pas des mesures.
+
 **Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`), `MIKA_MANAGER_LIVENESS_URL` (mika#1990, no default — absent ⇒ the beat channel is disarmed). **All eleven are declared in `.env.example` since mika#2267** — before it, not one `MIKA_MANAGER_*` variable was declared anywhere in the repo (`.env.example`, `docker-compose.yml`, `packaging/`), so no review had ever been in a position to notice their absence or their misspelling. `mika2267_every_manager_env_const_is_declared_in_env_example` keeps it that way.
 
 **Cadence spawn.** `spawn.rs` (`manager_config_from_env` + `spawn_manager_cycle_task`, the latter taking an `Arc<dyn TokenResolver>` since mika#2013) wires the cycle as a background tokio task at `server::run_server` startup. Env-gated on `MIKA_MANAGER_TARGET_MILESTONE`: unset → INFO `manager_cadence_disabled` and no spawn; set-and-valid → INFO `manager_cadence_start` + spawn; set-and-malformed → ERROR `manager_cadence_config_invalid` and no spawn (startup continues). The loop polls at `cfg.poll_interval` and calls `run_manager_cycle`; the cycle body itself decides whether to deliver (state-change OR heartbeat-elapsed) and is a no-op otherwise. Cycle failures log at WARN and do not stop the loop — except a sustained authentication failure, which escalates per the token-renewal note below (mika#2013). Graceful shutdown responds to a dedicated `manager_shutdown_token` (sibling to `kg_shutdown_token` and `webhook_queue_shutdown`) — cancelled at the same `.with_graceful_shutdown` site. Structurally mirrors `kg::resolver_tick::spawn_resolver_tick_task` (same `tokio::select!` shape, same fail-open discipline, same `info!/warn!` lifecycle events). Injection-verified per `todos/mika-manager-cadence-wiring-injection-verification.md`.
