@@ -46,7 +46,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 ## Versioning
 
-- **Pre-1.0 breaking changes:** Until v1.0, breaking changes do not require backward compatibility. They are shipped as minor or patch releases (no major version bump). PRs that introduce breaking changes must document the required manual migration steps in the PR description.
+- **Semver strict :** À partir de v1.0, Mika suit le semver strict. Tout changement cassant (format de données, schéma de config, contrat d'API, comportement sur lequel un membre s'appuie) sort en version majeure, accompagné d'un guide de migration.
 
 ## Conventions
 
