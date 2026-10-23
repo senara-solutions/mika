@@ -403,4 +403,12 @@ mod eval {
     // P0 porte ouverte, et rien ne part porte fermée — le défaut livré
     // (mika#2867)
     mod test_fabrication_detected_p0_2867;
+
+    // Le second site de la même classe, et le créneau devenu typé : la récidive
+    // de la garde `false_local_hosting_claim` (5d) part en P0 porte ouverte,
+    // rien ne part porte fermée, et la revérification à l'acceptation rejoue le
+    // prédicat DU SITE qui a déposé — le fixture ne porte aucune forme
+    // d'`assert_grounded`, donc le prédicat de l'autre site ne peut pas tenir
+    // ce test par accident (mika#2872)
+    mod test_fabrication_detected_p0_2872;
 }

@@ -1004,6 +1004,105 @@ fn sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// mika#2872 — le créneau de la classe `fabrication-detected`, typé
+// ---------------------------------------------------------------------------
+
+/// La notification P0 de la classe `fabrication-detected`, différée jusqu'à
+/// l'acceptation de l'`EndTurn`, **et le site qui l'a posée**.
+///
+/// mika#2867 a livré le créneau en `Option<String>` pour un site unique. Dès le
+/// second, le texte seul ne suffit plus : la revérification à l'acceptation doit
+/// rejouer *le prédicat du site qui a déposé*, pas un prédicat câblé en dur. Un
+/// message posé par 5d que l'on revérifierait avec le prédicat d'`assert_grounded`
+/// serait supprimé sur un texte portant pourtant toujours la fausse revendication
+/// de localité, ou émis sur un texte qui ne la porte plus — dans les deux sens,
+/// le silence est faux.
+pub(crate) struct PendingFabricationP0 {
+    /// Le texte de la notification, formaté au site de dépôt — il nomme la faute,
+    /// le `trace_id` et le geste.
+    pub(crate) message: String,
+    /// Le site qui a déposé, donc le prédicat avec lequel on revérifie.
+    pub(crate) site: PendingFabricationP0Site,
+}
+
+/// Les sites de la classe `fabrication-detected` qui déposent une P0.
+///
+/// **Le critère d'appartenance à la classe** (mika#2872 D1, du bearing de Prime
+/// du 2026-10-22) : *la phrase fautive affirme-t-elle un état du système
+/// qu'aucun résultat d'outil de ce tour ne porte ?* Oui ⇒ la classe ; personne
+/// dans le système ne sait si c'est vrai, seul un humain peut l'établir, et le
+/// réveil de l'opérateur a donc un geste. Non ⇒ hors classe : la faute est une
+/// divergence de forme, de registre ou de conduite mesurée contre un fait que le
+/// garde tient déjà (`tenant_language`, l'horloge, un `DeliveryRecord`), ou un
+/// engagement sur l'avenir, ou une omission — aucun état n'est posé, donc il n'y
+/// a rien à aller vérifier.
+///
+/// Un garde qui *réfute* la phrase (5d voit `deployment` et sait qu'elle est
+/// fausse) reste dans la classe : « un état attesté » décrit une réponse que le
+/// garde peut **confirmer**, pas une réponse qu'il peut réfuter.
+///
+/// Les quatre sites `_uncorrected` restants — `response_language_drift`,
+/// `time_of_day_greeting_mismatch`, `testimony_access_proposal`,
+/// `unacknowledged_send_failure` — sont **hors classe** par ce critère et n'ont
+/// délibérément pas de variante ici. `unactioned_frequency_promise` n'y est
+/// qu'à moitié (sa branche « état accompli » seulement) et attend son
+/// sous-prédicat.
+///
+/// **Un seul créneau, donc une seule P0 par tour pour toute la classe.** Le
+/// verrou du ticket (« un verrou d'une notification par tour ») se lit à
+/// l'échelle de la **classe**, pas du site : chaque branche n'écrit que si le
+/// créneau est `None`, et le premier écrivain gagne dans l'ordre de la chaîne.
+/// *Coût nommé* : un tour qui viole 5d **et** `assert_grounded` ne réveille
+/// l'opérateur qu'une fois, pour 5d. Rien n'est perdu — la notification porte le
+/// `trace_id` et tous les `_uncorrected` du tour sont sur cette trace dans
+/// `/var/log/mika/server.log`. L'alternative, un créneau par site, rendrait
+/// possible trois réveils pour un seul tour, qui est le mode d'extinction d'une
+/// surface jamais muette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFabricationP0Site {
+    /// La récidive de la garde `assert_grounded` (#1331, site de mika#2867) :
+    /// un état affirmé sur une ressource qu'aucun outil d'ancrage n'a touchée
+    /// ce tour.
+    AssertGrounded,
+    /// La récidive de la garde `false_local_hosting_claim` (5d, mika#2290,
+    /// rattachée par mika#2872) : « je tourne en local sur ta machine » est un
+    /// état du déploiement qu'aucun résultat d'outil ne porte — et que
+    /// `tool_ctx.deployment` contredit.
+    FalseLocalHosting,
+}
+
+impl PendingFabricationP0Site {
+    /// Le texte **accepté** porte-t-il encore la violation que ce site a posée ?
+    ///
+    /// Six gardes en aval de la chaîne peuvent encore refuser la clôture et
+    /// obtenir un texte qui ne porte plus la faute : la réponse qui a récidivé
+    /// ne sortirait alors jamais, et la notification dirait le contraire
+    /// (« The answer went out »). La revérification est donc obligatoire, et
+    /// elle est **une propriété du type** plutôt qu'un prédicat recopié dans la
+    /// boucle : un troisième site ne compile pas sans nommer son bras, donc
+    /// « j'ai oublié de revérifier » n'est plus un état atteignable — la forme
+    /// que mika#1381 a imposée à `send_notification` pour l'étage.
+    pub(crate) fn still_violated(
+        self,
+        text: &str,
+        summaries: &[ToolCallSummary],
+        deployment: mika_common::home::Deployment,
+    ) -> bool {
+        match self {
+            // Recopié à l'identique du site d'acceptation de mika#2867 plutôt
+            // que reformulé : le risque de ce refactor n'est pas que les tests
+            // de #2870 rougissent, c'est qu'ils restent verts sur un prédicat
+            // devenu plus permissif.
+            Self::AssertGrounded => detect_affirmative_state_claim(text)
+                .is_some_and(|claim| !assert_grounded_satisfied(&claim, summaries)),
+            // Pas de terme de satisfaction : 5d n'a pas d'outil d'ancrage, la
+            // vérité de terrain est `deployment` et le détecteur la prend déjà.
+            Self::FalseLocalHosting => detect_false_local_hosting_claim(text, deployment).is_some(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mika#2358 — Unactioned frequency-promise guard
 // ---------------------------------------------------------------------------
 
