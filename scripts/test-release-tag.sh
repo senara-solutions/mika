@@ -49,8 +49,8 @@ make_manifest() {
 assert_class() {
     local name="$1" tag="$2" manifest="$3" want="$4" out got=0
     out="$(bash "$SCRIPT" "$tag" "$manifest" 2>/dev/null)" || got=$?
-    if [ "$got" -eq 0 ] && printf '%s\n' "$out" | grep -qx "prerelease=$want" \
-        && printf '%s\n' "$out" | grep -qx "tag=$tag"; then
+    if [ "$got" -eq 0 ] && grep -qx -- "prerelease=$want" <<<"$out" \
+        && grep -qx -- "tag=$tag" <<<"$out"; then
         PASS=$((PASS + 1)); echo "ok   $name"
     else
         FAIL=$((FAIL + 1)); echo "FAIL $name (exit=$got, out=$(printf '%s' "$out" | tr '\n' ' '))"
