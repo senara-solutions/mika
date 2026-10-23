@@ -149,3 +149,174 @@ pub fn emit_max_steps_tool_census(
         "max steps exhausted; tool call census for the turn"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un résumé d'appel réussi, au step donné.
+    fn call(step: u32, name: &str) -> ToolCallSummary {
+        ToolCallSummary {
+            step,
+            name: name.to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }
+    }
+
+    /// Le même, en échec.
+    fn failed_call(step: u32, name: &str) -> ToolCallSummary {
+        ToolCallSummary {
+            success: false,
+            ..call(step, name)
+        }
+    }
+
+    /// **U1** — décompte exact sur une tranche mélangée, ordre des clés
+    /// déterministe, et l'identité `sum(per_tool) == total_calls`.
+    ///
+    /// La tranche est délibérément désordonnée par rapport à l'ordre alphabétique
+    /// (`run_gh` apparaît avant `read_file`, et `search_memory` est semé entre les
+    /// deux) : c'est ce qui fait de l'assertion sur l'ordre une assertion et non
+    /// une tautologie.
+    #[test]
+    fn mika2877_u1_le_decompte_est_exact_et_lordre_des_cles_deterministe() {
+        let summaries = vec![
+            call(1, "search_memory"),
+            call(2, "run_gh"),
+            call(3, "search_memory"),
+            call(4, "read_file"),
+            call(5, "search_memory"),
+            call(6, "run_gh"),
+        ];
+
+        let c = census(&summaries);
+
+        assert_eq!(c.per_tool.get("search_memory"), Some(&3));
+        assert_eq!(c.per_tool.get("run_gh"), Some(&2));
+        assert_eq!(c.per_tool.get("read_file"), Some(&1));
+        assert_eq!(c.distinct_tools, 3);
+        assert_eq!(c.total_calls, 6);
+        assert_eq!(c.steps_with_tools, 6);
+        assert_eq!(c.failed_calls, 0);
+
+        // L'ordre des clés est celui du `BTreeMap`, donc alphabétique, donc le
+        // même d'une exécution à l'autre : c'est ce qui rend le champ `per_tool`
+        // assertable en test et comparable entre deux lignes de log.
+        assert_eq!(
+            c.per_tool.keys().collect::<Vec<_>>(),
+            vec!["read_file", "run_gh", "search_memory"]
+        );
+        assert_eq!(
+            serde_json::to_string(&c.per_tool).unwrap(),
+            r#"{"read_file":1,"run_gh":2,"search_memory":3}"#
+        );
+
+        // L'identité tenue par construction, assertée ici et nulle part ailleurs :
+        // elle protège contre une refonte future de `census`, pas contre un état
+        // atteignable aujourd'hui.
+        assert_eq!(
+            c.per_tool.values().sum::<u32>(),
+            c.total_calls,
+            "la somme de la carte doit être le total des appels"
+        );
+    }
+
+    /// **U2** — tranche vide : carte vide, tous les scalaires à 0, aucune panique
+    /// et aucun `Option` à déballer.
+    ///
+    /// C'est le cas que l'émission inconditionnelle existe pour rendre lisible —
+    /// « le budget a brûlé hors appels d'outils » est peut-être *la* réponse, et un
+    /// `if !summaries.is_empty()` au site d'appel le rendrait muet.
+    #[test]
+    fn mika2877_u2_une_tranche_vide_est_une_mesure_pas_une_absence() {
+        let c = census(&[]);
+
+        assert!(c.per_tool.is_empty());
+        assert_eq!(c.total_calls, 0);
+        assert_eq!(c.steps_with_tools, 0);
+        assert_eq!(c.distinct_tools, 0);
+        assert_eq!(c.failed_calls, 0);
+        assert_eq!(c, MaxStepsToolCensus::default());
+
+        // Et la carte vide se sérialise en objet vide, pas en `null` : la ligne de
+        // log porte une mesure, `jq` la lit sans cas particulier.
+        assert_eq!(serde_json::to_string(&c.per_tool).unwrap(), "{}");
+    }
+
+    /// **U3** — plusieurs appels au même `step` : `total_calls > steps_with_tools`,
+    /// et `total_calls` peut dépasser `max_steps` sans que rien ne soit faux.
+    ///
+    /// C'est le parallélisme du modèle (plusieurs blocs `tool_use` dans une même
+    /// réponse). Un décompte qui compterait les **steps** rendrait ici les deux
+    /// nombres égaux ; c'est la seule chose qui sépare les deux implémentations.
+    #[test]
+    fn mika2877_u3_le_parallelisme_separe_les_appels_des_steps() {
+        let mut summaries = Vec::new();
+        // Trois steps, quatre appels parallèles chacun : 12 appels sur 3 steps.
+        for step in 1..=3u32 {
+            for _ in 0..4 {
+                summaries.push(call(step, "run_gh"));
+            }
+        }
+
+        let c = census(&summaries);
+
+        assert_eq!(c.total_calls, 12);
+        assert_eq!(c.steps_with_tools, 3);
+        assert!(
+            c.total_calls > c.steps_with_tools,
+            "un step porte autant d'appels que le modèle en a émis"
+        );
+
+        // Et le total peut dépasser le plafond : `max_steps` borne les STEPS, pas
+        // les appels. Un opérateur qui lirait `total_calls > max_steps` comme une
+        // anomalie se tromperait, d'où la note sur le champ.
+        let max_steps = 10usize;
+        assert!(
+            c.total_calls as usize > max_steps,
+            "total_calls n'est pas borné par max_steps"
+        );
+    }
+
+    /// **U4** — `failed_calls` compte les `success == false`, **et** ces appels
+    /// restent comptés dans `per_tool`.
+    ///
+    /// La seconde moitié est la charge : un échec consomme du budget comme un
+    /// succès. Les exclure de `per_tool` effacerait exactement le motif « un outil
+    /// qui boucle sur son erreur » — le plus probable des trois hypothèses du
+    /// ticket.
+    #[test]
+    fn mika2877_u4_un_echec_compte_dans_failed_calls_et_dans_per_tool() {
+        let summaries = vec![
+            call(1, "run_gh"),
+            failed_call(2, "run_gh"),
+            failed_call(3, "run_gh"),
+            call(4, "search_memory"),
+            failed_call(5, "read_file"),
+        ];
+
+        let c = census(&summaries);
+
+        assert_eq!(c.failed_calls, 3);
+        assert_eq!(
+            c.per_tool.get("run_gh"),
+            Some(&3),
+            "les deux échecs de run_gh restent comptés dans per_tool"
+        );
+        assert_eq!(c.per_tool.get("read_file"), Some(&1));
+        assert_eq!(c.per_tool.get("search_memory"), Some(&1));
+        assert_eq!(c.total_calls, 5);
+        assert_eq!(
+            c.per_tool.values().sum::<u32>(),
+            c.total_calls,
+            "aucun appel n'est perdu par son échec"
+        );
+
+        // Un tour tout en échecs reste lisible : `failed_calls == total_calls`.
+        let all_failed = census(&[failed_call(1, "run_gh"), failed_call(2, "run_gh")]);
+        assert_eq!(all_failed.failed_calls, all_failed.total_calls);
+    }
+}
