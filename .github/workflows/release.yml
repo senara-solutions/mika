@@ -344,7 +344,6 @@ jobs:
             gh release edit "$TAG" --draft=false --latest
           fi
 
-      # The barrier that matters to the family: install.sh installs this.
       - name: Check what install.sh now installs
         run: |
           set -euo pipefail
