@@ -1166,25 +1166,90 @@ const FREQUENCY_SUBJECT_ALTERNATION: &str = r"(?:
 /// decoration: French routinely pronominalises the object it has just named, so
 /// « la fréquence de mes veilles, je **la** réduis » is the *normal* way to
 /// write the subject-first order that this guard also has to catch.
-const FREQUENCY_ASSERTION_ALTERNATION: &str = r"(?:
-      je\s+vais\s+(?:l[ae]\s+|les\s+|l'|t'|te\s+|y\s+|en\s+)?(?:corriger|r[ée]gler|arr[êe]ter|r[ée]duire|changer|ajuster|limiter|baisser|espacer|couper)
-    | je\s+(?:l[ae]\s+|les\s+|l'|y\s+|en\s+)?(?:corrige|r[ée]gle|arr[êe]te|r[ée]duis|change|ajuste|limite|espace|coupe)\b
-    | je\s+n(?:e\s+t'?|'?)envoie\s+plus
-    | je\s+ne?\s*t'?enverrai\s+plus
-    | je\s+n'?enverrai\s+plus
-    | c'?est\s+(?:corrig[ée]|r[ée]gl[ée]|fait|bon|r[ée]par[ée])
-    | i'?ll\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
-    | i\s+will\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
-    | i\s+(?:won'?t|will\s+not)\s+send
+///
+/// # Two natures, since mika#2879
+///
+/// The twelve alternatives are **not** of one kind, and the difference decides
+/// membership of the P0 class `fabrication-detected` (mika#2878's verdict on
+/// this site). They are therefore split into
+/// [`FREQUENCY_ASSERTION_ACCOMPLISHED_STATE`] and
+/// [`FREQUENCY_ASSERTION_FUTURE_COMMITMENT`], whose **union** —
+/// [`FREQUENCY_ASSERTION_ALTERNATION`] — is what detection reads. Detection
+/// behaviour is unchanged by construction: there is one alternation, one pass,
+/// one evaluation order.
+///
+/// **Nature « accomplished state ».** The sentence asserts a state *of the
+/// system* — and term (C) of the detector ([`frequency_actor_called`]) has
+/// already proven that no `set_config` carries it. The membership criterion is
+/// `PendingFabricationP0Site`'s (mika#2872 D1): *does the offending sentence
+/// assert a system state that no tool result of this turn carries?* For
+/// « c'est corrigé », yes. This is the half that belongs to the class — the
+/// attachment itself is mika#2879's next flight, not this one.
+const FREQUENCY_ASSERTION_ACCOMPLISHED_STATE: &str = r"(?:
+      c'?est\s+(?:corrig[ée]|r[ée]gl[ée]|fait|bon|r[ée]par[ée])
     | i'?ve\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
     | i\s+have\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
     | (?:it'?s|that'?s|it\s+is)\s+(?:fixed|done|sorted)
 )";
 
+/// **Nature « future commitment ».** A commitment about behaviour, not a state.
+/// Outside the `fabrication-detected` class: nothing is posed that a human
+/// would have to go and verify. The guard still fires on it — an unbacked
+/// promise is what 5e exists to re-prompt — but it is not a fabrication.
+///
+/// The two **present-tense** forms (`je corrige`, `je ne t'envoie plus`) are
+/// here and not above, and the choice is deliberate: that is a present of
+/// decision, not a report. Nobody writes « je ne t'envoie plus » to state an
+/// already-reached state — the sentence announces the conduct to come. Filing
+/// it as accomplished would wake the operator on a commitment, exactly the
+/// false positive mika#2879 exists to make unreachable.
+const FREQUENCY_ASSERTION_FUTURE_COMMITMENT: &str = r"(?:
+      je\s+vais\s+(?:l[ae]\s+|les\s+|l'|t'|te\s+|y\s+|en\s+)?(?:corriger|r[ée]gler|arr[êe]ter|r[ée]duire|changer|ajuster|limiter|baisser|espacer|couper)
+    | je\s+(?:l[ae]\s+|les\s+|l'|y\s+|en\s+)?(?:corrige|r[ée]gle|arr[êe]te|r[ée]duis|change|ajuste|limite|espace|coupe)\b
+    | je\s+n(?:e\s+t'?|'?)envoie\s+plus
+    | je\s+ne?\s*t'?enverrai\s+plus
+    | je\s+n'?enverrai\s+plus
+    | i'?ll\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+will\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+(?:won'?t|will\s+not)\s+send
+)";
+
+/// The union of the two natures, and **the only site that assembles them**.
+///
+/// Three properties, all three load-bearing:
+///
+/// 1. **Detection reads the union, and the union IS the concatenation of the
+///    two halves.** An alternative therefore cannot fall on the floor: if it
+///    disappears from a half it disappears from detection, and the ten
+///    existing 5e tests redden. That is what makes "detection is unchanged" a
+///    property of the construction rather than of a sample.
+/// 2. **The nature is never re-computed.** The nested named groups let
+///    `caps.name("accompli")` read *the branch the engine took*. Re-matching
+///    the captured fragment against an anchored regex would introduce a third
+///    predicate, a word boundary to guess, and an "unclassifiable" case with a
+///    default to name. None of that exists here.
+/// 3. **The evaluation order of detection does not move.** Two passes
+///    (accomplished first, commitment second) would change *which* violation is
+///    returned on a text carrying both — hence `matched_assertion`, hence
+///    observable behaviour. One pass over the union, then a read of the branch.
+///
+/// A second site building a regex out of one half alone would undo all three,
+/// silently and with every behavioural test still green. That is the class the
+/// repo's single-reader scans exist to refuse (mika#1833, mika#2425), and
+/// `mika2879_les_deux_moities_nont_quun_seul_site_dunion` refuses it here.
+static FREQUENCY_ASSERTION_ALTERNATION: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
+        format!(
+            r"(?P<assert>(?P<accompli>{FREQUENCY_ASSERTION_ACCOMPLISHED_STATE})|(?P<engagement>{FREQUENCY_ASSERTION_FUTURE_COMMITMENT}))"
+        )
+    },
+);
+
 static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
+        let assertion = &*FREQUENCY_ASSERTION_ALTERNATION;
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
+            r"(?ix)\b{assertion}(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
         ))
         .expect("frequency-promise assert-then-subject regex must compile")
     },
@@ -1192,8 +1257,9 @@ static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::syn
 
 static FREQ_SUBJECT_THEN_ASSERT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
+        let assertion = &*FREQUENCY_ASSERTION_ALTERNATION;
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})"
+            r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?){assertion}"
         ))
         .expect("frequency-promise subject-then-assert regex must compile")
     },
