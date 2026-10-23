@@ -416,4 +416,12 @@ mod eval {
     // d'`assert_grounded`, donc le prédicat de l'autre site ne peut pas tenir
     // ce test par accident (mika#2872)
     mod test_fabrication_detected_p0_2872;
+
+    // Le troisième site de la même classe, et le premier dont la frontière de
+    // classe passe à l'INTÉRIEUR d'un garde : la récidive de 5e
+    // (`unactioned_frequency_promise`) part en P0 sur sa seule moitié « état
+    // accompli », et sa moitié « engagement sur l'avenir » ne lève rien — porte
+    // armée dans les deux cas, donc seule la nature de l'assertion décide
+    // (mika#2879)
+    mod test_fabrication_detected_p0_2879;
 }
