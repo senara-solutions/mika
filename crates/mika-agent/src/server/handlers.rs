@@ -1682,20 +1682,21 @@ pub(super) async fn run_agent_for_message(
         record_pr_sync_observed(&a.db, &req.text, &req.request_id).await;
     }
 
-    // Hot-reload skills if the dirty flag was set by a previous turn
+    // Hot-reload skills if the dirty flag was set by a previous turn. A reload is
+    // an assembly, so it goes through the single assembler (mika#2889).
     let skills = if a.skills_dirty.load(Ordering::Acquire) {
         a.skills_dirty.store(false, Ordering::Release);
-        let mut registry = crate::skills::SkillRegistry::from_dir(&a.home_dir.join("skills"));
         let identity = crate::prompt::load_identity(&a.home_dir);
-        if let Some(ref allowlist) = identity.skills.allowlist {
-            registry.apply_identity_allowlist(allowlist);
-        }
-        if let Ok(overrides) = a.db.get_skill_overrides(a.db.agent_id()).await {
-            registry.apply_overrides(&overrides);
-        }
-        // Phase 2 (mika#1798): testimony-grade ban.
-        registry.apply_testimony_grade_ban();
-        registry.log_summary();
+        let overrides =
+            a.db.get_skill_overrides(a.db.agent_id())
+                .await
+                .unwrap_or_default();
+        let registry = crate::skills::assembly::assemble_agent_registry(
+            &a.home_dir.join("skills"),
+            &identity,
+            &overrides,
+            a.db.agent_id(),
+        );
         let new = Arc::new(registry);
         *a.skills.lock().unwrap() = new.clone();
         new

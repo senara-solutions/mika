@@ -27,6 +27,7 @@ use crate::tui::ui;
 use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::prompt;
 use mika_agent::skills::SkillRegistry;
+use mika_agent::skills::assembly::assemble_agent_registry;
 use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
 use mika_agent::teams::types::TeamEvent;
 use mika_agent::tools;
@@ -303,24 +304,23 @@ async fn spawn_agent_worker(
                     images,
                     thinking_budget,
                 } => {
-                    // Hot-reload skills if the dirty flag was set by a previous turn
+                    // Hot-reload skills if the dirty flag was set by a previous
+                    // turn. A reload is an assembly, so it goes through the single
+                    // assembler (mika#2889).
                     let mut skills_reloaded = false;
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
-                        let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
                         let reload_identity = mika_agent::prompt::load_identity(&worker_home);
-                        if let Some(ref allowlist) = reload_identity.skills.allowlist {
-                            registry.apply_identity_allowlist(allowlist);
-                        }
-                        if let Ok(overrides) =
-                            worker_db.get_skill_overrides(&worker_db.agent_id).await
-                        {
-                            registry.apply_overrides(&overrides);
-                        }
-                        // Phase 2 (mika#1798): testimony-grade ban.
-                        registry.apply_testimony_grade_ban();
-                        registry.log_summary();
-                        worker_skills = Arc::new(registry);
+                        let overrides = worker_db
+                            .get_skill_overrides(&worker_db.agent_id)
+                            .await
+                            .unwrap_or_default();
+                        worker_skills = Arc::new(assemble_agent_registry(
+                            &worker_home.join("skills"),
+                            &reload_identity,
+                            &overrides,
+                            &worker_db.agent_id,
+                        ));
                         skills_reloaded = true;
                     }
 
@@ -385,20 +385,17 @@ async fn spawn_agent_worker(
                     // can send the updated registry to the TUI for autocomplete.
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
-                        let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
                         let reload_identity2 = mika_agent::prompt::load_identity(&worker_home);
-                        if let Some(ref allowlist) = reload_identity2.skills.allowlist {
-                            registry.apply_identity_allowlist(allowlist);
-                        }
-                        if let Ok(overrides) =
-                            worker_db.get_skill_overrides(&worker_db.agent_id).await
-                        {
-                            registry.apply_overrides(&overrides);
-                        }
-                        // Phase 2 (mika#1798): testimony-grade ban.
-                        registry.apply_testimony_grade_ban();
-                        registry.log_summary();
-                        worker_skills = Arc::new(registry);
+                        let overrides = worker_db
+                            .get_skill_overrides(&worker_db.agent_id)
+                            .await
+                            .unwrap_or_default();
+                        worker_skills = Arc::new(assemble_agent_registry(
+                            &worker_home.join("skills"),
+                            &reload_identity2,
+                            &overrides,
+                            &worker_db.agent_id,
+                        ));
                         skills_reloaded = true;
                     }
 

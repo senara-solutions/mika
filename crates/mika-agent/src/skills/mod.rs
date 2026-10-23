@@ -1,3 +1,4 @@
+pub mod assembly;
 pub mod builtin_handlers;
 pub mod context;
 pub mod curator;
