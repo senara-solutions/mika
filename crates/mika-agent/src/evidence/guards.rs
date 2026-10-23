@@ -1117,12 +1117,43 @@ impl PendingFabricationP0Site {
 /// about.
 pub(crate) const UNACTIONED_FREQUENCY_PROMISE_LABEL: &str = "unactioned_frequency_promise";
 
+/// The nature of the Layer-B alternative that matched (mika#2879).
+///
+/// Not a logging convenience: this is the discriminant that decides membership
+/// of the P0 class `fabrication-detected` (see `PendingFabricationP0Site`), and
+/// mika#2879's next flight makes it a term of a guard. It is `Copy` and has
+/// exactly two arms so that term reads `== AccomplishedState` and so a third
+/// arm cannot appear without breaking the `match`es.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrequencyAssertionNature {
+    /// « c'est corrigé », « i've stopped » — a state of the system is posed,
+    /// and term (C) has proven that no `set_config` carries it.
+    AccomplishedState,
+    /// « je vais réduire », « i'll stop » — a commitment about the future. No
+    /// state posed, so nothing to go and verify, so outside the class.
+    FutureCommitment,
+}
+
+impl FrequencyAssertionNature {
+    /// The value that goes on the wire — into the two `warn!`s of 5e, which
+    /// are this discriminant's production consumer (mika#2879 D2).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AccomplishedState => "accomplished_state",
+            Self::FutureCommitment => "future_commitment",
+        }
+    }
+}
+
 /// Structured result from unactioned-frequency-promise detection.
 pub(crate) struct FrequencyPromiseMatch {
     /// The frequency / proactive-message predicate captured by Layer A.
     pub(crate) subject: String,
     /// The performative assertion captured by Layer B.
     pub(crate) assertion: String,
+    /// Which of the two natures Layer B matched (mika#2879). Read from the
+    /// branch the regex engine took, never re-computed from `assertion`.
+    pub(crate) nature: FrequencyAssertionNature,
 }
 
 /// **Layer A — subject:** the frequency of, or the suspension of, Mika's own
@@ -1413,6 +1444,13 @@ fn first_surviving_frequency_promise(
         return Some(FrequencyPromiseMatch {
             subject: caps.name("subj")?.as_str().to_string(),
             assertion: caps.name("assert")?.as_str().to_string(),
+            // The branch the engine took, not a re-classification of the
+            // captured fragment (mika#2879 D1, property 2).
+            nature: if caps.name("accompli").is_some() {
+                FrequencyAssertionNature::AccomplishedState
+            } else {
+                FrequencyAssertionNature::FutureCommitment
+            },
         });
     }
     None
@@ -5886,6 +5924,167 @@ mod tests {
             .is_none(),
             "`la veille` = the day before; the qualifier is what makes it a subject"
         );
+    }
+
+    // -- mika#2879 — les deux natures de l'assertion de fréquence --
+    //
+    // (en-tête de doctrine : les recettes de rouge-avant jouées sur le commit
+    // vert sont consignées plus bas, juste avant le scan d'union.)
+
+    /// Le nombre d'alternatives d'une des deux moitiés.
+    ///
+    /// Compte les séparateurs de l'alternation plutôt que les lignes : une
+    /// alternative qui serait recollée sur la ligne d'une autre ne gonflerait
+    /// pas le compte, et c'est voulu — ce que la table pinne, c'est le nombre
+    /// d'alternatives, pas la mise en page.
+    fn alternative_count(alternation: &str) -> usize {
+        alternation.matches("\n    | ").count() + 1
+    }
+
+    /// **AC-a, première moitié : quatre et huit.**
+    ///
+    /// Le compte seul ne dit pas que la répartition est juste — c'est la table
+    /// ci-dessous qui le dit. Il dit qu'aucune alternative n'a été perdue ni
+    /// ajoutée en silence pendant la scission : douze avant, douze après.
+    #[test]
+    fn mika2879_les_douze_alternatives_sont_reparties_quatre_et_huit() {
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE),
+            4,
+            "la moitié « état accompli » porte quatre alternatives"
+        );
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_FUTURE_COMMITMENT),
+            8,
+            "la moitié « engagement sur l'avenir » porte huit alternatives"
+        );
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE)
+                + alternative_count(FREQUENCY_ASSERTION_FUTURE_COMMITMENT),
+            12,
+            "les douze de mika#2358 sont toutes là, et une seule fois"
+        );
+    }
+
+    /// **AC-a, seconde moitié : la table de classification des douze.**
+    ///
+    /// Une ligne par alternative de la couche B, avec un texte qui fait tirer
+    /// le détecteur et la nature que le moteur doit rendre. C'est la seule
+    /// attestation qui distingue « les deux constantes existent » de « chaque
+    /// alternative est du bon côté ».
+    ///
+    /// Elle rougit sur une alternative **dupliquée** dans les deux moitiés :
+    /// la branche accomplie est la première de l'union, donc elle gagne, donc
+    /// un texte d'engagement dupliqué rend `AccomplishedState` là où la table
+    /// attend `FutureCommitment`.
+    #[test]
+    fn mika2879_chaque_alternative_porte_la_nature_attendue() {
+        use FrequencyAssertionNature::{AccomplishedState, FutureCommitment};
+
+        // (alternative, texte représentatif, nature attendue)
+        let table: &[(&str, &str, FrequencyAssertionNature)] = &[
+            // --- les quatre d'état accompli ---
+            (
+                "c'est corrigé",
+                "C'est corrigé : plus aucun message de veille technique.",
+                AccomplishedState,
+            ),
+            (
+                "i've stopped",
+                "I've stopped the daily digests.",
+                AccomplishedState,
+            ),
+            (
+                "i have reduced",
+                "I have reduced the daily digests.",
+                AccomplishedState,
+            ),
+            (
+                "it's fixed",
+                "It's fixed, the daily digest stops today.",
+                AccomplishedState,
+            ),
+            // --- les huit d'engagement sur l'avenir ---
+            (
+                "je vais corriger",
+                "Je vais corriger ça : plus aucun message de veille technique.",
+                FutureCommitment,
+            ),
+            (
+                "je réduis",
+                "Je réduis la fréquence de mes veilles techniques.",
+                FutureCommitment,
+            ),
+            (
+                "je ne t'envoie plus",
+                "Je ne t'envoie plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "je ne t'enverrai plus",
+                "Je ne t'enverrai plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "je n'enverrai plus",
+                "Je n'enverrai plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "i'll reduce",
+                "I'll reduce the daily digests.",
+                FutureCommitment,
+            ),
+            (
+                "i will stop",
+                "I will stop the daily digests.",
+                FutureCommitment,
+            ),
+            (
+                "i won't send",
+                "I won't send you daily digests anymore.",
+                FutureCommitment,
+            ),
+        ];
+
+        assert_eq!(
+            table.len(),
+            12,
+            "la table couvre les douze alternatives, pas un échantillon"
+        );
+
+        for (alternative, text, expected) in table {
+            let m = detect_unactioned_frequency_promise(text, &no_tools()).unwrap_or_else(|| {
+                panic!(
+                    "l'alternative {alternative:?} doit faire tirer le détecteur : {text:?} — \
+                     si ce panic apparaît, la scission a perdu une alternative, et AC2 est faux"
+                )
+            });
+            assert_eq!(
+                m.nature, *expected,
+                "l'alternative {alternative:?} ({text:?}) est classée {:?}, attendu {expected:?}",
+                m.nature
+            );
+        }
+    }
+
+    /// **AC2, dit une fois de plus et autrement.** Les textes de la table sont
+    /// exactement ceux qui faisaient tirer le détecteur avant la scission ; le
+    /// contrôle qui compte est que les dix tests de mika#2358 ci-dessus sont
+    /// verts **sans modification**. Celui-ci ajoute la contrainte inverse : une
+    /// phrase honnête ne gagne pas une nature, elle ne fait rien tirer du tout.
+    #[test]
+    fn mika2879_une_phrase_honnete_na_pas_de_nature() {
+        for text in [
+            "Je ne peux pas régler la fréquence de mes veilles moi-même.",
+            "Tu veux que je réduise la fréquence de mes veilles techniques ?",
+            "En ce moment je t'envoie jusqu'à trois veilles techniques par jour.",
+        ] {
+            assert!(
+                detect_unactioned_frequency_promise(text, &no_tools()).is_none(),
+                "aucune violation, donc aucune nature à rendre : {text:?}"
+            );
+        }
     }
 
     // -- mika#2247 response language-drift tests --
