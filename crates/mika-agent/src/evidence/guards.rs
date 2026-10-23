@@ -5928,8 +5928,51 @@ mod tests {
 
     // -- mika#2879 — les deux natures de l'assertion de fréquence --
     //
-    // (en-tête de doctrine : les recettes de rouge-avant jouées sur le commit
-    // vert sont consignées plus bas, juste avant le scan d'union.)
+    // ## Rouge-avant, terme par terme (AC4)
+    //
+    // Un test qui n'a jamais été rouge n'atteste rien. Chaque recette est une
+    // injection jouée sur l'arbre vert, le test lancé, l'injection retirée.
+    // Ce qui suit est ce qui a été **observé** le 2026-10-23, pas ce qui
+    // était prévu.
+    //
+    // | # | injection | observé |
+    // |---|---|---|
+    // | i | `c'est corrigé` déplacée dans la moitié engagement | **rouge** sur la table (« classée FutureCommitment, attendu AccomplishedState ») et sur le compte (3 au lieu de 4) |
+    // | ii | `i won't send` dupliquée dans la moitié accomplie | **rouge** sur la table : la première branche de l'union gagne, donc l'alternative dupliquée rend `AccomplishedState` — et sur le compte (5 au lieu de 4) |
+    // | iii | `je vais …` supprimée sans être replacée | **rouge** sur trois des dix tests de mika#2358. C'est le contrôle d'AC2 : retirer une alternative d'une moitié la retire **de la détection**, donc la détection n'a pas d'autre source que l'union |
+    // | iv | `caps.name("accompli")` → `caps.name("engagement")` | **rouge** sur la table, dès sa première ligne — les douze natures s'inversent en bloc, le test s'arrête à la première |
+    // | v | `assertion_nature` retiré du `warn!` du résidu | **rouge** sur `agent_loop::tests::mika2879_les_deux_sites_5e_emettent_la_nature`, qui nomme lequel des deux sites est nu. Voir ci-dessous : ce n'est pas la forme que le plan prévoyait |
+    // | vi | un second `Regex::new(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE)` hors union | **rouge** sur le scan d'union, avec le chemin et la ligne. Livré aussi comme test sur source injectée, pas seulement joué |
+    //
+    // ## La recette (v) : ce qui a été livré, et pourquoi pas ce qui était prévu
+    //
+    // Le plan (R3) donnait deux issues au champ `assertion_nature`, et
+    // interdisait de livrer sans dire laquelle avait eu lieu. **Aucune des
+    // deux n'a eu lieu telle quelle**, et la raison n'est pas celle que le
+    // plan avait anticipée.
+    //
+    // L'issue (1) — un `tracing-test` sur la branche 5e — a été refusée non
+    // pour son coût en lignes mais parce qu'elle est **hors périmètre** :
+    // `tracing-test` n'est pas une dépendance de ce crate, donc l'ajouter
+    // mettrait `Cargo.toml` et `Cargo.lock` dans le diff, ce qu'AC-f refuse en
+    // toutes lettres. Une impossibilité de périmètre, pas une marge trop
+    // étroite.
+    //
+    // L'issue (2) — déclarer la recette verte — aurait donc été la suite
+    // littérale du plan. Elle a été écartée parce que le refus de (1) venait
+    // d'une raison **nouvelle**, et qu'une contre-mesure restait disponible
+    // dans le périmètre : une garde structurelle sur `agent_loop/mod.rs`,
+    // `mika2879_les_deux_sites_5e_emettent_la_nature`, qui refuse qu'un site
+    // d'émission 5e n'émette pas la nature. ~30 lignes, aucun fichier nouveau,
+    // aucune dépendance.
+    //
+    // Ce qu'elle atteste et ce qu'elle n'atteste pas, parce que la différence
+    // décide de ce que le vol 3 devra encore couvrir : elle atteste que le
+    // champ est **émis** par les deux sites ; elle n'atteste pas que la valeur
+    // émise est la bonne — c'est
+    // `mika2879_chaque_alternative_porte_la_nature_attendue` ci-dessous qui le
+    // fait, sur les douze alternatives. Ni l'une ni l'autre ne traverse la
+    // branche sous un vrai tour : le vol 3 le fera.
 
     /// Le nombre d'alternatives d'une des deux moitiés.
     ///

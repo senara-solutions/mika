@@ -11910,6 +11910,161 @@ mod tests {
     use std::path::PathBuf;
 
     // ===========================================================================
+    // mika#2879 — les deux sites 5e portent la nature de l'assertion
+    // ===========================================================================
+
+    /// Le préfixe d'événement des deux `warn!` de la garde 5e.
+    ///
+    /// Un préfixe et non deux noms exacts : il couvre
+    /// `guard.unactioned_frequency_promise` **et** son `_uncorrected`, et il
+    /// couvrirait un troisième site 5e le jour où il naîtrait — ce qui est la
+    /// bonne borne, puisque la question posée est « tout site 5e porte-t-il la
+    /// nature ? » et non « ces deux-là la portent-ils ? ».
+    const FREQUENCY_PROMISE_EVENT_PREFIX: &str = "event = \"guard.unactioned_frequency_promise";
+
+    /// Les sites d'émission 5e qui n'émettent PAS `assertion_nature`.
+    ///
+    /// Découpé sur `warn!(` : chaque segment est le corps d'une émission, et
+    /// celui qui nomme un événement 5e doit nommer la nature. Les commentaires
+    /// sont retirés d'abord ([`crate::source_scan::strip_comment_lines`]) — la
+    /// prose *à propos* du champ n'est pas une émission (motif mika#2050) — et
+    /// la moitié de production est isolée, puisque ce module de test cite les
+    /// deux tokens.
+    fn frequency_promise_sites_missing_nature(src: &str) -> (usize, Vec<String>) {
+        let production =
+            crate::source_scan::strip_comment_lines(crate::source_scan::production_half(src));
+        let mut sites = 0usize;
+        let mut missing = Vec::new();
+
+        for segment in production.split("warn!(").skip(1) {
+            if !segment.contains(FREQUENCY_PROMISE_EVENT_PREFIX) {
+                continue;
+            }
+            // Borner au corps de CETTE émission : le segment court jusqu'au
+            // prochain `warn!(`, mais l'événement peut être suivi de beaucoup
+            // de code. On s'arrête à la ligne de l'événement, qui est la
+            // dernière du corps dans l'idiome de ce fichier.
+            let body = match segment.find(FREQUENCY_PROMISE_EVENT_PREFIX) {
+                Some(i) => &segment[..i],
+                None => segment,
+            };
+            sites += 1;
+            if !body.contains("assertion_nature") {
+                let event = segment[segment.find(FREQUENCY_PROMISE_EVENT_PREFIX).unwrap_or(0)..]
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                missing.push(event);
+            }
+        }
+
+        (sites, missing)
+    }
+
+    /// **AC-d — le discriminant a un consommateur de production, aux DEUX sites.**
+    ///
+    /// Ce que cette garde attrape et ce qu'elle n'attrape pas, dit une fois pour
+    /// qu'un relecteur n'ait pas à le déduire. Elle atteste que le champ est
+    /// **émis** par les deux sites 5e ; elle n'atteste pas que la valeur émise
+    /// est la bonne — ça, c'est
+    /// `evidence::guards::tests::mika2879_chaque_alternative_porte_la_nature_attendue`,
+    /// sur les douze alternatives. Les deux ensemble couvrent D2 ; aucune des
+    /// deux seule ne le couvre.
+    ///
+    /// **Pourquoi une garde structurelle et pas un test moteur.** Le plan
+    /// (R3) offrait un `tracing-test` sur la branche 5e. `tracing-test` n'est
+    /// pas une dépendance de ce crate : l'ajouter mettrait `Cargo.toml` et
+    /// `Cargo.lock` dans le diff, ce qu'AC-f refuse. Le refus n'est donc pas une
+    /// question de marge — c'est une impossibilité de périmètre, et l'en-tête de
+    /// doctrine du module de `guards.rs` la consigne. Le vol 3 traverse cette
+    /// branche avec de vrais tests moteur.
+    #[test]
+    fn mika2879_les_deux_sites_5e_emettent_la_nature() {
+        let this_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("agent_loop")
+            .join("mod.rs");
+        let src = std::fs::read_to_string(&this_file)
+            .unwrap_or_else(|e| panic!("la garde doit pouvoir lire {}: {e}", this_file.display()));
+
+        let (sites, missing) = frequency_promise_sites_missing_nature(&src);
+
+        // Anti-vacuité : une garde qui ne trouve aucun site se lit exactement
+        // comme un arbre propre. Deux, et pas « au moins un » — le site du
+        // résidu est précisément celui qu'on oublie, et c'est sur lui que les
+        // deux populations resteraient confondues (classe mika#2205).
+        assert_eq!(
+            sites, 2,
+            "mika#2879 — deux sites d'émission 5e attendus (le tir et le \
+             résidu), {sites} trouvé(s). Zéro signifie que le découpage a \
+             cessé de les voir : la garde ne vérifie plus rien."
+        );
+
+        assert!(
+            missing.is_empty(),
+            "mika#2879 — un site 5e émet sans la nature de l'assertion :\n{}\n\n\
+             RÉSOLUTION : ajouter `assertion_nature = promise.nature.as_str()`. \
+             Sans lui les deux natures que mika#2878 a séparées restent une \
+             seule population sous un seul nom d'événement, donc non \
+             soustractibles (classe mika#2205).",
+            missing.join("\n")
+        );
+    }
+
+    /// Le contrôle de bonne foi de la garde ci-dessus (R1, recette v).
+    ///
+    /// Sans lui, « la garde voit un site nu » est indistinguable de « la garde
+    /// ne voit jamais rien ».
+    #[test]
+    fn mika2879_la_garde_des_sites_5e_rougit_sur_un_champ_retire() {
+        let complet = concat!(
+            "    warn!(\n",
+            "        step,\n",
+            "        assertion_nature = promise.nature.as_str(),\n",
+            "        event = \"guard.unactioned_frequency_promise\",\n",
+            "    );\n",
+            "    warn!(\n",
+            "        step,\n",
+            "        assertion_nature = promise.nature.as_str(),\n",
+            "        event = \"guard.unactioned_frequency_promise_uncorrected\",\n",
+            "    );\n",
+        );
+        assert_eq!(
+            frequency_promise_sites_missing_nature(complet),
+            (2, Vec::new()),
+            "la forme livrée doit se lire comme deux sites complets"
+        );
+
+        let ampute = complet.replace(
+            "        assertion_nature = promise.nature.as_str(),\n        event = \"guard.unactioned_frequency_promise_uncorrected\"",
+            "        event = \"guard.unactioned_frequency_promise_uncorrected\"",
+        );
+        let (sites, missing) = frequency_promise_sites_missing_nature(&ampute);
+        assert_eq!(sites, 2, "les deux sites restent reconnus comme tels");
+        assert_eq!(
+            missing.len(),
+            1,
+            "le site amputé doit être vu, et nommé par son événement : {missing:?}"
+        );
+        assert!(
+            missing[0].contains("_uncorrected"),
+            "la garde doit nommer LEQUEL des deux sites est nu : {missing:?}"
+        );
+
+        // Bonne foi dans l'autre sens : un `warn!` d'une autre garde ne rentre
+        // pas dans la population, même s'il parle de fréquence.
+        let (sites, _) = frequency_promise_sites_missing_nature(
+            "    warn!(step, event = \"guard.unactioned_hosting_claim\");\n",
+        );
+        assert_eq!(
+            sites, 0,
+            "une autre garde n'a pas à porter la nature d'une assertion de fréquence"
+        );
+    }
+
+    // ===========================================================================
     // mika#2342 — every LLM call of this module carries a safety net
     // ===========================================================================
 
