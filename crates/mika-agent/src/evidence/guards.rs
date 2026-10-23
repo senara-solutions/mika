@@ -6087,6 +6087,224 @@ mod tests {
         }
     }
 
+    // -- mika#2879 — le scan structurel : un seul site d'union (D3) --
+
+    const ACCOMPLISHED_CONST_NAME: &str = "FREQUENCY_ASSERTION_ACCOMPLISHED_STATE";
+    const COMMITMENT_CONST_NAME: &str = "FREQUENCY_ASSERTION_FUTURE_COMMITMENT";
+
+    /// **Livrée vide, et [`mika2879_lallowlist_dunion_est_vide`] l'y maintient.**
+    ///
+    /// La population a été recensée avant d'écrire le scan : les deux constantes
+    /// naissent avec ce vol, donc leurs usages hors union sont vides par
+    /// construction. Il n'y a rien à exempter, et il ne doit jamais y avoir rien
+    /// à exempter — une allowlist née vide est un tiroir où déposer la prochaine
+    /// infraction (mika#2323).
+    const UNION_SITE_EXCEPTIONS: &[&str] = &[];
+
+    /// Classe les lignes **non commentaires** de la moitié de production d'une
+    /// source, et rend `(nombre de sites d'union, infractions)`.
+    ///
+    /// Trois classes, et la troisième est celle qui compte :
+    /// - une ligne portant **les deux** noms est le site d'union — la seule forme
+    ///   où les deux moitiés se rencontrent légitimement ;
+    /// - une ligne portant `const <NOM>` est une déclaration ;
+    /// - toute autre ligne portant l'un des deux noms est une infraction : un
+    ///   second assembleur, ou une regex bâtie « juste pour une moitié ».
+    ///
+    /// Les commentaires sont retirés par [`crate::source_scan::strip_comment_lines`]
+    /// — la prose *à propos* des deux constantes n'est pas un usage, et il y en a
+    /// plusieurs paragraphes juste au-dessus de leur déclaration (motif mika#2050).
+    /// La moitié de production est découpée par
+    /// [`crate::source_scan::production_half`], parce que ce module même porte
+    /// les deux noms dans ses propres tests.
+    fn scan_union_sites(src: &str) -> (usize, Vec<String>) {
+        let production = crate::source_scan::production_half(src);
+        let mut union_sites = 0usize;
+        let mut offenders = Vec::new();
+
+        for line in crate::source_scan::strip_comment_lines(production).lines() {
+            let accomplished = line.contains(ACCOMPLISHED_CONST_NAME);
+            let commitment = line.contains(COMMITMENT_CONST_NAME);
+            if !accomplished && !commitment {
+                continue;
+            }
+            if accomplished && commitment {
+                union_sites += 1;
+                continue;
+            }
+            let name = if accomplished {
+                ACCOMPLISHED_CONST_NAME
+            } else {
+                COMMITMENT_CONST_NAME
+            };
+            if line.contains(&format!("const {name}")) {
+                continue;
+            }
+            offenders.push(line.trim().to_string());
+        }
+
+        (union_sites, offenders)
+    }
+
+    /// **AC-e — les deux moitiés n'ont qu'un seul site d'union (D3).**
+    ///
+    /// Le mode de régression que ce vol crée : deux constantes dans le module
+    /// invitent un futur éditeur à bâtir une regex « juste pour la moitié
+    /// accomplie », par souci de performance ou pour un troisième consommateur.
+    /// Ce jour-là la détection se dédouble — deux passes, deux ordres
+    /// d'évaluation, un `matched_assertion` qui change — et **aucun test de
+    /// comportement ne le voit** : c'est la classe `grooming_marker` (mika#2158),
+    /// et c'est pourquoi les scans « ce prédicat a un seul lecteur » existent
+    /// (mika#1833, mika#2425).
+    ///
+    /// **Quand ce scan tire, on route le site par l'union ; on n'ajoute pas de
+    /// ligne** (doctrine mika#2201).
+    #[test]
+    fn mika2879_les_deux_moities_nont_quun_seul_site_dunion() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        let mut offenders = Vec::new();
+        let mut union_sites = 0usize;
+        let mut scanned = 0usize;
+        let mut stack = vec![src_root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("la garde doit pouvoir lire {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("entrée de répertoire lisible").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs")
+                    || crate::source_scan::is_test_source_path(&path)
+                {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("la garde doit pouvoir lire {}: {e}", path.display())
+                });
+                scanned += 1;
+
+                let shown = path
+                    .strip_prefix(&src_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                if UNION_SITE_EXCEPTIONS.contains(&shown.as_str()) {
+                    continue;
+                }
+
+                let (sites, found) = scan_union_sites(&content);
+                union_sites += sites;
+                offenders.extend(found.into_iter().map(|l| format!("{shown}: {l}")));
+            }
+        }
+
+        assert!(
+            scanned > 0,
+            "la garde n'a scanné aucun fichier — chemin cassé"
+        );
+
+        // Anti-vacuité : un scan qui garde un motif que personne n'écrit ne
+        // vérifie rien, et se lit exactement comme un arbre propre. Si l'union
+        // cesse d'être une ligne unique — un rustfmt qui la scinde, par exemple
+        // — ce compte tombe à zéro et le scan doit le dire, pas passer.
+        assert_eq!(
+            union_sites, 1,
+            "mika#2879 — exactement un site d'union attendu (la ligne du \
+             `format!` qui porte les deux noms), {union_sites} trouvé(s). \
+             Zéro signifie que l'union a été scindée sur plusieurs lignes : ce \
+             scan ne garde plus rien. Plus d'un signifie un second assembleur."
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2879 — une moitié de l'assertion de fréquence est lue hors du \
+             site d'union :\n{}\n\n\
+             RÉSOLUTION : lire `FREQUENCY_ASSERTION_ALTERNATION`. Ne PAS ajouter \
+             le site à UNION_SITE_EXCEPTIONS — une seconde regex répondrait un \
+             jour différemment à la même question, en silence (classe mika#2158), \
+             et c'est AC2 qui tomberait.",
+            offenders.join("\n")
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus (R1, recette vi).
+    ///
+    /// Sans lui, « le scan voit un second site » est indistinguable de « le scan
+    /// ne voit jamais rien ». Il injecte la source plutôt que de l'écrire dans
+    /// l'arbre : un scan qui doit salir le dépôt pour être attesté n'est joué
+    /// qu'une fois.
+    #[test]
+    fn mika2879_le_scan_dunion_rougit_sur_un_second_site() {
+        // Le vrai arbre, tel que livré : une union, aucune infraction.
+        let canonical = concat!(
+            "const FREQUENCY_ASSERTION_ACCOMPLISHED_STATE: &str = r\"(?: c'est )\";\n",
+            "const FREQUENCY_ASSERTION_FUTURE_COMMITMENT: &str = r\"(?: je vais )\";\n",
+            "static U: LazyLock<String> = LazyLock::new(|| format!(\n",
+            "    r\"(?P<assert>(?P<accompli>{FREQUENCY_ASSERTION_ACCOMPLISHED_STATE})\
+             |(?P<engagement>{FREQUENCY_ASSERTION_FUTURE_COMMITMENT}))\"\n",
+            "));\n",
+        );
+        assert_eq!(
+            scan_union_sites(canonical),
+            (1, Vec::new()),
+            "la forme livrée doit se lire comme un site d'union et rien d'autre"
+        );
+
+        // L'infraction que le scan existe pour refuser : une seconde regex
+        // bâtie sur une seule moitié.
+        let (sites, offenders) = scan_union_sites(&format!(
+            "{canonical}\nstatic ACCOMPLI_ONLY: LazyLock<Regex> = LazyLock::new(|| {{\n    \
+             Regex::new(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE).unwrap()\n}});\n"
+        ));
+        assert_eq!(sites, 1, "le site légitime reste reconnu comme tel");
+        assert_eq!(
+            offenders.len(),
+            1,
+            "le second lecteur d'une moitié doit être vu : {offenders:?}"
+        );
+        assert!(
+            offenders[0].contains(ACCOMPLISHED_CONST_NAME),
+            "l'infraction doit nommer la constante lue : {offenders:?}"
+        );
+
+        // Bonne foi dans l'autre sens, les deux formes hors population.
+        let (_, prose_only) = scan_union_sites(
+            "/// `FREQUENCY_ASSERTION_ACCOMPLISHED_STATE` porte les quatre formes.\n\
+             // On n'utilise plus FREQUENCY_ASSERTION_FUTURE_COMMITMENT ailleurs.\n",
+        );
+        assert!(
+            prose_only.is_empty(),
+            "une mention en commentaire n'est pas un usage (classe mika#2050) : \
+             {prose_only:?}"
+        );
+
+        let (_, test_only) = scan_union_sites(concat!(
+            "const X: u8 = 0;\n",
+            "\n#[cfg(test)]\nmod tests {\n",
+            "    let n = count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE);\n}\n"
+        ));
+        assert!(
+            test_only.is_empty(),
+            "le code de test lit légitimement les deux moitiés — c'est ce que \
+             fait la table de classification ci-dessus : {test_only:?}"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist.
+    #[test]
+    fn mika2879_lallowlist_dunion_est_vide() {
+        assert!(
+            UNION_SITE_EXCEPTIONS.is_empty(),
+            "UNION_SITE_EXCEPTIONS est livrée vide et doit le rester : une \
+             allowlist née vide est un tiroir où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     // -- mika#2247 response language-drift tests --
 
     use crate::config_keys::TenantLanguage;
