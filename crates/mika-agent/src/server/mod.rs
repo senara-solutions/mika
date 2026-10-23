@@ -1101,7 +1101,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     agents.insert(name.clone(), Arc::new(agent_state));
                 }
                 Err(e) => {
-                    warn!(agent = name, error = %e, "failed to initialize agent, skipping");
+                    // mika#2876 — le sigil `%` de `tracing` est un `Display`, et
+                    // sur une erreur `anyhow` `Display` ne rend que le contexte le
+                    // plus externe : la cause posée sous un `.with_context(...)`
+                    // disparaît du log. `{e:#}` aplatit la chaîne `source()`
+                    // entière. Message, champs et niveau inchangés — les greps
+                    // opérateur portent sur ce littéral.
+                    let chain = format!("{e:#}");
+                    warn!(agent = name, error = %chain, "failed to initialize agent, skipping");
                 }
             }
         }
@@ -7419,6 +7426,135 @@ mod tests {
             charged[0].fields.get("release").map(String::as_str),
             Some("issue_task_active"),
             "la relâche distingue AC7 du désarmement et de l'escalade"
+        );
+    }
+
+    // ---- mika#2876 — la chaîne complète d'un échec d'initialisation -------
+    //
+    // Le constat : `%` est un `Display`, et sur une erreur `anyhow` `Display`
+    // ne rend que le contexte le plus externe. Trente-sept lignes « failed to
+    // initialize agent » dans `/var/log/mika/server.log` ne portaient que
+    // « failed to resolve [kg] config for agent mika-litha », jamais la cause.
+    //
+    // Ce test lit la ligne telle qu'un échec RÉEL l'émet : `init_agent` est
+    // appelé pour de bon, sur un agent dont la config `[kg]` pointe vers un
+    // `docs_root` absent, et c'est la ligne capturée qui est jugée — pas une
+    // erreur reconstruite à la main.
+
+    const MIKA2876_AGENT: &str = "mika-test-2876";
+
+    /// Pose sur disque un agent dont le `docs_root` n'existe pas, et rend
+    /// l'`AppState` capable de le résoudre.
+    ///
+    /// La clé d'API est écrite dans le `.env` **de l'agent**, jamais dans
+    /// l'environnement du processus : depuis mika#2218 cette source est ajoutée
+    /// en DERNIER par `Settings::load_for_agent`, donc elle gagne sur tout le
+    /// reste, et le test n'a aucun état global à muter (`set_var` est `unsafe`
+    /// en édition 2024 et sa portée déborderait sur les voisins). La valeur
+    /// n'est pas de forme OAuth (`sk-ant-oat01-…`), donc `ClaudeClient::new`
+    /// ne consulte pas `resolve_home_dir()`. Le `.env` fixe aussi le
+    /// fournisseur, pour que la fixture ne dépende pas d'un `MIKA_LLM_PROVIDER`
+    /// qui traînerait dans l'environnement de la suite.
+    async fn mika2876_state() -> (AppState, tempfile::TempDir) {
+        let global = tempfile::TempDir::new().unwrap();
+        let agent_home = global.path().join("agents").join(MIKA2876_AGENT);
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        // Jamais créé : c'est la cause que le log doit nommer.
+        let absent = global.path().join("absent-2876");
+        std::fs::write(
+            agent_home.join("identity.toml"),
+            format!(
+                "name = \"{MIKA2876_AGENT}\"\n\n[kg]\nenabled = true\ndocs_root = \"{}\"\n",
+                absent.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".env"),
+            "MIKA_LLM_PROVIDER=anthropic\nMIKA_ANTHROPIC_API_KEY=sk-ant-test-2876\n",
+        )
+        .unwrap();
+
+        let mut state = test_state();
+        state.global_home_dir = global.path().to_path_buf();
+        state
+            .dashboard_db
+            .register_agent(MIKA2876_AGENT, MIKA2876_AGENT, agent_home.to_str().unwrap())
+            .await
+            .unwrap();
+        (state, global)
+    }
+
+    /// AC1 + AC2 — le log d'un échec d'initialisation porte la cause interne.
+    ///
+    /// **Écart assumé au plan, à lire avant de « corriger » le site visé.** Le
+    /// plan désignait `"failed to initialize agent, skipping"`. Ce `warn!`-là
+    /// vit dans la boucle de démarrage de `run_server`, **hors**
+    /// d'`init_agent` : un test qui appellerait `init_agent` directement
+    /// recevrait son `Err` et n'émettrait aucune ligne — la capture serait
+    /// vide et l'assertion « exactement une ligne » fausse pour la mauvaise
+    /// raison. Les deux seules issues restantes étaient d'extraire un
+    /// auxiliaire d'émission (refusé par le plan, KTD1) ou de rejouer le
+    /// `warn!` dans le test (tautologique, refusé par KTD2). Le chemin
+    /// paresseux de mika#1399 est un **vrai** site de production qui enveloppe
+    /// `init_agent` et émet `"lazy agent construction failed"` ; les deux sites
+    /// portent le même `format!("{e:#}")`, et seul celui-ci est atteignable
+    /// sans démarrer un serveur complet. La garde de source de
+    /// `canonical_tokens` couvre l'autre site, qu'aucun test comportemental ne
+    /// voit.
+    ///
+    /// **Rouge-avant (AC2)** : avec `error = %e`, le champ capturé ne porte que
+    /// « failed to resolve [kg] config for agent mika-test-2876 », et
+    /// l'assertion sur « docs_root path does not exist » rougit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2876_un_docs_root_absent_dit_sa_cause_dans_le_log() {
+        let (state, _global) = mika2876_state().await;
+
+        // Tour de chauffe : enregistre le callsite SANS abonné, pour que le
+        // `rebuild_interest_cache()` d'`install_capturing_subscriber` puisse le
+        // rallumer sous le nôtre. Même raison que `mika2680_warm_callsites` —
+        // un callsite ne s'enregistre qu'à sa première atteinte, et son
+        // `Interest` est alors décidé par le dispatcher du thread qui
+        // l'enregistre. L'échec ne cache rien dans la carte des agents, donc le
+        // second appel rejoue le chemin paresseux entier.
+        assert!(state.resolve_agent(MIKA2876_AGENT).await.is_none());
+
+        let (_guard, events) = mika2680_capture();
+        assert!(
+            state.resolve_agent(MIKA2876_AGENT).await.is_none(),
+            "le comportement ne change pas : l'agent est toujours écarté"
+        );
+
+        let failures: Vec<Mika2680Event> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.fields.get("message").map(String::as_str)
+                    == Some("lazy agent construction failed")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(failures.len(), 1, "exactement une ligne d'échec");
+
+        let error = failures[0]
+            .fields
+            .get("error")
+            .expect("la ligne porte un champ `error`");
+        assert!(
+            error.contains("docs_root path does not exist"),
+            "AC1 — la cause interne doit être dans le message, pas seulement le \
+             contexte externe ; lu : {error}"
+        );
+        assert!(
+            error.contains("failed to resolve [kg] config for agent"),
+            "le contexte externe survit à l'aplatissement ; lu : {error}"
+        );
+        assert!(
+            failures[0].fields.contains_key("agent"),
+            "R3 — le champ structuré `agent` est inchangé"
         );
     }
 }
