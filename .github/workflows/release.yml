@@ -83,8 +83,7 @@ jobs:
             tag="$REF_NAME"
             publish=true
           else
-            # A manual run signs and attests what it builds, and the user
-            # procedure accepts any ref of this workflow: only main may do that.
+            # A manual run signs and attests what it builds: only main may do that.
             if [ "$REF" != "refs/heads/main" ]; then
               echo "::error::a manual run must start from main, not $REF"
               exit 1

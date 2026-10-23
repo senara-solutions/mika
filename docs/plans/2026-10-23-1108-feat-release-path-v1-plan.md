@@ -162,7 +162,7 @@ Table de décision de `scripts/release-tag.sh <tag> <version-workspace>` :
 
 - **Goal:** l'étape opérateur est écrite dans le dépôt (AC1, AC2).
 - **Files:** `docs/releasing.md` (nouveau : essai à blanc, launch, checklist de vérification, retour arrière), `docs/deployment.md` (§ Release Binaries), et `docs/release-verification.md` seulement si U2 en change un nom.
-- **Approach:** l'essai à blanc recommandé est le tag candidat, parce qu'il exerce le job `publish` et qu'il permet d'exécuter `install.sh <tag>` puis le binaire installé, sous Linux et sous macOS. La procédure de vérification seule n'extrait jamais l'archive : c'est exactement le genre de défaut, un nom ou une disposition qui diverge d'`install.sh`, qui a cassé v0.12.2. Le run manuel reste un outil de mise au point. La doc dit aussi qu'une relance de `publish` est sûre, qu'un run manuel hors `main` est refusé, et qu'une règle de tag GitHub sur `refs/tags/v*`, réservée à l'opérateur, rendrait AC4 structurel. Poser cette règle est un geste opérateur.
+- **Approach:** l'essai à blanc recommandé est le tag candidat, parce qu'il exerce le job `publish` et qu'il permet d'exécuter `install.sh <tag>` puis le binaire installé, sous Linux et sous macOS. La procédure de vérification seule n'extrait jamais l'archive : c'est exactement le genre de défaut, un nom ou une disposition qui diverge d'`install.sh`, qui a cassé v0.12.2. Le run manuel reste un outil de mise au point. La doc dit aussi qu'une relance de `publish` est sûre, et qu'un run manuel hors `main` est refusé.
 - **Test expectation:** none, c'est de la documentation. Le job `docs-sync` exige `scripts/sync-agent-docs.sh` si un fichier synchronisé change.
 
 ---
