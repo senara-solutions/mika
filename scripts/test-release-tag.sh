@@ -75,12 +75,20 @@ assert_class   "final tag is not a prerelease"          v1.0.0       "$V100" fal
 assert_class   "rc tag is a prerelease"                 v1.0.0-rc.1  "$V100" true
 assert_class   "two-digit rc is a prerelease"           v1.0.0-rc.12 "$V100" true
 assert_refused "base differs from workspace version"    v1.0.1       "$V100"
+assert_refused "rc of another version"                  v1.0.1-rc.1  "$V100"
 assert_refused "unknown pre-release form"               v1.0.0-beta  "$V100"
 assert_refused "rc without its number"                  v1.0.0-rc.   "$V100"
 assert_refused "missing v prefix"                       1.0.0        "$V100"
 assert_refused "trailing garbage"                       v1.0.0-rc.1x "$V100"
 assert_refused "missing manifest argument"              v1.0.0
-assert_refused "manifest without a workspace version"   v1.0.0       "$FIXTURE_ROOT/absent/Cargo.toml"
+assert_refused "manifest file absent"                   v1.0.0       "$FIXTURE_ROOT/absent/Cargo.toml"
+
+# A [workspace.package] table without its own `version`: the next table carries
+# a line-leading `version = "1.0.0"`, which must not be read as the workspace's.
+NOVER_DIR="$(mktemp -d -p "$FIXTURE_ROOT")"
+printf '%s\n' '[workspace]' 'members = ["crates/*"]' '' '[workspace.package]' 'edition = "2024"' \
+    '' '[workspace.metadata.release]' 'version = "1.0.0"' > "$NOVER_DIR/Cargo.toml"
+assert_refused "workspace.package without a version"    v1.0.0       "$NOVER_DIR/Cargo.toml"
 
 # The real manifest must classify a tag of its own version, or the release
 # workflow refuses every tag on the day it is needed.

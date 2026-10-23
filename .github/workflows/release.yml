@@ -46,8 +46,10 @@ permissions:
   contents: read
 
 concurrency:
-  # Two runs on the same tag would delete each other's draft in `publish`.
-  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  # Two runs on the same tag would delete each other's draft in `publish`. The
+  # event is part of the group because GitHub keeps one pending run per group
+  # and cancels the older one: a manual run must never cancel a tag push.
+  group: release-${{ github.event_name }}-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
   cancel-in-progress: false
 
 jobs:
