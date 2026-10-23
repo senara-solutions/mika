@@ -1044,9 +1044,10 @@ pub(crate) struct PendingFabricationP0 {
 /// Les quatre sites `_uncorrected` restants — `response_language_drift`,
 /// `time_of_day_greeting_mismatch`, `testimony_access_proposal`,
 /// `unacknowledged_send_failure` — sont **hors classe** par ce critère et n'ont
-/// délibérément pas de variante ici. `unactioned_frequency_promise` n'y est
-/// qu'à moitié (sa branche « état accompli » seulement) et attend son
-/// sous-prédicat.
+/// délibérément pas de variante ici. `unactioned_frequency_promise` y est entré
+/// avec mika#2879 (vol 3) **par sa seule branche « état accompli »** : sa
+/// moitié « engagement sur l'avenir » reste hors classe, et la frontière est
+/// tenue par la nature relue — au dépôt comme à la revérification.
 ///
 /// **Un seul créneau, donc une seule P0 par tour pour toute la classe.** Le
 /// verrou du ticket (« un verrou d'une notification par tour ») se lit à
@@ -1069,6 +1070,16 @@ pub(crate) enum PendingFabricationP0Site {
     /// état du déploiement qu'aucun résultat d'outil ne porte — et que
     /// `tool_ctx.deployment` contredit.
     FalseLocalHosting,
+    /// 5e sur sa seule branche « état accompli » (mika#2879, vol 3). La
+    /// moitié « engagement sur l'avenir » reste HORS de la classe : une
+    /// promesse non tenue n'affirme aucun état du système, et aucun geste
+    /// d'opérateur ne la rendrait vraie (critère mika#2872 D1).
+    ///
+    /// Le nom porte la moitié délibérément : une variante
+    /// `UnactionedFrequencyPromise` tout court inviterait le prochain lecteur à
+    /// y rattacher le détecteur entier, c'est-à-dire le verdict en bloc que
+    /// mika#2878 a refusé dans les deux sens.
+    UnactionedFrequencyPromiseAccomplished,
 }
 
 impl PendingFabricationP0Site {
@@ -1098,6 +1109,18 @@ impl PendingFabricationP0Site {
             // Pas de terme de satisfaction : 5d n'a pas d'outil d'ancrage, la
             // vérité de terrain est `deployment` et le détecteur la prend déjà.
             Self::FalseLocalHosting => detect_false_local_hosting_claim(text, deployment).is_some(),
+            // La nature est **relue**, jamais transportée dans le créneau :
+            // transporter `promise.nature` ferait d'un champ la source de
+            // vérité sur un texte qui a changé entre-temps — la forme que
+            // mika#2158 condamne. Ici les deux lectures appellent la même
+            // fonction, à deux instants, sur deux textes. Et le terme (C) du
+            // détecteur lit les `summaries` du tour d'**acceptation** : un tour
+            // qui a fini par appeler `set_config` ne réveille personne.
+            Self::UnactionedFrequencyPromiseAccomplished => {
+                detect_unactioned_frequency_promise(text, summaries).is_some_and(|promise| {
+                    promise.nature == FrequencyAssertionNature::AccomplishedState
+                })
+            }
         }
     }
 }
