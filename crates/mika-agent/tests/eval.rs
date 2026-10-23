@@ -431,4 +431,11 @@ mod eval {
     // armée dans les deux cas, donc seule la nature de l'assertion décide
     // (mika#2879)
     mod test_fabrication_detected_p0_2879;
+
+    // Le verrou de CLASSE de la même famille, enfin attesté : un tour qui viole
+    // 5d + 5e + assert_grounded à la fois n'émet qu'une P0, et c'est celle du
+    // premier écrivain de la chaîne ; et un engagement sur l'avenir ne prend pas
+    // le créneau du site aval. Les neuf fixtures mono-site des vols 1 à 3 ne
+    // pouvaient pas le voir — c'est leur R6/R7 resté vert (mika#2879, vol 4/4)
+    mod test_fabrication_detected_p0_2879_collision;
 }

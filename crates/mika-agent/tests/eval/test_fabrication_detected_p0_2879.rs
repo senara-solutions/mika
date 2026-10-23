@@ -53,9 +53,9 @@
 //! fixtures ci-dessous ne produit deux violations de la classe dans un même
 //! tour, donc le second écrivain n'existe nulle part et le verrou n'a rien à
 //! empêcher — c'est exactement ce que les recettes R6 et R7 du rouge-avant
-//! observent. Il appartient au vol suivant de mika#2879 (AC3). Écrit ici plutôt
-//! que dans le plan seul : c'est le fichier de test qui doit dire ce qu'il ne
-//! tient pas.
+//! observent. Il est livré par le vol 4 (AC3), dans
+//! `test_fabrication_detected_p0_2879_collision.rs`. Écrit ici plutôt que dans
+//! le plan seul : c'est le fichier de test qui doit dire ce qu'il ne tient pas.
 //!
 //! # Recettes de rouge-avant (AC4)
 //!
@@ -96,8 +96,10 @@
 //! relit la nature et le supprime avant l'émission. Ce que R6 ne peut donc pas
 //! voir — la P0 d'un *autre* site du même tour, perdue parce qu'un engagement
 //! lui a pris le créneau — est précisément ce qu'aucune fixture de ce vol ne
-//! produit : il faut le tour à deux violations de classe, c'est-à-dire le vol
-//! suivant.
+//! produit : il faut le tour à deux violations de classe. Le vol 4 le produit,
+//! et cette injection y rougit : c'est **R4** de
+//! `test_fabrication_detected_p0_2879_collision.rs`, sur son test
+//! `mika2879_la_nature_au_depot_protege_le_creneau_du_site_aval`.
 //!
 //! **R7 — le verrou de CLASSE retiré : reste VERT, et le site est donc livré
 //! non attesté sur ce point.** `pending_fabrication_p0.is_none()` retiré du
@@ -105,8 +107,10 @@
 //! mika#2872 est reconduit mot pour mot, et sa raison aussi : aucune des
 //! fixtures des trois sites ne produit deux violations de la classe dans un même
 //! tour, donc le second écrivain n'existe nulle part. Ce que `is_none()`
-//! garantit est tenu par le compilateur et par relecture, pas par ce fichier
-//! (AC3 → vol suivant).
+//! garantit n'est pas tenu par ce fichier — il l'est par le vol 4, où cette
+//! même injection est **R2** de
+//! `test_fabrication_detected_p0_2879_collision.rs` et rougit sur
+//! `mika2879_une_collision_triple_nemet_quune_seule_p0_de_classe` (AC3).
 //!
 //! **R8 — les DEUX termes de nature retirés ensemble** (R2 + R6, soit le verdict
 //! en bloc que mika#2878 a refusé) ⇒ **rouge** sur le contrôle d'engagement, qui
