@@ -257,25 +257,22 @@ async fn run_a2a_agent(
     model_override: Option<&Arc<dyn mika_common::llm::LlmProvider>>,
     session_isolated: bool,
 ) -> Result<A2aTurn, A2aTurnFailure> {
-    // Hot-reload skills if dirty
+    // Hot-reload skills if dirty. A reload is an assembly, so it goes through the
+    // single assembler (mika#2889) — not through a local copy of the sequence.
     let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
         agent_state.skills_dirty.store(false, Ordering::Release);
-        let mut registry =
-            crate::skills::SkillRegistry::from_dir(&agent_state.home_dir.join("skills"));
         let identity = crate::prompt::load_identity(&agent_state.home_dir);
-        if let Some(ref allowlist) = identity.skills.allowlist {
-            registry.apply_identity_allowlist(allowlist);
-        }
-        if let Ok(overrides) = agent_state
+        let overrides = agent_state
             .db
             .get_skill_overrides(agent_state.db.agent_id())
             .await
-        {
-            registry.apply_overrides(&overrides);
-        }
-        // Phase 2 (mika#1798): testimony-grade ban.
-        registry.apply_testimony_grade_ban();
-        registry.log_summary();
+            .unwrap_or_default();
+        let registry = crate::skills::assembly::assemble_agent_registry(
+            &agent_state.home_dir.join("skills"),
+            &identity,
+            &overrides,
+            agent_state.db.agent_id(),
+        );
         let new = Arc::new(registry);
         *agent_state.skills.lock().unwrap() = new.clone();
         new

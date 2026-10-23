@@ -1824,6 +1824,138 @@ mod tests {
         }
     }
 
+    /// AC4 de mika#2889 — l'ensemble des skills chargées à l'initialisation est
+    /// **inchangé** par le passage des six sites à l'assembleur unique.
+    ///
+    /// Le ticket demande une garantie de non-régression, et c'est la seule des
+    /// quatre que les trois autres critères ne couvrent pas : AC1 et AC2 disent
+    /// qu'une skill fautive est désormais écartée aux rechargements à chaud, AC3
+    /// dit qu'il n'existe qu'un assembleur — aucun des trois ne dirait qu'une
+    /// skill **légitime** a cessé d'être chargée au démarrage. Le témoin est la
+    /// séquence manuelle que `server/mod.rs` portait avant ce changement, rejouée
+    /// ici à la main : l'égalité des deux ensembles est ce qui atteste que
+    /// l'extraction n'a rien déplacé.
+    ///
+    /// L'identité passe par [`crate::prompt::load_identity`] sur un `identity.toml`
+    /// écrit pour l'occasion, et non par un littéral : `Identity` ne dérive pas
+    /// `Default`, et c'est le lecteur que les six sites utilisent réellement.
+    ///
+    /// **Angle mort nommé.** Sur une bibliothèque saine — mesuré : les trois
+    /// allowlists écartent zéro skill — retirer `apply_load_safety_check` ou
+    /// `apply_required_tools_coherence_check` de l'assembleur laisse ce test vert :
+    /// les deux côtés chargeraient le même ensemble et n'écarteraient toujours
+    /// rien. C'est AC1 et AC2 qui couvrent cette classe, en **posant** une skill
+    /// que chaque contrôle écarte ; ce test-ci répond à l'autre question, celle
+    /// qu'aucun des deux ne pose — l'extraction a-t-elle coûté une skill légitime.
+    #[test]
+    fn mika2889_lensemble_des_skills_a_linitialisation_est_inchange() {
+        use crate::bundled_skills::seed_bundled_skills;
+        use crate::skills::SkillRegistry;
+        use crate::skills::assembly::assemble_agent_registry;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+        seed_bundled_skills(&skills_dir);
+
+        let noms = |r: &SkillRegistry| -> Vec<String> {
+            let mut v: Vec<String> = r
+                .skills()
+                .iter()
+                .map(|e| e.manifest.skill.name.clone())
+                .collect();
+            v.sort();
+            v
+        };
+
+        for (agent, allowlist) in well_known_skill_allowlists() {
+            let home = tmp.path().join(format!("home-{agent}"));
+            fs::create_dir_all(&home).expect("agent home");
+            let quoted: Vec<String> = allowlist.iter().map(|s| format!("\"{s}\"")).collect();
+            fs::write(
+                home.join("identity.toml"),
+                format!(
+                    "name = \"{agent}\"\nemoji = \"✦\"\n\n[skills]\nallowlist = [{}]\n",
+                    quoted.join(", ")
+                ),
+            )
+            .expect("identity.toml");
+            let identity = crate::prompt::load_identity(&home);
+            assert_eq!(
+                identity.skills.allowlist.as_deref(),
+                Some(allowlist.as_slice()),
+                "l'identité écrite pour '{agent}' n'a pas été relue telle quelle — \
+                 le témoin et l'assembleur ne verraient pas la même allowlist"
+            );
+
+            // Le témoin : les sept étapes dans l'ordre de l'init serveur, à la main.
+            let mut temoin = SkillRegistry::from_dir(&skills_dir);
+            temoin.apply_identity_allowlist(&allowlist);
+            temoin.apply_overrides(&[]);
+            temoin.apply_testimony_grade_ban();
+            temoin.apply_load_safety_check();
+            temoin.apply_required_tools_coherence_check(agent);
+
+            let obtenu = assemble_agent_registry(&skills_dir, &identity, &[], agent);
+
+            // Sans ce plancher, deux ensembles vides satisfont l'égalité qui suit
+            // et le test reste vert en ne mesurant rien.
+            assert!(
+                !noms(&obtenu).is_empty(),
+                "'{agent}' ne charge aucune skill — l'égalité qui suit ne mesurerait rien"
+            );
+
+            // Ni l'un ni l'autre des deux contrôles n'écarte quoi que ce soit de la
+            // bibliothèque livrée — mesuré le 2026-10-23 : les trois allowlists
+            // rendent `skipped == []`. L'égalité ci-dessous ne le dirait pas : si
+            // les deux côtés écartaient la même skill, elle resterait verte.
+            //
+            // Les préfixes sont ceux que le code écrit réellement —
+            // `apply_load_safety_check` écrit `validation: …` et
+            // `apply_required_tools_coherence_check` écrit `coherence: …`. Le plan
+            // de mika#2889 annonçait `load:`, qui n'existe nulle part ; une
+            // assertion sur ce préfixe aurait été verte en ne filtrant rien.
+            let ecartes_par_les_controles: Vec<&str> = obtenu
+                .skipped()
+                .iter()
+                .filter(|s| {
+                    s.reason.starts_with("validation:") || s.reason.starts_with("coherence:")
+                })
+                .map(|s| s.name.as_str())
+                .collect();
+            assert!(
+                ecartes_par_les_controles.is_empty(),
+                "les deux contrôles de l'init écartent des skills de '{agent}' : {ecartes_par_les_controles:?}"
+            );
+
+            assert_eq!(
+                noms(&obtenu),
+                noms(&temoin),
+                "l'assembleur de mika#2889 ne charge pas le même ensemble que la \
+                 séquence de l'init serveur, pour '{agent}'"
+            );
+
+            // Et la population écartée est la même, raison par raison : un ensemble
+            // chargé identique obtenu en écartant pour d'autres motifs serait une
+            // régression que l'égalité ci-dessus ne verrait pas.
+            let skips = |r: &SkillRegistry| -> Vec<(String, String)> {
+                let mut v: Vec<(String, String)> = r
+                    .skipped()
+                    .iter()
+                    .map(|s| (s.name.clone(), s.reason.clone()))
+                    .collect();
+                v.sort();
+                v
+            };
+            assert_eq!(
+                skips(&obtenu),
+                skips(&temoin),
+                "les skills écartées diffèrent entre l'assembleur et le témoin, \
+                 pour '{agent}'"
+            );
+        }
+    }
+
     #[test]
     fn test_find_well_known_agent_not_found() {
         assert!(find_well_known_agent("mika").is_none());

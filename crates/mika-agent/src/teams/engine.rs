@@ -316,16 +316,17 @@ impl TeamEngine {
             {
                 tracing::warn!(agent = %ta.name, error = %e, "failed to migrate .disabled markers");
             }
-            let mut skills = SkillRegistry::from_dir(&skills_dir);
-            if let Some(ref allowlist) = identity.skills.allowlist {
-                skills.apply_identity_allowlist(allowlist);
-            }
-            if let Ok(overrides) = db.get_skill_overrides(&ta.name) {
-                skills.apply_overrides(&overrides);
-            }
-            // Phase 2 (mika#1798): testimony-grade ban.
-            skills.apply_testimony_grade_ban();
-            skills.log_summary();
+            // A team member serves turns, so it is a live agent: same assembler
+            // (mika#2889). The overrides are read on the SYNCHRONOUS `Database`
+            // here, before the `AsyncDatabase` exists — which is why the
+            // assembler takes them as a parameter rather than reading them.
+            let overrides = db.get_skill_overrides(&ta.name).unwrap_or_default();
+            let skills = crate::skills::assembly::assemble_agent_registry(
+                &skills_dir,
+                &identity,
+                &overrides,
+                &ta.name,
+            );
             let async_db = AsyncDatabase::new_with_agent(db, &ta.name);
 
             // Per-agent config cascade: per-agent config.toml > global config.toml > env vars.

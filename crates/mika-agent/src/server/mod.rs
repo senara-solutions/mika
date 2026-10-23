@@ -85,7 +85,6 @@ use mika_common::home;
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
 use crate::messaging::{GatewayMessageSender, MessageSender};
-use crate::skills::SkillRegistry;
 use crate::startup;
 use crate::task_engine::{self, TaskDispatcher, TaskEngine};
 use crate::tools;
@@ -636,26 +635,18 @@ async fn init_agent(
     {
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
-    let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
-    // Phase -1: identity-driven skill allowlist (well-known agents like mika-arch)
-    if let Some(ref allowlist) = identity.skills.allowlist {
-        skill_registry.apply_identity_allowlist(allowlist);
-    }
-    // Phase 0+1: DB-backed overrides (disabled state, always_on, LLM provider/model)
-    if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
-        skill_registry.apply_overrides(&overrides);
-    }
-    // Phase 2: testimony-grade ban (mika#1798, non-transit doctrine).
-    // Runs after allowlist + overrides so any re-enabling of a testimony-tagged
-    // skill is still overridden by the structural ban.
-    skill_registry.apply_testimony_grade_ban();
-    skill_registry.apply_load_safety_check();
-    // Runtime allowlist↔required_tools coherence guard (mika#1576). Runs after
-    // identity allowlist + DB overrides + safety check — the one point where both
-    // the allowlist and each skill's required_tools are simultaneously visible.
-    skill_registry.apply_required_tools_coherence_check(agent_name);
-    skill_registry.log_summary();
-    let skill_registry = Arc::new(skill_registry);
+    // The reference sequence of the whole fleet, now carried by the single
+    // assembler (mika#2889) so every hot reload replays this exact order.
+    let overrides = async_db
+        .get_skill_overrides(agent_name)
+        .await
+        .unwrap_or_default();
+    let skill_registry = Arc::new(crate::skills::assembly::assemble_agent_registry(
+        &skills_dir,
+        &identity,
+        &overrides,
+        agent_name,
+    ));
 
     let engine_sender = GatewayMessageSender::new(
         gateway_url.to_string(),
@@ -2186,6 +2177,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::SkillRegistry;
     use crate::task_engine::{TaskDispatcher, TaskEngine};
     use crate::test_utils::test_helpers::test_async_db;
     use axum::body::Body;

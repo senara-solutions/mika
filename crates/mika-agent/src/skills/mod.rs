@@ -1,3 +1,4 @@
+pub mod assembly;
 pub mod builtin_handlers;
 pub mod context;
 pub mod curator;
@@ -4180,5 +4181,136 @@ keywords = ["big-test"]
         // Critically: no lifecycle-gated entries leaked into disabled list.
         assert!(!registry.disabled.iter().any(|d| d.name == "alpha"));
         assert!(!registry.disabled.iter().any(|d| d.name == "gamma"));
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2889 — tout assemblage passe les deux contrôles de l'initialisation
+    //
+    // Les quatre sites de rechargement à chaud vivent dans des `async fn`
+    // privées (`run_a2a_agent`, le corps du handler HTTP, les deux blocs du
+    // worker de la TUI) qu'aucun test unitaire n'atteint. Le rouge-avant est
+    // donc obtenu par l'ORDRE DES COMMITS : ces deux tests sont écrits contre
+    // l'assembleur unique au commit où il ne porte pas encore les deux
+    // contrôles, et c'est le commit suivant qui les verdit. Un relecteur le
+    // vérifie par `git checkout <C2> && cargo test -p mika-agent skills::tests`
+    // — deux échecs nommés, et rien d'autre.
+    //
+    // Les deux contrôles sont discriminés par le PRÉFIXE de la raison du skip :
+    // `validation:` pour le contrôle de chargement, `coherence:` pour celui de
+    // cohérence des outils requis. Un test qui exigerait seulement « la skill
+    // est absente » passerait sur le mauvais contrôle.
+    // -----------------------------------------------------------------------
+
+    /// Un home d'agent minimal : `identity.toml` sans bloc `[skills]` (donc
+    /// aucune allowlist, le filtre d'identité ne retire rien) et un `skills/`
+    /// vide. Depuis mika#2027 l'absence d'`identity.toml` est fail-closed, donc
+    /// l'omettre testerait un état dans lequel aucun agent provisionné ne se
+    /// trouve.
+    fn agent_home_without_allowlist() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn mika2889_un_assemblage_ecarte_la_skill_que_le_controle_de_chargement_refuse() {
+        let home = agent_home_without_allowlist();
+        let skills_dir = home.path().join("skills");
+        create_valid_skill(&skills_dir, "good-skill");
+        let broken = create_valid_skill(&skills_dir, "broken-handler");
+        // tools.json désignant un handler qui n'existe pas : échec skip-worthy
+        // du contrôle de chargement (cf. test_apply_load_safety_check_missing_
+        // handler_script_skips).
+        std::fs::write(
+            broken.join("tools.json"),
+            r#"[{
+                "name": "run_something",
+                "description": "runs something",
+                "input_schema": {"type": "object"},
+                "handler": {"type": "exec", "command": "./nonexistent.sh"}
+            }]"#,
+        )
+        .unwrap();
+
+        let identity = crate::prompt::load_identity(home.path());
+        let registry =
+            assembly::assemble_agent_registry(&skills_dir, &identity, &[], "mika-test-2889");
+
+        let loaded: Vec<&str> = registry
+            .skills()
+            .iter()
+            .map(|s| s.manifest.skill.name.as_str())
+            .collect();
+        assert!(
+            !loaded.contains(&"broken-handler"),
+            "une skill que le contrôle de chargement écarte est revenue vivante : {loaded:?}"
+        );
+        assert!(
+            loaded.contains(&"good-skill"),
+            "l'assemblage a emporté une skill saine avec lui : {loaded:?}"
+        );
+        assert!(
+            registry
+                .skipped()
+                .iter()
+                .any(|s| s.name == "broken-handler" && s.reason.starts_with("validation:")),
+            "écartée, mais pas par le contrôle de chargement : {:?}",
+            registry.skipped()
+        );
+    }
+
+    #[test]
+    fn mika2889_un_assemblage_ecarte_la_skill_que_le_controle_de_coherence_refuse() {
+        let home = agent_home_without_allowlist();
+        let skills_dir = home.path().join("skills");
+        create_valid_skill(&skills_dir, "good-skill");
+        let incoherent = create_valid_skill(&skills_dir, "dangling-required-tool");
+        // `required_tools` nommant un outil absent de la surface effective : le
+        // contrôle de chargement ne rend là qu'un avertissement (validate_skill
+        // étape 5b), seul le contrôle de cohérence écarte la skill.
+        std::fs::write(
+            incoherent.join("skill.toml"),
+            r#"[skill]
+name = "dangling-required-tool"
+description = "test skill"
+
+[triggers]
+keywords = ["test-dangling-required-tool"]
+
+[constraints]
+required_tools = ["un_outil_que_personne_ne_fournit"]
+"#,
+        )
+        .unwrap();
+
+        let identity = crate::prompt::load_identity(home.path());
+        let registry =
+            assembly::assemble_agent_registry(&skills_dir, &identity, &[], "mika-test-2889");
+
+        let loaded: Vec<&str> = registry
+            .skills()
+            .iter()
+            .map(|s| s.manifest.skill.name.as_str())
+            .collect();
+        assert!(
+            !loaded.contains(&"dangling-required-tool"),
+            "une skill que le contrôle de cohérence écarte est revenue vivante : {loaded:?}"
+        );
+        assert!(
+            loaded.contains(&"good-skill"),
+            "l'assemblage a emporté une skill saine avec lui : {loaded:?}"
+        );
+        assert!(
+            registry.skipped().iter().any(|s| {
+                s.name == "dangling-required-tool" && s.reason.starts_with("coherence:")
+            }),
+            "écartée, mais pas par le contrôle de cohérence : {:?}",
+            registry.skipped()
+        );
     }
 }
