@@ -1902,11 +1902,15 @@ impl AsyncDatabase {
     /// dans la requête. Le réintroduire re-scoperait la lecture sur l'agent
     /// qu'un appelant a emprunté par commodité, qui n'est pas celui chez qui
     /// vivent les vols.
+    ///
+    /// Rend des [`crate::db::tasks::FinishedFlightRow`] depuis mika#2886 : le
+    /// vol **et** le `result` de son dernier enfant pilote, qui vivent sur deux
+    /// lignes différentes de `tasks`.
     pub async fn list_finished_implement_flights_in_container(
         &self,
         since: Option<String>,
         issue_urls: Vec<String>,
-    ) -> Result<Vec<Task>> {
+    ) -> Result<Vec<crate::db::tasks::FinishedFlightRow>> {
         self.with_db(move |db| {
             db.list_finished_implement_flights_in_container(since.as_deref(), &issue_urls)
         })

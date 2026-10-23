@@ -42,11 +42,31 @@
 //! `vec![]` — donc un rapport **sans** la section, ce qui se lit comme « aucun
 //! vol terminé » — et un WARN nommé, qui est la trace que la différence a
 //! existé.
+//!
+//! # Un vol est deux lignes de `tasks` (mika#2886)
+//!
+//! La ligne que l'URL du ticket trouve est la **parente** `ready-label: …#N` :
+//! elle porte le ticket, l'agent et les tours, et son `result` est vide. La
+//! ligne `Outcome: PR_OPENED — <url>` que l'évaluateur lit vit sur l'**enfant**
+//! `long_running:run_claude_pilot`, dont le `reference_url` est NULL et dont le
+//! `parent_task_id` pointe la parente — c'est la topologie que
+//! [`crate::skills::executor::build_callback_task`] produit, et
+//! `try_extract_callback_metadata` ne remonte dans la parente que des champs
+//! **nommés** de métadonnées, jamais le texte du `result`.
+//!
+//! La projection assemble donc les deux : tous les champs viennent de la
+//! parente, sauf `result`, qui vient de l'enfant quand il y en a un. Avant ce
+//! correctif, la source rendait le `result` vide de la parente, et le puits du
+//! manager a produit **531 verdicts identiques** — tous
+//! `mort — cause non classée (no_outcome_line) — reprise à la main` — entre le
+//! 2026-10-19 et le 2026-10-23, dont celui du vol de #2875, qui avait ouvert la
+//! PR #2881, mergée.
 
 use async_trait::async_trait;
 use tracing::warn;
 
 use crate::async_db::AsyncDatabase;
+use crate::db::tasks::FinishedFlightRow;
 use crate::milestone_manager::evaluator::{FinishedFlight, FlightSource};
 
 /// La source de production : les vols terminés lus dans `tasks`.
@@ -75,7 +95,7 @@ impl FlightSource for DbFlightSource {
             )
             .await;
         match rows {
-            Ok(tasks) => tasks.into_iter().map(task_to_finished_flight).collect(),
+            Ok(lignes) => lignes.into_iter().map(task_to_finished_flight).collect(),
             Err(e) => {
                 warn!(
                     target: "mika::milestone_manager",
@@ -91,8 +111,19 @@ impl FlightSource for DbFlightSource {
     }
 }
 
-/// `Task` → [`FinishedFlight`], c'est-à-dire la projection sur les sept données
-/// que l'évaluateur sait lire.
+/// [`FinishedFlightRow`] → [`FinishedFlight`], c'est-à-dire la projection sur
+/// les sept données que l'évaluateur sait lire.
+///
+/// **`result` est la seule donnée qui ne vient pas de la parente** (mika#2886) :
+/// `pilot_result.or(flight.result)` — l'enfant d'abord, la parente en
+/// repli. Les six autres restent celles du vol, et c'est ce qui laisse
+/// `PilotFields::parse` trouver les tours là où elle les a toujours trouvés, en
+/// métadonnées de la parente.
+///
+/// Le repli n'est pas défensif : il couvre le vol qui n'a aucun enfant pilote —
+/// un dispatch mort avant de produire un enfant, et la forme que sèment les
+/// tests de mika#2698/#2792. Un enfant présent mais sans `result` ne l'atteint
+/// pas : la lecture ne le retient pas (absent ≠ vide, motif mika#2331).
 ///
 /// `completed_at` reprend le **même `COALESCE`** que la borne qui a sélectionné
 /// la ligne
@@ -106,12 +137,16 @@ impl FlightSource for DbFlightSource {
 /// désormais chez qui le vol vivait ; sans cette projection, « zéro vol » et
 /// « la bonne base, mais interrogée sur le mauvais agent » rendraient à nouveau
 /// les mêmes octets — la mesure est ce qui a manqué quatre jours.
-fn task_to_finished_flight(t: crate::task_state::tasks::Task) -> FinishedFlight {
+fn task_to_finished_flight(row: FinishedFlightRow) -> FinishedFlight {
+    let FinishedFlightRow {
+        flight: t,
+        pilot_result,
+    } = row;
     FinishedFlight {
         task_id: t.id,
         agent_id: t.agent_id,
         status: t.status,
-        result: t.result,
+        result: pilot_result.or(t.result),
         metadata: t.metadata,
         reference_url: t.reference_url,
         completed_at: t.completed_at.or(Some(t.updated_at)),
@@ -167,13 +202,13 @@ mod tests {
         let mut t = task_fixture();
         t.completed_at = None;
         t.updated_at = "2026-10-14T08:00:00Z".into();
-        let f = task_to_finished_flight(t);
+        let f = task_to_finished_flight(sans_enfant(t));
         assert_eq!(f.completed_at.as_deref(), Some("2026-10-14T08:00:00Z"));
 
         let mut t = task_fixture();
         t.completed_at = Some("2026-10-14T09:00:00Z".into());
         t.updated_at = "2026-10-14T08:00:00Z".into();
-        let f = task_to_finished_flight(t);
+        let f = task_to_finished_flight(sans_enfant(t));
         assert_eq!(
             f.completed_at.as_deref(),
             Some("2026-10-14T09:00:00Z"),
@@ -183,9 +218,13 @@ mod tests {
 
     /// La projection porte les sept données que l'évaluateur lit, et rien de
     /// plus : si une ligne de `tasks` gagne un champ, ce test ne bouge pas.
+    ///
+    /// Le vol n'a **aucun enfant pilote**, donc ce test porte aussi le repli de
+    /// mika#2886 : `pilot_result` absent ⇒ c'est le `result` de la parente qui
+    /// est rendu.
     #[test]
     fn mika2792_la_projection_porte_les_sept_donnees_lues() {
-        let f = task_to_finished_flight(task_fixture());
+        let f = task_to_finished_flight(sans_enfant(task_fixture()));
         assert_eq!(f.task_id, "task-1");
         assert_eq!(f.status, "completed");
         assert!(f.result.unwrap().contains("Outcome: PR_OPENED"));
@@ -203,7 +242,16 @@ mod tests {
     fn mika2792_la_projection_porte_lagent_du_vol() {
         let mut t = task_fixture();
         t.agent_id = "mika-dev".into();
-        assert_eq!(task_to_finished_flight(t).agent_id, "mika-dev");
+        assert_eq!(task_to_finished_flight(sans_enfant(t)).agent_id, "mika-dev");
+    }
+
+    /// Un vol sans enfant pilote — la forme que lisent les tests de projection
+    /// de mika#2698 et mika#2792, et le repli de mika#2886.
+    fn sans_enfant(flight: crate::task_state::tasks::Task) -> FinishedFlightRow {
+        FinishedFlightRow {
+            flight,
+            pilot_result: None,
+        }
     }
 
     /// **Le test qui aurait rougi sur mika#2792.** Le chemin de production

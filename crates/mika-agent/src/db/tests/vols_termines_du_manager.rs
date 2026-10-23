@@ -69,7 +69,7 @@ fn lire_sur(db: &Database, since: Option<&str>, urls: &[String]) -> Vec<String> 
     db.list_finished_implement_flights_in_container(since, urls)
         .expect("la lecture doit répondre")
         .into_iter()
-        .map(|t| t.id)
+        .map(|r| r.flight.id)
         .collect()
 }
 
@@ -126,9 +126,9 @@ fn mika2698_un_vol_mort_sans_completed_at_est_vu_par_le_coalesce() {
         .list_finished_implement_flights_in_container(None, &[issue_url(TICKET)])
         .expect("la lecture doit répondre");
     assert_eq!(vu.len(), 1, "le vol mort sans `completed_at` doit être vu");
-    assert_eq!(vu[0].id, id);
+    assert_eq!(vu[0].flight.id, id);
     assert!(
-        vu[0].completed_at.is_none(),
+        vu[0].flight.completed_at.is_none(),
         "la fixture doit bien porter `completed_at = NULL`, sinon ce test ne \
          pose pas sa question"
     );
