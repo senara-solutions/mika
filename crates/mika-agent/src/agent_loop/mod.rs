@@ -54,6 +54,7 @@ use mika_common::llm::ProviderKind;
 /// Nudge-driven skill creation (mika#1583) — turn-end counter + advisory
 /// prompt-injection helpers. Co-located with the loop that reads them.
 pub mod context_history;
+pub mod max_steps_census;
 pub mod review_anchor;
 pub mod skill_nudge;
 use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pending_nudge};
@@ -5110,6 +5111,17 @@ async fn run_loop(
     warn!(
         label = mode.label(),
         max_steps, "agent exceeded max tool steps"
+    );
+    // mika#2877 — le décompte par outil du tour coupé. Inconditionnel : une carte
+    // vide est la mesure « le budget a brûlé hors outils », pas une absence de
+    // mesure. Doit précéder le déplacement de `all_tool_summaries` ci-dessous.
+    crate::agent_loop::max_steps_census::emit_max_steps_tool_census(
+        &all_tool_summaries,
+        db.agent_id(),
+        session_id,
+        tool_ctx.trace_id,
+        mode.label(),
+        max_steps,
     );
     // mika#2515 — chemin de coupure 2/2. Cette sortie est l'**expression finale**
     // de `run_loop`, sans `return` : un scan de sites ancré sur `return
