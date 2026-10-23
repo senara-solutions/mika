@@ -165,6 +165,11 @@ mod eval {
     // lent mais borné ne l'est pas.
     mod test_llm_watchdog_2342;
     mod test_max_steps_continuation;
+    // mika#2877 — à la coupure au plafond de steps, le décompte par outil du
+    // tour est exact (AC1), et un tour qui ne s'épuise pas ne l'émet pas (AC2) :
+    // c'est la paire qui est le livrable, un contrôle d'absence seul n'attestant
+    // rien.
+    mod test_max_steps_tool_census_2877;
     // mika#2281 — la frontière de secret du canal MCP, mesurée sur un serveur
     // stdio factice : les noms traversent, la valeur non — et le contrôle
     // positif montre qu'elle traverse bel et bien par le canal FICHIER, qui

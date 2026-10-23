@@ -32,7 +32,16 @@ use super::harness::EvalHarness;
 
 // -- tracing capture (same shape as `test_llm_watchdog_2342.rs`) --
 
-type Captured = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+/// Captured `(message, fields)` pairs.
+///
+/// `pub(crate)` since mika#2877: a **second consumer**,
+/// `test_max_steps_tool_census_2877.rs`, reads the same capture rather than
+/// writing a sixth duplicate of it — which is how it inherits
+/// [`keep_registry_multi_dispatcher`] and its reasoning on the single-dispatcher
+/// interest cache of `tracing-core` 0.1.36. Migrating the five existing
+/// duplicates into a shared `tests/eval/tracing_capture.rs` is the right gesture
+/// and deserves its own ticket; it is not this one's.
+pub(crate) type Captured = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
 
 struct CapturingLayer {
     events: Captured,
@@ -95,7 +104,10 @@ fn keep_registry_multi_dispatcher() {
     KEEPER.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }
 
-fn capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+/// Installs the capture for the current thread and returns its guard.
+///
+/// `pub(crate)` since mika#2877 — see [`Captured`] for the second consumer.
+pub(crate) fn capture() -> (tracing::subscriber::DefaultGuard, Captured) {
     use tracing_subscriber::layer::SubscriberExt;
     keep_registry_multi_dispatcher();
     let events: Captured = Arc::new(Mutex::new(Vec::new()));
