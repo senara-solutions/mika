@@ -56,6 +56,65 @@
 //! observent. Il appartient au vol suivant de mika#2879 (AC3). Écrit ici plutôt
 //! que dans le plan seul : c'est le fichier de test qui doit dire ce qu'il ne
 //! tient pas.
+//!
+//! # Recettes de rouge-avant (AC4)
+//!
+//! Les trois tests sont passés **verts du premier coup**, ce qui n'atteste rien.
+//! Chaque injection ci-dessous a donc été jouée sur l'arbre vert, les tests
+//! lancés, puis le site restauré par `git checkout`. **Ce qui suit est ce qui a
+//! été observé, pas ce qui était prévu** — et le plan s'est trompé deux fois.
+//!
+//! **R1 — le site retiré.** `if false && …` en tête du dépôt de 5e ⇒ **rouge**
+//! sur le test positif, `observé 0`, émissions vides.
+//!
+//! **R2 — la nature retirée de la REVÉRIFICATION** (le bras de `still_violated`
+//! réduit à `.is_some()`) ⇒ **VERT, et le plan prévoyait rouge.** La raison est
+//! structurelle, pas accidentelle : le dépôt porte **lui aussi** le terme de
+//! nature, donc un engagement sur l'avenir n'occupe jamais le créneau et
+//! `still_violated` n'est jamais appelé pour lui. Avec un seul fixture par tour,
+//! chacun des deux termes **suffit seul** à tenir la frontière de classe — d'où
+//! R8 ci-dessous, qui est la recette qui la pince réellement.
+//!
+//! **R3 — la porte ignorée.** `fabrication_p0_notify &&` retiré du dépôt ⇒
+//! **rouge** sur le contrôle à porte fermée, `observé 1` émission en `Some(P0)`.
+//!
+//! **R4 — l'étage dégradé.** `NotificationSeverity::P0` → `::P2` au site
+//! d'acceptation ⇒ **rouge** sur le positif, `observé Some(P2)` — **et rouge
+//! aussi sur mika#2867 et mika#2872**. Le site d'acceptation est partagé par
+//! les trois, et cette solidarité est la propriété voulue : l'étage de la classe
+//! ne peut pas être dégradé pour un seul de ses membres.
+//!
+//! **R5 — la fuite silencieuse.** L'appel remplacé par
+//! `sender.send(&pending.message)`, qui **compile** ⇒ **rouge** sur
+//! « arrivée au transport SANS étage ». C'est la régression que rien d'autre
+//! qu'une assertion au transport ne peut voir (mika#1381).
+//!
+//! **R6 — la nature retirée du DÉPÔT** (le bras de `still_violated` intact) ⇒
+//! **VERT**, comme le plan le prévoyait, mais pas pour la raison qu'il donnait.
+//! Ce n'est pas l'absence de second écrivain qui tient ce cas : l'engagement
+//! **occupe** bien le créneau, et c'est la revérification à l'acceptation qui
+//! relit la nature et le supprime avant l'émission. Ce que R6 ne peut donc pas
+//! voir — la P0 d'un *autre* site du même tour, perdue parce qu'un engagement
+//! lui a pris le créneau — est précisément ce qu'aucune fixture de ce vol ne
+//! produit : il faut le tour à deux violations de classe, c'est-à-dire le vol
+//! suivant.
+//!
+//! **R7 — le verrou de CLASSE retiré : reste VERT, et le site est donc livré
+//! non attesté sur ce point.** `pending_fabrication_p0.is_none()` retiré du
+//! dépôt de 5e ⇒ les **neuf** tests de la classe restent verts. Le R6 de
+//! mika#2872 est reconduit mot pour mot, et sa raison aussi : aucune des
+//! fixtures des trois sites ne produit deux violations de la classe dans un même
+//! tour, donc le second écrivain n'existe nulle part. Ce que `is_none()`
+//! garantit est tenu par le compilateur et par relecture, pas par ce fichier
+//! (AC3 → vol suivant).
+//!
+//! **R8 — les DEUX termes de nature retirés ensemble** (R2 + R6, soit le verdict
+//! en bloc que mika#2878 a refusé) ⇒ **rouge** sur le contrôle d'engagement, qui
+//! observe `Some(P0)` portant le texte
+//! `«Je vais corriger … plus aucun message» as an accomplished state`. Cette
+//! recette n'était pas au plan ; c'est R2 vert qui l'a rendue nécessaire, et
+//! c'est elle qui atteste que la frontière de classe est tenue **quelque part**
+//! plutôt qu'à un endroit nommé d'avance.
 
 use mika_agent::messaging::NotificationSeverity;
 use mika_common::llm::mock::*;
