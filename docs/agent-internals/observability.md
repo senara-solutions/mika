@@ -22,9 +22,12 @@ no line, no audit row.
 **What the code reading displaced in the ticket, and it is the first deliverable.**
 mika#2474 asked to *measure* and to *bound* the architect brief. **The measurement
 already existed**, component by component, on ungated events: the system prompt on
-`system_prompt_assembled` (`system_prompt_bytes`, `per_skill_bytes`, mika#1217);
+`system_prompt_assembled` (whose field is named **`total_bytes`**, not
+`system_prompt_bytes` — the divergence is real, deliberate and documented in the
+mika#2884 section below; plus `per_skill_bytes`, mika#1217);
 the history, the plan and the tool definitions on `context_window_assembled`
-(`history_bytes`, `user_message_bytes`, `tool_defs_bytes`, mika#2295); the total on
+(`history_bytes`, `user_message_bytes`, `tool_defs_bytes`, `system_prompt_bytes`
+since mika#2884, mika#2295); the total on
 `turn_usage` (`request_bytes`, mika#2331). Nothing needed instrumenting — and a
 fifth instrument restating those same numbers would have created two sources of
 truth for one value, exactly what `emit_context_window_assembled`'s own doc-comment
@@ -252,6 +255,94 @@ grep -c tool_defs_census_duplicate_name "$MIKA_SPIRIT_LOG_FILE"   # expected: 0
 ```
 
 **Session lifecycle:** Silent dispatcher variants call `end_session()` after completion. CLI commands call `end_session()` on all exit paths. `startup_recovery()` prunes old sessions via `prune_old_sessions()`.
+
+### The attribution line carries every component of the window (mika#2884)
+
+`context_window_assembled` gains `system_prompt_bytes`, a bare `usize` emitted
+next to the other three byte counts rather than at the end of the field list —
+`history_bytes`, `user_message_bytes`, `tool_defs_bytes` and
+`system_prompt_bytes` are the four components of the window and are read
+together. Full field set: the four byte counts, `message_count`,
+`distinct_sessions`, `history_scope`, `oldest_age_secs`, `truncated_messages`,
+`truncated_bytes`, and the four correlation fields (`agent_id`, `session_id`,
+`trace_id`, `mode`).
+
+**What it buys is a join avoided, not a measurement saved.** The driving ticket
+stated that the size of the system prompt "exists only on `turn_usage`" and is
+"lost" when a turn dies before it. That premise is **inexact on the value and
+exact on the name**: three surfaces already carried it, at different coverage.
+
+| surface | field | when | coverage |
+|---|---|---|---|
+| `system_prompt_assembled` (mika#1217) | **`total_bytes`** | **before** the model call | every turn, unconditional |
+| `brief_size_overrun` (mika#2474) | `system_prompt_bytes` | before the model call | only on a threshold crossing |
+| `turn_usage` (mika#1889 / mika#2331) | `system_prompt_bytes` | **after** the model call | turns that reach a response |
+
+So the "over-long prompt refused on the first turn" scenario never erased the
+measurement — `system_prompt_assembled` is emitted before the call and carries
+it, under another name. What the ticket was right about is the **name**
+(`grep system_prompt_bytes` does not find `total_bytes`) and the **join**:
+reading what filled one window meant correlating two or three events by
+`trace_id`. Now one line answers it.
+
+**Why a field on the sibling here, when this document refuses one twice.**
+mika#2474 refused an `oversized` boolean on this very event, and mika#2783
+refused the per-tool census as a field on it (*"it must grep alone"*). Both
+refusals concerned a **new measurement needing its own grep**. This need is the
+inverse: the value must *not* grep alone — it already greps on three lines — it
+must be **on the attribution line**. The governing precedent is mika#2474's own
+§ *`system_prompt_bytes` rides on the line*, which the doc-comment of
+`report_brief_size_overrun` phrases as *"the same value, at the same instant, on
+the line that needs it"*. Same argument, applied to the line that decomposes the
+window.
+
+**And it is not a second source of truth** (the warning a few sections above):
+all emissions derive from `system.len()` on the same `String`. The equality holds
+by construction, on three readings of it — `system.len()` at the call site,
+`request.system = Some(system)` on its way to the provider, and
+`request.system.as_ref().map_or(0, |s| s.len())` for `turn_usage` — plus two
+properties: nothing mutates `system` between its assembly and its move into
+`LlmRequest`, and `system_prompt_len` is computed **before** the step loop, hence
+before the end-of-budget nudge that does `system.push_str(nudge)`. That second
+property is what makes the equality non-trivial: on a multi-step turn with a
+nudge, a naive `turn_usage` would have diverged. It does not, and
+`tests/eval/test_context_window_system_prompt_bytes_2884.rs` pins both halves
+through a real turn (the field equals the bytes actually sent; and it equals what
+`turn_usage` reports for the same turn).
+
+**Scope, unchanged:** `emit_context_window_assembled` still has **one** caller
+(see the mika#2783 note above) — the silent and team paths do not build
+`ContextWindowFields` and emit nothing here, so there is nothing to carry there.
+`system_prompt_assembled`'s `total_bytes` is **not** renamed: that would be a
+schema change on an event operator probes have grepped since mika#1217, and the
+ticket said "no other change". The divergence is documented rather than resorbed.
+No threshold and no alert is added on the new value either — `brief_size_overrun`
+is already the threshold detector for this measurement, and a second one would be
+the duplicate truth this document warns against.
+
+**Post-deploy reading.** After `make deploy`, and not before: the instrument is
+not alive while the binary in service predates the change (mika#2340 motif).
+
+```bash
+# The full decomposition of a window, one line, no join.
+grep context_window_assembled /var/log/mika/server.log \
+  | jq -r 'select(.fields.agent_id == "mika-dev")
+           | [.timestamp, .fields.system_prompt_bytes, .fields.history_bytes,
+              .fields.tool_defs_bytes, .fields.user_message_bytes,
+              .fields.message_count] | @tsv'
+```
+
+What becomes readable on it: the **share of the system prompt** in the window,
+turn by turn, without touching `turn_usage`; a **jump in `system_prompt_bytes` at
+constant history**, which is the signature of a repository change (`CLAUDE.md`, a
+bundled skill) rather than a conversation change; and **turns that died before
+`turn_usage`**, which now show their prompt size on the attribution line instead
+of requiring a second grep on `system_prompt_assembled` and its divergent field
+name.
+
+**An absent field on this line means "binary older than this change"**, never
+"empty system prompt": at the emission site the prompt is a `String` in hand, so
+zero is not a reachable state for a turn that emitted the event (mika#2331).
 
 ### Exhausting the step budget names the tools that consumed it (mika#2877)
 
