@@ -560,6 +560,11 @@ jobs:
       # for it".
       - name: Release profile keeps the line tables a wedged binary needs (mika#1719)
         run: make check-release-debuginfo
+      # release.yml publishes `--prerelease --latest=false` on this answer, and
+      # install.sh installs `releases/latest`: a candidate classified final would
+      # be served to the family.
+      - name: A release candidate tag is classified prerelease (mika#2890)
+        run: make check-release-tag
       # The load-bearing invariant of the mika#893 factorisation: dev-pilot and
       # dev-groom differ only by their entry slash command. Pure structural diff
       # over two tracked files.
