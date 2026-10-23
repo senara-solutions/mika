@@ -292,8 +292,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'pull_request' &&
-       !startsWith(github.head_ref, 'release/') &&
-       !startsWith(github.head_ref, 'release-please--'))
+       !startsWith(github.head_ref, 'release/'))
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Check crate-local docs are in sync
@@ -560,6 +559,11 @@ jobs:
       # for it".
       - name: Release profile keeps the line tables a wedged binary needs (mika#1719)
         run: make check-release-debuginfo
+      # release.yml publishes `--prerelease --latest=false` on this answer, and
+      # install.sh installs `releases/latest`: a candidate classified final would
+      # be served to the family.
+      - name: A release candidate tag is classified prerelease (mika#2890)
+        run: make check-release-tag
       # The load-bearing invariant of the mika#893 factorisation: dev-pilot and
       # dev-groom differ only by their entry slash command. Pure structural diff
       # over two tracked files.
@@ -906,7 +910,6 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       !startsWith(github.head_ref, 'release/') &&
-      !startsWith(github.head_ref, 'release-please--') &&
       !startsWith(github.head_ref, 'dependabot/')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
