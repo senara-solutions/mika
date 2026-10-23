@@ -36,7 +36,21 @@ use crate::prompt::Identity;
 ///    `always_on`, fournisseur/modèle LLM)
 /// 4. [`SkillRegistry::apply_testimony_grade_ban`] — ban structurel (mika#1798),
 ///    après allowlist et overrides pour qu'une ré-activation ne le contourne pas
-/// 5. [`SkillRegistry::log_summary`] — compte à trois états, après tout le reste
+/// 5. [`SkillRegistry::apply_load_safety_check`] — **contrôle de chargement** :
+///    écarte une skill dont la validation rend un échec skip-worthy (handler
+///    introuvable, manifeste incohérent) ; raison préfixée `validation:`
+/// 6. [`SkillRegistry::apply_required_tools_coherence_check`] — **contrôle de
+///    cohérence** : écarte une skill dont un `required_tools` ne se résout pas
+///    dans la surface effective de cet agent ; raison préfixée `coherence:`
+/// 7. [`SkillRegistry::log_summary`] — compte à trois états, après tout le reste
+///
+/// Les étapes 5 et 6 sont la règle de mika#2889 : **les deux contrôles, dans cet
+/// ordre, à tout assemblage**. Elles viennent après le ban et les overrides parce
+/// qu'elles jugent la surface *finale* — contrôler avant laisserait passer une
+/// skill qu'un override vient de réactiver. L'ordre entre elles est celui de
+/// l'initialisation serveur, et il porte : le contrôle de chargement ne rend
+/// qu'un avertissement sur un `required_tools` inconnu (`validate_skill`
+/// étape 5b), donc seul le second écarte cette population.
 ///
 /// Prend l'[`Identity`] entière plutôt que l'allowlist nue : « j'ai oublié
 /// l'allowlist » devient inexprimable au site d'appel.
@@ -49,7 +63,7 @@ pub fn assemble_agent_registry(
     skills_dir: &Path,
     identity: &Identity,
     overrides: &[SkillOverride],
-    _agent_id: &str,
+    agent_id: &str,
 ) -> SkillRegistry {
     let mut registry = SkillRegistry::from_dir(skills_dir);
     if let Some(ref allowlist) = identity.skills.allowlist {
@@ -57,6 +71,8 @@ pub fn assemble_agent_registry(
     }
     registry.apply_overrides(overrides);
     registry.apply_testimony_grade_ban();
+    registry.apply_load_safety_check();
+    registry.apply_required_tools_coherence_check(agent_id);
     registry.log_summary();
     registry
 }

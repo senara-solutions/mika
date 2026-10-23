@@ -128,16 +128,18 @@ impl Tool for DelegateTaskTool {
 
         // Load delegate agent identity and skills (with identity allowlist + DB overrides)
         let identity = crate::prompt::load_identity(&agent_home);
-        let mut skills = crate::skills::SkillRegistry::from_dir(&agent_home.join("skills"));
-        if let Some(ref allowlist) = identity.skills.allowlist {
-            skills.apply_identity_allowlist(allowlist);
-        }
-        if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
-            skills.apply_overrides(&overrides);
-        }
-        // Phase 2 (mika#1798): testimony-grade ban.
-        skills.apply_testimony_grade_ban();
-        skills.log_summary();
+        let overrides = async_db
+            .get_skill_overrides(agent_name)
+            .await
+            .unwrap_or_default();
+        // The delegate serves turns, so it is a live agent: same assembler, hence
+        // the two init checks it was missing (mika#2889).
+        let skills = crate::skills::assembly::assemble_agent_registry(
+            &agent_home.join("skills"),
+            &identity,
+            &overrides,
+            agent_name,
+        );
 
         // Register delegate agent so sessions FK constraint is satisfied.
         // Follows the team engine pattern (engine.rs line 95).

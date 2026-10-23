@@ -135,24 +135,19 @@ async fn spawn_agent_worker(
     {
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
-    let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
-    if let Some(ref allowlist) = identity.skills.allowlist {
-        skill_registry.apply_identity_allowlist(allowlist);
-    }
-    if let Ok(overrides) = ctx
+    // Same assembler as the server init and as the two hot reloads below
+    // (mika#2889) — the TUI no longer carries its own copy of the sequence.
+    let overrides = ctx
         .async_db
         .get_skill_overrides(&ctx.async_db.agent_id)
         .await
-    {
-        skill_registry.apply_overrides(&overrides);
-    }
-    // Phase 2 (mika#1798): testimony-grade ban.
-    skill_registry.apply_testimony_grade_ban();
-    skill_registry.apply_load_safety_check();
-    // Runtime allowlist↔required_tools coherence guard (mika#1576).
-    skill_registry.apply_required_tools_coherence_check(ctx.async_db.agent_id());
-    skill_registry.log_summary();
-    let skill_registry = Arc::new(skill_registry);
+        .unwrap_or_default();
+    let skill_registry = Arc::new(assemble_agent_registry(
+        &skills_dir,
+        &identity,
+        &overrides,
+        ctx.async_db.agent_id(),
+    ));
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
     let message_sender = crate::init::make_message_sender(
