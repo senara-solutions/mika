@@ -73,7 +73,14 @@ flate2 = "1"
 tar = "0.4"
 unicode-normalization.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# `cfg(unix)` et non `cfg(target_os = "linux")` : le `Drop` de
+# `ProcessGroupKillGuard` (`src/skills/executor.rs`) appelle `libc::killpg` hors
+# de tout `#[cfg]`, et `release.yml` construit aussi les deux cibles darwin
+# (mika#2900). La clé ne sur-approxime pas — `executor.rs` appelle
+# `.process_group(0)`, méthode de `std::os::unix::process::CommandExt`, donc le
+# crate n'est de toute façon compilable sur aucune cible non-unix.
+# Garde : `tests/libc_target_scope_2900.rs`.
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
