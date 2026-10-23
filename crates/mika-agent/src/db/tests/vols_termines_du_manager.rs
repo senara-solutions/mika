@@ -24,6 +24,14 @@
 //! - **une liste d'URLs vide rend `vec![]`** avant toute requête : c'est le
 //!   contrôle négatif du détecteur. Un milestone sans sous-ticket ne doit pas
 //!   faire évaluer la table entière.
+//!
+//! Depuis mika#2886 la lecture rend **deux lignes de `tasks` par vol** : la
+//! parente, et le `result` du dernier enfant pilote terminé. Les deux tests
+//! `mika2886_*` en bas de ce fichier pinnent les deux arbitrages de cette
+//! seconde requête (dernier enfant, population des labels) ; la forme réelle
+//! que la production produit, elle, est semée de bout en bout jusqu'au verdict
+//! par l'AC1 de mika#2886 — `crate::flight_source`,
+//! `mika2886_la_forme_reelle_rend_un_verdict_de_pr_ouverte`.
 
 use super::*;
 
@@ -71,6 +79,36 @@ fn lire_sur(db: &Database, since: Option<&str>, urls: &[String]) -> Vec<String> 
         .into_iter()
         .map(|r| r.flight.id)
         .collect()
+}
+
+/// Seede un enfant de dispatch **terminé** sous `parente_id`, portant `label`
+/// et `result`, et rend son id. Le gabarit est [`groom_callback`], qui porte
+/// déjà la topologie réelle d'un enfant de pilote : `trigger_type: "callback"`,
+/// `parent_task_id` renseigné, `depth: 1`, et surtout `reference_url: None` —
+/// c'est cette absence qui rend l'enfant invisible à la requête 1.
+fn seed_enfant(
+    db: &Database,
+    agent_id: &str,
+    parente_id: &str,
+    label: &str,
+    result: &str,
+) -> String {
+    let id = db
+        .create_task(&NewTask {
+            label: label.to_string(),
+            ..groom_callback(agent_id, parente_id, "implement")
+        })
+        .expect("l'enfant doit être créé");
+    db.update_task_completed(&id, agent_id, Some(result))
+        .expect("la complétion de l'enfant doit réussir");
+    id
+}
+
+/// Les lignes elles-mêmes, et non leurs seuls ids : les tests de mika#2886
+/// portent sur `pilot_result`.
+fn lire_lignes(db: &Database) -> Vec<crate::db::tasks::FinishedFlightRow> {
+    db.list_finished_implement_flights_in_container(None, &[issue_url(TICKET)])
+        .expect("la lecture doit répondre")
 }
 
 /// Enregistre un agent pour que ses lignes de `tasks` puissent exister :
@@ -315,4 +353,102 @@ fn mika2698_les_vols_sortent_dans_lordre_chronologique() {
     let neuf = seed_vol_termine(&db, "mika", &issue_url(TICKET));
 
     assert_eq!(lire(&db, None), vec![vieux, neuf]);
+}
+
+/// **Le dernier enfant pilote gagne** (mika#2886). Un vol qui a été relancé
+/// porte plusieurs enfants `long_running:run_claude_pilot`, chacun avec sa
+/// propre issue ; celle qui vaut est la dernière. Le tri est fait en Rust sur
+/// `COALESCE(completed_at, updated_at)` puis sur l'`id`, sur l'ensemble déjà
+/// filtré — un `ORDER BY … LIMIT 1` en SQL aurait choisi avant les filtres de
+/// population et de contenu, donc parfois un enfant muet.
+///
+/// Les trois lignes de `tasks` ne rendent **qu'un** vol : un enfant ne porte
+/// pas de `reference_url`, donc la requête 1 ne le voit pas. Si ce compte
+/// passait à trois, la jointure aurait fait des enfants des vols.
+#[test]
+fn mika2886_le_dernier_enfant_pilote_gagne() {
+    let db = db();
+    let parente = seed_vol_termine(&db, "mika", &issue_url(TICKET));
+
+    let premier = seed_enfant(
+        &db,
+        "mika",
+        &parente,
+        "long_running:run_claude_pilot",
+        "Outcome: PIPELINE_INCOMPLETE\nTurns: 47\n",
+    );
+    db.backdate_task_completed_at(&premier, 3_600)
+        .expect("le recul doit réussir");
+    db.backdate_task_updated_at(&premier, 3_600)
+        .expect("le recul doit réussir");
+
+    seed_enfant(
+        &db,
+        "mika",
+        &parente,
+        "long_running:run_claude_pilot",
+        "Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2881\nTurns: 121\n",
+    );
+
+    let lignes = lire_lignes(&db);
+    assert_eq!(
+        lignes.len(),
+        1,
+        "trois lignes de `tasks`, un seul vol : un enfant n'est pas un vol"
+    );
+    assert_eq!(lignes[0].flight.id, parente);
+    assert_eq!(
+        lignes[0].pilot_result.as_deref(),
+        Some(
+            "Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2881\nTurns: 121\n"
+        ),
+        "c'est l'issue du dernier enfant qui vaut, non celle de la relance \
+         précédente"
+    );
+}
+
+/// **Un enfant hors population n'est pas lu** (mika#2886). Une parente de vol
+/// porte aussi des enfants qui ne sont pas des dispatches de pilote —
+/// `long_running:build_mika` en est un, et son `result` n'est pas une issue de
+/// vol. Le filtre est [`crate::task_engine::engine::is_pilot_dispatch_label`],
+/// son lecteur unique : une clause `IN` recopiant la liste des labels en SQL
+/// serait une seconde source de vérité, et c'est par là que `build_mika` se
+/// glisserait au premier élargissement de la liste.
+///
+/// Le contrôle positif est ce qui sépare « le label délimite » de « la
+/// jointure ne trouve jamais rien » : le même enfant, sous le label du pilote,
+/// doit être lu.
+#[test]
+fn mika2886_un_enfant_hors_population_nest_pas_lu() {
+    const ISSUE: &str = "Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2881\n";
+
+    let hors = db();
+    let parente = seed_vol_termine(&hors, "mika", &issue_url(TICKET));
+    seed_enfant(&hors, "mika", &parente, "long_running:build_mika", ISSUE);
+
+    let lignes = lire_lignes(&hors);
+    assert_eq!(lignes.len(), 1);
+    assert!(
+        lignes[0].pilot_result.is_none(),
+        "`long_running:build_mika` n'est pas un dispatch de pilote — reçu {:?}",
+        lignes[0].pilot_result
+    );
+
+    // Contrôle positif, sur une base neuve : même parente, même `result`, seul
+    // le label change.
+    let temoin = db();
+    let parente = seed_vol_termine(&temoin, "mika", &issue_url(TICKET));
+    seed_enfant(
+        &temoin,
+        "mika",
+        &parente,
+        "long_running:run_claude_pilot",
+        ISSUE,
+    );
+    assert_eq!(
+        lire_lignes(&temoin)[0].pilot_result.as_deref(),
+        Some(ISSUE),
+        "sous le label du pilote, le même enfant doit être lu — sinon ce test \
+         ne mesure pas le label"
+    );
 }
