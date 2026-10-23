@@ -555,6 +555,63 @@ pub(crate) const PILOT_TRANSCRIPT_REPORTED_KEY: &str = "pilot_transcript_empty_r
 pub(crate) const PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY: &str =
     "pilot_stall_signal_unavailable_reported";
 
+/// Les labels de tâche des deux dispatchs de pilote, tels que
+/// `skills::executor::build_callback_task` les forme
+/// (`format!("long_running:{tool_name}")`).
+///
+/// **Égalité stricte, et ce n'est pas de la rigueur décorative** — même forme
+/// et même raison que [`crate::qa_build_callback::is_build_callback_label`]. Un
+/// `starts_with` avalerait en silence deux populations qui n'ont aucune des
+/// trois surfaces du reaper :
+///
+/// - [`crate::agent::DEFERRED_DISPATCH_LABEL`]
+///   (`long_running:run_claude_pilot:deferred`) — une row d'enveloppe qui ne
+///   porte aucun PID et ne décrit aucun processus pilote ;
+/// - tout futur `run_claude_pilot_*` dont personne n'aurait vérifié qu'il écrit
+///   un transcript, un log pilote et un worktree déclaré.
+///
+/// `long_running:build_mika` est hors de cette liste **à tout âge** : un build
+/// n'a par construction ni transcript, ni log pilote, ni worktree déclaré, et
+/// c'est sa définition, pas une anomalie d'observabilité. Les 120 lignes de
+/// build sur les 135 mesurées le 2026-10-22 étaient cette confusion de
+/// population (mika#2875).
+///
+/// Au niveau **skill** et non **label**, le pendant est
+/// `skills::executor::PILOT_DISPATCH_SKILLS` — d'où une liste nouvelle plutôt
+/// qu'une réutilisation.
+pub(crate) const PILOT_DISPATCH_LABELS: &[&str] = &[
+    "long_running:run_claude_pilot",
+    "long_running:run_claude_pilot_groom",
+];
+
+/// Ce label de callback est-il celui d'un dispatch de pilote ?
+pub(crate) fn is_pilot_dispatch_label(label: &str) -> bool {
+    PILOT_DISPATCH_LABELS.contains(&label)
+}
+
+/// L'âge d'un dispatch en secondes, ou `None` quand la question n'a pas de
+/// réponse lisible (mika#2875).
+///
+/// `fired_at` d'abord : il est estampillé **au spawn** par
+/// `set_task_process_id` (via `FIRED_AT_STAMP_IF_NULL`, mika#2263), et la
+/// requête de population du reaper exige `process_id IS NOT NULL` — donc sur
+/// exactement cette population c'est l'instant de naissance précis du
+/// dispatch. `created_at` ne sert de repli que pour les rows antérieures à
+/// cette estampille.
+///
+/// Deux cas rendent `None`, et tous deux veulent dire *silencieux et non
+/// marqué* plutôt que *signalé* : un horodatage illisible, et un âge
+/// **négatif** (dérive d'horloge). Une passe ultérieure pourra encore
+/// signaler — c'est le marqueur qui est permanent, jamais le silence, et c'est
+/// pourquoi « taire sans marquer » est la seule forme sûre d'une porte posée
+/// devant cet avertissement.
+fn dispatch_age_secs(task: &Task) -> Option<i64> {
+    let born =
+        crate::timestamp::parse(task.fired_at.as_deref().unwrap_or(&task.created_at)).ok()?;
+    let age = (chrono::Utc::now() - born).num_seconds();
+    (age >= 0).then_some(age)
+}
+
 /// Task-metadata key under which the executor records the exit status and the
 /// stderr of a long-running handler that exited non-zero (mika#2532 R1).
 ///
@@ -2957,6 +3014,16 @@ impl TaskEngine {
     /// dispatch dropped because a surface is **active** is nominal and stays
     /// silent.
     ///
+    /// Since mika#2875, "the first time" means the first time **past
+    /// `max_age_secs`, and only for a pilot**. Before that the warning fired
+    /// on births and on builds and consumed its own marker doing so, which
+    /// made the late unavailability it exists to catch unreportable; the two
+    /// gates live at the head of
+    /// [`Self::report_unavailable_liveness_signal`], whose doc carries the
+    /// measurement. Nothing about what the reaper *does* to a pilot changed —
+    /// the six-term conjunction above, the kill and the transition are
+    /// untouched.
+    ///
     /// # Evaluation order is cost, not semantics
     ///
     /// The two single-file `stat`s run before the bounded worktree walk, and an
@@ -3072,6 +3139,7 @@ impl TaskEngine {
             else {
                 self.report_unavailable_liveness_signal(
                     &task,
+                    max_age_secs,
                     transcript_signal,
                     pilot_log_signal,
                     worktree_signal,
@@ -3196,13 +3264,65 @@ impl TaskEngine {
     /// A failed stamp is logged at `debug` and nothing else: re-warning next
     /// tick is noisier than intended but strictly better than swallowing the
     /// signal, and the repetition is itself visible.
+    ///
+    /// # Two gates stand before all of that (mika#2875)
+    ///
+    /// Measured on 2026-10-22, the warning had fired 135 times since
+    /// 2026-10-07 — and **not once** on its object. 120 of those lines carried
+    /// a `long_running:build_mika`, which is not a pilot and has none of the
+    /// three surfaces by construction; the other 14 were pilots signalled
+    /// between 1 and 41 s after creation, before a pilot could have written
+    /// anything. 100 % of the lines left within 60 s of the task's creation.
+    /// Since the marker is stamped on that first shot, the one case the
+    /// instrument exists to see — an unavailability arising *late*, in a
+    /// dispatch that had surfaces and lost them — was never reportable at all.
+    /// The instrument measured a different population than the one it names
+    /// (class mika#2205) and consumed itself before meeting its object.
+    ///
+    /// So two refusals run **before** `missing` is built and before any
+    /// marker is written, in this order:
+    ///
+    /// 1. **Population.** [`is_pilot_dispatch_label`] — a build is out of
+    ///    remit at *any* age, so this gate is first and costs a slice
+    ///    comparison. Putting the age gate first would merely delay the 120
+    ///    lines rather than remove them.
+    /// 2. **Age.** Younger than `max_age_secs` — the reaper's own silence
+    ///    threshold — is not inertia, it is a birth. Nothing is said and,
+    ///    decisively, **nothing is stamped**: a marker laid at birth is what
+    ///    made the late case unreachable, so the two halves of the fix are one
+    ///    gate, not two.
+    ///
+    /// An unreadable or future-dated timestamp yields `None` from
+    /// [`dispatch_age_secs`] and therefore silence — the fail-safe rule of
+    /// this module, applied to the age as it already is to the surfaces: a
+    /// term that cannot be read is never a satisfied term.
+    ///
+    /// `max_age_secs` is the caller's, resolved once per tick from
+    /// [`mika_common::config::Settings::effective_pilot_stall_reap_age_seconds`].
+    /// It is passed rather than re-read so the gate and the surfaces it
+    /// describes can never be measured against two different thresholds.
     async fn report_unavailable_liveness_signal(
         &self,
         task: &crate::db::Task,
+        max_age_secs: u64,
         transcript: LivenessSignal,
         pilot_log: LivenessSignal,
         worktree: LivenessSignal,
     ) {
+        // Gate 1 — population. Not a pilot, not this warning's business.
+        if !is_pilot_dispatch_label(&task.label) {
+            return;
+        }
+
+        // Gate 2 — age. A dispatch younger than the reaper's own threshold has
+        // not been silent, it has just been born. No warning, and no marker.
+        let Some(age_secs) = dispatch_age_secs(task) else {
+            return;
+        };
+        if (age_secs as u64) < max_age_secs {
+            return;
+        }
+
         let missing: Vec<&str> = [
             (transcript, "transcript"),
             (pilot_log, "pilot_log"),
@@ -3230,6 +3350,13 @@ impl TaskEngine {
             event = "pilot_stall_signal_unavailable",
             task_id = %task.id,
             parent_task_id = ?task.parent_task_id,
+            // The three fields mika#2875 adds, so the line says which
+            // population it belongs to and that it cleared the age gate. The
+            // 2026-10-22 reading had to join every `task_id` to `tasks` to
+            // learn both; now the line carries them.
+            label = %task.label,
+            age_secs = age_secs,
+            max_age_secs = max_age_secs,
             missing_surfaces = %missing,
             "pilot_stall_reaper: a liveness signal could not be read, so this dispatch is \
              invisible to the silent-stall reaper for its whole life (mika#2277 AC4)"
@@ -10993,5 +11120,174 @@ mod tests {
             "quand le scan tire, la résolution est de retirer la lecture — \
              jamais d'ajouter une entrée (doctrine mika#2201)"
         );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // mika#2875 — les deux portes de `pilot_stall_signal_unavailable`.
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// La population, énumérée terme par terme.
+    ///
+    /// Les deux admissions **et** les trois refus : un prédicat qui dirait
+    /// `starts_with("long_running:run_claude_pilot")` passerait les deux
+    /// premières assertions et les deux dernières lignes sont ce qui le fait
+    /// rougir.
+    #[test]
+    fn mika2875_la_population_de_lavertissement_est_exactement_les_deux_pilotes() {
+        assert!(is_pilot_dispatch_label("long_running:run_claude_pilot"));
+        assert!(is_pilot_dispatch_label(
+            "long_running:run_claude_pilot_groom"
+        ));
+
+        // Le build : 120 des 135 lignes mesurées le 2026-10-22, et la raison
+        // du ticket.
+        assert!(!is_pilot_dispatch_label("long_running:build_mika"));
+        // L'enveloppe différée : un préfixe du label pilote, sans PID.
+        assert!(!is_pilot_dispatch_label(
+            crate::agent::DEFERRED_DISPATCH_LABEL
+        ));
+        // Un futur `run_claude_pilot_*` dont personne n'a vérifié les surfaces.
+        assert!(!is_pilot_dispatch_label(
+            "long_running:run_claude_pilot_extra"
+        ));
+        // Et le nom d'outil nu, sans le préfixe que le producteur ajoute.
+        assert!(!is_pilot_dispatch_label("run_claude_pilot"));
+    }
+
+    /// **Garde de dérive** : la constante est épinglée contre son PRODUCTEUR.
+    ///
+    /// `build_callback_task` est le seul site qui forme un label de callback
+    /// (`format!("long_running:{tool_name}")`). Comparer
+    /// [`PILOT_DISPATCH_LABELS`] à un littéral recopié ne dirait rien — les
+    /// deux copies dériveraient ensemble. On reconstruit donc le label que ce
+    /// producteur **produit** réellement, exactement comme
+    /// `qa_build_callback.rs:525` le fait pour `BUILD_CALLBACK_LABEL`.
+    #[test]
+    fn mika2875_la_constante_est_la_forme_que_le_producteur_emet() {
+        for tool in ["run_claude_pilot", "run_claude_pilot_groom"] {
+            let produced = crate::skills::executor::build_callback_task(
+                "mika".to_string(),
+                None,
+                tool,
+                &serde_json::json!({}),
+                60,
+                "session",
+                "trace",
+                None,
+            )
+            .label;
+            assert!(
+                is_pilot_dispatch_label(&produced),
+                "le label que `build_callback_task` produit pour `{tool}` \
+                 ({produced}) n'est pas dans PILOT_DISPATCH_LABELS : la \
+                 constante a dérivé de son producteur"
+            );
+        }
+
+        // Le témoin dégénéré de la garde : le build passe par le même
+        // producteur, et il doit rester dehors.
+        let build = crate::skills::executor::build_callback_task(
+            "mika".to_string(),
+            None,
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            &serde_json::json!({}),
+            60,
+            "session",
+            "trace",
+            None,
+        )
+        .label;
+        assert!(
+            !is_pilot_dispatch_label(&build),
+            "le label de build ({build}) est précisément la population que \
+             mika#2875 retire de cet avertissement"
+        );
+    }
+
+    /// Une tâche réelle, lue depuis la base, dont on mute les deux horodatages.
+    ///
+    /// `Task` porte une trentaine de champs et aucun littéral de struct
+    /// n'existe dans ce module : on passe donc par `create_task` + `get_task`,
+    /// la seule forme qui ne dérive pas quand un champ est ajouté.
+    async fn task_with_timestamps(
+        db: &AsyncDatabase,
+        created_at: &str,
+        fired_at: Option<&str>,
+    ) -> Task {
+        let id = db
+            .create_task(make_task(
+                "long_running:run_claude_pilot",
+                &crate::timestamp::now(),
+            ))
+            .await
+            .unwrap();
+        let mut task = db.get_task(&id).await.unwrap().unwrap();
+        task.created_at = created_at.to_string();
+        task.fired_at = fired_at.map(str::to_owned);
+        task
+    }
+
+    /// `fired_at` gagne quand il est là — c'est l'instant du spawn (mika#2263).
+    #[tokio::test]
+    async fn mika2875_lage_se_compte_depuis_fired_at_quand_il_existe() {
+        let db = test_db();
+        // Né il y a deux heures, tiré il y a une minute : c'est le tir qui
+        // compte, donc l'âge doit être minuscule et non de 7200 s.
+        let task = task_with_timestamps(
+            &db,
+            &crate::timestamp::now_minus(chrono::Duration::seconds(7200)),
+            Some(&crate::timestamp::now_minus(chrono::Duration::seconds(60))),
+        )
+        .await;
+        let age = dispatch_age_secs(&task).expect("deux horodatages lisibles");
+        assert!(
+            (55..=120).contains(&age),
+            "l'âge devait se compter depuis `fired_at` (≈60 s), obtenu {age}"
+        );
+    }
+
+    /// Sans `fired_at`, `created_at` sert de repli.
+    #[tokio::test]
+    async fn mika2875_sans_fired_at_lage_se_compte_depuis_created_at() {
+        let db = test_db();
+        let task = task_with_timestamps(
+            &db,
+            &crate::timestamp::now_minus(chrono::Duration::seconds(3000)),
+            None,
+        )
+        .await;
+        let age = dispatch_age_secs(&task).expect("`created_at` est lisible");
+        assert!(
+            (2990..=3060).contains(&age),
+            "l'âge devait se compter depuis `created_at` (≈3000 s), obtenu {age}"
+        );
+    }
+
+    /// Un horodatage illisible rend `None` : la question n'a pas de réponse.
+    ///
+    /// `None` ne vaut **pas** « assez vieux » : la porte doit se taire sans
+    /// marquer, pour qu'une passe ultérieure puisse encore signaler.
+    #[tokio::test]
+    async fn mika2875_un_horodatage_illisible_rend_none() {
+        let db = test_db();
+        let task = task_with_timestamps(&db, "pas-une-date", Some("pas-une-date-non-plus")).await;
+        assert_eq!(dispatch_age_secs(&task), None);
+    }
+
+    /// Un âge **négatif** rend `None` : c'est une dérive d'horloge, pas un âge.
+    ///
+    /// Sans ce cas, une horloge qui recule donnerait un âge négatif, donc
+    /// strictement inférieur au seuil — la porte se tairait par accident,
+    /// pour la bonne raison mais sans l'avoir décidé.
+    #[tokio::test]
+    async fn mika2875_un_age_negatif_rend_none_plutot_quun_nombre() {
+        let db = test_db();
+        let task = task_with_timestamps(
+            &db,
+            &crate::timestamp::now(),
+            Some(&crate::timestamp::now_plus(chrono::Duration::seconds(600))),
+        )
+        .await;
+        assert_eq!(dispatch_age_secs(&task), None);
     }
 }
