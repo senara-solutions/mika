@@ -2983,6 +2983,15 @@ async fn run_loop(
                             step,
                             matched_subject = %promise.subject,
                             matched_assertion = %promise.assertion,
+                            // mika#2879 — les deux natures que mika#2878 a
+                            // séparées sont deux populations sous un seul nom
+                            // d'événement, donc non soustractibles (classe
+                            // mika#2205). Ce champ est ce qui les sépare, et
+                            // c'est à lui que le vol 3 adossera le rattachement
+                            // de la seule moitié accomplie. Son ABSENCE d'une
+                            // ligne signifie un binaire antérieur à ce vol
+                            // (classe mika#2340), jamais « aucune des deux ».
+                            assertion_nature = promise.nature.as_str(),
                             guard_correlation_id = %corr_id,
                             label = mode.label(),
                             event = "guard.unactioned_frequency_promise",
@@ -3049,6 +3058,11 @@ async fn run_loop(
                             step,
                             matched_subject = %promise.subject,
                             matched_assertion = %promise.assertion,
+                            // mika#2879, même raison qu'au site corrigé
+                            // ci-dessus : le résidu se compte aussi par nature,
+                            // sinon les deux populations du résidu restent
+                            // confondues là où celles du tir sont séparées.
+                            assertion_nature = promise.nature.as_str(),
                             label = mode.label(),
                             event = "guard.unactioned_frequency_promise_uncorrected",
                             "Unactioned frequency-promise guard already fired this turn — \
