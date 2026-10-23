@@ -5351,6 +5351,237 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2876 — un échec d'initialisation d'agent journalise sa chaîne.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le message du site de démarrage (`run_server`, boucle d'init).
+    ///
+    /// Ce littéral est aussi ce sur quoi portent les greps opérateur — c'est
+    /// pourquoi le correctif de mika#2876 ne l'a pas touché d'un octet.
+    const INIT_FAILURE_STARTUP_MESSAGE: &str = "failed to initialize agent, skipping";
+
+    /// Le message du site paresseux (`AppState::resolve_agent`, mika#1399).
+    const INIT_FAILURE_LAZY_MESSAGE: &str = "lazy agent construction failed";
+
+    /// Combien de lignes le scan remonte depuis le littéral pour retrouver le
+    /// `warn!(` qui l'ouvre.
+    ///
+    /// Huit suffit aux deux sites d'aujourd'hui (le site de démarrage tient sur
+    /// une seule ligne, le site paresseux sur quatre). Une refonte `rustfmt` qui
+    /// pousserait un littéral hors de cette fenêtre doit **élargir la fenêtre**,
+    /// jamais allowlister le site.
+    const INIT_FAILURE_MACRO_WINDOW: usize = 8;
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Quand ce scan tire, on route le site par `let chain = format!("{e:#}")`
+    /// (doctrine mika#2201) — une allowlist née vide est un emplacement où
+    /// déposer la prochaine infraction (mika#2323).
+    const INIT_FAILURE_CHAIN_EXCEPTIONS: &[&str] = &[];
+
+    /// Vrai si `block` journalise son erreur par un `%e` nu — c'est-à-dire par
+    /// le `Display` d'`anyhow`, qui ne rend que le contexte le plus externe.
+    ///
+    /// La borne de mot est load-bearing : sans elle, `error = %err` — un nom de
+    /// variable parfaitement légitime, qui peut très bien porter une chaîne déjà
+    /// aplatie — serait lu comme l'infraction.
+    fn logs_the_bare_display(block: &str) -> bool {
+        let needle = "error = %e";
+        let mut from = 0;
+        while let Some(offset) = block[from..].find(needle) {
+            let end = from + offset + needle.len();
+            let next = block[end..].chars().next();
+            if !next.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    /// Les sites d'émission d'un échec d'initialisation qui **masquent** la
+    /// cause : fonction pure de `(chemin, contenu)`, pour qu'un contrôle de
+    /// bonne foi puisse lui donner un bloc fabriqué.
+    ///
+    /// Le jugement porte sur la **fenêtre de macro** — depuis la ligne du
+    /// littéral, on remonte au plus [`INIT_FAILURE_MACRO_WINDOW`] lignes jusqu'au
+    /// `warn!(` qui l'ouvre, et c'est ce bloc-là qui doit porter un `error = %`
+    /// et ne pas porter de `error = %e` nu. Une ligne de prose qui cite le
+    /// message n'ouvre aucune macro et sort donc d'elle-même.
+    ///
+    /// **Angle mort nommé.** Un TROISIÈME site qui inventerait un message
+    /// NOUVEAU et le journaliserait avec `%e` n'est pas vu : le scan est ancré
+    /// sur les deux littéraux d'aujourd'hui. Un prédicat plus large — « tout
+    /// `warn!` portant `error = %e` » — attraperait des voisins légitimes, au
+    /// premier rang desquels la garde de dérive de palier de mika#1962
+    /// (`server/state.rs`, `refusing to lazy-resolve agent`), dont l'erreur est
+    /// un `thiserror` sans contexte empilé : `%e` y rend la chaîne entière et
+    /// l'aplatir ne changerait rien. Sous-approximer rend des faux rouges
+    /// impossibles, jamais des faux verts (mika#2761).
+    fn init_failure_masked_sites(rel: &str, content: &str) -> Vec<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut out = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(INIT_FAILURE_STARTUP_MESSAGE)
+                && !line.contains(INIT_FAILURE_LAZY_MESSAGE)
+            {
+                continue;
+            }
+            let Some(start) = (i.saturating_sub(INIT_FAILURE_MACRO_WINDOW)..=i)
+                .rev()
+                .find(|&j| lines[j].contains("warn!("))
+            else {
+                continue;
+            };
+            let block = lines[start..=i].join("\n");
+            if logs_the_bare_display(&block) || !block.contains("error = %") {
+                out.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+            }
+        }
+        out
+    }
+
+    /// Les deux sites d'échec d'initialisation journalisent la chaîne entière.
+    ///
+    /// Aucun test comportemental ne peut tenir les DEUX : le `warn!` de
+    /// démarrage vit dans la boucle de `run_server`, hors d'`init_agent`, donc
+    /// hors de portée d'un test qui ne démarre pas un serveur complet. C'est
+    /// cette garde-ci qui le couvre, et c'est pour cela qu'elle existe à côté de
+    /// `mika2876_un_docs_root_absent_dit_sa_cause_dans_le_log`.
+    #[test]
+    fn mika2876_aucun_site_dinit_ne_masque_la_chaine() {
+        let mut masked: Vec<String> = Vec::new();
+        let mut startup_seen = false;
+        let mut lazy_seen = false;
+
+        for (rel, content) in production_sources() {
+            if INIT_FAILURE_CHAIN_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            // Termes de vivacité : les DEUX littéraux existent-ils encore ? Sans
+            // eux, un renommage de message rendrait ce scan silencieux et donc
+            // décoratif — vert parce qu'il ne vise plus rien.
+            startup_seen |= content.contains(INIT_FAILURE_STARTUP_MESSAGE);
+            lazy_seen |= content.contains(INIT_FAILURE_LAZY_MESSAGE);
+            masked.extend(init_failure_masked_sites(&rel, &content));
+        }
+
+        assert!(
+            startup_seen,
+            "mika#2876 — le message « {INIT_FAILURE_STARTUP_MESSAGE} » n'existe \
+             plus dans la production : ce scan vise un littéral mort"
+        );
+        assert!(
+            lazy_seen,
+            "mika#2876 — le message « {INIT_FAILURE_LAZY_MESSAGE} » n'existe plus \
+             dans la production : ce scan vise un littéral mort"
+        );
+        assert!(
+            masked.is_empty(),
+            "mika#2876 — {} site(s) d'échec d'initialisation journalisent l'erreur \
+             sans sa chaîne :\n{}\n\n\
+             RÉSOLUTION : router le site par `let chain = format!(\"{{e:#}}\");` puis \
+             `error = %chain`, et NE PAS l'allowlister. Le sigil `%` de `tracing` \
+             est un `Display`, et sur une erreur `anyhow` `Display` ne rend que le \
+             contexte le plus externe : la cause posée sous un `.with_context(...)` \
+             disparaît du log. C'est ce qui a coûté 37 lignes sans cause pour \
+             mika-litha, diagnostiquées en lisant `identity.toml` à la main.",
+            masked.len(),
+            masked.join("\n")
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne regarde rien — très exactement le
+    /// mode de panne qu'il existe pour rendre visible. On le montre donc rougir
+    /// sur les deux formes d'infraction, et rester muet sur les formes voisines
+    /// qui citent le message sans le masquer.
+    #[test]
+    fn mika2876_le_scan_rougit_sur_un_site_qui_masque_la_cause() {
+        // 1. La régression exacte : le `%e` nu, sur une seule ligne.
+        let une_ligne = format!(
+            "                    warn!(agent = name, error = %e, \"{INIT_FAILURE_STARTUP_MESSAGE}\");\n"
+        );
+        assert_eq!(
+            init_failure_masked_sites("fixture.rs", &une_ligne).len(),
+            1,
+            "le `%e` nu sur la ligne du littéral doit être vu"
+        );
+
+        // 2. La même, étalée sur la fenêtre de macro.
+        let multi_ligne = format!(
+            "                tracing::warn!(\n                    agent = normalized.as_str(),\n\
+             \x20                   error = %e,\n                    \"{INIT_FAILURE_LAZY_MESSAGE}\"\n                );\n"
+        );
+        assert_eq!(
+            init_failure_masked_sites("fixture.rs", &multi_ligne).len(),
+            1,
+            "le `%e` nu quelques lignes au-dessus du littéral doit être vu"
+        );
+
+        // 3. Un site qui ne porte AUCUN champ d'erreur masque la cause tout
+        //    autant — par omission plutôt que par aplatissement manquant.
+        let sans_erreur = format!(
+            "                    warn!(agent = name, \"{INIT_FAILURE_STARTUP_MESSAGE}\");\n"
+        );
+        assert_eq!(
+            init_failure_masked_sites("fixture.rs", &sans_erreur).len(),
+            1,
+            "un site sans champ `error` ne porte pas davantage la cause"
+        );
+
+        // 4. La forme corrigée, sur une ligne et sur quatre.
+        let corrige = format!(
+            "                    let chain = format!(\"{{e:#}}\");\n\
+             \x20                   warn!(agent = name, error = %chain, \"{INIT_FAILURE_STARTUP_MESSAGE}\");\n"
+        );
+        assert!(
+            init_failure_masked_sites("fixture.rs", &corrige).is_empty(),
+            "la forme corrigée ne doit pas être dénoncée"
+        );
+
+        // 5. `error = %err` n'est pas `error = %e` — la borne de mot tient.
+        let err_nomme = format!(
+            "                    warn!(agent = name, error = %err, \"{INIT_FAILURE_LAZY_MESSAGE}\");\n"
+        );
+        assert!(
+            init_failure_masked_sites("fixture.rs", &err_nomme).is_empty(),
+            "un nom de variable commençant par `e` n'est pas le `Display` nu"
+        );
+
+        // 6. La prose qui cite le message n'ouvre aucune macro.
+        let prose =
+            format!("/// Les greps opérateur portent sur « {INIT_FAILURE_STARTUP_MESSAGE} ».\n");
+        assert!(
+            init_failure_masked_sites("fixture.rs", &prose).is_empty(),
+            "citer le message dans un commentaire n'est pas l'émettre"
+        );
+
+        // 7. La garde de dérive de palier de mika#1962, le voisin légitime que
+        //    le prédicat ne doit pas attraper : son erreur est un `thiserror`
+        //    sans contexte empilé, et `%e` y rend bien la chaîne entière.
+        let voisin = "                tracing::error!(\n                    agent = %normalized,\n\
+                      \x20                   error = %e,\n                    \"refusing to lazy-resolve agent: family-tier provisioning drift\"\n                );\n";
+        assert!(
+            init_failure_masked_sites("fixture.rs", voisin).is_empty(),
+            "le scan est ancré sur les deux littéraux d'init, pas sur tout `%e`"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2876_the_chain_allowlist_is_empty() {
+        assert!(
+            INIT_FAILURE_CHAIN_EXCEPTIONS.is_empty(),
+            "INIT_FAILURE_CHAIN_EXCEPTIONS est livrée vide et doit le rester : \
+             quand le scan tire, on route le site par `format!(\"{{e:#}}\")`, on ne \
+             l'exempte pas (doctrine mika#2201)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2575 — le nom d'audit du ré-armement d'une récurrente en vol.
     // ─────────────────────────────────────────────────────────────────────
 

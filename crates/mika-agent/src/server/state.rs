@@ -333,9 +333,15 @@ impl AppState {
                 Some(agent_state)
             }
             Err(e) => {
+                // mika#2876 — même raison qu'au site de démarrage
+                // (`server/mod.rs`, boucle d'init) : `%` est un `Display`, donc
+                // seul le contexte le plus externe de l'erreur `anyhow` est
+                // rendu. `{e:#}` aplatit la chaîne `source()` entière. Message,
+                // champs et niveau inchangés.
+                let chain = format!("{e:#}");
                 tracing::warn!(
                     agent = normalized.as_str(),
-                    error = %e,
+                    error = %chain,
                     "lazy agent construction failed"
                 );
                 None
