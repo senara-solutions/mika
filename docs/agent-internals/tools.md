@@ -1177,11 +1177,19 @@ have **opposite** dispositions — the point the words confuse most easily:
 Treating the first as the second makes the arm **inert over a healthy
 population** while reading exactly like a healthy disk (class mika#2205);
 treating the second as the first purges blind. Hence three variants, never a
-bool. `libc` is already a dependency but sits under
-`[target.'cfg(target_os = "linux")'.dependencies]`, so the call follows
-`process_liveness::is_same_process_alive`: a `#[cfg(target_os = "linux")]` block
-with an **explicit non-Linux fallback that keeps**. Rendering "free" there would
-purge on the one platform where a running build cannot be seen.
+bool. The call follows `process_liveness::is_same_process_alive`: a
+`#[cfg(target_os = "linux")]` block with an **explicit non-Linux fallback that
+keeps**. **Nothing in the manifest forces that `#[cfg]`** — since mika#2900
+`libc` is declared under `[target.'cfg(unix)'.dependencies]`, so the crate is
+available for a darwin target. What forces it is semantic: `flock` semantics
+differ across OSes, and the population of `<target>/<profile>/.cargo-lock` is
+only verified under Linux. Rendering "free" there would purge on the one
+platform where a running build cannot be seen.
+
+The earlier wording presented the Cargo key as the cause of the `#[cfg]`, and
+that is precisely the reading that produced mika#2900: the key was taken for a
+platform constraint when it was only a too-narrow declaration, which an unguarded
+call site brought down at the first release tag.
 
 **P4 walks a bounded, declared set** — `target/`, its direct children, and their
 children (depth 2) — and deliberately **not** `measure_tree_size`, whose 400 000

@@ -4490,13 +4490,21 @@ fn probe_one_cargo_lock(path: &Path) -> LockProbe {
 ///
 /// # Le repli non-Linux **conserve**, et son sens n'est pas libre
 ///
-/// `libc` vit sous `[target.'cfg(target_os = "linux")'.dependencies]`, donc cet
-/// appel suit le patron de `task_engine::process_liveness::is_same_process_alive`.
-/// Hors Linux le verrou est **inévaluable**, donc il conserve, et la purge n'y
+/// **Rien dans le manifeste ne l'impose** : depuis mika#2900 `libc` est déclaré
+/// sous `[target.'cfg(unix)'.dependencies]`, donc le crate est disponible pour
+/// une cible darwin. Ce qui impose le `#[cfg(target_os = "linux")]` de ce site
+/// est **sémantique** : la sémantique de `flock` diffère entre OS, et la
+/// population de `<target>/<profil>/.cargo-lock` n'est vérifiée que sous Linux.
+/// Hors Linux le verrou est donc **inévaluable**, il conserve, et la purge n'y
 /// fire jamais. Rendre `Free` y serait purger sur la seule plateforme où l'on ne
 /// peut pas vérifier qu'un build tourne. La cible de production est Linux
 /// (`Dockerfile.agent`, OpenRC) : le coût est nul, et ce qui est en jeu est
 /// `cargo build` sur le poste d'un développeur plus la release cross-plateforme.
+///
+/// Le texte précédent présentait la clé Cargo comme la cause du `#[cfg]`, et
+/// c'est exactement la lecture qui a produit mika#2900 : la clé était prise pour
+/// une contrainte de plateforme alors qu'elle n'était qu'une déclaration trop
+/// étroite, qu'un site non gardé a fait tomber au premier tag de release.
 pub fn cargo_build_lock_is_free(target: &Path) -> LockProbe {
     #[cfg(target_os = "linux")]
     {
