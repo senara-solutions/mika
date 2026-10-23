@@ -292,8 +292,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'pull_request' &&
-       !startsWith(github.head_ref, 'release/') &&
-       !startsWith(github.head_ref, 'release-please--'))
+       !startsWith(github.head_ref, 'release/'))
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Check crate-local docs are in sync
@@ -911,7 +910,6 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       !startsWith(github.head_ref, 'release/') &&
-      !startsWith(github.head_ref, 'release-please--') &&
       !startsWith(github.head_ref, 'dependabot/')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
