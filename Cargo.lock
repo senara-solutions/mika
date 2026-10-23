@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "mika-a2a"
-version = "0.12.2"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "mika-agent"
-version = "0.12.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "mika-cli"
-version = "0.12.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "mika-common"
-version = "0.12.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "mika-gateway"
-version = "0.12.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "mika-os"
-version = "0.12.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",

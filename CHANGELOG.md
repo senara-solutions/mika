@@ -4,8 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v1.0.0](https://github.com/senara-solutions/mika/releases/tag/v1.0.0)
+
+First numbered 1.0 release, gathering the 942 commits since v0.12.2. Release notes for users:
+[`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
+
+### Changed
+
+- *(release)* `release.yml` publishes a complete release from a `v*` tag: archives with `.tar.gz.sha256` checksums, cosign bundles, provenance attestations and per-binary SBOMs. A `-rc.N` tag publishes a prerelease that never becomes `latest`. x86_64-apple-darwin builds on macos-14 (mika#2890).
+- *(release)* release-please removed; the version and this changelog now move by hand in the release PR (mika#2890).
+
 ### Fixed
 
+- *(release)* `install.sh` found no checksum on v0.12.x releases (`<archive>.sha256` published, `<archive>.tar.gz.sha256` fetched); releases now publish the name it fetches (mika#2890).
 - *(self-dev)* Webhook fallthrough enforced at the dispatch tool boundary; `run_claude_pilot` on `[GitHub]` fallthrough-domain turns (issue events, comments, or unknown event types) is rejected with `unauthorized_webhook_dispatch` before the subprocess spawns. Ready-label dispatches and qa/ci handler-skill dispatches are explicitly allowlisted (mika#933).
 
 ## [v0.12.2](https://github.com/senara-solutions/mika/releases/tag/v0.12.2) — 2026-05-09
