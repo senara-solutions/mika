@@ -1,7 +1,7 @@
 ---
 title: "Release automation chronic drift — failure classes that outlive tool choice"
 date: 2026-04-23
-last_updated: 2026-08-29
+last_updated: 2026-10-23
 category: ci-cd
 problem_type: operational-pattern
 severity: medium
@@ -13,9 +13,12 @@ tags:
   - institutional-memory
   - rust-workspace
   - disabled-channel
+  - consumer-contract
 modules:
   - .github/workflows/release-pr.yml
   - .github/workflows/release.yml
+  - scripts/release-tag.sh
+  - install.sh
 related:
   - docs/solutions/ci-cd/rust-workspace-release-plz-github-actions.md
 ---
@@ -37,7 +40,7 @@ Zero impact on the CI gate (`CI` workflow is green on the same commits). The `Re
 
 ## Failure classes that survive tool choice
 
-The 14+ historical fix commits cluster into **four root causes**, plus a fifth that no fix commit could reach (Class E, added 2026-08-29). Each has outlasted at least one tool migration. Name these explicitly when diagnosing the next failure:
+The 14+ historical fix commits cluster into **four root causes**, plus a fifth that no fix commit could reach (Class E, added 2026-08-29) and a sixth that only a consumer could see (Class F, added 2026-10-23). Each has outlasted at least one tool migration. Name these explicitly when diagnosing the next failure:
 
 ### Class A — Workspace dep resolution with mixed publish-status crates
 
@@ -137,10 +140,22 @@ class you are in.
 **Class E is the class that justifies turning a channel off** rather than iterating, when the channel
 is not delivering anything and every iteration costs a red `main`.
 
-## Current state (2026-08-29): channel disabled
+### Class F — the consumer's contract was never exercised
 
-**There is no current failure, because there is no longer a running release workflow.** See Stage 5 —
-the `push: main` trigger was removed under mika#2047; resume conditions are in mika#2048.
+Added 2026-10-23 (mika#2890). The workflow went green on the producer side while the consumer of its
+output could not use it. Nothing in the pipeline ran `install.sh` against a real release, so the
+mismatch lived as long as the channel did. See Stage 6.
+
+**Tell it apart by asking who would notice.** A–E fail in the workflow's own log. Class F fails on a
+user's machine, or in a sibling workflow that silently relied on a side effect. Its fix is to exercise
+the consumer, not to read the producer's YAML more carefully.
+
+## Current state (2026-10-23): tag-driven, no release tool
+
+release-please and its workflow are removed. `release.yml` publishes from a pushed `v*` tag; version
+and changelog move by hand in the release PR. See Stage 6. The fix sits on branch
+`release/2890/une-voie-de-release-v-rifi-e-pour-v1-0-0`, not yet pushed or merged at the time of
+writing, and its first real run is the operator's `v1.0.0-rc.1` dry run (`docs/releasing.md`).
 
 <details>
 <summary>Historical: current failure as of 2026-05-06 (Class C, fix in validation)</summary>
@@ -253,11 +268,81 @@ for 300 is a channel to decide about.
 - **Nothing was half-repaired.** `Cargo.toml`, `release-please-config.json` and
   `.release-please-manifest.json` are untouched: they are the resume ticket's raw material.
 
+## Stage 6 — tag-driven release, release-please removed (mika#2890, 2026-10-23)
+
+**Outcome.** `release-pr.yml`, `release-please-config.json` and `.release-please-manifest.json` are
+deleted. mika#2048, the resume ticket, had been closed not planned. Keeping a workflow whose only
+trigger would open a real release PR on `main` was a trap, not a resume path. `release.yml` was
+rewritten for the v1.0.0 launch.
+
+### What the "cancelled" runs actually were
+
+Runs v0.12.0, v0.12.1 and v0.12.2 (25571118235, 25571572348, 25596130472) ended `cancelled`, not
+`failed`. The run logs had expired (`gh run view --log` → HTTP 410). The run's annotations had not:
+
+```
+X The job has exceeded the maximum execution time while awaiting a runner for 24h0m0s
+Build x86_64-apple-darwin: .github#1
+```
+
+The `macos-13` job never started. The three other targets finished in 10 to 12 minutes. **A runner
+label GitHub no longer serves reads as `cancelled` after 24 hours, not as an error.** When an old run's
+log is gone, read `gh run view <id>` (without `--log`): the annotations outlive the logs.
+
+### Class F, twice: two contracts nobody had exercised
+
+1. **The release was created by a tool we later turned off.** `taiki-e/upload-rust-binary-action` only
+   runs `gh release upload` (its `main.sh:637`). It has never created a release, and it has no
+   prerelease option. release-please created the v0.12.x releases. Disabling release-please in Stage 5
+   therefore also broke `release.yml`, silently: a tag pushed after 2026-08-29 had no release to
+   upload into. Stage 5's "dormant, left in place so a manually pushed tag still produces binaries" was
+   false the day it was written.
+2. **install.sh had never matched the checksum name.** The action writes `<archive>.sha256`, while
+   `install.sh` fetches `${URL}.sha256`, that is `<archive>.tar.gz.sha256`. Run against v0.12.2,
+   install.sh gets a 404, then fails with `Checksum mismatch! Expected , got 4a16…`. The 404 hides
+   inside `EXPECTED=$(curl … | awk …)`, whose exit status is awk's. Nobody had run install.sh against
+   a real release. `docs/release-verification.md` (`sha256sum --check <archive>.tar.gz.sha256`)
+   shared the same wrong assumption.
+
+A third one, waiting to happen: the never-run `sbom` job copied `crates/*/bom.json`, but
+cargo-cyclonedx 0.5 writes `<package>.cdx.json` (its `generator.rs`, function `filename`).
+
+### What the rewrite does about it
+
+- Build, SBOM and signing write **workflow artifacts only**. One final `publish` job creates the release
+  itself, as a draft with every file, then makes it public. No step depends on another tool having
+  created a release.
+- The checksum is produced by hand under the name `install.sh` fetches. It is computed from the
+  archive's own directory, so the file reads `<hash>  <bare name>` and `sha256sum --check` accepts it.
+- The SBOM names are explicit `cp` targets, so a renamed output fails the job instead of matching nothing.
+- `x86_64-apple-darwin` is cross-compiled on `macos-14`, the runner aarch64-apple-darwin already used.
+- **A release candidate never becomes `latest`.** `install.sh` installs `releases/latest`, and GitHub
+  keeps only prereleases out of it. The decision "is this tag a candidate?" lives in
+  `scripts/release-tag.sh`, held offline by `scripts/test-release-tag.sh`, and not in YAML that nothing
+  can execute locally. `publish` checks the flag on the draft, re-reads `releases/latest` after
+  publishing, and puts a candidate back to draft if GitHub disagrees.
+- The `sign` job runs step 2 of `docs/release-verification.md` with its exact identity, so drift
+  between the doc and the workflow fails in CI, not on a user's machine.
+
+### Rule
+
+**Close a release channel by exercising its consumer.** For this repo that means the
+`v1.0.0-rc.1` dry run in `docs/releasing.md`: run `install.sh` against the candidate, then run the
+binary. The verification procedure alone never extracts an archive, which is exactly how failure 2
+survived. When a step relies on a side effect of another workflow or tool (failure 1), write the
+dependency down where the step is, or remove it.
+
 ## Operational workaround
+
+### Stage 6 (tag-driven) rerun and rollback
+
+See `docs/releasing.md` § Rerun, rollback, fallbacks. In short, a run that failed before
+"Make it public" reruns as is, and a published release is never overwritten.
 
 ### Stage 4 (release-please) reset procedure
 
-If release-please gets stuck or produces an incorrect Release PR:
+No longer applicable since Stage 6, because the workflow is deleted. Retained for history. If
+release-please got stuck or produced an incorrect Release PR:
 
 ```bash
 # 1. Delete the release-please managed branch — the action recreates it on next push to main
@@ -283,9 +368,10 @@ Failure classes are the primary axis of this doc. Tool chronology is here as sec
 - **Stage 1 — release-plz** (2026-03-01 → 2026-04-03). Setup captured in [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) (now historical). 10+ fixes, all in Classes A, B, D. Migration driven by Class A.
 - **Stage 2 — git-cliff** (2026-04-03 → 2026-05-09). Migration commit `4825e7ae`. Fixes in Classes C, D. Replaced due to Class C variant ("No commits between" on release PR merge).
 - **Stage 4 — release-please** (2026-05-09 → 2026-08-29). Migration in mika#1049. `googleapis/release-please-action` v4 with persistent Release PR branch. Structurally avoided Classes A, B, C — and was killed by Class E. (This entry was numbered "Stage 3" until 2026-08-29, contradicting the "Stage 4" heading above; the headings are authoritative.)
-- **Stage 5 — disabled** (2026-08-29 → present). mika#2047. No automated release channel; `workflow_dispatch` only. Resume conditions in mika#2048.
+- **Stage 5 — disabled** (2026-08-29 → 2026-10-23). mika#2047. No automated release channel; `workflow_dispatch` only. Resume ticket mika#2048, closed not planned.
+- **Stage 6 — tag-driven, no release tool** (2026-10-23 →). mika#2890. release-please removed; `release.yml` publishes from an operator-pushed `v*` tag, with `-rc.N` as a prerelease.
 
-The workflow file is `.github/workflows/release-pr.yml`; the tool is `googleapis/release-please-action`. As of Stage 5 the workflow is disabled and the tool does not run.
+As of Stage 6 there is no release-PR tool. The release workflow is `.github/workflows/release.yml`, and the operator runbook is `docs/releasing.md`.
 
 ## Meta — why release automation drifts chronically
 
@@ -305,4 +391,5 @@ Combined effect: it's psychologically easier to apply a point-fix than to unders
 - Ticket mika#775 — fix Class C (`release/v0.6.0` non-fast-forward)
 - Ticket mika#1006 — fix Class D (`release` label missing, unmasked by mika#1003)
 - Ticket mika#1049 — Stage 4: git-cliff → release-please migration
+- Ticket mika#2890 — Stage 6: tag-driven release.yml, release-please removed, Class F
 - MEMORY: `feedback_compound_infra_fixes.md` — institutional rule about infra-fix evaporation

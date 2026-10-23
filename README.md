@@ -138,13 +138,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, commit
 
 ## Versioning
 
-Mika follows [Conventional Commits](https://www.conventionalcommits.org/). **Automated releases are currently disabled** — see `docs/deployment.md` and mika#2048. The convention is kept for changelog readability and so releases can be turned back on.
+Mika follows [Conventional Commits](https://www.conventionalcommits.org/). Releases are cut by hand: the version and `CHANGELOG.md` move in a release PR, then the operator pushes a `v*` tag — see `docs/releasing.md`. The convention keeps the changelog readable.
 
-**Pre-1.0 breaking changes policy:** Until v1.0, breaking changes do not trigger a major version bump. They are shipped as minor or patch releases. Each PR that introduces a breaking change must document the required manual migration steps in its description so users can act on them during upgrade.
+**Semver strict :** À partir de v1.0, Mika suit le semver strict. Tout changement cassant (format de données, schéma de config, contrat d'API, comportement sur lequel un membre s'appuie) sort en version majeure, accompagné d'un guide de migration.
 
 ## Current Status
 
-**Phase 4** -- Deployment infrastructure. Dockerfiles and CI/CD pipeline are complete; automated releases are disabled (see `docs/deployment.md`). Gateway with Telegram integration is operational.
+**Phase 4** -- Deployment infrastructure. Dockerfiles and CI/CD pipeline are complete; releases are cut by tag (see `docs/releasing.md`). Gateway with Telegram integration is operational.
 
 ## License
 
