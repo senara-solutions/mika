@@ -253,6 +253,95 @@ grep -c tool_defs_census_duplicate_name "$MIKA_SPIRIT_LOG_FILE"   # expected: 0
 
 **Session lifecycle:** Silent dispatcher variants call `end_session()` after completion. CLI commands call `end_session()` on all exit paths. `startup_recovery()` prunes old sessions via `prune_old_sessions()`.
 
+### Exhausting the step budget names the tools that consumed it (mika#2877)
+
+`max_steps_tool_census` — a WARN event (`target: "mika::otel"`) emitted at the
+**single** site where the agent loop cuts a turn at `MAX_TOOL_STEPS`, immediately
+after the pre-existing `"agent exceeded max tool steps"` WARN and before
+`all_tool_summaries` is moved into `LoopResult::MaxStepsExceeded`. It carries
+`per_tool` — a compact JSON `{name: calls}` map under sorted keys — plus
+`total_calls`, `steps_with_tools`, `distinct_tools`, `failed_calls`, `max_steps`,
+the same `label` as the neighbouring WARN, and the three correlation fields
+(`agent_id`, `session_id`, `trace_id`). Module: `agent_loop::max_steps_census`.
+
+**What was missing.** The neighbouring WARN carries `label` and `max_steps` only:
+it says *that* the budget was exhausted and *what* the ceiling was, never *by
+what*. Measured 2026-10-22 on `/var/log/mika/server.log`: 204 occurrences in ten
+days, almost entirely on mika-qa, and the three candidate corrections — raise the
+ceiling, fix a looping tool, shorten the QA prompt — are decided exactly on this
+data. This is a measurement flight: neither the ceiling nor the behaviour at
+exhaustion changed.
+
+**Why a distinct event rather than fields on the neighbour.** The finding above
+*is* a grep of that line, so the line is the denominator of the measurement, and
+adding fields would rewrite the very line the series follows. A neighbouring event
+leaves the old curve readable, starts the new one at the deploy date, and lets the
+two be compared.
+
+**Why WARN.** To travel with the WARN it accompanies: an exhaustion is abnormal,
+and an operator filtering their log at WARN must see both lines or neither. This
+is the opposite arbitration from `tool_defs_census` above, and for the opposite
+reason — that one fires on every nominal turn, this one only on a cut.
+
+**`total_calls` is not bounded by `max_steps`.** A step carries as many calls as
+the model emitted `tool_use` blocks, so twenty steps can hold more than twenty
+calls. `steps_with_tools` is therefore load-bearing, not decorative: without it
+`total_calls = 20` covers two non-subtractable populations (class mika#2205) —
+"20 steps × 1 call" (the model is working, the ceiling is too low) and "5 steps ×
+4 parallel calls" (the budget burns elsewhere) — which call for opposite
+corrections.
+
+**Failed calls stay counted in `per_tool`.** A failure consumes budget like a
+success; excluding them would erase exactly the "a tool looping on its error"
+pattern. `failed_calls` is the separate count, never a subtraction from the map.
+
+**Absent is never zero — at three distinct levels:**
+
+| what is absent | what it means | how it is held |
+|---|---|---|
+| **a key** of `per_tool` | that tool **was not called** on this turn | property of the map: the census enumerates what consumed, not the universe of tools. Never `0` (mika#2331) |
+| **the whole line** | the binary in service **predates** this change | the emission is unconditional and ungated (mika#2340). **Never** "no tool was called" |
+| **a non-empty map** | nothing: `per_tool = {}` with `total_calls = 0` is **a measurement** — the budget burned outside tool calls (guard re-prompts), and that may be *the* answer |
+
+The last row is why the call site carries no `if !summaries.is_empty()`: such a
+guard would mute precisely the most interesting case.
+
+**Operator reading** (`/var/log/mika/server.log` on the host, or
+`$MIKA_SPIRIT_LOG_FILE`):
+
+```sh
+# The tools that consume the budget, by decreasing cost, on mika-qa
+grep max_steps_tool_census /var/log/mika/server.log \
+  | jq -r 'select(.agent_id == "mika-qa") | .per_tool' \
+  | jq -s 'reduce (.[] | fromjson | to_entries[]) as $e ({}; .[$e.key] += $e.value)
+           | to_entries | sort_by(-.value)'
+
+# Parallelism or length: total_calls vs steps_with_tools
+grep max_steps_tool_census /var/log/mika/server.log \
+  | jq -r '[.label, .total_calls, .steps_with_tools, .distinct_tools, .failed_calls] | @tsv'
+```
+
+**Conformance probe — the two counts must be EQUAL:**
+
+```sh
+grep -c "agent exceeded max tool steps" /var/log/mika/server.log
+grep -c max_steps_tool_census           /var/log/mika/server.log
+```
+
+Both lines are emitted at the same site without condition, so their counts are
+equal by construction on any binary postdating this flight. An inequality is not a
+log detail: **first > second** means a cut path escapes the emission (or the log
+spans the deployment); **second > first** means a double emission, which the
+harness test forbids (`tests/eval/test_max_steps_tool_census_2877.rs` asserts
+*exactly one* event per turn — a turn emitting two would make the reading above
+ambiguous without failing anything). Both at `0` means no exhaustion over the
+window.
+
+**What this does NOT buy.** The ceiling is unchanged, no tool is bounded, nothing
+is refused, and turns already served will never have their line. The choice of a
+correction is a second flight, after reading this measurement in production — and
+the instrument is not live until `make deploy`.
+
 ### Guard Fabrication Telemetry (#953)
 
 Structured telemetry for the five fabrication-class EndTurn guards. Each guard firing emits a `target: "mika::otel"` event (exported to Langfuse via OTLP when telemetry is enabled, always in log file). Two paired event types:
