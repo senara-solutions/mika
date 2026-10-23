@@ -21,11 +21,11 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
-    DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL, PendingFabricationP0,
-    PendingFabricationP0Site, RESPONSE_LANGUAGE_DRIFT_LABEL, TESTIMONY_ACCESS_PROPOSAL_LABEL,
-    TIME_OF_DAY_GREETING_LABEL, TestimonyProposalChannel, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
-    UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
-    asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL, FrequencyAssertionNature,
+    PendingFabricationP0, PendingFabricationP0Site, RESPONSE_LANGUAGE_DRIFT_LABEL,
+    TESTIMONY_ACCESS_PROPOSAL_LABEL, TIME_OF_DAY_GREETING_LABEL, TestimonyProposalChannel,
+    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends,
+    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
     detect_fabricated_action_claim, detect_false_local_hosting_claim,
     detect_response_language_drift, detect_testimony_access_proposal,
@@ -3069,6 +3069,58 @@ async fn run_loop(
                             "Unactioned frequency-promise guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
+                        // mika#2879 (vol 3) — ce site est rattaché à la classe
+                        // P0 `fabrication-detected` **sur sa seule moitié « état
+                        // accompli »**. Par le critère mika#2872 D1 : « c'est
+                        // corrigé » affirme un état du système que le terme (C)
+                        // du détecteur vient de contredire (aucun `set_config`
+                        // sur les deux clés proactives n'a tourné ce tour), donc
+                        // personne dans le système ne sait si c'est vrai et seul
+                        // un humain peut l'établir. « Je vais réduire » reste
+                        // dehors : une promesse non tenue ne pose aucun état, et
+                        // aucun geste d'opérateur ne la rendrait vraie.
+                        //
+                        // Trois termes, trois rôles distincts :
+                        // - la porte, désarmée par défaut (mika#1574 (b)) ;
+                        // - le verrou de **classe** : une seule P0 par tour pour
+                        //   toute la classe, le premier écrivain gagne ;
+                        // - l'appartenance. Ce dernier n'est pas redondant avec
+                        //   le bras de `still_violated` : sans lui un engagement
+                        //   sur l'avenir **occuperait le créneau**, la P0 du 5d
+                        //   du même tour serait perdue, puis celle de 5e
+                        //   supprimée à l'acceptation. Le terme protège le
+                        //   créneau, là où la revérification protège l'émission.
+                        if fabrication_p0_notify
+                            && pending_fabrication_p0.is_none()
+                            && promise.nature == FrequencyAssertionNature::AccomplishedState
+                        {
+                            pending_fabrication_p0 = Some(PendingFabricationP0 {
+                                message: format!(
+                                    "Fabrication detected (uncorrected) on message \
+                                     frequency: the frequency-promise guard fired and \
+                                     the re-prompt budget is spent, yet the response \
+                                     still asserts «{assertion} … {subject}» as an \
+                                     accomplished state, and no set_config on \
+                                     {budget_key} or {pause_key} ran this turn. The \
+                                     answer went out, and the tenant was told the \
+                                     frequency had already changed. Investigate \
+                                     trace_id {trace_id} in /var/log/mika/server.log.",
+                                    // Assertion puis sujet, dans l'ordre où la
+                                    // garde les a appariés ; l'ellipse dit le trou
+                                    // (les deux fragments sont à moins de
+                                    // `CLAIM_GAP_MAX` l'un de l'autre, pas
+                                    // contigus). Même forme qu'au site 5d
+                                    // ci-dessus, et pour la même raison.
+                                    assertion = promise.assertion,
+                                    subject = promise.subject,
+                                    budget_key = crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY,
+                                    pause_key = crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY,
+                                    trace_id = tool_ctx.trace_id,
+                                ),
+                                site:
+                                    PendingFabricationP0Site::UnactionedFrequencyPromiseAccomplished,
+                            });
+                        }
                     }
 
                     // 5f. Response language-drift guard (mika#2247 AC2) — refuse
