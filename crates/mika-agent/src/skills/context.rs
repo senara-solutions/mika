@@ -89,6 +89,39 @@ impl ContextBlock {
     }
 }
 
+/// Pourquoi la résolution d'un contexte de skill n'a pas rendu de bloc.
+///
+/// Les deux variantes séparent deux événements de natures opposées que le type
+/// `anyhow::Error` confondait (mika#2885) : une entrée absente du message est un
+/// fonctionnement normal sur un contexte optionnel, un échec de résolution est
+/// un incident. Le site de log de [`resolve_contexts`] est le seul lecteur de
+/// cette distinction, et il la lit par [`Self::is_missing_input`], jamais par le
+/// texte du message.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextResolutionError {
+    /// Le message du tour ne contient pas ce que le résolveur cherche.
+    ///
+    /// Aucun appel réseau n'a eu lieu : le résolveur s'est arrêté à l'entrée.
+    #[error("{0}")]
+    MissingInput(String),
+
+    /// La résolution a réellement échoué — appel `gh` ou réseau en échec,
+    /// réponse illisible, type de contexte inconnu.
+    ///
+    /// C'est la variante que `?` produit sur n'importe quelle `anyhow::Error`,
+    /// donc **le défaut d'un résolveur qui ne classe rien** : un oubli de
+    /// classification reste bruyant.
+    #[error("{0}")]
+    Failed(#[from] anyhow::Error),
+}
+
+impl ContextResolutionError {
+    /// `true` quand le message du tour ne portait pas l'entrée du résolveur.
+    pub fn is_missing_input(&self) -> bool {
+        matches!(self, Self::MissingInput(_))
+    }
+}
+
 /// Resolve context requirements for matched skills.
 ///
 /// For each matched skill with `[context]` declarations, dispatches to the appropriate
@@ -160,7 +193,10 @@ pub async fn resolve_contexts(
             "gh_pr_diff" => resolve_gh_pr_diff(message, github_token).await,
             _ => {
                 tracing::warn!(context_type = context_type.as_str(), "unknown context type");
-                Err(anyhow::anyhow!("unknown context type: {}", context_type))
+                Err(ContextResolutionError::Failed(anyhow::anyhow!(
+                    "unknown context type: {}",
+                    context_type
+                )))
             }
         };
 
@@ -176,13 +212,29 @@ pub async fn resolve_contexts(
                 resolved.insert(key.clone(), content);
             }
             Err(err) => {
-                tracing::warn!(
-                    key = key.as_str(),
-                    context_type = context_type.as_str(),
-                    error = %err,
-                    required = required,
-                    "context resolution failed"
-                );
+                // mika#2885 — une absence d'entrée sur un contexte OPTIONNEL est un
+                // fonctionnement normal : la sentinelle est insérée juste en dessous et le
+                // tour se déroule. Elle part en `debug!`, sous son propre littéral.
+                // Tout le reste — vrai échec, ou contexte requis — garde le `warn!` avec
+                // le même message et les mêmes champs : les greps opérateur portent sur
+                // ce littéral.
+                if !*required && err.is_missing_input() {
+                    tracing::debug!(
+                        key = key.as_str(),
+                        context_type = context_type.as_str(),
+                        error = %err,
+                        required = required,
+                        "optional context has no input in message"
+                    );
+                } else {
+                    tracing::warn!(
+                        key = key.as_str(),
+                        context_type = context_type.as_str(),
+                        error = %err,
+                        required = required,
+                        "context resolution failed"
+                    );
+                }
                 if *required {
                     exclude_indices.extend(skill_indices);
                 } else {
@@ -254,9 +306,17 @@ pub fn extract_pr_url(message: &str) -> Option<(String, String, u64)> {
 }
 
 /// Resolve a `gh_pr_diff` context requirement.
-async fn resolve_gh_pr_diff(message: &str, github_token: Option<&str>) -> Result<ContextBlock> {
-    let (owner, repo, number) =
-        extract_pr_url(message).context("no GitHub PR URL found in message")?;
+async fn resolve_gh_pr_diff(
+    message: &str,
+    github_token: Option<&str>,
+) -> Result<ContextBlock, ContextResolutionError> {
+    // mika#2885 — l'extraction d'URL est la SEULE étape de ce résolveur qui lit
+    // le message du tour : son échec est une absence d'entrée, pas un incident.
+    // Tout ce qui suit passe par `?` sur une `anyhow::Error`, donc par
+    // `ContextResolutionError::Failed`, donc reste bruyant.
+    let (owner, repo, number) = extract_pr_url(message).ok_or_else(|| {
+        ContextResolutionError::MissingInput("no GitHub PR URL found in message".to_string())
+    })?;
 
     let diff = fetch_pr_diff(&owner, &repo, number, github_token).await?;
 
@@ -1032,6 +1092,25 @@ mod tests {
             mika2885_events_with_message(&events, "optional context has no input in message")
                 .is_empty(),
             "AC3 — le littéral `debug!` ne porte que sur les contextes optionnels"
+        );
+    }
+
+    /// Le défaut de la conversion est la variante BRUYANTE.
+    ///
+    /// `#[from] anyhow::Error` fait de `Failed` ce que `?` produit sur
+    /// n'importe quelle erreur non classée : un résolveur qui oublie de classer
+    /// son absence d'entrée garde son WARN, il ne la fait pas taire. C'est
+    /// pourquoi la distinction est portée par le type et non par le texte du
+    /// message.
+    #[test]
+    fn mika2885_une_erreur_anyhow_non_classee_nest_pas_une_absence_dentree() {
+        assert!(
+            !ContextResolutionError::from(anyhow::anyhow!("boom")).is_missing_input(),
+            "une `anyhow::Error` non classée doit rester un vrai échec"
+        );
+        assert!(
+            ContextResolutionError::MissingInput("x".to_string()).is_missing_input(),
+            "seule la variante déclarée est une absence d'entrée"
         );
     }
 }
