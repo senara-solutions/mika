@@ -250,6 +250,151 @@ mod tests {
         );
     }
 
+    /// L'URL du ticket de l'exemple relevé à la source (mika#2886) : le vol de
+    /// #2875, classé « mort, reprise à la main » par le puits alors qu'il avait
+    /// ouvert #2881.
+    const TICKET_2886: &str = "https://github.com/senara-solutions/mika/issues/2875";
+
+    /// Sème **la forme que la production produit**, et elle seule (mika#2886).
+    ///
+    /// Deux lignes, pas une. La **parente** `ready-label: …#N` porte l'URL du
+    /// ticket et un `result` **absent** ; l'**enfant**
+    /// `long_running:run_claude_pilot` porte l'issue du pilote, son
+    /// `reference_url` est NULL et son `parent_task_id` pointe la parente.
+    /// C'est le relevé de #2875 : parente `752be6cf` (`result` vide), enfant
+    /// `d2dbf5e8` (`Outcome: PR_OPENED — …/pull/2881`).
+    ///
+    /// L'enfant passe par le constructeur de **production**
+    /// [`crate::skills::executor::build_callback_task`] plutôt que par un
+    /// `NewTask` littéral : c'est lui qui décide le label, le `reference_url`
+    /// NULL et la `dispatch_class`, et un fixture qui les recopierait pourrait
+    /// rester vert après qu'il a changé d'avis.
+    ///
+    /// Rend l'identifiant de la parente — la ligne que la source doit rendre.
+    fn seme_la_forme_reelle(db: &Database, resultat_de_lenfant: &str) -> String {
+        db.register_agent("mika-dev", "mika-dev", "/tmp/mika-dev")
+            .expect("l'agent dispatcheur doit être enregistré");
+
+        let parente = crate::task_state::tasks::NewTask {
+            dispatch_class: Some("implement".to_string()),
+            ..crate::db::tests::groom_parent("mika-dev", TICKET_2886)
+        };
+        let parente_id = db
+            .create_task(&parente)
+            .expect("la parente doit être créée");
+        // `None` : la parente se termine sans `result`. C'est l'absence, pas une
+        // chaîne vide (motif mika#2331), et c'est ce que la production écrit.
+        db.update_task_completed(&parente_id, "mika-dev", None)
+            .expect("la complétion de la parente doit réussir");
+
+        let enfant = crate::skills::executor::build_callback_task(
+            "mika-dev".to_string(),
+            Some(parente_id.clone()),
+            "run_claude_pilot",
+            &serde_json::json!({"skill": "dev-pilot"}),
+            3_600,
+            "session-2886",
+            "trace-2886",
+            None,
+        );
+        let enfant_id = db.create_task(&enfant).expect("l'enfant doit être créé");
+        db.update_task_completed(&enfant_id, "mika-dev", Some(resultat_de_lenfant))
+            .expect("la complétion de l'enfant doit réussir");
+
+        parente_id
+    }
+
+    /// **AC1 — le test qui rougit contre le code actuel (AC3).** La forme réelle
+    /// sur le chemin complet : base → source → `evaluate_flights`, et
+    /// l'exigence du verdict *PR ouverte, merge-candidat*.
+    ///
+    /// Les 531 verdicts du puits mesurés le 2026-10-23 disaient tous
+    /// `mort — cause non classée (no_outcome_line) — reprise à la main`, parce
+    /// que la source ne rendait que le `result` de la parente — vide. L'issue du
+    /// pilote vit sur l'enfant.
+    ///
+    /// Le test est hermétique : `sub_issues` est vide, donc `pr_state` est
+    /// `None`, et `recommend` rend `MergeCandidate` sur `PrOpened` + `None`
+    /// (*« va regarder »*). Aucun accès à GitHub.
+    #[tokio::test]
+    async fn mika2886_la_forme_reelle_rend_un_verdict_de_pr_ouverte() {
+        let db = Database::open_in_memory().unwrap();
+        let parente_id = seme_la_forme_reelle(
+            &db,
+            "Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2881\nTurns: 121\n",
+        );
+
+        let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
+        let vols = source
+            .finished_implement_flights(None, &[TICKET_2886.to_string()])
+            .await;
+
+        assert_eq!(
+            vols.len(),
+            1,
+            "un vol, celui de la parente : l'enfant n'a pas de `reference_url` et \
+             n'est pas un vol de plus"
+        );
+        assert_eq!(
+            vols[0].task_id, parente_id,
+            "le vol rendu est la parente — c'est elle qui porte le ticket"
+        );
+
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(&vols, &[]);
+        assert_eq!(verdicts.len(), 1);
+        assert!(
+            matches!(
+                verdicts[0].issue,
+                crate::milestone_manager::evaluator::FlightIssue::PrOpened { .. }
+            ),
+            "la ligne `Outcome:` de l'enfant doit atteindre l'évaluateur — reçu {:?}",
+            verdicts[0].issue
+        );
+        assert_eq!(
+            verdicts[0].recommendation,
+            crate::milestone_manager::evaluator::FlightRecommendation::MergeCandidate,
+            "une PR ouverte dont l'état n'est pas connu est un merge-candidat"
+        );
+    }
+
+    /// **AC2 — le contrôle négatif, et il est auto-nettoyant.** Un enfant qui
+    /// n'écrit aucune ligne `Outcome:` rend *toujours* `no_outcome_line` : le
+    /// correctif de mika#2886 fait lire le bon `result`, il n'invente pas
+    /// d'issue quand il n'y en a pas.
+    ///
+    /// Vert **avant comme après** le correctif, et c'est voulu : un contrôle
+    /// négatif qui aurait rougi avant ne contrôlerait rien — il mesurerait le
+    /// même défaut que l'AC1, par le même chemin.
+    #[tokio::test]
+    async fn mika2886_un_enfant_sans_ligne_outcome_reste_une_cause_non_classee() {
+        let db = Database::open_in_memory().unwrap();
+        seme_la_forme_reelle(
+            &db,
+            "Le pilote s'est arrêté sans rien conclure.\nTurns: 47\n",
+        );
+
+        let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
+        let vols = source
+            .finished_implement_flights(None, &[TICKET_2886.to_string()])
+            .await;
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(&vols, &[]);
+
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(
+            verdicts[0].issue,
+            crate::milestone_manager::evaluator::FlightIssue::Dead {
+                cause: crate::milestone_manager::evaluator::DeathCause::Unknown(
+                    "no_outcome_line".to_string()
+                )
+            },
+            "sans ligne `Outcome:`, la cause reste non classée"
+        );
+        assert_eq!(
+            verdicts[0].recommendation,
+            crate::milestone_manager::evaluator::FlightRecommendation::ManualResumption
+        );
+    }
+
     fn task_fixture() -> crate::task_state::tasks::Task {
         crate::task_state::tasks::Task {
             id: "task-1".into(),
