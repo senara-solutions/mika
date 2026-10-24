@@ -204,6 +204,14 @@ assert_refused "a pre-release target: the major is read before the dash" \
     1.4.0 v2.0.0-rc.1
 assert_passes  "the flag may come before the version (D2)" \
     1.4.0 v2.0.0 --allow-major-upgrade v2.0.0
+# The semver promise starts at v1.0: a 0.x installation carries none, so the
+# guard does not apply to it. 0.12.2 → v1.0.0 is the launch itself — refusing it
+# would turn every member's update into an error on launch day. assert_passes
+# also checks that no "major" line was printed.
+assert_passes  "a 0.x installation upgrades to v1.0.0 untouched: the promise starts at v1.0" \
+    0.12.2 v1.0.0 v1.0.0
+assert_passes  "a 0.x installation is outside the guard for any target major" \
+    0.12.2 v2.0.0 v2.0.0
 
 # ── Anchoring assertions ─────────────────────────────────────────────────────
 # A detector whose corpus is a single file can go green by losing its grip: if
