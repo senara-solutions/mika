@@ -146,7 +146,12 @@ if [ "${ALLOW_MAJOR}" -eq 0 ] && [ -e "${INSTALL_DIR}/${BINARY}" ]; then
     else
         INSTALLED_MAJOR=$(mika_major_of "${INSTALLED_VERSION}")
         TARGET_MAJOR=$(mika_major_of "${VERSION}")
-        if [ "${INSTALLED_MAJOR}" != "${TARGET_MAJOR}" ]; then
+        # A 0.x installation is outside the guard. The semver promise starts at
+        # v1.0, so a 0.x carries none to break; and 0.x → v1.0.0 is the launch
+        # itself — guarding it would turn every member's `curl … | sh` into an
+        # error on launch day. INSTALLED_MAJOR is digits (validated above), so
+        # the numeric test is safe.
+        if [ "${INSTALLED_MAJOR}" -ge 1 ] && [ "${INSTALLED_MAJOR}" != "${TARGET_MAJOR}" ]; then
             # The guide is anchored on the target tag, never on main: a link on
             # main describes today's version, not the one being migrated to.
             # release.yml refuses to prepare a tag whose docs/releases/vX.Y.Z.md
