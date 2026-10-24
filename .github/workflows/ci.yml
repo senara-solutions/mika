@@ -234,6 +234,44 @@ jobs:
           MIKA_INTERNAL_TOKEN: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
           MIKA_ROUTING_URL: "http://localhost:19999"
 
+  darwin-check:
+    name: Darwin Check (${{ matrix.target }})
+    runs-on: macos-14
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show  # reads rust-toolchain.toml
+          rustup target add "$TARGET"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        with:
+          prefix-key: v1-darwin-check
+          key: ${{ matrix.target }}
+
+      # `rust-embed` lit ce répertoire au build ; release.yml fait le même geste.
+      - name: Create dashboard dist placeholder
+        run: mkdir -p dashboard/dist
+
+      # `cargo check` et non `cargo build` : la classe de défaut visée est une
+      # erreur de RÉSOLUTION DE NOMS (E0433), qui tombe avant le link. `check`
+      # la voit entièrement, pour une fraction du temps d'un build release.
+      # `--locked` pour que le job échoue si `Cargo.lock` a bougé, comme release.yml.
+      # `-p mika-agent -p mika-cli` : les deux crates qui portent les binaires
+      # construits par release.yml (`mika-spirit` et `mika`).
+      - name: Check both darwin targets
+        run: cargo check --locked --target "$TARGET" -p mika-agent -p mika-cli
+
   dashboard:
     name: Dashboard
     runs-on: ubuntu-22.04
