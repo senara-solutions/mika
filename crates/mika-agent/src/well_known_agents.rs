@@ -4495,6 +4495,202 @@ mod tests {
         }
     }
 
+    // -- La réserve de mika#1580 est épinglée par valeur (mika#2888) --
+
+    /// **Livrée vide, et le détecteur plus bas assert qu'elle l'est.**
+    ///
+    /// Il n'y a rien à excuser à la livraison : les quatre spécifications de
+    /// [`WELL_KNOWN_AGENTS`] déclarent déjà `allow_authoring = false` — mika-dev
+    /// et mika-qa dans leurs constantes statiques, mika-arch dans le `format!`
+    /// de `build_mika_arch_identity` (voie `Computed`), mika-test dans la sienne.
+    /// Le détecteur est donc armé et vert au merge, sans aucune dérogation.
+    ///
+    /// **Quand ce détecteur tire, on ne l'excepte pas.** Une entrée ici serait une
+    /// ouverture de l'écriture de skills décidée hors de mika#1580, ce qui est
+    /// exactement ce que cette réserve interdit. Les deux seules issues légitimes
+    /// sont : rendre la valeur à `false`, ou modifier ce détecteur dans la PR de
+    /// mika#1580 en y citant la décision de Vincent (doctrine mika#2201 — un site
+    /// qu'on ne veut pas armer est un site à supprimer, pas à excepter).
+    ///
+    /// Ce n'est donc **pas un filtre** : le détecteur ne la consulte pas pour
+    /// blanchir un agent, il assert qu'elle est vide. Une entrée ajoutée fait
+    /// rougir le détecteur lui-même, pas seulement la revue — et l'exception ne
+    /// peut pas devenir stale, puisqu'il n'y en a aucune.
+    const ALLOW_AUTHORING_PIN_EXCEPTIONS: &[&str] = &[];
+
+    /// Retourne `None` quand la spécification épingle bien la réserve de
+    /// mika#1580, et `Some(<message nommant l'agent et ce qui cloche>)` sinon.
+    ///
+    /// Deux formes de violation, et une seule porte : la clé **absente** et la clé
+    /// à **`true`** sont toutes deux des manquements à la réserve. L'absence compte
+    /// parce que `skills.allow_authoring` est code-owned
+    /// ([`CODE_OWNED_IDENTITY_SECTIONS`]) : une spécification qui n'émet rien laisse
+    /// le réconciliateur sans valeur à imposer, et la valeur effective retombe sur
+    /// le défaut de `SkillsIdentityConfig::authoring_enabled()` — `false`
+    /// aujourd'hui, mais un défaut n'est pas une réserve, et il se change à un
+    /// autre endroit du code.
+    ///
+    /// Prend le TOML **rendu** en `&str` plutôt qu'un `&WellKnownAgent` : c'est ce
+    /// qui rend le prédicat exerçable sur un fixture, et donc ce qui arme les
+    /// recettes de rouge-avant AC2 et AC3 au-delà du jour de la PR.
+    fn allow_authoring_pin_violation(agent_name: &str, rendered_toml: &str) -> Option<String> {
+        let value: toml::Value = match toml::from_str(rendered_toml) {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(format!(
+                    "l'identité rendue de l'agent bien connu '{agent_name}' n'est pas \
+                     du TOML valide, donc la réserve de mika#1580 n'y est pas \
+                     lisible : {e}"
+                ));
+            }
+        };
+
+        match get_path(&value, "skills.allow_authoring") {
+            Some(v) if v.as_bool() == Some(false) => None,
+            Some(v) => Some(format!(
+                "l'agent bien connu '{agent_name}' déclare \
+                 skills.allow_authoring = {v} — la réserve de mika#1580 exige \
+                 `false`. La clé étant code-owned (CODE_OWNED_IDENTITY_SECTIONS), \
+                 cette valeur se propage à l'agent sur disque au démarrage suivant."
+            )),
+            None => Some(format!(
+                "l'agent bien connu '{agent_name}' n'émet pas \
+                 skills.allow_authoring — la clé est code-owned \
+                 (CODE_OWNED_IDENTITY_SECTIONS), donc une spécification muette laisse \
+                 le réconciliateur sans valeur à imposer et la valeur effective \
+                 retombe sur le défaut de SkillsIdentityConfig::authoring_enabled(). \
+                 Un défaut n'est pas la réserve de mika#1580 : déclare \
+                 `allow_authoring = false` explicitement."
+            )),
+        }
+    }
+
+    /// AC1 de mika#2888 — chaque spécification bien connue épingle
+    /// `skills.allow_authoring = false`, et un échec nomme l'agent fautif.
+    ///
+    /// Énumère [`WELL_KNOWN_AGENTS`] et marche le chemin avec [`get_path`] : c'est,
+    /// terme pour terme, la source et le marcheur du réconciliateur
+    /// (`reconcile_well_known_identity`). Un cinquième agent bien connu est donc
+    /// couvert sans édition de ce test, et mika-arch est couvert par sa voie
+    /// `Computed` — la valeur testée est celle que l'agent reçoit vraiment, pas
+    /// celle qu'un littéral laisse croire.
+    ///
+    /// **Rouge-avant joué à la main pendant l'implémentation** (plan mika#2888,
+    /// étapes 5–6), les deux fois avec retour en arrière et vert retrouvé :
+    /// - `MIKA_DEV_IDENTITY` passée à `allow_authoring = true` → rouge, message
+    ///   nommant `mika-dev` et citant la valeur `true`.
+    /// - ligne retirée du `format!` de `build_mika_arch_identity` → rouge, message
+    ///   nommant `mika-arch` sur la branche « clé absente ». C'est la recette qui
+    ///   atteste que la voie non-littérale est bien couverte — aucun scan textuel
+    ///   du source ne l'aurait vue.
+    #[test]
+    fn mika2888_les_agents_bien_connus_epinglent_allow_authoring_false() {
+        assert!(
+            ALLOW_AUTHORING_PIN_EXCEPTIONS.is_empty(),
+            "ALLOW_AUTHORING_PIN_EXCEPTIONS est livrée vide et doit le rester : une \
+             entrée serait une ouverture de l'écriture de skills décidée hors de \
+             mika#1580. Lis son doc-comment — les deux seules issues sont de rendre \
+             la valeur à `false`, ou de modifier ce détecteur dans la PR de mika#1580 \
+             en citant la décision de Vincent. Entrées trouvées : {ALLOW_AUTHORING_PIN_EXCEPTIONS:?}"
+        );
+
+        let settings = test_settings_with_kg_roots();
+        let mut violations = Vec::new();
+
+        for spec in WELL_KNOWN_AGENTS {
+            // Pas de `Err(_) => continue` ici, contrairement aux deux détecteurs
+            // voisins : `render_identity_content` ne rend `Err` que sur la voie
+            // `Computed` de mika-arch quand `kg_docs_roots` est absent, et
+            // `test_settings_with_kg_roots()` le peuple. Un `Err` sous ces
+            // settings-là est un défaut, et `continue` le transformerait en
+            // couverture silencieusement perdue — mika-arch sauté, test vert,
+            // réserve non épinglée chez l'agent qui lit le plus de code.
+            let content = render_identity_content(spec, &settings).unwrap_or_else(|e| {
+                panic!(
+                    "le RENDU de l'identité a échoué pour l'agent bien connu '{}' — ce \
+                     n'est PAS une violation de la réserve de mika#1580, c'est un agent \
+                     que ce détecteur ne couvre pas encore. Complète \
+                     test_settings_with_kg_roots() avec le setting manquant. Cause : {e}",
+                    spec.name
+                )
+            });
+
+            if let Some(violation) = allow_authoring_pin_violation(spec.name, &content) {
+                violations.push(violation);
+            }
+        }
+
+        // Collecte complète avant l'assertion : un seul run doit nommer les quatre
+        // fautifs s'il y en a quatre, pas seulement le premier.
+        assert!(
+            violations.is_empty(),
+            "la réserve de mika#1580 n'est plus épinglée par {} spécification(s) \
+             bien connue(s) :\n  - {}",
+            violations.len(),
+            violations.join("\n  - ")
+        );
+    }
+
+    /// Contrôle positif du prédicat — sans lui, un helper qui rendrait `Some`
+    /// inconditionnellement passerait les deux tests de fixture ci-dessous.
+    #[test]
+    fn mika2888_la_valeur_conforme_nest_pas_une_violation() {
+        assert_eq!(
+            allow_authoring_pin_violation(
+                "agent-fictif-conforme",
+                "[skills]\nallow_authoring = false\n"
+            ),
+            None,
+            "`allow_authoring = false` EST la réserve de mika#1580 — le prédicat ne \
+             doit rien signaler"
+        );
+    }
+
+    /// AC2 de mika#2888, armé — une spécification qui déclare `true` est une
+    /// violation, et le message nomme l'agent.
+    #[test]
+    fn mika2888_une_valeur_a_true_est_une_violation_qui_nomme_lagent() {
+        let violation =
+            allow_authoring_pin_violation("agent-fictif-ac2", "[skills]\nallow_authoring = true\n")
+                .expect(
+                    "`allow_authoring = true` doit être une violation de la réserve de \
+                     mika#1580",
+                );
+
+        // AC1 n'est pas « le test échoue », c'est « il nomme le fautif » : seule une
+        // assertion sur le texte du message le vérifie.
+        assert!(
+            violation.contains("agent-fictif-ac2"),
+            "le message de violation doit nommer l'agent fautif — obtenu : {violation}"
+        );
+        assert!(
+            violation.contains("allow_authoring"),
+            "le message doit nommer la clé en cause — obtenu : {violation}"
+        );
+    }
+
+    /// AC3 de mika#2888, armé — une spécification bien connue qui n'émet pas la
+    /// clé est elle aussi une violation, et le message nomme l'agent.
+    #[test]
+    fn mika2888_une_cle_absente_est_une_violation_qui_nomme_lagent() {
+        let violation =
+            allow_authoring_pin_violation("agent-fictif-ac3", "[skills]\nnudge_enabled = false\n")
+                .expect(
+                    "une spécification sans skills.allow_authoring laisse le \
+                     réconciliateur sans valeur à imposer — c'est une violation, pas \
+                     une abstention",
+                );
+
+        assert!(
+            violation.contains("agent-fictif-ac3"),
+            "le message de violation doit nommer l'agent fautif — obtenu : {violation}"
+        );
+        assert!(
+            violation.contains("allow_authoring"),
+            "le message doit nommer la clé manquante — obtenu : {violation}"
+        );
+    }
+
     // -- Config reconciliation tests (mika#1633) --
 
     fn read_config(home: &Path, agent_name: &str) -> String {
