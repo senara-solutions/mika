@@ -258,6 +258,8 @@ jobs:
         with:
           prefix-key: v1-darwin-check
           key: ${{ matrix.target }}
+          # Sauvegarde sur main seulement : le cache Actions est à 8,30 Go sur 10, les PR ne doivent pas évincer celui de Check (mika#2902 AC3).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # `rust-embed` lit ce répertoire au build ; release.yml fait le même geste.
       - name: Create dashboard dist placeholder
