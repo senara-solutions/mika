@@ -604,6 +604,13 @@ jobs:
       # be served to the family.
       - name: A release candidate tag is classified prerelease (mika#2890)
         run: make check-release-tag
+      # The other half of the same promise: from v1.0 a breaking change ships as
+      # a major version with a migration guide, and `curl … | sh` is exactly the
+      # path that would carry someone from 1.x to 2.x without a word. The suite
+      # intercepts curl and reads its call log, so "nothing was replaced" is
+      # measured rather than inferred from a successful install.
+      - name: install.sh stops before a major change and names the migration guide (mika#2897)
+        run: make check-install-major-gate
       # The load-bearing invariant of the mika#893 factorisation: dev-pilot and
       # dev-groom differ only by their entry slash command. Pure structural diff
       # over two tracked files.

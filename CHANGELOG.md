@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- *(install)* `install.sh` stops before a major change instead of replacing the binary in silence: it reads the version in `INSTALL_DIR`, and when the target changes the major number it exits non-zero before requesting any archive, naming both versions and the migration guide of the target release. `--allow-major-upgrade` installs anyway once the migration is done; `-h`/`--help` prints the usage. An absent installation, or one of the same major, is unaffected (mika#2897).
+
 ## [v1.0.0](https://github.com/senara-solutions/mika/releases/tag/v1.0.0)
 
 First numbered 1.0 release, gathering the 942 commits since v0.12.2. Release notes for users:
