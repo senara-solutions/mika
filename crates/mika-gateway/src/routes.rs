@@ -1144,14 +1144,38 @@ fn token_validation_error_body(err: &TelegramApiError) -> serde_json::Value {
     body
 }
 
+/// Machine code of the "the username does not match the bot" refusal.
+///
+/// **A wire format.** mika-cloud#230 AC1 classifies this cause on this symbol, to
+/// send the user back to fix the *username* and not the *token*. Changing the value
+/// is a cross-repo break to be dated, never a rename — to the letter of what
+/// [`INVALID_BOT_TOKEN_MESSAGE`] says of its own.
+///
+/// **Lowercase `snake_case`, and that is the consumer's casing, not a style
+/// choice.** `classify_gateway_error` (mika-cloud) already carries a
+/// `code == "invalid_bot_token"` rung in that form; one vocabulary across both
+/// repos is the point, so a second casing for the same kind of symbol would be the
+/// cross-repo lookup table mika#2191 KTD1 declined to create. mika#2908's body
+/// proposed `BOT_USERNAME_MISMATCH` "for example" — the naming decision
+/// (samidarko, 2026-10-25) settles the lowercase form.
+///
+/// `mika2908_ac1_le_mismatch_porte_son_code` asserts the string **in full** rather
+/// than against this constant, for the reason spelled out there.
+const BOT_USERNAME_MISMATCH_CODE: &str = "bot_username_mismatch";
+
 /// Error body for a `bot_username` that does not match what `getMe` returned.
 ///
 /// Extracted from the handler so AC3 is asserted rather than deduced by reading it:
 /// this branch lives on the `Ok` arm — the upstream answered 200 and refused
-/// nothing — so it carries **no** `upstream_status`.
+/// nothing — so it carries **no** `upstream_status`. Its closed field is
+/// [`BOT_USERNAME_MISMATCH_CODE`] instead (mika#2908): the one cause on this path
+/// that `upstream_status` cannot express without claiming a refusal that never
+/// happened. The two fields stay disjoint — a token refusal carries no `code`
+/// (`mika2908_ac2_aucun_refus_de_token_ne_porte_ce_code`).
 fn bot_username_mismatch_body(provided: &str, actual: &str) -> serde_json::Value {
     serde_json::json!({
-        "error": format!("bot_username mismatch: provided '{provided}' but Telegram returned '{actual}'")
+        "error": format!("bot_username mismatch: provided '{provided}' but Telegram returned '{actual}'"),
+        "code": BOT_USERNAME_MISMATCH_CODE
     })
 }
 
@@ -4418,6 +4442,117 @@ mod tests {
             assert_eq!(
                 total, 1,
                 "the literal must have exactly one production site (the constant); found: {sites:?}"
+            );
+        }
+    }
+
+    /// mika#2908 — the `bot_username` mismatch carries a closed machine code.
+    ///
+    /// Same shape as [`mika2191_upstream_status`] above, and for the same reason:
+    /// these assert the **body**, not the handler. The two modules hold disjoint
+    /// vocabularies on purpose — `upstream_status` answers "did the upstream refuse,
+    /// and with what status", which this branch cannot answer at all (it lives on the
+    /// `Ok` arm of `get_me`), so the mismatch needed the only other closed field
+    /// available. Nothing here modifies a mika#2191 test.
+    mod mika2908_code_du_mismatch {
+        use super::*;
+
+        /// AC1 — the mismatch body carries `code`, with a value fixed by the wire.
+        ///
+        /// **Deliberately not `== BOT_USERNAME_MISMATCH_CODE`.** Same doctrine as
+        /// `mika2191_ac2_le_message_du_401_est_un_format_de_fil`: asserting against
+        /// the constant would prove nothing, since whoever renamed the symbol would
+        /// move both sides at once, pass this test, and break the consumer
+        /// (mika-cloud#230 AC1 classifies on this exact string). The literal is
+        /// written out in full so a rename reddens here and becomes a cross-repo
+        /// break to be dated.
+        ///
+        /// The second half asserts the value does **not** depend on the arguments: a
+        /// code interpolating the usernames would look closed and classify as badly
+        /// as the prose it replaces.
+        ///
+        /// **The casing is part of what is asserted.** `bot_username_mismatch` is the
+        /// consumer's form (`classify_gateway_error` already matches
+        /// `code == "invalid_bot_token"`), so an "equivalent" uppercase rename is a
+        /// break, and reddening here is what dates it.
+        #[test]
+        fn mika2908_ac1_le_mismatch_porte_son_code() {
+            let body = bot_username_mismatch_body("wanted_bot", "actual_bot");
+            assert_eq!(
+                body["code"].as_str(),
+                Some("bot_username_mismatch"),
+                "mika-cloud#230 AC1 classifies the mismatch on this exact symbol: {body}"
+            );
+
+            let other = bot_username_mismatch_body("a_completely_different", "pair_of_names");
+            assert_eq!(
+                other["code"].as_str(),
+                body["code"].as_str(),
+                "the code must be fixed, never derived from provided/actual: {other}"
+            );
+        }
+
+        /// AC2 — no token-refusal body carries this code, on any branch.
+        ///
+        /// **A non-regression guard: green before as after**, and that is said
+        /// rather than dressed up as a red. It reddens the day someone decides the
+        /// two vocabularies should overlap — which the plan's first non-goal refuses,
+        /// because `upstream_status` already answers the question the token branch
+        /// asks, and a second symbol for it is the cross-repo lookup table
+        /// mika#2191 KTD1 declined to create.
+        ///
+        /// The six variants are the ones `mika2191_la_cle_error_est_toujours_presente`
+        /// already enumerates — the enum is closed, so this is a case table.
+        #[test]
+        fn mika2908_ac2_aucun_refus_de_token_ne_porte_ce_code() {
+            for err in [
+                TelegramApiError::Unauthorized,
+                TelegramApiError::BotBlocked,
+                TelegramApiError::RateLimited {
+                    retry_after: Some(30),
+                },
+                TelegramApiError::BadRequest {
+                    message: "nope".to_string(),
+                },
+                TelegramApiError::Other {
+                    status: 502,
+                    body: String::new(),
+                },
+                TelegramApiError::Other {
+                    status: 200,
+                    body: "unusable".to_string(),
+                },
+            ] {
+                let body = token_validation_error_body(&err);
+                assert!(
+                    body.get("code").is_none(),
+                    "a token refusal must carry no `code` key: {err:?} → {body}"
+                );
+            }
+        }
+
+        /// AC3 — the mismatch's `error` is unchanged, and it still carries no
+        /// `upstream_status`.
+        ///
+        /// Also a non-regression guard, green before as after. The message stays a
+        /// wire format until mika-cloud#230 AC1 switches its classifier onto `code`:
+        /// reword it today and both paths break on the same day, so it is asserted in
+        /// full. The `upstream_status` half restates mika#2191's negative control
+        /// from this side, so the two fields stay disjoint by test and not by
+        /// goodwill.
+        #[test]
+        fn mika2908_ac3_le_message_du_mismatch_est_inchange() {
+            let body = bot_username_mismatch_body("wanted_bot", "actual_bot");
+            assert_eq!(
+                body["error"].as_str(),
+                Some(
+                    "bot_username mismatch: provided 'wanted_bot' but Telegram returned 'actual_bot'"
+                ),
+                "mika-cloud's textual classifier still reads this message: {body}"
+            );
+            assert!(
+                body.get("upstream_status").is_none(),
+                "the mismatch lives on the `Ok` arm — there is no upstream status to carry: {body}"
             );
         }
     }

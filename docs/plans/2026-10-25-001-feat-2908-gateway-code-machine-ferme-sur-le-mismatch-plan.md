@@ -47,7 +47,7 @@ peut pas aboutir.
 
 - **R1.** Le corps rendu par `bot_username_mismatch_body` contient une clé
   `code`, de valeur fixe et indépendante de `provided` / `actual`. (AC1)
-- **R2.** La valeur est exactement `BOT_USERNAME_MISMATCH`, et un test l'asserte
+- **R2.** La valeur est exactement `bot_username_mismatch`, et un test l'asserte
   **en toutes lettres**, pas contre la constante qui la porte. (AC1)
 - **R3.** Les corps de `token_validation_error_body` sont inchangés sur
   **toutes** leurs variantes, et aucun ne porte de clé `code`. (AC2)
@@ -108,15 +108,17 @@ le teste.
 ### D2 — La valeur, et qui l'arbitre
 
 mika#2191 n'arbitrait rien : le consommateur avait déjà fixé `upstream_status`,
-entier. Ici, **personne ne l'a fixée**. mika-cloud#230 AC1 parle de « cause
-distincte » et AC3 de « code machine », sans nommer de symbole ; le corps de
-mika#2908 propose `"code": "BOT_USERNAME_MISMATCH"`. Ce dépôt tranche donc, et
-prend la valeur du ticket telle quelle — inventer un synonyme
-(`bot_username_mismatch`, `USERNAME_MISMATCH`) laisserait les deux dépôts
-attendre l'autre, pour un gain nul.
+entier. Ici, la valeur **est fixée** par le consommateur unique,
+`classify_gateway_error` (mika-cloud `api/src/services/provisioning.rs`), qui
+a déjà un barreau `code == "invalid_bot_token"` en `snake_case` minuscule. Un
+seul vocabulaire des deux côtés est voulu : la forme minuscule fait foi, et le
+corps du ticket proposait `BOT_USERNAME_MISMATCH` en majuscules « par exemple » —
+la décision de nommage (samidarko, 2026-10-25) fixe `"bot_username_mismatch"`
+en minuscules. Inventer un synonyme en majuscules laisserait les deux dépôts
+avec deux casse différentes pour le même concept, pour un gain nul.
 
-`SCREAMING_SNAKE` plutôt que `snake_case` : c'est la forme du ticket, et elle
-distingue à l'œil un symbole de protocole d'une clé JSON ordinaire.
+`snake_case` minuscule plutôt que `SCREAMING_SNAKE` : alignement sur le
+classifieur de la console, qui est le seul lecteur de ce code machine.
 
 ### D3 — Une constante, et un test qui ne l'utilise pas
 
@@ -127,12 +129,12 @@ distingue à l'œil un symbole de protocole d'une clé JSON ordinaire.
 /// pour renvoyer l'utilisateur corriger l'username et non le token. En changer
 /// la valeur est une rupture inter-dépôt à dater, jamais un renommage — à la
 /// lettre de ce que dit [`INVALID_BOT_TOKEN_MESSAGE`] de la sienne.
-const BOT_USERNAME_MISMATCH_CODE: &str = "BOT_USERNAME_MISMATCH";
+const BOT_USERNAME_MISMATCH_CODE: &str = "bot_username_mismatch";
 ```
 
 La constante existe pour **porter ce doc comment au bon endroit**, pas pour
 factoriser un site unique. Et le test d'AC1 asserte le littéral
-`"BOT_USERNAME_MISMATCH"` écrit en toutes lettres, **pas** la constante : la
+`"bot_username_mismatch"` écrit en toutes lettres, **pas** la constante : la
 doctrine est déjà écrite dans ce fichier
 (`mika2191_ac2_le_message_du_401_est_un_format_de_fil`, `routes.rs:4292-4299`) —
 asserter contre la constante ne prouverait rien, puisque qui la renommerait
@@ -197,7 +199,7 @@ Un nouveau module `mod mika2908_code_du_mismatch`, voisin de
 `mika2191_upstream_status`, qui ne modifie aucun test existant.
 
 - **V1 (AC1) — `mika2908_ac1_le_mismatch_porte_son_code`.** Le corps porte
-  `code == "BOT_USERNAME_MISMATCH"`, littéral en toutes lettres, et la valeur ne
+  `code == "bot_username_mismatch"`, littéral en toutes lettres, et la valeur ne
   dépend pas des arguments : deux appels avec des couples `(provided, actual)`
   différents rendent le même `code`. **Rougit sur `origin/main`** — la clé est
   absente aujourd'hui.
@@ -244,7 +246,7 @@ curl -s -X POST "$GATEWAY/admin/customers" \
   | jq '{error, code, upstream_status}'
 ```
 
-- `code: "BOT_USERNAME_MISMATCH"` + `error` inchangé + `upstream_status: null` →
+- `code: "bot_username_mismatch"` + `error` inchangé + `upstream_status: null` →
   régime attendu, AC1 de mika-cloud#230 peut être réveillé.
 - `code: null` → **halte : établir la version déployée avant de toucher au
   code.** `GET /version` du gateway, et comparer son `git_hash` au commit de
@@ -294,10 +296,10 @@ classifier et l'écran qui renvoie corriger l'username).*
 
 ## Assumptions
 
-- **A1.** mika-cloud#230 AC1 acceptera le symbole `BOT_USERNAME_MISMATCH` tel
-  quel. Rien ne le fixe à date (D2), et le corps de mika#2908 le propose. Si la
-  console préfère une autre forme, le correctif est d'une ligne dans la
-  constante, plus la même ligne dans le test de V1.
+- **A1.** mika-cloud#230 AC1 acceptera le symbole `bot_username_mismatch` tel
+  quel. La valeur est fixée par le consommateur unique (D2) : `classify_gateway_error`
+  a déjà un barreau `code == "invalid_bot_token"` en `snake_case` minuscule, et la
+  décision de nommage (samidarko, 2026-10-25) aligne ce symbole sur la même casse.
 - **A2.** Aucun consommateur actuel ne rejette un corps JSON portant une clé
   supplémentaire. Le seul lecteur connu est `classify_gateway_error`
   (mika-cloud), qui lit `error` et `upstream_status` par nom.
