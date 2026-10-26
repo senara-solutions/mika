@@ -2269,7 +2269,7 @@ mod tests {
         assert_eq!(v.turns_used, Some(83));
         assert!(
             body.report_markdown.contains(
-                "### Vols terminés depuis le cycle précédent (mode ombre — aucune écriture)"
+                "### Vols terminés depuis le cycle précédent (toute la boucle — mode ombre, aucune écriture)"
             ),
             "la section doit apparaître :\n{}",
             body.report_markdown

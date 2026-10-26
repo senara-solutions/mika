@@ -37,7 +37,9 @@
 //! reintroduce it. Do NOT reorder these four write_* calls in `Reporter::report`
 //! without an explicit Prime override captured in a follow-up plan.
 
-use super::evaluator::{DeathCause, FlightIssue, FlightRecommendation, FlightVerdict};
+use super::evaluator::{
+    DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, PrStateKnowledge,
+};
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
 use super::reader::priority_from_labels;
@@ -223,10 +225,16 @@ impl Reporter {
         //
         // MODE OMBRE : cette section est la seule destination du verdict. Rien
         // ici n'écrit sur la forge.
+        //
+        // Le titre nomme le périmètre depuis mika#2921 : la section couvre
+        // **toute la boucle** — tout vol `implement` terminé sur un dépôt sous
+        // contrôle — là où le reste du rapport reste par milestone. Sans cette
+        // mention, un opérateur lirait les vols hors milestone cible comme un
+        // débordement du rapport au lieu de son périmètre déclaré.
         if !assessment.flight_verdicts.is_empty() {
             writeln!(
                 out,
-                "### Vols terminés depuis le cycle précédent (mode ombre — aucune écriture)"
+                "### Vols terminés depuis le cycle précédent (toute la boucle — mode ombre, aucune écriture)"
             )
             .unwrap();
             for v in &assessment.flight_verdicts {
@@ -696,20 +704,83 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
 
 /// Un verdict de vol en une ligne de liste Markdown.
 ///
-/// Forme : `- #<ticket> — <issue> — <tours> — <recommandation>`. Chacun des
-/// quatre segments dit explicitement quand il ne sait pas, parce qu'un segment
-/// manquant décale la lecture et qu'un `0` par défaut mentirait.
+/// Forme (mika#2921) :
+/// `- <dépôt>#<ticket> — <milestone> — <issue> — <tours> — [<état de PR> —] <recommandation>`.
+///
+/// Chaque segment dit explicitement quand il ne sait pas, parce qu'un segment
+/// manquant décale la lecture et qu'un `0` par défaut mentirait. Deux segments
+/// sont nés de l'élargissement du périmètre à toute la boucle :
+///
+/// - **le dépôt**, parce que deux vols de deux dépôts peuvent porter le même
+///   numéro de ticket (`mika#193` et `mika-cloud#193` existent tous les deux) et
+///   que depuis mika#2921 ils se lisent dans la même section ;
+/// - **l'appartenance au milestone cible**, qui est ce que le rapport *sait* :
+///   pour un vol hors cible le milestone réel n'a pas été lu, donc il n'est pas
+///   rendu — l'absence nommée est l'absence du milestone **cible**, jamais une
+///   prétention sur l'appartenance du ticket à un autre milestone.
+///
+/// Le segment d'état de PR, lui, est **omis** quand l'état a été lu et trouvé
+/// vide ([`PrStateKnowledge::Read(None)`]) : un vol du milestone cible sans PR
+/// connue ne gagne pas un segment qui ne dit rien. C'est aussi ce qui laisse
+/// intact le rendu de la population d'avant mika#2921.
 pub fn render_flight_verdict(v: &FlightVerdict) -> String {
-    let ticket = match v.issue_number {
-        Some(n) => format!("#{n}"),
-        None => "(ticket inconnu)".to_string(),
+    let mut segments = vec![
+        flight_ticket_label(v),
+        flight_milestone_label(&v.pr_state).to_string(),
+        flight_issue_label(&v.issue),
+        flight_turns_label(v),
+    ];
+    if let Some(etat) = flight_pr_state_label(&v.pr_state) {
+        segments.push(etat);
+    }
+    segments.push(flight_recommendation_label(v.recommendation).to_string());
+    format!("- {}", segments.join(" — "))
+}
+
+/// `<dépôt court>#<numéro>` — l'adresse du ticket telle qu'un humain l'écrit.
+///
+/// Le dépôt est rendu **court** (`mika`, `mika-cloud`), parce que c'est la forme
+/// que le ticket, les PR et les messages de commit emploient, et que le
+/// périmètre jugé est d'un seul propriétaire par construction (il vient de
+/// `DISPATCHABLE_REPOS`).
+///
+/// `(ticket inconnu)` est conservé **tel quel** quand le numéro manque : sans
+/// numéro, le dépôt ne désigne rien de lisible. Et un numéro sans dépôt dit
+/// `(dépôt inconnu)#<n>` plutôt qu'un `#<n>` nu, parce que le `#<n>` nu est
+/// exactement l'ambiguïté que le champ `repo` existe pour lever.
+fn flight_ticket_label(v: &FlightVerdict) -> String {
+    let Some(n) = v.issue_number else {
+        return "(ticket inconnu)".to_string();
     };
-    format!(
-        "- {ticket} — {issue} — {turns} — {reco}",
-        issue = flight_issue_label(&v.issue),
-        turns = flight_turns_label(v),
-        reco = flight_recommendation_label(v.recommendation),
-    )
+    match v.repo.as_deref() {
+        Some(repo) => {
+            let court = repo.rsplit('/').next().unwrap_or(repo);
+            format!("{court}#{n}")
+        }
+        None => format!("(dépôt inconnu)#{n}"),
+    }
+}
+
+/// Ce que le rapport sait de l'appartenance du vol au milestone cible.
+///
+/// La connaissance de l'état de PR *est* celle de l'appartenance : le `Reader`
+/// n'hydrate que les sous-issues du milestone cible, donc un appariement réussi
+/// dit « ce ticket est dans la cible » et un échec dit « il n'y est pas ». Les
+/// deux faits ont une seule source, et ce rendu ne la dédouble pas.
+fn flight_milestone_label(pr_state: &PrStateKnowledge) -> &'static str {
+    match pr_state {
+        PrStateKnowledge::Read(_) => "milestone cible",
+        PrStateKnowledge::NotRead => "hors milestone cible",
+    }
+}
+
+/// L'état de la PR, ou le fait qu'il n'a pas été lu — `None` pour « lu et vide ».
+fn flight_pr_state_label(pr_state: &PrStateKnowledge) -> Option<String> {
+    match pr_state {
+        PrStateKnowledge::Read(Some(etat)) => Some(format!("PR {etat}")),
+        PrStateKnowledge::Read(None) => None,
+        PrStateKnowledge::NotRead => Some("état de PR non lu".to_string()),
+    }
 }
 
 fn flight_issue_label(issue: &FlightIssue) -> String {
@@ -759,7 +830,6 @@ fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::milestone_manager::evaluator::PrStateKnowledge;
     use crate::milestone_manager::pool::{
         PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause, assess_pool,
         assess_pool_sans_tailles,
@@ -901,23 +971,25 @@ mod tests {
         ]);
         assert!(
             out.contains(
-                "### Vols terminés depuis le cycle précédent (mode ombre — aucune écriture)"
+                "### Vols terminés depuis le cycle précédent (toute la boucle — mode ombre, aucune écriture)"
             ),
-            "le titre doit dire le mode ombre. Obtenu :\n{out}"
+            "le titre doit dire le périmètre ET le mode ombre. Obtenu :\n{out}"
         );
         assert!(
             out.contains(
-                "- #2693 — PR ouverte (#2696) — 83 tours (plafond non instrumenté) — merge-candidat"
+                "- mika#2693 — milestone cible — PR ouverte (#2696) — 83 tours (plafond non instrumenté) — merge-candidat"
             ),
             "Obtenu :\n{out}"
         );
         assert!(
-            out.contains("- #2661 — mort au plafond (budget_exhausted) — 200 tours — re-groom"),
+            out.contains(
+                "- mika#2661 — milestone cible — mort au plafond (budget_exhausted) — 200 tours — re-groom"
+            ),
             "Obtenu :\n{out}"
         );
         assert!(
             out.contains(
-                "- #2655 — PR de sauvetage (#2690) — 141 tours (plafond non instrumenté) — reprise à la main"
+                "- mika#2655 — milestone cible — PR de sauvetage (#2690) — 141 tours (plafond non instrumenté) — reprise à la main"
             ),
             "Obtenu :\n{out}"
         );
@@ -974,7 +1046,7 @@ mod tests {
         )]);
         assert!(
             out.contains(
-                "- (ticket inconnu) — mort — cause non classée (PLAN_COMMITTED) — \
+                "- (ticket inconnu) — milestone cible — mort — cause non classée (PLAN_COMMITTED) — \
                  tours non lus (plafond non instrumenté) — reprise à la main"
             ),
             "Obtenu :\n{out}"
@@ -1029,6 +1101,156 @@ mod tests {
             }),
             "PR de sauvetage (numéro inconnu)"
         );
+    }
+
+    // -- mika#2921 : la ligne porte le dépôt, le milestone et la lecture --
+
+    /// Un verdict hors milestone cible — donc non apparié, donc `NotRead`.
+    fn verdict_hors_cible(issue_number: Option<u64>, repo: Option<&str>) -> FlightVerdict {
+        FlightVerdict {
+            pr_state: PrStateKnowledge::NotRead,
+            repo: repo.map(str::to_string),
+            ..verdict(
+                issue_number,
+                FlightIssue::PrOpened {
+                    number: Some(9001),
+                    url: None,
+                },
+                Some(42),
+                false,
+                FlightRecommendation::MergeCandidate,
+            )
+        }
+    }
+
+    /// AC5 côté rendu : un vol hors cible **nomme** sa non-lecture, et ne rend
+    /// aucun numéro de milestone.
+    ///
+    /// Le contrôle positif est dans le même test, et c'est lui qui rend
+    /// l'assertion concluante : un rendu qui dirait « non lu » partout passerait
+    /// la première moitié. Les deux arms côte à côte séparent « le type est
+    /// correct » de « le rendu est branché ».
+    #[test]
+    fn mika2921_un_vol_hors_cible_nomme_sa_non_lecture_et_pas_son_milestone() {
+        let hors = render_flight_verdict(&verdict_hors_cible(
+            Some(2900),
+            Some("senara-solutions/mika"),
+        ));
+        assert_eq!(
+            hors,
+            "- mika#2900 — hors milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — état de PR non lu — merge-candidat",
+        );
+
+        let dans = render_flight_verdict(&FlightVerdict {
+            pr_state: PrStateKnowledge::Read(Some("open".into())),
+            ..verdict_hors_cible(Some(2900), Some("senara-solutions/mika"))
+        });
+        assert_eq!(
+            dans,
+            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — PR open — merge-candidat",
+        );
+        assert!(
+            !dans.contains("non lu"),
+            "un état lu ne se rend jamais comme non lu. Obtenu : {dans}"
+        );
+    }
+
+    /// « Lu, et vide » ne gagne **aucun** segment : cinq segments, pas six.
+    ///
+    /// C'est ce qui laisse le rendu de la population d'avant mika#2921 intact —
+    /// un segment vide serait du bruit sur chaque vol du milestone cible sans PR.
+    #[test]
+    fn mika2921_un_etat_lu_et_vide_ne_gagne_aucun_segment() {
+        let ligne = render_flight_verdict(&FlightVerdict {
+            pr_state: PrStateKnowledge::Read(None),
+            ..verdict_hors_cible(Some(2900), Some("senara-solutions/mika"))
+        });
+        assert_eq!(
+            ligne,
+            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — merge-candidat",
+        );
+        assert!(
+            !ligne.contains("PR open") && !ligne.contains("non lu"),
+            "aucun segment d'état quand l'état lu est vide. Obtenu : {ligne}"
+        );
+    }
+
+    /// Le dépôt est rendu court, et il **distingue** : `mika#193` et
+    /// `mika-cloud#193` sont deux vols, pas un seul lu deux fois.
+    #[test]
+    fn mika2921_le_depot_court_distingue_deux_vols_de_meme_numero() {
+        let mika = render_flight_verdict(&verdict_hors_cible(
+            Some(193),
+            Some("senara-solutions/mika"),
+        ));
+        let cloud = render_flight_verdict(&verdict_hors_cible(
+            Some(193),
+            Some("senara-solutions/mika-cloud"),
+        ));
+        assert!(mika.starts_with("- mika#193 — "), "obtenu : {mika}");
+        assert!(cloud.starts_with("- mika-cloud#193 — "), "obtenu : {cloud}");
+        assert_ne!(mika, cloud);
+    }
+
+    /// Un numéro sans dépôt le dit. Un `#193` nu est exactement l'ambiguïté que
+    /// le champ `repo` existe pour lever — le rendre nu la réintroduirait.
+    #[test]
+    fn mika2921_un_numero_sans_depot_ne_se_lit_pas_comme_un_depot_connu() {
+        let ligne = render_flight_verdict(&verdict_hors_cible(Some(193), None));
+        assert!(
+            ligne.starts_with("- (dépôt inconnu)#193 — "),
+            "obtenu : {ligne}"
+        );
+    }
+
+    /// **AC4, octet pour octet.** Sur la même entrée, tout ce qui n'est pas la
+    /// section « Vols terminés » rend les mêmes octets qu'avant mika#2921.
+    ///
+    /// Les deux moitiés sont figées ici plutôt que comparées entre deux appels :
+    /// un golden écrit à la main est ce qui rougit sur un changement, là où deux
+    /// appels du même code rendraient toujours la même chose.
+    #[test]
+    fn mika2921_le_rapport_par_milestone_rend_les_memes_octets() {
+        let out = report_with_verdicts(vec![verdict(
+            Some(2693),
+            FlightIssue::PrOpened {
+                number: Some(2696),
+                url: None,
+            },
+            Some(83),
+            false,
+            FlightRecommendation::MergeCandidate,
+        )]);
+
+        const AVANT: &str = concat!(
+            "## Milestone: Luminescent Core reconciliation [senara-solutions/mika#1799]\n",
+            "\n",
+            "### État\n",
+            "- Progress: 0/0 sub-issues complete (0% done)\n",
+            "- Completed: (none)\n",
+            "- In-flight: (none)\n",
+            "- Blocked: (none)\n",
+            "- Unstarted: (none)\n",
+            "\n",
+            "### Next action (recommendation)\n",
+            "- Next: — milestone complete — no open sub-issues remain\n",
+            "\n",
+        );
+        const APRES: &str = concat!(
+            "### Silent-progress / drift alerts\n",
+            "- (none)\n",
+            "\n",
+            "### Cross-cutting concerns (from mika-arch-groom-milestone)\n",
+            "- (none — Phase 1: hydration deferred to Phase 1.5)\n",
+        );
+
+        let debut = out.find("### Vols terminés").expect("section présente");
+        let fin = debut
+            + out[debut..]
+                .find("### Silent-progress")
+                .expect("la dérive suit les vols");
+        assert_eq!(&out[..debut], AVANT, "les sections d'avant ont bougé");
+        assert_eq!(&out[fin..], APRES, "les sections d'après ont bougé");
     }
 
     // -- mika#1948 AC6: the Dispatch contention section --
