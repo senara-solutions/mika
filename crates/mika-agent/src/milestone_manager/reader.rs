@@ -1363,6 +1363,171 @@ mod tests {
         assert_eq!(s1680.pr_link_source, None);
     }
 
+    // -----------------------------------------------------------------
+    // mika#2924 R7 — la résolution du lien de PR a un lecteur unique.
+    // -----------------------------------------------------------------
+
+    /// Les trois aiguilles de la résolution du lien ticket ↔ PR de clôture.
+    ///
+    /// Trois, pas une : la régression redoutée n'a pas de forme canonique. Un
+    /// second site peut rebâtir l'index inverse (`pr_by_issue`), relire le
+    /// champ côté PR (`closingIssuesReferences`) ou relire celui côté issue
+    /// (`closedByPullRequestsReferences`) — et le troisième est le plus
+    /// probable, puisque c'est le chemin que ce ticket vient d'ouvrir. Un filet
+    /// posé sur une seule des trois serait vert le jour où il compte.
+    const AIGUILLES_DE_RESOLUTION: &[&str] = &[
+        "pr_by_issue",
+        "closingIssuesReferences",
+        "closedByPullRequestsReferences",
+    ];
+
+    /// Les fonctions dont le corps porte l'une des aiguilles, dans un corpus
+    /// `(fichier, source)` quelconque — l'ensemble trié et dédoublonné.
+    ///
+    /// Le découpage passe par [`crate::source_scan::fn_bodies`], qui retire les
+    /// commentaires **avant** de découper : la prose de ce module *nomme* les
+    /// trois champs à six endroits (le doc-comment de `PrLinkSource`, celui de
+    /// `SubIssue::pr_number`, celui de `write_completed`, trois commentaires du
+    /// composeur), et une mention n'est pas une lecture. C'est le motif
+    /// mika#2050 signal S, et la raison pour laquelle
+    /// `mika2425_identity_context_history_has_a_single_reader` ancre sur les
+    /// lignes non commentaires.
+    fn fonctions_portant_une_aiguille(corpus: &[(String, String)]) -> Vec<String> {
+        let mut trouvees: Vec<String> = Vec::new();
+        for (_, source) in corpus {
+            for (nom, corps) in crate::source_scan::fn_bodies(source) {
+                if AIGUILLES_DE_RESOLUTION.iter().any(|a| corps.contains(a)) {
+                    trouvees.push(nom);
+                }
+            }
+        }
+        trouvees.sort();
+        trouvees.dedup();
+        trouvees
+    }
+
+    /// La moitié production de `src/milestone_manager/`, fichier par fichier.
+    ///
+    /// Passe par [`crate::source_scan::production_files`], qui compose déjà les
+    /// deux écartements du code de test demandés par le plan — par le chemin
+    /// ([`crate::source_scan::is_test_source_path`]) puis par la troncature
+    /// ([`crate::source_scan::production_half`]). L'API déjà en place, prise là
+    /// où elle est déjà composée : une troisième énumération du répertoire
+    /// serait un second prédicat pour une seule question (mika#2158), et celle
+    /// de `mod.rs` est plate là où celle-ci est récursive — un futur
+    /// sous-répertoire du module y échapperait en silence.
+    fn production_du_module() -> Vec<(String, String)> {
+        let corpus: Vec<(String, String)> = crate::source_scan::production_files()
+            .into_iter()
+            .filter(|(rel, _)| rel.starts_with("milestone_manager/"))
+            .collect();
+        assert!(
+            corpus.len() >= 10,
+            "le corpus du module est anormalement petit ({} fichiers) — le \
+             filtre de chemin ne mord plus, et le scan ne regarde presque rien",
+            corpus.len()
+        );
+        corpus
+    }
+
+    /// mika#2924 R7 — **l'ensemble** des fonctions de production qui résolvent
+    /// le lien ticket ↔ PR de clôture, par égalité d'ensembles et non par
+    /// `contains`.
+    ///
+    /// Ce que ça refuse : un second site qui résout le lien à côté du premier.
+    /// La classe est celle de mika#2158 — un second site correct *aujourd'hui*
+    /// qui rate l'élargissement de demain, sans qu'aucune assertion de
+    /// comportement ne rougisse, parce que les deux sites rendent les mêmes
+    /// octets jusqu'au jour où l'un des deux change.
+    ///
+    /// **Deux noms attendus, et chacun pour sa raison** — le plan en annonçait
+    /// un, n'ayant pas compté le site de *demande* :
+    ///
+    /// - `compose_from_gh_outputs` **résout** : c'est lui qui décide, pour un
+    ///   ticket, quelle PR l'a fermé et d'où vient cette réponse.
+    /// - `read_with_runner` **demande** : il nomme les deux champs dans ses
+    ///   listes `--json`. Il ne répond pas à la question, il la rend posable —
+    ///   la même distinction que mika#2305 a dû écrire pour son résolveur de
+    ///   portée (« amended, not excepted … it *produces* the answer »).
+    ///
+    /// Quand ce test rougit : **router le site par `compose_from_gh_outputs`**,
+    /// ne pas ajouter de ligne à l'allowlist (doctrine mika#2201). Si le
+    /// nouveau site est un troisième *demandeur* légitime, l'attendu s'amende
+    /// en nommant sa raison, comme les deux lignes ci-dessus.
+    #[test]
+    fn mika2924_la_resolution_de_pr_de_cloture_a_un_lecteur_unique() {
+        /// Aucune exception. Livrée vide, et son vide est épinglé juste en
+        /// dessous : une allowlist qui se remplit sans bruit est le mécanisme
+        /// que mika#2309 condamne.
+        const ALLOWLIST: &[&str] = &[];
+        assert!(
+            ALLOWLIST.is_empty(),
+            "une exception a été ajoutée à ce scan. Ce n'est pas la \
+             réparation : router le site par `compose_from_gh_outputs` l'est \
+             (mika#2201). Si une exception est vraiment la bonne réponse, \
+             ouvrir un ticket qui porte sa raison et le citer ici."
+        );
+
+        let trouvees = fonctions_portant_une_aiguille(&production_du_module());
+
+        // Anti-vacuité : un prédicat qui ne trouve plus rien passerait toutes
+        // les égalités d'ensembles qu'on lui demanderait, y compris celle-ci si
+        // l'attendu venait à se vider par un refactor.
+        assert!(
+            !trouvees.is_empty(),
+            "le scan ne trouve plus aucune lecture — les aiguilles ont cessé de \
+             mordre (champ renommé, découpage cassé), et le filet est décoratif"
+        );
+
+        assert_eq!(
+            trouvees,
+            vec![
+                "compose_from_gh_outputs".to_string(),
+                "read_with_runner".to_string(),
+            ],
+            "l'ensemble des fonctions qui touchent au lien de PR de clôture a \
+             changé. Lire le doc-comment de ce test avant de toucher à \
+             l'attendu."
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus : sur une source **synthétique**
+    /// portant un second résolveur, le prédicat doit rougir.
+    ///
+    /// Sans lui, un scan dont le découpage s'est cassé — aiguille renommée,
+    /// `fn_bodies` qui rend des corps vides — resterait vert pour toujours, et
+    /// son vert se lirait comme « un seul lecteur » au lieu de « je ne vois
+    /// plus rien ». L'anti-vacuité du test précédent couvre le corpus réel ;
+    /// celui-ci couvre le prédicat lui-même, sur une entrée dont on connaît la
+    /// réponse.
+    #[test]
+    fn mika2924_le_scan_rougit_sur_un_second_lecteur() {
+        let synthetique = r#"
+/// Cette prose nomme `closedByPullRequestsReferences` et `pr_by_issue` sans
+/// les lire : elle ne doit pas être comptée.
+fn seulement_de_la_prose() {
+    let _ = 1;
+}
+
+fn un_second_resolveur(issue: &Value) -> Option<u64> {
+    issue
+        .get("closedByPullRequestsReferences")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("number"))
+        .and_then(|v| v.as_u64())
+}
+"#;
+        let corpus = vec![("synthetique.rs".to_string(), synthetique.to_string())];
+        let trouvees = fonctions_portant_une_aiguille(&corpus);
+        assert_eq!(
+            trouvees,
+            vec!["un_second_resolveur".to_string()],
+            "le prédicat doit voir le second résolveur, et lui seul — une \
+             prose qui nomme le champ n'est pas une lecture"
+        );
+    }
+
     /// mika#1975 D5/D8 — the typed error renders **exactly** the legacy
     /// `anyhow!("gh {} failed: {}", args.join(" "), stderr)` string.
     ///
