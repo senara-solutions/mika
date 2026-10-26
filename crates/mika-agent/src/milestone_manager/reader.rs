@@ -780,9 +780,15 @@ pub fn compose_from_gh_outputs(
         // `is_in_flight()`, le palier 1 de `pick_next_action`, `is_hard_blocked()`
         // et surtout `detect_silent_progress`, qui exige
         // `state == Open && pr_state == Some("merged")`.
+        // La référence côté issue ne vient **qu'en comblement** : c'est une
+        // union, pas un remplacement. Elle répond pour les PR que la boucle
+        // produit — le pilote rattache le milestone au ticket, jamais à la PR,
+        // donc l'index ci-dessus est vide pour elles — mais elle ne dit rien de
+        // l'état de la PR ni de sa CI, et les deviner serait affirmer une mesure
+        // qui n'a pas eu lieu (mika#2331).
         let mut pr_number: Option<u64> = None;
         let mut pr_state: Option<String> = None;
-        let pr_url: Option<String> = None;
+        let mut pr_url: Option<String> = None;
         let mut pr_link_source: Option<PrLinkSource> = None;
         let mut ci_state = CiState::None;
         if let Some((n, s, c)) = pr_by_issue.get(&number).cloned() {
@@ -794,6 +800,33 @@ pub fn compose_from_gh_outputs(
             // « liste du milestone » et « blob d'un binaire antérieur », et la
             // sonde AC3 ne pourrait plus séparer les deux (mika#2340).
             pr_link_source = Some(PrLinkSource::MilestonePrList);
+        } else if let Some(r) = issue
+            .get("closedByPullRequestsReferences")
+            .and_then(|v| v.as_array())
+            // Première entrée retenue, comme l'index ci-dessus : un ticket peut
+            // être fermé par plusieurs PR (un vol en deux temps), et un choix
+            // dépendant de l'ordre de la page rendrait deux rapports différents
+            // sur le même état.
+            .and_then(|a| a.first())
+        {
+            // Les **deux** champs sont exigés, et le numéro seul ne suffit pas :
+            // la référence peut porter une PR d'un autre dépôt, et recomposer
+            // `{repo}/pull/{n}` rendrait alors un lien vers une PR qui n'existe
+            // pas — plus difficile à démentir qu'une absence de lien. Sans `url`
+            // la ligne garde donc son `closed (no linked PR)`, qui est vrai de ce
+            // que l'on sait.
+            if let (Some(n), Some(url)) = (
+                r.get("number").and_then(|v| v.as_u64()),
+                r.get("url").and_then(|v| v.as_str()),
+            ) {
+                pr_number = Some(n);
+                pr_url = Some(url.to_string());
+                pr_link_source = Some(PrLinkSource::IssueClosingRef);
+                // `pr_state` et `ci_state` restent volontairement vides : ce
+                // chemin n'a pas vu la PR. `detect_silent_progress` exige
+                // `pr_state == Some("merged")` et doit continuer de ne le tenir
+                // que de la liste du milestone.
+            }
         }
 
         sub_issues.push(SubIssue {
