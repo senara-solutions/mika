@@ -759,6 +759,7 @@ fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::milestone_manager::evaluator::PrStateKnowledge;
     use crate::milestone_manager::pool::{
         PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause, assess_pool,
         assess_pool_sans_tailles,
@@ -842,12 +843,17 @@ mod tests {
     ) -> FlightVerdict {
         FlightVerdict {
             task_id: "task-x".into(),
+            repo: Some("senara-solutions/mika".into()),
             issue_number,
             issue,
             turns_used,
             hit_ceiling,
             turn_ceiling: None,
             last_commit_turn: None,
+            // Un vol du milestone cible dont le `Reader` n'a trouvé aucune PR :
+            // la population d'avant mika#2921, donc le rendu attendu ne bouge
+            // pas.
+            pr_state: PrStateKnowledge::Read(None),
             recommendation,
             completed_at: Some("2026-10-13T08:00:00Z".into()),
         }

@@ -523,10 +523,11 @@ mod tests {
     #[test]
     fn mika2698_un_verdict_fait_laller_retour() {
         use super::super::evaluator::{
-            DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
+            DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, PrStateKnowledge,
         };
         let v = FlightVerdict {
             task_id: "t".into(),
+            repo: Some("senara-solutions/mika".into()),
             issue_number: Some(2661),
             issue: FlightIssue::Dead {
                 cause: DeathCause::CeilingReached,
@@ -535,6 +536,7 @@ mod tests {
             hit_ceiling: true,
             turn_ceiling: None,
             last_commit_turn: None,
+            pr_state: PrStateKnowledge::NotRead,
             recommendation: FlightRecommendation::Regroom,
             completed_at: Some("2026-10-13T10:00:00Z".into()),
         };
@@ -543,6 +545,68 @@ mod tests {
         assert!(
             out.contains(r#""turn_ceiling":null"#),
             "le plafond non instrumenté doit rester visible comme null — obtenu : {out}"
+        );
+    }
+
+    // -- mika#2921 : les deux champs neufs du verdict, et leur format fil --
+
+    /// Un verdict écrit **avant** mika#2921 se relit, et ce qu'il n'a pas écrit
+    /// se lit comme non lu — jamais comme lu-et-vide.
+    ///
+    /// Le puits hors-ligne garde de tels blobs. `pr_state` absent ⇒ `NotRead` :
+    /// un blob qui ne porte aucune lecture ne doit pas se mettre à en attester
+    /// une (motif mika#2331, classe mika#2205).
+    #[test]
+    fn mika2921_un_verdict_anterieur_se_relit_sans_depot_et_sans_lecture() {
+        use super::super::evaluator::{FlightRecommendation, FlightVerdict, PrStateKnowledge};
+        let avant = serde_json::json!({
+            "task_id": "t",
+            "issue_number": 2661,
+            "issue": { "dead": { "cause": "ceiling_reached" } },
+            "turns_used": 200,
+            "hit_ceiling": true,
+            "turn_ceiling": null,
+            "last_commit_turn": null,
+            "recommendation": "regroom",
+            "completed_at": "2026-10-13T10:00:00Z"
+        })
+        .to_string();
+
+        let v: FlightVerdict = serde_json::from_str(&avant)
+            .expect("un JSON d'avant les deux champs doit encore se lire");
+        assert_eq!(
+            v.repo, None,
+            "aucun dépôt nommé, et surtout pas une chaîne vide"
+        );
+        assert_eq!(
+            v.pr_state,
+            PrStateKnowledge::NotRead,
+            "un blob muet n'a rien lu — `Read(None)` prétendrait le contraire"
+        );
+        assert_eq!(v.recommendation, FlightRecommendation::Regroom);
+    }
+
+    /// Et les trois états de connaissance font l'aller-retour en restant
+    /// distinguables sur le fil.
+    #[test]
+    fn mika2921_les_trois_etats_de_connaissance_survivent_au_fil() {
+        use super::super::evaluator::PrStateKnowledge;
+        for etat in [
+            PrStateKnowledge::Read(Some("open".into())),
+            PrStateKnowledge::Read(None),
+            PrStateKnowledge::NotRead,
+        ] {
+            let out = serde_json::to_string(&etat).unwrap();
+            assert_eq!(
+                serde_json::from_str::<PrStateKnowledge>(&out).unwrap(),
+                etat,
+                "aller-retour fidèle — obtenu : {out}"
+            );
+        }
+        assert_ne!(
+            serde_json::to_string(&PrStateKnowledge::Read(None)).unwrap(),
+            serde_json::to_string(&PrStateKnowledge::NotRead).unwrap(),
+            "« lu, et vide » et « pas lu » doivent différer sur le fil aussi"
         );
     }
 

@@ -265,7 +265,7 @@ pub use cadence::{
 };
 pub use evaluator::{
     DeathCause, FinishedFlight, FlightIssue, FlightRecommendation, FlightSource, FlightVerdict,
-    evaluate_flight, evaluate_flights, milestone_issue_urls,
+    PrStateKnowledge, evaluate_flight, evaluate_flights, milestone_issue_urls,
 };
 pub use liveness::{
     ENV_LIVENESS_URL, HttpLivenessSink, LIVENESS_ENTITY, LIVENESS_TIMEOUT, LivenessBody,

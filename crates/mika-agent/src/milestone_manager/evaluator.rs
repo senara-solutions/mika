@@ -84,6 +84,35 @@ pub enum DeathCause {
     Unknown(String),
 }
 
+/// Ce que le manager **sait** de l'état de la PR d'un vol (mika#2921).
+///
+/// Pas un `Option<String>`, et c'est tout l'objet du type : depuis que
+/// l'évaluateur juge toute la boucle, un vol peut porter sur un ticket que le
+/// `Reader` n'a jamais hydraté — il n'hydrate que les sous-issues du milestone
+/// cible, et le lire coûterait un appel réseau par vol et par cycle, que ce vol
+/// refuse. « Lu, et vide » et « pas lu » sont alors deux populations
+/// distinctes (classe mika#2205), qu'un `Option` aurait fusionnées en une seule
+/// absence (motif mika#2331).
+///
+/// La recommandation ne change pas entre les deux — voir [`recommend`] — c'est
+/// le **rendu** qui porte la non-lecture.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrStateKnowledge {
+    /// Le ticket est apparié à une sous-issue du milestone cible : l'état a été
+    /// lu, et il peut être vide (`None` = ce ticket n'a pas de PR connue).
+    Read(Option<String>),
+    /// Le ticket n'est apparié à aucune sous-issue du milestone cible : **ni**
+    /// son milestone **ni** son état de PR n'ont été lus.
+    ///
+    /// C'est aussi le défaut à la désérialisation, et pour la même raison : un
+    /// blob de rapport antérieur à mika#2921 ne porte pas le champ, donc il ne
+    /// porte aucune lecture — dire `Read(None)` à sa place serait inventer une
+    /// mesure.
+    #[default]
+    NotRead,
+}
+
 /// Ce que le manager recommande à l'opérateur pour ce vol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +130,19 @@ pub enum FlightRecommendation {
 pub struct FlightVerdict {
     /// `tasks.id` du vol évalué — la clé qui rend le verdict rejouable.
     pub task_id: String,
+    /// Le **dépôt** du ticket, `owner/repo` (mika#2921).
+    ///
+    /// `None` = le vol ne porte pas d'URL de ticket, jamais une chaîne vide
+    /// (motif mika#2331). Deux vols de deux dépôts différents peuvent porter le
+    /// même `issue_number` : depuis que le périmètre est la boucle entière,
+    /// c'est ce champ qui les distingue, et le rendu le lit pour cela.
+    ///
+    /// `#[serde(default)]` pour la même raison que les champs de
+    /// [`super::types::Assessment`] : le puits hors-ligne garde des blobs
+    /// écrits avant ce champ, et une montée de version incapable de relire son
+    /// propre arriéré le perd.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Le ticket sur lequel le vol portait, lu dans `reference_url`.
     pub issue_number: Option<u64>,
     pub issue: FlightIssue,
@@ -113,6 +155,13 @@ pub struct FlightVerdict {
     pub turn_ceiling: Option<u32>,
     /// Tour du dernier commit. **Toujours `None` au vol 1** (vol 2 : transcript).
     pub last_commit_turn: Option<u32>,
+    /// Ce que le manager sait de l'état de la PR — lu, ou non lu (mika#2921).
+    ///
+    /// `#[serde(default)]` ⇒ [`PrStateKnowledge::NotRead`] : un blob antérieur
+    /// à ce champ ne porte aucune lecture, et c'est exactement ce que la
+    /// variante par défaut dit.
+    #[serde(default)]
+    pub pr_state: PrStateKnowledge,
     pub recommendation: FlightRecommendation,
     /// ISO 8601 UTC — `tasks.completed_at`.
     pub completed_at: Option<String>,
@@ -203,33 +252,46 @@ pub fn milestone_issue_urls(state: &MilestoneState) -> Vec<String> {
 }
 
 /// Le verdict de chaque vol, dans l'ordre reçu.
+///
+/// `sub_issues` sert à **apparier**, jamais à borner : depuis mika#2921 la liste
+/// des vols vient du périmètre des dépôts sous contrôle, et un vol qui ne
+/// s'apparie à rien reçoit tout de même son verdict — avec
+/// [`PrStateKnowledge::NotRead`] au lieu d'un état deviné.
 pub fn evaluate_flights(flights: &[FinishedFlight], sub_issues: &[SubIssue]) -> Vec<FlightVerdict> {
     flights
         .iter()
         .map(|f| {
             let issue_number = issue_number_from_url(f.reference_url.as_deref());
-            let pr_state = issue_number
-                .and_then(|n| sub_issues.iter().find(|s| s.number == n))
-                .and_then(|s| s.pr_state.as_deref());
-            evaluate_flight(f, issue_number, pr_state)
+            // L'échec d'appariement n'est pas « pas d'état » : c'est « pas lu ».
+            let pr_state =
+                match issue_number.and_then(|n| sub_issues.iter().find(|s| s.number == n)) {
+                    Some(s) => PrStateKnowledge::Read(s.pr_state.clone()),
+                    None => PrStateKnowledge::NotRead,
+                };
+            evaluate_flight(f, issue_number, &pr_state)
         })
         .collect()
 }
 
-/// Le verdict d'un vol, `pr_state` étant l'état de la PR tel que le `Reader` l'a
-/// déjà hydraté (`open` / `closed` / `merged`, ou `None` s'il n'y en a pas).
+/// Le verdict d'un vol, `pr_state` étant ce que le manager **sait** de l'état de
+/// sa PR : [`PrStateKnowledge::Read`] quand le `Reader` l'a hydraté (`open` /
+/// `closed` / `merged`, ou `None` s'il n'y en a pas),
+/// [`PrStateKnowledge::NotRead`] quand le ticket n'appartient pas au milestone
+/// cible et n'a donc jamais été lu.
 pub fn evaluate_flight(
     flight: &FinishedFlight,
     issue_number: Option<u64>,
-    pr_state: Option<&str>,
+    pr_state: &PrStateKnowledge,
 ) -> FlightVerdict {
     let result = flight.result.as_deref().unwrap_or("");
     let pilot = PilotFields::parse(flight.metadata.as_deref());
     let issue = classify_issue(result, &pilot);
     FlightVerdict {
         task_id: flight.task_id.clone(),
+        repo: flight.repo.clone(),
         issue_number,
         recommendation: recommend(&issue, pr_state),
+        pr_state: pr_state.clone(),
         issue,
         turns_used: pilot.turns.or_else(|| {
             line_value(result, "Turns:").and_then(|v| v.split_whitespace().next()?.parse().ok())
@@ -244,17 +306,27 @@ pub fn evaluate_flight(
     }
 }
 
-/// La matrice de recommandation, dérivée de l'issue et de l'état de la PR.
+/// La matrice de recommandation, dérivée de l'issue et de ce qui est **su** de
+/// l'état de la PR.
 ///
-/// `pr_state: None` sur une PR ouverte rend `MergeCandidate` : la seule raison
-/// de s'en écarter serait une preuve que la PR est déjà fusionnée ou fermée, et
-/// la recommandation est de toute façon *« va regarder »*, pas un geste.
-fn recommend(issue: &FlightIssue, pr_state: Option<&str>) -> FlightRecommendation {
+/// `Read(None)` sur une PR ouverte rend `MergeCandidate` : la seule raison de
+/// s'en écarter serait une preuve que la PR est déjà fusionnée ou fermée, et la
+/// recommandation est de toute façon *« va regarder »*, pas un geste.
+///
+/// `NotRead` rend **la même chose** (mika#2921), et ce n'est pas une
+/// approximation : pour un vol qui a ouvert une PR, la recommandation utile est
+/// identique avec ou sans l'état. Ce que le manager doit cesser de faire, c'est
+/// la **présenter comme si l'état avait été lu** — et c'est au rendu, pas ici,
+/// que la non-lecture se dit (R7). Deviner `ManualResumption` sur une
+/// non-lecture enverrait un humain sur chaque vol de la boucle.
+fn recommend(issue: &FlightIssue, pr_state: &PrStateKnowledge) -> FlightRecommendation {
     match issue {
         FlightIssue::PrOpened { .. } => match pr_state {
             // Fusionnée ou fermée pendant que le vol volait : le verdict du vol
             // est en retard sur la réalité, un humain tranche.
-            Some(s) if !s.eq_ignore_ascii_case("open") => FlightRecommendation::ManualResumption,
+            PrStateKnowledge::Read(Some(s)) if !s.eq_ignore_ascii_case("open") => {
+                FlightRecommendation::ManualResumption
+            }
             _ => FlightRecommendation::MergeCandidate,
         },
         // Un sauvetage n'est jamais un merge-candidat, quel que soit l'état de
@@ -503,6 +575,12 @@ mod tests {
         }
     }
 
+    /// « Le `Reader` a lu cet état » — l'autre population étant
+    /// [`PrStateKnowledge::NotRead`], écrite en clair partout où elle sert.
+    fn lu(etat: Option<&str>) -> PrStateKnowledge {
+        PrStateKnowledge::Read(etat.map(str::to_string))
+    }
+
     // ---- AC3 : les trois issues, avec les tours lus correctement ----------
 
     #[test]
@@ -568,7 +646,7 @@ mod tests {
             fixture_rescue_pr(),
             fixture_dead_at_ceiling(),
         ] {
-            let v = evaluate_flight(&f, None, None);
+            let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead);
             assert_eq!(v.turn_ceiling, None, "{}", f.task_id);
             assert_eq!(v.last_commit_turn, None, "{}", f.task_id);
         }
@@ -580,7 +658,7 @@ mod tests {
     fn mika2698_les_tours_retombent_sur_la_ligne_turns_sans_metadata() {
         let mut f = fixture_pr_opened();
         f.metadata = None;
-        let v = evaluate_flight(&f, None, Some("open"));
+        let v = evaluate_flight(&f, None, &lu(Some("open")));
         assert_eq!(
             v.turns_used,
             Some(83),
@@ -601,7 +679,10 @@ mod tests {
         let mut f = fixture_pr_opened();
         f.metadata = Some(r#"{"claude_pilot":{}}"#.to_string());
         f.result = Some("Turns: unknown\nOutcome: PR_OPENED — x\n".to_string());
-        assert_eq!(evaluate_flight(&f, None, None).turns_used, None);
+        assert_eq!(
+            evaluate_flight(&f, None, &PrStateKnowledge::NotRead).turns_used,
+            None
+        );
     }
 
     #[test]
@@ -614,7 +695,10 @@ mod tests {
              Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n"
                 .to_string(),
         );
-        assert_eq!(evaluate_flight(&f, None, None).turns_used, Some(200));
+        assert_eq!(
+            evaluate_flight(&f, None, &PrStateKnowledge::NotRead).turns_used,
+            Some(200)
+        );
     }
 
     // ---- Les causes de mort, une par forme du producteur -----------------
@@ -625,7 +709,7 @@ mod tests {
             result: Some(result.to_string()),
             ..Default::default()
         };
-        match evaluate_flight(&f, None, None).issue {
+        match evaluate_flight(&f, None, &PrStateKnowledge::NotRead).issue {
             FlightIssue::Dead { cause } => cause,
             other => panic!("attendu mort, obtenu {other:?}"),
         }
@@ -680,7 +764,7 @@ mod tests {
             task_id: "t".to_string(),
             ..Default::default()
         };
-        let v = evaluate_flight(&f, None, None);
+        let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead);
         assert_eq!(
             v.issue,
             FlightIssue::Dead {
@@ -704,7 +788,7 @@ mod tests {
              Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n"
                 .to_string(),
         );
-        let v = evaluate_flight(&f, Some(2655), Some("open"));
+        let v = evaluate_flight(&f, Some(2655), &lu(Some("open")));
         assert!(v.hit_ceiling);
         assert!(matches!(v.issue, FlightIssue::RescuePr { .. }));
         assert_eq!(v.recommendation, FlightRecommendation::ManualResumption);
@@ -712,6 +796,15 @@ mod tests {
 
     // ---- La matrice de recommandation, exhaustivement ---------------------
 
+    /// La matrice entière, les trois issues croisées avec les **trois** états de
+    /// connaissance — `Read(Some(…))`, `Read(None)` et, depuis mika#2921,
+    /// `NotRead`.
+    ///
+    /// La colonne `NotRead` est la moitié d'AC5 qui vit ici : la recommandation
+    /// d'un vol non lu est celle d'un vol lu-sans-état, et c'est **voulu**.
+    /// L'autre moitié — que le rapport le dise au lieu de le taire — est dans
+    /// `reporter.rs`. Si cette colonne divergeait un jour de la précédente, un
+    /// humain serait envoyé sur chaque vol de la boucle.
     #[test]
     fn mika2698_la_matrice_de_recommandation_est_exhaustive() {
         let pr = || FlightIssue::PrOpened {
@@ -723,80 +816,159 @@ mod tests {
             url: None,
         };
         let dead = |c: DeathCause| FlightIssue::Dead { cause: c };
+        let non_lu = || PrStateKnowledge::NotRead;
 
-        let cases: &[(FlightIssue, Option<&str>, FlightRecommendation)] = &[
-            (pr(), Some("open"), FlightRecommendation::MergeCandidate),
-            (pr(), None, FlightRecommendation::MergeCandidate),
-            (pr(), Some("merged"), FlightRecommendation::ManualResumption),
-            (pr(), Some("closed"), FlightRecommendation::ManualResumption),
+        let cases: &[(FlightIssue, PrStateKnowledge, FlightRecommendation)] = &[
+            (pr(), lu(Some("open")), FlightRecommendation::MergeCandidate),
+            (pr(), lu(None), FlightRecommendation::MergeCandidate),
+            (pr(), non_lu(), FlightRecommendation::MergeCandidate),
             (
-                rescue(),
-                Some("open"),
+                pr(),
+                lu(Some("merged")),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                pr(),
+                lu(Some("closed")),
                 FlightRecommendation::ManualResumption,
             ),
             (
                 rescue(),
-                Some("merged"),
+                lu(Some("open")),
                 FlightRecommendation::ManualResumption,
             ),
-            (rescue(), None, FlightRecommendation::ManualResumption),
+            (
+                rescue(),
+                lu(Some("merged")),
+                FlightRecommendation::ManualResumption,
+            ),
+            (rescue(), lu(None), FlightRecommendation::ManualResumption),
+            (rescue(), non_lu(), FlightRecommendation::ManualResumption),
             (
                 dead(DeathCause::CeilingReached),
-                None,
+                lu(None),
+                FlightRecommendation::Regroom,
+            ),
+            (
+                dead(DeathCause::CeilingReached),
+                non_lu(),
                 FlightRecommendation::Regroom,
             ),
             (
                 dead(DeathCause::Refusal),
-                None,
+                lu(None),
                 FlightRecommendation::Regroom,
             ),
             (
                 dead(DeathCause::Escalated),
-                None,
+                lu(None),
                 FlightRecommendation::Regroom,
             ),
             (
                 dead(DeathCause::PipelineFailure),
-                None,
+                lu(None),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                dead(DeathCause::PipelineFailure),
+                non_lu(),
                 FlightRecommendation::ManualResumption,
             ),
             (
                 dead(DeathCause::LauncherDead),
-                None,
+                lu(None),
                 FlightRecommendation::ManualResumption,
             ),
             (
                 dead(DeathCause::Unknown("x".to_string())),
-                None,
+                lu(None),
                 FlightRecommendation::ManualResumption,
             ),
         ];
         for (issue, pr_state, expected) in cases {
             assert_eq!(
-                recommend(issue, *pr_state),
+                recommend(issue, pr_state),
                 *expected,
                 "issue={issue:?} pr_state={pr_state:?}"
             );
         }
     }
 
+    /// Un sous-ticket non apparié ne prête pas son état — et depuis mika#2921 le
+    /// verdict dit *pourquoi* : il n'a rien lu.
+    ///
+    /// L'assertion s'est renforcée, pas affaiblie. Avant, le troisième cas
+    /// vérifiait seulement que la recommandation ne bougeait pas ; un
+    /// `Read(None)` posé par erreur à la place du `NotRead` l'aurait laissée
+    /// verte, et le rapport aurait annoncé un état lu qui n'existait pas.
     #[test]
     fn mika2698_letat_de_pr_vient_du_sous_ticket_apparie() {
         // Le même vol, deux milestones : seul l'état hydraté par le Reader
         // change le verdict. Aucun appel `gh` de plus.
         let flights = [fixture_pr_opened()];
+        let apparie_fusionne = &evaluate_flights(&flights, &[sub_issue(2693, Some("merged"))])[0];
         assert_eq!(
-            evaluate_flights(&flights, &[sub_issue(2693, Some("merged"))])[0].recommendation,
+            apparie_fusionne.recommendation,
             FlightRecommendation::ManualResumption
+        );
+        assert_eq!(
+            apparie_fusionne.pr_state,
+            lu(Some("merged")),
+            "un vol apparié porte l'état que le Reader a lu"
         );
         assert_eq!(
             evaluate_flights(&flights, &[sub_issue(2693, Some("open"))])[0].recommendation,
             FlightRecommendation::MergeCandidate
         );
+
+        let non_apparie = &evaluate_flights(&flights, &[sub_issue(9999, Some("merged"))])[0];
         assert_eq!(
-            evaluate_flights(&flights, &[sub_issue(9999, Some("merged"))])[0].recommendation,
+            non_apparie.recommendation,
             FlightRecommendation::MergeCandidate,
             "un sous-ticket qui n'apparie pas ne doit pas prêter son état"
+        );
+        assert_eq!(
+            non_apparie.pr_state,
+            PrStateKnowledge::NotRead,
+            "et le verdict doit dire qu'il n'a rien lu, pas qu'il a lu du vide"
+        );
+    }
+
+    /// AC5, le contrôle positif à côté du négatif : le **même** vol apparié dit
+    /// `Read`, non apparié dit `NotRead`, et les deux populations ne se
+    /// confondent pas (classe mika#2205).
+    #[test]
+    fn mika2921_lu_vide_et_non_lu_sont_deux_populations() {
+        let flights = [fixture_pr_opened()];
+        let lu_vide = &evaluate_flights(&flights, &[sub_issue(2693, None)])[0];
+        let jamais_lu = &evaluate_flights(&flights, &[])[0];
+
+        assert_eq!(lu_vide.pr_state, PrStateKnowledge::Read(None));
+        assert_eq!(jamais_lu.pr_state, PrStateKnowledge::NotRead);
+        assert_ne!(
+            lu_vide.pr_state, jamais_lu.pr_state,
+            "« lu, et vide » n'est pas « pas lu » — un Option les aurait fusionnés"
+        );
+        assert_eq!(
+            lu_vide.recommendation, jamais_lu.recommendation,
+            "la recommandation est bien la même : c'est le rendu qui porte la différence"
+        );
+    }
+
+    /// Le dépôt traverse jusqu'au verdict, et vient du vol — jamais de la liste
+    /// interrogée (mika#2921).
+    #[test]
+    fn mika2921_le_verdict_porte_le_depot_du_vol() {
+        let v = &evaluate_flights(&[fixture_pr_opened()], &[])[0];
+        assert_eq!(v.repo.as_deref(), Some("senara-solutions/mika"));
+
+        let mut sans_depot = fixture_pr_opened();
+        sans_depot.repo = None;
+        sans_depot.reference_url = None;
+        let v = &evaluate_flights(&[sans_depot], &[])[0];
+        assert_eq!(
+            v.repo, None,
+            "un vol qui ne nomme aucun dépôt ne s'en voit pas attribuer un"
         );
     }
 
