@@ -514,6 +514,17 @@ mod tests {
     /// condamne.
     #[test]
     fn mika2917_a1_les_sites_gh_du_prefiltre_sont_recenses() {
+        // Le **contenu** de la constante, et pas seulement l'égalité du scan avec
+        // elle (mika#2917, vol 3, audit MPC point 3). Sans cette ligne, le vol 3
+        // pourrait y glisser une entrée et rester vert : l'`assert_eq!` ci-dessous
+        // comparerait alors deux ensembles qui ont grandi ensemble. Le ticket dit
+        // « le vol 3 n'y ajoute rien » ; c'est ici que ce rien est attesté.
+        assert_eq!(
+            GH_CALL_SITES_ALLOWED,
+            &["pr_state"],
+            "le vol 3 n'ajoute aucun site `gh` ; une entrée nouvelle est une \
+             décision à prendre sur son propre ticket, pas un effet de bord"
+        );
         let src = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/webhook_prefilter.rs"),
         )
@@ -575,11 +586,13 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
     ///   vol 3 ajoute un lecteur, pas un écrivain. Au vol 2 l'ensemble est vide
     ///   avant que `tools/record_reviewed_head.rs` n'existe, et c'est le seul
     ///   instant du vol où il l'est.
-    /// - **Le lecteur, borné à un.** `≤ 1` délibérément, et non un ensemble
-    ///   exact : un ensemble exact rougirait au vol 3 **par construction**, et un
-    ///   rouge attendu s'apprend à ignorer. Le `≤ 1` mord sur le seul défaut
-    ///   qu'AC3 nomme — « le Rust ne lit qu'une seule source » — et il mord aux
-    ///   deux vols.
+    /// - **Le lecteur, ensemble exact depuis le vol 3.** Posé en `≤ 1` au vol 2,
+    ///   où aucun lecteur n'existait et où un ensemble exact aurait rougi par
+    ///   construction. Le vol 3 pose le lecteur et **resserre** l'assertion :
+    ///   `server/webhook_prefilter.rs`, et lui seul. Un second lecteur du
+    ///   registre — la forme exacte de ce que le bearing refuse, « aucune copie
+    ///   de la logique de dedup dans le Rust » — la fait rougir, et un lecteur
+    ///   renommé la fait rougir aussi.
     ///
     /// Quand l'une des deux rougit, la résolution est de router l'accès par ce
     /// module, **jamais** d'ajouter une entrée : il n'y a pas d'allowlist ici.
@@ -603,9 +616,12 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         );
 
         let readers = readers_of(&files, "QA_REVIEWED_HEAD_TOOL", &writers);
-        assert!(
-            readers.len() <= 1,
-            "au plus un lecteur ; trouvés : {readers:?}"
+        assert_eq!(
+            readers,
+            vec!["server/webhook_prefilter.rs".to_string()],
+            "SOLE READER : le pré-filtre, et lui seul (mika#2917, vol 3). Quand \
+             cet ensemble grandit, route la lecture par PrefilterState::reviewed_head \
+             — n'ajoute pas d'entrée"
         );
 
         // Aucun littéral recopié hors de ce module.
