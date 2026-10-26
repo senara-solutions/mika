@@ -312,9 +312,9 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         let writers = audit_writers("QA_REVIEWED_HEAD_TOOL");
         assert_eq!(
             writers,
-            Vec::<String>::new(),
-            "SOLE WRITER : aucun écrivain tant que l'outil n'existe pas ; \
-             l'ensemble passe à {{ tools/record_reviewed_head.rs }} avec lui"
+            vec!["tools/record_reviewed_head.rs".to_string()],
+            "SOLE WRITER : un seul écrivain. Quand cet ensemble grandit, route \
+             l'écriture par l'outil — n'ajoute pas d'entrée"
         );
 
         let readers = readers_of(&files, "QA_REVIEWED_HEAD_TOOL", &writers);

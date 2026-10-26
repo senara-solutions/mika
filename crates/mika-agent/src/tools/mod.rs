@@ -38,6 +38,7 @@ mod query_knowledge_graph;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
+mod record_reviewed_head;
 mod record_served_content;
 mod remove_team_member;
 mod resolve_issue_order;
@@ -1370,6 +1371,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     // Content-serve ledger tools (mika#1867)
     "record_served_content",
     "check_already_served",
+    // Registre des têtes revues (mika#2917) — écrivain unique
+    "record_reviewed_head",
     // management_tools_if_needed() — always-added management tools
     "create_agent",
     "create_team",
@@ -1448,6 +1451,11 @@ pub fn default_tools() -> ToolRegistry {
     // a fidelity gate is engine, not skill.
     registry.register(Box::new(record_served_content::RecordServedContentTool));
     registry.register(Box::new(check_already_served::CheckAlreadyServedTool));
+    // Registre des têtes revues (mika#2917). Niveau moteur comme ses voisins :
+    // l'outil n'écrit que ce que son appelant lui passe, et c'est le prompt du
+    // skill `qa-review-webhook-success` — non une allowlist — qui décide quel
+    // tour l'appelle.
+    registry.register(Box::new(record_reviewed_head::RecordReviewedHeadTool));
     registry
 }
 
