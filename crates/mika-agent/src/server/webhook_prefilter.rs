@@ -246,6 +246,7 @@ use mika_common::github_event_format::{
 use mika_common::llm::LlmProvider;
 
 use crate::async_db::AsyncDatabase;
+use crate::qa_reviewed_head::QA_REVIEWED_HEAD_TOOL;
 
 use super::ci_failure_handler::{
     CI_FAILURE_ESCALATED_TOOL, CI_FAILURE_HANDLED_TOOL, CI_FAILURE_NO_ACTION_NO_OPEN_PR,
@@ -753,6 +754,19 @@ pub(crate) trait PrefilterState {
     /// [`decide`], une lecture qui peut échouer — et la faire passer par le
     /// trait est ce qui rend les quatre pannes bouchonnables sans réseau.
     async fn triage(&self, text: &str) -> anyhow::Result<TriageVerdict>;
+    /// (g′) l'issue attestée au registre pour CETTE tête, telle que
+    /// `record_reviewed_head` l'a écrite — `None` quand le registre ne porte pas
+    /// la tête (mika#2917, vol 3). La clé est celle de
+    /// [`crate::qa_reviewed_head::head_key`], `pr:{repo}#{n}@{sha}`, retapée
+    /// nulle part.
+    ///
+    /// La valeur est rendue **BRUTE** : la validation contre
+    /// [`crate::qa_reviewed_head::REVIEWED_HEAD_OUTCOMES`] appartient au
+    /// décideur, pour qu'une valeur hors contrat soit une relâche nommée —
+    /// `Release::ReviewedHeadOutOfContract` — et non un silence. Normaliser
+    /// ici rendrait « le registre porte autre chose » indiscernable de « le
+    /// registre ne porte rien », et ce sont deux populations (mika#2205).
+    async fn reviewed_head(&self, head_key: &str) -> anyhow::Result<Option<String>>;
 }
 
 /// L'état réel : base de l'agent, et `gh` pour la forge.
@@ -834,6 +848,27 @@ impl PrefilterState for LiveState<'_> {
             anyhow::bail!("aucun fournisseur LLM injecté pour le triage (h)");
         };
         comment_triage::run_triage(llm, text).await
+    }
+
+    /// (g′) mika#2917, vol 3. **Aucun `gh`** : la base de l'agent, par
+    /// l'accesseur de mika#2242.
+    ///
+    /// L'`agent_id` n'est pas un argument — `latest_audit_event_for_target`
+    /// clone celui du handle et le passe comme paramètre SQL 1. Le premier point
+    /// de l'audit MPC du vol 3 est donc tenu structurellement : cette signature
+    /// ne permet pas de lire le registre d'un autre agent, donc ne permet pas de
+    /// le passer de travers.
+    ///
+    /// Seule la colonne `after_value` est retenue ; `reasoning` et `created_at`
+    /// de la projection sont jetés. `after_value` reste un `Option` jusqu'au
+    /// décideur et n'est jamais coercé en `""` (mika#2331).
+    async fn reviewed_head(&self, head_key: &str) -> anyhow::Result<Option<String>> {
+        let since = crate::qa_reviewed_head::reviewed_head_lookup_since();
+        Ok(self
+            .db
+            .latest_audit_event_for_target(QA_REVIEWED_HEAD_TOOL, head_key, &since)
+            .await?
+            .and_then(|(after_value, _reasoning, _created_at)| after_value))
     }
 }
 
@@ -1970,6 +2005,16 @@ pub(crate) mod tests {
         /// et panique s'il l'est — c'est ce qui prouve que la moitié
         /// commentaire ne passe pas par ce chemin.
         pub(crate) closure_snapshot: Option<ClosureSnapshot>,
+        /// (g′) mika#2917, vol 3. Trois états et non deux, parce que le terme en
+        /// a trois :
+        ///
+        /// - `None` — « le registre ne doit pas être consulté », et le `panic!`
+        ///   d'[`answer_cloned`] l'atteste. C'est ce qui prouve qu'un texte sans
+        ///   tête nommable n'ouvre pas la lecture.
+        /// - `Some(Ok(None))` — le registre est lu et ne porte pas la tête.
+        /// - `Some(Ok(Some(v)))` — le registre porte `v`, **brut** : le bouchon
+        ///   ne valide rien, exactement comme la base.
+        pub(crate) reviewed_head: Option<Result<Option<String>, &'static str>>,
     }
 
     fn answer_rows(
@@ -1986,6 +2031,18 @@ pub(crate) mod tests {
     fn answer<T: Copy>(slot: &Option<Result<T, &'static str>>, what: &str) -> anyhow::Result<T> {
         match slot {
             Some(Ok(v)) => Ok(*v),
+            Some(Err(e)) => Err(anyhow::anyhow!(*e)),
+            None => panic!("recherche d'état non attendue : {what}"),
+        }
+    }
+
+    /// Même convention qu'[`answer`], pour une valeur qui n'est pas `Copy`.
+    fn answer_cloned<T: Clone>(
+        slot: &Option<Result<T, &'static str>>,
+        what: &str,
+    ) -> anyhow::Result<T> {
+        match slot {
+            Some(Ok(v)) => Ok(v.clone()),
             Some(Err(e)) => Err(anyhow::anyhow!(*e)),
             None => panic!("recherche d'état non attendue : {what}"),
         }
@@ -2021,6 +2078,9 @@ pub(crate) mod tests {
             self.closure_snapshot
                 .as_ref()
                 .unwrap_or_else(|| panic!("recherche d'état non attendue : closure_snapshot"))
+        }
+        async fn reviewed_head(&self, _: &str) -> anyhow::Result<Option<String>> {
+            answer_cloned(&self.reviewed_head, "reviewed_head")
         }
     }
 

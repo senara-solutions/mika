@@ -1,14 +1,16 @@
 //! Le registre des têtes sur lesquelles mika-qa a **statué**
-//! (mika#2917, vol 2/3 — enfant de mika#2680, classe (g′), forme (a) ;
+//! (mika#2917, vols 2 et 3/3 — enfant de mika#2680, classe (g′), forme (a) ;
 //! vocabulaire corrigé par mika#2927).
 //!
-//! # Ce que ce module est, et ce qu'il n'est pas encore
+//! # Ce que ce module est
 //!
 //! Il fige le **vocabulaire** du registre : son `tool_name`, les trois issues qui
-//! l'écrivent, et la normalisation qui transforme une attestation du modèle en
-//! l'un de ces trois littéraux. Il ne lit rien et ne décide rien : au vol 2 les
-//! skills écrivent, **personne ne lit**. Le pré-filtre lira au vol 3, par un
-//! seul terme du trait `PrefilterState`.
+//! l'écrivent, la normalisation qui transforme une attestation du modèle en l'un
+//! de ces trois littéraux, et depuis le vol 3 la **profondeur** sur laquelle il
+//! se lit ([`REVIEWED_HEAD_WINDOW_DAYS`]). Il ne décide toujours rien : le vol 3
+//! a ajouté un lecteur, et ce lecteur est unique — le terme
+//! `PrefilterState::reviewed_head` de [`crate::server::webhook_prefilter`], que
+//! la garde (a.2) de ce module borne à un.
 //!
 //! # L'endroit, et pourquoi là
 //!
@@ -24,26 +26,30 @@
 //! Les quatre champs que le ticket demande y sont au complet : `repo`, `PR` et
 //! `head_sha` dans la clé, l'issue dans `after_value`.
 //!
-//! 1. **Aucun `gh`.** Le lecteur du vol 3 lira la base SQLite de son propre agent
-//!    par les accesseurs qui existent déjà
-//!    (`count_recent_audit_events_for_target`, `get_audit_event_rows_by_tool_name`).
-//!    Le bearing de mika#2680 refuse un appel `gh` depuis `webhook_prefilter.rs`
-//!    (mika#2260).
+//! 1. **Aucun `gh`.** Le lecteur du vol 3 lit la base SQLite de son propre agent
+//!    par l'accesseur qui existait déjà,
+//!    `AsyncDatabase::latest_audit_event_for_target` (mika#2242). Le bearing de
+//!    mika#2680 refuse un appel `gh` depuis `webhook_prefilter.rs` (mika#2260).
 //! 2. **Aucune table, aucune migration.** Le précédent vit dans ce dépôt :
 //!    [`crate::qa_head_supersession`], dont la doc dit « pas de table, pas de
 //!    migration » et dont `SYNC_OBSERVED_TOOL` porte la même déclaration
 //!    **SOLE WRITER**. Même mécanisme, même titre.
 //! 3. **Par agent sans que l'appelant le dise.** `AsyncDatabase::log_audit_event`
 //!    clone son propre `agent_id` et ne l'accepte pas en argument — son premier
-//!    paramètre est le `session_id`. L'état de mika-qa ne peut donc pas écarter un
-//!    tour de mika-dev, et la propriété ne dépend d'aucune discipline d'appel.
+//!    paramètre est le `session_id`. `latest_audit_event_for_target` fait de même
+//!    en lecture : l'`agent_id` est le paramètre SQL 1 et vient du handle, pas de
+//!    l'appelant. L'état de mika-qa ne peut donc pas écarter un tour de mika-dev,
+//!    et la propriété ne dépend d'aucune discipline d'appel — c'est le premier
+//!    point de l'audit MPC du vol 3, et
+//!    `mika2917_vol3_une_ligne_de_mika_qa_necarte_pas_le_tour_de_mika_dev` la
+//!    mesure au niveau de la base, non au niveau d'un bouchon.
 //! 4. **Aucune grammaire de clé nouvelle.** [`head_key`] existe et le pré-filtre
 //!    la relit déjà telle quelle. Une forme de clé retapée dans un second fichier
 //!    est la divergence programmée que mika#2158 a payée — une garde de ce module
 //!    refuse donc que ce fichier retape la grammaire.
 //! 5. **La décision reste entière dans le skill.** Le moteur ne calcule jamais
-//!    « cette tête est revue » : au vol 3 il comparera la tête que le payload
-//!    nomme à une ligne que le skill a écrite.
+//!    « cette tête est revue » : il compare la tête que le payload nomme à une
+//!    ligne que le skill a écrite, et il ne lit qu'`after_value`.
 //!
 //! # La perte de revue, et ce qui l'empêche
 //!
@@ -139,6 +145,37 @@ pub(crate) const REVIEWED_HEAD_OUTCOMES: &[&str] = &[
     "stop_already_reviewed_sha",
     "stop_verdict_recorded",
 ];
+
+/// La profondeur, en jours, sur laquelle le registre se lit (mika#2917, vol 3).
+///
+/// **Une propriété du registre, pas du pré-filtre**, et déclarée ici pour cette
+/// raison : c'est la durée pendant laquelle une ligne écrite par le skill vaut
+/// encore « cette tête est traitée ». Un second lecteur hériterait du même
+/// horizon sans avoir à le redécider.
+///
+/// Deux bornes la fixent, et elles ne disent pas la même chose :
+///
+/// - **Au-dessus**, [`crate::evidence::audit::AUDIT_RETENTION_DAYS`] (90) :
+///   `compact_old_audit_events` replie les lignes plus vieilles en résumé
+///   mensuel, donc une fenêtre plus large lirait sur des lignes qui n'existent
+///   plus — une recherche qui cesse silencieusement de trouver, la classe que
+///   mika#2242 avait déjà payée.
+/// - **En dessous**, le coût d'une revue perdue est nul et celui d'un tour payé
+///   vaut un tour : trente jours, parce qu'une `check_suite` sur une tête d'il y
+///   a plus d'un mois est une PR laissée ouverte un mois, et que faire passer ce
+///   tour est le sens sûr (§ *La perte de revue*, point 4). Une fenêtre trop
+///   courte ne perd jamais de revue ; elle ne fait que rendre le tour.
+pub(crate) const REVIEWED_HEAD_WINDOW_DAYS: i64 = 30;
+
+/// La borne basse de la lecture du registre, dans la graphie
+/// qu'`audit_events.created_at` porte.
+///
+/// Rendue par une fonction et non par une constante : la borne est relative à
+/// l'instant de la lecture, et [`crate::timestamp::now_minus`] est le seul site
+/// du crate qui sache l'écrire.
+pub(crate) fn reviewed_head_lookup_since() -> String {
+    crate::timestamp::now_minus(chrono::Duration::days(REVIEWED_HEAD_WINDOW_DAYS))
+}
 
 /// L'issue telle que l'attestation la porte, ou `None` sur toute autre valeur —
 /// l'outil rend alors une erreur et n'écrit pas.
