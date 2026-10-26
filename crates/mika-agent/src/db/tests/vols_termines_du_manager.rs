@@ -529,3 +529,438 @@ fn mika2886_un_enfant_hors_population_nest_pas_lu() {
          ne mesure pas le label"
     );
 }
+
+// ---- mika#2921 : le corpus des 13 vols mesurés, de la base au rapport ------
+
+/// Le milestone cible de la production le 2026-10-26
+/// (`MIKA_MANAGER_TARGET_MILESTONE = senara-solutions/mika#33`), et ses quatre
+/// sous-tickets. **Aucun** des 13 vols mesurés n'en est un : c'est le relevé
+/// qui a ouvert mika#2921, et c'est ce qui rendait la section « Vols terminés »
+/// vide en production.
+const MILESTONE_CIBLE: u64 = 33;
+const SOUS_TICKETS_DU_MILESTONE_CIBLE: [u64; 4] = [2921, 2922, 2923, 2924];
+
+/// Les 13 vols `implement` terminés entre le 2026-10-23T15:00Z et le relevé du
+/// 2026-10-26, sous leur forme réelle : `(dépôt, ticket, statut de la parente,
+/// issue du pilote)`, dans l'ordre où ils ont fini.
+///
+/// Les issues sont celles que l'enfant `long_running:run_claude_pilot` porte en
+/// base, réduites aux lignes que l'évaluateur lit (`Turns:`, `PR:`,
+/// `Outcome:`, `Halt class:`, la bannière `PIPELINE FAILURE:`) et aux numéros
+/// de PR réels. Les répétitions sont réelles aussi : mika#2900, #2879 et #2917
+/// ont chacun volé deux fois.
+///
+/// **Deux écarts de forme, nommés.** (1) Le premier vol de mika#2879 est
+/// `cancelled` en base (conflit de rebase, deux lignes) ; le ticket le compte
+/// parmi les douze `completed`, et [`seme_la_forme_reelle`] ne sème que les deux
+/// chemins d'écriture terminaux qu'il connaît, donc il est semé `completed`
+/// avec son issue réelle — elle ne porte aucune ligne `Outcome:`, et c'est ce
+/// qui décide son verdict, pas son statut. (2) claude-pilot#232 n'a **aucun**
+/// enfant en base (`failed`, `phantom_aged_out`) ; le helper lui en sème un.
+/// Ni l'un ni l'autre ne touche ce que ce test mesure : le **dépôt** est le
+/// seul axe du périmètre.
+const CORPUS_DES_13_VOLS: [(&str, u32, &str, &str); 13] = [
+    (
+        "senara-solutions/mika",
+        2900,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 112\nPR: https://github.com/senara-solutions/mika/pull/2903\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2903\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2879,
+        "completed",
+        "STATUS=REBASE_CONFLICT\nBranch feat/2879/suivi-mika-2872-vol-2-rattacher-la-seule is 6 commits behind origin/main.\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2879,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 88\nPR: https://github.com/senara-solutions/mika/pull/2904\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2904\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2900,
+        "completed",
+        "aucun dispatch produit ; parent d4b93658-ca04-4800-8bed-59a04ee3fe0c (completed) terminal — re-armement impossible\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2897,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 77\nPR: https://github.com/senara-solutions/mika/pull/2907\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2907\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2908,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 47\nPR: https://github.com/senara-solutions/mika/pull/2910\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2910\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2909,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 60\nPR: https://github.com/senara-solutions/mika/pull/2911\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2911\n",
+    ),
+    (
+        "senara-solutions/mika-cloud",
+        193,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 177\nPR: https://github.com/senara-solutions/mika-cloud/pull/277\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika-cloud/pull/277\n",
+    ),
+    (
+        "senara-solutions/mika-cloud",
+        198,
+        "completed",
+        "PIPELINE FAILURE: the claude-pilot session was terminated before it finished, but it left work behind.\nTurns: 151\nHalt class: budget_exhausted — SDK turn limit reached; work was produced and the recovery chain carries it\nOutcome: UNKNOWN — inspect worktree manually.\nPR: https://github.com/senara-solutions/mika-cloud/pull/281\n",
+    ),
+    (
+        "senara-solutions/mika-cloud",
+        196,
+        "completed",
+        "PIPELINE FAILURE: the claude-pilot session was terminated before it finished, but it left work behind.\nTurns: 151\nHalt class: budget_exhausted — SDK turn limit reached; work was produced and the recovery chain carries it\nOutcome: UNKNOWN — inspect worktree manually.\nPR: https://github.com/senara-solutions/mika-cloud/pull/284\n",
+    ),
+    (
+        "senara-solutions/claude-pilot",
+        232,
+        "failed",
+        "phantom_aged_out\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2917,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 102\nPR: https://github.com/senara-solutions/mika/pull/2918\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2918\n",
+    ),
+    (
+        "senara-solutions/mika",
+        2917,
+        "completed",
+        "claude-pilot completed (status: success).\nTurns: 138\nPR: https://github.com/senara-solutions/mika/pull/2919\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2919\n",
+    ),
+];
+
+/// Sème chaque vol de `corpus` dans la topologie à deux lignes de mika#2886, sous
+/// `mika-dev` — l'agent qui possède les vols en production — et rend la base
+/// prête à être prêtée à la source.
+fn base_semee(corpus: &[(&str, u32, &str, &str)]) -> Database {
+    let db = db();
+    for (repo, ticket, statut, issue_du_pilote) in corpus {
+        seme_la_forme_reelle(
+            &db,
+            "mika-dev",
+            &VolReel {
+                url_du_ticket: &issue_url_sur(repo, *ticket),
+                statut,
+                issue_du_pilote,
+            },
+        );
+    }
+    db
+}
+
+/// Un sous-ticket du milestone cible, tel que le `Reader` l'hydrate : seuls
+/// `number` et `pr_state` comptent pour l'évaluateur.
+fn sous_ticket(number: u64, pr_state: Option<&str>) -> crate::milestone_manager::types::SubIssue {
+    use crate::milestone_manager::types::{CiState, IssueState, SubIssue};
+    SubIssue {
+        number,
+        title: format!("sous-ticket {number}"),
+        state: IssueState::Open,
+        priority_rank: None,
+        plan_present: true,
+        branch_present: false,
+        pr_number: None,
+        pr_state: pr_state.map(str::to_string),
+        ci_state: CiState::None,
+        blockers: vec![],
+        updated_at: "2026-10-26T00:00:00Z".into(),
+        labels: vec![],
+    }
+}
+
+/// Le rapport complet d'un cycle dont l'évaluateur a rendu `verdicts`, sur le
+/// milestone cible de production.
+fn rapport(
+    sub_issues: Vec<crate::milestone_manager::types::SubIssue>,
+    verdicts: Vec<crate::milestone_manager::evaluator::FlightVerdict>,
+) -> String {
+    use crate::milestone_manager::types::{
+        Assessment, IssueState, MilestoneRef, MilestoneState, ProgressCounts, Recommendation,
+        Severity,
+    };
+    let state = MilestoneState {
+        milestone_ref: MilestoneRef {
+            repo: REPO.into(),
+            number: MILESTONE_CIBLE,
+        },
+        title: "mika-manager tient sa partie".into(),
+        description: "".into(),
+        state: IssueState::Open,
+        created_at: "".into(),
+        due_on: None,
+        last_activity_at: None,
+        sub_issues,
+        progress: ProgressCounts::default(),
+        recent_activity: vec![],
+        executor_healthy: None,
+        ready_pool: vec![],
+        outside_candidates: vec![],
+        outside_read_truncated: None,
+        plan_sizes: Default::default(),
+    };
+    let assessment = Assessment {
+        severity: Severity::Healthy,
+        recommendation: Recommendation {
+            next_sub_issue: None,
+            rationale: "corpus mika#2921".into(),
+        },
+        alerts: vec![],
+        cross_cutting: vec![],
+        contention_events: vec![],
+        pool: None,
+        flight_verdicts: verdicts,
+        relief: None,
+    };
+    crate::milestone_manager::reporter::Reporter::new().report(&state, &assessment)
+}
+
+/// Les lignes de la section « Vols terminés » d'un rapport — et rien d'autre.
+fn lignes_des_vols(rapport: &str) -> Vec<String> {
+    let debut = rapport
+        .find("### Vols terminés")
+        .unwrap_or_else(|| panic!("la section « Vols terminés » doit être rendue :\n{rapport}"));
+    let section = &rapport[debut..];
+    let fin = section
+        .find("### Silent-progress")
+        .expect("la section des alertes suit celle des vols");
+    section[..fin]
+        .lines()
+        .filter(|l| l.starts_with("- "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// **AC1 et AC2 de mika#2921, sur une vraie base et dans le même test.**
+///
+/// Le corpus des 13 vols mesurés passe par le chemin de production entier —
+/// base, [`crate::flight_source::DbFlightSource`] (donc le périmètre lu dans
+/// `DISPATCHABLE_REPOS`, et lui seul), `evaluate_flights`, puis le `Reporter` —
+/// sans bouchon de `FlightSource`.
+///
+/// - **AC1, la boucle visible.** Les 12 vols sur mika et mika-cloud reçoivent
+///   chacun un verdict, alors qu'**aucun** n'est un sous-ticket du milestone
+///   cible : c'est le relevé du 2026-10-26, contre lequel l'ancien périmètre
+///   rendait zéro verdict.
+/// - **AC2, jamais au-delà.** claude-pilot#232 n'est ni jugé ni rapporté. Son
+///   contrôle positif est dans le même test : la ligne existe en base, et c'est
+///   son **dépôt** — absent de `DISPATCHABLE_REPOS` — qui la tient dehors, pas
+///   une fixture qui n'aurait rien semé.
+///
+/// Le compte des issues est épinglé aussi (8 PR ouvertes, 2 morts au plafond,
+/// 2 sans ligne `Outcome:`) : c'est la forme qu'AC6 attend du premier cycle
+/// après déploiement — des verdicts **classés** sur des vols qui ont ouvert une
+/// PR, pas une colonne de `no_outcome_line`.
+#[tokio::test]
+async fn mika2921_le_corpus_des_13_vols_rend_12_verdicts_et_aucun_pour_claude_pilot() {
+    use crate::milestone_manager::evaluator::{
+        DeathCause, FlightIssue, FlightSource, PrStateKnowledge, evaluate_flights,
+    };
+
+    let base = crate::async_db::AsyncDatabase::new_with_agent(
+        base_semee(&CORPUS_DES_13_VOLS),
+        "mika-test",
+    );
+    let source = crate::flight_source::DbFlightSource::new(base.clone());
+    let sub_issues: Vec<_> = SOUS_TICKETS_DU_MILESTONE_CIBLE
+        .iter()
+        .map(|n| sous_ticket(*n, None))
+        .collect();
+
+    let vols = source.finished_implement_flights(None).await;
+    let verdicts = evaluate_flights(&vols, &sub_issues);
+
+    // AC1 — un verdict par vol d'un dépôt sous contrôle, et pas un de plus.
+    assert_eq!(
+        verdicts.len(),
+        12,
+        "13 vols semés, 12 sur un dépôt sous contrôle : obtenu {:?}",
+        verdicts
+            .iter()
+            .map(|v| (v.repo.clone(), v.issue_number))
+            .collect::<Vec<_>>()
+    );
+    let mut juges: Vec<(String, u64)> = verdicts
+        .iter()
+        .map(|v| {
+            (
+                v.repo
+                    .clone()
+                    .expect("chaque vol du corpus nomme son dépôt"),
+                v.issue_number
+                    .expect("chaque vol du corpus nomme son ticket"),
+            )
+        })
+        .collect();
+    juges.sort();
+    let mut attendus: Vec<(String, u64)> = CORPUS_DES_13_VOLS
+        .iter()
+        .filter(|(repo, ..)| *repo != REPO_DEHORS)
+        .map(|(repo, ticket, ..)| (repo.to_string(), u64::from(*ticket)))
+        .collect();
+    attendus.sort();
+    assert_eq!(
+        juges, attendus,
+        "chaque vol de mika et de mika-cloud est jugé, répétitions comprises"
+    );
+
+    // Aucun n'est dans le milestone cible : tous disent qu'ils n'ont rien lu.
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| v.pr_state == PrStateKnowledge::NotRead),
+        "aucun vol du corpus n'est un sous-ticket du milestone {MILESTONE_CIBLE} — \
+         un état « lu » serait inventé"
+    );
+
+    // La forme qu'AC6 attend : des verdicts classés.
+    let ouvertes = verdicts
+        .iter()
+        .filter(|v| {
+            matches!(
+                v.issue,
+                FlightIssue::PrOpened {
+                    number: Some(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    let au_plafond = verdicts
+        .iter()
+        .filter(|v| {
+            v.issue
+                == FlightIssue::Dead {
+                    cause: DeathCause::CeilingReached,
+                }
+        })
+        .count();
+    let sans_outcome = verdicts
+        .iter()
+        .filter(|v| {
+            v.issue
+                == FlightIssue::Dead {
+                    cause: DeathCause::Unknown("no_outcome_line".into()),
+                }
+        })
+        .count();
+    assert_eq!(
+        (ouvertes, au_plafond, sans_outcome),
+        (8, 2, 2),
+        "8 PR ouvertes, 2 morts au plafond, 2 sans ligne `Outcome:`"
+    );
+
+    // AC2 — ni le verdict ni le rapport ne nomment le vol hors périmètre.
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| v.repo.as_deref() != Some(REPO_DEHORS)),
+        "claude-pilot#232 a été jugé : le périmètre fuit"
+    );
+    let lignes = lignes_des_vols(&rapport(sub_issues, verdicts));
+    assert_eq!(
+        lignes.len(),
+        12,
+        "une ligne de rapport par verdict : {lignes:#?}"
+    );
+    for ligne in &lignes {
+        assert!(
+            !ligne.contains("claude-pilot") && !ligne.contains("#232 "),
+            "le rapport nomme le vol hors périmètre : {ligne}"
+        );
+        assert!(
+            ligne.contains(" — hors milestone cible — ") && ligne.contains("état de PR non lu"),
+            "un vol hors cible le dit, et dit qu'il n'a rien lu : {ligne}"
+        );
+    }
+
+    // Contrôle positif d'AC2 : la ligne de claude-pilot#232 existe, et c'est son
+    // dépôt — non une fixture vide — qui l'a tenue dehors.
+    let dehors = base
+        .list_finished_implement_flights_in_container(None, vec![REPO_DEHORS.to_string()])
+        .await
+        .expect("la lecture doit répondre");
+    assert_eq!(
+        dehors.len(),
+        1,
+        "claude-pilot#232 doit être en base, sous son propre dépôt"
+    );
+    assert_eq!(
+        dehors[0].flight.reference_url.as_deref(),
+        Some(issue_url_sur(REPO_DEHORS, 232).as_str())
+    );
+}
+
+/// **AC5 de mika#2921 — l'état de PR hors milestone, par le chemin réel.**
+///
+/// Un vol sur mika **hors** du milestone cible rend
+/// [`PrStateKnowledge::NotRead`], et sa ligne de rapport dit
+/// `état de PR non lu`. Le contrôle positif est dans le même test : un vol
+/// **dans** le milestone cible, apparié à un sous-ticket dont le `Reader` a lu
+/// `pr_state = "open"`, rend `Read(Some("open"))` et une ligne qui ne dit pas
+/// « non lu ». Les deux arms côte à côte séparent « le type est correct » de
+/// « le rendu est branché » ; les tests du `Reporter` tiennent le rendu sur des
+/// verdicts littéraux, celui-ci le tient sur des verdicts sortis de la base.
+#[tokio::test]
+async fn mika2921_hors_cible_letat_de_pr_est_non_lu_et_dans_la_cible_il_est_lu() {
+    use crate::milestone_manager::evaluator::{FlightSource, PrStateKnowledge, evaluate_flights};
+
+    const PR_OUVERTE: &str = "claude-pilot completed (status: success).\nTurns: 90\nPR: https://github.com/senara-solutions/mika/pull/2925\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2925\n";
+    let corpus = [
+        (REPO, 2921, "completed", PR_OUVERTE),
+        (REPO, 2900, "completed", PR_OUVERTE),
+    ];
+    let source = crate::flight_source::DbFlightSource::new(
+        crate::async_db::AsyncDatabase::new_with_agent(base_semee(&corpus), "mika-test"),
+    );
+    let sub_issues = vec![sous_ticket(2921, Some("open"))];
+
+    let vols = source.finished_implement_flights(None).await;
+    let verdicts = evaluate_flights(&vols, &sub_issues);
+    assert_eq!(verdicts.len(), 2);
+    let verdict_de = |n: u64| {
+        verdicts
+            .iter()
+            .find(|v| v.issue_number == Some(n))
+            .unwrap_or_else(|| panic!("le vol de mika#{n} doit être jugé"))
+    };
+
+    // Hors cible : rien n'a été lu, et le verdict le porte.
+    let hors = verdict_de(2900);
+    assert_eq!(hors.pr_state, PrStateKnowledge::NotRead);
+    let ligne_hors = crate::milestone_manager::reporter::render_flight_verdict(hors);
+    assert!(
+        ligne_hors.contains(" — hors milestone cible — ")
+            && ligne_hors.contains(" — état de PR non lu — "),
+        "obtenu : {ligne_hors}"
+    );
+
+    // Contrôle positif : dans la cible, l'état lu est rendu, et jamais « non lu ».
+    let dans = verdict_de(2921);
+    assert_eq!(dans.pr_state, PrStateKnowledge::Read(Some("open".into())));
+    let ligne_dans = crate::milestone_manager::reporter::render_flight_verdict(dans);
+    assert!(
+        ligne_dans.starts_with("- mika#2921 — milestone cible — ")
+            && ligne_dans.contains(" — PR open — "),
+        "obtenu : {ligne_dans}"
+    );
+    assert!(
+        !ligne_dans.contains("non lu"),
+        "un état lu ne se rend jamais comme non lu : {ligne_dans}"
+    );
+
+    // Et le rapport complet porte les deux, dans la même section.
+    let lignes = lignes_des_vols(&rapport(sub_issues, verdicts.clone()));
+    assert_eq!(lignes.len(), 2, "{lignes:#?}");
+    assert!(lignes.contains(&ligne_hors) && lignes.contains(&ligne_dans));
+}
