@@ -77,6 +77,32 @@ pub enum CiState {
     Failed,
 }
 
+/// D'où vient le lien entre un ticket et la PR qui le ferme (mika#2924).
+///
+/// Il y a deux chemins, et ils n'ont pas les mêmes garanties :
+///
+/// - [`Self::MilestonePrList`] — l'index inverse bâti sur
+///   `gh pr list --search milestone:N` et `closingIssuesReferences`. Ce chemin
+///   est le **seul** à porter `pr_state` et `ci_state` : il a vu la PR.
+/// - [`Self::IssueClosingRef`] — la référence que GitHub tient *côté issue*
+///   (`closedByPullRequestsReferences`). Elle répond pour les PR de la boucle
+///   autonome, qui rattache le milestone au **ticket** et jamais à la PR, donc
+///   que la liste ci-dessus ne voit pas. Elle ne dit rien de l'état de la PR.
+///
+/// **Pourquoi un champ, et pas une déduction.** Sans lui, « aucune PR » et « une
+/// PR que la liste du milestone ne voit pas » rendent les mêmes octets une fois
+/// le correctif posé (classe mika#2205 : deux populations rendant les mêmes
+/// octets), et la sonde AC3 ne peut pas distinguer les 14 tickets fermés à la
+/// main des tickets que le correctif vient de réparer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrLinkSource {
+    /// L'index inverse des PR du milestone — porte `pr_state` et `ci_state`.
+    MilestonePrList,
+    /// La référence de clôture côté issue — ne porte que numéro et URL.
+    IssueClosingRef,
+}
+
 /// A single sub-issue enumerated under the milestone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubIssue {
@@ -94,6 +120,28 @@ pub struct SubIssue {
     pub pr_number: Option<u64>,
     /// PR state: `open`, `closed`, `merged` — plain string from `gh pr view`.
     pub pr_state: Option<String>,
+    /// L'URL de la PR de clôture **telle que GitHub la donne** (mika#2924),
+    /// quand le lien vient de la référence côté issue.
+    ///
+    /// `None` sur le chemin liste-du-milestone, où le dépôt est connu par
+    /// construction et l'URL recomposée depuis `{repo}/pull/{pr_number}`. Sur le
+    /// chemin côté issue la recomposition est **refusée** : la référence peut
+    /// porter une PR d'un autre dépôt, et un lien recomposé pointerait alors sur
+    /// une PR qui n'existe pas.
+    ///
+    /// `#[serde(default)]` pour la raison de `outside_read_truncated` — le puits
+    /// hors-ligne tient des blobs écrits avant ce champ.
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    /// D'où vient [`Self::pr_number`] (mika#2924).
+    ///
+    /// Posé par les **deux** chemins de résolution, pour que `None` dise
+    /// « sérialisé par un binaire antérieur au correctif » et jamais
+    /// « liste du milestone » (mika#2340 : un signal absent veut dire un binaire
+    /// plus vieux, pas une valeur par défaut). Voir [`PrLinkSource`] pour ce que
+    /// chaque chemin garantit.
+    #[serde(default)]
+    pub pr_link_source: Option<PrLinkSource>,
     pub ci_state: CiState,
     /// Numbers of open blocker issues from the `blockedBy` GraphQL edge.
     pub blockers: Vec<u64>,
@@ -719,6 +767,8 @@ mod tests {
             branch_present: false,
             pr_number: None,
             pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-08-21T00:00:00Z".into(),
@@ -759,6 +809,8 @@ mod tests {
             branch_present: false,
             pr_number: None,
             pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-08-21T00:00:00Z".into(),
@@ -784,5 +836,114 @@ mod tests {
             ..base
         };
         assert!(ci_failed.is_hard_blocked());
+    }
+
+    // -- mika#2924 : la provenance du lien de PR, et son contrat de fil --
+
+    /// **V6** — un `MilestoneState` écrit par un binaire antérieur à mika#2924
+    /// se relit, et les deux champs neufs valent `None`.
+    ///
+    /// Le puits hors-ligne tient de tels blobs : une montée de version incapable
+    /// de relire son propre arriéré le perdrait. Et `pr_link_source == None` doit
+    /// rester lisible comme « sérialisé avant le correctif » — c'est le motif
+    /// mika#2340, un signal absent veut dire un binaire plus vieux, jamais une
+    /// valeur par défaut. Le ticket **porte un `pr_number`** dans ce blob, pour
+    /// que l'assertion ne puisse pas passer par simple absence de lien.
+    #[test]
+    fn mika2924_un_blob_anterieur_se_relit_avec_provenance_absente() {
+        let blob = r#"{
+            "ref": {"repo": "senara-solutions/mika", "number": 33},
+            "title": "m33",
+            "description": "",
+            "state": "open",
+            "created_at": "2026-10-01T00:00:00Z",
+            "due_on": null,
+            "last_activity_at": null,
+            "sub_issues": [{
+                "number": 2886,
+                "title": "t",
+                "state": "closed",
+                "priority_rank": null,
+                "plan_present": true,
+                "branch_present": true,
+                "pr_number": 2892,
+                "pr_state": "merged",
+                "ci_state": "success",
+                "blockers": [],
+                "updated_at": "2026-10-23T00:00:00Z",
+                "labels": []
+            }],
+            "progress": {"completed": 1, "in_flight": 0, "blocked": 0, "unstarted": 0, "total": 1},
+            "recent_activity": [],
+            "executor_healthy": null
+        }"#;
+        let st: MilestoneState =
+            serde_json::from_str(blob).expect("un blob d'avant les champs doit encore se lire");
+        let sub = &st.sub_issues[0];
+        assert_eq!(
+            sub.pr_number,
+            Some(2892),
+            "le lien préexistant est conservé"
+        );
+        assert_eq!(
+            sub.pr_url, None,
+            "champ absent ⇒ None, et surtout pas une URL recomposée"
+        );
+        assert_eq!(
+            sub.pr_link_source, None,
+            "champ absent ⇒ None, qui dit « binaire antérieur » et non \
+             « liste du milestone » (mika#2340)"
+        );
+    }
+
+    /// `None` sort en `null`, jamais en chaîne vide ni en objet : « on ne sait
+    /// pas d'où vient ce lien » et « il vient de la liste du milestone » sont
+    /// deux faits différents, et les confondre est exactement ce que le champ
+    /// existe pour empêcher (motif mika#2331).
+    #[test]
+    fn mika2924_une_provenance_absente_serialise_en_null() {
+        let sub = SubIssue {
+            number: 1,
+            title: "t".into(),
+            state: IssueState::Closed,
+            priority_rank: None,
+            plan_present: false,
+            branch_present: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
+            ci_state: CiState::None,
+            blockers: vec![],
+            updated_at: "2026-10-26T00:00:00Z".into(),
+            labels: vec![],
+        };
+        let out = serde_json::to_string(&sub).unwrap();
+        assert!(
+            out.contains(r#""pr_url":null"#) && out.contains(r#""pr_link_source":null"#),
+            "une provenance non posée se dit null — obtenu : {out}"
+        );
+        let back: SubIssue = serde_json::from_str(&out).unwrap();
+        assert_eq!(back, sub, "aller-retour fidèle");
+    }
+
+    /// Les deux variantes de provenance ont un nom de fil **distinct et
+    /// stable** : le puits hors-ligne les relit, et la sonde AC3 s'en sert pour
+    /// séparer les tickets fermés à la main de ceux que le correctif répare.
+    #[test]
+    fn mika2924_les_deux_provenances_ont_un_nom_de_fil_distinct() {
+        let a = serde_json::to_string(&PrLinkSource::MilestonePrList).unwrap();
+        let b = serde_json::to_string(&PrLinkSource::IssueClosingRef).unwrap();
+        assert_eq!(a, r#""milestone_pr_list""#);
+        assert_eq!(b, r#""issue_closing_ref""#);
+        assert_ne!(a, b);
+        assert_eq!(
+            serde_json::from_str::<PrLinkSource>(&a).unwrap(),
+            PrLinkSource::MilestonePrList
+        );
+        assert_eq!(
+            serde_json::from_str::<PrLinkSource>(&b).unwrap(),
+            PrLinkSource::IssueClosingRef
+        );
     }
 }

@@ -324,7 +324,7 @@ pub use spawn::{
 };
 pub use types::{
     Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MilestoneRef, MilestoneState,
-    ProgressCounts, RecentActivity, Recommendation, Severity, SubIssue,
+    PrLinkSource, ProgressCounts, RecentActivity, Recommendation, Severity, SubIssue,
 };
 pub use verdict_poster::{
     ENV_EVALUATE_WRITE, MARKER_PREFIX, post_verdicts, render_verdict_comment, verdict_marker,

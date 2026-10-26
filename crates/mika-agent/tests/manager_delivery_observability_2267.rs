@@ -134,6 +134,8 @@ fn base_state() -> MilestoneState {
             branch_present: true,
             pr_number: Some(2002),
             pr_state: Some("open".into()),
+            pr_url: None,
+            pr_link_source: None,
             ci_state: CiState::Success,
             blockers: vec![],
             updated_at: "2026-08-20T00:00:00Z".into(),
