@@ -440,37 +440,23 @@ mod tests {
     /// rester vert après qu'il a changé d'avis.
     ///
     /// Rend l'identifiant de la parente — la ligne que la source doit rendre.
+    ///
+    /// Le geste lui-même a été **promu** en
+    /// [`crate::db::tests::seme_la_forme_reelle`] par mika#2921 : le corpus des
+    /// 13 vols mesurés en a besoin depuis `db::tests::vols_termines_du_manager`,
+    /// un module frère de celui-ci — donc invisible d'ici, et réciproquement
+    /// (règle de visibilité mika#2321). Ce qui reste ici est ce que mika#2886
+    /// fixe : *ce* ticket, *cet* agent, et une parente `completed`.
     fn seme_la_forme_reelle(db: &Database, resultat_de_lenfant: &str) -> String {
-        db.register_agent("mika-dev", "mika-dev", "/tmp/mika-dev")
-            .expect("l'agent dispatcheur doit être enregistré");
-
-        let parente = crate::task_state::tasks::NewTask {
-            dispatch_class: Some("implement".to_string()),
-            ..crate::db::tests::groom_parent("mika-dev", TICKET_2886)
-        };
-        let parente_id = db
-            .create_task(&parente)
-            .expect("la parente doit être créée");
-        // `None` : la parente se termine sans `result`. C'est l'absence, pas une
-        // chaîne vide (motif mika#2331), et c'est ce que la production écrit.
-        db.update_task_completed(&parente_id, "mika-dev", None)
-            .expect("la complétion de la parente doit réussir");
-
-        let enfant = crate::skills::executor::build_callback_task(
-            "mika-dev".to_string(),
-            Some(parente_id.clone()),
-            "run_claude_pilot",
-            &serde_json::json!({"skill": "dev-pilot"}),
-            3_600,
-            "session-2886",
-            "trace-2886",
-            None,
-        );
-        let enfant_id = db.create_task(&enfant).expect("l'enfant doit être créé");
-        db.update_task_completed(&enfant_id, "mika-dev", Some(resultat_de_lenfant))
-            .expect("la complétion de l'enfant doit réussir");
-
-        parente_id
+        crate::db::tests::seme_la_forme_reelle(
+            db,
+            "mika-dev",
+            &crate::db::tests::VolReel {
+                url_du_ticket: TICKET_2886,
+                statut: "completed",
+                issue_du_pilote: resultat_de_lenfant,
+            },
+        )
     }
 
     /// **AC1 — le test qui rougit contre le code actuel (AC3).** La forme réelle
