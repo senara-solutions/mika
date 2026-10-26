@@ -37,6 +37,7 @@ use super::reader::{GhCommandError, GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
 use super::types::MilestoneRef;
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
+use crate::flight_verdict_ledger::FlightVerdictLedger;
 use mika_common::auth_boundary::AuthBoundaryError;
 use mika_common::config::Settings;
 use mika_common::github_app::GitHubApp;
@@ -306,6 +307,13 @@ pub async fn manager_config_from_env(
 /// nominal : sans source, l'assessment ne porte aucun verdict, le rapport n'a
 /// pas la section, et le cycle est exactement celui d'avant mika#2698. La
 /// source n'a **aucune** autorité d'écriture — elle lit `tasks`, c'est tout.
+///
+/// **mika#2922 — `verdict_ledger`.** Où chaque verdict de l'évaluateur est
+/// inscrit. Injectée comme `auth_ledger`, et pour la même raison : un registre
+/// est une destination, pas une décision. `None` est un état nominal — le cycle
+/// est alors exactement celui d'avant mika#2922. Le registre n'a **aucune**
+/// autorité : il écrit dans `audit_events` et ne touche ni la forge, ni le
+/// rapport, ni le verdict qu'il inscrit.
 pub fn spawn_manager_cycle_task(
     mut cfg: ManagerConfig,
     cancel: CancellationToken,
@@ -313,6 +321,7 @@ pub fn spawn_manager_cycle_task(
     auth_ledger: Option<Arc<dyn AuthBoundaryLedger>>,
     liveness_sink: Arc<dyn LivenessSink>,
     flight_source: Option<Arc<dyn FlightSource>>,
+    verdict_ledger: Option<Arc<dyn FlightVerdictLedger>>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -477,6 +486,7 @@ pub fn spawn_manager_cycle_task(
                 auth_ledger.as_ref(),
                 &pending_auth_notes,
                 flight_source.as_ref(),
+                verdict_ledger.as_ref(),
             )
             .await
             {
@@ -2034,6 +2044,7 @@ mod tests {
             None,
             noop_liveness_sink(),
             None,
+            None,
         )
         .expect("first spawn returns Some(handle)");
 
@@ -2500,6 +2511,7 @@ mod tests {
             None,
             noop_liveness_sink(),
             None,
+            None,
         );
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
@@ -2511,6 +2523,7 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
             None,
         );
         assert!(
@@ -2675,6 +2688,7 @@ mod tests {
             Arc::new(resolver),
             None,
             noop_liveness_sink(),
+            None,
             None,
         )
         .expect("spawn returns Some(handle)");
