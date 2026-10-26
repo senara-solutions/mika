@@ -57,6 +57,27 @@ Two details that make the line readable rather than decorative:
 - **Attest on every outcome, the stops included.** A stop writes no trace at all today, and this measurement exists precisely to count the stops by number.
 - **If the line is missing, the engine records `outcome_absent`** — never a guessed stop, because steps 1 and 2 leave the same tool trace, as do steps 3 and 4. An unattested turn still costs its tokens; it just no longer says what they bought.
 
+## Record the head you concluded on (mika#2917)
+
+**When.** After step 3, after step 4, or after step 5 — once the stop is established or the review is dispatched. Never before: the call attests what this turn did, it does not decide it, and it never replaces a step.
+
+**What.** One call, carrying the **same** `outcome` value as this turn's attestation line (§ *Outcome attestation* above):
+
+| ended the turn at | the call that closes it |
+|---|---|
+| step 3 — one of your own reviews already carries this `commit_id` | `record_reviewed_head(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>", outcome: "stop_already_reviewed_sha")` |
+| step 4 — an authoritative verdict is already recorded on this head | `record_reviewed_head(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>", outcome: "stop_verdict_recorded")` |
+| step 5 — you dispatched the `qa-review` skill | `record_reviewed_head(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>", outcome: "review")` |
+
+`head_sha` is the check_suite's head SHA — the one you already read off the event at step 1. Do not go back to the forge for it.
+
+**The three other outcomes record nothing, and the tool refuses them:**
+
+- `stop_no_open_pr` (step 1) and `stop_out_of_scope` (step 2) — there is no PR, or none of yours, so there is no head to name.
+- `review_failed` (step 6) — the review did **not** conclude on this head. Recording it would suppress a future review that still has to happen.
+
+**If the call fails.** Do not retry it, do not escalate it, and do not change the turn's outcome. A missing row costs one paid turn on the next `check_suite` for this head — which is exactly today's regime. An escalation, by contrast, would turn a bookkeeping miss into an operator interrupt.
+
 ## Why this skill exists
 
 Before mika#1711 shipped this handler, `check_suite.completed(success)` events routed only to mika-dev's `self-dev-webhook-ci` (which handles CI **failures**, not successes). mika-qa never received a webhook signalling that CI was green and the PR was ready for review — so autonomous review only fired when a human or bot explicitly used `gh api .../requested_reviewers` to request `mika-platform-qa`. The gap caused a 14-hour dead qa window on 2026-07-01 during which multiple autonomous-loop PRs landed READY+GREEN with zero qa attempts.

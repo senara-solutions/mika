@@ -199,6 +199,81 @@ pub(crate) fn production_half(content: &str) -> &str {
     }
 }
 
+/// Tous les fichiers de production de `crates/mika-agent/src/`, en paires
+/// `(chemin relatif à `src/`, moitié production)`.
+///
+/// Le code de test est écarté deux fois, et les deux passes sont nécessaires :
+/// par le **chemin** ([`is_test_source_path`], la réparation mika#2321 — un
+/// module de test extrait ne porte aucun littéral `#[cfg(test)]`), puis par la
+/// **troncature** de [`production_half`] pour le `mod tests` inline du reste.
+///
+/// Le séparateur est normalisé en `/` : les assertions des gardes nomment des
+/// chemins, et un chemin qui dépend de la plateforme n'est pas un attendu.
+pub(crate) fn production_files() -> Vec<(String, String)> {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    walk(&root, &mut paths);
+    paths
+        .into_iter()
+        .filter(|p| !is_test_source_path(p))
+        .map(|p| {
+            let src = std::fs::read_to_string(&p).unwrap();
+            let prod = production_half(&src).to_string();
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, prod)
+        })
+        .collect()
+}
+
+/// Les fichiers de production qui passent `needle` à `log_audit_event` : la
+/// fenêtre lue est la ligne d'ouverture de l'appel et les quatre suivantes,
+/// parce qu'un appel d'audit est écrit sur cinq lignes par `rustfmt` et que le
+/// nom d'outil y est le deuxième argument.
+///
+/// **Le lecteur unique de ce prédicat.** Il vivait inline dans le `mod tests` de
+/// [`crate::qa_head_supersession`], où il tient les trois noms d'audit de
+/// mika#2671 ; mika#2917 l'a promu ici parce qu'une seconde garde pose la même
+/// question sur un quatrième nom. Promu plutôt que recopié : deux prédicats pour
+/// une question, dans deux fichiers, avec deux fenêtres à faire diverger, est la
+/// classe que `grooming_marker` a dû graver une fois (mika#2158 — une regex
+/// copiée dont le commentaire disait « Mirrors … » et qui a ensuite raté deux
+/// élargissements), et c'est la règle que ce module énonce pour lui-même.
+///
+/// `needle` est le **nom de la constante**, pas sa valeur : une garde qui
+/// cherchait le littéral ne verrait pas le site qui passe la constante, qui est
+/// précisément la forme qu'un écrivain correct emploie.
+pub(crate) fn audit_writers(needle: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (rel, prod) in production_files() {
+        let lines: Vec<&str> = prod.lines().collect();
+        let writes = lines.iter().enumerate().any(|(i, l)| {
+            l.contains("log_audit_event(")
+                && lines[i..(i + 5).min(lines.len())]
+                    .iter()
+                    .any(|w| w.contains(needle))
+        });
+        if writes {
+            out.push(rel);
+        }
+    }
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
