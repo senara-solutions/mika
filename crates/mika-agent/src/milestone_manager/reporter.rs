@@ -558,10 +558,30 @@ impl Default for Reporter {
 /// The section is always present so downstream parsers (Assessor consumers,
 /// external `mika milestone report` clients) see a uniform shape.
 ///
-/// PR-linkage: reuses `SubIssue::pr_number` populated by
-/// `Reader::compose_from_gh_outputs` via the `closingIssuesReferences`
-/// reverse index. When a closed sub-issue has no linked PR (hand-closed,
-/// or PR not tagged with the milestone), the entry reads `closed (no linked PR)`.
+/// PR-linkage: reuses `SubIssue::pr_number` and `SubIssue::pr_url`, both
+/// populated by `Reader::compose_from_gh_outputs` — from the
+/// `closingIssuesReferences` reverse index when the PR carries the milestone,
+/// else from the ticket's own `closedByPullRequestsReferences` (mika#2924).
+///
+/// Three arms, because the two resolution paths do not carry the same thing
+/// and collapsing them would make the report lie:
+///
+/// 1. **An URL is carried** (`pr_url`) — render it verbatim. It comes from the
+///    issue-side reference, whose entry carries a nested `repository` object:
+///    the PR may live in **another** repository, so recomposing
+///    `{repo}/pull/{number}` would point at a PR that does not exist.
+/// 2. **A number only** (`pr_number`) — recompose from `repo`. This is the
+///    milestone-index path, built on the PR list of the milestone's own
+///    repository, so the recomposition is sound there.
+/// 3. **Neither** — the entry reads `closed (no linked PR)`, **word for
+///    word**: that string is what the AC3 probe counts on the sink report
+///    (`grep -c 'closed (no linked PR)'`, 87 → 14 expected). Changing it
+///    silently retires the instrument.
+///
+/// The third arm now means what it says: hand-closed, and nothing else. Until
+/// mika#2924 it also absorbed "the PR exists but does not carry the
+/// milestone" — the autonomous loop's entire output, 87 lines on milestone 33
+/// — and the report read as though nothing had been delivered.
 fn write_completed(out: &mut String, subs: &[SubIssue], repo: &str) {
     let completed: Vec<&SubIssue> = subs
         .iter()
@@ -573,8 +593,16 @@ fn write_completed(out: &mut String, subs: &[SubIssue], repo: &str) {
     }
     writeln!(out, "- Completed:").unwrap();
     for s in completed {
-        match s.pr_number {
-            Some(pr) => {
+        match (s.pr_url.as_deref(), s.pr_number) {
+            (Some(url), _) => {
+                let _ = writeln!(
+                    out,
+                    "  - #{n} {title} — PR {url}",
+                    n = s.number,
+                    title = s.title
+                );
+            }
+            (None, Some(pr)) => {
                 let _ = writeln!(
                     out,
                     "  - #{n} {title} — PR https://github.com/{repo}/pull/{pr}",
@@ -582,7 +610,7 @@ fn write_completed(out: &mut String, subs: &[SubIssue], repo: &str) {
                     title = s.title
                 );
             }
-            None => {
+            (None, None) => {
                 let _ = writeln!(
                     out,
                     "  - #{n} {title} — closed (no linked PR)",
@@ -834,6 +862,7 @@ mod tests {
         PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause, assess_pool,
         assess_pool_sans_tailles,
     };
+    use crate::milestone_manager::reader::compose_from_gh_outputs;
     use crate::milestone_manager::relief::name_relief;
     use crate::milestone_manager::types::{
         ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
@@ -1496,6 +1525,78 @@ mod tests {
         };
         let out = Reporter::new().report(&state_with(vec![closed], p), &empty_assessment());
         assert!(out.contains("- #1801 issue 1801 — closed (no linked PR)"));
+    }
+
+    // -----------------------------------------------------------------
+    // mika#2924 AC1 — le rapport, depuis une sortie `gh` réellement capturée.
+    // -----------------------------------------------------------------
+
+    /// La sortie `gh issue list --milestone 33` capturée le 2026-10-26,
+    /// filtrée sur les deux contrôles. Même document que celui que les tests du
+    /// `Reader` consomment : un seul fichier témoigne, pour les deux étages.
+    const FIXTURE_MILESTONE_33: &str =
+        include_str!("../../tests/fixtures/mika2924/issues-milestone-33.json");
+
+    /// mika#2924 AC1 — **le contrôle positif et le contrôle négatif dans le
+    /// même test**, sur le même document, bout en bout : la sortie `gh`
+    /// capturée traverse le `Reader` puis le `Reporter`, et c'est le texte du
+    /// rapport qui est assert.
+    ///
+    /// La liste des PR du milestone est `[]`, ce qui *est* la situation de
+    /// production : le pilote rattache le milestone au ticket et jamais à la
+    /// PR, et c'est exactement ce qui a fait dire `closed (no linked PR)` à 87
+    /// lignes du rapport du sink.
+    ///
+    /// Les deux contrôles sont indissociables. Sans le négatif, un rapporteur
+    /// qui rendrait un lien de PR pour tout ticket fermé passerait le positif ;
+    /// sans le positif, un rapporteur qui ne rendrait jamais rien passerait le
+    /// négatif. C'est le couple qui atteste.
+    #[test]
+    fn mika2924_le_rapport_rend_la_pr_de_cloture_et_garde_le_mot_pour_mot_sans_pr() {
+        let milestone_json = r#"{"title": "M33", "description": "sink", "state": "open", "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state =
+            compose_from_gh_outputs(&r, milestone_json, FIXTURE_MILESTONE_33, "[]").unwrap();
+        let out = Reporter::new().report(&state, &empty_assessment());
+
+        // Contrôle positif : #2886, fermé par la PR #2892 mergée le
+        // 2026-10-23. L'URL est celle que la référence côté issue porte.
+        let ligne_2886 = out
+            .lines()
+            .find(|l| l.contains("#2886"))
+            .expect("la ligne de #2886 est dans la section Completed");
+        assert!(
+            ligne_2886.ends_with(" — PR https://github.com/senara-solutions/mika/pull/2892"),
+            "la ligne de #2886 doit finir par le lien de sa PR de clôture, \
+             or elle dit : {ligne_2886}"
+        );
+
+        // Contrôle négatif : #1680, fermé à la main, aucune référence de
+        // clôture. La chaîne est celle que la sonde AC3 compte sur le rapport
+        // du sink — `grep -c 'closed (no linked PR)'`, 87 → 14 attendu : elle
+        // est assert mot pour mot, parce que la changer retirerait
+        // l'instrument en silence.
+        let ligne_1680 = out
+            .lines()
+            .find(|l| l.contains("#1680"))
+            .expect("la ligne de #1680 est dans la section Completed");
+        assert!(
+            ligne_1680.ends_with(" — closed (no linked PR)"),
+            "la ligne de #1680 doit finir par `closed (no linked PR)`, \
+             or elle dit : {ligne_1680}"
+        );
+
+        // Et le rapport ne dit `no linked PR` qu'une seule fois : si la
+        // résolution régressait, les deux lignes se remettraient à le dire, et
+        // les deux assertions ci-dessus laisseraient passer celle de #1680.
+        assert_eq!(
+            out.matches("closed (no linked PR)").count(),
+            1,
+            "un seul des deux tickets fermés est sans PR :\n{out}"
+        );
     }
 
     #[test]
