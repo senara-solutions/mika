@@ -14,6 +14,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
+use mika_common::github_event_format::{
+    CHECK_SUITE_HEAD_LINE_PREFIX, CHECK_SUITE_PRS_LINE_PREFIX, CHECK_SUITE_PRS_NONE,
+};
 use rand::RngExt;
 use secrecy::ExposeSecret;
 use sha2::Sha256;
@@ -99,6 +102,29 @@ pub struct GitHubInstallation {
 pub struct CheckSuite {
     pub conclusion: Option<String>,
     pub head_branch: Option<String>,
+    /// La tête de la suite (mika#2917). Jetée jusqu'à ce vol, ce qui rendait
+    /// le texte transmis incapable de nommer de quelle tête l'événement parle.
+    pub head_sha: Option<String>,
+    /// Les PR que la forge associe à cette suite (mika#2917).
+    ///
+    /// `#[serde(default)]` : un payload dépourvu du tableau se désérialise, il
+    /// ne fait pas échouer la livraison. Mesuré vide sur mika#2681, ce qui est
+    /// un état nominal de la forge et non une anomalie.
+    #[serde(default)]
+    pub pull_requests: Vec<CheckSuitePullRequest>,
+}
+
+/// Une entrée de `check_suite.pull_requests[]` (mika#2917).
+///
+/// **Tout est `Option`, délibérément.** Une entrée dont `number` manquerait
+/// ferait échouer la désérialisation de l'événement **entier** si le champ
+/// était requis — donc une livraison perdue pour un champ que ce vol ne fait
+/// que transmettre. Le producteur saute l'entrée qu'il ne sait pas nommer ;
+/// c'est le fail-safe de la bonne direction (le tour a lieu).
+#[derive(Debug, serde::Deserialize)]
+pub struct CheckSuitePullRequest {
+    pub number: Option<u64>,
+    pub head: Option<GitHubRef>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -124,6 +150,15 @@ pub struct GitHubPullRequest {
 pub struct GitHubRef {
     #[serde(rename = "ref")]
     pub ref_name: Option<String>,
+    /// La tête que ce `ref` désigne (mika#2917). Présente sur tous les objets
+    /// `head` de la forge (`pull_request.head`, `check_suite.pull_requests[].head`)
+    /// et jusqu'ici non désérialisée.
+    ///
+    /// **Un seul type de `ref`, et pas un second.** La forme de l'objet est la
+    /// même partout chez GitHub ; en écrire une copie pour le seul besoin de
+    /// `check_suite` serait la classe de divergence programmée que ce dépôt
+    /// refuse ailleurs (mika#2158).
+    pub sha: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -391,6 +426,36 @@ fn truncate_body(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Rend la valeur de la ligne [`CHECK_SUITE_PRS_LINE_PREFIX`] : les PR que la
+/// suite **nomme**, sous la forme `{n}@{sha}` séparés par un espace (mika#2917).
+///
+/// Une entrée dont le numéro ou le `head.sha` manque est **sautée** : une PR
+/// sans tête n'est pas une PR nommée, et la transmettre à moitié donnerait au
+/// consommateur un numéro sans la tête qu'il compare.
+///
+/// Rend [`CHECK_SUITE_PRS_NONE`] quand rien n'est nommable — tableau vide (état
+/// nominal de la forge, mesuré sur mika#2681) comme tableau dont toutes les
+/// entrées ont été sautées. **Jamais une valeur vide** : « ne nomme aucune
+/// tête » est une forme de la grammaire, et elle a un nom.
+fn format_check_suite_prs(pull_requests: &[CheckSuitePullRequest]) -> String {
+    let named: Vec<String> = pull_requests
+        .iter()
+        .filter_map(|pr| {
+            let number = pr.number?;
+            let sha = pr.head.as_ref()?.sha.as_deref()?;
+            if sha.is_empty() {
+                return None;
+            }
+            Some(format!("{number}@{sha}"))
+        })
+        .collect();
+
+    if named.is_empty() {
+        return CHECK_SUITE_PRS_NONE.to_string();
+    }
+    named.join(" ")
+}
+
 /// Format a GitHub webhook event into a markdown summary suitable for the agent's context.
 ///
 /// Includes event type, action, repository, relevant titles/bodies, and URLs.
@@ -550,8 +615,27 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
             let branch = cs
                 .and_then(|c| c.head_branch.as_deref())
                 .unwrap_or("unknown");
+            // `unknown` sur le modèle exact de `conclusion` et `branch` : le
+            // gateway n'invente pas une tête, et le consommateur traite
+            // `unknown` comme une tête non nommée.
+            let head = cs.and_then(|c| c.head_sha.as_deref()).unwrap_or("unknown");
+            // Pas de `unwrap_or_default()` ici : une valeur VIDE n'est pas une
+            // forme de la grammaire, et `CHECK_SUITE_PRS_NONE` dit exactement
+            // ce qu'un `check_suite` absent dit du payload — il ne nomme
+            // aucune tête.
+            let prs = cs.map_or_else(
+                || CHECK_SUITE_PRS_NONE.to_string(),
+                |c| format_check_suite_prs(&c.pull_requests),
+            );
 
-            format!("[GitHub] Check suite {conclusion} on {repo_name} (branch: {branch})")
+            // Les deux lignes nouvelles sont des lignes 2 et 3, JAMAIS la
+            // ligne 1 : les quatre lecteurs du moteur ne lisent que la
+            // première et la terminent sur son `)` (mika#2917 R3).
+            format!(
+                "[GitHub] Check suite {conclusion} on {repo_name} (branch: {branch})\n\
+                 {CHECK_SUITE_HEAD_LINE_PREFIX}{head}\n\
+                 {CHECK_SUITE_PRS_LINE_PREFIX}{prs}"
+            )
         }
         _ => {
             format!("[GitHub] {event_type}.{action} on {repo_name}")
@@ -2330,6 +2414,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/bug".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2372,6 +2457,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/review-routing".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2427,6 +2513,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/review-routing".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2487,6 +2574,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/review-routing".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2531,6 +2619,8 @@ mod tests {
             check_suite: Some(CheckSuite {
                 conclusion: Some("failure".to_string()),
                 head_branch: Some("main".to_string()),
+                head_sha: None,
+                pull_requests: Vec::new(),
             }),
             issue: None,
             pull_request: None,
@@ -2566,6 +2656,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("feat/new".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2783,6 +2874,7 @@ mod tests {
             body: None,
             head: Some(GitHubRef {
                 ref_name: Some("feat/2680/registre".to_string()),
+                sha: None,
             }),
             merged: Some(true),
         })
@@ -2809,6 +2901,8 @@ mod tests {
             event.check_suite = Some(CheckSuite {
                 conclusion: Some(conclusion.to_string()),
                 head_branch: Some("main".to_string()),
+                head_sha: None,
+                pull_requests: Vec::new(),
             });
             let text = format_event_text("check_suite", &event);
             assert!(
@@ -2958,6 +3052,147 @@ mod tests {
             text, "[GitHub] push.unknown on senara-solutions/mika",
             "la forme réelle d'un push est celle de l'attrape-tout"
         );
+
+        // (8) Les deux lignes de tête de mika#2917 — et leur POSITION, qui est
+        // la moitié non négociable du contrat. Les quatre lecteurs du texte
+        // `check_suite` (`parse_check_suite_success`, `parse_check_suite_failure`
+        // et les deux `CHECK_SUITE_RE`) ne lisent que la première ligne : une
+        // tête émise en ligne 1 les casserait tous, en silence pour trois
+        // d'entre eux. Ce test épingle donc l'indice de ligne, pas seulement
+        // la présence du préfixe.
+        let mut event = mika2680_blank_event();
+        event.check_suite = Some(CheckSuite {
+            conclusion: Some("success".to_string()),
+            head_branch: Some("feat/2917/x".to_string()),
+            head_sha: Some("1a2b3c4d".to_string()),
+            pull_requests: vec![CheckSuitePullRequest {
+                number: Some(2917),
+                head: Some(GitHubRef {
+                    ref_name: Some("feat/2917/x".to_string()),
+                    sha: Some("1a2b3c4d".to_string()),
+                }),
+            }],
+        });
+        let text = format_event_text("check_suite", &event);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "le gabarit `check_suite` porte exactement trois lignes depuis \
+             mika#2917 : {text:?}"
+        );
+        assert!(
+            lines[1].starts_with(fmt::CHECK_SUITE_HEAD_LINE_PREFIX),
+            "CHECK_SUITE_HEAD_LINE_PREFIX a dérivé, ou a changé de ligne : {text:?}"
+        );
+        assert!(
+            lines[2].starts_with(fmt::CHECK_SUITE_PRS_LINE_PREFIX),
+            "CHECK_SUITE_PRS_LINE_PREFIX a dérivé, ou a changé de ligne : {text:?}"
+        );
+        assert!(
+            !lines[0].contains(fmt::CHECK_SUITE_HEAD_LINE_PREFIX)
+                && !lines[0].contains(fmt::CHECK_SUITE_PRS_LINE_PREFIX),
+            "une tête en PREMIÈRE ligne casse les quatre lecteurs du texte \
+             `check_suite`, dont trois en silence : {text:?}"
+        );
+    }
+
+    /// mika#2917 — l'aller-retour producteur → consommateur, sur les quatre
+    /// formes que la charge utile peut prendre.
+    ///
+    /// Les constantes et le parse vivent dans `mika-common`, et c'est ce qui
+    /// rend ce test possible : il fait passer la sortie **réelle** de
+    /// `format_event_text` par `parse_check_suite_heads`, au lieu d'épingler de
+    /// part et d'autre deux littéraux qui peuvent dériver ensemble en restant
+    /// verts (classe mika#2158). Un format qui change et un parse qui suit
+    /// restent verts ici — un format qui change **seul** ne l'est pas.
+    #[test]
+    fn mika2917_le_texte_emis_se_relit_par_le_parse_de_mika_common() {
+        use mika_common::github_event_format::{CheckSuiteHeads, parse_check_suite_heads};
+
+        fn text_for(pull_requests: Vec<CheckSuitePullRequest>) -> String {
+            let mut event = mika2680_blank_event();
+            event.check_suite = Some(CheckSuite {
+                conclusion: Some("success".to_string()),
+                head_branch: Some("feat/2917/x".to_string()),
+                head_sha: Some("1a2b3c4d".to_string()),
+                pull_requests,
+            });
+            format_event_text("check_suite", &event)
+        }
+
+        fn pr(number: u64, sha: &str) -> CheckSuitePullRequest {
+            CheckSuitePullRequest {
+                number: Some(number),
+                head: Some(GitHubRef {
+                    ref_name: Some("feat/2917/x".to_string()),
+                    sha: Some(sha.to_string()),
+                }),
+            }
+        }
+
+        // (a) `pull_requests` ABSENT de la charge utile — la forme qui
+        // décide si `#[serde(default)]` est là, et la seule que `Vec::new()`
+        // ne peut pas simuler : sans lui, un payload dépourvu du tableau fait
+        // échouer la désérialisation de l'événement ENTIER, donc perd la
+        // livraison, pour un champ que ce vol ne fait que transmettre.
+        // Le gateway écrit alors `none` : du point de vue du consommateur, une
+        // forge qui ne nomme aucune PR et une forge qui en nomme zéro disent
+        // la même chose du payload. C'est `LineAbsent` qui est l'autre
+        // population — un binaire antérieur à ce vol (motif mika#2340) — et
+        // aucun gateway conforme ne l'émet.
+        let sans_tableau: CheckSuite = serde_json::from_str(
+            r#"{"conclusion":"success","head_branch":"feat/2917/x","head_sha":"1a2b3c4d"}"#,
+        )
+        .expect(
+            "un `check_suite` sans `pull_requests` doit se désérialiser — \
+             sinon la livraison est perdue",
+        );
+        assert!(sans_tableau.pull_requests.is_empty());
+        assert_eq!(
+            parse_check_suite_heads(&text_for(sans_tableau.pull_requests)),
+            CheckSuiteHeads::Empty
+        );
+
+        // (b) Tableau vide — la forme mesurée sur mika#2681.
+        assert_eq!(
+            parse_check_suite_heads(&text_for(Vec::new())),
+            CheckSuiteHeads::Empty
+        );
+
+        // (c) Une seule PR : le seul cas où l'événement nomme SA tête.
+        assert_eq!(
+            parse_check_suite_heads(&text_for(vec![pr(2917, "1a2b3c4d")])),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string(),
+            }
+        );
+
+        // (d) Plusieurs PR : la suite est partagée, donc elle ne nomme la tête
+        // d'aucune d'elles en particulier.
+        assert_eq!(
+            parse_check_suite_heads(&text_for(vec![pr(2917, "1a2b3c4d"), pr(2918, "9f8e7d6c")])),
+            CheckSuiteHeads::Many(2)
+        );
+
+        // (e) Une PR dont la forge ne donne pas le `head.sha` est sautée, et
+        // non promue en tête anonyme : c'est tout le point du vol que la tête
+        // soit nommée ou absente, jamais devinée.
+        let sans_sha = CheckSuitePullRequest {
+            number: Some(2919),
+            head: Some(GitHubRef {
+                ref_name: Some("feat/2919/y".to_string()),
+                sha: None,
+            }),
+        };
+        assert_eq!(
+            parse_check_suite_heads(&text_for(vec![pr(2917, "1a2b3c4d"), sans_sha])),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string(),
+            }
+        );
     }
 
     /// mika#2755 — le producteur réel traversant le masque du consommateur.
@@ -2983,20 +3218,35 @@ mod tests {
         event.check_suite = Some(CheckSuite {
             conclusion: Some("success".to_string()),
             head_branch: Some("fix/2750/dispatch-un-groom-ready-label-qui-crashe".to_string()),
+            head_sha: None,
+            pull_requests: Vec::new(),
         });
         let text = format_event_text("check_suite", &event);
+        // La PREMIÈRE ligne, et elle seule, est le message fondateur. Depuis
+        // mika#2917 le texte en porte deux de plus — c'est précisément la
+        // contrainte R3 de ce vol : la tête s'ajoute en lignes 2 et 3, jamais
+        // en ligne 1, parce que les quatre lecteurs du texte `check_suite` ne
+        // lisent que la première. L'assertion est donc portée à la ligne
+        // plutôt que relâchée en `starts_with` : un préfixe laisserait passer
+        // le jour où un mot s'ajoute en fin de première ligne.
         assert_eq!(
-            text,
+            text.lines().next().unwrap_or_default(),
             "[GitHub] Check suite success on senara-solutions/mika \
              (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)",
-            "le gabarit `check_suite` a dérivé — ce littéral EST le message du \
-             webhook du 2026-10-16 23:49Z, celui que le critère d'acceptation de \
-             mika#2755 épingle mot pour mot"
+            "la première ligne du gabarit `check_suite` a dérivé — ce littéral \
+             EST le message du webhook du 2026-10-16 23:49Z, celui que le \
+             critère d'acceptation de mika#2755 épingle mot pour mot"
         );
         let masked = fmt::mask_cited_branch(&text);
         assert_eq!(
-            masked, "[GitHub] Check suite success on senara-solutions/mika (branch: )",
-            "le masque doit retirer le slug cité et rien d'autre"
+            masked,
+            "[GitHub] Check suite success on senara-solutions/mika (branch: )\n\
+             Head-Sha: unknown\n\
+             Check-Suite-PRs: none",
+            "le masque doit retirer le slug cité et rien d'autre — les deux \
+             lignes de tête de mika#2917 traversent intactes, et `unknown` / \
+             `none` sont ce que ce payload fondateur nomme (il ne porte ni \
+             `head_sha` ni `pull_requests[]`)"
         );
         assert!(
             !masked.contains("groom"),
@@ -3015,6 +3265,7 @@ mod tests {
             body: None,
             head: Some(GitHubRef {
                 ref_name: Some("fix/2755/agent-le-mot-cl-groom-match-dans-un-nom".to_string()),
+                sha: None,
             }),
             merged: None,
         });
@@ -3194,6 +3445,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("feat/new".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
