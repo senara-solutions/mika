@@ -385,6 +385,80 @@ mod tests {
         );
     }
 
+    // ---- le périmètre `agent_id`, au niveau de la base ---------------------
+
+    /// Une ligne écrite par mika-qa n'écarte pas le tour de mika-dev — audit MPC
+    /// du vol 3, point 1 (mika#2917).
+    ///
+    /// **Mesuré au niveau de la base, non au niveau d'un bouchon.** Un `Stub` de
+    /// `PrefilterState` rendrait ce que le test lui fait rendre : il attesterait
+    /// la discipline du test, pas la propriété du code. Ce qui tient la propriété
+    /// est que `latest_audit_event_for_target` clone l'`agent_id` du handle et le
+    /// passe comme paramètre SQL 1 — l'appelant ne peut pas le fournir, donc ne
+    /// peut pas le fournir de travers. Seule une vraie base peut le dire.
+    ///
+    /// **Une seule base, deux handles.** `with_agent` clone le handle en
+    /// partageant l'`Arc` interne : un seul fil, une seule connexion, un seul
+    /// fichier. Deux `open_in_memory` rendraient la propriété intestable plutôt
+    /// que de la faire échouer — l'isolation observée viendrait des deux
+    /// fichiers, et le test resterait vert même si le filtrage par `agent_id`
+    /// disparaissait (motif mika#1926).
+    ///
+    /// **Le contrôle positif est dans le même test, pas dans un voisin.** Sans
+    /// lui, « mika-dev ne voit rien » est indistinguable de « la ligne n'a jamais
+    /// été écrite » ou de « la fenêtre de lecture ne la couvre pas » (classe
+    /// mika#2205).
+    #[tokio::test]
+    async fn mika2917_vol3_une_ligne_de_mika_qa_necarte_pas_le_tour_de_mika_dev() {
+        let db = crate::async_db::AsyncDatabase::new(
+            crate::db::Database::open_in_memory().expect("base en mémoire"),
+        );
+        // `audit_events.agent_id` référence `agents(id)` : les deux agents
+        // existent, sinon la FK refuserait l'écriture et le test rougirait pour
+        // une raison qui n'est pas la sienne.
+        for id in ["mika-qa", "mika-dev"] {
+            db.register_agent(id, id, "").await.expect("agent");
+        }
+
+        let key = head_key("senara-solutions/mika", 2917, "cafe1234");
+        let since = reviewed_head_lookup_since();
+
+        // mika-qa atteste la tête, par le chemin que l'outil emprunte.
+        db.with_agent("mika-qa")
+            .log_audit_event(
+                "system",
+                QA_REVIEWED_HEAD_TOOL,
+                &key,
+                None,
+                Some("review"),
+                None,
+                None,
+            )
+            .await
+            .expect("écriture mika-qa");
+
+        // mika-dev lit la MÊME clé sur la MÊME base : rien.
+        assert_eq!(
+            db.with_agent("mika-dev")
+                .latest_audit_event_for_target(QA_REVIEWED_HEAD_TOOL, &key, &since)
+                .await
+                .expect("lecture mika-dev"),
+            None,
+            "une ligne de mika-qa est visible depuis mika-dev : le périmètre \
+             agent_id de la lecture a sauté, et un agent écarterait le tour d'un autre"
+        );
+
+        // Contrôle positif : mika-qa, lui, la voit — donc le `None` ci-dessus
+        // mesure le périmètre et non une absence d'écriture.
+        let (after_value, _reasoning, _created_at) = db
+            .with_agent("mika-qa")
+            .latest_audit_event_for_target(QA_REVIEWED_HEAD_TOOL, &key, &since)
+            .await
+            .expect("lecture mika-qa")
+            .expect("la ligne que mika-qa vient d'écrire");
+        assert_eq!(after_value.as_deref(), Some("review"));
+    }
+
     // ---- Fire-Disposition (a.1) : les sites `gh` de `webhook_prefilter.rs` --
 
     /// Les sites de `webhook_prefilter.rs` qui appellent `gh`. Une entrée par
