@@ -20,6 +20,7 @@ pub mod config_keys;
 pub mod db;
 pub mod evidence;
 pub mod flight_source;
+pub mod flight_verdict_ledger;
 /// Le seul site `Command::new("gh")` de la suite `auto_pull` (mika#2713).
 /// Sous `#[cfg(test)]`, il ne spawne rien et refuse un vrai numéro d'issue.
 pub(crate) mod gh_process;
