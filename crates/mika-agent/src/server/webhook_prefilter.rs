@@ -264,6 +264,10 @@ use super::webhook_queue_v2::{WebhookEventKind, classify_event};
 /// de mika#2671 ([`crate::qa_head_supersession::parse_switch`]).
 pub(crate) const PREFILTER_ENV: &str = "MIKA_WEBHOOK_PREFILTER";
 
+/// Interrupteur de la seule classe (g′), armé par défaut (mika#2917, vol 3).
+/// Table de vérité et raison du défaut : [`reviewed_head_enabled`].
+pub(crate) const REVIEWED_HEAD_ENV: &str = "MIKA_WEBHOOK_PREFILTER_REVIEWED_HEAD";
+
 /// `audit_events.tool_name` d'un événement écarté. **SOLE WRITER** :
 /// [`skip_turn`].
 pub(crate) const PREFILTER_SKIPPED_TOOL: &str = "webhook_prefilter_skipped";
@@ -289,7 +293,7 @@ const PR_STATE_TIMEOUT_SECS: u64 = 15;
 /// ([`PrefilterClass::CommentTriagedNote`]) écarte le tour *complet* au prix
 /// d'un brin de triage borné, sans outils. Elle n'écarte donc pas un tour sans
 /// appeler de modèle — elle écarte 77 k tokens d'entrée au prix de 160 tokens
-/// de sortie. Les douze autres classes restent purement déterministes.
+/// de sortie. Les treize autres classes restent purement déterministes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrefilterClass {
     /// (a) `check_suite` verte sur la branche par défaut, sans tâche active.
@@ -329,6 +333,23 @@ pub(crate) enum PrefilterClass {
     /// refusé de l'écarter sur un prédicat de forme. Mesurée à 13 tours et
     /// 1 007 748 tokens d'entrée sur la fenêtre du 2026-10-19.
     CommentTriagedNote,
+    /// (g′) `check_suite` verte sur une tête de PR que le skill
+    /// `qa-review-webhook-success` a **déjà traitée** (mika#2917, vol 3).
+    ///
+    /// Voisine de [`PrefilterClass::GreenCheckSuiteHeadDecided`] et non son
+    /// remplaçante : (b) lit l'audit du MOTEUR — une ligne DECISION-CORE que la
+    /// boucle a écrite — là où (g′) lit le registre que le SKILL écrit
+    /// ([`crate::qa_reviewed_head`]). Deux sources, deux populations, et la
+    /// seconde couvre les tours que la première ne voyait pas : les 51 tours
+    /// `check_suite_pr_branch` mesurés sur 4,9 jours qui se terminaient en
+    /// `stop_verdict_recorded` (35) ou `stop_already_reviewed_sha` (16), pour
+    /// 7,06 M tokens d'entrée.
+    ///
+    /// **Le transfert de population est attendu, et il n'est pas une
+    /// régression.** (g′) est consultée AVANT (b) : un événement que les deux
+    /// sauraient écarter s'inscrit désormais ici. La quantité conservée est la
+    /// **somme** des deux classes, jamais l'une d'elles (mika#2205).
+    GreenCheckSuiteHeadAlreadyReviewed,
 }
 
 impl PrefilterClass {
@@ -347,6 +368,7 @@ impl PrefilterClass {
             Self::CiFailureTaskNotInProgress => "ci_failure_task_not_in_progress",
             Self::PrClosedNoLoopTask => "pr_closed_no_loop_task",
             Self::CommentTriagedNote => "comment_triaged_note",
+            Self::GreenCheckSuiteHeadAlreadyReviewed => "green_check_suite_head_already_reviewed",
         }
     }
 }
@@ -948,10 +970,11 @@ fn pr_prefix(head: &str) -> Option<&str> {
 ///
 /// Un terme par porte qui relâche un tour, et le registre en porte exactement
 /// un. Les trois premiers sont rendus par [`skip_turn`] lui-même, avant toute
-/// consultation d'état ; les onze autres par [`decide`] et ses six décideurs
+/// consultation d'état ; les quinze autres par [`decide`] et ses sept décideurs
 /// (le compte annonçait « quatre » alors que [`decide_pr_closed`] en était le
-/// cinquième depuis mika#2680 : corrigé ici, en même temps que le sixième).
-/// Un quinzième site de relâche ne compile pas sans son terme : c'est la
+/// cinquième depuis mika#2680 : corrigé au vol 4, en même temps que le
+/// sixième ; le septième est `decide_green_pr_branch`, mika#2917 vol 3).
+/// Un dix-neuvième site de relâche ne compile pas sans son terme : c'est la
 /// propriété que ce type achète, et la raison de ne pas s'être contenté d'une
 /// chaîne au site d'émission.
 ///
@@ -1039,6 +1062,42 @@ pub(crate) enum Release {
     /// qui a sauté (mika#2205). En régime nominal ce terme vaut **zéro**, et
     /// c'est ce zéro qui atteste le câblage.
     ClosureSnapshotAbsent,
+    /// (g′) le payload nomme UNE PR et sa tête, mais le registre du skill ne
+    /// porte **aucune** ligne pour cette tête (mika#2917, vol 3). (b) est alors
+    /// consultée entière, et c'est son verdict qui décide ; ce terme ne se lit
+    /// que lorsque (b) ne mord pas non plus.
+    ///
+    /// **Le terme nominal du régime, et non une panne.** C'est ce que rend une
+    /// tête neuve — le premier `check_suite` d'un push — et c'est le contrôle
+    /// négatif d'AC1 : une nouvelle tête sur une PR déjà revue passe. Son
+    /// effondrement à zéro serait le symptôme à craindre, pas sa présence.
+    ReviewedHeadAbsent,
+    /// (g′) le registre porte une ligne pour cette tête, mais sa valeur n'est
+    /// pas l'une de celles que [`crate::qa_reviewed_head::REVIEWED_HEAD_OUTCOMES`]
+    /// déclare (mika#2917, vol 3). **Fail-safe** : (b) est consultée, et le tour
+    /// a lieu si elle ne mord pas.
+    ///
+    /// Distinct de [`Release::StateUnreadable`], qui dit « la base n'a pas
+    /// répondu » : ici la base a répondu, et c'est l'écrivain qui a écrit hors
+    /// contrat. Deux populations, deux causes, deux gestes de réparation — les
+    /// fusionner enverrait le diagnostic vers SQLite quand le défaut est dans le
+    /// prompt du skill (mika#2205).
+    ///
+    /// En régime attendu ce terme vaut **zéro** : l'outil `record_reviewed_head`
+    /// est le seul écrivain et il valide sa valeur. Un non-zéro nomme une
+    /// divergence entre l'outil et cette liste.
+    ReviewedHeadOutOfContract,
+    /// (g′) `MIKA_WEBHOOK_PREFILTER_REVIEWED_HEAD` à `off` : la classe est
+    /// désarmée et (b) décide seule, exactement comme avant ce vol (mika#2917,
+    /// vol 3).
+    ///
+    /// Le terme existe pour que « la classe est désarmée » et « la classe est
+    /// armée et ne trouve jamais rien » ne rendent pas les mêmes octets :
+    /// sans lui, un désarmement oublié ressemblerait à un registre muet, et le
+    /// diagnostic partirait vers l'écrivain. En régime attendu — l'interrupteur
+    /// est armé par défaut — ce terme vaut **zéro**, et c'est ce zéro qui dit
+    /// que la classe tourne.
+    ReviewedHeadSwitchDisarmed,
 }
 
 impl Release {
@@ -1059,6 +1118,9 @@ impl Release {
             Self::IssueTaskActive => "issue_task_active",
             Self::TriageDisarmed => "triage_disarmed",
             Self::ClosureSnapshotAbsent => "closure_snapshot_absent",
+            Self::ReviewedHeadAbsent => "reviewed_head_absent",
+            Self::ReviewedHeadOutOfContract => "reviewed_head_out_of_contract",
+            Self::ReviewedHeadSwitchDisarmed => "reviewed_head_switch_disarmed",
         }
     }
 }
@@ -1083,7 +1145,18 @@ pub(crate) enum Decision {
     },
 }
 
-fn state_unreadable(what: &str, target: &str, e: &anyhow::Error) -> Decision {
+/// La SONDE d'un état illisible, sans le verdict (mika#2917, vol 3).
+///
+/// Extraite de [`state_unreadable`] parce que (g′) a besoin des deux moitiés
+/// **séparément** : elle doit nommer la panne de lecture du registre — sinon une
+/// base muette et un registre vide rendent les mêmes octets — puis consulter (b)
+/// entière, qui peut très bien écarter le tour. Un seul appel rendant
+/// `Decision::Llm` aurait forcé (g′) à relâcher le tour pour pouvoir le dire.
+///
+/// Les cinq appelants historiques passent par [`state_unreadable`], inchangé :
+/// l'extraction n'ajoute pas un second site d'émission, elle en sépare les deux
+/// moitiés.
+fn warn_state_unreadable(what: &str, target: &str, e: &anyhow::Error) {
     warn!(
         event = "webhook_prefilter_state_unreadable",
         what,
@@ -1091,6 +1164,10 @@ fn state_unreadable(what: &str, target: &str, e: &anyhow::Error) -> Decision {
         error = %e,
         "pré-filtre : état illisible — le tour a lieu (fail-safe)"
     );
+}
+
+fn state_unreadable(what: &str, target: &str, e: &anyhow::Error) -> Decision {
+    warn_state_unreadable(what, target, e);
     Decision::Llm(Release::StateUnreadable)
 }
 
@@ -1360,6 +1437,89 @@ pub(crate) fn prefilter_enabled() -> bool {
         PREFILTER_ENV,
         std::env::var(PREFILTER_ENV).ok().as_deref(),
     )
+}
+
+/// L'interrupteur de (g′) est-il armé ? Lu à chaque `check_suite` verte de
+/// branche de PR (mika#2917, vol 3).
+///
+/// **Exactement la table de vérité de [`prefilter_enabled`], l'absence
+/// comprise : armé.** C'est la ligne qui diverge de
+/// [`super::comment_triage::triage_enabled`], et la divergence est argumentée,
+/// pas héritée :
+///
+/// - (h) est livrée **désarmée** parce qu'elle appelle un modèle sur du texte
+///   humain et neuf, et qu'un armement par déploiement y engagerait une dépense
+///   que personne n'a demandée.
+/// - (g′) est livrée **armée** parce qu'elle ne décide sur rien de neuf : elle
+///   compare une tête à un registre que le skill a écrit, et son seul effet est
+///   de ne pas repayer un tour dont la conclusion est déjà inscrite. La livrer
+///   désarmée reviendrait à déployer la mesure sans la mesurer — exactement la
+///   forme que mika#2578/#2752 condamnent, une garde que rien n'exécute.
+///
+/// Le reste de la table est celui de tout interrupteur du dépôt, **y compris la
+/// valeur non reconnue qui laisse l'interrupteur armé** avec son WARN
+/// `qa_switch_invalid` : taper le nom de la variable *est* l'adhésion, en
+/// garbler la valeur est une faute de frappe.
+///
+/// `MIKA_WEBHOOK_PREFILTER` désarme en amont : (g′) vit dans le chemin du
+/// pré-filtre, donc le désarmement global l'emporte sans que cette fonction ait
+/// à le savoir.
+///
+/// **Lu dans le décideur, pas dans [`skip_turn`]** : un désarmement doit laisser
+/// (b) décider comme avant ce vol, et non relâcher le tour. Faire traverser
+/// l'interrupteur par `skip_turn` puis `decide` ferait porter à sept décideurs
+/// un argument qu'un seul lit.
+pub(crate) fn reviewed_head_enabled() -> bool {
+    crate::qa_head_supersession::parse_switch(
+        REVIEWED_HEAD_ENV,
+        std::env::var(REVIEWED_HEAD_ENV).ok().as_deref(),
+    )
+}
+
+/// Le garde RAII de [`REVIEWED_HEAD_ENV`], jumeau de
+/// [`super::comment_triage::TriageEnvGuard`] (mika#2917, vol 3).
+///
+/// Un second type plutôt qu'un garde générique sur un nom de variable : le
+/// générique serait plus court et rendrait possible de surveiller la mauvaise
+/// variable sans que rien ne le dise. Le prix est vingt lignes jumelles ; le
+/// prix de l'autre forme est un test vert qui ne mesure rien.
+///
+/// Tout test qui le construit porte `#[serial_test::serial]` : l'environnement
+/// est un état global du processus.
+#[cfg(test)]
+pub(crate) struct ReviewedHeadEnvGuard(Option<String>);
+
+#[cfg(test)]
+impl ReviewedHeadEnvGuard {
+    /// `None` retire la variable : la ligne « absente » de la table de vérité,
+    /// celle du régime de production.
+    pub(crate) fn set(value: Option<&str>) -> Self {
+        let previous = std::env::var(REVIEWED_HEAD_ENV).ok();
+        // SAFETY: les tests qui construisent ce garde sont sérialisés par
+        // `#[serial_test::serial]`, donc aucun autre fil ne lit
+        // l'environnement pendant la mutation.
+        match value {
+            Some(v) => unsafe { std::env::set_var(REVIEWED_HEAD_ENV, v) },
+            None => unsafe { std::env::remove_var(REVIEWED_HEAD_ENV) },
+        }
+        Self(previous)
+    }
+
+    /// Armé (`1`) ou désarmé (`0`).
+    pub(crate) fn armed(armed: bool) -> Self {
+        Self::set(Some(if armed { "1" } else { "0" }))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReviewedHeadEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: même sérialisation qu'à la pose.
+        match self.0.take() {
+            Some(v) => unsafe { std::env::set_var(REVIEWED_HEAD_ENV, v) },
+            None => unsafe { std::env::remove_var(REVIEWED_HEAD_ENV) },
+        }
+    }
 }
 
 /// Ce que les handlers ont fait du texte. (a) verte et (d) exigent un texte
@@ -2202,6 +2362,27 @@ pub(crate) mod tests {
             PrefilterClass::CommentTriagedNote.as_str(),
             "comment_triaged_note"
         );
+        // (g′) mika#2917, vol 3. La classe ET ses trois termes de relâche :
+        // `measure-webhook-turn-cost` groupe dynamiquement sur `.class` et sur
+        // `.release`, donc ces quatre chaînes sont les clés de la mesure d'AC4.
+        // Les renommer sans renommer la requête casse la mesure en silence —
+        // c'est le seul endroit du vol où un littéral est une interface.
+        assert_eq!(
+            PrefilterClass::GreenCheckSuiteHeadAlreadyReviewed.as_str(),
+            "green_check_suite_head_already_reviewed"
+        );
+        assert_eq!(Release::ReviewedHeadAbsent.as_str(), "reviewed_head_absent");
+        assert_eq!(
+            Release::ReviewedHeadOutOfContract.as_str(),
+            "reviewed_head_out_of_contract"
+        );
+        assert_eq!(
+            Release::ReviewedHeadSwitchDisarmed.as_str(),
+            "reviewed_head_switch_disarmed"
+        );
+        // Le nom de l'interrupteur est lui aussi une interface : il vit dans la
+        // doc opérateur et dans le geste de retraite.
+        assert_eq!(REVIEWED_HEAD_ENV, "MIKA_WEBHOOK_PREFILTER_REVIEWED_HEAD");
     }
 
     // ---- phase 2 — classe (c) -------------------------------------------
@@ -2436,6 +2617,20 @@ pub(crate) mod tests {
     const HEAD_B: &str = "pr:senara-solutions/mika#2678@ffffffffffffffffffffffffffffffffffffffff";
     pub(crate) const GREEN_PR: &str =
         "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)";
+
+    /// Le même `check_suite` vert, porteur de la ligne que le gateway émet
+    /// depuis le vol 1 : UNE PR et sa tête (mika#2917).
+    ///
+    /// `head_key(REPO, 2678, <le SHA ci-dessous>)` vaut exactement [`HEAD_A`] —
+    /// c'est ce qui permet au même fixture de servir (b) et (g′), et donc de
+    /// mesurer leur ordre de consultation sur un seul texte.
+    ///
+    /// [`GREEN_PR`], lui, n'a **pas** cette ligne : il vaut
+    /// `CheckSuiteHeads::LineAbsent`, et c'est la raison pour laquelle toute la
+    /// section (b) reste verte sans une retouche. La non-régression est une
+    /// propriété des fixtures, pas une promesse de prose.
+    pub(crate) const GREEN_PR_ONE_HEAD: &str = "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2675/x)\n\
+         Check-Suite-PRs: 2678@1a2edc8091fee6eec4c736b5dd974221802287b6";
 
     pub(crate) fn hold(target: &str, after: &str, trace: &str) -> AuditFact {
         AuditFact {
@@ -3311,7 +3506,7 @@ pub(crate) mod tests {
             by_any_handler: true,
             ..intact
         };
-        // Pas de bras `_` : ajouter un quinzième terme ne compile pas tant
+        // Pas de bras `_` : ajouter un dix-neuvième terme ne compile pas tant
         // qu'il n'a pas son cas ici (DoD 8).
         match terme {
             Release::SwitchDisarmed => (GREEN_MAIN.into(), Stub::default(), intact, false, false),
@@ -3404,6 +3599,45 @@ pub(crate) mod tests {
                 intact,
                 true,
                 true,
+            ),
+            // (g′) mika#2917, vol 3 — les trois termes du septième décideur. Le
+            // texte porte UNE tête, donc (g′) est consultée ; dans les trois cas
+            // elle n'écarte pas, (b) est consultée entière et ne mord pas non
+            // plus (`event_rows: Ok(vec![])`, aucune ligne DECISION-CORE), et
+            // c'est le terme nommé par (g′) qui s'inscrit — jamais le
+            // `NoDecisionAttested` de (b).
+            Release::ReviewedHeadAbsent => (
+                GREEN_PR_ONE_HEAD.into(),
+                Stub {
+                    reviewed_head: Some(Ok(None)),
+                    ..rows(Ok(vec![]), None)
+                },
+                intact,
+                true,
+                false,
+            ),
+            // `review_failed` est précisément l'une des issues que l'outil
+            // n'écrit PAS : la trouver au registre nomme une divergence entre
+            // l'écrivain et `REVIEWED_HEAD_OUTCOMES`.
+            Release::ReviewedHeadOutOfContract => (
+                GREEN_PR_ONE_HEAD.into(),
+                Stub {
+                    reviewed_head: Some(Ok(Some("review_failed".into()))),
+                    ..rows(Ok(vec![]), None)
+                },
+                intact,
+                true,
+                false,
+            ),
+            // Désarmée, (g′) ne lit RIEN : `reviewed_head: None` panique à
+            // toute lecture, donc ce cas prouve l'abstention au lieu de la
+            // supposer.
+            Release::ReviewedHeadSwitchDisarmed => (
+                GREEN_PR_ONE_HEAD.into(),
+                rows(Ok(vec![]), None),
+                intact,
+                true,
+                false,
             ),
         }
     }

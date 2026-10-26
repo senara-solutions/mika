@@ -85,11 +85,20 @@
 //!    non résolu est un échec **terminal**, donc une revue perdue là où une
 //!    écriture manquée ne coûte qu'un tour).
 //!
-//! # Pas d'interrupteur dans ce vol
+//! # L'interrupteur ne vit pas ici
 //!
-//! Il n'y a aucune porte à désarmer : rien ne lit ce registre. L'interrupteur de
-//! la classe (g′) arrive au vol 3, avec le décideur qu'il désarme — un
-//! interrupteur qui ne commande rien se lit comme une protection qui existe.
+//! `MIKA_WEBHOOK_PREFILTER_REVIEWED_HEAD` désarme la classe (g′), et il est
+//! déclaré **avec son décideur**, dans
+//! [`crate::server::webhook_prefilter`] — pas ici. La raison tient en une
+//! phrase : ce module est le registre, et un registre ne se désarme pas. Le
+//! désarmement ne fait pas taire l'écrivain — l'outil continue d'inscrire les
+//! têtes traitées, ce qui est voulu : le jour où l'on réarme, le registre a de
+//! la profondeur au lieu d'un trou.
+//!
+//! Ce qu'il désarme est la **lecture**, donc la décision, donc exactement la
+//! chose qu'un opérateur veut pouvoir retirer. Déclarer l'interrupteur ici
+//! l'aurait éloigné de la seule porte qu'il commande, et un interrupteur qu'on
+//! lit loin de ce qu'il ferme est celui dont on croit qu'il ferme autre chose.
 
 use crate::qa_build_callback::pr_review_posted_in_turn;
 use crate::tool_execution::ToolCallSummary;
