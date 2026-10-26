@@ -1249,6 +1249,120 @@ mod tests {
         assert_eq!(closed.pr_number, Some(1929));
     }
 
+    /// La sortie `gh` réellement capturée sur le milestone 33 le 2026-10-26,
+    /// filtrée sur les deux contrôles de l'AC1 de mika#2924. Les deux vivent
+    /// dans le **même** document, parce que c'est ainsi qu'ils arrivent en
+    /// production — le composeur ne lit pas deux fichiers. Provenance, commande
+    /// de capture et fidélités : `tests/fixtures/mika2924/README.md`.
+    const FIXTURE_MILESTONE_33: &str =
+        include_str!("../../tests/fixtures/mika2924/issues-milestone-33.json");
+
+    /// mika#2924 R2/R3 — la situation de **production**, celle qui a produit les
+    /// 87 lignes `closed (no linked PR)` : la liste des PR du milestone est
+    /// vide, parce que le pilote rattache le milestone au ticket et jamais à la
+    /// PR. La référence de clôture côté issue comble alors le trou.
+    ///
+    /// Les deux contrôles de l'AC1 sont dans ce test, sur le même document :
+    /// #2886 fermé par #2892 (contrôle positif) et #1680 fermé à la main,
+    /// `closedByPullRequestsReferences` à `[]` (contrôle négatif). Sans le
+    /// second, un lecteur qui peuplerait `pr_number` pour tout ticket fermé
+    /// passerait le premier.
+    #[test]
+    fn mika2924_la_reference_cote_issue_comble_lindex_vide_du_milestone() {
+        let milestone_json = r#"{"title": "M33", "description": "sink", "state": "open", "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        // `[]` : aucune PR de la boucle n'est rattachée au milestone.
+        let state =
+            compose_from_gh_outputs(&r, milestone_json, FIXTURE_MILESTONE_33, "[]").unwrap();
+
+        let s2886 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 2886)
+            .expect("#2886 présent dans l'énumération");
+        assert_eq!(s2886.state, IssueState::Closed);
+        assert_eq!(s2886.pr_number, Some(2892));
+        // L'URL est celle que la référence porte, jamais une recomposition :
+        // l'entrée porte un objet `repository` imbriqué, donc elle peut nommer
+        // un autre dépôt (R3).
+        assert_eq!(
+            s2886.pr_url.as_deref(),
+            Some("https://github.com/senara-solutions/mika/pull/2892")
+        );
+        assert_eq!(s2886.pr_link_source, Some(PrLinkSource::IssueClosingRef));
+        // Ce chemin ne porte ni l'état de la PR ni celui de la CI — la
+        // référence côté issue ne les transporte pas, et les inventer serait
+        // rendre deux populations en octets identiques (mika#2205).
+        assert_eq!(s2886.pr_state, None);
+        assert_eq!(s2886.ci_state, CiState::None);
+
+        let s1680 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 1680)
+            .expect("#1680 présent dans l'énumération");
+        assert_eq!(s1680.state, IssueState::Closed);
+        assert_eq!(s1680.pr_number, None);
+        assert_eq!(s1680.pr_url, None);
+        assert_eq!(
+            s1680.pr_link_source, None,
+            "aucune provenance : le ticket a été fermé à la main, les deux \
+             chemins ont été essayés et aucun n'a répondu"
+        );
+    }
+
+    /// mika#2924 R2 — l'**ordre** de l'union, qui n'est pas symétrique :
+    /// l'index inverse des PR du milestone passe en premier parce qu'il est le
+    /// seul porteur de `pr_state` et `ci_state`. Si la référence côté issue
+    /// gagnait, un milestone dont les PR *sont* rattachées perdrait l'état de
+    /// sa CI sans qu'aucune autre assertion ne rougisse.
+    #[test]
+    fn mika2924_lindex_du_milestone_garde_la_priorite_sur_la_reference_cote_issue() {
+        let milestone_json = r#"{"title": "M33", "description": "sink", "state": "open", "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#;
+        // Le même #2886, cette fois atteignable par les deux chemins.
+        let pr_json = r#"[
+            {"number": 2892, "state": "MERGED", "closingIssuesReferences": [{"number": 2886}], "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        ]"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state =
+            compose_from_gh_outputs(&r, milestone_json, FIXTURE_MILESTONE_33, pr_json).unwrap();
+
+        let s2886 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 2886)
+            .expect("#2886 présent dans l'énumération");
+        assert_eq!(s2886.pr_number, Some(2892));
+        assert_eq!(s2886.pr_state.as_deref(), Some("merged"));
+        assert_eq!(s2886.ci_state, CiState::Success);
+        assert_eq!(
+            s2886.pr_link_source,
+            Some(PrLinkSource::MilestonePrList),
+            "l'index du milestone a répondu : c'est lui qui nomme la provenance"
+        );
+        assert_eq!(
+            s2886.pr_url, None,
+            "ce chemin ne porte pas d'URL — le rapport la recompose depuis le \
+             dépôt et le numéro, ce qui est correct ici puisque l'index \
+             inverse est construit sur les PR du dépôt du milestone"
+        );
+        // Le contrôle négatif reste négatif quel que soit le chemin pris par
+        // son voisin.
+        let s1680 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 1680)
+            .expect("#1680 présent dans l'énumération");
+        assert_eq!(s1680.pr_number, None);
+        assert_eq!(s1680.pr_link_source, None);
+    }
+
     /// mika#1975 D5/D8 — the typed error renders **exactly** the legacy
     /// `anyhow!("gh {} failed: {}", args.join(" "), stderr)` string.
     ///
