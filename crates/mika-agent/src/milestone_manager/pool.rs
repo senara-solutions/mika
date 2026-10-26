@@ -52,6 +52,25 @@
 //! absence de mesure comme un `under_bound` (*un `null` n'est jamais un `0`*,
 //! mika#2331).
 //!
+//! # Le troisième motif : un ticket que l'opérateur tient n'est pas admissible
+//!
+//! mika#2923 ajoute [`RefusalReason::OperatorHeld`] : un candidat portant l'un
+//! des labels de [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`]
+//! (`blocked`, `operator-review`, `operator-gated`) est refusé, et le refus
+//! **nomme lequel** — le geste correctif est de retirer *ce* label-là.
+//!
+//! Mesuré le 2026-10-26 : le rapport du sink recommandait d'admettre #2698,
+//! #2699 et #1806, tous trois `operator-gated`. Le prédicat d'admission ne
+//! lisait aucun de ces labels, donc le jour où `MIKA_MANAGER_POOL_WRITE`
+//! s'ouvrirait, le poseur aurait posé `ready` sur un ticket que l'opérateur
+//! retient — exactement l'autorité que l'interrupteur devait borner.
+//!
+//! Les deux littéraux ne sont pas retapés ici : la liste est celle de
+//! mika#2263, déjà « la liste unique derrière deux surfaces » (le feeder
+//! d'`auto_pull` et la porte du `ready_label_handler`). Le bassin est la
+//! troisième surface qui pose la même question, et une quatrième orthographe de
+//! la liste serait la divergence que mika#2263 a déjà payée une fois.
+//!
 //! # Ce que ce module ne fait pas
 //!
 //! L'écriture. Le vol 4 l'a livrée, et délibérément **pas ici** : `assess_pool`
@@ -76,7 +95,7 @@
 
 use super::plan_size;
 use super::types::{IssueState, SubIssue};
-use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL};
+use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL, operator_held_label};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -295,8 +314,15 @@ pub struct Admission {
 ///
 /// Un `enum` plutôt qu'un message, et le vol 3 est ce que cette forme achetait :
 /// le second motif du point 2 du ticket arrive comme un **variant**, pas comme
-/// une refonte du rapport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// une refonte du rapport. mika#2923 en est la confirmation : le troisième
+/// motif arrive de la même façon.
+///
+/// **`Clone` sans `Copy`**, depuis mika#2923 : [`RefusalReason::OperatorHeld`]
+/// porte une `String` parce que ce type est `Serialize + Deserialize` (le
+/// verdict va dans le puits hors-ligne du sink) et qu'un `&'static str` ne se
+/// désérialise pas. Précédent exact une porte plus loin :
+/// `auto_pull::RefusalReason` est `Clone` sans `Copy` pour la même raison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalReason {
     /// Aucun callout `Plan: docs/plans/…` dans le corps du ticket.
@@ -308,6 +334,14 @@ pub enum RefusalReason {
     /// eux ne dit pas de combien découper, et le geste correctif est
     /// précisément un découpage chiffré.
     EstimateOverFlightBound { total_loc: u64, bound_loc: u32 },
+    /// Le candidat porte un label par lequel l'opérateur — ou une autre
+    /// instance — le tient (mika#2923).
+    ///
+    /// `label` dit **lequel**, pour la raison que porte déjà
+    /// [`crate::webhook_dispatch::operator_held_label`] : le geste correctif est
+    /// de retirer *ce* label-là, et un compteur doit pouvoir distinguer « tenu
+    /// par `blocked` » de « tenu par `operator-gated` ».
+    OperatorHeld { label: String },
 }
 
 impl RefusalReason {
@@ -315,7 +349,7 @@ impl RefusalReason {
     /// variant neuf ne puisse pas être rendu sans libellé — y compris quand le
     /// libellé porte des nombres, auquel cas il est **composé ici** plutôt
     /// qu'épelé une seconde fois par le rapporteur.
-    pub fn label(self) -> String {
+    pub fn label(&self) -> String {
         match self {
             RefusalReason::NoGroomedPlan => "plan groomé absent".to_string(),
             RefusalReason::EstimateOverFlightBound {
@@ -325,6 +359,25 @@ impl RefusalReason {
                 "estimation {total_loc} lignes au-delà de la borne par vol ({bound_loc}) \
                  — à découper"
             ),
+            RefusalReason::OperatorHeld { label } => {
+                format!("tenu par l'opérateur — label `{label}` à retirer")
+            }
+        }
+    }
+
+    /// Ce refus se corrige-t-il par un **grooming** ?
+    ///
+    /// `match` exhaustif, sans bras `_` : un variant neuf ne compile pas sans
+    /// que son auteur ait répondu. C'est ce qui empêche la relève de proposer
+    /// un travail que rien ne débloque — « à grommer : tenu par l'opérateur »
+    /// serait un faux conseil dans le rapport, et le lecteur agirait dessus.
+    pub fn remediable_by_grooming(&self) -> bool {
+        match self {
+            RefusalReason::NoGroomedPlan => true,
+            // Le geste correctif est un découpage chiffré du plan, donc un
+            // re-groom : comportement d'aujourd'hui, inchangé.
+            RefusalReason::EstimateOverFlightBound { .. } => true,
+            RefusalReason::OperatorHeld { .. } => false,
         }
     }
 }
@@ -568,6 +621,29 @@ fn well_formed_candidates<'a>(
             // est un défaut de forme, donc un refus qui se **nomme** — les
             // filtres ci-dessus, eux, ne sont pas des reproches : un ticket
             // déjà `ready` n'a rien à corriger.
+            //
+            // Premier des refus nommés, et l'ordre des deux est la priorité du
+            // motif : `AdmissionRefusal` n'en porte qu'un. Un ticket que
+            // l'opérateur tient n'a pas besoin d'un plan — le geste correctif
+            // est de retirer le label — donc le nommer `NoGroomedPlan` le
+            // ferait entrer dans la relève à grommer (`relief::name_relief`) et
+            // proposerait un travail que rien ne débloque.
+            //
+            // Après les filtres silencieux, pas avant : un ticket déjà `ready`
+            // *et* tenu est une anomalie réelle, mais elle n'appartient pas à
+            // l'admission — poser `ready` n'y est plus en jeu, et cette
+            // population est déjà la charge de la porte du
+            // `ready_label_handler` (mika#2263).
+            if let Some(held) = operator_held_label(s.labels.iter().map(String::as_str)) {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::OperatorHeld {
+                        label: held.to_string(),
+                    },
+                });
+                continue;
+            }
             if !s.plan_present {
                 refusals.push(AdmissionRefusal {
                     number: s.number,
@@ -1417,6 +1493,204 @@ mod tests {
             sites[0].starts_with("pool.rs:"),
             "le site unique vit dans `pool.rs` ; trouvé : {}",
             sites[0]
+        );
+    }
+
+    // -- mika#2923 : un ticket que l'opérateur tient n'entre pas -------------
+
+    /// Membres de `OPERATOR_HELD_LABELS` qui, délibérément, **n'excluent pas**
+    /// un candidat du bassin. **Livrée vide, et c'est l'état nominal** : les
+    /// trois membres d'aujourd'hui tiennent tous le ticket au même titre
+    /// (mika#2263).
+    ///
+    /// Une entrée future doit nommer le label, dire pourquoi l'admission
+    /// l'ignore, et référencer son ticket de suivi — jamais un nom seul.
+    const EXCEPTIONS_ADMISSION: &[(&str, &str)] = &[];
+
+    /// V1 — le corpus du rapport du 2026-10-26, contrôle positif et contrôle
+    /// négatif dans le **même** test (AC1).
+    ///
+    /// Les vrais numéros et les vrais labels : un corpus inventé testerait le
+    /// prédicat sans attester la cause du ticket. Le rapport recommandait
+    /// d'admettre #2698, #2699 et #1806, tous trois `operator-gated` ; le
+    /// quatrième candidat, groomé et sans label gaté, est ce qui sépare « le
+    /// filtre marche » de « plus rien n'est admis ».
+    #[test]
+    fn mika2923_le_corpus_du_2026_10_26_refuse_les_trois_gates_et_admet_le_non_gate() {
+        let milestone = vec![
+            cand(2698, Some(1), true, &["p1-important", "operator-gated"]),
+            cand(2699, Some(1), true, &["p1-important", "operator-gated"]),
+            // Le candidat non gaté, groomé : le contrôle négatif.
+            cand(2923, Some(1), true, &["p1-important"]),
+        ];
+        let outside = vec![cand(
+            1806,
+            Some(1),
+            true,
+            &["p1-important", "operator-gated"],
+        )];
+        // Bande famine pour que `admit` soit non vide.
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &outside);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2923],
+            "seul le candidat sans label gaté est recommandé : {:?}",
+            v.admit
+        );
+        let refuses: Vec<(u64, String)> = v
+            .refusals
+            .iter()
+            .map(|r| (r.number, r.reason.label()))
+            .collect();
+        assert_eq!(
+            refuses,
+            vec![
+                (
+                    2698,
+                    "tenu par l'opérateur — label `operator-gated` à retirer".to_string()
+                ),
+                (
+                    2699,
+                    "tenu par l'opérateur — label `operator-gated` à retirer".to_string()
+                ),
+                // Le dehors vient après le milestone : les refus sortent dans
+                // l'ordre de parcours des candidats, pas dans l'ordre de tri du
+                // bassin — c'est `admit` qui est trié.
+                (
+                    1806,
+                    "tenu par l'opérateur — label `operator-gated` à retirer".to_string()
+                ),
+            ],
+            "les trois gatés sont refusés, et le refus **nomme** le label à retirer"
+        );
+    }
+
+    /// V2a — `operator-gated` **seul** suffit à refuser (AC2).
+    ///
+    /// Son jumeau non labellisé est dans le même test : sans lui, un refus
+    /// pourrait venir de n'importe quel autre filtre du semis.
+    #[test]
+    fn mika2923_operator_gated_seul_suffit_a_refuser() {
+        let milestone = vec![
+            cand(70, Some(1), true, &["operator-gated"]),
+            cand(71, Some(1), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![71],
+            "le jumeau sans label est admis — c'est le label qui écarte #70, \
+             pas le hasard du semis : {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 70,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "operator-gated".to_string(),
+                },
+            }],
+        );
+    }
+
+    /// V2b — `blocked` **seul** suffit à refuser (AC2).
+    ///
+    /// Un test distinct de V2a, exprès : neutraliser un terme du prédicat ne
+    /// doit pas laisser l'autre vert par accident.
+    #[test]
+    fn mika2923_blocked_seul_suffit_a_refuser() {
+        let milestone = vec![
+            cand(80, Some(1), true, &["blocked"]),
+            cand(81, Some(1), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![81],
+            "le jumeau sans label est admis : {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 80,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "blocked".to_string(),
+                },
+            }],
+        );
+    }
+
+    /// V3 — **chaque** membre de `OPERATOR_HELD_LABELS` refuse à l'admission.
+    ///
+    /// L'itération est sur la constante, jamais sur une liste recopiée : donc
+    /// `operator-review` est couvert aujourd'hui sans l'avoir nommé, et un
+    /// membre ajouté demain l'est le jour de son arrivée. C'est le détecteur de
+    /// ce vol, et il atterrit vert sur les trois membres.
+    #[test]
+    fn mika2923_chaque_label_tenu_refuse_a_ladmission() {
+        use crate::webhook_dispatch::OPERATOR_HELD_LABELS;
+
+        // Sans cette assertion, la boucle garderait zéro chose et le test
+        // passerait en ne mesurant rien.
+        assert!(
+            !OPERATOR_HELD_LABELS.is_empty(),
+            "une liste vide ferait de ce test une boucle sur rien"
+        );
+
+        for label in OPERATOR_HELD_LABELS {
+            if EXCEPTIONS_ADMISSION.iter().any(|(l, _)| l == label) {
+                continue;
+            }
+            let milestone = vec![cand(60, Some(1), true, &[label])];
+            let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+            assert!(
+                v.admit.is_empty(),
+                "`{label}` tient le ticket : il ne doit pas être admis — {:?}",
+                v.admit
+            );
+            assert_eq!(
+                v.refusals,
+                vec![AdmissionRefusal {
+                    number: 60,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::OperatorHeld {
+                        label: (*label).to_string(),
+                    },
+                }],
+                "`{label}` doit refuser en se nommant"
+            );
+        }
+
+        // Une exception qui survit au label qu'elle exemptait est la façon dont
+        // une allowlist meurt sans bruit.
+        for (label, _raison) in EXCEPTIONS_ADMISSION {
+            assert!(
+                OPERATOR_HELD_LABELS.contains(label),
+                "exception stale : `{label}` n'est plus dans OPERATOR_HELD_LABELS — \
+                 retire l'entrée, l'exception ne protège plus rien"
+            );
+        }
+    }
+
+    /// V6 — `MIKA_MANAGER_POOL_WRITE` reste lu exactement comme avant (AC4).
+    ///
+    /// Épinglage **par valeur**, dans le même commit que le filtre : « rien
+    /// n'a changé » doit être une assertion et pas une déclaration. Le vol
+    /// n'écrit aucune ligne dans `pool_writer.rs`, et c'est ce test qui le dit.
+    #[test]
+    fn mika2923_linterrupteur_decriture_reste_lu_comme_avant() {
+        use crate::milestone_manager::pool_writer::ENV_POOL_WRITE;
+
+        assert_eq!(
+            ENV_POOL_WRITE, "MIKA_MANAGER_POOL_WRITE",
+            "le nom de l'interrupteur est le contrat opérateur : il ne bouge pas"
         );
     }
 }
