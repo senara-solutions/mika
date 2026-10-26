@@ -12,7 +12,8 @@
 use super::plan_size;
 use super::pool::{PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause};
 use super::types::{
-    CiState, IssueState, MilestoneRef, MilestoneState, ProgressCounts, RecentActivity, SubIssue,
+    CiState, IssueState, MilestoneRef, MilestoneState, PrLinkSource, ProgressCounts,
+    RecentActivity, SubIssue,
 };
 use crate::auto_pull::extract_branch_name;
 use crate::plan_callout::{FenceHandling, plan_callout};
@@ -162,6 +163,16 @@ impl Reader {
             .await?;
 
         // 2. Sub-issue enumeration (issues attached to this milestone).
+        //
+        //    `closedByPullRequestsReferences` est la référence de clôture que
+        //    GitHub tient **côté issue** (mika#2924). Elle est demandée ici, sur
+        //    une lecture déjà émise, parce que le milestone est rattaché au
+        //    ticket et jamais à la PR : la liste des PR du milestone (appel 3)
+        //    ne voit aucune PR de la boucle autonome, et 87 tickets fermés du
+        //    milestone 33 rendaient `closed (no linked PR)` dont 73 avaient une
+        //    PR de clôture. Le coût en appels `gh` par cycle est **inchangé** —
+        //    mesuré le 2026-10-26 sur le dépôt réel : 1 appel avant, 1 après
+        //    (1,639 s → 1,795 s).
         let issues_json = runner
             .run(&[
                 "issue",
@@ -173,7 +184,7 @@ impl Reader {
                 "--state",
                 "all",
                 "--json",
-                "number,title,state,body,labels,updatedAt",
+                "number,title,state,body,labels,updatedAt,closedByPullRequestsReferences",
                 "--limit",
                 "100",
             ])
@@ -762,11 +773,28 @@ pub fn compose_from_gh_outputs(
         let branch_present = branch_callout_present(&body);
         let blockers = extract_blockers(&body);
         let priority_rank = priority_from_labels(&labels);
-        let (pr_number, pr_state, ci_state) = pr_by_issue
-            .get(&number)
-            .cloned()
-            .map(|(n, s, c)| (Some(n), Some(s), c))
-            .unwrap_or((None, None, CiState::None));
+        // La PR de clôture, et **d'où** on la tient (mika#2924).
+        //
+        // L'index des PR du milestone passe en premier et reste inchangé : il
+        // est le seul porteur de `pr_state` et de `ci_state`, dont dépendent
+        // `is_in_flight()`, le palier 1 de `pick_next_action`, `is_hard_blocked()`
+        // et surtout `detect_silent_progress`, qui exige
+        // `state == Open && pr_state == Some("merged")`.
+        let mut pr_number: Option<u64> = None;
+        let mut pr_state: Option<String> = None;
+        let pr_url: Option<String> = None;
+        let mut pr_link_source: Option<PrLinkSource> = None;
+        let mut ci_state = CiState::None;
+        if let Some((n, s, c)) = pr_by_issue.get(&number).cloned() {
+            pr_number = Some(n);
+            pr_state = Some(s);
+            ci_state = c;
+            // Posé même ici, où la provenance pourrait se déduire de la seule
+            // présence d'un numéro : sans ça, `None` voudrait dire à la fois
+            // « liste du milestone » et « blob d'un binaire antérieur », et la
+            // sonde AC3 ne pourrait plus séparer les deux (mika#2340).
+            pr_link_source = Some(PrLinkSource::MilestonePrList);
+        }
 
         sub_issues.push(SubIssue {
             number,
@@ -777,8 +805,8 @@ pub fn compose_from_gh_outputs(
             branch_present,
             pr_number,
             pr_state,
-            pr_url: None,
-            pr_link_source: None,
+            pr_url,
+            pr_link_source,
             ci_state,
             blockers,
             updated_at: updated_at.clone(),
@@ -1522,6 +1550,59 @@ mod gh_arg_capture_tests {
         // would render `closed (no linked PR)` in every case.
         assert_adjacent_pair(pr_call, "--state", "all");
         assert_adjacent_pair(pr_call, "--limit", "100");
+    }
+
+    // -- mika#2924 : la référence de clôture côté issue, sans appel de plus --
+
+    /// **V5** — la deuxième lecture demande `closedByPullRequestsReferences`, et
+    /// le **nombre** d'appels `gh` ne bouge pas.
+    ///
+    /// Les deux moitiés portent la décision, et elles sont distinctes :
+    ///
+    /// - le champ, parce que sans lui la référence côté issue n'arrive jamais et
+    ///   le correctif est décoratif — l'index des PR du milestone reste vide
+    ///   pour toute PR de la boucle, qui rattache le milestone au ticket ;
+    /// - le compte, parce que la réparation évidente — un `gh` par ticket fermé
+    ///   — coûterait 87 appels par cycle sur le milestone 33 là où ce champ en
+    ///   coûte zéro. La lecture était déjà émise ; on lui demande une colonne de
+    ///   plus.
+    ///
+    /// L'assertion de compte double celle de `mika2699_la_cinquieme_lecture_est_depot_large`
+    /// **à dessein** : elle y est un contrôle de non-régression du vol 2, elle est
+    /// ici la moitié mesurée du § coût du plan. Les deux rougiraient ensemble, et
+    /// c'est ce qu'on veut — un sixième appel ajouté pour servir ce champ serait
+    /// exactement la régression que ce test refuse.
+    #[tokio::test]
+    async fn mika2924_la_lecture_des_tickets_demande_la_reference_de_cloture_sans_appel_de_plus() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let calls = calls.lock().unwrap();
+        let issue_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue")
+                    && c.iter().any(|a| a == "--milestone")
+            })
+            .expect("l'appel d'énumération des sous-tickets doit être capturé");
+        assert_adjacent_pair(
+            issue_call,
+            "--json",
+            "number,title,state,body,labels,updatedAt,closedByPullRequestsReferences",
+        );
+        assert_eq!(
+            calls.len(),
+            5,
+            "la référence de clôture arrive sur une lecture déjà émise — aucun \
+             sixième appel `gh` par cycle : {calls:?}"
+        );
     }
 
     // -- mika#2699 Phase 2 (a) vol 1 : la quatrième lecture --
