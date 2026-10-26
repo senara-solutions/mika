@@ -717,6 +717,66 @@ journal. Garder le WARN inconditionnel était l'alternative, refusée : elle
 aurait fait du journal et de la table deux populations non soustractibles
 (classe mika#2205).
 
+### `tool_name = 'manager_flight_verdict'` — le verdict de l'évaluateur de vols (mika#2922, vol 1)
+
+Un `FlightVerdict` (`milestone_manager/evaluator.rs`) n'existait que dans le texte
+du rapport du sink et dans le compteur `verdicts` de `manager_flight_scan` : ni
+table, ni `audit_events`. Le seuil qui ouvre l'écriture de l'évaluateur — *les
+mêmes verdicts que MPC sur 10 vols consécutifs ou 7 jours* — était donc
+immesurable. Ces lignes sont la moitié amont de la mesure : **une ligne par vol,
+écrite par le cycle qui le juge pour la première fois**. Rien ne les lit encore ;
+le jugement de MPC et le compte de concordance sont le vol 2.
+
+**Row shape** (écrite uniquement par `flight_verdict_ledger::write_and_swallow`) :
+
+| column | value |
+|---|---|
+| `tool_name` | `manager_flight_verdict` (`MANAGER_FLIGHT_VERDICT_TOOL`) |
+| `session_id` | `manager-flight-verdict` (`MANAGER_FLIGHT_VERDICT_SESSION_ID`) — un verdict de cycle n'appartient à aucune conversation, même raison qu'`auth-boundary` ci-dessus |
+| `target_key` | `FlightVerdict::task_id` (`tasks.id`) — « la clé qui rend le verdict rejouable » |
+| `after_value` | JSON serde de `VerdictRecord { issue, recommendation }`, donc des types **existants** (`FlightIssue`, `DeathCause`, `FlightRecommendation`) : la graphie des termes ne peut pas diverger du code (classe mika#2158) |
+| `reasoning` | `issue_number=<n>` quand le vol porte un ticket lisible, sinon `NULL` — une **donnée**, jamais une clé de regroupement (même règle qu'`agent_recurring_gate`) |
+| `before_value` | toujours `NULL` — il n'y a aucun état antérieur à nommer |
+
+L'`agent_id` n'est **pas** un paramètre : `AsyncDatabase::log_audit_event` clone le
+sien, donc le cloisonnement par agent est structurel et non une discipline d'appel.
+
+**Operator query:**
+
+```sql
+SELECT target_key, after_value, count(*)
+FROM audit_events
+WHERE tool_name = 'manager_flight_verdict'
+GROUP BY 1, 2;
+```
+
+**Sonde :** `event = "manager_verdict_inscription"` (INFO, `target:
+"mika::milestone_manager"`), une ligne par cycle sur **toutes** les branches —
+`unwired` (aucun registre injecté), `no_verdicts`, `written` — portant `scope`,
+`candidates`, `inscribed`, `already_recorded` et `failed`. Ces deux derniers sont
+deux champs et **jamais une somme** : les additionner rendrait « 3 nouveaux » et
+« 3 déjà là » identiques (classe mika#2205). L'absence de la ligne signifie un
+binaire antérieur au vol (motif mika#2340), jamais une absence d'inscription.
+
+**Deux propriétés, toutes deux load-bearing :**
+
+- **Aucune autorité sur la forge.** `FlightVerdictLedger::record` rend un
+  `InscriptionTally` de trois `usize` et jamais un `Result` : une écriture en
+  échec ne peut pas changer un verdict, parce que la signature n'offre aucun
+  moyen de le propager — même forme et même raison qu'`AuthBoundaryLedger`.
+  L'inscription est néanmoins **attendue** et non détachée, pour que « exactement
+  une ligne par vol jugé » soit mesurable dans le cycle qui la produit.
+  L'écrivain vit **hors** de `milestone_manager/` — comme `flight_source.rs`, et
+  pour la même raison — afin que `no_dispatch_test.rs` passe sans modification de
+  son ensemble de jetons. Son unicité est tenue par
+  `mika2922_ac2_un_seul_ecrivain_du_verdict_du_manager` via
+  `source_scan::audit_writers`, avec son contrôle négatif.
+- **Idempotence bornée par la rétention, pas par une contrainte.** Un vol déjà
+  inscrit dans la fenêtre `AUDIT_RETENTION_DAYS` (90 j, `evidence/audit.rs`) n'est
+  pas réécrit : le test est une lecture préalable dérivée de cette constante, non
+  un `UNIQUE`. Au-delà de la rétention la ligne n'existe plus, et une
+  réinscription est alors la bonne réponse — pas un doublon.
+
 ## Timestamps
 
 All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). The `crate::timestamp` module provides centralized helpers: `now()`, `format()`, `parse()`, `now_plus()`, `now_minus()`. Fixed-width UTC format ensures correct lexicographic ordering.
