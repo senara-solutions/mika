@@ -282,6 +282,9 @@ pub mod verdict_poster;
 #[cfg(test)]
 mod no_dispatch_test;
 
+#[cfg(test)]
+mod no_repo_list_test;
+
 pub use assessor::{Assessor, AssessorConfig};
 pub use cadence::{
     CycleContext, CycleKind, DeliveryBody, DeliveryError, DeliveryFailureKind, HttpReportDeliverer,
