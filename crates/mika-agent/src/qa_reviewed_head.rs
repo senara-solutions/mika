@@ -380,4 +380,104 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         );
         assert!(readers.len() > 1, "le scan doit mordre sur deux lecteurs");
     }
+
+    // ---- conformité du prompt --------------------------------------------
+
+    /// Le prompt **embarqué**, pas celui de l'arbre : `include_str!` fige les
+    /// octets au build, exactement comme `build.rs` les fige dans
+    /// `BUNDLED_SKILL_MANIFESTS`. Une édition de l'arbre est invisible aux deux
+    /// jusqu'au prochain `make deploy` (motif mika#2340). Même idiome que
+    /// `server::webhook_turn_outcome::tests::EMBEDDED_PROMPT`, sur le même
+    /// fichier et pour la même raison.
+    const EMBEDDED_PROMPT: &str =
+        include_str!("../../../skills/bundled/qa-review-webhook-success/system_prompt.md");
+
+    /// Les issues que le prompt passe à l'outil : la valeur entre guillemets de
+    /// chaque `outcome: "…"` porté par une ligne qui **appelle** l'outil.
+    ///
+    /// Le prédicat est sorti du test pour que le contrôle de bonne foi
+    /// l'exerce sur un prompt synthétique. Il lit la valeur citée plutôt que de
+    /// chercher le littéral dans la ligne, parce que `review` est un
+    /// sous-mot de `review_failed` **et** de `stop_already_reviewed_sha` : un
+    /// `contains` rendrait un ensemble faux sans jamais rougir.
+    fn issues_appelees(prompt: &str) -> Vec<String> {
+        let mut found: Vec<String> = prompt
+            .lines()
+            .filter(|line| line.contains("record_reviewed_head("))
+            .flat_map(|line| line.split("outcome: \"").skip(1))
+            .filter_map(|rest| rest.split('"').next())
+            .map(|v| v.to_string())
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// Le prompt appelle l'outil pour **exactement** les trois issues
+    /// enregistrables, et pour aucune autre.
+    ///
+    /// La propriété que ce test tient n'est pas « le prompt mentionne l'outil »
+    /// mais « le vocabulaire du prompt et celui du registre ne divergent pas » :
+    /// une quatrième issue passée à l'appel serait refusée à l'exécution, et une
+    /// des trois oubliée serait une perte de dedup silencieuse — un tour payé par
+    /// `check_suite` pour cette tête, sans rien qui le dise.
+    #[test]
+    fn mika2917_le_prompt_appelle_loutil_aux_trois_issues_enregistrables() {
+        let appelees = issues_appelees(EMBEDDED_PROMPT);
+        let mut attendues: Vec<String> = REVIEWED_HEAD_OUTCOMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        attendues.sort();
+        assert_eq!(
+            appelees, attendues,
+            "le prompt embarqué et le vocabulaire du registre divergent"
+        );
+
+        // Chaque issue appelée est bien l'une que l'outil accepte : la
+        // réciproque du `assert_eq!` ci-dessus, dite par le prédicat de vérité
+        // lui-même plutôt que par l'égalité de deux listes.
+        for issue in &appelees {
+            assert_eq!(
+                reviewed_head_outcome(issue),
+                Some(issue.as_str()),
+                "le prompt passe {issue:?}, que l'outil refuserait"
+            );
+        }
+
+        // Les six valeurs de l'attestation mika#2855 restent dans le prompt :
+        // la section ajoutée n'en remplace aucune.
+        for ligne in [
+            "Webhook-Outcome: stop_no_open_pr",
+            "Webhook-Outcome: stop_out_of_scope",
+            "Webhook-Outcome: stop_already_reviewed_sha",
+            "Webhook-Outcome: stop_verdict_recorded",
+            "Webhook-Outcome: review",
+            "Webhook-Outcome: review_failed",
+        ] {
+            assert!(
+                EMBEDDED_PROMPT.contains(ligne),
+                "la section ajoutée a fait perdre {ligne:?} au prompt"
+            );
+        }
+    }
+
+    /// Contrôle négatif — un prompt synthétique qui passerait à l'outil une
+    /// issue hors contrat. Une égalité d'ensemble sur un prédicat inerte est
+    /// indiscernable d'une égalité vraie.
+    #[test]
+    fn mika2917_le_scan_du_prompt_mord_sur_une_issue_hors_contrat() {
+        let fabrique = concat!(
+            "| step 1 | `record_reviewed_head(repo: \"r\", pr: 1, head_sha: \"s\", ",
+            "outcome: \"stop_no_open_pr\")` |\n",
+            "| step 5 | `record_reviewed_head(repo: \"r\", pr: 1, head_sha: \"s\", ",
+            "outcome: \"review\")` |\n",
+            "Une ligne qui nomme outcome: \"review_failed\" sans appeler l'outil.\n",
+        );
+        assert_eq!(
+            issues_appelees(fabrique),
+            vec!["review".to_string(), "stop_no_open_pr".to_string()],
+            "le scan doit voir l'issue hors contrat, et ignorer la ligne qui n'appelle pas"
+        );
+    }
 }
