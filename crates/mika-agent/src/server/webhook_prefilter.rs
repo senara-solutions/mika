@@ -238,9 +238,10 @@
 use tracing::{info, warn};
 
 use mika_common::github_event_format::{
-    BRANCH_MARKER, CHECK_SUITE_EVENT_PREFIX, ISSUE_CLOSED_EVENT_PREFIX, ISSUE_COMMENT_EVENT_PREFIX,
-    ISSUE_EVENT_PREFIX, ISSUE_LABELED_EVENT_PREFIX, PR_CLOSED_EVENT_PREFIX, PR_EVENT_PREFIX,
-    PR_OPENED_EVENT_PREFIX, PR_REVIEW_EVENT_PREFIX, PUSH_EVENT_PREFIX,
+    BRANCH_MARKER, CHECK_SUITE_EVENT_PREFIX, CheckSuiteHeads, ISSUE_CLOSED_EVENT_PREFIX,
+    ISSUE_COMMENT_EVENT_PREFIX, ISSUE_EVENT_PREFIX, ISSUE_LABELED_EVENT_PREFIX,
+    PR_CLOSED_EVENT_PREFIX, PR_EVENT_PREFIX, PR_OPENED_EVENT_PREFIX, PR_REVIEW_EVENT_PREFIX,
+    PUSH_EVENT_PREFIX, parse_check_suite_heads,
 };
 use mika_common::llm::LlmProvider;
 
@@ -449,6 +450,23 @@ pub(crate) enum Candidate {
     GreenPrBranch {
         repo: String,
         branch: String,
+        /// Ce que l'événement nomme de SA tête (mika#2917), lu du texte par
+        /// [`parse_check_suite_heads`] — jamais par un appel `gh`, que le
+        /// bearing de mika#2680 refuse depuis ce module (mika#2260).
+        ///
+        /// **Aucun décideur ne le lit dans ce vol.** Le champ est transporté
+        /// et rien de plus : la pièce 3 de la forme (a) — comparer cette tête
+        /// à l'état de dedup du skill — attend que la pièce 2 existe, et une
+        /// garde qui arrive avec le diff qu'elle juge n'a jamais rien refusé
+        /// (mika#2578, mika#2752). Ce qui est acquis ici, c'est que la tête
+        /// traverse : elle était jetée au gateway.
+        ///
+        /// [`CheckSuiteHeads::LineAbsent`] n'est pas [`CheckSuiteHeads::Empty`]
+        /// — la première dit « binaire de gateway antérieur à mika#2917 »
+        /// (motif mika#2340), la seconde « la forge ne nomme aucune PR », ce
+        /// qui est la forme mesurée sur mika#2681. Les confondre serait
+        /// additionner deux populations sous un nom (mika#2205).
+        heads: CheckSuiteHeads,
     },
     /// (a rouge) `check_suite` en échec ou `timed_out` sur la branche par
     /// défaut (mika#2683).
@@ -508,6 +526,10 @@ pub(crate) fn classify(text: &str) -> Option<Candidate> {
             Candidate::GreenPrBranch {
                 repo: event.repo,
                 branch: event.branch,
+                // La fonction reste pure : la tête se lit dans le MÊME texte,
+                // par le parse déclaré dans `mika-common` à côté de la
+                // grammaire que le gateway émet (mika#2917).
+                heads: parse_check_suite_heads(text),
             }
         });
     }
@@ -1098,7 +1120,10 @@ pub(crate) async fn decide(candidate: Candidate, state: &impl PrefilterState) ->
             )
             .await
         }
-        Candidate::GreenPrBranch { repo, branch } => {
+        // `heads` est délibérément ignoré : dans ce vol la tête traverse et
+        // rien ne la lit (mika#2917). Le verdict de (b) reste exactement celui
+        // de mika#2680 — aucune porte ne change d'avis sur aucune entrée.
+        Candidate::GreenPrBranch { repo, branch, .. } => {
             decide_head_decided(&repo, &branch, state).await
         }
         Candidate::RedPrBranch { repo, branch } => {
@@ -1718,11 +1743,175 @@ pub(crate) mod tests {
                 classify(text),
                 Some(Candidate::GreenPrBranch {
                     repo: "senara-solutions/mika".into(),
-                    branch: branch.into()
+                    branch: branch.into(),
+                    // Ces deux textes sont ceux d'avant mika#2917 : ils ne
+                    // portent AUCUNE ligne de tête, et c'est ce que
+                    // `LineAbsent` dit. Un gateway à jour écrit `none` sur un
+                    // payload sans PR, donc `Empty` — les deux valeurs ne se
+                    // confondent pas, et l'ancien texte continue d'entrer
+                    // dans la population exactement comme avant.
+                    heads: CheckSuiteHeads::LineAbsent,
                 }),
                 "{text}"
             );
         }
+    }
+
+    /// Le texte d'un `check_suite` d'avant mika#2917 et celui d'après, tels
+    /// que le gateway les émet.
+    ///
+    /// Le second est obtenu en ajoutant les lignes 2 et 3 au premier, comme
+    /// `format_event_text` le fait — et non recopié à la main : les deux
+    /// moitiés du couple doivent rester le même premier mot pour que le test
+    /// dise quelque chose.
+    fn mika2917_ancien_puis_nouveau(premiere_ligne: &str) -> (String, String) {
+        use mika_common::github_event_format::{
+            CHECK_SUITE_HEAD_LINE_PREFIX, CHECK_SUITE_PRS_LINE_PREFIX,
+        };
+        let nouveau = format!(
+            "{premiere_ligne}\n\
+             {CHECK_SUITE_HEAD_LINE_PREFIX}1a2b3c4d\n\
+             {CHECK_SUITE_PRS_LINE_PREFIX}2917@1a2b3c4d"
+        );
+        (premiere_ligne.to_string(), nouveau)
+    }
+
+    /// mika#2917 — les QUATRE lecteurs du texte `check_suite` lisent l'ancien
+    /// et le nouveau texte **identiquement**.
+    ///
+    /// C'est la Definition of Done de ce vol, et la raison pour laquelle la
+    /// tête s'écrit en lignes 2 et 3. Les quatre ne lisent que la première
+    /// ligne — `parse_check_suite_success` et `parse_check_suite_failure` par
+    /// `lines().next()` puis `strip_suffix(')')`, les deux `CHECK_SUITE_RE` par
+    /// un motif ancré en tête dont le `[^)]+` s'arrête sur la parenthèse. Mais
+    /// cette propriété est tenue par quatre sites indépendants, dont deux
+    /// régulières recopiées l'une de l'autre : elle doit être épinglée, pas
+    /// déduite. Trois des quatre casseraient en silence.
+    #[test]
+    fn mika2917_les_quatre_lecteurs_lisent_lancien_et_le_nouveau_texte_identiquement() {
+        use super::super::webhook_queue::correlate_webhook;
+
+        // (1) et (3) — le succès : `parse_check_suite_success` et les deux
+        // régulières, sur la forme verte.
+        let (ancien, nouveau) = mika2917_ancien_puis_nouveau(
+            "[GitHub] Check suite success on senara-solutions/mika (branch: feat/2917/x)",
+        );
+        for (etiquette, texte) in [("ancien", &ancien), ("nouveau", &nouveau)] {
+            let event = parse_check_suite_success(texte).unwrap_or_else(|| {
+                panic!("`parse_check_suite_success` ne lit plus le {etiquette}")
+            });
+            assert_eq!(event.repo, "senara-solutions/mika", "{etiquette}");
+            assert_eq!(event.branch, "feat/2917/x", "{etiquette}");
+
+            // `CHECK_SUITE_RE` de `webhook_queue` (mika#528), par son seul
+            // consommateur.
+            let correlation = correlate_webhook(texte)
+                .unwrap_or_else(|| panic!("`correlate_webhook` ne corrèle plus le {etiquette}"));
+            assert_eq!(
+                correlation.branch,
+                Some("feat/2917/x".to_string()),
+                "{etiquette}"
+            );
+            assert!(
+                correlation.event_desc.contains("success"),
+                "{etiquette} : {correlation:?}"
+            );
+
+            // `CHECK_SUITE_RE` de `webhook_queue_v2`, le jumeau recopié.
+            assert_eq!(
+                classify_event(texte),
+                WebhookEventKind::CheckSuite {
+                    repo: "senara-solutions/mika".to_string(),
+                    branch: "feat/2917/x".to_string(),
+                },
+                "{etiquette}"
+            );
+        }
+
+        // (2) — l'échec : `parse_check_suite_failure`, qui lit la conclusion
+        // en plus du couple repo/branche.
+        let (ancien, nouveau) = mika2917_ancien_puis_nouveau(
+            "[GitHub] Check suite failure on senara-solutions/mika (branch: feat/2917/x)",
+        );
+        for (etiquette, texte) in [("ancien", &ancien), ("nouveau", &nouveau)] {
+            let event = parse_check_suite_failure(texte).unwrap_or_else(|| {
+                panic!("`parse_check_suite_failure` ne lit plus le {etiquette}")
+            });
+            assert_eq!(event.repo, "senara-solutions/mika", "{etiquette}");
+            assert_eq!(event.branch, "feat/2917/x", "{etiquette}");
+            assert_eq!(event.conclusion, "failure", "{etiquette}");
+        }
+
+        // La moitié qui rend le test non vide : une tête écrite en PREMIÈRE
+        // ligne casse bien les lecteurs. Sans ce contrôle, le test ci-dessus
+        // passerait aussi si les quatre lecteurs s'étaient mis à tout lire.
+        let tete_en_premier = format!(
+            "{}1a2b3c4d\n[GitHub] Check suite success on senara-solutions/mika (branch: feat/2917/x)",
+            mika_common::github_event_format::CHECK_SUITE_HEAD_LINE_PREFIX
+        );
+        assert!(
+            parse_check_suite_success(&tete_en_premier).is_none(),
+            "si la tête en ligne 1 ne cassait rien, la contrainte de position \
+             de ce vol serait sans objet — et ce test, vide"
+        );
+        assert!(correlate_webhook(&tete_en_premier).is_none());
+        assert_eq!(classify_event(&tete_en_premier), WebhookEventKind::Other);
+    }
+
+    /// mika#2917 — `classify` transporte la tête, et distingue ses quatre
+    /// formes.
+    ///
+    /// Aucun décideur ne la lit dans ce vol : ce test est donc tout ce qui
+    /// atteste que la tête traverse. Il épingle en particulier que
+    /// `LineAbsent` et `Empty` ne sont pas la même valeur — un gateway
+    /// antérieur au vol et une forge qui ne nomme aucune PR sont deux
+    /// populations, et une seule des deux se corrige par un déploiement.
+    #[test]
+    fn mika2917_classify_transporte_la_tete_sans_que_rien_ne_la_lise() {
+        fn heads_de(texte: &str) -> CheckSuiteHeads {
+            match classify(texte) {
+                Some(Candidate::GreenPrBranch { heads, .. }) => heads,
+                autre => panic!("hors population : {autre:?}"),
+            }
+        }
+
+        let premiere =
+            "[GitHub] Check suite success on senara-solutions/mika (branch: feat/2917/x)";
+        let (ancien, nouveau) = mika2917_ancien_puis_nouveau(premiere);
+
+        assert_eq!(
+            heads_de(&ancien),
+            CheckSuiteHeads::LineAbsent,
+            "un texte sans ligne de tête vient d'un gateway antérieur au vol"
+        );
+        assert_eq!(
+            heads_de(&nouveau),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string(),
+            }
+        );
+        assert_ne!(heads_de(&ancien), CheckSuiteHeads::Empty);
+
+        // `none` : la forge ne nomme aucune PR — la forme mesurée sur
+        // mika#2681, et celle qu'un gateway à jour écrit sur un payload sans
+        // `pull_requests[]`.
+        let vide = format!(
+            "{premiere}\n{}1a2b3c4d\n{}{}",
+            mika_common::github_event_format::CHECK_SUITE_HEAD_LINE_PREFIX,
+            mika_common::github_event_format::CHECK_SUITE_PRS_LINE_PREFIX,
+            mika_common::github_event_format::CHECK_SUITE_PRS_NONE,
+        );
+        assert_eq!(heads_de(&vide), CheckSuiteHeads::Empty);
+
+        // Plusieurs PR : la suite est partagée, elle ne nomme la tête
+        // d'aucune.
+        let plusieurs = format!(
+            "{premiere}\n{}1a2b3c4d\n{}2917@1a2b3c4d 2918@9f8e7d6c",
+            mika_common::github_event_format::CHECK_SUITE_HEAD_LINE_PREFIX,
+            mika_common::github_event_format::CHECK_SUITE_PRS_LINE_PREFIX,
+        );
+        assert_eq!(heads_de(&plusieurs), CheckSuiteHeads::Many(2));
     }
 
     /// (d) chaque famille de l'ensemble lu par la boucle sort de la population.

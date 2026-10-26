@@ -166,6 +166,135 @@ pub const ISSUE_COMMENT_EVENT_PREFIX: &str = "[GitHub] New comment on ";
 pub const PUSH_EVENT_PREFIX: &str = "[GitHub] push.";
 
 // ---------------------------------------------------------------------------
+// La tête d'un `check_suite`, transmise au lieu d'être jetée (mika#2917)
+// ---------------------------------------------------------------------------
+//
+// Jusqu'à mika#2917, `format_event_text` jetait `check_suite.head_sha` et
+// `check_suite.pull_requests[]` : son texte ne nommait donc **aucune tête**, et
+// la seule façon pour le moteur d'apprendre de quelle tête l'événement parlait
+// était un appel `gh` — que le bearing de mika#2680 refuse (mika#2260). Les
+// deux lignes déclarées ci-dessous lèvent cet obstacle matériel.
+//
+// **Lignes 2 et 3, jamais la ligne 1, et c'est une contrainte.** Quatre
+// lecteurs du texte `check_suite` existent, et les quatre ne lisent que la
+// PREMIÈRE ligne, qu'ils terminent sur son `)` :
+// `ci_success_handler::parse_check_suite_success`,
+// `ci_failure_handler::parse_check_suite_failure`,
+// `webhook_queue::CHECK_SUITE_RE` (mika#528) et `webhook_queue_v2::CHECK_SUITE_RE`.
+// Aucun n'est ancré en fin de texte, aucun n'utilise `(?m)`, et leur `[^)]+`
+// s'arrête au `)`. Ajouter des lignes **après** la première les laisse donc
+// tous intacts — et c'est ce qu'épingle
+// `webhook_prefilter::tests::mika2917_les_quatre_lecteurs_lisent_lancien_et_le_nouveau_texte`.
+//
+// Producteur : `mika_gateway::github::format_event_text` (bras `check_suite`).
+// Consommateur : [`parse_check_suite_heads`], juste en dessous.
+
+/// Deuxième ligne d'un texte de `check_suite` : la tête de la suite.
+/// Forme complète : `Head-Sha: {sha}`.
+///
+/// `unknown` quand le payload n'en portait pas — même modèle que `conclusion`
+/// et `branch` sur la première ligne : le gateway n'invente pas, et le
+/// consommateur traite `unknown` comme une tête non nommée.
+pub const CHECK_SUITE_HEAD_LINE_PREFIX: &str = "Head-Sha: ";
+
+/// Troisième ligne : les PR que la suite nomme, `{n}@{sha}` séparés par un
+/// espace, ou [`CHECK_SUITE_PRS_NONE`] quand aucune n'est nommable.
+/// Forme complète : `Check-Suite-PRs: 2917@1a2b3c 2918@9f8e7d`.
+pub const CHECK_SUITE_PRS_LINE_PREFIX: &str = "Check-Suite-PRs: ";
+
+/// Le payload ne nommait **aucune** tête de PR — ce qui n'est pas la même
+/// chose que la ligne absente (mika#2340).
+///
+/// Sa cause nominale est un tableau `pull_requests` présent et **vide**, l'état
+/// mesuré sur mika#2681. Elle couvre aussi le cas dégénéré d'un tableau non
+/// vide dont aucune entrée ne porte de `head.sha` : une PR sans tête n'est pas
+/// une PR nommée, et le producteur rend donc `none` là aussi plutôt que
+/// d'émettre une valeur vide. **Une seule population sous ce nom** — « le
+/// payload ne nomme aucune tête » — déclarée identiquement aux deux bouts, et
+/// non deux populations additionnées (mika#2205).
+pub const CHECK_SUITE_PRS_NONE: &str = "none";
+
+/// Ce que le texte dit des têtes de la suite. Quatre valeurs, et aucune ne se
+/// déduit d'une autre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckSuiteHeads {
+    /// La ligne [`CHECK_SUITE_PRS_LINE_PREFIX`] est absente : binaire d'avant
+    /// mika#2917 (classe mika#2340). **Jamais confondu avec [`Self::Empty`]** :
+    /// l'absence nomme un régime de déploiement, `Empty` un comportement de la
+    /// forge, et les confondre, c'est additionner deux populations sous un nom
+    /// (mika#2205).
+    LineAbsent,
+    /// La ligne est là et ne nomme aucune tête — voir [`CHECK_SUITE_PRS_NONE`].
+    Empty,
+    /// Exactement une PR, avec son `head.sha`. Le seul cas qu'un décideur
+    /// pourra comparer.
+    One { pr: u64, head_sha: String },
+    /// Plusieurs PR : le payload ne nomme pas LA tête de l'événement.
+    Many(usize),
+}
+
+/// Lit les têtes qu'un texte de `check_suite` nomme. Fonction **pure** : aucun
+/// état, aucun réseau, aucune allocation hors le `sha` retenu.
+///
+/// # Ce qu'elle ne fait pas
+///
+/// Elle ne décide rien, et au vol 1 de mika#2917 **aucun décideur ne la lit** :
+/// `webhook_prefilter::classify` transporte sa valeur pour que le vol 3 n'ait
+/// qu'un décideur à écrire, et sa présence ne change aucune porte.
+///
+/// # Un jeton illisible est sauté, pas promu en erreur
+///
+/// Numéro non numérique, `@` absent, `sha` vide : le jeton est ignoré. Le texte
+/// vient du gateway et non d'un utilisateur, donc un jeton qu'on ne sait pas
+/// lire doit se comporter comme si le payload n'avait pas nommé cette PR —
+/// fail-safe, dans le sens où le tour a lieu.
+///
+/// # Aucun découpage d'octets
+///
+/// `strip_prefix`, `split_whitespace` et `split_once` seulement : un `sha` est
+/// de l'ASCII, mais rien ne garantit que le reste de la ligne le soit, et
+/// `scripts/check-byte-slices.sh` (mika#764) refuse la forme indexée.
+pub fn parse_check_suite_heads(text: &str) -> CheckSuiteHeads {
+    let Some(value) = text
+        .lines()
+        .find_map(|line| line.strip_prefix(CHECK_SUITE_PRS_LINE_PREFIX))
+    else {
+        return CheckSuiteHeads::LineAbsent;
+    };
+
+    let value = value.trim();
+    if value == CHECK_SUITE_PRS_NONE {
+        return CheckSuiteHeads::Empty;
+    }
+
+    let mut heads: Vec<(u64, &str)> = Vec::new();
+    for token in value.split_whitespace() {
+        let Some((number, sha)) = token.split_once('@') else {
+            continue;
+        };
+        let Ok(pr) = number.parse::<u64>() else {
+            continue;
+        };
+        if sha.is_empty() {
+            continue;
+        }
+        heads.push((pr, sha));
+    }
+
+    match heads.as_slice() {
+        // Ligne présente, rien de nommable : la même valeur que `none`, parce
+        // que c'est la même chose dite du payload. Inatteignable depuis un
+        // gateway conforme, qui écrit `none` dans ce cas.
+        [] => CheckSuiteHeads::Empty,
+        [(pr, head_sha)] => CheckSuiteHeads::One {
+            pr: *pr,
+            head_sha: (*head_sha).to_string(),
+        },
+        many => CheckSuiteHeads::Many(many.len()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Les données citées ne sont pas du texte d'intention (mika#2755)
 // ---------------------------------------------------------------------------
 
@@ -643,6 +772,124 @@ mod tests {
                 "forme invalide acceptée : {not_a_tag:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // La tête d'un `check_suite` (mika#2917, vol 1)
+    // -----------------------------------------------------------------------
+
+    /// Seul assembleur de texte `check_suite` **nouveau** de ce module : les
+    /// trois lignes dans leur ordre, par leurs constantes.
+    fn check_suite_text_with_heads(prs: &str) -> String {
+        format!(
+            "[GitHub] Check suite success on senara-solutions/mika (branch: feat/2917/x)\n\
+             {CHECK_SUITE_HEAD_LINE_PREFIX}1a2b3c4d\n\
+             {CHECK_SUITE_PRS_LINE_PREFIX}{prs}"
+        )
+    }
+
+    #[test]
+    fn mika2917_une_ligne_absente_nest_pas_un_tableau_vide() {
+        // Le texte d'un binaire d'avant ce vol : une seule ligne.
+        let ancien = check_suite_text("feat/2917/x");
+        assert_eq!(
+            parse_check_suite_heads(&ancien),
+            CheckSuiteHeads::LineAbsent,
+            "sans la ligne, on ne sait RIEN du payload — pas « il était vide »"
+        );
+
+        let vide = check_suite_text_with_heads(CHECK_SUITE_PRS_NONE);
+        assert_eq!(
+            parse_check_suite_heads(&vide),
+            CheckSuiteHeads::Empty,
+            "la ligne `none` dit que le payload ne nommait aucune tête"
+        );
+
+        assert_ne!(
+            parse_check_suite_heads(&ancien),
+            parse_check_suite_heads(&vide),
+            "mika#2205 — un régime de déploiement et un comportement de la \
+             forge ne s'additionnent pas sous un nom"
+        );
+    }
+
+    #[test]
+    fn mika2917_une_seule_pr_est_le_seul_cas_comparable() {
+        assert_eq!(
+            parse_check_suite_heads(&check_suite_text_with_heads("2917@1a2b3c4d")),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mika2917_plusieurs_pr_ne_nomment_pas_la_tete_de_levenement() {
+        assert_eq!(
+            parse_check_suite_heads(&check_suite_text_with_heads("2917@1a2b3c4d 2918@9f8e7d6c")),
+            CheckSuiteHeads::Many(2),
+            "deux PR : le payload ne dit pas de LAQUELLE la suite parle"
+        );
+    }
+
+    #[test]
+    fn mika2917_un_jeton_illisible_est_saute_et_non_promu_en_erreur() {
+        // `@` absent, numéro non numérique, `sha` vide : chacun saute, et la PR
+        // lisible qui les voisine survit. Le résultat est donc `One`, pas
+        // `Many(4)` — un jeton qu'on ne sait pas lire ne nomme aucune PR.
+        assert_eq!(
+            parse_check_suite_heads(&check_suite_text_with_heads(
+                "2917 nan@1a2b3c4d 2919@ 2918@9f8e7d6c"
+            )),
+            CheckSuiteHeads::One {
+                pr: 2918,
+                head_sha: "9f8e7d6c".to_string()
+            }
+        );
+
+        // Tous illisibles : la ligne est là, elle ne nomme rien. Même valeur
+        // que `none`, parce que c'est la même chose dite du payload.
+        assert_eq!(
+            parse_check_suite_heads(&check_suite_text_with_heads("2917 nan@abc 2919@")),
+            CheckSuiteHeads::Empty
+        );
+    }
+
+    #[test]
+    fn mika2917_la_ligne_des_pr_se_lit_ou_quelle_soit() {
+        // Le prédicat est par ligne et non positionnel : un enrichissement
+        // préfixé ou une enveloppe de gestionnaire décale les lignes sans que
+        // le parse en souffre (même leçon que mika#2768 sur `mask_cited_branch`).
+        let enveloppe = format!(
+            "<ci_success_handler>\n{}\n</ci_success_handler>",
+            check_suite_text_with_heads("2917@1a2b3c4d")
+        );
+        assert_eq!(
+            parse_check_suite_heads(&enveloppe),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mika2917_le_masque_de_branche_ne_touche_pas_les_lignes_de_tete() {
+        // Les deux mécanismes cohabitent sur le même texte : `mask_cited_branch`
+        // borne sa coupe à la ligne de l'occurrence, donc les lignes 2 et 3
+        // traversent intactes et le parse les lit encore après masquage.
+        let text = check_suite_text_with_heads("2917@1a2b3c4d");
+        let masked = mask_cited_branch(&text);
+
+        assert_eq!(
+            parse_check_suite_heads(masked.as_ref()),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string()
+            },
+            "le masque a mangé une ligne qu'il ne vise pas : {masked}"
+        );
     }
 
     #[test]
