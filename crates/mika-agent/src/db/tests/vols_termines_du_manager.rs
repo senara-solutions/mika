@@ -1,5 +1,5 @@
 //! Ce que « les vols d'implémentation terminés depuis le cycle précédent »
-//! veut dire en SQL (mika#2698, vol 1).
+//! veut dire en SQL (mika#2698 vol 1, élargi par mika#2921).
 //!
 //! Le lecteur unique est
 //! [`crate::db::Database::list_finished_implement_flights_in_container`], et
@@ -9,10 +9,12 @@
 //!   d'agent, et filtrer sur celui du handle emprunté pour la connexion est
 //!   exactement ce qui a rendu l'évaluateur inerte pendant quatre jours. Le
 //!   scope est le conteneur, qui n'a qu'une base ;
-//! - **l'ensemble clos des variantes d'URL** (`issue_url_variants`), parce que
-//!   `reference_url` porte parfois `?phase=groom` — et parce qu'une égalité,
-//!   contrairement à un `LIKE` préfixe, ne confond pas `#2693` avec `#26930`
-//!   (le défaut que mika#2638 a dû réparer sur deux autres sites) ;
+//! - **un motif `LIKE` par dépôt** (mika#2921), `https://github.com/<dépôt>/issues/%`
+//!   avec `ESCAPE '\'`. Le périmètre est le **dépôt**, plus le ticket : un vol
+//!   est jugé quel que soit son milestone, pourvu que son ticket vive sur un
+//!   dépôt sous contrôle. Le `/issues/` littéral avant le joker est ce qui
+//!   empêche `mika` de capturer `mika-cloud`, et l'échappement est ce qui
+//!   empêche un `_` d'élargir le périmètre en silence ;
 //! - **`COALESCE(completed_at, updated_at)`** comme borne temporelle, parce
 //!   qu'un vol mort par `failed` peut n'avoir que son `updated_at` : avec
 //!   `completed_at > ?` seul, `NULL > '…'` rend `NULL`, et ce sont exactement
@@ -21,8 +23,8 @@
 //!   « un statut inconnu n'est pas terminal » de `is_terminal_task_status` n'a
 //!   pas d'expression dans ce dialecte, et qu'une troisième copie de la liste
 //!   des statuts divergerait ;
-//! - **une liste d'URLs vide rend `vec![]`** avant toute requête : c'est le
-//!   contrôle négatif du détecteur. Un milestone sans sous-ticket ne doit pas
+//! - **une liste de dépôts vide rend `vec![]`** avant toute requête : c'est le
+//!   contrôle négatif du détecteur. « Aucun dépôt sous contrôle » ne doit pas
 //!   faire évaluer la table entière.
 //!
 //! Depuis mika#2886 la lecture rend **deux lignes de `tasks` par vol** : la
@@ -37,13 +39,25 @@ use super::*;
 
 const REPO: &str = "senara-solutions/mika";
 
-/// Le ticket de référence, et son voisin numérique — `2693` est un préfixe de
-/// `26930`, et c'est tout l'intérêt de l'égalité.
+/// Un second dépôt sous contrôle, dont le nom **commence par celui du premier**
+/// — c'est tout l'intérêt du `/issues/` littéral dans le motif.
+const REPO_VOISIN: &str = "senara-solutions/mika-cloud";
+
+/// Un dépôt **hors** de la liste. C'est la forme de claude-pilot#232, le vol
+/// mesuré le 2026-10-26 qui sort du périmètre jugé (AC2 de mika#2921).
+const REPO_DEHORS: &str = "senara-solutions/claude-pilot";
+
+/// Le ticket de référence, et un second sur le même dépôt — deux milestones
+/// différents en production, une seule et même population ici.
 const TICKET: u32 = 2693;
-const VOISIN: u32 = 26930;
+const AUTRE_TICKET: u32 = 26930;
 
 fn issue_url(n: u32) -> String {
-    format!("https://github.com/{REPO}/issues/{n}")
+    issue_url_sur(REPO, n)
+}
+
+fn issue_url_sur(repo: &str, n: u32) -> String {
+    format!("https://github.com/{repo}/issues/{n}")
 }
 
 /// Un vol d'implémentation portant `reference_url` : la topologie d'un dispatch
@@ -65,16 +79,16 @@ fn seed_vol_termine(db: &Database, agent_id: &str, reference_url: &str) -> Strin
     id
 }
 
-/// Lit les vols du ticket de référence. **Plus d'agent à passer** (mika#2792) :
+/// Lit les vols du dépôt de référence. **Plus d'agent à passer** (mika#2792) :
 /// c'est le conteneur qui est interrogé, et l'absence de ce paramètre est la
 /// forme même du correctif.
 fn lire(db: &Database, since: Option<&str>) -> Vec<String> {
-    lire_sur(db, since, &[issue_url(TICKET)])
+    lire_sur(db, since, &[REPO.to_string()])
 }
 
-/// Idem, sur une liste d'URLs choisie par l'appelant.
-fn lire_sur(db: &Database, since: Option<&str>, urls: &[String]) -> Vec<String> {
-    db.list_finished_implement_flights_in_container(since, urls)
+/// Idem, sur une liste de dépôts choisie par l'appelant.
+fn lire_sur(db: &Database, since: Option<&str>, repos: &[String]) -> Vec<String> {
+    db.list_finished_implement_flights_in_container(since, repos)
         .expect("la lecture doit répondre")
         .into_iter()
         .map(|r| r.flight.id)
@@ -107,7 +121,7 @@ fn seed_enfant(
 /// Les lignes elles-mêmes, et non leurs seuls ids : les tests de mika#2886
 /// portent sur `pilot_result`.
 fn lire_lignes(db: &Database) -> Vec<crate::db::tasks::FinishedFlightRow> {
-    db.list_finished_implement_flights_in_container(None, &[issue_url(TICKET)])
+    db.list_finished_implement_flights_in_container(None, &[REPO.to_string()])
         .expect("la lecture doit répondre")
 }
 
@@ -118,8 +132,10 @@ fn enregistrer(db: &Database, agent_id: &str) {
         .expect("l'agent doit être enregistré");
 }
 
-/// La variante `?phase=groom` est dans l'ensemble clos : un vol estampillé sous
-/// cette forme est bien vu depuis l'URL canonique.
+/// Le suffixe `?phase=groom` est couvert par le `%` terminal du motif.
+/// mika#2698 l'obtenait en énumérant un ensemble clos de variantes ; mika#2921
+/// l'obtient par construction, et ce test est ce qui dit que le remplacement
+/// n'a rien perdu.
 #[test]
 fn mika2698_la_variante_phase_groom_est_appariee() {
     let db = db();
@@ -127,20 +143,75 @@ fn mika2698_la_variante_phase_groom_est_appariee() {
     assert_eq!(lire(&db, None), vec![id]);
 }
 
-/// Le voisin numérique n'est pas apparié — avec son contrôle positif, sans quoi
-/// le test ne distinguerait pas « l'égalité délimite » de « la fixture
-/// n'enregistre rien ».
+/// **AC1 — tout vol du dépôt, quel que soit son ticket.** Deux vols sur deux
+/// tickets du même dépôt sortent tous les deux. Avant mika#2921 la lecture
+/// visait une liste de tickets (les sous-issues du milestone cible), donc le
+/// second aurait été invisible : c'est exactement le silence que ce ticket
+/// répare.
 #[test]
-fn mika2698_le_voisin_numerique_nest_pas_apparie() {
+fn mika2921_deux_tickets_du_meme_depot_sortent_tous_les_deux() {
     let db = db();
-    let voisin = seed_vol_termine(&db, "mika", &issue_url(VOISIN));
+    let un = seed_vol_termine(&db, "mika", &issue_url(TICKET));
+    let deux = seed_vol_termine(&db, "mika", &issue_url(AUTRE_TICKET));
+
+    let vu = lire(&db, None);
+    assert_eq!(
+        vu.len(),
+        2,
+        "le périmètre est le dépôt, pas le ticket — obtenu {vu:?}"
+    );
+    assert!(vu.contains(&un) && vu.contains(&deux));
+}
+
+/// **Un dépôt n'est pas un préfixe d'un autre.** `senara-solutions/mika` ne
+/// capture pas `senara-solutions/mika-cloud` : le motif exige `/issues/` juste
+/// après le nom du dépôt. Avec son contrôle positif, sans quoi le test ne
+/// distinguerait pas « le motif délimite » de « la fixture n'enregistre rien ».
+#[test]
+fn mika2921_un_depot_nest_pas_le_prefixe_dun_autre() {
+    let db = db();
+    let voisin = seed_vol_termine(&db, "mika", &issue_url_sur(REPO_VOISIN, TICKET));
     assert!(
         lire(&db, None).is_empty(),
-        "le vol de #{VOISIN} a été lu comme un vol de #{TICKET}"
+        "un vol de {REPO_VOISIN} a été lu comme un vol de {REPO}"
     );
 
-    // Contrôle positif : la fixture est bien enregistrée, sous son ticket.
-    assert_eq!(lire_sur(&db, None, &[issue_url(VOISIN)]), vec![voisin]);
+    // Contrôle positif : la fixture est bien enregistrée, sous son dépôt.
+    assert_eq!(
+        lire_sur(&db, None, &[REPO_VOISIN.to_string()]),
+        vec![voisin]
+    );
+}
+
+/// **L'échappement du `_`, et pourquoi il porte.** Sans `ESCAPE '\'`, le `_` de
+/// `senara-solutions/mika_cloud` serait un joker d'un caractère et le motif
+/// reconnaîtrait `mika-cloud` — un élargissement silencieux du périmètre, soit
+/// précisément ce que « jamais au-delà » interdit. Le dépôt interrogé n'existe
+/// pas sur GitHub : c'est la **forme** du prédicat qui est mesurée.
+#[test]
+fn mika2921_un_souligne_dans_un_nom_de_depot_nest_pas_un_joker() {
+    let db = db();
+    let reel = seed_vol_termine(&db, "mika", &issue_url_sur(REPO_VOISIN, TICKET));
+
+    assert!(
+        lire_sur(&db, None, &["senara-solutions/mika_cloud".to_string()]).is_empty(),
+        "le `_` a joué le joker : {REPO_VOISIN} est entré dans le périmètre"
+    );
+
+    // Contrôle positif : la même fixture, sous son nom exact, est bien lue.
+    assert_eq!(lire_sur(&db, None, &[REPO_VOISIN.to_string()]), vec![reel]);
+}
+
+/// **Plusieurs dépôts sous contrôle sont lus d'un seul coup** — les motifs sont
+/// joints par `OR`, et l'ordre rendu reste chronologique.
+#[test]
+fn mika2921_la_liste_de_depots_est_lue_dun_seul_coup() {
+    let db = db();
+    let ici = seed_vol_termine(&db, "mika", &issue_url(TICKET));
+    let la = seed_vol_termine(&db, "mika", &issue_url_sur(REPO_VOISIN, TICKET));
+
+    let vu = lire_sur(&db, None, &[REPO.to_string(), REPO_VOISIN.to_string()]);
+    assert_eq!(vu, vec![ici, la], "les deux dépôts sont dans le périmètre");
 }
 
 /// **La clause porteuse.** Un vol mort par `failed` sans `completed_at` est vu,
@@ -161,7 +232,7 @@ fn mika2698_un_vol_mort_sans_completed_at_est_vu_par_le_coalesce() {
         .expect("le passage en failed doit réussir");
 
     let vu = db
-        .list_finished_implement_flights_in_container(None, &[issue_url(TICKET)])
+        .list_finished_implement_flights_in_container(None, &[REPO.to_string()])
         .expect("la lecture doit répondre");
     assert_eq!(vu.len(), 1, "le vol mort sans `completed_at` doit être vu");
     assert_eq!(vu[0].flight.id, id);
@@ -266,8 +337,8 @@ fn mika2698_le_grooming_est_exclu_et_la_classe_absente_vaut_implement() {
 ///
 /// Le test n'a pas été supprimé : il est **retourné**, pour qu'un lecteur de
 /// l'historique trouve la trace du renversement plutôt qu'un trou. Ce qui porte
-/// désormais la délimitation est l'URL d'issue, et c'est
-/// [`mika2792_un_vol_hors_milestone_nest_pas_trouve_meme_sous_un_autre_agent`]
+/// désormais la délimitation est le **dépôt**, et c'est
+/// [`mika2921_un_vol_hors_depot_controle_nest_pas_trouve_meme_sous_un_autre_agent`]
 /// qui l'exige.
 #[test]
 fn mika2792_la_lecture_nest_plus_cantonnee_a_lagent() {
@@ -304,40 +375,46 @@ fn mika2792_un_vol_seme_sous_un_autre_agent_est_trouve() {
     );
 }
 
-/// **Le contrôle négatif.** Lever le filtre agent n'a pas levé la délimitation :
-/// un vol sur une URL hors de la liste reste invisible, y compris quand il
-/// appartient à un autre agent. Le filtre porteur est bien l'URL d'issue.
+/// **AC2 — le contrôle négatif, au niveau du SQL.** Élargir du milestone au
+/// dépôt n'a pas levé la délimitation : un vol sur un dépôt hors de la liste
+/// reste invisible, y compris sous un autre agent. C'est la forme de
+/// claude-pilot#232.
 #[test]
-fn mika2792_un_vol_hors_milestone_nest_pas_trouve_meme_sous_un_autre_agent() {
+fn mika2921_un_vol_hors_depot_controle_nest_pas_trouve_meme_sous_un_autre_agent() {
     let db = db();
     enregistrer(&db, "mika-dev");
-    let dehors = seed_vol_termine(&db, "mika-dev", &issue_url(VOISIN));
+    let dehors = seed_vol_termine(&db, "mika-dev", &issue_url_sur(REPO_DEHORS, 232));
     let dedans = seed_vol_termine(&db, "mika-dev", &issue_url(TICKET));
 
     assert_eq!(
         lire(&db, None),
         vec![dedans],
-        "seul le vol du ticket interrogé sort, même sous un autre agent"
+        "seul le vol du dépôt interrogé sort, même sous un autre agent"
     );
 
     // Contrôle positif sur la fixture écartée : elle existe bien, et c'est son
-    // URL — non son agent — qui l'a tenue dehors.
-    assert_eq!(lire_sur(&db, None, &[issue_url(VOISIN)]), vec![dehors]);
+    // dépôt — non son agent — qui l'a tenue dehors.
+    assert_eq!(
+        lire_sur(&db, None, &[REPO_DEHORS.to_string()]),
+        vec![dehors]
+    );
 }
 
-/// **Le contrôle négatif du détecteur.** Aucune URL ne peut pas vouloir dire
-/// « tous les vols » : sans cette borne, un milestone sans sous-ticket ferait
-/// évaluer la table entière — et un `IN ()` vide n'est même pas du SQL valide.
+/// **Le contrôle négatif du détecteur** (V5 de mika#2921). Aucun dépôt ne peut
+/// pas vouloir dire « tous les vols » : sans cette borne, une liste de dépôts
+/// vide — un `DISPATCHABLE_REPOS` vidé, une projection en échec — ferait juger
+/// la table entière, claude-pilot compris. Et un prédicat vide n'est pas du SQL
+/// valide.
 #[test]
-fn mika2698_aucune_url_ne_rend_jamais_tous_les_vols() {
+fn mika2921_aucun_depot_ne_rend_jamais_tous_les_vols() {
     let db = db();
     seed_vol_termine(&db, "mika", &issue_url(TICKET));
-    seed_vol_termine(&db, "mika", &issue_url(VOISIN));
+    seed_vol_termine(&db, "mika", &issue_url_sur(REPO_DEHORS, 232));
 
     let vu = db
         .list_finished_implement_flights_in_container(None, &[])
-        .expect("la lecture doit répondre, pas échouer sur un `IN ()` vide");
-    assert!(vu.is_empty(), "aucune URL ⇒ aucun vol, jamais tous");
+        .expect("la lecture doit répondre, pas échouer sur un prédicat vide");
+    assert!(vu.is_empty(), "aucun dépôt ⇒ aucun vol, jamais tous");
 }
 
 /// L'ordre est chronologique croissant sur la borne qui a sélectionné la ligne

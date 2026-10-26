@@ -145,6 +145,17 @@ pub struct FinishedFlight {
     pub metadata: Option<String>,
     pub reference_url: Option<String>,
     pub completed_at: Option<String>,
+    /// Le **dépôt** du ticket du vol, `owner/repo` (mika#2921) — la huitième
+    /// donnée, née du jour où l'évaluateur a cessé d'être cantonné à un seul
+    /// dépôt.
+    ///
+    /// Dérivée de [`FinishedFlight::reference_url`] par la source
+    /// ([`crate::flight_source::repo_from_issue_url`]), jamais de la liste
+    /// interrogée : `None` est « ce vol ne nomme pas de dépôt », pas « dépôt
+    /// inconnu de la liste » (motif mika#2331). Un vol sur deux dépôts
+    /// différents peut porter le même numéro, donc le rendu la lit pour
+    /// désambiguïser.
+    pub repo: Option<String>,
 }
 
 /// D'où viennent les vols terminés.
@@ -156,14 +167,19 @@ pub struct FinishedFlight {
 /// de cadence ne tient aucune poignée de base.
 #[async_trait]
 pub trait FlightSource: Send + Sync {
-    /// Vols d'implémentation terminés depuis `since` (exclu), pour les issues
-    /// données. Lecture seule. Jamais d'erreur visible : un échec rend `vec![]`
-    /// et un WARN — un rapport sans section vaut mieux qu'un cycle mort.
-    async fn finished_implement_flights(
-        &self,
-        since: Option<&str>,
-        issue_urls: &[String],
-    ) -> Vec<FinishedFlight>;
+    /// Vols d'implémentation terminés depuis `since` (exclu), sur **tout le
+    /// périmètre des dépôts sous contrôle**. Lecture seule. Jamais d'erreur
+    /// visible : un échec rend `vec![]` et un WARN — un rapport sans section
+    /// vaut mieux qu'un cycle mort.
+    ///
+    /// **Le périmètre n'est pas un paramètre** (mika#2921). Il l'était —
+    /// `issue_urls`, les sous-tickets du milestone surveillé — et c'est ce qui
+    /// faisait du manager un rapporteur du milestone. L'implémentation le tient
+    /// désormais elle-même, parce qu'aucun fichier de ce module ne doit nommer de
+    /// dépôt (garde `no_repo_list_test.rs`) : le lecteur unique de la liste est
+    /// [`crate::flight_source`]. Un appelant n'a donc plus de façon de restreindre
+    /// la lecture — ni de l'élargir.
+    async fn finished_implement_flights(&self, since: Option<&str>) -> Vec<FinishedFlight>;
 }
 
 // ---- Évaluation ------------------------------------------------------------
@@ -419,6 +435,7 @@ mod tests {
             ),
             reference_url: Some("https://github.com/senara-solutions/mika/issues/2693".to_string()),
             completed_at: Some("2026-10-13T08:00:00Z".to_string()),
+            repo: Some("senara-solutions/mika".to_string()),
         }
     }
 
@@ -440,6 +457,7 @@ mod tests {
             metadata: Some(r#"{"claude_pilot":{"turns":141,"pr_number":2690}}"#.to_string()),
             reference_url: Some("https://github.com/senara-solutions/mika/issues/2655".to_string()),
             completed_at: Some("2026-10-13T09:00:00Z".to_string()),
+            repo: Some("senara-solutions/mika".to_string()),
         }
     }
 
@@ -464,6 +482,7 @@ mod tests {
             metadata: Some(r#"{"claude_pilot":{"turns":200}}"#.to_string()),
             reference_url: Some("https://github.com/senara-solutions/mika/issues/2661".to_string()),
             completed_at: Some("2026-10-13T10:00:00Z".to_string()),
+            repo: Some("senara-solutions/mika".to_string()),
         }
     }
 

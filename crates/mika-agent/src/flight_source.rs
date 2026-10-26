@@ -31,8 +31,31 @@
 //! comme « aucun vol terminé ».
 //!
 //! Qui construit la source choisit donc **une connexion**, jamais un périmètre
-//! de lecture. Le périmètre, c'est `issue_urls` — les sous-tickets du milestone
-//! que le manager surveille déjà.
+//! de lecture.
+//!
+//! # Le périmètre, et son lecteur unique (mika#2921)
+//!
+//! Le périmètre est **la liste des dépôts sous contrôle**, et plus les
+//! sous-tickets du milestone surveillé. Un manager qui ne juge qu'un milestone
+//! n'est pas un manager, c'est un rapporteur du milestone ; le rapport, lui,
+//! reste par milestone.
+//!
+//! Ce fichier est le **seul lecteur** de
+//! [`crate::webhook_dispatch::DISPATCHABLE_REPOS`] sur le chemin de
+//! l'évaluateur, et c'est la forme du point 1 tranché par le plan : réutiliser
+//! la liste que ce dépôt a déjà arbitrée sur la même question
+//! (`server/ci_failure_handler.rs`), plutôt qu'en retaper une troisième. Les
+//! quatre dépôts sont `mika`, `mika-cloud`, `mika-skills`, `mika-platform`.
+//!
+//! Le coût est nommé plutôt que tu : `claude-pilot` et `wizzard` — que le
+//! CLAUDE.md du méta-dépôt compte parmi les dépôts contrôlés et que
+//! `INTERNAL_REPOS` (privé, dans `mika-gateway`) porte — **sortent** du
+//! périmètre jugé. L'alternative aurait été de promouvoir une liste adjacente à
+//! la sécurité dans `mika-common`, c'est-à-dire un changement d'autorité
+//! déguisé en dé-duplication. « Jamais au-delà » désigne la liste la plus
+//! serrée, et le geste de réparation est **une ligne dans une seule liste**.
+//! Aucun nom de dépôt n'est écrit ailleurs sur ce chemin : la garde
+//! `milestone_manager/no_repo_list_test.rs` le refuse.
 //!
 //! # Une panne rend le vide, jamais une erreur
 //!
@@ -68,6 +91,35 @@ use tracing::warn;
 use crate::async_db::AsyncDatabase;
 use crate::db::tasks::FinishedFlightRow;
 use crate::milestone_manager::evaluator::{FinishedFlight, FlightSource};
+use crate::webhook_dispatch::DISPATCHABLE_REPOS;
+
+/// Les dépôts sous contrôle, **lus ici et nulle part ailleurs** sur le chemin de
+/// l'évaluateur (mika#2921). Voir le module pour l'arbitrage et son coût.
+///
+/// Rend des `String` parce que c'est ce que le paramètre de liaison SQLite
+/// demande ; la liste reste un `&[&str]` à sa source.
+pub(crate) fn controlled_repos() -> Vec<String> {
+    DISPATCHABLE_REPOS.iter().map(|r| r.to_string()).collect()
+}
+
+/// `https://github.com/<owner>/<repo>/issues/<n>` → `owner/repo` (mika#2921).
+///
+/// Tolère ce qui suit le numéro — `?phase=groom`, un `#fragment`, un segment de
+/// plus — parce que la coupure est faite **avant** : le dépôt vit à gauche de
+/// `/issues/`. Rend `None` sur tout ce qui n'est pas une URL d'issue GitHub, et
+/// `None` est « ce vol ne nomme pas de dépôt », jamais une chaîne vide (motif
+/// mika#2331).
+pub(crate) fn repo_from_issue_url(url: &str) -> Option<String> {
+    let (gauche, _) = url.split_once("/issues/")?;
+    let reste = gauche
+        .strip_prefix("https://github.com/")
+        .or_else(|| gauche.strip_prefix("http://github.com/"))?;
+    let (owner, repo) = reste.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
 
 /// La source de production : les vols terminés lus dans `tasks`.
 pub struct DbFlightSource {
@@ -82,17 +134,12 @@ impl DbFlightSource {
 
 #[async_trait]
 impl FlightSource for DbFlightSource {
-    async fn finished_implement_flights(
-        &self,
-        since: Option<&str>,
-        issue_urls: &[String],
-    ) -> Vec<FinishedFlight> {
+    async fn finished_implement_flights(&self, since: Option<&str>) -> Vec<FinishedFlight> {
+        let repos = controlled_repos();
+        let repo_count = repos.len();
         let rows = self
             .db
-            .list_finished_implement_flights_in_container(
-                since.map(str::to_string),
-                issue_urls.to_vec(),
-            )
+            .list_finished_implement_flights_in_container(since.map(str::to_string), repos)
             .await;
         match rows {
             Ok(lignes) => lignes.into_iter().map(task_to_finished_flight).collect(),
@@ -100,7 +147,7 @@ impl FlightSource for DbFlightSource {
                 warn!(
                     target: "mika::milestone_manager",
                     event = "flight_source_read_failed",
-                    issue_count = issue_urls.len(),
+                    repo_count,
                     since = since.unwrap_or(""),
                     error = %e,
                     "could not read finished flights — the cycle reports no verdict rather than dying"
@@ -112,7 +159,14 @@ impl FlightSource for DbFlightSource {
 }
 
 /// [`FinishedFlightRow`] → [`FinishedFlight`], c'est-à-dire la projection sur
-/// les sept données que l'évaluateur sait lire.
+/// les huit données que l'évaluateur sait lire.
+///
+/// **`repo` est la huitième, et elle n'existe que depuis mika#2921** : le
+/// rapport couvre désormais plusieurs dépôts, donc `#2900` tout seul est
+/// ambigu — `mika#2900` et `mika-cloud#196` sont deux vols que le rapport doit
+/// pouvoir nommer sans les confondre. Elle est dérivée de la ligne lue
+/// ([`repo_from_issue_url`]), jamais de la liste interrogée : un vol qui ne
+/// nomme pas de dépôt rend `None`, et le rendu le dit.
 ///
 /// **`result` est la seule donnée qui ne vient pas de la parente** (mika#2886) :
 /// `pilot_result.or(flight.result)` — l'enfant d'abord, la parente en
@@ -142,6 +196,7 @@ fn task_to_finished_flight(row: FinishedFlightRow) -> FinishedFlight {
         flight: t,
         pilot_result,
     } = row;
+    let repo = t.reference_url.as_deref().and_then(repo_from_issue_url);
     FinishedFlight {
         task_id: t.id,
         agent_id: t.agent_id,
@@ -150,6 +205,7 @@ fn task_to_finished_flight(row: FinishedFlightRow) -> FinishedFlight {
         metadata: t.metadata,
         reference_url: t.reference_url,
         completed_at: t.completed_at.or(Some(t.updated_at)),
+        repo,
     }
 }
 
@@ -175,23 +231,76 @@ mod tests {
     #[tokio::test]
     async fn mika2698_une_base_vide_rend_aucun_vol_sans_erreur() {
         let source = DbFlightSource::new(seeded_db());
-        let got = source
-            .finished_implement_flights(
-                None,
-                &["https://github.com/senara-solutions/mika/issues/2693".to_string()],
-            )
-            .await;
+        let got = source.finished_implement_flights(None).await;
         assert!(got.is_empty(), "une base vide n'a aucun vol terminé");
     }
 
-    /// Le contrôle négatif du détecteur, côté source : **aucune URL** ne peut
-    /// pas rendre « tous les vols ». Sans cette borne, un milestone sans
-    /// sous-ticket ferait évaluer l'intégralité de `tasks`.
-    #[tokio::test]
-    async fn mika2698_aucune_url_ne_rend_jamais_tous_les_vols() {
-        let source = DbFlightSource::new(seeded_db());
-        let got = source.finished_implement_flights(None, &[]).await;
-        assert!(got.is_empty());
+    /// Le périmètre interrogé n'est **jamais vide** (mika#2921). La borne
+    /// « liste vide ⇒ `vec![]` » vit en base
+    /// (`mika2921_aucun_depot_ne_rend_jamais_tous_les_vols`) ; ce qu'elle ne peut
+    /// pas dire, c'est que la production ne l'atteint pas. Depuis que
+    /// `issue_urls` a disparu du trait, la source n'a plus de paramètre où un
+    /// appelant pourrait passer `&[]` : la liste vient de
+    /// [`controlled_repos`], et ce test atteste qu'elle porte bien les quatre
+    /// dépôts sous contrôle.
+    ///
+    /// Un `DISPATCHABLE_REPOS` vidé rendrait l'évaluateur muet **sans aucune
+    /// erreur** — un silence que rien d'autre ne nomme.
+    #[test]
+    fn mika2921_le_perimetre_interroge_nest_jamais_vide() {
+        let repos = controlled_repos();
+        assert!(
+            !repos.is_empty(),
+            "un périmètre vide rendrait l'évaluateur muet en silence"
+        );
+        for attendu in [
+            "senara-solutions/mika",
+            "senara-solutions/mika-cloud",
+            "senara-solutions/mika-skills",
+            "senara-solutions/mika-platform",
+        ] {
+            assert!(
+                repos.iter().any(|r| r == attendu),
+                "{attendu} doit être dans le périmètre jugé — reçu {repos:?}"
+            );
+        }
+    }
+
+    /// `repo_from_issue_url` : la dérivation du dépôt depuis l'URL **de la
+    /// ligne lue** (mika#2921), suffixe de grooming compris, et `None` partout
+    /// où il n'y a pas de dépôt à nommer — jamais une chaîne vide (motif
+    /// mika#2331).
+    #[test]
+    fn mika2921_le_depot_se_lit_dans_lurl_du_ticket() {
+        assert_eq!(
+            repo_from_issue_url("https://github.com/senara-solutions/mika/issues/2900").as_deref(),
+            Some("senara-solutions/mika")
+        );
+        assert_eq!(
+            repo_from_issue_url("https://github.com/senara-solutions/mika-cloud/issues/196")
+                .as_deref(),
+            Some("senara-solutions/mika-cloud"),
+            "le voisin de préfixe est un dépôt distinct, et il se nomme"
+        );
+        assert_eq!(
+            repo_from_issue_url("https://github.com/senara-solutions/mika/issues/2693?phase=groom")
+                .as_deref(),
+            Some("senara-solutions/mika"),
+            "le suffixe de grooming est après le numéro — il ne touche pas le dépôt"
+        );
+        for pas_une_url in [
+            "",
+            "https://github.com/senara-solutions/mika",
+            "https://github.com/senara-solutions/mika/pull/2881",
+            "https://example.com/senara-solutions/mika/issues/1",
+            "https://github.com/mika/issues/1",
+        ] {
+            assert_eq!(
+                repo_from_issue_url(pas_une_url),
+                None,
+                "{pas_une_url} ne nomme aucun dépôt d'issue"
+            );
+        }
     }
 
     /// Le `COALESCE` de `completed_at` est dans la projection, pas seulement
@@ -216,14 +325,18 @@ mod tests {
         );
     }
 
-    /// La projection porte les sept données que l'évaluateur lit, et rien de
+    /// La projection porte les huit données que l'évaluateur lit, et rien de
     /// plus : si une ligne de `tasks` gagne un champ, ce test ne bouge pas.
     ///
     /// Le vol n'a **aucun enfant pilote**, donc ce test porte aussi le repli de
     /// mika#2886 : `pilot_result` absent ⇒ c'est le `result` de la parente qui
     /// est rendu.
+    ///
+    /// La huitième est `repo` (mika#2921) : dérivée de l'URL **de la ligne**, et
+    /// c'est elle qui permet au rapport de distinguer `mika#2900` de
+    /// `mika-cloud#196`.
     #[test]
-    fn mika2792_la_projection_porte_les_sept_donnees_lues() {
+    fn mika2792_la_projection_porte_les_huit_donnees_lues() {
         let f = task_to_finished_flight(sans_enfant(task_fixture()));
         assert_eq!(f.task_id, "task-1");
         assert_eq!(f.status, "completed");
@@ -233,6 +346,16 @@ mod tests {
             f.reference_url.as_deref(),
             Some("https://github.com/senara-solutions/mika/issues/2693")
         );
+        assert_eq!(f.repo.as_deref(), Some("senara-solutions/mika"));
+    }
+
+    /// Un vol sans `reference_url` ne nomme **aucun** dépôt, et `repo` le dit
+    /// par `None` — jamais par une chaîne vide (motif mika#2331, mika#2921).
+    #[test]
+    fn mika2921_un_vol_sans_url_ne_nomme_aucun_depot() {
+        let mut t = task_fixture();
+        t.reference_url = None;
+        assert_eq!(task_to_finished_flight(sans_enfant(t)).repo, None);
     }
 
     /// La septième donnée est l'agent **de la ligne**, pas celui du handle : la
@@ -281,9 +404,7 @@ mod tests {
         // Le handle est celui de l'agent par défaut du processus — sur gentux
         // `mika-test`, et c'est lui que `server/mod.rs` prête à la source.
         let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
-        let got = source
-            .finished_implement_flights(None, &[url.to_string()])
-            .await;
+        let got = source.finished_implement_flights(None).await;
 
         assert_eq!(
             got.len(),
@@ -373,9 +494,7 @@ mod tests {
         );
 
         let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
-        let vols = source
-            .finished_implement_flights(None, &[TICKET_2886.to_string()])
-            .await;
+        let vols = source.finished_implement_flights(None).await;
 
         assert_eq!(
             vols.len(),
@@ -422,9 +541,7 @@ mod tests {
         );
 
         let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
-        let vols = source
-            .finished_implement_flights(None, &[TICKET_2886.to_string()])
-            .await;
+        let vols = source.finished_implement_flights(None).await;
         let verdicts = crate::milestone_manager::evaluator::evaluate_flights(&vols, &[]);
 
         assert_eq!(verdicts.len(), 1);
