@@ -14,7 +14,7 @@ sed -n '1,80p' $MIKA_PLATFORM_DIR/claude-pilot/README.md
 
 ### Step Budget
 
-You have a maximum of 14 tool steps per turn. Plan carefully:
+You have a maximum of 30 tool steps per turn. Plan carefully:
 
 | Purpose | Steps |
 |---------|-------|
@@ -31,6 +31,7 @@ You have a maximum of 14 tool steps per turn. Plan carefully:
 **Efficiency rules:**
 - Use `run_gh` for all GitHub CLI operations (`gh pr view`, `gh pr diff`). Combine multiple `gh` checks into a single `run_gh` call using `&&` or `;`. Use `run_shell` only for non-GitHub commands (e.g., reading files, running the repo guards — never a build, see 2.5.3).
 - Step 2 runs the repo's guard scripts (one `run_shell`); Step 2.5.4 uses `--name-only` for the parallel-plan structural AC; Step 3 reviews the **engine-injected full diff**. These are separate concerns — `--name-only` is NOT a substitute for the full diff.
+- **Reading or searching the repo by `run_shell` is capped at 2 calls** beyond those Steps 1, 2 and 2.5.4 prescribe. At the cap, emit `hold[review]` naming the verification you could not complete: measured on 13 cut-off turns (mika#2926), `run_shell` consumed 9–28 steps and the turn posted **no verdict at all**.
 - If a command fails, diagnose the error before retrying. Do not retry blindly.
 
 ### Data Integrity Rules
@@ -231,7 +232,7 @@ Every one that exists is executed, and **the pipeline verdict is the conjunction
 
 **2B. Execute against the PR's ref, in a disposable detached worktree.**
 
-The guards `cd "$(dirname "$0")/.."` and aggregate committed + staged + unstaged diffs. Running them inside the shared checkout at `$MIKA_PLATFORM_DIR/<repo>/` would judge whatever is checked out there — usually `main`, possibly dirty — not the PR. A detached worktree on the PR head has an empty index and no unstaged changes, so the guard sees exactly the PR's diff. Measured cost on `mika` (3323 tracked files): ~0.6s, against `run_shell`'s 30s budget — a budget the engine actually holds since mika#2276, where it was previously raised to the turn's maximum (300 s via `build-mika`) without anything saying so.
+The guards `cd "$(dirname "$0")/.."` and aggregate committed + staged + unstaged diffs. Running them inside the shared checkout at `$MIKA_PLATFORM_DIR/<repo>/` would judge whatever is checked out there — usually `main`, possibly dirty — not the PR. A detached worktree on the PR head has an empty index and no unstaged changes, so the guard sees exactly the PR's diff. Measured cost on `mika` (3323 tracked files): ~0.6s, against `run_shell`'s 30s budget.
 
 **Since mika#2449 the alternative is refused, not discouraged:** `git checkout <ref> [-- <paths>]`, `git stash`, `git reset`, non-`--ff-only` merges against `$MIKA_PLATFORM_DIR/<repo>/` are refused by `run_shell` (`REFUS (shared-checkout-guard, mika#2449)`) — extracting PR files there left 15 staged files on `main` (2026-09-20), and the `git checkout -- <paths>` "cleanup" re-reads the index just overwritten, restoring nothing. On a refusal, do not rewrite the command around it (`cd`/`-C`/`~` are followed; a variable indirection or `bash -c` is the same violation, dated by `main_checkout_dirty`): use the recipe below or `git -C "$R" show origin/<headRefName>:<path>`.
 

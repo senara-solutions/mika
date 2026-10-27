@@ -368,6 +368,12 @@ mod eval {
     // coupures (deadline, max-steps), avec leurs contrôles négatifs.
     mod test_qa_cut_off_verdict_2515;
 
+    // mika#2926 — le budget de pas d'un tour de revue : le corpus rejoué de
+    // `callback-0f07c520` pose son verdict sous le plafond de mika-qa, la MÊME
+    // séquence l'épuise sur un autre agent (c'est ce qui tient AC3), et le WARN
+    // de coupure annonce le plafond SERVI et non celui du déclencheur.
+    mod test_qa_step_budget_2926;
+
     // mika#2358 — la garde 5e sur le chemin de production : une promesse de
     // fréquence sans acteur est refusée, l'aveu d'incapacité passe, et le
     // budget d'un seul re-prompt tient.

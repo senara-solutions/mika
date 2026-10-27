@@ -1288,7 +1288,7 @@ enum LoopResult {
         /// Original system prompt length before step-awareness nudge was appended.
         system_prompt_original_len: usize,
     },
-    /// Loop exited because `crate::planning::policy::MAX_TOOL_STEPS` was reached without an EndTurn.
+    /// Loop exited because the turn's step ceiling was reached without an EndTurn.
     /// Caller is expected to attempt a continuation turn for a final summary.
     MaxStepsExceeded {
         thinking: Option<String>,
@@ -1298,6 +1298,16 @@ enum LoopResult {
         run_usage: Option<LlmUsage>,
         tool_call_summaries: Vec<ToolCallSummary>,
         system_prompt_original_len: usize,
+        /// Le plafond que la boucle a **servi** (mika#2926).
+        ///
+        /// Transporté plutôt que recalculé en aval : depuis mika#2926 le
+        /// plafond est résolu par agent à un site unique, et chaque lecteur qui
+        /// le recalculait annonçait celui que son chemin *déclarait* — 20 pour
+        /// un `SilentTrigger::Callback`, 20 pour `MAX_TOOL_STEPS` sur le chemin
+        /// conversationnel — pendant que la boucle en servait 30. Un opérateur
+        /// lisant ces sorties aurait diagnostiqué un tour coupé à 20 steps
+        /// alors qu'il en avait consommé 30.
+        max_steps: usize,
     },
     /// Loop exited because the agent total-turn deadline was reached between steps.
     /// Caller is expected to emit the mode-appropriate fallback message. The
@@ -1693,7 +1703,14 @@ async fn run_loop(
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
-    let max_steps = mode.max_steps();
+    // Le plafond de steps du tour, résolu **par agent** (mika#2926). Site
+    // unique : `mode.max_steps()` fournit le `default` — celui des trois
+    // plafonds que le mode déclare — et la table par agent le remplace quand
+    // elle nomme cet agent. Les trois modes passent par ici, donc un seul site
+    // les couvre tous, et la valeur résolue est celle que le WARN de coupure et
+    // le recensement annoncent (R1b) : rien en aval ne recalcule un plafond.
+    let max_steps =
+        crate::planning::policy::max_tool_steps_for_agent(db.agent_id(), mode.max_steps());
     for step in 0..max_steps {
         // Deadline check at iteration top — refuses to start the next step when
         // the agent total-turn deadline has been reached. Any in-flight LLM HTTP
@@ -5206,6 +5223,9 @@ async fn run_loop(
         run_usage,
         tool_call_summaries: all_tool_summaries,
         system_prompt_original_len: system_prompt_len,
+        // Le plafond servi, pris sur le local déjà résolu — jamais relu depuis
+        // une constante ni depuis le déclencheur (mika#2926 R1b).
+        max_steps,
     })
 }
 
@@ -6554,6 +6574,7 @@ async fn run_agent_inner(
             run_usage,
             tool_call_summaries,
             system_prompt_original_len,
+            max_steps,
         } => {
             // Continuation entry gate (mika#848 F3a) — skip continuation when its 60s
             // ceiling would push us past the agent total deadline.
@@ -6575,8 +6596,12 @@ async fn run_agent_inner(
                     scope_task_id,
                     // Reached from the MaxStepsExceeded arm: the loop ran its
                     // full step budget, then the deadline was too close for a
-                    // continuation turn.
-                    crate::planning::policy::MAX_TOOL_STEPS,
+                    // continuation turn. Le budget **servi**, transporté par la
+                    // variante (mika#2926 R1b) : relire `MAX_TOOL_STEPS` ici
+                    // annoncerait 20 pour un tour de mika-qa qui en a consommé
+                    // 30, sur le chemin `synchronize` où la mesure du ticket a
+                    // justement eu lieu (tour 4f94fbc8).
+                    max_steps,
                     undelivered,
                     effective_model_attestation,
                     // mika#1883: the full step budget was spent, so the turn has
@@ -7686,11 +7711,17 @@ async fn run_silent_inner(
         LoopResult::MaxStepsExceeded {
             tool_call_summaries,
             system_prompt_original_len,
+            max_steps,
             ..
         } => {
             warn!(
                 trigger = trigger_label,
-                max_steps = params.trigger.max_steps(),
+                // Le plafond **servi**, transporté par la variante
+                // (mika#2926 R1b). `params.trigger.max_steps()` rend ce que le
+                // déclencheur *déclare* — 20 pour un `Callback` — et divergeait
+                // du plafond que la boucle sert depuis que celui-ci est résolu
+                // par agent.
+                max_steps,
                 session_id = params.session_id,
                 "silent agent exceeded max tool steps"
             );

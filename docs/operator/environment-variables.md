@@ -9355,6 +9355,83 @@ Optional (Telegram outbound rendering — mika#2291):
 
   **Operator surfaces** (gateway log): `telegram_html_render_fallback` (WARN) and `telegram_html_fallback_failed` (WARN) — **expected regime for both: zero lines**; the second is the population where the user receives nothing. Plus `telegram_html_render_disabled` (INFO at startup, only when disarmed), because the silence of a disarmed renderer looks exactly like the silence of a healthy one (mika#2205). No message body is ever logged. Full contract, post-deploy probe and its two halts: `crates/mika-gateway/CLAUDE.md` § *Outbound Text Rendering*.
 
+### Le budget de pas d'un tour de revue (mika#2926)
+
+**Aucune variable d'environnement.** Le plafond de mika-qa est nommé **dans le
+code**, à un site unique — `planning::policy::max_tool_steps_for_agent(agent_id,
+default)`, appelée en tête de `run_loop` — et le prompt de `qa-review` annonce la
+valeur que cette fonction résout, égalité tenue par
+`tests/qa_review_executes_repo_guards.rs § mika2926_le_plafond_annonce_par_le_prompt_est_celui_du_moteur`.
+Il n'est **pas** réglable à chaud, et c'est délibéré : un plafond que l'opérateur
+peut bouger sans toucher le prompt rouvre exactement la dérive que ce ticket
+ferme — le moteur servait 20, le prompt annonçait 14, et le modèle planifiait
+contre un nombre faux. Le geste de changement est un commit, jamais un `export`.
+
+**Ce que le vol a changé.** mika-qa passe de 20 à 30 pas d'outil par tour (les
+autres agents gardent 20 — `mika2926_le_plafond_par_agent_ne_touche_que_mika_qa`
+l'affirme agent par agent), et les deux prompts de revue bornent l'exploration
+par `run_shell` : au plus 2 appels au-delà des étapes prescrites dans
+`qa-review`, au plus 2 tentatives de relecture du plan dans
+`qa-review-build-callback`, chacune nommant sa sortie (`hold[review]`,
+`block[pipeline]`). Le relèvement seul aurait déplacé l'épuisement ; la borne
+seule aurait laissé des tours couper sous 20 pendant que le prompt en annonçait
+14.
+
+**Sonde post-déploiement (AC4) — DEUX compteurs, et le second est ce qui rend le
+premier lisible.** Sur les 7 jours suivant le `make deploy` qui embarque ce vol :
+
+```sh
+# (A) les tours de mika-qa coupés au plafond — doit BAISSER depuis 13 en 3,5 jours
+grep '"event":"max_steps_tool_census"' /var/log/mika/server.log \
+  | grep '"agent_id":"mika-qa"' | wc -l
+
+# (B) le dénominateur : les tours webhook de mika-qa sur la même fenêtre
+grep '"event":"webhook_turn_charged"' /var/log/mika/server.log \
+  | grep '"agent_id":"mika-qa"' | wc -l
+```
+
+**Pourquoi (B) n'est pas décoratif.** (A) seul couvre deux populations non
+soustractibles (classe mika#2205) : *« les tours de revue aboutissent »* et
+*« mika-qa a été moins sollicitée »* — une semaine creuse de la boucle fait
+tomber (A) à zéro sans qu'une seule ligne de ce vol ait servi. La grandeur à lire
+est le **taux** `A / B`, et la baisse n'est attestée que si (B) tient. Référence
+d'avant le vol : 13 coupures du 2026-10-23T13:45Z au 2026-10-26T18:10Z, dont 4
+sur des tours de callback.
+
+**(B) est un dénominateur PARTIEL, et il faut le savoir pour ne pas sur-lire le
+taux.** `webhook_turn_charged` n'est émis que là où `original_github_text` est
+`Some`, c'est-à-dire sur le canal `github` : les tours de **callback** de build —
+4 des 13 coupures de référence — n'en portent aucun. Donc `A / B` surestime le
+taux de coupure, d'un facteur borné par la part de callbacks. Le remède n'est pas
+une seconde approximation mais la comparaison des deux séries de `label` : la
+ligne du census porte `label`, qui vaut `callback` sur cette population et permet
+de scinder (A) en ses deux moitiés (`grep -o '"label":"[^"]*"'`). Un dénominateur
+exact pour la moitié callback demanderait un compteur de tours silencieux que
+rien n'émet aujourd'hui — nommé ici, pas livré.
+
+**Trois haltes, à lire avant de conclure.**
+
+1. **(A) et (B) tous deux à zéro ⇒ la sonde n'a rien mesuré**, pas « c'est
+   réparé ». Vérifier que la fenêtre couvre des dispatches réels.
+2. **L'absence de la ligne `max_steps_tool_census` n'est pas une absence de
+   coupure** mais un binaire antérieur à mika#2877 (motif mika#2340). La sonde
+   de conformité qui le dit —  et **sa forme en différence**, parce que
+   `"agent exceeded max tool steps"` est une sous-chaîne de la variante silencieuse
+   — est dans
+   [`docs/agent-internals/observability.md`](../agent-internals/observability.md)
+   § *Exhausting the step budget names the tools that consumed it*.
+3. **Un `max_steps` à `30` sur une ligne dont l'`agent_id` n'est pas `mika-qa`
+   est un défaut**, pas une mesure : grouper une série par `max_steps` seul mêle
+   désormais deux populations. Filtrer sur `agent_id` d'abord.
+
+**Et si (A) ne baisse pas.** La borne est dans le prompt, donc elle n'atteint un
+agent que par la chaîne *rebuild → seed → read* (§ *Deploying a bundled-skill
+change*, `CLAUDE.md`) : vérifier d'abord
+`cat ~/.mika/skills/.manifest-writer` et que le sha qui y est attesté est celui
+du déploiement. Un prompt d'une semaine servi derrière un moteur à jour donne
+exactement « le plafond est monté, l'exploration n'est pas bornée » — c'est-à-dire
+le déplacement de l'épuisement que la mesure d'AC1 annonçait.
+
 Optional (webhook pre-filter, class (h) — mika#2854):
 - `MIKA_WEBHOOK_COMMENT_TRIAGE` — Dedicated switch for the light triage turn of pre-filter class (h): an `issue_comment` on an issue that carries **no loop task**. Armed, a short LLM call — the agent's own provider, `max_tokens = 160`, 20 s bound, **no tools** — answers one question, *does this text carry an actionable decision?* `DECISION` opens today's full turn; `NOTE: <line>` skips the turn and writes one memory `event` (indexed, deduplicated per issue and per day). **Default `off`** — a deliberate choice of vol 1: the class ships disarmed until the real-comment corpus under the real model (vol 2, tracked in senara-solutions/mika#2854) proves no operator order is downgraded to a note.
 
