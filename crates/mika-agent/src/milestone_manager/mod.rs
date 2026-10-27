@@ -148,7 +148,7 @@
 //!
 //! `target_key` is `<from>_to_<to>`; `after_value` is the failure kind
 //! (`missing`/`empty`/`invalid`/`rejected`/`unreachable`). Row shape documented
-//! in `crates/mika-agent/CLAUDE.md § Audit Log`; operator rotation procedure in
+//! in `docs/agent-internals/audit-log.md`; operator rotation procedure in
 //! `mika-platform/docs/operator/token-rotation-procedure.md`.
 //!
 //! **The role question is settled and does not need re-deriving.** The manager
