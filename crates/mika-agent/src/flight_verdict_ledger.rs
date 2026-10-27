@@ -448,6 +448,7 @@ mod tests {
     fn verdict_mort(task_id: &str, cause: DeathCause) -> FlightVerdict {
         FlightVerdict {
             task_id: task_id.to_string(),
+            repo: None,
             issue_number: Some(2922),
             issue: FlightIssue::Dead { cause },
             turns_used: Some(41),
@@ -455,6 +456,7 @@ mod tests {
             turn_ceiling: None,
             last_commit_turn: None,
             recommendation: FlightRecommendation::Regroom,
+            pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
             completed_at: Some("2026-10-26T10:00:00Z".to_string()),
         }
     }
@@ -464,6 +466,7 @@ mod tests {
     fn verdict_pr(task_id: &str) -> FlightVerdict {
         FlightVerdict {
             task_id: task_id.to_string(),
+            repo: None,
             issue_number: None,
             issue: FlightIssue::PrOpened {
                 number: Some(2923),
@@ -474,6 +477,7 @@ mod tests {
             turn_ceiling: None,
             last_commit_turn: None,
             recommendation: FlightRecommendation::MergeCandidate,
+            pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
             completed_at: None,
         }
     }
