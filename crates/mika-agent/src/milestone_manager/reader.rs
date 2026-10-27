@@ -840,6 +840,10 @@ pub fn compose_from_gh_outputs(
             pr_state,
             pr_url,
             pr_link_source,
+            // La sonde de timeline (lecture 7) est émise **après** la
+            // composition, sur l'état qu'on vient de bâtir : ici elle n'a pas
+            // encore parlé, et `None` dit exactement cela.
+            merged_prs: None,
             ci_state,
             blockers,
             updated_at: updated_at.clone(),
@@ -1648,6 +1652,7 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
             pr_state: None,
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "".into(),
@@ -2070,6 +2075,7 @@ mod gh_arg_capture_tests {
             pr_state: None,
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-10-15T00:00:00Z".into(),

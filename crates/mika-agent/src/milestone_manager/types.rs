@@ -103,6 +103,28 @@ pub enum PrLinkSource {
     IssueClosingRef,
 }
 
+/// Ce que la timeline REST d'un ticket **ouvert** a dit de ses PR (mika#2924,
+/// vol 2).
+///
+/// Quatre variantes et non deux : « aucune PR mergée ne cite ce ticket » et
+/// « la lecture n'a pas conclu » ont des remèdes opposés, et les confondre est
+/// la classe mika#2205. Les deux causes d'indétermination sont distinctes pour
+/// la même raison — une page pleine se corrige en paginant, un échec de lecture
+/// se corrige à la forge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergedPrReading {
+    /// Des PR mergées citent ce ticket, triées par `merged_at` **décroissant**.
+    Citing(Vec<u64>),
+    /// La timeline a été lue **en entier** et aucune PR mergée ne cite ce ticket.
+    NoneCiting,
+    /// La page est pleine : la timeline est possiblement tronquée, donc
+    /// l'absence de PR n'est **pas** attestée (mika#2930 AC2).
+    IndeterminatePageFull,
+    /// L'appel `gh` a échoué. Un échec ne refuse pas le cycle et ne se tait pas.
+    IndeterminateFetchFailed,
+}
+
 /// A single sub-issue enumerated under the milestone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubIssue {
@@ -142,6 +164,16 @@ pub struct SubIssue {
     /// chaque chemin garantit.
     #[serde(default)]
     pub pr_link_source: Option<PrLinkSource>,
+    /// Ce que la sonde de timeline a dit des PR de ce ticket (mika#2924,
+    /// vol 2).
+    ///
+    /// `None` signifie **la sonde n'a pas été émise** — palier 1 vainqueur,
+    /// ticket non désigné, ou blob d'un binaire antérieur au vol
+    /// (motif mika#2340) — et jamais « aucune PR ». C'est pourquoi `None` rend
+    /// le libellé **historique** côté `Assessor` : un binaire antérieur garde
+    /// son texte, il n'hérite pas d'une incertitude qu'il n'a pas mesurée.
+    #[serde(default)]
+    pub merged_prs: Option<MergedPrReading>,
     pub ci_state: CiState,
     /// Numbers of open blocker issues from the `blockedBy` GraphQL edge.
     pub blockers: Vec<u64>,
@@ -769,6 +801,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-08-21T00:00:00Z".into(),
@@ -811,6 +844,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-08-21T00:00:00Z".into(),
@@ -894,6 +928,15 @@ mod tests {
             "champ absent ⇒ None, qui dit « binaire antérieur » et non \
              « liste du milestone » (mika#2340)"
         );
+        // Vol 2 : le même blob est antérieur à la sonde de timeline. `None` doit
+        // s'y lire « la sonde n'a pas été émise », et surtout pas
+        // « aucune PR mergée ne cite ce ticket » — le libellé « Next » dépend de
+        // cette distinction, et ce ticket-ci *a* des PR mergées.
+        assert_eq!(
+            sub.merged_prs, None,
+            "champ absent ⇒ None, qui dit « sonde non émise » et non \
+             NoneCiting (mika#2340)"
+        );
     }
 
     /// `None` sort en `null`, jamais en chaîne vide ni en objet : « on ne sait
@@ -913,6 +956,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-10-26T00:00:00Z".into(),
@@ -920,7 +964,9 @@ mod tests {
         };
         let out = serde_json::to_string(&sub).unwrap();
         assert!(
-            out.contains(r#""pr_url":null"#) && out.contains(r#""pr_link_source":null"#),
+            out.contains(r#""pr_url":null"#)
+                && out.contains(r#""pr_link_source":null"#)
+                && out.contains(r#""merged_prs":null"#),
             "une provenance non posée se dit null — obtenu : {out}"
         );
         let back: SubIssue = serde_json::from_str(&out).unwrap();
@@ -945,5 +991,86 @@ mod tests {
             serde_json::from_str::<PrLinkSource>(&b).unwrap(),
             PrLinkSource::IssueClosingRef
         );
+    }
+
+    // -- mika#2924, vol 2 : l'état des PR d'un ticket ouvert ----------------
+
+    /// Les **quatre** variantes ont un nom de fil distinct, et `Citing`
+    /// transporte un tableau JSON.
+    ///
+    /// Quatre et non deux : le puits hors-ligne relit ces blobs, et c'est là que
+    /// la classe mika#2205 se jouerait. « Aucune PR mergée ne cite ce ticket »
+    /// se corrige en implémentant, « la page était pleine » se corrige en
+    /// paginant, « l'appel a échoué » se corrige à la forge — trois remèdes
+    /// opposés qu'un seul nom de fil rendrait indiscernables.
+    #[test]
+    fn mika2924_les_quatre_etats_de_pr_ont_un_nom_de_fil_distinct() {
+        let cases = [
+            (
+                MergedPrReading::Citing(vec![2931, 2929, 2892]),
+                r#"{"citing":[2931,2929,2892]}"#,
+            ),
+            (MergedPrReading::NoneCiting, r#""none_citing""#),
+            (
+                MergedPrReading::IndeterminatePageFull,
+                r#""indeterminate_page_full""#,
+            ),
+            (
+                MergedPrReading::IndeterminateFetchFailed,
+                r#""indeterminate_fetch_failed""#,
+            ),
+        ];
+        let mut wires = Vec::new();
+        for (value, expected) in &cases {
+            let out = serde_json::to_string(value).unwrap();
+            assert_eq!(&out, expected, "nom de fil figé pour {value:?}");
+            assert_eq!(
+                &serde_json::from_str::<MergedPrReading>(&out).unwrap(),
+                value,
+                "aller-retour fidèle pour {value:?}"
+            );
+            wires.push(out);
+        }
+        // Les deux indéterminations sont le couple qu'une simplification
+        // replierait en un seul mot ; l'ensemble le refuse.
+        let distinct: std::collections::HashSet<&String> = wires.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            cases.len(),
+            "quatre variantes, quatre noms de fil — obtenu : {wires:?}"
+        );
+    }
+
+    /// `Citing` garde l'**ordre** qu'on lui donne : c'est un tri par `merged_at`
+    /// décroissant, posé par le composeur, et le fil ne doit pas le trier
+    /// autrement ni le dédupliquer dans son dos.
+    #[test]
+    fn mika2924_letat_des_pr_voyage_sur_un_sub_issue() {
+        let sub = SubIssue {
+            number: 2698,
+            title: "t".into(),
+            state: IssueState::Open,
+            priority_rank: None,
+            plan_present: true,
+            branch_present: true,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
+            merged_prs: Some(MergedPrReading::Citing(vec![
+                2931, 2929, 2892, 2706, 2704, 2712,
+            ])),
+            ci_state: CiState::None,
+            blockers: vec![],
+            updated_at: "2026-10-27T00:00:00Z".into(),
+            labels: vec![],
+        };
+        let out = serde_json::to_string(&sub).unwrap();
+        assert!(
+            out.contains(r#""merged_prs":{"citing":[2931,2929,2892,2706,2704,2712]}"#),
+            "l'ordre du composeur traverse le fil tel quel — obtenu : {out}"
+        );
+        let back: SubIssue = serde_json::from_str(&out).unwrap();
+        assert_eq!(back, sub, "aller-retour fidèle");
     }
 }

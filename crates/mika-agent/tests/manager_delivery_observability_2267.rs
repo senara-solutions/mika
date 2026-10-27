@@ -136,6 +136,7 @@ fn base_state() -> MilestoneState {
             pr_state: Some("open".into()),
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::Success,
             blockers: vec![],
             updated_at: "2026-08-20T00:00:00Z".into(),

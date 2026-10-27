@@ -1089,6 +1089,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::Success,
             blockers: vec![2701],
             updated_at: "2026-10-15T00:00:00Z".into(),
