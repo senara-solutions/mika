@@ -2290,4 +2290,84 @@ mod tests {
             );
         }
     }
+
+    // -- mika#2923 : le rapport nomme le refus de porte -----------------------
+
+    /// V5 — le rapport du sink porte une ligne de refus par ticket gaté, avec
+    /// la raison, et aucun gaté n'apparaît sur la ligne « À admettre » (AC3).
+    ///
+    /// Le test lit le **rapport rendu**, pas le verdict : c'est le rapport que
+    /// l'opérateur a sous les yeux, et le ticket est né d'une ligne de ce
+    /// rapport. Le rapporteur, lui, ne reçoit **aucune ligne de code** de ce
+    /// vol — il appelle déjà `reason.label()`. Si ce test exige une édition de
+    /// `reporter.rs`, c'est que quelqu'un y a recopié un libellé.
+    #[test]
+    fn mika2923_le_rapport_nomme_chaque_refus_de_porte_et_nen_admet_aucun() {
+        let gate = |n: u64| {
+            let mut c = base_issue(n);
+            c.plan_present = true;
+            c.priority_rank = Some(1);
+            c.labels = vec!["p1-important".into(), "operator-gated".into()];
+            c
+        };
+        let non_gate = {
+            let mut c = base_issue(2923);
+            c.plan_present = true;
+            c.priority_rank = Some(1);
+            c.labels = vec!["p1-important".into()];
+            c
+        };
+        let mut state = state_with(
+            vec![gate(2698), gate(2699), non_gate],
+            ProgressCounts::default(),
+        );
+        state.outside_candidates = vec![PoolCandidate {
+            number: 1806,
+            state: IssueState::Open,
+            priority_rank: Some(1),
+            plan_present: true,
+            labels: vec!["p1-important".into(), "operator-gated".into()],
+        }];
+        let mut a = empty_assessment();
+        a.pool = Some(assess_pool_sans_tailles(
+            &[],
+            &milestone_cands(&state),
+            &state.outside_candidates,
+        ));
+        let out = Reporter::new().report(&state, &a);
+
+        for ligne in [
+            "- Refusé : #1806 (p1-important, hors milestone) — tenu par l'opérateur — \
+             label `operator-gated` à retirer",
+            "- Refusé : #2698 (p1-important) — tenu par l'opérateur — \
+             label `operator-gated` à retirer",
+            "- Refusé : #2699 (p1-important) — tenu par l'opérateur — \
+             label `operator-gated` à retirer",
+        ] {
+            assert!(
+                out.contains(ligne),
+                "une ligne de refus par ticket gaté, avec la raison :\n{ligne}\n--- \
+                 rapport ---\n{out}"
+            );
+        }
+
+        let section = out
+            .split("### Bassin ready")
+            .nth(1)
+            .expect("la section du bassin doit être rendue");
+        let ligne_admis = section
+            .lines()
+            .find(|l| l.starts_with("- À admettre"))
+            .expect("le non-gaté est recommandé, donc la ligne existe");
+        for gate in ["2698", "2699", "1806"] {
+            assert!(
+                !ligne_admis.contains(gate),
+                "aucun ticket gaté n'apparaît dans « À admettre » :\n{ligne_admis}"
+            );
+        }
+        assert!(
+            ligne_admis.contains("#2923"),
+            "contrôle négatif : le candidat non gaté y est, lui :\n{ligne_admis}"
+        );
+    }
 }

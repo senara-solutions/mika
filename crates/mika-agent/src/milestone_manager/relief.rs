@@ -32,6 +32,16 @@
 //!    liste dont l'opérateur ne verrait jamais le trou.
 //! 4. **`beyond` est un compte, pas un booléen.** « 7 autres candidats » dit à
 //!    l'opérateur si le bassin a du fond ; « il en reste » ne le dit pas.
+//! 5. **Tout refus n'est pas un motif de grooming** (mika#2923). La décision 1
+//!    tient toujours — la relève ne refiltre pas les *candidats* — mais un
+//!    refus que le grooming ne corrige pas n'est pas une relève : « à grommer :
+//!    tenu par l'opérateur » serait un faux conseil, et le lecteur agirait
+//!    dessus. Le prédicat vit au site unique de l'`enum`
+//!    ([`RefusalReason::remediable_by_grooming`], `match` exhaustif sans bras
+//!    `_`), pour qu'un variant neuf ne puisse pas y échapper. Il s'applique
+//!    **avant** le calcul de `beyond` : filtrer après aurait fait compter à
+//!    `beyond` — le chiffre qui dit si le bassin a du fond — des tickets que la
+//!    relève ne nommera jamais.
 //!
 //! Le motif, lui, réutilise [`RefusalReason`] : un `enum` jumeau divergerait du
 //! bassin au premier variant neuf, et le motif de la relève *est* le motif du
@@ -75,8 +85,10 @@ pub struct ReliefVerdict {
 ///
 /// Les deux ensembles de candidats sont ceux que [`super::pool::assess_pool`] a
 /// jugés : ils ne servent ici qu'à **relire** le rang de priorité d'un refus,
-/// que [`super::pool::AdmissionRefusal`] ne porte pas. Aucun filtre ne
-/// s'applique une seconde fois — voir la décision 1 du docstring du module.
+/// que [`super::pool::AdmissionRefusal`] ne porte pas. Aucun filtre de
+/// *candidat* ne s'applique une seconde fois — voir la décision 1 du docstring
+/// du module. Seuls les refus que le grooming corrige entrent, par la décision
+/// 5.
 pub fn name_relief(
     verdict: &PoolVerdict,
     milestone_candidates: &[PoolCandidate],
@@ -85,11 +97,13 @@ pub fn name_relief(
     let mut candidates: Vec<ReliefTicket> = verdict
         .refusals
         .iter()
+        // Décision 5 : avant le calcul de `beyond`, jamais après.
+        .filter(|r| r.reason.remediable_by_grooming())
         .map(|r| ReliefTicket {
             number: r.number,
             origin: r.origin,
             priority_rank: rank_of(r.number, milestone_candidates, outside_candidates),
-            motive: r.reason,
+            motive: r.reason.clone(),
         })
         .collect();
 
@@ -366,5 +380,57 @@ mod tests {
             "et son libellé vit dans `RefusalReason`, donc un variant neuf ne \
              peut pas être rendu sans libellé"
         );
+    }
+
+    // -- mika#2923 : un refus que le grooming ne corrige pas n'est pas une relève
+
+    /// V4 — un ticket tenu par l'opérateur n'entre pas dans la relève à
+    /// grommer, et n'est pas compté dans `beyond`.
+    ///
+    /// Les deux moitiés sont ici, parce qu'elles échouent séparément : filtrer
+    /// après le calcul de `beyond` laisserait `next` propre et le chiffre faux
+    /// — et c'est `beyond` qui dit à l'opérateur si le bassin a du fond.
+    ///
+    /// Contrôle positif dans le même test : les refus `NoGroomedPlan` du
+    /// **même** verdict sont nommés. Sans lui, un `name_relief` qui ne rend
+    /// jamais rien passerait.
+    #[test]
+    fn mika2923_un_ticket_tenu_nentre_pas_dans_la_releve_a_grommer() {
+        // Cinq refus groomables (un de plus que `RELIEF_SIZE`) et trois tickets
+        // tenus, intercalés par numéro : sans le filtre, #15 et #25 entreraient
+        // dans `next` et `beyond` passerait de 1 à 4.
+        let v = verdict_with(vec![
+            refusal(10, CandidateOrigin::Milestone),
+            tenu(15, "operator-gated"),
+            refusal(20, CandidateOrigin::Milestone),
+            tenu(25, "blocked"),
+            refusal(30, CandidateOrigin::Milestone),
+            tenu(35, "operator-review"),
+            refusal(40, CandidateOrigin::Milestone),
+            refusal(50, CandidateOrigin::Milestone),
+        ]);
+        let relief = name_relief(&v, &[], &[]);
+
+        assert_eq!(
+            numbers(&relief),
+            vec![10, 20, 30, 40],
+            "seuls les refus que le grooming corrige sont nommés"
+        );
+        assert_eq!(
+            relief.beyond, 1,
+            "`beyond` compte les refus groomables restants (un seul : #50), \
+             jamais les tickets tenus"
+        );
+    }
+
+    /// Un refus `OperatorHeld` tel que le bassin le produit.
+    fn tenu(number: u64, label: &str) -> AdmissionRefusal {
+        AdmissionRefusal {
+            number,
+            origin: CandidateOrigin::Milestone,
+            reason: RefusalReason::OperatorHeld {
+                label: label.to_string(),
+            },
+        }
     }
 }
