@@ -15,7 +15,7 @@ use mika_common::llm::LlmImage;
 
 use crate::agent;
 use crate::compaction;
-use crate::messaging::{GatewayMessageSender, MessageSender};
+use crate::messaging::{FlushDelivery, GatewayMessageSender, MessageSender};
 use crate::task_engine::types::{task_status, trigger_type};
 
 use super::ci_failure_handler;
@@ -2387,12 +2387,12 @@ fn classify_failed_send(created_at: &str, now: chrono::DateTime<chrono::Utc>) ->
 ///
 /// The `Drop` branch does NOT call `increment_failed_send_retry` — a dropped
 /// row was never retried, so incrementing would be incorrect accounting.
+///
+/// The delivery rail is [`FlushDelivery`], never `MessageSender` (mika#2935):
+/// this loop **owns** each row it reads, so it decides that row's fate itself —
+/// `delete` or `increment` — and the transport must not park a second one
+/// underneath it.
 async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
-    let sends = match agent_state.db.get_pending_failed_sends(5).await {
-        Ok(s) if !s.is_empty() => s,
-        _ => return,
-    };
-
     let sender = GatewayMessageSender::new(
         state.gateway_url.clone(),
         state.internal_token.clone(),
@@ -2403,6 +2403,26 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         None,
         agent_state.settings.customer_id.clone(),
     );
+
+    flush_failed_sends_with(&agent_state.db, &sender).await;
+}
+
+/// The flush itself, over an injected delivery rail (mika#2935).
+///
+/// Split out of [`flush_failed_sends`] so the lifecycle of a parked row — who
+/// deletes it, who increments it, and that nobody *adds* one — is testable
+/// against a sender whose outcome the test chooses. The injection point is
+/// [`FlushDelivery`] and not `&dyn MessageSender` on purpose: a `MessageSender`
+/// double does not park, while the real `GatewayMessageSender` does, so a test
+/// written against that trait would stay green above the defect.
+async fn flush_failed_sends_with<D: FlushDelivery + ?Sized>(
+    db: &crate::async_db::AsyncDatabase,
+    delivery: &D,
+) {
+    let sends = match db.get_pending_failed_sends(5).await {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
 
     let now = chrono::Utc::now();
     for send in sends {
@@ -2417,7 +2437,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     text_preview = %text_preview,
                     "dropping stale failed_send"
                 );
-                let _ = agent_state.db.delete_failed_send(send.id).await;
+                let _ = db.delete_failed_send(send.id).await;
             }
             FlushAction::Deliver { prefix } => {
                 if prefix == FAILED_SEND_UNPARSEABLE_PREFIX {
@@ -2430,19 +2450,28 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     debug!(id = send.id, "flushing failed_send with stale prefix");
                 }
                 let text_to_send = format!("{}{}", prefix, send.text);
-                match sender.send(&text_to_send).await {
+                match delivery.try_deliver(&text_to_send).await {
                     Ok(crate::messaging::SendOutcome::Delivered) => {
-                        let _ = agent_state.db.delete_failed_send(send.id).await;
-                        info!(id = send.id, "flushed failed send");
+                        let _ = db.delete_failed_send(send.id).await;
+                        // Same `text_preview` as the `Drop` branch, over the
+                        // text actually **sent** — prefix included. That is the
+                        // quantity the mika#2935 post-deploy probe counts, and
+                        // it was only readable on the dropped half until now.
+                        let text_preview: String = text_to_send.chars().take(80).collect();
+                        info!(
+                            id = send.id,
+                            text_preview = %text_preview,
+                            "flushed failed send"
+                        );
                     }
                     Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                         warn!(id = send.id, reason = %reason, "failed send flush: delivery failed again");
-                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                        let _ = db.increment_failed_send_retry(send.id).await;
                     }
                     Ok(crate::messaging::SendOutcome::NoChannel) => {
                         // Permanent condition — delete the entry instead of retrying.
                         // These entries were created before the NoChannel check existed.
-                        let _ = agent_state.db.delete_failed_send(send.id).await;
+                        let _ = db.delete_failed_send(send.id).await;
                         warn!(
                             id = send.id,
                             "failed send flush: no reply channel (chat_id=0), deleting entry"
@@ -2450,7 +2479,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     }
                     Err(e) => {
                         warn!(id = send.id, error = %e, "failed send flush: sender error");
-                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                        let _ = db.increment_failed_send_retry(send.id).await;
                     }
                 }
             }
