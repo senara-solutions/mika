@@ -106,11 +106,24 @@ pub trait MessageSender: Send + Sync {
     }
 }
 
+/// What the `failed_sends` flush needs, and nothing more: deliver a text and
+/// say whether it went through (mika#2935).
+///
+/// Deliberately **not** `MessageSender` — that trait parks, and the parking is
+/// the defect mika#2935 closes. A `MessageSender` double would not park while
+/// the real `GatewayMessageSender` does, so a test written against it would
+/// stay green above the bug.
+#[async_trait]
+pub trait FlushDelivery: Send + Sync {
+    async fn try_deliver(&self, text: &str) -> Result<SendOutcome>;
+}
+
 /// Sends outbound messages by POSTing to the gateway's /send endpoint.
 ///
-/// On failure, retries once after 2s. If both attempts fail, saves to
-/// `failed_sends` table for later flush and returns `Ok(SendOutcome::Failed)`
-/// so the caller can surface the delivery failure to the LLM.
+/// Two entries, and the difference between them is the whole of mika#2935:
+/// [`Self::try_deliver_with_severity`] delivers and reports, with no side
+/// effect on `failed_sends`; `MessageSender::send_with_severity` adds the
+/// parking. See the latter's doc-comment.
 pub struct GatewayMessageSender {
     client: reqwest::Client,
     gateway_url: String,
@@ -282,22 +295,16 @@ impl GatewayMessageSender {
             anyhow::anyhow!("gateway request failed: {e}")
         }
     }
-}
 
-#[async_trait]
-impl MessageSender for GatewayMessageSender {
-    /// Delegates to [`Self::send_with_severity`] with `P2` (mika#1381).
+    /// Deliver `text` and report the outcome — **without any side effect on
+    /// `failed_sends`** (mika#2935).
     ///
-    /// This direction — and not the reverse — is what guarantees the two paths
-    /// cannot drift: there is exactly one copy of the resolve/payload/retry/
-    /// failed_sends sequence, and `P2` resolves to the same chat `send()`
-    /// always used.
-    async fn send(&self, text: &str) -> Result<SendOutcome> {
-        self.send_with_severity(text, NotificationSeverity::P2)
-            .await
-    }
-
-    async fn send_with_severity(
+    /// Resolves the chat, routes the severity, short-circuits on the
+    /// `NoChannel` sentinel, POSTs and retries once after 2s. Everything
+    /// `send_with_severity` used to do, minus the parking, which is why a
+    /// caller that already owns a `failed_sends` row — the flush — can use it
+    /// without the row being duplicated underneath it.
+    pub async fn try_deliver_with_severity(
         &self,
         text: &str,
         severity: NotificationSeverity,
@@ -360,17 +367,78 @@ impl MessageSender for GatewayMessageSender {
         match self.try_send(&payload).await {
             Ok(()) => Ok(SendOutcome::Delivered),
             Err(e) => {
-                warn!(error = %e, "retry failed, saving to failed_sends");
-                let reason = e.to_string();
-                // Capture the delivery failure reason before attempting DB write.
-                // If save_failed_send fails, we still surface the original gateway
-                // error to the caller (not the DB error).
-                if let Err(db_err) = self.db.save_failed_send(text, None).await {
-                    warn!(error = %db_err, "failed to save to failed_sends table");
-                }
-                Ok(SendOutcome::Failed { reason })
+                // Says what this function did, and nothing it did not: the
+                // parking happens one level up, in `send_with_severity`
+                // (mika#2935). The former wording — "saving to failed_sends" —
+                // is what made a failed flush testify to a parking that had
+                // not happened on this path.
+                warn!(error = %e, "both /send attempts failed");
+                Ok(SendOutcome::Failed {
+                    reason: e.to_string(),
+                })
             }
         }
+    }
+}
+
+#[async_trait]
+impl MessageSender for GatewayMessageSender {
+    /// Delegates to [`Self::send_with_severity`] with `P2` (mika#1381).
+    ///
+    /// This direction — and not the reverse — is what guarantees the two paths
+    /// cannot drift: there is exactly one copy of the resolve/payload/retry/
+    /// failed_sends sequence, and `P2` resolves to the same chat `send()`
+    /// always used.
+    async fn send(&self, text: &str) -> Result<SendOutcome> {
+        self.send_with_severity(text, NotificationSeverity::P2)
+            .await
+    }
+
+    /// Deliver, then park on failure: retries once after 2s, and if both
+    /// attempts fail, saves to the `failed_sends` table for later flush and
+    /// returns `Ok(SendOutcome::Failed)` so the caller can surface the delivery
+    /// failure to the LLM.
+    ///
+    /// **The parking belongs to whoever owns no row** (mika#2935). A normal
+    /// turn owns none, so it parks here. The flush owns one, so it decides that
+    /// row's fate itself (`delete` or `increment`) and goes through
+    /// [`Self::try_deliver_with_severity`] instead — otherwise a failed flush
+    /// keeps its row *and* gets a second, already-prefixed one from this
+    /// clause, one extra `⏳ from earlier — ` per pass.
+    async fn send_with_severity(
+        &self,
+        text: &str,
+        severity: NotificationSeverity,
+    ) -> Result<SendOutcome> {
+        let outcome = self.try_deliver_with_severity(text, severity).await?;
+        if let SendOutcome::Failed { .. } = &outcome {
+            // Site UNIQUE de parquage du crate (mika#2935). Voir le détecteur
+            // `mika2935_le_parquage_a_un_seul_site`.
+            warn!(
+                event = "failed_send_parked",
+                agent_name = ?self.agent_name,
+                request_id = ?self.request_id,
+                text_len = text.len(),
+                "failed_send_parked: saving the undelivered text to failed_sends"
+            );
+            // Capture the delivery failure reason before attempting DB write.
+            // If save_failed_send fails, we still surface the original gateway
+            // error to the caller (not the DB error).
+            if let Err(db_err) = self.db.save_failed_send(text, None).await {
+                warn!(error = %db_err, "failed to save to failed_sends table");
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+/// The flush's delivery rail (mika#2935): the severity `send()` already
+/// resolved on this path, so routing does not move — only the parking does.
+#[async_trait]
+impl FlushDelivery for GatewayMessageSender {
+    async fn try_deliver(&self, text: &str) -> Result<SendOutcome> {
+        self.try_deliver_with_severity(text, NotificationSeverity::P2)
+            .await
     }
 }
 
@@ -847,6 +915,213 @@ mod tests {
             *sender.0.lock().unwrap(),
             vec!["alarme".to_string(), "alarme".to_string()],
             "le défaut du trait passe le texte à send(), quelle que soit la sévérité"
+        );
+    }
+
+    /// AC1 à la racine, et AC2 comme contrôle négatif dans le même test
+    /// (mika#2935).
+    ///
+    /// La paire est ce qui distingue « le parquage a été déplacé » de « le
+    /// parquage a été supprimé » : un seul des deux appels suffirait à l'un des
+    /// deux énoncés, jamais aux deux.
+    ///
+    /// Le point de terminaison vient de [`mika_common::dead_endpoint::DeadEndpoint`],
+    /// tenu pour toute la durée du test — jamais un `bind(:0)` suivi d'un
+    /// `drop` (mika#2569 : ce binaire est le plus parallèle de l'arbre, et un
+    /// port libéré est repris par le voisin, qui répond alors à l'appel censé
+    /// échouer).
+    #[tokio::test]
+    async fn mika2935_le_parquage_appartient_a_send_jamais_a_la_tentative_nue() {
+        let dead = mika_common::dead_endpoint::DeadEndpoint::reserve();
+        let harness = TestHarness::new();
+        harness
+            .db
+            .set_customer_config("chat_id", "4242")
+            .await
+            .unwrap();
+
+        let sender = GatewayMessageSender::new(
+            format!("http://{}", dead.addr()),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("mika".to_string()),
+            None,
+            None,
+        );
+
+        // 1. La primitive échoue et n'écrit pas. C'est AC1 à la racine : le
+        //    chemin que le flush emprunte ne peut pas créer de ligne.
+        let outcome = FlushDelivery::try_deliver(&sender, "réponse parquée")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Failed { .. }),
+            "un point de terminaison mort doit rendre Failed, pas {outcome:?}"
+        );
+        let parked = harness.db.get_pending_failed_sends(10).await.unwrap();
+        assert!(
+            parked.is_empty(),
+            "try_deliver n'a aucun effet de bord sur failed_sends, or la table \
+             porte {} ligne(s) : {:?}",
+            parked.len(),
+            parked.iter().map(|p| &p.text).collect::<Vec<_>>()
+        );
+
+        // 2. Même sender, l'entrée avec effet de bord : un tour normal parque
+        //    toujours. C'est AC2 — le contrôle négatif demandé dans ce test.
+        let outcome = MessageSender::send(&sender, "un tour normal")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Failed { .. }),
+            "même transport, même issue attendue, pas {outcome:?}"
+        );
+        let parked = harness.db.get_pending_failed_sends(10).await.unwrap();
+        assert_eq!(
+            parked.len(),
+            1,
+            "un envoi raté hors flush parque exactement une ligne : {:?}",
+            parked.iter().map(|p| &p.text).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parked[0].text, "un tour normal",
+            "la ligne parquée porte le texte de l'envoi, et seulement lui"
+        );
+    }
+
+    // ---- mika#2935 / R4 — le parquage n'a qu'un site de production ---------
+
+    /// Fichiers dispensés du détecteur de parquage unique. LIVRÉE VIDE, et
+    /// c'est le contrat. `(chemin relatif à `src/`, ticket de suivi)`.
+    const PARKING_SITE_ALLOWLIST: &[(&str, &str)] = &[];
+
+    /// L'aiguille : un **appel** de `save_failed_send`, pas sa définition.
+    const PARKING_NEEDLE: &str = ".save_failed_send(";
+
+    /// Hors périmètre, et ce n'est **pas** une exception (mika#2935).
+    ///
+    /// - `messaging.rs` est le propriétaire autorisé : le fichier qui porte le
+    ///   seul site de parquage, et ce détecteur.
+    /// - `db.rs` porte la définition et `async_db.rs` le délégué vers le fil
+    ///   DB. Ces deux-là *sont* la méthode ; les compter reviendrait à déclarer
+    ///   le type en violation de lui-même. (`db.rs` n'écrit aujourd'hui
+    ///   `pub fn save_failed_send(`, que l'aiguille ne reconnaît pas — la
+    ///   déclarer ici rend le périmètre indépendant de cette orthographe.)
+    ///
+    /// La distinction compte : une exclusion de périmètre décrit ce que le
+    /// détecteur **mesure**, une exception décrit une dette qu'il **tolère**.
+    const PARKING_SCOPE_EXCLUSIONS: &[&str] = &["messaging.rs", "db.rs", "async_db.rs"];
+
+    /// `true` si `src`, lu comme la production de `path`, parque une ligne
+    /// `failed_sends` alors que ce n'est pas son rôle (mika#2935).
+    ///
+    /// Extrait du test porteur pour que le contrôle de bonne foi puisse le
+    /// nourrir d'une source synthétique sans écrire sur le disque — une
+    /// allowlist vide au-dessus d'un scan qui ne voit rien serait verte pour la
+    /// mauvaise raison.
+    fn is_unexpected_parker(path: &std::path::Path, src: &str) -> bool {
+        if crate::source_scan::is_test_source_path(path) {
+            return false;
+        }
+        let rel = path.to_string_lossy().replace('\\', "/");
+        if PARKING_SCOPE_EXCLUSIONS.contains(&rel.as_str()) {
+            return false;
+        }
+        if PARKING_SITE_ALLOWLIST.iter().any(|(p, _)| *p == rel) {
+            return false;
+        }
+        let prod = crate::source_scan::production_half(src);
+        crate::source_scan::strip_comment_lines(prod).contains(PARKING_NEEDLE)
+    }
+
+    /// La correction de mika#2935 est locale ; la classe ne l'est pas. Un futur
+    /// site qui parque de son côté — ou qui rebranche le flush sur `send` —
+    /// réinstalle le défaut sans rougir aucune assertion de comportement.
+    #[test]
+    fn mika2935_le_parquage_a_un_seul_site() {
+        let files = crate::source_scan::production_files();
+        assert!(
+            files.len() > 50,
+            "le parcours de `src/` n'a rendu que {} fichiers : un scan qui ne \
+             trouve plus rien doit être rouge, pas vert",
+            files.len()
+        );
+
+        let coupables: Vec<String> = files
+            .iter()
+            .filter(|(rel, prod)| is_unexpected_parker(std::path::Path::new(rel), prod))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+
+        assert!(
+            coupables.is_empty(),
+            "ces fichiers de production parquent une ligne `failed_sends` alors \
+             que `send_with_severity` est le site unique : {coupables:?}. Un \
+             second site rouvre exactement mika#2935 — la ligne ratée est \
+             conservée par son propriétaire ET recréée par le transport, avec \
+             un préfixe de plus à chaque passe. Retirez le second site, ne \
+             l'allowlistez pas : routez-le par `send_with_severity`, ou passez \
+             par `try_deliver_with_severity` si l'appelant possède déjà sa ligne."
+        );
+    }
+
+    /// L'assertion auto-nettoyante de la Fire-Disposition (mika#2309) :
+    /// l'exception expire par le geste qui la rend inutile.
+    #[test]
+    fn mika2935_lallowlist_du_parqueur_unique_est_livree_vide_et_le_reste() {
+        assert!(
+            PARKING_SITE_ALLOWLIST.is_empty(),
+            "Une entrée a été ajoutée ici. Un second site de parquage rouvre \
+             exactement mika#2935 : la ligne ratée est conservée par son \
+             propriétaire ET recréée par le transport, avec un préfixe de plus \
+             à chaque passe. Route le site par `send_with_severity`, ou ouvre \
+             un ticket de suivi et nomme-le dans l'entrée."
+        );
+    }
+
+    /// Le contrôle de bonne foi : le détecteur rougit bel et bien sur un second
+    /// parqueur, et reste muet sur une fixture de test (mika#2935).
+    ///
+    /// Sans lui, `mika2935_le_parquage_a_un_seul_site` serait vert aussi bien
+    /// parce qu'il n'y a qu'un site que parce qu'il ne sait pas en voir deux.
+    #[test]
+    fn mika2935_le_detecteur_rougit_sur_un_second_parqueur() {
+        let second_parqueur = "\
+async fn flush(db: &AsyncDatabase, text: &str) {
+    let _ = db.save_failed_send(text, None).await;
+}
+";
+
+        // Un chemin de production réel — celui du flush, qui est précisément
+        // l'endroit où le second site vivait avant R3.
+        let prod = std::path::Path::new("server/handlers.rs");
+        assert!(
+            is_unexpected_parker(prod, second_parqueur),
+            "le détecteur ne voit pas un second site de parquage : \
+             `mika2935_le_parquage_a_un_seul_site` est décoratif"
+        );
+
+        // La même source sous un chemin de test : une fixture pose
+        // légitimement l'aiguille, et l'accuser rougirait sur du code sain.
+        assert!(
+            !is_unexpected_parker(
+                std::path::Path::new("server/tests/flush_fixtures.rs"),
+                second_parqueur
+            ),
+            "une fixture de test n'est pas un site de parquage de production"
+        );
+        assert!(
+            !is_unexpected_parker(std::path::Path::new("server/tests.rs"), second_parqueur),
+            "un `tests.rs` isolé non plus (mika#2321)"
+        );
+
+        // Et le propriétaire autorisé reste hors de cause, par périmètre.
+        assert!(
+            !is_unexpected_parker(std::path::Path::new("messaging.rs"), second_parqueur),
+            "`messaging.rs` porte le site unique : c'est une exclusion de \
+             périmètre, pas une exception"
         );
     }
 }

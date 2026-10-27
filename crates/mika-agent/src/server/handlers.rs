@@ -15,7 +15,7 @@ use mika_common::llm::LlmImage;
 
 use crate::agent;
 use crate::compaction;
-use crate::messaging::{GatewayMessageSender, MessageSender};
+use crate::messaging::{FlushDelivery, GatewayMessageSender, MessageSender};
 use crate::task_engine::types::{task_status, trigger_type};
 
 use super::ci_failure_handler;
@@ -2387,12 +2387,12 @@ fn classify_failed_send(created_at: &str, now: chrono::DateTime<chrono::Utc>) ->
 ///
 /// The `Drop` branch does NOT call `increment_failed_send_retry` — a dropped
 /// row was never retried, so incrementing would be incorrect accounting.
+///
+/// The delivery rail is [`FlushDelivery`], never `MessageSender` (mika#2935):
+/// this loop **owns** each row it reads, so it decides that row's fate itself —
+/// `delete` or `increment` — and the transport must not park a second one
+/// underneath it.
 async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
-    let sends = match agent_state.db.get_pending_failed_sends(5).await {
-        Ok(s) if !s.is_empty() => s,
-        _ => return,
-    };
-
     let sender = GatewayMessageSender::new(
         state.gateway_url.clone(),
         state.internal_token.clone(),
@@ -2403,6 +2403,26 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         None,
         agent_state.settings.customer_id.clone(),
     );
+
+    flush_failed_sends_with(&agent_state.db, &sender).await;
+}
+
+/// The flush itself, over an injected delivery rail (mika#2935).
+///
+/// Split out of [`flush_failed_sends`] so the lifecycle of a parked row — who
+/// deletes it, who increments it, and that nobody *adds* one — is testable
+/// against a sender whose outcome the test chooses. The injection point is
+/// [`FlushDelivery`] and not `&dyn MessageSender` on purpose: a `MessageSender`
+/// double does not park, while the real `GatewayMessageSender` does, so a test
+/// written against that trait would stay green above the defect.
+async fn flush_failed_sends_with<D: FlushDelivery + ?Sized>(
+    db: &crate::async_db::AsyncDatabase,
+    delivery: &D,
+) {
+    let sends = match db.get_pending_failed_sends(5).await {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
 
     let now = chrono::Utc::now();
     for send in sends {
@@ -2417,7 +2437,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     text_preview = %text_preview,
                     "dropping stale failed_send"
                 );
-                let _ = agent_state.db.delete_failed_send(send.id).await;
+                let _ = db.delete_failed_send(send.id).await;
             }
             FlushAction::Deliver { prefix } => {
                 if prefix == FAILED_SEND_UNPARSEABLE_PREFIX {
@@ -2430,19 +2450,28 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     debug!(id = send.id, "flushing failed_send with stale prefix");
                 }
                 let text_to_send = format!("{}{}", prefix, send.text);
-                match sender.send(&text_to_send).await {
+                match delivery.try_deliver(&text_to_send).await {
                     Ok(crate::messaging::SendOutcome::Delivered) => {
-                        let _ = agent_state.db.delete_failed_send(send.id).await;
-                        info!(id = send.id, "flushed failed send");
+                        let _ = db.delete_failed_send(send.id).await;
+                        // Same `text_preview` as the `Drop` branch, over the
+                        // text actually **sent** — prefix included. That is the
+                        // quantity the mika#2935 post-deploy probe counts, and
+                        // it was only readable on the dropped half until now.
+                        let text_preview: String = text_to_send.chars().take(80).collect();
+                        info!(
+                            id = send.id,
+                            text_preview = %text_preview,
+                            "flushed failed send"
+                        );
                     }
                     Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                         warn!(id = send.id, reason = %reason, "failed send flush: delivery failed again");
-                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                        let _ = db.increment_failed_send_retry(send.id).await;
                     }
                     Ok(crate::messaging::SendOutcome::NoChannel) => {
                         // Permanent condition — delete the entry instead of retrying.
                         // These entries were created before the NoChannel check existed.
-                        let _ = agent_state.db.delete_failed_send(send.id).await;
+                        let _ = db.delete_failed_send(send.id).await;
                         warn!(
                             id = send.id,
                             "failed send flush: no reply channel (chat_id=0), deleting entry"
@@ -2450,7 +2479,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     }
                     Err(e) => {
                         warn!(id = send.id, error = %e, "failed send flush: sender error");
-                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                        let _ = db.increment_failed_send_retry(send.id).await;
                     }
                 }
             }
@@ -3084,5 +3113,144 @@ mod tests {
         assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await);
         record_pr_sync_observed(&db, SYNC_2659, "Z").await;
         assert!(!skip_superseded_review_turn(&db, SYNC_2659, "A").await);
+    }
+
+    // ---- mika#2935 — le cycle de vie d'une ligne parquée pendant un flush ---
+
+    /// Un rail de livraison dont le test choisit l'issue, et qui mémorise ce
+    /// qu'on lui a demandé d'envoyer (mika#2935).
+    ///
+    /// C'est `FlushDelivery` et non `MessageSender` qu'on double, et la
+    /// différence est le défaut lui-même : un double de `MessageSender` ne
+    /// parque pas, alors que le vrai `GatewayMessageSender` le faisait, donc un
+    /// test écrit contre ce trait serait resté vert au-dessus du bug.
+    struct Mika2935Delivery {
+        outcome: crate::messaging::SendOutcome,
+        recus: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Mika2935Delivery {
+        fn new(outcome: crate::messaging::SendOutcome) -> Self {
+            Self {
+                outcome,
+                recus: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recus(&self) -> Vec<String> {
+            self.recus.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlushDelivery for Mika2935Delivery {
+        async fn try_deliver(&self, text: &str) -> anyhow::Result<crate::messaging::SendOutcome> {
+            self.recus.lock().unwrap().push(text.to_string());
+            Ok(self.outcome.clone())
+        }
+    }
+
+    /// Combien de fois le préfixe de mika#1751 apparaît dans un texte — la
+    /// grandeur exacte que compte la sonde post-déploiement d'AC3.
+    fn mika2935_prefixes(texte: &str) -> usize {
+        texte.matches(FAILED_SEND_STALE_PREFIX).count()
+    }
+
+    /// AC1 : deux flushs ratés d'affilée laissent **exactement une** ligne, et
+    /// son texte stocké ne porte **jamais** de préfixe (mika#2935).
+    ///
+    /// Deux passes, pas une : avec une seule, « la ligne n'est pas dupliquée »
+    /// et « la seconde ligne n'a pas encore eu lieu » rendent le même compte.
+    /// C'est la deuxième passe qui, avant le correctif, portait le second
+    /// `⏳ from earlier — `.
+    #[tokio::test]
+    async fn mika2935_un_flush_rate_laisse_exactement_une_ligne() {
+        let db = mika2671_db();
+        db.save_failed_send("réponse parquée", None).await.unwrap();
+
+        let origine = db.get_pending_failed_sends(10).await.unwrap();
+        assert_eq!(origine.len(), 1, "la table de départ porte une ligne");
+        assert_eq!(origine[0].text, "réponse parquée");
+        let created_at_origine = origine[0].created_at.clone();
+
+        let double = Mika2935Delivery::new(crate::messaging::SendOutcome::Failed {
+            reason: "point de terminaison mort".to_string(),
+        });
+
+        for passe in 1..=2usize {
+            flush_failed_sends_with(&db, &double).await;
+
+            let lignes = db.get_pending_failed_sends(10).await.unwrap();
+            assert_eq!(
+                lignes.len(),
+                1,
+                "passe {passe} : un flush raté ne crée aucune ligne, or la table \
+                 en porte {} : {:?}",
+                lignes.len(),
+                lignes.iter().map(|l| &l.text).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                lignes[0].text, "réponse parquée",
+                "passe {passe} : le texte stocké reste nu — c'est ce que \
+                 mika#2935 corrige, le préfixe n'entre jamais dans la table"
+            );
+            assert_eq!(
+                mika2935_prefixes(&lignes[0].text),
+                0,
+                "passe {passe} : zéro préfixe dans la table, quel qu'en soit le nombre"
+            );
+            assert_eq!(
+                lignes[0].created_at, created_at_origine,
+                "passe {passe} : une ligne conservée garde son `created_at` \
+                 d'origine — c'est ce dont le seuil de 5 minutes de mika#1751 a besoin"
+            );
+            assert_eq!(
+                lignes[0].retry_count, passe as i32,
+                "passe {passe} : la ligne est incrémentée, pas remplacée"
+            );
+
+            let recus = double.recus();
+            assert_eq!(
+                recus.len(),
+                passe,
+                "passe {passe} : un envoi par passe, pas davantage"
+            );
+            assert_eq!(
+                mika2935_prefixes(&recus[passe - 1]),
+                1,
+                "passe {passe} : le texte envoyé porte un seul préfixe, pas {} : {:?}",
+                mika2935_prefixes(&recus[passe - 1]),
+                recus[passe - 1]
+            );
+        }
+    }
+
+    /// Le contrôle positif du test ci-dessus : avec un rail qui livre, la ligne
+    /// est **supprimée** (mika#2935).
+    ///
+    /// Sans lui, un `flush_failed_sends_with` qui n'aurait jamais rien envoyé
+    /// satisferait les assertions d'AC1 pour la mauvaise raison.
+    #[tokio::test]
+    async fn mika2935_un_flush_reussi_supprime_la_ligne() {
+        let db = mika2671_db();
+        db.save_failed_send("réponse parquée", None).await.unwrap();
+
+        let double = Mika2935Delivery::new(crate::messaging::SendOutcome::Delivered);
+        flush_failed_sends_with(&db, &double).await;
+
+        let lignes = db.get_pending_failed_sends(10).await.unwrap();
+        assert!(
+            lignes.is_empty(),
+            "une livraison réussie supprime la ligne, or la table porte {:?}",
+            lignes.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        let recus = double.recus();
+        assert_eq!(recus.len(), 1, "le rail a bien été emprunté : {recus:?}");
+        assert_eq!(
+            recus[0],
+            format!("{FAILED_SEND_STALE_PREFIX}réponse parquée"),
+            "le texte envoyé porte le préfixe de mika#1751, une seule fois"
+        );
     }
 }
