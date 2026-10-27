@@ -1777,6 +1777,27 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     ))
                         as std::sync::Arc<dyn crate::milestone_manager::FlightSource>
                 }),
+                // mika#2922 vol 1 — où chaque verdict est inscrit.
+                //
+                // Même handle, et la même raison qu'au-dessus : le conteneur n'a
+                // qu'une base. L'`agent_id` que ce handle porte **est** celui
+                // sous lequel la ligne d'audit sera écrite, parce que
+                // `AsyncDatabase::log_audit_event` clone son propre `agent_id`
+                // et ne l'accepte pas en paramètre — le périmètre par agent est
+                // donc structurel, non déclaré. C'est délibérément le même
+                // `agent_id` que celui de la source de vols, pour que le vol 2
+                // relise sous la clé où le vol 1 a écrit.
+                //
+                // `None` quand l'agent par défaut est absent — aucune ligne
+                // inscrite, un cycle intact, la sonde sur sa branche `unwired`.
+                // Lecture et écriture cantonnées à `audit_events` : aucune
+                // autorité sur la forge ne passe par ce paramètre.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::flight_verdict_ledger::DbFlightVerdictLedger::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::flight_verdict_ledger::FlightVerdictLedger>
+                }),
             ),
             Ok(None) => {
                 info!(

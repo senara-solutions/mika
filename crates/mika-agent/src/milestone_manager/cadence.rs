@@ -30,6 +30,7 @@ use super::{
     verdict_poster::{post_verdicts, write_is_armed},
 };
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
+use crate::flight_verdict_ledger::{FlightVerdictLedger, InscriptionTally, record_if_wired};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use mika_common::auth_boundary::{AuthBoundaryError, AuthBoundaryKind};
@@ -510,6 +511,14 @@ pub struct CycleContext<'a> {
     /// câblée, et le rapport est alors identique à celui d'avant mika#2698 :
     /// aucun verdict, donc pas de section.
     pub flight_source: Option<&'a Arc<dyn FlightSource>>,
+    /// Où chaque verdict d'évaluateur est **inscrit** (mika#2922, vol 1).
+    ///
+    /// `None` = non câblé, et le cycle est alors identique à celui d'avant
+    /// mika#2922 : aucune ligne d'audit, et surtout aucun verdict changé. Ce
+    /// registre n'est pas une autorité — il n'a aucun effet sur
+    /// `post_flight_verdicts` ni sur le rapport, et sa signature ne rend aucune
+    /// erreur à propager (même raison qu'`auth_ledger` ci-dessus).
+    pub verdict_ledger: Option<&'a Arc<dyn FlightVerdictLedger>>,
     /// Par quoi passe le seul geste d'écriture du manager (mika#2698 vol 2).
     ///
     /// Réutilise l'exécutant `gh` déjà injectable du module (mika#1975) plutôt
@@ -528,6 +537,7 @@ impl<'a> CycleContext<'a> {
             auth_ledger: None,
             auth_notes: &[],
             flight_source: None,
+            verdict_ledger: None,
             gh_runner: None,
         }
     }
@@ -547,6 +557,11 @@ impl<'a> CycleContext<'a> {
 
     pub fn with_flight_source(mut self, source: Option<&'a Arc<dyn FlightSource>>) -> Self {
         self.flight_source = source;
+        self
+    }
+
+    pub fn with_verdict_ledger(mut self, ledger: Option<&'a Arc<dyn FlightVerdictLedger>>) -> Self {
+        self.verdict_ledger = ledger;
         self
     }
 
@@ -684,6 +699,66 @@ async fn collect_flight_verdicts(
         verdicts.len(),
     );
     (verdicts, scan)
+}
+
+/// Inscrit les verdicts de ce cycle, et dit ce qu'il a inscrit (mika#2922).
+///
+/// **N'est pas une autorité.** Appelé après que `assessment.flight_verdicts` est
+/// posé et **avant** `post_flight_verdicts`, mais il ne décide de rien : son
+/// retour n'est consommé que par sa propre sonde, et sa signature ne peut pas
+/// rendre d'erreur. Un registre en panne laisse le cycle, le rapport et le
+/// commentaire sur le ticket exactement tels qu'ils étaient (R5).
+///
+/// **Awaited, pas détaché.** AC1 demande qu'« après un cycle, chaque vol jugé a
+/// exactement une ligne » — une propriété mesurable seulement si l'écriture est
+/// terminée quand le cycle rend. Un `handle.spawn` la rendrait non observable, et
+/// le cycle tourne déjà toutes les N minutes en attendant un appel `gh` dans
+/// `post_flight_verdicts` : la latence d'une lecture et d'un INSERT par vol n'y
+/// pèse rien.
+///
+/// **Trois branches, et la sonde part sur les trois.** `unwired` (aucun registre
+/// câblé), `no_verdicts` (un registre, rien à inscrire) et `written`. Sans la
+/// distinction, les trois rendent les mêmes octets — aucune ligne nouvelle en
+/// base — et « le registre n'est pas câblé » devient indistinguable de « le
+/// cycle n'a jugé aucun vol » (classe mika#2205). La priorité est
+/// `unwired` → `no_verdicts` → `written` : non-câblé se dit même quand il n'y
+/// avait rien à inscrire, parce que c'est l'information qui porte.
+///
+/// `inscribed` et `already_recorded` sont **deux champs** et jamais une somme :
+/// « 3 inscrits » au premier cycle et « 3 déjà présents » au second sont deux
+/// mesures de sens opposé, et leur total ne distingue pas un registre qui écrit
+/// d'un registre qui relit. `failed` est le troisième, et son zéro est une
+/// mesure. L'**absence** de cette ligne signifie un binaire antérieur à ce vol
+/// (classe mika#2340), jamais une absence d'inscription.
+async fn record_flight_verdicts(ctx: &CycleContext<'_>, verdicts: &[FlightVerdict]) {
+    let tally = record_if_wired(ctx.verdict_ledger, verdicts).await;
+    let branch = inscription_branch(tally.as_ref(), verdicts.is_empty());
+    let tally = tally.unwrap_or_default();
+    info!(
+        target: "mika::milestone_manager",
+        event = "manager_verdict_inscription",
+        branch = branch,
+        scope = "container",
+        candidates = verdicts.len(),
+        inscribed = tally.inscribed,
+        already_recorded = tally.already_recorded,
+        failed = tally.failed,
+        "verdict inscription"
+    );
+}
+
+/// La branche que la sonde d'inscription annonce (mika#2922).
+///
+/// Pure et nommée, parce que c'est la seule part de `record_flight_verdicts` qui
+/// porte une décision de lecture : inlinée dans le `info!`, elle n'était
+/// vérifiable qu'en relisant un journal. La priorité est documentée sur
+/// l'appelant — `unwired` gagne même sans verdict à inscrire.
+fn inscription_branch(tally: Option<&InscriptionTally>, no_verdicts: bool) -> &'static str {
+    match (tally, no_verdicts) {
+        (None, _) => "unwired",
+        (Some(_), true) => "no_verdicts",
+        (Some(_), false) => "written",
+    }
 }
 
 /// Combien de vols postés le checkpoint retient (mika#2698 vol 2).
@@ -852,6 +927,9 @@ pub async fn run_manager_cycle_in(
             .and_then(|c| c.last_observed_at.as_deref()),
     );
     assessment.flight_verdicts = flight_verdicts;
+    // mika#2922 vol 1 — l'inscription. Avant le geste sur la forge, et sans
+    // aucun effet sur lui : le registre ne décide rien, il enregistre.
+    record_flight_verdicts(ctx, &assessment.flight_verdicts).await;
     let newly_posted =
         post_flight_verdicts(cfg, ctx, &assessment.flight_verdicts, checkpoint.as_ref()).await;
     // mika#2699 vol 4 — le geste du bassin. Le verdict qu'il consulte est déjà
@@ -1111,7 +1189,7 @@ pub async fn probe_executor_health(url: Option<&str>) -> Option<bool> {
 /// Live-runner variant: reads from `gh`, probes optional health endpoint,
 /// then runs the same cycle logic.
 pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
-    run_manager_cycle_with_auth(cfg, None, &[], None).await
+    run_manager_cycle_with_auth(cfg, None, &[], None, None).await
 }
 
 /// As [`run_manager_cycle`], with the mika#1949 auth-boundary wiring: where to
@@ -1119,11 +1197,16 @@ pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
 /// forward from previous cycles — plus, depuis mika#2698, d'où viennent les vols
 /// terminés à évaluer. `flight_source: None` rend un rapport identique à celui
 /// d'avant mika#2698 : aucun verdict, donc pas de section.
+///
+/// Depuis mika#2922, `verdict_ledger` dit où chaque verdict est **inscrit**.
+/// `None` rend un cycle identique à celui d'avant : aucune ligne d'audit, et
+/// aucun verdict changé — le registre n'a pas d'autorité.
 pub async fn run_manager_cycle_with_auth(
     cfg: &ManagerConfig,
     auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
     auth_notes: &[crate::milestone_manager::reporter::AuthBoundaryNote],
     flight_source: Option<&Arc<dyn FlightSource>>,
+    verdict_ledger: Option<&Arc<dyn FlightVerdictLedger>>,
 ) -> Result<CycleOutcome> {
     let reader = Reader::new(cfg.github_token.clone());
     let mut state = reader.read(&cfg.target).await?;
@@ -1141,6 +1224,7 @@ pub async fn run_manager_cycle_with_auth(
         .with_auth_ledger(auth_ledger)
         .with_auth_notes(auth_notes)
         .with_flight_source(flight_source)
+        .with_verdict_ledger(verdict_ledger)
         .with_gh_runner(Some(&gh_runner));
     run_manager_cycle_in(cfg, state, &ctx).await
 }
@@ -2831,6 +2915,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1802],
             "la décision est prise et dite, seule l'écriture manque d'exécutant"
+        );
+    }
+
+    /// Les trois branches de la sonde d'inscription sont distinctes, et
+    /// `unwired` gagne même quand il n'y avait rien à inscrire (mika#2922).
+    ///
+    /// Sans cette distinction les trois rendent les mêmes octets en base —
+    /// aucune ligne nouvelle — et « le registre n'est pas câblé » devient
+    /// indistinguable de « le cycle n'a jugé aucun vol » (classe mika#2205).
+    /// Le `CycleContext::new` ne câble aucun registre, donc la branche qu'un
+    /// conteneur sans câblage annonce est bien celle testée ici.
+    #[test]
+    fn mika2922_la_sonde_distingue_non_cable_de_rien_a_inscrire() {
+        assert_eq!(inscription_branch(None, true), "unwired");
+        assert_eq!(
+            inscription_branch(None, false),
+            "unwired",
+            "non-câblé se dit même avec des verdicts en main : c'est l'information qui porte"
+        );
+        assert_eq!(
+            inscription_branch(Some(&InscriptionTally::default()), true),
+            "no_verdicts"
+        );
+        assert_eq!(
+            inscription_branch(Some(&InscriptionTally::default()), false),
+            "written",
+            "un registre câblé avec des verdicts dit `written`, même si le compte est nul"
+        );
+
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+        assert!(
+            CycleContext::new(&rec, now).verdict_ledger.is_none(),
+            "un contexte nominal ne câble aucun registre — c'est la branche `unwired`"
         );
     }
 }
