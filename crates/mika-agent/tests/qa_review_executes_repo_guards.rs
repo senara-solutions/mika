@@ -537,3 +537,93 @@ fn mika2565_the_build_callback_branches_on_dependabot_before_the_plan_reread() {
          fact is available"
     );
 }
+
+/// mika#2926 R2 — le plafond que le prompt ANNONCE est celui que le moteur SERT.
+///
+/// # La dérive que ce garde ferme
+///
+/// Le prompt prescrivait 14 steps pendant que le moteur en servait 20, et le
+/// modèle en consommait 20 sans conclure : un budget annoncé plus serré que le
+/// budget réel n'économise rien, il fait seulement planifier à côté. Depuis
+/// mika#2926 le moteur sert 30 à mika-qa — si cette phrase reste à 14, ou si un
+/// futur ticket déplace le plafond moteur sans rouvrir le prompt, l'écart
+/// revient en silence et aucune assertion de comportement ne rougit : les deux
+/// nombres vivent dans deux fichiers que rien ne joint.
+///
+/// # Deux assertions, et la première porte la seconde
+///
+/// La phrase doit d'abord **exister** : un prompt qui ne l'annonce plus rendrait
+/// l'égalité vraie par vacuité. Puis l'entier qu'elle porte doit être égal à ce
+/// que `max_tool_steps_for_agent("mika-qa", MAX_TOOL_STEPS)` résout — la
+/// fonction elle-même, jamais un littéral recopié ici, sinon ce garde devient
+/// la troisième copie du même nombre.
+#[test]
+fn mika2926_le_plafond_annonce_par_le_prompt_est_celui_du_moteur() {
+    const SENTENCE_HEAD: &str = "You have a maximum of ";
+    const SENTENCE_TAIL: &str = " tool steps per turn.";
+
+    let prompt = qa_review_prompt();
+
+    let start = prompt.find(SENTENCE_HEAD).unwrap_or_else(|| {
+        panic!(
+            "qa-review/system_prompt.md n'annonce plus son budget de steps. \
+             La phrase `{SENTENCE_HEAD}<N>{SENTENCE_TAIL}` est ce que le modèle \
+             lit pour planifier son tour : sans elle il planifie à l'aveugle, \
+             et l'égalité que ce test vérifie devient vraie par vacuité."
+        )
+    });
+    let after_head = &prompt[start + SENTENCE_HEAD.len()..];
+    let end = after_head.find(SENTENCE_TAIL).unwrap_or_else(|| {
+        panic!(
+            "la phrase du budget de steps a changé de forme : \
+             `{SENTENCE_TAIL}` ne suit plus `{SENTENCE_HEAD}<N>`. \
+             Réparez l'extraction, n'élargissez pas le motif."
+        )
+    });
+    let announced: usize = after_head[..end].trim().parse().unwrap_or_else(|e| {
+        panic!(
+            "le budget annoncé n'est pas un entier (`{}`) : {e}",
+            after_head[..end].trim()
+        )
+    });
+
+    let served = mika_agent::planning::policy::max_tool_steps_for_agent(
+        "mika-qa",
+        mika_agent::planning::policy::MAX_TOOL_STEPS,
+    );
+
+    assert_eq!(
+        announced, served,
+        "qa-review annonce {announced} steps par tour et le moteur en sert \
+         {served} pour mika-qa. Les deux doivent bouger dans le même commit — \
+         un budget annoncé plus serré fait planifier à côté, un budget annoncé \
+         plus large fait dépasser. Site moteur : \
+         `planning::policy::max_tool_steps_for_agent` (mika#2926)."
+    );
+}
+
+/// mika#2926 R3 — l'exploration par `run_shell` est bornée, et la borne dit
+/// quoi faire au plafond.
+///
+/// La borne seule ne suffit pas : un prompt qui dirait « au plus 2 appels » sans
+/// nommer la sortie laisserait le modèle libre de s'arrêter sans rien poster, ce
+/// qui est exactement le symptôme mesuré — 13 tours coupés, zéro verdict. La
+/// seconde assertion est donc celle qui porte la charge.
+#[test]
+fn mika2926_lexploration_par_run_shell_est_bornee_avec_sa_sortie() {
+    let prompt = qa_review_prompt();
+
+    assert!(
+        prompt.contains("Reading or searching the repo by `run_shell` is capped at 2 calls"),
+        "la borne sur l'exploration par `run_shell` a disparu de \
+         qa-review/system_prompt.md. C'est la moitié du correctif mika#2926 qui \
+         s'attaque à la CAUSE : relever le plafond seul déplace l'épuisement \
+         sans le faire disparaître."
+    );
+    assert!(
+        prompt.contains("At the cap, emit `hold[review]` naming the verification"),
+        "la borne doit nommer sa SORTIE. Sans elle, un modèle qui atteint le \
+         plafond s'arrête sans rien poster — la PR sans verdict de mika#2920, \
+         c'est-à-dire précisément le coût que mika#2926 mesure."
+    );
+}

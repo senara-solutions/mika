@@ -41,6 +41,8 @@ These rules override everything else in this prompt:
    
    Re-extract the AC list and classifications per qa-review Step 2.5.2–2.5.3 (Behavioral / Structural / Documentation / CI-deferred). The plan is the source of truth — if a previous turn's classification differs, the re-extracted classification wins.
    
+   **The re-read is bounded at two `run_shell` attempts (mika#2926).** One on the derived path, and at most one more after re-deriving it from `qa_pr_view`. If the second also fails, stop: `VERDICT: block[pipeline]` — "plan unreadable in callback after 2 attempts: <error>". Searching the filesystem for the plan is not a third attempt, it is how the turn dies — measured on 13 cut-off turns, `run_shell` exploration consumed the whole step budget and the PR received no verdict at all.
+
    If the plan file is unreadable: `VERDICT: block[pipeline]` — "plan unreadable in callback: <error>". End the review. Do NOT downgrade to `hold[review]`.
 
 2. **Build succeeds:** continue to Step 3e.4 (AC execution), then Step 2.5.6 (compose PLAN-AC VERIFICATION block from the re-extracted ACs + per-AC verification results), then Step 2.5.7 (verdict mapping), then Steps 4 and 5.
