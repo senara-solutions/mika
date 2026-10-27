@@ -890,8 +890,8 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
     /// 4 jugent la tête sur **les revues de cette tête**.
     ///
     /// Même forme que [`CLAUSES_DU_POST_REUSSI`] : une clause par fichier,
-    /// jamais l'identité octet à octet d'un texte. Les trois littéraux sont les
-    /// trois maillons de la lecture, et aucun ne couvre les deux autres :
+    /// jamais l'identité octet à octet d'un texte. Les cinq littéraux sont les
+    /// cinq maillons de la lecture, et aucun ne couvre les autres :
     ///
     /// - `qa_head_reviews(` — l'outil est **appelé**, pas décrit. C'est le seul
     ///   qui rende `commit_id` ; `gh pr view --json reviews` ne porte pas ce
@@ -900,10 +900,30 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
     /// - `carries_verdict_line` — le prédicat de l'étape 4 porte sur un champ du
     ///   tableau rendu, et non sur un état de la PR.
     /// - `commit_id` — la raison vit dans le prompt, là où le modèle la lit :
-    ///   c'est le seul champ qui nomme la tête sur laquelle une revue a statué.
+    ///   c'est le champ qui nomme la tête à laquelle la forge attribue une revue.
+    ///
+    /// Les deux derniers sont ajoutés par mika#2939, qui a mesuré que
+    /// `commit_id` **seul** ne nomme pas la tête jugée : au force-push la forge
+    /// réattribue une revue à la nouvelle tête (#2920, une revue de 07:16:49Z
+    /// porte un `commit_id` créé à 12:14Z). Les trois clauses ci-dessus restent
+    /// donc toutes vraies d'un prompt qui conclut sur une revue antidatée :
+    ///
+    /// - `head_first_seen_at` — le repère temporel est **nommé** dans le prompt.
+    ///   Sans lui, l'étape 4 lit un tableau de revues sans savoir de quand date
+    ///   la tête, et le filtre pourrait être retiré de l'outil sans qu'une seule
+    ///   ligne du prompt change.
+    /// - `dropped_predating_head` — le compte des revues écartées est un
+    ///   **instrument**, et le prompt doit dire qu'il n'est jamais un motif
+    ///   d'écart : un compte non nul signifie preuve *absente*, donc revue.
     const CLAUSES_DE_LA_TETE_JUGEE: &[(&str, &[&str])] = &[(
         "qa-review-webhook-success",
-        &["qa_head_reviews(", "carries_verdict_line", "commit_id"],
+        &[
+            "qa_head_reviews(",
+            "carries_verdict_line",
+            "commit_id",
+            "head_first_seen_at",
+            "dropped_predating_head",
+        ],
     )];
 
     /// Les états de PR que le prompt du webhook ne doit plus citer du tout.
@@ -978,9 +998,39 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
                 fabrique,
                 CLAUSES_DE_LA_TETE_JUGEE[0].1,
             ),
-            vec!["qa_head_reviews(", "carries_verdict_line"],
+            vec![
+                "qa_head_reviews(",
+                "carries_verdict_line",
+                "head_first_seen_at",
+                "dropped_predating_head",
+            ],
             "le détecteur doit voir l'absence de la lecture, et ne pas se \
              contenter du champ qu'elle rend"
+        );
+
+        // Second contrôle négatif, celui de mika#2939 : le prompt d'après
+        // mika#2934, qui tient les trois premiers maillons et conclut quand même
+        // sur une revue antidatée. Seules les deux clauses du repère temporel
+        // manquent — et c'est précisément ce que les trois premières ne peuvent
+        // pas voir.
+        let apres_2934 = concat!(
+            "3. **Skip if already-reviewed at this SHA.** Read the reviews of ",
+            "THIS head, once: `qa_head_reviews(repo: \"<owner/repo>\", pr: <n>, ",
+            "head_sha: \"<sha>\")`. It returns the reviews whose `commit_id` is ",
+            "exactly this head.\n",
+            "4. **Skip if verdict is already recorded.** In the array already in ",
+            "hand, if an entry has `carries_verdict_line: true`, skip.\n",
+        );
+        assert_eq!(
+            clauses_absentes(
+                "qa-review-webhook-success",
+                apres_2934,
+                CLAUSES_DE_LA_TETE_JUGEE[0].1,
+            ),
+            vec!["head_first_seen_at", "dropped_predating_head"],
+            "le détecteur doit voir l'absence du repère temporel sur un prompt \
+             qui porte par ailleurs toute la lecture de mika#2934 — sinon il ne \
+             distingue pas mika#2939 de son antécédent"
         );
 
         // Auto-nettoyage : une exception dont la clause est revenue dans son
