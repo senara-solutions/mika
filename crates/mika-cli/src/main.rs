@@ -431,6 +431,12 @@ async fn main() -> Result<()> {
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
         Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
+        // mika#2922 — le chemin supporté vers le registre des verdicts de vol.
+        // Adaptateur mince : l'analyse des termes et l'écriture vivent dans
+        // `mika_agent::flight_verdict_ledger`, écrivain unique du `tool_name`.
+        Some(Commands::FlightVerdicts(args)) => {
+            commands::flight_verdicts::run(args, &agent_name).await
+        }
         Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
         Some(Commands::Dashboard(args)) => commands::dashboard::run(args.command).await,
         Some(Commands::Provider(args)) => commands::provider::run(args, &agent_name).await,

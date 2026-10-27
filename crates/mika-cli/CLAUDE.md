@@ -8,7 +8,19 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 ## Subcommands
 
-`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`.
+`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`, `flight-verdicts`.
+
+### `mika flight-verdicts judge` (mika#2922, vol 2/3)
+
+`mika flight-verdicts judge --task-id <ID> --issue <TERME> [--cause <TERME>] --recommendation <TERME> [--note <TEXTE>]` — inscrire le jugement de MPC sur un vol, sous la **même clé** (`tasks.id`) que le verdict du manager. C'est le « chemin supporté, jamais du SQL à la main » que le ticket exige ; le contrat de la ligne écrite est dans `crates/mika-agent/CLAUDE.md` § *Audit Log* → `tool_name = 'mpc_flight_judgment'`.
+
+**Adaptateur mince.** `commands/flight_verdicts.rs` analyse les trois termes par `parse_judgment_terms`, inscrit par `record_mpc_judgment`, et rend ce qui s'est passé. Aucune écriture d'audit, aucune recomposition de clé, aucune logique de domaine : l'écrivain unique du `tool_name` vit dans `mika_agent::flight_verdict_ledger`, et la garde d'unicité côté mika-agent est aveugle à ce crate — d'où `mika2922_ladaptateur_nest_pas_un_ecrivain` ici, avec son contrôle négatif.
+
+**Aucune table de graphies côté CLI.** Les termes acceptés sont ceux que serde écrit, et un terme hors contrat est refusé par l'analyseur **en nommant les valeurs acceptées**. Corollaire pour un futur éditeur : `--cause` est un `Option` libre, **sans `requires`** — « exigée avec `dead`, refusée ailleurs » est le contrat de `parse_judgment_terms`, et le redire en clap en ferait une seconde table divergente le jour où une quatrième issue porte une cause (classe mika#2158). `--task-id`, `--issue` et `--recommendation`, eux, sont exigés par clap : un jugement partiel n'a pas à atteindre la base.
+
+**L'analyse passe avant l'ouverture de la base**, donc un terme mal tapé est refusé sans connexion ouverte et sans ligne inscrite.
+
+**Un vol déjà jugé n'est pas rejugé, et la commande sort à 0** — un non-zéro sur une simple reprise casserait un rejeu scripté idempotent. Elle rend le jugement en place et, quand il diffère de celui proposé, le dit sans arbitrer : il n'y a aucun moyen d'écraser, et c'est l'opérateur qui sait lequel est le bon. Pas de `--format` : `judge` est un verbe d'écriture, comme `tasks cancel` et `tasks rearm`.
 
 ### `mika plan-callout` (mika#2194, three callers since mika#2608)
 
