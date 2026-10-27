@@ -1258,6 +1258,28 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Les lignes `audit_events` d'un `tool_name` écrites depuis `since`, avec
+    /// leur `created_at`. Enveloppe de
+    /// [`Database::list_audit_events_for_tool_since`] (mika#2922, vol 3).
+    ///
+    /// Contrairement à ses trois voisines ci-dessus, ce n'est pas un helper de
+    /// test : c'est la lecture de production du compte de concordance. Son
+    /// unique lecteur est `flight_verdict_ledger::read_concordance`, et
+    /// `mika2922_ac3_un_seul_lecteur_du_registre` en fait une assertion.
+    ///
+    /// `agent_id` est injecté par l'enveloppe, jamais passé par l'appelant.
+    pub async fn list_audit_events_for_tool_since(
+        &self,
+        tool_name: &str,
+        since: &str,
+    ) -> Result<Vec<crate::db::AuditEventWindowRow>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let sn = since.to_owned();
+        self.with_db(move |db| db.list_audit_events_for_tool_since(&a, &tn, &sn))
+            .await
+    }
+
     /// Test-only wrapper for [`Database::backdate_task_updated_at`] (mika#1712).
     /// Not for production use.
     #[doc(hidden)]

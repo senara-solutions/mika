@@ -1,5 +1,5 @@
 //! `mika flight-verdicts` — l'adaptateur du registre des verdicts de vol
-//! (mika#2922, vol 2/3).
+//! (mika#2922, vols 2 et 3).
 //!
 //! # Ce que ce module est
 //!
@@ -9,6 +9,17 @@
 //! aucune logique de domaine — ces trois gestes vivent dans
 //! `mika_agent::flight_verdict_ledger`, qui est l'écrivain unique du
 //! `tool_name` du jugement.
+//!
+//! Le vol 3 ajoute `concordance`, et la même minceur y tient : la lecture est
+//! [`read_concordance`], le rendu est [`render_concordance_text`], et cet
+//! adaptateur n'arbitre que la **forme** de sortie. Le lecteur unique des deux
+//! registres vit lui aussi dans `flight_verdict_ledger`, et pour la même raison
+//! de fond : ni l'écriture ni la lecture d'un `tool_name` ne peut vivre dans un
+//! crate à qui une garde interdit de le nommer.
+//!
+//! `concordance` porte `--format` et `judge` n'en porte pas : le premier est un
+//! verbe de **lecture**, qu'un script peut vouloir en JSON ; le second est un
+//! verbe d'écriture, comme `tasks cancel` et `tasks rearm`.
 //!
 //! La raison n'est pas l'élégance. La garde d'unicité d'écrivain
 //! (`mika2922_ac2_un_seul_ecrivain_du_jugement_de_mpc`) balaie le `src` de
@@ -37,10 +48,11 @@
 
 use anyhow::Result;
 use mika_agent::flight_verdict_ledger::{
-    MpcJudgmentOutcome, VerdictTerms, parse_judgment_terms, record_mpc_judgment,
+    MpcJudgmentOutcome, VerdictTerms, parse_judgment_terms, read_concordance, record_mpc_judgment,
+    render_concordance_text,
 };
 
-use crate::cli::{FlightVerdictsArgs, FlightVerdictsCommand};
+use crate::cli::{FlightVerdictsArgs, FlightVerdictsCommand, OutputFormat};
 use crate::init;
 
 pub async fn run(args: FlightVerdictsArgs, agent_name: &str) -> Result<()> {
@@ -88,6 +100,26 @@ pub async fn run(args: FlightVerdictsArgs, agent_name: &str) -> Result<()> {
                     }
                     println!();
                 }
+            }
+            Ok(())
+        }
+        FlightVerdictsCommand::Concordance { format } => {
+            let ctx = init::init_db_only_for_agent(agent_name)?;
+            let report = read_concordance(&ctx.async_db).await?;
+
+            match format {
+                // Le `Text` de cette commande est un **rendu**, et non la
+                // sortie de secours en JSON joli qu'emploie
+                // `commands/milestone.rs::emit` pour `read`/`assess` : le
+                // tableau à cinq colonnes est la surface humaine de ce verbe,
+                // il n'y en a pas d'autre ailleurs.
+                OutputFormat::Text => print!("\n{}", render_concordance_text(&report)),
+                // Le **même** type qu'en texte, sérialisé : un opérateur et un
+                // script lisent le même rapport. Le champ divergent y est un
+                // champ à part (`accord` + `field`), là où le texte le porte
+                // dans sa colonne « accord ».
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+                OutputFormat::Yaml => print!("{}", yaml_serde::to_string(&report)?),
             }
             Ok(())
         }

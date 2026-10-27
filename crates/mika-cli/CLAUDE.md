@@ -22,6 +22,18 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 **Un vol déjà jugé n'est pas rejugé, et la commande sort à 0** — un non-zéro sur une simple reprise casserait un rejeu scripté idempotent. Elle rend le jugement en place et, quand il diffère de celui proposé, le dit sans arbitrer : il n'y a aucun moyen d'écraser, et c'est l'opérateur qui sait lequel est le bon. Pas de `--format` : `judge` est un verbe d'écriture, comme `tasks cancel` et `tasks rearm`.
 
+### `mika flight-verdicts concordance` (mika#2922, vol 3/3)
+
+`mika flight-verdicts concordance [--format text|json|yaml]` — le compte de concordance manager / MPC, en **lecture seule**. C'est la commande que MPC présente à Vincent avant d'ouvrir `MIKA_MANAGER_EVALUATE_WRITE` : elle mesure le seuil de mika#2698 (*les mêmes verdicts que MPC sur 10 vols consécutifs ou 7 jours*), elle ne décide pas de l'ouverture.
+
+**Cinq colonnes, plus un en-tête.** `vol` (`tasks.id`, **non tronqué** : c'est ce que l'opérateur recolle dans `judge --task-id`), `ticket` (lu sur la ligne **du manager** — le `reasoning` de MPC porte une note libre, pas un numéro), `manager`, `MPC`, `accord`. L'en-tête donne le nombre de vols, la fenêtre en jours (`AUDIT_RETENTION_DAYS`) et « N vols consécutifs concordants », compté **du plus récent au plus ancien** : un concordant incrémente, un divergent arrête, un vol non jugé par MPC est sauté, un `after_value` illisible arrête. Les colonnes sont calculées sur le contenu, sans ellipse : une cellule tronquée effacerait précisément ce que la colonne `accord` vient de nommer.
+
+**Rien n'est inventé et rien n'est avalé.** Un vol que MPC n'a pas jugé est « non jugé par MPC » et ne compte ni pour ni contre (motif mika#2331). Un `after_value` illisible est **compté, nommé par un WARN, et rendu comme illisible** — jamais comme un désaccord. Les jugements de MPC orphelins (aucune ligne manager en face) sont **dits** dans l'en-tête, pas jetés.
+
+**L'asymétrie avec `judge` est délibérée, donc attestée par un test.** `concordance` porte `--format` parce qu'un script peut vouloir du JSON ; `judge` n'en porte pas parce que c'est un verbe d'écriture. Et le `Text` de cette commande est un **rendu**, pas une sortie de secours : le tableau *est* la surface humaine du verbe, et son défaut (contraste avec `commands/milestone.rs::emit`, qui rend du JSON joli sur son arm `Text` faute de surface humaine).
+
+**Adaptateur mince, deux gardes.** La lecture est `read_concordance` et le rendu `render_concordance_text`, tous deux dans `mika_agent::flight_verdict_ledger` ; ce crate n'arbitre que la forme de sortie. Aucune des quatre aiguilles de `mika2922_ladaptateur_nest_pas_un_ecrivain` n'apparaît dans l'arm — cette garde interdit à ce crate de **nommer** les deux `tool_name`, donc ni l'écriture ni la lecture ne peut y vivre. C'est la raison pour laquelle le lecteur n'est pas ici : enracinée côté CLI, la garde du lecteur unique (`mika2922_ac3_un_seul_lecteur_du_registre`, côté mika-agent) serait verte par construction (classe mika#2205).
+
 ### `mika plan-callout` (mika#2194, three callers since mika#2608)
 
 `mika plan-callout --body-file <path> [--raw]` — read the `Plan` callout of an issue body. It is the channel through which `dispatch-lib.sh` interrogates the repo's **single** reader of that callout ([`mika_agent::plan_callout`]) instead of carrying a second implementation in PCRE.

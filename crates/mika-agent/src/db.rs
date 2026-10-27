@@ -41,6 +41,18 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 56;
 #[doc(hidden)]
 pub type AuditEventRowTuple = (String, Option<String>, Option<String>, Option<String>);
 
+/// `(target_key, after_value, reasoning, created_at)` — forme rendue par
+/// [`Database::list_audit_events_for_tool_since`] et par son enveloppe async
+/// (mika#2922, vol 3).
+///
+/// Ce n'est **pas** [`AuditEventRowTuple`] avec une colonne de plus : celui-là
+/// est un helper de test `#[doc(hidden)]` sans borne basse, celui-ci est une
+/// lecture de production fenêtrée. `before_value` n'y est pas — le registre des
+/// verdicts de vol l'écrit toujours `NULL` — et `created_at` y est, parce que
+/// l'ordre des vols du plus récent au plus ancien est ce que le compte de
+/// concordance mesure.
+pub type AuditEventWindowRow = (String, Option<String>, Option<String>, String);
+
 /// One pending retention returned by [`Database::list_pending_audit_holds`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAuditHold {
@@ -2165,6 +2177,69 @@ impl Database {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Toutes les lignes `audit_events` d'un `tool_name` écrites depuis `since`,
+    /// avec leur `created_at` (mika#2922, vol 3).
+    ///
+    /// # Pourquoi une quatrième lecture et non l'une des trois voisines
+    ///
+    /// Les trois accesseurs par `tool_name` de ce fichier
+    /// ([`Self::count_audit_events_by_tool_name`],
+    /// [`Self::get_audit_event_target_keys_by_tool_name`],
+    /// [`Self::get_audit_event_rows_by_tool_name`]) sont des helpers
+    /// `#[doc(hidden)]` de mika#1712 : **aucun ne porte de borne basse et aucun
+    /// ne projette `created_at`**. Élargir le troisième aurait fait d'un helper
+    /// de test documenté comme tel une lecture de production, sur ~25 sites
+    /// d'appel. [`Self::latest_audit_event_for_target`], elle, projette bien
+    /// `created_at` mais est clouée à **un** `target_key` : elle ne peut pas
+    /// énumérer une fenêtre. Celle-ci n'est donc pas `#[doc(hidden)]`.
+    ///
+    /// # Les deux choix de la requête
+    ///
+    /// `created_at > ?3`, borne **exclusive**, comme les trois autres lectures
+    /// fenêtrées de ce fichier ([`Self::count_recent_audit_events_for_target`],
+    /// [`Self::count_recent_audit_events_by_value`],
+    /// [`Self::latest_audit_event_for_target`]). Une quatrième fenêtre dont la
+    /// borne serait inclusive serait une seconde graphie pour une seule
+    /// grammaire, c'est-à-dire la divergence programmée de mika#2158 : elle ne
+    /// se verrait que sur la ligne écrite exactement à la seconde de la borne,
+    /// donc jamais en test et une fois en production. `since` doit être un
+    /// instant ISO 8601 UTC (`%Y-%m-%dT%H:%M:%SZ`) ; la comparaison de chaînes
+    /// est correcte parce que le format de la colonne est à largeur fixe.
+    ///
+    /// `ORDER BY id` et **non** `ORDER BY created_at` : la colonne est un TEXT
+    /// ISO 8601 à la seconde, donc deux lignes d'un même cycle peuvent être
+    /// à égalité, et `id` est le seul ordre total que la table offre. C'est la
+    /// même raison qui fait le `id DESC` de
+    /// [`Self::latest_audit_event_for_target`].
+    ///
+    /// `after_value` et `reasoning` remontent en `Option<String>`, ce que les
+    /// colonnes sont. Un NULL ramené à `""` serait indistinguable d'une ligne
+    /// qui en porte un vide — règle « `null` n'est jamais `0` » de mika#2331.
+    pub fn list_audit_events_for_tool_since(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        since: &str,
+    ) -> Result<Vec<AuditEventWindowRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT target_key, after_value, reasoning, created_at
+             FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2 AND created_at > ?3
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, tool_name, since], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
