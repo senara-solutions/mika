@@ -990,4 +990,138 @@ mod tests {
             "la ligne parquée porte le texte de l'envoi, et seulement lui"
         );
     }
+
+    // ---- mika#2935 / R4 — le parquage n'a qu'un site de production ---------
+
+    /// Fichiers dispensés du détecteur de parquage unique. LIVRÉE VIDE, et
+    /// c'est le contrat. `(chemin relatif à `src/`, ticket de suivi)`.
+    const PARKING_SITE_ALLOWLIST: &[(&str, &str)] = &[];
+
+    /// L'aiguille : un **appel** de `save_failed_send`, pas sa définition.
+    const PARKING_NEEDLE: &str = ".save_failed_send(";
+
+    /// Hors périmètre, et ce n'est **pas** une exception (mika#2935).
+    ///
+    /// - `messaging.rs` est le propriétaire autorisé : le fichier qui porte le
+    ///   seul site de parquage, et ce détecteur.
+    /// - `db.rs` porte la définition et `async_db.rs` le délégué vers le fil
+    ///   DB. Ces deux-là *sont* la méthode ; les compter reviendrait à déclarer
+    ///   le type en violation de lui-même. (`db.rs` n'écrit aujourd'hui
+    ///   `pub fn save_failed_send(`, que l'aiguille ne reconnaît pas — la
+    ///   déclarer ici rend le périmètre indépendant de cette orthographe.)
+    ///
+    /// La distinction compte : une exclusion de périmètre décrit ce que le
+    /// détecteur **mesure**, une exception décrit une dette qu'il **tolère**.
+    const PARKING_SCOPE_EXCLUSIONS: &[&str] = &["messaging.rs", "db.rs", "async_db.rs"];
+
+    /// `true` si `src`, lu comme la production de `path`, parque une ligne
+    /// `failed_sends` alors que ce n'est pas son rôle (mika#2935).
+    ///
+    /// Extrait du test porteur pour que le contrôle de bonne foi puisse le
+    /// nourrir d'une source synthétique sans écrire sur le disque — une
+    /// allowlist vide au-dessus d'un scan qui ne voit rien serait verte pour la
+    /// mauvaise raison.
+    fn is_unexpected_parker(path: &std::path::Path, src: &str) -> bool {
+        if crate::source_scan::is_test_source_path(path) {
+            return false;
+        }
+        let rel = path.to_string_lossy().replace('\\', "/");
+        if PARKING_SCOPE_EXCLUSIONS.contains(&rel.as_str()) {
+            return false;
+        }
+        if PARKING_SITE_ALLOWLIST.iter().any(|(p, _)| *p == rel) {
+            return false;
+        }
+        let prod = crate::source_scan::production_half(src);
+        crate::source_scan::strip_comment_lines(prod).contains(PARKING_NEEDLE)
+    }
+
+    /// La correction de mika#2935 est locale ; la classe ne l'est pas. Un futur
+    /// site qui parque de son côté — ou qui rebranche le flush sur `send` —
+    /// réinstalle le défaut sans rougir aucune assertion de comportement.
+    #[test]
+    fn mika2935_le_parquage_a_un_seul_site() {
+        let files = crate::source_scan::production_files();
+        assert!(
+            files.len() > 50,
+            "le parcours de `src/` n'a rendu que {} fichiers : un scan qui ne \
+             trouve plus rien doit être rouge, pas vert",
+            files.len()
+        );
+
+        let coupables: Vec<String> = files
+            .iter()
+            .filter(|(rel, prod)| is_unexpected_parker(std::path::Path::new(rel), prod))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+
+        assert!(
+            coupables.is_empty(),
+            "ces fichiers de production parquent une ligne `failed_sends` alors \
+             que `send_with_severity` est le site unique : {coupables:?}. Un \
+             second site rouvre exactement mika#2935 — la ligne ratée est \
+             conservée par son propriétaire ET recréée par le transport, avec \
+             un préfixe de plus à chaque passe. Retirez le second site, ne \
+             l'allowlistez pas : routez-le par `send_with_severity`, ou passez \
+             par `try_deliver_with_severity` si l'appelant possède déjà sa ligne."
+        );
+    }
+
+    /// L'assertion auto-nettoyante de la Fire-Disposition (mika#2309) :
+    /// l'exception expire par le geste qui la rend inutile.
+    #[test]
+    fn mika2935_lallowlist_du_parqueur_unique_est_livree_vide_et_le_reste() {
+        assert!(
+            PARKING_SITE_ALLOWLIST.is_empty(),
+            "Une entrée a été ajoutée ici. Un second site de parquage rouvre \
+             exactement mika#2935 : la ligne ratée est conservée par son \
+             propriétaire ET recréée par le transport, avec un préfixe de plus \
+             à chaque passe. Route le site par `send_with_severity`, ou ouvre \
+             un ticket de suivi et nomme-le dans l'entrée."
+        );
+    }
+
+    /// Le contrôle de bonne foi : le détecteur rougit bel et bien sur un second
+    /// parqueur, et reste muet sur une fixture de test (mika#2935).
+    ///
+    /// Sans lui, `mika2935_le_parquage_a_un_seul_site` serait vert aussi bien
+    /// parce qu'il n'y a qu'un site que parce qu'il ne sait pas en voir deux.
+    #[test]
+    fn mika2935_le_detecteur_rougit_sur_un_second_parqueur() {
+        let second_parqueur = "\
+async fn flush(db: &AsyncDatabase, text: &str) {
+    let _ = db.save_failed_send(text, None).await;
+}
+";
+
+        // Un chemin de production réel — celui du flush, qui est précisément
+        // l'endroit où le second site vivait avant R3.
+        let prod = std::path::Path::new("server/handlers.rs");
+        assert!(
+            is_unexpected_parker(prod, second_parqueur),
+            "le détecteur ne voit pas un second site de parquage : \
+             `mika2935_le_parquage_a_un_seul_site` est décoratif"
+        );
+
+        // La même source sous un chemin de test : une fixture pose
+        // légitimement l'aiguille, et l'accuser rougirait sur du code sain.
+        assert!(
+            !is_unexpected_parker(
+                std::path::Path::new("server/tests/flush_fixtures.rs"),
+                second_parqueur
+            ),
+            "une fixture de test n'est pas un site de parquage de production"
+        );
+        assert!(
+            !is_unexpected_parker(std::path::Path::new("server/tests.rs"), second_parqueur),
+            "un `tests.rs` isolé non plus (mika#2321)"
+        );
+
+        // Et le propriétaire autorisé reste hors de cause, par périmètre.
+        assert!(
+            !is_unexpected_parker(std::path::Path::new("messaging.rs"), second_parqueur),
+            "`messaging.rs` porte le site unique : c'est une exclusion de \
+             périmètre, pas une exception"
+        );
+    }
 }
