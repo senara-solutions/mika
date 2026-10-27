@@ -1,14 +1,28 @@
-//! Le registre des verdicts de vol du manager (mika#2922, vol 1/2).
+//! Le registre des verdicts de vol (mika#2922, vols 1 et 2).
 //!
 //! # Ce que ce module est, et ce qu'il n'est pas encore
 //!
-//! Il inscrit le verdict de l'évaluateur — une ligne `audit_events` par vol et
-//! par cycle qui le juge pour la **première** fois. Au vol 1 **personne ne
-//! lit** : c'est la forme du vol 2 de mika#2917, que le ticket désigne comme le
-//! patron à reprendre. Le jugement de MPC et le compte de concordance arrivent
-//! au vol 2, avec leur propre `tool_name` — [`MANAGER_FLIGHT_VERDICT_TOOL`] est
-//! le seul déclaré ici, parce qu'une constante que personne n'écrit ferait une
-//! garde d'écrivain unique verte par construction.
+//! Il inscrit **les deux côtés de la mesure**, sous la même clé et chacun sous
+//! son `tool_name` :
+//!
+//! - le verdict de l'évaluateur ([`MANAGER_FLIGHT_VERDICT_TOOL`], vol 1) — une
+//!   ligne par vol et par cycle qui le juge pour la **première** fois, écrite
+//!   par [`write_and_swallow`] ;
+//! - le jugement de MPC ([`MPC_FLIGHT_JUDGMENT_TOOL`], vol 2) — une ligne par
+//!   vol, inscrite par un geste d'opérateur qui passe par
+//!   [`record_mpc_judgment`], jamais par du SQL à la main.
+//!
+//! C'est la forme du vol 2 de mika#2917, que le ticket désigne comme le patron à
+//! reprendre : un `tool_name` par écrivain, un seul écrivain par `tool_name`,
+//! aucune table et aucune migration.
+//!
+//! **Personne ne lit encore.** Le compte de concordance — celui qui met les deux
+//! côtés en face et rend « N vols consécutifs concordants » — est le vol 3. Il
+//! n'y a donc aucune garde de lecteur unique dans ce fichier : une garde sans
+//! lecteur serait verte par construction, ce qui est précisément la classe
+//! mika#2205. Les deux constantes déclarées ici sont en revanche l'une et
+//! l'autre **écrites** par ce module, donc leurs gardes d'écrivain unique
+//! mordent.
 //!
 //! # La forme de la ligne
 //!
@@ -28,6 +42,22 @@
 //! [`VerdictRecord`] les porte tels quels. Une grammaire `k=v;k=v` inventée ici
 //! serait un second vocabulaire à tenir en phase avec trois `enum` — la
 //! divergence programmée de mika#2158.
+//!
+//! Le jugement de MPC porte la **même** grammaire sous la **même** clé :
+//!
+//! ```text
+//! tool_name   = MPC_FLIGHT_JUDGMENT_TOOL
+//! session_id  = MPC_FLIGHT_JUDGMENT_SESSION_ID
+//! target_key  = le MÊME tasks.id
+//! after_value = JSON serde de VerdictRecord { issue, recommendation }
+//! before_value= NULL
+//! reasoning   = la note libre de l'opérateur, ou NULL
+//! ```
+//!
+//! `reasoning` diverge délibérément d'un côté à l'autre : le manager y porte
+//! `issue_number=<n>`, MPC une note libre. Le compte de concordance lira donc le
+//! ticket d'un vol sur la ligne **du manager** seule — un `reasoning` est une
+//! donnée et jamais une clé, de ce côté-ci non plus.
 //!
 //! # Pourquoi là, et pas sous `src/milestone_manager/`
 //!
@@ -58,7 +88,7 @@
 //!
 //! # L'idempotence est une lecture, pas un `UNIQUE`
 //!
-//! Avant d'écrire, [`write_and_swallow`] demande
+//! Avant d'écrire, [`write_and_swallow`] et [`record_mpc_judgment`] demandent
 //! `count_recent_audit_events_for_target` sur une fenêtre de
 //! [`AUDIT_RETENTION_DAYS`]. Au-delà de la rétention la ligne n'existe plus :
 //! « jamais inscrit » et « inscrit hors rétention » sont la même population, et
@@ -96,6 +126,14 @@
 //!   `post_flight_verdicts`. Le garde `Handle::try_current()` disparaît donc
 //!   avec le `spawn` qu'il protégeait.
 //!
+//! **[`record_mpc_judgment`] fait exactement l'inverse, et pour la raison
+//! inverse.** Elle rend un `Result`, parce que son appelant est une commande
+//! d'opérateur : avaler l'échec y dirait « inscrit » à quelqu'un qui n'a rien
+//! inscrit, et le jugement serait perdu sans que personne le sache. Le cycle de
+//! cadence, lui, n'a aucun geste de repli à offrir — il juge, il n'attend pas.
+//! La règle n'est donc pas « un audit n'échoue jamais bruyamment » mais *l'échec
+//! va là où quelqu'un peut en faire quelque chose*.
+//!
 //! # Rien n'est derrière l'interrupteur, et c'est tout le ticket
 //!
 //! L'interrupteur du geste sur la forge — `verdict_poster::ENV_EVALUATE_WRITE` —
@@ -113,8 +151,10 @@
 
 use std::sync::Arc;
 
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use tracing::warn;
 
 use crate::async_db::AsyncDatabase;
@@ -145,6 +185,32 @@ pub const MANAGER_FLIGHT_VERDICT_TOOL: &str = "manager_flight_verdict";
 /// session sans rapport et de faire passer la ligne pour le produit d'un tour.
 /// Même raisonnement que `AUTH_BOUNDARY_SESSION_ID`.
 pub const MANAGER_FLIGHT_VERDICT_SESSION_ID: &str = "manager-flight-verdict";
+
+/// `audit_events.tool_name` du jugement de MPC sur un vol (mika#2922, vol 2).
+///
+/// **La même clé, un `tool_name` distinct.** `target_key` est le même `tasks.id`
+/// que la ligne du manager — c'est ce qui permet de mettre les deux côtés en
+/// face — et le `tool_name` diffère, c'est ce qui interdit de les confondre. Un
+/// `tool_name` partagé avec un champ « côté » dans `after_value` rendrait les
+/// deux populations non soustractibles (classe mika#2205) et ferait de
+/// l'idempotence de chaque côté celle de l'autre.
+///
+/// **SOLE WRITER** : [`record_mpc_judgment`], dans ce fichier, et le seul chemin
+/// supporté pour l'atteindre est la sous-commande `mika flight-verdicts judge`.
+/// `mika2922_ac2_un_seul_ecrivain_du_jugement_de_mpc` en fait une assertion
+/// d'ensemble exact. Quand cet ensemble grandit, le remède est de router
+/// l'écriture par [`record_mpc_judgment`] — il n'y a pas d'allowlist à amender
+/// (doctrine mika#2201).
+///
+/// **Lecteur** : aucun dans ce vol ; le compte de concordance au vol 3.
+pub const MPC_FLIGHT_JUDGMENT_TOOL: &str = "mpc_flight_judgment";
+
+/// `session_id` porté par chaque ligne de jugement.
+///
+/// Même raisonnement que [`MANAGER_FLIGHT_VERDICT_SESSION_ID`] : un jugement
+/// d'opérateur sur un vol n'appartient à aucune conversation, et une constante
+/// bien connue le dit au lieu d'emprunter une session sans rapport.
+pub const MPC_FLIGHT_JUDGMENT_SESSION_ID: &str = "mpc-flight-judgment";
 
 /// Ce qu'une ligne du registre porte : l'issue du vol et la recommandation.
 ///
@@ -406,6 +472,265 @@ pub async fn record_if_wired(
         Some(l) => Some(l.record(verdicts).await),
         None => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Le jugement de MPC (vol 2) : l'analyse des termes, puis l'inscription.
+// ---------------------------------------------------------------------------
+
+/// Les termes d'issue qu'un jugement peut porter, dans l'ordre du ticket.
+///
+/// Les graphies sont demandées à [`issue_term`] — le site unique déjà épinglé
+/// sur serde par `mika2922_les_termes_sont_les_litteraux_serde` — et non
+/// retapées. Une seconde table de littéraux ici serait verte le jour où une
+/// variante est renommée en amont : c'est exactement la divergence programmée de
+/// mika#2158.
+fn judgeable_issue_terms() -> Vec<&'static str> {
+    [
+        FlightIssue::PrOpened {
+            number: None,
+            url: None,
+        },
+        FlightIssue::RescuePr {
+            number: None,
+            url: None,
+        },
+        FlightIssue::Dead {
+            cause: DeathCause::Refusal,
+        },
+    ]
+    .iter()
+    .map(issue_term)
+    .collect()
+}
+
+/// Le terme de l'issue qui **porte** une cause, demandé à [`issue_term`] plutôt
+/// qu'écrit en dur : une cause est exigée pour celle-là et refusée pour les
+/// autres, et ce test ne doit pas être un quatrième endroit où le mot est tapé.
+fn dead_issue_term() -> &'static str {
+    issue_term(&FlightIssue::Dead {
+        cause: DeathCause::Refusal,
+    })
+}
+
+/// Les termes de cause qu'un jugement peut porter : les cinq causes **classées**.
+///
+/// [`DeathCause::Unknown`] n'est délibérément pas offerte. C'est ce que le
+/// manager écrit quand il ne **sait pas** classer une halte, en portant le jeton
+/// qu'il a vu ; un opérateur qui juge sait, et un « inconnu » saisi à la main ne
+/// se comparerait à rien. Son refus n'est pas une vérification : il est
+/// structurel, parce que la forme serde d'une variante newtype est un objet
+/// (`{"unknown":"<jeton>"}`) et jamais un terme nu, donc aucune valeur de
+/// `--cause` ne peut la produire. `mika2922_un_jugement_ne_porte_pas_dinconnu`
+/// l'atteste.
+fn judgeable_cause_terms() -> Vec<String> {
+    [
+        DeathCause::CeilingReached,
+        DeathCause::Refusal,
+        DeathCause::PipelineFailure,
+        DeathCause::LauncherDead,
+        DeathCause::Escalated,
+    ]
+    .iter()
+    .map(cause_term)
+    .collect()
+}
+
+/// Les termes de recommandation qu'un jugement peut porter. Même geste que
+/// [`judgeable_issue_terms`] : les graphies viennent de [`recommendation_term`].
+fn judgeable_recommendation_terms() -> Vec<&'static str> {
+    [
+        FlightRecommendation::MergeCandidate,
+        FlightRecommendation::ManualResumption,
+        FlightRecommendation::Regroom,
+    ]
+    .into_iter()
+    .map(recommendation_term)
+    .collect()
+}
+
+/// Analyser les trois termes d'un jugement d'opérateur — l'inverse **exact** de
+/// serde.
+///
+/// **Aucune table de correspondance n'est recopiée.** L'analyse bâtit la
+/// `Value` de la forme que `#[serde(rename_all = "snake_case")]` produit —
+/// `{"dead":{"cause":"refusal"}}`, `{"pr_opened":{"number":null,"url":null}}`,
+/// `"regroom"` — et la passe à `serde_json::from_value`. Conséquence voulue :
+/// une sixième cause de mort ajoutée à [`DeathCause`] est acceptée sans qu'une
+/// ligne bouge ici, et seule l'énumération du message de refus demande un geste
+/// (que [`judgeable_cause_terms`] rend visible).
+///
+/// `number` et `url` sont `null` : MPC juge un vol, il ne connaît pas la PR.
+/// « Pas d'URL » n'est pas une URL vide (motif mika#2331), et c'est pourquoi la
+/// comparaison du vol 3 passe par [`VerdictRecord::terms`] et non par l'égalité
+/// des lignes — voir le § *Pourquoi une projection* de [`VerdictTerms`].
+pub fn parse_judgment_terms(
+    issue: &str,
+    cause: Option<&str>,
+    recommendation: &str,
+) -> Result<VerdictRecord> {
+    Ok(VerdictRecord {
+        issue: parse_issue_term(issue, cause)?,
+        recommendation: parse_recommendation_term(recommendation)?,
+    })
+}
+
+fn parse_issue_term(issue: &str, cause: Option<&str>) -> Result<FlightIssue> {
+    let payload = if issue == dead_issue_term() {
+        let cause = cause.ok_or_else(|| {
+            anyhow!(
+                "--cause est exigée avec --issue {} ; valeurs acceptées : {}",
+                dead_issue_term(),
+                judgeable_cause_terms().join(" · ")
+            )
+        })?;
+        json!({ "cause": parse_cause_term(cause)? })
+    } else {
+        if cause.is_some() {
+            bail!(
+                "--cause ne s'applique qu'à --issue {} ; reçue avec « {issue} »",
+                dead_issue_term()
+            );
+        }
+        json!({ "number": null, "url": null })
+    };
+
+    // La forme externally tagged que serde attend : `{"<terme>": <charge>}`. La
+    // clé est le terme reçu tel quel, donc un terme inconnu échoue ici — c'est
+    // serde qui refuse, pas une liste tenue à la main.
+    let mut tagged = Map::new();
+    tagged.insert(issue.to_string(), payload);
+    serde_json::from_value(Value::Object(tagged)).map_err(|_| {
+        anyhow!(
+            "--issue inconnue « {issue} » ; valeurs acceptées : {}",
+            judgeable_issue_terms().join(" · ")
+        )
+    })
+}
+
+fn parse_cause_term(cause: &str) -> Result<DeathCause> {
+    serde_json::from_value(Value::String(cause.to_string())).map_err(|_| {
+        anyhow!(
+            "--cause inconnue « {cause} » ; valeurs acceptées : {}",
+            judgeable_cause_terms().join(" · ")
+        )
+    })
+}
+
+fn parse_recommendation_term(recommendation: &str) -> Result<FlightRecommendation> {
+    serde_json::from_value(Value::String(recommendation.to_string())).map_err(|_| {
+        anyhow!(
+            "--recommendation inconnue « {recommendation} » ; valeurs acceptées : {}",
+            judgeable_recommendation_terms().join(" · ")
+        )
+    })
+}
+
+/// Ce qu'une inscription de jugement a fait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MpcJudgmentOutcome {
+    /// La ligne vient d'être écrite.
+    Inscribed,
+    /// Une ligne existait déjà dans la fenêtre : rien n'est réécrit.
+    ///
+    /// `held` porte le jugement **en place**, parce qu'un simple « déjà là »
+    /// laisserait l'opérateur corriger à l'aveugle. Il vaut `None` quand la
+    /// ligne existe mais que son `after_value` ne se re-type pas : absent n'est
+    /// pas zéro (motif mika#2331), et un [`VerdictRecord`] fabriqué pour
+    /// combler serait un jugement inventé.
+    AlreadyRecorded { held: Option<VerdictRecord> },
+}
+
+/// Inscrire le jugement de MPC sur un vol, sous la même clé que le verdict du
+/// manager.
+///
+/// **SOLE WRITER de [`MPC_FLIGHT_JUDGMENT_TOOL`].** `note` est la note libre de
+/// l'opérateur et va dans `reasoning` : une donnée, jamais une clé de
+/// regroupement.
+///
+/// Les erreurs **se propagent**, contrairement à [`write_and_swallow`] — voir le
+/// § *`record` est `async`* de la doc de module. Il n'y a pas de verbe de
+/// correction dans ce vol : un vol déjà jugé rend
+/// [`MpcJudgmentOutcome::AlreadyRecorded`] avec ce qui est inscrit, et c'est
+/// tout.
+pub async fn record_mpc_judgment(
+    db: &AsyncDatabase,
+    task_id: &str,
+    record: &VerdictRecord,
+    note: Option<&str>,
+) -> Result<MpcJudgmentOutcome> {
+    let since = inscription_window_start();
+    let already = db
+        .count_recent_audit_events_for_target(MPC_FLIGHT_JUDGMENT_TOOL, task_id, &since)
+        .await
+        .with_context(|| {
+            format!("lecture d'idempotence du jugement de MPC sur le vol {task_id}")
+        })?;
+    if already > 0 {
+        return Ok(MpcJudgmentOutcome::AlreadyRecorded {
+            held: held_judgment(db, task_id, &since).await,
+        });
+    }
+
+    let after_value = serde_json::to_string(record)
+        .with_context(|| format!("sérialisation du jugement de MPC sur le vol {task_id}"))?;
+    db.log_audit_event(
+        MPC_FLIGHT_JUDGMENT_SESSION_ID,
+        MPC_FLIGHT_JUDGMENT_TOOL,
+        task_id,
+        None,
+        Some(&after_value),
+        note,
+        None,
+    )
+    .await
+    .with_context(|| format!("inscription du jugement de MPC sur le vol {task_id}"))?;
+    Ok(MpcJudgmentOutcome::Inscribed)
+}
+
+/// Le jugement déjà en place, ou `None` quand il est illisible.
+///
+/// Un échec de lecture ou un `after_value` qui ne se re-type pas rend `None`
+/// **sans** faire échouer l'appel : la propriété que l'appelant a demandée — ne
+/// pas réécrire — est tenue, et rendre une erreur ici ferait passer une
+/// idempotence réussie pour une inscription échouée. Le WARN est ce qui garde la
+/// perte visible.
+async fn held_judgment(db: &AsyncDatabase, task_id: &str, since: &str) -> Option<VerdictRecord> {
+    let row = match db
+        .latest_audit_event_for_target(MPC_FLIGHT_JUDGMENT_TOOL, task_id, since)
+        .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            warn_held_unreadable(task_id, "read", &e.to_string());
+            return None;
+        }
+    };
+    let after_value = match row {
+        Some((Some(after_value), _, _)) => after_value,
+        // La ligne est comptée mais sans `after_value` : il n'y a rien à rendre,
+        // et ce n'est pas une erreur de lecture.
+        _ => return None,
+    };
+    match serde_json::from_str(&after_value) {
+        Ok(record) => Some(record),
+        Err(e) => {
+            warn_held_unreadable(task_id, "deserialize", &e.to_string());
+            None
+        }
+    }
+}
+
+/// WARN, et non ERROR : l'idempotence a tenu, seule la restitution est perdue.
+fn warn_held_unreadable(task_id: &str, stage: &str, error: &str) {
+    warn!(
+        target: "mika::flight_verdict_ledger",
+        event = "mpc_judgment_held_unreadable",
+        task_id = %task_id,
+        stage = stage,
+        error = error,
+        "le jugement déjà inscrit n'a pas pu être rendu — il reste inscrit"
+    );
 }
 
 #[cfg(test)]
