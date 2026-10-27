@@ -1,0 +1,84 @@
+[
+  {
+    "body": "> - **Branch:** `fix/2886/manager-l-valuateur-de-vols-lit-la-t-che`\n> - **Plan:** `docs/plans/2026-10-23-001-fix-2886-manager-levaluateur-de-vols-lit-lissue-du-pilote-plan.md` (committed on branch @ `8dfc386c`)\n> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: bf404dd2-db3d-4294-b855-261b2deb462e",
+    "closedByPullRequestsReferences": [
+      {
+        "id": "PR_kwDORWsgGM8AAAABKOAvjQ",
+        "number": 2892,
+        "repository": {
+          "id": "R_kgDORWsgGA",
+          "name": "mika",
+          "owner": {
+            "id": "O_kgDODXsPEA",
+            "login": "senara-solutions"
+          }
+        },
+        "url": "https://github.com/senara-solutions/mika/pull/2892"
+      }
+    ],
+    "labels": [
+      {
+        "color": "d73a4a",
+        "description": "Something isn't working",
+        "id": "LA_kwDORWsgGM8AAAACZCqVJA",
+        "name": "bug"
+      },
+      {
+        "color": "fbca04",
+        "description": "Normal priority — fix in regular cycle",
+        "id": "LA_kwDORWsgGM8AAAACaemMFg",
+        "name": "p2-normal"
+      },
+      {
+        "color": "1d76db",
+        "description": "PR opened by hand in an interactive session (mika#2026)",
+        "id": "LA_kwDORWsgGM8AAAACy4Bf5g",
+        "name": "origin:manual"
+      },
+      {
+        "color": "5319e7",
+        "description": "Substrat de la boucle autonome (pipeline, executor, feeder, dispatch, hygiène)",
+        "id": "LA_kwDORWsgGM8AAAAC3lmt6Q",
+        "name": "loop-substrate"
+      }
+    ],
+    "number": 2886,
+    "state": "CLOSED",
+    "title": "fix(manager): l'évaluateur de vols lit la tâche parente ready-label, jamais l'issue du pilote — 531/531 vols classés morts (bloque mika#2698)",
+    "updatedAt": "2026-10-23T15:00:25Z"
+  },
+  {
+    "body": "> - **Dormeur (2026-09-01) :** la branche `fix/1680/mika-dev-tui-broken-glyph-rendering-in` est **184 commits derrière `origin/main`**. Chaque dispatch meurt en `STATUS=REBASE_CONFLICT` avant d''atteindre le pilote — 42 dispatches perdus en 24 h sur ce motif, à concurrence 1.\n> - **Condition de réveil :** quand `git rev-list --count origin/fix/1680/mika-dev-tui-broken-glyph-rendering-in..origin/main` rend **0** — c''est-à-dire quand la branche est rebasée sur `origin/main`, ou remplacée par une branche de grooming fraîche.\n>",
+    "closedByPullRequestsReferences": [],
+    "labels": [
+      {
+        "color": "d73a4a",
+        "description": "Something isn't working",
+        "id": "LA_kwDORWsgGM8AAAACZCqVJA",
+        "name": "bug"
+      },
+      {
+        "color": "fbca04",
+        "description": "Normal priority — fix in regular cycle",
+        "id": "LA_kwDORWsgGM8AAAACaemMFg",
+        "name": "p2-normal"
+      },
+      {
+        "color": "1d76db",
+        "description": "Agent loop, tools, prompt assembly, memory",
+        "id": "LA_kwDORWsgGM8AAAACaemMeg",
+        "name": "agent-core"
+      },
+      {
+        "color": "b60205",
+        "description": "Not dispatchable until something outside the ticket changes. Feeder exclusion.",
+        "id": "LA_kwDORWsgGM8AAAACzNYxRQ",
+        "name": "blocked"
+      }
+    ],
+    "number": 1680,
+    "state": "CLOSED",
+    "title": "fix(mika-dev,tui): broken-glyph rendering in webhook dispatch summary — likely glm-5.2 non-ASCII output bleed",
+    "updatedAt": "2026-09-03T07:16:45Z"
+  }
+]

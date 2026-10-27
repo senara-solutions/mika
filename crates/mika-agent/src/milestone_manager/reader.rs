@@ -12,7 +12,8 @@
 use super::plan_size;
 use super::pool::{PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause};
 use super::types::{
-    CiState, IssueState, MilestoneRef, MilestoneState, ProgressCounts, RecentActivity, SubIssue,
+    CiState, IssueState, MilestoneRef, MilestoneState, PrLinkSource, ProgressCounts,
+    RecentActivity, SubIssue,
 };
 use crate::auto_pull::extract_branch_name;
 use crate::plan_callout::{FenceHandling, plan_callout};
@@ -162,6 +163,16 @@ impl Reader {
             .await?;
 
         // 2. Sub-issue enumeration (issues attached to this milestone).
+        //
+        //    `closedByPullRequestsReferences` est la référence de clôture que
+        //    GitHub tient **côté issue** (mika#2924). Elle est demandée ici, sur
+        //    une lecture déjà émise, parce que le milestone est rattaché au
+        //    ticket et jamais à la PR : la liste des PR du milestone (appel 3)
+        //    ne voit aucune PR de la boucle autonome, et 87 tickets fermés du
+        //    milestone 33 rendaient `closed (no linked PR)` dont 73 avaient une
+        //    PR de clôture. Le coût en appels `gh` par cycle est **inchangé** —
+        //    mesuré le 2026-10-26 sur le dépôt réel : 1 appel avant, 1 après
+        //    (1,639 s → 1,795 s).
         let issues_json = runner
             .run(&[
                 "issue",
@@ -173,7 +184,7 @@ impl Reader {
                 "--state",
                 "all",
                 "--json",
-                "number,title,state,body,labels,updatedAt",
+                "number,title,state,body,labels,updatedAt,closedByPullRequestsReferences",
                 "--limit",
                 "100",
             ])
@@ -762,11 +773,61 @@ pub fn compose_from_gh_outputs(
         let branch_present = branch_callout_present(&body);
         let blockers = extract_blockers(&body);
         let priority_rank = priority_from_labels(&labels);
-        let (pr_number, pr_state, ci_state) = pr_by_issue
-            .get(&number)
-            .cloned()
-            .map(|(n, s, c)| (Some(n), Some(s), c))
-            .unwrap_or((None, None, CiState::None));
+        // La PR de clôture, et **d'où** on la tient (mika#2924).
+        //
+        // L'index des PR du milestone passe en premier et reste inchangé : il
+        // est le seul porteur de `pr_state` et de `ci_state`, dont dépendent
+        // `is_in_flight()`, le palier 1 de `pick_next_action`, `is_hard_blocked()`
+        // et surtout `detect_silent_progress`, qui exige
+        // `state == Open && pr_state == Some("merged")`.
+        // La référence côté issue ne vient **qu'en comblement** : c'est une
+        // union, pas un remplacement. Elle répond pour les PR que la boucle
+        // produit — le pilote rattache le milestone au ticket, jamais à la PR,
+        // donc l'index ci-dessus est vide pour elles — mais elle ne dit rien de
+        // l'état de la PR ni de sa CI, et les deviner serait affirmer une mesure
+        // qui n'a pas eu lieu (mika#2331).
+        let mut pr_number: Option<u64> = None;
+        let mut pr_state: Option<String> = None;
+        let mut pr_url: Option<String> = None;
+        let mut pr_link_source: Option<PrLinkSource> = None;
+        let mut ci_state = CiState::None;
+        if let Some((n, s, c)) = pr_by_issue.get(&number).cloned() {
+            pr_number = Some(n);
+            pr_state = Some(s);
+            ci_state = c;
+            // Posé même ici, où la provenance pourrait se déduire de la seule
+            // présence d'un numéro : sans ça, `None` voudrait dire à la fois
+            // « liste du milestone » et « blob d'un binaire antérieur », et la
+            // sonde AC3 ne pourrait plus séparer les deux (mika#2340).
+            pr_link_source = Some(PrLinkSource::MilestonePrList);
+        } else if let Some(r) = issue
+            .get("closedByPullRequestsReferences")
+            .and_then(|v| v.as_array())
+            // Première entrée retenue, comme l'index ci-dessus : un ticket peut
+            // être fermé par plusieurs PR (un vol en deux temps), et un choix
+            // dépendant de l'ordre de la page rendrait deux rapports différents
+            // sur le même état.
+            .and_then(|a| a.first())
+        {
+            // Les **deux** champs sont exigés, et le numéro seul ne suffit pas :
+            // la référence peut porter une PR d'un autre dépôt, et recomposer
+            // `{repo}/pull/{n}` rendrait alors un lien vers une PR qui n'existe
+            // pas — plus difficile à démentir qu'une absence de lien. Sans `url`
+            // la ligne garde donc son `closed (no linked PR)`, qui est vrai de ce
+            // que l'on sait.
+            if let (Some(n), Some(url)) = (
+                r.get("number").and_then(|v| v.as_u64()),
+                r.get("url").and_then(|v| v.as_str()),
+            ) {
+                pr_number = Some(n);
+                pr_url = Some(url.to_string());
+                pr_link_source = Some(PrLinkSource::IssueClosingRef);
+                // `pr_state` et `ci_state` restent volontairement vides : ce
+                // chemin n'a pas vu la PR. `detect_silent_progress` exige
+                // `pr_state == Some("merged")` et doit continuer de ne le tenir
+                // que de la liste du milestone.
+            }
+        }
 
         sub_issues.push(SubIssue {
             number,
@@ -777,6 +838,8 @@ pub fn compose_from_gh_outputs(
             branch_present,
             pr_number,
             pr_state,
+            pr_url,
+            pr_link_source,
             ci_state,
             blockers,
             updated_at: updated_at.clone(),
@@ -1186,6 +1249,285 @@ mod tests {
         assert_eq!(closed.pr_number, Some(1929));
     }
 
+    /// La sortie `gh` réellement capturée sur le milestone 33 le 2026-10-26,
+    /// filtrée sur les deux contrôles de l'AC1 de mika#2924. Les deux vivent
+    /// dans le **même** document, parce que c'est ainsi qu'ils arrivent en
+    /// production — le composeur ne lit pas deux fichiers. Provenance, commande
+    /// de capture et fidélités : `tests/fixtures/mika2924/README.md`.
+    const FIXTURE_MILESTONE_33: &str =
+        include_str!("../../tests/fixtures/mika2924/issues-milestone-33.json");
+
+    /// mika#2924 R2/R3 — la situation de **production**, celle qui a produit les
+    /// 87 lignes `closed (no linked PR)` : la liste des PR du milestone est
+    /// vide, parce que le pilote rattache le milestone au ticket et jamais à la
+    /// PR. La référence de clôture côté issue comble alors le trou.
+    ///
+    /// Les deux contrôles de l'AC1 sont dans ce test, sur le même document :
+    /// #2886 fermé par #2892 (contrôle positif) et #1680 fermé à la main,
+    /// `closedByPullRequestsReferences` à `[]` (contrôle négatif). Sans le
+    /// second, un lecteur qui peuplerait `pr_number` pour tout ticket fermé
+    /// passerait le premier.
+    #[test]
+    fn mika2924_la_reference_cote_issue_comble_lindex_vide_du_milestone() {
+        let milestone_json = r#"{"title": "M33", "description": "sink", "state": "open", "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        // `[]` : aucune PR de la boucle n'est rattachée au milestone.
+        let state =
+            compose_from_gh_outputs(&r, milestone_json, FIXTURE_MILESTONE_33, "[]").unwrap();
+
+        let s2886 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 2886)
+            .expect("#2886 présent dans l'énumération");
+        assert_eq!(s2886.state, IssueState::Closed);
+        assert_eq!(s2886.pr_number, Some(2892));
+        // L'URL est celle que la référence porte, jamais une recomposition :
+        // l'entrée porte un objet `repository` imbriqué, donc elle peut nommer
+        // un autre dépôt (R3).
+        assert_eq!(
+            s2886.pr_url.as_deref(),
+            Some("https://github.com/senara-solutions/mika/pull/2892")
+        );
+        assert_eq!(s2886.pr_link_source, Some(PrLinkSource::IssueClosingRef));
+        // Ce chemin ne porte ni l'état de la PR ni celui de la CI — la
+        // référence côté issue ne les transporte pas, et les inventer serait
+        // rendre deux populations en octets identiques (mika#2205).
+        assert_eq!(s2886.pr_state, None);
+        assert_eq!(s2886.ci_state, CiState::None);
+
+        let s1680 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 1680)
+            .expect("#1680 présent dans l'énumération");
+        assert_eq!(s1680.state, IssueState::Closed);
+        assert_eq!(s1680.pr_number, None);
+        assert_eq!(s1680.pr_url, None);
+        assert_eq!(
+            s1680.pr_link_source, None,
+            "aucune provenance : le ticket a été fermé à la main, les deux \
+             chemins ont été essayés et aucun n'a répondu"
+        );
+    }
+
+    /// mika#2924 R2 — l'**ordre** de l'union, qui n'est pas symétrique :
+    /// l'index inverse des PR du milestone passe en premier parce qu'il est le
+    /// seul porteur de `pr_state` et `ci_state`. Si la référence côté issue
+    /// gagnait, un milestone dont les PR *sont* rattachées perdrait l'état de
+    /// sa CI sans qu'aucune autre assertion ne rougisse.
+    #[test]
+    fn mika2924_lindex_du_milestone_garde_la_priorite_sur_la_reference_cote_issue() {
+        let milestone_json = r#"{"title": "M33", "description": "sink", "state": "open", "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#;
+        // Le même #2886, cette fois atteignable par les deux chemins.
+        let pr_json = r#"[
+            {"number": 2892, "state": "MERGED", "closingIssuesReferences": [{"number": 2886}], "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        ]"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state =
+            compose_from_gh_outputs(&r, milestone_json, FIXTURE_MILESTONE_33, pr_json).unwrap();
+
+        let s2886 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 2886)
+            .expect("#2886 présent dans l'énumération");
+        assert_eq!(s2886.pr_number, Some(2892));
+        assert_eq!(s2886.pr_state.as_deref(), Some("merged"));
+        assert_eq!(s2886.ci_state, CiState::Success);
+        assert_eq!(
+            s2886.pr_link_source,
+            Some(PrLinkSource::MilestonePrList),
+            "l'index du milestone a répondu : c'est lui qui nomme la provenance"
+        );
+        assert_eq!(
+            s2886.pr_url, None,
+            "ce chemin ne porte pas d'URL — le rapport la recompose depuis le \
+             dépôt et le numéro, ce qui est correct ici puisque l'index \
+             inverse est construit sur les PR du dépôt du milestone"
+        );
+        // Le contrôle négatif reste négatif quel que soit le chemin pris par
+        // son voisin.
+        let s1680 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 1680)
+            .expect("#1680 présent dans l'énumération");
+        assert_eq!(s1680.pr_number, None);
+        assert_eq!(s1680.pr_link_source, None);
+    }
+
+    // -----------------------------------------------------------------
+    // mika#2924 R7 — la résolution du lien de PR a un lecteur unique.
+    // -----------------------------------------------------------------
+
+    /// Les trois aiguilles de la résolution du lien ticket ↔ PR de clôture.
+    ///
+    /// Trois, pas une : la régression redoutée n'a pas de forme canonique. Un
+    /// second site peut rebâtir l'index inverse (`pr_by_issue`), relire le
+    /// champ côté PR (`closingIssuesReferences`) ou relire celui côté issue
+    /// (`closedByPullRequestsReferences`) — et le troisième est le plus
+    /// probable, puisque c'est le chemin que ce ticket vient d'ouvrir. Un filet
+    /// posé sur une seule des trois serait vert le jour où il compte.
+    const AIGUILLES_DE_RESOLUTION: &[&str] = &[
+        "pr_by_issue",
+        "closingIssuesReferences",
+        "closedByPullRequestsReferences",
+    ];
+
+    /// Les fonctions dont le corps porte l'une des aiguilles, dans un corpus
+    /// `(fichier, source)` quelconque — l'ensemble trié et dédoublonné.
+    ///
+    /// Le découpage passe par [`crate::source_scan::fn_bodies`], qui retire les
+    /// commentaires **avant** de découper : la prose de ce module *nomme* les
+    /// trois champs à six endroits (le doc-comment de `PrLinkSource`, celui de
+    /// `SubIssue::pr_number`, celui de `write_completed`, trois commentaires du
+    /// composeur), et une mention n'est pas une lecture. C'est le motif
+    /// mika#2050 signal S, et la raison pour laquelle
+    /// `mika2425_identity_context_history_has_a_single_reader` ancre sur les
+    /// lignes non commentaires.
+    fn fonctions_portant_une_aiguille(corpus: &[(String, String)]) -> Vec<String> {
+        let mut trouvees: Vec<String> = Vec::new();
+        for (_, source) in corpus {
+            for (nom, corps) in crate::source_scan::fn_bodies(source) {
+                if AIGUILLES_DE_RESOLUTION.iter().any(|a| corps.contains(a)) {
+                    trouvees.push(nom);
+                }
+            }
+        }
+        trouvees.sort();
+        trouvees.dedup();
+        trouvees
+    }
+
+    /// La moitié production de `src/milestone_manager/`, fichier par fichier.
+    ///
+    /// Passe par [`crate::source_scan::production_files`], qui compose déjà les
+    /// deux écartements du code de test demandés par le plan — par le chemin
+    /// ([`crate::source_scan::is_test_source_path`]) puis par la troncature
+    /// ([`crate::source_scan::production_half`]). L'API déjà en place, prise là
+    /// où elle est déjà composée : une troisième énumération du répertoire
+    /// serait un second prédicat pour une seule question (mika#2158), et celle
+    /// de `mod.rs` est plate là où celle-ci est récursive — un futur
+    /// sous-répertoire du module y échapperait en silence.
+    fn production_du_module() -> Vec<(String, String)> {
+        let corpus: Vec<(String, String)> = crate::source_scan::production_files()
+            .into_iter()
+            .filter(|(rel, _)| rel.starts_with("milestone_manager/"))
+            .collect();
+        assert!(
+            corpus.len() >= 10,
+            "le corpus du module est anormalement petit ({} fichiers) — le \
+             filtre de chemin ne mord plus, et le scan ne regarde presque rien",
+            corpus.len()
+        );
+        corpus
+    }
+
+    /// mika#2924 R7 — **l'ensemble** des fonctions de production qui résolvent
+    /// le lien ticket ↔ PR de clôture, par égalité d'ensembles et non par
+    /// `contains`.
+    ///
+    /// Ce que ça refuse : un second site qui résout le lien à côté du premier.
+    /// La classe est celle de mika#2158 — un second site correct *aujourd'hui*
+    /// qui rate l'élargissement de demain, sans qu'aucune assertion de
+    /// comportement ne rougisse, parce que les deux sites rendent les mêmes
+    /// octets jusqu'au jour où l'un des deux change.
+    ///
+    /// **Deux noms attendus, et chacun pour sa raison** — le plan en annonçait
+    /// un, n'ayant pas compté le site de *demande* :
+    ///
+    /// - `compose_from_gh_outputs` **résout** : c'est lui qui décide, pour un
+    ///   ticket, quelle PR l'a fermé et d'où vient cette réponse.
+    /// - `read_with_runner` **demande** : il nomme les deux champs dans ses
+    ///   listes `--json`. Il ne répond pas à la question, il la rend posable —
+    ///   la même distinction que mika#2305 a dû écrire pour son résolveur de
+    ///   portée (« amended, not excepted … it *produces* the answer »).
+    ///
+    /// Quand ce test rougit : **router le site par `compose_from_gh_outputs`**,
+    /// ne pas ajouter de ligne à l'allowlist (doctrine mika#2201). Si le
+    /// nouveau site est un troisième *demandeur* légitime, l'attendu s'amende
+    /// en nommant sa raison, comme les deux lignes ci-dessus.
+    #[test]
+    fn mika2924_la_resolution_de_pr_de_cloture_a_un_lecteur_unique() {
+        /// Aucune exception. Livrée vide, et son vide est épinglé juste en
+        /// dessous : une allowlist qui se remplit sans bruit est le mécanisme
+        /// que mika#2309 condamne.
+        const ALLOWLIST: &[&str] = &[];
+        assert!(
+            ALLOWLIST.is_empty(),
+            "une exception a été ajoutée à ce scan. Ce n'est pas la \
+             réparation : router le site par `compose_from_gh_outputs` l'est \
+             (mika#2201). Si une exception est vraiment la bonne réponse, \
+             ouvrir un ticket qui porte sa raison et le citer ici."
+        );
+
+        let trouvees = fonctions_portant_une_aiguille(&production_du_module());
+
+        // Anti-vacuité : un prédicat qui ne trouve plus rien passerait toutes
+        // les égalités d'ensembles qu'on lui demanderait, y compris celle-ci si
+        // l'attendu venait à se vider par un refactor.
+        assert!(
+            !trouvees.is_empty(),
+            "le scan ne trouve plus aucune lecture — les aiguilles ont cessé de \
+             mordre (champ renommé, découpage cassé), et le filet est décoratif"
+        );
+
+        assert_eq!(
+            trouvees,
+            vec![
+                "compose_from_gh_outputs".to_string(),
+                "read_with_runner".to_string(),
+            ],
+            "l'ensemble des fonctions qui touchent au lien de PR de clôture a \
+             changé. Lire le doc-comment de ce test avant de toucher à \
+             l'attendu."
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus : sur une source **synthétique**
+    /// portant un second résolveur, le prédicat doit rougir.
+    ///
+    /// Sans lui, un scan dont le découpage s'est cassé — aiguille renommée,
+    /// `fn_bodies` qui rend des corps vides — resterait vert pour toujours, et
+    /// son vert se lirait comme « un seul lecteur » au lieu de « je ne vois
+    /// plus rien ». L'anti-vacuité du test précédent couvre le corpus réel ;
+    /// celui-ci couvre le prédicat lui-même, sur une entrée dont on connaît la
+    /// réponse.
+    #[test]
+    fn mika2924_le_scan_rougit_sur_un_second_lecteur() {
+        let synthetique = r#"
+/// Cette prose nomme `closedByPullRequestsReferences` et `pr_by_issue` sans
+/// les lire : elle ne doit pas être comptée.
+fn seulement_de_la_prose() {
+    let _ = 1;
+}
+
+fn un_second_resolveur(issue: &Value) -> Option<u64> {
+    issue
+        .get("closedByPullRequestsReferences")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("number"))
+        .and_then(|v| v.as_u64())
+}
+"#;
+        let corpus = vec![("synthetique.rs".to_string(), synthetique.to_string())];
+        let trouvees = fonctions_portant_une_aiguille(&corpus);
+        assert_eq!(
+            trouvees,
+            vec!["un_second_resolveur".to_string()],
+            "le prédicat doit voir le second résolveur, et lui seul — une \
+             prose qui nomme le champ n'est pas une lecture"
+        );
+    }
+
     /// mika#1975 D5/D8 — the typed error renders **exactly** the legacy
     /// `anyhow!("gh {} failed: {}", args.join(" "), stderr)` string.
     ///
@@ -1304,6 +1646,8 @@ mod tests {
             branch_present: false,
             pr_number: None,
             pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "".into(),
@@ -1520,6 +1864,59 @@ mod gh_arg_capture_tests {
         assert_adjacent_pair(pr_call, "--limit", "100");
     }
 
+    // -- mika#2924 : la référence de clôture côté issue, sans appel de plus --
+
+    /// **V5** — la deuxième lecture demande `closedByPullRequestsReferences`, et
+    /// le **nombre** d'appels `gh` ne bouge pas.
+    ///
+    /// Les deux moitiés portent la décision, et elles sont distinctes :
+    ///
+    /// - le champ, parce que sans lui la référence côté issue n'arrive jamais et
+    ///   le correctif est décoratif — l'index des PR du milestone reste vide
+    ///   pour toute PR de la boucle, qui rattache le milestone au ticket ;
+    /// - le compte, parce que la réparation évidente — un `gh` par ticket fermé
+    ///   — coûterait 87 appels par cycle sur le milestone 33 là où ce champ en
+    ///   coûte zéro. La lecture était déjà émise ; on lui demande une colonne de
+    ///   plus.
+    ///
+    /// L'assertion de compte double celle de `mika2699_la_cinquieme_lecture_est_depot_large`
+    /// **à dessein** : elle y est un contrôle de non-régression du vol 2, elle est
+    /// ici la moitié mesurée du § coût du plan. Les deux rougiraient ensemble, et
+    /// c'est ce qu'on veut — un sixième appel ajouté pour servir ce champ serait
+    /// exactement la régression que ce test refuse.
+    #[tokio::test]
+    async fn mika2924_la_lecture_des_tickets_demande_la_reference_de_cloture_sans_appel_de_plus() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let calls = calls.lock().unwrap();
+        let issue_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue")
+                    && c.iter().any(|a| a == "--milestone")
+            })
+            .expect("l'appel d'énumération des sous-tickets doit être capturé");
+        assert_adjacent_pair(
+            issue_call,
+            "--json",
+            "number,title,state,body,labels,updatedAt,closedByPullRequestsReferences",
+        );
+        assert_eq!(
+            calls.len(),
+            5,
+            "la référence de clôture arrive sur une lecture déjà émise — aucun \
+             sixième appel `gh` par cycle : {calls:?}"
+        );
+    }
+
     // -- mika#2699 Phase 2 (a) vol 1 : la quatrième lecture --
 
     /// Cas 9 — la lecture du bassin est **dépôt-large** et ciblée sur `ready`.
@@ -1671,6 +2068,8 @@ mod gh_arg_capture_tests {
             branch_present: false,
             pr_number: None,
             pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-10-15T00:00:00Z".into(),

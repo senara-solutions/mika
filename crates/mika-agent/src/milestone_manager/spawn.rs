@@ -1921,6 +1921,8 @@ mod tests {
                 branch_present: true,
                 pr_number: Some(200),
                 pr_state: Some("open".into()),
+                pr_url: None,
+                pr_link_source: None,
                 ci_state: CiState::Success,
                 blockers: vec![],
                 updated_at: "2026-08-22T00:00:00Z".into(),

@@ -335,6 +335,8 @@ mod tests {
             branch_present: false,
             pr_number: None,
             pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-08-20T00:00:00Z".into(),

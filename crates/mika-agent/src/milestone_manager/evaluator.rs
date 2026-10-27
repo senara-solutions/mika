@@ -568,6 +568,8 @@ mod tests {
             branch_present: true,
             pr_number: None,
             pr_state: pr_state.map(str::to_string),
+            pr_url: None,
+            pr_link_source: None,
             ci_state: crate::milestone_manager::types::CiState::None,
             blockers: vec![],
             updated_at: "2026-10-13T00:00:00Z".to_string(),
