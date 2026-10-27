@@ -210,6 +210,57 @@ pub fn detect_silence(
     }
 }
 
+/// Le sous-ticket que le **palier 1** nommerait, ou `None` (mika#2924, vol 2).
+///
+/// Extrait du corps de [`pick_next_action`] sans toucher ni au prédicat ni au
+/// tri : les sept tests de paliers déjà au dossier sont la preuve que rien n'a
+/// bougé. Existe pour que [`timeline_probe_target`] puisse poser la question
+/// « le palier 1 l'emporte-t-il ? » sans la rejouer.
+fn tier1_pick(state: &MilestoneState) -> Option<&SubIssue> {
+    let mut tier1: Vec<&SubIssue> = state
+        .sub_issues
+        .iter()
+        .filter(|s| s.state == IssueState::Open && s.pr_number.is_some() && !s.is_hard_blocked())
+        .collect();
+    tier1.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
+    tier1.first().copied()
+}
+
+/// Le sous-ticket que le **palier 2** nommerait, ou `None` (mika#2924, vol 2).
+///
+/// Même extraction, même preuve que [`tier1_pick`].
+fn tier2_pick(state: &MilestoneState) -> Option<&SubIssue> {
+    let mut tier2: Vec<&SubIssue> = state
+        .sub_issues
+        .iter()
+        .filter(|s| {
+            s.state == IssueState::Open
+                && s.plan_present
+                && s.pr_number.is_none()
+                && !s.is_hard_blocked()
+        })
+        .collect();
+    tier2.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
+    tier2.first().copied()
+}
+
+/// Le ticket dont la sonde de timeline décidera du libellé « Next » de ce
+/// cycle — au plus un, et `None` quand le palier 2 ne décide pas (mika#2924,
+/// vol 2).
+///
+/// Désigné **ici**, au même endroit qu'au jugement, et pour la même raison que
+/// la lecture 6 du `Reader` : rejouer le filtre côté lecture rendrait les deux
+/// réponses identiques aujourd'hui et muettes le jour où l'une des deux change.
+///
+/// `None` quand le palier 1 l'emporte — un milestone en vol ne paie **aucun**
+/// appel de plus.
+pub(super) fn timeline_probe_target(state: &MilestoneState) -> Option<u64> {
+    if tier1_pick(state).is_some() {
+        return None;
+    }
+    tier2_pick(state).map(|s| s.number)
+}
+
 /// Pick the next actionable sub-issue.
 ///
 /// Ranking (higher priority first):
@@ -222,13 +273,7 @@ pub fn detect_silence(
 /// then issue number ascending.
 pub fn pick_next_action(state: &MilestoneState, _alerts: &[Alert]) -> Recommendation {
     // Tier 1: in-flight with a PR.
-    let mut tier1: Vec<&SubIssue> = state
-        .sub_issues
-        .iter()
-        .filter(|s| s.state == IssueState::Open && s.pr_number.is_some() && !s.is_hard_blocked())
-        .collect();
-    tier1.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
-    if let Some(s) = tier1.first() {
+    if let Some(s) = tier1_pick(state) {
         return Recommendation {
             next_sub_issue: Some(s.number),
             rationale: format!(
@@ -240,18 +285,7 @@ pub fn pick_next_action(state: &MilestoneState, _alerts: &[Alert]) -> Recommenda
     }
 
     // Tier 2: open + plan + no PR.
-    let mut tier2: Vec<&SubIssue> = state
-        .sub_issues
-        .iter()
-        .filter(|s| {
-            s.state == IssueState::Open
-                && s.plan_present
-                && s.pr_number.is_none()
-                && !s.is_hard_blocked()
-        })
-        .collect();
-    tier2.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
-    if let Some(s) = tier2.first() {
+    if let Some(s) = tier2_pick(state) {
         return Recommendation {
             next_sub_issue: Some(s.number),
             rationale: format!(

@@ -12,8 +12,8 @@
 use super::plan_size;
 use super::pool::{PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause};
 use super::types::{
-    CiState, IssueState, MilestoneRef, MilestoneState, PrLinkSource, ProgressCounts,
-    RecentActivity, SubIssue,
+    CiState, IssueState, MergedPrReading, MilestoneRef, MilestoneState, PrLinkSource,
+    ProgressCounts, RecentActivity, SubIssue,
 };
 use crate::auto_pull::extract_branch_name;
 use crate::plan_callout::{FenceHandling, plan_callout};
@@ -36,6 +36,20 @@ use std::collections::{BTreeMap, HashMap};
 /// nombre que l'opérateur lit doit être celui que la lecture a demandé, jamais
 /// une copie qui peut dériver.
 pub const OUTSIDE_READ_LIMIT: usize = 100;
+
+/// Taille de page demandée au `timeline` REST (mika#2924, vol 2).
+///
+/// La page par défaut est de **30** et #2698 en portait **36** le 2026-10-27 :
+/// le ticket le plus actif du vivier est précisément celui sur lequel la
+/// réponse serait silencieusement fausse sans ce paramètre.
+pub const TIMELINE_PAGE_SIZE: usize = 100;
+
+/// Nombre de tickets dont la timeline est lue par cycle (mika#2924, vol 2).
+///
+/// Vaut 1 parce que la ligne « Next » ne nomme qu'**un** ticket : la borne
+/// exprime la forme de ce qui consomme la sonde, pas un budget posé sur une
+/// population. Coût mesuré : ≤ 17 appels `gh` par cycle avant, ≤ 18 après.
+pub const TIMELINE_PROBE_MAX: usize = 1;
 
 /// Reader — owns the `gh` invocations and composes `MilestoneState`.
 ///
@@ -290,8 +304,159 @@ impl Reader {
             let bodies = compose_candidate_bodies(&issues_json, &outside_json)?;
             state.plan_sizes = read_plan_sizes(runner, &milestone_ref.repo, &wanted, &bodies).await;
         }
+
+        // 7. L'état des PR du candidat que le palier 2 nommerait (mika#2924, vol 2).
+        //    Au plus `TIMELINE_PROBE_MAX` lecture, et zéro quand le palier 1
+        //    l'emporte. La cible est désignée par `assessor::timeline_probe_target`
+        //    sur l'état qu'on vient de composer — même site qu'au jugement, pour la
+        //    même raison que la lecture 6.
+        read_timeline_probe(runner, &milestone_ref.repo, &mut state).await;
+
         Ok(state)
     }
+}
+
+/// Lit la timeline du candidat désigné et pose le résultat sur son `SubIssue`
+/// (mika#2924, vol 2).
+///
+/// **Bornée au site d'appel, pas seulement dans le type.** La cible est un
+/// `Option<u64>`, mais le `.take(TIMELINE_PROBE_MAX)` est écrit ici pour que la
+/// borne se lise à l'endroit où les appels partent : élargir
+/// `timeline_probe_target` à plusieurs cibles ne suffirait pas à élargir le
+/// coût sans toucher cette ligne.
+///
+/// **Un échec ne refuse pas le cycle et ne se tait pas** — même politique que
+/// [`read_one_plan_size`] : le fait porte sur *un* ticket, et faire échouer le
+/// cycle pour lui priverait l'opérateur du rapport sur tous les autres.
+async fn read_timeline_probe<R: GhRunner>(runner: &R, repo: &str, state: &mut MilestoneState) {
+    let target = super::assessor::timeline_probe_target(state);
+    for number in target.into_iter().take(TIMELINE_PROBE_MAX) {
+        let path = format!("/repos/{repo}/issues/{number}/timeline?per_page={TIMELINE_PAGE_SIZE}");
+        let (reading, events_read) = match runner.run(&["api", &path]).await {
+            Ok(json) => {
+                let events = serde_json::from_str::<Vec<Value>>(&json)
+                    .map(|v| v.len())
+                    .ok();
+                match compose_merged_prs(&json) {
+                    Ok(r) => (r, events),
+                    // Une sortie illisible n'est pas une absence de PR : c'est
+                    // une lecture qui n'a pas conclu, et elle le dit.
+                    Err(_) => (MergedPrReading::IndeterminateFetchFailed, events),
+                }
+            }
+            Err(_) => (MergedPrReading::IndeterminateFetchFailed, None),
+        };
+        log_timeline_probe(Some(number), Some(&reading), events_read);
+        if let Some(s) = state.sub_issues.iter_mut().find(|s| s.number == number) {
+            s.merged_prs = Some(reading);
+        }
+    }
+    if target.is_none() {
+        log_timeline_probe(None, None, None);
+    }
+}
+
+/// Une ligne INFO par cycle, sur **toutes** les branches — celle où rien n'est
+/// émis comprise (mika#2924, vol 2).
+///
+/// Sans la branche muette, « le palier 1 l'emportait » et « le binaire déployé
+/// n'a pas la sonde » rendent le même journal : zéro ligne. L'opérateur qui
+/// compte les lignes par cycle doit pouvoir distinguer les deux.
+///
+/// `candidate` et `events_read` sont **absents** plutôt qu'à `0` quand ils
+/// n'ont pas été mesurés : un `0` affirmerait une mesure qui n'a pas eu lieu
+/// (motif mika#2331).
+fn log_timeline_probe(
+    candidate: Option<u64>,
+    reading: Option<&MergedPrReading>,
+    events_read: Option<usize>,
+) {
+    let outcome = match reading {
+        Some(MergedPrReading::Citing(_)) => "citing",
+        Some(MergedPrReading::NoneCiting) => "none_citing",
+        Some(MergedPrReading::IndeterminatePageFull) => "indeterminate_page_full",
+        Some(MergedPrReading::IndeterminateFetchFailed) => "indeterminate_fetch_failed",
+        None => "not_emitted",
+    };
+    let citing_prs = match reading {
+        Some(MergedPrReading::Citing(prs)) => Some(prs.len()),
+        _ => None,
+    };
+    tracing::info!(
+        target: "mika::milestone_manager",
+        event = "manager_timeline_probe",
+        outcome,
+        candidate,
+        events_read,
+        citing_prs,
+        "sonde de timeline du candidat « Next »"
+    );
+}
+
+/// Réduit une sortie `gh api …/timeline` aux PR **mergées** qui citent le
+/// ticket — fonction pure, pendant de [`compose_ready_pool`] pour la lecture 7
+/// (mika#2924, vol 2).
+///
+/// Trois filtres, chacun mesuré le 2026-10-27 :
+/// - `event == "cross-referenced"` ;
+/// - `source.issue.pull_request != null` — une citation peut venir d'une issue
+///   (#2698 en porte trois : #2886, #2924, #2930) ;
+/// - `source.issue.pull_request.merged_at != null` — #1727 cite 10 PR dont 2
+///   non mergées, #2934 n'en cite qu'une et elle n'est pas mergée.
+///
+/// **Une page pleine rend `IndeterminatePageFull`, même quand aucune PR n'a été
+/// trouvée** : à [`TIMELINE_PAGE_SIZE`] événements lus, l'absence n'est pas
+/// attestée (mika#2930 AC2). Une page pleine **avec** des PR trouvées rend
+/// `Citing` — la réponse est déjà sûre, et la troncature ne peut que l'allonger.
+///
+/// **`cross-referenced` est plus large que « la PR qui livre ce ticket. »**
+/// #2929 et #2931 citent #2698 sans le livrer. C'est pourquoi le libellé dit
+/// « des PR mergées le citent » et jamais « livré » : la sonde nomme ce qu'elle
+/// a vu, et l'opérateur garde la lecture.
+pub fn compose_merged_prs(timeline_json: &str) -> Result<MergedPrReading> {
+    let events: Vec<Value> = serde_json::from_str(timeline_json)
+        .map_err(|e| anyhow!("failed to parse timeline json: {e}"))?;
+    let page_full = events.len() >= TIMELINE_PAGE_SIZE;
+
+    // Dédoublonnage par numéro de PR : la timeline porte une entrée par
+    // citation, et une même PR peut citer le ticket deux fois.
+    let mut merged: BTreeMap<u64, String> = BTreeMap::new();
+    for e in &events {
+        if e.get("event").and_then(Value::as_str) != Some("cross-referenced") {
+            continue;
+        }
+        let Some(issue) = e.get("source").and_then(|s| s.get("issue")) else {
+            continue;
+        };
+        let Some(number) = issue.get("number").and_then(Value::as_u64) else {
+            continue;
+        };
+        // `pull_request` absent **ou** `null` : la citation vient d'une issue.
+        let Some(pr) = issue.get("pull_request").filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let Some(merged_at) = pr.get("merged_at").and_then(Value::as_str) else {
+            continue;
+        };
+        merged.insert(number, merged_at.to_string());
+    }
+
+    if merged.is_empty() {
+        return Ok(if page_full {
+            MergedPrReading::IndeterminatePageFull
+        } else {
+            MergedPrReading::NoneCiting
+        });
+    }
+
+    // Tri par `merged_at` **décroissant**, numéro décroissant en second pour
+    // que deux PR mergées au même instant gardent un ordre stable d'un cycle à
+    // l'autre — sans quoi deux rapports sur le même état différeraient.
+    let mut by_recency: Vec<(u64, String)> = merged.into_iter().collect();
+    by_recency.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+    Ok(MergedPrReading::Citing(
+        by_recency.into_iter().map(|(n, _)| n).collect(),
+    ))
 }
 
 /// Le corps de chaque issue lue à ce cycle, indexé par numéro — fonction
@@ -1368,6 +1533,145 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // mika#2924, vol 2 — la lecture 7 : la timeline d'un ticket ouvert.
+    // -----------------------------------------------------------------
+
+    /// La timeline **réellement capturée** de #2698 le 2026-10-27, réduite aux
+    /// trois chemins JSON que le composeur lit. 36 événements, dont 6 PR
+    /// mergées et 3 citations d'*issues*. Provenance, commande de capture et
+    /// fidélités : `tests/fixtures/mika2924/README.md`.
+    const FIXTURE_TIMELINE_2698: &str =
+        include_str!("../../tests/fixtures/mika2924/timeline-2698.json");
+
+    /// Le contrôle négatif, lui aussi capturé le 2026-10-27 : #2934 ne cite
+    /// qu'**une** PR, #2936, et elle n'est pas mergée. Un document distinct
+    /// parce qu'un ticket n'a qu'une timeline — les deux contrôles ne peuvent
+    /// pas tenir dans le même fichier comme ceux de l'AC1.
+    const FIXTURE_TIMELINE_2934: &str =
+        include_str!("../../tests/fixtures/mika2924/timeline-2934.json");
+
+    /// Fabrique une page de `n` événements dont `merged` PR mergées, pour les
+    /// cas que la forge ne fournit pas (une page pleine n'existe pas encore sur
+    /// le vivier : #1727, le plus actif, en porte 50).
+    fn timeline_page(n: usize, merged: &[u64]) -> String {
+        let mut events: Vec<String> = merged
+            .iter()
+            .map(|pr| {
+                format!(
+                    r#"{{"event":"cross-referenced","source":{{"issue":{{"number":{pr},"pull_request":{{"merged_at":"2026-10-{:02}T00:00:00Z"}}}}}}}}"#,
+                    10 + (pr % 10)
+                )
+            })
+            .collect();
+        while events.len() < n {
+            events.push(r#"{"event":"labeled","source":null}"#.to_string());
+        }
+        format!("[{}]", events.join(","))
+    }
+
+    /// mika#2924 AC2, R4 — la sonde rend les PR mergées qui citent le ticket,
+    /// triées par `merged_at` décroissant, et le contrôle négatif est dans le
+    /// même test.
+    ///
+    /// Le contrôle positif part de la forme exacte qui a produit le défaut :
+    /// #2698, ouvert, dont `closedByPullRequestsReferences` rend `[]` (vol 1) et
+    /// dont seule la timeline répond.
+    #[test]
+    fn mika2924_la_timeline_rend_les_pr_mergees_qui_citent_le_ticket() {
+        let reading = compose_merged_prs(FIXTURE_TIMELINE_2698).unwrap();
+        assert_eq!(
+            reading,
+            MergedPrReading::Citing(vec![2931, 2929, 2892, 2706, 2704, 2712]),
+            "l'ordre est celui des `merged_at` décroissants, et #2712 l'atteste : \
+             mergée le 2026-10-15, elle porte le plus grand numéro des trois \
+             dernières et arrive pourtant dernière — un tri replié sur le numéro \
+             de PR rougirait ici"
+        );
+
+        // Contrôle négatif, même instrument : une PR citée mais **non mergée**.
+        // Sans le filtre `merged_at`, « Next » dirait à l'opérateur que son
+        // travail est déjà livré alors que sa PR est encore ouverte.
+        assert_eq!(
+            compose_merged_prs(FIXTURE_TIMELINE_2934).unwrap(),
+            MergedPrReading::NoneCiting,
+            "#2934 ne cite que #2936, ouverte — et la timeline a été lue en \
+             entier (12 événements), donc l'absence est attestée"
+        );
+    }
+
+    /// mika#2930 AC2 — à `TIMELINE_PAGE_SIZE` événements lus, l'absence de PR
+    /// n'est **pas** attestée : la page est peut-être tronquée.
+    ///
+    /// Les deux moitiés comptent. Une page pleine **sans** PR trouvée est
+    /// indéterminée ; une page pleine **avec** des PR trouvées rend `Citing`,
+    /// parce que la réponse est déjà sûre et que la troncature ne peut que
+    /// l'allonger. Replier les deux sur `IndeterminatePageFull` priverait le
+    /// rapport de la seule information utile qu'il tienne.
+    #[test]
+    fn mika2924_une_page_pleine_est_une_troncature_et_jamais_une_absence() {
+        assert_eq!(
+            compose_merged_prs(&timeline_page(TIMELINE_PAGE_SIZE, &[])).unwrap(),
+            MergedPrReading::IndeterminatePageFull
+        );
+        // Un événement de moins : la timeline a été lue en entier.
+        assert_eq!(
+            compose_merged_prs(&timeline_page(TIMELINE_PAGE_SIZE - 1, &[])).unwrap(),
+            MergedPrReading::NoneCiting,
+            "la garde est sur la page pleine, pas sur « beaucoup d'événements »"
+        );
+        assert_eq!(
+            compose_merged_prs(&timeline_page(TIMELINE_PAGE_SIZE, &[2704])).unwrap(),
+            MergedPrReading::Citing(vec![2704]),
+            "une page pleine qui a trouvé une PR mergée répond quand même"
+        );
+    }
+
+    /// mika#2924 R4 — un événement qui n'est pas une PR ne compte pas, et le
+    /// fixture réel en porte trois.
+    ///
+    /// #2886, #2924 et #2930 citent #2698 : ce sont des *issues*, leur
+    /// `pull_request` est `null`. Sans le second filtre, la sonde les nommerait
+    /// comme des PR mergées — des numéros que l'opérateur irait chercher sous
+    /// `/pull/` et qui n'y sont pas.
+    #[test]
+    fn mika2924_un_evenement_qui_nest_pas_une_pr_ne_compte_pas() {
+        let MergedPrReading::Citing(prs) = compose_merged_prs(FIXTURE_TIMELINE_2698).unwrap()
+        else {
+            panic!("le fixture porte des PR mergées");
+        };
+        for issue in [2886u64, 2924, 2930] {
+            assert!(
+                !prs.contains(&issue),
+                "#{issue} cite #2698 sans être une PR — obtenu : {prs:?}"
+            );
+        }
+        // Et les deux autres filtres restent portés par le même document : un
+        // `labeled` n'est pas une citation, une PR non mergée n'est pas livrée.
+        assert_eq!(prs.len(), 6, "six PR mergées et rien d'autre : {prs:?}");
+    }
+
+    /// mika#2924 R4 — un échec de lecture n'est pas une absence de PR.
+    ///
+    /// Une sortie illisible et une sortie vide rendent des variantes
+    /// **différentes** : la première se corrige à la forge, la seconde dit que
+    /// l'implémentation est le pas suivant. Les confondre est la classe
+    /// mika#2205, et c'est la confusion qui remettrait le défaut en place.
+    #[test]
+    fn mika2924_une_sortie_illisible_nest_pas_une_absence_de_pr() {
+        assert!(
+            compose_merged_prs("pas du json").is_err(),
+            "le composeur rend l'erreur ; c'est l'appelant qui la classe en \
+             IndeterminateFetchFailed, et il est le seul à savoir qu'un échec \
+             ne refuse pas le cycle"
+        );
+        assert_eq!(
+            compose_merged_prs("[]").unwrap(),
+            MergedPrReading::NoneCiting,
+            "une timeline vide a bien été lue en entier"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // mika#2924 R7 — la résolution du lien de PR a un lecteur unique.
     // -----------------------------------------------------------------
 
@@ -1719,6 +2023,13 @@ mod gh_arg_capture_tests {
     /// (`/milestones/` vs `/contents/`), and neither is a fallback — a seventh
     /// `api`-shaped call lands on the error arm rather than being served the
     /// milestone metadata.
+    ///
+    /// **Extension performed a fourth time (mika#2924 vol 2).** The seventh call
+    /// is a third `api`, discriminating on `/timeline`. It is the first call the
+    /// reader emits **conditionally** — zero when tier 1 wins — so an arm that
+    /// never answers is not evidence of a missing call site; the bound test
+    /// `mika2924_la_sonde_est_bornee_a_une_lecture_par_cycle` is what reads the
+    /// absence as a result.
     struct RecordingGhRunner {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         milestone_json: String,
@@ -1735,6 +2046,15 @@ mod gh_arg_capture_tests {
         /// taille, donc `SectionAbsent`, donc un test vert qui ne prouve rien.
         /// Les deux arms `api` discriminent sur le chemin.
         plan_text: Option<String>,
+        /// Le texte servi à la **septième** lecture (mika#2924, vol 2), ou
+        /// `None` pour simuler l'échec de l'appel.
+        ///
+        /// Troisième `api` du lecteur, donc troisième arm discriminant sur le
+        /// chemin, et pour la même raison que les deux premières : sans elle,
+        /// la sonde recevrait les métadonnées du milestone, `compose_merged_prs`
+        /// rendrait une erreur de parse, et le test de borne compterait un
+        /// appel en croyant mesurer une lecture.
+        timeline_json: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1750,6 +2070,10 @@ mod gh_arg_capture_tests {
                 .map(|w| w[1].clone())
                 .unwrap_or_default();
             match owned.first().map(String::as_str) {
+                Some("api") if path.contains("/timeline") => self
+                    .timeline_json
+                    .clone()
+                    .ok_or_else(|| anyhow!("RecordingGhRunner: échec de la lecture de timeline")),
                 Some("api") if path.contains("/contents/") => self
                     .plan_text
                     .clone()
@@ -1761,10 +2085,10 @@ mod gh_arg_capture_tests {
                     Ok(self.outside_json.clone())
                 }
                 Some("pr") => Ok(self.pr_json.clone()),
-                // NOTE: extending `Reader::read_with_runner` with a sixth `gh`
+                // NOTE: extending `Reader::read_with_runner` with an eighth `gh`
                 // call (e.g., `gh auth status`, per-issue `gh issue view`) also
                 // requires extending this match — the guard covers only the
-                // five current call sites' arg contracts (mika#1933 testing F1).
+                // seven current call sites' arg contracts (mika#1933 testing F1).
                 _ => Err(anyhow!(
                     "RecordingGhRunner: unexpected call shape in {:?}",
                     owned
@@ -1786,6 +2110,7 @@ mod gh_arg_capture_tests {
             ready_json: "[]".into(),
             outside_json: "[]".into(),
             plan_text: None,
+            timeline_json: None,
         };
         (calls, runner)
     }
@@ -1921,6 +2246,137 @@ mod gh_arg_capture_tests {
              sixième appel `gh` par cycle : {calls:?}"
         );
     }
+
+    // -- mika#2924, vol 2 : la septième lecture, et sa borne --
+
+    /// Un corps de ticket groomé — plan **et** branche, les deux encarts que le
+    /// composeur lit.
+    const BODY_GROOME: &str = "> - **Plan:** `docs/plans/2026-10-27-002-foo-plan.md`\n\
+                               > - **Branch:** `fix/2698/foo`\n";
+
+    /// L'énumération des sous-tickets : #2698 ouvert et groomé, plus un voisin
+    /// ouvert sans plan pour que le palier 2 ait un rang à trier.
+    fn issues_du_milestone() -> String {
+        let body = serde_json::to_string(BODY_GROOME).unwrap();
+        format!(
+            r#"[
+              {{"number": 2698, "title": "t", "state": "OPEN", "body": {body},
+                "labels": [], "updatedAt": "2026-10-27T00:00:00Z",
+                "closedByPullRequestsReferences": []}},
+              {{"number": 2699, "title": "u", "state": "OPEN", "body": "",
+                "labels": [], "updatedAt": "2026-10-27T00:00:00Z",
+                "closedByPullRequestsReferences": []}}
+            ]"#
+        )
+    }
+
+    /// mika#2924 AC2, Fire-Disposition — **le** détecteur du vol : la sonde
+    /// coûte au plus `TIMELINE_PROBE_MAX` appel par cycle, et **zéro** quand le
+    /// palier 1 l'emporte.
+    ///
+    /// Les deux moitiés sont dans le même test parce qu'elles décident ensemble
+    /// du coût : une sonde bornée à un appel mais émise à chaque cycle, et une
+    /// sonde gratuite sur un milestone en vol, ne sont pas la même borne. Le
+    /// coût mesuré du cycle passe de ≤ 17 à ≤ 18 appels `gh` (+5,9 %), et à
+    /// ≤ 17 inchangé dès qu'un ticket du milestone porte une PR.
+    ///
+    /// L'assertion lit `TIMELINE_PROBE_MAX` plutôt qu'un `1` littéral : élargir
+    /// la borne sans toucher au test est possible, et c'est voulu — ce que le
+    /// détecteur refuse, c'est qu'elle s'élargisse **sans** être écrite.
+    #[tokio::test]
+    async fn mika2924_la_sonde_est_bornee_a_une_lecture_par_cycle() {
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+
+        // Moitié 1 — le palier 2 décide : exactement une lecture de timeline,
+        // sur le ticket que « Next » nommera, et à la page demandée.
+        let (calls, mut runner) = build_recorder();
+        runner.issues_json = issues_du_milestone();
+        runner.timeline_json = Some(FIXTURE_TIMELINE_2698_BORNE.to_string());
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let captured = calls.lock().unwrap().clone();
+        let timelines: Vec<&Vec<String>> = captured
+            .iter()
+            .filter(|c| c.iter().any(|a| a.contains("/timeline")))
+            .collect();
+        assert_eq!(
+            timelines.len(),
+            TIMELINE_PROBE_MAX,
+            "au plus TIMELINE_PROBE_MAX lecture de timeline par cycle : {captured:?}"
+        );
+        assert!(
+            timelines[0][1].contains("/issues/2698/timeline"),
+            "la cible est celle que le palier 2 nommerait, pas la première de \
+             l'énumération : {:?}",
+            timelines[0]
+        );
+        assert!(
+            timelines[0][1].contains(&format!("per_page={TIMELINE_PAGE_SIZE}")),
+            "sans `per_page`, la forge en rend 30 et #2698 en portait 36 le \
+             2026-10-27 : la réponse serait silencieusement fausse sur le \
+             ticket le plus actif du vivier — obtenu : {:?}",
+            timelines[0]
+        );
+        assert_eq!(
+            state
+                .sub_issues
+                .iter()
+                .find(|s| s.number == 2698)
+                .and_then(|s| s.merged_prs.clone()),
+            Some(MergedPrReading::Citing(vec![2704])),
+            "le résultat est posé sur le `SubIssue` du candidat, et sur lui seul"
+        );
+        assert_eq!(
+            state
+                .sub_issues
+                .iter()
+                .find(|s| s.number == 2699)
+                .and_then(|s| s.merged_prs.clone()),
+            None,
+            "le voisin non désigné garde `None` — « sonde non émise », et \
+             surtout pas « aucune PR »"
+        );
+
+        // Moitié 2 — le palier 1 l'emporte : **aucun** appel de timeline ne
+        // part. Un milestone en vol ne paie rien de plus.
+        let (calls, mut runner) = build_recorder();
+        runner.issues_json = issues_du_milestone();
+        runner.timeline_json = Some(FIXTURE_TIMELINE_2698_BORNE.to_string());
+        runner.pr_json = r#"[{"number": 2704, "state": "OPEN",
+            "closingIssuesReferences": [{"number": 2699}],
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}]"#
+            .into();
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let captured = calls.lock().unwrap().clone();
+        assert!(
+            !captured
+                .iter()
+                .any(|c| c.iter().any(|a| a.contains("/timeline"))),
+            "palier 1 vainqueur ⇒ zéro appel de timeline : {captured:?}"
+        );
+    }
+
+    /// Une timeline minimale : une PR mergée qui cite le ticket. Les trois
+    /// filtres du composeur sont éprouvés sur le fixture **réel** par
+    /// `mika2924_la_timeline_rend_les_pr_mergees_qui_citent_le_ticket` ; ici
+    /// seule la plomberie est en jeu, et un document court rend l'assertion de
+    /// borne lisible.
+    const FIXTURE_TIMELINE_2698_BORNE: &str = r#"[
+        {"event": "labeled", "source": null},
+        {"event": "cross-referenced",
+         "source": {"issue": {"number": 2704,
+                              "pull_request": {"merged_at": "2026-10-16T07:04:43Z"}}}}
+    ]"#;
 
     // -- mika#2699 Phase 2 (a) vol 1 : la quatrième lecture --
 
