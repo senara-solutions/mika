@@ -5,6 +5,7 @@ pub mod config;
 pub mod credential_helper;
 pub mod dashboard;
 pub mod doctor;
+pub mod flight_verdicts;
 pub mod format_helper;
 pub mod iterate;
 pub mod kg;
