@@ -671,6 +671,8 @@ fn sous_ticket(number: u64, pr_state: Option<&str>) -> crate::milestone_manager:
         plan_present: true,
         branch_present: false,
         pr_number: None,
+        pr_url: None,
+        pr_link_source: None,
         pr_state: pr_state.map(str::to_string),
         ci_state: CiState::None,
         blockers: vec![],
