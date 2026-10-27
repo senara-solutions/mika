@@ -439,7 +439,7 @@ mod tests {
                 QA_REVIEWED_HEAD_TOOL,
                 &key,
                 None,
-                Some("review"),
+                Some("verdict_posted"),
                 None,
                 None,
             )
@@ -465,7 +465,7 @@ mod tests {
             .await
             .expect("lecture mika-qa")
             .expect("la ligne que mika-qa vient d'écrire");
-        assert_eq!(after_value.as_deref(), Some("review"));
+        assert_eq!(after_value.as_deref(), Some("verdict_posted"));
     }
 
     // ---- Fire-Disposition (a.1) : les sites `gh` de `webhook_prefilter.rs` --

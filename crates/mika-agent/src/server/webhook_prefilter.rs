@@ -2351,7 +2351,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Un registre bouchonné, lu sur la clé : `registre(&[(HEAD_A, "review")])`.
+    /// Un registre bouchonné, lu sur la clé : `registre(&[(HEAD_A, "verdict_posted")])`.
     fn registre(lignes: &[(&str, &str)]) -> Option<Result<Vec<(String, String)>, &'static str>> {
         Some(Ok(lignes
             .iter()
@@ -3038,7 +3038,7 @@ pub(crate) mod tests {
     /// « Aucun tour terminé en `review` n'est écarté » tient par la même
     /// structure : un tour qui se *terminerait* en `review` porte une tête que
     /// le registre ne porte pas encore, et c'est exactement cette quatrième
-    /// ligne. Une ligne `review` AU registre, elle, dit « un tour a déjà posté
+    /// ligne. Une ligne `verdict_posted` AU registre, elle, dit « un tour a déjà posté
     /// la revue de cette tête », dont le successeur se terminerait en
     /// `stop_already_reviewed_sha` : elle doit donc écarter, et c'est la
     /// première ligne.
@@ -3066,7 +3066,7 @@ pub(crate) mod tests {
             Cas {
                 nom: "un tour antérieur a posté la revue de cette tête",
                 texte: GREEN_PR_ONE_HEAD,
-                registre: &[(HEAD_A, "review")],
+                registre: &[(HEAD_A, "verdict_posted")],
                 attendu: Attendu::Ecarte,
             },
             Cas {
@@ -3084,7 +3084,7 @@ pub(crate) mod tests {
             Cas {
                 nom: "contrôle négatif : tête NEUVE, la PR n'a de ligne que sur l'ancienne",
                 texte: GREEN_PR_NEW_HEAD,
-                registre: &[(HEAD_A, "review")],
+                registre: &[(HEAD_A, "verdict_posted")],
                 attendu: Attendu::Passe(Release::ReviewedHeadAbsent),
             },
         ] {
@@ -3123,7 +3123,7 @@ pub(crate) mod tests {
     async fn mika2917_vol3_quand_g_prime_ecarte_b_nest_pas_consultee() {
         let _garde = ReviewedHeadEnvGuard::armed(true);
         let state = Stub {
-            reviewed_head: registre(&[(HEAD_A, "review")]),
+            reviewed_head: registre(&[(HEAD_A, "verdict_posted")]),
             ..Stub::default()
         };
         assert_eq!(
@@ -3232,7 +3232,7 @@ pub(crate) mod tests {
             ("registre muet", registre(&[]), Release::ReviewedHeadAbsent),
             (
                 "ligne sur une AUTRE tête de la même PR",
-                registre(&[(HEAD_B, "review")]),
+                registre(&[(HEAD_B, "verdict_posted")]),
                 Release::ReviewedHeadAbsent,
             ),
             (

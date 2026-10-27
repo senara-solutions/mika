@@ -53,7 +53,7 @@ Une propriété tenue par la structure se teste quand même, mais pas avec un bo
 
 - **une seule base** (`Database::open_in_memory`) et **deux handles** obtenus par `with_agent`, qui clone en partageant l'`Arc` interne (`async_db.rs:122`). Deux bases en mémoire rendraient la propriété intestable : l'isolation observée viendrait des deux fichiers, et le test resterait vert même sans aucun filtrage (motif mika#1926) ;
 - **les deux agents enregistrés** (`register_agent`), parce que `audit_events.agent_id` est une clé étrangère et qu'un refus de la FK ferait rougir le test pour une raison qui n'est pas la sienne ;
-- **un contrôle positif dans le même test** : le handle mika-qa relit la même clé et obtient `Some("review")`. Sans ce contrôle, « mika-dev ne voit rien » ne se distingue pas de « rien n'a été écrit » ni de « la fenêtre ne couvre pas la ligne » (classe mika#2205).
+- **un contrôle positif dans le même test** : le handle mika-qa relit la même clé et obtient `Some("verdict_posted")`. Sans ce contrôle, « mika-dev ne voit rien » ne se distingue pas de « rien n'a été écrit » ni de « la fenêtre ne couvre pas la ligne » (classe mika#2205).
 
 ### 3. Le repli « tente (g′), consulte (b) entière, nomme la relâche »
 
