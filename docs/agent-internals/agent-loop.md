@@ -3,13 +3,76 @@
 Moved verbatim out of `crates/mika-agent/CLAUDE.md` on 2026-10-13. That file is loaded whole into a pilot's prompt as soon as the pilot reads anything under `crates/mika-agent/`; at 594 KB it no longer fit, and `crates/mika-common/tests/claude_md_size.rs` now caps every `CLAUDE.md` in the repository. Headings keep their original level.
 
 
-Max 20 tool steps (all modes: conversation, callback, reminder, team), a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()` for builtins, and by the owning skill's `timeout_secs` for skill tools — see § Per-Tool Skill Budget). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
+Max 20 tool steps (all modes: conversation, callback, reminder, team) — **30 for mika-qa since mika#2926, see § Le plafond de pas est résolu par agent below** — a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()` for builtins, and by the owning skill's `timeout_secs` for skill tools — see § Per-Tool Skill Budget). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
 
 **Deadline enforcement (#848, #939, mika#2189):** the turn budget is enforced via an `Instant`-based deadline checked at five points: (1) top of each `run_loop` step iteration, (2) end of prelude work in each inner function before entering `run_loop`, (3) before `attempt_continuation_turn` entry — skip when `now + CONTINUATION_TIMEOUT_SECS > deadline`, (4) inside `attempt_continuation_turn` itself, where the inner timeout is clamped to `min(60s, deadline - now)`, (5) inside the LLM transport retry loop — `send_message_with_deadline()` aborts the retry chain when the remaining budget falls under a threshold **derived from the effective per-call plafond** (`0.75 × plafond + 0.25 × plafond`, which is the historical 90 + 30 = 120s at the default plafond), preventing doomed retries from consuming the deadline (#939). **The outer agent deadline still never drops a future mid-flight** — that is the mika#848 contract and it is unchanged: the `llm_calls` row is always persisted (success or transport-timeout), and worst-case turn duration remains `envelope + plafond`, i.e. `300s + 120s = 420s` at the shipped defaults. What changed with **mika#2342** is that the provider's `reqwest` timeout is no longer the **sole** cancellation mechanism: `run_loop`'s call is wrapped in a `tokio::time::timeout` sized on `LlmProvider::worst_case_failure_secs() + LLM_WATCHDOG_MARGIN_SECS` (60 s) — see § LLM-call watchdog below. Sized on the *worst case* rather than on the remaining deadline, that net does not contradict the mika#848 reasoning: on a rail that bounds its own calls it can only fire once the rail's mechanism has already failed, i.e. on a call that is already lost. Note the Anthropic rail (`crates/mika-common/src/claude.rs`) still hard-codes its own `120s` literal instead of reading the plafond — a real inconsistency mika#2189 names and leaves to its own ticket; mika#2342 makes it a *declared* value (`AnthropicProvider::worst_case_failure_secs`) so the net is not sized on a budget that rail does not honour. `LoopResult` is a three-variant enum (`Done`/`MaxStepsExceeded`/`DeadlineExceeded`) without `#[non_exhaustive]` — the compiler's match-exhaustiveness check enforces that all three outer handlers (conversation, silent, team) handle every variant. CI lint guard `scripts/check-loop-select.sh` rejects `tokio::select!` inside `run_loop`'s body (would shadow the iteration-top deadline check).
 
 On max-steps exceeded: continuation turn (tools disabled, deadline-clamped timeout, ceiling 60s) forces a text summary via shared `attempt_continuation_turn()` helper (used by Conversation, Team, and Silent modes); the helper persists an `llm_calls` row in all outcomes (success/error/timeout) so the continuation is never the silent-drop variant of the in-flight-cancel bug at smaller scale. If continuation fails or is skipped (deadline too close), structured fallback shows last 5 tool names with status. Silent mode continuation sends the summary via `message_sender` if available, prefixed with "[Background task exceeded tool step limit]".
 
 **Test-only entry points (`run_*_with_deadline`):** publicly visible by naming convention, used only by `EvalHarness` to inject short deadlines for the deadline-during-LLM-call eval scenarios. Production callers should always use `run_agent`/`run_silent_agent`/`run_team_agent`. `AgentParams` carries no deadline knob.
+
+### Le plafond de pas est résolu par agent, et c'est celui-là qu'on annonce (mika#2926)
+
+**Un site unique de résolution.** En tête de `run_loop` :
+
+```rust
+let max_steps =
+    crate::planning::policy::max_tool_steps_for_agent(db.agent_id(), mode.max_steps());
+for step in 0..max_steps { … }
+```
+
+`mode.max_steps()` fournit le **défaut** — `MAX_TOOL_STEPS`,
+`MAX_CALLBACK_TOOL_STEPS` ou `MAX_TEAM_TOOL_STEPS` selon le `LoopMode`, parce que
+c'est le mode qui sait lequel des trois s'applique — et la fonction ne le
+remplace que pour `mika-qa`, à qui elle rend `MAX_TOOL_STEPS_MIKA_QA = 30`. Les
+trois modes passent par ce site et rien en aval ne recalcule un plafond : **c'est
+ce qui tient AC3 structurellement** plutôt que par relecture. La résolution est
+sensible à la casse (`"Mika-QA"` reçoit le défaut) ; les deux propriétés sont
+affirmées agent par agent dans `planning::policy`'s `mod tests`
+(`mika2926_le_plafond_par_agent_ne_touche_que_mika_qa`,
+`mika2926_la_resolution_est_sensible_a_la_casse`).
+
+**Pourquoi 30, et pas 25 ni 40.** Mesuré sur les 13 tours de mika-qa coupés au
+plafond entre le 2026-10-23 et le 2026-10-26 (série `max_steps_tool_census`,
+mika#2877) : `run_shell` consommait de 9 à 28 pas, et le `total_calls` maximum
+observé était 31. 30 couvre 12 des 13 tours ; le treizième est accepté comme
+coupé, parce qu'un plafond dimensionné sur le pire cas observé n'est plus un
+plafond. La borne d'exploration posée dans les deux prompts de revue est l'autre
+moitié du correctif — le relèvement seul **déplace** l'épuisement, la mesure le
+disait avant le geste.
+
+**Le plafond SERVI est transporté, jamais recalculé (R1b).**
+`LoopResult::MaxStepsExceeded` porte un champ `max_steps: usize`, rempli depuis
+le local déjà résolu. Trois consommateurs en aval le lisent là, et chacun
+annonçait auparavant un nombre qui pouvait divergir :
+
+| consommateur | ce qu'il lisait avant | pourquoi c'était faux |
+|---|---|---|
+| WARN `"silent agent exceeded max tool steps"` | `params.trigger.max_steps()` | le déclencheur **déclare** 20 pour un `Callback` ; c'est le plafond du déclencheur, pas celui que la boucle a servi |
+| `persist_deadline_fallback` (bras conversationnel) | la constante `MAX_TOOL_STEPS` | un quatrième site annonçant un plafond, non nommé par le ticket, trouvé en vol — c'est le site que le tour `synchronize` 4f94fbc8 de mika#2920 a traversé |
+| `max_steps_tool_census` | le local (déjà correct) | inchangé — il est émis **dans** le corps de boucle |
+
+L'invariant à retenir : **un nombre de pas annoncé hors de `run_loop` se lit sur
+la variante, jamais sur une constante ni sur le déclencheur.** Le bras `Team`
+détruisait déjà la variante avec `..` et n'a rien demandé.
+
+**Et le prompt est le quatrième annonceur.** `qa-review/system_prompt.md` dit
+*« You have a maximum of N tool steps per turn. »* ; N vivait dans un fichier que
+rien ne joignait au moteur, et valait **14** pendant que le moteur servait 20.
+L'égalité est désormais une assertion :
+`tests/qa_review_executes_repo_guards.rs § mika2926_le_plafond_annonce_par_le_prompt_est_celui_du_moteur`
+extrait N du prompt et le compare à ce que `max_tool_steps_for_agent` résout — la
+fonction, jamais un littéral recopié. Les deux nombres doivent donc bouger dans
+le même commit.
+
+**Attestation de bout en bout** : `tests/eval/test_qa_step_budget_2926.rs`, trois
+tours sur le **même** corpus rejoué (la session `callback-0f07c520`, 23
+`run_shell` puis la revue) — mika-qa pose son verdict sans census, un autre agent
+épuise à 20 sur la même séquence (le contrôle négatif, qui est l'information
+disant que le changement est bien par agent), et le WARN de coupure annonce 30 et
+non 20. Le troisième passe par `run_silent_agent` monté à la main, parce que
+`EvalHarness::run` appelle `run_agent` et que `callback_turn(true)` ne pose qu'un
+drapeau sur `AgentParams`.
 
 ### Timeout Budgets (mika#2189)
 

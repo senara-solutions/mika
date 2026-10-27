@@ -386,6 +386,18 @@ corrections.
 success; excluding them would erase exactly the "a tool looping on its error"
 pattern. `failed_calls` is the separate count, never a subtraction from the map.
 
+**`max_steps` is `20` OR `30`, per agent, since mika#2926.** The ceiling is
+resolved at a single site — `planning::policy::max_tool_steps_for_agent(agent_id,
+mode.max_steps())` at the top of `run_loop` — and mika-qa is the only agent it
+answers `30` for. So **grouping a census series by `max_steps` alone mixes two
+populations** (class mika#2205): on a mika-qa line `30` is nominal, on any other
+agent's line it would be a bug. Group by `(agent_id, max_steps)`, or read
+`max_steps` only after filtering on `agent_id`. The field is the ceiling the loop
+**served**, transported out of the loop body by `LoopResult::MaxStepsExceeded`'s
+`max_steps` field, never recomputed downstream from a constant or from the
+trigger — which is why the silent-path WARN below now carries the same value as
+this line, where it previously carried the trigger's declared `20`.
+
 **Absent is never zero — at three distinct levels:**
 
 | what is absent | what it means | how it is held |
@@ -412,26 +424,45 @@ grep max_steps_tool_census /var/log/mika/server.log \
   | jq -r '[.label, .total_calls, .steps_with_tools, .distinct_tools, .failed_calls] | @tsv'
 ```
 
-**Conformance probe — the two counts must be EQUAL:**
+**Conformance probe — a DIFFERENCE, not an equality (corrected by mika#2926):**
 
 ```sh
-grep -c "agent exceeded max tool steps" /var/log/mika/server.log
-grep -c max_steps_tool_census           /var/log/mika/server.log
+tot=$(grep -c "agent exceeded max tool steps"        /var/log/mika/server.log)
+sil=$(grep -c "silent agent exceeded max tool steps" /var/log/mika/server.log)
+cen=$(grep -c max_steps_tool_census                  /var/log/mika/server.log)
+echo "$((tot - sil)) == $cen ?"
 ```
 
-Both lines are emitted at the same site without condition, so their counts are
-equal by construction on any binary postdating this flight. An inequality is not a
-log detail: **first > second** means a cut path escapes the emission (or the log
-spans the deployment); **second > first** means a double emission, which the
-harness test forbids (`tests/eval/test_max_steps_tool_census_2877.rs` asserts
-*exactly one* event per turn — a turn emitting two would make the reading above
-ambiguous without failing anything). Both at `0` means no exhaustion over the
-window.
+**Why the subtraction.** `"agent exceeded max tool steps"` is a **substring** of
+`"silent agent exceeded max tool steps"`, and a cut silent turn emits *both*
+lines: the first inside `run_loop` (`mod.rs:5194`, next to the census), the second
+in `run_silent_agent` after the loop returns (`mod.rs:7717`). So a cut on the
+callback or heartbeat path contributes **two** to `tot` and **one** to `cen`, and
+the equality form over-counts by exactly the number of silent cuts. Measured on
+the mika#2926 window: 13 census lines, 4 of them on callback turns, so the
+equality form read `17 ≠ 13` and would have been diagnosed as *"a cut path
+escapes the emission"* — the opposite of the truth. `tot - sil` is the count of
+**loop-body** cuts, which is the population the census enumerates.
 
-**What this does NOT buy.** The ceiling is unchanged, no tool is bounded, nothing
-is refused, and turns already served will never have their line. The choice of a
-correction is a second flight, after reading this measurement in production — and
-the instrument is not live until `make deploy`.
+Census and loop-body WARN are emitted at the same site without condition, so
+`tot - sil == cen` holds by construction on any binary postdating mika#2877. An
+inequality is not a log detail: **left > right** means a cut path escapes the
+emission (or the log spans the deployment); **right > left** means a double
+emission, which the harness test forbids
+(`tests/eval/test_max_steps_tool_census_2877.rs` asserts *exactly one* event per
+turn — a turn emitting two would make the reading above ambiguous without failing
+anything). All three at `0` means no exhaustion over the window.
+
+**What this did NOT buy, and what read it.** mika#2877 changed neither the
+ceiling nor the behaviour at exhaustion, and turns already served will never have
+their line. **That second flight is mika#2926**, decided on this very series: 13
+cut mika-qa turns in 3.5 days, `run_shell` taking 9 to 28 of them, `qa_pr_view`
+called once. It raised mika-qa's ceiling to 30 *and* bounded `run_shell`
+exploration in both review prompts — the measurement is what said a raise alone
+would displace the exhaustion rather than remove it. Its own post-deploy probe is
+this counter's fall, and lives in
+[`docs/operator/environment-variables.md`](../operator/environment-variables.md)
+§ *Le budget de pas d'un tour de revue*.
 
 ### Guard Fabrication Telemetry (#953)
 
