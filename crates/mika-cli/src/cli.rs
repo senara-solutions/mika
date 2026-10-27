@@ -271,6 +271,23 @@ pub enum FlightVerdictsCommand {
         #[arg(long, value_name = "TEXTE")]
         note: Option<String>,
     },
+    /// Le compte de concordance manager / MPC, en lecture seule (mika#2922,
+    /// vol 3).
+    ///
+    /// Rend, ligne par ligne du vol le plus récent au plus ancien : le vol, son
+    /// ticket, le verdict du manager, le jugement de MPC, et l'accord — avec le
+    /// champ divergent quand il y en a un. En tête : « N vols consécutifs
+    /// concordants », la mesure qu'attend le seuil de mika#2698, et la fenêtre
+    /// en jours.
+    ///
+    /// La commande **mesure** ; elle n'ouvre rien et ne corrige rien. Un
+    /// désaccord se relit avec `judge`, qui est le verbe d'écriture ; c'est
+    /// aussi pourquoi `--format` est ici et pas là-bas.
+    Concordance {
+        /// Forme de sortie
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(clap::Args)]
@@ -1641,8 +1658,56 @@ mod tests {
                     assert_eq!(recommendation, "regroom");
                     assert_eq!(note.as_deref(), Some("vu avec Vincent"));
                 }
+                // Nommée plutôt que balayée par un `_` : une quatrième variante
+                // doit faire échouer la compilation de ce test, pour que
+                // l'auteur de la variante vienne décider ce qu'elle analyse.
+                FlightVerdictsCommand::Concordance { .. } => {
+                    panic!("expected the judge verb")
+                }
             },
             _ => panic!("expected FlightVerdicts command"),
+        }
+    }
+
+    /// `mika flight-verdicts concordance` porte `--format`, et son défaut est le
+    /// rendu texte (mika#2922, vol 3/3).
+    ///
+    /// Les deux moitiés sont une seule décision. Le **défaut** est tenu parce
+    /// qu'il est la surface humaine du verbe : un défaut en JSON joli ferait de
+    /// la lecture d'opérateur un cas particulier à taper. Et la **présence** de
+    /// `--format` est tenue parce qu'elle est ce qui distingue ce verbe de
+    /// `judge`, qui écrit et n'en porte pas — l'asymétrie est délibérée, donc
+    /// elle est attestée plutôt que laissée à la lecture du code.
+    #[test]
+    fn mika2922_concordance_porte_le_format_et_son_defaut_est_le_texte() {
+        for (args, attendu) in [
+            (vec!["mika", "flight-verdicts", "concordance"], "text"),
+            (
+                vec!["mika", "flight-verdicts", "concordance", "--format", "json"],
+                "json",
+            ),
+            (
+                vec!["mika", "flight-verdicts", "concordance", "--format", "yaml"],
+                "yaml",
+            ),
+        ] {
+            let cli = parse_cli(&args);
+            match cli.command {
+                Some(Commands::FlightVerdicts(a)) => match a.command {
+                    FlightVerdictsCommand::Concordance { format } => {
+                        let rendu = match format {
+                            OutputFormat::Text => "text",
+                            OutputFormat::Json => "json",
+                            OutputFormat::Yaml => "yaml",
+                        };
+                        assert_eq!(rendu, attendu, "pour {args:?}");
+                    }
+                    FlightVerdictsCommand::Judge { .. } => {
+                        panic!("expected the concordance verb")
+                    }
+                },
+                _ => panic!("expected FlightVerdicts command"),
+            }
         }
     }
 
