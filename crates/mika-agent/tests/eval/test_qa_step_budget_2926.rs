@@ -87,6 +87,9 @@ const RUN_SHELL_CALLS: usize = 23;
 // Outils
 // ---------------------------------------------------------------------------
 
+/// Le journal d'appels d'un outil : les entrées reçues, dans l'ordre.
+type CallLog = Arc<Mutex<Vec<Value>>>;
+
 /// Un outil qui enregistre ses appels et ne fait rien d'autre.
 ///
 /// `run_shell` et `run_gh` sont des outils de skill, absents de
@@ -94,7 +97,7 @@ const RUN_SHELL_CALLS: usize = 23;
 /// `gh` ni aucun shell n'est exécuté.
 struct Recording {
     name: &'static str,
-    calls: Arc<Mutex<Vec<Value>>>,
+    calls: CallLog,
 }
 
 #[async_trait]
@@ -128,7 +131,7 @@ impl MessageSender for NoopSender {
 
 /// Le registre du tour : `run_shell` et `run_gh`, chacun avec son journal
 /// d'appels.
-fn qa_tools() -> (ToolRegistry, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<Value>>>) {
+fn qa_tools() -> (ToolRegistry, CallLog, CallLog) {
     let shell_calls = Arc::new(Mutex::new(Vec::new()));
     let gh_calls = Arc::new(Mutex::new(Vec::new()));
     let mut tools = default_tools();
