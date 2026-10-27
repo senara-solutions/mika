@@ -1,0 +1,28 @@
+[
+  {
+    "name": "qa_head_reviews",
+    "description": "Fetch the reviews whose commit_id is exactly this head SHA. Returns a JSON array of {author, state, submitted_at, carries_verdict_line} — an empty array means no review has ever ruled on this head. Review bodies are NOT returned; carries_verdict_line is the fact that a body carries a `VERDICT: pass` or `VERDICT: block[...]` line. This is the only read that names the head a review ruled on: `reviewDecision` and `mergeStateStatus` are PR-level states that survive a force-push (mika#2934). A missing or malformed field is an error, never an empty array.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "repo": {
+          "type": "string",
+          "description": "owner/name, exactly as the webhook names it (e.g. senara-solutions/mika)"
+        },
+        "pr": {
+          "type": "integer",
+          "description": "the PR number the check_suite names"
+        },
+        "head_sha": {
+          "type": "string",
+          "description": "the check_suite's head SHA — 40 lowercase hex characters, already in hand from the event"
+        }
+      },
+      "required": ["repo", "pr", "head_sha"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/qa_head_reviews.sh"
+    }
+  }
+]

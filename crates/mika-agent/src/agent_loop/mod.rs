@@ -2116,6 +2116,9 @@ async fn run_loop(
                         mode.is_conversation(),
                         stream_ctx,
                         delivery_log,
+                        // mika#2934 — l'emprunt immuable meurt avec l'appel,
+                        // l'`extend` juste en dessous reprend la main.
+                        &all_tool_summaries,
                     )
                     .await;
                     all_tool_summaries.extend(step_summaries);
@@ -5030,6 +5033,11 @@ async fn run_loop(
                     mode.is_conversation(),
                     stream_ctx,
                     delivery_log,
+                    // mika#2934 — c'est ce site qui porte le cas réel : la
+                    // preuve exigée (un `pr review` posté, une lecture de cette
+                    // tête) vient presque toujours d'un pas **antérieur** du
+                    // même tour.
+                    &all_tool_summaries,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
