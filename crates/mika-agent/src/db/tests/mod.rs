@@ -1078,6 +1078,95 @@ pub(crate) fn completed_groom_pair(
     (parent_id, callback_id)
 }
 
+/// Les trois seuls axes qu'un vol `implement` terminé fait varier pour les
+/// tests de mika#2921. Tout le reste de sa forme est fixe et vient des
+/// constructeurs de production.
+pub(crate) struct VolReel<'a> {
+    /// L'URL du ticket, portée par la **parente** — la seule des deux rows qui
+    /// en porte une. C'est la colonne que
+    /// `list_finished_implement_flights_in_container` filtre par dépôt.
+    pub(crate) url_du_ticket: &'a str,
+    /// Le statut terminal de la parente, et par là le chemin d'écriture de
+    /// production emprunté : `"completed"` passe par `update_task_completed`,
+    /// `"failed"` par `update_task_failed`. Tout autre valeur panique — un
+    /// statut semé hors de ces deux chemins serait une forme que la production
+    /// n'écrit pas.
+    pub(crate) statut: &'a str,
+    /// Le `result` de l'**enfant** : la sortie de claude-pilot, dont la ligne
+    /// `Outcome:` est ce que l'évaluateur classe.
+    pub(crate) issue_du_pilote: &'a str,
+}
+
+/// Sème un vol `implement` terminé dans la **topologie à deux lignes** de
+/// mika#2886 et rend l'id de sa parente.
+///
+/// La forme est celle de la production, et c'est tout l'intérêt du helper :
+///
+/// - la **parente** (`ready-label: …`, `dispatch_class = "implement"`) porte le
+///   `reference_url` et **aucun** `result` sur le chemin `completed` — l'absence,
+///   pas une chaîne vide (motif mika#2331) ;
+/// - l'**enfant** (`long_running:run_claude_pilot`, `reference_url` NULL,
+///   `parent_task_id` → parente) porte la ligne `Outcome:`.
+///
+/// L'enfant est bâti par [`crate::skills::executor::build_callback_task`], le
+/// constructeur de production, et non par un `NewTask` littéral : son `label` et
+/// son `dispatch_class` sont exactement ce que `is_pilot_dispatch_label` et le
+/// `COALESCE(parent.dispatch_class, 'implement')` de la requête interrogent, et
+/// un littéral recopié ici cesserait de suivre un changement de l'un ou de
+/// l'autre.
+///
+/// `register_agent` est un upsert (`ON CONFLICT(id) DO UPDATE`), donc semer
+/// treize vols sous un même `agent_id` ne demande aucune précaution d'appel.
+///
+/// Promu ici par mika#2921 : il vivait dans le `mod tests` privé de
+/// `flight_source.rs`, et le corpus des 13 vols en a besoin depuis
+/// `db::tests::vols_termines_du_manager` — deux modules frères, donc invisibles
+/// l'un à l'autre (règle de visibilité mika#2321). Les helpers partagés vivent
+/// à la racine de ce module ; c'est ce que son docstring déclare.
+pub(crate) fn seme_la_forme_reelle(db: &Database, agent_id: &str, vol: &VolReel<'_>) -> String {
+    db.register_agent(agent_id, agent_id, &format!("/tmp/{agent_id}"))
+        .expect("l'agent dispatcheur doit être enregistré");
+
+    let parente = NewTask {
+        dispatch_class: Some("implement".to_string()),
+        ..groom_parent(agent_id, vol.url_du_ticket)
+    };
+    let parente_id = db
+        .create_task(&parente)
+        .expect("la parente doit être créée");
+
+    let enfant = crate::skills::executor::build_callback_task(
+        agent_id.to_string(),
+        Some(parente_id.clone()),
+        "run_claude_pilot",
+        &serde_json::json!({"skill": "dev-pilot"}),
+        3_600,
+        "session-2921",
+        "trace-2921",
+        None,
+    );
+    let enfant_id = db.create_task(&enfant).expect("l'enfant doit être créé");
+    db.update_task_completed(&enfant_id, agent_id, Some(vol.issue_du_pilote))
+        .expect("la complétion de l'enfant doit réussir");
+
+    match vol.statut {
+        "completed" => {
+            db.update_task_completed(&parente_id, agent_id, None)
+                .expect("la complétion de la parente doit réussir");
+        }
+        "failed" => {
+            db.update_task_failed(&parente_id, agent_id, "pilot_failed")
+                .expect("l'échec de la parente doit réussir");
+        }
+        autre => panic!(
+            "statut terminal non semable : {autre} — seuls `completed` et `failed` \
+             ont un chemin d'écriture de production ici"
+        ),
+    }
+
+    parente_id
+}
+
 /// Force `created_at` sur une row pour rendre l'ordre chronologique
 /// observable : les timestamps ISO-8601 sont à la seconde, donc deux rows
 /// créées dans le même test les partagent et l'ordre retomberait sur le

@@ -22,9 +22,7 @@
 
 use super::{
     assessor::{Assessor, AssessorConfig},
-    evaluator::{
-        FinishedFlight, FlightSource, FlightVerdict, evaluate_flights, milestone_issue_urls,
-    },
+    evaluator::{FinishedFlight, FlightSource, FlightVerdict, evaluate_flights},
     pool_writer::{admit_pool_tickets, pool_write_is_armed},
     reader::{GhRunner, ProcessGhRunner, Reader},
     reporter::Reporter,
@@ -570,16 +568,20 @@ impl<'a> CycleContext<'a> {
 ///
 /// Chaque branche construit donc son scan et l'émet, **y compris celle à
 /// zéro** : c'est la branche à zéro qui porte l'information.
+///
+/// Depuis mika#2921 il n'en reste que **deux** : le périmètre n'est plus les
+/// sous-tickets du milestone mais les dépôts sous contrôle, une liste constante,
+/// donc la branche « rien à interroger » n'existe plus.
 struct FlightScan {
-    /// Laquelle des trois branches a répondu : `unwired`,
-    /// `no_milestone_issues` ou `read`. Un champ, pas trois événements : la
-    /// question « où est passée la lecture de ce cycle ? » doit se répondre
-    /// avec un `group by` sur une seule ligne par cycle.
+    /// Laquelle des deux branches a répondu : `unwired` ou `read`. Un champ,
+    /// pas deux événements : la question « où est passée la lecture de ce
+    /// cycle ? » doit se répondre avec un `group by` sur une seule ligne par
+    /// cycle.
     branch: &'static str,
-    /// Sous-tickets du milestone interrogés. Zéro sur les deux branches
-    /// courtes, et c'est ce zéro qui sépare « milestone vide » de « lecture à
-    /// vide ».
-    issue_count: usize,
+    /// Dépôts sous contrôle interrogés (mika#2921). Zéro sur la branche
+    /// courte ; sur `read` c'est la taille du périmètre jugé, et un `4` ici est
+    /// ce qui distingue « la boucle entière a été lue » d'une liste rabotée.
+    repo_count: usize,
     flights_found: usize,
     verdicts: usize,
     /// Les agents **propriétaires** des vols trouvés, distincts et triés. Vide
@@ -595,20 +597,7 @@ impl FlightScan {
     fn unwired() -> Self {
         Self {
             branch: "unwired",
-            issue_count: 0,
-            flights_found: 0,
-            verdicts: 0,
-            flight_agents: String::new(),
-        }
-    }
-
-    /// Une source, mais aucun sous-ticket à interroger. La lecture n'a pas eu
-    /// lieu, et ne devait pas : une liste d'URLs vide ferait évaluer `tasks`
-    /// en entier.
-    fn no_milestone_issues() -> Self {
-        Self {
-            branch: "no_milestone_issues",
-            issue_count: 0,
+            repo_count: 0,
             flights_found: 0,
             verdicts: 0,
             flight_agents: String::new(),
@@ -617,24 +606,24 @@ impl FlightScan {
 
     /// La lecture a eu lieu. Les trois compteurs peuvent valoir zéro, et ce
     /// zéro est alors une mesure plutôt qu'une absence.
-    fn read(issue_count: usize, flights: &[FinishedFlight], verdicts: usize) -> Self {
+    fn read(repo_count: usize, flights: &[FinishedFlight], verdicts: usize) -> Self {
         let mut agents: Vec<&str> = flights.iter().map(|f| f.agent_id.as_str()).collect();
         agents.sort_unstable();
         agents.dedup();
         Self {
             branch: "read",
-            issue_count,
+            repo_count,
             flights_found: flights.len(),
             verdicts,
             flight_agents: agents.join(","),
         }
     }
 
-    /// Une ligne par cycle, sur les trois branches, sans condition.
+    /// Une ligne par cycle, sur les deux branches, sans condition.
     ///
     /// `scope` est constant : il dit que la lecture n'est plus scopée à un
     /// agent (mika#2792), donc qu'un `flights_found = 0` sous un
-    /// `issue_count > 0` se lit comme « aucun vol terminé » et non comme
+    /// `repo_count > 0` se lit comme « aucun vol terminé » et non comme
     /// « mauvaise base ». L'**absence** de cette ligne signifie un binaire
     /// antérieur au correctif (classe mika#2340), jamais une absence de vol.
     fn emit(&self, since: Option<&str>) {
@@ -643,7 +632,7 @@ impl FlightScan {
             event = "manager_flight_scan",
             branch = self.branch,
             scope = "container",
-            issue_count = self.issue_count,
+            repo_count = self.repo_count,
             flights_found = self.flights_found,
             verdicts = self.verdicts,
             flight_agents = %self.flight_agents,
@@ -658,13 +647,22 @@ impl FlightScan {
 /// Bornée par `since` — `checkpoint.last_observed_at`, c'est-à-dire exactement
 /// « depuis le cycle précédent » du ticket. Au premier cycle il n'y a pas de
 /// checkpoint, donc pas de borne : la source rend alors tous les vols terminés
-/// sur les tickets du milestone, ce qui est la lecture honnête de « depuis
+/// sur les dépôts sous contrôle, ce qui est la lecture honnête de « depuis
 /// toujours » et non un silence.
+///
+/// **Le périmètre ne passe plus par ici** (mika#2921). Cette fonction appelait
+/// [`milestone_issue_urls`] et court-circuitait sur une liste vide ; cette
+/// branche est retirée, et son absence ne veut **pas** dire que la borne a
+/// disparu — elle a déménagé dans la source, qui est le lecteur unique de la
+/// liste des dépôts (`crate::flight_source`). Un milestone sans sous-ticket ne
+/// rend donc plus zéro vol : il rend les vols de la boucle, ce qui est l'objet
+/// du ticket. `state.sub_issues` reste lu, mais pour **apparier** le rapport par
+/// milestone, jamais pour borner la lecture.
 ///
 /// Ne rend jamais d'erreur : une source en panne rend `vec![]` (et son propre
 /// WARN), donc un rapport sans section plutôt qu'un cycle mort.
 ///
-/// Rend aussi son [`FlightScan`] (mika#2792) : les trois sorties sont
+/// Rend aussi son [`FlightScan`] (mika#2792) : les deux sorties sont
 /// mesurées, pas seulement celle qui trouve quelque chose.
 async fn collect_flight_verdicts(
     ctx: &CycleContext<'_>,
@@ -674,14 +672,17 @@ async fn collect_flight_verdicts(
     let Some(source) = ctx.flight_source else {
         return (Vec::new(), FlightScan::unwired());
     };
-    let issue_urls = milestone_issue_urls(state);
-    if issue_urls.is_empty() {
-        return (Vec::new(), FlightScan::no_milestone_issues());
-    }
     let since = checkpoint.and_then(|c| c.last_observed_at.as_deref());
-    let flights = source.finished_implement_flights(since, &issue_urls).await;
+    let flights = source.finished_implement_flights(since).await;
     let verdicts = evaluate_flights(&flights, &state.sub_issues);
-    let scan = FlightScan::read(issue_urls.len(), &flights, verdicts.len());
+    // La taille du périmètre se demande à son lecteur unique : ce fichier ne
+    // nomme aucun dépôt (garde `no_repo_list_test.rs`) et n'a donc aucune liste
+    // à compter.
+    let scan = FlightScan::read(
+        crate::flight_source::controlled_repos().len(),
+        &flights,
+        verdicts.len(),
+    );
     (verdicts, scan)
 }
 
@@ -1949,13 +1950,18 @@ mod tests {
     // -- mika#2698 vol 1 : le câblage de la source de vols -------------------
 
     /// Source de vols instrumentée : elle enregistre **ce qu'on lui a demandé**
-    /// — la borne `since` et les URLs — et rend les vols qu'on lui a donnés.
+    /// — la borne `since` — et rend les vols qu'on lui a donnés.
     /// L'enregistrement est ce qui rend la borne observable : sans lui, un
     /// `since` toujours `None` donnerait exactement les mêmes verdicts qu'un
     /// `since` correct sur un jeu de fixtures d'un seul vol.
+    ///
+    /// Le journal ne porte plus de liste d'URLs (mika#2921) : le périmètre n'est
+    /// plus un paramètre du trait, donc il n'y a plus rien à enregistrer de ce
+    /// côté — et plus rien qu'un appelant puisse se tromper en passant.
+    ///
     /// Le journal des demandes : une entrée par lecture, portant la borne
-    /// `since` et la liste d'URLs interrogées.
-    type FlightQueries = Arc<Mutex<Vec<(Option<String>, Vec<String>)>>>;
+    /// `since`.
+    type FlightQueries = Arc<Mutex<Vec<Option<String>>>>;
 
     struct RecordingFlightSource {
         flights: Vec<crate::milestone_manager::evaluator::FinishedFlight>,
@@ -1982,12 +1988,8 @@ mod tests {
         async fn finished_implement_flights(
             &self,
             since: Option<&str>,
-            issue_urls: &[String],
         ) -> Vec<crate::milestone_manager::evaluator::FinishedFlight> {
-            self.asked
-                .lock()
-                .unwrap()
-                .push((since.map(str::to_string), issue_urls.to_vec()));
+            self.asked.lock().unwrap().push(since.map(str::to_string));
             self.flights.clone()
         }
     }
@@ -2008,10 +2010,11 @@ mod tests {
             metadata: Some(r#"{"claude_pilot":{"turns":83}}"#.into()),
             reference_url: Some("https://github.com/senara-solutions/mika/issues/1802".into()),
             completed_at: Some("2026-08-21T06:00:00Z".into()),
+            repo: Some("senara-solutions/mika".into()),
         }
     }
 
-    // -- mika#2792 : la ligne de scan, sur les trois branches ----------------
+    // -- mika#2792 : la ligne de scan, sur les deux branches -----------------
 
     /// Un `MakeWriter` qui accumule dans un tampon partagé les octets qu'un
     /// souscripteur `fmt` écrirait. Les tests de scan ci-dessous comparent les
@@ -2062,7 +2065,7 @@ mod tests {
     /// empoisonneurs autant que le capturant : un voisin qui enregistre ce
     /// callsite sans abonné en éteint l'`Interest` globalement, et la capture
     /// rendrait zéro. Ici le capturant est
-    /// `mika2792_les_trois_branches_ne_rendent_pas_les_memes_octets`, et les
+    /// `mika2792_les_deux_branches_ne_rendent_pas_les_memes_octets`, et les
     /// empoisonneurs sont les tests qui font tourner un cycle entier.
     fn octets_du_scan(scan: &FlightScan) -> String {
         use tracing_subscriber::layer::SubscriberExt;
@@ -2087,45 +2090,55 @@ mod tests {
     async fn mika2792_sans_source_le_scan_dit_unwired() {
         let scan = scan_du_cycle(None, &base_state()).await;
         assert_eq!(scan.branch, "unwired");
-        assert_eq!(scan.issue_count, 0);
+        assert_eq!(scan.repo_count, 0);
         assert_eq!(scan.flights_found, 0);
         assert!(scan.flight_agents.is_empty());
     }
 
-    /// Branche 2 : une source, mais aucun sous-ticket. La lecture n'a pas eu
-    /// lieu — et ne devait pas : une liste d'URLs vide ferait évaluer `tasks`
-    /// en entier. La source est câblée avec un vol, pour que le test échoue si
-    /// la branche courte cessait de court-circuiter.
+    /// **AC1 au niveau de la cadence** (mika#2921). Un milestone **sans
+    /// sous-ticket** faisait court-circuiter la lecture : c'était la branche
+    /// `no_milestone_issues`, et elle est retirée. La lecture part désormais, et
+    /// le vol trouvé reçoit son verdict — un manager qui ne juge qu'un milestone
+    /// n'est pas un manager.
+    ///
+    /// La source est câblée avec un vol, donc un retour de la branche courte
+    /// ferait rougir les deux assertions à la fois.
     #[tokio::test]
-    async fn mika2792_un_milestone_sans_sous_ticket_dit_no_milestone_issues() {
+    async fn mika2921_un_milestone_sans_sous_ticket_lit_quand_meme_la_boucle() {
         let (source, asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
         let state = MilestoneState {
             sub_issues: vec![],
             ..base_state()
         };
         let scan = scan_du_cycle(Some(&source), &state).await;
-        assert_eq!(scan.branch, "no_milestone_issues");
-        assert_eq!(scan.issue_count, 0);
-        assert_eq!(scan.flights_found, 0);
-        assert!(
-            asked.lock().unwrap().is_empty(),
-            "aucune lecture ne doit partir sans sous-ticket"
+        assert_eq!(scan.branch, "read");
+        assert_eq!(
+            scan.flights_found, 1,
+            "le vol de la boucle est lu même si le milestone est vide"
+        );
+        assert_eq!(scan.verdicts, 1, "et il reçoit un verdict");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "la lecture part : le périmètre ne dépend plus des sous-tickets"
         );
     }
 
-    /// Branche 3, le cas qui portait tout le silence : la lecture **a eu
-    /// lieu** et n'a rien trouvé. Le scan porte alors le compte de tickets
-    /// interrogés — c'est ce `issue_count > 0` avec `flights_found = 0` qui
+    /// Branche 2, le cas qui portait tout le silence : la lecture **a eu
+    /// lieu** et n'a rien trouvé. Le scan porte alors le compte de **dépôts**
+    /// interrogés — c'est ce `repo_count > 0` avec `flights_found = 0` qui
     /// sépare « aucun vol terminé » de « mauvaise base ».
     #[tokio::test]
-    async fn mika2792_une_lecture_a_zero_vol_porte_le_compte_de_tickets() {
+    async fn mika2921_une_lecture_a_zero_vol_porte_le_compte_de_depots() {
         let (source, _) = RecordingFlightSource::wired(vec![]);
         let scan = scan_du_cycle(Some(&source), &base_state()).await;
         assert_eq!(scan.branch, "read");
         assert_eq!(
-            scan.issue_count, 1,
-            "le milestone de `base_state` a un sous-ticket, et le scan doit le dire"
+            scan.repo_count,
+            crate::flight_source::controlled_repos().len(),
+            "le scan doit dire la taille du périmètre jugé, pas celle du milestone"
         );
+        assert!(scan.repo_count > 0);
         assert_eq!(scan.flights_found, 0);
         assert_eq!(scan.verdicts, 0);
         assert!(
@@ -2156,22 +2169,21 @@ mod tests {
         assert_eq!(scan.flight_agents, "mika-dev,mika-qa");
     }
 
-    /// **Le test de la classe mika#2205.** Les trois branches rendaient les
+    /// **Le test de la classe mika#2205.** Les branches rendaient les
     /// mêmes octets — rien — et c'est pourquoi quatre jours d'inertie n'ont été
     /// vus qu'en relisant le SQL. Chacune doit maintenant écrire une ligne, et
-    /// les trois lignes doivent différer deux à deux.
+    /// les lignes doivent différer deux à deux.
+    ///
+    /// Elles sont **deux** depuis mika#2921 : `no_milestone_issues` a disparu
+    /// avec le périmètre par milestone. La propriété pinnée ne change pas — ce
+    /// qui change est le nombre de populations à séparer.
     #[tokio::test]
     #[serial_test::serial]
-    async fn mika2792_les_trois_branches_ne_rendent_pas_les_memes_octets() {
+    async fn mika2792_les_deux_branches_ne_rendent_pas_les_memes_octets() {
         let (source, _) = RecordingFlightSource::wired(vec![]);
-        let sans_ticket = MilestoneState {
-            sub_issues: vec![],
-            ..base_state()
-        };
 
         let lignes = [
             octets_du_scan(&scan_du_cycle(None, &base_state()).await),
-            octets_du_scan(&scan_du_cycle(Some(&source), &sans_ticket).await),
             octets_du_scan(&scan_du_cycle(Some(&source), &base_state()).await),
         ];
 
@@ -2257,7 +2269,7 @@ mod tests {
         assert_eq!(v.turns_used, Some(83));
         assert!(
             body.report_markdown.contains(
-                "### Vols terminés depuis le cycle précédent (mode ombre — aucune écriture)"
+                "### Vols terminés depuis le cycle précédent (toute la boucle — mode ombre, aucune écriture)"
             ),
             "la section doit apparaître :\n{}",
             body.report_markdown
@@ -2293,28 +2305,29 @@ mod tests {
         let asked = asked.lock().unwrap();
         assert_eq!(asked.len(), 2, "une lecture par cycle");
         assert_eq!(
-            asked[0].0, None,
+            asked[0], None,
             "premier cycle : aucun checkpoint, aucune borne"
         );
         assert_eq!(
-            asked[1].0.as_deref(),
+            asked[1].as_deref(),
             Some("2026-08-20T00:00:00Z"),
             "second cycle : la borne est le `last_observed_at` du checkpoint"
         );
-        assert_eq!(
-            asked[0].1,
-            vec!["https://github.com/senara-solutions/mika/issues/1802".to_string()],
-            "les URLs demandées sont celles des sous-tickets du milestone"
-        );
     }
 
-    /// Le contrôle négatif du détecteur, côté cadence : un milestone **sans
-    /// sous-ticket** ne doit pas faire lire quoi que ce soit. Sans cette borne,
-    /// une liste d'URLs vide descendrait jusqu'au SQL, où elle se lirait comme
-    /// « tous les vols de la base ».
+    /// **AC1 sur le cycle entier** (mika#2921). Le test jumeau de mika#2698
+    /// exigeait l'inverse — « aucun sous-ticket ⇒ la source n'est même pas
+    /// interrogée » — parce que le périmètre était alors la liste d'URLs du
+    /// milestone, et qu'une liste vide se serait lue comme « tous les vols de la
+    /// base ». Cette borne vit maintenant en base, sur une liste de **dépôts**
+    /// que l'appelant ne fournit plus.
+    ///
+    /// Donc un milestone sans sous-ticket lit la boucle, et son verdict atteint
+    /// l'assessment : c'est exactement ce que les 43 rapports du puits ne
+    /// portaient pas.
     #[tokio::test]
     #[serial_test::serial]
-    async fn mika2698_un_milestone_sans_sous_ticket_ne_lit_aucun_vol() {
+    async fn mika2921_un_milestone_sans_sous_ticket_juge_quand_meme_la_boucle() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = mk_config(tmp.path());
         let rec = RecordingDeliverer::default();
@@ -2332,12 +2345,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            asked.lock().unwrap().is_empty(),
-            "aucun sous-ticket ⇒ la source n'est même pas interrogée"
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "la lecture part : le périmètre est le dépôt, pas le milestone"
         );
         let calls = rec.calls.lock().unwrap();
-        assert!(calls[0].2.assessment.flight_verdicts.is_empty());
+        assert_eq!(
+            calls[0].2.assessment.flight_verdicts.len(),
+            1,
+            "le vol hors milestone reçoit son verdict"
+        );
     }
 
     // -- mika#2698 vol 2 : l'interrupteur, le geste, l'idempotence -----------

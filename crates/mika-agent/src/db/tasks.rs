@@ -4909,15 +4909,31 @@ impl Database {
         Ok(rows)
     }
 
-    /// Les vols d'implémentation **terminés** sur un ensemble de tickets, pour le
-    /// manager de milestone (mika#2698, vol 1). Lecture seule, zéro DDL, aucune
-    /// dépendance réseau : tout est déjà dans `tasks`.
+    /// Les vols d'implémentation **terminés** sur un ensemble de **dépôts**, pour
+    /// le manager de milestone (mika#2698 vol 1, élargi par mika#2921). Lecture
+    /// seule, zéro DDL, aucune dépendance réseau : tout est déjà dans `tasks`.
     ///
-    /// `issue_urls` est étendu à l'**ensemble clos des variantes**
-    /// ([`crate::task_state::tasks::issue_url_variants`]) pour chaque URL, donc
-    /// le suffixe `?phase=groom` est couvert tandis qu'un voisin numérique ne
-    /// l'est pas — même règle que `find_dispatch_children_for_issue_url`. Un
-    /// `issue_urls` vide rend `vec![]` plutôt qu'un `IN ()` invalide.
+    /// **Le périmètre est le dépôt, plus le ticket** (mika#2921). `repos` porte
+    /// des `owner/repo` et chacun devient un `reference_url LIKE
+    /// 'https://github.com/<owner>/<repo>/issues/%' ESCAPE '\'` ; les motifs sont
+    /// joints par `OR`. Un `repos` vide rend `vec![]` — « aucun dépôt sous
+    /// contrôle » ⇒ « aucun vol », jamais « tous les vols ». **Aucun nom de dépôt
+    /// n'est écrit dans ce fichier** : la liste arrive par paramètre, et son
+    /// lecteur unique est [`crate::flight_source`].
+    ///
+    /// Trois propriétés du prédicat, chacune acquise plutôt que choisie :
+    ///
+    /// - l'ancien `IN (<variantes closes>)` couvrait `?phase=groom` par
+    ///   énumération ([`crate::task_state::tasks::issue_url_variants`]) ; le `%`
+    ///   terminal le couvre par construction, et le voisin numérique que
+    ///   l'énumération écartait n'est plus une question — on ne vise plus un
+    ///   numéro ;
+    /// - `senara-solutions/mika` ne capture pas `senara-solutions/mika-cloud` :
+    ///   le motif exige `/issues/` juste après le nom du dépôt ;
+    /// - `%`, `_` et `\` d'un nom de dépôt sont échappés
+    ///   ([`escape_like_literal`]), sans quoi un `_` ferait du motif un
+    ///   joker d'un caractère. Le `LIKE` de SQLite est insensible à la casse sur
+    ///   l'ASCII, ce qui coïncide avec la casse des dépôts GitHub.
     ///
     /// **La borne temporelle est `COALESCE(completed_at, updated_at)`**, et le
     /// `COALESCE` est portant plutôt que défensif : `update_task_completed`
@@ -4947,10 +4963,11 @@ impl Database {
     /// Lever le filtre ne traverse aucune frontière : `init_agent` ouvre une
     /// base **unique** par conteneur (`home::container_db_path`), donc le scope
     /// par `agent_id` y est purement logique, et un conteneur est un client
-    /// (topologie « one container per customer »). Le filtre porteur reste
-    /// `reference_url IN (…)` — les sous-issues du milestone que le manager
-    /// surveille déjà : la lecture **coïncide** désormais avec sa surveillance,
-    /// elle ne l'élargit pas.
+    /// (topologie « one container per customer »). Le filtre porteur est
+    /// désormais le dépôt : mika#2698 bornait la lecture aux sous-issues du
+    /// milestone surveillé, mika#2921 la borne au périmètre des dépôts sous
+    /// contrôle — « la boucle, jamais au-delà ». Le **rapport** reste, lui, par
+    /// milestone.
     ///
     /// **Deux requêtes, et la seconde est la raison de mika#2886.** La ligne
     /// que l'URL du ticket trouve est la **parente** `ready-label: …#N` : elle
@@ -4964,23 +4981,27 @@ impl Database {
     pub fn list_finished_implement_flights_in_container(
         &self,
         since: Option<&str>,
-        issue_urls: &[String],
+        repos: &[String],
     ) -> Result<Vec<FinishedFlightRow>> {
-        if issue_urls.is_empty() {
+        if repos.is_empty() {
             return Ok(vec![]);
         }
-        let variants: Vec<String> = issue_urls
-            .iter()
-            .flat_map(|u| crate::task_state::tasks::issue_url_variants(u))
-            .collect();
-        let placeholders: String = (0..variants.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let motifs: Vec<String> = repos.iter().map(|r| issue_url_like_pattern(r)).collect();
+        // Le prédicat de dépôt, écrit **une fois** et porté sur la colonne que
+        // chaque requête nomme — `reference_url` pour la 1, `parent.reference_url`
+        // pour la 2. Les numéros de liaison sont les mêmes des deux côtés, donc la
+        // seconde requête ne consomme **aucun paramètre de plus**.
+        let predicat_depot = |colonne: &str| -> String {
+            (0..motifs.len())
+                .map(|i| format!("{colonne} LIKE ?{} ESCAPE '\\'", i + 2))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
+        let clause = predicat_depot("reference_url");
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE COALESCE(dispatch_class, 'implement') = 'implement'
-               AND reference_url IN ({placeholders})
+               AND ({clause})
                AND COALESCE(completed_at, updated_at) > ?1
              ORDER BY COALESCE(completed_at, updated_at) ASC",
             Self::TASK_COLUMNS,
@@ -4988,8 +5009,8 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(since.unwrap_or("").to_string())];
-        for v in &variants {
-            bind.push(Box::new(v.clone()));
+        for m in &motifs {
+            bind.push(Box::new(m.clone()));
         }
         let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
         let rows: Vec<Task> = stmt
@@ -5021,12 +5042,13 @@ impl Database {
             .map(|c| format!("child.{}", c.trim()))
             .collect::<Vec<_>>()
             .join(", ");
+        let clause_parente = predicat_depot("parent.reference_url");
         let sql_enfants = format!(
             "SELECT {child_columns}
              FROM tasks child
              JOIN tasks parent ON child.parent_task_id = parent.id
              WHERE COALESCE(parent.dispatch_class, 'implement') = 'implement'
-               AND parent.reference_url IN ({placeholders})
+               AND ({clause_parente})
                AND COALESCE(parent.completed_at, parent.updated_at) > ?1"
         );
         let mut stmt = self.conn.prepare(&sql_enfants)?;
@@ -5104,4 +5126,34 @@ pub struct FinishedFlightRow {
     /// `None` quand le vol n'a aucun enfant pilote terminé portant un
     /// `result` — jamais une chaîne vide (motif mika#2331 : absent ≠ vide).
     pub pilot_result: Option<String>,
+}
+
+/// Le motif `LIKE` qui reconnaît **toute** URL d'issue d'un dépôt (mika#2921).
+///
+/// `senara-solutions/mika` ⇒ `https://github.com/senara-solutions/mika/issues/%`.
+/// Le `/issues/` littéral avant le joker est ce qui empêche `mika` de capturer
+/// `mika-cloud`, et le `%` terminal est ce qui couvre le suffixe `?phase=groom`
+/// sans énumérer de variante.
+fn issue_url_like_pattern(repo: &str) -> String {
+    format!(
+        "https://github.com/{}/issues/%",
+        escape_like_literal(repo.trim_matches('/'))
+    )
+}
+
+/// Échappe les métacaractères `LIKE` d'un littéral, pour un `ESCAPE '\'`.
+///
+/// Sans cela un `_` dans un nom de dépôt serait un joker d'un caractère, et
+/// `mika_cloud` reconnaîtrait `mika-cloud` : un élargissement silencieux du
+/// périmètre, exactement ce que « jamais au-delà » interdit. Le `\` est échappé
+/// en premier au sein du même parcours, donc jamais deux fois.
+fn escape_like_literal(litteral: &str) -> String {
+    let mut sortie = String::with_capacity(litteral.len());
+    for c in litteral.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            sortie.push('\\');
+        }
+        sortie.push(c);
+    }
+    sortie
 }

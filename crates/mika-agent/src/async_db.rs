@@ -1891,10 +1891,11 @@ impl AsyncDatabase {
         .await
     }
 
-    /// Les vols d'implémentation terminés sur un ensemble de tickets (mika#2698).
+    /// Les vols d'implémentation terminés sur un ensemble de **dépôts**
+    /// (mika#2698, élargi par mika#2921).
     /// Voir [`crate::db::Database::list_finished_implement_flights_in_container`]
-    /// pour la borne temporelle, l'ensemble clos des variantes d'URL et le
-    /// filtre de statut terminal.
+    /// pour la borne temporelle, le motif `LIKE` par dépôt et le filtre de
+    /// statut terminal. `repos` vide ⇒ aucun vol.
     ///
     /// **La seule méthode de ce fichier qui ne lit pas `self.agent_id`**, et
     /// c'est le correctif de mika#2792 : ce handle ne sert que de **connexion**
@@ -1909,10 +1910,10 @@ impl AsyncDatabase {
     pub async fn list_finished_implement_flights_in_container(
         &self,
         since: Option<String>,
-        issue_urls: Vec<String>,
+        repos: Vec<String>,
     ) -> Result<Vec<crate::db::tasks::FinishedFlightRow>> {
         self.with_db(move |db| {
-            db.list_finished_implement_flights_in_container(since.as_deref(), &issue_urls)
+            db.list_finished_implement_flights_in_container(since.as_deref(), &repos)
         })
         .await
     }

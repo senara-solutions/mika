@@ -192,7 +192,9 @@ fn geste_args() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::milestone_manager::evaluator::{FlightIssue, FlightRecommendation};
+    use crate::milestone_manager::evaluator::{
+        FlightIssue, FlightRecommendation, PrStateKnowledge,
+    };
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -229,6 +231,7 @@ mod tests {
     fn verdict(task_id: &str, issue_number: Option<u64>) -> FlightVerdict {
         FlightVerdict {
             task_id: task_id.into(),
+            repo: Some("senara-solutions/mika".into()),
             issue_number,
             issue: FlightIssue::PrOpened {
                 number: Some(2704),
@@ -238,6 +241,7 @@ mod tests {
             hit_ceiling: true,
             turn_ceiling: None,
             last_commit_turn: None,
+            pr_state: PrStateKnowledge::Read(None),
             recommendation: FlightRecommendation::MergeCandidate,
             completed_at: Some("2026-10-14T22:00:00Z".into()),
         }

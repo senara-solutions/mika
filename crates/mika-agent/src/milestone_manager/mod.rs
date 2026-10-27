@@ -179,6 +179,32 @@
 //! section « Vols terminés depuis le cycle précédent ». C'est le *mode ombre*
 //! du ticket, et il reste la destination par défaut.
 //!
+//! ## Le périmètre jugé est la boucle, le rapport reste par milestone (mika#2921)
+//!
+//! **Le vol 1 ne jugeait que les sous-issues du milestone cible, et la boucle
+//! travaillait ailleurs** : au 2026-10-26, aucun des 13 vols `implement`
+//! terminés des trois derniers jours n'était dans `senara-solutions/mika#33`,
+//! donc aucun rapport ne portait de section « Vols terminés » et le correctif
+//! mika#2886 n'avait jamais été vu à l'œuvre. L'évaluateur juge désormais **tout
+//! vol `implement` terminé dont le ticket est sur un dépôt sous contrôle**, quel
+//! que soit son milestone — le périmètre vient de
+//! [`crate::webhook_dispatch::DISPATCHABLE_REPOS`], lu à un seul endroit
+//! (`crate::flight_source`), et **aucun fichier de ce module ne nomme un
+//! dépôt** : la requête les reçoit en paramètre.
+//!
+//! **Le rapport, lui, reste par milestone.** Ce qu'il dit du milestone cible ne
+//! bouge pas d'un octet ; seule la section « Vols terminés » couvre la boucle, et
+//! son titre le dit. Chaque ligne porte le dépôt (`mika#2900` et
+//! `mika-cloud#193` ne sont pas le même vol) et ce que le rapport **sait** de
+//! l'appartenance au milestone cible — jamais un numéro de milestone deviné pour
+//! un vol hors cible, parce que le `Reader` ne l'a pas lu et que le lire
+//! coûterait l'appel réseau que l'invariant « aucun appel de plus » refuse. Un
+//! vol hors cible porte donc [`evaluator::PrStateKnowledge::NotRead`] : « lu et
+//! vide » et « pas lu » sont deux populations distinctes (classe mika#2205), et
+//! les fusionner dans un `Option` aurait rendu la non-lecture indicible.
+//!
+//! Aucune autorité nouvelle : `MIKA_MANAGER_EVALUATE_WRITE` n'est pas touchée.
+//!
 //! ## Phase 2 (b) vol 2 — l'interrupteur et le geste unique (mika#2698)
 //!
 //! **Ce que le vol 2 a ajouté :** [`verdict_poster`], et rien d'autre sur la
@@ -256,6 +282,9 @@ pub mod verdict_poster;
 #[cfg(test)]
 mod no_dispatch_test;
 
+#[cfg(test)]
+mod no_repo_list_test;
+
 pub use assessor::{Assessor, AssessorConfig};
 pub use cadence::{
     CycleContext, CycleKind, DeliveryBody, DeliveryError, DeliveryFailureKind, HttpReportDeliverer,
@@ -265,7 +294,7 @@ pub use cadence::{
 };
 pub use evaluator::{
     DeathCause, FinishedFlight, FlightIssue, FlightRecommendation, FlightSource, FlightVerdict,
-    evaluate_flight, evaluate_flights, milestone_issue_urls,
+    PrStateKnowledge, evaluate_flight, evaluate_flights, milestone_issue_urls,
 };
 pub use liveness::{
     ENV_LIVENESS_URL, HttpLivenessSink, LIVENESS_ENTITY, LIVENESS_TIMEOUT, LivenessBody,
