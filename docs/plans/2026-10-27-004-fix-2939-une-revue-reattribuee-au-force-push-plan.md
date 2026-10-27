@@ -358,11 +358,17 @@ Correction — un terme de plus, et un appel de plus :
 
 ```bash
 first_seen=$(gh api "repos/$repo/commits/$sha/check-suites?per_page=100" \
-  --jq '[.check_suites[].created_at] | min // empty')
+  --jq '[(.check_suites // [])[].created_at] | min // empty')
 [ -n "$first_seen" ] || { echo "INDÉTERMINÉ $repo#$pr@$sha — aucune check_suite"; continue; }
 first=$(gh api "repos/$repo/pulls/$pr/reviews" --paginate \
   --jq "[.[] | select(.user.login == \"mika-platform-qa\" and .commit_id == \"$sha\" and .submitted_at >= \"$first_seen\") | .submitted_at] | sort | first // empty")
 ```
+
+Le `// []` sur `.check_suites` est celui du handler livré, et pour la même
+raison : sans lui un corps sans ce champ fait planter `jq`, `gh` sort non nul, et
+la branche qui se déclenche est celle de l'erreur de transport — alors que la
+cause est une forme de réponse. Avec lui, `first_seen` repart vide et la sonde
+dit **`INDÉTERMINÉ`**, qui est la bonne issue.
 
 Trois propriétés voulues :
 
@@ -373,6 +379,15 @@ Trois propriétés voulues :
   mesure qui ne peut pas conclure doit le dire (mika#2331 — absent ≠ zéro) ;
 - la Lecture 4 est inchangée :
   `grep -c 'reviewed_head_write_without_evidence' ~/.mika/logs/mika-spirit.log`.
+
+**Pourquoi cette sonde refait le filtre, alors qu'AC1 l'interdit au prompt.** Les
+deux ne lisent pas la même chose. Le prompt est un tour de l'agent : il reçoit la
+sortie de `qa_head_reviews`, donc refaire le filtre y serait une seconde réponse
+à une question déjà tranchée, et la doctrine *remove capability, don't prohibit
+it* veut qu'il ne voie même pas les revues écartées. La sonde, elle, est un audit
+**externe** — elle lit la forge et `audit_events`, jamais l'outil — et son objet
+est précisément de vérifier que le moteur a appliqué le filtre. Une sonde qui
+demanderait la réponse à l'instrument qu'elle contrôle n'attesterait rien.
 
 **Vérification à la main, faite avant d'écrire ce plan.** Sur
 `#2920@5e4918cf` : `first_seen = 12:44:36Z`, la revue de 07:16:49Z est écartée, le
