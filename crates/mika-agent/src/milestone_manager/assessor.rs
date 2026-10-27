@@ -12,9 +12,11 @@
 //! `last_activity_at` is older than the threshold).
 
 use super::pool;
+use super::reader::TIMELINE_PAGE_SIZE;
 use super::relief;
 use super::types::{
-    Alert, AlertKind, Assessment, IssueState, MilestoneState, Recommendation, Severity, SubIssue,
+    Alert, AlertKind, Assessment, IssueState, MergedPrReading, MilestoneState, Recommendation,
+    Severity, SubIssue,
 };
 use chrono::{DateTime, Utc};
 
@@ -210,6 +212,130 @@ pub fn detect_silence(
     }
 }
 
+/// Le sous-ticket que le **palier 1** nommerait, ou `None` (mika#2924, vol 2).
+///
+/// Extrait du corps de [`pick_next_action`] sans toucher ni au prédicat ni au
+/// tri : les sept tests de paliers déjà au dossier sont la preuve que rien n'a
+/// bougé. Existe pour que [`timeline_probe_target`] puisse poser la question
+/// « le palier 1 l'emporte-t-il ? » sans la rejouer.
+fn tier1_pick(state: &MilestoneState) -> Option<&SubIssue> {
+    let mut tier1: Vec<&SubIssue> = state
+        .sub_issues
+        .iter()
+        .filter(|s| s.state == IssueState::Open && s.pr_number.is_some() && !s.is_hard_blocked())
+        .collect();
+    tier1.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
+    tier1.first().copied()
+}
+
+/// Le sous-ticket que le **palier 2** nommerait, ou `None` (mika#2924, vol 2).
+///
+/// Même extraction, même preuve que [`tier1_pick`].
+fn tier2_pick(state: &MilestoneState) -> Option<&SubIssue> {
+    let mut tier2: Vec<&SubIssue> = state
+        .sub_issues
+        .iter()
+        .filter(|s| {
+            s.state == IssueState::Open
+                && s.plan_present
+                && s.pr_number.is_none()
+                && !s.is_hard_blocked()
+        })
+        .collect();
+    tier2.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
+    tier2.first().copied()
+}
+
+/// Le ticket dont la sonde de timeline décidera du libellé « Next » de ce
+/// cycle — au plus un, et `None` quand le palier 2 ne décide pas (mika#2924,
+/// vol 2).
+///
+/// Désigné **ici**, au même endroit qu'au jugement, et pour la même raison que
+/// la lecture 6 du `Reader` : rejouer le filtre côté lecture rendrait les deux
+/// réponses identiques aujourd'hui et muettes le jour où l'une des deux change.
+///
+/// `None` quand le palier 1 l'emporte — un milestone en vol ne paie **aucun**
+/// appel de plus.
+pub(super) fn timeline_probe_target(state: &MilestoneState) -> Option<u64> {
+    if tier1_pick(state).is_some() {
+        return None;
+    }
+    tier2_pick(state).map(|s| s.number)
+}
+
+/// Combien de PR le libellé « Next » nomme au plus (mika#2924, vol 2).
+///
+/// Trois : l'opérateur veut savoir où en est le **dernier vol**, pas
+/// l'histoire complète du ticket. #2698 en portait six le 2026-10-27, et une
+/// ligne de rapport qui les énumère toutes cesse d'être lue.
+const NEXT_LABEL_PR_MAX: usize = 3;
+
+/// Le libellé « Next » du palier 2, dérivé de ce que la sonde de timeline a dit
+/// (mika#2924, vol 2).
+///
+/// Cinq branches, et c'est la seule fonction de ce vol qui change un octet du
+/// rapport :
+///
+/// - **des PR mergées citent le ticket** — le libellé les nomme. Il dit
+///   « merged PRs already cite it » et **jamais** « livré » :
+///   `cross-referenced` est plus large que « la PR qui délivre ce ticket »
+///   (#2929 et #2931 citent #2698 sans le livrer), et le ticket reste bien le
+///   « Next » — c'est la *raison* qui cesse de mentir, pas la recommandation
+///   qui disparaît.
+/// - **page pleine** / **échec de lecture** — deux libellés distincts, parce
+///   que les remèdes sont opposés : paginer d'un côté, réparer la forge de
+///   l'autre. Ni l'un ni l'autre ne dit « no PR », qui serait une affirmation
+///   que la lecture n'a pas faite.
+/// - **`NoneCiting`** — la timeline a été lue en entier, aucune PR mergée : le
+///   texte historique est vrai, il reste **mot pour mot**.
+/// - **`None`** — la sonde n'a pas été émise (palier 1 vainqueur, ticket non
+///   désigné, ou blob d'un binaire antérieur au vol). Le texte historique, là
+///   aussi : un binaire antérieur garde son libellé, il n'hérite pas d'une
+///   incertitude qu'il n'a pas mesurée (motif mika#2340).
+///
+/// `Citing` vide est traité comme `NoneCiting` — le composeur ne le produit
+/// pas, et une branche qui rendrait une liste de PR vide dirait moins que rien.
+fn tier2_rationale(s: &SubIssue) -> String {
+    let n = s.number;
+    match &s.merged_prs {
+        Some(MergedPrReading::Citing(prs)) if !prs.is_empty() => format!(
+            "#{n} has a plan and merged PRs already cite it ({}) — check what \
+             remains before implementing",
+            name_merged_prs(prs)
+        ),
+        Some(MergedPrReading::IndeterminatePageFull) => format!(
+            "#{n} has a plan; its timeline is truncated ({TIMELINE_PAGE_SIZE} events read) \
+             — PR state indeterminate, verify by hand before implementing"
+        ),
+        Some(MergedPrReading::IndeterminateFetchFailed) => format!(
+            "#{n} has a plan; its timeline could not be read — PR state \
+             indeterminate, verify by hand before implementing"
+        ),
+        Some(MergedPrReading::NoneCiting) | Some(MergedPrReading::Citing(_)) | None => {
+            format!("#{n} has a plan but no PR — implementation is the next step")
+        }
+    }
+}
+
+/// Les PR les plus récemment mergées, au plus [`NEXT_LABEL_PR_MAX`], et le
+/// reste compté (mika#2924, vol 2).
+///
+/// Le reste est **compté et non tu** : « trois PR mergées » et « six dont on
+/// vous montre trois » sont deux états différents du ticket, et la troncature
+/// silencieuse est ce qui ferait lire le second comme le premier.
+fn name_merged_prs(prs: &[u64]) -> String {
+    let shown: Vec<String> = prs
+        .iter()
+        .take(NEXT_LABEL_PR_MAX)
+        .map(|p| format!("#{p}"))
+        .collect();
+    let mut out = format!("PR {}", shown.join(", "));
+    if let Some(rest) = prs.len().checked_sub(NEXT_LABEL_PR_MAX).filter(|r| *r > 0) {
+        out.push_str(&format!(" (+{rest} more)"));
+    }
+    out
+}
+
 /// Pick the next actionable sub-issue.
 ///
 /// Ranking (higher priority first):
@@ -222,13 +348,7 @@ pub fn detect_silence(
 /// then issue number ascending.
 pub fn pick_next_action(state: &MilestoneState, _alerts: &[Alert]) -> Recommendation {
     // Tier 1: in-flight with a PR.
-    let mut tier1: Vec<&SubIssue> = state
-        .sub_issues
-        .iter()
-        .filter(|s| s.state == IssueState::Open && s.pr_number.is_some() && !s.is_hard_blocked())
-        .collect();
-    tier1.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
-    if let Some(s) = tier1.first() {
+    if let Some(s) = tier1_pick(state) {
         return Recommendation {
             next_sub_issue: Some(s.number),
             rationale: format!(
@@ -240,24 +360,10 @@ pub fn pick_next_action(state: &MilestoneState, _alerts: &[Alert]) -> Recommenda
     }
 
     // Tier 2: open + plan + no PR.
-    let mut tier2: Vec<&SubIssue> = state
-        .sub_issues
-        .iter()
-        .filter(|s| {
-            s.state == IssueState::Open
-                && s.plan_present
-                && s.pr_number.is_none()
-                && !s.is_hard_blocked()
-        })
-        .collect();
-    tier2.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
-    if let Some(s) = tier2.first() {
+    if let Some(s) = tier2_pick(state) {
         return Recommendation {
             next_sub_issue: Some(s.number),
-            rationale: format!(
-                "#{} has a plan but no PR — implementation is the next step",
-                s.number
-            ),
+            rationale: tier2_rationale(s),
         };
     }
 
@@ -337,6 +443,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-08-20T00:00:00Z".into(),
@@ -834,6 +941,151 @@ mod tests {
             ),
             "la relève est exactement celle que la fonction pure tire du verdict \
              posé — l'assesseur ne juge pas le bassin deux fois"
+        );
+    }
+
+    /// Un candidat du palier 2 dont des PR mergées citent le ticket (mika#2924,
+    /// vol 2, AC2).
+    ///
+    /// La forme exacte de #2698 le 2026-10-27 : six PR mergées, triées par
+    /// `merged_at` décroissant. Le contrôle négatif est dans le **même** test,
+    /// parce que c'est la paire qui sépare « le libellé suit la sonde » de « le
+    /// libellé a changé pour tout le monde ».
+    #[test]
+    fn mika2924_next_nomme_les_pr_mergees_au_lieu_de_reclamer_une_implementation() {
+        let mut cite = base_issue(2698);
+        cite.plan_present = true;
+        cite.merged_prs = Some(MergedPrReading::Citing(vec![
+            2931, 2929, 2892, 2706, 2704, 2712,
+        ]));
+        let rec = pick_next_action(&base_state(vec![cite]), &[]);
+
+        assert_eq!(
+            rec.next_sub_issue,
+            Some(2698),
+            "le ticket reste le « Next »"
+        );
+        assert_eq!(
+            rec.rationale,
+            "#2698 has a plan and merged PRs already cite it (PR #2931, #2929, \
+             #2892 (+3 more)) — check what remains before implementing",
+            "les trois plus récentes sont nommées, le reste est compté"
+        );
+        assert!(
+            !rec.rationale.contains("no PR"),
+            "c'est exactement le mensonge que ce vol corrige : le rapport du \
+             sink du 2026-10-26 disait « #2698 has a plan but no PR » alors que \
+             #2704 et #2706 étaient mergées depuis le 2026-10-16"
+        );
+        assert!(
+            !rec.rationale.contains("delivered") && !rec.rationale.contains("livré"),
+            "`cross-referenced` est plus large que « la PR qui délivre ce \
+             ticket » — #2929 et #2931 citent #2698 sans le livrer, donc le \
+             libellé ne déduit aucun numéro de vol"
+        );
+
+        // Contrôle négatif, même test : timeline lue en entier, aucune PR.
+        let mut sans = base_issue(2699);
+        sans.plan_present = true;
+        sans.merged_prs = Some(MergedPrReading::NoneCiting);
+        assert_eq!(
+            pick_next_action(&base_state(vec![sans]), &[]).rationale,
+            "#2699 has a plan but no PR — implementation is the next step",
+            "quand la timeline atteste l'absence, le texte historique est vrai \
+             et reste mot pour mot"
+        );
+    }
+
+    /// Une indétermination ne se lit jamais comme une absence (mika#2924,
+    /// vol 2 — classe mika#2205).
+    #[test]
+    fn mika2924_une_page_pleine_ne_se_lit_jamais_comme_une_absence_de_pr() {
+        let mut pleine = base_issue(2698);
+        pleine.plan_present = true;
+        pleine.merged_prs = Some(MergedPrReading::IndeterminatePageFull);
+        let page_full = pick_next_action(&base_state(vec![pleine]), &[]).rationale;
+
+        let mut echec = base_issue(2698);
+        echec.plan_present = true;
+        echec.merged_prs = Some(MergedPrReading::IndeterminateFetchFailed);
+        let fetch_failed = pick_next_action(&base_state(vec![echec]), &[]).rationale;
+
+        assert_eq!(
+            page_full,
+            "#2698 has a plan; its timeline is truncated (100 events read) — PR \
+             state indeterminate, verify by hand before implementing",
+            "la page pleine nomme le nombre d'événements lus, donc le remède : \
+             paginer"
+        );
+        assert_eq!(
+            fetch_failed,
+            "#2698 has a plan; its timeline could not be read — PR state \
+             indeterminate, verify by hand before implementing",
+            "l'échec de lecture nomme son remède : la forge"
+        );
+        assert_ne!(
+            page_full, fetch_failed,
+            "deux causes d'indétermination aux remèdes opposés ne peuvent pas \
+             rendre les mêmes octets (classe mika#2205)"
+        );
+        for r in [&page_full, &fetch_failed] {
+            assert!(
+                !r.contains("no PR"),
+                "« la lecture n'a pas conclu » n'est pas « aucune PR » : {r}"
+            );
+        }
+        assert!(
+            page_full.contains(&TIMELINE_PAGE_SIZE.to_string()),
+            "le nombre annoncé est celui de la constante qui décide la \
+             troncature, pas un littéral qui en divergerait"
+        );
+    }
+
+    /// Un binaire antérieur au vol garde son libellé (mika#2924, vol 2 — motif
+    /// mika#2340).
+    #[test]
+    fn mika2924_un_blob_sans_sonde_garde_le_libelle_historique() {
+        let mut sans_sonde = base_issue(2698);
+        sans_sonde.plan_present = true;
+        assert_eq!(sans_sonde.merged_prs, None, "la sonde n'a pas parlé");
+        assert_eq!(
+            pick_next_action(&base_state(vec![sans_sonde]), &[]).rationale,
+            "#2698 has a plan but no PR — implementation is the next step",
+            "`None` signifie « la sonde n'a pas été émise » et jamais « aucune \
+             PR » : un binaire antérieur garde son texte, il n'hérite pas d'une \
+             incertitude qu'il n'a pas mesurée"
+        );
+    }
+
+    /// La cible de la sonde est désignée au même endroit que le jugement
+    /// (mika#2924, vol 2).
+    #[test]
+    fn mika2924_la_cible_de_sonde_est_vide_quand_le_palier_1_lemporte() {
+        let mut avec_pr = base_issue(2700);
+        avec_pr.pr_number = Some(2701);
+        let mut avec_plan = base_issue(2698);
+        avec_plan.plan_present = true;
+
+        let palier1 = base_state(vec![avec_pr, avec_plan.clone()]);
+        assert_eq!(
+            timeline_probe_target(&palier1),
+            None,
+            "le palier 1 l'emporte : la sonde n'est pas émise, et son coût `gh` \
+             est nul"
+        );
+
+        let palier2 = base_state(vec![avec_plan]);
+        assert_eq!(
+            timeline_probe_target(&palier2),
+            Some(2698),
+            "sans candidat de palier 1, la cible est celle que le palier 2 \
+             nommerait"
+        );
+        assert_eq!(
+            timeline_probe_target(&palier2),
+            pick_next_action(&palier2, &[]).next_sub_issue,
+            "même site qu'au jugement : lire ailleurs que là où l'on décide, \
+             c'est sonder un ticket et en recommander un autre"
         );
     }
 }

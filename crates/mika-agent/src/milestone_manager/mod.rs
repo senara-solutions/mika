@@ -308,8 +308,8 @@ pub use pool::{
 };
 pub use pool_writer::{ENV_POOL_WRITE, admit_pool_tickets, pool_write_is_armed};
 pub use reader::{
-    GhRunner, OUTSIDE_READ_LIMIT, ProcessGhRunner, Reader, compose_from_gh_outputs,
-    compose_outside_candidates, compose_ready_pool,
+    GhRunner, OUTSIDE_READ_LIMIT, ProcessGhRunner, Reader, TIMELINE_PAGE_SIZE, TIMELINE_PROBE_MAX,
+    compose_from_gh_outputs, compose_merged_prs, compose_outside_candidates, compose_ready_pool,
 };
 pub use relief::{RELIEF_SIZE, ReliefTicket, ReliefVerdict, name_relief};
 pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};
@@ -323,8 +323,9 @@ pub use spawn::{
     spawn_manager_cycle_task,
 };
 pub use types::{
-    Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MilestoneRef, MilestoneState,
-    PrLinkSource, ProgressCounts, RecentActivity, Recommendation, Severity, SubIssue,
+    Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MergedPrReading, MilestoneRef,
+    MilestoneState, PrLinkSource, ProgressCounts, RecentActivity, Recommendation, Severity,
+    SubIssue,
 };
 pub use verdict_poster::{
     ENV_EVALUATE_WRITE, MARKER_PREFIX, post_verdicts, render_verdict_comment, verdict_marker,
