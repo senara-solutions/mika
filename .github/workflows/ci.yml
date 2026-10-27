@@ -647,6 +647,14 @@ jobs:
       # logic is guarded even though the operator script itself cannot be.
       - name: The dependabot topology verifier's own logic, with gh faked (mika#1997)
         run: bash scripts/test-verify-dependabot-topology.sh
+      # AC2 of mika#2939: a review only rules on a head that existed when it was
+      # submitted. The #2920 case is replayed against a faked `gh` — on the forge
+      # the pre-force-push state no longer exists, so this is the only place the
+      # property is establishable, and it is offline by construction. The suite
+      # carries its own redness control: the handler stripped of its `>=
+      # $first_seen` term must return the antedated review.
+      - name: A review predating its head is no evidence, with gh faked (mika#2939)
+        run: bash scripts/test-qa-head-reviews-handler.sh
       # The harness of the script every flight is required to end on. mika#2516
       # is what its absence from CI has already cost once: a guard announced
       # inside verify-pipeline.sh, never delivered, and nobody saw it. It was
