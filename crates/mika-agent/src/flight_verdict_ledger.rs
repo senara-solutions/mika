@@ -175,6 +175,7 @@ use crate::evidence::audit::AUDIT_RETENTION_DAYS;
 use crate::milestone_manager::evaluator::{
     DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
 };
+use crate::milestone_manager::reporter::{flight_issue_label, flight_recommendation_label};
 
 /// `audit_events.tool_name` du registre des verdicts de vol du manager
 /// (mika#2922, vol 1).
@@ -1056,6 +1057,162 @@ fn warn_concordance_unreadable(task_id: &str, side: &str, error: &str) {
         error = error,
         "une ligne du registre ne se re-type pas — le vol est rendu illisible, jamais concordant"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Le rendu du compte (vol 3) : ce que l'opérateur lit.
+// ---------------------------------------------------------------------------
+
+/// Les en-têtes des cinq colonnes. La **sixième** donnée qu'énonce le ticket —
+/// le champ divergent — est portée **dans** la colonne « accord », sous la forme
+/// `divergent (cause)`, exactement comme la maquette du plan l'écrit : un champ
+/// divergent n'existe que pour un désaccord, donc une sixième colonne serait
+/// vide sur toutes les autres lignes. Le rendu `json`/`yaml` les sépare
+/// (`accord` et `field`), et c'est là que la machine les lit.
+const COLUMNS: [&str; 5] = ["vol", "ticket", "manager", "MPC", "accord"];
+
+/// Ce qu'une cellule porte quand la donnée est **absente** : pas de ticket
+/// lisible, ou pas de jugement du tout. Jamais `0`, jamais `#0`, jamais une
+/// chaîne vide qu'on lirait pour un bug d'alignement (motif mika#2331).
+const ABSENT: &str = "—";
+
+/// Le compte de concordance, en texte, pour un opérateur.
+///
+/// # Deux choix de forme, parce qu'ils se re-devineraient mal
+///
+/// 1. **La clé est rendue entière.** La maquette du plan montre huit caractères
+///    (`a1b2c3d4`) ; en production `tasks.id` est un UUID, et l'étape 5 de la
+///    sonde d'AC6 demande à l'opérateur de recopier cette clé dans
+///    `mika flight-verdicts judge --task-id <…>`. Une clé tronquée rendrait le
+///    geste suivant impossible : on ne tronque pas ce qu'on demande de coller.
+/// 2. **Les largeurs se calculent sur le contenu**, sans ellipse. La maquette
+///    coupe à trente colonnes (`mort au plafond (budget_ex…)`) ; mais une
+///    cellule tronquée efface précisément ce que la colonne « accord » vient de
+///    nommer — un `divergent (cause)` dont les deux causes sont illisibles est
+///    un instrument qui montre un désaccord sans le montrer. La ligne est plus
+///    large ; elle est entière.
+///
+/// Le vocabulaire français vient de [`flight_issue_label`] et
+/// [`flight_recommendation_label`], promus `pub(crate)` par ce vol : un second
+/// vocabulaire pour une seule grammaire serait la divergence programmée de
+/// mika#2158.
+pub fn render_concordance_text(report: &ConcordanceReport) -> String {
+    let mut out = String::new();
+
+    out.push_str(&format!(
+        "Concordance manager / MPC — {} vol{}, fenêtre de {} jours\n",
+        report.rows.len(),
+        pluriel(report.rows.len()),
+        report.window_days
+    ));
+    out.push_str(&format!(
+        "{} vol{} consécutif{} concordant{} (du plus récent au plus ancien ; seuil mika#2698 : 10 vols ou 7 jours)\n",
+        report.consecutive_concordant,
+        pluriel(report.consecutive_concordant),
+        pluriel(report.consecutive_concordant),
+        pluriel(report.consecutive_concordant)
+    ));
+    // Les orphelins sont **dits**, pas jetés : une ligne de MPC sans verdict du
+    // manager sous la même clé n'a pas de place dans le tableau (l'appariement
+    // se fait sur la population du manager), mais la taire ferait d'un registre
+    // désaligné un registre sain.
+    if report.orphan_mpc > 0 {
+        out.push_str(&format!(
+            "{} jugement{} de MPC sans verdict du manager sous la même clé — hors du tableau, et comptés ici\n",
+            report.orphan_mpc,
+            pluriel(report.orphan_mpc)
+        ));
+    }
+
+    if report.rows.is_empty() {
+        out.push_str("\nAucun vol inscrit dans la fenêtre.\n");
+        return out;
+    }
+
+    let cells: Vec<[String; 5]> = report.rows.iter().map(row_cells).collect();
+    let mut widths = COLUMNS.map(str::len);
+    for row in &cells {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+
+    out.push('\n');
+    out.push_str(&ligne_alignee(&COLUMNS.map(String::from), &widths));
+    for row in &cells {
+        out.push_str(&ligne_alignee(row, &widths));
+    }
+    out
+}
+
+/// Les cinq cellules d'un vol.
+fn row_cells(row: &ConcordanceRow) -> [String; 5] {
+    [
+        row.task_id.clone(),
+        match row.issue_number {
+            Some(n) => format!("#{n}"),
+            None => ABSENT.to_string(),
+        },
+        cote(row.manager.as_ref(), row.agreement, SIDE_MANAGER),
+        cote(row.mpc.as_ref(), row.agreement, SIDE_MPC),
+        accord_label(row.agreement),
+    ]
+}
+
+/// Un côté du registre : son verdict, ou la raison de son absence.
+///
+/// « Illisible » et « absent » sont deux cellules distinctes parce qu'elles sont
+/// deux faits distincts (classe mika#2205) : la première dit qu'une ligne existe
+/// et ne se relit pas — donc qu'il y a quelque chose à réparer — la seconde
+/// qu'il n'y a rien à lire.
+fn cote(record: Option<&VerdictRecord>, agreement: FlightAgreement, side: &'static str) -> String {
+    match record {
+        Some(record) => format!(
+            "{} · {}",
+            flight_issue_label(&record.issue),
+            flight_recommendation_label(record.recommendation)
+        ),
+        None => match agreement {
+            FlightAgreement::Unreadable { side: fautif } if fautif == side => {
+                "illisible".to_string()
+            }
+            _ => ABSENT.to_string(),
+        },
+    }
+}
+
+/// La colonne « accord », qui porte aussi le champ divergent (cf. [`COLUMNS`]).
+fn accord_label(agreement: FlightAgreement) -> String {
+    match agreement {
+        FlightAgreement::Concordant => "concordant".to_string(),
+        FlightAgreement::Divergent { field } => format!("divergent ({field})"),
+        FlightAgreement::NotJudgedByMpc => "non jugé par MPC".to_string(),
+        FlightAgreement::Unreadable { side } => format!("illisible ({side})"),
+    }
+}
+
+/// Une ligne du tableau, les quatre premières colonnes complétées à leur
+/// largeur. Le comptage est en `chars()` et non en octets : « mort au plafond »
+/// porte des accents, et un `len()` décalerait tout le tableau.
+fn ligne_alignee(cells: &[String; 5], widths: &[usize; 5]) -> String {
+    let mut ligne = String::new();
+    for (i, (cell, width)) in cells.iter().zip(widths).enumerate() {
+        if i + 1 == cells.len() {
+            ligne.push_str(cell);
+        } else {
+            ligne.push_str(cell);
+            for _ in cell.chars().count()..*width + 2 {
+                ligne.push(' ');
+            }
+        }
+    }
+    ligne.push('\n');
+    ligne
+}
+
+/// Le `s` du pluriel français : absent à zéro **et** à un.
+fn pluriel(n: usize) -> &'static str {
+    if n > 1 { "s" } else { "" }
 }
 
 #[cfg(test)]
@@ -2169,6 +2326,255 @@ mod tests {
                 ligne("t-1", FlightAgreement::Concordant),
             ]),
             1
+        );
+    }
+
+    // ---- Le rendu : ce que l'opérateur lit ---------------------------------
+
+    /// **La tête porte les deux nombres et la fenêtre**, et le tableau porte
+    /// les cinq colonnes avec le champ divergent dans la cinquième.
+    ///
+    /// Le corpus est celui d'AC3 — deux concordants et un divergent sur la
+    /// cause, le divergent au milieu — donc la tête annonce `1` et non `2` :
+    /// le rendu lit le même compte que [`read_concordance`] et n'en recalcule
+    /// aucun.
+    #[tokio::test]
+    async fn mika2922_le_rendu_porte_la_tete_les_cinq_colonnes_et_le_champ_divergent() {
+        let db = base();
+        vol(
+            &db,
+            "task-1",
+            DeathCause::CeilingReached,
+            Some("ceiling_reached"),
+        )
+        .await;
+        vol(&db, "task-2", DeathCause::CeilingReached, Some("escalated")).await;
+        vol(
+            &db,
+            "task-3",
+            DeathCause::CeilingReached,
+            Some("ceiling_reached"),
+        )
+        .await;
+
+        let texte = render_concordance_text(&read_concordance(&db).await.unwrap());
+
+        assert!(
+            texte.contains(&format!(
+                "Concordance manager / MPC — 3 vols, fenêtre de {AUDIT_RETENTION_DAYS} jours"
+            )),
+            "la tête annonce le nombre de vols et la fenêtre : {texte}"
+        );
+        assert!(
+            texte.contains("1 vol consécutif concordant (du plus récent au plus ancien ; seuil mika#2698 : 10 vols ou 7 jours)"),
+            "la tête annonce le compte, au singulier, et nomme le seuil : {texte}"
+        );
+        for colonne in COLUMNS {
+            assert!(
+                texte.contains(colonne),
+                "colonne « {colonne} » absente : {texte}"
+            );
+        }
+        assert!(
+            texte.contains("divergent (cause)"),
+            "le champ divergent est nommé dans la colonne accord : {texte}"
+        );
+        assert!(
+            texte.contains("concordant\n"),
+            "les deux vols d'accord sont dits concordants : {texte}"
+        );
+        assert!(
+            texte.contains("#2922"),
+            "le ticket se lit sur la ligne du manager : {texte}"
+        );
+        // La clé est rendue **entière** : c'est elle que l'étape 5 de la sonde
+        // d'AC6 demande de recopier dans `judge --task-id`.
+        assert!(
+            texte.contains("task-2"),
+            "la clé n'est pas tronquée : {texte}"
+        );
+        // Le vocabulaire est celui de `reporter.rs`, pas un second.
+        assert!(
+            texte.contains("mort au plafond") && texte.contains("re-groom"),
+            "les labels viennent de reporter.rs : {texte}"
+        );
+        // Contrôle négatif de la tête : ce corpus n'a pas d'orphelin, donc la
+        // ligne des orphelins est **absente** — sans quoi « 0 orphelin » et
+        // « orphelins non comptés » rendraient le même texte.
+        assert!(
+            !texte.contains("sans verdict du manager"),
+            "pas d'orphelin ici, donc pas de ligne d'orphelins : {texte}"
+        );
+    }
+
+    /// Un vol non jugé par MPC, et un ticket absent, rendent la cellule
+    /// [`ABSENT`] et jamais une cellule vide, un `0` ou un `#0`.
+    ///
+    /// C'est exactement ce que l'étape 4 de la sonde d'AC6 doit lire.
+    #[tokio::test]
+    async fn mika2922_le_rendu_dit_labsence_et_lorphelin() {
+        let db = base();
+        // `verdict_pr` ne porte pas de ticket, et MPC ne juge pas ce vol.
+        assert_eq!(
+            write_and_swallow(&db, &verdict_pr("task-seul")).await,
+            InscriptionTally::one_inscribed()
+        );
+        let juge = parse_judgment_terms("dead", Some("escalated"), "regroom").unwrap();
+        record_mpc_judgment(&db, "task-orphelin", &juge, None)
+            .await
+            .unwrap();
+
+        let texte = render_concordance_text(&read_concordance(&db).await.unwrap());
+
+        assert!(
+            texte.contains("non jugé par MPC"),
+            "AC4 se lit dans le rendu : {texte}"
+        );
+        assert!(
+            texte.contains(ABSENT),
+            "le ticket absent et le côté MPC absent rendent « {ABSENT} » : {texte}"
+        );
+        assert!(
+            !texte.contains("#0"),
+            "un ticket absent n'est jamais le ticket #0 : {texte}"
+        );
+        assert!(
+            texte.contains("1 jugement de MPC sans verdict du manager sous la même clé"),
+            "l'orphelin est dit, pas jeté : {texte}"
+        );
+        assert!(
+            texte.contains("0 vol consécutif concordant"),
+            "un vol non jugé ne fait pas monter le compte : {texte}"
+        );
+    }
+
+    /// **Un registre vide rend la tête, et le dit.** C'est l'état que l'étape 2
+    /// de la sonde d'AC6 lit avant le premier cycle : la tête, la fenêtre, et
+    /// `0 vol`. Une sortie muette ferait passer « rien n'est inscrit » pour une
+    /// commande en panne.
+    #[tokio::test]
+    async fn mika2922_le_rendu_dun_registre_vide_porte_quand_meme_la_tete() {
+        let texte = render_concordance_text(&read_concordance(&base()).await.unwrap());
+
+        assert!(
+            texte.contains(&format!(
+                "Concordance manager / MPC — 0 vol, fenêtre de {AUDIT_RETENTION_DAYS} jours"
+            )),
+            "la fenêtre est annoncée même à vide, au singulier : {texte}"
+        );
+        assert!(texte.contains("0 vol consécutif concordant"), "{texte}");
+        assert!(
+            texte.contains("Aucun vol inscrit dans la fenêtre."),
+            "{texte}"
+        );
+        assert!(
+            !texte.contains(COLUMNS[4]),
+            "pas de tableau sans ligne : {texte}"
+        );
+    }
+
+    /// Une ligne illisible est **dite** illisible, des deux côtés distinctement,
+    /// et jamais rendue pour un désaccord.
+    ///
+    /// Sur la projection et non sur une base, pour la raison de
+    /// [`mika2922_une_ligne_illisible_arrete_le_compte`] : les écrivains des
+    /// vols 1 et 2 ne produisent pas d'`after_value` illisible, donc en
+    /// fabriquer un en base demanderait le SQL de fixture que la disposition du
+    /// plan refuse.
+    #[test]
+    fn mika2922_le_rendu_nomme_le_cote_illisible() {
+        let ligne = |agreement, manager: Option<VerdictRecord>| ConcordanceRow {
+            task_id: "task-1".to_string(),
+            issue_number: Some(2922),
+            manager,
+            mpc: None,
+            agreement,
+            created_at: "2026-10-26T10:00:00Z".to_string(),
+        };
+        let record = VerdictRecord {
+            issue: FlightIssue::Dead {
+                cause: DeathCause::Escalated,
+            },
+            recommendation: FlightRecommendation::Regroom,
+        };
+
+        let cote_manager = render_concordance_text(&ConcordanceReport {
+            rows: vec![ligne(
+                FlightAgreement::Unreadable { side: SIDE_MANAGER },
+                None,
+            )],
+            consecutive_concordant: 0,
+            window_days: AUDIT_RETENTION_DAYS,
+            orphan_mpc: 0,
+        });
+        assert!(
+            cote_manager.contains(&format!("illisible ({SIDE_MANAGER})")),
+            "la colonne accord nomme le côté fautif : {cote_manager}"
+        );
+        assert!(
+            cote_manager.contains("illisible  ") || cote_manager.contains("illisible\n"),
+            "la cellule du manager dit « illisible » : {cote_manager}"
+        );
+
+        // L'autre côté : le manager se lit, MPC non. La cellule du manager
+        // porte son verdict et c'est celle de MPC qui dit « illisible ».
+        let cote_mpc = render_concordance_text(&ConcordanceReport {
+            rows: vec![ligne(
+                FlightAgreement::Unreadable { side: SIDE_MPC },
+                Some(record),
+            )],
+            consecutive_concordant: 0,
+            window_days: AUDIT_RETENTION_DAYS,
+            orphan_mpc: 0,
+        });
+        assert!(
+            cote_mpc.contains(&format!("illisible ({SIDE_MPC})")),
+            "{cote_mpc}"
+        );
+        assert!(
+            cote_mpc.contains("mort — escalade"),
+            "le côté lisible reste rendu : {cote_mpc}"
+        );
+    }
+
+    /// Les colonnes s'alignent sur le contenu, en **caractères** et non en
+    /// octets. « mort au plafond » porte des accents : un `len()` sur les octets
+    /// déplacerait chaque colonne d'autant d'accents que la cellule en porte.
+    #[test]
+    fn mika2922_lalignement_compte_des_caracteres_pas_des_octets() {
+        let ligne = |task_id: &str, cause: DeathCause| ConcordanceRow {
+            task_id: task_id.to_string(),
+            issue_number: Some(2922),
+            manager: Some(VerdictRecord {
+                issue: FlightIssue::Dead { cause },
+                recommendation: FlightRecommendation::Regroom,
+            }),
+            mpc: None,
+            agreement: FlightAgreement::NotJudgedByMpc,
+            created_at: "2026-10-26T10:00:00Z".to_string(),
+        };
+        let texte = render_concordance_text(&ConcordanceReport {
+            rows: vec![
+                // Le premier label porte deux accents, le second aucun.
+                ligne("task-accentue", DeathCause::Escalated),
+                ligne("task-sans-accent", DeathCause::CeilingReached),
+            ],
+            consecutive_concordant: 0,
+            window_days: AUDIT_RETENTION_DAYS,
+            orphan_mpc: 0,
+        });
+
+        // « accord » est la dernière colonne, donc le rang de son premier
+        // caractère vaut la longueur de la ligne moins celle de la cellule.
+        let debuts: Vec<usize> = texte
+            .lines()
+            .filter(|l| l.ends_with("non jugé par MPC"))
+            .map(|l| l.chars().count() - "non jugé par MPC".chars().count())
+            .collect();
+        assert_eq!(debuts.len(), 2, "deux lignes de vol : {texte}");
+        assert_eq!(
+            debuts[0], debuts[1],
+            "la dernière colonne commence au même caractère sur les deux lignes : {texte}"
         );
     }
 

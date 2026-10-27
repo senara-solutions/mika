@@ -811,7 +811,13 @@ fn flight_pr_state_label(pr_state: &PrStateKnowledge) -> Option<String> {
     }
 }
 
-fn flight_issue_label(issue: &FlightIssue) -> String {
+/// `pub(crate)` depuis mika#2922 (vol 3) : le compte de concordance rend la
+/// **même** issue que le rapport du manager, donc il appelle ce label plutôt
+/// que d'en écrire un second. Un second vocabulaire français pour une seule
+/// grammaire serait la divergence programmée de mika#2158 — visible le jour où
+/// un terme change d'un côté seulement, et illisible pour l'opérateur qui lit
+/// les deux surfaces.
+pub(crate) fn flight_issue_label(issue: &FlightIssue) -> String {
     let pr = |number: &Option<u64>| match number {
         Some(n) => format!("#{n}"),
         None => "numéro inconnu".to_string(),
@@ -847,7 +853,9 @@ fn flight_turns_label(v: &FlightVerdict) -> String {
     }
 }
 
-fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
+/// `pub(crate)` depuis mika#2922 (vol 3), même raison que
+/// [`flight_issue_label`].
+pub(crate) fn flight_recommendation_label(r: FlightRecommendation) -> &'static str {
     match r {
         FlightRecommendation::MergeCandidate => "merge-candidat",
         FlightRecommendation::ManualResumption => "reprise à la main",
