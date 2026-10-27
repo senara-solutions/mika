@@ -134,6 +134,19 @@ timeout_secs = 30
 # Sharding was declined here as out of scope: it is a refactor of the largest
 # prompt in the repo, unrelated to a routing defect, and not risk-free (a
 # handler nobody depends on is unreachable and silently mute — mika#2355).
+#
+# **First addition since, and it took the trim option (mika#2927).** The
+# verdict-turn half of the `qa_reviewed_head` registry had to reach this prompt.
+# Written as the standalone `### Step 5b` section it takes in
+# `qa-review-build-callback` (9 Ko of headroom there), it cost 1 400 bytes and
+# reddened the gate at 78 692. It lives here instead as **invariant 7 of Step
+# 5's pre-termination self-check** — which is its natural home, not merely its
+# cheapest: invariant 6 already states the `pr review`-returned-success
+# condition that invariant 7 keys on. Cost 546 bytes, paid down by 230: the
+# Verdict/Review-type/Command table's four `--comment` rows repeated one
+# identical 64-byte command, and are now one row whose label still enumerates
+# all four classes. **Net +316 bytes, so 77 608 and 215 bytes of headroom** —
+# the next addition has no trim this cheap left and should expect to shard.
 max_prompt_size = 81920
 # `qa-review-build-callback` est listé ici pour une raison précise et
 # contre-intuitive (mika#2355 B1). Ce skill déclare déjà `dependencies =

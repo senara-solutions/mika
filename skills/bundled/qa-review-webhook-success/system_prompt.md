@@ -57,9 +57,9 @@ Two details that make the line readable rather than decorative:
 - **Attest on every outcome, the stops included.** A stop writes no trace at all today, and this measurement exists precisely to count the stops by number.
 - **If the line is missing, the engine records `outcome_absent`** — never a guessed stop, because steps 1 and 2 leave the same tool trace, as do steps 3 and 4. An unattested turn still costs its tokens; it just no longer says what they bought.
 
-## Record the head you concluded on (mika#2917)
+## Record the head you concluded on (mika#2917, corrected by mika#2927)
 
-**When.** After step 3, after step 4, or after step 5 — once the stop is established or the review is dispatched. Never before: the call attests what this turn did, it does not decide it, and it never replaces a step.
+**When.** After step 3 or after step 4 — once the stop is established. Never before: the call attests what this turn did, it does not decide it, and it never replaces a step.
 
 **What.** One call, carrying the **same** `outcome` value as this turn's attestation line (§ *Outcome attestation* above):
 
@@ -67,13 +67,15 @@ Two details that make the line readable rather than decorative:
 |---|---|
 | step 3 — one of your own reviews already carries this `commit_id` | `record_reviewed_head(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>", outcome: "stop_already_reviewed_sha")` |
 | step 4 — an authoritative verdict is already recorded on this head | `record_reviewed_head(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>", outcome: "stop_verdict_recorded")` |
-| step 5 — you dispatched the `qa-review` skill | `record_reviewed_head(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>", outcome: "review")` |
 
 `head_sha` is the check_suite's head SHA — the one you already read off the event at step 1. Do not go back to the forge for it.
 
-**The three other outcomes record nothing, and the tool refuses them:**
+**Dispatching a review at step 5 records NOTHING here.** There is no row to write when you hand the PR to `qa-review`, and the registry has no spelling for it — the tool refuses the value. The reason is measured, not theoretical: a dispatched review can die before its verdict. On 2026-10-26, session `4f94fbc8` recorded the head at dispatch, then exhausted its step budget 46 seconds later without launching a build or posting a verdict; the registry claimed a head had been ruled on that carries no review to this day. The head is recorded by the turn that **posts** the verdict on the forge (`qa-review` and `qa-review-build-callback`, after a successful `pr review`), never by the turn that dispatches one. So do not reinvent the step-5 row: it was deliberately removed.
+
+**The four other outcomes record nothing, and the tool refuses them:**
 
 - `stop_no_open_pr` (step 1) and `stop_out_of_scope` (step 2) — there is no PR, or none of yours, so there is no head to name.
+- `review` (step 5) — you dispatched a review; you did not rule on the head. See the paragraph above.
 - `review_failed` (step 6) — the review did **not** conclude on this head. Recording it would suppress a future review that still has to happen.
 
 **If the call fails.** Do not retry it, do not escalate it, and do not change the turn's outcome. A missing row costs one paid turn on the next `check_suite` for this head — which is exactly today's regime. An escalation, by contrast, would turn a bookkeeping miss into an operator interrupt.

@@ -652,6 +652,7 @@ If missing: note it as a finding but do NOT block or hold for this alone. The co
 4. If Step 3e ran, you have emitted a `BUILD VERIFICATION:` section (Step 3e.5).
 5. If verdict is `block[ac]`, you have emitted a `Plan amendment required:` section (Step 2.5.8).
 6. **You have called `run_gh("pr review <NUMBER> --<approve|comment> --body '<verdict_body>'")` and it returned success.** This is the only action that fires the `pull_request_review.submitted` webhook that mika-dev listens for. Without it, your review is invisible to the rest of the system — no matter how well-composed the verdict text is.
+7. **You have called `record_reviewed_head(repo: "<owner/repo>", pr: <NUMBER>, head_sha: "<headRefOid from Step 1>", outcome: "verdict_posted")`, once, after invariant 6 returned success** (mika#2917, mika#2927) — from the `headRefOid` already in context, with no extra forge call. If invariant 6 did not succeed (`POST_FAILED`, or a turn that never reached the post), record **nothing**: the row would silence the next `check_suite` on a head no verdict ever reached. If the call itself fails, do not retry or escalate it and do not change the verdict.
 
 > **Idempotency (enforced):** The engine rejects duplicate `pr review` calls within a single turn. If you attempt a second review, `run_gh` will return a `duplicate_pr_review` error — this is expected and means your first review was already posted. End your turn normally. Additionally, the engine accepts EndTurn immediately after a successful PR review (skipping later post-condition guards), so forced continuation will not occur. But if no review call exists yet, you MUST post before ending the turn — silent skip is a protocol violation.
 
@@ -660,10 +661,7 @@ Post your verdict as a GitHub pull request review using `run_gh`. The review typ
 | Verdict | Review type | Command |
 |---------|-------------|---------|
 | `pass`  | Approve     | `run_gh("pr review <NUMBER> --approve --body '<verdict_body>'")` |
-| `hold[review]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
-| `block[ac]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
-| `block[dependency]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
-| `block` (other sub-types) | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
+| `hold[review]`, `block[ac]`, `block[dependency]`, `block` (other sub-types) | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 
 The `<verdict_body>` is your full verdict output, structured **VERDICT-FIRST** so the routing token survives any transport-layer truncation: `VERDICT: <class>[<detail>]` as line 1, `DEPTH: <code-level|code-level (partial)|metadata-only>` as line 2, `REASON: <one-line summary>` as line 3, blank line, then the single `NEGATIVE-TEST:` line (Step 2.5.4b) + DIFF ANALYSIS + PLAN-AC VERIFICATION (always when Step 2.5 ran) + BUILD VERIFICATION (when Step 3e ran) + FINDINGS (if any) + (when `block[ac]`) Plan amendment required:. The closing `VERDICT:` + `DEPTH:` + `REASON:` block at the bottom of the body remains as a human-readable conclusion echo — both occurrences must agree (the engine's regex captures the first match per `crates/mika-agent/src/server/verdict.rs:97`). Mika#909 / mika#898 incident (2026-04-30): gateway truncates review.body at 16k chars; placing VERDICT at the top guarantees survival even on edge-case body sizes that exceed the cap. See `docs/solutions/workflow-issues/qa-verdict-truncation-2026-04-30.md` if compounded.
 
