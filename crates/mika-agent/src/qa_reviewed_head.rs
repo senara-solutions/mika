@@ -167,6 +167,23 @@ pub(crate) fn reviewed_head_outcome(raw: &str) -> Option<&'static str> {
 /// disperse pas sur les sites qui le testent.
 pub(crate) const QA_HEAD_REVIEWS_TOOL: &str = "qa_head_reviews";
 
+/// Le nom, côté modèle, de l'outil d'écriture du registre.
+///
+/// Distinct de [`QA_REVIEWED_HEAD_TOOL`], qui est le `tool_name` de la ligne
+/// d'audit : l'un est ce que le modèle appelle, l'autre ce que la base porte.
+/// Déclaré ici parce que depuis mika#2934 ce nom n'est plus seulement **servi**
+/// (`crate::tools::record_reviewed_head`, dans `name()` et `definition()`) : il
+/// est aussi **testé**, par le site de refus de `crate::tool_execution::dispatch`
+/// qui doit reconnaître l'appel avant de l'exécuter. Un nom recopié d'un côté du
+/// moteur à l'autre est une garde qui se désarme au premier renommage, en silence
+/// et avec tout le reste vert (classe mika#2158).
+///
+/// Ne couvre délibérément **pas** les deux tables de noms d'outils
+/// (`tools::mod::…`, `tools::classification`), où le littéral est l'idiome de la
+/// table entière : les router par constante demanderait de le faire pour les
+/// soixante autres outils, ou d'en singulariser un sans raison.
+pub(crate) const RECORD_REVIEWED_HEAD_TOOL: &str = "record_reviewed_head";
+
 /// Ce que ce tour n'a pas fait, et qui interdit la ligne qu'il demande.
 ///
 /// Les deux variantes sont les deux défauts mesurés le 2026-10-27 (mika#2934),

@@ -46,7 +46,8 @@ use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::qa_reviewed_head::{
-    QA_REVIEWED_HEAD_TOOL, REVIEWED_HEAD_OUTCOMES, head_key, reviewed_head_outcome,
+    QA_REVIEWED_HEAD_TOOL, RECORD_REVIEWED_HEAD_TOOL, REVIEWED_HEAD_OUTCOMES, head_key,
+    reviewed_head_outcome,
 };
 
 pub struct RecordReviewedHeadTool;
@@ -66,12 +67,12 @@ fn field_error(field: &str, hint: &str) -> ToolOutput {
 #[async_trait]
 impl Tool for RecordReviewedHeadTool {
     fn name(&self) -> &str {
-        "record_reviewed_head"
+        RECORD_REVIEWED_HEAD_TOOL
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "record_reviewed_head".to_string(),
+            name: RECORD_REVIEWED_HEAD_TOOL.to_string(),
             description: "Enregistre qu'un tour a statué sur une tête de PR : \
                  (repo, pr, head_sha, outcome). À appeler une fois par tour : à la \
                  fin d'un tour webhook qui a constaté un stop, ou juste après un \
