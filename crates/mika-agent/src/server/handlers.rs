@@ -3114,4 +3114,143 @@ mod tests {
         record_pr_sync_observed(&db, SYNC_2659, "Z").await;
         assert!(!skip_superseded_review_turn(&db, SYNC_2659, "A").await);
     }
+
+    // ---- mika#2935 — le cycle de vie d'une ligne parquée pendant un flush ---
+
+    /// Un rail de livraison dont le test choisit l'issue, et qui mémorise ce
+    /// qu'on lui a demandé d'envoyer (mika#2935).
+    ///
+    /// C'est `FlushDelivery` et non `MessageSender` qu'on double, et la
+    /// différence est le défaut lui-même : un double de `MessageSender` ne
+    /// parque pas, alors que le vrai `GatewayMessageSender` le faisait, donc un
+    /// test écrit contre ce trait serait resté vert au-dessus du bug.
+    struct Mika2935Delivery {
+        outcome: crate::messaging::SendOutcome,
+        recus: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Mika2935Delivery {
+        fn new(outcome: crate::messaging::SendOutcome) -> Self {
+            Self {
+                outcome,
+                recus: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recus(&self) -> Vec<String> {
+            self.recus.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlushDelivery for Mika2935Delivery {
+        async fn try_deliver(&self, text: &str) -> anyhow::Result<crate::messaging::SendOutcome> {
+            self.recus.lock().unwrap().push(text.to_string());
+            Ok(self.outcome.clone())
+        }
+    }
+
+    /// Combien de fois le préfixe de mika#1751 apparaît dans un texte — la
+    /// grandeur exacte que compte la sonde post-déploiement d'AC3.
+    fn mika2935_prefixes(texte: &str) -> usize {
+        texte.matches(FAILED_SEND_STALE_PREFIX).count()
+    }
+
+    /// AC1 : deux flushs ratés d'affilée laissent **exactement une** ligne, et
+    /// son texte stocké ne porte **jamais** de préfixe (mika#2935).
+    ///
+    /// Deux passes, pas une : avec une seule, « la ligne n'est pas dupliquée »
+    /// et « la seconde ligne n'a pas encore eu lieu » rendent le même compte.
+    /// C'est la deuxième passe qui, avant le correctif, portait le second
+    /// `⏳ from earlier — `.
+    #[tokio::test]
+    async fn mika2935_un_flush_rate_laisse_exactement_une_ligne() {
+        let db = mika2671_db();
+        db.save_failed_send("réponse parquée", None).await.unwrap();
+
+        let origine = db.get_pending_failed_sends(10).await.unwrap();
+        assert_eq!(origine.len(), 1, "la table de départ porte une ligne");
+        assert_eq!(origine[0].text, "réponse parquée");
+        let created_at_origine = origine[0].created_at.clone();
+
+        let double = Mika2935Delivery::new(crate::messaging::SendOutcome::Failed {
+            reason: "point de terminaison mort".to_string(),
+        });
+
+        for passe in 1..=2usize {
+            flush_failed_sends_with(&db, &double).await;
+
+            let lignes = db.get_pending_failed_sends(10).await.unwrap();
+            assert_eq!(
+                lignes.len(),
+                1,
+                "passe {passe} : un flush raté ne crée aucune ligne, or la table \
+                 en porte {} : {:?}",
+                lignes.len(),
+                lignes.iter().map(|l| &l.text).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                lignes[0].text, "réponse parquée",
+                "passe {passe} : le texte stocké reste nu — c'est ce que \
+                 mika#2935 corrige, le préfixe n'entre jamais dans la table"
+            );
+            assert_eq!(
+                mika2935_prefixes(&lignes[0].text),
+                0,
+                "passe {passe} : zéro préfixe dans la table, quel qu'en soit le nombre"
+            );
+            assert_eq!(
+                lignes[0].created_at, created_at_origine,
+                "passe {passe} : une ligne conservée garde son `created_at` \
+                 d'origine — c'est ce dont le seuil de 5 minutes de mika#1751 a besoin"
+            );
+            assert_eq!(
+                lignes[0].retry_count, passe as i32,
+                "passe {passe} : la ligne est incrémentée, pas remplacée"
+            );
+
+            let recus = double.recus();
+            assert_eq!(
+                recus.len(),
+                passe,
+                "passe {passe} : un envoi par passe, pas davantage"
+            );
+            assert_eq!(
+                mika2935_prefixes(&recus[passe - 1]),
+                1,
+                "passe {passe} : le texte envoyé porte un seul préfixe, pas {} : {:?}",
+                mika2935_prefixes(&recus[passe - 1]),
+                recus[passe - 1]
+            );
+        }
+    }
+
+    /// Le contrôle positif du test ci-dessus : avec un rail qui livre, la ligne
+    /// est **supprimée** (mika#2935).
+    ///
+    /// Sans lui, un `flush_failed_sends_with` qui n'aurait jamais rien envoyé
+    /// satisferait les assertions d'AC1 pour la mauvaise raison.
+    #[tokio::test]
+    async fn mika2935_un_flush_reussi_supprime_la_ligne() {
+        let db = mika2671_db();
+        db.save_failed_send("réponse parquée", None).await.unwrap();
+
+        let double = Mika2935Delivery::new(crate::messaging::SendOutcome::Delivered);
+        flush_failed_sends_with(&db, &double).await;
+
+        let lignes = db.get_pending_failed_sends(10).await.unwrap();
+        assert!(
+            lignes.is_empty(),
+            "une livraison réussie supprime la ligne, or la table porte {:?}",
+            lignes.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        let recus = double.recus();
+        assert_eq!(recus.len(), 1, "le rail a bien été emprunté : {recus:?}");
+        assert_eq!(
+            recus[0],
+            format!("{FAILED_SEND_STALE_PREFIX}réponse parquée"),
+            "le texte envoyé porte le préfixe de mika#1751, une seule fois"
+        );
+    }
 }
