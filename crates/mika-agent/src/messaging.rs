@@ -917,4 +917,77 @@ mod tests {
             "le défaut du trait passe le texte à send(), quelle que soit la sévérité"
         );
     }
+
+    /// AC1 à la racine, et AC2 comme contrôle négatif dans le même test
+    /// (mika#2935).
+    ///
+    /// La paire est ce qui distingue « le parquage a été déplacé » de « le
+    /// parquage a été supprimé » : un seul des deux appels suffirait à l'un des
+    /// deux énoncés, jamais aux deux.
+    ///
+    /// Le point de terminaison vient de [`mika_common::dead_endpoint::DeadEndpoint`],
+    /// tenu pour toute la durée du test — jamais un `bind(:0)` suivi d'un
+    /// `drop` (mika#2569 : ce binaire est le plus parallèle de l'arbre, et un
+    /// port libéré est repris par le voisin, qui répond alors à l'appel censé
+    /// échouer).
+    #[tokio::test]
+    async fn mika2935_le_parquage_appartient_a_send_jamais_a_la_tentative_nue() {
+        let dead = mika_common::dead_endpoint::DeadEndpoint::reserve();
+        let harness = TestHarness::new();
+        harness
+            .db
+            .set_customer_config("chat_id", "4242")
+            .await
+            .unwrap();
+
+        let sender = GatewayMessageSender::new(
+            format!("http://{}", dead.addr()),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("mika".to_string()),
+            None,
+            None,
+        );
+
+        // 1. La primitive échoue et n'écrit pas. C'est AC1 à la racine : le
+        //    chemin que le flush emprunte ne peut pas créer de ligne.
+        let outcome = FlushDelivery::try_deliver(&sender, "réponse parquée")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Failed { .. }),
+            "un point de terminaison mort doit rendre Failed, pas {outcome:?}"
+        );
+        let parked = harness.db.get_pending_failed_sends(10).await.unwrap();
+        assert!(
+            parked.is_empty(),
+            "try_deliver n'a aucun effet de bord sur failed_sends, or la table \
+             porte {} ligne(s) : {:?}",
+            parked.len(),
+            parked.iter().map(|p| &p.text).collect::<Vec<_>>()
+        );
+
+        // 2. Même sender, l'entrée avec effet de bord : un tour normal parque
+        //    toujours. C'est AC2 — le contrôle négatif demandé dans ce test.
+        let outcome = MessageSender::send(&sender, "un tour normal")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Failed { .. }),
+            "même transport, même issue attendue, pas {outcome:?}"
+        );
+        let parked = harness.db.get_pending_failed_sends(10).await.unwrap();
+        assert_eq!(
+            parked.len(),
+            1,
+            "un envoi raté hors flush parque exactement une ligne : {:?}",
+            parked.iter().map(|p| &p.text).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parked[0].text, "un tour normal",
+            "la ligne parquée porte le texte de l'envoi, et seulement lui"
+        );
+    }
 }
