@@ -112,6 +112,49 @@ structurelle, et nulle part ici.
 Ce fait est vérifiable dans le dépôt, sans la base de production, et il porte
 seul la moitié de la décision ci-dessous.
 
+### 5. Le second site qui annonce un plafond — et qui ne suivra pas tout seul
+
+La divergence du § 4 est entre un prompt et le moteur. Il en existe une seconde,
+**à l'intérieur du moteur**, et elle ne se révèle qu'une fois (a) retenue.
+
+Le plafond est lu à deux endroits indépendants sur le chemin d'un tour coupé :
+
+| site | ce qu'il lit | suit-il une résolution par agent ? |
+|---|---|---|
+| `mod.rs:1696` | `mode.max_steps()` → la variable locale `max_steps` de `run_loop` | **oui**, c'est le site de R1 |
+| `mod.rs:5179` (WARN) et `mod.rs:5184` (census) | la **même** variable locale | oui, par construction |
+| `mod.rs:7693` (WARN du chemin silent) | `params.trigger.max_steps()` — **source indépendante** | **NON** |
+
+Le troisième est le WARN `"silent agent exceeded max tool steps"`, émis par
+l'appelant de `run_loop` dans l'arm `LoopResult::MaxStepsExceeded`. Il recalcule
+le plafond depuis le trigger au lieu de rapporter celui que la boucle a servi.
+Après R1, un tour de callback de mika-qa coupé à 30 émettrait donc un WARN
+annonçant **20** : la dérive annoncé-vs-servi du § 4, réintroduite au site voisin
+le jour même où R2 l'interdit ailleurs — et sur le chemin qui porte **4 des 13**
+épuisements mesurés, dont `callback-0f07c520`, la session sur laquelle AC2 se
+construit. R1b la ferme.
+
+### 6. La sonde de conformité de mika#2877 surcompte déjà, et AC4 en hérite
+
+`docs/agent-internals/observability.md` § mika#2877 donne la sonde de conformité
+comme une égalité : `grep -c "agent exceeded max tool steps"` doit égaler
+`grep -c max_steps_tool_census`, « emitted at the same site without condition, so
+their counts are equal by construction ».
+
+Les deux WARN du § 5 **ne sont pas au même site**, et le motif du premier est une
+**sous-chaîne** du second : `"agent exceeded max tool steps"` matche aussi
+`"silent agent exceeded max tool steps"`. Or le WARN silent est émis par
+l'appelant **en plus** de celui de `run_loop`, jamais à sa place — `run_loop` a
+déjà émis son WARN et son census avant de rendre `MaxStepsExceeded`. Un tour de
+callback coupé produit donc **deux lignes pour un census**.
+
+La sonde rend ainsi `premier > second` sur toute fenêtre contenant un callback
+coupé — et sa propre doctrine lit cette inégalité comme « un chemin de coupure
+échappe à l'émission », c'est-à-dire comme un défaut qui **invalide le relevé
+avant toute lecture**. Avec 4 callbacks sur les 13 tours mesurés, la sonde d'AC4
+recopiée telle quelle s'auto-invaliderait sur sa toute première exécution. Le
+§ *Sonde post-déploiement* l'ancre, et le commit 4 corrige `observability.md`.
+
 ## La décision : (c), les deux — et pourquoi dans cet ordre
 
 **(a) relever le plafond pour mika-qa seul, et (b) resserrer les deux prompts.**
@@ -231,6 +274,35 @@ est le seul endroit où le plafond est lu avant la boucle `for step in 0..max_st
 restent la source du `default`. AC3 est tenu structurellement : un agent dont le
 nom n'est pas dans la table reçoit exactement ce qu'il recevait.
 
+### R1b — Le WARN du chemin silent rapporte le plafond servi, et non un second calcul
+
+Le site du § 5, `mod.rs:7693`, logue `max_steps = params.trigger.max_steps()`.
+Il doit rapporter ce que la boucle **a servi**. La forme qui le garantit sans
+créer un second site de résolution :
+
+```rust
+    MaxStepsExceeded {
+        …
+        /// Le plafond que la boucle a effectivement servi (mika#2926). Rapporté
+        /// plutôt que recalculé : le WARN du chemin silent le recalculait depuis
+        /// le trigger et annonçait donc 20 pour un tour de mika-qa coupé à 30.
+        max_steps: usize,
+    },
+```
+
+rempli à l'**unique** site de construction (`mod.rs:5203`) depuis la variable
+locale déjà résolue par R1, et lu en `mod.rs:7693` à la place de l'appel au
+trigger. AC3 reste tenu : il n'y a toujours qu'un seul site qui *résout* le
+plafond ; ce champ ne fait que le **transporter** jusqu'au WARN.
+
+Sites touchés, tous dans `agent_loop/mod.rs` : la déclaration de la variante
+(`:1293`), sa construction (`:5203`), la lecture du WARN (`:7693`), et la
+destructuration de `:6551` qui est **exhaustive** et doit donc accueillir le
+champ ou un `..` — les arms `:7686` et `:8350` portent déjà `..` et ne bougent
+pas. La garde structurelle de mika#2515 (`mod.rs:13679`) n'est pas concernée :
+son `final_expr` est un corpus littéral de test, pas la forme réelle de la
+sortie.
+
 ### R2 — Le nombre du prompt suit le const, et une garde le tient
 
 `skills/bundled/qa-review/system_prompt.md:17` passe de 14 à 30, et
@@ -281,9 +353,18 @@ rejouent, et c'est la paire qui est le livrable :
   `max_steps_tool_census` avec `max_steps = "20"` et `per_tool` portant
   `run_shell`, et **aucune** revue enregistrée.
 
-Le discriminant entre les deux tours est l'`agent_id` et **rien d'autre** — même
-mock, même séquence, même nombre de réponses. C'est ce qui fait que la paire
-atteste le plafond par agent et pas un artefact de fixture.
+Les deux tours sont en `callback_turn(true)` : le discriminant est l'`agent_id` et
+**rien d'autre** — même mock, même séquence, même nombre de réponses. C'est ce
+qui fait que la paire atteste le plafond par agent et pas un artefact de fixture.
+
+**Un troisième tour, pour R1b.** Ni le positif (qui ne s'épuise pas) ni le négatif
+(qui s'épuise sur mika-dev, où 20 = 20 des deux côtés) ne peut révéler la dérive
+du § 5. Il faut un tour **mika-qa, callback, coupé** : une séquence de 31
+`run_shell` — au-delà du plafond 30 — en `.agent_id("mika-qa").callback_turn(true)`.
+Assertion : le WARN `"silent agent exceeded max tool steps"` porte
+`max_steps = "30"`. Sans R1b il porte 20, et c'est le rouge-avant du point 4
+ci-dessous. Ce tour atteste aussi, gratuitement, que le plafond relevé **coupe
+encore** — 30 est un plafond, pas une levée.
 
 Déclaration du module dans `crates/mika-agent/tests/eval.rs`, dans le bloc
 `mod eval`.
@@ -300,9 +381,20 @@ Déclaration du module dans `crates/mika-agent/tests/eval.rs`, dans le bloc
   des guards en un appel). C'est la suite naturelle de C1, mais elle est
   **conditionnée par la part manquante du relevé** : sans l'attribution par
   catégorie du § 2, construire un outil pour C1 serait spéculatif, alors que C1
-  est déjà borné à 1 par le prompt. Tracked in: senara-solutions/mika#2926 —
-  à ouvrir comme ticket de suivi après la première lecture de la requête SQL du
-  § 2 sur l'hôte.
+  est déjà borné à 1 par le prompt.
+
+  **Aucune ligne `Tracked in:` n'est due ici, et c'est délibéré.** Ce vol ne
+  renvoie aucun périmètre à un vol suivant — il est entier sous sa borne, et
+  cette pièce est écartée pour une raison de fond, pas de place. Un
+  `Tracked in:` pointant mika#2926 lui-même ne tracke rien : c'est un défaut qui
+  ressemble à une réponse, la classe que ce dépôt refuse partout ailleurs. Le
+  ticket de suivi naît de la **première lecture de la requête SQL du § 2 sur
+  l'hôte**, qui est un geste de Vincent au merge, et il porte alors son propre
+  numéro. **Conséquence pour le pilote d'implémentation :** le corps de PR ne
+  doit porter aucune phrase de déferrement (« sera corrigé dans un suivi »,
+  « reporté à une PR séparée ») — sinon `check-pr-body-consistency.sh` exige un
+  `Tracked in:` qu'aucun numéro ne peut encore remplir. Décrire ce
+  Non-Requirement comme hors périmètre suffit.
 - **Le relevé par catégorie lui-même.** Inatteignable depuis le bac à sable (§ 2,
   trois faits vérifiés). La décision de ce plan n'en dépend pas : elle repose sur
   le relevé du prescripteur (§ 3) et sur la divergence prompt/moteur (§ 4), tous
@@ -312,7 +404,7 @@ Déclaration du module dans `crates/mika-agent/tests/eval.rs`, dans le bloc
 
 | # | vérification | commande |
 |---|---|---|
-| V1 | AC2, la paire | `cargo test -p mika-agent --test eval qa_step_budget_2926` |
+| V1 | AC2, la paire, plus le troisième tour de R1b | `cargo test -p mika-agent --test eval qa_step_budget_2926` |
 | V2 | la garde prompt↔const | `cargo test -p mika-agent --test qa_review_executes_repo_guards mika2926` |
 | V3 | le plafond par agent, unités | `cargo test -p mika-agent policy::tests` |
 | V4 | aucune régression sur les plafonds existants | `cargo test -p mika-agent` (dont `test_max_steps_continuation`, `test_max_steps_tool_census_2877`, `test_callback_terminal_action` — tous sur l'agent par défaut `mika`, donc inchangés) |
@@ -333,6 +425,11 @@ Déclaration du module dans `crates/mika-agent/tests/eval.rs`, dans le bloc
    l'absence est totale.
 3. **V1, moitié négative** : remplacer `"mika-dev"` par `"mika-qa"` dans le tour
    négatif. Il rougit sur `expected exactly one max_steps_tool_census event, got 0`.
+4. **V1, le troisième tour (R1b)** : rétablir `max_steps = params.trigger.max_steps()`
+   en `mod.rs:7693`, à la place du champ transporté. Le tour rougit — le WARN
+   silent annonce 20 là où la boucle a servi 30 — et **les deux autres moitiés
+   restent vertes**. C'est l'information qui dit que la paire d'AC2 ne couvre pas
+   la dérive du § 5 : elle atteste le plafond servi, jamais le plafond *rapporté*.
 
 ## Definition of Done
 
@@ -342,6 +439,10 @@ Déclaration du module dans `crates/mika-agent/tests/eval.rs`, dans le bloc
 - [ ] `agent_loop/mod.rs:1696` est le **seul** site qui résout le plafond ; un
       `grep` de `mode.max_steps()` hors de `LoopMode` et de ses tests ne trouve
       rien d'autre.
+- [ ] `LoopResult::MaxStepsExceeded` porte `max_steps`, rempli au seul site de
+      construction depuis la variable locale résolue, et un `grep` de
+      `trigger.max_steps()` ne trouve plus qu'un site : la construction du
+      `LoopMode::Silent` en `mod.rs:7534`, qui est en **amont** de la résolution.
 - [ ] `qa-review/system_prompt.md` porte 30, la borne C4/C5, et le trim de la
       ligne 234 ; `wc -c` sous 77 824.
 - [ ] `qa-review-build-callback/system_prompt.md` porte la borne à deux
@@ -349,12 +450,15 @@ Déclaration du module dans `crates/mika-agent/tests/eval.rs`, dans le bloc
 - [ ] La garde R2 est verte après correction du prompt et rouge avant (recette
       ci-dessus, point 1).
 - [ ] `test_qa_step_budget_2926.rs` existe, est déclaré dans `tests/eval.rs`, et
-      ses deux moitiés passent — avec les deux recettes de rouge-avant tenues.
+      ses **trois** tours passent — avec les trois recettes de rouge-avant tenues.
 - [ ] V4 à V7 verts.
-- [ ] `docs/agent-internals/observability.md` § mika#2877 gagne un renvoi : le
-      plafond de mika-qa n'est plus `MAX_TOOL_STEPS`, donc le champ `max_steps`
-      d'une ligne de census vaut désormais 20 **ou** 30 selon l'agent, et un
-      opérateur qui groupe par ce champ doit le savoir.
+- [ ] `docs/agent-internals/observability.md` § mika#2877 gagne deux corrections :
+      (i) le plafond de mika-qa n'est plus `MAX_TOOL_STEPS`, donc le champ
+      `max_steps` d'une ligne de census vaut désormais 20 **ou** 30 selon
+      l'agent, et un opérateur qui groupe par ce champ doit le savoir ;
+      (ii) la sonde de conformité passe à la forme en différence du § *Sonde
+      post-déploiement* — l'égalité brute surcompte sur le chemin callback
+      (relevé § 6), et c'est un défaut de l'instrument antérieur à ce vol.
 - [ ] `docs/operator/environment-variables.md` : la sonde d'AC4 et ses deux
       compteurs y sont documentés (pas dans `CLAUDE.md`, qui est sous cap).
 - [ ] Corps de PR : `Closes #2926`, et
@@ -367,18 +471,21 @@ Transcrits du ticket, verbatim, avec la façon dont ce plan les ferme.
 - **AC1.** Le plan contient le relevé : pour au moins 5 des 13 tours, la catégorie
   des commandes `run_shell` (lecture du diff, `git log`, `cargo`, recherche dans
   le dépôt…), avec leur compte.
-  → § *Le relevé*, en quatre parties : les comptes mesurés de **7** tours (§ 1),
+  → § *Le relevé*, en six parties : les comptes mesurés de **7** tours (§ 1),
   la raison pour laquelle l'attribution par catégorie n'est pas dans le log et la
   requête qui la produit sur l'hôte (§ 2, avec les trois faits qui établissent
   qu'aucun pilote ne peut l'exécuter), le relevé **des six catégories du
   prescripteur** avec leur compte et la propriété que deux d'entre elles sont sans
-  borne (§ 3), et le fait indépendant qui porte la décision (§ 4).
+  borne (§ 3), le fait indépendant qui porte la décision (§ 4), la seconde
+  divergence de plafond, interne au moteur, que (a) révélerait (§ 5), et le
+  surcomptage de la sonde de conformité dont AC4 héritait (§ 6).
 - **AC2.** Sur un corpus rejoué de la forme de la session callback-0f07c520 (un
   callback de build réussi sur une PR de la boucle, mika#2920 à 0a55d28a), le tour
   pose un verdict sous le budget. Le contrôle négatif est dans le même test : la
   forme d'avant épuise le budget.
   → R4. Même séquence de 23 `run_shell` + `pr review`, deux tours, l'`agent_id`
-  pour seul discriminant. V1 et ses deux recettes de rouge-avant.
+  pour seul discriminant — plus un troisième tour pour R1b. V1 et ses trois
+  recettes de rouge-avant.
 - **AC3.** Si la voie (a) est retenue, le nouveau plafond est nommé à un seul site
   et justifié par la mesure d'AC1. Il ne s'applique pas aux autres agents.
   → R1. Un seul site de résolution (`mod.rs:1696`), un seul const
@@ -389,7 +496,11 @@ Transcrits du ticket, verbatim, avec la façon dont ce plan les ferme.
 - **AC4, la sonde post-déploiement.** Après `make deploy`, sur les 7 jours
   suivants, le compte de `max_steps_tool_census` de mika-qa baisse depuis 13 en
   3,5 jours. Le plan donne la commande qui le compte.
-  → § *Sonde post-déploiement* ci-dessous.
+  → § *Sonde post-déploiement* ci-dessous — deux compteurs plutôt qu'un, pour que
+  un épuisement migré vers l'enveloppe de 300 s ne se lise pas comme une
+  guérison, et une sonde de conformité **corrigée** : sous la forme héritée de
+  mika#2877 elle aurait déclaré l'instrument en panne dès le premier callback
+  coupé (§ 6 du relevé).
 
 ## Sonde post-déploiement (AC4)
 
@@ -418,47 +529,73 @@ de **13 sur 7 jours** (≤ 1,9/jour, soit une baisse du taux d'au moins la moiti
 la raison d'être de la paire : sans lui, un épuisement qui a simplement migré du
 budget de steps vers l'enveloppe de 300 s se lirait comme une guérison.
 
-**Sonde de conformité, à relever d'abord** — elle dit que l'instrument tourne, et
-elle est de mika#2877 :
+**Sonde de conformité, à relever d'abord** — elle dit que l'instrument tourne.
+Elle vient de mika#2877, **et ce plan la corrige** : sous sa forme d'origine elle
+surcompte, pour la raison établie au § 6 du relevé. Le motif du WARN de
+`run_loop` est une sous-chaîne de celui du WARN silent, qui est émis **en plus**
+sur le chemin callback — deux lignes pour un census. La conformité se lit donc sur
+une **différence**, jamais sur l'égalité brute :
 
 ```sh
-grep -c "agent exceeded max tool steps" "$L"   # doit égaler (1) tous agents confondus
-grep -c max_steps_tool_census           "$L"
+tot=$(grep -c "agent exceeded max tool steps"        "$L")
+sil=$(grep -c "silent agent exceeded max tool steps" "$L")
+cen=$(grep -c max_steps_tool_census                  "$L")
+echo "conforme si $(( tot - sil )) == $cen"
 ```
 
-Les deux lignes sont émises au même site sans condition : une inégalité est un
-défaut de l'instrument, pas un détail de log, et elle invalide le relevé avant
-toute lecture.
+Soustraire plutôt qu'ancrer le grep sur un champ JSON est le même choix que
+ci-dessus pour l'horodatage : `tot` et `sil` portent le même motif à un préfixe
+près, donc la soustraction est juste sans qu'aucun nom de champ de
+`tracing-subscriber` ait à être deviné.
+
+`tot - sil` strictement supérieur à `cen` signifie qu'un chemin de coupure
+échappe à l'émission (ou que le log enjambe le déploiement) ; strictement
+inférieur, une double émission, que le harnais de mika#2877 interdit. Une
+inégalité est un défaut de l'instrument, pas un détail de log, et elle invalide
+le relevé avant toute lecture — ce qui est précisément pourquoi la forme
+d'origine ne pouvait pas servir : avec 4 callbacks sur 13, elle aurait déclaré
+l'instrument en panne au premier relevé.
 
 ## Fire-Disposition
 
-Ce vol livre **un** détecteur : la garde R2, dont le chemin de succès est
-« le nombre du prompt égale le const du moteur », c'est-à-dire « aucune
-divergence trouvée ». Le test AC2 (R4) n'en est pas un — ses deux moitiés
-assertent un comportement (« un verdict a été posé », « le budget a été épuisé »),
-pas l'absence d'une violation dans un corpus.
+Ce vol livre **deux** détecteurs, et ils sont de la même famille — « le plafond
+annoncé égale le plafond servi », c'est-à-dire « aucune divergence trouvée » :
+
+1. **La garde R2** — le nombre du prompt `qa-review` contre le const du moteur.
+2. **Le troisième tour de R4 (R1b)** — le champ `max_steps` du WARN silent contre
+   le plafond que la boucle a servi.
+
+Les deux premières moitiés du test AC2 n'en sont pas : elles assertent un
+comportement (« un verdict a été posé », « le budget a été épuisé »), pas
+l'absence d'une violation.
 
 **Option retenue : (a) — exception nommée en allowlist, avec une allowlist
 vide, et c'est la forme exacte que l'option prend ici.**
 
-- **Population des violations existantes : une seule**, la ligne 17 de
-  `qa-review/system_prompt.md` qui porte 14. Elle est **corrigée dans le même
-  commit** que la garde (ordre de commit ci-dessous, commits 2 et 3 : le const
-  d'abord, puis le prompt et la garde ensemble). La garde atterrit donc **armée et
-  verte**, sans aucune entrée d'allowlist — il n'y a rien à exempter.
+- **Population des violations existantes : deux, une par détecteur, et chacune
+  corrigée dans le commit qui arme son détecteur** — donc aucune entrée
+  d'allowlist, parce qu'il n'y a rien à exempter à la fin de la PR :
+  - pour R2, la ligne 17 de `qa-review/system_prompt.md` qui porte 14 ; prompt et
+    garde atterrissent **dans le même commit** (le 3) ;
+  - pour R1b, le site `mod.rs:7693` qui recalcule le plafond depuis le trigger ;
+    il est corrigé au commit 2, qui est aussi celui qui fait passer au vert le
+    tour de R4 déposé rouge au commit 1 — la discipline de rouge-avant du plan,
+    pas une allowlist.
 - **Pourquoi pas (b), livrer désarmé** : il n'y a pas de résidu à trier. Un
   `#[ignore]` sur une garde qui passerait sans lui crée un suivi vide et une garde
   qu'aucun pipeline n'exécute — la classe que `suite-wiring-lint` existe pour
   refuser.
 - **Pourquoi pas (c), halte-et-remontée** : la correction est de deux caractères
   et le relecteur la voit dans le diff.
-- **Auto-nettoyage, par construction et non par assertion ajoutée** : la garde ne
-  compare pas à une valeur gravée mais à
-  `max_tool_steps_for_agent("mika-qa", MAX_TOOL_STEPS)`. Une exception ne peut pas
-  devenir stale parce qu'il n'y en a aucune : le jour où le plafond bouge, la garde
-  rougit sur le prompt jusqu'à ce qu'il suive. C'est précisément la dérive
-  silencieuse de 14 vs 20 qu'elle rend impossible à réintroduire.
-- **Portée délibérément étroite** : la garde ne couvre que `qa-review`. Les autres
+- **Auto-nettoyage, par construction et non par assertion ajoutée** : aucun des
+  deux détecteurs ne compare à une valeur gravée. R2 compare à
+  `max_tool_steps_for_agent("mika-qa", MAX_TOOL_STEPS)` ; R1b compare le champ du
+  WARN au plafond que la boucle a servi. Une exception ne peut pas devenir stale
+  parce qu'il n'y en a aucune : le jour où le plafond bouge, R2 rougit sur le
+  prompt jusqu'à ce qu'il suive, et R1b rougit sur tout site qui recalculerait le
+  plafond au lieu de le rapporter. C'est précisément la dérive silencieuse de
+  14 vs 20 — et sa jumelle du § 5 — qu'ils rendent impossibles à réintroduire.
+- **Portée délibérément étroite** : R2 ne couvre que `qa-review`. Les autres
   prompts bundled n'annoncent aucun plafond de steps (`grep` du § 4 : une seule
   occurrence dans tout `skills/bundled/`), donc une garde générique n'aurait, à ce
   jour, aucune population — et une garde sans population est une garde qui ne
@@ -469,41 +606,52 @@ vide, et c'est la forme exacte que l'option prend ici.**
 | livrable | lignes de code (hors `docs/`) |
 |---|---|
 | `crates/mika-agent/src/planning/policy.rs` | 95 |
-| `crates/mika-agent/src/agent_loop/mod.rs` | 14 |
+| `crates/mika-agent/src/agent_loop/mod.rs` (R1 : 14 ; R1b : 8) | 22 |
 | `skills/bundled/qa-review/system_prompt.md` | 12 |
 | `skills/bundled/qa-review-build-callback/system_prompt.md` | 9 |
 | `crates/mika-agent/tests/qa_review_executes_repo_guards.rs` | 70 |
-| tests (`crates/mika-agent/tests/eval/test_qa_step_budget_2926.rs`) | 150 |
+| tests (`crates/mika-agent/tests/eval/test_qa_step_budget_2926.rs`, 3 tours) | 195 |
 | `crates/mika-agent/tests/eval.rs` | 1 |
 
-Total estimé : 351 lignes
+Total estimé : 404 lignes
 Plafond de tours : 200 (`loop-substrate`)
 Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 
-**Un seul vol, et voici pourquoi il tient.** 351 est sous la borne par vol (429)
+**Un seul vol, et voici pourquoi il tient.** 404 est sous la borne par vol (429)
 et très loin du seuil par PR (1000). La pièce qui aurait fait sortir ce vol de sa
 borne — l'outil borné `qa_repo_guards` qui remplacerait la recette 2B, ≈ 200
 lignes de handler plus son test — est explicitement renvoyée aux
 Non-Requirements, et pour une raison de fond et non de place : elle est
 conditionnée par la part du relevé qu'aucun pilote ne peut lire. Le reste du vol
 est serré par construction : les deux prompts ne bougent que de 21 lignes au total
-parce que l'un est sur son plafond dur d'octets, et le gros du volume est la paire
-de tests qui ferme AC2.
+parce que l'un est sur son plafond dur d'octets, et le gros du volume est le
+triplet de tests qui ferme AC2 et R1b.
+
+**La marge est de 25 lignes, et elle est nommée parce qu'elle est mince.** R1b et
+son tour de test coûtent 53 lignes de plus que la version antérieure de ce plan
+(351), et cette dépense est justifiée au § 5 : sans elle, (a) atterrit en
+réintroduisant au site voisin la dérive que R2 corrige. **Conséquence pour le
+pilote d'implémentation :** toute pièce découverte en vol part en ticket de suivi,
+jamais dans ce vol — 404 ne laisse pas la place d'une seconde découverte. Les
+candidats connus sont déjà aux Non-Requirements.
 
 ## Ordre de commit
 
-1. `test(2926)` — `test_qa_step_budget_2926.rs` + sa déclaration dans `eval.rs`.
-   Rouge sur les deux moitiés : le plafond de mika-qa vaut encore 20.
+1. `test(2926)` — `test_qa_step_budget_2926.rs` (les trois tours) + sa déclaration
+   dans `eval.rs`. Rouge sur le tour positif et sur celui de R1b : le plafond de
+   mika-qa vaut encore 20, et le WARN silent recalcule encore.
 2. `feat(2926)` — `max_tool_steps_for_agent` + `MAX_TOOL_STEPS_MIKA_QA` dans
-   `policy.rs`, et le site unique de résolution dans `agent_loop/mod.rs`.
-   Le commit 1 passe au vert. V3, V4.
+   `policy.rs`, le site unique de résolution dans `agent_loop/mod.rs`, **et R1b**
+   (le champ `max_steps` sur `MaxStepsExceeded`, sa construction, sa lecture au
+   WARN silent). Le commit 1 passe entièrement au vert. V3, V4.
 3. `fix(2926)` — le prompt `qa-review` (30, borne C4/C5, trim de la ligne 234),
    le prompt `qa-review-build-callback` (borne à deux tentatives), et la garde R2,
    **dans le même commit** : c'est ce qui fait atterrir le détecteur armé et vert
    sans allowlist. V2, V5, V6.
 4. `docs(2926)` — `observability.md` (le champ `max_steps` vaut 20 ou 30 selon
-   l'agent), `environment-variables.md` (la sonde d'AC4 et sa paire de compteurs),
-   puis `scripts/sync-agent-docs.sh`.
+   l'agent, **et** la sonde de conformité passe à la forme en différence),
+   `environment-variables.md` (la sonde d'AC4 et ses compteurs), puis
+   `scripts/sync-agent-docs.sh`.
 
 Chaque commit laisse l'arbre compilable ; seul le 1 laisse un test rouge, qui est
 son objet.
