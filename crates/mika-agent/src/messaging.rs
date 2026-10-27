@@ -106,11 +106,24 @@ pub trait MessageSender: Send + Sync {
     }
 }
 
+/// What the `failed_sends` flush needs, and nothing more: deliver a text and
+/// say whether it went through (mika#2935).
+///
+/// Deliberately **not** `MessageSender` — that trait parks, and the parking is
+/// the defect mika#2935 closes. A `MessageSender` double would not park while
+/// the real `GatewayMessageSender` does, so a test written against it would
+/// stay green above the bug.
+#[async_trait]
+pub trait FlushDelivery: Send + Sync {
+    async fn try_deliver(&self, text: &str) -> Result<SendOutcome>;
+}
+
 /// Sends outbound messages by POSTing to the gateway's /send endpoint.
 ///
-/// On failure, retries once after 2s. If both attempts fail, saves to
-/// `failed_sends` table for later flush and returns `Ok(SendOutcome::Failed)`
-/// so the caller can surface the delivery failure to the LLM.
+/// Two entries, and the difference between them is the whole of mika#2935:
+/// [`Self::try_deliver_with_severity`] delivers and reports, with no side
+/// effect on `failed_sends`; `MessageSender::send_with_severity` adds the
+/// parking. See the latter's doc-comment.
 pub struct GatewayMessageSender {
     client: reqwest::Client,
     gateway_url: String,
@@ -282,22 +295,16 @@ impl GatewayMessageSender {
             anyhow::anyhow!("gateway request failed: {e}")
         }
     }
-}
 
-#[async_trait]
-impl MessageSender for GatewayMessageSender {
-    /// Delegates to [`Self::send_with_severity`] with `P2` (mika#1381).
+    /// Deliver `text` and report the outcome — **without any side effect on
+    /// `failed_sends`** (mika#2935).
     ///
-    /// This direction — and not the reverse — is what guarantees the two paths
-    /// cannot drift: there is exactly one copy of the resolve/payload/retry/
-    /// failed_sends sequence, and `P2` resolves to the same chat `send()`
-    /// always used.
-    async fn send(&self, text: &str) -> Result<SendOutcome> {
-        self.send_with_severity(text, NotificationSeverity::P2)
-            .await
-    }
-
-    async fn send_with_severity(
+    /// Resolves the chat, routes the severity, short-circuits on the
+    /// `NoChannel` sentinel, POSTs and retries once after 2s. Everything
+    /// `send_with_severity` used to do, minus the parking, which is why a
+    /// caller that already owns a `failed_sends` row — the flush — can use it
+    /// without the row being duplicated underneath it.
+    pub async fn try_deliver_with_severity(
         &self,
         text: &str,
         severity: NotificationSeverity,
@@ -360,17 +367,78 @@ impl MessageSender for GatewayMessageSender {
         match self.try_send(&payload).await {
             Ok(()) => Ok(SendOutcome::Delivered),
             Err(e) => {
-                warn!(error = %e, "retry failed, saving to failed_sends");
-                let reason = e.to_string();
-                // Capture the delivery failure reason before attempting DB write.
-                // If save_failed_send fails, we still surface the original gateway
-                // error to the caller (not the DB error).
-                if let Err(db_err) = self.db.save_failed_send(text, None).await {
-                    warn!(error = %db_err, "failed to save to failed_sends table");
-                }
-                Ok(SendOutcome::Failed { reason })
+                // Says what this function did, and nothing it did not: the
+                // parking happens one level up, in `send_with_severity`
+                // (mika#2935). The former wording — "saving to failed_sends" —
+                // is what made a failed flush testify to a parking that had
+                // not happened on this path.
+                warn!(error = %e, "both /send attempts failed");
+                Ok(SendOutcome::Failed {
+                    reason: e.to_string(),
+                })
             }
         }
+    }
+}
+
+#[async_trait]
+impl MessageSender for GatewayMessageSender {
+    /// Delegates to [`Self::send_with_severity`] with `P2` (mika#1381).
+    ///
+    /// This direction — and not the reverse — is what guarantees the two paths
+    /// cannot drift: there is exactly one copy of the resolve/payload/retry/
+    /// failed_sends sequence, and `P2` resolves to the same chat `send()`
+    /// always used.
+    async fn send(&self, text: &str) -> Result<SendOutcome> {
+        self.send_with_severity(text, NotificationSeverity::P2)
+            .await
+    }
+
+    /// Deliver, then park on failure: retries once after 2s, and if both
+    /// attempts fail, saves to the `failed_sends` table for later flush and
+    /// returns `Ok(SendOutcome::Failed)` so the caller can surface the delivery
+    /// failure to the LLM.
+    ///
+    /// **The parking belongs to whoever owns no row** (mika#2935). A normal
+    /// turn owns none, so it parks here. The flush owns one, so it decides that
+    /// row's fate itself (`delete` or `increment`) and goes through
+    /// [`Self::try_deliver_with_severity`] instead — otherwise a failed flush
+    /// keeps its row *and* gets a second, already-prefixed one from this
+    /// clause, one extra `⏳ from earlier — ` per pass.
+    async fn send_with_severity(
+        &self,
+        text: &str,
+        severity: NotificationSeverity,
+    ) -> Result<SendOutcome> {
+        let outcome = self.try_deliver_with_severity(text, severity).await?;
+        if let SendOutcome::Failed { .. } = &outcome {
+            // Site UNIQUE de parquage du crate (mika#2935). Voir le détecteur
+            // `mika2935_le_parquage_a_un_seul_site`.
+            warn!(
+                event = "failed_send_parked",
+                agent_name = ?self.agent_name,
+                request_id = ?self.request_id,
+                text_len = text.len(),
+                "failed_send_parked: saving the undelivered text to failed_sends"
+            );
+            // Capture the delivery failure reason before attempting DB write.
+            // If save_failed_send fails, we still surface the original gateway
+            // error to the caller (not the DB error).
+            if let Err(db_err) = self.db.save_failed_send(text, None).await {
+                warn!(error = %db_err, "failed to save to failed_sends table");
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+/// The flush's delivery rail (mika#2935): the severity `send()` already
+/// resolved on this path, so routing does not move — only the parking does.
+#[async_trait]
+impl FlushDelivery for GatewayMessageSender {
+    async fn try_deliver(&self, text: &str) -> Result<SendOutcome> {
+        self.try_deliver_with_severity(text, NotificationSeverity::P2)
+            .await
     }
 }
 
