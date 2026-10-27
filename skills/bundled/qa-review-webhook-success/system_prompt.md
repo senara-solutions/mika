@@ -12,7 +12,7 @@ You've received a GitHub webhook event for `check_suite.completed` with `conclus
 
 1. **Correlate to PR.** Extract the repo and head SHA from the event. Use `run_gh` to find the open PR matching the check_suite's head SHA:
    ```
-   run_gh(command: ["pr", "list", "--head", "<branch>", "--state", "open", "--json", "number,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup"], repo: "<owner/repo>")
+   run_gh(command: ["pr", "list", "--head", "<branch>", "--state", "open", "--json", "number,mergeable,mergeStateStatus,statusCheckRollup"], repo: "<owner/repo>")
    ```
    If no matching open PR (the CI could be for a PR that's already been closed/merged), stop the turn — nothing to do.
 
@@ -23,9 +23,16 @@ You've received a GitHub webhook event for `check_suite.completed` with `conclus
 
    If any of those fail, stop the turn.
 
-3. **Skip if already-reviewed at this SHA.** Fetch the latest review by yourself (`mika-platform-qa`) via `run_gh("pr view <n> --json reviews", repo: ...)`. If a review exists with `commit_id == pr.headRefOid` (i.e. a review of THIS exact commit), skip — you already ruled on this SHA. Prevents duplicate reviews on repeated check_suite events.
+3. **Skip if already-reviewed at this SHA.** Read the reviews of THIS head, once:
+   ```
+   qa_head_reviews(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>")
+   ```
+   It returns only the reviews whose `commit_id` is exactly this head — an empty array means no review has ever ruled on it, and that is an answer, not a failure. **Keep that array:** steps 3 and 4 both read it, and nothing else answers either question. If an entry is authored by you (`mika-platform-qa`), skip — you already ruled on this SHA. Prevents duplicate reviews on repeated check_suite events.
 
-4. **Skip if verdict is already recorded.** If the PR already has an authoritative verdict from a recent review pass (`VERDICT: pass` or `VERDICT: block[*]`) tied to the current head SHA, skip. The verdict handler will drive merge or block state.
+4. **Skip if verdict is already recorded.** In the **same array already in hand**, if an entry has `carries_verdict_line: true` — its body carries `VERDICT: pass` or `VERDICT: block[*]` — then an authoritative verdict is recorded on this head: skip. The verdict handler will drive merge or block state.
+
+   - **Never judge this step on `mergeStateStatus`, on an approval count, nor on any other PR-level state: they survive a force-push.** An approval earned by an older head stays on the PR after a rebase, and reading it is how three freshly-pushed heads were declared already ruled on — 9 to 17 minutes before the first verdict on each (2026-10-27, mika#2934). A review's `commit_id` is the only field that names the head it ruled on, and `qa_head_reviews` is the only read that renders it.
+   - **Do not call `qa_head_reviews` a second time:** step 3 already called it, and its result is in your context.
 
 5. **Dispatch the review.** Call the `qa-review` skill on the PR. This is the standard qa-review flow — the skill's own prompt owns the diff analysis, plan-AC verification, build verification, and verdict emission.
 
