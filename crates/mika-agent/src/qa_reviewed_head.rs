@@ -761,6 +761,159 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         );
     }
 
+    // ---- mika#2934 : la tête jugée sur les revues de cette tête ------------
+
+    /// Les clauses que le prompt du webhook doit porter pour que ses étapes 3 et
+    /// 4 jugent la tête sur **les revues de cette tête**.
+    ///
+    /// Même forme que [`CLAUSES_DU_POST_REUSSI`] : une clause par fichier,
+    /// jamais l'identité octet à octet d'un texte. Les trois littéraux sont les
+    /// trois maillons de la lecture, et aucun ne couvre les deux autres :
+    ///
+    /// - `qa_head_reviews(` — l'outil est **appelé**, pas décrit. C'est le seul
+    ///   qui rende `commit_id` ; `gh pr view --json reviews` ne porte pas ce
+    ///   champ, donc avant mika#2934 l'étape 3 nommait un champ que sa propre
+    ///   lecture ne produisait pas — le frère silencieux du défaut 1.
+    /// - `carries_verdict_line` — le prédicat de l'étape 4 porte sur un champ du
+    ///   tableau rendu, et non sur un état de la PR.
+    /// - `commit_id` — la raison vit dans le prompt, là où le modèle la lit :
+    ///   c'est le seul champ qui nomme la tête sur laquelle une revue a statué.
+    const CLAUSES_DE_LA_TETE_JUGEE: &[(&str, &[&str])] = &[(
+        "qa-review-webhook-success",
+        &["qa_head_reviews(", "carries_verdict_line", "commit_id"],
+    )];
+
+    /// Les états de PR que le prompt du webhook ne doit plus citer du tout.
+    ///
+    /// `reviewDecision` **survit au force-push** : rien ne révoque ici une
+    /// approbation périmée, donc une ancienne tête approuvée suffisait à faire
+    /// déclarer la nouvelle statuée — trois fois sur trois le 2026-10-27, de 9 à
+    /// 17 minutes avant le premier verdict sur chacune.
+    ///
+    /// **L'absence porte sur le prompt ENTIER, l'interdiction comprise.** R2 du
+    /// plan donnait au refus de l'étape 4 un libellé qui nommait le champ, et R5
+    /// exige son absence : les deux ne peuvent pas être vrais ensemble. C'est
+    /// l'absence qui est le terme fort — citer un nom de champ dans une
+    /// interdiction le réinjecte dans le contexte du modèle, ce que *remove
+    /// capability, don't prohibit it* refuse précisément. Le prompt énonce donc
+    /// la propriété (« ils survivent au force-push ») sans rendre le champ
+    /// nommable, et l'étape 1 ne le demande plus à la forge.
+    const ETATS_DE_PR_REFUSES_A_LETAPE_4: &[&str] = &["reviewDecision"];
+
+    /// Prompts dispensés du détecteur de la tête jugée, par `(fichier, clause)`.
+    ///
+    /// **LIVRÉE VIDE, et c'est le contrat.** Même forme et même raison que
+    /// [`PROMPT_OUTCOME_ALLOWLIST`] : aucune violation n'existe dans le code à
+    /// l'issue de mika#2934 — le prompt est corrigé dans le commit qui précède
+    /// celui du détecteur, donc il n'y a aucun antécédent à excuser.
+    const CONFORMITE_TETE_JUGEE_ALLOWLIST: &[(&str, &str)] = &[];
+
+    /// Les clauses d'une table que le prompt ne porte pas, exceptions retirées.
+    ///
+    /// Sorti du test pour que le contrôle négatif l'exerce sur un prompt
+    /// synthétique : une liste de présences tenue par un prédicat inerte est
+    /// indiscernable d'une liste vraie.
+    fn clauses_absentes<'a>(fichier: &str, prompt: &str, clauses: &'a [&'a str]) -> Vec<&'a str> {
+        clauses
+            .iter()
+            .copied()
+            .filter(|litteral| !prompt.contains(*litteral))
+            .filter(|litteral| {
+                !CONFORMITE_TETE_JUGEE_ALLOWLIST
+                    .iter()
+                    .any(|(f, exc)| *f == fichier && exc == litteral)
+            })
+            .collect()
+    }
+
+    /// **AC1.** L'étape 4 nomme la lecture qu'elle fait, et l'outil qui la donne.
+    #[test]
+    fn mika2934_letape_4_nomme_la_lecture_et_son_outil() {
+        for &(fichier, clauses) in CLAUSES_DE_LA_TETE_JUGEE {
+            assert_eq!(
+                clauses_absentes(fichier, prompt_de(fichier), clauses),
+                Vec::<&str>::new(),
+                "{fichier} : l'étape 4 ne nomme plus la lecture de la tête, ou \
+                 plus l'outil qui la donne"
+            );
+        }
+
+        // Contrôle négatif — le prompt d'avant mika#2934, reconstruit depuis son
+        // propre texte. Il porte `commit_id` et rien d'autre : c'est exactement
+        // la forme du défaut, un prédicat qui nomme le bon champ sans tenir la
+        // lecture qui le rend.
+        let fabrique = concat!(
+            "3. **Skip if already-reviewed at this SHA.** Fetch the latest review ",
+            "by yourself via `run_gh(\"pr view <n> --json reviews\")`. If a review ",
+            "exists with `commit_id == pr.headRefOid`, skip.\n",
+            "4. **Skip if verdict is already recorded.** If the PR already has an ",
+            "authoritative verdict tied to the current head SHA, skip.\n",
+        );
+        assert_eq!(
+            clauses_absentes(
+                "qa-review-webhook-success",
+                fabrique,
+                CLAUSES_DE_LA_TETE_JUGEE[0].1,
+            ),
+            vec!["qa_head_reviews(", "carries_verdict_line"],
+            "le détecteur doit voir l'absence de la lecture, et ne pas se \
+             contenter du champ qu'elle rend"
+        );
+
+        // Auto-nettoyage : une exception dont la clause est revenue dans son
+        // prompt est une exception qui ne protège plus rien.
+        for (fichier, clause) in CONFORMITE_TETE_JUGEE_ALLOWLIST {
+            assert!(
+                !prompt_de(fichier).contains(clause),
+                "exception stale dans CONFORMITE_TETE_JUGEE_ALLOWLIST : {clause:?} \
+                 est de nouveau dans {fichier} — retirer l'entrée"
+            );
+        }
+    }
+
+    /// **AC1, l'autre moitié.** Le champ du défaut n'est plus dans le prompt —
+    /// ni lu à l'étape 1, ni cité par l'interdiction de l'étape 4.
+    #[test]
+    fn mika2934_le_prompt_du_webhook_ne_cite_plus_aucun_etat_de_pr_revocable() {
+        for etat in ETATS_DE_PR_REFUSES_A_LETAPE_4 {
+            assert!(
+                !PROMPT_WEBHOOK.contains(etat),
+                "le prompt webhook cite encore {etat:?} : un état de PR survit au \
+                 force-push, et juger la tête sur lui est le défaut 1 de mika#2934"
+            );
+        }
+
+        // Contrôle négatif — une copie du prompt où le champ est réinséré dans
+        // la liste `--json` de l'étape 1, à la place exacte qu'il occupait.
+        let reintroduit = PROMPT_WEBHOOK.replace(
+            "number,mergeable,mergeStateStatus,statusCheckRollup",
+            "number,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
+        );
+        assert_ne!(
+            reintroduit, PROMPT_WEBHOOK,
+            "anti-vacuité : la réinsertion n'a pas trouvé sa cible, donc le \
+             contrôle négatif ne prouve rien — l'étape 1 a changé de forme"
+        );
+        assert!(
+            ETATS_DE_PR_REFUSES_A_LETAPE_4
+                .iter()
+                .any(|etat| reintroduit.contains(etat)),
+            "l'assertion ci-dessus doit rougir sur un prompt qui réintroduit le champ"
+        );
+    }
+
+    /// Fire-Disposition de mika#2934, option (a) : l'allowlist atterrit vide.
+    #[test]
+    fn mika2934_lallowlist_de_conformite_est_livree_vide_et_le_reste() {
+        assert!(
+            CONFORMITE_TETE_JUGEE_ALLOWLIST.is_empty(),
+            "Une entrée a été ajoutée ici. Une dispense de conformité sur ce \
+             détecteur rouvre exactement le défaut 1 de mika#2934 : un prompt qui \
+             juge une tête sur un état de PR révocable. Corrige le prompt, ou \
+             ouvre un ticket de suivi et cite-le dans l'entrée."
+        );
+    }
+
     // ---- R7/AC1 : le corpus de la session 4f94fbc8 -------------------------
 
     /// La tête que le défaut a marquée le 2026-10-26 à 15:18:30Z, telle
