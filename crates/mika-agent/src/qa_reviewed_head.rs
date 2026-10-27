@@ -85,6 +85,9 @@
 //! la classe (g′) arrive au vol 3, avec le décideur qu'il désarme — un
 //! interrupteur qui ne commande rien se lit comme une protection qui existe.
 
+use crate::qa_build_callback::pr_review_posted_in_turn;
+use crate::tool_execution::ToolCallSummary;
+
 /// La grammaire de clé du registre, réexportée plutôt que retapée (point 4 de la
 /// doc de module). `pr:{repo}#{n}@{sha}`.
 pub(crate) use crate::server::ci_success_handler::head_key;
@@ -151,6 +154,109 @@ pub(crate) fn reviewed_head_outcome(raw: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|canonical| *canonical == normalised)
+}
+
+// ---- La preuve du tour (mika#2934, R3) -----------------------------------
+
+/// L'outil de lecture head-matched : le seul qui dise sur quelle tête une revue
+/// a statué.
+///
+/// Source de vérité du nom : `skills/bundled/qa-review-webhook-success/tools.json`.
+/// Même idiome que [`crate::qa_build_callback::BUILD_MIKA_TOOL`] — un nom
+/// d'outil de skill se déclare une fois côté Rust, pour qu'un littéral ne se
+/// disperse pas sur les sites qui le testent.
+pub(crate) const QA_HEAD_REVIEWS_TOOL: &str = "qa_head_reviews";
+
+/// Ce que ce tour n'a pas fait, et qui interdit la ligne qu'il demande.
+///
+/// Les deux variantes sont les deux défauts mesurés le 2026-10-27 (mika#2934),
+/// et elles ne se recouvrent pas : la première dit qu'un verdict a été attesté
+/// avant d'être posté, la seconde qu'une tête a été déclarée conclue sur une
+/// preuve qui n'est pas la sienne.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreuveManquante {
+    /// `verdict_posted` sans `run_gh pr review` réussi dans ce tour.
+    ///
+    /// Le défaut 2, n=1 : le 2026-10-27 à 07:07:19Z la session `7418ef0c` a
+    /// écrit `verdict_posted` sur `#2931@1f649bf1` alors qu'elle venait de
+    /// lancer un build et attendait son callback.
+    VerdictSansPost,
+    /// Un `stop_*` sans lecture head-matched des revues de CETTE tête.
+    ///
+    /// Le défaut 1, n=3/3 : trois têtes fraîchement poussées déclarées déjà
+    /// jugées sur la foi d'un `reviewDecision: APPROVED` porté par la tête
+    /// précédente — un état de PR qui survit au force-push.
+    StopSansLectureDeTete,
+}
+
+/// La preuve que cette `outcome` exige, est-elle **absente de ce tour** ?
+///
+/// `None` veut dire « la ligne demandée est couverte par ce que ce tour a
+/// réellement fait ». Une preuve par valeur, et les trois valeurs en ont une :
+///
+/// | `outcome` | preuve exigée dans ce tour |
+/// |---|---|
+/// | `verdict_posted` | un `run_gh pr review` réussi |
+/// | `stop_already_reviewed_sha` | un [`QA_HEAD_REVIEWS_TOOL`] réussi nommant `head_sha` |
+/// | `stop_verdict_recorded` | idem |
+///
+/// Trois propriétés, chacune parce que son contraire était un défaut :
+///
+/// - **Un `outcome` hors vocabulaire rend `None`.** Le refus de valeur
+///   appartient à [`reviewed_head_outcome`] et au schéma de l'outil ; ce
+///   prédicat ne redouble pas ce jugement, il ne répond qu'à « la preuve
+///   est-elle là ». Deux juges d'une même valeur divergent (classe mika#2158).
+/// - **[`pr_review_posted_in_turn`] est appelée, pas recopiée.** Son
+///   doc-comment porte déjà la raison (mika#2355), et elle est publique.
+/// - **La correspondance de la tête passe par `input_summary`**, qui est
+///   tronqué à `crate::planning::policy::INPUT_SUMMARY_MAX` et scrubbé. Un SHA
+///   de 40 caractères dans un objet à trois champs y tient très largement ; si
+///   une évolution de cette borne le mettait en danger, c'est un test qui doit
+///   rougir, pas une troncature silencieuse.
+///
+/// **Pure**, et sans autorité : elle dit ce qui manque, le site (`dispatch.rs`)
+/// décide quoi en faire.
+pub(crate) fn preuve_du_tour_manquante(
+    outcome: &str,
+    head_sha: &str,
+    deja_execute: &[ToolCallSummary],
+) -> Option<PreuveManquante> {
+    match reviewed_head_outcome(outcome)? {
+        "verdict_posted" if !pr_review_posted_in_turn(deja_execute) => {
+            Some(PreuveManquante::VerdictSansPost)
+        }
+        "verdict_posted" => None,
+        // Les deux `stop_*` attestent le même fait — « un verdict existait déjà
+        // sur CETTE tête » — et exigent donc la même preuve. Le bras large est
+        // délibéré : une quatrième valeur ajoutée à [`REVIEWED_HEAD_OUTCOMES`]
+        // sans preuve propre tomberait ici et serait **refusée** faute de
+        // lecture de tête, jamais écrite sans preuve. C'est le fail-safe du
+        // module (point 4 du § *La perte de revue*) : une ligne manquante coûte
+        // un tour payé, une ligne fausse coûte une revue.
+        _ if lecture_de_tete_dans_le_tour(head_sha, deja_execute) => None,
+        _ => Some(PreuveManquante::StopSansLectureDeTete),
+    }
+}
+
+/// Ce tour a-t-il lu les revues de **cette** tête, avec succès ?
+///
+/// La tête est comparée en ASCII minuscule : le handler n'accepte que 40
+/// caractères hex minuscules, mais une graphie majuscule venue du modèle doit
+/// satisfaire la preuve plutôt que de la perdre.
+///
+/// Une tête vide ne satisfait **aucune** preuve — `contains("")` est vrai de
+/// toute chaîne, et une tête non nommée serait alors attestée par n'importe
+/// quel appel. L'outil refuse déjà ce cas en amont ; le prédicat ne s'y fie pas.
+fn lecture_de_tete_dans_le_tour(head_sha: &str, deja_execute: &[ToolCallSummary]) -> bool {
+    let tete = head_sha.trim().to_ascii_lowercase();
+    if tete.is_empty() {
+        return false;
+    }
+    deja_execute.iter().any(|resume| {
+        resume.name == QA_HEAD_REVIEWS_TOOL
+            && resume.success
+            && resume.input_summary.to_ascii_lowercase().contains(&tete)
+    })
 }
 
 #[cfg(test)]
@@ -1008,6 +1114,235 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
             Some("verdict_posted"),
             "contrôle positif : une tête dont le verdict est posté est reconnue, \
              donc écartée"
+        );
+    }
+
+    // ---- R6/AC2+AC3 : la preuve du tour -----------------------------------
+
+    /// La tête de #2931 **après** le force-push du 2026-10-27 — celle que la
+    /// ligne de 07:06:02Z a déclarée conclue. Le ticket l'abrège `1f649bf1` ;
+    /// elle est complétée ici, parce que le prédicat compare des chaînes et que
+    /// la longueur réelle est ce que le test doit lui présenter.
+    const TETE_NOUVELLE_2931: &str = "1f649bf10e2d4c6a8b1d3f5e7a9c0b2d4e6f8a1c";
+
+    /// La tête **précédente** de la même PR, celle qui portait l'APPROVED du
+    /// 2026-10-26 à 23:06Z — abrégée `3b44b035` par le ticket. C'est l'approbation
+    /// que le force-push a laissée sur la PR, et que `reviewDecision` rendait
+    /// indistinguable d'un verdict sur la nouvelle tête.
+    const TETE_ANCIENNE_2931: &str = "3b44b0359c7e5a3f1d0b8a6c4e2f0d9b7a5c3e1f";
+
+    /// La branche de #2931, telle que l'étape 1 la passe à `gh pr list`.
+    const BRANCHE_2931: &str = "fix/2924/la-pr-qui-ferme-un-ticket";
+
+    /// Un pas de tour, dans la forme que `process_tool_calls` pousse.
+    ///
+    /// `non_zero_exit` est laissé à `false` sur les deux branches : le prédicat
+    /// ne le lit pas, et le faire varier suggérerait qu'il compte.
+    fn resume(step: u32, name: &str, input_summary: String, success: bool) -> ToolCallSummary {
+        ToolCallSummary {
+            step,
+            name: name.to_string(),
+            input_summary,
+            output_summary: String::new(),
+            success,
+            non_zero_exit: false,
+        }
+    }
+
+    /// L'appel de l'étape 1, qui ne porte aucune preuve de tête.
+    fn pas_de_letape_1() -> ToolCallSummary {
+        resume(
+            1,
+            "run_gh",
+            serde_json::json!({
+                "command": ["pr", "list", "--head", BRANCHE_2931, "--state", "open",
+                            "--json", "number,mergeable,mergeStateStatus,statusCheckRollup"],
+                "repo": "senara-solutions/mika",
+            })
+            .to_string(),
+            true,
+        )
+    }
+
+    /// L'appel de l'étape 3, sur la tête donnée.
+    fn pas_de_letape_3(step: u32, tete: &str, success: bool) -> ToolCallSummary {
+        resume(
+            step,
+            QA_HEAD_REVIEWS_TOOL,
+            serde_json::json!({
+                "repo": "senara-solutions/mika",
+                "pr": 2931,
+                "head_sha": tete,
+            })
+            .to_string(),
+            success,
+        )
+    }
+
+    /// **AC3, test 1 et son contrôle négatif.** La reproduction littérale de la
+    /// session `7418ef0c` : à 07:07:19Z elle avait lancé un build et attendait
+    /// son callback, et elle a écrit `verdict_posted`. Son propre message de fin
+    /// le dit — « la tête a été enregistrée prématurément ». La consigne
+    /// (invariant 7 de `qa-review`) existait déjà et n'a pas tenu ; c'est
+    /// pourquoi le prédicat existe.
+    #[test]
+    fn mika2934_ac3_un_tour_qui_attend_un_callback_de_build_necrit_pas_verdict_posted() {
+        let attente_de_callback = vec![
+            resume(
+                1,
+                "run_gh",
+                serde_json::json!({
+                    "command": ["pr", "view", "2931", "--json", "files"],
+                    "repo": "senara-solutions/mika",
+                })
+                .to_string(),
+                true,
+            ),
+            resume(
+                2,
+                "build_mika",
+                serde_json::json!({"branch": BRANCHE_2931}).to_string(),
+                true,
+            ),
+        ];
+        assert_eq!(
+            preuve_du_tour_manquante("verdict_posted", TETE_NOUVELLE_2931, &attente_de_callback),
+            Some(PreuveManquante::VerdictSansPost),
+            "AC3 : un build lancé n'est pas un verdict posté"
+        );
+
+        // Un post qui a **échoué** n'est pas un post. Sans cette moitié, « le
+        // modèle a appelé `pr review` » suffirait, et c'est le contraire de ce
+        // que `verdict_posted` atteste.
+        let mut post_en_echec = attente_de_callback.clone();
+        post_en_echec.push(resume(
+            3,
+            "run_gh",
+            serde_json::json!({
+                "command": ["pr", "review", "2931", "--approve"],
+                "repo": "senara-solutions/mika",
+            })
+            .to_string(),
+            false,
+        ));
+        assert_eq!(
+            preuve_du_tour_manquante("verdict_posted", TETE_NOUVELLE_2931, &post_en_echec),
+            Some(PreuveManquante::VerdictSansPost),
+            "un `pr review` en échec ne satisfait pas la preuve"
+        );
+
+        // Contrôle négatif — le même historique, plus le post réussi.
+        let mut verdict_poste = attente_de_callback;
+        verdict_poste.push(resume(
+            3,
+            "run_gh",
+            serde_json::json!({
+                "command": ["pr", "review", "2931", "--approve", "--body", "VERDICT: pass"],
+                "repo": "senara-solutions/mika",
+            })
+            .to_string(),
+            true,
+        ));
+        assert_eq!(
+            preuve_du_tour_manquante("verdict_posted", TETE_NOUVELLE_2931, &verdict_poste),
+            None,
+            "contrôle négatif : le tour qui a posté son verdict écrit sa ligne"
+        );
+    }
+
+    /// **AC2, test 3 et son contrôle négatif.** Ce que la session `7b8f16b1`
+    /// avait réellement en main à 07:06:02Z : la liste de PR de l'étape 1, et
+    /// rien d'autre. Elle en a tiré « verdict déjà enregistré » et écrit
+    /// `stop_verdict_recorded`.
+    #[test]
+    fn mika2934_ac2_un_stop_sans_lecture_de_tete_est_refuse() {
+        let seule_la_liste = vec![pas_de_letape_1()];
+        for stop in ["stop_verdict_recorded", "stop_already_reviewed_sha"] {
+            assert_eq!(
+                preuve_du_tour_manquante(stop, TETE_NOUVELLE_2931, &seule_la_liste),
+                Some(PreuveManquante::StopSansLectureDeTete),
+                "{stop} sans lecture de tête est refusé : la liste de PR ne dit \
+                 sur quelle tête aucune revue a statué"
+            );
+        }
+
+        // Propriété 1 du prédicat : une valeur hors vocabulaire n'est pas jugée
+        // ici. Le refus de valeur appartient à `reviewed_head_outcome` et au
+        // schéma de l'outil ; deux juges d'une même valeur divergent.
+        for hors_contrat in ["review", "review_failed", "stop_no_open_pr", ""] {
+            assert_eq!(
+                preuve_du_tour_manquante(hors_contrat, TETE_NOUVELLE_2931, &seule_la_liste),
+                None,
+                "{hors_contrat} n'est pas enregistrable, et ce prédicat ne \
+                 redouble pas ce jugement"
+            );
+        }
+
+        // Contrôle négatif — la lecture de l'étape 3, sur CETTE tête.
+        let mut avec_lecture = seule_la_liste;
+        avec_lecture.push(pas_de_letape_3(2, TETE_NOUVELLE_2931, true));
+        for stop in ["stop_verdict_recorded", "stop_already_reviewed_sha"] {
+            assert_eq!(
+                preuve_du_tour_manquante(stop, TETE_NOUVELLE_2931, &avec_lecture),
+                None,
+                "contrôle négatif : {stop} après la lecture de cette tête passe"
+            );
+        }
+    }
+
+    /// **AC2, l'autre moitié — celle qui porte la tête.** Un `qa_head_reviews`
+    /// réussi portant **l'ancienne** tête ne satisfait pas une ligne demandée
+    /// sur la **nouvelle**. C'est exactement la propriété que `reviewDecision`
+    /// n'avait pas : une approbation gagnée par une tête précédente reste sur la
+    /// PR après un rebase, et c'est ce qui a fait déclarer trois têtes conclues
+    /// 9 à 17 minutes avant le premier verdict sur chacune.
+    #[test]
+    fn mika2934_ac2_le_force_push_ne_satisfait_pas_la_preuve() {
+        let lecture_de_lancienne_tete = vec![pas_de_letape_3(1, TETE_ANCIENNE_2931, true)];
+
+        assert_eq!(
+            preuve_du_tour_manquante(
+                "stop_verdict_recorded",
+                TETE_NOUVELLE_2931,
+                &lecture_de_lancienne_tete,
+            ),
+            Some(PreuveManquante::StopSansLectureDeTete),
+            "la preuve porte une tête, pas une PR : l'approbation de \
+             {TETE_ANCIENNE_2931} ne conclut rien sur {TETE_NOUVELLE_2931}"
+        );
+
+        // Contrôle positif, dans le même test — la même lecture satisfait la
+        // ligne demandée sur la tête qu'elle nomme. Sans lui, « le prédicat
+        // refuse » serait indistinguable de « le prédicat refuse tout ».
+        assert_eq!(
+            preuve_du_tour_manquante(
+                "stop_verdict_recorded",
+                TETE_ANCIENNE_2931,
+                &lecture_de_lancienne_tete,
+            ),
+            None,
+            "contrôle positif : sur sa propre tête, la lecture est la preuve"
+        );
+
+        // Et une lecture en échec ne prouve rien, sur aucune tête.
+        let lecture_en_echec = vec![pas_de_letape_3(1, TETE_NOUVELLE_2931, false)];
+        assert_eq!(
+            preuve_du_tour_manquante(
+                "stop_verdict_recorded",
+                TETE_NOUVELLE_2931,
+                &lecture_en_echec,
+            ),
+            Some(PreuveManquante::StopSansLectureDeTete),
+            "un appel en échec n'a rendu aucune revue à lire"
+        );
+
+        // Une tête vide ne satisfait aucune preuve : `contains("")` est vrai de
+        // toute chaîne, et une tête non nommée serait attestée par n'importe
+        // quel appel. L'outil refuse déjà ce cas ; le prédicat ne s'y fie pas.
+        assert_eq!(
+            preuve_du_tour_manquante("stop_verdict_recorded", "", &lecture_de_lancienne_tete),
+            Some(PreuveManquante::StopSansLectureDeTete),
+            "une tête vide n'est pas satisfaite par n'importe quel appel"
         );
     }
 }
