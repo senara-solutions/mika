@@ -8,11 +8,19 @@
 //! par aucun de leurs tests : un prédicat `created_at` faux, un `agent_id`
 //! oublié ou un `ORDER BY created_at` resteraient verts sans ceux-ci.
 
+//! **Les noms d'outil de ces tests sont neutres, et c'est une décision.** La
+//! requête est générique sur `tool_name` : aucune de ses quatre propriétés ne
+//! dépend de la valeur passée, donc y recopier les `tool_name` du registre
+//! n'apporterait rien et ferait de ce fichier un second endroit où ces noms
+//! vivent. Le registre en est l'unique porteur
+//! (`flight_verdict_ledger::MANAGER_FLIGHT_VERDICT_TOOL` et sa voisine), et
+//! c'est ce que sa garde de lecteur unique dit du côté production.
+
 use crate::db::Database;
 
-const TOOL: &str = "manager_flight_verdict";
-const AUTRE_TOOL: &str = "mpc_flight_judgment";
-const SESSION: &str = "manager-flight-verdict";
+const TOOL: &str = "outil_a";
+const AUTRE_TOOL: &str = "outil_b";
+const SESSION: &str = "session-de-test";
 const SINCE: &str = "2026-10-01T00:00:00Z";
 
 /// Une ligne du registre, sous l'agent nommé. `register_agent` et

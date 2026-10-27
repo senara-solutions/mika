@@ -2578,6 +2578,173 @@ mod tests {
         );
     }
 
+    // ---- Le lecteur unique des deux registres -----------------------------
+
+    /// Les quatre aiguilles par lesquelles un site nomme l'un des deux
+    /// registres : les deux littéraux, et les deux constantes qui les portent.
+    ///
+    /// Elles sont **concaténées** plutôt qu'écrites d'un bloc. La moitié
+    /// production de ce fichier est tronquée avant `mod tests`, donc la garde ne
+    /// se verrait pas elle-même de toute façon — mais cette troncature repose
+    /// sur un littéral `#[cfg(test)]` qu'un module de test extrait ne porterait
+    /// plus (classe mika#2321), et une garde qui se mord elle-même est rouge
+    /// pour une raison qui n'a rien à voir avec son objet.
+    fn aiguilles_du_registre() -> [String; 4] {
+        [
+            String::from("\"manager_flight_") + "verdict\"",
+            String::from("\"mpc_flight_") + "judgment\"",
+            String::from("MANAGER_FLIGHT_VERDICT_") + "TOOL",
+            String::from("MPC_FLIGHT_JUDGMENT_") + "TOOL",
+        ]
+    }
+
+    /// Les rangs (1-indexés) des lignes de `source` qui nomment un des deux
+    /// registres, commentaires exclus.
+    ///
+    /// Le retrait des commentaires est **porteur** : de la prose *sur* le
+    /// registre dans un autre fichier n'est pas une lecture, et une garde qui
+    /// la refuserait serait une taxe sur la documentation (la forme du signal S
+    /// de mika#2050). C'est aussi pourquoi le prédicat n'est pas
+    /// [`audit_writers`], qui ne retire rien : lui cherche un **geste**
+    /// d'écriture, celui-ci cherche une **mention**.
+    ///
+    /// Le filtre passe par [`strip_comment_lines`] ligne à ligne plutôt que sur
+    /// la source entière, pour que le rang rendu soit celui du fichier et non
+    /// celui d'un texte amputé.
+    fn sites_nommant_le_registre(source: &str) -> Vec<usize> {
+        let aiguilles = aiguilles_du_registre();
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, ligne)| !strip_comment_lines(ligne).trim().is_empty())
+            .filter(|(_, ligne)| aiguilles.iter().any(|a| ligne.contains(a.as_str())))
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// **Le lecteur unique.** Hors de ce fichier, aucun site de production de ce
+    /// crate ne nomme l'un des deux `tool_name` : la lecture du registre passe
+    /// par [`read_concordance`], comme son écriture passe par
+    /// [`FlightVerdictLedger::record`] et [`record_mpc_judgment`].
+    ///
+    /// **Pourquoi le prédicat porte sur le nom et non sur la lecture.** « Lire
+    /// le registre » n'a pas de forme syntaxique stable — c'est aujourd'hui un
+    /// appel à `list_audit_events_for_tool_since`, demain l'une de ses voisines
+    /// ou une cinquième. Ce qui est stable, c'est que **toutes** ont besoin du
+    /// `tool_name` : un site qui ne le nomme pas ne peut pas lire ces lignes-là.
+    /// Le prédicat est donc plus large que « une lecture » — il subsume la
+    /// lecture et l'écriture — et c'est ce qui le rend auto-nettoyant et sans
+    /// liste d'exception. La liste est **absente**, pas vide (doctrine
+    /// mika#2201) : quand la garde rougit, le remède est de router le site par
+    /// le chemin canonique, jamais d'y ajouter une ligne.
+    ///
+    /// **Ce que ce scan ne voit pas, dit ici plutôt que supposé.**
+    /// [`production_files`] est enraciné sur le `src` de *ce* crate et écarte
+    /// les sources de test ([`crate::source_scan::is_test_source_path`]), donc
+    /// ni un lecteur côté `mika-cli` ni un fichier de test ne lui sont visibles.
+    /// Le côté CLI porte sa propre garde dans son propre crate
+    /// (`mika2922_ladaptateur_nest_pas_un_ecrivain`), et c'est précisément
+    /// pourquoi le lecteur vit ici : une garde enracinée ailleurs serait verte
+    /// par construction (classe mika#2205).
+    #[test]
+    fn mika2922_ac3_un_seul_lecteur_du_registre() {
+        let files = production_files();
+
+        // Anti-vacuité, deux termes (mika#2205). Le premier : l'arbre a été lu.
+        assert!(
+            files.len() >= 100,
+            "anti-vacuité : {} fichiers lus, le scan n'a rien lu",
+            files.len()
+        );
+        // Le second : le seul site autorisé est bien dans ce qui a été lu. Un
+        // balayage qui ne voit pas le registre ne dit rien du lecteur.
+        assert!(
+            files
+                .iter()
+                .any(|(rel, _)| rel == "flight_verdict_ledger.rs"),
+            "anti-vacuité : le scan ne voit pas flight_verdict_ledger.rs"
+        );
+
+        let mut sites: Vec<String> = Vec::new();
+        for (rel, prod) in &files {
+            if rel == "flight_verdict_ledger.rs" {
+                continue;
+            }
+            for rang in sites_nommant_le_registre(prod) {
+                sites.push(format!("{rel}:{rang}"));
+            }
+        }
+
+        assert!(
+            sites.is_empty(),
+            "SOLE READER : le registre des verdicts de vol a un seul lecteur, \
+             read_concordance, et il vit dans flight_verdict_ledger.rs. \
+             Site(s) nommant un de ces tool_name ailleurs :\n{}\n\
+             Route la lecture par read_concordance et l'écriture par \
+             record / record_mpc_judgment — n'ajoute pas d'entrée \
+             (doctrine mika#2201).",
+            sites.join("\n")
+        );
+    }
+
+    /// Contrôle négatif du scan du lecteur. Il appelle
+    /// [`sites_nommant_le_registre`], le prédicat **réel** de la garde, plutôt
+    /// que d'en reproduire la forme comme le font ses deux voisins de l'AC2 :
+    /// ici la question n'est pas « la fenêtre de 5 lignes mord-elle ? » mais
+    /// « les quatre aiguilles sont-elles exactes et le retrait des commentaires
+    /// est-il bien en place ? », et une reproduction porterait les mêmes fautes
+    /// que l'original.
+    ///
+    /// Trois sources fabriquées, et chacune tient un terme que la verdeur seule
+    /// ne distinguerait pas :
+    ///
+    /// 1. un **second lecteur** — une lecture fenêtrée sous le `tool_name` du
+    ///    manager : le prédicat doit mordre, sinon « un seul lecteur » est
+    ///    indistinguable de « le scan ne trouve jamais rien » (classe
+    ///    mika#2205) ;
+    /// 2. une lecture d'`audit_events` **légitime**, sous un autre `tool_name`
+    ///    (celui de mika#2917) : le prédicat ne doit rien en dire, sinon la
+    ///    garde parle d'autre chose que de ces deux registres ;
+    /// 3. une mention en **commentaire** : le retrait est porteur, donc il est
+    ///    attesté. Sans ce terme, on ne saurait pas si la prose passe par
+    ///    décision ou par accident.
+    #[test]
+    fn mika2922_le_scan_du_lecteur_mord() {
+        let second_lecteur = "    let lignes = db\n        \
+                              .list_audit_events_for_tool_since(MANAGER_FLIGHT_VERDICT_TOOL, since)\n        \
+                              .await?;\n";
+        assert_eq!(
+            sites_nommant_le_registre(second_lecteur),
+            vec![2],
+            "le scan doit mordre sur un second lecteur, et nommer sa ligne"
+        );
+
+        let litteral_recopie = "    let tool = \"mpc_flight_judgment\";\n";
+        assert_eq!(
+            sites_nommant_le_registre(litteral_recopie),
+            vec![1],
+            "le scan doit mordre sur le littéral recopié"
+        );
+
+        // La population que la garde ne doit PAS refuser : une lecture
+        // d'`audit_events` sous un `tool_name` qui n'est ni l'un ni l'autre.
+        let lecture_legitime = "    let lignes = db\n        \
+                                .get_audit_event_rows_by_tool_name(QA_REVIEWED_HEAD_TOOL)\n        \
+                                .await?;\n";
+        assert!(
+            sites_nommant_le_registre(lecture_legitime).is_empty(),
+            "le scan ne doit RIEN dire d'une lecture d'audit sous un autre tool_name"
+        );
+
+        let en_commentaire = "    // MANAGER_FLIGHT_VERDICT_TOOL est écrit par le registre,\n    \
+                              /// et \"mpc_flight_judgment\" l'est par record_mpc_judgment.\n";
+        assert!(
+            sites_nommant_le_registre(en_commentaire).is_empty(),
+            "parler du registre n'est pas le lire : le retrait des commentaires \
+             est porteur et doit tenir"
+        );
+    }
+
     // ---- AC5 : aucune autorité, et l'interrupteur reste intouché ----------
 
     /// **AC5.** Ce module ne nomme pas l'interrupteur du geste sur la forge, et
