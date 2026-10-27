@@ -51,6 +51,7 @@
 use super::*;
 
 mod dispatch_stamp_and_slots;
+mod fenetre_daudit_par_outil;
 mod newer_audit_holds;
 mod reapers;
 mod recurring_tasks;
