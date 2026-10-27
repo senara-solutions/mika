@@ -129,8 +129,12 @@ du rapport du sink et dans le compteur `verdicts` de `manager_flight_scan` : ni
 table, ni `audit_events`. Le seuil qui ouvre l'écriture de l'évaluateur — *les
 mêmes verdicts que MPC sur 10 vols consécutifs ou 7 jours* — était donc
 immesurable. Ces lignes sont la moitié amont de la mesure : **une ligne par vol,
-écrite par le cycle qui le juge pour la première fois**. Rien ne les lit encore ;
-le jugement de MPC et le compte de concordance sont le vol 2.
+écrite par le cycle qui le juge pour la première fois**.
+
+**Et depuis le vol 3, un lecteur les lit** : `flight_verdict_ledger::read_concordance`,
+l'unique lecteur des deux registres, rendu à l'opérateur par
+`mika flight-verdicts concordance`. C'est lui qui met les deux côtés en face et
+qui rend le compte de vols consécutifs concordants — le seuil de mika#2698.
 
 **Row shape** (écrite uniquement par `flight_verdict_ledger::write_and_swallow`) :
 
@@ -146,7 +150,13 @@ le jugement de MPC et le compte de concordance sont le vol 2.
 L'`agent_id` n'est **pas** un paramètre : `AsyncDatabase::log_audit_event` clone le
 sien, donc le cloisonnement par agent est structurel et non une discipline d'appel.
 
-**Operator query:**
+**Lecture d'opérateur : `mika flight-verdicts concordance`** (`--format text|json|yaml`,
+`text` par défaut). Elle passe par `read_concordance`, qui lit cette ligne et celle
+de MPC par `Database::list_audit_events_for_tool_since` — une lecture fenêtrée sur
+la même `AUDIT_RETENTION_DAYS` que l'idempotence ci-dessous.
+
+**Repli SQL**, pour une base qu'aucun binaire courant ne sert ou pour un décompte
+que la commande ne rend pas :
 
 ```sql
 SELECT target_key, after_value, count(*)
@@ -163,7 +173,7 @@ deux champs et **jamais une somme** : les additionner rendrait « 3 nouveaux » 
 « 3 déjà là » identiques (classe mika#2205). L'absence de la ligne signifie un
 binaire antérieur au vol (motif mika#2340), jamais une absence d'inscription.
 
-**Deux propriétés, toutes deux load-bearing :**
+**Trois propriétés, toutes load-bearing :**
 
 - **Aucune autorité sur la forge.** `FlightVerdictLedger::record` rend un
   `InscriptionTally` de trois `usize` et jamais un `Result` : une écriture en
@@ -181,6 +191,19 @@ binaire antérieur au vol (motif mika#2340), jamais une absence d'inscription.
   pas réécrit : le test est une lecture préalable dérivée de cette constante, non
   un `UNIQUE`. Au-delà de la rétention la ligne n'existe plus, et une
   réinscription est alors la bonne réponse — pas un doublon.
+- **Un seul lecteur, pour les deux registres à la fois.**
+  `mika2922_ac3_un_seul_lecteur_du_registre` refuse, dans la moitié production de
+  ce crate et hors de `flight_verdict_ledger.rs`, tout site qui **nomme** l'un
+  des deux `tool_name` — par son littéral ou par sa constante. Le prédicat porte
+  sur le nom et non sur la forme d'une lecture, parce que « lire le registre »
+  n'a pas de forme syntaxique stable alors que toutes les lectures ont besoin du
+  `tool_name` : il subsume donc la lecture et l'écriture, et c'est ce qui le rend
+  auto-nettoyant. Aucune liste d'exception — elle est **absente**, pas vide
+  (doctrine mika#2201) : quand la garde rougit, on route le site par
+  `read_concordance` ou par `record` / `record_mpc_judgment`. Les commentaires
+  sont retirés du balayage : parler du registre n'est pas le lire, et refuser
+  qu'on en parle ferait de cette garde une taxe sur la documentation (forme du
+  signal S de mika#2050).
 
 ### `tool_name = 'mpc_flight_judgment'` — le jugement de MPC sur un vol (mika#2922, vol 2)
 
@@ -190,6 +213,12 @@ manager** — c'est ce qui permet de mettre les deux côtés en face — et le
 partagé, l'idempotence de chaque côté serait celle de l'autre, et le compte de
 concordance (vol 3) lirait un accord là où un seul des deux a parlé.
 
+**Et depuis le vol 3, le compte existe** : `flight_verdict_ledger::read_concordance`
+met cette ligne en face de celle du manager, et
+`mika flight-verdicts concordance` la rend à l'opérateur. Un vol que MPC n'a pas
+jugé y apparaît **« non jugé par MPC »** et ne compte ni pour ni contre : la
+ligne absente n'est pas un désaccord (motif mika#2331).
+
 **Row shape** (écrite uniquement par `flight_verdict_ledger::record_mpc_judgment`) :
 
 | column | value |
@@ -198,7 +227,7 @@ concordance (vol 3) lirait un accord là où un seul des deux a parlé.
 | `session_id` | `mpc-flight-judgment` (`MPC_FLIGHT_JUDGMENT_SESSION_ID`) |
 | `target_key` | `tasks.id` — la même clé que la ligne du manager, à l'octet |
 | `after_value` | JSON serde du **même** `VerdictRecord { issue, recommendation }` que le vol 1, donc la même grammaire — issue, cause, recommandation |
-| `reasoning` | la note libre de l'opérateur (`--note`), telle quelle, ou `NULL` |
+| `reasoning` | la note libre de l'opérateur (`--note`), telle quelle, ou `NULL`. **La colonne ne porte pas la même donnée des deux côtés, et c'est délibéré** : côté manager elle porte `issue_number=<n>`, ici une note. Le compte de concordance lit donc le ticket d'un vol sur la ligne **du manager**, jamais sur celle-ci |
 | `before_value` | toujours `NULL` |
 
 **Le chemin supporté est `mika flight-verdicts judge`**, jamais du SQL à la
@@ -214,7 +243,13 @@ une sixième cause de mort ajoutée en amont est acceptée sans qu'une ligne bou
 **structurel** : la forme serde d'une variante newtype est un objet, jamais un
 terme nu. Un terme hors contrat est refusé en nommant les valeurs acceptées.
 
-**Operator query:**
+**Lecture d'opérateur : `mika flight-verdicts concordance`**, la même commande que
+pour le registre du manager — c'est tout l'objet du compte que de ne pas lire les
+deux côtés séparément.
+
+**Repli SQL** (noter que `ORDER BY created_at` est ici acceptable parce qu'on
+lit, pas parce qu'on ordonne : l'accesseur du registre trie par `id`, seul ordre
+total à la seconde près — voir `db/tests/fenetre_daudit_par_outil.rs`) :
 
 ```sql
 SELECT target_key, after_value, reasoning
@@ -241,7 +276,19 @@ WHERE tool_name = 'mpc_flight_judgment' ORDER BY created_at DESC;
   dont le prédicat est le `tool_name` et **jamais** `log_audit_event` — ce crate
   écrit légitimement des lignes d'audit sous d'autres noms d'outil. Aucune des
   deux ne porte de liste d'exception : quand l'une rougit, une écriture se route
-  par `record_mpc_judgment` et une lecture par l'accesseur du registre.
+  par `record_mpc_judgment` et une lecture par `read_concordance`.
+- **Un seul lecteur, et il est ici.** `mika2922_ac3_un_seul_lecteur_du_registre`
+  (décrit dans la section du vol 1, parce qu'il couvre les deux `tool_name` d'un
+  seul prédicat) refuse tout second site nommant ce `tool_name` dans la moitié
+  production de ce crate. La garde CLI
+  (`mika2922_ladaptateur_nest_pas_un_ecrivain`) le refuse aussi côté `mika-cli` :
+  l'adaptateur ne nomme ni l'un ni l'autre, et c'est précisément pourquoi
+  `read_concordance` vit dans `flight_verdict_ledger.rs` et non dans la commande.
+  Enracinée côté CLI, une garde du lecteur serait verte par construction (classe
+  mika#2205).
 
 L'idempotence réemploie la fenêtre `AUDIT_RETENTION_DAYS` et l'accesseur du
-vol 1 ; aucune table, aucune migration, le schéma reste à v56.
+vol 1. Le vol 3 ajoute une **quatrième** lecture par `tool_name`,
+`Database::list_audit_events_for_tool_since` — la seule qui porte une borne basse
+et projette `created_at` — mais toujours aucune table et aucune migration : le
+schéma reste à v56.
