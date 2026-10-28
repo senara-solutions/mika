@@ -127,10 +127,23 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 /// Le littéral `docs/plans/` : ce qui sépare un chemin de plan d'un chemin de
 /// `docs/brainstorms/` ou de `docs/solutions/`.
 const PLAN_DIR_PREFIX: &str = "docs/plans/";
+
+/// Le préfixe de la ligne que [`rewrite_callout_as_prior_plan`] écrit à la place
+/// du run de callout d'un vol livré — **site unique** (mika#2952).
+///
+/// L'écrivain le consomme pour composer sa ligne et [`plan_reading`] pour la
+/// reconnaître ; aucun des deux ne l'épelle. La constante existe parce que
+/// mika#2952 a créé le lecteur que le § *L'idempotence est structurelle*
+/// déclarait absent : l'orthographe de cette prose porte désormais un contrat,
+/// et le tenir par une constante partagée plus un test d'aller-retour
+/// ([`tests::mika2952_la_ligne_ecrite_par_la_porte_est_relue_par_le_lecteur`])
+/// est structurel là où une convention de relecture serait prudentielle.
+pub const PRIOR_PLAN_PREFIX: &str = "> Plan antérieur :";
 
 /// Faut-il retirer les blocs clôturés avant de lire le callout ?
 ///
@@ -285,8 +298,17 @@ fn normalize(raw: &str) -> String {
 ///
 /// Agir exige une ligne `> - **Plan:** …` ; après une réécriture elle n'existe
 /// plus, donc un second passage rend `None` par construction. Aucun marqueur
-/// « déjà réécrit » n'est ajouté au corps, et la prose produite a un écrivain et
-/// zéro lecteur — rien ne peut dériver de son orthographe.
+/// « déjà réécrit » n'est ajouté au corps.
+///
+/// # La prose produite a un lecteur depuis mika#2952
+///
+/// Ce doc-comment disait « *un écrivain et zéro lecteur — rien ne peut dériver
+/// de son orthographe* ». Ce n'est plus vrai : [`plan_reading`] reconnaît cette
+/// ligne, et le bassin du manager en tire un refus d'admission nommé. Un
+/// écrivain, un lecteur, et un test qui les joint —
+/// [`tests::mika2952_la_ligne_ecrite_par_la_porte_est_relue_par_le_lecteur`] :
+/// les deux côtés consomment [`PRIOR_PLAN_PREFIX`] sans l'épeler, et changer la
+/// prose sans changer la constante devient rouge.
 pub fn rewrite_callout_as_prior_plan(body: &str, branch: &str, merged_pr: u64) -> Option<String> {
     // `split_inclusive` et non `lines()` : les terminateurs sont conservés, donc
     // le texte autour du run est reproduit à l'octet près (`\r\n` compris) et un
@@ -338,7 +360,7 @@ pub fn rewrite_callout_as_prior_plan(body: &str, branch: &str, merged_pr: u64) -
     // chemin sur `main` — la sonde a mesuré une suppression de branche, pas la
     // présence d'un fichier.
     out.push_str(&format!(
-        "> Plan antérieur : `{plan}` — la branche `{branch}` qui le portait a été \
+        "{PRIOR_PLAN_PREFIX} `{plan}` — la branche `{branch}` qui le portait a été \
          supprimée par le merge de #{merged_pr} dans `main`. Callout réécrit par la \
          porte d'auto-pull (mika#2839)."
     ));
@@ -356,6 +378,77 @@ pub fn rewrite_callout_as_prior_plan(body: &str, branch: &str, merged_pr: u64) -
 /// Un budget, pas une borne : la ligne porte un chemin et une branche de
 /// longueur libre, et `String` réalloue sans drame si elle le dépasse.
 const PRIOR_PLAN_LINE_BUDGET: usize = 256;
+
+/// Ce que le corps d'une issue dit de son plan, en **trois** états (mika#2952).
+///
+/// Un booléen portait deux populations sous un seul nom — « ce corps porte un
+/// callout vivant » et « ce corps porte la trace d'un vol déjà livré » — et le
+/// bassin du manager concluait « un vol est dû » sur les deux. Trois états parce
+/// que les trois appellent trois gestes différents ; les confondre est la classe
+/// mika#2205.
+///
+/// Orthogonal à `milestone_manager::reader::plan_callout_present`, que mika#2608
+/// a figé et que mika#2952 **ne resserre pas** : la levée a pris la forme d'une
+/// séparation. La propriété de sur-ensemble épinglée par mika#2608 est
+/// précisément ce qui rend [`PlanReading::PriorOnly`] bien défini — `lâche \
+/// stricte` est non vide, et c'est la population mesurée le 2026-10-28.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReading {
+    /// Le corps porte un callout `> - **Plan:** …` **strict**, hors bloc
+    /// clôturé.
+    ///
+    /// Question répondue : « un vol est-il groomé et dû sur ce ticket ? » — oui.
+    /// Geste correctif : aucun, le candidat est admissible. Cet état couvre
+    /// aussi le découpage en N vols dont le vol 1 est livré et le vol suivant
+    /// groomé : le corps porte alors les **deux** lignes, et c'est le callout
+    /// frais qui décide.
+    Live,
+    /// Pas de callout strict, et au moins une ligne [`PRIOR_PLAN_PREFIX`] : le
+    /// travail de vol est livré et la branche qui le portait a disparu.
+    ///
+    /// Question répondue : « reste-t-il un vol à faire ? » — non. Geste
+    /// correctif : mesurer et fermer, ou re-groomer le vol suivant. **Aucun
+    /// groom ne débloque cet état tel quel**, d'où le `false` que le refus tiré
+    /// par le bassin rend à `remediable_by_grooming()`.
+    PriorOnly,
+    /// Ni l'un ni l'autre : le corps ne nomme aucun plan.
+    ///
+    /// Question répondue : « ce ticket est-il groomé ? » — non. Geste correctif :
+    /// le groomer, ce que la relève de `milestone_manager::relief` propose déjà
+    /// par `RefusalReason::NoGroomedPlan`.
+    Absent,
+}
+
+/// L'état du plan dans un corps d'issue — le lecteur que mika#2952 crée pour le
+/// bassin du manager.
+///
+/// L'ordre des deux questions **est** la sémantique : un callout strict gagne
+/// toujours, donc un corps qui porte à la fois la trace d'un vol livré et un
+/// callout frais rend [`PlanReading::Live`]. C'est la distinction « vol 1/2
+/// livré » / « tout livré » que mika#2952 exige, et elle tient sur une
+/// convention de la boucle plutôt que sur un compte de PR : quand un vol suivant
+/// est dû, le grooming réécrit un callout canonique sur une branche neuve.
+///
+/// La politique de fences du premier test est [`FenceHandling::Strip`], celle
+/// d'`auto_pull` : un callout *cité* dans un bloc clôturé n'est pas un plan
+/// vivant (mika#2120). Le second test ne la rejoue pas, et l'écart ne change
+/// aucun verdict — un corps dont la seule ligne antérieure est citée dans un
+/// bloc rendrait sinon `Absent`, qui refuse l'admission tout autant. Seul le
+/// **nom** du refus diffère, et nommer la ligne qu'on a lue est le moins faux
+/// des deux.
+pub fn plan_reading(body: &str) -> PlanReading {
+    if plan_callout(body, FenceHandling::Strip).is_some() {
+        return PlanReading::Live;
+    }
+    if body
+        .lines()
+        .any(|l| l.trim_start().starts_with(PRIOR_PLAN_PREFIX))
+    {
+        return PlanReading::PriorOnly;
+    }
+    PlanReading::Absent
+}
 
 /// Le marqueur de fence d'une ligne (```` ``` ```` ou `~~~`), ou rien.
 fn fence_marker(line: &str) -> Option<char> {
@@ -643,6 +736,130 @@ mod tests {
         assert!(
             out.contains(PLAN_2108) && out.contains("docs/plans/"),
             "le substring non ancré que lit `check_grooming_markers` subsiste"
+        );
+    }
+
+    // ───────── Lecture à trois états du plan (mika#2952) ─────────
+
+    /// **C'est le test qui tient le contrat d'orthographe.**
+    ///
+    /// L'écrivain compose, le lecteur relit. Les deux consomment
+    /// [`PRIOR_PLAN_PREFIX`] sans l'épeler, donc changer la prose de la porte
+    /// d'auto-pull sans changer la constante est impossible à merger : c'est ce
+    /// qui remplace la phrase « zéro lecteur » que le doc-comment portait.
+    #[test]
+    fn mika2952_la_ligne_ecrite_par_la_porte_est_relue_par_le_lecteur() {
+        assert_eq!(
+            plan_reading(CANONICAL),
+            PlanReading::Live,
+            "le corps canonique porte un callout strict"
+        );
+        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834)
+            .expect("le corps canonique doit être réécrit");
+        assert_eq!(
+            plan_reading(&out),
+            PlanReading::PriorOnly,
+            "la ligne que la porte vient d'écrire doit être relue : {out}"
+        );
+    }
+
+    /// AC3-b au niveau de la grammaire : un découpage en N vols dont le vol 1
+    /// est livré et le vol 2 groomé porte les **deux** lignes, et c'est le
+    /// callout frais qui décide.
+    #[test]
+    fn mika2952_un_callout_vivant_a_cote_dune_ligne_anterieure_reste_live() {
+        let body = format!("{CANONICAL_REWRITTEN}\n{CANONICAL}");
+        assert!(
+            body.contains(PRIOR_PLAN_PREFIX),
+            "la trace du vol livré est bien là : {body}"
+        );
+        assert_eq!(plan_reading(&body), PlanReading::Live);
+    }
+
+    // Le corpus mesuré : extraits des corps de #2943, #2946 et #2680, relus sur
+    // la forge le 2026-10-28. Les trois portent une ligne `Plan antérieur :` et
+    // **aucune** ligne de callout strict — ni, pour les trois, de ligne
+    // `Branch`, la vérification croisée que le § 2 du plan nomme.
+
+    /// #2943 — ligne machine, écrite par la porte au merge de #2945.
+    const CORPUS_2943: &str = concat!(
+        "> Plan antérieur : `docs/plans/2026-10-28-001-fix-2943-filet-de-verdict-sur-coupure-max-steps-webhook-plan.md` — la branche `fix/2943/qa-review-un-tour-webhook-de-mika-qa` qui le portait a été supprimée par le merge de #2945 dans `main`. Callout réécrit par la porte d'auto-pull (mika#2839).\n",
+        "\n",
+        "## Le défaut\n",
+        "\n",
+        "Quand un tour **webhook** de mika-qa épuise son budget de pas, il se termine en `outcome_absent` sans verdict.\n",
+    );
+
+    /// #2946 — ligne machine, écrite par la porte au merge de #2949.
+    const CORPUS_2946: &str = concat!(
+        "> Plan antérieur : `docs/plans/2026-10-28-002-fix-2946-levaluateur-ne-compte-plus-un-groom-comme-un-vol-plan.md` — la branche `fix/2946/mika-manager-l-valuateur-compte-les` qui le portait a été supprimée par le merge de #2949 dans `main`. Callout réécrit par la porte d'auto-pull (mika#2839).\n",
+        "\n",
+        "## Le défaut\n",
+        "\n",
+        "L'évaluateur compte comme « vols terminés » des tâches qui n'en sont pas.\n",
+    );
+
+    /// #2680 — ligne **écrite à la main**, sans la clause « supprimée par le
+    /// merge de #N », en milieu de corps, et dont la PR citée (#2833) a été
+    /// *fermée sans merge*. C'est le cas qu'un ancrage sur la clause de merge
+    /// aurait raté, et dont extraire un numéro de PR aurait menti (§ question 1).
+    const CORPUS_2680: &str = concat!(
+        "**Conclusion : (a) tient.** Elle coûte trois pièces : le gateway transmet `head_sha`.\n",
+        "\n",
+        "---\n",
+        "> Plan antérieur : `docs/plans/2026-10-19-007-feat-2680-cellule-g-chiffree-et-refutee-plan.md` (vol 6). Il n'est pas sur `main` : il vit dans la PR #2833, fermée sans merge le 2026-10-20 (tête `816e05b8`, lisible par `refs/pull/2833/head`). Le résultat de ce vol est versé plus bas, dans « Vol 6 : résultat ».\n",
+        "\n",
+        "## Vol 6 : résultat\n",
+    );
+
+    /// Le corpus de régression : les trois corps que le bassin lisait comme
+    /// portant un plan vivant rendent `PriorOnly`.
+    #[test]
+    fn mika2952_le_corpus_mesure_rend_prior_only() {
+        for (ticket, body) in [
+            ("#2943", CORPUS_2943),
+            ("#2946", CORPUS_2946),
+            ("#2680", CORPUS_2680),
+        ] {
+            assert_eq!(
+                plan_reading(body),
+                PlanReading::PriorOnly,
+                "{ticket} doit se lire comme un vol livré"
+            );
+            // Vérification croisée : le signal corroborant du § 2, écarté comme
+            // prédicat parce qu'il est aveugle par origine, mais vrai ici.
+            assert!(
+                !body.contains("> - **Branch:**"),
+                "{ticket} ne porte plus de ligne `Branch`"
+            );
+        }
+        // Contrôle négatif de bonne foi (mika#2205) : le prédicat n'est pas un
+        // « tout rend PriorOnly ». Un corps qui ne nomme aucun plan rend
+        // `Absent`, et c'est `NoGroomedPlan` qui le refusera, pas ce motif.
+        assert_eq!(
+            plan_reading("## Le défaut\n\nUn ticket que personne n'a groomé.\n"),
+            PlanReading::Absent
+        );
+    }
+
+    /// **Livrée vide, et elle le reste** — l'exception nommée de la
+    /// Fire-Disposition de mika#2952, forme mika#2425 / mika#1833.
+    ///
+    /// Un tuple `(corps, ticket de suivi)`. Une future ligne `Plan antérieur :`
+    /// dont la lecture devrait être exceptée s'inscrit ici **avec son ticket**,
+    /// jamais par un élargissement du prédicat — ce qui est la différence entre
+    /// une exception qui expire et l'allowlist que mika#2309 condamne.
+    const MIKA2952_CORPUS_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// L'assertion auto-nettoyante de l'allowlist ci-dessus.
+    #[test]
+    fn mika2952_lallowlist_du_corpus_est_vide() {
+        assert!(
+            MIKA2952_CORPUS_EXCEPTIONS.is_empty(),
+            "une exception a été inscrite : {MIKA2952_CORPUS_EXCEPTIONS:?}\n\n\
+             RÉSOLUTION : chaque entrée doit citer son ticket de suivi, et ce test \
+             doit alors être édité pour l'exiger nommément. Une allowlist qui \
+             grossit sans ticket est celle que mika#2309 condamne."
         );
     }
 
