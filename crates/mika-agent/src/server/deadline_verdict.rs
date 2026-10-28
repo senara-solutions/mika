@@ -173,17 +173,35 @@ pub enum TurnConclusion {
     /// `LlmError` via `downcast_ref` — jamais un `contains()` sur le message
     /// rendu. `detail` est le message d'erreur, tronqué par le call-site.
     Failed { error_class: String, detail: String },
+    /// Le tour a été coupé par son **budget de pas d'outil** sans rédiger de
+    /// verdict (mika#2943). `steps_completed` vient de
+    /// [`crate::agent_loop::MaxStepsCutOff`], c'est-à-dire du plafond **servi**.
+    MaxStepsExceeded { steps_completed: usize },
 }
 
-impl From<Option<crate::agent_loop::DeadlineOverrun>> for TurnConclusion {
-    /// La traduction d'un `AgentOutput` : un tour qui a rendu `Ok` a conclu ou
-    /// a été coupé — il n'est pas mort.
-    fn from(overrun: Option<crate::agent_loop::DeadlineOverrun>) -> Self {
-        match overrun {
-            None => Self::Concluded,
-            Some(o) => Self::DeadlineExceeded {
-                steps_completed: o.steps_completed,
+impl TurnConclusion {
+    /// La traduction d'un `AgentOutput` : un tour qui a rendu `Ok` a conclu, ou
+    /// a été coupé par l'une de ses deux bornes — il n'est pas mort.
+    ///
+    /// Remplace l'`impl From<Option<DeadlineOverrun>>` de mika#2276, qui ne
+    /// lisait qu'un champ : le garder à côté de celui-ci en ferait un piège, un
+    /// futur lecteur l'appellerait et perdrait la moitié « coupé par les pas ».
+    /// Un seul convertisseur, et il est total.
+    ///
+    /// Les deux champs sont mutuellement exclusifs par construction
+    /// (`agent_loop::AgentOutput::max_steps_exceeded`). Le croisement est quand
+    /// même traité, en faisant gagner la deadline — jamais par un
+    /// `unreachable!()` : paniquer sur un champ d'observabilité serait le pire
+    /// des échanges (doctrine mika#2515).
+    pub fn of_output(output: &crate::agent_loop::AgentOutput) -> Self {
+        match (output.deadline_exceeded, output.max_steps_exceeded) {
+            (Some(overrun), _) => Self::DeadlineExceeded {
+                steps_completed: overrun.steps_completed,
             },
+            (None, Some(cut)) => Self::MaxStepsExceeded {
+                steps_completed: cut.steps_completed,
+            },
+            (None, None) => Self::Concluded,
         }
     }
 }
@@ -262,6 +280,27 @@ pub enum VerdictReason {
         exit: crate::qa_build_callback::CutOffExit,
         steps_completed: usize,
     },
+    /// mika#2943 — le tour **webhook** a été coupé par son budget de pas
+    /// d'outil avant de poster son verdict.
+    ///
+    /// # Pourquoi la population de mika#2276, discriminée par `cause`
+    ///
+    /// C'est une perte du chemin **webhook**, exactement comme
+    /// [`Self::CutOffByDeadline`] et [`Self::TurnFailed`] : même déclencheur,
+    /// même cible, même opérateur en bout de chaîne. Lui donner un nom
+    /// d'événement neuf couperait en deux la population que l'opérateur agrège,
+    /// et obligerait chaque sonde webhook à nommer deux noms. Il rend donc
+    /// [`DEADLINE_VERDICT_EVENT`], discriminé par `cause=cut_off_max_steps` —
+    /// le geste de mika#2289, et la valeur de `cause` est celle que
+    /// `qa_build_callback` sert déjà au chemin callback, jamais un littéral neuf.
+    ///
+    /// Son corps est celui de mika#2276 à **une phrase près** : la borne qui a
+    /// coupé. Dire « a atteint la limite de son enveloppe de temps » d'un tour
+    /// qui avait encore 295 s devant lui (trace `b22e6ea0`) serait une mesure
+    /// fausse rendue avec autorité, et le corps de la branche deadline est figé
+    /// octet pour octet par
+    /// [`tests::mika2368_the_deadline_body_is_frozen_byte_for_byte`].
+    WebhookCutOffByMaxSteps { steps_completed: usize },
 }
 
 impl VerdictReason {
@@ -276,6 +315,9 @@ impl VerdictReason {
             // mika#2515 : perte du chemin callback, donc la population
             // callback — discriminée par `cause`, jamais par un nom neuf.
             Self::CallbackCutOffWithoutVerdict { .. } => CALLBACK_VERDICT_EVENT,
+            // mika#2943 : perte du chemin webhook, donc la population webhook —
+            // même geste, même `cause`, l'autre côté du miroir.
+            Self::WebhookCutOffByMaxSteps { .. } => DEADLINE_VERDICT_EVENT,
         }
     }
 
@@ -297,6 +339,11 @@ impl VerdictReason {
             Self::CallbackConcludedWithoutVerdict => None,
             Self::TurnFailed { .. } => Some(CAUSE_ERROR),
             Self::CallbackCutOffWithoutVerdict { exit, .. } => Some(exit.as_cause()),
+            // La même valeur que le chemin callback sert pour la même borne —
+            // lue depuis la constante, jamais recopiée (mika#2943).
+            Self::WebhookCutOffByMaxSteps { .. } => {
+                Some(crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS)
+            }
         }
     }
 }
@@ -415,6 +462,9 @@ pub fn deadline_verdict_target(
             error_class,
             detail,
         },
+        TurnConclusion::MaxStepsExceeded { steps_completed } => {
+            VerdictReason::WebhookCutOffByMaxSteps { steps_completed }
+        }
     };
     // Un tour Telegram, un heartbeat ou un événement non-PR peut dépasser sa
     // deadline ou mourir : il n'y a alors rien sur quoi poster, et ce n'est pas
@@ -572,6 +622,32 @@ fn build_verdict_body(reason: &VerdictReason, trace_id: &str) -> String {
                 cause = exit.as_cause(),
             )
         }
+        // mika#2943 — la grammaire de mika#2276 à une phrase près : la borne
+        // franchie. Le reste est identique parce que c'est le même défaut vu par
+        // le même opérateur sur la même population ; la branche deadline étant
+        // figée octet pour octet, la phrase juste s'écrit ici.
+        VerdictReason::WebhookCutOffByMaxSteps { steps_completed } => format!(
+            "{DEADLINE_VERDICT_LINE}\n\
+             \n\
+             Ce verdict est posté par le moteur, pas par le tour de revue.\n\
+             \n\
+             Le tour de revue QA a atteint la limite de son budget de steps d'outil \
+             avant d'avoir rédigé un verdict : il s'est arrêté après \
+             {steps_completed} step(s) d'outil. Aucune conclusion de revue n'a été \
+             produite — ce `hold[review]` ne dit rien du contenu de la PR, seulement \
+             que la revue n'a pas abouti.\n\
+             \n\
+             Relancer la revue (retirer puis remettre le reviewer) suffit dans le cas \
+             nominal. Si la coupure se répète sur cette PR, le tour bute \
+             probablement sur un travail trop long pour un budget de revue — regarder \
+             les `run_shell` du tour avant de relancer une troisième fois.\n\
+             \n\
+             Trace : `{trace_id}` — chercher `{DEADLINE_VERDICT_EVENT}` et \
+             `cause={cause}` dans `$MIKA_SPIRIT_LOG_FILE`.\n\
+             \n\
+             <sub>mika#2943</sub>",
+            cause = crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS,
+        ),
     }
 }
 
@@ -723,6 +799,22 @@ where
                     "callback de build QA coupé avant d'avoir posté — verdict \
                      hold[review] posté par le moteur"
                 ),
+                // mika#2943 — cinquième `warn!`, même raison. La ligne porte
+                // `cause` **et** `steps_completed` : c'est par leur conjonction
+                // que l'opérateur joint cette ligne au `max_steps_tool_census`
+                // de la même trace (sonde AC4).
+                VerdictReason::WebhookCutOffByMaxSteps { steps_completed } => warn!(
+                    event,
+                    agent_id = %input.agent_id,
+                    trace_id = %input.trace_id,
+                    repo = %target.repo,
+                    pr = target.pr_number,
+                    cause = crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS,
+                    steps_completed = *steps_completed,
+                    outcome = "posted",
+                    "tour de revue coupé par son budget de steps — verdict \
+                     hold[review] posté par le moteur"
+                ),
             }
             DeadlineVerdictOutcome::Posted
         }
@@ -763,10 +855,16 @@ mod tests {
 
     const REVIEW_REQUESTED: &str = "[GitHub] PR review_requested: senara-solutions/mika#2275 — fix(mika#2272) (branch: fix/2272)\nhttps://github.com/senara-solutions/mika/pull/2275\nRequested reviewer: @mika-platform-qa";
 
-    fn overrun(steps: usize) -> Option<DeadlineOverrun> {
-        Some(DeadlineOverrun {
+    /// La conclusion d'un tour coupé par son enveloppe de temps.
+    ///
+    /// Rendait un `Option<DeadlineOverrun>` passé en `.into()` jusqu'à
+    /// mika#2943, qui a supprimé ce convertisseur partiel : la conclusion se
+    /// nomme maintenant, et c'est la moitié du contrat de
+    /// [`TurnConclusion::of_output`].
+    fn overrun(steps: usize) -> TurnConclusion {
+        TurnConclusion::DeadlineExceeded {
             steps_completed: steps,
-        })
+        }
     }
 
     /// Le motif mika#2276, tel que [`deadline_verdict_target`] le construit.
@@ -1040,8 +1138,7 @@ mod tests {
     #[test]
     fn a_non_pr_deadline_overrun_never_reaches_the_net() {
         assert!(
-            deadline_verdict_target(overrun(9).into(), "Salut, tu peux me résumer ma semaine ?")
-                .is_none()
+            deadline_verdict_target(overrun(9), "Salut, tu peux me résumer ma semaine ?").is_none()
         );
     }
 
@@ -1050,7 +1147,7 @@ mod tests {
     #[test]
     fn a_cut_off_pr_turn_produces_the_deadline_reason_and_its_target() {
         let (reason, target) =
-            deadline_verdict_target(overrun(5).into(), REVIEW_REQUESTED).expect("motif + cible");
+            deadline_verdict_target(overrun(5), REVIEW_REQUESTED).expect("motif + cible");
         assert_eq!(reason, cut_off(5));
         assert_eq!(reason.event_name(), DEADLINE_VERDICT_EVENT);
         assert_eq!(target, requested_target());
@@ -1496,7 +1593,7 @@ mod tests {
     /// son ticket.
     #[test]
     fn mika2289_the_two_causes_are_never_collapsed() {
-        let (envelope, _) = deadline_verdict_target(overrun(5).into(), REVIEW_REQUESTED)
+        let (envelope, _) = deadline_verdict_target(overrun(5), REVIEW_REQUESTED)
             .expect("un dépassement n'est pas une conclusion");
         let (error, _) = deadline_verdict_target(died("transport_timeout"), REVIEW_REQUESTED)
             .expect("une mort n'est pas une conclusion");
@@ -1748,5 +1845,347 @@ mod tests {
             );
             assert_eq!(calls.load(Ordering::SeqCst), 0, "zéro POST ({key})");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2943 — le cinquième motif : le tour WEBHOOK a été coupé par ses pas
+    // -----------------------------------------------------------------------
+
+    use crate::agent_loop::{AgentOutput, MaxStepsCutOff};
+
+    /// L'événement exact qui a produit le défaut : la sortie du draft de #2920,
+    /// 2026-10-28 06:42:09Z, trace `b22e6ea0`. Le tour qui l'a servi a brûlé 46
+    /// appels d'outil contre un plafond de 30, puis s'est terminé en
+    /// `outcome_absent` sans qu'aucune revue n'atteigne la PR.
+    const READY_FOR_REVIEW_2920: &str = "[GitHub] PR ready_for_review: senara-solutions/mika#2920 — feat(2926): le plafond de pas de mika-qa (branch: fix/2926)\nhttps://github.com/senara-solutions/mika/pull/2920";
+
+    /// Un `AgentOutput` réduit aux deux seuls champs que
+    /// [`TurnConclusion::of_output`] lit.
+    ///
+    /// Les six autres champs sont du bruit pour ce contrat, mais ils sont écrits
+    /// à la main plutôt que remplis par un `Default` : `AgentOutput` n'en dérive
+    /// pas, et un `Default` ajouté pour la commodité d'un test rendrait
+    /// constructible un output sans `effective_model`, ce que mika#2304 refuse.
+    fn output(
+        deadline_exceeded: Option<DeadlineOverrun>,
+        max_steps_exceeded: Option<MaxStepsCutOff>,
+    ) -> AgentOutput {
+        AgentOutput {
+            text: Some("Je continue la revue…".to_string()),
+            thinking: None,
+            usage: None,
+            run_usage: None,
+            deadline_exceeded,
+            max_steps_exceeded,
+            undelivered_sends: None,
+            effective_model: Some("anthropic/claude-sonnet-4-6".to_string()),
+        }
+    }
+
+    /// Le motif mika#2943, tel que [`deadline_verdict_target`] le construit.
+    fn max_steps(steps: usize) -> VerdictReason {
+        VerdictReason::WebhookCutOffByMaxSteps {
+            steps_completed: steps,
+        }
+    }
+
+    /// **R5.1** — [`TurnConclusion::of_output`] est **total** sur les deux
+    /// drapeaux, croisement inclus.
+    ///
+    /// C'est la propriété que le convertisseur partiel retiré par ce ticket ne
+    /// pouvait pas tenir : `From<Option<DeadlineOverrun>>` ne voyait qu'un champ,
+    /// donc un appelant pouvait lire la deadline seule *en compilant* — le défaut
+    /// même de mika#2943. Le croisement (les deux `Some`) est
+    /// constructivement impossible — chaque sortie de `run_loop` pose au plus un
+    /// champ — mais il est **tranché** plutôt que paniqué : un `unreachable!()`
+    /// transformerait une future sortie mal câblée en crash du serveur, là où la
+    /// deadline qui gagne ne coûte qu'un corps de verdict moins précis.
+    #[test]
+    fn mika2943_of_output_is_total_and_never_panics() {
+        let cases: [(&str, AgentOutput, TurnConclusion); 4] = [
+            (
+                "ni l'un ni l'autre",
+                output(None, None),
+                TurnConclusion::Concluded,
+            ),
+            (
+                "deadline seule",
+                output(Some(DeadlineOverrun { steps_completed: 7 }), None),
+                TurnConclusion::DeadlineExceeded { steps_completed: 7 },
+            ),
+            (
+                "budget de pas seul",
+                output(
+                    None,
+                    Some(MaxStepsCutOff {
+                        steps_completed: 30,
+                    }),
+                ),
+                TurnConclusion::MaxStepsExceeded {
+                    steps_completed: 30,
+                },
+            ),
+            (
+                "le croisement : la deadline gagne, sans panique",
+                output(
+                    Some(DeadlineOverrun { steps_completed: 7 }),
+                    Some(MaxStepsCutOff {
+                        steps_completed: 30,
+                    }),
+                ),
+                TurnConclusion::DeadlineExceeded { steps_completed: 7 },
+            ),
+        ];
+
+        for (label, out, expected) in cases {
+            assert_eq!(
+                TurnConclusion::of_output(&out),
+                expected,
+                "of_output sur « {label} »"
+            );
+        }
+    }
+
+    /// **AC1 / V1 (R5.2)** — le contrat central : un tour webhook coupé par ses
+    /// pas sur un événement de PR poste **exactement un** `hold[review]` sur
+    /// cette PR, et le corps dit la vérité.
+    ///
+    /// La cible et le motif viennent de `deadline_verdict_target`, jamais écrits
+    /// à la main : c'est le seul chemin que `handlers.rs` emprunte, donc le seul
+    /// dont un test puisse dire qu'il tient.
+    #[tokio::test]
+    async fn mika2943_a_max_steps_cut_webhook_turn_posts_exactly_one_hold() {
+        let (reason, target) = deadline_verdict_target(
+            TurnConclusion::MaxStepsExceeded {
+                steps_completed: 30,
+            },
+            READY_FOR_REVIEW_2920,
+        )
+        .expect("une coupure par pas sur une PR appelle le filet");
+        assert_eq!(reason, max_steps(30));
+        assert_eq!(target.repo, "senara-solutions/mika");
+        assert_eq!(target.pr_number, 2920);
+
+        let registry: DashMap<String, HashSet<String>> = DashMap::new();
+        let captured = Arc::new(std::sync::Mutex::new(None::<PostReviewRequest>));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let sink = captured.clone();
+        let counter = calls.clone();
+        let outcome = maybe_post_deadline_verdict(
+            DeadlineVerdictInput {
+                reason,
+                target,
+                session_id: "webhook-session",
+                trace_id: "b22e6ea0-b4d9-11f1-9f3e-90c3b908c45a",
+                agent_id: "mika-qa",
+                pr_reviews_posted: Some(&registry),
+            },
+            move |req| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                *sink.lock().unwrap() = Some(req);
+                async { Ok("ok".to_string()) }
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, DeadlineVerdictOutcome::Posted);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactement un POST");
+
+        let req = captured.lock().unwrap().clone().expect("un POST capturé");
+        assert_eq!(req.repo, "senara-solutions/mika");
+        assert_eq!(req.pr_number, 2920, "la PR mesurée, pas une autre");
+        assert!(
+            req.body.starts_with(DEADLINE_VERDICT_LINE),
+            "AC1 : la grammaire de mika#2276, pas une seconde — got: {}",
+            req.body
+        );
+        assert!(
+            req.body.contains("30 step(s)"),
+            "AC1 : le nombre de pas — le plafond SERVI, celui que mika#2926 a \
+             relevé, pas la constante par défaut de 20 : {}",
+            req.body
+        );
+        assert!(
+            req.body.contains("b22e6ea0-b4d9-11f1-9f3e-90c3b908c45a"),
+            "trace_id manquant : {}",
+            req.body
+        );
+        assert!(
+            !req.body.contains("enveloppe de temps"),
+            "le tour avait encore ~295 s devant lui — c'est le mensonge que la \
+             réutilisation de `CutOffByDeadline` aurait produit : {}",
+            req.body
+        );
+        assert!(
+            req.body
+                .contains(crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS),
+            "le corps nomme la `cause` que l'opérateur grep : {}",
+            req.body
+        );
+        assert!(req.body.contains("<sub>mika#2943</sub>"));
+
+        // Ce que la machine d'état lira réellement : la constante seule ne le
+        // prouve pas, et `parse_verdict` est ce qui merge sur `pass`.
+        let parsed = crate::server::verdict::parse_verdict(&req.body);
+        assert!(
+            matches!(&parsed, crate::server::verdict::Verdict::Hold(k) if k == "review"),
+            "le filet ne peut produire que hold[review], got {parsed:?}"
+        );
+    }
+
+    /// **AC1 / V1 (R5.3)** — le fil : l'événement est celui de la population
+    /// **webhook**, et la `cause` est la constante partagée avec mika#2515.
+    ///
+    /// Les deux assertions tiennent la soustraction opérateur. Un
+    /// `qa_callback_verdict` ici ferait compter une perte du chemin webhook dans
+    /// la population callback, et la sonde de contrôle négatif de mika#2355
+    /// (`grep qa_deadline_verdict | jq 'select(.outcome == "posted")'`) ne
+    /// verrait jamais le défaut qu'elle existe pour voir. La `cause` est
+    /// comparée **à la constante** et non à un littéral recopié : une grammaire
+    /// de fil dupliquée est ce qui a laissé deux lecteurs diverger dans
+    /// mika#2158.
+    #[test]
+    fn mika2943_the_webhook_cut_off_keeps_its_own_population_and_cause() {
+        assert_eq!(
+            max_steps(30).event_name(),
+            DEADLINE_VERDICT_EVENT,
+            "une perte du chemin webhook appartient à la population webhook"
+        );
+        assert_ne!(max_steps(30).event_name(), CALLBACK_VERDICT_EVENT);
+        assert_eq!(
+            max_steps(30).cause(),
+            Some(crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS),
+            "la même `cause` que la coupure par pas du chemin callback — une \
+             seule grandeur, un seul nom"
+        );
+    }
+
+    /// **AC2 / V2 (R5.4)** — la déduplication : une coupure par pas dont la
+    /// session a **déjà** posté sa revue ne poste rien de plus.
+    ///
+    /// C'est le cas `e6e7d8e0` (#2941, 2026-10-27 15:38), que la mesure du
+    /// ticket écarte explicitement du compte des six. Les deux formes de clé
+    /// sont couvertes, et aucune n'est recomposée à la main : `run_gh` écrit
+    /// `__default__|{n}` quand l'appel `gh pr review` n'a pas porté de `--repo`,
+    /// et manquer cette forme ferait re-poster le filet sur une PR déjà revue.
+    #[tokio::test]
+    async fn mika2943_a_cut_off_turn_that_already_reviewed_posts_nothing() {
+        use crate::skills::builtin_handlers::format_pr_dedup_key;
+
+        for key in [
+            format_pr_dedup_key(Some("senara-solutions/mika"), "2920"),
+            format_pr_dedup_key(None, "2920"),
+        ] {
+            let registry: DashMap<String, HashSet<String>> = DashMap::new();
+            registry
+                .entry("webhook-session".to_string())
+                .or_default()
+                .insert(key.clone());
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let (reason, target) = deadline_verdict_target(
+                TurnConclusion::MaxStepsExceeded {
+                    steps_completed: 30,
+                },
+                READY_FOR_REVIEW_2920,
+            )
+            .expect("le filet est appelé");
+
+            let counter = calls.clone();
+            let outcome = maybe_post_deadline_verdict(
+                DeadlineVerdictInput {
+                    reason,
+                    target,
+                    session_id: "webhook-session",
+                    trace_id: "trace-2943",
+                    agent_id: "mika-qa",
+                    pr_reviews_posted: Some(&registry),
+                },
+                move |_req| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(String::new()) }
+                },
+            )
+            .await;
+
+            assert_eq!(
+                outcome,
+                DeadlineVerdictOutcome::AlreadyReviewed,
+                "clé {key}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "AC2 : zéro POST ({key})");
+        }
+    }
+
+    /// **AC2 / V3 (R5.5)** — un tour non-PR coupé par ses pas ne poste rien, et
+    /// ce n'est pas un défaut.
+    ///
+    /// Un tour Telegram, un heartbeat ou un `check_suite` sur une branche peut
+    /// épuiser son budget de pas : il n'y a alors aucune PR sur quoi poster. La
+    /// décision est rendue **avant** qu'un token soit résolu ou qu'une ligne
+    /// soit journalisée.
+    #[test]
+    fn mika2943_a_non_pr_cut_off_turn_has_no_target() {
+        for text in [
+            "Bonjour",
+            "[GitHub] Check suite success on senara-solutions/mika (branch: main)",
+        ] {
+            assert!(
+                deadline_verdict_target(
+                    TurnConclusion::MaxStepsExceeded {
+                        steps_completed: 30
+                    },
+                    text
+                )
+                .is_none(),
+                "aucune PR dans « {text} » : le filet s'abstient"
+            );
+        }
+    }
+
+    /// **V5 (R5.6)** — le motif neuf n'a déplacé aucune population existante.
+    ///
+    /// Contrôle de D2, et il ne se confond pas avec les tests fondateurs qu'il
+    /// cite : ceux-là resteraient verts si le motif neuf *s'ajoutait* à la
+    /// population mika#2276 sans rien lui retirer. Ce que celui-ci dit, c'est que
+    /// les quatre motifs restent **distincts** sur les deux axes que l'opérateur
+    /// soustrait — le corps et la `cause` — et que les deux motifs fondateurs
+    /// n'ont toujours **aucune** `cause`, ce dont dépend `select(.cause == null)`.
+    #[test]
+    fn mika2943_the_founding_populations_are_untouched() {
+        assert_eq!(cut_off(5).cause(), None, "mika#2276 : AC5c la fige");
+        assert_eq!(
+            VerdictReason::CallbackConcludedWithoutVerdict.cause(),
+            None,
+            "mika#2368 : la réparation P0 entre dans cette population"
+        );
+
+        let deadline_body = build_verdict_body(&cut_off(5), "t");
+        let max_steps_body = build_verdict_body(&max_steps(30), "t");
+        assert!(deadline_body.contains("<sub>mika#2276</sub>"));
+        assert!(max_steps_body.contains("<sub>mika#2943</sub>"));
+        assert_ne!(
+            deadline_body, max_steps_body,
+            "deux bornes, deux corps — les confondre rendrait la `cause` inutile"
+        );
+        assert!(
+            !max_steps_body.contains("enveloppe de temps"),
+            "le corps de mika#2276 est figé byte pour byte, et celui-ci ne \
+             l'emprunte pas"
+        );
+
+        // La coupure par pas du chemin CALLBACK partage la `cause`, jamais
+        // l'événement : c'est ce qui garde les deux populations soustractibles.
+        assert_eq!(
+            cut_off_reason(CutOffExit::MaxSteps, 30).cause(),
+            max_steps(30).cause(),
+            "une seule grandeur, un seul nom"
+        );
+        assert_ne!(
+            cut_off_reason(CutOffExit::MaxSteps, 30).event_name(),
+            max_steps(30).event_name(),
+            "deux chemins, deux populations"
+        );
     }
 }

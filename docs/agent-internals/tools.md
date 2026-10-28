@@ -553,13 +553,20 @@ even though 30 is the manifest default (mika#2276 AC5).
 `server::deadline_verdict` — when a turn **owed a verdict on a PR and did not post
 one**, the engine itself posts `VERDICT: hold[review]` on that PR.
 
-**Two reasons since mika#2368, and the question the module answers changed with
-them.** It is no longer *"was the turn cut off?"* but *"did this turn owe a verdict
-and fail to post one?"* — `VerdictReason::CutOffByDeadline` (mika#2276: the turn
-never reached its conclusion) and `VerdictReason::CallbackConcludedWithoutVerdict`
-(mika#2368: a QA build callback **concluded**, cleanly, posting nothing). The
-reason decides the **body**, the **log line** and the **event name**; it decides
-nothing else — target resolution, the anti-double-post registry, the 422
+**Five reasons since mika#2943, and the question the module answers changed at
+the second.** It is no longer *"was the turn cut off?"* but *"did this turn owe a
+verdict and fail to post one?"*:
+
+| `VerdictReason` | ticket | the turn | `event_name()` | `cause()` |
+|---|---|---|---|---|
+| `CutOffByDeadline` | mika#2276 | webhook turn, never reached its conclusion | `qa_deadline_verdict` | *absent* |
+| `CallbackConcludedWithoutVerdict` | mika#2368 | QA build callback, **concluded** cleanly, posting nothing | `qa_callback_verdict` | *absent* |
+| `TurnFailed` | mika#2289 | died on a loop error (transport timeout, …) | `qa_deadline_verdict` | `error` |
+| `CallbackCutOffWithoutVerdict` | mika#2515 | callback cut off by its deadline **or** its step budget | `qa_callback_verdict` | `cut_off_deadline` / `cut_off_max_steps` |
+| `WebhookCutOffByMaxSteps` | mika#2943 | webhook turn cut off by its **step budget** | `qa_deadline_verdict` | `cut_off_max_steps` |
+
+The reason decides the **body**, the **log line** and the **event name**; it
+decides nothing else — target resolution, the anti-double-post registry, the 422
 classification and the never-return-an-error discipline are shared.
 
 The entry guard that used to read `overrun == None → NotApplicable("turn_completed")`
@@ -569,10 +576,16 @@ population, so it could not stay a refusal. It moved down into
 `deadline_verdict_target`, the webhook call-site's entry decision, where it still
 costs nothing on the nominal path (no token resolution, no log, no parse).
 
-**The signal.** `AgentOutput.deadline_exceeded: Option<DeadlineOverrun>` (carrying
-`steps_completed`) is stamped in `persist_deadline_fallback` — the one function all
-three deadline gates (prelude, continuation-skip, `LoopResult::DeadlineExceeded`)
-return through, so the flag cannot be set on two and forgotten on the third.
+**The signal — two fields, one per bound.** `AgentOutput.deadline_exceeded:
+Option<DeadlineOverrun>` (carrying `steps_completed`) is stamped in
+`persist_deadline_fallback` — the one function all three deadline gates (prelude,
+continuation-skip, `LoopResult::DeadlineExceeded`) return through, so the flag
+cannot be set on two and forgotten on the third. Since mika#2943 its sibling
+`max_steps_exceeded: Option<MaxStepsCutOff>` carries the **step** bound, stamped
+only on the "continuation performed" exit of the `LoopResult::MaxStepsExceeded`
+arm. The two are mutually exclusive by construction (each exit of `run_loop`
+poses at most one), and `handlers.rs` reads them through the single **total**
+converter `TurnConclusion::of_output(&AgentOutput)` — never field by field.
 Architect Q3 chose a field over propagating `LoopResult`: `handlers.rs` already
 consumes this struct, and widening the agent-core/orchestrator interface was too
 much surface for a p1.
@@ -696,12 +709,83 @@ of the new reason read as a regression of the old. Same principle as
 `wip_rescue_no_token` (mika#2205). Both carry an `outcome` field in
 `{posted, already_reviewed, already_posted_upstream, post_failed, no_token, no_registry}`,
 plus, for the callback reason, `disarmed` and the four abstention motives above.
-Steady state for `qa_deadline_verdict` after M1 is zero lines. For
-`qa_callback_verdict`, **near zero is the contract**: a net carrying nominal traffic
-has replaced a silence with a systematic `hold[review]`, which means mika#2355's
-B1/B2/guard did not take — and *that* is where to look, not in the net's tuning.
-*This is a net, not a path*; if it carries the nominal traffic it has also erased the
-signal that would show it.
+For `qa_callback_verdict`, **near zero is the contract**: a net carrying nominal
+traffic has replaced a silence with a systematic `hold[review]`, which means
+mika#2355's B1/B2/guard did not take — and *that* is where to look, not in the
+net's tuning. *This is a net, not a path*; if it carries the nominal traffic it
+has also erased the signal that would show it.
+
+**Two names are no longer two populations — `cause` is what subtracts them, and
+reading the name alone now lies.** `qa_deadline_verdict` carried exactly one
+reason when mika#2355 wrote its negative-control probe (*"the mika#2276 net must
+not start firing"*, steady state zero lines); it carries three since mika#2943.
+A `posted` under that name is therefore **not**, by itself, a regression of
+mika#2276. The founding population is isolated by the **absence** of the field:
+
+```sh
+# mika#2276's founding population — the probe mika#2355 wrote, corrected.
+grep qa_deadline_verdict /var/log/mika/server.log \
+  | jq 'select(.cause == null) | select(.outcome == "posted")'   # expected: empty
+
+# mika#2943's population — a webhook turn cut off at its step ceiling.
+grep qa_deadline_verdict /var/log/mika/server.log \
+  | jq 'select(.cause == "cut_off_max_steps")'
+```
+
+`cut_off_max_steps` is **one constant**
+(`qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS`), shared with the callback path
+rather than retyped: one quantity, one name. The two paths stay separable
+because they keep **different event names** while sharing the cause — so
+`cause` alone answers *"which bound?"* and the name alone answers *"which
+path?"*, and neither has to answer both.
+
+#### The fifth reason: a webhook turn cut off by its step budget (mika#2943)
+
+**The half of the net that was missing, and the reason nothing noticed.** The
+mika#2276 net arms on `DeadlineExceeded` or `Failed`. A turn that exhausts its
+**tool-step** budget arrives as `Concluded`, because the loop runs a continuation
+turn and that turn produces text: `text` reads exactly like an answer. Six
+webhook turns of mika-qa between 2026-10-26 and 2026-10-28 ended that way, each
+leaving its PR unreviewed and **nothing on the PR saying so** — including
+`b22e6ea0` on #2920 at the 30-step ceiling mika#2926 had just raised, so the
+raise was not the fix. The callback path already had this net (mika#2515); the
+webhook path did not.
+
+**The partial converter is gone, and that is the fix's shape.**
+`impl From<Option<DeadlineOverrun>> for TurnConclusion` saw one field, so a call
+site could read the deadline alone **and compile** — which is precisely how this
+defect shipped. It is replaced by `TurnConclusion::of_output(&AgentOutput)`,
+total on both flags. Keeping the partial one beside it would have left the trap
+armed for the next field. The constructively-impossible crossing (both `Some`)
+is **decided** in favour of the deadline rather than `unreachable!()`: a future
+mis-wired exit should cost a less precise verdict body, never a server crash.
+Held structurally — `grep -rn 'TurnConclusion::from' crates/` returns nothing.
+
+**One body, no second grammar (AC1).** The posted body is mika#2276's, with one
+sentence changed, because the deadline body is frozen byte-for-byte by
+mika#2368 AC5c: *"Le tour de revue QA a atteint la limite de son budget de steps
+d'outil…"*. It says *budget de steps*, never *enveloppe de temps* — trace
+`b22e6ea0` still had ~295 s of its envelope left, and reusing `CutOffByDeadline`
+would have posted that falsehood. The step count is the **served** ceiling,
+transported by `LoopResult::MaxStepsExceeded`, never re-read from a constant: a
+mika-qa turn that consumed 30 must not be reported as 20.
+
+**A build callback in flight is the one abstention (AC3).** The measured cases
+`11699630` (#2920) and `517380e0` (#2932) were cut off at the ceiling **after**
+dispatching a `long_running:build_mika` — and their review came back through the
+callback, hence through *its* net. So when
+`qa_build_callback::build_callback_dispatched_in_turn` holds, `run_loop` poses no
+cut-off fact at all and says so once
+(`event = "qa_max_steps_verdict_withheld"`, `cause = "build_callback_pending"`).
+Posting here would double the `hold`. The abstention is **journalised** rather
+than silent, because an abstention and a blind net return identical bytes.
+
+**Probe (AC4).** At the next `max_steps_tool_census` of a mika-qa webhook turn on
+a PR, the same `trace_id` carries either a posted `qa_deadline_verdict` with
+`cause=cut_off_max_steps`, or a review the session posted itself, or a
+`qa_max_steps_verdict_withheld`. Those three exhaust the dispositions; a fourth
+outcome — the census line alone — is the defect still live. The instrument is not
+live until `make deploy` (motif mika#2340).
 
 ### Structural Verdict Handler
 

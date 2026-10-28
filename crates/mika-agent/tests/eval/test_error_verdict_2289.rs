@@ -68,7 +68,7 @@ const INCIDENT_MESSAGE: &str = "failed to read response body: error decoding res
 /// message rendu.
 fn conclusion_of(run: &anyhow::Result<mika_agent::agent_loop::AgentOutput>) -> TurnConclusion {
     match run {
-        Ok(output) => TurnConclusion::from(output.deadline_exceeded),
+        Ok(output) => TurnConclusion::of_output(output),
         Err(e) => TurnConclusion::Failed {
             error_class: mika_common::llm::error::classify_anyhow_error(e).into_owned(),
             detail: format!("{e:#}"),

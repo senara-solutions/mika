@@ -43,7 +43,7 @@ use tokio::time::Instant;
 
 use mika_agent::server::deadline_verdict::{
     DEADLINE_VERDICT_LINE, DeadlineVerdictInput, DeadlineVerdictOutcome, PostReviewRequest,
-    deadline_verdict_target, maybe_post_deadline_verdict,
+    TurnConclusion, deadline_verdict_target, maybe_post_deadline_verdict,
 };
 
 use super::harness::EvalHarness;
@@ -144,7 +144,7 @@ async fn ac2_a_qa_turn_cut_off_by_its_deadline_posts_a_verdict() {
     // `deadline_verdict_target` — l'appeler ici, c'est rester « branché comme en
     // production ».
     let (reason, target) =
-        deadline_verdict_target(output.deadline_exceeded.into(), REVIEW_REQUESTED_EVENT)
+        deadline_verdict_target(TurnConclusion::of_output(&output), REVIEW_REQUESTED_EVENT)
             .expect("un tour coupé sur une PR doit produire un motif et une cible");
 
     let sink = captured.clone();
@@ -220,7 +220,7 @@ async fn ac3_a_turn_that_already_posted_its_review_adds_no_second_verdict() {
         .insert("senara-solutions/mika|2275".to_string());
 
     let (reason, target) =
-        deadline_verdict_target(output.deadline_exceeded.into(), REVIEW_REQUESTED_EVENT)
+        deadline_verdict_target(TurnConclusion::of_output(&output), REVIEW_REQUESTED_EVENT)
             .expect("un tour coupé sur une PR doit produire un motif et une cible");
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -287,7 +287,7 @@ async fn a_turn_that_concludes_in_budget_posts_nothing() {
     // qu'un `NotApplicable`.
     assert!(
         deadline_verdict_target(
-            trace.output.deadline_exceeded.into(),
+            TurnConclusion::of_output(&trace.output),
             REVIEW_REQUESTED_EVENT
         )
         .is_none(),

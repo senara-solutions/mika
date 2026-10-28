@@ -177,6 +177,12 @@ mod eval {
     // c'est la paire qui est le livrable, un contrôle d'absence seul n'attestant
     // rien.
     mod test_max_steps_tool_census_2877;
+    // mika#2943 (règle 13, mika#2264) — le contrôle NÉGATIF du filet de verdict
+    // sur coupure par pas : la conjonction « tour webhook coupé au plafond &
+    // aucune revue de la session & rien sur la PR » n'est pas atteignable. Seul
+    // test du ticket à traverser le joint où le défaut vivait — entre ce que la
+    // boucle sait de sa coupure et ce que le call-site en lit.
+    mod test_max_steps_verdict_2943;
     // mika#2281 — la frontière de secret du canal MCP, mesurée sur un serveur
     // stdio factice : les noms traversent, la valeur non — et le contrôle
     // positif montre qu'elle traverse bel et bien par le canal FICHIER, qui
