@@ -123,6 +123,23 @@ pub fn pr_review_posted_in_turn(summaries: &[ToolCallSummary]) -> bool {
     })
 }
 
+/// Un callback de build QA a-t-il été dispatché dans ce tour ?
+///
+/// Voisin exact de [`pr_review_posted_in_turn`], et pour le même emploi : un
+/// terme partagé plutôt qu'une conjonction recopiée (leçon mika#2158).
+///
+/// Lu par le chemin webhook de mika#2943 sur sa sortie coupée. Un `true` dit
+/// qu'une tâche callback existe, porteuse du stamp
+/// `deadline_verdict::QA_REVIEW_PR_TARGET_KEY` que
+/// `skills::executor::resolve_qa_review_pr_target` pose sur ce même nom d'outil
+/// — donc que le filet mika#2368/#2515 de ce callback portera le verdict si le
+/// callback revient muet ou coupé. Le filet webhook s'abstient alors (AC3).
+pub fn build_callback_dispatched_in_turn(summaries: &[ToolCallSummary]) -> bool {
+    summaries
+        .iter()
+        .any(|s| s.name == BUILD_MIKA_TOOL && s.success)
+}
+
 /// Label de la garde positive, pour `intent_guard_retries`.
 pub const QA_VERDICT_REQUIRED_LABEL: &str = "qa_build_callback_verdict";
 
@@ -612,6 +629,42 @@ mod tests {
             summary("send_message", "{}", true),
         ];
         assert!(!pr_review_posted_in_turn(&self_dev));
+    }
+
+    /// mika#2943 AC3 — le prédicat d'abstention du filet webhook, et les trois
+    /// contrôles négatifs qui séparent « un build QA est en vol » de « un outil
+    /// quelconque a tourné ».
+    ///
+    /// Un `false` de trop coûte un `hold` doublé ; un `true` de trop coûte le
+    /// défaut que ce ticket corrige. Les quatre cas sont donc pris ensemble.
+    #[test]
+    fn mika2943_un_build_qa_en_vol_est_le_seul_cas_dabstention() {
+        let cases: [(&str, Vec<ToolCallSummary>, bool); 4] = [
+            (
+                "un build_mika réussi : le callback portera le verdict",
+                vec![summary(BUILD_MIKA_TOOL, "{}", true)],
+                true,
+            ),
+            (
+                "un build_mika échoué : aucune tâche callback n'existe",
+                vec![summary(BUILD_MIKA_TOOL, "{}", false)],
+                false,
+            ),
+            (
+                "un autre long_running : son filet ne porte pas de verdict de PR",
+                vec![summary("run_claude_pilot", "{}", true)],
+                false,
+            ),
+            ("aucun outil : le tour n'a rien dispatché", vec![], false),
+        ];
+
+        for (why, summaries, expected) in cases {
+            assert_eq!(
+                build_callback_dispatched_in_turn(&summaries),
+                expected,
+                "{why}"
+            );
+        }
     }
 
     /// mika#2368 — le complémentaire de la garde : les trois termes, chacun
