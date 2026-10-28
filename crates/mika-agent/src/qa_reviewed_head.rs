@@ -100,6 +100,10 @@
 //! l'aurait éloigné de la seule porte qu'il commande, et un interrupteur qu'on
 //! lit loin de ce qu'il ferme est celui dont on croit qu'il ferme autre chose.
 
+use std::collections::HashSet;
+
+use tracing::warn;
+
 use crate::qa_build_callback::pr_review_posted_in_turn;
 use crate::tool_execution::ToolCallSummary;
 
@@ -320,6 +324,175 @@ fn lecture_de_tete_dans_le_tour(head_sha: &str, deja_execute: &[ToolCallSummary]
             && resume.success
             && resume.input_summary.to_ascii_lowercase().contains(&tete)
     })
+}
+
+// ---- L'inscription du tour de callback (mika#2948, L1) -------------------
+//
+// Le vol 3 de mika#2917 a posé le lecteur ; mika#2927 a posé la condition
+// d'écriture (« après un `pr review` réussi »). Ce qui manquait est l'écriture
+// elle-même sur la population modale : du 2026-10-27 09:20Z au 2026-10-28
+// 14:00Z, **dix** callbacks de build ont posté un `pr review` réussi et **un
+// seul** a appelé `record_reviewed_head` (session `43057a9e`). La consigne était
+// dans le prompt déployé ; le modèle ne l'exécutait pas.
+//
+// La forme retenue est **(b)** : le moteur reprend le tour une fois, il
+// n'inscrit jamais. Les trois raisons sont dans le plan ; la plus courte est que
+// le moteur ne détient pas la tête — `PrTarget` ne porte que `{repo, pr_number}`,
+// le `headRefOid` a été lu au tour précédent, et un `gh` frais est refusé par le
+// bearing de mika#2680. **SOLE WRITER tient** : rien ici n'appelle
+// `log_audit_event`.
+
+/// Ce tour a-t-il **inscrit** la tête qu'il vient de juger, avec succès ?
+///
+/// Le nom lu est [`RECORD_REVIEWED_HEAD_TOOL`] — ce que le modèle appelle — et
+/// non [`QA_REVIEWED_HEAD_TOOL`], qui est le `tool_name` que la base porte : ce
+/// prédicat lit une trace d'outil, jamais le registre.
+///
+/// **`success` est le terme porteur.** Un `record_reviewed_head` refusé par son
+/// handler (champ manquant, issue hors vocabulaire, preuve du tour absente) n'a
+/// rien écrit. Le compter satisferait la garde sur un registre resté vide —
+/// exactement l'état que mika#2948 ferme.
+pub(crate) fn recorded_in_turn(summaries: &[ToolCallSummary]) -> bool {
+    summaries
+        .iter()
+        .any(|resume| resume.name == RECORD_REVIEWED_HEAD_TOOL && resume.success)
+}
+
+/// Label de la garde, pour `intent_guard_retries` (mika#2948).
+///
+/// Voisin de [`QA_REVIEWED_HEAD_TOOL`] sans en être une recopie : la garde (a.2)
+/// refuse le littéral `"qa_reviewed_head"` **guillemets compris** hors de ce
+/// module, et le suffixe `_record` l'en sépare. Deux noms voisins, deux rôles —
+/// l'un est une clé de budget de re-prompt, l'autre un `tool_name` d'audit.
+pub(crate) const RECORD_REVIEWED_HEAD_LABEL: &str = "qa_reviewed_head_record";
+
+/// L'inscription est-elle **due et absente** de ce tour (mika#2948, AC1) ?
+///
+/// Conjonction à trois termes, et chacun écarte une population que la mesure du
+/// 2026-10-28 nomme :
+///
+/// | terme | ce qu'il écarte |
+/// |---|---|
+/// | `qa_verdict_due` | le callback de build de mika-dev, qui ne doit aucun verdict à personne |
+/// | [`pr_review_posted_in_turn`] | le tour sans post — et le post **en échec**, celui qui a rendu la ligne `POST_FAILED` (AC2) |
+/// | `!`[`recorded_in_turn`] | le tour sain : la session `43057a9e`, la seule des dix |
+///
+/// **`qa_verdict_due` est réutilisé, jamais recalculé.** La valeur que
+/// [`crate::qa_build_callback::qa_verdict_required`] a rendue en tête de boucle
+/// est en portée au site d'armement ; la recalculer là demanderait de relire
+/// `loaded_skill_names`, et deux réponses à « un verdict est-il dû ? »
+/// divergent (leçon mika#2158).
+///
+/// **Cette garde et celle de mika#2355 sont mutuellement exclusives par
+/// construction** : l'une s'arme sur `!pr_review_posted_in_turn`, l'autre sur
+/// `pr_review_posted_in_turn`. Un tour ne peut donc pas consommer les deux
+/// budgets de re-prompt, et l'ordre des deux `if` au site d'armement est sans
+/// conséquence — propriété du prédicat, pas une discipline de site.
+pub(crate) fn record_due_but_missing(qa_verdict_due: bool, summaries: &[ToolCallSummary]) -> bool {
+    qa_verdict_due && pr_review_posted_in_turn(summaries) && !recorded_in_turn(summaries)
+}
+
+/// Le re-prompt de la garde (mika#2948, forme (b)).
+///
+/// Trois choses qu'il doit dire, et chacune parce que son absence a un coût :
+///
+/// - **La revue est postée.** Sans cette phrase, un modèle re-prompté sur un
+///   tour qui a déjà posté son verdict peut le reposter — c'est le défaut que la
+///   garde de mika#2355 ne peut pas produire, mais que celle-ci pourrait.
+/// - **Le `head_sha` est déjà en main.** C'est le `headRefOid` lu à l'étape 1 du
+///   tour de revue, dans le contexte de ce tour. Aucun `gh` frais : le bearing
+///   de mika#2680 le refuse, et une tête re-lue maintenant peut être une tête
+///   qui a bougé — l'incident fondateur de mika#2727 est précisément une tête
+///   mouvante (`4a216bf7` → `3f2c3fa4`).
+/// - **Un appel en échec ne se réessaie pas.** La règle est celle du prompt
+///   (`qa-review-build-callback/system_prompt.md`, étape 5b) : une écriture
+///   manquée ne coûte qu'un tour payé, une boucle de réessais coûte le tour
+///   entier (§ *La perte de revue*, point 4).
+pub(crate) const RECORD_REVIEWED_HEAD_CORRECTION: &str = "[mika-engine] The review IS posted — do not post it again. What is missing is the \
+     one call that records the head you just ruled on: no successful \
+     `record_reviewed_head` appears in this turn's tool history. Without that row the \
+     next green `check_suite` on this same head pays a full webhook turn for both \
+     mika-qa and mika-dev. Make exactly one call, before any other closing action \
+     (`update_task_status`, `store_fact`, `update_core_memory`, `send_message`): \
+     `record_reviewed_head(repo: \"<owner/repo>\", pr: <NUMBER>, head_sha: \"<headRefOid>\", \
+     outcome: \"verdict_posted\")`. The `head_sha` is the `headRefOid` you already read at \
+     Step 1 of this review — it is in this turn's context. Do NOT run a fresh `gh` call to \
+     fetch it: a head re-read now may be a head that moved, and recording a head you did \
+     not rule on costs a review. If the call fails, do not retry it and do not fabricate \
+     the row — say so in your response and end the turn.";
+
+/// Ce tour devait l'inscription, son budget de re-prompt est épuisé, et rien
+/// n'est inscrit (mika#2948).
+///
+/// Le **complémentaire exact** de la garde : même conjonction, plus le terme de
+/// budget. Même forme et même raison que
+/// [`crate::qa_build_callback::verdict_unmet_after_retry`] — le site « budget
+/// déjà consommé » n'existe pas comme branche (la condition
+/// `!intent_guard_retries.contains(…)` est *dans* le `if` du re-prompt, et
+/// budget épuisé on tombe à travers sans `else`), donc le prédicat se pose sur
+/// les **sorties** EndTurn et vit ici plutôt qu'en trois termes recopiés à
+/// chacune.
+pub(crate) fn record_unmet_after_retry(
+    qa_verdict_due: bool,
+    intent_guard_retries: &HashSet<&'static str>,
+    summaries: &[ToolCallSummary],
+) -> bool {
+    record_due_but_missing(qa_verdict_due, summaries)
+        && intent_guard_retries.contains(RECORD_REVIEWED_HEAD_LABEL)
+}
+
+/// Le nom d'événement de la population résiduelle (mika#2948, AC4).
+///
+/// Ce que l'opérateur grep dans `~/.mika/logs/mika-spirit.log*` pour
+/// dimensionner ce qui reste après le correctif : les tours qui ont posté leur
+/// verdict, été re-promptés, et n'ont **toujours** rien inscrit. Son **absence**
+/// signifie un binaire antérieur à ce vol (motif mika#2340), jamais une
+/// population vide.
+pub(crate) const TURN_ENDED_WITHOUT_RECORD_EVENT: &str = "qa_reviewed_head_unrecorded";
+
+/// Dire le tour qui a posté son verdict et n'a rien inscrit, re-prompt compris.
+///
+/// # Les deux champs qui n'y sont pas, et pourquoi leur absence est le contrat
+///
+/// La ligne ne porte **ni `repo` ni `pr`**, là où son modèle
+/// [`crate::qa_review_submission::emit_turn_ended_without_review`] les porte.
+/// Ce n'est pas un oubli : ce voisin-là lit un tour **webhook**, dont le texte
+/// d'entrée est un événement d'action de PR que
+/// `webhook_queue_v2::parse_pr_action_event` sait relire. Le texte d'un tour de
+/// callback de build est `[callback: long_running:build_mika]` suivi du résultat
+/// du build — il ne nomme aucune PR. Les porter demanderait de les deviner, et
+/// une valeur devinée dans une ligne d'opérateur est pire que son absence
+/// (motif mika#2331 : absent n'est pas vide).
+///
+/// La jointure se fait donc par `trace_id` et `agent_id`, qui suffisent : les
+/// `tool_calls` du même `trace_id` portent le `pr review` et sa PR.
+///
+/// # Où elle est appelée, et où elle ne l'est pas
+///
+/// Aux **trois** sorties EndTurn de `agent_loop::run_loop` — texte non vide,
+/// miroir texte vide, et le « Force EndTurn » d'après `send_message` — et à
+/// aucune des deux sorties coupées. Un tour coupé n'a jamais produit d'EndTurn,
+/// donc la garde n'a jamais eu son tour et son budget est intact : la condition
+/// serait structurellement insatisfaisable là (leçon mika#2272), et un tour
+/// coupé avant d'avoir inscrit relève du filet de mika#2515, pas de celui-ci.
+pub(crate) fn emit_turn_ended_without_record(
+    qa_verdict_due: bool,
+    intent_guard_retries: &HashSet<&'static str>,
+    summaries: &[ToolCallSummary],
+    trace_id: &str,
+    agent_id: &str,
+) {
+    if !record_unmet_after_retry(qa_verdict_due, intent_guard_retries, summaries) {
+        return;
+    }
+    warn!(
+        target: "mika::otel",
+        event = TURN_ENDED_WITHOUT_RECORD_EVENT,
+        trace_id = %trace_id,
+        agent_id = %agent_id,
+        "build-callback turn posted its verdict without recording the head it ruled on, \
+         after the re-prompt failed too"
+    );
 }
 
 #[cfg(test)]
@@ -1547,5 +1720,291 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
             Some(PreuveManquante::StopSansLectureDeTete),
             "une tête vide n'est pas satisfaite par n'importe quel appel"
         );
+    }
+
+    // ---- mika#2948 : la garde de l'inscription ---------------------------
+
+    /// La tête de #2947 que le callback `58de1325` a jugée le 2026-10-28 à
+    /// 13:28:04Z — abrégée `da3d86df` par le ticket, complétée ici parce que le
+    /// registre indexe sur la forme longue.
+    const TETE_2947: &str = "da3d86df1c4b7e2a9f0d6c3b8e5a1f7d4c2b9e60";
+
+    /// L'appel de l'étape 5 : le post du verdict. C'est le pas 14 de la session
+    /// `58de1325`, celui qui a réussi.
+    fn pas_du_post_2948(step: u32, success: bool) -> ToolCallSummary {
+        resume(
+            step,
+            "run_gh",
+            serde_json::json!({
+                "command": ["pr", "review", "2947", "--approve", "--body", "VERDICT: pass"],
+                "repo": "senara-solutions/mika",
+            })
+            .to_string(),
+            success,
+        )
+    }
+
+    /// L'appel de l'étape 5b : l'inscription. C'est le pas que les neuf sessions
+    /// mesurées n'ont pas fait.
+    fn pas_de_linscription_2948(step: u32, success: bool) -> ToolCallSummary {
+        resume(
+            step,
+            RECORD_REVIEWED_HEAD_TOOL,
+            serde_json::json!({
+                "repo": "senara-solutions/mika",
+                "pr": 2947,
+                "head_sha": TETE_2947,
+                "outcome": "verdict_posted",
+            })
+            .to_string(),
+            success,
+        )
+    }
+
+    /// **AC1.** Les quatre populations que la mesure du 2026-10-28 distingue,
+    /// chacune par le terme qui l'écarte — ou, pour la première, par les trois
+    /// qui la retiennent.
+    #[test]
+    fn mika2948_ac1_la_garde_sarme_sur_le_tour_qui_a_poste_sans_inscrire() {
+        // 1. Le défaut, littéralement : le tour de `58de1325`. Post au pas 14,
+        //    puis `update_task_status`, `store_fact`, `update_core_memory` — et
+        //    pas d'inscription. Neuf sessions sur dix.
+        let defaut = vec![
+            pas_de_letape_1(),
+            pas_du_post_2948(14, true),
+            resume(
+                15,
+                "update_task_status",
+                serde_json::json!({"task_id": "t-2947", "status": "completed"}).to_string(),
+                true,
+            ),
+            resume(
+                16,
+                "store_fact",
+                serde_json::json!({"category": "event", "key": "qa-2947"}).to_string(),
+                true,
+            ),
+        ];
+        assert!(
+            record_due_but_missing(true, &defaut),
+            "AC1 : un verdict posté sans inscription arme la garde"
+        );
+
+        // 2. Le callback de build de mika-dev : aucun verdict dû, donc aucune
+        //    inscription due, même si son historique porte un `pr review`.
+        assert!(
+            !record_due_but_missing(false, &defaut),
+            "un callback qui ne doit aucun verdict ne doit aucune inscription"
+        );
+
+        // 3. Le tour qui n'a rien posté, et celui dont le post a échoué — la
+        //    ligne `POST_FAILED` du prompt (AC2). Ni l'un ni l'autre n'a de tête
+        //    jugée à inscrire.
+        assert!(
+            !record_due_but_missing(true, &[pas_de_letape_1()]),
+            "AC2 : sans `pr review`, rien n'est dû"
+        );
+        assert!(
+            !record_due_but_missing(true, &[pas_de_letape_1(), pas_du_post_2948(14, false)]),
+            "AC2 : un `pr review` en échec n'a pas livré de verdict, donc rien n'est dû"
+        );
+
+        // 4. Le tour sain : la session `43057a9e`, la seule des dix.
+        let mut sain = defaut.clone();
+        sain.push(pas_de_linscription_2948(17, true));
+        assert!(
+            !record_due_but_missing(true, &sain),
+            "contrôle négatif : le tour qui a inscrit n'arme rien"
+        );
+
+        // 5. L'inscription **refusée** par son handler n'a rien écrit : la garde
+        //    doit s'armer. Sans ce cas, `success` cesserait d'être porteur et la
+        //    garde serait satisfaite sur un registre resté vide.
+        let mut inscription_en_echec = defaut;
+        inscription_en_echec.push(pas_de_linscription_2948(17, false));
+        assert!(
+            record_due_but_missing(true, &inscription_en_echec),
+            "un `record_reviewed_head` refusé n'a rien inscrit"
+        );
+        assert!(
+            !recorded_in_turn(&inscription_en_echec),
+            "`recorded_in_turn` lit le succès, pas la tentative"
+        );
+    }
+
+    /// **Les deux gardes ne peuvent pas s'armer sur le même tour.** Propriété du
+    /// prédicat, pas discipline de site : celle de mika#2355 s'arme sur
+    /// `!pr_review_posted_in_turn`, celle-ci sur `pr_review_posted_in_turn`.
+    /// C'est ce qui rend l'ordre des deux `if` au site d'armement indifférent —
+    /// et ce test est ce qui empêche qu'un futur assouplissement de l'une rende
+    /// cette indifférence fausse en silence.
+    #[test]
+    fn mika2948_les_deux_gardes_du_callback_sont_mutuellement_exclusives() {
+        let populations: Vec<Vec<ToolCallSummary>> = vec![
+            vec![],
+            vec![pas_de_letape_1()],
+            vec![pas_de_letape_1(), pas_du_post_2948(14, false)],
+            vec![pas_de_letape_1(), pas_du_post_2948(14, true)],
+            vec![
+                pas_de_letape_1(),
+                pas_du_post_2948(14, true),
+                pas_de_linscription_2948(15, true),
+            ],
+            vec![
+                pas_de_letape_1(),
+                pas_du_post_2948(14, true),
+                pas_de_linscription_2948(15, false),
+            ],
+        ];
+        let mut armements = 0;
+        for (index, historique) in populations.iter().enumerate() {
+            for du in [true, false] {
+                let verdict = crate::qa_build_callback::verdict_unmet_at_cut_off(du, historique);
+                let inscription = record_due_but_missing(du, historique);
+                assert!(
+                    !(verdict && inscription),
+                    "population {index} (dû = {du}) arme les deux gardes à la fois"
+                );
+                if verdict || inscription {
+                    armements += 1;
+                }
+            }
+        }
+        // Anti-vacuité : si aucune population n'armait rien, l'exclusion
+        // ci-dessus serait vraie pour une raison qui ne dit rien.
+        assert!(
+            armements >= 4,
+            "anti-vacuité : {armements} armements sur 12 cas, la table ne mord pas"
+        );
+    }
+
+    /// **Le complémentaire exact**, budget compris. Le troisième cas est celui
+    /// qui compte : un budget consommé par **l'autre** garde ne satisfait pas
+    /// celle-ci — deux labels, deux budgets.
+    #[test]
+    fn mika2948_le_complementaire_ninverse_que_le_terme_de_budget() {
+        let defaut = vec![pas_de_letape_1(), pas_du_post_2948(14, true)];
+
+        let vierge: HashSet<&'static str> = HashSet::new();
+        assert!(
+            !record_unmet_after_retry(true, &vierge, &defaut),
+            "budget intact : le re-prompt n'a pas encore eu lieu, rien à dire"
+        );
+
+        let mut consomme: HashSet<&'static str> = HashSet::new();
+        consomme.insert(RECORD_REVIEWED_HEAD_LABEL);
+        assert!(
+            record_unmet_after_retry(true, &consomme, &defaut),
+            "budget consommé et toujours rien d'inscrit : la population résiduelle"
+        );
+
+        let mut autre_budget: HashSet<&'static str> = HashSet::new();
+        autre_budget.insert(crate::qa_build_callback::QA_VERDICT_REQUIRED_LABEL);
+        assert!(
+            !record_unmet_after_retry(true, &autre_budget, &defaut),
+            "le budget de la garde du verdict n'est pas celui de l'inscription"
+        );
+
+        // Et le complémentaire hérite des trois termes de la garde : un tour qui
+        // a inscrit ne rend rien, quel que soit le budget.
+        let mut inscrit = defaut;
+        inscrit.push(pas_de_linscription_2948(15, true));
+        assert!(
+            !record_unmet_after_retry(true, &consomme, &inscrit),
+            "contrôle négatif : un tour qui a inscrit n'est pas résiduel"
+        );
+    }
+
+    /// Le harnais de capture de `tracing`, dans la forme que
+    /// `compaction_handsoff.rs` a posée : seul moyen d'attester une ligne
+    /// d'opérateur depuis le module qui l'émet.
+    fn abonne_capteur() -> (
+        impl tracing::Subscriber + Send + Sync,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let tampon = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plume = tampon.clone();
+        let couche = tracing_subscriber::fmt::layer()
+            .with_writer(move || PlumeDeCapture(plume.clone()))
+            .with_ansi(false)
+            .with_target(true);
+        (tracing_subscriber::registry().with(couche), tampon)
+    }
+
+    struct PlumeDeCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PlumeDeCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// **AC4.** La population résiduelle se dit, et elle se dit avec de quoi la
+    /// joindre. Contrôle négatif dans le même test, parce qu'une ligne émise
+    /// inconditionnellement mesurerait les dix sessions et pas les résiduelles.
+    ///
+    /// `#[serial_test::serial]` est la moitié porteuse du test (mika#2646) :
+    /// `install_capturing_subscriber` reconstruit le cache d'intérêt global, et
+    /// un voisin qui émettrait sur ce point d'appel en parallèle polluerait le
+    /// tampon. Les deux autres tests mika#2948 n'émettent rien — ils ne lisent
+    /// que des prédicats — donc le point d'appel n'a que ce capteur.
+    #[test]
+    #[serial_test::serial]
+    fn mika2948_ac4_la_population_residuelle_se_dit_sans_repo_ni_pr() {
+        let defaut = vec![pas_de_letape_1(), pas_du_post_2948(14, true)];
+        let mut consomme: HashSet<&'static str> = HashSet::new();
+        consomme.insert(RECORD_REVIEWED_HEAD_LABEL);
+        let vierge: HashSet<&'static str> = HashSet::new();
+
+        let (abonne, tampon) = abonne_capteur();
+        {
+            let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(abonne);
+
+            // Le cas résiduel : il se dit.
+            emit_turn_ended_without_record(
+                true,
+                &consomme,
+                &defaut,
+                "trace-2947-da3d86df",
+                "mika-qa",
+            );
+
+            // Contrôle négatif, même capteur : budget intact, puis tour qui a
+            // inscrit. Ni l'un ni l'autre n'ajoute une ligne.
+            emit_turn_ended_without_record(true, &vierge, &defaut, "trace-muette-1", "mika-qa");
+            let mut inscrit = defaut.clone();
+            inscrit.push(pas_de_linscription_2948(15, true));
+            emit_turn_ended_without_record(true, &consomme, &inscrit, "trace-muette-2", "mika-qa");
+        }
+
+        let capture = tampon.lock().unwrap();
+        let sortie = String::from_utf8_lossy(&capture);
+
+        assert!(
+            sortie.contains(TURN_ENDED_WITHOUT_RECORD_EVENT),
+            "la ligne résiduelle porte son nom d'événement : {sortie}"
+        );
+        assert!(
+            sortie.contains("trace-2947-da3d86df") && sortie.contains("mika-qa"),
+            "elle porte de quoi la joindre — `trace_id` et `agent_id` : {sortie}"
+        );
+        assert!(
+            !sortie.contains("trace-muette-1") && !sortie.contains("trace-muette-2"),
+            "contrôle négatif : hors population résiduelle, rien n'est émis : {sortie}"
+        );
+        // Les deux champs qui n'y sont pas. Une valeur devinée serait pire que
+        // leur absence (motif mika#2331) : un callback ne nomme aucune PR.
+        for devine in ["repo=", "pr="] {
+            assert!(
+                !sortie.contains(devine),
+                "la ligne ne devine pas `{devine}` : {sortie}"
+            );
+        }
     }
 }
