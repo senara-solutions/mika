@@ -1,14 +1,16 @@
 //! Le registre des têtes sur lesquelles mika-qa a **statué**
-//! (mika#2917, vol 2/3 — enfant de mika#2680, classe (g′), forme (a) ;
+//! (mika#2917, vols 2 et 3/3 — enfant de mika#2680, classe (g′), forme (a) ;
 //! vocabulaire corrigé par mika#2927).
 //!
-//! # Ce que ce module est, et ce qu'il n'est pas encore
+//! # Ce que ce module est
 //!
 //! Il fige le **vocabulaire** du registre : son `tool_name`, les trois issues qui
-//! l'écrivent, et la normalisation qui transforme une attestation du modèle en
-//! l'un de ces trois littéraux. Il ne lit rien et ne décide rien : au vol 2 les
-//! skills écrivent, **personne ne lit**. Le pré-filtre lira au vol 3, par un
-//! seul terme du trait `PrefilterState`.
+//! l'écrivent, la normalisation qui transforme une attestation du modèle en l'un
+//! de ces trois littéraux, et depuis le vol 3 la **profondeur** sur laquelle il
+//! se lit ([`REVIEWED_HEAD_WINDOW_DAYS`]). Il ne décide toujours rien : le vol 3
+//! a ajouté un lecteur, et ce lecteur est unique — le terme
+//! `PrefilterState::reviewed_head` de [`crate::server::webhook_prefilter`], que
+//! la garde (a.2) de ce module borne à un.
 //!
 //! # L'endroit, et pourquoi là
 //!
@@ -24,26 +26,30 @@
 //! Les quatre champs que le ticket demande y sont au complet : `repo`, `PR` et
 //! `head_sha` dans la clé, l'issue dans `after_value`.
 //!
-//! 1. **Aucun `gh`.** Le lecteur du vol 3 lira la base SQLite de son propre agent
-//!    par les accesseurs qui existent déjà
-//!    (`count_recent_audit_events_for_target`, `get_audit_event_rows_by_tool_name`).
-//!    Le bearing de mika#2680 refuse un appel `gh` depuis `webhook_prefilter.rs`
-//!    (mika#2260).
+//! 1. **Aucun `gh`.** Le lecteur du vol 3 lit la base SQLite de son propre agent
+//!    par l'accesseur qui existait déjà,
+//!    `AsyncDatabase::latest_audit_event_for_target` (mika#2242). Le bearing de
+//!    mika#2680 refuse un appel `gh` depuis `webhook_prefilter.rs` (mika#2260).
 //! 2. **Aucune table, aucune migration.** Le précédent vit dans ce dépôt :
 //!    [`crate::qa_head_supersession`], dont la doc dit « pas de table, pas de
 //!    migration » et dont `SYNC_OBSERVED_TOOL` porte la même déclaration
 //!    **SOLE WRITER**. Même mécanisme, même titre.
 //! 3. **Par agent sans que l'appelant le dise.** `AsyncDatabase::log_audit_event`
 //!    clone son propre `agent_id` et ne l'accepte pas en argument — son premier
-//!    paramètre est le `session_id`. L'état de mika-qa ne peut donc pas écarter un
-//!    tour de mika-dev, et la propriété ne dépend d'aucune discipline d'appel.
+//!    paramètre est le `session_id`. `latest_audit_event_for_target` fait de même
+//!    en lecture : l'`agent_id` est le paramètre SQL 1 et vient du handle, pas de
+//!    l'appelant. L'état de mika-qa ne peut donc pas écarter un tour de mika-dev,
+//!    et la propriété ne dépend d'aucune discipline d'appel — c'est le premier
+//!    point de l'audit MPC du vol 3, et
+//!    `mika2917_vol3_une_ligne_de_mika_qa_necarte_pas_le_tour_de_mika_dev` la
+//!    mesure au niveau de la base, non au niveau d'un bouchon.
 //! 4. **Aucune grammaire de clé nouvelle.** [`head_key`] existe et le pré-filtre
 //!    la relit déjà telle quelle. Une forme de clé retapée dans un second fichier
 //!    est la divergence programmée que mika#2158 a payée — une garde de ce module
 //!    refuse donc que ce fichier retape la grammaire.
 //! 5. **La décision reste entière dans le skill.** Le moteur ne calcule jamais
-//!    « cette tête est revue » : au vol 3 il comparera la tête que le payload
-//!    nomme à une ligne que le skill a écrite.
+//!    « cette tête est revue » : il compare la tête que le payload nomme à une
+//!    ligne que le skill a écrite, et il ne lit qu'`after_value`.
 //!
 //! # La perte de revue, et ce qui l'empêche
 //!
@@ -79,11 +85,20 @@
 //!    non résolu est un échec **terminal**, donc une revue perdue là où une
 //!    écriture manquée ne coûte qu'un tour).
 //!
-//! # Pas d'interrupteur dans ce vol
+//! # L'interrupteur ne vit pas ici
 //!
-//! Il n'y a aucune porte à désarmer : rien ne lit ce registre. L'interrupteur de
-//! la classe (g′) arrive au vol 3, avec le décideur qu'il désarme — un
-//! interrupteur qui ne commande rien se lit comme une protection qui existe.
+//! `MIKA_WEBHOOK_PREFILTER_REVIEWED_HEAD` désarme la classe (g′), et il est
+//! déclaré **avec son décideur**, dans
+//! [`crate::server::webhook_prefilter`] — pas ici. La raison tient en une
+//! phrase : ce module est le registre, et un registre ne se désarme pas. Le
+//! désarmement ne fait pas taire l'écrivain — l'outil continue d'inscrire les
+//! têtes traitées, ce qui est voulu : le jour où l'on réarme, le registre a de
+//! la profondeur au lieu d'un trou.
+//!
+//! Ce qu'il désarme est la **lecture**, donc la décision, donc exactement la
+//! chose qu'un opérateur veut pouvoir retirer. Déclarer l'interrupteur ici
+//! l'aurait éloigné de la seule porte qu'il commande, et un interrupteur qu'on
+//! lit loin de ce qu'il ferme est celui dont on croit qu'il ferme autre chose.
 
 use crate::qa_build_callback::pr_review_posted_in_turn;
 use crate::tool_execution::ToolCallSummary;
@@ -139,6 +154,37 @@ pub(crate) const REVIEWED_HEAD_OUTCOMES: &[&str] = &[
     "stop_already_reviewed_sha",
     "stop_verdict_recorded",
 ];
+
+/// La profondeur, en jours, sur laquelle le registre se lit (mika#2917, vol 3).
+///
+/// **Une propriété du registre, pas du pré-filtre**, et déclarée ici pour cette
+/// raison : c'est la durée pendant laquelle une ligne écrite par le skill vaut
+/// encore « cette tête est traitée ». Un second lecteur hériterait du même
+/// horizon sans avoir à le redécider.
+///
+/// Deux bornes la fixent, et elles ne disent pas la même chose :
+///
+/// - **Au-dessus**, [`crate::evidence::audit::AUDIT_RETENTION_DAYS`] (90) :
+///   `compact_old_audit_events` replie les lignes plus vieilles en résumé
+///   mensuel, donc une fenêtre plus large lirait sur des lignes qui n'existent
+///   plus — une recherche qui cesse silencieusement de trouver, la classe que
+///   mika#2242 avait déjà payée.
+/// - **En dessous**, le coût d'une revue perdue est nul et celui d'un tour payé
+///   vaut un tour : trente jours, parce qu'une `check_suite` sur une tête d'il y
+///   a plus d'un mois est une PR laissée ouverte un mois, et que faire passer ce
+///   tour est le sens sûr (§ *La perte de revue*, point 4). Une fenêtre trop
+///   courte ne perd jamais de revue ; elle ne fait que rendre le tour.
+pub(crate) const REVIEWED_HEAD_WINDOW_DAYS: i64 = 30;
+
+/// La borne basse de la lecture du registre, dans la graphie
+/// qu'`audit_events.created_at` porte.
+///
+/// Rendue par une fonction et non par une constante : la borne est relative à
+/// l'instant de la lecture, et [`crate::timestamp::now_minus`] est le seul site
+/// du crate qui sache l'écrire.
+pub(crate) fn reviewed_head_lookup_since() -> String {
+    crate::timestamp::now_minus(chrono::Duration::days(REVIEWED_HEAD_WINDOW_DAYS))
+}
 
 /// L'issue telle que l'attestation la porte, ou `None` sur toute autre valeur —
 /// l'outil rend alors une erreur et n'écrit pas.
@@ -348,6 +394,80 @@ mod tests {
         );
     }
 
+    // ---- le périmètre `agent_id`, au niveau de la base ---------------------
+
+    /// Une ligne écrite par mika-qa n'écarte pas le tour de mika-dev — audit MPC
+    /// du vol 3, point 1 (mika#2917).
+    ///
+    /// **Mesuré au niveau de la base, non au niveau d'un bouchon.** Un `Stub` de
+    /// `PrefilterState` rendrait ce que le test lui fait rendre : il attesterait
+    /// la discipline du test, pas la propriété du code. Ce qui tient la propriété
+    /// est que `latest_audit_event_for_target` clone l'`agent_id` du handle et le
+    /// passe comme paramètre SQL 1 — l'appelant ne peut pas le fournir, donc ne
+    /// peut pas le fournir de travers. Seule une vraie base peut le dire.
+    ///
+    /// **Une seule base, deux handles.** `with_agent` clone le handle en
+    /// partageant l'`Arc` interne : un seul fil, une seule connexion, un seul
+    /// fichier. Deux `open_in_memory` rendraient la propriété intestable plutôt
+    /// que de la faire échouer — l'isolation observée viendrait des deux
+    /// fichiers, et le test resterait vert même si le filtrage par `agent_id`
+    /// disparaissait (motif mika#1926).
+    ///
+    /// **Le contrôle positif est dans le même test, pas dans un voisin.** Sans
+    /// lui, « mika-dev ne voit rien » est indistinguable de « la ligne n'a jamais
+    /// été écrite » ou de « la fenêtre de lecture ne la couvre pas » (classe
+    /// mika#2205).
+    #[tokio::test]
+    async fn mika2917_vol3_une_ligne_de_mika_qa_necarte_pas_le_tour_de_mika_dev() {
+        let db = crate::async_db::AsyncDatabase::new(
+            crate::db::Database::open_in_memory().expect("base en mémoire"),
+        );
+        // `audit_events.agent_id` référence `agents(id)` : les deux agents
+        // existent, sinon la FK refuserait l'écriture et le test rougirait pour
+        // une raison qui n'est pas la sienne.
+        for id in ["mika-qa", "mika-dev"] {
+            db.register_agent(id, id, "").await.expect("agent");
+        }
+
+        let key = head_key("senara-solutions/mika", 2917, "cafe1234");
+        let since = reviewed_head_lookup_since();
+
+        // mika-qa atteste la tête, par le chemin que l'outil emprunte.
+        db.with_agent("mika-qa")
+            .log_audit_event(
+                "system",
+                QA_REVIEWED_HEAD_TOOL,
+                &key,
+                None,
+                Some("verdict_posted"),
+                None,
+                None,
+            )
+            .await
+            .expect("écriture mika-qa");
+
+        // mika-dev lit la MÊME clé sur la MÊME base : rien.
+        assert_eq!(
+            db.with_agent("mika-dev")
+                .latest_audit_event_for_target(QA_REVIEWED_HEAD_TOOL, &key, &since)
+                .await
+                .expect("lecture mika-dev"),
+            None,
+            "une ligne de mika-qa est visible depuis mika-dev : le périmètre \
+             agent_id de la lecture a sauté, et un agent écarterait le tour d'un autre"
+        );
+
+        // Contrôle positif : mika-qa, lui, la voit — donc le `None` ci-dessus
+        // mesure le périmètre et non une absence d'écriture.
+        let (after_value, _reasoning, _created_at) = db
+            .with_agent("mika-qa")
+            .latest_audit_event_for_target(QA_REVIEWED_HEAD_TOOL, &key, &since)
+            .await
+            .expect("lecture mika-qa")
+            .expect("la ligne que mika-qa vient d'écrire");
+        assert_eq!(after_value.as_deref(), Some("verdict_posted"));
+    }
+
     // ---- Fire-Disposition (a.1) : les sites `gh` de `webhook_prefilter.rs` --
 
     /// Les sites de `webhook_prefilter.rs` qui appellent `gh`. Une entrée par
@@ -394,6 +514,17 @@ mod tests {
     /// condamne.
     #[test]
     fn mika2917_a1_les_sites_gh_du_prefiltre_sont_recenses() {
+        // Le **contenu** de la constante, et pas seulement l'égalité du scan avec
+        // elle (mika#2917, vol 3, audit MPC point 3). Sans cette ligne, le vol 3
+        // pourrait y glisser une entrée et rester vert : l'`assert_eq!` ci-dessous
+        // comparerait alors deux ensembles qui ont grandi ensemble. Le ticket dit
+        // « le vol 3 n'y ajoute rien » ; c'est ici que ce rien est attesté.
+        assert_eq!(
+            GH_CALL_SITES_ALLOWED,
+            &["pr_state"],
+            "le vol 3 n'ajoute aucun site `gh` ; une entrée nouvelle est une \
+             décision à prendre sur son propre ticket, pas un effet de bord"
+        );
         let src = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/webhook_prefilter.rs"),
         )
@@ -455,11 +586,13 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
     ///   vol 3 ajoute un lecteur, pas un écrivain. Au vol 2 l'ensemble est vide
     ///   avant que `tools/record_reviewed_head.rs` n'existe, et c'est le seul
     ///   instant du vol où il l'est.
-    /// - **Le lecteur, borné à un.** `≤ 1` délibérément, et non un ensemble
-    ///   exact : un ensemble exact rougirait au vol 3 **par construction**, et un
-    ///   rouge attendu s'apprend à ignorer. Le `≤ 1` mord sur le seul défaut
-    ///   qu'AC3 nomme — « le Rust ne lit qu'une seule source » — et il mord aux
-    ///   deux vols.
+    /// - **Le lecteur, ensemble exact depuis le vol 3.** Posé en `≤ 1` au vol 2,
+    ///   où aucun lecteur n'existait et où un ensemble exact aurait rougi par
+    ///   construction. Le vol 3 pose le lecteur et **resserre** l'assertion :
+    ///   `server/webhook_prefilter.rs`, et lui seul. Un second lecteur du
+    ///   registre — la forme exacte de ce que le bearing refuse, « aucune copie
+    ///   de la logique de dedup dans le Rust » — la fait rougir, et un lecteur
+    ///   renommé la fait rougir aussi.
     ///
     /// Quand l'une des deux rougit, la résolution est de router l'accès par ce
     /// module, **jamais** d'ajouter une entrée : il n'y a pas d'allowlist ici.
@@ -483,9 +616,12 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         );
 
         let readers = readers_of(&files, "QA_REVIEWED_HEAD_TOOL", &writers);
-        assert!(
-            readers.len() <= 1,
-            "au plus un lecteur ; trouvés : {readers:?}"
+        assert_eq!(
+            readers,
+            vec!["server/webhook_prefilter.rs".to_string()],
+            "SOLE READER : le pré-filtre, et lui seul (mika#2917, vol 3). Quand \
+             cet ensemble grandit, route la lecture par PrefilterState::reviewed_head \
+             — n'ajoute pas d'entrée"
         );
 
         // Aucun littéral recopié hors de ce module.

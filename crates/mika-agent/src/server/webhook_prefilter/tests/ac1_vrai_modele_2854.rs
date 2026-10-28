@@ -426,6 +426,9 @@ impl PrefilterState for EvalState<'_> {
     async fn decision_core_holds(&self, _: &str) -> anyhow::Result<Vec<AuditFact>> {
         unreachable!("un cas de (h) n'atteint pas decision_core_holds")
     }
+    async fn reviewed_head(&self, _: &str) -> anyhow::Result<Option<String>> {
+        unreachable!("un cas de (h) n'atteint pas reviewed_head")
+    }
     /// Aucune tâche de boucle : c'est la population de (h) par définition.
     /// Ce qu'on mesure est le triage, pas la porte AC7 — qui a ses propres
     /// tests mécaniques dans le `mod tests` parent.
