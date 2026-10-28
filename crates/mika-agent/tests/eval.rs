@@ -364,6 +364,13 @@ mod eval {
     // même fichier, plus le caractère à un coup du re-prompt.
     mod test_qa_review_submission_2727;
 
+    // mika#2948 — la SUITE du même tour : la revue est postée, et la tête jugée
+    // n'est pas inscrite, donc le pré-filtre (g′) de mika#2917 lit un registre
+    // vide et paie un tour. AC1 (la ligne atteint `audit_events` par l'outil
+    // réel) et AC2 (post refusé, post absent) dans le MÊME test, plus le
+    // caractère à un coup du re-prompt — qui est la population résiduelle d'AC4.
+    mod test_qa_reviewed_head_record_2948;
+
     // mika#1952 — le schéma SERVI en mode réflexion déclare `evidence` requis,
     // les autres modes sont inchangés, et la garde d'exécution reste la seule
     // barrière dure (`"evidence": ""` satisfait `required` et échoue la garde).

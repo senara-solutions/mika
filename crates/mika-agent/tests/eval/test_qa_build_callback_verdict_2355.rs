@@ -238,6 +238,16 @@ fn corrections_seen(requests: &[LlmRequest], needle: &str) -> usize {
 /// Un fragment du re-prompt #870 qui n'apparaît dans aucun autre message.
 const SELF_DEV_CORRECTION_NEEDLE: &str = "without the required terminal actions";
 
+/// Un fragment du re-prompt de mika#2948 — la garde de l'inscription, qui
+/// s'arme sur la **suite** du tour que ce fichier mesure. Les deux gardes sont
+/// mutuellement exclusives par construction (celle-ci exige un `pr review`
+/// réussi, celle du verdict exige son absence), mais elles se succèdent sur le
+/// même tour : les comptes ci-dessous distinguent laquelle a parlé. Le littéral
+/// est retapé parce que `qa_reviewed_head` est `pub(crate)` ; une dérive rend ce
+/// test **rouge**, jamais vert.
+const RECORD_REVIEWED_HEAD_NEEDLE: &str =
+    "What is missing is the one call that records the head you just ruled on";
+
 fn build_callback_marker() -> String {
     format!("[callback: {BUILD_CALLBACK_LABEL}]")
 }
@@ -263,7 +273,13 @@ async fn ac8_a_qa_build_callback_that_only_says_build_succeeded_ends_up_posting_
                 json!({"command": ["pr", "review", "2359", "--comment", "--body",
                     "## PLAN-AC VERIFICATION\n…\n\nVERDICT: pass"]}),
             ),
-            // Pas 3 : EndTurn, la garde est satisfaite.
+            // Pas 3 : EndTurn, la garde du verdict est satisfaite.
+            text_response("VERDICT: pass"),
+            // Pas 4 : la tête jugée n'est pas inscrite, donc la garde de
+            // mika#2948 reprend le tour une fois. Les deux gardes se succèdent
+            // sur ce tour, et c'est leur ordre : le verdict d'abord (il n'y a
+            // rien à inscrire avant qu'une revue existe), l'inscription
+            // ensuite.
             text_response("VERDICT: pass"),
         ])
         .tools(tools)
@@ -286,8 +302,9 @@ async fn ac8_a_qa_build_callback_that_only_says_build_succeeded_ends_up_posting_
     let requests = harness.mock().captured_requests();
     assert_eq!(
         requests.len(),
-        3,
-        "text → correction → run_gh → text = 3 LLM calls"
+        4,
+        "text → correction verdict → run_gh → text → correction inscription \
+         (mika#2948) = 4 appels LLM"
     );
     assert!(
         user_texts(&requests[0])
@@ -297,7 +314,7 @@ async fn ac8_a_qa_build_callback_that_only_says_build_succeeded_ends_up_posting_
     );
     assert_eq!(
         corrections_seen(&requests, QA_VERDICT_REQUIRED_CORRECTION),
-        2,
+        3,
         "the correction is in the history of every request after the re-prompt"
     );
     assert!(
@@ -345,6 +362,9 @@ async fn ac4_an_empty_endturn_on_the_silent_path_is_reprompted_too() {
                 json!({"command": ["pr", "review", "2359", "--comment", "--body", "VERDICT: hold[review]"]}),
             ),
             text_response(""),
+            // Le miroir à texte vide de mika#2948 reprend ensuite le tour, pour
+            // la tête jugée qui n'est pas inscrite.
+            text_response(""),
         ])
         .tools(tools)
         .skills(qa_registry())
@@ -360,12 +380,17 @@ async fn ac4_an_empty_endturn_on_the_silent_path_is_reprompted_too() {
         "the review is posted after the re-prompt"
     );
     let requests = harness.mock().captured_requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert!(
         user_texts(&requests[1])
             .iter()
             .any(|t| t == QA_VERDICT_REQUIRED_CORRECTION),
         "the empty-text mirror injected the verdict correction"
+    );
+    assert_eq!(
+        corrections_seen(&requests, RECORD_REVIEWED_HEAD_NEEDLE),
+        1,
+        "et le miroir à texte vide de mika#2948 a injecté la sienne"
     );
     assert_eq!(corrections_seen(&requests, SELF_DEV_CORRECTION_NEEDLE), 0);
 }
@@ -405,11 +430,14 @@ async fn ac4b_a_build_callback_without_qa_review_loaded_is_not_reprompted() {
 }
 
 // ---------------------------------------------------------------------------
-// Satisfaite d'emblée — pas de re-prompt quand la revue est déjà postée
+// Satisfaite d'emblée — la garde du verdict n'a rien à dire sur un tour qui a
+// posté. Depuis mika#2948 le tour est tout de même repris une fois, par
+// l'AUTRE garde : le nom du test porte donc laquelle, parce que « n'est pas
+// re-prompté » tout court est devenu faux.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_qa_build_callback_that_posts_its_review_first_is_not_reprompted() {
+async fn a_qa_build_callback_that_posts_its_review_first_is_not_reprompted_by_the_verdict_guard() {
     let (tools, gh_calls) = tools_with_recording_run_gh();
     let harness = EvalHarness::builder()
         .responses(vec![
@@ -417,6 +445,12 @@ async fn a_qa_build_callback_that_posts_its_review_first_is_not_reprompted() {
                 "run_gh",
                 json!({"command": ["pr", "review", "2359", "--approve", "--body", "VERDICT: pass"]}),
             ),
+            text_response("VERDICT: pass"),
+            // mika#2948 : la revue est postée et la tête jugée n'est pas
+            // inscrite, donc la garde de l'inscription reprend le tour une
+            // fois. C'est la SUITE du même tour, pas la garde du verdict —
+            // l'assertion qui porte mika#2355 reste le compte à zéro de
+            // QA_VERDICT_REQUIRED_CORRECTION, plus bas.
             text_response("VERDICT: pass"),
         ])
         .tools(tools)
@@ -429,10 +463,20 @@ async fn a_qa_build_callback_that_posts_its_review_first_is_not_reprompted() {
 
     assert_eq!(gh_calls.lock().unwrap().len(), 1);
     let requests = harness.mock().captured_requests();
-    assert_eq!(requests.len(), 2, "run_gh → text, and nothing in between");
+    assert_eq!(
+        requests.len(),
+        3,
+        "run_gh → text, puis le re-prompt d'inscription de mika#2948"
+    );
     assert_eq!(
         corrections_seen(&requests, QA_VERDICT_REQUIRED_CORRECTION),
-        0
+        0,
+        "la garde du verdict n'a rien à dire : la revue est postée"
+    );
+    assert_eq!(
+        corrections_seen(&requests, RECORD_REVIEWED_HEAD_NEEDLE),
+        1,
+        "la garde de l'inscription, elle, a quelque chose à dire (mika#2948)"
     );
 }
 
