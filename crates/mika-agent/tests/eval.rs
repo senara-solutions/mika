@@ -111,6 +111,10 @@ mod eval {
     // with a negative control for each. The neighbours above cover the
     // identity-declared scope; this one covers a caller narrowing one turn.
     mod test_correction_message_classifier_guard;
+
+    // mika#2944 — un 402 de crédit retient la ligne au lieu de rejouer la revue,
+    // le retour du crédit la relance, et un 429 garde le backoff de mika#2179.
+    mod test_credit_hold_2944;
     mod test_deadline_in_flight_llm_call;
     mod test_session_isolation_1951;
 
