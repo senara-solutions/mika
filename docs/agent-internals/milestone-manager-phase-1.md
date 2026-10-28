@@ -196,6 +196,110 @@ correctif (classe mika#2340), pas que la cause est ailleurs. Le compte de
 concordance de mika#2698 vol 2 **repart de zéro** au redémarrage qui charge ce
 correctif : les 531 verdicts antérieurs ne sont pas des mesures.
 
+### Un vol relancé est **trois** lignes, et la parente est terminale au milieu (mika#2951)
+
+La topologie ci-dessus décrit le vol `ready-label` classique. Depuis mika#1614
+(« engine-side direct spawn, task reuse ») le moteur relance le pilote
+d'implémentation **sur la row de la parente de groom**, et cette row est passée
+`completed` à la fin du groom. Il y a donc une troisième ligne, et surtout :
+**la terminalité de la parente n'est pas la terminalité du vol.**
+
+| ligne de `tasks` | label | état à l'instant où la parente devient terminale |
+|---|---|---|
+| parente | `ready-label: <owner/repo>#<n>` | `completed`, `completed_at` = fin du **groom** |
+| enfant 1 | `long_running:run_claude_pilot_groom` | terminal, `Outcome: PLAN_GROOMED` ou `NO_PR` |
+| enfant 2 | `long_running:run_claude_pilot` | **créé, encore en vol** |
+
+Le défaut que cela produisait : l'évaluateur retenait la parente dès
+`is_terminal_task_status`, ne voyait que l'enfant de groom, et inscrivait son
+issue au registre — où `write_and_swallow` la figeait pour toujours. Les trois
+vols du 2026-10-28 ont ouvert les PR #2947, #2949 et #2950, toutes mergées, et
+sont inscrits « mort PLAN_GROOMED · reprise à la main ». Sur ce chemin — c'est-à-dire
+sur **tous** les vols depuis mika#1614 — le compte de concordance de mika#2698
+ne pouvait pas monter.
+
+**D1 — le discriminant est le label de l'enfant.** `run_claude_pilot` pour
+l'implémentation, `run_claude_pilot_groom` pour le groom, constantes nommées
+dans `task_engine::engine` (`IMPLEMENT_PILOT_DISPATCH_LABEL`,
+`GROOM_PILOT_DISPATCH_LABEL`) avec `is_implement_pilot_label` pour lecteur.
+Ni `dispatch_class` ni l'ordre ne pouvaient servir : la `dispatch_class` vit sur
+la **parente** et c'est précisément elle que la relance réécrit de `groom` en
+`implement`, donc elle ne distingue pas les deux enfants ; et l'ordre de création
+est une propriété du dispatcheur, pas une donnée de la ligne — un re-groom
+postérieur l'inverse. Le label, lui, a un producteur unique,
+`skills::executor::build_callback_task` via `format!("long_running:{tool_name}")`,
+et `mika2875_la_constante_est_la_forme_que_le_producteur_emet` lie chaque
+constante à l'outil que ce producteur reçoit.
+
+**D2 — la classe prime, jamais la récence.** `pilot_result =
+dernier_implement.or(dernier_groom)`. « Le plus récent des enfants » est
+exactement la moitié du défaut : un re-groom postérieur à l'implémentation
+reprendrait la main et re-classerait un vol abouti en `PLAN_GROOMED`.
+
+**D3 — la base rapporte, `flight_source` décide.**
+`FinishedFlightRow::pending_implement` dit *qu'un enfant d'implémentation vole
+encore*; il ne retire rien. Le filtre vit dans
+`flight_source::finished_implement_flights`, qui partitionne et n'évalue que le
+reste. Deux couches, parce qu'une base qui filtre rend deux populations sous un
+seul nom et qu'elles ne sont pas soustractables (motif mika#2205) — et parce que
+la sonde a besoin de voir ce qui a été écarté. `pending_implement` a un
+**lecteur unique**, tenu par un scan de source à allowlist vide
+(`mika2951_lajournement_a_un_lecteur_unique`) : deux fichiers de production le
+touchent, `db/tasks.rs` qui rapporte et `flight_source.rs` qui décide.
+
+**La borne temporelle porte sur la fin du VOL, pas sur celle de la parente** —
+et c'est la moitié du correctif sans laquelle l'ajournement serait un oubli
+définitif. Une parente passe la fenêtre quand sa propre terminalité **ou** celle
+d'un de ses enfants est postérieure à `last_observed_at`. Sans cette
+disjonction : le `completed_at` d'une parente de groom est figé à la fin du
+groom, le poll tourne toutes les 5 minutes par défaut, donc le cycle qui vient
+d'ajourner avance le point de reprise au-delà — et la parente ne repasse
+**jamais**. AC1 tenu (aucun verdict prématuré), AC4 jamais (aucun verdict du
+tout). La sous-requête ne filtre **pas** par label, délibérément : les filtres
+fins restent en Rust derrière leur lecteur unique, et les deux erreurs ne
+coûtent pas le même prix — surapprocher fait relire une parente que les filtres
+Rust jugeront juste et que l'idempotence du registre protège, sous-approcher
+perd le vol pour toujours. Épinglé par
+`mika2951_une_parente_ajournee_repasse_la_borne_quand_son_implement_finit`, dont
+les horodatages sont ceux du premier vol mesuré et dont le contrôle négatif
+sépare « la disjonction fonctionne » de « la borne a été retirée ».
+
+**Une prémisse extérieure, assertée plutôt que supposée.** Tout cela suppose que
+l'enfant d'implémentation est créé *avant* que la parente devienne terminale.
+C'est vrai parce que `deliver_callback` appelle
+`try_complete_parent_on_callback_success` **avant**
+`try_dispatch_pilot_after_groom_success`, et qu'un callback de groom ne porte pas
+de `pr_url` — la première est donc un no-op sur cette parente. Si l'ordre
+s'inversait, il y aurait une fenêtre où la parente est terminale sans enfant
+d'implémentation, et elle serait jugée sur son groom : le défaut d'aujourd'hui,
+revenu en silence. L'ordre est épinglé sur le source de `dispatcher.rs` par
+`mika2951_la_parente_devient_terminale_apres_la_naissance_de_lenfant_dimplementation`.
+
+**Le faux négatif qui reste, borné et assumé.** Entre la terminalité de la
+parente et la naissance de l'enfant d'implémentation, `pending_implement` est
+faux : la parente est rendue et le groom est lu, donc `not_a_flight` (le
+classement de mika#2949). Ajourner sur la convergence du groom plutôt que sur
+l'existence de l'enfant serait plus précis mais **non borné** — un groom convergé
+dont la relance n'allume jamais (frein STOP, pas de jeton) resterait ajourné pour
+toujours. On choisit le faux négatif borné contre le silence infini.
+
+**Sonde.** INFO `flight_deferred_pending_implement` (`target:
+"mika::milestone_manager"`), un par cycle, avec `deferred`, `task_ids` et
+`scope = "container"`. `task_ids` est **absent** quand `deferred == 0`, jamais
+`""` (motif mika#2331). L'**absence de la ligne** signifie un binaire antérieur
+au correctif, pas un zéro (motif mika#2340).
+
+**Les trois lignes déjà figées ne sont pas réécrites par le programme** : un
+journal d'audit n'est pas une table que son écrivain corrige, et un rattrapage
+automatique demanderait à `write_and_swallow` de savoir *quand* un verdict
+antérieur fut prématuré — c'est-à-dire de réimplémenter l'AC1 à l'envers, dans le
+seul site qui doit rester bête. Elles partent par un geste opérateur nommé,
+borné aux trois `target_key` littéraux :
+[`docs/operator/flight-verdict-premature-rows-2951.md`](../operator/flight-verdict-premature-rows-2951.md).
+Le runbook dit aussi ce que la suppression ne fait **pas** : la concordance de
+mika#2698 ne remonte pas de trois d'autant, elle cesse d'être *contredite*, ce
+qui n'est pas la même chose.
+
 **Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`), `MIKA_MANAGER_LIVENESS_URL` (mika#1990, no default — absent ⇒ the beat channel is disarmed). **All eleven are declared in `.env.example` since mika#2267** — before it, not one `MIKA_MANAGER_*` variable was declared anywhere in the repo (`.env.example`, `docker-compose.yml`, `packaging/`), so no review had ever been in a position to notice their absence or their misspelling. `mika2267_every_manager_env_const_is_declared_in_env_example` keeps it that way.
 
 **Cadence spawn.** `spawn.rs` (`manager_config_from_env` + `spawn_manager_cycle_task`, the latter taking an `Arc<dyn TokenResolver>` since mika#2013) wires the cycle as a background tokio task at `server::run_server` startup. Env-gated on `MIKA_MANAGER_TARGET_MILESTONE`: unset → INFO `manager_cadence_disabled` and no spawn; set-and-valid → INFO `manager_cadence_start` + spawn; set-and-malformed → ERROR `manager_cadence_config_invalid` and no spawn (startup continues). The loop polls at `cfg.poll_interval` and calls `run_manager_cycle`; the cycle body itself decides whether to deliver (state-change OR heartbeat-elapsed) and is a no-op otherwise. Cycle failures log at WARN and do not stop the loop — except a sustained authentication failure, which escalates per the token-renewal note below (mika#2013). Graceful shutdown responds to a dedicated `manager_shutdown_token` (sibling to `kg_shutdown_token` and `webhook_queue_shutdown`) — cancelled at the same `.with_graceful_shutdown` site. Structurally mirrors `kg::resolver_tick::spawn_resolver_tick_task` (same `tokio::select!` shape, same fail-open discipline, same `info!/warn!` lifecycle events). Injection-verified per `todos/mika-manager-cadence-wiring-injection-verification.md`.
