@@ -419,6 +419,11 @@ async fn v2b_a_turn_whose_guard_never_fired_arms_nothing() {
             // re-prompter, son budget reste intact.
             posted_review(),
             text_response("Revue postée."),
+            // La garde de l'inscription (mika#2948) reprend le tour une fois :
+            // la tête jugée n'est pas inscrite. C'est l'AUTRE garde, sur l'autre
+            // moitié du contrat — celle du verdict garde son budget intact, ce
+            // que l'asymétrie épinglée ici mesure.
+            text_response("Revue postée."),
         ])
         .tools(tools)
         .skills(qa_registry())
