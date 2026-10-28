@@ -3699,6 +3699,66 @@ async fn run_loop(
                         continue;
                     }
 
+                    // mika#2948 — QA reviewed-head record guard (non-empty text
+                    // path). A build callback that POSTED its review concludes by
+                    // RECORDING the head it ruled on, so the (g′) pre-filter of
+                    // mika#2917 can discard the next green `check_suite` on that
+                    // same head. Measured 2026-10-28: ten callbacks posted a
+                    // successful `pr review` since 2026-10-27 09:20Z, one called
+                    // `record_reviewed_head` — the instruction was in the deployed
+                    // prompt and the model did not execute it, so each of the nine
+                    // others paid a full webhook turn for mika-qa AND mika-dev.
+                    //
+                    // The engine re-prompts; it never writes the registry itself.
+                    // SOLE WRITER (`qa_reviewed_head.rs`) holds, and it must: the
+                    // engine does not own the head — `PrTarget` carries only
+                    // `{repo, pr_number}`, the `headRefOid` was read in the previous
+                    // turn, and a head re-read now may be a head that moved (the
+                    // founding incident of mika#2727).
+                    //
+                    // **Mutually exclusive with the mika#2355 guard above, by
+                    // construction**: that one arms on `!pr_review_posted_in_turn`,
+                    // this one on `pr_review_posted_in_turn`. A turn cannot consume
+                    // both re-prompt budgets, so the order of the two `if`s is
+                    // immaterial — a property of the predicates, pinned by
+                    // `mika2948_les_deux_gardes_du_callback_sont_mutuellement_exclusives`,
+                    // not a discipline of this site. `qa_verdict_due` is the same
+                    // value both read; it is never recomputed (mika#2158).
+                    // Single retry via intent_guard_retries.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries
+                            .contains(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL)
+                        && crate::qa_reviewed_head::record_due_but_missing(
+                            qa_verdict_due,
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL,
+                            "QA build-callback posted its verdict without recording the head \
+                             it ruled on — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
                     // #1218 — Webhook milestone advance guard. Mirrors
                     // callback_milestone_advance for `pull_request.closed(merged:true)`
                     // webhook turns whose correlated task has a milestone/project
@@ -4723,6 +4783,19 @@ async fn run_loop(
                         db.agent_id(),
                     );
 
+                    // mika#2948 — sortie 1/3 : le re-prompt de la garde de
+                    // l'inscription a échoué aussi. Le verdict est posté, la tête
+                    // n'est pas inscrite, et le prochain `check_suite` vert sur
+                    // cette tête paiera son tour. C'est la population résiduelle
+                    // d'AC4, et elle n'a pas d'autre instrument.
+                    crate::qa_reviewed_head::emit_turn_ended_without_record(
+                        qa_verdict_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
                     apply_nudge_turn_end(tool_use_occurred);
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
@@ -4845,6 +4918,55 @@ async fn run_loop(
                             role: LlmRole::User,
                             content: LlmContent::Text(
                                 crate::qa_review_submission::REVIEW_SUBMISSION_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // mika#2948 — QA reviewed-head record guard for empty-text
+                    // exits. Mirror of the inline guard in the non-empty text path,
+                    // byte for byte but for the log message.
+                    //
+                    // REACHABLE for this population, unlike the mika#2727 mirror
+                    // just above, and that is the asymmetry worth naming: a build
+                    // callback arrives through `run_silent_agent` with
+                    // `SilentTrigger::Callback`, so `follow_up_on_empty()` is false
+                    // and this block runs. mika#2515 measured the bare EndTurn as
+                    // the MORE probable half of the population — a model that just
+                    // posted a review and considers itself done is exactly the
+                    // shape that returns EndTurn with no text. Omitting this mirror
+                    // would leave the modal half of the defect uncovered.
+                    //
+                    // Mutually exclusive with the mika#2355 mirror above for the
+                    // same structural reason as the non-empty pair.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries
+                            .contains(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL)
+                        && crate::qa_reviewed_head::record_due_but_missing(
+                            qa_verdict_due,
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL,
+                            "QA build-callback posted its verdict without recording the head \
+                             it ruled on, on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_CORRECTION
                                     .to_string(),
                             ),
                         });
@@ -4975,6 +5097,17 @@ async fn run_loop(
                         &intent_guard_retries,
                         &all_tool_summaries,
                         &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
+                    // mika#2948 — sortie 2/3 : même ligne, même population, et
+                    // c'est ici qu'elle est **la plus probable** — un callback qui
+                    // a posté sa revue et se croit quitte rend un EndTurn sec.
+                    crate::qa_reviewed_head::emit_turn_ended_without_record(
+                        qa_verdict_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
                         tool_ctx.trace_id,
                         db.agent_id(),
                     );
@@ -5215,6 +5348,19 @@ async fn run_loop(
                         &intent_guard_retries,
                         &all_tool_summaries,
                         &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
+                    // mika#2948 — sortie 3/3. Le terme de budget vaut ici ce qu'il
+                    // vaut au bloc du verdict ci-dessus : cet EndTurn est forcé,
+                    // donc la garde a pu firer à un step antérieur. Un tour qui
+                    // n'a jamais produit d'EndTurn n'a pas dépensé ce budget et ne
+                    // dit rien — c'est le re-prompt qui le couvre, pas le filet.
+                    crate::qa_reviewed_head::emit_turn_ended_without_record(
+                        qa_verdict_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
                         tool_ctx.trace_id,
                         db.agent_id(),
                     );
