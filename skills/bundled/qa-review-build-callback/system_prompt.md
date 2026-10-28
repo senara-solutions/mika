@@ -119,7 +119,11 @@ Each argument is a separate element in the `command` array. The `--body` value i
 
 If `run_gh pr review` fails, record the error in `FINDINGS`, then retry the call **exactly once**. If it still fails, emit the verdict text with a `POST_FAILED: <error>` line prepended to the verdict block so mika-dev's turn-end handler can surface the failure — but **never silently skip posting**. Silent skip breaks the dev↔qa contract; a `POST_FAILED` line is at least observable. mika-dev receives successful verdicts via the `pull_request_review.submitted` webhook triggered by the posted review. **Do NOT queue auto-merge** — merging is mika-dev's responsibility.
 
-**Step 5b — Record the head you ruled on (mika#2917, mika#2927)**
+**Step 5b — Record the head you ruled on (mika#2917, mika#2927, mika#2948)**
+
+**The condition is the post's success, literally:** if the call failed twice and you emitted a `POST_FAILED` line instead, record **nothing**. No verdict reached the forge, so no head was ruled on, and a row written here would silence the next `check_suite` on this head instead of paying a turn for it. The same holds if you never reached the post at all.
+
+**If it did succeed, this is the next thing you do — before any other closing action.** Before `update_task_status`, before `store_fact`, before `update_core_memory`, before `send_message`. Measured 2026-10-28: ten build callbacks posted a successful review, one recorded the head. The instruction was not ignored, it was outdistanced — the closing actions ran first and the turn ended. Record first, close afterwards.
 
 Once the `run_gh("pr review …")` call of Step 5 has returned success, make one call:
 
@@ -127,13 +131,13 @@ Once the `run_gh("pr review …")` call of Step 5 has returned success, make one
 record_reviewed_head(repo: "<owner/repo>", pr: <NUMBER>, head_sha: "<headRefOid from Step 1>", outcome: "verdict_posted")
 ```
 
-The condition is the post's success, literally: if the call failed twice and you emitted a `POST_FAILED` line instead, record **nothing**. No verdict reached the forge, so no head was ruled on, and a row written here would silence the next `check_suite` on this head instead of paying a turn for it. The same holds if you never reached the post at all.
-
 `head_sha` is the `headRefOid` you already read in Step 1's `qa_pr_view` output — the same value Step 3e.2 reuses as `head_sha`, already in context. **Do NOT re-fetch PR metadata, and make no extra forge call for it.**
 
 `verdict_posted` is the only value this call takes on a verdict turn. The registry has no spelling for a *dispatched* review: a review that was handed off can die before its verdict, so only the turn that posted one records the head (mika#2927).
 
 **If the call fails.** Do not retry it, do not escalate it, and do not change the verdict. A missing row costs one paid turn on the next `check_suite` for this head — which is exactly today's regime. An escalation, by contrast, would turn a bookkeeping miss into an operator interrupt.
+
+**If the engine re-prompts you here (mika#2948).** The engine refuses this turn's exit when a successful `pr review` appears in its tool history with no successful `record_reviewed_head`. The review is already posted — do not post it again, and do not recompose the verdict. Make the one call above and end the turn.
 
 ### Verdict Output
 

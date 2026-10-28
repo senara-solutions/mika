@@ -1915,6 +1915,99 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         );
     }
 
+    /// Le rang de la première ligne du bloc qui porte l'aiguille.
+    fn rang_dans_le_bloc(bloc: &[&str], aiguille: &str) -> Option<usize> {
+        bloc.iter().position(|ligne| ligne.contains(aiguille))
+    }
+
+    /// **L3.** Le prompt **embarqué** ordonne l'inscription avant toute autre
+    /// action de clôture, et pose sa condition en tête plutôt qu'en queue.
+    ///
+    /// Les octets lus sont ceux que `include_str!` a gelés au build, donc ceux
+    /// que `BUNDLED_SKILL_MANIFESTS` servira : une édition de l'arbre de travail
+    /// est invisible ici jusqu'au prochain `make deploy` (motif mika#2340), et
+    /// c'est la propriété qui fait de ce test un test et non une relecture.
+    ///
+    /// **C'est un renfort, pas le mécanisme.** Le mécanisme est L2 : le prompt
+    /// seul portait déjà la consigne, et le ticket est la mesure de ce qu'elle a
+    /// obtenu. Ce que ce test empêche est la dérive inverse — qu'un futur
+    /// éditeur remette la condition en queue, ou glisse Step 5b derrière une
+    /// autre section, en croyant ne déplacer que de la prose.
+    #[test]
+    fn mika2948_l3_le_prompt_embarque_ordonne_linscription_avant_la_cloture() {
+        let bloc = bloc_step_5b(PROMPT_BUILD_CALLBACK);
+        assert!(
+            bloc.len() >= 6,
+            "anti-vacuité : le bloc Step 5b fait {} lignes",
+            bloc.len()
+        );
+
+        let appel = rang_dans_le_bloc(&bloc, "record_reviewed_head(")
+            .expect("le bloc Step 5b appelle l'outil");
+        let condition = rang_dans_le_bloc(&bloc, "The condition is the post's success, literally:")
+            .expect("le bloc Step 5b porte sa condition");
+        let ordre = rang_dans_le_bloc(&bloc, "before any other closing action")
+            .expect("le bloc Step 5b ordonne l'inscription avant la clôture");
+
+        assert!(
+            condition < appel,
+            "la condition est en tête, pas en queue : condition au rang \
+             {condition}, appel au rang {appel}"
+        );
+        assert!(
+            ordre < appel,
+            "l'ordonnancement précède l'appel : ordre au rang {ordre}, appel \
+             au rang {appel}"
+        );
+
+        // Les quatre actions de clôture que la session `58de1325` a exécutées à
+        // la place de l'inscription sont nommées, et nommées **avant** l'appel.
+        // Une consigne qui dit « avant toute autre action » sans dire
+        // lesquelles laisse au modèle le soin de deviner la liste.
+        for cloture in [
+            "update_task_status",
+            "store_fact",
+            "update_core_memory",
+            "send_message",
+        ] {
+            let rang = rang_dans_le_bloc(&bloc, cloture)
+                .unwrap_or_else(|| panic!("le bloc Step 5b ne nomme pas {cloture}"));
+            assert!(
+                rang < appel,
+                "{cloture} est nommée avant l'appel, pas après : rang {rang}, \
+                 appel au rang {appel}"
+            );
+        }
+
+        // Step 5b suit **immédiatement** Step 5 : aucun autre titre de section
+        // ni d'étape ne s'intercale. C'est la distance que la mesure incrimine.
+        let intercale: Vec<&str> = PROMPT_BUILD_CALLBACK
+            .lines()
+            .skip_while(|l| !l.starts_with("**Step 5 — Post review"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("**Step 5b — Record the head you ruled on"))
+            .filter(|l| l.starts_with("### ") || l.starts_with("**Step "))
+            .collect();
+        assert!(
+            intercale.is_empty(),
+            "Step 5b ne suit plus immédiatement Step 5 : {intercale:?}"
+        );
+
+        // Contrôle négatif : le même prédicat sur un bloc où la condition est
+        // revenue en queue le refuse. Sans lui, les trois comparaisons de rang
+        // seraient vraies pour une raison qui ne dit rien.
+        let queue = vec![
+            "**Step 5b — Record the head you ruled on**",
+            "record_reviewed_head(…, outcome: \"verdict_posted\")",
+            "The condition is the post's success, literally: …",
+        ];
+        assert!(
+            rang_dans_le_bloc(&queue, "The condition is the post's success, literally:")
+                > rang_dans_le_bloc(&queue, "record_reviewed_head("),
+            "le prédicat doit mordre sur une condition remise en queue"
+        );
+    }
+
     /// Le harnais de capture de `tracing`, dans la forme que
     /// `compaction_handsoff.rs` a posée : seul moyen d'attester une ligne
     /// d'opérateur depuis le module qui l'émet.
