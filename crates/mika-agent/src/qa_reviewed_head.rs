@@ -1915,6 +1915,106 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         );
     }
 
+    /// La condition d'armement de chaque site mika#2948 : du `if` qui ouvre le
+    /// bloc jusqu'à la ligne qui appelle [`record_due_but_missing`], lignes de
+    /// commentaire retirées — le texte de la garde ci-dessous *parle* du terme
+    /// interdit, et un scan qui lirait les commentaires s'accuserait lui-même.
+    fn conditions_darmement_2948(src: &str) -> Vec<String> {
+        let lignes: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, ligne) in lignes.iter().enumerate() {
+            if !ligne.contains("record_due_but_missing(") {
+                continue;
+            }
+            let debut = (0..=i)
+                .rev()
+                .find(|&j| lignes[j].trim_start().starts_with("if "))
+                .expect("chaque appel vit dans la condition d'un `if`");
+            out.push(strip_comment_lines(&lignes[debut..=i].join("\n")));
+        }
+        out
+    }
+
+    /// **`skip_remaining_guards` ne garde PAS cette garde, et ce n'est pas une
+    /// convention — c'est la condition pour qu'elle morde une seule fois.**
+    ///
+    /// Le drapeau vaut `EndTurn && has_successful_pr_review(&all_tool_summaries)`
+    /// (`agent_loop/mod.rs`, « PR review early-accept », #695/#1178/#1645) :
+    /// exactement la population sur laquelle [`record_due_but_missing`] s'arme,
+    /// puisqu'elle exige [`crate::qa_build_callback::pr_review_posted_in_turn`].
+    /// Un `!skip_remaining_guards` en tête de condition la rend donc
+    /// **structurellement insatisfiable** — la garde ne tire jamais, sur aucun
+    /// tour, et se lit comme une précaution plutôt que comme du code mort
+    /// (motif mika#2272). Ce n'est pas une hypothèse : le terme y était au
+    /// premier jet, et les deux populations de l'éval L4 sont revenues avec un
+    /// registre vide.
+    ///
+    /// L'épingle est un **scan de source** parce qu'aucune assertion de
+    /// comportement ne peut voir la différence : un site réarmé sous ce terme
+    /// rend un registre vide, ce qui est aussi ce que rend un modèle qui a
+    /// oublié d'inscrire. Les deux sites — texte non vide et son miroir à texte
+    /// vide — sont lus ensemble : le miroir du vol L2 ne portait déjà pas le
+    /// terme, et c'est ce qui a permis de localiser la collision.
+    #[test]
+    fn mika2948_l2_la_garde_nest_pas_gardee_par_skip_remaining_guards() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_loop/mod.rs"),
+        )
+        .unwrap();
+        let conditions = conditions_darmement_2948(&src);
+
+        // Anti-vacuité : les deux sites d'armement, et pas un scan qui n'a rien
+        // lu. Un site de plus se déclare ici en nommant sa population.
+        assert_eq!(
+            conditions.len(),
+            2,
+            "deux sites d'armement attendus (texte non vide, miroir à texte vide)"
+        );
+
+        for (rang, condition) in conditions.iter().enumerate() {
+            assert!(
+                !condition.contains("skip_remaining_guards"),
+                "site {rang} : `skip_remaining_guards` est vrai sur exactement la \
+                 population de cette garde — le terme la rend insatisfiable. Le \
+                 risque qu'il protège (une continuation forcée qui reposte la \
+                 revue) est répondu par la première phrase de \
+                 RECORD_REVIEWED_HEAD_CORRECTION.\ncondition lue :\n{condition}"
+            );
+            // Et le scan a bien attrapé une condition, pas une ligne isolée.
+            assert!(
+                condition.contains("LlmStopReason::EndTurn"),
+                "site {rang} : la condition lue ne porte pas son terme d'arrêt, \
+                 le scan a mal découpé le bloc"
+            );
+        }
+
+        // La correction porte bien la phrase sur laquelle repose l'argument
+        // ci-dessus — sinon l'exemption se justifierait d'un texte disparu.
+        assert!(
+            RECORD_REVIEWED_HEAD_CORRECTION.contains("The review IS posted"),
+            "l'argument de l'exemption cite cette phrase ; elle doit exister"
+        );
+    }
+
+    /// Contrôle négatif — sans lui, « aucun site ne porte le terme » est
+    /// indistinguable de « le scan ne sait pas le voir ».
+    #[test]
+    fn mika2948_l2_le_scan_mord_sur_un_site_reporte_sous_le_drapeau() {
+        let fixture = "\
+                    // skip_remaining_guards est nommé ici, en commentaire.\n\
+                    if !skip_remaining_guards\n\
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)\n\
+                        && crate::qa_reviewed_head::record_due_but_missing(\n";
+        let conditions = conditions_darmement_2948(fixture);
+        assert_eq!(conditions.len(), 1);
+        assert!(conditions[0].contains("skip_remaining_guards"));
+        assert!(conditions[0].contains("LlmStopReason::EndTurn"));
+
+        // Et le commentaire, lui, est bien retiré : c'est ce qui permet au texte
+        // de la garde réelle de nommer le terme sans se dénoncer.
+        assert!(!conditions[0].contains("nommé ici"));
+    }
+
     /// Le rang de la première ligne du bloc qui porte l'aiguille.
     fn rang_dans_le_bloc(bloc: &[&str], aiguille: &str) -> Option<usize> {
         bloc.iter().position(|ligne| ligne.contains(aiguille))

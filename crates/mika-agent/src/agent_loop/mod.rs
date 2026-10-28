@@ -3724,9 +3724,31 @@ async fn run_loop(
                     // `mika2948_les_deux_gardes_du_callback_sont_mutuellement_exclusives`,
                     // not a discipline of this site. `qa_verdict_due` is the same
                     // value both read; it is never recomputed (mika#2158).
+                    //
+                    // Like 5c/5d/6c/6d/6e, NOT skipped by
+                    // `skip_remaining_guards` (#1178): a posted PR review does
+                    // not write the registry row that the review's own head
+                    // needs. Here that opt-out is **load-bearing rather than
+                    // conventional**, and it is the one thing a future editor
+                    // must not "restore". That flag is
+                    // `EndTurn && has_successful_pr_review(&all_tool_summaries)`
+                    // — the exact population this guard arms on
+                    // (`record_due_but_missing` requires
+                    // `pr_review_posted_in_turn`), so a leading
+                    // `!skip_remaining_guards` makes the condition
+                    // **structurally unsatisfiable**: the guard would never fire
+                    // once, on any turn, and read as a precaution rather than as
+                    // dead code (mika#2272 — a condition that can never hold has
+                    // to be said). Measured: with the term in place both L4 eval
+                    // populations came back with an empty registry.
+                    // The early accept exists because a FORCED CONTINUATION
+                    // might post a duplicate review; that risk is answered at
+                    // the source by the first sentence of
+                    // `RECORD_REVIEWED_HEAD_CORRECTION` — "The review IS posted
+                    // — do not post it again." What is missing is not the
+                    // action, it is its ledger row.
                     // Single retry via intent_guard_retries.
-                    if !skip_remaining_guards
-                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !intent_guard_retries
                             .contains(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL)
                         && crate::qa_reviewed_head::record_due_but_missing(
