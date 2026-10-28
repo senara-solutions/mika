@@ -232,6 +232,22 @@ pub const UPSTREAM_PR_MERGED: &str = "upstream_pr_merged";
 /// unmerged).
 pub const UPSTREAM_PR_CLOSED_UNMERGED: &str = "upstream_pr_closed_unmerged";
 
+/// `tasks.result` `"error"` field written when a `ready-label` envelope is
+/// refused at the grooming-marker gate (mika#907, mika#919). SOLE WRITER:
+/// [`crate::skills::executor::evaluate_grooming_gate`], whose `MarkersMissing`
+/// arm builds the JSON envelope this token keys.
+///
+/// # Pourquoi une constante
+///
+/// Depuis mika#2946 l'évaluateur du milestone manager doit reconnaître cette
+/// enveloppe pour ne **pas** la compter comme un vol d'implémentation mort. Le
+/// producteur et ce lecteur sont les deux moitiés d'un même fait : écrites en
+/// littéral de part et d'autre, elles divergent en silence le jour où l'une
+/// bouge, et toutes les assertions des deux côtés restent vertes (mika#2158).
+/// La constante fait de l'identité des deux bouts une propriété du binaire.
+/// `tests/test_dispatch_no_grooming_marker_guard.rs` en est l'attestation.
+pub const DISPATCH_NO_GROOMING_MARKER: &str = "dispatch_no_grooming_marker";
+
 /// `audit_events.tool_name` emitted per row superseded by a fresh dispatch
 /// (mika#1934 AC2).
 pub const TRACKING_ROW_SUPERSEDED_TOOL: &str = "tracking_row_superseded";

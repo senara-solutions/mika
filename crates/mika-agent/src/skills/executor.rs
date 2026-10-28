@@ -19,7 +19,7 @@ use crate::async_db::AsyncDatabase;
 use crate::db::{self, NewTask};
 use crate::github_graphql::{fetch_issue_body, fetch_pr_summary, parse_pr_url};
 use crate::task_engine::types::{action_type, trigger_type};
-use crate::task_state::tasks::GroomConvergence;
+use crate::task_state::tasks::{DISPATCH_NO_GROOMING_MARKER, GroomConvergence};
 use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 
 /// Maximum output size from a skill tool (10,000 characters).
@@ -2565,7 +2565,9 @@ pub(crate) async fn evaluate_grooming_gate(
     // par un joker (mika#2484 D1).
     match groomed_state(db, owner, repo, number, issue_body).await {
         GroomedState::MarkersMissing(missing) => Err(serde_json::json!({
-            "error": "dispatch_no_grooming_marker",
+            // Lu par l'évaluateur du milestone manager (mika#2946) : l'identité
+            // des deux bouts est portée par la constante, pas par le littéral.
+            "error": DISPATCH_NO_GROOMING_MARKER,
             "task_id": task_id,
             "issue": format!("{}/{}#{}", owner, repo, number),
             "missing_signals": missing,
