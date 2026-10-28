@@ -173,17 +173,35 @@ pub enum TurnConclusion {
     /// `LlmError` via `downcast_ref` — jamais un `contains()` sur le message
     /// rendu. `detail` est le message d'erreur, tronqué par le call-site.
     Failed { error_class: String, detail: String },
+    /// Le tour a été coupé par son **budget de pas d'outil** sans rédiger de
+    /// verdict (mika#2943). `steps_completed` vient de
+    /// [`crate::agent_loop::MaxStepsCutOff`], c'est-à-dire du plafond **servi**.
+    MaxStepsExceeded { steps_completed: usize },
 }
 
-impl From<Option<crate::agent_loop::DeadlineOverrun>> for TurnConclusion {
-    /// La traduction d'un `AgentOutput` : un tour qui a rendu `Ok` a conclu ou
-    /// a été coupé — il n'est pas mort.
-    fn from(overrun: Option<crate::agent_loop::DeadlineOverrun>) -> Self {
-        match overrun {
-            None => Self::Concluded,
-            Some(o) => Self::DeadlineExceeded {
-                steps_completed: o.steps_completed,
+impl TurnConclusion {
+    /// La traduction d'un `AgentOutput` : un tour qui a rendu `Ok` a conclu, ou
+    /// a été coupé par l'une de ses deux bornes — il n'est pas mort.
+    ///
+    /// Remplace l'`impl From<Option<DeadlineOverrun>>` de mika#2276, qui ne
+    /// lisait qu'un champ : le garder à côté de celui-ci en ferait un piège, un
+    /// futur lecteur l'appellerait et perdrait la moitié « coupé par les pas ».
+    /// Un seul convertisseur, et il est total.
+    ///
+    /// Les deux champs sont mutuellement exclusifs par construction
+    /// (`agent_loop::AgentOutput::max_steps_exceeded`). Le croisement est quand
+    /// même traité, en faisant gagner la deadline — jamais par un
+    /// `unreachable!()` : paniquer sur un champ d'observabilité serait le pire
+    /// des échanges (doctrine mika#2515).
+    pub fn of_output(output: &crate::agent_loop::AgentOutput) -> Self {
+        match (output.deadline_exceeded, output.max_steps_exceeded) {
+            (Some(overrun), _) => Self::DeadlineExceeded {
+                steps_completed: overrun.steps_completed,
             },
+            (None, Some(cut)) => Self::MaxStepsExceeded {
+                steps_completed: cut.steps_completed,
+            },
+            (None, None) => Self::Concluded,
         }
     }
 }
@@ -262,6 +280,27 @@ pub enum VerdictReason {
         exit: crate::qa_build_callback::CutOffExit,
         steps_completed: usize,
     },
+    /// mika#2943 — le tour **webhook** a été coupé par son budget de pas
+    /// d'outil avant de poster son verdict.
+    ///
+    /// # Pourquoi la population de mika#2276, discriminée par `cause`
+    ///
+    /// C'est une perte du chemin **webhook**, exactement comme
+    /// [`Self::CutOffByDeadline`] et [`Self::TurnFailed`] : même déclencheur,
+    /// même cible, même opérateur en bout de chaîne. Lui donner un nom
+    /// d'événement neuf couperait en deux la population que l'opérateur agrège,
+    /// et obligerait chaque sonde webhook à nommer deux noms. Il rend donc
+    /// [`DEADLINE_VERDICT_EVENT`], discriminé par `cause=cut_off_max_steps` —
+    /// le geste de mika#2289, et la valeur de `cause` est celle que
+    /// `qa_build_callback` sert déjà au chemin callback, jamais un littéral neuf.
+    ///
+    /// Son corps est celui de mika#2276 à **une phrase près** : la borne qui a
+    /// coupé. Dire « a atteint la limite de son enveloppe de temps » d'un tour
+    /// qui avait encore 295 s devant lui (trace `b22e6ea0`) serait une mesure
+    /// fausse rendue avec autorité, et le corps de la branche deadline est figé
+    /// octet pour octet par
+    /// [`tests::mika2368_the_deadline_body_is_frozen_byte_for_byte`].
+    WebhookCutOffByMaxSteps { steps_completed: usize },
 }
 
 impl VerdictReason {
@@ -276,6 +315,9 @@ impl VerdictReason {
             // mika#2515 : perte du chemin callback, donc la population
             // callback — discriminée par `cause`, jamais par un nom neuf.
             Self::CallbackCutOffWithoutVerdict { .. } => CALLBACK_VERDICT_EVENT,
+            // mika#2943 : perte du chemin webhook, donc la population webhook —
+            // même geste, même `cause`, l'autre côté du miroir.
+            Self::WebhookCutOffByMaxSteps { .. } => DEADLINE_VERDICT_EVENT,
         }
     }
 
@@ -297,6 +339,11 @@ impl VerdictReason {
             Self::CallbackConcludedWithoutVerdict => None,
             Self::TurnFailed { .. } => Some(CAUSE_ERROR),
             Self::CallbackCutOffWithoutVerdict { exit, .. } => Some(exit.as_cause()),
+            // La même valeur que le chemin callback sert pour la même borne —
+            // lue depuis la constante, jamais recopiée (mika#2943).
+            Self::WebhookCutOffByMaxSteps { .. } => {
+                Some(crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS)
+            }
         }
     }
 }
@@ -415,6 +462,9 @@ pub fn deadline_verdict_target(
             error_class,
             detail,
         },
+        TurnConclusion::MaxStepsExceeded { steps_completed } => {
+            VerdictReason::WebhookCutOffByMaxSteps { steps_completed }
+        }
     };
     // Un tour Telegram, un heartbeat ou un événement non-PR peut dépasser sa
     // deadline ou mourir : il n'y a alors rien sur quoi poster, et ce n'est pas
@@ -572,6 +622,32 @@ fn build_verdict_body(reason: &VerdictReason, trace_id: &str) -> String {
                 cause = exit.as_cause(),
             )
         }
+        // mika#2943 — la grammaire de mika#2276 à une phrase près : la borne
+        // franchie. Le reste est identique parce que c'est le même défaut vu par
+        // le même opérateur sur la même population ; la branche deadline étant
+        // figée octet pour octet, la phrase juste s'écrit ici.
+        VerdictReason::WebhookCutOffByMaxSteps { steps_completed } => format!(
+            "{DEADLINE_VERDICT_LINE}\n\
+             \n\
+             Ce verdict est posté par le moteur, pas par le tour de revue.\n\
+             \n\
+             Le tour de revue QA a atteint la limite de son budget de steps d'outil \
+             avant d'avoir rédigé un verdict : il s'est arrêté après \
+             {steps_completed} step(s) d'outil. Aucune conclusion de revue n'a été \
+             produite — ce `hold[review]` ne dit rien du contenu de la PR, seulement \
+             que la revue n'a pas abouti.\n\
+             \n\
+             Relancer la revue (retirer puis remettre le reviewer) suffit dans le cas \
+             nominal. Si la coupure se répète sur cette PR, le tour bute \
+             probablement sur un travail trop long pour un budget de revue — regarder \
+             les `run_shell` du tour avant de relancer une troisième fois.\n\
+             \n\
+             Trace : `{trace_id}` — chercher `{DEADLINE_VERDICT_EVENT}` et \
+             `cause={cause}` dans `$MIKA_SPIRIT_LOG_FILE`.\n\
+             \n\
+             <sub>mika#2943</sub>",
+            cause = crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS,
+        ),
     }
 }
 
@@ -723,6 +799,22 @@ where
                     "callback de build QA coupé avant d'avoir posté — verdict \
                      hold[review] posté par le moteur"
                 ),
+                // mika#2943 — cinquième `warn!`, même raison. La ligne porte
+                // `cause` **et** `steps_completed` : c'est par leur conjonction
+                // que l'opérateur joint cette ligne au `max_steps_tool_census`
+                // de la même trace (sonde AC4).
+                VerdictReason::WebhookCutOffByMaxSteps { steps_completed } => warn!(
+                    event,
+                    agent_id = %input.agent_id,
+                    trace_id = %input.trace_id,
+                    repo = %target.repo,
+                    pr = target.pr_number,
+                    cause = crate::qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS,
+                    steps_completed = *steps_completed,
+                    outcome = "posted",
+                    "tour de revue coupé par son budget de steps — verdict \
+                     hold[review] posté par le moteur"
+                ),
             }
             DeadlineVerdictOutcome::Posted
         }
@@ -763,10 +855,16 @@ mod tests {
 
     const REVIEW_REQUESTED: &str = "[GitHub] PR review_requested: senara-solutions/mika#2275 — fix(mika#2272) (branch: fix/2272)\nhttps://github.com/senara-solutions/mika/pull/2275\nRequested reviewer: @mika-platform-qa";
 
-    fn overrun(steps: usize) -> Option<DeadlineOverrun> {
-        Some(DeadlineOverrun {
+    /// La conclusion d'un tour coupé par son enveloppe de temps.
+    ///
+    /// Rendait un `Option<DeadlineOverrun>` passé en `.into()` jusqu'à
+    /// mika#2943, qui a supprimé ce convertisseur partiel : la conclusion se
+    /// nomme maintenant, et c'est la moitié du contrat de
+    /// [`TurnConclusion::of_output`].
+    fn overrun(steps: usize) -> TurnConclusion {
+        TurnConclusion::DeadlineExceeded {
             steps_completed: steps,
-        })
+        }
     }
 
     /// Le motif mika#2276, tel que [`deadline_verdict_target`] le construit.
@@ -1040,8 +1138,7 @@ mod tests {
     #[test]
     fn a_non_pr_deadline_overrun_never_reaches_the_net() {
         assert!(
-            deadline_verdict_target(overrun(9).into(), "Salut, tu peux me résumer ma semaine ?")
-                .is_none()
+            deadline_verdict_target(overrun(9), "Salut, tu peux me résumer ma semaine ?").is_none()
         );
     }
 
@@ -1050,7 +1147,7 @@ mod tests {
     #[test]
     fn a_cut_off_pr_turn_produces_the_deadline_reason_and_its_target() {
         let (reason, target) =
-            deadline_verdict_target(overrun(5).into(), REVIEW_REQUESTED).expect("motif + cible");
+            deadline_verdict_target(overrun(5), REVIEW_REQUESTED).expect("motif + cible");
         assert_eq!(reason, cut_off(5));
         assert_eq!(reason.event_name(), DEADLINE_VERDICT_EVENT);
         assert_eq!(target, requested_target());
@@ -1496,7 +1593,7 @@ mod tests {
     /// son ticket.
     #[test]
     fn mika2289_the_two_causes_are_never_collapsed() {
-        let (envelope, _) = deadline_verdict_target(overrun(5).into(), REVIEW_REQUESTED)
+        let (envelope, _) = deadline_verdict_target(overrun(5), REVIEW_REQUESTED)
             .expect("un dépassement n'est pas une conclusion");
         let (error, _) = deadline_verdict_target(died("transport_timeout"), REVIEW_REQUESTED)
             .expect("une mort n'est pas une conclusion");

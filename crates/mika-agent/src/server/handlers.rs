@@ -1557,7 +1557,7 @@ const VERDICT_ERROR_DETAIL_MAX_BYTES: usize = 600;
 /// que l'opérateur agrège.
 fn conclusion_of(run: &anyhow::Result<agent::AgentOutput>) -> TurnConclusion {
     match run {
-        Ok(output) => TurnConclusion::from(output.deadline_exceeded),
+        Ok(output) => TurnConclusion::of_output(output),
         Err(e) => {
             let rendered = format!("{e:#}");
             TurnConclusion::Failed {
