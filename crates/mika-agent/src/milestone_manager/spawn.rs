@@ -1918,6 +1918,7 @@ mod tests {
                 state: IssueState::Open,
                 priority_rank: None,
                 plan_present: true,
+                plan_reading: None,
                 branch_present: true,
                 pr_number: Some(200),
                 pr_state: Some("open".into()),

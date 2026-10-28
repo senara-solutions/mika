@@ -639,6 +639,12 @@ pub fn compose_outside_candidates(
                 state,
                 priority_rank: priority_from_labels(&labels),
                 plan_present: plan_callout_present(body),
+                // Une seule lecture du corps, deux questions (mika#2952) : le
+                // booléen lâche que mika#2608 a figé, et la lecture à trois
+                // états dont le bassin tire son refus. Posée **ici** et sur le
+                // chemin milestone, parce qu'un prédicat aveugle par origine
+                // est la classe mika#2205 réintroduite.
+                plan_reading: Some(crate::plan_callout::plan_reading(body)),
                 labels,
             })
         })
@@ -743,6 +749,22 @@ pub fn priority_from_labels(labels: &[String]) -> Option<u8> {
 /// mesure ne l'établit**. Suivi nommé, avec sa précondition : un rapport dont
 /// `plan_present` est mesurément faux. Armer un resserrement sur une population
 /// non mesurée est ce que mika#2520 refuse.
+///
+/// # La précondition a été remplie, et la levée n'est PAS ici (mika#2952)
+///
+/// Le rapport du sink du 2026-10-28T17:06:59 **est** cette mesure : quatre
+/// candidats « à admettre » dont le seul `docs/plans/` restant était une ligne
+/// `Plan antérieur :`, écrite par la porte d'auto-pull (mika#2839) *parce que*
+/// le vol avait été livré. La seconde branche les lisait comme portant un
+/// callout vivant.
+///
+/// La levée a pris la forme d'une **séparation**, et ce prédicat est
+/// **inchangé** : mika#2608 reste en vigueur, ses deux tests sont verts sans
+/// édition, et les quatre consommateurs du booléen gardent leur tolérance. Le
+/// bassin reçoit à côté [`crate::plan_callout::plan_reading`], qui rend trois
+/// états. La propriété de sur-ensemble épinglée au § 1 est précisément ce qui
+/// rend l'état intermédiaire bien défini : `lâche \ stricte` est non vide, et
+/// c'est la population mesurée.
 pub fn plan_callout_present(body: &str) -> bool {
     // Canonical callout shape: `> - **Plan:** docs/plans/...`.
     // Loose form: any occurrence of `docs/plans/` in a callout blockquote.
@@ -935,6 +957,9 @@ pub fn compose_from_gh_outputs(
         }
 
         let plan_present = plan_callout_present(&body);
+        // Le même corps, la seconde question (mika#2952) — voir le site jumeau
+        // dans `compose_outside_candidates`.
+        let plan_reading = Some(crate::plan_callout::plan_reading(&body));
         let branch_present = branch_callout_present(&body);
         let blockers = extract_blockers(&body);
         let priority_rank = priority_from_labels(&labels);
@@ -1000,6 +1025,7 @@ pub fn compose_from_gh_outputs(
             state: state.clone(),
             priority_rank,
             plan_present,
+            plan_reading,
             branch_present,
             pr_number,
             pr_state,
@@ -1951,6 +1977,7 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
             state: IssueState::Closed,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -2526,6 +2553,7 @@ mod gh_arg_capture_tests {
             state: IssueState::Open,
             priority_rank: Some(1),
             plan_present: true,
+            plan_reading: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,

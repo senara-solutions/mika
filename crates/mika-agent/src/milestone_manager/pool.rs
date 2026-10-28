@@ -95,6 +95,7 @@
 
 use super::plan_size;
 use super::types::{IssueState, SubIssue};
+use crate::plan_callout::PlanReading;
 use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL, operator_held_label};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -107,15 +108,30 @@ use std::collections::{BTreeMap, HashSet};
 /// hors milestone (`gh issue list`) **n'en mesure aucun**, et les remplir à leur
 /// valeur neutre ferait dire « pas de CI » à une absence de mesure — le motif
 /// mika#2331 que ce dépôt refuse ailleurs (« un null n'est jamais un 0 »). Les
-/// cinq champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
+/// six champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
 /// les deux ensembles de candidats partagent un type sans qu'aucun ait à
 /// inventer de valeur.
+///
+/// Le sixième, `plan_reading` (mika#2952), n'est pas une entorse à cette borne :
+/// c'est une lecture du **corps**, que les deux lectures d'issues demandent
+/// déjà (`--json body`), donc les deux origines la paient à l'identique et
+/// aucune n'a de valeur à inventer. C'est exactement ce qui le distingue de
+/// `pr_state`, `ci_state` et `branch_present`, qui sont mesurés sur un seul
+/// chemin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolCandidate {
     pub number: u64,
     pub state: IssueState,
     pub priority_rank: Option<u8>,
     pub plan_present: bool,
+    /// Ce que le corps dit de son plan, en trois états (mika#2952).
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison de `SubIssue::merged_prs` :
+    /// le puits hors-ligne tient des blobs écrits avant ce champ, et `None` y
+    /// dit « ce binaire n'a pas lu le corps », jamais « aucun plan »
+    /// (mika#2340). C'est pourquoi `None` ne déclenche aucun refus ici.
+    #[serde(default)]
+    pub plan_reading: Option<PlanReading>,
     pub labels: Vec<String>,
 }
 
@@ -129,6 +145,7 @@ impl From<&SubIssue> for PoolCandidate {
             state: s.state.clone(),
             priority_rank: s.priority_rank,
             plan_present: s.plan_present,
+            plan_reading: s.plan_reading,
             labels: s.labels.clone(),
         }
     }
@@ -731,6 +748,11 @@ mod tests {
             state: IssueState::Open,
             priority_rank: rank,
             plan_present,
+            // `None` et non `Some(Live)` : la graine partagée reste celle d'un
+            // blob antérieur à mika#2952, donc les verdicts que les tests du
+            // vol 2 et du vol 3 épinglent ne bougent pas. Les tests de
+            // mika#2952 posent la lecture explicitement, par `..cand(…)`.
+            plan_reading: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1084,6 +1106,9 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(2),
             plan_present: true,
+            // La projection doit **transporter** la lecture, pas la refaire :
+            // le corps est lu une fois, au composeur (mika#2952).
+            plan_reading: Some(PlanReading::Live),
             branch_present: true,
             pr_number: Some(2710),
             pr_state: None,
@@ -1102,6 +1127,7 @@ mod tests {
                 state: IssueState::Open,
                 priority_rank: Some(2),
                 plan_present: true,
+                plan_reading: Some(PlanReading::Live),
                 labels: vec!["ready".into(), "agent-core".into()],
             }
         );
