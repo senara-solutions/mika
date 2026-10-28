@@ -1197,6 +1197,17 @@ pub struct Settings {
     #[serde(default)]
     pub callback_delivery_backoff_max_secs: Option<u64>,
 
+    /// Intervalle de retenue après un 402 de crédit, en secondes (mika#2944).
+    ///
+    /// Env override: `MIKA_CALLBACK_DELIVERY_CREDIT_HOLD_SECS`.
+    ///
+    /// Default: [`DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS`] (900).
+    ///
+    /// `0` **désarme** la retenue et restaure l'échelle de mika#2179 pour le
+    /// 402 : interrupteur STOP déclaré, pas un plancher (doctrine mika#1833).
+    #[serde(default)]
+    pub callback_delivery_credit_hold_secs: Option<u64>,
+
     /// Per-call LLM HTTP plafond, in seconds (mika#2189 D1/D4).
     ///
     /// The same knob mika#1660 introduced as `MIKA_LLM_HTTP_TIMEOUT_SECS`,
@@ -1569,6 +1580,19 @@ pub const DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS: u64 = 3600;
 /// setting meant to bound it. A backoff beyond thirty days has no meaning here
 /// anyway: the callback carries a pilot's return that someone is waiting on.
 pub const CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Intervalle de retenue par défaut après un 402 de crédit, en secondes
+/// (mika#2944). Quinze minutes.
+///
+/// Ce n'est pas un backoff : c'est le pas d'une **sonde**. Le 2026-10-28, les
+/// quatre reprises de la tâche 26b8d5c7 ont rejoué 60 tours de revue en
+/// soixante-cinq minutes, et la recharge est arrivée vers 08:51Z — un geste
+/// humain, dont le délai se compte en dizaines de minutes. Quinze minutes
+/// coûtent au pire **une** revue rejouée par intervalle au lieu d'une toutes
+/// les soixante secondes, et rendent la main au verdict dans le quart d'heure
+/// qui suit la recharge, ce que l'échelle de mika#2179 ne faisait qu'au bout
+/// d'une heure une fois quarantinée.
+pub const DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS: u64 = 900;
 
 /// Cost, in USD, above which a finished pilot dispatch is reported as an
 /// overrun (mika#2496).
@@ -2398,6 +2422,31 @@ impl Settings {
             )
     }
 
+    /// Intervalle de retenue effectif après un 402 de crédit (mika#2944).
+    ///
+    /// Trois tiers, et le premier est le seul qui ressemble aux accesseurs
+    /// mika#2179 voisins :
+    ///
+    /// * absent ⇒ [`DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS`] (900) ;
+    /// * `Some(0)` ⇒ **`0`**, et surtout pas `1`. C'est l'interrupteur STOP de
+    ///   la retenue, déclaré comme tel (doctrine mika#1833) : l'opérateur qui
+    ///   le pose veut retrouver l'échelle de mika#2179 sur le 402, et un clamp
+    ///   à `1` lui rendrait une retenue d'une seconde en prétendant l'avoir
+    ///   désarmée ;
+    /// * sinon, clampé dans `1..=`[`CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS`],
+    ///   pour la raison qui clampe déjà le backoff : la valeur atteint
+    ///   `chrono::Duration::seconds`, qui **panique** au-delà de
+    ///   `i64::MAX / 1000`, et la tâche mourrait dans la fonction même qui
+    ///   allait écrire le `next_fire_at`.
+    #[must_use]
+    pub fn effective_callback_delivery_credit_hold_secs(&self) -> u64 {
+        match self.callback_delivery_credit_hold_secs {
+            None => DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS,
+            Some(0) => 0,
+            Some(n) => n.clamp(1, CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS),
+        }
+    }
+
     /// Effective per-call LLM HTTP plafond, in seconds (mika#2189).
     ///
     /// Falls back to [`crate::llm::http_timeout_secs`] when unset, so the
@@ -2801,6 +2850,7 @@ impl Settings {
             operator_escalation_chat_id: None,
             callback_delivery_backoff_base_secs: None,
             callback_delivery_backoff_max_secs: None,
+            callback_delivery_credit_hold_secs: None,
             kg_docs_root: None,
             kg_docs_roots: None,
             operational_partner: false,
@@ -4369,6 +4419,68 @@ mod tests {
             // representable — this is the assertion the clamp exists for.
             let _ = chrono::Duration::seconds(
                 settings.effective_callback_delivery_backoff_max_secs() as i64,
+            );
+        }
+    }
+
+    // -- Retenue sur crédit épuisé (mika#2944) --
+
+    #[test]
+    #[serial]
+    fn callback_delivery_credit_hold_default_and_env_override() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert_eq!(settings.callback_delivery_credit_hold_secs, None);
+        assert_eq!(
+            settings.effective_callback_delivery_credit_hold_secs(),
+            900,
+            "quinze minutes : le pas d'une sonde, pas un backoff"
+        );
+
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_CALLBACK_DELIVERY_CREDIT_HOLD_SECS", "300") };
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert_eq!(settings.effective_callback_delivery_credit_hold_secs(), 300);
+        unsafe { std::env::remove_var("MIKA_CALLBACK_DELIVERY_CREDIT_HOLD_SECS") };
+    }
+
+    /// `0` est un **interrupteur déclaré**, pas un plancher (doctrine mika#1833),
+    /// et les valeurs absurdes restent représentables pour `chrono`.
+    ///
+    /// Sans la première assertion, un clamp copié sur l'accesseur voisin rendrait
+    /// `1` : une retenue d'une seconde vendue comme un désarmement. Sans la
+    /// seconde, une valeur en millisecondes **paniquerait** dans la fonction même
+    /// qui allait écrire le `next_fire_at`.
+    #[test]
+    #[serial]
+    fn callback_delivery_credit_hold_zero_is_a_stop_switch_not_a_floor() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+
+        settings.callback_delivery_credit_hold_secs = Some(0);
+        assert_eq!(
+            settings.effective_callback_delivery_credit_hold_secs(),
+            0,
+            "0 désarme la retenue et restaure l'échelle de mika#2179 — il ne vaut pas 1"
+        );
+
+        settings.callback_delivery_credit_hold_secs = Some(1);
+        assert_eq!(settings.effective_callback_delivery_credit_hold_secs(), 1);
+
+        // `i64::MAX as u64 + 1` est la valeur qui, sans clamp, **casse en
+        // négatif** à l'entrée de `chrono` ; `u64::MAX` est le pire cas.
+        for absurd in [(i64::MAX as u64) + 1, u64::MAX] {
+            settings.callback_delivery_credit_hold_secs = Some(absurd);
+            assert_eq!(
+                settings.effective_callback_delivery_credit_hold_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS
+            );
+            let _ = chrono::Duration::seconds(
+                settings.effective_callback_delivery_credit_hold_secs() as i64,
             );
         }
     }
