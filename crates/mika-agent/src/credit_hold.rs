@@ -64,6 +64,15 @@ pub const DELIVERY_CREDIT_RELEASED_AT_KEY: &str = "delivery_credit_released_at";
 /// payées pour en arriver là, c'est-à-dire la facture réelle de la retenue.
 pub const DELIVERY_CREDIT_PROBES_KEY: &str = "delivery_credit_probes";
 
+/// Les trois noms d'événement de la retenue (mika#2944), définis ici parce que
+/// le dispatcher les émet et les tests les lisent : deux orthographes d'un même
+/// nom scindent une population sans le dire (mika#2205).
+pub const CREDIT_HELD_EVENT: &str = "callback_delivery_credit_held";
+/// Le crédit est revenu, la revue reprend dans le tour qui suit (AC2).
+pub const CREDIT_RESTORED_EVENT: &str = "callback_delivery_credit_restored";
+/// La sonde n'a pas conclu — retenue maintenue, fail-closed assumé.
+pub const CREDIT_PROBE_INCONCLUSIVE_EVENT: &str = "callback_delivery_credit_probe_inconclusive";
+
 /// La ligne est-elle en retenue pour crédit épuisé ? (mika#2944)
 ///
 /// Seul lecteur de la représentation à deux marques décrite en tête de module.

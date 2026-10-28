@@ -1407,6 +1407,15 @@ impl TaskDispatcher {
             return Ok(());
         }
 
+        // mika#2944 — une ligne retenue pour crédit épuisé paie une sonde d'un
+        // message, jamais une revue complète. Même raison d'être avant le
+        // verrou, et **après** la garde ci-dessus parce que l'ordre est
+        // porteur : la supersession est un test de base gratuit, la retenue
+        // coûte un appel LLM.
+        if is_callback && self.hold_callback_on_exhausted_credit(task).await {
+            return Ok(());
+        }
+
         // Acquire agent lock — return error if busy so caller can re-queue
         let _guard = if let Some(ref lock) = self.agent_lock {
             match lock.try_lock() {
@@ -3069,7 +3078,40 @@ impl TaskDispatcher {
         // far end of a long outage.
         let max_attempts = self.settings.effective_callback_delivery_max_attempts();
         let max_backoff = self.settings.effective_callback_delivery_backoff_max_secs();
-        let backoff_secs = if counter_written {
+
+        // mika#2944 — un 402 de crédit **remplace** le calcul du backoff par un
+        // intervalle de retenue. Un backoff borne la *fréquence* d'un réessai ;
+        // il ne peut rien contre un réessai dont on sait qu'il ne peut pas
+        // aboutir. La ligne garde tout le reste : son compteur, sa classe de
+        // fil `http_402`, son événement `callback_delivery_failed`, son
+        // résultat de build, et sa quarantaine le jour où elle la franchit.
+        //
+        // La retenue ne dépend **pas** de `counter_written`, et c'est une
+        // différence de nature, non un oubli : l'intervalle est constant, donc
+        // il n'y a rien à escalader depuis un nombre non fiable. Le compteur
+        // illisible dégrade l'échelle de mika#2179, pas celle-ci.
+        //
+        // `0` est l'interrupteur STOP déclaré du ticket (voir
+        // `effective_callback_delivery_credit_hold_secs`) : la retenue est
+        // désarmée et le 402 retrouve l'échelle de mika#2179.
+        let credit_hold_secs = if mika_common::llm::error::is_credit_exhausted_anyhow(err) {
+            self.settings.effective_callback_delivery_credit_hold_secs()
+        } else {
+            0
+        };
+
+        let backoff_secs = if credit_hold_secs > 0 {
+            self.stamp_credit_hold(
+                task,
+                session_id,
+                trace_id,
+                &class,
+                credit_hold_secs,
+                attempts,
+            )
+            .await;
+            credit_hold_secs
+        } else if counter_written {
             delivery_backoff_secs(
                 self.settings
                     .effective_callback_delivery_backoff_base_secs(),
@@ -3145,6 +3187,227 @@ impl TaskDispatcher {
                 attempts,
                 "callback delivery quarantined — retrying at the backoff ceiling, result preserved"
             );
+        }
+    }
+
+    /// mika#2944 — Poser (ou reposer) la marque de retenue sur crédit épuisé.
+    ///
+    /// N'écrit **pas** le `next_fire_at` : les deux appelants ont chacun leur
+    /// propre site de timer — `record_callback_delivery_failure` en a déjà un et
+    /// un seul (le `next_fire_at` de mika#2179, dont la valeur devient
+    /// l'intervalle de retenue), et [`Self::hold_callback_on_exhausted_credit`]
+    /// doit écrire le sien parce qu'aucun autre chemin ne le fera. Un helper qui
+    /// écrirait le timer poserait deux `next_fire_at` sur le chemin de l'échec,
+    /// dont le second effacerait le premier sans trace.
+    ///
+    /// `probes` est incrémenté ici parce que c'est ici que la facture de la
+    /// retenue se lit : une sonde payée par intervalle, et le compte dit combien.
+    async fn stamp_credit_hold(
+        &self,
+        task: &Task,
+        session_id: &str,
+        trace_id: &str,
+        class: &str,
+        hold_secs: u64,
+        attempts: u32,
+    ) {
+        use crate::credit_hold::{
+            CREDIT_HELD_EVENT, DELIVERY_CREDIT_HELD_AT_KEY, DELIVERY_CREDIT_PROBES_KEY,
+        };
+
+        let probes = self
+            .db
+            .get_task_metadata_field(&task.id, DELIVERY_CREDIT_PROBES_KEY)
+            .await
+            .unwrap_or_default()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        self.set_delivery_metadata(
+            &task.id,
+            DELIVERY_CREDIT_HELD_AT_KEY,
+            &crate::timestamp::now(),
+        )
+        .await;
+        self.set_delivery_metadata(&task.id, DELIVERY_CREDIT_PROBES_KEY, &probes.to_string())
+            .await;
+
+        let reasoning = format!(
+            "hold_secs={hold_secs} probes={probes} attempts={attempts} label:{}",
+            task.label
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                session_id,
+                CREDIT_HELD_EVENT,
+                &format!("task:{}", task.id),
+                None,
+                Some(class),
+                Some(&reasoning),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, task_id = %task.id, "failed to write callback_delivery_credit_held audit event");
+        }
+
+        warn!(
+            event = CREDIT_HELD_EVENT,
+            task_id = %task.id,
+            label = %task.label,
+            error_class = %class,
+            hold_secs,
+            probes,
+            attempts,
+            "crédit du fournisseur épuisé — la ligne est retenue au lieu de rejouer \
+             la revue (résultat préservé, reprise à la prochaine sonde)"
+        );
+    }
+
+    /// mika#2944 — Une ligne retenue pour crédit épuisé ne rejoue pas sa revue :
+    /// elle paie une sonde d'un message, et c'est tout.
+    ///
+    /// Rend `true` quand le tour ne doit pas tourner. Appelée **avant le
+    /// verrou**, juste après la garde mika#2671, pour la même raison : un tour
+    /// qu'on ne lance pas n'a ni à attendre le verrou ni à compter un report
+    /// `AgentBusy`. Et **après** elle, parce que l'ordre est porteur — la
+    /// supersession est un test de base gratuit, la retenue coûte un appel LLM.
+    ///
+    /// # Les trois sorties, et pourquoi la troisième est fermée
+    ///
+    /// * la sonde **passe** ⇒ le crédit est revenu : on pose la marque de
+    ///   relâchement, on l'annonce, et on rend `false` — la revue reprend dans
+    ///   le tour qui suit immédiatement, sans geste à la main (AC2) ;
+    /// * la sonde rend un **402** ⇒ le crédit manque toujours : re-retenue,
+    ///   `true`. C'est le cas nominal d'une retenue, et il coûte un message
+    ///   par intervalle au lieu d'une revue complète ;
+    /// * la sonde rend **autre chose** (429, 5xx, transport) ⇒ re-retenue sous
+    ///   WARN, `true`. **Fail-closed assumé** : on ne sait pas si le crédit est
+    ///   revenu, et la seule façon de le savoir coûterait précisément ce que ce
+    ///   ticket existe pour ne plus payer. Un quart d'heure de retard sur un
+    ///   verdict est moins cher qu'une revue de 28 tours rejouée dans le vide.
+    ///   L'événement porte la classe de l'erreur, donc une retenue qui dure
+    ///   parce que le fournisseur est en panne se distingue d'une retenue qui
+    ///   dure parce que le solde est à zéro.
+    ///
+    /// # Ce que la sonde ne prouve pas
+    ///
+    /// Qu'elle passe ne garantit pas que la revue aboutira : le pré-vol porte
+    /// sur l'enveloppe de la requête, et une revue de 28 tours en consomme
+    /// plusieurs. C'est une **indication**, et le résidu assumé est au pire une
+    /// revue rejouée par intervalle de retenue — contre une toutes les soixante
+    /// secondes avant ce ticket.
+    async fn hold_callback_on_exhausted_credit(&self, task: &Task) -> bool {
+        use crate::credit_hold::{
+            CREDIT_PROBE_INCONCLUSIVE_EVENT, CREDIT_RESTORED_EVENT, DELIVERY_CREDIT_HELD_AT_KEY,
+            DELIVERY_CREDIT_PROBES_KEY, DELIVERY_CREDIT_RELEASED_AT_KEY,
+        };
+
+        if !crate::credit_hold::is_held(task.metadata.as_deref()) {
+            return false;
+        }
+
+        let hold_secs = self.settings.effective_callback_delivery_credit_hold_secs();
+        if hold_secs == 0 {
+            // Interrupteur STOP déclaré (doctrine mika#1833) : l'opérateur a
+            // désarmé la retenue, la ligne repart sur l'échelle de mika#2179.
+            // Aucune marque n'est retirée — `async_db` n'a pas de suppression —
+            // donc le désarmement est réversible sans toucher aux données.
+            return false;
+        }
+
+        let session_id = format!("credit-probe-{}", uuid::Uuid::new_v4());
+        let trace_id = mika_common::trace::generate_trace_id();
+        let probe = crate::credit_hold::probe_request(self.llm.as_ref());
+
+        match self.llm.send_message(&probe).await {
+            Ok(_) => {
+                let held_secs = task
+                    .metadata
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|v| {
+                        v.get(DELIVERY_CREDIT_HELD_AT_KEY)
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string)
+                    })
+                    .and_then(|ts| crate::timestamp::parse(&ts).ok())
+                    .map(|held| chrono::Utc::now().signed_duration_since(held).num_seconds())
+                    .unwrap_or(-1);
+                let probes = crate::qa_build_callback::metadata_counter(
+                    task.metadata.as_deref(),
+                    DELIVERY_CREDIT_PROBES_KEY,
+                );
+
+                self.set_delivery_metadata(
+                    &task.id,
+                    DELIVERY_CREDIT_RELEASED_AT_KEY,
+                    &crate::timestamp::now(),
+                )
+                .await;
+
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &session_id,
+                        CREDIT_RESTORED_EVENT,
+                        &format!("task:{}", task.id),
+                        None,
+                        Some(&held_secs.to_string()),
+                        Some(&format!("held_secs={held_secs} probes={probes}")),
+                        Some(&trace_id),
+                    )
+                    .await
+                {
+                    warn!(error = %e, task_id = %task.id, "failed to write callback_delivery_credit_restored audit event");
+                }
+
+                info!(
+                    event = CREDIT_RESTORED_EVENT,
+                    task_id = %task.id,
+                    label = %task.label,
+                    held_secs,
+                    probes,
+                    "crédit revenu — la revue reprend dans ce tour, sans geste à la main"
+                );
+                false
+            }
+            Err(e) => {
+                let class = e.error_class();
+                let conclusive = mika_common::llm::error::is_credit_exhausted(&e);
+                if !conclusive {
+                    warn!(
+                        event = CREDIT_PROBE_INCONCLUSIVE_EVENT,
+                        task_id = %task.id,
+                        label = %task.label,
+                        error_class = %class,
+                        error = %e,
+                        "la sonde de crédit n'a pas conclu — retenue maintenue (fail-closed : \
+                         la seule façon de savoir coûterait la revue que ce ticket évite)"
+                    );
+                }
+                self.stamp_credit_hold(
+                    task,
+                    &session_id,
+                    &trace_id,
+                    class.as_ref(),
+                    hold_secs,
+                    crate::qa_build_callback::metadata_counter(
+                        task.metadata.as_deref(),
+                        DELIVERY_ATTEMPTS_KEY,
+                    ) as u32,
+                )
+                .await;
+
+                let fire_at =
+                    crate::timestamp::now_plus(chrono::Duration::seconds(hold_secs as i64));
+                if let Err(e) = self.db.update_task_next_fire_at(&task.id, &fire_at).await {
+                    warn!(error = %e, task_id = %task.id, "failed to write callback credit hold");
+                }
+                true
+            }
         }
     }
 
