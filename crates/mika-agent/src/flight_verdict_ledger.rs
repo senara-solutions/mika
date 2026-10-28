@@ -173,7 +173,7 @@ use tracing::warn;
 use crate::async_db::AsyncDatabase;
 use crate::evidence::audit::AUDIT_RETENTION_DAYS;
 use crate::milestone_manager::evaluator::{
-    DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
+    DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, NotFlightReason,
 };
 use crate::milestone_manager::reporter::{flight_issue_label, flight_recommendation_label};
 
@@ -296,7 +296,13 @@ impl VerdictRecord {
             issue: issue_term(&self.issue),
             cause: match &self.issue {
                 FlightIssue::Dead { cause } => Some(cause_term(cause)),
-                FlightIssue::PrOpened { .. } | FlightIssue::RescuePr { .. } => None,
+                FlightIssue::PrOpened { .. }
+                | FlightIssue::RescuePr { .. }
+                // mika#2946 : le motif de non-vol est porté par le terme
+                // d'issue lui-même (`not_a_flight:<motif>`), jamais par
+                // `cause` — `--cause` garde son contrat, qui est de ne
+                // s'appliquer qu'à une mort.
+                | FlightIssue::NotAFlight { .. } => None,
             },
             recommendation: recommendation_term(self.recommendation),
         }
@@ -315,7 +321,33 @@ fn issue_term(issue: &FlightIssue) -> &'static str {
         FlightIssue::PrOpened { .. } => "pr_opened",
         FlightIssue::RescuePr { .. } => "rescue_pr",
         FlightIssue::Dead { .. } => "dead",
+        // mika#2946 — terme **composé**, sur le précédent de `unknown:<jeton>`
+        // de [`cause_term`] : le motif voyage dans le terme, donc un
+        // `not_a_flight:groom_completed` du manager et un
+        // `not_a_flight:superseded` de MPC divergent, au lieu de concorder sur
+        // un « pas un vol » qui aurait fondu trois faits en un (mika#2205).
+        FlightIssue::NotAFlight { reason } => match reason {
+            NotFlightReason::GroomCompleted => "not_a_flight:groom_completed",
+            NotFlightReason::DispatchRefused => "not_a_flight:dispatch_refused",
+            NotFlightReason::Superseded => "not_a_flight:superseded",
+        },
     }
+}
+
+/// L'étiquette des termes composés de non-vol — `not_a_flight`, qui est aussi la
+/// clé serde de la variante.
+///
+/// **Dérivée, pas réécrite** : un quatrième littéral porterait l'étiquette une
+/// fois de plus qu'il n'en faut, et c'est exactement par là qu'une graphie
+/// divergerait en silence (mika#2158). `str::split` sur un `&'static str` rend
+/// du `&'static str`, donc la dérivation est gratuite.
+fn not_a_flight_tag() -> &'static str {
+    issue_term(&FlightIssue::NotAFlight {
+        reason: NotFlightReason::GroomCompleted,
+    })
+    .split(':')
+    .next()
+    .expect("un terme composé porte toujours son étiquette")
 }
 
 /// Le littéral serde de la cause de mort. [`DeathCause::Unknown`] **porte** son
@@ -338,6 +370,7 @@ fn recommendation_term(r: FlightRecommendation) -> &'static str {
         FlightRecommendation::MergeCandidate => "merge_candidate",
         FlightRecommendation::ManualResumption => "manual_resumption",
         FlightRecommendation::Regroom => "regroom",
+        FlightRecommendation::Nothing => "nothing",
     }
 }
 
@@ -534,6 +567,21 @@ fn judgeable_issue_terms() -> Vec<&'static str> {
         FlightIssue::Dead {
             cause: DeathCause::Refusal,
         },
+        // mika#2946 AC3 : les trois motifs de non-vol sont saisissables, donc
+        // MPC a un terme pour contredire chacune des huit lignes que le manager
+        // comptait en mort. Les variantes sont **instanciées**, pas listées :
+        // un quatrième motif ajouté à `NotFlightReason` sans ligne ici reste
+        // injugeable, et c'est le compilateur qui refusera de le laisser muet le
+        // jour où `issue_term` cessera d'être exhaustif.
+        FlightIssue::NotAFlight {
+            reason: NotFlightReason::GroomCompleted,
+        },
+        FlightIssue::NotAFlight {
+            reason: NotFlightReason::DispatchRefused,
+        },
+        FlightIssue::NotAFlight {
+            reason: NotFlightReason::Superseded,
+        },
     ]
     .iter()
     .map(issue_term)
@@ -579,6 +627,10 @@ fn judgeable_recommendation_terms() -> Vec<&'static str> {
         FlightRecommendation::MergeCandidate,
         FlightRecommendation::ManualResumption,
         FlightRecommendation::Regroom,
+        // mika#2946 : juger « pas un vol » sans pouvoir dire « rien à
+        // recommander » obligerait MPC à recommander un geste sur une tâche qui
+        // n'en appelle aucun.
+        FlightRecommendation::Nothing,
     ]
     .into_iter()
     .map(recommendation_term)
@@ -612,7 +664,10 @@ pub fn parse_judgment_terms(
 }
 
 fn parse_issue_term(issue: &str, cause: Option<&str>) -> Result<FlightIssue> {
-    let payload = if issue == dead_issue_term() {
+    // `tag` est la clé serde, `payload` la charge. Les deux ne coïncident que
+    // pour les termes **simples** : depuis mika#2946 un terme de non-vol est
+    // composé (`not_a_flight:<motif>`), et c'est son étiquette qui est la clé.
+    let (tag, payload) = if issue == dead_issue_term() {
         let cause = cause.ok_or_else(|| {
             anyhow!(
                 "--cause est exigée avec --issue {} ; valeurs acceptées : {}",
@@ -620,22 +675,30 @@ fn parse_issue_term(issue: &str, cause: Option<&str>) -> Result<FlightIssue> {
                 judgeable_cause_terms().join(" · ")
             )
         })?;
-        json!({ "cause": parse_cause_term(cause)? })
+        (issue, json!({ "cause": parse_cause_term(cause)? }))
     } else {
+        // Le refus de `--cause` reste **entier** : cette branche est celle de
+        // tout ce qui n'est pas une mort, les termes composés compris.
         if cause.is_some() {
             bail!(
                 "--cause ne s'applique qu'à --issue {} ; reçue avec « {issue} »",
                 dead_issue_term()
             );
         }
-        json!({ "number": null, "url": null })
+        match issue.split_once(':') {
+            // Le motif voyage tel quel dans la charge : une graphie hors
+            // contrat est refusée par serde en aval, jamais par une liste
+            // tenue ici (doctrine mika#2201).
+            Some((tag, reason)) if tag == not_a_flight_tag() => (tag, json!({ "reason": reason })),
+            _ => (issue, json!({ "number": null, "url": null })),
+        }
     };
 
     // La forme externally tagged que serde attend : `{"<terme>": <charge>}`. La
     // clé est le terme reçu tel quel, donc un terme inconnu échoue ici — c'est
     // serde qui refuse, pas une liste tenue à la main.
     let mut tagged = Map::new();
-    tagged.insert(issue.to_string(), payload);
+    tagged.insert(tag.to_string(), payload);
     serde_json::from_value(Value::Object(tagged)).map_err(|_| {
         anyhow!(
             "--issue inconnue « {issue} » ; valeurs acceptées : {}",
@@ -1289,6 +1352,24 @@ mod tests {
         }
     }
 
+    /// Un verdict de **non-vol** (mika#2946) — la forme dont le terme d'issue
+    /// est composé et dont la recommandation est `Nothing`.
+    fn verdict_non_vol(task_id: &str, reason: NotFlightReason) -> FlightVerdict {
+        FlightVerdict {
+            task_id: task_id.to_string(),
+            repo: None,
+            issue_number: Some(2946),
+            issue: FlightIssue::NotAFlight { reason },
+            turns_used: None,
+            hit_ceiling: false,
+            turn_ceiling: None,
+            last_commit_turn: None,
+            recommendation: FlightRecommendation::Nothing,
+            pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
+            completed_at: Some("2026-10-28T12:10:00Z".to_string()),
+        }
+    }
+
     // ---- l'idiome d'injection ---------------------------------------------
 
     #[tokio::test]
@@ -1419,6 +1500,45 @@ mod tests {
                 .as_deref(),
             Some("unknown:abc")
         );
+
+        // mika#2946 — un terme **composé** : la clé serde est l'étiquette nue,
+        // le terme porte l'étiquette **et** le motif. La boucle ci-dessus ne
+        // peut pas le vérifier (elle compare le terme à la clé), donc la
+        // graphie des deux moitiés s'assère ici, comme celle d'`unknown:abc`.
+        for (reason, attendu) in [
+            (NotFlightReason::GroomCompleted, "groom_completed"),
+            (NotFlightReason::DispatchRefused, "dispatch_refused"),
+            (NotFlightReason::Superseded, "superseded"),
+        ] {
+            let record = VerdictRecord::from(&verdict_non_vol("t", reason));
+            let json = serde_json::to_string(&record).unwrap();
+            let back: VerdictRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, record, "aller-retour serde : {json}");
+
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let map = value["issue"].as_object().expect("variante nommée");
+            let cle = map.keys().next().unwrap();
+            assert_eq!(cle, not_a_flight_tag(), "l'étiquette, dans {json}");
+            // Le motif est la graphie serde de la variante, pas un libellé
+            // retapé — c'est ce que `rename_all` produit réellement.
+            assert_eq!(
+                map[cle]["reason"].as_str().unwrap(),
+                attendu,
+                "le motif, dans {json}"
+            );
+            assert_eq!(
+                record.terms().issue,
+                format!("{}:{attendu}", not_a_flight_tag()),
+                "le terme composé, dans {json}"
+            );
+            // Un non-vol ne porte pas de cause : `--cause` reste le vocabulaire
+            // de la mort seule.
+            assert_eq!(record.terms().cause, None);
+            assert_eq!(
+                record.terms().recommendation,
+                value["recommendation"].as_str().unwrap()
+            );
+        }
     }
 
     // ---- AC1, sur une vraie base ------------------------------------------
@@ -1720,9 +1840,11 @@ mod tests {
             }
         }
         assert_eq!(
-            analyses, 21,
-            "3 issues, dont une à 5 causes, × 3 recommandations = 21 jugements \
-             saisissables ; un autre compte veut dire que l'énumération a bougé"
+            analyses, 40,
+            "6 issues — `pr_opened`, `rescue_pr`, `dead` et les trois motifs de \
+             non-vol de mika#2946 — dont la seule `dead` porte 5 causes, × 4 \
+             recommandations : (5 × 4) + (5 × 1 × 4) = 40 jugements saisissables ; \
+             un autre compte veut dire que l'énumération a bougé"
         );
 
         // MPC juge un vol, pas une PR : les deux champs sont `null` et non 0 ni
@@ -1927,6 +2049,36 @@ mod tests {
         }
     }
 
+    /// Le pendant mika#2946 de [`vol`] : écrire un **non-vol** des deux côtés,
+    /// par les écrivains de production et jamais par du SQL de fixture.
+    ///
+    /// `mpc` porte les trois termes **tels que l'opérateur les saisirait** —
+    /// `--issue`, `--cause`, `--recommendation`. Ils passent donc par
+    /// [`parse_judgment_terms`], et son échec est une **panique nommée** plutôt
+    /// qu'un `unwrap` : c'est cette moitié qui atteste qu'un terme de non-vol est
+    /// saisissable, et un `unwrap` nu dirait « thread panicked » là où le test
+    /// doit dire *quel* terme la ligne de commande refuse.
+    async fn non_vol(
+        db: &AsyncDatabase,
+        task_id: &str,
+        reason: NotFlightReason,
+        mpc: (&str, Option<&str>, &str),
+    ) {
+        assert_eq!(
+            write_and_swallow(db, &verdict_non_vol(task_id, reason)).await,
+            InscriptionTally::one_inscribed(),
+            "le verdict du manager sur {task_id} doit s'inscrire"
+        );
+        let (issue, cause, recommendation) = mpc;
+        let juge = parse_judgment_terms(issue, cause, recommendation)
+            .unwrap_or_else(|e| panic!("MPC doit pouvoir saisir « {issue} » : {e:#}"));
+        assert_eq!(
+            record_mpc_judgment(db, task_id, &juge, None).await.unwrap(),
+            MpcJudgmentOutcome::Inscribed,
+            "le jugement de MPC sur {task_id} doit s'inscrire"
+        );
+    }
+
     fn base() -> AsyncDatabase {
         AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
     }
@@ -2046,6 +2198,93 @@ mod tests {
         assert_eq!(
             rapport.consecutive_concordant, 0,
             "un désaccord sur le vol le plus récent remet le compte à zéro"
+        );
+    }
+
+    /// **AC3 de mika#2946.** Une ligne de non-vol n'est plus laissée **hors du
+    /// compte** : MPC a un terme pour la contredire, et un terme pour l'accorder.
+    ///
+    /// Les deux moitiés sont dans le même test parce que c'est leur écart qui est
+    /// la propriété. « Divergent » seul ne distingue pas un terme que MPC
+    /// *saisit* d'un terme que l'analyse refuse — un refus ferait paniquer
+    /// [`non_vol`], mais une graphie acceptée *de travers* rendrait aussi un
+    /// désaccord, et on le lirait comme un succès. « Concordant » seul ne
+    /// distingue pas un appariement correct d'une comparaison qui ne regarde
+    /// rien. Avant mika#2946 aucune des deux n'était atteignable : `--issue`
+    /// n'acceptait que `pr_opened · rescue_pr · dead`, donc la ligne du manager
+    /// comptait comme « non jugée par MPC » (motif de l'AC4 de mika#2922) et
+    /// sortait du compte en silence, sans jamais pouvoir peser comme désaccord.
+    ///
+    /// La seconde moitié porte les **trois** motifs, et pas un seul : le terme
+    /// est composé, donc c'est la charge (`reason`) qui voyage, et une charge
+    /// perdue en route rendrait les trois lignes concordantes entre elles tout
+    /// en les confondant.
+    #[tokio::test]
+    async fn mika2946_un_non_vol_se_contredit_et_saccorde() {
+        // Première moitié : MPC contredit — il tient la tâche pour un vol mort.
+        let db = base();
+        non_vol(
+            &db,
+            "task-groom",
+            NotFlightReason::GroomCompleted,
+            ("dead", Some("refusal"), "regroom"),
+        )
+        .await;
+
+        let rapport = read_concordance(&db).await.unwrap();
+        assert_eq!(
+            accords(&rapport),
+            vec![("task-groom", FlightAgreement::Divergent { field: "issue" })],
+            "le désaccord porte sur l'issue — le premier des trois champs"
+        );
+        assert_eq!(
+            rapport.consecutive_concordant, 0,
+            "une ligne de non-vol que MPC contredit pèse, au lieu d'être sautée"
+        );
+        assert_eq!(
+            rapport.orphan_mpc, 0,
+            "le jugement a trouvé sa ligne de manager : le désaccord est bien apparié"
+        );
+
+        // Seconde moitié : MPC accorde, sur les trois motifs. Le même corpus à
+        // l'appariement près.
+        let db = base();
+        for (task_id, reason, motif) in [
+            (
+                "task-groom",
+                NotFlightReason::GroomCompleted,
+                "groom_completed",
+            ),
+            (
+                "task-refus",
+                NotFlightReason::DispatchRefused,
+                "dispatch_refused",
+            ),
+            ("task-remplace", NotFlightReason::Superseded, "superseded"),
+        ] {
+            // Le terme est **dérivé** de l'étiquette, jamais retapé : un
+            // `not_a_flight` réécrit ici resterait vert pour toujours (mika#2158).
+            let terme = format!("{}:{motif}", not_a_flight_tag());
+            non_vol(&db, task_id, reason, (&terme, None, "nothing")).await;
+        }
+
+        let rapport = read_concordance(&db).await.unwrap();
+        assert_eq!(
+            accords(&rapport),
+            vec![
+                ("task-remplace", FlightAgreement::Concordant),
+                ("task-refus", FlightAgreement::Concordant),
+                ("task-groom", FlightAgreement::Concordant),
+            ],
+            "du plus récent au plus ancien, et les trois motifs s'accordent"
+        );
+        assert_eq!(
+            rapport.consecutive_concordant, 3,
+            "contrôle positif : un non-vol que MPC confirme compte comme accord"
+        );
+        assert!(
+            rapport.rows.iter().all(|r| r.issue_number == Some(2946)),
+            "le ticket se lit sur la ligne du manager : {rapport:?}"
         );
     }
 

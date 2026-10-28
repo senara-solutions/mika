@@ -38,7 +38,7 @@
 //! without an explicit Prime override captured in a follow-up plan.
 
 use super::evaluator::{
-    DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, PrStateKnowledge,
+    DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, NotFlightReason, PrStateKnowledge,
 };
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
@@ -834,6 +834,14 @@ pub(crate) fn flight_issue_label(issue: &FlightIssue) -> String {
             // La famille non classée se lit telle que le producteur l'a écrite.
             DeathCause::Unknown(family) => format!("mort — cause non classée ({family})"),
         },
+        // mika#2946 : le libellé commence par « pas un vol » parce que c'est la
+        // phrase que l'opérateur doit lire d'abord — avant mika#2946 ces lignes
+        // disaient « mort » et réclamaient une reprise à la main.
+        FlightIssue::NotAFlight { reason } => match reason {
+            NotFlightReason::GroomCompleted => "pas un vol — groom terminé".to_string(),
+            NotFlightReason::DispatchRefused => "pas un vol — dispatch refusé".to_string(),
+            NotFlightReason::Superseded => "pas un vol — remplacé".to_string(),
+        },
     }
 }
 
@@ -860,6 +868,7 @@ pub(crate) fn flight_recommendation_label(r: FlightRecommendation) -> &'static s
         FlightRecommendation::MergeCandidate => "merge-candidat",
         FlightRecommendation::ManualResumption => "reprise à la main",
         FlightRecommendation::Regroom => "re-groom",
+        FlightRecommendation::Nothing => "aucune recommandation",
     }
 }
 
@@ -1097,9 +1106,9 @@ mod tests {
         );
     }
 
-    /// Les six causes de mort et les trois recommandations ont chacune leur
-    /// libellé : un `match` muet rendrait deux causes distinctes identiques à
-    /// l'écran.
+    /// Les six causes de mort, les trois motifs de non-vol et les quatre
+    /// recommandations ont chacun leur libellé : un `match` muet rendrait deux
+    /// causes distinctes identiques à l'écran.
     #[test]
     fn mika2698_chaque_cause_et_chaque_recommandation_a_son_libelle() {
         let causes = [
@@ -1119,10 +1128,37 @@ mod tests {
         for (cause, expected) in causes {
             assert_eq!(flight_issue_label(&FlightIssue::Dead { cause }), expected);
         }
+        // mika#2946 : les trois motifs de non-vol. Chacun a son libellé parce
+        // que c'est le motif que l'opérateur doit lire pour savoir s'il a
+        // quelque chose à faire ailleurs — un groom terminé est un succès, un
+        // dispatch refusé attend un groom, un remplacement n'attend rien.
+        let non_vols = [
+            (
+                NotFlightReason::GroomCompleted,
+                "pas un vol — groom terminé",
+            ),
+            (
+                NotFlightReason::DispatchRefused,
+                "pas un vol — dispatch refusé",
+            ),
+            (NotFlightReason::Superseded, "pas un vol — remplacé"),
+        ];
+        for (reason, expected) in non_vols {
+            assert_eq!(
+                flight_issue_label(&FlightIssue::NotAFlight { reason }),
+                expected
+            );
+            assert!(
+                !flight_issue_label(&FlightIssue::NotAFlight { reason }).contains("mort"),
+                "une ligne de non-vol ne dit jamais « mort » : c'est le défaut \
+                 que mika#2946 ferme, et il se lit d'abord à l'écran"
+            );
+        }
         let recos = [
             (FlightRecommendation::MergeCandidate, "merge-candidat"),
             (FlightRecommendation::ManualResumption, "reprise à la main"),
             (FlightRecommendation::Regroom, "re-groom"),
+            (FlightRecommendation::Nothing, "aucune recommandation"),
         ];
         for (r, expected) in recos {
             assert_eq!(flight_recommendation_label(r), expected);

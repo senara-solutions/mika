@@ -59,6 +59,37 @@ pub enum FlightIssue {
     },
     /// Aucune PR. La cause est nommée, jamais avalée.
     Dead { cause: DeathCause },
+    /// **Ce n'est pas un vol d'implémentation** (mika#2946). La tâche est
+    /// terminée, elle est bien passée par la boucle, mais ce qu'elle a terminé
+    /// n'est pas une implémentation : un groom, ou une enveloppe de dispatch que
+    /// la porte a refusée ou qu'un dispatch frais a remplacée.
+    ///
+    /// Elle reste **rendue**, et c'est la décision du plan : un vol filtré est
+    /// un silence indistinguable d'un vol absent (classe mika#2205, motif
+    /// mika#2331), et le compte de concordance a besoin que la ligne existe
+    /// pour que MPC puisse la contredire (AC3).
+    NotAFlight { reason: NotFlightReason },
+}
+
+/// Pourquoi cette tâche terminée n'est pas un vol d'implémentation (mika#2946).
+///
+/// Énumération **fermée** : chaque motif correspond à un fait qu'un producteur
+/// unique a écrit dans `tasks.result`, pas à une heuristique. Élargir la famille
+/// — `ISSUE_CLOSED_UPSTREAM`, `UPSTREAM_PR_MERGED`,
+/// `UPSTREAM_PR_CLOSED_UNMERGED` — demande d'ajouter la variante ici, donc de
+/// décider par écrit, jamais de laisser un joker absorber le cas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotFlightReason {
+    /// Un groom qui a convergé — [`crate::task_state::tasks::GROOM_SUCCESS_MARKER`]
+    /// en position de ligne, lu par son lecteur unique.
+    GroomCompleted,
+    /// Une enveloppe `ready-label` refusée par la porte des marqueurs de
+    /// grooming — [`crate::task_state::tasks::DISPATCH_NO_GROOMING_MARKER`].
+    DispatchRefused,
+    /// Une ligne de tracking annulée parce qu'un dispatch frais l'a remplacée —
+    /// [`crate::task_state::tasks::SUPERSEDED_BY_NEW_DISPATCH`].
+    Superseded,
 }
 
 /// Pourquoi un vol est mort, dans les termes que le producteur écrit.
@@ -123,6 +154,16 @@ pub enum FlightRecommendation {
     ManualResumption,
     /// Rien d'exploitable n'est sorti : le ticket doit repasser au grooming.
     Regroom,
+    /// **Rien à recommander** (mika#2946) : la tâche n'est pas un vol
+    /// d'implémentation, donc aucun geste n'est dû sur elle.
+    ///
+    /// Une variante, et pas un `Option<FlightRecommendation>` : le champ
+    /// [`FlightVerdict::recommendation`] est non optionnel, sérialisé par
+    /// `VerdictRecord`, traduit par `VerdictTerms`, reconstruit par
+    /// `parse_judgment_terms` et exigé par `--recommendation`. Un `Option`
+    /// rippellerait sur cinq sites **et** fondrait « rien à recommander » dans
+    /// « recommandation absente » — deux populations sous un nom (mika#2205).
+    Nothing,
 }
 
 /// Le verdict structuré d'un vol terminé.
@@ -344,11 +385,22 @@ fn recommend(issue: &FlightIssue, pr_state: &PrStateKnowledge) -> FlightRecommen
                 FlightRecommendation::ManualResumption
             }
         },
+        // mika#2946 : la tâche n'est pas un vol, donc le manager ne recommande
+        // rien. C'est le défaut que ce ticket ferme — ces huit lignes
+        // recommandaient « reprise à la main » sur des vols qui n'ont jamais
+        // existé.
+        FlightIssue::NotAFlight { .. } => FlightRecommendation::Nothing,
     }
 }
 
 /// Quelle issue `tasks.result` décrit.
 fn classify_issue(result: &str, pilot: &PilotFields) -> FlightIssue {
+    // mika#2946 — en TÊTE, avant toute lecture d'`Outcome:`. L'ordre est la
+    // décision : `death_cause` a un bras attrape-tout (`Unknown`), donc tout
+    // test placé après lui est inatteignable pour les trois formes ci-dessous.
+    if let Some(reason) = not_a_flight_reason(result) {
+        return FlightIssue::NotAFlight { reason };
+    }
     let outcome = line_value(result, "Outcome:").and_then(|v| v.split_whitespace().next());
     let (number, url) = pr_reference(result, pilot);
     match outcome {
@@ -362,6 +414,63 @@ fn classify_issue(result: &str, pilot: &PilotFields) -> FlightIssue {
             cause: death_cause(result, outcome),
         },
     }
+}
+
+/// Cette tâche terminée est-elle autre chose qu'un vol d'implémentation ?
+/// (mika#2946)
+///
+/// Fonction **pure**, un seul argument : les trois faits se lisent dans
+/// `tasks.result` et nulle part ailleurs. `PilotFields` n'y entre pas — le plan
+/// l'avait esquissée en second paramètre, mais aucune des trois formes ne
+/// consulte les métadonnées du pilote, et un paramètre inutilisé laisse croire
+/// à une dépendance qui n'existe pas.
+///
+/// # Les trois faits, et par quel lecteur
+///
+/// 1. **Groom convergé.** `Outcome: PLAN_GROOMED` est un jeton canonique de
+///    classe B dont [`crate::task_state::tasks::groom_result_convergence`] est le
+///    lecteur **unique** (mika#2590) : ce module l'appelle et ne nomme jamais le
+///    marqueur. Seul [`crate::task_state::tasks::GroomConvergence::Converged`]
+///    compte — un `MarkerOutOfPosition` est le JSON d'auto-skip qui *cite* le
+///    marqueur sans l'ancrer (les 651 caractères que mika#2590 a dû refuser), et
+///    il reste classé exactement comme aujourd'hui.
+/// 2. **Refus au dispatch.** Lecture d'un **champ** de l'enveloppe JSON —
+///    `"error"` — jamais un `contains` sur le corps du `result` : le texte de
+///    `recovery` et celui de `reason` parlent tous deux du grooming, et une
+///    sous-chaîne y trouverait ce qu'elle cherche dans une phrase qui explique
+///    le contraire (classe mika#2050 / mika#2590).
+/// 3. **Remplacé.** `tasks.result` vaut exactement
+///    [`crate::task_state::tasks::SUPERSEDED_BY_NEW_DISPATCH`], écrit par
+///    `Database::cancel_task_superseded` et par personne d'autre.
+fn not_a_flight_reason(result: &str) -> Option<NotFlightReason> {
+    use crate::task_state::tasks::{
+        DISPATCH_NO_GROOMING_MARKER, SUPERSEDED_BY_NEW_DISPATCH, groom_result_convergence,
+    };
+
+    if groom_result_convergence(result).is_converged() {
+        return Some(NotFlightReason::GroomCompleted);
+    }
+    if envelope_error_is(result, DISPATCH_NO_GROOMING_MARKER) {
+        return Some(NotFlightReason::DispatchRefused);
+    }
+    if result.trim() == SUPERSEDED_BY_NEW_DISPATCH {
+        return Some(NotFlightReason::Superseded);
+    }
+    None
+}
+
+/// Le `result` est-il une enveloppe JSON dont le champ `"error"` vaut
+/// exactement `token` ?
+///
+/// Un **champ**, et pas une sous-chaîne : c'est tout l'objet de cette fonction.
+/// Faux dès que le `result` n'est pas un objet JSON, ou que `error` est absent,
+/// n'est pas une chaîne, ou dit autre chose.
+fn envelope_error_is(result: &str, token: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("error")?.as_str())
+        == Some(token)
 }
 
 /// Vrai quand la halte observée est `budget_exhausted` — la famille que
@@ -706,18 +815,35 @@ mod tests {
 
     // ---- Les causes de mort, une par forme du producteur -----------------
 
-    fn dead_cause_of(result: &str) -> DeathCause {
+    /// Le verdict d'un `result` nu — ni métadonnées, ni sous-ticket apparié : la
+    /// forme minimale où la seule variable est ce que le producteur a écrit.
+    fn verdict_of(result: &str) -> FlightVerdict {
         let f = FinishedFlight {
             task_id: "t".to_string(),
             result: Some(result.to_string()),
             ..Default::default()
         };
-        match evaluate_flight(&f, None, &PrStateKnowledge::NotRead).issue {
+        evaluate_flight(&f, None, &PrStateKnowledge::NotRead)
+    }
+
+    fn dead_cause_of(result: &str) -> DeathCause {
+        match verdict_of(result).issue {
             FlightIssue::Dead { cause } => cause,
             other => panic!("attendu mort, obtenu {other:?}"),
         }
     }
 
+    /// Chaque forme du producteur, et la cause qu'elle porte.
+    ///
+    /// **Depuis mika#2946 cette population est plus étroite qu'elle n'en a
+    /// l'air** : trois formes — un groom convergé, une enveloppe de dispatch
+    /// refusée, une ligne remplacée — n'entrent plus dans [`death_cause`] du
+    /// tout, parce que [`classify_issue`] les écarte en tête. Elles tombaient
+    /// ici, dans `Unknown("PLAN_GROOMED")` et `Unknown("no_outcome_line")`, et
+    /// c'est le défaut que ce ticket ferme. Leur classement est asséré par
+    /// `mika2946_un_groom_un_refus_et_un_remplacement_ne_sont_pas_des_vols` ; ce
+    /// qui reste tenu **ici** est que les deux `Unknown` restent atteignables
+    /// pour tout le reste, car un prédicat trop large en amont les viderait.
     #[test]
     fn mika2698_chaque_forme_du_producteur_a_sa_cause_de_mort() {
         assert_eq!(
@@ -797,6 +923,161 @@ mod tests {
         assert_eq!(v.recommendation, FlightRecommendation::ManualResumption);
     }
 
+    // ---- mika#2946 : ce qui n'est pas un vol, et ce qui en est un ---------
+
+    /// **AC1 et AC2, dans le même test.** Les trois formes qui ne sont pas des
+    /// vols d'implémentation sont classées à part et ne recommandent rien ; les
+    /// trois morts réelles restent des morts, avec leur cause et leur
+    /// recommandation.
+    ///
+    /// Le contrôle négatif est **ici**, et pas dans un test voisin, parce que
+    /// c'est l'écart qui est la propriété. [`not_a_flight_reason`] est consulté
+    /// en tête de [`classify_issue`], donc un prédicat trop large y requalifie
+    /// en non-vol des morts que plus personne ne reprendrait à la main — le
+    /// défaut de mika#2946 retourné, et un test qui ne regarderait que la
+    /// première moitié resterait vert pendant tout ce temps.
+    ///
+    /// Les trois jetons sont **repris de leurs producteurs**, jamais retapés :
+    /// les deux bouts de chacun sont les deux moitiés d'un même fait, et un
+    /// littéral recopié ici divergerait en silence le jour où le producteur
+    /// bouge (mika#2158). C'est un emprunt de fixture et non un second lecteur :
+    /// la décision reste chez [`not_a_flight_reason`] et, pour le groom, chez
+    /// [`crate::task_state::tasks::groom_result_convergence`].
+    #[test]
+    fn mika2946_un_groom_un_refus_et_un_remplacement_ne_sont_pas_des_vols() {
+        use crate::task_state::tasks::{
+            DISPATCH_NO_GROOMING_MARKER, GROOM_SUCCESS_MARKER, SUPERSEDED_BY_NEW_DISPATCH,
+        };
+
+        // --- AC1 : les trois formes, au format de leurs producteurs ---------
+
+        // Un groom convergé : depuis mika#2590 U5a la ligne est posée par
+        // `_set_outcome_line`, donc elle est ancrée en début de ligne.
+        let groom = format!(
+            "Session: d4533d9b\n\
+             Turns: 37\n\
+             {GROOM_SUCCESS_MARKER} — docs/plans/2026-10-28-002-x-plan.md\n"
+        );
+        // L'enveloppe que `evaluate_grooming_gate` écrit sur refus. Sa prose
+        // parle du grooming de bout en bout — `recovery` comme `reason` — donc
+        // une lecture par sous-chaîne y trouverait ce qu'elle cherche dans une
+        // phrase qui dit le contraire (classe mika#2050).
+        let refus = serde_json::json!({
+            "error": DISPATCH_NO_GROOMING_MARKER,
+            "task_id": "45dd5b15",
+            "issue": "senara-solutions/mika#2943",
+            "missing_signals": ["branch_callout"],
+            "recovery": "Dispatch dev-groom first so the autonomous loop \
+                         produces the canonical callout block.",
+            "reason": "Cannot dispatch dev-pilot on ticket #2943: issue body is \
+                       missing one or more grooming-marker signals.",
+        })
+        .to_string();
+
+        for (result, reason) in [
+            (groom.as_str(), NotFlightReason::GroomCompleted),
+            (refus.as_str(), NotFlightReason::DispatchRefused),
+            (SUPERSEDED_BY_NEW_DISPATCH, NotFlightReason::Superseded),
+        ] {
+            let v = verdict_of(result);
+            assert_eq!(
+                v.issue,
+                FlightIssue::NotAFlight { reason },
+                "ce n'est pas un vol : {result:?}"
+            );
+            assert_eq!(
+                v.recommendation,
+                FlightRecommendation::Nothing,
+                "et le manager ne recommande donc rien : {result:?}"
+            );
+        }
+
+        // --- AC2 : le contrôle négatif, trois morts qui restent des morts ---
+
+        for (result, cause, recommandation) in [
+            (
+                "PIPELINE FAILURE: pilot halted\n\
+                 Halt class: budget_exhausted — deterministic\n\
+                 Commits: 0\n\
+                 NO_PR: no_branch_pushed\n\
+                 Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n",
+                DeathCause::CeilingReached,
+                FlightRecommendation::Regroom,
+            ),
+            (
+                "STRUCTURAL VIOLATION: le plan demande un second lecteur\n\
+                 Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n",
+                DeathCause::Refusal,
+                FlightRecommendation::Regroom,
+            ),
+            (
+                "PIPELINE FAILURE: no shipping tail\n\
+                 Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n",
+                DeathCause::PipelineFailure,
+                FlightRecommendation::ManualResumption,
+            ),
+        ] {
+            let v = verdict_of(result);
+            assert_eq!(
+                v.issue,
+                FlightIssue::Dead { cause },
+                "une mort reste une mort, avec sa cause : {result:?}"
+            );
+            assert_eq!(
+                v.recommendation, recommandation,
+                "et sa recommandation : {result:?}"
+            );
+        }
+
+        // Et un vol nominal n'est pas davantage requalifié.
+        let nominal = evaluate_flight(&fixture_pr_opened(), None, &PrStateKnowledge::NotRead);
+        assert!(
+            matches!(nominal.issue, FlightIssue::PrOpened { .. }),
+            "une PR ouverte reste une PR ouverte : {:?}",
+            nominal.issue
+        );
+    }
+
+    /// **Non-régression mika#2590 et mika#2050.** Une *mention* du jeton n'est
+    /// pas le fait : ni l'enveloppe d'auto-saut qui cite le marqueur de groom, ni
+    /// celle dont la prose nomme le jeton de refus, ne sont requalifiées en
+    /// non-vol. Les deux restent classées exactement comme avant mika#2946.
+    ///
+    /// La première est la forme des 651 caractères que mika#2590 a dû refuser ;
+    /// la seconde est pourquoi [`envelope_error_is`] lit un **champ** et non une
+    /// sous-chaîne. Dans les deux cas, remplacer le lecteur par un `contains`
+    /// ferait disparaître une mort du rapport — et sans ce test, en silence.
+    #[test]
+    fn mika2946_citer_le_jeton_ne_suffit_pas_a_sortir_du_compte() {
+        use crate::task_state::tasks::{DISPATCH_NO_GROOMING_MARKER, GROOM_SUCCESS_MARKER};
+
+        let muet = FlightIssue::Dead {
+            cause: DeathCause::Unknown("no_outcome_line".to_string()),
+        };
+
+        let auto_saut = serde_json::json!({
+            "status": "skipped",
+            "reason": format!("the issue already carries `{GROOM_SUCCESS_MARKER}` from a prior pass"),
+        })
+        .to_string();
+        assert_eq!(
+            verdict_of(&auto_saut).issue,
+            muet,
+            "le marqueur hors position ne prouve pas un groom (mika#2590)"
+        );
+
+        let autre_refus = serde_json::json!({
+            "error": "already_groomed",
+            "reason": format!("not a {DISPATCH_NO_GROOMING_MARKER} refusal: the gate was never reached"),
+        })
+        .to_string();
+        assert_eq!(
+            verdict_of(&autre_refus).issue,
+            muet,
+            "le jeton se lit dans le champ `error`, jamais dans le corps"
+        );
+    }
+
     // ---- La matrice de recommandation, exhaustivement ---------------------
 
     /// La matrice entière, les trois issues croisées avec les **trois** états de
@@ -819,6 +1100,7 @@ mod tests {
             url: None,
         };
         let dead = |c: DeathCause| FlightIssue::Dead { cause: c };
+        let non_vol = |r: NotFlightReason| FlightIssue::NotAFlight { reason: r };
         let non_lu = || PrStateKnowledge::NotRead;
 
         let cases: &[(FlightIssue, PrStateKnowledge, FlightRecommendation)] = &[
@@ -886,6 +1168,33 @@ mod tests {
                 dead(DeathCause::Unknown("x".to_string())),
                 lu(None),
                 FlightRecommendation::ManualResumption,
+            ),
+            // mika#2946 — les trois motifs de non-vol, et les deux états de
+            // connaissance qui leur sont atteignables. L'état de la PR n'entre
+            // pas dans la décision : il n'y a pas de PR, puisqu'il n'y a pas eu
+            // de vol. Les trois sont là plutôt qu'un seul parce que la
+            // recommandation est portée par la **variante** et non par le
+            // motif : un futur motif qui recommanderait autre chose doit se
+            // décider ici, pas se glisser dans le bras existant.
+            (
+                non_vol(NotFlightReason::GroomCompleted),
+                lu(None),
+                FlightRecommendation::Nothing,
+            ),
+            (
+                non_vol(NotFlightReason::GroomCompleted),
+                non_lu(),
+                FlightRecommendation::Nothing,
+            ),
+            (
+                non_vol(NotFlightReason::DispatchRefused),
+                non_lu(),
+                FlightRecommendation::Nothing,
+            ),
+            (
+                non_vol(NotFlightReason::Superseded),
+                non_lu(),
+                FlightRecommendation::Nothing,
             ),
         ];
         for (issue, pr_state, expected) in cases {

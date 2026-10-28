@@ -36,7 +36,7 @@
 //! réseau. Le marqueur HTML en tête de corps n'est là que pour rendre un
 //! doublon *reconnaissable* par un humain si ce checkpoint est perdu.
 
-use super::evaluator::FlightVerdict;
+use super::evaluator::{FlightIssue, FlightVerdict};
 use super::reader::GhRunner;
 use super::reporter::render_flight_verdict;
 
@@ -104,14 +104,18 @@ pub fn render_verdict_comment(v: &FlightVerdict) -> String {
 /// Poste un commentaire de verdict par vol non encore posté, et rend les
 /// `task_id` **effectivement** postés.
 ///
-/// Les trois raisons de ne rien poster, toutes silencieuses pour l'appelant et
+/// Les quatre raisons de ne rien poster, toutes silencieuses pour l'appelant et
 /// visibles dans les logs :
 ///
 /// - `armed == false` — l'AC1. Aucun appel au runner n'est émis, pas même pour
 ///   un vol neuf ;
 /// - le vol est déjà dans `already_posted` — l'AC2, l'idempotence sur le rejeu ;
 /// - le verdict n'a pas de numéro de ticket : il n'y a aucun endroit où poster,
-///   et inventer un numéro serait pire que se taire.
+///   et inventer un numéro serait pire que se taire ;
+/// - **le verdict n'est pas celui d'un vol** (mika#2946) : commenter un groom
+///   terminé ou une enveloppe de dispatch refusée serait du bruit posé sur le
+///   ticket d'autrui. Le verdict reste **rendu** dans le rapport et **inscrit**
+///   au registre — c'est le geste d'écriture sortant, et lui seul, qui s'abstient.
 ///
 /// Un appel `gh` qui échoue **n'est pas** rendu : le vol reste donc non posté et
 /// sera retenté au cycle suivant. C'est la seule lecture honnête — marquer
@@ -140,6 +144,24 @@ pub async fn post_verdicts(
             );
             continue;
         };
+        // mika#2946 — le filtre est ici, sur l'issue, et non sur la
+        // recommandation : `Nothing` est la conséquence de `NotAFlight`, pas sa
+        // définition, et un futur vol pourrait avoir une raison de ne rien
+        // recommander sur un vol réel.
+        if let FlightIssue::NotAFlight { reason } = &v.issue {
+            tracing::warn!(
+                target: "mika::milestone_manager",
+                event = "manager_verdict_not_postable",
+                task_id = %v.task_id,
+                issue = number,
+                reason = "not_a_flight",
+                // Le motif est porté à côté de la raison, jamais fondu dedans :
+                // `reason` est le vocabulaire fermé du *refus de poster*, que
+                // l'opérateur agrège (motif mika#2205).
+                not_a_flight_reason = ?reason,
+            );
+            continue;
+        }
         let numero = number.to_string();
         let corps = render_verdict_comment(v);
         let mut args = geste_args();
@@ -375,6 +397,69 @@ mod tests {
             posted.is_empty(),
             "un échec réseau ne doit pas consommer le verdict"
         );
+    }
+
+    /// **mika#2946.** Un non-vol n'est pas commenté ; une mort l'est. Les deux
+    /// moitiés sont dans le même test parce que c'est l'écart qui est la
+    /// propriété : « zéro appel » seul serait aussi rendu par un posteur qui ne
+    /// poste plus rien du tout (classe mika#2205), et le ticket que l'évaluateur
+    /// a mal classé est un **vrai** ticket — rien, dans le numéro, l'état de la
+    /// PR ou la recommandation, ne distingue la ligne qu'il ne faut pas poster.
+    ///
+    /// Les trois motifs sont là plutôt qu'un seul : le filtre est sur la
+    /// **variante**, donc un futur motif entre dans le refus sans qu'on le
+    /// décide, et c'est ici que ce défaut-là se verrait.
+    #[tokio::test]
+    async fn mika2946_un_non_vol_nest_pas_commente_une_mort_lest() {
+        use crate::milestone_manager::evaluator::{DeathCause, NotFlightReason};
+
+        let non_vol = |task_id: &str, reason| FlightVerdict {
+            issue: FlightIssue::NotAFlight { reason },
+            recommendation: FlightRecommendation::Nothing,
+            ..verdict(task_id, Some(2946))
+        };
+
+        let runner = RunnerEnregistreur::default();
+        let posted = post_verdicts(
+            true,
+            &runner,
+            "senara-solutions/mika",
+            &[
+                non_vol("t-groom", NotFlightReason::GroomCompleted),
+                non_vol("t-refus", NotFlightReason::DispatchRefused),
+                non_vol("t-remplace", NotFlightReason::Superseded),
+            ],
+            &[],
+        )
+        .await;
+        assert!(
+            posted.is_empty(),
+            "aucun non-vol ne doit être marqué comme posté : {posted:?}"
+        );
+        assert!(
+            runner.appels().is_empty(),
+            "le ticket d'un non-vol ne reçoit aucun commentaire, vu : {:?}",
+            runner.appels()
+        );
+
+        // Le contrôle positif : même fixture, même ticket, même absence de PR —
+        // seule l'issue change, et la mort passe.
+        let runner = RunnerEnregistreur::default();
+        let mort = FlightVerdict {
+            issue: FlightIssue::Dead {
+                cause: DeathCause::PipelineFailure,
+            },
+            recommendation: FlightRecommendation::ManualResumption,
+            ..verdict("t-mort", Some(2946))
+        };
+        let posted = post_verdicts(true, &runner, "senara-solutions/mika", &[mort], &[]).await;
+        assert_eq!(
+            posted,
+            vec!["t-mort".to_string()],
+            "une mort réelle reste postable : c'est la reprise à la main que le \
+             manager doit réclamer"
+        );
+        assert_eq!(runner.appels().len(), 1, "{:?}", runner.appels());
     }
 
     /// Le commentaire et le rapport disent la même phrase, par construction.
