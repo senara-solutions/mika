@@ -530,6 +530,169 @@ fn mika2886_un_enfant_hors_population_nest_pas_lu() {
     );
 }
 
+/// **mika#2951 — la quantité que la sonde publie, et la population qu'elle
+/// sépare.**
+///
+/// Trois parentes dans une seule base, les trois terminales, les trois sur le
+/// dépôt interrogé — et une seule ajournée :
+///
+/// 1. un groom relancé dont le pilote d'implémentation **vole encore** :
+///    `pending_implement` vrai, c'est la ligne que `flight_source` retient et
+///    que la sonde compte ;
+/// 2. un groom **pur**, sans implémentation relancée : rien à attendre, donc
+///    faux ;
+/// 3. un groom relancé dont l'implémentation a **fini** : plus rien à attendre,
+///    donc faux aussi.
+///
+/// Les deux derniers sont ce qui fait de ce test une mesure plutôt qu'une
+/// tautologie : un `pending_implement` câblé à « la parente a un enfant groom »
+/// passerait le premier cas et rougirait sur les deux autres.
+///
+/// La sonde elle-même vit chez le lecteur unique du type
+/// ([`crate::flight_source`]) — ce que ce test fixe est le **fait** qu'elle
+/// rapporte, à la source où il est calculé. Un décompte juste ici et une sonde
+/// muette là-bas resteraient deux défauts distincts ; celui-là est tenu par le
+/// fait que la sonde s'émet à chaque lecture, zéro compris.
+#[test]
+fn mika2951_la_sonde_compte_les_parentes_ajournees() {
+    const GROOM: &str = "Outcome: PLAN_GROOMED\nTurns: 44\n";
+    const PR: &str = "Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2947\n";
+
+    let db = db();
+    let seme = |url: String, implementation| {
+        seme_un_groom_puis_un_implement(
+            &db,
+            "mika-dev",
+            &VolDeGroomRelance {
+                url_du_ticket: &url,
+                issue_du_groom: GROOM,
+                implementation,
+                regroom_posterieur: None,
+            },
+        )
+    };
+
+    let en_vol = seme(issue_url(TICKET), Implementation::EnVol);
+    let pur = seme(issue_url(AUTRE_TICKET), Implementation::Absente);
+    let fini = seme(issue_url_sur(REPO, 2948), Implementation::Terminee(PR));
+
+    assert!(
+        en_vol.implementation.is_some() && pur.implementation.is_none(),
+        "le semis doit avoir produit les trois formes : en vol {:?}, pur {:?}",
+        en_vol.implementation,
+        pur.implementation
+    );
+
+    let lignes = lire_lignes(&db);
+    assert_eq!(lignes.len(), 3, "les trois parentes sont terminales");
+    let ajournee = |id: &str| -> bool {
+        lignes
+            .iter()
+            .find(|l| l.flight.id == id)
+            .unwrap_or_else(|| panic!("la parente {id} doit être lue"))
+            .pending_implement
+    };
+
+    assert!(
+        ajournee(&en_vol.parente),
+        "un pilote d'implémentation en vol ajourne sa parente"
+    );
+    assert!(
+        !ajournee(&pur.parente),
+        "un groom pur n'attend aucune implémentation — il n'a pas d'enfant {:?} \
+         à attendre",
+        pur.groom
+    );
+    assert!(
+        !ajournee(&fini.parente),
+        "une implémentation terminée n'ajourne plus rien"
+    );
+
+    assert_eq!(
+        lignes.iter().filter(|l| l.pending_implement).count(),
+        1,
+        "la quantité que la sonde publie : une parente ajournée sur trois"
+    );
+}
+
+/// **Une parente ajournée revient dans la fenêtre du cycle suivant.** C'est la
+/// moitié de mika#2951 sans laquelle l'ajournement serait un oubli définitif :
+/// le `completed_at` d'une parente de groom est l'heure de fin du *groom* et ne
+/// bouge plus jamais, alors que le cycle qui vient de l'ajourner avance
+/// `last_observed_at` au-delà.
+///
+/// Les horodatages ne sont pas choisis, ils sont **mesurés** — le premier des
+/// trois vols du tableau de mika#2951 : groom fini à 12:28:08Z (`completed_at`
+/// de la parente), cycle d'ajournement à 12:31:59Z (la ligne prématurée du
+/// registre), pilote d'implémentation fini à 13:20:48Z. Avec une borne portée
+/// sur la seule parente, le cycle suivant cherche au-delà de 12:31:59Z et ne
+/// rend plus rien : AC1 tenu, AC4 jamais.
+///
+/// Le contrôle négatif est dans le même test, et il est ce qui sépare « la
+/// disjonction fonctionne » de « la borne a été retirée » : un groom pur, dont
+/// ni la parente ni l'enfant n'ont bougé après la borne, reste **hors**
+/// fenêtre.
+#[test]
+fn mika2951_une_parente_ajournee_repasse_la_borne_quand_son_implement_finit() {
+    const GROOM: &str = "Outcome: PLAN_GROOMED\nTurns: 44\n";
+    const PR: &str = "Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2947\n";
+
+    /// L'heure du cycle qui a ajourné la parente — postérieure à la fin du
+    /// groom, antérieure à la fin de l'implémentation.
+    const CYCLE_DAJOURNEMENT: &str = "2026-10-28T12:31:59Z";
+
+    let db = db();
+    let seme = |url: String, implementation| {
+        seme_un_groom_puis_un_implement(
+            &db,
+            "mika-dev",
+            &VolDeGroomRelance {
+                url_du_ticket: &url,
+                issue_du_groom: GROOM,
+                implementation,
+                regroom_posterieur: None,
+            },
+        )
+    };
+
+    let relance = seme(issue_url(TICKET), Implementation::Terminee(PR));
+    let pur = seme(issue_url(AUTRE_TICKET), Implementation::Absente);
+
+    assert!(
+        PARENTE_FINIE_A < CYCLE_DAJOURNEMENT && CYCLE_DAJOURNEMENT < IMPLEMENT_FINI_A,
+        "la prémisse du test : la borne tombe entre la fin de la parente ({PARENTE_FINIE_A}) \
+         et celle de l'implémentation ({IMPLEMENT_FINI_A})"
+    );
+
+    let lignes = db
+        .list_finished_implement_flights_in_container(Some(CYCLE_DAJOURNEMENT), &[REPO.to_string()])
+        .expect("la lecture doit répondre");
+
+    let ligne = lignes
+        .iter()
+        .find(|l| l.flight.id == relance.parente)
+        .expect(
+            "la parente ajournée doit repasser la borne : son enfant d'implémentation \
+             est devenu terminal après le cycle qui l'a ajournée",
+        );
+    assert_eq!(
+        ligne.pilot_result.as_deref(),
+        Some(PR),
+        "et elle doit être jugée sur l'issue de l'implémentation, pas sur celle du groom"
+    );
+    assert!(
+        !ligne.pending_implement,
+        "l'implémentation est terminale : plus rien à ajourner"
+    );
+
+    assert!(
+        !lignes.iter().any(|l| l.flight.id == pur.parente),
+        "contrôle négatif : un groom pur, dont rien n'a bougé après {CYCLE_DAJOURNEMENT}, \
+         reste hors fenêtre. S'il est rendu, la borne ne borne plus — la disjonction \
+         surapproche la population au lieu de rattraper les ajournées"
+    );
+}
+
 // ---- mika#2921 : le corpus des 13 vols mesurés, de la base au rapport ------
 
 /// Le milestone cible de la production le 2026-10-26

@@ -4944,6 +4944,32 @@ impl Database {
     /// qui est strictement inférieur à tout horodatage ISO 8601 : « depuis
     /// toujours », au premier cycle, et non « rien ».
     ///
+    /// **Elle porte sur la fin du VOL, pas sur celle de la parente** — une
+    /// parente passe la borne quand sa propre terminalité est postérieure à
+    /// `since` **ou** quand l'un de ses enfants l'est. Sans cette disjonction,
+    /// l'ajournement de mika#2951 serait un oubli définitif, et c'était la
+    /// moitié manquante du correctif : le `completed_at` d'une parente de groom
+    /// est l'heure de fin du *groom* et ne bouge plus jamais, alors que le
+    /// cycle qui vient de l'ajourner avance `last_observed_at` au-delà. Mesuré
+    /// sur les trois vols du 2026-10-28 : groom fini à 12:28:08Z, cycle à
+    /// 12:31:59Z, pilote d'implémentation fini à 13:20:48Z — le cycle suivant
+    /// aurait cherché au-delà de 12:31 et n'aurait plus jamais rendu cette
+    /// parente. AC1 aurait été tenu (aucun verdict prématuré) et AC4 jamais
+    /// (aucun verdict du tout) : un silence sans fin, qui est précisément la
+    /// classe que D5 du plan refuse.
+    ///
+    /// **La sous-requête surapproxime délibérément : aucun filtre de label.**
+    /// Un enfant quelconque suffit à faire relire la parente. C'est voulu à
+    /// deux titres. D'abord parce que les filtres fins vivent en Rust
+    /// ([`crate::task_engine::engine::is_pilot_dispatch_label`] en est le
+    /// lecteur unique) et qu'une clause `IN` ici en ferait une seconde source
+    /// de vérité — le refus que le commentaire de l'agrégation ci-dessous
+    /// écrit en propre. Ensuite parce que les deux erreurs ne coûtent pas le
+    /// même prix : **surapprocher ne produit aucune fausseté** (la parente est
+    /// relue, les filtres Rust concluent juste, et `write_and_swallow` est
+    /// idempotent, donc au pire une ligne de rapport), tandis que
+    /// sous-approcher perd le vol pour toujours.
+    ///
     /// **Le statut terminal se filtre en Rust**, par
     /// [`crate::task_state::tasks::is_terminal_task_status`], et pas dans le SQL.
     /// Ce serait une troisième copie de la liste, dans un dialecte où sa règle
@@ -4978,6 +5004,27 @@ impl Database {
     /// requête par vol serait un N+1 sur le chemin du cycle), et le résultat
     /// est rendu dans [`FinishedFlightRow`] — deux champs parce que les deux
     /// données viennent de deux lignes.
+    ///
+    /// **Une parente terminale n'est pas un vol terminé** (mika#2951). Depuis
+    /// mika#1614 le moteur relance le pilote d'implémentation **sur la row de la
+    /// parente de groom**, qui est passée `completed` à la fin du groom : la
+    /// terminalité de la parente est donc l'heure de fin du *groom*, pas celle
+    /// du vol. La requête 2 rapporte les deux faits que cette ambiguïté
+    /// demande — l'issue de l'enfant d'implémentation quand il y en a une
+    /// (`pilot_result`, la **classe** primant la récence), et le fait qu'un tel
+    /// enfant vole encore (`pending_implement`).
+    ///
+    /// Cette lecture repose sur **une propriété d'ordonnancement** qui lui est
+    /// extérieure : l'enfant d'implémentation est créé *avant* que la parente
+    /// devienne terminale. Elle tient parce que `deliver_callback` appelle
+    /// `try_complete_parent_on_callback_success` **avant**
+    /// `try_dispatch_pilot_after_groom_success`, et qu'un callback de groom ne
+    /// porte pas de `pr_url` — donc la première est un no-op sur cette parente,
+    /// qui reste `in_progress` jusqu'à ce que l'enfant existe. Si l'ordre
+    /// s'inversait, il y aurait une fenêtre où la parente est terminale sans
+    /// enfant d'implémentation : elle serait jugée sur son groom, exactement le
+    /// défaut d'aujourd'hui. L'ordre est épinglé par
+    /// `task_engine::engine::tests::mika2951_la_parente_devient_terminale_apres_la_naissance_de_lenfant_dimplementation`.
     pub fn list_finished_implement_flights_in_container(
         &self,
         since: Option<&str>,
@@ -4997,14 +5044,33 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(" OR ")
         };
+        // La borne temporelle, écrite **une fois** et portée sur le préfixe de
+        // table que chaque requête nomme — `tasks.` pour la 1, `parent.` pour la
+        // 2. Les deux doivent border à l'identique : la 1 décide quelle parente
+        // est lue, la 2 va chercher ses enfants, et une parente rendue sans ses
+        // enfants serait jugée sur un `pilot_result` vide.
+        //
+        // La qualification n'est pas cosmétique : non qualifié, `id` dans le
+        // `EXISTS` se résoudrait sur `enfant.id` — la sous-requête corrélée
+        // deviendrait une tautologie et la borne ne bornerait plus rien.
+        let predicat_borne = |prefixe: &str| -> String {
+            format!(
+                "(COALESCE({prefixe}completed_at, {prefixe}updated_at) > ?1
+                   OR EXISTS (SELECT 1 FROM tasks enfant
+                               WHERE enfant.parent_task_id = {prefixe}id
+                                 AND COALESCE(enfant.completed_at, \
+                                              enfant.updated_at) > ?1))"
+            )
+        };
         let clause = predicat_depot("reference_url");
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE COALESCE(dispatch_class, 'implement') = 'implement'
                AND ({clause})
-               AND COALESCE(completed_at, updated_at) > ?1
+               AND {}
              ORDER BY COALESCE(completed_at, updated_at) ASC",
             Self::TASK_COLUMNS,
+            predicat_borne("tasks."),
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -5049,7 +5115,8 @@ impl Database {
              JOIN tasks parent ON child.parent_task_id = parent.id
              WHERE COALESCE(parent.dispatch_class, 'implement') = 'implement'
                AND ({clause_parente})
-               AND COALESCE(parent.completed_at, parent.updated_at) > ?1"
+               AND {}",
+            predicat_borne("parent."),
         );
         let mut stmt = self.conn.prepare(&sql_enfants)?;
         let enfants: Vec<Task> = stmt
@@ -5066,38 +5133,61 @@ impl Database {
             )
         }
 
-        // Les trois filtres vivent en **Rust**, jamais en SQL.
+        /// Ce qu'on retient des enfants d'**une** parente : la dernière issue de
+        /// chaque classe, et le fait qu'une implémentation vole encore.
+        #[derive(Default)]
+        struct Enfants {
+            dernier_implement: Option<Task>,
+            dernier_groom: Option<Task>,
+            implement_en_vol: bool,
+        }
+
+        // Les filtres vivent en **Rust**, jamais en SQL.
         //
         // - **population** : `is_pilot_dispatch_label` est le lecteur unique de
         //   la liste des labels de pilote. La recopier dans une clause `IN`
         //   serait une seconde source de vérité, et `long_running:build_mika`
         //   s'y glisserait au premier élargissement.
+        // - **classe** : `is_implement_pilot_label` sépare le pilote
+        //   d'implémentation du pilote de groom. Son doc-comment porte le
+        //   pourquoi de ce discriminant-là (mika#2951).
         // - **vivacité** : `is_terminal_task_status`, même raison que la
         //   requête 1 ci-dessus — sa règle « un statut inconnu n'est pas
         //   terminal » ne se lit pas dans un `IN` SQL.
         // - **contenu** : un `result` présent **et** non vide. Un enfant
         //   terminé sans texte ne dit rien, et le dire quand même écraserait un
         //   enfant antérieur qui, lui, parlait.
-        let mut derniers: std::collections::HashMap<String, Task> =
+        let mut par_parente: std::collections::HashMap<String, Enfants> =
             std::collections::HashMap::new();
         for enfant in enfants {
             if !crate::task_engine::engine::is_pilot_dispatch_label(&enfant.label) {
                 continue;
             }
+            let Some(parente_id) = enfant.parent_task_id.clone() else {
+                continue;
+            };
+            let implement = crate::task_engine::engine::is_implement_pilot_label(&enfant.label);
+            let etat = par_parente.entry(parente_id).or_default();
+
             if !crate::task_state::tasks::is_terminal_task_status(&enfant.status) {
+                // Un **groom** encore en vol n'ajourne rien : la parente n'est
+                // alors pas terminale non plus, donc la requête 1 ne l'a pas
+                // retenue. C'est l'implémentation qui survit à la terminalité
+                // de sa parente (mika#1614), et elle seule.
+                etat.implement_en_vol |= implement;
                 continue;
             }
             if enfant.result.as_deref().unwrap_or("").is_empty() {
                 continue;
             }
-            let Some(parente_id) = enfant.parent_task_id.clone() else {
-                continue;
+            let tenant = if implement {
+                &mut etat.dernier_implement
+            } else {
+                &mut etat.dernier_groom
             };
-            match derniers.get(&parente_id) {
-                Some(tenant) if recence(tenant) >= recence(&enfant) => {}
-                _ => {
-                    derniers.insert(parente_id, enfant);
-                }
+            match tenant {
+                Some(t) if recence(t) >= recence(&enfant) => {}
+                _ => *tenant = Some(enfant),
             }
         }
 
@@ -5105,9 +5195,20 @@ impl Database {
         // parentes. La seconde requête enrichit, elle ne réordonne pas.
         Ok(flights
             .into_iter()
-            .map(|flight| FinishedFlightRow {
-                pilot_result: derniers.remove(&flight.id).and_then(|e| e.result),
-                flight,
+            .map(|flight| {
+                let etat = par_parente.remove(&flight.id).unwrap_or_default();
+                FinishedFlightRow {
+                    // **La classe prime, jamais la récence** (mika#2951). Un
+                    // re-groom postérieur à l'implémentation ne reprend pas la
+                    // main : « le plus récent » est exactement la moitié du
+                    // défaut que ce ticket corrige.
+                    pilot_result: etat
+                        .dernier_implement
+                        .or(etat.dernier_groom)
+                        .and_then(|e| e.result),
+                    pending_implement: etat.implement_en_vol,
+                    flight,
+                }
             })
             .collect())
     }
@@ -5125,7 +5226,20 @@ pub struct FinishedFlightRow {
     pub flight: crate::task_state::tasks::Task,
     /// `None` quand le vol n'a aucun enfant pilote terminé portant un
     /// `result` — jamais une chaîne vide (motif mika#2331 : absent ≠ vide).
+    ///
+    /// Quand les deux classes d'enfant ont parlé, c'est **l'implémentation**
+    /// qui est portée, quelle que soit la date du groom (mika#2951).
     pub pilot_result: Option<String>,
+    /// mika#2951 — un enfant d'implémentation est encore en vol sous cette
+    /// parente : elle est terminale (mika#1614 la réutilise), le vol ne l'est
+    /// pas.
+    ///
+    /// **Cette couche rapporte, elle ne filtre pas.** Un `SELECT` qui aurait
+    /// écarté la ligne ici rendrait « vol ajourné » et « aucun vol » en octets
+    /// identiques (classe mika#2205), et l'ajournement ne serait mesurable par
+    /// personne. La décision de ne pas juger, et la sonde qui la dit, vivent
+    /// chez le lecteur unique de ce type — [`crate::flight_source`].
+    pub pending_implement: bool,
 }
 
 /// Le motif `LIKE` qui reconnaît **toute** URL d'issue d'un dépôt (mika#2921).
