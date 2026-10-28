@@ -436,4 +436,51 @@ mod tests {
             },
         }
     }
+
+    // -- mika#2952 : un vol déjà livré n'est pas une relève à grommer
+
+    /// La seconde moitié d'**AC1**, au niveau du comportement.
+    ///
+    /// `remediable_by_grooming()` rend `false`, mais c'est une réponse d'enum :
+    /// elle ne devient une propriété que si `name_relief` filtre dessus. Ce test
+    /// mesure l'effet, et il échouerait si quelqu'un déplaçait le filtre après le
+    /// calcul de `beyond` — la même paire de moitiés que V4 ci-dessus.
+    ///
+    /// Contrôle positif dans le même test : les refus `NoGroomedPlan` du **même**
+    /// verdict sont nommés. Sans lui, un `name_relief` qui ne rendrait jamais
+    /// rien passerait (mika#2205).
+    #[test]
+    fn mika2952_un_vol_livre_nentre_pas_dans_la_releve_a_grommer() {
+        let v = verdict_with(vec![
+            refusal(2900, CandidateOrigin::Milestone),
+            livre(2943),
+            refusal(2910, CandidateOrigin::Milestone),
+            livre(2946),
+            refusal(2920, CandidateOrigin::Milestone),
+            livre(2680),
+            refusal(2930, CandidateOrigin::Milestone),
+            refusal(2940, CandidateOrigin::Milestone),
+        ]);
+        let relief = name_relief(&v, &[], &[]);
+
+        assert_eq!(
+            numbers(&relief),
+            vec![2900, 2910, 2920, 2930],
+            "les trois vols livrés du corpus mesuré ne sont pas proposés à grommer"
+        );
+        assert_eq!(
+            relief.beyond, 1,
+            "`beyond` ne compte que les refus groomables restants (#2940), \
+             jamais les vols livrés"
+        );
+    }
+
+    /// Un refus `PriorPlanOnly` tel que le bassin le produit.
+    fn livre(number: u64) -> AdmissionRefusal {
+        AdmissionRefusal {
+            number,
+            origin: CandidateOrigin::Milestone,
+            reason: RefusalReason::PriorPlanOnly,
+        }
+    }
 }

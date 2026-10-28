@@ -2588,6 +2588,70 @@ mod gh_arg_capture_tests {
         assert!(!t, "une page vide n'est pas une page pleine");
     }
 
+    /// Les **deux** chemins de composition posent la même lecture sur le même
+    /// corps (mika#2952).
+    ///
+    /// Un candidat du milestone et un candidat du dehors arrivent au bassin par
+    /// deux fonctions différentes, et le bassin les juge dans la même boucle. Un
+    /// écart de lecture entre les deux origines serait la classe mika#2205
+    /// réintroduite : le même ticket serait refusé ou admis selon le chemin par
+    /// lequel il est entré, et le rapport ne dirait pas lequel.
+    ///
+    /// Le corps est celui que la porte d'auto-pull écrit — donc `PriorOnly` — et
+    /// le contrôle positif est dans le même test : un corps portant un callout
+    /// vivant rend `Live` par les deux chemins. Sans lui, deux `Absent` par
+    /// défaut passeraient pour un accord.
+    #[test]
+    fn mika2952_les_deux_chemins_de_composition_posent_la_meme_lecture() {
+        use crate::plan_callout::PlanReading;
+
+        let livre = "> Plan antérieur : `docs/plans/2026-10-27-001-fix-2943-plan.md` — \
+                     la branche `fix/2943/x` a été supprimée par le merge de #2945.";
+        let vivant = "> - **Plan:** `docs/plans/2026-10-28-009-feat-x-plan.md`";
+
+        for (corps, attendu) in [(livre, PlanReading::PriorOnly), (vivant, PlanReading::Live)] {
+            let body = serde_json::to_string(corps).expect("un corps s'échappe en JSON");
+
+            // Chemin A — le milestone, par `compose_from_gh_outputs`.
+            let issues_json = format!(
+                r#"[{{"number": 2943, "title": "t", "state": "OPEN", "body": {body},
+                      "labels": [{{"name":"p1-important"}}],
+                      "updatedAt": "2026-10-28T00:00:00Z"}}]"#
+            );
+            let r = MilestoneRef {
+                repo: "senara-solutions/mika".into(),
+                number: 33,
+            };
+            let state = compose_from_gh_outputs(
+                &r,
+                r#"{"title": "m", "description": "", "state": "open",
+                    "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#,
+                &issues_json,
+                "[]",
+            )
+            .expect("une sortie gh valide se compose");
+            let du_milestone = state.sub_issues[0].plan_reading;
+
+            // Chemin B — le dehors, par `compose_outside_candidates`.
+            let outside_json =
+                format!(r#"[{{"number": 2943, "state": "OPEN", "body": {body}, "labels": []}}]"#);
+            let (cands, _) =
+                compose_outside_candidates(&outside_json, &[]).expect("idem pour le dehors");
+            let du_dehors = cands[0].plan_reading;
+
+            assert_eq!(
+                du_milestone,
+                Some(attendu),
+                "le chemin du milestone doit lire {attendu:?}"
+            );
+            assert_eq!(
+                du_dehors, du_milestone,
+                "les deux origines lisent le même corps : un écart serait \
+                 un verdict dépendant du chemin d'entrée"
+            );
+        }
+    }
+
     /// Cas 13 — une page pleine vide l'ensemble et le **déclare**.
     ///
     /// C'est le contrôle négatif de la garde : sans elle, le manager
