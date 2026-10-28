@@ -417,6 +417,25 @@ pub struct AgentOutput {
     /// everywhere else, including max-steps continuation — a turn that ran out
     /// of *steps* did produce a summary and is not this class.
     pub deadline_exceeded: Option<DeadlineOverrun>,
+    /// The turn ended because it ran out of its **tool-step budget**, not
+    /// because it concluded (mika#2943).
+    ///
+    /// Same reasoning as [`Self::deadline_exceeded`] one field above, and the
+    /// half it could not cover: a turn cut off at the step ceiling produces a
+    /// continuation text, so `text` reads exactly like an answer and the call
+    /// site saw `Concluded`. Six webhook turns of mika-qa between 2026-10-26 and
+    /// 2026-10-28 ended that way, each leaving its PR unreviewed and silent.
+    ///
+    /// `Some` **only** on the "continuation performed" exit of the
+    /// `LoopResult::MaxStepsExceeded` arm, and only when no QA build callback was
+    /// dispatched in the turn — that callback's own net (mika#2368/#2515) carries
+    /// the verdict, so posting here would double the `hold` (AC3).
+    ///
+    /// `None` everywhere else, **including the "continuation skipped" exit** of
+    /// that same arm: it goes through `persist_deadline_fallback` and already
+    /// poses `deadline_exceeded`. The two fields are mutually exclusive by
+    /// construction — each exit of `run_loop` poses at most one.
+    pub max_steps_exceeded: Option<MaxStepsCutOff>,
     /// A `send_message` of this turn failed and nothing repaired it
     /// (mika#2136).
     ///
@@ -472,6 +491,21 @@ pub struct AgentOutput {
 pub struct DeadlineOverrun {
     /// Tool steps the loop completed before the envelope ran out. `0` when the
     /// deadline was already past before the loop was entered (prelude gate).
+    pub steps_completed: usize,
+}
+
+/// Le tour a épuisé son **budget de pas d'outil** sans conclure sur ce qu'il
+/// devait conclure (mika#2943).
+///
+/// Symétrique de [`DeadlineOverrun`], et distinct à dessein : confondre les deux
+/// ferait dire au corps du verdict « a atteint la limite de son enveloppe de
+/// temps » d'un tour qui avait encore 295 s devant lui (trace `b22e6ea0`), et
+/// couperait en deux une population que l'opérateur agrège par `cause`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxStepsCutOff {
+    /// Le plafond **servi**, transporté par `LoopResult::MaxStepsExceeded`
+    /// (mika#2926 R1b) — jamais relu depuis une constante, qui annoncerait 20
+    /// pour un tour de mika-qa qui en a consommé 30.
     pub steps_completed: usize,
 }
 
@@ -6573,6 +6607,7 @@ async fn run_agent_inner(
             usage,
             run_usage,
             deadline_exceeded: None,
+            max_steps_exceeded: None,
             undelivered_sends: undelivered,
             effective_model: effective_model_attestation,
         }),
@@ -6617,6 +6652,27 @@ async fn run_agent_inner(
                     run_usage,
                 )
                 .await;
+            }
+            // mika#2943 — le fait que mika#2276 ne pouvait pas voir : un tour
+            // coupé au plafond de pas produit un texte de continuation, donc
+            // indiscernable d'une réponse pour le call-site. Évalué AVANT la
+            // continuation, qui emprunte les summaries — exactement comme le
+            // fait `classify_delegation_from_summaries` dans le bras jumeau du
+            // team agent (mika#1671 D1/D2).
+            let build_callback_pending =
+                crate::qa_build_callback::build_callback_dispatched_in_turn(&tool_call_summaries);
+            if build_callback_pending {
+                info!(
+                    target: "mika::otel",
+                    event = "qa_max_steps_verdict_withheld",
+                    trace_id = %trace_id,
+                    session_id,
+                    max_steps,
+                    cause = "build_callback_pending",
+                    "mika#2943 : tour coupé au plafond de pas avec un dispatch de build QA \
+                     en vol — le filet de ce callback portera le verdict, aucun fait de \
+                     coupure n'est posé ici"
+                );
             }
             let cont = attempt_continuation_turn(
                 &mut request,
@@ -6663,6 +6719,11 @@ async fn run_agent_inner(
                 // Max-steps continuation, not a deadline overrun: the turn
                 // produced a summary. mika#2276's net must not fire here.
                 deadline_exceeded: None,
+                // …mais mika#2943's does, and this is its one posing site. Le
+                // plafond **servi** (`max_steps`), jamais une constante relue.
+                max_steps_exceeded: (!build_callback_pending).then_some(MaxStepsCutOff {
+                    steps_completed: max_steps,
+                }),
                 // A dead send is a dead send whether the turn concluded or ran
                 // out of steps — the continuation summary says nothing about
                 // delivery.
@@ -6751,6 +6812,10 @@ async fn persist_deadline_fallback(
         run_usage,
         // mika#2276 M2: the one place that says "cut off, not concluded".
         deadline_exceeded: Some(DeadlineOverrun { steps_completed }),
+        // The "continuation skipped" exit of the max-steps arm lands here too,
+        // and poses the field above rather than this one: mutually exclusive by
+        // construction (mika#2943 R2b).
+        max_steps_exceeded: None,
         undelivered_sends,
         effective_model,
     })
