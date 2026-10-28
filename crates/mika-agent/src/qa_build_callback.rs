@@ -402,10 +402,23 @@ pub const QA_VERDICT_REQUIRED_CORRECTION: &str = "[mika-engine] This is a build 
 /// dimensionner le suivi « poster sur quarantaine ». `match` exhaustif **sans
 /// bras `_`**, épinglé par test.
 ///
-/// Les quatre valeurs sont lues sur les clés que mika#2179 écrit déjà plus le
-/// compteur d'U3 — aucune requête de plus, aucune colonne de plus.
+/// Les cinq valeurs sont lues sur les clés que mika#2179 écrit déjà, plus le
+/// compteur d'U3 et les marques de mika#2944 — aucune requête de plus, aucune
+/// colonne de plus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UndeliveredVerdictCause {
+    /// La ligne est **retenue** parce que le crédit du fournisseur est épuisé
+    /// (mika#2944), lu par [`crate::credit_hold::is_held`].
+    ///
+    /// Distinct de `TurnFailed` et de `Quarantined`, et c'est le point de ce
+    /// cinquième bras : une retenue de crédit porte des `delivery_attempts`, et
+    /// une retenue longue finit même par porter une quarantaine — donc sans lui
+    /// la population se lirait comme « le fournisseur est en panne » ou « le
+    /// verdict est perdu », et le remède qu'on irait chercher (du backoff, de la
+    /// patience) n'aurait aucun rapport avec la panne, qui est un budget à
+    /// recharger. C'est la même séparation que `below_threshold` de
+    /// `no_ready_label_event` (mika#2131).
+    CreditHeld,
     /// `verdict_delivery_deferrals > 0` et aucune tentative de livraison : le
     /// verrou d'agent n'a jamais été gagné, le tour n'a **jamais tourné**.
     /// C'est la contention, et c'est la population que mika#2515 U3 rend
@@ -432,6 +445,7 @@ impl UndeliveredVerdictCause {
     /// Le mot de fil de cette cause. `match` exhaustif, aucun bras `_`.
     pub fn as_wire(self) -> &'static str {
         match self {
+            Self::CreditHeld => "credit_held",
             Self::AgentBusyStarvation => "agent_busy_starvation",
             Self::TurnFailed => "turn_failed",
             Self::Quarantined => "quarantined",
@@ -440,21 +454,23 @@ impl UndeliveredVerdictCause {
     }
 }
 
-/// Attribue la non-livraison d'un verdict à l'un des quatre chemins, en lisant
-/// le `metadata` de la ligne callback (mika#2515 U2a).
+/// Attribue la non-livraison d'un verdict à l'un des cinq chemins, en lisant
+/// le `metadata` de la ligne callback (mika#2515 U2a, mika#2944).
 ///
-/// **Fonction pure** : testable aux quatre bornes sans base de données, ce qui
+/// **Fonction pure** : testable aux cinq bornes sans base de données, ce qui
 /// est la seule façon de voir rougir chaque terme séparément (leçon mika#2420 —
 /// une assertion de non-vacuité est insensible aux termes qu'un autre absorbe en
 /// aval).
 ///
 /// # L'ordre des tests est porteur, et il va du plus spécifique au plus général
 ///
-/// La quarantaine **implique** des tentatives, et une tentative **implique** que
-/// le verrou a été gagné au moins une fois. Tester dans l'autre sens ferait lire
-/// une ligne quarantinée comme un simple `turn_failed`, et une ligne affamée
-/// puis enfin livrée-et-échouée comme une famine — deux attributions fausses
-/// portant l'autorité d'une mesure.
+/// La retenue de crédit **implique** des tentatives et peut impliquer une
+/// quarantaine ; la quarantaine **implique** des tentatives, et une tentative
+/// **implique** que le verrou a été gagné au moins une fois. Tester dans l'autre
+/// sens ferait lire une ligne retenue comme quarantinée, une ligne quarantinée
+/// comme un simple `turn_failed`, et une ligne affamée puis enfin
+/// livrée-et-échouée comme une famine — des attributions fausses portant
+/// l'autorité d'une mesure.
 ///
 /// # Fail-safe vers « on ne sait pas »
 ///
@@ -464,6 +480,15 @@ impl UndeliveredVerdictCause {
 /// cause avant de toucher à l'attribution. L'inverse — deviner la contention —
 /// fabriquerait le diagnostic le plus flatteur pour ce ticket.
 pub fn classify_undelivered_verdict(metadata: Option<&str>) -> UndeliveredVerdictCause {
+    // mika#2944 — testé **en premier**, parce qu'une retenue de crédit est le
+    // terme le plus spécifique : elle porte des tentatives, et une retenue
+    // longue porte en plus une quarantaine (`delivery_attempts` continue de
+    // monter sous retenue, par construction). Dans l'autre ordre, la population
+    // disparaîtrait derrière `quarantined`, qui dit « perdu » là où la vérité
+    // est « il manque du crédit ».
+    if crate::credit_hold::is_held(metadata) {
+        return UndeliveredVerdictCause::CreditHeld;
+    }
     if metadata_field_present(metadata, crate::task_engine::DELIVERY_QUARANTINED_AT_KEY) {
         return UndeliveredVerdictCause::Quarantined;
     }
@@ -958,13 +983,14 @@ mod tests {
         assert_eq!(metadata_counter(None, "delivery_attempts"), 0);
     }
 
-    /// **Format de fil** — les quatre mots de `UndeliveredVerdictCause` sont
+    /// **Format de fil** — les cinq mots de `UndeliveredVerdictCause` sont
     /// figés et deux à deux distincts : l'opérateur en fait des `GROUP BY` pour
     /// dimensionner le suivi « poster sur quarantaine ».
     #[test]
     fn mika2515_the_undelivered_cause_values_are_a_wire_format() {
         use UndeliveredVerdictCause as C;
         let all = [
+            (C::CreditHeld, "credit_held"),
             (C::AgentBusyStarvation, "agent_busy_starvation"),
             (C::TurnFailed, "turn_failed"),
             (C::Quarantined, "quarantined"),
@@ -974,7 +1000,45 @@ mod tests {
             assert_eq!(cause.as_wire(), wire);
         }
         let wires: HashSet<&str> = all.iter().map(|(c, _)| c.as_wire()).collect();
-        assert_eq!(wires.len(), 4, "quatre mots deux à deux distincts");
+        assert_eq!(wires.len(), 5, "cinq mots deux à deux distincts");
+    }
+
+    /// mika#2944 — une retenue de crédit se lit **avant** la quarantaine, et
+    /// avant les tentatives.
+    ///
+    /// Les deux premières assertions sont le terme que l'ordre protège : une
+    /// retenue longue porte les deux autres marques, donc dans l'autre ordre
+    /// elle disparaîtrait derrière `quarantined` — « perdu » là où la vérité est
+    /// « il manque du crédit ». La troisième est le contrôle négatif : relâchée,
+    /// la ligne retourne à l'attribution de mika#2515.
+    #[test]
+    fn mika2944_une_retenue_de_credit_se_lit_avant_la_quarantaine() {
+        use UndeliveredVerdictCause as C;
+
+        assert_eq!(
+            classify_undelivered_verdict(Some(
+                r#"{"delivery_attempts":"2","delivery_credit_held_at":"2026-10-28T06:58:21Z"}"#
+            )),
+            C::CreditHeld
+        );
+        assert_eq!(
+            classify_undelivered_verdict(Some(
+                r#"{"delivery_attempts":"3","delivery_quarantined_at":"2026-10-28T07:02:24Z",
+                    "delivery_credit_held_at":"2026-10-28T08:04:17Z"}"#
+            )),
+            C::CreditHeld,
+            "retenue ET quarantinée : la retenue gagne, sinon la population \
+             disparaît derrière « perdu »"
+        );
+        assert_eq!(
+            classify_undelivered_verdict(Some(
+                r#"{"delivery_attempts":"3","delivery_quarantined_at":"2026-10-28T07:02:24Z",
+                    "delivery_credit_held_at":"2026-10-28T08:04:17Z",
+                    "delivery_credit_released_at":"2026-10-28T08:51:00Z"}"#
+            )),
+            C::Quarantined,
+            "crédit revenu : l'attribution de mika#2515 reprend la main"
+        );
     }
 
     /// AC1b — l'en-tête de portée du prompt cite **la** chaîne que le moteur

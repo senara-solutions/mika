@@ -17,6 +17,7 @@ pub(crate) mod check_link;
 pub mod compaction;
 pub mod compaction_handsoff;
 pub mod config_keys;
+pub mod credit_hold;
 pub mod db;
 pub mod evidence;
 pub mod flight_source;
