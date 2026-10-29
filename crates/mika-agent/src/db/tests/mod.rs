@@ -1189,6 +1189,194 @@ pub(crate) fn set_created_at(db: &Database, task_id: &str, created_at: &str) {
     assert_eq!(n, 1, "la row de test doit exister");
 }
 
+/// Force l'instant **terminal** d'une row : `completed_at` *et* `updated_at`,
+/// parce que la clé de récence des enfants pilotes est le `COALESCE` des deux —
+/// n'en forcer qu'un laisserait l'autre décider de l'ordre.
+///
+/// À n'appeler que sur une row déjà terminale : sur un enfant encore en vol,
+/// elle inventerait un `completed_at` que la production n'écrit pas (motif
+/// mika#2331 — l'absence est l'information).
+pub(crate) fn set_completed_at(db: &Database, task_id: &str, completed_at: &str) {
+    let n = db
+        .conn
+        .execute(
+            "UPDATE tasks SET completed_at = ?2, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, completed_at],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "la row de test doit exister");
+}
+
+/// L'état de l'enfant d'**implémentation** sous une parente de groom relancée
+/// (mika#2951). Les trois valeurs sont les trois populations que le correctif
+/// doit distinguer, et aucune n'est hypothétique : le moteur produit les trois.
+pub(crate) enum Implementation<'a> {
+    /// **Aucun** enfant d'implémentation. La parente a bien basculé en
+    /// `dispatch_class = "implement"` (étape 5c de
+    /// `try_dispatch_pilot_after_groom_success`), puis le dispatch s'est arrêté
+    /// avant de créer l'enfant — frein `auto_pull_stop`, jeton GitHub absent,
+    /// `validate_dispatch_readiness` qui refuse, handler manquant. C'est le
+    /// groom pur de l'AC2 : il reste un non-vol.
+    Absente,
+    /// L'enfant existe et **vole encore** (`in_progress`, pas de `result`).
+    /// C'est l'instant du défaut mika#2951 : la parente est terminale, le vol
+    /// ne l'est pas.
+    EnVol,
+    /// L'enfant a fini et porte sa ligne `Outcome:`.
+    Terminee(&'a str),
+}
+
+/// Ce qu'un vol de groom relancé (mika#1614, « task reuse ») fait varier.
+/// Tout le reste de sa forme est fixe et vient des constructeurs de production.
+pub(crate) struct VolDeGroomRelance<'a> {
+    /// L'URL du ticket, portée par la **parente** — la seule row qui en porte
+    /// une (topologie mika#2886).
+    pub(crate) url_du_ticket: &'a str,
+    /// Le `result` de l'enfant **groom** : en production une ligne
+    /// `Outcome: PLAN_GROOMED`, que mika#2949 classe en `not_a_flight`.
+    pub(crate) issue_du_groom: &'a str,
+    /// L'enfant d'implémentation que le moteur relance sur la même parente.
+    pub(crate) implementation: Implementation<'a>,
+    /// Un second enfant **groom**, terminé *après* l'implémentation. Forme
+    /// **synthétique**, et dite comme telle : le dispatch ne la produit pas
+    /// aujourd'hui (l'étape 1 de `try_dispatch_pilot_after_groom_success`
+    /// exige `dispatch_class = "groom"`, que l'étape 5c a déjà basculé). Elle
+    /// est là pour rendre la précédence *observable* — par récence le groom
+    /// gagnerait, par classe l'implémentation gagne — parce que « le plus
+    /// récent » est exactement la moitié du défaut mika#2951, et qu'un
+    /// correctif qui se contenterait de l'ordre resterait vert sans elle.
+    pub(crate) regroom_posterieur: Option<&'a str>,
+}
+
+/// Les ids semés par [`seme_un_groom_puis_un_implement`], pour que le test
+/// puisse nommer la row qu'il attend plutôt que la deviner.
+pub(crate) struct VolRelanceSeme {
+    pub(crate) parente: String,
+    pub(crate) groom: String,
+    pub(crate) implementation: Option<String>,
+    pub(crate) regroom: Option<String>,
+}
+
+/// Instants de la mesure de mika#2951 (parente `9bed44f8`, ticket #2944), à
+/// l'ordre près : le groom finit, la parente passe `completed` une poignée de
+/// secondes plus tard, et l'implémentation ne finit qu'une heure après. Le
+/// re-groom est postérieur à l'implémentation, pour que la récence et la classe
+/// désignent deux enfants différents.
+const GROOM_FINI_A: &str = "2026-10-28T12:27:50Z";
+const IMPLEMENT_NE_A: &str = "2026-10-28T12:27:55Z";
+const PARENTE_FINIE_A: &str = "2026-10-28T12:28:08Z";
+const IMPLEMENT_FINI_A: &str = "2026-10-28T13:20:48Z";
+const REGROOM_FINI_A: &str = "2026-10-28T14:00:00Z";
+
+/// Sème un **vol de groom relancé** — la forme que mika#1614 a rendue modale et
+/// que mika#2951 corrige — et rend les ids de ses rows.
+///
+/// La topologie est celle de la production, à trois rows plutôt que deux :
+///
+/// - la **parente** (`ready-label: …`, `reference_url` porté) naît
+///   `dispatch_class = "groom"`, bascule en `"implement"` à l'étape 5c du
+///   dispatch, et devient `completed` **à la fin du groom** — avant que
+///   l'implémentation ait commencé. C'est tout le défaut ;
+/// - l'enfant **groom** (`long_running:run_claude_pilot_groom`) porte
+///   `Outcome: PLAN_GROOMED` ;
+/// - l'enfant **implémentation** (`long_running:run_claude_pilot`) porte la
+///   ligne `Outcome:` du vol réel — ou n'existe pas, ou vole encore, selon
+///   [`Implementation`].
+///
+/// Les deux enfants sont bâtis par
+/// [`crate::skills::executor::build_callback_task`], le constructeur de
+/// production, et jamais par un `NewTask` littéral : leur `label` est
+/// exactement ce que `is_implement_pilot_label` interroge, et un littéral
+/// recopié ici cesserait de suivre un changement du producteur. C'est la même
+/// règle que le docstring de [`seme_la_forme_reelle`] pose.
+///
+/// Les horodatages sont forcés parce que les timestamps ISO-8601 sont à la
+/// seconde : trois rows créées dans le même test les partagent, et l'ordre
+/// retomberait sur un départage par UUID.
+pub(crate) fn seme_un_groom_puis_un_implement(
+    db: &Database,
+    agent_id: &str,
+    vol: &VolDeGroomRelance<'_>,
+) -> VolRelanceSeme {
+    db.register_agent(agent_id, agent_id, &format!("/tmp/{agent_id}"))
+        .expect("l'agent dispatcheur doit être enregistré");
+
+    let parente_id = db
+        .create_task(&groom_parent(agent_id, vol.url_du_ticket))
+        .expect("la parente doit être créée");
+    db.update_task_status(&parente_id, "in_progress")
+        .expect("la parente doit passer in_progress");
+
+    let groom_id = enfant_pilote(db, agent_id, &parente_id, "run_claude_pilot_groom");
+    db.update_task_completed(&groom_id, agent_id, Some(vol.issue_du_groom))
+        .expect("la complétion de l'enfant groom doit réussir");
+    set_completed_at(db, &groom_id, GROOM_FINI_A);
+
+    // Étape 5c de `try_dispatch_pilot_after_groom_success` : la classe bascule
+    // sur la parente elle-même, avant la création de l'enfant.
+    let basculees = db
+        .conn
+        .execute(
+            "UPDATE tasks SET dispatch_class = 'implement' WHERE id = ?1",
+            rusqlite::params![parente_id],
+        )
+        .unwrap();
+    assert_eq!(basculees, 1, "la parente doit basculer en implement");
+
+    let implementation = match vol.implementation {
+        Implementation::Absente => None,
+        Implementation::EnVol | Implementation::Terminee(_) => {
+            let id = enfant_pilote(db, agent_id, &parente_id, "run_claude_pilot");
+            set_created_at(db, &id, IMPLEMENT_NE_A);
+            Some(id)
+        }
+    };
+
+    // La parente devient terminale ici : mika#1614 réutilise la row, donc sa
+    // terminalité ne dit rien de celle du vol.
+    db.update_task_completed(&parente_id, agent_id, None)
+        .expect("la complétion de la parente doit réussir");
+    set_completed_at(db, &parente_id, PARENTE_FINIE_A);
+
+    if let (Implementation::Terminee(issue), Some(id)) = (&vol.implementation, &implementation) {
+        db.update_task_completed(id, agent_id, Some(*issue))
+            .expect("la complétion de l'enfant d'implémentation doit réussir");
+        set_completed_at(db, id, IMPLEMENT_FINI_A);
+    }
+
+    let regroom = vol.regroom_posterieur.map(|issue| {
+        let id = enfant_pilote(db, agent_id, &parente_id, "run_claude_pilot_groom");
+        db.update_task_completed(&id, agent_id, Some(issue))
+            .expect("la complétion du re-groom doit réussir");
+        set_completed_at(db, &id, REGROOM_FINI_A);
+        id
+    });
+
+    VolRelanceSeme {
+        parente: parente_id,
+        groom: groom_id,
+        implementation,
+        regroom,
+    }
+}
+
+/// Un enfant pilote bâti par le constructeur de production, pour l'outil
+/// nommé — c'est le nom de l'outil qui décide du label
+/// (`format!("long_running:{tool_name}")`).
+fn enfant_pilote(db: &Database, agent_id: &str, parente_id: &str, outil: &str) -> String {
+    let enfant = crate::skills::executor::build_callback_task(
+        agent_id.to_string(),
+        Some(parente_id.to_string()),
+        outil,
+        &serde_json::json!({"skill": "dev-pilot"}),
+        3_600,
+        "session-2951",
+        "trace-2951",
+        None,
+    );
+    db.create_task(&enfant).expect("l'enfant doit être créé")
+}
+
 /// mika#2310 — harnais isolé pour la porte mika#1620 / mika#2287 (cas 4 et 8,
 /// niveau prédicat). Le chemin de module `db::tests::harnais_porte` est ce que
 /// le critère de sortie du ticket interroge

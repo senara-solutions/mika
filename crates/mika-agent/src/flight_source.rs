@@ -86,7 +86,7 @@
 //! PR #2881, mergée.
 
 use async_trait::async_trait;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::tasks::FinishedFlightRow;
@@ -142,7 +142,12 @@ impl FlightSource for DbFlightSource {
             .list_finished_implement_flights_in_container(since.map(str::to_string), repos)
             .await;
         match rows {
-            Ok(lignes) => lignes.into_iter().map(task_to_finished_flight).collect(),
+            Ok(lignes) => {
+                let (ajournees, termines): (Vec<_>, Vec<_>) =
+                    lignes.into_iter().partition(|l| l.pending_implement);
+                sonde_ajournements(&ajournees);
+                termines.into_iter().map(task_to_finished_flight).collect()
+            }
             Err(e) => {
                 warn!(
                     target: "mika::milestone_manager",
@@ -156,6 +161,42 @@ impl FlightSource for DbFlightSource {
             }
         }
     }
+}
+
+/// Dit, à **chaque** lecture, combien de parentes ont été ajournées parce qu'un
+/// pilote d'implémentation vole encore sous elles (mika#2951).
+///
+/// **Émise y compris à zéro**, et c'est tout son intérêt. Sans la ligne, « aucun
+/// vol parce qu'il n'y en avait pas » et « aucun vol parce que les trois en
+/// cours ont été ajournés » rendent les mêmes octets — deux populations sous un
+/// seul nom ne sont pas soustractibles (mika#2205). C'est exactement le silence
+/// qui a laissé le registre figer trois verdicts prématurés sans que personne
+/// le voie.
+///
+/// `task_ids` est **absent** quand `deferred == 0`, jamais `""` : rien n'a été
+/// ajourné, ce n'est pas « une liste vide d'ajournements » (motif mika#2331). Et
+/// l'**absence de la ligne** signifie un binaire antérieur à ce correctif, pas
+/// un zéro (motif mika#2340) : l'instrument n'est vivant qu'après `make deploy`.
+fn sonde_ajournements(ajournees: &[FinishedFlightRow]) {
+    let task_ids = if ajournees.is_empty() {
+        None
+    } else {
+        Some(
+            ajournees
+                .iter()
+                .map(|l| l.flight.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+    info!(
+        target: "mika::milestone_manager",
+        event = "flight_deferred_pending_implement",
+        deferred = ajournees.len(),
+        task_ids = task_ids.as_deref(),
+        scope = "container",
+        "parentes terminales dont le pilote d'implémentation vole encore — non jugées ce cycle"
+    );
 }
 
 /// [`FinishedFlightRow`] → [`FinishedFlight`], c'est-à-dire la projection sur
@@ -195,6 +236,10 @@ fn task_to_finished_flight(row: FinishedFlightRow) -> FinishedFlight {
     let FinishedFlightRow {
         flight: t,
         pilot_result,
+        // mika#2951 — déjà consommé par `finished_implement_flights`, qui
+        // n'appelle cette projection que sur les vols non ajournés. Le champ est
+        // nommé ici pour que l'ajout d'un troisième ne passe pas en silence.
+        pending_implement: _,
     } = row;
     let repo = t.reference_url.as_deref().and_then(repo_from_issue_url);
     FinishedFlight {
@@ -374,6 +419,7 @@ mod tests {
         FinishedFlightRow {
             flight,
             pilot_result: None,
+            pending_implement: false,
         }
     }
 
@@ -581,5 +627,388 @@ mod tests {
             dispatch_class: Some("implement".into()),
             dispatcher_source: None,
         }
+    }
+
+    /// Le ticket de la première ligne de la mesure de mika#2951 : parente
+    /// `9bed44f8`, groom terminé à 12:28:08Z, pilote d'implémentation terminé à
+    /// 13:20:48Z sur la PR #2947 — et registre figé sur
+    /// « mort PLAN_GROOMED » dès 12:31:59Z.
+    const TICKET_2951: &str = "https://github.com/senara-solutions/mika/issues/2944";
+
+    /// Ce que le pilote de **groom** écrit : la ligne que mika#2949 classe en
+    /// `not_a_flight`.
+    const ISSUE_DU_GROOM: &str = "Outcome: PLAN_GROOMED\nTurns: 44\n";
+
+    /// Ce que le pilote d'**implémentation** écrit : la PR réellement ouverte,
+    /// mergée depuis par Vincent.
+    const ISSUE_DE_LIMPLEMENTATION: &str =
+        "Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2947\nTurns: 197\n";
+
+    /// Sème un vol de groom relancé sous `mika-dev` et rend ses ids.
+    fn seme_un_groom_relance(
+        db: &Database,
+        implementation: crate::db::tests::Implementation<'_>,
+        regroom_posterieur: Option<&str>,
+    ) -> crate::db::tests::VolRelanceSeme {
+        crate::db::tests::seme_un_groom_puis_un_implement(
+            db,
+            "mika-dev",
+            &crate::db::tests::VolDeGroomRelance {
+                url_du_ticket: TICKET_2951,
+                issue_du_groom: ISSUE_DU_GROOM,
+                implementation,
+                regroom_posterieur,
+            },
+        )
+    }
+
+    /// **AC1 — le test qui rougit contre `origin/main`.** Une parente dont
+    /// l'enfant d'implémentation vole encore n'est pas un vol terminé.
+    ///
+    /// Contre le code d'avant le correctif, la source rend **un** vol : la
+    /// parente est `completed` (mika#1614 réutilise sa row), son seul enfant
+    /// terminal est le pilote de **groom**, et l'évaluateur en tire
+    /// `not_a_flight` — verdict que `flight_verdict_ledger` fige pour toujours,
+    /// alors que la PR n'est même pas encore ouverte. C'est la ligne
+    /// « 12:31:59Z : mort PLAN_GROOMED » de la mesure.
+    ///
+    /// Après le correctif, la lecture **ajourne** : zéro vol, donc zéro verdict,
+    /// donc rien à figer. Le vol sera jugé au cycle suivant la fin de l'enfant —
+    /// c'est le test [`mika2951_une_fois_limplement_terminal_cest_son_issue_qui_est_jugee`].
+    #[tokio::test]
+    async fn mika2951_une_parente_dont_limplement_vole_encore_nest_pas_un_vol_termine() {
+        let db = Database::open_in_memory().unwrap();
+        let seme = seme_un_groom_relance(&db, crate::db::tests::Implementation::EnVol, None);
+
+        let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
+        let vols = source.finished_implement_flights(None).await;
+
+        assert!(
+            vols.is_empty(),
+            "la parente {} est terminale, mais son enfant d'implémentation vole \
+             encore : le vol n'est pas terminé et ne doit pas être rendu — reçu {:?}",
+            seme.parente,
+            vols.iter().map(|v| &v.result).collect::<Vec<_>>()
+        );
+    }
+
+    /// **AC1 — la précédence est celle de la classe, jamais celle de la
+    /// récence.** Un re-groom terminé *après* l'implémentation ne reprend pas la
+    /// main.
+    ///
+    /// C'est le test qui refuse le correctif facile. « Prendre l'enfant le plus
+    /// récent » laisserait le premier test vert et celui-ci rouge, parce que
+    /// « le plus récent » est exactement la moitié du défaut : la lecture d'avant
+    /// le correctif prend déjà le plus récent *des enfants terminaux*, et c'est
+    /// le groom. Seul un prédicat sur le **label** de l'enfant
+    /// (`is_implement_pilot_label`) tient les deux.
+    #[tokio::test]
+    async fn mika2951_limplement_prime_le_groom_meme_quand_le_groom_est_plus_recent() {
+        let db = Database::open_in_memory().unwrap();
+        let seme = seme_un_groom_relance(
+            &db,
+            crate::db::tests::Implementation::Terminee(ISSUE_DE_LIMPLEMENTATION),
+            Some("Outcome: PLAN_GROOMED\nTurns: 12\n"),
+        );
+        assert!(
+            seme.regroom.is_some(),
+            "le re-groom postérieur est la condition de la question"
+        );
+
+        let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
+        let vols = source.finished_implement_flights(None).await;
+
+        assert_eq!(vols.len(), 1, "un vol, la parente");
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(&vols, &[]);
+        assert_eq!(
+            verdicts[0].issue,
+            crate::milestone_manager::evaluator::FlightIssue::PrOpened {
+                number: Some(2947),
+                url: Some("https://github.com/senara-solutions/mika/pull/2947".to_string()),
+            },
+            "l'issue jugée est celle de l'implémentation, pas celle du groom le \
+             plus récent"
+        );
+    }
+
+    /// **AC1 — une fois l'enfant d'implémentation terminal, c'est son issue qui
+    /// est jugée.** La forme exacte de la première ligne de la mesure, à l'instant
+    /// où le manager a enfin le droit de juger : PR ouverte, #2947,
+    /// merge-candidat.
+    ///
+    /// Hermétique comme son aîné de mika#2886 : `sub_issues` est vide, donc
+    /// `pr_state` est `None` et `recommend` rend `MergeCandidate` sans toucher
+    /// GitHub.
+    #[tokio::test]
+    async fn mika2951_une_fois_limplement_terminal_cest_son_issue_qui_est_jugee() {
+        let db = Database::open_in_memory().unwrap();
+        let seme = seme_un_groom_relance(
+            &db,
+            crate::db::tests::Implementation::Terminee(ISSUE_DE_LIMPLEMENTATION),
+            None,
+        );
+
+        let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
+        let vols = source.finished_implement_flights(None).await;
+
+        assert_eq!(vols.len(), 1, "un vol, la parente");
+        assert_eq!(
+            vols[0].task_id, seme.parente,
+            "le vol rendu est la parente — c'est elle qui porte le ticket"
+        );
+
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(&vols, &[]);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(
+            verdicts[0].issue,
+            crate::milestone_manager::evaluator::FlightIssue::PrOpened {
+                number: Some(2947),
+                url: Some("https://github.com/senara-solutions/mika/pull/2947".to_string()),
+            },
+            "l'issue du pilote d'implémentation doit atteindre l'évaluateur"
+        );
+        assert_eq!(
+            verdicts[0].recommendation,
+            crate::milestone_manager::evaluator::FlightRecommendation::MergeCandidate
+        );
+    }
+
+    /// **AC2 — contrôle négatif n° 1 : un groom pur reste un non-vol.**
+    ///
+    /// La parente a basculé en `implement` (étape 5c du dispatch) mais aucun
+    /// enfant d'implémentation n'est né : le frein `auto_pull_stop`, un jeton
+    /// GitHub absent, un `validate_dispatch_readiness` qui refuse, ou un handler
+    /// manquant. Le seul enfant est le groom, et mika#2949 le classe
+    /// `not_a_flight` — ce que ce test exige **avant comme après** le correctif.
+    ///
+    /// C'est ce qui sépare « ajourner une parente dont l'implémentation vole »
+    /// de « ne plus jamais rendre une parente de groom » : sans ce contrôle, un
+    /// correctif qui ajournerait les deux resterait vert.
+    #[tokio::test]
+    async fn mika2951_un_groom_pur_reste_un_non_vol() {
+        let db = Database::open_in_memory().unwrap();
+        seme_un_groom_relance(&db, crate::db::tests::Implementation::Absente, None);
+
+        let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
+        let vols = source.finished_implement_flights(None).await;
+
+        assert_eq!(
+            vols.len(),
+            1,
+            "un groom sans implémentation relancée est un vol terminé — il n'a \
+             rien à attendre"
+        );
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(&vols, &[]);
+        assert_eq!(
+            verdicts[0].issue,
+            crate::milestone_manager::evaluator::FlightIssue::NotAFlight {
+                reason: crate::milestone_manager::evaluator::NotFlightReason::GroomCompleted,
+            },
+            "classé comme mika#2949 le classe"
+        );
+        assert_eq!(
+            verdicts[0].recommendation,
+            crate::milestone_manager::evaluator::FlightRecommendation::Nothing
+        );
+    }
+
+    /// **AC2 — contrôle négatif n° 2 : un vol `ready-label` classique est jugé
+    /// comme aujourd'hui.**
+    ///
+    /// Une parente, **un seul** enfant pilote d'implémentation, aucun groom : la
+    /// topologie de mika#2886, inchangée par mika#2951. Vert avant comme après,
+    /// par le même chemin de production que
+    /// `mika2886_la_forme_reelle_rend_un_verdict_de_pr_ouverte` — dont il se
+    /// distingue par ce qu'il interroge : non pas « l'enfant est-il lu ? » mais
+    /// « le nouveau prédicat laisse-t-il passer le cas nominal ? ».
+    #[tokio::test]
+    async fn mika2951_un_vol_ready_label_a_un_seul_enfant_est_juge_comme_avant() {
+        let db = Database::open_in_memory().unwrap();
+        let parente_id = seme_la_forme_reelle(&db, ISSUE_DE_LIMPLEMENTATION);
+
+        let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
+        let vols = source.finished_implement_flights(None).await;
+
+        assert_eq!(vols.len(), 1, "un vol, la parente");
+        assert_eq!(vols[0].task_id, parente_id);
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(&vols, &[]);
+        assert_eq!(
+            verdicts[0].issue,
+            crate::milestone_manager::evaluator::FlightIssue::PrOpened {
+                number: Some(2947),
+                url: Some("https://github.com/senara-solutions/mika/pull/2947".to_string()),
+            },
+            "le vol `ready-label` à un seul enfant est jugé comme avant"
+        );
+        assert_eq!(
+            verdicts[0].recommendation,
+            crate::milestone_manager::evaluator::FlightRecommendation::MergeCandidate
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // mika#2951 — Fire-Disposition : `pending_implement` a un lecteur unique.
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Les deux formes sous lesquelles le champ est touché dans du code Rust.
+    ///
+    /// Deux, pas une, et ni l'une ni l'autre n'est le nom nu : `pending_implement`
+    /// seul attraperait la chaîne `"flight_deferred_pending_implement"` — le nom
+    /// de la sonde, qui n'est pas une lecture du champ — et rendrait l'attendu
+    /// faux pour une raison qui n'a rien à voir avec ce que le scan refuse.
+    const AIGUILLES_DAJOURNEMENT: &[&str] = &[".pending_implement", "pending_implement:"];
+
+    /// Les **fichiers** de production qui touchent le champ, triés.
+    ///
+    /// Le grain est le fichier et non la fonction, pour deux raisons qui vont
+    /// dans le même sens :
+    ///
+    /// - `pending_implement` est un contrat **entre** deux fichiers — l'un
+    ///   l'écrit, l'autre le décide — donc « qui le touche » se pose à ce
+    ///   grain-là, et c'est à ce grain que la régression redoutée se voit.
+    /// - [`crate::source_scan::fn_bodies`] est **plat** : `recence` est une
+    ///   fonction imbriquée dans `list_finished_implement_flights_in_container`,
+    ///   donc tout ce qui suit sa déclaration est attribué à `recence` et le nom
+    ///   de la fonction englobante n'apparaît jamais. Mesuré, pas supposé.
+    ///   Au même grain, un `pub pending_implement: bool` à portée de module
+    ///   serait invisible — la borne que le doc-comment de
+    ///   [`crate::source_scan::strip_comment_lines`] nomme.
+    ///
+    /// Les commentaires sont retirés par [`crate::source_scan::strip_comment_lines`] :
+    /// trois doc-comments de ce ticket nomment le champ pour expliquer la
+    /// décision (celui de `list_finished_implement_flights_in_container`, celui
+    /// du champ lui-même, celui du test D5 dans `task_engine/engine.rs`) et une
+    /// mention n'est pas une lecture — motif mika#2050 signal S.
+    ///
+    /// Le corpus est **tout** `src/`, pas un module : la régression redoutée est
+    /// précisément un lecteur qui naît ailleurs.
+    fn fichiers_touchant_lajournement(corpus: &[(String, String)]) -> Vec<String> {
+        let mut trouves: Vec<String> = corpus
+            .iter()
+            .filter(|(_, source)| {
+                let code = crate::source_scan::strip_comment_lines(source);
+                AIGUILLES_DAJOURNEMENT.iter().any(|a| code.contains(a))
+            })
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        trouves.sort();
+        trouves.dedup();
+        trouves
+    }
+
+    /// **`pending_implement` est rapporté par la base et décidé ici, nulle part
+    /// ailleurs.**
+    ///
+    /// La couche base *rapporte* (mika#2205 : deux populations sous un nom ne
+    /// sont pas soustractibles, donc elle ne filtre pas), et `flight_source`
+    /// *décide* — il écarte les parentes ajournées et émet la sonde. Un second
+    /// site qui lirait le champ pour en tirer sa propre conclusion est la classe
+    /// mika#2158 : correct le jour où il est écrit, muet le jour où la règle
+    /// d'ajournement change, et aucune assertion de comportement ne rougirait
+    /// puisque les deux sites rendraient les mêmes octets jusque-là.
+    ///
+    /// **Deux fichiers attendus, et chacun pour sa raison** — un attendu à un
+    /// seul nom serait faux et donnerait envie d'élargir l'aiguille :
+    ///
+    /// - `db/tasks.rs` **rapporte** : il déclare le champ et l'écrit
+    ///   (`pending_implement: etat.implement_en_vol`). Il ne répond pas à la
+    ///   question « faut-il ajourner ? », il la rend posable — la distinction
+    ///   que mika#2305 a dû écrire pour son résolveur de portée
+    ///   (« it *produces* the answer »).
+    /// - `flight_source.rs` **décide** : le `partition` de
+    ///   `finished_implement_flights`, seul site qui en tire une conséquence,
+    ///   et la sonde qui publie la quantité. Son `task_to_finished_flight`
+    ///   porte en plus un `pending_implement: _` qui ne lit rien — un
+    ///   destructuring exhaustif dont le commentaire dit que le champ a déjà
+    ///   été consommé en amont.
+    ///
+    /// Quand ce test rougit : **router le site par `finished_implement_flights`**,
+    /// ne pas ajouter de ligne à l'allowlist (doctrine mika#2201).
+    #[test]
+    fn mika2951_lajournement_a_un_lecteur_unique() {
+        /// Aucune exception. Livrée vide, et son vide est épinglé juste en
+        /// dessous : une allowlist qui se remplit sans bruit est le mécanisme
+        /// que mika#2309 condamne.
+        const ALLOWLIST: &[&str] = &[];
+        assert!(
+            ALLOWLIST.is_empty(),
+            "une exception a été ajoutée à ce scan. Ce n'est pas la \
+             réparation : router le site par `finished_implement_flights` \
+             l'est (mika#2201). Si une exception est vraiment la bonne \
+             réponse, ouvrir un ticket qui porte sa raison et le citer ici."
+        );
+
+        let corpus = crate::source_scan::production_files();
+        assert!(
+            corpus.len() >= 100,
+            "le corpus de production est anormalement petit ({} fichiers) — \
+             l'énumération ne mord plus, et le scan ne regarde presque rien",
+            corpus.len()
+        );
+
+        let trouves = fichiers_touchant_lajournement(&corpus);
+
+        // Anti-vacuité : un prédicat qui ne trouve plus rien passerait toute
+        // égalité d'ensembles qu'on lui demanderait si l'attendu venait à se
+        // vider par un refactor.
+        assert!(
+            !trouves.is_empty(),
+            "le scan ne trouve plus aucune mention — les aiguilles ont cessé \
+             de mordre (champ renommé, dépouillement cassé), et le filet est \
+             décoratif"
+        );
+
+        assert_eq!(
+            trouves,
+            vec!["db/tasks.rs".to_string(), "flight_source.rs".to_string()],
+            "l'ensemble des fichiers de production qui touchent \
+             `pending_implement` a changé. Lire le doc-comment de ce test \
+             avant de toucher à l'attendu."
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus : sur un corpus
+    /// **synthétique** portant un second lecteur, le prédicat doit rougir.
+    ///
+    /// Sans lui, un scan dont les aiguilles ont cessé de mordre — champ
+    /// renommé, dépouillement cassé — resterait vert pour toujours, et son
+    /// vert se lirait comme « un seul lecteur » au lieu de « je ne vois plus
+    /// rien ». L'anti-vacuité du test précédent couvre le corpus réel ;
+    /// celui-ci couvre le prédicat, sur une entrée dont on connaît la réponse.
+    ///
+    /// Les deux fichiers innocents ne sont pas décoratifs : ils portent les
+    /// deux formes qui nomment le champ **sans le toucher** — la prose d'un
+    /// doc-comment, et le nom de la sonde, qui contient le nom du champ comme
+    /// sous-chaîne. Un scan ancré sur le nom nu les compterait tous les deux.
+    #[test]
+    fn mika2951_le_scan_rougit_sur_un_second_lecteur() {
+        let prose = r#"
+/// Cette prose nomme .pending_implement et pending_implement: sans les lire.
+fn seulement_de_la_prose() {
+    let _ = 1;
+}
+"#;
+        let sonde = r#"
+fn seulement_la_sonde() {
+    tracing::info!(event = "flight_deferred_pending_implement", deferred = 1);
+}
+"#;
+        let second_lecteur = r#"
+fn un_second_lecteur(lignes: Vec<FinishedFlightRow>) -> usize {
+    lignes.iter().filter(|l| l.pending_implement).count()
+}
+"#;
+        let corpus = vec![
+            ("innocent_prose.rs".to_string(), prose.to_string()),
+            ("innocent_sonde.rs".to_string(), sonde.to_string()),
+            ("coupable.rs".to_string(), second_lecteur.to_string()),
+        ];
+        assert_eq!(
+            fichiers_touchant_lajournement(&corpus),
+            vec!["coupable.rs".to_string()],
+            "le prédicat doit voir le second lecteur, et lui seul — une prose \
+             qui nomme le champ n'est pas une lecture, et le nom de la sonde \
+             contient le nom du champ sans le toucher"
+        );
     }
 }

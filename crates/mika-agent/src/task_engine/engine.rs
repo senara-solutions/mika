@@ -579,14 +579,56 @@ pub(crate) const PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY: &str =
 /// Au niveau **skill** et non **label**, le pendant est
 /// `skills::executor::PILOT_DISPATCH_SKILLS` — d'où une liste nouvelle plutôt
 /// qu'une réutilisation.
-pub(crate) const PILOT_DISPATCH_LABELS: &[&str] = &[
-    "long_running:run_claude_pilot",
-    "long_running:run_claude_pilot_groom",
-];
+pub(crate) const PILOT_DISPATCH_LABELS: &[&str] =
+    &[IMPLEMENT_PILOT_DISPATCH_LABEL, GROOM_PILOT_DISPATCH_LABEL];
+
+/// Le label du pilote d'**implémentation** — celui qui écrit du code et ouvre
+/// une PR (outil `run_claude_pilot`, skill `dev-pilot`).
+pub(crate) const IMPLEMENT_PILOT_DISPATCH_LABEL: &str = "long_running:run_claude_pilot";
+
+/// Le label du pilote de **groom** — celui qui écrit un plan (outil
+/// `run_claude_pilot_groom`, skill `dev-groom`).
+pub(crate) const GROOM_PILOT_DISPATCH_LABEL: &str = "long_running:run_claude_pilot_groom";
 
 /// Ce label de callback est-il celui d'un dispatch de pilote ?
 pub(crate) fn is_pilot_dispatch_label(label: &str) -> bool {
     PILOT_DISPATCH_LABELS.contains(&label)
+}
+
+/// Ce label de callback est-il celui du pilote d'**implémentation**, par
+/// opposition à celui du groom ?
+///
+/// **C'est le discriminant de mika#2951**, et le plan tranche par écrit pourquoi
+/// c'est celui-là. Depuis mika#1614 (« engine-side direct spawn, task reuse ») le
+/// moteur relance le pilote d'implémentation **sur la row de la parente de
+/// groom**, qui est déjà `completed` : la terminalité de la parente ne dit donc
+/// plus rien de celle du vol, et il faut savoir *lequel* de ses enfants décide.
+/// Trois candidats, deux refusés :
+///
+/// - **`dispatch_class` de l'enfant** — refusé. La colonne est nullable
+///   (pré-v34), et toute la couche la lit à travers
+///   `COALESCE(dispatch_class, 'implement')` : un enfant de groom dont la classe
+///   est NULL se présenterait donc comme une implémentation. Un faux positif ici
+///   rend le vol ajourné *pour toujours*, puisque l'enfant qu'on attend n'existe
+///   pas.
+/// - **l'ordre des enfants** — refusé, parce que « le plus récent » *est* la
+///   moitié du défaut. La lecture d'avant mika#2951 prenait déjà le plus récent
+///   des enfants terminaux, et c'était le groom. Un re-groom postérieur à
+///   l'implémentation rendrait le même défaut sous une autre date
+///   (`flight_source::tests::mika2951_limplement_prime_le_groom_meme_quand_le_groom_est_plus_recent`).
+/// - **le label** — retenu. Il est non-nullable, il est produit par un **site
+///   unique** (`skills::executor::build_callback_task`, via
+///   `format!("long_running:{tool_name}")`), et les deux pilotes passent par
+///   deux outils distincts : `run_claude_pilot` et `run_claude_pilot_groom`. La
+///   distinction est donc une propriété du producteur, pas une convention que
+///   quelqu'un doit se rappeler de maintenir.
+///
+/// La propriété d'ordonnancement sur laquelle repose l'ajournement — l'enfant
+/// d'implémentation naît **avant** que la parente devienne terminale — est
+/// tenue par `task_engine::dispatcher`, et épinglée par
+/// `mika2951_la_parente_devient_terminale_apres_la_naissance_de_lenfant_dimplementation`.
+pub(crate) fn is_implement_pilot_label(label: &str) -> bool {
+    label == IMPLEMENT_PILOT_DISPATCH_LABEL
 }
 
 /// L'âge d'un dispatch en secondes, ou `None` quand la question n'a pas de
@@ -11202,6 +11244,173 @@ mod tests {
             "le label de build ({build}) est précisément la population que \
              mika#2875 retire de cet avertissement"
         );
+
+        // mika#2951 — chaque constante **nommée** est épinglée à l'outil dont
+        // elle prétend porter le label, par le même producteur. Sans ces deux
+        // lignes, `is_implement_pilot_label` pourrait désigner le groom et
+        // toute la suite resterait verte : les deux labels ne diffèrent que par
+        // un suffixe, et l'un est un préfixe de l'autre.
+        for (tool, attendu) in [
+            ("run_claude_pilot", IMPLEMENT_PILOT_DISPATCH_LABEL),
+            ("run_claude_pilot_groom", GROOM_PILOT_DISPATCH_LABEL),
+        ] {
+            let produced = crate::skills::executor::build_callback_task(
+                "mika".to_string(),
+                None,
+                tool,
+                &serde_json::json!({}),
+                60,
+                "session",
+                "trace",
+                None,
+            )
+            .label;
+            assert_eq!(
+                produced, attendu,
+                "la constante nommée pour `{tool}` a dérivé de son producteur"
+            );
+            assert_eq!(
+                is_implement_pilot_label(&produced),
+                tool == "run_claude_pilot",
+                "`is_implement_pilot_label` doit distinguer les deux outils — \
+                 c'est le discriminant de mika#2951"
+            );
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // mika#2951 — D5 : la propriété d'ordonnancement dont dépend l'ajournement.
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Le source de `dispatcher.rs`, tronqué à son `mod tests`.
+    ///
+    /// Les deux fonctions scannées ci-dessous sont **aussi** appelées une
+    /// dizaine de fois par les tests du dispatcheur ; sans la troncature,
+    /// « le premier appel précède le second » n'aurait aucun sens. Le fichier
+    /// ne porte qu'un seul `#[cfg(test)]` (mesuré), et il est en aval des deux
+    /// sites de production — la prémisse que mika#2321 invalide pour les
+    /// fichiers de test **extraits** tient ici, où le `mod tests` est inline.
+    const DISPATCHER_SOURCE: &str = include_str!("dispatcher.rs");
+
+    /// Les numéros de ligne où `nom` est **appelé** en production.
+    ///
+    /// Trois formes portent le nom sans l'appeler, et chacune est écartée par
+    /// sa forme et non par une position : la définition (`async fn …`), la
+    /// prose d'un commentaire (`// …`, `/// …`) — `dispatcher.rs` en porte deux
+    /// qui nomment ces fonctions — et tout ce qui vit après le `mod tests`.
+    fn lignes_dappel_en_production(nom: &str) -> Vec<usize> {
+        let motif = format!("{nom}(");
+        DISPATCHER_SOURCE
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("#[cfg(test)]"))
+            .enumerate()
+            .filter(|(_, ligne)| {
+                let t = ligne.trim_start();
+                !t.starts_with("//") && !t.starts_with("async fn ") && t.contains(&motif)
+            })
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// **L'enfant d'implémentation naît AVANT que la parente devienne terminale.**
+    ///
+    /// C'est la prémisse dont `db::tasks::list_finished_implement_flights_in_container`
+    /// dépend : au moment où la requête 1 retient une parente de groom devenue
+    /// terminale, l'enfant `long_running:run_claude_pilot` existe déjà en base,
+    /// donc `pending_implement` peut valoir vrai. Si la prémisse tombe, AC1
+    /// redevient un pari — et la régression serait **muette**, parce que les
+    /// cinq tests de bout en bout sèment la base dans le bon ordre eux-mêmes.
+    ///
+    /// La propriété tient à deux faits, tous deux assertés ici :
+    ///
+    /// 1. Dans le bloc de livraison de callback,
+    ///    `try_complete_parent_on_callback_success` est appelé **avant**
+    ///    `try_dispatch_pilot_after_groom_success` — le second est ce qui crée
+    ///    l'enfant d'implémentation.
+    /// 2. Le premier est un **no-op** sur un callback de groom : il exige un
+    ///    `pr_url`, qu'un groom ne porte pas, et refuse la classe `groom`. Le
+    ///    témoin de ce no-op est
+    ///    `test_try_complete_parent_on_callback_success_groom_class_noop`, dont
+    ///    la disparition rougit ici plutôt que de laisser la prémisse sans
+    ///    personne.
+    ///
+    /// Donc la parente ne devient terminale ni au premier appel ni au second,
+    /// mais au tour silencieux qui suit tout le bloc — après la naissance de
+    /// l'enfant. On ne rejoue pas le dispatcheur (le coût d'un `deliver_callback`
+    /// réel : git, `gh`, un pilote) : on asserte l'ordre du source, à la manière
+    /// de `mika2875_la_constante_est_la_forme_que_le_producteur_emet`.
+    #[test]
+    fn mika2951_la_parente_devient_terminale_apres_la_naissance_de_lenfant_dimplementation() {
+        let completion = lignes_dappel_en_production("try_complete_parent_on_callback_success");
+        let naissance = lignes_dappel_en_production("try_dispatch_pilot_after_groom_success");
+
+        // L'unicité d'abord : « avant » ne veut rien dire sur deux ensembles.
+        assert_eq!(
+            completion.len(),
+            1,
+            "un seul site de production doit compléter la parente sur succès \
+             de callback ; trouvé {completion:?}"
+        );
+        assert_eq!(
+            naissance.len(),
+            1,
+            "un seul site de production doit relancer le pilote après un \
+             groom ; trouvé {naissance:?}"
+        );
+
+        assert!(
+            completion[0] < naissance[0],
+            "mika#2951 : `try_complete_parent_on_callback_success` \
+             (dispatcher.rs:{}) doit rester AVANT \
+             `try_dispatch_pilot_after_groom_success` (dispatcher.rs:{}). \
+             Le bloc de livraison a été réordonné : la parente peut désormais \
+             devenir terminale avant que l'enfant d'implémentation existe, et \
+             `pending_implement` ne la retiendra plus — AC1 de mika#2951 \
+             tombe en silence.",
+            completion[0],
+            naissance[0]
+        );
+
+        // Le fait 2 : le témoin du no-op sur un callback de groom.
+        assert!(
+            DISPATCHER_SOURCE
+                .contains("test_try_complete_parent_on_callback_success_groom_class_noop"),
+            "le témoin du no-op de groom a disparu de dispatcher.rs : sans \
+             lui, rien ne dit plus que le premier appel laisse la parente \
+             `in_progress` sur un callback de groom"
+        );
+    }
+
+    /// Contrôle de bonne foi du scan ci-dessus.
+    ///
+    /// Un prédicat qui ne trouverait **rien** rendrait deux vecteurs vides, et
+    /// `assert_eq!(len, 1)` rougirait — bien. Mais un prédicat trop large (par
+    /// exemple sans la troncature au `mod tests`) rendrait des dizaines de
+    /// lignes et rougirait aussi, en accusant l'ordre au lieu du scan. Ce test
+    /// sépare les deux causes : il dit que le scan voit bien les deux sites
+    /// qu'il prétend voir, et qu'il écarte bien les trois formes qui portent
+    /// le nom sans l'appeler.
+    #[test]
+    fn mika2951_le_scan_ecarte_la_definition_la_prose_et_les_tests() {
+        for nom in [
+            "try_complete_parent_on_callback_success",
+            "try_dispatch_pilot_after_groom_success",
+        ] {
+            let motif = format!("{nom}(");
+            let brutes = DISPATCHER_SOURCE
+                .lines()
+                .filter(|l| l.contains(&motif))
+                .count();
+            let retenues = lignes_dappel_en_production(nom).len();
+            assert_eq!(retenues, 1, "{nom} : le scan doit retenir un seul site");
+            assert!(
+                brutes > retenues,
+                "{nom} : le scan ne filtre rien ({brutes} occurrences brutes \
+                 pour {retenues} retenue) — la définition, la prose ou les \
+                 appels de test ne sont plus écartés, donc le test d'ordre \
+                 mesure autre chose que ce qu'il nomme"
+            );
+        }
     }
 
     /// Une tâche réelle, lue depuis la base, dont on mute les deux horodatages.
