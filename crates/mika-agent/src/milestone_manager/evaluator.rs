@@ -196,7 +196,13 @@ pub enum CiUnreadCause {
 impl CiKnowledge {
     /// Le défaut serde du champ [`FlightVerdict::ci`] — voir
     /// [`CiUnreadCause::NotMeasured`].
-    fn default_unread() -> Self {
+    ///
+    /// `pub(crate)` parce que `VerdictRecord::ci`
+    /// (`crate::flight_verdict_ledger`) prend **le même** défaut : les deux
+    /// désérialisent la même population de blobs antérieurs au champ, et une
+    /// seconde graphie du défaut diverge le jour où l'une des deux change
+    /// (mika#2201). Un `impl Default` aurait été cette seconde graphie.
+    pub(crate) fn default_unread() -> Self {
         CiKnowledge::Unread(CiUnreadCause::NotMeasured)
     }
 }
