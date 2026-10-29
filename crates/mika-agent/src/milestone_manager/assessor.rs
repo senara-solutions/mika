@@ -439,6 +439,7 @@ mod tests {
             priority_rank: None,
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -827,6 +828,7 @@ mod tests {
             priority_rank: Some(1),
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             labels: vec!["p1-important".into()],
         }];
 
@@ -903,6 +905,7 @@ mod tests {
             priority_rank: Some(1),
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             labels: vec!["p1-important".into()],
         }];
 

@@ -639,12 +639,13 @@ pub fn compose_outside_candidates(
                 state,
                 priority_rank: priority_from_labels(&labels),
                 plan_present: plan_callout_present(body),
-                // Une seule lecture du corps, deux questions (mika#2952) : le
-                // booléen lâche que mika#2608 a figé, et la lecture à trois
-                // états dont le bassin tire son refus. Posée **ici** et sur le
-                // chemin milestone, parce qu'un prédicat aveugle par origine
-                // est la classe mika#2205 réintroduite.
+                // Une seule lecture du corps, trois questions (mika#2952) : le
+                // booléen lâche que mika#2608 a figé, la lecture à trois états
+                // dont le bassin tire son refus, et la dormance. Posées **ici**
+                // et sur le chemin milestone, parce qu'un prédicat aveugle par
+                // origine est la classe mika#2205 réintroduite.
                 plan_reading: Some(crate::plan_callout::plan_reading(body)),
+                dormancy: Some(crate::milestone_manager::pool::dormancy_reading(body)),
                 labels,
             })
         })
@@ -957,9 +958,10 @@ pub fn compose_from_gh_outputs(
         }
 
         let plan_present = plan_callout_present(&body);
-        // Le même corps, la seconde question (mika#2952) — voir le site jumeau
-        // dans `compose_outside_candidates`.
+        // Le même corps, les deux autres questions (mika#2952) — voir le site
+        // jumeau dans `compose_outside_candidates`.
         let plan_reading = Some(crate::plan_callout::plan_reading(&body));
+        let dormancy = Some(crate::milestone_manager::pool::dormancy_reading(&body));
         let branch_present = branch_callout_present(&body);
         let blockers = extract_blockers(&body);
         let priority_rank = priority_from_labels(&labels);
@@ -1026,6 +1028,7 @@ pub fn compose_from_gh_outputs(
             priority_rank,
             plan_present,
             plan_reading,
+            dormancy,
             branch_present,
             pr_number,
             pr_state,
@@ -1978,6 +1981,7 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
             priority_rank: None,
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -2554,6 +2558,7 @@ mod gh_arg_capture_tests {
             priority_rank: Some(1),
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,

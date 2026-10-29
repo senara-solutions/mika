@@ -302,9 +302,9 @@ pub use liveness::{
     REASON_POLL_PREFIX, TransitionLine, liveness_reason,
 };
 pub use pool::{
-    Admission, AdmissionRefusal, CandidateOrigin, PLAN_SIZE_READ_MAX, POOL_MAX, POOL_MIN,
-    PlanSizeReading, PoolBand, PoolCandidate, PoolDepth, PoolVerdict, ReadyTicket, RefusalReason,
-    UnreadCause, assess_pool, numbers_needing_size, pool_sort_key,
+    Admission, AdmissionRefusal, CandidateOrigin, DormancyReading, PLAN_SIZE_READ_MAX, POOL_MAX,
+    POOL_MIN, PlanSizeReading, PoolBand, PoolCandidate, PoolDepth, PoolVerdict, ReadyTicket,
+    RefusalReason, UnreadCause, assess_pool, numbers_needing_size, pool_sort_key,
 };
 pub use pool_writer::{ENV_POOL_WRITE, admit_pool_tickets, pool_write_is_armed};
 pub use reader::{

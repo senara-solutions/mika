@@ -4,7 +4,7 @@
 //! composers over `gh` CLI output. See the module docstring in `mod.rs`
 //! for the full Phase 1 discipline.
 
-use super::pool::{PlanSizeReading, PoolCandidate, PoolVerdict, ReadyTicket};
+use super::pool::{DormancyReading, PlanSizeReading, PoolCandidate, PoolVerdict, ReadyTicket};
 use crate::plan_callout::PlanReading;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -151,6 +151,19 @@ pub struct SubIssue {
     /// hors ligne relit ses blobs anciens sans changer de verdict.
     #[serde(default)]
     pub plan_reading: Option<PlanReading>,
+    /// Ce que le corps dit de sa **dormance** (mika#2952, vol 2/2).
+    ///
+    /// Un axe orthogonal à [`Self::plan_reading`] et non un état de plus sur
+    /// celui-ci : un ticket dormant peut porter n'importe laquelle des trois
+    /// lectures de plan — #2854 porte les deux à la fois — et deux populations
+    /// sous un seul nom ne sont pas soustrayables (mika#2205).
+    ///
+    /// `None` veut dire **« le corps n'a pas été lu par ce binaire »**, jamais
+    /// « éveillé » (motif mika#2340). Un blob du puits hors ligne écrit avant ce
+    /// vol relit donc sans dormance et garde son verdict d'origine, au lieu
+    /// d'hériter d'un éveil que personne n'a mesuré.
+    #[serde(default)]
+    pub dormancy: Option<DormancyReading>,
     /// True if the issue body carries a `> - **Branch:**` callout.
     pub branch_present: bool,
     /// PR number linked via GitHub `closingIssuesReferences` (first hit wins).
@@ -812,6 +825,7 @@ mod tests {
             priority_rank: None,
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -856,6 +870,7 @@ mod tests {
             priority_rank: None,
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -969,6 +984,7 @@ mod tests {
             priority_rank: None,
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -1047,6 +1063,75 @@ mod tests {
                 "aller-retour fidèle pour {reading:?}"
             );
         }
+    }
+
+    /// Un blob antérieur à `dormancy` se relit, et son `None` ne se confond pas
+    /// avec « ce corps ne porte pas de condition de réveil » (mika#2952 AC2,
+    /// motif mika#2340).
+    ///
+    /// La distinction est exactement celle que l'AC2 exige de nommer : un
+    /// marqueur **absent** rend `Awake`, qui est une mesure, et le bassin admet
+    /// — il n'exclut pas en silence. `None` est l'autre chose, l'absence de
+    /// mesure, et n'autorise aucun refus. Les relire comme un seul état
+    /// remettrait deux populations sous un nom (mika#2205) : le ticket éveillé
+    /// et le ticket jamais lu.
+    #[test]
+    fn mika2952_un_blob_anterieur_se_relit_sans_lecture_de_dormance() {
+        let blob = r#"{
+            "number": 2854,
+            "title": "t",
+            "state": "open",
+            "priority_rank": 2,
+            "plan_present": true,
+            "branch_present": false,
+            "pr_number": null,
+            "pr_state": null,
+            "ci_state": "none",
+            "blockers": [],
+            "updated_at": "2026-10-28T00:00:00Z",
+            "labels": ["p2-normal"]
+        }"#;
+        let sub: SubIssue =
+            serde_json::from_str(blob).expect("un blob d'avant le champ doit encore se lire");
+        assert_eq!(
+            sub.dormancy, None,
+            "champ absent ⇒ None, qui dit « corps non lu par ce binaire » et \
+             non Awake (mika#2340)"
+        );
+
+        let out = serde_json::to_string(&sub).unwrap();
+        assert!(
+            out.contains(r#""dormancy":null"#),
+            "une lecture non faite se dit null — obtenu : {out}"
+        );
+        let back: SubIssue = serde_json::from_str(&out).unwrap();
+        assert_eq!(back, sub, "aller-retour fidèle");
+
+        // Les deux états mesurés ont un nom de fil stable, et celui qui porte la
+        // condition la transporte : le puits hors-ligne relit le motif de refus
+        // que l'opérateur lira dans le rapport.
+        let awake = serde_json::to_string(&DormancyReading::Awake).unwrap();
+        assert_eq!(awake, r#""awake""#, "nom de fil figé pour Awake");
+        assert_eq!(
+            serde_json::from_str::<DormancyReading>(&awake).unwrap(),
+            DormancyReading::Awake
+        );
+
+        let dormant = DormancyReading::Dormant {
+            condition: "Condition de réveil : quand `MIKA_WEBHOOK_COMMENT_TRIAGE` passe à `on`"
+                .into(),
+        };
+        let s = serde_json::to_string(&dormant).unwrap();
+        assert!(
+            s.starts_with(r#"{"dormant":{"condition":"#),
+            "nom de fil figé pour Dormant — obtenu : {s}"
+        );
+        assert_ne!(s, awake, "les deux états ne se confondent pas sur le fil");
+        assert_eq!(
+            serde_json::from_str::<DormancyReading>(&s).unwrap(),
+            dormant,
+            "la condition citée fait l'aller-retour mot pour mot"
+        );
     }
 
     /// Les deux variantes de provenance ont un nom de fil **distinct et
@@ -1129,6 +1214,7 @@ mod tests {
             priority_rank: None,
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             branch_present: true,
             pr_number: None,
             pr_state: None,

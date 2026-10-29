@@ -150,9 +150,11 @@ mod tests {
             state: IssueState::Open,
             priority_rank: rank,
             plan_present,
-            // La graine partagée reste un blob de binaire antérieur : les verdicts
-            // déjà couverts par les tests de la relève ne bougent pas (mika#2952).
+            // La graine partagée reste un blob de binaire antérieur, sur les deux
+            // lectures de corps : les verdicts déjà couverts par les tests de la
+            // relève ne bougent pas (mika#2952).
             plan_reading: None,
+            dormancy: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -481,6 +483,61 @@ mod tests {
             number,
             origin: CandidateOrigin::Milestone,
             reason: RefusalReason::PriorPlanOnly,
+        }
+    }
+
+    // -- mika#2952 : un dormeur n'est pas une relève à grommer
+
+    /// La seconde moitié d'**AC2**, au niveau du comportement.
+    ///
+    /// Même paire de moitiés que le test ci-dessus : `remediable_by_grooming()`
+    /// rend `false` pour `Dormant`, mais ce n'est qu'une réponse d'enum tant que
+    /// `name_relief` ne filtre pas dessus. Un dormeur proposé à grommer ferait
+    /// écrire un plan à un ticket qui attend un évènement — et le plan ne
+    /// réveillerait rien.
+    ///
+    /// Contrôle positif dans le même verdict : les refus `NoGroomedPlan` sont
+    /// nommés, sans quoi un `name_relief` muet passerait (mika#2205).
+    #[test]
+    fn mika2952_un_dormeur_nentre_pas_dans_la_releve_a_grommer() {
+        let v = verdict_with(vec![
+            refusal(2900, CandidateOrigin::Milestone),
+            dormeur(
+                2854,
+                "Condition de réveil : quand `MIKA_WEBHOOK_COMMENT_TRIAGE` passe à `on`",
+            ),
+            refusal(2910, CandidateOrigin::Milestone),
+            dormeur(
+                2912,
+                "Condition de réveil : quand Vincent rouvre l'onboarding cloud",
+            ),
+            refusal(2920, CandidateOrigin::Milestone),
+            dormeur(2472, "Condition de réveil : feu vert explicite de Vincent"),
+            refusal(2930, CandidateOrigin::Milestone),
+            refusal(2940, CandidateOrigin::Milestone),
+        ]);
+        let relief = name_relief(&v, &[], &[]);
+
+        assert_eq!(
+            numbers(&relief),
+            vec![2900, 2910, 2920, 2930],
+            "les trois dormeurs du corpus mesuré ne sont pas proposés à grommer"
+        );
+        assert_eq!(
+            relief.beyond, 1,
+            "`beyond` ne compte que les refus groomables restants (#2940), \
+             jamais les dormeurs"
+        );
+    }
+
+    /// Un refus `Dormant` tel que le bassin le produit.
+    fn dormeur(number: u64, condition: &str) -> AdmissionRefusal {
+        AdmissionRefusal {
+            number,
+            origin: CandidateOrigin::Milestone,
+            reason: RefusalReason::Dormant {
+                condition: condition.to_string(),
+            },
         }
     }
 }
