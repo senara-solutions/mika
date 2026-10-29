@@ -3214,9 +3214,8 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
     #[test]
     fn mika2963_le_scan_voit_un_second_site_et_compte_les_inattribuables() {
         let aiguille = aiguille_construction_jeton_ci();
-        let fixture = "\
-static REPLI: LazyLock<CiReadToken> =
-    LazyLock::new(|| CiReadToken::new(\"x\", CiReadTokenSource::Pat));
+        let fixture = r#"static REPLI: LazyLock<CiReadToken> =
+    LazyLock::new(|| CiReadToken::new("x", CiReadTokenSource::Pat));
 
 /// Prose citant `CiReadToken::new(` — ne doit PAS compter.
 // Ni ce commentaire portant CiReadToken::new(.
@@ -3235,7 +3234,7 @@ impl Consommateur {
         CiReadToken::new(&self.pat, CiReadTokenSource::Pat)
     }
 }
-";
+"#;
         let (fns, total) = constructions_de_jeton_ci(fixture, &aiguille);
 
         assert_eq!(
