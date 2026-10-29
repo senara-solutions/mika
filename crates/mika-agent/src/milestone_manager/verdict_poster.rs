@@ -215,7 +215,7 @@ fn geste_args() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::milestone_manager::evaluator::{
-        FlightIssue, FlightRecommendation, PrStateKnowledge,
+        CiKnowledge, CiUnreadCause, FlightIssue, FlightRecommendation, PrStateKnowledge,
     };
     use std::sync::Mutex;
 
@@ -264,6 +264,7 @@ mod tests {
             turn_ceiling: None,
             last_commit_turn: None,
             pr_state: PrStateKnowledge::Read(None),
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             recommendation: FlightRecommendation::MergeCandidate,
             completed_at: Some("2026-10-14T22:00:00Z".into()),
         }

@@ -37,7 +37,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::types::{MilestoneState, SubIssue};
+use super::types::{CiState, MilestoneState, SubIssue};
 
 // ---- Le verdict ------------------------------------------------------------
 
@@ -144,6 +144,63 @@ pub enum PrStateKnowledge {
     NotRead,
 }
 
+/// Ce que le manager **sait** de la CI de la tête de la PR d'un vol (mika#2968).
+///
+/// Même forme et même raison que [`PrStateKnowledge`], sur un autre axe : la CI
+/// d'une PR n'est lue que lorsque la PR est venue de la liste du milestone
+/// (`gh pr list --search milestone:<n>`, seule requête qui rend un
+/// `statusCheckRollup`). Pour tous les autres vols, il n'y a **pas de mesure** —
+/// et « pas de mesure » n'est pas « pas de check » : [`CiState::None`] dit qu'une
+/// lecture a eu lieu et n'a trouvé aucun check, [`CiKnowledge::Unread`] dit que
+/// rien n'a été lu. Deux populations sous un `Option` auraient rendu les mêmes
+/// octets (classe mika#2205), et la plus dangereuse des deux confusions serait
+/// qu'une CI non lue passe pour verte (AC du ticket, point 3).
+///
+/// La variante `Read` porte **le moment de la lecture**, parce que la
+/// recommandation qu'elle fonde est écrite une fois et jamais révisée : sans cet
+/// instant, le rapport affirmerait un état CI sans dire de quand il date.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiKnowledge {
+    /// La CI de la tête a été lue, à cet instant (ISO 8601 UTC — le `now` du
+    /// cycle, pas une horloge de ce module).
+    Read { state: CiState, at: String },
+    /// Rien n'a été lu, et la cause est **nommée** plutôt qu'avalée.
+    Unread(CiUnreadCause),
+}
+
+/// Pourquoi la CI d'un vol n'a pas été lue (mika#2968).
+///
+/// Énumération **fermée** : chaque variante correspond à un point précis où la
+/// chaîne de provenance se casse, et aucune ne vaut « échec inconnu ». Élargir
+/// la famille demande d'ajouter la variante ici, donc de décider par écrit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiUnreadCause {
+    /// La sous-issue est appariée, mais son lien de PR ne vient **pas** de la
+    /// liste du milestone — donc son `ci_state` ne vient d'aucune lecture de la
+    /// PR. C'est le cas modal de la boucle : mesuré le 2026-10-29, aucune des
+    /// cinq PR du jour ne portait le milestone.
+    NotFromPrList,
+    /// Le ticket du vol n'est apparié à aucune sous-issue du milestone cible —
+    /// le pendant CI de [`PrStateKnowledge::NotRead`].
+    NoSubIssue,
+    /// Le vol ne porte pas d'URL de ticket, donc il n'y a rien à apparier.
+    NoIssueNumber,
+    /// **Non mesurée** : c'est le défaut à la désérialisation. Un blob de rapport
+    /// antérieur à mika#2968 ne porte pas le champ, donc il ne porte aucune
+    /// lecture — dire `Read` à sa place serait inventer une mesure.
+    NotMeasured,
+}
+
+impl CiKnowledge {
+    /// Le défaut serde du champ [`FlightVerdict::ci`] — voir
+    /// [`CiUnreadCause::NotMeasured`].
+    fn default_unread() -> Self {
+        CiKnowledge::Unread(CiUnreadCause::NotMeasured)
+    }
+}
+
 /// Ce que le manager recommande à l'opérateur pour ce vol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -203,6 +260,15 @@ pub struct FlightVerdict {
     /// variante par défaut dit.
     #[serde(default)]
     pub pr_state: PrStateKnowledge,
+    /// Ce que le manager sait de la CI de la tête de la PR (mika#2968) — lue à
+    /// un instant nommé, ou non lue pour une cause nommée.
+    ///
+    /// `#[serde(default = "CiKnowledge::default_unread")]` ⇒
+    /// `Unread(NotMeasured)`, pour la même raison que `pr_state` : un blob
+    /// antérieur à ce champ ne porte aucune lecture, et c'est exactement ce que
+    /// ce défaut dit.
+    #[serde(default = "CiKnowledge::default_unread")]
+    pub ci: CiKnowledge,
     pub recommendation: FlightRecommendation,
     /// ISO 8601 UTC — `tasks.completed_at`.
     pub completed_at: Option<String>,
@@ -333,6 +399,7 @@ pub fn evaluate_flight(
         issue_number,
         recommendation: recommend(&issue, pr_state),
         pr_state: pr_state.clone(),
+        ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
         issue,
         turns_used: pilot.turns.or_else(|| {
             line_value(result, "Turns:").and_then(|v| v.split_whitespace().next()?.parse().ok())

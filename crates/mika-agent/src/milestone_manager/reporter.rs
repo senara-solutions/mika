@@ -875,6 +875,7 @@ pub(crate) fn flight_recommendation_label(r: FlightRecommendation) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::milestone_manager::evaluator::{CiKnowledge, CiUnreadCause};
     use crate::milestone_manager::pool::{
         PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause, assess_pool,
         assess_pool_sans_tailles,
@@ -976,6 +977,7 @@ mod tests {
             // la population d'avant mika#2921, donc le rendu attendu ne bouge
             // pas.
             pr_state: PrStateKnowledge::Read(None),
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             recommendation,
             completed_at: Some("2026-10-13T08:00:00Z".into()),
         }

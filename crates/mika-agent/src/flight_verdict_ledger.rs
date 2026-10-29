@@ -1310,6 +1310,7 @@ mod tests {
     use super::test_support::RecordingLedger;
     use super::*;
     use crate::db::Database;
+    use crate::milestone_manager::evaluator::{CiKnowledge, CiUnreadCause};
     use crate::source_scan::{
         audit_writers, production_files, production_half, strip_comment_lines,
     };
@@ -1327,6 +1328,7 @@ mod tests {
             last_commit_turn: None,
             recommendation: FlightRecommendation::Regroom,
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: Some("2026-10-26T10:00:00Z".to_string()),
         }
     }
@@ -1348,6 +1350,7 @@ mod tests {
             last_commit_turn: None,
             recommendation: FlightRecommendation::MergeCandidate,
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: None,
         }
     }
@@ -1366,6 +1369,7 @@ mod tests {
             last_commit_turn: None,
             recommendation: FlightRecommendation::Nothing,
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: Some("2026-10-28T12:10:00Z".to_string()),
         }
     }
