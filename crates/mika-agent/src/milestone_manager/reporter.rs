@@ -894,6 +894,7 @@ mod tests {
 
     fn base_issue(n: u64) -> SubIssue {
         SubIssue {
+            missing_grooming_signals: None,
             number: n,
             title: format!("issue {n}"),
             state: IssueState::Open,
@@ -2016,6 +2017,7 @@ mod tests {
         };
         let mut state = state_with(vec![dedans], ProgressCounts::default());
         state.outside_candidates = vec![PoolCandidate {
+            missing_grooming_signals: None,
             number: 1700,
             state: IssueState::Open,
             priority_rank: Some(0),
@@ -2048,6 +2050,7 @@ mod tests {
     fn mika2699_un_refus_hors_milestone_porte_sa_provenance() {
         let mut state = state_with(vec![], ProgressCounts::default());
         state.outside_candidates = vec![PoolCandidate {
+            missing_grooming_signals: None,
             number: 1700,
             state: IssueState::Open,
             priority_rank: None,
@@ -2082,6 +2085,7 @@ mod tests {
     fn mika2699_le_refus_par_la_borne_entre_dans_le_rapport_avec_ses_nombres() {
         let mut state = state_with(vec![], ProgressCounts::default());
         state.outside_candidates = vec![PoolCandidate {
+            missing_grooming_signals: None,
             number: 1700,
             state: IssueState::Open,
             priority_rank: Some(0),
@@ -2123,6 +2127,7 @@ mod tests {
     fn mika2699_une_admission_de_taille_non_mesuree_est_nommee() {
         let mut state = state_with(vec![], ProgressCounts::default());
         state.outside_candidates = vec![PoolCandidate {
+            missing_grooming_signals: None,
             number: 1700,
             state: IssueState::Open,
             priority_rank: Some(0),
@@ -2166,6 +2171,7 @@ mod tests {
     fn mika2699_une_taille_mesuree_sous_la_borne_ne_dit_rien() {
         let mut state = state_with(vec![], ProgressCounts::default());
         state.outside_candidates = vec![PoolCandidate {
+            missing_grooming_signals: None,
             number: 1700,
             state: IssueState::Open,
             priority_rank: Some(0),
@@ -2277,6 +2283,7 @@ mod tests {
         let mut state = state_with(subs, ProgressCounts::default());
         state.outside_candidates = vec![
             PoolCandidate {
+                missing_grooming_signals: None,
                 number: 2740,
                 state: IssueState::Open,
                 priority_rank: Some(0),
@@ -2286,6 +2293,7 @@ mod tests {
                 labels: vec!["p0-critical".into()],
             },
             PoolCandidate {
+                missing_grooming_signals: None,
                 number: 2750,
                 state: IssueState::Open,
                 priority_rank: None,
@@ -2486,6 +2494,7 @@ mod tests {
             ProgressCounts::default(),
         );
         state.outside_candidates = vec![PoolCandidate {
+            missing_grooming_signals: None,
             number: 1806,
             state: IssueState::Open,
             priority_rank: Some(1),

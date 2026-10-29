@@ -639,13 +639,15 @@ pub fn compose_outside_candidates(
                 state,
                 priority_rank: priority_from_labels(&labels),
                 plan_present: plan_callout_present(body),
-                // Une seule lecture du corps, trois questions (mika#2952) : le
-                // booléen lâche que mika#2608 a figé, la lecture à trois états
-                // dont le bassin tire son refus, et la dormance. Posées **ici**
+                // Une seule lecture du corps, quatre questions (mika#2952,
+                // mika#2956) : le booléen lâche que mika#2608 a figé, la lecture
+                // à trois états dont le bassin tire son refus, la dormance, et
+                // les trois signaux que le gate du dispatch exige. Posées **ici**
                 // et sur le chemin milestone, parce qu'un prédicat aveugle par
                 // origine est la classe mika#2205 réintroduite.
                 plan_reading: Some(crate::plan_callout::plan_reading(body)),
                 dormancy: Some(crate::milestone_manager::pool::dormancy_reading(body)),
+                missing_grooming_signals: Some(crate::auto_pull::missing_grooming_signals(body)),
                 labels,
             })
         })
@@ -766,6 +768,28 @@ pub fn priority_from_labels(labels: &[String]) -> Option<u8> {
 /// états. La propriété de sur-ensemble épinglée au § 1 est précisément ce qui
 /// rend l'état intermédiaire bien défini : `lâche \ stricte` est non vide, et
 /// c'est la population mesurée.
+///
+/// # Le bassin ne DÉCIDE plus sur ce booléen (mika#2956)
+///
+/// Et ce prédicat est, de nouveau, **inchangé**. Le rapport du sink du
+/// 2026-10-29T10:11:41 a mesuré la seconde moitié de la population du § ci-dessus :
+/// #2194, admise « à admettre » alors que le même rapport disait d'elle
+/// « callout de plan ou de branche absent ». Son corps *cite* `docs/plans/` dans
+/// une ligne de prose citée, donc la seconde branche rend `true`, et le gate du
+/// dispatch (`executor::check_grooming_markers`) l'aurait refusée en
+/// `dispatch_no_grooming_marker` — un dispatch vide, la classe que mika#2952 a
+/// voulu fermer.
+///
+/// Depuis mika#2956, `well_formed_candidates` admet sur
+/// [`crate::auto_pull::missing_grooming_signals`], le prédicat **strict** que le
+/// gate accepte par construction. Ce booléen-ci garde une voix, mais une seule :
+/// il choisit entre deux **libellés** de refus — « plan groomé absent » quand
+/// rien ne cite de plan, « grooming incomplet » quand un plan est cité et que
+/// les trois signaux n'y sont pas. Il nomme, il ne décide plus.
+///
+/// Ses quatre autres consommateurs gardent leur tolérance, `tier2_pick` et le
+/// tier 3 du « Next » inclus : ils lisent `SubIssue::plan_present` et jamais le
+/// champ mesuré (AC3 de mika#2956, fermée par non-modification).
 pub fn plan_callout_present(body: &str) -> bool {
     // Canonical callout shape: `> - **Plan:** docs/plans/...`.
     // Loose form: any occurrence of `docs/plans/` in a callout blockquote.
@@ -958,10 +982,11 @@ pub fn compose_from_gh_outputs(
         }
 
         let plan_present = plan_callout_present(&body);
-        // Le même corps, les deux autres questions (mika#2952) — voir le site
-        // jumeau dans `compose_outside_candidates`.
+        // Le même corps, les trois autres questions (mika#2952, mika#2956) —
+        // voir le site jumeau dans `compose_outside_candidates`.
         let plan_reading = Some(crate::plan_callout::plan_reading(&body));
         let dormancy = Some(crate::milestone_manager::pool::dormancy_reading(&body));
+        let missing_grooming_signals = Some(crate::auto_pull::missing_grooming_signals(&body));
         let branch_present = branch_callout_present(&body);
         let blockers = extract_blockers(&body);
         let priority_rank = priority_from_labels(&labels);
@@ -1029,6 +1054,7 @@ pub fn compose_from_gh_outputs(
             plan_present,
             plan_reading,
             dormancy,
+            missing_grooming_signals,
             branch_present,
             pr_number,
             pr_state,
@@ -1975,6 +2001,7 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
     #[test]
     fn compute_progress_all_completed() {
         let subs = vec![SubIssue {
+            missing_grooming_signals: None,
             number: 1,
             title: "t".into(),
             state: IssueState::Closed,
@@ -2552,6 +2579,7 @@ mod gh_arg_capture_tests {
              "labels": [{"name":"p1-important"}]}
         ]"#;
         let subs = vec![SubIssue {
+            missing_grooming_signals: None,
             number: 1802,
             title: "déjà dans sub_issues".into(),
             state: IssueState::Open,

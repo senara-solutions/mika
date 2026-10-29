@@ -146,6 +146,7 @@ mod tests {
 
     fn cand(number: u64, rank: Option<u8>, plan_present: bool, labels: &[&str]) -> PoolCandidate {
         PoolCandidate {
+            missing_grooming_signals: None,
             number,
             state: IssueState::Open,
             priority_rank: rank,

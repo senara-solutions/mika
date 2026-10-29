@@ -1253,6 +1253,7 @@ mod tests {
             due_on: None,
             last_activity_at: Some("2026-08-20T00:00:00Z".into()),
             sub_issues: vec![SubIssue {
+                missing_grooming_signals: None,
                 number: 1802,
                 title: "LC.2".into(),
                 state: IssueState::Open,
@@ -1611,6 +1612,7 @@ mod tests {
         s.sub_issues.insert(
             0,
             SubIssue {
+                missing_grooming_signals: None,
                 number: 1803,
                 title: "LC.3".into(),
                 state: IssueState::Closed,

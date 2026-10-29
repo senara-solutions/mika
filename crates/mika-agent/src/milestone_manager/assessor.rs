@@ -433,6 +433,7 @@ mod tests {
 
     fn base_issue(number: u64) -> SubIssue {
         SubIssue {
+            missing_grooming_signals: None,
             number,
             title: format!("issue {number}"),
             state: IssueState::Open,
@@ -823,6 +824,7 @@ mod tests {
             labels: vec!["ready".into(), "dispatch:loop".into()],
         }];
         state.outside_candidates = vec![pool::PoolCandidate {
+            missing_grooming_signals: None,
             number: 1700,
             state: IssueState::Open,
             priority_rank: Some(1),
@@ -900,6 +902,7 @@ mod tests {
         a_grommer.priority_rank = Some(1);
         let mut state = base_state(vec![a_grommer]);
         state.outside_candidates = vec![pool::PoolCandidate {
+            missing_grooming_signals: None,
             number: 1700,
             state: IssueState::Open,
             priority_rank: Some(1),

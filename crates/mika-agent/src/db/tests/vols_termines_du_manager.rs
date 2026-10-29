@@ -827,6 +827,7 @@ fn base_semee(corpus: &[(&str, u32, &str, &str)]) -> Database {
 fn sous_ticket(number: u64, pr_state: Option<&str>) -> crate::milestone_manager::types::SubIssue {
     use crate::milestone_manager::types::{CiState, IssueState, SubIssue};
     SubIssue {
+        missing_grooming_signals: None,
         number,
         title: format!("sous-ticket {number}"),
         state: IssueState::Open,

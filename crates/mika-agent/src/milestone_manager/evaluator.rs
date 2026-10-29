@@ -669,6 +669,7 @@ mod tests {
 
     fn sub_issue(number: u64, pr_state: Option<&str>) -> SubIssue {
         SubIssue {
+            missing_grooming_signals: None,
             number,
             title: format!("sujet {number}"),
             state: crate::milestone_manager::types::IssueState::Open,

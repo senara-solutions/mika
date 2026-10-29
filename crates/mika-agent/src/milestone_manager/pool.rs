@@ -139,6 +139,7 @@
 
 use super::plan_size;
 use super::types::{IssueState, SubIssue};
+use crate::auto_pull::GroomingSignal;
 use crate::plan_callout::PlanReading;
 use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL, operator_held_label};
 use serde::{Deserialize, Serialize};
@@ -242,16 +243,16 @@ pub(crate) fn dormancy_reading(body: &str) -> DormancyReading {
 /// hors milestone (`gh issue list`) **n'en mesure aucun**, et les remplir à leur
 /// valeur neutre ferait dire « pas de CI » à une absence de mesure — le motif
 /// mika#2331 que ce dépôt refuse ailleurs (« un null n'est jamais un 0 »). Les
-/// six champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
+/// sept champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
 /// les deux ensembles de candidats partagent un type sans qu'aucun ait à
 /// inventer de valeur.
 ///
-/// Les sixième et septième, `plan_reading` et `dormancy` (mika#2952), ne sont
-/// pas une entorse à cette borne : ce sont des lectures du **corps**, que les
-/// deux lectures d'issues demandent déjà (`--json body`), donc les deux origines
-/// les paient à l'identique et aucune n'a de valeur à inventer. C'est exactement
-/// ce qui les distingue de `pr_state`, `ci_state` et `branch_present`, qui sont
-/// mesurés sur un seul chemin.
+/// Les trois lectures du **corps** — `plan_reading` et `dormancy` (mika#2952),
+/// `missing_grooming_signals` (mika#2956) — ne sont pas une entorse à cette
+/// borne : les deux lectures d'issues demandent déjà le corps (`--json body`),
+/// donc les deux origines les paient à l'identique et aucune n'a de valeur à
+/// inventer. C'est exactement ce qui les distingue de `pr_state`, `ci_state` et
+/// `branch_present`, qui sont mesurés sur un seul chemin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolCandidate {
     pub number: u64,
@@ -281,6 +282,19 @@ pub struct PoolCandidate {
     /// mesurée ; `None` est l'autre chose, l'absence de mesure.
     #[serde(default)]
     pub dormancy: Option<DormancyReading>,
+    /// Lesquels des trois signaux de grooming manquent au corps (mika#2956).
+    ///
+    /// Troisième lecture du **corps**, donc dans la même borne que les deux
+    /// précédentes : les deux lectures d'issues demandent déjà `--json body`, et
+    /// aucune n'a de valeur à inventer.
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison des deux champs précédents :
+    /// `None` dit « ce binaire n'a pas lu le corps », jamais « rien ne manque »
+    /// (mika#2340), et ne déclenche donc aucun refus ici — un blob écrit avant ce
+    /// vol retombe sur le plancher `plan_present`, celui d'avant. `Some(vec![])`
+    /// est la mesure « les trois signaux sont là ».
+    #[serde(default)]
+    pub missing_grooming_signals: Option<Vec<GroomingSignal>>,
     pub labels: Vec<String>,
 }
 
@@ -296,6 +310,7 @@ impl From<&SubIssue> for PoolCandidate {
             plan_present: s.plan_present,
             plan_reading: s.plan_reading,
             dormancy: s.dormancy.clone(),
+            missing_grooming_signals: s.missing_grooming_signals.clone(),
             labels: s.labels.clone(),
         }
     }
@@ -1005,13 +1020,21 @@ mod tests {
             state: IssueState::Open,
             priority_rank: rank,
             plan_present,
-            // `None` et non `Some(Live)` / `Some(Awake)` : la graine partagée
-            // reste celle d'un blob antérieur à mika#2952 sur les **deux**
+            // `None` et non `Some(Live)` / `Some(Awake)` / `Some(vec![])` : la
+            // graine partagée reste celle d'un blob antérieur sur les **trois**
             // lectures de corps, donc les verdicts que les tests du vol 2 et du
-            // vol 3 épinglent ne bougent pas. Les tests de mika#2952 posent la
-            // lecture qui les concerne explicitement, par `..cand(…)`.
+            // vol 3 épinglent ne bougent pas. Les tests de mika#2952 et de
+            // mika#2956 posent la lecture qui les concerne explicitement, par
+            // `..cand(…)`.
+            //
+            // `Some(vec![])` serait en outre une graine **incohérente** sous
+            // `plan_present: false` — « les trois signaux sont là » alors que rien
+            // ne cite de plan est un état qu'aucun corps ne produit, puisque
+            // `PlanCallout` manquerait. `None` se compose avec les deux valeurs
+            // de l'argument.
             plan_reading: None,
             dormancy: None,
+            missing_grooming_signals: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1360,6 +1383,7 @@ mod tests {
     fn mika2699_la_projection_dune_sub_issue_porte_les_champs_de_ladmission() {
         use crate::milestone_manager::types::CiState;
         let sub = SubIssue {
+            missing_grooming_signals: None,
             number: 2699,
             title: "le manager tient le bassin ready".into(),
             state: IssueState::Open,
@@ -1388,6 +1412,7 @@ mod tests {
         assert_eq!(
             PoolCandidate::from(&sub),
             PoolCandidate {
+                missing_grooming_signals: None,
                 number: 2699,
                 state: IssueState::Open,
                 priority_rank: Some(2),
