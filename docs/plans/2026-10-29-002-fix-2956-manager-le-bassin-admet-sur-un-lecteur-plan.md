@@ -14,15 +14,34 @@
 `pool.rs`, queue de l'échelle d'admission dans `well_formed_candidates` :
 
 ```rust
-if s.plan_reading == Some(PlanReading::PriorOnly) { … RefusalReason::PriorPlanOnly; continue; }
-if !s.plan_present { … RefusalReason::NoGroomedPlan; continue; }
-eligible.push((s, origin));
+            if s.plan_reading == Some(PlanReading::PriorOnly) {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::PriorPlanOnly,
+                });
+                continue;
+            }
+            if !s.plan_present {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::NoGroomedPlan,
+                });
+                continue;
+            }
+            eligible.push((s, origin));
 ```
 
 `plan_present` est alimenté par `reader::plan_callout_present` (`reader.rs:769-782`), qui rend vrai sur **toute** ligne de citation contenant la sous-chaîne `docs/plans/` :
 
 ```rust
-if t.starts_with("> ") && t.contains("docs/plans/") { return true; }
+        if t.starts_with("> ") && t.contains("**Plan:**") {
+            return true;
+        }
+        if t.starts_with("> ") && t.contains("docs/plans/") {
+            return true;
+        }
 ```
 
 Donc une admission du bassin n'atteste **aucun** des trois signaux que le gate du dispatch exige. L'écart n'est pas d'un cheveu : il est de deux signaux sur trois.
@@ -60,24 +79,27 @@ Conséquence qui décide tout le plan : **`is_groomed(b) ⟹ check_grooming_mark
 
 `grooming_marker.rs`, en-tête `//!` :
 
-> Elles restent volontairement asymétriques sur la rigueur […] L'écart va dans le sens sûr : **le lecteur strict est celui qui promeut.**
-> `auto_pull` décide d'une promotion, `executor` d'un routage : […] un prédicat commun leur imposerait la rigueur du plus strict ou la tolérance du plus lâche sans que personne ait tranché lequel.
+> Elles restent volontairement asymétriques sur la rigueur — `auto_pull` ancre ses trois prédicats en début de ligne et lit hors des blocs clôturés, `executor` se contente d'une sous-chaîne. L'écart va dans le sens sûr : le lecteur strict est celui qui promeut.
+
+> **Ce module n'a pas absorbé cette moitié-là, et ce n'est pas un oubli.** `auto_pull` décide d'une promotion, `executor` d'un routage : les deux lisent le même callout mais n'engagent pas la même dépense, et un prédicat commun leur imposerait la rigueur du plus strict ou la tolérance du plus lâche sans que personne ait tranché lequel.
 
 `auto_pull.rs`, doc-comment de `is_groomed` :
 
-> `executor::check_grooming_markers` se contente de la sous-chaîne `docs/plans/`, non ancrée. **Ne le resserrez pas pour « harmoniser » les deux** […] C'est le lecteur qui rejoint son écrivain, pas l'inverse.
+> `executor::check_grooming_markers` se contente de la sous-chaîne `docs/plans/`, non ancrée. **Ne le resserrez pas pour « harmoniser » les deux** — ce sens-là de l'alignement recréerait le défaut symétrique de celui que ce ticket ferme. C'est le lecteur qui rejoint son écrivain, pas l'inverse.
 
-`plan_callout.rs:48`, table des quatre tolérances, ligne `executor` : *« intouché — resserrement **interdit** »*. La même table nomme `reader::plan_callout_present` comme le lecteur lâche **ratifié** par mika#2608, dont le doc-comment (`reader.rs:725-782`) enregistre les quatre raisons pour lesquelles la forme lâche est prescrite et conclut : *« La levée a pris la forme d'une séparation, et ce prédicat est inchangé. »*
+`plan_callout.rs:48`, table des quatre tolérances, ligne `executor`, colonne statut : *« intouché — resserrement **interdit** par le doc-comment de `auto_pull::is_groomed` »*. La même table nomme `milestone_manager::reader::plan_callout_present` comme la tolérance *« **conservée, décidée** par mika#2608 »*, et le doc-comment de ce prédicat (`reader.rs:725-782`) conclut :
+
+> La levée a pris la forme d'une **séparation**, et ce prédicat est **inchangé** : mika#2608 reste en vigueur, ses deux tests sont verts sans édition, et les quatre consommateurs du booléen gardent leur tolérance.
 
 Ce plan ne resserre donc **aucun** des deux lecteurs lâches. Il ajoute une lecture orthogonale — le motif mika#2952, déjà appliqué deux fois dans ce module (`plan_reading`, `dormancy`).
 
 ### 1.4 `plan_reading` ne rattrape pas le défaut
 
-`plan_callout.rs:397-455` : `PlanReading::Live` ne dit que ceci — *il existe un callout `> - **Plan:** …` strict hors bloc clôturé*. Il ne dit rien du callout de branche ni du verdict GROOMED. Aucun des sept champs actuels de `PoolCandidate` (`number`, `state`, `priority_rank`, `plan_present`, `plan_reading`, `dormancy`, `labels`) ne mesure ces deux axes. Le défaut n'est donc pas réparable par un réordonnancement de l'échelle : **il manque une mesure.**
+`plan_callout.rs:397-455` : `PlanReading::Live` répond à une seule question, et son doc-comment la nomme — *« un vol est-il groomé et dû sur ce ticket ? »*. Il atteste qu'il existe un callout de plan strict hors bloc clôturé, et rien de plus : il ne dit rien du callout de branche ni du verdict GROOMED. Aucun des sept champs actuels de `PoolCandidate` (`number`, `state`, `priority_rank`, `plan_present`, `plan_reading`, `dormancy`, `labels`) ne mesure ces deux axes. Le défaut n'est donc pas réparable par un réordonnancement de l'échelle : **il manque une mesure.**
 
 ### 1.5 L'état de #2194 au 2026-10-29, et pourquoi la sonde ne porte pas sur elle
 
-Mesuré aujourd'hui : #2194 est OPEN, sans label, hors jalon. Son corps porte depuis le 2026-10-29 une ligne 5 `> **Condition de réveil :** …` et une ligne 7 de prose `> Plan de référence : \`docs/plans/2026-10-19-005-…-plan.md\` (sur \`main\`, § 1). La branche du vol 3 n'existe plus.` Ni `**Branch:**`, ni `**Plan:**` strict, ni `Grooming history`.
+Mesuré aujourd'hui : #2194 est OPEN, sans label, hors jalon. Son corps porte depuis le 2026-10-29 une ligne de réveil au préfixe `> **Condition de réveil :**`, puis une ligne de prose en citation qui nomme un plan de référence sous `docs/plans/` et signale que la branche du vol 3 n'existe plus. Il ne porte ni `**Branch:**`, ni `**Plan:**` strict, ni `Grooming history`.
 
 Donc **#2194 est aujourd'hui captée par le bras `Dormant`** (mika#2952 vol 2/2), en amont du bras défaillant. Deux conséquences opératoires :
 
@@ -99,14 +121,18 @@ La cause nommée par le ticket reste entière : elle valait pour #2194 avant l'a
 `grooming_marker.rs` ~l. 560-680 : `FIXTURES` (six corps gelés via `include_str!`), `fixture_table`, et
 
 ```rust
-#[test]
-fn ac7_both_rust_predicates_agree_on_the_frozen_bodies() {
-    for (ticket, body, _) in FIXTURES {
-        let p1 = crate::auto_pull::is_groomed(body);
-        let p2 = crate::skills::executor::check_grooming_markers(body).is_empty();
-        assert_eq!(p1, p2, …);
+    #[test]
+    fn ac7_both_rust_predicates_agree_on_the_frozen_bodies() {
+        for (ticket, body, _) in FIXTURES {
+            let p1 = crate::auto_pull::is_groomed(body);
+            let p2 = crate::skills::executor::check_grooming_markers(body).is_empty();
+            assert_eq!(
+                p1, p2,
+                "fixture #{ticket}: désaccord entre les prédicats — \
+                 auto_pull::is_groomed={p1}, executor::check_grooming_markers().is_empty()={p2}"
+            );
+        }
     }
-}
 ```
 
 Plus `mika2120_repo_prefixed_plan_callout_is_read_by_both_predicates` et la garde structurelle `no_grooming_regex_outside_this_module`. **Les deux prédicats sont donc déjà d'accord sur les six corps gelés** : l'implication du § 1.2 y est vraie sans exception, ce qui est la mesure qui rend la Fire-Disposition verte à la livraison (§ Fire-Disposition).
@@ -152,13 +178,32 @@ pub enum GroomingSignal { BranchCallout, PlanCallout, GroomedVerdict }
 
 impl GroomingSignal {
     /// Le mot posé sur le fil (rapport, journal). Format de fil.
-    pub fn token(self) -> &'static str { … }
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::BranchCallout => "branch_callout",
+            Self::PlanCallout => "plan_callout",
+            Self::GroomedVerdict => "groomed_verdict",
+        }
+    }
 }
 
 /// Lesquels des trois signaux manquent — dans l'ordre de
 /// `check_grooming_markers`, pour que les deux listes soient comparables
 /// élément par élément.
-pub fn missing_grooming_signals(body: &str) -> Vec<GroomingSignal> { … }
+pub fn missing_grooming_signals(body: &str) -> Vec<GroomingSignal> {
+    let readable = strip_fenced_blocks(body);
+    let mut missing = Vec::new();
+    if extract_branch_name(&readable).is_none() {
+        missing.push(GroomingSignal::BranchCallout);
+    }
+    if extract_plan_path(&readable).is_none() {
+        missing.push(GroomingSignal::PlanCallout);
+    }
+    if !crate::grooming_marker::has_groomed_verdict(&readable) {
+        missing.push(GroomingSignal::GroomedVerdict);
+    }
+    missing
+}
 
 pub fn is_groomed(body: &str) -> bool { missing_grooming_signals(body).is_empty() }
 ```
@@ -172,7 +217,7 @@ L'ordre d'évaluation change (branche, plan, verdict au lieu de verdict, branche
 ///
 /// `None` = **ce binaire n'a pas lu le corps** (blob d'un binaire antérieur à
 /// ce champ), jamais « rien ne manque ». `Some(vec![])` = mesuré et groomé.
-/// `Some([…])` = mesuré, et voici ce qui manque.
+/// Un `Some` non vide = mesuré, et voici ce qui manque.
 #[serde(default)]
 pub missing_grooming_signals: Option<Vec<GroomingSignal>>,
 ```
@@ -223,8 +268,9 @@ if let Some(missing) = s.missing_grooming_signals.as_deref()
     refusals.push(AdmissionRefusal { number: s.number, origin, reason });
     continue;
 }
-if !s.plan_present { … RefusalReason::NoGroomedPlan; continue; }
 ```
+
+Le bras 5 est le filtre `if !s.plan_present` d'aujourd'hui, cité au § 1.1 : il reste en place, inchangé, immédiatement sous le bras 4, et ne décide plus que du cas où le champ vaut `None`.
 
 Deux propriétés à retenir, parce qu'elles sont le cœur de la décision :
 
@@ -289,20 +335,20 @@ Production :
 - `PoolCandidate` gagne le champ ; son doc-comment passe de « les six champs » à « les sept champs ci-dessous sont exactement ceux que `assess_pool` consulte », et le champ rejoint la liste de ceux qui sont dérivés du corps donc gratuits sur les deux chemins.
 - `impl From<&SubIssue> for PoolCandidate` propage le champ.
 - Le bras 4 de l'échelle, avec les deux commentaires du § 2.6.
-- Le helper de test `fn cand(…)` gagne le champ (défaut : `Some(vec![])`, « mesuré et groomé », pour que les tests existants restent verts sans édition de leurs assertions).
+- Le helper de test `cand` gagne le champ (défaut : `Some(vec![])`, « mesuré et groomé », pour que les tests existants restent verts sans édition de leurs assertions).
 
 Tests (dans `mod tests`, via `assess_pool_sans_tailles`) :
 
-1. **AC1** — `mika2956_un_corps_qui_cite_docs_plans_sans_branche_ni_verdict_nest_pas_admis` : fixture synthétique de la forme du § 1.5 (`> Plan de référence : \`docs/plans/…-plan.md\``, ni `**Branch:**`, ni verdict), passée par le vrai `missing_grooming_signals`. Assertions : absent de `admit` ; présent dans `refusals` avec `UngroomedForDispatch` ; `missing` contient `BranchCallout` et `GroomedVerdict` et **pas** `PlanCallout` (le gate est lâche sur cet axe, et le test le dit plutôt que de le taire).
+1. **AC1** — `mika2956_un_corps_qui_cite_docs_plans_sans_branche_ni_verdict_nest_pas_admis` : fixture synthétique de la forme du § 1.5 — une seule ligne de citation en prose, `> Plan de référence : \`docs/plans/2026-01-01-001-fixture-plan.md\``, sans callout de branche et sans verdict, passée par le vrai `missing_grooming_signals`. Assertions : absent de `admit` ; présent dans `refusals` avec `UngroomedForDispatch` ; `missing` contient `BranchCallout` et `GroomedVerdict` et **pas** `PlanCallout` (le gate est lâche sur cet axe, et le test le dit plutôt que de le taire).
 2. **AC1, relève** — `mika2956_un_refus_de_grooming_entre_dans_la_releve` : `name_relief` nomme ce ticket dans `next` ou `beyond`. Contrôle négatif dans le même test : un `Dormant` n'y entre pas.
 3. **AC2, contrôle négatif** — même fonction de test que (1), second candidat : corps canoniquement groomé (les trois signaux) ⇒ **reste admis**, et `refusals` ne le contient pas. C'est la paire qui sépare « le bras refuse la bonne population » de « le bras refuse tout ».
 4. **Effet de bord** — `mika2956_un_candidat_non_groome_ne_demande_plus_destimation` : `numbers_needing_size` ne contient pas le candidat de (1).
-5. **AC3** — `mika2956_le_next_ne_lit_pas_le_nouveau_champ` : un `SubIssue` dont `missing_grooming_signals` vaut `Some([…])` non vide mais dont `plan_present` est vrai reste choisi par `tier2_pick` et absent du tier 3. Le test est le garde-fou de la prose du § 4 : il rougit le jour où quelqu'un câble le nouveau champ dans l'assesseur.
+5. **AC3** — `mika2956_le_next_ne_lit_pas_le_nouveau_champ` : un `SubIssue` dont `missing_grooming_signals` vaut un `Some` non vide mais dont `plan_present` est vrai reste choisi par `tier2_pick` et absent du tier 3. Le test est le garde-fou de la prose du § 4 : il rougit le jour où quelqu'un câble le nouveau champ dans l'assesseur.
 6. **Plancher** — `mika2956_un_corps_non_mesure_retombe_sur_lancien_plancher` : `missing_grooming_signals == None` + `plan_present == false` ⇒ `NoGroomedPlan`, comme avant. `None` ne vaut jamais admission.
 
 ### 5.5 `crates/mika-agent/src/grooming_marker.rs` — la liaison d'AC2
 
-Le test de parité existant (`ac7_…`) assure **l'égalité** sur les six corps gelés. L'égalité est fausse en général **par conception** (§ 1.3) et son harmonisation est interdite. Le lien qu'AC2 demande est donc posé sur l'**implication**, qui est vraie partout :
+Le test de parité existant (`ac7_both_rust_predicates_agree_on_the_frozen_bodies`) assure **l'égalité** sur les six corps gelés. L'égalité est fausse en général **par conception** (§ 1.3) et son harmonisation est interdite. Le lien qu'AC2 demande est donc posé sur l'**implication**, qui est vraie partout :
 
 ```rust
 /// Le bassin du manager admet sur `is_groomed` (mika#2956). Cette implication
@@ -311,14 +357,24 @@ Le test de parité existant (`ac7_…`) assure **l'égalité** sur les six corps
 /// (`gate` ∖ `is_groomed` — orthographes non canoniques, callout dans un bloc
 /// clôturé) est refusé par le bassin dans le sens sûr, et c'est voulu.
 #[test]
-fn mika2956_is_groomed_implique_le_gate_du_dispatch() { … }
+fn mika2956_is_groomed_implique_le_gate_du_dispatch() {
+    for (ticket, body, _) in FIXTURES {
+        if crate::auto_pull::is_groomed(body) {
+            assert!(
+                crate::skills::executor::check_grooming_markers(body).is_empty(),
+                "fixture #{ticket}: is_groomed accepte un corps que le gate du \
+                 dispatch refuse — l'implication qui porte le bassin est rompue"
+            );
+        }
+    }
+}
 ```
 
 Plus `mika2956_le_vocabulaire_des_signaux_est_commun_aux_deux_predicats` : sur un corps vide, `check_grooming_markers` rend ses trois jetons dans l'ordre, et `missing_grooming_signals` rend les trois variantes dont les `token()` sont ces jetons, dans le même ordre. Une renomination d'un côté rougit : la parité de vocabulaire devient un fait testé, et le `missing` du rapport du bassin se lit avec le même grep que le `missing_signals` du refus de dispatch.
 
 ### 5.6 Essaimage littéral
 
-`SubIssue { … }` : **28** sites (`assessor.rs`, `pool.rs`, `spawn.rs`, `db/tests/vols_termines_du_manager.rs`, `reporter.rs`, `cadence.rs`, `reader.rs`, `types.rs`, `evaluator.rs`, `tests/manager_delivery_observability_2267.rs`). `PoolCandidate { … }` : **30** sites (`assessor.rs`, `pool.rs`, `relief.rs`, `reporter.rs`, `reader.rs`). ≈ **58 ajouts d'une ligne**, mécaniques, en une passe.
+Le littéral de struct `SubIssue {` : **28** sites (`assessor.rs`, `pool.rs`, `spawn.rs`, `db/tests/vols_termines_du_manager.rs`, `reporter.rs`, `cadence.rs`, `reader.rs`, `types.rs`, `evaluator.rs`, `tests/manager_delivery_observability_2267.rs`). le littéral `PoolCandidate {` : **30** sites (`assessor.rs`, `pool.rs`, `relief.rs`, `reporter.rs`, `reader.rs`). ≈ **58 ajouts d'une ligne**, mécaniques, en une passe.
 
 ---
 
@@ -360,7 +416,7 @@ Les trois dernières lignes ne sont pas décoratives : `check-byte-slices.sh` (m
 | 1 | section `### Bassin ready (mode ombre — aucune écriture)`, relever chaque ligne `- À admettre : #N` | la liste des numéros à vérifier ; **liste vide ⇒ sonde non concluante**, pas sonde verte (voir ci-dessous) |
 | 2 | pour chaque `#N` : `gh issue view N --repo senara-solutions/mika --json body` | le corps tel que le binaire l'a lu |
 | 3 | relire ce corps contre `is_groomed` | **vrai pour chaque numéro** — c'est AC4 |
-| 4 | section du bassin, lignes `- Refusé :` | au moins une ligne `grooming incomplet — manque …` si la population existe ce jour-là ; son `missing` se lit avec le même grep que le `missing_signals` d'un refus `dispatch_no_grooming_marker` |
+| 4 | section du bassin, lignes `- Refusé :` | au moins une ligne de la forme `grooming incomplet — manque branch_callout, groomed_verdict` si la population existe ce jour-là ; son `missing` se lit avec le même grep que le `missing_signals` d'un refus `dispatch_no_grooming_marker` |
 | 5 | lignes `- Taille non vérifiée :` | population rétrécie (§ 2.7) ; aucune entrée dont le corps échoue à `is_groomed` |
 
 **Deux mises en garde, parce qu'une sonde qui mentirait ici est pire que pas de sonde.**
