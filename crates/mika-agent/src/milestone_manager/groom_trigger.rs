@@ -1,5 +1,5 @@
 //! Le geste de groom de la relève — `MIKA_MANAGER_GROOM_WRITE`, OFF par défaut
-//! (mika#2958, vol 1/2).
+//! (mika#2958, vols 1 et 2a).
 //!
 //! Ce fichier est la **troisième et dernière** exception nommée de l'allowlist
 //! de `no_dispatch_test.rs`, pour l'unique jeton `message/send`. Tout le reste
@@ -48,11 +48,12 @@
 //!
 //! ## Ce que ce vol ne fait pas
 //!
-//! **Il ne porte pas le rail.** Aucune implémentation de [`GroomSender`] n'est
-//! livrée ici : au vol 1, `sender` est `None` au site d'appel, ce qui est le cas
-//! nominal et se lit comme tel (`reason = "no_sender"`). Le rail A2A, le câblage
-//! de cycle, la lecture « un groom est en cours » et le rendu de rapport (AC4,
-//! moitié ON) sont le vol 2 — voir le `Tracked in:` du corps de PR de ce vol.
+//! **Il porte le rail, mais ne le branche pas.** [`A2aGroomSender`] est livré
+//! par le vol 2a, et reste un objet qu'aucun cycle n'instancie : `sender` est
+//! `None` au site d'appel, ce qui est le cas nominal et se lit comme tel
+//! (`reason = "no_sender"`). Le câblage de cycle, la lecture « un groom est en
+//! cours » et le rendu de rapport (AC4, moitié ON) sont les vols 2b et 2c —
+//! voir le `Tracked in:` du corps de PR de ce vol.
 //!
 //! **Il n'ouvre pas l'interrupteur.** L'ouverture reste un geste opérateur, au
 //! seuil écrit dans le vol 1 de la Phase 2 (c) : les interrupteurs de
@@ -103,7 +104,7 @@ pub(crate) fn armed_from_value(raw: Option<&str>) -> bool {
     }
 }
 
-/// L'émetteur du geste, **injectable** — le rail arrive au vol 2.
+/// L'émetteur du geste, **injectable** — le rail est [`A2aGroomSender`].
 #[async_trait::async_trait]
 pub trait GroomSender: Send + Sync {
     /// `instruction` est le corps du message utilisateur, déjà formé :
@@ -117,7 +118,8 @@ pub trait GroomSender: Send + Sync {
 ///
 /// Le vol 1 fixe l'énumération et la fige par un test de vocabulaire de fil
 /// (mika#1990 D8) : les opérateurs groupent sur [`GroomSendError::classe`]. Le
-/// vol 2, qui portera le rail, en dérive les variants du code de statut.
+/// vol 2a en dérive les variants, dans [`classify_send_outcome`] pour les
+/// réponses HTTP et dans [`A2aGroomSender::send`] pour les échecs de transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroomSendError {
     /// mika-dev tient déjà un verrou de tour : la file d'attente A2A refuse
