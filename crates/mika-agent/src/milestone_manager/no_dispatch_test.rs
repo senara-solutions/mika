@@ -12,6 +12,8 @@
 //! - No `gh issue edit` (label mutations).
 //! - No `gh pr merge` (PR merge).
 //! - No `gh pr comment` / `gh issue comment` (write to GitHub).
+//! - No `message/send` (the A2A engine door: sending an instruction to another
+//!   agent is a write, even though no GitHub call appears in it).
 //!
 //! If a legitimate use of any of these ever appears (e.g., Phase 2 promotion after the
 //! 3 portes are cleared), the fix is to update this test AND the module docstring
@@ -54,23 +56,32 @@ const FORBIDDEN_TOKENS: &[&str] = &[
     // ahead of it.
     "dispatcher_source = 'mika_manager'",
     "dispatcher_source=\"mika_manager\"",
+    // mika#2958 — la porte moteur. `message/send` est la méthode A2A par
+    // laquelle un agent fait agir un autre agent : aucune API GitHub n'y
+    // apparaît, et c'est pourtant une écriture. Le jeton entre ici **avec** son
+    // exception nommée ci-dessous, et il entre sur une mesure : avant ce
+    // ticket, aucun fichier du module ne le portait, donc le scan se resserre
+    // sans amnistier une seule occurrence préexistante.
+    "message/send",
 ];
 
 /// Files exempt from the grep — this test file itself contains the tokens as literals.
 const EXEMPT_FILES: &[&str] = &["no_dispatch_test.rs"];
 
-/// Exceptions **nommées**, par `(fichier, jeton, raison)`. Deux lignes : le vol 2
-/// de mika#2698 a inscrit la première, le vol 4 de mika#2699 la seconde. Une par
-/// geste d'écriture que la Phase 2 du manager a reçu par un ticket, et aucune
-/// autre — un troisième geste est un troisième ticket, avec son propre seuil
-/// d'ouverture.
+/// Exceptions **nommées**, par `(fichier, jeton, raison)`. Trois lignes : le
+/// vol 2 de mika#2698 a inscrit la première, le vol 4 de mika#2699 la seconde,
+/// mika#2958 la troisième. Une par geste d'écriture que la Phase 2 du manager a
+/// reçu par un ticket, et aucune autre — un quatrième geste est un quatrième
+/// ticket, avec son propre seuil d'ouverture.
 ///
 /// Une exception par *fichier et par jeton*, jamais par fichier seul : exempter
 /// un fichier entier rendrait ses autres jetons invisibles, ce qui est
 /// précisément la façon dont un garde structurel meurt sans bruit. La propriété
 /// est tenue par `mika2698_une_exception_ne_couvre_quun_seul_jeton_du_fichier`
 /// — `verdict_poster.rs` reste donc interdit sur `gh pr merge`, `gh issue edit`
-/// et les dix-neuf autres, et `pool_writer.rs` l'est sur `gh issue comment`.
+/// et les dix-neuf autres, `pool_writer.rs` l'est sur `gh issue comment`, et le
+/// fichier du geste de groom l'est sur les vingt-deux jetons qui ne sont pas le
+/// sien.
 ///
 /// **Ce que chaque exception coûte, et ce qui le paie.** Le grep ne protège plus
 /// le couple nommé, donc l'AC1 du ticket concerné ne repose plus sur lui seul.
@@ -89,6 +100,11 @@ const EXEMPTED_OCCURRENCES: &[(&str, &str, &str)] = &[
         "pool_writer.rs",
         "gh issue edit",
         "mika#2699 vol 4 — pose `ready` + rattache au milestone cible en un geste groupé, derrière MIKA_MANAGER_POOL_WRITE",
+    ),
+    (
+        "groom_trigger.rs",
+        "message/send",
+        "mika#2958 — déclenche le groom de la relève par la voie moteur (A2A vers mika-dev, jamais un spawn), derrière MIKA_MANAGER_GROOM_WRITE, OFF par défaut",
     ),
 ];
 
@@ -126,19 +142,22 @@ fn no_dispatch_scaffolding_in_milestone_manager() {
     }
 }
 
-/// mika#2699 vol 4 — l'allowlist porte **les deux** gestes, et pas un de plus.
+/// mika#2958 — l'allowlist porte **les trois** gestes, et pas un de plus.
 ///
 /// Ce test n'est pas une tautologie : il est le **prix** des gestes d'écriture.
-/// Chacun des deux tickets autorise exactement un geste derrière son propre
+/// Chacun des trois tickets autorise exactement un geste derrière son propre
 /// interrupteur, et c'est ici qu'ils se déclarent — avec leur fichier, leur
 /// jeton et leur raison. Le vol 1 de mika#2698 exigeait que cette assertion
 /// change « EN MÊME TEMPS que la branche ON de l'interrupteur et que le
-/// docstring du module » : elle l'a fait deux fois, dans le commit qui a créé
-/// `verdict_poster.rs` puis dans celui qui a créé `pool_writer.rs`.
+/// docstring du module » : elle l'a fait trois fois, dans le commit qui a créé
+/// `verdict_poster.rs`, dans celui qui a créé `pool_writer.rs`, puis dans celui
+/// qui a créé `groom_trigger.rs`.
 ///
-/// Ce qui rougit : une troisième entrée, un autre fichier, un autre jeton. Aucun
-/// des trois ne se justifie par ces deux tickets — un geste d'écriture de plus
-/// est un ticket de plus, avec son propre seuil d'ouverture.
+/// Ce qui rougit : une quatrième entrée, un autre fichier, un autre jeton. Aucun
+/// des trois ne se justifie par ces trois tickets — un geste d'écriture de plus
+/// est un ticket de plus, avec son propre seuil d'ouverture. La Phase 2 du
+/// manager a reçu trois gestes d'écriture, un par vol, et c'est tout ce qu'elle
+/// a reçu.
 ///
 /// **Et ce qui rougit aussi, le jour où une exception devient inutile.** La
 /// dernière boucle vérifie que chaque couple exempté existe *encore* : le
@@ -149,13 +168,13 @@ fn no_dispatch_scaffolding_in_milestone_manager() {
 /// rend inutile). Le scan est fait sur la source **privée de commentaires**,
 /// parce qu'une prose qui cite le jeton n'est pas un geste (mika#2050, signal S).
 #[test]
-fn mika2699_lallowlist_porte_les_deux_gestes_et_pas_un_de_plus() {
+fn mika2958_lallowlist_porte_les_trois_gestes_et_pas_un_de_plus() {
     assert_eq!(
         EXEMPTED_OCCURRENCES.len(),
-        2,
-        "la Phase 2 du manager n'a reçu que deux gestes d'écriture : l'allowlist doit porter \
-         exactement deux entrées. Une écriture de plus est un autre ticket, avec son propre \
-         seuil d'ouverture : {EXEMPTED_OCCURRENCES:?}"
+        3,
+        "la Phase 2 du manager n'a reçu que trois gestes d'écriture, un par vol : l'allowlist \
+         doit porter exactement trois entrées. Une écriture de plus est un autre ticket, avec \
+         son propre seuil d'ouverture : {EXEMPTED_OCCURRENCES:?}"
     );
 
     let (fichier, jeton, raison) = EXEMPTED_OCCURRENCES[0];
@@ -186,6 +205,22 @@ fn mika2699_lallowlist_porte_les_deux_gestes_et_pas_un_de_plus() {
     );
     assert!(
         raison.contains("mika#2699") && raison.contains("MIKA_MANAGER_POOL_WRITE"),
+        "la raison doit nommer le ticket et l'interrupteur : {raison}"
+    );
+
+    let (fichier, jeton, raison) = EXEMPTED_OCCURRENCES[2];
+    assert_eq!(
+        fichier, "groom_trigger.rs",
+        "la troisième exception nomme le fichier qui porte la branche ON de l'interrupteur du \
+         geste de groom, et lui seul"
+    );
+    assert_eq!(
+        jeton, "message/send",
+        "le seul jeton que mika#2958 autorise — la porte moteur, ni un spawn, ni un dispatch \
+         d'implémentation"
+    );
+    assert!(
+        raison.contains("mika#2958") && raison.contains("MIKA_MANAGER_GROOM_WRITE"),
         "la raison doit nommer le ticket et l'interrupteur : {raison}"
     );
 
@@ -253,6 +288,39 @@ fn mika2698_le_scan_rougit_sur_une_source_fautive() {
         )
         .is_empty(),
         "limite connue : la forme éclatée en `.args([…])` échappe au grep textuel"
+    );
+
+    // mika#2958 — le jeton de la porte moteur, même traitement. Dans un fichier
+    // qui n'est pas l'exception nommée, il rougit ; et c'est bien l'exception
+    // qui le laisse passer dans le fichier du geste, pas un trou dans le scan.
+    let moteur = "let method = \"message/send\";";
+    let found = scan_source("cadence.rs", "cadence.rs", moteur, EXEMPTED_OCCURRENCES);
+    assert_eq!(
+        found.len(),
+        1,
+        "le scan doit trouver `message/send` dans une source fautive, trouvé : {found:?}"
+    );
+    assert_eq!(found[0].1, "message/send");
+    assert!(
+        scan_source(
+            "groom_trigger.rs",
+            "groom_trigger.rs",
+            moteur,
+            EXEMPTED_OCCURRENCES
+        )
+        .is_empty(),
+        "l'exception nommée couvre ce couple `(fichier, jeton)` — et seulement lui"
+    );
+    assert_eq!(
+        scan_source(
+            "groom_trigger.rs",
+            "groom_trigger.rs",
+            "let cmd = \"gh issue comment 2958\";",
+            EXEMPTED_OCCURRENCES
+        )
+        .len(),
+        1,
+        "l'exception ne couvre qu'un jeton : le fichier du geste reste interdit sur les autres"
     );
 }
 

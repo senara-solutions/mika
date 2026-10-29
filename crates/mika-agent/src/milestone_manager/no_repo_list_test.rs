@@ -166,7 +166,13 @@ fn est_declaration_ou_import(t: &str) -> bool {
 /// `#[cfg(test)]` immédiatement suivi de `mod <nom>;`. Lus dans le fichier qui
 /// les déclare, parce que c'est cette déclaration — et non leur chemin — qui en
 /// fait du code de test.
-fn modules_de_test_extraits(mod_rs: &str) -> Vec<String> {
+///
+/// `pub(super)` depuis mika#2958 : le `mod tests` de `mod.rs` a besoin de la
+/// **même** classification pour sa moitié « un seul déclarant de
+/// l'interrupteur », et deux lectures de « ce fichier est-il du code de test ? »
+/// divergeraient le jour où un troisième garde extrait arrive (doctrine du
+/// lecteur unique, mika#2201).
+pub(super) fn modules_de_test_extraits(mod_rs: &str) -> Vec<String> {
     let lignes: Vec<&str> = mod_rs.lines().map(str::trim).collect();
     lignes
         .windows(2)
