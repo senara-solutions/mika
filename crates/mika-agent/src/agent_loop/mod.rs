@@ -22,12 +22,13 @@ use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
     DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL, FrequencyAssertionNature,
-    PendingFabricationP0, PendingFabricationP0Site, RESPONSE_LANGUAGE_DRIFT_LABEL,
-    TESTIMONY_ACCESS_PROPOSAL_LABEL, TIME_OF_DAY_GREETING_LABEL, TestimonyProposalChannel,
-    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends,
-    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
-    detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
-    detect_fabricated_action_claim, detect_false_local_hosting_claim,
+    PendingFabricationP0, PendingFabricationP0Site, RESPONSE_CJK_SCRIPT_LABEL,
+    RESPONSE_LANGUAGE_DRIFT_LABEL, TESTIMONY_ACCESS_PROPOSAL_LABEL, TIME_OF_DAY_GREETING_LABEL,
+    TestimonyProposalChannel, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
+    UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
+    asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    detect_asserted_unavailability, detect_cjk_script_response, detect_doctrine_public_promo,
+    detect_equivalence_claim, detect_fabricated_action_claim, detect_false_local_hosting_claim,
     detect_response_language_drift, detect_testimony_access_proposal,
     detect_time_of_day_greeting_mismatch, detect_unactioned_frequency_promise,
     detect_unverified_callback_state_claim, equivalence_claim_satisfied,
@@ -3529,6 +3530,135 @@ async fn run_loop(
                             channel = TestimonyProposalChannel::EndTurn.as_wire(),
                             event = "guard.testimony_access_proposal_uncorrected",
                             "Testimony access-proposal guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
+                    // 5i. CJK-script response guard (mika#1680) — refuse a turn
+                    // written in Chinese ideographs rather than the Latin script.
+                    //
+                    // **The measured defect.** 2026-10-29, `messages` table of
+                    // `~/.mika/data/mika.db`, `agent_id='mika-dev'`,
+                    // `role='assistant'`: 5 responses of 15 are written entirely
+                    // in Chinese — webhook acknowledgements, no-ops, a CI report.
+                    // The content is correct; only the language is wrong. The
+                    // model is `z-ai/glm-5.2`, and the swap of model *class* is
+                    // precisely why the prompt line of `write_latin_script_line`
+                    // does not travel alone: mika#2120 already established that
+                    // the execution of an instruction does not bind across model
+                    // classes, so the prompt gets the right answer first try and
+                    // this guard is what **measures** what the prompt obtains.
+                    //
+                    // **Why mika#2247's 5f does not cover it.** Three independent
+                    // reasons, each sufficient, all written at
+                    // `detect_cjk_script_response`: 5f needs a *declared*
+                    // language and nothing declares one here, its verdict domain
+                    // has no Chinese and its function-word threshold fails at the
+                    // opening on an ideographic text, and its correction names a
+                    // `zh` that `TenantLanguage::parse` does not accept. The axis
+                    // is therefore the **script**, which needs no declaration to
+                    // arm.
+                    //
+                    // **Appended at the tail rather than placed next to 5f**,
+                    // which would read better and would cost renumbering 5g and
+                    // 5h across eight sites. The order is observably neutral
+                    // here, for two reasons: every earlier guard's lexicon is
+                    // Latin, so a fully Chinese text fires none of them; and if a
+                    // suffix-line guard fires first, the budgets are **per
+                    // label**, so 5i fires on the following turn without losing
+                    // anything.
+                    //
+                    // **Scope, taken from 5h's doc and not widened:** this reads
+                    // the turn's final assistant text, never a `send_message`
+                    // argument. Chinese passed as a tool argument is not seen.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(RESPONSE_CJK_SCRIPT_LABEL)
+                        && let Some(cjk) = detect_cjk_script_response(&text)
+                    {
+                        intent_guard_retries.insert(RESPONSE_CJK_SCRIPT_LABEL);
+                        let corr_id = format!("{}:{}:response_cjk_script", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "response_cjk_script",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            ideographs = cjk.ideographs,
+                            latin = cjk.latin,
+                            share_pct = cjk.share_pct,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.response_cjk_script",
+                            "CJK-script response guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        // The second sentence of the last paragraph is there
+                        // because the measured defect is one of language, not of
+                        // content: without it, a re-prompted model has every
+                        // reason to rebuild its answer and lose the correct fact
+                        // it was carrying.
+                        let correction = format!(
+                            "[mika-engine] Your response is written in Chinese ideographs \
+                             ({ideographs} of {ideographs}+{latin} script characters, \
+                             {share_pct}%). The operator who reads this agent's output does \
+                             not read that script, and the only declared conversation \
+                             languages of this platform are `fr` and `en` - both Latin \
+                             script.\n\n\
+                             Offending excerpt: {excerpt}\n\n\
+                             Rewrite your response now in the Latin script. Keep the \
+                             substance exactly as it is - the content of your previous \
+                             answer was correct, only its script is wrong. If you must name \
+                             a CJK string that is itself data (a filename, a test fixture), \
+                             keep it inside backticks and write the sentence around it in \
+                             the Latin script.",
+                            ideographs = cjk.ideographs,
+                            latin = cjk.latin,
+                            share_pct = cjk.share_pct,
+                            excerpt = cjk.excerpt,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#1680 — the residue of 5i's single-retry budget, named.
+                    //
+                    // Same gesture and same reason as 5d/5e/5f/5g/5h above. Without
+                    // this line, "the guard corrected" and "the guard gave up"
+                    // render the same bytes, and the AC4 probe stays an assertion
+                    // instead of being a measurement: `guard.response_cjk_script`
+                    // counts the turns caught, this one counts the turns the guard
+                    // did not close. If it is non-negligible the remedy is an engine
+                    // net of the mika#2368 shape — **a ticket, not a loosened
+                    // threshold**. Expected regime: zero lines.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(RESPONSE_CJK_SCRIPT_LABEL)
+                        && let Some(cjk) = detect_cjk_script_response(&text)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            ideographs = cjk.ideographs,
+                            latin = cjk.latin,
+                            share_pct = cjk.share_pct,
+                            label = mode.label(),
+                            event = "guard.response_cjk_script_uncorrected",
+                            "CJK-script response guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
                     }

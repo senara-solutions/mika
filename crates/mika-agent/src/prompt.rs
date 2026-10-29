@@ -1492,7 +1492,59 @@ fn write_runtime_section(
     );
     prompt.push_str(hosting_ground_truth_line(deployment, persona));
     write_thread_language_line(prompt, tenant_language);
+    write_latin_script_line(prompt);
     prompt.push('\n');
+}
+
+/// The script half of the `## Runtime` ground truth (mika#1680).
+///
+/// **Unconditional, and that is the whole point.** Measured 2026-10-29 on the
+/// `messages` table of `~/.mika/data/mika.db`: 5 of 15 mika-dev assistant
+/// responses are written entirely in Chinese, the content correct and only the
+/// language wrong. Nothing in the prompt said which script to write in — not
+/// because an instruction had been removed, but because until glm-5.2 no served
+/// model had a reason to change it.
+///
+/// The axis is the **script**, not the language, and that is what lets this line
+/// take no condition. mika#2247's declarable language domain — `{fr, en}` — is
+/// entirely Latin, so "write in the Latin script" is true for every declarable
+/// tenant **and** for an agent that declared nothing. It therefore sits next to
+/// [`write_thread_language_line`], which stays untouched: the two are orthogonal
+/// and say different things (*which language to converse in* vs *which script to
+/// write in*), and this one renders something even when that one renders
+/// nothing.
+///
+/// One write site covers both conversational constructors, because
+/// `write_runtime_section` is called from `build_system_prompt` **and**
+/// `build_silent_prompt` — which is exactly the coverage the measurement asks
+/// for: of the five Chinese responses, four are webhook acknowledgements, no-ops
+/// and a CI report (silent mode) and one answers `mika ask` (conversational).
+///
+/// **`build_compact_system_prompt` (`ProviderKind::MikaModel`) does not render
+/// it, and that is a refusal rather than a deferral** — mika#1925 AC4 is an
+/// unmet blocking precondition, no MikaModel endpoint exists, and the compact
+/// constructor exists to avoid an out-of-distribution completion mode whose
+/// cause is the *shape* (markdown headings), not the mass. The refusal is
+/// asserted by
+/// `mika1680_la_ligne_de_script_latin_est_posee_dans_les_deux_constructeurs_et_refusee_dans_le_compact`
+/// rather than left to a future editor's memory.
+///
+/// The last sentence is not politeness: it is what keeps the instruction from
+/// making the model unable to cite legitimate data, and it is the same contract
+/// the detector's legitimate-citation control asserts
+/// ([`crate::evidence::guards::detect_cjk_script_response`]).
+///
+/// Written in plain ASCII punctuation end to end, for the reason the neighbouring
+/// function states: a punctuation character posed in a prompt is copied verbatim
+/// into what the reader reads.
+fn write_latin_script_line(prompt: &mut String) {
+    prompt.push_str(
+        "Write your responses in the Latin script. The people who read this agent's output \
+         do not read Chinese, Japanese or Korean, and the only declared conversation \
+         languages are `fr` and `en` - both Latin script. If you must name a CJK string \
+         that is itself data (a filename, a test fixture), keep it inside backticks and \
+         write the sentence around it in the Latin script.\n",
+    );
 }
 
 /// The thread-language half of the `## Runtime` ground truth (mika#2247 AC2).
@@ -5875,6 +5927,102 @@ enabled = true
             !compact.contains("A skill's operational mapping outranks"),
             "the clause must not be added to the compact path on its own — it qualifies a \
              line that path does not render"
+        );
+    }
+
+    // ── mika#1680 Latin-script line ───────────────────────────────────────
+
+    /// **The shape of layer 1, asserted at the three constructors.**
+    ///
+    /// Present in `build_system_prompt` and in `build_silent_prompt` — one write
+    /// site in `write_runtime_section` covers both, and that is exactly the
+    /// coverage the 2026-10-29 measurement asks for: four of the five Chinese
+    /// responses are webhook acknowledgements, no-ops and a CI report (silent
+    /// mode), one answers `mika ask` (conversational).
+    ///
+    /// **Absent from `build_compact_system_prompt`,** and that third assertion
+    /// is what turns the mika#1925 AC4 carve-out into an asserted refusal rather
+    /// than an intention a future editor has to remember.
+    ///
+    /// `tenant_language: None` on both contexts is deliberate: the line must
+    /// render with nothing declared, which is the whole reason the axis is the
+    /// script and not the language. If it only rendered next to a declared
+    /// language it would inherit mika#2247's inertia — the one the ticket body
+    /// points at.
+    #[test]
+    fn mika1680_la_ligne_de_script_latin_est_posee_dans_les_deux_constructeurs_et_refusee_dans_le_compact()
+     {
+        let identity = test_identity();
+        let sentinel = "Write your responses in the Latin script.";
+
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            compaction_imminent: None,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+            pending_transmission: None,
+        };
+
+        let system = build_system_prompt(&ctx);
+        assert!(
+            system.contains(sentinel),
+            "the conversational constructor must pose the script, undeclared tenant included"
+        );
+        assert!(
+            system.contains("keep it inside backticks"),
+            "the escape hatch for legitimate CJK data must travel with the instruction — \
+             it is the same contract detect_cjk_script_response asserts"
+        );
+
+        let silent_ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+            compaction_imminent: None,
+        };
+        let silent = build_silent_prompt(&silent_ctx);
+        assert!(
+            silent.contains(sentinel),
+            "the silent constructor carries four of the five measured responses — it must \
+             pose the script too"
+        );
+
+        let compact = build_compact_system_prompt(&ctx);
+        assert!(
+            !compact.contains(sentinel),
+            "mika#1925 AC4 is an unmet blocking precondition: the compact MikaModel path \
+             refuses this line, and the refusal is asserted rather than remembered"
         );
     }
 
