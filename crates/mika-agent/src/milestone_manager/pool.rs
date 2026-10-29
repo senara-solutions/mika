@@ -222,12 +222,12 @@ pub(crate) fn dormancy_reading(body: &str) -> DormancyReading {
 /// les deux ensembles de candidats partagent un type sans qu'aucun ait à
 /// inventer de valeur.
 ///
-/// Le sixième, `plan_reading` (mika#2952), n'est pas une entorse à cette borne :
-/// c'est une lecture du **corps**, que les deux lectures d'issues demandent
-/// déjà (`--json body`), donc les deux origines la paient à l'identique et
-/// aucune n'a de valeur à inventer. C'est exactement ce qui le distingue de
-/// `pr_state`, `ci_state` et `branch_present`, qui sont mesurés sur un seul
-/// chemin.
+/// Les sixième et septième, `plan_reading` et `dormancy` (mika#2952), ne sont
+/// pas une entorse à cette borne : ce sont des lectures du **corps**, que les
+/// deux lectures d'issues demandent déjà (`--json body`), donc les deux origines
+/// les paient à l'identique et aucune n'a de valeur à inventer. C'est exactement
+/// ce qui les distingue de `pr_state`, `ci_state` et `branch_present`, qui sont
+/// mesurés sur un seul chemin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolCandidate {
     pub number: u64,
@@ -242,6 +242,21 @@ pub struct PoolCandidate {
     /// (mika#2340). C'est pourquoi `None` ne déclenche aucun refus ici.
     #[serde(default)]
     pub plan_reading: Option<PlanReading>,
+    /// Ce que le corps dit de sa dormance (mika#2952, vol 2/2).
+    ///
+    /// Orthogonal à `plan_reading` et non un état de plus sur lui : #2854 porte
+    /// les deux ensemble, et deux populations sous un seul nom ne sont pas
+    /// soustrayables (mika#2205). Les deux arbitrages se lisent donc
+    /// indépendamment, dans l'ordre que fixe `well_formed_candidates`.
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison du champ précédent : `None`
+    /// dit « ce binaire n'a pas lu le corps », jamais « éveillé » (mika#2340), et
+    /// ne déclenche donc aucun refus ici — c'est la réponse de ce vol à la
+    /// question de l'AC2, « que fait le bassin d'un ticket dont le marqueur est
+    /// absent ». Un marqueur absent rend [`DormancyReading::Awake`], une valeur
+    /// mesurée ; `None` est l'autre chose, l'absence de mesure.
+    #[serde(default)]
+    pub dormancy: Option<DormancyReading>,
     pub labels: Vec<String>,
 }
 
@@ -256,6 +271,7 @@ impl From<&SubIssue> for PoolCandidate {
             priority_rank: s.priority_rank,
             plan_present: s.plan_present,
             plan_reading: s.plan_reading,
+            dormancy: s.dormancy.clone(),
             labels: s.labels.clone(),
         }
     }
@@ -908,11 +924,13 @@ mod tests {
             state: IssueState::Open,
             priority_rank: rank,
             plan_present,
-            // `None` et non `Some(Live)` : la graine partagée reste celle d'un
-            // blob antérieur à mika#2952, donc les verdicts que les tests du
-            // vol 2 et du vol 3 épinglent ne bougent pas. Les tests de
-            // mika#2952 posent la lecture explicitement, par `..cand(…)`.
+            // `None` et non `Some(Live)` / `Some(Awake)` : la graine partagée
+            // reste celle d'un blob antérieur à mika#2952 sur les **deux**
+            // lectures de corps, donc les verdicts que les tests du vol 2 et du
+            // vol 3 épinglent ne bougent pas. Les tests de mika#2952 posent la
+            // lecture qui les concerne explicitement, par `..cand(…)`.
             plan_reading: None,
+            dormancy: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1266,9 +1284,15 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(2),
             plan_present: true,
-            // La projection doit **transporter** la lecture, pas la refaire :
-            // le corps est lu une fois, au composeur (mika#2952).
+            // La projection doit **transporter** les lectures, pas les refaire :
+            // le corps est lu une fois, au composeur (mika#2952). La dormance y
+            // est posée non triviale — une condition citée, pas `Awake` — pour
+            // que le test redevienne rouge si la projection la remplaçait par
+            // une valeur neutre au lieu de la cloner.
             plan_reading: Some(PlanReading::Live),
+            dormancy: Some(DormancyReading::Dormant {
+                condition: "Condition de réveil : quand POOL_WRITE s'ouvre".into(),
+            }),
             branch_present: true,
             pr_number: Some(2710),
             pr_state: None,
@@ -1288,6 +1312,9 @@ mod tests {
                 priority_rank: Some(2),
                 plan_present: true,
                 plan_reading: Some(PlanReading::Live),
+                dormancy: Some(DormancyReading::Dormant {
+                    condition: "Condition de réveil : quand POOL_WRITE s'ouvre".into(),
+                }),
                 labels: vec!["ready".into(), "agent-core".into()],
             }
         );

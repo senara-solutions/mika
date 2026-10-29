@@ -833,6 +833,7 @@ fn sous_ticket(number: u64, pr_state: Option<&str>) -> crate::milestone_manager:
         priority_rank: None,
         plan_present: true,
         plan_reading: None,
+        dormancy: None,
         branch_present: false,
         pr_number: None,
         pr_url: None,

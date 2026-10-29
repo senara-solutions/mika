@@ -900,6 +900,7 @@ mod tests {
             priority_rank: None,
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -2020,6 +2021,7 @@ mod tests {
             priority_rank: Some(0),
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             labels: vec!["p0-critical".into()],
         }];
         let mut a = empty_assessment();
@@ -2051,6 +2053,7 @@ mod tests {
             priority_rank: None,
             plan_present: false,
             plan_reading: None,
+            dormancy: None,
             labels: vec![],
         }];
         let mut a = empty_assessment();
@@ -2084,6 +2087,7 @@ mod tests {
             priority_rank: Some(0),
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             labels: vec!["p0-critical".into()],
         }];
         state.plan_sizes = [(1700, PlanSizeReading::Measured(900))]
@@ -2124,6 +2128,7 @@ mod tests {
             priority_rank: Some(0),
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             labels: vec!["p0-critical".into()],
         }];
         state.plan_sizes = [(1700, PlanSizeReading::Unread(UnreadCause::FetchFailed))]
@@ -2166,6 +2171,7 @@ mod tests {
             priority_rank: Some(0),
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             labels: vec!["p0-critical".into()],
         }];
         state.plan_sizes = [(1700, PlanSizeReading::Measured(120))]
@@ -2276,6 +2282,7 @@ mod tests {
                 priority_rank: Some(0),
                 plan_present: false,
                 plan_reading: None,
+                dormancy: None,
                 labels: vec!["p0-critical".into()],
             },
             PoolCandidate {
@@ -2284,6 +2291,7 @@ mod tests {
                 priority_rank: None,
                 plan_present: false,
                 plan_reading: None,
+                dormancy: None,
                 labels: vec![],
             },
         ];
@@ -2483,6 +2491,7 @@ mod tests {
             priority_rank: Some(1),
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             labels: vec!["p1-important".into(), "operator-gated".into()],
         }];
         let mut a = empty_assessment();

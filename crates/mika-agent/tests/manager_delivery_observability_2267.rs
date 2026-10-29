@@ -132,6 +132,7 @@ fn base_state() -> MilestoneState {
             priority_rank: None,
             plan_present: true,
             plan_reading: None,
+            dormancy: None,
             branch_present: true,
             pr_number: Some(2002),
             pr_state: Some("open".into()),

@@ -150,9 +150,11 @@ mod tests {
             state: IssueState::Open,
             priority_rank: rank,
             plan_present,
-            // La graine partagée reste un blob de binaire antérieur : les verdicts
-            // déjà couverts par les tests de la relève ne bougent pas (mika#2952).
+            // La graine partagée reste un blob de binaire antérieur, sur les deux
+            // lectures de corps : les verdicts déjà couverts par les tests de la
+            // relève ne bougent pas (mika#2952).
             plan_reading: None,
+            dormancy: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
