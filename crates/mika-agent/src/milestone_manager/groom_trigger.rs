@@ -59,6 +59,9 @@
 //! l'évaluation des vols et du bassin `ready` ouverts, et stables sur un cycle
 //! complet. Les deux sont OFF aujourd'hui, et ce vol n'en ouvre aucun.
 
+use mika_a2a::jsonrpc::AGENT_BUSY;
+use std::time::Duration;
+
 /// L'interrupteur du point 1 du ticket. **OFF par défaut.**
 pub const ENV_GROOM_WRITE: &str = "MIKA_MANAGER_GROOM_WRITE";
 
@@ -138,6 +141,195 @@ impl GroomSendError {
             Self::AgentBusy => "agent_busy",
             Self::CredentialRefused | Self::Unreachable | Self::Other => "send_failed",
         }
+    }
+}
+
+/// Le rail du geste — un POST JSON-RPC `message/send` vers le spirit local.
+///
+/// Patron copié trait pour trait sur [`super::HttpLivenessSink`], le rail
+/// sortant déjà déclaré de ce module : un client `reqwest` construit une fois
+/// avec son budget, `client.post(url)` — jamais `Method::POST` ni le littéral,
+/// que le scan du module refuse dans tout fichier —, le bearer sur le jeton, et
+/// `e.without_url()` au site d'erreur pour que l'URL n'atteigne aucun journal.
+///
+/// **Il ne lit rien.** `url`, `token` et `budget` sont reçus en arguments de
+/// [`A2aGroomSender::new`], et c'est la même ligne de coupe que `deja_groome` et
+/// `groom_en_cours` côté candidats : un second lecteur du même fait divergerait
+/// du premier le jour où la réponse compte (doctrine mika#2201). Leur résolution
+/// depuis l'environnement arrive avec son site d'appel, au câblage de cycle.
+pub struct A2aGroomSender {
+    client: reqwest::Client,
+    url: String,
+    token: String,
+}
+
+impl A2aGroomSender {
+    /// `url`, `token` et `budget` sont **reçus**, jamais lus ici.
+    ///
+    /// **Le budget doit majorer le budget de tour de mika-dev** (~300 s), et ce
+    /// n'est pas une prudence. Le geste est synchrone : si le manager abandonne
+    /// la requête avant que le tour ait rendu la main, le tour continue côté
+    /// mika-dev, le groom part, et le manager le compte `send_failed` — puis le
+    /// relance au cycle suivant. Ni l'une ni l'autre moitié n'est fausse
+    /// localement ; ensemble elles produisent un double groom sous un rapport qui
+    /// dit « échec ». C'est aussi pourquoi le budget est un **argument** et non
+    /// une constante du fichier : celui qui le choisit est celui qui connaît le
+    /// budget de tour.
+    ///
+    /// Un client qui ne se construit pas ne doit pas empêcher un cycle de
+    /// **lecture** du manager de tourner, donc `unwrap_or_else` rend le client
+    /// par défaut — qui échouera au premier envoi, et dont l'échec sera nommé.
+    pub fn new(url: String, token: String, budget: Duration) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(budget)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            url,
+            token,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl GroomSender for A2aGroomSender {
+    async fn send(&self, instruction: &str) -> Result<(), GroomSendError> {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let body = build_send_body(instruction, &message_id);
+        // `client.post(url)` et non une construction par `Method::POST` ni par
+        // chaîne : `no_dispatch_test.rs` interdit le littéral `"POST"` dans tout
+        // fichier du module, et les deux autres formes le porteraient.
+        let envoi = self
+            .client
+            .post(&self.url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await;
+        let res = match envoi {
+            Ok(r) => r,
+            Err(e) => {
+                let class = if e.is_connect() || e.is_timeout() {
+                    GroomSendError::Unreachable
+                } else {
+                    GroomSendError::Other
+                };
+                // Événement **distinct** de `manager_groom_failed`, que
+                // [`envoyer`] émet par candidat : celui-là dit « le candidat N
+                // n'est pas parti », celui-ci dit « le rail n'a pas pu poster »
+                // et porte la seule moitié actionnable que l'autre ne peut pas
+                // voir, le message de transport. Deux populations sous un nom ne
+                // sont pas soustrayables (mika#2205).
+                tracing::warn!(
+                    target: "mika::milestone_manager",
+                    event = "manager_groom_send_error",
+                    class = class.classe(),
+                    // `without_url()` et non `{e}` : le `Display` de
+                    // `reqwest::Error` appende « for url (…) » à toute erreur qui
+                    // en porte une, et le manifeste d'egress affirme que l'URL du
+                    // geste n'atteint aucun journal. La classe est déjà calculée
+                    // au-dessus, donc la ligne ne perd rien d'actionnable.
+                    error = %e.without_url(),
+                );
+                return Err(class);
+            }
+        };
+        let status = res.status().as_u16();
+        // Un corps illisible est `None`, jamais une erreur : c'est le statut qui
+        // tranche alors, et la table de [`classify_send_outcome`] le dit.
+        let corps = res.json::<serde_json::Value>().await.ok();
+        classify_send_outcome(status, corps.as_ref())
+    }
+}
+
+/// Le corps JSON-RPC du geste — **fonction pure**, donc assertable au champ
+/// près.
+///
+/// Rend l'enveloppe complète : `jsonrpc`, `id`, `method` et `params.message`,
+/// dans la forme que `mika_a2a::types::Message` sérialise — `messageId`, `role`,
+/// `parts` avec une seule part `{kind: "text", text}`, et `kind: "message"`.
+/// C'est le corps que `mika ask --agent mika-dev "groom mika#N"` poste déjà, par
+/// la même porte.
+///
+/// `method` vaut [`GESTE`] et **jamais une chaîne retypée** : c'est la constante
+/// à plat que le scan de `no_dispatch_test.rs` grep, et ce rail est son premier
+/// lecteur (propriété 3 du docstring de module).
+///
+/// **`configuration` est délibérément ABSENT du corps, et c'est le piège que
+/// cette fonction garde.** Dans `server/a2a.rs`, la branche `returnImmediately`
+/// « creates the task row and returns it in `submitted` » et **ne fait jamais
+/// tourner la boucle d'agent**. Un manager qui l'emprunterait créerait une tâche
+/// qui ne groome rien, pendant que son rapport dirait « groom déclenché ».
+/// L'absence du champ n'est donc pas un oubli, c'est le choix, et
+/// `mika2958_le_corps_nemet_aucune_configuration` l'assère nommément.
+///
+/// `message_id` est **reçu** et non tiré d'un `Uuid::new_v4()` interne : c'est ce
+/// qui rend le corps entier déterministe, donc comparable dans un test. Patron
+/// et raison : `classify_delivery_auth` (`cadence.rs`) — « passing it in rather
+/// than reading the environment here keeps the function pure and testable ».
+pub(crate) fn build_send_body(instruction: &str, message_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": message_id,
+        "method": GESTE,
+        "params": {
+            "message": {
+                "messageId": message_id,
+                "role": "user",
+                "parts": [{ "kind": "text", "text": instruction }],
+                "kind": "message",
+            }
+        }
+    })
+}
+
+/// Ce qu'un statut HTTP et un corps de réponse disent du geste — **fonction
+/// pure**, donc sa table de lecture est épinglable.
+///
+/// | fait observé | classe |
+/// |---|---|
+/// | `error.code == AGENT_BUSY` (−32000) | [`GroomSendError::AgentBusy`] |
+/// | `error.code` autre, dont `INTERNAL_ERROR` (−32603) | [`GroomSendError::Other`] |
+/// | 2xx, aucun champ `error` | `Ok(())` |
+/// | 401 ou 403 | [`GroomSendError::CredentialRefused`] |
+/// | autre non-2xx | [`GroomSendError::Other`] |
+///
+/// Le corps est lu **avant** le statut, parce qu'un refus JSON-RPC ne dégrade pas
+/// le statut HTTP : le refus busy arrive en 200 avec un champ `error`.
+///
+/// **La classification est sur le CODE, jamais sur le message** (mika#2179).
+/// `a2a_wait_queue::busy_error` et `legacy_busy_error` portent tous deux le
+/// message `"Agent is busy"` ; seul le code les sépare. [`AGENT_BUSY`] est donc
+/// importé de `mika_a2a::jsonrpc` et jamais retapé : il n'existe qu'un endroit du
+/// dépôt où ce nombre vit.
+///
+/// **Conséquence nommée, parce qu'elle est une lecture honnête et non un
+/// défaut.** Quand la file d'attente A2A est désarmée, le refus busy arrive par
+/// `legacy_busy_error()` — code −32603, indistinguable d'une panne interne. Le
+/// rail le classe donc `Other`, et le motif au rapport sera `send_failed` et non
+/// `agent_busy`. Un instrument qui devinerait la classe par le message mentirait
+/// le jour où le message change ;
+/// `mika2958_la_file_desarmee_nest_pas_maquillee_en_agent_busy` fige cette
+/// lecture plutôt que de la laisser à l'interprétation.
+pub(crate) fn classify_send_outcome(
+    status: u16,
+    body: Option<&serde_json::Value>,
+) -> Result<(), GroomSendError> {
+    if let Some(code) = body
+        .and_then(|b| b.get("error"))
+        .and_then(|e| e.get("code"))
+        .and_then(serde_json::Value::as_i64)
+    {
+        return Err(if code == i64::from(AGENT_BUSY) {
+            GroomSendError::AgentBusy
+        } else {
+            GroomSendError::Other
+        });
+    }
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => Err(GroomSendError::CredentialRefused),
+        _ => Err(GroomSendError::Other),
     }
 }
 
@@ -292,6 +484,7 @@ async fn envoyer(sender: &dyn GroomSender, candidats: &[GroomCandidate]) -> Groo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mika_a2a::jsonrpc::INTERNAL_ERROR;
     use std::sync::Mutex;
 
     /// Le harnais est **redéclaré ici** plutôt que partagé avec les `mod tests`
@@ -594,5 +787,211 @@ mod tests {
                 "motif hors vocabulaire : {motif}"
             );
         }
+    }
+
+    /// Le corps du geste, **au champ près** — il est déterministe, donc on le
+    /// compare entier.
+    ///
+    /// Trois propriétés dans la même assertion, et c'est voulu : `method` vaut
+    /// [`GESTE`] (la chaîne que le garde grep, pas une voisine), la seule part
+    /// porte l'instruction telle quelle, et `messageId` vaut l'argument reçu —
+    /// sans quoi la comparaison du corps entier serait impossible, et c'est
+    /// précisément ce que `message_id` en paramètre achète.
+    #[test]
+    fn mika2958_le_corps_du_geste_nomme_le_geste_et_porte_linstruction() {
+        let body = build_send_body("groom mika#2958", "msg-42");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "msg-42",
+                "method": "message/send",
+                "params": {
+                    "message": {
+                        "messageId": "msg-42",
+                        "role": "user",
+                        "parts": [{ "kind": "text", "text": "groom mika#2958" }],
+                        "kind": "message",
+                    }
+                }
+            }),
+            "le corps est celui de `mika ask --agent mika-dev`, au caractère près"
+        );
+        assert_eq!(
+            body["method"], GESTE,
+            "le geste vient de la constante à plat, pas d'une chaîne retypée"
+        );
+    }
+
+    /// **Le test du piège.** `params.configuration` est absent, et son absence
+    /// est le choix.
+    ///
+    /// `server/a2a.rs` : la branche `returnImmediately` crée la ligne de tâche et
+    /// la rend en `submitted` **sans jamais faire tourner la boucle d'agent**. Un
+    /// manager qui l'emprunterait créerait une tâche qui ne groome rien pendant
+    /// que son rapport dirait « groom déclenché » — un groom jamais fait,
+    /// rapporté comme fait (mika#2958).
+    #[test]
+    fn mika2958_le_corps_nemet_aucune_configuration() {
+        let body = build_send_body("groom mika#10", "msg-1");
+        assert!(
+            body["params"].get("configuration").is_none(),
+            "aucune `configuration` : la branche `returnImmediately` ne fait pas \
+             tourner la boucle d'agent, donc elle ne groome rien : {body}"
+        );
+    }
+
+    /// La table de lecture de [`classify_send_outcome`], dans son ordre.
+    ///
+    /// Le corps est consulté avant le statut parce qu'un refus JSON-RPC n'abaisse
+    /// pas le statut HTTP : le refus busy arrive en **200** avec un champ
+    /// `error`. Un classement qui ne lirait que le statut appellerait ce refus un
+    /// succès.
+    #[test]
+    fn mika2958_la_table_de_classification_des_reponses() {
+        assert_eq!(
+            classify_send_outcome(
+                200,
+                Some(&serde_json::json!({ "result": { "kind": "task" } }))
+            ),
+            Ok(()),
+            "2xx sans champ `error` est le succès"
+        );
+        assert_eq!(
+            classify_send_outcome(200, None),
+            Ok(()),
+            "un 2xx dont le corps n'a pas pu être lu reste un succès"
+        );
+
+        let busy = serde_json::json!({
+            "error": { "code": AGENT_BUSY, "message": "Agent is busy" }
+        });
+        assert_eq!(
+            classify_send_outcome(200, Some(&busy)),
+            Err(GroomSendError::AgentBusy),
+            "le refus busy arrive en 200 avec un code, et c'est le code qui le dit"
+        );
+        assert_eq!(GroomSendError::AgentBusy.classe(), "agent_busy");
+
+        assert_eq!(
+            classify_send_outcome(401, None),
+            Err(GroomSendError::CredentialRefused),
+            "401 : le jeton interne a été refusé"
+        );
+        assert_eq!(
+            classify_send_outcome(403, None),
+            Err(GroomSendError::CredentialRefused),
+            "403 : idem, patron de `liveness.rs`"
+        );
+        assert_eq!(
+            classify_send_outcome(500, None),
+            Err(GroomSendError::Other),
+            "un non-2xx sans corps lisible reste nommé, pas deviné"
+        );
+    }
+
+    /// **La lecture honnête**, figée plutôt que laissée à l'interprétation.
+    ///
+    /// Quand la file d'attente A2A est désarmée, le refus busy arrive par
+    /// `legacy_busy_error()` — code −32603, **même message** `"Agent is busy"`
+    /// que `busy_error()`, et indistinguable d'une panne interne. Le rail le
+    /// classe donc `Other` et le rapport dira `send_failed`, pas `agent_busy`.
+    ///
+    /// Les deux corps de ce test ne diffèrent que par le code, message compris :
+    /// c'est ce qui prouve que la classification est sur le champ structuré et
+    /// non sur une sous-chaîne (mika#2179). Un instrument qui devinerait par le
+    /// message mentirait le jour où le message change.
+    #[test]
+    fn mika2958_la_file_desarmee_nest_pas_maquillee_en_agent_busy() {
+        let legacy = serde_json::json!({
+            "error": { "code": INTERNAL_ERROR, "message": "Agent is busy" }
+        });
+        assert_eq!(
+            classify_send_outcome(200, Some(&legacy)),
+            Err(GroomSendError::Other),
+            "−32603 n'est pas maquillé en `agent_busy` : le message est le même, \
+             seul le code sépare les deux refus"
+        );
+        assert_eq!(
+            GroomSendError::Other.classe(),
+            "send_failed",
+            "et le motif au rapport dit `send_failed`, ce qui est la vérité : \
+             le rail ne peut pas savoir que la file était désarmée"
+        );
+        assert_ne!(
+            AGENT_BUSY, INTERNAL_ERROR,
+            "les deux codes sont bien distincts, sans quoi ce test ne prouverait rien"
+        );
+    }
+
+    /// Propriété 11 : le rail **reçoit** son adresse et son jeton, il ne les
+    /// lit pas.
+    ///
+    /// C'est le contrôle que rien n'est résolu depuis l'environnement dans ce
+    /// fichier : si une variable `MIKA_MANAGER_GROOM_URL` apparaissait un jour
+    /// sous [`A2aGroomSender::new`], les deux assertions ci-dessous resteraient
+    /// vraies — mais elles sont ici pour que le **jour où** quelqu'un remplace
+    /// un argument par une lecture, le test dise où la ligne de coupe passait.
+    /// Le budget est passé et non assert : il vit dans le client `reqwest`, qui
+    /// n'expose pas son `timeout`. C'est aussi pourquoi le site d'appel, au vol
+    /// 2b, est le seul endroit où le budget de tour de mika-dev se compare au
+    /// budget du rail.
+    #[test]
+    fn mika2958_le_rail_recoit_son_adresse_et_son_jeton() {
+        let rail = A2aGroomSender::new(
+            "http://127.0.0.1:8080/a2a/mika-dev".to_string(),
+            "jeton-de-test".to_string(),
+            Duration::from_secs(420),
+        );
+        assert_eq!(
+            rail.url, "http://127.0.0.1:8080/a2a/mika-dev",
+            "l'URL est celle reçue, pas une URL par défaut ni une lecture d'environnement"
+        );
+        assert_eq!(
+            rail.token, "jeton-de-test",
+            "le jeton est celui reçu — ce fichier ne connaît aucun nom de variable de jeton"
+        );
+    }
+
+    /// Propriété 12, **contrôle négatif de non-régression (AC1)** : le rail est
+    /// présent, l'interrupteur est à `false`, et il ne part rien.
+    ///
+    /// C'est la forme qui distingue « désarmé » de « poseur mort ». Les tests
+    /// de refus de cycle du vol 1 passaient `None` ou un double : avec un vrai
+    /// `A2aGroomSender` au bout, un refus qui aurait régressé émettrait une
+    /// requête HTTP réelle.
+    ///
+    /// **Le test ne dépend pas de l'adresse** — le refus de cycle précède toute
+    /// construction de requête, et c'est précisément ce qu'il assère. L'adresse
+    /// non routable et le budget court ne sont là que pour que la régression
+    /// rougisse **vite** au lieu de pendre : si le refus tombait, l'envoi
+    /// échouerait sur un refus de connexion local en quelques millisecondes, et
+    /// l'outcome porterait `send_failed` au lieu d'être vide.
+    #[tokio::test]
+    async fn mika2958_le_rail_arme_a_false_nemet_aucune_requete() {
+        let rail = A2aGroomSender::new(
+            "http://127.0.0.1:1/a2a/mika-dev".to_string(),
+            "jeton-de-test".to_string(),
+            Duration::from_millis(50),
+        );
+        let candidats = vec![
+            GroomCandidate {
+                number: 2958,
+                deja_groome: false,
+                groom_en_cours: false,
+            },
+            GroomCandidate {
+                number: 2959,
+                deja_groome: false,
+                groom_en_cours: false,
+            },
+        ];
+        let outcome = trigger_relief_grooms(false, Some(&rail), &candidats).await;
+        assert_eq!(
+            outcome,
+            GroomTriggerOutcome::default(),
+            "interrupteur OFF : rien n'est déclenché et rien n'est sauté — \
+             un `sautes` non vide voudrait dire que le cycle est entré dans la boucle"
+        );
     }
 }

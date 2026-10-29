@@ -303,6 +303,18 @@ owner              = "@samidarko"
 notes              = "Le rail agent↔spirit. Depuis mika#1727 `mika ask` est un client mince : c'est par ici que passe tout tour d'agent lancé en ligne de commande."
 
 [[sink]]
+id                 = "manager-groom-a2a"
+destination        = "l'URL A2A de mika-dev, reçue en argument par A2aGroomSender::new"
+destination_source = "config"
+class              = "internal"
+data               = "la consigne de groom (`groom mika#N`, le numéro du ticket et rien d'autre), un identifiant de message tiré d'un UUID v4, et le jeton interne en bearer"
+logged             = false
+client_site        = "crates/mika-agent/src/milestone_manager/groom_trigger.rs"
+call_site          = "crates/mika-agent/src/milestone_manager/groom_trigger.rs"
+owner              = "@samidarko"
+notes              = "Le geste de groom de la relève du manager (mika#2958, vol 2), derrière MIKA_MANAGER_GROOM_WRITE, OFF par défaut : avec l'interrupteur fermé ce sink n'émet rien, et `mika2958_le_rail_arme_a_false_nemet_aucune_requete` est ce qui le tient. La voie est celle du moteur — un `message/send` A2A vers mika-dev, jamais un spawn ni un dispatch d'implémentation. Ce qui atteint le journal : le numéro du ticket (sonde `manager_groom_triggered`) et, en cas d'échec de transport, le message de reqwest passé par `without_url()` (sonde `manager_groom_send_error`). Ce qui ne l'atteint jamais : l'URL et le jeton. Le rail ne lit ni l'un ni l'autre dans l'environnement — il les reçoit, et le site d'appel qui les résout arrive au vol 2b."
+
+[[sink]]
 id                 = "cli-spirit-dashboard"
 destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
 destination_source = "config"
