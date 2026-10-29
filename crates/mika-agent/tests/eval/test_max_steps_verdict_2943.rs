@@ -36,6 +36,25 @@
 //! comme **préconditions dures** avant la négation, qui ne peut alors jamais
 //! passer pour la mauvaise raison.
 //!
+//! # Les quatre tours du fichier (vol 2/2)
+//!
+//! Le détecteur ci-dessus est le contrôle **positif** du joint. Les trois
+//! autres bornent la population sur laquelle le filet s'arme — chacun par un
+//! tour réel du relevé du ticket, passé par la **même** chaîne de production
+//! ([`what_the_pr_receives`]) :
+//!
+//! | test | tour mesuré | ce que la PR reçoit, et pourquoi |
+//! |---|---|---|
+//! | `…ne_laisse_jamais_la_pr_muette` | `b22e6ea0` (#2920, 28/10) | un `hold[review]` — c'est le défaut réparé |
+//! | `…apres_revue_postee_najoute_rien_sur_la_pr` | `e6e7d8e0` (#2941, 27/10) | rien : la session a déjà revu (`AlreadyReviewed`) |
+//! | `…un_tour_non_pr_coupe_ne_poste_rien` | la forme `check_suite` sur `main` | rien : aucune PR n'est nommée |
+//! | `…avec_un_build_en_vol_laisse_le_verdict_au_callback` | `11699630` (#2920), `517380e0` (#2932) | rien : le callback du build portera le verdict (D1) |
+//!
+//! Les trois derniers mesurent un **silence**, et un silence est vrai de trop
+//! de choses : chacun porte donc des préconditions dures qui établissent que le
+//! tour a bien été coupé et que le fait de coupure a bien été posé — sans quoi
+//! le défaut d'avant les rendrait tous verts.
+//!
 //! # Rouge-avant, recette exécutable par le relecteur
 //!
 //! 1. Ramener les sources au parent du correctif :
@@ -59,6 +78,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use mika_agent::agent_loop::AgentOutput;
 use mika_agent::planning::policy::{MAX_TOOL_STEPS, max_tool_steps_for_agent};
+use mika_agent::qa_build_callback::BUILD_MIKA_TOOL;
 use mika_agent::server::deadline_verdict::{
     DEADLINE_VERDICT_LINE, DeadlineVerdictInput, DeadlineVerdictOutcome, PostReviewRequest,
     TurnConclusion, deadline_verdict_target, maybe_post_deadline_verdict,
@@ -236,6 +256,32 @@ fn reviewed_then_burned_budget_corpus(ceiling: usize) -> Vec<MockResponse> {
     }));
     responses.push(text_response(
         "La revue est postée ; j'ai continué à lire le plan jusqu'au plafond.",
+    ));
+    responses.push(text_response("(sentinelle : ne doit jamais être rendue)"));
+    responses
+}
+
+/// La forme mesurée de `11699630` (#2920, 26/10 15:13) et de `517380e0`
+/// (#2932, 27/10 00:58) : le tour **dispatche un build**, puis brûle le reste
+/// de son budget. Le verdict reviendra par le callback de ce build.
+///
+/// Le nom de l'outil vient de la constante que lit
+/// `qa_build_callback::build_callback_dispatched_in_turn` — un littéral recopié
+/// ici laisserait le test vert si la constante changeait, et l'abstention qu'il
+/// atteste ne porterait plus sur rien.
+fn build_then_burned_budget_corpus(ceiling: usize) -> Vec<MockResponse> {
+    let mut responses = vec![tool_call_response(
+        BUILD_MIKA_TOOL,
+        json!({"branch": "fix/2926"}),
+    )];
+    responses.extend((0..ceiling - 1).map(|i| {
+        tool_call_response(
+            "run_shell",
+            json!({"command": format!("git show HEAD~{i}:docs/plans/plan.md")}),
+        )
+    }));
+    responses.push(text_response(
+        "Le build est lancé ; j'ai continué à lire le plan jusqu'au plafond.",
     ));
     responses.push(text_response("(sentinelle : ne doit jamais être rendue)"));
     responses
@@ -593,5 +639,132 @@ async fn mika2943_une_coupure_apres_revue_postee_najoute_rien_sur_la_pr() {
     assert_eq!(
         posts, 0,
         "aucun second verdict sur une PR déjà revue — capturé = {captured:?}"
+    );
+}
+
+/// **AC3** — une coupure avec un build en vol laisse le verdict au callback.
+///
+/// Les traces `11699630` (#2920, 26/10 15:13) et `517380e0` (#2932, 27/10
+/// 00:58) : le tour a été coupé au plafond, mais il avait dispatché un
+/// `build_mika`, et la revue est revenue par le filet de ce callback
+/// (mika#2515). Le filet du webhook doit donc **se taire** — un second
+/// `hold[review]` réveillerait `verdict_handler` deux fois sur une décision qui
+/// n'est pas la sienne (décision D1 du plan, reconduite du vol 1).
+///
+/// L'abstention est assertée sur sa **cause** : le site unique qui pose
+/// `max_steps_exceeded` ne le pose pas quand un build est en vol
+/// (`agent_loop/mod.rs:7020-7024`). La ligne INFO `qa_max_steps_verdict_withheld`
+/// qui l'accompagne (`agent_loop/mod.rs:6960-6973`) n'est **pas** assertée ici :
+/// le harnais eval ne capture pas le flux `tracing`, et l'y brancher pour une
+/// ligne serait une infrastructure hors périmètre. C'est le témoin opérateur,
+/// que la sonde AC4 relit en production ; le test tient la cause (décision D2).
+#[tokio::test]
+async fn mika2943_une_coupure_avec_un_build_en_vol_laisse_le_verdict_au_callback() {
+    let ceiling = max_tool_steps_for_agent("mika-qa", MAX_TOOL_STEPS);
+    let registry: Arc<DashMap<String, HashSet<String>>> = Arc::new(DashMap::new());
+
+    let (mut tools, shell_calls, gh_calls) = qa_tools();
+    let build_calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    tools.register(Box::new(Recording {
+        name: BUILD_MIKA_TOOL,
+        calls: build_calls.clone(),
+        on_success: None,
+    }));
+
+    let harness = EvalHarness::builder()
+        .responses(build_then_burned_budget_corpus(ceiling))
+        .tools(tools)
+        .agent_id("mika-qa")
+        .session_id(SESSION_ID)
+        .pr_reviews_posted(registry.clone())
+        .build()
+        .await
+        .expect("harness build");
+
+    let trace = harness.run(READY_FOR_REVIEW_2920).await.expect("agent run");
+
+    // -- Précondition 1 : le tour a bien été coupé à son plafond. -------------
+    // `ceiling - 1` parce que le premier pas est le build. La sentinelle du
+    // corpus n'a pas été consommée, sans quoi `MockLlmProvider` aurait paniqué.
+    let served = shell_calls.lock().unwrap().len();
+    assert_eq!(
+        served,
+        ceiling - 1,
+        "précondition : après le build, le tour doit brûler le reste de son \
+         plafond ({} pas), or {served} appels servis",
+        ceiling - 1
+    );
+
+    // -- Précondition 2 : le build est bien parti, et la trace le dit. -------
+    // C'est le terme exact que lit `build_callback_dispatched_in_turn` : le nom
+    // de l'outil **et** le succès de l'appel. Mesuré dans `trace.tool_calls`,
+    // pas supposé depuis le corpus — un outil qui aurait échoué laisserait le
+    // prédicat faux et l'abstention viendrait d'ailleurs.
+    assert_eq!(
+        build_calls.lock().unwrap().len(),
+        1,
+        "précondition : le build est dispatché une fois, au premier pas"
+    );
+    let dispatched_builds: Vec<&_> = trace
+        .tool_calls
+        .iter()
+        .filter(|c| c.tool_name == BUILD_MIKA_TOOL && c.success)
+        .collect();
+    assert_eq!(
+        dispatched_builds.len(),
+        1,
+        "précondition : la trace porte exactement un `{BUILD_MIKA_TOOL}` réussi — \
+         c'est ce que `build_callback_dispatched_in_turn` lit. outils vus = {:?}",
+        trace
+            .tool_calls
+            .iter()
+            .map(|c| (c.tool_name.as_str(), c.success))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        gh_calls.lock().unwrap().is_empty(),
+        "précondition : aucune revue dans ce corpus — le silence mesuré plus \
+         bas n'est pas celui de la déduplication"
+    );
+
+    // -- Précondition 3 : ce n'est pas une coupure par deadline. -------------
+    // L'abstention qu'on mesure est celle du plafond de pas. Un tour mort sur
+    // sa deadline armerait le filet de mika#2276, et ce test n'attesterait
+    // plus l'abstention de mika#2943.
+    assert!(
+        trace.output.deadline_exceeded.is_none(),
+        "précondition : le tour est coupé par ses pas, pas par sa deadline"
+    );
+
+    // -- L'abstention, sur sa cause. -----------------------------------------
+    assert!(
+        trace.output.max_steps_exceeded.is_none(),
+        "le site unique qui pose le fait de coupure s'en abstient quand un \
+         build QA est en vol — sinon le filet du webhook poserait un second \
+         `hold[review]` sur une PR dont le callback de build portera déjà le \
+         verdict (traces 11699630 et 517380e0)"
+    );
+    assert_eq!(
+        conclusion_of(&trace.output),
+        TurnConclusion::Concluded,
+        "sans fait de coupure, le call-site lit un tour conclu — c'est par là \
+         que le filet du webhook reste muet"
+    );
+
+    let NetDecision {
+        outcome,
+        posts,
+        captured,
+    } = what_the_pr_receives(&trace.output, READY_FOR_REVIEW_2920, &registry).await;
+
+    assert!(
+        outcome.is_none(),
+        "le filet du webhook ne s'arme pas : le verdict appartient au callback \
+         du build. motif = {outcome:?}"
+    );
+    assert_eq!(
+        posts, 0,
+        "aucun verdict du webhook sur une PR dont le build portera le sien — \
+         capturé = {captured:?}"
     );
 }
