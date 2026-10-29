@@ -1913,6 +1913,7 @@ mod tests {
             due_on: None,
             last_activity_at: Some("2026-08-22T00:00:00Z".into()),
             sub_issues: vec![SubIssue {
+                missing_grooming_signals: None,
                 number: 100,
                 title: "T".into(),
                 state: IssueState::Open,

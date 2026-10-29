@@ -126,6 +126,7 @@ fn base_state() -> MilestoneState {
         due_on: None,
         last_activity_at: Some("2026-08-20T00:00:00Z".into()),
         sub_issues: vec![SubIssue {
+            missing_grooming_signals: None,
             number: 1802,
             title: "LC.2".into(),
             state: IssueState::Open,

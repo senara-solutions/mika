@@ -454,6 +454,60 @@ pub struct Issue {
 // restent ici, où l'ancrage du ticket a sa valeur historique — ils exercent la
 // fonction importée, pas une copie.
 use crate::plan_callout::strip_fenced_blocks;
+use serde::{Deserialize, Serialize};
+
+/// Les trois signaux que le grooming écrit et que le dispatch exige.
+///
+/// Ce vocabulaire est **commun** aux deux prédicats : les `token()` ci-dessous
+/// sont, dans le même ordre, les jetons que `executor::check_grooming_markers`
+/// rend dans son `missing_signals` (`mika2956_le_vocabulaire_des_signaux_est_commun_aux_deux_predicats`,
+/// `grooming_marker.rs`). Un refus du bassin et un refus du dispatch nomment donc
+/// la même chose avec les mêmes mots, ce qui est la condition pour que l'opérateur
+/// puisse les rapprocher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroomingSignal {
+    BranchCallout,
+    PlanCallout,
+    GroomedVerdict,
+}
+
+impl GroomingSignal {
+    /// Le jeton que le dispatch écrit déjà dans son `missing_signals`.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::BranchCallout => "branch_callout",
+            Self::PlanCallout => "plan_callout",
+            Self::GroomedVerdict => "groomed_verdict",
+        }
+    }
+}
+
+/// Lesquels des trois signaux de grooming manquent à ce corps.
+///
+/// C'est la face **mesurée** de [`is_groomed`], dont celui-ci n'est que la
+/// réduction booléenne : les deux ne peuvent pas diverger, puisqu'il n'y a qu'un
+/// seul corps de prédicat. Un appelant qui doit *nommer* ce qui manque — le
+/// refus du bassin du manager (mika#2956) — passe par ici ; un appelant qui n'a
+/// qu'à promouvoir passe par `is_groomed`.
+///
+/// L'ordre du vecteur est celui des variantes, et il est stable : branche, plan,
+/// verdict. Un `Vec` vide signifie « les trois signaux sont là », jamais
+/// « on n'a pas lu ».
+pub fn missing_grooming_signals(body: &str) -> Vec<GroomingSignal> {
+    let readable = strip_fenced_blocks(body);
+    let mut missing = Vec::new();
+    if extract_branch_name(&readable).is_none() {
+        missing.push(GroomingSignal::BranchCallout);
+    }
+    if extract_plan_path(&readable).is_none() {
+        missing.push(GroomingSignal::PlanCallout);
+    }
+    if !crate::grooming_marker::has_groomed_verdict(&readable) {
+        missing.push(GroomingSignal::GroomedVerdict);
+    }
+    missing
+}
 
 /// Structural detection of a groomed issue body.
 ///
@@ -501,11 +555,18 @@ use crate::plan_callout::strip_fenced_blocks;
 /// les deux** — ce sens-là de l'alignement recréerait le défaut symétrique de
 /// celui que ce ticket ferme. C'est le lecteur qui rejoint son écrivain, pas
 /// l'inverse.
+///
+/// # Deux consommateurs de promotion, et c'est voulu (mika#2956)
+///
+/// Ce prédicat a désormais deux consommateurs de promotion — le feeder et le
+/// bassin du manager — et c'est voulu : les deux écrivains de `ready` partagent
+/// un seul prédicat d'admission. Le bassin jugeait la présence d'un plan avec
+/// `reader::plan_callout_present`, un lecteur plus lâche (mika#2608), donc il
+/// admettait un ticket que le gate du dispatch refusait ensuite en
+/// `dispatch_no_grooming_marker`. Depuis mika#2956, il admet sur
+/// [`missing_grooming_signals`], dont ce booléen est la réduction.
 pub fn is_groomed(body: &str) -> bool {
-    let readable = strip_fenced_blocks(body);
-    crate::grooming_marker::has_groomed_verdict(&readable)
-        && extract_branch_name(&readable).is_some()
-        && extract_plan_path(&readable).is_some()
+    missing_grooming_signals(body).is_empty()
 }
 
 // ───────────────────── Plan ownership (mika#2020) ─────────────────────
@@ -6683,6 +6744,85 @@ Some description of the issue.
 > - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
 "#;
         assert!(!is_groomed(body));
+    }
+
+    // ── missing_grooming_signals : la face mesurée (mika#2956) ──
+
+    /// Le corps de la population de mika#2956 : il *cite* `docs/plans/` dans une
+    /// ligne de prose citée — donc le lecteur lâche de mika#2608 le croit porteur
+    /// d'un plan — mais il n'a ni callout de branche ni marqueur GROOMED.
+    const CORPS_QUI_CITE_SANS_ETRE_GROOME: &str = r#"## Le défaut
+
+> Plan de référence : `docs/plans/2026-01-01-001-fixture-plan.md` (sur main, § 1).
+> La branche du vol 3 n'existe plus.
+"#;
+
+    #[test]
+    fn mika2956_un_corps_qui_cite_un_plan_sans_branche_ni_verdict_nomme_ce_qui_manque() {
+        let missing = missing_grooming_signals(CORPS_QUI_CITE_SANS_ETRE_GROOME);
+        assert!(
+            missing.contains(&GroomingSignal::BranchCallout),
+            "le callout de branche manque et doit être nommé : {missing:?}"
+        );
+        assert!(
+            missing.contains(&GroomingSignal::GroomedVerdict),
+            "le marqueur GROOMED manque et doit être nommé : {missing:?}"
+        );
+        assert!(
+            missing.contains(&GroomingSignal::PlanCallout),
+            "la citation n'est pas un callout de plan ancré : {missing:?}"
+        );
+        assert!(!is_groomed(CORPS_QUI_CITE_SANS_ETRE_GROOME));
+    }
+
+    /// `is_groomed` n'est que la réduction booléenne de la mesure : les deux ne
+    /// peuvent pas diverger, et ce test est ce qui l'épingle.
+    #[test]
+    fn mika2956_is_groomed_est_la_reduction_de_la_mesure() {
+        for (ticket, body, _) in crate::grooming_marker::tests::FIXTURES {
+            assert_eq!(
+                is_groomed(body),
+                missing_grooming_signals(body).is_empty(),
+                "fixture #{ticket}: le booléen et la mesure divergent"
+            );
+        }
+        for body in [
+            CORPS_QUI_CITE_SANS_ETRE_GROOME,
+            "",
+            "> - **Branch:** `fix/1/x`\n",
+        ] {
+            assert_eq!(is_groomed(body), missing_grooming_signals(body).is_empty());
+        }
+    }
+
+    /// Un corps canoniquement groomé ne manque de rien : `Some(vec![])` est
+    /// « mesuré et groomé », pas « on n'a pas lu » (discipline tri-état mika#2340).
+    #[test]
+    fn mika2956_un_corps_groome_ne_manque_de_rien() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: 550e8400
+"#;
+        assert_eq!(missing_grooming_signals(body), Vec::new());
+    }
+
+    /// Les trois jetons sont ceux que le dispatch écrit déjà. Le pendant croisé,
+    /// qui les confronte à `check_grooming_markers`, vit dans `grooming_marker.rs`.
+    #[test]
+    fn mika2956_les_jetons_sont_ceux_du_dispatch() {
+        assert_eq!(GroomingSignal::BranchCallout.token(), "branch_callout");
+        assert_eq!(GroomingSignal::PlanCallout.token(), "plan_callout");
+        assert_eq!(GroomingSignal::GroomedVerdict.token(), "groomed_verdict");
+        assert_eq!(
+            missing_grooming_signals("")
+                .iter()
+                .map(|s| s.token())
+                .collect::<Vec<_>>(),
+            vec!["branch_callout", "plan_callout", "groomed_verdict"],
+            "l'ordre du vecteur est stable, et c'est celui du dispatch"
+        );
     }
 
     /// **Inversé par mika#2158 (AC1).** Une première passe `READY` sans seconde passe est

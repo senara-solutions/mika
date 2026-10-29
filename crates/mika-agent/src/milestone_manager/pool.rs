@@ -115,6 +115,42 @@
 //! candidat continue sa route et reste admissible. `None`, lui, dit « ce binaire
 //! n'a pas lu le corps » (motif mika#2340) et n'autorise aucun refus.
 //!
+//! # Le sixième motif : le bassin admet sur le prédicat du dispatch
+//!
+//! mika#2956 ajoute [`RefusalReason::UngroomedForDispatch`], et il fait plus
+//! qu'ajouter un motif : il déplace la **décision**. Jusqu'ici le dernier
+//! filtre était `!plan_present`, donc le lecteur lâche
+//! [`super::reader::plan_callout_present`] (mika#2608) — toute ligne de citation
+//! contenant `docs/plans/`. Le gate du dispatch, lui, exige **trois** signaux :
+//! le callout de branche, le callout de plan et le marqueur GROOMED. Le bassin
+//! admettait donc un ticket que le dispatch refusait ensuite en
+//! `dispatch_no_grooming_marker` : un dispatch vide, la population même que
+//! mika#2952 a voulu fermer.
+//!
+//! Mesuré le 2026-10-29 (rapport du sink `…T10-11-41`) : #2194 était la **seule**
+//! admission du rapport, et le même rapport disait d'elle, deux sections plus
+//! bas, « callout de plan ou de branche absent ». Son corps cite un plan dans
+//! une ligne de prose citée, et n'a ni callout de branche ni verdict.
+//!
+//! L'admission se décide donc sur [`crate::auto_pull::missing_grooming_signals`],
+//! la face mesurée du prédicat **strict** que le feeder utilise déjà pour
+//! promouvoir. Les deux écrivains de `ready` partagent désormais un seul
+//! prédicat d'admission, et l'implication qui le rend sûr — `is_groomed(b)` ⟹ le
+//! gate accepte `b` — est épinglée dans `grooming_marker.rs`, sur les six corps
+//! figés.
+//!
+//! **Ce n'est pas un resserrement de `plan_callout_present`**, et le ticket
+//! l'interdisait : ce lecteur alimente aussi `tier2_pick` et le tier 3 du
+//! « Next », qui lisent [`SubIssue::plan_present`] et jamais le champ mesuré
+//! (AC3, fermée par non-modification). Le booléen garde une voix au bassin, mais
+//! une seule : il choisit entre deux **libellés** — « plan groomé absent » quand
+//! rien ne cite de plan, « grooming incomplet » quand un plan est cité sans ses
+//! deux autres signaux. Il nomme, il ne décide plus.
+//!
+//! Le refus **entre dans la relève à grommer**, seul des quatre motifs nommés
+//! après `NoGroomedPlan` à le faire : un groom débloque ce candidat, et c'est la
+//! seule chose qui le débloque.
+//!
 //! # Ce que ce module ne fait pas
 //!
 //! L'écriture. Le vol 4 l'a livrée, et délibérément **pas ici** : `assess_pool`
@@ -139,6 +175,7 @@
 
 use super::plan_size;
 use super::types::{IssueState, SubIssue};
+use crate::auto_pull::GroomingSignal;
 use crate::plan_callout::PlanReading;
 use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL, operator_held_label};
 use serde::{Deserialize, Serialize};
@@ -242,16 +279,16 @@ pub(crate) fn dormancy_reading(body: &str) -> DormancyReading {
 /// hors milestone (`gh issue list`) **n'en mesure aucun**, et les remplir à leur
 /// valeur neutre ferait dire « pas de CI » à une absence de mesure — le motif
 /// mika#2331 que ce dépôt refuse ailleurs (« un null n'est jamais un 0 »). Les
-/// six champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
+/// sept champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
 /// les deux ensembles de candidats partagent un type sans qu'aucun ait à
 /// inventer de valeur.
 ///
-/// Les sixième et septième, `plan_reading` et `dormancy` (mika#2952), ne sont
-/// pas une entorse à cette borne : ce sont des lectures du **corps**, que les
-/// deux lectures d'issues demandent déjà (`--json body`), donc les deux origines
-/// les paient à l'identique et aucune n'a de valeur à inventer. C'est exactement
-/// ce qui les distingue de `pr_state`, `ci_state` et `branch_present`, qui sont
-/// mesurés sur un seul chemin.
+/// Les trois lectures du **corps** — `plan_reading` et `dormancy` (mika#2952),
+/// `missing_grooming_signals` (mika#2956) — ne sont pas une entorse à cette
+/// borne : les deux lectures d'issues demandent déjà le corps (`--json body`),
+/// donc les deux origines les paient à l'identique et aucune n'a de valeur à
+/// inventer. C'est exactement ce qui les distingue de `pr_state`, `ci_state` et
+/// `branch_present`, qui sont mesurés sur un seul chemin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolCandidate {
     pub number: u64,
@@ -281,6 +318,19 @@ pub struct PoolCandidate {
     /// mesurée ; `None` est l'autre chose, l'absence de mesure.
     #[serde(default)]
     pub dormancy: Option<DormancyReading>,
+    /// Lesquels des trois signaux de grooming manquent au corps (mika#2956).
+    ///
+    /// Troisième lecture du **corps**, donc dans la même borne que les deux
+    /// précédentes : les deux lectures d'issues demandent déjà `--json body`, et
+    /// aucune n'a de valeur à inventer.
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison des deux champs précédents :
+    /// `None` dit « ce binaire n'a pas lu le corps », jamais « rien ne manque »
+    /// (mika#2340), et ne déclenche donc aucun refus ici — un blob écrit avant ce
+    /// vol retombe sur le plancher `plan_present`, celui d'avant. `Some(vec![])`
+    /// est la mesure « les trois signaux sont là ».
+    #[serde(default)]
+    pub missing_grooming_signals: Option<Vec<GroomingSignal>>,
     pub labels: Vec<String>,
 }
 
@@ -296,6 +346,7 @@ impl From<&SubIssue> for PoolCandidate {
             plan_present: s.plan_present,
             plan_reading: s.plan_reading,
             dormancy: s.dormancy.clone(),
+            missing_grooming_signals: s.missing_grooming_signals.clone(),
             labels: s.labels.clone(),
         }
     }
@@ -547,6 +598,25 @@ pub enum RefusalReason {
     /// une tenue par **label**, visible sur la forge ; la dormance vit dans le
     /// corps et aucun label ne la dit.
     Dormant { condition: String },
+    /// Le corps **cite** un plan, mais il échoue au prédicat que le gate du
+    /// dispatch exige : il manque le callout de branche, le marqueur GROOMED, ou
+    /// les deux (mika#2956).
+    ///
+    /// Distinct de [`RefusalReason::NoGroomedPlan`], et pour la raison de
+    /// mika#2205 : les deux populations ne se soustraient pas. « Plan groomé
+    /// absent » est honnête quand rien ne cite de plan ; sur #2194 il a fait
+    /// mécroire le rapport, qui disait d'elle « à admettre » dans une section et
+    /// « callout de plan ou de branche absent » dans la suivante. Un seul libellé
+    /// pour les deux rendrait ce couple illisible, et un compteur ne pourrait pas
+    /// distinguer « rien à groomer n'existe » de « le groom est à finir ».
+    ///
+    /// **La charge nomme ce qui manque**, avec les jetons du dispatch
+    /// (`GroomingSignal::token`, croisés par
+    /// `grooming_marker::mika2956_le_vocabulaire_des_signaux_est_commun_aux_deux_predicats`) :
+    /// le geste correctif n'est pas le même selon que le groom n'a jamais eu lieu
+    /// ou qu'il s'est arrêté avant d'écrire son verdict, et un refus du bassin
+    /// doit pouvoir se rapprocher du `missing_signals` d'un refus du dispatch.
+    UngroomedForDispatch { missing: Vec<GroomingSignal> },
 }
 
 impl RefusalReason {
@@ -581,6 +651,19 @@ impl RefusalReason {
             RefusalReason::Dormant { condition } => {
                 format!("dormant — « {condition} » ; à réveiller quand la condition est remplie")
             }
+            // Les signaux sont nommés avec les jetons du dispatch, et non
+            // traduits : c'est ce qui permet à l'opérateur de rapprocher ce refus
+            // du `missing_signals` que le gate écrit dans son
+            // `dispatch_no_grooming_marker`. Une paraphrase française lirait
+            // mieux et se rapprocherait de rien.
+            RefusalReason::UngroomedForDispatch { missing } => {
+                let noms = missing
+                    .iter()
+                    .map(|s| format!("`{}`", s.token()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("grooming incomplet — manque {noms} ; à (re)groomer")
+            }
         }
     }
 
@@ -608,6 +691,13 @@ impl RefusalReason {
             // plan n'y gagnerait rien — il existe souvent déjà (#2854 en porte
             // un, livré sur trois vols).
             RefusalReason::Dormant { .. } => false,
+            // `true`, et l'AC1 de mika#2956 le demande explicitement : un groom
+            // débloque ce candidat — c'est la seule chose qui le débloque. La
+            // relève à grommer est donc exactement l'endroit où il doit
+            // apparaître, et c'est ce qui le sépare des trois `false`
+            // ci-dessus : là le travail n'existe pas (vol livré), attend un
+            // évènement (dormant) ou appartient à l'opérateur (tenu).
+            RefusalReason::UngroomedForDispatch { .. } => true,
         }
     }
 }
@@ -918,6 +1008,56 @@ fn well_formed_candidates<'a>(
                 });
                 continue;
             }
+            // Quatrième refus nommé, et c'est lui qui **décide** de l'admission
+            // depuis mika#2956. Le prédicat STRICT décide seul : le lecteur lâche
+            // de mika#2608 n'y a plus voix, il choisit le LIBELLÉ et rien
+            // d'autre.
+            //
+            // L'implication qui porte ce bras est épinglée ailleurs —
+            // `grooming_marker::mika2956_is_groomed_implique_le_gate_du_dispatch`
+            // : un `Vec` vide ici veut dire `is_groomed`, donc un corps que le
+            // gate du dispatch accepte. C'est ce qui rend « admis par le bassin
+            // ⇒ accepté au dispatch » structurel et non constaté.
+            //
+            // Ce bras ne demande PAS l'égalité des deux prédicats, et ne doit
+            // pas la demander : le résidu (`gate` ∖ `is_groomed` —
+            // orthographes non canoniques, callout dans un bloc clôturé) est
+            // refusé **ici** et accepté là-bas, donc dans le sens sûr. Harmoniser
+            // dans l'autre sens est interdit par le doc-comment de
+            // `auto_pull::is_groomed`.
+            //
+            // `None` ne déclenche rien : ce binaire n'a pas lu le corps
+            // (mika#2340), et le candidat retombe sur le plancher ci-dessous,
+            // celui d'avant ce vol. Refuser sur une absence de mesure serait
+            // exclure en silence sous un nom.
+            if let Some(missing) = s.missing_grooming_signals.as_deref()
+                && !missing.is_empty()
+            {
+                let reason = if s.plan_present {
+                    // Le corps CITE `docs/plans/` et échoue quand même au
+                    // prédicat du dispatch : c'est la population de mika#2956,
+                    // celle dont le libellé « plan groomé absent » a fait
+                    // mécroire le rapport.
+                    RefusalReason::UngroomedForDispatch {
+                        missing: missing.to_vec(),
+                    }
+                } else {
+                    // Rien ne cite de plan : « plan groomé absent » est honnête
+                    // et complet, et c'est le libellé que l'opérateur lit depuis
+                    // le vol 1. Le changer ici déplacerait une population que ce
+                    // ticket ne touche pas.
+                    RefusalReason::NoGroomedPlan
+                };
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason,
+                });
+                continue;
+            }
+            // Plancher, et il n'est plus atteint que par un candidat **non
+            // mesuré** — un blob du puits hors ligne écrit avant mika#2956. Il
+            // garde donc exactement le verdict qu'il avait.
             if !s.plan_present {
                 refusals.push(AdmissionRefusal {
                     number: s.number,
@@ -1005,13 +1145,21 @@ mod tests {
             state: IssueState::Open,
             priority_rank: rank,
             plan_present,
-            // `None` et non `Some(Live)` / `Some(Awake)` : la graine partagée
-            // reste celle d'un blob antérieur à mika#2952 sur les **deux**
+            // `None` et non `Some(Live)` / `Some(Awake)` / `Some(vec![])` : la
+            // graine partagée reste celle d'un blob antérieur sur les **trois**
             // lectures de corps, donc les verdicts que les tests du vol 2 et du
-            // vol 3 épinglent ne bougent pas. Les tests de mika#2952 posent la
-            // lecture qui les concerne explicitement, par `..cand(…)`.
+            // vol 3 épinglent ne bougent pas. Les tests de mika#2952 et de
+            // mika#2956 posent la lecture qui les concerne explicitement, par
+            // `..cand(…)`.
+            //
+            // `Some(vec![])` serait en outre une graine **incohérente** sous
+            // `plan_present: false` — « les trois signaux sont là » alors que rien
+            // ne cite de plan est un état qu'aucun corps ne produit, puisque
+            // `PlanCallout` manquerait. `None` se compose avec les deux valeurs
+            // de l'argument.
             plan_reading: None,
             dormancy: None,
+            missing_grooming_signals: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1360,6 +1508,7 @@ mod tests {
     fn mika2699_la_projection_dune_sub_issue_porte_les_champs_de_ladmission() {
         use crate::milestone_manager::types::CiState;
         let sub = SubIssue {
+            missing_grooming_signals: None,
             number: 2699,
             title: "le manager tient le bassin ready".into(),
             state: IssueState::Open,
@@ -1388,6 +1537,7 @@ mod tests {
         assert_eq!(
             PoolCandidate::from(&sub),
             PoolCandidate {
+                missing_grooming_signals: None,
                 number: 2699,
                 state: IssueState::Open,
                 priority_rank: Some(2),
@@ -2535,6 +2685,267 @@ mod tests {
                 },
             ],
             "la dormance est le motif le plus bloquant des deux côtés"
+        );
+    }
+
+    // -- mika#2956 : le bassin admet sur le prédicat du dispatch ------------
+
+    /// La forme mesurée le 2026-10-29 : une ligne de citation en **prose** qui
+    /// nomme un plan sous `docs/plans/`, sans callout de branche et sans
+    /// marqueur GROOMED.
+    ///
+    /// Fixture synthétique et non #2194, parce que ce numéro est aujourd'hui
+    /// capté par le bras `Dormant`, en amont du bras que ce vol ajoute : un
+    /// test posé sur lui mesurerait l'autre bras. La cause, elle, vaut pour
+    /// tout ticket dans cette situation — et elle valait pour #2194 avant que
+    /// son corps ne soit ajusté.
+    const CORPS_CITE_UN_PLAN_SANS_GROOM: &str = "\
+Le vol 3 est à refaire, et sa branche a disparu.
+
+> Plan de référence : `docs/plans/2026-01-01-001-fix-3101-fixture-plan.md` (sur
+> main, § 1). La branche du vol 3 n'existe plus.
+";
+
+    /// Le callout de plan **strict** est là ; les deux autres signaux ne sont
+    /// pas.
+    ///
+    /// C'est la population dont le `missing` se lit exactement comme le
+    /// `missing_signals` d'un refus `dispatch_no_grooming_marker` — deux
+    /// jetons, dans l'ordre du gate, la forme du refus de ffa8a6aa du
+    /// 2026-10-29 à 07:00Z que le ticket cite.
+    const CORPS_CALLOUT_SANS_BRANCHE_NI_VERDICT: &str = "\
+> - **Plan:** `docs/plans/2026-01-01-002-fix-3102-fixture-plan.md`
+
+## Le défaut
+";
+
+    /// Les trois signaux : le corps que le gate du dispatch accepte **par
+    /// construction**, donc celui que le bassin doit continuer d'admettre
+    /// (AC2).
+    const CORPS_GROOME: &str = "\
+> - **Branch:** `fix/3103/fixture-groomee`
+> - **Plan:** `docs/plans/2026-01-01-003-fix-3103-fixture-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED)
+
+## Le défaut
+";
+
+    /// Un candidat dont les **quatre** lectures du corps viennent des vrais
+    /// lecteurs — ceux que `reader.rs` appelle à son composeur, et dans le même
+    /// ordre.
+    ///
+    /// Fabriquer la mesure à la main rendrait ces tests tautologiques : ce qui
+    /// est en jeu est précisément l'écart entre le lecteur lâche de mika#2608 et
+    /// le prédicat strict du dispatch, et seul le vrai couple de lecteurs le
+    /// porte. `priority_rank` est le même pour tous les candidats de ces cas :
+    /// l'ordre y est celui des numéros, jamais celui de la liste.
+    fn candidat_lu(number: u64, body: &str) -> PoolCandidate {
+        PoolCandidate {
+            plan_present: crate::milestone_manager::reader::plan_callout_present(body),
+            plan_reading: Some(crate::plan_callout::plan_reading(body)),
+            dormancy: Some(dormancy_reading(body)),
+            missing_grooming_signals: Some(crate::auto_pull::missing_grooming_signals(body)),
+            ..cand(number, Some(2), false, &[])
+        }
+    }
+
+    /// AC1 et AC2 dans la même fonction, et c'est la **paire** qui compte :
+    /// elle sépare « le bras refuse la bonne population » de « le bras refuse
+    /// tout ».
+    ///
+    /// Précision sur le plan (§ 5.4, ligne 1), qui annonçait un `missing` sans
+    /// `PlanCallout` pour la fixture en prose, au motif que « le gate est lâche
+    /// sur cet axe » : le champ ne porte pas la mesure du gate mais celle du
+    /// prédicat **strict**, dont `extract_plan_path` est ancré. Une ligne de
+    /// prose n'y est un callout sur aucun des trois axes, donc `PlanCallout`
+    /// manque bel et bien — et c'est la raison même pour laquelle ce vol
+    /// existe. La propriété que le plan décrivait est celle de la **seconde**
+    /// fixture, qui porte le callout strict ; elle est testée telle quelle
+    /// ci-dessous, avec son libellé.
+    #[test]
+    fn mika2956_un_corps_qui_cite_docs_plans_sans_branche_ni_verdict_nest_pas_admis() {
+        let en_prose = candidat_lu(3101, CORPS_CITE_UN_PLAN_SANS_GROOM);
+        let callout_seul = candidat_lu(3102, CORPS_CALLOUT_SANS_BRANCHE_NI_VERDICT);
+        let groome = candidat_lu(3103, CORPS_GROOME);
+
+        // Les deux prémisses du défaut, mesurées et non supposées. Sans la
+        // première, ces fixtures auraient cessé d'être celles de la population
+        // du ticket et le test passerait pour une autre raison que la bonne.
+        for c in [&en_prose, &callout_seul, &groome] {
+            assert!(
+                c.plan_present,
+                "#{} : le lecteur lâche de mika#2608 doit voir un plan ici",
+                c.number
+            );
+        }
+        assert_eq!(
+            groome.missing_grooming_signals.as_deref(),
+            Some(&[] as &[GroomingSignal]),
+            "le corps canonique ne manque d'aucun des trois signaux"
+        );
+        assert_eq!(
+            en_prose.missing_grooming_signals.as_deref(),
+            Some(
+                &[
+                    GroomingSignal::BranchCallout,
+                    GroomingSignal::PlanCallout,
+                    GroomingSignal::GroomedVerdict,
+                ][..]
+            ),
+            "une citation en prose n'est un callout pour aucun des trois axes \
+             du prédicat strict"
+        );
+        assert_eq!(
+            callout_seul.missing_grooming_signals.as_deref(),
+            Some(
+                &[
+                    GroomingSignal::BranchCallout,
+                    GroomingSignal::GroomedVerdict
+                ][..]
+            ),
+            "le callout de plan est là : il manque la branche et le verdict, \
+             dans l'ordre du gate"
+        );
+
+        let milestone = vec![en_prose, callout_seul, groome];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![3103],
+            "seul le corps que le gate du dispatch accepte est admis (AC2) : \
+             les deux autres auraient produit un `dispatch_no_grooming_marker`, \
+             donc un dispatch vide"
+        );
+        assert_eq!(
+            v.refusals,
+            vec![
+                AdmissionRefusal {
+                    number: 3101,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::UngroomedForDispatch {
+                        missing: vec![
+                            GroomingSignal::BranchCallout,
+                            GroomingSignal::PlanCallout,
+                            GroomingSignal::GroomedVerdict,
+                        ],
+                    },
+                },
+                AdmissionRefusal {
+                    number: 3102,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::UngroomedForDispatch {
+                        missing: vec![
+                            GroomingSignal::BranchCallout,
+                            GroomingSignal::GroomedVerdict,
+                        ],
+                    },
+                },
+            ],
+            "le refus est nommé, distinct de `NoGroomedPlan`, et sa charge dit \
+             ce qui manque"
+        );
+        assert_eq!(
+            v.refusals[1].reason.label(),
+            "grooming incomplet — manque `branch_callout`, `groomed_verdict` ; \
+             à (re)groomer",
+            "le libellé porte les jetons du dispatch, pas une paraphrase : \
+             c'est ce qui permet de le rapprocher du `missing_signals` du gate"
+        );
+    }
+
+    /// AC1, seconde moitié : un groom débloque ce candidat — c'est la seule
+    /// chose qui le débloque — donc la relève à grommer est exactement
+    /// l'endroit où il doit apparaître.
+    ///
+    /// Contrôle négatif dans le même test, et il n'est pas décoratif : un
+    /// dormant n'entre pas dans la relève, parce que ce qu'il attend n'est pas
+    /// un groom. C'est la paire qui dit que `remediable_by_grooming` discrimine
+    /// au lieu de tout laisser passer.
+    #[test]
+    fn mika2956_un_refus_de_grooming_entre_dans_la_releve() {
+        use crate::milestone_manager::relief::name_relief;
+
+        let non_groome = candidat_lu(3101, CORPS_CITE_UN_PLAN_SANS_GROOM);
+        let dormant = PoolCandidate {
+            dormancy: Some(DormancyReading::Dormant {
+                condition: "quand POOL_WRITE s'ouvre".into(),
+            }),
+            ..cand(3104, Some(2), true, &[])
+        };
+        let milestone = vec![non_groome, dormant];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+        let releve = name_relief(&v, &milestone, &[]);
+
+        assert_eq!(
+            releve.next.iter().map(|t| t.number).collect::<Vec<_>>(),
+            vec![3101],
+            "le refus de grooming est nommé dans la relève ; le dormant, non"
+        );
+        assert_eq!(
+            releve.beyond, 0,
+            "le filtre de la décision 5 passe avant le calcul de `beyond`, donc \
+             un refus non groomable ne gonfle pas le reste"
+        );
+        assert_eq!(
+            releve.next[0].motive,
+            RefusalReason::UngroomedForDispatch {
+                missing: vec![
+                    GroomingSignal::BranchCallout,
+                    GroomingSignal::PlanCallout,
+                    GroomingSignal::GroomedVerdict,
+                ],
+            },
+            "la relève porte **le motif du bassin**, pas une reformulation : \
+             l'opérateur lit dans la relève ce qui manque au corps"
+        );
+    }
+
+    /// Effet de bord voulu du site de filtrage unique : `numbers_needing_size`
+    /// passe par le même `well_formed_candidates`, donc un candidat refusé en
+    /// amont ne demande plus d'estimation.
+    ///
+    /// Estimer un ticket non groomé est du travail jeté — un appel `gh` et une
+    /// lecture de plan pour un candidat qui ne sera pas admis — et la ligne
+    /// « Taille non vérifiée » du rapport rétrécit d'autant.
+    #[test]
+    fn mika2956_un_candidat_non_groome_ne_demande_plus_destimation() {
+        let non_groome = candidat_lu(3101, CORPS_CITE_UN_PLAN_SANS_GROOM);
+        let groome = candidat_lu(3103, CORPS_GROOME);
+        assert_eq!(
+            numbers_needing_size(&pool_of(0, 0), &[non_groome, groome], &[]),
+            vec![3103],
+            "le bras du bassin décide une seule fois, pour les deux lecteurs"
+        );
+    }
+
+    /// Le plancher d'avant ce vol est intact, et c'est ce qui rend le vol sûr
+    /// pour les blobs du puits hors ligne : `cand` sème `None` sur les trois
+    /// lectures du corps, soit exactement un blob écrit avant mika#2956.
+    ///
+    /// `None` veut dire « ce binaire n'a pas lu le corps » (mika#2340) : il ne
+    /// refuse rien de lui-même, et il n'admet rien non plus. Le verdict d'un
+    /// blob antérieur est donc exactement celui qu'il avait.
+    #[test]
+    fn mika2956_un_corps_non_mesure_retombe_sur_lancien_plancher() {
+        let sans_plan = cand(3105, Some(2), false, &[]);
+        let avec_plan = cand(3106, Some(2), true, &[]);
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &[sans_plan, avec_plan], &[]);
+
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 3105,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::NoGroomedPlan,
+            }],
+            "sans mesure, le plancher décide seul et son libellé ne change pas"
+        );
+        assert_eq!(
+            admitted(&v),
+            vec![3106],
+            "un candidat non mesuré que le lecteur lâche accepte reste admis — \
+             le vol ne rétroagit pas sur ce qu'il n'a pas mesuré"
         );
     }
 }

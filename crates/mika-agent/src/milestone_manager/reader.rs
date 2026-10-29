@@ -639,13 +639,15 @@ pub fn compose_outside_candidates(
                 state,
                 priority_rank: priority_from_labels(&labels),
                 plan_present: plan_callout_present(body),
-                // Une seule lecture du corps, trois questions (mika#2952) : le
-                // booléen lâche que mika#2608 a figé, la lecture à trois états
-                // dont le bassin tire son refus, et la dormance. Posées **ici**
+                // Une seule lecture du corps, quatre questions (mika#2952,
+                // mika#2956) : le booléen lâche que mika#2608 a figé, la lecture
+                // à trois états dont le bassin tire son refus, la dormance, et
+                // les trois signaux que le gate du dispatch exige. Posées **ici**
                 // et sur le chemin milestone, parce qu'un prédicat aveugle par
                 // origine est la classe mika#2205 réintroduite.
                 plan_reading: Some(crate::plan_callout::plan_reading(body)),
                 dormancy: Some(crate::milestone_manager::pool::dormancy_reading(body)),
+                missing_grooming_signals: Some(crate::auto_pull::missing_grooming_signals(body)),
                 labels,
             })
         })
@@ -766,6 +768,28 @@ pub fn priority_from_labels(labels: &[String]) -> Option<u8> {
 /// états. La propriété de sur-ensemble épinglée au § 1 est précisément ce qui
 /// rend l'état intermédiaire bien défini : `lâche \ stricte` est non vide, et
 /// c'est la population mesurée.
+///
+/// # Le bassin ne DÉCIDE plus sur ce booléen (mika#2956)
+///
+/// Et ce prédicat est, de nouveau, **inchangé**. Le rapport du sink du
+/// 2026-10-29T10:11:41 a mesuré la seconde moitié de la population du § ci-dessus :
+/// #2194, admise « à admettre » alors que le même rapport disait d'elle
+/// « callout de plan ou de branche absent ». Son corps *cite* `docs/plans/` dans
+/// une ligne de prose citée, donc la seconde branche rend `true`, et le gate du
+/// dispatch (`executor::check_grooming_markers`) l'aurait refusée en
+/// `dispatch_no_grooming_marker` — un dispatch vide, la classe que mika#2952 a
+/// voulu fermer.
+///
+/// Depuis mika#2956, `well_formed_candidates` admet sur
+/// [`crate::auto_pull::missing_grooming_signals`], le prédicat **strict** que le
+/// gate accepte par construction. Ce booléen-ci garde une voix, mais une seule :
+/// il choisit entre deux **libellés** de refus — « plan groomé absent » quand
+/// rien ne cite de plan, « grooming incomplet » quand un plan est cité et que
+/// les trois signaux n'y sont pas. Il nomme, il ne décide plus.
+///
+/// Ses quatre autres consommateurs gardent leur tolérance, `tier2_pick` et le
+/// tier 3 du « Next » inclus : ils lisent `SubIssue::plan_present` et jamais le
+/// champ mesuré (AC3 de mika#2956, fermée par non-modification).
 pub fn plan_callout_present(body: &str) -> bool {
     // Canonical callout shape: `> - **Plan:** docs/plans/...`.
     // Loose form: any occurrence of `docs/plans/` in a callout blockquote.
@@ -958,10 +982,11 @@ pub fn compose_from_gh_outputs(
         }
 
         let plan_present = plan_callout_present(&body);
-        // Le même corps, les deux autres questions (mika#2952) — voir le site
-        // jumeau dans `compose_outside_candidates`.
+        // Le même corps, les trois autres questions (mika#2952, mika#2956) —
+        // voir le site jumeau dans `compose_outside_candidates`.
         let plan_reading = Some(crate::plan_callout::plan_reading(&body));
         let dormancy = Some(crate::milestone_manager::pool::dormancy_reading(&body));
+        let missing_grooming_signals = Some(crate::auto_pull::missing_grooming_signals(&body));
         let branch_present = branch_callout_present(&body);
         let blockers = extract_blockers(&body);
         let priority_rank = priority_from_labels(&labels);
@@ -1029,6 +1054,7 @@ pub fn compose_from_gh_outputs(
             plan_present,
             plan_reading,
             dormancy,
+            missing_grooming_signals,
             branch_present,
             pr_number,
             pr_state,
@@ -1975,6 +2001,7 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
     #[test]
     fn compute_progress_all_completed() {
         let subs = vec![SubIssue {
+            missing_grooming_signals: None,
             number: 1,
             title: "t".into(),
             state: IssueState::Closed,
@@ -2552,6 +2579,7 @@ mod gh_arg_capture_tests {
              "labels": [{"name":"p1-important"}]}
         ]"#;
         let subs = vec![SubIssue {
+            missing_grooming_signals: None,
             number: 1802,
             title: "déjà dans sub_issues".into(),
             state: IssueState::Open,
@@ -2683,11 +2711,21 @@ mod gh_arg_capture_tests {
 
     // -- mika#2699 vol 3 : la sixième lecture, le plan au ref de sa branche --
 
-    /// Un corps d'issue groomée : les deux callouts que la sixième lecture
-    /// épelle, et rien d'autre. `\n` littéraux — c'est du JSON.
+    /// Un corps d'issue groomée : les **trois** signaux du prédicat du dispatch,
+    /// et rien d'autre. `\n` littéraux — c'est du JSON.
+    ///
+    /// Le marqueur `Grooming history` a été ajouté par mika#2956, et il n'est
+    /// pas décoratif : depuis ce vol l'admission exige les trois signaux, donc
+    /// un corps qui n'en porte que deux n'est plus candidat du tout et
+    /// `numbers_needing_size` ne le désigne pas — la sixième lecture ne partait
+    /// plus, et ces deux cas mesuraient une population vide. La fixture mérite
+    /// désormais son nom : avant, « groomée » y voulait dire « ce que la
+    /// sixième lecture épelle », pas « ce que le dispatch accepte ».
     const CORPS_GROOME: &str = "> - **Branch:** `feat/1700/x`\\n\
          > - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md` \
-         (committed on branch @ `abc1234`)";
+         (committed on branch @ `abc1234`)\\n\
+         > - **Grooming history:** mika-arch first-pass (READY) → \
+         second-pass (GROOMED)";
 
     const PLAN_DE_500: &str = "# Plan\n\n## Taille estimée\n\nTotal estimé : 500 lignes\n";
 
@@ -2781,11 +2819,25 @@ mod gh_arg_capture_tests {
 
     /// Cas 16 — un candidat sans callout de branche ne coûte aucun appel.
     ///
-    /// Le ticket porte bien un callout de plan — `plan_callout_present` le voit,
-    /// donc il passe le filtre d'admission du vol 2 — mais pas de quoi désigner
-    /// un ref. La lecture ne part pas : il n'y a pas d'adresse à lire, et un
-    /// appel au hasard sur `main` répondrait pour un autre fichier que celui du
-    /// ticket.
+    /// Le ticket porte bien un callout de plan — `plan_callout_present` le voit
+    /// — mais pas de quoi désigner un ref. La lecture ne part pas.
+    ///
+    /// **Ce que mika#2956 a changé, et pourquoi l'assertion de queue a bougé.**
+    /// Jusqu'à ce vol, ce corps passait le filtre d'admission (qui ne lisait que
+    /// `plan_present`), entrait donc dans `numbers_needing_size`, et
+    /// `read_one_plan_size` l'arrêtait sur son troisième garde en répondant
+    /// `Unread(NoCallout)`. Depuis mika#2956 l'admission exige les trois
+    /// signaux du prédicat du dispatch : il manque ici le callout de branche et
+    /// le marqueur GROOMED, donc le candidat est refusé **avant** la lecture et
+    /// `plan_sizes` ne porte aucune entrée pour lui. L'économie d'appel est la
+    /// même, obtenue un cran plus haut — et le `None` n'est pas un zéro : il dit
+    /// que la question de la taille n'a pas été posée, parce que l'admission
+    /// avait déjà répondu non (motif mika#2331).
+    ///
+    /// Le garde en profondeur de `read_one_plan_size` reste en place et reste
+    /// attesté — par `mika2956_le_garde_en_profondeur_de_la_sixieme_lecture_tient`
+    /// ci-dessous, qui l'appelle directement puisque le bassin ne lui envoie
+    /// plus personne.
     #[tokio::test]
     async fn mika2699_sans_callout_de_branche_aucun_appel_ne_part() {
         let (calls, mut runner) = build_recorder();
@@ -2813,9 +2865,44 @@ mod gh_arg_capture_tests {
         );
         assert_eq!(
             state.plan_sizes.get(&1700),
-            Some(&PlanSizeReading::Unread(UnreadCause::NoCallout)),
-            "et le fait est dit, pas tu : {:?}",
+            None,
+            "l'admission a refusé avant que la taille soit une question : {:?}",
             state.plan_sizes
+        );
+    }
+
+    /// mika#2956 — le troisième garde de `read_one_plan_size` tient, même si le
+    /// bassin ne lui envoie plus personne.
+    ///
+    /// Depuis que l'admission exige les trois signaux, un candidat désigné par
+    /// `numbers_needing_size` porte **par construction** un callout de branche
+    /// et un callout de plan stricts : les deux gardes de forme de
+    /// `read_one_plan_size` sont devenus inatteignables par ce chemin. Les
+    /// retirer serait pourtant un couplage silencieux — cette fonction ne lit
+    /// pas le filtre d'admission, et un futur appelant (le puits hors ligne, une
+    /// lecture ciblée) peut lui tendre n'importe quel corps. Le garde est donc
+    /// attesté ici **en appel direct**, à sa seule propriété propre : il nomme
+    /// la cause et ne part pas en appel.
+    #[tokio::test]
+    async fn mika2956_le_garde_en_profondeur_de_la_sixieme_lecture_tient() {
+        let (calls, mut runner) = build_recorder();
+        runner.plan_text = Some(PLAN_DE_500.into());
+        let bodies = HashMap::from([(
+            1700u64,
+            "> - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md`".to_string(),
+        )]);
+
+        let lu = read_one_plan_size(&runner, "senara-solutions/mika", 1700, &bodies).await;
+
+        assert_eq!(
+            lu,
+            PlanSizeReading::Unread(UnreadCause::NoCallout),
+            "sans ref à lire, la cause se nomme"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "et aucun appel ne part : {:?}",
+            calls.lock().unwrap()
         );
     }
 

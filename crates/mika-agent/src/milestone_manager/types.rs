@@ -5,6 +5,7 @@
 //! for the full Phase 1 discipline.
 
 use super::pool::{DormancyReading, PlanSizeReading, PoolCandidate, PoolVerdict, ReadyTicket};
+use crate::auto_pull::GroomingSignal;
 use crate::plan_callout::PlanReading;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -164,6 +165,21 @@ pub struct SubIssue {
     /// d'hériter d'un éveil que personne n'a mesuré.
     #[serde(default)]
     pub dormancy: Option<DormancyReading>,
+    /// Lesquels des trois signaux de grooming manquent au corps (mika#2956).
+    ///
+    /// La face **mesurée** du prédicat strict `auto_pull::is_groomed`, celui que
+    /// le gate du dispatch accepte par construction. À côté de
+    /// [`Self::plan_present`] et non à sa place : ce booléen est le lecteur
+    /// **lâche** de mika#2608, qui rend vrai pour toute ligne de citation
+    /// contenant `docs/plans/` — y compris une ligne de prose qui *cite* un plan
+    /// sans en porter le callout.
+    ///
+    /// `None` veut dire **« le corps n'a pas été lu par ce binaire »**, jamais
+    /// « rien ne manque » (motif mika#2340, comme [`Self::plan_reading`] et
+    /// [`Self::dormancy`]). `Some(vec![])` est la mesure « les trois signaux sont
+    /// là » ; un `Some` non vide nomme ce qui manque, avec les mots du dispatch.
+    #[serde(default)]
+    pub missing_grooming_signals: Option<Vec<GroomingSignal>>,
     /// True if the issue body carries a `> - **Branch:**` callout.
     pub branch_present: bool,
     /// PR number linked via GitHub `closingIssuesReferences` (first hit wins).
@@ -819,6 +835,7 @@ mod tests {
     #[test]
     fn is_in_flight_semantics() {
         let base = SubIssue {
+            missing_grooming_signals: None,
             number: 1,
             title: "t".into(),
             state: IssueState::Open,
@@ -864,6 +881,7 @@ mod tests {
     #[test]
     fn is_hard_blocked_semantics() {
         let base = SubIssue {
+            missing_grooming_signals: None,
             number: 1,
             title: "t".into(),
             state: IssueState::Open,
@@ -978,6 +996,7 @@ mod tests {
     #[test]
     fn mika2924_une_provenance_absente_serialise_en_null() {
         let sub = SubIssue {
+            missing_grooming_signals: None,
             number: 1,
             title: "t".into(),
             state: IssueState::Closed,
@@ -1208,6 +1227,7 @@ mod tests {
     #[test]
     fn mika2924_letat_des_pr_voyage_sur_un_sub_issue() {
         let sub = SubIssue {
+            missing_grooming_signals: None,
             number: 2698,
             title: "t".into(),
             state: IssueState::Open,
