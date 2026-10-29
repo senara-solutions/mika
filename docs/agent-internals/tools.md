@@ -455,9 +455,11 @@ où qa-review réorganise son manifeste.
 **Le prédicat, et sa population.** `classify_pipeline_block_grounding`
 (`evidence::guards`) ne s'applique qu'à `parse_verdict(&body) == Verdict::Block(k)`
 avec `k.eq_ignore_ascii_case("pipeline")` — hérité de `parse_verdict`, donc des
-tolérances mika#1828/#2239 **et de leurs bornes**. Trois issues :
+tolérances mika#1828/#2239 **et de leurs bornes**. Trois issues de ce côté-ci :
 `RefusedSectionAbsent` (aucune ligne `PIPELINE:`), `RefusedNoFailingGuardCited`
-(section présente, aucune citation d'échec), `Allowed`. La citation est une
+(section présente, aucune citation d'échec), `Allowed`. Depuis mika#2961 la
+fonction porte un second booléen et une quatrième issue, pour le membre `pass` —
+§ suivant. La citation est une
 **disjonction de trois motifs**, insensible à la casse et tolérante au préfixe
 d'emphase markdown : (1) `exit` suivi d'un entier **non nul** (`PIPELINE_EXIT_CODE_RE`,
 comparaison chiffre à chiffre, jamais un `parse`) ; (2) `REJECT:` ; (3)
@@ -512,6 +514,99 @@ décide bien resterait compatible avec une garde que personne n'appelle**. Noter
 que notre lien est en aval du `debug_assert!` de dedup mika#821 : un test au
 niveau `run_gh` sur un `pr review` doit donc fournir `ctx.pr_reviews_posted` —
 une map **vide**, car la peupler ferait répondre mika#821 avant nous.
+
+### Et un `pass` dit ce que la garde a fait — la population passe à deux membres (mika#2961, vol 1/2)
+
+**Le défaut, mesuré sur toute la population.** Le prompt de qa-review exige une
+section `PIPELINE:` dans **chaque** verdict qui atteint Step 2E, et plafonne à
+`hold[review]` celui qui en manque (l. 45). Sur 261 `pass` de
+`mika-platform-qa` — 60 dernières PR de mika, claude-pilot, mika-platform et
+control-monitor, relevé du 2026-10-29 — **zéro** porte une ligne `PIPELINE:`
+ancrée. Aucun garde moteur ne tenait la règle sur cette population : mika#2687
+ci-dessus a une population étroite et déclarée, `block[pipeline]` seul. Le cas
+fondateur est `control-monitor#217` (14:26:22Z) : une approbation nue, postée une
+seconde après une abstention du garde CI de mika#2455, sur un dépôt sans garde
+exécutable et sans porte de merge.
+
+**`contains` et un prédicat ancré ne comptent pas la même population**, et c'est
+ce qui a corrigé la mesure du ticket. `pipeline_section_present` lit une ligne qui
+**commence** par `PIPELINE:` (blancs de tête, course d'emphase markdown, casse
+repliée) ; les quatre `pass` de mika#2691 que la mesure initiale comptait comme
+conformes portent le mot dans leur **prose** — cette PR implémentait mika#2687 et
+en parle — et zéro ligne ancrée. Régime réel : 426/426, pas 422/426. Un
+`contains` compterait la prose d'une revue comme sa preuve, c'est-à-dire le
+fail-open même que le ticket condamne. Le garde de cette doctrine est un test, pas
+un commentaire : `mika2961_le_corps_de_2691_contient_le_mot_et_na_pas_la_section`
+assère les **deux** faits sur le même corps mesuré, donc il rougit le jour où
+quelqu'un réécrit le prédicat en `contains`.
+
+**Un membre de plus, pas un garde de plus.** `classify_pipeline_block_grounding`
+prend `verdict_is_pass: bool` en second argument — même convention que
+`classify_dependabot_verdict` — et rend `RefusedPassSectionAbsent` sur un `pass`
+sans section. Élargir plutôt que dupliquer, parce que la question est la même
+(*ce corps porte-t-il la preuve de la garde ?*), que le prédicat de section est
+le même, et que deux gardes voisins lisant le même corps auraient deux prédicats
+à garder synchrones. Les deux booléens sont mutuellement exclusifs chez
+l'appelant : un corps a une classe de verdict.
+
+**Les deux autres refus de mika#2687 ne s'appliquent pas, et c'est un choix
+argumenté.** `RefusedNoFailingGuardCited` serait un contresens sous un `pass` —
+une approbation ne cite aucun échec par construction. `RefusedNoGuardExecuted`
+lit le ledger d'outils : il reste réservé au membre `block`, donc **un `pass` ne
+paie pas cette requête** et n'écrit jamais de ligne `abstained`.
+
+**Polarité inverse, et c'est la seule de la famille.** `MIKA_QA_PASS_EVIDENCE_GATE`
+est **désarmé par défaut** : `1`/`true`/`on`/`yes` arment, tout le reste laisse
+désarmé (valeur non reconnue ⇒ WARN citant la valeur entre guillemets,
+mika#2220). Ses quatre voisins sont armés par défaut, donc leur ligne de
+démarrage signale une **dérogation** ; ici elle décrit le cas **nominal**, et
+c'est le silence qui veut dire « armé ». Raison du défaut : armer d'emblée
+changerait le régime de 261 verdicts d'un coup, et un refus tue le tour sans
+aucune revue postée. L'ouverture est une décision de Vincent (AC4). Même
+`OnceLock`, même scission wrapper/`…_gated`, pour la même raison qu'au § ci-dessus.
+
+**Le remède ne cite pas la forme qu'il demande.** Un refus portant sa propre
+ligne `PIPELINE:` **ancrée** satisferait ce garde-ci si le modèle le recollait
+dans son corps suivant — le garde lirait alors son propre texte comme la preuve
+du relecteur. Les deux sorties correctes (la section de Step 2E, la forme
+*not-applicable* de Step 2D) sont donc **décrites** et jamais citées verbatim.
+Pinné par `le_remedy_nomme_les_deux_sorties_sans_se_satisfaire_lui_meme`, qui
+vérifie en plus qu'aucune ligne n'ouvre sur un libellé de verdict (`VERDICT_RE`
+est ancré là).
+
+**Audit et greps : noms d'événement distincts.** La ligne `audit_events` partage
+`tool_name = 'pipeline_grounding_guard'` et son contrôle positif `allowed`, mais
+le WARN est `pass_evidence_refused` (`reason = pass_section_absent`) et **non**
+`pipeline_block_refused` : ce dernier est déjà un jeton de fil dans la doc
+opérateur et dans les greps de `server.log`, et y classer un refus de `pass`
+élargirait en silence une population publiée (mika#2131). La charge utile porte
+`"error": "pass_evidence_absent"` et `"doctrine": "mika#2961"`, pour la même
+raison. Sonde d'ouverture (AC5), tables de lecture et haltes :
+`docs/operator/environment-variables.md` § *Un `pass` dit ce que la garde du
+dépôt a fait*.
+
+**Couverture de régression.** Layer A dans `evidence::guards::tests::mika2961`
+(10 cas : les trois corps **mesurés** de cm#217, mika#2960 et mika#2691, le
+contraste `contains`/ancrage, le `not-applicable` de Step 2D admis sous `pass` et
+refusé sous `block` sur le **même** corps, le hors-population, la non-lecture du
+ledger sur les deux valeurs du 4ᵉ argument, et la polarité de l'interrupteur) ;
+Layer B dans `skills::builtin_handlers::mika2961_pass_evidence` (8 cas sur la
+forme gatée). Ce module ne repasse pas par `run_gh` — l'interrupteur étant
+désarmé par défaut derrière un `OnceLock`, un tour complet traverserait et irait
+chercher `gh` ; les deux membres entrent dans le **même** appel, au même point de
+chaîne, et le test `run_gh` de mika#2687 tient la position. Ce qu'aucun cas de
+comportement ne pourrait voir — l'enveloppe non gatée figeant son second argument
+à `false`, garde mort partout avec toutes les assertions vertes (classe
+mika#2158) — est tenu par un scan de source à deux rôles : la décision et la
+ligne de démarrage.
+
+**Ce que le vol ne ferme pas.** La ligne `NEGATIVE-TEST:` (mika#2264) part au vol
+2/2, avec son propre jeton canonique et son lint. L'abstention de mika#2455 reste
+**fail-open**, inchangée : sur un dépôt qui ne merge pas par
+`pr_merge_with_gate`, rien de mécanique ne tient le merge fermé — le vol ferme le
+signal, pas la porte. **Aucun jeton canonique ajouté** :
+`scripts/canonical-tokens.tsv` déclare déjà `PIPELINE` avec la tolérance
+`ci+emphasis:line-anchored`.
 
 ### Per-Tool Skill Budget (mika#2276 M1)
 
