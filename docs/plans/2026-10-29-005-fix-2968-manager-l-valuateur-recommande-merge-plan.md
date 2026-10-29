@@ -135,7 +135,10 @@ Dans `evaluator.rs` :
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiKnowledge {
-    /// Le rollup de la PR a été lu, à cet instant ISO 8601 UTC.
+    /// Le rollup de la PR a été lu, au cycle daté de cet instant ISO 8601
+    /// UTC. C'est l'instant du **cycle**, pas celui de la requête `gh` : la
+    /// granularité disponible est le cycle, parce qu'un cycle fait une seule
+    /// lecture (§ 2.5).
     Read { state: CiState, at: String },
     /// Il ne l'a pas été — et la cause est dite.
     Unread(CiUnreadCause),
@@ -161,7 +164,7 @@ pub enum CiUnreadCause {
 }
 ```
 
-Quatre causes et non une, pour la raison de `MergedPrReading` (`types.rs:111`) : « la PR n'est pas dans la liste du milestone » se corrige par le vol 2, « le vol ne nomme pas de ticket » ne se corrige pas du tout, et « blob antérieur » ne se corrige pas en production. Les replier donnerait un seul mot pour trois remèdes.
+Quatre causes et non une, pour la raison de `MergedPrReading` (`types.rs:118`) : « la PR n'est pas dans la liste du milestone » se corrige par le vol 2, « le vol ne nomme pas de ticket » ne se corrige pas du tout, et « blob antérieur » ne se corrige pas en production. Les replier donnerait un seul mot pour trois remèdes.
 
 ### 2.2 Le champ, et son défaut de relecture
 
@@ -272,7 +275,9 @@ Trois propriétés de cette forme, chacune délibérée :
 
 - **`pr_link_source` est le garde, pas une précaution.** `ci_state` vaut `CiState::None` aussi bien pour « lue, aucun check » que pour « ce chemin ne lit pas de rollup » (§ 1.4). Sans le discriminant, le vol 1 ferait passer la seconde pour la première — c'est-à-dire ferait exactement ce que le point 3 du ticket interdit.
 - **`Some(PrLinkSource::IssueClosingRef)` et `None` tombent dans le même bras**, mais pour des raisons différentes qui ne changent pas la conclusion : le premier ne porte pas de rollup, le second est un blob antérieur à mika#2924. Les deux donnent `NotFromPrList`, dont le libellé dit « pas lue par la liste des PR » et non « pas de checks ».
-- **`read_at` vient de l'appelant**, capturé par `run_manager_cycle_in` juste après `reader::read()` — `MilestoneState` ne porte pas d'horodatage de lecture (`types.rs:263`) et ce plan ne lui en ajoute pas. Prendre `timestamp::now()` dans `evaluate_flights` daterait la lecture de l'instant du *verdict*, à quelques secondes et trois appels `gh` près : une approximation qu'AC3 n'autorise pas à écrire comme un fait.
+- **`read_at` vient de `ctx.now`, et c'est une décision mesurée.** `collect_flight_verdicts` reçoit déjà `ctx` (`cadence.rs:682`) : il passe `ctx.now.to_rfc3339()`. Ce n'est pas un instant inventé sur place — dans le chemin de production, `run_manager_cycle_with_auth` (`cadence.rs:1205`) appelle `reader.read()` à la l. 1212 **puis** construit `CycleContext::new(&deliverer, Utc::now())` à la l. 1223. `ctx.now` est donc capturé *après* la lecture : il la **majore**, de la durée du probe de santé de la l. 1214. C'est pourquoi le doc-comment du § 2.1 et le libellé du § 2.7 disent « au cycle de », jamais « à la seconde où la requête est partie ».
+
+  **Deux alternatives écartées, avec leur coût.** (a) `timestamp::now()` dans `evaluate_flights` : daterait la lecture de l'instant du verdict, après les sept appels `gh` — strictement moins juste que `ctx.now`, pour la même plomberie. (b) Un instant posé à la source : `reader.rs` ne porte **aucune** horloge (`Utc::now` absent du fichier), donc il faudrait injecter un `now` dans `read_with_runner` et reprendre ses **11 sites d'appel**, dont 10 en test. Cela achèterait quelques secondes de précision sur un instant que le rapport présente déjà à la granularité du cycle. Si un besoin futur réclame l'instant de la requête, c'est là qu'il faudra payer — et `MilestoneState` est le porteur naturel, sur le patron déjà établi de `ready_pool` / `outside_candidates`, posés après composition (`reader.rs:280-283`).
 
 **Effet mesuré au vol 1, dit sans l'enjoliver.** Sur les cinq PR du § 1.4, aucune n'est dans la liste du milestone : le verdict portera `Unread(NoSubIssue)` ou `Unread(NotFromPrList)`, la recommandation restera `MergeCandidate`, et le rapport dira **« CI non lue (PR hors liste du milestone) »** au lieu de se taire. C'est le changement réel du vol 1 : la recommandation cesse de prétendre, et la cause de la non-lecture est nommée là où un opérateur la lit. Le vol 2 remplace cette non-lecture par une lecture et ferme AC5.
 
@@ -318,7 +323,10 @@ fn flight_ci_label(ci: &CiKnowledge) -> String {
                 CiState::Pending => "CI en cours",
                 CiState::None => "CI sans check",
             };
-            format!("{etat} (lue à {at})")
+            // « au cycle de » et non « à » : l'instant est celui du cycle qui a
+            // lu, capturé après le retour du reader (§ 2.5). Un « lue à »
+            // promettrait la seconde de la requête `gh`, que le manager n'a pas.
+            format!("{etat} (lue au cycle de {at})")
         }
         CiKnowledge::Unread(c) => format!("CI non lue ({})", ci_unread_label(*c)),
     }
@@ -339,7 +347,7 @@ Les deux `match` sont exhaustifs sans bras `_` (mika#2923) : une cinquième caus
 Le vol mesuré, tel qu'il se lira — la recommandation change (AC1) **et** la ligne dit sur quoi elle repose (AC3) :
 
 ```
-- mika#2963 (milestone cible) — PR #2966 ouverte — 7 tours / 200 — PR open — CI rouge (lue à 2026-10-29T17:46:12Z) — reprise à la main
+- mika#2963 (milestone cible) — PR #2966 ouverte — 7 tours / 200 — PR open — CI rouge (lue au cycle de 2026-10-29T17:46:12Z) — reprise à la main
 ```
 
 Et le même vol tel qu'il se lira au vol 1, où la PR de la boucle n'est pas dans la liste du milestone (§ 2.5) — la recommandation ne change pas, mais elle cesse de prétendre :
@@ -353,7 +361,7 @@ Et le même vol tel qu'il se lira au vol 1, où la PR de la boucle n'est pas dan
 ## 3. Ce que le plan ne touche pas
 
 - **`classify_ci_state`** (`reader.rs:858`) — lecteur unique du rollup, réutilisé tel quel. Aucune seconde classification.
-- **`CiState`** (`types.rs:68`) — quatre variantes, inchangées. Le tri-état « su / pas su » est au-dessus, dans `CiKnowledge`, pas dedans : `CiState` a d'autres lecteurs (`is_hard_blocked`, l'Assessor) qui n'ont pas à apprendre une variante.
+- **`CiState`** (`types.rs:71`) — quatre variantes, inchangées. Le tri-état « su / pas su » est au-dessus, dans `CiKnowledge`, pas dedans : `CiState` a d'autres lecteurs (`is_hard_blocked`, l'Assessor) qui n'ont pas à apprendre une variante.
 - **`pr_state`, et c'est une décision, pas un oubli.** Le ticket demande que le plan dise comment `pr_state` est lu, puisque la même requête l'alimente. Réponse : **il reste lu par l'appariement au milestone, inchangé, aux deux vols.** La raison est dans `reporter.rs:798` — `flight_milestone_label` *dérive* l'appartenance au milestone cible de `PrStateKnowledge` (`Read(_)` ⇒ « milestone cible », `NotRead` ⇒ hors cible). Poser `Read` depuis une lecture directe de PR ferait écrire « milestone cible » pour un ticket qui n'y est pas : un mensonge dans le rapport, au titre d'une amélioration. Découpler le libellé demande un champ d'appartenance explicite sur `FlightVerdict`, son `#[serde(default)]`, et la reprise des tests de `reporter.rs` qui en dépendent — c'est le vol 2, § 9.
 - **`VerdictTerms`, `first_divergence`, `consecutive_concordant`, `print_terms`** — non édités (§ 2.6). AC4.
 - **Le pré-filtre webhook** (mika#2675, la classe `ci_failure_surfaced_for_adoption`) — il écarte l'échec CI sans tour, et c'est ce qui rend le verdict du manager seul porteur du signal. Son comportement n'est pas touché ici.
@@ -370,7 +378,7 @@ Et le même vol tel qu'il se lira au vol 1, où la PR de la boucle n'est pas dan
 | L2 | `evaluator.rs` | champ `ci` sur `FlightVerdict`, `#[serde(default = …)]` |
 | L3 | `evaluator.rs` | `recommend` prend `&CiKnowledge`, bras rouge du § 2.3 |
 | L4 | `evaluator.rs` | `evaluate_flight` et `evaluate_flights` : signatures, `read_at`, appariement par `pr_link_source` (§ 2.5) |
-| L5 | `cadence.rs` | `run_manager_cycle_in` capture `read_at` après `reader::read()` et le passe à `collect_flight_verdicts` → `evaluate_flights` |
+| L5 | `cadence.rs` | `collect_flight_verdicts` (l. 682) passe `ctx.now.to_rfc3339()` à `evaluate_flights` ; aucune horloge neuve, aucune signature d'appelant touchée (§ 2.5) |
 | L6 | `reporter.rs` | `flight_ci_label` + `ci_unread_label` + segment dans `render_flight_verdict` |
 | L7 | `flight_verdict_ledger.rs` | champ `ci` sur `VerdictRecord`, `From<&FlightVerdict>`, **hors** `terms()` |
 | L8 | tests `evaluator.rs` | la matrice d'AC2, sur la fixture mesurée de #2966 |
@@ -445,7 +453,7 @@ Un vol interrompu après le commit 1 laisse l'arbre sain et le comportement inch
 - `FlightVerdict::ci` livré avec `#[serde(default = "CiKnowledge::default_unread")]` ; un blob antérieur relu rend `Unread(NotMeasured)` et jamais un état.
 - `recommend` prend `&CiKnowledge` ; une CI **lue** et rouge sur une PR ouverte rend `ManualResumption` ; `Pending`, `None` et `Unread(_)` rendent `MergeCandidate`, et le § 2.3 porte par écrit pourquoi.
 - `evaluate_flights` alimente `ci` depuis la sous-issue appariée **sous condition de `pr_link_source == Some(MilestonePrList)`** ; les trois autres cas donnent leur cause nommée.
-- `read_at` capturé par `run_manager_cycle_in` après `reader::read()` et traversé jusqu'à `evaluate_flights` ; aucun `timestamp::now()` dans l'évaluateur.
+- `read_at` alimenté par `ctx.now.to_rfc3339()` depuis `collect_flight_verdicts` ; aucun `timestamp::now()` ni `Utc::now()` dans l'évaluateur, aucune horloge ajoutée à `reader.rs`, aucun des 11 sites de `read_with_runner` touché.
 - `render_flight_verdict` porte un segment CI **sur chaque vol**, y compris vert, y compris non lu ; les deux `match` de libellé exhaustifs sans bras `_`.
 - `VerdictRecord::ci` livré avec `#[serde(default)]` et **absent** de `terms()` ; `VerdictTerms`, `first_divergence`, `consecutive_concordant` et `print_terms` non édités.
 - La matrice d'AC2 verte dans une seule fonction, son cas rouge passant par `classify_ci_state` sur le rollup mesuré de #2966, son contrôle négatif vert dans la même fonction.
@@ -469,7 +477,7 @@ Un vol interrompu après le commit 1 laisse l'arbre sain et le comportement inch
 
 **Périmètre du vol 2 :** le lecteur CI par numéro de PR, `pr_state` lu par la même requête, le découplage de `flight_milestone_label`, et la sonde d'AC5.
 
-- **Le lecteur.** Un appel `gh pr list --repo <R> --state all --json number,state,statusCheckRollup --limit 100` **par dépôt distinct** présent dans les verdicts `PrOpened`/`RescuePr`, exécuté via `ctx.gh_runner` (déjà porté par `CycleContext`, `cadence.rs:529`) depuis `collect_flight_verdicts`, puis un lookup par `FlightIssue::PrOpened { number }`. Un appel par dépôt et non par vol, parce qu'au premier cycle il n'y a pas de checkpoint et la source rend **tous** les vols terminés (`cadence.rs:659`) : un appel par vol n'a pas de borne, un appel par dépôt est borné par `flight_source::controlled_repos().len()`. Le dépôt vient de `FlightVerdict::repo`, jamais d'un littéral (garde `no_repo_list_test.rs`). Refus nommés sur le patron de `write_pool_admissions` : `NoRunner`, `ReadFailed`, `NotFound` — trois causes de plus sur `CiUnreadCause`, dont les libellés manquants ne compilent pas (§ 2.7).
+- **Le lecteur.** Un appel `gh pr list --repo <R> --state all --json number,state,statusCheckRollup --limit 100` **par dépôt distinct** présent dans les verdicts `PrOpened`/`RescuePr`, exécuté via `ctx.gh_runner` (déjà porté par `CycleContext`, `cadence.rs:529`) depuis `collect_flight_verdicts`, puis un lookup par `FlightIssue::PrOpened { number }`. Un appel par dépôt et non par vol, parce qu'au premier cycle il n'y a pas de checkpoint et la source rend **tous** les vols terminés (`cadence.rs:691`, `finished_implement_flights(None)`) : un appel par vol n'a pas de borne, un appel par dépôt est borné par `flight_source::controlled_repos().len()`. Le dépôt vient de `FlightVerdict::repo`, jamais d'un littéral (garde `no_repo_list_test.rs`). Refus nommés sur le patron de `write_pool_admissions` : `NoRunner`, `ReadFailed`, `NotFound` — trois causes de plus sur `CiUnreadCause`, dont les libellés manquants ne compilent pas (§ 2.7).
 - **`pr_state` et le label milestone.** La même requête rend `state`, donc le vol 2 peut poser `PrStateKnowledge::Read` depuis la lecture directe — mais seulement après avoir donné à `flight_milestone_label` un champ d'appartenance explicite (§ 3), sans quoi le rapport écrirait « milestone cible » pour un ticket hors cible.
 - **La sonde d'AC5**, pour que le vol 2 n'ait pas à la retrouver :
 
@@ -492,7 +500,7 @@ Deux mises en garde de lecture. L'**absence** du champ `ci` sur une ligne signif
 
 **Pourquoi la séparation, et pas un seul vol.** La section `## Taille estimée` chiffre le vol 1 à 326 lignes, soit 103 sous la borne de 429. Le lecteur et ses tests sont estimés à 176 lignes (`reader.rs` 52, `cadence.rs` 46, tests 78) : ils ne tiennent pas dans cette marge, et le découpage est donc celui que mika#2693 prescrit, non une commodité. La coupe est posée là plutôt qu'ailleurs parce que c'est la seule qui donne deux vols mergeables seuls : livrer la décision sans le rendu écrirait un verdict sans dire sur quoi il repose — exactement le défaut que le point 3 du ticket condamne —, et livrer le lecteur sans la décision alimenterait un champ que personne ne lit.
 
-`Tracked in: senara-solutions/mika#2968` (vol 2 — le lecteur CI par numéro de PR, `pr_state` lu directement, le découplage de `flight_milestone_label`, et la sonde d'AC5 ; à ouvrir en sous-ticket ou à rouvrir sur ce ticket à la fermeture du vol 1).
+Tracked in: senara-solutions/mika#2968 — vol 2 : le lecteur CI par numéro de PR, `pr_state` lu directement, le découplage de `flight_milestone_label`, et la sonde d'AC5. À ouvrir en sous-ticket, ou à rouvrir sur ce ticket à la fermeture du vol 1.
 
 ## Fire-Disposition
 
@@ -511,12 +519,12 @@ Donc aucune des trois options de mika#1574 n'est applicable ici : il n'y a ni al
 
 | livrable | lignes de code (hors `docs/`) |
 |---|---|
-| `crates/mika-agent/src/milestone_manager/evaluator.rs` (L1 — `CiKnowledge`, `CiUnreadCause`, doc-comments) | 62 |
+| `crates/mika-agent/src/milestone_manager/evaluator.rs` (L1 — `CiKnowledge`, `CiUnreadCause`, doc-comments) | 63 |
 | `crates/mika-agent/src/milestone_manager/evaluator.rs` (L2 — champ `ci`, défaut serde, doc) | 16 |
 | `crates/mika-agent/src/milestone_manager/evaluator.rs` (L3 — `recommend`, signature et bras) | 26 |
 | `crates/mika-agent/src/milestone_manager/evaluator.rs` (L4 — `evaluate_flight`, `evaluate_flights`, appariement) | 28 |
-| `crates/mika-agent/src/milestone_manager/cadence.rs` (L5 — capture et passage de `read_at`) | 12 |
-| `crates/mika-agent/src/milestone_manager/reporter.rs` (L6 — deux libellés, segment, doc) | 28 |
+| `crates/mika-agent/src/milestone_manager/cadence.rs` (L5 — passage de `ctx.now.to_rfc3339()`, doc de la décision) | 8 |
+| `crates/mika-agent/src/milestone_manager/reporter.rs` (L6 — deux libellés, segment, doc) | 31 |
 | `crates/mika-agent/src/flight_verdict_ledger.rs` (L7 — champ hors `terms()`, doc) | 18 |
 | essaimage littéral (constructions `FlightVerdict {` des tests existants) | 14 |
 | tests (L8 — matrice d'AC2, fixture mesurée de #2966) | 72 |
@@ -543,4 +551,4 @@ L'ordre de commit du § 5 est construit pour que ce soit vrai même si un tour m
 - **Les checks requis** — § 2.4. La population est le rollup entier, délibérément, et la prémisse du point 2 du ticket est corrigée par la mesure du § 1.5.
 - **Le pré-filtre webhook** (mika#2675) qui écarte `check_suite(failure)` sans tour — c'est ce qui rend le verdict du manager seul porteur du signal, et c'est un autre ticket.
 - **Un drapeau CLI pour comparer la CI** dans `mika flight-verdicts concordance` — § 2.6. MPC ne mesure pas la CI ; un drapeau pour un champ non comparé serait du YAGNI.
-- **Un horodatage de lecture sur `MilestoneState`** — § 2.5. `read_at` traverse en paramètre ; ajouter un champ à l'état composé toucherait le puits hors-ligne et ses blobs pour un besoin que le paramètre couvre.
+- **L'instant exact de la requête `gh`** — § 2.5. Le rapport date la lecture à la granularité du **cycle** (`ctx.now`, capturé après le retour du reader). Descendre à la seconde de la requête demanderait une horloge dans `reader.rs`, qui n'en a aucune, et la reprise de ses 11 sites d'appel. L'alternative est nommée au § 2.5 avec son porteur naturel (`MilestoneState`, patron `ready_pool`), pour le jour où un besoin la réclame.
