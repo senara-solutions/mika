@@ -12,8 +12,8 @@
 use super::plan_size;
 use super::pool::{PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause};
 use super::types::{
-    CiState, IssueState, MergedPrReading, MilestoneRef, MilestoneState, PrLinkSource,
-    ProgressCounts, RecentActivity, SubIssue,
+    CiState, IssueState, MergedPrReading, MilestoneReadAudit, MilestoneRef, MilestoneState,
+    PrLinkSource, ProgressCounts, RecentActivity, SubIssue,
 };
 use crate::auto_pull::extract_branch_name;
 use crate::plan_callout::{FenceHandling, plan_callout};
@@ -36,6 +36,31 @@ use std::collections::{BTreeMap, HashMap};
 /// nombre que l'opérateur lit doit être celui que la lecture a demandé, jamais
 /// une copie qui peut dériver.
 pub const OUTSIDE_READ_LIMIT: usize = 100;
+
+/// Combien de tickets la lecture **du milestone cible** rapporte au plus
+/// (mika#2969).
+///
+/// C'est la borne du `--limit` de la deuxième lecture `gh`, et c'est aussi le
+/// seuil de la garde de troncature de [`MilestoneReadAudit::truncated`].
+///
+/// **Pourquoi une borne nommée et non une pagination par curseur.** Mesuré le
+/// 2026-10-29 sur le milestone 33, 192 items annoncés par l'API :
+/// `--limit 100` rend 100 tickets en ≈2,5 s pour **1** appel `gh` ;
+/// `--limit 1000` rend les 117 issues du milestone en 2,6–3,0 s pour **1**
+/// appel `gh` — `gh issue list` pagine en interne, une invocation quel que soit
+/// `N`. Le changement de borne coûte donc **zéro appel `gh` de plus par cycle**
+/// et ≈0,1–0,5 s, là où une pagination écrite à la main coûterait un appel par
+/// page et un curseur à tenir. La mesure est celle que mika#2924 a faite pour
+/// son champ, sur le même appel.
+///
+/// **Pourquoi 1000.** ≈8,5× la taille du plus gros milestone du dépôt
+/// aujourd'hui. Une borne n'est pas une pagination : elle peut être atteinte, et
+/// c'est pourquoi elle est **dite** quand elle l'est — une page pleine ne passe
+/// jamais pour un milestone complet.
+///
+/// Public pour la même raison qu'[`OUTSIDE_READ_LIMIT`] : le rapporteur l'épelle,
+/// et le nombre que l'opérateur lit doit être celui que la lecture a demandé.
+pub const MILESTONE_READ_LIMIT: usize = 1000;
 
 /// Taille de page demandée au `timeline` REST (mika#2924, vol 2).
 ///
@@ -187,6 +212,12 @@ impl Reader {
         //    PR de clôture. Le coût en appels `gh` par cycle est **inchangé** —
         //    mesuré le 2026-10-26 sur le dépôt réel : 1 appel avant, 1 après
         //    (1,639 s → 1,795 s).
+        //
+        //    La borne est nommée (`MILESTONE_READ_LIMIT`, mika#2969) : elle
+        //    valait `100` en littéral, et le milestone 33 en portait 192 items
+        //    — 17 tickets du milestone, dont les ouverts #1721 et #1727,
+        //    sortaient de `sub_issues` sans laisser de trace. Une page pleine
+        //    se dit maintenant au rapport, par `compose_read_audit` ci-dessous.
         let issues_json = runner
             .run(&[
                 "issue",
@@ -200,7 +231,7 @@ impl Reader {
                 "--json",
                 "number,title,state,body,labels,updatedAt,closedByPullRequestsReferences",
                 "--limit",
-                "100",
+                &MILESTONE_READ_LIMIT.to_string(),
             ])
             .await?;
 
@@ -274,9 +305,16 @@ impl Reader {
         // `compose_from_gh_outputs` garde sa signature à quatre arguments : ni le
         // bassin ni les candidats du dehors ne sont une propriété du milestone, et
         // l'eval `manager_loop_resistance` l'appelle de l'extérieur. Les deux sont
-        // donc posés ici, après composition.
+        // donc posés ici, après composition. L'audit de lecture (mika#2969) suit
+        // la même règle, pour une raison de plus : il a besoin de la borne que
+        // l'appel 2 vient de demander, que le composeur ne reçoit pas.
         let mut state =
             compose_from_gh_outputs(milestone_ref, &milestone_json, &issues_json, &pr_json)?;
+        state.milestone_read_audit = Some(compose_read_audit(
+            &milestone_json,
+            &issues_json,
+            MILESTONE_READ_LIMIT,
+        )?);
         state.ready_pool = compose_ready_pool(&ready_json)?;
         let (outside, truncated) = compose_outside_candidates(&outside_json, &state.sub_issues)?;
         state.outside_candidates = outside;
@@ -1156,6 +1194,46 @@ pub fn compose_from_gh_outputs(
     })
 }
 
+/// L'audit de la deuxième lecture : ce qu'elle a rendu, ce qu'elle demandait, et
+/// ce que l'API du milestone annonce (mika#2969). Fonction pure.
+///
+/// Les trois nombres sortent de deux blobs **déjà lus** — l'appel 1 pour le
+/// compte de l'API, l'appel 2 pour les tickets : aucun appel `gh` de plus par
+/// cycle. C'est la raison pour laquelle l'écart se rapporte au lieu d'être
+/// résolu par une décomposition `gh api graphql` : elle serait redondante avec
+/// le prédicat de complétude, coûterait un appel de plus, et `gh api graphql`
+/// est refusé par la permission-policy du bac à sable de la boucle.
+///
+/// **`api_item_total` n'est pas de la même population que `returned`.** L'API du
+/// milestone compte ses *items* — issues **et** PR —, `gh issue list` ne rend
+/// que les *issues*. Sur le milestone 33 au 2026-10-29 : 192 items annoncés,
+/// 117 issues rendues, et l'écart de 75 vaut exactement le nombre de PR du
+/// milestone. Il est structurel et permanent, donc sans pouvoir de détection
+/// (classe mika#2205) : le signal de complétude est
+/// [`MilestoneReadAudit::truncated`], exact par construction, et jamais
+/// l'égalité des deux comptes.
+///
+/// `open_issues` ou `closed_issues` absent vaut `0` : une réponse de l'API du
+/// milestone en porte toujours les deux, et un `0` rapporté à côté d'un compte
+/// lu non nul se dénonce de lui-même au rapport, là où une erreur ferait échouer
+/// tout le cycle pour une ligne d'observabilité.
+fn compose_read_audit(
+    milestone_json: &str,
+    issues_json: &str,
+    limit: usize,
+) -> Result<MilestoneReadAudit> {
+    let m: Value = serde_json::from_str(milestone_json)
+        .map_err(|e| anyhow!("failed to parse milestone json for read audit: {e}"))?;
+    let count = |field: &str| m.get(field).and_then(|v| v.as_u64()).unwrap_or(0);
+    let issues: Vec<Value> = serde_json::from_str(issues_json)
+        .map_err(|e| anyhow!("failed to parse issues json for read audit: {e}"))?;
+    Ok(MilestoneReadAudit {
+        returned: issues.len(),
+        limit,
+        api_item_total: count("open_issues") + count("closed_issues"),
+    })
+}
+
 /// Compute `ProgressCounts` from sub-issues. Pure function.
 pub fn compute_progress(subs: &[SubIssue]) -> ProgressCounts {
     let mut p = ProgressCounts {
@@ -2029,6 +2107,74 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
         assert_eq!(p.completed, 1);
         assert_eq!(p.total, 1);
     }
+
+    // -- mika#2969 : l'audit de la lecture du milestone --
+
+    /// Un blob de milestone à la forme de l'API, avec ses deux comptes d'items.
+    fn milestone_blob(open: u64, closed: u64) -> String {
+        format!(
+            r#"{{"title": "Substrat de boucle", "description": "", "state": "open",
+                 "created_at": "2026-08-01T00:00:00Z", "due_on": null,
+                 "open_issues": {open}, "closed_issues": {closed}}}"#
+        )
+    }
+
+    /// Une énumération de `n` tickets ouverts, numérotés à partir de 1.
+    fn issues_blob(n: usize) -> String {
+        let items: Vec<String> = (1..=n)
+            .map(|i| {
+                format!(
+                    r#"{{"number": {i}, "title": "t", "state": "OPEN", "body": "", "labels": []}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// **T1** — l'audit rend les trois nombres, et la complétude est un prédicat
+    /// sur le couple `(returned, limit)`.
+    ///
+    /// La borne est **paramétrée** plutôt que prise à [`MILESTONE_READ_LIMIT`] :
+    /// le prédicat se teste alors sur trois tickets au lieu de mille, et le test
+    /// garde son sens le jour où la constante bouge. C'est la constante elle-même
+    /// que `mika2969_la_lecture_des_tickets_demande_la_borne_nommee_et_laudit_porte_la_meme`
+    /// épingle, sur le vecteur d'arguments.
+    #[test]
+    fn mika2969_laudit_dit_le_lu_la_borne_et_le_compte_de_lapi() {
+        // Page non pleine : la lecture est complète, et l'écart avec le compte
+        // de l'API ne la rend pas tronquée — ce sont deux populations.
+        let audit = compose_read_audit(&milestone_blob(1, 1), &issues_blob(2), 3)
+            .expect("l'audit doit se composer sur du JSON bien formé");
+        assert_eq!(audit.returned, 2);
+        assert_eq!(audit.limit, 3);
+        assert_eq!(audit.api_item_total, 2);
+        assert!(
+            !audit.truncated(),
+            "deux tickets rendus pour une borne de trois : la lecture est complète"
+        );
+
+        // Page pleine : tronquée, même si le compte de l'API tombe juste.
+        let pleine = compose_read_audit(&milestone_blob(2, 1), &issues_blob(3), 3)
+            .expect("l'audit doit se composer sur du JSON bien formé");
+        assert_eq!(pleine.returned, 3);
+        assert!(
+            pleine.truncated(),
+            "une page pleine ne dit pas « voici tout le milestone »"
+        );
+
+        // L'écart entre les deux comptes n'est pas un signal de troncature : ici
+        // l'API annonce 192 items (PR comprises) pour 2 issues rendues sur une
+        // borne de 3, et la lecture est **complète**. C'est la classe mika#2205 —
+        // deux populations sous un même nom ne se soustraient pas.
+        let ecart = compose_read_audit(&milestone_blob(14, 178), &issues_blob(2), 3)
+            .expect("l'audit doit se composer sur du JSON bien formé");
+        assert_eq!(ecart.api_item_total, 192);
+        assert!(
+            !ecart.truncated(),
+            "l'écart avec le compte de l'API vaut les PR du milestone, pas des \
+             tickets manquants"
+        );
+    }
 }
 
 /// Injection-verified arg-capture guards (mika#1933 AC6, plan § S4).
@@ -2036,8 +2182,9 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
 /// **What this guards:** the `gh` invocation contract in `Reader::read_with_runner`.
 /// The AC1/AC2 lock-in (closed sub-issues included in the denominator) depends
 /// on TWO adjacent-pair arg tokens on the `issue list` call — `"--state", "all"`
-/// and `"--limit", "100"` — plus the matching `"--state", "all"` on the `pr list`
-/// call. A regression that reverts either token (e.g. someone re-defaulting to
+/// and `"--limit", "1000"` (the named [`MILESTONE_READ_LIMIT`] since mika#2969;
+/// it was a `"100"` literal before) — plus the matching `"--state", "all"` on
+/// the `pr list` call. A regression that reverts either token (e.g. someone re-defaulting to
 /// `--state open`, which is the ticket body's original hypothesis and the pre-PR#1932
 /// state) would silently take the Reader back to reste-à-faire semantics.
 ///
@@ -2167,7 +2314,11 @@ mod gh_arg_capture_tests {
             // Minimal well-shaped JSON — composer runs to completion without
             // meaningful state, which is fine because these tests assert only
             // on the captured argument vectors.
-            milestone_json: r#"{"title": "T", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null}"#.into(),
+            // `open_issues` et `closed_issues` sont ceux que l'API du milestone
+            // rend toujours (mika#2969) : le fixture porte la forme réelle,
+            // pour que le chemin par défaut de `compose_read_audit` ne soit
+            // jamais celui que les gardes d'arguments exercent.
+            milestone_json: r#"{"title": "T", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null, "open_issues": 0, "closed_issues": 0}"#.into(),
             issues_json: "[]".into(),
             pr_json: "[]".into(),
             ready_json: "[]".into(),
@@ -2207,14 +2358,28 @@ mod gh_arg_capture_tests {
         );
     }
 
+    /// L'appel 2 demande `--state all` et la borne **nommée** de mika#2969, et
+    /// l'audit transporte celle que l'appel a réellement demandée.
+    ///
+    /// Renommé de `reader_issue_list_uses_state_all_and_limit_100` : le nom
+    /// épelait `100`, la borne vaut maintenant [`MILESTONE_READ_LIMIT`], et un
+    /// nom qui dit un autre nombre que son assertion est le premier endroit où
+    /// un lecteur se trompe.
+    ///
+    /// La deuxième moitié n'est pas tautologique : la borne comparée est lue
+    /// dans le **vecteur d'arguments capturé**, pas dans la constante. Un
+    /// correctif qui changerait la constante sans changer l'appel, ou qui
+    /// poserait sur l'audit une borne tierce, rougirait ici — alors qu'une
+    /// assertion `audit.limit == MILESTONE_READ_LIMIT` passerait dans les deux
+    /// cas.
     #[tokio::test]
-    async fn reader_issue_list_uses_state_all_and_limit_100() {
+    async fn mika2969_la_lecture_des_tickets_demande_la_borne_nommee_et_laudit_porte_la_meme() {
         let (calls, runner) = build_recorder();
         let mref = MilestoneRef {
             repo: "senara-solutions/mika".into(),
             number: 31,
         };
-        Reader::new(None)
+        let state = Reader::new(None)
             .read_with_runner(&mref, &runner)
             .await
             .expect("read_with_runner should succeed on canned JSON");
@@ -2225,11 +2390,26 @@ mod gh_arg_capture_tests {
             .find(|c| c.first().map(String::as_str) == Some("issue"))
             .expect("issue list call captured");
         // Adjacent-pair assertions — a sed-inject that re-adds `--state open`
-        // or drops `--limit 100` would fail here.
+        // or drops the named bound would fail here.
         assert_adjacent_pair(issue_call, "--state", "all");
-        assert_adjacent_pair(issue_call, "--limit", "100");
+        assert_adjacent_pair(issue_call, "--limit", "1000");
         // Sanity: the milestone number is threaded through.
         assert_adjacent_pair(issue_call, "--milestone", "31");
+
+        let demandee: usize = issue_call
+            .windows(2)
+            .find(|w| w[0] == "--limit")
+            .and_then(|w| w[1].parse().ok())
+            .expect("la borne demandée doit se lire dans les arguments capturés");
+        let audit = state
+            .milestone_read_audit
+            .as_ref()
+            .expect("un cycle qui a lu le milestone doit porter son audit");
+        assert_eq!(
+            audit.limit, demandee,
+            "l'audit doit porter la borne que l'appel a demandée, sinon le rapport \
+             épelle un nombre que la lecture n'a jamais utilisé"
+        );
     }
 
     #[tokio::test]
