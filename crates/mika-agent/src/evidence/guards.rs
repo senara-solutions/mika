@@ -1683,6 +1683,137 @@ pub(crate) fn detect_response_language_drift(
 }
 
 // ---------------------------------------------------------------------------
+// mika#1680 — CJK-script response guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the CJK-script guard
+/// (mika#1680). Inline guard at position 5i, appended at the tail of the chain.
+pub(crate) const RESPONSE_CJK_SCRIPT_LABEL: &str = "response_cjk_script";
+
+/// Ideograph floor. Below it, a text is naming a CJK string, not written in one.
+const CJK_MIN_IDEOGRAPHS: usize = 5;
+
+/// Share floor, in percent of script characters. The two bounds apply together
+/// and the tighter one bites, depending on the length of the text: the floor
+/// alone would fire on an English sentence quoting five ideographs, the share
+/// alone would fire on a three-ideograph text and nothing else.
+const CJK_MIN_SHARE_PCT: usize = 30;
+
+/// Width of the excerpt carried into the correction message, in **characters**.
+const CJK_EXCERPT_CHARS: usize = 80;
+
+/// Structured result of a response written in CJK ideographs.
+pub(crate) struct CjkScriptMatch {
+    /// Characters in U+4E00–U+9FFF.
+    pub(crate) ideographs: usize,
+    /// `char::is_alphabetic()` characters **outside** that range.
+    pub(crate) latin: usize,
+    /// `ideographs` as a percentage of `ideographs + latin`.
+    pub(crate) share_pct: usize,
+    /// Window of `CJK_EXCERPT_CHARS` characters opening on the first ideograph.
+    pub(crate) excerpt: String,
+}
+
+/// CJK Unified Ideographs, **exactly** U+4E00–U+9FFF, no more and no less.
+///
+/// The range is the one the mika#1680 AC4 probe measures
+/// (`content GLOB '*[一-鿿]*'`), and the parity is deliberate: **the guard and
+/// the probe must count the same population**, or the probe's target of 0 says
+/// nothing about the guard. The historical GLOB of the ticket body, `[一-龥]`,
+/// stops at U+9FA5 and leaks 90 codepoints — that difference is exactly the one
+/// between a probe that measures this guard and a probe that measures something
+/// else.
+///
+/// CJK punctuation (U+3000–U+303F: `。`, `（`, `、`) is **out** of the
+/// predicate, despite being present in the measured fixture. The defect
+/// measured on 2026-10-29 is a response **in Chinese**, not an English response
+/// with CJK decoration — that is the correction the 2026-06-30 14:53Z comment
+/// already made to this ticket's original framing, and reopening it would
+/// reopen the "punctuation police" class that reframing closed. Hiragana,
+/// katakana and Hangul are outside the range for the same reason: nothing has
+/// measured them, and a predicate that refuses a population with no known
+/// occurrence is a predicate whose false positives nobody can count.
+fn is_cjk_ideograph(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+}
+
+/// Does this response read as written in Chinese ideographs rather than in the
+/// Latin script?
+///
+/// Fires **iff** `ideographs >= CJK_MIN_IDEOGRAPHS` **and**
+/// `ideographs * 100 >= CJK_MIN_SHARE_PCT * (ideographs + latin)`. The share is
+/// written as a cross-product rather than a division: no division means no
+/// division-by-zero to reason about, and the order of the two conjuncts
+/// guarantees a non-zero denominator anyway.
+///
+/// # Why mika#2247's guard is not reused, which is not guessable
+///
+/// `detect_response_language_drift` is the thematic neighbour and it cannot
+/// cover this. Each of the three reasons is sufficient on its own, and none is
+/// repaired by a setting:
+///
+/// 1. **It requires a *declared* language, and nothing declares one for
+///    mika-dev.** Its body opens on `let expected = expected?;`, and the value
+///    comes from the `customer_config` key `language`, which nothing in this
+///    repository emits — setting `MIKA_TENANT_LANGUAGE` is a `mika-cloud`
+///    gesture.
+/// 2. **Its verdict domain does not know Chinese, and its threshold makes it
+///    fail at the opening.** `LanguageVerdict` is `French | English |
+///    Undetermined`, measured by counting function words from two closed Latin
+///    lists with `LANGUAGE_MIN_HITS = 3`; a fully Chinese text produces tokens
+///    (ideographs are `char::is_alphabetic()`) but **zero** hits in either
+///    list, hence `Undetermined`, hence `None`.
+/// 3. **Its correction names a value that does not exist.** The re-prompt
+///    points at `set_config language = <detected>` and `TenantLanguage::parse`
+///    accepts only `fr` and `en`. There is no `zh` to name, and a guard whose
+///    correction prescribes an impossible gesture corrects nothing.
+///
+/// The consequence decides the axis: the right quantity is not the **language**
+/// but the **script**. mika#2247's declarable domain — `{fr, en}` — is entirely
+/// Latin, so "write in the Latin script" is true for **every** declarable
+/// tenant **and** for an agent that declared nothing. A script guard needs no
+/// declaration to arm itself.
+pub(crate) fn detect_cjk_script_response(text: &str) -> Option<CjkScriptMatch> {
+    let mut ideographs = 0usize;
+    let mut latin = 0usize;
+    let mut first: Option<usize> = None;
+
+    for (idx, c) in text.chars().enumerate() {
+        if is_cjk_ideograph(c) {
+            ideographs += 1;
+            if first.is_none() {
+                first = Some(idx);
+            }
+        } else if c.is_alphabetic() {
+            latin += 1;
+        }
+    }
+
+    if ideographs < CJK_MIN_IDEOGRAPHS {
+        return None;
+    }
+    let script = ideographs + latin;
+    if ideographs * 100 < CJK_MIN_SHARE_PCT * script {
+        return None;
+    }
+
+    // Built character-wise, never by byte offset: `scripts/check-byte-slices.sh`
+    // (mika#764) refuses the three byte-slicing shapes it knows, and on an
+    // ideographic text they would panic on the first multi-byte character
+    // anyway. No `// safe-byte-slice:` derogation is needed here, and the plan
+    // forbids adding one: the site is written right instead of excepted.
+    let first = first.unwrap_or(0);
+    let excerpt: String = text.chars().skip(first).take(CJK_EXCERPT_CHARS).collect();
+
+    Some(CjkScriptMatch {
+        ideographs,
+        latin,
+        share_pct: ideographs * 100 / script,
+        excerpt,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // mika#2247 — Time-of-day greeting guard
 // ---------------------------------------------------------------------------
 
@@ -6475,6 +6606,78 @@ mod tests {
         assert!(
             detect_response_language_drift(text, None).is_none(),
             "no declaration, no ground truth, nothing to drift from"
+        );
+    }
+
+    // -- mika#1680 CJK-script response tests --
+
+    /// **AC2 of mika#1680, in one test, on measured text.**
+    ///
+    /// Three cases, and the third is the one that carries the regression value.
+    ///
+    /// 1. The Chinese response measured 2026-10-29 at 14:09:58Z in the
+    ///    `messages` table of `~/.mika/data/mika.db` (`agent_id='mika-dev'`,
+    ///    `role='assistant'`), answering `mika ask --agent mika-dev "groom
+    ///    mika#2959"`. Transcribed verbatim in the ticket body. The test asserts
+    ///    `share_pct >= CJK_MIN_SHARE_PCT` on top of the `Some`, because a `Some`
+    ///    alone does not say *which* bound carried the decision.
+    /// 2. The English control, from the same table and the same agent.
+    /// 3. An English sentence naming a CJK filename inside backticks. It is the
+    ///    only case that reddens if someone lowers the ideograph floor or drops
+    ///    the share bound, and it is the property the prompt line of
+    ///    `write_latin_script_line` promises in its last sentence.
+    ///
+    /// # Provenance of the English fixture (the plan requires this declaration)
+    ///
+    /// The plan offers two paths and asks which one was used. **Path 2 was
+    /// used.** Path 1 — reading the live table from the dispatch sandbox — was
+    /// tried first and refused: `sqlite3 ~/.mika/data/mika.db "SELECT content
+    /// FROM messages WHERE agent_id='mika-dev' AND role='assistant' AND content
+    /// NOT GLOB '*[一-鿿]*' ORDER BY created_at DESC LIMIT 1;"` exits 1 with
+    /// `Parse error: no such table: messages` — only `pilot-transcripts` is
+    /// mounted under `~/.mika/data/`, so the file resolved there is not the
+    /// agent database. Path 2 is therefore the English acknowledgement measured
+    /// 2026-06-30 at 14:48:48Z, transcribed verbatim by operator-CC into this
+    /// ticket's `UPDATE — Hard evidence captured (2026-06-30 14:53Z)` block. A
+    /// fixture whose provenance is not written down becomes, in six months, a
+    /// fixture that was invented.
+    #[test]
+    fn mika1680_le_detecteur_rougit_sur_la_reponse_chinoise_mesuree_et_pas_sur_langlaise() {
+        // Case 1 — the measured defect, 2026-10-29 14:09:58Z, verbatim.
+        let chinese = "已分派 mika#2959 的梳理任务。正在等待通过回调获取架构师评审结果（任务：3c94d788-6e36-4a7c-8fe1-59369c8c92c8）。";
+        let m = detect_cjk_script_response(chinese)
+            .expect("the response measured on 2026-10-29 at 14:09:58Z is the founding defect");
+        assert!(
+            m.ideographs >= CJK_MIN_IDEOGRAPHS,
+            "{} ideographs must clear the floor of {CJK_MIN_IDEOGRAPHS}",
+            m.ideographs
+        );
+        assert!(
+            m.share_pct >= CJK_MIN_SHARE_PCT,
+            "the measured response is majority-ideographic: {}% must clear {CJK_MIN_SHARE_PCT}%",
+            m.share_pct
+        );
+        assert!(
+            m.excerpt.starts_with('已'),
+            "the excerpt opens on the first ideograph, got {:?}",
+            m.excerpt
+        );
+
+        // Case 2 — the English control, same table, same agent (see provenance).
+        let english = "Engine confirmed: `issue_comment.created` webhook is not authorized \
+                       for dispatch (mika#933). mika#1665 grooming completed - plan located \
+                       in the `fix/1665/calibration-refusal-regression-max-tokens` branch, \
+                       `ready` label applied. Task `f76f594e` created and in `in_progress`.";
+        assert!(
+            detect_cjk_script_response(english).is_none(),
+            "a measured English acknowledgement must never be re-prompted"
+        );
+
+        // Case 3 — the legitimate citation, and the bound that makes it pass.
+        let citation = "the fixture lives in `任务.md`, see above";
+        assert!(
+            detect_cjk_script_response(citation).is_none(),
+            "naming a CJK string that is itself data is the contract the prompt line grants"
         );
     }
 
