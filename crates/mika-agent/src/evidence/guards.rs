@@ -9528,7 +9528,13 @@ PIPELINE: block (mika)
 ";
 
         /// L'exemple vert de Step 2E — section présente, garde à `exit 0`.
-        const STEP_2E_GREEN: &str = "\
+        ///
+        /// `pub(super)` depuis mika#2961 : c'est le contrôle positif T4 du
+        /// module voisin, et deux frères ne voient pas leurs items privés. La
+        /// partager plutôt que la recopier est ce qui garantit que les deux
+        /// membres de la population sont jugés sur le **même** verbatim du
+        /// prompt déployé.
+        pub(super) const STEP_2E_GREEN: &str = "\
 VERDICT: block[pipeline]
 
 PIPELINE: pass (mika)
@@ -9974,6 +9980,331 @@ fn ailleurs(body: &str) -> bool {
                 classify_call_sites("pub fn classify_pipeline_block_grounding(\n").is_empty(),
                 "la définition n'est pas un lecteur"
             );
+        }
+    }
+
+    /// mika#2961 — le second membre de la population : le `pass` dont le corps
+    /// ne porte aucune section `PIPELINE:`.
+    mod mika2961 {
+        use super::super::*;
+
+        /// Le membre `block[pipeline]` est hors sujet pour tout ce module :
+        /// chaque cas y arme le bit `pass` et laisse celui-ci à `false`. Nommé
+        /// plutôt qu'écrit `false`, pour la raison de `NOT_A_PASS` chez le
+        /// voisin — un booléen positionnel au bout d'un appel ne dit pas lequel
+        /// des quatre faits il porte.
+        const NOT_A_BLOCK: bool = false;
+        /// Le bit du membre de ce module.
+        const IS_A_PASS: bool = true;
+        /// Son contraire — pour les deux seuls cas de ce module qui sortent de
+        /// la population : le contraste du gate désarmé, et la moitié
+        /// `block[pipeline]` de l'assertion de polarité.
+        const NOT_A_PASS: bool = false;
+        /// Quatrième paramètre. Le membre `pass` ne lit **pas** le ledger
+        /// d'exécution (cf. la doc de
+        /// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`]) : son
+        /// appelant passe donc `true` en dur, et la valeur n'a aucun effet sur
+        /// cette branche. `mika2961_la_preuve_dexecution_nest_pas_lue_par_le_pass`
+        /// en fait une propriété assérée plutôt qu'une convention d'écriture.
+        const GUARD_RAN: bool = true;
+
+        // -- les trois corps mesurés du § 2 du plan --
+        //
+        // Têtes verbatim, tronquées au gabarit des fixtures `MEASURED_2685_*`
+        // du module voisin. La troncature ne peut pas fabriquer le refus : la
+        // ligne `PIPELINE:` est **absente de la totalité** des trois corps, et
+        // chaque doc ci-dessous porte le compte mesuré qui l'établit.
+
+        /// control-monitor#217, revue APPROVED du 2026-10-29T14:26:24Z — le cas
+        /// d'origine du ticket : abstention CI (`qa_ci_coherence_abstained`,
+        /// `reason "gh_failed"`), dépôt sans aucune garde, merge manuel.
+        ///
+        /// Mesuré sur le corps **entier** : 30 lignes, **0** ligne `PIPELINE:`
+        /// ancrée, `contains("PIPELINE:")` **faux**, `NEGATIVE-TEST:` absent.
+        /// Step 2D exigeait pourtant un `PIPELINE: not-applicable (…)` — c'est
+        /// la ligne de [`STEP_2D_NOT_APPLICABLE`] ci-dessous.
+        const MEASURED_CM217: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Idempotent POST /messages on client_ref with detached delivery, reconcile command, and 5 ACs all verified against source.
+
+DIFF ANALYSIS:
+Files reviewed: 11
+Key changes:
+- messages.rs: client_ref field (optional, serde default), delivered_under() replay detection
+
+BUILD VERIFICATION: skipped (control-monitor PR — build_mika does not apply; cm CI gates are the build verification)
+
+FINDINGS: none
+";
+
+        /// mika#2960, revue du 2026-10-29T13:57:06Z — la même classe sur ce
+        /// dépôt-ci, la veille du ticket, sur une PR qui *a* une garde
+        /// exécutable.
+        ///
+        /// Mesuré sur le corps entier : 41 lignes, **0** ligne ancrée,
+        /// `contains("PIPELINE:")` **faux**, `NEGATIVE-TEST:` absent. Son
+        /// `BUILD VERIFICATION:` dit `Build: pass` — donc une garde *a* tourné,
+        /// et le corps n'en porte pas la trace au format exigé.
+        const MEASURED_2960: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Vol 1/2 of mika#2958 — le geste de groom de la relève existe, derrière un interrupteur OFF par défaut, avec son exception nommée au scan, sa table de vérité et son contrôle négatif. Build pass, tous les AC structurels vérifiés.
+
+DIFF ANALYSIS:
+Files reviewed: 7
+Key changes:
+- Nouveau fichier `groom_trigger.rs` (598 lignes) : déclare `ENV_GROOM_WRITE`, `groom_write_is_armed()` (lecteur unique)
+
+BUILD VERIFICATION:
+Build: pass
+ACs tested: 0 (cargo test refused by shell tool budget policy — 30s limit exceeded)
+";
+
+        /// mika#2691, revue du 2026-10-14T14:00:51Z — **le corps que le ticket
+        /// comptait comme porteur**, et le plus utile des trois.
+        ///
+        /// Mesuré sur le corps entier : 39 lignes, **0** ligne ancrée, et
+        /// `contains("PIPELINE:")` **vrai** — le mot est dans la ligne `REASON:`
+        /// ci-dessous, parce que cette PR implémentait mika#2687 et *parle* de
+        /// la section. Les trois autres revues `pass` de #2691
+        /// (15:05:35Z, 15:20:47Z, 16:25:27Z) sont dans le même cas.
+        const MEASURED_2691: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Pipeline grounding gate correctly refuses block[pipeline] verdicts without a PIPELINE: section citing a failing guard; all 3 ACs verified.
+
+PR: wip(mika#2687): trailing content after pilot end_turn (mika#1383)
+Size: +1815 -0, 8 files
+State: OPEN
+
+DIFF ANALYSIS:
+Files reviewed: 8
+";
+
+        /// La sortie de Step 2D, verbatim de `system_prompt.md:275` — la ligne
+        /// exacte que control-monitor#217 devait porter, et le contrôle positif
+        /// qui fixe la **polarité inversée** du second terme de mika#2687 :
+        /// `not-applicable` est refusé sous `block[pipeline]`
+        /// ([`PipelineGroundingOutcome::RefusedNoFailingGuardCited`]) et
+        /// autorisé sous `pass`.
+        const STEP_2D_NOT_APPLICABLE: &str = "\
+VERDICT: pass
+
+PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/verify-pipeline.sh, scripts/plan-doc-check.sh)
+";
+
+        // -- T1, T2 : les deux corps que le ticket demande d'arrêter --
+
+        #[test]
+        fn mika2961_les_deux_corps_mesures_sont_arretes() {
+            for (label, body) in [
+                ("control-monitor#217 @ 2026-10-29T14:26:24Z", MEASURED_CM217),
+                ("mika#2960 @ 2026-10-29T13:57:06Z", MEASURED_2960),
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, body, GUARD_RAN),
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                    "{label} : un `pass` sans aucune ligne `PIPELINE:` — \
+                     c'est la classe mesurée, 261 sur 261"
+                );
+            }
+        }
+
+        // -- T3 : les deux faits sur le même corps --
+
+        #[test]
+        fn mika2961_le_corps_de_2691_contient_le_mot_et_na_pas_la_section() {
+            // Ce test porte à lui seul la doctrine du prédicat ancré, et il
+            // remplace le contrôle positif qu'AC2 demandait sans pouvoir
+            // l'obtenir : aucune revue `pass` de #2691 ne porte de ligne de
+            // section. Les deux assertions sont sur le MÊME corps, et c'est
+            // tout l'intérêt — séparées, chacune reste vraie après un passage
+            // du prédicat en `contains`.
+            assert!(
+                MEASURED_2691.contains(PIPELINE_SECTION_LINE_PREFIX),
+                "le corps contient bien la chaîne `PIPELINE:` — c'est ce que le \
+                 ticket a mesuré, et c'est pour ça qu'il comptait 4 verdicts \
+                 porteurs sur #2691"
+            );
+            assert!(
+                !pipeline_section_present(MEASURED_2691),
+                "et il n'ouvre aucune section : le mot est dans la prose de la \
+                 ligne `REASON:`. Un prédicat en `contains` compterait cette \
+                 prose comme la preuve pipeline de la revue — le fail-open même \
+                 que ce garde ferme"
+            );
+            assert_eq!(
+                classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, MEASURED_2691, GUARD_RAN),
+                PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                "donc le garde l'arrête, et le régime réel est 426 sur 426 et \
+                 non 422 sur 426"
+            );
+        }
+
+        // -- T4, T5 : les deux contrôles positifs, verbatim du prompt --
+
+        #[test]
+        fn mika2961_un_pass_qui_porte_la_section_passe() {
+            // T4 — `STEP_2E_GREEN` est la fixture déjà au dépôt, verbatim de
+            // l'exemple vert de Step 2E. Elle déclare `block[pipeline]` dans
+            // son texte, ce qui n'a aucun effet ici : la classification lit des
+            // booléens passés par son appelant, pas la ligne du corps.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    super::mika2687::STEP_2E_GREEN,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::Allowed,
+                "section présente : rien à refuser"
+            );
+        }
+
+        #[test]
+        fn mika2961_le_not_applicable_de_step_2d_passe_sous_pass() {
+            // T5 — et la polarité inversée, assérée sur le MÊME corps : ce
+            // verbatim est refusé sous `block[pipeline]` (une garde qu'on n'a
+            // pas trouvée n'est pas une garde qui a refusé) et autorisé sous
+            // `pass` (c'est exactement ce que Step 2D prescrit à un dépôt sans
+            // garde — le cas de control-monitor).
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    STEP_2D_NOT_APPLICABLE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::Allowed,
+                "sous `pass`, `not-applicable` est la sortie prescrite"
+            );
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    true,
+                    NOT_A_PASS,
+                    STEP_2D_NOT_APPLICABLE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited,
+                "sous `block[pipeline]`, le même corps est refusé — c'est la \
+                 polarité qui interdit de réutiliser le second terme de \
+                 mika#2687 pour le membre `pass`"
+            );
+        }
+
+        // -- le contraste qui dit que le bit décide, et lui seul --
+
+        #[test]
+        fn mika2961_hors_population_le_meme_corps_traverse() {
+            // Le contrôle négatif du gate : les trois corps mesurés sont des
+            // `pass`, mais tant que le bit n'est pas armé — gate désarmé, ou
+            // verdict d'une autre classe — ils traversent. C'est ce qui sépare
+            // « le garde mord sur sa population » de « le garde mord sur tout
+            // corps sans section ».
+            for (label, body) in [
+                ("control-monitor#217", MEASURED_CM217),
+                ("mika#2960", MEASURED_2960),
+                ("mika#2691", MEASURED_2691),
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(NOT_A_BLOCK, NOT_A_PASS, body, GUARD_RAN),
+                    PipelineGroundingOutcome::Allowed,
+                    "{label} hors population : rien à refuser"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2961_la_preuve_dexecution_nest_pas_lue_par_le_pass() {
+            // Propriété, pas convention : la branche `pass` rend le même
+            // verdict quelle que soit la preuve d'exécution, parce qu'elle ne
+            // la lit pas. C'est ce qui autorise l'appelant à passer `true` en
+            // dur et à ne PAS payer la lecture en base sur la population la
+            // plus fréquente de la flotte.
+            for observed in [true, false] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(
+                        NOT_A_BLOCK,
+                        IS_A_PASS,
+                        MEASURED_CM217,
+                        observed
+                    ),
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                    "refus sans section, quelle que soit la preuve d'exécution \
+                     ({observed})"
+                );
+                assert_eq!(
+                    classify_pipeline_block_grounding(
+                        NOT_A_BLOCK,
+                        IS_A_PASS,
+                        STEP_2D_NOT_APPLICABLE,
+                        observed
+                    ),
+                    PipelineGroundingOutcome::Allowed,
+                    "et passage avec section, de même ({observed})"
+                );
+            }
+        }
+
+        // -- V6 : la polarité de l'interrupteur --
+
+        #[test]
+        fn mika2961_linterrupteur_est_desarme_par_defaut() {
+            // La décision D5, en assertion : absente, vide, ou blancs seuls, la
+            // variable laisse le gate DÉSARMÉ. C'est l'inverse de son voisin
+            // mika#2687, et c'est pourquoi l'ouverture revient à l'opérateur.
+            for raw in [None, Some(""), Some("   ")] {
+                assert!(
+                    !pass_evidence_gate_is_armed(raw),
+                    "désarmé par défaut : {raw:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2961_le_vocabulaire_darmement_est_celui_de_ses_voisins() {
+            for raw in [
+                Some("1"),
+                Some("true"),
+                Some("on"),
+                Some("YES"),
+                Some(" On "),
+            ] {
+                assert!(pass_evidence_gate_is_armed(raw), "armé : {raw:?}");
+            }
+            for raw in [
+                Some("0"),
+                Some("false"),
+                Some("off"),
+                Some("NO"),
+                Some(" off "),
+            ] {
+                assert!(!pass_evidence_gate_is_armed(raw), "désarmé : {raw:?}");
+            }
+        }
+
+        #[test]
+        fn mika2961_une_valeur_non_reconnue_laisse_desarme() {
+            // Le côté sûr de l'arithmétique fail-open de mika#2455 : sur la
+            // population la plus fréquente de la flotte, une faute de frappe ne
+            // doit pas armer un garde dont le faux refus tue le tour sans
+            // aucune revue postée. Le WARN qui nomme la valeur entre guillemets
+            // est ce qui rend la faute lisible (mika#2220).
+            for raw in [Some("oui"), Some("2"), Some("enabled"), Some("ON!")] {
+                assert!(
+                    !pass_evidence_gate_is_armed(raw),
+                    "valeur non reconnue ⇒ défaut, donc désarmé : {raw:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2961_le_jeton_de_linterrupteur_est_un_format_de_fil() {
+            // Même raison que chez le voisin : un opérateur, un runbook et une
+            // sonde `grep` nomment cette chaîne. La renommer sans toucher les
+            // trois est un changement muet.
+            assert_eq!(PASS_EVIDENCE_GATE_ENV, "MIKA_QA_PASS_EVIDENCE_GATE");
         }
     }
 }
