@@ -63,6 +63,7 @@ use mika_agent::server::deadline_verdict::{
     DEADLINE_VERDICT_LINE, DeadlineVerdictInput, DeadlineVerdictOutcome, PostReviewRequest,
     TurnConclusion, deadline_verdict_target, maybe_post_deadline_verdict,
 };
+use mika_agent::skills::builtin_handlers::format_pr_dedup_key;
 use mika_agent::tools::{Tool, ToolContext, ToolOutput, ToolRegistry, default_tools};
 use mika_common::claude::ToolDefinition;
 use mika_common::llm::mock::*;
@@ -125,7 +126,20 @@ type CallLog = Arc<Mutex<Vec<Value>>>;
 struct Recording {
     name: &'static str,
     calls: CallLog,
+    /// Ce que l'outil écrit dans le registre de session quand il réussit.
+    ///
+    /// C'est le maillon qu'aucun test d'unité ne voit : en production,
+    /// `run_gh` sur un `pr review` qui réussit inscrit la clé de déduplication
+    /// dans `pr_reviews_posted`, et c'est cette écriture-là que le filet relit.
+    /// Un champ plutôt qu'un second `impl Tool` — la fixture reste une seule
+    /// forme, et ce que l'outil écrit se lit à son site de construction.
+    on_success: OnSuccess,
 }
+
+/// Le crochet d'écriture au registre, reçu tel que `ToolContext` le porte : le
+/// registre de la session, et l'identifiant de session **du tour** — jamais la
+/// constante du fichier, qui serait supposée plutôt que mesurée.
+type OnSuccess = Option<Box<dyn Fn(&DashMap<String, HashSet<String>>, &str) + Send + Sync>>;
 
 #[async_trait]
 impl Tool for Recording {
@@ -141,8 +155,11 @@ impl Tool for Recording {
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> anyhow::Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> anyhow::Result<ToolOutput> {
         self.calls.lock().unwrap().push(input);
+        if let (Some(hook), Some(registry)) = (self.on_success.as_ref(), ctx.pr_reviews_posted) {
+            hook(registry, ctx.session_id);
+        }
         Ok(ToolOutput::success("ok"))
     }
 }
@@ -150,16 +167,24 @@ impl Tool for Recording {
 /// Le registre du tour : `run_shell` (l'exploration qui brûle le budget) et
 /// `run_gh` (la revue, qui dans ce corpus ne vient jamais).
 fn qa_tools() -> (ToolRegistry, CallLog, CallLog) {
+    qa_tools_with(None)
+}
+
+/// Le même registre, avec un `run_gh` qui inscrit au registre de session ce
+/// qu'un `pr review` réussi y inscrirait.
+fn qa_tools_with(on_gh_success: OnSuccess) -> (ToolRegistry, CallLog, CallLog) {
     let shell_calls: CallLog = Arc::new(Mutex::new(Vec::new()));
     let gh_calls: CallLog = Arc::new(Mutex::new(Vec::new()));
     let mut tools = default_tools();
     tools.register(Box::new(Recording {
         name: "run_shell",
         calls: shell_calls.clone(),
+        on_success: None,
     }));
     tools.register(Box::new(Recording {
         name: "run_gh",
         calls: gh_calls.clone(),
+        on_success: on_gh_success,
     }));
     (tools, shell_calls, gh_calls)
 }
@@ -183,6 +208,34 @@ fn burned_budget_corpus(ceiling: usize) -> Vec<MockResponse> {
         .collect();
     responses.push(text_response(
         "J'ai lu le diff et le plan, la revue n'est pas encore rédigée.",
+    ));
+    responses.push(text_response("(sentinelle : ne doit jamais être rendue)"));
+    responses
+}
+
+/// La forme mesurée de `e6e7d8e0` (#2941, 27/10 15:38) : le tour **poste sa
+/// revue**, puis brûle le reste de son budget.
+///
+/// Même longueur que [`burned_budget_corpus`] à l'appel près — le premier pas
+/// est le `gh pr review`, les `ceiling - 1` suivants sont l'exploration. Le
+/// tour est donc coupé exactement de la même façon ; la seule différence est
+/// qu'une revue est déjà partie.
+fn reviewed_then_burned_budget_corpus(ceiling: usize) -> Vec<MockResponse> {
+    let mut responses = vec![tool_call_response(
+        "run_gh",
+        json!({
+            "command": ["pr", "review", PR.to_string(), "--comment", "--body", "VERDICT: pass"],
+            "repo": REPO,
+        }),
+    )];
+    responses.extend((0..ceiling - 1).map(|i| {
+        tool_call_response(
+            "run_shell",
+            json!({"command": format!("git show HEAD~{i}:docs/plans/plan.md")}),
+        )
+    }));
+    responses.push(text_response(
+        "La revue est postée ; j'ai continué à lire le plan jusqu'au plafond.",
     ));
     responses.push(text_response("(sentinelle : ne doit jamais être rendue)"));
     responses
@@ -442,5 +495,103 @@ async fn mika2943_un_tour_non_pr_coupe_ne_poste_rien() {
     assert_eq!(
         posts, 0,
         "aucun POST sur un événement qui ne nomme pas de PR — capturé = {captured:?}"
+    );
+}
+
+/// **AC2, premier contrôle** — une coupure qui suit une revue déjà postée
+/// n'ajoute rien sur la PR.
+///
+/// C'est la trace `e6e7d8e0` (#2941, 27/10 15:38), que le ticket compte hors de
+/// la population du défaut : le tour a été coupé, mais la PR a eu sa revue.
+/// Reposer un `hold[review]` par-dessus serait une régression **pire** que le
+/// silence qu'on répare — deux verdicts sur une PR réveillent `verdict_handler`
+/// deux fois sur une décision déjà prise.
+///
+/// Le maillon que les tests d'unité du filet ne voient pas est l'écriture au
+/// registre : eux la posent à la main, ici c'est la fixture `run_gh` qui
+/// l'exécute au moment où le tour poste sa revue, avec la clé que
+/// [`format_pr_dedup_key`] fabrique — jamais une clé recomposée, sans quoi le
+/// test deviendrait un troisième lecteur du format (mika#2158).
+#[tokio::test]
+async fn mika2943_une_coupure_apres_revue_postee_najoute_rien_sur_la_pr() {
+    let ceiling = max_tool_steps_for_agent("mika-qa", MAX_TOOL_STEPS);
+    let registry: Arc<DashMap<String, HashSet<String>>> = Arc::new(DashMap::new());
+
+    // Ce que le handler de production fait sur un `gh pr review` qui réussit.
+    let (tools, shell_calls, gh_calls) = qa_tools_with(Some(Box::new(|registry, session_id| {
+        registry
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(format_pr_dedup_key(Some(REPO), &PR.to_string()));
+    })));
+
+    let harness = EvalHarness::builder()
+        .responses(reviewed_then_burned_budget_corpus(ceiling))
+        .tools(tools)
+        .agent_id("mika-qa")
+        .session_id(SESSION_ID)
+        .pr_reviews_posted(registry.clone())
+        .build()
+        .await
+        .expect("harness build");
+
+    let trace = harness.run(READY_FOR_REVIEW_2920).await.expect("agent run");
+
+    // -- Précondition 1 : le tour a bien été coupé à son plafond. -------------
+    // `ceiling - 1` parce que le premier pas est la revue. La sentinelle du
+    // corpus n'a pas été consommée, sans quoi `MockLlmProvider` aurait paniqué.
+    let served = shell_calls.lock().unwrap().len();
+    assert_eq!(
+        served,
+        ceiling - 1,
+        "précondition : après la revue, le tour doit brûler le reste de son \
+         plafond ({} pas), or {served} appels servis",
+        ceiling - 1
+    );
+    assert_eq!(
+        gh_calls.lock().unwrap().len(),
+        1,
+        "précondition : la revue est postée une fois, au premier pas"
+    );
+
+    // -- Précondition 2 : le fait de coupure est bien posé. ------------------
+    // Aucun build n'est en vol dans ce corpus, donc l'abstention de R4 ne peut
+    // pas être la cause du silence mesuré plus bas.
+    assert!(
+        trace.output.max_steps_exceeded.is_some(),
+        "précondition : la boucle pose le fait de coupure — sinon le filet ne \
+         s'arme pas, et son silence ne dirait rien de la déduplication"
+    );
+
+    // -- Précondition 3 : le registre porte exactement une clé. --------------
+    // La revue du tour, et rien d'autre. Un registre vide rendrait l'assertion
+    // sans objet ; deux clés voudraient dire que la fixture écrit deux fois.
+    let keys_for_session = registry
+        .get(SESSION_ID)
+        .map(|entry| entry.len())
+        .unwrap_or(0);
+    assert_eq!(
+        keys_for_session, 1,
+        "précondition : la fixture a inscrit la revue du tour, une fois — \
+         registre = {registry:?}"
+    );
+
+    let NetDecision {
+        outcome,
+        posts,
+        captured,
+    } = what_the_pr_receives(&trace.output, READY_FOR_REVIEW_2920, &registry).await;
+
+    // Les deux termes comptent. `posts == 0` seul serait aussi vrai d'un filet
+    // jamais armé — c'est-à-dire du défaut que cette PR répare.
+    assert_eq!(
+        outcome,
+        Some(DeadlineVerdictOutcome::AlreadyReviewed),
+        "le filet s'arme bien sur la coupure, et décide de ne rien poster \
+         parce que la session a déjà revu cette PR"
+    );
+    assert_eq!(
+        posts, 0,
+        "aucun second verdict sur une PR déjà revue — capturé = {captured:?}"
     );
 }
