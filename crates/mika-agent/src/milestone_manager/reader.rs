@@ -2279,6 +2279,10 @@ mod gh_arg_capture_tests {
                 .find(|w| w[0] == "--json")
                 .map(|w| w[1].clone())
                 .unwrap_or_default();
+            let limite = owned
+                .windows(2)
+                .find(|w| w[0] == "--limit")
+                .and_then(|w| w[1].parse::<usize>().ok());
             match owned.first().map(String::as_str) {
                 Some("api") if path.contains("/timeline") => self
                     .timeline_json
@@ -2290,7 +2294,7 @@ mod gh_arg_capture_tests {
                     .ok_or_else(|| anyhow!("RecordingGhRunner: 404 au ref de la branche")),
                 Some("api") if path.contains("/milestones/") => Ok(self.milestone_json.clone()),
                 Some("issue") if has("--label") => Ok(self.ready_json.clone()),
-                Some("issue") if has("--milestone") => Ok(self.issues_json.clone()),
+                Some("issue") if has("--milestone") => servir_borne(&self.issues_json, limite),
                 Some("issue") if json_fields == "number,body,labels,state" => {
                     Ok(self.outside_json.clone())
                 }
@@ -2305,6 +2309,30 @@ mod gh_arg_capture_tests {
                 )),
             }
         }
+    }
+
+    /// Sert une énumération d'issues **tronquée à la borne que l'appel a
+    /// demandée**, comme `gh issue list --limit N` le fait (mika#2969).
+    ///
+    /// Sans cela le fixture rendrait les 117 tickets quelle que soit la borne,
+    /// et le test de bout en bout de l'AC2 serait vert avec le `--limit "100"`
+    /// littéral d'avant ce vol : le mock fournirait le résultat que le code est
+    /// censé produire. Avec cela, ramener la borne à 100 rougit
+    /// `mika2969_un_ticket_au_dela_du_centieme_est_une_sous_issue` — vérifié par
+    /// mutation avant de poser le vol.
+    ///
+    /// Posé sur l'arm `--milestone` seul, parce que c'est la lecture que ce vol
+    /// borne. Un test qui aurait besoin de la borne d'un autre arm l'y étendra
+    /// alors — pas d'avance.
+    fn servir_borne(json: &str, limite: Option<usize>) -> Result<String> {
+        let Some(limite) = limite else {
+            return Ok(json.to_string());
+        };
+        let items: Vec<Value> = serde_json::from_str(json)
+            .map_err(|e| anyhow!("RecordingGhRunner: énumération mal formée : {e}"))?;
+        let gardes: Vec<Value> = items.into_iter().take(limite).collect();
+        serde_json::to_string(&gardes)
+            .map_err(|e| anyhow!("RecordingGhRunner: ré-sérialisation impossible : {e}"))
     }
 
     fn build_recorder() -> (Arc<Mutex<Vec<Vec<String>>>>, RecordingGhRunner) {
@@ -3125,5 +3153,144 @@ mod gh_arg_capture_tests {
         let bodies = compose_candidate_bodies(r#"[{"number": 42}]"#, "[]")
             .expect("un body absent reste du JSON valide");
         assert_eq!(bodies.get(&42).map(String::as_str), Some(""));
+    }
+
+    // -- mika#2969 : un milestone de plus de cent tickets, de bout en bout ----
+
+    /// Une énumération de `n` tickets fermés, numéros **décroissants** depuis
+    /// `depart` — l'ordre que `gh issue list` rend, le plus récent d'abord.
+    ///
+    /// Décroissant parce que c'est ce qui donne son sens au test : sous une
+    /// borne, ce sont les **plus petits** numéros qui tombent, donc les plus
+    /// anciens tickets du milestone. Le défaut de mika#2969 s'est vu là — #1721
+    /// et #1727, ouverts, lus « hors milestone ».
+    fn tickets_decroissants(depart: u64, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let number = depart - i as u64;
+                format!(
+                    r#"{{"number": {number}, "title": "t{number}", "state": "CLOSED", "body": "", "labels": [], "updatedAt": "2026-10-01T00:00:00Z"}}"#
+                )
+            })
+            .collect()
+    }
+
+    /// **T2 (AC2)** — un ticket ouvert au-delà du centième est une sous-issue du
+    /// milestone, et non un candidat « hors milestone ».
+    ///
+    /// Le fixture sert 117 tickets et **tronque à la borne demandée**
+    /// (`servir_borne`), comme `gh issue list` le fait : c'est ce qui rend ce
+    /// test sensible. Avec le `--limit "100"` d'avant ce vol, #1727 — 117ᵉ de
+    /// l'énumération — tombe hors de `sub_issues`, et comme `outside_json` le
+    /// porte aussi, il entre dans `outside_candidates` avec le motif faux que le
+    /// ticket décrit. Vérifié par mutation avant de poser le vol : borne à 100,
+    /// ce test rougit sur les deux assertions.
+    ///
+    /// #1700 est là pour la contre-épreuve : la lecture hors milestone garde son
+    /// office, et un ticket réellement hors du milestone y reste. Sans lui, un
+    /// `outside_candidates` vide pour n'importe quelle raison ferait passer
+    /// l'assertion négative.
+    #[tokio::test]
+    async fn mika2969_un_ticket_au_dela_du_centieme_est_une_sous_issue_pas_un_candidat_du_dehors() {
+        let mut items = tickets_decroissants(2150, 116);
+        // Le 117ᵉ : ouvert, et le plus petit numéro du milestone.
+        items.push(
+            r#"{"number": 1727, "title": "p1", "state": "OPEN", "body": "", "labels": [], "updatedAt": "2026-10-20T00:00:00Z"}"#
+                .to_string(),
+        );
+        let (_calls, mut runner) = build_recorder();
+        runner.issues_json = format!("[{}]", items.join(","));
+        runner.milestone_json = r#"{"title": "Substrat de boucle", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null, "open_issues": 14, "closed_issues": 178}"#.into();
+        // La lecture hors milestone voit #1727 — c'est le cœur du défaut — et
+        // #1700, qui lui est réellement dehors.
+        runner.outside_json = r#"[{"number": 1727, "body": "", "labels": [], "state": "OPEN"}, {"number": 1700, "body": "", "labels": [], "state": "OPEN"}]"#.into();
+
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        assert_eq!(
+            state.sub_issues.len(),
+            117,
+            "les 117 tickets du milestone sont lus, pas 100"
+        );
+        assert!(
+            state.sub_issues.iter().any(|s| s.number == 1727),
+            "#1727, 117ᵉ de l'énumération, est une sous-issue du milestone"
+        );
+        assert!(
+            !state.outside_candidates.iter().any(|c| c.number == 1727),
+            "un ticket du milestone n'est pas un candidat « hors milestone » : {:?}",
+            state.outside_candidates
+        );
+        assert!(
+            state.outside_candidates.iter().any(|c| c.number == 1700),
+            "la lecture hors milestone garde son office : {:?}",
+            state.outside_candidates
+        );
+
+        let audit = state
+            .milestone_read_audit
+            .as_ref()
+            .expect("un cycle qui a lu le milestone porte son audit");
+        assert_eq!(audit.returned, 117);
+        assert_eq!(audit.limit, MILESTONE_READ_LIMIT);
+        assert_eq!(
+            audit.api_item_total, 192,
+            "14 ouverts + 178 fermés, PR comprises"
+        );
+        assert!(
+            !audit.truncated(),
+            "117 pour une borne de 1000 : la lecture est complète, et l'écart avec \
+             les 192 items de l'API vaut les PR du milestone (classe mika#2205)"
+        );
+    }
+
+    /// **T3 (AC2, contrôle négatif)** — un milestone sous la borne se lit comme
+    /// avant, et son rapport ne signale aucune troncature.
+    ///
+    /// Le rapport est produit par la chaîne de production — `Assessor::assess`
+    /// puis `Reporter::report`, comme la cadence le fait — et non par un
+    /// littéral : un fixture écrit à la main resterait vert le jour où le
+    /// rapporteur change de phrase.
+    #[tokio::test]
+    async fn mika2969_un_milestone_sous_la_borne_se_lit_comme_avant_et_ne_signale_rien() {
+        let (_calls, mut runner) = build_recorder();
+        runner.issues_json = format!("[{}]", tickets_decroissants(2150, 7).join(","));
+        runner.milestone_json = r#"{"title": "Petit", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null, "open_issues": 0, "closed_issues": 7}"#.into();
+
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        assert_eq!(state.sub_issues.len(), 7);
+        assert_eq!(state.progress.total, 7);
+        let audit = state
+            .milestone_read_audit
+            .as_ref()
+            .expect("un cycle qui a lu le milestone porte son audit");
+        assert_eq!(audit.returned, 7);
+        assert!(!audit.truncated());
+
+        let assessment = super::super::assessor::Assessor::new(Default::default()).assess(&state);
+        let rapport = super::super::reporter::Reporter::new().report(&state, &assessment);
+        assert!(
+            !rapport.contains("TRONQUÉE"),
+            "sept tickets sous une borne de mille ne tronquent rien :\n{rapport}"
+        );
+        assert!(
+            rapport.contains("- Lecture du milestone : 7 tickets lus, borne 1000 — complète"),
+            "le rapport dit le compte lu, la borne, et le mot « complète » :\n{rapport}"
+        );
     }
 }
