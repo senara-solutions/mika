@@ -4116,6 +4116,97 @@ restent dus au vol 5.
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
+### Le manager groome la relève d'avance (mika#2958, vol 1)
+
+- `MIKA_MANAGER_GROOM_WRITE` — le **troisième** interrupteur d'écriture du
+  `milestone_manager`, **OFF par défaut**, indépendant de
+  `MIKA_MANAGER_EVALUATE_WRITE` et de `MIKA_MANAGER_POOL_WRITE` ci-dessus. Armé
+  par `1` ou `true` (insensible à la casse, espaces tolérés) ; l'**absence est
+  l'état normal**, pas un cas d'erreur, et toute autre valeur laisse
+  l'interrupteur fermé. Lecteur unique :
+  `groom_trigger::groom_write_is_armed()` (doctrine mika#2201). Le prédicat est
+  celui de `pool_writer` — `trim` puis `eq_ignore_ascii_case` — délibérément, pour
+  que deux interrupteurs du même module ne puissent pas avoir deux tables de
+  vérité.
+
+  ```
+  MIKA_MANAGER_GROOM_WRITE=1
+  ```
+
+**Ce qu'il autorise, et rien de plus.** Un `message/send` A2A vers mika-dev
+portant l'instruction `groom mika#<n>` — la **porte moteur**, la même que
+`mika ask --agent mika-dev "groom mika#N"`. Ni spawn, ni dispatch
+d'implémentation, ni appel GitHub : le geste ne touche pas le dépôt, il demande à
+un agent de groomer.
+
+**Pourquoi c'est une exception nommée et pas un trou.** L'allowlist de
+`milestone_manager/no_dispatch_test.rs` porte désormais **exactement trois**
+entrées, une par ticket, épinglées au fichier et au jeton près —
+(`verdict_poster.rs`, `gh issue comment`), (`pool_writer.rs`, `gh issue edit`) et
+(`groom_trigger.rs`, `message/send`). Le scan n'a **pas** été assoupli : il a été
+**resserré** sur un jeton de plus, mesuré à zéro occurrence préexistante dans le
+module avant l'ajout. `groom_trigger.rs` reste interdit sur les vingt-deux autres
+jetons d'écriture, et son geste est déclaré **à plat**
+(`const GESTE: &str = "message/send"`) pour que ce qui s'exécute soit exactement
+ce que le garde voit. Chaque dérogation est **auto-nettoyante** (motif
+mika#2309) : le test rougit si le fichier disparaît ou si sa source hors
+commentaires cesse de porter le jeton.
+
+**Un groom par cycle, et le nombre n'est pas une prudence.** `GROOMS_PER_CYCLE`
+vaut `1` parce que le moteur ne tient qu'un créneau `dispatch_class = 'groom'`
+par agent (schéma v34) : un second envoi dans le même cycle serait refusé par le
+moteur, pas absorbé. Au-delà de la borne, les candidats restants sont **nommés**
+`budget_spent` plutôt que tus. Si mika-dev tient déjà son créneau, le refus A2A
+préexistant (`a2a_wait_queue`, mika#2163) est **transcrit** en `agent_busy` et le
+cycle s'arrête là — pas de retente, le cycle suivant reprendra la relève telle
+qu'elle sera alors. La classe d'échec est dérivée du **statut HTTP**, jamais d'un
+sous-texte de message (mika#2179), et son vocabulaire est gelé par un test de
+format de fil (mika#1990 D8) parce que l'opérateur `GROUP BY` dessus.
+
+**Seuil d'ouverture — un geste opérateur, jamais une bascule automatique.** Il
+faut que `MIKA_MANAGER_EVALUATE_WRITE` **et** `MIKA_MANAGER_POOL_WRITE` soient
+déjà ouverts, et stables sur un cycle complet. Les deux sont OFF aujourd'hui, et
+**mika#2958 n'en ouvre aucun**. Le rollback est le retrait de la variable, sans
+redéploiement.
+
+**Surfaces opérateur** (journal `$MIKA_SPIRIT_LOG_FILE`) :
+
+```
+# 1. Quels grooms ont été déclenchés, et par quel geste ?
+grep manager_groom_triggered "$MIKA_SPIRIT_LOG_FILE"
+
+# 2. Pourquoi aucun groom n'a été déclenché. `reason` prend trois valeurs :
+#      disarmed    — l'interrupteur est fermé : le régime par défaut
+#      no_sender   — aucun émetteur A2A câblé (le régime du vol 1, voir plus bas)
+#      no_relief   — la relève est vide : rien à groomer, le régime NOMINAL
+grep manager_groom_not_triggered "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Les sauts, par ticket, avec leur motif :
+#      already_groomed  — le ticket porte déjà son plan groomé
+#      groom_in_flight  — un groom est déjà en vol sur ce ticket
+#      budget_spent     — la borne d'un groom par cycle est consommée
+grep manager_groom_skipped "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. Un envoi refusé. `class` prend deux valeurs, dérivées du statut HTTP :
+#      agent_busy   — mika-dev tient déjà son créneau ; le cycle s'arrête
+#      send_failed  — credential refusé, injoignable, ou autre
+grep manager_groom_failed "$MIKA_SPIRIT_LOG_FILE"
+```
+
+La sonde 2 est son **propre contrôle positif** : elle est émise sur *toutes* les
+branches de refus, y compris celle à relève vide, donc « le geste tourne et n'a
+rien à faire » et « le geste n'est pas câblé » ne rendent pas les mêmes octets
+(classe mika#2205). Son **absence** du journal signifie un binaire antérieur à ce
+vol (classe mika#2340), jamais une relève calme — et l'instrument n'est vivant
+qu'après `make deploy`.
+
+**Ce que ce vol n'achète PAS.** Il n'ouvre pas l'interrupteur. Et il ne branche
+**aucun rail** : au vol 1 le site d'appel passe un émetteur absent, donc un
+interrupteur armé rend `reason: no_sender` et rien d'autre — c'est le régime
+nominal du vol, pas un défaut. Le rail A2A, le câblage de cycle, la lecture d'un
+« groom en cours » depuis les tâches moteur et le rendu ON du rapport (AC4,
+moitié ON) sont le **vol 2** de mika#2958 et restent dus.
+
 ### Un `ESCALATE` de groom est terminal, et son producteur l'estampille (mika#2545)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette

@@ -253,20 +253,31 @@
 //!   deuxième écriture du triplet `(priorité, provenance, numéro)` ferait se
 //!   contredire deux listes du même rapport sans qu'aucune assertion de
 //!   comportement rougisse (doctrine du lecteur unique, mika#2201).
-//! - **Le vol 1 n'ouvre aucun chemin d'écriture, et n'en désarme aucun.**
-//!   `MIKA_MANAGER_GROOM_WRITE` n'y est **pas déclarée** — un interrupteur dont
-//!   la branche ON ne fait rien est un mensonge de surface, même raison qu'au
-//!   vol 1 de mika#2698. Le geste de groom est le **vol 2** : derrière cet
-//!   interrupteur, OFF par défaut, par la voie moteur existante (le groom passe
-//!   par mika-dev, jamais par un spawn), et il arrivera comme **exception
-//!   nommée** au scan de `no_dispatch_test.rs`, amendée dans le même commit que
-//!   ce paragraphe — jamais comme un assouplissement du scan. Les deux moitiés
-//!   de `mika2700_le_vol_1_nouvre_aucun_chemin_decriture` sont ce qui rougit ce
-//!   jour-là. Suivi sur `senara-solutions/mika#2700`.
+//! - **Le geste de groom est arrivé, et il est fermé par défaut.** Depuis
+//!   mika#2958, [`groom_trigger`] déclare `MIKA_MANAGER_GROOM_WRITE` — OFF par
+//!   défaut, lecteur unique — et porte la troisième et dernière **exception
+//!   nommée** du scan de `no_dispatch_test.rs`, pour le seul jeton
+//!   `message/send` : le scan n'a pas été assoupli, il a été resserré sur un
+//!   jeton de plus. La moitié 2 de
+//!   `mika2700_le_vol_1_nouvre_aucun_chemin_decriture` est ce qui a rougi ce
+//!   jour-là ; elle est devenue
+//!   `tests::mika2958_le_vol_2_declare_son_interrupteur_avec_sa_table_de_verite`,
+//!   qui affirme l'inverse — l'interrupteur est déclaré, et par un seul fichier.
+//!   La moitié 1 est intacte : aucune exception du scan n'est attribuable au
+//!   vol 1.
+//! - **Ce qui reste dû, et ce qui ne le sera jamais par le code.** Le rail A2A
+//!   de l'émetteur, le câblage de cycle, la lecture « un groom est en cours » et
+//!   le rendu ON du rapport sont le vol 2 de mika#2958, suivis par son ticket de
+//!   suite ; au vol 1, `sender` est `None` au site d'appel et c'est le cas
+//!   nominal. **L'ouverture de l'interrupteur, elle, reste un geste
+//!   d'opérateur** — au seuil écrit par mika#2700 : les interrupteurs de
+//!   l'évaluation des vols et du bassin `ready` ouverts, et stables sur un cycle
+//!   complet. Les deux sont OFF aujourd'hui, et mika#2958 n'en ouvre aucun.
 
 pub mod assessor;
 pub mod cadence;
 pub mod evaluator;
+pub mod groom_trigger;
 pub mod liveness;
 pub mod plan_size;
 pub mod pool;
@@ -295,6 +306,10 @@ pub use cadence::{
 pub use evaluator::{
     DeathCause, FinishedFlight, FlightIssue, FlightRecommendation, FlightSource, FlightVerdict,
     PrStateKnowledge, evaluate_flight, evaluate_flights, milestone_issue_urls,
+};
+pub use groom_trigger::{
+    ENV_GROOM_WRITE, GROOMS_PER_CYCLE, GroomCandidate, GroomSendError, GroomSender,
+    GroomTriggerOutcome, groom_write_is_armed, trigger_relief_grooms,
 };
 pub use liveness::{
     ENV_LIVENESS_URL, HttpLivenessSink, LIVENESS_ENTITY, LIVENESS_TIMEOUT, LivenessBody,
@@ -347,12 +362,32 @@ mod tests {
     /// suffit à séparer production et tests (prémisse mika#2321).
     ///
     /// Les commentaires tombent parce que la prose *parle* de l'interrupteur du
-    /// vol 2 — le paragraphe de docstring juste au-dessus le nomme — et qu'une
-    /// mention n'est pas une déclaration. Même forme que
+    /// geste de groom — le paragraphe de docstring juste au-dessus le nomme — et
+    /// qu'une mention n'est pas une déclaration. Même forme que
     /// `mika2425_identity_context_history_has_a_single_reader` (motif mika#2050
     /// signal S).
+    ///
+    /// Les **modules de test extraits** sont écartés, et pour une raison
+    /// mesurée : depuis mika#2958 la raison de l'exception nommée de
+    /// `no_dispatch_test.rs` cite l'interrupteur dans une *chaîne de caractères*,
+    /// que la troncature au premier `#[cfg(test)]` ne retire pas (ce fichier n'en
+    /// porte aucun : il est déclaré `#[cfg(test)] mod …;` par celui-ci) et que le
+    /// retrait des commentaires ne voit pas. Sans ce filtre, le garde structurel
+    /// compterait comme un second déclarant de l'interrupteur, et « un seul
+    /// déclarant » deviendrait infalsifiable. Le lecteur de cette classification
+    /// est unique et vit chez l'autre garde : la **déclaration** dans ce
+    /// fichier — et non le chemin — est ce qui fait d'une source du code de test
+    /// (doctrine de `source_scan` : un garde qui scanne un module de test comme
+    /// de la production ne protège rien, il rougit sur du code sain).
     fn production_sans_commentaires() -> Vec<(String, String)> {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/milestone_manager");
+        let extraits = super::no_repo_list_test::modules_de_test_extraits(
+            &fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/milestone_manager/mod.rs"
+            ))
+            .expect("mod.rs doit être lisible"),
+        );
         let mut out: Vec<(String, String)> = Vec::new();
         for entry in fs::read_dir(dir).expect("le répertoire du module doit être lisible") {
             let path = entry.expect("entrée de répertoire lisible").path();
@@ -364,6 +399,9 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
+            if extraits.contains(&nom) {
+                continue;
+            }
             let src = fs::read_to_string(&path).expect("source du module lisible");
             let production = src.split("#[cfg(test)]").next().unwrap_or_default();
             let code = production
@@ -380,29 +418,32 @@ mod tests {
     /// plus forte.
     ///
     /// L'AC1 demande « avec l'interrupteur OFF, aucun déclenchement de groom ».
-    /// Le vol 1 satisfait la forme **dégénérée** de cette garantie : il n'y a
-    /// pas d'interrupteur, donc pas de branche ON, donc aucun déclenchement
-    /// n'est possible. Deux moitiés le tiennent structurellement.
+    /// Le vol 1 satisfaisait la forme **dégénérée** de cette garantie : il n'y
+    /// avait pas d'interrupteur, donc pas de branche ON, donc aucun
+    /// déclenchement possible. De ses deux moitiés, il reste celle-ci.
     ///
     /// **Moitié 1 — aucune exception du scan n'est attribuable à ce ticket.**
-    /// `no_dispatch_test.rs` couvre tout le répertoire et reste **intouché** par
-    /// ce vol : `relief.rs` et `reporter.rs` y sont donc soumis comme les
-    /// autres. La lecture est textuelle et non programmatique parce que
+    /// `no_dispatch_test.rs` couvre tout le répertoire, et l'exception que
+    /// mika#2958 y a inscrite ne nomme ni `relief.rs` ni `reporter.rs` : les
+    /// deux sorties du vol 1 y restent soumises comme les autres sources. La
+    /// lecture est textuelle et non programmatique parce que
     /// `EXEMPTED_OCCURRENCES` est privée à un module *frère* : la lire
     /// demanderait de la passer `pub(super)`, c'est-à-dire de toucher le
     /// fichier dont ce test affirme qu'il n'a pas bougé.
     ///
     /// L'assertion n'est pas « l'allowlist est vide » — elle ne l'est pas, et
-    /// n'avait pas à l'être : elle porte depuis mika#2698 vol 2 exactement une
-    /// entrée, épinglée à une par
-    /// `mika2698_lallowlist_ne_porte_que_le_geste_du_vol_2`. L'assertion est
-    /// « aucune exception attribuable à mika#2700 », ce qui est la même
-    /// propriété pour ce vol-ci, et ce qui rougit au vol 2.
+    /// n'avait pas à l'être : elle porte depuis mika#2958 exactement trois
+    /// entrées, une par vol de la Phase 2, épinglées à trois par
+    /// `mika2958_lallowlist_porte_les_trois_gestes_et_pas_un_de_plus`.
+    /// L'assertion est « aucune exception attribuable à mika#2700 » — et elle
+    /// tient encore, parce que l'exception du geste de groom nomme
+    /// `groom_trigger.rs` et `message/send`, ni `relief.rs` ni `reporter.rs`.
     ///
-    /// **Moitié 2 — l'interrupteur du vol 2 n'est pas déclaré.** Un
-    /// `pub const ENV_*` sans lecteur serait une promesse d'armement non tenue,
-    /// et il déclencherait `mika2267_every_manager_env_const_is_declared_in_env_example`
-    /// sans qu'aucun comportement ne le justifie.
+    /// **Moitié 2 — partie.** Elle affirmait que l'interrupteur du geste de
+    /// groom n'était **pas** déclaré ; mika#2958 le déclare, donc elle est
+    /// devenue son inverse,
+    /// [`mika2958_le_vol_2_declare_son_interrupteur_avec_sa_table_de_verite`],
+    /// dans le même commit que le paragraphe de docstring qui l'engageait.
     #[test]
     fn mika2700_le_vol_1_nouvre_aucun_chemin_decriture() {
         let garde = fs::read_to_string(concat!(
@@ -414,12 +455,31 @@ mod tests {
             assert!(
                 !garde.contains(jeton),
                 "aucune exception du scan n'est attribuable à mika#2700, et `{jeton}` en nomme \
-                 une. Si c'est le vol 2 qui arrive, l'exception s'inscrit AVEC son fichier, son \
-                 jeton et sa raison, et ce test change dans le même commit que le paragraphe du \
-                 docstring — jamais l'un sans l'autre."
+                 une. L'exception du geste de groom nomme `groom_trigger.rs` et son unique \
+                 jeton : le lecteur et le rapporteur du vol 1 restent soumis au scan comme les \
+                 autres, et une exception qui les nommerait serait un assouplissement, pas un \
+                 resserrement."
             );
         }
+    }
 
+    /// Cas 16 bis — **l'interrupteur du geste de groom est déclaré, et par un
+    /// seul fichier** (mika#2958).
+    ///
+    /// C'est l'inverse exact de la moitié 2 de
+    /// [`mika2700_le_vol_1_nouvre_aucun_chemin_decriture`], et le renversement
+    /// est le point : jusqu'à ce vol, un `pub const ENV_*` sans lecteur aurait
+    /// été une promesse d'armement non tenue. Il a maintenant son lecteur
+    /// unique, sa table de vérité et son contrôle négatif — tous trois chez
+    /// [`groom_trigger`].
+    ///
+    /// Le **seul** déclarant est ce qui compte : un second site qui lirait
+    /// `MIKA_MANAGER_GROOM_WRITE` un peu autrement serait un second
+    /// interrupteur, et l'opérateur qui en ouvre un verrait l'autre fermé sans
+    /// qu'aucune assertion de comportement rougisse (doctrine mika#2201, même
+    /// forme que pour `MIKA_MANAGER_POOL_WRITE`).
+    #[test]
+    fn mika2958_le_vol_2_declare_son_interrupteur_avec_sa_table_de_verite() {
         let sources = production_sans_commentaires();
         // Contrôle positif du lecteur : un scan qui ne trouve jamais rien et un
         // module propre rendent les mêmes octets (classe mika#2205).
@@ -427,7 +487,7 @@ mod tests {
             sources
                 .iter()
                 .any(|(nom, code)| nom == "relief.rs" && code.contains("pub fn name_relief")),
-            "le lecteur doit voir la production de relief.rs — sinon « aucun déclarant » ne \
+            "le lecteur doit voir la production de relief.rs — sinon « un seul déclarant » ne \
              prouve rien. Lus : {:?}",
             sources.iter().map(|(n, _)| n).collect::<Vec<_>>()
         );
@@ -435,17 +495,33 @@ mod tests {
         // Le besoin est épelé en deux morceaux pour que ce test ne se trouve pas
         // lui-même si la troncature venait à ne plus l'exclure.
         let interrupteur = concat!("MIKA_MANAGER_", "GROOM_WRITE");
-        let declarants: Vec<String> = sources
-            .into_iter()
+        let declarants: Vec<&str> = sources
+            .iter()
             .filter(|(_, code)| code.contains(interrupteur))
-            .map(|(nom, _)| nom)
+            .map(|(nom, _)| nom.as_str())
             .collect();
-        assert!(
-            declarants.is_empty(),
-            "le vol 1 ne déclare pas l'interrupteur du vol 2 — un interrupteur dont la branche \
-             ON ne fait rien est un mensonge de surface. Déclaré dans : {declarants:?}. Si c'est \
-             le vol 2 qui arrive, il arrive avec son `write_is_armed()`, sa table de vérité et \
-             son contrôle négatif, et ce test change dans le même commit."
+        assert_eq!(
+            declarants,
+            vec!["groom_trigger.rs"],
+            "l'interrupteur du geste de groom se déclare dans `groom_trigger.rs`, et nulle part \
+             ailleurs. Un second déclarant est un second interrupteur."
         );
+
+        let (_, geste) = sources
+            .iter()
+            .find(|(nom, _)| nom == "groom_trigger.rs")
+            .expect("le fichier du geste doit être dans la production lue");
+        for besoin in [
+            "pub fn groom_write_is_armed",
+            "fn armed_from_value",
+            "pub const GROOMS_PER_CYCLE",
+        ] {
+            assert!(
+                geste.contains(besoin),
+                "`{besoin}` manque au fichier du geste : la déclaration de l'interrupteur ne vaut \
+                 que par son lecteur unique, sa table de vérité testable sans `unsafe` et la \
+                 borne que le moteur fixe."
+            );
+        }
     }
 }
