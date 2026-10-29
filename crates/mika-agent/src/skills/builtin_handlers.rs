@@ -5477,7 +5477,12 @@ fn make_pr_dedup_key(args: &[String], repo: Option<&str>) -> String {
 /// places, which is the mika#2158 shape: two readers of one format drift, and
 /// here the drift is silent in both directions — a missed match posts a
 /// duplicate review, a false match leaves the PR silent.
-pub(crate) fn format_pr_dedup_key(repo: Option<&str>, pr_identifier: &str) -> String {
+///
+/// `pub` depuis mika#2943 vol 2 : le test de bout en bout de la déduplication
+/// (`tests/eval/test_max_steps_verdict_2943.rs`) doit *écrire* dans le registre
+/// la clé que le handler écrirait, et une clé recomposée dans le test en ferait
+/// un troisième lecteur du format — le reproche exact de la ligne ci-dessus.
+pub fn format_pr_dedup_key(repo: Option<&str>, pr_identifier: &str) -> String {
     format!("{}|{}", repo.unwrap_or("__default__"), pr_identifier)
 }
 

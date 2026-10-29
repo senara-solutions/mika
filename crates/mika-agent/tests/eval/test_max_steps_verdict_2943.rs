@@ -180,6 +180,75 @@ fn burned_budget_corpus(ceiling: usize) -> Vec<MockResponse> {
 }
 
 // ---------------------------------------------------------------------------
+// La chaîne de production, en un terme
+// ---------------------------------------------------------------------------
+
+/// Ce que la chaîne a décidé, et ce qu'elle a émis.
+struct NetDecision {
+    /// `None` = `deadline_verdict_target` n'a pas armé le filet.
+    outcome: Option<DeadlineVerdictOutcome>,
+    /// Le nombre de POST que le poster injecté a vus passer.
+    posts: usize,
+    /// La dernière requête capturée, telle que la PR l'aurait reçue.
+    captured: Option<PostReviewRequest>,
+}
+
+/// Ce que le call-site webhook exécute, et ce que la PR en reçoit.
+///
+/// La chaîne entière de production — `conclusion_of` → `deadline_verdict_target`
+/// → `maybe_post_deadline_verdict` — plus le poster qui capture. Un terme
+/// partagé plutôt qu'une copie par test : quatre copies de la chaîne
+/// divergeraient, et un test qui n'appellerait plus `conclusion_of` cesserait
+/// de traverser le joint où le défaut vivait sans que rien ne le dise
+/// (classe mika#2158).
+///
+/// Pas d'`expect()` sur l'`Option` que `deadline_verdict_target` rend : le refus
+/// du call-site est ce que deux des quatre tests de ce fichier **attendent** (le
+/// tour non-PR, le build en vol), et un dépliage y paniquerait sur le chemin
+/// nominal. Le `None` remonte dans [`NetDecision::outcome`].
+async fn what_the_pr_receives(
+    output: &AgentOutput,
+    event_text: &str,
+    registry: &DashMap<String, HashSet<String>>,
+) -> NetDecision {
+    let captured = Arc::new(Mutex::new(None::<PostReviewRequest>));
+    let posts = Arc::new(AtomicUsize::new(0));
+
+    let outcome = match deadline_verdict_target(conclusion_of(output), event_text) {
+        // Le refus du call-site : c'est par ici que le défaut sortait.
+        None => None,
+        Some((reason, target)) => {
+            let sink = captured.clone();
+            let counter = posts.clone();
+            Some(
+                maybe_post_deadline_verdict(
+                    DeadlineVerdictInput {
+                        reason,
+                        target,
+                        session_id: SESSION_ID,
+                        trace_id: TRACE_ID,
+                        agent_id: "mika-qa",
+                        pr_reviews_posted: Some(registry),
+                    },
+                    move |req| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        *sink.lock().unwrap() = Some(req);
+                        async { Ok("submitted".to_string()) }
+                    },
+                )
+                .await,
+            )
+        }
+    };
+
+    NetDecision {
+        outcome,
+        posts: posts.load(Ordering::SeqCst),
+        captured: captured.lock().unwrap().take(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Le détecteur
 // ---------------------------------------------------------------------------
 
@@ -247,38 +316,11 @@ async fn mika2943_un_tour_webhook_coupe_par_ses_pas_ne_laisse_jamais_la_pr_muett
     );
 
     // -- Ce que la PR reçoit réellement, par le chemin de production. --------
-    let captured = Arc::new(Mutex::new(None::<PostReviewRequest>));
-    let posts = Arc::new(AtomicUsize::new(0));
-
-    let outcome = match deadline_verdict_target(conclusion_of(&trace.output), READY_FOR_REVIEW_2920)
-    {
-        // Le refus du call-site : c'est par ici que le défaut sortait. Pas de
-        // `expect()` — un `panic` ne serait pas le rouge que ce détecteur doit
-        // rendre, et masquerait la conjonction derrière un message d'option.
-        None => None,
-        Some((reason, target)) => {
-            let sink = captured.clone();
-            let counter = posts.clone();
-            Some(
-                maybe_post_deadline_verdict(
-                    DeadlineVerdictInput {
-                        reason,
-                        target,
-                        session_id: SESSION_ID,
-                        trace_id: TRACE_ID,
-                        agent_id: "mika-qa",
-                        pr_reviews_posted: Some(&registry),
-                    },
-                    move |req| {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        *sink.lock().unwrap() = Some(req);
-                        async { Ok("submitted".to_string()) }
-                    },
-                )
-                .await,
-            )
-        }
-    };
+    let NetDecision {
+        outcome,
+        posts,
+        captured,
+    } = what_the_pr_receives(&trace.output, READY_FOR_REVIEW_2920, &registry).await;
 
     // -- La négation. --------------------------------------------------------
     // « Rien n'atteint la PR » couvre les trois formes du silence : aucun motif,
@@ -286,7 +328,7 @@ async fn mika2943_un_tour_webhook_coupe_par_ses_pas_ne_laisse_jamais_la_pr_muett
     // PR laisse #2920 tout aussi muette que zéro POST, et serait une régression
     // pire — c'est pourquoi le terme porte sur le contenu capturé, pas sur le
     // compteur seul.
-    let reached_the_pr = captured.lock().unwrap().as_ref().is_some_and(|req| {
+    let reached_the_pr = captured.as_ref().is_some_and(|req| {
         req.repo == REPO
             && req.pr_number == PR
             && req.body.starts_with(DEADLINE_VERDICT_LINE)
@@ -297,11 +339,10 @@ async fn mika2943_un_tour_webhook_coupe_par_ses_pas_ne_laisse_jamais_la_pr_muett
         reached_the_pr,
         "ÉTAT INTERDIT (mika#2943) : un tour webhook de mika-qa coupé à \
          {ceiling} pas sur {REPO}#{PR}, sans revue postée dans la session, et \
-         la PR n'a rien reçu. motif = {outcome:?}, POST = {}, capturé = {:?}. \
+         la PR n'a rien reçu. motif = {outcome:?}, POST = {posts}, capturé = {:?}. \
          C'est la trace b22e6ea0 du 2026-10-28, et les cinq tours de la mesure \
          qui la précèdent.",
-        posts.load(Ordering::SeqCst),
-        captured.lock().unwrap().as_ref().map(|r| (
+        captured.as_ref().map(|r| (
             r.repo.clone(),
             r.pr_number,
             r.body.lines().next().unwrap_or("").to_string()
@@ -313,8 +354,7 @@ async fn mika2943_un_tour_webhook_coupe_par_ses_pas_ne_laisse_jamais_la_pr_muett
     // décision qui n'est pas la sienne.
     assert_eq!(outcome, Some(DeadlineVerdictOutcome::Posted));
     assert_eq!(
-        posts.load(Ordering::SeqCst),
-        1,
+        posts, 1,
         "exactement un POST — ni zéro (le défaut), ni deux (la régression)"
     );
 }
