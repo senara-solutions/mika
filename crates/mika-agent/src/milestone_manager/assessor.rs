@@ -1097,4 +1097,68 @@ mod tests {
              c'est sonder un ticket et en recommander un autre"
         );
     }
+
+    /// AC3 de mika#2956 — le « Next » ne lit pas `missing_grooming_signals`.
+    ///
+    /// Ce test est le garde-fou de la prose du § 4 du plan : AC3 est fermée
+    /// **par non-modification**, et une fermeture par non-modification n'est
+    /// tenue par rien tant qu'aucun test ne rougit le jour où quelqu'un câble
+    /// le nouveau champ ici.
+    ///
+    /// Il vit dans ce module plutôt que dans `pool.rs`, où le plan le rangeait
+    /// (§ 5.4, ligne 5), pour la raison même qui le rend utile : `tier2_pick`
+    /// est privée à ce module, et un garde-fou doit vivre là où le câblage
+    /// qu'il refuse apparaîtrait. Les deux paliers sont donc lus à leur propre
+    /// site de décision, et non par une reconstruction de leur filtre — qui
+    /// resterait verte si le filtre réel changeait.
+    ///
+    /// Les deux candidats portent une mesure **contraire** à leur
+    /// `plan_present` : c'est ce qui sépare « le palier ignore le champ » de
+    /// « le champ se trouvait d'accord avec le booléen ».
+    #[test]
+    fn mika2956_le_next_ne_lit_pas_le_nouveau_champ() {
+        use crate::auto_pull::GroomingSignal;
+
+        let mut non_groome = base_issue(3101);
+        non_groome.plan_present = true;
+        non_groome.missing_grooming_signals = Some(vec![
+            GroomingSignal::BranchCallout,
+            GroomingSignal::GroomedVerdict,
+        ]);
+
+        let palier2 = base_state(vec![non_groome]);
+        assert_eq!(
+            tier2_pick(&palier2).map(|s| s.number),
+            Some(3101),
+            "le palier 2 lit `plan_present` — « il y a de quoi lire » — et le \
+             bassin répond à l'autre question, « il y a de quoi dispatcher »"
+        );
+        assert_eq!(
+            pick_next_action(&palier2, &[]).next_sub_issue,
+            Some(3101),
+            "donc le palier 3 n'est pas atteint et le « Next » de ce cycle ne \
+             bouge pas d'un pouce"
+        );
+
+        // Le miroir : mesuré groomé, mais sans callout pour le lecteur lâche.
+        // Aucun corps réel ne produit cet état ; il est ici pour que le palier 3
+        // soit lu sur sa seule entrée, `!plan_present`.
+        let mut groome_sans_callout = base_issue(3102);
+        groome_sans_callout.plan_present = false;
+        groome_sans_callout.missing_grooming_signals = Some(vec![]);
+
+        let palier3 = base_state(vec![groome_sans_callout]);
+        assert_eq!(
+            tier2_pick(&palier3).map(|s| s.number),
+            None,
+            "le palier 2 ne récupère pas un ticket sur la seule foi de la mesure"
+        );
+        let rec = pick_next_action(&palier3, &[]);
+        assert_eq!(rec.next_sub_issue, Some(3102));
+        assert!(
+            rec.rationale.contains("grooming is the next step"),
+            "c'est bien le palier 3 qui a décidé : {}",
+            rec.rationale
+        );
+    }
 }

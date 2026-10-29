@@ -2711,11 +2711,21 @@ mod gh_arg_capture_tests {
 
     // -- mika#2699 vol 3 : la sixième lecture, le plan au ref de sa branche --
 
-    /// Un corps d'issue groomée : les deux callouts que la sixième lecture
-    /// épelle, et rien d'autre. `\n` littéraux — c'est du JSON.
+    /// Un corps d'issue groomée : les **trois** signaux du prédicat du dispatch,
+    /// et rien d'autre. `\n` littéraux — c'est du JSON.
+    ///
+    /// Le marqueur `Grooming history` a été ajouté par mika#2956, et il n'est
+    /// pas décoratif : depuis ce vol l'admission exige les trois signaux, donc
+    /// un corps qui n'en porte que deux n'est plus candidat du tout et
+    /// `numbers_needing_size` ne le désigne pas — la sixième lecture ne partait
+    /// plus, et ces deux cas mesuraient une population vide. La fixture mérite
+    /// désormais son nom : avant, « groomée » y voulait dire « ce que la
+    /// sixième lecture épelle », pas « ce que le dispatch accepte ».
     const CORPS_GROOME: &str = "> - **Branch:** `feat/1700/x`\\n\
          > - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md` \
-         (committed on branch @ `abc1234`)";
+         (committed on branch @ `abc1234`)\\n\
+         > - **Grooming history:** mika-arch first-pass (READY) → \
+         second-pass (GROOMED)";
 
     const PLAN_DE_500: &str = "# Plan\n\n## Taille estimée\n\nTotal estimé : 500 lignes\n";
 
@@ -2809,11 +2819,25 @@ mod gh_arg_capture_tests {
 
     /// Cas 16 — un candidat sans callout de branche ne coûte aucun appel.
     ///
-    /// Le ticket porte bien un callout de plan — `plan_callout_present` le voit,
-    /// donc il passe le filtre d'admission du vol 2 — mais pas de quoi désigner
-    /// un ref. La lecture ne part pas : il n'y a pas d'adresse à lire, et un
-    /// appel au hasard sur `main` répondrait pour un autre fichier que celui du
-    /// ticket.
+    /// Le ticket porte bien un callout de plan — `plan_callout_present` le voit
+    /// — mais pas de quoi désigner un ref. La lecture ne part pas.
+    ///
+    /// **Ce que mika#2956 a changé, et pourquoi l'assertion de queue a bougé.**
+    /// Jusqu'à ce vol, ce corps passait le filtre d'admission (qui ne lisait que
+    /// `plan_present`), entrait donc dans `numbers_needing_size`, et
+    /// `read_one_plan_size` l'arrêtait sur son troisième garde en répondant
+    /// `Unread(NoCallout)`. Depuis mika#2956 l'admission exige les trois
+    /// signaux du prédicat du dispatch : il manque ici le callout de branche et
+    /// le marqueur GROOMED, donc le candidat est refusé **avant** la lecture et
+    /// `plan_sizes` ne porte aucune entrée pour lui. L'économie d'appel est la
+    /// même, obtenue un cran plus haut — et le `None` n'est pas un zéro : il dit
+    /// que la question de la taille n'a pas été posée, parce que l'admission
+    /// avait déjà répondu non (motif mika#2331).
+    ///
+    /// Le garde en profondeur de `read_one_plan_size` reste en place et reste
+    /// attesté — par `mika2956_le_garde_en_profondeur_de_la_sixieme_lecture_tient`
+    /// ci-dessous, qui l'appelle directement puisque le bassin ne lui envoie
+    /// plus personne.
     #[tokio::test]
     async fn mika2699_sans_callout_de_branche_aucun_appel_ne_part() {
         let (calls, mut runner) = build_recorder();
@@ -2841,9 +2865,44 @@ mod gh_arg_capture_tests {
         );
         assert_eq!(
             state.plan_sizes.get(&1700),
-            Some(&PlanSizeReading::Unread(UnreadCause::NoCallout)),
-            "et le fait est dit, pas tu : {:?}",
+            None,
+            "l'admission a refusé avant que la taille soit une question : {:?}",
             state.plan_sizes
+        );
+    }
+
+    /// mika#2956 — le troisième garde de `read_one_plan_size` tient, même si le
+    /// bassin ne lui envoie plus personne.
+    ///
+    /// Depuis que l'admission exige les trois signaux, un candidat désigné par
+    /// `numbers_needing_size` porte **par construction** un callout de branche
+    /// et un callout de plan stricts : les deux gardes de forme de
+    /// `read_one_plan_size` sont devenus inatteignables par ce chemin. Les
+    /// retirer serait pourtant un couplage silencieux — cette fonction ne lit
+    /// pas le filtre d'admission, et un futur appelant (le puits hors ligne, une
+    /// lecture ciblée) peut lui tendre n'importe quel corps. Le garde est donc
+    /// attesté ici **en appel direct**, à sa seule propriété propre : il nomme
+    /// la cause et ne part pas en appel.
+    #[tokio::test]
+    async fn mika2956_le_garde_en_profondeur_de_la_sixieme_lecture_tient() {
+        let (calls, mut runner) = build_recorder();
+        runner.plan_text = Some(PLAN_DE_500.into());
+        let bodies = HashMap::from([(
+            1700u64,
+            "> - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md`".to_string(),
+        )]);
+
+        let lu = read_one_plan_size(&runner, "senara-solutions/mika", 1700, &bodies).await;
+
+        assert_eq!(
+            lu,
+            PlanSizeReading::Unread(UnreadCause::NoCallout),
+            "sans ref à lire, la cause se nomme"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "et aucun appel ne part : {:?}",
+            calls.lock().unwrap()
         );
     }
 
