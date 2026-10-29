@@ -2175,6 +2175,33 @@ fn un_second_resolveur(issue: &Value) -> Option<u64> {
              tickets manquants"
         );
     }
+
+    /// Les milestones pour lesquels l'implication « page non pleine ⇒ lecture
+    /// complète » est connue fausse.
+    ///
+    /// **Livrée vide, et c'est une mesure, pas un optimisme** : le prédicat de
+    /// page pleine ne peut rougir qu'à partir de [`MILESTONE_READ_LIMIT`]
+    /// tickets rendus, et le plus grand milestone du dépôt en compte 117
+    /// (mesuré le 2026-10-29 sous `7df2c1e1c`). Il n'existe donc aucune
+    /// violation existante à excepter.
+    ///
+    /// Une entrée ici est une dette nommée, jamais une exemption confortable :
+    /// elle nomme son milestone, référence son ticket de suivi, et l'assertion
+    /// ci-dessous la fait rougir dès qu'elle devient stale.
+    const MILESTONE_READ_COMPLETENESS_EXCEPTIONS: &[&str] = &[];
+
+    /// La garde auto-nettoyante du § Fire-Disposition de mika#2969.
+    #[test]
+    fn mika2969_lallowlist_de_completude_est_vide_et_le_reste_tant_quelle_na_pas_dentree() {
+        // Une exception qui n'excepte plus rien est du bruit qui survit à son
+        // motif. Cette assertion rougit dans les deux sens : à l'ajout d'une
+        // entrée (qui doit alors citer son ticket) et au retrait de son motif.
+        assert!(
+            MILESTONE_READ_COMPLETENESS_EXCEPTIONS.is_empty(),
+            "une exception a été ajoutée : elle doit nommer son milestone et son ticket \
+             de suivi, et ce test doit être amendé pour l'attester — pas élargi"
+        );
+    }
 }
 
 /// Injection-verified arg-capture guards (mika#1933 AC6, plan § S4).
