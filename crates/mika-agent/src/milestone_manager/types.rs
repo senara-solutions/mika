@@ -5,6 +5,7 @@
 //! for the full Phase 1 discipline.
 
 use super::pool::{PlanSizeReading, PoolCandidate, PoolVerdict, ReadyTicket};
+use crate::plan_callout::PlanReading;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -136,6 +137,20 @@ pub struct SubIssue {
     pub priority_rank: Option<u8>,
     /// True if the issue body carries a `Plan: docs/plans/` callout.
     pub plan_present: bool,
+    /// Ce que le corps dit de son plan, en trois états (mika#2952).
+    ///
+    /// À côté de [`Self::plan_present`] et non à sa place : ce booléen est la
+    /// tolérance **lâche** que mika#2608 a figée, et quatre consommateurs en
+    /// dépendent. Cette lecture-ci sépare les deux populations que le booléen
+    /// confondait — un callout vivant, et la ligne `Plan antérieur :` qu'écrit
+    /// la livraison d'un vol.
+    ///
+    /// `None` veut dire **« le corps n'a pas été lu par ce binaire »**, jamais
+    /// « aucun plan » : c'est le motif de [`Self::merged_prs`] et de
+    /// [`Self::pr_link_source`] (mika#2340), et la raison pour laquelle le puits
+    /// hors ligne relit ses blobs anciens sans changer de verdict.
+    #[serde(default)]
+    pub plan_reading: Option<PlanReading>,
     /// True if the issue body carries a `> - **Branch:**` callout.
     pub branch_present: bool,
     /// PR number linked via GitHub `closingIssuesReferences` (first hit wins).
@@ -796,6 +811,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -839,6 +855,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -951,6 +968,7 @@ mod tests {
             state: IssueState::Closed,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -971,6 +989,64 @@ mod tests {
         );
         let back: SubIssue = serde_json::from_str(&out).unwrap();
         assert_eq!(back, sub, "aller-retour fidèle");
+    }
+
+    /// Un blob antérieur à `plan_reading` se relit, et son `None` ne se confond
+    /// pas avec « ce corps ne nomme aucun plan » (mika#2952, motif mika#2340).
+    ///
+    /// Le blob porte `plan_present: true` — le booléen lâche, qui était vrai
+    /// pour la mauvaise raison sur la population mesurée. Un `None` relu comme
+    /// `Absent` ferait du vieux blob un refus `NoGroomedPlan` qu'aucune lecture
+    /// n'a établi ; un `None` relu comme `Live` affirmerait un callout que
+    /// personne n'a vu. Il ne doit donc rien dire du tout.
+    #[test]
+    fn mika2952_un_blob_anterieur_se_relit_sans_lecture_de_plan() {
+        let blob = r#"{
+            "number": 2943,
+            "title": "t",
+            "state": "open",
+            "priority_rank": 1,
+            "plan_present": true,
+            "branch_present": false,
+            "pr_number": null,
+            "pr_state": null,
+            "ci_state": "none",
+            "blockers": [],
+            "updated_at": "2026-10-28T00:00:00Z",
+            "labels": ["p1-important"]
+        }"#;
+        let sub: SubIssue =
+            serde_json::from_str(blob).expect("un blob d'avant le champ doit encore se lire");
+        assert!(sub.plan_present, "le booléen lâche est conservé tel quel");
+        assert_eq!(
+            sub.plan_reading, None,
+            "champ absent ⇒ None, qui dit « corps non lu par ce binaire » et \
+             non Absent (mika#2340)"
+        );
+
+        let out = serde_json::to_string(&sub).unwrap();
+        assert!(
+            out.contains(r#""plan_reading":null"#),
+            "une lecture non faite se dit null — obtenu : {out}"
+        );
+        let back: SubIssue = serde_json::from_str(&out).unwrap();
+        assert_eq!(back, sub, "aller-retour fidèle");
+
+        // Et les trois états ont un nom de fil stable : le puits hors-ligne les
+        // relit, et c'est là que la classe mika#2205 se rejouerait.
+        for (reading, wire) in [
+            (PlanReading::Live, r#""live""#),
+            (PlanReading::PriorOnly, r#""prior_only""#),
+            (PlanReading::Absent, r#""absent""#),
+        ] {
+            let s = serde_json::to_string(&reading).unwrap();
+            assert_eq!(s, wire, "nom de fil figé pour {reading:?}");
+            assert_eq!(
+                serde_json::from_str::<PlanReading>(&s).unwrap(),
+                reading,
+                "aller-retour fidèle pour {reading:?}"
+            );
+        }
     }
 
     /// Les deux variantes de provenance ont un nom de fil **distinct et
@@ -1052,6 +1128,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: None,
             plan_present: true,
+            plan_reading: None,
             branch_present: true,
             pr_number: None,
             pr_state: None,

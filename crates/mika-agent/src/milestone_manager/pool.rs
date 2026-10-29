@@ -71,6 +71,26 @@
 //! troisième surface qui pose la même question, et une quatrième orthographe de
 //! la liste serait la divergence que mika#2263 a déjà payée une fois.
 //!
+//! # Le quatrième motif : un vol déjà livré n'est pas admissible
+//!
+//! mika#2952 ajoute [`RefusalReason::PriorPlanOnly`] : un candidat dont le corps
+//! ne porte plus qu'une ligne `Plan antérieur :` — celle que la porte d'auto-pull
+//! (mika#2839) écrit à la place du callout quand le merge a supprimé la branche —
+//! est refusé, et son refus **ne passe pas par la relève à grommer** : aucun
+//! groom ne débloque un vol livré.
+//!
+//! Mesuré le 2026-10-28 (rapport du sink `…T17-06-59`) : le bassin recommandait
+//! d'admettre #2943, #2946, #2680 et #2854, dont les trois premiers n'avaient
+//! plus qu'une sonde ou une mesure à faire, PR mergées. La cause n'est pas
+//! l'absence d'une lecture de PR : c'est que le lecteur lâche
+//! [`super::reader::plan_callout_present`] voit la ligne antérieure comme un
+//! callout vivant. La levée a donc pris la forme d'une **séparation** — la
+//! lecture à trois états [`crate::plan_callout::PlanReading`], orthogonale au
+//! booléen que mika#2608 a ratifié — et non d'un resserrement.
+//!
+//! Le quatrième candidat, #2854, est **dormant** : il porte une condition de
+//! réveil et c'est un second axe, livré par le vol 2/2 de mika#2952.
+//!
 //! # Ce que ce module ne fait pas
 //!
 //! L'écriture. Le vol 4 l'a livrée, et délibérément **pas ici** : `assess_pool`
@@ -95,6 +115,7 @@
 
 use super::plan_size;
 use super::types::{IssueState, SubIssue};
+use crate::plan_callout::PlanReading;
 use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL, operator_held_label};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -107,15 +128,30 @@ use std::collections::{BTreeMap, HashSet};
 /// hors milestone (`gh issue list`) **n'en mesure aucun**, et les remplir à leur
 /// valeur neutre ferait dire « pas de CI » à une absence de mesure — le motif
 /// mika#2331 que ce dépôt refuse ailleurs (« un null n'est jamais un 0 »). Les
-/// cinq champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
+/// six champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
 /// les deux ensembles de candidats partagent un type sans qu'aucun ait à
 /// inventer de valeur.
+///
+/// Le sixième, `plan_reading` (mika#2952), n'est pas une entorse à cette borne :
+/// c'est une lecture du **corps**, que les deux lectures d'issues demandent
+/// déjà (`--json body`), donc les deux origines la paient à l'identique et
+/// aucune n'a de valeur à inventer. C'est exactement ce qui le distingue de
+/// `pr_state`, `ci_state` et `branch_present`, qui sont mesurés sur un seul
+/// chemin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolCandidate {
     pub number: u64,
     pub state: IssueState,
     pub priority_rank: Option<u8>,
     pub plan_present: bool,
+    /// Ce que le corps dit de son plan, en trois états (mika#2952).
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison de `SubIssue::merged_prs` :
+    /// le puits hors-ligne tient des blobs écrits avant ce champ, et `None` y
+    /// dit « ce binaire n'a pas lu le corps », jamais « aucun plan »
+    /// (mika#2340). C'est pourquoi `None` ne déclenche aucun refus ici.
+    #[serde(default)]
+    pub plan_reading: Option<PlanReading>,
     pub labels: Vec<String>,
 }
 
@@ -129,6 +165,7 @@ impl From<&SubIssue> for PoolCandidate {
             state: s.state.clone(),
             priority_rank: s.priority_rank,
             plan_present: s.plan_present,
+            plan_reading: s.plan_reading,
             labels: s.labels.clone(),
         }
     }
@@ -342,6 +379,26 @@ pub enum RefusalReason {
     /// de retirer *ce* label-là, et un compteur doit pouvoir distinguer « tenu
     /// par `blocked` » de « tenu par `operator-gated` ».
     OperatorHeld { label: String },
+    /// Le corps ne porte plus de callout `Plan:` vivant — seulement une ligne
+    /// `Plan antérieur :`, écrite par la livraison du vol (mika#2952).
+    ///
+    /// Distinct de [`RefusalReason::NoGroomedPlan`] et **pas** par excès de
+    /// précision : le lecteur lâche rend `plan_present == true` sur cette
+    /// population, donc `NoGroomedPlan` la ferait entrer dans la relève à
+    /// grommer alors qu'aucun groom ne la débloque — c'est l'exigence d'AC1.
+    ///
+    /// **Variant sans charge, et c'est une décision.** Le plan laissait
+    /// `PriorPlanOnly { plan: … }` en ellipse ; [`PoolCandidate`] ne porte pas
+    /// de chemin de plan, et le seul endroit où il en existe un est la *prose*
+    /// de la ligne antérieure. Or le contrat du marqueur est son **préfixe**
+    /// (site unique [`crate::plan_callout::PRIOR_PLAN_PREFIX`], tenu par le
+    /// test d'aller-retour) ; le chemin qui le suit n'est contractuel que pour
+    /// la ligne écrite par la machine, et la ligne manuscrite de #2680 montre
+    /// qu'un humain en écrit aussi. Un libellé qui nommerait parfois
+    /// `` plan `` `` dirait moins que celui qui nomme le fait mesuré. Le ticket,
+    /// lui, est nommé par [`AdmissionRefusal::number`], et c'est ce que
+    /// l'opérateur ouvre.
+    PriorPlanOnly,
 }
 
 impl RefusalReason {
@@ -362,6 +419,13 @@ impl RefusalReason {
             RefusalReason::OperatorHeld { label } => {
                 format!("tenu par l'opérateur — label `{label}` à retirer")
             }
+            // Le geste correctif, et aucun numéro de PR : le bassin ne lit pas
+            // l'état des PR, donc en nommer une serait affirmer plus que ce
+            // qu'il a mesuré (mika#2205). Ce qu'il a mesuré est le corps.
+            RefusalReason::PriorPlanOnly => "travail de vol livré — le corps ne porte plus \
+                 qu'un « Plan antérieur » ; à mesurer et fermer, ou à re-groomer pour le vol \
+                 suivant"
+                .to_string(),
         }
     }
 
@@ -378,6 +442,11 @@ impl RefusalReason {
             // re-groom : comportement d'aujourd'hui, inchangé.
             RefusalReason::EstimateOverFlightBound { .. } => true,
             RefusalReason::OperatorHeld { .. } => false,
+            // La moitié structurelle d'AC1 : le vol est livré, donc il n'y a
+            // rien à groomer. Un re-groom n'arrive qu'au vol *suivant*, et ce
+            // vol-là est un autre ticket — ou le même, re-groomé par un humain
+            // qui a vu la mesure. La relève ne doit pas le proposer d'elle-même.
+            RefusalReason::PriorPlanOnly => false,
         }
     }
 }
@@ -644,6 +713,24 @@ fn well_formed_candidates<'a>(
                 });
                 continue;
             }
+            // Deuxième refus nommé, et sa place dans l'ordre n'est pas un
+            // raffinement : le lecteur lâche (`reader::plan_callout_present`,
+            // ratifié par mika#2608) voit la ligne `Plan antérieur :` comme un
+            // callout, donc `plan_present == true` sur toute cette population.
+            // Après `!s.plan_present`, ce bras serait **inerte** — pas
+            // seulement moins précis.
+            //
+            // `None` (corps non lu par ce binaire, mika#2340), `Absent` et
+            // `Live` ne déclenchent rien ici : `Absent` tombe sur
+            // `NoGroomedPlan` comme aujourd'hui.
+            if s.plan_reading == Some(PlanReading::PriorOnly) {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::PriorPlanOnly,
+                });
+                continue;
+            }
             if !s.plan_present {
                 refusals.push(AdmissionRefusal {
                     number: s.number,
@@ -731,6 +818,11 @@ mod tests {
             state: IssueState::Open,
             priority_rank: rank,
             plan_present,
+            // `None` et non `Some(Live)` : la graine partagée reste celle d'un
+            // blob antérieur à mika#2952, donc les verdicts que les tests du
+            // vol 2 et du vol 3 épinglent ne bougent pas. Les tests de
+            // mika#2952 posent la lecture explicitement, par `..cand(…)`.
+            plan_reading: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1084,6 +1176,9 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(2),
             plan_present: true,
+            // La projection doit **transporter** la lecture, pas la refaire :
+            // le corps est lu une fois, au composeur (mika#2952).
+            plan_reading: Some(PlanReading::Live),
             branch_present: true,
             pr_number: Some(2710),
             pr_state: None,
@@ -1102,6 +1197,7 @@ mod tests {
                 state: IssueState::Open,
                 priority_rank: Some(2),
                 plan_present: true,
+                plan_reading: Some(PlanReading::Live),
                 labels: vec!["ready".into(), "agent-core".into()],
             }
         );
@@ -1694,6 +1790,198 @@ mod tests {
         assert_eq!(
             ENV_POOL_WRITE, "MIKA_MANAGER_POOL_WRITE",
             "le nom de l'interrupteur est le contrat opérateur : il ne bouge pas"
+        );
+    }
+
+    // ───────── Un vol livré n'est pas admissible (mika#2952) ─────────
+
+    /// Le corps que le bassin lisait comme portant un plan vivant : la ligne que
+    /// la porte d'auto-pull a écrite à la place du callout, et rien d'autre.
+    /// Mesuré sur #2943, #2946 et #2680 le 2026-10-28.
+    const CORPS_VOL_LIVRE: &str = concat!(
+        "## Le défaut\n",
+        "\n",
+        "> Plan antérieur : `docs/plans/2026-10-27-001-fix-2943-plan.md` — la branche ",
+        "`fix/2943/x` qui le portait a été supprimée par le merge de #2945 dans `main`. ",
+        "Callout réécrit par la porte d'auto-pull (mika#2839).\n",
+    );
+
+    /// Le même corps, plus le callout du vol **suivant** : le découpage en N vols
+    /// dont le vol 1/2 est livré et le vol 2/2 dû.
+    const CORPS_VOL_1_SUR_2: &str = concat!(
+        "> - **Branch:** `fix/2952/vol-2`\n",
+        "> - **Plan:** `docs/plans/2026-10-28-004-fix-2952-vol-2-plan.md`\n",
+        "\n",
+        "> Plan antérieur : `docs/plans/2026-10-28-003-fix-2952-vol-1-plan.md` — la branche ",
+        "`fix/2952/vol-1` qui le portait a été supprimée par le merge de #2953 dans `main`.\n",
+    );
+
+    /// **AC1** — un vol livré porte un refus nommé, n'est pas admis, et ce refus
+    /// n'est pas remédiable par un groom.
+    ///
+    /// La lecture n'est pas écrite à la main : elle sort de
+    /// [`crate::plan_callout::plan_reading`] sur un corps mesuré, donc le test
+    /// joint la grammaire du marqueur au verdict du bassin. Un test qui poserait
+    /// `Some(PriorOnly)` au littéral resterait vert si l'écrivain et le lecteur
+    /// divergeaient d'orthographe.
+    ///
+    /// `plan_present: true` est le fait de la mesure, pas une commodité : le
+    /// lecteur lâche voit la ligne antérieure comme un callout (mika#2608), et
+    /// c'est exactement pourquoi ce bras passe **avant** `NoGroomedPlan`.
+    #[test]
+    fn mika2952_un_vol_livre_porte_un_refus_nomme_et_nest_pas_admis() {
+        let reading = crate::plan_callout::plan_reading(CORPS_VOL_LIVRE);
+        assert_eq!(
+            reading,
+            PlanReading::PriorOnly,
+            "le corps mesuré doit se lire comme un vol livré"
+        );
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(reading),
+            ..cand(2943, Some(1), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(
+            v.admit.is_empty(),
+            "aucun vol n'est dû : #2943 ne doit pas être admis — {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2943,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::PriorPlanOnly,
+            }],
+            "le refus doit se nommer, et se distinguer de `NoGroomedPlan`"
+        );
+        assert!(
+            !RefusalReason::PriorPlanOnly.remediable_by_grooming(),
+            "aucun groom ne débloque un vol livré : la relève ne doit pas le proposer"
+        );
+    }
+
+    /// **AC3-a** — contrôle négatif : même graine, seul `plan_reading` change.
+    ///
+    /// C'est la paire qui sépare « le bras lit la lecture » de « le bras refuse
+    /// tout candidat portant un plan » (mika#2205).
+    #[test]
+    fn mika2952_un_plan_groome_sans_marqueur_anterieur_reste_admis() {
+        let corps = "> - **Plan:** `docs/plans/2026-10-28-009-feat-x-plan.md`\n";
+        let reading = crate::plan_callout::plan_reading(corps);
+        assert_eq!(reading, PlanReading::Live);
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(reading),
+            ..cand(2943, Some(1), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2943],
+            "un plan groomé vivant reste admis : {:?}",
+            v.admit
+        );
+        assert!(v.refusals.is_empty(), "aucun refus ici — {:?}", v.refusals);
+    }
+
+    /// **AC3-b** — un vol 1/2 livré avec un vol suivant dû reste admissible.
+    ///
+    /// Le corps porte la ligne antérieure **et** le callout frais. Le prédicat ne
+    /// tombe donc pas sur « au moins une livraison » : il tombe sur « plus aucun
+    /// callout vivant ».
+    #[test]
+    fn mika2952_un_vol_1_sur_2_livre_avec_un_callout_vivant_reste_admissible() {
+        let reading = crate::plan_callout::plan_reading(CORPS_VOL_1_SUR_2);
+        assert_eq!(
+            reading,
+            PlanReading::Live,
+            "un callout vivant à côté d'une ligne antérieure reste un vol dû"
+        );
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(reading),
+            ..cand(2952, Some(1), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2952],
+            "le vol 2/2 est dû : le ticket reste admissible — {:?}",
+            v.admit
+        );
+        assert!(v.refusals.is_empty(), "aucun refus ici — {:?}", v.refusals);
+    }
+
+    /// Une lecture **absente** n'est pas un refus, et une lecture `Absent` n'en
+    /// est pas un non plus : elle retombe sur `NoGroomedPlan`, comme avant.
+    ///
+    /// `None` veut dire « le corps n'a pas été lu par ce binaire » (mika#2340) :
+    /// un blob du puits hors-ligne écrit avant ce vol garde son verdict. Si ce
+    /// test rougissait, le champ aurait cessé d'être un `Option` au sens de
+    /// mika#2331 et serait devenu un booléen à trois valeurs dont l'une ment.
+    #[test]
+    fn mika2952_une_lecture_absente_nest_pas_un_refus() {
+        // Blob antérieur : la lecture n'a pas eu lieu.
+        let anterieur = vec![cand(70, Some(1), true, &[])];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &anterieur, &[]);
+        assert_eq!(
+            admitted(&v),
+            vec![70],
+            "un blob antérieur garde son comportement — {:?}",
+            v.admit
+        );
+        assert!(v.refusals.is_empty(), "{:?}", v.refusals);
+
+        // Lecture faite, aucun marqueur : le motif reste celui d'aujourd'hui.
+        assert_eq!(
+            crate::plan_callout::plan_reading("rien du tout\n"),
+            PlanReading::Absent
+        );
+        let sans_plan = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::Absent),
+            ..cand(71, Some(1), false, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &sans_plan, &[]);
+        assert!(v.admit.is_empty(), "{:?}", v.admit);
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 71,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::NoGroomedPlan,
+            }],
+            "`Absent` tombe sur `NoGroomedPlan` : ce vol ne déplace pas ce motif"
+        );
+    }
+
+    /// L'ordre des bras **est** la priorité du motif, et un ticket tenu par
+    /// l'opérateur dont le vol est livré doit lire « tenu », pas « livré ».
+    ///
+    /// `AdmissionRefusal` ne porte qu'un motif, donc cette précédence est un
+    /// choix, et un choix non épinglé se perd au premier déplacement de bras.
+    #[test]
+    fn mika2952_un_ticket_tenu_et_livre_lit_dabord_le_label() {
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::PriorOnly),
+            ..cand(2680, Some(2), true, &["operator-gated"])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2680,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "operator-gated".to_string(),
+                },
+            }],
+            "le geste correctif vérifiable d'abord : retirer le label"
         );
     }
 }

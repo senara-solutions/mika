@@ -899,6 +899,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
@@ -2018,6 +2019,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(0),
             plan_present: true,
+            plan_reading: None,
             labels: vec!["p0-critical".into()],
         }];
         let mut a = empty_assessment();
@@ -2048,6 +2050,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
             labels: vec![],
         }];
         let mut a = empty_assessment();
@@ -2080,6 +2083,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(0),
             plan_present: true,
+            plan_reading: None,
             labels: vec!["p0-critical".into()],
         }];
         state.plan_sizes = [(1700, PlanSizeReading::Measured(900))]
@@ -2119,6 +2123,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(0),
             plan_present: true,
+            plan_reading: None,
             labels: vec!["p0-critical".into()],
         }];
         state.plan_sizes = [(1700, PlanSizeReading::Unread(UnreadCause::FetchFailed))]
@@ -2160,6 +2165,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(0),
             plan_present: true,
+            plan_reading: None,
             labels: vec!["p0-critical".into()],
         }];
         state.plan_sizes = [(1700, PlanSizeReading::Measured(120))]
@@ -2269,6 +2275,7 @@ mod tests {
                 state: IssueState::Open,
                 priority_rank: Some(0),
                 plan_present: false,
+                plan_reading: None,
                 labels: vec!["p0-critical".into()],
             },
             PoolCandidate {
@@ -2276,6 +2283,7 @@ mod tests {
                 state: IssueState::Open,
                 priority_rank: None,
                 plan_present: false,
+                plan_reading: None,
                 labels: vec![],
             },
         ];
@@ -2474,6 +2482,7 @@ mod tests {
             state: IssueState::Open,
             priority_rank: Some(1),
             plan_present: true,
+            plan_reading: None,
             labels: vec!["p1-important".into(), "operator-gated".into()],
         }];
         let mut a = empty_assessment();

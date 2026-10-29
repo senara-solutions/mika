@@ -674,6 +674,7 @@ mod tests {
             state: crate::milestone_manager::types::IssueState::Open,
             priority_rank: None,
             plan_present: true,
+            plan_reading: None,
             branch_present: true,
             pr_number: None,
             pr_state: pr_state.map(str::to_string),
