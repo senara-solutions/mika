@@ -769,6 +769,7 @@ async fn run_investigation(
         embedding_client: None,
         brave_api_key: None,
         github_token: None,
+        ci_read_token: None,
         gateway_url: None,
         internal_token: None,
         skills_dirty: &skills_dirty,

@@ -74,9 +74,9 @@ use crate::messaging::MessageSender;
 use crate::perimeter::{self, Classification};
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    BehindMainInfo, BehindMainRemediation, CheckClassification, classify_checks,
-    describe_behind_main_remediation, is_behind_main, remediate_behind_main, run_gh_checks,
-    run_gh_pr_view, run_gh_subprocess,
+    BehindMainInfo, BehindMainRemediation, CheckClassification, ci_read_token_or_pat,
+    classify_checks, describe_behind_main_remediation, is_behind_main, remediate_behind_main,
+    run_gh_checks, run_gh_pr_view, run_gh_subprocess,
 };
 use mika_common::forge_identity::{DISPATCHER_AGENT, MergeReadySignal, owns_merge_transition};
 
@@ -428,7 +428,11 @@ pub async fn try_handle_ci_success(
     }
 
     // 5. CI aggregation gate (load-bearing — check_suite event is per-workflow)
-    let checks_future = run_gh_checks(pr.number, &event.repo, token);
+    //
+    // mika#2963 — `None` : ce handler ne porte pas de `ToolContext`, donc le
+    // repli PAT est explicite et le log le dit (`source = "pat"`).
+    let ci_token = ci_read_token_or_pat(None, token);
+    let checks_future = run_gh_checks(pr.number, &event.repo, &ci_token);
     let checks = match tokio::time::timeout(std::time::Duration::from_secs(60), checks_future).await
     {
         Ok(Ok(c)) => c,

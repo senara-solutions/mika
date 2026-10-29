@@ -5,6 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use mika_common::ci_read::{CiReadToken, CiReadTokenSource};
 use mika_common::claude::ToolDefinition;
 use mika_common::forge_identity::{
     MergeClearance, MpcGateVerdict, mpc_gate_required, mpc_gate_verdict,
@@ -258,7 +259,19 @@ impl Tool for PrMergeWithGateTool {
         }
 
         // -- Step 2: Fetch EVERY check status of the head (mika#2617) --
-        let checks_result = run_gh_checks(pr_number, repo, token).await;
+        //
+        // mika#2963 — la lecture prend le jeton d'App quand le contexte en porte
+        // un, le PAT sinon. Le refus de l'étape ci-dessus (l. 170) n'a pas bougé :
+        // c'est lui qui porte AC3, et il refuse encore quand NI l'App NI le PAT
+        // n'ont donné de jeton. Une lecture au PAT dégrade vers exactement le
+        // régime d'avant ce ticket — `statusCheckRollup` échoue, l'erreur est
+        // classée `GhCliFailure`, le gate se ferme — jamais vers du vert.
+        let checks_result = run_gh_checks(
+            pr_number,
+            repo,
+            &ci_read_token_or_pat(ctx.ci_read_token, token),
+        )
+        .await;
         let checks = match checks_result {
             Ok(c) => c,
             Err(e) => {
@@ -1056,9 +1069,45 @@ pub(crate) async fn run_gh_pr_view(
 pub(crate) async fn run_gh_checks(
     pr_number: u64,
     repo: &str,
-    token: &str,
+    token: &CiReadToken,
 ) -> Result<Vec<GhCheck>, String> {
     parse_gh_checks(&run_gh_checks_raw(pr_number, repo, token).await?)
+}
+
+/// Le jeton de lecture CI de ce site, ou un repli bâti sur son PAT (mika#2963).
+///
+/// Rend le [`CiReadToken`] résolu par `Settings::resolve_ci_read_token` quand
+/// il existe, sinon un jeton de source [`CiReadTokenSource::Pat`] bâti sur le
+/// PAT de l'appelant.
+///
+/// # Pourquoi ce repli, et pourquoi il ne contredit pas AC3
+///
+/// Sans lui, un site de production dont le câblage serait oublié — ou un
+/// `ToolContext` de test — ferait refuser le gate sur une cause de
+/// configuration qui n'existe pas : une panne inventée par le câblage, pas par
+/// la forge. Avec lui, un tel site dégrade vers **exactement** le comportement
+/// d'avant mika#2963 : lecture au PAT, échec sur `statusCheckRollup`, gate
+/// fermé sur `GhCliFailure` — et le log de [`CiReadToken::report_read`] le dit
+/// honnêtement (`source = "pat"`) plutôt que de le taire.
+///
+/// Le fail-closed d'AC3 n'est pas porté par ce repli mais par le cas « ni App
+/// ni PAT », déjà refusé en tête de [`PrMergeWithGateTool::execute`].
+///
+/// # Site unique, et c'est structurel
+///
+/// C'est le seul endroit de `crates/mika-agent/src` où un `CiReadToken` de
+/// source `Pat` se construit hors module de tests, et
+/// `mika2963_la_source_pat_ne_se_construit_qu_au_site_du_repli` le refuse
+/// ailleurs : un site qui bâtirait le sien contournerait la résolution
+/// App-first, lirait au PAT, échouerait sur `statusCheckRollup` — et le log
+/// dirait `source = "pat"`, ce qui ressemble au repli nominal. Le défaut serait
+/// **invisible dans l'instrument même qui le mesure**. Seule la structure le
+/// décide.
+pub(crate) fn ci_read_token_or_pat(resolved: Option<&CiReadToken>, pat: &str) -> CiReadToken {
+    match resolved {
+        Some(t) => t.clone(),
+        None => CiReadToken::new(pat, CiReadTokenSource::Pat),
+    }
 }
 
 /// The single site that composes the `gh pr checks` argv (mika#2617).
@@ -1108,15 +1157,35 @@ pub(crate) fn gh_checks_args(pr_number: u64, repo: &str) -> Vec<String> {
 /// to the engine. Do not restore the flag believing you are repairing a
 /// regression — the divergence between two definitions of "green" is the defect,
 /// and this side is the one that fails closed.
+///
+/// # Le jeton, depuis mika#2963
+///
+/// Elle prend un [`CiReadToken`] et non une `&str` : `gh` résout ce `--json`
+/// par le champ GraphQL `statusCheckRollup`, qu'un PAT fine-grained ne peut pas
+/// lire — 77 échecs mesurés dans `server.log` du 2026-10-07 au 2026-10-29, dont
+/// 55 abstentions du garde mika#2455 sur `reason "gh_failed"`. Le jeton
+/// d'installation de l'App porte `checks=read` ; `Settings::resolve_ci_read_token`
+/// le cherche d'abord, le PAT reste le repli.
+///
+/// Elle est donc aussi, depuis ce ticket, le **seul site qui dit quel jeton a
+/// lu** ([`CiReadToken::report_read`], AC4) — les cinq consommateurs héritent de
+/// cette ligne sans un mot chez eux. Ce qui change est **par quel jeton** la
+/// lecture passe, jamais **ce qu'elle lit** : [`gh_checks_args`] n'est pas
+/// touché, ni le `--json`, ni l'absence de `--required`.
 pub(crate) async fn run_gh_checks_raw(
     pr_number: u64,
     repo: &str,
-    token: &str,
+    token: &CiReadToken,
 ) -> Result<String, String> {
     let args = gh_checks_args(pr_number, repo);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    run_gh_subprocess(&argv, token).await
+    // AC4 — émis AVANT l'appel : une lecture qui n'aboutit pas est tout de même
+    // une lecture tentée, et c'est le silence d'un lecteur qui ne tourne pas que
+    // la sonde doit pouvoir distinguer du silence d'un lecteur sain (mika#2205).
+    token.report_read(repo, pr_number);
+
+    run_gh_subprocess(&argv, token.token()).await
 }
 
 /// Prefix of the error [`parse_gh_checks`] returns when `gh` answered but its
@@ -4922,6 +4991,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             gateway_url: None,
             internal_token: None,
             github_token: None,
+            ci_read_token: None,
             skills_dirty,
             is_reflection: false,
             is_task_context: false,

@@ -125,6 +125,21 @@ pub struct ToolContext<'a> {
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
     pub github_token: Option<&'a str>,
+    /// Le jeton des **lectures CI** (mika#2963) — App d'abord, PAT en repli.
+    ///
+    /// Jumeau non identitaire de `github_token`, qui reste le jeton
+    /// d'**exécution** (`pr review`, `pr merge`, `pr comment`). Les deux
+    /// coexistent parce que la priorité dépend de la classe d'opération, pas de
+    /// l'appelant : la forge lit l'auteur d'un approve, jamais celui d'une
+    /// lecture de checks. Voie (i) de mika#2963 — lire avec l'App, poster avec
+    /// le PAT `mika-platform-qa`, pour ne déplacer aucune identité observable.
+    ///
+    /// Peuplé aux trois sites de production de `agent_loop::mod` par
+    /// `Settings::resolve_ci_read_token`. `None` ailleurs : ces sites dégradent
+    /// par `pr_merge_with_gate::ci_read_token_or_pat`, qui bâtit alors un jeton
+    /// de source `Pat` — exactement le comportement d'avant ce ticket, et le
+    /// log le dit.
+    pub ci_read_token: Option<&'a mika_common::ci_read::CiReadToken>,
     /// Gateway base URL for builtins that call substrate endpoints on
     /// the gateway (mika#1969 — `fetch_url` calls
     /// `POST /internal/fetch`). Populated from `settings.routing_url`

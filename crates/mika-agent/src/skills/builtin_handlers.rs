@@ -4399,6 +4399,14 @@ async fn validate_qa_ci_coherence(
 ///
 /// Public because `tests/eval/` is a separate crate. It has exactly one
 /// production caller, [`validate_qa_ci_coherence`].
+///
+/// # Le jeton, depuis mika#2963
+///
+/// Le troisième paramètre du lecteur est un [`mika_common::ci_read::CiReadToken`]
+/// et non plus une `String` : c'est ce qui rend la **divergence** observable dans
+/// un test. Au même `ToolContext`, [`gh_exec_token`] rend le PAT — qui poste le
+/// `pr review` — et ce lecteur reçoit le jeton d'App. Un test portant sur un seul
+/// des deux resterait vert le jour où ils se confondraient à nouveau.
 pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
     args: &[String],
     repo: Option<&str>,
@@ -4406,7 +4414,7 @@ pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
     read_checks: F,
 ) -> Result<(), ToolOutput>
 where
-    F: FnOnce(u64, String, String) -> Fut,
+    F: FnOnce(u64, String, mika_common::ci_read::CiReadToken) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
     use crate::evidence::guards::pr_review_target;
@@ -4490,7 +4498,14 @@ where
 
     // -- Read, bounded --
 
-    let read = read_checks(pr_number, repo.to_string(), token.to_string());
+    // mika#2963 — App d'abord, PAT en repli. L'abstention `NO_TOKEN` ci-dessus
+    // reste conditionnée au PAT : sans lui, le repli n'existe pas, et un jeton
+    // d'App seul suffirait à lire mais pas à poster la revue qui suit.
+    let read = read_checks(
+        pr_number,
+        repo.to_string(),
+        crate::tools::pr_merge_with_gate::ci_read_token_or_pat(ctx.ci_read_token, token),
+    );
     let raw = match tokio::time::timeout(
         std::time::Duration::from_secs(QA_CI_READ_TIMEOUT_SECS),
         read,
@@ -5130,6 +5145,25 @@ where
     }
 }
 
+/// Le jeton d'**exécution** `gh` : le PAT, et rien d'autre (mika#2963, voie (i)).
+///
+/// Mêmes octets que `ctx.github_token`, mais un nom. Il existe pour que la
+/// divergence soit nommable : depuis mika#2963 le contexte porte **deux** jetons,
+/// et un `pr review` posté avec le jeton d'App serait signé
+/// `mika-platform-bot[bot]` au lieu de `mika-platform-qa`, ce que sept modules
+/// lisent par login (`qa_review_reconcile`, `qa_head_supersession`,
+/// `server::verdict`, `deadline_verdict`, `skills::matcher`,
+/// `task_engine::dispatcher`, `server::sync_debounce`). La lecture de CI prend
+/// l'autre chemin, par [`crate::tools::pr_merge_with_gate::ci_read_token_or_pat`].
+///
+/// C'est le site que T1 épingle : `gh_exec_token` et le lecteur CI reçoivent des
+/// valeurs **différentes** d'un même `ToolContext`, et c'est cette divergence qui
+/// est l'observable — un test sur l'un des deux seuls resterait vert si les deux
+/// se confondaient à nouveau.
+fn gh_exec_token<'a>(ctx: &'a ToolContext<'_>) -> Option<&'a str> {
+    ctx.github_token
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -5363,7 +5397,11 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // mika#2715 — l'événement reste **au site** et non dans la couture : il lit
     // `ctx.session_id`/`ctx.github_token`, que `gh_process` ne connaît pas. Les
     // clés qu'il nomme sont celles que la couture pose, dans l'ordre de #380.
-    let env_keys_set: &[&str] = match ctx.github_token {
+    //
+    // mika#2963 — le jeton se lit par `gh_exec_token` : `run_gh` **exécute**
+    // (`pr review`, `pr merge`, `pr comment`), donc il reste sur le PAT.
+    let exec_token = gh_exec_token(ctx);
+    let env_keys_set: &[&str] = match exec_token {
         Some(_) => &["GH_PROMPT_DISABLED", "GH_TOKEN"],
         None => &["GH_PROMPT_DISABLED"],
     };
@@ -5372,7 +5410,7 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         argv = ?&gh_args.args,
         repo = ?&gh_args.repo,
         env_keys_set = ?env_keys_set,
-        has_github_token = ctx.github_token.is_some(),
+        has_github_token = exec_token.is_some(),
         "run_gh invocation"
     );
 
@@ -5380,7 +5418,7 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // parce que `run_gh` sert des sous-commandes libres : il n'y a pas de champ
     // d'entrée structuré où le lire.
     let output = crate::gh_process::run_gh_tool(
-        ctx.github_token,
+        exec_token,
         crate::gh_process::gh_subject_from_argv(&gh_args.args),
         &gh_args.args,
         gh_args.repo.as_deref(),
@@ -7669,6 +7707,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            ci_read_token: None,
             gateway_url: Some(gateway_url),
             internal_token: None,
             skills_dirty: &SKILLS_DIRTY,
@@ -7714,6 +7753,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            ci_read_token: None,
             gateway_url: Some(gateway_url),
             internal_token: Some(token),
             skills_dirty: &SKILLS_DIRTY,
