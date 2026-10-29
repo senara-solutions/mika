@@ -88,8 +88,32 @@
 //! lecture à trois états [`crate::plan_callout::PlanReading`], orthogonale au
 //! booléen que mika#2608 a ratifié — et non d'un resserrement.
 //!
-//! Le quatrième candidat, #2854, est **dormant** : il porte une condition de
-//! réveil et c'est un second axe, livré par le vol 2/2 de mika#2952.
+//! # Le cinquième motif : un ticket dormant n'est pas admissible
+//!
+//! Le quatrième candidat de cette mesure, #2854, n'a rien d'un vol livré de
+//! plus : il est **dormant**. Son corps porte une ligne `Condition de réveil`
+//! — règle « Dormeurs visibles », ratifiée par Vincent le 2026-09-01 — et le
+//! vol 2/2 de mika#2952 ajoute [`RefusalReason::Dormant`] pour le dire.
+//!
+//! Un **second axe**, et non un état de plus sur le précédent : #2854 porte les
+//! deux ensemble (ses trois vols sont mergés *et* il attend
+//! `MIKA_WEBHOOK_COMMENT_TRIAGE`), donc une lecture qui les empilerait rendrait
+//! le couple inexprimable — la classe mika#2205, deux populations sous un seul
+//! nom. [`PoolCandidate::dormancy`] se lit donc à côté de `plan_reading`, et le
+//! bras de dormance passe **devant** celui du vol livré : des deux motifs, un
+//! seul décrit ce que l'opérateur peut faire aujourd'hui.
+//!
+//! Le refus **cite** la condition sans jamais l'arbitrer. Les cinq conditions
+//! mesurées sur le dépôt nomment une variable d'environnement, une commande
+//! `gh issue list`, un `git rev-list`, une date : les évaluer demanderait un
+//! sous-processus, un appel réseau et une horloge dans une fonction que ce
+//! module tient **pure**. Le bassin dit donc ce que le corps dit, et l'opérateur
+//! juge.
+//!
+//! Et ce qu'il fait d'un marqueur **absent** — la seconde moitié de l'AC2 — est
+//! une valeur, pas un silence : [`DormancyReading::Awake`] est une mesure, le
+//! candidat continue sa route et reste admissible. `None`, lui, dit « ce binaire
+//! n'a pas lu le corps » (motif mika#2340) et n'autorise aucun refus.
 //!
 //! # Ce que ce module ne fait pas
 //!
@@ -505,6 +529,24 @@ pub enum RefusalReason {
     /// lui, est nommé par [`AdmissionRefusal::number`], et c'est ce que
     /// l'opérateur ouvre.
     PriorPlanOnly,
+    /// Le corps porte une ligne `Condition de réveil` : le ticket dort derrière
+    /// un évènement, règle « Dormeurs visibles » ratifiée le 2026-09-01
+    /// (mika#2952 AC2).
+    ///
+    /// **La condition voyage avec le motif, et elle est citée.** L'AC2 exige un
+    /// refus qui la *cite* : sans elle le libellé dirait « dormant » et
+    /// l'opérateur devrait ouvrir le ticket pour savoir quoi attendre — or les
+    /// conditions mesurées nomment une variable d'environnement, une commande
+    /// `gh`, une date. Le bassin ne l'**évalue** jamais : `assess_pool` est une
+    /// fonction pure, et arbitrer `git rev-list` demanderait un sous-processus,
+    /// un appel réseau et une horloge.
+    ///
+    /// Distinct de [`RefusalReason::PriorPlanOnly`] bien que #2854 porte les
+    /// deux : le geste correctif n'est pas le même — là une mesure de fermeture,
+    /// ici une attente. Et distinct de [`RefusalReason::OperatorHeld`], qui est
+    /// une tenue par **label**, visible sur la forge ; la dormance vit dans le
+    /// corps et aucun label ne la dit.
+    Dormant { condition: String },
 }
 
 impl RefusalReason {
@@ -532,6 +574,13 @@ impl RefusalReason {
                  qu'un « Plan antérieur » ; à mesurer et fermer, ou à re-groomer pour le vol \
                  suivant"
                 .to_string(),
+            // La condition est **citée**, entre guillemets, telle que le corps
+            // l'écrit : le bassin ne l'a pas arbitrée, et le libellé ne doit pas
+            // laisser croire le contraire. C'est l'opérateur qui juge si elle
+            // est remplie.
+            RefusalReason::Dormant { condition } => {
+                format!("dormant — « {condition} » ; à réveiller quand la condition est remplie")
+            }
         }
     }
 
@@ -553,6 +602,12 @@ impl RefusalReason {
             // vol-là est un autre ticket — ou le même, re-groomé par un humain
             // qui a vu la mesure. La relève ne doit pas le proposer d'elle-même.
             RefusalReason::PriorPlanOnly => false,
+            // La moitié structurelle d'AC2 : un plan groomé ne réveille pas un
+            // dormeur, c'est l'évènement cité qui le fait. Proposer « à
+            // grommer » ici ferait agir le lecteur sur un conseil faux, et le
+            // plan n'y gagnerait rien — il existe souvent déjà (#2854 en porte
+            // un, livré sur trois vols).
+            RefusalReason::Dormant { .. } => false,
         }
     }
 }
@@ -819,7 +874,33 @@ fn well_formed_candidates<'a>(
                 });
                 continue;
             }
-            // Deuxième refus nommé, et sa place dans l'ordre n'est pas un
+            // Deuxième refus nommé — la dormance (mika#2952 AC2), et sa place
+            // devant `PriorPlanOnly` est une décision, pas un ordre d'écriture.
+            // #2854 porte les **deux** : son corps ne garde qu'un « Plan
+            // antérieur » et il dort derrière `MIKA_WEBHOOK_COMMENT_TRIAGE`.
+            // `AdmissionRefusal` ne porte qu'un motif, et de ces deux-là un seul
+            // décrit ce que l'opérateur peut faire aujourd'hui : « à mesurer et
+            // fermer » lui ferait ouvrir un ticket qui attend un évènement,
+            // tandis que « dormant — <condition> » est vrai des deux populations
+            // superposées. Le motif le plus **bloquant** gagne, comme
+            // `OperatorHeld` gagne sur l'absence de plan juste au-dessus.
+            //
+            // `Awake` ne déclenche rien — c'est une mesure, et c'est la réponse
+            // à la question d'AC2 sur le marqueur absent : le candidat continue
+            // sa route et reste admissible. `None` non plus : aucun corps n'a été
+            // lu par ce binaire (mika#2340), et refuser sur une absence de
+            // mesure serait exclure en silence sous un nom.
+            if let Some(DormancyReading::Dormant { condition }) = &s.dormancy {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::Dormant {
+                        condition: condition.clone(),
+                    },
+                });
+                continue;
+            }
+            // Troisième refus nommé, et sa place dans l'ordre n'est pas un
             // raffinement : le lecteur lâche (`reader::plan_callout_present`,
             // ratifié par mika#2608) voit la ligne `Plan antérieur :` comme un
             // callout, donc `plan_present == true` sur toute cette population.
@@ -2239,5 +2320,221 @@ mod tests {
                  RÉSOLUTION : retirer l'entrée et fermer {suivi}."
             );
         }
+    }
+
+    // ───────── La dormance : le motif et son bras (mika#2952) ─────────
+
+    /// **Test 2 — AC2, moitié positive.** Un dormant n'est pas admis, son refus
+    /// se **nomme**, et il **cite** la condition.
+    ///
+    /// La lecture sort de [`dormancy_reading`] sur le corps mesuré de #2854,
+    /// jamais d'un littéral : c'est ce qui joint la grammaire du marqueur au
+    /// verdict du bassin. Un test qui poserait `Dormant { condition: "x" }` à la
+    /// main resterait vert si l'écrivain et le lecteur divergeaient.
+    ///
+    /// `plan_reading: Live` est délibéré : le refus ne doit rien emprunter aux
+    /// deux autres motifs de ce vol — c'est la dormance **seule** qui l'arrête.
+    #[test]
+    fn mika2952_un_dormant_nest_pas_admis_et_son_refus_cite_la_condition() {
+        let lecture = dormancy_reading(CORPS_DORMANT_2854);
+        let DormancyReading::Dormant { condition } = lecture.clone() else {
+            panic!("le corps mesuré de #2854 doit se lire dormant : {lecture:?}");
+        };
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::Live),
+            dormancy: Some(lecture),
+            ..cand(2854, Some(2), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(
+            v.admit.is_empty(),
+            "#2854 dort derrière un évènement : il ne doit pas être admis — {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2854,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::Dormant {
+                    condition: condition.clone(),
+                },
+            }],
+            "le refus doit se nommer, et se distinguer de `NoGroomedPlan`"
+        );
+
+        // Le rapport que l'opérateur lit doit porter la condition **mot pour
+        // mot** : un motif qui dit « dormant » sans dire derrière quoi oblige à
+        // rouvrir le ticket pour le savoir.
+        let dit = v.refusals[0].reason.label();
+        assert!(
+            dit.contains("MIKA_WEBHOOK_COMMENT_TRIAGE"),
+            "le motif doit citer la condition : {dit}"
+        );
+
+        assert!(
+            !RefusalReason::Dormant { condition }.remediable_by_grooming(),
+            "aucun groom ne réveille un dormeur : la relève ne doit pas le proposer"
+        );
+    }
+
+    /// **Test 3 — AC2, moitié négative.** Marqueur absent, le candidat
+    /// **continue**.
+    ///
+    /// C'est la réponse à la question qu'AC2 pose explicitement — « ce que le
+    /// bassin fait d'un ticket dont le marqueur est absent » — et la paire qui
+    /// sépare « le bras lit la dormance » de « le bras refuse tout candidat dont
+    /// le corps a été lu » (mika#2205). Même graine que le test 2, seule la
+    /// lecture change.
+    ///
+    /// Les deux absences sont ici, et ce ne sont pas la même : `Awake` est une
+    /// **mesure** (le corps a été lu, il ne porte pas le marqueur) et `None`
+    /// l'absence de mesure (mika#2340). Aucune des deux n'autorise un refus, et
+    /// aucun `AdmissionRefusal` ne doit nommer ces candidats.
+    #[test]
+    fn mika2952_un_marqueur_absent_laisse_le_candidat_continuer() {
+        assert_eq!(
+            dormancy_reading("## Le défaut\n\nRien ne retient ce ticket.\n"),
+            DormancyReading::Awake,
+            "la graine du contrôle négatif doit vraiment se lire éveillée"
+        );
+
+        let milestone = vec![
+            PoolCandidate {
+                plan_reading: Some(PlanReading::Live),
+                dormancy: Some(DormancyReading::Awake),
+                ..cand(2940, Some(1), true, &[])
+            },
+            // Blob du puits hors-ligne écrit avant ce vol : aucun corps lu.
+            PoolCandidate {
+                plan_reading: Some(PlanReading::Live),
+                dormancy: None,
+                ..cand(2941, Some(1), true, &[])
+            },
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2940, 2941],
+            "un marqueur absent et une lecture absente restent tous deux admissibles — {:?}",
+            v.admit
+        );
+        assert!(
+            v.refusals.is_empty(),
+            "aucun de ces deux candidats ne doit être nommé dans un refus — {:?}",
+            v.refusals
+        );
+    }
+
+    /// **Test 4** — `OperatorHeld` mord **avant** la dormance.
+    ///
+    /// Le cas #2117/#2472 : un corps qui dort **et** un label `blocked`. Des deux
+    /// motifs, un seul nomme un geste que l'opérateur peut faire aujourd'hui —
+    /// retirer le label — donc c'est celui que le refus doit porter.
+    /// `AdmissionRefusal` n'en portant qu'un, cette précédence est un choix, et
+    /// un choix non épinglé se perd au premier déplacement de bras.
+    #[test]
+    fn mika2952_un_ticket_tenu_et_dormant_lit_dabord_le_label() {
+        let lecture = dormancy_reading(CORPS_DORMANT_2472);
+        assert!(
+            matches!(lecture, DormancyReading::Dormant { .. }),
+            "la graine doit vraiment dormir, sans quoi le test ne mesure rien : {lecture:?}"
+        );
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::Live),
+            dormancy: Some(lecture),
+            ..cand(2472, Some(2), true, &["blocked"])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(v.admit.is_empty(), "{:?}", v.admit);
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2472,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "blocked".to_string(),
+                },
+            }],
+            "le geste correctif vérifiable d'abord : retirer le label"
+        );
+    }
+
+    /// **Test 5** — la dormance mord **avant** `PriorPlanOnly` et avant
+    /// `NoGroomedPlan`.
+    ///
+    /// Les deux cas tiennent dans un seul test parce que c'est la même frontière
+    /// lue deux fois : de part et d'autre du bras de la dormance, les deux
+    /// motifs qu'elle précède.
+    ///
+    /// #2854 porte les **deux** faits — plus aucun callout vivant, et une
+    /// condition de réveil. Entre « à mesurer et fermer » et « dormant », le
+    /// second est vrai des deux populations superposées, et c'est le plus
+    /// bloquant : le premier ferait ouvrir un ticket qui attend un évènement.
+    ///
+    /// #2912/#2913 est l'autre côté : dormant **sans** plan du tout. Le motif
+    /// doit dire la dormance et non l'absence de plan, sans quoi le ticket
+    /// entrerait dans la relève à grommer et proposerait un groom que rien
+    /// n'attend (le `remediable_by_grooming` du test 2).
+    #[test]
+    fn mika2952_la_dormance_mord_avant_le_vol_livre_et_avant_labsence_de_plan() {
+        let lecture_2854 = dormancy_reading(CORPS_DORMANT_2854);
+        let lecture_2912 = dormancy_reading(CORPS_DORMANT_2912);
+        let DormancyReading::Dormant {
+            condition: cond_2854,
+        } = lecture_2854.clone()
+        else {
+            panic!("la graine de #2854 doit dormir : {lecture_2854:?}");
+        };
+        let DormancyReading::Dormant {
+            condition: cond_2912,
+        } = lecture_2912.clone()
+        else {
+            panic!("la graine de #2912 doit dormir : {lecture_2912:?}");
+        };
+
+        let milestone = vec![
+            // Vol livré **et** dormant : le lecteur lâche voit la ligne
+            // antérieure comme un callout, donc `plan_present == true`.
+            PoolCandidate {
+                plan_reading: Some(PlanReading::PriorOnly),
+                dormancy: Some(lecture_2854),
+                ..cand(2854, Some(2), true, &[])
+            },
+            // Dormant et sans plan du tout.
+            PoolCandidate {
+                plan_reading: Some(PlanReading::Absent),
+                dormancy: Some(lecture_2912),
+                ..cand(2912, Some(2), false, &[])
+            },
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(v.admit.is_empty(), "{:?}", v.admit);
+        assert_eq!(
+            v.refusals,
+            vec![
+                AdmissionRefusal {
+                    number: 2854,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::Dormant {
+                        condition: cond_2854,
+                    },
+                },
+                AdmissionRefusal {
+                    number: 2912,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::Dormant {
+                        condition: cond_2912,
+                    },
+                },
+            ],
+            "la dormance est le motif le plus bloquant des deux côtés"
+        );
     }
 }
