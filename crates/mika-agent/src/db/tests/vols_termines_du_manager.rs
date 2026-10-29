@@ -1130,8 +1130,12 @@ async fn mika2921_hors_cible_letat_de_pr_est_non_lu_et_dans_la_cible_il_est_lu()
             && ligne_dans.contains(" — PR open — "),
         "obtenu : {ligne_dans}"
     );
+    // L'aiguille nomme son segment depuis mika#2968 : « CI non lue » contient
+    // « non lu », et la CI de ces vols est bien non lue (la sous-issue ne porte
+    // aucune provenance de PR). Un `contains("non lu")` nu rougirait donc sur
+    // l'autre axe, sans rien dire de l'état de PR que ce test atteste.
     assert!(
-        !ligne_dans.contains("non lu"),
+        !ligne_dans.contains("état de PR non lu"),
         "un état lu ne se rend jamais comme non lu : {ligne_dans}"
     );
 

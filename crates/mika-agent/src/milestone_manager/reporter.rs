@@ -38,7 +38,8 @@
 //! without an explicit Prime override captured in a follow-up plan.
 
 use super::evaluator::{
-    DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, NotFlightReason, PrStateKnowledge,
+    CiKnowledge, CiUnreadCause, DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
+    NotFlightReason, PrStateKnowledge,
 };
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
@@ -751,6 +752,14 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
 /// vide ([`PrStateKnowledge::Read(None)`]) : un vol du milestone cible sans PR
 /// connue ne gagne pas un segment qui ne dit rien. C'est aussi ce qui laisse
 /// intact le rendu de la population d'avant mika#2921.
+///
+/// Le segment de CI (mika#2968, AC3) est le seul qui ne s'omette **jamais** :
+/// il est inséré entre l'état de PR et la recommandation, parce que c'est l'une
+/// des deux prémisses sur lesquelles cette recommandation repose et qu'une
+/// prémisse se lit avant sa conclusion. Il est toujours rendu parce que
+/// l'omettre ferait de « rien n'a été lu » et de « ce rapport est antérieur au
+/// champ » les mêmes octets (classe mika#2205) : le silence serait le seul
+/// endroit où une CI non lue pourrait passer pour verte.
 pub fn render_flight_verdict(v: &FlightVerdict) -> String {
     let mut segments = vec![
         flight_ticket_label(v),
@@ -761,6 +770,7 @@ pub fn render_flight_verdict(v: &FlightVerdict) -> String {
     if let Some(etat) = flight_pr_state_label(&v.pr_state) {
         segments.push(etat);
     }
+    segments.push(flight_ci_label(&v.ci));
     segments.push(flight_recommendation_label(v.recommendation).to_string());
     format!("- {}", segments.join(" — "))
 }
@@ -808,6 +818,48 @@ fn flight_pr_state_label(pr_state: &PrStateKnowledge) -> Option<String> {
         PrStateKnowledge::Read(Some(etat)) => Some(format!("PR {etat}")),
         PrStateKnowledge::Read(None) => None,
         PrStateKnowledge::NotRead => Some("état de PR non lu".to_string()),
+    }
+}
+
+/// Ce que le manager sait de la CI de la tête de la PR, et de quand il le sait
+/// (mika#2968, AC3).
+///
+/// Le libellé d'une lecture porte **l'instant du cycle** et le dit ainsi :
+/// « lue au cycle de <instant> ». La formule est délibérément moins précise que
+/// « lue à <instant> », parce que l'instant est `ctx.now`, capturé après le
+/// `reader.read()` du cycle — il majore la lecture de quelques secondes. Dire
+/// « au cycle de » est exact ; dire « à » serait une précision inventée.
+///
+/// `CiState::None` se dit « CI sans check » et non « CI non lue » : c'est une
+/// lecture qui a abouti et n'a trouvé aucun check. La confusion des deux est
+/// exactement ce que [`CiKnowledge`] existe pour rendre impossible.
+///
+/// Le `match` est exhaustif sur les deux axes, sans bras `_` (mika#2923) : un
+/// cinquième état CI ou une cinquième cause de non-lecture doit se décider ici,
+/// pas se glisser dans un fourre-tout qui dirait le mot d'un autre.
+fn flight_ci_label(ci: &CiKnowledge) -> String {
+    match ci {
+        CiKnowledge::Read { state, at } => {
+            let etat = match state {
+                CiState::Success => "CI verte",
+                CiState::Failed => "CI rouge",
+                CiState::Pending => "CI en cours",
+                CiState::None => "CI sans check",
+            };
+            format!("{etat} (lue au cycle de {at})")
+        }
+        CiKnowledge::Unread(cause) => format!("CI non lue ({})", ci_unread_label(*cause)),
+    }
+}
+
+/// Pourquoi la CI n'a pas été lue — nommé, parce que les quatre causes
+/// n'appellent pas la même action de l'opérateur.
+fn ci_unread_label(cause: CiUnreadCause) -> &'static str {
+    match cause {
+        CiUnreadCause::NotFromPrList => "PR hors liste du milestone",
+        CiUnreadCause::NoSubIssue => "aucune sous-issue appariée",
+        CiUnreadCause::NoIssueNumber => "vol sans ticket",
+        CiUnreadCause::NotMeasured => "non mesurée",
     }
 }
 
@@ -875,7 +927,6 @@ pub(crate) fn flight_recommendation_label(r: FlightRecommendation) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::milestone_manager::evaluator::{CiKnowledge, CiUnreadCause};
     use crate::milestone_manager::pool::{
         PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause, assess_pool,
         assess_pool_sans_tailles,
@@ -1031,19 +1082,19 @@ mod tests {
         );
         assert!(
             out.contains(
-                "- mika#2693 — milestone cible — PR ouverte (#2696) — 83 tours (plafond non instrumenté) — merge-candidat"
+                "- mika#2693 — milestone cible — PR ouverte (#2696) — 83 tours (plafond non instrumenté) — CI non lue (non mesurée) — merge-candidat"
             ),
             "Obtenu :\n{out}"
         );
         assert!(
             out.contains(
-                "- mika#2661 — milestone cible — mort au plafond (budget_exhausted) — 200 tours — re-groom"
+                "- mika#2661 — milestone cible — mort au plafond (budget_exhausted) — 200 tours — CI non lue (non mesurée) — re-groom"
             ),
             "Obtenu :\n{out}"
         );
         assert!(
             out.contains(
-                "- mika#2655 — milestone cible — PR de sauvetage (#2690) — 141 tours (plafond non instrumenté) — reprise à la main"
+                "- mika#2655 — milestone cible — PR de sauvetage (#2690) — 141 tours (plafond non instrumenté) — CI non lue (non mesurée) — reprise à la main"
             ),
             "Obtenu :\n{out}"
         );
@@ -1101,7 +1152,8 @@ mod tests {
         assert!(
             out.contains(
                 "- (ticket inconnu) — milestone cible — mort — cause non classée (PLAN_COMMITTED) — \
-                 tours non lus (plafond non instrumenté) — reprise à la main"
+                 tours non lus (plafond non instrumenté) — CI non lue (non mesurée) — \
+                 reprise à la main"
             ),
             "Obtenu :\n{out}"
         );
@@ -1219,7 +1271,7 @@ mod tests {
         ));
         assert_eq!(
             hors,
-            "- mika#2900 — hors milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — état de PR non lu — merge-candidat",
+            "- mika#2900 — hors milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — état de PR non lu — CI non lue (non mesurée) — merge-candidat",
         );
 
         let dans = render_flight_verdict(&FlightVerdict {
@@ -1228,15 +1280,20 @@ mod tests {
         });
         assert_eq!(
             dans,
-            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — PR open — merge-candidat",
+            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — PR open — CI non lue (non mesurée) — merge-candidat",
         );
+        // L'aiguille **nomme son segment** depuis mika#2968 : « CI non lue »
+        // contient « non lu », donc un `contains("non lu")` nu rougirait sur la
+        // non-lecture de l'autre axe — un faux rouge qui ne dit rien de l'état
+        // de PR, le seul que ce test atteste.
         assert!(
-            !dans.contains("non lu"),
+            !dans.contains("état de PR non lu"),
             "un état lu ne se rend jamais comme non lu. Obtenu : {dans}"
         );
     }
 
-    /// « Lu, et vide » ne gagne **aucun** segment : cinq segments, pas six.
+    /// « Lu, et vide » ne gagne **aucun** segment d'état de PR : cinq segments
+    /// (six depuis mika#2968, qui a ajouté celui de la CI), pas celui-là.
     ///
     /// C'est ce qui laisse le rendu de la population d'avant mika#2921 intact —
     /// un segment vide serait du bruit sur chaque vol du milestone cible sans PR.
@@ -1248,10 +1305,12 @@ mod tests {
         });
         assert_eq!(
             ligne,
-            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — merge-candidat",
+            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — CI non lue (non mesurée) — merge-candidat",
         );
+        // Même raison que ci-dessus : l'aiguille nomme le segment d'état de PR,
+        // pas le mot « non lu » que la CI emploie désormais sur son propre axe.
         assert!(
-            !ligne.contains("PR open") && !ligne.contains("non lu"),
+            !ligne.contains("PR open") && !ligne.contains("état de PR non lu"),
             "aucun segment d'état quand l'état lu est vide. Obtenu : {ligne}"
         );
     }
