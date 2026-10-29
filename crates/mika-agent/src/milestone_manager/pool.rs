@@ -181,20 +181,49 @@ use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL, operator_
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
-/// Le mot qui ouvre une ligne de condition de réveil, décorations retirées.
+/// Le mot d'une ligne de condition de réveil, décorations retirées.
 ///
-/// Mesuré le 2026-10-29 sur les tickets ouverts du dépôt : cinq le portent, en
-/// **trois** orthographes — `> - **Condition de réveil :**` (#2854),
-/// `> **Condition de réveil :**` (#2472, #2117) et `**Condition de réveil : …**`
-/// (#2912, #2913), cette dernière sans blockquote et le deux-points **dans**
-/// l'emphase. D'où un test sur le mot seul, après normalisation des
-/// décorations : ni le deux-points ni l'emphase fermante n'en font partie.
+/// Recensé le 2026-10-29 sur les tickets du dépôt — treize corps ouverts et deux
+/// fermés le portent, en **sept** orthographes : `> - **Condition de réveil :**`
+/// (#2854), `> **Condition de réveil :**` (#2472, #2117),
+/// `**Condition de réveil : …**` (#2912, #2913, sans blockquote, le deux-points
+/// **dans** l'emphase), `## Condition de réveil (…)` (#2592, #2506 en `###`),
+/// `## Dormant : condition de réveil` (#2871),
+/// `> **Dormant, ouvert. Condition de réveil :**` (#1761, #1721) et
+/// `> - **Dormeur visible** … **condition de réveil datée et concrète :**`
+/// (#2262). D'où un test sur le mot seul, après normalisation des décorations :
+/// ni le deux-points ni l'emphase fermante n'en font partie.
+///
+/// Les quatre dernières orthographes sont celles que mika#2959 a ajoutées. Les
+/// trois premières étaient seules reconnues, et les sept corps qui emploient les
+/// autres entraient dans la relève à grommer sous le motif « plan groomé
+/// absent » — un motif faux, qui aurait fait groomer des dormants le jour de
+/// l'ouverture de `MIKA_MANAGER_GROOM_WRITE` (mika#2958).
 ///
 /// La ligne **n'a pas d'écrivain** dans ce dépôt — des humains l'écrivent à la
 /// main — ce qui est la raison pour laquelle la grammaire vit ici et non dans
 /// [`crate::plan_callout`], où un écrivain et un lecteur se tiennent par un test
-/// d'aller-retour (mika#2952 § 2.b).
+/// d'aller-retour (mika#2952 § 2.b). C'est aussi pourquoi le lecteur s'élargit
+/// sur ce qu'il mesure, et jamais sur ce qu'il voudrait qu'on écrive.
 pub(crate) const DORMANCY_MARKER: &str = "Condition de réveil";
+
+/// Les mots qui **ouvrent** une déclaration de dormance quand
+/// [`DORMANCY_MARKER`] n'est pas en tête de ligne, décorations retirées.
+///
+/// Mesurés : `Dormant` ouvre #2871 (`## Dormant : condition de réveil`), #1761
+/// et #1721 (`> **Dormant, ouvert. Condition de réveil :** …`) ; `Dormeur` ouvre
+/// #2262 (`> - **Dormeur visible** … **condition de réveil …**`). Comparés en
+/// **préfixe**, donc les flexions suivent (`Dormante`, `Dormants`) sans entrée
+/// supplémentaire.
+///
+/// **Ce n'est pas l'allowlist que mika#2309 condamne.** Une allowlist y est une
+/// liste de *valeurs tolérées* qui dispense de poser le prédicat ; ici la liste
+/// **est** le prédicat — la grammaire dit « une déclaration de dormance ouvre en
+/// nommant la dormance », et ces deux racines sont la forme française de ce
+/// nom. Elle ne contient aucun ticket, aucune condition, aucun corps : rien
+/// qu'un ticket neuf ferait expirer. Ce qui la ferait grandir, c'est une
+/// troisième racine mesurée, pas un dormant de plus.
+pub(crate) const DORMANCY_OPENERS: &[&str] = &["dormant", "dormeur"];
 
 /// Budget de citation de la condition, en **caractères**.
 ///
@@ -232,33 +261,91 @@ pub enum DormancyReading {
     Awake,
 }
 
+/// Où [`DORMANCY_MARKER`] commence dans `texte`, en **caractères**.
+///
+/// `Some(0)` quand le marqueur ouvre le texte, `Some(n)` quand il est ailleurs,
+/// `None` quand il est absent. La comparaison est caractère par caractère, casse
+/// ASCII ignorée : aucun octet n'est découpé, donc aucune frontière de caractère
+/// à risquer (garde `byte-slice-lint`, mika#764). L'index rendu est un index de
+/// **caractère**, consommable par `chars().skip(…)` et par rien d'autre — le
+/// passer à `&texte[n..]` couperait un `é` en deux.
+///
+/// Fonction plutôt que code inline parce que [`dormancy_reading`] en a besoin
+/// deux fois : pour savoir *si* le marqueur est là, et pour savoir *où* la
+/// citation commence.
+fn marker_char_position(texte: &str) -> Option<usize> {
+    let marqueur: Vec<char> = DORMANCY_MARKER.chars().collect();
+    let lu: Vec<char> = texte.chars().collect();
+    (0..=lu.len().checked_sub(marqueur.len())?).find(|&depart| {
+        marqueur
+            .iter()
+            .zip(&lu[depart..])
+            .all(|(attendu, c)| attendu.eq_ignore_ascii_case(c))
+    })
+}
+
 /// La dormance d'un corps d'issue — lecteur unique de [`DORMANCY_MARKER`].
 ///
-/// La normalisation des décorations de tête est **inline** : huit lignes de
-/// corps, un seul appelant, aucun second site à tenir en cohérence. Elle retire
-/// de façon répétée les espaces, `>`, `-`, `*` et `_`, ce qui couvre les trois
-/// orthographes mesurées sans allowlist de littéraux. Un `starts_with` sur
-/// `"**Condition de réveil :**"` en raterait la troisième, dont le deux-points
+/// La normalisation des décorations de tête est **inline** : un seul appelant,
+/// aucun second site à tenir en cohérence. Elle retire de façon répétée les
+/// espaces, `>`, `-`, `*`, `_` et `#`, ce qui couvre les sept orthographes
+/// mesurées sans allowlist de littéraux. Un `starts_with` sur
+/// `"**Condition de réveil :**"` en raterait celle de #2912, dont le deux-points
 /// est à l'intérieur de l'emphase.
 ///
-/// Un titre de section (`## Pourquoi ce ticket est bloqué — condition de
-/// réveil`, mesuré sur #2472) ne la satisfait pas : `#` n'est pas une
-/// décoration retirée, et le marqueur est testé **en tête** du texte restant.
+/// # La grammaire : deux portes, et un rang
+///
+/// Une ligne **déclare** une dormance si, décorations retirées, l'une des deux
+/// portes s'ouvre :
+///
+/// 1. le marqueur est en **tête** (`Condition de réveil :** quand …`, #2854) ;
+/// 2. la ligne ouvre sur un [`DORMANCY_OPENERS`] **et** porte le marqueur
+///    ailleurs (`Dormant, ouvert. Condition de réveil :** …`, #1761).
+///
+/// Le marqueur en milieu de ligne n'est **jamais** accepté seul, et c'est
+/// l'arbitrage central de mika#2959 : ce ticket-là décrit la dormance d'autrui
+/// en prose et en table, et un lecteur qui prendrait le marqueur n'importe où
+/// retirerait du bassin, sous le motif « dormant », le ticket actionnable qui
+/// corrige ce lecteur. L'ouvreur est ce qui sépare une déclaration d'une
+/// mention — mesuré, pas supposé : #2871 l.3 (`> **Redémarrage : …** … C'est la
+/// condition de réveil.`) et #2506 l.5 (`… **DORMANT** — voir Condition de
+/// réveil en bas.`) sont deux mentions qu'il refuse.
+///
+/// Un **titre** de section (`#`) n'est pas exclu — #2592 et #2871 déclarent leur
+/// dormance en titre, #2506 n'a que ça — mais il cède : un titre ne rend sa
+/// condition que si aucune ligne non-titre n'en déclare une. Sur #2592 le titre
+/// l.60 (`## Condition de réveil (orchestrateur, 2026-10-17)`) précède la
+/// déclaration l.62, et c'est la seconde que l'opérateur doit lire dans le
+/// rapport du sink. D'où deux rangs : rang 0 pour une déclaration hors titre,
+/// qui sort immédiatement ; rang 1 pour tout le reste, retenu et rendu en
+/// dernier recours.
 pub(crate) fn dormancy_reading(body: &str) -> DormancyReading {
+    let mut rang_1: Option<String> = None;
     for ligne in body.lines() {
-        let texte = ligne
-            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '>' | '-' | '*' | '_'));
-        // Égalité caractère par caractère, casse ASCII ignorée : aucun octet
-        // n'est découpé, donc aucune frontière de caractère à risquer.
-        let ouvre_sur_le_marqueur = texte.chars().count() >= DORMANCY_MARKER.chars().count()
-            && DORMANCY_MARKER
-                .chars()
-                .zip(texte.chars())
-                .all(|(attendu, lu)| attendu.eq_ignore_ascii_case(&lu));
-        if !ouvre_sur_le_marqueur {
+        // Mesuré **avant** la normalisation, qui retire précisément le `#`.
+        let est_un_titre = ligne.trim_start().starts_with('#');
+        let texte = ligne.trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '>' | '-' | '*' | '_' | '#')
+        });
+        let Some(position) = marker_char_position(texte) else {
+            continue;
+        };
+        let porte_1 = position == 0;
+        let porte_2 = DORMANCY_OPENERS.iter().any(|ouvreur| {
+            texte.chars().count() >= ouvreur.chars().count()
+                && ouvreur
+                    .chars()
+                    .zip(texte.chars())
+                    .all(|(attendu, lu)| attendu.eq_ignore_ascii_case(&lu))
+        });
+        if !porte_1 && !porte_2 {
             continue;
         }
-        let citee = texte.trim_end();
+        // La citation commence **au marqueur** : sur #2262 elle laisse dehors
+        // `Dormeur visible** (règle ratifiée 2026-09-01) —`, qui n'est pas la
+        // condition. Index en caractères, jamais en octets (mika#764).
+        let citee: String = texte.chars().skip(position).collect();
+        let citee = citee.trim_end();
         let condition = if citee.chars().count() > DORMANCY_CONDITION_BUDGET {
             let mut coupee: String = citee.chars().take(DORMANCY_CONDITION_BUDGET).collect();
             coupee.push('…');
@@ -266,9 +353,19 @@ pub(crate) fn dormancy_reading(body: &str) -> DormancyReading {
         } else {
             citee.to_string()
         };
-        return DormancyReading::Dormant { condition };
+        if porte_1 && !est_un_titre {
+            return DormancyReading::Dormant { condition };
+        }
+        // Rang 1, premier gagnant : un titre ou une porte 2 attend qu'aucune
+        // déclaration de rang 0 ne se présente plus loin dans le corps.
+        if rang_1.is_none() {
+            rang_1 = Some(condition);
+        }
     }
-    DormancyReading::Awake
+    match rang_1 {
+        Some(condition) => DormancyReading::Dormant { condition },
+        None => DormancyReading::Awake,
+    }
 }
 
 /// Ce qu'il faut savoir d'un ticket pour décider s'il entre au bassin — et rien
@@ -2368,6 +2465,128 @@ mod tests {
         "## Le défaut\n",
     );
 
+    /// #2592 — le titre `## Condition de réveil (orchestrateur, 2026-10-17)`
+    /// (l.60) **suivi** de la déclaration (l.62). La paire *est* le corps,
+    /// parce que c'est elle qui mesure le rang (mika#2959 § 2.3) : le titre
+    /// vient d'abord, et la déclaration seule porte la condition que
+    /// l'opérateur doit lire.
+    ///
+    /// La l.62 réelle continue (« Cette ligne reprend le paragraphe ci-dessous
+    /// sans le changer. Elle a été ajoutée le 2026-10-29 … ») ; elle est
+    /// abrégée ici à sa première phrase, comme [`CORPS_DORMANT_2912`], pour que
+    /// la condition attendue s'écrive en entier sous le budget. La coupe au
+    /// budget est mesurée par la dernière assertion du test 1.
+    const CORPS_DORMANT_2592: &str = concat!(
+        "## Condition de réveil (orchestrateur, 2026-10-17)\n",
+        "\n",
+        "> **Condition de réveil :** quand la fenêtre S2 de 30 jours est close, ",
+        "au plus tôt le 2026-11-01.\n",
+    );
+
+    /// #2871 — le titre `## Dormant : condition de réveil` (l.11), où le
+    /// marqueur n'est **pas** en tête, suivi de sa déclaration (l.13). Même
+    /// raison que #2592 : la paire mesure le rang.
+    ///
+    /// La l.3 est reprise en tête parce qu'elle porte le marqueur en fin de
+    /// phrase (« C'est la condition de réveil. ») derrière un ouvreur qui n'en
+    /// est pas un : si le lecteur acceptait le marqueur **n'importe où**, la
+    /// citation sortirait de là. Elle est abrégée en son milieu (la ligne réelle
+    /// nomme les deux PR contenues dans le binaire) ; sa tête et sa queue sont
+    /// mot pour mot. La l.13 est abrégée à sa première phrase comme #2592.
+    const CORPS_DORMANT_2871: &str = concat!(
+        "> **Redémarrage : 2026-10-23 à 13:01:03Z**, sur 94b21916. ",
+        "C'est la condition de réveil.\n",
+        "\n",
+        "## Dormant : condition de réveil\n",
+        "\n",
+        "> **Condition de réveil :** 7 jours après le redémarrage du moteur sur ",
+        "un binaire qui contient #2870, soit le 2026-10-30 à 13:01Z.\n",
+    );
+
+    /// #1761 (l.9) — le marqueur en **milieu de ligne**, derrière l'ouvreur
+    /// `Dormant`. C'est l'orthographe que l'arbitrage du § 2.1 de mika#2959
+    /// accepte, et seulement derrière un ouvreur.
+    ///
+    /// La l.7 du corps réel — une déclaration ordinaire ajoutée le 2026-10-29 —
+    /// est délibérément **absente** : elle satisfait la porte 1, qui existait
+    /// déjà, et la laisser ici ferait sortir le test en rang 0 sans que la
+    /// porte 2 soit jamais exercée. La ligne est abrégée à sa première phrase.
+    const CORPS_DORMANT_1761: &str = concat!(
+        "> **Dormant, ouvert. Condition de réveil :** Vincent ou Prime écrit ",
+        "dans ce ticket la forme retenue (« via le pilote » ou un canal nommé).\n",
+    );
+
+    /// #2262 (l.1) — l'ouvreur `Dormeur` et le marqueur **en minuscules**, au
+    /// milieu de la ligne. La citation commence donc au marqueur et laisse
+    /// `Dormeur visible** (règle ratifiée 2026-09-01) —` dehors.
+    ///
+    /// Le parenthétique final de la ligne réelle (« (le seul chemin d'escalade
+    /// pour cette classe MITM). ») est abrégé en un point, pour la raison de
+    /// #2592 : la condition attendue doit s'écrire entière sous le budget.
+    ///
+    /// Ce ticket porte `operator-gated`, donc `OperatorHeld` mord **avant** sa
+    /// dormance (`mika2952_un_ticket_tenu_et_dormant_lit_dabord_le_label`) :
+    /// son arbitrage au bassin ne change pas, ce qui change c'est que le motif
+    /// cesse d'être faux en amont.
+    const CORPS_DORMANT_2262: &str = concat!(
+        "> - **Dormeur visible** (règle ratifiée 2026-09-01) — **condition de ",
+        "réveil datée et concrète :** *quand l'opérateur (Vincent/sami) arbitre ",
+        "l'édition du bras de refus de `crates/mika-agent/src/server/auth.rs`*.\n",
+        "> - **Companion :** suite de mika#1949 / PR#2124.\n",
+    );
+
+    /// #2506 (fermé) — `### Condition de réveil (datée, concrète)` **seul** : sa
+    /// condition vit sur les lignes suivantes, sous des puces numérotées. C'est
+    /// le corps qui interdit de refuser les titres en bloc, et le cas où le
+    /// **rang 1** doit sortir faute de déclaration ailleurs.
+    ///
+    /// La l.5 est reprise parce qu'elle porte `**DORMANT**` et le marqueur, tous
+    /// deux en milieu de ligne derrière `Enfant` : elle doit être refusée, sans
+    /// quoi la citation en sortirait. C'est aussi ce qui dit que l'ouvreur est
+    /// testé en **préfixe** et non n'importe où.
+    const CORPS_DORMANT_2506: &str = concat!(
+        "> **Enfant 8 de #2491** (umbrella substrat nuit 2026-09-22). ",
+        "**DORMANT** — voir Condition de réveil en bas. Ne PAS poser `ready` ",
+        "tant que la condition n'est pas remplie.\n",
+        "\n",
+        "### Condition de réveil (datée, concrète)\n",
+        "Réveiller (retirer DORMANT, groomer, poser `ready`) dès **l'un** de :\n",
+    );
+
+    /// #2872 (fermé, **réveillé** le 2026-10-22) — l'historique, l.17 et l.36.
+    ///
+    /// Le faux positif que l'AC2 de mika#2959 demande de contrôler, et il est
+    /// mesuré : un lecteur qui accepterait tout titre contenant le marqueur
+    /// lirait ce ticket réveillé comme dormant.
+    const CORPS_REVEILLE_2872: &str = concat!(
+        "## Réveillé le 2026-10-22 (ancienne condition de réveil)\n",
+        "\n",
+        "## Ce qu'il faut faire au réveil\n",
+    );
+
+    /// #2959 — un ticket qui **décrit la dormance d'autrui**, en prose et en
+    /// table. C'est le second faux positif de l'AC2, et c'est l'argument qui
+    /// tranche la question que l'AC1 laissait ouverte : un lecteur qui
+    /// accepterait le marqueur **n'importe où** endormirait ce ticket-ci —
+    /// `p1-important`, actionnable, et qui corrige précisément ce lecteur.
+    ///
+    /// Les deux dernières lignes de table citent une forme de porte 2
+    /// (`Dormant : condition de réveil`, `Dormant, ouvert. Condition de
+    /// réveil :`). Elles restent refusées parce que `|` n'est pas une
+    /// décoration de tête retirée : le texte ouvre sur `| #2871 |`.
+    const CORPS_CITE_LA_DORMANCE_DAUTRUI_2959: &str = concat!(
+        "Le lecteur de dormance du bassin (`pool::dormancy_reading`, mika#2952 ",
+        "vol 2) ne reconnaît qu'une orthographe. La ligne doit **commencer** ",
+        "par `Condition de réveil`, une fois retirés `>`, `-`, `*` et `_`.\n",
+        "\n",
+        "| #2592 | `## Condition de réveil (orchestrateur, 2026-10-17)` | ",
+        "C'est un titre de section : `#` n'est pas retiré. |\n",
+        "| #2871 | `## Dormant : condition de réveil` | C'est un titre, et le ",
+        "marqueur n'est pas en tête. |\n",
+        "| #1761 | `> **Dormant, ouvert. Condition de réveil :** …` | Le ",
+        "marqueur est en milieu de ligne. |\n",
+    );
+
     /// **Test 1** — le corpus mesuré, en table : les trois orthographes rendent
     /// `Dormant` avec leur condition citée, et un corps sans marqueur rend
     /// `Awake`.
@@ -2412,9 +2631,12 @@ mod tests {
             DormancyReading::Awake
         );
 
-        // Le titre de section de #2472, **seul** : `#` n'est pas une décoration
-        // retirée, donc une section qui *parle* de la condition n'endort pas le
-        // ticket. C'est la frontière qui sépare la prose du marqueur.
+        // Le titre de section de #2472, **seul** : il ouvre sur `Pourquoi`, donc
+        // ni le marqueur ni un ouvreur de dormance n'y est en tête. Une section
+        // qui *parle* de la condition n'endort pas le ticket. C'est la frontière
+        // qui sépare la prose du marqueur, et mika#2959 l'a déplacée sans la
+        // supprimer : un titre qui **ouvre** sur le marqueur, lui, déclare
+        // (`CORPS_DORMANT_2506`).
         assert_eq!(
             dormancy_reading(
                 "## Pourquoi ce ticket est `blocked` — condition de réveil (2026-09-22)\n"
@@ -2441,16 +2663,115 @@ mod tests {
         );
     }
 
+    /// **Test 1 bis (AC1 de mika#2959)** — les orthographes mesurées que le
+    /// lecteur ratait rendent `Dormant`, avec la condition de la **déclaration**.
+    ///
+    /// La condition attendue n'est jamais celle du titre quand une déclaration
+    /// existe sur une autre ligne (#2592, #2871) : c'est elle que l'opérateur
+    /// doit lire dans le rapport du sink, et c'est ce que mesure le système de
+    /// rangs. Quand la déclaration *est* le titre (#2506), le rang 1 sort.
+    ///
+    /// Un seul test paramétré, pour la raison du test 1 : les cinq cas
+    /// interrogent la même frontière — ce qui fait d'une ligne une déclaration
+    /// de dormance plutôt qu'une mention du mot.
+    #[test]
+    fn mika2959_les_orthographes_mesurees_de_dormance_sont_lues() {
+        for (ticket, corps, condition_attendue) in [
+            (
+                "#2592 (titre puis déclaration : la déclaration gagne)",
+                CORPS_DORMANT_2592,
+                "Condition de réveil :** quand la fenêtre S2 de 30 jours est close, \
+                 au plus tôt le 2026-11-01.",
+            ),
+            (
+                "#2871 (titre sans marqueur en tête, puis déclaration)",
+                CORPS_DORMANT_2871,
+                "Condition de réveil :** 7 jours après le redémarrage du moteur sur \
+                 un binaire qui contient #2870, soit le 2026-10-30 à 13:01Z.",
+            ),
+            (
+                "#1761 (marqueur en milieu de ligne, derrière `Dormant`)",
+                CORPS_DORMANT_1761,
+                "Condition de réveil :** Vincent ou Prime écrit dans ce ticket la \
+                 forme retenue (« via le pilote » ou un canal nommé).",
+            ),
+            (
+                "#2262 (ouvreur `Dormeur`, marqueur en minuscules)",
+                CORPS_DORMANT_2262,
+                "condition de réveil datée et concrète :** *quand l'opérateur \
+                 (Vincent/sami) arbitre l'édition du bras de refus de \
+                 `crates/mika-agent/src/server/auth.rs`*.",
+            ),
+            (
+                "#2506 (le titre *est* la déclaration : rang 1)",
+                CORPS_DORMANT_2506,
+                "Condition de réveil (datée, concrète)",
+            ),
+        ] {
+            assert_eq!(
+                dormancy_reading(corps),
+                DormancyReading::Dormant {
+                    condition: condition_attendue.to_string(),
+                },
+                "{ticket} doit se lire dormant, et citer la ligne qui le déclare"
+            );
+        }
+    }
+
+    /// **Test 1 ter (AC2 de mika#2959)** — citer une condition de réveil n'est
+    /// pas en déclarer une.
+    ///
+    /// Les trois corps sont mesurés, et chacun porte un faux positif distinct :
+    /// l'historique d'un ticket réveillé (#2872), un ticket qui décrit la
+    /// dormance d'autrui en prose et en table (#2959), et un titre qui nomme le
+    /// marqueur sans ouvrir dessus (#2472). Le second est l'argument qui
+    /// tranche l'arbitrage laissé ouvert par l'AC1 : accepter le marqueur
+    /// n'importe où endormirait le ticket qui corrige ce lecteur.
+    ///
+    /// C'est le contrôle que mika#2205 réclame — deux populations sous un nom —
+    /// et il est ici du côté cher : un faux positif retire du bassin un ticket
+    /// actionnable, sous un motif faux.
+    #[test]
+    fn mika2959_une_citation_de_condition_nest_pas_une_declaration_de_dormance() {
+        for (cas, corps) in [
+            (
+                "#2872, réveillé le 2026-10-22 : son historique garde le mot",
+                CORPS_REVEILLE_2872,
+            ),
+            (
+                "#2959, qui décrit la dormance d'autrui",
+                CORPS_CITE_LA_DORMANCE_DAUTRUI_2959,
+            ),
+            (
+                "#2472, dont un titre nomme le marqueur sans ouvrir dessus",
+                "## Pourquoi ce ticket est `blocked` — condition de réveil (2026-09-22)\n",
+            ),
+        ] {
+            assert_eq!(
+                dormancy_reading(corps),
+                DormancyReading::Awake,
+                "{cas} : une mention n'est pas une déclaration, et le lecteur ne \
+                 retire pas un ticket actionnable du bassin sur ce motif"
+            );
+        }
+    }
+
     /// **Livrée vide, et elle le reste** — l'exception nommée de la
     /// Fire-Disposition de mika#2952 vol 2/2, forme mika#2425 / mika#1833, et
     /// sœur de `MIKA2952_CORPUS_EXCEPTIONS` que le vol 1 a posée vide.
     ///
     /// Corps de la population dormante qui **échappent** au prédicat du § 1.b.
-    /// Vide au 2026-10-29 : le recensement des tickets ouverts porteurs du
-    /// marqueur rend exactement cinq corps (#2117, #2472, #2854, #2912, #2913),
-    /// et les trois orthographes qu'ils emploient sont toutes couvertes par le
-    /// test ci-dessus. Une entrée ici nomme le corps précis, la raison, et son
-    /// ticket de suivi.
+    ///
+    /// Vide au 2026-10-29, et elle le reste après mika#2959. Le recensement de
+    /// ce jour (plan de mika#2959 § 1.2) rend **treize** corps ouverts porteurs
+    /// du marqueur, plus deux fermés, en **sept** orthographes — contre cinq
+    /// corps et trois orthographes au recensement de mika#2952, qui ne comptait
+    /// que ce que le lecteur d'alors savait lire. Les sept sont couvertes par les
+    /// deux tests ci-dessus : #2854 / #2472 / #2117 / #2912 / #2913 par le
+    /// test 1, #2592 / #2871 / #1761 / #2262 / #2506 par le test 1 bis, et #1721
+    /// partage l'orthographe de #1761.
+    ///
+    /// Une entrée ici nomme le corps précis, la raison, et son ticket de suivi.
     const MIKA2952_DORMANCY_EXCEPTIONS: &[(&str, &str)] = &[];
 
     /// L'assertion auto-nettoyante de l'allowlist ci-dessus : une entrée dont le
