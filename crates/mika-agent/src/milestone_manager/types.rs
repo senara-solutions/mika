@@ -258,6 +258,47 @@ pub struct RecentActivity {
     pub subject: String,
 }
 
+/// Ce que la lecture des tickets du milestone a rendu, face à ce qu'elle
+/// demandait et à ce que l'API du milestone annonce (mika#2969).
+///
+/// Un seul champ sur [`MilestoneState`] plutôt que trois : les trois nombres ne
+/// se lisent qu'ensemble. `returned` seul ne dit pas s'il manque quelque chose,
+/// `limit` seul ne dit rien du tout, et `api_item_total` seul ne se compare à
+/// rien. La complétude est un prédicat sur le couple, pas une valeur stockée —
+/// voir [`Self::truncated`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MilestoneReadAudit {
+    /// Nombre de tickets que l'appel 2 a rendus.
+    pub returned: usize,
+    /// Borne que cet appel a demandée — [`super::reader::MILESTONE_READ_LIMIT`]
+    /// au moment de la lecture. Transportée plutôt que relue à la constante :
+    /// un blob du puits hors-ligne doit se relire avec la borne qui l'a produit,
+    /// pas avec celle du binaire qui le relit.
+    pub limit: usize,
+    /// `open_issues + closed_issues` de l'appel 1, l'API du milestone.
+    ///
+    /// **Ce n'est pas la même population que [`Self::returned`]** : l'API compte
+    /// les *items* du milestone, PR comprises, là où `gh issue list` ne rend que
+    /// les *issues*. L'écart entre les deux vaut le nombre de PR du milestone —
+    /// structurel, permanent, et sans pouvoir de détection (classe mika#2205).
+    /// Il se rapporte parce qu'il se lit au rapport, jamais comme signal de
+    /// troncature : ce signal-là est [`Self::truncated`], exact par
+    /// construction.
+    pub api_item_total: u64,
+}
+
+impl MilestoneReadAudit {
+    /// La page était-elle pleine, donc des tickets potentiellement restés
+    /// dehors ?
+    ///
+    /// Dérivé plutôt que stocké, sur le patron de
+    /// [`SubIssue::is_in_flight`] : deux champs ne peuvent pas se contredire
+    /// quand l'un se calcule depuis les autres.
+    pub fn truncated(&self) -> bool {
+        self.returned >= self.limit
+    }
+}
+
 /// The composed milestone state — output of `Reader::read`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MilestoneState {
@@ -332,6 +373,23 @@ pub struct MilestoneState {
     /// l'autre.
     #[serde(default)]
     pub plan_sizes: BTreeMap<u64, PlanSizeReading>,
+    /// Ce que la lecture des tickets du milestone a rendu, face à sa borne et au
+    /// compte de l'API (mika#2969).
+    ///
+    /// `Option`, et non la structure nue : `None` dit « la question n'a pas été
+    /// posée » — blob du puits hors-ligne antérieur au champ, ou binaire
+    /// antérieur à ce vol. Le motif est celui de mika#2331 et de
+    /// [`Self::outside_read_truncated`] : un audit par défaut affirmerait une
+    /// mesure qui n'a pas eu lieu, et un `returned: 0, limit: 0` se lirait
+    /// « complète ». Le rapport ne dit alors **rien** plutôt que de dire faux.
+    ///
+    /// Sur [`MilestoneReadAudit::truncated`] vrai, [`Self::sub_issues`] n'est
+    /// **pas** vidée — contrairement à [`Self::outside_candidates`]. La lecture
+    /// du milestone est une énumération : partielle, elle informe encore. La
+    /// lecture hors milestone est un classement : partiel, il répond faux. On
+    /// rapporte, on ne refuse pas.
+    #[serde(default)]
+    pub milestone_read_audit: Option<MilestoneReadAudit>,
 }
 
 /// Severity classification for an assessment. Drives escalation routing.

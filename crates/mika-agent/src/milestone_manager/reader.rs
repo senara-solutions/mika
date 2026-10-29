@@ -1148,6 +1148,11 @@ pub fn compose_from_gh_outputs(
         // bassin et du dehors, qu'on n'a pas ici. Vide, donc « non mesuré » pour
         // chaque candidat — jamais « de taille nulle ».
         plan_sizes: BTreeMap::new(),
+        // Idem pour l'audit de la lecture (mika#2969) : il a besoin de la borne
+        // qu'a demandée l'appel 2, que cette fonction ne reçoit pas. Posé après
+        // composition par `compose_read_audit`. `None` et non un audit à zéro :
+        // un `returned: 0, limit: 0` se lirait « complète » (mika#2331).
+        milestone_read_audit: None,
     })
 }
 
