@@ -2606,4 +2606,147 @@ mod tests {
             "contrôle négatif : le candidat non gaté y est, lui :\n{ligne_admis}"
         );
     }
+
+    // -- mika#2968 : le rapport dit la CI sur laquelle il s'appuie (AC3) --
+
+    /// AC3 — les huit libellés, et l'instant de lecture avec eux.
+    ///
+    /// Les quatre états **lus** portent « lue au cycle de <instant> », et non
+    /// « lue à <instant> » : l'instant est `ctx.now`, capturé après le
+    /// `reader.read()` du cycle, donc il majore la lecture. Les quatre causes de
+    /// non-lecture sont nommées séparément parce qu'elles n'appellent pas la
+    /// même action — « PR hors liste du milestone » est le trou amont du
+    /// ticket, « non mesurée » est un rapport antérieur au champ.
+    #[test]
+    fn mika2968_ac3_le_rapport_nomme_letat_ci_et_linstant_de_la_lecture() {
+        let au_cycle_de = "2026-10-29T17:46:12Z";
+        let rendu = |ci: CiKnowledge| {
+            let mut v = verdict(
+                Some(2963),
+                FlightIssue::PrOpened {
+                    number: Some(2966),
+                    url: None,
+                },
+                Some(83),
+                false,
+                FlightRecommendation::MergeCandidate,
+            );
+            v.ci = ci;
+            render_flight_verdict(&v)
+        };
+        let lue = |etat: CiState| CiKnowledge::Read {
+            state: etat,
+            at: au_cycle_de.to_string(),
+        };
+
+        for (ci, attendu) in [
+            (
+                lue(CiState::Success),
+                "CI verte (lue au cycle de 2026-10-29T17:46:12Z)",
+            ),
+            (
+                lue(CiState::Failed),
+                "CI rouge (lue au cycle de 2026-10-29T17:46:12Z)",
+            ),
+            (
+                lue(CiState::Pending),
+                "CI en cours (lue au cycle de 2026-10-29T17:46:12Z)",
+            ),
+            (
+                lue(CiState::None),
+                "CI sans check (lue au cycle de 2026-10-29T17:46:12Z)",
+            ),
+            (
+                CiKnowledge::Unread(CiUnreadCause::NotFromPrList),
+                "CI non lue (PR hors liste du milestone)",
+            ),
+            (
+                CiKnowledge::Unread(CiUnreadCause::NoSubIssue),
+                "CI non lue (aucune sous-issue appariée)",
+            ),
+            (
+                CiKnowledge::Unread(CiUnreadCause::NoIssueNumber),
+                "CI non lue (vol sans ticket)",
+            ),
+            (
+                CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+                "CI non lue (non mesurée)",
+            ),
+        ] {
+            let ligne = rendu(ci);
+            assert!(
+                ligne.contains(attendu),
+                "la ligne du vol doit porter « {attendu} » :\n{ligne}"
+            );
+        }
+    }
+
+    /// « Sans check » n'est pas « non lue », et le rendu ne les confond pas.
+    ///
+    /// C'est la frontière que l'AC3 nomme : une lecture qui a abouti et n'a
+    /// trouvé aucun check est un fait sur la PR ; une non-lecture est un fait
+    /// sur l'instrument. Les rendre par les mêmes octets ferait des deux
+    /// populations une seule (classe mika#2205) — et puisque « CI sans check »
+    /// ne s'oppose pas au merge, la confusion irait dans le sens où une CI non
+    /// lue passerait pour mergeable sans réserve.
+    #[test]
+    fn mika2968_une_ci_sans_check_ne_se_rend_jamais_comme_non_lue() {
+        let mut v = verdict(
+            Some(2963),
+            FlightIssue::PrOpened {
+                number: Some(2966),
+                url: None,
+            },
+            Some(83),
+            false,
+            FlightRecommendation::MergeCandidate,
+        );
+        v.ci = CiKnowledge::Read {
+            state: CiState::None,
+            at: "2026-10-29T17:46:12Z".into(),
+        };
+        let ligne = render_flight_verdict(&v);
+        assert!(
+            !ligne.contains("CI non lue"),
+            "une lecture aboutie ne se rend jamais comme non lue :\n{ligne}"
+        );
+        assert!(ligne.contains("CI sans check"), "{ligne}");
+    }
+
+    /// Le segment CI ne s'omet **jamais**, sur aucune des quatre issues.
+    ///
+    /// L'omettre pour une non-lecture ferait de « rien n'a été lu » et de « ce
+    /// rapport est antérieur au champ » les mêmes octets, et le silence serait
+    /// alors le seul endroit où une CI non lue pourrait passer pour verte.
+    #[test]
+    fn mika2968_le_segment_ci_ne_somet_sur_aucune_issue() {
+        for issue in [
+            FlightIssue::PrOpened {
+                number: Some(2966),
+                url: None,
+            },
+            FlightIssue::RescuePr {
+                number: Some(2690),
+                url: None,
+            },
+            FlightIssue::Dead {
+                cause: DeathCause::CeilingReached,
+            },
+            FlightIssue::NotAFlight {
+                reason: NotFlightReason::GroomCompleted,
+            },
+        ] {
+            let ligne = render_flight_verdict(&verdict(
+                Some(2963),
+                issue.clone(),
+                Some(83),
+                false,
+                FlightRecommendation::Nothing,
+            ));
+            assert!(
+                ligne.contains("CI non lue (non mesurée)"),
+                "le segment CI est le seul qui ne s'omette jamais :\n{ligne}"
+            );
+        }
+    }
 }

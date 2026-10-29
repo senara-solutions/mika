@@ -1518,4 +1518,201 @@ mod tests {
             ]
         );
     }
+
+    // ---- mika#2968 : la CI entre dans la recommandation ------------------
+
+    /// Le rollup **mesuré** de mika#2966 à 17:46:12Z, réduit au check qui
+    /// décide. Pas un littéral inventé : `Egress Manifest Lint` est le job
+    /// 123624936407 du run 40924115345, terminé en `failure` à 17:44:16Z — 116 s
+    /// avant le verdict de la ligne 805100 d'`audit_events`, qui a tout de même
+    /// recommandé « merge-candidat ». Le second check dit que la PR n'était pas
+    /// rouge de bout en bout : un seul check suffisait.
+    fn rollup_2966_mesure() -> serde_json::Value {
+        serde_json::json!([
+            { "name": "Egress Manifest Lint", "status": "COMPLETED", "conclusion": "FAILURE" },
+            { "name": "Check", "status": "COMPLETED", "conclusion": "SUCCESS" }
+        ])
+    }
+
+    /// AC2 — les douze cellules dans **un** appel, parce qu'une matrice éclatée
+    /// en douze tests ne dit pas qu'elle est exhaustive.
+    ///
+    /// Le cas « rouge et ouverte » — celui du vol 4f1fe163 — ne part pas d'un
+    /// `CiState::Failed` écrit à la main : il traverse
+    /// [`crate::milestone_manager::reader::classify_ci_state`], le lecteur de
+    /// production, depuis le rollup mesuré de mika#2966. Un littéral aurait
+    /// attesté la décision sans attester que le rollup réel y mène, et c'est
+    /// exactement l'articulation qui manquait.
+    #[test]
+    fn mika2968_ac2_la_matrice_ci_x_etat_de_pr_decide_la_recommandation() {
+        let rouge_mesuree =
+            crate::milestone_manager::reader::classify_ci_state(&rollup_2966_mesure());
+        assert_eq!(
+            rouge_mesuree,
+            CiState::Failed,
+            "le rollup mesuré de mika#2966 se réduit en CI rouge : si ce n'est \
+             plus le cas, la cellule rouge de la matrice ne teste plus rien"
+        );
+
+        let pr_du_vol = FlightIssue::PrOpened {
+            number: Some(2966),
+            url: None,
+        };
+        let lue = |etat: CiState| CiKnowledge::Read {
+            state: etat,
+            at: AU_CYCLE_DE.to_string(),
+        };
+
+        let matrice: Vec<(&str, PrStateKnowledge, CiKnowledge, FlightRecommendation)> = vec![
+            // --- PR encore ouverte : la CI décide ---
+            (
+                "verte + ouverte",
+                lu(Some("open")),
+                lue(CiState::Success),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "rouge mesurée (#2966) + ouverte",
+                lu(Some("open")),
+                lue(rouge_mesuree.clone()),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "en cours + ouverte",
+                lu(Some("open")),
+                lue(CiState::Pending),
+                // Le verdict est écrit ~2 min après l'ouverture, pendant que la
+                // CI tourne (pour #2966 le run a fini à 17:57:56Z). « En cours »
+                // n'est donc pas un refus : c'est l'état nominal au moment du
+                // verdict, et le rapport le dit à côté de la recommandation.
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "sans check + ouverte",
+                lu(Some("open")),
+                lue(CiState::None),
+                // Une lecture qui a abouti et n'a trouvé aucun check. Rien ne
+                // s'oppose au merge — et surtout, ce n'est pas une non-lecture.
+                FlightRecommendation::MergeCandidate,
+            ),
+            // --- PR fusionnée ou fermée : l'état de PR décide, quelle que soit
+            //     la CI. Le bras est **avant** le bras CI dans `recommend`.
+            (
+                "verte + fusionnée",
+                lu(Some("merged")),
+                lue(CiState::Success),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "rouge + fusionnée",
+                lu(Some("merged")),
+                lue(CiState::Failed),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "en cours + fermée",
+                lu(Some("closed")),
+                lue(CiState::Pending),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "sans check + fermée",
+                lu(Some("closed")),
+                lue(CiState::None),
+                FlightRecommendation::ManualResumption,
+            ),
+            // --- Les quatre non-lectures, PR ouverte. Aucune ne bascule la
+            //     recommandation : une CI non lue n'est pas une CI rouge. Elle
+            //     n'est pas non plus une CI verte — c'est le rapport qui porte
+            //     la différence (AC3), jamais la recommandation seule.
+            (
+                "non lue (PR hors liste du milestone) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NotFromPrList),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "non lue (aucune sous-issue appariée) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NoSubIssue),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "non lue (vol sans ticket) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NoIssueNumber),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "non lue (non mesurée) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+                FlightRecommendation::MergeCandidate,
+            ),
+        ];
+
+        assert_eq!(
+            matrice.len(),
+            12,
+            "la matrice de l'AC2 compte douze cellules"
+        );
+
+        for (nom, pr_state, ci, attendu) in &matrice {
+            assert_eq!(
+                &recommend(&pr_du_vol, pr_state, ci),
+                attendu,
+                "cellule « {nom} »"
+            );
+        }
+    }
+
+    /// Le contrôle négatif de la cellule rouge : **même** vol, **même** état de
+    /// PR, seule la couleur change. Sans lui, la matrice resterait verte le jour
+    /// où `recommend` rendrait `ManualResumption` pour tout vol `PrOpened` —
+    /// elle attesterait alors la panne d'un axe, pas sa lecture.
+    #[test]
+    fn mika2968_ac1_seule_la_couleur_separe_les_deux_recommandations() {
+        let vol = FlightIssue::PrOpened {
+            number: Some(2966),
+            url: None,
+        };
+        let ouverte = lu(Some("open"));
+        let ci = |etat: CiState| CiKnowledge::Read {
+            state: etat,
+            at: AU_CYCLE_DE.to_string(),
+        };
+
+        assert_eq!(
+            recommend(&vol, &ouverte, &ci(CiState::Failed)),
+            FlightRecommendation::ManualResumption
+        );
+        assert_eq!(
+            recommend(&vol, &ouverte, &ci(CiState::Success)),
+            FlightRecommendation::MergeCandidate
+        );
+    }
+
+    /// Un blob de verdict antérieur au champ `ci` se relit en « non mesurée »,
+    /// jamais en CI verte (mika#2331 : l'absence n'est pas zéro). C'est le
+    /// défaut de production qui est éprouvé ici — le seul endroit du module où
+    /// `default_unread` est appelé par un test plutôt que contourné.
+    #[test]
+    fn mika2968_un_verdict_anterieur_au_champ_se_relit_en_non_mesuree() {
+        let ancien = r#"{
+            "task_id": "4f1fe163-a7a2-442d-ba70-56e343470dba",
+            "agent_id": "mika-dev",
+            "issue_number": 2963,
+            "issue": { "pr_opened": { "number": 2966, "url": null } },
+            "turns_used": 83,
+            "hit_ceiling": false,
+            "turn_ceiling": 200,
+            "last_commit_turn": null,
+            "pr_state": "not_read",
+            "recommendation": "merge_candidate",
+            "evidence": []
+        }"#;
+        let v: FlightVerdict = serde_json::from_str(ancien).expect("un blob antérieur se relit");
+        assert_eq!(v.ci, CiKnowledge::Unread(CiUnreadCause::NotMeasured));
+        assert_eq!(v.ci, CiKnowledge::default_unread());
+    }
 }

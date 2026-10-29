@@ -1332,6 +1332,7 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use crate::milestone_manager::evaluator::CiUnreadCause;
+    use crate::milestone_manager::types::CiState;
     use crate::source_scan::{
         audit_writers, production_files, production_half, strip_comment_lines,
     };
@@ -3093,6 +3094,84 @@ mod tests {
         assert!(
             code.contains("write_is_armed"),
             "le prédicat doit mordre sur un site de production fabriqué"
+        );
+    }
+
+    // ---- mika#2968 : le champ CI entre au registre, pas au comparateur ----
+
+    fn record_avec_ci(ci: CiKnowledge) -> VerdictRecord {
+        VerdictRecord {
+            issue: FlightIssue::PrOpened {
+                number: Some(2966),
+                url: None,
+            },
+            recommendation: FlightRecommendation::MergeCandidate,
+            ci,
+        }
+    }
+
+    /// AC4 — la CI n'entre pas dans les termes comparés.
+    ///
+    /// Deux lignes qui ne diffèrent que par la couleur de la CI rendent les
+    /// **mêmes** `VerdictTerms`. C'est la moitié refusée du ticket : projeter la
+    /// CI dans la comparaison aurait noyé la divergence du vol 4f1fe163 dans une
+    /// seconde, sur un axe que MPC ne juge pas — il juge à la main et ne lit
+    /// aucun `statusCheckRollup`.
+    #[test]
+    fn mika2968_ac4_la_ci_nentre_pas_dans_les_termes_compares() {
+        let rouge = record_avec_ci(CiKnowledge::Read {
+            state: CiState::Failed,
+            at: "2026-10-29T17:46:12Z".into(),
+        });
+        let vert = record_avec_ci(CiKnowledge::Read {
+            state: CiState::Success,
+            at: "2026-10-29T17:46:12Z".into(),
+        });
+        assert_ne!(
+            rouge.ci, vert.ci,
+            "anti-vacuité : les deux lignes diffèrent"
+        );
+        assert_eq!(
+            rouge.terms(),
+            vert.terms(),
+            "la CI n'entre pas dans les termes comparés"
+        );
+    }
+
+    /// AC4, seconde moitié — la divergence du vol mesuré reste divergente, et
+    /// le nouveau champ l'explique.
+    ///
+    /// La ligne du manager est relue depuis un blob **antérieur** au champ : son
+    /// `ci` vaut donc `Unread(NotMeasured)` — « rien n'a été mesuré », jamais une
+    /// CI verte inventée (mika#2331). Le verdict reste `divergent` sur
+    /// `recommendation`, exactement comme avant ce ticket.
+    #[test]
+    fn mika2968_ac4_la_divergence_du_vol_4f1fe163_reste_divergente() {
+        let manager: VerdictRecord = serde_json::from_str(
+            r#"{"issue":{"pr_opened":{"number":2966,"url":null}},
+                "recommendation":"merge_candidate"}"#,
+        )
+        .expect("un blob de verdict antérieur au champ se relit");
+        assert_eq!(
+            manager.ci,
+            CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            "un blob antérieur au champ ne porte aucune mesure"
+        );
+
+        let mpc = VerdictRecord {
+            issue: FlightIssue::PrOpened {
+                number: Some(2966),
+                url: None,
+            },
+            recommendation: FlightRecommendation::ManualResumption,
+            ci: CiKnowledge::default_unread(),
+        };
+
+        assert_eq!(
+            first_divergence(&manager.terms(), &mpc.terms()),
+            FlightAgreement::Divergent {
+                field: FIELD_RECOMMENDATION
+            }
         );
     }
 }
