@@ -79,6 +79,15 @@ const READY_FOR_REVIEW_2920: &str = concat!(
     "https://github.com/senara-solutions/mika/pull/2920"
 );
 
+/// Un événement webhook réel qui ne nomme **aucune** PR : la forme qu'émet
+/// `server::webhook_queue::CHECK_SUITE_RE`, sur la branche par défaut.
+///
+/// Choisi plutôt qu'un texte Telegram parce que c'est un **webhook**, donc le
+/// même call-site : le terme sous test est l'absence de PR dans le texte, pas
+/// l'absence de webhook.
+const CHECK_SUITE_ON_MAIN: &str =
+    "[GitHub] Check suite success on senara-solutions/mika (branch: main)";
+
 const TRACE_ID: &str = "b22e6ea0b4d911f19f3e90c3b908c45a";
 const SESSION_ID: &str = "webhook-2920-ready-for-review";
 const REPO: &str = "senara-solutions/mika";
@@ -356,5 +365,82 @@ async fn mika2943_un_tour_webhook_coupe_par_ses_pas_ne_laisse_jamais_la_pr_muett
     assert_eq!(
         posts, 1,
         "exactement un POST — ni zéro (le défaut), ni deux (la régression)"
+    );
+}
+
+/// **AC2, second contrôle** — un tour **non-PR** coupé par ses pas ne poste
+/// rien, et ce n'est pas un défaut.
+///
+/// Le ticket le dit en une phrase : *« Un tour non-PR coupé ne poste rien. »*
+/// Le filet n'a pas de cible, donc il n'a rien à dire : le silence est ici le
+/// comportement correct, pas le symptôme de `b22e6ea0`. Ce que ce test interdit
+/// est l'inverse — qu'un filet élargi à `MaxStepsExceeded` se mette à chercher
+/// une PR dans un texte qui n'en nomme pas, et en trouve une par accident
+/// (le numéro d'une issue, un `#N` dans un titre de commit).
+///
+/// La seconde précondition porte tout : sans elle, un filet qui s'abstient
+/// **parce que la boucle n'a rien posé** passerait pour un filet qui s'abstient
+/// faute de cible, et le test serait vert pour la mauvaise raison.
+#[tokio::test]
+async fn mika2943_un_tour_non_pr_coupe_ne_poste_rien() {
+    let ceiling = max_tool_steps_for_agent("mika-qa", MAX_TOOL_STEPS);
+    let (tools, shell_calls, _gh_calls) = qa_tools();
+    let registry: Arc<DashMap<String, HashSet<String>>> = Arc::new(DashMap::new());
+
+    let harness = EvalHarness::builder()
+        .responses(burned_budget_corpus(ceiling))
+        .tools(tools)
+        .agent_id("mika-qa")
+        .session_id(SESSION_ID)
+        .pr_reviews_posted(registry.clone())
+        .build()
+        .await
+        .expect("harness build");
+
+    let trace = harness.run(CHECK_SUITE_ON_MAIN).await.expect("agent run");
+
+    // -- Précondition 1 : le tour a bien été coupé à son plafond. -------------
+    // Même mesure qu'au test AC1 : le décompte d'appels servis, et la
+    // sentinelle du corpus qu'un pas de plus aurait consommée — `MockLlmProvider`
+    // paniquerait alors à l'épuisement.
+    let served = shell_calls.lock().unwrap().len();
+    assert_eq!(
+        served, ceiling,
+        "précondition : le tour doit brûler exactement son plafond de pas \
+         ({ceiling}), or {served} appels servis — sans coupure, ce test \
+         n'atteste rien"
+    );
+
+    // -- Précondition 2 : le fait de coupure est bien posé. ------------------
+    // C'est ce que le filet lit. Un `None` ici rendrait l'abstention triviale :
+    // le call-site verrait `Concluded`, exactement comme avant le correctif, et
+    // l'absence de POST ne dirait plus rien de l'absence de cible.
+    assert!(
+        trace.output.max_steps_exceeded.is_some(),
+        "précondition : la boucle doit poser le fait de coupure — sans lui, \
+         l'abstention mesurée plus bas serait celle du défaut, pas celle de \
+         l'absence de PR"
+    );
+
+    // -- Précondition 3 : le déclencheur ne nomme aucune PR. -----------------
+    assert!(
+        !CHECK_SUITE_ON_MAIN.contains('#') && !CHECK_SUITE_ON_MAIN.contains("/pull/"),
+        "précondition : le déclencheur ne porte ni `repo#N` ni URL de PR"
+    );
+
+    let NetDecision {
+        outcome,
+        posts,
+        captured,
+    } = what_the_pr_receives(&trace.output, CHECK_SUITE_ON_MAIN, &registry).await;
+
+    assert!(
+        outcome.is_none(),
+        "un tour non-PR coupé n'arme pas le filet : il n'y a pas de PR à qui \
+         dire quoi que ce soit. motif = {outcome:?}"
+    );
+    assert_eq!(
+        posts, 0,
+        "aucun POST sur un événement qui ne nomme pas de PR — capturé = {captured:?}"
     );
 }
