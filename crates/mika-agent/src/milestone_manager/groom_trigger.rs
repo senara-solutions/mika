@@ -1,5 +1,5 @@
 //! Le geste de groom de la relève — `MIKA_MANAGER_GROOM_WRITE`, OFF par défaut
-//! (mika#2958, vols 1 et 2a).
+//! (mika#2958, vols 1 à 2b).
 //!
 //! Ce fichier est la **troisième et dernière** exception nommée de l'allowlist
 //! de `no_dispatch_test.rs`, pour l'unique jeton `message/send`. Tout le reste
@@ -48,12 +48,17 @@
 //!
 //! ## Ce que ce vol ne fait pas
 //!
-//! **Il porte le rail, mais ne le branche pas.** [`A2aGroomSender`] est livré
-//! par le vol 2a, et reste un objet qu'aucun cycle n'instancie : `sender` est
-//! `None` au site d'appel, ce qui est le cas nominal et se lit comme tel
-//! (`reason = "no_sender"`). Le câblage de cycle, la lecture « un groom est en
-//! cours » et le rendu de rapport (AC4, moitié ON) sont les vols 2b et 2c —
-//! voir le `Tracked in:` du corps de PR de ce vol.
+//! **Le rail est branché, mais son idempotence n'est pas durable.** Depuis le
+//! vol 2b, [`resolve_groom_rail`] construit l'émetteur au site qui tient le jeton
+//! et `cadence.rs` l'injecte dans le cycle : le chemin de production existe de
+//! bout en bout, et c'est l'interrupteur — OFF — qui le tient muet. Ce qui
+//! manque est la lecture « un groom est **en cours** » : [`GroomCandidate`] la
+//! reçoit à `false` par construction, parce que la fenêtre entre `message/send`
+//! et la pose du siège par le moteur n'est pas lisible sans état durable, et
+//! qu'agent-scoped la lecture rendrait une constante `false` (mika#2792).
+//! [`GROOMS_PER_CYCLE`] borne le dégât à un doublon au pire. Cette fenêtre est le
+//! vol 2c, et le rendu de rapport (AC4, moitié ON) le vol 2d — voir le
+//! `Tracked in:` du corps de PR de ce vol.
 //!
 //! **Il n'ouvre pas l'interrupteur.** L'ouverture reste un geste opérateur, au
 //! seuil écrit dans le vol 1 de la Phase 2 (c) : les interrupteurs de
