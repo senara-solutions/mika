@@ -12,6 +12,7 @@ pub mod dashboard_dev_runs;
 pub mod deadline_verdict;
 pub mod draft_pr_opened_handler;
 pub mod embedded_dashboard;
+pub mod fabrication_p0_guard;
 mod handlers;
 pub mod investigate;
 pub mod iterate_dispatch;
@@ -964,6 +965,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // the other half keeps answering — the failure shape that reads like a
     // provider outage and is not one.
     budget_guard::assert_llm_budgets_valid(global_home)?;
+
+    // mika#2871 AC3 — même geste, même raison, pour la porte P0 de fabrication
+    // armée sans chat d'escalade. Ici et pas ailleurs : la garde lit le
+    // `config.toml` par agent que le provisionnement vient d'écrire, et elle doit
+    // précéder `init_agent`, qui est l'endroit où le `GatewayMessageSender` reçoit
+    // son chat d'escalade — refuser après aurait laissé le premier P0 partir chez
+    // l'utilisateur final avant que quiconque lise le refus.
+    fabrication_p0_guard::assert_fabrication_p0_arming_valid(global_home)?;
 
     // mika#2455 — say, once at startup, that the CI↔verdict gate is disarmed.
     // Silent when armed: a line per boot on a healthy fleet is the churn the
