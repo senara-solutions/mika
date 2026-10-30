@@ -265,11 +265,16 @@
 //!   qui affirme l'inverse — l'interrupteur est déclaré, et par un seul fichier.
 //!   La moitié 1 est intacte : aucune exception du scan n'est attribuable au
 //!   vol 1.
-//! - **Ce qui reste dû, et ce qui ne le sera jamais par le code.** Le rail A2A
-//!   de l'émetteur, le câblage de cycle, la lecture « un groom est en cours » et
-//!   le rendu ON du rapport sont le vol 2 de mika#2958, suivis par son ticket de
-//!   suite ; au vol 1, `sender` est `None` au site d'appel et c'est le cas
-//!   nominal. **L'ouverture de l'interrupteur, elle, reste un geste
+//! - **Le rail existe, et il n'est encore branché sur rien.** Le vol 2a livre
+//!   [`A2aGroomSender`] : la voie moteur, un `message/send` A2A vers mika-dev,
+//!   dont l'URL, le jeton et le budget sont **reçus** en arguments et jamais
+//!   lus — la résolution arrive avec son site d'appel. Le rail est donc un
+//!   objet testable sans qu'aucun cycle ne l'instancie : au vol 2a comme au vol
+//!   1, `sender` est `None` au site d'appel et c'est le cas nominal.
+//! - **Ce qui reste dû, et ce qui ne le sera jamais par le code.** Le câblage de
+//!   cycle, la lecture « un groom est en cours » et le rendu ON du rapport sont
+//!   les vols 2b et 2c de mika#2958, suivis par le `Tracked in:` du corps de PR
+//!   du vol 2a. **L'ouverture de l'interrupteur, elle, reste un geste
 //!   d'opérateur** — au seuil écrit par mika#2700 : les interrupteurs de
 //!   l'évaluation des vols et du bassin `ready` ouverts, et stables sur un cycle
 //!   complet. Les deux sont OFF aujourd'hui, et mika#2958 n'en ouvre aucun.
@@ -308,7 +313,7 @@ pub use evaluator::{
     PrStateKnowledge, evaluate_flight, evaluate_flights, milestone_issue_urls,
 };
 pub use groom_trigger::{
-    ENV_GROOM_WRITE, GROOMS_PER_CYCLE, GroomCandidate, GroomSendError, GroomSender,
+    A2aGroomSender, ENV_GROOM_WRITE, GROOMS_PER_CYCLE, GroomCandidate, GroomSendError, GroomSender,
     GroomTriggerOutcome, groom_write_is_armed, trigger_relief_grooms,
 };
 pub use liveness::{
