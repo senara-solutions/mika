@@ -980,6 +980,16 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // ungrounded is then the declared state, not a regression.
     crate::evidence::guards::log_pipeline_grounding_gate_state();
 
+    // mika#2961 — le second membre de cette famille, et **la polarité inverse**
+    // de ses quatre voisins ci-dessus : il est désarmé par défaut, donc sa ligne
+    // de démarrage décrit le cas NOMINAL, pas une dérogation. D'où l'absence de
+    // ligne qui veut dire « armé », à l'envers de `log_pipeline_grounding_gate_state`
+    // juste au-dessus — ce qui est aussi pourquoi la ligne est obligatoire : sans
+    // elle, un `pass` sans preuve pipeline passerait sans que rien n'ait dit que
+    // le garde dort. L'ouverture est `MIKA_QA_PASS_EVIDENCE_GATE=1` + redémarrage,
+    // et elle revient à Vincent.
+    crate::evidence::guards::log_pass_evidence_gate_state();
+
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
         warn!(

@@ -5161,6 +5161,172 @@ Raisonnement complet (la position du lien dans la chaîne, et pourquoi pas
 une garde en échec* — c'est là que vit la doctrine de la chaîne `run_gh` depuis
 que `crates/mika-agent/CLAUDE.md` § *Tools* y a été vidé (mika#2684).
 
+### Un `pass` dit ce que la garde du dépôt a fait, ou il ne part pas (mika#2961, vol 1/2)
+
+- `MIKA_QA_PASS_EVIDENCE_GATE` — **arme** le refus d'un `pass` qui ne porte
+  aucune ligne `PIPELINE:`. **Défaut : DÉSARMÉ**, et c'est la seule variable de
+  cette famille dont la polarité est inverse : `1`/`true`/`on`/`yes` arment,
+  absente, vide ou **non reconnue** laissent désarmé, avec un
+  `pass_evidence_gate_unrecognized_value` nommant la valeur **entre guillemets**
+  (mika#2220). Lue **une fois par process** et mise en cache, comme ses quatre
+  voisines : poser ou retirer la variable sur un process déjà démarré n'a aucun
+  effet, par construction. **L'ouverture revient à Vincent** (AC4) :
+  `MIKA_QA_PASS_EVIDENCE_GATE=1` + redémarrage.
+
+**Pourquoi désarmé par défaut, chiffré.** Le régime mesuré n'est pas une
+exception, c'est la règle : sur 261 `pass` de `mika-platform-qa` (60 dernières PR
+de mika, claude-pilot, mika-platform et control-monitor, relevé du 2026-10-29),
+**zéro** porte une ligne `PIPELINE:` ancrée. Armer d'emblée changerait donc le
+régime de toute la population d'un coup, et un refus tue le tour **sans aucune
+revue postée** — l'asymétrie que calcule la doc de `validate_qa_ci_coherence`.
+L'interrupteur existe pour que l'ouverture soit une décision datée, pas un effet
+de bord de `make deploy`.
+
+**Le défaut, mesuré (n=1, sur un dépôt sans porte de merge).** Revue directe sur
+`senara-solutions/control-monitor#217`, binaire `8d127552` : à 14:26:21Z
+`gh pr checks` échoue (`Resource not accessible by personal access token`) et le
+garde CI de mika#2455 s'abstient (`qa_ci_coherence_abstained`, `reason
+"gh_failed"`) ; à 14:26:22Z un `pr review 217 --approve` part avec
+`VERDICT: pass` et **aucune** preuve pipeline. control-monitor n'a aucune garde
+exécutable : Step 2D y prescrivait `PIPELINE: not-applicable (…)`. Le merge y est
+manuel, donc l'approbation est restée seule sur la PR, sans contrôle CI ni preuve
+pipeline, jusqu'à ce que samidarko la requalifie en `hold[review]`.
+
+**Ce que ça fait, en une phrase.** Interrupteur ouvert, un `pr review` dont le
+corps porte `VERDICT: pass` sans **aucune** ligne `PIPELINE:` est refusé **avant
+tout sous-processus** (`reason = pass_section_absent`), au même point de chaîne
+que mika#2687. Le refus nomme les **deux** sorties que le prompt prescrit à une
+approbation — la section de Step 2E quand le dépôt a une garde, la forme
+*not-applicable* de Step 2D quand il n'en a pas — et il **décrit** les deux
+formes sans en citer aucune verbatim : un remède portant sa propre ligne
+`PIPELINE:` ancrée satisferait ce garde-ci si le modèle le recollait dans son
+corps suivant.
+
+**Le prédicat est ancré, et c'est le cœur du vol.** `pipeline_section_present`
+lit une ligne qui **commence** par `PIPELINE:` (blancs de tête et course
+d'emphase markdown tolérés, casse repliée) — pas un `contains` sur le corps. Les
+quatre `pass` de mika#2691 que la mesure initiale comptait comme conformes
+portent le mot dans leur **prose** (cette PR implémentait mika#2687 et en parle)
+et **zéro** ligne ancrée : le régime réel est 426/426, pas 422/426. Un `contains`
+compterait la prose d'une revue comme sa preuve, c'est-à-dire exactement le
+fail-open que le ticket condamne. Tenu par
+`mika2961_le_corps_de_2691_contient_le_mot_et_na_pas_la_section`, qui assère les
+**deux** faits sur le même corps mesuré.
+
+**Un `pass` ne paie pas la lecture du ledger d'outils.** Le troisième motif de
+mika#2687 (`no_guard_executed`) reste réservé au membre `block` : une approbation
+ne cite aucun échec, donc la preuve d'exécution n'a rien à corroborer, et la
+requête n'est pas faite. Conséquence lisible en base : le membre `pass` n'écrit
+jamais de ligne `abstained`.
+
+**Ce que le vol ne ferme pas, et c'est écrit (AC3).** L'abstention de mika#2455
+**reste fail-open**, inchangée — aucune ligne de ce vol ne touche
+`validate_qa_ci_coherence`. Ce qui tient alors le merge fermé sur
+control-monitor, réponse franche : **rien de mécanique**, le merge y est un acte
+humain. Ce que le vol change n'est pas la porte, c'est le **signal** :
+l'enchaînement mesuré du 2026-10-29 — abstention CI puis approbation nue — n'est
+plus postable une fois l'interrupteur ouvert.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Le garde a-t-il refusé un `pass` ? (nom d'événement DISTINCT de celui de
+#    mika#2687 : un refus de `pass` classé sous `pipeline_block_refused`
+#    élargirait en silence une population déjà publiée — mika#2131)
+grep pass_evidence_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{target, reason, agent_id, session_id}'
+
+# 2. L'interrupteur est-il désarmé ? (une ligne INFO par démarrage — ici c'est le
+#    cas NOMINAL qui parle, et le SILENCE qui veut dire « armé » : polarité
+#    inverse de ses quatre voisines)
+grep pass_evidence_gate_disarmed "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Une valeur d'interrupteur illisible ? (régime attendu : VIDE)
+grep pass_evidence_gate_unrecognized_value "$MIKA_SPIRIT_LOG_FILE"
+```
+
+```sql
+-- CONTRÔLE POSITIF, partagé avec mika#2687 : la garde écrit une ligne sur
+-- TOUTES les issues, `allowed` compris. Une table vide dit « le lien n'est
+-- jamais atteint », jamais « la garde ne refuse rien » (mika#2205).
+SELECT target_key, after_value, count(*) FROM audit_events
+ WHERE tool_name = 'pipeline_grounding_guard' GROUP BY 1, 2;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `pass_evidence_gate_disarmed` | INFO | **non vide avant l'ouverture** | l'état livré ; son absence après `make deploy` veut dire *armé*, ou un binaire antérieur au vol |
+| `reason = pass_section_absent` | WARN | **vide avant l'ouverture, puis décroissant** | la forme mesurée sur cm#217 et mika#2960 |
+| `pass_evidence_gate_unrecognized_value` | WARN | **vide** | une faute de frappe laisse désarmé, donc muet autrement |
+| `after_value = 'allowed'` | audit | **non vide après l'ouverture** | le contrôle positif ; son absence seule ne prouve rien |
+
+#### Sonde d'ouverture (AC5), et ses deux haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** (classe mika#2340),
+> et l'interrupteur n'est lu qu'au démarrage. Avant toute conclusion : établir
+> que le `mika-spirit` qui tourne porte le correctif **et** que
+> `pass_evidence_gate_disarmed` a cessé d'apparaître.
+
+**S1 — le compte des `pass` sans ligne `PIPELINE:` sur 7 jours. Cible : 0.** La
+requête est celle qui a produit la mesure du vol, ancrée en début de ligne
+(`contains` ne mesure pas la même population — c'est tout l'objet du § ci-dessus) :
+
+```sh
+gh pr list --repo senara-solutions/<repo> --state all --limit 60 \
+  --json number,reviews,state \
+  --jq '[.[] | .number as $n | .reviews[]
+         | select(.author.login=="mika-platform-qa")
+         | select(.body|startswith("VERDICT: pass"))
+         | {n:$n,
+            pipe:([.body|split("\n")|.[]
+                   |select(test("^[ \t*_]*[Pp][Ii][Pp][Ee][Ll][Ii][Nn][Ee]:"))]|length)}]
+        | {pass:length, sans_pipeline:([.[]|select(.pipe==0)]|length)}'
+```
+
+**S2 — le compte des tours QA morts, à côté, sur la même fenêtre.** C'est l'autre
+moitié de la mesure, et elle n'est pas facultative : un `sans_pipeline: 0` obtenu
+en tuant les tours n'est pas un succès. Le numérateur est
+`grep -c pass_evidence_refused`, à rapporter aux PR de la fenêtre dont aucune
+revue `mika-platform-qa` n'est jamais arrivée.
+
+*Halte 1 — un refus sur une approbation qui portait bien sa section.* Désarmer
+(retirer la variable + redémarrage), **puis** diagnostiquer : un garde qui rend
+les revues légitimes impostables coûte plus que le défaut qu'il ferme.
+*Halte 2 — les deux sondes muettes.* Zéro refus **et** zéro ligne `allowed` ne
+prouve rien : il faut qu'un `pass` ait été rendu depuis l'ouverture. *Une garde
+que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne traite pas `NEGATIVE-TEST:`.** La seconde exigence du prompt
+  (mika#2264) part au vol 2/2, avec son propre jeton canonique et son lint :
+  le motif d'une ligne de test négatif n'est pas celui d'une section, et les deux
+  prédicats n'auraient pas la même mesure. Le régime mesuré est le même (0 sur
+  261).
+- **Il ne ferme pas l'abstention de mika#2455** (voir AC3 ci-dessus) : sur un
+  dépôt qui ne merge pas par `pr_merge_with_gate`, rien de mécanique ne tient le
+  merge fermé. Ce vol ferme le signal, pas la porte.
+- **Il ne rétrograde pas en `hold[review]`.** Le ticket proposait « refuse ou
+  plafonne » ; refuser est le bras retenu, comme chez mika#2687 et pour la même
+  raison — les gardes de cette chaîne rendent `Result<(), ToolOutput>` et ne
+  mutent jamais l'argv, donc plafonner voudrait dire réécrire le jugement de
+  l'agent au lieu de le lui rendre. Le remède nomme les sorties, l'agent choisit.
+- **Il ne rattrape aucune des 261 approbations mesurées.** Elles sont publiées.
+  La sonde est la **prochaine** occurrence.
+- **Il n'annonce pas le refus dans le prompt.** `qa-review/system_prompt.md` est
+  à 78 octets de sa porte de taille et la prochaine addition doit le sharder
+  (même report que mika#2687). L'agent rencontre donc le refus sans l'avoir lu
+  dans ses instructions — d'où un `remedy` qui nomme Step 2E et Step 2D
+  explicitement.
+- **Aucune liste d'exemptions, et elle est vide par construction** : aucun label,
+  aucune constante, aucun dépôt ne permet de passer outre. L'échappatoire est la
+  variable ci-dessus, et elle n'est jamais silencieuse.
+
+Raisonnement complet (la position du lien dans la chaîne, la population à deux
+membres et l'inversion de polarité) : `docs/agent-internals/tools.md` § *Un
+`block[pipeline]` cite une garde en échec*.
+
 ### La porte de merge lit TOUS les checks, et cesse de déléguer le vert (mika#2617, phase A)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette

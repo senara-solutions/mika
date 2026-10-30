@@ -4052,36 +4052,52 @@ async fn validate_pr_review_flag_coherence(
 }
 
 /// Refuse a `gh pr review` whose verdict is `block[pipeline]` while its body
-/// cites no guard that actually ran and exited non-zero (mika#2687).
+/// cites no guard that actually ran and exited non-zero (mika#2687), or whose
+/// verdict is `pass` while its body carries no `PIPELINE:` section at all
+/// (mika#2961).
 ///
 /// # What gates it
 ///
-/// Four fail-open terms, in this order: the gate
-/// (`MIKA_PIPELINE_GROUNDING_GATE`), a readable `--body`, a verdict inside the
-/// population, and the pure predicate. Any term the guard cannot read is a
-/// **pass**, never a refusal — same arithmetic as mika#2455 and mika#2519: a
-/// false negative leaves today's already-paid cost in place, a false positive
-/// makes a legitimate review impossible to post **and** pushes a genuinely
-/// broken PR across the merge gate.
+/// Four fail-open terms, in this order: **a** gate
+/// (`MIKA_PIPELINE_GROUNDING_GATE` for the `block[pipeline]` member,
+/// `MIKA_QA_PASS_EVIDENCE_GATE` for the `pass` one), a readable `--body`, a
+/// verdict inside the population, and the pure predicate. Any term the guard
+/// cannot read is a **pass**, never a refusal — same arithmetic as mika#2455 and
+/// mika#2519: a false negative leaves today's already-paid cost in place, a
+/// false positive makes a legitimate review impossible to post **and** pushes a
+/// genuinely broken PR across the merge gate.
+///
+/// The two gates are **independent**, and their polarity is deliberately
+/// opposite: the `block[pipeline]` one is armed by default, the `pass` one is
+/// not (mika#2961 § 4.5 — the measured regime is 261 out of 261, and opening it
+/// is the operator's call).
 ///
 /// Deliberately **not** gated on `required_tool_arg_suffixes`, like its three
 /// siblings: its subject is the body itself, not the active skill.
 ///
-/// # Why the population is only `block[pipeline]`
+/// # Why the population is these two classes
 ///
-/// That is the class mika#2685 measured, and the only one whose grounding has a
-/// named, executable source of truth (`scripts/verify-pipeline.sh` and the
-/// `PIPELINE:` section Step 2E prescribes). `block[ac]`, `block[ci]`,
-/// `block[security]` and `block[dependency]` are grounded in other evidence,
-/// each of which would need its own measurement. Everything outside the
-/// population traverses intact.
+/// Those are the classes mika#2685 and mika#2961 measured, and the only ones
+/// whose grounding has a named, executable source of truth
+/// (`scripts/verify-pipeline.sh` and the `PIPELINE:` section Step 2E
+/// prescribes). `hold[review]`, `block[ac]`, `block[ci]`, `block[security]` and
+/// `block[dependency]` are grounded in other evidence, each of which would need
+/// its own measurement. Everything outside the population traverses intact.
 ///
 /// # Which way it fails
 ///
-/// Audit-wise it does not fail at all: a row is written on **all three**
-/// outcomes, including `Allowed`. An `audit_events` table empty of
+/// Audit-wise it does not fail at all: a row is written on **every** outcome,
+/// including `Allowed`. An `audit_events` table empty of
 /// `pipeline_grounding_guard` says the link is unreached, not that it refuses
 /// nothing (mika#2205 positive control).
+///
+/// # The name is one member behind
+///
+/// `validate_pipeline_block_grounding` was exact while the population had a
+/// single member. The rename to `validate_pipeline_evidence` travels with
+/// mika#2961's flight 2/2 (the `NEGATIVE-TEST:` motif), so that a rename diff
+/// does not ride inside a behaviour diff. Tracked in the follow-up ticket named
+/// in that flight's PR body.
 async fn validate_pipeline_block_grounding(
     args: &[String],
     repo: Option<&str>,
@@ -4089,6 +4105,7 @@ async fn validate_pipeline_block_grounding(
 ) -> Result<(), ToolOutput> {
     validate_pipeline_block_grounding_gated(
         crate::evidence::guards::pipeline_grounding_gate_enabled(),
+        crate::evidence::guards::pass_evidence_gate_armed(),
         args,
         repo,
         ctx,
@@ -4096,7 +4113,7 @@ async fn validate_pipeline_block_grounding(
     .await
 }
 
-/// The body of the guard, with the gate passed as a **fact** rather than read.
+/// The body of the guard, with both gates passed as **facts** rather than read.
 ///
 /// Same convention as [`crate::evidence::guards::classify_dependabot_verdict`],
 /// which takes `verdict_is_pipeline_block: bool` rather than the `Verdict`: the
@@ -4105,9 +4122,13 @@ async fn validate_pipeline_block_grounding(
 /// so a test that wanted to exercise the disarmed branch by setting the
 /// variable would depend on being the first test in the binary to touch it.
 /// Passing the bit instead makes both branches deterministic, and keeps exactly
-/// one site reading the environment.
+/// one site reading the environment. `pass_gate_enabled` is the second bit,
+/// mika#2961, and it is passed for the same reason — with the added one that its
+/// default is the *disarmed* branch, so that branch is the one a test must be
+/// able to reach without being first in the binary.
 async fn validate_pipeline_block_grounding_gated(
     gate_enabled: bool,
+    pass_gate_enabled: bool,
     args: &[String],
     repo: Option<&str>,
     ctx: &ToolContext<'_>,
@@ -4117,7 +4138,7 @@ async fn validate_pipeline_block_grounding_gated(
     };
     use crate::server::verdict::{Verdict, parse_verdict};
 
-    if !gate_enabled {
+    if !gate_enabled && !pass_gate_enabled {
         return Ok(());
     }
 
@@ -4129,11 +4150,18 @@ async fn validate_pipeline_block_grounding_gated(
     // case-folded, no `trim`. A guard stricter than the consumer it protects
     // would abstain on the very forms the consumer acts upon
     // (`guard-parser-must-be-as-permissive-as-downstream-consumer`).
-    let verdict_is_pipeline_block = matches!(
-        parse_verdict(&body),
-        Verdict::Block(ref kind) if kind.eq_ignore_ascii_case("pipeline")
-    );
-    if !verdict_is_pipeline_block {
+    //
+    // Each member is conjoined with **its own** gate here rather than later: a
+    // disarmed member must be out of population, not merely allowed, so that it
+    // pays neither the DB read nor an audit row.
+    let verdict = parse_verdict(&body);
+    let verdict_is_pipeline_block = gate_enabled
+        && matches!(
+            verdict,
+            Verdict::Block(ref kind) if kind.eq_ignore_ascii_case("pipeline")
+        );
+    let verdict_is_pass = pass_gate_enabled && matches!(verdict, Verdict::Pass);
+    if !verdict_is_pipeline_block && !verdict_is_pass {
         return Ok(());
     }
 
@@ -4144,48 +4172,81 @@ async fn validate_pipeline_block_grounding_gated(
     // population of `block[pipeline]` calls is rare, so the query costs nothing
     // on the nominal path and no extra population predicate is needed to keep
     // it that way.
-    let guard_execution_observed = observe_pipeline_guard_execution(ctx, &target_key).await;
+    //
+    // It stays **reserved to the `block[pipeline]` member** (mika#2961 § 5.2):
+    // the `pass` member's term is the presence of the section alone, and `pass`
+    // is the most frequent verdict of the fleet — paying a query per approval
+    // for a fact the classification never reads would be a cost with no
+    // decision behind it. `true` is the value `classify_…` never observes on
+    // that path, and it is also the fail-open side.
+    let guard_execution_observed = if verdict_is_pipeline_block {
+        observe_pipeline_guard_execution(ctx, &target_key).await
+    } else {
+        true
+    };
 
-    let (reason, reasoning) =
-        match classify_pipeline_block_grounding(true, &body, guard_execution_observed) {
-            PipelineGroundingOutcome::Allowed => {
-                // The positive control, and the reason this branch writes a row
-                // rather than returning early: a population of zero allowed
-                // calls is how a guard that never runs looks exactly like a
-                // guard that never has to refuse (mika#2205).
-                audit_pipeline_grounding(
-                    ctx,
-                    &target_key,
-                    "allowed",
+    let (reason, reasoning) = match classify_pipeline_block_grounding(
+        verdict_is_pipeline_block,
+        verdict_is_pass,
+        &body,
+        guard_execution_observed,
+    ) {
+        PipelineGroundingOutcome::Allowed => {
+            // The positive control, and the reason this branch writes a row
+            // rather than returning early: a population of zero allowed
+            // calls is how a guard that never runs looks exactly like a
+            // guard that never has to refuse (mika#2205).
+            audit_pipeline_grounding(
+                ctx,
+                &target_key,
+                "allowed",
+                if verdict_is_pass {
+                    "pass carries a PIPELINE: section"
+                } else {
                     "block[pipeline] carries a PIPELINE: section citing a guard that exited \
-                     non-zero, and a guard was actually invoked in this session",
-                )
-                .await;
-                return Ok(());
-            }
-            PipelineGroundingOutcome::RefusedSectionAbsent => (
-                "section_absent",
-                "block[pipeline] with no PIPELINE: section anywhere in the body",
-            ),
-            PipelineGroundingOutcome::RefusedNoFailingGuardCited => (
-                "no_failing_guard_cited",
-                "block[pipeline] whose PIPELINE: section cites no guard at a non-zero exit",
-            ),
-            PipelineGroundingOutcome::RefusedNoGuardExecuted => (
-                "no_guard_executed",
-                "block[pipeline] whose body cites a failing guard, while this session's tool \
-                 ledger records shell calls and none of them invoked a pipeline guard",
-            ),
-        };
+                     non-zero, and a guard was actually invoked in this session"
+                },
+            )
+            .await;
+            return Ok(());
+        }
+        PipelineGroundingOutcome::RefusedSectionAbsent => (
+            "section_absent",
+            "block[pipeline] with no PIPELINE: section anywhere in the body",
+        ),
+        PipelineGroundingOutcome::RefusedNoFailingGuardCited => (
+            "no_failing_guard_cited",
+            "block[pipeline] whose PIPELINE: section cites no guard at a non-zero exit",
+        ),
+        PipelineGroundingOutcome::RefusedNoGuardExecuted => (
+            "no_guard_executed",
+            "block[pipeline] whose body cites a failing guard, while this session's tool \
+             ledger records shell calls and none of them invoked a pipeline guard",
+        ),
+        PipelineGroundingOutcome::RefusedPassSectionAbsent => (
+            "pass_section_absent",
+            "pass with no PIPELINE: section anywhere in the body",
+        ),
+    };
 
+    // Two **separate** event names, one per member, and the choice is
+    // deliberate: `pipeline_block_refused` is already a wire token in the
+    // operator docs and in the greps that read `server.log`, and a `pass` refusal
+    // filed under it would silently widen a published population (mika#2131).
+    // Within each name, `reason` stays the discriminant.
+    let event_name = if verdict_is_pass {
+        "pass_evidence_refused"
+    } else {
+        "pipeline_block_refused"
+    };
     tracing::warn!(
-        event = "pipeline_block_refused",
+        event = %event_name,
         agent_id = %ctx.db.agent_id(),
         session_id = %ctx.session_id,
         target = %target_key,
-        verdict = "block[pipeline]",
+        verdict = if verdict_is_pass { "pass" } else { "block[pipeline]" },
         reason = %reason,
-        "refused a block[pipeline] review that cites no guard actually run and failed (mika#2687)"
+        "refused a review whose pipeline evidence is absent from its body (mika#2687, mika#2961)"
     );
     audit_pipeline_grounding(ctx, &target_key, "refused", reasoning).await;
 
@@ -4200,6 +4261,42 @@ async fn validate_pipeline_block_grounding_gated(
     // anchored on that line prefix, and a stray line would be re-read as a
     // verdict by the next consumer of this payload. The tokens are named in
     // plain prose for that reason.
+    if verdict_is_pass {
+        // The `pass` member gets its **own** remedy, and that is the whole point
+        // of writing one: mika#2687's text says "run the guard and quote its
+        // failure", which is a non-sequitur under a `pass` — an approval cites
+        // no failure by construction. This one names the two outputs the prompt
+        // actually prescribes for an approval, Step 2E and Step 2D, and nothing
+        // else. Naming only one of them would push the model to write the other
+        // from memory, which is the measured defect with one more step.
+        //
+        // The two forms are **described, never quoted verbatim**: a remedy
+        // carrying its own anchored `PIPELINE:` line would satisfy this very
+        // gate if the model pasted the refusal into its next body — the guard
+        // would then be reading its own text as the reviewer's evidence.
+        let body = serde_json::json!({
+            "error": "pass_evidence_absent",
+            "doctrine": "mika#2961",
+            "target": target_key,
+            "reason": reason,
+            "remedy": "This approval carries no PIPELINE: section, and Step 2E requires one in \
+                       every verdict that reached it. There are exactly two correct outputs, \
+                       both prescribed by the prompt you are running. (a) The repository has a \
+                       pipeline guard: run it as Step 2B prescribes and post the section Step 2E \
+                       shows — the opening line, then each guard, its exit code, and its output \
+                       as printed. On a clean repository that reads as a pipeline line stating \
+                       the result for this repo, with the guard at exit 0 and the line it \
+                       printed. (b) The repository has no executable guard: post the \
+                       not-applicable form of Step 2D, naming the repo and the guard paths you \
+                       checked. What is refused is neither of those two: an approval that says \
+                       nothing about the guard at all. Do not write the section from memory, and \
+                       do not change your conclusion to fit this refusal — the guard's own \
+                       output is the only evidence this gate accepts, and if it refused \
+                       something then the pipeline is what is wrong rather than this call.",
+        });
+        return Err(ToolOutput::error(body.to_string()));
+    }
+
     let body = serde_json::json!({
         "error": "pipeline_block_ungrounded",
         "doctrine": "mika#2687",
@@ -13528,6 +13625,13 @@ mod mika2687_pipeline_grounding_tests {
     const TARGET: &str = "pr_review:senara-solutions/mika#2685";
     const SINCE: &str = "1970-01-01T00:00:00Z";
 
+    /// The second member's gate (mika#2961), **disarmed** — its default, and the
+    /// state in which every case of this module was written. Named rather than
+    /// written `false` for the same reason as `GUARD_RAN` next door: it is the
+    /// only change the arrival of the `pass` member makes to these tests, and
+    /// not one of their expectations moves.
+    const PASS_GATE_DISARMED: bool = false;
+
     /// Review 2 on mika#2685, `0a53b5f0`, 2026-10-13 17:03Z — no `PIPELINE:`
     /// section, and a reason `verify-pipeline.sh` does not carry.
     const MEASURED_BODY: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\npipeline-exempt label \
@@ -13674,9 +13778,15 @@ mod mika2687_pipeline_grounding_tests {
         record_a_shell_call(&h, "bash scripts/verify-pipeline.sh origin/main").await;
         let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
         assert!(
-            validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
-                .await
-                .is_ok()
+            validate_pipeline_block_grounding_gated(
+                true,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok()
         );
         assert_eq!(rows(&h, "allowed").await, 1);
         assert_eq!(all_rows(&h).await, 1);
@@ -13691,9 +13801,15 @@ mod mika2687_pipeline_grounding_tests {
         record_a_shell_call(&h, "git diff --stat origin/main").await;
         record_a_shell_call(&h, "cargo test -p mika-agent").await;
         let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
-        let err = validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
-            .await
-            .expect_err("a section written rather than observed must not publish");
+        let err = validate_pipeline_block_grounding_gated(
+            true,
+            PASS_GATE_DISARMED,
+            &args,
+            Some(REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("a section written rather than observed must not publish");
         assert!(err.content.contains("no_guard_executed"), "{}", err.content);
         assert!(err.content.contains("Step 2B"), "{}", err.content);
         assert_eq!(rows(&h, "refused").await, 1);
@@ -13714,9 +13830,15 @@ mod mika2687_pipeline_grounding_tests {
         let h = TestHarness::with_agent("mika-qa");
         let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
         assert!(
-            validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
-                .await
-                .is_ok(),
+            validate_pipeline_block_grounding_gated(
+                true,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
             "an unreadable term must not turn a grounded review into a refusal"
         );
         assert_eq!(rows(&h, "abstained").await, 1, "the abstention is SAID");
@@ -13735,9 +13857,15 @@ mod mika2687_pipeline_grounding_tests {
     async fn abstaining_on_execution_does_not_disarm_the_body_predicates() {
         let h = TestHarness::with_agent("mika-qa");
         let args = argv(&["pr", "review", "2685", "--comment", "--body", MEASURED_BODY]);
-        let err = validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
-            .await
-            .expect_err("the measured body is refused whatever the ledger says");
+        let err = validate_pipeline_block_grounding_gated(
+            true,
+            PASS_GATE_DISARMED,
+            &args,
+            Some(REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("the measured body is refused whatever the ledger says");
         assert!(err.content.contains("section_absent"), "{}", err.content);
         assert_eq!(rows(&h, "abstained").await, 1);
         assert_eq!(rows(&h, "refused").await, 1);
@@ -13766,9 +13894,15 @@ mod mika2687_pipeline_grounding_tests {
         ] {
             let args = argv(&["pr", "review", "2685", flag, "--body", body]);
             assert!(
-                validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
-                    .await
-                    .is_ok(),
+                validate_pipeline_block_grounding_gated(
+                    true,
+                    PASS_GATE_DISARMED,
+                    &args,
+                    Some(REPO),
+                    &h.ctx()
+                )
+                .await
+                .is_ok(),
                 "{body:?}"
             );
         }
@@ -13782,9 +13916,15 @@ mod mika2687_pipeline_grounding_tests {
         let h = TestHarness::with_agent("mika-qa");
         let args = argv(&["pr", "review", "2685", "--comment", "--body", MEASURED_BODY]);
         assert!(
-            validate_pipeline_block_grounding_gated(false, &args, Some(REPO), &h.ctx())
-                .await
-                .is_ok(),
+            validate_pipeline_block_grounding_gated(
+                false,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
             "MIKA_PIPELINE_GROUNDING_GATE=0 must be a real STOP"
         );
         assert_eq!(all_rows(&h).await, 0);
@@ -13798,10 +13938,434 @@ mod mika2687_pipeline_grounding_tests {
         let h = TestHarness::with_agent("mika-qa");
         let args = argv(&["pr", "review", "2685", "--comment", "--body-file", "b.md"]);
         assert!(
-            validate_pipeline_block_grounding_gated(true, &args, Some(REPO), &h.ctx())
-                .await
-                .is_ok()
+            validate_pipeline_block_grounding_gated(
+                true,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok()
         );
         assert_eq!(rows(&h, "refused").await, 0);
+    }
+}
+
+/// Layer B du second membre — le câblage du `pass` (mika#2961).
+///
+/// Son frère ci-dessus prouve la **position dans la chaîne** par un appel
+/// `run_gh` complet : le refus revient à l'appelant sans qu'aucun subprocess ne
+/// soit lancé. Ce module-ci ne le reprouve pas, et ne peut pas : l'interrupteur
+/// du `pass` est **désarmé par défaut**, donc un appel `run_gh` traverserait le
+/// lien et irait chercher `gh`. Les deux membres entrent dans le **même** appel
+/// à `validate_pipeline_block_grounding_gated`, au même point de la chaîne — la
+/// position est partagée par construction, et ce qui reste à attester ici est le
+/// câblage du second bit, de son armement à sa ligne d'audit.
+#[cfg(test)]
+mod mika2961_pass_evidence {
+    use super::validate_pipeline_block_grounding_gated;
+    use crate::evidence::guards::PIPELINE_GROUNDING_AUDIT_TOOL;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    const CM_REPO: &str = "senara-solutions/control-monitor";
+    const CM_TARGET: &str = "pr_review:senara-solutions/control-monitor#217";
+    const MIKA_REPO: &str = "senara-solutions/mika";
+    const SINCE: &str = "1970-01-01T00:00:00Z";
+
+    /// Le gate du `pass`, armé — l'état que l'opérateur ouvrira, et le seul dans
+    /// lequel ce module a un sujet.
+    const PASS_GATE_ARMED: bool = true;
+    /// Son défaut.
+    const PASS_GATE_DISARMED: bool = false;
+    /// Le gate de mika#2687, désarmé : chaque cas de ce module isole le second
+    /// membre, pour qu'un vert ne puisse pas venir du premier.
+    const BLOCK_GATE_DISARMED: bool = false;
+    /// Et armé, pour le seul cas qui vérifie que les deux cohabitent.
+    const BLOCK_GATE_ARMED: bool = true;
+
+    /// La tête de la revue APPROVED de control-monitor#217 du
+    /// 2026-10-29T14:26:24Z — mesurée : 30 lignes, aucune ligne `PIPELINE:`
+    /// ancrée, `contains("PIPELINE:")` faux. Dépôt sans garde exécutable et
+    /// merge manuel : c'est le cas d'origine du ticket.
+    const MEASURED_CM217: &str = "VERDICT: pass\nDEPTH: code-level\nREASON: Idempotent POST \
+                                  /messages on client_ref with detached delivery, reconcile \
+                                  command, and 5 ACs all verified against \
+                                  source.\n\nBUILD VERIFICATION: skipped (control-monitor PR — \
+                                  build_mika does not apply; cm CI gates are the build \
+                                  verification)\n\nFINDINGS: none\n";
+
+    /// Le même corps, plus la ligne que Step 2D prescrivait à ce dépôt-là —
+    /// verbatim de `system_prompt.md:275`. C'est le contrôle positif : un seul
+    /// changement entre lui et le corps mesuré, et c'est le terme du garde.
+    const CM217_WITH_STEP_2D: &str = "VERDICT: pass\nDEPTH: code-level\nREASON: Idempotent POST \
+                                      /messages on client_ref with detached delivery, reconcile \
+                                      command, and 5 ACs all verified against \
+                                      source.\n\nPIPELINE: not-applicable (no executable guard \
+                                      found in senara-solutions/control-monitor: checked \
+                                      scripts/verify-pipeline.sh, \
+                                      scripts/plan-doc-check.sh)\n\nFINDINGS: none\n";
+
+    /// Un `block[pipeline]` fondé, pour le seul cas qui fait cohabiter les deux
+    /// membres. Copie de `GROUNDED_BODY` du module voisin — recopiée plutôt
+    /// qu'empruntée parce que ce qu'elle vérifie ici n'est pas le prédicat du
+    /// corps mais que l'arrivée du second bit ne déplace pas le premier.
+    const GROUNDED_BLOCK: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\nPIPELINE: block \
+                                  (mika)\n- scripts/verify-pipeline.sh → exit 1\n  \
+                                  [pipeline-exempt: none] REJECT: code-only PR\n  Verification \
+                                  FAILED: 1 missing artifact(s).\n";
+
+    /// Le corps mesuré de mika#2685, hors section — le cas de mika#2687, pour la
+    /// moitié `block` du test de cohabitation.
+    const MEASURED_BLOCK: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\npipeline-exempt \
+                                  label present but PR contains non-docs files.\n";
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cm_argv(body: &str) -> Vec<String> {
+        argv(&["pr", "review", "217", "--approve", "--body", body])
+    }
+
+    /// Lignes que le garde a écrites pour une issue donnée, lues sur
+    /// `after_value` — même raison que chez le voisin : un test qui compterait
+    /// les lignes sur le seul nom d'outil resterait vert sur un garde qui écrit
+    /// la mauvaise issue.
+    async fn rows(h: &TestHarness, target: &str, outcome: &str) -> usize {
+        h.db.get_audit_events("test-session")
+            .await
+            .expect("get_audit_events")
+            .iter()
+            .filter(|e| {
+                e.tool_name == PIPELINE_GROUNDING_AUDIT_TOOL
+                    && e.target_key == target
+                    && e.after_value.as_deref() == Some(outcome)
+            })
+            .count()
+    }
+
+    async fn all_rows(h: &TestHarness, target: &str) -> i64 {
+        h.db.count_recent_audit_events_for_target(PIPELINE_GROUNDING_AUDIT_TOOL, target, SINCE)
+            .await
+            .unwrap()
+    }
+
+    /// V3 — le corps mesuré est refusé, sous **son** motif et **sa** doctrine.
+    ///
+    /// Les deux jetons comptent : `pass_evidence_absent` et `mika#2961`
+    /// séparent ce refus de celui de mika#2687 dans tout ce qui lit cette charge
+    /// utile, à commencer par le modèle qui la reçoit. Un refus du `pass` classé
+    /// sous `pipeline_block_ungrounded` élargirait en silence une population déjà
+    /// publiée (motif mika#2131).
+    #[tokio::test]
+    async fn le_corps_mesure_de_cm217_est_refuse_sous_son_propre_motif() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(MEASURED_CM217),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("une approbation sans aucune preuve pipeline n'est plus postable");
+        assert!(
+            err.content.contains("pass_evidence_absent"),
+            "{}",
+            err.content
+        );
+        assert!(err.content.contains("mika#2961"), "{}", err.content);
+        assert!(
+            err.content.contains("pass_section_absent"),
+            "le motif discriminant du membre : {}",
+            err.content
+        );
+        assert_eq!(rows(&h, CM_TARGET, "refused").await, 1);
+        assert_eq!(
+            rows(&h, CM_TARGET, "abstained").await,
+            0,
+            "le membre `pass` ne lit pas le ledger, donc ne peut pas s'abstenir \
+             dessus"
+        );
+    }
+
+    /// V7 — et deux propriétés du texte du remedy, qui sont deux pièges
+    /// distincts.
+    #[tokio::test]
+    async fn le_remedy_nomme_les_deux_sorties_sans_se_satisfaire_lui_meme() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(MEASURED_CM217),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("refusé");
+
+        // Les deux sorties correctes sont nommées. N'en nommer qu'une pousserait
+        // le modèle à écrire l'autre de mémoire, ce qui est le défaut mesuré
+        // avec une étape de plus.
+        assert!(err.content.contains("Step 2E"), "{}", err.content);
+        assert!(err.content.contains("Step 2D"), "{}", err.content);
+
+        for line in err.content.lines() {
+            // Piège 1, celui de mika#2687 : `VERDICT_RE` est ancré sur ce
+            // préfixe de ligne, donc une ligne du remedy qui l'ouvrirait serait
+            // relue comme un verdict par le prochain consommateur.
+            assert!(
+                !line.trim_start().starts_with("VERDICT:"),
+                "une ligne du remedy serait relue comme un verdict : {line:?}"
+            );
+            // Piège 2, propre à ce membre : un remedy portant sa propre ligne
+            // `PIPELINE:` **ancrée** satisferait ce garde-ci si le modèle
+            // recollait le refus dans son corps suivant. Le garde lirait alors
+            // son propre texte comme la preuve du relecteur. C'est pourquoi les
+            // deux formes sont décrites et jamais citées verbatim.
+            assert!(
+                !crate::evidence::guards::pipeline_section_present(line),
+                "le remedy porte une ligne de section qui satisferait ce garde : \
+                 {line:?}"
+            );
+        }
+    }
+
+    /// V4 — le contrôle positif, et sa ligne `allowed`.
+    ///
+    /// Un seul changement sépare ce corps du précédent : la ligne de Step 2D.
+    /// La ligne `allowed` est ce qui distingue « le garde n'a rien refusé » de
+    /// « le garde n'a jamais été atteint » (mika#2205) — sans elle, une table
+    /// vide a deux causes de signe opposé.
+    #[tokio::test]
+    async fn un_pass_qui_porte_la_section_traverse_et_laisse_sa_ligne() {
+        let h = TestHarness::with_agent("mika-qa");
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_DISARMED,
+                PASS_GATE_ARMED,
+                &cm_argv(CM217_WITH_STEP_2D),
+                Some(CM_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "la sortie que Step 2D prescrit à un dépôt sans garde est la bonne"
+        );
+        assert_eq!(rows(&h, CM_TARGET, "allowed").await, 1);
+        assert_eq!(
+            all_rows(&h, CM_TARGET).await,
+            1,
+            "une ligne, et une seule : le membre `pass` ne paie pas la lecture \
+             du ledger, donc n'écrit pas de ligne d'abstention à côté"
+        );
+    }
+
+    /// V5 — l'interrupteur arrête vraiment : le corps qui est refusé armé
+    /// traverse désarmé, et ne laisse rien.
+    ///
+    /// C'est l'état **par défaut** du vol, donc ce test décrit ce que la flotte
+    /// fait à la livraison : rien. L'ouverture revient à l'opérateur (AC4).
+    #[tokio::test]
+    async fn le_gate_desarme_laisse_passer_le_corps_mesure() {
+        let h = TestHarness::with_agent("mika-qa");
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_DISARMED,
+                PASS_GATE_DISARMED,
+                &cm_argv(MEASURED_CM217),
+                Some(CM_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "désarmé, le garde est hors circuit"
+        );
+        assert_eq!(
+            all_rows(&h, CM_TARGET).await,
+            0,
+            "et hors circuit veut dire hors population : pas de ligne, pas de \
+             requête"
+        );
+    }
+
+    /// Hors population, gate armé : seul le `pass` est l'affaire de ce membre.
+    ///
+    /// L'assertion porte sur l'**absence totale** de ligne, et pas sur l'absence
+    /// de refus : la population `allowed` doit rester lisible comme « une
+    /// approbation portant sa section », jamais comme « une revue qui est
+    /// passée ».
+    #[tokio::test]
+    async fn les_autres_verdicts_traversent_et_ne_laissent_rien() {
+        let h = TestHarness::with_agent("mika-qa");
+        for body in [
+            "VERDICT: block[ac]\n\nAC3 n'est pas testé.\n",
+            "VERDICT: hold[review]\n\nEn attente de la CI.\n",
+            "VERDICT: block[pipeline]\n\nAucune section.\n",
+        ] {
+            let args = argv(&["pr", "review", "217", "--comment", "--body", body]);
+            assert!(
+                validate_pipeline_block_grounding_gated(
+                    BLOCK_GATE_DISARMED,
+                    PASS_GATE_ARMED,
+                    &args,
+                    Some(CM_REPO),
+                    &h.ctx()
+                )
+                .await
+                .is_ok(),
+                "{body:?}"
+            );
+        }
+        assert_eq!(all_rows(&h, CM_TARGET).await, 0);
+    }
+
+    /// Les deux membres cohabitent, et armer le second ne déplace pas le
+    /// premier.
+    ///
+    /// Les 32 tests de mika#2687 le disent déjà avec le second bit **désarmé** —
+    /// ce qui est leur contrôle de non-régression, et pas celui-ci. Ici les deux
+    /// gates sont armés en même temps, le seul état que ces 32 tests ne
+    /// traversent pas, et chaque membre rend son propre motif sur le corps de sa
+    /// propre classe.
+    #[tokio::test]
+    async fn les_deux_membres_armes_rendent_chacun_son_motif() {
+        let h = TestHarness::with_agent("mika-qa");
+        let target = "pr_review:senara-solutions/mika#2685";
+
+        let args = argv(&[
+            "pr",
+            "review",
+            "2685",
+            "--comment",
+            "--body",
+            MEASURED_BLOCK,
+        ]);
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_ARMED,
+            PASS_GATE_ARMED,
+            &args,
+            Some(MIKA_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("le chemin mika#2687 est intact");
+        assert!(
+            err.content.contains("pipeline_block_ungrounded"),
+            "{}",
+            err.content
+        );
+        assert!(err.content.contains("mika#2687"), "{}", err.content);
+        assert!(
+            !err.content.contains("mika#2961"),
+            "un refus de `block[pipeline]` ne porte pas la doctrine du `pass` : {}",
+            err.content
+        );
+
+        let args = argv(&[
+            "pr",
+            "review",
+            "2685",
+            "--comment",
+            "--body",
+            GROUNDED_BLOCK,
+        ]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_ARMED,
+                PASS_GATE_ARMED,
+                &args,
+                Some(MIKA_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "et un `block[pipeline]` fondé passe toujours, les deux gates armés"
+        );
+        assert_eq!(rows(&h, target, "refused").await, 1);
+        assert_eq!(rows(&h, target, "allowed").await, 1);
+    }
+
+    /// Ce que ce module ne prouve pas par un tour, et ce qui le tient : le bit
+    /// que la chaîne `run_gh` passe réellement est l'**interrupteur**, pas un
+    /// `false` en dur.
+    ///
+    /// Tous les cas ci-dessus passent le bit en paramètre, donc aucun d'eux ne
+    /// rougirait si `validate_pipeline_block_grounding` — le seul appelant que
+    /// `run_gh` atteint — figeait son second argument à `false`. Le garde serait
+    /// alors mort sur toute la flotte, interrupteur ouvert ou non, et chaque
+    /// assertion de comportement resterait verte : c'est la classe mika#2158.
+    /// Un scan de source le refuse, sur le même `ProductionScanner` que le
+    /// lecteur unique de mika#2687.
+    ///
+    /// L'interrupteur a **deux** lecteurs de production, un par rôle, et les
+    /// deux sont exigés : la décision (ici) et la ligne de démarrage qui dit
+    /// qu'il est désarmé (`log_pass_evidence_gate_state`, dans `guards.rs`) —
+    /// la seconde moitié d'AC4. Le scan tient les deux rôles plutôt qu'un
+    /// compte : zéro lecteur de décision est un garde mort, zéro lecteur de
+    /// démarrage est un réglage qu'on ne peut pas observer (mika#2293), et un
+    /// troisième site serait une seconde résolution à côté du `OnceLock`.
+    #[test]
+    fn linterrupteur_a_un_lecteur_de_production_par_role() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut readers: Vec<String> = Vec::new();
+        scanner.for_each(|path, production| {
+            for (i, text) in production.lines().enumerate() {
+                if text.contains("pass_evidence_gate_armed()") && !text.contains("fn ") {
+                    let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+                    readers.push(format!("{rel}:{}: {}", i + 1, text.trim()));
+                }
+            }
+        });
+        readers.sort();
+        assert_eq!(
+            readers.len(),
+            2,
+            "mika#2961 : l'interrupteur a exactement DEUX lecteurs de production, \
+             un par rôle — la décision dans `skills/builtin_handlers.rs` et la \
+             ligne de démarrage dans `evidence/guards.rs`. Un de moins est un \
+             rôle perdu en silence ; un de plus est une seconde résolution à côté \
+             du `OnceLock`. Trouvés : {readers:#?}"
+        );
+        assert!(
+            readers[0].starts_with("evidence/guards.rs:"),
+            "le lecteur de démarrage (AC4) doit rester dans `guards.rs`, avec \
+             l'interrupteur — trouvé : {}",
+            readers[0]
+        );
+        assert!(
+            readers[1].starts_with("skills/builtin_handlers.rs:"),
+            "le lecteur de décision reste l'enveloppe non gatée de cette chaîne, \
+             celle que `run_gh` atteint — trouvé : {}",
+            readers[1]
+        );
+    }
+
+    /// Un corps que ce garde ne lit pas ne devient pas un refus : `--body-file`
+    /// est hors de sa portée, donc l'appel traverse.
+    ///
+    /// C'est le côté sûr de l'arithmétique de mika#2455, et il compte plus pour
+    /// ce membre-ci que pour son voisin : un faux refus sur un `pass` tue le
+    /// tour **sans aucune revue postée**, sur la population la plus fréquente de
+    /// la flotte.
+    #[tokio::test]
+    async fn un_corps_illisible_traverse_plutot_que_detre_refuse() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "217", "--approve", "--body-file", "b.md"]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_DISARMED,
+                PASS_GATE_ARMED,
+                &args,
+                Some(CM_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(all_rows(&h, CM_TARGET).await, 0);
     }
 }
