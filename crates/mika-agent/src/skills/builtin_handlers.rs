@@ -4094,10 +4094,16 @@ async fn validate_pr_review_flag_coherence(
 /// # The name is one member behind
 ///
 /// `validate_pipeline_block_grounding` was exact while the population had a
-/// single member. The rename to `validate_pipeline_evidence` travels with
-/// mika#2961's flight 2/2 (the `NEGATIVE-TEST:` motif), so that a rename diff
-/// does not ride inside a behaviour diff. Tracked in the follow-up ticket named
-/// in that flight's PR body.
+/// single member. It is now two members and three refusal classes behind, and
+/// the rename to `validate_pipeline_evidence` did **not** travel with mika#2961's
+/// flight 2/2 either, where this comment said it would — for a reason that is a
+/// perimeter fact rather than a preference: the function's single call site sits
+/// inside `run_gh`'s body, which mika#2966 was modifying in parallel on
+/// 2026-10-30, and that flight's written scope constraint keeps every line of
+/// `run_gh` out of its diff. A rename whose call site cannot move is not a
+/// rename. Plan: `docs/plans/2026-10-30-001-fix-2961-la-ligne-negative-test-plan.md`
+/// § 0. Tracked in the follow-up ticket named in that flight's PR body, whose
+/// precondition is the merge of mika#2966.
 async fn validate_pipeline_block_grounding(
     args: &[String],
     repo: Option<&str>,
@@ -4185,12 +4191,18 @@ async fn validate_pipeline_block_grounding_gated(
         true
     };
 
-    let (reason, reasoning) = match classify_pipeline_block_grounding(
+    // The outcome is bound rather than matched inline because the `pass` member
+    // now has **two** refusal classes and each one gets its own remedy below.
+    // Binding it keeps that second branch typed — a `reason` string comparison
+    // would drift silently the day the token is renamed.
+    let outcome = classify_pipeline_block_grounding(
         verdict_is_pipeline_block,
         verdict_is_pass,
         &body,
         guard_execution_observed,
-    ) {
+    );
+
+    let (reason, reasoning) = match outcome {
         PipelineGroundingOutcome::Allowed => {
             // The positive control, and the reason this branch writes a row
             // rather than returning early: a population of zero allowed
@@ -4227,6 +4239,10 @@ async fn validate_pipeline_block_grounding_gated(
             "pass_section_absent",
             "pass with no PIPELINE: section anywhere in the body",
         ),
+        PipelineGroundingOutcome::RefusedPassNegativeTestAbsent => (
+            "pass_negative_test_absent",
+            "pass with no NEGATIVE-TEST: line anywhere in the body",
+        ),
     };
 
     // Two **separate** event names, one per member, and the choice is
@@ -4261,6 +4277,53 @@ async fn validate_pipeline_block_grounding_gated(
     // anchored on that line prefix, and a stray line would be re-read as a
     // verdict by the next consumer of this payload. The tokens are named in
     // plain prose for that reason.
+    if outcome == PipelineGroundingOutcome::RefusedPassNegativeTestAbsent {
+        // The second refusal class of the `pass` member (mika#2961, flight 2/2)
+        // gets its own remedy for the same reason the member got one from
+        // mika#2687's: the section remedy below talks about running a guard and
+        // posting its output, which is a non-sequitur here — the section is
+        // already there, and what is missing is a line about the diff's negative
+        // assertion. One wrong remedy costs a turn and teaches the model the
+        // wrong lesson.
+        //
+        // **Three of the prompt's four forms are named, and the fourth is named
+        // as refused.** `missing` is only consistent with `block[ac]`, and the
+        // downstream merge handler rejects a `pass` that carries it
+        // (`self-dev-webhook-qa`, mika#2264) — so a remedy that listed all four
+        // would hand the model a one-token way out of this gate that costs it
+        // the merge one hop later. The sentence says so rather than hiding it:
+        // a perverse incentive named is one the next reader can measure.
+        //
+        // No line of this text may START with a verdict label (`VERDICT_RE` is
+        // anchored there), and — new with this flight — none may START with the
+        // token this gate reads either: a remedy carrying its own anchored line
+        // would satisfy the very guard it explains if the model pasted the
+        // refusal into its next body. The token is therefore cited mid-sentence,
+        // and the test module asserts that property over every line of this
+        // payload rather than trusting the author.
+        let body = serde_json::json!({
+            "error": "pass_negative_test_absent",
+            "doctrine": "mika#2961",
+            "target": target_key,
+            "reason": reason,
+            "remedy": "This approval carries a pipeline section but no NEGATIVE-TEST: line, and \
+                       the prompt you are running requires exactly one such top-level line in \
+                       every verdict body. Add it, naming the invariant and what holds it: the \
+                       satisfied form when the diff carries a test asserting the invariant (name \
+                       the invariant, then the test file and symbol); the mechanical form when \
+                       the perimeter has no behavior change to assert against; the n/a form when \
+                       the PR is out of perimeter altogether. A fourth form exists in the prompt \
+                       and is not a way out of this refusal: the missing form is consistent only \
+                       with a blocking verdict on acceptance criteria, and the downstream merge \
+                       handler rejects an approval that carries it, so writing it here costs the \
+                       merge one hop later instead of buying it. Do not weaken your conclusion to \
+                       fit this refusal either — if no negative assertion exists and the \
+                       perimeter does change behavior, that is a finding about the diff, and the \
+                       verdict that states it is the blocking one.",
+        });
+        return Err(ToolOutput::error(body.to_string()));
+    }
+
     if verdict_is_pass {
         // The `pass` member gets its **own** remedy, and that is the whole point
         // of writing one: mika#2687's text says "run the guard and quote its
@@ -14136,8 +14199,13 @@ mod mika2961_pass_evidence {
                                   verification)\n\nFINDINGS: none\n";
 
     /// Le même corps, plus la ligne que Step 2D prescrivait à ce dépôt-là —
-    /// verbatim de `system_prompt.md:275`. C'est le contrôle positif : un seul
-    /// changement entre lui et le corps mesuré, et c'est le terme du garde.
+    /// verbatim de `system_prompt.md:275`. Un seul changement entre lui et le
+    /// corps mesuré, et c'est le **premier** terme du garde.
+    ///
+    /// C'était le contrôle positif du vol 1. Depuis le vol 2/2 il est la fixture
+    /// du **second** refus : la section y est, la ligne de test négatif n'y est
+    /// pas, et c'est exactement la forme que le vol 1 laissait passer. Le
+    /// contrôle positif est devenu [`CM217_CONFORME`].
     const CM217_WITH_STEP_2D: &str = "VERDICT: pass\nDEPTH: code-level\nREASON: Idempotent POST \
                                       /messages on client_ref with detached delivery, reconcile \
                                       command, and 5 ACs all verified against \
@@ -14145,6 +14213,24 @@ mod mika2961_pass_evidence {
                                       found in senara-solutions/control-monitor: checked \
                                       scripts/verify-pipeline.sh, \
                                       scripts/plan-doc-check.sh)\n\nFINDINGS: none\n";
+
+    /// Le corps **conforme** : la section de Step 2D *et* la ligne de test
+    /// négatif dans la forme `n/a` de `system_prompt.md:412` — ce que la revue
+    /// de control-monitor#217 devait porter, et le contrôle positif du membre
+    /// `pass` depuis le vol 2/2.
+    ///
+    /// Un seul changement le sépare de [`CM217_WITH_STEP_2D`], et c'est le
+    /// second terme du garde. Les deux moitiés sont verbatim du prompt ; leur
+    /// assemblage ne l'est pas, parce qu'aucun des 260 `pass` mesurés le
+    /// 2026-10-30 ne portait les deux.
+    const CM217_CONFORME: &str = "VERDICT: pass\nDEPTH: code-level\nREASON: Idempotent POST \
+                                  /messages on client_ref with detached delivery, reconcile \
+                                  command, and 5 ACs all verified against \
+                                  source.\n\nPIPELINE: not-applicable (no executable guard \
+                                  found in senara-solutions/control-monitor: checked \
+                                  scripts/verify-pipeline.sh, \
+                                  scripts/plan-doc-check.sh)\n\nNEGATIVE-TEST: n/a — PR out of \
+                                  perimeter\n\nFINDINGS: none\n";
 
     /// Un `block[pipeline]` fondé, pour le seul cas qui fait cohabiter les deux
     /// membres. Copie de `GROUNDED_BODY` du module voisin — recopiée plutôt
@@ -14269,29 +14355,142 @@ mod mika2961_pass_evidence {
                 "le remedy porte une ligne de section qui satisferait ce garde : \
                  {line:?}"
             );
+            // Piège 3, ajouté par le vol 2/2 : le second terme est une ligne
+            // ancrée aussi, donc le même recollage satisferait le second terme
+            // avec le texte du premier refus.
+            assert!(
+                !crate::evidence::guards::negative_test_line_present(line),
+                "le remedy porte une ligne de test négatif qui satisferait le \
+                 second terme de ce garde : {line:?}"
+            );
         }
+    }
+
+    /// V7′ — les mêmes pièges sur le remedy du **second** refus, plus la
+    /// propriété qui lui est propre : il nomme trois des quatre formes du
+    /// prompt, et nomme la quatrième comme refusée.
+    ///
+    /// Les deux remedys sont deux textes distincts, donc deux surfaces
+    /// distinctes : asserter l'un ne dit rien de l'autre, et c'est le second qui
+    /// court le risque neuf — celui de porter lui-même la ligne qu'il réclame.
+    #[tokio::test]
+    async fn le_remedy_de_la_ligne_nomme_les_formes_sans_offrir_la_sortie_contradictoire() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(CM217_WITH_STEP_2D),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("refusé");
+
+        // Les trois formes compatibles avec une approbation sont nommées.
+        for forme in ["satisfied", "mechanical", "n/a"] {
+            assert!(
+                err.content.contains(forme),
+                "la forme `{forme}` doit être nommée, sinon le modèle l'écrit de \
+                 mémoire : {}",
+                err.content
+            );
+        }
+        // Et la quatrième est nommée comme refusée, jamais offerte : un `pass`
+        // qui la porte est rejeté par le handler de merge en aval (mika#2264),
+        // donc la lister sans le dire achèterait un tour contre un merge.
+        assert!(
+            err.content.contains("missing"),
+            "la forme contradictoire doit être NOMMÉE — une incitation perverse \
+             passée sous silence est une incitation qu'on ne peut pas mesurer : {}",
+            err.content
+        );
+        assert!(
+            err.content.contains("rejects"),
+            "et dite comme refusée en aval, dans la même phrase : {}",
+            err.content
+        );
+
+        for line in err.content.lines() {
+            assert!(
+                !line.trim_start().starts_with("VERDICT:"),
+                "une ligne du remedy serait relue comme un verdict : {line:?}"
+            );
+            assert!(
+                !crate::evidence::guards::negative_test_line_present(line),
+                "le remedy porte la ligne même qu'il réclame — il satisferait \
+                 donc le garde qu'il explique : {line:?}"
+            );
+            assert!(
+                !crate::evidence::guards::pipeline_section_present(line),
+                "et il ne porte pas davantage de ligne de section : {line:?}"
+            );
+        }
+    }
+
+    /// V4′ — le corps qui portait la section et rien d'autre : refusé par le
+    /// **second** terme, sous son propre motif et sa propre ligne d'audit.
+    ///
+    /// C'est le test qui atteste le vol 2/2 de bout en bout côté câblage : au
+    /// vol 1 ce même corps traversait avec une ligne `allowed`, et c'est le
+    /// basculement de cette assertion qui dit que le second terme est réellement
+    /// branché — pas seulement classé.
+    #[tokio::test]
+    async fn un_pass_sans_ligne_de_test_negatif_est_refuse_sous_son_propre_motif() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(CM217_WITH_STEP_2D),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("la section seule ne suffit plus depuis le vol 2/2");
+        assert!(
+            err.content.contains("pass_negative_test_absent"),
+            "le motif ET la clé d'erreur du second refus — un refus de ligne \
+             classé sous `pass_evidence_absent` serait indistinguable du premier \
+             dans les greps qui lisent cette charge utile (motif mika#2131) : {}",
+            err.content
+        );
+        assert!(
+            !err.content.contains("pass_evidence_absent"),
+            "et il ne porte pas la clé du premier : {}",
+            err.content
+        );
+        assert!(err.content.contains("mika#2961"), "{}", err.content);
+        assert_eq!(rows(&h, CM_TARGET, "refused").await, 1);
+        assert_eq!(
+            all_rows(&h, CM_TARGET).await,
+            1,
+            "une ligne, et une seule : le membre `pass` ne lit pas le ledger, \
+             donc n'écrit pas de ligne d'abstention à côté"
+        );
     }
 
     /// V4 — le contrôle positif, et sa ligne `allowed`.
     ///
-    /// Un seul changement sépare ce corps du précédent : la ligne de Step 2D.
-    /// La ligne `allowed` est ce qui distingue « le garde n'a rien refusé » de
-    /// « le garde n'a jamais été atteint » (mika#2205) — sans elle, une table
-    /// vide a deux causes de signe opposé.
+    /// Un seul changement sépare ce corps du précédent : la ligne de test
+    /// négatif. La ligne `allowed` est ce qui distingue « le garde n'a rien
+    /// refusé » de « le garde n'a jamais été atteint » (mika#2205) — sans elle,
+    /// une table vide a deux causes de signe opposé. Et sans ce cas, un garde
+    /// qui refuserait **tout** `pass` resterait vert sur tout le reste du
+    /// module.
     #[tokio::test]
-    async fn un_pass_qui_porte_la_section_traverse_et_laisse_sa_ligne() {
+    async fn un_pass_conforme_traverse_et_laisse_sa_ligne() {
         let h = TestHarness::with_agent("mika-qa");
         assert!(
             validate_pipeline_block_grounding_gated(
                 BLOCK_GATE_DISARMED,
                 PASS_GATE_ARMED,
-                &cm_argv(CM217_WITH_STEP_2D),
+                &cm_argv(CM217_CONFORME),
                 Some(CM_REPO),
                 &h.ctx()
             )
             .await
             .is_ok(),
-            "la sortie que Step 2D prescrit à un dépôt sans garde est la bonne"
+            "la sortie que Step 2D et Step 2.5.5 prescrivent ensemble à un dépôt \
+             sans garde est la bonne"
         );
         assert_eq!(rows(&h, CM_TARGET, "allowed").await, 1);
         assert_eq!(
@@ -14482,6 +14681,69 @@ mod mika2961_pass_evidence {
              celle que `run_gh` atteint — trouvé : {}",
             readers[1]
         );
+    }
+
+    /// Les deux jetons ancrés n'ont **qu'un** site littéral chacun en
+    /// production : leur `const`.
+    ///
+    /// La classe que ce scan ferme est celle du vol entier, retournée contre
+    /// lui-même. Un site qui écrirait `body.contains("NEGATIVE-TEST:")` — ou le
+    /// jeton de section — au lieu de passer par le prédicat ancré rendrait
+    /// exactement le fail-open mesuré : la prose de la revue de PR #2967
+    /// compterait pour la ligne qu'elle dit reportée. Aucune assertion de
+    /// comportement de ce module ne devient fausse dans ce cas, parce qu'aucune
+    /// ne traverse ce site-là : c'est la classe mika#2158, et elle se referme en
+    /// scannant la source.
+    ///
+    /// Le prédicat anchore sur le **littéral entier entre guillemets** et pas
+    /// sur le jeton nu, pour une raison qui est tout l'intérêt du scan : les
+    /// deux remedys citent les deux jetons en pleine phrase, et c'est prescrit —
+    /// un refus qui ne nomme pas ce qu'il réclame ne s'explique pas. Ce qui est
+    /// refusé est la *comparaison en dur*, pas la mention.
+    #[test]
+    fn les_deux_jetons_ancres_nont_quun_site_litteral_de_production() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let needles = [
+            crate::evidence::guards::PIPELINE_SECTION_LINE_PREFIX,
+            crate::evidence::guards::NEGATIVE_TEST_LINE_PREFIX,
+        ];
+        let mut sites: Vec<String> = Vec::new();
+        scanner.for_each(|path, production| {
+            for (i, text) in production.lines().enumerate() {
+                let t = text.trim_start();
+                if t.starts_with("//") || t.starts_with("///") || t.starts_with("* ") {
+                    continue;
+                }
+                for needle in needles {
+                    // Le littéral entier, guillemets comprises. `format!` plutôt
+                    // qu'une chaîne écrite ici : le jeton ne doit vivre qu'au
+                    // site de sa `const`, celui-ci compris.
+                    if text.contains(&format!("\"{needle}\"")) {
+                        let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+                        sites.push(format!("{rel}:{}: {}", i + 1, t));
+                    }
+                }
+            }
+        });
+        sites.sort();
+        assert_eq!(
+            sites.len(),
+            2,
+            "mika#2961 : chacun des deux jetons ancrés n'a qu'UN site littéral de \
+             production, sa `const` dans `evidence/guards.rs`. Un second site est \
+             une comparaison en dur qui contourne le prédicat ancré — quand ce \
+             test rougit, router le site par `line_prefix_present`, ne pas \
+             ajouter de ligne (doctrine mika#2201). Trouvés : {sites:#?}"
+        );
+        for site in &sites {
+            assert!(
+                site.starts_with("evidence/guards.rs:") && site.contains("const "),
+                "le seul site littéral autorisé est la déclaration de la `const` — \
+                 trouvé : {site}"
+            );
+        }
     }
 
     /// Un corps que ce garde ne lit pas ne devient pas un refus : `--body-file`
