@@ -822,6 +822,13 @@ fn base_semee(corpus: &[(&str, u32, &str, &str)]) -> Database {
     db
 }
 
+/// L'instant du cycle qui date la lecture CI (mika#2968). Les sous-tickets d'ici
+/// portent `pr_link_source: None`, donc **aucune** CI n'y est lue — la
+/// connaissance reste `Unread(NotFromPrList)` et cette valeur n'entre dans
+/// aucune assertion de ce fichier. Elle existe pour que l'appel reste celui de
+/// la production.
+const AU_CYCLE_DE: &str = "2026-10-29T17:46:12Z";
+
 /// Un sous-ticket du milestone cible, tel que le `Reader` l'hydrate : seuls
 /// `number` et `pr_state` comptent pour l'évaluateur.
 fn sous_ticket(number: u64, pr_state: Option<&str>) -> crate::milestone_manager::types::SubIssue {
@@ -947,7 +954,7 @@ async fn mika2921_le_corpus_des_13_vols_rend_12_verdicts_et_aucun_pour_claude_pi
         .collect();
 
     let vols = source.finished_implement_flights(None).await;
-    let verdicts = evaluate_flights(&vols, &sub_issues);
+    let verdicts = evaluate_flights(&vols, &sub_issues, AU_CYCLE_DE);
 
     // AC1 — un verdict par vol d'un dépôt sous contrôle, et pas un de plus.
     assert_eq!(
@@ -1095,7 +1102,7 @@ async fn mika2921_hors_cible_letat_de_pr_est_non_lu_et_dans_la_cible_il_est_lu()
     let sub_issues = vec![sous_ticket(2921, Some("open"))];
 
     let vols = source.finished_implement_flights(None).await;
-    let verdicts = evaluate_flights(&vols, &sub_issues);
+    let verdicts = evaluate_flights(&vols, &sub_issues, AU_CYCLE_DE);
     assert_eq!(verdicts.len(), 2);
     let verdict_de = |n: u64| {
         verdicts
@@ -1123,8 +1130,12 @@ async fn mika2921_hors_cible_letat_de_pr_est_non_lu_et_dans_la_cible_il_est_lu()
             && ligne_dans.contains(" — PR open — "),
         "obtenu : {ligne_dans}"
     );
+    // L'aiguille nomme son segment depuis mika#2968 : « CI non lue » contient
+    // « non lu », et la CI de ces vols est bien non lue (la sous-issue ne porte
+    // aucune provenance de PR). Un `contains("non lu")` nu rougirait donc sur
+    // l'autre axe, sans rien dire de l'état de PR que ce test atteste.
     assert!(
-        !ligne_dans.contains("non lu"),
+        !ligne_dans.contains("état de PR non lu"),
         "un état lu ne se rend jamais comme non lu : {ligne_dans}"
     );
 

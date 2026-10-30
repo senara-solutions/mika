@@ -173,7 +173,7 @@ use tracing::warn;
 use crate::async_db::AsyncDatabase;
 use crate::evidence::audit::AUDIT_RETENTION_DAYS;
 use crate::milestone_manager::evaluator::{
-    DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, NotFlightReason,
+    CiKnowledge, DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, NotFlightReason,
 };
 use crate::milestone_manager::reporter::{flight_issue_label, flight_recommendation_label};
 
@@ -259,6 +259,21 @@ const ISSUE_NUMBER_PREFIX: &str = "issue_number=";
 pub struct VerdictRecord {
     pub issue: FlightIssue,
     pub recommendation: FlightRecommendation,
+    /// Ce que le manager savait de la CI quand il a écrit cette ligne
+    /// (mika#2968).
+    ///
+    /// La ligne reste fidèle, donc elle le porte. La **comparaison** ne le voit
+    /// pas : [`VerdictRecord::terms`] ne le projette pas, et c'est délibéré.
+    /// MPC juge à la main et n'écrit aucun état CI ; si la CI entrait dans les
+    /// termes, chaque vol divergerait sur un terme que l'un des deux côtés ne
+    /// produit jamais, et la divergence du vol 4f1fe163 — qui est une
+    /// divergence de *recommandation* — serait noyée (AC4).
+    ///
+    /// Le défaut est celui de l'évaluateur, appelé et non recopié : une ligne
+    /// écrite avant ce champ n'a porté aucune lecture, et dire `Read` à sa
+    /// place serait inventer une mesure (motif mika#2331).
+    #[serde(default = "CiKnowledge::default_unread")]
+    pub ci: CiKnowledge,
 }
 
 impl From<&FlightVerdict> for VerdictRecord {
@@ -266,6 +281,7 @@ impl From<&FlightVerdict> for VerdictRecord {
         Self {
             issue: v.issue.clone(),
             recommendation: v.recommendation,
+            ci: v.ci.clone(),
         }
     }
 }
@@ -660,6 +676,11 @@ pub fn parse_judgment_terms(
     Ok(VerdictRecord {
         issue: parse_issue_term(issue, cause)?,
         recommendation: parse_recommendation_term(recommendation)?,
+        // MPC juge à la main et ne lit aucun `statusCheckRollup` : sa ligne ne
+        // porte donc aucune lecture CI (mika#2968). Aucun terme ne l'expose à
+        // la ligne de commande — ce serait demander à l'opérateur d'attester
+        // une mesure qu'il n'a pas faite.
+        ci: CiKnowledge::default_unread(),
     })
 }
 
@@ -1310,6 +1331,8 @@ mod tests {
     use super::test_support::RecordingLedger;
     use super::*;
     use crate::db::Database;
+    use crate::milestone_manager::evaluator::CiUnreadCause;
+    use crate::milestone_manager::types::CiState;
     use crate::source_scan::{
         audit_writers, production_files, production_half, strip_comment_lines,
     };
@@ -1327,6 +1350,7 @@ mod tests {
             last_commit_turn: None,
             recommendation: FlightRecommendation::Regroom,
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: Some("2026-10-26T10:00:00Z".to_string()),
         }
     }
@@ -1348,6 +1372,7 @@ mod tests {
             last_commit_turn: None,
             recommendation: FlightRecommendation::MergeCandidate,
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: None,
         }
     }
@@ -1366,6 +1391,7 @@ mod tests {
             last_commit_turn: None,
             recommendation: FlightRecommendation::Nothing,
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: Some("2026-10-28T12:10:00Z".to_string()),
         }
     }
@@ -2735,6 +2761,7 @@ mod tests {
                 cause: DeathCause::Escalated,
             },
             recommendation: FlightRecommendation::Regroom,
+            ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
         };
 
         let cote_manager = render_concordance_text(&ConcordanceReport {
@@ -2787,6 +2814,7 @@ mod tests {
             manager: Some(VerdictRecord {
                 issue: FlightIssue::Dead { cause },
                 recommendation: FlightRecommendation::Regroom,
+                ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             }),
             mpc: None,
             agreement: FlightAgreement::NotJudgedByMpc,
@@ -3066,6 +3094,84 @@ mod tests {
         assert!(
             code.contains("write_is_armed"),
             "le prédicat doit mordre sur un site de production fabriqué"
+        );
+    }
+
+    // ---- mika#2968 : le champ CI entre au registre, pas au comparateur ----
+
+    fn record_avec_ci(ci: CiKnowledge) -> VerdictRecord {
+        VerdictRecord {
+            issue: FlightIssue::PrOpened {
+                number: Some(2966),
+                url: None,
+            },
+            recommendation: FlightRecommendation::MergeCandidate,
+            ci,
+        }
+    }
+
+    /// AC4 — la CI n'entre pas dans les termes comparés.
+    ///
+    /// Deux lignes qui ne diffèrent que par la couleur de la CI rendent les
+    /// **mêmes** `VerdictTerms`. C'est la moitié refusée du ticket : projeter la
+    /// CI dans la comparaison aurait noyé la divergence du vol 4f1fe163 dans une
+    /// seconde, sur un axe que MPC ne juge pas — il juge à la main et ne lit
+    /// aucun `statusCheckRollup`.
+    #[test]
+    fn mika2968_ac4_la_ci_nentre_pas_dans_les_termes_compares() {
+        let rouge = record_avec_ci(CiKnowledge::Read {
+            state: CiState::Failed,
+            at: "2026-10-29T17:46:12Z".into(),
+        });
+        let vert = record_avec_ci(CiKnowledge::Read {
+            state: CiState::Success,
+            at: "2026-10-29T17:46:12Z".into(),
+        });
+        assert_ne!(
+            rouge.ci, vert.ci,
+            "anti-vacuité : les deux lignes diffèrent"
+        );
+        assert_eq!(
+            rouge.terms(),
+            vert.terms(),
+            "la CI n'entre pas dans les termes comparés"
+        );
+    }
+
+    /// AC4, seconde moitié — la divergence du vol mesuré reste divergente, et
+    /// le nouveau champ l'explique.
+    ///
+    /// La ligne du manager est relue depuis un blob **antérieur** au champ : son
+    /// `ci` vaut donc `Unread(NotMeasured)` — « rien n'a été mesuré », jamais une
+    /// CI verte inventée (mika#2331). Le verdict reste `divergent` sur
+    /// `recommendation`, exactement comme avant ce ticket.
+    #[test]
+    fn mika2968_ac4_la_divergence_du_vol_4f1fe163_reste_divergente() {
+        let manager: VerdictRecord = serde_json::from_str(
+            r#"{"issue":{"pr_opened":{"number":2966,"url":null}},
+                "recommendation":"merge_candidate"}"#,
+        )
+        .expect("un blob de verdict antérieur au champ se relit");
+        assert_eq!(
+            manager.ci,
+            CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            "un blob antérieur au champ ne porte aucune mesure"
+        );
+
+        let mpc = VerdictRecord {
+            issue: FlightIssue::PrOpened {
+                number: Some(2966),
+                url: None,
+            },
+            recommendation: FlightRecommendation::ManualResumption,
+            ci: CiKnowledge::default_unread(),
+        };
+
+        assert_eq!(
+            first_divergence(&manager.terms(), &mpc.terms()),
+            FlightAgreement::Divergent {
+                field: FIELD_RECOMMENDATION
+            }
         );
     }
 }

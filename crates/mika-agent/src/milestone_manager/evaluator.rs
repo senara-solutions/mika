@@ -37,7 +37,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::types::{MilestoneState, SubIssue};
+use super::types::{CiState, MilestoneState, PrLinkSource, SubIssue};
 
 // ---- Le verdict ------------------------------------------------------------
 
@@ -144,6 +144,69 @@ pub enum PrStateKnowledge {
     NotRead,
 }
 
+/// Ce que le manager **sait** de la CI de la tête de la PR d'un vol (mika#2968).
+///
+/// Même forme et même raison que [`PrStateKnowledge`], sur un autre axe : la CI
+/// d'une PR n'est lue que lorsque la PR est venue de la liste du milestone
+/// (`gh pr list --search milestone:<n>`, seule requête qui rend un
+/// `statusCheckRollup`). Pour tous les autres vols, il n'y a **pas de mesure** —
+/// et « pas de mesure » n'est pas « pas de check » : [`CiState::None`] dit qu'une
+/// lecture a eu lieu et n'a trouvé aucun check, [`CiKnowledge::Unread`] dit que
+/// rien n'a été lu. Deux populations sous un `Option` auraient rendu les mêmes
+/// octets (classe mika#2205), et la plus dangereuse des deux confusions serait
+/// qu'une CI non lue passe pour verte (AC du ticket, point 3).
+///
+/// La variante `Read` porte **le moment de la lecture**, parce que la
+/// recommandation qu'elle fonde est écrite une fois et jamais révisée : sans cet
+/// instant, le rapport affirmerait un état CI sans dire de quand il date.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiKnowledge {
+    /// La CI de la tête a été lue, à cet instant (ISO 8601 UTC — le `now` du
+    /// cycle, pas une horloge de ce module).
+    Read { state: CiState, at: String },
+    /// Rien n'a été lu, et la cause est **nommée** plutôt qu'avalée.
+    Unread(CiUnreadCause),
+}
+
+/// Pourquoi la CI d'un vol n'a pas été lue (mika#2968).
+///
+/// Énumération **fermée** : chaque variante correspond à un point précis où la
+/// chaîne de provenance se casse, et aucune ne vaut « échec inconnu ». Élargir
+/// la famille demande d'ajouter la variante ici, donc de décider par écrit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiUnreadCause {
+    /// La sous-issue est appariée, mais son lien de PR ne vient **pas** de la
+    /// liste du milestone — donc son `ci_state` ne vient d'aucune lecture de la
+    /// PR. C'est le cas modal de la boucle : mesuré le 2026-10-29, aucune des
+    /// cinq PR du jour ne portait le milestone.
+    NotFromPrList,
+    /// Le ticket du vol n'est apparié à aucune sous-issue du milestone cible —
+    /// le pendant CI de [`PrStateKnowledge::NotRead`].
+    NoSubIssue,
+    /// Le vol ne porte pas d'URL de ticket, donc il n'y a rien à apparier.
+    NoIssueNumber,
+    /// **Non mesurée** : c'est le défaut à la désérialisation. Un blob de rapport
+    /// antérieur à mika#2968 ne porte pas le champ, donc il ne porte aucune
+    /// lecture — dire `Read` à sa place serait inventer une mesure.
+    NotMeasured,
+}
+
+impl CiKnowledge {
+    /// Le défaut serde du champ [`FlightVerdict::ci`] — voir
+    /// [`CiUnreadCause::NotMeasured`].
+    ///
+    /// `pub(crate)` parce que `VerdictRecord::ci`
+    /// (`crate::flight_verdict_ledger`) prend **le même** défaut : les deux
+    /// désérialisent la même population de blobs antérieurs au champ, et une
+    /// seconde graphie du défaut diverge le jour où l'une des deux change
+    /// (mika#2201). Un `impl Default` aurait été cette seconde graphie.
+    pub(crate) fn default_unread() -> Self {
+        CiKnowledge::Unread(CiUnreadCause::NotMeasured)
+    }
+}
+
 /// Ce que le manager recommande à l'opérateur pour ce vol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -203,6 +266,15 @@ pub struct FlightVerdict {
     /// variante par défaut dit.
     #[serde(default)]
     pub pr_state: PrStateKnowledge,
+    /// Ce que le manager sait de la CI de la tête de la PR (mika#2968) — lue à
+    /// un instant nommé, ou non lue pour une cause nommée.
+    ///
+    /// `#[serde(default = "CiKnowledge::default_unread")]` ⇒
+    /// `Unread(NotMeasured)`, pour la même raison que `pr_state` : un blob
+    /// antérieur à ce champ ne porte aucune lecture, et c'est exactement ce que
+    /// ce défaut dit.
+    #[serde(default = "CiKnowledge::default_unread")]
+    pub ci: CiKnowledge,
     pub recommendation: FlightRecommendation,
     /// ISO 8601 UTC — `tasks.completed_at`.
     pub completed_at: Option<String>,
@@ -298,18 +370,49 @@ pub fn milestone_issue_urls(state: &MilestoneState) -> Vec<String> {
 /// des vols vient du périmètre des dépôts sous contrôle, et un vol qui ne
 /// s'apparie à rien reçoit tout de même son verdict — avec
 /// [`PrStateKnowledge::NotRead`] au lieu d'un état deviné.
-pub fn evaluate_flights(flights: &[FinishedFlight], sub_issues: &[SubIssue]) -> Vec<FlightVerdict> {
+///
+/// `read_at` est l'instant **du cycle** (ISO 8601 UTC), porté par la variante
+/// [`CiKnowledge::Read`] (mika#2968). Il est passé plutôt que capturé ici :
+/// aucune horloge ne vit dans ce module, et le `now` du cycle majore la lecture
+/// `gh` au lieu de la dater après les sept appels — d'où le libellé « au cycle
+/// de » plutôt que « lue à » (§ 2.5 du plan).
+pub fn evaluate_flights(
+    flights: &[FinishedFlight],
+    sub_issues: &[SubIssue],
+    read_at: &str,
+) -> Vec<FlightVerdict> {
     flights
         .iter()
         .map(|f| {
             let issue_number = issue_number_from_url(f.reference_url.as_deref());
+            let matched = issue_number.and_then(|n| sub_issues.iter().find(|s| s.number == n));
             // L'échec d'appariement n'est pas « pas d'état » : c'est « pas lu ».
-            let pr_state =
-                match issue_number.and_then(|n| sub_issues.iter().find(|s| s.number == n)) {
-                    Some(s) => PrStateKnowledge::Read(s.pr_state.clone()),
-                    None => PrStateKnowledge::NotRead,
-                };
-            evaluate_flight(f, issue_number, &pr_state)
+            let pr_state = match matched {
+                Some(s) => PrStateKnowledge::Read(s.pr_state.clone()),
+                None => PrStateKnowledge::NotRead,
+            };
+            // La CI n'est lue que si sa **provenance** la garantit (mika#2968) :
+            // `ci_state` vaut `CiState::None` aussi bien pour « lue, aucun
+            // check » que pour « ce chemin ne lit aucun rollup », et seul
+            // `pr_link_source` sépare les deux. Sans ce garde, le second
+            // passerait pour le premier — donc une CI non lue passerait pour
+            // verte, ce que le ticket interdit (classe mika#2205).
+            let ci = match (issue_number, matched) {
+                (None, _) => CiKnowledge::Unread(CiUnreadCause::NoIssueNumber),
+                (Some(_), None) => CiKnowledge::Unread(CiUnreadCause::NoSubIssue),
+                (Some(_), Some(s)) => match s.pr_link_source {
+                    // Seule la liste des PR du milestone rend un
+                    // `statusCheckRollup`, donc elle seule atteste une lecture.
+                    Some(PrLinkSource::MilestonePrList) => CiKnowledge::Read {
+                        state: s.ci_state.clone(),
+                        at: read_at.to_string(),
+                    },
+                    // `IssueClosingRef` ne porte pas de rollup ; `None` est un
+                    // blob antérieur à mika#2924. Deux raisons, une conclusion.
+                    _ => CiKnowledge::Unread(CiUnreadCause::NotFromPrList),
+                },
+            };
+            evaluate_flight(f, issue_number, &pr_state, &ci)
         })
         .collect()
 }
@@ -319,10 +422,15 @@ pub fn evaluate_flights(flights: &[FinishedFlight], sub_issues: &[SubIssue]) -> 
 /// `closed` / `merged`, ou `None` s'il n'y en a pas),
 /// [`PrStateKnowledge::NotRead`] quand le ticket n'appartient pas au milestone
 /// cible et n'a donc jamais été lu.
+///
+/// `ci` est ce qu'il sait de la CI de la tête de cette PR (mika#2968) — lue à un
+/// instant nommé, ou non lue pour une cause nommée. L'appelant la **compose**,
+/// ce qui garde la provenance hors de cette fonction.
 pub fn evaluate_flight(
     flight: &FinishedFlight,
     issue_number: Option<u64>,
     pr_state: &PrStateKnowledge,
+    ci: &CiKnowledge,
 ) -> FlightVerdict {
     let result = flight.result.as_deref().unwrap_or("");
     let pilot = PilotFields::parse(flight.metadata.as_deref());
@@ -331,8 +439,9 @@ pub fn evaluate_flight(
         task_id: flight.task_id.clone(),
         repo: flight.repo.clone(),
         issue_number,
-        recommendation: recommend(&issue, pr_state),
+        recommendation: recommend(&issue, pr_state, ci),
         pr_state: pr_state.clone(),
+        ci: ci.clone(),
         issue,
         turns_used: pilot.turns.or_else(|| {
             line_value(result, "Turns:").and_then(|v| v.split_whitespace().next()?.parse().ok())
@@ -360,12 +469,53 @@ pub fn evaluate_flight(
 /// la **présenter comme si l'état avait été lu** — et c'est au rendu, pas ici,
 /// que la non-lecture se dit (R7). Deviner `ManualResumption` sur une
 /// non-lecture enverrait un humain sur chaque vol de la boucle.
-fn recommend(issue: &FlightIssue, pr_state: &PrStateKnowledge) -> FlightRecommendation {
+///
+/// **La CI entre dans la décision depuis mika#2968, et par un seul bras** : une
+/// CI *lue* et rouge sur une PR encore ouverte rend `ManualResumption`. Trois
+/// choses que ce bras décide, et qui ne se devinent pas en le lisant :
+///
+/// - **`ManualResumption`, pas une variante neuve.** C'est le geste dû — la PR
+///   attend un correctif — et c'est ce que MPC a jugé sur le vol mesuré. Une
+///   quatrième variante ajouterait un terme au vocabulaire que `VerdictTerms`
+///   compare, donc à celui que MPC doit apprendre (mika#2158), pour un geste
+///   identique. Le *pourquoi* va dans le segment CI du rapport.
+/// - **`Pending` reste `MergeCandidate`.** Un verdict est écrit une fois, ~2 min
+///   après l'ouverture de la PR, pendant que la CI tourne. Refuser sur `Pending`
+///   rendrait `ManualResumption` sur la quasi-totalité des vols sains, et un
+///   instrument qui crie à chaque vol ne dit plus rien. Une CI en cours est une
+///   absence de preuve, pas une preuve de refus — et le gate de merge la refuse
+///   de lui-même.
+/// - **`Unread(_)` reste `MergeCandidate`**, comme `PrStateKnowledge::NotRead`
+///   et pour la même raison : deviner le refus sur une non-lecture enverrait un
+///   humain sur chaque vol. Ce que le manager doit cesser de faire, c'est
+///   présenter la non-lecture comme une CI verte, et c'est **au rendu** que
+///   cette distinction se dit.
+///
+/// Un rouge posé **après** le verdict ne le fait pas réviser : le verdict est
+/// une mesure horodatée, et l'`at` de [`CiKnowledge::Read`] est ce qui la rend
+/// honnête.
+fn recommend(
+    issue: &FlightIssue,
+    pr_state: &PrStateKnowledge,
+    ci: &CiKnowledge,
+) -> FlightRecommendation {
     match issue {
         FlightIssue::PrOpened { .. } => match pr_state {
             // Fusionnée ou fermée pendant que le vol volait : le verdict du vol
-            // est en retard sur la réalité, un humain tranche.
+            // est en retard sur la réalité, un humain tranche. **Avant** le bras
+            // CI, parce que l'état de la PR décide quelle que soit la CI.
             PrStateKnowledge::Read(Some(s)) if !s.eq_ignore_ascii_case("open") => {
+                FlightRecommendation::ManualResumption
+            }
+            // AC1 : une CI **lue** et rouge sur une PR encore ouverte.
+            _ if matches!(
+                ci,
+                CiKnowledge::Read {
+                    state: CiState::Failed,
+                    ..
+                }
+            ) =>
+            {
                 FlightRecommendation::ManualResumption
             }
             _ => FlightRecommendation::MergeCandidate,
@@ -696,11 +846,28 @@ mod tests {
         PrStateKnowledge::Read(etat.map(str::to_string))
     }
 
+    /// « Rien n'a été lu de la CI » (mika#2968) — la connaissance que portent
+    /// les tests qui n'instruisent pas cet axe. La valeur est écrite ici
+    /// plutôt qu'empruntée à `CiKnowledge::default_unread` : un test qui
+    /// suivrait le défaut de production n'attesterait plus rien le jour où ce
+    /// défaut changerait.
+    const CI_NON_LUE: CiKnowledge = CiKnowledge::Unread(CiUnreadCause::NotMeasured);
+
+    /// L'instant du cycle qui date la lecture CI. Les sous-tickets de ce module
+    /// portent `pr_link_source: None`, donc aucune CI n'y est lue et cet
+    /// instant n'entre dans aucune assertion — il existe pour que l'appel reste
+    /// celui de la production.
+    const AU_CYCLE_DE: &str = "2026-10-29T17:46:12Z";
+
     // ---- AC3 : les trois issues, avec les tours lus correctement ----------
 
     #[test]
     fn mika2698_une_pr_ouverte_est_un_merge_candidat_avec_ses_tours() {
-        let v = evaluate_flights(&[fixture_pr_opened()], &[sub_issue(2693, Some("open"))]);
+        let v = evaluate_flights(
+            &[fixture_pr_opened()],
+            &[sub_issue(2693, Some("open"))],
+            AU_CYCLE_DE,
+        );
         let v = &v[0];
         assert_eq!(v.issue_number, Some(2693));
         assert_eq!(
@@ -718,7 +885,11 @@ mod tests {
 
     #[test]
     fn mika2698_une_pr_de_sauvetage_demande_une_reprise_a_la_main() {
-        let v = evaluate_flights(&[fixture_rescue_pr()], &[sub_issue(2655, Some("open"))]);
+        let v = evaluate_flights(
+            &[fixture_rescue_pr()],
+            &[sub_issue(2655, Some("open"))],
+            AU_CYCLE_DE,
+        );
         let v = &v[0];
         assert_eq!(v.issue_number, Some(2655));
         assert_eq!(
@@ -736,7 +907,11 @@ mod tests {
 
     #[test]
     fn mika2698_une_mort_au_plafond_demande_un_re_groom() {
-        let v = evaluate_flights(&[fixture_dead_at_ceiling()], &[sub_issue(2661, None)]);
+        let v = evaluate_flights(
+            &[fixture_dead_at_ceiling()],
+            &[sub_issue(2661, None)],
+            AU_CYCLE_DE,
+        );
         let v = &v[0];
         assert_eq!(v.issue_number, Some(2661));
         assert_eq!(
@@ -761,7 +936,7 @@ mod tests {
             fixture_rescue_pr(),
             fixture_dead_at_ceiling(),
         ] {
-            let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead);
+            let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE);
             assert_eq!(v.turn_ceiling, None, "{}", f.task_id);
             assert_eq!(v.last_commit_turn, None, "{}", f.task_id);
         }
@@ -773,7 +948,7 @@ mod tests {
     fn mika2698_les_tours_retombent_sur_la_ligne_turns_sans_metadata() {
         let mut f = fixture_pr_opened();
         f.metadata = None;
-        let v = evaluate_flight(&f, None, &lu(Some("open")));
+        let v = evaluate_flight(&f, None, &lu(Some("open")), &CI_NON_LUE);
         assert_eq!(
             v.turns_used,
             Some(83),
@@ -795,7 +970,7 @@ mod tests {
         f.metadata = Some(r#"{"claude_pilot":{}}"#.to_string());
         f.result = Some("Turns: unknown\nOutcome: PR_OPENED — x\n".to_string());
         assert_eq!(
-            evaluate_flight(&f, None, &PrStateKnowledge::NotRead).turns_used,
+            evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE).turns_used,
             None
         );
     }
@@ -811,7 +986,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            evaluate_flight(&f, None, &PrStateKnowledge::NotRead).turns_used,
+            evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE).turns_used,
             Some(200)
         );
     }
@@ -826,7 +1001,7 @@ mod tests {
             result: Some(result.to_string()),
             ..Default::default()
         };
-        evaluate_flight(&f, None, &PrStateKnowledge::NotRead)
+        evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE)
     }
 
     fn dead_cause_of(result: &str) -> DeathCause {
@@ -896,7 +1071,7 @@ mod tests {
             task_id: "t".to_string(),
             ..Default::default()
         };
-        let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead);
+        let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE);
         assert_eq!(
             v.issue,
             FlightIssue::Dead {
@@ -920,7 +1095,7 @@ mod tests {
              Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n"
                 .to_string(),
         );
-        let v = evaluate_flight(&f, Some(2655), &lu(Some("open")));
+        let v = evaluate_flight(&f, Some(2655), &lu(Some("open")), &CI_NON_LUE);
         assert!(v.hit_ceiling);
         assert!(matches!(v.issue, FlightIssue::RescuePr { .. }));
         assert_eq!(v.recommendation, FlightRecommendation::ManualResumption);
@@ -1033,7 +1208,12 @@ mod tests {
         }
 
         // Et un vol nominal n'est pas davantage requalifié.
-        let nominal = evaluate_flight(&fixture_pr_opened(), None, &PrStateKnowledge::NotRead);
+        let nominal = evaluate_flight(
+            &fixture_pr_opened(),
+            None,
+            &PrStateKnowledge::NotRead,
+            &CI_NON_LUE,
+        );
         assert!(
             matches!(nominal.issue, FlightIssue::PrOpened { .. }),
             "une PR ouverte reste une PR ouverte : {:?}",
@@ -1202,7 +1382,7 @@ mod tests {
         ];
         for (issue, pr_state, expected) in cases {
             assert_eq!(
-                recommend(issue, pr_state),
+                recommend(issue, pr_state, &CI_NON_LUE),
                 *expected,
                 "issue={issue:?} pr_state={pr_state:?}"
             );
@@ -1221,7 +1401,8 @@ mod tests {
         // Le même vol, deux milestones : seul l'état hydraté par le Reader
         // change le verdict. Aucun appel `gh` de plus.
         let flights = [fixture_pr_opened()];
-        let apparie_fusionne = &evaluate_flights(&flights, &[sub_issue(2693, Some("merged"))])[0];
+        let apparie_fusionne =
+            &evaluate_flights(&flights, &[sub_issue(2693, Some("merged"))], AU_CYCLE_DE)[0];
         assert_eq!(
             apparie_fusionne.recommendation,
             FlightRecommendation::ManualResumption
@@ -1232,11 +1413,13 @@ mod tests {
             "un vol apparié porte l'état que le Reader a lu"
         );
         assert_eq!(
-            evaluate_flights(&flights, &[sub_issue(2693, Some("open"))])[0].recommendation,
+            evaluate_flights(&flights, &[sub_issue(2693, Some("open"))], AU_CYCLE_DE)[0]
+                .recommendation,
             FlightRecommendation::MergeCandidate
         );
 
-        let non_apparie = &evaluate_flights(&flights, &[sub_issue(9999, Some("merged"))])[0];
+        let non_apparie =
+            &evaluate_flights(&flights, &[sub_issue(9999, Some("merged"))], AU_CYCLE_DE)[0];
         assert_eq!(
             non_apparie.recommendation,
             FlightRecommendation::MergeCandidate,
@@ -1255,8 +1438,8 @@ mod tests {
     #[test]
     fn mika2921_lu_vide_et_non_lu_sont_deux_populations() {
         let flights = [fixture_pr_opened()];
-        let lu_vide = &evaluate_flights(&flights, &[sub_issue(2693, None)])[0];
-        let jamais_lu = &evaluate_flights(&flights, &[])[0];
+        let lu_vide = &evaluate_flights(&flights, &[sub_issue(2693, None)], AU_CYCLE_DE)[0];
+        let jamais_lu = &evaluate_flights(&flights, &[], AU_CYCLE_DE)[0];
 
         assert_eq!(lu_vide.pr_state, PrStateKnowledge::Read(None));
         assert_eq!(jamais_lu.pr_state, PrStateKnowledge::NotRead);
@@ -1274,13 +1457,13 @@ mod tests {
     /// interrogée (mika#2921).
     #[test]
     fn mika2921_le_verdict_porte_le_depot_du_vol() {
-        let v = &evaluate_flights(&[fixture_pr_opened()], &[])[0];
+        let v = &evaluate_flights(&[fixture_pr_opened()], &[], AU_CYCLE_DE)[0];
         assert_eq!(v.repo.as_deref(), Some("senara-solutions/mika"));
 
         let mut sans_depot = fixture_pr_opened();
         sans_depot.repo = None;
         sans_depot.reference_url = None;
-        let v = &evaluate_flights(&[sans_depot], &[])[0];
+        let v = &evaluate_flights(&[sans_depot], &[], AU_CYCLE_DE)[0];
         assert_eq!(
             v.repo, None,
             "un vol qui ne nomme aucun dépôt ne s'en voit pas attribuer un"
@@ -1334,5 +1517,202 @@ mod tests {
                 "https://github.com/senara-solutions/mika/issues/2661".to_string(),
             ]
         );
+    }
+
+    // ---- mika#2968 : la CI entre dans la recommandation ------------------
+
+    /// Le rollup **mesuré** de mika#2966 à 17:46:12Z, réduit au check qui
+    /// décide. Pas un littéral inventé : `Egress Manifest Lint` est le job
+    /// 123624936407 du run 40924115345, terminé en `failure` à 17:44:16Z — 116 s
+    /// avant le verdict de la ligne 805100 d'`audit_events`, qui a tout de même
+    /// recommandé « merge-candidat ». Le second check dit que la PR n'était pas
+    /// rouge de bout en bout : un seul check suffisait.
+    fn rollup_2966_mesure() -> serde_json::Value {
+        serde_json::json!([
+            { "name": "Egress Manifest Lint", "status": "COMPLETED", "conclusion": "FAILURE" },
+            { "name": "Check", "status": "COMPLETED", "conclusion": "SUCCESS" }
+        ])
+    }
+
+    /// AC2 — les douze cellules dans **un** appel, parce qu'une matrice éclatée
+    /// en douze tests ne dit pas qu'elle est exhaustive.
+    ///
+    /// Le cas « rouge et ouverte » — celui du vol 4f1fe163 — ne part pas d'un
+    /// `CiState::Failed` écrit à la main : il traverse
+    /// [`crate::milestone_manager::reader::classify_ci_state`], le lecteur de
+    /// production, depuis le rollup mesuré de mika#2966. Un littéral aurait
+    /// attesté la décision sans attester que le rollup réel y mène, et c'est
+    /// exactement l'articulation qui manquait.
+    #[test]
+    fn mika2968_ac2_la_matrice_ci_x_etat_de_pr_decide_la_recommandation() {
+        let rouge_mesuree =
+            crate::milestone_manager::reader::classify_ci_state(&rollup_2966_mesure());
+        assert_eq!(
+            rouge_mesuree,
+            CiState::Failed,
+            "le rollup mesuré de mika#2966 se réduit en CI rouge : si ce n'est \
+             plus le cas, la cellule rouge de la matrice ne teste plus rien"
+        );
+
+        let pr_du_vol = FlightIssue::PrOpened {
+            number: Some(2966),
+            url: None,
+        };
+        let lue = |etat: CiState| CiKnowledge::Read {
+            state: etat,
+            at: AU_CYCLE_DE.to_string(),
+        };
+
+        let matrice: Vec<(&str, PrStateKnowledge, CiKnowledge, FlightRecommendation)> = vec![
+            // --- PR encore ouverte : la CI décide ---
+            (
+                "verte + ouverte",
+                lu(Some("open")),
+                lue(CiState::Success),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "rouge mesurée (#2966) + ouverte",
+                lu(Some("open")),
+                lue(rouge_mesuree.clone()),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "en cours + ouverte",
+                lu(Some("open")),
+                lue(CiState::Pending),
+                // Le verdict est écrit ~2 min après l'ouverture, pendant que la
+                // CI tourne (pour #2966 le run a fini à 17:57:56Z). « En cours »
+                // n'est donc pas un refus : c'est l'état nominal au moment du
+                // verdict, et le rapport le dit à côté de la recommandation.
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "sans check + ouverte",
+                lu(Some("open")),
+                lue(CiState::None),
+                // Une lecture qui a abouti et n'a trouvé aucun check. Rien ne
+                // s'oppose au merge — et surtout, ce n'est pas une non-lecture.
+                FlightRecommendation::MergeCandidate,
+            ),
+            // --- PR fusionnée ou fermée : l'état de PR décide, quelle que soit
+            //     la CI. Le bras est **avant** le bras CI dans `recommend`.
+            (
+                "verte + fusionnée",
+                lu(Some("merged")),
+                lue(CiState::Success),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "rouge + fusionnée",
+                lu(Some("merged")),
+                lue(CiState::Failed),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "en cours + fermée",
+                lu(Some("closed")),
+                lue(CiState::Pending),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "sans check + fermée",
+                lu(Some("closed")),
+                lue(CiState::None),
+                FlightRecommendation::ManualResumption,
+            ),
+            // --- Les quatre non-lectures, PR ouverte. Aucune ne bascule la
+            //     recommandation : une CI non lue n'est pas une CI rouge. Elle
+            //     n'est pas non plus une CI verte — c'est le rapport qui porte
+            //     la différence (AC3), jamais la recommandation seule.
+            (
+                "non lue (PR hors liste du milestone) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NotFromPrList),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "non lue (aucune sous-issue appariée) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NoSubIssue),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "non lue (vol sans ticket) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NoIssueNumber),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "non lue (non mesurée) + ouverte",
+                lu(Some("open")),
+                CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+                FlightRecommendation::MergeCandidate,
+            ),
+        ];
+
+        assert_eq!(
+            matrice.len(),
+            12,
+            "la matrice de l'AC2 compte douze cellules"
+        );
+
+        for (nom, pr_state, ci, attendu) in &matrice {
+            assert_eq!(
+                &recommend(&pr_du_vol, pr_state, ci),
+                attendu,
+                "cellule « {nom} »"
+            );
+        }
+    }
+
+    /// Le contrôle négatif de la cellule rouge : **même** vol, **même** état de
+    /// PR, seule la couleur change. Sans lui, la matrice resterait verte le jour
+    /// où `recommend` rendrait `ManualResumption` pour tout vol `PrOpened` —
+    /// elle attesterait alors la panne d'un axe, pas sa lecture.
+    #[test]
+    fn mika2968_ac1_seule_la_couleur_separe_les_deux_recommandations() {
+        let vol = FlightIssue::PrOpened {
+            number: Some(2966),
+            url: None,
+        };
+        let ouverte = lu(Some("open"));
+        let ci = |etat: CiState| CiKnowledge::Read {
+            state: etat,
+            at: AU_CYCLE_DE.to_string(),
+        };
+
+        assert_eq!(
+            recommend(&vol, &ouverte, &ci(CiState::Failed)),
+            FlightRecommendation::ManualResumption
+        );
+        assert_eq!(
+            recommend(&vol, &ouverte, &ci(CiState::Success)),
+            FlightRecommendation::MergeCandidate
+        );
+    }
+
+    /// Un blob de verdict antérieur au champ `ci` se relit en « non mesurée »,
+    /// jamais en CI verte (mika#2331 : l'absence n'est pas zéro). C'est le
+    /// défaut de production qui est éprouvé ici — le seul endroit du module où
+    /// `default_unread` est appelé par un test plutôt que contourné.
+    #[test]
+    fn mika2968_un_verdict_anterieur_au_champ_se_relit_en_non_mesuree() {
+        let ancien = r#"{
+            "task_id": "4f1fe163-a7a2-442d-ba70-56e343470dba",
+            "agent_id": "mika-dev",
+            "issue_number": 2963,
+            "issue": { "pr_opened": { "number": 2966, "url": null } },
+            "turns_used": 83,
+            "hit_ceiling": false,
+            "turn_ceiling": 200,
+            "last_commit_turn": null,
+            "pr_state": "not_read",
+            "recommendation": "merge_candidate",
+            "evidence": []
+        }"#;
+        let v: FlightVerdict = serde_json::from_str(ancien).expect("un blob antérieur se relit");
+        assert_eq!(v.ci, CiKnowledge::Unread(CiUnreadCause::NotMeasured));
+        assert_eq!(v.ci, CiKnowledge::default_unread());
     }
 }
