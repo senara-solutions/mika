@@ -1089,6 +1089,9 @@ mod tests {
                 FlightPrRead {
                     state: etat.to_string(),
                     ci: ci.clone(),
+                    head_oid: None,
+                    review: None,
+                    review_decision: None,
                 },
             );
         }
