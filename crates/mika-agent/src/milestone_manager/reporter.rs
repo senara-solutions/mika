@@ -3087,4 +3087,168 @@ mod tests {
             );
         }
     }
+
+    // -- mika#2968, vol 2b : le segment de la revue de la tête (AC6) ---------
+
+    /// AC6 — les cinq états lus et le bras non lu, chacun sous son libellé.
+    ///
+    /// Les libellés sont **distincts** parce que les états n'appellent pas la
+    /// même action : « approuvée sur `be26552`, pas sur la tête » envoie demander
+    /// une relecture du dernier commit, « hold[review] sur la tête » envoie lire
+    /// le motif du relecteur, « aucune revue » envoie en demander une. Deux
+    /// états sous les mêmes octets referaient de deux populations une seule
+    /// (classe mika#2205).
+    ///
+    /// Le bras non lu réemploie `ci_unread_label` — pas un second vocabulaire
+    /// pour une seule grammaire (mika#2158) : les deux savoirs sortent du même
+    /// appel `gh`, donc ils ont les mêmes causes.
+    #[test]
+    fn mika2968_ac6_chaque_etat_de_revue_a_son_libelle() {
+        let au_cycle_de = "2026-10-29T22:55:00Z";
+        let rendu = |review: ReviewKnowledge| {
+            let mut v = verdict(
+                Some(2969),
+                FlightIssue::PrOpened {
+                    number: Some(2972),
+                    url: None,
+                },
+                Some(83),
+                false,
+                FlightRecommendation::ManualResumption,
+            );
+            v.review = review;
+            render_flight_verdict(&v)
+        };
+        let lue = |state: HeadReviewState| ReviewKnowledge::Read {
+            state,
+            decision: None,
+            at: au_cycle_de.to_string(),
+        };
+
+        for (review, attendu) in [
+            (
+                lue(HeadReviewState::ApprovedOnHead),
+                "revue : approuvée sur la tête (lue au cycle de 2026-10-29T22:55:00Z)",
+            ),
+            (
+                lue(HeadReviewState::ApprovedOnOlderCommit {
+                    reviewed: Some("be2655270f30db9a59b7110cad08034faeca48a8".to_string()),
+                }),
+                "revue : approuvée sur be26552, pas sur la tête",
+            ),
+            (
+                lue(HeadReviewState::ApprovedOnOlderCommit { reviewed: None }),
+                "revue : approuvée sur un commit non lu, pas sur la tête",
+            ),
+            (
+                lue(HeadReviewState::Held {
+                    reason: "review".to_string(),
+                    on_head: true,
+                }),
+                "revue : hold[review] sur la tête",
+            ),
+            (
+                lue(HeadReviewState::Held {
+                    reason: "ci".to_string(),
+                    on_head: false,
+                }),
+                "revue : hold[ci] sur un commit antérieur",
+            ),
+            (
+                lue(HeadReviewState::NoVerdict { on_head: true }),
+                "revue : commentée sans verdict sur la tête",
+            ),
+            (
+                lue(HeadReviewState::NoReview),
+                "revue : aucune revue du relecteur",
+            ),
+            (
+                ReviewKnowledge::Unread(CiUnreadCause::ReadFailed),
+                "revue non lue (lecture gh en échec)",
+            ),
+            (
+                ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
+                "revue non lue (non mesurée)",
+            ),
+        ] {
+            let ligne = rendu(review);
+            assert!(
+                ligne.contains(attendu),
+                "la ligne du vol doit porter « {attendu} » :\n{ligne}"
+            );
+        }
+    }
+
+    /// `reviewDecision` voyage jusqu'au rapport, entre parenthèses et à côté du
+    /// moment de la lecture — **et nulle part ailleurs**. C'est la frontière
+    /// décision/rapport : la forge peut dire `REVIEW_REQUIRED` sur une tête que
+    /// mika-platform-qa a approuvée (une autre règle de branche l'exige), donc ce
+    /// champ informe l'opérateur sans jamais rien décider.
+    #[test]
+    fn mika2968_la_decision_de_la_forge_sinforme_et_ne_decide_pas() {
+        let mut v = verdict(
+            Some(2969),
+            FlightIssue::PrOpened {
+                number: Some(2972),
+                url: None,
+            },
+            Some(83),
+            false,
+            FlightRecommendation::MergeCandidate,
+        );
+        v.review = ReviewKnowledge::Read {
+            state: HeadReviewState::ApprovedOnHead,
+            decision: Some("REVIEW_REQUIRED".to_string()),
+            at: "2026-10-29T22:55:00Z".to_string(),
+        };
+        let ligne = render_flight_verdict(&v);
+        assert!(
+            ligne.contains(
+                "revue : approuvée sur la tête (lue au cycle de \
+                 2026-10-29T22:55:00Z, décision forge REVIEW_REQUIRED)"
+            ),
+            "{ligne}"
+        );
+        assert!(
+            ligne.contains("merge-candidat"),
+            "et elle ne retire rien à la recommandation :\n{ligne}"
+        );
+    }
+
+    /// Le segment de la revue ne s'omet **jamais**, sur aucune des quatre
+    /// issues — même argument que pour le segment CI, un cran plus loin : le
+    /// silence serait le seul endroit où une revue non lue pourrait passer pour
+    /// une approbation.
+    #[test]
+    fn mika2968_le_segment_de_revue_ne_somet_sur_aucune_issue() {
+        for issue in [
+            FlightIssue::PrOpened {
+                number: Some(2972),
+                url: None,
+            },
+            FlightIssue::RescuePr {
+                number: Some(2690),
+                url: None,
+            },
+            FlightIssue::Dead {
+                cause: DeathCause::CeilingReached,
+            },
+            FlightIssue::NotAFlight {
+                reason: NotFlightReason::GroomCompleted,
+            },
+        ] {
+            let ligne = render_flight_verdict(&verdict(
+                Some(2969),
+                issue.clone(),
+                Some(83),
+                false,
+                FlightRecommendation::Nothing,
+            ));
+            assert!(
+                ligne.contains("revue non lue (non mesurée)"),
+                "le segment de la revue ne s'omet pas davantage que celui de la \
+                 CI :\n{ligne}"
+            );
+        }
+    }
 }
