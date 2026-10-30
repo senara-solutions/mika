@@ -20,7 +20,7 @@ use crate::plan_callout::{FenceHandling, plan_callout};
 use crate::webhook_dispatch::READY_LABEL;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Combien d'issues ouvertes la lecture **hors milestone cible** rapporte au
 /// plus (mika#2699, vol 2).
@@ -927,6 +927,240 @@ pub fn classify_ci_state(rollup: &Value) -> CiState {
         CiState::Pending
     } else {
         CiState::Success
+    }
+}
+
+/// Ce qu'une lecture **par numéro** sait d'une PR (mika#2968, vol 2a).
+///
+/// `state` est écrit tel que `gh` le rend — `OPEN`, `MERGED`, `CLOSED` — et
+/// n'est pas normalisé ici : [`super::evaluator`] le compose en
+/// `PrStateKnowledge::Read`, dont le rapport épelle la valeur.
+///
+/// **`ci` à `None` est une propriété de la lecture, pas une CI absente.** Le
+/// second appel `gh` ne demande le `statusCheckRollup` que des PR `--state
+/// open`, donc une PR fusionnée ou fermée n'a jamais été lue sur cet axe ; et
+/// quand ce second appel échoue, une PR **ouverte** se retrouve elle aussi à
+/// `None`. Les deux populations sont distinguées par le composeur, qui lit
+/// `state` d'abord : `CiUnreadCause::PrNotOpen` pour la première,
+/// `CiUnreadCause::ReadFailed` pour la seconde. Aucune des deux ne passe pour
+/// une CI verte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlightPrRead {
+    /// L'état de la PR, tel que `gh` l'écrit.
+    pub state: String,
+    /// L'état CI de la tête — `Some` seulement pour une PR ouverte dont le
+    /// second appel a abouti.
+    pub ci: Option<CiState>,
+}
+
+/// Ce qu'**un dépôt** a rendu à la lecture par numéro (mika#2968, vol 2a).
+///
+/// « Lu » et « pas lu » sont une distinction de **type**, jamais une map vide :
+/// un dépôt dont la lecture a échoué et un dépôt sans aucune PR rendraient les
+/// mêmes octets alors qu'ils disent le contraire l'un de l'autre (classe
+/// mika#2205). Le composeur en tire `CiUnreadCause::ReadFailed` d'un côté et
+/// `CiUnreadCause::NotFound` de l'autre.
+///
+/// `Failed` porte sur **un** dépôt : les autres sont lus quand même, et le
+/// cycle n'échoue pas — même politique que [`read_timeline_probe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoPrRead {
+    /// Les PR lues, indexées par numéro.
+    Read(HashMap<u64, FlightPrRead>),
+    /// Le premier appel n'a pas abouti : rien n'est su de ce dépôt.
+    Failed,
+}
+
+/// Combien de PR la lecture par numéro rapporte au plus, **par dépôt**
+/// (mika#2968, vol 2a).
+///
+/// C'est la borne du `--limit` des deux appels de [`read_flight_prs`], et elle
+/// est nommée pour la même raison que [`OUTSIDE_READ_LIMIT`] : une page pleine
+/// ne dit pas « voici toutes les PR », elle dit « il y en avait peut-être
+/// d'autres ».
+///
+/// **Pourquoi une page récente et non une lecture par PR.** La population visée
+/// est celle des PR que les vols du cycle viennent d'ouvrir. Mesuré le
+/// 2026-10-29 sur `senara-solutions/mika`, la boucle du jour en a ouvert
+/// **cinq** — #2960, #2962, #2964, #2966, #2967 — et **aucune** ne portait le
+/// milestone cible, ce qui est la raison d'être de cette lecture : la requête
+/// `--search milestone:33` du lecteur de milestone n'en voyait pas une.
+/// `gh pr list` les rend toutes en **un** appel, là où un `gh pr view` par vol
+/// en coûterait un par vol. Le coût est donc en `2 × |dépôts|`, indépendant du
+/// nombre de vols.
+///
+/// **Pourquoi deux appels et non un.** `statusCheckRollup` est le champ qui
+/// coûte, et une PR fusionnée ou fermée n'a pas de CI à lire pour la
+/// recommandation : le premier appel prend l'état de toutes les PR sans le
+/// rollup, le second le rollup des seules PR ouvertes.
+///
+/// **Une borne peut être atteinte, et c'est pourquoi elle se dit.** Un numéro
+/// absent de la page lue ne passe jamais pour une CI verte : il rend
+/// `CiUnreadCause::NotFound`, « PR hors de la page lue », que le rapport épelle.
+pub const FLIGHT_PR_READ_LIMIT: usize = 100;
+
+/// Lit l'état et la CI des PR de chaque dépôt, **par numéro** et non par
+/// milestone (mika#2968, vol 2a).
+///
+/// Deux appels `gh` par dépôt, dans cet ordre :
+/// 1. `pr list --state all --json number,state` — l'état de toutes les PR ;
+/// 2. `pr list --state open --json number,statusCheckRollup` — le rollup des
+///    seules PR ouvertes, **joint au premier par le numéro**.
+///
+/// La jointure est volontairement un `get_mut` : une PR rendue par l'appel 2 et
+/// absente de la page de l'appel 1 — possible si plus de
+/// [`FLIGHT_PR_READ_LIMIT`] PR ont été ouvertes depuis — n'est pas inventée.
+/// Elle rend `NotFound` au composeur, qui le dit, plutôt qu'une demi-lecture.
+///
+/// **Échec par dépôt, jamais par cycle.** L'appel 1 en échec rend
+/// [`RepoPrRead::Failed`] pour ce dépôt seul, avec un WARN nommé ; les autres
+/// dépôts sont lus. L'appel 2 en échec rend `Read(map)` avec tous les `ci` à
+/// `None` — l'état des PR reste lu, la CI ne l'est pas, et c'est exactement ce
+/// que `ci: None` sur une PR ouverte signifie.
+///
+/// `classify_ci_state` reste le **seul** réducteur de `statusCheckRollup` du
+/// module (mika#2201).
+pub async fn read_flight_prs(
+    runner: &dyn GhRunner,
+    repos: &BTreeSet<String>,
+) -> HashMap<String, RepoPrRead> {
+    let mut out = HashMap::with_capacity(repos.len());
+    for repo in repos {
+        out.insert(repo.clone(), read_one_repo_flight_prs(runner, repo).await);
+    }
+    out
+}
+
+/// La lecture d'**un** dépôt — les deux appels, la jointure, et la ligne qui
+/// dit ce qui a été lu sur toutes les branches.
+async fn read_one_repo_flight_prs(runner: &dyn GhRunner, repo: &str) -> RepoPrRead {
+    let limite = FLIGHT_PR_READ_LIMIT.to_string();
+
+    // Appel 1 — l'état de toutes les PR, sans le champ qui coûte.
+    let states = runner
+        .run(&[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--json",
+            "number,state",
+            "--limit",
+            &limite,
+        ])
+        .await
+        .and_then(|json| {
+            serde_json::from_str::<Vec<Value>>(&json)
+                .map_err(|e| anyhow!("failed to parse flight pr states: {e}"))
+        });
+    let states = match states {
+        Ok(v) => v,
+        Err(_) => {
+            log_flight_pr_read(repo, "state_read_failed", None, None);
+            return RepoPrRead::Failed;
+        }
+    };
+
+    let mut map: HashMap<u64, FlightPrRead> = HashMap::new();
+    for pr in &states {
+        let Some(number) = pr.get("number").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(state) = pr.get("state").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        map.insert(
+            number,
+            FlightPrRead {
+                state: state.to_string(),
+                ci: None,
+            },
+        );
+    }
+
+    // Appel 2 — le rollup des seules PR ouvertes.
+    let rollups = runner
+        .run(&[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+            "number,statusCheckRollup",
+            "--limit",
+            &limite,
+        ])
+        .await
+        .and_then(|json| {
+            serde_json::from_str::<Vec<Value>>(&json)
+                .map_err(|e| anyhow!("failed to parse flight pr rollups: {e}"))
+        });
+    let rollups = match rollups {
+        Ok(v) => v,
+        Err(_) => {
+            log_flight_pr_read(repo, "rollup_read_failed", Some(map.len()), None);
+            return RepoPrRead::Read(map);
+        }
+    };
+
+    let mut ci_read = 0usize;
+    for pr in &rollups {
+        let Some(number) = pr.get("number").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if let Some(entry) = map.get_mut(&number) {
+            entry.ci = Some(
+                pr.get("statusCheckRollup")
+                    .map(classify_ci_state)
+                    .unwrap_or(CiState::None),
+            );
+            ci_read += 1;
+        }
+    }
+
+    log_flight_pr_read(repo, "read", Some(map.len()), Some(ci_read));
+    RepoPrRead::Read(map)
+}
+
+/// Une ligne par dépôt lu, sur **toutes** les branches — les deux échecs
+/// comprises (mika#2968, vol 2a).
+///
+/// Même nom d'événement partout, et le niveau porte l'issue : `WARN` pour un
+/// échec, `INFO` pour une lecture aboutie. Un dépôt en échec est donc **nommé**
+/// (la politique du vol : un échec `gh` ne tue pas le cycle, mais il ne se tait
+/// pas), et la branche saine reste émise — sans elle, « le manager ne lit aucune
+/// PR par numéro » et « le binaire servi est antérieur à ce vol » rendraient le
+/// même journal : zéro ligne (motif mika#2340).
+///
+/// `prs_read` et `ci_read` sont **absents** plutôt qu'à `0` quand ils n'ont pas
+/// été mesurés : un `0` affirmerait un comptage qui n'a pas eu lieu (motif
+/// mika#2331). Un appel 1 en échec n'a compté aucune PR ; un appel 2 en échec
+/// n'a compté aucune CI.
+fn log_flight_pr_read(repo: &str, outcome: &str, prs_read: Option<usize>, ci_read: Option<usize>) {
+    if outcome == "read" {
+        tracing::info!(
+            target: "mika::milestone_manager",
+            event = "manager_flight_pr_read",
+            repo,
+            outcome,
+            prs_read,
+            ci_read,
+            "lecture des PR des vols, par numéro"
+        );
+    } else {
+        tracing::warn!(
+            target: "mika::milestone_manager",
+            event = "manager_flight_pr_read",
+            repo,
+            outcome,
+            prs_read,
+            ci_read,
+            "lecture des PR des vols en échec : ce dépôt reste non lu"
+        );
     }
 }
 
@@ -3318,6 +3552,302 @@ mod gh_arg_capture_tests {
         assert!(
             rapport.contains("- Lecture du milestone : 7 tickets lus, borne 1000 — complète"),
             "le rapport dit le compte lu, la borne, et le mot « complète » :\n{rapport}"
+        );
+    }
+}
+
+/// Les tests de [`read_flight_prs`] — la lecture des PR des vols **par numéro**
+/// (mika#2968, vol 2a).
+///
+/// Module à part, et non une extension de `gh_arg_capture_tests`, pour une
+/// raison qui est le cœur de ce qu'ils attestent : l'enregistreur de ce dernier
+/// porte un arm `Some("pr")` **nu**, qui aurait servi la fixture des PR du
+/// milestone aux deux nouveaux appels. Les quatre cas seraient verts sans
+/// qu'aucun n'ait lu ce qu'il croit lire — exactement l'échec contre lequel la
+/// docstring de cet enregistreur met en garde.
+#[cfg(test)]
+mod flight_pr_read_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const DEPOT: &str = "senara-solutions/mika";
+    const AUTRE_DEPOT: &str = "senara-solutions/mika-cloud";
+
+    /// Un enregistreur **dédié** aux deux appels de [`read_flight_prs`].
+    ///
+    /// Il discrimine sur la valeur de `--state` — `all` pour l'appel 1, `open`
+    /// pour l'appel 2 — c'est-à-dire sur le jeton que chaque appel possède
+    /// seul, et jamais sur le premier argument, que les deux partagent. Un
+    /// dépôt absent de `par_depot` et toute autre forme d'appel tombent sur
+    /// l'arm d'erreur : un test ne peut pas lire un dépôt qu'il n'a pas gréé, et
+    /// un troisième appel `gh` devra étendre ce `match` plutôt qu'hériter d'une
+    /// réponse qui n'est pas la sienne.
+    struct RecordingFlightPrRunner {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        /// Par dépôt : la réponse de l'appel 1, puis celle de l'appel 2.
+        /// `None` simule l'échec de l'appel correspondant.
+        par_depot: BTreeMap<String, (Option<String>, Option<String>)>,
+    }
+
+    impl RecordingFlightPrRunner {
+        fn new(par_depot: BTreeMap<String, (Option<String>, Option<String>)>) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                par_depot,
+            }
+        }
+
+        fn appels(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for RecordingFlightPrRunner {
+        async fn run(&self, args: &[&str]) -> Result<String> {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            self.calls.lock().unwrap().push(owned.clone());
+            let valeur = |drapeau: &str| {
+                owned
+                    .windows(2)
+                    .find(|w| w[0] == drapeau)
+                    .map(|w| w[1].clone())
+                    .unwrap_or_default()
+            };
+            let depot = valeur("--repo");
+            let etat = valeur("--state");
+            let Some((etats, rollups)) = self.par_depot.get(&depot) else {
+                return Err(anyhow!(
+                    "RecordingFlightPrRunner : dépôt non gréé {depot:?} dans {owned:?}"
+                ));
+            };
+            match (owned.first().map(String::as_str), etat.as_str()) {
+                (Some("pr"), "all") => etats
+                    .clone()
+                    .ok_or_else(|| anyhow!("échec simulé de l'appel 1 sur {depot}")),
+                (Some("pr"), "open") => rollups
+                    .clone()
+                    .ok_or_else(|| anyhow!("échec simulé de l'appel 2 sur {depot}")),
+                _ => Err(anyhow!(
+                    "RecordingFlightPrRunner : forme d'appel inattendue {owned:?}"
+                )),
+            }
+        }
+    }
+
+    /// Le `statusCheckRollup` **mesuré** de mika#2966 le 2026-10-29 : le job
+    /// `Egress Manifest Lint`, un check requis, terminé en `FAILURE` à
+    /// 17:44:16Z, à côté d'un `Check` vert.
+    fn rollup_2966_mesure() -> serde_json::Value {
+        serde_json::json!([
+            { "name": "Egress Manifest Lint", "status": "COMPLETED", "conclusion": "FAILURE" },
+            { "name": "Check", "status": "COMPLETED", "conclusion": "SUCCESS" }
+        ])
+    }
+
+    fn etats_mesures() -> String {
+        serde_json::json!([
+            { "number": 2966, "state": "OPEN" },
+            { "number": 2962, "state": "MERGED" },
+            { "number": 2960, "state": "CLOSED" }
+        ])
+        .to_string()
+    }
+
+    fn rollups_mesures() -> String {
+        serde_json::json!([
+            { "number": 2966, "statusCheckRollup": rollup_2966_mesure() }
+        ])
+        .to_string()
+    }
+
+    fn un_depot(etats: Option<String>, rollups: Option<String>) -> RecordingFlightPrRunner {
+        RecordingFlightPrRunner::new(BTreeMap::from([(DEPOT.to_string(), (etats, rollups))]))
+    }
+
+    fn cibles() -> BTreeSet<String> {
+        BTreeSet::from([DEPOT.to_string()])
+    }
+
+    fn lu(reads: &HashMap<String, RepoPrRead>, depot: &str) -> HashMap<u64, FlightPrRead> {
+        match reads.get(depot) {
+            Some(RepoPrRead::Read(map)) => map.clone(),
+            autre => panic!("{depot} devait être lu, et rend {autre:?}"),
+        }
+    }
+
+    /// Cas nominal — et c'est ici que les arguments `gh` sont épinglés.
+    ///
+    /// Les deux vecteurs sont comparés **en entier**, parce que c'est la seule
+    /// forme d'assertion qui attrape la dérive qui compte : un `--state open`
+    /// devenu `all` sur l'appel 2 demanderait le rollup de toutes les PR du
+    /// dépôt — un test vert pour un coût que la borne nommée prétend contenir —
+    /// et un `--json` qui perd `statusCheckRollup` rendrait toutes les CI non
+    /// lues sans qu'aucune assertion d'état ne bouge.
+    #[tokio::test]
+    async fn mika2968_le_lecteur_par_numero_joint_le_rollup_a_letat() {
+        let runner = un_depot(Some(etats_mesures()), Some(rollups_mesures()));
+        let reads = read_flight_prs(&runner, &cibles()).await;
+
+        let map = lu(&reads, DEPOT);
+        assert_eq!(map.len(), 3, "les trois PR de la page sont lues : {map:?}");
+
+        let pr2966 = map.get(&2966).expect("la PR ouverte du vol mesuré est lue");
+        assert_eq!(pr2966.state, "OPEN");
+        assert_eq!(
+            pr2966.ci,
+            Some(CiState::Failed),
+            "le rollup mesuré de mika#2966 traverse `classify_ci_state` et rend \
+             une CI rouge — si ce n'est plus le cas, le cas rouge ne teste plus rien"
+        );
+
+        let pr2962 = map.get(&2962).expect("la PR fusionnée est lue");
+        assert_eq!(pr2962.state, "MERGED");
+        assert_eq!(
+            pr2962.ci, None,
+            "une PR fusionnée n'a pas été lue sur l'axe CI : l'appel 2 ne \
+             demande que les `--state open`"
+        );
+        assert_eq!(map.get(&2960).map(|p| p.state.as_str()), Some("CLOSED"));
+        assert_eq!(map.get(&2960).and_then(|p| p.ci.clone()), None);
+
+        let appels = runner.appels();
+        assert_eq!(appels.len(), 2, "deux appels `gh` par dépôt : {appels:?}");
+        assert_eq!(
+            appels[0],
+            vec![
+                "pr",
+                "list",
+                "--repo",
+                DEPOT,
+                "--state",
+                "all",
+                "--json",
+                "number,state",
+                "--limit",
+                "100"
+            ],
+            "appel 1 : l'état de toutes les PR, sans le champ qui coûte"
+        );
+        assert_eq!(
+            appels[1],
+            vec![
+                "pr",
+                "list",
+                "--repo",
+                DEPOT,
+                "--state",
+                "open",
+                "--json",
+                "number,statusCheckRollup",
+                "--limit",
+                "100"
+            ],
+            "appel 2 : le rollup des **seules** PR ouvertes"
+        );
+    }
+
+    /// L'appel 1 en échec rend `Failed` pour ce dépôt — et **seulement** pour
+    /// lui.
+    ///
+    /// Le second dépôt, lu nominalement dans le même appel, est ce qui sépare
+    /// « l'échec est circonscrit » de « l'échec a emporté le cycle » : sans lui,
+    /// un `return` prématuré de `read_flight_prs` passerait le test.
+    #[tokio::test]
+    async fn mika2968_un_premier_appel_en_echec_ne_coute_que_son_depot() {
+        let runner = RecordingFlightPrRunner::new(BTreeMap::from([
+            (DEPOT.to_string(), (None, Some(rollups_mesures()))),
+            (
+                AUTRE_DEPOT.to_string(),
+                (Some(etats_mesures()), Some(rollups_mesures())),
+            ),
+        ]));
+        let reads = read_flight_prs(
+            &runner,
+            &BTreeSet::from([DEPOT.to_string(), AUTRE_DEPOT.to_string()]),
+        )
+        .await;
+
+        assert_eq!(
+            reads.get(DEPOT),
+            Some(&RepoPrRead::Failed),
+            "appel 1 en échec : rien n'est su de ce dépôt, et ce n'est pas une \
+             map vide — une map vide dirait « aucune PR » (classe mika#2205)"
+        );
+        assert_eq!(
+            lu(&reads, AUTRE_DEPOT).get(&2966).map(|p| p.ci.clone()),
+            Some(Some(CiState::Failed)),
+            "l'autre dépôt est lu quand même : un échec `gh` ne tue pas le cycle"
+        );
+    }
+
+    /// L'appel 2 seul en échec garde les états lus et laisse **toutes** les CI
+    /// non lues.
+    ///
+    /// C'est la cellule que le composeur traduira en `ReadFailed` sur une PR
+    /// ouverte : `ci: None` avec `state: "OPEN"` ne dit pas « CI absente », il
+    /// dit « CI non lue ».
+    #[tokio::test]
+    async fn mika2968_un_second_appel_en_echec_laisse_les_etats_lus_et_les_ci_non_lues() {
+        let runner = un_depot(Some(etats_mesures()), None);
+        let reads = read_flight_prs(&runner, &cibles()).await;
+
+        let map = lu(&reads, DEPOT);
+        assert_eq!(map.len(), 3, "les états restent lus : {map:?}");
+        assert_eq!(map.get(&2966).map(|p| p.state.as_str()), Some("OPEN"));
+        assert!(
+            map.values().all(|p| p.ci.is_none()),
+            "aucune CI lue quand l'appel 2 échoue : {map:?}"
+        );
+    }
+
+    /// Un numéro hors de la page lue n'est **pas** inventé, dans les deux sens.
+    ///
+    /// Côté appel 1, le numéro cherché est simplement absent de la map : le
+    /// composeur en tirera `NotFound`, « PR hors de la page lue », plutôt
+    /// qu'une CI verte. Côté appel 2, une PR ouverte que l'appel 1 n'a pas
+    /// rendue — ce que [`FLIGHT_PR_READ_LIMIT`] rend possible — n'entre pas dans
+    /// la map par la porte du rollup : la jointure est un `get_mut` et non un
+    /// `insert`, donc une PR n'arrive jamais avec une CI et sans état.
+    #[tokio::test]
+    async fn mika2968_un_numero_hors_de_la_page_nest_pas_invente() {
+        let rollups = serde_json::json!([
+            { "number": 2966, "statusCheckRollup": rollup_2966_mesure() },
+            { "number": 2999, "statusCheckRollup": rollup_2966_mesure() }
+        ])
+        .to_string();
+        let runner = un_depot(Some(etats_mesures()), Some(rollups));
+        let reads = read_flight_prs(&runner, &cibles()).await;
+
+        let map = lu(&reads, DEPOT);
+        assert!(
+            !map.contains_key(&2999),
+            "la jointure n'invente pas une PR que l'appel 1 n'a pas rendue : {map:?}"
+        );
+        assert!(
+            !map.contains_key(&2967),
+            "un numéro que personne n'a rendu reste absent : {map:?}"
+        );
+        assert_eq!(
+            map.len(),
+            3,
+            "la page lue reste celle de l'appel 1 : {map:?}"
+        );
+    }
+
+    /// Un dépôt sans aucune PR est **lu**, et son vide est une réponse.
+    ///
+    /// Contrôle négatif de la distinction de type : si [`RepoPrRead`] redevenait
+    /// un `Option<HashMap<…>>`, ce cas et celui de l'appel 1 en échec rendraient
+    /// les mêmes octets.
+    #[tokio::test]
+    async fn mika2968_un_depot_sans_pr_est_lu_et_nest_pas_en_echec() {
+        let runner = un_depot(Some("[]".to_string()), Some("[]".to_string()));
+        let reads = read_flight_prs(&runner, &cibles()).await;
+        assert_eq!(
+            reads.get(DEPOT),
+            Some(&RepoPrRead::Read(HashMap::new())),
+            "lu et vide, et non en échec"
         );
     }
 }
