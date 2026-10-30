@@ -358,8 +358,14 @@ DECISION NEEDED	B	crates/mika-agent/src/operational/write.rs::RE	exact:literal
 # `Verdict: pass` in lowercase IS read by the webhook handler and is NOT read by
 # the review-history reader. Declared as measured; unifying them is a decision
 # outside mika#2201, whose perimeter is the text, not the predicates.
+#
+# `milestone_manager/reader.rs::hold_reason_from_body` (mika#2968, vol 2b) joins
+# the byte-exact half: it reads the head review's `VERDICT: hold[<motif>]` line
+# to tell a cut-off QA review from a plain comment. Same `strip_prefix` on a
+# trimmed line as `extract_latest_verdict`, hence the same tolerance.
 VERDICT	B	crates/mika-agent/src/server/verdict.rs::VERDICT_RE	ci+emphasis:line-anchored
 VERDICT	B	crates/mika-agent/src/github_graphql.rs::extract_latest_verdict	exact:prefix
+VERDICT	B	crates/mika-agent/src/milestone_manager/reader.rs::hold_reason_from_body	exact:prefix
 VERDICT	B	crates/mika-agent/src/calibration/roles/mika_qa.rs::run_verdict_format_canonical_shape	exact:literal
 VERDICT	B	crates/mika-agent/src/server/deadline_verdict.rs::DEADLINE_VERDICT_LINE	exact:literal
 DEPTH	B	crates/mika-agent/src/server/verdict.rs::DEPTH_RE	ci:line-anchored
