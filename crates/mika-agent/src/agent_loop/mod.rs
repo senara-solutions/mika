@@ -6271,6 +6271,15 @@ async fn run_agent_inner(
         params.github_token.map(String::from)
     };
 
+    // Le jumeau non identitaire du précédent, pour les **lectures** de CI
+    // (mika#2963) : App d'abord, PAT en repli. Symétrique et séparé, parce que
+    // la priorité dépend de la classe d'opération et non de l'appelant.
+    let resolved_ci_read_token = if let Some(settings) = params.settings {
+        settings.resolve_ci_read_token(params.github_app).await
+    } else {
+        None
+    };
+
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.user_message);
 
@@ -6627,6 +6636,7 @@ async fn run_agent_inner(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: resolved_github_token.as_deref(),
+        ci_read_token: resolved_ci_read_token.as_ref(),
         gateway_url: params.gateway_url,
         internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
@@ -7810,6 +7820,13 @@ async fn run_silent_inner(
         params.github_token.map(String::from)
     };
 
+    // Le jumeau non identitaire, pour les **lectures** de CI (mika#2963).
+    let resolved_ci_read_token = if let Some(settings) = params.settings {
+        settings.resolve_ci_read_token(params.github_app).await
+    } else {
+        None
+    };
+
     // Extract callback_task_id from the trigger for deferred dispatch registration
     // (mika#1058). Callback AND DeferredDispatch triggers carry a task_id needed for
     // cycle detection. DeferredDispatch must also be able to re-defer if it hits
@@ -7854,6 +7871,7 @@ async fn run_silent_inner(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: resolved_github_token.as_deref(),
+        ci_read_token: resolved_ci_read_token.as_ref(),
         gateway_url: params.gateway_url,
         internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
@@ -8469,6 +8487,13 @@ async fn run_team_agent_inner_impl(
         stage_prev,
     );
 
+    // Le jumeau non identitaire, pour les **lectures** de CI (mika#2963).
+    let team_resolved_ci_read_token = if let Some(settings) = params.settings {
+        settings.resolve_ci_read_token(params.github_app).await
+    } else {
+        None
+    };
+
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.task_message);
 
@@ -8595,6 +8620,7 @@ async fn run_team_agent_inner_impl(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: team_resolved_github_token.as_deref(),
+        ci_read_token: team_resolved_ci_read_token.as_ref(),
         gateway_url: params.gateway_url,
         internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,

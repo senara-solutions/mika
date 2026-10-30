@@ -67,7 +67,7 @@ use crate::async_db::AsyncDatabase;
 use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    CheckClassification, classify_checks, run_gh_checks, run_gh_subprocess,
+    CheckClassification, ci_read_token_or_pat, classify_checks, run_gh_checks, run_gh_subprocess,
 };
 
 use super::ci_success_handler::{PrInfo, find_open_pr};
@@ -944,9 +944,13 @@ async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> Failu
     };
 
     // Fetch checks with timeout
+    //
+    // mika#2963 — `None` : pas de `ToolContext` ici, repli PAT explicite, dit
+    // dans le log (`source = "pat"`).
+    let ci_token = ci_read_token_or_pat(None, token);
     let checks = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run_gh_checks(pr_number, repo, token),
+        run_gh_checks(pr_number, repo, &ci_token),
     )
     .await
     {

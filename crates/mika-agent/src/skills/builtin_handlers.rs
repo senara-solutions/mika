@@ -4496,6 +4496,14 @@ async fn validate_qa_ci_coherence(
 ///
 /// Public because `tests/eval/` is a separate crate. It has exactly one
 /// production caller, [`validate_qa_ci_coherence`].
+///
+/// # Le jeton, depuis mika#2963
+///
+/// Le troisième paramètre du lecteur est un [`mika_common::ci_read::CiReadToken`]
+/// et non plus une `String` : c'est ce qui rend la **divergence** observable dans
+/// un test. Au même `ToolContext`, [`gh_exec_token`] rend le PAT — qui poste le
+/// `pr review` — et ce lecteur reçoit le jeton d'App. Un test portant sur un seul
+/// des deux resterait vert le jour où ils se confondraient à nouveau.
 pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
     args: &[String],
     repo: Option<&str>,
@@ -4503,7 +4511,7 @@ pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
     read_checks: F,
 ) -> Result<(), ToolOutput>
 where
-    F: FnOnce(u64, String, String) -> Fut,
+    F: FnOnce(u64, String, mika_common::ci_read::CiReadToken) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
     use crate::evidence::guards::pr_review_target;
@@ -4587,7 +4595,14 @@ where
 
     // -- Read, bounded --
 
-    let read = read_checks(pr_number, repo.to_string(), token.to_string());
+    // mika#2963 — App d'abord, PAT en repli. L'abstention `NO_TOKEN` ci-dessus
+    // reste conditionnée au PAT : sans lui, le repli n'existe pas, et un jeton
+    // d'App seul suffirait à lire mais pas à poster la revue qui suit.
+    let read = read_checks(
+        pr_number,
+        repo.to_string(),
+        crate::tools::pr_merge_with_gate::ci_read_token_or_pat(ctx.ci_read_token, token),
+    );
     let raw = match tokio::time::timeout(
         std::time::Duration::from_secs(QA_CI_READ_TIMEOUT_SECS),
         read,
@@ -5227,6 +5242,25 @@ where
     }
 }
 
+/// Le jeton d'**exécution** `gh` : le PAT, et rien d'autre (mika#2963, voie (i)).
+///
+/// Mêmes octets que `ctx.github_token`, mais un nom. Il existe pour que la
+/// divergence soit nommable : depuis mika#2963 le contexte porte **deux** jetons,
+/// et un `pr review` posté avec le jeton d'App serait signé
+/// `mika-platform-bot[bot]` au lieu de `mika-platform-qa`, ce que sept modules
+/// lisent par login (`qa_review_reconcile`, `qa_head_supersession`,
+/// `server::verdict`, `deadline_verdict`, `skills::matcher`,
+/// `task_engine::dispatcher`, `server::sync_debounce`). La lecture de CI prend
+/// l'autre chemin, par [`crate::tools::pr_merge_with_gate::ci_read_token_or_pat`].
+///
+/// C'est le site que T1 épingle : `gh_exec_token` et le lecteur CI reçoivent des
+/// valeurs **différentes** d'un même `ToolContext`, et c'est cette divergence qui
+/// est l'observable — un test sur l'un des deux seuls resterait vert si les deux
+/// se confondaient à nouveau.
+fn gh_exec_token<'a>(ctx: &'a ToolContext<'_>) -> Option<&'a str> {
+    ctx.github_token
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -5460,7 +5494,11 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // mika#2715 — l'événement reste **au site** et non dans la couture : il lit
     // `ctx.session_id`/`ctx.github_token`, que `gh_process` ne connaît pas. Les
     // clés qu'il nomme sont celles que la couture pose, dans l'ordre de #380.
-    let env_keys_set: &[&str] = match ctx.github_token {
+    //
+    // mika#2963 — le jeton se lit par `gh_exec_token` : `run_gh` **exécute**
+    // (`pr review`, `pr merge`, `pr comment`), donc il reste sur le PAT.
+    let exec_token = gh_exec_token(ctx);
+    let env_keys_set: &[&str] = match exec_token {
         Some(_) => &["GH_PROMPT_DISABLED", "GH_TOKEN"],
         None => &["GH_PROMPT_DISABLED"],
     };
@@ -5469,7 +5507,7 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         argv = ?&gh_args.args,
         repo = ?&gh_args.repo,
         env_keys_set = ?env_keys_set,
-        has_github_token = ctx.github_token.is_some(),
+        has_github_token = exec_token.is_some(),
         "run_gh invocation"
     );
 
@@ -5477,7 +5515,7 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // parce que `run_gh` sert des sous-commandes libres : il n'y a pas de champ
     // d'entrée structuré où le lire.
     let output = crate::gh_process::run_gh_tool(
-        ctx.github_token,
+        exec_token,
         crate::gh_process::gh_subject_from_argv(&gh_args.args),
         &gh_args.args,
         gh_args.repo.as_deref(),
@@ -7771,6 +7809,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            ci_read_token: None,
             gateway_url: Some(gateway_url),
             internal_token: None,
             skills_dirty: &SKILLS_DIRTY,
@@ -7816,6 +7855,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            ci_read_token: None,
             gateway_url: Some(gateway_url),
             internal_token: Some(token),
             skills_dirty: &SKILLS_DIRTY,
@@ -7837,6 +7877,101 @@ mod tests {
             deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         }
+    }
+
+    /// **T1 (AC2) — la voie (i) : on lit avec l'App, on poste avec le PAT.**
+    ///
+    /// Les deux assertions sont dans le **même** test, et ce n'est pas une
+    /// commodité : c'est leur **divergence** qui est l'observable. Deux tests
+    /// séparés — l'un pinçant `gh_exec_token`, l'autre le jeton du lecteur —
+    /// passeraient tous les deux, verts, sur un arbre où les deux chemins
+    /// lisent la *même* valeur. Or c'est exactement l'arbre d'avant ce ticket,
+    /// et exactement celui qu'une simplification future produirait en
+    /// « nettoyant » `gh_exec_token` pour revenir à `ctx.github_token`.
+    ///
+    /// Ce que l'assertion sur `gh_exec_token` protège : un `pr review` posté
+    /// avec le jeton d'installation serait signé `mika-platform-bot[bot]` et non
+    /// `mika-platform-qa`, login que sept modules lisent pour reconnaître leur
+    /// propre revue (`qa_review_reconcile`, `qa_head_supersession`,
+    /// `server::verdict`, `deadline_verdict`, `skills::matcher`,
+    /// `task_engine::dispatcher`, `server::sync_debounce`). Le basculement
+    /// serait silencieux : la revue serait bien postée.
+    ///
+    /// Le lecteur injecté rend `Err` — le garde s'abstient alors et laisse
+    /// passer, ce qui est son contrat fail-open. L'observable n'est pas sa
+    /// décision, c'est **le jeton qu'il a tenu**, donc l'abréger ici est exact
+    /// plutôt qu'économe.
+    #[tokio::test]
+    async fn mika2963_ac2_le_lecteur_prend_lapp_et_le_pr_review_garde_le_pat() {
+        use mika_common::ci_read::{CiReadToken, CiReadTokenSource};
+
+        const PAT: &str = "pat-mika2963";
+        const APP: &str = "app-mika2963";
+
+        let harness = TestHarness::new();
+        let jeton_app = CiReadToken::new(APP, CiReadTokenSource::App);
+        let mut ctx = harness.ctx();
+        ctx.github_token = Some(PAT);
+        ctx.ci_read_token = Some(&jeton_app);
+
+        // Premier terme : le jeton d'EXÉCUTION de `run_gh`, donc celui qui
+        // signera le `pr review`, est le PAT — alors même que l'App est là.
+        assert_eq!(
+            gh_exec_token(&ctx),
+            Some(PAT),
+            "mika#2963 AC2 — `run_gh` doit exécuter avec le PAT. Avec le jeton d'App, la \
+             revue serait postée par `mika-platform-bot[bot]` et les sept modules qui \
+             reconnaissent `mika-platform-qa` par login cesseraient de voir leur propre \
+             revue — sans qu'aucune erreur ne soit levée."
+        );
+
+        // Second terme : au MÊME contexte, le lecteur CI tient l'autre jeton.
+        let vu = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let plume = vu.clone();
+        let argv: Vec<String> = vec![
+            "pr".into(),
+            "review".into(),
+            "2963".into(),
+            "--approve".into(),
+            "--body".into(),
+            "VERDICT: pass\nDEPTH: code-level\nREASON: tous les AC sont tenus.".into(),
+        ];
+        validate_qa_ci_coherence_with_reader(
+            &argv,
+            Some("senara-solutions/mika"),
+            &ctx,
+            move |_pr, _repo, token| async move {
+                *plume.lock().unwrap() = Some((
+                    token.token().to_string(),
+                    token.source().as_str().to_string(),
+                ));
+                Err("lecture abrégée : l'observable est le jeton, pas la décision".to_string())
+            },
+        )
+        .await
+        .expect("le garde est fail-open sur un échec de lecture (mika#2455)");
+
+        let (jeton_vu, source_vue) = vu.lock().unwrap().clone().expect(
+            "mika#2963 AC2 — le lecteur CI n'a jamais été appelé : le garde s'est abstenu \
+                    en amont, et ce test ne mesure plus rien (mika#2103)",
+        );
+        assert_eq!(
+            jeton_vu, APP,
+            "mika#2963 AC2 — le lecteur CI doit tenir le jeton d'App résolu par \
+             `Settings::resolve_ci_read_token`. Avec le PAT, la lecture échoue sur \
+             `statusCheckRollup` et le garde s'abstient — les 55 `gh_failed` mesurés."
+        );
+        assert_eq!(
+            source_vue, "app",
+            "mika#2963 AC4 — la source portée par le jeton doit dire `app`, sinon la sonde \
+             AC5 lit un repli là où l'App a servi"
+        );
+        assert_ne!(
+            jeton_vu, PAT,
+            "mika#2963 AC2 — les deux chemins se sont reconfondus : c'est précisément la \
+             régression que ce test existe pour voir, et une assertion sur un seul des deux \
+             jetons serait restée verte."
+        );
     }
 
     #[tokio::test]

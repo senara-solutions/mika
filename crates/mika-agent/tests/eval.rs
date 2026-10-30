@@ -241,6 +241,10 @@ mod eval {
     // mika#2237, et les six abstentions nommées.
     mod test_qa_ci_coherence_2455;
 
+    // mika#2963 — AC3 : sans jeton d'App ni PAT, le gate de merge refuse en
+    // tête. Il ne lit jamais un échec de lecture comme du vert.
+    mod test_ci_read_token_gate_2963;
+
     // mika#2519 — l'exemption de plan dependabot existait deux fois et ne tenait
     // pas : le `block[pipeline]` que Step 1.6 rend inatteignable est refusé
     // avant le sous-processus, et un `pass` sur un saut de MAJEURE exige une

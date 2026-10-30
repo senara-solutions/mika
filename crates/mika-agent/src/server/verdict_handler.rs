@@ -31,9 +31,9 @@ use crate::perimeter::{self, Classification};
 use crate::skills::SkillRegistry;
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    BehindMainInfo, BehindMainRemediation, CheckClassification, classify_checks,
-    describe_behind_main_remediation, is_behind_main, mpc_gate_clearance, remediate_behind_main,
-    run_gh_checks, run_gh_merge, run_gh_pr_view, run_gh_subprocess,
+    BehindMainInfo, BehindMainRemediation, CheckClassification, ci_read_token_or_pat,
+    classify_checks, describe_behind_main_remediation, is_behind_main, mpc_gate_clearance,
+    remediate_behind_main, run_gh_checks, run_gh_merge, run_gh_pr_view, run_gh_subprocess,
 };
 
 use super::verdict::{
@@ -609,7 +609,13 @@ async fn handle_pass_verdict(
     // Run CI check classification (reuse pr_merge_with_gate logic).
     // Wrap in a 60-second timeout matching PrMergeWithGateTool::timeout_secs()
     // to prevent a hanging gh subprocess from blocking the agent lock.
-    let checks_future = run_gh_checks(event.pr_number, &event.repo, token);
+    // mika#2963 — un handler webhook ne porte pas de `ToolContext`, donc aucun
+    // jeton d'App n'est résolu ici : `None` dégrade explicitement vers le PAT, et
+    // le log le dit (`source = "pat"`). C'est le régime d'avant ce ticket, nommé
+    // plutôt que subi — le peupler demanderait de faire descendre un
+    // `GitHubApp` jusqu'aux trois handlers, hors du périmètre de ce ticket.
+    let ci_token = ci_read_token_or_pat(None, token);
+    let checks_future = run_gh_checks(event.pr_number, &event.repo, &ci_token);
     let checks = match tokio::time::timeout(std::time::Duration::from_secs(60), checks_future).await
     {
         Ok(Ok(c)) => c,
