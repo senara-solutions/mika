@@ -2904,4 +2904,107 @@ mod tests {
             );
         }
     }
+
+    // -- mika#2968, vol 2a : les causes de la lecture par numéro (AC3 étendu) --
+
+    /// AC3 — les six causes de non-lecture du vol 2a, chacune sous son libellé.
+    ///
+    /// Six libellés **distincts** parce que les six causes n'appellent pas la
+    /// même action : « lecture gh en échec » envoie regarder le jeton du dépôt
+    /// (mika#2963), « PR hors de la page lue » la borne de 100, « ce vol n'a pas
+    /// de PR » rien du tout. Deux causes sous les mêmes octets referaient une
+    /// seule population (classe mika#2205), donc la distinction est assertée
+    /// aussi, pas seulement la présence.
+    #[test]
+    fn mika2968_ac3_les_six_causes_de_la_lecture_par_numero_se_disent() {
+        let attendus = [
+            (
+                CiUnreadCause::NoPrNumber,
+                "CI non lue (ce vol n'a pas de PR)",
+            ),
+            (CiUnreadCause::NoRepo, "CI non lue (vol sans dépôt)"),
+            (
+                CiUnreadCause::NoRunner,
+                "CI non lue (aucun lecteur gh câblé)",
+            ),
+            (
+                CiUnreadCause::ReadFailed,
+                "CI non lue (lecture gh en échec)",
+            ),
+            (
+                CiUnreadCause::NotFound,
+                "CI non lue (PR hors de la page lue)",
+            ),
+            (CiUnreadCause::PrNotOpen, "CI non lue (PR non ouverte)"),
+        ];
+        for (cause, attendu) in attendus {
+            let mut v = verdict(
+                Some(2968),
+                FlightIssue::PrOpened {
+                    number: Some(2977),
+                    url: None,
+                },
+                Some(83),
+                false,
+                FlightRecommendation::MergeCandidate,
+            );
+            v.ci = CiKnowledge::Unread(cause);
+            let ligne = render_flight_verdict(&v);
+            assert!(
+                ligne.contains(attendu),
+                "la ligne du vol doit porter « {attendu} » :\n{ligne}"
+            );
+        }
+        let distincts: std::collections::HashSet<&str> = attendus
+            .iter()
+            .map(|(cause, _)| ci_unread_label(*cause))
+            .collect();
+        assert_eq!(
+            distincts.len(),
+            attendus.len(),
+            "deux causes sous le même libellé se confondraient au rapport"
+        );
+    }
+
+    /// AC3 — les trois appartenances au milestone, lues sur leur propre champ.
+    ///
+    /// Le `pr_state` est tenu **constant** et lu dans les trois cas : c'est ce
+    /// qui prouve que le libellé d'appartenance ne le lit plus. Sous l'ancienne
+    /// déduction, un `Read(_)` aurait rendu « milestone cible » trois fois.
+    #[test]
+    fn mika2968_ac3_les_trois_appartenances_se_disent_sans_lire_letat_de_pr() {
+        for (appartenance, attendu) in [
+            (MilestoneMembership::InTarget, " — milestone cible — "),
+            (
+                MilestoneMembership::OutOfTarget,
+                " — hors milestone cible — ",
+            ),
+            (
+                MilestoneMembership::NotRead,
+                " — appartenance au milestone non lue — ",
+            ),
+        ] {
+            let mut v = verdict(
+                Some(2968),
+                FlightIssue::PrOpened {
+                    number: Some(2977),
+                    url: None,
+                },
+                Some(83),
+                false,
+                FlightRecommendation::MergeCandidate,
+            );
+            v.pr_state = PrStateKnowledge::Read(Some("OPEN".into()));
+            v.in_target_milestone = appartenance;
+            let ligne = render_flight_verdict(&v);
+            assert!(
+                ligne.contains(attendu),
+                "la ligne du vol doit porter « {attendu} » :\n{ligne}"
+            );
+            assert!(
+                ligne.contains(" — PR OPEN — "),
+                "l'état de PR reste rendu, indépendamment :\n{ligne}"
+            );
+        }
+    }
 }
