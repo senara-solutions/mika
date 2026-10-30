@@ -260,10 +260,17 @@ mod tests {
     use crate::db::Database;
 
     /// L'instant du cycle qui date la lecture CI (mika#2968). Les tests d'ici
-    /// passent `&[]` en sous-issues, donc **aucune** CI n'est lue et cette
+    /// ne câblent aucun lecteur de PR, donc **aucune** CI n'est lue et cette
     /// valeur n'entre dans aucune de leurs assertions — elle existe pour que
     /// l'appel reste celui de la production.
     const AU_CYCLE_DE: &str = "2026-10-29T17:46:12Z";
+
+    /// Aucun lecteur de PR : ce qui est mesuré ici est l'**appariement des
+    /// vols** (quelle tâche porte le ticket, quelle ligne `Outcome:` atteint
+    /// l'évaluateur), pas la lecture `gh`. `Unwired` le dit sans l'inventer —
+    /// les verdicts rendus portent une CI non lue, cause `no_runner`.
+    const SANS_LECTEUR: crate::milestone_manager::evaluator::FlightPrReads =
+        crate::milestone_manager::evaluator::FlightPrReads::Unwired;
 
     fn seeded_db() -> AsyncDatabase {
         AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
@@ -545,8 +552,12 @@ mod tests {
             "le vol rendu est la parente — c'est elle qui porte le ticket"
         );
 
-        let verdicts =
-            crate::milestone_manager::evaluator::evaluate_flights(&vols, &[], AU_CYCLE_DE);
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(
+            &vols,
+            &[],
+            &SANS_LECTEUR,
+            AU_CYCLE_DE,
+        );
         assert_eq!(verdicts.len(), 1);
         assert!(
             matches!(
@@ -581,8 +592,12 @@ mod tests {
 
         let source = DbFlightSource::new(AsyncDatabase::new_with_agent(db, "mika-test"));
         let vols = source.finished_implement_flights(None).await;
-        let verdicts =
-            crate::milestone_manager::evaluator::evaluate_flights(&vols, &[], AU_CYCLE_DE);
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(
+            &vols,
+            &[],
+            &SANS_LECTEUR,
+            AU_CYCLE_DE,
+        );
 
         assert_eq!(verdicts.len(), 1);
         assert_eq!(
@@ -727,8 +742,12 @@ mod tests {
         let vols = source.finished_implement_flights(None).await;
 
         assert_eq!(vols.len(), 1, "un vol, la parente");
-        let verdicts =
-            crate::milestone_manager::evaluator::evaluate_flights(&vols, &[], AU_CYCLE_DE);
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(
+            &vols,
+            &[],
+            &SANS_LECTEUR,
+            AU_CYCLE_DE,
+        );
         assert_eq!(
             verdicts[0].issue,
             crate::milestone_manager::evaluator::FlightIssue::PrOpened {
@@ -766,8 +785,12 @@ mod tests {
             "le vol rendu est la parente — c'est elle qui porte le ticket"
         );
 
-        let verdicts =
-            crate::milestone_manager::evaluator::evaluate_flights(&vols, &[], AU_CYCLE_DE);
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(
+            &vols,
+            &[],
+            &SANS_LECTEUR,
+            AU_CYCLE_DE,
+        );
         assert_eq!(verdicts.len(), 1);
         assert_eq!(
             verdicts[0].issue,
@@ -808,8 +831,12 @@ mod tests {
             "un groom sans implémentation relancée est un vol terminé — il n'a \
              rien à attendre"
         );
-        let verdicts =
-            crate::milestone_manager::evaluator::evaluate_flights(&vols, &[], AU_CYCLE_DE);
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(
+            &vols,
+            &[],
+            &SANS_LECTEUR,
+            AU_CYCLE_DE,
+        );
         assert_eq!(
             verdicts[0].issue,
             crate::milestone_manager::evaluator::FlightIssue::NotAFlight {
@@ -842,8 +869,12 @@ mod tests {
 
         assert_eq!(vols.len(), 1, "un vol, la parente");
         assert_eq!(vols[0].task_id, parente_id);
-        let verdicts =
-            crate::milestone_manager::evaluator::evaluate_flights(&vols, &[], AU_CYCLE_DE);
+        let verdicts = crate::milestone_manager::evaluator::evaluate_flights(
+            &vols,
+            &[],
+            &SANS_LECTEUR,
+            AU_CYCLE_DE,
+        );
         assert_eq!(
             verdicts[0].issue,
             crate::milestone_manager::evaluator::FlightIssue::PrOpened {

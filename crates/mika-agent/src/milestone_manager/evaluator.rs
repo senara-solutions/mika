@@ -34,10 +34,13 @@
 //! [`FlightVerdict::last_commit_turn`], que le vol 2 branchera sur le
 //! transcript.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::types::{CiState, MilestoneState, PrLinkSource, SubIssue};
+use super::reader::RepoPrRead;
+use super::types::{CiState, MilestoneState, SubIssue};
 
 // ---- Le verdict ------------------------------------------------------------
 
@@ -177,9 +180,10 @@ pub enum MilestoneMembership {
 /// Ce que le manager **sait** de la CI de la tête de la PR d'un vol (mika#2968).
 ///
 /// Même forme et même raison que [`PrStateKnowledge`], sur un autre axe : la CI
-/// d'une PR n'est lue que lorsque la PR est venue de la liste du milestone
-/// (`gh pr list --search milestone:<n>`, seule requête qui rend un
-/// `statusCheckRollup`). Pour tous les autres vols, il n'y a **pas de mesure** —
+/// d'une PR n'est lue que lorsque la lecture par numéro de PR
+/// ([`super::reader::read_flight_prs`], vol 2a) a abouti sur son dépôt **et**
+/// trouvé ce numéro sur une PR ouverte. Partout ailleurs il n'y a **pas de
+/// mesure** —
 /// et « pas de mesure » n'est pas « pas de check » : [`CiState::None`] dit qu'une
 /// lecture a eu lieu et n'a trouvé aucun check, [`CiKnowledge::Unread`] dit que
 /// rien n'a été lu. Deux populations sous un `Option` auraient rendu les mêmes
@@ -204,23 +208,77 @@ pub enum CiKnowledge {
 /// Énumération **fermée** : chaque variante correspond à un point précis où la
 /// chaîne de provenance se casse, et aucune ne vaut « échec inconnu ». Élargir
 /// la famille demande d'ajouter la variante ici, donc de décider par écrit.
+///
+/// # Deux générations, et pourquoi les quatre premières restent
+///
+/// Les quatre variantes du vol 1 décrivaient une chaîne qui partait de la
+/// sous-issue du milestone. Le vol 2a part du **numéro de PR du vol**, donc
+/// aucune des quatre n'est plus écrite par
+/// [`evaluate_flights`] : les six suivantes couvrent la nouvelle chaîne en
+/// entier. Elles ne sont pas supprimées pour autant — `VerdictRecord::ci`
+/// (`crate::flight_verdict_ledger`) désérialise des blobs écrits par le vol 1,
+/// et retirer une variante ferait échouer cette lecture sur un verdict déjà
+/// écrit. Chacune porte la date après laquelle plus rien ne la produit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiUnreadCause {
     /// La sous-issue est appariée, mais son lien de PR ne vient **pas** de la
     /// liste du milestone — donc son `ci_state` ne vient d'aucune lecture de la
-    /// PR. C'est le cas modal de la boucle : mesuré le 2026-10-29, aucune des
+    /// PR. C'était le cas modal de la boucle : mesuré le 2026-10-29, aucune des
     /// cinq PR du jour ne portait le milestone.
+    ///
+    /// **Retirée de la production le 2026-10-30** (vol 2a) : la lecture ne part
+    /// plus de la liste du milestone. Conservée pour les verdicts du vol 1.
     NotFromPrList,
     /// Le ticket du vol n'est apparié à aucune sous-issue du milestone cible —
     /// le pendant CI de [`PrStateKnowledge::NotRead`].
+    ///
+    /// **Retirée de la production le 2026-10-30** (vol 2a) : la CI ne dépend
+    /// plus de l'appariement. Un vol hors milestone cible a désormais sa CI lue
+    /// comme les autres, et son appartenance se dit par
+    /// [`MilestoneMembership::OutOfTarget`].
     NoSubIssue,
     /// Le vol ne porte pas d'URL de ticket, donc il n'y a rien à apparier.
+    ///
+    /// **Retirée de la production le 2026-10-30** (vol 2a) : la lecture ne
+    /// passe plus par le ticket. Un vol sans ticket mais avec un numéro de PR
+    /// est lu ; un vol sans numéro de PR rend [`CiUnreadCause::NoPrNumber`].
     NoIssueNumber,
     /// **Non mesurée** : c'est le défaut à la désérialisation. Un blob de rapport
     /// antérieur à mika#2968 ne porte pas le champ, donc il ne porte aucune
     /// lecture — dire `Read` à sa place serait inventer une mesure.
+    ///
+    /// Toujours écrite, mais par serde seul et jamais par une composition.
     NotMeasured,
+    /// Le vol n'a pas de numéro de PR : son issue n'est ni
+    /// [`FlightIssue::PrOpened`] ni [`FlightIssue::RescuePr`], ou la PR n'a pas
+    /// laissé de numéro dans `tasks.metadata` ni de ligne `PR:` dans son
+    /// `result`. Il n'y a **rien** à lire, et c'est une propriété du vol, pas
+    /// un échec de lecture.
+    NoPrNumber,
+    /// Le vol ne dit pas sur quel dépôt il a volé (`FinishedFlight::repo` à
+    /// `None`), donc le numéro de PR n'est adressable nulle part : `#2966` n'a
+    /// de sens que joint à un dépôt.
+    NoRepo,
+    /// **Aucune lecture n'a été tentée pour ce dépôt** — soit le cycle n'a pas
+    /// de lecteur `gh` câblé ([`FlightPrReads::Unwired`]), soit le dépôt de ce
+    /// vol n'était pas dans l'ensemble lu. Une seule population : *non tentée*,
+    /// que [`CiUnreadCause::ReadFailed`] sépare de *tentée et échouée*.
+    NoRunner,
+    /// La lecture a eu lieu et a échoué : le premier appel `gh` du dépôt n'a
+    /// pas abouti ([`RepoPrRead::Failed`]), ou la PR est ouverte mais le second
+    /// appel — celui qui porte `statusCheckRollup` — n'a pas abouti. C'est le
+    /// cas des dépôts où le jeton ne lit pas le rollup (mika#2963).
+    ReadFailed,
+    /// Le dépôt a été lu, et le numéro de la PR n'était **pas** dans la page
+    /// rendue. Une page pleine ne dit pas « voici toutes les PR » : la cause
+    /// nomme la borne plutôt que de laisser croire que la PR n'existe pas.
+    NotFound,
+    /// La PR a été lue et n'est pas ouverte (fusionnée, fermée). Le second
+    /// appel ne demande le rollup que des PR ouvertes, donc il n'y a pas de CI
+    /// à lire — et la recommandation n'en a pas besoin : un état autre que
+    /// `open` décide à lui seul.
+    PrNotOpen,
 }
 
 impl CiKnowledge {
@@ -235,6 +293,28 @@ impl CiKnowledge {
     pub(crate) fn default_unread() -> Self {
         CiKnowledge::Unread(CiUnreadCause::NotMeasured)
     }
+}
+
+/// Ce que le cycle a lu des PR des vols, par dépôt (mika#2968, vol 2a).
+///
+/// Enveloppe nommée autour du rendu de [`super::reader::read_flight_prs`], et
+/// non un `Option<HashMap<…>>`, parce que « le cycle n'a pas de lecteur `gh` »
+/// et « le lecteur a tourné et n'a rien rendu » sont deux populations qu'un
+/// `None` rendrait indistinguables (classe mika#2205). La première est une
+/// propriété du câblage du cycle — en production elle ne survient que sur un
+/// cycle sans jeton — la seconde une propriété des dépôts lus.
+///
+/// Elle vit ici plutôt que dans le `reader` pour que la signature de
+/// `read_flight_prs` reste celle du § 4 du plan : c'est `cadence.rs` qui
+/// enveloppe, parce que c'est lui qui sait s'il a un lecteur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlightPrReads {
+    /// Aucun lecteur `gh` n'est câblé dans ce cycle : rien n'a été tenté.
+    Unwired,
+    /// Les lectures, indexées par dépôt (`senara-solutions/mika`, …). Un dépôt
+    /// absent de la table n'a pas été tenté non plus ; un dépôt présent porte
+    /// son propre [`RepoPrRead`].
+    Read(HashMap<String, RepoPrRead>),
 }
 
 /// Ce que le manager recommande à l'opérateur pour ce vol.
@@ -414,9 +494,19 @@ pub fn milestone_issue_urls(state: &MilestoneState) -> Vec<String> {
 /// aucune horloge ne vit dans ce module, et le `now` du cycle majore la lecture
 /// `gh` au lieu de la dater après les sept appels — d'où le libellé « au cycle
 /// de » plutôt que « lue à » (§ 2.5 du plan).
+///
+/// `pr_reads` est la lecture **par numéro de PR** du vol 2a, et depuis ce vol
+/// c'est la seule source de `ci` **et** de `pr_state`. Les deux voyagent
+/// ensemble parce qu'ils sortent du même appel `gh` : les séparer rendrait
+/// possible un verdict dont l'état de PR vient d'une lecture et la CI d'une
+/// autre. L'ancienne porte — le `pr_link_source` de la sous-issue appariée —
+/// est retirée : elle ne s'ouvrait que pour les PR portant elles-mêmes le
+/// milestone, c'est-à-dire aucune des cinq PR de la boucle du 2026-10-29.
+/// `sub_issues` ne sert donc plus qu'à l'appartenance au milestone.
 pub fn evaluate_flights(
     flights: &[FinishedFlight],
     sub_issues: &[SubIssue],
+    pr_reads: &FlightPrReads,
     read_at: &str,
 ) -> Vec<FlightVerdict> {
     flights
@@ -424,44 +514,103 @@ pub fn evaluate_flights(
         .map(|f| {
             let issue_number = issue_number_from_url(f.reference_url.as_deref());
             let matched = issue_number.and_then(|n| sub_issues.iter().find(|s| s.number == n));
-            // L'appartenance au milestone cible est désormais **son propre**
-            // champ (mika#2968, vol 2a). Ici elle reste équivalente à l'ancien
-            // `Read(_)` — `InTarget` ⟺ appariement réussi — donc le rendu ne
-            // change pas : c'est le découplage seul, sans la nouvelle porte.
+            // L'appartenance au milestone cible est **son propre** champ
+            // (mika#2968, vol 2a) : c'est ce découplage qui permet à la CI
+            // d'être lue pour un vol hors milestone cible.
             let in_target_milestone = match (issue_number, matched) {
                 (None, _) => MilestoneMembership::NotRead,
                 (Some(_), None) => MilestoneMembership::OutOfTarget,
                 (Some(_), Some(_)) => MilestoneMembership::InTarget,
             };
-            // L'échec d'appariement n'est pas « pas d'état » : c'est « pas lu ».
-            let pr_state = match matched {
-                Some(s) => PrStateKnowledge::Read(s.pr_state.clone()),
-                None => PrStateKnowledge::NotRead,
-            };
-            // La CI n'est lue que si sa **provenance** la garantit (mika#2968) :
-            // `ci_state` vaut `CiState::None` aussi bien pour « lue, aucun
-            // check » que pour « ce chemin ne lit aucun rollup », et seul
-            // `pr_link_source` sépare les deux. Sans ce garde, le second
-            // passerait pour le premier — donc une CI non lue passerait pour
-            // verte, ce que le ticket interdit (classe mika#2205).
-            let ci = match (issue_number, matched) {
-                (None, _) => CiKnowledge::Unread(CiUnreadCause::NoIssueNumber),
-                (Some(_), None) => CiKnowledge::Unread(CiUnreadCause::NoSubIssue),
-                (Some(_), Some(s)) => match s.pr_link_source {
-                    // Seule la liste des PR du milestone rend un
-                    // `statusCheckRollup`, donc elle seule atteste une lecture.
-                    Some(PrLinkSource::MilestonePrList) => CiKnowledge::Read {
-                        state: s.ci_state.clone(),
-                        at: read_at.to_string(),
-                    },
-                    // `IssueClosingRef` ne porte pas de rollup ; `None` est un
-                    // blob antérieur à mika#2924. Deux raisons, une conclusion.
-                    _ => CiKnowledge::Unread(CiUnreadCause::NotFromPrList),
-                },
-            };
+            let (pr_state, ci) =
+                compose_pr_knowledge(f.repo.as_deref(), flight_pr_number(f), pr_reads, read_at);
             evaluate_flight(f, issue_number, &pr_state, &ci, in_target_milestone)
         })
         .collect()
+}
+
+/// Le numéro de la PR qu'un vol a produite, s'il en a produit une.
+///
+/// Passe par [`classify_issue`], qui **est** le lecteur unique de ce que
+/// `tasks.result` et `tasks.metadata` disent du dénouement d'un vol
+/// (mika#2201). Une fonction pure appelée deux fois dans le même tour n'est pas
+/// un second lecteur : c'est le même, et les deux appels rendent la même issue
+/// par construction. Rouvrir `result` ici à la main en serait un.
+fn flight_pr_number(flight: &FinishedFlight) -> Option<u64> {
+    let pilot = PilotFields::parse(flight.metadata.as_deref());
+    let result = flight.result.as_deref().unwrap_or("");
+    match classify_issue(result, &pilot) {
+        FlightIssue::PrOpened { number, .. } | FlightIssue::RescuePr { number, .. } => number,
+        FlightIssue::Dead { .. } | FlightIssue::NotAFlight { .. } => None,
+    }
+}
+
+/// Ce que la lecture par numéro dit de la PR d'un vol : son état, et sa CI.
+///
+/// Les deux sortent **de la même lecture**, donc d'une seule fonction. La table
+/// est celle des § 5 et § 6 du plan :
+///
+/// | situation | `pr_state` | `ci` |
+/// |---|---|---|
+/// | le vol n'a pas de numéro de PR | `NotRead` | `Unread(NoPrNumber)` |
+/// | le vol ne dit pas son dépôt | `NotRead` | `Unread(NoRepo)` |
+/// | rien n'a été tenté sur ce dépôt | `NotRead` | `Unread(NoRunner)` |
+/// | la lecture du dépôt a échoué | `NotRead` | `Unread(ReadFailed)` |
+/// | le numéro n'est pas dans la page lue | `NotRead` | `Unread(NotFound)` |
+/// | PR lue, non ouverte | `Read(Some(état))` | `Unread(PrNotOpen)` |
+/// | PR lue, ouverte, rollup non lu | `Read(Some(état))` | `Unread(ReadFailed)` |
+/// | PR lue, ouverte, rollup lu | `Read(Some(état))` | `Read { … }` |
+///
+/// **L'ordre de lecture est porteur** : `state` est lu **avant** `ci`, parce que
+/// `FlightPrRead::ci` vaut `None` dans deux cas de sens opposé — sur une PR non
+/// ouverte le second appel `gh` ne l'a pas demandée, sur une PR ouverte il a
+/// échoué. Lire `ci` d'abord fondrait les deux en une seule cause, et
+/// « la CI n'avait pas à être lue » passerait pour « la CI n'a pas pu être
+/// lue » (classe mika#2205).
+///
+/// `pr_state` est `Read` **dès que le numéro est trouvé**, y compris pour une PR
+/// non ouverte : l'état *a* été lu, et c'est lui qui décide la recommandation
+/// dans ce cas.
+fn compose_pr_knowledge(
+    repo: Option<&str>,
+    pr_number: Option<u64>,
+    pr_reads: &FlightPrReads,
+    read_at: &str,
+) -> (PrStateKnowledge, CiKnowledge) {
+    let non_lu = |cause| (PrStateKnowledge::NotRead, CiKnowledge::Unread(cause));
+    let Some(number) = pr_number else {
+        return non_lu(CiUnreadCause::NoPrNumber);
+    };
+    let Some(repo) = repo else {
+        return non_lu(CiUnreadCause::NoRepo);
+    };
+    let FlightPrReads::Read(par_depot) = pr_reads else {
+        return non_lu(CiUnreadCause::NoRunner);
+    };
+    let Some(depot) = par_depot.get(repo) else {
+        return non_lu(CiUnreadCause::NoRunner);
+    };
+    let prs = match depot {
+        RepoPrRead::Read(prs) => prs,
+        RepoPrRead::Failed => return non_lu(CiUnreadCause::ReadFailed),
+    };
+    let Some(pr) = prs.get(&number) else {
+        return non_lu(CiUnreadCause::NotFound);
+    };
+    let pr_state = PrStateKnowledge::Read(Some(pr.state.clone()));
+    // `open` est comparé sans égard à la casse, comme dans `recommend` : `gh`
+    // écrit `OPEN`, et c'est la graphie que le rapport affiche telle quelle.
+    if !pr.state.eq_ignore_ascii_case("open") {
+        return (pr_state, CiKnowledge::Unread(CiUnreadCause::PrNotOpen));
+    }
+    let ci = match &pr.ci {
+        Some(state) => CiKnowledge::Read {
+            state: state.clone(),
+            at: read_at.to_string(),
+        },
+        None => CiKnowledge::Unread(CiUnreadCause::ReadFailed),
+    };
+    (pr_state, ci)
 }
 
 /// Le verdict d'un vol, `pr_state` étant ce que le manager **sait** de l'état de
@@ -796,6 +945,7 @@ impl PilotFields {
 
 #[cfg(test)]
 mod tests {
+    use super::super::reader::FlightPrRead;
     use super::*;
 
     // ---- Fixtures : les trois issues de l'AC3, au format du producteur ----
@@ -914,11 +1064,45 @@ mod tests {
     /// la même raison que [`CI_NON_LUE`].
     const CIBLE_NON_LUE: MilestoneMembership = MilestoneMembership::NotRead;
 
-    /// L'instant du cycle qui date la lecture CI. Les sous-tickets de ce module
-    /// portent `pr_link_source: None`, donc aucune CI n'y est lue et cet
-    /// instant n'entre dans aucune assertion — il existe pour que l'appel reste
-    /// celui de la production.
+    /// L'instant du cycle qui date la lecture CI.
     const AU_CYCLE_DE: &str = "2026-10-29T17:46:12Z";
+
+    /// Le dépôt des fixtures de ce module — celui que chacune nomme dans son
+    /// champ `repo`, donc celui sous lequel une lecture doit être rangée pour
+    /// que la jointure ait lieu.
+    const DEPOT: &str = "senara-solutions/mika";
+
+    /// Aucun lecteur `gh` câblé (mika#2968, vol 2a) : la connaissance que
+    /// portent les tests qui n'instruisent pas l'axe de la lecture.
+    const SANS_LECTEUR: FlightPrReads = FlightPrReads::Unwired;
+
+    /// Une lecture par numéro de PR sur [`DEPOT`], gréée : `(numéro, état, CI)`.
+    ///
+    /// `ci: None` est **une propriété de la lecture**, jamais une CI verte : sur
+    /// une PR non ouverte le second appel `gh` ne l'a pas demandée, sur une PR
+    /// ouverte il a échoué. L'helper laisse donc l'appelant le dire.
+    fn lectures(prs: &[(u64, &str, Option<CiState>)]) -> FlightPrReads {
+        let mut page = HashMap::new();
+        for (numero, etat, ci) in prs {
+            page.insert(
+                *numero,
+                FlightPrRead {
+                    state: etat.to_string(),
+                    ci: ci.clone(),
+                },
+            );
+        }
+        let mut par_depot = HashMap::new();
+        par_depot.insert(DEPOT.to_string(), RepoPrRead::Read(page));
+        FlightPrReads::Read(par_depot)
+    }
+
+    /// La lecture d'un dépôt dont le premier appel `gh` n'a pas abouti.
+    fn lecture_en_echec() -> FlightPrReads {
+        let mut par_depot = HashMap::new();
+        par_depot.insert(DEPOT.to_string(), RepoPrRead::Failed);
+        FlightPrReads::Read(par_depot)
+    }
 
     // ---- AC3 : les trois issues, avec les tours lus correctement ----------
 
@@ -927,6 +1111,7 @@ mod tests {
         let v = evaluate_flights(
             &[fixture_pr_opened()],
             &[sub_issue(2693, Some("open"))],
+            &lectures(&[(2696, "OPEN", Some(CiState::Success))]),
             AU_CYCLE_DE,
         );
         let v = &v[0];
@@ -949,6 +1134,7 @@ mod tests {
         let v = evaluate_flights(
             &[fixture_rescue_pr()],
             &[sub_issue(2655, Some("open"))],
+            &lectures(&[(2690, "OPEN", Some(CiState::Success))]),
             AU_CYCLE_DE,
         );
         let v = &v[0];
@@ -971,6 +1157,9 @@ mod tests {
         let v = evaluate_flights(
             &[fixture_dead_at_ceiling()],
             &[sub_issue(2661, None)],
+            // Le dépôt est lu, et la page est vide : la cause de non-lecture
+            // doit être « ce vol n'a pas de PR », pas « hors de la page ».
+            &lectures(&[]),
             AU_CYCLE_DE,
         );
         let v = &v[0];
@@ -985,6 +1174,11 @@ mod tests {
         assert_eq!(v.turns_used, Some(200));
         assert!(v.hit_ceiling);
         assert_eq!(v.recommendation, FlightRecommendation::Regroom);
+        assert_eq!(
+            v.ci,
+            CiKnowledge::Unread(CiUnreadCause::NoPrNumber),
+            "un vol sans PR n'a pas de CI à lire, et le dit par sa cause propre"
+        );
     }
 
     #[test]
@@ -1489,67 +1683,110 @@ mod tests {
         }
     }
 
-    /// Un sous-ticket non apparié ne prête pas son état — et depuis mika#2921 le
-    /// verdict dit *pourquoi* : il n'a rien lu.
+    /// L'état de PR vient de la **lecture par numéro**, et le sous-ticket
+    /// apparié ne le prête plus (mika#2968, vol 2a).
     ///
-    /// L'assertion s'est renforcée, pas affaiblie. Avant, le troisième cas
-    /// vérifiait seulement que la recommandation ne bougeait pas ; un
-    /// `Read(None)` posé par erreur à la place du `NotRead` l'aurait laissée
-    /// verte, et le rapport aurait annoncé un état lu qui n'existait pas.
+    /// Ce que mika#2698 tenait : « le même vol, deux milestones : seul l'état
+    /// hydraté par le Reader change le verdict ». La prémisse était que
+    /// `pr_state` sortait de `SubIssue::pr_state`, donc de l'appariement. Le
+    /// vol 2a la remplace : la source est `read_flight_prs`, interrogée par le
+    /// numéro que le vol porte lui-même, et l'appariement ne décide plus que
+    /// l'appartenance au milestone. Ce test mesure la substitution, pas une
+    /// version affaiblie de l'ancienne : l'axe `pr_state` est épinglé sur les
+    /// trois états que la lecture peut rendre, et le sous-ticket qui n'apparie
+    /// pas ne le change pas.
     #[test]
-    fn mika2698_letat_de_pr_vient_du_sous_ticket_apparie() {
-        // Le même vol, deux milestones : seul l'état hydraté par le Reader
-        // change le verdict. Aucun appel `gh` de plus.
+    fn mika2968_letat_de_pr_vient_de_la_lecture_par_numero() {
         let flights = [fixture_pr_opened()];
-        let apparie_fusionne =
-            &evaluate_flights(&flights, &[sub_issue(2693, Some("merged"))], AU_CYCLE_DE)[0];
+        let apparies = [sub_issue(2693, Some("merged"))];
+
+        // La lecture dit « fusionnée » : la reprise est manuelle, quoi que dise
+        // le sous-ticket apparié.
+        let fusionnee = &evaluate_flights(
+            &flights,
+            &apparies,
+            &lectures(&[(2696, "MERGED", None)]),
+            AU_CYCLE_DE,
+        )[0];
         assert_eq!(
-            apparie_fusionne.recommendation,
+            fusionnee.recommendation,
             FlightRecommendation::ManualResumption
         );
         assert_eq!(
-            apparie_fusionne.pr_state,
-            lu(Some("merged")),
-            "un vol apparié porte l'état que le Reader a lu"
+            fusionnee.pr_state,
+            lu(Some("MERGED")),
+            "le verdict porte l'état que la lecture par numéro a rendu"
         );
         assert_eq!(
-            evaluate_flights(&flights, &[sub_issue(2693, Some("open"))], AU_CYCLE_DE)[0]
-                .recommendation,
-            FlightRecommendation::MergeCandidate
+            fusionnee.ci,
+            CiKnowledge::Unread(CiUnreadCause::PrNotOpen),
+            "sur une PR fermée la CI n'est pas demandée, et le dit"
         );
 
-        let non_apparie =
-            &evaluate_flights(&flights, &[sub_issue(9999, Some("merged"))], AU_CYCLE_DE)[0];
-        assert_eq!(
-            non_apparie.recommendation,
-            FlightRecommendation::MergeCandidate,
-            "un sous-ticket qui n'apparie pas ne doit pas prêter son état"
-        );
+        // La même lecture, état `OPEN` et CI verte : merge-candidat.
+        let ouverte = &evaluate_flights(
+            &flights,
+            &apparies,
+            &lectures(&[(2696, "OPEN", Some(CiState::Success))]),
+            AU_CYCLE_DE,
+        )[0];
+        assert_eq!(ouverte.recommendation, FlightRecommendation::MergeCandidate);
+        assert_eq!(ouverte.pr_state, lu(Some("OPEN")));
+
+        // Un sous-ticket qui n'apparie pas ne retire rien à la lecture : c'est
+        // exactement ce que mika#2698 faisait dépendre de l'appariement.
+        let non_apparie = &evaluate_flights(
+            &flights,
+            &[sub_issue(9999, Some("merged"))],
+            &lectures(&[(2696, "OPEN", Some(CiState::Success))]),
+            AU_CYCLE_DE,
+        )[0];
         assert_eq!(
             non_apparie.pr_state,
-            PrStateKnowledge::NotRead,
-            "et le verdict doit dire qu'il n'a rien lu, pas qu'il a lu du vide"
+            lu(Some("OPEN")),
+            "la lecture par numéro ne passe pas par le milestone"
+        );
+        assert_eq!(
+            non_apparie.in_target_milestone,
+            MilestoneMembership::OutOfTarget,
+            "l'appariement garde son axe propre : l'appartenance au milestone"
         );
     }
 
-    /// AC5, le contrôle positif à côté du négatif : le **même** vol apparié dit
-    /// `Read`, non apparié dit `NotRead`, et les deux populations ne se
-    /// confondent pas (classe mika#2205).
+    /// AC5, le contrôle positif à côté du négatif : le **même** vol dit `Read`
+    /// quand la PR a été lue, `NotRead` quand aucune lecture n'a été tentée, et
+    /// les deux populations ne se confondent pas (classe mika#2205).
+    ///
+    /// mika#2921 opposait `Read(None)` à `NotRead` ; depuis le vol 2a de
+    /// mika#2968, `Read(None)` n'est plus produit par `evaluate_flights` —
+    /// trouver le numéro, c'est lire l'état. L'opposition est donc portée par la
+    /// porte neuve, et ce qu'elle épingle est le même : deux populations, deux
+    /// variantes, jamais un `Option` qui les fusionne.
     #[test]
-    fn mika2921_lu_vide_et_non_lu_sont_deux_populations() {
+    fn mika2968_lu_et_non_lu_sont_deux_populations() {
         let flights = [fixture_pr_opened()];
-        let lu_vide = &evaluate_flights(&flights, &[sub_issue(2693, None)], AU_CYCLE_DE)[0];
-        let jamais_lu = &evaluate_flights(&flights, &[], AU_CYCLE_DE)[0];
+        let lue = &evaluate_flights(
+            &flights,
+            &[],
+            &lectures(&[(2696, "OPEN", Some(CiState::Success))]),
+            AU_CYCLE_DE,
+        )[0];
+        let jamais_lue = &evaluate_flights(&flights, &[], &SANS_LECTEUR, AU_CYCLE_DE)[0];
 
-        assert_eq!(lu_vide.pr_state, PrStateKnowledge::Read(None));
-        assert_eq!(jamais_lu.pr_state, PrStateKnowledge::NotRead);
+        assert_eq!(lue.pr_state, lu(Some("OPEN")));
+        assert_eq!(jamais_lue.pr_state, PrStateKnowledge::NotRead);
         assert_ne!(
-            lu_vide.pr_state, jamais_lu.pr_state,
-            "« lu, et vide » n'est pas « pas lu » — un Option les aurait fusionnés"
+            lue.pr_state, jamais_lue.pr_state,
+            "« lu » n'est pas « pas lu » — un Option les aurait fusionnés"
+        );
+        assert_ne!(
+            lue.ci, jamais_lue.ci,
+            "et la CI suit la même porte : non tentée se dit, elle ne se devine pas"
         );
         assert_eq!(
-            lu_vide.recommendation, jamais_lu.recommendation,
-            "la recommandation est bien la même : c'est le rendu qui porte la différence"
+            jamais_lue.ci,
+            CiKnowledge::Unread(CiUnreadCause::NoRunner),
+            "sans lecteur câblé, la cause est « rien n'a été tenté »"
         );
     }
 
@@ -1557,17 +1794,68 @@ mod tests {
     /// interrogée (mika#2921).
     #[test]
     fn mika2921_le_verdict_porte_le_depot_du_vol() {
-        let v = &evaluate_flights(&[fixture_pr_opened()], &[], AU_CYCLE_DE)[0];
+        let v = &evaluate_flights(
+            &[fixture_pr_opened()],
+            &[],
+            &lectures(&[(2696, "OPEN", Some(CiState::Success))]),
+            AU_CYCLE_DE,
+        )[0];
         assert_eq!(v.repo.as_deref(), Some("senara-solutions/mika"));
 
         let mut sans_depot = fixture_pr_opened();
         sans_depot.repo = None;
         sans_depot.reference_url = None;
-        let v = &evaluate_flights(&[sans_depot], &[], AU_CYCLE_DE)[0];
+        let v = &evaluate_flights(
+            &[sans_depot],
+            &[],
+            &lectures(&[(2696, "OPEN", Some(CiState::Success))]),
+            AU_CYCLE_DE,
+        )[0];
         assert_eq!(
             v.repo, None,
             "un vol qui ne nomme aucun dépôt ne s'en voit pas attribuer un"
         );
+        assert_eq!(
+            v.ci,
+            CiKnowledge::Unread(CiUnreadCause::NoRepo),
+            "et sans dépôt, aucune page de lecture ne lui correspond : la cause le nomme"
+        );
+    }
+
+    /// Contrôle négatif de la porte : un vol dont le dépôt n'a pas été lu ne
+    /// peut **jamais** sortir avec `CiKnowledge::Read`, quelle que soit la
+    /// lecture posée sur un *autre* dépôt (mika#2968, AC2).
+    ///
+    /// C'est la garde qui sépare « la CI est verte » de « je n'ai pas regardé » :
+    /// sans elle, une page lue sur un dépôt voisin pourrait verdir un vol dont
+    /// la PR n'a jamais été interrogée.
+    #[test]
+    fn mika2968_un_depot_non_lu_ne_rend_jamais_une_ci_lue() {
+        let mut autre_depot = fixture_pr_opened();
+        autre_depot.repo = Some("senara-solutions/mika-cloud".to_string());
+
+        let candidats: [(&str, FlightPrReads); 3] = [
+            ("aucun lecteur", SANS_LECTEUR),
+            (
+                "lecture sur un autre dépôt",
+                lectures(&[(2696, "OPEN", Some(CiState::Success))]),
+            ),
+            ("lecture en échec", lecture_en_echec()),
+        ];
+
+        for (cas, reads) in &candidats {
+            let v = &evaluate_flights(&[autre_depot.clone()], &[], reads, AU_CYCLE_DE)[0];
+            assert!(
+                matches!(v.ci, CiKnowledge::Unread(_)),
+                "{cas} : la CI d'un dépôt non lu ne peut pas être « lue » (ci={:?})",
+                v.ci
+            );
+            assert_eq!(
+                v.pr_state,
+                PrStateKnowledge::NotRead,
+                "{cas} : et l'état de PR non plus"
+            );
+        }
     }
 
     // ---- Les URLs --------------------------------------------------------
@@ -1635,8 +1923,11 @@ mod tests {
         ])
     }
 
-    /// AC2 — les douze cellules dans **un** appel, parce qu'une matrice éclatée
-    /// en douze tests ne dit pas qu'elle est exhaustive.
+    /// AC2 — les trente cellules dans **un** appel, parce qu'une matrice éclatée
+    /// en trente tests ne dit pas qu'elle est exhaustive. Douze viennent du
+    /// vol 1 (quatre CI lues × deux états, puis les quatre non-lectures d'alors
+    /// sur PR ouverte) ; les dix-huit autres sont les six causes du vol 2a
+    /// croisées avec les trois états que la lecture par numéro peut rendre.
     ///
     /// Le cas « rouge et ouverte » — celui du vol 4f1fe163 — ne part pas d'un
     /// `CiState::Failed` écrit à la main : il traverse
@@ -1664,7 +1955,7 @@ mod tests {
             at: AU_CYCLE_DE.to_string(),
         };
 
-        let matrice: Vec<(&str, PrStateKnowledge, CiKnowledge, FlightRecommendation)> = vec![
+        let cellules: Vec<(&str, PrStateKnowledge, CiKnowledge, FlightRecommendation)> = vec![
             // --- PR encore ouverte : la CI décide ---
             (
                 "verte + ouverte",
@@ -1722,10 +2013,14 @@ mod tests {
                 lue(CiState::None),
                 FlightRecommendation::ManualResumption,
             ),
-            // --- Les quatre non-lectures, PR ouverte. Aucune ne bascule la
-            //     recommandation : une CI non lue n'est pas une CI rouge. Elle
-            //     n'est pas non plus une CI verte — c'est le rapport qui porte
-            //     la différence (AC3), jamais la recommandation seule.
+            // --- Les quatre non-lectures du vol 1, PR ouverte. Aucune n'est
+            //     plus écrite par une composition depuis le vol 2a, mais
+            //     `VerdictRecord::ci` désérialise encore les verdicts déjà
+            //     écrits : la décision qu'elles portent reste épinglée. Aucune
+            //     ne bascule la recommandation : une CI non lue n'est pas une
+            //     CI rouge. Elle n'est pas non plus une CI verte — c'est le
+            //     rapport qui porte la différence (AC3), jamais la
+            //     recommandation seule.
             (
                 "non lue (PR hors liste du milestone) + ouverte",
                 lu(Some("open")),
@@ -1752,10 +2047,61 @@ mod tests {
             ),
         ];
 
+        let mut matrice: Vec<(String, PrStateKnowledge, CiKnowledge, FlightRecommendation)> =
+            cellules
+                .into_iter()
+                .map(|(nom, pr_state, ci, attendu)| (nom.to_string(), pr_state, ci, attendu))
+                .collect();
+
+        // --- Vol 2a : les six causes que `compose_pr_knowledge` peut produire,
+        //     croisées avec les trois états de PR que la lecture peut rendre.
+        //     `recommend` est une fonction pure de son triplet, donc la matrice
+        //     couvre son domaine entier — y compris les cellules que la
+        //     production n'atteint pas (`NoPrNumber` ne cohabite jamais avec un
+        //     état lu). S'arrêter aux combinaisons atteignables n'attesterait
+        //     pas que le bras d'état reste **avant** le bras CI : c'est
+        //     justement sur une non-lecture de CI que l'ordre se mesure.
+        let causes_du_vol_2a = [
+            ("vol sans numéro de PR", CiUnreadCause::NoPrNumber),
+            ("vol sans dépôt", CiUnreadCause::NoRepo),
+            ("lecture non tentée", CiUnreadCause::NoRunner),
+            ("lecture en échec", CiUnreadCause::ReadFailed),
+            ("numéro absent de la page", CiUnreadCause::NotFound),
+            ("PR non ouverte", CiUnreadCause::PrNotOpen),
+        ];
+        let etats_de_pr = [
+            (
+                "ouverte",
+                lu(Some("open")),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "fusionnée",
+                lu(Some("merged")),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "état non lu",
+                PrStateKnowledge::NotRead,
+                FlightRecommendation::MergeCandidate,
+            ),
+        ];
+        for (nom_cause, cause) in &causes_du_vol_2a {
+            for (nom_etat, pr_state, attendu) in &etats_de_pr {
+                matrice.push((
+                    format!("non lue ({nom_cause}) + {nom_etat}"),
+                    pr_state.clone(),
+                    CiKnowledge::Unread(*cause),
+                    *attendu,
+                ));
+            }
+        }
+
         assert_eq!(
             matrice.len(),
-            12,
-            "la matrice de l'AC2 compte douze cellules"
+            30,
+            "la matrice de l'AC2 compte trente cellules : les douze du vol 1, \
+             plus les six causes du vol 2a croisées avec les trois états de PR"
         );
 
         for (nom, pr_state, ci, attendu) in &matrice {

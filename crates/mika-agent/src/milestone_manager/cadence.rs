@@ -22,7 +22,7 @@
 
 use super::{
     assessor::{Assessor, AssessorConfig},
-    evaluator::{FinishedFlight, FlightSource, FlightVerdict, evaluate_flights},
+    evaluator::{FinishedFlight, FlightPrReads, FlightSource, FlightVerdict, evaluate_flights},
     pool_writer::{admit_pool_tickets, pool_write_is_armed},
     reader::{GhRunner, ProcessGhRunner, Reader},
     reporter::Reporter,
@@ -695,7 +695,12 @@ async fn collect_flight_verdicts(
     // la requête est partie ». Aucune horloge n'est ajoutée ici — `evaluate_*`
     // n'en porte pas, et injecter un instant à la source coûterait les 11 sites
     // d'appel de `read_with_runner` pour quelques secondes de précision.
-    let verdicts = evaluate_flights(&flights, &state.sub_issues, &ctx.now.to_rfc3339());
+    let verdicts = evaluate_flights(
+        &flights,
+        &state.sub_issues,
+        &FlightPrReads::Unwired,
+        &ctx.now.to_rfc3339(),
+    );
     // La taille du périmètre se demande à son lecteur unique : ce fichier ne
     // nomme aucun dépôt (garde `no_repo_list_test.rs`) et n'a donc aucune liste
     // à compter.

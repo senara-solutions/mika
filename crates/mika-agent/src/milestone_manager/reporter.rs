@@ -894,14 +894,26 @@ fn flight_ci_label(ci: &CiKnowledge) -> String {
     }
 }
 
-/// Pourquoi la CI n'a pas été lue — nommé, parce que les quatre causes
-/// n'appellent pas la même action de l'opérateur.
+/// Pourquoi la CI n'a pas été lue — nommé, parce que les dix causes n'appellent
+/// pas la même action de l'opérateur : « lecture gh en échec » demande de
+/// regarder le jeton du dépôt, « PR hors de la page lue » de regarder la borne,
+/// « ce vol n'a pas de PR » rien du tout.
+///
+/// Les quatre premières ne sont plus écrites par aucune composition depuis
+/// mika#2968 (vol 2a) ; elles restent rendues parce que les verdicts du vol 1
+/// les portent encore. Voir [`CiUnreadCause`], qui date chacune.
 fn ci_unread_label(cause: CiUnreadCause) -> &'static str {
     match cause {
         CiUnreadCause::NotFromPrList => "PR hors liste du milestone",
         CiUnreadCause::NoSubIssue => "aucune sous-issue appariée",
         CiUnreadCause::NoIssueNumber => "vol sans ticket",
         CiUnreadCause::NotMeasured => "non mesurée",
+        CiUnreadCause::NoPrNumber => "ce vol n'a pas de PR",
+        CiUnreadCause::NoRepo => "vol sans dépôt",
+        CiUnreadCause::NoRunner => "aucun lecteur gh câblé",
+        CiUnreadCause::ReadFailed => "lecture gh en échec",
+        CiUnreadCause::NotFound => "PR hors de la page lue",
+        CiUnreadCause::PrNotOpen => "PR non ouverte",
     }
 }
 

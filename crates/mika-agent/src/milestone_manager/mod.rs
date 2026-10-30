@@ -309,8 +309,9 @@ pub use cadence::{
     run_manager_cycle_with, run_manager_cycle_with_auth, state_digest,
 };
 pub use evaluator::{
-    DeathCause, FinishedFlight, FlightIssue, FlightRecommendation, FlightSource, FlightVerdict,
-    MilestoneMembership, PrStateKnowledge, evaluate_flight, evaluate_flights, milestone_issue_urls,
+    DeathCause, FinishedFlight, FlightIssue, FlightPrReads, FlightRecommendation, FlightSource,
+    FlightVerdict, MilestoneMembership, PrStateKnowledge, evaluate_flight, evaluate_flights,
+    milestone_issue_urls,
 };
 pub use groom_trigger::{
     A2aGroomSender, ENV_GROOM_WRITE, GROOMS_PER_CYCLE, GroomCandidate, GroomSendError, GroomSender,

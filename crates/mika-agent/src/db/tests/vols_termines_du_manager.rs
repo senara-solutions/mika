@@ -822,12 +822,18 @@ fn base_semee(corpus: &[(&str, u32, &str, &str)]) -> Database {
     db
 }
 
-/// L'instant du cycle qui date la lecture CI (mika#2968). Les sous-tickets d'ici
-/// portent `pr_link_source: None`, donc **aucune** CI n'y est lue — la
-/// connaissance reste `Unread(NotFromPrList)` et cette valeur n'entre dans
-/// aucune assertion de ce fichier. Elle existe pour que l'appel reste celui de
-/// la production.
+/// L'instant du cycle qui date la lecture CI (mika#2968). Aucun test d'ici ne
+/// fait lire de `statusCheckRollup`, donc la connaissance CI y reste
+/// `Unread(…)` et cette valeur n'entre dans aucune assertion de ce fichier.
+/// Elle existe pour que l'appel reste celui de la production.
 const AU_CYCLE_DE: &str = "2026-10-29T17:46:12Z";
+
+/// Aucun lecteur de PR (mika#2968, vol 2a). Ce fichier mesure le **chemin de la
+/// base aux verdicts** — quels vols sont rendus, sous quel dépôt, avec quelle
+/// issue — et non la lecture `gh`. `Unwired` le dit au type plutôt que de
+/// laisser une table vide passer pour une lecture sans résultat.
+const SANS_LECTEUR: crate::milestone_manager::evaluator::FlightPrReads =
+    crate::milestone_manager::evaluator::FlightPrReads::Unwired;
 
 /// Un sous-ticket du milestone cible, tel que le `Reader` l'hydrate : seuls
 /// `number` et `pr_state` comptent pour l'évaluateur.
@@ -955,7 +961,7 @@ async fn mika2921_le_corpus_des_13_vols_rend_12_verdicts_et_aucun_pour_claude_pi
         .collect();
 
     let vols = source.finished_implement_flights(None).await;
-    let verdicts = evaluate_flights(&vols, &sub_issues, AU_CYCLE_DE);
+    let verdicts = evaluate_flights(&vols, &sub_issues, &SANS_LECTEUR, AU_CYCLE_DE);
 
     // AC1 — un verdict par vol d'un dépôt sous contrôle, et pas un de plus.
     assert_eq!(
@@ -991,13 +997,15 @@ async fn mika2921_le_corpus_des_13_vols_rend_12_verdicts_et_aucun_pour_claude_pi
         "chaque vol de mika et de mika-cloud est jugé, répétitions comprises"
     );
 
-    // Aucun n'est dans le milestone cible : tous disent qu'ils n'ont rien lu.
+    // Aucun lecteur de PR n'est câblé : tous disent qu'ils n'ont rien lu.
+    // Depuis mika#2968 (vol 2a) la cause n'est plus l'appartenance au milestone
+    // — aucun vol du corpus n'est un sous-ticket de {MILESTONE_CIBLE}, mais
+    // cela ne décide plus de `pr_state` — c'est l'absence de lecture.
     assert!(
         verdicts
             .iter()
             .all(|v| v.pr_state == PrStateKnowledge::NotRead),
-        "aucun vol du corpus n'est un sous-ticket du milestone {MILESTONE_CIBLE} — \
-         un état « lu » serait inventé"
+        "rien n'a été lu des PR de ce corpus — un état « lu » serait inventé"
     );
 
     // La forme qu'AC6 attend : des verdicts classés.
@@ -1078,19 +1086,37 @@ async fn mika2921_le_corpus_des_13_vols_rend_12_verdicts_et_aucun_pour_claude_pi
     );
 }
 
-/// **AC5 de mika#2921 — l'état de PR hors milestone, par le chemin réel.**
+/// **AC5 de mika#2921, repris par mika#2968 (vol 2a) — l'état de PR vient de la
+/// lecture par numéro, plus du milestone.**
 ///
-/// Un vol sur mika **hors** du milestone cible rend
-/// [`PrStateKnowledge::NotRead`], et sa ligne de rapport dit
-/// `état de PR non lu`. Le contrôle positif est dans le même test : un vol
-/// **dans** le milestone cible, apparié à un sous-ticket dont le `Reader` a lu
-/// `pr_state = "open"`, rend `Read(Some("open"))` et une ligne qui ne dit pas
-/// « non lu ». Les deux arms côte à côte séparent « le type est correct » de
-/// « le rendu est branché » ; les tests du `Reporter` tiennent le rendu sur des
-/// verdicts littéraux, celui-ci le tient sur des verdicts sortis de la base.
+/// Ce que mika#2921 tenait ici : un vol **hors** du milestone cible rend
+/// [`PrStateKnowledge::NotRead`] et sa ligne dit `état de PR non lu`, pendant
+/// qu'un vol **dans** la cible, apparié à un sous-ticket hydraté, rend
+/// `Read(…)`. La cause était l'appariement.
+///
+/// Ce que le vol 2a y substitue, délibérément : `pr_state` et la CI sortent
+/// tous deux de la lecture **par numéro de PR**, qui ne passe plus par le
+/// milestone — mesuré le 2026-10-29, aucune des cinq PR de la boucle ne le
+/// portait. Donc l'appartenance ne décide plus de ce qui est lu, et les deux
+/// axes se mesurent séparément dans ce test :
+///
+/// - **la lecture décide de `pr_state`** : lecteur câblé ⇒ les deux vols rendent
+///   `Read`, celui hors cible compris — c'est le gain du vol ;
+/// - **l'appartenance décide de son propre libellé** : les lignes disent
+///   « milestone cible » et « hors milestone cible » comme avant, sur les mêmes
+///   verdicts ;
+/// - **sans lecteur, « non lu » est rendu** : contrôle négatif sur le même
+///   corpus, qui tient le rendu `état de PR non lu` sur sa cause réelle.
+///
+/// Les trois sur des verdicts sortis de la base, là où les tests du `Reporter`
+/// tiennent le rendu sur des verdicts littéraux.
 #[tokio::test]
-async fn mika2921_hors_cible_letat_de_pr_est_non_lu_et_dans_la_cible_il_est_lu() {
-    use crate::milestone_manager::evaluator::{FlightSource, PrStateKnowledge, evaluate_flights};
+async fn mika2968_letat_de_pr_vient_de_la_lecture_par_numero_et_non_du_milestone() {
+    use crate::milestone_manager::evaluator::{
+        FlightPrReads, FlightSource, PrStateKnowledge, evaluate_flights,
+    };
+    use crate::milestone_manager::reader::{FlightPrRead, RepoPrRead};
+    use std::collections::HashMap;
 
     const PR_OUVERTE: &str = "claude-pilot completed (status: success).\nTurns: 90\nPR: https://github.com/senara-solutions/mika/pull/2925\n\nOutcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/2925\n";
     let corpus = [
@@ -1102,8 +1128,22 @@ async fn mika2921_hors_cible_letat_de_pr_est_non_lu_et_dans_la_cible_il_est_lu()
     );
     let sub_issues = vec![sous_ticket(2921, Some("open"))];
 
+    // La PR #2925 est lue ouverte, sans CI (le second appel `gh` n'a pas
+    // abouti) : ce test porte sur l'état de PR, pas sur la CI.
+    let mut prs = HashMap::new();
+    prs.insert(
+        2925,
+        FlightPrRead {
+            state: "OPEN".to_string(),
+            ci: None,
+        },
+    );
+    let mut par_depot = HashMap::new();
+    par_depot.insert(REPO.to_string(), RepoPrRead::Read(prs));
+    let lectures = FlightPrReads::Read(par_depot);
+
     let vols = source.finished_implement_flights(None).await;
-    let verdicts = evaluate_flights(&vols, &sub_issues, AU_CYCLE_DE);
+    let verdicts = evaluate_flights(&vols, &sub_issues, &lectures, AU_CYCLE_DE);
     assert_eq!(verdicts.len(), 2);
     let verdict_de = |n: u64| {
         verdicts
@@ -1112,36 +1152,48 @@ async fn mika2921_hors_cible_letat_de_pr_est_non_lu_et_dans_la_cible_il_est_lu()
             .unwrap_or_else(|| panic!("le vol de mika#{n} doit être jugé"))
     };
 
-    // Hors cible : rien n'a été lu, et le verdict le porte.
+    // Hors cible, et pourtant lu : c'est exactement ce que le vol 2a ouvre.
     let hors = verdict_de(2900);
-    assert_eq!(hors.pr_state, PrStateKnowledge::NotRead);
+    assert_eq!(
+        hors.pr_state,
+        PrStateKnowledge::Read(Some("OPEN".into())),
+        "la PR d'un vol hors milestone cible est lue par son numéro"
+    );
     let ligne_hors = crate::milestone_manager::reporter::render_flight_verdict(hors);
     assert!(
-        ligne_hors.contains(" — hors milestone cible — ")
-            && ligne_hors.contains(" — état de PR non lu — "),
-        "obtenu : {ligne_hors}"
+        ligne_hors.contains(" — hors milestone cible — ") && ligne_hors.contains(" — PR OPEN — "),
+        "l'appartenance se dit toujours, et l'état est celui qui a été lu : {ligne_hors}"
+    );
+    assert!(
+        !ligne_hors.contains("état de PR non lu"),
+        "un état lu ne se rend jamais comme non lu : {ligne_hors}"
     );
 
-    // Contrôle positif : dans la cible, l'état lu est rendu, et jamais « non lu ».
+    // Dans la cible : même lecture, autre libellé d'appartenance.
     let dans = verdict_de(2921);
-    assert_eq!(dans.pr_state, PrStateKnowledge::Read(Some("open".into())));
+    assert_eq!(dans.pr_state, PrStateKnowledge::Read(Some("OPEN".into())));
     let ligne_dans = crate::milestone_manager::reporter::render_flight_verdict(dans);
     assert!(
         ligne_dans.starts_with("- mika#2921 — milestone cible — ")
-            && ligne_dans.contains(" — PR open — "),
+            && ligne_dans.contains(" — PR OPEN — "),
         "obtenu : {ligne_dans}"
-    );
-    // L'aiguille nomme son segment depuis mika#2968 : « CI non lue » contient
-    // « non lu », et la CI de ces vols est bien non lue (la sous-issue ne porte
-    // aucune provenance de PR). Un `contains("non lu")` nu rougirait donc sur
-    // l'autre axe, sans rien dire de l'état de PR que ce test atteste.
-    assert!(
-        !ligne_dans.contains("état de PR non lu"),
-        "un état lu ne se rend jamais comme non lu : {ligne_dans}"
     );
 
     // Et le rapport complet porte les deux, dans la même section.
-    let lignes = lignes_des_vols(&rapport(sub_issues, verdicts.clone()));
+    let lignes = lignes_des_vols(&rapport(sub_issues.clone(), verdicts.clone()));
     assert_eq!(lignes.len(), 2, "{lignes:#?}");
     assert!(lignes.contains(&ligne_hors) && lignes.contains(&ligne_dans));
+
+    // Contrôle négatif — sans lecteur, le même corpus rend « non lu », sur les
+    // deux vols. C'est la cause réelle du libellé depuis le vol 2a : l'absence
+    // de lecture, jamais l'appartenance.
+    let sans = evaluate_flights(&vols, &sub_issues, &SANS_LECTEUR, AU_CYCLE_DE);
+    for v in &sans {
+        assert_eq!(v.pr_state, PrStateKnowledge::NotRead);
+        let ligne = crate::milestone_manager::reporter::render_flight_verdict(v);
+        assert!(
+            ligne.contains(" — état de PR non lu — "),
+            "sans lecteur, l'état de PR se dit non lu : {ligne}"
+        );
+    }
 }
