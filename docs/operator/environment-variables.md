@@ -9390,35 +9390,111 @@ l'instrument de cette mesure.
 
 #### Sondes de comptage
 
+**La porte couvre trois sites, et chacun a sa fenêtre.** mika#2878 y a rattaché
+`false_local_hosting_claim` (site 5d) et mika#2879 la moitié « état accompli » de
+`unactioned_frequency_promise` (site 5e). La porte est **unique** : l'armer arme les
+trois, donc un site trop bruyant interdit d'armer les autres, et le compte se donne
+**par site**.
+
+Les six sondes ci-dessous sont **bornées à leur fenêtre** (mika#2871). Ce n'est pas de
+l'hygiène : `$MIKA_SPIRIT_LOG_FILE` porte le trafic de binaires antérieurs aux sites,
+et un compte non borné mélange donc des jours où le détecteur n'existait pas avec des
+jours où il tirait — il sous-estime le taux, dans la direction qui fait paraître
+l'armement sûr. Les bornes sont les redémarrages du moteur, pas des dates rondes :
+**2026-10-23T13:01:03Z** pour les sites 6d et 5d (binaire 94b21916, qui contient #2870
+et #2878), **2026-10-23T16:00:35Z** pour le site 5e (binaire bc92d236, premier à porter
+`assertion_nature` à la racine). La fenêtre de 7 jours finit donc le 2026-10-30 à
+13:01Z pour les deux premiers et à 16:00:35Z pour le troisième — trois heures plus tard,
+et ce décalage est réel, pas un arrondi.
+
 ```sh
+# --- site 6d : assert_grounded (#1331, classe depuis mika#2867) ---
 # 1. La récidive, par jour (la population que l'armement enverrait en P0)
 grep guard.assert_grounded_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
-  | jq -r 'select(.event == "guard.assert_grounded_uncorrected") | .timestamp' \
+  | jq -r 'select(.event == "guard.assert_grounded_uncorrected"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
   | cut -c1-10 | uniq -c
 
 # 2. CONTRÔLE POSITIF — la première prise, par jour (instrumentée depuis #953)
 grep guard.assert_grounded "$MIKA_SPIRIT_LOG_FILE" \
-  | jq -r 'select(.event == "guard.assert_grounded") | .timestamp' \
+  | jq -r 'select(.event == "guard.assert_grounded"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# --- site 5d : false_local_hosting_claim (mika#2878, suivi de #2872) ---
+# 3. La récidive, par jour
+grep guard.false_local_hosting_claim_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.false_local_hosting_claim_uncorrected"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# 4. CONTRÔLE POSITIF — la première prise, par jour
+grep guard.false_local_hosting_claim "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.false_local_hosting_claim"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# --- site 5e : unactioned_frequency_promise, moitié « état accompli »
+#     (mika#2879, vol 3) — fenêtre décalée de trois heures ---
+# 5. La récidive, par jour
+grep guard.unactioned_frequency_promise_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.unactioned_frequency_promise_uncorrected"
+                  and .assertion_nature == "accomplished_state"
+                  and .timestamp >= "2026-10-23T16:00:35Z"
+                  and .timestamp <  "2026-10-30T16:00:35Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# 6. CONTRÔLE POSITIF — la première prise, par jour
+grep guard.unactioned_frequency_promise "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.unactioned_frequency_promise"
+                  and .assertion_nature == "accomplished_state"
+                  and .timestamp >= "2026-10-23T16:00:35Z"
+                  and .timestamp <  "2026-10-30T16:00:35Z") | .timestamp' \
   | cut -c1-10 | uniq -c
 ```
 
-Le `select` sur `.event` est porteur : le `grep` de la sonde 2 est une sous-chaîne et
-rend aussi les lignes de la sonde 1. La colonne 1 est un sous-ensemble de la colonne 2.
-Une sonde 2 vide sur plusieurs jours de trafic veut dire que le garde ne tire pas,
-**ou** que le binaire servi est antérieur à #953 : dans ce cas, la sonde 1 vide ne
-prouve rien. Une sonde 1 sans aucune ligne alors que la sonde 2 en a beaucoup, sur un
-binaire postérieur à mika#2867, est le résultat attendu, pas une panne.
+Le `select` sur `.event` est porteur : chaque `grep` de contrôle positif est une
+sous-chaîne du `grep` de récidive et rend aussi ses lignes. Pour chaque site, la
+colonne de la récidive est un sous-ensemble de celle du contrôle positif.
+
+Le terme `.assertion_nature == "accomplished_state"` du site 5e est **porteur de la
+même manière** : la moitié « engagement sur l'avenir » du même détecteur reste **hors**
+de la classe `fabrication-detected`, donc une sonde sans ce terme compte une population
+que l'armement n'enverrait pas en P0 — elle surestime, dans la direction qui fait
+paraître l'armement dangereux. Les deux erreurs de borne vont en sens contraire ; c'est
+pourquoi aucune des six ne se lit sans les siennes.
+
+**Lecture des absences.** Un contrôle positif vide sur plusieurs jours de trafic veut
+dire que le garde ne tire pas, **ou** que le binaire servi est antérieur au site : dans
+ce cas la récidive vide ne prouve rien. Une récidive sans aucune ligne alors que son
+contrôle positif en a beaucoup, sur un binaire qui contient le site, est le résultat
+attendu, pas une panne.
 
 #### Condition d'armement
 
-Armer (`MIKA_FABRICATION_P0_NOTIFY=true`, puis redémarrer) **seulement** sur un
-déploiement où `MIKA_OPERATOR_ESCALATION_CHAT_ID` est posé (sinon, voir ci-dessus :
-la P0 part chez l'utilisateur), après au moins 7 jours de relevé des deux sondes, et
-seulement si la colonne 1 tient sous un seuil que ce relevé rend défendable pour une
-surface jamais muette. Ce relevé et la décision
-sont portés par le ticket de suivi d'armement nommé dans le corps de la PR de mika#2867.
-Les six autres sites `_uncorrected` de la famille ne sont **pas** rattachés à cette
-classe : c'est un second suivi, une décision par site.
+Armer, c'est `MIKA_FABRICATION_P0_NOTIFY=true` puis redémarrer — un changement de
+configuration, pas un déploiement.
+
+**Le code refuse désormais de s'armer sans route (mika#2871 AC3).** Avec la porte armée
+et aucun chat d'escalade utilisable, `mika-spirit` **refuse de démarrer** en nommant
+l'agent fautif, la valeur lue et les deux sorties
+(`server::fabrication_p0_guard::assert_fabrication_p0_arming_valid`). Un
+`MIKA_OPERATOR_ESCALATION_CHAT_ID=0` compte comme une absence : c'est le sentinelle
+« aucun canal de réponse » (mika#650/#1090), qui perd la notification tout aussi
+silencieusement. La doc exigeait le couple ; le code l'exige maintenant aussi. Ce refus
+ne touche pas le CLI : `mika config get fabrication_p0_notify` reste lisible sur une
+installation mal configurée — c'est la commande qui diagnostique le refus.
+
+Armer après au moins 7 jours de relevé des six sondes, et seulement si les trois
+colonnes de récidive tiennent sous un seuil que ce relevé rend défendable pour une
+surface jamais muette. **Si les comptes divergent, écrire lequel bloque et ouvrir le vol
+qui sépare les portes, plutôt que d'armer en bloc.** Ce relevé et la décision sont
+portés par mika#2871. Les sites `_uncorrected` de la famille autres que ces trois ne
+sont **pas** rattachés à cette classe : c'est un second suivi, une décision par site.
 
 ### Lire un hang LLM « 420 s sans octet » (mika#2331)
 

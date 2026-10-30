@@ -1169,6 +1169,11 @@ pub struct Settings {
     /// that `GatewayMessageSender::send` short-circuits on (mika#650/#1090), so
     /// honouring it here would swallow every P0 in silence.
     ///
+    /// Since mika#2871 that same predicate is read at **boot**: with
+    /// [`Self::fabrication_p0_notify`] armed, a `None` or a `Some(0)` here
+    /// refuses startup rather than letting the fallback carry an operator P0 to
+    /// the end user's chat.
+    ///
     /// `Option<i64>` and not `Option<u64>`: a Telegram group chat id is
     /// negative. Only two of the sixteen `GatewayMessageSender::new` callsites
     /// arm it — see `with_escalation_chat_id`.
@@ -1275,6 +1280,16 @@ pub struct Settings {
     ///
     /// Deliberately absent from `SETTABLE_CONFIG_KEYS` (like
     /// `operational_partner`): it is an operator decision, not an agent one.
+    ///
+    /// **Arming requires a usable escalation chat, and that is now a machine
+    /// precondition (mika#2871 AC3).** With this `true` and
+    /// [`Self::operator_escalation_chat_id`] absent — or `Some(0)`, the
+    /// "no reply channel" sentinel — `mika-spirit` **refuses to start**, naming
+    /// the agent and the two exits
+    /// (`mika_agent::server::fabrication_p0_guard`). Without that refusal,
+    /// mika#1381's D4 fallback sends « the machine fabricated a claim » to the
+    /// normal chat, which on a tenant is the end user's own. Only the
+    /// documentation required the pair; the code requires it too now.
     #[serde(default)]
     pub fabrication_p0_notify: bool,
 
