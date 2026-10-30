@@ -1719,6 +1719,22 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // `webhook_queue_shutdown`; cancelled at shutdown below. The spawn is
     // env-gated on `MIKA_MANAGER_TARGET_MILESTONE` — unset → no spawn.
     let manager_shutdown_token = CancellationToken::new();
+
+    // mika#2958 vol 2b — le rail du geste de groom se résout **ici**, parce que
+    // c'est ici que le jeton interne est en portée : `/a2a/{agent}` n'accepte
+    // que `MIKA_INTERNAL_TOKEN` (`auth::require_internal_token`), donc le rail
+    // n'a pas de variable de jeton à lui et ne doit pas en avoir une seconde.
+    // Hors du `match` ci-dessous, parce que la résolution n'a rien à voir avec
+    // `manager_config_from_env` : elle appartient au jeton, pas à la cible.
+    // `None` est l'état nominal — `MIKA_MANAGER_GROOM_URL` absente ⇒ rail
+    // désarmé, le cycle dit `no_sender`, et mika-spirit démarre comme il démarre
+    // sans `liveness_sink`. La sonde `manager_groom_rail_resolved` dit laquelle
+    // des trois issues a eu lieu.
+    let groom_sender = crate::milestone_manager::resolve_groom_rail(Some(
+        internal_token.expose_secret(),
+    ))
+    .map(|s| std::sync::Arc::new(s) as std::sync::Arc<dyn crate::milestone_manager::GroomSender>);
+
     // mika#1968 AC5: `manager_config_from_env` now takes `&Settings` + optional
     // `GitHubApp` and routes token acquisition through `Settings::resolve_github_token`
     // (PAT first, App fallback). `global_github_app` is constructed above at this
@@ -1808,6 +1824,11 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     ))
                         as std::sync::Arc<dyn crate::flight_verdict_ledger::FlightVerdictLedger>
                 }),
+                // mika#2958 vol 2b — par quoi part le geste de groom. Résolu
+                // au-dessus, hors du `match`, parce que la résolution n'a rien à
+                // voir avec `manager_config_from_env` : elle appartient au jeton,
+                // pas à la cible du manager.
+                groom_sender,
             ),
             Ok(None) => {
                 info!(
