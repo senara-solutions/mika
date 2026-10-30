@@ -268,7 +268,17 @@ mod tests {
     /// Aucun lecteur de PR : ce qui est mesuré ici est l'**appariement des
     /// vols** (quelle tâche porte le ticket, quelle ligne `Outcome:` atteint
     /// l'évaluateur), pas la lecture `gh`. `Unwired` le dit sans l'inventer —
-    /// les verdicts rendus portent une CI non lue, cause `no_runner`.
+    /// les verdicts rendus portent une CI **et** une revue non lues, cause
+    /// `no_runner`.
+    ///
+    /// **Conséquence depuis mika#2968 AC6 : la recommandation d'un `PrOpened`
+    /// est ici `ManualResumption`, pas `MergeCandidate`.** Non parce que le
+    /// vol serait suspect, mais parce que AC6 est écrit en positif — *ne rendre
+    /// merge-candidat que si la tête porte une approbation du relecteur sur ce
+    /// commit* — donc une revue non lue n'est pas une preuve d'autorisation.
+    /// C'est l'inverse de AC1, négatif, où une CI non lue ne retirait rien.
+    /// Les tests de ce module épinglent l'**issue** du vol ; leur
+    /// recommandation n'est qu'un corollaire de l'absence de lecteur.
     const SANS_LECTEUR: crate::milestone_manager::evaluator::FlightPrReads =
         crate::milestone_manager::evaluator::FlightPrReads::Unwired;
 
@@ -527,9 +537,11 @@ mod tests {
     /// que la source ne rendait que le `result` de la parente — vide. L'issue du
     /// pilote vit sur l'enfant.
     ///
-    /// Le test est hermétique : `sub_issues` est vide, donc `pr_state` est
-    /// `None`, et `recommend` rend `MergeCandidate` sur `PrOpened` + `None`
-    /// (*« va regarder »*). Aucun accès à GitHub.
+    /// Le test est hermétique : `sub_issues` est vide et il n'y a pas de
+    /// lecteur, donc ni la CI ni la revue de la tête ne sont lues. Aucun accès
+    /// à GitHub. La recommandation rendue est `ManualResumption` — voir
+    /// [`SANS_LECTEUR`] pour pourquoi ; ce que mika#2886 épingle ici est
+    /// l'**issue** `PrOpened`, et c'est l'assertion qui précède.
     #[tokio::test]
     async fn mika2886_la_forme_reelle_rend_un_verdict_de_pr_ouverte() {
         let db = Database::open_in_memory().unwrap();
@@ -569,8 +581,9 @@ mod tests {
         );
         assert_eq!(
             verdicts[0].recommendation,
-            crate::milestone_manager::evaluator::FlightRecommendation::MergeCandidate,
-            "une PR ouverte dont l'état n'est pas connu est un merge-candidat"
+            crate::milestone_manager::evaluator::FlightRecommendation::ManualResumption,
+            "sans lecteur, la revue de la tête n'est pas lue, et AC6 (mika#2968) \
+             ne rend merge-candidat que sur une approbation lue sur ce commit"
         );
     }
 
@@ -760,13 +773,13 @@ mod tests {
     }
 
     /// **AC1 — une fois l'enfant d'implémentation terminal, c'est son issue qui
-    /// est jugée.** La forme exacte de la première ligne de la mesure, à l'instant
-    /// où le manager a enfin le droit de juger : PR ouverte, #2947,
-    /// merge-candidat.
+    /// est jugée.** La forme exacte de la première ligne de la mesure, à
+    /// l'instant où le manager a enfin le droit de juger : PR ouverte, #2947.
     ///
-    /// Hermétique comme son aîné de mika#2886 : `sub_issues` est vide, donc
-    /// `pr_state` est `None` et `recommend` rend `MergeCandidate` sans toucher
-    /// GitHub.
+    /// Hermétique comme son aîné de mika#2886 : `sub_issues` est vide et il n'y
+    /// a pas de lecteur, donc rien de la tête n'est lu et rien ne touche
+    /// GitHub. Recommandation `ManualResumption` depuis mika#2968 AC6 — voir
+    /// [`SANS_LECTEUR`] ; ce que ce test épingle est l'issue.
     #[tokio::test]
     async fn mika2951_une_fois_limplement_terminal_cest_son_issue_qui_est_jugee() {
         let db = Database::open_in_memory().unwrap();
@@ -802,7 +815,8 @@ mod tests {
         );
         assert_eq!(
             verdicts[0].recommendation,
-            crate::milestone_manager::evaluator::FlightRecommendation::MergeCandidate
+            crate::milestone_manager::evaluator::FlightRecommendation::ManualResumption,
+            "corollaire de l'absence de lecteur, pas de l'issue : voir `SANS_LECTEUR`"
         );
     }
 
@@ -885,7 +899,9 @@ mod tests {
         );
         assert_eq!(
             verdicts[0].recommendation,
-            crate::milestone_manager::evaluator::FlightRecommendation::MergeCandidate
+            crate::milestone_manager::evaluator::FlightRecommendation::ManualResumption,
+            "corollaire de l'absence de lecteur, pas du prédicat de mika#2951 : \
+             voir `SANS_LECTEUR`"
         );
     }
 
