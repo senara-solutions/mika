@@ -1128,14 +1128,17 @@ async fn mika2968_letat_de_pr_vient_de_la_lecture_par_numero_et_non_du_milestone
     );
     let sub_issues = vec![sous_ticket(2921, Some("open"))];
 
-    // La PR #2925 est lue ouverte, sans CI (le second appel `gh` n'a pas
-    // abouti) : ce test porte sur l'état de PR, pas sur la CI.
+    // La PR #2925 est lue ouverte, sans CI ni revue (le second appel `gh` n'a
+    // pas abouti) : ce test porte sur l'état de PR, pas sur la tête.
     let mut prs = HashMap::new();
     prs.insert(
         2925,
         FlightPrRead {
             state: "OPEN".to_string(),
             ci: None,
+            head_oid: None,
+            review: None,
+            review_decision: None,
         },
     );
     let mut par_depot = HashMap::new();

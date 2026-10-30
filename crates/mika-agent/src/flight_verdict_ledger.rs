@@ -174,6 +174,7 @@ use crate::async_db::AsyncDatabase;
 use crate::evidence::audit::AUDIT_RETENTION_DAYS;
 use crate::milestone_manager::evaluator::{
     CiKnowledge, DeathCause, FlightIssue, FlightRecommendation, FlightVerdict, NotFlightReason,
+    ReviewKnowledge,
 };
 use crate::milestone_manager::reporter::{flight_issue_label, flight_recommendation_label};
 
@@ -274,6 +275,19 @@ pub struct VerdictRecord {
     /// place serait inventer une mesure (motif mika#2331).
     #[serde(default = "CiKnowledge::default_unread")]
     pub ci: CiKnowledge,
+    /// Ce que le manager savait de la **revue** de la tête quand il a écrit
+    /// cette ligne (mika#2968, vol 2b).
+    ///
+    /// Même règle que `ci` juste au-dessus, sur les trois points : la ligne est
+    /// fidèle donc elle le porte, [`VerdictRecord::terms`] ne le projette **pas**
+    /// (AC4 — MPC n'écrit aucun état de revue), et le défaut est celui de
+    /// l'évaluateur, appelé et non recopié.
+    ///
+    /// C'est aussi ce champ que la sonde AC8 lit, par
+    /// `json_extract(payload, '$.review')` sur `audit_events` : sans lui, « la
+    /// tête n'avait pas d'approbation » ne serait pas requêtable après coup.
+    #[serde(default = "ReviewKnowledge::default_unread")]
+    pub review: ReviewKnowledge,
 }
 
 impl From<&FlightVerdict> for VerdictRecord {
@@ -282,6 +296,7 @@ impl From<&FlightVerdict> for VerdictRecord {
             issue: v.issue.clone(),
             recommendation: v.recommendation,
             ci: v.ci.clone(),
+            review: v.review.clone(),
         }
     }
 }
@@ -681,6 +696,9 @@ pub fn parse_judgment_terms(
         // la ligne de commande — ce serait demander à l'opérateur d'attester
         // une mesure qu'il n'a pas faite.
         ci: CiKnowledge::default_unread(),
+        // Et il ne lit pas davantage le tableau `reviews` : même raison, même
+        // défaut (vol 2b).
+        review: ReviewKnowledge::default_unread(),
     })
 }
 
@@ -1331,7 +1349,7 @@ mod tests {
     use super::test_support::RecordingLedger;
     use super::*;
     use crate::db::Database;
-    use crate::milestone_manager::evaluator::CiUnreadCause;
+    use crate::milestone_manager::evaluator::{CiUnreadCause, HeadReviewState};
     use crate::milestone_manager::types::CiState;
     use crate::source_scan::{
         audit_writers, production_files, production_half, strip_comment_lines,
@@ -1352,6 +1370,7 @@ mod tests {
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
             in_target_milestone: crate::milestone_manager::MilestoneMembership::NotRead,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            review: ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: Some("2026-10-26T10:00:00Z".to_string()),
         }
     }
@@ -1375,6 +1394,7 @@ mod tests {
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
             in_target_milestone: crate::milestone_manager::MilestoneMembership::NotRead,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            review: ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: None,
         }
     }
@@ -1395,6 +1415,7 @@ mod tests {
             pr_state: crate::milestone_manager::evaluator::PrStateKnowledge::NotRead,
             in_target_milestone: crate::milestone_manager::MilestoneMembership::NotRead,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            review: ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
             completed_at: Some("2026-10-28T12:10:00Z".to_string()),
         }
     }
@@ -2765,6 +2786,7 @@ mod tests {
             },
             recommendation: FlightRecommendation::Regroom,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            review: ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
         };
 
         let cote_manager = render_concordance_text(&ConcordanceReport {
@@ -2818,6 +2840,7 @@ mod tests {
                 issue: FlightIssue::Dead { cause },
                 recommendation: FlightRecommendation::Regroom,
                 ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+                review: ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
             }),
             mpc: None,
             agreement: FlightAgreement::NotJudgedByMpc,
@@ -3110,6 +3133,21 @@ mod tests {
             },
             recommendation: FlightRecommendation::MergeCandidate,
             ci,
+            review: ReviewKnowledge::default_unread(),
+        }
+    }
+
+    /// Le pendant de [`record_avec_ci`] sur l'axe de la revue (vol 2b) : tout
+    /// est tenu fixe sauf `review`.
+    fn record_avec_revue(review: ReviewKnowledge) -> VerdictRecord {
+        VerdictRecord {
+            issue: FlightIssue::PrOpened {
+                number: Some(2972),
+                url: None,
+            },
+            recommendation: FlightRecommendation::MergeCandidate,
+            ci: CiKnowledge::default_unread(),
+            review,
         }
     }
 
@@ -3141,6 +3179,39 @@ mod tests {
         );
     }
 
+    /// AC4 sur l'axe de la revue (vol 2b) — elle n'entre pas davantage dans les
+    /// termes comparés.
+    ///
+    /// Même raison, mot pour mot : MPC juge à la main et ne lit aucun tableau
+    /// `reviews`. Si la revue entrait dans les termes, **chaque** vol
+    /// divergerait sur un terme qu'un seul des deux côtés produit, et la
+    /// concordance annoncerait 0 le jour où tout concorde.
+    #[test]
+    fn mika2968_ac4_la_revue_nentre_pas_dans_les_termes_compares() {
+        let approuvee = record_avec_revue(ReviewKnowledge::Read {
+            state: HeadReviewState::ApprovedOnHead,
+            decision: Some("APPROVED".into()),
+            at: "2026-10-29T22:55:00Z".into(),
+        });
+        let coupee = record_avec_revue(ReviewKnowledge::Read {
+            state: HeadReviewState::Held {
+                reason: "review".into(),
+                on_head: true,
+            },
+            decision: Some("REVIEW_REQUIRED".into()),
+            at: "2026-10-29T22:55:00Z".into(),
+        });
+        assert_ne!(
+            approuvee.review, coupee.review,
+            "anti-vacuité : les deux lignes diffèrent"
+        );
+        assert_eq!(
+            approuvee.terms(),
+            coupee.terms(),
+            "la revue n'entre pas dans les termes comparés"
+        );
+    }
+
     /// AC4, seconde moitié — la divergence du vol mesuré reste divergente, et
     /// le nouveau champ l'explique.
     ///
@@ -3160,6 +3231,12 @@ mod tests {
             CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             "un blob antérieur au champ ne porte aucune mesure"
         );
+        assert_eq!(
+            manager.review,
+            ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
+            "le champ de revue du vol 2b se relit sur le même défaut, et dire \
+             `ApprovedOnHead` à sa place inventerait une approbation"
+        );
 
         let mpc = VerdictRecord {
             issue: FlightIssue::PrOpened {
@@ -3168,6 +3245,7 @@ mod tests {
             },
             recommendation: FlightRecommendation::ManualResumption,
             ci: CiKnowledge::default_unread(),
+            review: ReviewKnowledge::default_unread(),
         };
 
         assert_eq!(

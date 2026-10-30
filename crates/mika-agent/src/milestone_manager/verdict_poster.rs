@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use crate::milestone_manager::evaluator::{
         CiKnowledge, CiUnreadCause, FlightIssue, FlightRecommendation, MilestoneMembership,
-        PrStateKnowledge,
+        PrStateKnowledge, ReviewKnowledge,
     };
     use std::sync::Mutex;
 
@@ -267,6 +267,7 @@ mod tests {
             pr_state: PrStateKnowledge::Read(None),
             in_target_milestone: MilestoneMembership::InTarget,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            review: ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
             recommendation: FlightRecommendation::MergeCandidate,
             completed_at: Some("2026-10-14T22:00:00Z".into()),
         }

@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::reader::RepoPrRead;
+use super::reader::{HeadReview, RepoPrRead};
 use super::types::{CiState, MilestoneState, SubIssue};
 
 // ---- Le verdict ------------------------------------------------------------
@@ -295,6 +295,93 @@ impl CiKnowledge {
     }
 }
 
+/// Pourquoi la **revue** de la tête n'a pas été lue (mika#2968, vol 2b).
+///
+/// Un **alias**, et non un second énuméré : les causes de non-lecture de la tête
+/// sont exactement les mêmes pour la CI et pour la revue, parce que les deux
+/// sortent de l'appel 2 de [`super::reader::read_flight_prs`], joint au même
+/// appel 1. Dix variantes de plus diraient la même chose deux fois, et
+/// divergeraient au premier ajout fait d'un seul côté.
+///
+/// `serde(rename_all)` porte sur les **variantes**, jamais sur le nom du type :
+/// l'alias est donc neutre à la sérialisation — `ReviewKnowledge::Unread` écrit
+/// les mêmes octets qu'un énuméré jumeau l'aurait fait.
+pub type HeadUnreadCause = CiUnreadCause;
+
+/// Ce que le manager **sait** de la revue de la tête de la PR d'un vol
+/// (mika#2968, vol 2b).
+///
+/// Même forme et même raison que [`CiKnowledge`], sur le troisième axe de la
+/// même tête : voir son docstring pour pourquoi « lue et vide » et « non lue »
+/// sont deux variantes et non un `Option`. Ce qui est propre à cet axe est
+/// ailleurs — dans [`HeadReviewState`] pour les états, et dans le docstring de
+/// `recommend` pour l'asymétrie avec la CI sur la non-lecture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewKnowledge {
+    /// La revue de la tête a été lue, à cet instant (ISO 8601 UTC — le `now` du
+    /// cycle, comme [`CiKnowledge::Read`]).
+    Read {
+        state: HeadReviewState,
+        /// `reviewDecision` tel que la forge l'agrège, **pour le rapport
+        /// seul** : il ne dit pas sur quel commit, donc il ne peut pas fonder
+        /// `ApprovedOnHead`. Absent quand la forge ne le renseigne pas, jamais
+        /// une chaîne vide (motif mika#2331).
+        #[serde(default)]
+        decision: Option<String>,
+        at: String,
+    },
+    /// Rien n'a été lu, et la cause est **nommée** plutôt qu'avalée.
+    Unread(HeadUnreadCause),
+}
+
+/// L'état de la dernière revue du relecteur attendu, **relativement à la tête**
+/// (mika#2968, vol 2b).
+///
+/// Chaque variante est tranchée sur des champs **structurés** — `state`,
+/// l'auteur, `commit` — jamais sur le texte de la revue : une revue `COMMENTED`
+/// n'est jamais une approbation, quel que soit son corps. Le seul endroit où le
+/// corps est lu est `reason`, qui ne sert qu'au rapport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadReviewState {
+    /// Approuvée par le relecteur attendu, **sur la tête exacte**. Le seul état
+    /// qui laisse `MergeCandidate` (AC6).
+    ApprovedOnHead,
+    /// Approuvée, mais sur un commit qui n'est pas la tête — ou sur un commit
+    /// que la lecture n'a pas pu comparer à la tête. Les deux vont ici parce
+    /// que ni l'une ni l'autre n'est une approbation *de ce qui serait fusionné*,
+    /// et c'est le sens sûr : une tête absente ne peut pas compter pour une
+    /// égalité.
+    ApprovedOnOlderCommit {
+        /// Le commit que la revue visait, s'il est connu.
+        reviewed: Option<String>,
+    },
+    /// La dernière revue porte un `VERDICT: hold[<motif>]` — le cas mesuré de
+    /// mika#2972, où le tour de revue avait été coupé à 30 steps d'outil.
+    Held {
+        reason: String,
+        /// Si ce `hold` portait bien sur la tête. Un `hold` sur un commit
+        /// antérieur ne décrit pas ce qui serait fusionné, et le rapport le dit.
+        on_head: bool,
+    },
+    /// La dernière revue n'approuve pas et ne porte pas de verdict moteur :
+    /// un commentaire, une revue rejetée, un `changes_requested`.
+    NoVerdict { on_head: bool },
+    /// Le relecteur attendu n'a posé **aucune** revue — sur un tableau `reviews`
+    /// qui a bien été lu.
+    NoReview,
+}
+
+impl ReviewKnowledge {
+    /// Le défaut serde du champ [`FlightVerdict::review`] — même rôle et même
+    /// `pub(crate)` que [`CiKnowledge::default_unread`], parce que
+    /// `VerdictRecord::review` prend le même.
+    pub(crate) fn default_unread() -> Self {
+        ReviewKnowledge::Unread(HeadUnreadCause::NotMeasured)
+    }
+}
+
 /// Ce que le cycle a lu des PR des vols, par dépôt (mika#2968, vol 2a).
 ///
 /// Enveloppe nommée autour du rendu de [`super::reader::read_flight_prs`], et
@@ -393,6 +480,13 @@ pub struct FlightVerdict {
     /// ce défaut dit.
     #[serde(default = "CiKnowledge::default_unread")]
     pub ci: CiKnowledge,
+    /// Ce que le manager sait de la **revue** de la tête de la PR (mika#2968,
+    /// vol 2b) — le second axe de la même tête, lu par le même appel.
+    ///
+    /// `#[serde(default = "ReviewKnowledge::default_unread")]`, même raison que
+    /// `ci` juste au-dessus.
+    #[serde(default = "ReviewKnowledge::default_unread")]
+    pub review: ReviewKnowledge,
     pub recommendation: FlightRecommendation,
     /// ISO 8601 UTC — `tasks.completed_at`.
     pub completed_at: Option<String>,
@@ -522,9 +616,16 @@ pub fn evaluate_flights(
                 (Some(_), None) => MilestoneMembership::OutOfTarget,
                 (Some(_), Some(_)) => MilestoneMembership::InTarget,
             };
-            let (pr_state, ci) =
+            let (pr_state, ci, review) =
                 compose_pr_knowledge(f.repo.as_deref(), flight_pr_number(f), pr_reads, read_at);
-            evaluate_flight(f, issue_number, &pr_state, &ci, in_target_milestone)
+            evaluate_flight(
+                f,
+                issue_number,
+                &pr_state,
+                &ci,
+                &review,
+                in_target_milestone,
+            )
         })
         .collect()
 }
@@ -545,28 +646,35 @@ fn flight_pr_number(flight: &FinishedFlight) -> Option<u64> {
     }
 }
 
-/// Ce que la lecture par numéro dit de la PR d'un vol : son état, et sa CI.
+/// Ce que la lecture par numéro dit de la PR d'un vol : son état, sa CI, et la
+/// revue de sa tête.
 ///
-/// Les deux sortent **de la même lecture**, donc d'une seule fonction. La table
-/// est celle des § 5 et § 6 du plan :
+/// Les trois sortent **de la même lecture**, donc d'une seule fonction. La table
+/// est celle des § 5 et § 6 du plan, étendue au troisième terme par le vol 2b :
 ///
-/// | situation | `pr_state` | `ci` |
-/// |---|---|---|
-/// | le vol n'a pas de numéro de PR | `NotRead` | `Unread(NoPrNumber)` |
-/// | le vol ne dit pas son dépôt | `NotRead` | `Unread(NoRepo)` |
-/// | rien n'a été tenté sur ce dépôt | `NotRead` | `Unread(NoRunner)` |
-/// | la lecture du dépôt a échoué | `NotRead` | `Unread(ReadFailed)` |
-/// | le numéro n'est pas dans la page lue | `NotRead` | `Unread(NotFound)` |
-/// | PR lue, non ouverte | `Read(Some(état))` | `Unread(PrNotOpen)` |
-/// | PR lue, ouverte, rollup non lu | `Read(Some(état))` | `Unread(ReadFailed)` |
-/// | PR lue, ouverte, rollup lu | `Read(Some(état))` | `Read { … }` |
+/// | situation | `pr_state` | `ci` | `review` |
+/// |---|---|---|---|
+/// | le vol n'a pas de numéro de PR | `NotRead` | `Unread(NoPrNumber)` | `Unread(NoPrNumber)` |
+/// | le vol ne dit pas son dépôt | `NotRead` | `Unread(NoRepo)` | `Unread(NoRepo)` |
+/// | rien n'a été tenté sur ce dépôt | `NotRead` | `Unread(NoRunner)` | `Unread(NoRunner)` |
+/// | la lecture du dépôt a échoué | `NotRead` | `Unread(ReadFailed)` | `Unread(ReadFailed)` |
+/// | le numéro n'est pas dans la page lue | `NotRead` | `Unread(NotFound)` | `Unread(NotFound)` |
+/// | PR lue, non ouverte | `Read(Some(état))` | `Unread(PrNotOpen)` | `Unread(PrNotOpen)` |
+/// | PR lue, ouverte, second appel échoué | `Read(Some(état))` | `Unread(ReadFailed)` | `Unread(ReadFailed)` |
+/// | PR lue, ouverte, second appel lu | `Read(Some(état))` | `Read { … }` | `Read { … }` |
 ///
-/// **L'ordre de lecture est porteur** : `state` est lu **avant** `ci`, parce que
-/// `FlightPrRead::ci` vaut `None` dans deux cas de sens opposé — sur une PR non
-/// ouverte le second appel `gh` ne l'a pas demandée, sur une PR ouverte il a
-/// échoué. Lire `ci` d'abord fondrait les deux en une seule cause, et
-/// « la CI n'avait pas à être lue » passerait pour « la CI n'a pas pu être
-/// lue » (classe mika#2205).
+/// **Les deux dernières colonnes sont identiques par construction, et c'est la
+/// justification de l'alias [`HeadUnreadCause`]** : les causes de non-lecture
+/// sont les mêmes parce que `ci`, `head_oid` et `review` sortent du même appel
+/// `gh`. Une divergence future entre ces deux colonnes serait le signal qu'il
+/// faut deux énumérés — pas avant.
+///
+/// **L'ordre de lecture est porteur** : `state` est lu **avant** `ci` et
+/// `review`, parce que `FlightPrRead::ci` et `FlightPrRead::review` valent
+/// `None` dans deux cas de sens opposé — sur une PR non ouverte le second appel
+/// `gh` ne les a pas demandées, sur une PR ouverte il a échoué. Lire `ci`
+/// d'abord fondrait les deux en une seule cause, et « la CI n'avait pas à être
+/// lue » passerait pour « la CI n'a pas pu être lue » (classe mika#2205).
 ///
 /// `pr_state` est `Read` **dès que le numéro est trouvé**, y compris pour une PR
 /// non ouverte : l'état *a* été lu, et c'est lui qui décide la recommandation
@@ -576,8 +684,14 @@ fn compose_pr_knowledge(
     pr_number: Option<u64>,
     pr_reads: &FlightPrReads,
     read_at: &str,
-) -> (PrStateKnowledge, CiKnowledge) {
-    let non_lu = |cause| (PrStateKnowledge::NotRead, CiKnowledge::Unread(cause));
+) -> (PrStateKnowledge, CiKnowledge, ReviewKnowledge) {
+    let non_lu = |cause| {
+        (
+            PrStateKnowledge::NotRead,
+            CiKnowledge::Unread(cause),
+            ReviewKnowledge::Unread(cause),
+        )
+    };
     let Some(number) = pr_number else {
         return non_lu(CiUnreadCause::NoPrNumber);
     };
@@ -601,7 +715,11 @@ fn compose_pr_knowledge(
     // `open` est comparé sans égard à la casse, comme dans `recommend` : `gh`
     // écrit `OPEN`, et c'est la graphie que le rapport affiche telle quelle.
     if !pr.state.eq_ignore_ascii_case("open") {
-        return (pr_state, CiKnowledge::Unread(CiUnreadCause::PrNotOpen));
+        return (
+            pr_state,
+            CiKnowledge::Unread(CiUnreadCause::PrNotOpen),
+            ReviewKnowledge::Unread(HeadUnreadCause::PrNotOpen),
+        );
     }
     let ci = match &pr.ci {
         Some(state) => CiKnowledge::Read {
@@ -610,7 +728,63 @@ fn compose_pr_knowledge(
         },
         None => CiKnowledge::Unread(CiUnreadCause::ReadFailed),
     };
-    (pr_state, ci)
+    // `head_oid` est la preuve que le second appel a abouti : il est toujours
+    // renseigné sur une PR ouverte que `gh` a rendue. Son absence est donc une
+    // lecture échouée, et surtout jamais une approbation — voir
+    // [`compose_head_review_state`].
+    let review = match &pr.head_oid {
+        Some(head_oid) => ReviewKnowledge::Read {
+            state: compose_head_review_state(pr.review.as_ref(), head_oid),
+            decision: pr.review_decision.clone(),
+            at: read_at.to_string(),
+        },
+        None => ReviewKnowledge::Unread(HeadUnreadCause::ReadFailed),
+    };
+    (pr_state, ci, review)
+}
+
+/// La dernière revue du relecteur attendu, située **par rapport à la tête**.
+///
+/// Trois propriétés que ce classement porte, et qu'un futur éditeur ne doit pas
+/// avoir à redériver :
+///
+/// - **`APPROVED` est comparé sans égard à la casse**, comme `open` au-dessus :
+///   `gh` écrit les états de revue en capitales.
+/// - **Un `commit` absent ne vaut pas la tête.** `reviews[].commit.oid` peut
+///   revenir vide (c'est ce que `latestReviews` rend *systématiquement*, mesuré
+///   le 2026-10-30 sur cinq PR sur cinq, et c'est pourquoi le lecteur interroge
+///   `reviews`). Une approbation dont on ne sait pas ce qu'elle visait n'est pas
+///   une approbation de ce qui serait fusionné : elle tombe dans
+///   `ApprovedOnOlderCommit { reviewed: None }`, qui ne laisse pas `MergeCandidate`.
+/// - **Le `hold` n'est lu que sur une revue non approuvante.** Une approbation
+///   qui citerait `hold[...]` en prose reste une approbation : la décision tient
+///   aux champs structurés, jamais au texte (mika#2972 a montré l'inverse — une
+///   revue `COMMENTED` portant le verdict moteur — et c'est ce cas-là que
+///   `Held` nomme).
+fn compose_head_review_state(review: Option<&HeadReview>, head_oid: &str) -> HeadReviewState {
+    let Some(review) = review else {
+        return HeadReviewState::NoReview;
+    };
+    let on_head = review
+        .commit
+        .as_deref()
+        .is_some_and(|c| c.eq_ignore_ascii_case(head_oid));
+    if review.state.eq_ignore_ascii_case("APPROVED") {
+        return if on_head {
+            HeadReviewState::ApprovedOnHead
+        } else {
+            HeadReviewState::ApprovedOnOlderCommit {
+                reviewed: review.commit.clone(),
+            }
+        };
+    }
+    match &review.hold_reason {
+        Some(reason) => HeadReviewState::Held {
+            reason: reason.clone(),
+            on_head,
+        },
+        None => HeadReviewState::NoVerdict { on_head },
+    }
 }
 
 /// Le verdict d'un vol, `pr_state` étant ce que le manager **sait** de l'état de
@@ -621,7 +795,8 @@ fn compose_pr_knowledge(
 ///
 /// `ci` est ce qu'il sait de la CI de la tête de cette PR (mika#2968) — lue à un
 /// instant nommé, ou non lue pour une cause nommée. L'appelant la **compose**,
-/// ce qui garde la provenance hors de cette fonction.
+/// ce qui garde la provenance hors de cette fonction. `review` est le second axe
+/// de la même tête (vol 2b) et suit exactement la même règle.
 ///
 /// `in_target_milestone` suit la même règle, et c'est pourquoi c'est un
 /// paramètre plutôt qu'une dérivation de `pr_state` : depuis le vol 2a de
@@ -633,6 +808,7 @@ pub fn evaluate_flight(
     issue_number: Option<u64>,
     pr_state: &PrStateKnowledge,
     ci: &CiKnowledge,
+    review: &ReviewKnowledge,
     in_target_milestone: MilestoneMembership,
 ) -> FlightVerdict {
     let result = flight.result.as_deref().unwrap_or("");
@@ -642,10 +818,11 @@ pub fn evaluate_flight(
         task_id: flight.task_id.clone(),
         repo: flight.repo.clone(),
         issue_number,
-        recommendation: recommend(&issue, pr_state, ci),
+        recommendation: recommend(&issue, pr_state, ci, review),
         pr_state: pr_state.clone(),
         in_target_milestone,
         ci: ci.clone(),
+        review: review.clone(),
         issue,
         turns_used: pilot.turns.or_else(|| {
             line_value(result, "Turns:").and_then(|v| v.split_whitespace().next()?.parse().ok())
@@ -698,10 +875,44 @@ pub fn evaluate_flight(
 /// Un rouge posé **après** le verdict ne le fait pas réviser : le verdict est
 /// une mesure horodatée, et l'`at` de [`CiKnowledge::Read`] est ce qui la rend
 /// honnête.
+///
+/// **La revue entre dans la décision depuis le vol 2b (AC6), et par un bras
+/// placé après celui de la CI.** Il est écrit en *positif* : `MergeCandidate`
+/// exige une approbation du relecteur **sur la tête exacte**, et tout le reste
+/// — approuvée sur un commit antérieur, `hold[...]` de n'importe quel motif,
+/// commentée sans verdict, aucune revue, revue **non lue** — rend
+/// `ManualResumption`.
+///
+/// Les trois décisions du vol 1 restent fermées telles quelles, et ce bras ne
+/// les rouvre pas : `ManualResumption` plutôt qu'une variante neuve,
+/// `CiState::Pending` reste `MergeCandidate`, `CiKnowledge::Unread(_)` reste
+/// `MergeCandidate`.
+///
+/// **Mais une revue non lue, elle, ne reste PAS `MergeCandidate`** — et c'est
+/// délibérément l'inverse de la politique CI, pas un oubli. La raison est dans
+/// la forme des deux critères : AC1 est **négatif** (« une CI rouge interdit »),
+/// donc une non-lecture n'y est pas une preuve d'interdiction ; AC6 est
+/// **positif** (« une approbation sur la tête autorise »), donc une non-lecture
+/// n'y est pas une preuve d'autorisation. Dans les deux cas la non-lecture
+/// n'apporte aucune preuve ; c'est le sens du critère qui décide ce que
+/// l'absence de preuve coûte. Laisser passer `Unread` ici rendrait `MergeCandidate`
+/// sur une tête dont personne n'a vu la revue — exactement le signal que le
+/// ticket veut supprimer avant l'ouverture de `MIKA_MANAGER_EVALUATE_WRITE`.
+///
+/// **Le coût est réel et il est accepté, pas ignoré :** sur un dépôt où le jeton
+/// ne lit pas (mika-cloud, mika-platform — mika#2963) et sur un
+/// `FlightPrReads::Unwired`, *tous* les vols sortent en `ManualResumption`. C'est
+/// une sur-refusation : elle envoie un humain regarder là où il n'y avait
+/// peut-être rien à voir. Elle est préférée à la sous-refusation parce que le
+/// rapport **dit** pourquoi — « revue non lue (<cause>) » — donc l'opérateur lit
+/// la cause de la prudence au lieu de la deviner, et parce que la sortie fautive
+/// de l'autre côté (« merge-candidat » sur une PR que le gate refusera) est
+/// celle que mika#2968 existe pour fermer.
 fn recommend(
     issue: &FlightIssue,
     pr_state: &PrStateKnowledge,
     ci: &CiKnowledge,
+    review: &ReviewKnowledge,
 ) -> FlightRecommendation {
     match issue {
         FlightIssue::PrOpened { .. } => match pr_state {
@@ -716,6 +927,20 @@ fn recommend(
                 ci,
                 CiKnowledge::Read {
                     state: CiState::Failed,
+                    ..
+                }
+            ) =>
+            {
+                FlightRecommendation::ManualResumption
+            }
+            // AC6 : faute d'une approbation du relecteur **sur la tête**, pas de
+            // merge-candidat. Écrit en négation d'un seul motif accepté, afin
+            // qu'un état de revue ajouté plus tard tombe du côté prudent sans
+            // qu'on ait à y penser.
+            _ if !matches!(
+                review,
+                ReviewKnowledge::Read {
+                    state: HeadReviewState::ApprovedOnHead,
                     ..
                 }
             ) =>
@@ -1058,6 +1283,25 @@ mod tests {
     /// défaut changerait.
     const CI_NON_LUE: CiKnowledge = CiKnowledge::Unread(CiUnreadCause::NotMeasured);
 
+    /// « Rien n'a été lu de la revue » (vol 2b) — même rôle et même raison de
+    /// ne pas emprunter `ReviewKnowledge::default_unread` que [`CI_NON_LUE`].
+    const REVUE_NON_LUE: ReviewKnowledge = ReviewKnowledge::Unread(HeadUnreadCause::NotMeasured);
+
+    /// « La tête est approuvée par le relecteur attendu » — la seule
+    /// connaissance de revue qui laisse `MergeCandidate` (AC6).
+    ///
+    /// Les tests antérieurs au vol 2b portent sur d'autres axes et attendent
+    /// leur recommandation d'avant : ils passent donc *celle-ci*, qui est
+    /// neutre pour la nouvelle garde. Les faire passer [`REVUE_NON_LUE`]
+    /// retournerait leur attente sans rien attester de la revue.
+    fn revue_approuvee() -> ReviewKnowledge {
+        ReviewKnowledge::Read {
+            state: HeadReviewState::ApprovedOnHead,
+            decision: Some("APPROVED".to_string()),
+            at: AU_CYCLE_DE.to_string(),
+        }
+    }
+
     /// « L'appartenance au milestone n'a pas été lue » (mika#2968, vol 2a) — la
     /// connaissance que portent les appels directs à [`evaluate_flight`] sans
     /// numéro de ticket, où aucun appariement n'a pu avoir lieu. Écrite ici pour
@@ -1076,11 +1320,36 @@ mod tests {
     /// portent les tests qui n'instruisent pas l'axe de la lecture.
     const SANS_LECTEUR: FlightPrReads = FlightPrReads::Unwired;
 
+    /// La tête que [`lectures`] fait porter à chaque PR lue. Une valeur de
+    /// fixture, pas un relevé : ce qu'elle doit être, c'est **la même** que le
+    /// commit de [`approbation_sur_la_tete`], puisque c'est l'égalité des deux
+    /// qui est la décision.
+    const TETE_LUE: &str = "b972dd2e1f5c4a3b8e9d0c1a2b3c4d5e6f708192";
+
+    /// L'approbation du relecteur sur [`TETE_LUE`] : le seul motif qui laisse
+    /// passer un merge-candidat (AC6).
+    fn approbation_sur_la_tete() -> HeadReview {
+        HeadReview {
+            state: "APPROVED".to_string(),
+            commit: Some(TETE_LUE.to_string()),
+            submitted_at: "2026-10-29T17:45:00Z".to_string(),
+            hold_reason: None,
+        }
+    }
+
     /// Une lecture par numéro de PR sur [`DEPOT`], gréée : `(numéro, état, CI)`.
     ///
     /// `ci: None` est **une propriété de la lecture**, jamais une CI verte : sur
     /// une PR non ouverte le second appel `gh` ne l'a pas demandée, sur une PR
     /// ouverte il a échoué. L'helper laisse donc l'appelant le dire.
+    ///
+    /// La **revue**, elle, est fixée au motif qui laisse passer — tête lue,
+    /// approbation du relecteur sur ce commit exact. C'est le pendant du
+    /// `Some(CiState::Success)` que chaque site passe déjà : les tests qui
+    /// n'instruisent pas l'axe de la revue mesurent autre chose, et une revue non
+    /// lue retournerait leur attente (AC6 refuse en l'absence de preuve, à
+    /// l'inverse d'AC1). L'axe de la revue a ses propres tables :
+    /// [`lecture_dune_tete`] est ce qui les gréé.
     fn lectures(prs: &[(u64, &str, Option<CiState>)]) -> FlightPrReads {
         let mut page = HashMap::new();
         for (numero, etat, ci) in prs {
@@ -1089,9 +1358,36 @@ mod tests {
                 FlightPrRead {
                     state: etat.to_string(),
                     ci: ci.clone(),
+                    head_oid: Some(TETE_LUE.to_string()),
+                    review: Some(approbation_sur_la_tete()),
+                    review_decision: Some("APPROVED".to_string()),
                 },
             );
         }
+        let mut par_depot = HashMap::new();
+        par_depot.insert(DEPOT.to_string(), RepoPrRead::Read(page));
+        FlightPrReads::Read(par_depot)
+    }
+
+    /// Une lecture d'une seule PR ouverte et verte, dont la **tête** et la
+    /// **revue** sont nommées par l'appelant : l'helper des tables de l'axe de la
+    /// revue, là où [`lectures`] tient cet axe neutre.
+    fn lecture_dune_tete(
+        numero: u64,
+        head_oid: Option<&str>,
+        review: Option<HeadReview>,
+    ) -> FlightPrReads {
+        let mut page = HashMap::new();
+        page.insert(
+            numero,
+            FlightPrRead {
+                state: "OPEN".to_string(),
+                ci: Some(CiState::Success),
+                head_oid: head_oid.map(str::to_string),
+                review,
+                review_decision: Some("REVIEW_REQUIRED".to_string()),
+            },
+        );
         let mut par_depot = HashMap::new();
         par_depot.insert(DEPOT.to_string(), RepoPrRead::Read(page));
         FlightPrReads::Read(par_depot)
@@ -1196,6 +1492,7 @@ mod tests {
                 None,
                 &PrStateKnowledge::NotRead,
                 &CI_NON_LUE,
+                &REVUE_NON_LUE,
                 CIBLE_NON_LUE,
             );
             assert_eq!(v.turn_ceiling, None, "{}", f.task_id);
@@ -1209,7 +1506,14 @@ mod tests {
     fn mika2698_les_tours_retombent_sur_la_ligne_turns_sans_metadata() {
         let mut f = fixture_pr_opened();
         f.metadata = None;
-        let v = evaluate_flight(&f, None, &lu(Some("open")), &CI_NON_LUE, CIBLE_NON_LUE);
+        let v = evaluate_flight(
+            &f,
+            None,
+            &lu(Some("open")),
+            &CI_NON_LUE,
+            &revue_approuvee(),
+            CIBLE_NON_LUE,
+        );
         assert_eq!(
             v.turns_used,
             Some(83),
@@ -1236,6 +1540,7 @@ mod tests {
                 None,
                 &PrStateKnowledge::NotRead,
                 &CI_NON_LUE,
+                &REVUE_NON_LUE,
                 CIBLE_NON_LUE
             )
             .turns_used,
@@ -1259,6 +1564,7 @@ mod tests {
                 None,
                 &PrStateKnowledge::NotRead,
                 &CI_NON_LUE,
+                &REVUE_NON_LUE,
                 CIBLE_NON_LUE
             )
             .turns_used,
@@ -1281,6 +1587,7 @@ mod tests {
             None,
             &PrStateKnowledge::NotRead,
             &CI_NON_LUE,
+            &REVUE_NON_LUE,
             CIBLE_NON_LUE,
         )
     }
@@ -1357,6 +1664,7 @@ mod tests {
             None,
             &PrStateKnowledge::NotRead,
             &CI_NON_LUE,
+            &REVUE_NON_LUE,
             CIBLE_NON_LUE,
         );
         assert_eq!(
@@ -1387,6 +1695,9 @@ mod tests {
             Some(2655),
             &lu(Some("open")),
             &CI_NON_LUE,
+            // Approuvée : la `ManualResumption` attendue doit venir du bras
+            // `RescuePr`, pas de la garde de revue ajoutée par le vol 2b.
+            &revue_approuvee(),
             MilestoneMembership::InTarget,
         );
         assert!(v.hit_ceiling);
@@ -1506,6 +1817,7 @@ mod tests {
             None,
             &PrStateKnowledge::NotRead,
             &CI_NON_LUE,
+            &REVUE_NON_LUE,
             CIBLE_NON_LUE,
         );
         assert!(
@@ -1566,6 +1878,13 @@ mod tests {
     /// L'autre moitié — que le rapport le dise au lieu de le taire — est dans
     /// `reporter.rs`. Si cette colonne divergeait un jour de la précédente, un
     /// humain serait envoyé sur chaque vol de la boucle.
+    ///
+    /// **Les deux autres axes sont tenus neutres ici, et pas au hasard** : CI non
+    /// lue (qui laisse passer, vol 1) et revue approuvée sur la tête (qui laisse
+    /// passer, vol 2b). C'est la seule combinaison où la variable mesurée reste
+    /// `pr_state` seul ; une revue non lue retournerait chaque ligne `pr()` de
+    /// cette table et masquerait l'axe qu'elle épingle. Les axes CI et revue ont
+    /// leur propre matrice, chacune avec la même discipline en miroir.
     #[test]
     fn mika2698_la_matrice_de_recommandation_est_exhaustive() {
         let pr = || FlightIssue::PrOpened {
@@ -1676,7 +1995,7 @@ mod tests {
         ];
         for (issue, pr_state, expected) in cases {
             assert_eq!(
-                recommend(issue, pr_state, &CI_NON_LUE),
+                recommend(issue, pr_state, &CI_NON_LUE, &revue_approuvee()),
                 *expected,
                 "issue={issue:?} pr_state={pr_state:?}"
             );
@@ -2104,9 +2423,13 @@ mod tests {
              plus les six causes du vol 2a croisées avec les trois états de PR"
         );
 
+        // La revue est tenue approuvée sur la tête d'un bout à l'autre : c'est
+        // l'axe que le vol 2b ajoute, et le tenir au seul motif qui laisse
+        // passer est ce qui garde cette matrice une mesure de la **CI**. Sa
+        // propre matrice, en miroir, tient la CI verte.
         for (nom, pr_state, ci, attendu) in &matrice {
             assert_eq!(
-                &recommend(&pr_du_vol, pr_state, ci),
+                &recommend(&pr_du_vol, pr_state, ci, &revue_approuvee()),
                 attendu,
                 "cellule « {nom} »"
             );
@@ -2130,11 +2453,11 @@ mod tests {
         };
 
         assert_eq!(
-            recommend(&vol, &ouverte, &ci(CiState::Failed)),
+            recommend(&vol, &ouverte, &ci(CiState::Failed), &revue_approuvee()),
             FlightRecommendation::ManualResumption
         );
         assert_eq!(
-            recommend(&vol, &ouverte, &ci(CiState::Success)),
+            recommend(&vol, &ouverte, &ci(CiState::Success), &revue_approuvee()),
             FlightRecommendation::MergeCandidate
         );
     }
@@ -2161,5 +2484,316 @@ mod tests {
         let v: FlightVerdict = serde_json::from_str(ancien).expect("un blob antérieur se relit");
         assert_eq!(v.ci, CiKnowledge::Unread(CiUnreadCause::NotMeasured));
         assert_eq!(v.ci, CiKnowledge::default_unread());
+    }
+
+    // ---- mika#2968 vol 2b : la revue entre dans la recommandation ---------
+
+    /// La tête **mesurée** de mika#2972, et la revue que le relecteur y avait
+    /// posée à 22:42:22Z le 2026-10-29.
+    ///
+    /// **Ne pas relire mika#2972 pour reconstituer ces octets.** Une seconde
+    /// revue, `APPROVED`, a été posée sur le même commit le 2026-10-30 à
+    /// 07:14:30Z ; la PR ne montre donc plus l'état mesuré. Ce qui est figé ici
+    /// est le relevé : état `COMMENTED`, corps portant `VERDICT: hold[review]`,
+    /// cause `cut_off_max_steps` (le tour de callback a atteint 30 steps d'outil
+    /// sans poster de verdict, trace `1ecce0852bb84f42b7ca8471bf7ac20c`). Les
+    /// 28 checks requis de cette tête étaient SUCCESS : c'est précisément le vol
+    /// où la CI seule ne suffisait pas.
+    ///
+    /// La même fixture vit dans le module de test de `reader.rs`, comme celle du
+    /// rollup de mika#2966 — dupliquée plutôt que partagée, pour la même raison :
+    /// un module de test n'est pas une surface d'API, et ce qui est épinglé ici
+    /// est ce que l'**évaluateur** décide de ces octets.
+    const TETE_2972: &str = "be2655270f30db9a59b7110cad08034faeca48a8";
+
+    fn revue_2972_mesuree() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "author": { "login": "mika-platform-qa" },
+                "state": "COMMENTED",
+                "submittedAt": "2026-10-29T22:42:22Z",
+                "commit": { "oid": TETE_2972 },
+                "body": "Le tour de revue n'a pas conclu.\n\nVERDICT: hold[review]\n"
+            }
+        ])
+    }
+
+    /// AC7 — les six états de revue dans **un** appel, CI verte et PR ouverte
+    /// partout. Une seule cellule reste `MergeCandidate` : l'approbation du
+    /// relecteur sur la tête exacte.
+    ///
+    /// Les deux autres axes sont tenus au motif qui laisse passer — PR `open`,
+    /// CI lue et verte — pour la raison en miroir de la matrice d'AC2 : c'est la
+    /// seule combinaison où la variable mesurée reste la revue seule. Une CI
+    /// rouge rendrait les six cellules `ManualResumption` et la table resterait
+    /// verte le jour où `recommend` cesserait de lire la revue.
+    ///
+    /// **La cellule « coupée » traverse le lecteur de production**, comme la
+    /// cellule rouge d'AC2 : les octets mesurés de mika#2972 passent par
+    /// [`crate::milestone_manager::reader::classify_head_review`] puis par
+    /// [`compose_head_review_state`], et non par un `HeadReviewState::Held`
+    /// écrit à la main. Un littéral aurait attesté la décision sans attester
+    /// qu'une revue `COMMENTED` portant `VERDICT: hold[review]` y mène — ce qui
+    /// est l'articulation que le ticket demande de trancher.
+    ///
+    /// La cellule « non lue » est celle où ce vol **s'écarte** de la politique
+    /// du vol 1 : une CI non lue laisse passer, une revue non lue ne laisse pas.
+    /// L'argument est dans la docstring de [`recommend`] ; ce qui est épinglé
+    /// ici, c'est que l'écart est voulu et non une dérive.
+    #[test]
+    fn mika2968_ac7_la_matrice_de_revue_decide_la_recommandation() {
+        let coupee_mesuree =
+            crate::milestone_manager::reader::classify_head_review(&revue_2972_mesuree())
+                .expect("la revue mesurée de mika#2972 est celle du relecteur");
+        let etat_coupe = compose_head_review_state(Some(&coupee_mesuree), TETE_2972);
+        assert_eq!(
+            etat_coupe,
+            HeadReviewState::Held {
+                reason: "review".to_string(),
+                on_head: true,
+            },
+            "la revue mesurée de mika#2972 se réduit en hold[review] sur la \
+             tête : si ce n'est plus le cas, la cellule « coupée » ne teste plus \
+             rien"
+        );
+
+        let vol = FlightIssue::PrOpened {
+            number: Some(2972),
+            url: None,
+        };
+        let ouverte = lu(Some("open"));
+        let ci_verte = CiKnowledge::Read {
+            state: CiState::Success,
+            at: AU_CYCLE_DE.to_string(),
+        };
+        let lue = |etat: HeadReviewState| ReviewKnowledge::Read {
+            state: etat,
+            decision: Some("REVIEW_REQUIRED".to_string()),
+            at: AU_CYCLE_DE.to_string(),
+        };
+
+        let cellules: Vec<(&str, ReviewKnowledge, FlightRecommendation)> = vec![
+            (
+                "approuvée sur la tête",
+                lue(HeadReviewState::ApprovedOnHead),
+                FlightRecommendation::MergeCandidate,
+            ),
+            (
+                "approuvée sur un commit antérieur",
+                lue(HeadReviewState::ApprovedOnOlderCommit {
+                    reviewed: Some("0123456789abcdef".to_string()),
+                }),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                // Le commit revu n'a pas pu être lu : une tête absente ne compte
+                // pas pour une égalité, donc ce n'est pas une approbation.
+                "approuvée sur un commit non lu",
+                lue(HeadReviewState::ApprovedOnOlderCommit { reviewed: None }),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "hold[review] coupée, mesurée (#2972)",
+                lue(etat_coupe.clone()),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                // Un autre motif de hold : la décision est portée par la
+                // variante, jamais par le motif. Un motif neuf doit se décider
+                // ici plutôt que se glisser dans le bras existant.
+                "hold[ci], un autre motif",
+                lue(HeadReviewState::Held {
+                    reason: "ci".to_string(),
+                    on_head: true,
+                }),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "commentée sans verdict",
+                lue(HeadReviewState::NoVerdict { on_head: true }),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "aucune revue du relecteur",
+                lue(HeadReviewState::NoReview),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "non lue (lecture en échec)",
+                ReviewKnowledge::Unread(HeadUnreadCause::ReadFailed),
+                FlightRecommendation::ManualResumption,
+            ),
+            (
+                "non lue (non mesurée)",
+                REVUE_NON_LUE,
+                FlightRecommendation::ManualResumption,
+            ),
+        ];
+
+        assert_eq!(
+            cellules.len(),
+            9,
+            "les six états que l'AC7 nomme, plus les deux formes de \
+             `ApprovedOnOlderCommit` et la seconde cause de non-lecture"
+        );
+        assert_eq!(
+            cellules
+                .iter()
+                .filter(|(_, _, attendu)| *attendu == FlightRecommendation::MergeCandidate)
+                .count(),
+            1,
+            "une seule cellule laisse passer : c'est l'AC6 même"
+        );
+
+        for (nom, review, attendu) in &cellules {
+            assert_eq!(
+                &recommend(&vol, &ouverte, &ci_verte, review),
+                attendu,
+                "cellule « {nom} »"
+            );
+        }
+    }
+
+    /// La composition du troisième terme : ce que `compose_pr_knowledge` tire
+    /// d'une lecture, état par état. Dans **un** appel, parce que c'est une
+    /// table — et qu'une table éclatée en six tests ne dit pas qu'elle couvre
+    /// son domaine.
+    ///
+    /// La ligne qui porte la décision du vol est la dernière : une tête que la
+    /// lecture n'a pas rendue donne `Unread(ReadFailed)`, jamais un état lu. Sans
+    /// elle, une PR dont le `headRefOid` manque sortirait en merge-candidat sur
+    /// la foi d'une égalité qu'on n'a pas pu faire — et l'absence aurait valu
+    /// approbation (motif mika#2331).
+    #[test]
+    fn mika2968_ac6_la_composition_de_la_revue_etat_par_etat() {
+        let flights = [fixture_pr_opened()];
+        let compose = |head: Option<&str>, review: Option<HeadReview>| {
+            evaluate_flights(
+                &flights,
+                &[],
+                &lecture_dune_tete(2696, head, review),
+                AU_CYCLE_DE,
+            )[0]
+            .review
+            .clone()
+        };
+        let revue = |state: &str, commit: Option<&str>, hold: Option<&str>| HeadReview {
+            state: state.to_string(),
+            commit: commit.map(str::to_string),
+            submitted_at: "2026-10-29T22:42:22Z".to_string(),
+            hold_reason: hold.map(str::to_string),
+        };
+        let lue = |state: HeadReviewState| ReviewKnowledge::Read {
+            state,
+            decision: Some("REVIEW_REQUIRED".to_string()),
+            at: AU_CYCLE_DE.to_string(),
+        };
+
+        assert_eq!(
+            compose(Some(TETE_LUE), None),
+            lue(HeadReviewState::NoReview),
+            "aucune revue du relecteur : lu, et vide — ce n'est pas une non-lecture"
+        );
+        assert_eq!(
+            compose(
+                Some(TETE_LUE),
+                Some(revue("APPROVED", Some(TETE_LUE), None))
+            ),
+            lue(HeadReviewState::ApprovedOnHead),
+            "approuvée sur ce commit exact"
+        );
+        assert_eq!(
+            compose(
+                Some(TETE_LUE),
+                Some(revue("APPROVED", Some(TETE_2972), None))
+            ),
+            lue(HeadReviewState::ApprovedOnOlderCommit {
+                reviewed: Some(TETE_2972.to_string()),
+            }),
+            "approuvée, mais sur un autre commit : le commit revu est nommé"
+        );
+        assert_eq!(
+            compose(Some(TETE_LUE), Some(revue("APPROVED", None, None))),
+            lue(HeadReviewState::ApprovedOnOlderCommit { reviewed: None }),
+            "approuvée sur un commit que la lecture n'a pas rendu : une tête \
+             absente ne compte pas pour une égalité"
+        );
+        assert_eq!(
+            compose(
+                Some(TETE_LUE),
+                Some(revue("COMMENTED", Some(TETE_LUE), Some("review")))
+            ),
+            lue(HeadReviewState::Held {
+                reason: "review".to_string(),
+                on_head: true,
+            }),
+            "un `VERDICT: hold[...]` lu dans le corps porte son motif"
+        );
+        assert_eq!(
+            compose(
+                Some(TETE_LUE),
+                Some(revue("COMMENTED", Some(TETE_LUE), None))
+            ),
+            lue(HeadReviewState::NoVerdict { on_head: true }),
+            "commentée sans verdict : ce n'est ni un hold, ni une approbation"
+        );
+        assert_eq!(
+            compose(
+                Some(TETE_LUE),
+                Some(revue("CHANGES_REQUESTED", Some(TETE_2972), None))
+            ),
+            lue(HeadReviewState::NoVerdict { on_head: false }),
+            "et la place de la revue se dit même quand elle ne porte pas de verdict"
+        );
+        assert_eq!(
+            compose(None, Some(revue("APPROVED", Some(TETE_LUE), None))),
+            ReviewKnowledge::Unread(HeadUnreadCause::ReadFailed),
+            "sans tête lue, l'égalité est impossible : non lue, et pas approuvée"
+        );
+    }
+
+    /// Le contrôle négatif de la cellule qui passe : **même** vol, **même** état
+    /// de PR, **même** CI verte, seule la revue change — et elle ne change que
+    /// par le commit visé. Sans lui, la matrice resterait verte le jour où
+    /// `recommend` rendrait `ManualResumption` pour tout vol `PrOpened` : elle
+    /// attesterait la panne de l'axe, pas sa lecture.
+    #[test]
+    fn mika2968_ac6_seul_le_commit_revu_separe_les_deux_recommandations() {
+        let vol = FlightIssue::PrOpened {
+            number: Some(2972),
+            url: None,
+        };
+        let ouverte = lu(Some("open"));
+        let ci_verte = CiKnowledge::Read {
+            state: CiState::Success,
+            at: AU_CYCLE_DE.to_string(),
+        };
+        let approuvee_sur = |commit: &str| {
+            let revue = HeadReview {
+                state: "APPROVED".to_string(),
+                commit: Some(commit.to_string()),
+                submitted_at: "2026-10-30T07:14:30Z".to_string(),
+                hold_reason: None,
+            };
+            ReviewKnowledge::Read {
+                state: compose_head_review_state(Some(&revue), TETE_2972),
+                decision: Some("APPROVED".to_string()),
+                at: AU_CYCLE_DE.to_string(),
+            }
+        };
+
+        assert_eq!(
+            recommend(&vol, &ouverte, &ci_verte, &approuvee_sur(TETE_2972)),
+            FlightRecommendation::MergeCandidate
+        );
+        assert_eq!(
+            recommend(
+                &vol,
+                &ouverte,
+                &ci_verte,
+                &approuvee_sur("4ae5ec9f6a1b2c3d4e5f60718293a4b5c6d7e8f9")
+            ),
+            FlightRecommendation::ManualResumption
+        );
     }
 }

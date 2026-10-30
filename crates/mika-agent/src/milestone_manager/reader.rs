@@ -19,6 +19,7 @@ use crate::auto_pull::extract_branch_name;
 use crate::plan_callout::{FenceHandling, plan_callout};
 use crate::webhook_dispatch::READY_LABEL;
 use anyhow::{Result, anyhow};
+use mika_common::forge_identity::is_reviewer_forge_login;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -944,6 +945,10 @@ pub fn classify_ci_state(rollup: &Value) -> CiState {
 /// `state` d'abord : `CiUnreadCause::PrNotOpen` pour la première,
 /// `CiUnreadCause::ReadFailed` pour la seconde. Aucune des deux ne passe pour
 /// une CI verte.
+/// `head_oid` et `review` à `None` se lisent **exactement comme `ci`** : ils
+/// sortent du même second appel, donc ils portent la même propriété de lecture
+/// et les mêmes causes de non-lecture. C'est ce qui justifie l'alias
+/// `HeadUnreadCause = CiUnreadCause` côté composeur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightPrRead {
     /// L'état de la PR, tel que `gh` l'écrit.
@@ -951,6 +956,141 @@ pub struct FlightPrRead {
     /// L'état CI de la tête — `Some` seulement pour une PR ouverte dont le
     /// second appel a abouti.
     pub ci: Option<CiState>,
+    /// Le commit de tête (`headRefOid`), contre lequel le commit revu est
+    /// comparé. Son absence ne peut jamais compter pour une égalité.
+    pub head_oid: Option<String>,
+    /// La dernière revue du relecteur attendu — voir [`classify_head_review`].
+    pub review: Option<HeadReview>,
+    /// `reviewDecision` tel que la forge l'agrège (`APPROVED`,
+    /// `REVIEW_REQUIRED`, `CHANGES_REQUESTED`, ou vide).
+    ///
+    /// **Pour le rapport seul.** Il ne fonde aucune décision, parce qu'il ne
+    /// dit pas *sur quel commit* : une approbation sur un commit antérieur à la
+    /// tête le laisse à `APPROVED`. C'est en revanche l'information qu'un
+    /// opérateur lit sur la PR, donc le rapport la lui rend.
+    pub review_decision: Option<String>,
+}
+
+/// La **dernière** revue du relecteur attendu, par `submittedAt`
+/// (mika#2968, vol 2b).
+///
+/// Les champs sont écrits tels que `gh` les rend ; c'est [`super::evaluator`]
+/// qui en tire l'état décisionnel, lui seul comparant `commit` à `head_oid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadReview {
+    /// `APPROVED`, `COMMENTED`, `CHANGES_REQUESTED`, `DISMISSED`…
+    pub state: String,
+    /// Le commit que **cette** revue visait. Absent sur une revue que la forge
+    /// ne rattache à aucun commit.
+    pub commit: Option<String>,
+    /// L'instant de soumission, qui est aussi la clé de tri.
+    pub submitted_at: String,
+    /// Le motif d'un `VERDICT: hold[<motif>]` porté par le corps de **cette**
+    /// revue, pour le rapport.
+    ///
+    /// **La frontière décision / rapport passe ici.** La décision ne lit que
+    /// des champs structurés — `state`, l'auteur, `commit` — donc une revue
+    /// `COMMENTED` n'est jamais une approbation, quel que soit son texte. Le
+    /// corps n'est lu que pour *nommer* ce que l'opérateur verrait en ouvrant
+    /// la PR : le `hold[review]` mesuré sur mika#2972 était la seule trace du
+    /// tour coupé à 30 steps.
+    pub hold_reason: Option<String>,
+}
+
+/// Retient la dernière revue du relecteur attendu, par `submittedAt`
+/// (mika#2968, vol 2b).
+///
+/// Trois règles de lecture, chacune pour une raison qui ne se devine pas :
+///
+/// 1. **Le filtre sur l'auteur passe par
+///    [`is_reviewer_forge_login`]**, le comparateur canonique (mika#2667) — pas
+///    un huitième. La revue d'un autre auteur n'entre dans **aucune** des deux
+///    populations : ni dans l'approbation, ni dans le « aucune revue ». Elle est
+///    simplement hors sujet.
+/// 2. **Le tri est explicite.** L'ordre dans lequel `gh` rend le tableau n'est
+///    pas un contrat ; `submittedAt` est en ISO 8601 UTC à largeur fixe, donc la
+///    comparaison lexicographique est chronologique.
+/// 3. **`hold_reason` vient du corps de *cette* revue**, pas d'un balayage du
+///    tableau : un `hold` posé sur un commit antérieur ne décrit pas la tête.
+///
+/// `None` signifie « le relecteur attendu n'a posé aucune revue » — sur un
+/// tableau **lu**. Une lecture qui n'a pas eu lieu n'arrive jamais ici : elle
+/// est portée par [`RepoPrRead::Failed`] ou par l'absence du champ.
+///
+/// Pourquoi `reviews` et non `latestReviews` : mesuré le 2026-10-30 sur
+/// `senara-solutions/mika`, `latestReviews[].commit.oid` revient **vide**
+/// (`gh pr view 2972 --json latestReviews` rend une revue `APPROVED` avec
+/// `commit: ""`, et `gh pr list --json latestReviews --limit 10` rend cinq PR
+/// toutes à `commit: ""`), alors que `reviews[].commit.oid` est renseigné. Un
+/// champ qui ne porte pas le commit ne peut pas répondre à « approuvée sur la
+/// tête ? ».
+pub fn classify_head_review(reviews: &Value) -> Option<HeadReview> {
+    let arr = reviews.as_array()?;
+    arr.iter()
+        .filter(|r| {
+            r.get("author")
+                .and_then(|a| a.get("login"))
+                .and_then(|v| v.as_str())
+                .is_some_and(is_reviewer_forge_login)
+        })
+        .max_by(|a, b| {
+            let cle = |r: &Value| {
+                r.get("submittedAt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            cle(a).cmp(&cle(b))
+        })
+        .map(|r| HeadReview {
+            state: r
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            commit: r
+                .get("commit")
+                .and_then(|c| c.get("oid"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            submitted_at: r
+                .get("submittedAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            hold_reason: r
+                .get("body")
+                .and_then(|v| v.as_str())
+                .and_then(hold_reason_from_body),
+        })
+}
+
+/// Le motif d'une ligne `VERDICT: hold[<motif>]`, s'il y en a une
+/// (mika#2968, vol 2b).
+///
+/// Lecture **par ligne**, et non un `contains` sur tout le corps : une revue qui
+/// cite la forme du verdict en prose — « j'aurais dû poser `VERDICT:
+/// hold[review]` » — n'en pose pas un. Seul un `hold` compte ici : un `block[…]`
+/// ou un `pass` ne sont pas des motifs de suspension, et de toute façon aucun
+/// des deux ne change la décision, qui ne lit que `state`.
+fn hold_reason_from_body(body: &str) -> Option<String> {
+    for ligne in body.lines() {
+        let Some(reste) = ligne.trim().strip_prefix("VERDICT:") else {
+            continue;
+        };
+        let Some(motif) = reste
+            .trim()
+            .strip_prefix("hold[")
+            .and_then(|r| r.strip_suffix(']'))
+        else {
+            continue;
+        };
+        if !motif.is_empty() {
+            return Some(motif.to_string());
+        }
+    }
+    None
 }
 
 /// Ce qu'**un dépôt** a rendu à la lecture par numéro (mika#2968, vol 2a).
@@ -999,13 +1139,18 @@ pub enum RepoPrRead {
 /// `CiUnreadCause::NotFound`, « PR hors de la page lue », que le rapport épelle.
 pub const FLIGHT_PR_READ_LIMIT: usize = 100;
 
-/// Lit l'état et la CI des PR de chaque dépôt, **par numéro** et non par
-/// milestone (mika#2968, vol 2a).
+/// Lit l'état des PR de chaque dépôt et l'état de leur tête — CI et revue —,
+/// **par numéro** et non par milestone (mika#2968, vols 2a et 2b).
 ///
 /// Deux appels `gh` par dépôt, dans cet ordre :
 /// 1. `pr list --state all --json number,state` — l'état de toutes les PR ;
-/// 2. `pr list --state open --json number,statusCheckRollup` — le rollup des
-///    seules PR ouvertes, **joint au premier par le numéro**.
+/// 2. `pr list --state open --json number,statusCheckRollup,headRefOid,reviewDecision,reviews`
+///    — la tête des seules PR ouvertes, **jointe au premier par le numéro**.
+///
+/// Le vol 2b (mika#2968) n'ajoute **aucun appel** : la revue voyage dans l'appel
+/// 2, qui demandait déjà le rollup de la même tête. Le coût reste
+/// `2 × |dépôts|`, et la mesure du 2026-10-30 le chiffre à +0,45 s par dépôt
+/// (1,73 s → 2,18 s sur `senara-solutions/mika`).
 ///
 /// La jointure est volontairement un `get_mut` : une PR rendue par l'appel 2 et
 /// absente de la page de l'appel 1 — possible si plus de
@@ -1019,7 +1164,8 @@ pub const FLIGHT_PR_READ_LIMIT: usize = 100;
 /// que `ci: None` sur une PR ouverte signifie.
 ///
 /// `classify_ci_state` reste le **seul** réducteur de `statusCheckRollup` du
-/// module (mika#2201).
+/// module, et [`classify_head_review`] est le seul lecteur du tableau `reviews`
+/// (mika#2201).
 pub async fn read_flight_prs(
     runner: &dyn GhRunner,
     repos: &BTreeSet<String>,
@@ -1076,11 +1222,14 @@ async fn read_one_repo_flight_prs(runner: &dyn GhRunner, repo: &str) -> RepoPrRe
             FlightPrRead {
                 state: state.to_string(),
                 ci: None,
+                head_oid: None,
+                review: None,
+                review_decision: None,
             },
         );
     }
 
-    // Appel 2 — le rollup des seules PR ouvertes.
+    // Appel 2 — la tête des seules PR ouvertes : son rollup et sa revue.
     let rollups = runner
         .run(&[
             "pr",
@@ -1090,7 +1239,7 @@ async fn read_one_repo_flight_prs(runner: &dyn GhRunner, repo: &str) -> RepoPrRe
             "--state",
             "open",
             "--json",
-            "number,statusCheckRollup",
+            "number,statusCheckRollup,headRefOid,reviewDecision,reviews",
             "--limit",
             &limite,
         ])
@@ -1118,6 +1267,17 @@ async fn read_one_repo_flight_prs(runner: &dyn GhRunner, repo: &str) -> RepoPrRe
                     .map(classify_ci_state)
                     .unwrap_or(CiState::None),
             );
+            entry.head_oid = pr
+                .get("headRefOid")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            entry.review = pr.get("reviews").and_then(classify_head_review);
+            entry.review_decision = pr
+                .get("reviewDecision")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             ci_read += 1;
         }
     }
@@ -3654,11 +3814,75 @@ mod flight_pr_read_tests {
         .to_string()
     }
 
+    /// La revue **mesurée** de mika#2972 le 2026-10-29 à 22:42:22Z : la seule
+    /// revue de la PR, en état `COMMENTED` sur la tête `be265527`, portant le
+    /// texte moteur `VERDICT: hold[review]` — le tour de callback de mika-qa
+    /// avait atteint 30 steps d'outil sans poster de verdict
+    /// (`cut_off_max_steps`, trace `1ecce0852bb84f42b7ca8471bf7ac20c`).
+    ///
+    /// **Ne pas relire mika#2972 pour reconstituer cette fixture.** Une seconde
+    /// revue, `APPROVED`, a été posée le 2026-10-30 à 07:14:30Z sur le même
+    /// commit ; la PR ne montre donc plus l'état mesuré. Les octets ci-dessous
+    /// sont le relevé, et ils sont figés à ce titre.
+    const TETE_2972: &str = "be2655270f30db9a59b7110cad08034faeca48a8";
+
+    fn revue_2972_mesuree() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "author": { "login": "mika-platform-qa" },
+                "state": "COMMENTED",
+                "submittedAt": "2026-10-29T22:42:22Z",
+                "commit": { "oid": TETE_2972 },
+                "body": "Le tour de revue n'a pas conclu.\n\nVERDICT: hold[review]\n"
+            }
+        ])
+    }
+
     fn rollups_mesures() -> String {
         serde_json::json!([
-            { "number": 2966, "statusCheckRollup": rollup_2966_mesure() }
+            {
+                "number": 2966,
+                "statusCheckRollup": rollup_2966_mesure(),
+                "headRefOid": "b972dd2e",
+                "reviewDecision": "REVIEW_REQUIRED",
+                "reviews": []
+            }
         ])
         .to_string()
+    }
+
+    /// L'appel 2 d'une seule PR ouverte, dont la tête et les revues sont
+    /// passées telles quelles.
+    fn tete(numero: u64, head_oid: &str, decision: &str, reviews: serde_json::Value) -> String {
+        serde_json::json!([
+            {
+                "number": numero,
+                "statusCheckRollup": [
+                    { "name": "Check", "status": "COMPLETED", "conclusion": "SUCCESS" }
+                ],
+                "headRefOid": head_oid,
+                "reviewDecision": decision,
+                "reviews": reviews
+            }
+        ])
+        .to_string()
+    }
+
+    fn etat_ouvert(numero: u64) -> String {
+        serde_json::json!([{ "number": numero, "state": "OPEN" }]).to_string()
+    }
+
+    /// La revue lue d'une PR ouverte unique, grée par [`tete`].
+    async fn revue_lue(numero: u64, head_oid: &str, reviews: serde_json::Value) -> FlightPrRead {
+        let runner = un_depot(
+            Some(etat_ouvert(numero)),
+            Some(tete(numero, head_oid, "REVIEW_REQUIRED", reviews)),
+        );
+        let reads = read_flight_prs(&runner, &cibles()).await;
+        lu(&reads, DEPOT)
+            .get(&numero)
+            .cloned()
+            .expect("la PR ouverte est lue")
     }
 
     fn un_depot(etats: Option<String>, rollups: Option<String>) -> RecordingFlightPrRunner {
@@ -3739,12 +3963,227 @@ mod flight_pr_read_tests {
                 "--state",
                 "open",
                 "--json",
-                "number,statusCheckRollup",
+                "number,statusCheckRollup,headRefOid,reviewDecision,reviews",
                 "--limit",
                 "100"
             ],
-            "appel 2 : le rollup des **seules** PR ouvertes"
+            "appel 2 : la tête des **seules** PR ouvertes — rollup et revue dans \
+             le même appel, et c'est la propriété que ce vecteur épingle : un \
+             second appel `gh` pour les revues doublerait un coût que la borne \
+             nommée prétend contenir"
         );
+    }
+
+    /// Une approbation du relecteur attendu **sur la tête** est lue comme
+    /// telle, et le commit revu traverse intact jusqu'au composeur.
+    #[tokio::test]
+    async fn mika2968_une_approbation_sur_la_tete_est_lue_avec_son_commit() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T07:14:30Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: pass\n"
+                }
+            ]),
+        )
+        .await;
+
+        assert_eq!(pr.head_oid.as_deref(), Some(TETE_2972));
+        let revue = pr.review.expect("la revue du relecteur attendu est lue");
+        assert_eq!(revue.state, "APPROVED");
+        assert_eq!(revue.commit.as_deref(), Some(TETE_2972));
+        assert_eq!(revue.submitted_at, "2026-10-30T07:14:30Z");
+        assert_eq!(
+            revue.hold_reason, None,
+            "un `pass` n'est pas un `hold` : le motif reste absent"
+        );
+        assert_eq!(pr.review_decision.as_deref(), Some("REVIEW_REQUIRED"));
+    }
+
+    /// La revue mesurée de mika#2972 : `COMMENTED` + `VERDICT: hold[review]`.
+    ///
+    /// Les deux assertions portent la frontière décision / rapport : l'état
+    /// reste `COMMENTED` — donc la décision n'y verra jamais une approbation,
+    /// quel que soit le texte — et le motif est extrait pour le rapport seul.
+    #[tokio::test]
+    async fn mika2968_la_revue_coupee_de_2972_garde_son_etat_et_rend_son_motif() {
+        let pr = revue_lue(2972, TETE_2972, revue_2972_mesuree()).await;
+
+        let revue = pr.review.expect("la revue mesurée est lue");
+        assert_eq!(
+            revue.state, "COMMENTED",
+            "la revue mesurée n'approuve pas : si cela change, le cas « coupée » \
+             ne teste plus rien"
+        );
+        assert_eq!(revue.commit.as_deref(), Some(TETE_2972));
+        assert_eq!(
+            revue.hold_reason.as_deref(),
+            Some("review"),
+            "le motif du `VERDICT: hold[review]` est extrait pour le rapport"
+        );
+    }
+
+    /// Une revue d'un autre auteur n'entre dans **aucune** des deux
+    /// populations.
+    ///
+    /// Contrôle négatif du filtre : sans lui, l'approbation d'un tiers — un
+    /// humain de passage, un bot de la forge — passerait pour celle du
+    /// relecteur attendu. Ici l'approbation du tiers est la **plus récente**,
+    /// donc un tri sans filtre la retiendrait.
+    #[tokio::test]
+    async fn mika2968_une_revue_dun_autre_auteur_nest_pas_celle_du_relecteur() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-10-29T22:42:22Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: hold[review]\n"
+                },
+                {
+                    "author": { "login": "quelquun-dautre" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T09:00:00Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "LGTM\n"
+                }
+            ]),
+        )
+        .await;
+
+        let revue = pr.review.expect("la revue du relecteur attendu est lue");
+        assert_eq!(
+            revue.state, "COMMENTED",
+            "l'approbation du tiers, pourtant plus récente, n'est pas retenue"
+        );
+        assert_eq!(revue.submitted_at, "2026-10-29T22:42:22Z");
+    }
+
+    /// Le tri est sur `submittedAt`, pas sur l'ordre rendu.
+    ///
+    /// Le tableau est volontairement servi à l'envers : la plus récente en
+    /// premier n'est pas la première du tableau.
+    #[tokio::test]
+    async fn mika2968_la_derniere_revue_est_celle_du_dernier_submitted_at() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T07:14:30Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: pass\n"
+                },
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-10-29T22:42:22Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: hold[review]\n"
+                }
+            ]),
+        )
+        .await;
+
+        let revue = pr.review.expect("une revue est retenue");
+        assert_eq!(
+            revue.state, "APPROVED",
+            "la plus récente par `submittedAt` gagne, quel que soit l'ordre rendu"
+        );
+    }
+
+    /// Un `commit.oid` vide n'est pas un commit.
+    ///
+    /// C'est l'octet mesuré de `latestReviews` le 2026-10-30 — `commit: ""` sur
+    /// cinq PR sur cinq. S'il arrivait quand même par `reviews`, le composeur
+    /// doit le voir absent : une chaîne vide comparée à une tête absente serait
+    /// une égalité, donc une approbation inventée.
+    #[tokio::test]
+    async fn mika2968_un_commit_vide_nest_pas_un_commit() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T07:14:30Z",
+                    "commit": { "oid": "" },
+                    "body": ""
+                }
+            ]),
+        )
+        .await;
+
+        assert_eq!(pr.review.expect("la revue est lue").commit, None);
+    }
+
+    /// Aucune revue du relecteur attendu : `None` sur un tableau **lu**.
+    ///
+    /// Le tableau vide est la réponse de la forge, pas une lecture manquée —
+    /// c'est la même distinction que celle de [`RepoPrRead`], un rang plus bas.
+    #[tokio::test]
+    async fn mika2968_un_tableau_de_revues_vide_est_lu_et_ne_rend_aucune_revue() {
+        let pr = revue_lue(2972, TETE_2972, serde_json::json!([])).await;
+        assert_eq!(pr.review, None);
+        assert_eq!(
+            pr.head_oid.as_deref(),
+            Some(TETE_2972),
+            "la tête reste lue : « aucune revue » n'est pas « rien n'est lu »"
+        );
+    }
+
+    /// L'appel 2 en échec laisse la revue et la tête non lues, comme la CI.
+    #[tokio::test]
+    async fn mika2968_un_second_appel_en_echec_laisse_la_revue_non_lue() {
+        let runner = un_depot(Some(etats_mesures()), None);
+        let reads = read_flight_prs(&runner, &cibles()).await;
+        let map = lu(&reads, DEPOT);
+        assert!(
+            map.values()
+                .all(|p| p.review.is_none() && p.head_oid.is_none()),
+            "les trois axes de la tête tombent ensemble : {map:?}"
+        );
+    }
+
+    /// Le `VERDICT:` n'est reconnu qu'en tête de ligne.
+    ///
+    /// Une revue qui *cite* la forme du verdict en prose n'en pose pas un —
+    /// c'est exactement le texte qu'un relecteur écrit en expliquant ce qu'il
+    /// aurait dû poser.
+    #[test]
+    fn mika2968_un_verdict_cite_en_prose_nest_pas_un_motif() {
+        assert_eq!(
+            hold_reason_from_body("VERDICT: hold[ci]\n"),
+            Some("ci".to_string())
+        );
+        assert_eq!(
+            hold_reason_from_body("  VERDICT: hold[review]  \n"),
+            Some("review".to_string()),
+            "l'indentation et la queue de ligne sont tolérées"
+        );
+        assert_eq!(
+            hold_reason_from_body("j'aurais dû poser VERDICT: hold[review] ici\n"),
+            None,
+            "cité au milieu d'une phrase : ce n'est pas une ligne de verdict"
+        );
+        assert_eq!(
+            hold_reason_from_body("VERDICT: pass\n"),
+            None,
+            "un `pass` n'est pas un motif de suspension"
+        );
+        assert_eq!(hold_reason_from_body("VERDICT: block[ac]\n"), None);
+        assert_eq!(hold_reason_from_body("VERDICT: hold[]\n"), None);
     }
 
     /// L'appel 1 en échec rend `Failed` pour ce dépôt — et **seulement** pour
