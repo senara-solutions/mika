@@ -144,6 +144,36 @@ pub enum PrStateKnowledge {
     NotRead,
 }
 
+/// Ce que le manager **sait** de l'appartenance du vol au milestone cible
+/// (mika#2968, vol 2a).
+///
+/// Un troisième axe de connaissance, et il est né d'un **découplage** : jusqu'ici
+/// le rapport lisait l'appartenance dans [`PrStateKnowledge`], parce que les deux
+/// faits avaient une source unique — le `Reader` n'hydratait que les sous-issues
+/// du milestone cible, donc un appariement réussi disait les deux à la fois. Le
+/// vol 2a casse cette équivalence : `pr_state` vient désormais d'une lecture
+/// **par numéro de PR**, qui ignore le milestone. Garder un seul champ ferait
+/// dire « hors milestone cible » à un vol dont la PR a été lue par l'autre porte,
+/// et « milestone cible » à un vol simplement lu — deux populations sous un nom
+/// (classe mika#2205).
+///
+/// `NotRead` est le défaut à la désérialisation : un blob de rapport antérieur à
+/// ce champ ne porte aucune lecture d'appartenance, et c'est exactement ce que
+/// cette variante dit — jamais `OutOfTarget`, qui serait une mesure inventée
+/// (motif mika#2340).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MilestoneMembership {
+    /// Le ticket du vol est apparié à une sous-issue du milestone cible.
+    InTarget,
+    /// Le ticket du vol n'est apparié à **aucune** sous-issue du milestone
+    /// cible — l'appariement a eu lieu et a échoué.
+    OutOfTarget,
+    /// L'appartenance n'a pas été lue (défaut serde).
+    #[default]
+    NotRead,
+}
+
 /// Ce que le manager **sait** de la CI de la tête de la PR d'un vol (mika#2968).
 ///
 /// Même forme et même raison que [`PrStateKnowledge`], sur un autre axe : la CI
@@ -266,6 +296,14 @@ pub struct FlightVerdict {
     /// variante par défaut dit.
     #[serde(default)]
     pub pr_state: PrStateKnowledge,
+    /// Ce que le manager sait de l'appartenance du vol au **milestone cible**
+    /// (mika#2968, vol 2a) — le fait que `pr_state` portait jusqu'ici par
+    /// accident de provenance.
+    ///
+    /// `#[serde(default)]` ⇒ [`MilestoneMembership::NotRead`], même raison que
+    /// `pr_state`.
+    #[serde(default)]
+    pub in_target_milestone: MilestoneMembership,
     /// Ce que le manager sait de la CI de la tête de la PR (mika#2968) — lue à
     /// un instant nommé, ou non lue pour une cause nommée.
     ///
@@ -386,6 +424,15 @@ pub fn evaluate_flights(
         .map(|f| {
             let issue_number = issue_number_from_url(f.reference_url.as_deref());
             let matched = issue_number.and_then(|n| sub_issues.iter().find(|s| s.number == n));
+            // L'appartenance au milestone cible est désormais **son propre**
+            // champ (mika#2968, vol 2a). Ici elle reste équivalente à l'ancien
+            // `Read(_)` — `InTarget` ⟺ appariement réussi — donc le rendu ne
+            // change pas : c'est le découplage seul, sans la nouvelle porte.
+            let in_target_milestone = match (issue_number, matched) {
+                (None, _) => MilestoneMembership::NotRead,
+                (Some(_), None) => MilestoneMembership::OutOfTarget,
+                (Some(_), Some(_)) => MilestoneMembership::InTarget,
+            };
             // L'échec d'appariement n'est pas « pas d'état » : c'est « pas lu ».
             let pr_state = match matched {
                 Some(s) => PrStateKnowledge::Read(s.pr_state.clone()),
@@ -412,7 +459,7 @@ pub fn evaluate_flights(
                     _ => CiKnowledge::Unread(CiUnreadCause::NotFromPrList),
                 },
             };
-            evaluate_flight(f, issue_number, &pr_state, &ci)
+            evaluate_flight(f, issue_number, &pr_state, &ci, in_target_milestone)
         })
         .collect()
 }
@@ -426,11 +473,18 @@ pub fn evaluate_flights(
 /// `ci` est ce qu'il sait de la CI de la tête de cette PR (mika#2968) — lue à un
 /// instant nommé, ou non lue pour une cause nommée. L'appelant la **compose**,
 /// ce qui garde la provenance hors de cette fonction.
+///
+/// `in_target_milestone` suit la même règle, et c'est pourquoi c'est un
+/// paramètre plutôt qu'une dérivation de `pr_state` : depuis le vol 2a de
+/// mika#2968 les deux faits n'ont plus la même source, et les recoller ici
+/// rendrait le découplage inopérant au premier appelant qui l'oublie. Le
+/// compilateur exige donc que chaque site **nomme** ce qu'il sait.
 pub fn evaluate_flight(
     flight: &FinishedFlight,
     issue_number: Option<u64>,
     pr_state: &PrStateKnowledge,
     ci: &CiKnowledge,
+    in_target_milestone: MilestoneMembership,
 ) -> FlightVerdict {
     let result = flight.result.as_deref().unwrap_or("");
     let pilot = PilotFields::parse(flight.metadata.as_deref());
@@ -441,6 +495,7 @@ pub fn evaluate_flight(
         issue_number,
         recommendation: recommend(&issue, pr_state, ci),
         pr_state: pr_state.clone(),
+        in_target_milestone,
         ci: ci.clone(),
         issue,
         turns_used: pilot.turns.or_else(|| {
@@ -853,6 +908,12 @@ mod tests {
     /// défaut changerait.
     const CI_NON_LUE: CiKnowledge = CiKnowledge::Unread(CiUnreadCause::NotMeasured);
 
+    /// « L'appartenance au milestone n'a pas été lue » (mika#2968, vol 2a) — la
+    /// connaissance que portent les appels directs à [`evaluate_flight`] sans
+    /// numéro de ticket, où aucun appariement n'a pu avoir lieu. Écrite ici pour
+    /// la même raison que [`CI_NON_LUE`].
+    const CIBLE_NON_LUE: MilestoneMembership = MilestoneMembership::NotRead;
+
     /// L'instant du cycle qui date la lecture CI. Les sous-tickets de ce module
     /// portent `pr_link_source: None`, donc aucune CI n'y est lue et cet
     /// instant n'entre dans aucune assertion — il existe pour que l'appel reste
@@ -936,7 +997,13 @@ mod tests {
             fixture_rescue_pr(),
             fixture_dead_at_ceiling(),
         ] {
-            let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE);
+            let v = evaluate_flight(
+                &f,
+                None,
+                &PrStateKnowledge::NotRead,
+                &CI_NON_LUE,
+                CIBLE_NON_LUE,
+            );
             assert_eq!(v.turn_ceiling, None, "{}", f.task_id);
             assert_eq!(v.last_commit_turn, None, "{}", f.task_id);
         }
@@ -948,7 +1015,7 @@ mod tests {
     fn mika2698_les_tours_retombent_sur_la_ligne_turns_sans_metadata() {
         let mut f = fixture_pr_opened();
         f.metadata = None;
-        let v = evaluate_flight(&f, None, &lu(Some("open")), &CI_NON_LUE);
+        let v = evaluate_flight(&f, None, &lu(Some("open")), &CI_NON_LUE, CIBLE_NON_LUE);
         assert_eq!(
             v.turns_used,
             Some(83),
@@ -970,7 +1037,14 @@ mod tests {
         f.metadata = Some(r#"{"claude_pilot":{}}"#.to_string());
         f.result = Some("Turns: unknown\nOutcome: PR_OPENED — x\n".to_string());
         assert_eq!(
-            evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE).turns_used,
+            evaluate_flight(
+                &f,
+                None,
+                &PrStateKnowledge::NotRead,
+                &CI_NON_LUE,
+                CIBLE_NON_LUE
+            )
+            .turns_used,
             None
         );
     }
@@ -986,7 +1060,14 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE).turns_used,
+            evaluate_flight(
+                &f,
+                None,
+                &PrStateKnowledge::NotRead,
+                &CI_NON_LUE,
+                CIBLE_NON_LUE
+            )
+            .turns_used,
             Some(200)
         );
     }
@@ -1001,7 +1082,13 @@ mod tests {
             result: Some(result.to_string()),
             ..Default::default()
         };
-        evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE)
+        evaluate_flight(
+            &f,
+            None,
+            &PrStateKnowledge::NotRead,
+            &CI_NON_LUE,
+            CIBLE_NON_LUE,
+        )
     }
 
     fn dead_cause_of(result: &str) -> DeathCause {
@@ -1071,7 +1158,13 @@ mod tests {
             task_id: "t".to_string(),
             ..Default::default()
         };
-        let v = evaluate_flight(&f, None, &PrStateKnowledge::NotRead, &CI_NON_LUE);
+        let v = evaluate_flight(
+            &f,
+            None,
+            &PrStateKnowledge::NotRead,
+            &CI_NON_LUE,
+            CIBLE_NON_LUE,
+        );
         assert_eq!(
             v.issue,
             FlightIssue::Dead {
@@ -1095,7 +1188,13 @@ mod tests {
              Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n"
                 .to_string(),
         );
-        let v = evaluate_flight(&f, Some(2655), &lu(Some("open")), &CI_NON_LUE);
+        let v = evaluate_flight(
+            &f,
+            Some(2655),
+            &lu(Some("open")),
+            &CI_NON_LUE,
+            MilestoneMembership::InTarget,
+        );
         assert!(v.hit_ceiling);
         assert!(matches!(v.issue, FlightIssue::RescuePr { .. }));
         assert_eq!(v.recommendation, FlightRecommendation::ManualResumption);
@@ -1213,6 +1312,7 @@ mod tests {
             None,
             &PrStateKnowledge::NotRead,
             &CI_NON_LUE,
+            CIBLE_NON_LUE,
         );
         assert!(
             matches!(nominal.issue, FlightIssue::PrOpened { .. }),

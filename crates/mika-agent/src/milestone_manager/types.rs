@@ -706,7 +706,7 @@ mod tests {
     fn mika2698_un_verdict_fait_laller_retour() {
         use super::super::evaluator::{
             CiKnowledge, CiUnreadCause, DeathCause, FlightIssue, FlightRecommendation,
-            FlightVerdict, PrStateKnowledge,
+            FlightVerdict, MilestoneMembership, PrStateKnowledge,
         };
         let v = FlightVerdict {
             task_id: "t".into(),
@@ -720,6 +720,7 @@ mod tests {
             turn_ceiling: None,
             last_commit_turn: None,
             pr_state: PrStateKnowledge::NotRead,
+            in_target_milestone: MilestoneMembership::OutOfTarget,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             recommendation: FlightRecommendation::Regroom,
             completed_at: Some("2026-10-13T10:00:00Z".into()),

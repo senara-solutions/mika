@@ -310,7 +310,7 @@ pub use cadence::{
 };
 pub use evaluator::{
     DeathCause, FinishedFlight, FlightIssue, FlightRecommendation, FlightSource, FlightVerdict,
-    PrStateKnowledge, evaluate_flight, evaluate_flights, milestone_issue_urls,
+    MilestoneMembership, PrStateKnowledge, evaluate_flight, evaluate_flights, milestone_issue_urls,
 };
 pub use groom_trigger::{
     A2aGroomSender, ENV_GROOM_WRITE, GROOMS_PER_CYCLE, GroomCandidate, GroomSendError, GroomSender,
