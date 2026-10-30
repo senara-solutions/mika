@@ -75,6 +75,19 @@ pub enum TargetKind {
     EscalationUnsetFallback,
 }
 
+/// Cette valeur est-elle une route P0 utilisable ? (mika#2871)
+///
+/// Extrait de [`GatewayMessageSender::resolve_notification_target`] pour que la
+/// garde de démarrage et le transport posent *la même* question. `Some(0)` est
+/// faux : voir la doc de `resolve_notification_target` — c'est le sentinelle
+/// « aucun canal de réponse » (mika#650/#1090), donc un chat d'escalade à `0`
+/// retombe sur le chat normal exactement comme une variable absente. Une garde
+/// qui ne testerait que `is_none()` serait verte sur cette configuration, et la
+/// notification d'opérateur partirait chez l'utilisateur final.
+pub(crate) fn p0_route_is_usable(escalation_chat_id: Option<i64>) -> bool {
+    matches!(escalation_chat_id, Some(id) if id != 0)
+}
+
 /// Trait for sending outbound messages to the user.
 /// CLI mode uses the fallback in send_message tool; HTTP mode will POST to the gateway.
 ///
@@ -206,7 +219,10 @@ impl GatewayMessageSender {
     /// `Some(0)` is refused as a route: `chat_id == 0` is the documented
     /// "no reply channel" sentinel that `send()` short-circuits on before any
     /// POST (mika#650/#1090), so an escalation chat set to `0` would swallow
-    /// every P0 silently — the exact failure mode mika#1381 closes.
+    /// every P0 silently — the exact failure mode mika#1381 closes. Depuis
+    /// mika#2871 ce refus est porté par [`p0_route_is_usable`], que la garde de
+    /// démarrage lit aussi — une seconde écriture du prédicat serait libre de
+    /// divergir en silence.
     fn resolve_notification_target(
         &self,
         severity: NotificationSeverity,
@@ -214,10 +230,16 @@ impl GatewayMessageSender {
     ) -> (i64, TargetKind) {
         match severity {
             NotificationSeverity::P2 => (normal_chat_id, TargetKind::Normal),
-            NotificationSeverity::P0 => match self.escalation_chat_id {
-                Some(id) if id != 0 => (id, TargetKind::Escalation),
-                _ => (normal_chat_id, TargetKind::EscalationUnsetFallback),
-            },
+            NotificationSeverity::P0 => {
+                if p0_route_is_usable(self.escalation_chat_id) {
+                    (
+                        self.escalation_chat_id.unwrap_or(normal_chat_id),
+                        TargetKind::Escalation,
+                    )
+                } else {
+                    (normal_chat_id, TargetKind::EscalationUnsetFallback)
+                }
+            }
         }
     }
 
