@@ -192,6 +192,40 @@ impl Reporter {
             "- Progress: {}/{} sub-issues complete ({}% done)",
             state.progress.completed, state.progress.total, pct
         );
+        // Ce que la lecture du milestone a rendu, face à sa borne et au compte
+        // de l'API (mika#2969). Juste sous la progression, parce que c'est la
+        // progression que la troncature fausse : un ticket sorti de la page ne
+        // compte plus dans le dénominateur, et rien ne le disait.
+        //
+        // La borne épelée est celle que **l'audit transporte**, jamais la
+        // constante : un blob du puits hors-ligne doit se relire avec la borne
+        // qui l'a produit. `None` ne dit rien du tout — ni « complète » ni
+        // « tronquée » —, parce que « la question n'a pas été posée » n'est pas
+        // une mesure (mika#2331), et parce que c'est « complète » qui serait ici
+        // l'affirmation dangereuse.
+        //
+        // Le compte de l'API est dit avec sa **magnitude nommée** : il compte
+        // les items du milestone, PR comprises, là où la lecture ne rend que des
+        // issues. Les deux nombres ne sont pas égalisables et n'ont pas à
+        // l'être — 192 contre 117 sur le #33 au 2026-10-29, l'écart valant ses
+        // 75 PR. Le signal de complétude est le mot « complète », exact par
+        // construction ; l'écart, lui, est de la classe mika#2205 et n'a aucun
+        // pouvoir de détection.
+        if let Some(audit) = &state.milestone_read_audit {
+            if audit.truncated() {
+                let _ = writeln!(
+                    out,
+                    "- Lecture du milestone TRONQUÉE à {} tickets — des tickets du #{} sont hors de ce rapport, de sa progression et de son bassin (API du milestone : {} items, PR comprises)",
+                    audit.limit, state.milestone_ref.number, audit.api_item_total,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "- Lecture du milestone : {} tickets lus, borne {} — complète (API du milestone : {} items, PR comprises — autre population, mika#2969)",
+                    audit.returned, audit.limit, audit.api_item_total,
+                );
+            }
+        }
         // Section ordering: Completed → In-flight → Blocked → Unstarted.
         // See module docstring for the load-bearing rationale (mika#1933 F2, Prime bearing).
         write_completed(&mut out, &state.sub_issues, &state.milestone_ref.repo);
@@ -934,7 +968,7 @@ mod tests {
     use crate::milestone_manager::reader::compose_from_gh_outputs;
     use crate::milestone_manager::relief::name_relief;
     use crate::milestone_manager::types::{
-        ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
+        ContentionEvent, MilestoneReadAudit, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
     };
 
     /// Les candidats du milestone tels que l'assesseur les projette. Les tests
@@ -987,6 +1021,7 @@ mod tests {
             outside_candidates: vec![],
             outside_read_truncated: None,
             plan_sizes: Default::default(),
+            milestone_read_audit: None,
         }
     }
 
@@ -2292,6 +2327,97 @@ mod tests {
         assert!(
             !nominal.contains("tronquée"),
             "une lecture complète ne se commente pas :\n{nominal}"
+        );
+    }
+
+    // -- mika#2969 : la lecture du milestone se dit, complète ou tronquée -----
+
+    /// **T4** — une lecture du milestone tronquée se déclare, et les tickets
+    /// déjà lus restent **au rapport**.
+    ///
+    /// La deuxième moitié porte la décision du vol. Sur une page pleine,
+    /// `outside_candidates` est vidée (mika#2699) ; `sub_issues` ne l'est pas,
+    /// et ce n'est pas une inconséquence. La lecture du milestone est une
+    /// **énumération** : partielle, elle informe encore — les 1000 tickets lus
+    /// sont vrais. La lecture hors milestone est un **classement** : partiel, il
+    /// répond faux, parce qu'il présenterait le meilleur de la page comme le
+    /// meilleur du dépôt. On rapporte, on ne refuse pas.
+    ///
+    /// La ligne nomme aussi les trois surfaces que la troncature atteint —
+    /// rapport, progression, bassin : c'est par là que mika#2969 s'est vu, un
+    /// #1727 ouvert du #33 rapporté « hors milestone ».
+    #[test]
+    fn mika2969_une_lecture_du_milestone_tronquee_se_declare_sans_jeter_le_lu() {
+        let subs = vec![base_issue(1721), base_issue(1727)];
+        let mut state = state_with(
+            subs,
+            ProgressCounts {
+                total: 2,
+                unstarted: 2,
+                ..Default::default()
+            },
+        );
+        state.milestone_read_audit = Some(MilestoneReadAudit {
+            returned: 1000,
+            limit: 1000,
+            api_item_total: 1200,
+        });
+        let out = Reporter::new().report(&state, &empty_assessment());
+
+        assert!(
+            out.contains(
+                "- Lecture du milestone TRONQUÉE à 1000 tickets — des tickets du #1799 \
+                 sont hors de ce rapport, de sa progression et de son bassin \
+                 (API du milestone : 1200 items, PR comprises)"
+            ),
+            "la troncature se dit, avec la borne demandée et ce qu'elle emporte :\n{out}"
+        );
+        assert!(
+            out.contains("#1721") && out.contains("#1727"),
+            "une énumération tronquée reste une énumération : ce qui a été lu se \
+             rapporte :\n{out}"
+        );
+
+        // Page non pleine : la lecture se dit **complète**, et c'est ce mot-là
+        // que l'opérateur lit — jamais l'égalité des deux comptes, qui ne peut
+        // pas tomber juste (classe mika#2205 : l'API compte les PR aussi).
+        state.milestone_read_audit = Some(MilestoneReadAudit {
+            returned: 117,
+            limit: 1000,
+            api_item_total: 192,
+        });
+        let complete = Reporter::new().report(&state, &empty_assessment());
+        assert!(
+            complete.contains(
+                "- Lecture du milestone : 117 tickets lus, borne 1000 — complète \
+                 (API du milestone : 192 items, PR comprises — autre population, mika#2969)"
+            ),
+            "une lecture complète dit son compte, sa borne et le mot « complète » :\n{complete}"
+        );
+        assert!(
+            !complete.contains("TRONQUÉE"),
+            "117 pour une borne de 1000 n'est pas une troncature :\n{complete}"
+        );
+    }
+
+    /// **T5** — un audit absent ne fait dire **rien**.
+    ///
+    /// `None` veut dire « la question n'a pas été posée » : blob du puits
+    /// hors-ligne antérieur au champ, ou binaire antérieur à ce vol (mika#2331,
+    /// mika#2340). Ni « complète » ni « tronquée » — les deux affirmeraient une
+    /// mesure qui n'a pas eu lieu, et « complète » serait l'affirmation
+    /// dangereuse : c'est précisément le défaut que ce vol répare.
+    #[test]
+    fn mika2969_un_audit_absent_ne_fait_dire_ni_complete_ni_tronquee() {
+        let state = state_with(vec![], ProgressCounts::default());
+        assert!(
+            state.milestone_read_audit.is_none(),
+            "le helper doit partir d'un audit non posé"
+        );
+        let out = Reporter::new().report(&state, &empty_assessment());
+        assert!(
+            !out.contains("Lecture du milestone"),
+            "sans audit, le rapport se tait plutôt que de dire faux :\n{out}"
         );
     }
 

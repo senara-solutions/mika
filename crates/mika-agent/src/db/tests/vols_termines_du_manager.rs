@@ -884,6 +884,7 @@ fn rapport(
         outside_candidates: vec![],
         outside_read_truncated: None,
         plan_sizes: Default::default(),
+        milestone_read_audit: None,
     };
     let assessment = Assessment {
         severity: Severity::Healthy,

@@ -343,9 +343,9 @@ pub use spawn::{
     spawn_manager_cycle_task,
 };
 pub use types::{
-    Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MergedPrReading, MilestoneRef,
-    MilestoneState, PrLinkSource, ProgressCounts, RecentActivity, Recommendation, Severity,
-    SubIssue,
+    Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MergedPrReading,
+    MilestoneReadAudit, MilestoneRef, MilestoneState, PrLinkSource, ProgressCounts, RecentActivity,
+    Recommendation, Severity, SubIssue,
 };
 pub use verdict_poster::{
     ENV_EVALUATE_WRITE, MARKER_PREFIX, post_verdicts, render_verdict_comment, verdict_marker,

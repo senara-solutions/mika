@@ -1509,6 +1509,7 @@ mod tests {
             outside_candidates: vec![],
             outside_read_truncated: None,
             plan_sizes: Default::default(),
+            milestone_read_audit: None,
         };
         assert_eq!(
             milestone_issue_urls(&state),

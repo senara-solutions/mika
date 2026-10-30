@@ -370,4 +370,90 @@ blast radius (the loop freezes mid-cycle, in steady state), different remedy
 `gh api /milestones/N` and `gh pr list --limit 100 --search`, nor the CLI paths
 where an operator is waiting. That is its own ticket.
 
+### La lecture du milestone a une borne nommée, et elle se dit (mika#2969)
+
+Le reader lisait les tickets de son milestone en une page de 100, écrite en
+littéral, et **rien ne signalait qu'il en manquait**. Au-delà de 100 tickets les
+plus anciens sortaient de `MilestoneState::sub_issues` sans laisser de trace : ni
+dans le rapport, ni dans le digest d'état, ni dans le bassin. Mesuré le
+2026-10-29 sur le milestone 33 (`open_issues=13`, `closed_issues=178`) : 100
+tickets rendus, le plus petit numéro `#2034`, et **deux tickets ouverts du
+milestone** — `#1721` et `#1727` — lus par la lecture « outside » du reader,
+donc rapportés « hors milestone ». Le défaut grandissait avec le milestone :
+chaque ticket ajouté en poussait un autre dehors. La lecture « outside », juste
+après dans la même fonction, avait déjà les trois éléments qui manquaient ici —
+borne nommée, détection de page pleine, `outside_read_truncated` au rapport.
+
+**Une borne nommée, pas une pagination — et la mesure qui tranche.**
+`reader.rs::MILESTONE_READ_LIMIT = 1000`, sœur d'`OUTSIDE_READ_LIMIT`. Mesuré le
+2026-10-29 sur le milestone 33 : `--limit 100` rend 100 tickets en ≈2,5 s pour
+**1** appel `gh` ; `--limit 1000` rend les 117 issues en 2,6–3,0 s pour **1**
+appel `gh` — `gh issue list` pagine en interne, une invocation quel que soit
+`N`. Le coût est donc de **zéro appel `gh` de plus par cycle** et ≈0,1–0,5 s, là
+où une pagination écrite à la main coûterait un appel par page et un curseur à
+tenir (même protocole de mesure que mika#2924, sur le même appel). 1000 vaut
+≈8,5× le plus gros milestone du dépôt aujourd'hui. **Mais une borne n'est pas une
+pagination : elle peut être atteinte**, et c'est pourquoi elle est dite quand
+elle l'est.
+
+**Le prédicat est dérivé, jamais stocké.** `MilestoneReadAudit`
+(`types.rs`) porte trois nombres — `returned`, `limit`, `api_item_total` — et
+`truncated()` est une **méthode** : `returned >= limit`. Un booléen stocké peut
+mentir sur son propre blob ; une page pleine est une page pleine. Un seul champ
+sur `MilestoneState`, `milestone_read_audit: Option<MilestoneReadAudit>`, parce
+que les trois nombres ne se lisent qu'ensemble. `None` veut dire **« la question
+n'a pas été posée »** — un blob du puits hors-ligne écrit avant ce vol — et
+jamais « la lecture est complète » (motif mika#2331, mika#2340).
+
+**Sur une page pleine, `sub_issues` n'est pas vidée**, contrairement à
+`outside_candidates` sous sa propre borne : une énumération partielle informe
+encore, un classement partiel répond faux. La recommandation du bassin n'est pas
+changée non plus — hors périmètre, nommé.
+
+**Comment lire la ligne du rapport.** Une ligne sous `- Progress:`, parce que
+c'est la progression que la troncature fausse. Trois états, un seul site
+(`reporter.rs`) :
+
+| ce que le rapport dit | ce que ça veut dire |
+|---|---|
+| `- Lecture du milestone : 117 tickets lus, borne 1000 — complète (API du milestone : 192 items, PR comprises — autre population, mika#2969)` | nominal. Le signal de complétude est le **mot « complète »**, exact par construction. |
+| `- Lecture du milestone TRONQUÉE à 1000 tickets — des tickets du #33 sont hors de ce rapport, de sa progression et de son bassin (API du milestone : 192 items, PR comprises)` | la borne est atteinte. Le rapport, la progression **et** le bassin sont incomplets, tous les trois nommés. |
+| *rien* | l'audit est absent : binaire antérieur à ce vol. **Jamais « la lecture est bonne ».** |
+
+La borne épelée est celle que l'**audit transporte**, jamais la constante : un
+blob du puits se relit avec la borne qui l'a produit.
+
+**Correction de la prémisse d'AC3, qui change ce qu'il faut lire.** Le ticket
+demandait que le compte lu soit dit « à côté du compte de l'API du milestone
+(`open_issues + closed_issues`) », avec « un écart entre les deux » visible au
+rapport. Les deux comptes ne sont **pas égalisables et n'ont pas à l'être** :
+`open_issues + closed_issues` compte les **items** du milestone, PR comprises,
+tandis que la lecture énumère les **issues** seules. Au 2026-10-29 sur le #33 :
+192 items contre 117 issues, l'écart valant ses **75 PR**. Deux populations sous
+un même nom ne se soustraient pas (classe mika#2205). Le compte de l'API est donc
+dit **avec sa magnitude nommée** (« PR comprises, autre population ») et sert de
+grandeur de contexte ; ce qui atteste la complétude est le prédicat de page
+pleine, pas une égalité. La décomposition GraphQL qui rendrait les deux comptes
+comparables est **refusée** avec trois motifs : redondante avec le prédicat,
++1 appel `gh` par cycle, et non exécutable sous la permission-policy du bac à
+sable.
+
+**Garde de complétude.** `MILESTONE_READ_COMPLETENESS_EXCEPTIONS`, livrée
+**vide** dans le module de test de `reader.rs` (précédent : `IMPLICATION_EXCEPTIONS`,
+`grooming_marker.rs`). Ce n'est pas un optimisme mais une mesure : le prédicat ne
+peut rougir qu'à partir de 1000 tickets rendus, et le plus grand milestone du
+dépôt en compte 117 — il n'existe aucune violation à excepter. L'assertion rougit
+dans les deux sens : à l'ajout d'une entrée, qui doit alors nommer son milestone
+et son ticket de suivi, et au retrait de son motif.
+
+**Le fixture tronque comme `gh`.** `RecordingGhRunner` (test) honore le `--limit`
+qu'on lui demande (`servir_borne`). Sans cela il rendrait les 117 tickets quelle
+que soit la borne, et le test de l'AC2 serait vert avec le `--limit "100"`
+d'avant ce vol : le mock fournirait le résultat que le code est censé produire.
+Vérifié par mutation — borne ramenée à 100, le test rougit.
+
+**Hors périmètre, nommé.** La lecture des **PR** du milestone
+(`gh pr list --search milestone:<N>`), qui ne voit pas les PR de la boucle : voir
+mika#2968 et mika#2924. L'énumération `Completed:` du rapport reste non bornée.
+
 **Phase 2 gates NOT wired.** Dispatch authority stays gated behind the three portes (forge-gate loop-résistance + contention exec + INTERNAL_TOKEN alignment) documented in the brief § 3. This module contains no dispatch class, no `run_claude_pilot` invocation site, no scope-approval callsite. Promotion to Phase 2 requires updating both `no_dispatch_test.rs` FORBIDDEN_TOKENS and the module docstring atomically.
