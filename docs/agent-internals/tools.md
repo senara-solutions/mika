@@ -458,8 +458,8 @@ avec `k.eq_ignore_ascii_case("pipeline")` — hérité de `parse_verdict`, donc 
 tolérances mika#1828/#2239 **et de leurs bornes**. Trois issues de ce côté-ci :
 `RefusedSectionAbsent` (aucune ligne `PIPELINE:`), `RefusedNoFailingGuardCited`
 (section présente, aucune citation d'échec), `Allowed`. Depuis mika#2961 la
-fonction porte un second booléen et une quatrième issue, pour le membre `pass` —
-§ suivant. La citation est une
+fonction porte un second booléen et **deux** issues de plus, toutes deux pour le
+membre `pass` — §§ suivants. La citation est une
 **disjonction de trois motifs**, insensible à la casse et tolérante au préfixe
 d'emphase markdown : (1) `exit` suivi d'un entier **non nul** (`PIPELINE_EXIT_CODE_RE`,
 comparaison chiffre à chiffre, jamais un `parse`) ; (2) `REJECT:` ; (3)
@@ -601,12 +601,98 @@ mika#2158) — est tenu par un scan de source à deux rôles : la décision et l
 ligne de démarrage.
 
 **Ce que le vol ne ferme pas.** La ligne `NEGATIVE-TEST:` (mika#2264) part au vol
-2/2, avec son propre jeton canonique et son lint. L'abstention de mika#2455 reste
-**fail-open**, inchangée : sur un dépôt qui ne merge pas par
+2/2, avec son propre jeton canonique et son lint — § suivant. L'abstention de
+mika#2455 reste **fail-open**, inchangée : sur un dépôt qui ne merge pas par
 `pr_merge_with_gate`, rien de mécanique ne tient le merge fermé — le vol ferme le
 signal, pas la porte. **Aucun jeton canonique ajouté** :
 `scripts/canonical-tokens.tsv` déclare déjà `PIPELINE` avec la tolérance
 `ci+emphasis:line-anchored`.
+
+### Et il nomme l'invariant qu'un test négatif épingle — le membre `pass` passe à deux termes (mika#2961, vol 2/2)
+
+**Un terme de plus dans le même garde, pas un garde de plus.** Le prompt de
+qa-review exige **exactement une** ligne `NEGATIVE-TEST:` dans chaque verdict et
+plafonne à `hold[review]` celui qui en manque (même l. 45 que la section). Le vol
+2 ajoute `RefusedPassNegativeTestAbsent` à `classify_pipeline_block_grounding` —
+cinquième issue, deuxième classe de refus du membre `pass` — sans nouveau garde,
+sans nouvel interrupteur, sans nouveau point de chaîne. Le raisonnement
+d'élargissement du vol 1 s'applique mot pour mot : la question est la même (*ce
+corps porte-t-il la preuve que le prompt exige ?*), le prédicat d'ancrage est le
+même, et deux gardes voisins lisant le même corps auraient deux prédicats à
+garder synchrones.
+
+**Mesure, refaite sur la population du 2026-10-30** (60 dernières PR par dépôt,
+même requête que le vol 1 avec la casse de `NEGATIVE-TEST`) : **260 `pass`, zéro
+ligne `NEGATIVE-TEST:` ancrée, une seule occurrence en `contains`** — et cette
+occurrence est la revue de la PR #2967, le vol 1 lui-même, qui *parle* du jeton
+dans une case de critère d'acceptation. Le contraste `contains`/ancré du vol 1 se
+reproduit donc à l'identique sur le second jeton, sur un corps mesuré différent :
+`mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne` assère les deux
+faits sur ce corps.
+
+**La conjonction est ordonnée, et l'ordre est porteur.** Sous un `pass`, la
+section est évaluée d'abord, la ligne ensuite ; `RefusedPassSectionAbsent` sort
+donc sur un corps qui manque des deux. Deux conséquences qu'un futur éditeur ne
+doit pas avoir à déduire : les trois corps mesurés du vol 1 restent classés
+exactement comme avant, à zéro édition de fixture (c'est ce qui rend le vol 2
+non-régressif par construction) ; et un corps qui porte la ligne **sans** la
+section sort quand même en `RefusedPassSectionAbsent`. Ce dernier cas n'existe
+pas dans la population mesurée — sa seule raison d'être est d'épingler l'ordre, et
+c'est `mika2961_la_table_des_deux_termes_epingle_lordre` qui le fait, en
+asservissant les deux prédicats **et** la sortie sur quatre corps.
+
+**Présence seule, pas de validation de forme.** Le prompt prescrit quatre
+dispositions (`satisfied`, `mechanical`, `missing`, `n/a`) ; le garde ne lit que
+le préfixe ancré. Valider la disposition demanderait de décider ce qu'est un
+invariant « nommé » et un test « qui l'assère », c'est-à-dire de relire la revue —
+hors de ce que peut faire un garde pré-subprocess. Il n'y a pas non plus de bras
+de contradiction : un `pass` portant `NEGATIVE-TEST: missing` passe ce garde-ci,
+et c'est `self-dev-webhook-qa` (mika#2264) qui le rejette en aval. Le remedy le
+**dit**, parce qu'un modèle qui cherche la sortie la moins coûteuse doit lire que
+celle-là coûte le merge un cran plus tard au lieu de l'acheter.
+
+**Le prédicat de ligne est factorisé, pas copié.** `line_prefix_present(body,
+prefix)` porte le parcours char-par-char (blancs de tête, course d'emphase
+markdown, casse repliée, **sans** ancre de fin) ; `pipeline_section_present` et
+`negative_test_line_present` sont chacune une ligne au-dessus. Char-par-char parce
+que `scripts/check-byte-slices.sh` interdit les offsets d'octets calculés
+(mika#764).
+
+**Audit et greps : même événement, `reason` différent.** La ligne `audit_events`
+reste sous `tool_name = 'pipeline_grounding_guard'` et le WARN reste
+`pass_evidence_refused` — un seul nom d'événement par membre, discriminé par
+`reason` ∈ {`pass_section_absent`, `pass_negative_test_absent`} (mika#2131). La
+charge utile porte `"error": "pass_negative_test_absent"` et la même
+`"doctrine": "mika#2961"`. L'issue est **liée** avant le `match` chez l'appelant
+plutôt que comparée en chaîne : la seconde branche remedy reste ainsi typée, et
+ne dérive pas en silence le jour où le jeton est renommé.
+
+**Jeton canonique, celui-là oui.** `scripts/canonical-tokens.tsv` gagne une ligne
+— `NEGATIVE-TEST`, classe A, site
+`crates/mika-agent/src/evidence/guards.rs::NEGATIVE_TEST_LINE_PREFIX`, tolérance
+`ci+emphasis:line-anchored`. Un seul jeton pour la regex ALL-CAPS malgré le tiret.
+
+**Couverture de régression.** Layer A dans `evidence::guards::tests::mika2961`
+passe de 10 à **14 cas** (les deux contrôles positifs du vol 1 amendés et
+renommés — ils portaient la section et pas la ligne, donc leur issue attendue
+change —, le corps mesuré de #2967, la table d'ordre, et les deux `pass`
+conformes, composites assumés puisque **aucun** corps mesuré ne porte les deux
+lignes) ; Layer B dans `skills::builtin_handlers::mika2961_pass_evidence` passe
+de 8 à **11** (le refus sous son propre motif avec l'absence de l'autre motif
+assérée, le contrôle positif qui traverse, et le remedy qui nomme trois formes et
+refuse la quatrième). Le scan de source du vol 1 devient
+`les_deux_jetons_ancres_nont_quun_site_litteral_de_production` et boucle sur les
+**deux** constantes : un second site littéral comparant l'un ou l'autre jeton est
+la forme qu'aucune assertion de comportement ne verrait (classe mika#2158).
+
+**Ce que le vol 2 ne ferme pas.** Le rename
+`validate_pipeline_block_grounding` → `validate_pipeline_evidence` est **encore**
+reporté : son unique site d'appel est dans le corps de `run_gh`, que mika#2966
+modifiait en parallèle, et un rename dont le site d'appel ne peut pas bouger n'est
+pas un rename. Précondition du suivi : le merge de mika#2966. L'interrupteur
+reste **désarmé** — le vol 2 ne change pas la disposition de tir du vol 1, il
+ajoute un terme derrière le même bit, donc l'ouverture (AC4/AC5) reste une
+décision de Vincent, et la sonde d'ouverture compte désormais **deux** manquants.
 
 ### Per-Tool Skill Budget (mika#2276 M1)
 

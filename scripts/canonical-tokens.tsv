@@ -150,6 +150,31 @@ PIPELINE	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_SECTION_LINE_PREFI
 REJECT	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_GUARD_REJECT_TOKEN	ci:literal
 FAILED	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_GUARD_FAILED_TOKEN	ci:literal
 
+# mika#2961 vol 2/2 — the line by which a `pass` names the invariant a negative
+# test asserts. Required by `qa-review/system_prompt.md:406-415` since mika#2264
+# (#2268), consumed downstream by `self-dev-webhook-qa`; it became a MACHINE
+# token the day the engine started refusing an approval that omits it. Measured
+# cause, 2026-10-30, 60 latest PRs per repo: 0 anchored lines out of 260 `pass`
+# reviews.
+#
+# ONE row, and that is the survey's arithmetic rather than a choice: the ALL-CAPS
+# rule captures `/[A-Z][A-Z_]{4,}([ -][A-Z][A-Z_]+)*/`, whose `[ -]` alternative
+# makes `NEGATIVE-TEST` a SINGLE token — not `NEGATIVE` plus `TEST`. Same shape
+# as `PIPELINE` above: written as the survey produces it, stopping before the
+# colon.
+#
+# Class A, same tolerance as `PIPELINE`, and for the same reason — it is the
+# same predicate. `guards.rs::negative_test_line_present` delegates to
+# `line_prefix_present`, which walks the prefix character by character with
+# `eq_ignore_ascii_case` after `trim_start` AND after skipping a leading
+# markdown-emphasis run, so `**NEGATIVE-TEST: satisfied — …**` IS read. Hence
+# `ci+emphasis:line-anchored`. The markdown that also carries the token
+# (`qa-review/system_prompt.md`, `self-dev-webhook-qa/system_prompt.md`) is
+# outside the survey's scan perimeter — `crates/*/src/**/*.rs`, `scripts/*.sh`,
+# `skills/bundled/**/*.sh` — so this row exists because of the Rust const, and
+# the two prompts are the PRODUCER side, as everywhere.
+NEGATIVE-TEST	A	crates/mika-agent/src/evidence/guards.rs::NEGATIVE_TEST_LINE_PREFIX	ci+emphasis:line-anchored
+
 # `_parse_disposition` and `_parse_verdict` ARE produced by the survey — their
 # first tier is a strict `grep -oE` — and they are class A anyway. That is a
 # rectification of the mika#2201 plan, which listed those two literals as class

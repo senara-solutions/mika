@@ -4295,8 +4295,11 @@ static PIPELINE_EXIT_CODE_RE: std::sync::LazyLock<regex::Regex> = std::sync::Laz
 /// porte.
 ///
 /// La population a **deux membres** depuis mika#2961 : `block[pipeline]`
-/// (vol mika#2687, les trois premiers variants) et `pass`
-/// ([`PipelineGroundingOutcome::RefusedPassSectionAbsent`]).
+/// (vol mika#2687, les trois premiers variants) et `pass` — dont le vol 2/2
+/// porte **deux** classes de refus,
+/// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`] (la section
+/// `PIPELINE:`) et [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`]
+/// (la ligne `NEGATIVE-TEST:`), évaluées dans cet ordre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineGroundingOutcome {
     /// Le corps ne porte **aucune** ligne `PIPELINE:` — les deux revues
@@ -4320,8 +4323,10 @@ pub enum PipelineGroundingOutcome {
     /// mika#2960, mika#2691) sont exactement dans ce cas, et avec eux les 261
     /// `pass` de la population relevée le 2026-10-29.
     ///
-    /// **C'est la seule classe du membre `pass`**, et les deux autres refus ne
-    /// s'y appliquent délibérément pas :
+    /// **C'est la première des deux classes du membre `pass`** — la seconde est
+    /// [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`], ajoutée par
+    /// le vol 2/2 et évaluée **après** celle-ci. Les deux autres refus ne
+    /// s'appliquent délibérément pas au membre `pass` :
     ///
     /// - [`PipelineGroundingOutcome::RefusedNoFailingGuardCited`] serait un
     ///   contresens. Un `pass` ne cite **aucun** échec par construction : Step 2E
@@ -4336,9 +4341,55 @@ pub enum PipelineGroundingOutcome {
     ///   la flotte, pour une classe que la seule présence de la section ferme
     ///   déjà.
     RefusedPassSectionAbsent,
+    /// **mika#2961, vol 2/2** — un `pass` qui porte bien sa section `PIPELINE:`
+    /// et **aucune** ligne `NEGATIVE-TEST:`.
+    ///
+    /// Seconde classe du membre `pass`, sur la seconde exigence que le même
+    /// paragraphe du prompt déclare obligatoire *« whichever verdict you
+    /// emit »* (`qa-review/system_prompt.md:406-415`, mika#2264). Relevé du
+    /// 2026-10-30, 60 dernières PR par dépôt : **0 ligne ancrée sur 260
+    /// `pass`** — le même régime que la section au vol 1.
+    ///
+    /// # L'ordre des deux termes, et ce qu'il préserve
+    ///
+    /// La section est évaluée **d'abord**, et ce n'est pas cosmétique : les
+    /// trois corps mesurés que le vol 1 a mis au dépôt (`MEASURED_CM217`,
+    /// `MEASURED_2960`, `MEASURED_2691` dans le module de test) ne portent
+    /// **ni l'une ni l'autre**. Avec cet ordre ils restent classés
+    /// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`], et leurs trois
+    /// tests restent verts sans une ligne d'édition. L'ordre inverse les ferait
+    /// tous basculer sur ce variant-ci, pour un résultat identique en
+    /// production au prix de trois éditions de fixtures **mesurées** — ce qu'on
+    /// ne banalise pas. `mika2961_la_table_des_deux_termes_epingle_lordre`
+    /// l'épingle.
+    ///
+    /// # Ce que ce variant n'exige pas, et l'incitation perverse que ça crée
+    ///
+    /// **La présence de la ligne, rien de plus.** Le prédicat est sans ancre de
+    /// fin (voir [`negative_test_line_present`]) : aucune des quatre
+    /// dispositions du prompt — `satisfied`, `mechanical`, `missing`, `n/a` —
+    /// n'est validée, et la contradiction `pass` + `missing` que le prompt
+    /// déclare explicitement (l. 415) n'est **pas** refusée ici.
+    ///
+    /// C'est délibéré et ça se paie : la forme la moins chère à produire pour
+    /// satisfaire ce garde est `NEGATIVE-TEST: missing — … — no negative
+    /// assertion in diff`, c'est-à-dire exactement la seule que le prompt
+    /// déclare incohérente avec un `pass`. Le garde accepterait alors un corps
+    /// que son propre prompt interdit ; le remedy, lui, ne la propose pas.
+    ///
+    /// La raison de s'arrêter là est celle du vol 1 : **on ferme la classe
+    /// mesurée**, et la classe mesurée est 260 sur 260 *sans aucune ligne*. La
+    /// population de `pass` + `missing` est **vide** au relevé, et celle d'une
+    /// ligne mal formée l'est aussi par construction. Un garde dimensionné sur
+    /// une population vide est un garde dont on ne sait pas s'il mord, et dont
+    /// le premier vrai contact serait post-armement. Le bras de contradiction
+    /// et la validation des quatre dispositions attendent le chiffre de la
+    /// sonde AC5, et sont portés par le ticket de suivi de la PR de ce vol.
+    RefusedPassNegativeTestAbsent,
     /// Rien à refuser : hors population, ou section présente **et** citant au
     /// moins une garde en échec **et** exécution observée (ou abstention) — ou,
-    /// pour le membre `pass`, section simplement présente.
+    /// pour le membre `pass`, section présente **et** ligne `NEGATIVE-TEST:`
+    /// présente.
     Allowed,
 }
 
@@ -4359,17 +4410,48 @@ pub enum PipelineGroundingOutcome {
 /// vraie cause. La faire tomber ici dirait « section absente » d'une section
 /// qui est là, et enverrait le modèle réécrire ce qu'il a déjà écrit.
 ///
+/// Le prédicat lui-même vit dans [`line_prefix_present`] depuis mika#2961
+/// vol 2/2, partagé avec [`negative_test_line_present`] : signature et
+/// visibilité inchangées ici, aucun appelant ne bouge.
+pub fn pipeline_section_present(body: &str) -> bool {
+    line_prefix_present(body, PIPELINE_SECTION_LINE_PREFIX)
+}
+
+/// Le corps porte-t-il une ligne **ouvrant** sur `prefix` ?
+///
+/// Le prédicat ancré de cette famille, extrait de
+/// [`pipeline_section_present`] par mika#2961 vol 2/2 et traversé par **les
+/// deux** motifs du membre `pass` — la section `PIPELINE:` et la ligne
+/// `NEGATIVE-TEST:` ([`negative_test_line_present`]). Une seule
+/// implémentation, pour trois raisons mesurées :
+///
+/// - c'est **la** doctrine du vol : un `contains` compterait la prose d'une
+///   revue comme sa preuve. Le cas le plus net que le relevé ait produit est
+///   l'unique corps sur 260 que `contains("NEGATIVE-TEST:")` attrape — la revue
+///   de la PR du vol 1, dont la ligne de case à cocher dit que le test négatif
+///   est *reporté* ;
+/// - un futur passage du prédicat en `contains` casserait donc les tests des
+///   **deux** motifs d'un coup, au lieu d'un seul ;
+/// - le trait d'union de `NEGATIVE-TEST:` ne demande aucune règle : c'est un
+///   caractère du préfixe comme un autre, et `eq_ignore_ascii_case` le traite.
+///
+/// Les trois tolérances de la famille sont celles que
+/// `scripts/canonical-tokens.tsv` déclare en `ci+emphasis:line-anchored` pour
+/// les deux jetons : blancs de tête tolérés, course d'emphase markdown franchie
+/// (`**PIPELINE: block (mika)**`, précédent mika#1828), casse repliée, et
+/// **aucune ancre de fin**.
+///
 /// La comparaison marche caractère par caractère plutôt que par tranche
 /// d'octets : un corps de revue porte de l'UTF-8 multi-octets et
 /// `scripts/check-byte-slices.sh` refuse un offset calculé (mika#764,
 /// mika#2103).
-pub fn pipeline_section_present(body: &str) -> bool {
+pub fn line_prefix_present(body: &str, prefix: &str) -> bool {
     body.lines().any(|line| {
         let mut chars = line
             .trim_start()
             .chars()
             .skip_while(|c| *c == '*' || *c == '_');
-        for expected in PIPELINE_SECTION_LINE_PREFIX.chars() {
+        for expected in prefix.chars() {
             match chars.next() {
                 Some(got) if got.eq_ignore_ascii_case(&expected) => {}
                 _ => return false,
@@ -4441,10 +4523,13 @@ pub fn body_cites_failing_guard(body: &str) -> bool {
 /// tête** parce que son terme est le moins coûteux du lot : une seule lecture de
 /// prédicat de corps, et aucune lecture en base.
 ///
-/// Son terme est [`pipeline_section_present`] **seul**, jamais
-/// [`body_cites_failing_guard`] : voir
+/// Ses termes sont [`pipeline_section_present`] puis
+/// [`negative_test_line_present`], en **conjonction ordonnée** (mika#2961
+/// vol 2/2), jamais [`body_cites_failing_guard`] : voir
 /// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`] pour la polarité
-/// inversée du second terme entre les deux membres.
+/// inversée du second terme de mika#2687 entre les deux membres, et
+/// [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`] pour ce que
+/// l'ordre des deux termes du `pass` préserve.
 ///
 /// # `guard_execution_observed` — le fait que le corps ne peut pas porter
 ///
@@ -4468,11 +4553,17 @@ pub fn classify_pipeline_block_grounding(
     guard_execution_observed: bool,
 ) -> PipelineGroundingOutcome {
     if verdict_is_pass {
-        return if pipeline_section_present(body) {
-            PipelineGroundingOutcome::Allowed
-        } else {
-            PipelineGroundingOutcome::RefusedPassSectionAbsent
-        };
+        // La conjonction ordonnée du membre `pass` : la section d'abord, la
+        // ligne ensuite. L'ordre est load-bearing — il garde les trois corps
+        // mesurés du vol 1 dans leur classe d'origine (cf. la doc de
+        // `RefusedPassNegativeTestAbsent`).
+        if !pipeline_section_present(body) {
+            return PipelineGroundingOutcome::RefusedPassSectionAbsent;
+        }
+        if !negative_test_line_present(body) {
+            return PipelineGroundingOutcome::RefusedPassNegativeTestAbsent;
+        }
+        return PipelineGroundingOutcome::Allowed;
     }
     if !verdict_is_pipeline_block {
         return PipelineGroundingOutcome::Allowed;
@@ -4667,11 +4758,11 @@ pub fn log_pipeline_grounding_gate_state() {
 // revue n'existe pas encore sur GitHub.
 //
 // **Ce que ce vol ne ferme pas.** La ligne `NEGATIVE-TEST:` de mika#2264 reste
-// hors population (vol 2/2) : elle demande son propre jeton canonique, son lint,
-// et la mesure de sa cécité aval (la consigne de `self-dev-webhook-qa` n'a arrêté
-// aucun merge sur 69). L'abstention CI de mika#2455 reste fail-open et intacte :
-// ce vol ne change pas la porte de merge, il change le **signal** — une
-// approbation sans aucune preuve pipeline n'est plus postable.
+// hors population — c'est le **vol 2/2**, et il a atterri : voir le bandeau
+// ci-dessous, qui porte sa mesure, son jeton canonique et sa classe de refus.
+// L'abstention CI de mika#2455 reste fail-open et intacte : ce vol ne change pas
+// la porte de merge, il change le **signal** — une approbation sans aucune
+// preuve pipeline n'est plus postable.
 
 /// Variable d'**armement** du gate du membre `pass` — le switch opérateur,
 /// nommé et greppable.
@@ -4744,10 +4835,98 @@ pub fn log_pass_evidence_gate_state() {
             event = "pass_evidence_gate_disarmed",
             env = PASS_EVIDENCE_GATE_ENV,
             "mika#2961: le gate de preuve pipeline du `pass` est DÉSARMÉ (le défaut) — un `pass` \
-             sans section `PIPELINE:` peut être posté. L'armer : poser la variable à 1 et \
-             redémarrer"
+             sans section `PIPELINE:` ni ligne `NEGATIVE-TEST:` peut être posté. L'armer : poser \
+             la variable à 1 et redémarrer"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// mika#2961, vol 2/2 — la ligne `NEGATIVE-TEST:` : un `pass` qui ne nomme aucun
+// invariant testé négativement
+// ---------------------------------------------------------------------------
+//
+// Le même paragraphe de prompt qui exige la section exige **exactement une**
+// ligne `NEGATIVE-TEST:` par corps de verdict, en ligne de premier niveau,
+// *« whichever verdict you emit »* (`qa-review/system_prompt.md:406-415`,
+// mika#2264 / #2268 du 2026-09-09). Relevé du 2026-10-30, 60 dernières PR par
+// dépôt, tous états, sur les revues `mika-platform-qa` dont le corps commence
+// par `VERDICT: pass`, prédicat **ancré** appliqué ligne à ligne :
+//
+// | dépôt           | `pass` | ligne ancrée | `contains("NEGATIVE-TEST:")` |
+// |-----------------|--------|--------------|------------------------------|
+// | mika            |     78 |            0 |                            1 |
+// | claude-pilot    |     96 |            0 |                            0 |
+// | mika-platform   |     70 |            0 |                            0 |
+// | control-monitor |     16 |            0 |                            0 |
+// | **total**       | **260**|        **0** |                        **1** |
+//
+// **Le régime est 260 sur 260, et l'unique `contains` est le meilleur argument
+// pour l'ancrage que la mesure ait produit.** Ce corps-là est **la revue de la
+// PR du vol 1 elle-même** (#2967), et l'occurrence vit dans une ligne de case à
+// cocher d'AC : *« satisfied: AC1 — … `NEGATIVE-TEST:` explicitly deferred to
+// vol 2 »*. Une mesure en `contains` compterait donc comme **preuve de test
+// négatif** une revue qui dit que le test négatif est reporté. Le fail-open du
+// `contains` n'est pas théorique : il a un numéro de PR, et c'est le test
+// `mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne` qui le tient.
+//
+// **Ce que ce vol ajoute, et ce qu'il réutilise tel quel.** Il ajoute un
+// préfixe, un prédicat (partagé, cf. [`line_prefix_present`]), une classe de
+// refus et un bras de `match` chez l'appelant. Il ne crée **aucun** nom
+// d'événement (`pass_evidence_refused` couvre les deux classes, discriminées par
+// `reason` — mika#2131 interdit deux populations sous un nom, pas deux motifs
+// sous une population), **aucune** variable d'environnement, **aucun**
+// `OnceLock` et **aucune** ligne de démarrage : l'interrupteur ci-dessus est
+// celui des deux classes, et l'ouvrir les arme ensemble — deux exigences que le
+// même paragraphe du prompt déclare obligatoires ne se fractionnent pas en deux
+// sous-populations armables séparément.
+//
+// **Ce que ce vol ne ferme toujours pas.** Le membre `block[pipeline]` n'est
+// **pas** étendu : son gate est armé par défaut, donc lui ajouter un terme
+// changerait le comportement au merge sans interrupteur pour le refermer. Coût
+// assumé et dans le bon sens : un `block` sans sa ligne retient un merge qui
+// l'aurait été de toute façon, un `pass` sans la sienne en ouvre un. Et la
+// **forme** de la ligne n'est pas validée (cf. la doc de
+// [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`] pour l'incitation
+// perverse que ça laisse ouverte, et le ticket qui la suit).
+
+/// Le préfixe de la ligne par laquelle une revue nomme l'invariant qu'un test
+/// négatif assère.
+///
+/// **Jeton de fil** : prescrit par le paragraphe *« Mandatory `NEGATIVE-TEST:`
+/// line (consumed downstream) »* de `qa-review/system_prompt.md` (l. 406-415),
+/// lu ici par [`negative_test_line_present`], consommé en aval par
+/// `self-dev-webhook-qa` (mika#2264). Il porte sa ligne dans
+/// `scripts/canonical-tokens.tsv` avec sa tolérance et son site de match ;
+/// sans cette déclaration, `canonical-tokens-lint` ne le voit pas et la classe
+/// mika#2201 se rouvre. Une seule ligne y suffit : le relevé capture
+/// `/[A-Z][A-Z_]{4,}([ -][A-Z][A-Z_]+)*/`, dont l'alternative `[ -]` fait de
+/// `NEGATIVE-TEST` **un** jeton et non deux.
+///
+/// Les quatre formes que le prompt déclare, verbatim :
+///
+/// ```text
+/// NEGATIVE-TEST: satisfied — <invariant named> — <test file:symbol asserting it>
+/// NEGATIVE-TEST: mechanical — <invariant named> — no behavior change in perimeter
+/// NEGATIVE-TEST: missing — <invariant named> — no negative assertion in diff
+/// NEGATIVE-TEST: n/a — PR out of perimeter
+/// ```
+///
+/// Le prédicat est **sans ancre de fin**, donc aucune de ces quatre
+/// dispositions n'est distinguée : la seule présence du préfixe satisfait le
+/// garde. C'est la sémantique voulue, et son coût est nommé à la classe de
+/// refus.
+pub const NEGATIVE_TEST_LINE_PREFIX: &str = "NEGATIVE-TEST:";
+
+/// Le corps porte-t-il une ligne `NEGATIVE-TEST:` ?
+///
+/// Second motif du membre `pass`, sur le prédicat ancré **partagé** avec la
+/// section ([`line_prefix_present`], mika#2961 § 4.6) : blancs de tête tolérés,
+/// emphase markdown franchie, casse repliée, aucune ancre de fin. Lu en
+/// conjonction du premier terme par
+/// [`classify_pipeline_block_grounding`], jamais seul.
+pub fn negative_test_line_present(body: &str) -> bool {
+    line_prefix_present(body, NEGATIVE_TEST_LINE_PREFIX)
 }
 
 #[cfg(test)]
@@ -10094,6 +10273,91 @@ VERDICT: pass
 PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/verify-pipeline.sh, scripts/plan-doc-check.sh)
 ";
 
+        /// La revue `pass` de **PR #2967** — le vol 1 de ce ticket — réduite à
+        /// ses lignes utiles, lue le 2026-10-30 par
+        /// `gh pr view 2967 --repo senara-solutions/mika --json reviews`.
+        ///
+        /// C'est le **seul** corps sur les 260 `pass` mesurés le 2026-10-30 qui
+        /// contient la chaîne `NEGATIVE-TEST:`, et il ne la porte pas en tête de
+        /// ligne : elle vit au milieu de la prose d'une case AC, où elle dit que
+        /// la ligne est *reportée au vol 2*. Un prédicat en `contains`
+        /// compterait donc cette phrase comme la preuve de test négatif de la
+        /// revue — et la seule occurrence de la population serait un faux
+        /// positif. C'est le motif du vol 1 sur `MEASURED_2691`, rejoué un vol
+        /// plus tard sur l'autre jeton, ce qui est la mesure la plus forte dont
+        /// dispose la doctrine du prédicat ancré : elle s'est reproduite.
+        ///
+        /// Le corps ne porte **pas non plus** de section `PIPELINE:` ancrée
+        /// (`PLAN-AC VERIFICATION:` et `Plan:` n'en sont pas une), donc la
+        /// conjonction ordonnée le classe en
+        /// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`] — pas dans la
+        /// classe neuve. Le test qui le lit l'asserte explicitement : c'est
+        /// l'ordre des deux termes qui décide, et ce corps est la preuve que
+        /// l'ordre reste lisible même sur le corps qui a motivé le second terme.
+        const MEASURED_2967_PROSE: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Pipeline evidence gate for `pass` verdicts — refusal path in same guard as mika#2687, env switch with inverted polarity (default OFF), build passes, all structural ACs verified.
+
+PLAN-AC VERIFICATION:
+Plan: docs/plans/2026-10-29-005-fix-2961-un-pass-sans-section-pipeline-plan.md
+ACs evaluated: 5
+- [✅] satisfied: AC1 — Refusal (not plafonnement) in same guard as mika#2687: `RefusedPassSectionAbsent` variant + `pass_evidence_gate_armed()` check in `validate_pipeline_block_grounding_gated` (guards.rs:4474). `NEGATIVE-TEST:` explicitly deferred to vol 2 (§ 4.6).
+
+BUILD VERIFICATION:
+Build: pass (cargo build --release --features telemetry)
+";
+
+        /// Un `pass` **conforme** au prompt : la section verbatim de Step 2E
+        /// *plus* la ligne de test négatif, dans la forme `satisfied` de
+        /// `system_prompt.md:409`.
+        ///
+        /// C'est le contrôle positif du membre `pass` depuis le vol 2/2 — celui
+        /// que [`super::mika2687::STEP_2E_GREEN`] tenait au vol 1, avant que la
+        /// conjonction lui retire le second terme. Il est **composite**, et le
+        /// dit : ses deux moitiés sont verbatim du prompt, leur assemblage ne
+        /// l'est pas, parce que la population mesurée n'offre aucun corps qui
+        /// porte les deux (0 sur 260 — c'est le défaut du ticket).
+        const PASS_CONFORME: &str = "\
+VERDICT: pass
+
+PIPELINE: pass (mika)
+- scripts/verify-pipeline.sh → exit 0
+  Pipeline verification passed. Plan: <none> Compound: docs/solutions/bug-fixes/x.md
+
+NEGATIVE-TEST: satisfied — mika2961_un_pass_qui_porte_la_section_mais_pas_la_ligne_est_refuse pins the refusal
+";
+
+        /// La même conformité pour un dépôt **sans garde** : la sortie Step 2D
+        /// verbatim, plus la ligne de test négatif dans sa forme `n/a` de
+        /// `system_prompt.md:412`.
+        ///
+        /// C'est la composition que control-monitor#217 devait porter, et donc
+        /// la réponse à la question qu'un lecteur du ticket posera : le garde
+        /// n'exige pas d'un dépôt sans garde qu'il invente un test négatif.
+        const PASS_CONFORME_NOT_APPLICABLE: &str = "\
+VERDICT: pass
+
+PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/verify-pipeline.sh, scripts/plan-doc-check.sh)
+
+NEGATIVE-TEST: n/a — PR out of perimeter for an executable invariant
+";
+
+        /// [`PASS_CONFORME`] **privé de ses deux lignes de section** — la
+        /// quatrième combinaison de la table des deux termes, celle que la
+        /// population mesurée n'offre pas : une ligne de test négatif sans
+        /// section.
+        ///
+        /// Dérivé, et non mesuré : c'est dit ici parce que la distinction porte
+        /// tout le poids des autres fixtures de ce module. Sa seule raison
+        /// d'être est d'épingler l'**ordre** des deux termes — sans elle, un
+        /// échange des deux `if` resterait vert.
+        const PASS_LIGNE_SANS_SECTION: &str = "\
+VERDICT: pass
+
+NEGATIVE-TEST: satisfied — mika2961_un_pass_qui_porte_la_section_mais_pas_la_ligne_est_refuse pins the refusal
+";
+
         // -- T1, T2 : les deux corps que le ticket demande d'arrêter --
 
         #[test]
@@ -10142,14 +10406,29 @@ PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/v
             );
         }
 
-        // -- T4, T5 : les deux contrôles positifs, verbatim du prompt --
+        // -- T4′, T5′ : les deux contrôles positifs du vol 1, que la
+        // conjonction du vol 2 fait basculer — et c'est l'assertion que le
+        // second terme existe --
 
         #[test]
-        fn mika2961_un_pass_qui_porte_la_section_passe() {
-            // T4 — `STEP_2E_GREEN` est la fixture déjà au dépôt, verbatim de
+        fn mika2961_un_pass_qui_porte_la_section_mais_pas_la_ligne_est_refuse() {
+            // T4′ — `STEP_2E_GREEN` est la fixture déjà au dépôt, verbatim de
             // l'exemple vert de Step 2E. Elle déclare `block[pipeline]` dans
             // son texte, ce qui n'a aucun effet ici : la classification lit des
             // booléens passés par son appelant, pas la ligne du corps.
+            //
+            // Au vol 1 ce corps était le contrôle positif du membre `pass`
+            // (`…_un_pass_qui_porte_la_section_passe`, attendu `Allowed`). Le
+            // vol 2/2 le fait basculer, et la fixture n'est PAS mutée pour le
+            // ramener au vert : elle est `pub(super)` et partagée avec le
+            // module mika2687, où elle sert le membre `block`. Le contrôle
+            // positif du membre `pass` est désormais `PASS_CONFORME` (T7), qui
+            // porte les deux lignes.
+            assert!(
+                pipeline_section_present(super::mika2687::STEP_2E_GREEN),
+                "la section est bien là — c'est le premier terme, et il est \
+                 satisfait"
+            );
             assert_eq!(
                 classify_pipeline_block_grounding(
                     NOT_A_BLOCK,
@@ -10157,18 +10436,27 @@ PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/v
                     super::mika2687::STEP_2E_GREEN,
                     GUARD_RAN
                 ),
-                PipelineGroundingOutcome::Allowed,
-                "section présente : rien à refuser"
+                PipelineGroundingOutcome::RefusedPassNegativeTestAbsent,
+                "section présente, aucune ligne `NEGATIVE-TEST:` : c'est le \
+                 second terme qui mord, et le basculement de ce test est ce qui \
+                 l'atteste"
             );
         }
 
         #[test]
-        fn mika2961_le_not_applicable_de_step_2d_passe_sous_pass() {
-            // T5 — et la polarité inversée, assérée sur le MÊME corps : ce
-            // verbatim est refusé sous `block[pipeline]` (une garde qu'on n'a
-            // pas trouvée n'est pas une garde qui a refusé) et autorisé sous
-            // `pass` (c'est exactement ce que Step 2D prescrit à un dépôt sans
-            // garde — le cas de control-monitor).
+        fn mika2961_le_not_applicable_de_step_2d_porte_la_section_mais_pas_la_ligne_est_refuse() {
+            // T5′ — même basculement que T4′ sous `pass`. La fixture reste
+            // verbatim de `system_prompt.md:275` : c'est tout son intérêt, et
+            // la muter pour lui ajouter une ligne de test négatif ferait perdre
+            // la propriété qu'elle porte.
+            //
+            // **La seconde assertion est inchangée** — c'est la polarité
+            // inversée du second terme de mika#2687, assérée sur le MÊME corps :
+            // ce verbatim est refusé sous `block[pipeline]` (une garde qu'on
+            // n'a pas trouvée n'est pas une garde qui a refusé) et, sous
+            // `pass`, sa section est acceptée (c'est exactement ce que Step 2D
+            // prescrit à un dépôt sans garde — le cas de control-monitor), seule
+            // la ligne de test négatif lui manque.
             assert_eq!(
                 classify_pipeline_block_grounding(
                     NOT_A_BLOCK,
@@ -10176,8 +10464,9 @@ PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/v
                     STEP_2D_NOT_APPLICABLE,
                     GUARD_RAN
                 ),
-                PipelineGroundingOutcome::Allowed,
-                "sous `pass`, `not-applicable` est la sortie prescrite"
+                PipelineGroundingOutcome::RefusedPassNegativeTestAbsent,
+                "sous `pass`, `not-applicable` est la section prescrite — et la \
+                 ligne `NEGATIVE-TEST:` manque encore"
             );
             assert_eq!(
                 classify_pipeline_block_grounding(
@@ -10193,6 +10482,131 @@ PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/v
             );
         }
 
+        // -- T6 : le `contains` de la population, une seconde fois --
+
+        #[test]
+        fn mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne() {
+            // Le pendant exact de `…_le_corps_de_2691_contient_le_mot_et_na_pas_la_section`
+            // sur l'autre jeton, et sur le corps de la PR du vol 1. Les deux
+            // assertions sont sur le MÊME corps : séparées, chacune reste vraie
+            // après un passage du prédicat en `contains`.
+            assert!(
+                MEASURED_2967_PROSE.contains(NEGATIVE_TEST_LINE_PREFIX),
+                "le corps contient bien la chaîne — c'est l'unique occurrence \
+                 des 260 `pass` mesurés le 2026-10-30"
+            );
+            assert!(
+                !negative_test_line_present(MEASURED_2967_PROSE),
+                "et il n'ouvre aucune ligne : le jeton vit au milieu de la prose \
+                 d'une case AC, où il dit que la ligne est REPORTÉE. Un prédicat \
+                 en `contains` tiendrait cette phrase pour la preuve de test \
+                 négatif de la revue"
+            );
+            // Et la classification, qui n'est pas la classe neuve : ce corps ne
+            // porte pas non plus de section, donc le PREMIER terme mord. C'est
+            // l'ordre qui décide, et c'est pourquoi ce corps est resté dans la
+            // classe du vol 1 sans qu'aucun de ses tests ne bouge.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    MEASURED_2967_PROSE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                "les deux termes manquent : c'est le premier qui nomme le refus"
+            );
+        }
+
+        // -- T7, T8 : les contrôles positifs du membre `pass` après le vol 2 --
+
+        #[test]
+        fn mika2961_un_pass_conforme_passe() {
+            assert_eq!(
+                classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, PASS_CONFORME, GUARD_RAN),
+                PipelineGroundingOutcome::Allowed,
+                "section ET ligne : il ne reste rien à refuser — sans ce test, \
+                 un garde qui refuse TOUT `pass` resterait vert"
+            );
+        }
+
+        #[test]
+        fn mika2961_un_pass_conforme_sans_garde_au_depot_passe() {
+            // La composition que control-monitor#217 devait porter : le garde
+            // n'exige pas d'un dépôt sans garde qu'il invente un test négatif,
+            // il exige qu'il le DISE. Les deux formes `not-applicable` et `n/a`
+            // sont celles du prompt.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    PASS_CONFORME_NOT_APPLICABLE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::Allowed,
+                "`not-applicable` + `n/a` : la sortie prescrite d'un dépôt sans \
+                 garde traverse"
+            );
+        }
+
+        // -- T9 : la table des deux termes, qui épingle l'ORDRE --
+
+        #[test]
+        fn mika2961_la_table_des_deux_termes_epingle_lordre() {
+            // Les quatre combinaisons, dont la troisième est la seule raison
+            // d'être de `PASS_LIGNE_SANS_SECTION` : avec les trois autres
+            // seules, un échange des deux `if` de la conjonction resterait vert.
+            // L'ordre est load-bearing — c'est lui qui garde les quatre corps
+            // mesurés (les trois du vol 1 plus celui du vol 2) dans la classe
+            // du vol 1, à zéro édition de leurs tests.
+            for (label, body, section, ligne, attendu) in [
+                (
+                    "section ✓ ligne ✓",
+                    PASS_CONFORME,
+                    true,
+                    true,
+                    PipelineGroundingOutcome::Allowed,
+                ),
+                (
+                    "section ✓ ligne ✗",
+                    STEP_2D_NOT_APPLICABLE,
+                    true,
+                    false,
+                    PipelineGroundingOutcome::RefusedPassNegativeTestAbsent,
+                ),
+                (
+                    "section ✗ ligne ✓",
+                    PASS_LIGNE_SANS_SECTION,
+                    false,
+                    true,
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                ),
+                (
+                    "section ✗ ligne ✗",
+                    MEASURED_CM217,
+                    false,
+                    false,
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                ),
+            ] {
+                assert_eq!(
+                    pipeline_section_present(body),
+                    section,
+                    "{label} : le premier terme du corps"
+                );
+                assert_eq!(
+                    negative_test_line_present(body),
+                    ligne,
+                    "{label} : le second terme du corps"
+                );
+                assert_eq!(
+                    classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, body, GUARD_RAN),
+                    attendu,
+                    "{label} : la sortie de la conjonction ordonnée"
+                );
+            }
+        }
+
         // -- le contraste qui dit que le bit décide, et lui seul --
 
         #[test]
@@ -10202,10 +10616,19 @@ PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/v
             // verdict d'une autre classe — ils traversent. C'est ce qui sépare
             // « le garde mord sur sa population » de « le garde mord sur tout
             // corps sans section ».
+            //
+            // T10 du vol 2/2 : la liste porte aussi les corps du second terme —
+            // celui de #2967 (qui contient le mot sans la ligne) et les deux
+            // verbatim du prompt privés de leur ligne. Hors population, aucun
+            // des deux termes n'est évalué.
             for (label, body) in [
                 ("control-monitor#217", MEASURED_CM217),
                 ("mika#2960", MEASURED_2960),
                 ("mika#2691", MEASURED_2691),
+                ("mika#2967", MEASURED_2967_PROSE),
+                ("Step 2E vert, sans ligne", super::mika2687::STEP_2E_GREEN),
+                ("Step 2D not-applicable, sans ligne", STEP_2D_NOT_APPLICABLE),
+                ("ligne sans section", PASS_LIGNE_SANS_SECTION),
             ] {
                 assert_eq!(
                     classify_pipeline_block_grounding(NOT_A_BLOCK, NOT_A_PASS, body, GUARD_RAN),
@@ -10238,11 +10661,11 @@ PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/v
                     classify_pipeline_block_grounding(
                         NOT_A_BLOCK,
                         IS_A_PASS,
-                        STEP_2D_NOT_APPLICABLE,
+                        PASS_CONFORME,
                         observed
                     ),
                     PipelineGroundingOutcome::Allowed,
-                    "et passage avec section, de même ({observed})"
+                    "et passage avec les deux lignes, de même ({observed})"
                 );
             }
         }

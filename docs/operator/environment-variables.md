@@ -5161,10 +5161,13 @@ Raisonnement complet (la position du lien dans la chaîne, et pourquoi pas
 une garde en échec* — c'est là que vit la doctrine de la chaîne `run_gh` depuis
 que `crates/mika-agent/CLAUDE.md` § *Tools* y a été vidé (mika#2684).
 
-### Un `pass` dit ce que la garde du dépôt a fait, ou il ne part pas (mika#2961, vol 1/2)
+### Un `pass` dit ce que la garde du dépôt a fait, ou il ne part pas (mika#2961, vols 1 et 2 sur 2)
 
-- `MIKA_QA_PASS_EVIDENCE_GATE` — **arme** le refus d'un `pass` qui ne porte
-  aucune ligne `PIPELINE:`. **Défaut : DÉSARMÉ**, et c'est la seule variable de
+- `MIKA_QA_PASS_EVIDENCE_GATE` — **arme** le refus d'un `pass` qui ne porte pas
+  la preuve que le prompt exige : depuis le vol 2, **deux** termes derrière le
+  **même** bit — aucune ligne `PIPELINE:` (vol 1) et aucune ligne
+  `NEGATIVE-TEST:` (vol 2), évalués dans cet ordre.
+  **Défaut : DÉSARMÉ**, et c'est la seule variable de
   cette famille dont la polarité est inverse : `1`/`true`/`on`/`yes` arment,
   absente, vide ou **non reconnue** laissent désarmé, avec un
   `pass_evidence_gate_unrecognized_value` nommant la valeur **entre guillemets**
@@ -5219,6 +5222,41 @@ ne cite aucun échec, donc la preuve d'exécution n'a rien à corroborer, et la
 requête n'est pas faite. Conséquence lisible en base : le membre `pass` n'écrit
 jamais de ligne `abstained`.
 
+**Le second terme (vol 2), et ce que l'ordre change pour vous.** Interrupteur
+ouvert, un `pass` qui porte bien sa section `PIPELINE:` mais **aucune** ligne
+`NEGATIVE-TEST:` est refusé lui aussi, au même point de chaîne, sous
+`reason = pass_negative_test_absent`. La conjonction est **ordonnée** : la section
+d'abord, la ligne ensuite. Donc un corps qui manque des deux — le régime mesuré,
+et les trois corps du vol 1 — sort toujours en `pass_section_absent`, et
+`pass_negative_test_absent` ne se lit que sur une revue **déjà** à moitié
+conforme. Lire une croissance de ce second motif comme une dégradation serait un
+contresens : c'est la mesure du progrès du premier.
+
+**La mesure du second terme (2026-10-30, 60 dernières PR par dépôt).** **260
+`pass`, zéro ligne `NEGATIVE-TEST:` ancrée, une seule occurrence en `contains`** —
+et cette occurrence est la revue de la PR #2967, le vol 1 lui-même, qui *parle* du
+jeton dans une case de critère d'acceptation. Le contraste `contains`/ancré se
+reproduit donc à l'identique sur le second jeton. Tenu par
+`mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne`.
+
+**Le remedy du second terme nomme trois formes sur quatre, et dit pourquoi la
+quatrième n'est pas une sortie.** Le prompt prescrit `satisfied`, `mechanical`,
+`missing` et `n/a` ; le refus décrit les trois premières et nomme la quatrième
+comme **refusée** : `missing` n'est compatible qu'avec un verdict bloquant sur les
+critères d'acceptation, et `self-dev-webhook-qa` (mika#2264) rejette en aval une
+approbation qui la porte. L'écrire coûte donc le merge un cran plus tard au lieu
+de l'acheter — et c'est dit dans le refus, parce qu'un modèle qui cherche la
+sortie la moins coûteuse doit pouvoir la calculer. Comme au vol 1, aucune des
+formes n'est citée verbatim avec son préfixe ancré : un remède que le modèle
+recollerait satisferait le garde. Pinné par
+`le_remedy_de_la_ligne_nomme_les_formes_sans_offrir_la_sortie_contradictoire`.
+
+**Ce que le garde ne vérifie pas, et c'est délibéré.** La **présence** de la ligne,
+rien de plus. Pas la disposition, pas qu'un invariant soit nommé, pas qu'un
+fichier de test l'assère : valider cela, c'est relire la revue, hors de ce que
+peut faire un garde pré-subprocess. Un `pass` portant une ligne
+`NEGATIVE-TEST:` vide de sens passe donc ici.
+
 **Ce que le vol ne ferme pas, et c'est écrit (AC3).** L'abstention de mika#2455
 **reste fail-open**, inchangée — aucune ligne de ce vol ne touche
 `validate_qa_ci_coherence`. Ce qui tient alors le merge fermé sur
@@ -5257,6 +5295,7 @@ SELECT target_key, after_value, count(*) FROM audit_events
 |---|---|---|---|
 | `pass_evidence_gate_disarmed` | INFO | **non vide avant l'ouverture** | l'état livré ; son absence après `make deploy` veut dire *armé*, ou un binaire antérieur au vol |
 | `reason = pass_section_absent` | WARN | **vide avant l'ouverture, puis décroissant** | la forme mesurée sur cm#217 et mika#2960 |
+| `reason = pass_negative_test_absent` | WARN | **vide avant l'ouverture, puis croissant AVANT de décroître** | le second terme (vol 2) ; l'ordre de la conjonction ne le rend visible qu'une fois la section acquise, donc sa montée mesure le progrès du premier motif, pas une dégradation |
 | `pass_evidence_gate_unrecognized_value` | WARN | **vide** | une faute de frappe laisse désarmé, donc muet autrement |
 | `after_value = 'allowed'` | audit | **non vide après l'ouverture** | le contrôle positif ; son absence seule ne prouve rien |
 
@@ -5267,9 +5306,11 @@ SELECT target_key, after_value, count(*) FROM audit_events
 > que le `mika-spirit` qui tourne porte le correctif **et** que
 > `pass_evidence_gate_disarmed` a cessé d'apparaître.
 
-**S1 — le compte des `pass` sans ligne `PIPELINE:` sur 7 jours. Cible : 0.** La
-requête est celle qui a produit la mesure du vol, ancrée en début de ligne
-(`contains` ne mesure pas la même population — c'est tout l'objet du § ci-dessus) :
+**S1 — le compte des `pass` sans ligne `PIPELINE:` et sans ligne
+`NEGATIVE-TEST:` sur 7 jours. Cible : 0 pour les deux.** La requête est celle qui
+a produit les mesures des deux vols, ancrée en début de ligne (`contains` ne
+mesure pas la même population — c'est tout l'objet des deux § ci-dessus, et sur le
+second jeton l'écart est exactement de 1 corps sur 260) :
 
 ```sh
 gh pr list --repo senara-solutions/<repo> --state all --limit 60 \
@@ -5279,9 +5320,19 @@ gh pr list --repo senara-solutions/<repo> --state all --limit 60 \
          | select(.body|startswith("VERDICT: pass"))
          | {n:$n,
             pipe:([.body|split("\n")|.[]
-                   |select(test("^[ \t*_]*[Pp][Ii][Pp][Ee][Ll][Ii][Nn][Ee]:"))]|length)}]
-        | {pass:length, sans_pipeline:([.[]|select(.pipe==0)]|length)}'
+                   |select(test("^[ \t*_]*[Pp][Ii][Pp][Ee][Ll][Ii][Nn][Ee]:"))]|length),
+            neg:([.body|split("\n")|.[]
+                   |select(test("^[ \t*_]*negative-test:"; "i"))]|length)}]
+        | {pass:length,
+           sans_pipeline:([.[]|select(.pipe==0)]|length),
+           sans_negative_test:([.[]|select(.neg==0)]|length),
+           sans_les_deux:([.[]|select(.pipe==0 and .neg==0)]|length)}'
 ```
+
+Les deux termes ne se somment pas : `sans_les_deux` est l'intersection, et c'est
+elle que l'ordre de la conjonction classe sous `pass_section_absent`. Lire
+`sans_negative_test` seul, puis en déduire le compte du second motif, donnerait un
+sur-compte de `sans_les_deux` exactement.
 
 **S2 — le compte des tours QA morts, à côté, sur la même fenêtre.** C'est l'autre
 moitié de la mesure, et elle n'est pas facultative : un `sans_pipeline: 0` obtenu
