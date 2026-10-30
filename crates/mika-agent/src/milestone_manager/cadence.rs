@@ -23,6 +23,10 @@
 use super::{
     assessor::{Assessor, AssessorConfig},
     evaluator::{FinishedFlight, FlightPrReads, FlightSource, FlightVerdict, evaluate_flights},
+    groom_trigger::{
+        GroomCandidate, GroomSender, GroomTriggerOutcome, groom_write_is_armed,
+        trigger_relief_grooms,
+    },
     pool_writer::{admit_pool_tickets, pool_write_is_armed},
     reader::{GhRunner, ProcessGhRunner, Reader, read_flight_prs},
     reporter::Reporter,
@@ -528,6 +532,18 @@ pub struct CycleContext<'a> {
     /// capacité de test perdue. `None` = non câblé, et aucun verdict n'est
     /// alors posté quel que soit l'état de l'interrupteur.
     pub gh_runner: Option<&'a dyn GhRunner>,
+    /// Par quoi part le geste de groom de la relève (mika#2958, vol 2b).
+    ///
+    /// `None` = non câblé, et c'est le cas **nominal** : le cycle le dit
+    /// `reason = "no_sender"` et ne tente rien. Un rail n'est posé que si
+    /// `MIKA_MANAGER_GROOM_URL` est déclarée — voir
+    /// [`super::resolve_groom_rail`], dont le site d'appel est `server/mod.rs`
+    /// parce que c'est là que le jeton interne est en portée.
+    ///
+    /// `&dyn` plutôt que `&Arc<dyn …>` comme ses trois voisins ci-dessus, sur la
+    /// forme de `gh_runner` : rien ici ne clone l'émetteur, et un test injecte
+    /// alors son double sans l'emballer.
+    pub groom_sender: Option<&'a dyn GroomSender>,
 }
 
 impl<'a> CycleContext<'a> {
@@ -540,6 +556,7 @@ impl<'a> CycleContext<'a> {
             flight_source: None,
             verdict_ledger: None,
             gh_runner: None,
+            groom_sender: None,
         }
     }
 
@@ -568,6 +585,11 @@ impl<'a> CycleContext<'a> {
 
     pub fn with_gh_runner(mut self, runner: Option<&'a dyn GhRunner>) -> Self {
         self.gh_runner = runner;
+        self
+    }
+
+    pub fn with_groom_sender(mut self, sender: Option<&'a dyn GroomSender>) -> Self {
+        self.groom_sender = sender;
         self
     }
 }
@@ -894,6 +916,65 @@ async fn write_pool_admissions(
     .await
 }
 
+/// Traduit la relève en candidats et déclenche leur groom (mika#2958, vol 2b).
+///
+/// Calqué sur [`write_pool_admissions`] : un seul refus **propre à ce site**,
+/// `no_relief_verdict`, pour `assessment.relief == None` — c'est une *lecture
+/// absente*, jamais une relève vide (mika#2331 ; et jamais deux populations sous
+/// un même nom, mika#2205 : une relève mesurée à zéro est dite `no_relief` par
+/// `trigger_relief_grooms`, sous un autre nom). Les trois motifs de fil
+/// (`disarmed`, `no_sender`, `no_relief`) ne sont **pas** redits ici : ils
+/// restent à leur site unique `cycle_refusal` (mika#2201).
+///
+/// L'interrupteur est lu ici, au moment de l'appel, comme
+/// [`write_pool_admissions`] lit `pool_write_is_armed()` : le geste n'a pas de
+/// mémoire de son armement, il le constate à chaque cycle.
+async fn trigger_cycle_grooms(
+    ctx: &CycleContext<'_>,
+    assessment: &Assessment,
+) -> GroomTriggerOutcome {
+    let Some(relief) = assessment.relief.as_ref() else {
+        info!(
+            target: "mika::milestone_manager",
+            event = "manager_groom_not_triggered",
+            reason = "no_relief_verdict",
+        );
+        return GroomTriggerOutcome::default();
+    };
+    let candidats: Vec<GroomCandidate> = relief
+        .next
+        .iter()
+        .map(|t| GroomCandidate {
+            number: t.number,
+            // `deja_groome` ne se lit PAS sur `plan_present` / `plan_reading` :
+            // c'est la lecture fausse. `UngroomedForDispatch` cite un plan et
+            // c'est pourtant un groom qui le débloque ; `EstimateOverFlightBound`
+            // a un plan dont le remède est un re-groom. La dérivation honnête est
+            // le motif de refus lui-même, lu à son site unique
+            // (`RefusalReason::remediable_by_grooming`, `pool.rs`).
+            //
+            // Toujours `false` pour un ticket de relève, par construction :
+            // `name_relief` a déjà filtré sur ce même prédicat. Ce n'est pas du
+            // code mort mais un contrôle de cohérence — si la relève cessait un
+            // jour de filtrer, le candidat refuserait au lieu de grommer un
+            // ticket que rien ne débloque.
+            deja_groome: !t.motive.remediable_by_grooming(),
+            // La fenêtre entre `message/send` et la pose du siège par le moteur
+            // n'est pas lisible d'ici sans état durable. Agent-scoped, la lecture
+            // rendrait une constante `false` (mika#2792). `false` est donc la
+            // valeur honnête à ce vol, et `GROOMS_PER_CYCLE = 1` borne le dégât à
+            // un doublon au pire. Une lecture par label ne la remplacerait pas :
+            // `assess_pool` écarte déjà les porteurs de siège
+            // (`labels_hold_dispatch_seat`), donc elle serait inerte.
+            //
+            // Tracked in: vol 2c — fenêtre d'idempotence durable + lecture
+            // container-scoped des tâches moteur `Groom …` / `ready-label`.
+            groom_en_cours: false,
+        })
+        .collect();
+    trigger_relief_grooms(groom_write_is_armed(), ctx.groom_sender, &candidats).await
+}
+
 /// La liste des vols postés que le prochain checkpoint portera : l'ancienne,
 /// plus les nouveaux, bornée aux plus récents.
 fn merge_posted(previous: &[String], newly: &[String]) -> Vec<String> {
@@ -963,6 +1044,12 @@ pub async fn run_manager_cycle_in(
     // champ de checkpoint n'en a besoin. Lié plutôt que jeté pour que ce vol-là
     // soit l'ajout d'une ligne et non une reprise du site.
     let _admitted = write_pool_admissions(cfg, ctx, &state, &assessment).await;
+    // mika#2958 vol 2b — le geste de la relève. Lié ici, après le bassin, parce
+    // que la relève dérive du verdict de bassin : la nommer avant de l'avoir
+    // mesurée n'a pas de sens. Le résultat est lié et non jeté pour la même
+    // raison qu'`_admitted` : le rendu ON du rapport, au vol 2d, doit être
+    // l'ajout d'une ligne et non une reprise du site.
+    let _grooms = trigger_cycle_grooms(ctx, &assessment).await;
     let severity = assessment.severity.clone();
     let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
 
@@ -1213,7 +1300,7 @@ pub async fn probe_executor_health(url: Option<&str>) -> Option<bool> {
 /// Live-runner variant: reads from `gh`, probes optional health endpoint,
 /// then runs the same cycle logic.
 pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
-    run_manager_cycle_with_auth(cfg, None, &[], None, None).await
+    run_manager_cycle_with_auth(cfg, None, &[], None, None, None).await
 }
 
 /// As [`run_manager_cycle`], with the mika#1949 auth-boundary wiring: where to
@@ -1225,12 +1312,19 @@ pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
 /// Depuis mika#2922, `verdict_ledger` dit où chaque verdict est **inscrit**.
 /// `None` rend un cycle identique à celui d'avant : aucune ligne d'audit, et
 /// aucun verdict changé — le registre n'a pas d'autorité.
+///
+/// Depuis mika#2958 vol 2b, `groom_sender` dit par quoi part le geste de groom de
+/// la relève. `None` est l'état **nominal** : le cycle dit `no_sender` et ne
+/// tente rien. Il n'est pas construit ici comme `gh_runner` l'est : le rail
+/// demande le jeton interne, que ce site ne tient pas — il se résout par
+/// [`super::resolve_groom_rail`] au site qui le tient (`server/mod.rs`).
 pub async fn run_manager_cycle_with_auth(
     cfg: &ManagerConfig,
     auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
     auth_notes: &[crate::milestone_manager::reporter::AuthBoundaryNote],
     flight_source: Option<&Arc<dyn FlightSource>>,
     verdict_ledger: Option<&Arc<dyn FlightVerdictLedger>>,
+    groom_sender: Option<&dyn GroomSender>,
 ) -> Result<CycleOutcome> {
     let reader = Reader::new(cfg.github_token.clone());
     let mut state = reader.read(&cfg.target).await?;
@@ -1249,13 +1343,15 @@ pub async fn run_manager_cycle_with_auth(
         .with_auth_notes(auth_notes)
         .with_flight_source(flight_source)
         .with_verdict_ledger(verdict_ledger)
-        .with_gh_runner(Some(&gh_runner));
+        .with_gh_runner(Some(&gh_runner))
+        .with_groom_sender(groom_sender);
     run_manager_cycle_in(cfg, state, &ctx).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::milestone_manager::groom_trigger::{ENV_GROOM_WRITE, GroomSendError};
     use crate::milestone_manager::pool_writer::ENV_POOL_WRITE;
     use crate::milestone_manager::types::{
         CiState, IssueState, MilestoneRef, ProgressCounts, RecentActivity, SubIssue,
@@ -3104,6 +3200,233 @@ mod tests {
         assert!(
             CycleContext::new(&rec, now).verdict_ledger.is_none(),
             "un contexte nominal ne câble aucun registre — c'est la branche `unwired`"
+        );
+    }
+
+    /// Un rail de groom qui n'envoie rien et retient tout (mika#2958, vol 2b).
+    ///
+    /// Il rend toujours `Ok(())` : ce double existe pour compter les envois, pas
+    /// pour rejouer les classes d'échec — celles-ci sont déjà couvertes à leur
+    /// site, dans `groom_trigger.rs`.
+    #[derive(Default)]
+    struct RecordingGroom {
+        envois: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GroomSender for RecordingGroom {
+        async fn send(&self, instruction: &str) -> Result<(), GroomSendError> {
+            self.envois.lock().unwrap().push(instruction.to_string());
+            Ok(())
+        }
+    }
+
+    /// L'interrupteur du geste de groom, armé pour la durée d'un test.
+    ///
+    /// Même forme que [`BassinArme`] ci-dessus, et pour la même raison : le seul
+    /// lecteur de la variable est `groom_write_is_armed`, donc la brancher par
+    /// l'environnement est la seule façon d'exercer le chemin de production.
+    struct GroomArme;
+
+    impl GroomArme {
+        fn poser() -> Self {
+            // SAFETY: single-threaded via serial_test.
+            unsafe { std::env::set_var(ENV_GROOM_WRITE, "1") };
+            Self
+        }
+    }
+
+    impl Drop for GroomArme {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded via serial_test.
+            unsafe { std::env::remove_var(ENV_GROOM_WRITE) };
+        }
+    }
+
+    /// L'assessment que le cycle a livré dans son rapport.
+    ///
+    /// Les tests du geste de groom le relisent plutôt que d'en construire un :
+    /// c'est ce qui leur évite un littéral de plus à maintenir, et c'est aussi
+    /// ce qui garantit qu'ils jugent la *vraie* relève de ce cycle.
+    fn assessment_du_cycle(rec: &RecordingDeliverer) -> crate::milestone_manager::Assessment {
+        rec.calls
+            .lock()
+            .unwrap()
+            .last()
+            .expect("le cycle a livré un rapport")
+            .2
+            .assessment
+            .clone()
+    }
+
+    /// La relève que le cycle a nommée.
+    fn releve_du_cycle(rec: &RecordingDeliverer) -> crate::milestone_manager::ReliefVerdict {
+        assessment_du_cycle(rec)
+            .relief
+            .expect("l'assesseur nomme toujours la relève")
+    }
+
+    /// **AC1 au niveau du cycle.** Le rail est câblé, la relève nomme un ticket,
+    /// l'interrupteur est à son état par défaut : zéro envoi.
+    ///
+    /// L'assertion sur la relève est la moitié qui compte, exactement comme pour
+    /// le bassin au-dessus : sans elle, ce test resterait vert le jour où
+    /// `base_state()` cesse de produire un refus que le grooming corrige, et il
+    /// certifierait le silence d'un cycle qui n'avait personne à grommer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_linterrupteur_ferme_ne_declenche_aucun_groom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(
+            &cfg,
+            state,
+            &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            releve_du_cycle(&rec)
+                .next
+                .iter()
+                .map(|t| t.number)
+                .collect::<Vec<_>>(),
+            vec![1802],
+            "la relève nomme bien un ticket — le silence qui suit est donc un refus, pas un vide"
+        );
+        assert!(
+            groom.envois.lock().unwrap().is_empty(),
+            "interrupteur fermé : aucun geste ne part, vu : {:?}",
+            groom.envois.lock().unwrap()
+        );
+    }
+
+    /// **Le contrôle négatif d'AC1**, dans le même test de bout en bout : avec
+    /// l'interrupteur ouvert, le même cycle envoie **exactement un** groom.
+    ///
+    /// Sans lui, « zéro envoi » serait aussi satisfait par un rail mort, un
+    /// câblage absent ou une sélection qui refuse tout le monde — trois causes
+    /// sous un même silence (classe mika#2205). L'instruction est asservie mot
+    /// pour mot parce que c'est elle que mika-dev reçoit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_linterrupteur_ouvert_declenche_un_seul_groom() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(
+            &cfg,
+            state,
+            &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *groom.envois.lock().unwrap(),
+            vec!["groom mika#1802".to_string()],
+            "un groom, un seul, et le geste est celui que le moteur comprend"
+        );
+    }
+
+    /// Une relève **non mesurée** se dit `no_relief_verdict`, et pas comme une
+    /// relève vide (mika#2331, mika#2205).
+    ///
+    /// L'interrupteur est ouvert et le rail est câblé : le seul refus possible
+    /// est donc bien celui du site d'appel. Un `Assessment` relu du rapport,
+    /// amputé de sa relève, est ce qui met ce champ à `None` sans introduire de
+    /// littéral — `Assessor::assess` ne rend jamais cet état, il n'appartient
+    /// qu'aux blobs écrits par un binaire antérieur au champ.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_une_releve_non_mesuree_ne_declenche_rien() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(&cfg, state, &CycleContext::new(&rec, now))
+            .await
+            .unwrap();
+
+        let mut assessment = assessment_du_cycle(&rec);
+        assessment.relief = None;
+        let issue = trigger_cycle_grooms(
+            &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
+            &assessment,
+        )
+        .await;
+
+        assert_eq!(issue, GroomTriggerOutcome::default());
+        assert!(
+            groom.envois.lock().unwrap().is_empty(),
+            "une lecture absente ne se grommme pas, vu : {:?}",
+            groom.envois.lock().unwrap()
+        );
+    }
+
+    /// `deja_groome` se dérive du **motif**, jamais de `plan_present`.
+    ///
+    /// Le motif est remplacé par un refus que le grooming ne corrige pas, sans
+    /// toucher à l'état : le candidat est alors sauté pour `already_groomed`,
+    /// alors que `plan_present` vaut toujours `false`. C'est le contrôle de
+    /// cohérence du plan — `name_relief` filtre déjà sur ce prédicat, donc l'état
+    /// testé ici est inatteignable aujourd'hui ; le jour où la relève cesserait
+    /// de filtrer, le candidat refuse au lieu de grommer un ticket que rien ne
+    /// débloque.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_un_motif_que_le_groom_ne_corrige_pas_est_saute() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(&cfg, state, &CycleContext::new(&rec, now))
+            .await
+            .unwrap();
+
+        let mut assessment = assessment_du_cycle(&rec);
+        let releve = assessment.relief.as_mut().expect("relève nommée");
+        assert!(
+            releve.next[0].motive.remediable_by_grooming(),
+            "prémisse : le motif que le cycle a posé est bien corrigible par un groom"
+        );
+        releve.next[0].motive = crate::milestone_manager::pool::RefusalReason::PriorPlanOnly;
+
+        let issue = trigger_cycle_grooms(
+            &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
+            &assessment,
+        )
+        .await;
+
+        assert_eq!(issue.declenches, Vec::<u64>::new());
+        assert_eq!(issue.sautes, vec![(1802, "already_groomed")]);
+        assert!(
+            groom.envois.lock().unwrap().is_empty(),
+            "rien ne part, vu : {:?}",
+            groom.envois.lock().unwrap()
         );
     }
 }

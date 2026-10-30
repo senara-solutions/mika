@@ -32,6 +32,7 @@ use super::cadence::{
     run_manager_cycle_with_auth,
 };
 use super::evaluator::FlightSource;
+use super::groom_trigger::GroomSender;
 use super::liveness::{LivenessEmitter, LivenessSink};
 use super::reader::{GhCommandError, GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
@@ -314,6 +315,21 @@ pub async fn manager_config_from_env(
 /// est alors exactement celui d'avant mika#2922. Le registre n'a **aucune**
 /// autorité : il écrit dans `audit_events` et ne touche ni la forge, ni le
 /// rapport, ni le verdict qu'il inscrit.
+///
+/// **mika#2958 vol 2b — `groom_sender`.** Par quoi part le geste de groom de la
+/// relève. `None` est l'état nominal : le cycle le dit `reason = "no_sender"` et
+/// ne tente rien. Elle n'est **pas** construite ici comme l'est le `gh_runner`
+/// du vol 2 de mika#2698 : le rail demande le jeton interne, que ni ce site ni
+/// `ManagerConfig` ne tiennent — il se résout par
+/// [`super::resolve_groom_rail`] au site qui le tient, et traverse jusqu'ici.
+/// `Arc` plutôt que la propriété nue, parce que le contexte de cycle est rebâti
+/// à chaque tour et que l'émetteur, lui, vit aussi longtemps que la tâche.
+// `groom_sender` est la huitième injection et franchit le seuil de clippy. Elles
+// ne se regroupent pas en structure sans perdre ce qui les tient : chacune est
+// une dépendance que la production construit et que les tests remplacent une à
+// une, et un agrégat obligerait chaque test à nommer les sept autres pour en
+// changer une. L'idiome du dépôt pour ce cas est l'exemption nommée.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_manager_cycle_task(
     mut cfg: ManagerConfig,
     cancel: CancellationToken,
@@ -322,6 +338,7 @@ pub fn spawn_manager_cycle_task(
     liveness_sink: Arc<dyn LivenessSink>,
     flight_source: Option<Arc<dyn FlightSource>>,
     verdict_ledger: Option<Arc<dyn FlightVerdictLedger>>,
+    groom_sender: Option<Arc<dyn GroomSender>>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -487,6 +504,7 @@ pub fn spawn_manager_cycle_task(
                 &pending_auth_notes,
                 flight_source.as_ref(),
                 verdict_ledger.as_ref(),
+                groom_sender.as_deref(),
             )
             .await
             {
@@ -2052,6 +2070,7 @@ mod tests {
             noop_liveness_sink(),
             None,
             None,
+            None,
         )
         .expect("first spawn returns Some(handle)");
 
@@ -2519,6 +2538,7 @@ mod tests {
             noop_liveness_sink(),
             None,
             None,
+            None,
         );
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
@@ -2530,6 +2550,7 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
             None,
             None,
         );
@@ -2695,6 +2716,7 @@ mod tests {
             Arc::new(resolver),
             None,
             noop_liveness_sink(),
+            None,
             None,
             None,
         )

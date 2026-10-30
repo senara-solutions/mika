@@ -1,5 +1,5 @@
 //! Le geste de groom de la relève — `MIKA_MANAGER_GROOM_WRITE`, OFF par défaut
-//! (mika#2958, vols 1 et 2a).
+//! (mika#2958, vols 1 à 2b).
 //!
 //! Ce fichier est la **troisième et dernière** exception nommée de l'allowlist
 //! de `no_dispatch_test.rs`, pour l'unique jeton `message/send`. Tout le reste
@@ -48,12 +48,17 @@
 //!
 //! ## Ce que ce vol ne fait pas
 //!
-//! **Il porte le rail, mais ne le branche pas.** [`A2aGroomSender`] est livré
-//! par le vol 2a, et reste un objet qu'aucun cycle n'instancie : `sender` est
-//! `None` au site d'appel, ce qui est le cas nominal et se lit comme tel
-//! (`reason = "no_sender"`). Le câblage de cycle, la lecture « un groom est en
-//! cours » et le rendu de rapport (AC4, moitié ON) sont les vols 2b et 2c —
-//! voir le `Tracked in:` du corps de PR de ce vol.
+//! **Le rail est branché, mais son idempotence n'est pas durable.** Depuis le
+//! vol 2b, [`resolve_groom_rail`] construit l'émetteur au site qui tient le jeton
+//! et `cadence.rs` l'injecte dans le cycle : le chemin de production existe de
+//! bout en bout, et c'est l'interrupteur — OFF — qui le tient muet. Ce qui
+//! manque est la lecture « un groom est **en cours** » : [`GroomCandidate`] la
+//! reçoit à `false` par construction, parce que la fenêtre entre `message/send`
+//! et la pose du siège par le moteur n'est pas lisible sans état durable, et
+//! qu'agent-scoped la lecture rendrait une constante `false` (mika#2792).
+//! [`GROOMS_PER_CYCLE`] borne le dégât à un doublon au pire. Cette fenêtre est le
+//! vol 2c, et le rendu de rapport (AC4, moitié ON) le vol 2d — voir le
+//! `Tracked in:` du corps de PR de ce vol.
 //!
 //! **Il n'ouvre pas l'interrupteur.** L'ouverture reste un geste opérateur, au
 //! seuil écrit dans le vol 1 de la Phase 2 (c) : les interrupteurs de
@@ -65,6 +70,22 @@ use std::time::Duration;
 
 /// L'interrupteur du point 1 du ticket. **OFF par défaut.**
 pub const ENV_GROOM_WRITE: &str = "MIKA_MANAGER_GROOM_WRITE";
+
+/// L'adresse du rail, **déclarée** — jamais dérivée d'une URL voisine.
+///
+/// Même forme maison que [`super::ENV_LIVENESS_URL`] (mika#1990 R2) : absente ou
+/// vide ⇒ rail désarmé, zéro envoi, zéro erreur ; posée ⇒ rail armé. Le manager
+/// connaît déjà trois autres URLs (livraison, escalade, santé) et aucune ne peut
+/// servir de source : elles désignent des services différents, et le jour où
+/// l'une déménage le rail de groom partirait avec elle sans que personne l'ait
+/// demandé.
+///
+/// Le jeton, lui, n'a **pas** de variable à lui : `/a2a/{agent}` n'accepte que
+/// `MIKA_INTERNAL_TOKEN` (`auth::require_internal_token`), donc une seconde
+/// déclaration serait un second nom pour un fait unique, divergent au premier
+/// roulement de secret. Il arrive en argument de [`resolve_groom_rail`], depuis
+/// le site qui le tient déjà.
+pub const ENV_GROOM_URL: &str = "MIKA_MANAGER_GROOM_URL";
 
 /// Le geste autorisé, **à plat** — dans la forme même que
 /// `no_dispatch_test.rs` grep. Voir le docstring du module, propriété 3 : ce
@@ -189,6 +210,99 @@ impl A2aGroomSender {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             url,
             token,
+        }
+    }
+}
+
+/// Le budget du geste de groom, **dérivé** du budget de tour de la flotte.
+///
+/// `A2aGroomSender::new` reste agnostique de sa valeur — le budget y est un
+/// argument, et le paragraphe ci-dessus dit pourquoi. Cette constante est le
+/// choix du **résolveur**, c'est-à-dire du seul endroit qui sait vers quoi le
+/// rail pointe : un tour de mika-dev.
+///
+/// Le facteur 2 est ce que ce paragraphe exige : il faut **majorer** le budget
+/// de tour, pas l'égaler. À l'égalité, les deux horloges expirent ensemble et la
+/// course est garantie plutôt qu'improbable — le manager abandonne, le tour part
+/// quand même, le rapport dit « échec » et le cycle suivant relance. Dérivé de
+/// [`mika_common::llm::budget::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS`] et non écrit en
+/// chiffres, pour que le jour où la flotte change de plafond le rail suive sans
+/// qu'on y pense (mika#2189 D3, forme fractionnaire du même module).
+pub const GROOM_SEND_BUDGET: Duration =
+    Duration::from_secs(2 * mika_common::llm::budget::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS);
+
+/// Résout le rail depuis l'environnement, **au site qui tient le jeton**.
+///
+/// Trois issues, sur les trois paliers de la forme maison (mika#1990 D4) :
+///
+/// 1. `MIKA_MANAGER_GROOM_URL` absente, ou vide après `trim` ⇒ `None`. C'est
+///    l'**état nominal** d'un conteneur qui n'a pas ouvert ce canal : le cycle le
+///    dira `reason = "no_sender"`, et aucune erreur n'est levée. Une absence de
+///    rail n'est pas une faute de démarrage — d'où `Option` et jamais `Result`.
+/// 2. URL posée, `internal_token` absent ou vide ⇒ `None` également, mais la
+///    sonde le dit à **WARN** : c'est une configuration à moitié faite, dont
+///    l'effet est identique au cas 1 alors que l'intention ne l'est pas. Le
+///    distinguer est tout ce qui sépare « personne n'a branché le rail » de
+///    « quelqu'un l'a branché et le serveur n'a pas de jeton » (mika#2205).
+/// 3. Les deux présents ⇒ `Some(A2aGroomSender)` armé sur
+///    [`GROOM_SEND_BUDGET`].
+///
+/// **Aucune dérivation.** Le jeton vient de l'appelant, l'URL de sa propre
+/// variable, et rien n'est reconstruit depuis une URL voisine : voir
+/// [`ENV_GROOM_URL`].
+pub fn resolve_groom_rail(internal_token: Option<&str>) -> Option<A2aGroomSender> {
+    let url = std::env::var(ENV_GROOM_URL)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let token = internal_token.map(str::trim).filter(|t| !t.is_empty());
+    let budget_secs = GROOM_SEND_BUDGET.as_secs();
+
+    // La sonde est émise aux **trois** issues, y compris la nominale : sans la
+    // ligne du cas 1, « le rail n'est pas déclaré » et « ce binaire ne sait pas
+    // résoudre de rail » rendent les mêmes octets, et son absence doit se lire
+    // comme un binaire antérieur à ce vol (motif mika#2340).
+    //
+    // Ni l'URL ni le jeton n'atteignent la ligne — discipline du module, et
+    // promesse du manifeste d'egress pour ce sink. Les deux booléens
+    // **déterminent** l'issue, donc aucun champ `reason` ne les redouble : un
+    // champ dérivé d'un autre est une valeur de plus à relire, qui peut mentir
+    // le jour où l'une des deux dérives. Ce qui sépare le refus du cas nominal
+    // est le **niveau**.
+    match (url, token) {
+        (None, _) => {
+            tracing::info!(
+                event = "manager_groom_rail_resolved",
+                url_set = false,
+                token_set = token.is_some(),
+                budget_secs,
+                "rail de groom non déclaré — le cycle dira no_sender"
+            );
+            None
+        }
+        (Some(_), None) => {
+            tracing::warn!(
+                event = "manager_groom_rail_resolved",
+                url_set = true,
+                token_set = false,
+                budget_secs,
+                "rail de groom déclaré sans jeton interne — aucun groom ne partira"
+            );
+            None
+        }
+        (Some(url), Some(token)) => {
+            tracing::info!(
+                event = "manager_groom_rail_resolved",
+                url_set = true,
+                token_set = true,
+                budget_secs,
+                "rail de groom armé"
+            );
+            Some(A2aGroomSender::new(
+                url,
+                token.to_string(),
+                GROOM_SEND_BUDGET,
+            ))
         }
     }
 }
@@ -995,5 +1109,126 @@ mod tests {
             "interrupteur OFF : rien n'est déclenché et rien n'est sauté — \
              un `sautes` non vide voudrait dire que le cycle est entré dans la boucle"
         );
+    }
+
+    /// Pose [`ENV_GROOM_URL`] le temps d'un test et la retire à la sortie,
+    /// **même en cas de panique** — patron d'`InterrupteurArme` (`cadence.rs`).
+    struct AdressePosee;
+
+    impl AdressePosee {
+        fn poser(valeur: &str) -> Self {
+            // SAFETY: single-threaded via serial_test.
+            unsafe { std::env::set_var(ENV_GROOM_URL, valeur) };
+            Self
+        }
+
+        /// L'absence est un état à poser explicitement : un test précédent peut
+        /// avoir laissé la variable, et un environnement de CI peut la porter.
+        fn retirer() -> Self {
+            // SAFETY: single-threaded via serial_test.
+            unsafe { std::env::remove_var(ENV_GROOM_URL) };
+            Self
+        }
+    }
+
+    impl Drop for AdressePosee {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded via serial_test.
+            unsafe { std::env::remove_var(ENV_GROOM_URL) };
+        }
+    }
+
+    /// Le budget du rail **majore** le budget de tour, et il le majore par
+    /// dérivation.
+    ///
+    /// Les deux moitiés comptent. L'égalité serait une course garantie (voir le
+    /// docstring de [`GROOM_SEND_BUDGET`]), et une valeur écrite en chiffres
+    /// cesserait de suivre le plafond de la flotte le jour où il bouge — le test
+    /// compare donc à la constante, jamais à `600`.
+    #[test]
+    fn mika2958_le_budget_du_rail_majore_le_budget_de_tour() {
+        let tour = mika_common::llm::budget::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS;
+        assert!(
+            GROOM_SEND_BUDGET.as_secs() > tour,
+            "le budget du geste ({} s) doit MAJORER le budget de tour ({tour} s) : \
+             à l'égalité, les deux horloges expirent ensemble et le double groom \
+             devient la règle plutôt que l'exception",
+            GROOM_SEND_BUDGET.as_secs()
+        );
+        assert_eq!(
+            GROOM_SEND_BUDGET.as_secs(),
+            2 * tour,
+            "le budget est dérivé du plafond de la flotte, pas écrit en chiffres"
+        );
+    }
+
+    /// Les trois issues de la résolution, dans un seul test parce que c'est leur
+    /// **contraste** qui est la propriété.
+    ///
+    /// Le premier cas est aussi le contrôle négatif du troisième : l'URL absente
+    /// avec un jeton présent rend `None`, ce qui est ce qui prouve qu'aucune URL
+    /// n'est dérivée d'une voisine ni d'un défaut de code. Si une dérivation
+    /// existait, ce cas rendrait `Some` et le reste du test resterait vert.
+    #[test]
+    #[serial_test::serial]
+    fn mika2958_la_resolution_du_rail_a_trois_issues() {
+        {
+            let _absente = AdressePosee::retirer();
+            assert!(
+                resolve_groom_rail(Some("jeton-de-test")).is_none(),
+                "URL absente ⇒ rail désarmé, et c'est l'état NOMINAL : aucune \
+                 adresse n'est dérivée des trois autres URLs du manager"
+            );
+        }
+        {
+            let _vide = AdressePosee::poser("   ");
+            assert!(
+                resolve_groom_rail(Some("jeton-de-test")).is_none(),
+                "URL vide après trim ⇒ désarmé, troisième palier de la forme maison"
+            );
+        }
+        {
+            let _posee = AdressePosee::poser("http://127.0.0.1:8080/a2a/mika-dev");
+            assert!(
+                resolve_groom_rail(None).is_none(),
+                "URL posée sans jeton ⇒ désarmé : le rail ne s'invente pas de jeton"
+            );
+            assert!(
+                resolve_groom_rail(Some("  ")).is_none(),
+                "un jeton vide n'est pas un jeton — même palier que l'URL vide"
+            );
+            let rail =
+                resolve_groom_rail(Some("jeton-de-test")).expect("URL et jeton posés ⇒ rail armé");
+            assert_eq!(
+                rail.url, "http://127.0.0.1:8080/a2a/mika-dev",
+                "l'adresse du rail est celle déclarée, à l'octet"
+            );
+            assert_eq!(
+                rail.token, "jeton-de-test",
+                "le jeton du rail est celui reçu en argument"
+            );
+        }
+    }
+
+    /// L'adresse est `trim`ée avant d'atteindre le rail.
+    ///
+    /// Une variable d'environnement posée dans un `.env` traîne régulièrement un
+    /// espace ou un retour de ligne. Sans `trim`, le POST partirait vers une URL
+    /// invalide et le cycle lirait `send_failed` — un échec de transport là où le
+    /// fait est une faute de frappe.
+    #[test]
+    #[serial_test::serial]
+    fn mika2958_ladresse_du_rail_est_trimee() {
+        let _posee = AdressePosee::poser("  http://127.0.0.1:8080/a2a/mika-dev\n");
+        let rail = resolve_groom_rail(Some("jeton-de-test")).expect("rail armé");
+        assert_eq!(rail.url, "http://127.0.0.1:8080/a2a/mika-dev");
+    }
+
+    /// Le nom de la variable est un **format de fil** : il est écrit dans
+    /// `.env.example`, dans le manifeste d'egress et dans les recettes de
+    /// l'opérateur. Le renommer est un geste d'opérateur, pas un refactor.
+    #[test]
+    fn mika2958_le_nom_de_la_variable_dadresse_est_un_format_de_fil() {
+        assert_eq!(ENV_GROOM_URL, "MIKA_MANAGER_GROOM_URL");
     }
 }

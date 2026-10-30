@@ -314,8 +314,9 @@ pub use evaluator::{
     milestone_issue_urls,
 };
 pub use groom_trigger::{
-    A2aGroomSender, ENV_GROOM_WRITE, GROOMS_PER_CYCLE, GroomCandidate, GroomSendError, GroomSender,
-    GroomTriggerOutcome, groom_write_is_armed, trigger_relief_grooms,
+    A2aGroomSender, ENV_GROOM_URL, ENV_GROOM_WRITE, GROOM_SEND_BUDGET, GROOMS_PER_CYCLE,
+    GroomCandidate, GroomSendError, GroomSender, GroomTriggerOutcome, groom_write_is_armed,
+    resolve_groom_rail, trigger_relief_grooms,
 };
 pub use liveness::{
     ENV_LIVENESS_URL, HttpLivenessSink, LIVENESS_ENTITY, LIVENESS_TIMEOUT, LivenessBody,
