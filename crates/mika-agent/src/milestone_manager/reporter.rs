@@ -39,7 +39,7 @@
 
 use super::evaluator::{
     CiKnowledge, CiUnreadCause, DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
-    MilestoneMembership, NotFlightReason, PrStateKnowledge,
+    HeadReviewState, MilestoneMembership, NotFlightReason, PrStateKnowledge, ReviewKnowledge,
 };
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
@@ -787,13 +787,14 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
 /// connue ne gagne pas un segment qui ne dit rien. C'est aussi ce qui laisse
 /// intact le rendu de la population d'avant mika#2921.
 ///
-/// Le segment de CI (mika#2968, AC3) est le seul qui ne s'omette **jamais** :
-/// il est inséré entre l'état de PR et la recommandation, parce que c'est l'une
-/// des deux prémisses sur lesquelles cette recommandation repose et qu'une
-/// prémisse se lit avant sa conclusion. Il est toujours rendu parce que
-/// l'omettre ferait de « rien n'a été lu » et de « ce rapport est antérieur au
-/// champ » les mêmes octets (classe mika#2205) : le silence serait le seul
-/// endroit où une CI non lue pourrait passer pour verte.
+/// Les segments de CI (mika#2968, AC3) et de revue (vol 2b, AC6) sont les seuls
+/// qui ne s'omettent **jamais** : ils sont insérés entre l'état de PR et la
+/// recommandation, parce que ce sont les prémisses sur lesquelles cette
+/// recommandation repose et qu'une prémisse se lit avant sa conclusion. Ils sont
+/// toujours rendus parce que l'omettre ferait de « rien n'a été lu » et de « ce
+/// rapport est antérieur au champ » les mêmes octets (classe mika#2205) : le
+/// silence serait le seul endroit où une CI non lue pourrait passer pour verte,
+/// et une revue non lue pour une approbation.
 pub fn render_flight_verdict(v: &FlightVerdict) -> String {
     let mut segments = vec![
         flight_ticket_label(v),
@@ -805,6 +806,7 @@ pub fn render_flight_verdict(v: &FlightVerdict) -> String {
         segments.push(etat);
     }
     segments.push(flight_ci_label(&v.ci));
+    segments.push(flight_review_label(&v.review));
     segments.push(flight_recommendation_label(v.recommendation).to_string());
     format!("- {}", segments.join(" — "))
 }
@@ -915,6 +917,83 @@ fn ci_unread_label(cause: CiUnreadCause) -> &'static str {
         CiUnreadCause::NotFound => "PR hors de la page lue",
         CiUnreadCause::PrNotOpen => "PR non ouverte",
     }
+}
+
+/// Ce que le manager sait de la revue de la tête de la PR (mika#2968, vol 2b,
+/// AC6), sur la forme exacte de [`flight_ci_label`].
+///
+/// **La cause de non-lecture est rendue par [`ci_unread_label`]**, et non par un
+/// second vocabulaire : `HeadUnreadCause` *est* `CiUnreadCause`, parce que les
+/// deux axes sortent du même appel `gh`. Deux tables de dix libellés diraient la
+/// même chose deux fois et divergeraient au premier libellé retouché d'un seul
+/// côté (mika#2158).
+///
+/// Ce que ce libellé dit de plus que la recommandation, et qui est tout l'objet
+/// de l'AC6 : **sur quel commit** la revue portait. « approuvée » et « approuvée
+/// sur la tête » appellent des gestes opposés, et seule la seconde autorise une
+/// fusion.
+///
+/// `decision` — le `reviewDecision` agrégé par la forge — n'est rendu **qu'ici**.
+/// Il ne dit pas sur quel commit, donc il ne peut pas fonder une décision ; mais
+/// c'est le mot que l'opérateur voit dans l'interface de la forge, et le rapport
+/// est plus lisible quand il l'emploie. C'est la frontière décision / rapport du
+/// § 2 du plan, rendue par la place du champ et non par un commentaire.
+///
+/// Le `match` est exhaustif sur les deux axes, sans bras `_` (mika#2923).
+fn flight_review_label(review: &ReviewKnowledge) -> String {
+    match review {
+        ReviewKnowledge::Read {
+            state,
+            decision,
+            at,
+        } => {
+            let etat = match state {
+                HeadReviewState::ApprovedOnHead => "revue : approuvée sur la tête".to_string(),
+                HeadReviewState::ApprovedOnOlderCommit { reviewed } => match reviewed {
+                    Some(commit) => format!(
+                        "revue : approuvée sur {}, pas sur la tête",
+                        commit_abrege(commit)
+                    ),
+                    None => "revue : approuvée sur un commit non lu, pas sur la tête".to_string(),
+                },
+                HeadReviewState::Held { reason, on_head } => {
+                    format!("revue : hold[{reason}] {}", place_de_la_revue(*on_head))
+                }
+                HeadReviewState::NoVerdict { on_head } => format!(
+                    "revue : commentée sans verdict {}",
+                    place_de_la_revue(*on_head)
+                ),
+                HeadReviewState::NoReview => "revue : aucune revue du relecteur".to_string(),
+            };
+            let forge = match decision {
+                Some(d) => format!(", décision forge {d}"),
+                None => String::new(),
+            };
+            format!("{etat} (lue au cycle de {at}{forge})")
+        }
+        ReviewKnowledge::Unread(cause) => format!("revue non lue ({})", ci_unread_label(*cause)),
+    }
+}
+
+/// « sur la tête » / « sur un commit antérieur » — le fait qui décide, dit en
+/// clair à chacun des deux états de revue qui le portent.
+fn place_de_la_revue(on_head: bool) -> &'static str {
+    if on_head {
+        "sur la tête"
+    } else {
+        "sur un commit antérieur"
+    }
+}
+
+/// Les sept premiers caractères d'un OID, la graphie que `git` et la forge
+/// emploient.
+///
+/// Par `chars()` et non par tranche d'octets : un `&str[..7]` panique sur une
+/// frontière multi-octets, et `scripts/check-byte-slices.sh` refuse la forme
+/// (mika#764) — la règle porte sur la **forme**, pas sur la certitude que la
+/// valeur est hexadécimale.
+fn commit_abrege(commit: &str) -> String {
+    commit.chars().take(7).collect()
 }
 
 /// `pub(crate)` depuis mika#2922 (vol 3) : le compte de concordance rend la
@@ -1085,6 +1164,7 @@ mod tests {
             pr_state: PrStateKnowledge::Read(None),
             in_target_milestone: MilestoneMembership::InTarget,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
+            review: ReviewKnowledge::Unread(CiUnreadCause::NotMeasured),
             recommendation,
             completed_at: Some("2026-10-13T08:00:00Z".into()),
         }
@@ -1138,19 +1218,19 @@ mod tests {
         );
         assert!(
             out.contains(
-                "- mika#2693 — milestone cible — PR ouverte (#2696) — 83 tours (plafond non instrumenté) — CI non lue (non mesurée) — merge-candidat"
+                "- mika#2693 — milestone cible — PR ouverte (#2696) — 83 tours (plafond non instrumenté) — CI non lue (non mesurée) — revue non lue (non mesurée) — merge-candidat"
             ),
             "Obtenu :\n{out}"
         );
         assert!(
             out.contains(
-                "- mika#2661 — milestone cible — mort au plafond (budget_exhausted) — 200 tours — CI non lue (non mesurée) — re-groom"
+                "- mika#2661 — milestone cible — mort au plafond (budget_exhausted) — 200 tours — CI non lue (non mesurée) — revue non lue (non mesurée) — re-groom"
             ),
             "Obtenu :\n{out}"
         );
         assert!(
             out.contains(
-                "- mika#2655 — milestone cible — PR de sauvetage (#2690) — 141 tours (plafond non instrumenté) — CI non lue (non mesurée) — reprise à la main"
+                "- mika#2655 — milestone cible — PR de sauvetage (#2690) — 141 tours (plafond non instrumenté) — CI non lue (non mesurée) — revue non lue (non mesurée) — reprise à la main"
             ),
             "Obtenu :\n{out}"
         );
@@ -1209,7 +1289,7 @@ mod tests {
             out.contains(
                 "- (ticket inconnu) — milestone cible — mort — cause non classée (PLAN_COMMITTED) — \
                  tours non lus (plafond non instrumenté) — CI non lue (non mesurée) — \
-                 reprise à la main"
+                 revue non lue (non mesurée) — reprise à la main"
             ),
             "Obtenu :\n{out}"
         );
@@ -1333,7 +1413,7 @@ mod tests {
         ));
         assert_eq!(
             hors,
-            "- mika#2900 — hors milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — état de PR non lu — CI non lue (non mesurée) — merge-candidat",
+            "- mika#2900 — hors milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — état de PR non lu — CI non lue (non mesurée) — revue non lue (non mesurée) — merge-candidat",
         );
 
         let dans = render_flight_verdict(&FlightVerdict {
@@ -1343,7 +1423,7 @@ mod tests {
         });
         assert_eq!(
             dans,
-            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — PR open — CI non lue (non mesurée) — merge-candidat",
+            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — PR open — CI non lue (non mesurée) — revue non lue (non mesurée) — merge-candidat",
         );
         // L'aiguille **nomme son segment** depuis mika#2968 : « CI non lue »
         // contient « non lu », donc un `contains("non lu")` nu rougirait sur la
@@ -1369,7 +1449,7 @@ mod tests {
         });
         assert_eq!(
             ligne,
-            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — CI non lue (non mesurée) — merge-candidat",
+            "- mika#2900 — milestone cible — PR ouverte (#9001) — 42 tours (plafond non instrumenté) — CI non lue (non mesurée) — revue non lue (non mesurée) — merge-candidat",
         );
         // Même raison que ci-dessus : l'aiguille nomme le segment d'état de PR,
         // pas le mot « non lu » que la CI emploie désormais sur son propre axe.

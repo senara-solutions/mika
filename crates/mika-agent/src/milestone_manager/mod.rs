@@ -330,8 +330,8 @@ pub use pool::{
 };
 pub use pool_writer::{ENV_POOL_WRITE, admit_pool_tickets, pool_write_is_armed};
 pub use reader::{
-    FLIGHT_PR_READ_LIMIT, FlightPrRead, GhRunner, OUTSIDE_READ_LIMIT, ProcessGhRunner, Reader,
-    RepoPrRead, TIMELINE_PAGE_SIZE, TIMELINE_PROBE_MAX, compose_from_gh_outputs,
+    FLIGHT_PR_READ_LIMIT, FlightPrRead, GhRunner, HeadReview, OUTSIDE_READ_LIMIT, ProcessGhRunner,
+    Reader, RepoPrRead, TIMELINE_PAGE_SIZE, TIMELINE_PROBE_MAX, compose_from_gh_outputs,
     compose_merged_prs, compose_outside_candidates, compose_ready_pool, read_flight_prs,
 };
 pub use relief::{RELIEF_SIZE, ReliefTicket, ReliefVerdict, name_relief};
