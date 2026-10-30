@@ -1138,11 +1138,33 @@ fn test_get_last_cli_session_excludes_active_sessions() {
     assert!(result.is_none());
 }
 
+// Le troisième argument depuis mika#2981 — ce que chaque test de cette
+// famille en fait, et pourquoi il n'est pas `None`.
+//
+// Ces tests épinglent la moitié **sélection de row** du prédicat : quelle
+// row la requête retient, et laquelle elle écarte. Cette moitié ne doit pas
+// bouger, donc chacun garde son verdict attendu **au mot**. Pour cela ils
+// tournent dans la configuration nominale d'après mika#2981 — une preuve qui
+// porte son plan, et un plan attendu qui est le sien : c'est ce que
+// `dispatch-lib.sh` frappe maintenant, et c'est la seule combinaison qui rend
+// `Converged`. Passer `None` ici aurait rendu `ConvergedUnbound` sur chaque
+// cas nominal, c'est-à-dire aurait fait de ces tests des tests de la grâce D3
+// au lieu de tests de la requête.
+//
+// Sur les cas négatifs le plan attendu est le même, et la preuve semée reste
+// une preuve **liée et nominale** là où l'une existe : ce qui sépare le cas du
+// nominal est alors le seul terme que le test nomme (statut, classe, agent,
+// URL), jamais la forme de la preuve.
+//
+// La forme nue et la grâce qu'elle emprunte sont épinglées ailleurs, où c'est
+// leur sujet : `task_state::tasks` pour le verdict, `harnais_porte` pour la
+// porte.
+
 #[test]
 fn test_groom_cross_check_no_task_returns_false() {
     let db = db();
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent
     );
@@ -1151,9 +1173,14 @@ fn test_groom_cross_check_no_task_returns_false() {
 #[test]
 fn test_groom_cross_check_completed_callback_returns_true() {
     let db = db();
-    completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    completed_groom_pair(
+        &db,
+        "mika",
+        GROOM_ISSUE_URL,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Converged
     );
@@ -1162,11 +1189,15 @@ fn test_groom_cross_check_completed_callback_returns_true() {
 #[test]
 fn test_groom_cross_check_delivered_callback_returns_true() {
     let db = db();
-    let (_, callback_id) =
-        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    let (_, callback_id) = completed_groom_pair(
+        &db,
+        "mika",
+        GROOM_ISSUE_URL,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     db.update_task_status(&callback_id, "delivered").unwrap();
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Converged
     );
@@ -1179,14 +1210,18 @@ fn test_groom_cross_check_delivered_callback_returns_true() {
 #[test]
 fn test_groom_cross_check_survives_parent_flip_to_implement() {
     let db = db();
-    let (parent_id, _) =
-        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    let (parent_id, _) = completed_groom_pair(
+        &db,
+        "mika",
+        GROOM_ISSUE_URL,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     assert!(
         db.update_task_dispatch_class(&parent_id, "mika", "implement")
             .unwrap()
     );
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Converged
     );
@@ -1202,9 +1237,14 @@ fn test_groom_cross_check_legacy_suffixed_parent_url_returns_true() {
         GROOM_ISSUE_URL,
         crate::task_state::tasks::GROOM_PHASE_SUFFIX
     );
-    completed_groom_pair(&db, "mika", &suffixed, GROOM_CALLBACK_PLAN_GROOMED);
+    completed_groom_pair(
+        &db,
+        "mika",
+        &suffixed,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Converged
     );
@@ -1220,7 +1260,7 @@ fn test_groom_cross_check_pending_callback_returns_false() {
         .unwrap();
     // Callback never completed — no result, status pending.
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent
     );
@@ -1234,7 +1274,7 @@ fn test_groom_cross_check_plan_iterate_returns_false() {
     // pas `MarkerOutOfPosition`. C'est le contrôle qui sépare « n'a pas
     // convergé » de « a convergé et l'a mal écrit » (mika#2590 D2).
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent
     );
@@ -1249,10 +1289,14 @@ fn test_groom_cross_check_implement_class_callback_returns_false() {
     let callback_id = db
         .create_task(&groom_callback("mika", &parent_id, "implement"))
         .unwrap();
-    db.update_task_completed(&callback_id, "mika", Some(GROOM_CALLBACK_PLAN_GROOMED))
-        .unwrap();
+    db.update_task_completed(
+        &callback_id,
+        "mika",
+        Some(&groom_callback_liee_au_plan(GROOM_PLAN_VOL_1)),
+    )
+    .unwrap();
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent
     );
@@ -1266,11 +1310,11 @@ fn test_groom_cross_check_different_agent_returns_false() {
         &db,
         "other-agent",
         GROOM_ISSUE_URL,
-        GROOM_CALLBACK_PLAN_GROOMED,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
     );
     // Query for "mika" — must not see the other agent's proof.
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent
     );
@@ -1279,11 +1323,17 @@ fn test_groom_cross_check_different_agent_returns_false() {
 #[test]
 fn test_groom_cross_check_different_issue_returns_false() {
     let db = db();
-    completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    completed_groom_pair(
+        &db,
+        "mika",
+        GROOM_ISSUE_URL,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     assert_eq!(
         db.has_completed_groom_for_issue(
             "mika",
             "https://github.com/senara-solutions/mika/issues/124",
+            Some(GROOM_PLAN_VOL_1),
         )
         .unwrap(),
         GroomConvergence::Absent
@@ -1304,7 +1354,7 @@ fn test_groom_cross_check_parent_only_legacy_shape_returns_false() {
     let parent_id = db.create_task(&groom_parent("mika", &suffixed)).unwrap();
     db.update_task_status(&parent_id, "completed").unwrap();
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent
     );

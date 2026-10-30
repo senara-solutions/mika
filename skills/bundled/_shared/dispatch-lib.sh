@@ -10249,6 +10249,20 @@ _write_canonical_callout() {
         return 1
     }
 
+    # mika#2981 — publier le plan VALIDÉ pour que la preuve de groom le porte.
+    #
+    # La porte de provenance (mika#2287) acceptait n'importe quelle preuve de
+    # groom du ticket : sur un ticket à plusieurs vols, celle du vol 1 laissait
+    # partir dev-pilot pour le vol N. La preuve doit donc nommer SON plan, et
+    # `plan_relpath` est le seul chemin fiable à cet instant — il vient d'être
+    # strippé, borné au worktree et vérifié présent, et contrairement à
+    # `$VALID_PLAN` il n'est pas vide sur un re-dispatch.
+    #
+    # L'affectation est AVANT le court-circuit d'idempotence ci-dessous : un
+    # corps déjà estampillé est un succès du producteur, et sa preuve doit
+    # porter le plan tout autant.
+    GROOM_CALLOUT_PLAN="$plan_relpath"
+
     # Fetch current body for idempotency check.
     local current_body
     current_body=$(gh issue view "$ISSUE_NUM" --repo "senara-solutions/$REPO" \
@@ -12681,6 +12695,16 @@ dispatch_claude_pilot() {
     command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI is required but not in PATH" >&2; exit 1; }
     command -v claude-pilot >/dev/null 2>&1 || { echo "Error: claude-pilot CLI is required but not in PATH" >&2; exit 1; }
 
+    # mika#2981 — le plan que la preuve de groom nommera, remis à vide ICI.
+    #
+    # `_write_canonical_callout` l'affecte quand il a validé un chemin ; la
+    # frappe `Outcome: PLAN_GROOMED` plus bas le suffixe quand il est non vide.
+    # La remise à vide en tête du dispatch est ce qui empêche une valeur d'un
+    # dispatch antérieur de survivre dans l'environnement et de faire porter à
+    # une preuve le plan d'un AUTRE vol — exactement le défaut que mika#2981
+    # ferme, réintroduit par le haut.
+    GROOM_CALLOUT_PLAN=""
+
     # The claude-pilot venv smoke test (mika#1200) used to sit HERE, and that
     # placement is the whole of mika#2634. It now runs AFTER the EXIT trap is
     # armed — see `_launcher_smoke_test` below, called a few lines down.
@@ -12993,7 +13017,42 @@ ${RESULT}"
             # des `PIPELINE FAILURE:` périmés au-dessus est conservé — c'est une
             # démotion depuis mika#2077, et elle ne touche aucune ligne
             # `^Outcome: `, donc cet appel reste le seul auteur de celle-ci.
-            _set_outcome_line "Outcome: PLAN_GROOMED"
+            #
+            # mika#2981 — la ligne porte le PLAN que ce groom a validé.
+            # `_set_outcome_line` attend un corps de ligne complet (son
+            # doc-comment cite déjà « Outcome: PR_OPENED — <url> ») ; cette
+            # frappe était la seule des trois sans suffixe. Le suffixe est ce
+            # qui lie la preuve à son vol : la porte compare le plan nommé ici
+            # au plan nommé par le callout du corps COURANT.
+            #
+            # Repli nu quand `GROOM_CALLOUT_PLAN` est vide — c'est-à-dire sur le
+            # bras `canonical_callout_failed`, où aucun chemin n'a été validé.
+            # Une preuve nue reste ACCEPTÉE par la porte (grâce nommée
+            # `GROOM_PROOF_UNBOUND_GRACE`, comptée par l'événement
+            # `groom_proof_unbound_to_plan`) : sans ce repli la convergence
+            # serait perdue, ce qui serait un faux négatif pire que le trou.
+            #
+            # Le corps de ligne est COMPOSÉ dans une variable, et ce n'est pas
+            # un détail de style : l'assertion auto-nettoyante de la
+            # Fire-Disposition exige qu'aucune frappe NUE du marqueur — le
+            # marqueur passé littéralement au poseur de ligne, guillemet
+            # fermante immédiate — ne subsiste dans ce fichier, pour rougir le
+            # jour où quelqu'un ramène le producteur à cette forme, seul chemin
+            # par lequel la grâce deviendrait la voie nominale au lieu de se
+            # vider. Un `else` portant cette forme rendrait l'assertion
+            # inécrivable.
+            #
+            # Ce commentaire ne cite donc pas la forme d'appel verbatim : la
+            # garde de cardinalité d'U3c ne dépouille pas les commentaires, et
+            # un texte À PROPOS du signal y serait compté COMME le signal
+            # (classe mika#2050 — mesuré sur cette édition même).
+            # Le suffixe est AJOUTÉ, il ne réécrit pas la valeur : le marqueur
+            # garde ainsi un littéral unique dans tout le fichier, ce qui est ce
+            # que la garde de cardinalité d'U3c (mika#2590) compte.
+            local _groomed_outcome="Outcome: PLAN_GROOMED"
+            [ -n "${GROOM_CALLOUT_PLAN:-}" ] && \
+                _groomed_outcome="${_groomed_outcome} — ${GROOM_CALLOUT_PLAN}"
+            _set_outcome_line "$_groomed_outcome"
         elif grep -qE '^Outcome: ESCALATE' <<<"$RESULT"; then
             # mika#2545 — an ESCALATE is already fully stamped by its producer
             # (`_escalate_groom`): the terminal marker, the verdict, the session,

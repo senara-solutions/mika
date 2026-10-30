@@ -4679,10 +4679,14 @@ const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
 ///
 /// Trigger conditions (all must hold):
 ///   - `task.dispatch_class == Some("groom")` — groom-class callbacks only
-///   - `task.result` contains the literal `"Outcome: PLAN_GROOMED"` —
-///     the structural success marker emitted by `_write_canonical_callout`'s
-///     parent `_iterate_groom_loop` (does not depend on body-marker write
-///     having succeeded; the callback-result text is canonical for this signal)
+///   - `task.result` carries `"Outcome: PLAN_GROOMED"` **at the head of a
+///     line** — the structural success marker emitted by
+///     `_write_canonical_callout`'s parent `_iterate_groom_loop` (does not
+///     depend on body-marker write having succeeded; the callback-result text
+///     is canonical for this signal). Not "contains the literal": mika#2590
+///     anchored the reading, and since mika#2981 the line carries a
+///     ` — <plan>` suffix naming the plan that groom validated, so a reader
+///     that required an end anchor would refuse every real proof.
 ///   - parent task has a parseable `reference_url` of shape
 ///     `https://github.com/<owner>/<repo>/issues/<n>`
 ///
@@ -9010,6 +9014,10 @@ mod tests {
 
     const TEST_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/1614";
 
+    /// Le plan que le callout du corps nomme, et que la preuve liée porte
+    /// depuis mika#2981 — déjà normalisé (relatif au dépôt, sous `docs/plans/`).
+    const TEST_GROOM_PLAN: &str = "docs/plans/2026-10-30-001-fix-1614-plan.md";
+
     #[tokio::test]
     async fn test_auto_fire_skips_non_groom_class() {
         let db = test_db();
@@ -9725,7 +9733,17 @@ mod tests {
     #[tokio::test]
     async fn test_groom_gate_survives_implement_flip() {
         let db = test_db();
-        let (parent_id, _cb) = create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        // Preuve **liée** au plan courant (mika#2981) : le verdict attendu
+        // reste `Converged` au mot, donc ce test continue de ne parler que du
+        // flip. Le corps passe par le helper à `result` libre plutôt que par le
+        // booléen de son frère : celui-ci sert douze tests qui n'ont rien
+        // demandé au suffixe.
+        let (parent_id, _cb) = create_groom_callback_pair_with_result(
+            &db,
+            &format!("claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED — {TEST_GROOM_PLAN}\nSession: sess-2981"),
+            Some(TEST_ISSUE_URL),
+        )
+        .await;
 
         // The mika#1614 / mika#996 task-reuse flip — the parent is now
         // implement-class and still `in_progress`.
@@ -9735,7 +9753,7 @@ mod tests {
         assert_eq!(dispatch_class_of(&db, &parent_id).await, "implement");
 
         let verified = db
-            .has_completed_groom_for_issue(TEST_ISSUE_URL)
+            .has_completed_groom_for_issue(TEST_ISSUE_URL, Some(TEST_GROOM_PLAN))
             .await
             .expect("gate query must not error");
         assert_eq!(
@@ -9759,7 +9777,7 @@ mod tests {
             .unwrap();
 
         let verified = db
-            .has_completed_groom_for_issue(TEST_ISSUE_URL)
+            .has_completed_groom_for_issue(TEST_ISSUE_URL, Some(TEST_GROOM_PLAN))
             .await
             .expect("gate query must not error");
         assert_eq!(

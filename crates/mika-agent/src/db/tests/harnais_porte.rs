@@ -52,15 +52,21 @@ use crate::task_state::tasks::{GROOM_REJECTED_JSON_ENVELOPE, GroomConvergence};
 #[test]
 fn harnais_porte_cas4_failed_callback_returns_false() {
     let db = db();
-    let (_, callback_id) =
-        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    // Preuve **liée et nominale** (mika#2981) : le seul terme qui sépare ce cas
+    // du nominal est le statut, que la ligne suivante déplace.
+    let (_, callback_id) = completed_groom_pair(
+        &db,
+        "mika",
+        GROOM_ISSUE_URL,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     db.update_task_status(&callback_id, "failed").unwrap();
     // `Absent` et non `!is_converged()` : la row est écartée par le filtre de
     // statut, donc rien n'est lu et rien n'est écarté au sens de R6. Un
     // `MarkerOutOfPosition` ici dirait que la ligne a été lue puis refusée pour
     // sa forme — deux diagnostics opposés que le booléen confondrait.
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent,
         "a groom callback that carries `Outcome: PLAN_GROOMED` but died \
@@ -77,11 +83,15 @@ fn harnais_porte_cas4_failed_callback_returns_false() {
 #[test]
 fn harnais_porte_cas4_cancelled_callback_returns_false() {
     let db = db();
-    let (_, callback_id) =
-        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    let (_, callback_id) = completed_groom_pair(
+        &db,
+        "mika",
+        GROOM_ISSUE_URL,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     db.update_task_status(&callback_id, "cancelled").unwrap();
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Absent,
         "a groom callback cancelled after completing is not proof of grooming"
@@ -112,8 +122,11 @@ fn harnais_porte_cas4_cancelled_callback_returns_false() {
 fn mika2590_un_auto_skip_nest_pas_une_preuve_de_grooming() {
     let db = db();
     completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_AUTO_SKIPPED);
+    // Le plan attendu est passé, et il ne change rien : depuis mika#2981 le
+    // terme de liaison ne s'applique qu'à un verdict déjà `Converged`, donc un
+    // refus de forme reste rendu pour son motif et non pour le plan.
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE),
         "le JSON d'auto-skip de `dispatch-lib.sh` cite `Outcome: PLAN_GROOMED` \
@@ -131,9 +144,14 @@ fn mika2590_un_auto_skip_nest_pas_une_preuve_de_grooming() {
 #[test]
 fn mika2590_une_ligne_ancree_reste_une_preuve() {
     let db = db();
-    completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    completed_groom_pair(
+        &db,
+        "mika",
+        GROOM_ISSUE_URL,
+        &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+    );
     assert_eq!(
-        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1))
             .unwrap(),
         GroomConvergence::Converged,
         "un groom réellement convergé porte le marqueur en début de ligne et \
@@ -179,7 +197,7 @@ fn harnais_porte_cas8_unreadable_predicate_returns_err_not_ok_false() {
     db.conn
         .execute("DROP TABLE tasks", [])
         .expect("staging the failure must itself succeed");
-    let outcome = db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL);
+    let outcome = db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL, Some(GROOM_PLAN_VOL_1));
     assert!(
         outcome.is_err(),
         "an unreadable predicate must propagate `Err` so the caller \

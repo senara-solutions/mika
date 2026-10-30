@@ -951,11 +951,47 @@ fn recurring_task(agent: &str, label: &str) -> NewTask {
 
 pub(crate) const GROOM_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/123";
 
+/// La preuve **nue** : le marqueur seul en position de verdict, sans suffixe.
+///
+/// C'est la forme d'avant mika#2981, donc celle de **toutes** les preuves déjà
+/// en base et celle que les trois producteurs légitimes de la grâce D3 écrivent
+/// encore. Elle reste acceptée — par
+/// [`crate::task_state::tasks::GroomConvergence::ConvergedUnbound`], jamais par
+/// `Converged` — et c'est ce que le fixture sert à épingler.
 pub(crate) const GROOM_CALLBACK_PLAN_GROOMED: &str =
     "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-2287";
 
 const GROOM_CALLBACK_PLAN_ITERATE: &str =
     "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-2287";
+
+/// Le plan du **vol 1** — celui que les preuves liées de ce module nomment.
+///
+/// Forme réelle d'un `plan_relpath` tel que `_write_canonical_callout` le
+/// publie : relatif au dépôt, sous `docs/plans/`, donc déjà normalisé au sens
+/// de [`crate::plan_callout::PlanCallout::normalized`].
+pub(crate) const GROOM_PLAN_VOL_1: &str = "docs/plans/2026-10-29-001-fix-123-vol-1-plan.md";
+
+/// Le plan du **vol 2**, que nulle preuve de ce module ne nomme.
+///
+/// C'est le terme négatif de l'AC2 de mika#2981 : même ticket, même preuve,
+/// autre plan — la porte doit refuser.
+pub(crate) const GROOM_PLAN_VOL_2: &str = "docs/plans/2026-10-30-002-fix-123-vol-2-plan.md";
+
+/// Une preuve de groom **liée** au plan nommé, dans la forme que
+/// `dispatch-lib.sh` frappe depuis mika#2981 : le marqueur en tête de ligne,
+/// puis le séparateur, puis le chemin du plan.
+///
+/// Le séparateur est écrit **en littéral** et non lu depuis
+/// `GROOM_PROOF_PLAN_SEPARATOR` : un fixture doit porter la forme du fil, pas
+/// la constante du lecteur, sinon un changement de séparateur déplacerait les
+/// deux côtés ensemble et le test passerait des deux côtés. C'est
+/// `mika2981_le_separateur_et_le_motif_sont_un_format_de_fil`
+/// (`task_state/tasks.rs`) qui tient l'égalité entre les deux.
+pub(crate) fn groom_callback_liee_au_plan(plan: &str) -> String {
+    format!(
+        "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED — {plan}\nSession: sess-2981"
+    )
+}
 
 /// mika#2590 — le `result` d'un callback de groom **auto-skippé**, dans la forme
 /// que `dispatch-lib.sh` écrivait le 2026-09-29 sur mika#2105.

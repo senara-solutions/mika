@@ -4385,10 +4385,29 @@ impl Database {
     /// R9 totale plutôt que partielle.
     ///
     /// Une ligne dont la colonne `result` est NULL ne porte rien, donc `Absent`.
+    ///
+    /// # mika#2981 — la preuve est liée à SON vol, et le SQL ne bouge pas
+    ///
+    /// `expected_plan` est le plan nommé par le callout `Plan:` du corps
+    /// **courant** du ticket ([`crate::plan_callout::PlanCallout::normalized`]),
+    /// ou `None` quand le corps n'en porte aucun. La décision est
+    /// [`crate::task_state::tasks::groom_proof_convergence`] : une preuve dont
+    /// la ligne ancrée nomme un **autre** plan est celle d'un vol antérieur et
+    /// rend `PlanMismatch`. Sans ce terme, la porte acceptait n'importe quelle
+    /// preuve de groom du ticket — mesuré le 2026-10-30 sur mika#2968, trois
+    /// preuves simultanément valides, une par vol.
+    ///
+    /// **Aucun terme n'est ajouté au `SELECT`, et c'est délibéré.** Filtrer le
+    /// plan en SQL exigerait de relire le marqueur par `instr`, très exactement
+    /// la régression que mika#2590 a retirée d'ici (voir ci-dessus) ; et une
+    /// ligne écartée par SQL serait invisible au verdict, donc la preuve d'un
+    /// autre vol remonterait `Absent` au lieu de `PlanMismatch` et la sonde
+    /// d'AC4 mesurerait zéro sur sa propre population.
     pub fn has_completed_groom_for_issue(
         &self,
         agent_id: &str,
         issue_url: &str,
+        expected_plan: Option<&str>,
     ) -> Result<crate::task_state::tasks::GroomConvergence> {
         let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
         let mut stmt = self.conn.prepare(
@@ -4407,7 +4426,9 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .map(|result| match result {
-                Some(text) => crate::task_state::tasks::groom_result_convergence(&text),
+                Some(text) => {
+                    crate::task_state::tasks::groom_proof_convergence(&text, expected_plan)
+                }
                 None => crate::task_state::tasks::GroomConvergence::Absent,
             });
         Ok(crate::task_state::tasks::aggregate_groom_convergence(

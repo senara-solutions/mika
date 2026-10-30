@@ -75,6 +75,58 @@ pub const ALL_GROOM_CONVERGENCE_REJECTIONS: &[&str] = &[
     GROOM_REJECTED_NOT_LINE_ANCHORED,
 ];
 
+/// Le séparateur entre le marqueur de convergence et le plan que la preuve
+/// nomme (mika#2981). Producteur : la frappe GROOMED de `dispatch-lib.sh`, qui
+/// l'ajoute au corps de ligne que `_set_outcome_line` pose.
+///
+/// Même forme que les deux autres appelants de `_set_outcome_line`
+/// (`Outcome: PR_OPENED — <url>`, `Outcome: ESCALATE — <stage>`), dont le
+/// doc-comment du poseur de ligne faisait déjà le contrat. Le tiret est un
+/// **cadratin** U+2014 encadré d'espaces : écrit à la main ailleurs il
+/// divergerait en silence, d'où la constante.
+pub const GROOM_PROOF_PLAN_SEPARATOR: &str = " — ";
+
+/// **La grâce de mika#2981, nommée et comptée.** Motif de fil écrit par
+/// l'événement d'audit `groom_proof_unbound_to_plan`
+/// ([`crate::skills::executor`], écrivain unique).
+///
+/// # La donnée précise qu'elle épargne
+///
+/// Une preuve de groom dont la ligne ancrée `Outcome: PLAN_GROOMED` ne porte
+/// **aucun** suffixe [`GROOM_PROOF_PLAN_SEPARATOR`] — donc ne nomme aucun plan.
+/// La porte l'accepte, exactement comme avant mika#2981. Aucune preuve
+/// **suffixée** n'en bénéficie : sur celles-là la porte est strictement plus
+/// sévère qu'hier. Le gain net est donc strict, et jamais un relâchement.
+///
+/// # Ses trois producteurs légitimes
+///
+/// 1. **Toutes les preuves déjà en base** au moment du déploiement. Elles sont
+///    toutes nues : le suffixe n'existait pas.
+/// 2. **La fenêtre de déploiement.** `skills/bundled/` est lu au *build*
+///    (`build.rs` → `BUNDLED_SKILL_MANIFESTS`), donc le producteur corrigé
+///    n'atteint aucun agent avant `make deploy` + seed (mika#2340). Entre le
+///    merge et le déploiement, les grooms de la boucle frappent encore des
+///    preuves nues.
+/// 3. **Le flux opérateur `/mika-groom-ticket`**, qui écrit son callout
+///    lui-même et ne passe pas par `_write_canonical_callout`, donc ne publie
+///    aucun plan à suffixer.
+///
+/// # Comment elle se vide, et où elle se retire
+///
+/// `prune_completed_tasks` supprime les lignes terminales au-delà de 30 jours
+/// (`THIRTY_DAYS_SECS`, `task_engine/mod.rs`), et tout groom de boucle
+/// post-déploiement porte le suffixe : la population 1 s'éteint d'elle-même, la
+/// 2 est bornée par le déploiement, la 3 est un flux humain délibéré.
+///
+/// Le compteur qui la fait expirer est
+/// `SELECT count(*) FROM audit_events WHERE tool_name =
+/// 'groom_proof_unbound_to_plan'` — exact parce que l'écrivain est unique.
+/// C'est la sonde d'AC4 de mika#2981 ; **à 0, le site de retrait est le ticket
+/// de suivi** ouvert par la § *Deferred to Follow-Up Work* du plan
+/// (`Tracked in: senara-solutions/mika#2981`) : la grâce devient un refus, et
+/// l'assertion auto-nettoyante de `test-dispatch-lib.sh` part avec elle.
+pub const GROOM_PROOF_UNBOUND_GRACE: &str = "proof_unbound_to_plan";
+
 /// Un `result` de callback de groom porte-t-il une convergence ? (mika#2590)
 ///
 /// # Le défaut que ça ferme, mesuré le 2026-09-29 sur mika#2105
@@ -122,12 +174,41 @@ pub const ALL_GROOM_CONVERGENCE_REJECTIONS: &[&str] = &[
 /// réellement convergé aurait été refusé par cette fonction. Les deux moitiés
 /// voyagent dans le même binaire (`skills/bundled/` est une projection du
 /// binaire, mika#2340), donc elles ne peuvent pas être servies séparément.
+///
+/// # Cinq états depuis mika#2981, et pourquoi il en fallait DEUX de plus
+///
+/// Le plan de mika#2981 (D4) n'annonçait qu'un cinquième état, `PlanMismatch`.
+/// Il en faut deux, et la raison est son propre R6 : `executor.rs` doit être
+/// l'écrivain **unique** de `groom_proof_unbound_to_plan`, l'événement qui
+/// compte la grâce [`GROOM_PROOF_UNBOUND_GRACE`] et qui EST la sonde d'AC4. Or
+/// [`crate::skills::executor::groomed_state`] ne voit que l'agrégat : avec
+/// `PlanMismatch` seul, « accepté sur la grâce » rend exactement les mêmes
+/// octets que « accepté avec une preuve liée », et l'événement est inécrivable
+/// — la classe mika#2205, deux populations sous un nom, appliquée à la sonde du
+/// correctif lui-même.
+///
+/// D'où [`GroomConvergence::ConvergedUnbound`], pour qui [`Self::is_converged`]
+/// rend `true` : **aucun lecteur existant ne change**, en particulier le
+/// prédicat de dispatch de [`crate::task_engine::dispatcher`], et
+/// [`crate::skills::executor::GroomedState`] garde ses quatre bras (la garde
+/// `mika2484_les_quatre_verdicts_de_la_porte_sont_inchanges` reste verte sans
+/// être touchée).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroomConvergence {
-    /// Une ligne du `result` commence par [`GROOM_SUCCESS_MARKER`].
+    /// Une ligne du `result` commence par [`GROOM_SUCCESS_MARKER`] **et** son
+    /// suffixe nomme le plan attendu (mika#2981).
     Converged,
+    /// Convergée, mais la preuve ne nomme **aucun** plan : la grâce
+    /// [`GROOM_PROOF_UNBOUND_GRACE`], acceptée et comptée. Également le verdict
+    /// quand l'appelant n'a aucun plan attendu à opposer (corps sans callout
+    /// `Plan:`) — la porte des marqueurs a déjà tranché ce cas en amont, et
+    /// refuser ici déplacerait son refus sous un autre nom.
+    ConvergedUnbound,
     /// Le marqueur n'apparaît nulle part. Le cas nominal d'un premier grooming.
     Absent,
+    /// Convergée, mais la preuve nomme un **autre** plan que le callout du corps
+    /// courant : la preuve d'un vol antérieur (mika#2981). Refusée.
+    PlanMismatch,
     /// Le marqueur apparaît, hors position de verdict. Porte son motif, qui est
     /// un élément d'[`ALL_GROOM_CONVERGENCE_REJECTIONS`].
     MarkerOutOfPosition(&'static str),
@@ -152,8 +233,15 @@ impl GroomConvergence {
     /// `MarkerOutOfPosition` (R6) là où `Absent` est le régime nominal d'un
     /// premier grooming. Un booléen y fondrait les deux populations et rendrait
     /// le correctif incomptable (D2).
+    /// **mika#2981 : la grâce converge aussi.** `ConvergedUnbound` rend `true`
+    /// ici, et c'est ce qui fait que l'ajout des deux variantes ne change
+    /// aucun lecteur existant. Les deux refus neufs — `PlanMismatch` et la
+    /// grâce une fois retirée — passent par ce seul site.
     pub fn is_converged(&self) -> bool {
-        matches!(self, GroomConvergence::Converged)
+        matches!(
+            self,
+            GroomConvergence::Converged | GroomConvergence::ConvergedUnbound
+        )
     }
 }
 
@@ -189,6 +277,100 @@ pub fn groom_result_convergence(result: &str) -> GroomConvergence {
     GroomConvergence::Absent
 }
 
+/// Le plan que la preuve nomme, lu **sur la ligne ancrée uniquement**
+/// (mika#2981 R3).
+///
+/// # Pourquoi `lines().find_map(strip_prefix)` et pas une recherche de sous-chaîne
+///
+/// C'est le défaut de mika#2590 un cran plus loin. Un `result` d'auto-skip cite
+/// le marqueur dans sa prose pour expliquer qu'aucune preuve n'est frappée ; une
+/// lecture du suffixe par `.find(SEPARATOR)` ou par `.contains(MARKER)` y
+/// trouverait du texte **à propos** du plan et le prendrait POUR le plan
+/// (classe mika#2050, déjà mesurée trois fois dans ce dépôt). L'ancrage est
+/// donc la même propriété ici que pour le marqueur lui-même, et pour la même
+/// raison.
+///
+/// `strip_prefix` n'est ni `.contains(`, ni `instr(`, ni `.find(` : la garde
+/// `mika2590_le_marqueur_de_convergence_na_quun_lecteur` reste verte, et
+/// **rien n'est ajouté à `GROOM_MARKER_LOOSE_READERS_ALLOWED`**, que son test
+/// frère épingle vide.
+///
+/// Rend `None` pour une preuve nue, pour un suffixe vide ou blanc, et pour un
+/// marqueur hors position — dans les trois cas il n'y a pas de plan nommé, et
+/// l'appelant les traite tous par la grâce.
+pub fn groom_proof_plan(result: &str) -> Option<String> {
+    result
+        .lines()
+        .find_map(|line| line.strip_prefix(GROOM_SUCCESS_MARKER))
+        .and_then(|rest| rest.strip_prefix(GROOM_PROOF_PLAN_SEPARATOR))
+        .map(str::trim)
+        .filter(|plan| !plan.is_empty())
+        .map(str::to_string)
+}
+
+/// La décision de liaison de mika#2981 : cette preuve prouve-t-elle le grooming
+/// **de ce vol-ci** ?
+///
+/// # Ce que ça ferme
+///
+/// La porte de provenance de mika#2287 acceptait n'importe quelle preuve de
+/// groom du ticket. Sur un ticket à plusieurs vols, celle du vol 1 laissait
+/// partir `dev-pilot` pour le vol N, dont le plan et les callouts auraient pu
+/// être posés à la main — la classe même que mika#2287 existe pour refuser.
+/// Mesuré le 2026-10-30 sur mika#2968 : trois preuves simultanément valides.
+///
+/// # Le terme est le PLAN, pas l'instant du merge (mika#2981 D1)
+///
+/// AC1 laissait le choix entre « la preuve porte le plan du callout courant » et
+/// « la preuve est postérieure au dernier merge ». C'est le plan, pour trois
+/// raisons. Le plan est l'**objet** du groom : un instant de merge n'en est
+/// qu'un proxy. Le terme temporel exigerait un lecteur « issue → PR liée →
+/// dernier merge » qui n'existe pas
+/// ([`crate::github_graphql`] n'a que `gh_merged_pr_for_branch`, clé de
+/// branche). Et il ajouterait une dépendance réseau à un chemin qui, sans
+/// jeton, échoue déjà en ouverture — donc un vol pourrait partir *parce que* le
+/// réseau manque. Comparer deux chaînes hors-ligne est ce qui rend AC2
+/// testable « dans le même appel ».
+///
+/// # Égalité exacte, et pourquoi elle est sûre des deux côtés
+///
+/// Côté preuve, le suffixe vient de `plan_relpath` dans
+/// `_write_canonical_callout`, qui a déjà refusé l'absolu et borné le chemin au
+/// worktree. Côté appelant, c'est [`crate::plan_callout::PlanCallout::normalized`],
+/// qui laisse inchangé un `raw` commençant par `docs/plans/`. Les deux rendent
+/// donc la même forme repo-relative, et une comparaison relâchée (suffixe,
+/// nom de fichier seul) ferait d'un plan de vol 1 et d'un plan de vol 2 du même
+/// jour un seul plan.
+///
+/// # Le vol unique ne change pas (AC1, D5)
+///
+/// Une preuve, aucun merge : le groom qui a frappé la preuve a aussi écrit le
+/// plan **et** le callout, donc son suffixe nomme le plan du callout ⇒
+/// [`GroomConvergence::Converged`]. Si la preuve est antérieure au déploiement,
+/// elle est nue ⇒ [`GroomConvergence::ConvergedUnbound`], acceptée par la
+/// grâce. Les deux chemins acceptent.
+pub fn groom_proof_convergence(result: &str, expected_plan: Option<&str>) -> GroomConvergence {
+    let verdict = groom_result_convergence(result);
+    if !matches!(verdict, GroomConvergence::Converged) {
+        // `Absent` et `MarkerOutOfPosition` se transmettent tels quels : la
+        // liaison n'a de sens que sur une convergence, et réécrire un refus
+        // ici effacerait le motif que R6 compte.
+        return verdict;
+    }
+    // Pas de callout `Plan:` dans le corps courant ⇒ rien à opposer. La porte
+    // des marqueurs (mika#907) a déjà tranché ce cas en amont ; la grâce est le
+    // bon bras parce qu'elle est COMPTÉE, là qu'un `Converged` muet se
+    // confondrait avec une preuve liée.
+    let Some(expected) = expected_plan else {
+        return GroomConvergence::ConvergedUnbound;
+    };
+    match groom_proof_plan(result) {
+        None => GroomConvergence::ConvergedUnbound,
+        Some(plan) if plan == expected => GroomConvergence::Converged,
+        Some(_) => GroomConvergence::PlanMismatch,
+    }
+}
+
 /// Agrège les verdicts des callbacks de groom d'une même issue.
 ///
 /// **La préséance est celle de la sémantique historique**, `COUNT(*) > 0` : une
@@ -197,16 +379,44 @@ pub fn groom_result_convergence(result: &str) -> GroomConvergence {
 /// écart *mesuré* l'emporte sur l'absence — sinon un ticket refoulé pour preuve
 /// polluée se lirait exactement comme un ticket jamais groomé, qui est la classe
 /// mika#2205 appliquée au correctif lui-même.
+///
+/// # L'ordre, depuis les deux variantes de mika#2981
+///
+/// `Converged` > `ConvergedUnbound` > `PlanMismatch` > `MarkerOutOfPosition` >
+/// `Absent`. Deux de ces rangs portent une décision, pas une convention :
+///
+/// - **Une preuve LIÉE bat la grâce.** Sur un ticket qui porte à la fois une
+///   preuve nue d'avant le déploiement et la preuve suffixée de son vol courant,
+///   la porte accepte de plein droit et l'événement de grâce **ne tire pas** :
+///   sinon la sonde d'AC4 compterait des dispatches que la grâce n'a pas portés,
+///   et à 0 elle ne descendrait jamais.
+/// - **`PlanMismatch` bat `Absent`.** C'est le même motif que
+///   `MarkerOutOfPosition` l'an dernier : un ticket refoulé parce que sa seule
+///   preuve est celle d'un vol antérieur est exactement la population que
+///   mika#2981 existe pour compter, et la fondre dans « jamais groomé » la
+///   rendrait incomptable. Il bat aussi `MarkerOutOfPosition` parce qu'il est la
+///   mesure **plus précise** des deux : le marqueur y est en position, c'est son
+///   plan qui ne va pas.
 pub fn aggregate_groom_convergence(
     verdicts: impl IntoIterator<Item = GroomConvergence>,
 ) -> GroomConvergence {
+    let mut unbound = false;
+    let mut mismatched = false;
     let mut rejected: Option<&'static str> = None;
     for verdict in verdicts {
         match verdict {
             GroomConvergence::Converged => return GroomConvergence::Converged,
+            GroomConvergence::ConvergedUnbound => unbound = true,
+            GroomConvergence::PlanMismatch => mismatched = true,
             GroomConvergence::MarkerOutOfPosition(reason) => rejected = rejected.or(Some(reason)),
             GroomConvergence::Absent => {}
         }
+    }
+    if unbound {
+        return GroomConvergence::ConvergedUnbound;
+    }
+    if mismatched {
+        return GroomConvergence::PlanMismatch;
     }
     match rejected {
         Some(reason) => GroomConvergence::MarkerOutOfPosition(reason),
@@ -1011,12 +1221,21 @@ mod tests {
         );
     }
 
-    /// `is_converged` ne rend vrai que sur `Converged` — le contrôle qui empêche
-    /// qu'un futur éditeur en fasse « tout sauf le motif que je connais ».
+    /// `is_converged` n'est vrai que sur les deux bras d'acceptation — le
+    /// contrôle qui empêche qu'un futur éditeur en fasse « tout sauf le motif
+    /// que je connais ».
+    ///
+    /// **Amendé par mika#2981, et nommément.** `ConvergedUnbound` accepte : la
+    /// grâce D3 est ce qui empêche toutes les preuves déjà en base de devenir un
+    /// refus le jour du déploiement. Elle est comptée par
+    /// `groom_proof_unbound_to_plan` et se retire avec la grâce, pas avant.
+    /// `PlanMismatch` refuse, et c'est le cœur du correctif.
     #[test]
     fn mika2590_is_converged_nest_vrai_que_sur_converged() {
         assert!(GroomConvergence::Converged.is_converged());
+        assert!(GroomConvergence::ConvergedUnbound.is_converged());
         assert!(!GroomConvergence::Absent.is_converged());
+        assert!(!GroomConvergence::PlanMismatch.is_converged());
         for reason in ALL_GROOM_CONVERGENCE_REJECTIONS {
             assert!(!GroomConvergence::MarkerOutOfPosition(reason).is_converged());
         }
@@ -1031,5 +1250,182 @@ mod tests {
         assert_eq!(GROOM_REJECTED_JSON_ENVELOPE, "json_envelope");
         assert_eq!(GROOM_REJECTED_NOT_LINE_ANCHORED, "marker_not_line_anchored");
         assert_eq!(ALL_GROOM_CONVERGENCE_REJECTIONS.len(), 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2981 — l'extracteur de plan et la décision de liaison, aux bornes.
+    //
+    // Testés ici parce que la décision est **pure** : c'est ce qui rend AC2
+    // vérifiable « dans le même appel », et c'est la raison pour laquelle D1
+    // a choisi le terme du plan plutôt que l'instant du dernier merge (qui
+    // aurait exigé le réseau). Les cas de bout-en-bout à travers la base
+    // vivent dans `db/tests/harnais_porte.rs`.
+    // ---------------------------------------------------------------------
+
+    const PLAN_A: &str = "docs/plans/2026-10-29-001-vol-un-plan.md";
+    const PLAN_B: &str = "docs/plans/2026-10-30-005-vol-deux-plan.md";
+
+    /// Le RESULT d'un groom convergé **depuis mika#2981** : la ligne ancrée
+    /// porte le plan que ce groom a validé.
+    fn converged_pour(plan: &str) -> String {
+        format!(
+            "claude-pilot completed (status: done).\nSession: sess-2981\n\
+             {GROOM_SUCCESS_MARKER}{GROOM_PROOF_PLAN_SEPARATOR}{plan}"
+        )
+    }
+
+    #[test]
+    fn mika2981_le_suffixe_de_la_ligne_ancree_est_lu() {
+        assert_eq!(
+            groom_proof_plan(&converged_pour(PLAN_B)).as_deref(),
+            Some(PLAN_B)
+        );
+    }
+
+    /// **Le défaut de mika#2590 un cran plus loin.** Un `result` qui *parle* du
+    /// plan dans sa prose, marqueur hors position de verdict : l'extracteur ne
+    /// doit rien y lire. Sans l'ancrage, ce texte-ci — qui dit « aucune preuve
+    /// n'est frappée » — fournirait le plan ET la preuve (classe mika#2050).
+    #[test]
+    fn mika2981_un_suffixe_en_prose_nest_pas_lu() {
+        let prose = format!(
+            "auto-skip: already_groomed\n\
+             note: aucune preuve n'est frappée ici, le corps portait déjà \
+             {GROOM_SUCCESS_MARKER}{GROOM_PROOF_PLAN_SEPARATOR}{PLAN_A} au dispatch"
+        );
+        assert_eq!(groom_proof_plan(&prose), None);
+        assert_eq!(
+            groom_proof_convergence(&prose, Some(PLAN_B)),
+            GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_NOT_LINE_ANCHORED),
+            "le motif du refus doit survivre à la liaison, pas être réécrit"
+        );
+    }
+
+    /// Une preuve nue — toutes celles d'avant le déploiement — reste ACCEPTÉE,
+    /// sur le bras compté. Un suffixe vide ou blanc est la même chose : il ne
+    /// nomme aucun plan.
+    #[test]
+    fn mika2981_une_preuve_nue_reste_acceptee_sur_la_grace() {
+        for nue in [
+            CONVERGED.to_string(),
+            GROOM_SUCCESS_MARKER.to_string(),
+            format!("{GROOM_SUCCESS_MARKER}{GROOM_PROOF_PLAN_SEPARATOR}"),
+            format!("{GROOM_SUCCESS_MARKER}{GROOM_PROOF_PLAN_SEPARATOR}   "),
+        ] {
+            assert_eq!(groom_proof_plan(&nue), None, "aucun plan nommé: {nue:?}");
+            let verdict = groom_proof_convergence(&nue, Some(PLAN_B));
+            assert_eq!(verdict, GroomConvergence::ConvergedUnbound, "{nue:?}");
+            assert!(verdict.is_converged(), "la grâce accepte: {nue:?}");
+        }
+    }
+
+    /// **Le cœur du correctif.** La preuve du vol 1 face au callout du vol 2.
+    #[test]
+    fn mika2981_la_preuve_dun_autre_vol_est_refusee() {
+        let verdict = groom_proof_convergence(&converged_pour(PLAN_A), Some(PLAN_B));
+        assert_eq!(verdict, GroomConvergence::PlanMismatch);
+        assert!(!verdict.is_converged());
+    }
+
+    /// Le contrôle positif de l'assertion ci-dessus : **même preuve, même
+    /// extracteur**, seul le plan attendu change. C'est la paire qui sépare
+    /// « la porte lit le plan » de « la porte refuse tout ».
+    #[test]
+    fn mika2981_la_preuve_de_son_propre_vol_est_acceptee() {
+        assert_eq!(
+            groom_proof_convergence(&converged_pour(PLAN_B), Some(PLAN_B)),
+            GroomConvergence::Converged
+        );
+    }
+
+    /// Égalité **exacte** : les deux côtés rendent une forme repo-relative
+    /// `docs/plans/…`, donc une comparaison relâchée ferait de deux plans du
+    /// même jour un seul plan.
+    #[test]
+    fn mika2981_la_comparaison_de_plan_est_exacte() {
+        for voisin in [
+            "2026-10-30-005-vol-deux-plan.md",
+            "mika/docs/plans/2026-10-30-005-vol-deux-plan.md",
+            "docs/plans/2026-10-30-005-vol-deux-plan.md ",
+        ] {
+            assert_eq!(
+                groom_proof_convergence(&converged_pour(PLAN_B), Some(voisin)),
+                GroomConvergence::PlanMismatch,
+                "un voisin n'est pas le plan: {voisin:?}"
+            );
+        }
+    }
+
+    /// Aucun callout `Plan:` dans le corps courant ⇒ rien à opposer, donc la
+    /// grâce comptée plutôt qu'un `Converged` muet (qui se confondrait avec une
+    /// preuve liée) ou qu'un refus (que la porte des marqueurs a déjà rendu en
+    /// amont, sous son propre nom).
+    #[test]
+    fn mika2981_sans_plan_attendu_la_grace_est_le_bras() {
+        assert_eq!(
+            groom_proof_convergence(&converged_pour(PLAN_B), None),
+            GroomConvergence::ConvergedUnbound
+        );
+    }
+
+    /// L'ordre d'agrégation, et surtout son rang le plus décisif : **une preuve
+    /// liée bat la grâce**, sinon la sonde d'AC4 compterait des dispatches que
+    /// la grâce n'a pas portés et ne descendrait jamais à 0.
+    #[test]
+    fn mika2981_lordre_dagregation_une_preuve_liee_bat_la_grace() {
+        let hors_position = GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE);
+        for order in [
+            vec![
+                GroomConvergence::ConvergedUnbound,
+                GroomConvergence::Converged,
+            ],
+            vec![
+                GroomConvergence::Converged,
+                GroomConvergence::ConvergedUnbound,
+            ],
+        ] {
+            assert_eq!(
+                aggregate_groom_convergence(order),
+                GroomConvergence::Converged
+            );
+        }
+        assert_eq!(
+            aggregate_groom_convergence(vec![
+                GroomConvergence::PlanMismatch,
+                GroomConvergence::ConvergedUnbound,
+            ]),
+            GroomConvergence::ConvergedUnbound,
+            "la grâce accepte, et une preuve d'un autre vol ne la dégrade pas"
+        );
+        assert_eq!(
+            aggregate_groom_convergence(vec![
+                GroomConvergence::Absent,
+                hors_position.clone(),
+                GroomConvergence::PlanMismatch,
+            ]),
+            GroomConvergence::PlanMismatch,
+            "la mesure la plus précise l'emporte: le marqueur est en position, \
+             c'est son plan qui ne va pas"
+        );
+        assert_eq!(
+            aggregate_groom_convergence(vec![GroomConvergence::Absent, hors_position]),
+            GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE),
+            "contrôle: sans PlanMismatch le rang d'hier est inchangé"
+        );
+    }
+
+    /// Le séparateur et le motif de grâce sont un **format de fil** : le premier
+    /// est écrit par `dispatch-lib.sh` et relu ici, le second atterrit dans
+    /// `audit_events` et l'opérateur en fait le compte d'AC4. Le cadratin
+    /// U+2014 encadré d'espaces, en particulier, se retape faux en silence.
+    #[test]
+    fn mika2981_le_separateur_et_le_motif_sont_un_format_de_fil() {
+        assert_eq!(GROOM_PROOF_PLAN_SEPARATOR, " — ");
+        assert_eq!(GROOM_PROOF_UNBOUND_GRACE, "proof_unbound_to_plan");
+        assert!(
+            !ALL_GROOM_CONVERGENCE_REJECTIONS.contains(&GROOM_PROOF_UNBOUND_GRACE),
+            "la grâce ACCEPTE : la ranger parmi les refus du marqueur la ferait \
+             compter par le compteur de mika#2590, deux populations sous un nom"
+        );
     }
 }
