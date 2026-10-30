@@ -39,7 +39,7 @@
 
 use super::evaluator::{
     CiKnowledge, CiUnreadCause, DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
-    NotFlightReason, PrStateKnowledge,
+    MilestoneMembership, NotFlightReason, PrStateKnowledge,
 };
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
@@ -797,7 +797,7 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
 pub fn render_flight_verdict(v: &FlightVerdict) -> String {
     let mut segments = vec![
         flight_ticket_label(v),
-        flight_milestone_label(&v.pr_state).to_string(),
+        flight_milestone_label(v.in_target_milestone).to_string(),
         flight_issue_label(&v.issue),
         flight_turns_label(v),
     ];
@@ -835,14 +835,22 @@ fn flight_ticket_label(v: &FlightVerdict) -> String {
 
 /// Ce que le rapport sait de l'appartenance du vol au milestone cible.
 ///
-/// La connaissance de l'état de PR *est* celle de l'appartenance : le `Reader`
-/// n'hydrate que les sous-issues du milestone cible, donc un appariement réussi
-/// dit « ce ticket est dans la cible » et un échec dit « il n'y est pas ». Les
-/// deux faits ont une seule source, et ce rendu ne la dédouble pas.
-fn flight_milestone_label(pr_state: &PrStateKnowledge) -> &'static str {
-    match pr_state {
-        PrStateKnowledge::Read(_) => "milestone cible",
-        PrStateKnowledge::NotRead => "hors milestone cible",
+/// **Lu sur son propre champ depuis le vol 2a de mika#2968**, et non plus
+/// déduit de [`PrStateKnowledge`]. L'ancienne déduction était correcte sous une
+/// prémisse qui vient de tomber : l'état de PR n'avait qu'une source, les
+/// sous-issues du milestone cible, donc un appariement réussi disait les deux
+/// faits à la fois. Maintenant que `pr_state` peut venir d'une lecture **par
+/// numéro de PR**, la déduction dirait « hors milestone cible » d'un vol lu par
+/// l'autre porte.
+///
+/// Trois arbres, parce qu'il y a trois états de connaissance et qu'un
+/// appariement qui n'a pas eu lieu n'est pas un appariement qui a échoué (motif
+/// mika#2331).
+fn flight_milestone_label(membership: MilestoneMembership) -> &'static str {
+    match membership {
+        MilestoneMembership::InTarget => "milestone cible",
+        MilestoneMembership::OutOfTarget => "hors milestone cible",
+        MilestoneMembership::NotRead => "appartenance au milestone non lue",
     }
 }
 
@@ -886,14 +894,26 @@ fn flight_ci_label(ci: &CiKnowledge) -> String {
     }
 }
 
-/// Pourquoi la CI n'a pas été lue — nommé, parce que les quatre causes
-/// n'appellent pas la même action de l'opérateur.
+/// Pourquoi la CI n'a pas été lue — nommé, parce que les dix causes n'appellent
+/// pas la même action de l'opérateur : « lecture gh en échec » demande de
+/// regarder le jeton du dépôt, « PR hors de la page lue » de regarder la borne,
+/// « ce vol n'a pas de PR » rien du tout.
+///
+/// Les quatre premières ne sont plus écrites par aucune composition depuis
+/// mika#2968 (vol 2a) ; elles restent rendues parce que les verdicts du vol 1
+/// les portent encore. Voir [`CiUnreadCause`], qui date chacune.
 fn ci_unread_label(cause: CiUnreadCause) -> &'static str {
     match cause {
         CiUnreadCause::NotFromPrList => "PR hors liste du milestone",
         CiUnreadCause::NoSubIssue => "aucune sous-issue appariée",
         CiUnreadCause::NoIssueNumber => "vol sans ticket",
         CiUnreadCause::NotMeasured => "non mesurée",
+        CiUnreadCause::NoPrNumber => "ce vol n'a pas de PR",
+        CiUnreadCause::NoRepo => "vol sans dépôt",
+        CiUnreadCause::NoRunner => "aucun lecteur gh câblé",
+        CiUnreadCause::ReadFailed => "lecture gh en échec",
+        CiUnreadCause::NotFound => "PR hors de la page lue",
+        CiUnreadCause::PrNotOpen => "PR non ouverte",
     }
 }
 
@@ -1063,6 +1083,7 @@ mod tests {
             // la population d'avant mika#2921, donc le rendu attendu ne bouge
             // pas.
             pr_state: PrStateKnowledge::Read(None),
+            in_target_milestone: MilestoneMembership::InTarget,
             ci: CiKnowledge::Unread(CiUnreadCause::NotMeasured),
             recommendation,
             completed_at: Some("2026-10-13T08:00:00Z".into()),
@@ -1277,6 +1298,12 @@ mod tests {
     fn verdict_hors_cible(issue_number: Option<u64>, repo: Option<&str>) -> FlightVerdict {
         FlightVerdict {
             pr_state: PrStateKnowledge::NotRead,
+            // Les **deux** axes, nommés séparément depuis le vol 2a de
+            // mika#2968 : hors cible *et* état de PR non lu. C'est la
+            // conjonction que produisait l'ancien champ unique, et l'écrire en
+            // deux lignes est ce qui rend les deux moitiés du test suivant
+            // réellement indépendantes.
+            in_target_milestone: MilestoneMembership::OutOfTarget,
             repo: repo.map(str::to_string),
             ..verdict(
                 issue_number,
@@ -1311,6 +1338,7 @@ mod tests {
 
         let dans = render_flight_verdict(&FlightVerdict {
             pr_state: PrStateKnowledge::Read(Some("open".into())),
+            in_target_milestone: MilestoneMembership::InTarget,
             ..verdict_hors_cible(Some(2900), Some("senara-solutions/mika"))
         });
         assert_eq!(
@@ -1336,6 +1364,7 @@ mod tests {
     fn mika2921_un_etat_lu_et_vide_ne_gagne_aucun_segment() {
         let ligne = render_flight_verdict(&FlightVerdict {
             pr_state: PrStateKnowledge::Read(None),
+            in_target_milestone: MilestoneMembership::InTarget,
             ..verdict_hors_cible(Some(2900), Some("senara-solutions/mika"))
         });
         assert_eq!(
@@ -2872,6 +2901,109 @@ mod tests {
             assert!(
                 ligne.contains("CI non lue (non mesurée)"),
                 "le segment CI est le seul qui ne s'omette jamais :\n{ligne}"
+            );
+        }
+    }
+
+    // -- mika#2968, vol 2a : les causes de la lecture par numéro (AC3 étendu) --
+
+    /// AC3 — les six causes de non-lecture du vol 2a, chacune sous son libellé.
+    ///
+    /// Six libellés **distincts** parce que les six causes n'appellent pas la
+    /// même action : « lecture gh en échec » envoie regarder le jeton du dépôt
+    /// (mika#2963), « PR hors de la page lue » la borne de 100, « ce vol n'a pas
+    /// de PR » rien du tout. Deux causes sous les mêmes octets referaient une
+    /// seule population (classe mika#2205), donc la distinction est assertée
+    /// aussi, pas seulement la présence.
+    #[test]
+    fn mika2968_ac3_les_six_causes_de_la_lecture_par_numero_se_disent() {
+        let attendus = [
+            (
+                CiUnreadCause::NoPrNumber,
+                "CI non lue (ce vol n'a pas de PR)",
+            ),
+            (CiUnreadCause::NoRepo, "CI non lue (vol sans dépôt)"),
+            (
+                CiUnreadCause::NoRunner,
+                "CI non lue (aucun lecteur gh câblé)",
+            ),
+            (
+                CiUnreadCause::ReadFailed,
+                "CI non lue (lecture gh en échec)",
+            ),
+            (
+                CiUnreadCause::NotFound,
+                "CI non lue (PR hors de la page lue)",
+            ),
+            (CiUnreadCause::PrNotOpen, "CI non lue (PR non ouverte)"),
+        ];
+        for (cause, attendu) in attendus {
+            let mut v = verdict(
+                Some(2968),
+                FlightIssue::PrOpened {
+                    number: Some(2977),
+                    url: None,
+                },
+                Some(83),
+                false,
+                FlightRecommendation::MergeCandidate,
+            );
+            v.ci = CiKnowledge::Unread(cause);
+            let ligne = render_flight_verdict(&v);
+            assert!(
+                ligne.contains(attendu),
+                "la ligne du vol doit porter « {attendu} » :\n{ligne}"
+            );
+        }
+        let distincts: std::collections::HashSet<&str> = attendus
+            .iter()
+            .map(|(cause, _)| ci_unread_label(*cause))
+            .collect();
+        assert_eq!(
+            distincts.len(),
+            attendus.len(),
+            "deux causes sous le même libellé se confondraient au rapport"
+        );
+    }
+
+    /// AC3 — les trois appartenances au milestone, lues sur leur propre champ.
+    ///
+    /// Le `pr_state` est tenu **constant** et lu dans les trois cas : c'est ce
+    /// qui prouve que le libellé d'appartenance ne le lit plus. Sous l'ancienne
+    /// déduction, un `Read(_)` aurait rendu « milestone cible » trois fois.
+    #[test]
+    fn mika2968_ac3_les_trois_appartenances_se_disent_sans_lire_letat_de_pr() {
+        for (appartenance, attendu) in [
+            (MilestoneMembership::InTarget, " — milestone cible — "),
+            (
+                MilestoneMembership::OutOfTarget,
+                " — hors milestone cible — ",
+            ),
+            (
+                MilestoneMembership::NotRead,
+                " — appartenance au milestone non lue — ",
+            ),
+        ] {
+            let mut v = verdict(
+                Some(2968),
+                FlightIssue::PrOpened {
+                    number: Some(2977),
+                    url: None,
+                },
+                Some(83),
+                false,
+                FlightRecommendation::MergeCandidate,
+            );
+            v.pr_state = PrStateKnowledge::Read(Some("OPEN".into()));
+            v.in_target_milestone = appartenance;
+            let ligne = render_flight_verdict(&v);
+            assert!(
+                ligne.contains(attendu),
+                "la ligne du vol doit porter « {attendu} » :\n{ligne}"
+            );
+            assert!(
+                ligne.contains(" — PR OPEN — "),
+                "l'état de PR reste rendu, indépendamment :\n{ligne}"
             );
         }
     }

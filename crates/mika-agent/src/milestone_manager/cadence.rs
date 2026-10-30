@@ -22,13 +22,13 @@
 
 use super::{
     assessor::{Assessor, AssessorConfig},
-    evaluator::{FinishedFlight, FlightSource, FlightVerdict, evaluate_flights},
+    evaluator::{FinishedFlight, FlightPrReads, FlightSource, FlightVerdict, evaluate_flights},
     groom_trigger::{
         GroomCandidate, GroomSender, GroomTriggerOutcome, groom_write_is_armed,
         trigger_relief_grooms,
     },
     pool_writer::{admit_pool_tickets, pool_write_is_armed},
-    reader::{GhRunner, ProcessGhRunner, Reader},
+    reader::{GhRunner, ProcessGhRunner, Reader, read_flight_prs},
     reporter::Reporter,
     types::{Assessment, CycleOutcome, MilestoneRef, MilestoneState, Severity},
     verdict_poster::{post_verdicts, write_is_armed},
@@ -39,6 +39,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use mika_common::auth_boundary::{AuthBoundaryError, AuthBoundaryKind};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -711,13 +712,30 @@ async fn collect_flight_verdicts(
     };
     let since = checkpoint.and_then(|c| c.last_observed_at.as_deref());
     let flights = source.finished_implement_flights(since).await;
+    // La lecture des PR par numéro (mika#2968, vol 2a). Le périmètre interrogé
+    // sort des vols eux-mêmes : un dépôt n'est appelé que s'il porte un vol à
+    // juger dans ce cycle, et `BTreeSet` le rend déterministe. Sans runner
+    // câblé, `Unwired` — une non-lecture typée, jamais un jeu vide qui dirait
+    // « lu, et rien trouvé » (classe mika#2205).
+    let pr_reads = match ctx.gh_runner {
+        Some(runner) => {
+            let repos: BTreeSet<String> = flights.iter().filter_map(|f| f.repo.clone()).collect();
+            FlightPrReads::Read(read_flight_prs(runner, &repos).await)
+        }
+        None => FlightPrReads::Unwired,
+    };
     // `ctx.now` est l'instant du cycle, et c'est lui qui date la lecture CI
     // (mika#2968). Il est capturé *après* `reader.read()`, donc il la majore :
     // d'où le libellé « au cycle de » au rapport, jamais « lue à la seconde où
     // la requête est partie ». Aucune horloge n'est ajoutée ici — `evaluate_*`
     // n'en porte pas, et injecter un instant à la source coûterait les 11 sites
     // d'appel de `read_with_runner` pour quelques secondes de précision.
-    let verdicts = evaluate_flights(&flights, &state.sub_issues, &ctx.now.to_rfc3339());
+    let verdicts = evaluate_flights(
+        &flights,
+        &state.sub_issues,
+        &pr_reads,
+        &ctx.now.to_rfc3339(),
+    );
     // La taille du périmètre se demande à son lecteur unique : ce fichier ne
     // nomme aucun dépôt (garde `no_repo_list_test.rs`) et n'a donc aucune liste
     // à compter.
@@ -2576,6 +2594,28 @@ mod tests {
         }
     }
 
+    /// Les appels **autres que la lecture des PR par numéro** (mika#2968,
+    /// vol 2a). Le cycle lit désormais `pr list` à travers le même exécutant
+    /// que celui par lequel il poste, donc compter tous les appels confondrait
+    /// une lecture avec une écriture — et c'est l'absence d'**écriture** que
+    /// l'AC1 de mika#2698 épingle.
+    ///
+    /// Le filtre retire la forme lue, pas la forme écrite : tout appel d'une
+    /// troisième forme reste compté, donc une écriture neuve ne peut pas se
+    /// glisser sous cette garde.
+    fn hors_lecture_de_pr(gh: &RecordingGh) -> Vec<Vec<String>> {
+        gh.appels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| {
+                !(a.first().map(String::as_str) == Some("pr")
+                    && a.get(1).map(String::as_str) == Some("list"))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Arme l'interrupteur pour la durée du test, et le désarme à la sortie
     /// **même en cas de panique** — un `assert!` qui échoue laisserait sinon la
     /// variable posée pour tous les tests suivants du processus.
@@ -2631,10 +2671,10 @@ mod tests {
         .await
         .unwrap();
 
+        let ecritures = hors_lecture_de_pr(&gh);
         assert!(
-            gh.appels.lock().unwrap().is_empty(),
-            "AC1 : aucune écriture gh avec l'interrupteur OFF, vu : {:?}",
-            gh.appels.lock().unwrap()
+            ecritures.is_empty(),
+            "AC1 : aucune écriture gh avec l'interrupteur OFF, vu : {ecritures:?}"
         );
         assert!(
             lire_checkpoint(&cfg).posted_flight_task_ids.is_empty(),
@@ -2665,7 +2705,7 @@ mod tests {
         .await
         .unwrap();
 
-        let appels = gh.appels.lock().unwrap().clone();
+        let appels = hors_lecture_de_pr(&gh);
         assert_eq!(appels.len(), 1, "un commentaire pour un vol : {appels:?}");
         assert_eq!(appels[0][0], "issue");
         assert_eq!(appels[0][1], "comment");
@@ -2706,7 +2746,7 @@ mod tests {
             .unwrap();
         }
 
-        let appels = gh.appels.lock().unwrap().clone();
+        let appels = hors_lecture_de_pr(&gh);
         assert_eq!(
             appels.len(),
             1,
@@ -2752,7 +2792,7 @@ mod tests {
         .unwrap();
 
         assert!(!outcome.delivered, "ni changement d'état ni heartbeat");
-        assert_eq!(gh.appels.lock().unwrap().len(), 1, "et pourtant il poste");
+        assert_eq!(hors_lecture_de_pr(&gh).len(), 1, "et pourtant il poste");
 
         let apres_post = lire_checkpoint(&cfg);
         assert_eq!(
@@ -2771,6 +2811,102 @@ mod tests {
         assert_eq!(
             apres_post.last_observed_at, apres_livraison.last_observed_at,
             "la borne `since` du prochain cycle est préservée"
+        );
+    }
+
+    /// Un exécutant qui rend de vraies pages de PR, pour mesurer le câblage de
+    /// la lecture par numéro plutôt que son échec. `RecordingGh` rend la chaîne
+    /// vide, donc le premier appel y échoue au parse et le second n'a jamais
+    /// lieu : il attesterait l'absence de la lecture, pas sa présence.
+    #[derive(Default)]
+    struct PagesDePr {
+        appels: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for PagesDePr {
+        async fn run(&self, args: &[&str]) -> Result<String> {
+            self.appels
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|a| (*a).to_string()).collect());
+            if args.first() != Some(&"pr") {
+                return Ok(String::new());
+            }
+            // Le vol `un_vol_sur_1802` porte la PR #2002.
+            if args.contains(&"all") {
+                Ok(r#"[{"number":2002,"state":"OPEN"}]"#.to_string())
+            } else {
+                Ok(r#"[{"number":2002,"statusCheckRollup":[
+                    {"name":"Check","status":"COMPLETED","conclusion":"SUCCESS"}
+                ]}]"#
+                    .to_string())
+            }
+        }
+    }
+
+    /// **Le câblage du vol 2a.** Le cycle interroge les PR du dépôt **du vol**,
+    /// et le verdict qui en sort porte une CI *lue*.
+    ///
+    /// Sans ce test, le câblage pourrait rester `FlightPrReads::Unwired` en
+    /// production avec toute la suite de l'évaluateur verte : `Unwired` est un
+    /// état légitime, et c'est précisément ce que les onze autres appelants
+    /// passent. Un test de l'évaluateur seul ne peut donc pas voir l'oubli.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2968_le_cycle_lit_les_pr_du_depot_du_vol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let gh = PagesDePr::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let (source, _asked) = RecordingFlightSource::wired(vec![un_vol_sur_1802()]);
+
+        run_manager_cycle_in(
+            &cfg,
+            base_state(),
+            &CycleContext::new(&rec, now)
+                .with_flight_source(Some(&source))
+                .with_gh_runner(Some(&gh)),
+        )
+        .await
+        .unwrap();
+
+        let lectures: Vec<Vec<String>> = gh
+            .appels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("pr"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            lectures.len(),
+            2,
+            "deux appels pour un dépôt — `statusCheckRollup` est le champ qui \
+             coûte, donc il est demandé à part : {lectures:?}"
+        );
+        for appel in &lectures {
+            assert!(
+                appel.contains(&"senara-solutions/mika".to_string()),
+                "le dépôt interrogé sort du vol : {appel:?}"
+            );
+        }
+
+        // Et la lecture atteint le rapport : c'est le seul endroit où
+        // l'opérateur la voit, donc le seul endroit où elle doit être mesurée.
+        let calls = rec.calls.lock().unwrap().clone();
+        let rapport = calls
+            .first()
+            .map(|(_, _, body)| body.report_markdown.clone())
+            .expect("le cycle livre");
+        assert!(
+            rapport.contains("PR OPEN"),
+            "l'état de PR vient de la lecture par numéro :\n{rapport}"
+        );
+        assert!(
+            rapport.contains("CI verte (lue au cycle de"),
+            "et la CI est lue, pas devinée :\n{rapport}"
         );
     }
 
