@@ -1,7 +1,7 @@
 ---
 title: Une mesure en `contains` et un prédicat ancré ne comptent pas la même population
 date: 2026-10-29
-last_updated: 2026-10-29
+last_updated: 2026-10-30
 category: best-practices
 module: mika-agent/evidence/guards
 problem_type: best_practice
@@ -126,6 +126,32 @@ l'AC2 demandait et qui n'existe pas dans la population. Et il rend le fixture
 porte la mesure du corps entier (39 lignes, 0 ancrée, `contains` vrai), pour que
 la troncature du fixture ne puisse jamais être relue comme la cause du refus.
 
+## Reproduit à l'identique sur un second jeton (2026-10-30)
+
+Le vol 2/2 de mika#2961 porte le même garde sur la ligne `NEGATIVE-TEST:`. La
+mesure a été **refaite**, et non déduite de celle du vol 1 : 60 dernières PR par
+dépôt, prédicat ancré, casse repliée.
+
+| population | `pass` | ligne ancrée | `contains` |
+|---|---|---|---|
+| 2026-10-29, jeton `PIPELINE` | 261 | 0 | 4 |
+| 2026-10-30, jeton `NEGATIVE-TEST` | 260 | 0 | 1 |
+
+L'unique `contains` du second relevé est la revue de **la PR du vol 1
+elle-même** : elle cite le jeton dans une case de critère d'acceptation, parce que
+le vol 1 avait reporté ce terme par écrit. La forme du faux positif est donc
+identique à celle des quatre de #2691 — *une revue qui parle du jeton parce que la
+PR qu'elle relit l'implémente* — ce qui en fait moins une coïncidence qu'une
+**propriété de la population** : sur un dépôt qui s'auto-développe, les corps de
+revue les plus susceptibles de contenir le mot sont ceux des PR qui installent le
+garde. Un `contains` est donc structurellement biaisé vers le fail-open exactement
+là où la mesure sert à décider.
+
+Le coût de refaire la mesure : une requête, deux minutes. Le coût de l'avoir
+déduite : le même contrôle positif faux que le vol 1 avait failli écrire, sur un
+jeton où l'écart valait 1 sur 260 — assez petit pour qu'un relevé « ≈ 0, comme le
+vol 1 » soit passé sans objection.
+
 ## Ce que ça ne dit pas
 
 - **`contains` n'est pas faux en soi** : il est faux comme *estimateur d'un
@@ -143,7 +169,11 @@ la troncature du fixture ne puisse jamais être relue comme la cause du refus.
 
 ## Références
 
-- Vol : mika#2961 (`crates/mika-agent/src/evidence/guards.rs`, `mod mika2961`).
+- Vols : mika#2961 vol 1/2 (section `PIPELINE:`) et vol 2/2 (ligne
+  `NEGATIVE-TEST:`), tous deux dans `crates/mika-agent/src/evidence/guards.rs`,
+  `mod mika2961`. Le second a ajouté un terme au même garde : l'ordre dans lequel
+  les deux termes sont lus décide quel motif un corps porte —
+  `une-conjonction-de-deux-termes-dans-un-garde-se-lit-dans-un-ordre-2026-10-30.md`.
 - Famille du garde : mika#2687 (membre `block[pipeline]`), mika#2455
   (l'abstention CI et son arithmétique fail-open).
 - Classe « une garde que rien n'exerce se lit comme une garde qui marche » :
