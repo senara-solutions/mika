@@ -24,8 +24,8 @@ use super::{
     assessor::{Assessor, AssessorConfig},
     evaluator::{FinishedFlight, FlightPrReads, FlightSource, FlightVerdict, evaluate_flights},
     groom_trigger::{
-        GroomCandidate, GroomSender, GroomTriggerOutcome, groom_write_is_armed,
-        trigger_relief_grooms,
+        GroomCandidate, GroomInFlightReading, GroomInFlightSource, GroomIssue, GroomSender,
+        GroomTriggerOutcome, groom_write_is_armed, trigger_relief_grooms,
     },
     pool_writer::{admit_pool_tickets, pool_write_is_armed},
     reader::{GhRunner, ProcessGhRunner, Reader, read_flight_prs},
@@ -36,7 +36,7 @@ use super::{
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
 use crate::flight_verdict_ledger::{FlightVerdictLedger, InscriptionTally, record_if_wired};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use mika_common::auth_boundary::{AuthBoundaryError, AuthBoundaryKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -205,6 +205,17 @@ pub enum CycleKind {
     EventAndHeartbeat,
 }
 
+/// Un groom que **ce manager** a envoyé, et quand (mika#2958 vol 2d).
+///
+/// Un `Vec<(u64, String)>` sérialiserait en tableaux de deux éléments, illisible
+/// dans un checkpoint qu'un opérateur ouvre à la main pour diagnostiquer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggeredGroom {
+    pub number: u64,
+    /// ISO 8601 UTC, format `crate::timestamp`.
+    pub at: String,
+}
+
 /// Persisted checkpoint per milestone. Digest of the observed sub-issue set
 /// used to detect state change without needing to re-serialize the full
 /// `MilestoneState` on each cycle.
@@ -229,6 +240,11 @@ pub struct MilestoneCheckpoint {
     /// (un verdict perdu pour toujours).
     #[serde(default)]
     pub posted_flight_task_ids: Vec<String>,
+    /// Les grooms que ce manager a envoyés, avec leur instant — la fenêtre
+    /// d'idempotence durable d'AC2 (mika#2958 vol 2d). `#[serde(default)]` : un
+    /// checkpoint antérieur se relit en fenêtre vide, jamais en erreur.
+    #[serde(default)]
+    pub triggered_grooms: Vec<TriggeredGroom>,
 }
 
 // ---- mika#1949 U3 — the manager delivery boundary -------------------------
@@ -544,6 +560,23 @@ pub struct CycleContext<'a> {
     /// forme de `gh_runner` : rien ici ne clone l'émetteur, et un test injecte
     /// alors son double sans l'emballer.
     pub groom_sender: Option<&'a dyn GroomSender>,
+    /// Par quoi le cycle voit **qu'un groom est déjà en vol** (mika#2958, vol 2d).
+    ///
+    /// La lecture est container-scopée et vit hors de ce module
+    /// ([`crate::groom_in_flight::DbGroomInFlightSource`]) : du SQL avec un handle
+    /// de base ne passe pas le scan de `no_dispatch_test.rs` sans exception
+    /// nommée, et ce vol n'en ajoute aucune.
+    ///
+    /// `None` = non câblée, et ce n'est **pas** traité comme
+    /// [`super::GroomInFlightReading::Unreadable`] : le site dit
+    /// `no_in_flight_source`, un motif à lui. Les deux causes — « la base dit
+    /// qu'un groom tourne » et « il n'y a pas de source » — sont deux populations
+    /// qu'un nom commun rendrait insoustrayables (mika#2205), sur l'axe même où
+    /// AC2 se lit.
+    ///
+    /// `&Arc<dyn …>` comme `flight_source` : le site de production tient la source
+    /// dans un `Arc` partagé avec le reste du serveur.
+    pub groom_in_flight: Option<&'a Arc<dyn GroomInFlightSource>>,
 }
 
 impl<'a> CycleContext<'a> {
@@ -557,6 +590,7 @@ impl<'a> CycleContext<'a> {
             verdict_ledger: None,
             gh_runner: None,
             groom_sender: None,
+            groom_in_flight: None,
         }
     }
 
@@ -590,6 +624,14 @@ impl<'a> CycleContext<'a> {
 
     pub fn with_groom_sender(mut self, sender: Option<&'a dyn GroomSender>) -> Self {
         self.groom_sender = sender;
+        self
+    }
+
+    pub fn with_groom_in_flight(
+        mut self,
+        source: Option<&'a Arc<dyn GroomInFlightSource>>,
+    ) -> Self {
+        self.groom_in_flight = source;
         self
     }
 }
@@ -816,6 +858,29 @@ fn inscription_branch(tally: Option<&InscriptionTally>, no_verdicts: bool) -> &'
 /// son ticket. Un doublon visible, jamais un verdict perdu.
 const POSTED_FLIGHTS_RETAINED: usize = 500;
 
+/// Combien de temps la fenêtre durable tient un groom pour « en cours »
+/// (mika#2958 vol 2d).
+///
+/// Ce n'est pas la durée d'un groom : c'est la majoration du **trou de course**
+/// entre `message/send` accepté et l'apparition de la tâche moteur en base, le
+/// seul intervalle que la lecture container-scopée du vol 2c ne peut pas voir.
+/// Au-delà, c'est cette lecture qui détient la vérité — et si elle ne voit rien,
+/// le groom est fini ou mort, deux cas où un re-déclenchement est le comportement
+/// voulu. Une fenêtre plus longue n'achèterait pas de sûreté : elle achèterait de
+/// la famine (voir [`window_holds`]).
+///
+/// 30 minutes majore très largement le budget de tour de mika-dev (~300 s) que le
+/// corps de mika#2958 cite pour le groom moteur.
+///
+/// **La taille de la liste n'a pas besoin d'une seconde borne** : à
+/// `GROOMS_PER_CYCLE = 1`, cette TTL la borne déjà par le nombre de cycles tenant
+/// dans 30 minutes, et une double borne serait une seconde autorité sur la même
+/// question (mika#2201). C'est aussi pourquoi elle est en **temps** et non en
+/// nombre comme [`POSTED_FLIGHTS_RETAINED`] ci-dessus : à un groom par cycle,
+/// évacuer une entrée d'une borne en nombre coûterait N cycles, et jusque-là le
+/// numéro serait muselé.
+const GROOM_WINDOW: Duration = Duration::minutes(30);
+
 /// Le seul geste d'écriture du cycle (mika#2698 vol 2) — et le seul endroit du
 /// cycle qui consulte l'interrupteur.
 ///
@@ -916,22 +981,31 @@ async fn write_pool_admissions(
     .await
 }
 
-/// Traduit la relève en candidats et déclenche leur groom (mika#2958, vol 2b).
+/// Traduit la relève en candidats et déclenche leur groom (mika#2958, vols 2b
+/// et 2d).
 ///
-/// Calqué sur [`write_pool_admissions`] : un seul refus **propre à ce site**,
+/// Calqué sur [`write_pool_admissions`] : les refus **propres à ce site** sont
 /// `no_relief_verdict`, pour `assessment.relief == None` — c'est une *lecture
 /// absente*, jamais une relève vide (mika#2331 ; et jamais deux populations sous
 /// un même nom, mika#2205 : une relève mesurée à zéro est dite `no_relief` par
-/// `trigger_relief_grooms`, sous un autre nom). Les trois motifs de fil
-/// (`disarmed`, `no_sender`, `no_relief`) ne sont **pas** redits ici : ils
+/// `trigger_relief_grooms`, sous un autre nom) — et, depuis le vol 2d,
+/// `no_in_flight_source` pour une source de lecture non câblée. Les trois motifs
+/// de fil (`disarmed`, `no_sender`, `no_relief`) ne sont **pas** redits ici : ils
 /// restent à leur site unique `cycle_refusal` (mika#2201).
+///
+/// L'ordre des refus est celui de D4, et il porte une garantie : l'interrupteur
+/// est constaté **avant** la lecture en base, donc avec OFF aucune requête n'est
+/// payée et le motif nomme la cause dominante (`disarmed`, pas
+/// `no_in_flight_source`).
 ///
 /// L'interrupteur est lu ici, au moment de l'appel, comme
 /// [`write_pool_admissions`] lit `pool_write_is_armed()` : le geste n'a pas de
 /// mémoire de son armement, il le constate à chaque cycle.
 async fn trigger_cycle_grooms(
+    cfg: &ManagerConfig,
     ctx: &CycleContext<'_>,
     assessment: &Assessment,
+    checkpoint: Option<&MilestoneCheckpoint>,
 ) -> GroomTriggerOutcome {
     let Some(relief) = assessment.relief.as_ref() else {
         info!(
@@ -941,7 +1015,78 @@ async fn trigger_cycle_grooms(
         );
         return GroomTriggerOutcome::default();
     };
-    let candidats: Vec<GroomCandidate> = relief
+    let armed = groom_write_is_armed();
+    if !armed {
+        // R6 / D4 point 2 — l'interrupteur est constaté **avant** toute lecture
+        // en base : avec OFF, le cycle ne paie pas une requête SQL par tour, et
+        // `cycle_refusal` dit `disarmed` à son site unique (mika#2201).
+        //
+        // La tranche porte quand même les candidats, parce que
+        // `manager_groom_not_triggered` en rend le **nombre** : `candidates = 0`
+        // dirait « relève vide » sous le nom d'un cycle désarmé, deux
+        // populations sous un nom (mika#2205). Leur `groom_en_cours` n'est
+        // consulté par personne sur cette branche — `trigger_relief_grooms`
+        // rend avant `envoyer` — et il porte donc la lecture qui n'a pas eu
+        // lieu, `Unreadable` : la seule valeur qui ne prétende pas savoir
+        // (mika#2331).
+        let candidats =
+            relief_candidates(relief, &GroomInFlightReading::Unreadable, &BTreeSet::new());
+        return trigger_relief_grooms(false, ctx.groom_sender, &candidats).await;
+    }
+    let Some(source) = ctx.groom_in_flight else {
+        // D4 point 3 — un motif à ce site, et non `Unreadable` passé à la
+        // lecture : la direction fail-safe ferait bien sauter tous les
+        // candidats, mais sous le nom `groom_in_flight`, qui dirait alors deux
+        // choses — « la base voit un groom » et « il n'y a pas de source »
+        // (mika#2205), sur l'axe même où AC2 se lit.
+        info!(
+            target: "mika::milestone_manager",
+            event = "manager_groom_not_triggered",
+            reason = "no_in_flight_source",
+        );
+        return GroomTriggerOutcome::default();
+    };
+    let issues: Vec<GroomIssue> = relief
+        .next
+        .iter()
+        .map(|t| GroomIssue {
+            number: t.number,
+            // D2 — les deux provenances de `CandidateOrigin` sont dans le dépôt
+            // cible (« une issue ouverte **du dépôt** »), donc composer depuis
+            // `cfg.target.repo` est légitime et unique. C'est le patron
+            // d'`evaluator::milestone_issue_urls`. L'URL canonique nue suffit :
+            // le lecteur normalise lui-même par `issue_url_variants`.
+            url: format!("https://github.com/{}/issues/{}", cfg.target.repo, t.number),
+        })
+        .collect();
+    let reading = source.grooms_in_flight(&issues).await;
+    // D7 — l'élagage est appliqué **à la lecture** : un cycle qui ne déclenche
+    // ni ne poste rien ne sauvegarde pas le checkpoint, donc des entrées
+    // expirées peuvent y séjourner, et c'est ici que la correction se joue.
+    let window = triggered_window_at(
+        checkpoint
+            .map(|c| c.triggered_grooms.as_slice())
+            .unwrap_or(&[]),
+        ctx.now,
+    );
+    let candidats = relief_candidates(relief, &reading, &window);
+    trigger_relief_grooms(armed, ctx.groom_sender, &candidats).await
+}
+
+/// Les candidats de la relève, `groom_en_cours` compris (mika#2958 vol 2d).
+///
+/// Le booléen est la **disjonction** de deux lectures, et les deux sont
+/// nécessaires parce qu'aucune ne voit ce que l'autre voit : la lecture en base
+/// voit la tâche moteur une fois posée, la fenêtre durable couvre le trou de
+/// course entre le `message/send` accepté et cette pose. Ce site ne relit
+/// aucune des deux — chacune a son lecteur unique, `carries_groom` et
+/// [`triggered_window_at`] (mika#2201).
+fn relief_candidates(
+    relief: &super::relief::ReliefVerdict,
+    reading: &GroomInFlightReading,
+    window: &BTreeSet<u64>,
+) -> Vec<GroomCandidate> {
+    relief
         .next
         .iter()
         .map(|t| GroomCandidate {
@@ -959,20 +1104,85 @@ async fn trigger_cycle_grooms(
             // jour de filtrer, le candidat refuserait au lieu de grommer un
             // ticket que rien ne débloque.
             deja_groome: !t.motive.remediable_by_grooming(),
-            // La fenêtre entre `message/send` et la pose du siège par le moteur
-            // n'est pas lisible d'ici sans état durable. Agent-scoped, la lecture
-            // rendrait une constante `false` (mika#2792). `false` est donc la
-            // valeur honnête à ce vol, et `GROOMS_PER_CYCLE = 1` borne le dégât à
-            // un doublon au pire. Une lecture par label ne la remplacerait pas :
-            // `assess_pool` écarte déjà les porteurs de siège
-            // (`labels_hold_dispatch_seat`), donc elle serait inerte.
-            //
-            // Tracked in: vol 2c — fenêtre d'idempotence durable + lecture
-            // container-scoped des tâches moteur `Groom …` / `ready-label`.
-            groom_en_cours: false,
+            groom_en_cours: reading.carries_groom(t.number) || window.contains(&t.number),
         })
+        .collect()
+}
+
+/// La fenêtre tient-elle encore cette entrée, à `now` ? (mika#2958 vol 2d)
+///
+/// **Le site unique de la direction fail-safe de la fenêtre** (mika#2201), et
+/// cette direction est l'**inverse** de celle de
+/// [`super::GroomInFlightReading::carries_groom`], délibérément : là, une lecture
+/// `Unreadable` rend `true` pour tout numéro, parce que le doute doit bloquer un
+/// *envoi*. Ici, une entrée dont l'instant ne se parse pas est **écartée**.
+/// L'argument est l'asymétrie des conséquences :
+///
+/// - faux négatif (on renvoie un groom déjà envoyé) ⇒ **un doublon**, borné par
+///   `GROOMS_PER_CYCLE = 1`, et le moteur n'a de toute façon qu'un créneau
+///   `dispatch_class = 'groom'` (schéma v34) ;
+/// - faux positif permanent (une entrée illisible retient un numéro pour
+///   toujours) ⇒ **famine** : un ticket de relève que rien ne groome plus jamais,
+///   et silencieusement.
+///
+/// Un futur éditeur qui « réaligne » cette direction par symétrie avec le vol 2c
+/// choisit la seconde. Ne pas le faire.
+///
+/// L'écart est pris en **valeur absolue** : un instant dans le futur de plus de
+/// [`GROOM_WINDOW`] — dérive d'horloge, checkpoint édité à la main — retiendrait
+/// sinon le numéro indéfiniment, c'est-à-dire exactement la famine que la borne
+/// existe pour interdire.
+fn window_holds(entry: &TriggeredGroom, now: DateTime<Utc>) -> bool {
+    match crate::timestamp::parse(&entry.at) {
+        Ok(at) => now.signed_duration_since(at).abs() < GROOM_WINDOW,
+        Err(e) => {
+            tracing::warn!(
+                target: "mika::milestone_manager",
+                event = "groom_window_entry_unparsable",
+                number = entry.number,
+                at = %entry.at,
+                error = %e,
+            );
+            false
+        }
+    }
+}
+
+/// Les numéros que la fenêtre tient encore pour « déclenchés », à `now`.
+///
+/// L'élagage est appliqué à la **lecture**, et c'est de là que vient la
+/// correction : un cycle qui ne déclenche ni ne poste rien ne sauvegarde pas le
+/// checkpoint, donc des entrées expirées peuvent y séjourner. L'écriture élague
+/// aussi ([`merge_triggered`]), mais seulement pour que le fichier ne grossisse
+/// pas.
+fn triggered_window_at(window: &[TriggeredGroom], now: DateTime<Utc>) -> BTreeSet<u64> {
+    window
+        .iter()
+        .filter(|entry| window_holds(entry, now))
+        .map(|entry| entry.number)
+        .collect()
+}
+
+/// La fenêtre que le prochain checkpoint portera : l'ancienne élaguée, plus les
+/// numéros de ce cycle. Un numéro redéclenché garde l'instant le plus récent.
+fn merge_triggered(
+    previous: &[TriggeredGroom],
+    newly: &[u64],
+    now: DateTime<Utc>,
+) -> Vec<TriggeredGroom> {
+    let at = crate::timestamp::format(&now);
+    let newly: BTreeSet<u64> = newly.iter().copied().collect();
+    let mut merged: Vec<TriggeredGroom> = previous
+        .iter()
+        .filter(|entry| !newly.contains(&entry.number))
+        .filter(|entry| window_holds(entry, now))
+        .cloned()
         .collect();
-    trigger_relief_grooms(groom_write_is_armed(), ctx.groom_sender, &candidats).await
+    merged.extend(newly.into_iter().map(|number| TriggeredGroom {
+        number,
+        at: at.clone(),
+    }));
+    merged
 }
 
 /// La liste des vols postés que le prochain checkpoint portera : l'ancienne,
@@ -1044,12 +1254,13 @@ pub async fn run_manager_cycle_in(
     // champ de checkpoint n'en a besoin. Lié plutôt que jeté pour que ce vol-là
     // soit l'ajout d'une ligne et non une reprise du site.
     let _admitted = write_pool_admissions(cfg, ctx, &state, &assessment).await;
-    // mika#2958 vol 2b — le geste de la relève. Lié ici, après le bassin, parce
-    // que la relève dérive du verdict de bassin : la nommer avant de l'avoir
-    // mesurée n'a pas de sens. Le résultat est lié et non jeté pour la même
-    // raison qu'`_admitted` : le rendu ON du rapport, au vol 2d, doit être
-    // l'ajout d'une ligne et non une reprise du site.
-    let _grooms = trigger_cycle_grooms(ctx, &assessment).await;
+    // mika#2958 vols 2b et 2d — le geste de la relève. Lié ici, après le bassin,
+    // parce que la relève dérive du verdict de bassin : la nommer avant de
+    // l'avoir mesurée n'a pas de sens. Depuis le vol 2d le résultat a un
+    // consommateur — la fenêtre d'idempotence durable, composée au site de
+    // sauvegarde ci-dessous. Ce qu'il n'a toujours pas, c'est une destination
+    // dans le rapport : c'est le vol 2e (AC4, moitié ON).
+    let grooms = trigger_cycle_grooms(cfg, ctx, &assessment, checkpoint.as_ref()).await;
     let severity = assessment.severity.clone();
     let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
 
@@ -1160,31 +1371,48 @@ pub async fn run_manager_cycle_in(
     }
 
     // Persist checkpoint on delivery — ou sur un verdict posté sans livraison
-    // (mika#2698 vol 2). Sans cette seconde raison, un cycle qui poste sans
-    // livrer ne retiendrait rien et reposterait au cycle suivant : l'AC2
-    // tomberait précisément dans le cas où l'interrupteur sert.
+    // (mika#2698 vol 2), ou sur un groom envoyé (mika#2958 vol 2d, R5). Sans ces
+    // raisons secondes, un cycle qui agit sans livrer ne retiendrait rien et
+    // recommencerait au cycle suivant : l'AC2 tomberait précisément dans le cas
+    // où l'interrupteur sert.
     let posted_something = !newly_posted.is_empty();
-    if should_deliver || posted_something {
+    let triggered_something = !grooms.declenches.is_empty();
+    if should_deliver || posted_something || triggered_something {
         let previous = checkpoint
             .as_ref()
             .map(|c| c.posted_flight_task_ids.as_slice())
             .unwrap_or(&[]);
         let posted_flight_task_ids = merge_posted(previous, &newly_posted);
+        // D7 — l'élagage à l'écriture, pour que le fichier ne grossisse pas. La
+        // correction, elle, ne dépend que de l'élagage à la lecture : un cycle
+        // qui n'agit pas du tout ne passe jamais ici.
+        let triggered_grooms = merge_triggered(
+            checkpoint
+                .as_ref()
+                .map(|c| c.triggered_grooms.as_slice())
+                .unwrap_or(&[]),
+            &grooms.declenches,
+            now,
+        );
         let new_checkpoint = if should_deliver {
             MilestoneCheckpoint {
                 state_digest: digest,
                 last_delivered_at: Some(generated_at.clone()),
                 last_observed_at: state.last_activity_at.clone(),
                 posted_flight_task_ids,
+                triggered_grooms,
             }
         } else {
-            // Posté sans livrer : les trois champs de cadence sont **préservés**
+            // Agi sans livrer : les trois champs de cadence sont **préservés**
             // tels quels. Les réécrire ici avalerait l'événement
             // `state_changed` en attente — une sauvegarde faite pour une raison
-            // ne doit pas répondre à la place d'une autre.
+            // ne doit pas répondre à la place d'une autre. Les deux champs
+            // d'idempotence, eux, portent bien ce que ce cycle a fait : c'est
+            // la raison même de la sauvegarde.
             let base = checkpoint.clone().unwrap_or_default();
             MilestoneCheckpoint {
                 posted_flight_task_ids,
+                triggered_grooms,
                 ..base
             }
         };
@@ -1300,7 +1528,7 @@ pub async fn probe_executor_health(url: Option<&str>) -> Option<bool> {
 /// Live-runner variant: reads from `gh`, probes optional health endpoint,
 /// then runs the same cycle logic.
 pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
-    run_manager_cycle_with_auth(cfg, None, &[], None, None, None).await
+    run_manager_cycle_with_auth(cfg, None, &[], None, None, None, None).await
 }
 
 /// As [`run_manager_cycle`], with the mika#1949 auth-boundary wiring: where to
@@ -1318,6 +1546,12 @@ pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
 /// tente rien. Il n'est pas construit ici comme `gh_runner` l'est : le rail
 /// demande le jeton interne, que ce site ne tient pas — il se résout par
 /// [`super::resolve_groom_rail`] au site qui le tient (`server/mod.rs`).
+///
+/// Depuis mika#2958 vol 2d, `groom_in_flight` dit par quoi le cycle voit qu'un
+/// groom est **déjà en vol**. Même raison de ne pas le construire ici que le
+/// rail : la lecture tient un handle de base, que ce site n'a pas. `None` fait
+/// dire `no_in_flight_source` au geste — un motif à lui, jamais confondu avec
+/// « la base voit un groom » (mika#2205).
 pub async fn run_manager_cycle_with_auth(
     cfg: &ManagerConfig,
     auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
@@ -1325,6 +1559,7 @@ pub async fn run_manager_cycle_with_auth(
     flight_source: Option<&Arc<dyn FlightSource>>,
     verdict_ledger: Option<&Arc<dyn FlightVerdictLedger>>,
     groom_sender: Option<&dyn GroomSender>,
+    groom_in_flight: Option<&Arc<dyn GroomInFlightSource>>,
 ) -> Result<CycleOutcome> {
     let reader = Reader::new(cfg.github_token.clone());
     let mut state = reader.read(&cfg.target).await?;
@@ -1344,7 +1579,8 @@ pub async fn run_manager_cycle_with_auth(
         .with_flight_source(flight_source)
         .with_verdict_ledger(verdict_ledger)
         .with_gh_runner(Some(&gh_runner))
-        .with_groom_sender(groom_sender);
+        .with_groom_sender(groom_sender)
+        .with_groom_in_flight(groom_in_flight);
     run_manager_cycle_in(cfg, state, &ctx).await
 }
 
@@ -2814,6 +3050,85 @@ mod tests {
         );
     }
 
+    /// **R5 au vol 2d** — déclenché sans livrer : le checkpoint est écrit pour
+    /// cette raison seule, la fenêtre porte le numéro, et les trois champs de
+    /// cadence sont préservés.
+    ///
+    /// Sans cette troisième raison de sauvegarde, le groom envoyé ne laisserait
+    /// aucune trace durable et le cycle suivant le renverrait : la base ne voit
+    /// pas encore la tâche moteur, donc la lecture du vol 2c répondrait
+    /// honnêtement « rien ». C'est exactement le trou de course que la fenêtre
+    /// existe pour couvrir, et le premier cycle est ici celui qui l'ouvre.
+    ///
+    /// Le premier cycle court **sans rail de groom** exprès : s'il en avait un,
+    /// il aurait déjà envoyé, et le second mesurerait la fenêtre au lieu de la
+    /// sauvegarde.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_declencher_sans_livrer_sauvegarde_et_preserve_la_cadence() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut etat = base_state();
+        etat.sub_issues[0].plan_present = false;
+
+        // Cycle 1 : livre, sans rail de groom — rien n'est envoyé.
+        run_manager_cycle_in(&cfg, etat.clone(), &CycleContext::new(&rec, t0))
+            .await
+            .unwrap();
+        let apres_livraison = lire_checkpoint(&cfg);
+        assert!(
+            apres_livraison.triggered_grooms.is_empty(),
+            "prémisse : sans rail, le premier cycle n'a rien déclenché"
+        );
+
+        // Cycle 2 : dix minutes plus tard, état **inchangé** (donc pas de
+        // livraison), mais le rail et la lecture sont câblés.
+        let groom = RecordingGroom::default();
+        let source: Arc<dyn GroomInFlightSource> = Arc::new(LectureGroom::vide());
+        let outcome = run_manager_cycle_in(
+            &cfg,
+            etat,
+            &CycleContext::new(&rec, t0 + Duration::minutes(10))
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.delivered, "ni changement d'état ni heartbeat");
+        assert_eq!(
+            *groom.envois.lock().unwrap(),
+            vec!["groom mika#1802".to_string()],
+            "et pourtant il déclenche"
+        );
+
+        let apres_groom = lire_checkpoint(&cfg);
+        assert_eq!(
+            apres_groom
+                .triggered_grooms
+                .iter()
+                .map(|g| g.number)
+                .collect::<Vec<_>>(),
+            vec![1802],
+            "la fenêtre retient le numéro envoyé"
+        );
+        assert_eq!(
+            apres_groom.state_digest, apres_livraison.state_digest,
+            "le digest est préservé : cette sauvegarde ne parle pas de livraison"
+        );
+        assert_eq!(
+            apres_groom.last_delivered_at, apres_livraison.last_delivered_at,
+            "la date de dernière livraison est préservée"
+        );
+        assert_eq!(
+            apres_groom.last_observed_at, apres_livraison.last_observed_at,
+            "la borne `since` du prochain cycle est préservée"
+        );
+    }
+
     /// Un exécutant qui rend de vraies pages de PR, pour mesurer le câblage de
     /// la lecture par numéro plutôt que son échec. `RecordingGh` rend la chaîne
     /// vide, donc le premier appel y échoue au parse et le second n'a jamais
@@ -3221,6 +3536,38 @@ mod tests {
         }
     }
 
+    /// Une lecture de grooms en vol, scriptée, qui note ce qu'on lui a demandé
+    /// (mika#2958, vol 2d).
+    ///
+    /// Les `demandes` sont la moitié qui compte pour R6 : c'est par elles qu'un
+    /// test montre qu'avec l'interrupteur fermé **aucune lecture n'est payée**,
+    /// ce qu'aucune assertion sur les envois ne pourrait dire.
+    struct LectureGroom {
+        reponse: GroomInFlightReading,
+        demandes: Mutex<Vec<Vec<GroomIssue>>>,
+    }
+
+    impl LectureGroom {
+        fn rendant(reponse: GroomInFlightReading) -> Self {
+            Self {
+                reponse,
+                demandes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn vide() -> Self {
+            Self::rendant(GroomInFlightReading::Read(BTreeSet::new()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GroomInFlightSource for LectureGroom {
+        async fn grooms_in_flight(&self, issues: &[GroomIssue]) -> GroomInFlightReading {
+            self.demandes.lock().unwrap().push(issues.to_vec());
+            self.reponse.clone()
+        }
+    }
+
     /// L'interrupteur du geste de groom, armé pour la durée d'un test.
     ///
     /// Même forme que [`BassinArme`] ci-dessus, et pour la même raison : le seul
@@ -3266,13 +3613,18 @@ mod tests {
             .expect("l'assesseur nomme toujours la relève")
     }
 
-    /// **AC1 au niveau du cycle.** Le rail est câblé, la relève nomme un ticket,
-    /// l'interrupteur est à son état par défaut : zéro envoi.
+    /// **AC1 au niveau du cycle, et R6 au vol 2d.** Le rail est câblé, la lecture
+    /// est câblée, la relève nomme un ticket, l'interrupteur est à son état par
+    /// défaut : zéro envoi **et zéro lecture**.
     ///
     /// L'assertion sur la relève est la moitié qui compte, exactement comme pour
     /// le bassin au-dessus : sans elle, ce test resterait vert le jour où
     /// `base_state()` cesse de produire un refus que le grooming corrige, et il
     /// certifierait le silence d'un cycle qui n'avait personne à grommer.
+    ///
+    /// L'assertion sur les demandes est la garantie de D4 : l'interrupteur est
+    /// constaté **avant** la lecture, donc OFF ne paie pas une requête SQL par
+    /// tour. Aucune assertion sur les envois ne pourrait le dire.
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2958_linterrupteur_ferme_ne_declenche_aucun_groom() {
@@ -3280,6 +3632,8 @@ mod tests {
         let cfg = mk_config(tmp.path());
         let rec = RecordingDeliverer::default();
         let groom = RecordingGroom::default();
+        let lecture = Arc::new(LectureGroom::vide());
+        let source: Arc<dyn GroomInFlightSource> = lecture.clone();
         let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
         let mut state = base_state();
         state.sub_issues[0].plan_present = false;
@@ -3287,7 +3641,9 @@ mod tests {
         run_manager_cycle_in(
             &cfg,
             state,
-            &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
         )
         .await
         .unwrap();
@@ -3306,6 +3662,11 @@ mod tests {
             "interrupteur fermé : aucun geste ne part, vu : {:?}",
             groom.envois.lock().unwrap()
         );
+        assert!(
+            lecture.demandes.lock().unwrap().is_empty(),
+            "R6 : interrupteur fermé, aucune lecture en base n'est payée, vu : {:?}",
+            lecture.demandes.lock().unwrap()
+        );
     }
 
     /// **Le contrôle négatif d'AC1**, dans le même test de bout en bout : avec
@@ -3315,6 +3676,11 @@ mod tests {
     /// câblage absent ou une sélection qui refuse tout le monde — trois causes
     /// sous un même silence (classe mika#2205). L'instruction est asservie mot
     /// pour mot parce que c'est elle que mika-dev reçoit.
+    ///
+    /// Au vol 2d il porte aussi le **négatif sans fenêtre** : la lecture en base
+    /// ne voit rien, aucun checkpoint n'est posé, donc la disjonction de R2 est
+    /// fausse des deux côtés et le candidat passe. C'est ce qui sépare « la
+    /// fenêtre bloque » d'« un câblage qui bloque tout ».
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2958_linterrupteur_ouvert_declenche_un_seul_groom() {
@@ -3323,6 +3689,8 @@ mod tests {
         let cfg = mk_config(tmp.path());
         let rec = RecordingDeliverer::default();
         let groom = RecordingGroom::default();
+        let lecture = Arc::new(LectureGroom::vide());
+        let source: Arc<dyn GroomInFlightSource> = lecture.clone();
         let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
         let mut state = base_state();
         state.sub_issues[0].plan_present = false;
@@ -3330,7 +3698,9 @@ mod tests {
         run_manager_cycle_in(
             &cfg,
             state,
-            &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
         )
         .await
         .unwrap();
@@ -3339,6 +3709,19 @@ mod tests {
             *groom.envois.lock().unwrap(),
             vec!["groom mika#1802".to_string()],
             "un groom, un seul, et le geste est celui que le moteur comprend"
+        );
+        assert_eq!(
+            lecture
+                .demandes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|q| q.iter().map(|i| i.url.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                "https://github.com/senara-solutions/mika/issues/1802".to_string()
+            ]],
+            "D2 : l'URL interrogée est composée depuis `cfg.target.repo`, canonique et nue"
         );
     }
 
@@ -3369,8 +3752,10 @@ mod tests {
         let mut assessment = assessment_du_cycle(&rec);
         assessment.relief = None;
         let issue = trigger_cycle_grooms(
+            &cfg,
             &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
             &assessment,
+            None,
         )
         .await;
 
@@ -3415,9 +3800,14 @@ mod tests {
         );
         releve.next[0].motive = crate::milestone_manager::pool::RefusalReason::PriorPlanOnly;
 
+        let source: Arc<dyn GroomInFlightSource> = Arc::new(LectureGroom::vide());
         let issue = trigger_cycle_grooms(
-            &CycleContext::new(&rec, now).with_groom_sender(Some(&groom)),
+            &cfg,
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
             &assessment,
+            None,
         )
         .await;
 
@@ -3427,6 +3817,247 @@ mod tests {
             groom.envois.lock().unwrap().is_empty(),
             "rien ne part, vu : {:?}",
             groom.envois.lock().unwrap()
+        );
+    }
+
+    /// **R1 et R2, moitié « base » — le câblage atteint le candidat.** La lecture
+    /// dit qu'un groom tourne sur 1802 : le candidat est sauté pour
+    /// `groom_in_flight`, et rien ne part.
+    ///
+    /// C'est le test qui fait tomber le booléen codé en dur du vol 2c : avant le vol 2d, la
+    /// même lecture n'aurait rien changé au résultat, et aucune assertion n'aurait
+    /// pu le dire. Son négatif est
+    /// `mika2958_linterrupteur_ouvert_declenche_un_seul_groom`, qui court la même
+    /// relève avec une lecture vide et un checkpoint absent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_une_lecture_qui_voit_un_groom_en_vol_saute_le_candidat() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(&cfg, state, &CycleContext::new(&rec, now))
+            .await
+            .unwrap();
+        let assessment = assessment_du_cycle(&rec);
+
+        let source: Arc<dyn GroomInFlightSource> = Arc::new(LectureGroom::rendant(
+            GroomInFlightReading::Read(BTreeSet::from([1802])),
+        ));
+        let issue = trigger_cycle_grooms(
+            &cfg,
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
+            &assessment,
+            None,
+        )
+        .await;
+
+        assert_eq!(issue.declenches, Vec::<u64>::new());
+        assert_eq!(issue.sautes, vec![(1802, "groom_in_flight")]);
+        assert!(
+            groom.envois.lock().unwrap().is_empty(),
+            "AC2 : un groom déjà en vol n'est pas relancé, vu : {:?}",
+            groom.envois.lock().unwrap()
+        );
+    }
+
+    /// **R2, moitié « fenêtre » — la fenêtre durable bloque à elle seule.** La
+    /// base ne voit rien, mais le checkpoint porte un envoi de 5 minutes : le
+    /// candidat est sauté pour `groom_in_flight`.
+    ///
+    /// C'est le trou de course que la lecture en base ne peut pas couvrir : entre
+    /// un `message/send` accepté et la pose de la tâche moteur, la base répond
+    /// honnêtement « rien », et sans cette fenêtre le cycle suivant renverrait.
+    /// Le même test au-delà de [`GROOM_WINDOW`] — l'entrée à 31 minutes — est ce
+    /// qui montre que le blocage n'est pas définitif.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_la_fenetre_durable_bloque_ce_que_la_base_ne_voit_pas() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(&cfg, state, &CycleContext::new(&rec, now))
+            .await
+            .unwrap();
+        let assessment = assessment_du_cycle(&rec);
+        let source: Arc<dyn GroomInFlightSource> = Arc::new(LectureGroom::vide());
+
+        let dans_la_fenetre = MilestoneCheckpoint {
+            triggered_grooms: vec![entree(1802, now, 5)],
+            ..Default::default()
+        };
+        let issue = trigger_cycle_grooms(
+            &cfg,
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
+            &assessment,
+            Some(&dans_la_fenetre),
+        )
+        .await;
+
+        assert_eq!(issue.declenches, Vec::<u64>::new());
+        assert_eq!(issue.sautes, vec![(1802, "groom_in_flight")]);
+        assert!(
+            groom.envois.lock().unwrap().is_empty(),
+            "la fenêtre tient le numéro, vu : {:?}",
+            groom.envois.lock().unwrap()
+        );
+
+        let expiree = MilestoneCheckpoint {
+            triggered_grooms: vec![entree(1802, now, 31)],
+            ..Default::default()
+        };
+        let issue = trigger_cycle_grooms(
+            &cfg,
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
+            &assessment,
+            Some(&expiree),
+        )
+        .await;
+
+        assert_eq!(
+            issue.declenches,
+            vec![1802],
+            "R4 : passé la fenêtre, le numéro redevient déclenchable — pas de famine"
+        );
+        assert_eq!(
+            *groom.envois.lock().unwrap(),
+            vec!["groom mika#1802".to_string()],
+        );
+    }
+
+    // -- mika#2958 vol 2d : la fenêtre d'idempotence durable ------------------
+
+    /// Une entrée de fenêtre posée à `now - minutes`.
+    fn entree(number: u64, now: DateTime<Utc>, minutes: i64) -> TriggeredGroom {
+        TriggeredGroom {
+            number,
+            at: crate::timestamp::format(&(now - Duration::minutes(minutes))),
+        }
+    }
+
+    /// **R4 — la fenêtre expire.** Un groom envoyé dans la fenêtre y est tenu ;
+    /// au-delà de [`GROOM_WINDOW`] il redevient déclenchable.
+    ///
+    /// C'est la propriété qui interdit la famine : sans elle, un numéro entré
+    /// dans la fenêtre n'en sortirait jamais et plus rien ne le groomerait.
+    #[test]
+    fn mika2958_la_fenetre_expire_et_le_numero_redevient_declenchable() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let fenetre = vec![entree(1802, now, 29), entree(1803, now, 31)];
+
+        assert_eq!(
+            triggered_window_at(&fenetre, now),
+            BTreeSet::from([1802]),
+            "29 minutes est dans la fenêtre, 31 n'y est plus"
+        );
+        assert!(
+            triggered_window_at(&fenetre, now + Duration::minutes(2)).is_empty(),
+            "deux minutes plus tard, les deux sont sortis — rien ne retient indéfiniment"
+        );
+    }
+
+    /// **D5 — une entrée dont l'instant ne se parse pas est écartée**, et c'est
+    /// la direction **inverse** de `GroomInFlightReading::carries_groom`.
+    ///
+    /// La retenir serait un faux positif permanent : un ticket de relève que
+    /// rien ne groome plus jamais, et silencieusement. L'écarter coûte au pire un
+    /// doublon, borné par `GROOMS_PER_CYCLE = 1`.
+    #[test]
+    fn mika2958_une_entree_illisible_est_ecartee_de_la_fenetre() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let fenetre = vec![
+            TriggeredGroom {
+                number: 1802,
+                at: "pas-un-instant".to_string(),
+            },
+            entree(1803, now, 1),
+        ];
+
+        assert_eq!(
+            triggered_window_at(&fenetre, now),
+            BTreeSet::from([1803]),
+            "l'illisible sort, le lisible reste — un doublon possible, jamais une famine"
+        );
+    }
+
+    /// Un instant dans le **futur** de plus d'une fenêtre est écarté lui aussi.
+    ///
+    /// Dérive d'horloge ou checkpoint édité à la main : sans la valeur absolue de
+    /// l'écart, une telle entrée retiendrait son numéro indéfiniment — la famine
+    /// que la borne existe pour interdire.
+    #[test]
+    fn mika2958_un_instant_dans_le_futur_lointain_ne_retient_rien() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let fenetre = vec![entree(1802, now, -31), entree(1803, now, -5)];
+
+        assert_eq!(
+            triggered_window_at(&fenetre, now),
+            BTreeSet::from([1803]),
+            "un futur proche est tenu (horloge qui dérive d'une minute), un futur lointain non"
+        );
+    }
+
+    /// **D7 — la fusion dédoublonne, garde l'instant le plus récent, et élague.**
+    #[test]
+    fn mika2958_la_fusion_dedoublonne_et_elague() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let precedente = vec![
+            entree(1802, now, 20), // redéclenché ce cycle : son instant est rafraîchi
+            entree(1803, now, 5),  // intact
+            entree(1804, now, 45), // expiré : élagué par l'écriture
+        ];
+
+        let fusionnee = merge_triggered(&precedente, &[1802], now);
+
+        let numeros: Vec<u64> = fusionnee.iter().map(|e| e.number).collect();
+        assert_eq!(
+            numeros,
+            vec![1803, 1802],
+            "une entrée par numéro, l'expirée sortie et la redéclenchée en queue"
+        );
+        assert_eq!(
+            fusionnee
+                .iter()
+                .find(|e| e.number == 1802)
+                .map(|e| e.at.as_str()),
+            Some(crate::timestamp::format(&now).as_str()),
+            "le numéro redéclenché garde l'instant le plus récent"
+        );
+        assert_eq!(
+            triggered_window_at(&fusionnee, now),
+            BTreeSet::from([1802, 1803]),
+            "et la relecture de la fusion rend exactement ces deux numéros"
+        );
+    }
+
+    /// Un checkpoint écrit avant ce vol se relit en fenêtre **vide**, jamais en
+    /// erreur — `serde(default)`, comme `posted_flight_task_ids` au vol 2 de
+    /// mika#2698.
+    #[test]
+    fn mika2958_un_checkpoint_davant_le_vol_2d_se_relit() {
+        let ancien = r#"{"state_digest":"abc","last_delivered_at":"2026-10-31T12:00:00Z","last_observed_at":"2026-10-30T00:00:00Z","posted_flight_task_ids":["t-1"]}"#;
+        let c: MilestoneCheckpoint = serde_json::from_str(ancien).unwrap();
+        assert_eq!(c.posted_flight_task_ids, vec!["t-1".to_string()]);
+        assert!(
+            c.triggered_grooms.is_empty(),
+            "le champ absent se relit en fenêtre vide, jamais en erreur"
         );
     }
 }

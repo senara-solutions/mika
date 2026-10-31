@@ -20,7 +20,7 @@
 #   - runs v0.12.0/v0.12.1/v0.12.2 ended `cancelled`: the x86_64-apple-darwin job
 #     ran on `macos-13`, never got a runner, and hit "The job has exceeded the
 #     maximum execution time while awaiting a runner for 24h0m0s". That target is
-#     now cross-compiled on macos-14, the runner aarch64-apple-darwin already used.
+#     now cross-compiled on macos-15 (arm64), the runner aarch64-apple-darwin uses.
 #   - taiki-e/upload-rust-binary-action only runs `gh release upload`: the release
 #     itself came from release-please, gone since mika#2047.
 #   - the action names the checksum `<archive>.sha256`; install.sh and
@@ -131,9 +131,9 @@ jobs:
             os: ubuntu-22.04
           # Cross-compiled from arm64: `macos-13` never got a runner (see header).
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
       TARGET: ${{ matrix.target }}
