@@ -697,6 +697,56 @@ fn create_completable_parent_setup(db: &Database, pr_url: &str) -> (String, Stri
     (parent_id, child_id)
 }
 
+/// Seed a `completed`-but-**not**-`delivered` groom-class callback child under
+/// `parent_id` — the mika#2980 population: a groom whose pilot has finished and
+/// whose callback is still in flight.
+///
+/// Twin of `reapers::seed_groom_callback` on exactly two terms, and both are
+/// the point:
+/// - **no `mark_task_delivered`**, so the row stays `completed`. That is the
+///   state neither the grace anchor (`child.status = 'delivered'`) nor the old
+///   sibling guard (`('pending','in_progress')`) could see;
+/// - the backdating is on **`completed_at`**, not `updated_at`, because
+///   `completed_at` is what the liveness arm of the sibling guard reads.
+///
+/// `completed_age_secs` is `Some(n)` to date the completion `n` seconds ago, or
+/// `None` to leave `completed_at` NULL — the row shape written outside
+/// `update_task_completed`, which the guard must read as *not* live (a
+/// completion that cannot be dated cannot prove freshness).
+fn seed_completed_groom_callback(
+    db: &Database,
+    parent_id: &str,
+    label: &str,
+    completed_age_secs: Option<i64>,
+) -> String {
+    let mut child = callback_task("mika");
+    child.parent_task_id = Some(parent_id.to_string());
+    child.label = label.to_string();
+    child.dispatch_class = Some("groom".to_string());
+    let child_id = db.create_task(&child).unwrap();
+    assert!(
+        db.update_task_completed(&child_id, "mika", Some("Outcome: PLAN_GROOMED"))
+            .unwrap()
+    );
+    match completed_age_secs {
+        Some(secs) => db
+            .conn
+            .execute(
+                "UPDATE tasks SET completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2) WHERE id = ?1",
+                params![child_id, format!("-{secs} seconds")],
+            )
+            .unwrap(),
+        None => db
+            .conn
+            .execute(
+                "UPDATE tasks SET completed_at = NULL WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap(),
+    };
+    child_id
+}
+
 /// Seed a `skill_overrides` row with explicit curator-relevant columns for
 /// the archival-candidate query tests (AC9–AC12). Bypasses the upsert
 /// helpers so `lifecycle_state` and `last_used_at` can be set to arbitrary
