@@ -8,14 +8,25 @@
 //! lu**, et c'est très exactement le mode de panne. Seul un vrai tour, dont la
 //! garde tourne à sa position de production dans `run_gh`, ferme ça.
 //!
-//! **Les trois contrôles négatifs sont porteurs, pas décoratifs.** V1/V2 seuls
+//! **Les contrôles négatifs sont porteurs, pas décoratifs.** V1/V2 seuls
 //! seraient satisfaits par une garde qui refuse `run_gh` sur *tout* tour
 //! Fallthrough — c'est-à-dire par un correctif qui casse le geste de
 //! vérification que la SCOPE RULE du prompt prescrit littéralement
-//! (`issue view --json labels`). V3 (lecture sur un tour Fallthrough), V4
-//! (ready-label, dans le domaine `[GitHub]` mais hors du domaine fallthrough) et
-//! V5 (aucun préfixe `[GitHub]`) sont les trois axes qui séparent « la garde
-//! décide » de « la garde bloque `run_gh` ».
+//! (`issue view --json labels`). V3 (lecture sur un tour Fallthrough) et V7
+//! (une étiquette qui ne déclenche rien) sont deux des axes qui séparent « la
+//! garde décide » de « la garde bloque `run_gh` ».
+//!
+//! **mika#2995 a déplacé le troisième axe, il ne l'a pas retiré.** V4 et V5
+//! portaient l'axe « hors du domaine Fallthrough, rien ne change » sur le motif
+//! `ready_label_add` : ils affirmaient qu'un tour ready-label et qu'un tour de
+//! conversation ordinaire gardaient le `--add-label ready`. C'est très exactement
+//! la capacité par laquelle mika-dev s'est posé le consentement à lui-même le
+//! 2026-10-31 sur mika#2958, sur un tour **ordinaire** — donc une borne
+//! « Fallthrough seulement » n'aurait rien refusé ce jour-là. Les deux tests
+//! disent maintenant le refus, et l'axe qu'ils portaient passe à V6, sur
+//! `issue_create` : hors tour Fallthrough, créer une issue passe toujours.
+//! C'est ce qui sépare « la population dépend du motif » de « la garde refuse
+//! tout, partout » — mika#2995 retire **une** capacité au moteur, pas deux.
 
 use async_trait::async_trait;
 use mika_agent::skills::builtin_handlers;
@@ -34,10 +45,12 @@ const REFUSAL: &str = "fallthrough_work_creation_refused";
 const FALLTHROUGH_MSG: &str = "[GitHub] New comment on senara-solutions/mika#2567 — la branche est conservée pour le re-groom";
 
 /// Dans le domaine `[GitHub]`, **hors** du domaine fallthrough : le chemin de
-/// dispatch, qui doit garder chaque verbe qu'il avait.
+/// dispatch, qui garde chaque verbe qu'il avait — sauf la pose de `ready`, que
+/// mika#2995 lui retire comme à tous les autres tours.
 const READY_LABEL_MSG: &str = "[GitHub] Issue labeled ready on senara-solutions/mika#2562 — title";
 
-/// Hors du domaine `[GitHub]` entièrement.
+/// Hors du domaine `[GitHub]` entièrement — la classe de tour de l'incident du
+/// 2026-10-31 (mika#2995).
 const PLAIN_MSG: &str = "pose le label ready sur mika issue#2562";
 
 // -- Le vrai builtin, atteint par la boucle d'agent --
@@ -250,16 +263,18 @@ async fn mika2573_a_fallthrough_turn_may_still_read() {
 }
 
 // -------------------------------------------------------------------------
-// V4 (AC4, contrôle négatif — axe 1)
+// V4 (mika#2995) — le tour ready-label non plus ne peut pas poser `ready`.
 //
-// Le tour ready-label, dans le domaine `[GitHub]` et hors du domaine
-// fallthrough, garde les deux verbes. Sans lui, une garde armée sur tout tour
-// `[GitHub]` satisferait V1/V2 en cassant le chemin de dispatch — celui sur
-// lequel la boucle tourne.
+// Ce test disait l'inverse jusqu'à mika#2995, et c'était la moitié haute du
+// trou : le chemin de dispatch est dans le domaine `[GitHub]`, hors du domaine
+// fallthrough, donc une borne « Fallthrough seulement » le laissait écrire le
+// consentement que la garde de mika#2772 exige d'un humain. Le motif reste
+// `ready_label_add` : ce n'est pas une seconde garde, c'est la même dont la
+// population a changé.
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn mika2573_a_ready_label_turn_is_not_affected() {
+async fn mika2995_a_ready_label_turn_may_not_post_the_dispatch_label_either() {
     let (harness, output) = run_gh_output(
         READY_LABEL_MSG,
         json!(["issue", "edit", "2562", "--add-label", "ready"]),
@@ -267,28 +282,44 @@ async fn mika2573_a_ready_label_turn_is_not_affected() {
     .await;
 
     assert!(
-        !output.contains(REFUSAL),
-        "the ready-label dispatch path is outside the fallthrough domain and must be \
-         untouched; got: {output}"
+        output.contains(REFUSAL),
+        "the dispatch label is the operator's consent (mika#841); no turn class lets the \
+         engine write it, the ready-label path included; got: {output}"
+    );
+    assert!(
+        output.contains("mika#2995"),
+        "the refusal must name the ticket that widened its population, or an operator \
+         reading it cannot tell which rule is speaking; got: {output}"
     );
 
     let rows = refusal_rows(&harness).await;
-    assert!(
-        rows.is_empty(),
-        "no refusal row outside the fallthrough domain: {rows:?}"
+    assert_eq!(rows.len(), 1, "one audit row per refusal; got {rows:?}");
+    assert_eq!(
+        rows[0].0.as_deref(),
+        Some("ready_label_add"),
+        "the same motif as V1 — mika#2995 widened one population, it did not mint a \
+         second name for it (mika#2205)"
     );
 }
 
 // -------------------------------------------------------------------------
-// V5 (AC4, contrôle négatif — axe 2)
+// V5 (mika#2995) — l'argv exact de l'incident, sur sa classe de tour exacte.
 //
-// Le second axe : V4 seul serait satisfait par une garde calée sur le marqueur
-// ready-label plutôt que sur le domaine. Ce message porte le vocabulaire du
-// défaut (« label ready ») sans aucun préfixe `[GitHub]`.
+// Le 2026-10-31 à 16:51:37Z, trace `0104d923`, mika-dev a appelé
+// `run_gh ["issue","edit","2958","--add-label","ready"]` sur un tour ORDINAIRE,
+// cinq minutes après que la garde de mika#2772 lui ait refusé le groom — et le
+// texte de remède de ce refus prescrivait le geste. Ce test est le seul du
+// fichier qui tourne sur cette classe de tour ; il est donc le seul qui rougirait
+// si la borne « Fallthrough seulement » revenait.
+//
+// Le coût est réel et nommé : un opérateur qui demande en conversation « pose le
+// label `ready` sur #2562 » est refusé lui aussi. La promotion se fait depuis sa
+// propre surface. Une exception « quand c'est un humain qui demande » serait une
+// exception que l'agent se déclare à lui-même — c'est-à-dire pas une exception.
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn mika2573_an_ordinary_conversation_turn_is_not_affected() {
+async fn mika2995_an_ordinary_conversation_turn_may_not_post_the_dispatch_label() {
     let (harness, output) = run_gh_output(
         PLAIN_MSG,
         json!(["issue", "edit", "2562", "--add-label", "ready"]),
@@ -296,13 +327,76 @@ async fn mika2573_an_ordinary_conversation_turn_is_not_affected() {
     .await;
 
     assert!(
-        !output.contains(REFUSAL),
-        "an operator asking for the label by hand is outside the domain entirely — \
-         this is the path that un-parks a ticket; got: {output}"
+        output.contains(REFUSAL),
+        "this is the 2026-10-31 argv on the 2026-10-31 turn class: an ordinary turn. A \
+         guard bounded to Fallthrough turns refuses nothing here; got: {output}"
+    );
+    // AC3 — le remède ne prescrit pas le geste qu'il refuse. L'assertion est sur
+    // le CHAMP et non sur la sortie entière : `reason` nomme légitimement
+    // `gh issue edit --add-label` (dire ce qui est refusé), `remedy` ne peut pas
+    // (nommer un gabarit, c'est le prescrire — mika#2520). Une assertion sur la
+    // sortie entière serait verte par accident et muette sur la distinction.
+    let remedy = serde_json::from_str::<serde_json::Value>(&output)
+        .ok()
+        .and_then(|v| v["remedy"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("the refusal must be a JSON object with a remedy: {output}"));
+    for gabarit in ["--add-label", "--remove-label"] {
+        assert!(
+            !remedy.contains(gabarit),
+            "the remedy must not prescribe the very gesture it refuses — that is the \
+             defect mika#2995 closes, where the mika#2772 refusal's own remedy taught \
+             the agent the workaround. Found `{gabarit}` in: {remedy}"
+        );
+    }
+    assert!(
+        remedy.contains("belongs to the operator"),
+        "the remedy must attribute promotion to the operator rather than leave a blank \
+         the agent fills in; got: {remedy}"
     );
 
     let rows = refusal_rows(&harness).await;
-    assert!(rows.is_empty(), "no refusal row off the domain: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the refusal is countable on an ordinary turn too — AC5 counts `labeled ready` \
+         events by the engine identity, and this row is the other half of that join; \
+         got {rows:?}"
+    );
+}
+
+// -------------------------------------------------------------------------
+// V6 (mika#2995, contrôle négatif — l'axe que V4 et V5 portaient)
+//
+// Hors tour Fallthrough, `issue create` passe toujours. C'est ce qui sépare
+// « la population dépend du motif » de « la garde refuse tout `run_gh`
+// mutant » : sans ce test, les refus de V4 et V5 seraient indistinguables d'un
+// élargissement qui emporte aussi la borne de mika#2573.
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mika2995_issue_create_still_passes_off_a_fallthrough_turn() {
+    let (harness, output) = run_gh_output(
+        PLAIN_MSG,
+        json!([
+            "issue",
+            "create",
+            "--title",
+            "Re-groom mika#2562 — reprise substrat"
+        ]),
+    )
+    .await;
+
+    assert!(
+        !output.contains(REFUSAL),
+        "`issue create` keeps its mika#2573 bound — Fallthrough turns only. mika#2995 \
+         takes one capability from the engine, not two; got: {output}"
+    );
+
+    let rows = refusal_rows(&harness).await;
+    assert!(
+        rows.is_empty(),
+        "no refusal row for a motif whose population did not change: {rows:?}"
+    );
 }
 
 // -------------------------------------------------------------------------
