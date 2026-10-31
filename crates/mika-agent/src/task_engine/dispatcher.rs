@@ -4822,17 +4822,22 @@ const GROOM_PILOT_DISPATCHED_VALUE: &str = "implement_dispatched";
 const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
 
 /// mika#1289 — When a dev-groom callback delivers with `Outcome: PLAN_GROOMED`
-/// in its result text, re-add the `ready` label on the GitHub issue so the
-/// ready-label webhook handler dispatches dev-pilot. This is the structural
-/// counterpart to the LLM-mediated prompt-level path in `self-dev-callback`
-/// (mika#996 / PR #1291) which has a documented drift rate: the LLM
-/// sometimes sets `update_task_status(completed)` but skips the
-/// `gh issue edit --add-label ready` step, leaving the queue wedged.
+/// in its result text, dispatch dev-pilot. This is the structural counterpart
+/// to the LLM-mediated prompt-level path in `self-dev-callback` (mika#996 /
+/// PR #1291), which had a documented drift rate: the LLM sometimes set
+/// `update_task_status(completed)` and skipped its own step, leaving the queue
+/// wedged.
 ///
-/// Engine-side dispatch is fire-and-forget: failure to re-add the label is
-/// logged at WARN and does not affect the callback delivery. The prompt-
-/// level handler remains as defense-in-depth (idempotent — re-adding an
-/// already-present label is a no-op on GitHub).
+/// **This function is the ONLY auto-fire after a groom success since mika#2995.**
+/// The prompt-level path was not defense-in-depth, it was a self-consent
+/// surface: its step prescribed `gh issue edit --add-label ready`, i.e. the
+/// engine posting the operator's consent label to itself (mika#841 / mika#2772),
+/// and since mika#1614 moved dispatch here it had nothing left to achieve
+/// anyway. It was removed; the agent is now told the promotion belongs to the
+/// operator. Do not reinstate a label write on this path — a scan in
+/// `canonical_tokens.rs` refuses it in any bundled prompt.
+///
+/// Engine-side dispatch is fire-and-forget.
 ///
 /// Trigger conditions (all must hold):
 ///   - `task.dispatch_class == Some("groom")` — groom-class callbacks only
@@ -4860,8 +4865,11 @@ const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
 /// spawn — observed on mika#1609, 2026-06-28).
 ///
 /// Fire-and-forget: on ANY precondition failure (tool not in registry, readiness
-/// rejection, handler missing) the function logs a WARN and returns. The
-/// prompt-level path in `self-dev-callback` remains as defense-in-depth.
+/// rejection, handler missing) the function logs a WARN and returns. **Nothing
+/// catches that failure downstream since mika#2995** — the prompt-level path
+/// that used to be named here as defense-in-depth is gone (see above), so a
+/// precondition failure leaves the ticket promoted and undispatched, which is
+/// an operator-visible state and not an agent's business to repair.
 ///
 /// Audit event written under [`GROOM_PILOT_DISPATCHER_TOOL`] with
 /// `after_value=`[`GROOM_PILOT_DISPATCHED_VALUE`] for traceability — and, since
