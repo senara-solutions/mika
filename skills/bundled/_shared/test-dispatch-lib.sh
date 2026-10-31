@@ -9894,10 +9894,17 @@ assert_eq "U3c: la réécriture Outcome: PR_OPENED n'est appelée qu'au seul bra
     "1" "$(grep -c '_set_outcome_line "Outcome: PR_OPENED' "$DISPATCH_LIB" || true)"
 assert_eq "U3c (mika#2545): Outcome: ESCALATE n'est estampillé qu'à un site" \
     "1" "$(grep -c '_set_outcome_line "Outcome: ESCALATE' "$DISPATCH_LIB" || true)"
+# mika#2981 — PLAN_GROOMED est la seule des trois valeurs qui ne soit PAS passée
+# littéralement à `_set_outcome_line` : sa ligne porte depuis ce ticket un
+# suffixe ` — <plan>` nommant le plan que le groom a validé, composé dans
+# `_groomed_outcome` parce qu'il est conditionnel (repli nu sur le bras
+# `canonical_callout_failed`). La cardinalité de la VALEUR est donc comptée à son
+# site de composition, et elle reste de 1 : le geste juste est de suivre la
+# valeur là où elle est écrite, jamais de relâcher le compte.
 assert_eq "U3c (mika#2590): Outcome: PLAN_GROOMED n'est estampillé qu'à un site" \
-    "1" "$(grep -c '_set_outcome_line "Outcome: PLAN_GROOMED' "$DISPATCH_LIB" || true)"
+    "1" "$(grep -c '_groomed_outcome="Outcome: PLAN_GROOMED' "$DISPATCH_LIB" || true)"
 assert_eq "U3c: et _set_outcome_line n'a que ces trois valeurs déclarées" \
-    "3" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
+    "3" "$(grep -cE '_set_outcome_line "Outcome:|_groomed_outcome="Outcome:' "$DISPATCH_LIB" || true)"
 
 # --- D5 : la classe nouvelle passe par le même producteur de marqueur ---
 assert_contains "D5: _measure_pipeline_verified couvre toutes les classes de Path B" \
@@ -10731,11 +10738,30 @@ T2590_GROOMED_ARM=$(sed -n '/mika#1394: Architect converged on GROOMED/,/^      
 assert_eq "mika#2590 (bonne foi): le bras GROOMED a été extrait" \
     "yes" "$(if [ -n "$T2590_GROOMED_ARM" ]; then printf 'yes'; else printf 'no'; fi)"
 assert_contains "mika#2590 (U5a): le bras GROOMED pose sa ligne par _set_outcome_line" \
-    '_set_outcome_line "Outcome: PLAN_GROOMED"' "$T2590_GROOMED_ARM"
+    '_set_outcome_line "$_groomed_outcome"' "$T2590_GROOMED_ARM"
 assert_not_contains "mika#2590 (U5a): et le sed NON ANCRÉ a disparu (c'est lui, le faux négatif KTD3)" \
     's/Outcome: .*/Outcome: PLAN_GROOMED/' "$T2590_GROOMED_ARM"
 assert_contains "mika#2590 (U5a): le strip des PIPELINE FAILURE périmés est CONSERVÉ" \
     "sed '/^PIPELINE FAILURE:/d'" "$T2590_GROOMED_ARM"
+
+# --- mika#2981, Fire-Disposition : l'assertion auto-nettoyante de la grâce -----
+#
+# Le livrable de mika#2981 est une porte, et son chemin de succès est « aucune
+# violation trouvée ». La grâce D3 — une preuve dont la ligne ancrée ne porte
+# AUCUN suffixe de plan reste acceptée — a trois producteurs légitimes et doit se
+# vider d'elle-même (rétention de 30 jours de `prune_completed_tasks`). Le seul
+# chemin par lequel elle deviendrait la voie NOMINALE au lieu de se vider est un
+# retour du producteur à une frappe nue. Ces deux assertions rougissent ce
+# jour-là, et elles portent sur le FICHIER entier, pas sur le bras extrait : une
+# frappe nue ramenée ailleurs produirait la même population.
+#
+# Le compteur qui la fait expirer est `groom_proof_unbound_to_plan` dans
+# `audit_events` (écrivain unique, `executor.rs`) : c'est la sonde d'AC4, et à 0
+# le ticket de suivi retire la grâce et ces deux assertions avec elle.
+assert_not_contains "mika#2981 (Fire-Disposition): aucune frappe NUE de PLAN_GROOMED ne subsiste" \
+    '_set_outcome_line "Outcome: PLAN_GROOMED"' "$(cat "$DISPATCH_LIB")"
+assert_eq "mika#2981 (Fire-Disposition): la frappe SUFFIXÉE est présente une fois" \
+    "1" "$(grep -cF '_groomed_outcome="${_groomed_outcome} — ${GROOM_CALLOUT_PLAN}"' "$DISPATCH_LIB" || true)"
 
 # --- U7b (R8/D7) : aucune construction de RESULT auto_skipped ne cite le jeton -
 #

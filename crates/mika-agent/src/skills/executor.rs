@@ -1866,10 +1866,23 @@ fn groom_provenance_verdict(
             "error": "dispatch_grooming_not_verified",
             "task_id": task_id,
             "issue": format!("{}/{}#{}", owner, repo, number),
+            // mika#2981 — la condition du refus s'est ÉLARGIE, donc le prédicat
+            // qui la dit aussi. Depuis ce ticket, une preuve qui existe mais
+            // nomme le plan d'un AUTRE vol est également un refus, comme une
+            // preuve nue qu'une PR ouverte après elle a périmée : sans cette
+            // phrase, un opérateur qui lit « no completed groom callback …
+            // exists » devant un ticket dont il voit trois preuves en base
+            // conclurait à une panne de la porte, et chercherait au mauvais
+            // endroit.
             "predicate": "issue body has grooming markers but no completed groom \
                           callback carrying 'Outcome: PLAN_GROOMED' exists under a \
-                          task for this issue — markers may be pre-stamped by hand, \
-                          or the proof aged past the 30-day task retention",
+                          task for this issue, or the only such callback names a \
+                          different plan than the body's current `Plan:` callout, \
+                          or names no plan and a dev-pilot flight opened a PR for \
+                          this issue after it \
+                          (mika#2981 — proof of an earlier flight) — markers may be \
+                          pre-stamped by hand, or the proof aged past the 30-day \
+                          task retention",
             // mika#2484 — une phrase de ce champ est devenue FAUSSE par l'effet
             // de ce ticket, et la laisser serait livrer la régression que
             // mika#2287 a nommée : un texte de remède qui prescrit une route
@@ -1894,6 +1907,19 @@ fn groom_provenance_verdict(
             // mika#2012 y reste armée, délibérément, et `already_groomed` y est
             // encore la réponse. Le remède nomme cette population-là, et elle
             // seule.
+            //
+            // mika#2981 — QUATRIÈME strate, et c'est une vérification d'AC3
+            // plutôt qu'une correction : la route prescrite par les trois
+            // strates ci-dessus reste VIVANTE pour la cause neuve, et c'est ce
+            // qui rend la phrase ajoutée sûre. Un re-groom par la boucle part
+            // avec la provenance du refus (mika#2811), donc l'auto-skip du
+            // corps est désarmé, donc la passe est réelle et frappe une preuve
+            // neuve — qui porte désormais le plan du vol courant
+            // (`GROOM_CALLOUT_PLAN` dans `_write_canonical_callout`), donc
+            // satisfait la porte. La phrase ajoutée ne prescrit donc AUCUNE
+            // route neuve : elle nomme la cause pour que l'opérateur sache
+            // POURQUOI la route marche, là qu'il verrait sinon une preuve en
+            // base et un refus et conclurait à une boucle.
             "recovery": "Groom through the autonomous loop: re-apply the `ready` label, or \
                          dispatch dev-groom via 'mika ask --agent mika-dev \"groom \
                          <typed-ref>\"'. Since mika#2484 markers without proof route to \
@@ -1904,7 +1930,11 @@ fn groom_provenance_verdict(
                          where a hand-groomed ticket still answers `already_groomed` is a \
                          groom asked by an LLM turn (run_claude_pilot_groom), which carries \
                          no refusal provenance: there, remove the plan from the branch \
-                         first, or let the loop route it instead.",
+                         first, or let the loop route it instead. Since mika#2981 a proof \
+                         is bound to the plan it groomed, so on a multi-flight ticket an \
+                         earlier flight's proof no longer satisfies this gate: the same \
+                         route applies unchanged — the re-groom mints a proof carrying \
+                         the current `Plan:` callout.",
             "reason": format!(
                 "Cannot dispatch dev-pilot on ticket #{number}: grooming markers are \
                  present in the issue body but no completed autonomous groom task was \
@@ -2050,9 +2080,85 @@ pub(crate) async fn groomed_state(
     // not proof — the engine flips it groom→implement
     // (mika#1614) before it is terminal. Read-only.
     let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, number);
-    match db.has_completed_groom_for_issue(&issue_url).await {
+
+    // mika#2981 — la preuve doit porter le plan du vol COURANT.
+    //
+    // Le plan est lu du corps que cette fonction a déjà en main, par le lecteur
+    // unique de mika#2194 (garde `mika2194_aucun_motif_de_callout_hors_de_ce_module`,
+    // allowlist vide) : une seconde regex ici serait la régression de ce ticket.
+    // `Strip` parce que la question est la même que celle d'`auto_pull` — un
+    // callout CITÉ dans un bloc de code ne doit pas armer une porte, et le corps
+    // d'un ticket de ce dépôt cite régulièrement le gabarit (mika#2120).
+    //
+    // `normalized` et non `raw` : c'est la forme repo-relative, celle que
+    // `plan_relpath` publie côté preuve. Comparer les `raw` ferait divergir un
+    // callout préfixé (`mika/docs/plans/…`) de sa propre preuve.
+    //
+    // `None` quand le corps ne porte aucun callout lisible : ce cas-ci est
+    // normalement inatteignable (`check_grooming_markers` ci-dessus a déjà
+    // exigé `docs/plans/`), mais son prédicat est une sous-chaîne quand
+    // celui-ci est une ligne ancrée avec backtick fermant — donc l'écart
+    // existe, et la grâce comptée est le bras honnête : refuser ici
+    // déplacerait un refus de forme sous un nom de provenance.
+    let expected_plan =
+        crate::plan_callout::plan_callout(issue_body, crate::plan_callout::FenceHandling::Strip)
+            .map(|callout| callout.normalized);
+
+    match db
+        .has_completed_groom_for_issue(&issue_url, expected_plan.as_deref())
+        .await
+    {
         Ok(GroomConvergence::Converged) => GroomedState::Groomed,
+        // mika#2981 — ACCEPTÉE, et comptée. La grâce D3 : une preuve dont la
+        // ligne ancrée ne nomme aucun plan, et après laquelle aucun vol
+        // `dev-pilot` n'a ouvert de PR pour ce ticket. La compter est la sonde
+        // d'AC4.
+        Ok(GroomConvergence::ConvergedUnbound) => {
+            note_groom_proof_unbound_to_plan(
+                db,
+                &issue_url,
+                owner,
+                repo,
+                number,
+                expected_plan.as_deref(),
+            )
+            .await;
+            GroomedState::Groomed
+        }
         Ok(GroomConvergence::Absent) => GroomedState::MarkersWithoutProof,
+        // mika#2981 — REFUSÉE : la preuve est celle d'un autre vol. Même
+        // disposition qu'`Absent` (le refus `dispatch_grooming_not_verified`
+        // d'AC2), lecture opérateur différente, donc son propre événement —
+        // sans quoi le trou que ce ticket ferme serait incomptable après sa
+        // fermeture, classe mika#2205 appliquée au correctif lui-même.
+        Ok(GroomConvergence::PlanMismatch) => {
+            note_groom_proof_plan_mismatch(
+                db,
+                &issue_url,
+                owner,
+                repo,
+                number,
+                expected_plan.as_deref(),
+            )
+            .await;
+            GroomedState::MarkersWithoutProof
+        }
+        // mika#2981 — REFUSÉE : la preuve est nue, et un vol `dev-pilot` a
+        // ouvert une PR pour ce ticket après elle (borne de la grâce, décision
+        // de Vincent du 2026-10-31). Même disposition que `PlanMismatch`, son
+        // propre événement : l'un dit un plan, l'autre une date.
+        Ok(GroomConvergence::UnboundSuperseded) => {
+            note_groom_proof_unbound_superseded(
+                db,
+                &issue_url,
+                owner,
+                repo,
+                number,
+                expected_plan.as_deref(),
+            )
+            .await;
+            GroomedState::MarkersWithoutProof
+        }
         // mika#2590 R6 — même disposition que `Absent`, lecture opérateur
         // différente. Sans cette ligne, un ticket refoulé pour preuve polluée se
         // lit **exactement** comme un ticket jamais groomé : la classe mika#2205
@@ -2130,6 +2236,200 @@ async fn note_groom_proof_out_of_position(
             error = %e,
             "groomed_state: le WARN est passé, la ligne d'audit non — le \
              `GROUP BY` de la sonde S1 est alors incomplet (non fatal)"
+        );
+    }
+}
+
+/// `audit_events.tool_name` et nom d'événement du **refus** de mika#2981 : la
+/// preuve accepée nommait un autre plan que le callout du corps courant.
+///
+/// **SOLE WRITER** : [`note_groom_proof_plan_mismatch`]. C'est ce qui rend
+/// `SELECT count(*) FROM audit_events WHERE tool_name = '…'` exact — motif
+/// [`GROOM_PROOF_OUT_OF_POSITION_EVENT`].
+///
+/// Délibérément **distinct** de l'événement de grâce ci-dessous : l'un compte
+/// des vols que la porte a arrêtés, l'autre des vols qu'elle a laissés partir
+/// sans liaison. Sous un seul nom les deux populations ne se soustraient pas
+/// (mika#2205), et c'est la seconde qui est la sonde d'AC4.
+pub(crate) const GROOM_PROOF_PLAN_MISMATCH_EVENT: &str = "groom_proof_plan_mismatch";
+
+/// `audit_events.tool_name` et nom d'événement de la **grâce** de mika#2981 :
+/// une preuve acceptée dont la ligne ancrée ne nomme aucun plan.
+///
+/// **SOLE WRITER** : [`note_groom_proof_unbound_to_plan`].
+///
+/// # C'est la sonde d'AC4, et le site de retrait de la grâce
+///
+/// ```sql
+/// SELECT count(*) FROM audit_events
+///  WHERE tool_name = 'groom_proof_unbound_to_plan'
+///    AND created_at > '<10 derniers dispatches>';
+/// ```
+///
+/// La cible est 0. La population et ses trois producteurs légitimes sont
+/// documentés sur [`crate::task_state::tasks::GROOM_PROOF_UNBOUND_GRACE`], dont
+/// ce nom-ci est la forme d'audit ; à 0, le ticket de suivi retire la grâce,
+/// l'arme `ConvergedUnbound` devient un refus, et cette constante part avec
+/// elle.
+pub(crate) const GROOM_PROOF_UNBOUND_EVENT: &str = "groom_proof_unbound_to_plan";
+
+/// `audit_events.tool_name` et nom d'événement du refus de la **borne** de la
+/// grâce (mika#2981, décision de Vincent du 2026-10-31) : une preuve nue après
+/// laquelle un vol `dev-pilot` a ouvert une PR pour le ticket.
+///
+/// **SOLE WRITER** : [`note_groom_proof_unbound_superseded`].
+///
+/// Distinct de [`GROOM_PROOF_PLAN_MISMATCH_EVENT`] : les deux refusent la
+/// preuve d'un vol antérieur, mais l'un le lit sur le plan nommé, l'autre sur
+/// une date. Sous un seul nom, la part de chaque détecteur serait perdue
+/// (mika#2205).
+pub(crate) const GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT: &str = "groom_proof_unbound_superseded";
+
+/// Compte un refus de preuve pour cause de plan étranger (mika#2981).
+///
+/// Fire-and-forget, comme [`note_groom_proof_out_of_position`] : une écriture
+/// d'audit qui échoue est `warn!`ée et ne change pas le verdict. Une garde qui
+/// tomberait parce qu'elle ne peut pas se compter serait une garde qu'on retire.
+async fn note_groom_proof_plan_mismatch(
+    db: &AsyncDatabase,
+    issue_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    expected_plan: Option<&str>,
+) {
+    // Le plan ATTENDU seul est journalisé, jamais celui que la preuve portait :
+    // le second est le plan d'un vol antérieur du même ticket, donc il n'ajoute
+    // rien à la lecture, et le `target_key` porte déjà l'issue.
+    let expected = expected_plan.unwrap_or("<aucun>");
+    warn!(
+        event = GROOM_PROOF_PLAN_MISMATCH_EVENT,
+        issue_url = %issue_url,
+        expected_plan = expected,
+        "groomed_state: la seule preuve de groom de ce ticket nomme un AUTRE \
+         plan que le callout du corps courant — c'est la preuve d'un vol \
+         antérieur, le dispatch implement est refusé (mika#2981)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            GROOM_PROOF_SESSION_ID,
+            GROOM_PROOF_PLAN_MISMATCH_EVENT,
+            &format!("issue:{}/{}#{}", owner, repo, number),
+            None,
+            Some(expected),
+            Some(&format!("issue_url={issue_url}")),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "groom_proof_plan_mismatch_audit_failed",
+            issue_url = %issue_url,
+            error = %e,
+            "groomed_state: le WARN est passé, la ligne d'audit non — le compte \
+             du refus de mika#2981 est alors incomplet (non fatal)"
+        );
+    }
+}
+
+/// Compte une preuve **acceptée sur la grâce** de mika#2981 — ligne ancrée sans
+/// suffixe de plan.
+///
+/// Émise à chaque dispatch que la grâce laisse partir, pas une fois par preuve :
+/// c'est le dispatch qui est l'unité d'AC4 (« sur les 10 dispatches suivants »),
+/// et une preuve nue peut en porter plusieurs.
+///
+/// Fire-and-forget pour la même raison que ses deux sœurs — un compteur qui
+/// bloquerait le chemin de succès serait pire que le trou qu'il mesure.
+async fn note_groom_proof_unbound_to_plan(
+    db: &AsyncDatabase,
+    issue_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    expected_plan: Option<&str>,
+) {
+    // Le plan attendu est écrit même quand il est absent, sous un sentinel
+    // nommé : « le corps ne porte aucun callout lisible » et « la preuve est
+    // nue » sont deux producteurs différents de la même grâce, et un champ vide
+    // les confondrait (motif mika#2331 — absent n'est pas zéro).
+    let expected = expected_plan.unwrap_or("<aucun callout lisible>");
+    warn!(
+        event = GROOM_PROOF_UNBOUND_EVENT,
+        issue_url = %issue_url,
+        expected_plan = expected,
+        "groomed_state: la preuve de groom acceptée ne nomme AUCUN plan — \
+         dispatch autorisé par la grâce de mika#2981, qui s'arrête à la \
+         prochaine PR ouverte pour ce ticket (sonde AC4)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            GROOM_PROOF_SESSION_ID,
+            GROOM_PROOF_UNBOUND_EVENT,
+            &format!("issue:{}/{}#{}", owner, repo, number),
+            None,
+            Some(expected),
+            Some(&format!("issue_url={issue_url}")),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "groom_proof_unbound_audit_failed",
+            issue_url = %issue_url,
+            error = %e,
+            "groomed_state: le WARN est passé, la ligne d'audit non — la sonde \
+             d'AC4 est alors incomplète (non fatal)"
+        );
+    }
+}
+
+/// Compte un refus de la borne de la grâce (mika#2981) : la seule preuve est
+/// nue, et un vol `dev-pilot` a ouvert une PR pour le ticket après elle.
+///
+/// Fire-and-forget, comme ses trois sœurs : une écriture d'audit qui échoue est
+/// `warn!`ée et ne change pas le verdict.
+async fn note_groom_proof_unbound_superseded(
+    db: &AsyncDatabase,
+    issue_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    expected_plan: Option<&str>,
+) {
+    // Même sentinel que la grâce : les deux événements portent le même champ,
+    // et un vide y serait lu comme un plan absent plutôt que comme un corps
+    // sans callout lisible (mika#2331).
+    let expected = expected_plan.unwrap_or("<aucun callout lisible>");
+    warn!(
+        event = GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT,
+        issue_url = %issue_url,
+        expected_plan = expected,
+        "groomed_state: la seule preuve de groom ne nomme aucun plan, et un vol \
+         dev-pilot a ouvert une PR pour ce ticket après elle — la grâce de \
+         mika#2981 ne la couvre plus, le dispatch implement est refusé"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            GROOM_PROOF_SESSION_ID,
+            GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT,
+            &format!("issue:{}/{}#{}", owner, repo, number),
+            None,
+            Some(expected),
+            Some(&format!("issue_url={issue_url}")),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "groom_proof_unbound_superseded_audit_failed",
+            issue_url = %issue_url,
+            error = %e,
+            "groomed_state: le WARN est passé, la ligne d'audit non — le compte \
+             des refus de la borne est alors incomplet (non fatal)"
         );
     }
 }
@@ -12580,7 +12880,10 @@ Discussion: this one was a single-pass GROOMED case, unlike the others.
     mod harnais_porte {
         use super::*;
         use crate::async_db::AsyncDatabase;
-        use crate::db::tests::{GROOM_CALLBACK_PLAN_GROOMED, completed_groom_pair, db};
+        use crate::db::tests::{
+            GROOM_CALLBACK_PLAN_GROOMED, GROOM_PLAN_VOL_1, GROOM_PLAN_VOL_2, completed_groom_pair,
+            db, groom_callback, groom_callback_liee_au_plan, set_completed_at,
+        };
 
         /// Owner / repo / number that `evaluate_grooming_gate` folds into the
         /// issue URL — they MUST reproduce `db::tests::GROOM_ISSUE_URL`
@@ -12768,6 +13071,615 @@ Harness ticket.
                     .contains("shut down"),
                 "le message d'erreur original traverse `ProofUnreadable` sans être \
                  réécrit — c'est ce qui rend le JSON identique à l'octet près : {unreadable}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // mika#2981 AC2 — la preuve est liée à SON vol, et les quatre cas le
+        // disent dans le même appel
+        // -------------------------------------------------------------------
+        //
+        // **Ce que la fixture d'AC2 porte, et ce qu'elle ne porte pas.** Le
+        // critère écrit « une preuve de groom du vol 1 (plan A), **un merge**,
+        // puis un callout de corps qui nomme un plan B ». Il n'y a aucun merge
+        // ici, et c'est la décision D1 du plan : le terme retenu est le **plan**
+        // que la preuve nomme, pas l'instant du dernier merge. Un merge est un
+        // proxy de « un vol s'est terminé » ; le plan est l'objet même du groom.
+        // Le terme temporel aurait exigé un lecteur « issue → PR liée → dernier
+        // merge » qui n'existe pas (`github_graphql.rs` n'a que
+        // `gh_merged_pr_for_branch`, clé de branche) et aurait mis une
+        // dépendance réseau sur un chemin qui échoue-ouvert sans jeton — donc
+        // une porte que l'absence d'un jeton désarme. Sans merge dans la
+        // fixture, les quatre cas tournent **hors réseau, dans le même appel**,
+        // ce qu'AC2 demande littéralement.
+        //
+        // **La grâce d'une preuve nue a, elle, une borne datée** (décision de
+        // Vincent du 2026-10-31) : la première PR ouverte par un vol après la
+        // preuve. Elle se lit en base, sur la ligne `PR:` du callback
+        // d'implémentation, donc elle aussi sans réseau ; les quatre derniers
+        // cas de ce module la mesurent.
+        //
+        // Le corps est un **paramètre** de `evaluate_grooming_gate` : c'est ce
+        // qui rend ces quatre cas constructibles sans GitHub.
+
+        /// Un corps de ticket groomé nommant `plan` — la seule chose qui varie
+        /// d'un vol au suivant.
+        ///
+        /// Dérivé de [`GROOMED_ISSUE_BODY`] à la forme près : les trois
+        /// marqueurs canoniques doivent rester présents, sinon le refus rendu
+        /// serait `dispatch_no_grooming_marker` et aucun de ces tests ne
+        /// parlerait plus de la provenance.
+        fn corps_nommant(plan: &str) -> String {
+            format!(
+                "\
+## Summary
+
+Harness ticket.
+
+> - **Branch:** `feat/123/harnais-porte`
+> - **Plan:** `{plan}`
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE) → revisions → mika-arch second-pass (GROOMED)
+"
+            )
+        }
+
+        /// **AC2, cas 1 — la preuve du vol 1 ne fait pas partir le vol 2.**
+        ///
+        /// C'est le défaut que mika#2981 ferme, dans sa forme minimale : la base
+        /// porte UNE preuve de groom, convergée, terminale, sous une parente qui
+        /// porte bien l'URL du ticket — tout ce que mika#2287 exigeait — et elle
+        /// nomme le plan du vol 1. Le corps courant nomme le plan du vol 2.
+        /// Avant ce ticket la porte rendait `Ok` : la preuve d'un vol laissait
+        /// partir tous les suivants, dont les callouts auraient pu être posés à
+        /// la main. C'est la classe même que mika#2287 existe pour refuser.
+        ///
+        /// Le refus attendu est exactement `dispatch_grooming_not_verified` —
+        /// ni `dispatch_no_grooming_marker` (les trois marqueurs SONT là), ni
+        /// `dispatch_check_failed` (la base est lisible).
+        #[tokio::test]
+        async fn mika2981_la_preuve_du_vol_1_ne_fait_pas_partir_le_vol_2() {
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let rejection = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await
+            .expect_err(
+                "la preuve du vol 1 nomme le plan du vol 1 ; le corps courant nomme \
+                 celui du vol 2 — la porte doit refuser (mika#2981)",
+            );
+
+            assert_eq!(
+                rejection["error"], "dispatch_grooming_not_verified",
+                "les marqueurs sont présents et la base est lisible : le seul refus \
+                 admissible est celui de provenance ; {rejection}"
+            );
+
+            // AC3 — le texte de remède reste vrai POUR LA CAUSE NEUVE. La route
+            // qu'il prescrit est celle des trois strates antérieures, et elle
+            // reste vivante ici : un re-groom par la boucle frappe une preuve
+            // qui porte le callout du corps courant.
+            let recovery = rejection["recovery"].as_str().expect("recovery présent");
+            assert!(
+                recovery.contains("route to dev-groom, not dev-pilot"),
+                "le remède doit continuer de nommer la route qui marche : {recovery}"
+            );
+            assert!(
+                !recovery.contains("does NOT help"),
+                "aucune strate ne doit ressusciter la route morte de mika#2484 : {recovery}"
+            );
+            assert!(
+                rejection["predicate"]
+                    .as_str()
+                    .expect("predicate présent")
+                    .contains("different plan"),
+                "le prédicat doit nommer la cause neuve, sinon un opérateur qui voit \
+                 une preuve en base conclut à une panne de la porte : {rejection}"
+            );
+
+            // La ligne d'audit du refus — sans elle le refus n'est pas comptable.
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                lignes
+                    .iter()
+                    .filter(|l| l.tool_name == GROOM_PROOF_PLAN_MISMATCH_EVENT)
+                    .count(),
+                1,
+                "un refus pour plan étranger écrit exactement une ligne d'audit sous \
+                 son propre nom d'événement (mika#2205 : deux populations sous un nom \
+                 ne se soustraient pas) ; lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                lignes[0].after_value.as_deref(),
+                Some(GROOM_PLAN_VOL_2),
+                "la ligne porte le plan ATTENDU — celui du corps courant — et c'est \
+                 par lui que l'opérateur retrouve le vol qui a été arrêté"
+            );
+        }
+
+        /// **AC2, cas 2 — le contrôle positif, sur la MÊME fixture.**
+        ///
+        /// Même base que le cas 1, plus la preuve du vol 2. Sans ce test, « le
+        /// vol 2 est refusé » serait indistinguable de « plus rien ne part
+        /// jamais » — un prédicat qui refuse tout satisferait le cas 1 en entier
+        /// tout en cassant la boucle d'un bout à l'autre.
+        ///
+        /// La preuve du vol 1 est **toujours là** : c'est ce qui fait de ce test
+        /// une mesure de l'agrégation (`Converged` bat `PlanMismatch`) et pas
+        /// seulement du cas à une ligne.
+        ///
+        /// **Pourquoi la parente du vol 1 est terminée avant que celle du vol 2
+        /// naisse.** `idx_tasks_manual_active_ref_url` (schéma v17) est un index
+        /// unique PARTIEL : deux tâches `manual` **actives** ne peuvent pas
+        /// porter la même `reference_url` pour un agent. Un ticket à plusieurs
+        /// vols a donc toujours ses parentes antérieures terminales — c'est la
+        /// forme réelle, celle mesurée le 2026-10-30 sur mika#2968, et non une
+        /// commodité de fixture. La preuve du vol 1 survit malgré ça parce que
+        /// le prédicat ne filtre le statut que de l'**enfant** ; c'est
+        /// exactement ce qui rend le trou atteignable.
+        #[tokio::test]
+        async fn mika2981_la_preuve_du_vol_2_fait_partir_le_vol_2() {
+            let sync_db = db();
+            let (parente_vol_1, _) = completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+            );
+            sync_db
+                .update_task_status(&parente_vol_1, "completed")
+                .expect("terminer la parente du vol 1 passe par l'API d'écriture");
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_2),
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "le vol 2 a sa propre preuve, portant son propre plan : la porte doit \
+                 le laisser partir, et la preuve étrangère du vol 1 ne doit pas peser \
+                 dans l'agrégation ; {outcome:?}"
+            );
+
+            // Rien n'est écrit : l'acceptation est LIÉE, pas gracieuse. C'est ce
+            // qui sépare ce cas du cas 4 — sans cette assertion les deux
+            // rendraient `Ok` et la grâce serait invisible (mika#2205 appliqué à
+            // la sonde du correctif lui-même).
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert!(
+                lignes.is_empty(),
+                "une acceptation liée n'écrit aucune ligne : ni refus, ni grâce ; \
+                 lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **AC2, cas 3 — le vol unique part toujours.**
+        ///
+        /// Le critère exige que ce cas « ne change pas ». Il porte une preuve
+        /// liée et aucun merge, et le corps nomme le plan que cette preuve
+        /// nomme : c'est la configuration nominale d'après mika#2981, celle que
+        /// `_write_canonical_callout` produit depuis ce ticket.
+        ///
+        /// Ce qu'AC1 demande de dire explicitement — **ce que rend la porte pour
+        /// un ticket sans merge antérieur** — est répondu par construction : la
+        /// porte ne lit aucun merge. Une preuve liée est jugée sur le seul terme
+        /// du plan, et la borne datée ne touche que la grâce d'une preuve nue.
+        /// Un vol unique dont la preuve porte son plan est accepté, et c'est ici
+        /// que ça se lit.
+        ///
+        /// Son frère de forme nue est le cas 4 ci-dessous ; les deux ensemble
+        /// couvrent les deux populations de vol unique que la porte voit
+        /// aujourd'hui.
+        #[tokio::test]
+        async fn mika2981_le_vol_unique_part_toujours() {
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_1),
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "un vol unique dont la preuve porte le plan du corps est le cas \
+                 nominal : mika#2981 ne doit RIEN y changer ; {outcome:?}"
+            );
+        }
+
+        /// **AC2, cas 4 — la grâce D3 laisse partir une preuve nue, et elle est
+        /// comptée.**
+        ///
+        /// La preuve est la forme d'**avant** mika#2981 : ligne ancrée, aucun
+        /// suffixe de plan. Trois producteurs légitimes la frappent encore —
+        /// toutes les preuves déjà en base, la fenêtre de déploiement
+        /// (`skills/bundled/` est lu au build, donc le producteur corrigé
+        /// n'atteint aucun agent avant `make deploy`), et le flux opérateur
+        /// `/mika-groom-ticket`, qui écrit son propre callout. Les refuser
+        /// aurait arrêté la boucle le jour du merge.
+        ///
+        /// Elle part donc, et **la sonde d'AC4 est l'autre moitié du test** : un
+        /// dispatch laissé partir sans liaison écrit une ligne sous son propre
+        /// nom d'événement. C'est le compte que le ticket de suivi lit pour
+        /// retirer la grâce. Sans la ligne, « accepté sur la grâce » et
+        /// « accepté avec une preuve liée » rendent les mêmes octets et le
+        /// correctif n'a pas de sonde.
+        ///
+        /// Le compte attendu est **1** : la grâce est émise par dispatch, pas
+        /// par preuve, parce que le dispatch est l'unité d'AC4.
+        #[tokio::test]
+        async fn mika2981_une_preuve_nue_part_sur_la_grace_et_elle_est_comptee() {
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                GROOM_CALLBACK_PLAN_GROOMED,
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_1),
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "une preuve nue reste acceptée : la refuser aurait arrêté la boucle \
+                 sur toutes les preuves déjà en base, le jour du merge (grâce D3) ; \
+                 {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                lignes
+                    .iter()
+                    .filter(|l| l.tool_name == GROOM_PROOF_UNBOUND_EVENT)
+                    .count(),
+                1,
+                "chaque dispatch que la grâce laisse partir est compté une fois sous \
+                 son propre nom d'événement — c'est la sonde d'AC4, et le compte que \
+                 le ticket de suivi lit pour retirer la grâce ; lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                lignes[0].after_value.as_deref(),
+                Some(GROOM_PLAN_VOL_1),
+                "la ligne porte le plan attendu, lisible ici — le sentinel \
+                 `<aucun callout lisible>` est réservé au corps sans callout, et \
+                 confondre les deux producteurs de la grâce rendrait le compte \
+                 d'AC4 inutilisable (mika#2331)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // mika#2981 — la borne de la grâce : la première PR ouverte après la
+        // preuve nue (décision de Vincent du 2026-10-31)
+        // -------------------------------------------------------------------
+
+        /// Pose sous `parente` le callback d'implémentation d'un vol qui a
+        /// ouvert la PR `pr`, terminé à l'instant `a`.
+        ///
+        /// La ligne `PR: <url>` est celle que `dev-pilot/handlers/run.sh` écrit
+        /// et que lit `extract_callback_fields` ; la ligne `Outcome:` suit la
+        /// forme relevée sur mika#2968.
+        fn vol_qui_ouvre_une_pr(db: &crate::db::Database, parente: &str, pr: u64, a: &str) {
+            let enfant = db
+                .create_task(&groom_callback("mika", parente, "implement"))
+                .expect("le callback d'implémentation doit être créé");
+            let resultat = format!(
+                "claude-pilot completed (status: done).\n\
+                 PR: https://github.com/senara-solutions/mika/pull/{pr}\n\
+                 Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/{pr}"
+            );
+            assert!(
+                db.update_task_completed(&enfant, "mika", Some(&resultat))
+                    .expect("la complétion passe par l'API d'écriture"),
+                "le callback doit se terminer par le chemin de production"
+            );
+            set_completed_at(db, &enfant, a);
+        }
+
+        /// Une preuve terminée à l'instant `a`, sous une parente que l'appelant
+        /// termine quand il en a fini (index unique partiel, schéma v17).
+        fn preuve_a(db: &crate::db::Database, result: &str, a: &str) -> String {
+            let (parente, preuve) =
+                completed_groom_pair(db, "mika", crate::db::tests::GROOM_ISSUE_URL, result);
+            set_completed_at(db, &preuve, a);
+            parente
+        }
+
+        fn compte(lignes: &[crate::db::AuditEvent], evenement: &str) -> usize {
+            lignes.iter().filter(|l| l.tool_name == evenement).count()
+        }
+
+        /// **Contrôle négatif, le cas mesuré de mika#2968.** Vol 1 : une preuve
+        /// nue, puis sa PR (#2971). Vol 2a : une preuve nue, puis sa PR (#2977).
+        /// Vol N : le corps nomme un plan B, et aucune preuve ne le porte.
+        ///
+        /// Avant la borne, les deux preuves nues rendaient `ConvergedUnbound` et
+        /// la porte laissait partir le vol N sur la grâce. Chacune est
+        /// maintenant suivie d'une PR ouverte, donc la grâce ne couvre plus
+        /// aucune des deux : refus `dispatch_grooming_not_verified`, compté sous
+        /// son propre événement, et l'événement de grâce ne tire pas.
+        #[tokio::test]
+        async fn mika2981_une_preuve_nue_suivie_dune_pr_ne_fait_pas_partir_le_vol_n() {
+            let sync_db = db();
+            let vol_1 = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_1, 2971, "2026-10-29T22:24:20Z");
+            sync_db.update_task_status(&vol_1, "completed").unwrap();
+            let vol_2a = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-30T10:02:32Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_2a, 2977, "2026-10-30T10:57:25Z");
+            sync_db.update_task_status(&vol_2a, "completed").unwrap();
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let rejection = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await
+            .expect_err(
+                "les deux preuves nues sont suivies d'une PR ouverte : la grâce ne \
+                 les couvre plus, la porte doit refuser le vol N (mika#2981)",
+            );
+            assert_eq!(
+                rejection["error"], "dispatch_grooming_not_verified",
+                "les marqueurs sont présents et la base est lisible : le seul refus \
+                 admissible est celui de provenance ; {rejection}"
+            );
+            assert!(
+                rejection["predicate"]
+                    .as_str()
+                    .expect("predicate présent")
+                    .contains("opened a PR for this issue after it"),
+                "le prédicat doit nommer la borne, sinon un opérateur qui voit deux \
+                 preuves en base conclut à une panne de la porte : {rejection}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT),
+                1,
+                "le refus de la borne écrit une ligne sous son propre nom ; \
+                 lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_EVENT),
+                0,
+                "rien n'est parti sur la grâce ; lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **Cas positif, le vol unique.** Une preuve nue, aucune PR ouverte :
+        /// la porte accepte sur la grâce, et la grâce est comptée.
+        ///
+        /// Le ticket porte aussi un callback d'implémentation **sans** ligne
+        /// `PR:`, un vol qui a échoué avant d'ouvrir sa PR : il ne doit pas
+        /// couper la grâce. C'est le contrôle du prédicat de la seconde
+        /// requête, qui sans lui pourrait dater n'importe quel callback.
+        #[tokio::test]
+        async fn mika2981_le_vol_unique_garde_la_grace_sans_pr_ouverte() {
+            let sync_db = db();
+            let vol = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            let echoue = sync_db
+                .create_task(&groom_callback("mika", &vol, "implement"))
+                .unwrap();
+            assert!(
+                sync_db
+                    .update_task_completed(
+                        &echoue,
+                        "mika",
+                        Some("claude-pilot completed (status: error).\nNO_PR: no_pr_on_branch")
+                    )
+                    .unwrap()
+            );
+            set_completed_at(&sync_db, &echoue, "2026-10-29T22:24:20Z");
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_1),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "sans PR ouverte après elle, une preuve nue reste dans sa grâce ; \
+                 {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_EVENT),
+                1,
+                "le dispatch parti sur la grâce est compté ; lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT),
+                0,
+                "un callback sans ligne `PR:` ne coupe pas la grâce ; \
+                 lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **Cas lié.** Même histoire que le contrôle négatif, plus une preuve
+        /// liée au plan B frappée avant la dernière PR ouverte. La borne ne
+        /// touche que la grâce : la preuve liée est acceptée (`Converged`), et
+        /// aucun des deux événements ne tire.
+        #[tokio::test]
+        async fn mika2981_une_preuve_liee_part_meme_apres_une_pr() {
+            let sync_db = db();
+            let vol_1 = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_1, 2971, "2026-10-29T22:24:20Z");
+            sync_db.update_task_status(&vol_1, "completed").unwrap();
+            let vol_2 = preuve_a(
+                &sync_db,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_2),
+                "2026-10-30T10:02:32Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_2, 2977, "2026-10-30T10:57:25Z");
+            sync_db.update_task_status(&vol_2, "completed").unwrap();
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "une preuve liée au plan du corps est acceptée quelle que soit sa \
+                 date ; {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert!(
+                lignes.is_empty(),
+                "une acceptation liée n'écrit rien : ni grâce, ni refus de borne ; \
+                 lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **Contrôle de la borne elle-même.** Vol 1 : une preuve nue, puis sa
+        /// PR. Vol 2 : une preuve nue frappée **après** cette PR, par l'un des
+        /// producteurs de la grâce. La première est coupée, la seconde ne l'est
+        /// pas : la porte accepte sur la grâce, qui est comptée.
+        ///
+        /// Sans ce cas, « la borne coupe ce qui la précède » serait
+        /// indistinguable de « la borne coupe toute preuve nue dès qu'une PR
+        /// existe », qui arrêterait tout ticket à plusieurs vols groomé à la main.
+        #[tokio::test]
+        async fn mika2981_une_preuve_nue_posterieure_a_la_derniere_pr_garde_la_grace() {
+            let sync_db = db();
+            let vol_1 = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_1, 2971, "2026-10-29T22:24:20Z");
+            sync_db.update_task_status(&vol_1, "completed").unwrap();
+            preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-30T10:02:32Z",
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "une preuve nue frappée après la dernière PR ouverte est dans sa \
+                 grâce ; {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_EVENT),
+                1,
+                "l'acceptation est celle de la grâce, et elle est comptée ; \
+                 lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT),
+                0,
+                "une grâce valide l'emporte sur une grâce coupée ; \
+                 lignes vues : {lignes:?}"
             );
         }
     }

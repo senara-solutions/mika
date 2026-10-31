@@ -1769,13 +1769,20 @@ impl AsyncDatabase {
     /// (fail-closed), et les deux motifs de refus de
     /// [`crate::task_state::tasks::GroomConvergence`] sont distincts pour que la
     /// population du correctif reste comptable.
+    ///
+    /// Depuis mika#2981 la preuve doit porter le plan nommé par le callout du
+    /// corps **courant** : `expected_plan` est ce plan, `None` quand le corps
+    /// n'en porte aucun. Contrat complet au site synchrone
+    /// [`crate::db::Database::has_completed_groom_for_issue`].
     pub async fn has_completed_groom_for_issue(
         &self,
         issue_url: &str,
+        expected_plan: Option<&str>,
     ) -> Result<crate::task_state::tasks::GroomConvergence> {
         let a = self.agent_id.clone();
         let u = issue_url.to_owned();
-        self.with_db(move |db| db.has_completed_groom_for_issue(&a, &u))
+        let p = expected_plan.map(str::to_owned);
+        self.with_db(move |db| db.has_completed_groom_for_issue(&a, &u, p.as_deref()))
             .await
     }
 
