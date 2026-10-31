@@ -40,6 +40,17 @@
 //! d'API, [`crate::calibration::providers::create_real_provider`] rend `None`
 //! et le test se saute en le DISANT — jamais en passant vert pour rien.
 //!
+//! **La procédure de réveil, elle, est écrite ailleurs — et c'est là qu'il faut
+//! la lire** : `docs/dormeurs.md` § *Registre*, entrée `#2854`. Cette mesure est
+//! un dormeur déclaré : sa condition d'exécution est la livraison de
+//! `senara-solutions/claude-pilot#290`, et sa condition de réveil se tranche par
+//! une seule commande, écrite dans l'entrée. Qui lance cette suite au réveil n'a
+//! donc à redécouvrir ni le bloqueur, ni la voie admise — le pilote au grand
+//! jour, jamais un spawn tactique —, ni la règle d'interprétation du résultat,
+//! qui est celle de la propriété 3 ci-dessus. La commande ci-dessus dit *comment*
+//! jouer ; l'entrée du registre dit *quand*, et c'est la moitié qu'un lecteur ne
+//! peut pas deviner d'ici.
+//!
 //! # Pourquoi l'instrument vit ici, en intra-caisse
 //!
 //! `decide_comment_triage` est privé, et `PrefilterState` est `pub(crate)` :
@@ -554,7 +565,9 @@ async fn ac1_vrai_modele_2854() {
     if fournisseurs.is_empty() {
         println!(
             "⏭ {PROVIDERS_ENV} non défini — AC1 sous vrai modèle non joué. \
-             Rejouer avec : {PROVIDERS_ENV}=anthropic cargo test -p mika-agent --lib -- --ignored --nocapture ac1_vrai_modele_2854"
+             Rejouer avec : {PROVIDERS_ENV}=anthropic cargo test -p mika-agent --lib -- --ignored --nocapture ac1_vrai_modele_2854\n\
+             Procédure de réveil (quand, par quelle voie, et comment lire un rouge) : \
+             docs/dormeurs.md § Registre, entrée #2854."
         );
         return;
     }
@@ -643,7 +656,10 @@ async fn ac1_vrai_modele_2854() {
 async fn ac1_le_rouge_sous_vrai_modele_2854() {
     let fournisseurs = fournisseurs_demandes();
     if fournisseurs.is_empty() {
-        println!("⏭ {PROVIDERS_ENV} non défini — le témoin dégénéré n'est pas joué.");
+        println!(
+            "⏭ {PROVIDERS_ENV} non défini — le témoin dégénéré n'est pas joué.\n\
+             Procédure de réveil : docs/dormeurs.md § Registre, entrée #2854."
+        );
         return;
     }
     let _garde = comment_triage::TriageEnvGuard::armed(true);
