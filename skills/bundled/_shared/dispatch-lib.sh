@@ -4037,7 +4037,7 @@ _branch_reuse_gate() {
             action="reuse"
             ;;
         spent)
-            if true; then
+            if _reset_spent_branch "$repo_dir" "$worktree_dir" "$branch"; then
                 BRANCH_SPENT=1
                 action="reset"
             else

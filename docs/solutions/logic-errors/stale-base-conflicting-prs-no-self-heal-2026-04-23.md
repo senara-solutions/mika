@@ -97,6 +97,20 @@ This closes the gap between the startup guard (#747) and the push boundary — d
 
 See: `docs/solutions/logic-errors/mid-session-duplicate-commit-pre-push-guard-2026-05-26.md`
 
+## Suite : la porte de rebase bute sur la branche d'un vol déjà mergé (mika#2976)
+
+La porte de rebase du Fix 1 suppose que la branche reprise porte un travail en cours. Ce n'est plus vrai quand un ticket a plusieurs vols. Le nom de branche est dérivé du ticket (`scripts/derive-branch-name`), donc le groom du vol 2 dérive le nom du vol 1. Si la PR du vol 1 a été mergée en squash, la branche reprise ne porte plus que des commits dont le contenu est déjà dans `main`. La porte compte `rev-list --count HEAD..origin/main`, voit un retard, rebase, et rejoue ces commits contre leur propre squash : conflit, `STATUS=REBASE_CONFLICT`, groom sans plan ni PR. Trois occurrences en huit jours (mika#1727 le 2026-10-23, mika#2968 deux fois le 2026-10-30), sur origin comme en local seulement.
+
+Le défaut est de compter des **commits** là où un squash demande de compter des **patchs**. Le correctif ne touche pas à la porte de rebase. Il pose avant elle une question qu'elle ne sait pas poser : *cette branche porte-t-elle un travail en cours ?* (`_branch_reuse_gate` dans `skills/bundled/_shared/dispatch-lib.sh`).
+
+- **P1, les PR, en négatif.** « Aucune PR ouverte sur ce head », jamais « il existe une PR mergée » : deux PR peuvent partager un `headRefName`. Et **aucune PR du tout vaut `live`** : c'est une branche de groom poussée avec son plan, pas encore implémentée. La déclarer périmée détruirait ce plan.
+- **P2, la containment par patch-id.** Le même idiome que le garde #784 : `git log --cherry-mark --right-only origin/main...<tip>`, sur la ref locale **et** sur la ref `origin/…` quand elles diffèrent, car la ref de suivi locale peut survivre à la branche distante. Zéro `>` : la branche se réinitialise sur `origin/main` (`git branch -f`, après retrait du worktree par le geste unique `_stash_and_remove_worktree`). Au moins un `>` : halte sur un statut neuf, `STATUS=BRANCH_HAS_UNMERGED_WORK`, qui nomme les commits et ne touche à rien.
+- **Une non-mesure retombe sur la reprise d'aujourd'hui.** C'est l'inverse du faucheur de worktrees, et c'est voulu : ici l'action est destructive (réinitialiser), donc le repli sûr est l'échec bruyant déjà outillé, le `REBASE_CONFLICT`. La ligne `branch_reuse_gate:` le dit par `action=reuse_unmeasured`.
+
+**Règle qui se généralise.** Une porte qui reprend un état existant doit d'abord savoir si cet état est vivant. Le compter (en retard de *n* commits) ne le dit pas : un état atterri par squash a l'air en retard, et le « rattraper » rejoue ce qui a déjà atterri.
+
+**Le nettoyage asynchrone ne remplace pas la question synchrone.** `worktree_reaper` (mika#2420) finit par retirer worktree et branche locale d'une PR terminale. Mais il passe toutes les dix minutes, après 900 s de grâce, et un dispatch arrivé avant lui reprend la branche périmée. Dans le troisième cas, le premier groom a buté et le second est reparti sain, seulement parce qu'un tick du faucheur était passé entre les deux, 2 h 32 après le merge. Quand le résultat dépend de qui passe en premier, la porte doit poser la question au moment où elle décide.
+
 ## Related Issues
 
 - [#747](https://github.com/senara-solutions/mika/issues/747) — this fix
