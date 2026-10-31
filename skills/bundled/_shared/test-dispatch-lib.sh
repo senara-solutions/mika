@@ -15531,6 +15531,57 @@ assert_not_contains "mika#2976: la porte ne capture PAS le verdict dans un sous-
 assert_contains "mika#2976: la porte lit le jeton dans la globale" \
     '_BRANCH_REUSE_VERDICT' "$T2976_GATE_FUNC"
 
+# La réinitialisation : le worktree part par le geste unique, la branche par un
+# seul `branch -f`. Pas de `branch -D` — ni ici ni ailleurs dans ce fichier : le
+# plan § 11 l'exclut, et un `-D` suivi d'un `-b` ouvrirait une fenêtre où la
+# branche n'existe plus, qu'un échec du second geste rendrait permanente.
+T2976_RESET_FUNC=$(sed -n '/^_reset_spent_branch()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976: le scan de la réinitialisation a du corps (bonne foi)" \
+    'origin/main' "$T2976_RESET_FUNC"
+assert_contains "mika#2976: la réinitialisation délègue le retrait au geste unique" \
+    '_stash_and_remove_worktree "$repo_dir" "$worktree_dir" "$worktree_dir" "$branch" set_up_worktree_spent' \
+    "$T2976_RESET_FUNC"
+assert_contains "mika#2976: la branche est posée par un seul branch -f" \
+    'git -C "$repo_dir" branch -f "$branch" origin/main' "$T2976_RESET_FUNC"
+assert_not_contains "mika#2976: aucun branch -D dans dispatch-lib (plan § 11)" \
+    'branch -D' "$(cat "$DISPATCH_LIB")"
+
+# Les sites d'appel, scannés depuis l'autre bout. Les scans de corps ci-dessus
+# passeraient sur un geste correct que personne n'appelle ; ceux-ci ferment
+# l'invariant mika#2449 — le troisième argument est le worktree CANONIQUE, et
+# jamais `$SUB_REPO_DIR`, qui est le checkout de déploiement.
+T2976_CALLS=$(grep -n '_stash_and_remove_worktree ' "$DISPATCH_LIB" | grep -v '^[0-9]*:_stash_and_remove_worktree()' || true)
+T2976_CALL_COUNT=$(printf '%s\n' "$T2976_CALLS" | grep -c . || true)
+if [ "$T2976_CALL_COUNT" -ge 2 ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2976: le geste unique a ses deux sites d'appel (relic + périmée)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2976: le geste unique devrait avoir ≥2 sites d'appel, trouvé $T2976_CALL_COUNT"
+    echo "    actual: $T2976_CALLS"
+fi
+assert_not_contains "mika#2976: aucun site ne nomme SUB_REPO_DIR comme cible de récupération (mika#2449)" \
+    'SUB_REPO_DIR" "$SUB_REPO_DIR' "$T2976_CALLS"
+assert_contains "mika#2976: le site du relic nomme le worktree canonique" \
+    '_stash_and_remove_worktree "$SUB_REPO_DIR" "$existing_wt" "$WORKTREE_DIR" "$BRANCH" set_up_worktree_relic' \
+    "$T2976_CALLS"
+
+# Le site de la porte : `exit 1` et non `|| true`. Avec `|| true`, la halte de
+# l'AC3 poserait `RESULT` et le dispatch continuerait quand même sur la branche
+# qu'elle vient de déclarer en péril — un message d'arrêt sans arrêt.
+T2976_SET_UP=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976: le site de la porte arrête le dispatch sur la halte" \
+    'if ! _branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM"; then' \
+    "$T2976_SET_UP"
+assert_not_contains "mika#2976: la porte n'est pas appelée en || true" \
+    '_branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM" || true' \
+    "$T2976_SET_UP"
+# Le troisième bras du bloc reprise-ou-création est EXPLICITE : sans lui, la
+# correction serait héritée de la seconde tentative d'un repli écrit pour le
+# diagnostic de double échec de mika#1472, donc perdue au premier refactor.
+assert_contains "mika#2976: le bloc reprise-ou-création a un troisième bras explicite" \
+    'if [ "${BRANCH_SPENT:-0}" = "1" ]; then' "$T2976_SET_UP"
+assert_contains "mika#2976: une branche réinitialisée ne reprend pas un worktree" \
+    '[ "${BRANCH_SPENT:-0}" != "1" ] && [ -d "$WORKTREE_DIR" ]' "$T2976_SET_UP"
+
 # Harnais : `_fixture_setup` (bare file:// + clone) étendu d'une RACINE DE
 # WORKTREES portant le segment géré `/.claude/worktrees/`. Sans ce segment, le
 # terme T4 de `_assert_removable_worktree_path` (mika#1943) refuse tout retrait
@@ -15599,11 +15650,14 @@ test_t2976_local_spent() {
     grep -qF -- 'pr=#2971 MERGED' <<<"$gate_log" || failures="${failures}pr field should name the merged PR; "
     # La ref lue est la ref LOCALE : origin n'a jamais porté cette branche.
     grep -qF -- 'tips=refs/heads/' <<<"$gate_log" || failures="${failures}tips should name the local ref; "
-    # Palier d'observation : la porte MESURE et ne décide rien encore, donc rien
-    # ne bouge. Le commit qui arme la décision retourne cette assertion vers
-    # « après == origin/main » — et c'est la seule ligne qu'il a à retourner.
-    [ "$before" = "$after" ] || failures="${failures}observation tier must not move refs ($before -> $after); "
-    [ "$rc" = "0" ] || failures="${failures}observation tier must not halt (rc=$rc); "
+    # L'EFFET (AC1) : la branche repart de `origin/main`, et son worktree a été
+    # retiré. Le jeton seul laisserait passer une décision juste sans effet.
+    grep -qF -- 'action=reset' <<<"$gate_log" || failures="${failures}action should be reset; "
+    [ "${BRANCH_SPENT:-x}" = "1" ] || failures="${failures}BRANCH_SPENT should be 1; "
+    local main_sha; main_sha=$(git -C "$FIXTURE_CLONE" rev-parse refs/remotes/origin/main)
+    [ "$after" = "$main_sha|none" ] || failures="${failures}branch should be reset to origin/main (got $after, want $main_sha|none, was $before); "
+    [ ! -d "$wt" ] || failures="${failures}spent worktree should be removed; "
+    [ "$rc" = "0" ] || failures="${failures}a reset must not halt (rc=$rc); "
 
     _t2976_cleanup
     if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
@@ -15647,8 +15701,15 @@ test_t2976_remote_spent() {
     # de la population qu'une lecture à une seule ref manquerait.
     grep -qF -- 'tips=refs/remotes/origin/' <<<"$gate_log" || failures="${failures}tips should name the remote ref; "
     case "$before" in none\|*) ;; *) failures="${failures}fixture should have no local ref ($before); " ;; esac
-    [ "$before" = "$after" ] || failures="${failures}observation tier must not move refs ($before -> $after); "
-    [ "$rc" = "0" ] || failures="${failures}observation tier must not halt (rc=$rc); "
+    grep -qF -- 'action=reset' <<<"$gate_log" || failures="${failures}action should be reset; "
+    [ "${BRANCH_SPENT:-x}" = "1" ] || failures="${failures}BRANCH_SPENT should be 1; "
+    # La ref locale est POSÉE sur `origin/main` — et la ref DISTANTE n'a pas
+    # bougé. La réinitialisation est locale : rien ne pousse, rien ne supprime
+    # sur origin, et c'est `git push --force-with-lease` du post-vol qui tranchera
+    # au moment où il y aura quelque chose à pousser.
+    [ "$after" = "$(git -C "$FIXTURE_CLONE" rev-parse refs/remotes/origin/main)|${before#none|}" ] \
+        || failures="${failures}local ref should be origin/main and remote ref unmoved (got $after, was $before); "
+    [ "$rc" = "0" ] || failures="${failures}a reset must not halt (rc=$rc); "
 
     _t2976_cleanup
     if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
@@ -15770,7 +15831,18 @@ test_t2976_unmerged_work_halts() {
     [ "$stashes" = "$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)" ] \
         || failures="${failures}a stash entry was created; "
     [ -d "$wt" ] || failures="${failures}worktree should be untouched; "
-    [ "$rc" = "0" ] || failures="${failures}observation tier must not halt yet (rc=$rc); "
+    # La HALTE : un statut neuf, le sha en péril dans le corps, et la phrase sur
+    # l'effet — que le placement du site d'appel, en amont du nettoyage du relic,
+    # rend vraie.
+    grep -qF -- 'action=halt' <<<"$gate_log" || failures="${failures}action should be halt; "
+    [ "$rc" = "1" ] || failures="${failures}gate should halt the dispatch (rc=$rc); "
+    grep -qF -- 'STATUS=BRANCH_HAS_UNMERGED_WORK' <<<"${RESULT:-}" \
+        || failures="${failures}RESULT should carry the new status, got '${RESULT:-<empty>}'; "
+    grep -qF -- "$lost" <<<"${RESULT:-}" || failures="${failures}RESULT should name the unmerged sha; "
+    grep -qF -- '#2977 MERGED' <<<"${RESULT:-}" || failures="${failures}RESULT should name the terminal PR; "
+    grep -qF -- 'Nothing was reset, nothing was removed, nothing was stashed.' <<<"${RESULT:-}" \
+        || failures="${failures}RESULT should state its own non-effect; "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}BRANCH_SPENT should stay 0 on halt; "
 
     _t2976_cleanup
     if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
@@ -15817,11 +15889,11 @@ test_t2976_undetermined() {
 }
 
 for _t2976_case in \
-    "T1 (AC2a) branche locale d'un vol mergé: verdict=spent|test_t2976_local_spent" \
-    "T2 (AC2b) branche sur origin d'un vol mergé: verdict=spent|test_t2976_remote_spent" \
+    "T1 (AC2a) branche locale d'un vol mergé: reset sur origin/main, worktree retiré|test_t2976_local_spent" \
+    "T2 (AC2b) branche sur origin d'un vol mergé: reset local, ref distante intacte|test_t2976_remote_spent" \
     "T3 (AC2c) contrôle négatif — PR ouverte: verdict=live, rien ne bouge|test_t2976_open_pr_live" \
     "T4 (AC2c bis) contrôle négatif — aucune PR: verdict=live, rien ne bouge|test_t2976_no_pr_live" \
-    "T5 (AC3) patch absent de main: verdict=unmerged_work, rien ne bouge|test_t2976_unmerged_work_halts" \
+    "T5 (AC3) patch absent de main: halte sur BRANCH_HAS_UNMERGED_WORK|test_t2976_unmerged_work_halts" \
     "T6 non-mesure — gh muet: verdict=undetermined, rien ne bouge|test_t2976_undetermined"; do
     _t2976_label="${_t2976_case%%|*}"
     _t2976_fn="${_t2976_case##*|}"

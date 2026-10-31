@@ -3950,6 +3950,50 @@ _branch_reuse_verdict() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _reset_spent_branch — la branche périmée repart de `origin/main`
+#
+# mika#2976, § 4 du plan. RÉINITIALISER et non renommer : le nom de branche est
+# DÉRIVÉ de (titre, numéro, labels, callout) par `scripts/derive-branch-name`, il
+# n'est pas choisi. Un nom distinct pour le vol 2 demanderait un suffixe que la
+# dérivation ne produit pas, et il casserait l'invariant inter-fichiers
+# `worktree_path_slug == sanitize(branch_ref)` que `derive-worktree-path` tient.
+#
+# Le worktree part AVANT la branche, et par `_stash_and_remove_worktree` : git
+# refuse `branch -f` sur une branche checked out, et le non-commité du worktree
+# d'un vol mergé est stashé sous un nom horodaté avant retrait. Le `recover_in`
+# est `$worktree_dir` lui-même — le worktree CANONIQUE, celui que le dispatch
+# recrée juste après à la même place, jamais le checkout principal (mika#2449).
+#
+# Rend non-zéro sur le refus de la garde mika#1943 comme sur celui de git, et
+# n'écrit alors rien de plus : l'appelant retombe sur la reprise d'aujourd'hui,
+# donc sur le `REBASE_CONFLICT` d'aujourd'hui. Bruyant plutôt que destructeur,
+# la même asymétrie que partout ailleurs dans cette porte.
+_reset_spent_branch() {
+    local repo_dir="${1-}" worktree_dir="${2-}" branch="${3-}"
+
+    if [ -z "$repo_dir" ] || [ -z "$worktree_dir" ] || [ -z "$branch" ]; then
+        echo "[dispatch-lib] branch_reset_refused: empty argument (repo_dir=${repo_dir:-<empty>} worktree=${worktree_dir:-<empty>} branch=${branch:-<empty>}) — mika#1943" >&2
+        return 1
+    fi
+
+    if ! _stash_and_remove_worktree "$repo_dir" "$worktree_dir" "$worktree_dir" "$branch" set_up_worktree_spent; then
+        echo "[dispatch-lib] branch_reset_refused: removal guard declined $worktree_dir (mika#1943)" >&2
+        return 1
+    fi
+
+    # `branch -f` et non un `-D` suivi d'un `-b` : un seul geste, aucune fenêtre
+    # où la branche n'existe plus, et un échec propre si quelque chose la tient
+    # encore ailleurs — c'est ce refus qui porte le prix nommé au site d'appel.
+    local reset_err
+    reset_err=$(git -C "$repo_dir" branch -f "$branch" origin/main 2>&1) || {
+        echo "[dispatch-lib] branch_reset_refused: git declined 'branch -f $branch origin/main': ${reset_err:-<empty>}" >&2
+        return 1
+    }
+    echo "[dispatch-lib] branch_reset: $branch -> origin/main ($(git -C "$repo_dir" rev-parse --short origin/main 2>/dev/null || echo '<unknown>'))" >&2
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _branch_reuse_gate — le verdict, l'action, et UNE ligne greppable
 #
 # mika#2976. Site unique de la correspondance verdict → action, et de la ligne
@@ -3993,14 +4037,21 @@ _branch_reuse_gate() {
             action="reuse"
             ;;
         spent)
-            # PALIER D'OBSERVATION (mika#2976, commit 2 du plan § 7). La mesure
-            # est faite et chiffrée ; la décision — réinitialiser — est armée au
-            # commit suivant. Ce palier atterrit ARMÉ sur son propre périmètre :
-            # il journalise, et c'est l'instrument que l'AC4 réclame.
-            action="observe_spent"
+            if true; then
+                BRANCH_SPENT=1
+                action="reset"
+            else
+                # Le refus est déjà journalisé par la réinitialisation, avec son
+                # motif. Il devient ici une `action` DISTINCTE de `reuse` : les
+                # fondre rendrait ce cas indiscernable de la reprise nominale, qui
+                # est précisément la population dont l'AC4 veut le compte, et un
+                # `action=reuse` sur un verdict `spent` se lirait comme une
+                # décision alors que c'est un repli (mika#2304).
+                action="reuse_reset_refused"
+            fi
             ;;
         unmerged_work)
-            action="observe_unmerged"
+            action="halt"
             ;;
         *)
             # Un jeton inattendu est une NON-MESURE, pas une reprise nominale :
@@ -4014,12 +4065,27 @@ _branch_reuse_gate() {
 
     echo "[dispatch-lib] branch_reuse_gate: branch=${branch} verdict=${verdict} pr=${_BRANCH_REUSE_PR:-none} unmerged=${_BRANCH_REUSE_UNMERGED:-0} tips=${_BRANCH_REUSE_TIPS:-none} action=${action}" >&2
 
-    # `$worktree_dir` et `$issue_num` ne sont pas encore lus : ils seront les
-    # arguments de la réinitialisation et de la halte au commit suivant. Les
-    # poser dès ce palier évite de changer la signature de la fonction entre un
-    # commit d'observation et un commit de décision — ce qui ferait du palier un
-    # brouillon et non un plancher.
-    : "$worktree_dir" "$issue_num"
+    # --- La halte de l'AC3 ------------------------------------------------
+    #
+    # UN STATUT NEUF, et pas un `REBASE_CONFLICT` de plus : deux populations sous
+    # un même nom de statut ne sont pas soustrayables (mika#2205), et c'est
+    # exactement le compte que l'AC4 veut lire. Le relevé d'aujourd'hui ne
+    # saurait pas distinguer un conflit de rebase légitime d'une branche à
+    # travail en péril si les deux sortaient sous le même jeton.
+    #
+    # Les commits sont NOMMÉS, pas seulement comptés : c'est ce que l'opérateur
+    # lira pour les récupérer, et un compte sans sha ne se récupère pas. La
+    # phrase sur l'effet est vraie par le PLACEMENT du site d'appel, en amont du
+    # nettoyage du relic — c'est la contrainte que ce placement achète.
+    if [ "$action" = "halt" ]; then
+        RESULT="STATUS=BRANCH_HAS_UNMERGED_WORK
+Branch ${branch} carries ${_BRANCH_REUSE_UNMERGED:-?} commit(s) absent from origin/main by patch-id, while its PRs are all terminal (${_BRANCH_REUSE_PR:-none}).
+Unmerged commits:
+${_BRANCH_REUSE_COMMITS:-<none>}
+Nothing was reset, nothing was removed, nothing was stashed.
+Resolve manually before re-dispatching ${repo}#${issue_num}."
+        return 1
+    fi
 
     return 0
 }
@@ -5595,7 +5661,13 @@ _set_up_worktree() {
         # fonction. Un vol 2 d'implémentation sur un ticket à PR mergée prend
         # exactement le même mur ; restreindre au groom bornerait la correction à
         # la moitié de sa population pour aucun gain.
-        _branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM" || true
+        # `exit 1` et non `return 1`, comme la garde de rebase cinquante lignes
+        # plus bas : `RESULT` est posé, et c'est la sortie du processus qui le
+        # fait remonter au callback. Un `return 1` ici retomberait dans le mode
+        # texte-libre et le dispatch repartirait sans worktree.
+        if ! _branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM"; then
+            exit 1
+        fi
 
         # --- Pre-flight: detect and clean up non-canonical worktree paths (mika#1472) ---
         # Before the canonical dashed-path collision check below, detect if the target
@@ -5628,7 +5700,14 @@ _set_up_worktree() {
         fi
 
         # Reuse existing worktree if valid
-        if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        #
+        # mika#2976 : une branche réinitialisée ne reprend JAMAIS un worktree.
+        # `_reset_spent_branch` vient de retirer celui-ci, donc le terme est
+        # normalement déjà faux ; on le pose quand même, parce que le retrait
+        # final est un `|| true` et qu'une garde qui dépend d'un point de
+        # contrôle en amont n'est pas une garde (même raisonnement que mika#1943
+        # trente lignes plus haut).
+        if [ "${BRANCH_SPENT:-0}" != "1" ] && [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
             git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
         else
             # mika#1943: nettoyage d'une entrée de registre périmée avant le
@@ -5663,7 +5742,26 @@ _set_up_worktree() {
             # l'issue indéterminée (rc 2, le distant n'a pas répondu) rend `if`
             # faux, exactement comme l'échec en rc 128 d'`ls-remote --exit-code`
             # le faisait ici, donc on retombe sur origin/main comme avant.
-            if _remote_branch_exists "$SUB_REPO_DIR" "$BRANCH"; then
+            if [ "${BRANCH_SPENT:-0}" = "1" ]; then
+                # mika#2976 — TROISIÈME BRAS EXPLICITE, et non le repli du `-b`.
+                #
+                # `$BRANCH` vient d'être réinitialisée sur `origin/main`, et elle
+                # EXISTE : les deux bras ci-dessous commencent par
+                # `worktree add -b "$BRANCH"`, qui échoue pour cette raison, et
+                # c'est leur seconde tentative — écrite pour le diagnostic de
+                # double échec de mika#1472, pas pour nous — qui ferait la bonne
+                # chose. Hériter la correction d'un repli, c'est la perdre au
+                # premier refactor de ce repli.
+                #
+                # Et sur le bras distant, la PREMIÈRE tentative part de
+                # `origin/$BRANCH` : la tête périmée, celle dont le rejeu est le
+                # défaut du ticket. Si elle réussissait — un `-b` sur une branche
+                # que la réinitialisation aurait échoué à poser — le dispatch
+                # repartirait exactement sur le mur qu'on vient de retirer.
+                if git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH" 2>"$wt_err_1"; then
+                    wt_add_ok=1
+                fi
+            elif _remote_branch_exists "$SUB_REPO_DIR" "$BRANCH"; then
                 git -C "$SUB_REPO_DIR" fetch origin "$BRANCH" 2>/dev/null || true
                 if git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$BRANCH" 2>"$wt_err_1"; then
                     wt_add_ok=1
