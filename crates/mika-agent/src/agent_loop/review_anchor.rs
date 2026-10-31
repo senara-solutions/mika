@@ -105,6 +105,43 @@ impl AnchorMissReason {
 /// its own three lines is named, short enough that naming three of them stays a paragraph.
 const ANCHOR_EXCERPT_CHARS: usize = 72;
 
+/// Opening marker line of the plan a groom retry carries (mika#2996).
+///
+/// The UNPARSED retries of `_iterate_groom_loop` (mika#1823 on the first pass, mika#2641 on
+/// the second) used to send a ~380-character corrective prompt and then accept the
+/// disposition returned on that turn. Below `review_anchor_min_brief_chars` the guard does
+/// not arm, so a `READY` / `Verdict: GROOMED` with no anchor advanced the chain — measured on
+/// 2026-10-31, trace `15ea28bd`, a review of *another* plan accepted as `READY-after-retry`.
+///
+/// The retry now carries the plan, between this line and [`RETRY_PLAN_END`].
+/// `skills/bundled/_shared/dispatch-lib.sh` writes both lines **literally**; the copy there
+/// is held to this one by `tests/eval/grounding_regressions/review_anchor_unparsed_retry_2996.rs`,
+/// which runs the shell function and looks for these constants in its output.
+pub const RETRY_PLAN_BEGIN: &str = "----- BEGIN PLAN UNDER REVIEW (mika#2996) -----";
+
+/// Closing marker line of the plan a groom retry carries. See [`RETRY_PLAN_BEGIN`].
+pub const RETRY_PLAN_END: &str = "----- END PLAN UNDER REVIEW (mika#2996) -----";
+
+/// The part of a turn's brief that review anchors are verified against.
+///
+/// A brief carrying the retry envelope is reduced to the plan between the two markers: the
+/// corrective instruction around it is the engine's own text, not the reviewed document, and
+/// three 40-character quotes of it would otherwise satisfy the contract while saying nothing
+/// about the plan. Every other brief — a first pass, whose message *is* the plan — is
+/// returned whole.
+///
+/// The first opening marker and the last closing one bound the region, so a plan that
+/// happens to quote a marker line stays inside it. A brief with only one of the two markers
+/// is returned whole: the fallback keeps the guard armed on the full text rather than
+/// disarming it on an empty region, which would reopen the hole this exists to close.
+pub fn anchor_reference(brief: &str) -> &str {
+    brief
+        .split_once(RETRY_PLAN_BEGIN)
+        .and_then(|(_, rest)| rest.rsplit_once(RETRY_PLAN_END))
+        .map(|(plan, _)| plan)
+        .unwrap_or(brief)
+}
+
 /// One anchor line's fate, in body order.
 ///
 /// Four things a future editor needs, because each undoes itself if guessed:
@@ -1485,6 +1522,94 @@ mod matrix {
             real >= 1,
             "no real-provenance accept case — the shipped prompt's READY example could not be \
              read, so the matrix measures only constructed inputs"
+        );
+    }
+}
+
+/// mika#2996 — the region of a retry brief that anchors are checked against.
+#[cfg(test)]
+mod mika2996 {
+    use super::*;
+
+    const PLAN: &str = "Le plan re-résout le token du cycle avant chaque cycle au lieu de le \
+        figer au spawn, et garde le jeton précédent quand la re-résolution échoue.\n";
+
+    const CORRECTIVE: &str = "Your previous plan-review response is missing the required \
+        `Disposition:` line.\n\nPlease re-emit your findings and end with exactly ONE of these \
+        three lines as the last non-empty line of your response:\n\n    Disposition: READY\n    \
+        Disposition: ITERATE\n    Disposition: ESCALATE\n\nThe routing engine parses this line \
+        as the verdict — its absence blocks the pipeline (see mika#1823).\n";
+
+    fn enveloped(plan: &str) -> String {
+        format!("{CORRECTIVE}\n{RETRY_PLAN_BEGIN}\n{plan}{RETRY_PLAN_END}\n")
+    }
+
+    #[test]
+    fn mika2996_an_enveloped_brief_reduces_to_the_plan() {
+        let brief = enveloped(PLAN);
+        let reference = anchor_reference(&brief);
+        assert_eq!(reference.trim(), PLAN.trim());
+        assert!(!reference.contains("missing the required"));
+    }
+
+    /// Negative control of the reduction: a first pass has no envelope, and its whole
+    /// message is the plan.
+    #[test]
+    fn mika2996_a_brief_without_the_envelope_is_returned_whole() {
+        assert_eq!(anchor_reference(PLAN), PLAN);
+        assert_eq!(anchor_reference(CORRECTIVE), CORRECTIVE);
+    }
+
+    /// Half an envelope does not disarm the guard by producing an empty region.
+    #[test]
+    fn mika2996_half_an_envelope_keeps_the_whole_brief() {
+        let opened_only = format!("{CORRECTIVE}\n{RETRY_PLAN_BEGIN}\n{PLAN}");
+        assert_eq!(anchor_reference(&opened_only), opened_only);
+        let closed_only = format!("{CORRECTIVE}\n{PLAN}{RETRY_PLAN_END}\n");
+        assert_eq!(anchor_reference(&closed_only), closed_only);
+    }
+
+    /// A plan that quotes the closing marker keeps it inside the region: the LAST closing
+    /// marker bounds it.
+    #[test]
+    fn mika2996_a_plan_quoting_the_marker_stays_whole() {
+        let plan = format!("Avant.\n{RETRY_PLAN_END}\nAprès, toujours dans le plan.\n");
+        let brief = enveloped(&plan);
+        assert_eq!(anchor_reference(&brief).trim(), plan.trim());
+    }
+
+    /// Three anchors that quote only the corrective instruction — three distinct 40-character
+    /// regions of the message — satisfy the contract against the whole message, and are
+    /// refused against the plan. This pair is why the envelope exists.
+    #[test]
+    fn mika2996_anchors_quoting_the_corrective_text_are_refused_against_the_plan() {
+        let response = "A1: \"Your previous plan-review response is missing the required\" — vu.\n\
+             A2: \"end with exactly ONE of these three lines as the last non-empty line\" — vu.\n\
+             A3: \"The routing engine parses this line as the verdict — its absence blocks\" — vu.\n\
+             \n\
+             Disposition: READY";
+        let prefixes: Vec<String> = (1..=10).map(|n| format!("A{n}:")).collect();
+        let suffix = vec!["Disposition: READY".to_string()];
+        let brief = enveloped(PLAN);
+
+        let against_whole = verify_review_anchors(response, &brief, &prefixes, &suffix, 3, 40);
+        assert!(
+            against_whole.is_satisfied(),
+            "control: the three quotes must be valid against the whole message, or this test \
+             proves nothing about the envelope — got {against_whole:?}"
+        );
+
+        let against_plan = verify_review_anchors(
+            response,
+            anchor_reference(&brief),
+            &prefixes,
+            &suffix,
+            3,
+            40,
+        );
+        assert!(
+            !against_plan.is_satisfied(),
+            "anchors quoting the engine's own corrective text must not attest a review of the plan"
         );
     }
 }

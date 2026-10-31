@@ -694,10 +694,14 @@ async fn test_review_anchor_no_op_on_short_ad_hoc_question() -> anyhow::Result<(
     Ok(())
 }
 
-/// Test 9: the mika#1823 UNPARSED-recovery re-ask. Its user message is a ~480-character
-/// corrective prompt, not the plan — so an architect that correctly re-emits its review of
-/// the PLAN would have its anchors fail against the wrong brief. Before the carve-out this
-/// made a READY recovered on retry structurally impossible.
+/// Test 9: a short corrective prompt, the shape the mika#1823 UNPARSED-recovery re-ask had
+/// before mika#2996. Below the arming threshold the guard stays a no-op — that boundary is
+/// still the engine's, and still right for a brief that cannot contain the proof.
+///
+/// **This is no longer what the retry sends.** Since mika#2996 `dispatch-lib.sh` carries the
+/// plan in the retry message, so the guard arms on that turn and checks anchors against the
+/// plan: a short re-ask let an unanchored READY advance the chain (trace `15ea28bd`). The
+/// retry path itself is tested end to end in `review_anchor_unparsed_retry_2996.rs`.
 #[tokio::test]
 async fn test_review_anchor_no_op_on_unparsed_recovery_prompt() -> anyhow::Result<()> {
     let corrective_prompt = "Your previous plan-review response is missing the required \

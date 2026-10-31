@@ -11073,13 +11073,44 @@ internal reasoning before emitting the verdict (mika#2296) — confirm with \
 output_tokens/max_tokens, and raise \`llm_max_tokens\` in that agent's config.toml if it fired."
 }
 
+# mika#2996 — toute relance UNPARSED porte le plan en revue.
+#
+# Les deux relances de `_iterate_groom_loop` (mika#1823, mika#2641) acceptent la
+# disposition rendue à leur tour. Tant qu'elles envoyaient un prompt correctif
+# de ~380 caractères, la garde d'ancrage de mika#2037 — qui ne s'arme qu'au-dessus
+# de `review_anchor_min_brief_chars` — ne tournait pas sur ce tour, et un READY
+# ou un `Verdict: GROOMED` non ancré faisait avancer la chaîne. Mesuré le
+# 2026-10-31, trace `15ea28bd` : la revue d'un AUTRE plan, acceptée en
+# `READY-after-retry`.
+#
+# Le plan est donc recopié à l'octet entre deux lignes-marqueurs. Le moteur
+# (`review_anchor::anchor_reference`) vérifie les ancres contre ce qui est entre
+# les deux, jamais contre le texte correctif. Les deux lignes sont écrites ici
+# EN LITTÉRAL et doivent rester égales à `RETRY_PLAN_BEGIN` / `RETRY_PLAN_END` :
+# `review_anchor_unparsed_retry_2996.rs` exécute ces fonctions et y cherche les
+# constantes Rust. Les changer d'un côté seulement fait rougir ce test.
+#
+# Le faux positif que le seuil de 2 000 évitait — exiger une preuve qu'un brief
+# sans le plan ne peut pas contenir — disparaît : le brief contient le plan.
+#
+# $1 : le plan. Illisible → retour 1, donc pas de relance du tout : une relance
+# sans plan rouvrirait le trou au lieu d'échouer.
+_append_retry_plan_envelope() {
+    local plan="$1"
+    [ -n "$plan" ] && [ -r "$plan" ] || return 1
+    printf '\nThe plan under review is repeated below, verbatim, between the two marker lines. Any READY or GROOMED disposition still owes the review-anchor attestation, and its anchor lines are checked against this plan only, not against the instructions above (mika#2996).\n\n'
+    printf '%s\n' '----- BEGIN PLAN UNDER REVIEW (mika#2996) -----'
+    cat -- "$plan" || return 1
+    # Un plan sans fin de ligne finale collerait le marqueur à sa dernière ligne.
+    [ -z "$(tail -c 1 -- "$plan")" ] || printf '\n'
+    printf '%s\n' '----- END PLAN UNDER REVIEW (mika#2996) -----'
+}
+
 # mika#1823 — le prompt correctif de PREMIÈRE passe, à définition unique.
 #
-# Extrait du corps de `_iterate_groom_loop` pour que le message de relance soit
-# lisible par un test sans rejouer toute la boucle (mika#2996).
-#
+# $1 : le plan en revue, recopié dans la relance (mika#2996).
 # Stdout : le chemin du fichier temporaire. L'APPELANT le supprime.
-# Retour : 0, ou 1 si `mktemp` échoue.
+# Retour : 0, ou 1 si `mktemp` échoue ou si le plan est illisible.
 _first_pass_retry_prompt() {
     local f
     f=$(mktemp -t mika-arch-retry-XXXXXX.md 2>/dev/null) || return 1
@@ -11090,7 +11121,8 @@ _first_pass_retry_prompt() {
         printf '    Disposition: ITERATE\n'
         printf '    Disposition: ESCALATE\n\n'
         printf 'The routing engine parses this line as the verdict — its absence blocks the pipeline (see mika#1823).\n'
-    } > "$f"
+        _append_retry_plan_envelope "$1"
+    } > "$f" || { rm -f "$f"; return 1; }
     printf '%s' "$f"
 }
 
@@ -11100,23 +11132,19 @@ _first_pass_retry_prompt() {
 # dû engraver une fois (mika#2158) — un prédicat recopié prend du retard sans
 # que rien ne rougisse. Les deux sites de seconde passe appellent ceci.
 #
-# COURT PAR CONTRAT, ET C'EST ASSERTÉ (V4), pas espéré.
-# `mika-arch-second-review/skill.toml` déclare `review_anchor_min_brief_chars`,
-# le seuil d'armement de la garde d'ancrage mika#2037 : en dessous, la garde ne
-# fire pas. Un prompt de relance AU-DESSUS l'armerait — et l'architecte, qui n'a
-# pas le brief sous les yeux dans un re-prompt, ne peut produire aucune ancre.
-# Le moteur retire alors la disposition (tier 0) ou réécrit la réponse en
-# escalade (tier 0b, mika#2338), et `_parse_verdict` rend ESCALATE — donc le
-# correctif produirait EXACTEMENT le terminal qu'il existe pour empêcher.
-# Le test lit le seuil DEPUIS LE MANIFESTE plutôt qu'en le recopiant, donc un
-# seuil durci sans que ce corps rétrécisse fait rougir, au lieu de passer.
+# PORTE LE PLAN, ET C'EST ASSERTÉ (V4 de mika#2641, réécrit par mika#2996).
+# Jusqu'à mika#2996 ce prompt était court PAR CONTRAT : on craignait qu'au-dessus
+# de `review_anchor_min_brief_chars` la garde d'ancrage s'arme sur un brief qui
+# ne contient pas le plan, et que l'architecte ne puisse produire aucune ancre.
+# La crainte était juste, mais le remède laissait l'autre sens ouvert : sous le
+# seuil, un `Verdict: GROOMED` rendu à la relance était accepté sans aucune
+# preuve, et GROOMED ramène le dispatch vers dev-pilot (mika#996). Le prompt
+# porte désormais le plan (`_append_retry_plan_envelope`), donc la garde s'arme
+# ET l'architecte a sous les yeux ce qu'il doit citer.
 #
-# Même gabarit que le prompt correctif de PREMIÈRE passe (mika#1823), dont le
-# commentaire du manifeste cite déjà les ~480 caractères comme une population
-# que la garde d'ancrage ne peut pas atteindre.
-#
+# $1 : le plan en revue, recopié dans la relance (mika#2996).
 # Stdout : le chemin du fichier temporaire. L'APPELANT le supprime.
-# Retour : 0, ou 1 si `mktemp` échoue.
+# Retour : 0, ou 1 si `mktemp` échoue ou si le plan est illisible.
 _second_pass_retry_prompt() {
     local f
     f=$(mktemp -t mika-arch-second-retry-XXXXXX.md 2>/dev/null) || return 1
@@ -11126,7 +11154,8 @@ _second_pass_retry_prompt() {
         printf '    Verdict: GROOMED\n'
         printf '    Verdict: ESCALATE\n\n'
         printf 'The routing engine parses this line as the verdict — its absence halts the groom (see mika#2641).\n'
-    } > "$f"
+        _append_retry_plan_envelope "$1"
+    } > "$f" || { rm -f "$f"; return 1; }
     printf '%s' "$f"
 }
 
@@ -11217,8 +11246,10 @@ _iterate_groom_loop() {
             # Retry: corrective payload as an @-file so _arch_ask injects it
             # verbatim. Session preserved so the architect sees its own prior
             # response and can complete it in-place.
+            # mika#2996 — la relance porte le plan, pour que la garde d'ancrage
+            # s'arme sur ce tour comme sur celui qu'il répare.
             local retry_prompt; retry_prompt=$(_first_pass_retry_prompt "$plan_path") || {
-                _groom_warn "mktemp failed for retry prompt"
+                _groom_warn "cannot build retry prompt (mktemp failed, or the plan became unreadable — mika#2996)"
                 return 1
             }
             # Forme sûre sous `set -e` (mika#2641) : une affectation dont la
@@ -11294,8 +11325,8 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
                         _groom_warn "second-pass _arch_ask failed$(_arch_ask_error_suffix)"; return 1; }
                 else
                     _pass_label2="second-pass retry"
-                    local retry2; retry2=$(_second_pass_retry_prompt) || {
-                        _groom_warn "mktemp failed for second-pass retry prompt"
+                    local retry2; retry2=$(_second_pass_retry_prompt "$plan_path") || {
+                        _groom_warn "cannot build second-pass retry prompt (mktemp failed, or the plan became unreadable — mika#2996)"
                         return 1
                     }
                     # `if … then … else` plutôt que `local st=$?` : sous `set -e`
@@ -11457,8 +11488,8 @@ ${content2}"
                     }
                 else
                     _pass_label2i="second-pass retry (after revise)"
-                    local retry2i; retry2i=$(_second_pass_retry_prompt) || {
-                        _groom_warn "mktemp failed for second-pass retry prompt (after revise)"
+                    local retry2i; retry2i=$(_second_pass_retry_prompt "$plan_path") || {
+                        _groom_warn "cannot build second-pass retry prompt after revise (mktemp failed, or the plan became unreadable — mika#2996)"
                         return 1
                     }
                     # Forme sûre sous `set -e` — voir le site after-ready.

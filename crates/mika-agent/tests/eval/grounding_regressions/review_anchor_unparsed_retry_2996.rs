@@ -176,21 +176,52 @@ fn registry_from_manifest(skill: &str) -> SkillRegistry {
     }])
 }
 
-/// Un tour du moteur sur `message`, avec `responses` comme réponses de l'architecte.
-async fn engine_turn(
-    skill: &str,
-    message: &str,
-    responses: Vec<MockResponse>,
-) -> anyhow::Result<(String, usize)> {
+/// Début fixe du re-prompt correctif de la garde d'ancrage (`agent_loop/mod.rs`, mika#2037).
+const ANCHOR_REPROMPT_HEAD: &str = "[mika-engine] The previous response carries a non-terminal \
+     disposition without the review attestation";
+
+/// Combien de fois l'architecte simulé répond la même chose : assez pour que les re-prompts
+/// d'autres gardes ne fassent pas manquer de réponses au moteur.
+///
+/// Mesuré à l'écriture du correctif : sur un brief qui porte ce plan, la garde de sémantique
+/// de reprise (« A resume/continue instruction was received… ») re-prompte une fois avant la
+/// garde d'ancrage. Elle tire aussi, en production, sur le tour d'origine, dont le brief est
+/// le même plan, et c'est vraisemblablement ce qui a produit l'UNPARSED du 2026-10-31 (la
+/// réponse de 264 caractères disait chercher des engagements « comme demandé par
+/// l'instruction de reprise »). Les assertions portent donc sur le re-prompt d'ancrage, pas
+/// sur un nombre d'appels qu'une autre garde fait varier.
+const REPLIES: usize = 4;
+
+struct EngineTurn {
+    /// La réponse finale du tour, celle que le shell lit.
+    text: String,
+    /// Nombre de requêtes LLM dont le dernier message est le re-prompt de la garde d'ancrage.
+    anchor_reprompts: usize,
+}
+
+/// Un tour du moteur sur `message`, l'architecte simulé répondant toujours `reply`.
+async fn engine_turn(skill: &str, message: &str, reply: &str) -> anyhow::Result<EngineTurn> {
     let harness = EvalHarness::builder()
-        .responses(responses)
+        .responses((0..REPLIES).map(|_| text_response(reply)).collect())
         .skills(registry_from_manifest(skill))
         .build()
         .await?;
     let trace = harness.run(message).await?;
     assert_has_output(&trace);
-    let text = trace.output.text.clone().unwrap_or_default();
-    Ok((text, trace.llm_call_count))
+    let anchor_reprompts = trace
+        .captured_requests
+        .iter()
+        .filter(|req| {
+            matches!(
+                req.messages.last().map(|m| &m.content),
+                Some(mika_common::llm::LlmContent::Text(t)) if t.starts_with(ANCHOR_REPROMPT_HEAD)
+            )
+        })
+        .count();
+    Ok(EngineTurn {
+        text: trace.output.text.clone().unwrap_or_default(),
+        anchor_reprompts,
+    })
 }
 
 /// La réponse 15ea28bd avec sa dernière ligne non vide remplacée par `line`.
@@ -211,6 +242,34 @@ fn with_last_line(body: &str, line: &str) -> String {
     format!("{head}\n{line}\n")
 }
 
+/// Les deux lignes-marqueurs que le shell écrit sont celles que le moteur reconnaît.
+///
+/// `dispatch-lib.sh` les écrit en littéral. Si elles divergent des constantes Rust,
+/// `anchor_reference` rend le message entier, et la garde accepte des ancres qui ne citent
+/// que le texte correctif — sans qu'aucun des deux tests ci-dessous ne rougisse.
+#[test]
+fn mika2996_les_marqueurs_du_shell_sont_ceux_du_moteur() {
+    use mika_agent::agent_loop::review_anchor::{
+        RETRY_PLAN_BEGIN, RETRY_PLAN_END, anchor_reference,
+    };
+    let plan = read_fixture(PLAN_FIXTURE);
+    for function in ["_first_pass_retry_prompt", "_second_pass_retry_prompt"] {
+        let retry = retry_message(function);
+        let begin = retry.lines().filter(|l| *l == RETRY_PLAN_BEGIN).count();
+        let end = retry.lines().filter(|l| *l == RETRY_PLAN_END).count();
+        assert_eq!(
+            (begin, end),
+            (1, 1),
+            "{function} doit écrire chaque marqueur sur sa propre ligne, une fois"
+        );
+        assert_eq!(
+            anchor_reference(&retry).trim(),
+            plan.trim(),
+            "{function} : la région vérifiée doit être exactement le plan"
+        );
+    }
+}
+
 /// AC2 + AC3, première passe : relance de mika#1823.
 ///
 /// Négatif : la réponse réelle de la trace `15ea28bd` (une revue de mika#2752) ne doit pas
@@ -228,38 +287,38 @@ async fn mika2996_relance_de_premiere_passe_refuse_15ea28bd_et_laisse_passer_une
         "la fixture 15ea28bd doit se lire READY sans garde, sinon elle ne rejoue pas l'incident"
     );
 
-    // Négatif — l'incident. Deux réponses identiques : la garde re-prompte une fois, puis
+    // Négatif — l'incident. L'architecte s'obstine : la garde re-prompte une fois, puis
     // refuse (mika#2037, fail-closed).
-    let (refused, refused_calls) = engine_turn(
-        skill,
-        &retry,
-        vec![text_response(&fixture), text_response(&fixture)],
-    )
-    .await?;
-    let refused_word = routed_word("_parse_disposition", &refused);
+    let refused = engine_turn(skill, &retry, &fixture).await?;
+    let refused_word = routed_word("_parse_disposition", &refused.text);
     assert_ne!(
         refused_word, "READY",
         "mika#2996 : la revue d'un autre plan rendue à la relance UNPARSED fait avancer la \
-         chaîne ({refused_calls} appel(s) LLM — 1 veut dire que la garde ne s'est pas armée).\n\
-         Réponse finale :\n{refused}"
+         chaîne ({} re-prompt(s) d'ancrage — 0 veut dire que la garde ne s'est pas armée).\n\
+         Réponse finale :\n{}",
+        refused.anchor_reprompts, refused.text
     );
     assert_eq!(
         refused_word, "ESCALATE",
         "le refus doit être lisible comme un arrêt explicite (mika#2338)"
     );
+    assert_eq!(
+        refused.anchor_reprompts, 1,
+        "c'est la garde d'ancrage qui a refusé, après son unique re-prompt"
+    );
 
     // Positif — même message de relance, revue ancrée sur le plan.
     let anchored = format!("{ANCHORS_ON_PLAN}\nDisposition: READY\n");
-    let (accepted, accepted_calls) =
-        engine_turn(skill, &retry, vec![text_response(&anchored)]).await?;
+    let accepted = engine_turn(skill, &retry, &anchored).await?;
     assert_eq!(
-        routed_word("_parse_disposition", &accepted),
+        routed_word("_parse_disposition", &accepted.text),
         "READY",
-        "une revue ancrée sur le plan doit avancer dès le premier tour. Réponse finale :\n{accepted}"
+        "une revue ancrée sur le plan doit avancer. Réponse finale :\n{}",
+        accepted.text
     );
     assert_eq!(
-        accepted_calls, 1,
-        "une revue ancrée sur le plan ne doit pas être re-promptée"
+        accepted.anchor_reprompts, 0,
+        "une revue ancrée sur le plan ne doit pas être re-promptée par la garde d'ancrage"
     );
 
     Ok(())
@@ -278,29 +337,26 @@ async fn mika2996_relance_de_seconde_passe_refuse_un_groomed_non_ancre_et_laisse
         "la fixture doit se lire GROOMED sans garde"
     );
 
-    let (refused, refused_calls) = engine_turn(
-        skill,
-        &retry,
-        vec![text_response(&unanchored), text_response(&unanchored)],
-    )
-    .await?;
-    let refused_word = routed_word("_parse_verdict", &refused);
+    let refused = engine_turn(skill, &retry, &unanchored).await?;
+    let refused_word = routed_word("_parse_verdict", &refused.text);
     assert_ne!(
         refused_word, "GROOMED",
         "mika#2996 : un GROOMED non ancré rendu à la relance de seconde passe ramène le \
-         dispatch vers dev-pilot ({refused_calls} appel(s) LLM).\nRéponse finale :\n{refused}"
+         dispatch vers dev-pilot ({} re-prompt(s) d'ancrage).\nRéponse finale :\n{}",
+        refused.anchor_reprompts, refused.text
     );
     assert_eq!(refused_word, "ESCALATE");
+    assert_eq!(refused.anchor_reprompts, 1);
 
     let anchored = format!("{ANCHORS_ON_PLAN}\nVerdict: GROOMED\n");
-    let (accepted, accepted_calls) =
-        engine_turn(skill, &retry, vec![text_response(&anchored)]).await?;
+    let accepted = engine_turn(skill, &retry, &anchored).await?;
     assert_eq!(
-        routed_word("_parse_verdict", &accepted),
+        routed_word("_parse_verdict", &accepted.text),
         "GROOMED",
-        "une revue ancrée sur le plan doit avancer. Réponse finale :\n{accepted}"
+        "une revue ancrée sur le plan doit avancer. Réponse finale :\n{}",
+        accepted.text
     );
-    assert_eq!(accepted_calls, 1);
+    assert_eq!(accepted.anchor_reprompts, 0);
 
     Ok(())
 }

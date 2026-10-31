@@ -122,3 +122,12 @@ tour de relance n'est donc pas attesté. Le plan n'a pesé que le sens inverse
 leçon : une exception de chemin (« la relance est courte ») traverse une
 frontière que le reste du système tient pour universelle (« toute approbation
 de seconde passe est attestée »). Remède routé à l'arbitrage du plan.
+
+**Fermé par mika#2996 (2026-10-31), après mesure sur la PREMIÈRE passe.** La
+même frontière a été traversée en production par la relance de mika#1823 :
+trace `15ea28bd`, la revue d'un autre plan, close par `Disposition: READY`, a
+avancé la chaîne en `READY-after-retry`. Le remède ne relève pas le seuil et
+n'accepte pas une relance « sur parole » : la relance porte le plan entre deux
+lignes-marqueurs, et la garde vérifie les ancres contre ce plan seul
+(`review_anchor::anchor_reference`). La crainte qui avait fixé D7/V4 (une garde
+armée sur un brief sans le plan) tombe avec elle : le brief contient le plan.
