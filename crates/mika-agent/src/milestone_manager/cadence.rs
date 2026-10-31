@@ -24,8 +24,8 @@ use super::{
     assessor::{Assessor, AssessorConfig},
     evaluator::{FinishedFlight, FlightPrReads, FlightSource, FlightVerdict, evaluate_flights},
     groom_trigger::{
-        GroomCandidate, GroomSender, GroomTriggerOutcome, groom_write_is_armed,
-        trigger_relief_grooms,
+        GroomCandidate, GroomInFlightSource, GroomSender, GroomTriggerOutcome,
+        groom_write_is_armed, trigger_relief_grooms,
     },
     pool_writer::{admit_pool_tickets, pool_write_is_armed},
     reader::{GhRunner, ProcessGhRunner, Reader, read_flight_prs},
@@ -560,6 +560,23 @@ pub struct CycleContext<'a> {
     /// forme de `gh_runner` : rien ici ne clone l'émetteur, et un test injecte
     /// alors son double sans l'emballer.
     pub groom_sender: Option<&'a dyn GroomSender>,
+    /// Par quoi le cycle voit **qu'un groom est déjà en vol** (mika#2958, vol 2d).
+    ///
+    /// La lecture est container-scopée et vit hors de ce module
+    /// ([`crate::groom_in_flight::DbGroomInFlightSource`]) : du SQL avec un handle
+    /// de base ne passe pas le scan de `no_dispatch_test.rs` sans exception
+    /// nommée, et ce vol n'en ajoute aucune.
+    ///
+    /// `None` = non câblée, et ce n'est **pas** traité comme
+    /// [`super::GroomInFlightReading::Unreadable`] : le site dit
+    /// `no_in_flight_source`, un motif à lui. Les deux causes — « la base dit
+    /// qu'un groom tourne » et « il n'y a pas de source » — sont deux populations
+    /// qu'un nom commun rendrait insoustrayables (mika#2205), sur l'axe même où
+    /// AC2 se lit.
+    ///
+    /// `&Arc<dyn …>` comme `flight_source` : le site de production tient la source
+    /// dans un `Arc` partagé avec le reste du serveur.
+    pub groom_in_flight: Option<&'a Arc<dyn GroomInFlightSource>>,
 }
 
 impl<'a> CycleContext<'a> {
@@ -573,6 +590,7 @@ impl<'a> CycleContext<'a> {
             verdict_ledger: None,
             gh_runner: None,
             groom_sender: None,
+            groom_in_flight: None,
         }
     }
 
@@ -606,6 +624,14 @@ impl<'a> CycleContext<'a> {
 
     pub fn with_groom_sender(mut self, sender: Option<&'a dyn GroomSender>) -> Self {
         self.groom_sender = sender;
+        self
+    }
+
+    pub fn with_groom_in_flight(
+        mut self,
+        source: Option<&'a Arc<dyn GroomInFlightSource>>,
+    ) -> Self {
+        self.groom_in_flight = source;
         self
     }
 }
