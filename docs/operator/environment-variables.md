@@ -5819,7 +5819,7 @@ déploiement — et aujourd'hui, ce chemin est presque désert (ci-dessous).
   mesurée** sur un fil très long : un marqueur au-delà de ce que `gh` rend
   serait lu `Missing` — fail-closed, jamais ouvert.
 
-### Un tour Webhook Fallthrough ne crée pas de travail par `run_gh` (mika#2573)
+### Le moteur ne crée pas de travail par `run_gh` (mika#2573, élargi par mika#2995)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
 entrée est ici parce que l'opérateur qui voit un `run_gh` refusé sur un tour
@@ -5878,6 +5878,70 @@ ci-dessus.
   chemin de création de travail serait un désarmement par coquille. Le geste de
   désarmement est un **revert**, et le coût d'un faux positif le supporte.
 
+#### Les deux motifs n'ont plus la même population (mika#2995)
+
+**Depuis mika#2995 cette garde ne se lit plus « sur un tour Fallthrough ».** Elle
+se lit par motif, et l'asymétrie EST la décision :
+
+| motif | population refusée | borne |
+|---|---|---|
+| `issue_create` | tours **Webhook Fallthrough** seulement | inchangée depuis mika#2573 |
+| `ready_label_add` | **tout** tour, sans exception de classe | élargie par mika#2995 |
+
+- **Le défaut, mesuré le 2026-10-31 (n=1, trace `0104d923`).** À 16:46:32Z la
+  garde de consentement de mika#2772 refuse un groom forcé sur mika#2958
+  (`forced_dispatch_without_consent`), et **son propre texte de remède prescrit
+  de promouvoir le ticket en posant `ready`**. À 16:51:37Z mika-dev appelle
+  `run_gh ["issue","edit","2958","--add-label","ready"]` avec le `GH_TOKEN` du
+  moteur ; la timeline porte `16:51:38Z labeled mika-platform-dev ready`. À
+  16:52:09Z le groom `d18d6ef1` part — il s'arrête seul sur `auto_skipped` /
+  `already_groomed`, donc aucun dégât, et c'est une chance et non une garde. Le
+  label est retiré à la main à 16:54:19Z.
+
+- **Pourquoi la borne de mika#2573 n'a rien refusé ce jour-là.** Le tour de
+  16:51 était un tour **ordinaire**, pas un Fallthrough. Une garde bornée au
+  domaine Fallthrough est, sur ce défaut, une garde absente.
+
+- **Pourquoi le label et pas l'issue.** `ready` est le consentement positif de
+  l'opérateur au dispatch autonome (mika#841), et la garde de mika#2772 lit
+  seulement sa **présence** — ni qui l'a posé, ni quand. Une identité capable de
+  l'écrire se donne donc elle-même le consentement que cette garde existe pour
+  exiger d'un humain. Le consentement n'existe alors que si l'agent s'abstient :
+  une garde improbable, pas une garde impossible. mika#2995 vol 1 retire la
+  **capacité d'écriture** (voie B) ; la lecture de provenance dans la garde de
+  mika#2772 est le vol 2.
+
+- **L'arbitrage faux positif / faux négatif, refait hors du domaine
+  Fallthrough.** Il tombe du même côté, et c'est ce qui autorise
+  l'élargissement. Un faux positif coûte **un `run_gh` refusé** dont le remède
+  nomme la sortie. Un faux négatif coûte un **groom ou un dispatch que personne
+  n'a autorisé** — 48 tours et 3,40 $ le 2026-10-17, l'incident qui a fait
+  naître mika#2772.
+
+- **Sur la population nominale, le geste retiré était déjà inerte.** Depuis
+  mika#1614 `try_dispatch_pilot_after_groom_success` dispatche dev-pilot
+  **directement**, sans aller-retour par le label ni par le webhook. Et un
+  ticket qui porte déjà `ready` ne produit rien sur un `--add-label` : GitHub
+  n'émet `labeled` que sur une **transition** (mika#2323). Ce qui est retiré est
+  donc une capacité, pas un chemin en service.
+
+- **Le coût, nommé plutôt que découvert.** Un opérateur qui demande en
+  conversation « pose le label `ready` sur #2562 » est **refusé lui aussi**. La
+  promotion se fait depuis sa propre surface — le geste canonique
+  `remove` → `add` du § *Le geste opérateur canonique* reste entier, il quitte
+  seulement le texte que l'agent lit. Une exception « quand c'est un humain qui
+  demande » serait une exception que l'agent se déclare à lui-même, c'est-à-dire
+  pas une exception : la demande arrive dans le message, et le message est ce
+  que l'agent interprète.
+
+- **Le remède de mika#2772 ne prescrit plus le geste (AC3).** Son champ
+  `recovery` **attribue** désormais la promotion à l'opérateur au lieu de la
+  prescrire au lecteur, et conserve mot pour mot sa seconde voie —
+  `mika ask --agent mika-dev "groom <owner/repo>#<n>"`, qui porte une intention
+  de grooming et **traverse** la porte au lieu de la lever (mika#1173). Un refus
+  doit nommer sa levée (mika#2520) : la correction porte sur le mode, pas sur la
+  présence du label dans le texte.
+
 #### SQL
 
 ```sql
@@ -5906,7 +5970,12 @@ un **format de fil** à site de définition unique, épinglé par test.
 ```bash
 # 1. La garde a-t-elle mordu, et sur quel motif ?
 grep fallthrough_work_creation_blocked "$MIKA_SPIRIT_LOG_FILE" \
-  | jq -c '{agent_id, session_id, trace_id, motif, verb, label}'
+  | jq -c '{agent_id, session_id, trace_id, motif, verb, label, turn_is_fallthrough}'
+
+# 1b. Les deux sous-populations, séparées sans découper la mesure (mika#2995)
+grep fallthrough_work_creation_blocked "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -s 'group_by([.motif, .turn_is_fallthrough]) | map({motif: .[0].motif,
+      turn_is_fallthrough: .[0].turn_is_fallthrough, n: length})'
 
 # 2. La sonde du ticket : quel acteur a posé `ready` ?
 grep ready_label_received "$MIKA_SPIRIT_LOG_FILE" \
@@ -5920,8 +5989,10 @@ grep webhook_fallthrough_turn "$MIKA_SPIRIT_LOG_FILE" \
 | surface | régime attendu | lecture |
 |---|---|---|
 | `fallthrough_work_creation_blocked` | **non vide, faible** | chaque ligne est une création de travail que le moteur a arrêtée |
-| `after_value = 'ready_label_add'` | non vide, faible | le vecteur de dispatch mesuré le 2026-09-28 |
+| `after_value = 'ready_label_add'` | non vide, faible | le vecteur de dispatch mesuré le 2026-09-28, puis le self-consent du 2026-10-31 |
 | `after_value = 'issue_create'` | non vide, faible | le substitut mesuré à `create_task` |
+| `ready_label_add` avec `turn_is_fallthrough: false` | **attendu depuis mika#2995** | la sous-population que la borne de mika#2573 laissait passer — c'est l'incident du 2026-10-31, et une occurrence ici est la garde qui **marche** |
+| `issue_create` avec `turn_is_fallthrough: false` | **vide** | cette combinaison n'est pas atteignable : `issue_create` garde sa borne. Une ligne ici est un élargissement non voulu — lire `work_creation_is_refused` |
 | `webhook_fallthrough_turn` | non vide | **le contrôle positif** : zéro refus avec zéro tour ne prouve rien (mika#2205) |
 | une même session portant plusieurs refus | **anomalie** | le modèle insiste ; lire le prompt servi **avant** de toucher au prédicat |
 | `fallthrough_work_creation_audit_failed` | **vide** | le WARN est passé, la ligne d'audit non — le `GROUP BY` est alors incomplet |
@@ -5932,7 +6003,18 @@ mesuré (classe mika#2304). `webhook_fallthrough_turn` la porte déjà **sous le
 même `trace_id`** — une ligne dit *quel tour*, l'autre *ce qu'il a tenté*, et le
 `trace_id` les joint exactement.
 
-#### Sondes post-déploiement, et leurs quatre haltes
+**Le nom d'événement n'a PAS changé avec mika#2995, et `turn_is_fallthrough` est
+un champ, pas un second nom.** Deux noms ne se soustraient pas (mika#2205), et
+la jointure par `trace_id` avec `webhook_fallthrough_turn` ci-dessus n'en
+joindrait plus que la moitié — les refus hors domaine n'ont pas de tour
+Fallthrough à joindre, et c'est précisément ce que le champ dit. C'est le
+`group_by([.motif, .turn_is_fallthrough])` de la recette 1b qui sépare les
+sous-populations, sans découper la mesure en deux instruments dont aucun ne
+répond « combien de créations de travail le moteur a-t-il arrêtées ? ».
+L'**absence** du champ sur une ligne signifie un binaire antérieur à mika#2995
+(classe mika#2340), jamais un tour non-Fallthrough.
+
+#### Sondes post-déploiement, et leurs cinq haltes
 
 > **Préalable à toutes.** `skills/bundled/` est une projection du **binaire**,
 > pas du checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter
@@ -5958,18 +6040,49 @@ est inférieur à celui d'une lecture refusée en boucle.
 
 **S3 — la sonde du ticket (30 jours).** Chaque `ready_label_received` portant
 `actor: mika-platform-dev` est attribuable à `auto_pull` Phase 2 (remove → add),
-jamais à une session conversationnelle dont le tour est un Fallthrough.
-*Halte 3 — un refus apparaît sur un tour qui n'est **pas** Fallthrough :* c'est
-le **prédicat de classe du tour** qui est mal lu, pas la liste de verbes. Lire le
+jamais à une session conversationnelle.
+*Halte 3 — un `issue_create` refusé apparaît avec `turn_is_fallthrough: false` :*
+c'est le **prédicat de classe du tour** qui est mal lu, ou la population de ce
+motif qui a été élargie par inadvertance. Lire d'abord
+`work_creation_is_refused` (le motif décide, le tour est son paramètre), puis le
 message servi (`is_webhook_fallthrough_domain` refuse `[GitHub] PR `,
-`[GitHub] Check suite ` et le marqueur ready-label) **avant** de toucher au
+`[GitHub] Check suite ` et le marqueur ready-label) — **avant** de toucher au
 prédicat argv.
+*Ce qui n'est PAS une halte depuis mika#2995 :* un `ready_label_add` refusé avec
+`turn_is_fallthrough: false`. C'est la sous-population pour laquelle ce vol
+existe, et une occurrence y est la garde qui mord. Jusqu'à mika#2995 cette
+même ligne était la halte 3 ; elle est aujourd'hui le résultat attendu.
 
 **S4 — le résidu `run_shell` (30 jours).** La requête SQL n°3 ci-dessus.
 *Halte 4 — elle rend des lignes :* le vecteur est réel et mesuré ; le ticket de
 suivi s'ouvre **avec ce compte**, jamais avec une intuition. Zéro ligne est un
 **résultat** — il dit que le modèle n'emprunte pas cette route — et non une
 preuve que la route est fermée.
+
+**S5 — la sonde de l'AC5 (30 jours, à reporter sur mika#2995).** Le compte
+d'événements `labeled ready` dont l'acteur est l'identité du moteur. Cible **0**,
+ou **chaque cas refusé par la garde** — les deux sont des succès, et ce ne sont
+pas les mêmes : zéro dit que le geste n'est plus tenté, un refus compté dit que
+la garde l'arrête. Les deux moitiés de la jointure :
+
+```bash
+# a) côté forge — qui a posé `ready`, sur les 30 derniers jours
+gh api 'repos/senara-solutions/mika/issues/events?per_page=100' --paginate \
+  | jq -c '.[] | select(.event == "labeled" and .label.name == "ready")
+             | {created_at, actor: .actor.login, issue: .issue.number}'
+
+# b) côté moteur — ce que la garde a arrêté sur la même fenêtre
+grep fallthrough_work_creation_blocked "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.motif == "ready_label_add") | {trace_id, turn_is_fallthrough}'
+```
+
+*Halte 5 — (a) rend une pose par `mika-platform-dev` sans ligne correspondante
+en (b) :* une route non couverte a servi. **Ne pas élargir le prédicat argv par
+réflexe** — établir d'abord le déploiement (préalable ci-dessus), puis *quelle
+porte* : `run_shell` (le résidu de S4 ci-dessus), `gh pr edit --add-label` (hors
+population, § *Hors périmètre*), ou `auto_pull` Phase 2, qui est **légitime** et
+dont la signature est un `remove` immédiatement suivi d'un `add` sur le même
+ticket. Cette dernière est la raison pour laquelle (a) seul ne conclut rien.
 
 **Halte transverse — les deux sondes muettes.** Zéro refus et zéro tour
 Fallthrough ne prouve **rien** : vérifier le contrôle positif avant toute
@@ -5990,7 +6103,32 @@ garde qui marche* (mika#2205).
 - **Il ne rattrape pas l'incident du 2026-09-28.** L'issue #2571 existe et le
   dispatch `53a10c4a` a eu lieu ; **rien ici ne rétro-estampille** — fabriquer
   une ligne décrivant un fait qu'on n'a pas observé est l'inverse de ce que ce
-  travail défend. La sonde est la **prochaine** occurrence.
+  travail défend. La sonde est la **prochaine** occurrence. Idem pour le
+  2026-10-31 : le groom `d18d6ef1` est parti, et qu'il se soit arrêté seul sur
+  `already_groomed` est une chance, pas une garde.
+- **Il ne fait pas lire la provenance de `ready` à la garde de mika#2772
+  (mika#2995 vol 2).** Un `ready` posé par l'identité du moteur — par une route
+  que ce vol ne couvre pas, ou par un binaire antérieur au déploiement — **vaut
+  toujours consentement** pour cette garde, qui lit la seule présence du label.
+  Ce vol retire la capacité d'écriture ; il ne change pas la lecture. C'est
+  l'AC2 du ticket, et c'est ce qui rend la sonde S5 porteuse plutôt que
+  décorative.
+  - **La précondition du vol 2, nommée ici pour qu'il ne la redécouvre pas.**
+    Lire la provenance, c'est poser un **filtre d'identité**, et la doctrine
+    mika#2323 le déclare hors périmètre par construction au site voisin :
+    l'acteur traverse bien la frontière depuis ce ticket, mais
+    `mika2323_no_gate_predicate_reads_the_actor` (allowlist **vide**, contrôle
+    positif `mika2323_the_actor_guard_bites_on_a_planted_read`) refuse qu'un
+    prédicat de refus le lise, et son doc-comment dit la résolution :
+    *« remove the read »*, une entrée d'allowlist étant une décision de
+    politique qui exige son propre ticket. Ce scan est **borné au fichier**
+    `src/server/ready_label_handler.rs`, donc il ne refuse pas de lui-même la
+    lecture que le vol 2 ferait dans `executor.rs` — mais il dit à quel prix :
+    le vol 2 est le ticket qui décide cette politique, pas un correctif qui la
+    suppose.
+- **Il ne retire pas `ready` d'un ticket qui le porte déjà.** Rien ne nettoie
+  rétroactivement, et GitHub n'émet `labeled` que sur une transition
+  (mika#2323) : un ticket promu avant le déploiement reste promu.
 - **Il ne surveille rien.** Les seuls instruments sont les greps et les requêtes
   ci-dessus, et **leur silence ne prouve rien tant que personne ne les
   exécute** — d'où le contrôle positif sur `webhook_fallthrough_turn`, sans
@@ -6119,7 +6257,7 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 | `cancel_task` | oui | **OUI — et c'est le second cas mesuré** | **suivi mika#2653** : c'est lui qui a tué `8a3b2082` et jeté 71 tours (trace `8ec6364c-be71-11f1-908b-e931f18d2c16`). Son remède n'est pas un terme de cible mais un terme de **vivacité** (`live_pilot`, mika#2279) ; ce qui le sort d'ici est le rayon de souffle — un faux refus d'annulation retire à l'opérateur son geste de reprise le plus court — et le cinquième booléen sur `ToolContext` |
 | `promote_deferred_callback` | oui | oui | **fermé par mika#2654**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici avec sa précondition — **zéro occurrence mesurée à la rédaction**, levée depuis : mesure du 2026-10-07 (73 appels / 58 sessions sur 30 j, dont 27 sessions de canal `github` pour 33 appels et 10 promotions réussies). La même mesure a **écarté le terme de lignée** pour cet outil — les 10 réussites sont toutes dans la lignée de l'événement, donc la population de refus d'une garde de lignée serait vide (mika#2205) — et le remède retenu est un terme de **classe de tour** : refus sur un tour PR / check-suite |
 | `pr_merge_with_gate` | oui | non | sa cible **est** la PR, par la forme de son entrée |
-| `git_ops`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | ne touchent pas le plan de dispatch. `run_gh` porte déjà sa propre garde de création de travail (mika#2573), bornée au domaine Fallthrough |
+| `git_ops`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | ne touchent pas le plan de dispatch. `run_gh` porte déjà sa propre garde de création de travail (mika#2573) : `issue create` bornée au domaine Fallthrough, la pose de `ready` sur tout tour (mika#2995) |
 
 ### Sondes post-déploiement, et leurs cinq haltes
 
@@ -6852,7 +6990,7 @@ Optional (STOP global à chaud — mika#2329) :
 - **Portée de la sentinelle `auto-pull` : c'est le FREIN DE DISPATCH NEUF de la boucle, pas l'interrupteur privé d'un scan (mika#2498).** Son nom dit un scan ; lire le nom comme la portée a coûté un incident. Le 2026-09-23, sentinelle posée à **05:38** locales : le tick du feeder se court-circuite comme prévu, et un implement part quand même à **06:11:39Z** (`ff694ec0`, 103 tours, 17,86 USD, parent `resume_agent` `107f8849`). Un groom convergé enchaîne sur son implémentation par l'**auto-fire moteur** (`try_dispatch_pilot_after_groom_success`, mika#1614), qui ne passe par **aucun tick**. L'opérateur n'a pu que l'annuler en réaction. C'est la forme de panne que ce mécanisme nomme lui-même pour une autre raison : *« un STOP silencieusement inopérant se lit exactement comme un STOP qui marche »*.
   - **Élargie dans son sens, jamais dupliquée.** Le critère de mika#2420 est *« une décision distincte mérite un fichier distinct »* — or les deux routes ont la **même sortie** (un dispatch dev-pilot neuf) atteinte par deux chemins : le feeder promeut `ready` puis dispatche in-process (mika#2470), l'auto-fire dispatche directement. Un opérateur qui arrête l'une et pas l'autre n'a rien arrêté : c'est l'incident. Un second fichier (`groom-implement-stop`) est **refusé** pour cette raison — il scinde une décision d'opérateur en deux gestes, et celui de la mémoire musculaire rendrait alors le comportement d'aujourd'hui en ayant l'air d'arrêter. Renommer la sentinelle est refusé aussi : le fichier peut être armé **en ce moment** sur l'hôte, et la mémoire musculaire est ce qu'un frein de P0 ne doit pas casser. Ce qui change est la portée **documentée**, pas le geste.
   - **Le critère pour un futur consommateur**, et ce n'est pas « suis-je un scan ? » : *est-ce que je démarre du travail pilote **neuf** ?* Si oui, lire cette sentinelle, quelle que soit la porte d'entrée. Sinon, il lui faut un nom de scan à soi.
-  - **Ce que ça ne couvre pas, nommé.** `verdict_handler` (`block[ac]` / `block[ci]`) : réparer une PR ouverte est une **continuation**, pas du travail neuf — décision distincte, inchangée. Un `ready` posé **à la main** pendant un STOP : `ready_label_handler` dispatche, délibérément non couvert — savoir si un fichier prime sur le geste que l'opérateur vient de poser est une décision produit, pas substrat, et le discriminant qui permettrait de la scoper étroitement est structurellement interdit (l'acteur est lisible depuis mika#2323 mais **aucun prédicat de refus n'a le droit de le lire**, tenu par `mika2323_no_gate_predicate_reads_the_actor` à allowlist vide). **Tickets de suivi**, dont la précondition est la sonde S2 ci-dessous. Enfin la voie prompt-level de `self-dev-callback` (`run_gh issue edit --add-label ready`) : **inerte sur la population nominale** — le ticket porte déjà `ready`, `dispatch-lib.sh` ne le retire jamais, et GitHub n'émet `labeled` que sur une **transition** (mika#2323), donc un `--add-label` redondant n'émet rien. Elle cesse d'être inerte pour un groom lancé par `mika ask "groom mika issue#N"` (mika#2484) — même suivi, même précondition.
+  - **Ce que ça ne couvre pas, nommé.** `verdict_handler` (`block[ac]` / `block[ci]`) : réparer une PR ouverte est une **continuation**, pas du travail neuf — décision distincte, inchangée. Un `ready` posé **à la main** pendant un STOP : `ready_label_handler` dispatche, délibérément non couvert — savoir si un fichier prime sur le geste que l'opérateur vient de poser est une décision produit, pas substrat, et le discriminant qui permettrait de la scoper étroitement est structurellement interdit (l'acteur est lisible depuis mika#2323 mais **aucun prédicat de refus n'a le droit de le lire**, tenu par `mika2323_no_gate_predicate_reads_the_actor` à allowlist vide). **Tickets de suivi**, dont la précondition est la sonde S2 ci-dessous. Enfin la voie prompt-level de `self-dev-callback` (`run_gh issue edit --add-label ready`) : **inerte sur la population nominale** — le ticket porte déjà `ready`, `dispatch-lib.sh` ne le retire jamais, et GitHub n'émet `labeled` que sur une **transition** (mika#2323), donc un `--add-label` redondant n'émet rien. Elle cesse d'être inerte pour un groom lancé par `mika ask "groom mika issue#N"` (mika#2484) — même suivi, même précondition. **Cette voie-là est fermée depuis mika#2995, et deux fois** : le prompt du callback ne prescrit plus la pose du label, et `run_gh` la refuse sur **tout** tour (motif `ready_label_add`, § *Le moteur ne crée pas de travail par `run_gh`*) — ce qui ne ferme ni les deux cas précédents de cette puce ni le résidu `run_shell`, qui gardent leur ticket de suivi et leur précondition S2.
   - **Le refus est convergent, jamais terminal**, et c'est ce qui rend l'élargissement acceptable plutôt que destructeur : il n'annule pas le groom, ne perd pas le plan (committé et poussé par `_push_branch`), ne retire pas `ready`, ne marque rien `failed`, ne crée aucune row. Le parent reste `in_progress` / `groom` — une raison de refus de plus dans un sillon que les chemins de saut existants de la fonction (pas de jeton, outil absent du registre, handler non long-running, flip impossible, readiness refusée, création du callback échouée, script de handler absent) creusaient déjà, et c'est ce qui garde le changement petit. À la levée, le réconciliateur stuck-ready le re-drive (in-process depuis mika#2470) ; et pendant le STOP aucun tick ne tourne, donc **aucun point du budget de re-drive n'est consommé** (mika#2020). **Effet de bord utile :** sous STOP, les grooms en vol convergent, committent leur plan et **ne chaînent pas** — c'est littéralement la « pause grooms-seuls » demandée, obtenue sans introduire d'état nouveau.
   - **Surfaces.** Journal : `groom_pilot_autofire_stopped` (INFO — champs `parent_task_id`, `callback_task_id`, `repo`, `issue`, `stop_file`, ce dernier rendu par `stop_file_path`, jamais un littéral). Base : une row sous le **même `tool_name` que le chemin nominal**, la porte dans `after_value` — motif `ready_label_outcome` (mika#2323), délibérément **pas** le motif à deux noms de `phantom_aged_out` / `phantom_sweep_spared`, qui s'applique quand chaque nom porte sa propre cause ; ici les deux issues appartiennent au même dispatcheur et à la même population.
     ```bash
@@ -7194,12 +7332,25 @@ grooming n'exige pas un redéploiement ; il ne se pose pas « le temps de voir �
   classe est vide » et « la garde n'est pas déployée » rendraient les mêmes
   octets.
 
-- **Un refus nomme ses deux gestes de reprise**, dans son champ `recovery` :
-  reposer le label `ready` en **remove→add** (GitHub n'émet `labeled` que sur une
-  transition — mika#2323), ou groomer explicitement par
+- **Un refus nomme ses deux levées, et depuis mika#2995 il n'en prescrit
+  aucune** (AC3). Un refus qui ne nomme pas sa levée est un refus qu'on
+  contourne au jugé (mika#2520) — mais son champ `recovery` disait *« promote
+  the ticket by posting the `ready` label as remove→add »*, et c'est ce texte
+  que mika-dev a exécuté le 2026-10-31 à 16:51:37Z avec le `GH_TOKEN` du moteur.
+  Le remède d'une garde de consentement décrivait comment se donner le
+  consentement. Il **attribue** désormais : la promotion appartient à
+  l'opérateur, `ready` est son consentement positif (mika#841), et le moteur
+  refuse de l'écrire sur **tout** tour (mika#2995, § *Le moteur ne crée pas de
+  travail par `run_gh`*). La seconde levée est inchangée au mot près —
   `mika ask --agent mika-dev "groom <owner/repo>#<n>"`, qui fait du dispatch une
-  demande et sort de la population. Un refus qui ne nomme pas sa levée est un
-  refus qu'on contourne au jugé.
+  demande, **traverse** la porte au lieu de la lever (mika#1173) et sort de la
+  population. Le geste `remove` → `add` et le fait de mika#2323 qui le motive
+  n'ont pas disparu : ils vivent au § *Le geste opérateur canonique*, la surface
+  d'où la promotion se fait. Ils ont seulement quitté le texte que l'agent lit.
+  Épinglé par `mika2995_le_remede_attribue_la_promotion_sans_prescrire_le_geste`
+  (aucun des gabarits `--add-label`, `--remove-label`, `remove→add` dans
+  `recovery`, **et** la promotion attribuée — retirer le gabarit sans dire à qui
+  elle appartient laisserait un blanc, et un agent comble un blanc).
 
 ### Surfaces opérateur
 
