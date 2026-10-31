@@ -5392,6 +5392,116 @@ impl Database {
             })
             .collect())
     }
+
+    /// Les dispatches de **groom** vivants ou morts portant une de ces URLs
+    /// d'issue, sur tout le conteneur (mika#2958, vol 2c).
+    ///
+    /// La question est *« une tâche de classe `groom` existe-t-elle sur ce
+    /// ticket ? »*, et elle est posée **sans `agent_id`** — comme son précédent
+    /// [`Self::list_finished_implement_flights_in_container`] et pour le même
+    /// motif (mika#2792) : le manager est une tâche de processus *sans agent*,
+    /// donc tout filtre sur l'`agent_id` du handle emprunté pour la connexion
+    /// rend une lecture constamment vide. L'invariant est porté par le **nom**
+    /// de la méthode — `…_in_container` — pas par un commentaire qu'un refactor
+    /// déplace.
+    ///
+    /// L'appariement se fait sur l'**ensemble fermé** de variantes de
+    /// [`crate::task_state::tasks::issue_url_variants`], en `IN (?, ?, …)`.
+    /// **Jamais** un `LIKE 'url%'` : le préfixe faisait apparier `/issues/216`
+    /// avec `/issues/2161`, et c'est le bug que mika#2638 a corrigé.
+    ///
+    /// **Deux formes de ligne, en `UNION ALL`**, parce que la topologie d'un
+    /// dispatch en a deux (mika#2279) : la parente porte l'URL et jamais le
+    /// `process_id`, l'enfant porte le pgid et jamais l'URL. Sans la branche
+    /// (b), un enfant de groom encore en vol sous une parente **annulée** lit
+    /// comme « aucun groom » — exactement la collision que ce vol existe pour
+    /// éviter.
+    ///
+    /// Le statut sort **brut** : le filtre terminal est en Rust, chez l'appelant
+    /// ([`crate::groom_in_flight`]), parce que la règle « un statut inconnu
+    /// n'est pas terminal » de `is_terminal_task_status` n'a pas d'expression
+    /// dans ce dialecte, et qu'une seconde copie de la liste des statuts
+    /// divergerait.
+    ///
+    /// `issue_urls` vide ⇒ `Ok(vec![])` **sans requête** : un `IN ()` est une
+    /// syntaxe refusée, et un aller-retour qui ne peut rien rendre est un
+    /// aller-retour de trop. **Aucun plafond nommé ici** — le bornage vient de
+    /// l'unique appelant, dont la relève vaut au plus `RELIEF_SIZE` tickets ;
+    /// une constante locale serait un second lecteur du même chiffre
+    /// (doctrine mika#2201).
+    pub fn list_groom_dispatches_in_container(
+        &self,
+        issue_urls: &[String],
+    ) -> Result<Vec<GroomDispatchRow>> {
+        if issue_urls.is_empty() {
+            return Ok(vec![]);
+        }
+        let variantes: Vec<String> = issue_urls
+            .iter()
+            .flat_map(|url| crate::task_state::tasks::issue_url_variants(url))
+            .collect();
+        let places = (0..variantes.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Les deux branches lisent les **mêmes** numéros de liaison, donc la
+        // seconde ne consomme aucun paramètre de plus — même économie que les
+        // deux requêtes du précédent.
+        //
+        // Le lien parente/enfant de la branche (b) est **qualifié** des deux
+        // côtés (`enfant.parent_task_id = parent.id`), et la qualification n'est
+        // pas cosmétique : dans un prédicat qui nomme deux fois `tasks`, un `id`
+        // nu se résout sur l'alias le plus proche et le lien devient une
+        // tautologie — l'avertissement est déjà écrit au précédent, à la borne
+        // temporelle de sa requête 1. Il est tenu ici par une **jointure** et non
+        // par un `EXISTS` corrélé, pour une raison de projection : la branche (b)
+        // doit rendre l'URL de la *parente* **et** le statut de l'*enfant*, et un
+        // `EXISTS` ne projette rien — il faudrait une seconde sous-requête
+        // corrélée sur le même lien pour aller chercher l'URL.
+        let sql = format!(
+            "SELECT reference_url, status FROM tasks
+              WHERE COALESCE(dispatch_class, 'implement') = 'groom'
+                AND reference_url IN ({places})
+             UNION ALL
+             SELECT parent.reference_url, enfant.status
+               FROM tasks enfant
+               JOIN tasks parent ON enfant.parent_task_id = parent.id
+              WHERE COALESCE(enfant.dispatch_class, 'implement') = 'groom'
+                AND parent.reference_url IN ({places})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> = variantes
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                Ok(GroomDispatchRow {
+                    issue_url: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// Une ligne de dispatch de groom : l'URL qui l'a appariée, et le statut de la
+/// tâche qui la porte (mika#2958, vol 2c).
+///
+/// Le **statut sort brut**. Cette couche rapporte, elle ne filtre pas : un
+/// `SELECT` qui aurait écarté les statuts terminaux rendrait « un groom est
+/// mort ici » et « aucun groom n'a jamais eu lieu ici » en octets identiques
+/// (classe mika#2205), et le filtre vivrait alors à deux endroits — en SQL et
+/// chez le lecteur unique du type, [`crate::groom_in_flight`].
+///
+/// L'URL rendue est celle qui a **apparié**, variante comprise : c'est elle, et
+/// jamais un numéro reconstruit depuis sa forme, que le lecteur retraduit en
+/// numéro de ticket par sa propre table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroomDispatchRow {
+    pub issue_url: String,
+    pub status: String,
 }
 
 /// Un vol terminé, et l'issue que son pilote a écrite (mika#2886).
