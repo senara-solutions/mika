@@ -7565,13 +7565,11 @@ async fn un_troisieme_lecteur(db: &AsyncDatabase, u: &str) -> bool {
             let token = unquote(raw);
             for flag in ADD_LABEL_FLAGS {
                 let value = if token == *flag {
+                    // `--add-label ready` : la valeur est le jeton SUIVANT.
                     tokens.get(i + 1).map(|t| unquote(t))
-                } else if let Some(rest) =
-                    token.strip_prefix(flag).and_then(|r| r.strip_prefix('='))
-                {
-                    Some(rest)
                 } else {
-                    None
+                    // `--add-label=ready` : la valeur est collée au drapeau.
+                    token.strip_prefix(flag).and_then(|r| r.strip_prefix('='))
                 };
                 let Some(value) = value else { continue };
                 // `gh` accepte une liste : `--add-label ready,urgent`.
