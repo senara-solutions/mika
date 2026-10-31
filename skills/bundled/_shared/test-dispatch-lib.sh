@@ -15630,10 +15630,21 @@ test_t2976_local_spent() {
     git -C "$FIXTURE_CLONE" checkout -q main
     # Le squash : `main` reçoit le MÊME patch sous un autre sha. C'est ce que
     # `rev-list --count` ne sait pas voir et que `--cherry-mark` voit.
-    git -C "$FIXTURE_CLONE" cherry-pick "$tip" >/dev/null 2>&1
+    # `-x` et non un cherry-pick nu : sur le même parent, dans la même seconde et
+    # sous la même identité, un cherry-pick nu rend le MÊME sha que `$tip`. Ce
+    # n'est plus un squash mais un fast-forward, la tête de branche est déjà
+    # `origin/main`, et l'assertion « la branche repart de origin/main » passe
+    # sans que rien n'ait bougé. La ligne `(cherry picked from …)` change le sha
+    # et laisse le patch-id intact. Même raison aux trois autres fixtures.
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$tip" >/dev/null 2>&1
     git -C "$FIXTURE_CLONE" push -q origin main
     git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
     # La branche n'a JAMAIS été poussée : origin ne la porte pas.
+    if [ "$(git -C "$FIXTURE_CLONE" rev-parse main)" = "$tip" ]; then
+        _t2976_cleanup
+        echo "FAIL: fixture: le squash a rendu le sha de la branche, la scène n'est plus un squash"
+        return 0
+    fi
 
     gh() { printf '[{"number":2971,"state":"MERGED"}]\n'; }
 
@@ -15677,7 +15688,7 @@ test_t2976_remote_spent() {
     local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
     git -C "$FIXTURE_CLONE" push -q origin "$br"
     git -C "$FIXTURE_CLONE" checkout -q main
-    git -C "$FIXTURE_CLONE" cherry-pick "$tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$tip" >/dev/null 2>&1
     _t2976_commit other.txt "suite" "chore: un commit de plus sur main"
     git -C "$FIXTURE_CLONE" push -q origin main
     # La ref LOCALE est retirée : la branche ne vit plus que sur origin.
@@ -15805,7 +15816,7 @@ test_t2976_unmerged_work_halts() {
     git -C "$FIXTURE_CLONE" push -q origin "$br"
     git -C "$FIXTURE_CLONE" checkout -q main
     # SEUL le plan atterrit sur main : le `wip()` n'y est pas.
-    git -C "$FIXTURE_CLONE" cherry-pick "$merged_tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$merged_tip" >/dev/null 2>&1
     git -C "$FIXTURE_CLONE" push -q origin main
     git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
 
@@ -15861,7 +15872,7 @@ test_t2976_undetermined() {
     _t2976_commit plan.md "plan du vol 1" "docs(plans): groom mika#2976"
     local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
     git -C "$FIXTURE_CLONE" checkout -q main
-    git -C "$FIXTURE_CLONE" cherry-pick "$tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$tip" >/dev/null 2>&1
     git -C "$FIXTURE_CLONE" push -q origin main
     git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
 
