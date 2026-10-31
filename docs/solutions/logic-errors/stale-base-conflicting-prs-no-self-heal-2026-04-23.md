@@ -9,6 +9,7 @@ symptoms:
   - PR stuck in mergeable=CONFLICTING state for hours with no autonomous recovery
   - Sequential tickets dispatched after upstream merge inherit stale base
   - resolve-pr-conflicts skill exists but is never invoked by self-dev
+  - Le callback d'un arrêt de dispatch répare dans le worktree et laisse une parente in_progress sans enfant vivant
 root_cause: missing_workflow_step
 resolution_type: code_fix
 severity: high
@@ -20,6 +21,8 @@ tags:
   - worktree
   - stale-base
   - resolve-pr-conflicts
+  - callback
+  - task-engine
 ---
 
 # Stale-base branches cause CONFLICTING PRs with no self-heal path
@@ -129,6 +132,27 @@ T9 de `test-dispatch-lib.sh` reproduit cette topologie et épingle les deux crit
 **Une ref de suivi survit à sa branche.** Un `git fetch` sans `--prune` ne retire jamais `refs/remotes/origin/<b>`. Restée sur l'ancienne tête, elle suffisait à faire buter la porte. Le correctif demande au distant si la branche existe (`_remote_branch_exists`, mika#2626) avant de lire la ref. Absente : la ref est ignorée et la ligne la nomme (`stale=`). Pas de réponse : la ref est lue comme avant, ce qui peut arrêter mais jamais réinitialiser.
 
 **Ce qu'on retient.** Une non-perte se mesure sur le contenu, dans un seul sens, et sur la population que la porte doit juger. Le vol 1 mesurait la bonne chose (les patchs) dans la mauvaise unité (le commit), et sur une population trop large (tout ce que porte la branche, y compris le vol en cours et une ref que le distant a oubliée). La ligne `branch_reuse_gate:` porte maintenant `containment=` (`per_commit`, `cumulative`, `work`, `unmeasured`), `current=` et `stale=`, pour que le relevé d'AC4 sépare un vrai travail en péril d'une non-mesure.
+
+### Vol 3 : le second visage — le callback de l'arrêt répare hors pipeline, et la parente ne survit pas (mika#2976, AC5)
+
+Les deux vols précédents ont fermé la porte. Le défaut avait un second visage, en aval : **le tour de callback qui reçoit la bannière d'arrêt tentait la réparation lui-même**, dans le worktree, hors du pipeline. Mesuré le 2026-10-30 (session `callback-233cab88-90f9-4fb8-a43c-7e49015bcdd7`) : `git rebase origin/main` à 09:30:43Z, puis `git checkout --theirs` sur le fichier de plan à 09:31:28Z — dans un rebase, « theirs » est le commit rejoué, donc l'ancien brouillon du vol 1 l'emportait sur la version finale de `main`, 14 insertions contre 22 suppressions, indexées — puis « max steps exhausted » à 09:32:07Z. Restaient un worktree en HEAD détachée à `a219d0a3` avec `rebase-merge` ouvert à 1/7, et la parente de groom `19c11b09` figée en `in_progress` alors que son seul enfant `1f838a67` était `delivered` et qu'aucun processus ne tournait. Trois gestes à la main pour nettoyer.
+
+**Le modèle n'a pas dérivé : il a suivi le prompt.** Le routage du callback de groom teste launcher-dead, `Outcome: ESCALATE`, `PIPELINE FAILURE:`, puis *« Otherwise → route to the "On failure" handler (Step 4.5) »*. Or aucune des deux bannières d'arrêt ne porte le préfixe `PIPELINE FAILURE:` — elles tombaient donc dans le dernier « Otherwise », et Step 4.5 s'intitule *« Diagnose and recover from failure »*, point 3 : *« Attempt recovery (max 1) »*. Le défaut était **un discriminateur absent**, pas une désobéissance. C'est la règle générale : quand une branche de routage se termine par un « sinon » qui invite à réparer, tout producteur neuf de bannière hérite de cette invitation sans que personne l'ait décidé.
+
+Le correctif est en deux moitiés, qui ne vivent ni dans le même fichier ni dans la même couche — et **l'asymétrie entre les deux est le fait à retenir** :
+
+- **Moitié A, prescriptive.** Un sixième discriminateur dans `skills/bundled/self-dev-callback/system_prompt.md`, placé **avant** `Pipeline result classification` : prédicat en table close de deux valeurs sur la **première ligne** du `RESULT` (`STATUS=REBASE_CONFLICT`, `STATUS=BRANCH_HAS_UNMERGED_WORK` — jamais `STATUS=` nu, qui avalerait `CANCELLED_BY_OPERATOR` et `CANCELLED_BY_SIGNAL` et rendrait une annulation opérateur indistinguable d'un arrêt de branche), puis sept pas : aucune réparation, aucune relance, pas d'incrément de `pipeline_retry_count`, aucun label touché, `update_task_status(task_id, "blocked")` avec `{"dispatch_halt": true, "halt_status": …}`, `send_message` du `RESULT` verbatim, fin de tour.
+- **Moitié B, structurelle.** `parse_dispatch_halt_status` + `try_terminate_parent_on_dispatch_halt` dans `crates/mika-agent/src/task_engine/dispatcher.rs`, septième frère de la famille de hooks `try_*` de `deliver_callback`. Ces hooks tournent **avant** le tour silencieux — le commentaire du site le disait déjà : *« persist it to the parent task BEFORE the silent agent runs … even if the agent exhausts its step budget »*. La parente passe `failed` avec un motif `dispatch_halt_<status>`, un événement d'audit `dispatch_halt_resolver` et un `info!` `dispatch_halt_parent_terminated`.
+
+**L'asymétrie, dite plutôt que supposée.** Un mock valide la forme du prompt, jamais l'obéissance du modèle (doctrine mika#1190). La moitié A reste donc prescriptive : rien n'empêche structurellement un tour futur de lancer un `git rebase`. Ce qui est garanti structurellement, c'est que **ce rebase ne coûte plus la parente** — elle est déjà terminale quand le tour prend la main, et la relance n'est plus bloquée. Les trois gestes manuels du 2026-10-30 se réduisent aux deux premiers, qui ne bloquent rien. Fermer la moitié A structurellement demanderait une garde EndTurn refusant un outil mutant un worktree dans un tour de callback portant une bannière d'arrêt ; elle **n'est pas livrée**, et pas par oubli : c'est une garde sur le domaine entier des tours de callback, dont la population — combien de tours de callback touchent légitimement un worktree aujourd'hui ? — n'est pas mesurée, et une garde dont on ne connaît pas la population qu'elle va mordre est la forme que mika#2309 condamne. Suivi : mika#2976 (garde EndTurn du worktree en tour de callback).
+
+**La place dans le prompt EST le correctif, et rien de comportemental ne le dit.** Déplacé sous `Pipeline result classification`, le discriminateur redevient inopérant — les deux bannières retombent dans le « Otherwise » — sans qu'aucune assertion de comportement ne rougisse. Deux tests d'ordre dans `dispatcher.rs` lisent donc le prompt par `include_str!` et comparent les positions ; leur allowlist (`ORDER_SCAN_ALLOWLIST`) est livrée **vide** et pinée vide par un test frère, le compte de départ mesuré par le scan lui-même. Qui « range » ce fichier doit les faire passer.
+
+**Ce que ce vol ajoute à la sonde d'AC4**, sans en toucher le compte : un terme lisible. La limite nommée par le vol 2 — la ligne `[dispatch-lib] branch_reuse_gate: …` n'est écrite dans aucun journal persistant — reste entière ; mais `dispatch_halt_parent_terminated` et le `tool_name` `dispatch_halt_resolver` sont en base, donc comptables. Le relevé suivant pourra dire *combien d'arrêts de dispatch ont rendu leur parente terminale sans geste humain*. L'**absence** de ces lignes signifie un binaire antérieur à ce vol (motif mika#2340), jamais une absence d'arrêt — la moitié A, elle, ne mord qu'après `make deploy`, ce qui est pourquoi la moitié B part en premier : entre les deux, un callback d'arrêt peut encore tenter une réparation, mais sans laisser de parente zombie.
+
+**Deux termes qui ne se somment pas.** Le motif d'échec est `dispatch_halt_<status>`, pas `callback_no_pr_*` : les deux `RESULT` d'arrêt portent aussi `NO_PR: no_pr_on_branch`, que `parse_no_pr_reason` lit déjà, et réutiliser ce motif ferait écrire aux deux producteurs les mêmes octets (classe mika#2205). Deux populations sous un nom ne sont pas soustractibles.
+
+**Pourquoi le faucheur ne suffisait pas, encore une fois.** `find_orphaned_parent_tasks` porte neuf prédicats, et aucune mesure depuis un bac à sable de pilote ne sépare celui qui a exclu `19c11b09` : la base de production n'y est pas joignable. Ce vol n'y touche donc pas — *un verdict non mesuré ne se code pas*. Ce qu'il obtient sans cette mesure : la parente devient terminale **au moment de la livraison**, soit au plus tard 600 s avant que le faucheur n'en devienne la question. Les deux ne se contredisent pas : `update_task_failed` est un UPDATE gardé sur l'état terminal, donc le second à passer ne fait rien et le dit (`Ok(false)`).
 
 ## Related Issues
 
