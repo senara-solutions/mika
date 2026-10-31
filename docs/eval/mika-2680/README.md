@@ -91,7 +91,7 @@ L'agrégat porte deux populations qui ne se soustraient pas l'une de l'autre :
 | moitié | champ | ce qu'elle dit |
 |---|---|---|
 | payée | `by_agent_trigger` | les tours qui ont **eu lieu**, par agent × déclencheur, avec leur coût |
-| payée | `charged_by_release` | **pourquoi** chacun a eu lieu, par terme de relâche (dix valeurs, vol 4) |
+| payée | `charged_by_release` | **pourquoi** chacun a eu lieu, par terme de relâche (dix-huit valeurs, vol 4 puis mika#2854 et mika#2917 — table au § *Taxonomie servie*) |
 | payée | `by_agent_trigger_release` | les deux à la fois : agent × déclencheur × terme de relâche, **avec le coût en tokens** (vol 5) |
 | payée | `charged_by_outcome` | **ce que** chaque tour a fait, par issue attestée (huit valeurs, mika#2855) |
 | payée | `by_agent_trigger_release_outcome` | les quatre clés : agent × déclencheur × relâche × issue, **avec le coût en tokens** (mika#2855) |
@@ -198,6 +198,73 @@ l'essentiel, les tours Telegram et CLI, qui ne passent pas par le registre. Leur
 seau existe pour que leur coût soit **visible et hors tableau**, pas pour être
 ajouté.
 
+### Taxonomie servie
+
+Les deux tables ci-dessous déclarent **toute** la taxonomie que le moteur sert
+dans `skipped_by_class` et `charged_by_release`. Elles ne sont pas une
+commodité de lecture : un détecteur les lit à l'exécution de la suite
+(`webhook_prefilter.rs § mod tests`, vol 7) et confronte chaque table à l'`enum`
+correspondante **dans les deux sens**. Une clé servie et non déclarée fait
+rougir la suite ; une ligne déclarée que le moteur ne sert plus la fait rougir
+aussi. C'est ce second sens qui fait que ces tables se nettoient d'elles-mêmes
+au lieu de devenir un inventaire périmé (mika#2309).
+
+Les marqueurs HTML qui encadrent chaque table sont l'ancrage du détecteur. Ne
+les retire pas, et ne pose pas de clé hors de leur intervalle : le document cite
+ailleurs des termes côté lecture qui ressemblent à des clés sans en être
+(`absent_pre_field`, `outcome_line_absent`), et le § 10 énumère les huit valeurs
+d'un **troisième** axe, `charged_by_outcome`, que ces tables ne couvrent pas.
+
+**Axe `skipped_by_class` — les quatorze classes d'écart (`PrefilterClass`).**
+
+<!-- taxonomie-servie:debut axe=classe -->
+
+| clé de fil | axe | ce que la classe écarte |
+|---|---|---|
+| `green_check_suite_default_branch` | `skipped_by_class` | (a) `check_suite` verte sur la branche par défaut, aucune tâche active sur cette branche. |
+| `inert_label` | `skipped_by_class` | (d) un label qu'aucune partie de la boucle ne lit. |
+| `verdict_hold_tracked` | `skipped_by_class` | (c) `hold[review]` sans tâche : `hold_review_without_task` a déjà notifié l'opérateur et écrit sa ligne d'audit. |
+| `verdict_non_reviewer` | `skipped_by_class` | (c) un `pass` posé par une identité qui n'est pas le relecteur QA. |
+| `verdict_unreadable` | `skipped_by_class` | (c) la ligne `VERDICT:` est présente mais illisible. |
+| `verdict_pr_closed` | `skipped_by_class` | (c) la PR est fermée ou mergée côté forge : il n'y a plus rien à décider. |
+| `green_check_suite_head_decided` | `skipped_by_class` | (b) `check_suite` verte sur une tête déjà décidée par DECISION-CORE et notifiée. **Se somme avec (g′)** — voir § 11. |
+| `red_check_suite_default_branch` | `skipped_by_class` | (a rouge) `check_suite` en échec ou `timed_out` sur la branche par défaut, sans tâche active (mika#2683). |
+| `ci_failure_no_open_pr` | `skipped_by_class` | (c) CI rouge d'une branche qui n'a pas de PR ouverte. |
+| `ci_failure_surfaced_for_adoption` | `skipped_by_class` | (c) CI rouge d'une PR sans tâche : `surface_for_adoption` a déjà notifié (mika#1745). |
+| `ci_failure_task_not_in_progress` | `skipped_by_class` | (c) CI rouge d'une PR dont la tâche n'est pas `in_progress`. |
+| `pr_closed_no_loop_task` | `skipped_by_class` | (e) `closed`/`merged` d'une PR sans tâche de boucle active (mesurée à n=2 : 193 k puis 279 k tokens d'entrée). |
+| `comment_triaged_note` | `skipped_by_class` | (h) `issue_comment` ou `issues closed` sur un ticket sans tâche de boucle, dont le triage n'a trouvé **aucune décision actionnable**. Seule classe dont la décision passe par un modèle ; livrée **désarmée** (mika#2854). |
+| `green_check_suite_head_already_reviewed` | `skipped_by_class` | (g′) `check_suite` verte sur une tête que le skill `qa-review-webhook-success` a **déjà traitée**, lue sur le registre que ce skill écrit (mika#2917). **Se somme avec (b)** — voir § 11. |
+
+<!-- taxonomie-servie:fin axe=classe -->
+
+**Axe `charged_by_release` — les dix-huit termes de relâche (`Release`).**
+
+<!-- taxonomie-servie:debut axe=relache -->
+
+| clé de fil | axe | pourquoi le tour a lieu |
+|---|---|---|
+| `switch_disarmed` | `charged_by_release` | L'interrupteur du pré-filtre est désarmé : `skip_turn` rend la main sans rien classer. |
+| `not_classified` | `charged_by_release` | `classify` n'a reconnu aucune population candidate. Le gros du trafic, et le dénominateur de toute mesure de couverture. |
+| `text_touched` | `charged_by_release` | Un handler a réécrit le texte dans la fenêtre que la classe exige : le tour a lieu parce que le texte n'est plus celui que la classe sait lire. |
+| `branch_task_active` | `charged_by_release` | (a) une tâche vit sur la branche par défaut : son état est à prendre en compte. |
+| `pr_task_active` | `charged_by_release` | (c) revue et (e) `PR closed` : une tâche vit sur la PR. Deux sites, un seul terme — même prédicat, même clé. |
+| `pr_open` | `charged_by_release` | (c) revue : la PR est `Open` et aucun des termes lus dans le texte n'a mordu. |
+| `no_terminal_trace` | `charged_by_release` | (c) CI rouge : l'audit ne porte aucune trace terminale reconnue. |
+| `no_decision_attested` | `charged_by_release` | (b) aucune ligne DECISION-CORE dans l'audit : il n'y a aucune tête à comparer. |
+| `head_not_previously_decided` | `charged_by_release` | (b) la tête n'a pas d'attestation antérieure : c'est son premier traitement. |
+| `state_unreadable` | `charged_by_release` | Un état est illisible et le tour a lieu (AC3, fail-open). **Un seul** terme pour les cinq sites d'appel : le champ `what` du `warn!` nomme déjà le prédicat. |
+| `triage_escalated` | `charged_by_release` | (h) le triage a lu une décision actionnable. **Numérateur du taux d'escalade** : `triage_escalated / (triage_escalated + comment_triaged_note)`. |
+| `triage_unreadable` | `charged_by_release` | (h) le triage n'a rendu aucun verdict exploitable (transport, délai, hors grammaire, aucun fournisseur) : fail-open. |
+| `issue_task_active` | `charged_by_release` | (h) un vol est déjà en cours sur ce ticket : aucun triage n'est appelé. |
+| `triage_disarmed` | `charged_by_release` | (h) `MIKA_WEBHOOK_COMMENT_TRIAGE` absent ou `off` : la classe est livrée désarmée (mika#2854). |
+| `closure_snapshot_absent` | `charged_by_release` | (h) la moitié fermeture est armée et pourtant aucun instantané n'existe : le site de capture n'a pas tourné. **Zéro attendu** — voir § 11. |
+| `reviewed_head_absent` | `charged_by_release` | (g′) le payload nomme une PR et sa tête, et le registre du skill ne porte aucune ligne pour cette tête. **Terme nominal du régime**, pas une panne — voir § 11. |
+| `reviewed_head_out_of_contract` | `charged_by_release` | (g′) le registre a répondu hors contrat : le défaut est chez l'écrivain, pas dans la base. **Zéro attendu** — voir § 11. |
+| `reviewed_head_switch_disarmed` | `charged_by_release` | (g′) l'interrupteur de la classe est à `off` : (b) décide seule. **Zéro attendu** — voir § 11. |
+
+<!-- taxonomie-servie:fin axe=relache -->
+
 ## 5. La halte — deux raisons de refuser de conclure
 
 Un chiffre pris dans l'une de ces deux conditions ressemble à un résultat et n'en
@@ -277,19 +344,19 @@ ne s'implémente pas : elle se pose à l'opérateur.
   lèvent chacune de ces ambiguïtés : c'est cette propriété, et non une économie
   de fichiers, qui autorise ses quatre assertions à partager une entrée.
 
-## 9. L'état des quatre classes, après les vols 3 à 5
+## 9. L'état des quatre classes, après les vols 3 à 7
 
 Le § 7 dit ce que le vol 3 *fait* de l'artefact. Le § 2 bis dit pourquoi
 l'artefact n'est pas à sa portée. Ce qui suit est donc l'état réel, classe par
 classe — et **les quatre raisons ne sont pas la même raison** : c'est tout
 l'intérêt du tableau.
 
-| classe | déclencheur | état après les vols 3 à 5 | ce qui décide de cet état |
+| classe | déclencheur | état après les vols 3 à 7 | ce qui décide de cet état |
 |---|---|---|---|
 | **(e)** `closed`/`merged` d'une PR sans tâche de boucle | `pr_closed` | **implémentée** (`pr_closed_no_loop_task`) | la mesure 3 ne pouvait pas changer son chiffre |
 | **(f)** `pr_review` sur une PR fermée au texte réécrit par le `verdict_handler` | `pr_review` + `charged_by_release` | **couverte par (c) pour les deux formes citées** ; résidu = une décision AC2 et trois chemins non-filtres | le code servi, relu — pas une mesure |
-| **(g)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **bloquée par la mesure** ; sa soustraction est lisible sur l'agrégat depuis le vol 5 | la mesure 3 est sa condition d'existence |
-| **(h)** `issue_comment` / `issues_closed` sans tâche de boucle | `issue_comment`, `issues_closed` | **posée à l'opérateur** | aucune mesure ne la tranche |
+| **(g′)** `check_suite success` sur branche de PR, côté mika-qa | `check_suite_pr_branch` | **implémentée** sous la forme (a) (`green_check_suite_head_already_reviewed`, mika#2917) ; il reste son **AC4**, qui est une mesure et non du code | la forme (a) a été chiffrée faisable, puis livrée ; l'AC4 est un geste opérateur |
+| **(h)** `issue_comment` / `issues_closed` sans tâche de boucle | `issue_comment`, `issues_closed` | **implémentée désarmée** (`comment_triaged_note`, mika#2854) : `MIKA_WEBHOOK_COMMENT_TRIAGE` est `off` par défaut | la question posée à l'opérateur a été tranchée par un triage modèle, et l'armement reste sa décision |
 
 **(e) — pourquoi elle part sans l'artefact.** Le retrait que le § 7.1 prescrit
 (« après retrait de ce que `skipped_by_class` montre déjà écarté par (a)–(d) »)
@@ -332,13 +399,13 @@ Trois de ces quatre chemins **ne sont pas des filtres** : les toucher reviendrai
 c'est pourquoi (f) ne passe pas de « renvoyée » à « implémentée » mais de
 « renvoyée » à **tranchée** : il n'y a pas de classe (f) à écrire.
 
-**(g) — la mesure n'est pas un confort, c'est sa condition.** Son plafond se
-superpose à ce que (b) écarte déjà : la mesure 2 le dit en toutes lettres,
+**(g) — la mesure n'était pas un confort, c'était sa condition.** Son plafond se
+superposait à ce que (b) écarte déjà : la mesure 2 le dit en toutes lettres,
 aucune `check_suite` de branche de PR n'avait été vue depuis le déploiement de
 `e14ace7f`, donc un chiffrage pris là aurait compté comme à filtrer ce que (b)
 écarte. Et la question du § 7.2 — *que fait mika-qa de ce tour ?* — porte sur un
-agent dont le fan-out est délibéré (mika#1711). Les deux termes manquent, et les
-deux sont dans l'artefact.
+agent dont le fan-out est délibéré (mika#1711). Les deux termes manquaient, et
+les deux étaient dans l'artefact. Ils y sont depuis le vol 6.
 
 **Ce que le vol 4 change pour (g) : la soustraction devient nommable.** Avant lui,
 `by_agent_trigger` donnait le plafond de (g) — les `check_suite_pr_branch` payées
@@ -361,18 +428,46 @@ de sa soustraction vivaient donc sur deux axes qui ne se rencontraient pas, et
 les croiser demandait un `jq` à la main sur le fichier de tours. Depuis le
 vol 5, `by_agent_trigger_release` est cette cellule, avec son coût en tokens :
 la ligne `mika-qa × check_suite_pr_branch × head_not_previously_decided` **est**
-la réponse, lue sur le seul agrégat. La mesure 3 reste la condition de (g) — les
-vols 4 et 5 lui fournissent l'opérande qui manquait et le grain où le lire, ils
-ne la remplacent pas.
+la réponse, lue sur le seul agrégat. La mesure 3 est restée la condition de (g) —
+les vols 4 et 5 lui ont fourni l'opérande qui manquait et le grain où le lire,
+ils ne l'ont pas remplacée.
 
-**(h) — le plus gros volume, et le seul blocage qui ne soit pas un chiffre.**
-1,30 M tokens, 79 % de la fenêtre de la mesure 2 : le volume est établi. Ce qui
-manque n'est pas une mesure mais une **réponse** : le tour met à jour la mémoire
-et le fil de priorités, et savoir si ce travail survit sans tour LLM est un
-jugement sur ce que le tour fait, pas sur ce qu'il coûte. Le § 7 le tranche déjà
+**Ce que les vols 6 et 7 changent : (g′) est livrée, et ce qui reste est une
+mesure.** La mesure 3 a eu lieu le 2026-10-19, hors bac à sable, avec la commande
+exacte du § 3 : la cellule `mika-qa × check_suite_pr_branch` est entièrement en
+`no_decision_attested`, 36 tours pour 10,69 M tokens d'entrée, soit 16,3 % de la
+fenêtre. Bearing Prime a ratifié le filtrage le 2026-10-26 et arbitré la forme :
+la forme **(a)** — un pré-filtre qui n'utilise que le payload `check_suite` et le
+compare, **en lecture seule**, à l'état de dedup que le skill écrit — a été
+chiffrée faisable, et c'est elle que mika#2917 a livrée sous la classe
+`green_check_suite_head_already_reviewed`. La classe est donc **du code servi**,
+plus une attente de mesure. Ce qui reste d'elle est son **AC4** : lire, sur une
+fenêtre servie, que la classe écarte réellement la population visée. C'est une
+mesure, pas une implémentation, et le § 11 dit les trois choses qu'il faut savoir
+avant de conclure sur elle — au premier rang desquelles que **(b) et (g′) se
+somment** : lire (b) seule montrerait un transfert de population comme une
+régression (mika#2205).
+
+**(h) — le plus gros volume, et le seul blocage qui n'était pas un chiffre.**
+1,30 M tokens, 79 % de la fenêtre de la mesure 2 : le volume était établi. Ce qui
+manquait n'était pas une mesure mais une **réponse** : le tour met à jour la
+mémoire et le fil de priorités, et savoir si ce travail survit sans tour LLM est
+un jugement sur ce que le tour fait, pas sur ce qu'il coûte. Le § 7 le tranchait
 en une phrase — *une classe dont le chiffre est significatif mais dont la
-question reste ouverte ne s'implémente pas : elle se pose à l'opérateur.* Elle
-est posée dans le corps de PR du vol 3.
+question reste ouverte ne s'implémente pas : elle se pose à l'opérateur* — et
+elle a été posée dans le corps de PR du vol 3.
+
+**La réponse est venue sous la forme d'un triage, et la classe est livrée
+désarmée.** mika#2854 a livré `comment_triaged_note` : sur un `issue_comment` ou
+un `issues closed` sans tâche de boucle, un **modèle** lit le fil et dit s'il
+porte une décision actionnable. C'est la seule classe du pré-filtre dont la
+décision passe par un modèle — d'où `triage_escalated` quand il en trouve une,
+`triage_unreadable` quand il ne rend rien d'exploitable (fail-open), et un taux
+d'escalade `triage_escalated / (triage_escalated + comment_triaged_note)` qui est
+le chiffre à surveiller. Mesure du vol : 13 tours, 1 007 748 tokens d'entrée sur
+la fenêtre du 2026-10-19. **`MIKA_WEBHOOK_COMMENT_TRIAGE` est `off` par
+défaut** : l'armement reste la décision de l'opérateur, et `triage_disarmed` est
+ce qui le rend lisible plutôt que silencieux.
 
 ## 10. (g′) — l'axe `outcome`, et ce que la prochaine fenêtre chiffrera (mika#2855)
 
@@ -505,3 +600,67 @@ Elle doit rendre une ligne après le premier `check_suite` vert servi à mika-qa
 n'existe pour aucun agent avant ce rebuild. Un silence de la sonde se lit donc
 dans cet ordre — d'abord *quel binaire tourne*, ensuite seulement *ce que les
 tours ont attesté*.
+
+## 11. Lire l'AC4 de (g′) — trois choses à savoir avant de conclure
+
+L'AC4 de (g′) est une **mesure**, pas du code : la classe
+`green_check_suite_head_already_reviewed` est servie depuis mika#2917, et ce qui
+reste est de lire, sur une fenêtre servie, qu'elle écarte bien la population
+visée. Les trois lectures ci-dessous ne sont pas des précautions de style : sans
+elles, l'agrégat rend des chiffres qui ressemblent à des résultats et disent le
+contraire de ce qui se passe.
+
+### 11.1 (b) et (g′) se somment — la quantité conservée est leur somme
+
+(g′) est consultée **avant** (b). Un `check_suite` vert sur une tête que les deux
+classes sauraient écarter s'inscrit donc désormais sous
+`green_check_suite_head_already_reviewed`, et plus sous
+`green_check_suite_head_decided`. **Le transfert de population est attendu, et il
+n'est pas une régression.**
+
+La quantité conservée est :
+
+```
+green_check_suite_head_decided + green_check_suite_head_already_reviewed
+```
+
+jamais l'une des deux. Un lecteur qui suit (b) seule à travers le déploiement de
+mika#2917 verra son compte baisser et lira une régression du filtre là où il n'y
+a qu'un déplacement entre deux seaux — exactement la classe d'erreur de
+mika#2205 : deux populations sous un même nom ne sont pas soustractibles, et deux
+noms dont la somme est l'invariant ne se lisent pas séparément.
+
+Conséquence pratique pour la mesure : si la fenêtre chevauche le déploiement,
+`charged_by_release` n'est pas comparable terme à terme de part et d'autre. Prends
+une fenêtre **entièrement postérieure**, ou lis la somme.
+
+### 11.2 Trois termes dont le régime attendu est zéro — et ce qu'un non-zéro nomme
+
+Ces trois-là valent **zéro** en régime nominal, et c'est ce zéro qui atteste le
+câblage. Un non-zéro ne dit pas « la classe filtre mal » : il nomme un défaut
+précis, et à chaque fois **ailleurs** que là où on le chercherait d'instinct.
+
+| terme | ce qu'un non-zéro nomme | où va le diagnostic |
+|---|---|---|
+| `reviewed_head_out_of_contract` | l'écrivain a écrit hors contrat — le registre a répondu quelque chose que cette liste ne prévoit pas | dans le **prompt du skill**, pas dans SQLite. Les fusionner avec un autre terme enverrait le diagnostic vers la base quand le défaut est dans le prompt (mika#2205) |
+| `reviewed_head_switch_disarmed` | un **armement oublié** : l'interrupteur de la classe est à `off` alors que la mesure la suppose active | dans la configuration servie. Sans ce terme, un désarmement oublié ressemblerait à un registre muet |
+| `closure_snapshot_absent` | le **site de capture** de (h) n'a pas tourné, alors que la moitié fermeture est armée | dans le câblage de (h), pas dans son triage |
+
+Un zéro sur ces trois termes est donc une **information positive**, pas une
+absence de donnée : il dit que la classe tourne, que l'outil et cette liste
+s'accordent, et que le site de capture a bien tourné.
+
+### 11.3 `reviewed_head_absent` est le terme nominal — son effondrement serait le symptôme
+
+`reviewed_head_absent` se lit à l'envers des trois précédents. Il dit : le payload
+nommait une PR et sa tête, et le registre du skill ne portait **aucune ligne**
+pour cette tête. C'est le cas d'une tête vue pour la première fois — donc **le
+régime, et non une panne**. Un volume franc sur ce terme est le signe que la
+classe est consultée sur la bonne population.
+
+**C'est son effondrement à zéro qui serait le symptôme à craindre, pas sa
+présence.** Un `reviewed_head_absent` qui tombe à zéro sans que
+`green_check_suite_head_already_reviewed` monte d'autant veut dire que la classe
+n'est plus consultée du tout — et c'est la seule lecture de cet axe où zéro est
+une mauvaise nouvelle. Ne la confonds pas avec les trois termes du § 11.2, où
+zéro est l'attestation.
