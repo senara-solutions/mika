@@ -1958,6 +1958,99 @@ mod tests {
         );
     }
 
+    /// mika#2961 — un marqueur de contexte déclaré est injecté EXACTEMENT une fois.
+    ///
+    /// `apply_context_replacements` (`skills/context.rs`) est un `replace_all` :
+    /// chaque occurrence de `{{clé}}` dans le prompt reçoit une copie COMPLÈTE du
+    /// contenu résolu, annotation comprise. Le 2026-10-31, la base de `qa-review`
+    /// portait `{{pr_diff}}` deux fois — le vrai bloc et une citation du marqueur
+    /// au milieu de la règle `DEPTH` (mika#1359) — et la revue de mika#2992 a payé
+    /// 2 × 76 401 octets de diff dans un prompt de 230 673. La citation datait du
+    /// 2026-06-01 et n'avait jamais coûté : la variante `generated/` servie jusqu'au
+    /// 2026-10-31 ne portait aucun marqueur, donc ce prompt-là n'injectait rien du
+    /// tout. C'est la variante périmée qui masquait le doublon, et le retour à la
+    /// base qui l'a révélé.
+    ///
+    /// Les deux sens de l'arité sont des défauts. `>= 2` est la duplication
+    /// ci-dessus ; `0` est le contexte dispatché, résolu, et jamais consommé —
+    /// l'état que la variante périmée a tenu quatre mois, où la QA rendait une
+    /// ligne `DEPTH:` sans aucun bloc sous les yeux. Un détecteur qui n'accepterait
+    /// que « ≤ 1 » laisserait passer la moitié du défaut.
+    ///
+    /// L'assertion porte sur les octets **embarqués** : `all_bundled_skills()` rend
+    /// ce que `build.rs` a compilé dans le binaire, c'est-à-dire exactement le texte
+    /// que `apply_context_replacements` reçoit quand la base est servie. Le défaut
+    /// est né dans le texte servi ; le détecteur le lit là, et non dans l'arbre du
+    /// dépôt.
+    ///
+    /// **Portée, et sa borne.** Le détecteur ne juge QUE les clés déclarées en
+    /// `[context.*]`, et QUE le fichier `system_prompt.md`. Un marqueur non déclaré
+    /// (`{{foo}}` sans `[context.foo]`) est hors portée à dessein : il n'est pas
+    /// substitué — les clés inconnues restent telles quelles — donc il ne coûte
+    /// rien. Une éventuelle variante de prompt embarquée sous un autre nom de
+    /// fichier est hors portée aussi : borne inférieure assumée.
+    #[test]
+    fn mika2961_un_marqueur_de_contexte_declare_est_injecte_exactement_une_fois() {
+        let mut declared = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+
+        for skill in all_bundled_skills() {
+            let Some(toml_src) = skill.files.iter().find(|f| f.path == "skill.toml") else {
+                continue;
+            };
+            let manifest: crate::skills::manifest::SkillManifest = toml::from_str(toml_src.content)
+                .unwrap_or_else(|e| panic!("{} skill.toml must parse: {e}", skill.name));
+            if manifest.context.is_empty() {
+                continue;
+            }
+            let prompt = skill
+                .files
+                .iter()
+                .find(|f| f.path == "system_prompt.md")
+                .map(|f| f.content)
+                .unwrap_or("");
+
+            for key in manifest.context.keys() {
+                declared += 1;
+                let marker = format!("{{{{{key}}}}}");
+                let count = prompt.matches(marker.as_str()).count();
+                if count != 1 {
+                    let lines: Vec<usize> = prompt
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, l)| l.contains(&marker))
+                        .map(|(i, _)| i + 1)
+                        .collect();
+                    violations.push(format!(
+                        "{}: `{marker}` déclaré en [context.{key}] apparaît {count} fois \
+                         (lignes {lines:?}) — attendu exactement 1",
+                        skill.name
+                    ));
+                }
+            }
+        }
+
+        // Assertion de population non vide, et elle vient d'abord : sans elle, le
+        // détecteur est vert le jour où la découverte de `build.rs` casse, ou le
+        // jour où le dernier `[context.*]` disparaît — c'est-à-dire exactement le
+        // jour où un vert cesse de vouloir dire « aucune violation ».
+        assert!(
+            declared > 0,
+            "population vide — aucun skill bundled ne déclare de [context.*] : le \
+             détecteur ne compte plus rien, vérifier la découverte de build.rs avant \
+             de croire ce test vert"
+        );
+
+        violations.sort();
+        assert!(
+            violations.is_empty(),
+            "arité de marqueur de contexte violée — chaque occurrence au-delà de la \
+             première fait injecter une copie COMPLÈTE du contenu résolu, et zéro \
+             occurrence fait résoudre un contexte que personne ne lit :\n{}",
+            violations.join("\n")
+        );
+    }
+
     /// Engine post-condition guards (agent.rs, engine.rs, executor.rs) reference
     /// these skill tool names by string literal. The guards fire regardless of
     /// which skills are loaded — a missing tool means the guard silently no-ops
