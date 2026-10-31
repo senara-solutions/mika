@@ -4647,6 +4647,15 @@ pub(crate) mod tests {
     /// il ne sait rien de l'énumération, donc une variante ajoutée sans cas le
     /// laisse vert.
     ///
+    /// **La liste n'est plus écrite ici** (vol 7) : elle vient de
+    /// [`tous_les_termes_de_relache`], qui la dérive de la chaîne
+    /// [`Taxonomie::suivante`] — un second `match` sans bras `_`. Le tableau
+    /// littéral de dix-huit variantes qui vivait à cet endroit était une
+    /// troisième liste à tenir à jour, et la seule des trois qu'un oubli
+    /// laissait verte : une variante ajoutée à l'énumération et à
+    /// `cas_de_relache` mais pas au tableau n'était tout simplement jamais
+    /// exercée.
+    ///
     /// La base est réelle et vide : les dix-huit termes rendent tous **avant**
     /// la ligne d'audit, donc rien n'y est écrit — `skip_turn` n'en demande une
     /// que pour l'`agent_id` de sa ligne `info!`.
@@ -4662,26 +4671,7 @@ pub(crate) mod tests {
     async fn mika2680_la_relache_atteint_chacun_de_ses_dix_huit_termes() {
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
 
-        for terme in [
-            Release::SwitchDisarmed,
-            Release::NotClassified,
-            Release::TextTouched,
-            Release::BranchTaskActive,
-            Release::PrTaskActive,
-            Release::PrOpen,
-            Release::NoTerminalTrace,
-            Release::NoDecisionAttested,
-            Release::HeadNotPreviouslyDecided,
-            Release::StateUnreadable,
-            Release::TriageDisarmed,
-            Release::IssueTaskActive,
-            Release::TriageEscalated,
-            Release::TriageUnreadable,
-            Release::ClosureSnapshotAbsent,
-            Release::ReviewedHeadAbsent,
-            Release::ReviewedHeadOutOfContract,
-            Release::ReviewedHeadSwitchDisarmed,
-        ] {
+        for terme in tous_les_termes_de_relache() {
             let (texte, state, touched, enabled, triage) = cas_de_relache(terme);
             let _garde = comment_triage::TriageEnvGuard::armed(triage);
             let _garde_g =
