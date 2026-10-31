@@ -3743,6 +3743,100 @@ _stash_and_remove_worktree() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _branch_cumulative_absorbed — le patch CUMULÉ de la branche est-il sur `main` ?
+#
+# mika#2976 vol 2, plan § 1.4 et § 5.1. SITE UNIQUE de l'étage E2. Le vol 1
+# comparait le patch-id de CHAQUE commit ; un squash fusionne N patchs en un
+# seul, dont le patch-id n'égale celui d'aucun des N, et chaque vol porte au
+# moins deux commits (le plan puis le code). Tout vol suivant s'arrêtait donc
+# en `BRANCH_HAS_UNMERGED_WORK` (mika#2958, 2026-10-31, `59010336a` contre le
+# squash `fcb5148fd`). Ici l'unité de comparaison est le diff
+# `merge_base..tip` : mesuré, son patch-id est exactement celui du squash
+# (`402470424f…`). Les deux côtés sont calculés en `-U0` : `patch-id --stable`
+# ignore numéros de ligne et espaces mais hache le contexte, et le contexte est
+# précisément ce que le rebase d'un squash avant son atterrissage peut changer.
+#
+# Deux critères écartés par la mesure, à ne pas réessayer : le diff
+# `origin/main` contre la tête, restreint aux fichiers de la branche, n'est pas
+# directionnel (il voit le retard de la branche comme du travail) ; et
+# `merge-tree --write-tree origin/main <tip>` conflicte dès que `main` a réécrit
+# les mêmes lignes après l'atterrissage.
+#
+# Args : $1 repo_dir, $2 tip (un sha)
+# Rend 0 si le patch cumulé est retrouvé sur `main` (ou vide), 1 sinon.
+# Pose `_BRANCH_CUMULATIVE_REASON` : absorbed | empty_patch | no_merge_base |
+#   window_too_large | unreadable_patch_id | not_found. Seul `not_found` est
+#   du travail réel ; les autres sont des non-mesures, et aucune ne vaut
+#   absorption — une non-mesure qui vaudrait `spent` ferait réinitialiser une
+#   branche dont on ne sait rien.
+#
+# Le plafond de la fenêtre balayée : 1,77 s mesurées pour 600 commits le
+# 2026-10-31, donc ~3 s au plafond. Une constante nommée, pas un littéral au
+# site d'usage, pour survivre à la prochaine recalibration.
+_BRANCH_REUSE_WINDOW_MAX=1000
+
+_branch_cumulative_absorbed() {
+    local repo_dir="${1-}" tip="${2-}"
+    local merge_base="" window="" max="" cum="" scan=""
+    _BRANCH_CUMULATIVE_REASON=""
+
+    merge_base=$(git -C "$repo_dir" merge-base origin/main "$tip" 2>/dev/null) || merge_base=""
+    if [ -z "$merge_base" ]; then
+        _BRANCH_CUMULATIVE_REASON="no_merge_base"
+        return 1
+    fi
+
+    # Le coût se mesure AVANT de le payer. Un plafond illisible est traité
+    # comme dépassé : la non-mesure arrête, elle ne réinitialise pas.
+    max="${_BRANCH_REUSE_WINDOW_MAX-}"
+    window=$(git -C "$repo_dir" rev-list --count "$merge_base..origin/main" 2>/dev/null) || window=""
+    case "$max" in ''|*[!0-9]*) _BRANCH_CUMULATIVE_REASON="window_too_large"; return 1 ;; esac
+    case "$window" in ''|*[!0-9]*) _BRANCH_CUMULATIVE_REASON="unreadable_patch_id"; return 1 ;; esac
+    if [ "$window" -gt "$max" ]; then
+        _BRANCH_CUMULATIVE_REASON="window_too_large"
+        return 1
+    fi
+
+    # Le diff vide se décide sur le DIFF, pas sur le silence de `patch-id` :
+    # `patch-id` rend zéro ligne sur un diff vide, et zéro ligne est aussi ce
+    # qu'une erreur produit. Une branche qui n'apporte rien n'a rien à perdre.
+    if git -C "$repo_dir" diff --quiet "$merge_base" "$tip" 2>/dev/null; then
+        _BRANCH_CUMULATIVE_REASON="empty_patch"
+        return 0
+    fi
+
+    # `-U0` des DEUX côtés, et ce n'est pas un détail. `patch-id --stable`
+    # ignore numéros de ligne et espaces, mais il HACHE les lignes de contexte.
+    # Un commit tiers atterri sur `main` entre la merge-base et le squash, à
+    # trois lignes ou moins d'un hunk de la branche, change le contexte du
+    # squash et donc son patch-id : en `-U3`, une branche entièrement absorbée
+    # sortait `not_found`, c'est-à-dire `work` (relevé par la revue du vol 2,
+    # reproduit : `854db6a4…` contre `4259ad0b…` en `-U3`, `eede3fa7…` des deux
+    # côtés en `-U0`). Sans contexte, le patch-id ne porte que les noms de
+    # fichiers et les lignes ajoutées et retirées : le contenu, rien d'autre.
+    cum=$(git -C "$repo_dir" diff -U0 "$merge_base" "$tip" 2>/dev/null \
+        | git -C "$repo_dir" patch-id --stable 2>/dev/null | awk 'NR == 1 {print $1}')
+    case "$cum" in ''|*[!0-9a-f]*) _BRANCH_CUMULATIVE_REASON="unreadable_patch_id"; return 1 ;; esac
+
+    # `--no-merges` explicite : un merge n'a pas de patch-id exploitable, et un
+    # squash n'est jamais un merge. Les patch-ids sont capturés AVANT le `grep -q`,
+    # jamais pipés dedans : `grep -q` sort au premier match, et sous `pipefail`
+    # le producteur tué par SIGPIPE ferait lire 141 comme `not_found` (mika#2055).
+    local ids=""
+    if ! scan=$(git -C "$repo_dir" log -p -U0 --no-merges "$merge_base..origin/main" 2>/dev/null); then
+        _BRANCH_CUMULATIVE_REASON="unreadable_patch_id"
+        return 1
+    fi
+    ids=$(printf '%s\n' "$scan" | git -C "$repo_dir" patch-id --stable 2>/dev/null) || ids=""
+    if grep -q "^$cum " <<<"$ids"; then
+        _BRANCH_CUMULATIVE_REASON="absorbed"
+        return 0
+    fi
+    _BRANCH_CUMULATIVE_REASON="not_found"
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _branch_reuse_verdict — cette branche porte-t-elle un travail EN COURS ?
 #
 # mika#2976. Trois `REBASE_CONFLICT` mesurés en huit jours — mika#1727 le
@@ -3822,6 +3916,12 @@ _stash_and_remove_worktree() {
 #   _BRANCH_REUSE_COMMITS  — `<sha> <sujet>` par ligne (la liste de l'AC3)
 #   _BRANCH_REUSE_TIPS     — les refs effectivement lues
 #   _BRANCH_REUSE_VERDICT  — le jeton, pour un appelant qui ne peut pas capturer
+#   _BRANCH_REUSE_CONTAINMENT — l'étage qui a conclu (vol 2, plan § 4) :
+#                            per_commit | cumulative | work | unmeasured | none
+#   _BRANCH_REUSE_REASON   — la raison d'E2 sur un tip en péril
+#   _BRANCH_REUSE_CURRENT  — le compte de commits postérieurs au merge (AC8),
+#                            `unmeasured` si l'instant est illisible, `none` hors P2
+#   _BRANCH_REUSE_STALE    — la ref de suivi écartée comme périmée (AC9), ou `none`
 #
 # `_branch_reuse_emit <jeton>` — le jeton part sur stdout ET dans
 # `_BRANCH_REUSE_VERDICT`. Les deux, parce qu'ils servent deux lecteurs : un
@@ -3844,6 +3944,10 @@ _branch_reuse_verdict() {
     _BRANCH_REUSE_COMMITS=""
     _BRANCH_REUSE_TIPS="none"
     _BRANCH_REUSE_VERDICT=""
+    _BRANCH_REUSE_CONTAINMENT="none"
+    _BRANCH_REUSE_REASON=""
+    _BRANCH_REUSE_CURRENT="none"
+    _BRANCH_REUSE_STALE="none"
 
     if [ -z "$repo_dir" ] || [ -z "$repo" ] || [ -z "$branch" ]; then
         _branch_reuse_emit undetermined
@@ -3853,7 +3957,7 @@ _branch_reuse_verdict() {
     # --- P1 : le verdict des PR -------------------------------------------
     local pr_json=""
     pr_json=$(gh pr list --head "$branch" --repo "senara-solutions/$repo" --state all \
-        --json number,state --limit 20 2>/dev/null) || {
+        --json number,state,mergedAt,closedAt --limit 20 2>/dev/null) || {
         _branch_reuse_emit undetermined
         return 0
     }
@@ -3884,11 +3988,54 @@ _branch_reuse_verdict() {
         return 0
     fi
 
+    # --- P1 bis : l'instant de fermeture de la dernière PR terminale ------
+    #
+    # mika#2976 AC8 (plan § 13.2). Un commit daté APRÈS cet instant est le vol
+    # COURANT — le plan que le groom vient de frapper sur une branche recréée
+    # depuis `main` — et pas un travail laissé derrière. Sans cette partition,
+    # tout dispatch de dev-pilot d'un vol suivant s'arrête sur son propre plan
+    # (relevé du 2026-10-31, dev-pilot 0be4647a, plan 0c9203aaf, #2985).
+    #
+    # La date et non la topologie : la tête mergée n'est pas un ancêtre d'une
+    # branche recréée depuis `main`, et un commit local jamais poussé avant le
+    # merge DESCEND de cette tête. Seule la date sépare ces deux populations.
+    # Les deux sens d'erreur sont sûrs : un antérieur réécrit par un rebase
+    # (date neuve) conduit à `live`, donc à la reprise, jamais à une
+    # réinitialisation ; un postérieur mal daté passe par E1 et E2, qui
+    # l'arrêtent s'il est absent de `main`.
+    #
+    # Instant illisible ⇒ AUCUN commit n'est postérieur : tout passe par E1/E2,
+    # le comportement d'avant l'AC8, qui arrête plutôt que de réinitialiser. La
+    # ligne le dit (`current=unmeasured`).
+    local closed_at=""
+    closed_at=$(printf '%s' "$pr_json" \
+        | jq -r '[.[] | (.mergedAt // .closedAt) | select(. != null and . != "") | fromdateiso8601] | max // empty' \
+        2>/dev/null) || closed_at=""
+    case "$closed_at" in
+        ''|*[!0-9]*) closed_at=""; _BRANCH_REUSE_CURRENT="unmeasured" ;;
+        *)           _BRANCH_REUSE_CURRENT="0" ;;
+    esac
+
     # --- P2 : la containment par patch-id, sur les DEUX refs --------------
-    local tips="" ref sha
+    local tips="" ref sha remote_rc
     for ref in "refs/heads/$branch" "refs/remotes/origin/$branch"; do
         sha=$(git -C "$repo_dir" rev-parse --verify --quiet "$ref" 2>/dev/null) || sha=""
         [ -n "$sha" ] || continue
+        # mika#2976 AC9 (plan § 13.3). Un `git fetch` sans `--prune` ne retire
+        # jamais une ref de suivi : restée sur l'ancienne tête après la
+        # suppression de la branche sur origin, elle suffisait à faire buter la
+        # porte. Le distant tranche, par le lecteur unique de mika#2626. Rc 1
+        # (il répond « absente ») : la ref est périmée, elle n'est pas lue, et la
+        # ligne la nomme. Rc 2 (il ne répond pas) : elle est lue comme avant, ce
+        # qui ne peut qu'arrêter — jamais réinitialiser sur une ignorance.
+        if [ "$ref" = "refs/remotes/origin/$branch" ]; then
+            remote_rc=0
+            _remote_branch_exists "$repo_dir" "$branch" || remote_rc=$?
+            if [ "$remote_rc" = "1" ]; then
+                _BRANCH_REUSE_STALE="$ref"
+                continue
+            fi
+        fi
         # Les deux refs coïncident dans le cas nominal : une seule lecture
         # suffit alors, et `_BRANCH_REUSE_TIPS` ne nomme que ce qui a été lu.
         case " $tips " in *" $sha "*) continue ;; esac
@@ -3908,30 +4055,93 @@ _branch_reuse_verdict() {
         return 0
     fi
 
-    local unmerged_lines="" tip log_out right read_failed=0
+    # Par tip : chaque commit absent de `main` est postérieur (vol courant,
+    # écarté du jugement) ou antérieur. Les antérieurs passent l'escalier du
+    # plan § 3 : E1 (aucun `>` parmi eux) puis E2 (leur patch CUMULÉ retrouvé
+    # sur `main`, ce qu'un squash de plusieurs commits exige). Le jeton de
+    # containment d'un tip dit quel étage a conclu, ou pourquoi aucun.
+    local unmerged_lines="" tip log_out right read_failed=0 posterior_shas=""
+    local mark csha ct subj anterior_n anterior_top anterior_count tip_token
+    local has_work=0 has_unmeasured=0 has_cumulative=0 has_per_commit=0
     for tip in $tips; do
         log_out=""
-        if ! log_out=$(git -C "$repo_dir" log --cherry-mark --right-only \
-                --format='%m %H %s' "origin/main...$tip" 2>/dev/null); then
+        if ! log_out=$(git -C "$repo_dir" log --cherry-mark --right-only --topo-order \
+                --format='%m %H %ct %s' "origin/main...$tip" 2>/dev/null); then
             read_failed=1
             break
         fi
-        right=$(printf '%s\n' "$log_out" | grep '^>' || true)
-        if [ -n "$right" ]; then
-            unmerged_lines="${unmerged_lines}${unmerged_lines:+
-}${right}"
+        right=""; anterior_n=0; anterior_top=""
+        while IFS=' ' read -r mark csha ct subj; do
+            [ -n "$csha" ] || continue
+            if [ -n "$closed_at" ] && [ "$ct" -gt "$closed_at" ] 2>/dev/null; then
+                case " $posterior_shas " in
+                    *" $csha "*) ;;
+                    *) posterior_shas="${posterior_shas}${posterior_shas:+ }$csha" ;;
+                esac
+                continue
+            fi
+            anterior_n=$((anterior_n + 1))
+            # `--topo-order` rend les enfants avant les parents : le premier
+            # antérieur lu est le plus haut.
+            [ -n "$anterior_top" ] || anterior_top="$csha"
+            if [ "$mark" = ">" ]; then
+                right="${right}${right:+
+}${csha} ${subj}"
+            fi
+        done <<<"$log_out"
+
+        if [ -z "$right" ]; then
+            tip_token="per_commit"
+        else
+            # E2 ne mesure que les antérieurs, donc leur patch cumulé doit être
+            # exactement `origin/main..$anterior_top`. Un postérieur entrelacé
+            # dessous le fausserait : c'est une non-mesure, pas une absorption.
+            anterior_count=$(git -C "$repo_dir" rev-list --count "origin/main..$anterior_top" 2>/dev/null) || anterior_count=""
+            if [ "$anterior_count" != "$anterior_n" ]; then
+                _BRANCH_CUMULATIVE_REASON="interleaved_flight"
+                tip_token="unmeasured"
+            elif _branch_cumulative_absorbed "$repo_dir" "$anterior_top"; then
+                tip_token="cumulative"
+            elif [ "${_BRANCH_CUMULATIVE_REASON:-}" = "not_found" ]; then
+                tip_token="work"
+            else
+                tip_token="unmeasured"
+            fi
         fi
+
+        case "$tip_token" in
+            per_commit) has_per_commit=1 ;;
+            cumulative) has_cumulative=1 ;;
+            work|unmeasured)
+                if [ "$tip_token" = "work" ]; then has_work=1; else has_unmeasured=1; fi
+                _BRANCH_REUSE_REASON="${_BRANCH_CUMULATIVE_REASON:-unknown}"
+                unmerged_lines="${unmerged_lines}${unmerged_lines:+
+}${right}"
+                ;;
+        esac
     done
     if [ "$read_failed" = "1" ]; then
         _branch_reuse_emit undetermined
         return 0
     fi
 
-    # L'union des `>` des deux refs, dédupliquée PAR SHA et dans l'ordre de
-    # lecture : une ref qui porte la moitié de la population ne doit pas doubler
-    # le compte de l'autre.
+    # Le jeton global est le plus informatif des jetons de tip : un seul tip en
+    # péril décide du verdict, donc il décide aussi du mot qui le nomme.
+    if [ "$has_work" = "1" ]; then _BRANCH_REUSE_CONTAINMENT="work"
+    elif [ "$has_unmeasured" = "1" ]; then _BRANCH_REUSE_CONTAINMENT="unmeasured"
+    elif [ "$has_cumulative" = "1" ]; then _BRANCH_REUSE_CONTAINMENT="cumulative"
+    elif [ "$has_per_commit" = "1" ]; then _BRANCH_REUSE_CONTAINMENT="per_commit"
+    fi
+
+    if [ "$_BRANCH_REUSE_CURRENT" != "unmeasured" ] && [ -n "$posterior_shas" ]; then
+        _BRANCH_REUSE_CURRENT=$(printf '%s\n' $posterior_shas | grep -c . || true)
+    fi
+
+    # L'union des antérieurs en péril des deux refs, dédupliquée PAR SHA et dans
+    # l'ordre de lecture : une ref qui porte la moitié de la population ne doit
+    # pas doubler le compte de l'autre.
     if [ -n "$unmerged_lines" ]; then
-        unmerged_lines=$(printf '%s\n' "$unmerged_lines" | sed 's/^> *//' | awk '!seen[$1]++')
+        unmerged_lines=$(printf '%s\n' "$unmerged_lines" | awk '!seen[$1]++')
     fi
 
     local unmerged_count=0
@@ -3943,6 +4153,13 @@ _branch_reuse_verdict() {
 
     if [ "$unmerged_count" -gt 0 ]; then
         _branch_reuse_emit unmerged_work
+        return 0
+    fi
+    # Tout l'antérieur est dans `main`. S'il reste un postérieur, la branche
+    # porte le vol courant : elle se reprend telle quelle, et surtout ne se
+    # réinitialise pas — ce serait détruire le plan du groom (AC8).
+    if [ -n "$posterior_shas" ]; then
+        _branch_reuse_emit live
         return 0
     fi
     _branch_reuse_emit spent
@@ -4063,7 +4280,7 @@ _branch_reuse_gate() {
             ;;
     esac
 
-    echo "[dispatch-lib] branch_reuse_gate: branch=${branch} verdict=${verdict} pr=${_BRANCH_REUSE_PR:-none} unmerged=${_BRANCH_REUSE_UNMERGED:-0} tips=${_BRANCH_REUSE_TIPS:-none} action=${action}" >&2
+    echo "[dispatch-lib] branch_reuse_gate: branch=${branch} verdict=${verdict} pr=${_BRANCH_REUSE_PR:-none} unmerged=${_BRANCH_REUSE_UNMERGED:-0} tips=${_BRANCH_REUSE_TIPS:-none} containment=${_BRANCH_REUSE_CONTAINMENT:-none} current=${_BRANCH_REUSE_CURRENT:-none} stale=${_BRANCH_REUSE_STALE:-none} action=${action}" >&2
 
     # --- La halte de l'AC3 ------------------------------------------------
     #
@@ -4079,7 +4296,8 @@ _branch_reuse_gate() {
     # nettoyage du relic — c'est la contrainte que ce placement achète.
     if [ "$action" = "halt" ]; then
         RESULT="STATUS=BRANCH_HAS_UNMERGED_WORK
-Branch ${branch} carries ${_BRANCH_REUSE_UNMERGED:-?} commit(s) absent from origin/main by patch-id, while its PRs are all terminal (${_BRANCH_REUSE_PR:-none}).
+Branch ${branch} carries ${_BRANCH_REUSE_UNMERGED:-?} commit(s) that origin/main contains neither commit-by-commit nor in a squashed patch (${_BRANCH_REUSE_REASON:-unknown}), while its PRs are all terminal (${_BRANCH_REUSE_PR:-none}).
+Commits dated after the last PR closed (current flight, not judged): ${_BRANCH_REUSE_CURRENT:-none}.
 Unmerged commits:
 ${_BRANCH_REUSE_COMMITS:-<none>}
 Nothing was reset, nothing was removed, nothing was stashed.
