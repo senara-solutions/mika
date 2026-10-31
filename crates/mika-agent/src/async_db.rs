@@ -1947,6 +1947,26 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Les dispatches de groom portant l'une des `issue_urls` (mika#2958,
+    /// vol 2c).
+    /// Voir [`crate::db::Database::list_groom_dispatches_in_container`] pour
+    /// l'ensemble fermé de variantes d'URL, les deux formes de ligne et le
+    /// statut qui sort **brut**. `issue_urls` vide ⇒ aucune ligne.
+    ///
+    /// **La seconde méthode de ce fichier qui ne lit pas `self.agent_id`**, et
+    /// pour la raison de la précédente (mika#2792) : le manager est une tâche de
+    /// processus sans agent, le handle ne sert que de connexion, et re-scoper la
+    /// lecture sur l'agent emprunté la rendrait constamment vide. L'invariant
+    /// est porté par le nom — `…_in_container` — faute de pouvoir l'être par le
+    /// type.
+    pub async fn list_groom_dispatches_in_container(
+        &self,
+        issue_urls: Vec<String>,
+    ) -> Result<Vec<crate::db::tasks::GroomDispatchRow>> {
+        self.with_db(move |db| db.list_groom_dispatches_in_container(&issue_urls))
+            .await
+    }
+
     // -- Sessions --
 
     pub async fn create_session(&self, id: &str, agent_id: &str, channel_type: &str) -> Result<()> {

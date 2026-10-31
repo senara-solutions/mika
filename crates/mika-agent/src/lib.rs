@@ -26,6 +26,7 @@ pub mod flight_verdict_ledger;
 /// Sous `#[cfg(test)]`, il ne spawne rien et refuse un vrai numéro d'issue.
 pub(crate) mod gh_process;
 pub(crate) mod github_graphql;
+pub mod groom_in_flight;
 pub mod grooming_marker;
 pub mod image_disposition;
 pub mod kg;
