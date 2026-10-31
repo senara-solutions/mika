@@ -330,6 +330,29 @@ NO_PR	B	crates/mika-agent/src/task_engine/dispatcher.rs::RE_NO_PR	exact:line-anc
 # pipeline — exactement ce que l'AC3 demande de distinguer.
 STRUCTURAL VIOLATION	B	crates/mika-agent/src/milestone_manager/evaluator.rs::death_cause	exact:literal
 PIPELINE FAILURE	B	crates/mika-agent/src/milestone_manager/evaluator.rs::death_cause	exact:literal
+# mika#2976 AC5 — les deux bannières de HALTE de dispatch. `dispatch-lib.sh` les
+# pose comme PREMIÈRE ligne du `RESULT` (`_branch_reuse_gate` pour l'une, la
+# porte de rebase pour l'autre) ; `parse_dispatch_halt_status` les y lit par
+# égalité de cette première ligne, après `trim_end` — donc `exact:line-anchored`
+# et non `exact:literal` : la POSITION fait partie de la lecture, exactement
+# comme pour le `exact:suffix` du § tolérances.
+#
+# La table est CLOSE à ces deux valeurs, et c'est load-bearing. Un préfixe
+# `STATUS=` nu avalerait `CANCELLED_BY_OPERATOR` et `CANCELLED_BY_SIGNAL`, qui
+# ont leur propre discriminateur trois blocs plus bas et leur propre issue :
+# confondre un geste opérateur avec une branche inreprenable rend les deux
+# populations non soustractibles (mika#2205).
+#
+# SECOND LECTEUR, HORS DU PÉRIMÈTRE DU LINT : le prompt de `self-dev-callback`
+# discrimine sur les mêmes deux bannières pour rendre la main sans réparer. Il
+# n'est pas de la source Rust, donc ni le survey ni le scan d'exhaustivité ne le
+# voient ; il est nommé ici parce qu'une bannière reformulée côté shell
+# désarmerait les DEUX moitiés — le prompt retomberait sur le handler « On
+# failure » générique, qui a mesurément lancé un `git rebase` dans un worktree le
+# 2026-10-30, et la parente retomberait en zombie `in_progress`. Même forme que
+# le bloc `CANCELLED_BY_*` ci-dessous, dont le second lecteur est le même prompt.
+REBASE_CONFLICT	B	crates/mika-agent/src/task_engine/dispatcher.rs::parse_dispatch_halt_status	exact:line-anchored
+BRANCH_HAS_UNMERGED_WORK	B	crates/mika-agent/src/task_engine/dispatcher.rs::parse_dispatch_halt_status	exact:line-anchored
 
 # ── Cancel-reason discriminators (mika#749, #2249). The shell TERM trap and
 # `self-dev-callback` read these byte-exact; a reworded one makes a reaped pilot

@@ -1523,6 +1523,15 @@ impl TaskDispatcher {
             // and zeroing the auto-pull re-drive budget on every tick. Resolve
             // it here, at the moment the refusal arrives.
             try_resolve_parent_on_dispatch_refusal(&self.db, task).await;
+            // mika#2976 AC5 : le frère du précédent pour la HALTE de dispatch.
+            // `dispatch-lib` s'arrête sur `STATUS=REBASE_CONFLICT` ou
+            // `STATUS=BRANCH_HAS_UNMERGED_WORK` sans rien toucher ; mesuré le
+            // 2026-10-30, la parente de groom 19c11b09 est restée `in_progress`
+            // alors que son seul enfant était livré et qu'aucun processus ne
+            // tournait — une parente zombie, qui a demandé un `cancel` à la
+            // main. Ce lecteur la rend terminale à l'instant où la halte arrive,
+            // sans dépendre du prompt ni de `make deploy`.
+            try_terminate_parent_on_dispatch_halt(&self.db, task).await;
             // mika#1289 / mika#1614: structural counterpart to the prompt-level
             // groom-success handler in self-dev-callback (PR #1291). When a groom
             // callback delivers with `Outcome: PLAN_GROOMED`, the engine spawns the
@@ -4623,6 +4632,154 @@ async fn try_resolve_parent_on_dispatch_refusal(db: &AsyncDatabase, task: &Task)
                 parent_task_id = %parent_id,
                 error = %e,
                 "engine: failed to resolve parent task on dispatch refusal"
+            );
+        }
+    }
+}
+
+/// Le statut de **halte de dispatch** porté par un résultat de callback, quand
+/// le résultat en est un (mika#2976 AC5).
+///
+/// # Une table CLOSE, lue sur la PREMIÈRE LIGNE
+///
+/// `dispatch-lib.sh` pose ces deux bannières lui-même, comme première ligne du
+/// `RESULT` qu'il délivre : `_branch_reuse_gate` pour
+/// `STATUS=BRANCH_HAS_UNMERGED_WORK` (mika#2976 vol 1) et la porte de rebase
+/// pour `STATUS=REBASE_CONFLICT` (mika#1727, mika#2968 deux fois). Le prédicat
+/// est donc l'égalité de la première ligne, après `trim_end`, avec l'une de
+/// **deux** valeurs nommées.
+///
+/// Les deux bornes du prédicat sont load-bearing, et chacune ferme une
+/// mauvaise lecture :
+///
+/// * **Pas `contains`.** Un `RESULT` de refus qui *cite* la bannière pour
+///   expliquer qu'il n'y a rien à reprendre serait compté comme la halte
+///   elle-même — la classe mika#2590, où une sous-chaîne a fait passer la note
+///   d'un refus pour la preuve qu'elle décrivait.
+/// * **Pas un préfixe `STATUS=` nu.** La famille `STATUS=` porte aussi
+///   `CANCELLED_BY_OPERATOR` et `CANCELLED_BY_SIGNAL`, qui ont leur propre
+///   discriminateur et leur propre issue. Les avaler ici confondrait un geste
+///   opérateur avec une branche inreprenable, et rendrait les deux populations
+///   non soustractibles (mika#2205).
+///
+/// Les deux jetons sont déclarés classe B dans `scripts/canonical-tokens.tsv`,
+/// avec ce site : une bannière reformulée côté shell ferait retomber la parente
+/// en zombie, en silence.
+fn parse_dispatch_halt_status(result: &str) -> Option<&'static str> {
+    match result.lines().next()?.trim_end() {
+        "STATUS=REBASE_CONFLICT" => Some("REBASE_CONFLICT"),
+        "STATUS=BRANCH_HAS_UNMERGED_WORK" => Some("BRANCH_HAS_UNMERGED_WORK"),
+        _ => None,
+    }
+}
+
+/// Une halte de dispatch rend la parente terminale (mika#2976 AC5).
+///
+/// # Le défaut que ceci ferme
+///
+/// Le 2026-10-30, le groom de mika#2968 s'est arrêté en `REBASE_CONFLICT` : la
+/// branche du vol précédent, dont la PR venait d'être mergée en squash, a été
+/// reprise puis rebasée contre son propre squash. `dispatch-lib` a fait ce
+/// qu'il devait — s'arrêter sans rien toucher — et a livré l'enfant
+/// `1f838a67`. Mais la parente de groom `19c11b09` est restée `in_progress`
+/// alors que son seul enfant était livré et qu'aucun processus ne tournait. Une
+/// parente zombie bloque la relance du ticket : le nettoyage a demandé un
+/// `mika tasks … cancel` à la main, sur le mot de l'opérateur.
+///
+/// # Pourquoi `failed` et non `completed`
+///
+/// C'est l'inverse du frère `try_resolve_parent_on_dispatch_refusal`. Un refus
+/// `auto_skipped` est un **résultat correct** — le ticket EST groomé — donc il
+/// se résout en `completed`. Une halte, elle, est un vol qui n'a produit ni
+/// plan ni PR : la marquer `completed` dirait que le ticket est traité et le
+/// retirerait du compte des vraies pannes.
+///
+/// # Pourquoi `update_task_failed`
+///
+/// La **même primitive que le faucheur** : un UPDATE gardé sur l'état terminal,
+/// donc inoffensif en course avec lui ou avec un geste opérateur. `Ok(false)`
+/// veut dire « quelqu'un d'autre l'a déjà rendue terminale » et ne mérite qu'un
+/// `debug!`.
+///
+/// # Pourquoi un motif distinct
+///
+/// `dispatch_halt_<statut>` ne recouvre ni `callback_no_pr_*` ni
+/// `phantom_aged_out` : deux populations sous un même nom cessent d'être
+/// soustractibles, et c'est exactement ce que mika#2205 ferme. Le statut est
+/// reporté verbatim, donc `REBASE_CONFLICT` et `BRANCH_HAS_UNMERGED_WORK`
+/// restent séparables l'un de l'autre aussi.
+///
+/// Best-effort, fire-and-forget — même forme que les helpers frères.
+async fn try_terminate_parent_on_dispatch_halt(db: &AsyncDatabase, task: &Task) {
+    let Some(parent_id) = task.parent_task_id.clone() else {
+        return;
+    };
+
+    let Some(result) = task.result.as_deref().filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let Some(halt_status) = parse_dispatch_halt_status(result) else {
+        return;
+    };
+
+    // Portée identique aux frères : une tâche de suivi self_dev encore en vol.
+    // Pas de filtre sur `dispatch_class` — la halte tombe sur un groom comme sur
+    // un implement, et un second prédicat plus faible pour le même fait est ce
+    // que mika#2158 ferme.
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t))
+            if t.trigger_type == "manual"
+                && t.status == "in_progress"
+                && t.source.as_deref() == Some("self_dev") =>
+        {
+            t
+        }
+        _ => return,
+    };
+
+    let motif = format!("dispatch_halt_{halt_status}");
+    match db.update_task_failed(&parent_id, &motif).await {
+        Ok(true) => {
+            let system_session = format!("system-{}", parent.agent_id);
+            let trace_id = mika_common::trace::generate_trace_id();
+            if let Err(e) = db
+                .log_audit_event(
+                    &system_session,
+                    "dispatch_halt_resolver",
+                    &parent_id,
+                    Some("in_progress"),
+                    Some("failed"),
+                    Some(&motif),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "engine: failed to write dispatch-halt-resolver audit event"
+                );
+            }
+            info!(
+                event = "dispatch_halt_parent_terminated",
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                halt_status = %halt_status,
+                "engine: dispatch halt made its parent terminal (mika#2976)"
+            );
+        }
+        Ok(false) => {
+            debug!(
+                parent_task_id = %parent_id,
+                halt_status = %halt_status,
+                "engine: parent no longer in_progress, skipping dispatch-halt termination"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to terminate parent task on dispatch halt"
             );
         }
     }
@@ -8544,6 +8701,281 @@ mod tests {
         assert_eq!(
             parent.status, "failed",
             "a parent that already reached a terminal state is not this resolver's business"
+        );
+    }
+
+    // -- try_terminate_parent_on_dispatch_halt tests (mika#2976 AC5) --
+
+    /// Le `RESULT` verbatim de la tâche de pilote de groom `1f838a67`
+    /// (mika#2968, 2026-10-30), tronqué de ses champs de diagnostic longs.
+    ///
+    /// Verbatim et non paraphrasé : la bannière est posée par `dispatch-lib.sh`
+    /// comme PREMIÈRE ligne, et c'est cette position que le lecteur lit.
+    const REBASE_CONFLICT_RESULT: &str = "STATUS=REBASE_CONFLICT\n\
+         Branch fix/2968/manager-l-valuateur-recommande-merge is 7 commits behind origin/main.\n\
+         Rebase failure mode: conflict\n\
+         Conflicted files:\n\
+         docs/plans/2026-10-29-005-fix-2968-manager-l-valuateur-recommande-merge-plan.md\n\
+         Resolve manually before re-dispatching mika#2968.\n\
+         NO_PR: no_pr_on_branch";
+
+    /// Le `RESULT` verbatim du premier relevé de la sonde d'AC4 (mika#2958,
+    /// 2026-10-31) : la halte neuve que le vol 1 a posée.
+    const UNMERGED_WORK_RESULT: &str = "STATUS=BRANCH_HAS_UNMERGED_WORK\n\
+         Branch feat/2958/manager-phase-2-c-vol-2-le-manager carries 3 commit(s) absent from \
+         origin/main by patch-id, while its PRs are all terminal (#2975 MERGED).\n\
+         Nothing was reset, nothing was removed, nothing was stashed.";
+
+    /// Les transitions écrites sous `dispatch_halt_resolver` pour cette
+    /// parente, sous la forme `<avant>→<après> (<motif>)`. L'absence
+    /// d'événement est une information : c'est ce qui sépare « la garde n'a pas
+    /// tiré » de « la transition a eu lieu sans trace ».
+    async fn dispatch_halt_audit_values(db: &AsyncDatabase, parent_id: &str) -> Vec<String> {
+        db.get_audit_events("system-mika")
+            .await
+            .expect("la lecture des audit_events ne doit pas échouer")
+            .into_iter()
+            .filter(|e| e.tool_name == "dispatch_halt_resolver" && e.target_key == parent_id)
+            .map(|e| {
+                format!(
+                    "{}→{} ({})",
+                    e.before_value.as_deref().unwrap_or("?"),
+                    e.after_value.as_deref().unwrap_or("?"),
+                    e.reasoning.as_deref().unwrap_or("?"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_dispatch_halt_status_is_a_closed_table() {
+        assert_eq!(
+            parse_dispatch_halt_status(REBASE_CONFLICT_RESULT),
+            Some("REBASE_CONFLICT")
+        );
+        assert_eq!(
+            parse_dispatch_halt_status(UNMERGED_WORK_RESULT),
+            Some("BRANCH_HAS_UNMERGED_WORK")
+        );
+        // Une ligne terminée par un retour chariot reste la même bannière :
+        // `trim_end` est dans le prédicat, pas dans l'espoir.
+        assert_eq!(
+            parse_dispatch_halt_status("STATUS=REBASE_CONFLICT \r\nsuite"),
+            Some("REBASE_CONFLICT")
+        );
+        // La famille `STATUS=` n'est PAS la table : ces deux-là ont leur propre
+        // discriminateur et leur propre issue (mika#2205).
+        assert_eq!(
+            parse_dispatch_halt_status("STATUS=CANCELLED_BY_OPERATOR\nkilled by operator"),
+            None
+        );
+        assert_eq!(
+            parse_dispatch_halt_status("STATUS=PIPELINE_INCOMPLETE"),
+            None
+        );
+        // Ni `contains`, ni préfixe nu : la bannière citée hors première ligne
+        // n'est pas la halte.
+        assert_eq!(
+            parse_dispatch_halt_status("Log path: /tmp/x.log\nSTATUS=REBASE_CONFLICT"),
+            None
+        );
+        assert_eq!(parse_dispatch_halt_status(""), None);
+        assert_eq!(
+            parse_dispatch_halt_status("claude-pilot completed (status: done)."),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebase_conflict_halt_makes_the_parent_terminal() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, REBASE_CONFLICT_RESULT).await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "une halte de dispatch ne laisse pas sa parente `in_progress` après que son \
+             dernier enfant est livré — c'est la parente zombie 19c11b09 du 2026-10-30"
+        );
+        assert_eq!(
+            parent.result.as_deref(),
+            Some("dispatch_halt_REBASE_CONFLICT"),
+            "le motif nomme la halte et son statut, distinct de `callback_no_pr_*` et de \
+             `phantom_aged_out` (mika#2205)"
+        );
+        assert_eq!(
+            dispatch_halt_audit_values(&db, &parent_id).await,
+            vec!["in_progress→failed (dispatch_halt_REBASE_CONFLICT)".to_string()],
+            "la transition laisse une trace nommée, sinon son absence sous un fantôme ne dit rien"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unmerged_work_halt_makes_the_parent_terminal_under_its_own_motive() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, UNMERGED_WORK_RESULT).await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        assert_eq!(
+            parent.result.as_deref(),
+            Some("dispatch_halt_BRANCH_HAS_UNMERGED_WORK"),
+            "les deux haltes restent soustractibles l'une de l'autre, pas seulement du reste"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cancel_banner_is_not_a_dispatch_halt() {
+        let db = test_db();
+        let (parent_id, callback_id) = create_refusal_callback_pair(
+            &db,
+            "STATUS=CANCELLED_BY_OPERATOR\nkilled by operator request",
+        )
+        .await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "la table est CLOSE : un préfixe `STATUS=` nu avalerait le geste opérateur et \
+             confondrait deux populations"
+        );
+        assert!(dispatch_halt_audit_values(&db, &parent_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_halt_does_not_reopen_a_terminal_parent() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, REBASE_CONFLICT_RESULT).await;
+        db.update_task_completed(&parent_id, Some("delivered earlier"))
+            .await
+            .unwrap();
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "completed",
+            "l'UPDATE est gardé sur l'état terminal : inoffensif en course avec le faucheur \
+             ou avec un geste opérateur"
+        );
+        assert!(
+            dispatch_halt_audit_values(&db, &parent_id).await.is_empty(),
+            "pas de transition, pas d'événement — `Ok(false)` ne mérite qu'un `debug!`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_banner_off_the_first_line_is_not_a_halt() {
+        let db = test_db();
+        let (parent_id, callback_id) = create_refusal_callback_pair(
+            &db,
+            "Log path: /home/mika/.mika/logs/pilot-1f838a67.log\nSTATUS=REBASE_CONFLICT\n\
+             Branch fix/2968/x is 7 commits behind origin/main.",
+        )
+        .await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "la position fait partie de la lecture : `dispatch-lib` pose la bannière en \
+             première ligne, et un `RESULT` qui la cite ailleurs n'est pas la halte"
+        );
+        assert!(dispatch_halt_audit_values(&db, &parent_id).await.is_empty());
+    }
+
+    // -- mika#2976 AC5 : la POSITION du discriminateur dans le prompt --
+
+    /// Le prompt **embarqué**, pas celui de l'arbre : `include_str!` fige les
+    /// octets au build, exactement comme `build.rs` les fige dans
+    /// `BUNDLED_SKILL_MANIFESTS`. Une édition de l'arbre est invisible aux deux
+    /// jusqu'au prochain `make deploy` (motif mika#2340). Même idiome que
+    /// `qa_reviewed_head::tests` § *conformité des prompts*.
+    const PROMPT_SELF_DEV_CALLBACK: &str =
+        include_str!("../../../../skills/bundled/self-dev-callback/system_prompt.md");
+
+    /// L'en-tête que le discriminateur de halte doit PRÉCÉDER.
+    ///
+    /// C'est là que vit le handler générique qui a mesurément lancé le
+    /// `git rebase` du 2026-10-30 : sa section « Diagnose and recover from
+    /// failure » porte « **Attempt recovery (max 1).** ». Un discriminateur
+    /// placé **sous** cet en-tête est silencieusement désarmé — il est correct,
+    /// il est lisible, et il n'est jamais atteint.
+    const GENERIC_FAILURE_HEADING: &str = "Pipeline result classification";
+
+    /// Les bannières de halte dont la position n'est PAS exigée.
+    ///
+    /// **Livrée vide, et le test frère l'assert.** Quand ce scan tire, la
+    /// résolution est de REMONTER le discriminateur au-dessus de
+    /// [`GENERIC_FAILURE_HEADING`], jamais d'ajouter une entrée ici : une
+    /// allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction (mika#2323).
+    const ORDER_SCAN_ALLOWLIST: &[&str] = &[];
+
+    #[test]
+    fn mika2976_le_discriminateur_de_halte_precede_le_handler_generique() {
+        let heading = PROMPT_SELF_DEV_CALLBACK
+            .find(GENERIC_FAILURE_HEADING)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{GENERIC_FAILURE_HEADING}` est absent du prompt — l'ancre du scan a été \
+                     renommée, et un scan sans ancre ne mesure rien"
+                )
+            });
+
+        let mut offenders = Vec::new();
+        for banner in ["STATUS=REBASE_CONFLICT", "STATUS=BRANCH_HAS_UNMERGED_WORK"] {
+            if ORDER_SCAN_ALLOWLIST.contains(&banner) {
+                continue;
+            }
+            match PROMPT_SELF_DEV_CALLBACK.find(banner) {
+                None => offenders.push(format!(
+                    "{banner} est absent du prompt — le tour de callback retombe sur le handler \
+                     « On failure » générique, qui a lancé un `git rebase` dans un worktree le \
+                     2026-10-30"
+                )),
+                Some(at) if at > heading => offenders.push(format!(
+                    "{banner} apparaît APRÈS `{GENERIC_FAILURE_HEADING}` (octet {at} > {heading}) \
+                     — le discriminateur est désarmé en silence"
+                )),
+                Some(_) => {}
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "la POSITION du discriminateur de halte est le correctif, pas son texte :\n  {}\n\n\
+             RÉSOLUTION : remonter la section « Dispatch-halt discriminator » au-dessus de \
+             `**{GENERIC_FAILURE_HEADING}` dans \
+             skills/bundled/self-dev-callback/system_prompt.md (mika#2976 AC5).",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn mika2976_lallowlist_du_scan_dordre_est_livree_vide() {
+        assert!(
+            ORDER_SCAN_ALLOWLIST.is_empty(),
+            "l'allowlist du scan d'ordre porte {:?}. Une entrée ici exempte une bannière de \
+             l'exigence de POSITION, c'est-à-dire la réouvre au défaut de mika#2976 AC5. \
+             Elle n'est admissible qu'avec un ticket de suivi NOMMÉ et une date de retrait \
+             écrits en commentaire au-dessus de la ligne ; sinon, remonter le discriminateur.",
+            ORDER_SCAN_ALLOWLIST
         );
     }
 
