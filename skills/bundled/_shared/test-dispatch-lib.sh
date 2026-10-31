@@ -11987,7 +11987,11 @@ assert_eq "mika#2626 (V5): et ce site est DANS le lecteur" "1" \
 # la classe de panne qu'il existe pour empêcher (mika#2205).
 M2626_CALLERS=$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" \
     | grep -cE '^[[:space:]]*(if |local |[A-Za-z_]+=)?.*_remote_branch_exists[[:space:]]' || true)
-assert_eq "mika#2626 (V5, anti-vacuité): EXACTEMENT deux appelants du lecteur" "2" \
+# mika#2976 AC9 ajoute le TROISIÈME : `_branch_reuse_verdict` demande au
+# distant si la branche existe avant de lire la ref de suivi, et il le demande
+# au lecteur unique plutôt qu'à un second `ls-remote --exit-code` — c'est
+# exactement ce que ce test protège. Le compte suit, il ne s'élargit pas.
+assert_eq "mika#2626 (V5, anti-vacuité): EXACTEMENT trois appelants du lecteur" "3" \
     "$M2626_CALLERS"
 
 # Contrôle de bonne foi, DANS LES DEUX SENS, et chaque sens exerce le prédicat
