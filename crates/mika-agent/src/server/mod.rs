@@ -1838,6 +1838,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 // voir avec `manager_config_from_env` : elle appartient au jeton,
                 // pas à la cible du manager.
                 groom_sender,
+                // mika#2958 vol 2d — la lecture « un groom est en cours ». `None`
+                // ici le temps d'une étape : la construction arrive au commit
+                // suivant, au site qui tient le handle de base.
+                None,
             ),
             Ok(None) => {
                 info!(

@@ -32,7 +32,7 @@ use super::cadence::{
     run_manager_cycle_with_auth,
 };
 use super::evaluator::FlightSource;
-use super::groom_trigger::GroomSender;
+use super::groom_trigger::{GroomInFlightSource, GroomSender};
 use super::liveness::{LivenessEmitter, LivenessSink};
 use super::reader::{GhCommandError, GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
@@ -324,6 +324,16 @@ pub async fn manager_config_from_env(
 /// [`super::resolve_groom_rail`] au site qui le tient, et traverse jusqu'ici.
 /// `Arc` plutôt que la propriété nue, parce que le contexte de cycle est rebâti
 /// à chaque tour et que l'émetteur, lui, vit aussi longtemps que la tâche.
+///
+/// **mika#2958 vol 2d — `groom_in_flight`.** Par quoi le cycle voit qu'un groom
+/// est **déjà en vol**, pour ne pas le relancer (AC2). Même raison que
+/// `groom_sender` de ne pas la construire ici : la lecture tient un handle de
+/// base, que ni ce site ni `ManagerConfig` ne portent — elle se construit au
+/// site qui le tient (`server/mod.rs`) et traverse jusqu'ici. `None` est un état
+/// nominal, et il se dit `no_in_flight_source` : un motif à lui, distinct de
+/// « la base voit un groom », parce que deux causes sous un nom commun ne se
+/// soustraient plus (mika#2205) — et c'est l'axe même où AC2 se lit. La source
+/// n'a **aucune** autorité d'écriture : elle lit `tasks`, c'est tout.
 // `groom_sender` est la huitième injection et franchit le seuil de clippy. Elles
 // ne se regroupent pas en structure sans perdre ce qui les tient : chacune est
 // une dépendance que la production construit et que les tests remplacent une à
@@ -339,6 +349,7 @@ pub fn spawn_manager_cycle_task(
     flight_source: Option<Arc<dyn FlightSource>>,
     verdict_ledger: Option<Arc<dyn FlightVerdictLedger>>,
     groom_sender: Option<Arc<dyn GroomSender>>,
+    groom_in_flight: Option<Arc<dyn GroomInFlightSource>>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -505,9 +516,7 @@ pub fn spawn_manager_cycle_task(
                 flight_source.as_ref(),
                 verdict_ledger.as_ref(),
                 groom_sender.as_deref(),
-                // mika#2958 vol 2d — l'injection traverse ce site à l'étape
-                // suivante ; `None` y est l'état nominal.
-                None,
+                groom_in_flight.as_ref(),
             )
             .await
             {
@@ -2074,6 +2083,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("first spawn returns Some(handle)");
 
@@ -2542,6 +2552,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
@@ -2553,6 +2564,7 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
             None,
             None,
             None,
@@ -2719,6 +2731,7 @@ mod tests {
             Arc::new(resolver),
             None,
             noop_liveness_sink(),
+            None,
             None,
             None,
             None,
