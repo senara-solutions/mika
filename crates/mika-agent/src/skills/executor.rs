@@ -3514,15 +3514,30 @@ pub(crate) async fn validate_forced_dispatch_consent(
             "subject": subject,
             "reason": reason,
             // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
-            // jugé. Les deux gestes de reprise, nommés.
+            // jugé (mika#2520). Les deux voies de reprise sont donc nommées — mais
+            // la première est ATTRIBUÉE à l'opérateur, elle n'est pas prescrite au
+            // lecteur. C'est l'AC3 de mika#2995, et c'est une correction de
+            // défaut, pas une précaution : le 2026-10-31 à 16:46:32Z ce champ
+            // disait « promote the ticket by posting the `ready` label as
+            // remove→add » ; à 16:51:37Z mika-dev l'a fait, avec le `GH_TOKEN` du
+            // moteur, et le groom est parti. Un remède qui décrit le geste à un
+            // lecteur qui tient l'outil ne décrit pas une levée, il enseigne un
+            // contournement. Le geste `remove` → `add` et le fait de mika#2323 qui
+            // le motive vivent dans la doc opérateur, la surface d'où la promotion
+            // se fait ; ils ont quitté le texte que l'agent lit.
             "recovery": "This dispatch was not requested — it was demanded by a tool \
                          constraint this turn, and the ticket it targets has not been \
                          promoted. Grooming a ticket nobody promoted is what mika#2772 \
-                         refuses. Either promote the ticket by posting the `ready` label \
-                         as remove→add (GitHub only emits `labeled` on a transition — \
-                         mika#2323), or groom it explicitly with \
-                         `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"`, which \
-                         carries a grooming intent and traverses this gate (mika#1173)."
+                         refuses. Two things lift it, and only two. Promotion belongs to \
+                         the operator: the `ready` label is their positive consent to \
+                         autonomous dispatch (mika#841), it is not a gesture you perform \
+                         on their behalf, and the engine refuses to write it on any turn \
+                         (mika#2995) — so if this ticket deserves promotion, say so and \
+                         stop. Otherwise, grooming it explicitly traverses this gate \
+                         instead of lifting it: \
+                         `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"` carries a \
+                         grooming intent (mika#1173), and that request is the operator's \
+                         to make."
         })
         .to_string()
     };
@@ -17045,15 +17060,18 @@ Harness ticket.
     // (`forced_dispatch_needs_consent`, `labels_carry_ready`) qui portent la
     // décision, et leurs tests qui les tiennent — c'est le partage, pas un trou.
     //
-    // **Les SEPT portent `#[serial_test::serial]`, pas seulement celui qui pose
+    // **Les HUIT portent `#[serial_test::serial]`, pas seulement celui qui pose
     // la variable.** Le levier de désarmement est lu dans le process env, donc
     // le test qui le pose empoisonne tout voisin qui atteint la même lecture —
     // mesuré ici : `…_un_sujet_non_resolu_…` a rendu `Allowed` au premier
     // passage, désarmé par un voisin. `#[serial]` ne sérialise que contre ses
     // propres porteurs, donc annoter le seul poseur laisse la course entière
-    // ouverte (la moitié porteuse de mika#2646, et la leçon de mika#2073).
+    // ouverte (la moitié porteuse de mika#2646, et la leçon de mika#2073). Le
+    // huitième est celui de l'AC3 de mika#2995 : il atteint la même lecture que
+    // le refus nominal dont il inspecte le remède, donc il entre dans la même
+    // population — c'est le critère, jamais le compte.
     //
-    // Et sept suffisent — le reste du crate n'est pas une population de
+    // Et huit suffisent — le reste du crate n'est pas une population de
     // poisonnés, par **lecture** et non par prudence : la lecture du levier est
     // placée APRÈS le court-circuit du forçage, et aucun autre test ne pose
     // `tool_constraint_forced`. Un test de dispatch voisin n'atteint donc jamais
@@ -17129,6 +17147,52 @@ Harness ticket.
             assert!(
                 recovery.contains("mika ask --agent mika-dev"),
                 "la reprise doit nommer le groom opérateur de mika#1173 : {recovery}"
+            );
+        }
+
+        /// **AC3 de mika#2995 — le remède ne prescrit pas le geste interdit.**
+        ///
+        /// Ce test n'est pas une précaution, c'est la fermeture d'un défaut
+        /// mesuré. Le 2026-10-31 à 16:46:32Z ce champ disait *« promote the
+        /// ticket by posting the `ready` label as remove→add »* ; cinq minutes
+        /// plus tard, à 16:51:37Z, mika-dev a appelé
+        /// `run_gh ["issue","edit","2958","--add-label","ready"]` avec le
+        /// `GH_TOKEN` du moteur, et le groom est parti. Le remède d'une garde de
+        /// consentement avait enseigné comment se donner le consentement.
+        ///
+        /// La propriété tenue ici n'est donc **pas** « le remède ne nomme pas
+        /// `ready` » — il doit le nommer, un refus qui ne nomme pas sa levée se
+        /// contourne au jugé (mika#2520), et le test nominal ci-dessus l'exige.
+        /// C'est : le remède **attribue** la promotion à l'opérateur, et ne
+        /// fournit aucun gabarit exécutable pour l'écriture du label. Nommer la
+        /// personne qui agit, pas la commande.
+        ///
+        /// Les deux moitiés sont asserties ensemble à dessein : un remède qui
+        /// retire le gabarit sans dire à qui la promotion appartient laisse un
+        /// blanc, et un agent comble un blanc.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2995_le_remede_attribue_la_promotion_sans_prescrire_le_geste() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+            let recovery = json["recovery"].as_str().expect("un refus nomme sa levée");
+
+            // Aucun gabarit d'écriture du label, sous aucune forme.
+            for gabarit in ["--add-label", "--remove-label", "remove→add", "remove->add"] {
+                assert!(
+                    !recovery.contains(gabarit),
+                    "le remède ne doit porter aucun gabarit d'écriture du label — c'est le \
+                     geste du 2026-10-31. Trouvé `{gabarit}` dans : {recovery}"
+                );
+            }
+
+            // Et il dit à qui la promotion appartient, plutôt que de laisser le
+            // blanc que l'agent comblerait.
+            assert!(
+                recovery.contains("Promotion belongs to the operator"),
+                "le remède doit attribuer la promotion à l'opérateur : {recovery}"
             );
         }
 
