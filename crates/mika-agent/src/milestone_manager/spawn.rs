@@ -505,6 +505,9 @@ pub fn spawn_manager_cycle_task(
                 flight_source.as_ref(),
                 verdict_ledger.as_ref(),
                 groom_sender.as_deref(),
+                // mika#2958 vol 2d — l'injection traverse ce site à l'étape
+                // suivante ; `None` y est l'état nominal.
+                None,
             )
             .await
             {

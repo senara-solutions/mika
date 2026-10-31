@@ -1528,7 +1528,7 @@ pub async fn probe_executor_health(url: Option<&str>) -> Option<bool> {
 /// Live-runner variant: reads from `gh`, probes optional health endpoint,
 /// then runs the same cycle logic.
 pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
-    run_manager_cycle_with_auth(cfg, None, &[], None, None, None).await
+    run_manager_cycle_with_auth(cfg, None, &[], None, None, None, None).await
 }
 
 /// As [`run_manager_cycle`], with the mika#1949 auth-boundary wiring: where to
@@ -1546,6 +1546,12 @@ pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
 /// tente rien. Il n'est pas construit ici comme `gh_runner` l'est : le rail
 /// demande le jeton interne, que ce site ne tient pas — il se résout par
 /// [`super::resolve_groom_rail`] au site qui le tient (`server/mod.rs`).
+///
+/// Depuis mika#2958 vol 2d, `groom_in_flight` dit par quoi le cycle voit qu'un
+/// groom est **déjà en vol**. Même raison de ne pas le construire ici que le
+/// rail : la lecture tient un handle de base, que ce site n'a pas. `None` fait
+/// dire `no_in_flight_source` au geste — un motif à lui, jamais confondu avec
+/// « la base voit un groom » (mika#2205).
 pub async fn run_manager_cycle_with_auth(
     cfg: &ManagerConfig,
     auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
@@ -1553,6 +1559,7 @@ pub async fn run_manager_cycle_with_auth(
     flight_source: Option<&Arc<dyn FlightSource>>,
     verdict_ledger: Option<&Arc<dyn FlightVerdictLedger>>,
     groom_sender: Option<&dyn GroomSender>,
+    groom_in_flight: Option<&Arc<dyn GroomInFlightSource>>,
 ) -> Result<CycleOutcome> {
     let reader = Reader::new(cfg.github_token.clone());
     let mut state = reader.read(&cfg.target).await?;
@@ -1572,7 +1579,8 @@ pub async fn run_manager_cycle_with_auth(
         .with_flight_source(flight_source)
         .with_verdict_ledger(verdict_ledger)
         .with_gh_runner(Some(&gh_runner))
-        .with_groom_sender(groom_sender);
+        .with_groom_sender(groom_sender)
+        .with_groom_in_flight(groom_in_flight);
     run_manager_cycle_in(cfg, state, &ctx).await
 }
 
