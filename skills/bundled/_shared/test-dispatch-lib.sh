@@ -15494,6 +15494,345 @@ assert_eq "V14 (anti-vacuité B): avec les messages d'origine, V1 V2 V4 V9 écho
 
 rm -rf "$T2077_REGROOT"
 
+# ============================================================================
+# mika#2976 — la porte de reprise de branche (T1 à T6)
+# ============================================================================
+#
+# Trois `REBASE_CONFLICT` mesurés en huit jours, une racine : le nom de branche
+# est dérivé du ticket, donc le groom d'un vol 2 dérive le nom du vol 1 et le
+# dispatch reprend une branche déjà atterrie.
+#
+# Les six cas exercent `_branch_reuse_gate` — la production, pas une relecture de
+# sa table — sur un dépôt RÉEL, et lisent la ligne `branch_reuse_gate` qu'elle
+# émet. Chacun assertionne aussi les DEUX refs de la branche avant et après : un
+# verdict juste suivi d'un effet de bord faux passerait une assertion portée sur
+# le seul jeton.
+#
+# T3 et T4 sont deux contrôles négatifs distincts, et aucun n'est redondant : une
+# implémentation qui oublierait le bras « aucune PR » passerait T3 et casserait
+# T4 — et c'est le faux positif le plus coûteux du ticket, puisqu'il détruirait
+# le plan d'un vol qui attend son dispatch d'implémentation. T6 sépare « la porte
+# ne mord sur rien » de « la porte ne mesure rien ».
+
+echo ""
+echo "Test mika#2976: porte de reprise de branche (AC1/AC2/AC3)"
+echo "----------------------------------------------------------"
+
+# La mesure pose cinq globales ; un `$( )` autour d'elle n'en laisse sortir
+# aucune, et la ligne de l'AC4 dirait alors `pr=none unmerged=0 tips=none` sur
+# toute la population — un instrument qui mesure sa propre valeur par défaut.
+# Les six cas ci-dessous le détectent déjà par leurs assertions sur `pr=` et
+# `tips=` ; ce scan le nomme à la source, pour que le rouge dise *pourquoi*.
+T2976_GATE_FUNC=$(sed -n '/^_branch_reuse_gate()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976: le scan de la porte a du corps (bonne foi)" \
+    "_branch_reuse_verdict" "$T2976_GATE_FUNC"
+assert_not_contains "mika#2976: la porte ne capture PAS le verdict dans un sous-shell" \
+    '$(_branch_reuse_verdict' "$T2976_GATE_FUNC"
+assert_contains "mika#2976: la porte lit le jeton dans la globale" \
+    '_BRANCH_REUSE_VERDICT' "$T2976_GATE_FUNC"
+
+# Harnais : `_fixture_setup` (bare file:// + clone) étendu d'une RACINE DE
+# WORKTREES portant le segment géré `/.claude/worktrees/`. Sans ce segment, le
+# terme T4 de `_assert_removable_worktree_path` (mika#1943) refuse tout retrait
+# et les six cas mesureraient la garde au lieu de la porte.
+_t2976_fixture() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+    T2976_ROOT=$(mktemp -d)
+    T2976_WT_ROOT="$T2976_ROOT/.claude/worktrees"
+    mkdir -p "$T2976_WT_ROOT"
+}
+
+_t2976_cleanup() {
+    _fixture_cleanup
+    rm -rf "$T2976_ROOT" 2>/dev/null || true
+}
+
+# `_t2976_commit <fichier> <contenu> <sujet>` — un commit sur la branche courante.
+_t2976_commit() {
+    printf '%s\n' "$2" > "$FIXTURE_CLONE/$1"
+    git -C "$FIXTURE_CLONE" add "$1" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "$3"
+}
+
+# Les DEUX refs en une chaîne, pour l'assertion « avant / après ». Une seule ref
+# lue laisserait passer un effet de bord sur l'autre — c'est précisément le
+# troisième cas du ticket, où la ref locale `origin/…` pointait sur un sha que
+# le distant ne portait plus.
+_t2976_refs() {
+    printf '%s|%s' \
+        "$(git -C "$FIXTURE_CLONE" rev-parse --verify --quiet "refs/heads/$1" || echo none)" \
+        "$(git -C "$FIXTURE_CLONE" rev-parse --verify --quiet "refs/remotes/origin/$1" || echo none)"
+}
+
+# --- T1 (AC2a) : branche LOCALE seule, PR mergée, tête absorbée par un squash --
+#
+# Le second cas du ticket : origin avait supprimé la branche au merge de la PR,
+# la branche locale et son worktree sont restés sur la tête approuvée.
+test_t2976_local_spent() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t1" wt="$T2976_WT_ROOT/fix-2976-t1"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # Le squash : `main` reçoit le MÊME patch sous un autre sha. C'est ce que
+    # `rev-list --count` ne sait pas voir et que `--cherry-mark` voit.
+    git -C "$FIXTURE_CLONE" cherry-pick "$tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    # La branche n'a JAMAIS été poussée : origin ne la porte pas.
+
+    gh() { printf '[{"number":2971,"state":"MERGED"}]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t1.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t1.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=spent' <<<"$gate_log" || failures="${failures}verdict should be spent, log: $gate_log; "
+    grep -qF -- 'unmerged=0' <<<"$gate_log" || failures="${failures}unmerged should be 0; "
+    grep -qF -- 'pr=#2971 MERGED' <<<"$gate_log" || failures="${failures}pr field should name the merged PR; "
+    # La ref lue est la ref LOCALE : origin n'a jamais porté cette branche.
+    grep -qF -- 'tips=refs/heads/' <<<"$gate_log" || failures="${failures}tips should name the local ref; "
+    # Palier d'observation : la porte MESURE et ne décide rien encore, donc rien
+    # ne bouge. Le commit qui arme la décision retourne cette assertion vers
+    # « après == origin/main » — et c'est la seule ligne qu'il a à retourner.
+    [ "$before" = "$after" ] || failures="${failures}observation tier must not move refs ($before -> $after); "
+    [ "$rc" = "0" ] || failures="${failures}observation tier must not halt (rc=$rc); "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T2 (AC2b) : branche SUR ORIGIN, PR mergée, en retard sur main ------------
+#
+# Le premier cas du ticket (mika#1727), sous forme réduite : la branche est à
+# deux commits de retard au lieu de 584. Le bras sous test est
+# `_remote_branch_exists`, pas le NOMBRE de commits de retard.
+test_t2976_remote_spent() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t2"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit feature.txt "v1" "feat(2976): le vol 1"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" cherry-pick "$tip" >/dev/null 2>&1
+    _t2976_commit other.txt "suite" "chore: un commit de plus sur main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    # La ref LOCALE est retirée : la branche ne vit plus que sur origin.
+    # `update-ref -d` et non `branch -D` — la permission-policy du pilote refuse
+    # cette seconde forme d'un refus TERMINAL (plan mika#2976 § 11).
+    git -C "$FIXTURE_CLONE" update-ref -d "refs/heads/$br"
+
+    gh() { printf '[{"number":1728,"state":"MERGED"}]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$T2976_WT_ROOT/fix-2976-t2" 1727 2>"$T2976_ROOT/t2.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t2.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=spent' <<<"$gate_log" || failures="${failures}verdict should be spent, log: $gate_log; "
+    grep -qF -- 'unmerged=0' <<<"$gate_log" || failures="${failures}unmerged should be 0; "
+    # La ref lue est la ref DISTANTE : la locale n'existe plus. C'est la moitié
+    # de la population qu'une lecture à une seule ref manquerait.
+    grep -qF -- 'tips=refs/remotes/origin/' <<<"$gate_log" || failures="${failures}tips should name the remote ref; "
+    case "$before" in none\|*) ;; *) failures="${failures}fixture should have no local ref ($before); " ;; esac
+    [ "$before" = "$after" ] || failures="${failures}observation tier must not move refs ($before -> $after); "
+    [ "$rc" = "0" ] || failures="${failures}observation tier must not halt (rc=$rc); "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T3 (AC2c, contrôle négatif) : une PR OUVERTE se reprend ------------------
+#
+# Le cas NOMINAL de reprise d'un vol en cours. Si ce test rougit, la porte a
+# cessé d'être une porte.
+test_t2976_open_pr_live() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t3" wt="$T2976_WT_ROOT/fix-2976-t3"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit wip.txt "travail en cours" "feat(2976): vol en cours"
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    # Deux PR sur le même head : une FERMÉE, une OUVERTE. C'est la population
+    # que le terme positif « il existe une PR mergée ou fermée » déclarerait
+    # périmée à tort, et c'est pourquoi le prédicat est formulé en négatif.
+    gh() { printf '[{"number":2900,"state":"CLOSED"},{"number":2983,"state":"OPEN"}]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t3.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t3.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=live' <<<"$gate_log" || failures="${failures}verdict should be live, log: $gate_log; "
+    grep -qF -- 'action=reuse' <<<"$gate_log" || failures="${failures}action should be reuse; "
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}BRANCH_SPENT should stay 0; "
+    [ "$rc" = "0" ] || failures="${failures}gate should not halt (rc=$rc); "
+    [ -d "$wt" ] || failures="${failures}worktree should be intact; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T4 (AC2c bis, second contrôle négatif) : AUCUNE PR se reprend ------------
+#
+# La branche de groom poussée avec son plan et pas encore implémentée. La traiter
+# comme périmée détruirait ce plan : le faux positif le plus coûteux du ticket.
+test_t2976_no_pr_live() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t4" wt="$T2976_WT_ROOT/fix-2976-t4"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "le plan, jamais implémenté" "docs(plans): groom mika#2976"
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    gh() { printf '[]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t4.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t4.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=live' <<<"$gate_log" || failures="${failures}verdict should be live, log: $gate_log; "
+    grep -qF -- 'action=reuse' <<<"$gate_log" || failures="${failures}action should be reuse; "
+    grep -qF -- 'pr=none' <<<"$gate_log" || failures="${failures}pr field should be none; "
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ -d "$wt" ] || failures="${failures}worktree should be intact; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T5 (AC3) : PR mergée, MAIS un patch absent de main ⇒ halte ---------------
+#
+# Une PR mergée ne prouve pas que TOUT ce que porte la branche est dans `main` :
+# un commit poussé après l'approbation, ou le résidu d'un `wip()` de la chaîne de
+# secours, y vit encore. C'est la population que la porte ne peut pas disposer
+# sans risque de perte.
+test_t2976_unmerged_work_halts() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t5" wt="$T2976_WT_ROOT/fix-2976-t5"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "le plan, mergé" "docs(plans): groom mika#2976"
+    local merged_tip; merged_tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    _t2976_commit rescue.txt "rescapé" "wip(2976): rescapé de la chaîne de secours"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # SEUL le plan atterrit sur main : le `wip()` n'y est pas.
+    git -C "$FIXTURE_CLONE" cherry-pick "$merged_tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    gh() { printf '[{"number":2977,"state":"MERGED"}]\n'; }
+
+    local before after gate_log stashes rc=0
+    before=$(_t2976_refs "$br")
+    stashes=$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t5.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t5.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=unmerged_work' <<<"$gate_log" || failures="${failures}verdict should be unmerged_work, log: $gate_log; "
+    grep -qF -- 'unmerged=1' <<<"$gate_log" || failures="${failures}unmerged should be 1; "
+    # Le commit en péril est NOMMÉ, et pas seulement compté : c'est ce que
+    # l'opérateur lira pour le récupérer.
+    grep -qF -- "$lost" <<<"${_BRANCH_REUSE_COMMITS:-}" \
+        || failures="${failures}the unmerged commit should be named ($lost not in '${_BRANCH_REUSE_COMMITS:-}'); "
+    # L'effet, autant que le message : rien n'a bougé, rien n'a été stashé.
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ "$stashes" = "$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)" ] \
+        || failures="${failures}a stash entry was created; "
+    [ -d "$wt" ] || failures="${failures}worktree should be untouched; "
+    [ "$rc" = "0" ] || failures="${failures}observation tier must not halt yet (rc=$rc); "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T6 (non-mesure) : `gh` muet sur une branche par ailleurs périmée ---------
+#
+# Sépare « la porte ne mord sur rien » de « la porte ne mesure rien ». Le régime
+# attendu de cette population est VIDE ; un non-zéro en production rougit le
+# relevé de l'AC4 plutôt que de passer pour une reprise nominale.
+test_t2976_undetermined() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t6" wt="$T2976_WT_ROOT/fix-2976-t6"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" cherry-pick "$tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    # Aucune sortie réseau depuis le harness, et la mesure ÉCHOUE. `gh` n'est
+    # jamais invoqué via `command`, donc la fonction l'emporte (précédent
+    # `_t2492_recovery_probe`).
+    gh() { return 1; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t6.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t6.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=undetermined' <<<"$gate_log" || failures="${failures}verdict should be undetermined, log: $gate_log; "
+    grep -qF -- 'action=reuse_unmeasured' <<<"$gate_log" || failures="${failures}action should be reuse_unmeasured; "
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}BRANCH_SPENT should stay 0; "
+    [ "$rc" = "0" ] || failures="${failures}non-measure must not halt (rc=$rc); "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+for _t2976_case in \
+    "T1 (AC2a) branche locale d'un vol mergé: verdict=spent|test_t2976_local_spent" \
+    "T2 (AC2b) branche sur origin d'un vol mergé: verdict=spent|test_t2976_remote_spent" \
+    "T3 (AC2c) contrôle négatif — PR ouverte: verdict=live, rien ne bouge|test_t2976_open_pr_live" \
+    "T4 (AC2c bis) contrôle négatif — aucune PR: verdict=live, rien ne bouge|test_t2976_no_pr_live" \
+    "T5 (AC3) patch absent de main: verdict=unmerged_work, rien ne bouge|test_t2976_unmerged_work_halts" \
+    "T6 non-mesure — gh muet: verdict=undetermined, rien ne bouge|test_t2976_undetermined"; do
+    _t2976_label="${_t2976_case%%|*}"
+    _t2976_fn="${_t2976_case##*|}"
+    _t2976_out=$("$_t2976_fn" 2>/dev/null || echo "FAIL: harness aborted")
+    if [ "$_t2976_out" = "PASS" ]; then
+        PASS=$((PASS + 1)); echo "  ✓ mika#2976 $_t2976_label"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ mika#2976 $_t2976_label: $_t2976_out"
+    fi
+done
+
 # --- Summary ---
 
 echo ""

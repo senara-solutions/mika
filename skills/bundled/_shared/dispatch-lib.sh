@@ -3821,6 +3821,21 @@ _stash_and_remove_worktree() {
 #   _BRANCH_REUSE_UNMERGED — le compte de `>`
 #   _BRANCH_REUSE_COMMITS  — `<sha> <sujet>` par ligne (la liste de l'AC3)
 #   _BRANCH_REUSE_TIPS     — les refs effectivement lues
+#   _BRANCH_REUSE_VERDICT  — le jeton, pour un appelant qui ne peut pas capturer
+#
+# `_branch_reuse_emit <jeton>` — le jeton part sur stdout ET dans
+# `_BRANCH_REUSE_VERDICT`. Les deux, parce qu'ils servent deux lecteurs : un
+# appelant direct lit stdout, mais `_branch_reuse_gate` doit lire les quatre
+# AUTRES globales dans la même portée, donc sans `$( )`. Un `$( )` les
+# ramènerait à leurs défauts et la ligne de l'AC4 dirait `pr=none unmerged=0
+# tips=none` sur toute la population — un instrument qui mesure sa propre valeur
+# par défaut, et un zéro qui serait l'absence de mesure plutôt que la présence de
+# sûreté (mika#2272).
+_branch_reuse_emit() {
+    _BRANCH_REUSE_VERDICT="${1-}"
+    printf '%s\n' "${1-}"
+}
+
 _branch_reuse_verdict() {
     local repo_dir="${1-}" repo="${2-}" branch="${3-}"
 
@@ -3828,9 +3843,10 @@ _branch_reuse_verdict() {
     _BRANCH_REUSE_UNMERGED="0"
     _BRANCH_REUSE_COMMITS=""
     _BRANCH_REUSE_TIPS="none"
+    _BRANCH_REUSE_VERDICT=""
 
     if [ -z "$repo_dir" ] || [ -z "$repo" ] || [ -z "$branch" ]; then
-        printf 'undetermined\n'
+        _branch_reuse_emit undetermined
         return 0
     fi
 
@@ -3838,7 +3854,7 @@ _branch_reuse_verdict() {
     local pr_json=""
     pr_json=$(gh pr list --head "$branch" --repo "senara-solutions/$repo" --state all \
         --json number,state --limit 20 2>/dev/null) || {
-        printf 'undetermined\n'
+        _branch_reuse_emit undetermined
         return 0
     }
 
@@ -3847,10 +3863,10 @@ _branch_reuse_verdict() {
     # même faute que mika#2304, une cellule plus loin.
     local pr_count=""
     pr_count=$(printf '%s' "$pr_json" | jq -r 'length' 2>/dev/null) || pr_count=""
-    case "$pr_count" in ''|*[!0-9]*) printf 'undetermined\n'; return 0 ;; esac
+    case "$pr_count" in ''|*[!0-9]*) _branch_reuse_emit undetermined; return 0 ;; esac
 
     if [ "$pr_count" = "0" ]; then
-        printf 'live\n'
+        _branch_reuse_emit live
         return 0
     fi
 
@@ -3862,9 +3878,9 @@ _branch_reuse_verdict() {
     local open_count=""
     open_count=$(printf '%s' "$pr_json" \
         | jq -r '[.[] | select(.state == "OPEN")] | length' 2>/dev/null) || open_count=""
-    case "$open_count" in ''|*[!0-9]*) printf 'undetermined\n'; return 0 ;; esac
+    case "$open_count" in ''|*[!0-9]*) _branch_reuse_emit undetermined; return 0 ;; esac
     if [ "$open_count" != "0" ]; then
-        printf 'live\n'
+        _branch_reuse_emit live
         return 0
     fi
 
@@ -3888,7 +3904,7 @@ _branch_reuse_verdict() {
     # `-b $branch origin/main`. `live` est ici un NO-OP, pas un verdict de
     # travail en cours.
     if [ -z "$tips" ]; then
-        printf 'live\n'
+        _branch_reuse_emit live
         return 0
     fi
 
@@ -3907,7 +3923,7 @@ _branch_reuse_verdict() {
         fi
     done
     if [ "$read_failed" = "1" ]; then
-        printf 'undetermined\n'
+        _branch_reuse_emit undetermined
         return 0
     fi
 
@@ -3926,10 +3942,10 @@ _branch_reuse_verdict() {
     _BRANCH_REUSE_COMMITS="$unmerged_lines"
 
     if [ "$unmerged_count" -gt 0 ]; then
-        printf 'unmerged_work\n'
+        _branch_reuse_emit unmerged_work
         return 0
     fi
-    printf 'spent\n'
+    _branch_reuse_emit spent
     return 0
 }
 
@@ -3965,7 +3981,12 @@ _branch_reuse_gate() {
     local verdict action
 
     BRANCH_SPENT=0
-    verdict=$(_branch_reuse_verdict "$repo_dir" "$repo" "$branch")
+    # SANS `$( )` : la mesure pose cinq globales et un sous-shell n'en laisserait
+    # sortir aucune. Le jeton se lit donc dans `_BRANCH_REUSE_VERDICT`, et stdout
+    # — le contrat de la fonction pour un appelant direct — est écarté ici.
+    _BRANCH_REUSE_VERDICT=""
+    _branch_reuse_verdict "$repo_dir" "$repo" "$branch" >/dev/null
+    verdict="${_BRANCH_REUSE_VERDICT:-}"
 
     case "$verdict" in
         live)
