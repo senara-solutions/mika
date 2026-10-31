@@ -3676,6 +3676,421 @@ _assert_removable_worktree_path() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _stash_and_remove_worktree — retirer un worktree sans rien perdre
+#
+# mika#2976. SITE UNIQUE du geste « ce worktree doit disparaître, et ce qu'il
+# porte de non commité doit rester récupérable ». Deux appelants dans
+# `_set_up_worktree` : le relic non canonique (mika#1472, son auteur d'origine)
+# et la branche d'un vol atterri (`_reset_spent_branch`). C'est le MÊME geste,
+# écrit une fois — pas une seconde discipline de nettoyage à maintenir en
+# parallèle de celle-ci.
+#
+# Args :
+#   $1 repo_dir   — le dépôt qui porte le registre de worktrees
+#   $2 remove_dir — le worktree à retirer
+#   $3 recover_in — le worktree que l'indice de récupération nomme. TROISIÈME
+#                   argument, et non `$2` relu, parce que les deux DIFFÈRENT au
+#                   site du relic : on retire `$existing_wt`, qui n'existera plus
+#                   quand un opérateur lira le message, et on nomme le worktree
+#                   CANONIQUE. Jamais le checkout principal : y appliquer l'état
+#                   non commité d'un worktree est la signature exacte du sinistre
+#                   du 2026-09-21 (mika#2449 — staged + modified sur main,
+#                   rebuild bloqué). Le confondre avec `$2` est précisément le
+#                   défaut que mika#2449 a fermé, donc il est explicite ici
+#                   plutôt que capturé d'une globale.
+#   $4 branch     — pour nommer le stash
+#   $5 site       — nom de site pour `_assert_removable_worktree_path`, donc
+#                   trace d'audit d'un refus de suppression (mika#1943)
+#
+# Rend 0 si le worktree a été retiré, non-zéro si la garde mika#1943 a REFUSÉ le
+# chemin — et alors rien n'a été retiré, l'appelant décide. Le sens de
+# l'asymétrie est celui de mika#1943 : un worktree résiduel contre une
+# suppression irréversible.
+_stash_and_remove_worktree() {
+    local repo_dir="${1-}" remove_dir="${2-}" recover_in="${3-}" branch="${4-}" site="${5:-unknown}"
+
+    if [ -d "$remove_dir" ]; then
+        local dirty_state
+        dirty_state=$(git -C "$remove_dir" status --porcelain 2>/dev/null || true)
+        if [ -n "$dirty_state" ]; then
+            local stash_name
+            stash_name="dispatch-lib-stale-worktree-cleanup-$(printf '%s' "$branch" | tr / -)-$(date -u +%Y%m%dT%H%M%SZ)"
+            if git -C "$remove_dir" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
+                local stash_sha
+                stash_sha=$(git -C "$remove_dir" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
+                # mika#2449: the recovery hint names the CANONICAL worktree
+                # (`$recover_in`), never the primary/deployment checkout and never
+                # `$remove_dir` (removed below, so the hint would fail the moment
+                # an operator reads it). The stash stack is shared repo-wide, so
+                # the SHA resolves from any worktree of the repo.
+                # Held by a source scan in test-dispatch-lib.sh (allowlist empty).
+                echo "[dispatch-lib] stashed dirty state from $remove_dir as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $recover_in stash apply ${stash_sha:-<sha>} — in the canonical worktree, NOT in the primary checkout)" >&2
+            else
+                echo "[dispatch-lib] stash push failed or nothing to stash in $remove_dir; proceeding with remove" >&2
+            fi
+        fi
+    fi
+
+    # mika#1943: un worktree vient du registre git, donc `git worktree remove`
+    # le refuserait s'il n'en était pas un — mais c'est git qui protège, pas
+    # dispatch-lib, et un registre porte ce qu'on y a mis. Le passage par la
+    # garde est OBLIGATOIRE à tout site de suppression, sans exception.
+    if ! _assert_removable_worktree_path "$remove_dir" "$site"; then
+        return 1
+    fi
+    git -C "$repo_dir" worktree remove --force "$remove_dir" 2>/dev/null || true
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _branch_reuse_verdict — cette branche porte-t-elle un travail EN COURS ?
+#
+# mika#2976. Trois `REBASE_CONFLICT` mesurés en huit jours — mika#1727 le
+# 2026-10-23, mika#2968 deux fois le 2026-10-30 — pour une seule racine : le nom
+# de branche est DÉRIVÉ du ticket (`scripts/derive-branch-name`), donc le groom
+# d'un vol 2 dérive le nom du vol 1 et le dispatch reprend une branche DÉJÀ
+# ATTERRIE. Son contenu est dans `main` par squash, la porte de rebase le rejoue,
+# et elle bute. Le groom s'arrête sans plan et sans PR.
+#
+# Il existe déjà un mécanisme qui finit par assainir cet état :
+# `worktree_reaper` (mika#2420) retire le worktree d'une PR terminale et
+# supprime la branche locale avec. Mais il est PÉRIODIQUE (`0 */10 * * * *`,
+# grâce de 900 s après `closedAt`) là où le dispatch est ÉVÉNEMENTIEL, et le
+# vainqueur de la course décide de la base : le reflog du 2026-10-30 à 14:55:19Z
+# — « branch: Created from origin/main » — est la signature d'un tick arrivé
+# 2 h 32 après le merge. Les trois cas mesurés tombent tous dans cette fenêtre.
+# D'où cette porte : poser la MÊME question au moment du dispatch,
+# synchroniquement, sur la branche qu'il est sur le point de reprendre. Les deux
+# ne se recouvrent pas — le faucheur libère du disque sur une population
+# SCANNÉE, cette porte décide d'une base sur une branche NOMMÉE par le dispatch
+# en cours.
+#
+# ── P1 — le verdict des PR, FORMULÉ EN NÉGATIF ───────────────────────────────
+# « aucune PR ouverte », jamais « il existe une PR mergée ». Deux PR peuvent
+# partager un `headRefName` (une fermée, une rouverte), et le terme positif
+# déclarerait périmée une branche dont une PR est ouverte. C'est exactement le
+# raisonnement du terme T4 de `worktree_reaper.rs`, formulé en négatif pour cette
+# raison-là, et il se transporte parce que la population est la même.
+#
+# « AUCUNE PR » vaut `live`, DÉLIBÉRÉMENT. C'est la population d'une branche de
+# groom poussée avec son plan et pas encore implémentée — `pr_unknown` chez le
+# faucheur, qu'il conserve aussi. La traiter comme périmée détruirait le plan
+# d'un vol qui attend son dispatch d'implémentation : c'est le faux positif le
+# plus coûteux de tout ce ticket.
+#
+# ── P2 — la containment par PATCH-ID, qui est l'AC3 ──────────────────────────
+# P1 ne suffit pas : une PR mergée n'implique pas que TOUT ce que porte la
+# branche est dans `main`. Un commit poussé après l'approbation, ou le résidu
+# d'un `wip()` de la chaîne de secours, y vit encore.
+#
+# L'idiome est celui que la maison a déjà (`_check_duplicate_commits`, mika#784) :
+# `log --cherry-mark --right-only origin/main...<tip>` compare par PATCH-ID, donc
+# un commit absorbé par un squash sort avec la marque `=` et un commit réellement
+# neuf avec `>`. C'est précisément ce que `rev-list --count` ne sait pas faire, et
+# c'est l'origine du défaut : la porte de rebase compte des COMMITS là où il faut
+# compter des PATCHS.
+#
+# Les DEUX refs sont lues — `refs/heads/$branch` et `refs/remotes/origin/$branch`
+# — et l'union des `>` est retenue. Le troisième cas du ticket est exactement
+# celui-là : la ref locale `origin/…` pointait sur `6069e503` que le distant ne
+# portait plus. Une seule ref lue aurait manqué la moitié de la population.
+#
+# ── `undetermined` retombe sur le comportement d'aujourd'hui, et le DIT ──────
+# Le faucheur fail-safe vers « conserver » parce qu'une suppression fautive ne se
+# répare pas. Ici la direction sûre est INVERSE, et l'inversion est raisonnée :
+# cette porte RÉINITIALISE une branche. Une non-mesure qui conduirait à
+# réinitialiser détruirait du travail ; une non-mesure qui conduit à reprendre
+# reproduit le `REBASE_CONFLICT` d'aujourd'hui, c'est-à-dire un échec bruyant,
+# borné, et déjà outillé. Donc : non-mesure ⇒ reprise, comportement inchangé, et
+# une ligne de journal qui NOMME la non-mesure — un repli silencieux se lirait
+# comme une mesure (motif mika#2304). Le régime attendu de cette population est
+# vide, et elle est comptée séparément pour que « la porte ne mord sur rien » et
+# « la porte ne mesure rien » n'impriment pas les mêmes octets.
+#
+# Args : $1 repo_dir, $2 repo (basename), $3 branch
+#
+# Écrit UN jeton sur stdout : live | spent | unmerged_work | undetermined.
+# Un jeton plutôt qu'un code de retour à quatre valeurs : un `rc` à quatre
+# valeurs force chaque appelant à réécrire la table, et `_remote_branch_exists`
+# montre déjà le coût d'une troisième valeur mal lue.
+#
+# Pose quatre globales pour la ligne de journal et pour la halte de l'AC3 —
+# forme déjà pratiquée par `_pilot_max_turns`/`_PILOT_MAX_TURNS` ; parser une
+# sortie composite serait un lecteur de plus à écrire et à faire dériver :
+#   _BRANCH_REUSE_PR       — `#<n> <STATE>` (jusqu'à trois), ou `none`
+#   _BRANCH_REUSE_UNMERGED — le compte de `>`
+#   _BRANCH_REUSE_COMMITS  — `<sha> <sujet>` par ligne (la liste de l'AC3)
+#   _BRANCH_REUSE_TIPS     — les refs effectivement lues
+#   _BRANCH_REUSE_VERDICT  — le jeton, pour un appelant qui ne peut pas capturer
+#
+# `_branch_reuse_emit <jeton>` — le jeton part sur stdout ET dans
+# `_BRANCH_REUSE_VERDICT`. Les deux, parce qu'ils servent deux lecteurs : un
+# appelant direct lit stdout, mais `_branch_reuse_gate` doit lire les quatre
+# AUTRES globales dans la même portée, donc sans `$( )`. Un `$( )` les
+# ramènerait à leurs défauts et la ligne de l'AC4 dirait `pr=none unmerged=0
+# tips=none` sur toute la population — un instrument qui mesure sa propre valeur
+# par défaut, et un zéro qui serait l'absence de mesure plutôt que la présence de
+# sûreté (mika#2272).
+_branch_reuse_emit() {
+    _BRANCH_REUSE_VERDICT="${1-}"
+    printf '%s\n' "${1-}"
+}
+
+_branch_reuse_verdict() {
+    local repo_dir="${1-}" repo="${2-}" branch="${3-}"
+
+    _BRANCH_REUSE_PR="none"
+    _BRANCH_REUSE_UNMERGED="0"
+    _BRANCH_REUSE_COMMITS=""
+    _BRANCH_REUSE_TIPS="none"
+    _BRANCH_REUSE_VERDICT=""
+
+    if [ -z "$repo_dir" ] || [ -z "$repo" ] || [ -z "$branch" ]; then
+        _branch_reuse_emit undetermined
+        return 0
+    fi
+
+    # --- P1 : le verdict des PR -------------------------------------------
+    local pr_json=""
+    pr_json=$(gh pr list --head "$branch" --repo "senara-solutions/$repo" --state all \
+        --json number,state --limit 20 2>/dev/null) || {
+        _branch_reuse_emit undetermined
+        return 0
+    }
+
+    # `jq` muet est une NON-MESURE, pas « aucune PR ». Les confondre ferait dire
+    # `live` sur une sortie illisible en l'habillant du verdict nominal — la
+    # même faute que mika#2304, une cellule plus loin.
+    local pr_count=""
+    pr_count=$(printf '%s' "$pr_json" | jq -r 'length' 2>/dev/null) || pr_count=""
+    case "$pr_count" in ''|*[!0-9]*) _branch_reuse_emit undetermined; return 0 ;; esac
+
+    if [ "$pr_count" = "0" ]; then
+        _branch_reuse_emit live
+        return 0
+    fi
+
+    _BRANCH_REUSE_PR=$(printf '%s' "$pr_json" \
+        | jq -r '.[] | "#\(.number) \(.state)"' 2>/dev/null \
+        | head -3 | tr '\n' ',' | sed 's/,$//')
+    [ -n "$_BRANCH_REUSE_PR" ] || _BRANCH_REUSE_PR="unreadable"
+
+    local open_count=""
+    open_count=$(printf '%s' "$pr_json" \
+        | jq -r '[.[] | select(.state == "OPEN")] | length' 2>/dev/null) || open_count=""
+    case "$open_count" in ''|*[!0-9]*) _branch_reuse_emit undetermined; return 0 ;; esac
+    if [ "$open_count" != "0" ]; then
+        _branch_reuse_emit live
+        return 0
+    fi
+
+    # --- P2 : la containment par patch-id, sur les DEUX refs --------------
+    local tips="" ref sha
+    for ref in "refs/heads/$branch" "refs/remotes/origin/$branch"; do
+        sha=$(git -C "$repo_dir" rev-parse --verify --quiet "$ref" 2>/dev/null) || sha=""
+        [ -n "$sha" ] || continue
+        # Les deux refs coïncident dans le cas nominal : une seule lecture
+        # suffit alors, et `_BRANCH_REUSE_TIPS` ne nomme que ce qui a été lu.
+        case " $tips " in *" $sha "*) continue ;; esac
+        tips="${tips}${tips:+ }$sha"
+        case "$_BRANCH_REUSE_TIPS" in
+            none) _BRANCH_REUSE_TIPS="$ref" ;;
+            *)    _BRANCH_REUSE_TIPS="$_BRANCH_REUSE_TIPS,$ref" ;;
+        esac
+    done
+
+    # Aucune ref : la branche n'existe ni en local ni sur le distant. Il n'y a
+    # rien à reprendre, donc rien à réinitialiser — le chemin nominal crée déjà
+    # `-b $branch origin/main`. `live` est ici un NO-OP, pas un verdict de
+    # travail en cours.
+    if [ -z "$tips" ]; then
+        _branch_reuse_emit live
+        return 0
+    fi
+
+    local unmerged_lines="" tip log_out right read_failed=0
+    for tip in $tips; do
+        log_out=""
+        if ! log_out=$(git -C "$repo_dir" log --cherry-mark --right-only \
+                --format='%m %H %s' "origin/main...$tip" 2>/dev/null); then
+            read_failed=1
+            break
+        fi
+        right=$(printf '%s\n' "$log_out" | grep '^>' || true)
+        if [ -n "$right" ]; then
+            unmerged_lines="${unmerged_lines}${unmerged_lines:+
+}${right}"
+        fi
+    done
+    if [ "$read_failed" = "1" ]; then
+        _branch_reuse_emit undetermined
+        return 0
+    fi
+
+    # L'union des `>` des deux refs, dédupliquée PAR SHA et dans l'ordre de
+    # lecture : une ref qui porte la moitié de la population ne doit pas doubler
+    # le compte de l'autre.
+    if [ -n "$unmerged_lines" ]; then
+        unmerged_lines=$(printf '%s\n' "$unmerged_lines" | sed 's/^> *//' | awk '!seen[$1]++')
+    fi
+
+    local unmerged_count=0
+    if [ -n "$unmerged_lines" ]; then
+        unmerged_count=$(printf '%s\n' "$unmerged_lines" | grep -c . || true)
+    fi
+    _BRANCH_REUSE_UNMERGED="$unmerged_count"
+    _BRANCH_REUSE_COMMITS="$unmerged_lines"
+
+    if [ "$unmerged_count" -gt 0 ]; then
+        _branch_reuse_emit unmerged_work
+        return 0
+    fi
+    _branch_reuse_emit spent
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _reset_spent_branch — la branche périmée repart de `origin/main`
+#
+# mika#2976, § 4 du plan. RÉINITIALISER et non renommer : le nom de branche est
+# DÉRIVÉ de (titre, numéro, labels, callout) par `scripts/derive-branch-name`, il
+# n'est pas choisi. Un nom distinct pour le vol 2 demanderait un suffixe que la
+# dérivation ne produit pas, et il casserait l'invariant inter-fichiers
+# `worktree_path_slug == sanitize(branch_ref)` que `derive-worktree-path` tient.
+#
+# Le worktree part AVANT la branche, et par `_stash_and_remove_worktree` : git
+# refuse `branch -f` sur une branche checked out, et le non-commité du worktree
+# d'un vol mergé est stashé sous un nom horodaté avant retrait. Le `recover_in`
+# est `$worktree_dir` lui-même — le worktree CANONIQUE, celui que le dispatch
+# recrée juste après à la même place, jamais le checkout principal (mika#2449).
+#
+# Rend non-zéro sur le refus de la garde mika#1943 comme sur celui de git, et
+# n'écrit alors rien de plus : l'appelant retombe sur la reprise d'aujourd'hui,
+# donc sur le `REBASE_CONFLICT` d'aujourd'hui. Bruyant plutôt que destructeur,
+# la même asymétrie que partout ailleurs dans cette porte.
+_reset_spent_branch() {
+    local repo_dir="${1-}" worktree_dir="${2-}" branch="${3-}"
+
+    if [ -z "$repo_dir" ] || [ -z "$worktree_dir" ] || [ -z "$branch" ]; then
+        echo "[dispatch-lib] branch_reset_refused: empty argument (repo_dir=${repo_dir:-<empty>} worktree=${worktree_dir:-<empty>} branch=${branch:-<empty>}) — mika#1943" >&2
+        return 1
+    fi
+
+    if ! _stash_and_remove_worktree "$repo_dir" "$worktree_dir" "$worktree_dir" "$branch" set_up_worktree_spent; then
+        echo "[dispatch-lib] branch_reset_refused: removal guard declined $worktree_dir (mika#1943)" >&2
+        return 1
+    fi
+
+    # `branch -f` et non un `-D` suivi d'un `-b` : un seul geste, aucune fenêtre
+    # où la branche n'existe plus, et un échec propre si quelque chose la tient
+    # encore ailleurs — c'est ce refus qui porte le prix nommé au site d'appel.
+    local reset_err
+    reset_err=$(git -C "$repo_dir" branch -f "$branch" origin/main 2>&1) || {
+        echo "[dispatch-lib] branch_reset_refused: git declined 'branch -f $branch origin/main': ${reset_err:-<empty>}" >&2
+        return 1
+    }
+    echo "[dispatch-lib] branch_reset: $branch -> origin/main ($(git -C "$repo_dir" rev-parse --short origin/main 2>/dev/null || echo '<unknown>'))" >&2
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _branch_reuse_gate — le verdict, l'action, et UNE ligne greppable
+#
+# mika#2976. Site unique de la correspondance verdict → action, et de la ligne
+# d'observabilité qui est l'instrument de l'AC4. Séparée de `_set_up_worktree`
+# pour une raison de fond et non de style : la décision est testable en appel
+# direct, sur un vrai dépôt, alors que `_set_up_worktree` exige le binaire
+# `mika`, `derive-branch-name`, `gh issue view` et un siège de ticket. Un test
+# qui rejouerait la correspondance au lieu de l'exécuter ne mesurerait que
+# lui-même.
+#
+# `verdict` et `action` sont DEUX champs et non un. Ils coïncident aujourd'hui
+# sauf dans deux cas : `undetermined` (verdict non mesuré, action de reprise) et
+# un refus de la garde mika#1943 (verdict `spent`, action de reprise). Les
+# fusionner rendrait ces deux-là indistinguables de la reprise nominale, qui est
+# précisément la population dont l'AC4 veut le compte.
+#
+# Une seule clé pour tous les aboutissements, sur le modèle littéral de
+# `rebase_gate` et pour la raison que son commentaire énonce : la question que la
+# porte ne peut pas trancher de son côté — la boucle reprend-elle encore quelque
+# chose, ou la porte est-elle devenue si stricte que plus rien ne reprend ? —
+# exige un nombre.
+#
+# Args : $1 repo_dir, $2 repo, $3 branch, $4 worktree_dir, $5 issue_num
+# Pose `BRANCH_SPENT` (1 ssi la branche a été réinitialisée) et, sur la
+# population AC3, `RESULT`.
+# Rend 0 si le dispatch continue, 1 s'il doit s'arrêter (halte AC3).
+_branch_reuse_gate() {
+    local repo_dir="${1-}" repo="${2-}" branch="${3-}" worktree_dir="${4-}" issue_num="${5-}"
+    local verdict action
+
+    BRANCH_SPENT=0
+    # SANS `$( )` : la mesure pose cinq globales et un sous-shell n'en laisserait
+    # sortir aucune. Le jeton se lit donc dans `_BRANCH_REUSE_VERDICT`, et stdout
+    # — le contrat de la fonction pour un appelant direct — est écarté ici.
+    _BRANCH_REUSE_VERDICT=""
+    _branch_reuse_verdict "$repo_dir" "$repo" "$branch" >/dev/null
+    verdict="${_BRANCH_REUSE_VERDICT:-}"
+
+    case "$verdict" in
+        live)
+            action="reuse"
+            ;;
+        spent)
+            if _reset_spent_branch "$repo_dir" "$worktree_dir" "$branch"; then
+                BRANCH_SPENT=1
+                action="reset"
+            else
+                # Le refus est déjà journalisé par la réinitialisation, avec son
+                # motif. Il devient ici une `action` DISTINCTE de `reuse` : les
+                # fondre rendrait ce cas indiscernable de la reprise nominale, qui
+                # est précisément la population dont l'AC4 veut le compte, et un
+                # `action=reuse` sur un verdict `spent` se lirait comme une
+                # décision alors que c'est un repli (mika#2304).
+                action="reuse_reset_refused"
+            fi
+            ;;
+        unmerged_work)
+            action="halt"
+            ;;
+        *)
+            # Un jeton inattendu est une NON-MESURE, pas une reprise nominale :
+            # le bras large est fermé vers `undetermined` plutôt que vers
+            # `reuse`, sans quoi un futur jeton mal orthographié compterait dans
+            # la population de l'AC4 comme une reprise voulue.
+            verdict="undetermined"
+            action="reuse_unmeasured"
+            ;;
+    esac
+
+    echo "[dispatch-lib] branch_reuse_gate: branch=${branch} verdict=${verdict} pr=${_BRANCH_REUSE_PR:-none} unmerged=${_BRANCH_REUSE_UNMERGED:-0} tips=${_BRANCH_REUSE_TIPS:-none} action=${action}" >&2
+
+    # --- La halte de l'AC3 ------------------------------------------------
+    #
+    # UN STATUT NEUF, et pas un `REBASE_CONFLICT` de plus : deux populations sous
+    # un même nom de statut ne sont pas soustrayables (mika#2205), et c'est
+    # exactement le compte que l'AC4 veut lire. Le relevé d'aujourd'hui ne
+    # saurait pas distinguer un conflit de rebase légitime d'une branche à
+    # travail en péril si les deux sortaient sous le même jeton.
+    #
+    # Les commits sont NOMMÉS, pas seulement comptés : c'est ce que l'opérateur
+    # lira pour les récupérer, et un compte sans sha ne se récupère pas. La
+    # phrase sur l'effet est vraie par le PLACEMENT du site d'appel, en amont du
+    # nettoyage du relic — c'est la contrainte que ce placement achète.
+    if [ "$action" = "halt" ]; then
+        RESULT="STATUS=BRANCH_HAS_UNMERGED_WORK
+Branch ${branch} carries ${_BRANCH_REUSE_UNMERGED:-?} commit(s) absent from origin/main by patch-id, while its PRs are all terminal (${_BRANCH_REUSE_PR:-none}).
+Unmerged commits:
+${_BRANCH_REUSE_COMMITS:-<none>}
+Nothing was reset, nothing was removed, nothing was stashed.
+Resolve manually before re-dispatching ${repo}#${issue_num}."
+        return 1
+    fi
+
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _is_scaffold_path — ce chemin est-il de l'échafaudage possédé par dispatch-lib ?
 #
 # mika#2144. SITE UNIQUE des quatre motifs. mika#2157 (R3) écrivait déjà, dans ce
@@ -5219,6 +5634,41 @@ _set_up_worktree() {
             return 1
         fi
 
+        # --- Porte de reprise de branche (mika#2976) ---
+        #
+        # Le raisonnement, les deux prédicats et l'asymétrie de la non-mesure
+        # vivent sur `_branch_reuse_verdict` ; la correspondance verdict → action
+        # et la ligne greppable sur `_branch_reuse_gate`. Ce qui se décide ICI,
+        # c'est le PLACEMENT, et ses deux bornes portent chacune leur conséquence.
+        #
+        # APRÈS le `git fetch origin main` ci-dessus : sans lui `origin/main` est
+        # périmé, et P2 compterait comme non fusionné ce qui vient d'atterrir —
+        # soit la halte de l'AC3 sur la population même que cette porte doit
+        # réinitialiser.
+        #
+        # AVANT le nettoyage du relic non canonique, et pas seulement avant le
+        # bloc reprise-ou-création. La halte de l'AC3 affirme « nothing was
+        # removed, nothing was stashed » : placée après, un relic aurait déjà été
+        # retiré et stashé, et le message mentirait sur son propre effet. Le prix
+        # de ce choix est NOMMÉ plutôt que caché — une branche à la fois périmée
+        # ET checked out à un chemin non canonique voit son `branch -f` refusé
+        # par git, la réinitialisation rend non-zéro, et on retombe sur le
+        # `REBASE_CONFLICT` d'aujourd'hui. C'est la même asymétrie bruyante-
+        # plutôt-que-destructrice que partout ailleurs dans cette porte.
+        #
+        # INCONDITIONNEL, et pas restreint à `dev-groom` : le défaut est dans la
+        # dérivation de BASE, et `dev-pilot` dérive la même branche par la même
+        # fonction. Un vol 2 d'implémentation sur un ticket à PR mergée prend
+        # exactement le même mur ; restreindre au groom bornerait la correction à
+        # la moitié de sa population pour aucun gain.
+        # `exit 1` et non `return 1`, comme la garde de rebase cinquante lignes
+        # plus bas : `RESULT` est posé, et c'est la sortie du processus qui le
+        # fait remonter au callback. Un `return 1` ici retomberait dans le mode
+        # texte-libre et le dispatch repartirait sans worktree.
+        if ! _branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM"; then
+            exit 1
+        fi
+
         # --- Pre-flight: detect and clean up non-canonical worktree paths (mika#1472) ---
         # Before the canonical dashed-path collision check below, detect if the target
         # branch is already checked out at a DIFFERENT (non-canonical) worktree path —
@@ -5237,44 +5687,27 @@ _set_up_worktree() {
         # n'est pas une garde.
         if [ -n "$WORKTREE_DIR" ] && [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
             echo "[dispatch-lib] pre-flight: branch $BRANCH is checked out at non-canonical path $existing_wt (canonical: $WORKTREE_DIR); cleaning up relic" >&2
-            if [ -d "$existing_wt" ]; then
-                local dirty_state
-                dirty_state=$(git -C "$existing_wt" status --porcelain 2>/dev/null || true)
-                if [ -n "$dirty_state" ]; then
-                    local stash_name
-                    stash_name="dispatch-lib-stale-worktree-cleanup-$(printf '%s' "$BRANCH" | tr / -)-$(date -u +%Y%m%dT%H%M%SZ)"
-                    if git -C "$existing_wt" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
-                        local stash_sha
-                        stash_sha=$(git -C "$existing_wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
-                        # mika#2449: the recovery hint names the CANONICAL worktree,
-                        # never `$SUB_REPO_DIR` (the primary/deployment checkout) and
-                        # never `$existing_wt` (removed fourteen lines below, so the
-                        # hint would fail the moment an operator reads it). Applying a
-                        # worktree's uncommitted state in the primary checkout is the
-                        # exact signature of the 2026-09-21 incident (staged+modified
-                        # on main, `pull --ff-only` refused). The stash stack is shared
-                        # repo-wide, so the SHA resolves from any worktree of the repo.
-                        # Held by a source scan in test-dispatch-lib.sh (allowlist empty).
-                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $WORKTREE_DIR stash apply ${stash_sha:-<sha>} — in the canonical worktree, NOT in the primary checkout)" >&2
-                    else
-                        echo "[dispatch-lib] stash push failed or nothing to stash in $existing_wt; proceeding with remove" >&2
-                    fi
-                fi
-            fi
-            # mika#1943: le relic vient du registre git, donc `git worktree
-            # remove` le refuserait s'il n'en était pas un — mais c'est git qui
-            # protège, pas dispatch-lib, et un registre porte ce qu'on y a mis.
-            # Sur refus on ne supprime pas : le `worktree add` plus bas échouera
-            # alors bruyamment (`worktree_setup_failed`), ce qui est le bon sens
-            # de l'asymétrie — un worktree résiduel contre une suppression
+            # mika#2976: le geste — stash, capture du SHA, indice de récupération
+            # nommant le worktree CANONIQUE (mika#2449), garde mika#1943 —
+            # vit désormais à un seul endroit. Le troisième argument est
+            # `$WORKTREE_DIR` et non `$existing_wt` : c'est l'invariant mika#2449,
+            # et il est maintenant porté par un argument nommé.
+            # Sur refus de la garde on ne supprime pas : le `worktree add` plus bas
+            # échouera alors bruyamment (`worktree_setup_failed`), ce qui est le bon
+            # sens de l'asymétrie — un worktree résiduel contre une suppression
             # irréversible.
-            if _assert_removable_worktree_path "$existing_wt" set_up_worktree_relic; then
-                git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
-            fi
+            _stash_and_remove_worktree "$SUB_REPO_DIR" "$existing_wt" "$WORKTREE_DIR" "$BRANCH" set_up_worktree_relic || true
         fi
 
         # Reuse existing worktree if valid
-        if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        #
+        # mika#2976 : une branche réinitialisée ne reprend JAMAIS un worktree.
+        # `_reset_spent_branch` vient de retirer celui-ci, donc le terme est
+        # normalement déjà faux ; on le pose quand même, parce que le retrait
+        # final est un `|| true` et qu'une garde qui dépend d'un point de
+        # contrôle en amont n'est pas une garde (même raisonnement que mika#1943
+        # trente lignes plus haut).
+        if [ "${BRANCH_SPENT:-0}" != "1" ] && [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
             git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
         else
             # mika#1943: nettoyage d'une entrée de registre périmée avant le
@@ -5309,7 +5742,26 @@ _set_up_worktree() {
             # l'issue indéterminée (rc 2, le distant n'a pas répondu) rend `if`
             # faux, exactement comme l'échec en rc 128 d'`ls-remote --exit-code`
             # le faisait ici, donc on retombe sur origin/main comme avant.
-            if _remote_branch_exists "$SUB_REPO_DIR" "$BRANCH"; then
+            if [ "${BRANCH_SPENT:-0}" = "1" ]; then
+                # mika#2976 — TROISIÈME BRAS EXPLICITE, et non le repli du `-b`.
+                #
+                # `$BRANCH` vient d'être réinitialisée sur `origin/main`, et elle
+                # EXISTE : les deux bras ci-dessous commencent par
+                # `worktree add -b "$BRANCH"`, qui échoue pour cette raison, et
+                # c'est leur seconde tentative — écrite pour le diagnostic de
+                # double échec de mika#1472, pas pour nous — qui ferait la bonne
+                # chose. Hériter la correction d'un repli, c'est la perdre au
+                # premier refactor de ce repli.
+                #
+                # Et sur le bras distant, la PREMIÈRE tentative part de
+                # `origin/$BRANCH` : la tête périmée, celle dont le rejeu est le
+                # défaut du ticket. Si elle réussissait — un `-b` sur une branche
+                # que la réinitialisation aurait échoué à poser — le dispatch
+                # repartirait exactement sur le mur qu'on vient de retirer.
+                if git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH" 2>"$wt_err_1"; then
+                    wt_add_ok=1
+                fi
+            elif _remote_branch_exists "$SUB_REPO_DIR" "$BRANCH"; then
                 git -C "$SUB_REPO_DIR" fetch origin "$BRANCH" 2>/dev/null || true
                 if git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$BRANCH" 2>"$wt_err_1"; then
                     wt_add_ok=1
