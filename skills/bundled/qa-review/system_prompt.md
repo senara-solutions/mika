@@ -64,7 +64,7 @@ The engine enforces this with an EndTurn guard (`guard.equivalence_claim`) paral
 
 ### Review Depth Declaration
 
-Every verdict MUST include a `DEPTH:` line that honestly declares the level of code analysis performed. The depth is determined by the engine-injected diff availability — read the `<!-- context_meta: ... -->` annotation prepended to the `{{pr_diff}}` block below.
+Every verdict MUST include a `DEPTH:` line that honestly declares the level of code analysis performed. The depth is determined by the engine-injected diff availability — read the `context_meta` annotation prepended to the `pr_diff` context block below.
 
 | Depth | Meaning | Context status |
 |-------|---------|----------------|
