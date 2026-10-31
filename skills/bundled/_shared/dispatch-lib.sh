@@ -3676,6 +3676,73 @@ _assert_removable_worktree_path() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _stash_and_remove_worktree — retirer un worktree sans rien perdre
+#
+# mika#2976. SITE UNIQUE du geste « ce worktree doit disparaître, et ce qu'il
+# porte de non commité doit rester récupérable ». Deux appelants dans
+# `_set_up_worktree` : le relic non canonique (mika#1472, son auteur d'origine)
+# et la branche d'un vol atterri (`_reset_spent_branch`). C'est le MÊME geste,
+# écrit une fois — pas une seconde discipline de nettoyage à maintenir en
+# parallèle de celle-ci.
+#
+# Args :
+#   $1 repo_dir   — le dépôt qui porte le registre de worktrees
+#   $2 remove_dir — le worktree à retirer
+#   $3 recover_in — le worktree que l'indice de récupération nomme. TROISIÈME
+#                   argument, et non `$2` relu, parce que les deux DIFFÈRENT au
+#                   site du relic : on retire `$existing_wt`, qui n'existera plus
+#                   quand un opérateur lira le message, et on nomme le worktree
+#                   CANONIQUE. Jamais le checkout principal : y appliquer l'état
+#                   non commité d'un worktree est la signature exacte du sinistre
+#                   du 2026-09-21 (mika#2449 — staged + modified sur main,
+#                   rebuild bloqué). Le confondre avec `$2` est précisément le
+#                   défaut que mika#2449 a fermé, donc il est explicite ici
+#                   plutôt que capturé d'une globale.
+#   $4 branch     — pour nommer le stash
+#   $5 site       — nom de site pour `_assert_removable_worktree_path`, donc
+#                   trace d'audit d'un refus de suppression (mika#1943)
+#
+# Rend 0 si le worktree a été retiré, non-zéro si la garde mika#1943 a REFUSÉ le
+# chemin — et alors rien n'a été retiré, l'appelant décide. Le sens de
+# l'asymétrie est celui de mika#1943 : un worktree résiduel contre une
+# suppression irréversible.
+_stash_and_remove_worktree() {
+    local repo_dir="${1-}" remove_dir="${2-}" recover_in="${3-}" branch="${4-}" site="${5:-unknown}"
+
+    if [ -d "$remove_dir" ]; then
+        local dirty_state
+        dirty_state=$(git -C "$remove_dir" status --porcelain 2>/dev/null || true)
+        if [ -n "$dirty_state" ]; then
+            local stash_name
+            stash_name="dispatch-lib-stale-worktree-cleanup-$(printf '%s' "$branch" | tr / -)-$(date -u +%Y%m%dT%H%M%SZ)"
+            if git -C "$remove_dir" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
+                local stash_sha
+                stash_sha=$(git -C "$remove_dir" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
+                # mika#2449: the recovery hint names the CANONICAL worktree
+                # (`$recover_in`), never the primary/deployment checkout and never
+                # `$remove_dir` (removed below, so the hint would fail the moment
+                # an operator reads it). The stash stack is shared repo-wide, so
+                # the SHA resolves from any worktree of the repo.
+                # Held by a source scan in test-dispatch-lib.sh (allowlist empty).
+                echo "[dispatch-lib] stashed dirty state from $remove_dir as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $recover_in stash apply ${stash_sha:-<sha>} — in the canonical worktree, NOT in the primary checkout)" >&2
+            else
+                echo "[dispatch-lib] stash push failed or nothing to stash in $remove_dir; proceeding with remove" >&2
+            fi
+        fi
+    fi
+
+    # mika#1943: un worktree vient du registre git, donc `git worktree remove`
+    # le refuserait s'il n'en était pas un — mais c'est git qui protège, pas
+    # dispatch-lib, et un registre porte ce qu'on y a mis. Le passage par la
+    # garde est OBLIGATOIRE à tout site de suppression, sans exception.
+    if ! _assert_removable_worktree_path "$remove_dir" "$site"; then
+        return 1
+    fi
+    git -C "$repo_dir" worktree remove --force "$remove_dir" 2>/dev/null || true
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _is_scaffold_path — ce chemin est-il de l'échafaudage possédé par dispatch-lib ?
 #
 # mika#2144. SITE UNIQUE des quatre motifs. mika#2157 (R3) écrivait déjà, dans ce
@@ -5237,40 +5304,16 @@ _set_up_worktree() {
         # n'est pas une garde.
         if [ -n "$WORKTREE_DIR" ] && [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
             echo "[dispatch-lib] pre-flight: branch $BRANCH is checked out at non-canonical path $existing_wt (canonical: $WORKTREE_DIR); cleaning up relic" >&2
-            if [ -d "$existing_wt" ]; then
-                local dirty_state
-                dirty_state=$(git -C "$existing_wt" status --porcelain 2>/dev/null || true)
-                if [ -n "$dirty_state" ]; then
-                    local stash_name
-                    stash_name="dispatch-lib-stale-worktree-cleanup-$(printf '%s' "$BRANCH" | tr / -)-$(date -u +%Y%m%dT%H%M%SZ)"
-                    if git -C "$existing_wt" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
-                        local stash_sha
-                        stash_sha=$(git -C "$existing_wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
-                        # mika#2449: the recovery hint names the CANONICAL worktree,
-                        # never `$SUB_REPO_DIR` (the primary/deployment checkout) and
-                        # never `$existing_wt` (removed fourteen lines below, so the
-                        # hint would fail the moment an operator reads it). Applying a
-                        # worktree's uncommitted state in the primary checkout is the
-                        # exact signature of the 2026-09-21 incident (staged+modified
-                        # on main, `pull --ff-only` refused). The stash stack is shared
-                        # repo-wide, so the SHA resolves from any worktree of the repo.
-                        # Held by a source scan in test-dispatch-lib.sh (allowlist empty).
-                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $WORKTREE_DIR stash apply ${stash_sha:-<sha>} — in the canonical worktree, NOT in the primary checkout)" >&2
-                    else
-                        echo "[dispatch-lib] stash push failed or nothing to stash in $existing_wt; proceeding with remove" >&2
-                    fi
-                fi
-            fi
-            # mika#1943: le relic vient du registre git, donc `git worktree
-            # remove` le refuserait s'il n'en était pas un — mais c'est git qui
-            # protège, pas dispatch-lib, et un registre porte ce qu'on y a mis.
-            # Sur refus on ne supprime pas : le `worktree add` plus bas échouera
-            # alors bruyamment (`worktree_setup_failed`), ce qui est le bon sens
-            # de l'asymétrie — un worktree résiduel contre une suppression
+            # mika#2976: le geste — stash, capture du SHA, indice de récupération
+            # nommant le worktree CANONIQUE (mika#2449), garde mika#1943 —
+            # vit désormais à un seul endroit. Le troisième argument est
+            # `$WORKTREE_DIR` et non `$existing_wt` : c'est l'invariant mika#2449,
+            # et il est maintenant porté par un argument nommé.
+            # Sur refus de la garde on ne supprime pas : le `worktree add` plus bas
+            # échouera alors bruyamment (`worktree_setup_failed`), ce qui est le bon
+            # sens de l'asymétrie — un worktree résiduel contre une suppression
             # irréversible.
-            if _assert_removable_worktree_path "$existing_wt" set_up_worktree_relic; then
-                git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
-            fi
+            _stash_and_remove_worktree "$SUB_REPO_DIR" "$existing_wt" "$WORKTREE_DIR" "$BRANCH" set_up_worktree_relic || true
         fi
 
         # Reuse existing worktree if valid

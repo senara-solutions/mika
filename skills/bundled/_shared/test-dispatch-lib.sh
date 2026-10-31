@@ -3889,6 +3889,16 @@ echo "---------------------------------------------------"
 # Extract the _set_up_worktree function body for structural assertions
 SET_UP_WT_FUNC=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
 
+# mika#2976 a EXTRAIT le geste « stash puis retire » en `_stash_and_remove_worktree`
+# (deux appelants : ce site-ci, et `_reset_spent_branch`). Les six assertions U1
+# ci-dessous se répartissent donc en deux moitiés, et aucune n'est perdue : la
+# DÉTECTION du relic reste dans `_set_up_worktree`, le GESTE est dans le helper,
+# et la DÉLÉGATION entre les deux est elle-même assertionnée. Un helper juste
+# qu'aucun site n'appelle ne nettoierait rien.
+STASH_REMOVE_FUNC=$(sed -n '/^_stash_and_remove_worktree()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2976 bonne foi: le corps de _stash_and_remove_worktree est non vide" "yes" \
+    "$([ -n "$STASH_REMOVE_FUNC" ] && echo yes || echo non)"
+
 # U1: Pre-flight block contains worktree list --porcelain detection
 assert_contains "Pre-flight uses worktree list --porcelain" \
     'worktree list --porcelain' "$SET_UP_WT_FUNC"
@@ -3897,25 +3907,32 @@ assert_contains "Pre-flight uses worktree list --porcelain" \
 assert_contains "Pre-flight awk matches refs/heads/\$BRANCH" \
     'refs/heads/$BRANCH' "$SET_UP_WT_FUNC"
 
-# U1: Pre-flight block contains the directory-exists guard
-assert_contains "Pre-flight has directory-exists guard for existing_wt" \
-    '[ -d "$existing_wt" ]' "$SET_UP_WT_FUNC"
+# U1: Pre-flight delegates the relic's stash-then-remove to the single-site helper,
+# passing the relic as the removal target and the CANONICAL worktree as the
+# recovery target (mika#2449, now an argument rather than a global read).
+assert_contains "Pre-flight délègue le geste au helper, relic retiré / canonique nommé" \
+    '_stash_and_remove_worktree "$SUB_REPO_DIR" "$existing_wt" "$WORKTREE_DIR" "$BRANCH" set_up_worktree_relic' \
+    "$SET_UP_WT_FUNC"
 
-# U1: Pre-flight block contains status --porcelain check
-assert_contains "Pre-flight checks dirty state via status --porcelain" \
-    'status --porcelain' "$SET_UP_WT_FUNC"
+# U1: the helper carries the directory-exists guard
+assert_contains "Helper has directory-exists guard for the removal target" \
+    '[ -d "$remove_dir" ]' "$STASH_REMOVE_FUNC"
 
-# U1: Pre-flight block contains stash push -u -m with descriptive name pattern
-assert_contains "Pre-flight stashes with descriptive name (stash push --include-untracked -m)" \
-    'stash push --include-untracked -m "$stash_name"' "$SET_UP_WT_FUNC"
+# U1: the helper checks dirty state via status --porcelain
+assert_contains "Helper checks dirty state via status --porcelain" \
+    'status --porcelain' "$STASH_REMOVE_FUNC"
 
-# U1: Pre-flight block contains the stale-worktree-cleanup naming convention
-assert_contains "Pre-flight stash name uses dispatch-lib-stale-worktree-cleanup prefix" \
-    'dispatch-lib-stale-worktree-cleanup' "$SET_UP_WT_FUNC"
+# U1: the helper stashes with a descriptive name
+assert_contains "Helper stashes with descriptive name (stash push --include-untracked -m)" \
+    'stash push --include-untracked -m "$stash_name"' "$STASH_REMOVE_FUNC"
 
-# U1: Pre-flight block contains worktree remove --force for the existing_wt
-assert_contains "Pre-flight removes non-canonical worktree with --force" \
-    'worktree remove --force "$existing_wt"' "$SET_UP_WT_FUNC"
+# U1: the helper keeps the stale-worktree-cleanup naming convention
+assert_contains "Helper stash name uses dispatch-lib-stale-worktree-cleanup prefix" \
+    'dispatch-lib-stale-worktree-cleanup' "$STASH_REMOVE_FUNC"
+
+# U1: the helper removes the worktree with --force
+assert_contains "Helper removes the worktree with --force" \
+    'worktree remove --force "$remove_dir"' "$STASH_REMOVE_FUNC"
 
 # U1: Call ordering — pre-flight cleanup runs BEFORE the existing dashed-path
 # collision check (the "Reuse existing worktree if valid" block).
@@ -8932,8 +8949,16 @@ _mika1943_guard_calls_in() {
     awk -v fn="^$1\\\\(\\\\) \\\\{" '$0 ~ fn, /^\}/' "$DISPATCH_LIB" \
         | grep -c '_assert_removable_worktree_path' || true
 }
-assert_eq "mika#1943 U2: _set_up_worktree garde ses deux suppressions" \
-    "2" "$(_mika1943_guard_calls_in _set_up_worktree)"
+# mika#2976: `_set_up_worktree` avait DEUX appels directs. L'un des deux — le
+# relic non canonique — vit maintenant dans `_stash_and_remove_worktree`, qui
+# est le second appelant du helper avec `_reset_spent_branch`. Le total de sites
+# de suppression gardés est inchangé ; c'est leur répartition qui a bougé, et le
+# recensement suit, parce que l'invariant porte sur *tout* site de suppression
+# et non sur une liste figée.
+assert_eq "mika#1943 U2: _set_up_worktree garde sa suppression directe (registre périmé)" \
+    "1" "$(_mika1943_guard_calls_in _set_up_worktree)"
+assert_eq "mika#1943 U2 (mika#2976): _stash_and_remove_worktree garde la sienne" \
+    "1" "$(_mika1943_guard_calls_in _stash_and_remove_worktree)"
 assert_eq "mika#1943 U2: _handle_dry_run garde la sienne" \
     "1" "$(_mika1943_guard_calls_in _handle_dry_run)"
 assert_eq "mika#1943 U2: _clean_worktree_for_rebase garde son rm -rf" \
@@ -9607,14 +9632,21 @@ assert_eq "mika#2449 bonne foi: le scan trouve ≥ 2 sites « recover with … s
     "$([ "$T2449_SITE_COUNT" -ge 2 ] && echo yes || echo "non ($T2449_SITE_COUNT)")"
 assert_eq "mika#2449: aucun site « recover with » ne nomme SUB_REPO_DIR (allowlist vide)" "0" \
     "$(printf '%s\n' "$T2449_RECOVER_SITES" | grep -c 'SUB_REPO_DIR' || true)"
-# Le site B doit nommer le worktree CANONIQUE, pas le relic : celui-ci est
-# supprimé quelques lignes plus bas (`worktree remove --force "$existing_wt"`),
-# donc une consigne qui le nommerait échouerait au moment où l'opérateur la lit.
-T2449_SITE_B=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep 'stale-worktree-cleanup\|existing_wt' || true)
-assert_contains "mika#2449: le site B (relic) prescrit le worktree canonique \$WORKTREE_DIR" \
-    'git -C $WORKTREE_DIR stash apply' "$T2449_SITE_B"
-assert_not_contains "mika#2449: le site B ne prescrit pas le relic \$existing_wt (supprimé plus bas)" \
-    'git -C $existing_wt stash apply' "$T2449_SITE_B"
+# Le site B doit nommer le worktree CANONIQUE, pas celui qu'il retire : ce
+# dernier est supprimé quelques lignes plus bas (`worktree remove --force`), donc
+# une consigne qui le nommerait échouerait au moment où l'opérateur la lit.
+#
+# mika#2976 a EXTRAIT ce site en `_stash_and_remove_worktree`, donc il ne nomme
+# plus `$existing_wt` ni `$WORKTREE_DIR` : il porte deux paramètres, le worktree
+# retiré (`$remove_dir`) et celui que l'indice nomme (`$recover_in`). L'invariant
+# est inchangé — c'est son ancrage textuel qui a bougé, et les trois assertions
+# d'appel ci-dessous le referment par l'autre bout : chaque appelant doit passer
+# le worktree CANONIQUE en troisième argument.
+T2449_SITE_B=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep 'remove_dir' || true)
+assert_contains "mika#2449: le site B (helper extrait) prescrit le worktree de récupération \$recover_in" \
+    'git -C $recover_in stash apply' "$T2449_SITE_B"
+assert_not_contains "mika#2449: le site B ne prescrit pas le worktree retiré \$remove_dir (supprimé plus bas)" \
+    'git -C $remove_dir stash apply' "$T2449_SITE_B"
 assert_contains "mika#2449: le site B dit explicitement de ne pas appliquer dans le checkout principal" \
     'NOT in the primary checkout' "$T2449_SITE_B"
 
