@@ -3743,6 +3743,267 @@ _stash_and_remove_worktree() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _branch_reuse_verdict — cette branche porte-t-elle un travail EN COURS ?
+#
+# mika#2976. Trois `REBASE_CONFLICT` mesurés en huit jours — mika#1727 le
+# 2026-10-23, mika#2968 deux fois le 2026-10-30 — pour une seule racine : le nom
+# de branche est DÉRIVÉ du ticket (`scripts/derive-branch-name`), donc le groom
+# d'un vol 2 dérive le nom du vol 1 et le dispatch reprend une branche DÉJÀ
+# ATTERRIE. Son contenu est dans `main` par squash, la porte de rebase le rejoue,
+# et elle bute. Le groom s'arrête sans plan et sans PR.
+#
+# Il existe déjà un mécanisme qui finit par assainir cet état :
+# `worktree_reaper` (mika#2420) retire le worktree d'une PR terminale et
+# supprime la branche locale avec. Mais il est PÉRIODIQUE (`0 */10 * * * *`,
+# grâce de 900 s après `closedAt`) là où le dispatch est ÉVÉNEMENTIEL, et le
+# vainqueur de la course décide de la base : le reflog du 2026-10-30 à 14:55:19Z
+# — « branch: Created from origin/main » — est la signature d'un tick arrivé
+# 2 h 32 après le merge. Les trois cas mesurés tombent tous dans cette fenêtre.
+# D'où cette porte : poser la MÊME question au moment du dispatch,
+# synchroniquement, sur la branche qu'il est sur le point de reprendre. Les deux
+# ne se recouvrent pas — le faucheur libère du disque sur une population
+# SCANNÉE, cette porte décide d'une base sur une branche NOMMÉE par le dispatch
+# en cours.
+#
+# ── P1 — le verdict des PR, FORMULÉ EN NÉGATIF ───────────────────────────────
+# « aucune PR ouverte », jamais « il existe une PR mergée ». Deux PR peuvent
+# partager un `headRefName` (une fermée, une rouverte), et le terme positif
+# déclarerait périmée une branche dont une PR est ouverte. C'est exactement le
+# raisonnement du terme T4 de `worktree_reaper.rs`, formulé en négatif pour cette
+# raison-là, et il se transporte parce que la population est la même.
+#
+# « AUCUNE PR » vaut `live`, DÉLIBÉRÉMENT. C'est la population d'une branche de
+# groom poussée avec son plan et pas encore implémentée — `pr_unknown` chez le
+# faucheur, qu'il conserve aussi. La traiter comme périmée détruirait le plan
+# d'un vol qui attend son dispatch d'implémentation : c'est le faux positif le
+# plus coûteux de tout ce ticket.
+#
+# ── P2 — la containment par PATCH-ID, qui est l'AC3 ──────────────────────────
+# P1 ne suffit pas : une PR mergée n'implique pas que TOUT ce que porte la
+# branche est dans `main`. Un commit poussé après l'approbation, ou le résidu
+# d'un `wip()` de la chaîne de secours, y vit encore.
+#
+# L'idiome est celui que la maison a déjà (`_check_duplicate_commits`, mika#784) :
+# `log --cherry-mark --right-only origin/main...<tip>` compare par PATCH-ID, donc
+# un commit absorbé par un squash sort avec la marque `=` et un commit réellement
+# neuf avec `>`. C'est précisément ce que `rev-list --count` ne sait pas faire, et
+# c'est l'origine du défaut : la porte de rebase compte des COMMITS là où il faut
+# compter des PATCHS.
+#
+# Les DEUX refs sont lues — `refs/heads/$branch` et `refs/remotes/origin/$branch`
+# — et l'union des `>` est retenue. Le troisième cas du ticket est exactement
+# celui-là : la ref locale `origin/…` pointait sur `6069e503` que le distant ne
+# portait plus. Une seule ref lue aurait manqué la moitié de la population.
+#
+# ── `undetermined` retombe sur le comportement d'aujourd'hui, et le DIT ──────
+# Le faucheur fail-safe vers « conserver » parce qu'une suppression fautive ne se
+# répare pas. Ici la direction sûre est INVERSE, et l'inversion est raisonnée :
+# cette porte RÉINITIALISE une branche. Une non-mesure qui conduirait à
+# réinitialiser détruirait du travail ; une non-mesure qui conduit à reprendre
+# reproduit le `REBASE_CONFLICT` d'aujourd'hui, c'est-à-dire un échec bruyant,
+# borné, et déjà outillé. Donc : non-mesure ⇒ reprise, comportement inchangé, et
+# une ligne de journal qui NOMME la non-mesure — un repli silencieux se lirait
+# comme une mesure (motif mika#2304). Le régime attendu de cette population est
+# vide, et elle est comptée séparément pour que « la porte ne mord sur rien » et
+# « la porte ne mesure rien » n'impriment pas les mêmes octets.
+#
+# Args : $1 repo_dir, $2 repo (basename), $3 branch
+#
+# Écrit UN jeton sur stdout : live | spent | unmerged_work | undetermined.
+# Un jeton plutôt qu'un code de retour à quatre valeurs : un `rc` à quatre
+# valeurs force chaque appelant à réécrire la table, et `_remote_branch_exists`
+# montre déjà le coût d'une troisième valeur mal lue.
+#
+# Pose quatre globales pour la ligne de journal et pour la halte de l'AC3 —
+# forme déjà pratiquée par `_pilot_max_turns`/`_PILOT_MAX_TURNS` ; parser une
+# sortie composite serait un lecteur de plus à écrire et à faire dériver :
+#   _BRANCH_REUSE_PR       — `#<n> <STATE>` (jusqu'à trois), ou `none`
+#   _BRANCH_REUSE_UNMERGED — le compte de `>`
+#   _BRANCH_REUSE_COMMITS  — `<sha> <sujet>` par ligne (la liste de l'AC3)
+#   _BRANCH_REUSE_TIPS     — les refs effectivement lues
+_branch_reuse_verdict() {
+    local repo_dir="${1-}" repo="${2-}" branch="${3-}"
+
+    _BRANCH_REUSE_PR="none"
+    _BRANCH_REUSE_UNMERGED="0"
+    _BRANCH_REUSE_COMMITS=""
+    _BRANCH_REUSE_TIPS="none"
+
+    if [ -z "$repo_dir" ] || [ -z "$repo" ] || [ -z "$branch" ]; then
+        printf 'undetermined\n'
+        return 0
+    fi
+
+    # --- P1 : le verdict des PR -------------------------------------------
+    local pr_json=""
+    pr_json=$(gh pr list --head "$branch" --repo "senara-solutions/$repo" --state all \
+        --json number,state --limit 20 2>/dev/null) || {
+        printf 'undetermined\n'
+        return 0
+    }
+
+    # `jq` muet est une NON-MESURE, pas « aucune PR ». Les confondre ferait dire
+    # `live` sur une sortie illisible en l'habillant du verdict nominal — la
+    # même faute que mika#2304, une cellule plus loin.
+    local pr_count=""
+    pr_count=$(printf '%s' "$pr_json" | jq -r 'length' 2>/dev/null) || pr_count=""
+    case "$pr_count" in ''|*[!0-9]*) printf 'undetermined\n'; return 0 ;; esac
+
+    if [ "$pr_count" = "0" ]; then
+        printf 'live\n'
+        return 0
+    fi
+
+    _BRANCH_REUSE_PR=$(printf '%s' "$pr_json" \
+        | jq -r '.[] | "#\(.number) \(.state)"' 2>/dev/null \
+        | head -3 | tr '\n' ',' | sed 's/,$//')
+    [ -n "$_BRANCH_REUSE_PR" ] || _BRANCH_REUSE_PR="unreadable"
+
+    local open_count=""
+    open_count=$(printf '%s' "$pr_json" \
+        | jq -r '[.[] | select(.state == "OPEN")] | length' 2>/dev/null) || open_count=""
+    case "$open_count" in ''|*[!0-9]*) printf 'undetermined\n'; return 0 ;; esac
+    if [ "$open_count" != "0" ]; then
+        printf 'live\n'
+        return 0
+    fi
+
+    # --- P2 : la containment par patch-id, sur les DEUX refs --------------
+    local tips="" ref sha
+    for ref in "refs/heads/$branch" "refs/remotes/origin/$branch"; do
+        sha=$(git -C "$repo_dir" rev-parse --verify --quiet "$ref" 2>/dev/null) || sha=""
+        [ -n "$sha" ] || continue
+        # Les deux refs coïncident dans le cas nominal : une seule lecture
+        # suffit alors, et `_BRANCH_REUSE_TIPS` ne nomme que ce qui a été lu.
+        case " $tips " in *" $sha "*) continue ;; esac
+        tips="${tips}${tips:+ }$sha"
+        case "$_BRANCH_REUSE_TIPS" in
+            none) _BRANCH_REUSE_TIPS="$ref" ;;
+            *)    _BRANCH_REUSE_TIPS="$_BRANCH_REUSE_TIPS,$ref" ;;
+        esac
+    done
+
+    # Aucune ref : la branche n'existe ni en local ni sur le distant. Il n'y a
+    # rien à reprendre, donc rien à réinitialiser — le chemin nominal crée déjà
+    # `-b $branch origin/main`. `live` est ici un NO-OP, pas un verdict de
+    # travail en cours.
+    if [ -z "$tips" ]; then
+        printf 'live\n'
+        return 0
+    fi
+
+    local unmerged_lines="" tip log_out right read_failed=0
+    for tip in $tips; do
+        log_out=""
+        if ! log_out=$(git -C "$repo_dir" log --cherry-mark --right-only \
+                --format='%m %H %s' "origin/main...$tip" 2>/dev/null); then
+            read_failed=1
+            break
+        fi
+        right=$(printf '%s\n' "$log_out" | grep '^>' || true)
+        if [ -n "$right" ]; then
+            unmerged_lines="${unmerged_lines}${unmerged_lines:+
+}${right}"
+        fi
+    done
+    if [ "$read_failed" = "1" ]; then
+        printf 'undetermined\n'
+        return 0
+    fi
+
+    # L'union des `>` des deux refs, dédupliquée PAR SHA et dans l'ordre de
+    # lecture : une ref qui porte la moitié de la population ne doit pas doubler
+    # le compte de l'autre.
+    if [ -n "$unmerged_lines" ]; then
+        unmerged_lines=$(printf '%s\n' "$unmerged_lines" | sed 's/^> *//' | awk '!seen[$1]++')
+    fi
+
+    local unmerged_count=0
+    if [ -n "$unmerged_lines" ]; then
+        unmerged_count=$(printf '%s\n' "$unmerged_lines" | grep -c . || true)
+    fi
+    _BRANCH_REUSE_UNMERGED="$unmerged_count"
+    _BRANCH_REUSE_COMMITS="$unmerged_lines"
+
+    if [ "$unmerged_count" -gt 0 ]; then
+        printf 'unmerged_work\n'
+        return 0
+    fi
+    printf 'spent\n'
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _branch_reuse_gate — le verdict, l'action, et UNE ligne greppable
+#
+# mika#2976. Site unique de la correspondance verdict → action, et de la ligne
+# d'observabilité qui est l'instrument de l'AC4. Séparée de `_set_up_worktree`
+# pour une raison de fond et non de style : la décision est testable en appel
+# direct, sur un vrai dépôt, alors que `_set_up_worktree` exige le binaire
+# `mika`, `derive-branch-name`, `gh issue view` et un siège de ticket. Un test
+# qui rejouerait la correspondance au lieu de l'exécuter ne mesurerait que
+# lui-même.
+#
+# `verdict` et `action` sont DEUX champs et non un. Ils coïncident aujourd'hui
+# sauf dans deux cas : `undetermined` (verdict non mesuré, action de reprise) et
+# un refus de la garde mika#1943 (verdict `spent`, action de reprise). Les
+# fusionner rendrait ces deux-là indistinguables de la reprise nominale, qui est
+# précisément la population dont l'AC4 veut le compte.
+#
+# Une seule clé pour tous les aboutissements, sur le modèle littéral de
+# `rebase_gate` et pour la raison que son commentaire énonce : la question que la
+# porte ne peut pas trancher de son côté — la boucle reprend-elle encore quelque
+# chose, ou la porte est-elle devenue si stricte que plus rien ne reprend ? —
+# exige un nombre.
+#
+# Args : $1 repo_dir, $2 repo, $3 branch, $4 worktree_dir, $5 issue_num
+# Pose `BRANCH_SPENT` (1 ssi la branche a été réinitialisée) et, sur la
+# population AC3, `RESULT`.
+# Rend 0 si le dispatch continue, 1 s'il doit s'arrêter (halte AC3).
+_branch_reuse_gate() {
+    local repo_dir="${1-}" repo="${2-}" branch="${3-}" worktree_dir="${4-}" issue_num="${5-}"
+    local verdict action
+
+    BRANCH_SPENT=0
+    verdict=$(_branch_reuse_verdict "$repo_dir" "$repo" "$branch")
+
+    case "$verdict" in
+        live)
+            action="reuse"
+            ;;
+        spent)
+            # PALIER D'OBSERVATION (mika#2976, commit 2 du plan § 7). La mesure
+            # est faite et chiffrée ; la décision — réinitialiser — est armée au
+            # commit suivant. Ce palier atterrit ARMÉ sur son propre périmètre :
+            # il journalise, et c'est l'instrument que l'AC4 réclame.
+            action="observe_spent"
+            ;;
+        unmerged_work)
+            action="observe_unmerged"
+            ;;
+        *)
+            # Un jeton inattendu est une NON-MESURE, pas une reprise nominale :
+            # le bras large est fermé vers `undetermined` plutôt que vers
+            # `reuse`, sans quoi un futur jeton mal orthographié compterait dans
+            # la population de l'AC4 comme une reprise voulue.
+            verdict="undetermined"
+            action="reuse_unmeasured"
+            ;;
+    esac
+
+    echo "[dispatch-lib] branch_reuse_gate: branch=${branch} verdict=${verdict} pr=${_BRANCH_REUSE_PR:-none} unmerged=${_BRANCH_REUSE_UNMERGED:-0} tips=${_BRANCH_REUSE_TIPS:-none} action=${action}" >&2
+
+    # `$worktree_dir` et `$issue_num` ne sont pas encore lus : ils seront les
+    # arguments de la réinitialisation et de la halte au commit suivant. Les
+    # poser dès ce palier évite de changer la signature de la fonction entre un
+    # commit d'observation et un commit de décision — ce qui ferait du palier un
+    # brouillon et non un plancher.
+    : "$worktree_dir" "$issue_num"
+
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _is_scaffold_path — ce chemin est-il de l'échafaudage possédé par dispatch-lib ?
 #
 # mika#2144. SITE UNIQUE des quatre motifs. mika#2157 (R3) écrivait déjà, dans ce
@@ -5285,6 +5546,35 @@ _set_up_worktree() {
             echo "[dispatch-lib] worktree_path_derivation_failed: branch=$BRANCH repo=$REPO script=$PLATFORM_DIR/scripts/derive-worktree-path — aborting rather than propagating an empty path to a removal site (mika#1943)" >&2
             return 1
         fi
+
+        # --- Porte de reprise de branche (mika#2976) ---
+        #
+        # Le raisonnement, les deux prédicats et l'asymétrie de la non-mesure
+        # vivent sur `_branch_reuse_verdict` ; la correspondance verdict → action
+        # et la ligne greppable sur `_branch_reuse_gate`. Ce qui se décide ICI,
+        # c'est le PLACEMENT, et ses deux bornes portent chacune leur conséquence.
+        #
+        # APRÈS le `git fetch origin main` ci-dessus : sans lui `origin/main` est
+        # périmé, et P2 compterait comme non fusionné ce qui vient d'atterrir —
+        # soit la halte de l'AC3 sur la population même que cette porte doit
+        # réinitialiser.
+        #
+        # AVANT le nettoyage du relic non canonique, et pas seulement avant le
+        # bloc reprise-ou-création. La halte de l'AC3 affirme « nothing was
+        # removed, nothing was stashed » : placée après, un relic aurait déjà été
+        # retiré et stashé, et le message mentirait sur son propre effet. Le prix
+        # de ce choix est NOMMÉ plutôt que caché — une branche à la fois périmée
+        # ET checked out à un chemin non canonique voit son `branch -f` refusé
+        # par git, la réinitialisation rend non-zéro, et on retombe sur le
+        # `REBASE_CONFLICT` d'aujourd'hui. C'est la même asymétrie bruyante-
+        # plutôt-que-destructrice que partout ailleurs dans cette porte.
+        #
+        # INCONDITIONNEL, et pas restreint à `dev-groom` : le défaut est dans la
+        # dérivation de BASE, et `dev-pilot` dérive la même branche par la même
+        # fonction. Un vol 2 d'implémentation sur un ticket à PR mergée prend
+        # exactement le même mur ; restreindre au groom bornerait la correction à
+        # la moitié de sa population pour aucun gain.
+        _branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM" || true
 
         # --- Pre-flight: detect and clean up non-canonical worktree paths (mika#1472) ---
         # Before the canonical dashed-path collision check below, detect if the target
