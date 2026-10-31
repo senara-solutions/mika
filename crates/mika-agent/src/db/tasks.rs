@@ -2002,7 +2002,80 @@ impl Database {
     /// - **The most recent** retained callback's `updated_at` is older than
     ///   `grace_seconds` ago (`HAVING MAX(...)`, mika#2762)
     /// - Parent metadata does NOT contain `$.claude_pilot.pr_url`
-    /// - No other active callback child exists (defers to #870's retry loop)
+    /// - No other **live** sibling exists — `pending` / `in_progress`, or
+    ///   `completed` within the grace window (mika#2980). Defers to #870's
+    ///   retry loop.
+    ///
+    /// # Why a `completed` sibling counts as live (mika#2980)
+    ///
+    /// A groom child that reached `completed` without being `delivered` yet is
+    /// a child **in flight**: its callback is on its way, and it is
+    /// `deliver_callback` that — in delivering it — runs
+    /// `try_dispatch_pilot_after_groom_success`. Until mika#2980 neither
+    /// predicate knew that state: the anchor reads only `child.status =
+    /// 'delivered'`, the sibling guard only `('pending','in_progress')`. So a
+    /// parent that also carried an **older delivered** groom child was reaped
+    /// *inside* the `completed → delivered` window of the groom that had just
+    /// succeeded. Measured on 2026-10-30 (mika#2968 vol 2b): parent
+    /// `be9eca02`, first groom child delivered at 14:38:05Z with
+    /// `STATUS=REBASE_CONFLICT`, second one `completed` at 15:20:31Z with
+    /// `Outcome: PLAN_GROOMED` and its plan pushed, parent failed at 15:21:05Z,
+    /// callback delivered 40 s later to a terminal parent. The plan was on the
+    /// branch and the flight was lost, silently. Reachable case: a groom in two
+    /// attempts on the same parent — exactly what a `REBASE_CONFLICT`
+    /// (mika#2976) followed by a regroom produces.
+    ///
+    /// **The guard, not the anchor**, and the three reasons are distinct:
+    ///
+    /// 1. The two predicates do not answer the same question. The anchor
+    ///    answers *"how far back is the last movement the grace is measured
+    ///    against?"*; the guard answers *"does anybody still represent this
+    ///    parent?"*. Liveness is a property of **representation**, not of age.
+    /// 2. Widening the anchor would give one value two causes.
+    ///    `last_callback_at` is the instant of the last **delivery** (see the
+    ///    `callback_task_id` note below); if it also read `completed` rows, the
+    ///    field the engine logs would mean "last delivery" or "last completion"
+    ///    depending on the row, and the operator reading it could no longer
+    ///    tell which (class mika#2205).
+    /// 3. Widening the anchor would move the scythe on the healthy population
+    ///    too — it pushes the 600 s threshold out for **every** parent carrying
+    ///    a `completed` groom child, corpses included. The guard acts only
+    ///    inside the liveness window and hands back at the same instant as
+    ///    today's behaviour once the window has passed.
+    ///
+    /// Same shape, same house precedent:
+    /// [`Self::find_live_deferred_wrapper_child`] (mika#2181) closed this very
+    /// blind spot for the `stuck_pending` reaper. The groom reaper had not
+    /// inherited it.
+    ///
+    /// **Why the clause is bounded, and bounded on `completed_at`.** An
+    /// unbounded `sibling.status = 'completed'` would make the parent immortal:
+    /// the silent-turn error path leaves a child `completed` **for ever**, and
+    /// that corpse would become a permanent shield — trading a flight lost to
+    /// orphaning for a parent wedged for life, which is worse and mute.
+    /// `completed_at IS NOT NULL` is part of the bound, not decoration:
+    /// `update_task_completed` writes `status` and `completed_at` in the same
+    /// `UPDATE`, so on the nominal path the column is always set; a NULL marks
+    /// a row written otherwise, whose completion cannot be dated — and an
+    /// unknown date cannot prove freshness.
+    ///
+    /// **The window is `grace_seconds` itself** (`?2`, already bound — no new
+    /// parameter, no new constant, no new `MIKA_*`). A dedicated dial would
+    /// want its own clamp, and `strftime(…, 'now', '-N seconds')` returns NULL
+    /// on an out-of-range modifier, where `x > NULL` is NULL — an absurd
+    /// override would bring the defect back with **no signal at all**, the
+    /// guard simply never retaining anybody again. 600 s is also the right
+    /// order of magnitude: 2 × `AGENT_TOTAL_TIMEOUT`, and 8 × the measured
+    /// 74 s window. **Cost, named:** this number now does two jobs — it bounds
+    /// the grace *and* a `completed` sibling's liveness. Recalibrating
+    /// `REAPER_GRACE_SECONDS` moves both. The day the two must diverge is the
+    /// day a dedicated constant, with its clamp, is justified.
+    ///
+    /// **Why `sibling.id != child.id` does not filter the very child we want
+    /// to count.** The main `WHERE` requires `child.status = 'delivered'`, so a
+    /// `completed` child never enters the `child` population at all — it is
+    /// never the `child` of a joined row, and the inequality never applies
+    /// to it.
     ///
     /// Three properties of the mika#2762 grace the SQL does not state:
     ///
@@ -2092,7 +2165,12 @@ impl Database {
                  SELECT 1 FROM tasks sibling
                  WHERE sibling.parent_task_id = parent.id
                    AND sibling.id != child.id
-                   AND sibling.status IN ('pending', 'in_progress')
+                   AND (
+                     sibling.status IN ('pending', 'in_progress')
+                     OR (sibling.status = 'completed'
+                         AND sibling.completed_at IS NOT NULL
+                         AND sibling.completed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))
+                   )
                )
              GROUP BY parent.id
              HAVING MAX(child.updated_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
@@ -2470,7 +2548,25 @@ impl Database {
     /// - **The most recent** retained callback's `updated_at` is older than
     ///   `grace_seconds` ago (`HAVING MAX(...)`, mika#2762)
     /// - Parent metadata HAS a non-empty `$.claude_pilot.pr_url`
-    /// - No other active callback child exists (mirrors the reaper's guard)
+    /// - No other **live** sibling exists — `pending` / `in_progress`, or
+    ///   `completed` within the grace window (mirrors the reaper's guard,
+    ///   mika#2980)
+    ///
+    /// mika#2980 adds the `completed`-within-grace arm **in the same terms**,
+    /// with the same already-bound `?2`. The full reasoning — why the guard and
+    /// not the anchor, why the clause is bounded on `completed_at`, and why
+    /// `grace_seconds` now does two jobs — lives on
+    /// [`Self::find_orphaned_parent_tasks`] and is not duplicated here.
+    ///
+    /// **Cost on this half, named because it is not nil:** a discarded row does
+    /// not fail a parent here — it leaves it `in_progress` for up to 600 s
+    /// longer instead of completing it, so it **holds the dispatch slot** that
+    /// much longer. Strictly less grave than the scythe on the failure side,
+    /// and above all: the question the guard asks — *is the parent still
+    /// represented?* — has exactly the same answer on both halves. Leaving the
+    /// pair divergent on the guard's shape would amount to claiming
+    /// representation counts for deciding a failure but not for deciding a
+    /// completion, which the Coupled-pair contract forbids.
     ///
     /// Groom-class callbacks (mika#1001) cannot trip this path because they
     /// never emit `PR:` lines — the `dispatch_class` filter is defense-in-depth.
@@ -2515,7 +2611,12 @@ impl Database {
                  SELECT 1 FROM tasks sibling
                  WHERE sibling.parent_task_id = parent.id
                    AND sibling.id != child.id
-                   AND sibling.status IN ('pending', 'in_progress')
+                   AND (
+                     sibling.status IN ('pending', 'in_progress')
+                     OR (sibling.status = 'completed'
+                         AND sibling.completed_at IS NOT NULL
+                         AND sibling.completed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))
+                   )
                )
              GROUP BY parent.id
              HAVING MAX(child.updated_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)

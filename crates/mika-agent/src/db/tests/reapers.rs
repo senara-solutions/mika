@@ -975,6 +975,184 @@ fn mika2762_la_voie_de_succes_sancre_pareil() {
     assert_eq!(completable[0].id, parent_id);
 }
 
+// -- mika#2980 : un enfant de groom `completed` non livré protège sa parente,
+//    et la protection est bornée --
+
+/// **Le cas mesuré** (2026-10-30, mika#2968 vol 2b). Parente `be9eca02` : un
+/// premier enfant de groom livré à 14:38:05Z (`STATUS=REBASE_CONFLICT`,
+/// mika#2976), un second `completed` à 15:20:31Z avec son plan poussé et
+/// `Outcome: PLAN_GROOMED`. À 15:21:05Z l'ancre lisait 14:38:05 — soit 43 min,
+/// bien au-delà des 600 s — et aucun frère n'était `pending`/`in_progress`.
+/// La parente est passée `failed`, et le `callback_delivered` du groom réussi
+/// est arrivé 40 s plus tard à une parente terminale : le vol est perdu sans
+/// alarme.
+///
+/// Ici la fixture d'AC2 : enfant de groom `delivered` à T−40 min, second enfant
+/// de groom `completed` à T−30 s.
+#[test]
+fn mika2980_un_enfant_de_groom_complete_protege_sa_parente() {
+    let db = db();
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    seed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot_groom",
+        40 * 60,
+    );
+    seed_completed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot_groom",
+        Some(30),
+    );
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert!(
+        orphans.is_empty(),
+        "un enfant de groom `completed` dont le callback n'est pas encore livré \
+         représente encore sa parente : la faux ne doit pas tomber dans la \
+         fenêtre `completed → delivered`"
+    );
+}
+
+/// **Contrôle négatif** du cas ci-dessus, sur le seul terme qui change : sans
+/// le second enfant, la parente est bien fauchée. Le comportement voulu par
+/// mika#2750 tient.
+///
+/// C'est ce cas qui sépare « la garde a été élargie » de « le reaper a été
+/// désarmé » : sans lui, un `NOT EXISTS` toujours vrai passerait le cas 1.
+#[test]
+fn mika2980_sans_le_second_enfant_la_parente_est_bien_fauchee() {
+    let db = db();
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    let delivre = seed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot_groom",
+        40 * 60,
+    );
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "personne ne représente plus cette parente : elle reste candidate"
+    );
+    assert_eq!(orphans[0].id, parent_id);
+    assert_eq!(orphans[0].callback_task_id, delivre);
+}
+
+/// **La borne.** Le second enfant est `completed` mais sa complétion date de
+/// T−40 min, hors de la fenêtre de grâce : il ne protège plus.
+///
+/// Sans ce cas, une clause non bornée (`sibling.status = 'completed'` tout
+/// court) passerait les cas 1 et 2 et rendrait la parente immortelle — le
+/// chemin d'erreur du tour silencieux laisse un enfant `completed` pour
+/// toujours, et ce cadavre deviendrait un bouclier permanent.
+#[test]
+fn mika2980_une_completion_hors_fenetre_ne_protege_plus() {
+    let db = db();
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    seed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot_groom",
+        40 * 60,
+    );
+    seed_completed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot_groom",
+        Some(40 * 60),
+    );
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "une complétion plus ancienne que la grâce n'est plus une \
+         représentation : la parente redevient candidate"
+    );
+    assert_eq!(orphans[0].id, parent_id);
+}
+
+/// `completed_at IS NOT NULL` fait partie de la borne, pas de la décoration.
+/// `update_task_completed` écrit `status` et `completed_at` dans le même
+/// `UPDATE`, donc un NULL signale une ligne écrite autrement, dont on ne sait
+/// pas dater la complétion — et une date inconnue ne peut pas prouver la
+/// fraîcheur.
+///
+/// Épingle que l'absence de date se lit « non vivant », et non « vivant jusqu'à
+/// preuve du contraire ».
+#[test]
+fn mika2980_une_completion_sans_date_ne_protege_pas() {
+    let db = db();
+    let (parent_id, _implement_child) = create_orphaned_parent_setup(&db);
+
+    seed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot_groom",
+        40 * 60,
+    );
+    seed_completed_groom_callback(&db, &parent_id, "long_running:run_claude_pilot_groom", None);
+
+    let orphans = db.find_orphaned_parent_tasks("mika", 600, "groom").unwrap();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "une complétion non datée ne prouve aucune fraîcheur : elle ne protège pas"
+    );
+    assert_eq!(orphans[0].id, parent_id);
+}
+
+/// Symétrie du couple (mika#1162, AC3) : la voie de succès porte la même garde.
+/// Jumeau de `mika2762_la_voie_de_succes_sancre_pareil`.
+///
+/// La question que la garde pose — *la parente est-elle encore représentée ?* —
+/// a exactement la même réponse des deux côtés. Côté succès une ligne écartée
+/// ne fait pas échouer une parente : elle la laisse `in_progress` jusqu'à 600 s
+/// de plus, donc elle retient le slot de dispatch d'autant. C'est le coût,
+/// strictement moins grave que la faux côté échec.
+#[test]
+fn mika2980_la_voie_de_succes_garde_pareil() {
+    let db = db();
+    let (parent_id, implement_child) =
+        create_completable_parent_setup(&db, "https://github.com/senara-solutions/mika/pull/2980");
+
+    // Le vrai callback implement, hors grâce.
+    backdate_task_updated_at(&db, &implement_child, 700);
+
+    // Contrôle positif, dans le même test : la fixture EST complétable avant
+    // qu'un frère vivant n'arrive. Sans cette ligne, l'assertion finale serait
+    // verte même si la parente n'avait jamais été candidate — le vert par
+    // vacuité qu'un test de garde ne peut pas se permettre.
+    let avant = db
+        .find_completable_parent_tasks_on_pr_url("mika", 600)
+        .unwrap();
+    assert_eq!(avant.len(), 1, "fixture : la parente est bien complétable");
+    assert_eq!(avant[0].id, parent_id);
+
+    seed_completed_groom_callback(
+        &db,
+        &parent_id,
+        "long_running:run_claude_pilot_groom",
+        Some(30),
+    );
+
+    let completable = db
+        .find_completable_parent_tasks_on_pr_url("mika", 600)
+        .unwrap();
+    assert!(
+        completable.is_empty(),
+        "la voie de succès compte le même frère vivant que la faucheuse \
+         (contrat de couple mika#1162)"
+    );
+}
+
 #[test]
 fn test_find_dispatch_children_with_pid_ignores_pidless_children() {
     let db = db();
