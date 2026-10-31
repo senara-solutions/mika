@@ -94,9 +94,24 @@ pub const GROOM_PROOF_PLAN_SEPARATOR: &str = " — ";
 ///
 /// Une preuve de groom dont la ligne ancrée `Outcome: PLAN_GROOMED` ne porte
 /// **aucun** suffixe [`GROOM_PROOF_PLAN_SEPARATOR`] — donc ne nomme aucun plan.
-/// La porte l'accepte, exactement comme avant mika#2981. Aucune preuve
-/// **suffixée** n'en bénéficie : sur celles-là la porte est strictement plus
-/// sévère qu'hier. Le gain net est donc strict, et jamais un relâchement.
+/// La porte l'accepte **tant qu'aucun vol `dev-pilot` n'a ouvert de PR pour le
+/// ticket après elle**. Aucune preuve **suffixée** n'en bénéficie : sur
+/// celles-là la porte est strictement plus sévère qu'hier. Le gain net est donc
+/// strict, et jamais un relâchement.
+///
+/// # Sa borne : la première PR ouverte après elle
+///
+/// Décision de Vincent : borner la grâce le 2026-10-30, par l'option C le
+/// 2026-10-31. Une preuve nue d'un vol 1 reste sinon valide pour tous les vols
+/// suivants pendant les 30 jours de rétention, et c'est le trou même que
+/// mika#2981 ferme. Le « dernier merge » envisagé d'abord n'a aucune source
+/// locale : les merges faits à la main ne laissent rien en base (#2971 et
+/// #2977, mesuré le 2026-10-30). L'ouverture d'une PR en laisse une : la ligne
+/// ancrée `PR: <url>` du callback d'implémentation, celle que lit le
+/// parent-completer (mika#1162). Lecture et comparaison :
+/// [`crate::db::Database::has_completed_groom_for_issue`] et
+/// [`bound_unbound_grace`]. Une preuve que la borne arrête rend
+/// [`GroomConvergence::UnboundSuperseded`], refusée.
 ///
 /// # Ses trois producteurs légitimes
 ///
@@ -116,7 +131,8 @@ pub const GROOM_PROOF_PLAN_SEPARATOR: &str = " — ";
 /// `prune_completed_tasks` supprime les lignes terminales au-delà de 30 jours
 /// (`THIRTY_DAYS_SECS`, `task_engine/mod.rs`), et tout groom de boucle
 /// post-déploiement porte le suffixe : la population 1 s'éteint d'elle-même, la
-/// 2 est bornée par le déploiement, la 3 est un flux humain délibéré.
+/// 2 est bornée par le déploiement, la 3 est un flux humain délibéré. Pour
+/// chacune, la borne ci-dessus coupe la grâce dès le vol suivant.
 ///
 /// Le compteur qui la fait expirer est
 /// `SELECT count(*) FROM audit_events WHERE tool_name =
@@ -193,6 +209,11 @@ pub const GROOM_PROOF_UNBOUND_GRACE: &str = "proof_unbound_to_plan";
 /// [`crate::skills::executor::GroomedState`] garde ses quatre bras (la garde
 /// `mika2484_les_quatre_verdicts_de_la_porte_sont_inchanges` reste verte sans
 /// être touchée).
+///
+/// La borne de la grâce en ajoute un sixième,
+/// [`GroomConvergence::UnboundSuperseded`], pour la même raison : refusée comme
+/// `PlanMismatch`, elle n'est pas la même population (une preuve qui ne nomme
+/// rien, arrêtée par une date), et elle a son propre événement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroomConvergence {
     /// Une ligne du `result` commence par [`GROOM_SUCCESS_MARKER`] **et** son
@@ -209,6 +230,10 @@ pub enum GroomConvergence {
     /// Convergée, mais la preuve nomme un **autre** plan que le callout du corps
     /// courant : la preuve d'un vol antérieur (mika#2981). Refusée.
     PlanMismatch,
+    /// Convergée et nue, mais un vol `dev-pilot` a ouvert une PR pour le ticket
+    /// **après** elle : la grâce [`GROOM_PROOF_UNBOUND_GRACE`] ne la couvre plus
+    /// (mika#2981, décision de Vincent du 2026-10-31). Refusée.
+    UnboundSuperseded,
     /// Le marqueur apparaît, hors position de verdict. Porte son motif, qui est
     /// un élément d'[`ALL_GROOM_CONVERGENCE_REJECTIONS`].
     MarkerOutOfPosition(&'static str),
@@ -344,11 +369,18 @@ pub fn groom_proof_plan(result: &str) -> Option<String> {
 ///
 /// # Le vol unique ne change pas (AC1, D5)
 ///
-/// Une preuve, aucun merge : le groom qui a frappé la preuve a aussi écrit le
-/// plan **et** le callout, donc son suffixe nomme le plan du callout ⇒
-/// [`GroomConvergence::Converged`]. Si la preuve est antérieure au déploiement,
-/// elle est nue ⇒ [`GroomConvergence::ConvergedUnbound`], acceptée par la
-/// grâce. Les deux chemins acceptent.
+/// Une preuve, aucune PR ouverte après elle : le groom qui a frappé la preuve a
+/// aussi écrit le plan **et** le callout, donc son suffixe nomme le plan du
+/// callout ⇒ [`GroomConvergence::Converged`]. Si la preuve est nue (frappée sans
+/// suffixe, par l'un des trois producteurs de [`GROOM_PROOF_UNBOUND_GRACE`]),
+/// cette fonction rend [`GroomConvergence::ConvergedUnbound`], et la grâce
+/// l'accepte. Les deux chemins acceptent.
+///
+/// # Ce que cette fonction ne voit pas : la date
+///
+/// Elle juge un `result`, sans instant. `ConvergedUnbound` n'est donc ici
+/// qu'un candidat à la grâce : [`bound_unbound_grace`] le refuse ensuite si un
+/// vol `dev-pilot` a ouvert une PR pour le ticket après la preuve.
 pub fn groom_proof_convergence(result: &str, expected_plan: Option<&str>) -> GroomConvergence {
     let verdict = groom_result_convergence(result);
     if !matches!(verdict, GroomConvergence::Converged) {
@@ -371,6 +403,35 @@ pub fn groom_proof_convergence(result: &str, expected_plan: Option<&str>) -> Gro
     }
 }
 
+/// La borne de la grâce (mika#2981, décision de Vincent du 2026-10-31) : une
+/// preuve nue n'est plus acceptée dès qu'un vol `dev-pilot` a ouvert une PR pour
+/// le ticket **après** elle.
+///
+/// `proof_at` est l'instant terminal de la preuve, `last_pr_opened_at` celui du
+/// dernier callback d'implémentation qui porte une ligne `PR:`, ou `None` si
+/// aucun n'en porte (cas du vol unique, qui reste accepté sur la grâce). Les
+/// deux sont au format fixe de [`crate::timestamp`], donc l'ordre lexicographique
+/// est l'ordre chronologique.
+///
+/// L'inégalité est **stricte** : une PR horodatée à la même seconde que la
+/// preuve ne la coupe pas. Les deux instants sont à la seconde, et rien ne dit
+/// lequel est venu d'abord ; dans le doute, la grâce reste comme avant la borne.
+///
+/// Seul `ConvergedUnbound` est touché. Une preuve liée n'a pas besoin de date
+/// (son plan suffit), et les refus se transmettent tels quels.
+pub fn bound_unbound_grace(
+    verdict: GroomConvergence,
+    proof_at: &str,
+    last_pr_opened_at: Option<&str>,
+) -> GroomConvergence {
+    match (verdict, last_pr_opened_at) {
+        (GroomConvergence::ConvergedUnbound, Some(pr_at)) if pr_at > proof_at => {
+            GroomConvergence::UnboundSuperseded
+        }
+        (verdict, _) => verdict,
+    }
+}
+
 /// Agrège les verdicts des callbacks de groom d'une même issue.
 ///
 /// **La préséance est celle de la sémantique historique**, `COUNT(*) > 0` : une
@@ -382,11 +443,12 @@ pub fn groom_proof_convergence(result: &str, expected_plan: Option<&str>) -> Gro
 ///
 /// # L'ordre, depuis les deux variantes de mika#2981
 ///
-/// `Converged` > `ConvergedUnbound` > `PlanMismatch` > `MarkerOutOfPosition` >
-/// `Absent`. Deux de ces rangs portent une décision, pas une convention :
+/// `Converged` > `ConvergedUnbound` > `PlanMismatch` > `UnboundSuperseded` >
+/// `MarkerOutOfPosition` > `Absent`. Trois de ces rangs portent une décision,
+/// pas une convention :
 ///
 /// - **Une preuve LIÉE bat la grâce.** Sur un ticket qui porte à la fois une
-///   preuve nue d'avant le déploiement et la preuve suffixée de son vol courant,
+///   preuve nue et la preuve suffixée de son vol courant,
 ///   la porte accepte de plein droit et l'événement de grâce **ne tire pas** :
 ///   sinon la sonde d'AC4 compterait des dispatches que la grâce n'a pas portés,
 ///   et à 0 elle ne descendrait jamais.
@@ -397,17 +459,24 @@ pub fn groom_proof_convergence(result: &str, expected_plan: Option<&str>) -> Gro
 ///   rendrait incomptable. Il bat aussi `MarkerOutOfPosition` parce qu'il est la
 ///   mesure **plus précise** des deux : le marqueur y est en position, c'est son
 ///   plan qui ne va pas.
+/// - **Une grâce encore valide bat une grâce coupée.** Une preuve nue frappée
+///   après la dernière PR ouverte suffit, même si une preuve nue plus ancienne
+///   est arrêtée par la borne : c'est le contrôle de [`bound_unbound_grace`].
+///   Entre les deux refus, `PlanMismatch` passe devant parce qu'il nomme l'objet
+///   (le plan), là où `UnboundSuperseded` ne dit qu'une date.
 pub fn aggregate_groom_convergence(
     verdicts: impl IntoIterator<Item = GroomConvergence>,
 ) -> GroomConvergence {
     let mut unbound = false;
     let mut mismatched = false;
+    let mut superseded = false;
     let mut rejected: Option<&'static str> = None;
     for verdict in verdicts {
         match verdict {
             GroomConvergence::Converged => return GroomConvergence::Converged,
             GroomConvergence::ConvergedUnbound => unbound = true,
             GroomConvergence::PlanMismatch => mismatched = true,
+            GroomConvergence::UnboundSuperseded => superseded = true,
             GroomConvergence::MarkerOutOfPosition(reason) => rejected = rejected.or(Some(reason)),
             GroomConvergence::Absent => {}
         }
@@ -417,6 +486,9 @@ pub fn aggregate_groom_convergence(
     }
     if mismatched {
         return GroomConvergence::PlanMismatch;
+    }
+    if superseded {
+        return GroomConvergence::UnboundSuperseded;
     }
     match rejected {
         Some(reason) => GroomConvergence::MarkerOutOfPosition(reason),
@@ -1412,6 +1484,71 @@ mod tests {
             GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE),
             "contrôle: sans PlanMismatch le rang d'hier est inchangé"
         );
+    }
+
+    /// La borne de la grâce, aux bornes : seule une PR ouverte **strictement
+    /// après** la preuve nue la coupe, et seule la grâce est touchée.
+    #[test]
+    fn mika2981_la_borne_de_la_grace_est_la_premiere_pr_ouverte_apres() {
+        const PREUVE: &str = "2026-10-29T21:36:05Z";
+        assert_eq!(
+            bound_unbound_grace(
+                GroomConvergence::ConvergedUnbound,
+                PREUVE,
+                Some("2026-10-29T22:24:20Z")
+            ),
+            GroomConvergence::UnboundSuperseded,
+            "une PR ouverte après la preuve nue coupe la grâce (mika#2968, vol 1)"
+        );
+        assert_eq!(
+            bound_unbound_grace(GroomConvergence::ConvergedUnbound, PREUVE, None),
+            GroomConvergence::ConvergedUnbound,
+            "contrôle: sans PR ouverte, le vol unique garde la grâce"
+        );
+        assert_eq!(
+            bound_unbound_grace(
+                GroomConvergence::ConvergedUnbound,
+                PREUVE,
+                Some("2026-10-29T20:00:00Z")
+            ),
+            GroomConvergence::ConvergedUnbound,
+            "une preuve nue postérieure à la dernière PR ouverte garde la grâce"
+        );
+        assert_eq!(
+            bound_unbound_grace(GroomConvergence::ConvergedUnbound, PREUVE, Some(PREUVE)),
+            GroomConvergence::ConvergedUnbound,
+            "à la même seconde l'ordre n'est pas connu : la borne est stricte"
+        );
+        for autre in [
+            GroomConvergence::Converged,
+            GroomConvergence::PlanMismatch,
+            GroomConvergence::Absent,
+            GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_NOT_LINE_ANCHORED),
+        ] {
+            assert_eq!(
+                bound_unbound_grace(autre.clone(), PREUVE, Some("2026-10-30T00:00:00Z")),
+                autre,
+                "la borne ne touche que la grâce"
+            );
+        }
+        assert_eq!(
+            aggregate_groom_convergence(vec![
+                GroomConvergence::UnboundSuperseded,
+                GroomConvergence::ConvergedUnbound,
+            ]),
+            GroomConvergence::ConvergedUnbound,
+            "une preuve nue encore dans sa grâce suffit, même à côté d'une coupée"
+        );
+        assert_eq!(
+            aggregate_groom_convergence(vec![
+                GroomConvergence::UnboundSuperseded,
+                GroomConvergence::PlanMismatch,
+                GroomConvergence::Absent,
+            ]),
+            GroomConvergence::PlanMismatch,
+            "entre deux refus, celui qui nomme le plan passe devant"
+        );
+        assert!(!GroomConvergence::UnboundSuperseded.is_converged());
     }
 
     /// Le séparateur et le motif de grâce sont un **format de fil** : le premier

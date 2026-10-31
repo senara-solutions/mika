@@ -4403,6 +4403,23 @@ impl Database {
     /// ligne écartée par SQL serait invisible au verdict, donc la preuve d'un
     /// autre vol remonterait `Absent` au lieu de `PlanMismatch` et la sonde
     /// d'AC4 mesurerait zéro sur sa propre population.
+    ///
+    /// # La grâce d'une preuve nue s'arrête à la PR ouverte après elle
+    ///
+    /// Décision de Vincent du 2026-10-31 (option C). La seconde requête lit
+    /// l'instant de la dernière PR ouverte par un vol `dev-pilot` pour ce
+    /// ticket : un callback d'implémentation terminal, sous une parente qui
+    /// porte l'URL du ticket, dont le `result` porte la ligne ancrée `PR: <url>`.
+    /// Cette ligne est lue par
+    /// [`crate::task_engine::dispatcher::extract_callback_fields`], le lecteur
+    /// du parent-completer (mika#1162), et non par un second motif. L'instant est
+    /// le `COALESCE(completed_at, updated_at)` du callback, à quelques secondes
+    /// de l'ouverture réelle (mesuré le 2026-10-30 : #2971 ouverte à 22:23:59Z,
+    /// callback terminé à 22:24:20Z). La décision est
+    /// [`crate::task_state::tasks::bound_unbound_grace`].
+    ///
+    /// Locale et sans réseau : un merge fait à la main ne laisse rien en base,
+    /// une ouverture de PR par la boucle laisse cette ligne.
     pub fn has_completed_groom_for_issue(
         &self,
         agent_id: &str,
@@ -4410,8 +4427,10 @@ impl Database {
         expected_plan: Option<&str>,
     ) -> Result<crate::task_state::tasks::GroomConvergence> {
         let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
+        let last_pr_opened_at = self.last_pr_opened_for_issue(agent_id, issue_url)?;
         let mut stmt = self.conn.prepare(
-            "SELECT child.result FROM tasks child
+            "SELECT child.result, COALESCE(child.completed_at, child.updated_at)
+             FROM tasks child
              JOIN tasks parent ON child.parent_task_id = parent.id
              WHERE child.agent_id = ?1
                AND child.trigger_type = 'callback'
@@ -4421,19 +4440,58 @@ impl Database {
         )?;
         let verdicts = stmt
             .query_map(params![agent_id, exact_url, legacy_groom_url], |row| {
-                row.get::<_, Option<String>>(0)
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|result| match result {
-                Some(text) => {
-                    crate::task_state::tasks::groom_proof_convergence(&text, expected_plan)
-                }
+            .map(|(result, proof_at)| match result {
+                Some(text) => crate::task_state::tasks::bound_unbound_grace(
+                    crate::task_state::tasks::groom_proof_convergence(&text, expected_plan),
+                    &proof_at,
+                    last_pr_opened_at.as_deref(),
+                ),
                 None => crate::task_state::tasks::GroomConvergence::Absent,
             });
         Ok(crate::task_state::tasks::aggregate_groom_convergence(
             verdicts,
         ))
+    }
+
+    /// L'instant de la dernière PR ouverte par un vol `dev-pilot` pour ce
+    /// ticket, ou `None` si aucun callback d'implémentation n'en porte
+    /// (mika#2981). Lecteur de la borne de
+    /// [`Self::has_completed_groom_for_issue`], qui documente la source.
+    ///
+    /// `COALESCE(dispatch_class, 'implement')` comme le parent-completer : une
+    /// ligne d'avant v34 est un vol d'implémentation.
+    fn last_pr_opened_for_issue(&self, agent_id: &str, issue_url: &str) -> Result<Option<String>> {
+        let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
+        let mut stmt = self.conn.prepare(
+            "SELECT child.result, COALESCE(child.completed_at, child.updated_at)
+             FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE child.agent_id = ?1
+               AND child.trigger_type = 'callback'
+               AND COALESCE(child.dispatch_class, 'implement') = 'implement'
+               AND child.status IN ('completed', 'delivered')
+               AND child.result IS NOT NULL
+               AND parent.reference_url IN (?2, ?3)",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, exact_url, legacy_groom_url], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(result, _)| {
+                crate::task_engine::dispatcher::extract_callback_fields(result)
+                    .pointer("/claude_pilot/pr_url")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| !url.is_empty())
+            })
+            .map(|(_, at)| at)
+            .max())
     }
 
     /// The `result` of **every** terminal groom callback for a GitHub issue,

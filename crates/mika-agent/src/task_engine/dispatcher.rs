@@ -5394,7 +5394,11 @@ fn parse_repo_issue_from_url(url: &str) -> Option<(String, u64)> {
 ///
 /// Fields default to `"unknown"` in the handler when not available;
 /// this parser skips `"unknown"` values to avoid polluting metadata.
-fn extract_callback_fields(result: &str) -> serde_json::Value {
+///
+/// `pub(crate)` for mika#2981: the provenance gate reads the `PR:` line through
+/// this parser to date the last PR a flight opened, so the gate and the
+/// parent-completer share one reader of that line.
+pub(crate) fn extract_callback_fields(result: &str) -> serde_json::Value {
     static RE_SESSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Session:\s*(\S+)").unwrap());
     static RE_TURNS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Turns:\s*(\d+)").unwrap());
     static RE_COST: LazyLock<Regex> =
