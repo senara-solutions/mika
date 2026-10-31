@@ -1838,10 +1838,30 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 // voir avec `manager_config_from_env` : elle appartient au jeton,
                 // pas à la cible du manager.
                 groom_sender,
-                // mika#2958 vol 2d — la lecture « un groom est en cours ». `None`
-                // ici le temps d'une étape : la construction arrive au commit
-                // suivant, au site qui tient le handle de base.
-                None,
+                // mika#2958 vol 2d — par quoi le cycle voit qu'un groom est déjà
+                // en vol. Construite **ici** et pas dans `spawn.rs`, pour la même
+                // raison que les deux sources ci-dessus : elle tient un handle de
+                // base, que ni ce site d'appel ni `ManagerConfig` ne portent.
+                //
+                // Le périmètre de lecture est le **conteneur**, pas l'agent : la
+                // méthode est `list_groom_dispatches_in_container`, dont le nom dit
+                // le scope (mika#2792). C'est la direction qu'il faut : le groom que
+                // le manager ne doit pas relancer est une tâche de `mika-dev`, et
+                // l'agent par défaut n'est pas forcément celui-là — une lecture
+                // agent-scopée rendrait zéro ligne et ferait repartir un groom déjà
+                // en vol, exactement le défaut que le `DbFlightSource` ci-dessus a
+                // payé une fois.
+                //
+                // `None` quand l'agent par défaut est absent — le geste dit alors
+                // `no_in_flight_source` et ne déclenche rien, jamais un groom sur la
+                // foi d'un vide qu'il n'a pas mesuré. Lecture seule : la source lit
+                // `tasks`, et aucune autorité d'écriture ne passe par ce paramètre.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::groom_in_flight::DbGroomInFlightSource::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::milestone_manager::GroomInFlightSource>
+                }),
             ),
             Ok(None) => {
                 info!(
