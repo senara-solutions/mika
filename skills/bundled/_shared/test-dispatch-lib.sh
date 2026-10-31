@@ -16090,11 +16090,18 @@ test_t2976_measured_topology() {
     local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
 
     git -C "$FIXTURE_CLONE" checkout -q main
-    # Le tiers (le rôle de `milestone_read_audit`) : un fichier de la branche.
-    sed -i 's/^l11$/tiers-11/' "$FIXTURE_CLONE/shared.txt"
+    # Le tiers (le rôle de `milestone_read_audit`) : un fichier de la branche,
+    # et DANS le contexte de son hunk (l5 est à trois lignes de l2). C'est ce
+    # qui change le patch-id du squash en `-U3` : sans cette proximité, la scène
+    # ne mesurerait pas le défaut relevé par la revue du vol 2.
+    sed -i 's/^l5$/tiers-5/' "$FIXTURE_CLONE/shared.txt"
     git -C "$FIXTURE_CLONE" commit -q -am "feat: un autre ticket touche shared.txt"
+    local mb; mb=$(git -C "$FIXTURE_CLONE" merge-base main "$tip")
     git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
     git -C "$FIXTURE_CLONE" commit -q -m "feat(2958): le vol (#2975)"
+    local sq_u3 cum_u3
+    sq_u3=$(git -C "$FIXTURE_CLONE" show HEAD | git -C "$FIXTURE_CLONE" patch-id --stable | awk '{print $1}')
+    cum_u3=$(git -C "$FIXTURE_CLONE" diff "$mb" "$tip" | git -C "$FIXTURE_CLONE" patch-id --stable | awk '{print $1}')
     # main avance encore sur les lignes de la branche (le rôle du conflit de
     # `merge-tree` mesuré au § 1.3).
     sed -i 's/^branche-2$/main-2-reecrit/' "$FIXTURE_CLONE/shared.txt"
@@ -16104,6 +16111,10 @@ test_t2976_measured_topology() {
     _t2976_gh_merged
 
     local failures=""
+    # La scène : avec le contexte, le patch cumulé et le squash DIFFÈRENT. C'est
+    # ce qui rend ce cas plus dur que T8, et ce qui oblige E2 à travailler en -U0.
+    [ -n "$sq_u3" ] && [ "$sq_u3" != "$cum_u3" ] \
+        || failures="${failures}scène: the -U3 patch-ids should differ (squash=$sq_u3 cumul=$cum_u3); "
     # Critère écarté n°1 : le diff restreint aux fichiers n'est pas vide ici.
     [ -n "$(git -C "$FIXTURE_CLONE" diff origin/main "$tip" -- shared.txt plan.md)" ] \
         || failures="${failures}scène: the restricted diff should be non-empty (§ 1.2); "

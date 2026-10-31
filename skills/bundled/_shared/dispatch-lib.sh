@@ -3752,8 +3752,9 @@ _stash_and_remove_worktree() {
 # en `BRANCH_HAS_UNMERGED_WORK` (mika#2958, 2026-10-31, `59010336a` contre le
 # squash `fcb5148fd`). Ici l'unité de comparaison est le diff
 # `merge_base..tip` : mesuré, son patch-id est exactement celui du squash
-# (`402470424f…`), parce que `patch-id --stable` ignore numéros de ligne et
-# contexte, donc le rebase qu'un squash subit avant d'atterrir.
+# (`402470424f…`). Les deux côtés sont calculés en `-U0` : `patch-id --stable`
+# ignore numéros de ligne et espaces mais hache le contexte, et le contexte est
+# précisément ce que le rebase d'un squash avant son atterrissage peut changer.
 #
 # Deux critères écartés par la mesure, à ne pas réessayer : le diff
 # `origin/main` contre la tête, restreint aux fichiers de la branche, n'est pas
@@ -3804,17 +3805,30 @@ _branch_cumulative_absorbed() {
         return 0
     fi
 
-    cum=$(git -C "$repo_dir" diff "$merge_base" "$tip" 2>/dev/null \
+    # `-U0` des DEUX côtés, et ce n'est pas un détail. `patch-id --stable`
+    # ignore numéros de ligne et espaces, mais il HACHE les lignes de contexte.
+    # Un commit tiers atterri sur `main` entre la merge-base et le squash, à
+    # trois lignes ou moins d'un hunk de la branche, change le contexte du
+    # squash et donc son patch-id : en `-U3`, une branche entièrement absorbée
+    # sortait `not_found`, c'est-à-dire `work` (relevé par la revue du vol 2,
+    # reproduit : `854db6a4…` contre `4259ad0b…` en `-U3`, `eede3fa7…` des deux
+    # côtés en `-U0`). Sans contexte, le patch-id ne porte que les noms de
+    # fichiers et les lignes ajoutées et retirées : le contenu, rien d'autre.
+    cum=$(git -C "$repo_dir" diff -U0 "$merge_base" "$tip" 2>/dev/null \
         | git -C "$repo_dir" patch-id --stable 2>/dev/null | awk 'NR == 1 {print $1}')
     case "$cum" in ''|*[!0-9a-f]*) _BRANCH_CUMULATIVE_REASON="unreadable_patch_id"; return 1 ;; esac
 
     # `--no-merges` explicite : un merge n'a pas de patch-id exploitable, et un
-    # squash n'est jamais un merge.
-    if ! scan=$(git -C "$repo_dir" log -p --no-merges "$merge_base..origin/main" 2>/dev/null); then
+    # squash n'est jamais un merge. Les patch-ids sont capturés AVANT le `grep -q`,
+    # jamais pipés dedans : `grep -q` sort au premier match, et sous `pipefail`
+    # le producteur tué par SIGPIPE ferait lire 141 comme `not_found` (mika#2055).
+    local ids=""
+    if ! scan=$(git -C "$repo_dir" log -p -U0 --no-merges "$merge_base..origin/main" 2>/dev/null); then
         _BRANCH_CUMULATIVE_REASON="unreadable_patch_id"
         return 1
     fi
-    if printf '%s\n' "$scan" | git -C "$repo_dir" patch-id --stable 2>/dev/null | grep -q "^$cum "; then
+    ids=$(printf '%s\n' "$scan" | git -C "$repo_dir" patch-id --stable 2>/dev/null) || ids=""
+    if grep -q "^$cum " <<<"$ids"; then
         _BRANCH_CUMULATIVE_REASON="absorbed"
         return 0
     fi
