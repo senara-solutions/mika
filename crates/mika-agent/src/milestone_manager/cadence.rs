@@ -1254,12 +1254,13 @@ pub async fn run_manager_cycle_in(
     // champ de checkpoint n'en a besoin. Lié plutôt que jeté pour que ce vol-là
     // soit l'ajout d'une ligne et non une reprise du site.
     let _admitted = write_pool_admissions(cfg, ctx, &state, &assessment).await;
-    // mika#2958 vol 2b — le geste de la relève. Lié ici, après le bassin, parce
-    // que la relève dérive du verdict de bassin : la nommer avant de l'avoir
-    // mesurée n'a pas de sens. Le résultat est lié et non jeté pour la même
-    // raison qu'`_admitted` : le rendu ON du rapport, au vol 2d, doit être
-    // l'ajout d'une ligne et non une reprise du site.
-    let _grooms = trigger_cycle_grooms(cfg, ctx, &assessment, checkpoint.as_ref()).await;
+    // mika#2958 vols 2b et 2d — le geste de la relève. Lié ici, après le bassin,
+    // parce que la relève dérive du verdict de bassin : la nommer avant de
+    // l'avoir mesurée n'a pas de sens. Depuis le vol 2d le résultat a un
+    // consommateur — la fenêtre d'idempotence durable, composée au site de
+    // sauvegarde ci-dessous. Ce qu'il n'a toujours pas, c'est une destination
+    // dans le rapport : c'est le vol 2e (AC4, moitié ON).
+    let grooms = trigger_cycle_grooms(cfg, ctx, &assessment, checkpoint.as_ref()).await;
     let severity = assessment.severity.clone();
     let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
 
@@ -1370,22 +1371,27 @@ pub async fn run_manager_cycle_in(
     }
 
     // Persist checkpoint on delivery — ou sur un verdict posté sans livraison
-    // (mika#2698 vol 2). Sans cette seconde raison, un cycle qui poste sans
-    // livrer ne retiendrait rien et reposterait au cycle suivant : l'AC2
-    // tomberait précisément dans le cas où l'interrupteur sert.
+    // (mika#2698 vol 2), ou sur un groom envoyé (mika#2958 vol 2d, R5). Sans ces
+    // raisons secondes, un cycle qui agit sans livrer ne retiendrait rien et
+    // recommencerait au cycle suivant : l'AC2 tomberait précisément dans le cas
+    // où l'interrupteur sert.
     let posted_something = !newly_posted.is_empty();
-    if should_deliver || posted_something {
+    let triggered_something = !grooms.declenches.is_empty();
+    if should_deliver || posted_something || triggered_something {
         let previous = checkpoint
             .as_ref()
             .map(|c| c.posted_flight_task_ids.as_slice())
             .unwrap_or(&[]);
         let posted_flight_task_ids = merge_posted(previous, &newly_posted);
+        // D7 — l'élagage à l'écriture, pour que le fichier ne grossisse pas. La
+        // correction, elle, ne dépend que de l'élagage à la lecture : un cycle
+        // qui n'agit pas du tout ne passe jamais ici.
         let triggered_grooms = merge_triggered(
             checkpoint
                 .as_ref()
                 .map(|c| c.triggered_grooms.as_slice())
                 .unwrap_or(&[]),
-            &[],
+            &grooms.declenches,
             now,
         );
         let new_checkpoint = if should_deliver {
@@ -1397,13 +1403,16 @@ pub async fn run_manager_cycle_in(
                 triggered_grooms,
             }
         } else {
-            // Posté sans livrer : les trois champs de cadence sont **préservés**
+            // Agi sans livrer : les trois champs de cadence sont **préservés**
             // tels quels. Les réécrire ici avalerait l'événement
             // `state_changed` en attente — une sauvegarde faite pour une raison
-            // ne doit pas répondre à la place d'une autre.
+            // ne doit pas répondre à la place d'une autre. Les deux champs
+            // d'idempotence, eux, portent bien ce que ce cycle a fait : c'est
+            // la raison même de la sauvegarde.
             let base = checkpoint.clone().unwrap_or_default();
             MilestoneCheckpoint {
                 posted_flight_task_ids,
+                triggered_grooms,
                 ..base
             }
         };
@@ -3029,6 +3038,85 @@ mod tests {
         );
         assert_eq!(
             apres_post.last_observed_at, apres_livraison.last_observed_at,
+            "la borne `since` du prochain cycle est préservée"
+        );
+    }
+
+    /// **R5 au vol 2d** — déclenché sans livrer : le checkpoint est écrit pour
+    /// cette raison seule, la fenêtre porte le numéro, et les trois champs de
+    /// cadence sont préservés.
+    ///
+    /// Sans cette troisième raison de sauvegarde, le groom envoyé ne laisserait
+    /// aucune trace durable et le cycle suivant le renverrait : la base ne voit
+    /// pas encore la tâche moteur, donc la lecture du vol 2c répondrait
+    /// honnêtement « rien ». C'est exactement le trou de course que la fenêtre
+    /// existe pour couvrir, et le premier cycle est ici celui qui l'ouvre.
+    ///
+    /// Le premier cycle court **sans rail de groom** exprès : s'il en avait un,
+    /// il aurait déjà envoyé, et le second mesurerait la fenêtre au lieu de la
+    /// sauvegarde.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_declencher_sans_livrer_sauvegarde_et_preserve_la_cadence() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut etat = base_state();
+        etat.sub_issues[0].plan_present = false;
+
+        // Cycle 1 : livre, sans rail de groom — rien n'est envoyé.
+        run_manager_cycle_in(&cfg, etat.clone(), &CycleContext::new(&rec, t0))
+            .await
+            .unwrap();
+        let apres_livraison = lire_checkpoint(&cfg);
+        assert!(
+            apres_livraison.triggered_grooms.is_empty(),
+            "prémisse : sans rail, le premier cycle n'a rien déclenché"
+        );
+
+        // Cycle 2 : dix minutes plus tard, état **inchangé** (donc pas de
+        // livraison), mais le rail et la lecture sont câblés.
+        let groom = RecordingGroom::default();
+        let source: Arc<dyn GroomInFlightSource> = Arc::new(LectureGroom::vide());
+        let outcome = run_manager_cycle_in(
+            &cfg,
+            etat,
+            &CycleContext::new(&rec, t0 + Duration::minutes(10))
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.delivered, "ni changement d'état ni heartbeat");
+        assert_eq!(
+            *groom.envois.lock().unwrap(),
+            vec!["groom mika#1802".to_string()],
+            "et pourtant il déclenche"
+        );
+
+        let apres_groom = lire_checkpoint(&cfg);
+        assert_eq!(
+            apres_groom
+                .triggered_grooms
+                .iter()
+                .map(|g| g.number)
+                .collect::<Vec<_>>(),
+            vec![1802],
+            "la fenêtre retient le numéro envoyé"
+        );
+        assert_eq!(
+            apres_groom.state_digest, apres_livraison.state_digest,
+            "le digest est préservé : cette sauvegarde ne parle pas de livraison"
+        );
+        assert_eq!(
+            apres_groom.last_delivered_at, apres_livraison.last_delivered_at,
+            "la date de dernière livraison est préservée"
+        );
+        assert_eq!(
+            apres_groom.last_observed_at, apres_livraison.last_observed_at,
             "la borne `since` du prochain cycle est préservée"
         );
     }
