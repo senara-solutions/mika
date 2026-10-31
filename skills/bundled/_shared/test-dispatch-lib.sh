@@ -15903,13 +15903,388 @@ test_t2976_undetermined() {
     if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
 }
 
+# ═════════════════════════════════════════════════════════════════════════════
+# mika#2976 vol 2 — T7 à T12 (plan § 13.5)
+#
+# Trois défauts du vol 1, relevés par la sonde d'AC4 : un squash de plusieurs
+# commits jugé `unmerged_work` (AC6, AC7), le plan du groom courant pris pour un
+# travail laissé derrière (AC8), une ref de suivi périmée lue comme vivante
+# (AC9). Chaque cas porte son contrôle négatif DANS LA MÊME FONCTION, sur la même
+# fixture : un vert du positif sans le rouge du négatif ne prouverait que la
+# complaisance de la porte.
+#
+# Les dates sont POSÉES, pas subies : la partition de l'AC8 lit la date de
+# commit contre `mergedAt`, et un test qui dépendrait de l'horloge de la machine
+# mesurerait l'horloge. Antérieur = 1700000000 (+ décalage), merge = 1700001000
+# (2023-11-14T22:30:00Z), postérieur = 1700002000.
+T2976_ANTE=1700000000
+T2976_MERGED_ISO="2023-11-14T22:30:00Z"
+T2976_POST=1700002000
+
+# `_t2976_commit_at <epoch> <fichier> <contenu> <sujet>` — un commit daté.
+_t2976_commit_at() {
+    printf '%s\n' "$3" > "$FIXTURE_CLONE/$2"
+    git -C "$FIXTURE_CLONE" add "$2" >/dev/null 2>&1
+    GIT_COMMITTER_DATE="@$1 +0000" GIT_AUTHOR_DATE="@$1 +0000" \
+        git -C "$FIXTURE_CLONE" commit -q -m "$4"
+}
+
+# La PR précédente, MERGÉE, avec son instant de fermeture.
+_t2976_gh_merged() {
+    gh() { printf '[{"number":2985,"state":"MERGED","mergedAt":"%s","closedAt":"%s"}]\n' \
+        "$T2976_MERGED_ISO" "$T2976_MERGED_ISO"; }
+}
+
+# `_t2976_run_gate <branche> <worktree> <tag>` — exerce la PRODUCTION et relève
+# l'avant, l'après, le journal, le rc et le compte de stash.
+_t2976_run_gate() {
+    T2976_BEFORE=$(_t2976_refs "$1")
+    T2976_STASHES=$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)
+    BRANCH_SPENT=0; RESULT=""; T2976_RC=0
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$1" "$2" 2976 2>"$T2976_ROOT/$3.err" || T2976_RC=$?
+    T2976_AFTER=$(_t2976_refs "$1")
+    T2976_LOG=$(cat "$T2976_ROOT/$3.err" 2>/dev/null || true)
+}
+
+# Les assertions d'une halte : verdict, action, rc, sha nommé, et rien n'a bougé.
+# Écrit les manquements sur stdout, préfixés de `$2`.
+_t2976_assert_halt() {
+    local named="$1" tag="$2" f=""
+    grep -qF -- 'verdict=unmerged_work' <<<"$T2976_LOG" || f="${f}${tag}: verdict should be unmerged_work, log: $T2976_LOG; "
+    grep -qF -- 'action=halt' <<<"$T2976_LOG" || f="${f}${tag}: action should be halt; "
+    [ "$T2976_RC" = "1" ] || f="${f}${tag}: gate should halt (rc=$T2976_RC); "
+    grep -qF -- 'STATUS=BRANCH_HAS_UNMERGED_WORK' <<<"${RESULT:-}" || f="${f}${tag}: RESULT should carry the halt status; "
+    grep -qF -- "$named" <<<"${RESULT:-}" || f="${f}${tag}: RESULT should name $named; "
+    [ "$T2976_BEFORE" = "$T2976_AFTER" ] || f="${f}${tag}: refs moved ($T2976_BEFORE -> $T2976_AFTER); "
+    [ "$T2976_STASHES" = "$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)" ] \
+        || f="${f}${tag}: a stash entry was created; "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || f="${f}${tag}: BRANCH_SPENT should stay 0; "
+    printf '%s' "$f"
+}
+
+# Les assertions d'une réinitialisation : la branche repart de origin/main.
+_t2976_assert_reset() {
+    local br="$1" wt="$2" tag="$3" f="" main_sha
+    main_sha=$(git -C "$FIXTURE_CLONE" rev-parse refs/remotes/origin/main)
+    grep -qF -- 'verdict=spent' <<<"$T2976_LOG" || f="${f}${tag}: verdict should be spent, log: $T2976_LOG; "
+    grep -qF -- 'action=reset' <<<"$T2976_LOG" || f="${f}${tag}: action should be reset; "
+    [ "${BRANCH_SPENT:-x}" = "1" ] || f="${f}${tag}: BRANCH_SPENT should be 1; "
+    [ "${T2976_AFTER%%|*}" = "$main_sha" ] || f="${f}${tag}: local ref should be origin/main (got $T2976_AFTER); "
+    [ ! -d "$wt" ] || f="${f}${tag}: spent worktree should be removed; "
+    [ "$T2976_RC" = "0" ] || f="${f}${tag}: a reset must not halt (rc=$T2976_RC); "
+    printf '%s' "$f"
+}
+
+# --- T7 : UN commit squashé, et son contrôle négatif --------------------------
+#
+# Le cas que le vol 1 savait déjà juger (E1), refait par un vrai `merge --squash`
+# et daté : il ne doit pas régresser. Négatif : la même branche portant en plus
+# un commit d'AVANT le merge, absent de `main`.
+test_t2976_single_squash() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t7" neg="fix/2976/t7-neg" wt="$T2976_WT_ROOT/fix-2976-t7"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg"
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2976): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "docs(plans): groom mika#2976 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    _t2976_run_gate "$br" "$wt" t7
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" positif)"
+    grep -qF -- 'containment=per_commit' <<<"$T2976_LOG" || failures="${failures}positif: containment should be per_commit; "
+    grep -qF -- 'current=0' <<<"$T2976_LOG" || failures="${failures}positif: current should be 0; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t7-neg" t7neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+    grep -qF -- 'containment=work' <<<"$T2976_LOG" || failures="${failures}négatif: containment should be work; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T8 (AC6) : plan + code squashés en UN commit, et son contrôle négatif ----
+#
+# La fixture que le vol 1 n'avait pas. `merge --squash`, jamais deux
+# `cherry-pick -x` : des cherry-picks garderaient les patch-ids individuels, E1
+# absorberait la branche et le test mesurerait le vol 1 (plan § 10, piège 2). La
+# fixture assertionne donc sa propre scène avant de mesurer.
+test_t2976_multi_squash() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t8" neg="fix/2976/t8-neg" wt="$T2976_WT_ROOT/fix-2976-t8"
+
+    local mb; mb=$(git -C "$FIXTURE_CLONE" rev-parse main)
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    local plan_sha; plan_sha=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    _t2976_commit_at "$((T2976_ANTE + 10))" code.txt "le code du vol 1" "fix(2976): le code du vol 1"
+    local code_sha; code_sha=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg"
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2976): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "fix(2976): le vol 1 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    # La scène : UN commit de plus que la merge-base sur main, et aucun des deux
+    # commits de la branche n'y est.
+    [ "$(git -C "$FIXTURE_CLONE" rev-list --count "$mb..main")" = "1" ] \
+        || failures="${failures}scène: main should carry exactly one squash commit; "
+    if git -C "$FIXTURE_CLONE" merge-base --is-ancestor "$plan_sha" main \
+        || git -C "$FIXTURE_CLONE" merge-base --is-ancestor "$code_sha" main; then
+        failures="${failures}scène: a branch commit reached main, this is not a squash; "
+    fi
+
+    _t2976_run_gate "$br" "$wt" t8
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" positif)"
+    grep -qF -- 'containment=cumulative' <<<"$T2976_LOG" || failures="${failures}positif: containment should be cumulative (E2), log: $T2976_LOG; "
+    grep -qF -- 'unmerged=0' <<<"$T2976_LOG" || failures="${failures}positif: unmerged should be 0; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t8-neg" t8neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+    grep -qF -- 'containment=work' <<<"$T2976_LOG" || failures="${failures}négatif: containment should be work; "
+    grep -qF -- '(not_found)' <<<"${RESULT:-}" || failures="${failures}négatif: RESULT should give the E2 reason; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T9 (AC7) : la topologie mesurée, avec le retard de `main` ----------------
+#
+# Le cas réel est `59010336a` contre le squash `fcb5148fd` (mika#2958) : patch
+# cumulé `9d6c12257..59010336a` et squash au même patch-id `402470424f…`. Sa
+# branche a été supprimée, donc un clone de CI ne porte pas l'objet ; la fixture
+# reproduit ce qui FAIT le cas : un commit tiers sur main touche un fichier de la
+# branche avant le squash, et main réécrit encore ce fichier après. Les deux
+# critères écartés par le plan (§ 1.2 et 1.3) sont épinglés : leur
+# réintroduction rougit ici, motif en clair.
+test_t2976_measured_topology() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t9" neg="fix/2976/t9-neg" wt="$T2976_WT_ROOT/fix-2976-t9"
+
+    printf '%s\n' l1 l2 l3 l4 l5 l6 l7 l8 l9 l10 l11 l12 > "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" add shared.txt >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "chore: shared.txt"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol" "docs(plans): groom mika#2958"
+    sed -i 's/^l2$/branche-2/' "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" add shared.txt >/dev/null 2>&1
+    GIT_COMMITTER_DATE="@$((T2976_ANTE + 10)) +0000" GIT_AUTHOR_DATE="@$((T2976_ANTE + 10)) +0000" \
+        git -C "$FIXTURE_CLONE" commit -q -m "feat(2958): le code"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg"
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2958): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # Le tiers (le rôle de `milestone_read_audit`) : un fichier de la branche.
+    sed -i 's/^l11$/tiers-11/' "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" commit -q -am "feat: un autre ticket touche shared.txt"
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "feat(2958): le vol (#2975)"
+    # main avance encore sur les lignes de la branche (le rôle du conflit de
+    # `merge-tree` mesuré au § 1.3).
+    sed -i 's/^branche-2$/main-2-reecrit/' "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" commit -q -am "refactor: main réécrit la ligne"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    # Critère écarté n°1 : le diff restreint aux fichiers n'est pas vide ici.
+    [ -n "$(git -C "$FIXTURE_CLONE" diff origin/main "$tip" -- shared.txt plan.md)" ] \
+        || failures="${failures}scène: the restricted diff should be non-empty (§ 1.2); "
+    # Critère écarté n°2 : merge-tree ne rend pas l'arbre de origin/main.
+    local mt; mt=$(git -C "$FIXTURE_CLONE" merge-tree --write-tree origin/main "$tip" 2>/dev/null | head -1 || true)
+    [ "$mt" != "$(git -C "$FIXTURE_CLONE" rev-parse 'origin/main^{tree}')" ] \
+        || failures="${failures}scène: merge-tree should not yield origin/main's tree (§ 1.3); "
+
+    _t2976_run_gate "$br" "$wt" t9
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" positif)"
+    grep -qF -- 'containment=cumulative' <<<"$T2976_LOG" || failures="${failures}positif: containment should be cumulative, log: $T2976_LOG; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t9-neg" t9neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T10 (non-mesure) : la fenêtre dépassée ne vaut pas absorption ------------
+#
+# La scène positive de T8, plafond à 0 : `window_too_large`. Sépare, pour le
+# relevé d'AC4, « du travail réel » (`work`) de « on n'a pas su » (`unmeasured`).
+# C'est aussi l'anti-vacuité de T8 : un plafond non lu ferait passer ce cas en
+# `cumulative`. Contrôle négatif : le même cas, plafond par défaut, se réinitialise.
+test_t2976_window_unmeasured() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t10" wt="$T2976_WT_ROOT/fix-2976-t10"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    _t2976_commit_at "$((T2976_ANTE + 10))" code.txt "le code du vol 1" "fix(2976): le code du vol 1"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "fix(2976): le vol 1 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures="" head_sha
+    head_sha=$(git -C "$FIXTURE_CLONE" rev-parse "$br")
+    local _BRANCH_REUSE_WINDOW_MAX=0
+    _t2976_run_gate "$br" "$wt" t10
+    failures="${failures}$(_t2976_assert_halt "$head_sha" plafond)"
+    grep -qF -- 'containment=unmeasured' <<<"$T2976_LOG" || failures="${failures}plafond: containment should be unmeasured, log: $T2976_LOG; "
+    grep -qF -- '(window_too_large)' <<<"${RESULT:-}" || failures="${failures}plafond: RESULT should name window_too_large; "
+    [ -d "$wt" ] || failures="${failures}plafond: worktree should be untouched; "
+
+    _BRANCH_REUSE_WINDOW_MAX=1000
+    _t2976_run_gate "$br" "$wt" t10neg
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" défaut)"
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T11 (AC8) : le plan du groom courant laisse partir dev-pilot -------------
+#
+# Le cas mesuré sur ce ticket : la branche recréée depuis `main` après le merge
+# de #2985 ne porte que le plan `0c9203aaf`, daté après le merge, et dev-pilot
+# `0be4647a` s'est arrêté dessus. Le plan est le vol COURANT : `live`, rien ne
+# bouge — surtout pas une réinitialisation, qui détruirait le plan. Négatif : la
+# même branche portant en plus un commit d'avant le merge, absent de `main`.
+test_t2976_current_flight() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local old="fix/2976/t11-vol1" br="fix/2976/t11" neg="fix/2976/t11-neg"
+    local wt="$T2976_WT_ROOT/fix-2976-t11"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$old"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    _t2976_commit_at "$((T2976_ANTE + 10))" code.txt "le code du vol 1" "fix(2976): le vol 1"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$old" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "fix(2976): le vol 1 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    # Le re-groom : branche recréée depuis origin/main, un seul commit de plan,
+    # poussé. Le contrôle négatif part du même point.
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br" origin/main
+    _t2976_commit_at "$T2976_POST" plan2.md "plan du vol 2" "docs(plans): groom mika#2976 vol 2"
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg" origin/main
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2976): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    _t2976_commit_at "$T2976_POST" plan2.md "plan du vol 2" "docs(plans): groom mika#2976 vol 2"
+    local neg_plan; neg_plan=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    _t2976_run_gate "$br" "$wt" t11
+    grep -qF -- 'verdict=live' <<<"$T2976_LOG" || failures="${failures}positif: verdict should be live, log: $T2976_LOG; "
+    grep -qF -- 'action=reuse' <<<"$T2976_LOG" || failures="${failures}positif: action should be reuse; "
+    grep -qF -- 'current=1' <<<"$T2976_LOG" || failures="${failures}positif: current should be 1; "
+    [ "$T2976_BEFORE" = "$T2976_AFTER" ] || failures="${failures}positif: refs moved ($T2976_BEFORE -> $T2976_AFTER); "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}positif: BRANCH_SPENT should stay 0; "
+    [ "$T2976_RC" = "0" ] || failures="${failures}positif: gate should not halt (rc=$T2976_RC); "
+    [ -d "$wt" ] || failures="${failures}positif: worktree should be intact; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t11-neg" t11neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+    grep -qF -- 'current=1' <<<"$T2976_LOG" || failures="${failures}négatif: current should still count the plan; "
+    # Le plan du vol courant n'est PAS désigné comme travail en péril.
+    if grep -qF -- "$neg_plan" <<<"${RESULT:-}"; then
+        failures="${failures}négatif: the current-flight plan must not be named as unmerged; "
+    fi
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T12 (AC9) : une ref de suivi périmée ne fait pas buter la porte ----------
+#
+# Un `git fetch` sans `--prune` ne retire jamais `refs/remotes/origin/<b>` : la
+# branche supprimée sur origin, la ref reste sur l'ancienne tête. Ici elle porte
+# même un travail absent de `main` — le pire cas — et la porte ne doit pas la
+# lire, puisque le distant répond que la branche n'existe plus. Négatif : la
+# même scène, branche VIVANTE sur origin, s'arrête.
+test_t2976_stale_tracking_ref() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t12" neg="fix/2976/t12-neg"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" stale.txt "vieille tête" "wip(2976): vieille tête"
+    local stale_sha; stale_sha=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" branch -q "$neg"
+    git -C "$FIXTURE_CLONE" push -q origin "$neg"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # Suppression sur origin, puis la ref de suivi remise là où un fetch sans
+    # --prune l'aurait laissée. Les refs locales partent par update-ref.
+    git -C "$FIXTURE_CLONE" push -q origin --delete "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" update-ref "refs/remotes/origin/$br" "$stale_sha"
+    git -C "$FIXTURE_CLONE" update-ref -d "refs/heads/$br"
+    git -C "$FIXTURE_CLONE" update-ref -d "refs/heads/$neg"
+    _t2976_gh_merged
+
+    local failures=""
+    [ -z "$(git -C "$FIXTURE_CLONE" ls-remote origin "refs/heads/$br")" ] \
+        || failures="${failures}scène: the branch should be gone from origin; "
+    _t2976_run_gate "$br" "$T2976_WT_ROOT/fix-2976-t12" t12
+    grep -qF -- "stale=refs/remotes/origin/$br" <<<"$T2976_LOG" || failures="${failures}positif: stale should name the tracking ref, log: $T2976_LOG; "
+    grep -qF -- 'verdict=unmerged_work' <<<"$T2976_LOG" && failures="${failures}positif: a stale ref must not halt the gate; "
+    grep -qF -- 'tips=none' <<<"$T2976_LOG" || failures="${failures}positif: the stale ref should not be read; "
+    [ "$T2976_RC" = "0" ] || failures="${failures}positif: gate should not halt (rc=$T2976_RC); "
+    [ "$T2976_BEFORE" = "$T2976_AFTER" ] || failures="${failures}positif: refs moved ($T2976_BEFORE -> $T2976_AFTER); "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t12-neg" t12neg
+    failures="${failures}$(_t2976_assert_halt "$stale_sha" négatif)"
+    grep -qF -- "tips=refs/remotes/origin/$neg" <<<"$T2976_LOG" || failures="${failures}négatif: the live tracking ref should be read; "
+    grep -qF -- 'stale=none' <<<"$T2976_LOG" || failures="${failures}négatif: stale should be none; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# Scans de bonne foi (plan § 6) : E2 a son instrument, la ligne porte ses champs,
+# le plafond se lit dans sa constante nommée.
+T2976_E2_FUNC=$(sed -n '/^_branch_cumulative_absorbed()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976 vol 2: E2 compare par patch-id --stable" 'patch-id --stable' "$T2976_E2_FUNC"
+assert_contains "mika#2976 vol 2: E2 balaie --no-merges" '--no-merges' "$T2976_E2_FUNC"
+assert_contains "mika#2976 vol 2: E2 lit le plafond dans sa constante" '_BRANCH_REUSE_WINDOW_MAX' "$T2976_E2_FUNC"
+assert_not_contains "mika#2976 vol 2: aucun littéral 1000 dans le corps d'E2" '1000' "$T2976_E2_FUNC"
+assert_contains "mika#2976 vol 2: la ligne porte containment=" 'containment=${_BRANCH_REUSE_CONTAINMENT' "$T2976_GATE_FUNC"
+assert_contains "mika#2976 vol 2: la ligne porte current=" 'current=${_BRANCH_REUSE_CURRENT' "$T2976_GATE_FUNC"
+assert_contains "mika#2976 vol 2: la ligne porte stale=" 'stale=${_BRANCH_REUSE_STALE' "$T2976_GATE_FUNC"
+
 for _t2976_case in \
     "T1 (AC2a) branche locale d'un vol mergé: reset sur origin/main, worktree retiré|test_t2976_local_spent" \
     "T2 (AC2b) branche sur origin d'un vol mergé: reset local, ref distante intacte|test_t2976_remote_spent" \
     "T3 (AC2c) contrôle négatif — PR ouverte: verdict=live, rien ne bouge|test_t2976_open_pr_live" \
     "T4 (AC2c bis) contrôle négatif — aucune PR: verdict=live, rien ne bouge|test_t2976_no_pr_live" \
     "T5 (AC3) patch absent de main: halte sur BRANCH_HAS_UNMERGED_WORK|test_t2976_unmerged_work_halts" \
-    "T6 non-mesure — gh muet: verdict=undetermined, rien ne bouge|test_t2976_undetermined"; do
+    "T6 non-mesure — gh muet: verdict=undetermined, rien ne bouge|test_t2976_undetermined" \
+    "T7 un commit squashé: spent/per_commit ; négatif: commit antérieur absent, halte|test_t2976_single_squash" \
+    "T8 (AC6) plan + code squashés en un: spent/cumulative/reset ; négatif: halte|test_t2976_multi_squash" \
+    "T9 (AC7) topologie mesurée, critères écartés épinglés: spent/cumulative ; négatif: halte|test_t2976_measured_topology" \
+    "T10 non-mesure — fenêtre dépassée: unmeasured, halte ; négatif: plafond par défaut, reset|test_t2976_window_unmeasured" \
+    "T11 (AC8) plan postérieur au merge: live/reuse ; négatif: commit antérieur absent, halte|test_t2976_current_flight" \
+    "T12 (AC9) ref de suivi périmée non lue ; négatif: ref vivante, halte|test_t2976_stale_tracking_ref"; do
     _t2976_label="${_t2976_case%%|*}"
     _t2976_fn="${_t2976_case##*|}"
     _t2976_out=$("$_t2976_fn" 2>/dev/null || echo "FAIL: harness aborted")
