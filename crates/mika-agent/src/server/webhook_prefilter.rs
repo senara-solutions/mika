@@ -4021,6 +4021,456 @@ pub(crate) mod tests {
         );
     }
 
+    // ---- vol 7 — la taxonomie servie, et le protocole qui la déclare ------
+
+    /// L'axe d'une clé de fil : le seau de l'agrégat où elle apparaît.
+    ///
+    /// **Trois** axes vivent dans le registre des tours webhook et ne se
+    /// confondent jamais : `skipped_by_class` nomme ce qu'une porte a reconnu,
+    /// `charged_by_release` nomme la porte qui n'a pas écarté, et
+    /// `charged_by_outcome` (mika#2855) nomme ce que le tour a fait. Le
+    /// détecteur n'en connaît que les deux premiers — le troisième est servi
+    /// ailleurs, n'a pas de table, et un détecteur qui scannerait le document
+    /// entier confondrait les trois.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Axe {
+        Classe,
+        Relache,
+    }
+
+    impl Axe {
+        /// Le nom du seau dans l'agrégat — ce que le message d'échec nomme pour
+        /// que l'opérateur sache quelle table ouvrir.
+        fn seau(self) -> &'static str {
+            match self {
+                Axe::Classe => "skipped_by_class",
+                Axe::Relache => "charged_by_release",
+            }
+        }
+
+        /// Le discriminant du marqueur de table. Les deux tables vivent dans la
+        /// même section, donc les marqueurs portent leur axe : sans lui,
+        /// l'extraction de la première table happerait la seconde.
+        fn marqueur(self) -> &'static str {
+            match self {
+                Axe::Classe => "classe",
+                Axe::Relache => "relache",
+            }
+        }
+    }
+
+    /// Une énumération de fil qui sait énumérer ses propres variantes.
+    ///
+    /// **Le `match` EST la liste.** [`Taxonomie::suivante`] rend la variante
+    /// suivante dans l'ordre de déclaration et `None` sur la dernière, et son
+    /// `match` n'a **pas de bras `_`** : une variante ajoutée ne compile pas
+    /// tant qu'elle n'a pas son bras, et une fois le bras écrit elle est dans
+    /// la liste par construction. C'est ce qui ferme le découplage que
+    /// [`cas_de_relache`] nomme pour son voisin — *« il ne sait rien de
+    /// l'énumération, donc une variante ajoutée sans cas le laisse vert »* —
+    /// mais du côté de la **liste** cette fois, et non du côté des cas.
+    ///
+    /// Un trait plutôt que deux fonctions libres : deux `fn suivante` homonymes
+    /// ne cohabitent pas dans un module, et le nom doit être le même pour les
+    /// deux axes. Les signatures rendues sont exactement
+    /// `suivante(PrefilterClass) -> Option<PrefilterClass>` et
+    /// `suivante(Release) -> Option<Release>`.
+    trait Taxonomie: Copy + Sized {
+        /// La première variante dans l'ordre de déclaration : la graine de la
+        /// chaîne.
+        const PREMIERE: Self;
+        /// L'axe de l'agrégat que cette énumération peuple.
+        const AXE: Axe;
+        /// La variante suivante dans l'ordre de déclaration, `None` sur la
+        /// dernière.
+        fn suivante(self) -> Option<Self>;
+        /// La clé de fil que l'agrégat porte — `as_str`, par le trait.
+        fn cle(self) -> &'static str;
+
+        /// Toutes les variantes, dérivées de la chaîne.
+        ///
+        /// Bornée : un bras qui pointerait en arrière ferait un cycle, et
+        /// `successors` tournerait sans fin. La borne transforme ce blocage en
+        /// un échec de la garde de cardinalité, qui est lisible.
+        fn toutes() -> Vec<Self> {
+            const BORNE_DE_CHAINE: usize = 64;
+            std::iter::successors(Some(Self::PREMIERE), |t| t.suivante())
+                .take(BORNE_DE_CHAINE)
+                .collect()
+        }
+    }
+
+    impl Taxonomie for PrefilterClass {
+        const PREMIERE: Self = PrefilterClass::GreenCheckSuiteDefaultBranch;
+        const AXE: Axe = Axe::Classe;
+
+        fn cle(self) -> &'static str {
+            self.as_str()
+        }
+
+        /// Pas de bras `_` : une quinzième classe ne compile pas tant qu'elle
+        /// n'a pas son bras ici (DoD 1, AC3).
+        fn suivante(self) -> Option<Self> {
+            use PrefilterClass::*;
+            Some(match self {
+                GreenCheckSuiteDefaultBranch => InertLabel,
+                InertLabel => VerdictHoldTracked,
+                VerdictHoldTracked => VerdictNonReviewer,
+                VerdictNonReviewer => VerdictUnreadable,
+                VerdictUnreadable => VerdictPrClosed,
+                VerdictPrClosed => GreenCheckSuiteHeadDecided,
+                GreenCheckSuiteHeadDecided => RedCheckSuiteDefaultBranch,
+                RedCheckSuiteDefaultBranch => CiFailureNoOpenPr,
+                CiFailureNoOpenPr => CiFailureSurfacedForAdoption,
+                CiFailureSurfacedForAdoption => CiFailureTaskNotInProgress,
+                CiFailureTaskNotInProgress => PrClosedNoLoopTask,
+                PrClosedNoLoopTask => CommentTriagedNote,
+                CommentTriagedNote => GreenCheckSuiteHeadAlreadyReviewed,
+                GreenCheckSuiteHeadAlreadyReviewed => return None,
+            })
+        }
+    }
+
+    impl Taxonomie for Release {
+        const PREMIERE: Self = Release::SwitchDisarmed;
+        const AXE: Axe = Axe::Relache;
+
+        fn cle(self) -> &'static str {
+            self.as_str()
+        }
+
+        /// Pas de bras `_` : un dix-neuvième terme ne compile pas tant qu'il
+        /// n'a pas son bras ici (DoD 1, AC3), exactement comme dans
+        /// [`cas_de_relache`].
+        fn suivante(self) -> Option<Self> {
+            use Release::*;
+            Some(match self {
+                SwitchDisarmed => NotClassified,
+                NotClassified => TextTouched,
+                TextTouched => BranchTaskActive,
+                BranchTaskActive => PrTaskActive,
+                PrTaskActive => PrOpen,
+                PrOpen => NoTerminalTrace,
+                NoTerminalTrace => NoDecisionAttested,
+                NoDecisionAttested => HeadNotPreviouslyDecided,
+                HeadNotPreviouslyDecided => StateUnreadable,
+                StateUnreadable => TriageEscalated,
+                TriageEscalated => TriageUnreadable,
+                TriageUnreadable => IssueTaskActive,
+                IssueTaskActive => TriageDisarmed,
+                TriageDisarmed => ClosureSnapshotAbsent,
+                ClosureSnapshotAbsent => ReviewedHeadAbsent,
+                ReviewedHeadAbsent => ReviewedHeadOutOfContract,
+                ReviewedHeadOutOfContract => ReviewedHeadSwitchDisarmed,
+                ReviewedHeadSwitchDisarmed => return None,
+            })
+        }
+    }
+
+    /// Les quatorze classes, dérivées de la chaîne.
+    ///
+    /// La garde de cardinalité ne tient **pas** l'exhaustivité — la chaîne la
+    /// tient, et le compilateur avec elle. Elle rend visible un bras qui
+    /// pointerait en arrière (cycle) ou qui en sauterait un, là où la liste se
+    /// tronquerait sinon en silence.
+    fn toutes_les_classes() -> Vec<PrefilterClass> {
+        let liste = PrefilterClass::toutes();
+        assert_eq!(
+            liste.len(),
+            14,
+            "la chaîne de `suivante` ne traverse pas les quatorze classes : un bras \
+             saute une variante ou pointe en arrière — {liste:?}"
+        );
+        liste
+    }
+
+    /// Les dix-huit termes de relâche, dérivés de la chaîne. Même garde, même
+    /// raison.
+    fn tous_les_termes_de_relache() -> Vec<Release> {
+        let liste = Release::toutes();
+        assert_eq!(
+            liste.len(),
+            18,
+            "la chaîne de `suivante` ne traverse pas les dix-huit termes : un bras \
+             saute une variante ou pointe en arrière — {liste:?}"
+        );
+        liste
+    }
+
+    /// Ce que l'extraction d'une table peut refuser de rendre.
+    ///
+    /// Trois absences, trois messages (DoD 4) : un fichier absent, des
+    /// marqueurs absents et une table vide demandent trois gestes différents,
+    /// et aucun des trois n'est un saut. Un détecteur qui saute proprement est
+    /// un détecteur que rien ne lance (mika#2578, mika#2752), et le protocole
+    /// porte déjà la doctrine : *« un scan inerte en silence se lit exactement
+    /// comme un scan qui n'a rien trouvé »* (`README.md:232`, classe
+    /// mika#2205).
+    #[derive(Debug, PartialEq, Eq)]
+    enum ErreurTaxonomie {
+        FichierAbsent { chemin: String },
+        MarqueursAbsents { axe: Axe },
+        TableVide { axe: Axe },
+    }
+
+    impl std::fmt::Display for ErreurTaxonomie {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ErreurTaxonomie::FichierAbsent { chemin } => write!(
+                    f,
+                    "le protocole de lecture d'AC4 est introuvable à `{chemin}` : il porte les \
+                     tables que ce détecteur compare, son absence n'est pas un succès"
+                ),
+                ErreurTaxonomie::MarqueursAbsents { axe } => write!(
+                    f,
+                    "les marqueurs `taxonomie-servie:debut axe={m}` / `taxonomie-servie:fin \
+                     axe={m}` sont absents du protocole : la table de l'axe `{seau}` n'est pas \
+                     déclarée — ouvre `### Taxonomie servie` et pose-la",
+                    m = axe.marqueur(),
+                    seau = axe.seau(),
+                ),
+                ErreurTaxonomie::TableVide { axe } => write!(
+                    f,
+                    "la table de l'axe `{seau}` est vide entre ses marqueurs : ses lignes ont \
+                     disparu, ou leur première cellule n'est plus une clé de fil en snake_case",
+                    seau = axe.seau(),
+                ),
+            }
+        }
+    }
+
+    /// Le protocole de lecture d'AC4, relatif à la racine du dépôt.
+    const PROTOCOLE_AC4: &str = "docs/eval/mika-2680/README.md";
+
+    /// `docs/eval/` n'a pas de copie dans le crate — contrairement à
+    /// `docs/openapi/`, qu'`openapi.rs` atteint par `include_str!` — donc le
+    /// détecteur remonte à la racine du dépôt à l'exécution. Le pattern est
+    /// celui de `merge_gate_rerun.rs:1106` et de `qa_reviewed_head.rs:551`.
+    fn chemin_du_protocole() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("racine du dépôt au-dessus de crates/mika-agent")
+            .join(PROTOCOLE_AC4)
+    }
+
+    /// Prend le chemin en argument : c'est ce qui rend le cas « fichier
+    /// absent » jouable sans toucher à l'arbre.
+    fn lire_le_protocole(chemin: &std::path::Path) -> Result<String, ErreurTaxonomie> {
+        std::fs::read_to_string(chemin).map_err(|_| ErreurTaxonomie::FichierAbsent {
+            chemin: chemin.display().to_string(),
+        })
+    }
+
+    /// Les clés qu'une table déclare pour son axe, lues entre ses marqueurs.
+    ///
+    /// Prend le **texte** et non un chemin : c'est ce qui rend les deux
+    /// contrôles négatifs jouables sur la même graine que le chemin nominal
+    /// (DoD 5). Seule la première cellule de chaque ligne est lue, et seule une
+    /// cellule en snake_case nu est une clé — ce qui écarte l'en-tête
+    /// (`clé de fil`) et son séparateur (`---`) sans les énumérer.
+    fn taxonomie_declaree(
+        markdown: &str,
+        axe: Axe,
+    ) -> Result<std::collections::BTreeSet<String>, ErreurTaxonomie> {
+        let debut = format!("<!-- taxonomie-servie:debut axe={} -->", axe.marqueur());
+        let fin = format!("<!-- taxonomie-servie:fin axe={} -->", axe.marqueur());
+        let corps = markdown
+            .split_once(&debut)
+            .and_then(|(_, apres)| apres.split_once(&fin))
+            .map(|(entre, _)| entre)
+            .ok_or(ErreurTaxonomie::MarqueursAbsents { axe })?;
+
+        let cles: std::collections::BTreeSet<String> = corps
+            .lines()
+            .filter_map(|ligne| {
+                let cellule = ligne.trim().strip_prefix('|')?.split('|').next()?;
+                let cle = cellule.trim().trim_matches('`').trim();
+                (!cle.is_empty()
+                    && cle
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .then(|| cle.to_string())
+            })
+            .collect();
+
+        if cles.is_empty() {
+            return Err(ErreurTaxonomie::TableVide { axe });
+        }
+        Ok(cles)
+    }
+
+    /// La comparaison, **dans les deux sens** (DoD 3).
+    ///
+    /// Sens 1, *« le protocole a pris du retard »* : une clé servie par
+    /// `as_str()` et absente de sa table. Sens 2, *« la table a gardé un terme
+    /// mort »* : une entrée que plus aucune variante ne sert — l'assertion
+    /// auto-nettoyante, celle qui fait que le geste rendant une déclaration
+    /// inutile est le geste qui la fait expirer (mika#2309).
+    ///
+    /// Chaque grief nomme la clé, son axe et le geste de réparation (DoD 6).
+    fn confronter<T: Taxonomie>(
+        servies: &[T],
+        declarees: &std::collections::BTreeSet<String>,
+    ) -> Vec<String> {
+        let axe = T::AXE;
+        let servies: std::collections::BTreeSet<&str> = servies.iter().map(|t| t.cle()).collect();
+        let mut griefs = Vec::new();
+        for manquante in servies.iter().filter(|c| !declarees.contains(**c)) {
+            griefs.push(format!(
+                "`{manquante}` (axe `{seau}`) est servie par le moteur et le protocole ne la \
+                 déclare pas : ajoute-lui une ligne dans `### Taxonomie servie` de \
+                 {PROTOCOLE_AC4}, entre les marqueurs `taxonomie-servie:{m}`",
+                seau = axe.seau(),
+                m = axe.marqueur(),
+            ));
+        }
+        for morte in declarees.iter().filter(|c| !servies.contains(c.as_str())) {
+            griefs.push(format!(
+                "`{morte}` (axe `{seau}`) est déclarée par le protocole et aucune variante ne \
+                 la sert : retire sa ligne de `### Taxonomie servie` de {PROTOCOLE_AC4}",
+                seau = axe.seau(),
+            ));
+        }
+        griefs
+    }
+
+    /// Une table conforme, fabriquée depuis une liste de clés.
+    ///
+    /// La **graine** des deux contrôles négatifs : chacun en retire ou y ajoute
+    /// une seule chose, et rien d'autre ne diffère. Sans eux, un détecteur dont
+    /// l'extraction rendrait l'ensemble vide serait vert des deux côtés.
+    fn graine(axe: Axe, cles: &[&str]) -> String {
+        let lignes: String = cles
+            .iter()
+            .map(|cle| format!("| `{cle}` | `{}` | une phrase. |\n", axe.seau()))
+            .collect();
+        format!(
+            "Du texte libre autour, que le détecteur ne lit pas.\n\n\
+             <!-- taxonomie-servie:debut axe={m} -->\n\
+             | clé de fil | axe | ce qu'elle dit |\n\
+             |---|---|---|\n\
+             {lignes}<!-- taxonomie-servie:fin axe={m} -->\n\n\
+             Et du texte libre après, qui cite `absent_pre_field` sans le déclarer.\n",
+            m = axe.marqueur(),
+        )
+    }
+
+    /// Le détecteur : le protocole de lecture d'AC4 déclare **toute** la
+    /// taxonomie que le moteur sert, et rien de plus.
+    ///
+    /// Ce qu'il ferme : `webhook_prefilter.rs:2481-2500` garde les quatre
+    /// chaînes de fil de (g′) contre un renommage — il garde le **nom**, pas
+    /// que le protocole le **connaisse**. Deux classes et huit termes ont
+    /// atterri sans que rien ne rougisse, et c'est le mode de panne du
+    /// document : il prend du retard en silence, et la mesure d'AC4 se lit
+    /// dessus.
+    ///
+    /// La forme est celle que ce dépôt tient déjà pour deux listes qui doivent
+    /// bouger dans le même commit : `check-dispatch-seats-declared.sh` pour
+    /// `KNOWN_DISPATCH_SEATS`, `check-pilot-turn-ceiling-labels.sh` pour
+    /// `PILOT_LABEL_TURN_CEILINGS`. Ici la paire est *(la taxonomie servie par
+    /// le moteur, la taxonomie déclarée par le protocole)*.
+    #[test]
+    fn mika2680_le_protocole_de_lecture_declare_toute_la_taxonomie_servie() {
+        let markdown = lire_le_protocole(&chemin_du_protocole()).unwrap_or_else(|e| panic!("{e}"));
+
+        let classes = toutes_les_classes();
+        let relaches = tous_les_termes_de_relache();
+
+        let mut griefs = Vec::new();
+        match taxonomie_declaree(&markdown, Axe::Classe) {
+            Ok(declarees) => griefs.extend(confronter(&classes, &declarees)),
+            Err(e) => griefs.push(e.to_string()),
+        }
+        match taxonomie_declaree(&markdown, Axe::Relache) {
+            Ok(declarees) => griefs.extend(confronter(&relaches, &declarees)),
+            Err(e) => griefs.push(e.to_string()),
+        }
+
+        assert!(
+            griefs.is_empty(),
+            "le protocole de lecture d'AC4 et la taxonomie servie ont divergé \
+             ({n} grief(s)) :\n  - {details}",
+            n = griefs.len(),
+            details = griefs.join("\n  - "),
+        );
+    }
+
+    /// Contrôle négatif n° 1 (AC1) : une table amputée d'une clé rougit, et le
+    /// message nomme cette clé et son axe.
+    #[test]
+    fn mika2680_une_table_amputee_dune_cle_fait_rougir_le_detecteur() {
+        let servies = toutes_les_classes();
+        let cles: Vec<&str> = servies.iter().map(|c| c.cle()).collect();
+        let (retiree, restantes) = cles.split_first().expect("quatorze classes");
+
+        let declarees = taxonomie_declaree(&graine(Axe::Classe, restantes), Axe::Classe)
+            .expect("la graine amputée reste une table lisible");
+        let griefs = confronter(&servies, &declarees);
+
+        assert_eq!(griefs.len(), 1, "un seul grief attendu — {griefs:#?}");
+        assert!(
+            griefs[0].contains(retiree)
+                && griefs[0].contains(Axe::Classe.seau())
+                && griefs[0].contains("Taxonomie servie"),
+            "le grief doit nommer la clé, son axe et le geste — {}",
+            griefs[0]
+        );
+    }
+
+    /// Contrôle négatif n° 2 (AC2), **de même graine** que le premier : une
+    /// table portant une clé que le Rust ne sert pas rougit aussi. C'est la
+    /// propriété auto-nettoyante — sans elle, une déclaration peut devenir
+    /// stale sans être vue.
+    #[test]
+    fn mika2680_une_table_portant_un_terme_mort_fait_rougir_le_detecteur() {
+        let servies = tous_les_termes_de_relache();
+        let mut cles: Vec<&str> = servies.iter().map(|t| t.cle()).collect();
+        cles.push("reviewed_head_terme_retire");
+
+        let declarees = taxonomie_declaree(&graine(Axe::Relache, &cles), Axe::Relache)
+            .expect("la graine enrichie reste une table lisible");
+        let griefs = confronter(&servies, &declarees);
+
+        assert_eq!(griefs.len(), 1, "un seul grief attendu — {griefs:#?}");
+        assert!(
+            griefs[0].contains("reviewed_head_terme_retire")
+                && griefs[0].contains(Axe::Relache.seau())
+                && griefs[0].contains("retire sa ligne"),
+            "le grief doit nommer l'entrée morte, son axe et le geste — {}",
+            griefs[0]
+        );
+    }
+
+    /// AC4 : l'absence n'est pas un succès, et les trois absences ne se lisent
+    /// pas pareil.
+    ///
+    /// La table vide est jouée sur la graine à **zéro clé** : elle prouve du
+    /// même coup que l'en-tête et son séparateur ne sont pas comptés comme des
+    /// clés, ce dont dépend la cardinalité des deux autres contrôles.
+    #[test]
+    fn mika2680_les_trois_absences_du_protocole_echouent_avec_trois_messages_distincts() {
+        let introuvable = chemin_du_protocole().with_file_name("README-absent-mika2680.md");
+        let fichier = lire_le_protocole(&introuvable)
+            .expect_err("un protocole introuvable n'est pas un succès");
+        let marqueurs = taxonomie_declaree("du texte, et aucun marqueur.\n", Axe::Classe)
+            .expect_err("des marqueurs absents ne sont pas un succès");
+        let vide = taxonomie_declaree(&graine(Axe::Relache, &[]), Axe::Relache)
+            .expect_err("une table vide n'est pas un succès");
+
+        let messages = [fichier.to_string(), marqueurs.to_string(), vide.to_string()];
+        let distincts: std::collections::BTreeSet<&String> = messages.iter().collect();
+        assert_eq!(
+            distincts.len(),
+            3,
+            "les trois absences doivent se distinguer — {messages:#?}"
+        );
+        assert!(messages[0].contains("introuvable"), "{}", messages[0]);
+        assert!(messages[1].contains("marqueurs"), "{}", messages[1]);
+        assert!(messages[2].contains("vide"), "{}", messages[2]);
+    }
+
     // ---- vol 4 — le terme de relâche (mika#2680) -------------------------
 
     /// Le cas qui atteint chaque terme de relâche, et le `match` qui tient
@@ -4197,6 +4647,15 @@ pub(crate) mod tests {
     /// il ne sait rien de l'énumération, donc une variante ajoutée sans cas le
     /// laisse vert.
     ///
+    /// **La liste n'est plus écrite ici** (vol 7) : elle vient de
+    /// [`tous_les_termes_de_relache`], qui la dérive de la chaîne
+    /// [`Taxonomie::suivante`] — un second `match` sans bras `_`. Le tableau
+    /// littéral de dix-huit variantes qui vivait à cet endroit était une
+    /// troisième liste à tenir à jour, et la seule des trois qu'un oubli
+    /// laissait verte : une variante ajoutée à l'énumération et à
+    /// `cas_de_relache` mais pas au tableau n'était tout simplement jamais
+    /// exercée.
+    ///
     /// La base est réelle et vide : les dix-huit termes rendent tous **avant**
     /// la ligne d'audit, donc rien n'y est écrit — `skip_turn` n'en demande une
     /// que pour l'`agent_id` de sa ligne `info!`.
@@ -4212,26 +4671,7 @@ pub(crate) mod tests {
     async fn mika2680_la_relache_atteint_chacun_de_ses_dix_huit_termes() {
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
 
-        for terme in [
-            Release::SwitchDisarmed,
-            Release::NotClassified,
-            Release::TextTouched,
-            Release::BranchTaskActive,
-            Release::PrTaskActive,
-            Release::PrOpen,
-            Release::NoTerminalTrace,
-            Release::NoDecisionAttested,
-            Release::HeadNotPreviouslyDecided,
-            Release::StateUnreadable,
-            Release::TriageDisarmed,
-            Release::IssueTaskActive,
-            Release::TriageEscalated,
-            Release::TriageUnreadable,
-            Release::ClosureSnapshotAbsent,
-            Release::ReviewedHeadAbsent,
-            Release::ReviewedHeadOutOfContract,
-            Release::ReviewedHeadSwitchDisarmed,
-        ] {
+        for terme in tous_les_termes_de_relache() {
             let (texte, state, touched, enabled, triage) = cas_de_relache(terme);
             let _garde = comment_triage::TriageEnvGuard::armed(triage);
             let _garde_g =
