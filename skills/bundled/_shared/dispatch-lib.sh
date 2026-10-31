@@ -11073,6 +11073,27 @@ internal reasoning before emitting the verdict (mika#2296) — confirm with \
 output_tokens/max_tokens, and raise \`llm_max_tokens\` in that agent's config.toml if it fired."
 }
 
+# mika#1823 — le prompt correctif de PREMIÈRE passe, à définition unique.
+#
+# Extrait du corps de `_iterate_groom_loop` pour que le message de relance soit
+# lisible par un test sans rejouer toute la boucle (mika#2996).
+#
+# Stdout : le chemin du fichier temporaire. L'APPELANT le supprime.
+# Retour : 0, ou 1 si `mktemp` échoue.
+_first_pass_retry_prompt() {
+    local f
+    f=$(mktemp -t mika-arch-retry-XXXXXX.md 2>/dev/null) || return 1
+    {
+        printf 'Your previous plan-review response is missing the required `Disposition:` line.\n\n'
+        printf 'Please re-emit your findings and end with exactly ONE of these three lines as the last non-empty line of your response:\n\n'
+        printf '    Disposition: READY\n'
+        printf '    Disposition: ITERATE\n'
+        printf '    Disposition: ESCALATE\n\n'
+        printf 'The routing engine parses this line as the verdict — its absence blocks the pipeline (see mika#1823).\n'
+    } > "$f"
+    printf '%s' "$f"
+}
+
 # mika#2641 — le prompt correctif de SECONDE passe, à définition unique.
 #
 # R-b : deux copies divergeraient, et c'est la leçon que `grooming_marker.rs` a
@@ -11196,18 +11217,10 @@ _iterate_groom_loop() {
             # Retry: corrective payload as an @-file so _arch_ask injects it
             # verbatim. Session preserved so the architect sees its own prior
             # response and can complete it in-place.
-            local retry_prompt; retry_prompt=$(mktemp -t mika-arch-retry-XXXXXX.md 2>/dev/null) || {
+            local retry_prompt; retry_prompt=$(_first_pass_retry_prompt "$plan_path") || {
                 _groom_warn "mktemp failed for retry prompt"
                 return 1
             }
-            {
-                printf 'Your previous plan-review response is missing the required `Disposition:` line.\n\n'
-                printf 'Please re-emit your findings and end with exactly ONE of these three lines as the last non-empty line of your response:\n\n'
-                printf '    Disposition: READY\n'
-                printf '    Disposition: ITERATE\n'
-                printf '    Disposition: ESCALATE\n\n'
-                printf 'The routing engine parses this line as the verdict — its absence blocks the pipeline (see mika#1823).\n'
-            } > "$retry_prompt"
             # Forme sûre sous `set -e` (mika#2641) : une affectation dont la
             # substitution échoue avorte AVANT la ligne suivante, donc le
             # `rm -f` et le WARN ne tourneraient pas. Les trois sites de relance

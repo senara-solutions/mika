@@ -16332,6 +16332,126 @@ for _t2976_case in \
     fi
 done
 
+# ===========================================================================
+# mika#2996 — chaque relance UNPARSED porte le plan en revue
+#
+# La garde d'ancrage de mika#2037 vérifie les citations de l'architecte contre
+# le brief du tour, et ne s'arme qu'au-dessus de `review_anchor_min_brief_chars`.
+# Une relance de ~380 caractères laissait donc passer sans preuve la disposition
+# qui fait avancer la chaîne — mesuré le 2026-10-31, trace `15ea28bd`, un
+# `READY-after-retry` sur la revue d'un autre plan.
+#
+# Le correctif fait porter le plan à la relance, entre deux lignes-marqueurs que
+# le moteur reconnaît (`review_anchor::anchor_reference`). Ce bloc épingle le
+# CÂBLAGE, sur les trois sites de relance de `_iterate_groom_loop` : le vrai
+# loop tourne, `_arch_ask` est stubbé au bord de processus, et le message de la
+# relance doit contenir le plan À L'OCTET entre les deux marqueurs. Le jugement
+# de la garde sur ce message est testé côté moteur, avec les mêmes fonctions
+# shell, par `tests/eval/grounding_regressions/review_anchor_unparsed_retry_2996.rs`.
+# ===========================================================================
+
+echo ""
+echo "Test: chaque relance UNPARSED porte le plan en revue (mika#2996)"
+echo "------------------------------------------------------------"
+
+T2996_BEGIN='----- BEGIN PLAN UNDER REVIEW (mika#2996) -----'
+T2996_END='----- END PLAN UNDER REVIEW (mika#2996) -----'
+
+# $1 = site : first | second-ready | second-iterate
+# Imprime `arch_calls=`, `retry_call=`, puis le message de la relance entre
+# RETRY_BEGIN / RETRY_END, et le plan entre PLAN_BEGIN / PLAN_END.
+_groom_retry_plan_probe_2996() {
+    local site="$1" tmp wt plan retry_call
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    plan="$wt/docs/plans/2026-10-31-001-fix-2996-relance-plan.md"
+    {
+        echo "# Plan rejouant la relance de mika#2996"
+        echo "**Ticket:** mika issue#2996"
+        for i in $(seq 1 40); do
+            echo "Ligne de corps $i — la relance doit porter ce plan, à l'octet près."
+        done
+    } > "$plan"
+    case "$site" in
+        first) retry_call=2 ;;
+        *)     retry_call=3 ;;
+    esac
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        export MIKA_ARCH_ASK_RETRY=0
+        ARCH_CALLS="$tmp/arch-calls"
+        printf '0' > "$ARCH_CALLS"
+
+        _arch_ask() {
+            local n body
+            n=$(cat "$ARCH_CALLS")
+            n=$((n + 1))
+            printf '%s' "$n" > "$ARCH_CALLS"
+            cp -- "$2" "$tmp/prompt-$n" 2>/dev/null || true
+            case "$site:$n" in
+                first:1)          body="$UNPARSED_1772" ;;
+                first:2)          body='Disposition: READY' ;;
+                second-ready:1)   body='Disposition: READY' ;;
+                second-iterate:1) body='F1: un constat de première passe.
+
+Disposition: ITERATE' ;;
+                second-*:2)       body="$M2641_UNREADABLE" ;;
+                *)                body='Verdict: GROOMED' ;;
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-session-2996"}}'
+        }
+        _write_canonical_callout() { return 0; }
+        _launch_revise_pilot() { return 0; }
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="2996" REPO="mika" BRANCH="probe-2996"
+        _iterate_groom_loop >/dev/null 2>&1 || true
+
+        printf 'arch_calls=%s\n' "$(cat "$ARCH_CALLS")"
+        printf 'retry_call=%s\n' "$retry_call"
+        printf 'RETRY_BEGIN\n'
+        cat -- "$tmp/prompt-$retry_call" 2>/dev/null || true
+        printf 'RETRY_END\n'
+    )
+    rm -rf "$tmp"
+}
+
+# Le plan tel que la relance le porte : les lignes strictement entre les deux
+# marqueurs. Vide si l'un des deux manque.
+_t2996_enveloped_plan() {
+    awk -v b="$T2996_BEGIN" -v e="$T2996_END" '
+        $0 == b { inside = 1; seen_b = 1; next }
+        $0 == e { if (inside) { seen_e = 1 }; inside = 0; next }
+        inside  { buf = buf $0 "\n" }
+        END     { if (seen_b && seen_e) printf "%s", buf }'
+}
+
+T2996_EXPECTED_PLAN=$(
+    echo "# Plan rejouant la relance de mika#2996"
+    echo "**Ticket:** mika issue#2996"
+    for i in $(seq 1 40); do
+        echo "Ligne de corps $i — la relance doit porter ce plan, à l'octet près."
+    done
+)
+
+for _t2996_site in first second-ready second-iterate; do
+    _t2996_out=$(_groom_retry_plan_probe_2996 "$_t2996_site") || _t2996_out=""
+    _t2996_retry=$(printf '%s\n' "$_t2996_out" | sed -n '/^RETRY_BEGIN$/,/^RETRY_END$/p' | sed '1d;$d')
+    # Anti-vacuité : sur les trois sites, la relance est suivie d'un appel, donc
+    # trois appels architecte veulent dire que la relance a eu lieu.
+    assert_contains "mika#2996 ($_t2996_site): la sonde a mené la boucle jusqu'à la relance" \
+        "arch_calls=3" "$_t2996_out"
+    assert_contains "mika#2996 ($_t2996_site): le message est toujours le prompt correctif" \
+        "missing the required" "$_t2996_retry"
+    # Le cœur : le plan entier, à l'octet, entre les deux marqueurs.
+    _t2996_carried=$(printf '%s\n' "$_t2996_retry" | _t2996_enveloped_plan)
+    assert_eq "mika#2996 ($_t2996_site): la relance porte le plan à l'octet entre les marqueurs" \
+        "$T2996_EXPECTED_PLAN" "$_t2996_carried"
+done
+
 # --- Summary ---
 
 echo ""
