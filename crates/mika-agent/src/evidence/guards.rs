@@ -2864,7 +2864,12 @@ impl WorkCreationAction {
 /// d'`issue create`. Les deux sont listés parce que le scan des étiquettes sert
 /// aussi à la ligne de journal du verbe `create`, mais `IssueCreate` est refusé
 /// **entier** : le verbe suffit, indépendamment de ses étiquettes.
-const ADD_LABEL_FLAGS: &[&str] = &["--add-label", "--label", "-l"];
+///
+/// `pub(crate)` depuis mika#2995 : le scan de prose de `canonical_tokens.rs`
+/// cherche les mêmes trois drapeaux dans les prompts bundlés. Deux listes
+/// séparées dérivent — un quatrième drapeau ajouté ici laisserait le scan de
+/// prose aveugle sur sa forme, en silence (classe mika#2158).
+pub(crate) const ADD_LABEL_FLAGS: &[&str] = &["--add-label", "--label", "-l"];
 
 /// Reconnaît, dans un argv `gh`, un verbe qui crée du travail (mika#2573 U2).
 ///
