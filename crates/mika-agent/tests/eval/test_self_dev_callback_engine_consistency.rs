@@ -16,6 +16,9 @@
 //! 5. Failure callback — PR exists despite failure, routes to success handling.
 //! 6. error_max_turns — unpushed recovery path, no re-dispatch.
 //! 7. Groom callback — GROOMED verdict, task completed, ready label added.
+//! 8. Dispatch halt — `STATUS=REBASE_CONFLICT`: hands back, no shell/git tool
+//!    called, with an ordinary-failure negative control that still diagnoses
+//!    (mika#2976 AC5).
 
 use async_trait::async_trait;
 use mika_agent::tools::{Tool, ToolContext, ToolOutput, default_tools};
@@ -293,6 +296,26 @@ fn tools_error_max_turns() -> mika_agent::tools::ToolRegistry {
     tools.register(Box::new(StubRunShellTool::with_response(
         "abc1234 feat: implement feature X\ndef5678 fix: handle edge case",
     )));
+    tools.register(Box::new(StubRunClaudePilotTool));
+    tools
+}
+
+/// Tools for the dispatch-halt callback path (mika#2976 AC5).
+///
+/// **`run_shell`, `run_gh` et `run_claude_pilot` sont enregistrés
+/// délibérément.** C'est ce qui donne du sens à l'exclusion assertée plus bas :
+/// avec un registre qui ne les porte pas, « aucun outil de shell n'est
+/// appelé » serait trivialement vrai et ne dirait rien du chemin que le prompt
+/// prescrit. Le tour mesuré du 2026-10-30 avait ces outils sous la main et s'en
+/// est servi.
+fn tools_dispatch_halt() -> mika_agent::tools::ToolRegistry {
+    let mut tools = default_tools();
+    tools.register(Box::new(StubUpdateTaskStatusTool));
+    tools.register(Box::new(StubCheckTaskTool::with_label(
+        "long_running:run_claude_pilot_groom:dev-groom:mika#2968",
+    )));
+    tools.register(Box::new(StubRunGhTool::with_response("")));
+    tools.register(Box::new(StubRunShellTool::with_response("")));
     tools.register(Box::new(StubRunClaudePilotTool));
     tools
 }
@@ -733,6 +756,154 @@ async fn callback_groom_groomed_completes_and_labels() {
         &["check_task", "run_gh", "update_task_status", "send_message"],
     );
     // No re-dispatch on groom completion
+    assert_tools_exclude(&trace, &["run_claude_pilot"]);
+    assert_max_steps(&trace, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Dispatch halt — REBASE_CONFLICT (mika#2976 AC5)
+//
+// Le tour rend la main : il pose `blocked`, relaie le `RESULT` verbatim, et
+// n'appelle AUCUN outil de shell ni de git. Le tour mesuré du 2026-10-30
+// (session `callback-233cab88`) a fait l'inverse — `git rebase origin/main`
+// puis `git checkout --theirs` dans le worktree — et est mort sur « max steps
+// exhausted », laissant une HEAD détachée, un `rebase-merge` ouvert et sa
+// parente figée `in_progress`.
+// ---------------------------------------------------------------------------
+
+/// Le `RESULT` verbatim de la tâche de pilote de groom `1f838a67`, tronqué de
+/// ses champs de diagnostic longs. La bannière est en PREMIÈRE ligne, parce que
+/// c'est là que `dispatch-lib` la pose et là que le prédicat la lit.
+const REBASE_CONFLICT_CALLBACK: &str = "[callback: long_running:run_claude_pilot_groom] \
+     STATUS=REBASE_CONFLICT\n\
+     Branch fix/2968/manager-l-valuateur-recommande-merge is 7 commits behind origin/main.\n\
+     Rebase failure mode: conflict\n\
+     Conflicted files:\n\
+     docs/plans/2026-10-29-005-fix-2968-manager-l-valuateur-recommande-merge-plan.md\n\
+     Resolve manually before re-dispatching mika#2968.\n\
+     NO_PR: no_pr_on_branch";
+
+/// L'identifiant de la tâche du pilote de groom qui s'est arrêtée en
+/// `REBASE_CONFLICT` au vol 2b de mika#2968 (2026-10-30, 14:38Z).
+///
+/// Un UUID bien formé, et pas le `task-001` des tests voisins : `check_task`
+/// valide la FORME de `task_id` avant tout, et la rejette. Cela ne rend pas
+/// l'appel vert pour autant — voir le commentaire du contrôle négatif.
+const HALTED_GROOM_TASK_ID: &str = "207589e1-c54e-46d9-9761-ac3d7dbeb45c";
+
+#[tokio::test]
+async fn callback_dispatch_halt_hands_back_without_touching_the_worktree() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: update_task_status — `blocked` + les deux clés de métadonnée
+            // que le discriminateur prescrit.
+            tool_call_response(
+                "update_task_status",
+                json!({
+                    "task_id": HALTED_GROOM_TASK_ID,
+                    "status": "blocked",
+                    "metadata": {
+                        "dispatch_halt": true,
+                        "halt_status": "REBASE_CONFLICT"
+                    }
+                }),
+            ),
+            // Step 2: send_message — le `RESULT` verbatim, pas une paraphrase.
+            tool_call_response("send_message", json!({"text": REBASE_CONFLICT_CALLBACK})),
+            // Step 3: final text
+            text_response("Dispatch halted on REBASE_CONFLICT — nothing was touched."),
+        ])
+        .tools(tools_dispatch_halt())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run(REBASE_CONFLICT_CALLBACK).await.unwrap();
+
+    // Le moteur ACCEPTE ce chemin : pas de re-prompt de garde (le compte de pas
+    // est exactement celui du mock), et le refus zéro-appel (#870) ne mord pas
+    // puisque deux outils ont été appelés.
+    assert_has_output(&trace);
+    assert_exact_steps(&trace, 3);
+    assert_no_tool_errors(&trace);
+    assert_tools_include(&trace, &["update_task_status", "send_message"]);
+
+    // Les outils de réparation étaient sous la main — et n'ont pas été appelés.
+    assert_tools_registered(&trace, &["run_shell", "run_gh", "run_claude_pilot"]);
+    assert_tools_exclude(&trace, &["run_shell", "run_gh", "run_claude_pilot"]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8b: contrôle négatif — une panne ordinaire atteint toujours Step 4.5
+//
+// Sans ce contrôle, le test ci-dessus serait satisfait par un tour qui ne
+// diagnostique plus rien du tout. Un `RESULT` d'échec SANS bannière de halte
+// doit continuer de lire les logs et d'escalader.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn callback_ordinary_failure_still_reaches_the_recovery_handler() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("check_task", json!({"task_id": HALTED_GROOM_TASK_ID})),
+            tool_call_response(
+                "run_gh",
+                json!({"command": ["pr", "list", "--head", "fix/2968/x"]}),
+            ),
+            // Step 4.5 — « Diagnose and recover from failure » lit les logs.
+            tool_call_response(
+                "run_shell",
+                json!({"command": "tail -50 /path/to/session.log"}),
+            ),
+            tool_call_response(
+                "update_task_status",
+                json!({"task_id": HALTED_GROOM_TASK_ID, "status": "blocked"}),
+            ),
+            tool_call_response(
+                "send_message",
+                json!({"text": "Pipeline failed with no PR — escalating."}),
+            ),
+            // Le texte final évite tout mot en forme de verdict : « diagnosed »,
+            // « root cause », « confirmed that »… déclenchent le nudge de
+            // persistance (#648, `detect_persistable_output`), qui re-prompte le
+            // tour et épuise la séquence du mock — un échec qui ne dit rien du
+            // discriminateur mesuré ici.
+            text_response("Callback processed: ordinary failure, logs read, task blocked."),
+        ])
+        .tools(tools_dispatch_halt())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(
+            "[callback: long_running:run_claude_pilot_groom] \
+             claude-pilot completed (status: failed).\n\
+             Session: groom-xyz\nCost: $0.08\nNO_PR: no_pr_on_branch",
+        )
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    // Pas d'`assert_no_tool_errors` ici, et c'est délibéré : `check_task` est
+    // résolu par l'outil RÉEL — le stub du fichier ne le masque pas — et rend
+    // `task_not_found` contre une base qui ne porte pas la ligne. C'est la
+    // situation de tous les cas voisins de ce fichier, qui ne l'assertent pas.
+    // Le cas de halte ci-dessus, lui, l'asserte : il n'appelle pas `check_task`,
+    // donc « rendre la main » y veut dire « sans aucune erreur d'outil ».
+    //
+    // Le diagnostic reste atteignable : c'est ce que le discriminateur de halte
+    // soustrait, et rien de plus.
+    assert_tools_include(
+        &trace,
+        &[
+            "check_task",
+            "run_gh",
+            "run_shell",
+            "update_task_status",
+            "send_message",
+        ],
+    );
     assert_tools_exclude(&trace, &["run_claude_pilot"]);
     assert_max_steps(&trace, 10);
 }

@@ -8899,6 +8899,86 @@ mod tests {
         assert!(dispatch_halt_audit_values(&db, &parent_id).await.is_empty());
     }
 
+    // -- mika#2976 AC5 : la POSITION du discriminateur dans le prompt --
+
+    /// Le prompt **embarqué**, pas celui de l'arbre : `include_str!` fige les
+    /// octets au build, exactement comme `build.rs` les fige dans
+    /// `BUNDLED_SKILL_MANIFESTS`. Une édition de l'arbre est invisible aux deux
+    /// jusqu'au prochain `make deploy` (motif mika#2340). Même idiome que
+    /// `qa_reviewed_head::tests` § *conformité des prompts*.
+    const PROMPT_SELF_DEV_CALLBACK: &str =
+        include_str!("../../../../skills/bundled/self-dev-callback/system_prompt.md");
+
+    /// L'en-tête que le discriminateur de halte doit PRÉCÉDER.
+    ///
+    /// C'est là que vit le handler générique qui a mesurément lancé le
+    /// `git rebase` du 2026-10-30 : sa section « Diagnose and recover from
+    /// failure » porte « **Attempt recovery (max 1).** ». Un discriminateur
+    /// placé **sous** cet en-tête est silencieusement désarmé — il est correct,
+    /// il est lisible, et il n'est jamais atteint.
+    const GENERIC_FAILURE_HEADING: &str = "Pipeline result classification";
+
+    /// Les bannières de halte dont la position n'est PAS exigée.
+    ///
+    /// **Livrée vide, et le test frère l'assert.** Quand ce scan tire, la
+    /// résolution est de REMONTER le discriminateur au-dessus de
+    /// [`GENERIC_FAILURE_HEADING`], jamais d'ajouter une entrée ici : une
+    /// allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction (mika#2323).
+    const ORDER_SCAN_ALLOWLIST: &[&str] = &[];
+
+    #[test]
+    fn mika2976_le_discriminateur_de_halte_precede_le_handler_generique() {
+        let heading = PROMPT_SELF_DEV_CALLBACK
+            .find(GENERIC_FAILURE_HEADING)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{GENERIC_FAILURE_HEADING}` est absent du prompt — l'ancre du scan a été \
+                     renommée, et un scan sans ancre ne mesure rien"
+                )
+            });
+
+        let mut offenders = Vec::new();
+        for banner in ["STATUS=REBASE_CONFLICT", "STATUS=BRANCH_HAS_UNMERGED_WORK"] {
+            if ORDER_SCAN_ALLOWLIST.contains(&banner) {
+                continue;
+            }
+            match PROMPT_SELF_DEV_CALLBACK.find(banner) {
+                None => offenders.push(format!(
+                    "{banner} est absent du prompt — le tour de callback retombe sur le handler \
+                     « On failure » générique, qui a lancé un `git rebase` dans un worktree le \
+                     2026-10-30"
+                )),
+                Some(at) if at > heading => offenders.push(format!(
+                    "{banner} apparaît APRÈS `{GENERIC_FAILURE_HEADING}` (octet {at} > {heading}) \
+                     — le discriminateur est désarmé en silence"
+                )),
+                Some(_) => {}
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "la POSITION du discriminateur de halte est le correctif, pas son texte :\n  {}\n\n\
+             RÉSOLUTION : remonter la section « Dispatch-halt discriminator » au-dessus de \
+             `**{GENERIC_FAILURE_HEADING}` dans \
+             skills/bundled/self-dev-callback/system_prompt.md (mika#2976 AC5).",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn mika2976_lallowlist_du_scan_dordre_est_livree_vide() {
+        assert!(
+            ORDER_SCAN_ALLOWLIST.is_empty(),
+            "l'allowlist du scan d'ordre porte {:?}. Une entrée ici exempte une bannière de \
+             l'exigence de POSITION, c'est-à-dire la réouvre au défaut de mika#2976 AC5. \
+             Elle n'est admissible qu'avec un ticket de suivi NOMMÉ et une date de retrait \
+             écrits en commentaire au-dessus de la ligne ; sinon, remonter le discriminateur.",
+            ORDER_SCAN_ALLOWLIST
+        );
+    }
+
     // -- try_complete_parent_on_callback_success tests (mika#1162) --
 
     /// Helper: create a self_dev parent in `in_progress` with an `implement`
