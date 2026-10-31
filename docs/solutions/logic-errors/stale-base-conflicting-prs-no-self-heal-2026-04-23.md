@@ -111,6 +111,25 @@ Le défaut est de compter des **commits** là où un squash demande de compter d
 
 **Le nettoyage asynchrone ne remplace pas la question synchrone.** `worktree_reaper` (mika#2420) finit par retirer worktree et branche locale d'une PR terminale. Mais il passe toutes les dix minutes, après 900 s de grâce, et un dispatch arrivé avant lui reprend la branche périmée. Dans le troisième cas, le premier groom a buté et le second est reparti sain, seulement parce qu'un tick du faucheur était passé entre les deux, 2 h 32 après le merge. Quand le résultat dépend de qui passe en premier, la porte doit poser la question au moment où elle décide.
 
+### Vol 2 : la porte du vol 1 arrêtait tout vol suivant (mika#2976, 2026-10-31)
+
+Le vol 1 a remplacé le `REBASE_CONFLICT` par un arrêt sûr, mais l'arrêt est tombé sur tout vol suivant, pour trois raisons mesurées par la sonde d'AC4.
+
+**Un squash de plusieurs commits n'a le patch-id d'aucun d'eux.** `--cherry-mark` compare commit par commit. Un vol porte au moins deux commits (le plan puis le code), et le squash les fond en un seul patch. Le cas mesuré : `feat/2958/…` à `59010336a`, contre le squash `fcb5148fd`, sortait avec trois `>`. Le correctif ajoute un second étage, `_branch_cumulative_absorbed` : le patch-id du diff cumulé `merge_base..tip` est cherché dans `merge_base..origin/main`. Sur le cas réel, les deux valent `402470424f…`. `patch-id --stable` ignore numéros de ligne et contexte, donc le rebase que subit un squash avant d'atterrir ne le change pas.
+
+**Deux critères qui semblent justes et que la mesure réfute.** Ne pas les réessayer :
+
+- *Le diff entre `origin/main` et la tête, restreint aux fichiers de la branche, est vide.* Sur le cas réel il ne l'est pas (3 fichiers, +3 −5). L'écart est un champ apporté sur `main` par un autre ticket, que la branche n'avait jamais vu. Ce diff confond ce que la branche apporte (le danger) et ce que `main` apporte en plus (du retard, sans danger) : un critère de non-perte doit être directionnel.
+- *`git merge-tree --write-tree origin/main <tip>` rend l'arbre de `origin/main`.* C'est vrai au point d'atterrissage du squash, mais contre la tête réelle de `main` il conflicte dès que `main` a réécrit les mêmes lignes après l'atterrissage.
+
+T9 de `test-dispatch-lib.sh` reproduit cette topologie et épingle les deux critères : les réintroduire fait rougir le test.
+
+**Le plan du groom courant n'est pas un travail laissé derrière.** Au dispatch de dev-pilot d'un vol suivant, la branche recréée depuis `main` porte le plan que le groom vient de frapper, et la seule PR de ce nom est la PR mergée du vol précédent. La porte prenait ce plan pour du travail en péril (dev-pilot `0be4647a`, plan `0c9203aaf`, #2985). La règle retenue partitionne par la **date** : un commit daté après le `mergedAt` de la dernière PR terminale est le vol courant, il n'est pas jugé, et sa présence donne `live`. La topologie ne suffit pas : la tête mergée n'est pas un ancêtre d'une branche recréée, et un commit local jamais poussé avant le merge en descend. Les deux sens d'erreur restent sûrs : un commit réécrit par un rebase reçoit une date neuve et conduit à la reprise, jamais à une réinitialisation ; un commit mal daté vers le passé passe par les deux étages, qui l'arrêtent s'il manque à `main`.
+
+**Une ref de suivi survit à sa branche.** Un `git fetch` sans `--prune` ne retire jamais `refs/remotes/origin/<b>`. Restée sur l'ancienne tête, elle suffisait à faire buter la porte. Le correctif demande au distant si la branche existe (`_remote_branch_exists`, mika#2626) avant de lire la ref. Absente : la ref est ignorée et la ligne la nomme (`stale=`). Pas de réponse : la ref est lue comme avant, ce qui peut arrêter mais jamais réinitialiser.
+
+**Ce qu'on retient.** Une non-perte se mesure sur le contenu, dans un seul sens, et sur la population que la porte doit juger. Le vol 1 mesurait la bonne chose (les patchs) dans la mauvaise unité (le commit), et sur une population trop large (tout ce que porte la branche, y compris le vol en cours et une ref que le distant a oubliée). La ligne `branch_reuse_gate:` porte maintenant `containment=` (`per_commit`, `cumulative`, `work`, `unmeasured`), `current=` et `stale=`, pour que le relevé d'AC4 sépare un vrai travail en péril d'une non-mesure.
+
 ## Related Issues
 
 - [#747](https://github.com/senara-solutions/mika/issues/747) — this fix
