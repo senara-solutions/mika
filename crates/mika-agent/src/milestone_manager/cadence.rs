@@ -36,7 +36,7 @@ use super::{
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
 use crate::flight_verdict_ledger::{FlightVerdictLedger, InscriptionTally, record_if_wired};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use mika_common::auth_boundary::{AuthBoundaryError, AuthBoundaryKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -205,6 +205,17 @@ pub enum CycleKind {
     EventAndHeartbeat,
 }
 
+/// Un groom que **ce manager** a envoyé, et quand (mika#2958 vol 2d).
+///
+/// Un `Vec<(u64, String)>` sérialiserait en tableaux de deux éléments, illisible
+/// dans un checkpoint qu'un opérateur ouvre à la main pour diagnostiquer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggeredGroom {
+    pub number: u64,
+    /// ISO 8601 UTC, format `crate::timestamp`.
+    pub at: String,
+}
+
 /// Persisted checkpoint per milestone. Digest of the observed sub-issue set
 /// used to detect state change without needing to re-serialize the full
 /// `MilestoneState` on each cycle.
@@ -229,6 +240,11 @@ pub struct MilestoneCheckpoint {
     /// (un verdict perdu pour toujours).
     #[serde(default)]
     pub posted_flight_task_ids: Vec<String>,
+    /// Les grooms que ce manager a envoyés, avec leur instant — la fenêtre
+    /// d'idempotence durable d'AC2 (mika#2958 vol 2d). `#[serde(default)]` : un
+    /// checkpoint antérieur se relit en fenêtre vide, jamais en erreur.
+    #[serde(default)]
+    pub triggered_grooms: Vec<TriggeredGroom>,
 }
 
 // ---- mika#1949 U3 — the manager delivery boundary -------------------------
@@ -816,6 +832,29 @@ fn inscription_branch(tally: Option<&InscriptionTally>, no_verdicts: bool) -> &'
 /// son ticket. Un doublon visible, jamais un verdict perdu.
 const POSTED_FLIGHTS_RETAINED: usize = 500;
 
+/// Combien de temps la fenêtre durable tient un groom pour « en cours »
+/// (mika#2958 vol 2d).
+///
+/// Ce n'est pas la durée d'un groom : c'est la majoration du **trou de course**
+/// entre `message/send` accepté et l'apparition de la tâche moteur en base, le
+/// seul intervalle que la lecture container-scopée du vol 2c ne peut pas voir.
+/// Au-delà, c'est cette lecture qui détient la vérité — et si elle ne voit rien,
+/// le groom est fini ou mort, deux cas où un re-déclenchement est le comportement
+/// voulu. Une fenêtre plus longue n'achèterait pas de sûreté : elle achèterait de
+/// la famine (voir [`window_holds`]).
+///
+/// 30 minutes majore très largement le budget de tour de mika-dev (~300 s) que le
+/// corps de mika#2958 cite pour le groom moteur.
+///
+/// **La taille de la liste n'a pas besoin d'une seconde borne** : à
+/// `GROOMS_PER_CYCLE = 1`, cette TTL la borne déjà par le nombre de cycles tenant
+/// dans 30 minutes, et une double borne serait une seconde autorité sur la même
+/// question (mika#2201). C'est aussi pourquoi elle est en **temps** et non en
+/// nombre comme [`POSTED_FLIGHTS_RETAINED`] ci-dessus : à un groom par cycle,
+/// évacuer une entrée d'une borne en nombre coûterait N cycles, et jusque-là le
+/// numéro serait muselé.
+const GROOM_WINDOW: Duration = Duration::minutes(30);
+
 /// Le seul geste d'écriture du cycle (mika#2698 vol 2) — et le seul endroit du
 /// cycle qui consulte l'interrupteur.
 ///
@@ -973,6 +1012,82 @@ async fn trigger_cycle_grooms(
         })
         .collect();
     trigger_relief_grooms(groom_write_is_armed(), ctx.groom_sender, &candidats).await
+}
+
+/// La fenêtre tient-elle encore cette entrée, à `now` ? (mika#2958 vol 2d)
+///
+/// **Le site unique de la direction fail-safe de la fenêtre** (mika#2201), et
+/// cette direction est l'**inverse** de celle de
+/// [`super::GroomInFlightReading::carries_groom`], délibérément : là, une lecture
+/// `Unreadable` rend `true` pour tout numéro, parce que le doute doit bloquer un
+/// *envoi*. Ici, une entrée dont l'instant ne se parse pas est **écartée**.
+/// L'argument est l'asymétrie des conséquences :
+///
+/// - faux négatif (on renvoie un groom déjà envoyé) ⇒ **un doublon**, borné par
+///   `GROOMS_PER_CYCLE = 1`, et le moteur n'a de toute façon qu'un créneau
+///   `dispatch_class = 'groom'` (schéma v34) ;
+/// - faux positif permanent (une entrée illisible retient un numéro pour
+///   toujours) ⇒ **famine** : un ticket de relève que rien ne groome plus jamais,
+///   et silencieusement.
+///
+/// Un futur éditeur qui « réaligne » cette direction par symétrie avec le vol 2c
+/// choisit la seconde. Ne pas le faire.
+///
+/// L'écart est pris en **valeur absolue** : un instant dans le futur de plus de
+/// [`GROOM_WINDOW`] — dérive d'horloge, checkpoint édité à la main — retiendrait
+/// sinon le numéro indéfiniment, c'est-à-dire exactement la famine que la borne
+/// existe pour interdire.
+fn window_holds(entry: &TriggeredGroom, now: DateTime<Utc>) -> bool {
+    match crate::timestamp::parse(&entry.at) {
+        Ok(at) => now.signed_duration_since(at).abs() < GROOM_WINDOW,
+        Err(e) => {
+            tracing::warn!(
+                target: "mika::milestone_manager",
+                event = "groom_window_entry_unparsable",
+                number = entry.number,
+                at = %entry.at,
+                error = %e,
+            );
+            false
+        }
+    }
+}
+
+/// Les numéros que la fenêtre tient encore pour « déclenchés », à `now`.
+///
+/// L'élagage est appliqué à la **lecture**, et c'est de là que vient la
+/// correction : un cycle qui ne déclenche ni ne poste rien ne sauvegarde pas le
+/// checkpoint, donc des entrées expirées peuvent y séjourner. L'écriture élague
+/// aussi ([`merge_triggered`]), mais seulement pour que le fichier ne grossisse
+/// pas.
+fn triggered_window_at(window: &[TriggeredGroom], now: DateTime<Utc>) -> BTreeSet<u64> {
+    window
+        .iter()
+        .filter(|entry| window_holds(entry, now))
+        .map(|entry| entry.number)
+        .collect()
+}
+
+/// La fenêtre que le prochain checkpoint portera : l'ancienne élaguée, plus les
+/// numéros de ce cycle. Un numéro redéclenché garde l'instant le plus récent.
+fn merge_triggered(
+    previous: &[TriggeredGroom],
+    newly: &[u64],
+    now: DateTime<Utc>,
+) -> Vec<TriggeredGroom> {
+    let at = crate::timestamp::format(&now);
+    let newly: BTreeSet<u64> = newly.iter().copied().collect();
+    let mut merged: Vec<TriggeredGroom> = previous
+        .iter()
+        .filter(|entry| !newly.contains(&entry.number))
+        .filter(|entry| window_holds(entry, now))
+        .cloned()
+        .collect();
+    merged.extend(newly.into_iter().map(|number| TriggeredGroom {
+        number,
+        at: at.clone(),
+    }));
+    merged
 }
 
 /// La liste des vols postés que le prochain checkpoint portera : l'ancienne,
@@ -1170,12 +1285,21 @@ pub async fn run_manager_cycle_in(
             .map(|c| c.posted_flight_task_ids.as_slice())
             .unwrap_or(&[]);
         let posted_flight_task_ids = merge_posted(previous, &newly_posted);
+        let triggered_grooms = merge_triggered(
+            checkpoint
+                .as_ref()
+                .map(|c| c.triggered_grooms.as_slice())
+                .unwrap_or(&[]),
+            &[],
+            now,
+        );
         let new_checkpoint = if should_deliver {
             MilestoneCheckpoint {
                 state_digest: digest,
                 last_delivered_at: Some(generated_at.clone()),
                 last_observed_at: state.last_activity_at.clone(),
                 posted_flight_task_ids,
+                triggered_grooms,
             }
         } else {
             // Posté sans livrer : les trois champs de cadence sont **préservés**
@@ -3427,6 +3551,125 @@ mod tests {
             groom.envois.lock().unwrap().is_empty(),
             "rien ne part, vu : {:?}",
             groom.envois.lock().unwrap()
+        );
+    }
+
+    // -- mika#2958 vol 2d : la fenêtre d'idempotence durable ------------------
+
+    /// Une entrée de fenêtre posée à `now - minutes`.
+    fn entree(number: u64, now: DateTime<Utc>, minutes: i64) -> TriggeredGroom {
+        TriggeredGroom {
+            number,
+            at: crate::timestamp::format(&(now - Duration::minutes(minutes))),
+        }
+    }
+
+    /// **R4 — la fenêtre expire.** Un groom envoyé dans la fenêtre y est tenu ;
+    /// au-delà de [`GROOM_WINDOW`] il redevient déclenchable.
+    ///
+    /// C'est la propriété qui interdit la famine : sans elle, un numéro entré
+    /// dans la fenêtre n'en sortirait jamais et plus rien ne le groomerait.
+    #[test]
+    fn mika2958_la_fenetre_expire_et_le_numero_redevient_declenchable() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let fenetre = vec![entree(1802, now, 29), entree(1803, now, 31)];
+
+        assert_eq!(
+            triggered_window_at(&fenetre, now),
+            BTreeSet::from([1802]),
+            "29 minutes est dans la fenêtre, 31 n'y est plus"
+        );
+        assert!(
+            triggered_window_at(&fenetre, now + Duration::minutes(2)).is_empty(),
+            "deux minutes plus tard, les deux sont sortis — rien ne retient indéfiniment"
+        );
+    }
+
+    /// **D5 — une entrée dont l'instant ne se parse pas est écartée**, et c'est
+    /// la direction **inverse** de `GroomInFlightReading::carries_groom`.
+    ///
+    /// La retenir serait un faux positif permanent : un ticket de relève que
+    /// rien ne groome plus jamais, et silencieusement. L'écarter coûte au pire un
+    /// doublon, borné par `GROOMS_PER_CYCLE = 1`.
+    #[test]
+    fn mika2958_une_entree_illisible_est_ecartee_de_la_fenetre() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let fenetre = vec![
+            TriggeredGroom {
+                number: 1802,
+                at: "pas-un-instant".to_string(),
+            },
+            entree(1803, now, 1),
+        ];
+
+        assert_eq!(
+            triggered_window_at(&fenetre, now),
+            BTreeSet::from([1803]),
+            "l'illisible sort, le lisible reste — un doublon possible, jamais une famine"
+        );
+    }
+
+    /// Un instant dans le **futur** de plus d'une fenêtre est écarté lui aussi.
+    ///
+    /// Dérive d'horloge ou checkpoint édité à la main : sans la valeur absolue de
+    /// l'écart, une telle entrée retiendrait son numéro indéfiniment — la famine
+    /// que la borne existe pour interdire.
+    #[test]
+    fn mika2958_un_instant_dans_le_futur_lointain_ne_retient_rien() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let fenetre = vec![entree(1802, now, -31), entree(1803, now, -5)];
+
+        assert_eq!(
+            triggered_window_at(&fenetre, now),
+            BTreeSet::from([1803]),
+            "un futur proche est tenu (horloge qui dérive d'une minute), un futur lointain non"
+        );
+    }
+
+    /// **D7 — la fusion dédoublonne, garde l'instant le plus récent, et élague.**
+    #[test]
+    fn mika2958_la_fusion_dedoublonne_et_elague() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let precedente = vec![
+            entree(1802, now, 20), // redéclenché ce cycle : son instant est rafraîchi
+            entree(1803, now, 5),  // intact
+            entree(1804, now, 45), // expiré : élagué par l'écriture
+        ];
+
+        let fusionnee = merge_triggered(&precedente, &[1802], now);
+
+        let numeros: Vec<u64> = fusionnee.iter().map(|e| e.number).collect();
+        assert_eq!(
+            numeros,
+            vec![1803, 1802],
+            "une entrée par numéro, l'expirée sortie et la redéclenchée en queue"
+        );
+        assert_eq!(
+            fusionnee
+                .iter()
+                .find(|e| e.number == 1802)
+                .map(|e| e.at.as_str()),
+            Some(crate::timestamp::format(&now).as_str()),
+            "le numéro redéclenché garde l'instant le plus récent"
+        );
+        assert_eq!(
+            triggered_window_at(&fusionnee, now),
+            BTreeSet::from([1802, 1803]),
+            "et la relecture de la fusion rend exactement ces deux numéros"
+        );
+    }
+
+    /// Un checkpoint écrit avant ce vol se relit en fenêtre **vide**, jamais en
+    /// erreur — `serde(default)`, comme `posted_flight_task_ids` au vol 2 de
+    /// mika#2698.
+    #[test]
+    fn mika2958_un_checkpoint_davant_le_vol_2d_se_relit() {
+        let ancien = r#"{"state_digest":"abc","last_delivered_at":"2026-10-31T12:00:00Z","last_observed_at":"2026-10-30T00:00:00Z","posted_flight_task_ids":["t-1"]}"#;
+        let c: MilestoneCheckpoint = serde_json::from_str(ancien).unwrap();
+        assert_eq!(c.posted_flight_task_ids, vec!["t-1".to_string()]);
+        assert!(
+            c.triggered_grooms.is_empty(),
+            "le champ absent se relit en fenêtre vide, jamais en erreur"
         );
     }
 }
