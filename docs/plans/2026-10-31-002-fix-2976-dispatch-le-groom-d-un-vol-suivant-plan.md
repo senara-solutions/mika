@@ -579,3 +579,109 @@ voisinage que mika#2980 vient de modifier) et il ajouterait à lui seul plus de 
 ce qui ferait sortir le total de la borne.
 
 Tracked in: senara-solutions/mika#2976 (vol 3 — AC5)
+
+---
+
+## 13. Complément du 2026-10-31 : AC8 et AC9
+
+Ce plan a été écrit avant le second relevé de la sonde d'AC4. Ce relevé a montré deux
+défauts de plus, mesurés sur ce ticket même : le dev-pilot `0be4647a` s'est arrêté sur le
+plan `0c9203aaf` que le groom venait de frapper, et la porte lit une ref de suivi
+`origin/<branche>` que le distant ne porte plus. Ce complément les ajoute au vol 2. Il
+change le § 3, le § 4 et le § 6 ; le reste du plan tient.
+
+### 13.1 Mesures
+
+- PR #2985 : `mergedAt` = 2026-10-31T06:44:43Z. Le plan `0c9203aaf` a pour date de
+  commit 2026-10-31T07:44:51Z : il est **postérieur** au merge. C'est le vol courant.
+- Cas AC7 : les trois commits de `feat/2958/…` sont datés de 08:08 à 08:52Z le
+  2026-10-30, et #2975 a mergé à 11:04:06Z : ils sont **antérieurs**. La partition par
+  date ne change donc rien au cas AC7.
+- Cas AC9, sur le checkout de ce worktree : `git ls-remote origin
+  refs/heads/feat/2958/manager-phase-2-c-vol-2-le-manager` ne rend rien, alors que
+  `refs/remotes/origin/feat/2958/manager-phase-2-c-vol-2-le-manager` existe encore, à
+  `59010336a`. La ref périmée est là, aujourd'hui.
+
+### 13.2 La règle de « usée », complétée
+
+La porte lit l'instant de fermeture `T` de la dernière PR terminale du nom de branche
+(`mergedAt`, à défaut `closedAt`, le plus récent des PR lues ; `gh pr list` le donne dans
+la même requête que P1). Chaque commit de la branche absent de `main` est classé par sa
+date de commit (`%ct`) :
+
+- **postérieur** (`%ct > T`) : le vol courant. Il n'est ni jugé ni réinitialisé ;
+- **antérieur** (`%ct ≤ T`) : il relève de E1 puis de E2, comme au § 3.
+
+Verdict : `unmerged_work` dès qu'un antérieur n'est absorbé ni par E1 ni par E2 (AC3
+tient) ; sinon `live` s'il existe au moins un postérieur (la branche porte le vol courant,
+elle se reprend telle quelle) ; sinon `spent`.
+
+Pourquoi la date et non la topologie. La tête mergée (`headRefOid`) n'est pas un ancêtre
+de la branche recréée depuis `main`, et un commit local jamais poussé avant le merge est
+topologiquement un descendant de cette tête : la topologie ne sépare pas les deux
+populations que l'AC8 nomme, la date les sépare.
+
+Pourquoi c'est sûr dans les deux sens d'erreur. Un antérieur pris pour un postérieur
+(commit réécrit par un rebase, qui reçoit une date neuve) conduit à `live`, donc à la
+reprise : aucun geste destructif, le comportement d'avant la porte. Un postérieur pris
+pour un antérieur (horloge en retard) est jugé par E1 et E2 : absent de `main`, il arrête ;
+présent, il est déjà dans `main`. Aucun des deux cas ne réinitialise une branche qui porte
+du contenu absent de `main`.
+
+Non-mesure : `T` illisible (PR sans date, `jq` en échec) ⇒ tous les commits sont
+antérieurs, c'est-à-dire le comportement du § 3, qui arrête plutôt que de réinitialiser.
+La ligne le dit : `current=unmeasured`.
+
+E2 sur les seuls antérieurs : le patch cumulé se calcule de la merge-base au plus récent
+antérieur `A`, à condition que les antérieurs soient exactement `origin/main..A` (compte
+égal). Sinon les deux populations sont entrelacées, et E2 rend la raison
+`interleaved_flight`, une non-mesure de plus au § 3.1.
+
+### 13.3 AC9 : la ref de suivi périmée
+
+Avant de lire `refs/remotes/origin/$branch`, la porte demande au distant si la branche
+existe, par `_remote_branch_exists` (le lecteur unique de mika#2626). Rc 1 (le distant
+répond « absente ») : la ref est périmée, elle n'est pas lue, et la ligne la nomme dans
+`stale=`. Rc 2 (le distant ne répond pas) : la ref est lue comme aujourd'hui, ce qui ne
+peut qu'arrêter, jamais réinitialiser ce qu'on ignore. La question n'est posée que si la
+ref de suivi existe : la branche absente partout ne coûte aucun appel réseau.
+
+### 13.4 Observabilité
+
+La ligne `branch_reuse_gate:` gagne, en plus de `containment=` (§ 4), deux champs :
+`current=<n>|unmeasured` (le compte de postérieurs) et `stale=<ref>|none`. Le message de
+halte nomme les seuls antérieurs en péril.
+
+### 13.5 Tests, numérotation finale
+
+T1 à T6 restent inchangés : leurs bouchons `gh` ne portent pas de date, donc `T` est
+illisible et tous leurs commits sont antérieurs, ce qui est le comportement du vol 1.
+Chaque nouveau cas porte son contrôle négatif dans la même fonction.
+
+- **T7** (un commit, `merge --squash`) : `spent`, `containment=per_commit`. Négatif : un
+  commit antérieur au merge, absent de `main`, donne `unmerged_work`.
+- **T8** (AC6, plan + code squashés en un commit) : `spent`, `containment=cumulative`,
+  `action=reset`. Négatif : un commit antérieur au merge, absent de `main`. Le § 6 disait
+  « un commit ajouté après le squash » ; avec l'AC8 un tel commit est le vol courant, et
+  T11 le couvre. Le négatif d'AC6 devient donc un commit **daté d'avant** le merge.
+- **T9** (AC7, topologie mesurée avec le retard de `main`) : `spent`, `cumulative`, et
+  les deux critères écartés épinglés (§ 6).
+- **T10** (fenêtre dépassée) : `unmerged_work`, `containment=unmeasured`.
+- **T11** (AC8) : branche recréée sur `main` après le squash, un commit de plan postérieur
+  au merge : `live`, `action=reuse`, `current=1`, rien ne bouge. Négatif : la même branche
+  avec en plus un commit antérieur absent de `main` s'arrête.
+- **T12** (AC9) : ref de suivi périmée portant un travail absent de `main`, branche
+  supprimée sur origin : la porte ne bute pas, `stale=` la nomme. Négatif : la même ref,
+  branche vivante sur origin, s'arrête.
+
+### 13.6 Acceptance criteria ajoutés
+
+- **AC8.** Un commit postérieur à la tête mergée de la dernière PR terminale de la branche
+  est le vol courant, pas un travail laissé derrière : le verdict n'est pas
+  `unmerged_work`. Test dans le même appel, avec contrôle négatif : une branche recréée sur
+  `main` avec un seul commit de plan, PR précédente mergée, donne un verdict qui laisse
+  partir dev-pilot ; la même branche avec, en plus, un commit d'avant le merge absent de
+  `main` s'arrête toujours.
+- **AC9.** Une ref de suivi `origin/<branche>` dont la branche n'existe plus sur origin ne
+  fait pas buter la porte. Le plan dit si la porte la lit encore, et comment elle sait
+  qu'elle est périmée.
