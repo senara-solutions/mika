@@ -66,6 +66,7 @@
 //! complet. Les deux sont OFF aujourd'hui, et ce vol n'en ouvre aucun.
 
 use mika_a2a::jsonrpc::AGENT_BUSY;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// L'interrupteur du point 1 du ticket. **OFF par défaut.**
@@ -449,12 +450,96 @@ pub(crate) fn classify_send_outcome(
     }
 }
 
+/// Un ticket de la relève, tel qu'on le soumet à une lecture de vol
+/// (mika#2958, vol 2c).
+///
+/// Les deux champs voyagent **ensemble** parce que la base apparie sur l'URL et
+/// que le reste du geste compte en numéros. Le numéro n'est donc jamais
+/// reconstruit depuis une URL rendue : c'est l'appelant qui tient la
+/// correspondance, et [`GroomInFlightSource`] la retraduit par sa propre table.
+/// Un `parse` sur la queue d'une URL serait un second décodeur, faux le jour où
+/// une variante de chemin apparaît.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroomIssue {
+    pub number: u64,
+    pub url: String,
+}
+
+/// Quels tickets de la relève portent **déjà** un groom en vol.
+///
+/// Déclaré ici, implémenté dehors ([`crate::groom_in_flight`]) : voir le
+/// module-doc de [`crate::flight_source`] pour le motif — `no_dispatch_test.rs`
+/// grep tous les `.rs` de l'arbre de ce module à la recherche de jetons
+/// d'autorité d'écriture, et du SQL avec un handle de base n'y passe pas sans
+/// une exception nommée. C'est le découpage de `FlightSource` / `DbFlightSource`,
+/// mergé sur ce motif.
+#[async_trait::async_trait]
+pub trait GroomInFlightSource: Send + Sync {
+    /// `issues` vide est une question légitime, et sa réponse est
+    /// `Read(∅)` — **jamais** [`GroomInFlightReading::Unreadable`] : « personne
+    /// à regarder » n'est pas « je n'ai pas pu regarder ».
+    async fn grooms_in_flight(&self, issues: &[GroomIssue]) -> GroomInFlightReading;
+}
+
+/// La lecture, **typée** : « rien en vol » et « je n'ai pas pu lire » ne sont
+/// pas la même phrase (mika#2205, mika#2331).
+///
+/// Même forme que [`super::FlightPrReads`], et pour la même raison : un
+/// `BTreeSet` vide rendu sur une panne de base dirait « aucun groom en cours »
+/// avec l'autorité d'une mesure.
+///
+/// ## La direction du fail-safe, et pourquoi elle est **inverse** de celle de
+/// `live_pilot`
+///
+/// Ici, une lecture illisible fait **sauter** le candidat :
+/// [`Self::carries_groom`] rend `true` pour tout le monde quand rien n'a été lu.
+/// Chez `crate::live_pilot`, une lecture illisible fait au contraire **ne pas**
+/// conclure à la vivacité, donc laisse le geste passer.
+///
+/// Les deux sont la même règle appliquée au même sens : *le doute va contre
+/// l'acte irréversible*. Ce qui change est l'**acte**. `live_pilot` protège une
+/// tâche vivante d'une réaction qui la tuerait, donc le doute doit empêcher de
+/// conclure « elle est morte ». Ce consommateur-ci **envoie** : le doute doit
+/// empêcher d'envoyer, parce qu'un second groom sur un ticket déjà en cours de
+/// groom est exactement la collision que l'AC2 du ticket nomme. Lire la
+/// direction de l'un comme un précédent pour l'autre inverse la garantie en
+/// croyant la recopier.
+///
+/// Le coût est nommé : une base muette gèle la relève — zéro groom déclenché,
+/// pas un de trop. Il est borné par [`GROOMS_PER_CYCLE`] à un groom différé par
+/// cycle, et il est **visible** : le lecteur émet une sonde nommée au moment où
+/// il rend `Unreadable`, et le motif `groom_in_flight` ressort au journal du
+/// geste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroomInFlightReading {
+    /// Les numéros portant un groom non terminal. Un numéro **absent** n'en
+    /// porte pas — l'ensemble est la mesure complète de la question posée.
+    Read(BTreeSet<u64>),
+    /// La lecture a échoué, ou aucune source n'est câblée. **Rien n'est su.**
+    Unreadable,
+}
+
+impl GroomInFlightReading {
+    /// Ce ticket porte-t-il déjà un groom en vol ? **Le lecteur unique de la
+    /// direction du fail-safe** — `Unreadable` répond `true` pour tout numéro.
+    ///
+    /// Un second site qui ferait ce `match` autrement serait un second
+    /// fail-safe, et c'est le genre de divergence qu'on ne découvre que le jour
+    /// où la base est muette (doctrine mika#2201).
+    pub fn carries_groom(&self, number: u64) -> bool {
+        match self {
+            Self::Read(numbers) => numbers.contains(&number),
+            Self::Unreadable => true,
+        }
+    }
+}
+
 /// Un candidat de la relève, avec les deux faits qui décident de son sort.
 ///
 /// Les deux booléens sont des **lectures**, faites par l'appelant : au vol 2,
 /// `deja_groome` vient du callout `Plan: docs/plans/` du corps du ticket et
-/// `groom_en_cours` du siège `dispatch:` que le moteur y pose, plus le champ de
-/// checkpoint qui couvre la fenêtre entre l'envoi et la pose du siège. Ce
+/// `groom_en_cours` de [`GroomInFlightReading::carries_groom`], plus le champ de
+/// checkpoint qui couvrira la fenêtre entre l'envoi et la pose du siège. Ce
 /// fichier ne les relit pas : un second lecteur du même fait divergerait du
 /// premier le jour où la réponse compte (mika#2201).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -796,6 +881,101 @@ mod tests {
             emetteur.envois()
         );
         assert_eq!(issue.declenches, vec![30]);
+    }
+
+    /// Un candidat tel que le câblage le construira : son `groom_en_cours` est
+    /// **la réponse de la lecture**, jamais un booléen décidé sur place.
+    fn depuis_lecture(number: u64, lecture: &GroomInFlightReading) -> GroomCandidate {
+        GroomCandidate {
+            groom_en_cours: lecture.carries_groom(number),
+            ..propre(number)
+        }
+    }
+
+    /// Une lecture **faite** ne porte que les numéros lus, et un numéro absent
+    /// de l'ensemble n'est pas en vol.
+    ///
+    /// C'est la moitié qui empêche de lire la direction du fail-safe comme un
+    /// « toujours oui » : `Read` répond non, et c'est sur `Read(∅)` que repose
+    /// tout contrôle négatif du test suivant.
+    #[test]
+    fn mika2958_une_lecture_faite_ne_porte_que_ses_numeros() {
+        let vide = GroomInFlightReading::Read(BTreeSet::new());
+        assert!(
+            !vide.carries_groom(2958),
+            "un ensemble vide ne porte personne"
+        );
+
+        let lue = GroomInFlightReading::Read(BTreeSet::from([2958, 2700]));
+        assert!(lue.carries_groom(2958));
+        assert!(lue.carries_groom(2700));
+        assert!(
+            !lue.carries_groom(2959),
+            "un numéro hors de l'ensemble n'est pas en vol : la mesure est complète"
+        );
+    }
+
+    /// **La direction du fail-safe**, de bout en bout : une lecture illisible
+    /// fait sauter *tout le monde*, et zéro envoi part.
+    ///
+    /// Son contrôle négatif est dans le même test, sur le **même** semis et la
+    /// seule lecture en différence : sans lui, « zéro envoi » serait aussi rendu
+    /// par un interrupteur fermé ou un émetteur mort (classe mika#2205). Et sans
+    /// la première moitié, une base muette enverrait un second groom sur un
+    /// ticket qu'un pilote est en train de grommer — la collision que nomme AC2.
+    ///
+    /// Le motif rendu est `groom_in_flight`, celui que porte déjà la lecture
+    /// faite : du point de vue du cycle, « il y a un groom en vol » et « je ne
+    /// peux pas jurer qu'il n'y en a pas » mènent au même geste, qui est de ne
+    /// pas envoyer. Ce qui les sépare se lit à la sonde du lecteur, pas ici.
+    #[tokio::test]
+    async fn mika2958_une_lecture_illisible_fait_sauter_tout_le_monde() {
+        let illisible = GroomInFlightReading::Unreadable;
+        assert!(
+            illisible.carries_groom(2958) && illisible.carries_groom(2700),
+            "l'illisible répond oui pour tout numéro, y compris un inconnu"
+        );
+
+        let emetteur = EmetteurEnregistreur::default();
+        let issue = trigger_relief_grooms(
+            true,
+            Some(&emetteur),
+            &[
+                depuis_lecture(2958, &illisible),
+                depuis_lecture(2700, &illisible),
+            ],
+        )
+        .await;
+        assert!(
+            issue.declenches.is_empty(),
+            "une base muette ne déclenche rien : {issue:?}"
+        );
+        assert_eq!(
+            motifs(&issue),
+            vec!["groom_in_flight", "groom_in_flight"],
+            "chaque candidat est sauté, et pour le motif de la lecture : {issue:?}"
+        );
+        assert!(
+            emetteur.envois().is_empty(),
+            "AC2 : zéro envoi sous une lecture illisible, vu : {:?}",
+            emetteur.envois()
+        );
+
+        let lue = GroomInFlightReading::Read(BTreeSet::new());
+        let emetteur = EmetteurEnregistreur::default();
+        let issue = trigger_relief_grooms(
+            true,
+            Some(&emetteur),
+            &[depuis_lecture(2958, &lue), depuis_lecture(2700, &lue)],
+        )
+        .await;
+        assert_eq!(
+            issue.declenches,
+            vec![2958],
+            "contrôle négatif : le même semis part sous une lecture vide — c'est \
+             la lecture qui retient, pas l'interrupteur ni un émetteur mort : {issue:?}"
+        );
+        assert_eq!(emetteur.envois(), vec!["groom mika#2958".to_string()]);
     }
 
     /// **AC3, seconde moitié.** `AgentBusy` arrête le cycle, et ne compte pas
