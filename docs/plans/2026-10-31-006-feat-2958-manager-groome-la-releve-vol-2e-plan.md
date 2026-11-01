@@ -1,5 +1,19 @@
 # mika#2958 — ce que le cycle a fait de la relève se lit dans le rapport (vol 2e)
 
+> **Re-groom du 2026-11-01 — ce qui a changé, et ce qui n'a pas changé.**
+> La passe du 2026-10-31 (session `8d58b7d9`) s'est arrêtée sur la garde
+> d'ancrage (`QuoteTooShort`, 2 ancres valides sur 3), qui porte sur la **réponse
+> de l'architecte** et non sur ce plan : aucune objection de fond n'a été rendue.
+> Le fond est donc conservé — les huit décisions, les sept exigences et l'ordre de
+> commit sont ceux de `b723af2a0`. Trois faits vérifiables étaient faux et sont
+> corrigés : le nombre de tests de `reporter.rs` (**57**, non 97 — mesuré par
+> `cargo test -p mika-agent --lib milestone_manager::reporter -- --list`), le
+> chemin de module de `mika2700_le_vol_1_nouvre_aucun_chemin_decriture`
+> (`milestone_manager/mod.rs:457`, non `canonical_tokens`), et la branche des
+> trois assertions de D3 (deux sur `armed = false`, une sur `relief == None`).
+> Tous les autres ancrages ont été revérifiés sur le HEAD courant et tombent
+> juste ; `milestone_manager/` n'a reçu aucun commit depuis `b723af2a0`.
+
 > **Périmètre touché hors de la zone déclarée par le corps du ticket — et pourquoi.**
 > La « zone attendue » du corps (`groom_trigger.rs`, `cadence.rs`, `spawn.rs`)
 > datait du **vol 2b**. Ce vol en sort par **un** fichier :
@@ -57,7 +71,7 @@ Ce vol **clôt le ticket** : AC1 est fermé au vol 2a, AC2 au vol 2d, AC3 aux vo
 - **R1.** Le rapport reçoit ce que le cycle a fait de la relève par un
   **paramètre**, jamais par une relecture d'environnement.
 - **R2.** Un appelant qui n'a pas mesuré le geste rend **exactement** la section
-  du vol 1, au caractère près — les 97 tests actuels de `reporter.rs` passent sans
+  du vol 1, au caractère près — les 57 tests actuels de `reporter.rs` passent sans
   amendement.
 - **R3.** Avec l'interrupteur OFF, la section est **inchangée** : même titre, mêmes
   lignes. C'est la moitié OFF d'AC4, et elle est épinglée par un test de cycle, pas
@@ -100,10 +114,13 @@ et `report_with_auth_notes` délègue avec `None`, comme `report` délègue déj
 **Pourquoi pas `groom_write_is_armed()` lu dans le rapporteur**, qui aurait l'air
 plus court — deux raisons, et la seconde est une correction :
 
-1. Le rendu redeviendrait fonction de l'environnement du processus. Les 97 tests
-   de `reporter.rs` tournent aujourd'hui en parallèle sans `serial_test` ; chacun
-   qui toucherait à la relève devrait prendre le harnais `GroomArme` et le verrou
-   sériel. Le rendu est une fonction pure de ses entrées, et il le reste.
+1. Le rendu redeviendrait fonction de l'environnement du processus. Les 57 tests
+   de `reporter.rs` tournent aujourd'hui en parallèle sans `serial_test`
+   (`grep -c serial reporter.rs` rend `0`) ; chacun qui toucherait à la relève
+   devrait prendre un harnais d'interrupteur et son verrou sériel — et le seul
+   qui existe, `GroomArme` (`cadence.rs:3576`), vit dans le `mod tests` d'un
+   **autre** fichier, donc il faudrait le dupliquer ou le remonter. Le rendu est
+   une fonction pure de ses entrées, et il le reste.
 2. Ce serait un **second lecteur** du même interrupteur (mika#2201), et il pourrait
    mentir : le cycle lit l'armement **une fois**, à son site
    (`trigger_cycle_grooms`, décision D4 du vol 2d), et le rapport est composé après.
@@ -171,14 +188,23 @@ Rempli à quatre sites, tous existants :
   le motif que `cycle_refusal` aurait rendu pour cet état. Un `None` y serait
   l'affirmation « le geste a eu lieu » dans la branche qui existe précisément pour
   ne pas paniquer un cycle.
-- `trigger_cycle_grooms`, ses deux refus propres → `Some("no_relief_verdict")` et
-  `Some("no_in_flight_source")`.
+- `trigger_cycle_grooms`, ses deux refus propres → `Some("no_relief_verdict")`
+  (`cadence.rs:1016`, branche `relief == None`) et `Some("no_in_flight_source")`
+  (`cadence.rs:1047`, branche `ctx.groom_in_flight == None`). Les deux
+  journalisent déjà ce mot sous `manager_groom_not_triggered` : la valeur portée
+  est celle de la sonde, pas une seconde orthographe.
 - `envoyer` → `None`, par `Default` : le geste a eu lieu.
 
-**Trois assertions existantes comparent à `GroomTriggerOutcome::default()` sur une
-branche `armed = false`**, où le champ vaut désormais `Some("disarmed")`. Elles
-sont amendées dans le même commit, en **renforcement** et non en relâchement — la
-forme nommée épingle le motif en plus du vide :
+**Trois assertions existantes — et exactement trois — comparent à
+`GroomTriggerOutcome::default()`**, où le champ vaut désormais un `Some(…)`. Deux
+sont sur la branche `armed = false` (motif `disarmed`), la troisième sur la
+branche `relief == None` (motif `no_relief_verdict`) : ce sont deux motifs
+distincts, pas une seule branche. Le compte est vérifiable —
+`grep -n "GroomTriggerOutcome::default()" src/milestone_manager/*.rs` rend huit
+occurrences dont cinq sont des sites de production (retours de refus et
+initialisation de l'accumulateur), et trois seulement sont des `assert_eq!`.
+Elles sont amendées dans le même commit, en **renforcement** et non en
+relâchement — la forme nommée épingle le motif en plus du vide :
 
 ```rust
 GroomTriggerOutcome {
@@ -288,7 +314,8 @@ n'ajoute aucun geste d'écriture, et son assertion auto-nettoyante (`len() == 3`
 `no_dispatch_test.rs:173-178`) resterait verte parce que rien n'y touche ;
 `no_repo_list_test.rs` reste satisfait — aucune URL n'est composée ici, le rendu
 ne porte que des numéros ; et
-`canonical_tokens::mika2700_le_vol_1_nouvre_aucun_chemin_decriture` n'est pas
+`mika2700_le_vol_1_nouvre_aucun_chemin_decriture` — qui vit dans le `mod tests`
+de `milestone_manager/mod.rs:457`, et non dans `canonical_tokens` — n'est pas
 retouché (il l'a été au vol 2a). Le gate est **N/A**, et la section n'est pas
 inventée (mika#2306).
 
@@ -337,7 +364,7 @@ la suivante n'a pas de sens.
    l'assertion de `cadence.rs:3762` attend `Some("no_relief_verdict")`.
    *Plancher* : `cargo test -p mika-agent milestone_manager::cadence` vert.
 3. **`report_with_grooms` et sa délégation, sans aucun changement de rendu** (D1,
-   D2). *Plancher* : les 97 tests de `reporter.rs` verts **sans amendement** — c'est
+   D2). *Plancher* : les 57 tests de `reporter.rs` verts **sans amendement** — c'est
    la preuve de R2, et elle ne vaut qu'à cette étape, avant que le rendu bouge.
 4. **Le segment de titre (D4) et l'annotation par candidat (D5)**, avec leurs tests
    de rendu. *Plancher* : les quatre formes de titre et les trois annotations
