@@ -56,8 +56,10 @@ use mika_common::llm::ProviderKind;
 /// prompt-injection helpers. Co-located with the loop that reads them.
 pub mod context_history;
 pub mod max_steps_census;
+mod pr_review_groom; // mika#3004
 pub mod review_anchor;
 pub mod skill_nudge;
+use pr_review_groom::ProprietesDuTour;
 use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pending_nudge};
 
 /// Skills whose LLM output legitimately contains `Verdict:` lines.
@@ -1577,15 +1579,7 @@ async fn run_loop(
     // the return; see the parameter's doc in `tool_execution::dispatch` for why
     // it travels by `&mut` rather than in `LoopResult`.
     delivery_log: &mut Vec<crate::evidence::guards::DeliveryRecord>,
-    // mika#3004 — le texte de l'événement webhook d'AVANT les handlers de
-    // `server/`, quand ce tour en vient d'un ; `None` sinon. Un seul lecteur :
-    // `filter_available_required_tools` ci-dessous, qui juge la classe du tour.
-    //
-    // Il traverse en `Option<&str>` et non reconstruit depuis `request.messages`,
-    // parce que c'est précisément ce que `request.messages` ne contient plus : un
-    // pré-digest de `verdict_handler` a remplacé le texte de l'événement. Voir
-    // [`AgentParams::webhook_event_text`] pour la chaîne causale complète.
-    webhook_event_text: Option<&str>,
+    webhook_event_text: Option<&str>, // mika#3004 — [`pr_review_groom`]
 ) -> Result<LoopResult> {
     // Capture the user's input text for persistence evaluation guard (#648).
     // Extracted once before the loop starts so it always reflects the real user
@@ -1624,11 +1618,6 @@ async fn run_loop(
     // `INTENT_GUARDS` évaluent `is_unauthorized_webhook_dispatch` plus bas — ce
     // partage est ce qui interdit aux deux couches de désigner deux tours
     // différents.
-    // mika#3004 — et `webhook_event_text` est ce que `user_input_text` ne peut
-    // pas être : le texte de l'événement d'AVANT les handlers. Les deux voyagent
-    // ensemble jusqu'ici parce que les deux couches décrites ci-dessus ont besoin
-    // des deux — la contradiction de mika#2757 se lit sur le texte servi au
-    // modèle, la classe du tour sur le texte que le gateway a émis.
     let effective_required_tools = filter_available_required_tools(
         required_tools,
         tools,
@@ -1636,7 +1625,7 @@ async fn run_loop(
         mcp_manager,
         enabled_tool_names,
         &user_input_text,
-        webhook_event_text,
+        webhook_event_text, // mika#3004 — le texte d'AVANT les handlers
     );
 
     // All registered tool names (builtins + skills + MCP) for prose-style tool call
@@ -6014,37 +6003,9 @@ pub struct AgentParams<'a> {
     /// Emission is fire-and-forget: broadcast errors are `debug!`-logged and
     /// never fail the tool call.
     pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
-    /// Le texte de l'événement webhook **avant** tout handler de `server/`, quand
-    /// ce tour en vient d'un (mika#3004). `None` hors du chemin webhook.
-    ///
-    /// # Pourquoi un second texte, et pas `user_message`
-    ///
-    /// `user_message` est le texte que le modèle reçoit, et sur un tour webhook
-    /// ce n'est plus l'événement : les handlers de `server/handlers.rs` l'ont
-    /// réécrit. `verdict_handler` en particulier **remplace** `req.text` par un
-    /// pré-digest qui commence par `<verdict_handler>\n` et ne porte
-    /// `[GitHub] PR review (…)` qu'en **deuxième** ligne. Tout prédicat de
-    /// préfixe lu sur ce texte-là répond donc « ce n'est pas un événement
-    /// GitHub » sur un tour qui en est un — c'est la cause directe de l'incident
-    /// mika#3004 (trace `3b771914`, 2026-10-30 17:14:38Z : un tour `pr_review`
-    /// s'est vu exiger `run_claude_pilot_groom` et a groomé un ticket dont la PR
-    /// était ouverte).
-    ///
-    /// Le champ porte donc ce que le **gateway** a émis, que `handlers.rs` tient
-    /// déjà sous le nom `original_github_text` et que le pré-filtre mika#2680 lit
-    /// pour la même raison : *« le registre lit `original` — le texte d'AVANT les
-    /// handlers — jamais `req.text` »*.
-    ///
-    /// # Un seul alimenteur
-    ///
-    /// `server/handlers.rs` est le seul site qui le renseigne, parce que c'est le
-    /// seul qui tient le texte d'avant. Les quatre autres constructeurs
-    /// (`server/a2a.rs`, les trois de `tests/eval/harness.rs`) passent `None`, et
-    /// un `None` est exact chez eux : hors chemin webhook il n'existe pas de
-    /// texte d'avant qui diffère. Le consommateur
-    /// ([`filter_available_required_tools`], via `ProprietesDuTour::depuis`)
-    /// retombe alors sur le message du tour, ce qui préserve octet pour octet le
-    /// comportement mika#2757 partout ailleurs.
+    /// Texte de l'événement webhook d'**avant** les handlers de `server/` ;
+    /// `None` hors de ce chemin. Seul alimenteur : `server/handlers.rs`.
+    /// Pourquoi un second texte : [`pr_review_groom`] (mika#3004).
     pub webhook_event_text: Option<&'a str>,
 }
 
@@ -8200,10 +8161,7 @@ async fn run_silent_inner(
         None,              // mika#1583: silent-mode turns do not nudge
         None,              // mika#1757: silent turns have no A2A streaming subscriber
         &mut delivery_log, // mika#2136
-        // mika#3004 — un tour silencieux ne vient pas d'un webhook : il n'existe
-        // aucun texte d'événement d'avant les handlers, et `None` dit exactement
-        // cela. Le jugement retombe sur le message du tour, comme avant.
-        None,
+        None,              // mika#3004 — un tour silencieux ne naît pas d'un webhook
     )
     .await?;
 
@@ -8859,9 +8817,7 @@ async fn run_team_agent_inner_impl(
         None,              // mika#1583: team-mode turns do not nudge
         None,              // mika#1757: team turns have no A2A streaming subscriber
         &mut delivery_log, // mika#2136
-        // mika#3004 — ni un tour d'équipe : `TeamAgentParams` ne porte pas de
-        // texte d'événement parce qu'aucun webhook ne l'ouvre.
-        None,
+        None,              // mika#3004 — aucun webhook n'ouvre un tour d'équipe
     )
     .await?;
 
@@ -9851,78 +9807,9 @@ enum RaisonDesarmement {
     NonServi,
     /// Il est servi, mais le tour interdit qu'il réussisse (mika#2757).
     TourInterditDispatch,
-    /// Il est servi, le tour autorise le dispatch, mais ce tour-ci est le
-    /// territoire d'un handler qui a **déjà traité** l'événement : il n'y reste
-    /// rien à groomer (mika#3004).
+    /// Territoire d'un handler ayant **déjà traité** l'événement : il n'y reste
+    /// rien à groomer (mika#3004 — [`pr_review_groom`]).
     TerritoireSansGroom,
-}
-
-/// Ce que ce tour-ci est, lu **une fois** pour l'ensemble des exigences
-/// (mika#3004).
-///
-/// # Pourquoi un struct et pas deux booléens de plus
-///
-/// mika#2757 a établi que le domaine d'un tour est *« une propriété du tour, pas
-/// de l'outil »* et a fait entrer `turn_forbids_dispatch` dans
-/// [`raison_de_desarmement`] en `bool` déjà calculé, pour qu'aucune branche ne
-/// soit tentée de le réévaluer par outil. mika#3004 ajoute une **seconde**
-/// propriété du même tour, lue sur le même texte. Deux booléens parallèles
-/// auraient laissé un appelant les calculer sur deux textes différents — et c'est
-/// exactement l'erreur que ce ticket corrige, une couche plus haut.
-///
-/// Un seul constructeur ([`ProprietesDuTour::depuis`]), des champs privés et pas
-/// de `Default` : il n'existe aucune façon d'obtenir une valeur de ce type dont
-/// les deux champs ne viennent pas du **même** octet de texte. C'est ce que le
-/// type tient, et c'est pourquoi aucun scan de source n'a eu à le tenir.
-#[derive(Debug, Clone, Copy)]
-struct ProprietesDuTour {
-    /// Ce tour est dans le domaine Webhook Fallthrough : il interdit à un outil
-    /// de dispatch de réussir (mika#2757, branche 4).
-    interdit_dispatch: bool,
-    /// Ce tour est le territoire d'un handler de `server/` — un événement
-    /// `[GitHub] PR …` ou `[GitHub] Check suite …` que `self-dev-webhook-qa` /
-    /// `-ci` possèdent (mika#3004, branche 5).
-    territoire_handler: bool,
-}
-
-impl ProprietesDuTour {
-    /// Les deux propriétés, dérivées du texte qui dit ce que ce tour **est**.
-    ///
-    /// # Le texte jugé, et pourquoi c'est celui-là
-    ///
-    /// `webhook_event_text` est ce que le gateway a émis, avant tout handler de
-    /// `server/`. Quand il est `Some`, c'est lui qui est jugé — jamais
-    /// `turn_message`, qui sur un tour webhook a déjà été réécrit. C'est la cause
-    /// directe de l'incident mika#3004 : `verdict_handler` **remplace**
-    /// `req.text` par un pré-digest qui commence par `<verdict_handler>\n` et ne
-    /// porte `[GitHub] PR review (…)` qu'en deuxième ligne, si bien que les deux
-    /// prédicats de préfixe répondaient *« ce n'est pas un événement GitHub »*
-    /// sur un tour qui en était un.
-    ///
-    /// # Pourquoi `unwrap_or` et non deux chemins
-    ///
-    /// Hors du chemin webhook il n'existe pas de texte d'avant qui diffère :
-    /// `turn_message` **est** le texte du tour. La retombée préserve donc
-    /// octet pour octet le comportement de mika#2757 sur les tours Telegram, CLI,
-    /// A2A et de callback — un `None` n'est pas une absence d'information, c'est
-    /// l'information que les deux textes coïncident.
-    ///
-    /// # Pourquoi pas une lecture ligne à ligne du texte d'après
-    ///
-    /// Chercher le préfixe sur *chaque* ligne du pré-digest aurait évité de
-    /// faire voyager un second texte, et c'est précisément ce qui a été refusé :
-    /// un tour de fallthrough légitime qui **cite** une ligne
-    /// `[GitHub] PR review …` — un corps de ticket, un commentaire d'opérateur —
-    /// se serait vu désarmer un groom qu'il devait faire. C'est la classe
-    /// `mask_cited_branch` (mika#2755 / mika#2768) : un prédicat qui lit une
-    /// citation comme un fait.
-    fn depuis(webhook_event_text: Option<&str>, turn_message: &str) -> Self {
-        let texte = webhook_event_text.unwrap_or(turn_message);
-        Self {
-            interdit_dispatch: is_unauthorized_webhook_dispatch(texte),
-            territoire_handler: crate::webhook_dispatch::is_webhook_pr_event_domain(texte),
-        }
-    }
 }
 
 /// La décision de désarmement, **pure** et sans journalisation.
@@ -9937,8 +9824,8 @@ impl ProprietesDuTour {
 /// ## L'ordre des branches est load-bearing, et c'est la propriété du vol
 ///
 /// **1** l'outil n'existe pas → **2** son serveur déclare `testimony` → **3**
-/// le tour ne le sert pas → **4** le tour interdit le dispatch → **5** le tour
-/// est un territoire de handler sans groom à faire.
+/// le tour ne le sert pas → **4** le tour interdit le dispatch → **5** c'est un
+/// territoire de handler.
 ///
 /// Ce n'est pas une préférence de lisibilité. Un outil MCP testimony **n'est
 /// jamais servi** — `mcp::retain_publiables` l'a retiré du lot publié, donc de
@@ -9954,33 +9841,10 @@ impl ProprietesDuTour {
 /// pas n'a pas de grade, et parce que la branche 1 accuse une configuration de
 /// skill cassée — un diagnostic plus élémentaire, qui doit rester premier.
 ///
-/// `TerritoireSansGroom` se pose **cinquième**, et la position qui compte est
-/// celle vis-à-vis de la branche 3 (mika#3004). Sur un tour `check_suite`,
-/// [`filter_ci_excluded_tools`] (mika#1324) a déjà retiré les deux outils de
-/// dispatch du tableau servi : la branche 3 répond donc **première** là, et la
-/// branche 5 n'y est jamais atteinte en production. C'est voulu — le ticket
-/// demande que l'exigence ne tienne pas, pas qu'elle tombe sous un nom
-/// particulier — mais c'est aussi la raison pour laquelle on ne peut pas
-/// épingler la branche 5 avec une fixture `check_suite` *servie* : cet état-là,
-/// la production ne le produit pas, et un test qui le fabrique mesure une forme
-/// et non un tour. `mika3004_un_check_suite_repond_sous_non_servi_en_production`
-/// épingle les deux faits dans le même test, en le disant dans ses messages
-/// d'assertion.
-///
-/// Elle se pose **après** la branche 4 parce que les deux ne se recouvrent
-/// jamais : `interdit_dispatch` et `territoire_handler` sont mutuellement
-/// exclusifs par construction depuis mika#3004 — le domaine Fallthrough lit le
-/// territoire des handlers en négation — et c'est
-/// `mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs` qui le tient. L'ordre
-/// entre 4 et 5 est donc libre, et seule la position relative à 3 est une
-/// propriété.
-///
-/// [`ProprietesDuTour`] entre **déjà calculé**, et non en `&str` : ses deux
-/// prédicats sont évalués une fois pour l'ensemble des exigences (mika#2757 —
-/// « le domaine est une propriété du tour, pas de l'outil »), et faire entrer un
-/// texte ici inviterait à les réévaluer par outil. mika#3004 a transformé le
-/// `bool` en struct plutôt qu'ajouté un second `bool` à côté : deux booléens
-/// parallèles sont deux occasions de les calculer sur deux textes différents.
+/// [`ProprietesDuTour`] entre **déjà calculé**, et non en `&str` : évalué une
+/// fois pour toutes les exigences (mika#2757 — « le domaine est une propriété du
+/// tour »), là où un texte inviterait à le réévaluer par outil. Sa forme et la
+/// cinquième position de la branche 5 sont argumentées dans [`pr_review_groom`].
 fn raison_de_desarmement(
     outil: &str,
     tools: &ToolRegistry,
@@ -10013,18 +9877,8 @@ fn raison_de_desarmement(
         return Some(RaisonDesarmement::TourInterditDispatch);
     }
 
-    // Branche 5 — l'outil est servi, le tour autorise le dispatch, mais ce
-    // territoire-ci n'a pas de groom à faire (mika#3004).
-    //
-    // **Ne porte QUE l'outil de groom, et ce n'est pas une timidité.**
-    // `run_claude_pilot` reste exigible sur ce même territoire : un tour
-    // `[GitHub] PR …` ou `[GitHub] Check suite …` y porte des flux de dispatch
-    // d'implémentation parfaitement légitimes — `self-dev-webhook-qa` relance un
-    // pilote sur un `hold`, `self-dev-webhook-ci` en relance un sur un CI rouge.
-    // Élargir cette branche à [`is_dispatch_tool`] fermerait ces deux-là. Ce qui
-    // est impossible sur ce territoire est le *groom* : un handler y a déjà
-    // traité l'événement, et un événement de PR est par construction postérieur
-    // au plan.
+    // Branche 5 — territoire de handler : rien à groomer. Ne porte QUE l'outil
+    // de groom, et pas [`is_dispatch_tool`] — argumenté dans [`pr_review_groom`].
     if proprietes.territoire_handler && outil == "run_claude_pilot_groom" {
         return Some(RaisonDesarmement::TerritoireSansGroom);
     }
@@ -10049,31 +9903,8 @@ fn raison_de_desarmement(
 /// required tools`, créé puis annulé trois tâches `Placeholder…`, et conclu à un
 /// `create_task` manquant — une fausse piste : le défaut était la contradiction.
 ///
-/// ## Et la même contradiction, par un second chemin (mika#3004)
-///
-/// Le 2026-10-30 17:14:38Z, trace `3b771914`, un tour de mika-dev déclenché par
-/// un webhook `pr_review` sur mika#2968 — dont la PR #2982 était ouverte et le
-/// plan convergé — s'est vu exiger `run_claude_pilot_groom`. Il a pris le même
-/// re-prompt, créé une tâche parente « Groom mika#2968 », et ses deux enfants ont
-/// rendu `auto_skipped` / `already_groomed` en trois secondes. Coût : deux tours
-/// A2A pour aucun travail.
-///
-/// La branche 4 de mika#2757 n'a pas mordu, pour **deux** raisons cumulées, et
-/// c'est la seconde qui décide de la forme de la correction :
-///
-/// - *cause A* — le territoire des handlers qa / ci est **sorti** du domaine
-///   Webhook Fallthrough par conception (`self-dev-webhook-qa` / `-ci` y portent
-///   des dispatchs légitimes), donc `interdit_dispatch` y vaut `false` ;
-/// - *cause B* — le texte jugé était celui d'**après** les handlers. Sur ce
-///   tour-là `verdict_handler` avait remplacé `req.text` par un pré-digest
-///   commençant par `<verdict_handler>\n`, si bien que tout prédicat de préfixe
-///   répondait *« ce n'est pas un événement GitHub »* sur un tour qui en était
-///   un.
-///
-/// Un vol qui n'aurait traité que la cause A aurait été **vert sur une fixture
-/// d'événement brut et rouge en production** : c'est pourquoi
-/// [`AgentParams::webhook_event_text`] voyage, et pourquoi la fixture de bout en
-/// bout porte les deux textes à la fois.
+/// La même contradiction a un second chemin — trace `3b771914`, un tour
+/// `pr_review` sur une PR ouverte : [`pr_review_groom`] (mika#3004).
 ///
 /// **Le principe (plan § 2.1).** Une exigence que le tour lui-même rend
 /// impossible à satisfaire est une contradiction, et le moteur la désarme **en la
@@ -10090,11 +9921,9 @@ fn raison_de_desarmement(
 /// 4. **l'outil est servi mais le tour interdit qu'il réussisse** — un outil de
 ///    dispatch sur un message du domaine Webhook Fallthrough —
 ///    `INFO event = "required_tool_disarmed", reason = "turn_forbids_dispatch"` ;
-/// 5. **l'outil est servi, le tour autorise le dispatch, mais c'est le
-///    territoire d'un handler qui a déjà traité l'événement** — l'outil de groom
-///    sur un `[GitHub] PR …` ou `[GitHub] Check suite …` —
-///    `INFO event = "required_tool_disarmed", reason = "handler_territory_forbids_groom"`
-///    (mika#3004).
+/// 5. **c'est le territoire d'un handler qui a déjà traité l'événement** —
+///    `INFO … reason = "handler_territory_forbids_groom"` ; `INFO` parce que sa
+///    population est mesurément non vide (mika#3004 — [`pr_review_groom`]).
 ///
 /// **Cet ordre est la propriété, pas une préférence de lecture.** Un outil MCP
 /// testimony n'est jamais servi — [`crate::mcp::retain_publiables`] l'a retiré du lot
@@ -10127,15 +9956,6 @@ fn raison_de_desarmement(
 /// doctrine bannit. C'est une configuration à corriger, comme la branche 1, pas
 /// un tour qui restreint.
 ///
-/// **La branche 5 est un `INFO`, et sa population est mesurément non vide
-/// (mika#3004).** C'est le volume des webhooks de PR et de suite de checks de la
-/// boucle autonome, avec un mot `groom` dans le corps du ticket — l'incident
-/// mesuré, et non une forme imaginée. Son `reason` lui est propre, donc un
-/// `GROUP BY reason` la sépare des quatre autres : deux populations sous un même
-/// nom ne sont pas soustractibles (mika#2205). **L'absence de cette ligne ne dit
-/// rien d'autre que « le binaire précède le vol »** tant que `make deploy` n'a
-/// pas tourné (mika#2340) : l'instrument n'est pas vivant avant.
-///
 /// **Aucune capacité n'est retirée.** La valeur rendue n'est lue que par le
 /// re-prompt `required_tools` et par `has_terminal_required_tool_failure` ; rien
 /// d'autre ne la voit. L'outil reste dans le tableau servi quand il y était, le
@@ -10146,11 +9966,8 @@ fn raison_de_desarmement(
 /// `served` est le tableau d'outils réellement servi au modèle (#862) et
 /// `turn_message` la chaîne sur laquelle les `INTENT_GUARDS` sont évalués ; voir
 /// le site d'appel pour ce que le partage de ce binding garantit.
-///
-/// `webhook_event_text` est le texte de l'événement d'AVANT les handlers de
-/// `server/`, et c'est lui qui est jugé quand il existe — voir
-/// [`ProprietesDuTour::depuis`] pour pourquoi `turn_message` ne peut pas répondre
-/// de la classe d'un tour webhook.
+/// `webhook_event_text` est le texte d'AVANT les handlers, et c'est lui qui est
+/// jugé quand il existe (mika#3004).
 fn filter_available_required_tools(
     required: &HashSet<String>,
     tools: &ToolRegistry,
@@ -10217,16 +10034,14 @@ fn filter_available_required_tools(
                     false
                 }
 
-                // Branche 5 — ce territoire-ci n'a pas de groom à faire (mika#3004).
+                // Branche 5 — rien à groomer sur ce territoire (mika#3004).
                 Some(RaisonDesarmement::TerritoireSansGroom) => {
                     info!(
                         event = "required_tool_disarmed",
                         tool = %t,
                         reason = "handler_territory_forbids_groom",
-                        "this turn is the territory of a server/ handler that has already \
-                         processed the event (PR / check-suite), so there is nothing left to \
-                         groom and the groom tool cannot be required — disarming the \
-                         requirement (mika#3004)"
+                        "a server/ handler already processed this event (PR / check-suite): \
+                         nothing left to groom (mika#3004)"
                     );
                     false
                 }
@@ -16611,7 +16426,8 @@ mod tests {
 
     // -- filter_available_required_tools tests (#516, #517) --
 
-    fn make_resolved_skill_tool(name: &str) -> ResolvedSkillTool {
+    // mika#3004 — ouvert au frère `pr_review_groom`, et pas plus haut.
+    pub(in crate::agent_loop) fn make_resolved_skill_tool(name: &str) -> ResolvedSkillTool {
         ResolvedSkillTool {
             definition: ToolDefinition {
                 name: name.to_string(),
@@ -16626,7 +16442,7 @@ mod tests {
     }
 
     /// Create a ToolRegistry with a single dummy builtin tool named `name`.
-    fn make_registry_with_tool(name: &'static str) -> ToolRegistry {
+    pub(in crate::agent_loop) fn make_registry_with_tool(name: &'static str) -> ToolRegistry {
         struct DummyBuiltin(&'static str);
         #[async_trait::async_trait]
         impl crate::tools::Tool for DummyBuiltin {
@@ -16655,7 +16471,7 @@ mod tests {
 
     /// mika#2757 — le tableau d'outils servi (`enabled_tool_names`, #862) pour un
     /// cas qui ne mesure pas le désarmement : tout ce qui est exigé est servi.
-    fn served(names: &[&str]) -> HashSet<String> {
+    pub(in crate::agent_loop) fn served(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| (*n).to_string()).collect()
     }
 
@@ -16671,7 +16487,7 @@ mod tests {
             None,
             &served(&["run_gh"]),
             "",
-            None, // mika#3004 — hors chemin webhook
+            None,
         );
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains("run_gh"));
@@ -16689,7 +16505,7 @@ mod tests {
             None,
             &served(&["run_shell", "nonexistent"]),
             "",
-            None, // mika#3004 — hors chemin webhook
+            None,
         );
         assert!(
             filtered.is_empty(),
@@ -16712,7 +16528,7 @@ mod tests {
             None,
             &served(&["qa_pr_review"]),
             "",
-            None, // mika#3004 — hors chemin webhook
+            None,
         );
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains("qa_pr_review"));
@@ -16733,7 +16549,7 @@ mod tests {
     /// `github_event_format::mask_cited_branch`) ne lit que le marqueur
     /// `(branch: …)` de la première ligne, donc il ne le couvre pas. C'est
     /// exactement la seconde occurrence que ce vol doit couvrir.
-    const TICKET_2750_CLOSED_MSG: &str = "[GitHub] Issue closed: senara-solutions/mika#2750 — un dispatch ready-label qui échoue\n\nLe dispatch auto-groom s'est interrompu avant d'ouvrir la session.\n";
+    pub(in crate::agent_loop) const TICKET_2750_CLOSED_MSG: &str = "[GitHub] Issue closed: senara-solutions/mika#2750 — un dispatch ready-label qui échoue\n\nLe dispatch auto-groom s'est interrompu avant d'ouvrir la session.\n";
 
     /// mika#2757 — l'AC, de bout en bout :
     /// `match_skills` → `collect_required_tools` → `filter_available_required_tools` → `∅`.
@@ -16774,8 +16590,6 @@ mod tests {
             None,
             &served(&["run_claude_pilot_groom"]),
             TICKET_2750_CLOSED_MSG,
-            // mika#3004 — `None` : le tour d'origine est un `issues.closed` que
-            // nul handler n'a réécrit, donc le texte jugé est bien celui-ci.
             None,
         );
 
@@ -16816,7 +16630,7 @@ mod tests {
             None,
             &served(&["run_claude_pilot_groom"]),
             HUMAN_MSG,
-            None, // mika#3004 — une demande humaine n'a pas de texte d'avant
+            None,
         );
 
         assert_eq!(
@@ -16839,7 +16653,7 @@ mod tests {
             None,
             &served(&["run_gh", "run_shell"]),
             "",
-            None, // mika#3004 — hors chemin webhook
+            None,
         );
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains("run_gh"));
@@ -16873,8 +16687,6 @@ mod tests {
             None,
             &served(&["run_claude_pilot_groom"]),
             TICKET_2750_CLOSED_MSG,
-            // mika#3004 — `None` : le tour d'origine est un `issues.closed` que
-            // nul handler n'a réécrit, donc le texte jugé est bien celui-ci.
             None,
         );
 
@@ -16900,7 +16712,7 @@ mod tests {
             None,
             &served(&["run_claude_pilot_groom"]),
             "groom mika#2750",
-            None, // mika#3004 — une demande humaine n'a pas de texte d'avant
+            None,
         );
 
         assert_eq!(
@@ -16930,7 +16742,7 @@ mod tests {
             // Le tour ne sert pas `create_task`, alors que le registre le connaît.
             &served(&["run_gh"]),
             TICKET_2750_CLOSED_MSG,
-            None, // mika#3004 — un `issues.closed` que nul handler n'a réécrit
+            None,
         );
 
         assert!(
@@ -16963,7 +16775,7 @@ mod tests {
             None,
             &served(&["qa_pr_view", "run_gh"]),
             "[GitHub] PR review (approved) on senara-solutions/mika#2756 — vol 1 de mika#2755",
-            None, // mika#3004 — ce cas juge la paire de dispatch, pas le territoire
+            None,
         );
 
         assert_eq!(
@@ -16990,7 +16802,7 @@ mod tests {
             None,
             &served(&["run_claude_pilot"]),
             "[GitHub] Issue labeled ready on senara-solutions/mika#1234 — un ticket prêt",
-            None, // mika#3004 — un `ready`-label que nul handler n'a réécrit
+            None,
         );
 
         assert_eq!(
@@ -17015,15 +16827,7 @@ mod tests {
         )
     }
 
-    /// Les propriétés d'un tour **neutre** : ni domaine interdit au dispatch, ni
-    /// territoire de handler (mika#3004).
-    ///
-    /// C'est le `false` que les sept cas ci-dessous passaient en sixième
-    /// position jusqu'à ce que la cinquième branche demande deux bits au lieu
-    /// d'un. Le texte est celui du cas bout en bout — une demande d'assistante
-    /// ordinaire, hors de toute surface de préfixe `[GitHub] …` — donc les deux
-    /// prédicats y répondent `false` **par construction** plutôt que par un
-    /// littéral que rien ne relie au domaine qu'il prétend décrire.
+    /// Le `false` d'avant mika#3004, rendu par les prédicats eux-mêmes.
     fn tour_neutre() -> ProprietesDuTour {
         ProprietesDuTour::depuis(None, "classe les notes de la semaine")
     }
@@ -17046,16 +16850,10 @@ mod tests {
         let mcp = mcp_avec_outil(outil, DataGrade::Testimony);
         let tools = ToolRegistry::new();
         let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let rien = served(&[]);
 
         assert_eq!(
-            raison_de_desarmement(
-                outil,
-                &tools,
-                &skill_map,
-                Some(&mcp),
-                &served(&[]),
-                tour_neutre()
-            ),
+            raison_de_desarmement(outil, &tools, &skill_map, Some(&mcp), &rien, tour_neutre()),
             Some(RaisonDesarmement::BanTestimony),
             "la raison doit nommer le ban doctrinal, pas `NonServi` — deux populations \
              sous les mêmes octets est la classe mika#2205, et une branche testimony \
@@ -17131,16 +16929,10 @@ mod tests {
         let mcp = mcp_avec_outil(outil, DataGrade::Operational);
         let tools = ToolRegistry::new();
         let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let rien = served(&[]);
 
         assert_eq!(
-            raison_de_desarmement(
-                outil,
-                &tools,
-                &skill_map,
-                Some(&mcp),
-                &served(&[]),
-                tour_neutre()
-            ),
+            raison_de_desarmement(outil, &tools, &skill_map, Some(&mcp), &rien, tour_neutre()),
             Some(RaisonDesarmement::NonServi),
             "un outil MCP non banni et non servi relève de la branche 3, pas de la 2"
         );
@@ -17175,13 +16967,8 @@ mod tests {
     /// tour dont le domaine interdit le dispatch : `TourInterditDispatch`. Les
     /// propriétés du tour entrent déjà calculées (mika#2757 — le domaine est une
     /// propriété du tour), et l'insertion de la branche 2 ne les a pas déplacées.
-    ///
-    /// Depuis mika#3004 le sixième paramètre porte **deux** bits plutôt qu'un, et
-    /// ce cas passe le texte de l'`issues.closed` lui-même au lieu d'un `true`
-    /// littéral : c'est le prédicat de domaine qui décide, pas l'auteur du test.
-    /// La branche 5, qui vient après, ne peut pas voler cette réponse — un
-    /// `issues.closed` est du domaine Fallthrough, donc hors du territoire des
-    /// handlers par construction depuis D1.
+    /// Depuis mika#3004 le texte de l'`issues.closed` remplace le `true` littéral :
+    /// c'est le prédicat qui décide, et la branche 5 ne peut pas voler la réponse.
     #[test]
     fn mika2814_un_outil_de_dispatch_reste_desarme_par_le_tour() {
         let tools = make_registry_with_tool("run_claude_pilot_groom");
@@ -17197,8 +16984,7 @@ mod tests {
                 ProprietesDuTour::depuis(None, TICKET_2750_CLOSED_MSG)
             ),
             Some(RaisonDesarmement::TourInterditDispatch),
-            "la branche du tour reste la dernière des deux branches de domaine, et elle \
-             répond toujours"
+            "la branche du tour reste la dernière, et elle répond toujours"
         );
     }
 
@@ -17251,7 +17037,7 @@ mod tests {
             Some(&mcp),
             &served(&["create_task"]),
             "classe les notes de la semaine",
-            None, // mika#3004 — ce tour-ci ne vient pas d'un webhook du tout
+            None,
         );
 
         assert_eq!(
@@ -17260,234 +17046,6 @@ mod tests {
             "l'exigence testimony doit disparaître du lot effectif et le builtin y rester \
              — un lot vide dirait autre chose (classe mika#2205)"
         );
-    }
-
-    // -- territoire de handler sans groom (mika#3004) --
-
-    /// Le texte **brut** de l'événement webhook de la trace
-    /// `3b771914-d485-11f1-8e41-923f9687bff8` (AC3), tel que la passerelle le
-    /// compose pour un `pull_request_review` (`mika-gateway/src/github.rs`, bras
-    /// `"pull_request_review"`).
-    ///
-    /// **Ce que la trace atteste** : le dépôt, le ticket mika#2968, la PR #2982
-    /// ouverte, le déclencheur `pr_review`, le candidat `review_verdict`. **Ce
-    /// qu'elle n'atteste pas** : l'état de la revue, son auteur et le titre de la
-    /// PR — remplis ici par les valeurs nominales du flux qa. Aucune assertion
-    /// ci-dessous ne dépend d'un de ces trois champs : le prédicat interrogé ne
-    /// lit que le **préfixe** de la première ligne.
-    const PR_REVIEW_3004_EVENT: &str = "[GitHub] PR review (changes_requested) on \
-         senara-solutions/mika#2968 (fix(2968)) by @mika-platform-qa\n\
-         https://github.com/senara-solutions/mika/pull/2982";
-
-    /// Le **pré-digest** que `verdict_handler` substitue à `req.text` avant
-    /// `run_agent`, sur le modèle exact de ses dix sites de construction.
-    ///
-    /// **C'est la cause B du vol, et elle tient à une seule propriété** : ce texte
-    /// ne commence pas par `[GitHub] PR ` — il commence par `<verdict_handler>`,
-    /// et la ligne de l'événement y est la **deuxième**. Un prédicat de préfixe
-    /// interrogé là-dessus répond donc « hors territoire des handlers » sur le
-    /// tour même qu'un handler vient de traiter.
-    const PR_REVIEW_3004_PRE_DIGEST: &str = "<verdict_handler>\n\
-         [GitHub] PR review (changes_requested) on senara-solutions/mika#2968 by \
-         @mika-platform-qa\n\
-         VERDICT: block[ac] — un correctif est déjà en vol pour la tâche c4776ac0.\n\n\
-         Wait for the active callback to finish before taking further action.\n\
-         </verdict_handler>";
-
-    /// Un `check_suite` brut, sur le modèle de `mika-gateway/src/github.rs` bras
-    /// `"check_suite"` (trois lignes depuis mika#2917 ; seule la première est
-    /// lue par les quatre lecteurs du moteur).
-    const CHECK_SUITE_3004_EVENT: &str = "[GitHub] Check suite failure on \
-         senara-solutions/mika (branch: fix/2968/relance-de-groom)\n\
-         head: 0000000000000000000000000000000000000000\n\
-         prs: #2982";
-
-    /// **Le cœur d'AC1 et la première moitié d'AC2.** Le tour `pr_review` de la
-    /// fixture n'exige plus `run_claude_pilot_groom`.
-    ///
-    /// La seconde assertion est ce qui **nomme la cause B** : jugée sur le seul
-    /// texte du tour — exactement ce que faisait la production avant ce vol —
-    /// l'exigence survit intacte. Les deux appels ne diffèrent que par le texte
-    /// d'événement, donc ce test sépare « la cinquième branche existe » de « la
-    /// cinquième branche est alimentée par le bon texte ». Sans lui, un vol qui
-    /// n'aurait traité que la cause A serait vert ici et rouge en production.
-    #[test]
-    fn mika3004_un_tour_pr_review_desarme_lexigence_de_groom() {
-        let tools = make_registry_with_tool("run_claude_pilot_groom");
-        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let required: HashSet<String> = ["run_claude_pilot_groom".to_string()].into();
-
-        let effective = filter_available_required_tools(
-            &required,
-            &tools,
-            &skill_map,
-            None,
-            &served(&["run_claude_pilot_groom"]),
-            PR_REVIEW_3004_PRE_DIGEST,
-            Some(PR_REVIEW_3004_EVENT),
-        );
-
-        assert!(
-            effective.is_empty(),
-            "sur un tour `pr_review` d'un ticket dont la PR est ouverte, l'outil de groom \
-             ne peut pas être exigé — exigence restée : {effective:?}"
-        );
-
-        let juge_sur_le_pre_digest = filter_available_required_tools(
-            &required,
-            &tools,
-            &skill_map,
-            None,
-            &served(&["run_claude_pilot_groom"]),
-            PR_REVIEW_3004_PRE_DIGEST,
-            None,
-        );
-
-        assert_eq!(
-            juge_sur_le_pre_digest, required,
-            "contrôle de la cause B : le pré-digest de `verdict_handler` ne porte pas le \
-             préfixe de territoire en première ligne, donc un désarmement qui ne lirait que \
-             le texte du tour laisserait l'exigence debout — c'est l'état mesuré le \
-             2026-10-30 à 17:14:38Z, trace 3b771914"
-        );
-    }
-
-    /// **Le contrôle négatif de la largeur de la branche.** Sur ce même tour,
-    /// `run_claude_pilot` reste exigible.
-    ///
-    /// Ce n'est pas une précaution : `self-dev-webhook-qa` relance un pilote
-    /// d'implémentation sur un verdict `hold`, et `self-dev-webhook-ci` en relance
-    /// un sur un CI rouge. Une branche 5 élargie à [`is_dispatch_tool`] fermerait
-    /// ces deux flux — et tous les autres tests de ce fichier resteraient verts.
-    ///
-    /// Les deux exigences voyagent **ensemble** dans le même appel : un lot vide
-    /// et un lot correctement amputé ne doivent pas rendre les mêmes octets
-    /// (classe mika#2205).
-    #[test]
-    fn mika3004_le_meme_tour_laisse_run_claude_pilot_exigible() {
-        let tools = make_registry_with_tool("run_claude_pilot_groom");
-        let run_claude_pilot = make_resolved_skill_tool("run_claude_pilot");
-        let mut skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        skill_map.insert("run_claude_pilot".to_string(), &run_claude_pilot);
-        let required: HashSet<String> = [
-            "run_claude_pilot_groom".to_string(),
-            "run_claude_pilot".to_string(),
-        ]
-        .into();
-
-        let effective = filter_available_required_tools(
-            &required,
-            &tools,
-            &skill_map,
-            None,
-            &served(&["run_claude_pilot_groom", "run_claude_pilot"]),
-            PR_REVIEW_3004_PRE_DIGEST,
-            Some(PR_REVIEW_3004_EVENT),
-        );
-
-        assert_eq!(
-            effective,
-            HashSet::from(["run_claude_pilot".to_string()]),
-            "seul le groom est impossible sur un territoire de handler ; le dispatch \
-             d'implémentation y est un flux légitime (relance sur `hold`, relance sur CI \
-             rouge)"
-        );
-    }
-
-    /// **L'ordre des branches 3 et 5, et l'état que la production ne produit
-    /// pas.** Les deux faits sont dans le même test parce que le second n'a de
-    /// sens qu'énoncé à côté du premier.
-    ///
-    /// *Premier fait, celui de la production* : sur un tour `check_suite`,
-    /// [`filter_ci_excluded_tools`] (mika#1324) a déjà retiré les deux outils de
-    /// dispatch du tableau servi. La branche **3** répond donc première, et la
-    /// branche 5 n'est jamais atteinte là. C'est voulu — AC1 demande que
-    /// l'exigence ne tienne pas, pas qu'elle tombe sous un nom particulier.
-    ///
-    /// *Second fait* : si l'outil arrive quand même *servi*, la branche 5 répond.
-    /// Cet état-là, la production ne le produit pas ; ce cas mesure donc une
-    /// **forme** et non un tour, et il le dit dans son message d'assertion pour
-    /// qu'on ne le lise jamais comme une mesure de la production.
-    #[test]
-    fn mika3004_un_check_suite_repond_sous_non_servi_en_production() {
-        let tools = make_registry_with_tool("run_claude_pilot_groom");
-        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let proprietes = ProprietesDuTour::depuis(Some(CHECK_SUITE_3004_EVENT), "peu importe");
-
-        assert_eq!(
-            raison_de_desarmement(
-                "run_claude_pilot_groom",
-                &tools,
-                &skill_map,
-                None,
-                &served(&[]),
-                proprietes
-            ),
-            Some(RaisonDesarmement::NonServi),
-            "en PRODUCTION, `filter_ci_excluded_tools` (mika#1324) a déjà retiré l'outil du \
-             tableau servi sur un tour `check_suite` : la branche 3 répond première et la \
-             branche 5 n'y est jamais atteinte — si cette assertion rougit, c'est que \
-             l'exclusion ci a changé, pas que le désarmement est cassé"
-        );
-
-        assert_eq!(
-            raison_de_desarmement(
-                "run_claude_pilot_groom",
-                &tools,
-                &skill_map,
-                None,
-                &served(&["run_claude_pilot_groom"]),
-                proprietes
-            ),
-            Some(RaisonDesarmement::TerritoireSansGroom),
-            "état que la production ne produit PAS (un `check_suite` ne sert pas les outils \
-             de dispatch) : ce cas épingle la forme de la branche 5, pas un tour réel — il \
-             est ce qui garantit qu'elle n'est pas morte si l'exclusion ci disparaissait"
-        );
-    }
-
-    /// **Les deux bits se lisent sur UN texte, et ils sont disjoints.**
-    ///
-    /// `mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs` tient déjà la
-    /// disjonction des deux **prédicats** sur deux matrices. Ce que ce test
-    /// ajoute, et qu'aucun test de `webhook_dispatch` ne peut voir, est la
-    /// propriété de [`ProprietesDuTour::depuis`] : le texte jugé est **le même**
-    /// pour les deux. Deux `bool` parallèles auraient permis de les calculer sur
-    /// deux textes différents — un sur l'événement, l'autre sur le tour — et la
-    /// disjonction aurait cessé de tenir sans qu'aucun prédicat ne change.
-    ///
-    /// Le couple choisi le montre par l'absurde : le texte du tour est un
-    /// `issues.closed`, du domaine Fallthrough, donc `interdit_dispatch` serait
-    /// vrai s'il était lu ; c'est le texte d'événement qui décide, et lui seul.
-    #[test]
-    fn mika3004_les_deux_proprietes_du_tour_sont_disjointes() {
-        let sur_levenement =
-            ProprietesDuTour::depuis(Some(PR_REVIEW_3004_EVENT), TICKET_2750_CLOSED_MSG);
-
-        assert!(
-            sur_levenement.territoire_handler,
-            "le texte d'événement est un `[GitHub] PR …` : c'est lui qui est jugé"
-        );
-        assert!(
-            !sur_levenement.interdit_dispatch,
-            "et le texte du tour — un `issues.closed`, pourtant du domaine Fallthrough — ne \
-             l'est pas : un seul texte alimente les deux bits"
-        );
-
-        for texte in [
-            PR_REVIEW_3004_EVENT,
-            CHECK_SUITE_3004_EVENT,
-            TICKET_2750_CLOSED_MSG,
-            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 — un ticket prêt",
-            "classe les notes de la semaine",
-        ] {
-            let p = ProprietesDuTour::depuis(None, texte);
-            assert!(
-                !(p.interdit_dispatch && p.territoire_handler),
-                "les deux axes sont exclusifs par construction depuis mika#3004 — le domaine \
-                 Fallthrough lit le territoire des handlers en négation ; texte : {texte:?}"
-            );
-        }
     }
 
     // -- resolve_skill_llm_override tests (#463) --
