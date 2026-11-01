@@ -511,7 +511,7 @@ the refusal is fail-closed and, since mika#2338, fail-visible (the disposition b
 
 **Since mika#2794 the corrective re-prompt names the anchor that failed.** The verdict carries
 `per_anchor: Vec<AnchorOutcome>` — label, excerpt, refusal — and
-`agent_loop::format_anchor_diagnosis` turns it into the paragraph the model reads: the accepted
+`review_anchor::format_anchor_diagnosis` turns it into the paragraph the model reads: the accepted
 anchors by name (so the correction is local rather than a rewrite of all three), the refused
 ones with the start of what they said, and — gated on `QuoteNotInBrief` — the usual cause,
 stated as a likelihood: a quote absent from the brief generally comes from a document read with
@@ -644,11 +644,11 @@ there"* are two populations, and asserting the second from the first is how an i
 mark and the start of its prose, and no document contains that string. The search uses the
 matcher's own `find_brief_quote_range` over the normalized excerpt (trailing `…` removed), at a
 window clamped to `[ATTRIBUTION_MIN_QUOTE_CHARS = 40, ANCHOR_EXCERPT_CHARS = 72]` —
-`min_quote_chars.min(72).max(40)`. The floor is deliberate: a 12-character window would attribute
+`min_quote_chars.clamp(40, 72)`. The floor is deliberate: a 12-character window would attribute
 on a common phrase. Only a `QuoteNotInBrief` refusal is attributed at all; every other refusal
 reason returns `None` and changes no wording.
 
-**The re-prompt.** `format_anchor_diagnosis` takes the attributions indexed **in parallel with
+**The re-prompt.** `review_anchor::format_anchor_diagnosis` takes the attributions indexed **in parallel with
 `per_anchor`** (not "in refused order" — the pairing is positional, and a test pins that), and
 emits one indicative line per attributed anchor: *"A1 quotes, word for word, what the `<tool>`
 tool returned during this turn — not the brief. This is measured, not guessed: the engine searched
@@ -665,8 +665,9 @@ passes. A third line now does:
 |---|---|---|
 | `event = "guard.review_anchor_armed"` | INFO (`target: "mika::otel"`) | **one per guard evaluation**, on every armed branch including the healthy one |
 
-It carries `anchors_found`, `anchors_valid`, `brief_chars`, `withheld: bool` and
-`attributed_sources`. Three reading rules:
+It is emitted by `review_anchor::ArmedPassage::emit`, which also accumulates what the line
+reports across the guard's two branches. It carries `anchors_found`, `anchors_valid`,
+`brief_chars`, `withheld: bool` and `attributed_sources`. Three reading rules:
 
 - **One line per PASS, not per turn.** A turn that re-prompts emits two: the re-prompt's
   (`withheld: false`) and the following pass's. Counting turns would under-state the denominator
