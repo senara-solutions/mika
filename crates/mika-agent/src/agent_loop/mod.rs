@@ -90,6 +90,24 @@ fn has_verdict_producer_skill(skills: &[crate::skills::index::SkillEntry]) -> bo
         .any(|s| VERDICT_PRODUCER_SKILLS.contains(&s.manifest.skill.name.as_str()))
 }
 
+/// mika#3002 — lequel des skills **injectés sur ce tour** produit un verdict, pour la
+/// sonde `guard.resume_scope_stood_down`.
+///
+/// Ne mesure PAS la même population que [`has_verdict_producer_skill`], et c'est la seule
+/// chose qu'un lecteur de la sonde doit savoir : le discriminant `is_verdict_producer` est
+/// résolu sur le registre **entier** (`params.skills.skills()`), celui-ci sur les entrées
+/// **appariées** au tour. Un skill au registre sans être apparié rend donc le champ `skill`
+/// **absent** sur une ligne pourtant émise. Absent n'est pas « aucun skill » (motif
+/// mika#2331) : c'est « le tour appartenait à la population sans que l'entrée soit
+/// injectée » — en pratique un contrat `always_on` retiré, et une anomalie à lire comme
+/// telle plutôt qu'un zéro.
+fn verdict_producer_skill_name(loaded: &[String]) -> Option<&str> {
+    loaded
+        .iter()
+        .map(String::as_str)
+        .find(|name| VERDICT_PRODUCER_SKILLS.contains(name))
+}
+
 /// Fallback message sent when the agent completes without producing text output
 /// (e.g., all work done via tool calls).
 pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
@@ -3680,6 +3698,38 @@ async fn run_loop(
                             if intent_guard_retries.contains(guard.label) {
                                 continue; // already fired once — single-retry semantics
                             }
+                            // mika#3002 — le contrôle positif de la paire (doctrine
+                            // mika#2205). Sans cette ligne, « la garde ne tire plus sur
+                            // les plans » et « aucune revue d'architecte n'a eu lieu dans
+                            // la fenêtre » rendent les mêmes octets : AC3 compte des
+                            // relances, et zéro relance a deux causes de signe opposé.
+                            // Elle n'est émise que quand le rétrécissement a RÉELLEMENT
+                            // changé l'issue de ce tour — pas à chaque tour de revue.
+                            if guard.scope.stood_down(
+                                guard.trigger,
+                                &user_input_text,
+                                is_verdict_producer,
+                            ) {
+                                info!(
+                                    target: "mika::otel",
+                                    event = "guard.resume_scope_stood_down",
+                                    intent_guard = guard.label,
+                                    brief_chars = user_input_text.chars().count(),
+                                    // Présence des DEUX marqueurs, pas vacuité des deux
+                                    // régions : `outside_reviewed_plan` rend `("", "")`
+                                    // aussi bien sur un brief sans enveloppe que sur une
+                                    // enveloppe aux régions vides, et c'est précisément
+                                    // ces deux cas qu'il faut pouvoir séparer à la
+                                    // lecture — le premier est la première passe, le
+                                    // second serait un défaut du shell.
+                                    envelope = user_input_text
+                                        .contains(review_anchor::RETRY_PLAN_BEGIN)
+                                        && user_input_text
+                                            .contains(review_anchor::RETRY_PLAN_END),
+                                    skill = verdict_producer_skill_name(loaded_skill_names),
+                                    "Resume-intent guard stood down — the trigger words live in the reviewed plan"
+                                );
+                            }
                             if guard.scope.triggered(
                                 guard.trigger,
                                 &user_input_text,
@@ -3690,7 +3740,15 @@ async fn run_loop(
                                 warn!(
                                     step,
                                     label = mode.label(),
+                                    // mika#3002 — nommée pour être comptée : AC3 compte
+                                    // les relances de `resume_reconcile` sur vingt revues,
+                                    // et `is_verdict_producer` dit si le tour appartenait à
+                                    // la population du rétrécissement. Une garde qui tire
+                                    // avec ce champ à `true` est une fuite du stand-down,
+                                    // pas une relance ordinaire.
+                                    event = "guard.intent_precondition_fired",
                                     intent_guard = guard.label,
+                                    is_verdict_producer,
                                     "Intent-precondition guard fired — re-prompting"
                                 );
                                 request.messages.push(LlmMessage {

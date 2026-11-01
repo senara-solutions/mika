@@ -194,6 +194,39 @@ closes the ticket's question; pretending it does not exist would not.
 redden, someone "fixed" the intra-invocation carry-over believing they were
 closing mika#2305 — restore, and read the retry row.
 
+**Sur un tour de revue, la garde de reprise lit le brief MOINS le plan (mika#3002).**
+Un plan de groom parle de reprise parce que c'est son sujet, et l'`INTENT_GUARD`
+`resume_reconcile` relançait mika-arch sur ces mots-là. Mesuré le 2026-10-31,
+première passe du groom de mika#2995, trace `3a066c59` : l'architecte répond en
+264 caractères qu'il a cherché des engagements actifs « comme demandé par
+l'instruction de reprise », sans ligne `Disposition:` — donc `UNPARSED`, donc la
+relance de mika#1823. Depuis mika#2997 la relance porte aussi le plan, donc la
+garde pouvait tirer à **chaque** tour de relance. `IntentPrecondition` porte
+désormais un champ `scope: IntentScope` : `resume_reconcile` déclare
+`OutsideReviewedPlan`, et sur un tour de revue — `is_verdict_producer`, résolu
+depuis `VERDICT_PRODUCER_SKILLS` — son déclencheur est évalué sur le complément du
+plan (`review_anchor::outside_reviewed_plan`, frère exact d'`anchor_reference` sur
+les deux mêmes marqueurs). Partout ailleurs, et pour les cinq autres entrées, le
+message entier. Pas de `Default` sur `IntentScope`, délibérément : une nouvelle
+entrée ne compile pas sans nommer sa portée.
+
+**AC3 se lit en PAIRE, et une seule des deux lignes ne répond pas.** `guard.intent_precondition_fired`
+(WARN) porte `intent_guard` et `is_verdict_producer` : c'est le compte de relances
+qu'AC3 demande, et une relance de `resume_reconcile` avec ce champ à `true` est une
+fuite du stand-down, pas une relance ordinaire. `guard.resume_scope_stood_down`
+(INFO, `target: "mika::otel"`) porte `brief_chars`, `envelope`, `skill`, et n'est
+émise que quand le rétrécissement a **réellement** changé l'issue du tour. Sans
+elle, « la garde ne tire plus sur les plans » et « aucune revue d'architecte n'a
+eu lieu dans la fenêtre » rendent zéro tous les deux (classe mika#2205) — et la
+cible d'AC3 *est* zéro. `envelope` est la présence des deux marqueurs, jamais la
+vacuité des régions : `outside_reviewed_plan` rend `("", "")` aussi bien sur une
+première passe sans enveloppe que sur une enveloppe aux régions vides, et ces deux
+cas ne se lisent pas pareil. `skill` est **absent** — pas `""` — quand le skill est
+au registre sans être apparié au tour, parce que le discriminant lit le registre
+entier et ce champ les entrées appariées (motif mika#2331). **L'absence de la ligne
+elle-même ne veut pas dire « pas de stand-down » mais « binaire antérieur au vol »**
+(mika#2340) : l'instrument n'est pas vivant avant `make deploy`.
+
 ## Tools
 
 Reference moved to [`docs/agent-internals/tools.md`](../../docs/agent-internals/tools.md) (160 KB). Read it before changing this subsystem, and document new material there, not here.
