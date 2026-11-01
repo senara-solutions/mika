@@ -6,6 +6,25 @@
 > **Plan antérieur :** `docs/plans/2026-11-01-004-fix-3004-dispatch-un-tour-pr-review-de-mika-dev-plan.md`
 > (624 lignes, draft #3009). **Matière, pas plan à rejouer** — § 6 dit ce qui en est repris et ce qui en est écarté.
 
+> **Second groom du 2026-11-01 — ce qui a été re-mesuré, et ce qui a changé.**
+> Toutes les mesures des § 1.3 et § 1.4 ont été refaites à la main et
+> **confirmées** : `mod.rs` à 1 044 559 octets sur `main` et 1 071 667 sur la
+> branche, `LARGE_FILE_ALLOWLIST` vide, le recensement à frontière de mot à
+> 7 sites dans 4 fichiers, `cargo check -p mika-cli` à exactement deux `E0063`,
+> et les trois tests de bout en bout verts. Trois faits **nouveaux** sont entrés,
+> et ils changent le plan :
+>
+> 1. **La draft #3009 est ouverte et sa branche distante vit** — le corps du
+>    ticket l'annonce fermée et sa branche supprimée. C'est faux à la mesure, et
+>    cela décide de la fin de pipeline (§ 1.5).
+> 2. **Un troisième défaut de livraison** — le marqueur durable
+>    `clippy-errors-need-human` sur #3009, dont la cause est mesurée et n'est pas
+>    une lint (§ 1.5).
+> 3. **G1 avait une contradiction interne** : son § 3.1 descendait `tour_neutre()`
+>    et ses quatre tests, pendant que sa DoD interdisait tout élargissement de
+>    visibilité — or le déplacement en exige un. Les deux sont corrigés, et
+>    l'élargissement est désormais nommé et borné (§ 3.1).
+
 ---
 
 ## 1. Le point de départ, mesuré — et il n'est pas `main`
@@ -121,6 +140,60 @@ n'implémentent pas `Default`. Pas de constructeur non plus : deux éditions d'u
 ligne coûtent moins qu'un constructeur à trente paramètres. **Le plan dit
 donc : deux éditions à la main, `webhook_event_text: None`.**
 
+### 1.5 Défaut de livraison nº 3 — et l'état réel de la draft #3009
+
+**Le corps du ticket dit : « La draft #3009 est fermée sans merge avant le
+`ready`, et sa branche est supprimée. » Mesuré le 2026-11-01, c'est faux, et
+c'est la mesure qui décide.**
+
+```
+$ gh pr view 3009 --repo senara-solutions/mika --json state,isDraft,headRefOid
+{"state":"OPEN","isDraft":true,"headRefOid":"8da087abde87535e6ac69336f4db1c0f447c73e2"}
+$ git ls-remote --heads origin 'fix/3004*'
+8da087abde87535e6ac69336f4db1c0f447c73e2  refs/heads/fix/3004/…-de-mika-dev
+```
+
+#3009 est **OPEN**, en draft, et sa tête distante est exactement le `HEAD` local.
+L'intention de l'opérateur n'a pas été exécutée ; le travail n'est donc pas
+seulement lisible par `refs/pull/3009/head`, il est **sur la branche vivante que
+ce vol va pousser**. Trois conséquences, et la première est celle qui coûte des
+tours si elle est apprise en fin de pipeline :
+
+1. **`gh pr create` échouera** — une PR existe déjà pour cette tête. Le re-vol
+   **pousse sur la branche et met à jour #3009** ; il n'en ouvre pas une
+   seconde. Voir la fin de pipeline au § 5.
+2. **Le titre de #3009 est un titre de commit** — « test(3004): la trace
+   3b771914 rejouée de bout en bout, avec ses deux contrôles » — hérité du
+   premier commit poussé. Il décrit un commit, pas la PR. À corriger
+   (`gh pr edit 3009 --title …`), avec le corps.
+3. **#3009 est hors du scan d'auto-resume, de façon permanente.** Commentaire du
+   2026-11-01 15:46:38Z de `mika-platform-dev` : auto-resume s'est arrêté sur
+   `clippy-errors-need-human` et a rendu la PR à un humain. L'exclusion est un
+   **marqueur durable** (mika#2199), pas le label `human-review-required` :
+   retirer un label ne réarme rien. Ce vol ne doit donc compter sur aucune
+   reprise automatique, et il n'a pas à chercher à lever l'exclusion.
+
+**Le défaut nº 3, et sa cause mesurée.** Le marqueur nomme clippy, mais il n'y a
+**aucune lint clippy** sur la branche :
+
+```
+$ cargo clippy -p mika-agent --all-targets      # propre, 0 erreur, 0 lint
+$ cargo clippy --workspace --all-targets
+error[E0063]: missing field `webhook_event_text` … (×2)
+error: could not compile `mika-cli` (bin "mika") due to 2 previous errors
+error: could not compile `mika-cli` (bin "mika" test) due to 2 previous errors
+```
+
+Les « erreurs clippy » **sont** les deux `E0063` du § 1.4 : clippy ne peut pas
+compiler `mika-cli`, donc il rend des erreurs de compilation sous son propre nom.
+C'est un fait utile et non une mauvaise nouvelle : **G2, deux lignes, ferme
+d'un coup *Check*, les deux *Darwin* et le motif du marqueur clippy.** Ce qu'il
+ne ferme pas, parce que rien ne le ferme, c'est l'exclusion d'auto-resume
+elle-même — durable par conception.
+
+Il n'existe donc pas de troisième geste à concevoir : il existe un troisième
+symptôme, qui a la même cause que le deuxième. Le re-vol reste à deux gestes.
+
 ---
 
 ## 2. AC1 — le site qui l'exigeait, nommé
@@ -198,18 +271,43 @@ Y descendent, tels quels ou condensés :
   `run_claude_pilot` ;
 - les trois constantes de fixture `PR_REVIEW_3004_EVENT`,
   `PR_REVIEW_3004_PRE_DIGEST`, `CHECK_SUITE_3004_EVENT` ;
-- l'aide de test `tour_neutre()` ;
 - les quatre tests unitaires
   `mika3004_un_tour_pr_review_desarme_lexigence_de_groom`,
   `mika3004_le_meme_tour_laisse_run_claude_pilot_exigible`,
   `mika3004_un_check_suite_repond_sous_non_servi_en_production`,
   `mika3004_les_deux_proprietes_du_tour_sont_disjointes`.
 
+**Ne descend PAS, contre ce que disait la version antérieure de ce plan :
+l'aide de test `tour_neutre()`.** Mesuré — elle est définie à `mod.rs:17027` et
+appelée six fois (`:17057`, `:17087`, `:17115`, `:17142`, `:17166`, `:17220`),
+**toutes par des tests qui n'ont rien à voir avec mika#3004** (la famille
+mika#2757 / mika#2750), et **aucune** par les quatre tests mika#3004, qui
+construisent `ProprietesDuTour::depuis(…)` directement. La descendre casserait
+six tests restants, ou forcerait un `pub(super)` sur une aide dont le seul
+usage réel est dans `mod.rs`. Elle reste où elle est.
+
+**Les deux élargissements de visibilité que G1 exige — nommés, bornés, et dont
+l'un seul concerne un test.** Un module enfant voit les items privés de ses
+ancêtres, mais **pas** ceux d'un module frère : `agent_loop::pr_review_groom`
+ne voit rien de `agent_loop::tests` (`mod tests` à `:12786`). D'où :
+
+| item | visibilité | pourquoi, et pour qui |
+|---|---|---|
+| `ProprietesDuTour` + `ProprietesDuTour::depuis` | `pub(super)` | pour la **production** : `mod.rs` les utilise à `:9990` (signature) et `:10165` (appel réel). Rien à voir avec un test. |
+| `make_resolved_skill_tool` (`:16614`), `make_registry_with_tool` (`:16629`) | `pub(in crate::agent_loop)` | pour les **quatre tests déplacés**, qui les appellent. Élargissement **minimal** : la portée est exactement l'ancêtre qui possède déjà les deux items, ni `pub(crate)`, ni `pub`. |
+
 Les tests déplacés continuent d'appeler `super::raison_de_desarmement` et
-`super::filter_available_required_tools`, qui restent privés à `agent_loop` : un
-module **enfant** voit les items privés de ses ancêtres. Aucune visibilité à
-élargir, et surtout **aucun `pub(crate)` à ajouter** — élargir une visibilité
-pour satisfaire un test est exactement ce que ce geste doit éviter.
+`super::filter_available_required_tools` **sans aucun changement de visibilité** :
+ceux-là sont des items privés de l'ancêtre `agent_loop`, donc visibles depuis
+l'enfant.
+
+L'alternative — dupliquer les deux aides dans `pr_review_groom::tests` — est
+écartée : deux constructeurs de registre qui dérivent séparément sont la forme
+dont ce ticket corrige déjà une instance une couche plus haut (§ 3.5, « deux
+booléens parallèles »). **La règle que la DoD porte est donc : aucune
+visibilité de code de production élargie pour un test, et tout élargissement de
+visibilité de test borné à `pub(in crate::agent_loop)`** — jamais `pub(crate)`,
+jamais `pub`.
 
 Ce qui reste dans `mod.rs`, et rien d'autre :
 
@@ -223,7 +321,14 @@ Ce qui reste dans `mod.rs`, et rien d'autre :
 | le bras de journalisation `handler_territory_forbids_groom` (INFO) | 4 |
 | signature de `raison_de_desarmement` / `filter_available_required_tools` (le `bool` devient `ProprietesDuTour`) | 3 |
 | la branche 5, en cinquième position, après la branche 4 | 4 |
-| mise à jour des ~20 sites d'appel de test existants (`false,` → `tour_neutre(),`) | ~20 remplacés, net ≈ 0 |
+| `tour_neutre()` et ses six appelants non-3004 : **inchangés, ils restent** | 0 |
+| deux mots-clés de visibilité sur les aides de test (§ ci-dessus) | 0 net (2 modifiées) |
+
+Les sites d'appel de test existants n'apparaissent pas dans ce tableau, et c'est
+une mesure et non un oubli : le premier vol les a **déjà** migrés vers
+`tour_neutre()`, qui ne bouge plus. Le re-vol n'a aucune édition de masse à
+refaire, ce qui est une des trois raisons pour lesquelles il tient en un vol
+(§ 11).
 
 **La discipline qui tient le budget : aucune prose explicative nouvelle dans
 `mod.rs`.** Chaque site y porte un marqueur `// mika#3004` et un lien
@@ -329,7 +434,9 @@ c'est un ticket à ouvrir, pas un geste à glisser dans celui-ci.
 | axes exclusifs | `cargo test -p mika-agent mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs` | passé |
 | définition unique du domaine | `cargo test -p mika-agent mika2517_the_fallthrough_domain_has_a_single_definition` | passé |
 | suite complète | `cargo test` | aucune régression |
-| lints | `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` | propres |
+| lints | `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` | propres — **et c'est la preuve que le motif du marqueur `clippy-errors-need-human` est parti** (§ 1.5) |
+| visibilités élargies | `git diff origin/main...HEAD -- '*.rs' \| grep -E '^\+.*pub(\(crate\))? (fn\|struct)'` | aucune ligne pour un item de production ; les seuls `pub(in crate::agent_loop)` sont les deux aides de test du § 3.1 |
+| PR cible | `gh pr view 3009 --repo senara-solutions/mika --json state,headRefOid` | `OPEN`, tête = `HEAD` poussé — **aucune seconde PR ouverte** |
 | pipeline | `scripts/verify-pipeline.sh origin/main` | propre |
 
 ---
@@ -342,13 +449,34 @@ c'est un ticket à ouvrir, pas un geste à glisser dans celui-ci.
 2. `refactor(3004): le domaine du tour descend dans son propre module` — G1.
    Plancher : les quatre tests unitaires passent depuis leur nouveau site, et
    `wc -c mod.rs` ≤ 1 046 159.
-3. `test(3004): les trois sondes de taille dans la DoD` — si la DoD demande une
-   assertion exécutable (voir § 10, la sonde de taille n'en est pas une : c'est
-   `scripts/check-secrets.sh` qui la porte, et il existe déjà).
+
+**Deux commits, et pas un troisième.** La version antérieure de ce plan en
+proposait un conditionnel (« des sondes de taille, si la DoD en demande ») : il
+est retiré. La sonde de taille n'est pas un livrable à écrire —
+`scripts/check-secrets.sh` la porte déjà et tourne en CI (§ 10). Un plan ne
+laisse pas un commit à la discrétion de l'implémenteur.
 
 Les commits 1 et 2 sont séparés **parce que le premier est le seul dont CI peut
 rendre compte sans le second** : un workspace qui ne compile pas ne dit rien de
 la taille d'un fichier.
+
+### 5.1 Fin de pipeline — il n'y a **pas** de `gh pr create`
+
+C'est le point que le § 1.5 rend actionnable, et il se joue aux derniers tours,
+là où les vols meurent. #3009 est OPEN sur exactement cette tête de branche :
+
+1. `git push` sur `fix/3004/dispatch-un-tour-pr-review-de-mika-dev`. La PR #3009
+   se met à jour d'elle-même, et CI se rejoue dessus.
+2. **Ne pas appeler `gh pr create`** — il refusera, une PR existe pour cette
+   tête. Si une tentative a quand même lieu et échoue, ce n'est pas un échec de
+   pipeline : la PR est #3009.
+3. Corriger le titre de #3009, qui est aujourd'hui un titre de commit :
+   `gh pr edit 3009 --repo senara-solutions/mika --title "fix(3004): un tour pr_review n'exige plus l'outil de groom"`,
+   et réécrire son corps (règle mika#2211 : `pr-body.md` à la racine du
+   worktree, `--body-file pr-body.md`, puis `rm pr-body.md`).
+4. **Ne pas chercher à lever l'exclusion d'auto-resume** (§ 1.5, point 3) : elle
+   est durable par conception et aucun geste de ce vol ne la réarme. La sortie
+   de draft reste la décision de l'opérateur, une fois CI verte.
 
 ---
 
@@ -380,9 +508,11 @@ la taille d'un fichier.
 - **sa structure en neuf sections de conception** — le dessin est fait et vert ;
   ce plan-ci est un plan de livraison, pas de conception.
 
-**Ce que le re-vol ne fait pas :** la draft #3009 n'est ni fermée ni promue par
-ce vol. Les commits atterrissent sur la branche, CI les juge, et l'état
-draft / ready de la PR reste la décision de l'opérateur.
+**Ce que le re-vol ne fait pas :** la draft #3009 n'est ni fermée ni sortie de
+draft par ce vol. Les commits atterrissent sur sa branche — qui vit, § 1.5 — CI
+les juge, et la sortie de draft reste la décision de l'opérateur. Ce que le vol
+fait sur #3009 se borne à deux gestes de forme : pousser, et corriger le titre
+et le corps (§ 5.1).
 
 ---
 
@@ -410,8 +540,15 @@ Inchangés, et c'est une assertion : `webhook_dispatch.rs`, `server/handlers.rs`
 - [ ] `pr_review_groom.rs` ne contient **aucun** littéral de préfixe
       (`[GitHub] PR `, `[GitHub] Check suite `) hors de ses constantes de
       fixture : il appelle `is_webhook_pr_event_domain`.
-- [ ] Aucune visibilité élargie (`pub` / `pub(crate)`) pour satisfaire un test
-      déplacé.
+- [ ] `tour_neutre()` est **resté** dans `mod.rs`, et ses six appelants non-3004
+      sont inchangés.
+- [ ] Aucune visibilité de code de **production** élargie pour satisfaire un
+      test. Les seuls élargissements du diff sont : `pub(super)` sur
+      `ProprietesDuTour` / `::depuis` (production), et
+      `pub(in crate::agent_loop)` sur `make_resolved_skill_tool` /
+      `make_registry_with_tool`. **Aucun `pub(crate)`, aucun `pub` nu.**
+- [ ] Les deux aides de test ne sont **pas** dupliquées dans
+      `pr_review_groom.rs`.
 - [ ] `wc -c crates/mika-agent/src/agent_loop/mod.rs` ≤ **1 046 159** octets, et
       l'écart net avec `origin/main` ≤ **1 600** octets.
 - [ ] `LARGE_FILE_ALLOWLIST` de `scripts/check-secrets.sh` est toujours vide ;
@@ -427,6 +564,12 @@ Inchangés, et c'est une assertion : `webhook_dispatch.rs`, `server/handlers.rs`
 - [ ] `scripts/verify-pipeline.sh origin/main` : propre.
 - [ ] `spawn.rs` et `server/mod.rs` n'apparaissent pas dans
       `git diff --name-only origin/main...HEAD`.
+- [ ] Les commits sont poussés sur
+      `fix/3004/dispatch-un-tour-pr-review-de-mika-dev`, **aucune seconde PR
+      n'est ouverte**, et `gh pr view 3009 --json state,headRefOid` rend `OPEN`
+      sur la tête poussée.
+- [ ] Le titre de #3009 ne porte plus un titre de commit, et son corps est
+      réécrit (§ 5.1).
 
 ---
 
@@ -488,8 +631,8 @@ Détail d'implémentation :
 
 | livrable | lignes de code (hors `docs/`) |
 |---|---|
-| `crates/mika-agent/src/agent_loop/pr_review_groom.rs` (nouveau : struct + doc-module condensé + 3 fixtures + `tour_neutre()` + 4 tests) | 300 |
-| `crates/mika-agent/src/agent_loop/mod.rs` (plomberie nette conservée, § 3.1) | 30 |
+| `crates/mika-agent/src/agent_loop/pr_review_groom.rs` (nouveau : struct + doc-module condensé + 3 fixtures + 4 tests) | 300 |
+| `crates/mika-agent/src/agent_loop/mod.rs` (plomberie nette conservée, § 3.1, dont 2 mots-clés de visibilité à 0 ligne nette) | 30 |
 | `crates/mika-cli/src/commands/chat.rs` (2 sites) | 2 |
 
 Total estimé : 332 lignes
@@ -511,6 +654,15 @@ Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
    ne le contient pas sans risque pour le plafond ». Il le contient à coût nul :
    `test_pr_review_no_groom_requirement_3004.rs` est déjà écrit, déjà câblé et
    déjà vert, et le vol n'y touche pas (§ 3.3). Zéro ligne, zéro tour.
+
+4. **Aucune édition de masse à refaire.** Le premier vol a déjà migré les ~20
+   sites d'appel de test vers `tour_neutre()`, qui ne bouge plus (§ 3.1). Le
+   re-vol touche trois fichiers, dont un de deux lignes.
+5. **La fin de pipeline est désamorcée d'avance** (§ 5.1). Les trois vols morts
+   du 2026-10-14 ont tenu sur le travail et cédé sur la fin de pipeline, qui
+   coûte des tours et non des lignes — et ici elle portait un piège mesurable :
+   un `gh pr create` qui refuse sur une tête déjà portée par #3009. Le plan le
+   dit avant, pour qu'il ne s'apprenne pas au tour 190.
 
 332 lignes contre 429 : la borne par vol tient avec ~23 % de marge, et le seuil
 par PR de 1 000 lignes n'est pas approché. Pas de `Tracked in:` — il n'y a pas
