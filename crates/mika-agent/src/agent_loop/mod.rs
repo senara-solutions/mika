@@ -3675,8 +3675,11 @@ async fn run_loop(
                             if intent_guard_retries.contains(guard.label) {
                                 continue; // already fired once — single-retry semantics
                             }
-                            if (guard.trigger)(&user_input_text)
-                                && !(guard.satisfied)(&all_tool_summaries)
+                            if guard.scope.triggered(
+                                guard.trigger,
+                                &user_input_text,
+                                is_verdict_producer,
+                            ) && !(guard.satisfied)(&all_tool_summaries)
                             {
                                 intent_guard_retries.insert(guard.label);
                                 warn!(
@@ -11867,10 +11870,58 @@ struct IntentPrecondition {
     label: &'static str,
     /// Returns `true` when the user message expresses this intent.
     trigger: fn(&str) -> bool,
+    /// mika#3002 — sur quelle région du message `trigger` est évalué.
+    /// `WholeMessage` pour toute entrée dont la prémisse ne dépend pas du
+    /// contrat du skill : c'est le défaut de lecture, pas un défaut de langage
+    /// (il n'y a pas de `Default` ici, et c'est voulu — une nouvelle entrée
+    /// doit nommer sa portée).
+    scope: IntentScope,
     /// Returns `true` when the agent's tool calls satisfy the precondition.
     satisfied: fn(&[ToolCallSummary]) -> bool,
     /// Correction text injected on first rejection.
     correction_message: &'static str,
+}
+
+/// Sur quelle région du message le déclencheur d'une entrée est évalué.
+///
+/// `fn(&str) -> bool` voit le message seul (cf. la doc de `loaded_skill_names`),
+/// donc une entrée qui doit tenir compte d'un fait de tour le DÉCLARE ici, à
+/// côté d'elle, plutôt que de migrer en garde inline.
+#[derive(Clone, Copy)]
+enum IntentScope {
+    /// Le message entier. Portée de toutes les entrées sauf une.
+    WholeMessage,
+    /// mika#3002 — sur un tour de revue d'architecte, la région HORS du plan
+    /// revu ; partout ailleurs, le message entier.
+    OutsideReviewedPlan,
+}
+
+impl IntentScope {
+    /// L'entrée se déclenche-t-elle sur ce message, dans sa portée ?
+    fn triggered(self, trigger: fn(&str) -> bool, msg: &str, is_verdict_producer: bool) -> bool {
+        match self {
+            Self::WholeMessage => trigger(msg),
+            Self::OutsideReviewedPlan if is_verdict_producer => {
+                let (head, tail) = review_anchor::outside_reviewed_plan(msg);
+                trigger(head) || trigger(tail)
+            }
+            Self::OutsideReviewedPlan => trigger(msg),
+        }
+    }
+
+    /// mika#3002 — le contrôle positif de la sonde : le rétrécissement a-t-il
+    /// effectivement changé l'issue sur ce tour ?
+    ///
+    /// Vrai quand le message entier déclenchait et que la région adressée à
+    /// l'agent, elle, ne déclenche pas. Sans cette distinction, « la garde ne
+    /// tire plus » et « aucune revue n'a eu lieu dans la fenêtre » rendent les
+    /// mêmes octets (classe mika#2205).
+    fn stood_down(self, trigger: fn(&str) -> bool, msg: &str, is_verdict_producer: bool) -> bool {
+        matches!(self, Self::OutsideReviewedPlan)
+            && is_verdict_producer
+            && trigger(msg)
+            && !self.triggered(trigger, msg, is_verdict_producer)
+    }
 }
 
 /// Registry of intent-precondition guards.  Evaluated in order; each entry
@@ -11904,6 +11955,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: ready_label_dispatch_satisfied,
         correction_message: "[mika-engine] The `ready` label has been removed but neither \
              run_claude_pilot nor run_claude_pilot_groom was called this turn. The \
@@ -11939,6 +11991,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "webhook_no_unauthorized_dispatch",
         trigger: webhook_no_unauthorized_dispatch_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: webhook_no_unauthorized_dispatch_satisfied,
         correction_message: "[mika-engine] The previous response called run_claude_pilot or \
              run_claude_pilot_groom on a [GitHub] webhook turn that was NOT a \
@@ -11963,6 +12016,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "webhook_zero_tools",
         trigger: webhook_zero_tools_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: |summaries| summaries.iter().any(|s| s.success),
         correction_message: "[mika-engine] A GitHub webhook event was received but the \
              response was text-only with zero tool calls. Webhook events require \
@@ -11976,6 +12030,13 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "resume_reconcile",
         trigger: detect_resume_intent,
+        // mika#3002 — la seule entrée du registre dont la prémisse est fausse sur un tour de
+        // revue d'architecte : un plan de groom parle de reprise parce que c'est son sujet, et
+        // cite des jalons. Mesuré le 2026-10-31, trace `3a066c59` : l'architecte, relancé sur
+        // le groom de mika#2995, a répondu en 264 caractères qu'il cherchait des engagements
+        // actifs « comme demandé par l'instruction de reprise » au lieu de rendre une revue —
+        // donc aucune ligne `Disposition:`, donc `UNPARSED`, donc la relance de mika#1823.
+        scope: IntentScope::OutsideReviewedPlan,
         satisfied: resume_reconcile_satisfied,
         correction_message: "[mika-engine] A resume/continue instruction was received for a \
              milestone or project but no reconciliation tools were called. The \
@@ -12002,6 +12063,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: CALLBACK_TERMINAL_ACTION_LABEL,
         trigger: callback_trigger_active,
+        scope: IntentScope::WholeMessage,
         satisfied: callback_terminal_action_satisfied,
         correction_message: CALLBACK_TERMINAL_ACTION_CORRECTION,
     },
@@ -12012,6 +12074,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "deferred_dispatch_action",
         trigger: deferred_dispatch_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: deferred_dispatch_satisfied,
         correction_message: "[mika-engine] This is a deferred-dispatch retry — the prior \
              run_claude_pilot was rejected with global_dispatch_active. The dispatch \
@@ -18610,6 +18673,121 @@ mod tests {
         assert!(!detect_resume_intent("How's the project going?"));
         assert!(!detect_resume_intent("Can you explain the architecture?"));
         assert!(!detect_resume_intent(""));
+    }
+
+    // -- IntentScope tests (mika#3002) --
+
+    /// Un plan de groom ordinaire : il parle de reprise parce que c'est son sujet, et il
+    /// cite un jalon. Les deux conjoints de `detect_resume_intent` sont là, et aucune
+    /// intention de reprise n'est adressée à l'agent.
+    ///
+    /// Les deux lignes qui portent les conjoints sont celles **mesurées** sur le plan de
+    /// mika#2995 (`tests/fixtures/review_anchor_unparsed_retry_2996/plan-mika2995-61a3fb572.md`,
+    /// l. 479 et 506), le brief de l'incident `3a066c59` : le verbe vient du français « le
+    /// prompt servi *continue* de prescrire », que `\b(resume|continue)\b` attrape mot pour
+    /// mot, et le processus d'un « milestone #33 » **cité**. « reprendre le vol suivant »,
+    /// que nomme AC2, est là aussi mais ne porte aucun des deux — c'est le vocabulaire du
+    /// défaut, pas son déclencheur.
+    const PLAN_DE_GROOM: &str = "## 4. Ordre de vol\n\nLe premier vol livre le détecteur ; \
+         il faudra reprendre le vol suivant une fois la sonde relevée.\n\nLe défaut survit \
+         au correctif : le prompt servi continue de prescrire l'ancienne forme.\n\nLié : \
+         milestone #33, dont ce ticket est l'enfant.\n";
+
+    /// Le plan sous l'enveloppe de mika#2996, précédé d'une vraie instruction à l'agent.
+    fn brief_enveloppe(tete: &str) -> String {
+        format!(
+            "{tete}{}\n{PLAN_DE_GROOM}{}\n",
+            review_anchor::RETRY_PLAN_BEGIN,
+            review_anchor::RETRY_PLAN_END
+        )
+    }
+
+    /// Le contrôle qui fait tenir tous les autres : ce plan déclenche bien la garde quand
+    /// le message entier est lu. Sans lui, les tests de stand-down passeraient aussi sur un
+    /// plan que le détecteur n'a jamais vu.
+    #[test]
+    fn mika3002_le_plan_de_groom_declenche_sur_le_message_entier() {
+        assert!(
+            IntentScope::WholeMessage.triggered(detect_resume_intent, PLAN_DE_GROOM, true),
+            "la fixture ne porte plus les deux conjoints : les cas de stand-down ne \
+             mesureraient rien"
+        );
+    }
+
+    /// AC1 — sur un tour de revue, un brief sans enveloppe EST le plan : rien n'y est
+    /// adressé à l'agent, donc la garde ne s'arme pas. C'est la forme de l'incident
+    /// `3a066c59`.
+    #[test]
+    fn mika3002_sur_un_tour_de_revue_le_plan_seul_ne_declenche_pas() {
+        assert!(!IntentScope::OutsideReviewedPlan.triggered(
+            detect_resume_intent,
+            PLAN_DE_GROOM,
+            true
+        ));
+    }
+
+    /// Hors tour de revue, le rétrécissement ne s'applique pas : même entrée, même
+    /// message, comportement d'avant mika#3002. C'est ce qui borne le stand-down à sa
+    /// population.
+    #[test]
+    fn mika3002_hors_tour_de_revue_le_comportement_est_inchange() {
+        assert!(IntentScope::OutsideReviewedPlan.triggered(
+            detect_resume_intent,
+            PLAN_DE_GROOM,
+            false
+        ));
+    }
+
+    /// AC2 — une vraie instruction de reprise adressée à l'agent vit HORS du plan, donc
+    /// dans la région lue : la garde s'arme toujours.
+    #[test]
+    fn mika3002_une_instruction_hors_du_plan_declenche_toujours() {
+        let brief = brief_enveloppe("resume mika milestone#8\n\n");
+        assert!(IntentScope::OutsideReviewedPlan.triggered(detect_resume_intent, &brief, true));
+    }
+
+    /// `stood_down` ne dit vrai que quand le rétrécissement a réellement changé l'issue —
+    /// c'est le contrat de la sonde de contrôle positif, pas un synonyme de « tour de
+    /// revue ».
+    #[test]
+    fn mika3002_stood_down_ne_vaut_que_quand_le_retrecissement_change_lissue() {
+        // Le cas qu'AC3 compte : le message entier déclenchait, la région lue non.
+        assert!(IntentScope::OutsideReviewedPlan.stood_down(
+            detect_resume_intent,
+            PLAN_DE_GROOM,
+            true
+        ));
+        // Une instruction hors plan : la garde s'arme, donc aucun stand-down.
+        let brief = brief_enveloppe("resume mika milestone#8\n\n");
+        assert!(!IntentScope::OutsideReviewedPlan.stood_down(detect_resume_intent, &brief, true));
+        // Hors tour de revue : rien n'a été rétréci.
+        assert!(!IntentScope::OutsideReviewedPlan.stood_down(
+            detect_resume_intent,
+            PLAN_DE_GROOM,
+            false
+        ));
+        // Un message sans intention de reprise : il n'y avait rien à désarmer.
+        assert!(!IntentScope::OutsideReviewedPlan.stood_down(
+            detect_resume_intent,
+            "Can you explain the architecture?",
+            true
+        ));
+        // Une entrée à portée entière ne se désarme jamais, même sur un tour de revue.
+        assert!(!IntentScope::WholeMessage.stood_down(detect_resume_intent, PLAN_DE_GROOM, true));
+    }
+
+    /// `resume_reconcile` est la seule entrée rétrécie. Élargir le stand-down au reste du
+    /// registre serait un changement non mesuré déguisé en cohérence : aucune autre entrée
+    /// n'a de prémisse fausse sur un tour de revue, toutes exigent un préfixe `[GitHub]` ou
+    /// `[callback: …]` qu'un brief de plan ne porte pas.
+    #[test]
+    fn mika3002_resume_reconcile_est_la_seule_entree_retrecie() {
+        let retrecies: Vec<&str> = INTENT_GUARDS
+            .iter()
+            .filter(|g| matches!(g.scope, IntentScope::OutsideReviewedPlan))
+            .map(|g| g.label)
+            .collect();
+        assert_eq!(retrecies, vec!["resume_reconcile"]);
     }
 
     // -- resume_reconcile_satisfied tests --
