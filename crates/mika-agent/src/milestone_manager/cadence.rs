@@ -1260,15 +1260,18 @@ pub async fn run_manager_cycle_in(
     // champ de checkpoint n'en a besoin. Lié plutôt que jeté pour que ce vol-là
     // soit l'ajout d'une ligne et non une reprise du site.
     let _admitted = write_pool_admissions(cfg, ctx, &state, &assessment).await;
-    // mika#2958 vols 2b et 2d — le geste de la relève. Lié ici, après le bassin,
-    // parce que la relève dérive du verdict de bassin : la nommer avant de
-    // l'avoir mesurée n'a pas de sens. Depuis le vol 2d le résultat a un
-    // consommateur — la fenêtre d'idempotence durable, composée au site de
-    // sauvegarde ci-dessous. Ce qu'il n'a toujours pas, c'est une destination
-    // dans le rapport : c'est le vol 2e (AC4, moitié ON).
+    // mika#2958 vols 2b, 2d et 2e — le geste de la relève. Lié ici, après le
+    // bassin, parce que la relève dérive du verdict de bassin : la nommer avant
+    // de l'avoir mesurée n'a pas de sens. Le résultat a deux consommateurs : la
+    // fenêtre d'idempotence durable, composée au site de sauvegarde ci-dessous
+    // (vol 2d), et le rapport, juste en dessous (vol 2e, AC4 moitié ON).
     let grooms = trigger_cycle_grooms(cfg, ctx, &assessment, checkpoint.as_ref()).await;
     let severity = assessment.severity.clone();
-    let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
+    // Le rapport reçoit la mesure **par paramètre**. Il ne relit pas
+    // l'interrupteur : le cycle l'a lu une fois, dans `trigger_cycle_grooms`, et
+    // un second lecteur du même fait divergerait du premier (mika#2201).
+    let report =
+        Reporter::new().report_with_grooms(&state, &assessment, ctx.auth_notes, Some(&grooms));
 
     let should_deliver = state_changed || heartbeat_fired;
     let cycle_kind = match (state_changed, heartbeat_fired) {
@@ -3728,6 +3731,132 @@ mod tests {
                 "https://github.com/senara-solutions/mika/issues/1802".to_string()
             ]],
             "D2 : l'URL interrogée est composée depuis `cfg.target.repo`, canonique et nue"
+        );
+    }
+
+    /// Le rapport **livré** par le cycle — celui que l'opérateur lira.
+    ///
+    /// Les deux tests du vol 2e lisent celui-ci, et pas le rendu d'un
+    /// `Reporter` appelé à la main : ce qui est en cause est le câblage du site
+    /// d'appel, et un rendu reconstruit dans le test resterait vert le jour où
+    /// la cadence cesse de passer la mesure.
+    fn rapport_du_cycle(rec: &RecordingDeliverer) -> String {
+        rec.calls
+            .lock()
+            .unwrap()
+            .last()
+            .expect("le cycle a livré un rapport")
+            .2
+            .report_markdown
+            .clone()
+    }
+
+    /// La ligne de la section « Relève à grommer » qui nomme `number`.
+    fn ligne_de_releve(rapport: &str, number: u64) -> String {
+        rapport
+            .split("### Relève à grommer")
+            .nth(1)
+            .expect("la section de la relève doit être rendue")
+            .lines()
+            .find(|l| l.starts_with(&format!("- #{number}")))
+            .unwrap_or_else(|| panic!("#{number} doit être nommé dans :\n{rapport}"))
+            .to_string()
+    }
+
+    /// **AC4, moitié OFF, sur le rapport livré.** L'interrupteur fermé, la
+    /// section « Relève à grommer » est celle du vol 1 — titre et lignes.
+    ///
+    /// Ce test est la contrainte que R3 demande explicitement : un test de
+    /// *rendu* ne suffit pas. Le rendu reçoit désormais la mesure en paramètre,
+    /// donc la seule façon de prouver que l'interrupteur fermé n'a rien changé
+    /// est de faire tourner un **cycle** et de lire ce qu'il a livré.
+    ///
+    /// L'assertion sur la fin de ligne est la moitié qui compte : le titre seul
+    /// resterait vert si une annotation par candidat s'était glissée sous un
+    /// cycle désarmé.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_off_le_rapport_livre_porte_la_section_du_vol_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let lecture = Arc::new(LectureGroom::vide());
+        let source: Arc<dyn GroomInFlightSource> = lecture.clone();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(
+            &cfg,
+            state,
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
+        )
+        .await
+        .unwrap();
+
+        let rapport = rapport_du_cycle(&rec);
+        assert!(
+            rapport.contains("### Relève à grommer (mode ombre — aucun groom déclenché)\n"),
+            "interrupteur fermé : le titre est celui du vol 1, au caractère près :\n{rapport}"
+        );
+        let ligne = ligne_de_releve(&rapport, 1802);
+        assert!(
+            ligne.ends_with("plan groomé absent"),
+            "aucune annotation par candidat sous un cycle désarmé, vu : « {ligne} »"
+        );
+    }
+
+    /// **AC4, moitié ON, sur le rapport livré** — ce vol, en une assertion.
+    ///
+    /// Le même semis que le contrôle négatif d'AC1 ci-dessus, et c'est voulu :
+    /// ce cycle-là envoie exactement un groom, donc le rapport doit dire
+    /// « 1 groom déclenché » et l'annoter sur la ligne du ticket parti. Les
+    /// deux tests encadrent le même cycle, l'interrupteur en seule différence.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2958_on_le_rapport_livre_dit_quels_grooms_sont_partis() {
+        let _interrupteur = GroomArme::poser();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let groom = RecordingGroom::default();
+        let lecture = Arc::new(LectureGroom::vide());
+        let source: Arc<dyn GroomInFlightSource> = lecture.clone();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].plan_present = false;
+
+        run_manager_cycle_in(
+            &cfg,
+            state,
+            &CycleContext::new(&rec, now)
+                .with_groom_sender(Some(&groom))
+                .with_groom_in_flight(Some(&source)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *groom.envois.lock().unwrap(),
+            vec!["groom mika#1802".to_string()],
+            "le semis doit bien envoyer : sans cela le rapport dirait vrai par accident"
+        );
+        let rapport = rapport_du_cycle(&rec);
+        assert!(
+            rapport.contains("### Relève à grommer (1 groom déclenché)\n"),
+            "le titre dit le compte, pas « mode ombre » :\n{rapport}"
+        );
+        assert!(
+            !rapport.contains("mode ombre — aucun groom déclenché"),
+            "l'interrupteur est ouvert et le geste a eu lieu : plus d'ombre :\n{rapport}"
+        );
+        let ligne = ligne_de_releve(&rapport, 1802);
+        assert!(
+            ligne.ends_with("plan groomé absent — groom déclenché"),
+            "la ligne du ticket parti le dit, vu : « {ligne} »"
         );
     }
 
