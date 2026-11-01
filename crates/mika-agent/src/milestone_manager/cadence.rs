@@ -1013,7 +1013,10 @@ async fn trigger_cycle_grooms(
             event = "manager_groom_not_triggered",
             reason = "no_relief_verdict",
         );
-        return GroomTriggerOutcome::default();
+        return GroomTriggerOutcome {
+            refus_de_cycle: Some("no_relief_verdict"),
+            ..Default::default()
+        };
     };
     let armed = groom_write_is_armed();
     if !armed {
@@ -1044,7 +1047,10 @@ async fn trigger_cycle_grooms(
             event = "manager_groom_not_triggered",
             reason = "no_in_flight_source",
         );
-        return GroomTriggerOutcome::default();
+        return GroomTriggerOutcome {
+            refus_de_cycle: Some("no_in_flight_source"),
+            ..Default::default()
+        };
     };
     let issues: Vec<GroomIssue> = relief
         .next
@@ -3759,7 +3765,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(issue, GroomTriggerOutcome::default());
+        assert_eq!(
+            issue,
+            GroomTriggerOutcome {
+                refus_de_cycle: Some("no_relief_verdict"),
+                ..Default::default()
+            },
+            "le vide porte sa cause : une relève non mesurée n'est pas un cycle \
+             désarmé, et le rapport ne doit pas les confondre"
+        );
         assert!(
             groom.envois.lock().unwrap().is_empty(),
             "une lecture absente ne se grommme pas, vu : {:?}",
