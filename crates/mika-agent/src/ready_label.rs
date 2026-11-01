@@ -1073,4 +1073,241 @@ mod tests {
             offenders.join("\n")
         );
     }
+
+    // ── mika#2995 vol 2 — D1 : la surface d'outil n'atteint pas l'applicateur ──
+    //
+    // **Deux détecteurs et non un seul, et le test 13 reste intact.** Les trois
+    // populations diffèrent, et deux populations sous un même nom ne se
+    // soustraient pas (mika#2205) : le test 13 refuse une écriture de `ready`
+    // hors de ce module, D1 refuse qu'une *surface d'outil* atteigne
+    // l'applicateur même gouverné, D2 (plus bas) refuse qu'une écriture de forme
+    // argv ne soit pas déclarée. Chacun porte sa propre disposition.
+
+    /// Les quatre noms par lesquels `ready` s'écrit, l'applicateur unique de
+    /// mika#2315 et les deux poseurs de label qu'il appelle.
+    ///
+    /// L'ordre est porteur : `apply_ready_with_timeline` avant `apply_ready`,
+    /// pour qu'un offender soit nommé par le plus spécifique des deux.
+    const READY_APPLICATORS: &[&str] = &[
+        "apply_ready_with_timeline",
+        "apply_ready",
+        "gh_apply_label",
+        "add_label_to_issue",
+    ];
+
+    /// `true` si `rel` (relatif à `src/`) appartient à **la surface depuis
+    /// laquelle un tour LLM agit** : les handlers d'outils et les deux fichiers
+    /// de la porte de dispatch de compétences.
+    ///
+    /// C'est la population de D1, et c'est aussi exactement celle où le défaut
+    /// mesuré du 2026-10-31 vivait : `run_gh` est un handler de cette surface.
+    fn est_surface_doutil(rel: &str) -> bool {
+        rel.starts_with("tools/")
+            || rel == "skills/builtin_handlers.rs"
+            || rel == "skills/executor.rs"
+    }
+
+    /// Les **appels** à l'un des [`READY_APPLICATORS`] dans une moitié de
+    /// production, rendus en `"<fichier>: <ligne>"`.
+    ///
+    /// # Appeler, et non nommer
+    ///
+    /// Trois formes nomment l'applicateur sans l'appeler, et les trois sont
+    /// muettes, chacune pour une raison distincte :
+    ///
+    /// - **doc-comment et commentaire de bloc** — retirés par
+    ///   [`crate::source_scan::strip_comment_lines`], dont le doc-comment porte
+    ///   le prédicat et ses bornes. La prose *à propos* du geste n'est pas le
+    ///   geste : c'est la forme du précédent mika#2425, et
+    ///   `builtin_handlers.rs:3095` en porte une ;
+    /// - **ligne de `use`** — muette par la parenthèse exigée : la syntaxe
+    ///   `use` n'en porte jamais. C'est pour cela qu'il n'y a pas de branche
+    ///   `starts_with("use ")` ici — une branche morte dirait au lecteur qu'un
+    ///   import pourrait matcher ;
+    /// - **ligne de définition** — écartée par le `fn <nom>(` : `pub(crate)
+    ///   async fn apply_ready(` déclare l'applicateur, il ne l'appelle pas.
+    ///
+    /// # Pourquoi aucun numéro de ligne
+    ///
+    /// Le dépouillement des commentaires **décale** la numérotation, et un
+    /// numéro faux dans un message d'échec envoie le lecteur sur une ligne
+    /// innocente. Le texte de la ligne est rendu à la place : il est grep-able,
+    /// et il est vrai.
+    fn appels_a_lapplicateur(rel: &str, prod: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in crate::source_scan::strip_comment_lines(prod).lines() {
+            for app in READY_APPLICATORS {
+                if !line.contains(&format!("{app}(")) {
+                    continue;
+                }
+                if line.contains(&format!("fn {app}(")) {
+                    continue;
+                }
+                out.push(format!("{rel}: {}", line.trim()));
+                break;
+            }
+        }
+        out
+    }
+
+    /// **L'allowlist de D1, livrée VIDE — et elle le reste.**
+    ///
+    /// `(fichier, ticket)`. Elle est livrée vide **parce que la population est
+    /// vide** : les quatre appelants de l'applicateur vivent dans `auto_pull.rs`
+    /// (phases 0, 1 et 2) et dans `server/milestone_context_handler.rs` (cascade
+    /// M4), aucun sous la surface d'outil.
+    ///
+    /// Quand D1 tire, on **retire l'appel** ; on n'ajoute pas une ligne ici. Une
+    /// exception nommée serait un handler d'outil qui atteint l'applicateur
+    /// « parce qu'il est gouverné » — or il est gouverné pour le **parc**, jamais
+    /// pour le tour LLM : le parc dit *ce ticket est-il dé-promu*, il ne dit
+    /// jamais *qui demande*. C'est la doctrine mika#2201 : quand un détecteur
+    /// tire, on retire l'appel, on n'ajoute pas une ligne d'allowlist.
+    const TOOL_SURFACE_APPLICATOR_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// **L'assertion sœur d'auto-vacuité de D1.**
+    ///
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction. Celle-ci rougit à la première entrée, et c'est ce qui empêche
+    /// D1 de se remplir en silence — le mode de mensonge d'une allowlist vide que
+    /// la Fire-Disposition du plan nomme en premier.
+    #[test]
+    fn mika2995_lallowlist_de_surface_est_vide() {
+        assert!(
+            TOOL_SURFACE_APPLICATOR_EXCEPTIONS.is_empty(),
+            "une exception a été ajoutée à D1 : {:?}. La disposition de ce détecteur est de \
+             RETIRER l'appel, pas de l'allowlister (mika#2201). Un handler d'outil qui atteint \
+             l'applicateur rend la voie B de mika#2995 fausse : le moteur retrouve, dans un tour \
+             LLM, la capacité d'écrire le `ready` qui lève la garde de mika#2772.",
+            TOOL_SURFACE_APPLICATOR_EXCEPTIONS
+        );
+    }
+
+    /// **D1 — aucune surface d'outil n'atteint l'applicateur de `ready`
+    /// (AC2 de mika#2995, voie B).**
+    ///
+    /// # Ce qu'il refuse
+    ///
+    /// Qu'un handler d'outil, demain, appelle l'applicateur gouverné. La voie B
+    /// tient parce que la capacité d'écrire `ready` est **hors d'atteinte d'un
+    /// tour LLM** : `run_gh` la refuse depuis le vol 1
+    /// (`builtin_handlers.rs`, attestations de population dans `guards.rs`), et
+    /// l'applicateur unique n'a que quatre appelants, tous dans un corps de tick
+    /// ou un handler webhook. Cette seconde moitié est aujourd'hui vraie **par
+    /// accident** : rien ne la refuse. Ce test la rend structurelle.
+    ///
+    /// # Pourquoi un scan de source et pas un test de comportement
+    ///
+    /// Un handler qui appellerait `apply_ready` demain ne rendrait **aucune
+    /// décision fausse**. Le parc continuerait de répondre, la garde de mika#2772
+    /// continuerait de discriminer, les sept assertions de
+    /// `mod mika2772_consentement_force` resteraient vertes — et l'agent
+    /// retrouverait le geste du 2026-10-31. C'est la classe mika#2158 : seul un
+    /// scan structurel la voit.
+    ///
+    /// # Disposition si ce détecteur fire
+    ///
+    /// **Retirer l'appel**, jamais l'allowlister, jamais `#[ignore]`. Voir
+    /// [`TOOL_SURFACE_APPLICATOR_EXCEPTIONS`], et surfacer le site au corps de PR
+    /// sous `Fire-Disposition: cinquième applicateur découvert`.
+    #[test]
+    fn mika2995_aucune_surface_doutil_natteint_lapplicateur_de_ready() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut vus: Vec<String> = Vec::new();
+
+        for (rel, prod) in crate::source_scan::production_files() {
+            if !est_surface_doutil(&rel) {
+                continue;
+            }
+            scanned += 1;
+            vus.push(rel.clone());
+            for site in appels_a_lapplicateur(&rel, &prod) {
+                if TOOL_SURFACE_APPLICATOR_EXCEPTIONS
+                    .iter()
+                    .any(|(f, _)| *f == rel)
+                {
+                    continue;
+                }
+                offenders.push(site);
+            }
+        }
+
+        // Deuxième mode de mensonge d'une allowlist vide : le scan pourrait
+        // n'avoir rien scanné. L'idiome du test 13, resserré — « au moins un
+        // fichier » resterait vrai si les deux gros fichiers étaient renommés et
+        // que seuls les `tools/` restaient, donc les deux sont nommés.
+        assert!(
+            scanned > 2,
+            "D1 n'a scanné que {scanned} fichier(s) — la population est cassée, et un \
+             détecteur qui ne scanne rien ne refuse rien (mika#2578)"
+        );
+        for attendu in ["skills/builtin_handlers.rs", "skills/executor.rs"] {
+            assert!(
+                vus.iter().any(|v| v == attendu),
+                "`{attendu}` n'est plus dans la population de D1 — renommé ou déplacé. \
+                 Mettez `est_surface_doutil` à jour plutôt que de laisser le détecteur se \
+                 rendormir en silence. Vus : {vus:?}"
+            );
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2995 — une surface d'outil atteint l'applicateur de `ready`. L'applicateur \
+             est gouverné pour le PARC, pas pour le tour LLM : le parc dit « ce ticket est-il \
+             dé-promu », jamais « qui demande ». Un handler qui l'appelle redonne à l'agent, \
+             dans son tour, la capacité d'écrire le `ready` qui lève la garde de mika#2772 — \
+             c'est le défaut mesuré le 2026-10-31 à 16:51:37Z, par une autre porte. Retirez \
+             l'appel ; ne l'allowlistez pas.\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// **Le contrôle de bonne foi de D1 — le scan rougit sur un appel planté.**
+    ///
+    /// Troisième mode de mensonge d'une allowlist vide : le scan pourrait être
+    /// vert pour avoir **cessé de reconnaître sa forme**. Aucune assertion sur
+    /// l'arbre réel ne peut voir ça — elle passerait. Ce test plante donc un
+    /// appel et exige qu'il soit vu, puis quatre formes qui nomment
+    /// l'applicateur sans l'appeler et exige le silence sur chacune.
+    #[test]
+    fn mika2995_le_scan_de_surface_rougit_sur_un_appel_plante() {
+        let plante = "\
+async fn handler_doutil(db: &AsyncDatabase, req: ReadyRequest) -> Outcome {
+    ready_label::apply_ready(db, req).await
+}
+";
+        let vus = appels_a_lapplicateur("tools/plante.rs", plante);
+        assert_eq!(
+            vus.len(),
+            1,
+            "le scan doit voir l'appel planté, sinon il est vert pour avoir cessé de \
+             reconnaître sa forme : {vus:?}"
+        );
+        assert!(
+            vus[0].contains("tools/plante.rs") && vus[0].contains("apply_ready(db, req)"),
+            "l'offender doit nommer le fichier et rendre la ligne grep-able : {vus:?}"
+        );
+
+        // Les quatre formes muettes, chacune pour sa raison (cf. doc de
+        // `appels_a_lapplicateur`).
+        let muet = "\
+/// Un doc-comment qui cite apply_ready(db, req) pour expliquer pourquoi ce
+/// handler ne l'appelle pas — la forme de mika#2425.
+/*
+ * Un bloc qui cite gh_apply_label(auth, n, READY_LABEL) de la même façon.
+ */
+use crate::ready_label::{apply_ready, apply_ready_with_timeline};
+pub(crate) async fn add_label_to_issue(token: &str, n: u64) -> Result<(), String> {
+    Ok(())
+}
+";
+        let muets = appels_a_lapplicateur("tools/muet.rs", muet);
+        assert!(
+            muets.is_empty(),
+            "nommer l'applicateur n'est pas l'appeler : doc-comment, commentaire de bloc, \
+             ligne de `use` et ligne de définition doivent rester muets, sinon D1 rougit sur \
+             du code sain et finit par être désarmé — {muets:?}"
+        );
+    }
 }
