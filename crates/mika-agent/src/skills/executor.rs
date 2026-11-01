@@ -3623,21 +3623,65 @@ pub(crate) async fn validate_forced_dispatch_consent(
 
     // (5) Les labels — déjà le lecteur de la porte de place, déjà porteur de la
     // distinction PR/issue dans son type de retour.
-    match crate::github_graphql::fetch_issue_labels_unless_pull_request(
+    //
+    // Le fetch reste ici ; la décision qu'il alimente est la fonction sœur
+    // ci-dessous, et reçoit son résultat **tel quel**. En production la donnée
+    // vient du réseau, en test d'une fixture : le seul lien resté hors du test
+    // est le transport HTTP.
+    let labels = crate::github_graphql::fetch_issue_labels_unless_pull_request(
         token,
         subject_owner,
         subject_repo,
         number,
     )
-    .await
-    {
+    .await;
+
+    decide_forced_consent_on_labels(ctx, &subject, forced, requested, labels).await
+}
+
+/// L'étape (5) de la garde de mika#2772 : **la décision, les labels donnés**.
+///
+/// # Pourquoi les labels sont un paramètre
+///
+/// Les sept tests de `mod mika2772_consentement_force` passent tous
+/// `github_token = None` et s'arrêtent donc à [`FORCED_CONSENT_NO_TOKEN`] :
+/// **aucun** n'atteignait cette étape, parce que
+/// `fetch_issue_labels_unless_pull_request` écrit `https://api.github.com/…` en
+/// clair et qu'aucun réglage ne donne un parcours hors réseau. Les deux puces de
+/// l'AC2 de mika#2995 — « un `ready` humain laisse passer », « son absence
+/// refuse » — portent exactement sur ces quatre arms.
+///
+/// La coupe prend donc **la donnée récupérée en paramètre**, qui est la doctrine
+/// écrite au doc-comment d'[`evaluate_grooming_gate`] pour cette forme exacte :
+/// une URL de base configurable serait « a production configuration point nobody
+/// needs, for the benefit of a test ». Le fetch reste chez l'appelant.
+///
+/// # Ce que cette fonction ne lit pas
+///
+/// `crate::webhook_dispatch::labels_carry_ready(&labels)`, **et rien d'autre** —
+/// aucun acteur, aucune identité, aucune provenance. La voie B du vol 1 retire au
+/// moteur la *capacité* d'écrire `ready` ; elle n'apprend pas à la garde à
+/// reconnaître qui l'a posé. Un filtre d'identité ici serait un prédicat de gate
+/// qui lit l'acteur, que la doctrine mika#2323 refuse, et
+/// `ACTOR_READING_PREDICATES_ALLOWED` reste `&[]`. Pour cette garde, un `ready`
+/// moteur et un `ready` humain sont le même octet ; ce qui tient la propriété,
+/// c'est qu'aucune route atteignable depuis un tour LLM ne produit cet octet
+/// (détecteurs D1 et D2 de `ready_label.rs`).
+pub(crate) async fn decide_forced_consent_on_labels(
+    ctx: &LongRunningContext,
+    subject: &str,
+    forced: bool,
+    requested: bool,
+    labels: Result<Option<Vec<String>>, String>,
+) -> ForcedDispatchConsent {
+    match labels {
         Ok(Some(labels)) if crate::webhook_dispatch::labels_carry_ready(&labels) => {
             report_forced_dispatch_consent(
                 ctx,
                 FORCED_CONSENT_CONSENTED,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 Some(true),
                 false,
             )
@@ -3650,7 +3694,7 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 FORCED_CONSENT_WITHOUT_CONSENT,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 Some(false),
                 true,
             )
@@ -3658,7 +3702,7 @@ pub(crate) async fn validate_forced_dispatch_consent(
             ForcedDispatchConsent::Refused(forced_consent_refusal(
                 ctx,
                 FORCED_CONSENT_WITHOUT_CONSENT,
-                Some(subject.clone()),
+                Some(subject.to_string()),
                 format!(
                     "`{subject}` does not carry the `ready` label, and this groom dispatch \
                      was forced by a `required_tools` constraint rather than requested. The \
@@ -3675,7 +3719,7 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 FORCED_CONSENT_SUBJECT_IS_PR,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 None,
                 true,
             )
@@ -3683,7 +3727,7 @@ pub(crate) async fn validate_forced_dispatch_consent(
             ForcedDispatchConsent::Refused(forced_consent_refusal(
                 ctx,
                 FORCED_CONSENT_SUBJECT_IS_PR,
-                Some(subject.clone()),
+                Some(subject.to_string()),
                 format!(
                     "`{subject}` resolves to a pull request, not an issue. A PR's label set \
                      never carries `ready`, so reading it as consent would be a confident \
@@ -3699,7 +3743,7 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 FORCED_CONSENT_UNVERIFIABLE,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 None,
                 true,
             )
@@ -3707,7 +3751,7 @@ pub(crate) async fn validate_forced_dispatch_consent(
             ForcedDispatchConsent::Refused(forced_consent_refusal(
                 ctx,
                 FORCED_CONSENT_UNVERIFIABLE,
-                Some(subject.clone()),
+                Some(subject.to_string()),
                 format!(
                     "Could not read the labels of `{subject}` ({e}), so its consent could \
                      not be established. Unlike the seat gate on this same door — which is \
