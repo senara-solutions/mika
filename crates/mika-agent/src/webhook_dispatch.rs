@@ -103,19 +103,28 @@ pub(crate) fn is_webhook_fallthrough_domain(msg: &str) -> bool {
     if msg.starts_with(READY_LABEL_DISPATCH_MARKER) {
         return false;
     }
-    // qa skill territory (Phase 0 prefix surface rows E, F).
+    // Territoire des handlers qa / ci (lignes E, F et G de la surface de
+    // préfixes), **lu en négation depuis le site qui écrit la conjonction** —
+    // [`is_webhook_pr_event_domain`] — plutôt que recopié ici (mika#3004).
     //
-    // Depuis mika#2649 les deux littéraux de préfixe ont un **site de définition
-    // unique** ([`PR_EVENT_PREFIX`], [`CHECK_SUITE_EVENT_PREFIX`]) partagé avec
-    // `webhook_event_target`, qui lit la même frontière depuis l'autre côté : ce
-    // qui sort d'ici est exactement ce qu'il faut borner à sa cible. Même valeur,
-    // même comportement — la matrice à huit lignes de
-    // `test_is_unauthorized_webhook_dispatch_predicate` passe sans modification.
-    if msg.starts_with(PR_EVENT_PREFIX) {
-        return false;
-    }
-    // ci skill territory (Phase 0 prefix surface row G).
-    if msg.starts_with(CHECK_SUITE_EVENT_PREFIX) {
+    // Un seul corps pose la disjonction des deux préfixes ; deux questions la
+    // lisent, de signes opposés. Celle-ci demande « ce tour est-il *hors* de tout
+    // territoire de handler ? » ; le désarmement d'exigence de groom (mika#3004,
+    // `raison_de_desarmement` branche 5) demande « ce tour est-il *dans* l'un
+    // d'eux ? ». Tant que la conjonction s'écrivait deux fois, le premier
+    // territoire ajouté n'en aurait bougé qu'une — et la divergence aurait été
+    // verte à la compilation comme aux tests.
+    //
+    // Depuis mika#2649 les deux littéraux de préfixe ont déjà un **site de
+    // définition unique** ([`PR_EVENT_PREFIX`], [`CHECK_SUITE_EVENT_PREFIX`])
+    // partagé avec `webhook_event_target`, qui lit la même frontière depuis
+    // l'autre côté : ce qui sort d'ici est exactement ce qu'il faut borner à sa
+    // cible. Ce que mika#3004 ajoute est qu'ils ne sont plus lus qu'à **un** seul
+    // endroit de ce domaine. Même valeur, même comportement — la matrice à huit
+    // lignes de `test_is_unauthorized_webhook_dispatch_predicate` passe sans
+    // modification, et `mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs`
+    // devient vrai par construction là où il l'était par coïncidence.
+    if is_webhook_pr_event_domain(msg) {
         return false;
     }
     // Everything else in [GitHub] domain (rows B, C, D, H) is fallthrough.
@@ -923,6 +932,20 @@ pub(crate) fn webhook_event_target(msg: &str) -> WebhookEventTarget {
 /// même module* est exactement ce qu'elles existent pour permettre — le scan
 /// `mika2517_the_fallthrough_domain_has_a_single_definition` n'accuse que les
 /// fichiers **hors** de ce module.
+///
+/// # Le sens de lecture, depuis mika#3004
+///
+/// **Ce corps est le seul qui écrive la disjonction des deux préfixes, et
+/// [`is_webhook_fallthrough_domain`] le lit désormais en négation.** La section
+/// ci-dessus explique pourquoi cet axe n'est pas *dérivé* du domaine
+/// Fallthrough ; mika#3004 établit la dépendance **inverse**, qui ne contredit
+/// rien : le domaine Fallthrough est le complément de ce territoire *et* du
+/// marqueur de label `ready`, donc il a toujours eu besoin de cette question
+/// — il la posait simplement en recopiant la conjonction.
+///
+/// La conséquence pratique : ne jamais réécrire ce corps en
+/// `!is_webhook_fallthrough_domain(msg) && …`. Ce serait un cycle, et le
+/// quatrième booléen que la section ci-dessus refuse.
 pub(crate) fn is_webhook_pr_event_domain(msg: &str) -> bool {
     msg.starts_with(PR_EVENT_PREFIX) || msg.starts_with(CHECK_SUITE_EVENT_PREFIX)
 }
@@ -2254,6 +2277,15 @@ mod tests {
     /// Fallthrough, par exemple) créerait deux axes dont la conjonction n'est
     /// plus vide — et deux gardes qui mordent sur la même population sans que
     /// personne ait tranché laquelle décide.
+    ///
+    /// **Depuis mika#3004 l'invariant est vrai par construction** :
+    /// `is_webhook_fallthrough_domain` lit `is_webhook_pr_event_domain` en
+    /// négation au lieu de recopier sa disjonction. Ce test reste, et il reste le
+    /// détecteur 4 : il est ce qui rougit le jour où quelqu'un défait ce sens de
+    /// lecture — en remettant deux `starts_with` ici, ou en retirant le
+    /// `return false` qu'ils gardent. L'invariant n'a pas changé de contenu, il a
+    /// changé de **raison** d'être vrai, et un détecteur qui ne surveille plus
+    /// qu'une raison de tenir surveille toujours quelque chose.
     #[test]
     fn mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs() {
         for (msg, _) in PR_EVENT_DOMAIN_MATRIX {
