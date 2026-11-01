@@ -301,6 +301,12 @@ fn user_texts(req: &LlmRequest) -> Vec<String> {
 /// sentence of a ticket body the architect had read with `gh_read` — the mika#2750 reaper
 /// sentence of session `49ffa230`, verbatim — while `A2` and `A3` quote `BRIEF` at disjoint
 /// regions. 3 anchors found, 2 valid, `QuoteNotInBrief`, and the refused one is the first.
+///
+/// **Depuis mika#2037 vol mika#3003, ce test est aussi le contrôle négatif d'AC2** : les mêmes
+/// ancres, sans l'appel d'outil. Le registre de lecture du tour est vide, donc le moteur ne
+/// peut rien établir et le re-prompt reste celui d'avant ce vol, au conditionnel, mot pour
+/// mot. Son pendant positif est
+/// [`test_review_anchor_reprompt_names_the_tool_that_produced_the_quote`], dans ce fichier.
 #[tokio::test]
 async fn test_review_anchor_reprompt_names_the_refused_anchor() -> anyhow::Result<()> {
     let two_of_three = "A1: \"The reaper introduced by mika#2750 fails the parent before the relaunch\" — noted.\n\
@@ -368,18 +374,172 @@ async fn test_review_anchor_reprompt_names_the_refused_anchor() -> anyhow::Resul
         reprompt.contains("not from the brief message of this turn"),
         "the re-prompt must say where a wrong quote usually comes from, got:\n{reprompt}"
     );
-    // Stated as a likelihood, never as an established fact: the engine does not hold the
-    // turn's tool outputs and cannot know which document the line came from.
+    // Stated as a likelihood on this turn — and since mika#3003 that is a *measured* fact
+    // about this turn, not a permanent property of the engine: no tool ran here, so the
+    // read ledger is empty, nothing can be attributed, and the mood stays conditional.
     assert!(
         reprompt.contains("usually comes from"),
         "the origin sentence must stay hedged, got:\n{reprompt}"
     );
+    // mika#3003 — **le contrôle négatif d'AC2, dans le même fichier que le cas positif.**
+    // Aucun outil n'a tourné sur ce tour, donc le moteur ne détient aucun texte où chercher
+    // l'extrait : la phrase à l'indicatif doit être absente. Sans cette moitié, un moteur
+    // qui attribuerait à tort — à un outil qu'il n'a pas appelé, ou par défaut — passerait
+    // les sept assertions ci-dessus sans en rougir aucune.
+    for indicative in [
+        "quotes, word for word, what the",
+        "This is measured, not guessed",
+    ] {
+        assert!(
+            !reprompt.contains(indicative),
+            "mika#3003 — with no tool read this turn, nothing may be asserted in the \
+             indicative; found {indicative:?} in:\n{reprompt}"
+        );
+    }
 
     // Fail-closed, unchanged: the second response is no better, so the disposition still falls.
     assert_has_output(&trace);
     grounding_assertions::assert_response_forbids(&trace, &["Disposition: READY"]);
     grounding_assertions::assert_response_contains(&trace, "Disposition: ESCALATE");
     grounding_assertions::assert_response_contains(&trace, ENGINE_FINDING_MARKER);
+
+    Ok(())
+}
+
+/// Le corps du ticket mika#3003, servi par un outil pendant le tour.
+///
+/// C'est `gh_read issue_view` qui l'avait rendu le 2026-10-31 ; ici c'est `read_agent_file`,
+/// qui lit un fichier du home de l'agent — déterministe, sans réseau. **Le nom de l'outil est
+/// volontairement un autre que celui de l'incident** : ce vol n'a pas de cas spécial pour
+/// `gh_read`, il interroge le registre de lecture du tour, donc n'importe quel outil ayant
+/// rendu le texte prouve le mécanisme. Un test qui n'aurait passé que sur `gh_read` aurait
+/// laissé passer une implémentation par liste d'outils, que le plan écarte nommément.
+///
+/// Le corps est en français et [`BRIEF`] en anglais : aucune fenêtre de 40 caractères ne peut
+/// passer de l'un à l'autre par accident, donc l'ancre fautive est refusée pour la bonne
+/// raison (`QuoteNotInBrief`) et pas par collision de fixture.
+const TICKET_BODY_3003: &str = "# mika#3003 — mika-arch cite le corps du ticket\n\n\
+     La garde d'ancrage de mika#2037 retient une disposition de mika-arch quand ses citations \
+     ne viennent pas du brief, c'est-à-dire du plan revu. Le 2026-10-31, l'architecte a cité \
+     le corps du ticket, qu'il avait lu avec un outil, au lieu du plan.\n\n\
+     La garde a eu raison : elle n'est pas en cause. Le défaut est que l'architecte ne sait \
+     pas, à la relance, que sa citation vient du ticket et non du plan.\n";
+
+/// Test 2e: **mika#3003 AC2, moitié positive** — le rejeu de la forme mesurée le 2026-10-31.
+///
+/// Même géométrie que le test 2a, à une chose près et c'est tout le vol : un pas d'outil
+/// précède la revue. L'architecte lit un document, puis son `A1` en cite la première phrase
+/// mot pour mot tandis que `A2` et `A3` citent le brief à deux régions disjointes. 3 ancres
+/// trouvées, 2 valides, `QuoteNotInBrief` — exactement la trace `f2a64bd7`.
+///
+/// Ce que ce test attest et que 2a ne peut pas voir :
+///
+/// - le re-prompt passe à l'**indicatif** et **nomme l'outil** qui a rendu le texte ;
+/// - il dit que c'est mesuré, parce que ça l'est : le registre a retrouvé l'extrait dans la
+///   sortie de cet outil, à la fenêtre du matcher et au seuil du contrat ;
+/// - la phrase conditionnelle de mika#2794 **disparaît** pour cette ancre — deux réponses à
+///   la même question seraient pires qu'une seule imprécise ;
+/// - l'extrait de la ligne fautive est toujours cité, guillemets doublés compris (mika#2794) ;
+/// - et le fail-closed de mika#2037 avec le fail-visible de mika#2338 ne bougent pas d'un
+///   octet : une seconde réponse non corrigée finit sur `Disposition: ESCALATE`, portant la
+///   ligne de constat du moteur et `anchors_valid=2`. **Un re-prompt plus précis est une
+///   tentative d'obéissance, jamais une relaxation de la garde** (interdit du brief, doctrine
+///   mika#1190 pour le risque nommé).
+#[tokio::test]
+async fn test_review_anchor_reprompt_names_the_tool_that_produced_the_quote() -> anyhow::Result<()>
+{
+    // `A1` cite la première phrase du corps du ticket ; `A2` et `A3` citent le brief.
+    let two_of_three = "A1: \"La garde d'ancrage de mika#2037 retient une disposition de mika-arch quand ses citations ne viennent pas du brief\" — noté.\n\
+         A2: \"re-resolves the manager cycle token before every cycle instead of freezing it\" — correct.\n\
+         A3: \"is the trace exhaustive, should every refresh be journaled at INFO level\" — yes.\n\
+         \n\
+         Still nothing to add. The plan is fine as written.\n\
+         \n\
+         Disposition: READY";
+    let skills = SkillRegistry::from_test_entries(vec![make_anchor_skill(
+        "arch-groom-ticket",
+        &["groom-ticket"],
+        ARCH_SUFFIX_UNION,
+        ANCHOR_PREFIXES,
+        FINDING_PREFIXES,
+    )]);
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Le pas qui alimente le registre de lecture du tour.
+            tool_call_response(
+                "read_agent_file",
+                serde_json::json!({"path": "ticket-3003.md"}),
+            ),
+            text_response(two_of_three),
+            text_response(two_of_three),
+        ])
+        .skills(skills)
+        .build()
+        .await?;
+
+    // Le document que l'outil rendra, dans le home de l'agent — `read_agent_file` sans
+    // paramètre `agent` lit sous cette racine exactement.
+    std::fs::write(
+        harness.home_dir.path().join("ticket-3003.md"),
+        TICKET_BODY_3003,
+    )?;
+
+    let trace = harness.run(BRIEF).await?;
+
+    let requests = harness.mock().captured_requests();
+    // Le re-prompt est localisé **par son contenu**, jamais par un index : un pas d'outil
+    // s'intercale ici, donc la relance n'est pas la deuxième requête capturée mais la
+    // troisième. Chercher par contenu est ce qui garde ce test vrai si un futur vol ajoute
+    // ou retire un pas avant la revue.
+    let reprompt = requests
+        .iter()
+        .flat_map(user_texts)
+        .find(|t| t.contains("What blocked it"))
+        .expect("one request must carry the review-anchor corrective re-prompt");
+
+    // L'indicatif, et le nom de l'outil qui a réellement rendu le texte.
+    assert!(
+        reprompt.contains(
+            "A1 quotes, word for word, what the `read_agent_file` tool returned during this turn"
+        ),
+        "mika#3003 AC1 — the re-prompt must name the tool that produced the quote, got:\n{reprompt}"
+    );
+    assert!(
+        reprompt.contains("This is measured, not guessed"),
+        "mika#3003 — the sentence must say that the origin was established, not guessed, \
+         got:\n{reprompt}"
+    );
+    // Et la conditionnelle de mika#2794 s'efface : l'origine est établie, donc elle n'est
+    // plus une hypothèse. Deux phrases répondant à la même question en deux humeurs
+    // opposées, c'est la forme que le modèle skimme.
+    assert!(
+        !reprompt.contains("usually comes from"),
+        "mika#3003 — the hedged sentence must give way once the origin is established, \
+         got:\n{reprompt}"
+    );
+
+    // mika#2794 n'a rien perdu : la ligne fautive est toujours nommée et citée, guillemets
+    // doublés compris — l'extérieur est au moteur, l'intérieur au modèle.
+    assert!(
+        reprompt.contains("Anchors refused:"),
+        "the re-prompt must still open the refused list, got:\n{reprompt}"
+    );
+    assert!(
+        reprompt.contains("A1: \"\"La garde d'ancrage de mika#2037 retient une disposition"),
+        "the re-prompt must still quote the faulty line's opening, got:\n{reprompt}"
+    );
+    assert!(
+        reprompt.contains("Anchors accepted: A2, A3"),
+        "the re-prompt must still name the two anchors that passed, got:\n{reprompt}"
+    );
+
+    // Fail-closed et fail-visible, inchangés.
+    assert_has_output(&trace);
+    grounding_assertions::assert_response_forbids(&trace, &["Disposition: READY"]);
+    grounding_assertions::assert_response_contains(&trace, "Disposition: ESCALATE");
+    grounding_assertions::assert_response_contains(&trace, ENGINE_FINDING_MARKER);
+    grounding_assertions::assert_response_contains(&trace, "anchors_valid=2");
+    grounding_assertions::assert_response_forbids(&trace, &[WITHHELD_MARKER]);
 
     Ok(())
 }
@@ -734,6 +894,287 @@ async fn test_review_anchor_no_op_on_unparsed_recovery_prompt() -> anyhow::Resul
     );
     assert_has_output(&trace);
     grounding_assertions::assert_response_contains(&trace, "Disposition: READY");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mika#3003 U2 bis — le DÉNOMINATEUR d'AC3, lu sur le journal du tour réel.
+//
+// AC3 demande « le compte de `review_anchor_withheld` **avec son dénominateur**
+// (passages non terminaux) ». Ce dénominateur n'existait pas : les deux lignes
+// préexistantes ne sont émises que sur les branches fautives, donc leur rapport
+// mesure « retenues / refus », jamais « retenues / passages ». La ligne
+// `guard.review_anchor_armed` est ce dénominateur, et elle n'a de valeur que si
+// elle est émise sur **toutes** les branches armées, la saine comprise — une
+// ligne absente de la branche saine ferait de son compte un second numérateur.
+//
+// Ces deux sondes ne sont pas dans `src/` parce qu'elles ne peuvent pas y être :
+// la ligne est émise au fond de `run_loop`, qu'un test unitaire du module de la
+// garde n'atteint pas. Elles lisent donc le journal d'un tour `run_agent` entier.
+// ---------------------------------------------------------------------------
+
+/// Un événement capturé : son message, puis ses champs structurés.
+type Captured = std::sync::Arc<std::sync::Mutex<Vec<(String, HashMap<String, String>)>>>;
+
+struct CapturingLayer {
+    events: Captured,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = HashMap::new();
+        let mut visitor = FieldVisitor(&mut fields);
+        event.record(&mut visitor);
+        let message = fields.remove("message").unwrap_or_default();
+        if let Ok(mut events) = self.events.lock() {
+            events.push((message, fields));
+        }
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+/// `tracing_subscriber::registry()` installe un dispatcher mono-thread si rien ne
+/// retient l'autre forme ; sans ce garde, un `set_default` concurrent d'un test
+/// voisin perd les événements.
+fn keep_registry_multi_dispatcher() {
+    static KEEPER: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEPER.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
+fn capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+    use tracing_subscriber::layer::SubscriberExt;
+    keep_registry_multi_dispatcher();
+    let events: Captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(CapturingLayer {
+        events: std::sync::Arc::clone(&events),
+    });
+    let guard = tracing::subscriber::set_default(subscriber);
+    (guard, events)
+}
+
+/// Les champs des événements portant exactement ce nom, dans l'ordre d'émission.
+fn lines_named(events: &Captured, name: &str) -> Vec<HashMap<String, String>> {
+    events
+        .lock()
+        .expect("captured events mutex")
+        .iter()
+        .filter(|(_, fields)| fields.get("event").map(String::as_str) == Some(name))
+        .map(|(_, fields)| fields.clone())
+        .collect()
+}
+
+/// U2 bis, moitié SAINE : la garde s'arme, elle est satisfaite, et la ligne du
+/// dénominateur est émise quand même.
+///
+/// Ce que cette sonde attache, et que la moitié fautive ne peut pas voir :
+///
+/// - `guard.review_anchor_armed` est émise sur la branche `Satisfied`. C'est
+///   toute la valeur du dénominateur : un passage non terminal qui *réussit* est
+///   un passage, et une ligne qui ne sortirait que sur un refus donnerait un
+///   rapport de 1 à chaque fenêtre de mesure.
+/// - `anchors_found` et `anchors_valid` sont **absents**, pas à zéro. Sur la
+///   branche saine la garde ne compte rien : `AnchorVerdict::Satisfied` ne porte
+///   aucun compteur, et un `0` rendu là mentirait sur une réponse à trois ancres
+///   valides (motif mika#2331). Ils sont émis en `Option<usize>` pour cela.
+/// - `withheld` vaut `false` et `attributed_sources` est présent et vide : aucun
+///   outil n'a tourné, donc rien n'est attribuable, et c'est une chaîne vide
+///   plutôt qu'un champ absent (classe mika#2340 — un champ absent dirait
+///   « binaire antérieur », pas « rien attribué »).
+/// - Les deux lignes préexistantes sont absentes : elles mesurent le refus, pas
+///   le passage. Sans cette assertion, une ligne `armed` émise au mauvais endroit
+///   passerait les quatre précédentes.
+#[tokio::test]
+async fn test_review_anchor_armed_line_on_the_satisfied_branch_3003() -> anyhow::Result<()> {
+    let (_guard, events) = capture();
+
+    let harness = EvalHarness::builder()
+        .responses(vec![text_response(ANCHORED_REVIEW)])
+        .skills(groom_skill())
+        .build()
+        .await?;
+
+    let trace = harness.run(BRIEF).await?;
+
+    assert_eq!(
+        trace.llm_call_count, 1,
+        "the anchored review must be accepted on the first pass, got {} call(s)",
+        trace.llm_call_count
+    );
+    assert_has_output(&trace);
+
+    let armed = lines_named(&events, "guard.review_anchor_armed");
+    assert_eq!(
+        armed.len(),
+        1,
+        "mika#3003 AC3 — exactly one armed line per guard evaluation, got {}: {armed:?}",
+        armed.len()
+    );
+    let line = &armed[0];
+
+    assert_eq!(
+        line.get("withheld").map(String::as_str),
+        Some("false"),
+        "the satisfied branch withholds nothing: {line:?}"
+    );
+    assert_eq!(
+        line.get("attributed_sources").map(String::as_str),
+        Some(""),
+        "mika#3003 — `attributed_sources` is present and EMPTY when nothing was attributed, \
+         never absent: {line:?}"
+    );
+    assert!(
+        !line.contains_key("anchors_found") && !line.contains_key("anchors_valid"),
+        "mika#3003 — the satisfied branch counts nothing, so the two counters must render \
+         ABSENT rather than zero (mika#2331): {line:?}"
+    );
+    assert!(
+        line.get("brief_chars")
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n > 0),
+        "the armed line must carry the brief it armed on: {line:?}"
+    );
+
+    assert!(
+        lines_named(&events, "guard.review_anchor").is_empty()
+            && lines_named(&events, "guard.review_anchor_withheld").is_empty(),
+        "the two pre-existing lines measure a refusal; a satisfied pass emits neither"
+    );
+
+    Ok(())
+}
+
+/// U2 bis, moitié FAUTIVE : deux passages, deux lignes, et le champ neuf présent
+/// et vide sur les deux lignes préexistantes.
+///
+/// Même rejeu que le test 2 — deux réponses identiques à 2 ancres sur 3 — lu sur
+/// le journal. Ce qu'il attache :
+///
+/// - **Deux** lignes `armed` pour un tour qui relance une fois : une par
+///   *évaluation*. Le dénominateur d'AC3 est « passages non terminaux », et une
+///   relance est un passage ; compter les tours au lieu des passages sous-estimerait
+///   le dénominateur d'un facteur qui dépend du taux de relance.
+/// - `withheld` passe de `false` à `true` entre les deux. Le numérateur d'AC3 se
+///   lit donc aussi sur cette ligne seule, sans jointure avec l'ERROR.
+/// - `anchors_found=3` / `anchors_valid=2` sont **présents** ici — l'exact
+///   complément de l'absence attachée par la sonde saine. Les deux assertions
+///   ensemble disent que les compteurs suivent la branche, et non la ligne.
+/// - `attributed_sources` est présent et **vide** sur `guard.review_anchor`
+///   (WARN) et sur `guard.review_anchor_withheld` (ERROR). Aucun outil n'a
+///   tourné, donc le registre est vide : c'est le contrôle négatif du champ, et
+///   sans lui un champ qui ne serait émis *que* lorsqu'une attribution existe
+///   laisserait le lecteur d'AC3 incapable de distinguer « rien attribué » de
+///   « binaire antérieur au vol ».
+#[tokio::test]
+async fn test_review_anchor_armed_line_on_the_missing_branch_3003() -> anyhow::Result<()> {
+    let (_guard, events) = capture();
+
+    let two_of_three = "A1: \"re-resolves the manager cycle token before every cycle instead of freezing it\" — correct.\n\
+         A2: \"is the trace exhaustive, should every refresh be journaled at INFO level\" — yes.\n\
+         A3: the threshold for repeated auth failures is left open, express it as a duration.\n\
+         \n\
+         Still nothing to add. The plan is fine as written.\n\
+         \n\
+         Disposition: READY";
+    let skills = SkillRegistry::from_test_entries(vec![make_anchor_skill(
+        "arch-groom-ticket",
+        &["groom-ticket"],
+        ARCH_SUFFIX_UNION,
+        ANCHOR_PREFIXES,
+        FINDING_PREFIXES,
+    )]);
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            text_response(two_of_three),
+            text_response(two_of_three),
+        ])
+        .skills(skills)
+        .build()
+        .await?;
+
+    let trace = harness.run(BRIEF).await?;
+    assert_has_output(&trace);
+    grounding_assertions::assert_response_contains(&trace, "Disposition: ESCALATE");
+
+    let armed = lines_named(&events, "guard.review_anchor_armed");
+    assert_eq!(
+        armed.len(),
+        2,
+        "mika#3003 AC3 — one armed line per PASS, so a re-prompting turn emits two, got {}: \
+         {armed:?}",
+        armed.len()
+    );
+    assert_eq!(
+        armed[0].get("withheld").map(String::as_str),
+        Some("false"),
+        "the first pass re-prompts, it does not withhold: {:?}",
+        armed[0]
+    );
+    assert_eq!(
+        armed[1].get("withheld").map(String::as_str),
+        Some("true"),
+        "the second pass withholds — this is AC3's numerator on the armed line itself: {:?}",
+        armed[1]
+    );
+    for line in &armed {
+        assert_eq!(
+            line.get("anchors_found").map(String::as_str),
+            Some("3"),
+            "the missing branch carries its counters: {line:?}"
+        );
+        assert_eq!(
+            line.get("anchors_valid").map(String::as_str),
+            Some("2"),
+            "the missing branch carries its counters: {line:?}"
+        );
+        assert_eq!(
+            line.get("attributed_sources").map(String::as_str),
+            Some(""),
+            "no tool ran this turn, so the ledger is empty — present and empty, never absent: \
+             {line:?}"
+        );
+    }
+
+    for name in ["guard.review_anchor", "guard.review_anchor_withheld"] {
+        let lines = lines_named(&events, name);
+        assert_eq!(
+            lines.len(),
+            1,
+            "{name} must be emitted exactly once on this replay, got {}: {lines:?}",
+            lines.len()
+        );
+        assert_eq!(
+            lines[0].get("attributed_sources").map(String::as_str),
+            Some(""),
+            "mika#3003 — the new field is present and EMPTY on {name} when nothing was \
+             attributed (mika#2340: an absent field would mean an older binary): {:?}",
+            lines[0]
+        );
+    }
 
     Ok(())
 }
