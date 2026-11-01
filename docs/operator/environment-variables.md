@@ -9742,6 +9742,18 @@ grep guard.unactioned_frequency_promise "$MIKA_SPIRIT_LOG_FILE" \
                   and .timestamp >= "2026-10-23T16:00:35Z"
                   and .timestamp <  "2026-10-30T16:00:35Z") | .timestamp' \
   | cut -c1-10 | uniq -c
+
+# --- l'état de la porte elle-même (mika#2978) ---
+# 7. Quels agents SERVENT la porte armée, au dernier démarrage, et vers quel
+#    canal. Polarité inverse des six sondes ci-dessus : elles comptent une
+#    population et se lisent sur une fenêtre, celle-ci lit un état et se lit sur
+#    le DERNIER démarrage. Pas de borne de fenêtre, donc : la borner mélangerait
+#    les boots. Une sortie VIDE est le résultat attendu avant l'armement — la
+#    ligne ne parle que sur la dérogation (doctrine mika#2131).
+grep fabrication_p0_gate_armed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "fabrication_p0_gate_armed")
+           | [.timestamp, .agent_id, .escalation_chat_id] | @tsv' \
+  | tail -20
 ```
 
 Le `select` sur `.event` est porteur : chaque `grep` de contrôle positif est une
@@ -9761,6 +9773,17 @@ ce cas la récidive vide ne prouve rien. Une récidive sans aucune ligne alors q
 contrôle positif en a beaucoup, sur un binaire qui contient le site, est le résultat
 attendu, pas une panne.
 
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `fabrication_p0_gate_armed` | INFO | **vide avant l'armement** | une ligne par agent qui SERT la porte armée, avec son canal d'escalade ; son absence après `make deploy` veut dire *désarmée* — l'état livré — **ou** un binaire antérieur au vol (classe mika#2340) |
+
+Le champ `escalation_chat_id` est rendu par le **même formateur** que le refus de
+`assert_fabrication_p0_arming_valid` (`escalation_chat_display`) : il porte `absent`,
+ou la valeur lue, et **jamais** un défaut qui vaudrait `0`. Un `0` et une absence
+perdent tous deux le P0, mais ne se réparent pas au même endroit (mika#2871), et un
+`unwrap_or_default()` ferait mentir les deux lignes le jour où le couple
+armé-et-non-routé redevient atteignable.
+
 #### Condition d'armement
 
 Armer, c'est `MIKA_FABRICATION_P0_NOTIFY=true` puis redémarrer — un changement de
@@ -9775,6 +9798,15 @@ l'agent fautif, la valeur lue et les deux sorties
 silencieusement. La doc exigeait le couple ; le code l'exige maintenant aussi. Ce refus
 ne touche pas le CLI : `mika config get fabrication_p0_notify` reste lisible sur une
 installation mal configurée — c'est la commande qui diagnostique le refus.
+
+**Ce qui atteste l'armement, c'est la ligne de démarrage, pas le CLI (mika#2978).**
+`mika config get fabrication_p0_notify` lit la configuration **déclarée** : elle est
+verte sur un `config.toml` édité dont le redémarrage n'a jamais eu lieu, et verte aussi
+quand un `.env` par agent écrase la valeur plus haut dans la cascade. La sonde 7
+ci-dessus est écrite par le processus qui **sert** la valeur, au démarrage, après que
+la garde a établi que la porte armée a une route. C'est donc elle — et non le CLI — qui
+fait la preuve que la décision d'armement d'AC2 est en force : une ligne par agent
+armé, avec son canal, ou le silence qui dit « désarmée ».
 
 Armer après au moins 7 jours de relevé des six sondes, et seulement si les trois
 colonnes de récidive tiennent sous un seuil que ce relevé rend défendable pour une

@@ -974,6 +974,20 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // l'utilisateur final avant que quiconque lise le refus.
     fabrication_p0_guard::assert_fabrication_p0_arming_valid(global_home)?;
 
+    // mika#2978 — le cinquième membre de la famille `log_*_gate_state`, et il
+    // vient **ici** et non avec les quatre autres ci-dessous : la garde qu'on
+    // vient de passer a établi que *si* la porte est armée, *alors* elle a une
+    // route, donc la ligne peut dire les deux faits ensemble — « armée, et routée
+    // vers tel canal » — sans re-résoudre la cascade pour la valider.
+    //
+    // Sa polarité est celle de `log_pass_evidence_gate_state` par la lettre et
+    // celle des trois autres par l'esprit : la porte part désarmée
+    // (Fire-Disposition mika#1574), mais l'état livré est l'état **sûr**, donc
+    // c'est l'état ARMÉ qui est la dérogation et qui parle. Le silence veut dire
+    // « désarmée ». Une ligne par agent armé, jamais agrégée : désarmer se fait
+    // dans le `config.toml` d'un agent, pas de la flotte.
+    fabrication_p0_guard::log_fabrication_p0_gate_state(global_home);
+
     // mika#2455 — say, once at startup, that the CI↔verdict gate is disarmed.
     // Silent when armed: a line per boot on a healthy fleet is the churn the
     // mika#2131 doctrine bounds, while the silence of a *disarmed* gate reads
