@@ -66,7 +66,12 @@ use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pen
 /// guard skips — verdict text is the agent's real output, not fabrication.
 ///
 /// Adding a new verdict-producing skill? Add it here — single point of truth.
-const VERDICT_PRODUCER_SKILLS: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
+///
+/// `pub` depuis mika#3002 : c'est aussi la population du stand-down de la garde de
+/// reprise (`IntentScope::OutsideReviewedPlan`), et le test d'AC1/AC2 nomme son skill
+/// **depuis cette constante**. Retapé en littéral là-bas, un renommage en production
+/// laisserait le test vert sur un nom mort.
+pub const VERDICT_PRODUCER_SKILLS: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
 
 /// Check if any skill in the registry is a known verdict producer.
 /// mika#2355 — the names of the skills injected on a turn, in registry order.
