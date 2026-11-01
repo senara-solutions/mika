@@ -472,6 +472,10 @@ pub struct Issue {
 // restent ici, où l'ancrage du ticket a sa valeur historique — ils exercent la
 // fonction importée, pas une copie.
 use crate::plan_callout::strip_fenced_blocks;
+// La cause de péremption d'un callout vit chez l'écrivain de sa prose
+// (mika#3001) : c'est lui qui doit rester le seul à savoir ce que chaque
+// variante fait dire à la ligne « Plan antérieur ».
+use crate::plan_callout::PriorPlanCause;
 use serde::{Deserialize, Serialize};
 
 /// Les trois signaux que le grooming écrit et que le dispatch exige.
@@ -3421,7 +3425,7 @@ async fn gh_merged_pr_for_branch(
 /// `gh issue view --json body -q .body`, et non l'`issue.body` que la boucle
 /// porte déjà : entre la mesure et l'écriture il y a deux appels réseau, et le
 /// grooming écrit ce même bloc par `_write_canonical_callout`. La relecture est
-/// ce qui rend possible le comparer-puis-écrire de [`rewrite_dead_callout`].
+/// ce qui rend possible le comparer-puis-écrire de [`rewrite_stale_callout`].
 ///
 /// `jq -r` termine sa sortie par un `\n` qui n'est pas dans le corps : il est
 /// retiré, et lui seul, pour que la comparaison de R9 porte exactement sur les
@@ -3513,14 +3517,22 @@ const CALLOUT_REWRITE_TARGET_KEY: &str = "auto_pull_callout_rewrite";
 /// Le vocabulaire de `cause` est **clos** — `body_changed`, `body_unreadable`,
 /// `write_refused` — pour la raison de mika#2205 : deux populations sous un même
 /// nom ne se soustraient pas, et trois orthographes d'une même panne ne se
-/// comptent pas.
+/// comptent pas. mika#3001 n'y ajoute **rien** : ses non-conclusions ne sont pas
+/// des abandons de réécriture mais des non-candidatures, et elles sortent avant
+/// d'arriver ici, par [`plan_presence`].
+///
+/// Ce que mika#3001 ajoute est un **champ**, `staleness`, qui dit par quel des
+/// deux chemins ce callout a été jugé périmé. C'est par lui qu'un opérateur
+/// compte la population du chemin B : `merged_pr` seul ne les distingue pas, et
+/// deux populations sous un même nom ne se soustraient pas (mika#2205). Il est
+/// gratuit — le JSON est déjà écrit ici.
 #[allow(clippy::too_many_arguments)]
 async fn note_callout_rewrite(
     db: &AsyncDatabase,
     issue_number: u64,
     branch: &str,
     plan: Option<&str>,
-    merged_pr: u64,
+    staleness: PriorPlanCause,
     cause: Option<&str>,
     token_source: &str,
     phase: &str,
@@ -3532,11 +3544,13 @@ async fn note_callout_rewrite(
     } else {
         "abandoned"
     };
+    let merged_pr = staleness.merged_pr();
     let after = serde_json::json!({
         "issue": issue_number,
         "branch": branch,
         "plan": plan,
         "merged_pr": merged_pr,
+        "staleness": staleness.slug(),
         "outcome": outcome,
         "cause": cause,
         "token_source": token_source,
@@ -3550,9 +3564,10 @@ async fn note_callout_rewrite(
             branch,
             plan = ?plan,
             merged_pr,
+            staleness = staleness.slug(),
             phase,
-            "auto_pull: le callout d'une branche supprimée par un merge est réécrit \
-             en « Plan antérieur » (mika#2839)"
+            "auto_pull: le callout d'un vol dont la PR est mergée est réécrit \
+             en « Plan antérieur » (mika#2839, mika#3001)"
         ),
         Some(cause) => warn!(
             event = "auto_pull_callout_rewrite_abandoned",
@@ -3560,6 +3575,7 @@ async fn note_callout_rewrite(
             branch,
             plan = ?plan,
             merged_pr,
+            staleness = staleness.slug(),
             cause,
             phase,
             "auto_pull: le callout n'a pas été réécrit ; le ticket est promu \
@@ -3587,10 +3603,12 @@ async fn note_callout_rewrite(
     }
 }
 
-/// Réécrire le callout d'une branche que le merge de sa PR a supprimée
-/// (mika#2839 R6/R9).
+/// Réécrire le callout d'un vol dont le merge de la PR a périmé le plan
+/// (mika#2839 R6/R9, mika#3001).
 ///
-/// Appelée depuis l'arm `BranchDeletedByMerge` de [`promotion_gate_allows`],
+/// Appelée depuis [`promotion_gate_allows`] dès que [`stale_callout_cause`] a
+/// nommé une cause — par l'un ou l'autre de ses deux chemins, qui ne diffèrent
+/// plus ici que par le `staleness` qu'ils portent —
 /// **après** la ligne d'audit de mika#2837, et sans pouvoir changer le verdict :
 /// tous les écarts et toutes les pannes sortent par
 /// `auto_pull_callout_rewrite_abandoned` avec leur `cause` et rendent `Ok(())`.
@@ -3611,14 +3629,14 @@ async fn note_callout_rewrite(
 /// avait posée : R9 est la réponse — celui qui perd la course ne détruit pas
 /// l'écriture de l'autre, il l'abandonne et le dit.
 #[allow(clippy::too_many_arguments)]
-async fn rewrite_dead_callout(
+async fn rewrite_stale_callout(
     db: &AsyncDatabase,
     github_token: &str,
     label_auth: &LabelWriteToken,
     issue_number: u64,
     measured_body: &str,
     branch: &str,
-    merged_pr: u64,
+    staleness: PriorPlanCause,
     phase: &str,
     trace_id: &str,
     session_id: &str,
@@ -3644,7 +3662,7 @@ async fn rewrite_dead_callout(
                 issue_number,
                 branch,
                 plan,
-                merged_pr,
+                staleness,
                 Some("body_unreadable"),
                 token_source,
                 phase,
@@ -3668,7 +3686,7 @@ async fn rewrite_dead_callout(
             issue_number,
             branch,
             plan,
-            merged_pr,
+            staleness,
             Some("body_changed"),
             token_source,
             phase,
@@ -3685,14 +3703,14 @@ async fn rewrite_dead_callout(
     // un `expect` tuerait la tick pour une réécriture facultative, et le
     // vocabulaire de `cause` est clos.
     let Some(rewritten) =
-        crate::plan_callout::rewrite_callout_as_prior_plan(&fresh, branch, merged_pr)
+        crate::plan_callout::rewrite_callout_as_prior_plan(&fresh, branch, staleness)
     else {
         note_callout_rewrite(
             db,
             issue_number,
             branch,
             plan,
-            merged_pr,
+            staleness,
             Some("body_changed"),
             token_source,
             phase,
@@ -3714,7 +3732,7 @@ async fn rewrite_dead_callout(
             issue_number,
             branch,
             plan,
-            merged_pr,
+            staleness,
             Some("write_refused"),
             token_source,
             phase,
@@ -3730,7 +3748,7 @@ async fn rewrite_dead_callout(
         issue_number,
         branch,
         plan,
-        merged_pr,
+        staleness,
         None,
         token_source,
         phase,
@@ -3739,6 +3757,88 @@ async fn rewrite_dead_callout(
     )
     .await;
     Ok(())
+}
+
+/// La PR dont le merge rend ce callout périmé, ou rien (mika#3001 AC1).
+///
+/// Le discriminant de la porte, et il a changé de nature. Avant ce vol :
+/// *« la branche du callout est-elle absente d'`origin` ? »* — ce qu'une branche
+/// repoussée douze minutes après le merge de son plan fait répondre « non »
+/// (mika#2958, 2026-10-31 16:36Z). Après : *« la PR qui a porté le plan du
+/// callout est-elle mergée ? »*, ce qui rend l'état de la branche **non
+/// pertinent**.
+///
+/// Deux chemins y mènent, et les deux nomment une PR mergée :
+///
+/// - [`StalenessMeasurement::BranchDeletedByMerge`] — la sonde de mika#2837 a
+///   déjà établi que le merge de cette PR a supprimé la branche, et la branche
+///   n'a eu aucune autre vie depuis : la PR nommée est celle qui a porté le
+///   plan. **Zéro appel de plus**, et le comportement de mika#2839 est conservé
+///   à l'identique ;
+/// - [`StalenessMeasurement::Measured`] — la branche vit. On lit d'abord
+///   [`plan_presence`] sur la charge `compare` **déjà reçue** : c'est gratuit, et
+///   sur `OnBranch` comme sur `Unreadable` on sort sans rien appeler. Ce n'est
+///   que sur `NotOnBranch` — `main` a absorbé le plan, ou il n'existe nulle
+///   part — qu'on pose la sonde, et elle demande alors *quelle* PR mergée porte
+///   ce plan, pas si une PR porte la branche.
+///
+/// Toute autre mesure rend `None` : `NoBranchCallout` n'a pas de callout à
+/// réécrire, `Unavailable` n'a rien mesuré, et `BranchAbsent` est le refus de
+/// mika#2837 — dont le plan annoncé n'existe nulle part, donc rien ne prouve
+/// qu'un merge l'a périmé.
+///
+/// La sonde n'est donc posée que sur une population rare par construction et
+/// **auto-tarissante** : après réécriture le run de callout n'existe plus, donc
+/// [`extract_branch_name`] rend `None`, donc la porte ne mesure plus rien sur ce
+/// ticket.
+async fn stale_callout_cause(
+    github_token: &str,
+    issue_number: u64,
+    measurement: &StalenessMeasurement,
+    branch: &str,
+    plan: &str,
+) -> Option<PriorPlanCause> {
+    match measurement {
+        StalenessMeasurement::BranchDeletedByMerge { pr } => {
+            Some(PriorPlanCause::BranchDeletedByMerge { pr: *pr })
+        }
+        StalenessMeasurement::Measured(staleness) => {
+            match plan_presence(staleness, plan) {
+                PlanPresence::OnBranch => None,
+                PlanPresence::Unreadable => {
+                    // Une non-candidature, pas un abandon : rien n'est tenté,
+                    // donc rien n'est à réparer. `debug!` et non INFO parce que
+                    // le cas nominal passe par le même `match` — mais la
+                    // population existe et doit être trouvable.
+                    debug!(
+                        event = "auto_pull_callout_plan_presence_unreadable",
+                        issue = issue_number,
+                        branch,
+                        plan,
+                        "auto_pull: la liste des fichiers de la branche n'autorise \
+                         aucune conclusion d'absence ; callout laissé tel quel"
+                    );
+                    None
+                }
+                PlanPresence::NotOnBranch => {
+                    let probe =
+                        gh_merged_pr_for_branch(github_token, issue_number, branch, Some(plan))
+                            .await;
+                    // `Err` et `Ok(None)` fusionnés sous un même `None`, et
+                    // c'est délibéré : les deux appellent le geste d'avant ce
+                    // vol — ne pas réécrire. Le détail est déjà journalisé par
+                    // la sonde elle-même.
+                    probe
+                        .ok()
+                        .flatten()
+                        .map(|e| PriorPlanCause::PlanMergedBranchReused { pr: e.number })
+                }
+            }
+        }
+        StalenessMeasurement::NoBranchCallout
+        | StalenessMeasurement::Unavailable
+        | StalenessMeasurement::BranchAbsent { .. } => None,
+    }
 }
 
 /// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
@@ -3814,22 +3914,38 @@ async fn promotion_gate_allows(
         warn!(error = %e, issue = issue.number, "auto_pull: failed to write staleness audit event");
     }
 
-    // mika#2839 — la mesure vient de dire que la branche du callout a été
-    // supprimée par le merge de sa PR : le callout est périmé, le plan ne l'est
-    // pas. On le réécrit ici, et seulement ici, parce que c'est le seul endroit
-    // où cette réponse est déjà payée. L'écriture ne peut pas coûter le verdict
-    // que mika#2837 vient de rendre — voir [`rewrite_dead_callout`].
-    if let (StalenessMeasurement::BranchDeletedByMerge { pr }, Some(b)) =
-        (&measurement, branch.as_deref())
+    // mika#2839, étendu par mika#3001 — la mesure vient peut-être de dire que le
+    // merge d'une PR a périmé le callout de ce ticket : le callout est périmé, le
+    // plan ne l'est pas. On le réécrit ici, et seulement ici, parce que c'est le
+    // seul endroit où cette réponse est déjà payée. L'appel est désormais
+    // **inconditionnel** — le discriminant vit tout entier dans
+    // [`stale_callout_cause`], qui lit la mesure et ne sonde la forge que sur la
+    // seule population candidate. L'écriture ne peut pas coûter le verdict que
+    // mika#2837 vient de rendre — voir [`rewrite_stale_callout`].
+    //
+    // `plan_callout` et non [`extract_plan_path`] : c'est `normalized` qu'il faut
+    // ici — la forme sans préfixe de dépôt, celle des `filename` du `compare` et
+    // des `files[].path` d'une PR — et `extract_plan_path` jette ce champ.
+    let callout_plan =
+        crate::plan_callout::plan_callout(&issue.body, crate::plan_callout::FenceHandling::Strip);
+    if let (Some(b), Some(callout)) = (branch.as_deref(), &callout_plan)
+        && let Some(cause) = stale_callout_cause(
+            github_token,
+            issue.number,
+            &measurement,
+            b,
+            &callout.normalized,
+        )
+        .await
     {
-        let rewrite = rewrite_dead_callout(
+        let rewrite = rewrite_stale_callout(
             db,
             github_token,
             label_auth,
             issue.number,
             &issue.body,
             b,
-            *pr,
+            cause,
             phase,
             trace_id,
             session_id,
@@ -11569,6 +11685,15 @@ Un ticket à plusieurs vols.
 
     const DEAD_CALLOUT_BRANCH: &str = "chore/2839/auto-pull-r-crire-le-callout-d-une";
     const DEAD_CALLOUT_MERGED_PR: u64 = 2840;
+    /// La cause du chemin A, celle que ces quatre tests exercent (mika#3001).
+    ///
+    /// Les quatre sont conservés tels quels à ce paramètre près : leur prose
+    /// attendue ne change pas d'un octet, ce qui en fait le contrôle de
+    /// non-régression du vol et le cas 3 d'AC2 — « branche supprimée par le
+    /// merge, reste réécrit ».
+    const DEAD_CALLOUT_STALENESS: PriorPlanCause = PriorPlanCause::BranchDeletedByMerge {
+        pr: DEAD_CALLOUT_MERGED_PR,
+    };
 
     /// Les lignes d'audit de réécriture de callout d'une session.
     async fn callout_rewrite_rows(db: &AsyncDatabase, session: &str) -> Vec<String> {
@@ -11628,14 +11753,14 @@ Un ticket à plusieurs vols.
             format!("{DEAD_CALLOUT_BODY}\n"),
         );
 
-        let outcome = rewrite_dead_callout(
+        let outcome = rewrite_stale_callout(
             &db,
             "fake-token",
             &fake_label_auth(),
             n,
             DEAD_CALLOUT_BODY,
             DEAD_CALLOUT_BRANCH,
-            DEAD_CALLOUT_MERGED_PR,
+            DEAD_CALLOUT_STALENESS,
             "phase1",
             "trace",
             "session-2839-nominal",
@@ -11646,7 +11771,7 @@ Un ticket à plusieurs vols.
         let expected = crate::plan_callout::rewrite_callout_as_prior_plan(
             DEAD_CALLOUT_BODY,
             DEAD_CALLOUT_BRANCH,
-            DEAD_CALLOUT_MERGED_PR,
+            DEAD_CALLOUT_STALENESS,
         )
         .expect("le transform doit réécrire ce corps");
 
@@ -11677,6 +11802,10 @@ Un ticket à plusieurs vols.
             "\"cause\":null",
             "\"token_source\":\"pat\"",
             "\"merged_pr\":2840",
+            // mika#3001 : le numéro seul ne dit plus de quelle population cette
+            // réécriture vient — deux causes le portent. Le `slug` est ce qui
+            // rend les deux soustractibles (mika#2205).
+            "\"staleness\":\"branch_deleted_by_merge\"",
             "\"plan\":\"docs/plans/2026-10-20-002-chore-2839-x.md\"",
         ] {
             assert!(
@@ -11703,14 +11832,14 @@ Un ticket à plusieurs vols.
             format!("{regroomed}\n"),
         );
 
-        let outcome = rewrite_dead_callout(
+        let outcome = rewrite_stale_callout(
             &db,
             "fake-token",
             &fake_label_auth(),
             n,
             DEAD_CALLOUT_BODY,
             DEAD_CALLOUT_BRANCH,
-            DEAD_CALLOUT_MERGED_PR,
+            DEAD_CALLOUT_STALENESS,
             "phase1",
             "trace",
             "session-2839-autre-branche",
@@ -11755,14 +11884,14 @@ Un ticket à plusieurs vols.
             "Le callout a été retiré à la main.\n",
         );
 
-        let outcome = rewrite_dead_callout(
+        let outcome = rewrite_stale_callout(
             &db,
             "fake-token",
             &fake_label_auth(),
             n,
             DEAD_CALLOUT_BODY,
             DEAD_CALLOUT_BRANCH,
-            DEAD_CALLOUT_MERGED_PR,
+            DEAD_CALLOUT_STALENESS,
             "phase1",
             "trace",
             "session-2839-sans-callout",
@@ -11804,14 +11933,14 @@ Un ticket à plusieurs vols.
             "gh: Resource not accessible by integration (HTTP 403)",
         );
 
-        let outcome = rewrite_dead_callout(
+        let outcome = rewrite_stale_callout(
             &db,
             "fake-token",
             &fake_label_auth(),
             n,
             DEAD_CALLOUT_BODY,
             DEAD_CALLOUT_BRANCH,
-            DEAD_CALLOUT_MERGED_PR,
+            DEAD_CALLOUT_STALENESS,
             "phase1",
             "trace",
             "session-2839-refus",
@@ -12492,5 +12621,110 @@ Un ticket à plusieurs vols.
             PlanPresence::OnBranch,
             "la troncature ne retire pas un fait déjà établi"
         );
+    }
+
+    /// Le corps de #2958 à l'instant du groom d18d6ef1 — la branche vit encore
+    /// (repoussée à 16:36Z par le first-push de mika#2626) et le callout nomme
+    /// toujours le plan du vol 2d, déjà sur `main` depuis le merge de #2992.
+    ///
+    /// C'est le corps que le chemin A n'a jamais réécrit, parce que son
+    /// discriminant — l'absence de la branche — était faux ici.
+    const REUSED_CALLOUT_BODY_2958: &str = r#"## Phase 2-C — le manager groome la relève
+
+> - **Branch:** `feat/2958/manager-phase-2-c-vol-2-le-manager`
+> - **Plan:** `docs/plans/2026-10-31-005-feat-2958-manager-groome-la-releve-vol-2d-plan.md` (committed on branch @ 6fa323a9)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: dd15af62"#;
+
+    /// **Le câblage du chemin B — la cause que la porte a mesurée atteint la
+    /// prose écrite ET la ligne d'audit.**
+    ///
+    /// `rewrite_stale_callout` ne juge rien : il porte la `PriorPlanCause` que
+    /// `stale_callout_cause` a rendue. Ce test en fige les deux sorties sur le
+    /// corps réel de #2958, et son contrôle négatif est que la prose du chemin A
+    /// ne s'y trouve **pas** — sans quoi les deux variantes auraient pu se
+    /// confondre en gardant ce test vert, et le ticket aurait reçu la phrase
+    /// fausse (« la branche a été supprimée ») sur une branche bien vivante.
+    #[tokio::test]
+    async fn mika3001_le_chemin_b_ecrit_la_prose_de_sa_cause() {
+        let db = in_memory_db();
+        let n = 990_305u64;
+        crate::gh_process::assert_fixture_issue(n);
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{REUSED_CALLOUT_BODY_2958}\n"),
+        );
+
+        // #2992, vol 2d : la PR que la fixture d'AC3 désigne pour ce plan.
+        let cause = PriorPlanCause::PlanMergedBranchReused { pr: 2992 };
+        let outcome = rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            REUSED_CALLOUT_BODY_2958,
+            BRANCH_2958,
+            cause,
+            "phase1",
+            "trace",
+            "session-3001-chemin-b",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — la réécriture ne remonte rien");
+
+        let expected = crate::plan_callout::rewrite_callout_as_prior_plan(
+            REUSED_CALLOUT_BODY_2958,
+            BRANCH_2958,
+            cause,
+        )
+        .expect("le transform doit réécrire ce corps");
+        let path_a = crate::plan_callout::rewrite_callout_as_prior_plan(
+            REUSED_CALLOUT_BODY_2958,
+            BRANCH_2958,
+            PriorPlanCause::BranchDeletedByMerge { pr: 2992 },
+        )
+        .expect("le transform doit réécrire ce corps");
+
+        let edits: Vec<String> = gh_calls_for(n)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "exactement un `issue edit` sur #{n} ; vu : {edits:?}"
+        );
+        assert!(
+            edits[0].contains(&expected),
+            "le corps écrit doit être la sortie du transform pour CETTE \
+             cause.\nattendu : {expected:?}\nargv vu : {:?}",
+            edits[0]
+        );
+        assert!(
+            !edits[0].contains(&path_a),
+            "contrôle négatif — la prose du chemin A annoncerait une branche \
+             supprimée sur une branche repoussée, donc vivante"
+        );
+
+        let rows = callout_rewrite_rows(&db, "session-3001-chemin-b").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "une ligne d'audit par passage ; vu : {rows:?}"
+        );
+        for needle in [
+            "\"outcome\":\"rewritten\"",
+            "\"cause\":null",
+            "\"staleness\":\"plan_merged_branch_reused\"",
+            "\"merged_pr\":2992",
+            // Le plan NOMMÉ par le callout, pas celui du vol en cours : c'est
+            // la liaison de mika#2981 que ce vol répare.
+            "\"plan\":\"docs/plans/2026-10-31-005-feat-2958-manager-groome-la-releve-vol-2d-plan.md\"",
+        ] {
+            assert!(
+                rows[0].contains(needle),
+                "la ligne d'audit doit porter {needle} ; vu : {}",
+                rows[0]
+            );
+        }
     }
 }
