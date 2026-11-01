@@ -16,15 +16,15 @@ Inspect your own runtime state — logs, conversations, tasks, audit trail, team
 
 ### Report storage
 
-- Path: `data/self-check/YYYY-MM-DDTHH-MM-SS.json` (relative to agent home, use `write_file`)
+- Path: `data/self-check/YYYY-MM-DDTHH-MM-SS.json` (relative to agent home, use `write_agent_file` with `path` and `content`)
 - Each report is self-contained with `schema_version: 2`
 - Most recent file = last-check timestamp, no separate state file needed
 
 ### Workflow
 
-1. **Find previous report** via `list_home_files` on `data/self-check/`. First run if empty.
+1. **Find previous report** via `list_agent_files` with `path: "data/self-check"`. First run if empty.
 
-2. **Load previous report** via `read_home_file`. Extract `timestamp` for review window start.
+2. **Load previous report** via `read_agent_file` with `path` set to the file found at step 1. Extract `timestamp` for review window start.
 
 3. **Review window:** previous timestamp → now. Cap at 7 days; note if capped.
 
@@ -91,7 +91,7 @@ Inspect your own runtime state — logs, conversations, tasks, audit trail, team
 
 10. **Compare with previous report** — note trends, recurring issues, improvements.
 
-11. **Write report** via `write_file` to `data/self-check/YYYY-MM-DDTHH-MM-SS.json`.
+11. **Write report** via `write_agent_file` with `path: "data/self-check/YYYY-MM-DDTHH-MM-SS.json"` and the report JSON as `content`.
 
 12. **Present summary** — lead with most important findings, key metrics, recommendations.
 
