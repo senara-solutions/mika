@@ -1310,4 +1310,370 @@ pub(crate) async fn add_label_to_issue(token: &str, n: u64) -> Result<(), String
              du code sain et finit par être désarmé — {muets:?}"
         );
     }
+
+    // ── mika#2995 vol 2 — D2 : une écriture de `ready` en forme argv est déclarée ──
+
+    /// Le drapeau `gh` qui ne peut **qu'**ajouter : celui d'`issue edit`.
+    ///
+    /// Nu, et non cité : il est déjà sans ambiguïté, et cela couvre
+    /// `--add-label=ready` du même coup.
+    const ARGV_ADD_LABEL_FLAG: &str = "--add-label";
+
+    /// Les drapeaux d'étiquette **ambigus** : ceux d'`issue create`, qui sont
+    /// aussi ceux d'`issue list`.
+    ///
+    /// `gh issue create --label ready` écrit le consentement ; `gh issue list
+    /// --label ready` lit le bassin. Le drapeau est le même — seul le verbe
+    /// tranche, et c'est [`ARGV_READ_VERBS`] qui le fait. Sans ce second
+    /// prédicat, D2 rougirait sur `milestone_manager/reader.rs:273`, qui compte
+    /// le bassin `ready` du dépôt et n'écrit rien.
+    ///
+    /// # Pourquoi des jetons cités
+    ///
+    /// `-l` nu apparaît dans des dizaines de mots ordinaires ; `"-l"` cité
+    /// n'apparaît que là où un argv est construit. Même raison pour
+    /// `"--label"`. `--label=` porte son `=` : c'est la forme collée, et la
+    /// seule qui puisse naître d'un `format!`.
+    ///
+    /// # Ce n'est pas la liste de `guards.rs`
+    ///
+    /// [`crate::evidence::guards::ADD_LABEL_FLAGS`] liste les drapeaux tels que
+    /// `gh` les reçoit, pour les **lire** dans un argv à l'exécution. Celles-ci
+    /// listent les formes telles qu'un *fichier source* les écrit, pour les lire
+    /// dans du texte Rust. Les deux populations n'ont ni le même alphabet ni le
+    /// même lecteur — les réunir rendrait l'une des deux fausse en silence.
+    const ARGV_AMBIGUOUS_LABEL_FLAGS: &[&str] = &["\"--label\"", "--label=", "\"-l\""];
+
+    /// Les verbes `gh` qui **lisent** une étiquette au lieu de l'écrire.
+    ///
+    /// La polarité est fail-closed, et c'est la décision : un drapeau ambigu
+    /// compte comme une écriture **sauf** si l'argv nomme explicitement un verbe
+    /// de lecture. Un `--label=ready` dont aucun verbe n'est lisible dans sa
+    /// fenêtre est donc refusé plutôt qu'excusé — l'exemption se mérite, et un
+    /// site qui ne dit pas ce qu'il fait est exactement celui qu'il faut lire.
+    const ARGV_READ_VERBS: &[&str] = &["\"list\"", "\"view\""];
+
+    /// Le rayon de la fenêtre de D2, en lignes autour de la ligne du drapeau.
+    ///
+    /// La forme argv sépare le drapeau de sa valeur — `args.push("--add-label")`
+    /// puis `args.push(READY_LABEL)` — et c'est exactement ce qui la rend
+    /// invisible au test 13, qui exige les deux sur la **même** ligne. Deux
+    /// lignes de part et d'autre couvrent la forme réelle de `pool_writer`, un
+    /// `format!` coupé par rustfmt, et un commentaire intercalé ; au-delà, la
+    /// fenêtre commencerait à happer des constantes voisines sans rapport.
+    const FENETRE_ARGV: usize = 2;
+
+    /// Le rayon de la fenêtre du **verbe**, plus large que celle de la valeur.
+    ///
+    /// Le verbe ouvre l'argv et le drapeau vient après ses options : dans
+    /// `reader.rs`, `"list"` précède `"--label"` de cinq lignes, et un `--repo`
+    /// ou un `--state` de plus les écarterait encore. Huit lignes couvrent un
+    /// argv `gh` complet sans atteindre l'argv suivant de la même fonction.
+    const FENETRE_VERBE: usize = 8;
+
+    /// `true` si `line` porte le **jeton du label** `ready`.
+    ///
+    /// Deux écritures comptent, et une troisième est délibérément écartée :
+    ///
+    /// - `"ready"` **cité en entier** : la paire de guillemets est ce qui sépare
+    ///   le label de `"ready_label_add"`, le motif d'audit de `guards.rs:2816` ;
+    /// - `READY_LABEL` **non suivi d'un caractère d'identifiant** : c'est la
+    ///   constante de ce module. `WORK_CREATION_MOTIF_READY_LABEL_ADD` nomme
+    ///   autre chose et reste muet, sans quoi D2 rougirait sur le lecteur du
+    ///   vol 1 — le site même qui refuse l'écriture.
+    ///
+    /// Le découpage passe par [`str::split`] plutôt que par un index d'octet :
+    /// `scripts/check-byte-slices.sh` refuse la seconde forme, et pour une bonne
+    /// raison (mika#764).
+    fn porte_le_jeton_de_ready(line: &str) -> bool {
+        if line.contains("\"ready\"") {
+            return true;
+        }
+        line.split("READY_LABEL")
+            .skip(1)
+            .any(|apres| !apres.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    }
+
+    /// Les `rayon` lignes de part et d'autre de `lines[i]`, elle comprise.
+    fn fenetre<'a>(lines: &'a [&'a str], i: usize, rayon: usize) -> &'a [&'a str] {
+        let debut = i.saturating_sub(rayon);
+        let fin = (i + rayon + 1).min(lines.len());
+        &lines[debut..fin]
+    }
+
+    /// Les **écritures de `ready` en forme argv** dans une moitié de production,
+    /// rendues en `"<fichier>: <ligne du drapeau>"`.
+    ///
+    /// Trois conditions, dans cet ordre :
+    ///
+    /// 1. la ligne porte un drapeau d'étiquette — c'est lui qui ancre les deux
+    ///    fenêtres. Une ligne de `use crate::ready_label::READY_LABEL;` seule ne
+    ///    déclenche donc rien : importer la constante est le geste normal de tout
+    ///    *lecteur* du label ;
+    /// 2. le jeton du label est dans sa fenêtre ([`FENETRE_ARGV`]) — un
+    ///    `--add-label` portant un autre label n'est pas une écriture de `ready` ;
+    /// 3. si le drapeau est ambigu ([`ARGV_AMBIGUOUS_LABEL_FLAGS`]), aucun verbe
+    ///    de lecture n'est dans sa fenêtre ([`FENETRE_VERBE`]).
+    ///
+    /// Les commentaires sont retirés d'abord — la prose *à propos* du geste n'est
+    /// pas le geste (mika#2425), et `guards.rs` en porte quatre lignes qui citent
+    /// `--add-label=ready` pour expliquer ce qu'elle refuse.
+    fn ecritures_argv_de_ready(rel: &str, prod: &str) -> Vec<String> {
+        let depouille = crate::source_scan::strip_comment_lines(prod);
+        let lines: Vec<&str> = depouille.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let ambigu = if line.contains(ARGV_ADD_LABEL_FLAG) {
+                false
+            } else if ARGV_AMBIGUOUS_LABEL_FLAGS.iter().any(|f| line.contains(f)) {
+                true
+            } else {
+                continue;
+            };
+
+            if !fenetre(&lines, i, FENETRE_ARGV)
+                .iter()
+                .any(|w| porte_le_jeton_de_ready(w))
+            {
+                continue;
+            }
+
+            if ambigu
+                && fenetre(&lines, i, FENETRE_VERBE)
+                    .iter()
+                    .any(|w| ARGV_READ_VERBS.iter().any(|v| w.contains(v)))
+            {
+                continue;
+            }
+
+            out.push(format!("{rel}: {}", line.trim()));
+        }
+        out
+    }
+
+    /// **Les écritures de `ready` en forme argv qui sont DÉCLARÉES — une seule.**
+    ///
+    /// `(chemin depuis la racine du dépôt, ticket, le fait précis)`. Le chemin
+    /// porte son préfixe `src/` pour qu'un `grep` depuis la racine du dépôt tombe
+    /// sur cette entrée ; la population, elle, est relative à `src/` (c'est ce
+    /// que rend [`crate::source_scan::production_files`]), d'où le `src/{rel}` au
+    /// site de comparaison.
+    ///
+    /// Cette entrée n'est **pas** un contournement toléré : c'est le fait du
+    /// § 3.2 du plan, pré-déclaré. `admit_pool_tickets` décide `--add-label ready`
+    /// et `--milestone` d'un seul geste, hors applicateur **par conception**
+    /// (propriété 4 du doc de module de `pool_writer`), donc aveugle au parc.
+    /// `MIKA_MANAGER_POOL_WRITE` est OFF par défaut : il n'existe aujourd'hui
+    /// aucune écriture non parquée par cette porte. Router ce site par le parc
+    /// changerait un comportement voulu — c'est une **décision d'opérateur**, et
+    /// l'ouverture de l'interrupteur est ce qui la rend due.
+    const ARGV_READY_WRITERS_DECLARED: &[(&str, &str, &str)] = &[(
+        "src/milestone_manager/pool_writer.rs",
+        "mika#2995",
+        "admit_pool_tickets : décision groupée --add-label ready + --milestone, \
+         hors applicateur par conception (propriété 4 du doc de module), donc \
+         AVEUGLE AU PARC. MIKA_MANAGER_POOL_WRITE OFF par défaut : aucune écriture \
+         non parquée aujourd'hui. Router ce site par le parc changerait un \
+         comportement voulu — décision d'opérateur, pré-déclarée sous \
+         `Fire-Disposition: cinquième applicateur découvert`.",
+    )];
+
+    /// **D2 — toute écriture de `ready` en forme argv est déclarée (AC2c de
+    /// mika#2995, voie B).**
+    ///
+    /// # Ce qu'il refuse, et que le test 13 ne peut pas voir
+    ///
+    /// Le test 13 exige `"ready"` et le nom d'un poseur sur la **même ligne**.
+    /// La forme argv les sépare :
+    ///
+    /// ```text
+    /// args.push("--add-label");
+    /// args.push(READY_LABEL);
+    /// ```
+    ///
+    /// Aucune ligne ne porte les deux, donc le test 13 est vert sur une écriture
+    /// réelle — et il l'est aujourd'hui, sur `pool_writer.rs:156`. Ce n'est pas un
+    /// défaut du test 13 : sa population et sa question sont autres, et deux
+    /// populations sous un même nom ne se soustraient pas (mika#2205). D2 est
+    /// l'autre question, et il la pose sur toute la production sauf ce module.
+    ///
+    /// # L'assertion auto-nettoyante
+    ///
+    /// Chaque entrée déclarée doit **encore porter la forme argv**. Si
+    /// `pool_writer` est un jour routé par l'applicateur, supprimé ou réécrit,
+    /// l'entrée devient stale et ce test rougit en demandant son retrait. Le geste
+    /// qui rend l'exception inutile est celui qui la fait expirer : c'est ce qui
+    /// sépare une déclaration d'une allowlist, et c'est ce que mika#2309 condamne
+    /// quand il manque.
+    ///
+    /// # Disposition si un site NON déclaré apparaît
+    ///
+    /// Router le site par l'applicateur unique de mika#2315, jamais ajouter une
+    /// ligne ici. Une entrée nouvelle est une décision d'opérateur, et elle se
+    /// surface au corps de PR sous `Fire-Disposition: cinquième applicateur
+    /// découvert`.
+    #[test]
+    fn mika2995_une_ecriture_de_ready_en_forme_argv_est_declaree() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut vus: Vec<String> = Vec::new();
+        let mut declares_encore_porteurs: Vec<&str> = Vec::new();
+
+        for (rel, prod) in crate::source_scan::production_files() {
+            // Ce module EST l'applicateur : il porte le littéral et sa propre
+            // écriture gouvernée. Sa population est celle du test 13.
+            if rel == "ready_label.rs" {
+                continue;
+            }
+            scanned += 1;
+            vus.push(rel.clone());
+
+            let sites = ecritures_argv_de_ready(&rel, &prod);
+            if sites.is_empty() {
+                continue;
+            }
+            let depuis_la_racine = format!("src/{rel}");
+            match ARGV_READY_WRITERS_DECLARED
+                .iter()
+                .find(|(f, _, _)| *f == depuis_la_racine)
+            {
+                Some((f, _, _)) => declares_encore_porteurs.push(f),
+                None => offenders.extend(sites),
+            }
+        }
+
+        // Un détecteur qui ne scanne rien ne refuse rien (mika#2578/#2752). Les
+        // deux fichiers nommés sont ceux où un faux positif guetterait : le
+        // lecteur argv du vol 1, et le poseur générique de labels.
+        assert!(
+            scanned > 50,
+            "D2 n'a scanné que {scanned} fichier(s) de production — la population est cassée"
+        );
+        for attendu in ["evidence/guards.rs", "auto_pull.rs"] {
+            assert!(
+                vus.iter().any(|v| v == attendu),
+                "`{attendu}` n'est plus dans la population de D2 — renommé ou déplacé. \
+                 Remettez-le dans la population plutôt que de laisser le détecteur se \
+                 rendormir en silence."
+            );
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2995 — une écriture de `ready` en forme argv n'est pas déclarée. Le test 13 \
+             ne la voit pas : il exige le label et le poseur sur la MÊME ligne, et la forme \
+             argv les sépare. Un site qui écrit `ready` hors de l'applicateur unique \
+             (mika#2315) est aveugle au parc — il crée un consentement que personne n'a donné, \
+             et c'est le consentement que la garde de mika#2772 exige d'un humain. Routez le \
+             site par l'applicateur ; n'ajoutez une entrée que sur décision d'opérateur.\n{}",
+            offenders.join("\n")
+        );
+
+        // L'auto-nettoyage : une entrée dont le site a changé est retirée, pas
+        // conservée « au cas où ».
+        for (f, ticket, fait) in ARGV_READY_WRITERS_DECLARED {
+            assert!(
+                declares_encore_porteurs.contains(f),
+                "l'entrée `{f}` ({ticket}) ne porte plus de forme argv de `ready` — le site a \
+                 été routé par l'applicateur, supprimé ou renommé. RETIREZ L'ENTRÉE : une \
+                 déclaration qui survit à son site est l'allowlist que mika#2309 condamne. \
+                 Fait déclaré : {fait}"
+            );
+        }
+    }
+
+    /// **Le contrôle de bonne foi de D2 — le scan rougit sur une écriture
+    /// plantée.**
+    ///
+    /// D2 est vert sur l'arbre réel avec exactement une entrée déclarée. Ce vert
+    /// a trois causes possibles et une seule est bonne : il pourrait aussi venir
+    /// d'un scan qui a cessé de reconnaître sa forme. Aucune assertion sur
+    /// l'arbre ne peut le voir. Ce test plante donc les **trois** syntaxes,
+    /// chacune poussée sur deux lignes comme la forme réelle, et exige que
+    /// chacune soit vue — puis deux formes saines, et exige le silence.
+    #[test]
+    fn mika2995_le_scan_argv_rougit_sur_une_ecriture_plantee() {
+        // Les trois syntaxes que `gh` accepte, dans leur forme Rust réelle : le
+        // drapeau et la valeur sur deux lignes distinctes.
+        for (syntaxe, plante) in [
+            (
+                "--add-label",
+                "    args.push(\"--add-label\");\n    args.push(READY_LABEL);\n",
+            ),
+            (
+                "--label=",
+                "    let flag = format!(\"--label={}\",\n        READY_LABEL);\n",
+            ),
+            (
+                "-l",
+                "    args.push(\"-l\");\n    args.push(READY_LABEL);\n",
+            ),
+        ] {
+            let vus = ecritures_argv_de_ready("plante.rs", plante);
+            assert_eq!(
+                vus.len(),
+                1,
+                "D2 ne voit pas la syntaxe `{syntaxe}` poussée sur deux lignes — il serait \
+                 vert pour avoir cessé de reconnaître sa forme, et c'est exactement la forme \
+                 que le test 13 laisse passer : {vus:?}"
+            );
+        }
+
+        // Importer la constante est le geste de tout lecteur du label, et il
+        // n'écrit rien. Le drapeau est requis.
+        let import = "\
+use crate::ready_label::READY_LABEL;
+
+fn lit_seulement(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == READY_LABEL)
+}
+";
+        let muets = ecritures_argv_de_ready("import.rs", import);
+        assert!(
+            muets.is_empty(),
+            "un `use READY_LABEL` sans drapeau n'est pas une écriture — D2 rougirait sur tous \
+             les lecteurs du label et finirait désarmé : {muets:?}"
+        );
+
+        // La forme de `wip_rescue.rs` : le même drapeau, un autre label. Le
+        // jeton du label est requis, pas seulement le drapeau.
+        let autre_label = "\
+    let add_label = [
+        \"pr\",
+        \"edit\",
+        \"--add-label\",
+        HUMAN_REVIEW_LABEL,
+    ];
+";
+        let muets = ecritures_argv_de_ready("autre.rs", autre_label);
+        assert!(
+            muets.is_empty(),
+            "un `--add-label` portant un AUTRE label n'est pas une écriture de `ready` — D2 \
+             rougirait sur tout poseur de label du dépôt : {muets:?}"
+        );
+
+        // La forme de `milestone_manager/reader.rs:273` : le drapeau ambigu
+        // d'`issue create` est aussi celui d'`issue list`, et le verbe tranche.
+        // Sans ce cas, le prédicat du verbe pourrait être retiré sans qu'aucun
+        // test ne le dise — alors que c'est lui qui empêche D2 d'appeler
+        // « écriture » le comptage du bassin `ready`.
+        let lecture = "\
+    let ready_json = runner
+        .run(&[
+            \"issue\",
+            \"list\",
+            \"--state\",
+            \"open\",
+            \"--label\",
+            READY_LABEL,
+        ])
+        .await?;
+";
+        let muets = ecritures_argv_de_ready("lecture.rs", lecture);
+        assert!(
+            muets.is_empty(),
+            "`gh issue list --label ready` LIT le bassin, il n'écrit rien — D2 rougirait sur \
+             le compteur de la porte de place et serait désarmé pour cette raison : {muets:?}"
+        );
+    }
 }
