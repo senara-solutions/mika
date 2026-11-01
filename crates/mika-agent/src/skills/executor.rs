@@ -3402,6 +3402,58 @@ async fn report_forced_dispatch_consent(
     }
 }
 
+/// Le JSON de refus de la garde de consentement (mika#2772) — **un seul texte,
+/// un seul site**.
+///
+/// # Pourquoi une fonction libre et non la closure d'origine
+///
+/// Ce corps était une closure locale de [`validate_forced_dispatch_consent`],
+/// et elle ne capturait que `ctx.session_id`. L'étape (5) de la garde est
+/// maintenant [`decide_forced_consent_on_labels`], une fonction sœur : une
+/// closure capturée ne traverse pas cette coupe, et recopier le texte dans les
+/// deux moitiés le ferait diverger en silence — la classe mika#2158, où deux
+/// prédicats dupliqués ont dérivé des mois sans rien casser. Le texte du champ
+/// `recovery` porte l'AC3 de mika#2995 : il a **un** écrivain.
+fn forced_consent_refusal(
+    ctx: &LongRunningContext,
+    verdict: &'static str,
+    subject: Option<String>,
+    reason: String,
+) -> String {
+    serde_json::json!({
+        "error": verdict,
+        "session_id": ctx.session_id,
+        "subject": subject,
+        "reason": reason,
+        // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+        // jugé (mika#2520). Les deux voies de reprise sont donc nommées — mais
+        // la première est ATTRIBUÉE à l'opérateur, elle n'est pas prescrite au
+        // lecteur. C'est l'AC3 de mika#2995, et c'est une correction de
+        // défaut, pas une précaution : le 2026-10-31 à 16:46:32Z ce champ
+        // disait « promote the ticket by posting the `ready` label as
+        // remove→add » ; à 16:51:37Z mika-dev l'a fait, avec le `GH_TOKEN` du
+        // moteur, et le groom est parti. Un remède qui décrit le geste à un
+        // lecteur qui tient l'outil ne décrit pas une levée, il enseigne un
+        // contournement. Le geste `remove` → `add` et le fait de mika#2323 qui
+        // le motive vivent dans la doc opérateur, la surface d'où la promotion
+        // se fait ; ils ont quitté le texte que l'agent lit.
+        "recovery": "This dispatch was not requested — it was demanded by a tool \
+                     constraint this turn, and the ticket it targets has not been \
+                     promoted. Grooming a ticket nobody promoted is what mika#2772 \
+                     refuses. Two things lift it, and only two. Promotion belongs to \
+                     the operator: the `ready` label is their positive consent to \
+                     autonomous dispatch (mika#841), it is not a gesture you perform \
+                     on their behalf, and the engine refuses to write it on any turn \
+                     (mika#2995) — so if this ticket deserves promotion, say so and \
+                     stop. Otherwise, grooming it explicitly traverses this gate \
+                     instead of lifting it: \
+                     `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"` carries a \
+                     grooming intent (mika#1173), and that request is the operator's \
+                     to make."
+    })
+    .to_string()
+}
+
 /// Un dispatch de groom forcé par `required_tools` ne vise jamais un ticket sans
 /// `ready` (mika#2772).
 ///
@@ -3507,41 +3559,6 @@ pub(crate) async fn validate_forced_dispatch_consent(
         return ForcedDispatchConsent::Allowed;
     }
 
-    let refuse = |verdict: &'static str, subject: Option<String>, reason: String| {
-        serde_json::json!({
-            "error": verdict,
-            "session_id": ctx.session_id,
-            "subject": subject,
-            "reason": reason,
-            // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
-            // jugé (mika#2520). Les deux voies de reprise sont donc nommées — mais
-            // la première est ATTRIBUÉE à l'opérateur, elle n'est pas prescrite au
-            // lecteur. C'est l'AC3 de mika#2995, et c'est une correction de
-            // défaut, pas une précaution : le 2026-10-31 à 16:46:32Z ce champ
-            // disait « promote the ticket by posting the `ready` label as
-            // remove→add » ; à 16:51:37Z mika-dev l'a fait, avec le `GH_TOKEN` du
-            // moteur, et le groom est parti. Un remède qui décrit le geste à un
-            // lecteur qui tient l'outil ne décrit pas une levée, il enseigne un
-            // contournement. Le geste `remove` → `add` et le fait de mika#2323 qui
-            // le motive vivent dans la doc opérateur, la surface d'où la promotion
-            // se fait ; ils ont quitté le texte que l'agent lit.
-            "recovery": "This dispatch was not requested — it was demanded by a tool \
-                         constraint this turn, and the ticket it targets has not been \
-                         promoted. Grooming a ticket nobody promoted is what mika#2772 \
-                         refuses. Two things lift it, and only two. Promotion belongs to \
-                         the operator: the `ready` label is their positive consent to \
-                         autonomous dispatch (mika#841), it is not a gesture you perform \
-                         on their behalf, and the engine refuses to write it on any turn \
-                         (mika#2995) — so if this ticket deserves promotion, say so and \
-                         stop. Otherwise, grooming it explicitly traverses this gate \
-                         instead of lifting it: \
-                         `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"` carries a \
-                         grooming intent (mika#1173), and that request is the operator's \
-                         to make."
-        })
-        .to_string()
-    };
-
     // (3) Le sujet, depuis le prompt de dispatch seul.
     let Some((repo_ref, number)) = tool_input
         .and_then(|input| input.get("prompt"))
@@ -3558,7 +3575,8 @@ pub(crate) async fn validate_forced_dispatch_consent(
             true,
         )
         .await;
-        return ForcedDispatchConsent::Refused(refuse(
+        return ForcedDispatchConsent::Refused(forced_consent_refusal(
+            ctx,
             FORCED_CONSENT_SUBJECT_UNRESOLVED,
             None,
             "The dispatch prompt names no readable `<repo>#<number>`, so the ticket whose \
@@ -3584,7 +3602,8 @@ pub(crate) async fn validate_forced_dispatch_consent(
             true,
         )
         .await;
-        return ForcedDispatchConsent::Refused(refuse(
+        return ForcedDispatchConsent::Refused(forced_consent_refusal(
+            ctx,
             FORCED_CONSENT_NO_TOKEN,
             Some(subject.clone()),
             format!(
@@ -3636,7 +3655,8 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 true,
             )
             .await;
-            ForcedDispatchConsent::Refused(refuse(
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
                 FORCED_CONSENT_WITHOUT_CONSENT,
                 Some(subject.clone()),
                 format!(
@@ -3660,7 +3680,8 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 true,
             )
             .await;
-            ForcedDispatchConsent::Refused(refuse(
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
                 FORCED_CONSENT_SUBJECT_IS_PR,
                 Some(subject.clone()),
                 format!(
@@ -3683,7 +3704,8 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 true,
             )
             .await;
-            ForcedDispatchConsent::Refused(refuse(
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
                 FORCED_CONSENT_UNVERIFIABLE,
                 Some(subject.clone()),
                 format!(
