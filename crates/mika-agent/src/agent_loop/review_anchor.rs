@@ -142,6 +142,43 @@ pub fn anchor_reference(brief: &str) -> &str {
         .unwrap_or(brief)
 }
 
+/// La région du brief qui n'est PAS le plan revu : ce qui s'adresse à l'agent.
+///
+/// Exact complément de [`anchor_reference`], sur les mêmes deux constantes — posé à côté
+/// d'elle parce qu'une seconde lecture des marqueurs ailleurs dans l'arbre prendrait du
+/// retard sans que rien ne rougisse.
+///
+/// Rend DEUX tranches — la tête (avant [`RETRY_PLAN_BEGIN`]) et la queue (après
+/// [`RETRY_PLAN_END`]) — parce que les deux sont adressables à l'agent et qu'un `&str`
+/// unique ne peut pas porter deux régions disjointes. Aujourd'hui
+/// `_append_retry_plan_envelope` n'écrit rien après la ligne de fermeture, donc la queue est
+/// vide ; la rendre quand même est ce qui fait que le jour où la relance ajoutera un
+/// post-scriptum, il sera lu au lieu d'être muet.
+///
+/// - deux marqueurs → `(tête, queue)`
+/// - **zéro** marqueur → `("", "")`. Sur un tour de revue, un brief sans enveloppe EST le
+///   plan — [`anchor_reference`] le dit déjà : une première passe, dont le message *est* le
+///   plan, est rendue entière — donc rien n'y est adressé à l'agent.
+/// - **un seul** marqueur → `(brief, "")`, le brief entier. Fail-closed, même posture
+///   qu'[`anchor_reference`] : une enveloppe mutilée est un défaut du shell, et la direction
+///   conservatrice est que la garde appelante s'arme — elle ne coûte qu'un re-prompt.
+///
+/// Référence : mika#3002, mika#2996.
+pub fn outside_reviewed_plan(brief: &str) -> (&str, &str) {
+    match brief.split_once(RETRY_PLAN_BEGIN) {
+        // Enveloppe complète : la tête porte l'instruction, la queue le post-scriptum.
+        Some((head, rest)) => match rest.rsplit_once(RETRY_PLAN_END) {
+            Some((_, tail)) => (head, tail),
+            // Ouvrant seul.
+            None => (brief, ""),
+        },
+        // Fermant seul : l'autre moitié d'enveloppe mutilée.
+        None if brief.contains(RETRY_PLAN_END) => (brief, ""),
+        // Aucun marqueur : le brief est le plan.
+        None => ("", ""),
+    }
+}
+
 /// One anchor line's fate, in body order.
 ///
 /// Four things a future editor needs, because each undoes itself if guessed:
@@ -1610,6 +1647,98 @@ mod mika2996 {
         assert!(
             !against_plan.is_satisfied(),
             "anchors quoting the engine's own corrective text must not attest a review of the plan"
+        );
+    }
+}
+
+/// mika#3002 — la région complémentaire : ce qui, dans un brief de revue, s'adresse à
+/// l'agent plutôt qu'au relecteur.
+#[cfg(test)]
+mod mika3002 {
+    use super::*;
+
+    /// Un plan de groom ordinaire : il parle de reprise parce que c'est son sujet, et il
+    /// cite un jalon. Les deux conjoints de `detect_resume_intent` sont là, et aucune
+    /// intention de reprise n'est exprimée — c'est la forme mesurée le 2026-10-31
+    /// (trace `3a066c59`).
+    const PLAN: &str = "## 4. Ordre de vol\n\nLe premier vol livre le détecteur ; il faudra \
+        reprendre le vol suivant une fois la sonde relevée.\n\nLié : milestone #33, dont ce \
+        ticket est l'enfant.\n";
+
+    /// Ce que la relance de mika#1823 écrit avant l'enveloppe : l'engin parlant à l'agent.
+    const CORRECTIVE: &str = "Your previous plan-review response is missing the required \
+        `Disposition:` line.\n";
+
+    /// La forme que le shell écrit : chaque marqueur seul sur sa ligne, le plan entre les
+    /// deux, et ce que la relance ajoute avant et après.
+    fn enveloped(head: &str, plan: &str, tail: &str) -> String {
+        format!("{head}{RETRY_PLAN_BEGIN}\n{plan}{RETRY_PLAN_END}\n{tail}")
+    }
+
+    #[test]
+    fn mika3002_deux_marqueurs_rendent_la_tete_et_la_queue() {
+        let brief = enveloped(CORRECTIVE, PLAN, "Post-scriptum : rien à ajouter.\n");
+        let (head, tail) = outside_reviewed_plan(&brief);
+        assert_eq!(head, CORRECTIVE);
+        assert_eq!(tail, "\nPost-scriptum : rien à ajouter.\n");
+        // La raison d'être de la fonction : les mots du plan ne sont dans aucune des deux.
+        for region in [head, tail] {
+            assert!(
+                !region.contains("reprendre") && !region.contains("milestone #33"),
+                "le plan revu a fui dans la région adressée à l'agent : {region:?}"
+            );
+        }
+    }
+
+    /// Aujourd'hui `_append_retry_plan_envelope` n'écrit rien après la fermeture : la queue
+    /// ne porte que la fin de la ligne-marqueur, et la tête porte tout le reste.
+    #[test]
+    fn mika3002_sans_post_scriptum_la_queue_est_vide() {
+        let brief = enveloped(CORRECTIVE, PLAN, "");
+        assert_eq!(outside_reviewed_plan(&brief), (CORRECTIVE, "\n"));
+    }
+
+    /// Zéro marqueur — une première passe, dont le message EST le plan. Rien n'y est
+    /// adressé à l'agent, donc les deux régions sont vides. C'est exactement le cas qui
+    /// désarme la garde de reprise sur l'incident `3a066c59`.
+    #[test]
+    fn mika3002_zero_marqueur_ne_rend_aucune_region() {
+        assert_eq!(outside_reviewed_plan(PLAN), ("", ""));
+        assert_eq!(outside_reviewed_plan(""), ("", ""));
+    }
+
+    /// Un seul marqueur — enveloppe mutilée, donc le brief entier, dans les deux sens.
+    /// Fail-closed : la garde appelante reste armée plutôt que de se taire sur un défaut
+    /// du shell.
+    #[test]
+    fn mika3002_un_seul_marqueur_rend_le_brief_entier() {
+        let opened_only = format!("{CORRECTIVE}{RETRY_PLAN_BEGIN}\n{PLAN}");
+        assert_eq!(
+            outside_reviewed_plan(&opened_only),
+            (opened_only.as_str(), "")
+        );
+        let closed_only = format!("{CORRECTIVE}{PLAN}{RETRY_PLAN_END}\n");
+        assert_eq!(
+            outside_reviewed_plan(&closed_only),
+            (closed_only.as_str(), "")
+        );
+    }
+
+    /// Les deux fonctions découpent le même brief sur les mêmes marqueurs : ce que l'une
+    /// rend, l'autre ne le rend pas. Si une seule des deux change de convention de
+    /// marqueur, cette paire rougit.
+    #[test]
+    fn mika3002_les_deux_regions_sont_complementaires() {
+        let brief = enveloped(CORRECTIVE, PLAN, "Queue.\n");
+        let plan = anchor_reference(&brief);
+        let (head, tail) = outside_reviewed_plan(&brief);
+        assert_eq!(plan.trim(), PLAN.trim());
+        assert!(!plan.contains(CORRECTIVE));
+        assert!(!plan.contains("Queue."));
+        assert_eq!(
+            head.len() + RETRY_PLAN_BEGIN.len() + plan.len() + RETRY_PLAN_END.len() + tail.len(),
+            brief.len(),
+            "les deux découpes doivent partitionner le brief, marqueurs exclus"
         );
     }
 }

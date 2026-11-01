@@ -183,13 +183,19 @@ const ANCHOR_REPROMPT_HEAD: &str = "[mika-engine] The previous response carries 
 /// Combien de fois l'architecte simulé répond la même chose : assez pour que les re-prompts
 /// d'autres gardes ne fassent pas manquer de réponses au moteur.
 ///
-/// Mesuré à l'écriture du correctif : sur un brief qui porte ce plan, la garde de sémantique
-/// de reprise (« A resume/continue instruction was received… ») re-prompte une fois avant la
-/// garde d'ancrage. Elle tire aussi, en production, sur le tour d'origine, dont le brief est
-/// le même plan, et c'est vraisemblablement ce qui a produit l'UNPARSED du 2026-10-31 (la
-/// réponse de 264 caractères disait chercher des engagements « comme demandé par
-/// l'instruction de reprise »). Les assertions portent donc sur le re-prompt d'ancrage, pas
-/// sur un nombre d'appels qu'une autre garde fait varier.
+/// **Le compte reste 4, et la raison de le garder n'est plus celle qui l'a fixé.** Mesuré à
+/// l'écriture du correctif de mika#2996 : sur un brief qui porte ce plan, la garde de
+/// sémantique de reprise (« A resume/continue instruction was received… ») re-promptait une
+/// fois avant la garde d'ancrage, et elle tirait aussi en production sur le tour d'origine —
+/// c'est l'UNPARSED du 2026-10-31, trace `3a066c59`, dont la réponse de 264 caractères
+/// disait chercher des engagements « comme demandé par l'instruction de reprise ». **Depuis
+/// mika#3002 elle ne tire plus ici** : les deux skills de ce fichier sont des
+/// verdict-producers, le message de relance porte l'enveloppe du plan, et le déclencheur
+/// n'est donc évalué que sur la région adressée à l'agent. Le compte garde sa marge parce
+/// qu'il borne les re-prompts de **toutes** les gardes, pas d'une seule.
+///
+/// Les assertions portent, elles, sur le re-prompt d'ancrage et sur rien d'autre — c'est ce
+/// qui a permis à ce fichier de rester vert sans retouche à travers mika#3002.
 const REPLIES: usize = 4;
 
 struct EngineTurn {
