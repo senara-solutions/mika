@@ -162,6 +162,16 @@ pub(crate) async fn process_tool_calls(
     // L'emprunt est immuable et se termine avec l'appel, donc les sites d'appel
     // peuvent passer `&all_tool_summaries` puis l'`extend`er juste après.
     prior_summaries: &[ToolCallSummary],
+    // mika#3003 — le registre de ce que les outils du tour ont RENDU, pour que la
+    // relance de la garde d'ancrage puisse nommer l'outil qui a produit une
+    // citation absente du brief. Rempli **vers l'avant**, ici, au site unique où
+    // un résultat d'outil est appendu au tour : la garde reçoit une valeur et ne
+    // remonte jamais `request.messages`. En `&mut` pour la même raison que
+    // `delivery_log` ci-dessus — la portée est le TOUR, pas le pas, et les sorties
+    // `MaxStepsExceeded` / `DeadlineExceeded` n'ont rien à resynchroniser.
+    // Normalisé et plafonné à la poussée (voir `ToolReadLedger`). Jamais
+    // persisté, jamais sérialisé ; il meurt avec le tour.
+    tool_read_ledger: &mut crate::agent_loop::review_anchor::ToolReadLedger,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
@@ -535,6 +545,18 @@ pub(crate) async fn process_tool_calls(
                     outcome: verdict.outcome,
                 });
             }
+
+            // mika#3003 — LE site unique qui alimente le registre de lecture du
+            // tour, tenu par `agent_loop::tests::mika3003_le_registre_de_lecture_a_un_seul_ecrivain`.
+            // Ici et pas plus haut : les deux autres `tool_results.push` de cette
+            // fonction portent un texte écrit par le moteur (suppression de
+            // frontière #771, refus de preuve mika#2934), pas un document qu'un
+            // outil a rendu — attribuer une ancre à l'un d'eux nommerait un outil
+            // qui n'a rien lu. Juste avant que `output.content` ne soit déplacé
+            // dans `content`. Une sortie en erreur est enregistrée comme les
+            // autres : c'est bien ce que le modèle a lu à ce pas, et le refus
+            // d'attribution se joue sur la recherche verbatim, pas sur `is_error`.
+            tool_read_ledger.record_tool_read(name, &output.content);
 
             let image_count = output.images.len();
             let content = if output.images.is_empty() {
@@ -991,6 +1013,7 @@ mod tests {
         let mut supprimes: Vec<String> = Vec::new();
         let mut capture = String::new();
         let mut livraisons: Vec<crate::evidence::guards::DeliveryRecord> = Vec::new();
+        let mut registre = crate::agent_loop::review_anchor::ToolReadLedger::default();
 
         let summaries = process_tool_calls(
             vec![LlmResponseContent::ToolCall {
@@ -1019,6 +1042,7 @@ mod tests {
             None,
             &mut livraisons,
             prior_summaries,
+            &mut registre,
         )
         .await;
 

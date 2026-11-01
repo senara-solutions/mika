@@ -227,6 +227,19 @@ entier et ce champ les entrées appariées (motif mika#2331). **L'absence de la 
 elle-même ne veut pas dire « pas de stand-down » mais « binaire antérieur au vol »**
 (mika#2340) : l'instrument n'est pas vivant avant `make deploy`.
 
+**La relance d'ancrage nomme l'outil qui a produit la citation (mika#3003).** Un registre de
+lecture tenu sur le tour — `review_anchor::ToolReadLedger`, alimenté depuis un **site unique**
+dans `tool_execution/dispatch.rs` et scanné par `mika3003_le_registre_de_lecture_a_un_seul_ecrivain`
+— permet de retrouver l'extrait refusé mot pour mot dans la sortie d'un outil ; alors seulement la
+phrase passe du conditionnel de mika#2794 à l'indicatif, et un registre tronqué rend `Unknown`
+plutôt qu'une absence (classe mika#2205). **Le dénominateur d'AC3 n'existait pas** : la ligne
+`guard.review_anchor_armed` (INFO) le fournit, une par **passage** armé et non par tour, branche
+saine comprise, avec `anchors_found`/`anchors_valid` **absents** sur `Satisfied` (jamais `0`,
+motif mika#2331) ; le « avant » se reconstruit hors ligne depuis `llm_calls.response_text` (v31),
+car aucune ligne ne comptait les passages. Registre, fenêtre d'attribution, protocole `jq` et
+lecture 14+14 jours : [`docs/agent-internals/agent-loop.md`](../../docs/agent-internals/agent-loop.md)
+§ *the re-prompt names the tool that produced the quote*.
+
 ## Tools
 
 Reference moved to [`docs/agent-internals/tools.md`](../../docs/agent-internals/tools.md) (160 KB). Read it before changing this subsystem, and document new material there, not here.
