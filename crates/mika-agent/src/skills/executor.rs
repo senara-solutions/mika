@@ -17414,6 +17414,117 @@ Harness ticket.
                  sinon ce test mesure l'entrée et non le levier"
             );
         }
+
+        /// **AC2 de mika#2995, voie B — un `ready` humain laisse passer le groom
+        /// forcé, et son absence le refuse.**
+        ///
+        /// Un seul test et **une seule fixture**, parce que c'est littéralement
+        /// ce que l'AC2 demande : « test dans le même appel, avec contrôle
+        /// négatif ». La fixture partagée est ce qui sépare « la garde laisse
+        /// passer un `ready` » de « la garde laisse tout passer » — deux moitiés
+        /// dans deux tests distincts ne se soustraient pas (mika#2205). Entre les
+        /// deux moitiés, **le seul octet qui change est le label**.
+        ///
+        /// `ctx_forced(INCIDENT_EVENT, true)` donne `forced = true` et
+        /// `requested = false` : l'intersection exacte où la garde décide, celle
+        /// du dispatch de 08:59:18Z.
+        ///
+        /// # Pourquoi ce test n'existait pas avant ce vol
+        ///
+        /// Les sept tests ci-dessus passent tous `github_token = None` et
+        /// s'arrêtent donc à [`FORCED_CONSENT_NO_TOKEN`], l'étape (4). L'étape
+        /// (5) — les quatre arms de la lecture de labels, qui sont *les deux
+        /// puces de l'AC2* — était hors d'atteinte sans réseau : le lecteur écrit
+        /// `https://api.github.com/…` en clair. Ce que ce vol a ajouté, c'est le
+        /// joint : [`decide_forced_consent_on_labels`] prend les labels en
+        /// paramètre, en production depuis le fetch, ici depuis une fixture.
+        ///
+        /// # Et `ready` posé par le **moteur** ?
+        ///
+        /// Ce n'est plus une entrée de test, parce que la voie B l'a retiré du
+        /// domaine : cette garde ne lit pas la provenance, donc un `ready` moteur
+        /// et un `ready` humain sont **le même octet** pour elle. Ce qui tient la
+        /// propriété, c'est qu'aucune route atteignable depuis un tour LLM ne
+        /// produit cet octet — `run_gh` refusé par le vol 1
+        /// (`builtin_handlers.rs`, `guards.rs`), et les détecteurs D1 et D2 de
+        /// `ready_label.rs` pour la route gouvernée. C'est la réécriture de
+        /// l'AC2 sous la voie B (décision du 2026-11-01), pas une version
+        /// affaiblie.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2995_un_ready_humain_laisse_passer_le_groom_force_et_son_absence_le_refuse() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let subject = "senara-solutions/mika#2766";
+
+            // ── Moitié positive : le ticket porte `ready`. ──
+            //
+            // Et un second label, pour que ce soit l'**appartenance** qui décide
+            // et non la longueur de la liste.
+            assert_eq!(
+                decide_forced_consent_on_labels(
+                    &ctx,
+                    subject,
+                    true,
+                    false,
+                    Ok(Some(vec!["bug".to_string(), "ready".to_string()])),
+                )
+                .await,
+                ForcedDispatchConsent::Allowed,
+                "un ticket que quelqu'un a promu laisse passer le dispatch forcé : `ready` \
+                 est le consentement positif de mika#841"
+            );
+
+            // Et la décision est **journalisée sous son propre verdict**. Un
+            // passage muet serait indiscernable d'une garde absente (mika#2293),
+            // et la sonde de D5 lit cette colonne.
+            let lignes = ctx
+                .db
+                .get_audit_events(&ctx.session_id)
+                .await
+                .expect("les événements d'audit de la session doivent se lire");
+            let consentement: Vec<&crate::evidence::audit::AuditEvent> = lignes
+                .iter()
+                .filter(|e| e.tool_name == FORCED_CONSENT_EVENT)
+                .collect();
+            assert_eq!(
+                consentement.len(),
+                1,
+                "la moitié positive écrit exactement une ligne de consentement"
+            );
+            assert_eq!(
+                consentement[0].after_value.as_deref(),
+                Some(FORCED_CONSENT_CONSENTED),
+                "le passage porte le verdict `allowed_consented`, pas un silence"
+            );
+            assert_eq!(
+                consentement[0].target_key, subject,
+                "la ligne nomme le ticket dont le consentement a été lu"
+            );
+
+            // ── Contrôle négatif, MÊME fixture, `ready` retiré. ──
+            let json = refusal(
+                decide_forced_consent_on_labels(
+                    &ctx,
+                    subject,
+                    true,
+                    false,
+                    Ok(Some(vec!["bug".to_string()])),
+                )
+                .await,
+            );
+
+            assert_eq!(
+                json["error"].as_str(),
+                Some(FORCED_CONSENT_WITHOUT_CONSENT),
+                "sans `ready`, le refus est le refus nominal et porte son propre nom — un \
+                 refus qui emprunte le nom d'un autre rend la sonde illisible (mika#2205)"
+            );
+            assert!(
+                json["reason"].as_str().is_some_and(|r| r.contains(subject)),
+                "le refus doit nommer le ticket visé : {}",
+                json["reason"]
+            );
+        }
     }
 
     // ---- mika#2772 : le drapeau de forçage a un écrivain et un lecteur ----
