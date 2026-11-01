@@ -1664,6 +1664,8 @@ async fn run_loop(
     let mut run_usage: Option<LlmUsage> = None;
     let mut thinking_text = None;
     let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
+    // mika#3003 — portée = le tour, d'où la déclaration AVANT la boucle des pas.
+    let mut tool_read_ledger = review_anchor::ToolReadLedger::default();
     // Track which tools have been called across all steps for required_tools enforcement.
     let mut tools_called: HashSet<String> = HashSet::new();
     // Whether we already injected a required-tools correction. Only allow one retry.
@@ -2181,6 +2183,7 @@ async fn run_loop(
                         // mika#2934 — l'emprunt immuable meurt avec l'appel,
                         // l'`extend` juste en dessous reprend la main.
                         &all_tool_summaries,
+                        &mut tool_read_ledger,
                     )
                     .await;
                     all_tool_summaries.extend(step_summaries);
@@ -4704,6 +4707,11 @@ async fn run_loop(
                             review_anchor.min_quote_chars,
                         );
 
+                        // mika#3003 (AC3) — le dénominateur, dont le contrat entier
+                        // vit dans `review_anchor::ArmedPassage`.
+                        let mut armed = review_anchor::ArmedPassage::default();
+                        let mut reprompted = false;
+
                         if let review_anchor::AnchorVerdict::Missing {
                             anchors_found,
                             anchors_valid,
@@ -4713,6 +4721,15 @@ async fn run_loop(
                         {
                             let (accepted_labels, refused_labels) =
                                 anchor_label_fields(&per_anchor);
+                            // mika#3003 — une seule lecture du registre nourrit la
+                            // prose de la relance et les champs des deux lignes.
+                            let attributions = armed.attribute(
+                                &tool_read_ledger,
+                                &per_anchor,
+                                review_anchor.min_quote_chars,
+                                anchors_found,
+                                anchors_valid,
+                            );
                             if !review_anchor_retry_done {
                                 review_anchor_retry_done = true;
                                 let correlation_id = format!(
@@ -4739,6 +4756,10 @@ async fn run_loop(
                                     // the before/after measurement can be read per label.
                                     refused_labels = %refused_labels,
                                     accepted_labels = %accepted_labels,
+                                    // mika#3003 — les outils du tour d'où sortent les
+                                    // citations refusées, quand une recherche verbatim
+                                    // l'a établi. Vide, jamais absent.
+                                    attributed_sources = %armed.sources(),
                                     event = "guard.review_anchor",
                                     "Review-anchor guard: non-terminal disposition without \
                                      a verifiable attestation — re-prompting (#2037)"
@@ -4778,71 +4799,94 @@ async fn run_loop(
                                         // and the contract recap. Empty when the matcher
                                         // reported no per-line fate, so the message is then
                                         // character for character its pre-mika#2794 form.
-                                        format_anchor_diagnosis(&per_anchor)
-                                            .map(|d| format!("{d}\n\n"))
-                                            .unwrap_or_default(),
+                                        review_anchor::format_anchor_diagnosis(
+                                            &per_anchor,
+                                            &attributions,
+                                        )
+                                        .map(|d| format!("{d}\n\n"))
+                                        .unwrap_or_default(),
                                         review_anchor.min_count,
                                         review_anchor.prefixes.join(", "),
                                         review_anchor.min_quote_chars,
                                         review_anchor.min_count,
                                     )),
                                 });
-                                continue;
-                            }
-
-                            // Second failure: withhold rather than accept.
-                            //
-                            // Take the correlation rather than leaving it set: the #953
-                            // block below emits `guard.correction_accepted` for whatever is
-                            // still pending, and a withheld attestation is the opposite of a
-                            // correction. Leaving it would count a refused forgery as a
-                            // successful repair on the Signal K surface operators read.
-                            let withheld_correlation_id = guard_correlation
-                                .take()
-                                .map(|c| c.correlation_id)
-                                .unwrap_or_default();
-                            // mika#2338 — fail-visible: rewrite into a terminal ESCALATE that
-                            // names the cause, so the groom reports it instead of an opaque
-                            // "verdict missing". The withheld marker remains the fallback for
-                            // a skill that declares no ESCALATE of the withdrawn family.
-                            let escalated = escalate_unattested_disposition(
-                                &text,
-                                required_suffix_lines,
-                                required_finding_list_prefixes,
-                                anchors_found,
-                                anchors_valid,
-                                reason,
-                            );
-                            let emitted = if escalated.is_some() {
-                                "escalate"
+                                // mika#3003 — le `continue` historique a reculé
+                                // derrière `armed.emit()` : une relance est un
+                                // passage armé de la garde.
+                                reprompted = true;
                             } else {
-                                "withheld-marker"
-                            };
-                            error!(
-                                target: "mika::otel",
-                                trace_id = %tool_ctx.trace_id,
-                                agent_id = %db.agent_id(),
-                                session_id,
-                                step,
-                                label = mode.label(),
-                                guard_correlation_id = %withheld_correlation_id,
-                                anchors_found,
-                                anchors_valid,
-                                miss_reason = ?reason,
-                                // mika#2794's numerator. Same two fields as the denominator
-                                // above: a withhold is read against the re-prompt that
-                                // preceded it, label by label.
-                                refused_labels = %refused_labels,
-                                accepted_labels = %accepted_labels,
-                                emitted,
-                                event = "guard.review_anchor_withheld",
-                                "Review-anchor guard: attestation still absent after the \
-                                 corrective re-prompt — disposition withheld from the final \
-                                 response (#2037, escalated with its cause since #2338)"
-                            );
-                            text = escalated.unwrap_or_else(|| {
-                                withhold_disposition(&text, required_suffix_lines)
-                            });
+                                // Second failure: withhold rather than accept.
+                                //
+                                // Take the correlation rather than leaving it set: the #953
+                                // block below emits `guard.correction_accepted` for whatever is
+                                // still pending, and a withheld attestation is the opposite of a
+                                // correction. Leaving it would count a refused forgery as a
+                                // successful repair on the Signal K surface operators read.
+                                let withheld_correlation_id = guard_correlation
+                                    .take()
+                                    .map(|c| c.correlation_id)
+                                    .unwrap_or_default();
+                                // mika#2338 — fail-visible: rewrite into a terminal ESCALATE that
+                                // names the cause, so the groom reports it instead of an opaque
+                                // "verdict missing". The withheld marker remains the fallback for
+                                // a skill that declares no ESCALATE of the withdrawn family.
+                                let escalated = escalate_unattested_disposition(
+                                    &text,
+                                    required_suffix_lines,
+                                    required_finding_list_prefixes,
+                                    anchors_found,
+                                    anchors_valid,
+                                    reason,
+                                );
+                                let emitted = if escalated.is_some() {
+                                    "escalate"
+                                } else {
+                                    "withheld-marker"
+                                };
+                                error!(
+                                    target: "mika::otel",
+                                    trace_id = %tool_ctx.trace_id,
+                                    agent_id = %db.agent_id(),
+                                    session_id,
+                                    step,
+                                    label = mode.label(),
+                                    guard_correlation_id = %withheld_correlation_id,
+                                    anchors_found,
+                                    anchors_valid,
+                                    miss_reason = ?reason,
+                                    // mika#2794's numerator. Same two fields as the denominator
+                                    // above: a withhold is read against the re-prompt that
+                                    // preceded it, label by label.
+                                    refused_labels = %refused_labels,
+                                    accepted_labels = %accepted_labels,
+                                    // mika#3003 — même champ que sur la relance, pour
+                                    // que le numérateur dise aussi d'où venaient les
+                                    // citations. Vide, jamais absent.
+                                    attributed_sources = %armed.sources(),
+                                    emitted,
+                                    event = "guard.review_anchor_withheld",
+                                    "Review-anchor guard: attestation still absent after the \
+                                     corrective re-prompt — disposition withheld from the final \
+                                     response (#2037, escalated with its cause since #2338)"
+                                );
+                                text = escalated.unwrap_or_else(|| {
+                                    withhold_disposition(&text, required_suffix_lines)
+                                });
+                                armed.mark_withheld();
+                            }
+                        }
+
+                        armed.emit(
+                            tool_ctx.trace_id,
+                            db.agent_id(),
+                            session_id,
+                            step,
+                            mode.label(),
+                            brief.chars().count(),
+                        );
+                        if reprompted {
+                            continue;
                         }
                     }
 
@@ -5433,6 +5477,7 @@ async fn run_loop(
                     // tête) vient presque toujours d'un pas **antérieur** du
                     // même tour.
                     &all_tool_summaries,
+                    &mut tool_read_ledger,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -9610,90 +9655,6 @@ fn anchor_label_fields(per_anchor: &[review_anchor::AnchorOutcome]) -> (String, 
     (join(false), join(true))
 }
 
-/// How many refused anchor lines the corrective re-prompt names.
-///
-/// The measured shape refuses one of three (mika#2794); three is already the contract's whole
-/// anchor budget, and a re-prompt that enumerates ten lines is a wall the model skims.
-const MAX_DIAGNOSED_ANCHORS: usize = 3;
-
-/// Name the anchor lines that failed, for the corrective re-prompt (mika#2794).
-///
-/// The guard already told the model *what* condition it missed — `reason.describe()` — and
-/// mika#2794 measured that this is not enough: across three replayed 2026-10-18 sessions the
-/// refused anchor was one of three and, in two of them, always the first, and session
-/// `a7f1ccad` returned that same faulty anchor three times in a row. The reason alone names a
-/// class; this paragraph names the line.
-///
-/// Three parts, and each one is there for a reason the others do not cover:
-///
-/// - **The accepted anchors, by name.** A model told only "one anchor does not quote the brief"
-///   rewrites all three. Naming the two that passed is what makes the correction local.
-/// - **The refused anchors, one per line**, with the start of what they said and why it was
-///   blocked, bounded by [`MAX_DIAGNOSED_ANCHORS`].
-/// - **Where a wrong quote comes from**, said as a likelihood and gated on
-///   `QuoteNotInBrief`. The engine does **not** know which document the line came from — it
-///   holds the brief and the response, nothing else — so the sentence is phrased as the usual
-///   cause and never as an established fact (grounding rule). Deterministic attribution would
-///   need access to the turn's tool outputs and is deliberately out of scope. The gate matters
-///   as much as the wording: saying "you quoted another document" to a response whose anchors
-///   all landed on the *same region of the right brief* would send exactly the wrong fix.
-///
-/// `None` when the list is empty — the two early returns of [`review_anchor::verify_review_anchors`]
-/// report no per-line fate, and the re-prompt then falls back word for word on the form it had
-/// before mika#2794.
-fn format_anchor_diagnosis(per_anchor: &[review_anchor::AnchorOutcome]) -> Option<String> {
-    if per_anchor.is_empty() {
-        return None;
-    }
-
-    let label_of =
-        |outcome: &review_anchor::AnchorOutcome| outcome.label.trim_end_matches(':').to_string();
-    let accepted: Vec<String> = per_anchor
-        .iter()
-        .filter(|outcome| outcome.refused.is_none())
-        .map(label_of)
-        .collect();
-    let refused: Vec<&review_anchor::AnchorOutcome> = per_anchor
-        .iter()
-        .filter(|outcome| outcome.refused.is_some())
-        .collect();
-
-    let mut parts: Vec<String> = Vec::new();
-    if !accepted.is_empty() {
-        parts.push(format!(
-            "Anchors accepted: {} — keep them exactly as written; do not rewrite them.",
-            accepted.join(", ")
-        ));
-    }
-    if !refused.is_empty() {
-        let mut lines = vec!["Anchors refused:".to_string()];
-        for outcome in refused.iter().take(MAX_DIAGNOSED_ANCHORS) {
-            let reason = outcome
-                .refused
-                .map(review_anchor::AnchorMissReason::describe)
-                .unwrap_or_default();
-            lines.push(format!(
-                "{} \"{}\" — refused: {reason}",
-                outcome.label, outcome.excerpt
-            ));
-        }
-        parts.push(lines.join("\n"));
-    }
-    if refused
-        .iter()
-        .any(|outcome| outcome.refused == Some(review_anchor::AnchorMissReason::QuoteNotInBrief))
-    {
-        parts.push(
-            "A quote that is absent from the brief usually comes from a document you read with \
-             a tool — a ticket body, a file, a page — and not from the brief message of this \
-             turn. Quote the brief itself: the message that asked you for this review."
-                .to_string(),
-        );
-    }
-
-    Some(parts.join("\n\n"))
-}
-
 /// Withhold an unattested disposition from the final text (mika#2037).
 ///
 /// Replaces the disposition line with `DISPOSITION_WITHHELD_MARKER` and leaves the rest of
@@ -13637,7 +13598,10 @@ mod tests {
             outcome("A2:", "sur l'exhaustivité du tracé", None),
             outcome("A3:", "Je n'ai pas fixé N pour le seuil", None),
         ];
-        let diagnosis = format_anchor_diagnosis(&per_anchor).expect("a non-empty list diagnoses");
+        // mika#3003 — aucune attribution : ce test mesure la forme pré-mika#3003
+        // du diagnostic, et c'est précisément ce qu'une liste vide doit rendre.
+        let diagnosis = review_anchor::format_anchor_diagnosis(&per_anchor, &[])
+            .expect("a non-empty list diagnoses");
 
         assert!(
             diagnosis.contains("Anchors accepted: A2, A3"),
@@ -13676,7 +13640,8 @@ mod tests {
                 Some(review_anchor::AnchorMissReason::OverlappingRegions),
             ),
         ];
-        let diagnosis = format_anchor_diagnosis(&per_anchor).expect("a non-empty list diagnoses");
+        let diagnosis = review_anchor::format_anchor_diagnosis(&per_anchor, &[])
+            .expect("a non-empty list diagnoses");
 
         assert!(diagnosis.contains("Anchors accepted: A1"), "{diagnosis}");
         assert!(diagnosis.contains("A2: \"re-résoudre"), "{diagnosis}");
@@ -13691,7 +13656,7 @@ mod tests {
     /// `None` is the whole mechanism — the insertion point is a `{}` filled with `""`.
     #[test]
     fn mika2794_an_empty_fate_list_leaves_the_reprompt_untouched() {
-        assert_eq!(format_anchor_diagnosis(&[]), None);
+        assert_eq!(review_anchor::format_anchor_diagnosis(&[], &[]), None);
     }
 
     /// The paragraph is bounded. Five refused anchors name three — a wall of ten lines is a
@@ -13707,7 +13672,8 @@ mod tests {
                 )
             })
             .collect();
-        let diagnosis = format_anchor_diagnosis(&per_anchor).expect("a non-empty list diagnoses");
+        let diagnosis = review_anchor::format_anchor_diagnosis(&per_anchor, &[])
+            .expect("a non-empty list diagnoses");
 
         let named = (1..=5)
             .filter(|n| diagnosis.contains(&format!("A{n}: \"")))

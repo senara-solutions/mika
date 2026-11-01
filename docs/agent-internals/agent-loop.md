@@ -511,7 +511,7 @@ the refusal is fail-closed and, since mika#2338, fail-visible (the disposition b
 
 **Since mika#2794 the corrective re-prompt names the anchor that failed.** The verdict carries
 `per_anchor: Vec<AnchorOutcome>` — label, excerpt, refusal — and
-`agent_loop::format_anchor_diagnosis` turns it into the paragraph the model reads: the accepted
+`review_anchor::format_anchor_diagnosis` turns it into the paragraph the model reads: the accepted
 anchors by name (so the correction is local rather than a rewrite of all three), the refused
 ones with the start of what they said, and — gated on `QuoteNotInBrief` — the usual cause,
 stated as a likelihood: a quote absent from the brief generally comes from a document read with
@@ -564,6 +564,11 @@ operator gesture over a deployment window. mika#2794 does not take it and opens 
 it: a ticket opened on an unmeasured hypothesis is precisely what mika#2786 declined to do for
 this lead.
 
+**That gesture was taken, on a measurement, by mika#3003** — see *the re-prompt names the tool
+that produced the quote* below. The hypothesis stopped being unmeasured on 2026-10-31 (trace
+`f2a64bd7`): the three anchors were absent from a brief byte-identical to the committed plan and
+present word for word in the ticket body the architect had read with `gh_read issue_view`.
+
 ### Review-anchor guard — the UNPARSED retries carry the plan (mika#2996)
 
 The guard only arms when the turn's brief reaches `review_anchor_min_brief_chars` (2000 on
@@ -601,6 +606,110 @@ which proves it was satisfied. Check this by replaying `verify_review_anchors` a
 `anchor_reference(user_message)`. The count of entries that fail either half is reported on
 mika#2996, and the target is 0. The instrument is not live before `make deploy`:
 `dispatch-lib.sh` is seeded from the binary, not read from the checkout.
+
+### Review-anchor guard — the re-prompt names the tool that produced the quote (mika#3003)
+
+mika#2794's re-prompt phrases the origin **in the conditional** — *"a quote that is absent from
+the brief usually comes from a document you read with a tool"* — because the engine did not know.
+Since mika#3003 it knows, and the sentence goes to the indicative **only when a verbatim search
+established it**.
+
+**The turn's read ledger.** `review_anchor::ToolReadLedger` is a turn-scoped `Vec<(tool_name,
+normalized_text)>`, created in `run_loop` before the step loop and threaded into
+`process_tool_calls`. Its **single feed site** is in `tool_execution/dispatch.rs`, just before the
+`tool_results.push` that carries a real tool output: `record_tool_read(name, &output.content)`.
+The two other `tool_results.push` of that function carry text the *engine* wrote (boundary
+removal #771, evidence refusal mika#2934), not a document a tool returned, and must never feed
+the ledger — a source scan holds that (`mika3003_le_registre_de_lecture_a_un_seul_ecrivain`,
+allowlist shipped **empty**, with its good-faith positive control; the predicate consults
+`crate::source_scan::is_test_source_path` rather than truncating at `#[cfg(test)]`). An output in
+**error** is recorded like any other: the architect quoted what it was shown, whatever the tool
+thought of it.
+
+**Why the text is normalized at the write.** `find_brief_quote_range` requires its haystack to be
+in the matcher's canonical form (`normalize_for_anchor_match` — strips `*` and backticks, folds
+typographic apostrophes, collapses whitespace, idempotent). Normalizing at the write makes the
+ledger and the matcher symmetric by construction, instead of hoping every reader remembers.
+
+**The ceiling, and `Unknown`.** `TOOL_READ_LEDGER_CHARS = 200_000` bounds the whole ledger, not
+each entry. The **raw** text is clipped first and normalized after, in **characters** (never bytes
+— `scripts/check-byte-slices.sh`), and a clip sets `truncated`. The consequence is the rule that
+matters: when an excerpt is found in no entry and the ledger was truncated, the attribution is
+`AnchorAttribution::Unknown`, never `AbsentFromReads` — *"I did not find it"* and *"it is not
+there"* are two populations, and asserting the second from the first is how an instrument lies
+(class mika#2205). `Unknown` keeps the conditional sentence.
+
+**What is searched, and with what window.** Not `outcome.excerpt` as-is: the excerpt is the first
+72 characters of the anchor line *after* its `A1:` prefix, so it carries the model's own quotation
+mark and the start of its prose, and no document contains that string. The search uses the
+matcher's own `find_brief_quote_range` over the normalized excerpt (trailing `…` removed), at a
+window clamped to `[ATTRIBUTION_MIN_QUOTE_CHARS = 40, ANCHOR_EXCERPT_CHARS = 72]` —
+`min_quote_chars.clamp(40, 72)`. The floor is deliberate: a 12-character window would attribute
+on a common phrase. Only a `QuoteNotInBrief` refusal is attributed at all; every other refusal
+reason returns `None` and changes no wording.
+
+**The re-prompt.** `review_anchor::format_anchor_diagnosis` takes the attributions indexed **in parallel with
+`per_anchor`** (not "in refused order" — the pairing is positional, and a test pins that), and
+emits one indicative line per attributed anchor: *"A1 quotes, word for word, what the `<tool>`
+tool returned during this turn — not the brief. This is measured, not guessed: the engine searched
+the text that tool returned and found that line in it."* The mika#2794 conditional paragraph
+survives **byte for byte** for any `QuoteNotInBrief` anchor the ledger did not attribute. The two
+moods cohabit on a mixed turn. **Nothing in the decision reads the attributions**: the guard's
+refusal path is unchanged, exactly as mika#2794 left it.
+
+**AC3's denominator did not exist, so it was built.** mika#2794's ratio is *withholds over
+re-prompts*; mika#3003 AC3 asks for *withholds over non-terminal **passes***, and no line counted
+passes. A third line now does:
+
+| line | level | cardinality |
+|---|---|---|
+| `event = "guard.review_anchor_armed"` | INFO (`target: "mika::otel"`) | **one per guard evaluation**, on every armed branch including the healthy one |
+
+It is emitted by `review_anchor::ArmedPassage::emit`, which also accumulates what the line
+reports across the guard's two branches. It carries `anchors_found`, `anchors_valid`,
+`brief_chars`, `withheld: bool` and `attributed_sources`. Three reading rules:
+
+- **One line per PASS, not per turn.** A turn that re-prompts emits two: the re-prompt's
+  (`withheld: false`) and the following pass's. Counting turns would under-state the denominator
+  by a factor that depends on the re-prompt rate.
+- **`anchors_found` / `anchors_valid` are ABSENT on the `Satisfied` branch, not zero.** That
+  branch counts nothing (`AnchorVerdict::Satisfied` carries no counter), and a `0` would lie about
+  a reply with three valid anchors (motif mika#2331). They are emitted as `Option<usize>` for
+  that reason — `tracing` renders `None` as an absent field.
+- **This is not the probe mika#2794 refused.** That one wanted to replay the verbatim search over
+  every document of the turn to *guess* an origin. This line only counts what the guard already
+  decided.
+
+Both pre-existing lines gained **one** field, the same on both: **`attributed_sources`** — tool
+names joined by `,`, order-preserving and deduplicated, and an **empty string** when nothing was
+attributed. Empty is an empty string, never an absent field: the **absence** of the field means a
+binary older than this change (class mika#2340), never "nothing was attributed" (mika#2331).
+
+Protocol, read on `$MIKA_SPIRIT_LOG_FILE` (`/var/log/mika/server.log`):
+
+```sh
+jq -r 'select(.event | startswith("guard.review_anchor"))
+       | [.timestamp, .event, .anchors_valid, .attributed_sources, .miss_reason] | @tsv' \
+  < /var/log/mika/server.log
+```
+
+**The "before" denominator is unobtainable from the log, and is reconstructed offline.** The
+numerator is already acquired from `server.log` (12 withholds over 2026-10-17 → 2026-10-31: 2 on
+17/10, 5 on 18/10, 2 on 20/10, 1 on 29/10, 2 on 31/10). The denominator is not there — no line
+counted passes before this change. It is rebuilt from `llm_calls.response_text` (the column added
+in schema v31) in `~/.mika/data/mika.db`: a non-terminal pass is a response carrying a
+non-terminal `Disposition:` / `Verdict:` line, on a brief of at least
+`review_anchor_min_brief_chars`. The two halves of the ratio therefore come from two instruments
+for the "before" window and from one for the "after" window — which is itself a reading rule, not
+a defect to hide.
+
+**The 14+14-day read is an operator gesture on a deploy window, not a CI assertion.** The
+instrument is not live before `make deploy`: the journal is written by the binary being served,
+not by the checkout. No script ships for it — the written protocol above is AC3's deliverable.
+
+**Named risk (AC3's whole point).** This is a model-behaviour defect, and a more precise re-prompt
+does not guarantee obedience (doctrine mika#1190). The measurement is what will say whether it
+moved.
 
 ### Deterministic Context Injection
 

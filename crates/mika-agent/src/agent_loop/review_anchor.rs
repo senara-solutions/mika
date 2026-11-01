@@ -37,8 +37,7 @@
 //! line found in the body, in body order, each with its prefix, the start of what it said and
 //! whether it was refused. **Nothing in the decision reads it**: the counters and the
 //! [`AnchorMissReason`] still decide alone, and the two early returns carry an empty list. It
-//! exists for the corrective re-prompt, which `agent_loop::format_anchor_diagnosis` builds
-//! from it.
+//! exists for the corrective re-prompt, which [`format_anchor_diagnosis`] builds from it.
 //!
 //! The measurement that asked for it. After mika#2786 (frein à trois retenues, tolérance
 //! `**A1:**`), an offline replay of this matcher over the real 2026-10-18 briefs
@@ -230,6 +229,402 @@ impl AnchorVerdict {
     }
 }
 
+/// Total budget of the turn's tool-read ledger, in **normalized characters**.
+///
+/// Counted in chars, never bytes (`scripts/check-byte-slices.sh`): the ticket bodies and plans
+/// this engine reads are French, and a 200 000-*byte* prefix of one lands inside a codepoint.
+///
+/// The figure is a ceiling on cost, not a target. The measured shape — the body of mika#2995,
+/// read with `gh_read issue_view` on 2026-10-31 — is a few kilobytes, and a whole grooming
+/// turn's reads sit far below this. What the ceiling bounds is the other tail: a `read_file` on
+/// a multi-megabyte log, where an unbounded ledger would pay a normalization pass over the lot.
+/// The budget is the price of ONE pass per tool result, paid at push and linear in its length;
+/// the search it serves is a 72-character needle ([`ANCHOR_EXCERPT_CHARS`]) in a bounded
+/// haystack. That asymmetry is what retires mika#2794's verbatim-budget objection.
+const TOOL_READ_LEDGER_CHARS: usize = 200_000;
+
+/// Hard floor, in normalized characters, on the span an attribution is allowed to rest on.
+///
+/// The claim the indicative mood makes — *this line comes from that tool* — is the same kind of
+/// claim the matcher makes about the brief, so it owes the same evidence: a span long enough
+/// that a coincidence is not the likelier explanation. 40 is `review_anchor_min_quote_chars` as
+/// every shipped arch manifest declares it, so in practice the attribution and the matcher run
+/// the same window; the floor exists for the skill that lowers its own threshold. Lowering the
+/// bar there would buy nothing and risk naming a tool on a coincidence — and a false
+/// attribution is worse than none, because the sentence that carries it is indicative.
+const ATTRIBUTION_MIN_QUOTE_CHARS: usize = 40;
+
+/// Normalized text of what the turn's tools returned, for anchor attribution (mika#3003).
+///
+/// Filled forward, at the single site where a tool result is appended to the turn — never
+/// by walking `request.messages` back at the guard site. The guard receives a value; it
+/// traverses nothing. This is the shape mika#2794 refused when the lookup would have been
+/// a second reader of the conversation.
+///
+/// Three properties, each because the opposite guesses badly:
+///
+/// - **Filled forward, at the single append site.** No access to `request.messages`, so no
+///   second reader of the conversation. The single writer is held by a source scan in this
+///   module's `mika3003` tests — a second push site would double-count one tool output, or
+///   worse push it *unnormalized*, leaving a ledger no search ever hits and a guard that falls
+///   back on the conditional sentence in silence (the class of mika#2158: every behavioural
+///   assertion stays green).
+/// - **Normalized and clipped at push, never at read.** [`TOOL_READ_LEDGER_CHARS`] bounds the
+///   whole ledger, and the normalization is the matcher's own
+///   [`normalize_for_anchor_match`] — a needle normalized one way and a haystack another is a
+///   comparison that silently never matches.
+/// - **The scope is the TURN, not the step.** Declared before the step loop, so it accumulates
+///   every step of the turn — "read during the turn" is exactly what the attribution claims, and
+///   it is precisely what the measurement needs: on 2026-10-31 the architect read the ticket
+///   body at step 1 and quoted it at step 4. A per-step ledger would have attributed nothing.
+#[derive(Debug, Default)]
+pub(crate) struct ToolReadLedger {
+    /// `(tool name, normalized output)`, in call order. Normalized with the SAME
+    /// [`normalize_for_anchor_match`] the matcher uses.
+    entries: Vec<(String, String)>,
+    /// Set when a push was clipped by [`TOOL_READ_LEDGER_CHARS`]. A miss in a truncated
+    /// ledger is NOT an absence (mika#2331) — see [`AnchorAttribution::Unknown`].
+    truncated: bool,
+}
+
+/// Which tool's output a refused anchor's excerpt was found in, verbatim, this turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnchorAttribution {
+    /// Found: the excerpt appears in this tool's normalized output.
+    Tool(String),
+    /// Not found, and the ledger was WHOLE — the engine may say so.
+    AbsentFromReads,
+    /// Not found, but the ledger was CLIPPED — the engine may NOT say so.
+    ///
+    /// A failed search in a clipped ledger and a failed search in a whole one return the same
+    /// `false`; conflating them would have the engine assert "this line comes from no tool"
+    /// about an output it had itself cut short. On this arm the re-prompt falls back **word for
+    /// word** on mika#2794's conditional sentence: the knowledge is missing, so the assertion
+    /// is not made. That is the repo's grounding rule applied to the engine itself.
+    Unknown,
+}
+
+impl ToolReadLedger {
+    /// Record what one tool returned this turn, normalized and clipped to the remaining budget.
+    ///
+    /// **The single writer under `src/`.** Held by
+    /// `review_anchor::mika3003::mika3003_le_registre_de_lecture_a_un_seul_ecrivain`.
+    pub(crate) fn record_tool_read(&mut self, tool_name: &str, output: &str) {
+        let used: usize = self
+            .entries
+            .iter()
+            .map(|(_, text)| text.chars().count())
+            .sum();
+        let remaining = TOOL_READ_LEDGER_CHARS.saturating_sub(used);
+        if remaining == 0 {
+            self.truncated = true;
+            return;
+        }
+        // Clip the RAW text first, then normalize. Normalization only ever shrinks (markers
+        // dropped, runs of whitespace collapsed), so a raw prefix of `remaining` chars can
+        // never normalize past the budget — and the transient allocation stays bounded by it
+        // too, which clipping after normalizing would not achieve.
+        let normalized = if output.chars().count() > remaining {
+            self.truncated = true;
+            let clipped: String = output.chars().take(remaining).collect();
+            normalize_for_anchor_match(&clipped)
+        } else {
+            normalize_for_anchor_match(output)
+        };
+        self.entries.push((tool_name.to_string(), normalized));
+    }
+
+    /// Where a refused anchor's text came from, when a verbatim search can establish it.
+    ///
+    /// `None` on any outcome that is not a [`AnchorMissReason::QuoteNotInBrief`] refusal: an
+    /// `OverlappingRegions` or a `QuoteTooShort` does not ask "where does this text come
+    /// from?" — the text **is** in the brief, it is its geometry or its length that failed.
+    /// Saying "you quoted another document" there would send exactly the wrong fix. This is
+    /// the gate mika#2794 already wrote at the formatting site, reused as written.
+    ///
+    /// `Tool` on the first entry the search hits, in call order; `Unknown` when nothing matched
+    /// and the ledger was clipped; `AbsentFromReads` when nothing matched and it was whole — an
+    /// empty ledger (no tool called this turn) is whole, not unknown.
+    ///
+    /// **The search is the matcher's own** [`find_brief_quote_range`], at the same threshold,
+    /// and not a `contains` of the excerpt. An anchor line reads
+    /// `A1: "…citation…" — my comment`, so the excerpt carries the model's quotation marks and
+    /// the start of its own prose; no document ever contains that string, and a `contains`
+    /// would have answered `AbsentFromReads` on the very shape mika#3003 was measured on. What
+    /// the attribution asks is the question the matcher asks of the brief — *does a checkable
+    /// span of this line appear verbatim in that text* — put to the tool's output instead.
+    pub(crate) fn attribute(
+        &self,
+        outcome: &AnchorOutcome,
+        min_quote_chars: usize,
+    ) -> Option<AnchorAttribution> {
+        if outcome.refused != Some(AnchorMissReason::QuoteNotInBrief) {
+            return None;
+        }
+        // The trailing `…` is a rendering marker [`anchor_excerpt`] appended, not text the
+        // model wrote: searching with it attached would miss every truncated anchor, which is
+        // every anchor longer than 72 characters — the ordinary case.
+        //
+        // Re-normalized rather than assumed normalized: `anchor_excerpt` already works on a
+        // normalized line, and the function is idempotent, so this costs one pass and removes
+        // a dependency on a caller's invariant (the asymmetry of mika#2794's objection).
+        let needle = normalize_for_anchor_match(outcome.excerpt.trim_end_matches('…'));
+        // The excerpt is capped at `ANCHOR_EXCERPT_CHARS`, so a contract demanding a longer
+        // quote cannot be re-proven on it; the window is clamped to that cap. The floor is the
+        // part that matters: below `ATTRIBUTION_MIN_QUOTE_CHARS` a hit is noise, and naming a
+        // tool on noise is a fabrication the indicative mood would carry as a measurement.
+        // Both bounds are constants, and the floor is below the cap, so `clamp` cannot panic.
+        let window = min_quote_chars.clamp(ATTRIBUTION_MIN_QUOTE_CHARS, ANCHOR_EXCERPT_CHARS);
+        if needle.chars().count() >= window {
+            for (tool, text) in &self.entries {
+                if matches!(
+                    find_brief_quote_range(&needle, text, window, &[]),
+                    QuoteSearch::Found(_)
+                ) {
+                    return Some(AnchorAttribution::Tool(tool.clone()));
+                }
+            }
+        }
+        Some(if self.truncated {
+            AnchorAttribution::Unknown
+        } else {
+            AnchorAttribution::AbsentFromReads
+        })
+    }
+}
+
+/// What the denominator line of mika#3003 AC3 reports, accumulated across the guard's branches.
+///
+/// The numerator `guard.review_anchor_withheld` existed before this flight; the ticket's own
+/// words are "the denominator, that is the number of non-terminal passages per day, is not
+/// measured". So `guard.review_anchor_armed` is emitted **once per evaluation** of the armed
+/// guard — `Satisfied` included — after both branches have run. A turn that re-prompts produces
+/// two lines: the re-prompt's (`withheld: false`) and the following passage's. That is
+/// deliberate: the rate the ticket asks for is "withholds over non-terminal passages", and a
+/// passage is an evaluation. The pre-flight denominator can only be rebuilt offline, from
+/// `llm_calls.response_text` (column v31) — see `docs/agent-internals/agent-loop.md`.
+///
+/// This is **not** the probe mika#2794 refused: that one wanted to replay the verbatim search
+/// over every document of the turn to guess an origin. This line only counts what the guard has
+/// already decided.
+///
+/// `found` / `valid` stay `None` on the `Satisfied` branch, hence **absent** from the line:
+/// `AnchorVerdict::Satisfied` is a unit variant a dozen `assert_eq!`s depend on, and adding two
+/// fields to it for one log line would change those tests' intent. This is not the absence
+/// mika#2331 condemns — the line always carries `withheld` and `brief_chars`, and the
+/// denominator is counted in **lines**, not in anchors.
+#[derive(Debug, Default)]
+pub(crate) struct ArmedPassage {
+    found: Option<usize>,
+    valid: Option<usize>,
+    withheld: bool,
+    /// Tool names, in encounter order and deduplicated. Empty string when nothing was
+    /// attributed, never an absent field — the line must separate "no source found" from
+    /// "pre-mika#3003 binary" (mika#2331, mika#2340).
+    sources: String,
+}
+
+impl ArmedPassage {
+    /// Attribute every anchor of a `Missing` verdict, and capture what the line will report.
+    ///
+    /// Returns the attributions **indexed in parallel with `per_anchor`**, for
+    /// [`format_anchor_diagnosis`]. Computed once, before the guard's two branches: the
+    /// re-prompt renders it as prose, the two structured lines render it as a field, and a
+    /// single read of the ledger feeds both.
+    ///
+    /// Three anchors taken from the same ticket body describe ONE source, so repeating it would
+    /// read as a count where there is a set — hence the dedup on the way into [`Self::sources`].
+    pub(crate) fn attribute(
+        &mut self,
+        ledger: &ToolReadLedger,
+        per_anchor: &[AnchorOutcome],
+        min_quote_chars: usize,
+        anchors_found: usize,
+        anchors_valid: usize,
+    ) -> Vec<Option<AnchorAttribution>> {
+        let attributions: Vec<Option<AnchorAttribution>> = per_anchor
+            .iter()
+            .map(|outcome| ledger.attribute(outcome, min_quote_chars))
+            .collect();
+        let mut sources: Vec<&str> = Vec::new();
+        for attribution in attributions.iter().flatten() {
+            if let AnchorAttribution::Tool(tool) = attribution
+                && !sources.contains(&tool.as_str())
+            {
+                sources.push(tool.as_str());
+            }
+        }
+        self.sources = sources.join(",");
+        self.found = Some(anchors_found);
+        self.valid = Some(anchors_valid);
+        attributions
+    }
+
+    /// The turn's tools a refused quote was traced to, `,`-joined. Empty, never absent.
+    ///
+    /// Also carried by `guard.review_anchor` and `guard.review_anchor_withheld`, so the
+    /// numerator says where the quotes came from too.
+    pub(crate) fn sources(&self) -> &str {
+        &self.sources
+    }
+
+    /// The disposition was withheld on this passage.
+    pub(crate) fn mark_withheld(&mut self) {
+        self.withheld = true;
+    }
+
+    /// Emit the denominator line, once, for every exit of the armed guard.
+    pub(crate) fn emit(
+        &self,
+        trace_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        step: usize,
+        label: &str,
+        brief_chars: usize,
+    ) {
+        tracing::info!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            agent_id = %agent_id,
+            session_id,
+            step,
+            label,
+            anchors_found = self.found,
+            anchors_valid = self.valid,
+            brief_chars,
+            withheld = self.withheld,
+            attributed_sources = %self.sources,
+            event = "guard.review_anchor_armed",
+            "Review-anchor guard armed on a non-terminal disposition \
+             (#3003 AC3 — the denominator `review_anchor_withheld` is read against)"
+        );
+    }
+}
+
+/// How many refused anchor lines the corrective re-prompt names.
+///
+/// The measured shape refuses one of three (mika#2794); three is already the contract's whole
+/// anchor budget, and a re-prompt that enumerates ten lines is a wall the model skims.
+const MAX_DIAGNOSED_ANCHORS: usize = 3;
+
+/// Name the anchor lines that failed, for the corrective re-prompt (mika#2794).
+///
+/// The guard already told the model *what* condition it missed — `reason.describe()` — and
+/// mika#2794 measured that this is not enough: across three replayed 2026-10-18 sessions the
+/// refused anchor was one of three and, in two of them, always the first, and session
+/// `a7f1ccad` returned that same faulty anchor three times in a row. The reason alone names a
+/// class; this paragraph names the line.
+///
+/// Three parts, and each one is there for a reason the others do not cover:
+///
+/// - **The accepted anchors, by name.** A model told only "one anchor does not quote the brief"
+///   rewrites all three. Naming the two that passed is what makes the correction local.
+/// - **The refused anchors, one per line**, with the start of what they said and why it was
+///   blocked, bounded by [`MAX_DIAGNOSED_ANCHORS`].
+/// - **Where a wrong quote comes from**, gated on `QuoteNotInBrief`, and since mika#3003 said in
+///   one of two moods depending on what the engine can establish. `attributions[i]` carries
+///   [`ToolReadLedger::attribute`]'s verdict for `per_anchor[i]`: on `Tool(name)` — the refused
+///   excerpt was found **verbatim** in what that tool returned this turn — the sentence is
+///   indicative and names the line and the tool. On `AbsentFromReads`, on `Unknown`, and on an
+///   absent entry it stays the pre-mika#3003 likelihood, word for word: the engine then holds no
+///   fact to assert, and a conditional sentence is what the grounding rule allows. mika#2794
+///   phrased it conditionally because the engine had no access to the turn's tool outputs; this
+///   flight gives it that access, and the mood follows the knowledge rather than the hypothesis.
+///   The gate matters as much as the wording: saying "you quoted another document" to a response
+///   whose anchors all landed on the *same region of the right brief* would send exactly the
+///   wrong fix.
+///
+/// `attributions` is indexed **in parallel with `per_anchor`**, never by rank among the refused
+/// lines: `attribute` returns `None` for every refusal that is not `QuoteNotInBrief`, so a turn
+/// refusing one line for its quote and another for overlap yields one attribution, and a rank
+/// would have lost which line it belongs to. A shorter slice degrades to the conditional mood
+/// rather than mis-pairing — the caller holds both vectors, but the pairing is load-bearing
+/// enough to be defended here too.
+///
+/// `None` when the list is empty — the two early returns of [`verify_review_anchors`] report no
+/// per-line fate, and the re-prompt then falls back word for word on the form it had before
+/// mika#2794.
+pub(crate) fn format_anchor_diagnosis(
+    per_anchor: &[AnchorOutcome],
+    attributions: &[Option<AnchorAttribution>],
+) -> Option<String> {
+    if per_anchor.is_empty() {
+        return None;
+    }
+
+    let label_of = |outcome: &AnchorOutcome| outcome.label.trim_end_matches(':').to_string();
+    let accepted: Vec<String> = per_anchor
+        .iter()
+        .filter(|outcome| outcome.refused.is_none())
+        .map(label_of)
+        .collect();
+    let refused: Vec<&AnchorOutcome> = per_anchor
+        .iter()
+        .filter(|outcome| outcome.refused.is_some())
+        .collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if !accepted.is_empty() {
+        parts.push(format!(
+            "Anchors accepted: {} — keep them exactly as written; do not rewrite them.",
+            accepted.join(", ")
+        ));
+    }
+    if !refused.is_empty() {
+        let mut lines = vec!["Anchors refused:".to_string()];
+        for outcome in refused.iter().take(MAX_DIAGNOSED_ANCHORS) {
+            let reason = outcome
+                .refused
+                .map(AnchorMissReason::describe)
+                .unwrap_or_default();
+            lines.push(format!(
+                "{} \"{}\" — refused: {reason}",
+                outcome.label, outcome.excerpt
+            ));
+        }
+        parts.push(lines.join("\n"));
+    }
+    // mika#3003 — l'indicatif, une ligne par ancre dont le registre de lecture du
+    // tour a retrouvé l'extrait mot pour mot dans la sortie d'un outil.
+    for (label, tool) in per_anchor
+        .iter()
+        .enumerate()
+        .filter_map(|(index, outcome)| match attributions.get(index) {
+            Some(Some(AnchorAttribution::Tool(tool))) => Some((label_of(outcome), tool.as_str())),
+            _ => None,
+        })
+    {
+        parts.push(format!(
+            "{label} quotes, word for word, what the `{tool}` tool returned during this turn — \
+             not the brief. This is measured, not guessed: the engine searched the text that \
+             tool returned and found that line in it. Quote the brief instead: the message that \
+             asked you for this review, which is the document under review."
+        ));
+    }
+    // Le conditionnel reste, mot pour mot, pour toute ancre refusée sur
+    // `QuoteNotInBrief` que le registre n'a PAS attribuée — `AbsentFromReads`,
+    // `Unknown`, ou pas d'entrée du tout. Un registre tronqué qui n'a pas trouvé
+    // l'extrait n'établit pas une absence (mika#3003), et le moteur n'a alors
+    // rien à affirmer.
+    if per_anchor.iter().enumerate().any(|(index, outcome)| {
+        outcome.refused == Some(AnchorMissReason::QuoteNotInBrief)
+            && !matches!(
+                attributions.get(index),
+                Some(Some(AnchorAttribution::Tool(_)))
+            )
+    }) {
+        parts.push(
+            "A quote that is absent from the brief usually comes from a document you read with \
+             a tool — a ticket body, a file, a page — and not from the brief message of this \
+             turn. Quote the brief itself: the message that asked you for this review."
+                .to_string(),
+        );
+    }
+
+    Some(parts.join("\n\n"))
+}
+
 /// Normalize a span of text to the form the quote comparison runs on.
 ///
 /// Applied to both the brief and each anchor line before comparison, so it is a symmetric
@@ -255,7 +650,10 @@ impl AnchorVerdict {
 ///
 /// Without this, a genuine quote fails on the reviewer's rendering, which is a false rejection
 /// of exactly the response the guard must let through.
-fn normalize_for_anchor_match(text: &str) -> String {
+/// `pub(crate)` since mika#3003: [`ToolReadLedger`] normalizes its haystacks with this very
+/// function rather than a second copy of it. A ledger normalized one way and a needle another
+/// is a search that never matches and a guard that silently stops attributing.
+pub(crate) fn normalize_for_anchor_match(text: &str) -> String {
     let unmarked: String = text
         .chars()
         .filter(|c| !matches!(c, '*' | '`'))
@@ -1740,5 +2138,723 @@ mod mika3002 {
             brief.len(),
             "les deux découpes doivent partitionner le brief, marqueurs exclus"
         );
+    }
+}
+
+/// mika#3003 — le registre de lecture du tour et l'attribution d'une ancre refusée.
+#[cfg(test)]
+mod mika3003 {
+    use super::*;
+
+    /// La forme mesurée le 2026-10-31 : le corps du ticket que l'architecte a lu avec
+    /// `gh_read issue_view`, et dont il a cité la première phrase au lieu de citer le plan.
+    const TICKET_BODY: &str = "La garde d'ancrage de mika#2037 retient une disposition de \
+        mika-arch quand ses citations ne viennent pas du brief, c'est-à-dire du plan revu.\n\n\
+        Le 2026-10-31, l'architecte a cité le **corps du ticket**, qu'il avait lu avec \
+        `gh_read issue_view`, au lieu du plan.\n";
+
+    fn refused(excerpt: &str, reason: AnchorMissReason) -> AnchorOutcome {
+        AnchorOutcome {
+            label: "A1:".to_string(),
+            excerpt: excerpt.to_string(),
+            refused: Some(reason),
+        }
+    }
+
+    /// Le `review_anchor_min_quote_chars` que les trois manifestes arch déclarent.
+    const MIN_QUOTE: usize = 40;
+
+    /// `attribute` au seuil de production.
+    fn attribue(ledger: &ToolReadLedger, outcome: &AnchorOutcome) -> Option<AnchorAttribution> {
+        ledger.attribute(outcome, MIN_QUOTE)
+    }
+
+    fn tool(name: &str) -> Option<AnchorAttribution> {
+        Some(AnchorAttribution::Tool(name.to_string()))
+    }
+
+    /// Une sortie d'outil sous le plafond est retenue entière, et le registre reste complet.
+    #[test]
+    fn une_poussee_sous_le_plafond_ne_tronque_pas() {
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+
+        assert!(
+            !ledger.truncated,
+            "rien n'a été clippé, donc rien à signaler"
+        );
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].0, "gh_read");
+        assert!(
+            ledger.entries[0]
+                .1
+                .contains("l'architecte a cité le corps du ticket"),
+            "le texte normalisé doit être retrouvable : {:?}",
+            ledger.entries[0].1
+        );
+    }
+
+    /// Le plafond est en caractères, et il pose `truncated`. Le corps est français : le même
+    /// clippage en octets couperait au milieu d'un codepoint (`scripts/check-byte-slices.sh`).
+    #[test]
+    fn une_poussee_au_dessus_du_plafond_clippe_en_caracteres_et_le_dit() {
+        let overflowing = "é ".repeat(TOOL_READ_LEDGER_CHARS);
+        assert!(overflowing.chars().count() > TOOL_READ_LEDGER_CHARS);
+
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("read_file", &overflowing);
+
+        assert!(
+            ledger.truncated,
+            "un clippage doit être signalé (mika#2331)"
+        );
+        assert!(
+            ledger.entries[0].1.chars().count() <= TOOL_READ_LEDGER_CHARS,
+            "le registre dépasse son plafond : {} caractères",
+            ledger.entries[0].1.chars().count()
+        );
+        assert!(
+            ledger.entries[0].1.starts_with("é é"),
+            "le clippage doit garder le début, et ne pas couper un codepoint"
+        );
+    }
+
+    /// Le plafond est celui du registre **entier**, pas celui d'une poussée : trois sorties
+    /// d'un demi-plafond chacune ne font pas un registre d'un plafond et demi.
+    #[test]
+    fn le_plafond_porte_sur_le_registre_entier() {
+        let half = "a ".repeat(TOOL_READ_LEDGER_CHARS / 2);
+        let mut ledger = ToolReadLedger::default();
+        for _ in 0..3 {
+            ledger.record_tool_read("read_file", &half);
+        }
+
+        let total: usize = ledger
+            .entries
+            .iter()
+            .map(|(_, text)| text.chars().count())
+            .sum();
+        assert!(
+            total <= TOOL_READ_LEDGER_CHARS,
+            "le registre entier dépasse son plafond : {total} caractères"
+        );
+        assert!(
+            ledger.truncated,
+            "le troisième appel n'a pas tenu : le registre doit le dire"
+        );
+    }
+
+    /// Le registre normalise avec **la fonction du matcher**, pas une seconde copie : un
+    /// extrait dont seuls les espaces et les marqueurs markdown diffèrent est retrouvé.
+    #[test]
+    fn le_registre_normalise_comme_le_matcher() {
+        let mut ledger = ToolReadLedger::default();
+        // Sauts de ligne et `**` dans la source, aucun des deux dans l'extrait de l'ancre.
+        ledger.record_tool_read(
+            "gh_read",
+            "l'architecte a cité le\n   **corps du ticket**, qu'il avait lu\n",
+        );
+
+        let outcome = refused(
+            "l'architecte a cité le corps du ticket, qu'il avait lu",
+            AnchorMissReason::QuoteNotInBrief,
+        );
+        assert_eq!(attribue(&ledger, &outcome), tool("gh_read"));
+    }
+
+    /// Premier arm : l'extrait est dans la sortie d'un outil du tour, et l'attribution nomme
+    /// cet outil-là. C'est le cas du 2026-10-31 et la première phrase d'AC2.
+    #[test]
+    fn extrait_present_dans_une_sortie_doutil_rend_tool() {
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("store_fact", "Préférence enregistrée.");
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+
+        let outcome = refused(
+            "La garde d'ancrage de mika#2037 retient une disposition de mika-arch",
+            AnchorMissReason::QuoteNotInBrief,
+        );
+        assert_eq!(
+            attribue(&ledger, &outcome),
+            tool("gh_read"),
+            "l'attribution doit nommer l'outil dont la sortie porte l'extrait"
+        );
+    }
+
+    /// **Le test que le défaut de conception de ce vol a gagné.** `anchor_excerpt` coupe la
+    /// ligne d'ancre APRÈS son préfixe `A1:`, donc l'extrait porte les guillemets du modèle
+    /// et le début de sa propre prose — forme attestée par l'assertion de l'eval 2a
+    /// (`A1: ""The reaper introduced by mika#2750 fails the parent`). **Aucun document ne
+    /// contient cette chaîne**, donc un `contains` aurait répondu `AbsentFromReads` sur la
+    /// forme même sur laquelle mika#3003 a été mesuré. La recherche passe par la fenêtre
+    /// glissante du matcher, et c'est ce que ce test épingle.
+    #[test]
+    fn un_extrait_de_la_forme_reelle_du_2026_10_31_sattribue() {
+        let anchor_line = normalize_for_anchor_match(
+            "\"La garde d'ancrage de mika#2037 retient une disposition de mika-arch quand ses \
+             citations ne viennent pas du brief\" — le plan porte bien cette garantie.",
+        );
+        let excerpt = anchor_excerpt(&anchor_line);
+        assert!(
+            excerpt.starts_with('"'),
+            "le fixture doit porter les guillemets du modèle : {excerpt:?}"
+        );
+
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+
+        let needle = excerpt.trim_end_matches('…');
+        assert!(
+            !normalize_for_anchor_match(TICKET_BODY).contains(needle),
+            "la prémisse du test : le corps du ticket ne contient PAS l'extrait tel quel"
+        );
+        assert_eq!(
+            attribue(
+                &ledger,
+                &refused(&excerpt, AnchorMissReason::QuoteNotInBrief)
+            ),
+            tool("gh_read"),
+            "la fenêtre glissante doit retrouver la citation dans le bruit du modèle"
+        );
+    }
+
+    /// Deuxième arm : rien trouvé, registre complet — y compris vide, quand le tour n'a
+    /// appelé aucun outil. C'est la seconde phrase d'AC2 (le re-prompt d'avant ce vol).
+    #[test]
+    fn extrait_absent_dun_registre_complet_rend_absent_from_reads() {
+        // 59 caractères : au-dessus du plancher, donc l'échec vient bien de la recherche
+        // et non de la garde de longueur — les deux rendent `AbsentFromReads`.
+        const INEDIT: &str = "une phrase que personne au monde n'a lue pendant ce tour-ci";
+        assert!(INEDIT.chars().count() > ATTRIBUTION_MIN_QUOTE_CHARS);
+
+        let mut ledger = ToolReadLedger::default();
+        assert_eq!(
+            attribue(&ledger, &refused(INEDIT, AnchorMissReason::QuoteNotInBrief)),
+            Some(AnchorAttribution::AbsentFromReads),
+            "un registre vide est complet, pas inconnu"
+        );
+
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+        assert_eq!(
+            attribue(&ledger, &refused(INEDIT, AnchorMissReason::QuoteNotInBrief)),
+            Some(AnchorAttribution::AbsentFromReads)
+        );
+    }
+
+    /// Troisième arm : rien trouvé, mais le registre avait été clippé. L'absence n'est pas
+    /// établie, donc elle n'est pas affirmée — c'est la décision de conception de D1.
+    #[test]
+    fn extrait_absent_dun_registre_tronque_rend_unknown() {
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("read_file", &"a ".repeat(TOOL_READ_LEDGER_CHARS));
+
+        assert_eq!(
+            attribue(
+                &ledger,
+                &refused(
+                    "une phrase qui pourrait bien être dans la part coupée du registre",
+                    AnchorMissReason::QuoteNotInBrief
+                )
+            ),
+            Some(AnchorAttribution::Unknown),
+            "un échec de recherche dans un registre tronqué n'est pas une absence"
+        );
+    }
+
+    /// Le `…` que `anchor_excerpt` appose est un marqueur de rendu, pas du texte lu : il est
+    /// retiré avant la recherche, sinon aucune ancre de plus de 72 caractères ne s'attribue.
+    #[test]
+    fn le_marqueur_de_troncature_est_retire_avant_la_recherche() {
+        let long_line = normalize_for_anchor_match(TICKET_BODY);
+        let excerpt = anchor_excerpt(&long_line);
+        assert!(
+            excerpt.ends_with('…'),
+            "le fixture doit bien produire un extrait tronqué : {excerpt:?}"
+        );
+
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+        assert_eq!(
+            attribue(
+                &ledger,
+                &refused(&excerpt, AnchorMissReason::QuoteNotInBrief)
+            ),
+            tool("gh_read"),
+            "un extrait tronqué doit s'attribuer comme un court"
+        );
+    }
+
+    /// L'attribution ne tourne que sur `QuoteNotInBrief`. Les autres refus ne posent pas la
+    /// question de l'origine : le texte EST dans le brief, c'est sa géométrie ou sa longueur
+    /// qui échoue, et une phrase d'origine y enverrait le mauvais correctif.
+    #[test]
+    fn seul_un_refus_quote_not_in_brief_est_attribue() {
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+        let excerpt = "La garde d'ancrage de mika#2037 retient une disposition de mika-arch";
+
+        for reason in [
+            AnchorMissReason::OverlappingRegions,
+            AnchorMissReason::QuoteTooShort,
+            AnchorMissReason::NoAnchorLine,
+            AnchorMissReason::TooFewAnchors,
+        ] {
+            assert_eq!(
+                attribue(&ledger, &refused(excerpt, reason)),
+                None,
+                "{reason:?} ne demande pas d'où vient le texte"
+            );
+        }
+
+        let accepted = AnchorOutcome {
+            label: "A1:".to_string(),
+            excerpt: excerpt.to_string(),
+            refused: None,
+        };
+        assert_eq!(
+            attribue(&ledger, &accepted),
+            None,
+            "une ancre acceptée n'est jamais attribuée"
+        );
+    }
+
+    /// Un extrait vide est dans tous les foins. Atteignable à `min_quote_chars == 0`, où une
+    /// ligne d'ancre vide est refusée en `QuoteNotInBrief` : l'attribuer au premier outil du
+    /// tour serait une fabrication. Le plancher de longueur suffit à l'écarter — pas besoin
+    /// d'un `is_empty` séparé, qui serait un second prédicat pour la même propriété.
+    #[test]
+    fn un_extrait_vide_ne_sattribue_a_aucun_outil() {
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+        assert_eq!(
+            attribue(&ledger, &refused("", AnchorMissReason::QuoteNotInBrief)),
+            Some(AnchorAttribution::AbsentFromReads)
+        );
+        assert_eq!(
+            attribue(&ledger, &refused("   ", AnchorMissReason::QuoteNotInBrief)),
+            Some(AnchorAttribution::AbsentFromReads)
+        );
+    }
+
+    /// **Le plancher de l'attribution, par les deux bouts.** La phrase que ce vol ajoute au
+    /// re-prompt est à l'indicatif : elle affirme. Une fausse attribution est donc pire
+    /// qu'aucune, et un span de 12 caractères retrouvé dans une sortie d'outil est une
+    /// coïncidence, pas une provenance. En bas, `ATTRIBUTION_MIN_QUOTE_CHARS` tient le
+    /// plancher même si un manifeste déclarait un `min_quote_chars` laxiste ; en haut, la
+    /// fenêtre est bornée par `ANCHOR_EXCERPT_CHARS`, sans quoi un contrat exigeant plus que
+    /// la longueur de l'extrait rendrait toute attribution inatteignable.
+    #[test]
+    fn le_plancher_de_lattribution_ne_depend_pas_du_contrat() {
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+
+        // Présent mot pour mot dans le corps, mais trop court pour affirmer quoi que ce soit.
+        let court = "mika#2037 retient";
+        assert!(court.chars().count() < ATTRIBUTION_MIN_QUOTE_CHARS);
+        assert!(normalize_for_anchor_match(TICKET_BODY).contains(court));
+        assert_eq!(
+            ledger.attribute(&refused(court, AnchorMissReason::QuoteNotInBrief), 10),
+            Some(AnchorAttribution::AbsentFromReads),
+            "un contrat laxiste ne doit pas abaisser le plancher de l'affirmation"
+        );
+
+        // Le même extrait au-dessus du plancher s'attribue, au même contrat laxiste : ce qui
+        // a changé est la longueur, pas le seuil déclaré.
+        let long = "La garde d'ancrage de mika#2037 retient une disposition";
+        assert!(long.chars().count() > ATTRIBUTION_MIN_QUOTE_CHARS);
+        assert_eq!(
+            ledger.attribute(&refused(long, AnchorMissReason::QuoteNotInBrief), 10),
+            tool("gh_read")
+        );
+
+        // Borne haute : un contrat de 400 caractères n'empêche pas d'attribuer un extrait
+        // plein, parce qu'`ANCHOR_EXCERPT_CHARS` est tout ce qu'`anchor_excerpt` peut rendre
+        // et qu'une fenêtre de 400 ne tiendrait dans aucun extrait.
+        let plein = "La garde d'ancrage de mika#2037 retient une disposition de mika-arch quand";
+        assert!(plein.chars().count() >= ANCHOR_EXCERPT_CHARS);
+        assert_eq!(
+            ledger.attribute(&refused(plein, AnchorMissReason::QuoteNotInBrief), 400),
+            tool("gh_read"),
+            "la fenêtre doit être clippée à la longueur maximale d'un extrait"
+        );
+    }
+
+    // -- le re-prompt : l'humeur de la phrase d'origine ----------------------
+
+    /// Un `AnchorOutcome` à l'étiquette choisie. [`refused`] fixe `A1:`, et les tests du
+    /// formateur ont besoin de trois lignes distinctes dans un même `per_anchor`.
+    fn outcome(label: &str, excerpt: &str, refused: Option<AnchorMissReason>) -> AnchorOutcome {
+        AnchorOutcome {
+            label: label.to_string(),
+            excerpt: excerpt.to_string(),
+            refused,
+        }
+    }
+
+    /// La forme mesurée du 2026-10-31, rejouée au niveau du formateur : `A1` cite le corps du
+    /// ticket lu avec `gh_read`, `A2` et `A3` citent le plan. Le registre a retrouvé l'extrait
+    /// de `A1` mot pour mot dans la sortie de `gh_read`, donc la phrase d'origine passe à
+    /// l'indicatif, nomme la ligne **et** l'outil, et le conditionnel disparaît : affirmer et
+    /// supposer la même chose dans le même re-prompt est ce qui le rend ignorable.
+    #[test]
+    fn mika3003_une_ancre_attribuee_passe_le_paragraphe_a_lindicatif() {
+        let per_anchor = vec![
+            outcome(
+                "A1:",
+                "La garde d'ancrage de mika#2037 retient une disposition de mika-arch…",
+                Some(AnchorMissReason::QuoteNotInBrief),
+            ),
+            outcome("A2:", "sur l'exhaustivité du tracé", None),
+            outcome("A3:", "Je n'ai pas fixé N pour le seuil", None),
+        ];
+        let attributions = vec![tool("gh_read"), None, None];
+        let diagnosis = format_anchor_diagnosis(&per_anchor, &attributions)
+            .expect("a non-empty list diagnoses");
+
+        // Les deux premiers paragraphes sont ceux de mika#2794, inchangés.
+        assert!(
+            diagnosis.contains("Anchors accepted: A2, A3") && diagnosis.contains("A1: \""),
+            "{diagnosis}"
+        );
+        // AC1 : la ligne, l'outil, et le fait que c'est mesuré.
+        assert!(
+            diagnosis.contains("A1 quotes, word for word, what the `gh_read` tool returned"),
+            "l'indicatif doit nommer la ligne et l'outil : {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("This is measured, not guessed"),
+            "le moteur dit d'où lui vient le droit d'affirmer : {diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("usually comes from"),
+            "le conditionnel ne cohabite pas avec l'indicatif sur la même ancre : {diagnosis}"
+        );
+    }
+
+    /// Premier contrôle négatif : l'extrait est absent d'un registre **complet**. Le moteur a
+    /// cherché et n'a pas trouvé, mais « absent de ce que j'ai lu » n'est pas « absent de tout
+    /// document » — il n'a donc rien à affirmer, et le paragraphe doit être caractère pour
+    /// caractère celui d'avant ce vol. La comparaison porte sur le diagnostic entier contre
+    /// l'appel à liste vide, parce qu'une égalité de substrings laisserait passer un ajout.
+    #[test]
+    fn mika3003_une_absence_etablie_garde_le_conditionnel_mot_pour_mot() {
+        let per_anchor = vec![
+            outcome(
+                "A1:",
+                "une phrase que personne n'a lue ce tour-ci",
+                Some(AnchorMissReason::QuoteNotInBrief),
+            ),
+            outcome("A2:", "sur l'exhaustivité du tracé", None),
+        ];
+        let avant = format_anchor_diagnosis(&per_anchor, &[]).expect("non-empty");
+
+        for attribution in [
+            AnchorAttribution::AbsentFromReads,
+            AnchorAttribution::Unknown,
+        ] {
+            let apres = format_anchor_diagnosis(&per_anchor, &[Some(attribution.clone())])
+                .expect("non-empty");
+            assert_eq!(
+                apres, avant,
+                "{attribution:?} n'établit aucune origine : le re-prompt doit être intact"
+            );
+            assert!(apres.contains("usually comes from"), "{apres}");
+            assert!(!apres.contains("word for word, what the"), "{apres}");
+        }
+    }
+
+    /// Les deux humeurs cohabitent quand les ancres ne sont pas du même cas : `A1` est
+    /// attribuée, `A2` ne l'est pas. L'indicatif ne porte que sur `A1`, et le conditionnel
+    /// reste pour `A2` — c'est le seul re-prompt où les deux phrases sont vraies ensemble.
+    #[test]
+    fn mika3003_les_deux_humeurs_cohabitent_sur_un_tour_mixte() {
+        let per_anchor = vec![
+            outcome(
+                "A1:",
+                "La garde d'ancrage de mika#2037 retient une disposition…",
+                Some(AnchorMissReason::QuoteNotInBrief),
+            ),
+            outcome(
+                "A2:",
+                "une phrase que personne n'a lue ce tour-ci",
+                Some(AnchorMissReason::QuoteNotInBrief),
+            ),
+        ];
+        let attributions = vec![tool("gh_read"), Some(AnchorAttribution::AbsentFromReads)];
+        let diagnosis = format_anchor_diagnosis(&per_anchor, &attributions).expect("non-empty");
+
+        assert!(
+            diagnosis.contains("A1 quotes, word for word, what the `gh_read` tool returned"),
+            "{diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("A2 quotes, word for word"),
+            "A2 n'a pas été retrouvée : rien ne l'affirme : {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("usually comes from"),
+            "A2 garde le conditionnel : {diagnosis}"
+        );
+    }
+
+    /// **L'appariement, qui est la déviation de ce vol par rapport au plan.** Le plan écrivait
+    /// « dans l'ordre des refusées » ; `attribute` rend `None` pour tout refus qui n'est pas
+    /// `QuoteNotInBrief`, donc un rang parmi les refusées perd de quelle ligne l'attribution
+    /// parle. Ici `A1` est refusée sur un chevauchement et `A2` sur sa citation : un index par
+    /// rang parmi les refusées attribuerait `gh_read` à `A1`, et le moteur affirmerait, à
+    /// l'indicatif, une origine pour une ancre qui cite bel et bien le plan.
+    #[test]
+    fn mika3003_lattribution_sapparie_sur_per_anchor_et_pas_sur_les_refusees() {
+        let per_anchor = vec![
+            outcome(
+                "A1:",
+                "re-résoudre le token avant chaque cycle",
+                Some(AnchorMissReason::OverlappingRegions),
+            ),
+            outcome(
+                "A2:",
+                "La garde d'ancrage de mika#2037 retient une disposition…",
+                Some(AnchorMissReason::QuoteNotInBrief),
+            ),
+        ];
+        let attributions = vec![None, tool("gh_read")];
+        let diagnosis = format_anchor_diagnosis(&per_anchor, &attributions).expect("non-empty");
+
+        assert!(
+            diagnosis.contains("A2 quotes, word for word, what the `gh_read` tool returned"),
+            "{diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("A1 quotes, word for word"),
+            "A1 a été refusée sur sa géométrie, pas sur son origine : {diagnosis}"
+        );
+    }
+
+    /// Dernier contrôle négatif, et le plus bête : une liste d'attributions vide — ce que rend
+    /// un appel qui n'a rien attribué — laisse le diagnostic identique à la forme mika#2794.
+    /// Les quatre tests de ce vol-là l'appellent ainsi, et c'est ce qui les garde honnêtes.
+    #[test]
+    fn mika3003_une_liste_dattributions_vide_est_la_forme_pre_vol() {
+        let per_anchor = vec![outcome(
+            "A1:",
+            "une ligne qui ne cite pas le brief",
+            Some(AnchorMissReason::QuoteNotInBrief),
+        )];
+        let avant = format_anchor_diagnosis(&per_anchor, &[]).expect("non-empty");
+        assert!(avant.contains("usually comes from"), "{avant}");
+        assert!(!avant.contains("word for word, what the"), "{avant}");
+        assert_eq!(format_anchor_diagnosis(&[], &[]), None);
+    }
+
+    // -- le registre de lecture a UN seul écrivain --------------------------
+
+    /// Sites de production exemptés de
+    /// [`mika3003_le_registre_de_lecture_a_un_seul_ecrivain`].
+    ///
+    /// **Née vide, et la résolution quand le scan tire est de RETIRER le second
+    /// écrivain, jamais d'ajouter une entrée ici.** Même contrat que
+    /// `CONTEXT_HISTORY_READERS_ALLOWED` du module parent : une liste née vide
+    /// est un emplacement pour le prochain oubli, donc sa vacuité est elle-même
+    /// assertée, et une entrée doit nommer le ticket de suite qui la retirera.
+    const TOOL_READ_LEDGER_WRITERS_ALLOWED: &[&str] = &[];
+
+    /// Lignes de production qui alimentent le registre de lecture du tour, en
+    /// `(ligne 1-indexée, texte trimé)`.
+    ///
+    /// L'aiguille est la **forme appelée** (`.record_tool_read(`), pas le nom nu :
+    /// la déclaration de la méthode, son doc-comment et le nom de ce test
+    /// portent l'identifiant sans alimenter quoi que ce soit — même raison que
+    /// le chemin pointé d'`identity_history_reader_sites` (module parent), dont
+    /// ce prédicat reprend aussi les trois exclusions (ligne de commentaire,
+    /// fichier de test par son chemin, régions de test masquées ailleurs).
+    fn tool_read_ledger_writer_sites(path: &std::path::Path, src: &str) -> Vec<(usize, String)> {
+        if crate::source_scan::is_test_source_path(path) {
+            return Vec::new();
+        }
+        mika_common::source_guard::mask_test_regions(src)
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line.trim().to_string()))
+            .filter(|(_, line)| {
+                line.contains(".record_tool_read(")
+                    && !line.starts_with("//")
+                    && !line.starts_with('*')
+            })
+            .collect()
+    }
+
+    /// **D4** — le registre a exactement un site d'alimentation en production.
+    ///
+    /// La phrase que ce vol ajoute au re-prompt est à l'**indicatif** : elle
+    /// affirme qu'un outil a rendu ce texte pendant ce tour. Ce droit tient
+    /// entièrement à ce que le registre ne contienne que des sorties d'outils.
+    /// Un second écrivain — un texte écrit par le moteur, un message du modèle,
+    /// un fragment de brief — ferait attribuer à un outil une phrase qu'aucun
+    /// outil n'a rendue, et **rien ne redeviendrait rouge** : l'attribution
+    /// resterait plausible, le re-prompt resterait bien formé, et l'architecte
+    /// se verrait accusé d'avoir cité un document qu'il n'a pas lu. C'est la
+    /// classe de mika#2158 — deux réponses individuellement crédibles à une
+    /// question qui n'en a qu'une.
+    #[test]
+    fn mika3003_le_registre_de_lecture_a_un_seul_ecrivain() {
+        assert!(
+            TOOL_READ_LEDGER_WRITERS_ALLOWED
+                .iter()
+                .all(|entry| entry.contains("mika#")),
+            "mika#3003 — toute entrée de TOOL_READ_LEDGER_WRITERS_ALLOWED doit nommer le \
+             ticket de suite qui la retirera. Une exemption que personne ne porte est la \
+             façon dont une garde cesse de garder. Liste actuelle : \
+             {TOOL_READ_LEDGER_WRITERS_ALLOWED:?}"
+        );
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut sites: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if TOOL_READ_LEDGER_WRITERS_ALLOWED
+                .iter()
+                .any(|allowed| rel.contains(allowed))
+            {
+                return;
+            }
+            for (line, text) in tool_read_ledger_writer_sites(path, production) {
+                sites.push(format!("{rel}:{line}: {text}"));
+            }
+        });
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "mika#3003 — un seul site de production doit alimenter le registre de lecture : \
+             celui de `tool_execution::dispatch::process_tool_calls` qui tient la sortie \
+             qu'un outil vient de rendre. Trouvés {} :\n{}\n\nSi tu en as ajouté un second, \
+             retire-le : le registre est ce qui donne au moteur le droit d'affirmer, à \
+             l'indicatif, qu'un outil a rendu ce texte.",
+            sites.len(),
+            sites.join("\n")
+        );
+        assert!(
+            sites[0].starts_with("tool_execution/dispatch.rs:")
+                || sites[0].starts_with("tool_execution\\dispatch.rs:"),
+            "mika#3003 — l'écrivain unique doit être le site de dispatch, là où la sortie \
+             de l'outil est encore disponible :\n{}",
+            sites[0]
+        );
+    }
+
+    /// **D4b — contrôle de bonne foi pour D4.**
+    ///
+    /// D4 pourrait être vert parce qu'il ne regarde rien, ce qui est exactement
+    /// la panne que D4 existe pour rendre visible. Le prédicat est donc montré
+    /// rouge sur un écrivain ajouté ailleurs, et muet sur les quatre formes qui
+    /// nomment la méthode sans l'appeler.
+    #[test]
+    fn mika3003_le_scan_de_lecrivain_rougit_sur_un_second_site() {
+        let prod = std::path::Path::new("src/ailleurs.rs");
+
+        let offending = "fn ailleurs(l: &mut ToolReadLedger, brief: &str) {\n    \
+             l.record_tool_read(\"brief\", brief);\n}\n";
+        assert_eq!(
+            tool_read_ledger_writer_sites(prod, offending).len(),
+            1,
+            "le scan doit voir un écrivain ajouté hors du site de dispatch"
+        );
+
+        // 1. La déclaration de la méthode elle-même n'est pas un appel.
+        let declaration = "    pub(crate) fn record_tool_read(&mut self, n: &str, o: &str) {\n";
+        assert!(
+            tool_read_ledger_writer_sites(prod, declaration).is_empty(),
+            "déclarer la méthode n'alimente pas le registre"
+        );
+
+        // 2. Le nom en prose — la forme qui accuse les doc-comments expliquant
+        // pourquoi l'écrivain est unique (classe mika#2050 Signal S).
+        let prose = "\
+// Seul site appelant `record_tool_read` sous `src/`.
+/// Tenu par `mika3003_le_registre_de_lecture_a_un_seul_ecrivain`.
+ * `ledger.record_tool_read(name, out)` est l'unique alimentation.
+";
+        assert!(
+            tool_read_ledger_writer_sites(prod, prose).is_empty(),
+            "une prose nommant la méthode n'alimente rien — et la troisième ligne porte \
+             bien la forme appelée, derrière un marqueur de commentaire de bloc"
+        );
+
+        // 3. Un appel dans une région de test masquée.
+        let in_tests = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    \
+             ledger.record_tool_read(\"gh_read\", TICKET_BODY);\n}\n";
+        assert!(
+            tool_read_ledger_writer_sites(prod, in_tests).is_empty(),
+            "une région de test est masquée avant le scan"
+        );
+
+        // 4. Un fichier dont le CHEMIN est du code de test n'a pas de moitié de
+        // production, quel que soit son contenu (mika#2321).
+        let test_path = std::path::Path::new("src/db/tests/harnais.rs");
+        assert!(
+            tool_read_ledger_writer_sites(test_path, offending).is_empty(),
+            "mika#2321 — un fichier sous `tests/` est du code de test"
+        );
+
+        // …mais un commentaire en fin de ligne n'exempte pas le code qui précède.
+        let trailing = "    ledger.record_tool_read(name, &out.content); // site unique\n";
+        assert_eq!(
+            tool_read_ledger_writer_sites(prod, trailing).len(),
+            1,
+            "seule une ligne qui COMMENCE par un marqueur de commentaire est de la prose"
+        );
+    }
+
+    /// Le dénominateur de l'AC3 n'est pas un binaire : il porte les comptes de la branche
+    /// `Missing`, l'ensemble dédupliqué des outils, et la retenue quand elle a eu lieu.
+    /// Trois ancres prises dans le même corps de ticket décrivent UNE source.
+    #[test]
+    fn mika3003_le_passage_arme_dedoublonne_ses_sources_et_capte_les_comptes() {
+        let mut ledger = ToolReadLedger::default();
+        ledger.record_tool_read("gh_read", TICKET_BODY);
+
+        let excerpt = "La garde d'ancrage de mika#2037 retient une disposition de mika-arch";
+        let per_anchor = vec![
+            outcome("A1:", excerpt, Some(AnchorMissReason::QuoteNotInBrief)),
+            outcome("A2:", excerpt, Some(AnchorMissReason::QuoteNotInBrief)),
+            outcome("A3:", "sur l'exhaustivité du tracé", None),
+        ];
+
+        let mut armed = ArmedPassage::default();
+        let attributions = armed.attribute(&ledger, &per_anchor, MIN_QUOTE, 3, 1);
+
+        assert_eq!(
+            attributions,
+            vec![tool("gh_read"), tool("gh_read"), None],
+            "l'attribution est parallèle à `per_anchor`, index pour index"
+        );
+        assert_eq!(
+            armed.sources(),
+            "gh_read",
+            "deux ancres du même corps de ticket décrivent une source, pas deux"
+        );
+        assert_eq!((armed.found, armed.valid), (Some(3), Some(1)));
+        assert!(!armed.withheld, "rien n'a encore été retenu");
+
+        armed.mark_withheld();
+        assert!(armed.withheld);
+    }
+
+    /// La forme par défaut — celle de la branche `Satisfied`, qui n'appelle jamais
+    /// `attribute` : les comptes restent absents de la ligne, et `attributed_sources` est une
+    /// chaîne vide, jamais un champ absent (mika#2331, mika#2340).
+    #[test]
+    fn mika3003_le_passage_arme_par_defaut_est_vide_et_pas_absent() {
+        let armed = ArmedPassage::default();
+        assert_eq!(armed.sources(), "");
+        assert_eq!((armed.found, armed.valid), (None, None));
+        assert!(!armed.withheld);
     }
 }
