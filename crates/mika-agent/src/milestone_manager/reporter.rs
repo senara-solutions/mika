@@ -41,6 +41,7 @@ use super::evaluator::{
     CiKnowledge, CiUnreadCause, DeathCause, FlightIssue, FlightRecommendation, FlightVerdict,
     HeadReviewState, MilestoneMembership, NotFlightReason, PrStateKnowledge, ReviewKnowledge,
 };
+use super::groom_trigger::GroomTriggerOutcome;
 use super::pool::{CandidateOrigin, POOL_MAX, POOL_MIN, PoolBand};
 use super::reader::OUTSIDE_READ_LIMIT;
 use super::reader::priority_from_labels;
@@ -170,6 +171,41 @@ impl Reporter {
         assessment: &Assessment,
         auth_notes: &[AuthBoundaryNote],
     ) -> String {
+        self.report_with_grooms(state, assessment, auth_notes, None)
+    }
+
+    /// Comme [`Reporter::report_with_auth_notes`], plus ce que le cycle a fait
+    /// de la relève (mika#2958 vol 2e, AC4 moitié ON). `None` rend
+    /// identiquement à `report_with_auth_notes`.
+    ///
+    /// # Pourquoi en paramètre, et pas lu ici
+    ///
+    /// Le rendu pourrait constater l'armement lui-même, par
+    /// `groom_write_is_armed()`. Deux raisons de ne pas le faire :
+    ///
+    /// 1. Le rendu deviendrait fonction de l'environnement du processus. Les
+    ///    tests de ce fichier tournent en parallèle, sans `serial_test`, et le
+    ///    seul harnais d'interrupteur vit dans le `mod tests` d'un autre
+    ///    fichier (`GroomArme`, `cadence.rs`).
+    /// 2. Ce serait un **second lecteur** de l'interrupteur (mika#2201), et il
+    ///    pourrait mentir : le cycle lit l'armement **une fois**, à
+    ///    `trigger_cycle_grooms`, et tout ce qui a suivi en découle.
+    ///
+    /// `None` ne veut pas dire « rien n'est parti » : il veut dire que le geste
+    /// n'a pas été **mesuré** — un appelant qui n'a pas de cycle derrière lui.
+    /// C'est pour cela qu'il rend la section du vol 1 au caractère près, et non
+    /// une section qui prétendrait répondre (mika#2331).
+    pub fn report_with_grooms(
+        &self,
+        state: &MilestoneState,
+        assessment: &Assessment,
+        auth_notes: &[AuthBoundaryNote],
+        grooms: Option<&GroomTriggerOutcome>,
+    ) -> String {
+        // Pas encore consulté : cette étape porte la délégation seule, pour que
+        // les 57 tests de ce fichier prouvent R2 **sans amendement**. L'étape
+        // suivante le lit.
+        let _ = grooms;
         let mut out = String::new();
         // Header.
         let _ = writeln!(
