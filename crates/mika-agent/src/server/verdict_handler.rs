@@ -4935,7 +4935,7 @@ mod mika2667_tests {
             "trace",
             &skills,
         )
-            .await
+        .await
     }
 
     async fn audit(db: &AsyncDatabase, tool: &str, pr: u64) -> i64 {
@@ -5239,5 +5239,349 @@ mod mika1381_tests {
              mutée, et les deux paliers se taisent ensemble. `{SEVERITE_ABSENTE}` est une fuite \
              de sévérité : le routage retombe sur le chat normal par accident et non par choix"
         );
+    }
+}
+
+/// mika#2965 — AC2 : **ce handler-ci** lit la CI en `app` quand l'App est là, en
+/// `pat` sinon.
+///
+/// # Pourquoi ce test est inline et pas sous `tests/eval/`
+///
+/// Il installe un abonné `tracing` de capture, et le site d'installation unique
+/// de mika#2646 — `crate::test_utils::test_helpers::install_capturing_subscriber`
+/// — est `#[cfg(test)]`, donc hors d'atteinte d'une cible d'intégration. Un
+/// second site d'installation écrit pour l'occasion est exactement ce que ce
+/// ticket-là a retiré.
+///
+/// # Ce qu'il mesure, et ce qui le rend falsifiable
+///
+/// Les **deux** provenances dans le **même** corps, sur **deux numéros de PR
+/// distincts**, et chaque ligne est assertée sur son numéro. C'est cette
+/// croisée qui porte tout : deux tests séparés, ou une assertion sur `source`
+/// seule, resteraient verts sur un arbre où le champ est écrit en dur, ou sur un
+/// arbre où le paramètre est ignoré et la source toujours `pat`. Même raison que
+/// `pr_merge_with_gate.rs § mika2963_ac4_la_provenance_est_dite`, dont ce test
+/// est la suite : là-bas l'émetteur était appelé à nu, ici il est atteint **à
+/// travers le handler**, par le chemin de production entier.
+///
+/// # Les quatre portes à franchir avant la lecture, et pourquoi elles comptent
+///
+/// Un test naïf de ce chemin est **vert sans jamais lire la CI** : la
+/// classification de périmètre est fail-closed, donc un `gh` absent la fait
+/// retomber sur `DecisionCore` et le handler rend `Handled` **avant** la
+/// lecture. Il faut donc, dans l'ordre : `state == "approved"` ; un auteur égal
+/// à [`mika_common::forge_identity::REVIEWER_FORGE_LOGIN`] ; une liste de
+/// fichiers que `perimeter` classe MECHANICAL — d'où le faux `gh` qui répond
+/// `docs/plans/…` à `pr view --json files` ; et une tâche `in_progress` portant
+/// l'URL de la PR. L'absence de la ligne de capture **est** le signal qu'une de
+/// ces portes a fermé plus tôt, et le message d'assertion le dit.
+///
+/// Le faux `gh` répond ensuite un check au `bucket: "fail"`, pour que le flot
+/// s'arrête **juste après** la lecture : `classify_checks` rend `HasFailures`,
+/// `link: null` désarme la relance de mika#2617 sans un appel de plus, et le
+/// handler rend un `Passthrough`. Aucun merge, aucun effet de bord sur la forge.
+///
+/// `#[serial_test::serial]` pour deux raisons indépendantes : `set_var("PATH")`
+/// est un état de processus, et l'abonné de capture touche le cache de
+/// callsites global — dont la doc de `install_capturing_subscriber` dit que
+/// `#[serial]` est « la moitié porteuse ».
+#[cfg(test)]
+mod mika2965_tests {
+    use super::{VerdictAction, try_handle_pr_review_verdict};
+    use crate::async_db::AsyncDatabase;
+    use crate::db::NewTask;
+    use mika_common::config::Settings;
+    use mika_common::github_app::GitHubApp;
+    use std::path::Path;
+
+    const REPO: &str = "senara-solutions/mika";
+    const SESSION: &str = "mika2965-session";
+    /// La PR lue avec le jeton d'installation de l'App.
+    const PR_APP: u64 = 29651;
+    /// La PR lue avec le PAT, faute d'App.
+    const PR_PAT: u64 = 29652;
+    const JETON_APP: &str = "ghs-app-mika2965-ne-doit-jamais-fuiter";
+    const JETON_PAT: &str = "ghp-pat-mika2965-ne-doit-jamais-fuiter";
+
+    // --- le harnais ------------------------------------------------------
+    //
+    // `PathGuard` / `prepend_to_path` / `install_fake_gh` reprennent la forme de
+    // `wip_rescue.rs § mod tests`, et l'abonné de capture celle de
+    // `pr_merge_with_gate.rs § abonne_capteur`.
+
+    struct PathGuard(Option<std::ffi::OsString>);
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            // SAFETY: le test est `#[serial]`, la fenêtre est bornée au corps.
+            unsafe {
+                match self.0.take() {
+                    Some(prev) => std::env::set_var("PATH", prev),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    fn prepend_to_path(dir: &Path) -> PathGuard {
+        let previous = std::env::var_os("PATH");
+        let mut next = std::ffi::OsString::from(dir);
+        if let Some(prev) = &previous {
+            next.push(":");
+            next.push(prev);
+        }
+        // SAFETY: voir la note du garde ci-dessus.
+        unsafe { std::env::set_var("PATH", &next) };
+        PathGuard(previous)
+    }
+
+    /// Le faux `gh`, en tête de `PATH`.
+    ///
+    /// Le répertoire est **cuit dans le texte du script** et non passé par
+    /// l'environnement : `run_gh_subprocess` appelle `scrub_mika_env_vars`, donc
+    /// aucune variable `MIKA_*` n'atteint l'enfant. `PATH`, lui, survit — c'est
+    /// la seule couture disponible sur ce chemin.
+    fn install_fake_gh(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir.display();
+        let corps = format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> {d}/calls.log\n\
+             if [ \"$1 $2\" = \"pr view\" ]; then\n\
+             \x20 echo '{{\"files\":[{{\"path\":\"docs/plans/2026-11-01-006-mika2965.md\"}}]}}'\n\
+             \x20 exit 0\n\
+             fi\n\
+             if [ \"$1 $2\" = \"pr checks\" ]; then\n\
+             \x20 echo '[{{\"name\":\"Check\",\"state\":\"FAILURE\",\"bucket\":\"fail\",\"link\":null}}]'\n\
+             \x20 exit 0\n\
+             fi\n\
+             exit 1\n"
+        );
+        let path = dir.join("gh");
+        std::fs::write(&path, corps).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn abonne_capteur() -> (
+        impl tracing::Subscriber + Send + Sync,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let tampon = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plume = tampon.clone();
+        let couche = tracing_subscriber::fmt::layer()
+            .with_writer(move || PlumeDeCapture(plume.clone()))
+            .with_ansi(false)
+            .with_target(true);
+        (tracing_subscriber::registry().with(couche), tampon)
+    }
+
+    struct PlumeDeCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PlumeDeCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // --- les fixtures ----------------------------------------------------
+
+    async fn db() -> AsyncDatabase {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        db.create_session(SESSION, "mika", "github").await.unwrap();
+        db
+    }
+
+    /// Une tâche `in_progress` portant l'URL de la PR — la quatrième porte.
+    async fn seed_task(db: &AsyncDatabase, pr: u64) {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: format!("mika#2965 fixture PR #{pr}"),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+        db.update_task_metadata(
+            &id,
+            &format!(r#"{{"claude_pilot":{{"pr_url":"https://github.com/{REPO}/pull/{pr}"}}}}"#),
+        )
+        .await
+        .unwrap();
+        db.update_task_status(&id, "in_progress").await.unwrap();
+    }
+
+    /// L'événement tel que le gateway le formate : `approved`, par l'identité de
+    /// revue, corps `VERDICT: pass`.
+    fn review(pr: u64) -> String {
+        let relecteur = mika_common::forge_identity::REVIEWER_FORGE_LOGIN;
+        format!(
+            "[GitHub] PR review (approved) on {REPO}#{pr} (fix: mika#2965) by @{relecteur}\n\
+             https://github.com/{REPO}/pull/{pr}#pullrequestreview-1\n\
+             \n\
+             VERDICT: pass\n\nRAS."
+        )
+    }
+
+    /// Un `Settings` ne portant que le PAT — le repli de `resolve_ci_read_token`.
+    fn settings_avec_pat() -> Settings {
+        let mut s = Settings::test_defaults();
+        s.github_token = Some(secrecy::SecretString::from(JETON_PAT.to_string()));
+        s
+    }
+
+    async fn passe(
+        db: &AsyncDatabase,
+        pr: u64,
+        ci_read_token: Option<&mika_common::ci_read::CiReadToken>,
+    ) -> VerdictAction {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
+        try_handle_pr_review_verdict(
+            &review(pr),
+            db,
+            // Le jeton de **post** reste le PAT : AC3 dit que les identités de
+            // post ne bougent pas, et la lecture de périmètre (`pr view`) passe
+            // par lui, pas par le jeton de lecture CI.
+            Some(JETON_PAT),
+            ci_read_token,
+            None,
+            SESSION,
+            &format!("trace-2965-{pr}"),
+            &skills,
+        )
+        .await
+    }
+
+    /// La ligne `ci_read_token_source` de la source demandée.
+    fn ligne_de_source<'a>(capture: &'a str, source: &str) -> &'a str {
+        capture
+            .lines()
+            .find(|l| l.contains("ci_read_token_source") && l.contains(&format!("\"{source}\"")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "mika#2965 AC2 — aucune ligne `ci_read_token_source` de source \
+                     `{source}` dans la capture. Soit le handler ne reçoit pas le jeton \
+                     résolu, soit le flot s'est arrêté AVANT la lecture CI : la \
+                     classification de périmètre est fail-closed, donc un faux `gh` qui \
+                     ne répond pas `docs/plans/…` à `pr view --json files` fait rendre \
+                     `Handled` sans jamais lire la CI — et le test serait vert sans rien \
+                     mesurer.\n\ncapture :\n{capture}"
+                )
+            })
+    }
+
+    /// **T1 — AC2.** Le handler lit la CI en `app` puis en `pat`, et chaque
+    /// provenance est attachée à SA lecture.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2965_ac2_le_handler_lit_la_ci_en_app_puis_en_pat() {
+        let bac = tempfile::tempdir().unwrap();
+        install_fake_gh(bac.path());
+        let _chemin = prepend_to_path(bac.path());
+
+        let db = db().await;
+        seed_task(&db, PR_APP).await;
+        seed_task(&db, PR_PAT).await;
+
+        let reglages = settings_avec_pat();
+        let app = GitHubApp::new_with_test_token(JETON_APP).await;
+
+        let (abonne, tampon) = abonne_capteur();
+        let (action_app, action_pat) = {
+            let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(abonne);
+
+            // Passe 1 — l'App est là : `resolve_ci_read_token` rend sa source.
+            let resolu_app = reglages.resolve_ci_read_token(Some(&app)).await;
+            let a = passe(&db, PR_APP, resolu_app.as_ref()).await;
+
+            // Passe 2 — aucune App : le même résolveur retombe sur le PAT.
+            let resolu_pat = reglages.resolve_ci_read_token(None).await;
+            let p = passe(&db, PR_PAT, resolu_pat.as_ref()).await;
+            (a, p)
+        };
+
+        let capture = String::from_utf8(tampon.lock().unwrap().clone()).expect("capture UTF-8");
+
+        // Contrôle positif du flot : les deux passes doivent s'être arrêtées sur
+        // le bras « CI rouge », qui est la toute première décision APRÈS la
+        // lecture. Toute autre issue signale une porte fermée plus tôt.
+        for (quoi, action) in [("app", &action_app), ("pat", &action_pat)] {
+            match action {
+                VerdictAction::Passthrough {
+                    enrichment: Some(e),
+                } => assert!(
+                    e.contains("CI checks are failing"),
+                    "passe `{quoi}` : le flot devait s'arrêter juste après la lecture CI, \
+                     sur le bras des checks rouges. Enrichissement : {e}"
+                ),
+                autre => panic!(
+                    "passe `{quoi}` : le flot n'a pas atteint la lecture CI — une des \
+                     quatre portes (approved, identité de revue, périmètre MECHANICAL, \
+                     tâche `in_progress`) a fermé plus tôt. Obtenu : {autre:?}"
+                ),
+            }
+        }
+
+        // AC2 — et c'est la croisée qui porte : chaque source est attachée à SA
+        // PR. Une assertion sur `source` seule resterait verte sur un arbre où
+        // le champ est écrit en dur, ou où le paramètre est ignoré.
+        let ligne_app = ligne_de_source(&capture, "app");
+        assert!(
+            ligne_app.contains(&PR_APP.to_string()),
+            "mika#2965 AC2 — la ligne de source `app` doit porter la PR #{PR_APP}, celle \
+             qui a été lue avec le jeton d'installation. ligne = {ligne_app}"
+        );
+        assert!(
+            !ligne_app.contains(&PR_PAT.to_string()),
+            "mika#2965 AC2 — la ligne de source `app` porte la PR #{PR_PAT}, qui a été lue \
+             sans App : la provenance n'est pas attachée à sa lecture. ligne = {ligne_app}"
+        );
+
+        let ligne_pat = ligne_de_source(&capture, "pat");
+        assert!(
+            ligne_pat.contains(&PR_PAT.to_string()),
+            "mika#2965 AC2 — la ligne de source `pat` doit porter la PR #{PR_PAT}, celle \
+             résolue sans App. Le repli au PAT n'est pas une régression : c'est le régime \
+             d'un déploiement sans App, et il doit se dire. ligne = {ligne_pat}"
+        );
+        assert!(
+            !ligne_pat.contains(&PR_APP.to_string()),
+            "mika#2965 AC2 — la ligne de source `pat` porte la PR #{PR_APP}, qui disposait \
+             de l'App : le handler ignore le jeton résolu. ligne = {ligne_pat}"
+        );
+
+        // Le `Debug` de `CiReadToken` rédige le jeton ; aucune ligne de ce
+        // chemin ne doit le réintroduire.
+        for jeton in [JETON_APP, JETON_PAT] {
+            assert!(
+                !capture.contains(jeton),
+                "mika#2965 — le jeton `{jeton}` est apparu dans le log.\n\ncapture :\n{capture}"
+            );
+        }
     }
 }
