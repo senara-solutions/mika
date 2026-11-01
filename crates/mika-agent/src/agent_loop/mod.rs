@@ -4609,19 +4609,25 @@ async fn run_loop(
                     if !skip_remaining_guards
                         && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !review_anchor.is_empty()
-                        && let Some(brief) = review_brief
+                        // mika#2996 — a groom retry carries the plan inside an envelope;
+                        // anchors are checked against the plan only, never against the
+                        // corrective instruction around it. Any other brief is used whole.
+                        && let Some(brief) = review_brief.map(review_anchor::anchor_reference)
                         // A brief too short to contain the proof cannot be reviewed into
                         // one. Demanding evidence that cannot exist is the false-positive
-                        // direction this guard is forbidden to take: it would break both
-                        // `/mika-ask-arch` and the mika#1823 UNPARSED recovery, whose user
-                        // message is a corrective prompt rather than the plan (mika#2037).
+                        // direction this guard is forbidden to take: it would break
+                        // `/mika-ask-arch` (mika#2037). The UNPARSED retries of mika#1823 and
+                        // mika#2641 used to be the other population below this line; since
+                        // mika#2996 they carry the plan, so they arm the guard like the turn
+                        // they repair — a retry was the one path where an advancing
+                        // disposition owed no evidence.
                         && brief.chars().count() >= review_anchor.min_brief_chars
                         && !is_terminal_disposition(&text, required_suffix_lines)
                         && has_declared_disposition(&text, required_suffix_lines)
                     {
                         let verdict = review_anchor::verify_review_anchors(
                             &text,
-                            brief,
+                            brief, // the plan region (mika#2996), not the whole message
                             &review_anchor.prefixes,
                             required_suffix_lines,
                             review_anchor.min_count,

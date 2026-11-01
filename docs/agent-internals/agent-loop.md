@@ -564,6 +564,44 @@ operator gesture over a deployment window. mika#2794 does not take it and opens 
 it: a ticket opened on an unmeasured hypothesis is precisely what mika#2786 declined to do for
 this lead.
 
+### Review-anchor guard — the UNPARSED retries carry the plan (mika#2996)
+
+The guard only arms when the turn's brief reaches `review_anchor_min_brief_chars` (2000 on
+both groom skills). The two UNPARSED retries of `_iterate_groom_loop` — mika#1823 on the
+first pass, mika#2641 on the second — used to send a ~380-character corrective prompt and
+then **accept the disposition returned on that turn**. That turn was below the threshold, so
+an advancing disposition owed no evidence there. Measured on 2026-10-31, trace `15ea28bd`: a
+review of *another* plan, ending in `Disposition: READY`, advanced the chain as
+`READY-after-retry`.
+
+Since mika#2996 the retry message carries the plan, verbatim, between two marker lines
+(`review_anchor::RETRY_PLAN_BEGIN` / `RETRY_PLAN_END`, written literally by
+`_append_retry_plan_envelope` in `dispatch-lib.sh`). `review_anchor::anchor_reference`
+reduces such a brief to the plan before the length check and the quote matching, so:
+
+- the guard arms on the retry exactly as on the turn it repairs;
+- anchors are checked against the **plan only**: three quotes of the corrective instruction
+  around it attest nothing;
+- the false positive the threshold was guarding against (demanding proof from a brief that
+  cannot contain it) is gone, because the brief contains the plan.
+
+A brief with no envelope, or with only one of the two markers, is used whole — a malformed
+envelope keeps the guard armed rather than disarming it on an empty region. A plan that has
+become unreadable makes the retry prompt fail to build, and the loop stops instead of
+retrying without the plan.
+
+**Post-deploy probe (AC4 of mika#2996).** A guard that passes on the first try emits no line,
+so the journal alone cannot tell "evaluated and satisfied" from "never armed". The probe is
+on the messages instead. For every `READY-after-retry` or `GROOMED-after-retry` entry of a
+`.claude/groom-verdict-trail.log`, read the retry turn's user message and the reply in
+`~/.mika/data/mika.db` (session from the trail's third field). The user message must carry
+both marker lines and a plan region of at least 2000 characters, which proves the guard
+armed. The reply must carry three anchors that quote that plan region at disjoint places,
+which proves it was satisfied. Check this by replaying `verify_review_anchors` against
+`anchor_reference(user_message)`. The count of entries that fail either half is reported on
+mika#2996, and the target is 0. The instrument is not live before `make deploy`:
+`dispatch-lib.sh` is seeded from the binary, not read from the checkout.
+
 ### Deterministic Context Injection
 
 Skills with `[context.*]` sections have their data pre-fetched by the engine before the LLM turn. `resolve_contexts()` dispatches to engine-owned handlers by `context_type`, deduplicates across skills, and returns `ContextBlock`s. `apply_context_replacements()` performs single-pass `{{key}}` template substitution on skill prompts (injection-safe — replaced content is never re-scanned). If a `required = true` context fails, the declaring skill is excluded from the turn; if `required = false`, a sentinel message replaces the placeholder. Known types: `gh_pr_diff`. Module: `skills/context.rs`.

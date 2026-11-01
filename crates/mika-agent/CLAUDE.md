@@ -167,7 +167,7 @@ UUID per ask. *Continued on explicit request:* `_arch_ask`
 | call | `session_id`? | why |
 |---|---|---|
 | 1st pass `mika-arch-groom-ticket` | **no** | fresh session |
-| UNPARSED retry | **yes** | the architect must see **its own prior turn** — the retry does not re-ask for the review, it asks the architect to *complete* its answer with the missing `Disposition:` line. Without the session the request is unintelligible: the carry-over is the mechanism's **condition of correctness**, not its contamination |
+| UNPARSED retry | **yes** | the architect must see **its own prior turn** — the retry does not re-ask for the review, it asks the architect to *complete* its answer with the missing `Disposition:` line. Without the session the request is unintelligible: the carry-over is the mechanism's **condition of correctness**, not its contamination. Since mika#2996 the retry message (both passes) also carries the plan between two marker lines, so the review-anchor guard arms on that turn and checks anchors against the plan only (`review_anchor::anchor_reference`) — a short retry let an unanchored READY advance the chain |
 | 2nd pass `mika-arch-second-review` (both branches) | **yes** | continuing the session so findings stay in conversation memory, per that skill's session-continuity contract |
 
 The session id is even written into the body-callout published on the ticket

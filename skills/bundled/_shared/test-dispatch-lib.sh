@@ -14070,44 +14070,39 @@ M2641_RETRY_EMPTY_REASON=$(printf '%s\n' "$M2641_RETRY_EMPTY" | grep '^reason=' 
 assert_contains "mika#2641 (V5-bis): le motif nomme la RELANCE, pas la 2e passe" \
     "second-pass retry returned an EMPTY .content" "$M2641_RETRY_EMPTY_REASON"
 
-# --- V4 (R5/D7) : le prompt de relance est COURT, et le seuil est LU --------
+# --- V4 (réécrit par mika#2996) : le prompt de relance porte le plan --------
 #
-# `mika-arch-second-review` déclare `review_anchor_min_brief_chars` : en dessous,
-# la garde d'ancrage mika#2037 ne s'arme pas. Un prompt de relance au-dessus
-# l'armerait — et l'architecte, qui n'a pas le brief sous les yeux dans un
-# re-prompt, ne peut produire aucune ancre ; le moteur retire alors la
-# disposition (tier 0) ou réécrit la réponse en escalade (tier 0b), et
-# `_parse_verdict` rend ESCALATE. Le correctif produirait exactement le terminal
-# qu'il existe pour empêcher.
-#
-# Le seuil est lu DEPUIS LE MANIFESTE, jamais recopié : un seuil durci dans le
-# `skill.toml` sans que le prompt rétrécisse doit faire rougir ce test.
+# V4 asserta d'abord l'inverse : prompt COURT, sous `review_anchor_min_brief_chars`,
+# pour que la garde d'ancrage mika#2037 ne s'arme pas sur un brief sans le plan.
+# Ce contrat laissait passer un `Verdict: GROOMED` sans aucune preuve au tour de
+# relance (mika#2996, trace `15ea28bd` pour la première passe). Le prompt porte
+# désormais le plan, donc la garde s'arme et l'architecte a de quoi citer. Le
+# câblage à l'octet est épinglé par le bloc mika#2996 en fin de fichier ; ici on
+# garde la mesure (anti-vacuité) et on pose le nouveau sens de l'inégalité :
+# le prompt est PLUS LONG que le plan qu'il porte.
 M2641_ANCHOR_MANIFEST="$SCRIPT_DIR/../mika-arch-second-review/skill.toml"
-M2641_ANCHOR_THRESHOLD=$(grep -E '^[[:space:]]*review_anchor_min_brief_chars[[:space:]]*=' \
-    "$M2641_ANCHOR_MANIFEST" 2>/dev/null | head -1 | sed 's/.*=[[:space:]]*//' | tr -d ' \r' || true)
-
-if [ -z "$M2641_ANCHOR_THRESHOLD" ]; then
-    echo "SKIP: mika#2641 (V4) — review_anchor_min_brief_chars absent de $M2641_ANCHOR_MANIFEST"
-    SKIPPED=$((SKIPPED + 1))
+M2641_RETRY_BYTES=$(printf '%s\n' "$M2641_RECOVERED" | grep '^retry_prompt_bytes=' \
+    | head -1 | cut -d= -f2 || true)
+if [ "${M2641_RETRY_BYTES:-0}" -gt 0 ] 2>/dev/null; then
+    PASS=$((PASS + 1))
+    echo "  ✓ mika#2641 (V4): le prompt de relance a été mesuré (${M2641_RETRY_BYTES} octets)"
 else
-    M2641_RETRY_BYTES=$(printf '%s\n' "$M2641_RECOVERED" | grep '^retry_prompt_bytes=' \
-        | head -1 | cut -d= -f2 || true)
-    # Anti-vacuité : un prompt de 0 octet satisferait l'inégalité en ne
-    # mesurant rien (la sonde n'aurait pas tourné, ou le fichier aurait disparu).
-    if [ "${M2641_RETRY_BYTES:-0}" -gt 0 ] 2>/dev/null; then
-        PASS=$((PASS + 1))
-        echo "  ✓ mika#2641 (V4): le prompt de relance a été mesuré (${M2641_RETRY_BYTES} octets)"
-    else
-        FAIL=$((FAIL + 1))
-        echo "  ✗ mika#2641 (V4): le prompt de relance n'a PAS été mesuré (vide ou sonde muette)"
-    fi
-    if [ "${M2641_RETRY_BYTES:-0}" -lt "$M2641_ANCHOR_THRESHOLD" ] 2>/dev/null; then
-        PASS=$((PASS + 1))
-        echo "  ✓ mika#2641 (V4): le prompt de relance (${M2641_RETRY_BYTES}) est sous le seuil d'ancrage (${M2641_ANCHOR_THRESHOLD})"
-    else
-        FAIL=$((FAIL + 1))
-        echo "  ✗ mika#2641 (V4): le prompt de relance (${M2641_RETRY_BYTES}) ATTEINT le seuil d'ancrage (${M2641_ANCHOR_THRESHOLD}) — il armerait la garde mika#2037"
-    fi
+    FAIL=$((FAIL + 1))
+    echo "  ✗ mika#2641 (V4): le prompt de relance n'a PAS été mesuré (vide ou sonde muette)"
+fi
+M2641_PLAN_BYTES=$( {
+    echo "# Plan rejouant la signature mika#2641"
+    echo "**Ticket:** mika issue#2641"
+    for i in $(seq 1 14); do
+        echo "Ligne de corps $i — rembourrage rembourrage rembourrage."
+    done
+} | wc -c | tr -d ' ')
+if [ "${M2641_RETRY_BYTES:-0}" -gt "$M2641_PLAN_BYTES" ] 2>/dev/null; then
+    PASS=$((PASS + 1))
+    echo "  ✓ mika#2641 (V4, mika#2996): le prompt de relance (${M2641_RETRY_BYTES}) dépasse le plan qu'il porte (${M2641_PLAN_BYTES})"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ mika#2641 (V4, mika#2996): le prompt de relance (${M2641_RETRY_BYTES}) ne peut pas porter le plan (${M2641_PLAN_BYTES}) — la garde d'ancrage ne s'armerait pas"
 fi
 
 # --- S-c : scan de cardinalité des appels à `_escalate_groom` ---------------
@@ -14183,9 +14178,14 @@ assert_eq "mika#2641 (R-b): le prompt correctif a une définition unique" \
 # Les appels, jamais la définition : `$(_second_pass_retry_prompt)` en
 # substitution de commande. La forme réelle est `local x; x=$(...)` sur une
 # ligne, donc le prédicat porte sur la substitution et non sur le début de ligne.
-M2641_HELPER_CALLS=$(grep -cE '\$\(_second_pass_retry_prompt\)' "$DISPATCH_LIB" || true)
-assert_eq "mika#2641 (R-b): les deux sites de seconde passe l'appellent" \
+# Depuis mika#2996 chaque appel passe le plan : un site qui l'oublierait
+# relancerait sans plan, donc sans garde armée, et ne serait pas compté ici.
+M2641_HELPER_CALLS=$(grep -cE '\$\(_second_pass_retry_prompt "\$plan_path"\)' "$DISPATCH_LIB" || true)
+assert_eq "mika#2641 (R-b): les deux sites de seconde passe l'appellent, avec le plan (mika#2996)" \
     "2" "$M2641_HELPER_CALLS"
+M2996_FIRST_CALLS=$(grep -cE '\$\(_first_pass_retry_prompt "\$plan_path"\)' "$DISPATCH_LIB" || true)
+assert_eq "mika#2996: le site de première passe appelle son prompt correctif avec le plan" \
+    "1" "$M2996_FIRST_CALLS"
 
 # ===========================================================================
 # mika#2701 — PORTE 3 : la ligne `plan_size_estimate` porte la borne PAR VOL
@@ -16330,6 +16330,142 @@ for _t2976_case in \
     else
         FAIL=$((FAIL + 1)); echo "  ✗ mika#2976 $_t2976_label: $_t2976_out"
     fi
+done
+
+# ===========================================================================
+# mika#2996 — chaque relance UNPARSED porte le plan en revue
+#
+# La garde d'ancrage de mika#2037 vérifie les citations de l'architecte contre
+# le brief du tour, et ne s'arme qu'au-dessus de `review_anchor_min_brief_chars`.
+# Une relance de ~380 caractères laissait donc passer sans preuve la disposition
+# qui fait avancer la chaîne — mesuré le 2026-10-31, trace `15ea28bd`, un
+# `READY-after-retry` sur la revue d'un autre plan.
+#
+# Le correctif fait porter le plan à la relance, entre deux lignes-marqueurs que
+# le moteur reconnaît (`review_anchor::anchor_reference`). Ce bloc épingle le
+# CÂBLAGE, sur les trois sites de relance de `_iterate_groom_loop` : le vrai
+# loop tourne, `_arch_ask` est stubbé au bord de processus, et le message de la
+# relance doit contenir le plan À L'OCTET entre les deux marqueurs. Le jugement
+# de la garde sur ce message est testé côté moteur, avec les mêmes fonctions
+# shell, par `tests/eval/grounding_regressions/review_anchor_unparsed_retry_2996.rs`.
+# ===========================================================================
+
+echo ""
+echo "Test: chaque relance UNPARSED porte le plan en revue (mika#2996)"
+echo "------------------------------------------------------------"
+
+T2996_BEGIN='----- BEGIN PLAN UNDER REVIEW (mika#2996) -----'
+T2996_END='----- END PLAN UNDER REVIEW (mika#2996) -----'
+
+# $1 = site : first | second-ready | second-iterate
+# Imprime `arch_calls=`, `retry_call=`, puis le message de la relance entre
+# RETRY_BEGIN / RETRY_END, et le plan entre PLAN_BEGIN / PLAN_END.
+_groom_retry_plan_probe_2996() {
+    local site="$1" tmp wt plan retry_call
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    plan="$wt/docs/plans/2026-10-31-001-fix-2996-relance-plan.md"
+    {
+        echo "# Plan rejouant la relance de mika#2996"
+        echo "**Ticket:** mika issue#2996"
+        for i in $(seq 1 40); do
+            echo "Ligne de corps $i — la relance doit porter ce plan, à l'octet près."
+        done
+    } > "$plan"
+    case "$site" in
+        first) retry_call=2 ;;
+        *)     retry_call=3 ;;
+    esac
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        export MIKA_ARCH_ASK_RETRY=0
+        ARCH_CALLS="$tmp/arch-calls"
+        printf '0' > "$ARCH_CALLS"
+
+        _arch_ask() {
+            local n body
+            n=$(cat "$ARCH_CALLS")
+            n=$((n + 1))
+            printf '%s' "$n" > "$ARCH_CALLS"
+            cp -- "$2" "$tmp/prompt-$n" 2>/dev/null || true
+            case "$site:$n" in
+                first:1)          body="$UNPARSED_1772" ;;
+                first:2)          body='Disposition: READY' ;;
+                second-ready:1)   body='Disposition: READY' ;;
+                second-iterate:1) body='F1: un constat de première passe.
+
+Disposition: ITERATE' ;;
+                second-*:2)       body="$M2641_UNREADABLE" ;;
+                *)                body='Verdict: GROOMED' ;;
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-session-2996"}}'
+        }
+        _write_canonical_callout() { return 0; }
+        _launch_revise_pilot() { return 0; }
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="2996" REPO="mika" BRANCH="probe-2996"
+        _iterate_groom_loop >/dev/null 2>&1 || true
+
+        printf 'arch_calls=%s\n' "$(cat "$ARCH_CALLS")"
+        printf 'retry_call=%s\n' "$retry_call"
+        printf 'RETRY_BEGIN\n'
+        cat -- "$tmp/prompt-$retry_call" 2>/dev/null || true
+        printf 'RETRY_END\n'
+    )
+    rm -rf "$tmp"
+}
+
+# Le plan tel que la relance le porte : les lignes strictement entre les deux
+# marqueurs. Vide si l'un des deux manque.
+_t2996_enveloped_plan() {
+    awk -v b="$T2996_BEGIN" -v e="$T2996_END" '
+        $0 == b { inside = 1; seen_b = 1; next }
+        $0 == e { if (inside) { seen_e = 1 }; inside = 0; next }
+        inside  { buf = buf $0 "\n" }
+        END     { if (seen_b && seen_e) printf "%s", buf }'
+}
+
+T2996_EXPECTED_PLAN=$(
+    echo "# Plan rejouant la relance de mika#2996"
+    echo "**Ticket:** mika issue#2996"
+    for i in $(seq 1 40); do
+        echo "Ligne de corps $i — la relance doit porter ce plan, à l'octet près."
+    done
+)
+
+for _t2996_site in first second-ready second-iterate; do
+    _t2996_out=$(_groom_retry_plan_probe_2996 "$_t2996_site") || _t2996_out=""
+    _t2996_retry=$(printf '%s\n' "$_t2996_out" | sed -n '/^RETRY_BEGIN$/,/^RETRY_END$/p' | sed '1d;$d')
+    # Anti-vacuité : sur les trois sites, la relance est suivie d'un appel, donc
+    # trois appels architecte veulent dire que la relance a eu lieu.
+    assert_contains "mika#2996 ($_t2996_site): la sonde a mené la boucle jusqu'à la relance" \
+        "arch_calls=3" "$_t2996_out"
+    assert_contains "mika#2996 ($_t2996_site): le message est toujours le prompt correctif" \
+        "missing the required" "$_t2996_retry"
+    # Le cœur : le plan entier, à l'octet, entre les deux marqueurs.
+    _t2996_carried=$(printf '%s\n' "$_t2996_retry" | _t2996_enveloped_plan)
+    assert_eq "mika#2996 ($_t2996_site): la relance porte le plan à l'octet entre les marqueurs" \
+        "$T2996_EXPECTED_PLAN" "$_t2996_carried"
+done
+
+# Un plan devenu illisible ne donne pas une relance sans plan : la construction
+# échoue, et la boucle s'arrête au lieu de relancer sous le seuil de la garde.
+for _t2996_fn in _first_pass_retry_prompt _second_pass_retry_prompt; do
+    _t2996_rc=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        if _t2996_f=$("$_t2996_fn" "/nonexistent/mika-2996-plan.md"); then
+            rm -f -- "$_t2996_f"; echo 0
+        else
+            echo 1
+        fi
+    )
+    assert_eq "mika#2996: $_t2996_fn refuse un plan illisible (pas de relance sans plan)" \
+        "1" "$_t2996_rc"
 done
 
 # --- Summary ---

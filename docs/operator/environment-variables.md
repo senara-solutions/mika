@@ -4564,6 +4564,12 @@ dans le voisinage de mika#2545.
   empêcher. Le prompt est donc court **par contrat et c'est asserté** (347 octets
   mesurés contre 2000), avec le seuil **lu depuis le manifeste** plutôt que
   recopié : un seuil durci sans que le prompt rétrécisse fait rougir.
+  **Renversé par mika#2996 (2026-10-31).** Sous le seuil, un `Verdict: GROOMED`
+  (ou un `Disposition: READY` en première passe) rendu à la relance était accepté
+  sans aucune preuve. Mesuré sur la première passe, trace `15ea28bd`. Les deux
+  relances portent désormais le plan entre deux lignes-marqueurs, la garde s'arme
+  sur ce tour et ne vérifie les ancres que contre le plan. V4 asserte le sens
+  inverse : le prompt de relance est plus long que le plan qu'il porte.
 
 - **`Outcome: ESCALATE` reste la ligne de disposition, et c'est une décision.**
   Tentant de poser un autre mot pour éviter le gel de mika#2545 ; **refusé**, et
