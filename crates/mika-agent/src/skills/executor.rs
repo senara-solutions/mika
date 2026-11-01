@@ -3402,6 +3402,58 @@ async fn report_forced_dispatch_consent(
     }
 }
 
+/// Le JSON de refus de la garde de consentement (mika#2772) — **un seul texte,
+/// un seul site**.
+///
+/// # Pourquoi une fonction libre et non la closure d'origine
+///
+/// Ce corps était une closure locale de [`validate_forced_dispatch_consent`],
+/// et elle ne capturait que `ctx.session_id`. L'étape (5) de la garde est
+/// maintenant [`decide_forced_consent_on_labels`], une fonction sœur : une
+/// closure capturée ne traverse pas cette coupe, et recopier le texte dans les
+/// deux moitiés le ferait diverger en silence — la classe mika#2158, où deux
+/// prédicats dupliqués ont dérivé des mois sans rien casser. Le texte du champ
+/// `recovery` porte l'AC3 de mika#2995 : il a **un** écrivain.
+fn forced_consent_refusal(
+    ctx: &LongRunningContext,
+    verdict: &'static str,
+    subject: Option<String>,
+    reason: String,
+) -> String {
+    serde_json::json!({
+        "error": verdict,
+        "session_id": ctx.session_id,
+        "subject": subject,
+        "reason": reason,
+        // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+        // jugé (mika#2520). Les deux voies de reprise sont donc nommées — mais
+        // la première est ATTRIBUÉE à l'opérateur, elle n'est pas prescrite au
+        // lecteur. C'est l'AC3 de mika#2995, et c'est une correction de
+        // défaut, pas une précaution : le 2026-10-31 à 16:46:32Z ce champ
+        // disait « promote the ticket by posting the `ready` label as
+        // remove→add » ; à 16:51:37Z mika-dev l'a fait, avec le `GH_TOKEN` du
+        // moteur, et le groom est parti. Un remède qui décrit le geste à un
+        // lecteur qui tient l'outil ne décrit pas une levée, il enseigne un
+        // contournement. Le geste `remove` → `add` et le fait de mika#2323 qui
+        // le motive vivent dans la doc opérateur, la surface d'où la promotion
+        // se fait ; ils ont quitté le texte que l'agent lit.
+        "recovery": "This dispatch was not requested — it was demanded by a tool \
+                     constraint this turn, and the ticket it targets has not been \
+                     promoted. Grooming a ticket nobody promoted is what mika#2772 \
+                     refuses. Two things lift it, and only two. Promotion belongs to \
+                     the operator: the `ready` label is their positive consent to \
+                     autonomous dispatch (mika#841), it is not a gesture you perform \
+                     on their behalf, and the engine refuses to write it on any turn \
+                     (mika#2995) — so if this ticket deserves promotion, say so and \
+                     stop. Otherwise, grooming it explicitly traverses this gate \
+                     instead of lifting it: \
+                     `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"` carries a \
+                     grooming intent (mika#1173), and that request is the operator's \
+                     to make."
+    })
+    .to_string()
+}
+
 /// Un dispatch de groom forcé par `required_tools` ne vise jamais un ticket sans
 /// `ready` (mika#2772).
 ///
@@ -3507,41 +3559,6 @@ pub(crate) async fn validate_forced_dispatch_consent(
         return ForcedDispatchConsent::Allowed;
     }
 
-    let refuse = |verdict: &'static str, subject: Option<String>, reason: String| {
-        serde_json::json!({
-            "error": verdict,
-            "session_id": ctx.session_id,
-            "subject": subject,
-            "reason": reason,
-            // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
-            // jugé (mika#2520). Les deux voies de reprise sont donc nommées — mais
-            // la première est ATTRIBUÉE à l'opérateur, elle n'est pas prescrite au
-            // lecteur. C'est l'AC3 de mika#2995, et c'est une correction de
-            // défaut, pas une précaution : le 2026-10-31 à 16:46:32Z ce champ
-            // disait « promote the ticket by posting the `ready` label as
-            // remove→add » ; à 16:51:37Z mika-dev l'a fait, avec le `GH_TOKEN` du
-            // moteur, et le groom est parti. Un remède qui décrit le geste à un
-            // lecteur qui tient l'outil ne décrit pas une levée, il enseigne un
-            // contournement. Le geste `remove` → `add` et le fait de mika#2323 qui
-            // le motive vivent dans la doc opérateur, la surface d'où la promotion
-            // se fait ; ils ont quitté le texte que l'agent lit.
-            "recovery": "This dispatch was not requested — it was demanded by a tool \
-                         constraint this turn, and the ticket it targets has not been \
-                         promoted. Grooming a ticket nobody promoted is what mika#2772 \
-                         refuses. Two things lift it, and only two. Promotion belongs to \
-                         the operator: the `ready` label is their positive consent to \
-                         autonomous dispatch (mika#841), it is not a gesture you perform \
-                         on their behalf, and the engine refuses to write it on any turn \
-                         (mika#2995) — so if this ticket deserves promotion, say so and \
-                         stop. Otherwise, grooming it explicitly traverses this gate \
-                         instead of lifting it: \
-                         `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"` carries a \
-                         grooming intent (mika#1173), and that request is the operator's \
-                         to make."
-        })
-        .to_string()
-    };
-
     // (3) Le sujet, depuis le prompt de dispatch seul.
     let Some((repo_ref, number)) = tool_input
         .and_then(|input| input.get("prompt"))
@@ -3558,7 +3575,8 @@ pub(crate) async fn validate_forced_dispatch_consent(
             true,
         )
         .await;
-        return ForcedDispatchConsent::Refused(refuse(
+        return ForcedDispatchConsent::Refused(forced_consent_refusal(
+            ctx,
             FORCED_CONSENT_SUBJECT_UNRESOLVED,
             None,
             "The dispatch prompt names no readable `<repo>#<number>`, so the ticket whose \
@@ -3584,7 +3602,8 @@ pub(crate) async fn validate_forced_dispatch_consent(
             true,
         )
         .await;
-        return ForcedDispatchConsent::Refused(refuse(
+        return ForcedDispatchConsent::Refused(forced_consent_refusal(
+            ctx,
             FORCED_CONSENT_NO_TOKEN,
             Some(subject.clone()),
             format!(
@@ -3604,21 +3623,65 @@ pub(crate) async fn validate_forced_dispatch_consent(
 
     // (5) Les labels — déjà le lecteur de la porte de place, déjà porteur de la
     // distinction PR/issue dans son type de retour.
-    match crate::github_graphql::fetch_issue_labels_unless_pull_request(
+    //
+    // Le fetch reste ici ; la décision qu'il alimente est la fonction sœur
+    // ci-dessous, et reçoit son résultat **tel quel**. En production la donnée
+    // vient du réseau, en test d'une fixture : le seul lien resté hors du test
+    // est le transport HTTP.
+    let labels = crate::github_graphql::fetch_issue_labels_unless_pull_request(
         token,
         subject_owner,
         subject_repo,
         number,
     )
-    .await
-    {
+    .await;
+
+    decide_forced_consent_on_labels(ctx, &subject, forced, requested, labels).await
+}
+
+/// L'étape (5) de la garde de mika#2772 : **la décision, les labels donnés**.
+///
+/// # Pourquoi les labels sont un paramètre
+///
+/// Les sept tests de `mod mika2772_consentement_force` passent tous
+/// `github_token = None` et s'arrêtent donc à [`FORCED_CONSENT_NO_TOKEN`] :
+/// **aucun** n'atteignait cette étape, parce que
+/// `fetch_issue_labels_unless_pull_request` écrit `https://api.github.com/…` en
+/// clair et qu'aucun réglage ne donne un parcours hors réseau. Les deux puces de
+/// l'AC2 de mika#2995 — « un `ready` humain laisse passer », « son absence
+/// refuse » — portent exactement sur ces quatre arms.
+///
+/// La coupe prend donc **la donnée récupérée en paramètre**, qui est la doctrine
+/// écrite au doc-comment d'[`evaluate_grooming_gate`] pour cette forme exacte :
+/// une URL de base configurable serait « a production configuration point nobody
+/// needs, for the benefit of a test ». Le fetch reste chez l'appelant.
+///
+/// # Ce que cette fonction ne lit pas
+///
+/// `crate::webhook_dispatch::labels_carry_ready(&labels)`, **et rien d'autre** —
+/// aucun acteur, aucune identité, aucune provenance. La voie B du vol 1 retire au
+/// moteur la *capacité* d'écrire `ready` ; elle n'apprend pas à la garde à
+/// reconnaître qui l'a posé. Un filtre d'identité ici serait un prédicat de gate
+/// qui lit l'acteur, que la doctrine mika#2323 refuse, et
+/// `ACTOR_READING_PREDICATES_ALLOWED` reste `&[]`. Pour cette garde, un `ready`
+/// moteur et un `ready` humain sont le même octet ; ce qui tient la propriété,
+/// c'est qu'aucune route atteignable depuis un tour LLM ne produit cet octet
+/// (détecteurs D1 et D2 de `ready_label.rs`).
+pub(crate) async fn decide_forced_consent_on_labels(
+    ctx: &LongRunningContext,
+    subject: &str,
+    forced: bool,
+    requested: bool,
+    labels: Result<Option<Vec<String>>, String>,
+) -> ForcedDispatchConsent {
+    match labels {
         Ok(Some(labels)) if crate::webhook_dispatch::labels_carry_ready(&labels) => {
             report_forced_dispatch_consent(
                 ctx,
                 FORCED_CONSENT_CONSENTED,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 Some(true),
                 false,
             )
@@ -3631,14 +3694,15 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 FORCED_CONSENT_WITHOUT_CONSENT,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 Some(false),
                 true,
             )
             .await;
-            ForcedDispatchConsent::Refused(refuse(
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
                 FORCED_CONSENT_WITHOUT_CONSENT,
-                Some(subject.clone()),
+                Some(subject.to_string()),
                 format!(
                     "`{subject}` does not carry the `ready` label, and this groom dispatch \
                      was forced by a `required_tools` constraint rather than requested. The \
@@ -3655,14 +3719,15 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 FORCED_CONSENT_SUBJECT_IS_PR,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 None,
                 true,
             )
             .await;
-            ForcedDispatchConsent::Refused(refuse(
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
                 FORCED_CONSENT_SUBJECT_IS_PR,
-                Some(subject.clone()),
+                Some(subject.to_string()),
                 format!(
                     "`{subject}` resolves to a pull request, not an issue. A PR's label set \
                      never carries `ready`, so reading it as consent would be a confident \
@@ -3678,14 +3743,15 @@ pub(crate) async fn validate_forced_dispatch_consent(
                 FORCED_CONSENT_UNVERIFIABLE,
                 forced,
                 requested,
-                Some(&subject),
+                Some(subject),
                 None,
                 true,
             )
             .await;
-            ForcedDispatchConsent::Refused(refuse(
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
                 FORCED_CONSENT_UNVERIFIABLE,
-                Some(subject.clone()),
+                Some(subject.to_string()),
                 format!(
                     "Could not read the labels of `{subject}` ({e}), so its consent could \
                      not be established. Unlike the seat gate on this same door — which is \
@@ -17346,6 +17412,117 @@ Harness ticket.
                 ),
                 "armée par défaut : sans le levier, la même entrée est refusée — \
                  sinon ce test mesure l'entrée et non le levier"
+            );
+        }
+
+        /// **AC2 de mika#2995, voie B — un `ready` humain laisse passer le groom
+        /// forcé, et son absence le refuse.**
+        ///
+        /// Un seul test et **une seule fixture**, parce que c'est littéralement
+        /// ce que l'AC2 demande : « test dans le même appel, avec contrôle
+        /// négatif ». La fixture partagée est ce qui sépare « la garde laisse
+        /// passer un `ready` » de « la garde laisse tout passer » — deux moitiés
+        /// dans deux tests distincts ne se soustraient pas (mika#2205). Entre les
+        /// deux moitiés, **le seul octet qui change est le label**.
+        ///
+        /// `ctx_forced(INCIDENT_EVENT, true)` donne `forced = true` et
+        /// `requested = false` : l'intersection exacte où la garde décide, celle
+        /// du dispatch de 08:59:18Z.
+        ///
+        /// # Pourquoi ce test n'existait pas avant ce vol
+        ///
+        /// Les sept tests ci-dessus passent tous `github_token = None` et
+        /// s'arrêtent donc à [`FORCED_CONSENT_NO_TOKEN`], l'étape (4). L'étape
+        /// (5) — les quatre arms de la lecture de labels, qui sont *les deux
+        /// puces de l'AC2* — était hors d'atteinte sans réseau : le lecteur écrit
+        /// `https://api.github.com/…` en clair. Ce que ce vol a ajouté, c'est le
+        /// joint : [`decide_forced_consent_on_labels`] prend les labels en
+        /// paramètre, en production depuis le fetch, ici depuis une fixture.
+        ///
+        /// # Et `ready` posé par le **moteur** ?
+        ///
+        /// Ce n'est plus une entrée de test, parce que la voie B l'a retiré du
+        /// domaine : cette garde ne lit pas la provenance, donc un `ready` moteur
+        /// et un `ready` humain sont **le même octet** pour elle. Ce qui tient la
+        /// propriété, c'est qu'aucune route atteignable depuis un tour LLM ne
+        /// produit cet octet — `run_gh` refusé par le vol 1
+        /// (`builtin_handlers.rs`, `guards.rs`), et les détecteurs D1 et D2 de
+        /// `ready_label.rs` pour la route gouvernée. C'est la réécriture de
+        /// l'AC2 sous la voie B (décision du 2026-11-01), pas une version
+        /// affaiblie.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2995_un_ready_humain_laisse_passer_le_groom_force_et_son_absence_le_refuse() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let subject = "senara-solutions/mika#2766";
+
+            // ── Moitié positive : le ticket porte `ready`. ──
+            //
+            // Et un second label, pour que ce soit l'**appartenance** qui décide
+            // et non la longueur de la liste.
+            assert_eq!(
+                decide_forced_consent_on_labels(
+                    &ctx,
+                    subject,
+                    true,
+                    false,
+                    Ok(Some(vec!["bug".to_string(), "ready".to_string()])),
+                )
+                .await,
+                ForcedDispatchConsent::Allowed,
+                "un ticket que quelqu'un a promu laisse passer le dispatch forcé : `ready` \
+                 est le consentement positif de mika#841"
+            );
+
+            // Et la décision est **journalisée sous son propre verdict**. Un
+            // passage muet serait indiscernable d'une garde absente (mika#2293),
+            // et la sonde de D5 lit cette colonne.
+            let lignes = ctx
+                .db
+                .get_audit_events(&ctx.session_id)
+                .await
+                .expect("les événements d'audit de la session doivent se lire");
+            let consentement: Vec<&crate::evidence::audit::AuditEvent> = lignes
+                .iter()
+                .filter(|e| e.tool_name == FORCED_CONSENT_EVENT)
+                .collect();
+            assert_eq!(
+                consentement.len(),
+                1,
+                "la moitié positive écrit exactement une ligne de consentement"
+            );
+            assert_eq!(
+                consentement[0].after_value.as_deref(),
+                Some(FORCED_CONSENT_CONSENTED),
+                "le passage porte le verdict `allowed_consented`, pas un silence"
+            );
+            assert_eq!(
+                consentement[0].target_key, subject,
+                "la ligne nomme le ticket dont le consentement a été lu"
+            );
+
+            // ── Contrôle négatif, MÊME fixture, `ready` retiré. ──
+            let json = refusal(
+                decide_forced_consent_on_labels(
+                    &ctx,
+                    subject,
+                    true,
+                    false,
+                    Ok(Some(vec!["bug".to_string()])),
+                )
+                .await,
+            );
+
+            assert_eq!(
+                json["error"].as_str(),
+                Some(FORCED_CONSENT_WITHOUT_CONSENT),
+                "sans `ready`, le refus est le refus nominal et porte son propre nom — un \
+                 refus qui emprunte le nom d'un autre rend la sonde illisible (mika#2205)"
+            );
+            assert!(
+                json["reason"].as_str().is_some_and(|r| r.contains(subject)),
+                "le refus doit nommer le ticket visé : {}",
+                json["reason"]
             );
         }
     }
