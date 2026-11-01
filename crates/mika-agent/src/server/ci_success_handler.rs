@@ -78,6 +78,7 @@ use crate::tools::pr_merge_with_gate::{
     classify_checks, describe_behind_main_remediation, is_behind_main, remediate_behind_main,
     run_gh_checks, run_gh_pr_view, run_gh_subprocess,
 };
+use mika_common::ci_read::CiReadToken;
 use mika_common::forge_identity::{DISPATCHER_AGENT, MergeReadySignal, owns_merge_transition};
 
 use super::check_suite_dedup;
@@ -172,11 +173,17 @@ pub(crate) fn decision_core_notification_value(
 /// the LLM. It never merges — see the `mika#2248` invariant above.
 /// Returns `VerdictAction::Passthrough` for all other cases (non-matching events,
 /// no open PR, no QA verdict, stale verdict, checks not all green).
+///
+/// `ci_read_token` est le jeton de **lecture** de CI (mika#2963, câblé par
+/// mika#2965), résolu une seule fois dans `server/handlers.rs`. Second jeton à
+/// côté de `github_token`, jamais son remplaçant : lire des checks n'est
+/// identitaire pour personne, donc la priorité s'y inverse (App d'abord).
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_ci_success(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -429,9 +436,13 @@ pub async fn try_handle_ci_success(
 
     // 5. CI aggregation gate (load-bearing — check_suite event is per-workflow)
     //
-    // mika#2963 — `None` : ce handler ne porte pas de `ToolContext`, donc le
-    // repli PAT est explicite et le log le dit (`source = "pat"`).
-    let ci_token = ci_read_token_or_pat(None, token);
+    // mika#2963, câblé par mika#2965 — jeton App-first résolu une seule fois
+    // dans `server/handlers.rs` et descendu en paramètre. Le repli au PAT reste
+    // atteignable (pas d'App configurée, ou échange échoué) et dégrade vers le
+    // régime d'avant mika#2963 : échec sur `statusCheckRollup`, gate fermé sur
+    // une erreur de lecture. La ligne `ci_read_token_source` dit laquelle des
+    // deux sources a servi.
+    let ci_token = ci_read_token_or_pat(ci_read_token, token);
     let checks_future = run_gh_checks(pr.number, &event.repo, &ci_token);
     let checks = match tokio::time::timeout(std::time::Duration::from_secs(60), checks_future).await
     {

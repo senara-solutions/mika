@@ -140,6 +140,7 @@ async fn mika2260_lattribution_du_fanout_est_mesurable() -> Result<()> {
                 db,
                 None,
                 None,
+                None,
                 h.session_id(agent_id),
                 "trace-2260-fanout-ordre",
             )
@@ -196,12 +197,14 @@ async fn mika2260_lattribution_du_fanout_est_mesurable() -> Result<()> {
                 h.db(DISPATCHER),
                 None,
                 None,
+                None,
                 h.session_id(DISPATCHER),
                 "trace-2260-fanout-course",
             ),
             try_handle_ci_success(
                 CHECK_SUITE_TEXT,
                 h.db(REVIEWER),
+                None,
                 None,
                 None,
                 h.session_id(REVIEWER),

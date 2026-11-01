@@ -1791,10 +1791,32 @@ pub(super) async fn run_agent_for_message(
             .settings
             .resolve_github_token(a.github_app.as_deref())
             .await;
+        // Jeton de **lecture** de CI (mika#2963 vol 1, câblé ici par mika#2965).
+        //
+        // Résolu une seule fois pour les trois handlers qui lisent
+        // `gh pr checks` — `verdict_handler`, `ci_success_handler`,
+        // `ci_failure_handler` — et App-first, parce que GitHub n'accorde pas
+        // la permission Checks à un PAT fine-grained : `statusCheckRollup`
+        // répond « Resource not accessible by personal access token » (77
+        // échecs mesurés du 2026-10-07 au 2026-10-29).
+        //
+        // Ce n'est **pas** un remplacement de `verdict_github_token` : celui-ci
+        // reste PAT-first (ADR-008) parce qu'il porte les identités de post —
+        // `pr review`, `pr comment`, `pr merge`, là où la forge lit l'auteur de
+        // l'action. Lire des checks n'est identitaire pour personne, donc la
+        // priorité s'y inverse. Les deux jetons descendent côte à côte.
+        //
+        // La résolution unique est tenue par
+        // `tests/eval/test_ci_read_token_handlers_2965.rs`.
+        let ci_read_token = a
+            .settings
+            .resolve_ci_read_token(a.github_app.as_deref())
+            .await;
         let action = try_handle_pr_review_verdict(
             &req.text,
             &a.db,
             verdict_github_token.as_deref(),
+            ci_read_token.as_ref(),
             Some(&sender_arc),
             &session_id,
             &req.request_id,
@@ -1827,6 +1849,7 @@ pub(super) async fn run_agent_for_message(
             &req.text,
             &a.db,
             verdict_github_token.as_deref(),
+            ci_read_token.as_ref(),
             Some(&sender_arc),
             &session_id,
             &req.request_id,
@@ -1885,6 +1908,7 @@ pub(super) async fn run_agent_for_message(
             &req.text,
             &a.db,
             verdict_github_token.as_deref(),
+            ci_read_token.as_ref(),
             Some(&sender_arc),
             &session_id,
             &req.request_id,

@@ -35,6 +35,7 @@ use crate::tools::pr_merge_with_gate::{
     classify_checks, describe_behind_main_remediation, is_behind_main, mpc_gate_clearance,
     remediate_behind_main, run_gh_checks, run_gh_merge, run_gh_pr_view, run_gh_subprocess,
 };
+use mika_common::ci_read::CiReadToken;
 
 use super::verdict::{
     PrReviewEvent, Verdict, parse_pr_review_event, parse_review_depth, parse_verdict,
@@ -138,11 +139,19 @@ pub enum VerdictAction {
 /// Returns `VerdictAction::Handled` when the handler acted on a recognized
 /// verdict (merge, dispatch, escalation, hold). Returns `VerdictAction::Passthrough`
 /// only for non-review events or unrecognized block/hold subtypes.
+///
+/// `ci_read_token` est le jeton de **lecture** de CI (mika#2963, câblé par
+/// mika#2965), résolu une seule fois dans `server/handlers.rs`. Il est distinct
+/// de `github_token` et ne le remplace pas : celui-ci est PAT-first et porte les
+/// identités de post (ADR-008), celui-là est App-first parce qu'un PAT
+/// fine-grained ne peut pas lire `statusCheckRollup`. `None` dégrade vers le PAT
+/// — déploiement sans App, ou échange d'App échoué — et le log le dit.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_pr_review_verdict(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -273,6 +282,7 @@ pub async fn try_handle_pr_review_verdict(
                 &event,
                 db,
                 github_token,
+                ci_read_token,
                 message_sender,
                 session_id,
                 trace_id,
@@ -400,10 +410,12 @@ async fn refuse_pass_from_non_reviewer(
 }
 
 /// Handle a VERDICT: pass — look up task, initiate merge, update metadata.
+#[allow(clippy::too_many_arguments)]
 async fn handle_pass_verdict(
     event: &PrReviewEvent,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -609,12 +621,20 @@ async fn handle_pass_verdict(
     // Run CI check classification (reuse pr_merge_with_gate logic).
     // Wrap in a 60-second timeout matching PrMergeWithGateTool::timeout_secs()
     // to prevent a hanging gh subprocess from blocking the agent lock.
-    // mika#2963 — un handler webhook ne porte pas de `ToolContext`, donc aucun
-    // jeton d'App n'est résolu ici : `None` dégrade explicitement vers le PAT, et
-    // le log le dit (`source = "pat"`). C'est le régime d'avant ce ticket, nommé
-    // plutôt que subi — le peupler demanderait de faire descendre un
-    // `GitHubApp` jusqu'aux trois handlers, hors du périmètre de ce ticket.
-    let ci_token = ci_read_token_or_pat(None, token);
+    // mika#2963, câblé par mika#2965 — le jeton de lecture CI est résolu une
+    // seule fois dans `server/handlers.rs`, à côté du `verdict_github_token`
+    // PAT-first qui porte les identités de post, et descend jusqu'ici en
+    // paramètre. Il est App-first : GitHub n'accorde pas la permission Checks à
+    // un PAT fine-grained, et c'est ce webhook-ci — celui qui décide d'un merge
+    // sur un `VERDICT: pass` — qui lisait la CI avec le jeton qui ne sait pas la
+    // lire.
+    //
+    // Le repli au PAT subsiste et reste légitime : déploiement sans App
+    // configurée, ou échange de jeton d'installation échoué. Il dégrade vers
+    // exactement le régime d'avant mika#2963 — échec sur `statusCheckRollup`,
+    // gate fermé sur une erreur de lecture, jamais du vert — et la ligne
+    // `ci_read_token_source` dit laquelle des deux sources a servi.
+    let ci_token = ci_read_token_or_pat(ci_read_token, token);
     let checks_future = run_gh_checks(event.pr_number, &event.repo, &ci_token);
     let checks = match tokio::time::timeout(std::time::Duration::from_secs(60), checks_future).await
     {
@@ -4905,7 +4925,16 @@ mod mika2667_tests {
     async fn run(db: &AsyncDatabase, text: &str) -> VerdictAction {
         let tmp = tempfile::tempdir().unwrap();
         let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
-        try_handle_pr_review_verdict(text, db, None, None, "mika2667-session", "trace", &skills)
+        try_handle_pr_review_verdict(
+            text,
+            db,
+            None,
+            None,
+            None,
+            "mika2667-session",
+            "trace",
+            &skills,
+        )
             .await
     }
 
