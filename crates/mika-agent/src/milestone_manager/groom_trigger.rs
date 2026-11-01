@@ -557,6 +557,19 @@ pub struct GroomTriggerOutcome {
     pub declenches: Vec<u64>,
     /// `(numéro, motif)` — motif dans le vocabulaire fermé des sondes.
     pub sautes: Vec<(u64, &'static str)>,
+    /// Le refus qui a arrêté le **cycle entier**, ou `None` si le geste a eu
+    /// lieu.
+    ///
+    /// Le vocabulaire est celui des sondes, et il est fermé : `disarmed`,
+    /// `no_sender`, `no_relief` (les trois de [`cycle_refusal`]), plus
+    /// `no_relief_verdict` et `no_in_flight_source` (les deux du site d'appel,
+    /// dans `cadence.rs`). `None` ne dit pas « tout est parti » : il dit que la
+    /// boucle par candidat a tourné, et ce sont alors `declenches` et `sautes`
+    /// qui portent la réponse.
+    ///
+    /// Sans ce champ, un `GroomTriggerOutcome` vide a cinq causes possibles
+    /// dont trois sont visibles au rapport (mika#2958 vol 2e, D3).
+    pub refus_de_cycle: Option<&'static str>,
 }
 
 /// Déclenche le groom de la relève, **borné à [`GROOMS_PER_CYCLE`]**, et rend
@@ -600,13 +613,22 @@ pub async fn trigger_relief_grooms(
                 reason = reason,
                 candidates = candidats.len(),
             );
-            GroomTriggerOutcome::default()
+            GroomTriggerOutcome {
+                refus_de_cycle: Some(reason),
+                ..Default::default()
+            }
         }
         (None, Some(sender)) => envoyer(sender, candidats).await,
         // Inatteignable : `cycle_refusal` rend `no_sender` quand l'émetteur
         // manque. Le bras est écrit plutôt que `unreachable!()` pour qu'aucune
-        // branche de ce geste ne puisse paniquer un cycle du manager.
-        (None, None) => GroomTriggerOutcome::default(),
+        // branche de ce geste ne puisse paniquer un cycle du manager. Le motif
+        // porté est celui que `cycle_refusal` aurait rendu : si la branche
+        // devenait atteignable, le rapport nommerait la cause au lieu de rendre
+        // un vide muet.
+        (None, None) => GroomTriggerOutcome {
+            refus_de_cycle: Some("no_sender"),
+            ..Default::default()
+        },
     }
 }
 
@@ -786,8 +808,12 @@ mod tests {
         let issue = trigger_relief_grooms(false, Some(&emetteur), &candidats).await;
         assert_eq!(
             issue,
-            GroomTriggerOutcome::default(),
-            "rien n'est déclenché ni même sauté : le geste n'a pas lieu"
+            GroomTriggerOutcome {
+                refus_de_cycle: Some("disarmed"),
+                ..Default::default()
+            },
+            "rien n'est déclenché ni même sauté : le geste n'a pas lieu, et \
+             l'outcome dit pourquoi"
         );
         assert!(
             emetteur.envois().is_empty(),
@@ -1085,6 +1111,59 @@ mod tests {
         }
     }
 
+    /// Les trois refus de cycle voyagent désormais **par une valeur**, et pas
+    /// seulement par la sonde (mika#2958 vol 2e, D3).
+    ///
+    /// C'est ce que le champ achète : avant lui, les trois motifs n'existaient
+    /// qu'au journal, et un `GroomTriggerOutcome` vide avait cinq causes
+    /// possibles indiscernables. Le test les épingle sur le résultat rendu, par
+    /// le comportement qui les produit — pas sur [`cycle_refusal`], dont le test
+    /// voisin couvre déjà le site pur.
+    ///
+    /// La seconde moitié est le **contrôle négatif** : quand la boucle par
+    /// candidat tourne, le refus est `None`, et ce sont `declenches` et `sautes`
+    /// qui portent la réponse. Sans elle, `Some(_)` partout passerait.
+    #[tokio::test]
+    async fn mika2958_les_refus_de_cycle_voyagent_par_loutcome() {
+        let emetteur = EmetteurEnregistreur::default();
+        for (armed, sender, candidats, attendu) in [
+            (
+                false,
+                Some(&emetteur as &dyn GroomSender),
+                &[propre(10)][..],
+                "disarmed",
+            ),
+            (true, None, &[propre(10)][..], "no_sender"),
+            (
+                true,
+                Some(&emetteur as &dyn GroomSender),
+                &[][..],
+                "no_relief",
+            ),
+        ] {
+            let issue = trigger_relief_grooms(armed, sender, candidats).await;
+            assert_eq!(
+                issue,
+                GroomTriggerOutcome {
+                    refus_de_cycle: Some(attendu),
+                    ..Default::default()
+                },
+                "un refus de cycle porte son motif, et laisse les deux listes \
+                 vides : le geste n'a pas eu lieu"
+            );
+        }
+
+        let emetteur = EmetteurEnregistreur::default();
+        let issue = trigger_relief_grooms(true, Some(&emetteur), &[propre(10), propre(20)]).await;
+        assert_eq!(
+            issue.refus_de_cycle, None,
+            "la boucle a tourné : le refus de cycle est l'absence, pas un motif \
+             de saut promu (motif mika#2331)"
+        );
+        assert_eq!(issue.declenches, vec![10]);
+        assert_eq!(issue.sautes, vec![(20, "budget_spent")]);
+    }
+
     /// Le corps du geste, **au champ près** — il est déterministe, donc on le
     /// compare entier.
     ///
@@ -1285,7 +1364,10 @@ mod tests {
         let outcome = trigger_relief_grooms(false, Some(&rail), &candidats).await;
         assert_eq!(
             outcome,
-            GroomTriggerOutcome::default(),
+            GroomTriggerOutcome {
+                refus_de_cycle: Some("disarmed"),
+                ..Default::default()
+            },
             "interrupteur OFF : rien n'est déclenché et rien n'est sauté — \
              un `sautes` non vide voudrait dire que le cycle est entré dans la boucle"
         );
