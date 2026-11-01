@@ -6132,6 +6132,14 @@ garde qui marche* (mika#2205).
     lecture que le vol 2 ferait dans `executor.rs` — mais il dit à quel prix :
     le vol 2 est le ticket qui décide cette politique, pas un correctif qui la
     suppose.
+  - **Décision du 2026-11-01 : la politique est décidée, et c'est « non ».**
+    L'AC2 a été **réécrite sous la voie B** par Vincent. Le vol 2 n'a posé
+    aucun filtre d'identité dans la garde, et n'a ajouté aucune entrée à
+    `ACTOR_READING_PREDICATES_ALLOWED`, qui reste `&[]`. La garde de mika#2772
+    lit donc **toujours** la seule présence du label, et c'est le périmètre
+    d'écriture qui porte la sûreté — voir § *Les cinq écrivains de `ready`*
+    ci-dessous. Ce qui précède reste vrai comme **état du vol 1** ; ce n'est
+    plus une précondition en attente.
 - **Il ne retire pas `ready` d'un ticket qui le porte déjà.** Rien ne nettoie
   rétroactivement, et GitHub n'émet `labeled` que sur une transition
   (mika#2323) : un ticket promu avant le déploiement reste promu.
@@ -6152,6 +6160,128 @@ garde qui marche* (mika#2205).
 - **La classification `marker_class` sur la ligne de refus** — refusée : la
   jointure par `trace_id` la donne, et l'inventer serait un champ qui affirme ce
   qu'on n'a pas mesuré.
+
+### Les cinq écrivains de `ready`, et les deux détecteurs qui les tiennent (mika#2995 vol 2)
+
+**Aucune variable d'environnement, aucune migration, aucune surface opérateur
+neuve.** Cette entrée est ici parce que c'est le voisinage où l'on cherche :
+elle dit *qui* peut écrire le consentement que la garde ci-dessus exige, et
+*quels tests* refusent qu'un sixième écrivain apparaisse en silence.
+
+#### Le recensement (AC2c)
+
+Cinq sites écrivent `ready`. Quatre passent par l'applicateur unique
+(`ready_label::apply_ready` / `apply_ready_with_timeline`, mika#2315) ; le
+cinquième ne passe pas par lui, délibérément.
+
+| site | porte d'entrée | le ticket porte-t-il déjà `ready` ? | crée-t-il un consentement que personne n'a donné ? | vol 2 |
+|---|---|---|---|---|
+| `auto_pull.rs` — `phase0_feeder` | tick `auto_pull`, après `promotion_gate_allows` | **non** (le feeder promeut) | **oui** | **nomme** |
+| `auto_pull.rs` — `phase1_idle_pull` | tick `auto_pull` | **non** (filtre inverse de la phase 2) | **oui** | **nomme** |
+| `auto_pull.rs` — `phase2_stuck_rescue` | tick `auto_pull`, filtre 1 = porte `ready` | **oui** | **non** — il **repose**, il ne crée pas | rien à faire |
+| `server/milestone_context_handler.rs` — `milestone_phase_cascade` | handler webhook, après `classify_dispatch_seat` | **non** (cascade M4) | **oui** | **nomme** |
+| `milestone_manager/pool_writer.rs` — `admit_pool_tickets` | tick manager, `MIKA_MANAGER_POOL_WRITE` **OFF** par défaut | **non** (l'admission promeut) | **oui**, et **sans consulter le parc** | **nomme + rend visible** (D2) |
+
+**Pourquoi les quatre premiers sont nommés et non fermés.** Les phases 0 et 1 et
+la cascade M4 créent bien un consentement que personne n'a donné, et *c'est la
+promotion déléguée de la boucle autonome* : mika#841 définit `ready` comme le
+consentement positif de l'opérateur, mika#1824 délègue au moteur le droit de le
+poser au nom d'une politique que l'opérateur a armée en amont. Les fermer
+tuerait le feeder et la cascade.
+
+**Ce n'est pas une échappatoire, parce que l'incident n'est pas là.** Le défaut
+du 2026-10-31 n'est pas « le moteur pose `ready` » : c'est « **l'agent, dans son
+tour LLM, pose le `ready` qui lève la garde qui venait de le retenir** ». Les
+quatre sites gouvernés sont atteignables depuis un corps de tick ou un handler
+webhook, et depuis rien d'autre. C'est cette propriété que le détecteur D1 rend
+structurelle au lieu de la laisser vraie par accident.
+
+**La phase 2 d'`auto_pull` est la seule qui ne demande rien (AC2b).** Son filtre
+nº 1 *est* la porte `ready` : elle ne considère qu'un ticket qui le porte déjà,
+et son `remove` + `add` **repose** un consentement existant. Elle ne peut donc
+pas en créer un, et le vol 2 n'y touche pas — ni code, ni halte.
+
+#### Les deux détecteurs, et comment les lire quand ils rougissent
+
+Tous deux vivent dans `crates/mika-agent/src/ready_label.rs § mod tests`, à côté
+du test 13 (`no_ready_label_write_outside_this_module`), qui reste **intact**.
+Trois détecteurs, trois populations : deux populations sous un même nom ne se
+soustraient pas (mika#2205), donc chacun porte son nom, sa question et sa
+disposition.
+
+| détecteur | question | population | disposition quand il rougit |
+|---|---|---|---|
+| test 13 (mika#2315) | une écriture de `ready` existe-t-elle hors de ce module ? | tout `src/**/*.rs`, label et poseur sur la **même ligne** | router par l'applicateur |
+| **D1** `mika2995_aucune_surface_doutil_natteint_lapplicateur_de_ready` | une **surface d'outil** atteint-elle l'applicateur ? | `tools/**`, `skills/builtin_handlers.rs`, `skills/executor.rs` | **retirer l'appel** — jamais l'allowlister (mika#2201) |
+| **D2** `mika2995_une_ecriture_de_ready_en_forme_argv_est_declaree` | une écriture de **forme argv** est-elle non déclarée ? | toute la production hors `ready_label.rs`, fenêtre de ±2 lignes | router par l'applicateur ; une entrée nouvelle est une décision d'opérateur |
+
+**D1 — l'allowlist est livrée vide et le reste.** `TOOL_SURFACE_APPLICATOR_EXCEPTIONS`
+est `&[]`, et `mika2995_lallowlist_de_surface_est_vide` rougit à la première
+entrée. L'applicateur est gouverné **pour le parc**, jamais pour le tour LLM :
+le parc dit *ce ticket est-il dé-promu*, il ne dit jamais *qui demande*. Un
+handler d'outil qui l'appelle rend la voie B fausse — il redonne à l'agent le
+geste du 2026-10-31 par une autre porte.
+
+**D2 — une seule entrée déclarée, et elle expire d'elle-même.**
+`ARGV_READY_WRITERS_DECLARED` porte `src/milestone_manager/pool_writer.rs` avec
+le fait précis dans le littéral : décision groupée `--add-label ready` +
+`--milestone`, hors applicateur **par conception**, donc aveugle au parc, bornée
+par `MIKA_MANAGER_POOL_WRITE` OFF. L'assertion auto-nettoyante exige que chaque
+entrée **porte encore** la forme argv : router ce site par l'applicateur, le
+supprimer ou le renommer fait rougir le test en demandant le retrait de
+l'entrée. *Le geste qui rend l'exception inutile est celui qui la fait expirer*
+— c'est ce qui l'empêche de devenir l'allowlist que mika#2309 condamne.
+
+**Pourquoi D2 existe, et ce que le test 13 ne pouvait pas voir.** Le test 13
+exige le label et le nom d'un poseur sur la **même ligne**. La forme argv les
+sépare :
+
+```rust
+args.push("--add-label");
+args.push(READY_LABEL);
+```
+
+Aucune ligne ne porte les deux : le test 13 est donc vert sur une écriture
+réelle, `pool_writer.rs:156`. Ce n'est pas un défaut du test 13 — sa question est
+autre — mais c'est la classe mika#2578/mika#2752 : une garde qui ne refuse rien
+pour une **forme entière** passe la revue et passe la CI par construction.
+
+**Le verbe tranche, et c'est ce qui évite un faux positif réel.** Les drapeaux
+d'`issue create` (`--label`, `-l`) sont aussi ceux d'`issue list`.
+`milestone_manager/reader.rs` **compte** le bassin `ready` du dépôt avec
+`gh issue list --label ready` et n'écrit rien. D2 excuse donc un drapeau ambigu
+quand son argv nomme un verbe de lecture (`ARGV_READ_VERBS`), et **seulement**
+alors : la polarité est fail-closed, un `--label=ready` dont aucun verbe n'est
+lisible est refusé plutôt qu'excusé. Si vous retirez ce prédicat, D2 rougit sur
+le compteur de la porte de place — et c'est exactement comme ça qu'un détecteur
+finit désarmé. Le contrôle `mika2995_le_scan_argv_rougit_sur_une_ecriture_plantee`
+le tient : trois syntaxes plantées sur deux lignes, et trois silences exigés (un
+`use READY_LABEL` sans drapeau, un `--add-label` portant un autre label, la forme
+de `reader.rs`).
+
+#### Ce que ce vol n'achète PAS
+
+- **La garde de mika#2772 ne lit toujours pas la provenance.** C'est la décision
+  du 2026-11-01, pas un oubli : voir la puce *Décision du 2026-11-01* du § ci-dessus.
+- **`pool_writer` n'est pas routé par le parc.** Le faire changerait un
+  comportement voulu (la décision groupée) et relève de l'ouverture de
+  `MIKA_MANAGER_POOL_WRITE`, que le doc de module de `pool_writer` pré-déclare
+  sous `Fire-Disposition: cinquième applicateur découvert`. L'interrupteur reste
+  OFF : aucun ticket non parqué ne peut être écrit par ce chemin aujourd'hui.
+- **Deux textes de remède nomment encore le geste.**
+  `skills/executor.rs` — `recovery` de `dispatch_grooming_not_verified`
+  (« re-apply the `ready` label ») et de `DISPATCH_NO_GROOMING_MARKER`
+  (« or re-apply the `ready` label »). Ce ne sont pas des routes d'écriture :
+  zéro capacité, de la prose dans un payload d'erreur, et les deux s'adressent
+  d'abord à l'opérateur qui lit l'erreur d'outil. Depuis le vol 1 le moteur ne
+  *peut* plus exécuter ce geste, donc ces deux phrases décrivent à l'agent une
+  route morte (classe mika#2520). Les corriger serait un amendement d'AC3 —
+  décision de Vincent.
+- **Aucun des deux détecteurs ne voit un comportement.** Un site qui lirait le
+  bon champ et n'écrirait jamais reste invisible à un scan de source ; c'est
+  pourquoi l'AC2 est aussi tenue par un test de comportement,
+  `mika2995_un_ready_humain_laisse_passer_le_groom_force_et_son_absence_le_refuse`
+  (`skills/executor.rs § mod mika2772_consentement_force`).
 
 ### Un dispatch ouvert par un événement PR est borné à la lignée de cet événement (mika#2649)
 
