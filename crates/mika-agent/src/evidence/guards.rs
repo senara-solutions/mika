@@ -2864,7 +2864,12 @@ impl WorkCreationAction {
 /// d'`issue create`. Les deux sont listés parce que le scan des étiquettes sert
 /// aussi à la ligne de journal du verbe `create`, mais `IssueCreate` est refusé
 /// **entier** : le verbe suffit, indépendamment de ses étiquettes.
-const ADD_LABEL_FLAGS: &[&str] = &["--add-label", "--label", "-l"];
+///
+/// `pub(crate)` depuis mika#2995 : le scan de prose de `canonical_tokens.rs`
+/// cherche les mêmes trois drapeaux dans les prompts bundlés. Deux listes
+/// séparées dérivent — un quatrième drapeau ajouté ici laisserait le scan de
+/// prose aveugle sur sa forme, en silence (classe mika#2158).
+pub(crate) const ADD_LABEL_FLAGS: &[&str] = &["--add-label", "--label", "-l"];
 
 /// Reconnaît, dans un argv `gh`, un verbe qui crée du travail (mika#2573 U2).
 ///
@@ -2902,6 +2907,47 @@ pub fn detect_fallthrough_work_creation(args: &[String]) -> Option<WorkCreationA
         Some("edit") => added_dispatch_trigger_label(&args[2..])
             .map(|label| WorkCreationAction::ReadyLabelAdd { label }),
         _ => None,
+    }
+}
+
+/// Sur quelle **population** chaque motif est refusé (mika#2995 AC1).
+///
+/// # L'asymétrie est la décision, pas un oubli
+///
+/// `IssueCreate` garde sa borne de mika#2573 : il est refusé sur les tours
+/// Webhook Fallthrough, où la prémisse est qu'un événement informationnel n'est
+/// pas un ordre de créer du travail (mika#2517). Hors de ces tours, créer une
+/// issue est un geste légitime qu'aucune doctrine ne refuse.
+///
+/// `ReadyLabelAdd` est refusé sur **toute** la population, quel que soit le
+/// tour. `ready` est le consentement positif de l'opérateur au dispatch
+/// autonome (mika#841), et la garde de mika#2772 n'en lit que la PRÉSENCE : un
+/// moteur qui peut le poser se donne à lui-même le consentement qu'une garde
+/// exige d'un humain. Le 2026-10-31, c'est exactement ce qui est arrivé sur
+/// mika#2958, sur un tour qui n'était **pas** un Fallthrough — donc une borne
+/// « Fallthrough seulement » n'aurait rien refusé ce jour-là. Retirer la
+/// capacité est ce qui rend le self-consent impossible plutôt
+/// qu'improbable ; en dévaluer le geste côté lecteur est l'autre voie, et elle
+/// est suivie par le vol 2.
+///
+/// # Pourquoi un `match` et pas un `||`
+///
+/// Les deux arms énumérés rendent l'asymétrie lisible à l'endroit où elle est
+/// décidée, et un troisième motif ne compilera pas sans que son auteur dise sur
+/// quelle population il tombe. Un `matches!(action, ReadyLabelAdd{..}) || turn`
+/// enterrerait la même information dans une précédence d'opérateurs.
+///
+/// # Le booléen reste un PARAMÈTRE
+///
+/// Ce module ne lit que de l'argv et le reste (mika#2201 : un seul lecteur pour
+/// `ctx`). Le tour est fourni par l'appelant, qui est le seul à le connaître.
+pub fn work_creation_is_refused(
+    action: &WorkCreationAction,
+    is_webhook_fallthrough_turn: bool,
+) -> bool {
+    match action {
+        WorkCreationAction::ReadyLabelAdd { .. } => true,
+        WorkCreationAction::IssueCreate => is_webhook_fallthrough_turn,
     }
 }
 
@@ -7541,6 +7587,74 @@ mod tests {
                 produced.len(),
                 "the registry has an entry no variant produces — a dead value in a wire \
                  format reads exactly like a live one"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2995 — `work_creation_is_refused` : la population par motif
+    // -----------------------------------------------------------------------
+
+    /// Les quatre cases de la table (motif × tour). Chacune est un test, parce
+    /// que chacune est une **population** distincte et qu'un seul test
+    /// paramétré rendrait l'asymétrie illisible dans le nom de ce qui rougit.
+    mod mika2995 {
+        use super::super::*;
+
+        fn ready_label_add() -> WorkCreationAction {
+            WorkCreationAction::ReadyLabelAdd {
+                label: "ready".to_string(),
+            }
+        }
+
+        /// Sur un tour Fallthrough, `ready_label_add` était déjà refusé par
+        /// mika#2573. Ce vol ne l'affaiblit pas.
+        #[test]
+        fn ready_label_add_est_refuse_sur_un_tour_fallthrough() {
+            assert!(work_creation_is_refused(&ready_label_add(), true));
+        }
+
+        /// **La case que ce vol ajoute, et l'incident fondateur.**
+        ///
+        /// Le 2026-10-31 à 16:51:37Z, `run_gh` a été appelé avec
+        /// `["issue", "edit", "2958", "--add-label", "ready"]` sur un tour
+        /// ordinaire — pas un Fallthrough. La borne de mika#2573 n'avait donc
+        /// rien à refuser, et la garde de consentement de mika#2772 a lu la
+        /// présence du label une minute plus tard comme un consentement
+        /// d'opérateur.
+        #[test]
+        fn ready_label_add_est_refuse_hors_dun_tour_fallthrough() {
+            assert!(
+                work_creation_is_refused(&ready_label_add(), false),
+                "mika#2995 — la pose de `ready` est refusée sur TOUTE la population. Si ce \
+                 test rougit, l'asymétrie a été perdue et le moteur peut à nouveau se \
+                 donner le consentement que mika#2772 exige d'un opérateur (mika#841)."
+            );
+        }
+
+        /// `issue create` garde sa borne mika#2573.
+        #[test]
+        fn issue_create_est_refuse_sur_un_tour_fallthrough() {
+            assert!(work_creation_is_refused(
+                &WorkCreationAction::IssueCreate,
+                true
+            ));
+        }
+
+        /// **Le contrôle négatif de l'asymétrie.**
+        ///
+        /// Hors d'un tour Fallthrough, créer une issue est un geste légitime —
+        /// c'est la moitié de la table que mika#2573 a délibérément laissée
+        /// passer, et un refus qui l'emporterait ferait de ce vol un
+        /// élargissement silencieux. Si ce test rougit, la décision à prendre
+        /// est de restaurer, pas de mettre l'attente à jour.
+        #[test]
+        fn issue_create_passe_hors_dun_tour_fallthrough() {
+            assert!(
+                !work_creation_is_refused(&WorkCreationAction::IssueCreate, false),
+                "mika#2573 — hors d'un tour Webhook Fallthrough, `gh issue create` n'est \
+                 pas refusé. mika#2995 retire une capacité au moteur, il n'en retire pas \
+                 deux."
             );
         }
     }

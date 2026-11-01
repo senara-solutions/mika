@@ -321,13 +321,16 @@ mod eval {
     // la boucle en ayant l'air de fermer le ticket.
     mod test_webhook_fallthrough_no_task_2517;
 
-    // mika#2573 — le frère du précédent, sur l'outil voisin : un tour du domaine
-    // Webhook Fallthrough se voit REFUSER les deux verbes `run_gh` qui créent du
-    // travail (`issue create`, `issue edit --add-label ready`), et garde ses
-    // lectures. Les quatre contrôles négatifs sont porteurs : V1/V2 seuls
-    // seraient satisfaits par une garde qui bloque `run_gh` sur tout tour
-    // Fallthrough, c'est-à-dire qui casse le geste de vérification que la SCOPE
-    // RULE du prompt prescrit littéralement.
+    // mika#2573 — le frère du précédent, sur l'outil voisin : les verbes `run_gh`
+    // qui créent du travail sont REFUSÉS, et les lectures passent. Depuis
+    // mika#2995 les deux motifs n'ont plus la même population, et l'asymétrie EST
+    // la décision : `issue create` garde sa borne de mika#2573 (tours Webhook
+    // Fallthrough seulement), la pose de `ready` est refusée sur TOUT tour —
+    // l'incident du 2026-10-31, où mika-dev s'est posé le consentement de
+    // mika#2772 à lui-même, a eu lieu sur un tour ordinaire. Les contrôles
+    // négatifs sont porteurs des deux côtés : V3/V7 séparent « la garde décide »
+    // de « la garde bloque `run_gh` », V6 sépare « la population dépend du
+    // motif » de « la garde refuse tout, partout ».
     mod test_fallthrough_run_gh_refused_2573;
 
     // mika#2653 — second cas mesuré de la même famille, et le plus coûteux : un

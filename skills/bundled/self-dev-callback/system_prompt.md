@@ -22,9 +22,9 @@ When you receive a callback result from a completed background task (`run_claude
 >
 >    - **If `second-pass (GROOMED)` IS present → GROOMED success:**
 >      a. Call `update_task_status(task_id, "completed")` to mark the groom task done (frees groom dispatch slot — independent from implement slot per mika#1001).
->      b. Call `run_gh("issue edit <n> --add-label ready --repo senara-solutions/<repo>")` to re-add the `ready` label. This re-triggers the ready-label webhook handler, which finds the groomed body callout and dispatches dev-pilot.
->      c. Call `send_message`: "Auto-groom completed for {repo}#{n}. Re-added `ready` label to trigger dev-pilot dispatch."
->      d. Stop the turn. The ready-label webhook handler takes over from here.
+>      b. Call `send_message`: "Auto-groom completed for {repo}#{n}. The `ready` label was not touched."
+>      c. Stop the turn.
+>      **Do NOT post the `ready` label — not with `run_gh`, not by any other route (mika#2995).** `ready` is the operator's positive consent to autonomous dispatch (mika#841), and the mika#2772 consent gate reads only its presence: an agent that posts it grants itself the consent that gate exists to require of a human. Promoting a ticket belongs to the operator. It also never did anything here: the engine dispatches dev-pilot **directly** after a groom success (`try_dispatch_pilot_after_groom_success`, mika#1614), and a ticket that reached this callback already carries `ready` — nothing in the dispatch library removes it, and GitHub emits `labeled` only on a transition (mika#2323) — so the re-add this step used to prescribe was a silent no-op. If you believe this ticket needs an operator decision, say so with `send_message` and stop.
 >      **Do NOT check the callback result text for `PIPELINE FAILURE:` or `Outcome:` lines — the body marker is authoritative.**
 >
 >    - **If `second-pass (GROOMED)` is ABSENT → failure routing, and the FIRST test is terminality:**

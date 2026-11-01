@@ -169,8 +169,16 @@ pub struct ToolContext<'a> {
     /// Quatrième booléen de classe de tour, à côté de `is_reflection`,
     /// `is_task_context` et `is_callback_turn` — la forme de la maison, pas une
     /// exception. Lu par la garde `validate_fallthrough_work_creation` de
-    /// `run_gh`, qui refuse les verbes créant du travail (`issue create`,
-    /// `issue edit --add-label ready`) sur un tel tour.
+    /// `run_gh`, qui refuse `issue create` sur un tel tour.
+    ///
+    /// **Ce champ ne borne plus toute cette garde (mika#2995).** La pose de
+    /// `ready` y est refusée sur **tout** tour, et donc sans consulter ce
+    /// booléen : l'incident du 2026-10-31 — mika-dev se posant à lui-même le
+    /// consentement que la garde de mika#2772 exige d'un opérateur — a eu lieu
+    /// sur un tour **ordinaire**. La population de chaque motif se lit à son
+    /// seul site, `evidence::guards::work_creation_is_refused`, où ce terme entre
+    /// en paramètre ; ce champ est donc l'une des entrées du prédicat, plus sa
+    /// borne (mika#2201).
     ///
     /// # Un booléen, jamais `originating_message`
     ///

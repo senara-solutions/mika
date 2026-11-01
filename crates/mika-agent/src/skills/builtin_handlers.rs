@@ -3082,8 +3082,9 @@ async fn validate_dispatcher_not_reviewer(
     Err(ToolOutput::error(payload.to_string()))
 }
 
-/// Refuse, sur un tour **Webhook Fallthrough**, les verbes `run_gh` qui créent
-/// du travail (mika#2573).
+/// Refuse les verbes `run_gh` qui créent du travail : `issue create` sur un tour
+/// **Webhook Fallthrough** (mika#2573), la pose de `ready` sur **tout** tour
+/// (mika#2995).
 ///
 /// # Ce que ça ferme
 ///
@@ -3115,10 +3116,40 @@ async fn validate_dispatcher_not_reviewer(
 /// 1. **Fail-open à la détection.** Un argv qui n'est aucune des deux formes
 ///    n'est pas l'affaire de cette garde ⇒ `Ok(())`. `gh` dans son ensemble est
 ///    intouché et la surface reste bornée à deux verbes.
-/// 2. **Fail-closed après.** Forme reconnue **et**
-///    `ctx.is_webhook_fallthrough_turn` ⇒ refus. Hors tour Fallthrough,
-///    `Ok(())` — c'est la garantie de non-régression, et c'est un **terme du
-///    prédicat**, pas une branche de l'appelant.
+/// 2. **Fail-closed après**, sur la population que
+///    [`crate::evidence::guards::work_creation_is_refused`] donne au motif.
+///    `ReadyLabelAdd` ⇒ refus sur **tout** tour (mika#2995) ; `IssueCreate` ⇒
+///    refus sur les tours Fallthrough seulement, sa borne de mika#2573
+///    intacte. Le terme de classe de tour reste un **paramètre du prédicat**,
+///    pas une branche de l'appelant : « hors tour Fallthrough, `gh issue
+///    create` ne change pas » est une propriété testable de `guards.rs`, et ce
+///    site ne la ré-énonce pas (mika#2201).
+///
+/// # Les deux populations, et pourquoi elles diffèrent (mika#2995)
+///
+/// La borne « tours Fallthrough seulement » de mika#2573 ne pouvait pas tenir
+/// pour `ready` : l'incident du 2026-10-31 sur mika#2958 s'est produit sur un
+/// tour **ordinaire**, où mika-dev a posé lui-même le label qui lève la garde
+/// de consentement de mika#2772, avec le `GH_TOKEN` du moteur. `ready` est le
+/// consentement positif de l'**opérateur** au dispatch autonome (mika#841) :
+/// une identité qui peut l'écrire se donne le consentement que la garde existe
+/// pour exiger d'un humain. Retirer l'écriture au moteur est ce qui rend ce
+/// self-consent impossible plutôt qu'improbable — une consigne de prompt
+/// demandant de s'abstenir ne l'aurait rendu qu'improbable.
+///
+/// Le `reason` et le `remedy` sont donc **par motif**. Servir le texte
+/// Fallthrough à un refus de `ready` hors tour Fallthrough affirmerait de ce
+/// tour ce qu'il n'est pas (classe mika#2304), et le `remedy` de mika#2573
+/// renvoie à la lecture de l'issue, pas à la question de la promotion.
+///
+/// # Le coût, nommé plutôt que découvert
+///
+/// Un opérateur qui demande en conversation « pose le label `ready` sur
+/// \#2562 » se voit désormais refuser aussi. C'est le prix de voie B et il est
+/// délibéré : une exception « quand un humain le demande » serait une
+/// exception que l'agent déclare lui-même, donc pas une exception. La
+/// promotion se fait depuis la surface opérateur — l'UI GitHub ou le `gh` de
+/// l'opérateur — et le `remedy` le dit.
 ///
 /// # L'asymétrie qui décide du sens du fail-safe
 ///
@@ -3132,6 +3163,15 @@ async fn validate_dispatcher_not_reviewer(
 /// détruisait du travail, ici l'action *est* la création de travail non
 /// autorisé. **L'arbitrage est local et ne se transporte pas.**
 ///
+/// **Depuis mika#2995 ce calcul se refait hors du domaine Fallthrough, pour
+/// `ready` seulement, et il tombe du même côté.** Le faux positif y coûte une
+/// promotion que l'agent ne fait pas et qu'un opérateur fait en une seconde —
+/// un geste qui lui appartient déjà. Le faux négatif y coûte la garde de
+/// mika#2772 en entier. Et sur la population nominale le geste était déjà
+/// inerte : le ticket qui atteint le callback de groom porte **déjà** `ready`,
+/// rien dans la bibliothèque de dispatch ne le retire, et GitHub n'émet
+/// `labeled` que sur une transition (mika#2323).
+///
 /// Pas d'interrupteur d'environnement, et c'est un choix avec son précédent :
 /// mika#1646, la garde sœur la plus proche, n'en a pas non plus. Un
 /// désarmement par variable sur un chemin de création de travail serait un
@@ -3144,6 +3184,7 @@ async fn validate_fallthrough_work_creation(
 ) -> Result<(), ToolOutput> {
     use crate::evidence::guards::{
         FALLTHROUGH_WORK_CREATION_AUDIT_TOOL, WorkCreationAction, detect_fallthrough_work_creation,
+        work_creation_is_refused,
     };
 
     // Disposition 1 — fail-open : ce n'est pas le sujet de cette garde.
@@ -3151,10 +3192,12 @@ async fn validate_fallthrough_work_creation(
         return Ok(());
     };
 
-    // Disposition 2 — le terme de classe de tour est DANS le prédicat, jamais
-    // une branche de l'appelant : « hors tour Fallthrough, rien ne change »
-    // devient une propriété de cette fonction, avec son propre test.
-    if !ctx.is_webhook_fallthrough_turn {
+    // Disposition 2 — la population de chaque motif vit dans `guards.rs`, et le
+    // terme de classe de tour y entre en PARAMÈTRE. « Hors tour Fallthrough,
+    // `gh issue create` ne change pas » et « la pose de `ready` est refusée sur
+    // tout tour » sont deux propriétés testables là-bas ; ce site ne les
+    // ré-énonce pas (mika#2201 — un seul lecteur).
+    if !work_creation_is_refused(&action, ctx.is_webhook_fallthrough_turn) {
         return Ok(());
     }
 
@@ -3173,10 +3216,21 @@ async fn validate_fallthrough_work_creation(
         motif = %motif,
         verb = %verb,
         label = label.unwrap_or("—"),
+        turn_is_fallthrough = ctx.is_webhook_fallthrough_turn,
         repo = %repo.unwrap_or("unknown"),
-        "refused work creation on a Webhook Fallthrough turn (mika#2517 + mika#2573)"
+        "refused work creation (mika#2517 + mika#2573 + mika#2995)"
     );
 
+    // Le nom d'événement ne change PAS, et `turn_is_fallthrough` est un champ
+    // plutôt qu'un second nom : depuis mika#2995 la population a deux motifs,
+    // mais elle reste **une** mesure — « un refus de création de travail ».
+    // Deux noms ne se soustraient pas (mika#2205), et le `trace_id` qui joint
+    // cette ligne à `webhook_fallthrough_turn` (mika#2517) ne joindrait plus
+    // qu'une moitié. Le champ est ce qui rend les deux sous-populations
+    // séparables sans les séparer : `GROUP BY motif, turn_is_fallthrough`.
+    // Il porte le booléen tel qu'il a été lu — jamais `marker_class`, que ce
+    // booléen ne transporte pas.
+    //
     // La ligne ne porte pas de `marker_class` : le booléen ne la transporte pas,
     // et l'inventer serait un champ qui affirme ce qu'on n'a pas mesuré (classe
     // mika#2304). `webhook_fallthrough_turn` (mika#2517) porte déjà le
@@ -3203,27 +3257,61 @@ async fn validate_fallthrough_work_creation(
         );
     }
 
-    // Le `remedy` nomme les deux sorties correctes que le prompt possède déjà —
+    // Le `remedy` nomme les sorties correctes que le prompt possède déjà —
     // accuser réception et s'arrêter, ou alerter l'opérateur — et **ne nomme
     // aucun contournement** : un refus qui donne le gabarit est une fuite avec
-    // une étape de plus (doctrine mika#2520).
-    Err(ToolOutput::error(
-        serde_json::json!({
-            "error": "fallthrough_work_creation_refused",
-            "doctrine": "mika#2517 + mika#2573",
-            "action": motif,
-            "reason": format!(
+    // une étape de plus (doctrine mika#2520). Celui de `ready` ne nomme donc
+    // PAS le `remove → add` que la surface opérateur connaît : c'est exactement
+    // le geste que l'incident du 2026-10-31 a rejoué depuis le texte d'un
+    // refus, et ce texte-ci est lu par l'agent.
+    //
+    // Les deux motifs ont leurs propres textes. La branche `IssueCreate` garde
+    // les siens **mot pour mot** : ce qu'elle refuse et pourquoi n'a pas bougé.
+    let (doctrine, reason, remedy) = match &action {
+        WorkCreationAction::IssueCreate => (
+            "mika#2517 + mika#2573",
+            format!(
                 "This turn is a Webhook Fallthrough turn: an informational GitHub event \
                  that is not a trigger to start new work. `gh {verb}` creates work, and \
                  no work may be created here."
             ),
-            "remedy":
-                "Two exits, and they are the only two. (1) Acknowledge the event and stop \
-                 — reading the issue is still permitted, so `gh issue view <n> --json labels` \
-                 remains available if you need to correlate. (2) If this event deserves a \
-                 human decision, say so to the operator with `send_message` and stop. Do not \
-                 look for another route: this refusal is not lifted by retrying under a \
-                 different shape.",
+            "Two exits, and they are the only two. (1) Acknowledge the event and stop \
+             — reading the issue is still permitted, so `gh issue view <n> --json labels` \
+             remains available if you need to correlate. (2) If this event deserves a \
+             human decision, say so to the operator with `send_message` and stop. Do not \
+             look for another route: this refusal is not lifted by retrying under a \
+             different shape."
+                .to_string(),
+        ),
+        WorkCreationAction::ReadyLabelAdd { label } => (
+            "mika#2517 + mika#2573 + mika#2995",
+            format!(
+                "The `{label}` label is the operator's positive consent to autonomous \
+                 dispatch (mika#841), and the mika#2772 consent gate reads only its \
+                 presence. An identity that can write it grants itself the consent that \
+                 gate exists to require of a human, so `gh {verb}` is refused here — on \
+                 every turn, not only on a Webhook Fallthrough one."
+            ),
+            "Promoting a ticket belongs to the operator; it is not a gesture you perform, \
+             under any shape, and no turn class lifts this. Three exits, and they are the \
+             only three. (1) Report what you found and stop — reading stays permitted, so \
+             `gh issue view <n> --json labels` remains available. (2) If this ticket needs \
+             a human decision, say so to the operator with `send_message` and stop. \
+             (3) If what it needs is grooming, an explicit groom request traverses the \
+             consent gate instead of lifting it (mika#1173) — that request is the \
+             operator's to make, so ask for it rather than manufacturing the consent it \
+             requires."
+                .to_string(),
+        ),
+    };
+
+    Err(ToolOutput::error(
+        serde_json::json!({
+            "error": "fallthrough_work_creation_refused",
+            "doctrine": doctrine,
+            "action": motif,
+            "reason": reason,
+            "remedy": remedy,
         })
         .to_string(),
     ))
@@ -5351,10 +5439,13 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         return err;
     }
 
-    // Fallthrough work-creation gate (mika#2573): on a Webhook Fallthrough turn,
-    // refuse the two `gh` verbs that create work — `issue create` and
-    // `issue edit --add-label ready`. Placed here, before the first gate that
-    // makes a network call: the chain runs from the most local to the most
+    // Work-creation gate (mika#2573 + mika#2995): refuse the two `gh` verbs that
+    // create work. `issue create` is refused on a Webhook Fallthrough turn;
+    // posting the dispatch-trigger label is refused on **every** turn, because
+    // the engine writing it is the engine consenting for the operator. Each
+    // motif's population lives in `work_creation_is_refused`, never here.
+    // Placed here, before the first gate that makes a network call: the chain
+    // runs from the most local to the most
     // engaging, and this one is pure argv plus a turn-class boolean. Refuses
     // rather than withholds `run_gh`, because the prompt's own verification
     // gesture (`issue view --json labels`) is a `run_gh` read.
@@ -14769,5 +14860,190 @@ mod mika2961_pass_evidence {
             .is_ok()
         );
         assert_eq!(all_rows(&h, CM_TARGET).await, 0);
+    }
+}
+
+/// mika#2995 — le câblage : la pose de `ready` est refusée **hors** tour
+/// Fallthrough, et `gh issue create` y passe toujours.
+///
+/// Frère unitaire de `evidence::guards::tests::mika2995`, et il mesure autre
+/// chose. Là-bas, `work_creation_is_refused` rend un booléen sur les quatre
+/// cases de la table (motif × tour) ; ici la garde tourne à sa position de
+/// production dans `run_gh`, avec un `ToolContext` réel, et c'est le seul
+/// niveau où un prédicat correct mais **jamais appelé** se voit. Le vol a
+/// changé la ligne qui l'appelle : c'est elle que ce module épingle.
+#[cfg(test)]
+mod mika2995_work_creation_wiring {
+    use super::validate_fallthrough_work_creation;
+    use crate::test_utils::test_helpers::TestHarness;
+    use crate::tools::ToolContext;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// L'argv **mesuré** le 2026-10-31 à 16:51:37Z dans la trace
+    /// `0104d923`, mot pour mot. Pas un équivalent : c'est l'appel qui a
+    /// posé `ready` sur mika#2958 avec le `GH_TOKEN` du moteur, et ce test
+    /// existe pour que cet appel-là, cinq jetons compris, soit refusé.
+    fn largv_de_lincident() -> Vec<String> {
+        argv(&["issue", "edit", "2958", "--add-label", "ready"])
+    }
+
+    async fn refus(args: &[String], ctx: &ToolContext<'_>) -> serde_json::Value {
+        let err = validate_fallthrough_work_creation(args, Some("senara-solutions/mika"), ctx)
+            .await
+            .expect_err("cet appel doit être refusé");
+        serde_json::from_str(&err.content).expect("le refus est un objet JSON")
+    }
+
+    /// **Le test du ticket.** Tour ordinaire — `is_webhook_fallthrough_turn`
+    /// est faux, comme il l'était le 2026-10-31 — et la pose de `ready` est
+    /// refusée.
+    ///
+    /// C'est la seule assertion de ce fichier qui dit quelque chose que
+    /// l'arbre d'avant mika#2995 ne disait pas : sur ce tour-là, la garde
+    /// de mika#2573 rendait `Ok(())` et l'agent se donnait le consentement
+    /// que la garde de mika#2772 exige d'un humain.
+    #[tokio::test]
+    async fn largv_de_lincident_est_refuse_hors_tour_fallthrough() {
+        let h = TestHarness::new();
+        let ctx = h.ctx();
+        assert!(
+            !ctx.is_webhook_fallthrough_turn,
+            "la prémisse du test : l'incident n'était PAS un tour Fallthrough. \
+                 Si ce booléen est vrai, le test ne mesure plus le défaut."
+        );
+
+        let payload = refus(&largv_de_lincident(), &ctx).await;
+        assert_eq!(payload["error"], "fallthrough_work_creation_refused");
+        assert_eq!(
+            payload["action"], "ready_label_add",
+            "le motif est le format de fil sur lequel l'opérateur fait son GROUP BY"
+        );
+    }
+
+    /// Sur un tour Fallthrough, rien ne change : le refus que mika#2573
+    /// livrait tient, sous le même identifiant.
+    #[tokio::test]
+    async fn la_pose_de_ready_reste_refusee_sur_un_tour_fallthrough() {
+        let h = TestHarness::new();
+        let mut ctx = h.ctx();
+        ctx.is_webhook_fallthrough_turn = true;
+
+        let payload = refus(&largv_de_lincident(), &ctx).await;
+        assert_eq!(payload["error"], "fallthrough_work_creation_refused");
+        assert_eq!(payload["action"], "ready_label_add");
+    }
+
+    /// **Contrôle négatif, et le plus porteur des trois.** mika#2995 retire
+    /// une capacité au moteur, il n'en retire pas deux : `gh issue create`
+    /// garde sa borne de mika#2573 — tours Fallthrough seulement.
+    ///
+    /// Sans lui, « la population dépend du motif » serait indistinguable de
+    /// « la garde refuse tout, partout », c'est-à-dire d'un élargissement
+    /// silencieux qui casserait la création d'issue sur les tours de
+    /// conversation où elle est le travail nominal de mika-dev.
+    #[tokio::test]
+    async fn issue_create_passe_toujours_hors_tour_fallthrough() {
+        let h = TestHarness::new();
+        let args = argv(&["issue", "create", "--title", "Re-groom mika#2958"]);
+        assert!(
+            validate_fallthrough_work_creation(&args, Some("senara-solutions/mika"), &h.ctx())
+                .await
+                .is_ok(),
+            "hors tour Fallthrough, `gh issue create` n'est pas l'affaire de cette garde"
+        );
+    }
+
+    /// Et sur un tour Fallthrough il reste refusé, **avec sa doctrine
+    /// inchangée**. Les deux citations de mika#2573 sont ce qu'un opérateur
+    /// grep ; les renommer casserait la jointure avec le ticket.
+    #[tokio::test]
+    async fn issue_create_reste_refuse_sur_un_tour_fallthrough() {
+        let h = TestHarness::new();
+        let mut ctx = h.ctx();
+        ctx.is_webhook_fallthrough_turn = true;
+
+        let args = argv(&["issue", "create", "--title", "Re-groom mika#2958"]);
+        let payload = refus(&args, &ctx).await;
+        assert_eq!(payload["action"], "issue_create");
+        assert_eq!(payload["doctrine"], "mika#2517 + mika#2573");
+        assert!(
+            payload["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Webhook Fallthrough turn"),
+            "le `reason` de ce motif est celui de mika#2573, mot pour mot : {}",
+            payload["reason"]
+        );
+    }
+
+    /// **AC3 au niveau de ce refus-ci.** Le remède de `ready` ne prescrit
+    /// pas le geste qu'il refuse, et ne nomme pas le gabarit `remove → add`
+    /// que la surface opérateur connaît.
+    ///
+    /// Le `reason`, lui, **a le droit** de nommer `gh issue edit
+    /// --add-label` : un refus qui ne dit pas ce qu'il refuse ne s'explique
+    /// pas. L'assertion porte donc sur le `remedy` seul, et cette asymétrie
+    /// est la décision (mika#2520 interdit le gabarit de contournement, pas
+    /// la désignation de l'interdit).
+    #[tokio::test]
+    async fn le_remede_de_ready_ne_prescrit_aucun_geste_de_promotion() {
+        let h = TestHarness::new();
+        let payload = refus(&largv_de_lincident(), &h.ctx()).await;
+        let remedy = payload["remedy"].as_str().expect("remedy est une chaîne");
+
+        for gabarit in ["--add-label", "--remove-label", "remove"] {
+            assert!(
+                !remedy.contains(gabarit),
+                "le remède est lu par l'agent même qu'on retient : il ne doit porter \
+                     aucun geste de promotion ni de bascule. Trouvé « {gabarit} » dans : \
+                     {remedy}"
+            );
+        }
+        assert!(
+            remedy.contains("belongs to the operator"),
+            "le remède doit ATTRIBUER la promotion à l'opérateur, pas seulement se \
+                 taire : {remedy}"
+        );
+        assert!(
+            remedy.contains("send_message"),
+            "et nommer la sortie correcte, sans quoi le refus se contourne au jugé \
+                 (mika#2520) : {remedy}"
+        );
+    }
+
+    /// La ligne d'audit est comptable sous son motif, sur un tour ordinaire.
+    ///
+    /// Le `warn!` n'est pas observable d'ici ; la ligne d'audit l'est, et
+    /// c'est elle que la sonde AC5 agrège. Un refus qui n'écrirait pas sa
+    /// ligne laisserait le `GROUP BY` de l'opérateur sous-compter
+    /// exactement la population que mika#2995 ouvre.
+    #[tokio::test]
+    async fn le_refus_hors_fallthrough_ecrit_sa_ligne_daudit() {
+        use crate::evidence::guards::FALLTHROUGH_WORK_CREATION_AUDIT_TOOL;
+
+        let h = TestHarness::new();
+        let _ = refus(&largv_de_lincident(), &h.ctx()).await;
+
+        let rows: Vec<_> =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events")
+                .into_iter()
+                .filter(|e| e.tool_name == FALLTHROUGH_WORK_CREATION_AUDIT_TOOL)
+                .collect();
+        assert_eq!(rows.len(), 1, "une ligne par refus : {rows:?}");
+        assert_eq!(rows[0].after_value.as_deref(), Some("ready_label_add"));
+        assert!(
+            rows[0]
+                .reasoning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("label=ready"),
+            "la ligne nomme le label tel qu'il a été écrit : {:?}",
+            rows[0].reasoning
+        );
     }
 }

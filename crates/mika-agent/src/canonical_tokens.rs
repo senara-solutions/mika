@@ -7480,4 +7480,287 @@ async fn un_troisieme_lecteur(db: &AsyncDatabase, u: &str) -> bool {
             "la ligne de définition n'est pas un site d'appel"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // mika#2995 — aucun prompt bundlé ne prescrit au moteur de poser `ready`
+    // -----------------------------------------------------------------------
+
+    /// **Livrée vide, et un test sœur l'assert.**
+    ///
+    /// Une entrée ici autoriserait un prompt à enseigner à l'agent le geste par
+    /// lequel il se donne le consentement que la garde de mika#2772 exige d'un
+    /// autre (mika#841) : ce n'est pas une exception, c'est le défaut. Quand ce
+    /// scan tire, on **retire la prescription** et on la remplace par la sortie
+    /// correcte — la promotion appartient à l'opérateur.
+    const READY_PRESCRIPTION_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// Tous les prompts bundlés, chemin relatif + contenu.
+    ///
+    /// `system_prompt*.md` et pas `system_prompt.md` seul : le système de skills
+    /// porte des variantes par fournisseur et par modèle, et une variante hors
+    /// population serait un trou que rien ne signale.
+    fn bundled_prompts() -> Vec<(String, String)> {
+        let root = repo_root();
+        let mut out = Vec::new();
+        let mut stack = vec![root.join("skills").join("bundled")];
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("entrée de répertoire lisible").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if !name.starts_with("system_prompt") || !name.ends_with(".md") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("chemin sous la racine")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // Un prompt illisible ÉCHOUE plutôt que de rendre une
+                // population plus petite : un scan qui ne lit rien se lit comme
+                // un scan d'accord (motif mika#2641).
+                let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("mika#2995 — {rel} doit être lisible pour que ce scan vérifie quelque chose : {e}")
+                });
+                out.push((rel, src));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Les lignes (1-indexées) d'un prompt qui prescrivent la pose du label de
+    /// déclenchement.
+    fn ready_prescription_lines(src: &str) -> Vec<usize> {
+        src.lines()
+            .enumerate()
+            .filter(|(_, line)| line_prescribes_dispatch_trigger_write(line))
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// Vrai si la ligne porte un drapeau d'ajout d'étiquette dont la **valeur**
+    /// est le label de déclenchement.
+    ///
+    /// La valeur est lue au jeton, jamais par sous-chaîne : `--add-label
+    /// ready-for-review` ne prescrit pas `ready`, et un `contains("ready")`
+    /// l'accuserait — un faux rouge est ce qui fait désarmer un scan.
+    ///
+    /// Le prédicat ne cherche **pas** à distinguer la prescription de
+    /// l'interdiction. Un prompt qui nomme le geste l'enseigne, même pour le
+    /// défendre : un refus qui nomme son contournement est un refus contourné
+    /// (mika#2520).
+    fn line_prescribes_dispatch_trigger_write(line: &str) -> bool {
+        use crate::evidence::guards::{ADD_LABEL_FLAGS, DISPATCH_TRIGGER_LABEL};
+
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for (i, raw) in tokens.iter().enumerate() {
+            let token = unquote(raw);
+            for flag in ADD_LABEL_FLAGS {
+                let value = if token == *flag {
+                    // `--add-label ready` : la valeur est le jeton SUIVANT.
+                    tokens.get(i + 1).map(|t| unquote(t))
+                } else {
+                    // `--add-label=ready` : la valeur est collée au drapeau.
+                    token.strip_prefix(flag).and_then(|r| r.strip_prefix('='))
+                };
+                let Some(value) = value else { continue };
+                // `gh` accepte une liste : `--add-label ready,urgent`.
+                if value
+                    .split(',')
+                    .any(|l| unquote(l).eq_ignore_ascii_case(DISPATCH_TRIGGER_LABEL))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Retire la ponctuation de citation autour d'un jeton de prose.
+    ///
+    /// Un prompt écrit la commande dans un littéral markdown :
+    /// `` `run_gh("issue edit <n> --add-label ready")` ``. Sans ce décapage, le
+    /// jeton de valeur serait `ready")` et le scan ne verrait rien.
+    fn unquote(token: &str) -> &str {
+        token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | '.'
+                    | ';'
+                    | ':'
+                    | '*'
+                    | '\\'
+                    | '>'
+            )
+        })
+    }
+
+    /// **mika#2995 AC1 — aucun prompt bundlé ne prescrit la pose de `ready`.**
+    ///
+    /// Un scan de source, et il n'y a pas d'autre forme possible : la ligne
+    /// fautive ne rend **aucune** décision fausse. Elle enseigne à l'agent le
+    /// geste par lequel il se donne lui-même le consentement positif que la
+    /// garde de mika#2772 exige d'un opérateur — exactement l'incident du
+    /// 2026-10-31 sur mika#2958. Chaque assertion de comportement de cette
+    /// caisse reste verte pendant que le prompt porte la prescription, parce
+    /// que le prompt n'est pas du code : il est lu par un modèle, au build
+    /// (mika#2340), et son absence de défaut n'est observable que par une
+    /// lecture de sa prose.
+    ///
+    /// **Résolution quand il tire : retirer la prescription.** Ajouter une
+    /// entrée à `READY_PRESCRIPTION_EXCEPTIONS` rend au moteur la capacité que
+    /// ce vol lui retire.
+    #[test]
+    fn mika2995_aucun_prompt_bundle_ne_prescrit_la_pose_de_ready() {
+        let prompts = bundled_prompts();
+
+        // Assertion de population non vide : un scan dont le walk ne résout
+        // aucun fichier passe vert par construction (classes mika#2578 /
+        // mika#2752). Le seuil est bas et le nom est cité : les deux pannes à
+        // couvrir sont « la racine a bougé » et « le filtre de nom ne reconnaît
+        // plus rien ».
+        assert!(
+            prompts.len() >= 10,
+            "mika#2995 — seulement {} prompt(s) bundlé(s) trouvé(s) sous skills/bundled : \
+             ce scan ne regarde plus la population qu'il existe pour couvrir",
+            prompts.len()
+        );
+        assert!(
+            prompts
+                .iter()
+                .any(|(rel, _)| rel == "skills/bundled/self-dev-callback/system_prompt.md"),
+            "mika#2995 — le prompt du callback n'est plus dans la population du scan ; \
+             c'est le site de l'incident fondateur, il doit y rester"
+        );
+
+        let violations: Vec<String> = prompts
+            .iter()
+            .flat_map(|(rel, src)| {
+                ready_prescription_lines(src)
+                    .into_iter()
+                    .map(move |line| format!("{rel}:{line}"))
+            })
+            .collect();
+
+        let allowed: Vec<&str> = READY_PRESCRIPTION_EXCEPTIONS
+            .iter()
+            .map(|(rel, _)| *rel)
+            .collect();
+        let unexpected: Vec<&String> = violations
+            .iter()
+            .filter(|v| {
+                let rel = v.rsplit_once(':').map(|(r, _)| r).unwrap_or(v.as_str());
+                !allowed.contains(&rel)
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "mika#2995 VIOLÉ — ces prompts bundlés prescrivent la pose du label `ready` : \
+             {unexpected:?}.\n\n\
+             `ready` est le consentement positif au dispatch autonome (mika#841), et la garde \
+             de mika#2772 n'en lit que la PRÉSENCE. Un prompt qui enseigne ce geste rend le \
+             self-consent possible : l'agent que la garde retient se la lève à lui-même avec \
+             `run_gh`.\n\n\
+             RÉSOLUTION : retirer la prescription et nommer la sortie correcte — la promotion \
+             appartient à l'opérateur. Ne pas ajouter d'entrée à \
+             READY_PRESCRIPTION_EXCEPTIONS."
+        );
+
+        // Moitié auto-nettoyante : une entrée qui ne correspond plus à une
+        // violation réelle est une permission périmée, et une permission
+        // périmée est la façon dont une exception survit à sa raison.
+        for (rel, ticket) in READY_PRESCRIPTION_EXCEPTIONS {
+            assert!(
+                violations.iter().any(|v| v.starts_with(&format!("{rel}:"))),
+                "entrée d'allowlist périmée {rel:?} (ticket {ticket}) — ce prompt ne \
+                 prescrit plus la pose de `ready` ; retirer l'entrée"
+            );
+        }
+    }
+
+    /// **L'allowlist du scan ci-dessus est livrée vide.**
+    #[test]
+    fn mika2995_lallowlist_des_prescriptions_est_vide() {
+        assert!(
+            READY_PRESCRIPTION_EXCEPTIONS.is_empty(),
+            "READY_PRESCRIPTION_EXCEPTIONS est livrée vide et doit le rester : quand le scan \
+             tire, on retire la prescription du prompt (mika#2995)."
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne reconnaît plus la forme qu'il
+    /// cherche — le mode de panne qu'il existe pour rendre visible. On le montre
+    /// donc rougir sur les trois syntaxes d'ajout, et rester muet sur les
+    /// quatre formes qui nomment le label sans prescrire sa pose.
+    #[test]
+    fn mika2995_le_scan_rougit_sur_une_prescription_plantee() {
+        // La forme exacte de l'incident, puis les deux autres syntaxes.
+        let fautif = "\
+> Nothing to see on this line.
+>      b. Call `run_gh(\"issue edit <n> --add-label ready --repo senara-solutions/<repo>\")`.
+Then `run_gh(\"issue edit <n> --label=ready\")` also posts it.
+And `run_gh(\"issue create --title t -l ready,urgent\")` creates it promoted.
+";
+        assert_eq!(
+            ready_prescription_lines(fautif),
+            vec![2, 3, 4],
+            "le scan doit voir les trois syntaxes d'ajout — `--add-label <v>`, `--label=<v>` \
+             et `-l <liste>` — chacune sous son numéro de ligne, sans quoi le message \
+             d'échec ne dirait pas OÙ retirer la prescription"
+        );
+
+        // 1. Le label nommé en prose, sans drapeau : c'est la forme de la
+        //    sortie correcte que ce vol écrit à la place de la prescription.
+        let prose = "The `ready` label is posted by the operator, never by you.\n";
+        assert!(
+            ready_prescription_lines(prose).is_empty(),
+            "nommer le label n'est pas prescrire sa pose — sans quoi le remède correct \
+             serait lui-même une violation"
+        );
+
+        // 2. Un autre label sous le même drapeau. `dispatch:loop` est posé par
+        //    `dispatch-lib.sh` sous l'autorité de l'opérateur, et n'est pas un
+        //    consentement.
+        let autre = "run `gh issue edit 7 --add-label dispatch:loop` to stamp the seat\n";
+        assert!(
+            ready_prescription_lines(autre).is_empty(),
+            "un autre label sous le même drapeau n'est pas le label de déclenchement"
+        );
+
+        // 3. Le piège du préfixe : la valeur est lue au jeton, pas par
+        //    sous-chaîne.
+        let prefixe = "`gh pr edit 12 --add-label ready-for-review` is a review signal\n";
+        assert!(
+            ready_prescription_lines(prefixe).is_empty(),
+            "`ready-for-review` n'est pas `ready` : un scan par sous-chaîne l'accuserait, \
+             et un faux rouge est ce qui fait désarmer un scan"
+        );
+
+        // 4. Le RETRAIT. Il n'est pas un consentement — et il est la moitié
+        //    que l'opérateur garde (`remove → add`, mika#2323).
+        let retrait = "`gh issue edit 7 --remove-label ready` demotes the ticket\n";
+        assert!(
+            ready_prescription_lines(retrait).is_empty(),
+            "retirer `ready` n'est pas se donner le consentement"
+        );
+    }
 }

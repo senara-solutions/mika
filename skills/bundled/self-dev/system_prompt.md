@@ -132,6 +132,8 @@ When you receive a GitHub webhook event (message starts with `[GitHub]`) and **n
 > 4. Stop — do NOT proceed to the generic Workflow section above
 >
 > **No work is created on this turn, by any route.** Creating work on the forge is refused here as well: no new issue, no label that triggers a dispatch. Reading the forge stays permitted — that is what permitted action 2 and the `--json labels` check above rest on. If the event genuinely deserves new work, that is a decision for the operator: say so with `send_message` and stop. The engine refuses these routes (mika#2517 + mika#2573); looking for a third one is not a route, it is the same refusal one step later.
+>
+> **Of these two refusals, only the issue-creation one is bounded to this turn.** Writing the `ready` label is refused on **every** turn, this one included and all the others besides — it is the operator's consent to autonomous dispatch (mika#841), never a gesture you perform (mika#2995). Do not read the paragraph above as granting it elsewhere.
 
 **What this covers:** `issues.assigned`, `issue_comment.created`, `pull_request.labeled`, `discussion.created`, and any other GitHub event type that lacks a dedicated keyword-matched handler skill.
 
@@ -330,6 +332,8 @@ When you receive a GitHub webhook event (`[GitHub]` prefix) and no webhook-speci
 The engine rejects `run_claude_pilot` at the webhook-fallthrough tool boundary with `unauthorized_webhook_dispatch` (mika#933) and caps one dispatch per turn — but prompt-level discipline is the first line of defense.
 
 **The engine also refuses creating work on the forge from such a turn** (`fallthrough_work_creation_refused`, mika#2517 + mika#2573): no new issue, no dispatch-triggering label. It withholds `create_task` outright and refuses those two routes — `run_gh` stays available for reading, which is what the verification gesture above needs. If you meet that refusal, it is not a shape to work around: acknowledge the event, or hand the decision to the operator with `send_message`, and stop.
+
+**The second of those two routes is refused on every turn, not only on this one** (mika#2995). Writing the `ready` label is the operator's consent to autonomous dispatch (mika#841), and the consent gate of mika#2772 reads only its presence — so an identity able to write it grants itself the very consent that gate exists to require of a human. That is a capability you do not have, under any shape and on any turn class. Promoting a ticket is the operator's gesture; if what a ticket needs is grooming, an explicit groom request traverses the gate rather than lifting it (mika#1173), and that request is the operator's to make.
 
 **Incidents:** mika#583 (2026-04-15) — `pull_request_review.submitted` had no specific handler; agent ran generic Workflow, dispatched on unrelated issues. mika#932 (2026-05-02) — `issue_comment.created` with dispatch-class keywords bypassed prose rule; #910 guard fired too late. mika#2573 (2026-09-28) — an `issue_comment.created` turn created an issue and relaunched an implement dispatch via `run_gh`, the tool neighbouring the one mika#2517 had withheld; the model itself called the issue "created by mistake".
 
