@@ -256,6 +256,43 @@ fn normalize(raw: &str) -> String {
     }
 }
 
+/// Pourquoi le callout d'un vol est périmé — et par quel merge (mika#3001).
+///
+/// Les deux variantes nomment une PR **mergée**, ce qui est le discriminant que
+/// la porte d'auto-pull applique désormais. Ce qu'elles séparent est l'état de la
+/// branche, qui n'est plus ce qui décide mais reste ce que la prose doit dire
+/// sans mentir : sur le second chemin la branche existe toujours, et la phrase
+/// « la branche qui le portait a été supprimée » y serait fausse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorPlanCause {
+    /// Le merge de cette PR a supprimé la branche (mika#2839).
+    BranchDeletedByMerge { pr: u64 },
+    /// Le merge de cette PR a mis le plan sur `main` ; la branche a été
+    /// repoussée depuis et porte autre chose (mika#3001).
+    PlanMergedBranchReused { pr: u64 },
+}
+
+impl PriorPlanCause {
+    /// Le numéro de la PR mergée que la prose nomme.
+    pub fn merged_pr(self) -> u64 {
+        match self {
+            Self::BranchDeletedByMerge { pr } | Self::PlanMergedBranchReused { pr } => pr,
+        }
+    }
+
+    /// Le nom de la population, pour la ligne d'audit de la réécriture.
+    ///
+    /// Un vocabulaire clos, et c'est par lui qu'un opérateur compte les deux
+    /// chemins séparément : `merged_pr` seul ne les distingue pas, et deux
+    /// populations sous un même nom ne se soustraient pas (mika#2205).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::BranchDeletedByMerge { .. } => "branch_deleted_by_merge",
+            Self::PlanMergedBranchReused { .. } => "plan_merged_branch_reused",
+        }
+    }
+}
+
 /// Réécrit le callout périmé d'un corps d'issue en une ligne « Plan antérieur »,
 /// ou rend `None` si ce corps n'en porte pas (mika#2839).
 ///
@@ -308,8 +345,14 @@ fn normalize(raw: &str) -> String {
 /// écrivain, un lecteur, et un test qui les joint —
 /// [`tests::mika2952_la_ligne_ecrite_par_la_porte_est_relue_par_le_lecteur`] :
 /// les deux côtés consomment [`PRIOR_PLAN_PREFIX`] sans l'épeler, et changer la
-/// prose sans changer la constante devient rouge.
-pub fn rewrite_callout_as_prior_plan(body: &str, branch: &str, merged_pr: u64) -> Option<String> {
+/// prose sans changer la constante devient rouge. Depuis mika#3001 les **deux**
+/// prose de [`PriorPlanCause`] en partent, donc le test d'aller-retour vaut pour
+/// les deux sans qu'il faille en écrire un second.
+pub fn rewrite_callout_as_prior_plan(
+    body: &str,
+    branch: &str,
+    cause: PriorPlanCause,
+) -> Option<String> {
     // `split_inclusive` et non `lines()` : les terminateurs sont conservés, donc
     // le texte autour du run est reproduit à l'octet près (`\r\n` compris) et un
     // corps sans saut de ligne final n'en gagne pas un.
@@ -357,13 +400,21 @@ pub fn rewrite_callout_as_prior_plan(body: &str, branch: &str, merged_pr: u64) -
     // Les trois faits de la ligne sont les trois faits **mesurés** : le chemin lu
     // dans le callout remplacé, la branche sur laquelle la mesure a porté, le
     // numéro de PR rendu par la sonde. Rien n'y affirme que le plan existe à ce
-    // chemin sur `main` — la sonde a mesuré une suppression de branche, pas la
-    // présence d'un fichier.
-    out.push_str(&format!(
-        "{PRIOR_PLAN_PREFIX} `{plan}` — la branche `{branch}` qui le portait a été \
-         supprimée par le merge de #{merged_pr} dans `main`. Callout réécrit par la \
-         porte d'auto-pull (mika#2839)."
-    ));
+    // chemin sur `main` — sur la première cause la sonde a mesuré une suppression
+    // de branche, pas la présence d'un fichier ; sur la seconde elle a mesuré que
+    // les fichiers d'une PR mergée portaient ce chemin.
+    out.push_str(&match cause {
+        PriorPlanCause::BranchDeletedByMerge { pr } => format!(
+            "{PRIOR_PLAN_PREFIX} `{plan}` — la branche `{branch}` qui le portait a été \
+             supprimée par le merge de #{pr} dans `main`. Callout réécrit par la \
+             porte d'auto-pull (mika#2839)."
+        ),
+        PriorPlanCause::PlanMergedBranchReused { pr } => format!(
+            "{PRIOR_PLAN_PREFIX} `{plan}` — ce plan a été mergé par #{pr} dans `main` ; \
+             la branche `{branch}` a été repoussée depuis et porte un autre vol. \
+             Callout réécrit par la porte d'auto-pull (mika#3001)."
+        ),
+    });
     if lines[end].ends_with("\r\n") {
         out.push_str("\r\n");
     } else if lines[end].ends_with('\n') {
@@ -625,6 +676,11 @@ mod tests {
     // ───────── Réécriture en « Plan antérieur » (mika#2839) ─────────
 
     const DEAD_BRANCH: &str = "chore/2108/orienter-le-pilote-avant-le-corps";
+    /// La cause historique : le merge de #2834 a supprimé `DEAD_BRANCH`.
+    ///
+    /// Nommée une fois pour que les sites de test de mika#2839 restent à un
+    /// argument et que leur prose attendue reste leur seul contrat.
+    const DEAD_MERGE: PriorPlanCause = PriorPlanCause::BranchDeletedByMerge { pr: 2834 };
     const PLAN_2108: &str =
         "docs/plans/2026-10-19-006-fix-2108-orienter-le-pilote-avant-le-corps-du-ticket-plan.md";
 
@@ -652,7 +708,7 @@ mod tests {
     /// reste du corps est reproduit à l'octet près.
     #[test]
     fn mika2839_le_run_entier_devient_une_ligne_de_prose() {
-        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834)
+        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, DEAD_MERGE)
             .expect("le corps canonique doit être réécrit");
         assert_eq!(out, CANONICAL_REWRITTEN);
     }
@@ -663,8 +719,8 @@ mod tests {
     #[test]
     fn mika2839_un_second_passage_rend_none_sans_marqueur() {
         let once =
-            rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834).expect("1er passage");
-        assert!(rewrite_callout_as_prior_plan(&once, DEAD_BRANCH, 2834).is_none());
+            rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, DEAD_MERGE).expect("1er passage");
+        assert!(rewrite_callout_as_prior_plan(&once, DEAD_BRANCH, DEAD_MERGE).is_none());
     }
 
     /// AC3 — un corps dont le seul callout vit dans un bloc clôturé n'est pas
@@ -672,14 +728,15 @@ mod tests {
     #[test]
     fn mika2839_un_callout_cite_dans_une_fence_nest_pas_reecrit() {
         let body = "prose\n```\n> - **Plan:** `docs/plans/x-plan.md`\n```\nfin\n";
-        assert!(rewrite_callout_as_prior_plan(body, DEAD_BRANCH, 2834).is_none());
+        assert!(rewrite_callout_as_prior_plan(body, DEAD_BRANCH, DEAD_MERGE).is_none());
     }
 
     /// Un corps sans aucune ligne de callout rend `None`.
     #[test]
     fn mika2839_sans_callout_rien_nest_reecrit() {
         assert!(
-            rewrite_callout_as_prior_plan("## Titre\n\ndu texte.\n", DEAD_BRANCH, 2834).is_none()
+            rewrite_callout_as_prior_plan("## Titre\n\ndu texte.\n", DEAD_BRANCH, DEAD_MERGE)
+                .is_none()
         );
     }
 
@@ -696,7 +753,7 @@ mod tests {
             "\n",
             "suite\n",
         );
-        let out = rewrite_callout_as_prior_plan(body, DEAD_BRANCH, 2834).expect("réécrit");
+        let out = rewrite_callout_as_prior_plan(body, DEAD_BRANCH, DEAD_MERGE).expect("réécrit");
         assert_eq!(
             out.lines().filter(|l| l.starts_with("> - ")).count(),
             0,
@@ -723,7 +780,8 @@ mod tests {
     /// ici, avec la chute du strict qui tarit la sonde.
     #[test]
     fn mika2839_la_sortie_tarit_le_lecteur_strict_et_garde_le_lache() {
-        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834).expect("réécrit");
+        let out =
+            rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, DEAD_MERGE).expect("réécrit");
         assert!(
             plan_callout(&out, FenceHandling::Strip).is_none(),
             "le lecteur strict ne doit plus rien voir — c'est ce qui fait tomber \
@@ -739,6 +797,68 @@ mod tests {
         );
     }
 
+    // ───────── La prose nomme sa cause (mika#3001) ─────────
+
+    /// La cause du second chemin : le merge d'une PR a mis le plan sur `main`,
+    /// la branche a été repoussée depuis.
+    ///
+    /// Le numéro est celui du merge **mesuré** du 2026-10-31 à 16:24:32Z, qui a
+    /// laissé le callout du vol 2d de mika#2958 en place douze minutes avant un
+    /// repush de la même branche.
+    const REUSED_MERGE: PriorPlanCause = PriorPlanCause::PlanMergedBranchReused { pr: 2992 };
+
+    /// La sortie du second chemin, figée à l'octet.
+    ///
+    /// Le corps d'entrée reste [`CANONICAL`] : ce test fige la **composition** de
+    /// la prose, pas l'appariement plan ↔ PR, qui se mesure sur la charge figée
+    /// d'`auto_pull`.
+    const CANONICAL_REWRITTEN_REUSED: &str = concat!(
+        "> Plan antérieur : `docs/plans/2026-10-19-006-fix-2108-orienter-le-pilote-avant-le-corps-du-ticket-plan.md` — ce plan a été mergé par #2992 dans `main` ; la branche `chore/2108/orienter-le-pilote-avant-le-corps` a été repoussée depuis et porte un autre vol. Callout réécrit par la porte d'auto-pull (mika#3001).\n",
+        "\n",
+        "## Le résidu\n",
+        "\n",
+        "Un paragraphe, avec un `backtick` et une > citation.\n",
+    );
+
+    /// La prose du second chemin ne dit pas que la branche a été supprimée —
+    /// parce qu'elle ne l'est pas, et c'est tout le sujet de mika#3001.
+    ///
+    /// Le run entier est remplacé comme sur le premier chemin : laisser la ligne
+    /// `Branch` ferait repayer la mesure à chaque pull.
+    #[test]
+    fn mika3001_la_prose_du_chemin_b_nomme_le_merge_et_pas_une_suppression() {
+        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, REUSED_MERGE)
+            .expect("le corps canonique doit être réécrit");
+        assert_eq!(out, CANONICAL_REWRITTEN_REUSED);
+        assert!(
+            !out.contains("supprimée par le merge"),
+            "sur ce chemin la branche vit toujours : {out}"
+        );
+        assert!(
+            !out.contains("> - **Branch:**"),
+            "le run entier est remplacé, ligne `Branch` comprise : {out}"
+        );
+    }
+
+    /// La prose du premier chemin est **inchangée** quand l'autre cause existe.
+    ///
+    /// Les deux sorties diffèrent, et aucune ne porte la phrase de l'autre : une
+    /// cause dont la prose se serait alignée sur sa voisine mentirait sur la
+    /// moitié de la population.
+    #[test]
+    fn mika3001_les_deux_causes_ecrivent_deux_prose_distinctes() {
+        let a =
+            rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, DEAD_MERGE).expect("chemin A");
+        let b =
+            rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, REUSED_MERGE).expect("chemin B");
+        assert_eq!(a, CANONICAL_REWRITTEN, "la prose historique ne bouge pas");
+        assert_ne!(a, b);
+        assert_eq!(DEAD_MERGE.slug(), "branch_deleted_by_merge");
+        assert_eq!(REUSED_MERGE.slug(), "plan_merged_branch_reused");
+        assert_eq!(DEAD_MERGE.merged_pr(), 2834);
+        assert_eq!(REUSED_MERGE.merged_pr(), 2992);
+    }
+
     // ───────── Lecture à trois états du plan (mika#2952) ─────────
 
     /// **C'est le test qui tient le contrat d'orthographe.**
@@ -747,6 +867,10 @@ mod tests {
     /// [`PRIOR_PLAN_PREFIX`] sans l'épeler, donc changer la prose de la porte
     /// d'auto-pull sans changer la constante est impossible à merger : c'est ce
     /// qui remplace la phrase « zéro lecteur » que le doc-comment portait.
+    ///
+    /// Étendu par mika#3001 aux **deux** causes, sur la même boucle plutôt que
+    /// par un second test : c'est le contrat d'orthographe qui s'étend, pas une
+    /// seconde propriété qui apparaît.
     #[test]
     fn mika2952_la_ligne_ecrite_par_la_porte_est_relue_par_le_lecteur() {
         assert_eq!(
@@ -754,13 +878,15 @@ mod tests {
             PlanReading::Live,
             "le corps canonique porte un callout strict"
         );
-        let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, 2834)
-            .expect("le corps canonique doit être réécrit");
-        assert_eq!(
-            plan_reading(&out),
-            PlanReading::PriorOnly,
-            "la ligne que la porte vient d'écrire doit être relue : {out}"
-        );
+        for cause in [DEAD_MERGE, REUSED_MERGE] {
+            let out = rewrite_callout_as_prior_plan(CANONICAL, DEAD_BRANCH, cause)
+                .expect("le corps canonique doit être réécrit");
+            assert_eq!(
+                plan_reading(&out),
+                PlanReading::PriorOnly,
+                "la ligne que la porte vient d'écrire pour {cause:?} doit être relue : {out}"
+            );
+        }
     }
 
     /// AC3-b au niveau de la grammaire : un découpage en N vols dont le vol 1
