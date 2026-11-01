@@ -82,6 +82,20 @@ pub struct EvalHarness {
     /// threads it into `AgentParams.stream_ctx` so `process_tool_calls`
     /// emits `ToolCallStart` / `ToolCallResult` frames on tool dispatch.
     pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    /// Le texte de l'événement webhook d'AVANT les handlers de `server/`
+    /// (mika#3004). `None` tant que `.webhook_event_text()` n'a pas été appelé,
+    /// donc tout scénario pré-existant est octet pour octet identique.
+    ///
+    /// Un champ du harnais et non un quatrième point d'entrée, pour la raison
+    /// qu'`user_images` a déjà écrite : les trois sites de `run` doivent
+    /// s'accorder sur ce qu'un tour porte, et un quatrième est un quatrième
+    /// endroit où l'oublier.
+    ///
+    /// C'est ce champ qui rend la fixture mika#3004 possible du tout : elle doit
+    /// porter **deux** textes à la fois — l'événement brut que le gateway a
+    /// émis, et le pré-digest de `verdict_handler` que le modèle reçoit — parce
+    /// que c'est leur divergence qui est le défaut.
+    pub webhook_event_text: Option<String>,
 }
 
 impl EvalHarness {
@@ -142,6 +156,7 @@ impl EvalHarness {
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
             stream_ctx: self.stream_ctx.clone(),
+            webhook_event_text: self.webhook_event_text.as_deref(), // mika#3004
         };
 
         let output = run_agent(&params).await?;
@@ -202,6 +217,7 @@ impl EvalHarness {
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
             stream_ctx: self.stream_ctx.clone(),
+            webhook_event_text: self.webhook_event_text.as_deref(), // mika#3004
         };
 
         let output = run_agent_with_deadline(&params, deadline).await?;
@@ -271,6 +287,7 @@ impl EvalHarness {
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
             stream_ctx: self.stream_ctx.clone(),
+            webhook_event_text: self.webhook_event_text.as_deref(), // mika#3004
         };
 
         let output = run_agent(&params).await?;
@@ -307,6 +324,7 @@ pub struct EvalHarnessBuilder {
     session_isolated: bool,
     pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    webhook_event_text: Option<String>,
 }
 
 impl Default for EvalHarnessBuilder {
@@ -338,6 +356,7 @@ impl Default for EvalHarnessBuilder {
             session_isolated: false,
             pr_reviews_posted: None,
             stream_ctx: None,
+            webhook_event_text: None,
         }
     }
 }
@@ -526,6 +545,19 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Déclare le texte de l'événement webhook d'AVANT les handlers de `server/`
+    /// pour tous les tours de ce harnais (mika#3004). Défaut : `None`.
+    ///
+    /// À régler **en plus** du message du tour, pas à la place : un scénario de
+    /// tour webhook post-handler en porte deux, et c'est leur divergence qui est
+    /// le sujet. Les régler à la même valeur reproduit un tour qu'aucun handler
+    /// n'a réécrit — ce qui est le cas du label `ready`, et donc exactement la
+    /// forme du contrôle négatif.
+    pub fn webhook_event_text(mut self, text: impl Into<String>) -> Self {
+        self.webhook_event_text = Some(text.into());
+        self
+    }
+
     /// Attach user images to every turn this harness runs (mika#1784).
     ///
     /// Pair with `MockLlmProviderBuilder::supports_vision(false)` to exercise the
@@ -667,6 +699,7 @@ impl EvalHarnessBuilder {
             session_isolated: self.session_isolated,
             pr_reviews_posted: self.pr_reviews_posted,
             stream_ctx: self.stream_ctx,
+            webhook_event_text: self.webhook_event_text,
         })
     }
 }

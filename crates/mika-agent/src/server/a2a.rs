@@ -353,6 +353,11 @@ async fn run_a2a_agent(
         internal: false,
         pr_reviews_posted: Some(&state.pr_reviews_posted),
         stream_ctx,
+        // mika#3004 — un appel A2A n'est pas un webhook : aucun handler de
+        // `server/` n'a réécrit son texte, donc il n'existe pas de texte d'avant
+        // qui diffère de `message`. Le jugement de classe de tour retombe sur le
+        // message, ce qu'il a toujours fait ici.
+        webhook_event_text: None,
     };
 
     match agent::run_agent(&params).await {

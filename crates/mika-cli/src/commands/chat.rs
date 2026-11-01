@@ -372,6 +372,10 @@ async fn spawn_agent_worker(
                         correlated_task_id: None,
                         internal: false,
                         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
+                        // mika#3004: a CLI chat turn is not born of a webhook, so
+                        // there is no pre-handler event text distinct from the turn
+                        // message; `ProprietesDuTour::depuis` falls back to it.
+                        webhook_event_text: None,
                         stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
                     })
                     .await;
@@ -493,6 +497,9 @@ async fn spawn_agent_worker(
                         correlated_task_id: None,
                         internal: false,
                         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
+                        // mika#3004: see the sibling construction above — a callback
+                        // turn on the CLI path has no pre-handler webhook text either.
+                        webhook_event_text: None,
                         stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
                     })
                     .await;

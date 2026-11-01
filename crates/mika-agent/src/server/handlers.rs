@@ -2134,6 +2134,18 @@ pub(super) async fn run_agent_for_message(
         internal: false,
         pr_reviews_posted: Some(&state.pr_reviews_posted),
         stream_ctx: None,
+        // mika#3004 — **le seul site qui renseigne ce champ**, parce que c'est le
+        // seul qui tient le texte d'avant les handlers. `original_github_text`
+        // est le même binding que le pré-filtre mika#2680 lit vingt lignes plus
+        // haut, et pour la même raison : *« le registre lit `original` — le texte
+        // d'AVANT les handlers — jamais `req.text` »*. Entre sa capture et ici,
+        // `req.text` a pu être entièrement remplacé par un pré-digest de
+        // `verdict_handler`.
+        //
+        // `None` hors du chemin GitHub : le binding est
+        // `(req.channel == "github").then(…)`, donc un tour Telegram n'en porte
+        // aucun — et n'en a pas besoin, `req.text` y étant le texte du tour.
+        webhook_event_text: original_github_text.as_deref(),
     };
 
     // mika#2276 M2 + mika#2289 — le filet. Si le tour n'a pas CONCLU — coupé par

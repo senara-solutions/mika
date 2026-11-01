@@ -259,6 +259,11 @@ mod eval {
     // laisse passer) et les deux abstentions nommées.
     mod test_dependabot_build_evidence_2565;
 
+    // mika#3004 — un tour `pr_review` n'exige plus l'outil de groom : la trace
+    // `3b771914` rejouée, le contrôle de la cause B (`webhook_event_text`
+    // absent) et le contrôle négatif du label `ready` sans PR.
+    mod test_pr_review_no_groom_requirement_3004;
+
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.
     mod test_qa_review_reconcile_2334;
