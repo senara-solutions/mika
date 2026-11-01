@@ -202,10 +202,6 @@ impl Reporter {
         auth_notes: &[AuthBoundaryNote],
         grooms: Option<&GroomTriggerOutcome>,
     ) -> String {
-        // Pas encore consulté : cette étape porte la délégation seule, pour que
-        // les 57 tests de ce fichier prouvent R2 **sans amendement**. L'étape
-        // suivante le lit.
-        let _ = grooms;
         let mut out = String::new();
         // Header.
         let _ = writeln!(
@@ -487,18 +483,21 @@ impl Reporter {
         // dire « rien à grommer d'avance » : une section vide inviterait à
         // chercher une cause là où il n'y a rien.
         //
-        // « mode ombre — aucun groom déclenché » est dans le TITRE, pas en note
-        // de bas de page : une liste de tickets « à grommer » se lit comme un
+        // Ce que le cycle a fait de la relève est dans le TITRE, pas en note de
+        // bas de page : une liste de tickets « à grommer » se lit comme un
         // geste fait si rien ne dit le contraire à l'instant où l'œil tombe
-        // dessus. Au vol 1, aucun interrupteur n'existe — la mention n'est pas
-        // une précaution, c'est le fait.
+        // dessus. Au vol 1 le titre ne pouvait dire qu'une chose — aucun
+        // interrupteur n'existait, et « mode ombre » était le fait. Depuis le
+        // vol 2e il a quatre formes, et c'est [`groom_title_segment`] qui
+        // arbitre (D4).
         if let Some(relief) = &assessment.relief
             && !relief.next.is_empty()
         {
             writeln!(out).unwrap();
             writeln!(
                 out,
-                "### Relève à grommer (mode ombre — aucun groom déclenché)"
+                "### Relève à grommer ({})",
+                groom_title_segment(grooms)
             )
             .unwrap();
             // Le suffixe passe par `candidate_suffix` : priorité par son **nom
@@ -508,19 +507,31 @@ impl Reporter {
             //
             // Le motif est celui du bassin, par `RefusalReason::label()` : un
             // libellé réécrit ici serait une seconde orthographe du même fait.
+            //
+            // L'annotation de fin de ligne dit ce que le cycle a fait de **ce**
+            // candidat (D5). Elle est vide quand le geste n'a pas été mesuré ou
+            // qu'un refus de cycle l'a arrêté : la ligne est alors celle du
+            // vol 1, au caractère près.
             for t in &relief.next {
                 let _ = writeln!(
                     out,
-                    "- #{}{} — à grommer : {}",
+                    "- #{}{} — à grommer : {}{}",
                     t.number,
                     candidate_suffix(state, t.number, t.origin),
                     t.motive.label(),
+                    groom_annotation(grooms, t.number),
                 );
             }
             // Le reste se **compte**, il ne s'énumère pas : au-delà de quatre,
             // l'opérateur ne lit plus une consigne mais un inventaire. Taire ce
             // compte ferait lire les quatre nommés comme la totalité de ce qui
             // attend.
+            //
+            // Cette ligne n'est **jamais** annotée, et ce n'est pas un oubli :
+            // `relief_candidates` ne porte que `relief.next` (`cadence.rs`), de
+            // sorte que le cycle n'a rien fait de ce reste — ni déclenché, ni
+            // sauté, ni même atteint. Une annotation y serait une réponse
+            // inventée (mika#2331).
             if relief.beyond > 0 {
                 let pluriel = if relief.beyond == 1 { "" } else { "s" };
                 let _ = writeln!(
@@ -555,6 +566,84 @@ fn band_label(band: &PoolBand) -> &'static str {
         PoolBand::Nominal => "nominal",
         PoolBand::Saturated => "saturé",
     }
+}
+
+/// Le segment entre parenthèses du titre « Relève à grommer » — quatre formes
+/// (mika#2958 vol 2e, D4).
+///
+/// | état de `grooms` | segment |
+/// |---|---|
+/// | `None`, ou `refus_de_cycle == Some("disarmed")` | `OMBRE`, le titre du vol 1 |
+/// | `refus_de_cycle == Some(r)`, `r != "disarmed"` | `aucun groom déclenché — <r>` |
+/// | `refus_de_cycle == None`, `n` déclenchés, `n > 0` | `<n> groom<pluriel> déclenché<pluriel>` |
+/// | `refus_de_cycle == None`, `n == 0` | `aucun groom déclenché` |
+///
+/// Les deux premières lignes du tableau rendent la **même** chaîne, et c'est
+/// l'AC, pas une confusion : avec l'interrupteur OFF, la section est inchangée
+/// (R3), et un appelant sans mesure rend exactement le vol 1 (R2).
+///
+/// La deuxième ligne est R6 : un interrupteur ouvert dont le geste n'a pas eu
+/// lieu ne lit **pas** « mode ombre » — il nomme sa cause. Le motif est le
+/// jeton de sonde nu, jamais une traduction française : une table de
+/// traduction serait une seconde orthographe du même fait (mika#2201), et
+/// c'est l'arbitrage déjà rendu au vol 2a pour `GroomSendError::classe()`.
+///
+/// Le pluriel est dérivé, pas supposé : le rendu ne lit pas
+/// `GROOMS_PER_CYCLE`, de sorte qu'une borne portée à deux n'imprime pas
+/// « 2 groom déclenché ».
+fn groom_title_segment(grooms: Option<&GroomTriggerOutcome>) -> String {
+    // Site **unique** du littéral du vol 1 dans la production de ce fichier :
+    // deux orthographes du mode ombre dériveraient le jour où l'une change, et
+    // c'est précisément la chaîne que R3 épingle au caractère près.
+    const OMBRE: &str = "mode ombre — aucun groom déclenché";
+    let Some(grooms) = grooms else {
+        return OMBRE.to_string();
+    };
+    match grooms.refus_de_cycle {
+        Some("disarmed") => OMBRE.to_string(),
+        Some(refus) => format!("aucun groom déclenché — {refus}"),
+        None => {
+            let n = grooms.declenches.len();
+            if n == 0 {
+                "aucun groom déclenché".to_string()
+            } else {
+                let pluriel = if n == 1 { "" } else { "s" };
+                format!("{n} groom{pluriel} déclenché{pluriel}")
+            }
+        }
+    }
+}
+
+/// Ce que le cycle a fait de **ce** candidat — le suffixe de sa ligne
+/// (mika#2958 vol 2e, D5).
+///
+/// Trois formes, consultées dans cet ordre : ` — groom déclenché`,
+/// ` — sauté : <motif>`, ` — non atteint`. Et une quatrième, qui est l'absence
+/// de suffixe : quand `grooms` est `None` ou qu'un refus a arrêté le cycle
+/// entier, la ligne est celle du vol 1 au caractère près — le titre porte déjà
+/// la réponse, et la répéter sur chaque ligne dirait deux fois le même fait.
+///
+/// # Pourquoi « non atteint » existe
+///
+/// `declenches ∪ sautes` n'est **pas** `relief.next`. Sur `Err(AgentBusy)`,
+/// `envoyer` sort de la boucle (`groom_trigger.rs`) : le créneau du moteur est
+/// pris, le suivant échouerait identiquement, et les candidats restants ne sont
+/// ni déclenchés ni sautés. Les rendre « sautés » leur inventerait un motif ;
+/// les taire les ferait lire comme déclenchés (mika#2331).
+fn groom_annotation(grooms: Option<&GroomTriggerOutcome>, number: u64) -> String {
+    let Some(grooms) = grooms else {
+        return String::new();
+    };
+    if grooms.refus_de_cycle.is_some() {
+        return String::new();
+    }
+    if grooms.declenches.contains(&number) {
+        return " — groom déclenché".to_string();
+    }
+    if let Some((_, motif)) = grooms.sautes.iter().find(|(n, _)| *n == number) {
+        return format!(" — sauté : {motif}");
+    }
+    " — non atteint".to_string()
 }
 
 /// ` (p1-important, hors milestone)` — la priorité et la provenance d'un
@@ -2793,6 +2882,258 @@ mod tests {
                 "{muet:?} ne justifie aucune ligne de troncature :\n{section}"
             );
         }
+    }
+
+    // -- mika#2958 vol 2e : la moitié ON d'AC4 --------------------------------
+
+    /// Le même rapport que [`report_with_pool_and_relief`], plus ce que le
+    /// cycle a fait de la relève.
+    ///
+    /// Le bassin et la relève restent posés par la production ; seul l'outcome
+    /// est un littéral, et il doit l'être : c'est l'entrée du rendu, le fait
+    /// que le cycle mesure et que ce fichier ne sait pas produire.
+    fn report_with_grooms_mesures(
+        state: &MilestoneState,
+        grooms: Option<&GroomTriggerOutcome>,
+    ) -> String {
+        let cands = milestone_cands(state);
+        let verdict =
+            assess_pool_sans_tailles(&state.ready_pool, &cands, &state.outside_candidates);
+        let relief = name_relief(&verdict, &cands, &state.outside_candidates);
+        let mut a = empty_assessment();
+        a.pool = Some(verdict);
+        a.relief = Some(relief);
+        Reporter::new().report_with_grooms(state, &a, &[], grooms)
+    }
+
+    /// Un état à cinq candidats sans plan groomé : quatre nommés (`2740`,
+    /// `2731`, `2726`, `2744`, dans l'ordre du bassin) et un compté (`2750`).
+    ///
+    /// Le même semis que le cas 12 du vol 1, parce que c'est lui qui donne
+    /// assez de lignes pour que les **trois** annotations par candidat
+    /// coexistent dans un seul rendu.
+    fn etat_a_quatre_nommes() -> MilestoneState {
+        let subs = vec![
+            {
+                let mut c = base_issue(2731);
+                c.priority_rank = Some(1);
+                c.labels = vec!["p1-important".into()];
+                c
+            },
+            base_issue(2726),
+            base_issue(2744),
+        ];
+        let mut state = state_with(subs, ProgressCounts::default());
+        state.outside_candidates = vec![
+            PoolCandidate {
+                missing_grooming_signals: None,
+                number: 2740,
+                state: IssueState::Open,
+                priority_rank: Some(0),
+                plan_present: false,
+                plan_reading: None,
+                dormancy: None,
+                labels: vec!["p0-critical".into()],
+            },
+            PoolCandidate {
+                missing_grooming_signals: None,
+                number: 2750,
+                state: IssueState::Open,
+                priority_rank: None,
+                plan_present: false,
+                plan_reading: None,
+                dormancy: None,
+                labels: vec![],
+            },
+        ];
+        state
+    }
+
+    /// **R3 et R2 — l'interrupteur OFF ne change pas un caractère.**
+    ///
+    /// Les deux comparaisons sont sur le rapport **entier**, pas sur une
+    /// sous-chaîne : un `contains` resterait vert si le vol ajoutait une ligne
+    /// ailleurs dans la section. Et le `None` est la seconde moitié — trois
+    /// appelants n'ont pas de cycle derrière eux (`Reporter::report`,
+    /// `reader.rs`, le test de vols terminés) et doivent rendre le vol 1.
+    ///
+    /// `None` et `Some(outcome dont le refus est `disarmed`)` rendent la
+    /// **même** chaîne. C'est l'AC, pas une confusion : avec l'interrupteur
+    /// fermé, la section est inchangée.
+    #[test]
+    fn mika2958_off_la_section_de_la_releve_est_inchangee_au_caractere_pres() {
+        let state = etat_a_quatre_nommes();
+        let vol1 = report_with_pool_and_relief(&state);
+
+        assert_eq!(
+            report_with_grooms_mesures(&state, None),
+            vol1,
+            "un appelant sans mesure rend exactement le vol 1 (R2)"
+        );
+        assert_eq!(
+            report_with_grooms_mesures(
+                &state,
+                Some(&GroomTriggerOutcome {
+                    refus_de_cycle: Some("disarmed"),
+                    ..Default::default()
+                }),
+            ),
+            vol1,
+            "interrupteur fermé : la section est inchangée (R3)"
+        );
+        assert!(
+            vol1.contains("### Relève à grommer (mode ombre — aucun groom déclenché)"),
+            "contrôle négatif : c'est bien le titre du vol 1 qui est épinglé :\n{vol1}"
+        );
+    }
+
+    /// **R6 — un interrupteur ouvert dont le geste n'a pas eu lieu nomme sa
+    /// cause**, il ne lit pas « mode ombre ».
+    ///
+    /// Les quatre refus de cycle qui ne sont pas `disarmed` sont ceux qu'un
+    /// opérateur peut voir après avoir ouvert l'interrupteur : rail absent,
+    /// relève vide, verdict de relève absent, source de lecture absente. Les
+    /// deux derniers coupent le rendu de la section avant ce titre
+    /// aujourd'hui ; ils sont testés quand même, parce que le rendu ne doit pas
+    /// dépendre de ce qui, au site d'appel, se trouve l'empêcher.
+    ///
+    /// Le motif rendu est le **jeton de sonde nu**. Pas de table de traduction
+    /// française : ce serait une seconde orthographe du même fait (mika#2201),
+    /// et l'arbitrage a déjà été rendu au vol 2a pour `GroomSendError::classe()`.
+    #[test]
+    fn mika2958_un_interrupteur_ouvert_sans_geste_nomme_sa_cause() {
+        let state = etat_a_quatre_nommes();
+        for refus in [
+            "no_sender",
+            "no_relief",
+            "no_relief_verdict",
+            "no_in_flight_source",
+        ] {
+            let out = report_with_grooms_mesures(
+                &state,
+                Some(&GroomTriggerOutcome {
+                    refus_de_cycle: Some(refus),
+                    ..Default::default()
+                }),
+            );
+            assert!(
+                out.contains(&format!(
+                    "### Relève à grommer (aucun groom déclenché — {refus})"
+                )),
+                "le titre nomme la cause pour « {refus} » :\n{out}"
+            );
+            assert!(
+                !out.contains("mode ombre — aucun groom déclenché"),
+                "« {refus} » n'est pas le mode ombre : l'interrupteur est ouvert \
+                 et le geste n'a pas eu lieu :\n{out}"
+            );
+            let section = out
+                .split("### Relève à grommer")
+                .nth(1)
+                .expect("la section de la relève doit être rendue");
+            for muet in [" — groom déclenché", " — sauté : ", " — non atteint"] {
+                assert!(
+                    !section.contains(muet),
+                    "un refus de cycle n'annote aucune ligne — « {muet} » vu :\n{section}"
+                );
+            }
+        }
+    }
+
+    /// **R4 et R5 — le rapport dit quels grooms sont partis, lesquels ont été
+    /// sautés et avec quel motif, et lesquels n'ont pas été atteints.**
+    ///
+    /// Le semis est celui d'`Err(AgentBusy)` : un envoi réussi, un saut sur
+    /// `agent_busy`, et la boucle sort — les deux candidats restants ne sont ni
+    /// déclenchés ni sautés. `declenches ∪ sautes` n'est pas `relief.next`, et
+    /// c'est précisément pourquoi « non atteint » existe : les taire les ferait
+    /// lire comme déclenchés, les dire « sautés » leur inventerait un motif
+    /// (mika#2331, R5).
+    ///
+    /// La ligne du reste compté n'est **jamais** annotée — `relief_candidates`
+    /// ne porte que `relief.next`, donc le cycle n'a rien fait de ce reste.
+    #[test]
+    fn mika2958_chaque_candidat_dit_ce_que_le_cycle_en_a_fait() {
+        let state = etat_a_quatre_nommes();
+        let grooms = GroomTriggerOutcome {
+            declenches: vec![2740],
+            sautes: vec![(2731, "agent_busy")],
+            refus_de_cycle: None,
+        };
+        let out = report_with_grooms_mesures(&state, Some(&grooms));
+        let section = out
+            .split("### Relève à grommer")
+            .nth(1)
+            .expect("la section de la relève doit être rendue");
+
+        for attendu in [
+            "- #2740 (p0-critical, hors milestone) — à grommer : plan groomé absent — groom déclenché",
+            "- #2731 (p1-important) — à grommer : plan groomé absent — sauté : agent_busy",
+            "- #2726 — à grommer : plan groomé absent — non atteint",
+            "- #2744 — à grommer : plan groomé absent — non atteint",
+        ] {
+            assert!(
+                section.contains(attendu),
+                "ligne attendue « {attendu} » dans :\n{section}"
+            );
+        }
+        assert!(
+            section.contains("- 1 autre candidat au-delà des 4 nommés\n"),
+            "le reste compté n'est pas annoté : le cycle n'en a rien fait :\n{section}"
+        );
+        assert!(
+            out.contains("### Relève à grommer (1 groom déclenché)"),
+            "le titre compte les déclenchés, au singulier quand il vaut un :\n{out}"
+        );
+    }
+
+    /// Les quatre formes du segment de titre, **à la chaîne près** (D4).
+    ///
+    /// Le site pur plutôt que le rendu entier, pour la même raison que
+    /// `cycle_refusal` a son test à lui : les quatre formes sont un format
+    /// opérateur, et un rendu complet par forme coûterait quatre fixtures sans
+    /// rien épingler de plus.
+    ///
+    /// La dernière moitié est celle qui compte le plus longtemps : le pluriel
+    /// est **dérivé**, pas supposé. Le rendu ne lit pas `GROOMS_PER_CYCLE`, de
+    /// sorte que le jour où la borne passe à deux, le titre dit « 2 grooms
+    /// déclenchés » sans qu'une ligne de ce fichier change.
+    #[test]
+    fn mika2958_les_quatre_formes_du_segment_de_titre() {
+        let mesure = |refus, n: usize| GroomTriggerOutcome {
+            declenches: (0..n as u64).collect(),
+            sautes: vec![],
+            refus_de_cycle: refus,
+        };
+
+        assert_eq!(
+            groom_title_segment(None),
+            "mode ombre — aucun groom déclenché",
+            "pas de mesure ⇒ le titre du vol 1"
+        );
+        assert_eq!(
+            groom_title_segment(Some(&mesure(Some("disarmed"), 0))),
+            "mode ombre — aucun groom déclenché",
+            "interrupteur fermé ⇒ le titre du vol 1, au caractère près"
+        );
+        assert_eq!(
+            groom_title_segment(Some(&mesure(Some("no_sender"), 0))),
+            "aucun groom déclenché — no_sender",
+        );
+        assert_eq!(
+            groom_title_segment(Some(&mesure(None, 0))),
+            "aucun groom déclenché",
+            "la boucle a tourné et rien n'est parti : ce n'est pas le mode ombre"
+        );
+        assert_eq!(
+            groom_title_segment(Some(&mesure(None, 1))),
+            "1 groom déclenché"
+        );
+        assert_eq!(
+            groom_title_segment(Some(&mesure(None, 2))),
+            "2 grooms déclenchés",
+            "le pluriel est dérivé du compte, jamais de `GROOMS_PER_CYCLE`"
+        );
     }
 
     // -- mika#2923 : le rapport nomme le refus de porte -----------------------
