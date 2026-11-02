@@ -82,8 +82,12 @@
 # reading forms.
 second-pass	A	crates/mika-agent/src/grooming_marker.rs::LATER_PASS_RE	ci+fr:seconde passe,deuxième passe,deuxieme passe
 first-pass	A	crates/mika-agent/src/grooming_marker.rs::FIRST_PASS_READY_RE	ci+fr:première passe,premiere passe
-Disposition:	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition_fuzzy	paraphrase
-Verdict:	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict_fuzzy	paraphrase
+# mika#2194 vol 5 — les deux lignes `_parse_disposition_fuzzy` et
+# `_parse_verdict_fuzzy` sont parties d'ici parce que les deux FONCTIONS sont
+# parties de `dispatch-lib.sh`. Déclarées temporaires au vol 3 (seconde copie de
+# la table du tier 2, le temps que le corpus doré prouve la parité), elles
+# tiennent la promesse. Le lecteur du tier 2 est `arch_paraphrase::paraphrase`,
+# déclaré plus bas, et il est désormais seul.
 rescue-pipeline-verified	A	crates/mika-agent/src/wip_rescue.rs::pipeline_verified	ci+space — the VALUE only; the KEY is class B below
 Closes #N	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
 Tracked in:	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
@@ -175,21 +179,30 @@ FAILED	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_GUARD_FAILED_TOKEN	c
 # the two prompts are the PRODUCER side, as everywhere.
 NEGATIVE-TEST	A	crates/mika-agent/src/evidence/guards.rs::NEGATIVE_TEST_LINE_PREFIX	ci+emphasis:line-anchored
 
-# `_parse_disposition` and `_parse_verdict` ARE produced by the survey — their
-# first tier is a strict `grep -oE` — and they are class A anyway. That is a
-# rectification of the mika#2201 plan, which listed those two literals as class
-# B (§ M1, rows "dispatch-lib.sh:5168,5267" and "5177,5250"). Read at the
-# granularity this file designates — the function — both END on a `Tier 2
-# fallback` calling `_parse_*_fuzzy`, so a reworded disposition IS read.
-# Classing the strict tier B would describe a fast path and call it the reader.
-ESCALATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-GROOMED	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-ITERATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-ESCALATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
-GROOMED	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
-ITERATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
-READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
+# mika#2194 vol 5 — CES HUIT LIGNES SONT PARTIES, et c'est le livrable.
+#
+# Elles déclaraient `_parse_disposition` et `_parse_verdict` comme sites de match
+# de classe A, avec la note suivante, conservée ici comme constat parce qu'elle
+# explique pourquoi la classe était A et non B :
+#
+#   « `_parse_disposition` and `_parse_verdict` ARE produced by the survey —
+#   their first tier is a strict `grep -oE` — and they are class A anyway. That
+#   is a rectification of the mika#2201 plan, which listed those two literals as
+#   class B (§ M1, rows "dispatch-lib.sh:5168,5267" and "5177,5250"). Read at
+#   the granularity this file designates — the function — both END on a `Tier 2
+#   fallback` calling `_parse_*_fuzzy`, so a reworded disposition IS read. »
+#
+# Ce qui a changé : les deux fonctions ne LISENT plus rien. Elles écrivent la
+# réponse de l'architecte dans un fichier et appellent `mika arch-disposition`.
+# Un site qui délègue n'est pas un site de match, et le garder ici ferait
+# compter deux lecteurs de plus à l'inventaire que l'arbre n'en porte — l'erreur
+# exacte que ce fichier existe pour empêcher, dans l'autre sens.
+#
+# L'inventaire des quatre jetons redescend donc aux deux ports Rust ci-dessous :
+# `arch_paraphrase.rs::paraphrase` (le tier 2, vol 3) et
+# `arch_disposition.rs::decide` (les cinq tiers, vol 4). Les lignes de
+# `_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` sont parties avec elles,
+# en haut de ce fichier : ces deux fonctions n'existent plus du tout.
 
 # mika#2194 vol 3 — le lecteur Rust du tier 2, DÉCLARÉ AVANT D'AVOIR UN
 # APPELANT. C'est volontaire et c'est la moitié « tests dorés » de la méthode
@@ -605,6 +618,17 @@ CACHEDIR	B	crates/mika-agent/src/worktree_reaper.rs::CACHEDIR_TAG_MARKER	exact:l
 # aurait caché un lecteur réel derrière un nom.
 REFUSED	B	crates/mika-cli/src/commands/plan_callout.rs::REFUSAL_PREFIX	exact:prefix
 REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_plan_callout_refusal	exact:prefix
+
+# mika#2194 vol 5 — LES MÊMES DEUX SITES, pour le lecteur de disposition.
+#
+# `arch-disposition` reprend le canal à trois codes du lecteur de callout, donc
+# il reprend aussi ses deux sites de match, pour les deux mêmes raisons : une
+# constante en `*_PREFIX`, et une garde d'idempotence qui RELIT le préfixe déjà
+# présent dans `$RESULT`. Le motif est `REFUSED (arch-disposition, mika#2194)`
+# et il est distinct de celui du callout — deux refus nommés, deux causes, et un
+# `RESULT` qui peut les porter tous les deux.
+REFUSED	B	crates/mika-cli/src/commands/arch_disposition.rs::REFUSAL_PREFIX	exact:prefix
+REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_arch_disposition_refusal	exact:prefix
 
 # ── mika#2627 — le préfixe du refus doctrinal côté outils.
 #

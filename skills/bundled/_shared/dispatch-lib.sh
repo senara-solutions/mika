@@ -3370,6 +3370,12 @@ _dispatch_lib_exit_trap() {
     _unstage_pilot_egress_push_scope || true
     # Cleanup fuzzy-match side-channel tmpfile (mika#1272)
     rm -f "${_DISPOSITION_FUZZY_FILE:-}" 2>/dev/null
+    # Cleanup arch-disposition refusal side-channel tmpfile (mika#2194, vol 5).
+    # Nettoyé APRÈS que `_deliver_callback` a annexé le motif sur le chemin
+    # nominal — ce trap tourne après lui — et avant le callback que ce trap
+    # délivre lui-même. Le résidu d'un `$$` recyclé annoncerait un refus qui
+    # n'a pas eu lieu : le retrait est une condition de justesse.
+    rm -f "${_ARCH_DISPOSITION_REFUSAL_FILE:-}" 2>/dev/null
     # Cleanup architect-stderr side-channel tmpfile (mika#2278)
     rm -f "${_ARCH_ASK_STDERR_FILE:-}" 2>/dev/null
     # Guard: skip if already delivered or no task ID
@@ -9787,99 +9793,30 @@ _arch_ask_with_retry() {
 _DISPOSITION_FUZZY=0
 _DISPOSITION_FUZZY_FILE="${TMPDIR:-/tmp}/.dispatch-lib-fuzzy-$$"
 
+# Second canal de franchissement de sous-shell, de la même nature et pour la
+# même raison (mika#2194, vol 5). L'enveloppe de `_parse_disposition` /
+# `_parse_verdict` **est** le sous-shell : les trois appelants de production
+# capturent en `$(...)`, donc une globale qu'elle poserait mourrait avec elle.
+# Le refus d'un code `≥2` (« je n'ai pas pu regarder ») emprunte donc le canal
+# du booléen fuzzy — un fichier porté par `$$`, lu depuis le shell principal par
+# `_annex_arch_disposition_refusal` au moment du callback.
+#
+# Le nettoyage n'est pas de l'hygiène, c'est une condition de justesse : un
+# résidu lu par un `$$` recyclé annoncerait un refus qui n'a pas eu lieu. Il
+# entre donc dans le trap `EXIT` de `_dispatch_lib_exit_trap`, à côté de son
+# jumeau. La phase 4 retirera les deux ensemble.
+_ARCH_DISPOSITION_REFUSAL_FILE="${TMPDIR:-/tmp}/.dispatch-lib-arch-refusal-$$"
+# Vidé AU CHARGEMENT aussi, pas seulement par le trap : un processus tué sans
+# trap (SIGKILL, OOM) laisse son fichier, et le `$$` recyclé d'un dispatch
+# ultérieur l'annexerait comme son propre refus. La bibliothèque est sourcée une
+# fois par handler, en tête : ce `rm` ne peut effacer que le résidu d'un autre
+# processus, jamais un refus du dispatch en cours.
+rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null || true
+
 _disposition_was_fuzzy() {
     # Returns 0 (true) if the last _parse_disposition/_parse_verdict call used
     # tier-2 fuzzy matching; 1 (false) otherwise. Reads the tmpfile side-channel.
     [ -f "$_DISPOSITION_FUZZY_FILE" ] && [ "$(cat "$_DISPOSITION_FUZZY_FILE" 2>/dev/null)" = "1" ]
-}
-
-_parse_disposition_fuzzy() {
-    # Tier 2 — fuzzy disposition parser (mika#1272). Reads architect response
-    # text from stdin, applies case-insensitive pattern matching against known
-    # paraphrase indicators, and emits the canonical disposition on stdout.
-    #
-    # Priority: ESCALATE > ITERATE > READY (most conservative wins).
-    # Emits nothing if no pattern matches. Logs matched snippet to stderr.
-    local text
-    text=$(cat)
-
-    local matched_escalate="" matched_iterate="" matched_ready=""
-    local snippet=""
-
-    # ESCALATE patterns
-    for pat in "escalate" "human review" "cannot proceed" "fundamental" "out of scope for"; do
-        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
-            matched_escalate="$snippet"
-            break
-        fi
-    done
-
-    # ITERATE patterns
-    for pat in "needs revision" "another pass" "revise" "address the following" "concerns that require"; do
-        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
-            matched_iterate="$snippet"
-            break
-        fi
-    done
-
-    # READY patterns (affirmative forward-motion signals only — no negated-absence)
-    for pat in "proceed" "ship it" "dispatch" "good to go" "plan is clean"; do
-        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
-            matched_ready="$snippet"
-            break
-        fi
-    done
-
-    # Disambiguation: ESCALATE > ITERATE > READY
-    if [ -n "$matched_escalate" ]; then
-        echo "_parse_disposition_fuzzy: mapped paraphrased disposition → ESCALATE (matched: '$matched_escalate')" >&2
-        echo "ESCALATE"
-    elif [ -n "$matched_iterate" ]; then
-        echo "_parse_disposition_fuzzy: mapped paraphrased disposition → ITERATE (matched: '$matched_iterate')" >&2
-        echo "ITERATE"
-    elif [ -n "$matched_ready" ]; then
-        echo "_parse_disposition_fuzzy: mapped paraphrased disposition → READY (matched: '$matched_ready')" >&2
-        echo "READY"
-    fi
-    # No match → emit nothing (caller's * case fires)
-}
-
-_parse_verdict_fuzzy() {
-    # Tier 2 — fuzzy verdict parser (mika#1272). Same pattern as
-    # _parse_disposition_fuzzy but for second-pass verdicts (GROOMED vs ESCALATE).
-    #
-    # Priority: ESCALATE > GROOMED (conservative).
-    local text
-    text=$(cat)
-
-    local matched_escalate="" matched_groomed=""
-    local snippet=""
-
-    # ESCALATE patterns
-    for pat in "escalate" "cannot approve" "human review needed" "fundamental issues remain"; do
-        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
-            matched_escalate="$snippet"
-            break
-        fi
-    done
-
-    # GROOMED patterns (use "ship it" not bare "ship" — avoids substring
-    # false positives in "relationship", "ownership", "leadership", etc.)
-    for pat in "groomed" "approved" "plan is ready" "ship it" "no remaining concerns"; do
-        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
-            matched_groomed="$snippet"
-            break
-        fi
-    done
-
-    # Disambiguation: ESCALATE > GROOMED
-    if [ -n "$matched_escalate" ]; then
-        echo "_parse_verdict_fuzzy: mapped paraphrased verdict → ESCALATE (matched: '$matched_escalate')" >&2
-        echo "ESCALATE"
-    elif [ -n "$matched_groomed" ]; then
-        echo "_parse_verdict_fuzzy: mapped paraphrased verdict → GROOMED (matched: '$matched_groomed')" >&2
-        echo "GROOMED"
-    fi
 }
 
 # _engine_escalation_line — Tier 0b recognizer (mika#2338).
@@ -9900,191 +9837,139 @@ _engine_escalation_line() {
     grep -m1 -E '^[[:space:]]*F[0-9]+: \(BLOCKING\) \[mika-engine\] review-anchor:' 2>/dev/null || true
 }
 
+# ─── Les cinq tiers sont partis dans le moteur (mika#2194, vol 5) ────────────
+#
+# `_parse_disposition` et `_parse_verdict` ne décident plus rien. Elles écrivent
+# la réponse de l'architecte dans un fichier, appellent `mika arch-disposition`
+# et rendent ce que le moteur a lu. Les cinq tiers — marqueur retenu (mika#2037),
+# escalade du moteur (mika#2338), `Disposition:`/`Verdict:` littéral, tolérance de
+# reprise de session (mika#1421 v3 et son miroir), paraphrase — vivent désormais
+# dans `crates/mika-agent/src/arch_disposition.rs`, dans cet ordre.
+# `crates/mika-cli/src/commands/arch_disposition.rs` n'est que le canal : il lit
+# le fichier, appelle `decide` et formate deux lignes.
+#
+# **Le corps passe par un FICHIER, jamais par argv.** C'est la classe de panne
+# cpp#157 (portée des guillemets) : une réponse d'architecte contient des
+# apostrophes, des backticks, des `>` et des sauts de ligne. `--response-file`
+# est la seule forme qui ne dépende pas de la citation.
+#
+# **Les deux enveloppes rendent 0 sur TOUS les chemins** — divergence délibérée
+# avec le pseudo-code du plan, qui proposait `return 1` sur un UNPARSED et
+# `return rc` sur un refus. Mesuré : les trois appelants de production capturent
+# en `$(...)` nu sous un `set -e` vivant (les trois sites de `_iterate_groom_loop`
+# — première passe, seconde passe, seconde passe après itération), et le chemin
+# UNPARSED *est* le chemin de reprise (mika#1823, mika#2641) — un `return 1` y
+# tuerait le handler au lieu de le faire réessayer, ce que l'AC2 interdit. Un
+# `return rc` serait pire encore : le trap `EXIT` délivre son propre callback et
+# n'appelle jamais l'annexe, donc l'avortement produirait un
+# « HANDLER CRASH (exit code 2) » SANS le refus nommé que l'AC3 exige. Le refus
+# emprunte donc le canal fichier, comme son précédent `plan-callout`.
+#
+# Rien ne se replie sur du bash : un repli serait une seconde implémentation
+# (§ 2 de la doctrine). Un moteur absent est un refus nommé, pas une décision.
+#
+# **Chaque corps contient le littéral `arch-disposition` exactement une fois**,
+# et c'est contraint de l'extérieur : la sentinelle de bascule de
+# `test-dispatch-lib.sh` compte
+#     { declare -f _parse_disposition; declare -f _parse_verdict; } | grep -c 'arch-disposition'
+# et l'attend à 2. `declare -f` efface les commentaires, donc seule l'invocation
+# réelle compte — c'est ce qui rend la sentinelle non vide. Le gabarit du
+# `mktemp` dit donc `mika-arch-dispo`, abrégé exprès : l'allonger ajouterait une
+# seconde ligne porteuse du motif par corps et ferait rougir la sentinelle sur un
+# renommage cosmétique. Si l'un des deux corps doit porter le littéral deux fois,
+# c'est l'assertion qu'il faut déplacer, pas le gabarit qu'il faut raccourcir
+# encore.
+
+_arch_disposition_refuse() {
+    # Enregistre un motif de refus (code `≥2` : « je n'ai pas pu regarder ») sur
+    # stderr et dans le canal fichier, d'où `_annex_arch_disposition_refusal` le
+    # reprendra au moment du callback. Facteur commun aux deux enveloppes —
+    # délibérément hors de leur corps, puisque `declare -f` ne la verra pas et
+    # que la sentinelle de bascule compte l'invocation littérale, pas le préfixe.
+    echo "dispatch-lib: REFUSED (arch-disposition, mika#2194) $1" >&2
+    printf '%s' "$1" > "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null || true
+}
+
 _parse_disposition() {
-    # Phase B — first-pass verdict parser. Reads architect response text from
-    # stdin, emits READY|ITERATE|ESCALATE on stdout (or nothing on no match).
+    # Première passe. Lit la réponse de l'architecte sur stdin, rend
+    # READY|ITERATE|ESCALATE sur stdout (ou rien si aucun jeton).
     #
-    # Tiered matching:
-    #   Tier 1a: strict literal `Disposition: <X>` (zero-cost fast path).
-    #   Tier 1b: literal `Verdict: GROOMED`/`Verdict: ESCALATE` (mika#1421 v3).
-    #            When mika-arch's session memory has prior ITERATE findings on
-    #            the same plan, a first-pass invocation can return second-pass
-    #            keyword shapes — the architect has effectively "carried over"
-    #            into a second-review stance. Without this tolerance, the
-    #            iterate-loop logs UNPARSED, _iterate_groom_loop returns 1, and
-    #            the groom lands in the half-state #1421 v1+v2 closed for a
-    #            different sub-class. Mapping: GROOMED → READY (loop runs a
-    #            confirmatory second-pass), ESCALATE → ESCALATE.
-    #   Tier 2:  fuzzy paraphrase matching (conservative, ESCALATE wins ties).
-    # Writes "1" to $_DISPOSITION_FUZZY_FILE when tier 2 fires, "0" when tier
-    # 1a/1b fires. Callers read _disposition_was_fuzzy() after the $(...)
-    # returns.
+    # Écrit "1" dans $_DISPOSITION_FUZZY_FILE quand le moteur dit avoir décidé au
+    # tier 2, "0" sinon — le `printf '0'` de tête reste, car un résidu du tour
+    # précédent ferait mentir `_disposition_was_fuzzy` sur une réponse franche.
     printf '0' > "$_DISPOSITION_FUZZY_FILE"
-    local text
-    text=$(cat)
-    local result
-    # Tier 0 — withheld-disposition short-circuit (mika#2037). The engine strips a
-    # disposition it refused to let stand and substitutes this literal marker. When it is
-    # present, NO tier may derive a verdict: the response is an absence of verdict, not an
-    # approval.
-    #
-    # The position is load-bearing, not stylistic. After tier 1a the marker would still be
-    # honoured, but after tier 2 it would not: the fuzzy pass matches paraphrases
-    # ("proceed", "good to go", "plan is clean") anywhere in the text, so a response whose
-    # disposition line was merely removed could still yield READY out of its own body. Tier 0
-    # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
-    # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
-    # Matched at the START OF A LINE, not anywhere in the text: a response that QUOTES the
-    # marker while carrying a genuine ITERATE or GROOMED must not be suppressed. Only the
-    # engine writes it as a line of its own. Since mika#2338 this tier is the FALLBACK — the
-    # engine escalates with a cause (tier 0b below) whenever the skill declares an ESCALATE of
-    # the withdrawn line's family, which every shipped arch manifest does.
-    case "$text" in
-        "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
-Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
-            echo "_parse_disposition: tier 0 — disposition withheld by the engine (review-anchor attestation missing, mika#2037); emitting nothing" >&2
-            return
-            ;;
+    local tmp out token tier rc=0
+    tmp=$(mktemp "${TMPDIR:-/tmp}/mika-arch-dispo.XXXXXX") || {
+        _arch_disposition_refuse "response_file_unwritable: mktemp a échoué (_parse_disposition)"
+        return 0
+    }
+    cat > "$tmp" || {
+        rm -f "$tmp"
+        _arch_disposition_refuse "response_file_unwritable: écriture impossible dans $tmp (_parse_disposition)"
+        return 0
+    }
+    # stderr n'est PAS redirigé : la note du tier 2 — « (matched: '…') » — est
+    # lue par la suite de tests et par les logs de dispatch.
+    out=$(mika arch-disposition --pass first --response-file "$tmp") || rc=$?
+    rm -f "$tmp"
+    case "$rc" in
+    0)
+        token=$(printf '%s\n' "$out" | sed -n '1p')
+        tier=$(printf '%s\n' "$out" | sed -n '2p')
+        if [ "$tier" = "2" ]; then
+            printf '1' > "$_DISPOSITION_FUZZY_FILE"
+        fi
+        printf '%s\n' "$token"
+        ;;
+    1)
+        # UNPARSED. Rien sur stdout : les appelants lisent la capture vide et
+        # relancent (mika#1823). Surtout pas de `return 1` — voir le bloc ci-dessus.
+        : ;;
+    *)
+        _arch_disposition_refuse "subcommand_error: la sous-commande (passe first) a rendu $rc (_parse_disposition)"
+        ;;
     esac
-    # Tier 0b — engine escalation line (mika#2338). The engine's refusal of an
-    # unattested disposition is an ESCALATE with a cause, and it must win before
-    # tier 1a: that tier greps the FIRST `Disposition:` anywhere in the text,
-    # unanchored, so a READY the model quoted inline would otherwise be read
-    # before the ESCALATE the engine appended at the end. The engine also
-    # rewrites inline mentions; the two layers each suffice alone.
-    if [ -n "$(printf '%s\n' "$text" | _engine_escalation_line)" ]; then
-        echo "_parse_disposition: tier 0b — engine escalation line present (review-anchor attestation withheld, mika#2338); ESCALATE" >&2
-        echo "ESCALATE"
-        return
-    fi
-    # Tier 1a — canonical first-pass shape
-    # `|| true` on tiers 1a and 1b: no match is a normal path, and grep reports it
-    # with exit 1. Under errexit + pipefail that status kills the caller whenever
-    # the function runs outside a `$(...)` (e.g. as a pipeline element), before
-    # tier 1b or tier 2 is reached.
-    result=$(printf '%s' "$text" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
-        | grep -oE '(READY|ITERATE|ESCALATE)' \
-        | head -1) || true
-    if [ -n "$result" ]; then
-        echo "$result"
-        return
-    fi
-    # Tier 1b — Verdict-shape carry-over from architect session memory
-    local verdict_keyword
-    verdict_keyword=$(printf '%s' "$text" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
-        | grep -oE '(GROOMED|ESCALATE)' \
-        | head -1) || true
-    case "$verdict_keyword" in
-        GROOMED)
-            echo "_parse_disposition: tier 1b accepted Verdict: GROOMED → READY (mika#1421 v3 session-carry-over tolerance)" >&2
-            echo "READY"
-            return
-            ;;
-        ESCALATE)
-            echo "_parse_disposition: tier 1b accepted Verdict: ESCALATE → ESCALATE (mika#1421 v3 session-carry-over tolerance)" >&2
-            echo "ESCALATE"
-            return
-            ;;
-    esac
-    # Tier 2 fallback
-    result=$(printf '%s' "$text" | _parse_disposition_fuzzy)
-    if [ -n "$result" ]; then
-        printf '1' > "$_DISPOSITION_FUZZY_FILE"
-        echo "$result"
-    fi
+    return 0
 }
 
 _parse_verdict() {
-    # Phase B — second-pass verdict parser. Reads architect response text from
-    # stdin, emits GROOMED|ESCALATE on stdout (or nothing on no match).
+    # Seconde passe. Lit la réponse de l'architecte sur stdin, rend
+    # GROOMED|ESCALATE sur stdout (ou rien si aucun jeton).
     #
-    # Three-tier matching (mika#1272 + session-carry-over tolerance):
-    #   Tier 1:  strict literal `Verdict: <X>` (zero-cost fast path)
-    #   Tier 1b: session-carry-over tolerance — accept `Disposition: <X>`
-    #            (first-pass shape) when the architect legitimately declines
-    #            a third-pass on unchanged plan (spec §4.5 / R11). Mirror of
-    #            mika#1421 v3 in _parse_disposition. Founding incident: 16+
-    #            spurious ESCALATE events across 8+ tickets on 2 repos
-    #            spanning 2026-07-01 → 2026-07-22 — all plans passed content
-    #            grooming but failed on shape mismatch in this parser.
-    #   Tier 2:  fuzzy paraphrase matching (conservative, ESCALATE wins ties)
-    # Writes "1" to $_DISPOSITION_FUZZY_FILE when tier 2 fires, "0" when tier 1
-    # or tier 1b fires. Callers read _disposition_was_fuzzy() after the $(...)
-    # returns.
+    # Même forme que `_parse_disposition`, à la passe près. L'asymétrie qui
+    # compte — pas de bras `ITERATE` au tier 1b, parce que la spec interdit une
+    # troisième passe (§ 4.5 / R11) — est portée par le moteur, qui la tient par
+    # type plutôt que par l'absence d'un `case`.
     printf '0' > "$_DISPOSITION_FUZZY_FILE"
-    local text
-    text=$(cat)
-    local result
-    # Tier 0 — withheld-disposition short-circuit (mika#2037). The engine strips a
-    # disposition it refused to let stand and substitutes this literal marker. When it is
-    # present, NO tier may derive a verdict: the response is an absence of verdict, not an
-    # approval.
-    #
-    # The position is load-bearing, not stylistic. After tier 1a the marker would still be
-    # honoured, but after tier 2 it would not: the fuzzy pass matches paraphrases
-    # ("proceed", "good to go", "plan is clean") anywhere in the text, so a response whose
-    # disposition line was merely removed could still yield READY out of its own body. Tier 0
-    # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
-    # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
-    # Matched at the START OF A LINE, not anywhere in the text: a response that QUOTES the
-    # marker while carrying a genuine ITERATE or GROOMED must not be suppressed. Only the
-    # engine writes it as a line of its own. Since mika#2338 this tier is the FALLBACK — the
-    # engine escalates with a cause (tier 0b below) whenever the skill declares an ESCALATE of
-    # the withdrawn line's family, which every shipped arch manifest does.
-    case "$text" in
-        "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
-Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
-            echo "_parse_verdict: tier 0 — disposition withheld by the engine (review-anchor attestation missing, mika#2037); emitting nothing" >&2
-            return
-            ;;
+    local tmp out token tier rc=0
+    tmp=$(mktemp "${TMPDIR:-/tmp}/mika-arch-dispo.XXXXXX") || {
+        _arch_disposition_refuse "response_file_unwritable: mktemp a échoué (_parse_verdict)"
+        return 0
+    }
+    cat > "$tmp" || {
+        rm -f "$tmp"
+        _arch_disposition_refuse "response_file_unwritable: écriture impossible dans $tmp (_parse_verdict)"
+        return 0
+    }
+    out=$(mika arch-disposition --pass second --response-file "$tmp") || rc=$?
+    rm -f "$tmp"
+    case "$rc" in
+    0)
+        token=$(printf '%s\n' "$out" | sed -n '1p')
+        tier=$(printf '%s\n' "$out" | sed -n '2p')
+        if [ "$tier" = "2" ]; then
+            printf '1' > "$_DISPOSITION_FUZZY_FILE"
+        fi
+        printf '%s\n' "$token"
+        ;;
+    1)
+        # UNPARSED — chemin de reprise de la seconde passe (mika#2641).
+        : ;;
+    *)
+        _arch_disposition_refuse "subcommand_error: la sous-commande (passe second) a rendu $rc (_parse_verdict)"
+        ;;
     esac
-    # Tier 0b — engine escalation line (mika#2338); see _parse_disposition.
-    if [ -n "$(printf '%s\n' "$text" | _engine_escalation_line)" ]; then
-        echo "_parse_verdict: tier 0b — engine escalation line present (review-anchor attestation withheld, mika#2338); ESCALATE" >&2
-        echo "ESCALATE"
-        return
-    fi
-    result=$(printf '%s' "$text" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
-        | grep -oE '(GROOMED|ESCALATE)' \
-        | head -1)
-    if [ -n "$result" ]; then
-        echo "$result"
-        return
-    fi
-    # Tier 1b — session-carry-over tolerance (symmetric to _parse_disposition
-    # mika#1421 v3 which accepts Verdict: → READY). On session-recall of an
-    # unchanged already-ratified plan, mika-arch legitimately emits first-pass
-    # shape "Disposition: READY|ESCALATE" and declines a third pass per
-    # spec §4.5 / R11 — that ratification-on-recall MUST map to a GROOMED
-    # verdict, not the default ESCALATE. See mika-arch-second-review/
-    # system_prompt.md for the two-pass discipline; see the founding streak
-    # investigation for the failure evidence.
-    local disposition_keyword
-    disposition_keyword=$(printf '%s' "$text" \
-        | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
-        | grep -oE '(READY|ITERATE|ESCALATE)' \
-        | head -1)
-    case "$disposition_keyword" in
-        READY)
-            echo "_parse_verdict: tier 1b accepted Disposition: READY → GROOMED (session-carry-over tolerance, mirror of mika#1421 v3)" >&2
-            echo "GROOMED"
-            return
-            ;;
-        ESCALATE)
-            echo "_parse_verdict: tier 1b accepted Disposition: ESCALATE → ESCALATE (session-carry-over tolerance)" >&2
-            echo "ESCALATE"
-            return
-            ;;
-        # Deliberately no ITERATE case — the spec forbids a third-pass, so
-        # ITERATE at second-pass falls through to Tier 2 fuzzy (typically
-        # ESCALATE-biased) rather than being aliased.
-    esac
-    # Tier 2 fallback
-    result=$(printf '%s' "$text" | _parse_verdict_fuzzy)
-    if [ -n "$result" ]; then
-        printf '1' > "$_DISPOSITION_FUZZY_FILE"
-        echo "$result"
-    fi
+    return 0
 }
 
 _trail_append() {
@@ -12846,6 +12731,31 @@ _annex_plan_callout_refusal() {
 REFUSED (plan-callout, mika#2194) ${_PLAN_CALLOUT_REFUSAL}"
 }
 
+# _annex_arch_disposition_refusal — le jumeau du précédent pour la bascule des
+# deux lecteurs de disposition (mika#2194, vol 5). Même raison, même forme, une
+# seule différence : le motif arrive par FICHIER et non par variable, parce que
+# l'enveloppe qui l'écrit *est* un sous-shell (les trois appelants capturent en
+# `$(...)`), donc une globale qu'elle poserait mourrait avec elle.
+#
+# C'est ce qui rend l'AC3 tenable sans toucher aux appelants : un code `≥2` ne
+# remonte pas par le code de retour — il ne le pourrait pas, un avortement sous
+# errexit partirait dans le trap `EXIT`, qui délivre son propre callback et
+# n'appelle aucune annexe, et produirait « HANDLER CRASH » sans le motif. Le
+# refus voyage donc par le fichier et se lit ici, au point unique par lequel
+# tout `RESULT` sort.
+_annex_arch_disposition_refusal() {
+    local motif
+    [ -f "${_ARCH_DISPOSITION_REFUSAL_FILE:-}" ] || return 0
+    motif=$(cat "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null) || return 0
+    [ -n "$motif" ] || return 0
+    if grep -qF -- 'REFUSED (arch-disposition, mika#2194)' <<<"${RESULT:-}"; then
+        return 0
+    fi
+    RESULT="${RESULT:-}
+
+REFUSED (arch-disposition, mika#2194) ${motif}"
+}
+
 _deliver_callback() {
     # mika#1996: every delivery path crosses the non-empty-output gate. First
     # executable statement, so no future early-return above it can skip it.
@@ -12858,6 +12768,7 @@ _deliver_callback() {
     # point every RESULT leaves by, and after the gate so a refusal can never be
     # what makes a callback fail to arrive.
     _annex_plan_callout_refusal
+    _annex_arch_disposition_refusal
     # mika#2155: end the loop's live claim BEFORE the message that can start
     # the next dispatch on this ticket. No-op unless _set_up_worktree claimed
     # (ISSUE_SEAT_CLAIMED=1); the EXIT trap repeats it only if this one failed.

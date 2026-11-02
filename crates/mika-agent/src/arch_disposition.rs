@@ -9,21 +9,22 @@
 //! **appelle** `arch_paraphrase::paraphrase` et ne touche à aucune de ses deux
 //! tables. Les tiers 0, 0b, 1a et 1b, plus l'entrée unique, vivent ici.
 //!
-//! # Ce module n'a AUCUN appelant de production, et c'est la propriété du vol
+//! # Le lecteur de PRODUCTION depuis le vol 5 ; la parité est datée au vol 4
 //!
-//! `skills/bundled/_shared/dispatch-lib.sh::_parse_disposition` et
-//! `::_parse_verdict` restent les lecteurs de production, mot pour mot. Ce
-//! module est l'autre moitié d'un **corpus doré** : un répertoire de corps, un
-//! fichier d'attendus, et **deux** lecteurs qui le lisent — le bash dans
-//! `test-dispatch-lib.sh`, le Rust dans
-//! `crates/mika-agent/tests/arch_paraphrase_parity.rs`.
+//! Au vol 4 ce module n'avait aucun appelant de production : il était l'autre
+//! moitié d'un **corpus doré**, lu par deux lecteurs indépendants : le bash
+//! dans `test-dispatch-lib.sh`, le Rust dans
+//! `crates/mika-agent/tests/arch_paraphrase_parity.rs`. Leur accord était une
+//! **preuve** de parité, et elle vit au commit `593a745c5`, *pre-switch* et
+//! mergé.
 //!
-//! C'est la seule fenêtre où la parité est une **preuve**. Au vol suivant les
-//! deux fonctions bash deviennent des enveloppes sur une sous-commande `mika`
-//! qui appelle [`decide`] : le lecteur bash et le lecteur Rust seront alors le
-//! même lecteur, et un lecteur comparé à lui-même est toujours d'accord avec
-//! lui-même. D'où l'ordre imposé par le plan : **le commit *pre-switch* se
-//! merge d'abord**, sinon la parité du vol suivant est une tautologie.
+//! Depuis le vol 5, `skills/bundled/_shared/dispatch-lib.sh::_parse_disposition`
+//! et `::_parse_verdict` sont des enveloppes sur `mika arch-disposition`
+//! (`crates/mika-cli/src/commands/arch_disposition.rs`), qui appelle
+//! [`decide`]. Ce module est donc le lecteur de production des cinq tiers, et le
+//! côté bash du corpus ne prouve plus la parité : un lecteur comparé à lui-même
+//! est toujours d'accord avec lui-même. Il reste une non-régression de forme du
+//! canal.
 //!
 //! # L'ORDRE DES TIERS EST PORTEUR, et chaque position a sa raison
 //!

@@ -65,7 +65,13 @@
 //! premier match est exactement la désambiguïsation du bash.
 
 /// Quelle passe d'architecte a produit le texte, donc quelle table l'interroge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `clap::ValueEnum` depuis le vol 5 : `mika arch-disposition --pass
+/// <first|second>` prend **cet** énuméré, et non un jumeau déclaré côté CLI. Un
+/// second vocabulaire serait deux listes à tenir d'accord — exactement la
+/// duplication que mika#2194 retire. Le dérivé ne décide rien : il ne nomme que
+/// les deux variantes déjà là, en kebab-case (`first`, `second`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ArchPass {
     /// `mika-arch-groom-ticket` — `_parse_disposition_fuzzy`.
     First,

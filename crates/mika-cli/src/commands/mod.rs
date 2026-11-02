@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod arch_disposition;
 pub mod ask;
 pub mod chat;
 pub mod config;

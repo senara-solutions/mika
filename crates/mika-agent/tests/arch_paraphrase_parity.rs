@@ -10,16 +10,25 @@
 //! `mika_agent::arch_disposition::decide`, qui n'a aucun appelant. Un attendu
 //! modifié d'un seul côté redevient rouge de l'autre.
 //!
-//! # Pourquoi la parité est une preuve DANS CE VOL, et cessera de l'être au vol 5
+//! # La parité a ÉTÉ une preuve, au vol 4. Depuis le vol 5, elle ne l'est plus.
 //!
-//! Tant que le bash décide lui-même ses cinq tiers, les deux lecteurs sont deux
-//! implémentations et le corpus les confronte. Au vol 5, `_parse_disposition` et
-//! `_parse_verdict` deviennent des enveloppes qui appellent la sous-commande :
-//! la parité comparerait alors `decide` à lui-même — verte, et vide. La preuve
-//! exige donc un commit *pre-switch* **mergé**, et c'est celui-ci. Les cinq
-//! assertions auto-nettoyantes ci-dessous sont écrites pour lui survivre : elles
-//! portent sur des propriétés **internes au Rust**, jamais sur une comparaison
-//! au bash.
+//! Tant que le bash décidait lui-même ses cinq tiers, les deux lecteurs étaient
+//! deux implémentations et le corpus les confrontait. Le vol 5 a basculé :
+//! `_parse_disposition` et `_parse_verdict` sont des enveloppes qui appellent
+//! `mika arch-disposition`, donc le côté bash du corpus compare désormais
+//! `decide` à lui-même — un lecteur comparé à lui-même est toujours d'accord.
+//!
+//! **La preuve est donc datée, et c'est volontaire.** Elle vit au commit
+//! `593a745c5` (PR #3014), *pre-switch* et **mergé** : un commit ne change pas
+//! d'avis. Le bloc bash a été conservé et son titre dit ce qu'il est devenu —
+//! une non-régression de **forme du canal** sur les 28 classes du corpus, ce qui
+//! garde une valeur réelle (le canal à trois codes, la colonne de tier, le
+//! fragment de stderr) sans prétendre à une parité qu'il ne mesure plus.
+//!
+//! Ce fichier-ci n'a rien perdu : les cinq assertions auto-nettoyantes
+//! ci-dessous ont toujours porté sur des propriétés **internes au Rust**, jamais
+//! sur une comparaison au bash — elles ont été écrites pour survivre à la
+//! bascule, et c'est fait. Aucune attente ne change au vol 5.
 //!
 //! # Anti-vacuité : trois termes, parce qu'une parité verte sur zéro cas ment
 //!

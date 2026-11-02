@@ -84,6 +84,19 @@ jobs:
       - name: Dispatch-lib assertion suite (mika#1772)
         run: make test-dispatch-lib
 
+      # La grammaire des jetons de `_parse_disposition` (mika#1272) — 67
+      # assertions sur les cinq tiers. Elle tournait dans
+      # `dispatch-lib-offline-suites`, qui ne construit rien, jusqu'à la bascule
+      # de mika#2194 (vol 5) : depuis, les deux lecteurs délèguent à `mika
+      # arch-disposition`, donc la suite a une dépendance de fabrication et doit
+      # tourner APRÈS `cargo test`, ici, où `target/debug/mika` existe.
+      #
+      # Elle skippe bruyamment sans le binaire plutôt que de rougir — ce qui est
+      # le bon comportement en dev et serait un vert sur rien en CI. C'est la
+      # raison du déplacement, et pas l'économie d'un build.
+      - name: The token grammar of _parse_disposition (mika#1272, mika#2194)
+        run: bash skills/bundled/_shared/tests/test_parse_disposition.sh
+
       # mika#2312: the permission-policy plugin suite — including the AST guard
       # that refuses the registry any filesystem/network capability — ran in no
       # workflow at all, so a carve-out could merge green past the very guard
@@ -697,10 +710,18 @@ jobs:
       # The refusal of a force-push from a dispatch worktree.
       - name: A force-push from a dispatch worktree is refused (mika#1318)
         run: bash skills/bundled/_shared/tests/test_force_push_guard.sh
-      # The token grammar of `_parse_disposition` — a pure function over
-      # strings. Nothing in this repository is cheaper to run in CI.
-      - name: The token grammar of _parse_disposition (mika#1272)
-        run: bash skills/bundled/_shared/tests/test_parse_disposition.sh
+      # `test_parse_disposition.sh` A QUITTÉ CE JOB (mika#2194, vol 5) et tourne
+      # désormais dans `Check`, après `cargo test`. Son ancien commentaire ici
+      # disait « a pure function over strings. Nothing in this repository is
+      # cheaper to run in CI » — et c'était vrai jusqu'à la bascule. Depuis,
+      # `_parse_disposition` et `_parse_verdict` appellent `mika
+      # arch-disposition` : la suite a une DÉPENDANCE DE FABRICATION, et ce job
+      # ne construit rien. Elle skipperait proprement (le helper le dit), donc
+      # elle ne rougirait pas — elle ne mesurerait plus rien, en vert.
+      #
+      # La ligne est laissée ici plutôt que retirée : sans elle, le prochain qui
+      # voudra économiser le temps de build la ramènera dans ce job, où elle a
+      # l'air d'être à sa place.
       # The push/rebase retry loop, against local repositories.
       - name: The push/rebase retry loop (mika#1857)
         run: bash skills/bundled/_shared/tests/test_push_with_rebase_retry.sh
