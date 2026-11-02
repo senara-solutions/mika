@@ -229,21 +229,28 @@ GROOMED	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
 ITERATE	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
 READY	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
 
-# mika#2194 vol 4 — le TROISIÈME site de match, et le dernier avant que leur
-# nombre redescende. `arch_disposition::decide` porte les cinq tiers dans
-# l'ordre du bash (0, 0b, 1a, 1b, 2) et sert d'entrée unique ; il n'a, comme
-# `paraphrase` au vol 3, AUCUN appelant de production.
+# mika#2194 vol 4 — le TROISIÈME site de match, DEVENU LE SEUL.
+# `arch_disposition::decide` porte les cinq tiers dans l'ordre du bash
+# (0, 0b, 1a, 1b, 2) et sert d'entrée unique. Déclaré au vol 4 sans AUCUN
+# appelant de production, comme `paraphrase` au vol 3, il en a reçu un au
+# vol 5 (#3016).
 #
-# POURQUOI TROIS SITES COEXISTENT, ET LEQUEL EST TRANSITOIRE. Les huit lignes de
-# `_parse_disposition` / `_parse_verdict` sont le lecteur de PRODUCTION : elles
-# restent. Les quatre lignes d'`arch_paraphrase::paraphrase` ne sont plus un
-# second site au sens de l'inventaire — `decide` est son seul appelant, donc le
-# jeton y est lu par délégation et non par une seconde table. Le site transitoire
-# est celui-ci, `decide` : au vol 5 les deux enveloppes bash délèguent à la
-# sous-commande, les huit lignes ci-dessus partent avec leurs tables, les deux
-# lignes 85-86 partent avec les deux fonctions fuzzy, et l'inventaire redevient
-# ce qu'il doit être — UN site par jeton. Ce qui est transitoire est donc la
-# COEXISTENCE, pas ce site-ci : c'est lui qui survit.
+# LA COEXISTENCE A PRIS FIN, et c'est elle qui était transitoire — pas ce
+# site-ci, qui est celui qui survit. Ce que le vol 5 a fait, dans l'ordre où ce
+# fichier le lit : les huit lignes de `_parse_disposition` / `_parse_verdict`
+# sont parties avec leurs tables (bloc du vol 5 plus haut), les deux lignes que
+# portaient les fonctions fuzzy sont parties avec ces fonctions, qui n'existent
+# plus du tout, et `decide` est resté. Les quatre lignes
+# d'`arch_paraphrase::paraphrase` ne comptent pas pour un second site —
+# `decide` est son seul appelant, donc le jeton y est lu par délégation et non
+# par une seconde table. L'inventaire est redevenu ce qu'il doit être : UN site
+# par jeton.
+#
+# CE QUE CET INVENTAIRE NE DIT PAS TOUT SEUL. Un site retiré de cette table y
+# reste retiré ; il ne reste pas retiré de `dispatch-lib.sh`. Cette seconde
+# question — qu'aucune COPIE du motif ne revienne dans le bash — est portée par
+# le scan anti-copie, pour le tier 2 comme pour le tier 1 : assertions
+# « mika#2194 (AC4) » de `skills/bundled/_shared/test-dispatch-lib.sh`.
 #
 # Classe A pour la raison écrite au bloc des huit lignes ci-dessus, et à la même
 # granularité : la fonction. `decide` finit sur le tier 2, donc une disposition

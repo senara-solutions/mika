@@ -11189,9 +11189,14 @@ M2194_EXTRACT_SRC_EARLY=$(sed -n '/^_extract_plan_path()/,/^}/p' "$DISPATCH_LIB"
 M2194_NEEDLE='Plan:(\\)?\*(\\)?\*'
 M2194_READER='grep|sed|awk|=~|case[[:space:]]|expr[[:space:]]'
 
-m2194_read_sites() { # lit sur stdin, rend le compte des lignes de LECTURE portant le motif
+# L'aiguille est un PARAMÈTRE depuis le vol 6 de mika#2194, et non une copie du
+# pipeline : le scan de tier 1 (plus bas, AC4) pose la même question sur une
+# autre aiguille. Le recopier créerait deux lecteurs de « quelles lignes de
+# commande LISENT ce motif » — précisément la classe que ce ticket migre. Le
+# corps, le discriminant et la sémantique de retour sont inchangés.
+m2194_read_sites() { # $1 = aiguille ERE ; lit sur stdin, rend le compte des lignes de LECTURE
     grep -v '^[[:space:]]*#' \
-        | grep -E -- "$M2194_NEEDLE" \
+        | grep -E -- "$1" \
         | grep -Ec -- "$M2194_READER" || true
 }
 
@@ -11209,7 +11214,7 @@ m2194_read_sites() { # lit sur stdin, rend le compte des lignes de LECTURE porta
 #    pas moins : ce sont eux qui distinguent « zéro lecteur » de « le prédicat ne
 #    regarde rien » (classe mika#2205), et sur un zéro il n'y a plus de
 #    population positive pour le faire à leur place.
-M2194_READ_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites)
+M2194_READ_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites "$M2194_NEEDLE")
 assert_eq "mika#2608 (R7): ZÉRO lecteur bash du callout — les deux de phase 2 ont migré" \
     "0" "$M2194_READ_COUNT"
 
@@ -11218,18 +11223,18 @@ assert_eq "mika#2608 (R7): ZÉRO lecteur bash du callout — les deux de phase 2
 # migré. Les deux assertions de la phase 1 s'INVERSENT plutôt que de disparaître.
 M2194_COMMITTED_SRC=$(sed -n '/^_committed_plan_on_branch()/,/^}/p' "$DISPATCH_LIB")
 assert_eq "mika#2608 (R7): _committed_plan_on_branch ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_COMMITTED_SRC" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_COMMITTED_SRC" | m2194_read_sites "$M2194_NEEDLE")"
 assert_contains "mika#2608 (R7): …et elle délègue au canal" \
     "_extract_plan_path" "$M2194_COMMITTED_SRC"
 M2194_WORKTREE_SRC=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
 assert_eq "mika#2608 (R7): _set_up_worktree ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_WORKTREE_SRC" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_WORKTREE_SRC" | m2194_read_sites "$M2194_NEEDLE")"
 assert_contains "mika#2608 (R7): …et son \`elif\` délègue au canal" \
     "_extract_plan_path" "$M2194_WORKTREE_SRC"
 
 # Et le site que ce ticket bascule n'en est PLUS un : c'est le livrable de R3.
 assert_eq "mika#2194 (R5): _extract_plan_path ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_EXTRACT_SRC_EARLY" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_EXTRACT_SRC_EARLY" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°1 : sur une fixture portant le motif ÉCHAPPÉ en
 # position de lecture, le prédicat DOIT accuser. Sans lui, « aucun site » est
@@ -11238,13 +11243,13 @@ assert_eq "mika#2194 (R5): _extract_plan_path ne lit plus le motif" "0" \
 # livrable.
 M2194_FX_PCRE='    path=$(printf "%s\n" "$body" | grep -oP "^> - \*\*Plan:\*\* `\K[^`]+")'
 assert_eq "mika#2194 (R5, contrôle négatif a): le prédicat accuse un PCRE échappé" "1" \
-    "$(printf '%s\n' "$M2194_FX_PCRE" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_PCRE" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°2 : la forme NON échappée aussi (un `case` sur le
 # littéral, la façon dont un futur lecteur bash le plus simple s'écrirait).
 M2194_FX_LITERAL='    case "$body" in *"> - **Plan:**"*) printf yes ;; esac'
 assert_eq "mika#2194 (R5, contrôle négatif b): le prédicat accuse un littéral lu" "1" \
-    "$(printf '%s\n' "$M2194_FX_LITERAL" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_LITERAL" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°3 — celui qui borne la population : l'ÉCRIVAIN du
 # callout porte le motif et ne doit PAS être accusé. Sans ce contrôle, la
@@ -11252,7 +11257,7 @@ assert_eq "mika#2194 (R5, contrôle négatif b): le prédicat accuse un littéra
 # plus rien.
 M2194_FX_WRITER='> - **Plan:** \`${plan_relpath}\` (committed on branch @ \`${head_sha}\`)'
 assert_eq "mika#2194 (R5, contrôle négatif c): l'écrivain du callout est hors population" "0" \
-    "$(printf '%s\n' "$M2194_FX_WRITER" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_WRITER" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Et l'anti-vacuité de la population elle-même : le motif DOIT encore apparaître
 # dans dispatch-lib. Le seuil passe de 3 à 1 avec la phase 2, et cette
@@ -11443,6 +11448,155 @@ assert_eq "mika#2194 (AC4): _parse_disposition_fuzzy n'est plus définie" "no" \
     "$(if declare -f _parse_disposition_fuzzy >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
 assert_eq "mika#2194 (AC4): _parse_verdict_fuzzy n'est plus définie" "no" \
     "$(if declare -f _parse_verdict_fuzzy >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
+
+# ============================================================================
+# mika#2194 vol 6 (AC4) — le scan anti-copie des MOTIFS DE TIER 1
+# ============================================================================
+#
+# Le scan ci-dessus borne la table du tier 2. Celui-ci borne l'autre moitié
+# d'AC4 : les lecteurs de forme `Disposition:` / `Verdict:` que le vol 5 a
+# retirés de `_parse_disposition` et `_parse_verdict`. Leur foyer unique est
+# désormais `arch_disposition::decide` (`canonical-tokens.tsv:257-262`).
+#
+# RIEN d'autre dans l'arbre ne tient cette absence, et les trois choses qui en
+# ont l'air n'en sont pas : `scripts/check-canonical-tokens.sh:181` porte sur la
+# TYPOGRAPHIE (règle L4, espace insécable), l'assertion de `_detect_plan_on_branch`
+# plus haut est COMPORTEMENTALE sur `$RESULT`, et le scan de portée de module de
+# `plan_callout` lit une source RUST.
+#
+# ── L'AIGUILLE COUVRE LES DEUX ÉCRITURES DU MOTIF — piège 3 du § 5 de la
+#    doctrine (`dispatch-lib-migration.md:453-456`), déjà payé une fois sur le
+#    callout. Les deux écritures ne se recouvrent PAS : un littéral contigu
+#    (`Disposition:`) et une alternation en source (`(Verdict|Disposition)`).
+#    Mesuré le 2026-11-02, discriminant appliqué : sur `HEAD` le littéral compte
+#    0 et l'alternation 1 ; sur la révision pre-switch `593a745c5`, 4 et 1. Une
+#    aiguille au seul littéral vaudrait zéro aujourd'hui et resterait VERTE si un
+#    tier 1 revenait sous forme tolérante à l'emphase — exactement le défaut que
+#    le piège 3 documente comme déjà payé.
+#
+#    Le `:` est EXIGÉ, et c'est une mesure et non un confort : `Fire-Disposition`
+#    (`dispatch-lib.sh:10330`, `grep -qF`) est un vrai lecteur, portant le mot
+#    `Disposition`, sur une ligne de commande. Relâcher au mot nu le ferait
+#    rougir sur du code sain, donc désarmer le scan dans la semaine.
+#
+#    SENSIBLE À LA CASSE, et ce choix ne porte RIEN aujourd'hui : les deux jetons
+#    sont canoniquement capitalisés (`canonical-tokens.tsv:257-258`) et les deux
+#    variantes rendent le même verdict une fois le discriminant appliqué. Dit ici
+#    pour qu'un futur lecteur ne le croie pas mesuré sur un écart. Sans le
+#    discriminant, l'insensible ramasserait 4 artefacts d'affectation de variable
+#    (`${_BRANCH_REUSE_VERDICT:-}`, `${disposition:-UNPARSED}`, …) : élargir la
+#    population sans élargir la classe de défaut.
+M2194_T1_NEEDLE='Disposition:|Verdict:|\(Verdict\|Disposition\)'
+
+# ── UNE exception, PAR VALEUR, avec son ticket — et elle s'auto-nettoie.
+#
+#    `_second_pass_explicit_iterate` (`dispatch-lib.sh:11060`) est un lecteur de
+#    forme tier 1, en bash, CONSERVÉ PAR DÉCISION : AC1 de mika#2641 exclut
+#    nommément ITERATE du périmètre de relance, parce que `_parse_verdict` n'a
+#    aucun bras ITERATE et qu'une seconde passe qui écrit `Disposition: ITERATE`
+#    est une objection LISIBLE et non un illisible. Sa doctrine est au
+#    commentaire 11047-11057 de dispatch-lib, et il a deux appelants de
+#    production.
+#
+#    L'énoncé d'AC4 au corps du ticket (« aucun motif de tier 1 ou 2 ne subsiste
+#    dans dispatch-lib.sh ») est donc LITTÉRALEMENT FAUX sur ce lecteur, et
+#    l'écart est déclaré plutôt que résolu en silence. Rétrécir l'aiguille pour
+#    atteindre un zéro littéral serait choisir le NOMBRE plutôt que la
+#    CONSÉQUENCE — la faute que mika#2309 refuse sur les budgets d'appel et que
+#    mika#1804 a redite sur les couleurs du landing, et celle que le bearing de
+#    Prime du 2026-11-02 vient de corriger sur AC5. Le scan NOMME ce lecteur
+#    plutôt que de le rencontrer.
+#
+#    L'exception retire de la population le CORPS DE LA FONCTION NOMMÉE, et non
+#    une ligne littérale : c'est l'identité stable à travers un reformatage de la
+#    regex.
+M2194_T1_EXCEPTION='_second_pass_explicit_iterate'
+M2194_T1_EXC_LINES=$(sed -n "/^${M2194_T1_EXCEPTION}()/,/^}/p" "$DISPATCH_LIB" \
+    | grep -v '^[[:space:]]*#' | grep -E -- "$M2194_T1_NEEDLE" || true)
+
+m2194_t1_offenders() { # rend le compte des lecteurs de tier 1, exception nommée retirée
+    # `grep -vxF` sur une chaîne MULTILIGNE : chaque ligne du corps devient un
+    # motif à ligne entière. Le garde-fou sur le vide n'est pas décoratif — avec
+    # une exception vide, `grep -vxF -- ''` retirerait les lignes vides de la
+    # population, donc un compte juste pour une mauvaise raison.
+    if [ -n "$M2194_T1_EXC_LINES" ]; then
+        printf '%s\n' "$M2194_CMD_LINES" \
+            | grep -vxF -- "$M2194_T1_EXC_LINES" \
+            | m2194_read_sites "$M2194_T1_NEEDLE"
+    else
+        printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites "$M2194_T1_NEEDLE"
+    fi
+}
+
+assert_eq "mika#2194 (AC4): aucun lecteur de tier 1 hors l'exception nommée dans dispatch-lib.sh" \
+    "0" "$(m2194_t1_offenders)"
+
+# ── PÉREMPTION DE L'EXCEPTION. Le corps de la fonction doit exister et porter
+#    EXACTEMENT UN lecteur de l'aiguille. Trois façons de devenir stale, et les
+#    trois rougissent : mika#2641 migre vers le moteur (corps vide), la fonction
+#    est renommée (corps vide), un second lecteur est ajouté dans ce corps
+#    (compte à 2). Le geste qui rend l'exception inutile est celui qui la fait
+#    expirer — et ce jour-là on la retire, l'assertion zéro tenant seule.
+assert_eq "mika#2194 (AC4): l'exception mika#2641 porte exactement un lecteur (auto-nettoyage)" \
+    "1" "$(printf '%s\n' "$M2194_T1_EXC_LINES" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+# ── CONTRÔLE DE BONNE FOI POSITIF, sur fixture : les QUATRE formes de lecteur
+#    que le vol 5 a retirées (lignes 9965, 9974, 10047 et 10064 de la révision
+#    pre-switch). Le prédicat doit en compter 4. Sur un zéro il n'y a plus aucune
+#    population pour le dire à sa place, et « zéro lecteur » se lirait exactement
+#    comme « le prédicat ne regarde rien » (classe mika#2205).
+M2194_T1_FX=(
+    "    result=\$(printf '%s' \"\$text\" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \\"
+    "    verdict_keyword=\$(printf '%s' \"\$text\" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \\"
+    "    result=\$(printf '%s' \"\$text\" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \\"
+    "        | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \\"
+)
+assert_eq "mika#2194 (AC4, contrôle positif): le prédicat accuse les quatre lecteurs retirés" \
+    "4" "$(printf '%s\n' "${M2194_T1_FX[@]}" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+# ── LES DEUX CONTRÔLES NÉGATIFS QUI ÉPINGLENT LE DESSIN DE L'AIGUILLE. Ce sont
+#    eux qui la rendent non substituable par un littéral nu, et ils rougissent si
+#    quelqu'un la rétrécit — ou la relâche au mot.
+#
+#    (a) un tier 1 revenu sous forme TOLÉRANTE À L'EMPHASE — donc SANS
+#        `Disposition:` contigu — EST compté. C'est la seconde écriture du § 2,
+#        celle qu'une aiguille au seul littéral laisserait passer en silence.
+M2194_T1_FX_EMPHASE='    grep -qE "^[[:space:]>*_]*(Verdict|Disposition)[*_]*:[[:space:]]*READY"'
+assert_eq "mika#2194 (AC4, contrôle négatif a): un lecteur tolérant à l'emphase est compté" \
+    "1" "$(printf '%s\n' "$M2194_T1_FX_EMPHASE" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+#    (b) `Fire-Disposition` n'est PAS compté : vrai lecteur, vrai outil de
+#        lecture, portant le mot `Disposition` — mais sans `:` contigu. C'est la
+#        mesure qui justifie que l'aiguille garde son `:`.
+M2194_T1_FX_FIREDISP="    grep -qF -- 'Fire-Disposition' \"\$first_pass_findings\" 2>/dev/null || return 0"
+assert_eq "mika#2194 (AC4, contrôle négatif b): Fire-Disposition est hors population" \
+    "0" "$(printf '%s\n' "$M2194_T1_FX_FIREDISP" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+# ── LE TERME D'ANTI-VACUITÉ, mesuré sur la même révision IMMUABLE que le scan de
+#    tier 2 ci-dessus. Les quatre lecteurs retirés par le vol 5 y sont, sur des
+#    lignes de commande, dans les deux fonctions fuzzy — plus le lecteur mika#2641
+#    qui existait déjà, d'où CINQ. Le jour où ils n'y sont plus, c'est que
+#    l'assertion a cessé de mesurer son objet, et elle rougit.
+#
+#    Même mécanique que le bloc de tier 2 : `git cat-file -e` d'abord, SKIP qui
+#    se dit si le clone est shallow (`actions/checkout` à `fetch-depth: 1` n'a
+#    pas l'objet), et jamais `grep -q` dans la mesure — sous `set -o pipefail` un
+#    `-q` ferme le tube au premier match, `printf`/`git show` meurt sur SIGPIPE
+#    et le pipeline rend 141, donc le `if` lit FAUX sur des chaînes PRÉSENTES.
+if ! git cat-file -e "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" 2>/dev/null; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2194 (AC4 tier 1, anti-vacuité) — la révision pre-switch ${M2194_T2_PRESWITCH_REV} n'est pas dans ce clone."
+    echo "    Un clone à 'fetch-depth: 1' n'a pas l'objet ; l'absence de la révision"
+    echo "    n'est pas l'absence des lecteurs, et seule la seconde doit rougir."
+    echo "    Remède : git fetch --unshallow (ou fetch-depth: 0 dans le workflow)."
+else
+    M2194_T1_OLD_COUNT=$(git show "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" \
+        | m2194_read_sites "$M2194_T1_NEEDLE")
+    # CINQ, et pas « au moins un » : un seuil bas laisserait quatre des cinq
+    # cesser d'être des lecteurs sans que personne ne l'apprenne.
+    assert_eq "mika#2194 (AC4 tier 1, anti-vacuité): les cinq lecteurs étaient bien dans ${M2194_T2_PRESWITCH_REV}" \
+        "5" "$M2194_T1_OLD_COUNT"
+fi
 
 # ── La forme des deux enveloppes, et le canal du refus (AC3).
 #
