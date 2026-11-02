@@ -1,22 +1,27 @@
-# Migrer `dispatch-lib.sh` — la doctrine, bornée à ce que les phases 1 et 2 ont établi
+# Migrer `dispatch-lib.sh` — la doctrine, bornée à ce que les phases 1 à 3 ont établi
 
 **Ticket parent :** [mika#2194](https://github.com/senara-solutions/mika/issues/2194).
-**État :** phases **1** ([mika#2194](https://github.com/senara-solutions/mika/issues/2194))
-et **2** ([mika#2608](https://github.com/senara-solutions/mika/issues/2608)) livrées.
+**État :** phases **1** ([mika#2194](https://github.com/senara-solutions/mika/issues/2194)),
+**2** ([mika#2608](https://github.com/senara-solutions/mika/issues/2608)) et **3**
+(même ticket, vols 3 à 6) **livrées**.
 Les **quatre** lecteurs bash et Rust du callout `Plan` délèguent à
 `crates/mika-agent/src/plan_callout.rs`, l'inventaire des lecteurs bash est un
 **zéro** tenu par un scan, et la tolérance du quatrième
 (`milestone_manager::reader::plan_callout_present`) est **conservée par décision**
-avec sa raison structurelle. Les phases 3 et 4 sont nommées ici et **aucune n'est
-ouverte**. La décision d'AC5 de la phase 3 (famille de sous-commandes plate, critère
-de bascule remplacé) est inscrite au § 6 depuis le 2026-11-02 ; le passage de la
-phase 3 à « livrée » viendra avec le vol 5.
+avec sa raison structurelle. `_parse_disposition` et `_parse_verdict` sont deux
+**enveloppes** : elles écrivent la réponse de l'architecte dans un fichier et
+appellent `mika arch-disposition`, qui porte les cinq tiers à
+`crates/mika-agent/src/arch_disposition.rs`. Leur inventaire de lecteurs est lui
+aussi un **zéro** tenu par un scan, à **une** exception nommée et auto-expirante
+(§ 6). La phase **4** est nommée ici et **n'est pas ouverte**. La décision d'AC5
+de la phase 3 (famille de sous-commandes plate, critère de bascule remplacé) est
+inscrite au § 6 depuis le 2026-11-02.
 
-Ce document ne décrit pas un programme souhaitable : il décrit ce que **deux**
+Ce document ne décrit pas un programme souhaitable : il décrit ce que **trois**
 maillons ont établi, pour que le suivant ne redécouvre pas les mêmes bornes. Tout
 ce qui n'a pas été mesuré est marqué comme tel — au premier rang le coût réel d'un
-démarrage de `mika`, que la phase 2 porte à trois par dispatch (§ 2) sans l'avoir
-chronométré.
+démarrage de `mika`, que la phase 2 porte à trois par dispatch (§ 2) et la phase 3
+à un de plus par passe d'architecte (§ 6), sans l'avoir chronométré.
 
 ---
 
@@ -335,11 +340,15 @@ chemin tronqué, sans que personne l'ait mesuré.
 
 ### La même forme appliquée au tier 2 (vol 3), et les trois classes qu'elle mesure
 
-Le vol 3 de mika#2194 réplique cette forme sur le **tier 2 de paraphrase** —
-`_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` — et **rien ne bascule** : le
-bash reste le lecteur de production, le lecteur Rust (`arch_paraphrase::paraphrase`)
-n'a **aucun appelant**. C'est la moitié « TESTS DORÉS » de la clause de méthode du
-ticket, posée avant la phase 3 plutôt que pendant.
+Le vol 3 de mika#2194 a répliqué cette forme sur le **tier 2 de paraphrase** —
+`_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` — et **rien n'y basculait** :
+le bash y restait le lecteur de production, le lecteur Rust
+(`arch_paraphrase::paraphrase`) n'avait **aucun appelant**. C'est la moitié « TESTS
+DORÉS » de la clause de méthode du ticket, posée avant la bascule plutôt que
+pendant. La bascule, elle, est venue au vol 5 (#3016), et les deux corps bash
+décrits ci-dessous n'existent plus : ce qui suit décrit le **dispositif de preuve**,
+qui a survécu à son objet et dont le corpus est aujourd'hui exercé contre le bash
+**pre-switch** figé.
 
 Ce que le corpus ajoute à la forme de la phase 1 : **cinq** colonnes
 (`fichier · passe · token · fragment · classe`) au lieu de six, parce que la
@@ -482,37 +491,84 @@ raison d'être de ces deux scans.
 |---|---|---|---|
 | **1** | `_extract_plan_path` → Rust, de bout en bout, **plus cette doctrine** | — | **livrée** (mika#2194) |
 | **2** | les deux autres lecteurs du même jeton : `_committed_plan_on_branch`, `_set_up_worktree` — **plus la décision sur le quatrième** | phase 1 mergée | **livrée** (mika#2608) |
-| **vol 3** | le **corpus doré** du tier 2 de paraphrase et son lecteur Rust **sans appelant** — la moitié « tests dorés » de la phase 3, **sans bascule** | phase 2 mergée | **livré** (mika#2194 vol 3) |
-| 3 | `_parse_disposition` / `_parse_verdict` → **bascule** | décider ce que devient le canal de retour par fichier (`$_DISPOSITION_FUZZY_FILE`) — **inchangée** ; le corpus, lui, n'en est plus une : le vol 3 l'a posé | ticket à ouvrir |
+| **3** | `_parse_disposition` / `_parse_verdict` → **bascule**, en **quatre vols** : le corpus doré du tier 2 et son lecteur Rust sans appelant (vol 3), le lecteur unique des cinq tiers et la parité dorée pre-switch (vol 4, #3014), le canal et la bascule des deux enveloppes (vol 5, #3016), le scan anti-copie du tier 1 et cette doctrine (vol 6) | **tranchée** le 2026-11-02 : le canal de retour par fichier (`$_DISPOSITION_FUZZY_FILE`) **reste**, et c'est le shell qui l'écrit à partir de la sortie du moteur (§ *Le canal*, ci-dessous) | **livrée** (mika#2194, vols 3 à 6) |
 | 4 | la glue d'orchestration (bwrap / git / gh / trap / worktree / callback) → Python | un maillon dont la nature est de la **glue** et non une décision | ticket à ouvrir |
 
-**Ni la phase 3 ni la phase 4 n'est ouverte**, et c'est délibéré, pour la même
-raison que la phase 1 l'avait écrit : les ouvrir avant qu'une mesure les demande
-serait instruire sans mesure. Leurs préconditions ci-dessus sont inchangées — et le
-vol 3 n'en lève aucune, ce qui est exactement son périmètre.
+**La phase 4 n'est pas ouverte**, et c'est délibéré, pour la même raison que la
+phase 1 l'avait écrit : l'ouvrir avant qu'une mesure la demande serait instruire
+sans mesure. Sa précondition ci-dessus est **inchangée**, et aucun des quatre vols
+de la phase 3 ne la lève — le canal par fichier reste, donc la glue qui le porte
+reste elle aussi. C'est exactement leur périmètre.
 
-### Ce que le vol 3 change pour la phase 3, et ce qu'il ne change pas
+### Le canal : il reste, et c'est le shell qui l'écrit
 
-**Il retire une inconnue, il ne tranche aucune décision.** Le tier 2 avait zéro
-entrée commune entre ses deux futurs lecteurs — la configuration que le § 4 décrit
-comme « celle dans laquelle une divergence ne peut pas être vue ». Elle est fermée :
-17 cas, deux lecteurs, **zéro écart à la première exécution**. La phase 3 n'aura
-donc pas à établir la parité du tier 2 ; elle aura à décider du **canal**.
+**La précondition de la phase 3 était une décision écrite sur le sort de
+`$_DISPOSITION_FUZZY_FILE`. Elle est tranchée (2026-11-02) : le fichier reste, et
+c'est le shell qui l'écrit à partir de la sortie du moteur.**
 
-**Le coût de ce vol est une ligne de plus à l'inventaire des jetons, dite plutôt que
-découverte.** Les quatre jetons `READY` / `ITERATE` / `ESCALATE` / `GROOMED` ont
-désormais **deux** sites de match dans l'arbre, et `scripts/canonical-tokens.tsv`
-déclare le second (classe A, `arch_paraphrase.rs::paraphrase`) alors qu'il n'a aucun
-appelant. C'est une duplication **temporaire et déclarée**, pas une infraction au
-§ 5 : le scan anti-copie de la phase 1 était lui aussi un inventaire fermé **avant**
-de devenir un zéro, et pour la même raison — un lint rouge le jour où il naît se
-fait désarmer. Le zéro ici est la phase 3, pas le vol 3.
+**C'est C3 qui la tranche, et non un confort.** Le fichier n'est pas une décision,
+c'est de la **glue** : il fait passer un booléen à travers la frontière d'un
+`$(...)`, et son unique lecteur est `_disposition_was_fuzzy`, qui ajoute
+« (fuzzy) » à une ligne de trail. *Ce que seul le shell connaît reste au shell* —
+le retirer relèverait de la phase 4, pas de celle-ci. Le garder inchangé tient le
+contrat des **trois** appelants à l'identique, et c'est la forme strangler.
 
-**Ce qui doit rester vrai jusque-là :** les deux corps `_parse_disposition_fuzzy` et
-`_parse_verdict_fuzzy` sont une **transcription littérale** de l'autre côté. Le vol 3
-ne touche pas une ligne de `dispatch-lib.sh`. Un futur maillon qui édite l'une des
-deux tables sans éditer l'autre rougit sur le corpus commun — c'est tout le
-dispositif, et c'est ce qui le rend utile entre maintenant et la bascule.
+**La forme du canal, elle, suit le § 2 à la lettre.** La réponse de l'architecte
+passe par un **fichier**, jamais en argument. La sous-commande rend le jeton
+canonique sur la ligne 1 de stdout, le tier qui a décidé sur la ligne 2 (`0`, `0b`,
+`1a`, `1b`, `2`), le fragment décisif sur stderr ; code `0` pour un jeton lu, `1`
+pour UNPARSED, `≥ 2` pour « je n'ai pas pu regarder », avec un refus **nommé** dans
+le `RESULT`. Les deux enveloppes dérivent le booléen `fuzzy` de la ligne 2 (`2` ⇒
+`1`) : le shell n'en redécide rien, il transcrit.
+
+**Le coût est un démarrage de `mika` de plus par passe d'architecte, dit plutôt que
+découvert, et toujours pas chronométré.** La sonde S3 reste hors tranche. Si elle
+dépasse ~500 ms, le remède est le placement dans `main.rs`, **jamais** un cache —
+un cache rendrait une décision périmée sur un texte qui a changé.
+
+### Le zéro est arrivé, et voici ce qui le tient
+
+**Le vol 3 avait ajouté une ligne à l'inventaire des jetons ; les vols 5 et 6 l'ont
+refermée.** Les quatre jetons `READY` / `ITERATE` / `ESCALATE` / `GROOMED` avaient
+**deux** sites de match dans l'arbre, et `scripts/canonical-tokens.tsv` déclarait le
+second alors qu'il n'avait aucun appelant. C'était une duplication **temporaire et
+déclarée**, pas une infraction au § 5 : le scan anti-copie de la phase 1 était lui
+aussi un inventaire fermé **avant** de devenir un zéro, et pour la même raison — un
+lint rouge le jour où il naît se fait désarmer. L'inventaire est redescendu à **un
+site par jeton**, `arch_disposition.rs::decide` ; `paraphrase` n'en est plus un
+second, `decide` étant son seul appelant.
+
+**Les deux corps `_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` n'existent
+plus.** La phase 3 avait à tenir, jusqu'à la bascule, qu'ils soient une
+**transcription littérale** de l'autre côté, et le corpus doré commun le tenait.
+Cette obligation est éteinte parce que son objet a disparu — et ce qui la remplace
+est d'une autre nature : le corpus doré prouve la **parité** (mêmes entrées, mêmes
+sorties, mesurées contre le bash pre-switch), le **scan anti-copie** du § 5 prouve
+l'**absence**, pour le tier 2 comme pour le tier 1. Deux assertions `declare -f`
+épinglent en plus que les deux fonctions ne sont plus définies : une fonction
+retirée peut revenir, et aucun test comportemental ne le verrait.
+
+**Le scan de tier 1 porte UNE exception, par valeur, avec son ticket, et elle
+s'auto-expire.** `_second_pass_explicit_iterate` est un lecteur de forme tier 1
+resté en bash **par décision** : l'AC1 de mika#2641 exclut nommément `ITERATE` du
+périmètre de relance, parce qu'une seconde passe qui écrit `Disposition: ITERATE`
+est une objection **lisible** et non un illisible. L'énoncé d'AC4 au corps du
+ticket — « aucun motif de tier 1 ou 2 ne subsiste dans `dispatch-lib.sh` » — est
+donc **littéralement faux** sur ce lecteur, et l'écart est **déclaré** plutôt que
+résolu en rétrécissant l'aiguille : rétrécir pour atteindre un zéro littéral serait
+choisir le **nombre** plutôt que la **conséquence**, la faute que mika#2309 refuse
+sur les budgets d'appel et que mika#1804 a redite sur les couleurs du landing.
+L'exception retire le **corps de la fonction nommée** — identité stable à travers
+un reformatage de la regex — et une assertion de péremption exige que ce corps
+porte **exactement un** lecteur : les trois façons de la rendre périmée (migration
+par mika#2641, renommage, second lecteur ajouté) rougissent toutes les trois.
+
+**Un manque est nommé plutôt qu'absorbé : il n'existe pas, côté Rust, de scan de
+portée de module pour `arch_disposition` et `arch_paraphrase`,** là où
+`plan_callout` en a un (§ 5). Rien n'empêche aujourd'hui un troisième lecteur des
+cinq tiers de naître dans un autre module Rust, et aucun test comportemental ne le
+verrait — c'est exactement la classe que le § 5 décrit. C'est un vrai trou ; il est
+écrit ici parce que le vol 6 ne le comble pas.
 
 ### Ce que la phase 2 a établi sur le maillon migrable, et qui sert aux suivantes
 
@@ -596,11 +652,25 @@ diagnostic de la seule classe d'erreur qu'il produit. L'argument ne devient déc
 que le jour décrit par le critère ci-dessus, quel que soit alors le nombre de
 prédicats.
 
-La phase 3 est la plus tentante — `_parse_disposition` et `_parse_verdict` sont les
-plus mordus du lot (mika#1421, #2037, #2338) — et elle est écartée sur mesure : ils
-rendent **deux** valeurs via un fichier, donc l'effet de bord est dans le contrat,
-et leur tier 2 est une **paraphrase** (classe A du TSV de mika#2201) dont la
-migration est un arbitrage de **tolérance**, pas un portage.
+La phase 3 était la plus tentante — `_parse_disposition` et `_parse_verdict` sont
+les plus mordus du lot (mika#1421, #2037, #2338) — et elle a longtemps été écartée
+sur mesure, pour deux raisons que la livraison n'a pas démenties mais **traitées** :
+
+- ils rendent **deux** valeurs via un fichier, donc l'effet de bord est dans le
+  contrat. Traité en gardant le canal tel quel et en le faisant écrire par le
+  shell depuis la ligne 2 de la sortie du moteur (§ *Le canal*) : l'effet de bord
+  reste où C3 le laisse, et les trois appelants ne changent pas ;
+- leur tier 2 est une **paraphrase** (classe A du TSV de mika#2201) dont la
+  migration serait un arbitrage de **tolérance** et non un portage. Traité par
+  B1 : la tolérance est portée **telle quelle**, anglaise et inerte sur les
+  réponses françaises (classe `french-inert`), et le corpus doré du vol 3 en est
+  la preuve plutôt que l'intention. La corriger est un changement de comportement,
+  donc un autre vol.
+
+Ce qui vaut pour la phase 4, et qui est la leçon à retenir de celle-ci : un maillon
+« écarté sur mesure » n'est pas un maillon refusé. Il est en attente d'une forme qui
+respecte C3 — ici, la décision écrite sur le canal — et c'est cette forme, pas une
+nouvelle volonté, qui l'ouvre.
 
 ---
 
@@ -612,12 +682,16 @@ migration est un arbitrage de **tolérance**, pas un portage.
 |---|---|---|---|
 | ticket parent, 2026-09-05 | ≈ 300 000 | — | — |
 | phase 1, 2026-09-30 | 551 330 | 9 757 | 119 |
-| **vol 3, 2026-10-19** | **741 823** | **12 844** | **146** |
+| vol 3, 2026-10-19 | 741 823 | 12 844 | 146 |
+| **vol 6, 2026-11-02** | **815 217** | **14 058** | **159** |
 
-**Le fichier a crû de ~35 % en 19 jours, et de ~2,5× en 44 jours** — pendant que
-deux phases de la migration étaient livrées. C'est la mesure qui compte pour
-dimensionner la phase 4, et elle va dans le sens inverse de l'intuition qu'une
-migration en cours fait rétrécir sa source.
+**Le fichier a crû de ~10 % en 14 jours, et de ~2,7× en 58 jours** — pendant que
+**trois** phases de la migration étaient livrées, et alors même que la phase 3
+retirait de ce fichier les deux tables de paraphrase et les deux corps fuzzy. C'est
+la mesure qui compte pour dimensionner la phase 4, et elle va dans le sens inverse
+de l'intuition qu'une migration en cours fait rétrécir sa source : un retrait de
+quelques centaines de lignes est noyé par ce que le fichier gagne par ailleurs sur
+la même fenêtre.
 
 La part des prédicats purs mesurée à la phase 1 — de l'ordre de **1 600 lignes sur
 9 757**, les ~84 % restants étant de la **glue** (bwrap, git, gh, traps, worktree,
@@ -723,6 +797,14 @@ qui marche* (mika#2205).
 - `crates/mika-cli/src/commands/plan_callout.rs` — le canal et ses trois codes
 - `crates/mika-agent/tests/fixtures/plan_callout_bodies/` — le corpus commun
 - `crates/mika-agent/tests/plan_callout_parity.rs` — le lecteur Rust du corpus
-- `skills/bundled/_shared/test-dispatch-lib.sh` — le lecteur bash et le scan R5
+- `crates/mika-agent/src/arch_disposition.rs` — l'entrée unique des cinq tiers
+- `crates/mika-agent/src/arch_paraphrase.rs` — le tier 2, appelé par `decide` seul
+- `crates/mika-agent/tests/fixtures/arch_paraphrase_texts/` — le corpus doré des
+  cinq tiers, et `crates/mika-agent/tests/arch_paraphrase_parity.rs` son lecteur
+- `skills/bundled/_shared/test-dispatch-lib.sh` — le lecteur bash, le scan R5 du
+  callout, et les deux scans anti-copie de la disposition (assertions
+  « mika#2194 (AC4) » : tier 2 au vol 5, tier 1 au vol 6)
+- `skills/bundled/_shared/tests/lib-mika-bin.sh` — la résolution du binaire `mika`
+  pour les suites bash, partagée plutôt que recopiée
 - `scripts/canonical-tokens.tsv` — l'inventaire des sites de match (mika#2201)
 - `docs/solutions/architecture-patterns/guard-parser-must-be-as-permissive-as-downstream-consumer-2026-08-29.md`
