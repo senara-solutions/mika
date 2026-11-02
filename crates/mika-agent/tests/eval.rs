@@ -245,6 +245,12 @@ mod eval {
     // tête. Il ne lit jamais un échec de lecture comme du vert.
     mod test_ci_read_token_gate_2963;
 
+    // mika#2965 — AC1 : la résolution du jeton de lecture CI est unique dans
+    // `server/handlers.rs`, et les trois handlers webhook la reçoivent. Un scan
+    // de source, parce que deux résolutions successives rendraient le même
+    // jeton et laisseraient tout test de comportement vert.
+    mod test_ci_read_token_handlers_2965;
+
     // mika#2519 — l'exemption de plan dependabot existait deux fois et ne tenait
     // pas : le `block[pipeline]` que Step 1.6 rend inatteignable est refusé
     // avant le sous-processus, et un `pass` sur un saut de MAJEURE exige une

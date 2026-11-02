@@ -69,6 +69,7 @@ use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     CheckClassification, ci_read_token_or_pat, classify_checks, run_gh_checks, run_gh_subprocess,
 };
+use mika_common::ci_read::CiReadToken;
 
 use super::ci_success_handler::{PrInfo, find_open_pr};
 use super::verdict_handler::VerdictAction;
@@ -265,11 +266,18 @@ async fn log_no_action(
 /// [`surface_for_adoption`], **after** the dispatchable-repo term, so a
 /// misconfigured value is named on the population that would have been notified
 /// rather than on every CI failure the fleet sees.
+///
+/// `ci_read_token` est le jeton de **lecture** de CI (mika#2963, câblé par
+/// mika#2965), résolu une seule fois dans `server/handlers.rs` et transmis à
+/// [`fetch_failure_context`]. Second jeton à côté de `github_token`, jamais son
+/// remplaçant : App-first, parce qu'un PAT fine-grained ne lit pas
+/// `statusCheckRollup`.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_ci_failure(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -459,7 +467,7 @@ pub async fn try_handle_ci_failure(
     // 8. Fetch failing checks and job logs for context
     //    Done BEFORE incrementing ci_fix_count so transient CI self-healing
     //    doesn't waste a circuit-breaker slot (COR-002).
-    let failure_context = fetch_failure_context(pr.number, &event.repo, token).await;
+    let failure_context = fetch_failure_context(pr.number, &event.repo, token, ci_read_token).await;
 
     // 8b. If CI self-healed between the event and our check, abort without
     //     incrementing the counter — no dispatch needed.
@@ -936,7 +944,12 @@ struct FailureContext {
 /// context for a larger prompt with no measurement asking for it. The follow-up
 /// is conditioned on a measurement showing a repair context whose useful log was
 /// missing because lints occupied the `MAX_FAILING_JOBS` slots.
-async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> FailureContext {
+async fn fetch_failure_context(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+    ci_read_token: Option<&CiReadToken>,
+) -> FailureContext {
     let mut ctx = FailureContext {
         failing_checks: Vec::new(),
         job_logs: Vec::new(),
@@ -945,9 +958,13 @@ async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> Failu
 
     // Fetch checks with timeout
     //
-    // mika#2963 — `None` : pas de `ToolContext` ici, repli PAT explicite, dit
-    // dans le log (`source = "pat"`).
-    let ci_token = ci_read_token_or_pat(None, token);
+    // mika#2963, câblé par mika#2965 — jeton App-first résolu une seule fois
+    // dans `server/handlers.rs`, descendu par `try_handle_ci_failure`. Le repli
+    // au PAT reste atteignable (pas d'App, ou échange échoué) ; il dégrade vers
+    // le régime d'avant mika#2963 et la ligne `ci_read_token_source` nomme la
+    // source. Ici l'enjeu n'est pas un merge mais le contexte de réparation : au
+    // PAT, `ctx.error` porte l'échec de lecture au lieu des checks rouges.
+    let ci_token = ci_read_token_or_pat(ci_read_token, token);
     let checks = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         run_gh_checks(pr_number, repo, &ci_token),
