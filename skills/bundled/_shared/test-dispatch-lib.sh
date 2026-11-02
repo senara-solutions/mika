@@ -11189,9 +11189,14 @@ M2194_EXTRACT_SRC_EARLY=$(sed -n '/^_extract_plan_path()/,/^}/p' "$DISPATCH_LIB"
 M2194_NEEDLE='Plan:(\\)?\*(\\)?\*'
 M2194_READER='grep|sed|awk|=~|case[[:space:]]|expr[[:space:]]'
 
-m2194_read_sites() { # lit sur stdin, rend le compte des lignes de LECTURE portant le motif
+# L'aiguille est un PARAMÈTRE depuis le vol 6 de mika#2194, et non une copie du
+# pipeline : le scan de tier 1 (plus bas, AC4) pose la même question sur une
+# autre aiguille. Le recopier créerait deux lecteurs de « quelles lignes de
+# commande LISENT ce motif » — précisément la classe que ce ticket migre. Le
+# corps, le discriminant et la sémantique de retour sont inchangés.
+m2194_read_sites() { # $1 = aiguille ERE ; lit sur stdin, rend le compte des lignes de LECTURE
     grep -v '^[[:space:]]*#' \
-        | grep -E -- "$M2194_NEEDLE" \
+        | grep -E -- "$1" \
         | grep -Ec -- "$M2194_READER" || true
 }
 
@@ -11209,7 +11214,7 @@ m2194_read_sites() { # lit sur stdin, rend le compte des lignes de LECTURE porta
 #    pas moins : ce sont eux qui distinguent « zéro lecteur » de « le prédicat ne
 #    regarde rien » (classe mika#2205), et sur un zéro il n'y a plus de
 #    population positive pour le faire à leur place.
-M2194_READ_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites)
+M2194_READ_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites "$M2194_NEEDLE")
 assert_eq "mika#2608 (R7): ZÉRO lecteur bash du callout — les deux de phase 2 ont migré" \
     "0" "$M2194_READ_COUNT"
 
@@ -11218,18 +11223,18 @@ assert_eq "mika#2608 (R7): ZÉRO lecteur bash du callout — les deux de phase 2
 # migré. Les deux assertions de la phase 1 s'INVERSENT plutôt que de disparaître.
 M2194_COMMITTED_SRC=$(sed -n '/^_committed_plan_on_branch()/,/^}/p' "$DISPATCH_LIB")
 assert_eq "mika#2608 (R7): _committed_plan_on_branch ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_COMMITTED_SRC" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_COMMITTED_SRC" | m2194_read_sites "$M2194_NEEDLE")"
 assert_contains "mika#2608 (R7): …et elle délègue au canal" \
     "_extract_plan_path" "$M2194_COMMITTED_SRC"
 M2194_WORKTREE_SRC=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
 assert_eq "mika#2608 (R7): _set_up_worktree ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_WORKTREE_SRC" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_WORKTREE_SRC" | m2194_read_sites "$M2194_NEEDLE")"
 assert_contains "mika#2608 (R7): …et son \`elif\` délègue au canal" \
     "_extract_plan_path" "$M2194_WORKTREE_SRC"
 
 # Et le site que ce ticket bascule n'en est PLUS un : c'est le livrable de R3.
 assert_eq "mika#2194 (R5): _extract_plan_path ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_EXTRACT_SRC_EARLY" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_EXTRACT_SRC_EARLY" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°1 : sur une fixture portant le motif ÉCHAPPÉ en
 # position de lecture, le prédicat DOIT accuser. Sans lui, « aucun site » est
@@ -11238,13 +11243,13 @@ assert_eq "mika#2194 (R5): _extract_plan_path ne lit plus le motif" "0" \
 # livrable.
 M2194_FX_PCRE='    path=$(printf "%s\n" "$body" | grep -oP "^> - \*\*Plan:\*\* `\K[^`]+")'
 assert_eq "mika#2194 (R5, contrôle négatif a): le prédicat accuse un PCRE échappé" "1" \
-    "$(printf '%s\n' "$M2194_FX_PCRE" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_PCRE" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°2 : la forme NON échappée aussi (un `case` sur le
 # littéral, la façon dont un futur lecteur bash le plus simple s'écrirait).
 M2194_FX_LITERAL='    case "$body" in *"> - **Plan:**"*) printf yes ;; esac'
 assert_eq "mika#2194 (R5, contrôle négatif b): le prédicat accuse un littéral lu" "1" \
-    "$(printf '%s\n' "$M2194_FX_LITERAL" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_LITERAL" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°3 — celui qui borne la population : l'ÉCRIVAIN du
 # callout porte le motif et ne doit PAS être accusé. Sans ce contrôle, la
@@ -11252,7 +11257,7 @@ assert_eq "mika#2194 (R5, contrôle négatif b): le prédicat accuse un littéra
 # plus rien.
 M2194_FX_WRITER='> - **Plan:** \`${plan_relpath}\` (committed on branch @ \`${head_sha}\`)'
 assert_eq "mika#2194 (R5, contrôle négatif c): l'écrivain du callout est hors population" "0" \
-    "$(printf '%s\n' "$M2194_FX_WRITER" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_WRITER" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Et l'anti-vacuité de la population elle-même : le motif DOIT encore apparaître
 # dans dispatch-lib. Le seuil passe de 3 à 1 avec la phase 2, et cette
