@@ -11473,6 +11473,72 @@ assert_contains "mika#2194 (vol 5, AC3): _deliver_callback annexe le refus du le
 assert_contains "mika#2194 (vol 5): le trap de sortie nettoie le fichier de refus" \
     "_ARCH_DISPOSITION_REFUSAL_FILE" "$(declare -f _dispatch_lib_exit_trap)"
 
+# ── AC3 par le COMPORTEMENT, aux deux polarités, dans le même bloc (revue du vol 5).
+#
+# Les assertions ci-dessus lisent le SOURCE : elles disent que les enveloppes
+# nomment le refus, pas qu'un refus traverse réellement le `$(...)` jusqu'au
+# `RESULT`. Ici `mika` est remplacé par une fonction du shell, ce qui exerce le
+# vrai chemin des enveloppes sans dépendre du binaire, donc sans porte de SKIP :
+#   - polarité positive : le moteur sort à 3. Jeton vide, enveloppe à 0 (le
+#     contrat de retour que les trois appelants lisent sous errexit), motif
+#     `subcommand_error` dans le fichier de refus ;
+#   - polarité négative : le moteur lit un jeton. Jeton rendu, fichier de refus
+#     ABSENT. Sans elle, « refuse quand il faut » et « refuse toujours » se
+#     liraient pareil.
+# Chaque cas tourne dans un sous-shell, pour que la fonction `mika` ne masque pas
+# le binaire dans la suite du fichier.
+for m2194_fn in _parse_disposition _parse_verdict; do
+    M2194_REFUSED=$(
+        mika() { return 3; }
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+        m2194_rc=0
+        m2194_tok=$(printf 'Disposition: READY\nVerdict: GROOMED\n' | "$m2194_fn" 2>/dev/null) || m2194_rc=$?
+        printf 'tok=[%s] rc=%s refus=[%s]' "$m2194_tok" "$m2194_rc" \
+            "$(cat "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null || true)"
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    )
+    assert_contains "mika#2194 (vol 5, AC3+): $m2194_fn sur moteur en échec rend un jeton vide" \
+        "tok=[] rc=0" "$M2194_REFUSED"
+    assert_contains "mika#2194 (vol 5, AC3+): $m2194_fn sur moteur en échec écrit le motif nommé" \
+        "refus=[subcommand_error: la sous-commande" "$M2194_REFUSED"
+
+    M2194_SAIN=$(
+        mika() { printf 'READY\n1a\n'; return 0; }
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+        m2194_rc=0
+        m2194_tok=$(printf 'Disposition: READY\n' | "$m2194_fn" 2>/dev/null) || m2194_rc=$?
+        printf 'tok=[%s] rc=%s refus=%s' "$m2194_tok" "$m2194_rc" \
+            "$(if [ -e "$_ARCH_DISPOSITION_REFUSAL_FILE" ]; then printf 'present'; else printf 'absent'; fi)"
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    )
+    assert_eq "mika#2194 (vol 5, AC3-): $m2194_fn sur réponse saine ne refuse rien" \
+        "tok=[READY] rc=0 refus=absent" "$M2194_SAIN"
+done
+
+# L'annexe, par le comportement : le motif atteint le `RESULT` une fois et une
+# seule (idempotence, deux appels), et un `RESULT` sans refus en attente sort
+# intact (polarité négative).
+M2194_ANNEXE=$(
+    printf '%s' 'subcommand_error: sonde' > "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    RESULT="corps du résultat"
+    _annex_arch_disposition_refusal
+    _annex_arch_disposition_refusal
+    rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    printf '%s' "$RESULT"
+)
+assert_eq "mika#2194 (vol 5, AC3+): l'annexe porte le motif dans le RESULT, une seule fois" \
+    "1" "$(grep -cF -- 'REFUSED (arch-disposition, mika#2194) subcommand_error: sonde' <<<"$M2194_ANNEXE" || true)"
+assert_contains "mika#2194 (vol 5, AC3+): l'annexe garde le corps du RESULT" \
+    "corps du résultat" "$M2194_ANNEXE"
+M2194_ANNEXE_VIDE=$(
+    rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    RESULT="corps du résultat"
+    _annex_arch_disposition_refusal
+    printf '%s' "$RESULT"
+)
+assert_eq "mika#2194 (vol 5, AC3-): sans refus en attente, l'annexe laisse le RESULT intact" \
+    "corps du résultat" "$M2194_ANNEXE_VIDE"
+
 # ============================================================================
 # mika#2608 R6 — l'inventaire du jeton dans `canonical-tokens.tsv`, fermé à UNE
 # ============================================================================

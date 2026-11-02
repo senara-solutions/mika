@@ -9806,6 +9806,12 @@ _DISPOSITION_FUZZY_FILE="${TMPDIR:-/tmp}/.dispatch-lib-fuzzy-$$"
 # entre donc dans le trap `EXIT` de `_dispatch_lib_exit_trap`, à côté de son
 # jumeau. La phase 4 retirera les deux ensemble.
 _ARCH_DISPOSITION_REFUSAL_FILE="${TMPDIR:-/tmp}/.dispatch-lib-arch-refusal-$$"
+# Vidé AU CHARGEMENT aussi, pas seulement par le trap : un processus tué sans
+# trap (SIGKILL, OOM) laisse son fichier, et le `$$` recyclé d'un dispatch
+# ultérieur l'annexerait comme son propre refus. La bibliothèque est sourcée une
+# fois par handler, en tête : ce `rm` ne peut effacer que le résidu d'un autre
+# processus, jamais un refus du dispatch en cours.
+rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null || true
 
 _disposition_was_fuzzy() {
     # Returns 0 (true) if the last _parse_disposition/_parse_verdict call used
@@ -9838,7 +9844,9 @@ _engine_escalation_line() {
 # et rendent ce que le moteur a lu. Les cinq tiers — marqueur retenu (mika#2037),
 # escalade du moteur (mika#2338), `Disposition:`/`Verdict:` littéral, tolérance de
 # reprise de session (mika#1421 v3 et son miroir), paraphrase — vivent désormais
-# dans `crates/mika-cli/src/commands/arch_disposition.rs`, dans cet ordre.
+# dans `crates/mika-agent/src/arch_disposition.rs`, dans cet ordre.
+# `crates/mika-cli/src/commands/arch_disposition.rs` n'est que le canal : il lit
+# le fichier, appelle `decide` et formate deux lignes.
 #
 # **Le corps passe par un FICHIER, jamais par argv.** C'est la classe de panne
 # cpp#157 (portée des guillemets) : une réponse d'architecte contient des

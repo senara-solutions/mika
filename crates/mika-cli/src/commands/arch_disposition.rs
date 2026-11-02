@@ -309,6 +309,26 @@ mod tests {
         }
     }
 
+    /// Les trois codes de sortie de [`run`], qui sont le format de fil lu par les
+    /// deux enveloppes bash : `0` jeton lu, `1` aucun jeton, `EXIT_UNREADABLE`
+    /// fichier illisible. Les tests ci-dessus portent sur [`outcome`] ; celui-ci
+    /// épingle la traduction en code, que seule une suite bash exerçait.
+    #[test]
+    fn mika2194_run_rend_les_trois_codes_du_canal() {
+        let dir = tempfile::tempdir().expect("répertoire temporaire");
+        let saine = dir.path().join("saine.md");
+        std::fs::write(&saine, "Disposition: READY\n").expect("écriture");
+        let sans_jeton = dir.path().join("sans-jeton.md");
+        std::fs::write(&sans_jeton, "Aucune disposition ici.\n").expect("écriture");
+
+        assert_eq!(run(&saine, ArchPass::First), 0);
+        assert_eq!(run(&sans_jeton, ArchPass::First), 1);
+        assert_eq!(
+            run(&dir.path().join("absent.md"), ArchPass::First),
+            EXIT_UNREADABLE
+        );
+    }
+
     /// Le code `1` porte deux populations, et c'est la ligne 2 qui les sépare.
     ///
     /// `0` = le moteur a retiré la disposition (une absence **décidée**),
