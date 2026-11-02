@@ -8,7 +8,9 @@ Les **quatre** lecteurs bash et Rust du callout `Plan` délèguent à
 **zéro** tenu par un scan, et la tolérance du quatrième
 (`milestone_manager::reader::plan_callout_present`) est **conservée par décision**
 avec sa raison structurelle. Les phases 3 et 4 sont nommées ici et **aucune n'est
-ouverte**.
+ouverte**. La décision d'AC5 de la phase 3 (famille de sous-commandes plate, critère
+de bascule remplacé) est inscrite au § 6 depuis le 2026-11-02 ; le passage de la
+phase 3 à « livrée » viendra avec le vol 5.
 
 Ce document ne décrit pas un programme souhaitable : il décrit ce que **deux**
 maillons ont établi, pour que le suivant ne redécouvre pas les mêmes bornes. Tout
@@ -545,25 +547,54 @@ miroir CLI des deux champs de `PlanCallout`, et le retirer ferait du canal un
 miroir partiel du lecteur) ; son absence d'appelant est **dite** plutôt que
 découverte.
 
-**La famille de sous-commandes reste PLATE, et le critère de bascule est écrit.**
+**La famille de sous-commandes reste PLATE, et son critère de bascule est remplacé
+(2026-11-02).**
 La phase 2 n'ajoute **aucune** sous-commande et **aucun** drapeau : ses deux usages
 nouveaux sont le **même** prédicat, réutilisé — la distinction 0/1 du canal *est* la
 réponse booléenne du second site. La population des sous-commandes de prédicat est
 donc encore **un**, et nommer une famille pour une population de un est le geste que
 ce dépôt a refusé deux fois par écrit (mika#2329, le fichier sentinelle paramétré
-livré avec un seul usage ; mika#2201, les allowlists livrées vides). **Critère de
-bascule, pour que la phase 3 n'ait pas à le redériver : la seconde sous-commande de
-prédicat distincte.** Tant qu'il n'y en a qu'une, la famille n'a rien à grouper.
+livré avec un seul usage ; mika#2201, les allowlists livrées vides). Le critère qui
+dit quand grouper est, depuis le 2026-11-02 :
+
+> **Grouper quand les prédicats cessent d'être des instruments de diagnostic.**
+> Tant que chaque sous-commande de prédicat est aussi quelque chose qu'un
+> opérateur rejoue à la main pour diagnostiquer un refus `≥2`, elle appartient au
+> namespace de tête, à côté de `token` et `credential-helper`, qui sont la même
+> espèce. Le jour où un prédicat existe qu'un opérateur n'a aucune raison
+> d'invoquer, la famille a quelque chose à grouper — et c'est ce jour-là, pas au
+> deuxième membre, que `mika predicate <nom>` se paie.
+
+**L'ancien critère est remplacé, et il reste cité ici pour qu'on sache ce qu'il
+était.** La phase 2 l'avait écrit ainsi :
+
+> **Critère de bascule, pour que la phase 3 n'ait pas à le redériver : la seconde
+> sous-commande de prédicat distincte.** Tant qu'il n'y en a qu'une, la famille n'a
+> rien à grouper.
+
+Il a été remplacé le 2026-11-02, à la décision d'AC5 de la phase 3. Il comptait un
+nombre et non une conséquence : il déclenchait le regroupement au deuxième membre,
+quelle que soit la nature de ce membre. Et sa prémisse, que `mika predicate <nom>`
+dise « ceci n'est pas pour vous », est fausse pour des instruments que l'opérateur
+rejoue à la main pour diagnostiquer un refus `≥2`. Le remplacement suit le bearing
+de Prime sur mika#2194
+([commentaire du 2026-11-02](https://github.com/senara-solutions/mika/issues/2194#issuecomment-6573335138)).
 
 Le coût du report est borné et lisible : un renommage ultérieur produit l'état
 « dispatch-lib neuf + `mika` ancien » pendant une fenêtre de déploiement, où `mika`
 sort non-zéro sur une sous-commande inconnue ⇒ code `≥ 2` ⇒ refus **bruyant et
 nommé** (`subcommand_error`), jamais un chemin vide — et cet état n'est pas produit
-par `make deploy` (le binaire qui seede est celui qui est installé). L'alternative
-refusée, pour qu'elle ne soit pas re-proposée à l'aveugle : `mika predicate <nom>`
-dirait « ceci n'est pas pour vous » sur un namespace de tête qui porte déjà 22
-sous-commandes d'opérateur. C'est un vrai argument, et il devient décisif au
-**deuxième** prédicat, pas au premier.
+par `make deploy` (le binaire qui seede est celui qui est installé).
+
+**L'alternative `mika predicate <nom>` reste refusée, avec sa raison écrite, pour
+qu'elle ne soit pas re-proposée à l'aveugle au troisième prédicat.** Elle dirait
+« ceci n'est pas pour vous » sur un namespace de tête qui porte déjà 22
+sous-commandes d'opérateur. La phase 2 jugeait cet argument décisif au deuxième
+prédicat. Il ne l'est pas : tant qu'un prédicat sert à diagnostiquer un refus, il
+est pour l'opérateur, et le cacher sous un namespace rend plus difficile le
+diagnostic de la seule classe d'erreur qu'il produit. L'argument ne devient décisif
+que le jour décrit par le critère ci-dessus, quel que soit alors le nombre de
+prédicats.
 
 La phase 3 est la plus tentante — `_parse_disposition` et `_parse_verdict` sont les
 plus mordus du lot (mika#1421, #2037, #2338) — et elle est écartée sur mesure : ils
