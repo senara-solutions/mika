@@ -48,48 +48,22 @@ FAIL=0
 SKIPPED=0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Le binaire `mika`, résolu UNE fois et PARTAGÉ (mika#2608 R4)
+# Le binaire `mika`, résolu UNE fois et PARTAGÉ — désormais par une bibliothèque
+# commune aux DEUX suites (mika#2608 R4, déplacé par mika#2194 vol 5 R6).
 #
 # Depuis mika#2194 `_extract_plan_path` invoque `mika` par son nom, et depuis
 # mika#2608 les deux lecteurs bash du callout délèguent à cette fonction. Donc
 # les douze cas fonctionnels de la porte de grooming (`test_groom_gate_*`,
-# invoqués vers la ligne 4210) en dépendent AUSSI — et ils tournent bien avant
-# le bloc mika#2194, qui portait cette résolution en local.
+# invoqués vers la ligne 4210) en dépendent AUSSI.
 #
-# Trois portes, dans l'ordre : le PATH (le cas production), puis les deux cibles
-# cargo (le cas dev, et CI où `cargo test` précède `make test-dispatch-lib`).
-#
-# Le PATH est augmenté pour TOUT le fichier plutôt que par bloc : `mika` est
-# appelé par son nom au fond de dispatch-lib, donc un bloc qui oublierait de
-# l'augmenter skipperait sans le dire — l'inverse du contrat de la troisième
-# colonne. Aucune variable de production n'est introduite : c'est le PATH.
-MIKA_BIN=""
-if command -v mika >/dev/null 2>&1; then
-    MIKA_BIN="$(command -v mika)"
-else
-    for _mika_cand in "$SCRIPT_DIR/../../../target/debug/mika" "$SCRIPT_DIR/../../../target/release/mika"; do
-        if [ -x "$_mika_cand" ]; then MIKA_BIN="$_mika_cand"; break; fi
-    done
-fi
-if [ -n "$MIKA_BIN" ]; then
-    PATH="$(cd "$(dirname "$MIKA_BIN")" && pwd -P):$PATH"
-    export PATH
-fi
-
-# `mika_bin_or_skip <étiquette>` — rend 0 si le binaire est là, sinon compte un
-# SKIP BRUYANT et rend 1. Le SKIP est bruyant parce qu'un bloc de porte qui n'a
-# pas pu s'armer ne doit pas se lire comme un vert (mika#2149, troisième
-# colonne). CI construit avant (`cargo test` précède `make test-dispatch-lib`
-# dans `ci.yml`), donc le SKIP est le cas dev, pas le cas CI.
-mika_bin_or_skip() {
-    [ -n "$MIKA_BIN" ] && return 0
-    SKIPPED=$((SKIPPED + 1))
-    echo "  ⊘ SKIP $1 — binaire 'mika' introuvable (PATH, target/debug, target/release)."
-    echo "    Depuis mika#2608 les deux lecteurs bash du callout délèguent à"
-    echo "    'mika plan-callout' : sans le binaire ce bloc ne peut RIEN mesurer."
-    echo "    Remède : cargo build -p mika-cli --bin mika"
-    return 1
-}
+# Le vol 5 ajoute un second dépendant hors de ce fichier : depuis la bascule,
+# `_parse_disposition` et `_parse_verdict` appellent `mika arch-disposition`, et
+# `tests/test_parse_disposition.sh` les exerce sur 55 cas. La résolution est donc
+# sortie d'ici vers `tests/lib-mika-bin.sh`, SOURCÉE par les deux — pas recopiée.
+# Recopier reproduirait, dans le geste qui retire une seconde implémentation du
+# bash, le défaut que ce geste existe pour fermer.
+# shellcheck source=skills/bundled/_shared/tests/lib-mika-bin.sh
+source "$SCRIPT_DIR/tests/lib-mika-bin.sh"
 
 assert_eq() {
     local label="$1" expected="$2" actual="$3"
@@ -719,6 +693,26 @@ echo "-----------------------------------------"
 # shellcheck disable=SC1090
 source "$DISPATCH_LIB" 2>/dev/null || true
 
+# Les trois entrées littérales des cas de tier 0 et 0b, définies AVANT la porte
+# ci-dessous : la garde de dérive de marqueur (plus bas dans ce fichier) les lit,
+# et elle tourne même quand ce bloc skippe. Les laisser à l'intérieur les rendrait
+# indéfinies sous `set -u` le jour où le binaire manque — un SKIP qui casse un
+# autre bloc n'est plus un SKIP.
+WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
+ENGINE_FINDING_MARKER="(BLOCKING) [mika-engine] review-anchor:"
+ENGINE_LINE="F1: $ENGINE_FINDING_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: paraphrase."
+
+# mika#2194 (vol 5) : depuis la bascule, les ~30 cas ci-dessous appellent
+# `_parse_disposition` / `_parse_verdict`, qui délèguent à `mika arch-disposition`.
+# Sans le binaire, chaque enveloppe prend son chemin de refus et rend un jeton
+# vide : les cas « aucun match » resteraient verts et tous les autres rougiraient,
+# ce qui est exactement le genre de rouge qui ne dit pas sa cause. Le SKIP la dit.
+# Forme reprise de la porte de grooming mika#2012/#2608 plus bas — le corps n'est
+# pas réindenté, délibérément, pour que le diff de ce vol reste lisible.
+if ! mika_bin_or_skip "mika#2194 formes littérales des deux lecteurs (~30 cas)"; then
+    : # le SKIP est déjà compté et dit par le helper
+else
+
 # _parse_disposition — recognizes the three literal forms
 assert_eq "_parse_disposition READY" "READY" \
     "$(printf 'Some prose.\nDisposition: READY\nMore prose.\n' | _parse_disposition)"
@@ -763,9 +757,13 @@ assert_eq "_parse_verdict empty on no match" "" \
 # sixth assertions below are the ones that fail if tier 0 ever moves down.
 #
 # The literal must stay in sync with DISPOSITION_WITHHELD_MARKER in
-# crates/mika-agent/src/agent_loop/mod.rs.
+# crates/mika-agent/src/agent_loop/mod.rs. `$WITHHELD_MARKER` est défini en tête
+# de ce bloc, au-dessus de la porte du binaire.
+#
+# mika#2194 (vol 5) : le tier 0 vit désormais dans le moteur, et ces cas
+# l'exercent à travers les enveloppes. Ce qu'ils gardent est inchangé — la
+# POSITION du tier 0 dans l'ordre des cinq — et ils n'ont pas changé d'attente.
 # ---------------------------------------------------------------------------
-WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
 
 assert_eq "tier 0 beats tier 1a (literal Disposition present)" "" \
     "$(printf 'Some review prose.\n%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
@@ -818,9 +816,14 @@ assert_eq "no marker — verdict tier 1a still returns GROOMED" "GROOMED" \
 #
 # The literal must stay in sync with REVIEW_ANCHOR_ENGINE_FINDING_MARKER in
 # crates/mika-agent/src/agent_loop/mod.rs (drift guard below, next to the marker's).
+# `$ENGINE_FINDING_MARKER` et `$ENGINE_LINE` sont définis en tête de ce bloc, au-dessus
+# de la porte du binaire — la garde de dérive les lit même quand ce bloc skippe.
+#
+# mika#2194 (vol 5) : le tier 0b a basculé dans le moteur comme les quatre autres,
+# mais `_engine_escalation_line` RESTE dans le bash — elle a un second appelant de
+# production, `_escalate_groom` (mika#2338), qui n'est pas un lecteur de disposition.
+# C'est la seule des cinq fonctions du bloc d'origine que ce vol conserve.
 # ---------------------------------------------------------------------------
-ENGINE_FINDING_MARKER="(BLOCKING) [mika-engine] review-anchor:"
-ENGINE_LINE="F1: $ENGINE_FINDING_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: paraphrase."
 
 assert_eq "tier 0b — engine line + Disposition: ESCALATE parses ESCALATE" "ESCALATE" \
     "$(printf 'A1: x\nA2: y\n\n%s\n\nDisposition: ESCALATE\n' "$ENGINE_LINE" | _parse_disposition 2>/dev/null)"
@@ -842,6 +845,8 @@ assert_eq "echo of the marker mid-line does not force ESCALATE on a genuine ITER
     "$(printf 'Were the anchors missing the engine would write %s here.\nDisposition: ITERATE\n' "$ENGINE_FINDING_MARKER" | _parse_disposition 2>/dev/null)"
 assert_eq "verdict parser — echo of [mika-engine] in prose keeps a genuine GROOMED" "GROOMED" \
     "$(printf 'I saw a [mika-engine] re-prompt earlier.\nA1: x\nVerdict: GROOMED\n' | _parse_verdict 2>/dev/null)"
+
+fi # fin de la porte du binaire pour les formes littérales (mika#2194, vol 5)
 
 # _trail_append + _trail_read — round-trip
 TRAIL_TMP=$(mktemp -d)
@@ -6427,26 +6432,51 @@ if [ -f "$RUST_SRC" ]; then
     assert_eq "shell allowlist matches Rust DISPATCHABLE_REPOS (no drift)" "$RUST_LIST" "$SHELL_LIST"
 fi
 
-# --- Drift guard: the withheld-disposition marker must equal the Rust constant ---
-# Same necessity as the list above: the engine side is a compile-time `&str`, not a
-# runtime-readable data file, so the literal exists in both languages. Here the stakes
-# are higher than drift-as-noise — if the two copies diverge, the engine still strips
-# the disposition but tier 0 stops recognizing the substitute, and every tier below it
-# resumes deriving a verdict from the body. The refusal would fail OPEN, silently
-# (mika#2037).
+# --- Garde de dérive du marqueur, INVERSÉE par la bascule (mika#2194, vol 5) ---
+#
+# CE QU'ELLE GARDAIT. Le littéral du marqueur de disposition retenue existait en
+# DEUX copies, une par langue, par nécessité (le côté moteur est un `&str` de
+# compilation, pas un fichier de données lisible à l'exécution). L'enjeu dépassait
+# le bruit de dérive : si les deux copies divergeaient, le moteur continuait de
+# retirer la disposition mais le tier 0 cessait de reconnaître le substitut, et
+# tous les tiers en dessous se remettaient à dériver un verdict du corps. Le refus
+# échouait OUVERT, en silence (mika#2037). La garde assérait donc que le bash
+# PORTAIT le littéral.
+#
+# CE QU'ELLE GARDE DEPUIS. Le vol 5 a retiré le tier 0 du bash : il n'y a plus
+# deux copies, il y en a une, et c'est la constante Rust. La garde est donc
+# retournée — elle assère que le littéral n'est PLUS dans le bash. Et les deux
+# moitiés tiennent ensemble :
+#   - la supprimer verdirait un arbre où le tier 0 aurait été RECOPIÉ ailleurs
+#     dans le bash (le retour que l'AC4 vise) ;
+#   - sa première moitié seule verdirait un arbre où le littéral aurait disparu
+#     DES DEUX CÔTÉS, c'est-à-dire où le tier 0 n'existerait plus du tout.
+# D'où la seconde moitié : la constante Rust a un lecteur, et c'est le moteur.
+#
+# L'extraction par `grep -oE 'const DISPOSITION_WITHHELD_MARKER: &str = "[^"]+"'`
+# est conservée telle quelle : non ancrée, elle survit au `pub(crate)` posé au
+# vol 4.
+#
+# Noter l'asymétrie avec le tier 0b, juste en dessous : `_engine_escalation_line`
+# est CONSERVÉE dans le bash (second appelant de production, `_escalate_groom`,
+# mika#2338), donc sa moitié « le bash porte le littéral » reste dans son sens
+# d'origine. Les deux tiers n'ont pas basculé ensemble, et le test le dit.
 ANCHOR_RUST_SRC="$REPO_ROOT/crates/mika-agent/src/agent_loop/mod.rs"
 if [ -f "$ANCHOR_RUST_SRC" ]; then
     RUST_MARKER=$(grep -oE 'const DISPOSITION_WITHHELD_MARKER: &str = "[^"]+"' "$ANCHOR_RUST_SRC" \
         | sed 's/.*= "//; s/"$//')
-    assert_eq "shell tier-0 marker matches Rust DISPOSITION_WITHHELD_MARKER (no drift)" \
-        "$RUST_MARKER" "$WITHHELD_MARKER"
-    # The shell parser must actually contain the literal, not merely compare equal to a
-    # variable this test defined.
-    if grep -qF "$RUST_MARKER" "$DISPATCH_LIB"; then
-        assert_eq "dispatch-lib carries the marker literal" "yes" "yes"
-    else
-        assert_eq "dispatch-lib carries the marker literal" "yes" "no"
-    fi
+    # Moitié 1 — le littéral a bien quitté le bash. `$WITHHELD_MARKER` reste
+    # défini par cette suite : c'est l'entrée des cas de tier 0 ci-dessus, qui
+    # exercent désormais le moteur à travers les enveloppes.
+    assert_eq "mika#2194: le littéral du tier 0 n'est plus dans dispatch-lib.sh" "no" \
+        "$(if grep -qF "$RUST_MARKER" "$DISPATCH_LIB"; then printf 'yes'; else printf 'no'; fi)"
+    # Moitié 2 — anti-vacuité de la précédente : le marqueur existe toujours, et
+    # il a un lecteur unique. Un arbre où la constante a disparu des deux côtés
+    # passerait la moitié 1 et rougit ici.
+    assert_eq "mika#2194: la constante Rust du tier 0 existe (lecteur unique)" "yes" \
+        "$(if [ -n "$RUST_MARKER" ]; then printf 'yes'; else printf 'no'; fi)"
+    assert_eq "mika#2194: le moteur est le lecteur du marqueur du tier 0" "yes" \
+        "$(if grep -rqF "DISPOSITION_WITHHELD_MARKER" "$REPO_ROOT/crates/mika-agent/src/arch_disposition.rs" 2>/dev/null; then printf 'yes'; else printf 'no'; fi)"
     # mika#2338 — same necessity, same shape, for the engine escalation line. If the two
     # copies diverge, tier 0b stops recognizing the engine's line and the escalation falls
     # through to the unanchored textual tiers.
@@ -11278,6 +11308,172 @@ assert_contains "mika#2194: _deliver_callback annexe le refus" \
     "_annex_plan_callout_refusal" "$M2194_DELIVER_SRC"
 
 # ============================================================================
+# mika#2194 vol 5 (AC4) — le scan anti-copie des TABLES DE TIER 2
+# ============================================================================
+#
+# Ce que le scan ci-dessus borne, c'est le motif du callout. Celui-ci borne
+# l'autre table que le vol 5 retire : les paraphrases du tier 2, qui vivaient
+# dans `_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` — déclarées
+# TEMPORAIRES au vol 3, donc explicitement en attente de ce retrait. Leur foyer
+# unique est désormais `arch_paraphrase::paraphrase`, avec son corpus doré.
+#
+# Pourquoi un scan et pas la seule disparition des deux fonctions : une fonction
+# retirée ne garantit rien sur ses littéraux. Le mode de rechute n'est pas « la
+# fonction revient » — personne ne la réécrira sous son nom — c'est « quelqu'un
+# recopie trois lignes de la table à l'endroit où il en a besoin », exactement ce
+# que le vol 3 a vu arriver une fois.
+#
+# La population : les lignes de COMMANDE de `dispatch-lib.sh`, commentaires
+# retirés d'abord. La doctrine de ce fichier cite abondamment les tiers et doit
+# pouvoir continuer — c'est le corps qu'on mesure, jamais la prose qui le décrit.
+#
+# ── CINQ DES QUINZE CHAÎNES DE LA TABLE SONT ÉCARTÉES PAR NOM, avec leur raison.
+#
+#    `escalate`, `fundamental`, `revise`, `proceed` et `dispatch` sont des mots
+#    courants de ce fichier (`dispatch` y est partout : c'est son nom). Une
+#    assertion qui les inclurait serait ROUGE À LA NAISSANCE, donc désarmée dans
+#    la semaine — et une garde désarmée est pire qu'une garde absente, parce
+#    qu'elle se lit comme une garde. Les dix qui restent sont les
+#    DISCRIMINANTES : des locutions de paraphrase d'architecte, qu'aucun autre
+#    besoin de ce fichier n'a de raison d'écrire.
+M2194_T2_NEEDLES=(
+    "human review"
+    "cannot proceed"
+    "out of scope for"
+    "needs revision"
+    "another pass"
+    "address the following"
+    "concerns that require"
+    "ship it"
+    "good to go"
+    "plan is clean"
+)
+
+# ── UNE exception PAR VALEUR, et elle s'auto-nettoie.
+#
+#    `human review` subsiste une fois sur une ligne de commande, dans le `RESULT`
+#    que `_halt_groom` compose : « Verdict: ESCALATE — human review required. »
+#    C'est une chaîne PRODUITE, pas un motif LU — l'inverse exact de ce que le
+#    scan refuse. L'exception est par valeur et non par fichier ni par fonction
+#    (doctrine mika#1804 / mika#2309), et l'assertion ci-dessous la rend
+#    AUTO-NETTOYANTE : le jour où `_halt_groom` cesse d'écrire cette ligne,
+#    l'exception rougit et on la retire. Le geste qui la rend inutile est celui
+#    qui la fait expirer.
+M2194_T2_EXCEPTION='Verdict: ESCALATE — human review required.'
+
+m2194_t2_offenders() { # rend le compte des lignes de commande portant une paraphrase
+    local needle count=0 n
+    for needle in "${M2194_T2_NEEDLES[@]}"; do
+        n=$(printf '%s\n' "$M2194_CMD_LINES" \
+            | grep -vF -- "$M2194_T2_EXCEPTION" \
+            | grep -ciF -- "$needle" || true)
+        count=$((count + n))
+    done
+    printf '%s' "$count"
+}
+
+assert_eq "mika#2194 (AC4): aucune paraphrase de tier 2 ne subsiste dans dispatch-lib.sh" \
+    "0" "$(m2194_t2_offenders)"
+
+assert_eq "mika#2194 (AC4): l'exception \`human review\` a encore son écrivain (auto-nettoyage)" \
+    "1" "$(printf '%s\n' "$M2194_CMD_LINES" | grep -cF -- "$M2194_T2_EXCEPTION" || true)"
+
+# Contrôle de bonne foi POSITIF : sur une fixture qui recopie trois lignes de la
+# table, le prédicat DOIT accuser. Sur un zéro il n'y a plus aucune population
+# pour le dire à sa place, et « zéro paraphrase » se lit exactement comme « le
+# prédicat ne regarde rien » (classe mika#2205).
+M2194_T2_FX='        *"ship it"*|*"good to go"*|*"plan is clean"*) printf READY ;;'
+M2194_T2_FX_HITS=0
+for m2194_needle in "${M2194_T2_NEEDLES[@]}"; do
+    M2194_T2_FX_HITS=$((M2194_T2_FX_HITS + $(printf '%s\n' "$M2194_T2_FX" | grep -ciF -- "$m2194_needle" || true)))
+done
+assert_eq "mika#2194 (AC4, contrôle positif): le prédicat accuse une table recopiée" \
+    "3" "$M2194_T2_FX_HITS"
+
+# ── LE TERME D'ANTI-VACUITÉ, mesuré sur une révision IMMUABLE.
+#
+#    Sans lui, un zéro et un prédicat aveugle se lisent pareil : si les dix
+#    chaînes n'étaient jamais des paraphrases de ce fichier, le zéro serait vrai
+#    sans rien mesurer. La population positive est donc prise dans l'arbre
+#    d'AVANT le retrait — `593a745c5`, le vol 4, un commit mergé : les dix
+#    chaînes y sont, sur des lignes de commande, dans les deux fonctions fuzzy.
+#    Le jour où elles n'y sont plus, c'est que l'assertion a cessé de mesurer son
+#    objet, et elle rougit.
+#
+#    La révision peut être INACCESSIBLE sans être fautive : `actions/checkout`
+#    clone à `fetch-depth: 1`, et l'objet n'est alors pas dans le dépôt. On
+#    distingue les deux cas — révision absente ⇒ SKIP qui se dit, révision
+#    présente mais vidée de ses chaînes ⇒ rouge. Confondre les deux donnerait soit
+#    une CI rouge sur rien, soit un vert acheté par un clone peu profond.
+M2194_T2_PRESWITCH_REV='593a745c5'
+if ! git cat-file -e "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" 2>/dev/null; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2194 (AC4, anti-vacuité) — la révision pre-switch ${M2194_T2_PRESWITCH_REV} n'est pas dans ce clone."
+    echo "    Un clone à 'fetch-depth: 1' n'a pas l'objet ; l'absence de la révision"
+    echo "    n'est pas l'absence des chaînes, et seule la seconde doit rougir."
+    echo "    Remède : git fetch --unshallow (ou fetch-depth: 0 dans le workflow)."
+else
+    M2194_T2_OLD=$(git show "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" \
+        | grep -v '^[[:space:]]*#' || true)
+    # La taille de la population est DITE : une anti-vacuité qui rougit sans
+    # nommer ce qu'elle a lu envoie chercher la cause dans la mauvaise moitié.
+    echo "    → mika#2194 (AC4): $(printf '%s\n' "$M2194_T2_OLD" | wc -l) lignes de commande lues dans ${M2194_T2_PRESWITCH_REV}"
+    # `grep -ciF` et non `grep -qiF` : sous `set -o pipefail`, un `-q` ferme le
+    # tube au premier match, `printf` meurt sur SIGPIPE, et le pipeline rend 141
+    # — donc le `if` lit FAUX sur les chaînes PRÉSENTES. Mesuré ici le
+    # 2026-11-02 : les dix comptaient zéro sur une population de 5 670 lignes.
+    # C'est la classe de panne que ce ticket existe pour sortir du bash, et elle
+    # mord jusque dans le test qui l'énonce.
+    M2194_T2_OLD_COVERED=0
+    for m2194_needle in "${M2194_T2_NEEDLES[@]}"; do
+        if [ "$(printf '%s\n' "$M2194_T2_OLD" | grep -ciF -- "$m2194_needle" || true)" -gt 0 ]; then
+            M2194_T2_OLD_COVERED=$((M2194_T2_OLD_COVERED + 1))
+        fi
+    done
+    # Les DIX, pas « au moins une » : un seuil bas laisserait neuf chaînes cesser
+    # d'être des paraphrases sans que personne ne l'apprenne.
+    assert_eq "mika#2194 (AC4, anti-vacuité): les dix chaînes étaient bien dans ${M2194_T2_PRESWITCH_REV}" \
+        "10" "$M2194_T2_OLD_COVERED"
+fi
+
+# Et les deux fonctions qui portaient la table ne sont plus définies du tout —
+# ce que la sentinelle de bascule ne dit pas : elle compte des délégations, pas
+# des absences.
+assert_eq "mika#2194 (AC4): _parse_disposition_fuzzy n'est plus définie" "no" \
+    "$(if declare -f _parse_disposition_fuzzy >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "mika#2194 (AC4): _parse_verdict_fuzzy n'est plus définie" "no" \
+    "$(if declare -f _parse_verdict_fuzzy >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
+
+# ── La forme des deux enveloppes, et le canal du refus (AC3).
+#
+# Même grille que `_extract_plan_path` ci-dessus, parce que c'est la même
+# doctrine : le corps par FICHIER (classe de portée de guillemets cpp#157), les
+# trois codes de sortie traités, et le refus qui ATTEINT le `RESULT` — un stderr
+# d'avant-pilote est perdu sur un dispatch qui réussit (classe mika#2050), et ce
+# refus laisse précisément le dispatch réussir.
+for m2194_fn in _parse_disposition _parse_verdict; do
+    M2194_W_SRC=$(declare -f "$m2194_fn")
+    assert_eq "mika#2194 (vol 5): $m2194_fn est définie" "yes" \
+        "$(if [ -n "$M2194_W_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+    assert_contains "mika#2194 (vol 5): $m2194_fn délègue à la sous-commande" \
+        "mika arch-disposition" "$M2194_W_SRC"
+    assert_contains "mika#2194 (vol 5): $m2194_fn passe la réponse par un fichier" \
+        "mktemp" "$M2194_W_SRC"
+    assert_contains "mika#2194 (vol 5, AC3): $m2194_fn nomme son refus sur le code ≥2" \
+        "_arch_disposition_refuse" "$M2194_W_SRC"
+    assert_contains "mika#2194 (vol 5): $m2194_fn écrit encore le canal fuzzy" \
+        "_DISPOSITION_FUZZY_FILE" "$M2194_W_SRC"
+done
+assert_contains "mika#2194 (vol 5, AC3): le refus porte le motif nommé" \
+    "REFUSED (arch-disposition, mika#2194)" "$(declare -f _arch_disposition_refuse)"
+assert_contains "mika#2194 (vol 5, AC3): _deliver_callback annexe le refus du lecteur" \
+    "_annex_arch_disposition_refusal" "$M2194_DELIVER_SRC"
+# Le fichier de refus est nettoyé par le trap, comme son jumeau fuzzy : deux
+# canaux `$`-suffixés, un seul endroit qui les retire.
+assert_contains "mika#2194 (vol 5): le trap de sortie nettoie le fichier de refus" \
+    "_ARCH_DISPOSITION_REFUSAL_FILE" "$(declare -f _dispatch_lib_exit_trap)"
+
+# ============================================================================
 # mika#2608 R6 — l'inventaire du jeton dans `canonical-tokens.tsv`, fermé à UNE
 # ============================================================================
 #
@@ -14941,33 +15137,49 @@ else
 fi
 
 echo ""
-echo "Test: mika#2194 — parité des cinq tiers de disposition sur le corpus doré"
-echo "-------------------------------------------------------------------------"
+echo "Test: mika#2194 — non-régression de forme du canal sur le corpus doré"
+echo "----------------------------------------------------------------------"
 
-# UN corpus, DEUX lecteurs, UN fichier d'attendus (mika#2194, vols 3 et 4).
+# UN corpus, DEUX lecteurs — mais depuis la bascule du vol 5, UN SEUL des deux
+# mesure encore quelque chose, et ce bloc n'est plus celui-là.
 #
-# Le bloc ci-dessous fait passer le corpus par _parse_disposition et
-# _parse_verdict — les lecteurs de PRODUCTION, les vrais, inchangés par ce vol.
-# Le jumeau Rust, crates/mika-agent/tests/arch_paraphrase_parity.rs, fait passer
-# le MÊME corpus et le MÊME fichier d'attendus par
-# mika_agent::arch_disposition::decide, qui n'a aucun appelant. Un attendu
-# modifié d'un seul côté redevient rouge de l'autre : c'est tout le dispositif,
-# et c'est la seule fenêtre où la parité est une preuve — après la bascule du
-# vol suivant, les deux enveloppes appelleront la sous-commande, et un lecteur
-# comparé à lui-même est toujours d'accord avec lui-même.
+# CE QUE CE BLOC ÉTAIT. Jusqu'au vol 4, `_parse_disposition` et `_parse_verdict`
+# décidaient elles-mêmes, en bash, indépendamment du Rust. Leur accord avec
+# crates/mika-agent/tests/arch_paraphrase_parity.rs sur le MÊME corpus et le MÊME
+# fichier d'attendus était donc une PREUVE DE PARITÉ : deux implémentations
+# écrites séparément tombaient d'accord, ou l'une des deux rougissait.
 #
-# CE BLOC N'ASSERTE PAS LA COLONNE « tier ». Avant la bascule, le bash n'a aucun
-# canal de sortie pour le tier : il rend le jeton sur stdout et de la prose sur
-# stderr. Ce n'est pas une lacune à combler ici — c'est le canal que le vol 5
-# ouvre (ligne 2 de stdout). Le lecteur Rust est donc le seul lecteur de cette
-# colonne, et son en-tête de TSV le dit.
+# CE QU'IL EST DEVENU. Le vol 5 a basculé les deux lecteurs : ils écrivent la
+# réponse dans un fichier et appellent `mika arch-disposition`, qui appelle le
+# MÊME `arch_disposition::decide` que le lecteur Rust. **Un lecteur comparé à
+# lui-même est toujours d'accord avec lui-même.** Ce bloc ne prouve donc plus la
+# parité, et le prétendre serait pire que de le supprimer.
+#
+# LA PREUVE, ELLE, EXISTE — et elle est ailleurs : c'est le commit `593a745c5`
+# (vol 4, PR #3014), où ce même bloc comparait le bash autonome au Rust sur ce
+# même corpus, et était vert. Immuable sur la branche. Une parité n'a pas besoin
+# d'être rejouée éternellement pour avoir eu lieu ; elle a besoin d'avoir été
+# mesurée une fois, sur un arbre qu'on peut nommer.
+#
+# POURQUOI LE GARDER ALORS. Parce qu'il mesure maintenant autre chose, qui n'a
+# aucun autre lecteur : la FORME DU CANAL. Que les deux enveloppes écrivent bien
+# le corps dans un fichier, appellent bien la sous-commande, rendent bien la
+# ligne 1 sur stdout, écrivent bien le fichier fuzzy sur un tier 2 et sur lui
+# seul, et n'avortent sur aucune des classes du corpus. Un canal cassé rougit
+# ici, sur les 28 classes du corpus plutôt que sur les trois cas d'un test
+# d'unité. C'est une non-régression, pas une preuve — et l'en-tête le dit
+# désormais au lieu de laisser croire le contraire.
+#
+# CE BLOC N'ASSERTE PAS LA COLONNE « tier ». La ligne 2 du canal l'expose
+# désormais, mais le shell ne la rend pas à ses appelants : les enveloppes la
+# consomment pour écrire le fichier fuzzy et la jettent (les trois appelants de
+# production ne lisent qu'un jeton — c'est leur contrat, et le vol 5 ne le touche
+# pas). Le lecteur Rust reste donc le seul lecteur de cette colonne.
 #
 # ET IL NE COMPARE LE FRAGMENT QUE SUR LES LIGNES DE TIER 2. Les quatre tiers de
-# tête décident sur un littéral et ne citent rien ; la prose qu'ils écrivent sur
-# stderr (note de tier 0, note d'escalade, note de reprise) n'est pas un
-# fragment, et le vol 5 la remplace par le fragment décisif. La moitié « aucun
-# fragment hors du tier 2 » est tenue côté Rust, où elle est une propriété du
-# type (`Decision::fragment` est `None`).
+# tête décident sur un littéral et ne citent rien ; la prose écrite sur stderr
+# n'est pas un fragment. La moitié « aucun fragment hors du tier 2 » est tenue
+# côté Rust, où elle est une propriété du type (`Decision::fragment` est `None`).
 #
 # Rien à ajouter à scripts/suite-wiring.tsv : ce fichier est atteint par
 # `make test-dispatch-lib`, que ci.yml:85 nomme.
@@ -14996,17 +15208,35 @@ assert_eq "mika#2194 (sentinelle): les deux lecteurs de production sont définis
     "$(if declare -f _parse_disposition >/dev/null 2>&1 \
           && declare -f _parse_verdict >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
 
-# Sentinelle PRE-SWITCH — ce qui fait de la parité une preuve plutôt qu'une
-# tautologie. Elle épingle l'état du vol 4 : les deux lecteurs décident ENCORE
-# eux-mêmes, et n'appellent pas la sous-commande. Le jour du vol 5 elle rougit,
-# et c'est son office : elle force à retirer la parité du même commit que la
-# bascule, au lieu de laisser un test vert comparer `decide` à lui-même.
+# Sentinelle DE BASCULE — la même, retournée (mika#2194, vol 5).
+#
+# Elle a été écrite au vol 4 pour épingler l'état d'avant (`== 0` : les deux
+# lecteurs décident encore eux-mêmes) et pour ROUGIR le jour de la bascule,
+# forçant l'en-tête ci-dessus à changer de camp dans le même commit. Elle a fait
+# exactement cela. Elle n'est pas supprimée pour autant — une sentinelle
+# supprimée perd son information, une sentinelle inversée la retourne : elle
+# garde désormais que la bascule A EU LIEU, dans LES DEUX fonctions.
+#
+# `== 2`, soit une occurrence littérale par corps. `declare -f` efface les
+# commentaires, donc seule l'invocation réelle compte : un corps qui se
+# remettrait à décider en bash tout en gardant la doctrine en commentaire tombe
+# à 1 et rougit. Pas d'allowlist, parce que pas de population : elle lit deux
+# fonctions nommées. Le gabarit du `mktemp` des deux corps dit `mika-arch-dispo`
+# abrégé pour ne pas porter une seconde fois le motif — voir le bloc de doctrine
+# au-dessus des deux enveloppes dans dispatch-lib.sh.
 M3_SWITCHED=$({ declare -f _parse_disposition; declare -f _parse_verdict; } 2>/dev/null \
     | grep -c 'arch-disposition' || true)
-assert_eq "mika#2194 (sentinelle pre-switch): les deux lecteurs ne délèguent pas encore au moteur" \
-    "0" "$M3_SWITCHED"
+assert_eq "mika#2194 (sentinelle de bascule): les deux lecteurs délèguent au moteur" \
+    "2" "$M3_SWITCHED"
 
+# La porte du binaire (mika#2194, vol 5 § 4). Depuis la bascule ce bloc a une
+# DÉPENDANCE DE BUILD : sans `mika`, chaque enveloppe prend son chemin de refus
+# et rend un jeton vide — ce que le corpus attend pour ses seules classes
+# inertes, donc le bloc rougirait partout ailleurs sans rien dire d'utile. Le
+# SKIP est bruyant, et c'est le cas développeur : en CI `cargo test` précède
+# `make test-dispatch-lib`.
 if [ "$M3_DECLARED" -gt 0 ] \
+    && mika_bin_or_skip "mika#2194 non-régression du canal (corpus doré)" \
     && declare -f _parse_disposition >/dev/null 2>&1 \
     && declare -f _parse_verdict >/dev/null 2>&1; then
 
@@ -15029,15 +15259,21 @@ if [ "$M3_DECLARED" -gt 0 ] \
         m3_body=$(cat "$m3_body_file")
         M3_CASES=$((M3_CASES + 1))
 
-        # Pas de `|| true` sur l'appel, et c'est délibéré. Le tier 1a de
-        # _parse_verdict ne porte PAS le `|| true` que son jumeau porte
-        # (dispatch-lib.sh l. 10047 contre l. 9961), donc l'appel peut rendre un
-        # statut non nul sur un corps sans `Verdict:`. Mesuré le 2026-11-02 sous
-        # `set -euo pipefail` : l'appel survit, les tiers 1b et 2 sont atteints,
-        # rc=0 — l'asymétrie est absorbée par la substitution de commande. Un
-        # `|| true` posé ici avalerait en revanche le code ≥ 2 que le vol 5
-        # rendra décisif (« je n'ai pas pu regarder »), et masquerait exactement
-        # la panne que ce canal existe pour nommer.
+        # Pas de `|| true` sur l'appel, et c'est délibéré — la raison a changé
+        # au vol 5, le geste non.
+        #
+        # Avant la bascule, l'absence tenait à une asymétrie des corps : le tier
+        # 1a de `_parse_verdict` ne portait pas le `|| true` de son jumeau, donc
+        # l'appel pouvait rendre un statut non nul. Les deux corps sont désormais
+        # des enveloppes identiques à la passe près, et elles rendent 0 sur TOUS
+        # leurs chemins — tiers 0 à 2, UNPARSED et refus compris — parce que les
+        # trois appelants de production capturent en `$(...)` nu sous errexit et
+        # que l'UNPARSED *est* leur chemin de reprise (mika#1823, mika#2641).
+        #
+        # Le `|| true` reste absent parce qu'il avalerait le jour où cela
+        # cesserait d'être vrai. Un statut non nul remonté ici est le signe que
+        # le contrat de retour des enveloppes a bougé — exactement la panne que
+        # ce bloc doit nommer plutôt que masquer.
         : >"$M3_ERR"
         case "$m3_pass" in
             first)

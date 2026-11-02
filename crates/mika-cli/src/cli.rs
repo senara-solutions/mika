@@ -102,6 +102,10 @@ pub enum Commands {
     /// no agent, no DB, no network
     #[command(name = "plan-callout")]
     PlanCallout(PlanCalloutArgs),
+    /// Read the disposition of an architect response (mika#2194) — pure predicate,
+    /// no agent, no DB, no network
+    #[command(name = "arch-disposition")]
+    ArchDisposition(ArchDispositionArgs),
     /// Le registre des verdicts de vol — inscrire le jugement de MPC (mika#2922)
     #[command(name = "flight-verdicts")]
     FlightVerdicts(FlightVerdictsArgs),
@@ -138,6 +142,7 @@ impl Commands {
             | Commands::Milestone(_)
             | Commands::Iterate(_)
             | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -170,6 +175,7 @@ impl Commands {
             | Commands::Milestone(_)
             | Commands::Iterate(_)
             | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_)
             | Commands::FlightVerdicts(_)
             | Commands::CredentialHelper(_) => false,
         }
@@ -203,6 +209,7 @@ impl Commands {
             | Commands::Milestone(_)
             | Commands::Iterate(_)
             | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_)
             | Commands::FlightVerdicts(_)
             | Commands::CredentialHelper(_) => None,
         }
@@ -229,6 +236,27 @@ pub struct PlanCalloutArgs {
     /// l'appartenance du plan et non le fichier à ouvrir.
     #[arg(long)]
     pub raw: bool,
+}
+
+/// `mika arch-disposition --pass <first|second> --response-file <path>` (mika#2194, vol 5).
+///
+/// **Aucune variante positionnelle, et c'est structurel** — même raison que
+/// [`PlanCalloutArgs`] : une réponse d'architecte porte des retours à la ligne,
+/// des backticks et des `$`, et la passer en argv ré-introduirait la classe de
+/// portée de guillemets dans le geste qui prétend la fermer. Le fichier est le
+/// seul canal.
+#[derive(clap::Args)]
+pub struct ArchDispositionArgs {
+    /// Quelle passe d'architecte a produit la réponse, donc quelles tables l'interrogent.
+    ///
+    /// `ArchPass` est l'énuméré du moteur, pris tel quel : un jumeau local serait
+    /// un second vocabulaire à tenir d'accord avec le premier, ce que ce ticket
+    /// existe pour retirer.
+    #[arg(long, value_name = "PASS")]
+    pub pass: mika_agent::arch_disposition::ArchPass,
+    /// Fichier contenant la réponse de l'architecte à lire.
+    #[arg(long, value_name = "PATH")]
+    pub response_file: std::path::PathBuf,
 }
 
 /// `mika flight-verdicts` — le chemin supporté vers le registre des verdicts

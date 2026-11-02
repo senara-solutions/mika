@@ -34,6 +34,18 @@ async fn main() -> Result<()> {
         Some(Commands::PlanCallout(args)) => {
             std::process::exit(commands::plan_callout::run(&args.body_file, args.raw));
         }
+        // mika#2194 vol 5 — même chemin court, et pour la même raison : lire la
+        // disposition d'une réponse d'architecte est un prédicat pur. Le
+        // placement est la réponse PRISE D'AVANCE à la sonde S3 du corps du
+        // ticket — « si S3 dépasse environ 500 ms, le remède est le placement
+        // dans `main.rs`, jamais un cache » — parce que la bascule ajoute un
+        // démarrage de process par passe d'architecte.
+        Some(Commands::ArchDisposition(args)) => {
+            std::process::exit(commands::arch_disposition::run(
+                &args.response_file,
+                args.pass,
+            ));
+        }
         Some(Commands::Token(args)) => {
             let global_home = home::resolve_home_dir()?;
             let agent_home = cli
@@ -467,7 +479,12 @@ async fn main() -> Result<()> {
             commands::notify::run(&args.text, &args.channel, &args.severity).await
         }
         // Handled by early-exit above — unreachable, but listed for exhaustive match.
-        Some(Commands::Token(_) | Commands::CredentialHelper(_) | Commands::PlanCallout(_)) => {
+        Some(
+            Commands::Token(_)
+            | Commands::CredentialHelper(_)
+            | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_),
+        ) => {
             unreachable!()
         }
     }
