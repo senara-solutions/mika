@@ -86,17 +86,64 @@ fn read_fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("lire {}: {e}", path.display()))
 }
 
+/// Le répertoire du binaire `mika`, à mettre en tête du `PATH` du bash de test.
+///
+/// Depuis mika#2194 (vol 5), `_parse_disposition` et `_parse_verdict` délèguent à
+/// `mika arch-disposition`. Sans le binaire, chaque enveloppe prend son chemin de refus et
+/// rend un mot vide : la lecture « sans garde » de la fixture rougirait sur une cause qui
+/// n'est pas la sienne, et un `assert_ne!(…, "READY")` passerait sur rien.
+///
+/// `mika` appartient à `mika-cli`, qui dépend de ce crate : `env!("CARGO_BIN_EXE_mika")`
+/// n'existe pas ici. Le binaire est donc cherché à côté de `mika-spirit`, dans le même
+/// répertoire de cible, où le `cargo test` de l'espace de travail le construit avant de
+/// lancer le moindre test. Un binaire absent, ou périmé au point d'ignorer la
+/// sous-commande (`cargo test -p mika-agent` seul ne le reconstruit pas), arrête le test
+/// avec son remède au lieu de le laisser lire un mot vide.
+fn mika_bin_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_BIN_EXE_mika-spirit"))
+        .parent()
+        .expect("le binaire mika-spirit a un répertoire parent")
+        .to_path_buf();
+    let mika = dir.join("mika");
+    let probe = Command::new(&mika)
+        .args(["arch-disposition", "--help"])
+        .output();
+    match probe {
+        Ok(out) if out.status.success() => dir,
+        Ok(out) => panic!(
+            "{} ne connaît pas `arch-disposition` (binaire périmé ?). Remède : \
+             cargo build -p mika-cli --bin mika\nstderr: {}",
+            mika.display(),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => panic!(
+            "binaire {} introuvable ({e}). Remède : cargo build -p mika-cli --bin mika",
+            mika.display()
+        ),
+    }
+}
+
 /// Source `dispatch-lib.sh` dans un bash neuf et y exécute `script`, avec `args` en `$1…`.
 ///
 /// Le source est fait comme `test-dispatch-lib.sh` le fait (`2>/dev/null || true`) : la
-/// bibliothèque se charge hors de tout contexte de dispatch.
+/// bibliothèque se charge hors de tout contexte de dispatch. Le `PATH` porte le binaire
+/// `mika` en tête (voir [`mika_bin_dir`]).
 fn bash_with_dispatch_lib(script: &str, args: &[&str]) -> String {
     let full = format!("source \"$0\" >/dev/null 2>&1 || true\n{script}");
+    let path = match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut dirs = vec![mika_bin_dir()];
+            dirs.extend(std::env::split_paths(&p));
+            std::env::join_paths(dirs).expect("PATH joignable")
+        }
+        None => mika_bin_dir().into_os_string(),
+    };
     let out = Command::new("bash")
         .arg("-c")
         .arg(&full)
         .arg(dispatch_lib())
         .args(args)
+        .env("PATH", path)
         .output()
         .expect("lancer bash");
     assert!(
