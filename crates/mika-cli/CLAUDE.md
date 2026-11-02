@@ -8,7 +8,7 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 ## Subcommands
 
-`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`, `flight-verdicts`.
+`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`, `arch-disposition`, `flight-verdicts`.
 
 ### `mika flight-verdicts judge` (mika#2922, vol 2/3)
 
@@ -40,7 +40,7 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 **Three callers since mika#2608 (phase 2), all of them `dispatch-lib.sh`, all through `_extract_plan_path`:** `_detect_plan_on_branch` (« which file do I open? » — phase 1), `_committed_plan_on_branch` (« which path does this body name? », resolved against the branch tree and bound to the ticket, mika#2034) and the `elif` of `_set_up_worktree` (« does this body carry a callout at all? » — a log line). **No subcommand and no flag was added for the second and third**: the 0/1 distinction *is* the boolean answer, and `--raw` was not needed either (see below). Three process starts per dev-groom dispatch — the arithmetic, and the halt if the S3 probe contradicts it, are in `docs/architecture/dispatch-lib-migration.md` § 2.
 
-**The family stays flat, with its switch criterion written.** Nothing here is namespaced under a `predicate` head, and that is a decision rather than a deferral: the population of predicate subcommands is still **one**, and naming a family for a population of one is the gesture this repo has refused twice in writing (mika#2329's sentinel file parameterized by scan name, shipped with a single use; mika#2201's allowlists shipped empty). **Switch criterion, so phase 3 does not have to re-derive it: the second distinct predicate subcommand.** The cost of the deferral is bounded and legible — a later rename produces "new dispatch-lib + old `mika`" for a deployment window, where `mika` exits non-zero on an unknown subcommand ⇒ code `≥2` ⇒ a **loud, named** refusal (`subcommand_error`), never an empty path. The refused alternative, so it is not re-proposed blind: `mika predicate <name>` would say "this is not for you" on a head namespace that already carries 22 operator subcommands — a real argument, decisive at the **second** predicate, not the first.
+**The family stays flat, and its switch criterion is no longer a count.** Nothing here is namespaced under a `predicate` head. Since mika#2194 vol 5 there are **two** predicate subcommands (`plan-callout`, `arch-disposition`), and they stay at the head on purpose: the old criterion (« the second distinct predicate subcommand ») was **replaced on 2026-11-02** (AC5 of phase 3, landed by #3015 in `docs/architecture/dispatch-lib-migration.md` § 6) by *« group when predicates stop being diagnostic instruments »*. As long as an operator replays each one by hand to diagnose a `≥2` refusal, it belongs beside `token` and `credential-helper`; `mika predicate <name>` becomes worth its cost the day a predicate exists that no operator has a reason to invoke, whatever the count. The doctrine file carries the full reasoning and the old criterion it replaced. A later rename still costs only a deployment window of loud, named refusals (`subcommand_error`), never an empty path.
 
 **The shortest path in the binary, and deliberately shorter than `token`.** It exits in the head `match &cli.command` of `main.rs`, beside `Token` and `CredentialHelper`, and does **strictly less** than either: no `dotenv`, no `Settings`, no `home`, no DB, no network. A pure predicate has no reason to resolve an agent — and that is what makes a process start acceptable on a path called **once per dispatch** (the channel criterion in `docs/architecture/dispatch-lib-migration.md` § 2).
 
@@ -74,6 +74,25 @@ Before the switch, `_extract_plan_path` returned `1` in both of the last two cas
 ```sql
 SELECT id, result FROM tasks
  WHERE result LIKE 'REFUSED (plan-callout, mika#2194)%' ORDER BY created_at DESC;
+```
+
+### `mika arch-disposition` (mika#2194, vol 5)
+
+`mika arch-disposition --pass <first|second> --response-file <path>` reads the disposition of an architect response. It is the channel through which `dispatch-lib.sh::_parse_disposition` and `::_parse_verdict` (now thin wrappers) interrogate the **single** reader of the five tiers, [`mika_agent::arch_disposition::decide`]. `commands/arch_disposition.rs` holds **no tier rule**: it reads the file, calls `decide`, formats. `--pass` takes the engine's own `ArchPass` (`clap::ValueEnum` derived on it), never a CLI twin.
+
+Same shape as `plan-callout`, for the same reasons: shortest path in `main.rs` (no `dotenv`, `Settings`, `home`, DB or network), body by **file** only, no positional variant.
+
+| code | stdout | stderr |
+|---|---|---|
+| `0` | line 1 = token, line 2 = tier (`0b`, `1a`, `1b`, `2`) | tier 2 only: `… (matched: '<fragment>')`, the shape an existing `sed` reads |
+| `1` | line 1 **empty**, line 2 = `0` (engine withheld the disposition) or `-` (nothing matched) | — |
+| `≥2` | empty | `REFUSED (arch-disposition, mika#2194) <reason>: <detail>` |
+
+**Two lines, always**, on `0` and `1`: a `sed -n '2p'` on a one-line output reads empty and cannot tell it from an absent tier. **A refusal reaches `tasks.result`**, never a log only: the wrappers run inside the callers' `$(...)`, so the reason crosses the subshell through the `$$`-suffixed `_ARCH_DISPOSITION_REFUSAL_FILE` and `_annex_arch_disposition_refusal` appends it from `_deliver_callback`. The wrappers return `0` on every path (callers capture under `set -e`, and UNPARSED is their retry path), so to the caller a refusal reads as UNPARSED; the named reason in `RESULT` is what tells them apart.
+
+```sql
+SELECT id, result FROM tasks
+ WHERE result LIKE '%REFUSED (arch-disposition, mika#2194)%' ORDER BY created_at DESC;
 ```
 
 ### Key Commands
