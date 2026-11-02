@@ -41,8 +41,11 @@ source "$SCRIPT_DIR/lib-mika-bin.sh"
 
 if ! mika_bin_or_skip "mika#2194 vol 5 — les 55 cas des deux lecteurs"; then
     echo ""
-    echo "Suite skippée : le binaire 'mika' est requis depuis la bascule du vol 5."
+    echo "Suite non exécutée : le binaire 'mika' est requis depuis la bascule du vol 5."
     echo "  PASS: $PASS  FAIL: $FAIL  SKIP: $SKIPPED"
+    # En CI le helper a compté un FAIL (binaire absent = panne de câblage) : la
+    # suite sort non nulle. Hors CI, un SKIP dit reste un 0.
+    [ "$FAIL" -eq 0 ] || exit 1
     exit 0
 fi
 
