@@ -9695,7 +9695,7 @@ fn withhold_disposition(text: &str, required_suffix_lines: &[String]) -> String 
 /// matches paraphrases (`proceed`, `good to go`) anywhere in the text, so a response whose
 /// disposition line was merely deleted could still yield READY from its own body. Keep this
 /// literal in sync with the tier-0 check in `skills/bundled/_shared/dispatch-lib.sh`.
-const DISPOSITION_WITHHELD_MARKER: &str = "Disposition-Withheld: REVIEW-ANCHOR-MISSING";
+pub(crate) const DISPOSITION_WITHHELD_MARKER: &str = "Disposition-Withheld: REVIEW-ANCHOR-MISSING";
 
 /// Collect tool-argument suffix constraints from keyword-matched and always-on skills'
 /// `[output]` sections. Returns the union of all declared `required_tool_arg_suffixes`
