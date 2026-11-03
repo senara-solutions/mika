@@ -170,6 +170,10 @@ a truncated fetch can never read as a real count.
 When opening a PR by hand — orchestrator or spawn — apply `origin:manual` or
 `origin:spawn` yourself (`gh pr edit <n> --add-label origin:manual`). Nothing does
 it for you: only the loop half has a structural producer.
+A pilot dispatched by the engine (claude-pilot) applies **no** `origin:` label,
+even when it opens the PR itself: `_stamp_pr_origin` stamps `origin:loop` after
+the run and never overwrites an origin already present (`pr_origin.already_claimed`),
+so a pilot's own `origin:manual` would count a loop PR as manual (PR #3018, 2026-11-03).
 
 ## Architecture Summary
 
