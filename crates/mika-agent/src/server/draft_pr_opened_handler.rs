@@ -140,7 +140,14 @@ async fn fetch_draft_and_closing_refs(
 }
 
 /// Fetch the current label names on an issue via `gh issue view --json labels`.
-async fn fetch_issue_labels(
+///
+/// `pub(crate)` depuis mika#3022 : `server::merged_pr_ready_cleanup_handler` doit
+/// **lire** les étiquettes avant de retirer, parce qu'un instrument qui dit
+/// « retiré » sur un ticket qui ne portait rien est un instrument qui mente
+/// (mika#2331) — absent n'est pas zéro. Lire par un second appel `gh` serait
+/// lire une autre forme de JSON, et le jour où `gh` change la forme des
+/// étiquettes, l'un des deux lecteurs rendrait silencieusement la liste vide.
+pub(crate) async fn fetch_issue_labels(
     issue_number: u64,
     repo: &str,
     token: &str,
@@ -158,7 +165,19 @@ async fn fetch_issue_labels(
 
 /// Remove the `ready` label from an issue via `gh issue edit --remove-label`.
 /// Idempotent on GitHub's side — removing an absent label is a no-op.
-async fn remove_ready_label(issue_number: u64, repo: &str, token: &str) -> Result<(), String> {
+///
+/// `pub(crate)` depuis mika#3022 : c'est **le** geste de retrait, et
+/// `server::merged_pr_ready_cleanup_handler` l'appelle tel quel plutôt que de
+/// réécrire son argv. Retirer, c'est rendre un consentement, jamais s'en donner
+/// un (voie B, mika#2995) : `--remove-label` est le seul drapeau que ce module
+/// pose, et il n'est dans aucune des deux listes argv de
+/// [`crate::ready_label`] — ce qui est exactement pourquoi la promotion n'ouvre
+/// aucune route d'écriture et ne demande aucune entrée d'allowlist.
+pub(crate) async fn remove_ready_label(
+    issue_number: u64,
+    repo: &str,
+    token: &str,
+) -> Result<(), String> {
     let n = issue_number.to_string();
     let args = vec![
         "issue",

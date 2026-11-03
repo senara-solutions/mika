@@ -31,10 +31,27 @@ use tracing::{debug, info, warn};
 const ISSUE_CLOSED_PREFIX: &str = "[GitHub] Issue closed:";
 
 /// Prefix on PR-closed webhook messages from the gateway.
-const PR_CLOSED_PREFIX: &str = "[GitHub] PR closed:";
+///
+/// `pub(crate)` depuis mika#3022, pour la raison exacte qui a ouvert
+/// [`extract_pr_url`] à mika#2680 et [`extract_issue_url`] à mika#2854 :
+/// `server::merged_pr_ready_cleanup_handler` reconnaît le **même** événement sur
+/// le **même** gabarit de gateway, et une copie de plus serait une chance de plus
+/// que les deux lecteurs divergent — l'un retirerait `ready` sur une population
+/// que l'autre ne terminal-marque plus, et aucun test de comportement ne bougerait.
+///
+/// **Doublon pré-existant, nommé et hors vol :** `milestone_context_handler.rs`
+/// (l. 28 et 31) porte sa propre copie de ce jeton et du suivant. Elle date
+/// d'avant mika#3022 et la dédupliquer déplacerait la population d'un troisième
+/// handler — c'est une dette déclarée, pas une omission.
+pub(crate) const PR_CLOSED_PREFIX: &str = "[GitHub] PR closed:";
 
 /// Sentinel line indicating a merged PR (gateway appends this on close events).
-const MERGED_TRUE_LINE: &str = "\nMerged: true";
+///
+/// `pub(crate)` depuis mika#3022 — même raison que [`PR_CLOSED_PREFIX`], dont ce
+/// jeton est l'inséparable : « cet événement est un `PR closed` » et « ce PR a
+/// été mergé » sont deux questions, et un lecteur qui n'en poserait qu'une
+/// agirait sur la mauvaise population.
+pub(crate) const MERGED_TRUE_LINE: &str = "\nMerged: true";
 
 /// Suffix `truncate_body` appends when it cut a webhook body
 /// (`mika-gateway/src/github.rs`).
@@ -299,7 +316,16 @@ fn body_is_truncated(text: &str) -> bool {
 /// so a PR whose title happens to contain that shape cannot displace the real
 /// one. Returns `None` on anything else — an unreadable branch costs the
 /// operator a pointer, never a decision.
-fn extract_head_branch(text: &str) -> Option<String> {
+///
+/// `pub(crate)` depuis mika#3022, même précédent que [`extract_pr_url`]
+/// (mika#2680) et [`extract_issue_url`] (mika#2854) :
+/// `server::merged_pr_ready_cleanup_handler` lit la branche sur le même gabarit
+/// de gateway pour en tirer le numéro de ticket, et sur les PR mesurées
+/// `closingIssuesReferences` est vide — la branche est le **seul** porteur de
+/// `<N>`. Un second parseur de cet en-tête serait un second jeu de sémantiques
+/// « première ligne / dernier `(branch: …)` », et les deux tests de mika#2242
+/// qui les épinglent ne tiendraient plus que sur l'un des deux.
+pub(crate) fn extract_head_branch(text: &str) -> Option<String> {
     let header = text.lines().next()?;
     let tail = header.rsplit_once(" (branch: ")?.1;
     let branch = tail.strip_suffix(')')?.trim();
