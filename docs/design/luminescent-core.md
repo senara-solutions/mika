@@ -103,6 +103,24 @@ We reject traditional drop shadows in favor of **Ambient Light**.
 ### Buttons
 
 - **Primary:** Gradient fill (`primary` to `primary_dim`), `xl` (1.5rem) roundedness. No border.
+  - **Contrast condition on the gradient.** A gradient is admissible on a CTA
+    only if the `on_surface` text reaches 4.5:1 on **every** stop, hover
+    included; otherwise the CTA is flattened onto a solid tint that satisfies
+    the threshold. The condition is on the stops, not on the texture: the day
+    the brand hues permit it, the gradient comes back without this section
+    moving.
+  - **State of application, 2026-11-03.** Against §2 as it stands,
+    `primary` -> `primary_dim` does **not** satisfy it — `on_surface` (#e8e8ec)
+    measures 1.82:1 on `primary` and 3.82:1 on `primary_dim`. The primary CTA
+    is therefore flattened onto `secondary_container`, the only §2 token of the
+    purple family that clears the threshold (7.66:1); its hover mixes 88%
+    toward `background` (8.55:1). Dark text is not an alternative — §7 forbids
+    leaving `on_surface`, and it would not reach the threshold either (4.14:1).
+  - *Provenance:* mika#2912, path (c), rendered by Prime on Vincent's
+    delegation on 2026-11-03. §7 ("No Pure White") and §2 are untouched by this
+    amendment. Permanent guardian: `packages/ui/src/theme.test.ts`, which
+    recomputes the contrast from the tokens and fails if any stop drops below
+    the threshold.
 - **Secondary:** Ghost style. `outline_variant` at 20% opacity border. On hover, transition to `secondary_container` background.
 - **Tertiary:** Text-only using `primary` color, no background, for low-priority actions.
 

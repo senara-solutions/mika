@@ -212,6 +212,18 @@ const ruleFor = (selector: string): string =>
 const hasRule = (selector: string): boolean =>
   mikaRules.some(([sel]) => sel === selector)
 
+/** `<prop>: <value>;` pairs of a rule body, collapsed/lowercased like the rest. */
+const declarationsOf = (body: string): Map<string, string> => {
+  const map = new Map<string, string>()
+  const re = /([a-z-]+)\s*:\s*([^;]+);/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(body)) !== null) map.set(m[1], m[2].trim())
+  return map
+}
+
+const CTA_REST = '.mika-cta-gradient'
+const CTA_HOVER = '.mika-cta-gradient:not(:disabled):hover'
+
 describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
   it.each(canonicalTokens)(
     'defines canonical token %s = %s (%s)',
@@ -346,31 +358,250 @@ describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
  */
 describe('theme.css — LC.2 (mika#1801) rulebook §2/§5 CTA texture', () => {
   it('declares the .mika-cta-gradient rest state', () => {
-    expect(hasRule('.mika-cta-gradient')).toBe(true)
+    expect(hasRule(CTA_REST)).toBe(true)
   })
 
   it('declares a hover state scoped away from :disabled', () => {
     // `:hover` fires on a disabled <button> in every engine, so an unscoped
     // hover would animate a button that cannot be pressed. `:not(:disabled)` is
     // vacuously true on the <a> branch of <Button>, so one selector serves both.
-    expect(hasRule('.mika-cta-gradient:not(:disabled):hover')).toBe(true)
+    // Unchanged by the §5 amendment: the reason is technical, not chromatic.
+    expect(hasRule(CTA_HOVER)).toBe(true)
   })
 
-  it('renders the rest state as a 135deg gradient from primary to primary_dim', () => {
-    const body = ruleFor('.mika-cta-gradient')
+  /**
+   * D7 (mika#2913) — this `it` replaces the three that pinned
+   * `linear-gradient`, `135deg` and the `primary`-before-`primary_dim` order.
+   * Those stated the rule as it stood BEFORE the §5 amendment and would fail
+   * on the flattened CTA. They are rewritten, not deleted: what §5 now
+   * prescribes is a background composed of §2 tokens whose contrast holds
+   * (asserted by D6 below), in whichever form — solid or gradient — satisfies
+   * the threshold.
+   */
+  it.each([CTA_REST, CTA_HOVER])('composes %s from §2 tokens, in one background form', (sel) => {
+    const decls = declarationsOf(ruleFor(sel))
+    const forms = ['background-color', 'background-image'].filter((p) => decls.has(p))
 
-    expect(body).toContain('linear-gradient')
-    // §2: "at a 135-degree angle".
-    expect(body).toContain('135deg')
+    // Exactly one: a rule declaring both leaves which one paints up to the
+    // cascade, and D6 would then be measuring a background the user never sees.
+    expect(forms).toHaveLength(1)
 
-    // §2/§5: `primary` FIRST, then `primary_dim`. The closing paren in
-    // `var(--color-primary)` is what makes this unambiguous — without it the
-    // needle would also match inside `var(--color-primary-dim)`.
-    const from = body.indexOf('var(--color-primary)')
-    const to = body.indexOf('var(--color-primary-dim)')
-    expect(from).toBeGreaterThanOrEqual(0)
-    expect(to).toBeGreaterThanOrEqual(0)
-    expect(from).toBeLessThan(to)
+    // Tokens, never literals — the property that keeps the CTA tracking §2 when
+    // §2 moves. (The file-wide scan at the bottom covers the hex form; this
+    // asserts the positive: the background is built out of `var(--color-*)`.)
+    expect(decls.get(forms[0])).toContain('var(--color-')
+  })
+})
+
+/**
+ * D6 (mika#2913, = mika#2912 AC2) — the permanent guardian of the amended §5
+ * button rule.
+ *
+ * The rule, as Prime rendered it on Vincent's delegation (mika#2912, 2026-11-03,
+ * path (c)) and as `luminescent-core.md` §5 now carries it:
+ *
+ *   > a gradient is admissible on a CTA only if the `on_surface` text reaches
+ *   > 4.5:1 on EVERY stop, hover included; otherwise the CTA is flattened onto
+ *   > a solid tint that satisfies the threshold.
+ *
+ * So this does NOT assert "the CTA is `secondary_container`". That would pin a
+ * value, and the value is not the rule — written that way the guard would fail
+ * the day the brand hues move in a way the rule allows, and stay green the day
+ * one of them drops below the threshold. It asserts the RULE: resolve whatever
+ * the CTA paints, resolve the text colour from `.mika-btn--primary` rather than
+ * retyping it (so the test follows §7 if §7 ever moves), and require 4.5:1 on
+ * every stop of both states. A gradient becomes admissible again the day the
+ * hues permit, exactly as the rule provides.
+ *
+ * Measured on 0.5.0 before the fix: 1.82:1 on `primary`, 3.82:1 on
+ * `primary_dim`. After: 7.66:1 at rest, 8.59:1 on hover.
+ */
+
+type Rgb = [number, number, number]
+
+/** Split a comma-separated list, ignoring commas nested inside parentheses. */
+const splitTopLevel = (s: string): string[] => {
+  const out: string[] = []
+  let depth = 0
+  let cur = ''
+  for (const ch of s) {
+    if (ch === '(') depth += 1
+    if (ch === ')') depth -= 1
+    if (ch === ',' && depth === 0) {
+      out.push(cur.trim())
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  if (cur.trim() !== '') out.push(cur.trim())
+  return out
+}
+
+const parseHex = (hex: string): Rgb => {
+  const h = hex.slice(1)
+  const full = h.length === 3 ? [...h].map((c) => c + c).join('') : h
+  return [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16)) as Rgb
+}
+
+/**
+ * Resolve a CSS colour expression to sRGB, accepting THREE forms and three
+ * only: a literal hex, `var(--token)` (resolved through `declarationMap`, so
+ * the test reads the same §2 the browser does), and
+ * `color-mix(in srgb, <A> P%, <B>)` (component-wise interpolation, which is
+ * what the spec prescribes for that space).
+ *
+ * **Anything else throws, and the throw is the point** — not an implementation
+ * detail. A resolver that answered "indeterminate → green" would declare
+ * conformant the first `oklch()` or `light-dark()` written in good faith, and
+ * silent conformity is the one failure mode this repo refuses in a detector.
+ * Asserted directly by a case below, on an expression invented in the test.
+ */
+const resolveColour = (expr: string, depth = 0): Rgb => {
+  if (depth > 8) throw new Error(`colour reference cycle while resolving: ${expr}`)
+  const v = expr.trim().toLowerCase()
+
+  if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/.test(v)) return parseHex(v)
+
+  const varRef = /^var\(\s*(--[a-z0-9-]+)\s*\)$/.exec(v)
+  if (varRef) {
+    const target = declarationMap.get(varRef[1])
+    if (target === undefined) {
+      throw new Error(`unknown token ${varRef[1]} — theme.css declares no such custom property`)
+    }
+    return resolveColour(target, depth + 1)
+  }
+
+  const mix = /^color-mix\(\s*in\s+srgb\s*,([\s\S]+)\)$/.exec(v)
+  if (mix) {
+    const args = splitTopLevel(mix[1])
+    if (args.length !== 2) {
+      throw new Error(`color-mix() with ${args.length} colour arguments is not supported: ${expr}`)
+    }
+    const weighted = /^([\s\S]+?)\s+([0-9.]+)%$/.exec(args[0])
+    if (!weighted) {
+      throw new Error(`color-mix() needs an explicit percentage on its first colour: ${expr}`)
+    }
+    const a = resolveColour(weighted[1], depth + 1)
+    const b = resolveColour(args[1], depth + 1)
+    const p = Number(weighted[2]) / 100
+    return [0, 1, 2].map((i) => a[i] * p + b[i] * (1 - p)) as Rgb
+  }
+
+  throw new Error(
+    `unresolvable colour form: "${expr}". D6 (mika#2913) admits a literal hex, ` +
+      `var(--token) and color-mix(in srgb, <A> P%, <B>) only. Anything else must ` +
+      `fail here rather than read as conformant — see theme.test.ts § D6.`,
+  )
+}
+
+/** WCAG 2.x relative luminance. */
+const relativeLuminance = (rgb: Rgb): number => {
+  const [r, g, b] = rgb.map((c) => {
+    const s = c / 255
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
+  })
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/** WCAG 2.x contrast ratio, order-independent. */
+const contrastRatio = (a: Rgb, b: Rgb): number => {
+  const [hi, lo] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x)
+  return (hi + 0.05) / (lo + 0.05)
+}
+
+/**
+ * Every colour the CTA paints in one state: a single value for
+ * `background-color`, or the stop list of a `linear-gradient`. Throws on a
+ * rule that declares neither, or that declares both forms at once — the
+ * resolver's refusal to guess, applied one level up.
+ */
+const ctaBackgroundStops = (selector: string): string[] => {
+  const body = ruleFor(selector)
+  if (body === '') throw new Error(`theme.css declares no rule for ${selector}`)
+  const decls = declarationsOf(body)
+
+  const solid = decls.get('background-color')
+  const gradient = decls.get('background-image')
+
+  if (solid !== undefined && gradient !== undefined) {
+    throw new Error(`${selector} declares both a background-color and a background-image`)
+  }
+  if (solid !== undefined) return [solid]
+  if (gradient !== undefined) {
+    const inner = /^linear-gradient\(([\s\S]*)\)$/.exec(gradient)
+    if (inner === null) {
+      throw new Error(`unsupported background-image form on ${selector}: ${gradient}`)
+    }
+    return splitTopLevel(inner[1])
+      // A leading angle or `to <side>` is geometry, not a colour.
+      .filter((arg) => !/^(-?[0-9.]+deg$|to\s)/.test(arg))
+      // Drop the optional stop position: `var(--color-primary) -25%`.
+      .map((arg) => arg.replace(/\s+-?[0-9.]+%$/, ''))
+  }
+  throw new Error(`${selector} paints no background — D6 cannot measure what is not declared`)
+}
+
+describe('theme.css — mika#2913 (mika#2912 AC2) amended §5: the CTA text clears 4.5:1', () => {
+  // Read, never retyped: §7 prescribes `on_surface` for the primary button's
+  // text, and the day §7 moves this test follows it instead of measuring a
+  // colour the button no longer uses.
+  const ctaTextExpr = declarationsOf(ruleFor('.mika-btn--primary')).get('color')
+
+  it('reads the CTA text colour from .mika-btn--primary rather than assuming it', () => {
+    expect(ctaTextExpr).toBe('var(--color-on-surface)')
+  })
+
+  it.each([
+    ['rest', CTA_REST],
+    ['hover', CTA_HOVER],
+  ])('clears 4.5:1 on every %s stop', (_state, selector) => {
+    const text = resolveColour(ctaTextExpr as string)
+    const stops = ctaBackgroundStops(selector)
+
+    // Anti-vacuity: an empty stop list would make the assertion below hold by
+    // looking at nothing, and a CTA with no measurable background must fail.
+    expect(stops.length).toBeGreaterThan(0)
+
+    // Measured first, asserted once. A per-stop `expect` inside a loop stops at
+    // the first violation and hides the others — on 0.5.0 it printed 1.82 and
+    // said nothing about primary_dim's 3.82, which is half the defect.
+    const measured = stops.map((stop) => [stop, contrastRatio(text, resolveColour(stop))] as const)
+    const report = measured.map(([s, r]) => `\`${s}\` → ${r.toFixed(2)}:1`).join(', ')
+
+    expect(
+      measured.filter(([, ratio]) => ratio < 4.5).map(([stop]) => stop),
+      `${selector}: ${report}`,
+    ).toEqual([])
+  })
+
+  it('refuses a colour form it cannot resolve, instead of passing', () => {
+    // The load-bearing property of the resolver. Invented here rather than
+    // taken from the file: the point is what happens to a form NOT in the
+    // file, the day somebody writes one in good faith.
+    expect(() => resolveColour('oklch(62% 0.21 292)')).toThrow(/unresolvable colour form/)
+    expect(() => resolveColour('light-dark(#ffffff, #000000)')).toThrow(/unresolvable colour form/)
+    expect(() => resolveColour('var(--color-does-not-exist)')).toThrow(/unknown token/)
+    expect(() => resolveColour('color-mix(in oklab, #fff 50%, #000)')).toThrow(
+      /unresolvable colour form/,
+    )
+  })
+
+  it('resolves the three admitted forms', () => {
+    // Anti-vacuity for the test above: a resolver that threw on everything
+    // would satisfy it while measuring nothing.
+    expect(resolveColour('#0c0e11')).toEqual([12, 14, 17])
+    expect(resolveColour('var(--color-on-surface)')).toEqual([232, 232, 236])
+    expect(resolveColour('color-mix(in srgb, #ffffff 50%, #000000)')).toEqual([
+      127.5, 127.5, 127.5,
+    ])
+  })
+
+  it('computes WCAG contrast the way the spec does', () => {
+    // Two anchors with known values, so an arithmetic slip in the luminance
+    // transfer function cannot hide behind a threshold that happens to pass.
+    expect(contrastRatio([255, 255, 255], [0, 0, 0])).toBeCloseTo(21, 5)
+    expect(contrastRatio([12, 14, 17], [12, 14, 17])).toBeCloseTo(1, 5)
   })
 })
 
