@@ -424,9 +424,20 @@ BLOCKING	B	skills/bundled/_shared/dispatch-lib.sh::_engine_escalation_line	exact
 # le DEMANDE (`canonical-tokens-survey.sh --check` le rend MISSING) : l'ancre est
 # une forme de lecture stricte, à la différence du tier 2 qui est classe A.
 BLOCKING	B	crates/mika-agent/src/arch_disposition.rs::ENGINE_ESCALATION_ANCHOR	exact:line-anchored
-# mika#2786 — the anchor brake counts withholdings by the same marker, read with
-# `contains` on a line already anchored by the `Engine reason: ` prefix.
-BLOCKING	B	crates/mika-agent/src/skills/executor.rs::anchor_withheld_streak	exact:literal
+# mika#2786 comptait les retenues du frein par le même marqueur, avec un
+# `contains` sur une ligne déjà ancrée par le préfixe `Engine reason: `, et
+# déclarait ici `executor.rs::anchor_withheld_streak` en `exact:literal`.
+# mika#3027 a retiré cette lecture : `anchor_withheld_streak` délègue à
+# `executor.rs::carries_engine_anchor_withholding`, qui ancre la ligne sur le
+# préfixe puis passe le reste à `ENGINE_ESCALATION_ANCHOR` — l'entrée juste
+# au-dessus. Son entrée est donc RETIRÉE, pas conservée : c'est exactement la
+# rot résiduelle que `canonical-tokens-survey.sh` nomme sans pouvoir la voir
+# (« a row whose file and symbol both still exist but which no longer reads the
+# token »), et que `mika2201_every_declared_symbol_still_exists` laisse verte
+# puisque le symbole existe toujours. Le préfixe lui-même n'entre pas dans cette
+# table : les quatre formes de token du relevé ne le reconnaissent pas, et son
+# lecteur unique est épinglé ailleurs — par
+# `canonical_tokens::tests::mika3027_la_retenue_dancrage_a_un_seul_lecteur`.
 
 # ── Architect decision marker (mika#1262), read off written architect text.
 DECISION NEEDED	B	crates/mika-agent/src/operational/write.rs::RE	exact:literal

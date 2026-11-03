@@ -4758,6 +4758,157 @@ mod tests {
         }
     }
 
+    // ---- mika#3027 : la retenue d'ancrage a un seul lecteur ----------------
+
+    /// **Livrée vide, et elle le reste.**
+    ///
+    /// Quand le scan tire, on **route le site** vers
+    /// `carries_engine_anchor_withholding` ; on ne l'allowliste pas. Une
+    /// allowlist née vide est un emplacement où déposer la prochaine infraction
+    /// (doctrine mika#2201), et mika#2309 condamne celle qui n'expire pas.
+    const ENGINE_REASON_READER_ALLOWLIST: &[&str] = &[];
+
+    /// Le fichier qui déclare le préfixe et le lit, une fois chacun.
+    const ENGINE_REASON_OWNER: &str = "crates/mika-agent/src/skills/executor.rs";
+
+    /// Le nom du jeton, assemblé par `concat!`.
+    ///
+    /// Le littéral est produit à la compilation, donc le nom cherché n'apparaît
+    /// nulle part dans le code **non commenté** de cette garde. Écrit d'un bloc,
+    /// il ferait de la garde son propre troisième site le jour où la troncature
+    /// au premier `#[cfg(test)]` cesserait de couvrir ce module — et cette
+    /// prémisse a déjà été fausse dans ce dépôt (mika#2335 F2a).
+    fn engine_reason_token() -> String {
+        format!("GROOM_ENGINE_REASON{}", "_PREFIX")
+    }
+
+    /// Les sites de production qui nomment le jeton, et combien de fois.
+    ///
+    /// **Les commentaires sont retirés, et ce n'est pas prudentiel.** Le
+    /// doc-comment de `carries_engine_anchor_withholding` dit « Site unique de
+    /// lecture de [`GROOM_ENGINE_REASON_PREFIX`] » : une prose qui *nomme* le
+    /// jeton n'est pas un lecteur, et sans ce retrait la garde serait rouge au
+    /// jour de sa naissance, donc désarmée le lendemain (forme du signal S,
+    /// mika#2050).
+    fn engine_reason_sites(sources: &[(String, String)]) -> Vec<(String, usize)> {
+        let token = engine_reason_token();
+        sources
+            .iter()
+            .filter_map(|(rel, src)| {
+                if !src.contains(token.as_str()) {
+                    return None;
+                }
+                let n = crate::source_scan::strip_comment_lines(src)
+                    .matches(token.as_str())
+                    .count();
+                (n > 0).then(|| (rel.clone(), n))
+            })
+            .collect()
+    }
+
+    /// La reconnaissance de la retenue d'ancrage passe par **un seul lecteur**
+    /// du préfixe `Engine reason: ` (mika#3027 AC2).
+    ///
+    /// La forme du moteur était déjà reconnue en trois endroits avant ce vol —
+    /// `arch_disposition.rs` (tier 0b), `dispatch-lib.sh::_engine_escalation_line`,
+    /// et le compteur du frein mika#2786. Le vol en a retiré un : le frein
+    /// délègue désormais à `arch_disposition::is_engine_escalation_line` au lieu
+    /// de recomposer la forme depuis un fragment. Ce scan tient la propriété
+    /// qu'aucun test comportemental ne peut voir — un second lecteur ajouté ne
+    /// rend fausse **aucune** décision le jour où il est écrit ; il divergera le
+    /// jour où la forme bougera, et ce jour-là une retenue traversera la porte
+    /// chez l'un et pas chez l'autre (classe `grooming_marker`, mika#2158).
+    #[test]
+    fn mika3027_la_retenue_dancrage_a_un_seul_lecteur() {
+        let sources = production_sources();
+        assert!(
+            sources.len() > 200,
+            "le scan n'a énuméré que {} fichiers — un scan qui ne scanne rien est \
+             un laissez-passer vide, pas un arbre propre",
+            sources.len()
+        );
+
+        let sites = engine_reason_sites(&sources);
+
+        // ANTI-VACUITÉ, et elle porte sur la CARDINALITÉ. Un scan qui vise un
+        // nom mort (jeton renommé, site déplacé) rend zéro infraction et se lit
+        // comme un arbre sain.
+        let owner = sites
+            .iter()
+            .find(|(rel, _)| rel == ENGINE_REASON_OWNER)
+            .map(|(_, n)| *n);
+        assert_eq!(
+            owner,
+            Some(2),
+            "attendu EXACTEMENT deux mentions dans {ENGINE_REASON_OWNER} : la \
+             déclaration et l'unique lecture de \
+             `carries_engine_anchor_withholding`. Vu {owner:?}. Zéro ou un = le \
+             scan vise un nom mort ; plus de deux = un second lecteur du \
+             préfixe. Sites vus : {sites:?}"
+        );
+
+        let offenders: Vec<&String> = sites
+            .iter()
+            .filter(|(rel, _)| rel.as_str() != ENGINE_REASON_OWNER)
+            .filter(|(rel, _)| !ENGINE_REASON_READER_ALLOWLIST.contains(&rel.as_str()))
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "lecture du préfixe `Engine reason: ` hors de son site unique, \
+             dans : {offenders:?}\n\
+             \n\
+             RÉSOLUTION : router le site vers \
+             `skills::executor::carries_engine_anchor_withholding`, qui ancre sur \
+             la LIGNE puis délègue la forme fixe à \
+             `arch_disposition::is_engine_escalation_line`. Ne PAS ajouter \
+             d'entrée à `ENGINE_REASON_READER_ALLOWLIST` : on route le site, on \
+             n'allowliste pas (mika#2201)."
+        );
+
+        assert!(
+            ENGINE_REASON_READER_ALLOWLIST.is_empty(),
+            "il n'y a rien à excepter : le préfixe a un site et il est nommé. Une \
+             entrée ici est un consentement rouvert (mika#2309)."
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne regarde rien — très exactement le
+    /// mode de panne qu'il existe pour rendre visible. On le montre donc rougir
+    /// sur un lecteur ajouté ailleurs, et rester muet sur la prose qui nomme le
+    /// jeton sans le lire.
+    #[test]
+    fn mika3027_le_scan_du_lecteur_rougit_sur_un_second_site() {
+        let token = engine_reason_token();
+        let synthetic = vec![
+            (
+                "crates/mika-agent/src/second_lecteur.rs".to_string(),
+                format!(
+                    "fn retenue(text: &str) -> bool {{\n    \
+                     text.lines().any(|l| l.starts_with({token}))\n}}\n"
+                ),
+            ),
+            (
+                "crates/mika-agent/src/prose.rs".to_string(),
+                format!(
+                    "    /// On ne lit plus [`{token}`] ici, et le paragraphe\n    \
+                     /// suivant explique pourquoi `{token}` a un seul lecteur.\n"
+                ),
+            ),
+        ];
+
+        let sites = engine_reason_sites(&synthetic);
+        assert_eq!(
+            sites,
+            vec![("crates/mika-agent/src/second_lecteur.rs".to_string(), 1)],
+            "le scan doit voir le lecteur ajouté et IGNORER les deux lignes de \
+             prose — sans ce contrôle, « la garde décide » est indistinguable de \
+             « la garde ne regarde rien »"
+        );
+    }
+
     /// Le vocabulaire de refus est un **format de fil** à site unique, et cette
     /// garde vit ici — avec les autres scans de nom — plutôt que dans le module,
     /// parce que c'est la valeur telle qu'elle atterrit dans `audit_events` qui
