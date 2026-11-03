@@ -129,6 +129,81 @@ pub(crate) const READY_LABEL_SESSION_ID: &str = "ready-label";
 /// `tool_name` des lignes d'audit de refus-pour-park (AC8).
 pub(crate) const READY_LABEL_PARK_TOOL_NAME: &str = "ready_label_park";
 
+// ──────── Le discriminant de parente, et les noms de la relecture ────────
+//
+// mika#2995, tranche du 2026-11-03 : le consentement est lu à l'ENTRÉE de la
+// file (le webhook `labeled ready` crée la tâche parente) et n'était jamais
+// relu à la SORTIE, au moment où le wrapper différé promu part en tour. Les
+// trois noms ci-dessous sont les sites de définition uniques de cette
+// relecture (AC-T4) ; aucun ne contient `noop` nu, déjà pris par
+// `deferred_dispatch_noop_completion` (mika#1124) et par le vocabulaire de
+// mika#2169.
+
+/// Préfixe du label des tâches parentes créées par le feeder `ready-label`.
+///
+/// **SITE DE DÉFINITION UNIQUE** (doctrine mika#2158, classe `grooming_marker`) :
+/// le producteur (`server/ready_label_handler.rs`) **compose** par cette
+/// constante, et le prédicat de la garde mika#2995 **lit** par elle. Deux
+/// littéraux pour le même fait dériveraient en silence, et la dérive serait
+/// invisible des deux côtés — le label continuerait d'être produit, la garde
+/// cesserait simplement de reconnaître ses parentes.
+pub(crate) const READY_LABEL_TASK_PREFIX: &str = "ready-label:";
+
+/// Motif terminal écrit sur le wrapper différé **et** sur sa parente quand le
+/// consentement a été retiré entre la création de la file et le départ du tour.
+///
+/// **Le même littéral des deux côtés, délibérément** : c'est un seul fait, et
+/// deux motifs pour un fait sont deux populations qu'on ne peut plus rapprocher
+/// (classe mika#2205). Il ne recouvre ni `phantom_aged_out`, ni
+/// `callback_no_pr_*`, ni `dispatch_halt_*`, ni
+/// `stuck_pending_no_deferred_wrapper` — chacun garde sa propre issue.
+pub(crate) const READY_CONSENT_WITHDRAWN_REASON: &str = "ready_consent_withdrawn";
+
+/// `tool_name` de la ligne d'audit de la relecture de consentement.
+///
+/// Frère de [`READY_LABEL_PARK_TOOL_NAME`] ci-dessus, et distinct de lui : le
+/// park est une **écriture refusée**, la relecture est un **dispatch refusé**.
+/// Les agréger sous un nom rendrait les deux non soustractibles.
+pub(crate) const READY_CONSENT_RECHECK_TOOL_NAME: &str = "ready_label_consent_recheck";
+
+/// `"ready-label: senara-solutions/mika#3002"` → `("senara-solutions/mika", 3002)`.
+///
+/// # Pourquoi les coordonnées se lisent dans le LABEL
+///
+/// La traversée `parent_issue_coordinates` (`task_engine/dispatcher.rs`) existe
+/// et fonctionne, mais elle passe par `parse_repo_issue_from_url`, qui rend le
+/// **repo nu** (`"mika"`) — alors que [`read_ready_label_timeline`] interpole
+/// `repos/{repo}/issues/{issue}/timeline` et exige `owner/repo`. Re-préfixer
+/// `senara-solutions/` serait un littéral d'organisation codé en dur dans le
+/// dispatcher. Le label, lui, porte déjà `location.owner_repo()` : l'information
+/// exacte, à sa source, sans devinette.
+///
+/// # Pourquoi `None` est le discriminant, et non une erreur
+///
+/// `None` veut dire « cette parente ne vient pas du feeder `ready-label` », et
+/// c'est le cas d'AC-T3 : groom, revue, dispatch manuel, parente absente. Un
+/// label qui porte le préfixe mais dont les coordonnées ne se lisent pas tombe
+/// dans le même sac, et c'est **structurellement sans population** : le
+/// producteur unique compose par [`READY_LABEL_TASK_PREFIX`] avec cette forme
+/// exacte, et `parse_le_label_du_producteur_fait_laller_retour` épingle
+/// l'aller-retour.
+pub(crate) fn parse_ready_label_task_label(label: &str) -> Option<(String, u64)> {
+    let rest = label.strip_prefix(READY_LABEL_TASK_PREFIX)?.trim();
+    // `rsplit_once` et non `split_once` : un `#` dans un nom de dépôt est
+    // impossible, mais la dernière occurrence est celle qui sépare le numéro
+    // quoi qu'il arrive.
+    let (repo, number) = rest.rsplit_once('#')?;
+    let repo = repo.trim();
+    // `owner/repo` est exigé — un repo nu ferait une URL d'API fausse, qui
+    // rendrait un 404 que D4 lirait comme une timeline illisible, donc un
+    // report sans fin plutôt qu'un refus de parenté.
+    if !repo.contains('/') {
+        return None;
+    }
+    let issue = number.trim().parse::<u64>().ok()?;
+    Some((repo.to_string(), issue))
+}
+
 // ───────────────────── Le prédicat (D2), pur ─────────────────────
 
 /// Un événement de timeline portant le label `ready`.
@@ -432,6 +507,32 @@ pub(crate) async fn read_ready_label_timeline_with<F: TimelinePageFetcher + ?Siz
     })
 }
 
+/// Le verdict de parc d'une issue, en une lecture (mika#2995).
+///
+/// `Ok(None)` = non parqué. `Ok(Some((parked_by, parked_at)))` = parqué, avec
+/// l'acteur et l'instant du retrait, pour que l'appelant les journalise **sans
+/// relire**. `Err` = la timeline ne se lit pas (D4), et c'est à l'appelant de
+/// décider ; ici le refus est une valeur retournée, jamais un échec avalé
+/// (leçon mika#2199).
+///
+/// Ce composeur existe pour que la garde du dispatcher ne recopie pas la
+/// séquence `read_ready_label_timeline_with` → `is_parked` → `events.last()`.
+/// Trois lignes recopiées, c'est trois lignes qui dérivent le jour où `is_parked`
+/// change de contrat.
+pub(crate) async fn park_verdict_for_issue_with<F: TimelinePageFetcher + ?Sized>(
+    fetcher: &F,
+    repo: &str,
+    issue: u64,
+    machine: &MachineIdentities,
+) -> Result<Option<(Option<String>, String)>, TimelineReadError> {
+    let events = read_ready_label_timeline_with(fetcher, repo, issue).await?;
+    if !is_parked(&events, machine) {
+        return Ok(None);
+    }
+    let last = events.last().expect("is_parked is false on an empty set");
+    Ok(Some((last.actor.clone(), last.created_at.clone())))
+}
+
 // ───────────────────── Les identités machine (D3) ─────────────────────
 
 /// Cache process des identités machine résolues.
@@ -691,8 +792,64 @@ async fn refuse_unreadable(
     ReadyApplyOutcome::RefusedUnreadable { reason }
 }
 
+/// Les fixtures de timeline, partagées par les deux modules qui en ont besoin.
+///
+/// Promues ici par mika#2995 (tranche du 2026-11-03) depuis le `mod tests`
+/// voisin, où elles vivaient depuis mika#2315 : la garde du dispatcher injecte
+/// une timeline par le même trait [`TimelinePageFetcher`], donc elle a besoin
+/// des mêmes gabarits JSON. **Un seul site de fixture de timeline pour la
+/// crate** — un second gabarit recopié dériverait du premier le jour où la
+/// forme de l'API change, et les deux modules croiraient tester la même chose.
+#[cfg(test)]
+pub(crate) mod timeline_fixtures {
+    use super::TimelinePageFetcher;
+
+    /// Un fournisseur de pages fixées.
+    pub(crate) struct FixturePages(pub(crate) Vec<String>);
+
+    #[async_trait::async_trait]
+    impl TimelinePageFetcher for FixturePages {
+        async fn fetch(&self, _repo: &str, _issue: u64, page: u32) -> Result<String, String> {
+            Ok(self
+                .0
+                .get(page as usize - 1)
+                .cloned()
+                .unwrap_or_else(|| "[]".to_string()))
+        }
+    }
+
+    /// Construit une page de `n` événements `commented` suivis des `extras`.
+    pub(crate) fn page_of(filler: usize, extras: &[&str]) -> String {
+        let mut items: Vec<String> = (0..filler)
+            .map(|i| {
+                format!(
+                    r#"{{"event":"commented","actor":{{"login":"someone"}},"created_at":"2026-09-01T00:{:02}:00Z"}}"#,
+                    i % 60
+                )
+            })
+            .collect();
+        items.extend(extras.iter().map(|s| s.to_string()));
+        format!("[{}]", items.join(","))
+    }
+
+    pub(crate) fn labeled_json(actor: &str, at: &str) -> String {
+        format!(
+            r#"{{"event":"labeled","label":{{"name":"ready"}},"actor":{{"login":"{actor}"}},"created_at":"{at}"}}"#
+        )
+    }
+
+    /// Le frère de [`labeled_json`] — le retrait, celui que la garde mika#2995
+    /// doit voir en dernier pour refuser un tour.
+    pub(crate) fn unlabeled_json(actor: &str, at: &str) -> String {
+        format!(
+            r#"{{"event":"unlabeled","label":{{"name":"ready"}},"actor":{{"login":"{actor}"}},"created_at":"{at}"}}"#
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::timeline_fixtures::*;
     use super::*;
 
     fn machine() -> MachineIdentities {
@@ -852,41 +1009,105 @@ mod tests {
         );
     }
 
-    // ── Tests 11–12 : la pagination (B1) ──
+    // ── mika#2995 — le discriminant de parente et le composeur de verdict ──
 
-    /// Un fournisseur de pages fixées.
-    struct FixturePages(Vec<String>);
+    /// **L'aller-retour producteur → parseur.**
+    ///
+    /// La forme composée ici est celle de `server/ready_label_handler.rs`, qui
+    /// compose par [`READY_LABEL_TASK_PREFIX`] depuis mika#2995. C'est ce test
+    /// qui rend le « structurellement sans population » du doc-comment de
+    /// [`parse_ready_label_task_label`] vérifiable plutôt que postulé : si la
+    /// forme du producteur dérivait, le parseur rendrait `None` et la garde
+    /// cesserait silencieusement de reconnaître ses parentes.
+    #[test]
+    fn mika2995_le_label_du_producteur_fait_laller_retour() {
+        let produit = format!(
+            "{READY_LABEL_TASK_PREFIX} {}#{}",
+            "senara-solutions/mika", 3002
+        );
+        assert_eq!(
+            parse_ready_label_task_label(&produit),
+            Some(("senara-solutions/mika".to_string(), 3002)),
+            "le parseur doit lire exactement ce que le producteur compose"
+        );
+    }
 
-    #[async_trait::async_trait]
-    impl TimelinePageFetcher for FixturePages {
-        async fn fetch(&self, _repo: &str, _issue: u64, page: u32) -> Result<String, String> {
-            Ok(self
-                .0
-                .get(page as usize - 1)
-                .cloned()
-                .unwrap_or_else(|| "[]".to_string()))
+    /// Les quatre formes que le discriminant refuse, chacune pour sa raison.
+    #[test]
+    fn mika2995_une_parente_hors_prefixe_ou_malformee_nest_pas_un_ready_label() {
+        for (label, pourquoi) in [
+            ("manual self_dev parent", "aucun préfixe — le cas d'AC-T3"),
+            (
+                "long_running:run_claude_pilot_groom",
+                "une parente de groom",
+            ),
+            (
+                "ready-label: mika#3002",
+                "repo nu : l'URL d'API serait fausse, et son 404 se lirait comme \
+                 une timeline illisible",
+            ),
+            (
+                "ready-label: senara-solutions/mika#trois",
+                "numéro d'issue illisible",
+            ),
+        ] {
+            assert_eq!(
+                parse_ready_label_task_label(label),
+                None,
+                "`{label}` ne doit pas être lu comme une parente `ready-label` ({pourquoi})"
+            );
         }
     }
 
-    /// Construit une page de `n` événements `commented` suivis des `extras`.
-    fn page_of(filler: usize, extras: &[&str]) -> String {
-        let mut items: Vec<String> = (0..filler)
-            .map(|i| {
-                format!(
-                    r#"{{"event":"commented","actor":{{"login":"someone"}},"created_at":"2026-09-01T00:{:02}:00Z"}}"#,
-                    i % 60
-                )
-            })
-            .collect();
-        items.extend(extras.iter().map(|s| s.to_string()));
-        format!("[{}]", items.join(","))
+    /// Le composeur rend l'acteur et l'instant du retrait, **sans relire**.
+    #[tokio::test]
+    async fn mika2995_le_composeur_rend_lacteur_et_linstant_du_retrait() {
+        let pages = FixturePages(vec![page_of(
+            0,
+            &[
+                &labeled_json("samidarko", "2026-11-01T13:00:00Z"),
+                &unlabeled_json("samidarko", "2026-11-01T14:08:43Z"),
+            ],
+        )]);
+
+        let verdict =
+            park_verdict_for_issue_with(&pages, "senara-solutions/mika", 3002, &machine())
+                .await
+                .expect("la timeline est lisible");
+
+        assert_eq!(
+            verdict,
+            Some((
+                Some("samidarko".to_string()),
+                "2026-11-01T14:08:43Z".to_string()
+            )),
+            "le parc doit porter qui a retiré et quand — l'appelant les journalise sans \
+             payer une seconde lecture"
+        );
     }
 
-    fn labeled_json(actor: &str, at: &str) -> String {
-        format!(
-            r#"{{"event":"labeled","label":{{"name":"ready"}},"actor":{{"login":"{actor}"}},"created_at":"{at}"}}"#
-        )
+    /// Contrôle négatif du composeur, sur la même fixture à un événement près :
+    /// un `labeled` final rend `Ok(None)`.
+    #[tokio::test]
+    async fn mika2995_le_composeur_rend_none_quand_le_consentement_tient() {
+        let pages = FixturePages(vec![page_of(
+            0,
+            &[
+                &labeled_json("samidarko", "2026-11-01T13:00:00Z"),
+                &unlabeled_json("samidarko", "2026-11-01T14:08:43Z"),
+                &labeled_json("samidarko", "2026-11-01T15:32:14Z"),
+            ],
+        )]);
+
+        let verdict =
+            park_verdict_for_issue_with(&pages, "senara-solutions/mika", 3002, &machine())
+                .await
+                .expect("la timeline est lisible");
+
+        assert_eq!(verdict, None, "un `labeled` en dernier n'est pas un parc");
     }
+
+    // ── Tests 11–12 : la pagination (B1) ──
 
     /// **Test 11 — la régression B1, nommée et épinglée.**
     ///
