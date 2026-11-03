@@ -49,6 +49,45 @@ const declarationMap: Map<string, string> = (() => {
   return map
 })()
 
+/**
+ * The `--color-*` declarations of the legacy-alias block, as `[name, value]`.
+ *
+ * Read from `THEME_CSS_RAW` (comments intact) because the block is delimited by
+ * its own comments: from the `Legacy aliases` marker to the next SECTION
+ * comment — one that opens its own line. A note trailing a declaration
+ * (`--x: #y;  /* no-op *\/`) deliberately does not close the region: were it to,
+ * a seventh declaration written after such a note would fall outside the scan
+ * and pass in silence, which is the exact failure this guard exists for. The
+ * region is stripped of comments afterwards so a trailing note is never read
+ * as a value.
+ *
+ * Throws rather than returning an empty list when the marker is gone: a
+ * shape guard that silently scans nothing passes on a deleted block, which is
+ * the other way it could fail open.
+ */
+const aliasBlockDeclarations = (): Array<[name: string, value: string]> => {
+  const start = THEME_CSS_RAW.indexOf('/* Legacy aliases')
+  if (start < 0) {
+    throw new Error(
+      'theme.css: the `/* Legacy aliases` marker is gone — the alias-block shape guard (mika#2913) has nothing to scan.',
+    )
+  }
+  const afterMarker = THEME_CSS_RAW.indexOf('*/', start) + 2
+  const tail = THEME_CSS_RAW.slice(afterMarker)
+  const nextSection = tail.search(/\n[ \t]*\/\*/)
+  const region = tail
+    .slice(0, nextSection < 0 ? undefined : nextSection)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+
+  const out: Array<[string, string]> = []
+  const re = /(--[a-z0-9-]+)\s*:\s*([^;]+);/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(region)) !== null) {
+    out.push([m[1].toLowerCase(), collapse(m[2]).trim()])
+  }
+  return out
+}
+
 const canonicalTokens: Array<[name: string, hex: string, source: string]> = [
   // Surface hierarchy — rulebook §2 Full Token Reference
   ['--color-background', '#0c0e11', 'background/surface/surface_dim'],
@@ -87,30 +126,65 @@ const canonicalTokens: Array<[name: string, hex: string, source: string]> = [
   ['--color-error-container', '#a70138', 'error_container'],
 ]
 
-const backwardCompatAliases: Array<[legacy: string, canonical: string]> = [
-  ['--color-bg', 'var(--color-background)'],
-  ['--color-bg-card', 'var(--color-surface-container)'],
-  ['--color-accent', 'var(--color-primary)'],
-  ['--color-accent-light', 'var(--color-secondary)'],
-  ['--color-heading', 'var(--color-on-surface)'],
-  ['--color-muted', 'var(--color-on-surface-variant)'],
+/**
+ * mika#2913 — the legacy aliases are frozen at their 0.3.1 VALUES.
+ *
+ * This table replaces `backwardCompatAliases`, which asserted the opposite
+ * (`--color-accent: var(--color-primary)`). That form carried 0.5.0's
+ * intention — pull every unmigrated consumer onto §2 through the alias — and
+ * Vincent disavowed it on 2026-10-26: a minor bump recoloured all of
+ * mika-cloud#287's pages, including the ones it never touched. The guard is
+ * rewritten the other way round, not deleted: a consumer writing a legacy
+ * name gets the legacy value, and the canonical names keep canonical values.
+ *
+ * The expected value is a literal hex on purpose. A `var()` onto a canonical
+ * token is the exact mechanism the regression arrived by, so a `var()`
+ * reintroduced here fails printing the drift by name
+ * (`expected "#7c6af7", received "var(--color-primary)"`).
+ */
+const legacyAliasValues: Array<[legacy: string, hex: string, canonicalCounterpart: string]> = [
+  ['--color-bg', '#0d0f12', '--color-background'],
+  ['--color-bg-card', '#151820', '--color-surface-container'],
+  ['--color-accent', '#7c6af7', '--color-primary'],
+  // A no-op by value (`--color-secondary` is #9d8fff too). Listed anyway: the
+  // block-shape guard below slaves the *whole* block to one form, and a sixth
+  // member left in the other form would be the special case by which the guard
+  // stops being uniform.
+  ['--color-accent-light', '#9d8fff', '--color-secondary'],
+  ['--color-heading', '#e8ecf2', '--color-on-surface'],
+  ['--color-muted', '#a0a8b8', '--color-on-surface-variant'],
 ]
 
-// Formerly-live legacy hex values — must be absent from the theme file after
-// LC.1 reconciliation. Reintroducing any of them regresses the fix and forces
-// the operator to justify the reintroduction (or update this list with a
-// documented rationale).
+/**
+ * The §2 token each in-repo surface re-aliases a legacy name onto.
+ *
+ * Counterpart of the table above, and the reason restoring the legacy values
+ * is not merely moving the regression: `dashboard/src` (840 usages) and
+ * `site/src` (136) are surfaces the rulebook is the law of, so they take canon
+ * back locally instead of being de-canonised in silence on 791 lines nobody
+ * re-reads. Asserted here, and not in a dashboard test or a CI script, because
+ * `site/` declares no test runner at all (mika#2578/#2752: a guard nothing
+ * runs refuses nothing) while `npm test -w packages/ui` is already required.
+ */
+const inRepoRealiasConsumers: Array<[label: string, relPath: string]> = [
+  ['dashboard', '../../../dashboard/src/index.css'],
+  ['site', '../../../site/src/index.css'],
+]
+
+// Legacy hex values that must stay absent from the theme file. Reduced to two
+// entries by mika#2913: the five the table above now *requires* left the list,
+// because a guard that banned them would fail the repo against itself. What
+// remains is exactly the hex whose NAME is canonical §2 and whose canonical
+// value is not being restored.
 const bannedLegacyHexValues: Array<[hex: string, wasFor: string]> = [
-  ['#7c6af7', 'legacy accent — replaced by canonical primary #ada3ff'],
-  ['#0d0f12', 'legacy bg — replaced by canonical background #0c0e11'],
-  ['#151820', 'legacy bg-card — replaced by canonical surface_container #171a1d'],
-  ['#1e2130', 'legacy surface-container-high — replaced by canonical #1d2024'],
-  ['#e8ecf2', 'legacy heading — replaced by canonical on_surface #e8e8ec'],
-  ['#a0a8b8', 'legacy muted — replaced by canonical on_surface_variant #aaabaf'],
-  // Kept, and the entry outlives its contradiction on purpose: #1976 removed
-  // #ef4444 from the rulebook, which makes it a hex that *was* canonical and is
-  // no longer — the kind a consumer retypes from memory rather than reads.
-  ['#ef4444', 'former §5.5 error hex — removed from the rulebook by #1976'],
+  [
+    '#1e2130',
+    'legacy surface-container-high — the name is canonical §2, value #1d2024 (mika#2913 § 2.2)',
+  ],
+  [
+    '#ef4444',
+    'former §5.5 error hex — removed from the rulebook by #1976; restoring it would reverse the rulebook, not just the lib',
+  ],
 ]
 
 /**
@@ -138,6 +212,18 @@ const ruleFor = (selector: string): string =>
 const hasRule = (selector: string): boolean =>
   mikaRules.some(([sel]) => sel === selector)
 
+/** `<prop>: <value>;` pairs of a rule body, collapsed/lowercased like the rest. */
+const declarationsOf = (body: string): Map<string, string> => {
+  const map = new Map<string, string>()
+  const re = /([a-z-]+)\s*:\s*([^;]+);/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(body)) !== null) map.set(m[1], m[2].trim())
+  return map
+}
+
+const CTA_REST = '.mika-cta-gradient'
+const CTA_HOVER = '.mika-cta-gradient:not(:disabled):hover'
+
 describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
   it.each(canonicalTokens)(
     'defines canonical token %s = %s (%s)',
@@ -151,14 +237,88 @@ describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
     },
   )
 
-  it.each(backwardCompatAliases)(
-    'preserves backward-compat alias %s → %s',
-    (legacy, canonical) => {
-      expect(declarationMap.get(legacy.toLowerCase())).toBe(
-        collapse(canonical).trim(),
-      )
+  it.each(legacyAliasValues)(
+    'freezes legacy alias %s at its 0.3.1 value %s',
+    (legacy, hex) => {
+      expect(declarationMap.get(legacy.toLowerCase())).toBe(hex.toLowerCase())
     },
   )
+
+  /**
+   * The table above is a LIST, so a seventh declaration added to the alias
+   * block with no entry in it would pass in silence — the class of defect
+   * `scripts/check-landing-tokens.sh` had to leave a list to catch, and that
+   * this file already names about its own denylist ("green on a *new* purple
+   * written in good faith"). So the rule here is on the SHAPE of the block,
+   * not on a set of values, and it is asserted both ways: an undeclared
+   * declaration fails, and an entry describing no declaration fails too —
+   * which is what makes the table expire with the block it describes.
+   */
+  it('declares no alias outside the table, and no table entry outside the block', () => {
+    const declared = aliasBlockDeclarations().map(([name]) => name)
+    const tabled = legacyAliasValues.map(([name]) => name.toLowerCase())
+
+    expect([...declared].sort()).toEqual([...tabled].sort())
+  })
+
+  it.each(legacyAliasValues)(
+    'writes %s as a literal, never as a var() onto §2',
+    (legacy) => {
+      // The `var()` form IS the regression mechanism (mika#2913 § 4.1): it
+      // renders identically the day it is written and recolours a consumer the
+      // next time §2 moves. Asserted on the raw block rather than on the value
+      // alone so the failure names the shape, not just the hex.
+      const value = aliasBlockDeclarations().find(([name]) => name === legacy.toLowerCase())?.[1]
+      expect(value).toBeDefined()
+      expect(value).not.toContain('var(')
+      expect(value).toMatch(/^#[0-9a-f]{3,8}$/)
+    },
+  )
+
+  /**
+   * Anti-stale, both tables. An entry stops being an assertion the day its
+   * premise dissolves, and a guard that keeps passing on a dissolved premise
+   * is worse than no guard: it reads as conformity.
+   *
+   *   - a banned hex that became a canonical token's value is no longer a ban,
+   *     it is a guard that would fail against the rulebook;
+   *   - a legacy alias value that coincides with its canonical counterpart's
+   *     value proves nothing — the alias would be tautological.
+   *
+   * Either way the crossing fails THIS entry and forces its removal.
+   */
+  it.each(bannedLegacyHexValues)(
+    'banned hex %s is not the value of a canonical token (anti-stale)',
+    (hex) => {
+      expect(canonicalTokens.map(([, h]) => h.toLowerCase())).not.toContain(hex.toLowerCase())
+    },
+  )
+
+  it.each(legacyAliasValues.filter(([name]) => name !== '--color-accent-light'))(
+    'legacy value of %s differs from its canonical counterpart (anti-tautology)',
+    (_legacy, hex, counterpart) => {
+      // `--color-accent-light` is excluded by name and by measurement: #9d8fff
+      // IS `--color-secondary`'s value, which is why mika#2913 § 2.3 calls the
+      // sixth alias a no-op. Excluding it here is what lets the other five
+      // carry a real assertion instead of a weakened one.
+      expect(declarationMap.get(counterpart)).not.toBe(hex.toLowerCase())
+    },
+  )
+
+  /**
+   * D5 — the in-repo surfaces take canon back locally. Without this, losing
+   * either block de-canonises a surface on hundreds of utilities that no
+   * review re-reads, which is this very ticket's defect pointed the other way.
+   */
+  it.each(inRepoRealiasConsumers)('%s re-aliases all six legacy names onto §2', (_label, relPath) => {
+    // `readFileSync` relative to `import.meta.url`, like THEME_CSS_RAW above: a
+    // move breaks the test rather than making it vacuous.
+    const css = collapse(readFileSync(join(HERE, relPath), 'utf8'))
+
+    for (const [legacy, , counterpart] of legacyAliasValues) {
+      expect(css).toContain(`${legacy}: var(${counterpart});`)
+    }
+  })
 
   it.each(bannedLegacyHexValues)(
     'does not reintroduce legacy hex %s (%s)',
@@ -198,31 +358,250 @@ describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
  */
 describe('theme.css — LC.2 (mika#1801) rulebook §2/§5 CTA texture', () => {
   it('declares the .mika-cta-gradient rest state', () => {
-    expect(hasRule('.mika-cta-gradient')).toBe(true)
+    expect(hasRule(CTA_REST)).toBe(true)
   })
 
   it('declares a hover state scoped away from :disabled', () => {
     // `:hover` fires on a disabled <button> in every engine, so an unscoped
     // hover would animate a button that cannot be pressed. `:not(:disabled)` is
     // vacuously true on the <a> branch of <Button>, so one selector serves both.
-    expect(hasRule('.mika-cta-gradient:not(:disabled):hover')).toBe(true)
+    // Unchanged by the §5 amendment: the reason is technical, not chromatic.
+    expect(hasRule(CTA_HOVER)).toBe(true)
   })
 
-  it('renders the rest state as a 135deg gradient from primary to primary_dim', () => {
-    const body = ruleFor('.mika-cta-gradient')
+  /**
+   * D7 (mika#2913) — this `it` replaces the three that pinned
+   * `linear-gradient`, `135deg` and the `primary`-before-`primary_dim` order.
+   * Those stated the rule as it stood BEFORE the §5 amendment and would fail
+   * on the flattened CTA. They are rewritten, not deleted: what §5 now
+   * prescribes is a background composed of §2 tokens whose contrast holds
+   * (asserted by D6 below), in whichever form — solid or gradient — satisfies
+   * the threshold.
+   */
+  it.each([CTA_REST, CTA_HOVER])('composes %s from §2 tokens, in one background form', (sel) => {
+    const decls = declarationsOf(ruleFor(sel))
+    const forms = ['background-color', 'background-image'].filter((p) => decls.has(p))
 
-    expect(body).toContain('linear-gradient')
-    // §2: "at a 135-degree angle".
-    expect(body).toContain('135deg')
+    // Exactly one: a rule declaring both leaves which one paints up to the
+    // cascade, and D6 would then be measuring a background the user never sees.
+    expect(forms).toHaveLength(1)
 
-    // §2/§5: `primary` FIRST, then `primary_dim`. The closing paren in
-    // `var(--color-primary)` is what makes this unambiguous — without it the
-    // needle would also match inside `var(--color-primary-dim)`.
-    const from = body.indexOf('var(--color-primary)')
-    const to = body.indexOf('var(--color-primary-dim)')
-    expect(from).toBeGreaterThanOrEqual(0)
-    expect(to).toBeGreaterThanOrEqual(0)
-    expect(from).toBeLessThan(to)
+    // Tokens, never literals — the property that keeps the CTA tracking §2 when
+    // §2 moves. (The file-wide scan at the bottom covers the hex form; this
+    // asserts the positive: the background is built out of `var(--color-*)`.)
+    expect(decls.get(forms[0])).toContain('var(--color-')
+  })
+})
+
+/**
+ * D6 (mika#2913, = mika#2912 AC2) — the permanent guardian of the amended §5
+ * button rule.
+ *
+ * The rule, as Prime rendered it on Vincent's delegation (mika#2912, 2026-11-03,
+ * path (c)) and as `luminescent-core.md` §5 now carries it:
+ *
+ *   > a gradient is admissible on a CTA only if the `on_surface` text reaches
+ *   > 4.5:1 on EVERY stop, hover included; otherwise the CTA is flattened onto
+ *   > a solid tint that satisfies the threshold.
+ *
+ * So this does NOT assert "the CTA is `secondary_container`". That would pin a
+ * value, and the value is not the rule — written that way the guard would fail
+ * the day the brand hues move in a way the rule allows, and stay green the day
+ * one of them drops below the threshold. It asserts the RULE: resolve whatever
+ * the CTA paints, resolve the text colour from `.mika-btn--primary` rather than
+ * retyping it (so the test follows §7 if §7 ever moves), and require 4.5:1 on
+ * every stop of both states. A gradient becomes admissible again the day the
+ * hues permit, exactly as the rule provides.
+ *
+ * Measured on 0.5.0 before the fix: 1.82:1 on `primary`, 3.82:1 on
+ * `primary_dim`. After: 7.66:1 at rest, 8.59:1 on hover.
+ */
+
+type Rgb = [number, number, number]
+
+/** Split a comma-separated list, ignoring commas nested inside parentheses. */
+const splitTopLevel = (s: string): string[] => {
+  const out: string[] = []
+  let depth = 0
+  let cur = ''
+  for (const ch of s) {
+    if (ch === '(') depth += 1
+    if (ch === ')') depth -= 1
+    if (ch === ',' && depth === 0) {
+      out.push(cur.trim())
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  if (cur.trim() !== '') out.push(cur.trim())
+  return out
+}
+
+const parseHex = (hex: string): Rgb => {
+  const h = hex.slice(1)
+  const full = h.length === 3 ? [...h].map((c) => c + c).join('') : h
+  return [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16)) as Rgb
+}
+
+/**
+ * Resolve a CSS colour expression to sRGB, accepting THREE forms and three
+ * only: a literal hex, `var(--token)` (resolved through `declarationMap`, so
+ * the test reads the same §2 the browser does), and
+ * `color-mix(in srgb, <A> P%, <B>)` (component-wise interpolation, which is
+ * what the spec prescribes for that space).
+ *
+ * **Anything else throws, and the throw is the point** — not an implementation
+ * detail. A resolver that answered "indeterminate → green" would declare
+ * conformant the first `oklch()` or `light-dark()` written in good faith, and
+ * silent conformity is the one failure mode this repo refuses in a detector.
+ * Asserted directly by a case below, on an expression invented in the test.
+ */
+const resolveColour = (expr: string, depth = 0): Rgb => {
+  if (depth > 8) throw new Error(`colour reference cycle while resolving: ${expr}`)
+  const v = expr.trim().toLowerCase()
+
+  if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/.test(v)) return parseHex(v)
+
+  const varRef = /^var\(\s*(--[a-z0-9-]+)\s*\)$/.exec(v)
+  if (varRef) {
+    const target = declarationMap.get(varRef[1])
+    if (target === undefined) {
+      throw new Error(`unknown token ${varRef[1]} — theme.css declares no such custom property`)
+    }
+    return resolveColour(target, depth + 1)
+  }
+
+  const mix = /^color-mix\(\s*in\s+srgb\s*,([\s\S]+)\)$/.exec(v)
+  if (mix) {
+    const args = splitTopLevel(mix[1])
+    if (args.length !== 2) {
+      throw new Error(`color-mix() with ${args.length} colour arguments is not supported: ${expr}`)
+    }
+    const weighted = /^([\s\S]+?)\s+([0-9.]+)%$/.exec(args[0])
+    if (!weighted) {
+      throw new Error(`color-mix() needs an explicit percentage on its first colour: ${expr}`)
+    }
+    const a = resolveColour(weighted[1], depth + 1)
+    const b = resolveColour(args[1], depth + 1)
+    const p = Number(weighted[2]) / 100
+    return [0, 1, 2].map((i) => a[i] * p + b[i] * (1 - p)) as Rgb
+  }
+
+  throw new Error(
+    `unresolvable colour form: "${expr}". D6 (mika#2913) admits a literal hex, ` +
+      `var(--token) and color-mix(in srgb, <A> P%, <B>) only. Anything else must ` +
+      `fail here rather than read as conformant — see theme.test.ts § D6.`,
+  )
+}
+
+/** WCAG 2.x relative luminance. */
+const relativeLuminance = (rgb: Rgb): number => {
+  const [r, g, b] = rgb.map((c) => {
+    const s = c / 255
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
+  })
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/** WCAG 2.x contrast ratio, order-independent. */
+const contrastRatio = (a: Rgb, b: Rgb): number => {
+  const [hi, lo] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x)
+  return (hi + 0.05) / (lo + 0.05)
+}
+
+/**
+ * Every colour the CTA paints in one state: a single value for
+ * `background-color`, or the stop list of a `linear-gradient`. Throws on a
+ * rule that declares neither, or that declares both forms at once — the
+ * resolver's refusal to guess, applied one level up.
+ */
+const ctaBackgroundStops = (selector: string): string[] => {
+  const body = ruleFor(selector)
+  if (body === '') throw new Error(`theme.css declares no rule for ${selector}`)
+  const decls = declarationsOf(body)
+
+  const solid = decls.get('background-color')
+  const gradient = decls.get('background-image')
+
+  if (solid !== undefined && gradient !== undefined) {
+    throw new Error(`${selector} declares both a background-color and a background-image`)
+  }
+  if (solid !== undefined) return [solid]
+  if (gradient !== undefined) {
+    const inner = /^linear-gradient\(([\s\S]*)\)$/.exec(gradient)
+    if (inner === null) {
+      throw new Error(`unsupported background-image form on ${selector}: ${gradient}`)
+    }
+    return splitTopLevel(inner[1])
+      // A leading angle or `to <side>` is geometry, not a colour.
+      .filter((arg) => !/^(-?[0-9.]+deg$|to\s)/.test(arg))
+      // Drop the optional stop position: `var(--color-primary) -25%`.
+      .map((arg) => arg.replace(/\s+-?[0-9.]+%$/, ''))
+  }
+  throw new Error(`${selector} paints no background — D6 cannot measure what is not declared`)
+}
+
+describe('theme.css — mika#2913 (mika#2912 AC2) amended §5: the CTA text clears 4.5:1', () => {
+  // Read, never retyped: §7 prescribes `on_surface` for the primary button's
+  // text, and the day §7 moves this test follows it instead of measuring a
+  // colour the button no longer uses.
+  const ctaTextExpr = declarationsOf(ruleFor('.mika-btn--primary')).get('color')
+
+  it('reads the CTA text colour from .mika-btn--primary rather than assuming it', () => {
+    expect(ctaTextExpr).toBe('var(--color-on-surface)')
+  })
+
+  it.each([
+    ['rest', CTA_REST],
+    ['hover', CTA_HOVER],
+  ])('clears 4.5:1 on every %s stop', (_state, selector) => {
+    const text = resolveColour(ctaTextExpr as string)
+    const stops = ctaBackgroundStops(selector)
+
+    // Anti-vacuity: an empty stop list would make the assertion below hold by
+    // looking at nothing, and a CTA with no measurable background must fail.
+    expect(stops.length).toBeGreaterThan(0)
+
+    // Measured first, asserted once. A per-stop `expect` inside a loop stops at
+    // the first violation and hides the others — on 0.5.0 it printed 1.82 and
+    // said nothing about primary_dim's 3.82, which is half the defect.
+    const measured = stops.map((stop) => [stop, contrastRatio(text, resolveColour(stop))] as const)
+    const report = measured.map(([s, r]) => `\`${s}\` → ${r.toFixed(2)}:1`).join(', ')
+
+    expect(
+      measured.filter(([, ratio]) => ratio < 4.5).map(([stop]) => stop),
+      `${selector}: ${report}`,
+    ).toEqual([])
+  })
+
+  it('refuses a colour form it cannot resolve, instead of passing', () => {
+    // The load-bearing property of the resolver. Invented here rather than
+    // taken from the file: the point is what happens to a form NOT in the
+    // file, the day somebody writes one in good faith.
+    expect(() => resolveColour('oklch(62% 0.21 292)')).toThrow(/unresolvable colour form/)
+    expect(() => resolveColour('light-dark(#ffffff, #000000)')).toThrow(/unresolvable colour form/)
+    expect(() => resolveColour('var(--color-does-not-exist)')).toThrow(/unknown token/)
+    expect(() => resolveColour('color-mix(in oklab, #fff 50%, #000)')).toThrow(
+      /unresolvable colour form/,
+    )
+  })
+
+  it('resolves the three admitted forms', () => {
+    // Anti-vacuity for the test above: a resolver that threw on everything
+    // would satisfy it while measuring nothing.
+    expect(resolveColour('#0c0e11')).toEqual([12, 14, 17])
+    expect(resolveColour('var(--color-on-surface)')).toEqual([232, 232, 236])
+    expect(resolveColour('color-mix(in srgb, #ffffff 50%, #000000)')).toEqual([
+      127.5, 127.5, 127.5,
+    ])
+  })
+
+  it('computes WCAG contrast the way the spec does', () => {
+    // Two anchors with known values, so an arithmetic slip in the luminance
+    // transfer function cannot hide behind a threshold that happens to pass.
+    expect(contrastRatio([255, 255, 255], [0, 0, 0])).toBeCloseTo(21, 5)
+    expect(contrastRatio([12, 14, 17], [12, 14, 17])).toBeCloseTo(1, 5)
   })
 })
 

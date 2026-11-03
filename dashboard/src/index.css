@@ -1,2 +1,21 @@
 @import "tailwindcss";
 @import '@samidarko/ui/theme.css';
+
+/* mika#2913 — this surface takes the canonical §2 values back, locally.
+   `@samidarko/ui/theme.css` froze the six legacy alias names at their 0.3.1
+   values, because a published lib must not recolour an unmigrated consumer on
+   a minor bump (mika-cloud#287). This dashboard is not that consumer: the
+   rulebook is its law, and 840 utilities written on these names must keep
+   resolving to canon. Re-aliasing here is what makes migrating those call
+   sites a naming cleanup with no visual deadline (tracked in mika#2912).
+   Written as `var(--color-*)`, never as hex, so it keeps tracking §2 when §2
+   moves. Slaved by `packages/ui/src/theme.test.ts`: remove this block and
+   `npm test -w packages/ui` fails. */
+@theme {
+  --color-bg: var(--color-background);
+  --color-bg-card: var(--color-surface-container);
+  --color-accent: var(--color-primary);
+  --color-accent-light: var(--color-secondary);
+  --color-heading: var(--color-on-surface);
+  --color-muted: var(--color-on-surface-variant);
+}

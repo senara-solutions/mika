@@ -52,17 +52,28 @@
   --color-warning: #f59e0b;
   --color-blocked: #f97316;
 
-  /* Backward-compat aliases (legacy names → canonical values).
-     Ensures any consumer missed by the packages/ui + dashboard grep sweep
-     continues to render (with the new canonical color — the intended fix).
-     Remove once a cross-repo grep sweep (cloud-console, landing-page) confirms
-     zero legacy references. Tracked in plan § Out of scope. */
-  --color-bg: var(--color-background);
-  --color-bg-card: var(--color-surface-container);
-  --color-accent: var(--color-primary);
-  --color-accent-light: var(--color-secondary);
-  --color-heading: var(--color-on-surface);
-  --color-muted: var(--color-on-surface-variant);
+  /* Legacy aliases — the names below are frozen at their 0.3.1 VALUES, not just
+     their spelling. Until 0.5.0 they were `var(--color-*)` onto §2, which
+     recoloured a whole consumer on a minor bump (mika-cloud#287, 862 usages,
+     every page — not only the ones it touched). Vincent called that a
+     regression on 2026-10-26; mika#2913 restores the values.
+
+     Written as LITERAL hex, never as `var(--color-*)`: a `var()` onto a
+     canonical token is precisely the mechanism the regression arrived by, and
+     it would replay it at the next §2 move. Pinned both ways by
+     `theme.test.ts § legacyAliasValues` — a seventh declaration in this block,
+     or a `var(` in it, fails the suite.
+
+     This repo's own surfaces want canon and re-alias these six names locally
+     (`dashboard/src/index.css`, `site/src/index.css`), asserted by the same
+     test. `--color-error` and `--color-surface-container-high` are NOT here:
+     they are canonical §2 names, not aliases, and keep their §2 values. */
+  --color-bg: #0d0f12;
+  --color-bg-card: #151820;
+  --color-accent: #7c6af7;
+  --color-accent-light: #9d8fff;  /* no-op: identical to var(--color-secondary) */
+  --color-heading: #e8ecf2;
+  --color-muted: #a0a8b8;
 
   /* Roundedness scale per luminescent-core §6: "All interactive elements adhere
      to the `xl` (1.5rem) or `lg` (1rem) scale."
@@ -93,38 +104,64 @@ html {
   scroll-behavior: smooth;
 }
 
-/* Rulebook §2 "Signature Textures" (luminescent-core.md:44) + §5 "Buttons"
-   (l.105): main CTAs are a `primary` -> `primary_dim` linear gradient at 135deg.
-   This is the SINGLE declaration of that texture, and LC.2 (mika#1801) is the
-   first time any surface applies it — every CTA in the repo was a flat
-   `bg-accent` until then.
+/* Rulebook §5 "Buttons", as amended on 2026-11-03 (mika#2912, path (c), Prime
+   on Vincent's delegation; the §5 text carries the rule and its provenance):
 
-   It lives here, and not in `<Button>`'s TSX, because `theme.css` is the one file
-   all three surfaces already import (`site/` imports nothing else from this
-   package), because Tailwind v4 cannot express a 135deg gradient between two
-   arbitrary CSS variables without an arbitrary value repeated at every callsite,
-   and because this file is statically pinned — `theme.test.ts` asserts the angle,
-   the token order, and the absence of any colour literal. Written in TSX the
+     a gradient is admissible on a CTA only if the `on_surface` text reaches
+     4.5:1 on EVERY stop, hover included; otherwise the CTA is flattened onto a
+     solid tint that satisfies the threshold.
+
+   Against §2 as it stands, the `primary` -> `primary_dim` gradient this rule
+   used to prescribe unconditionally does NOT satisfy it: `on_surface` (#e8e8ec)
+   measures 1.82:1 on `primary` and 3.82:1 on `primary_dim`, and dark text does
+   not rescue the dark stop either (4.14:1) — §7 forbids leaving `on_surface`
+   in any case. The defect was in the two rules combined, not in a consumer,
+   which is why the rule was corrected rather than a callsite.
+
+   So the CTA is flattened. `secondary_container` is not a choice among
+   several: it is the ONLY §2 token of the purple family that clears the
+   threshold (7.66:1, which is AAA), every other primary/secondary tint being
+   lighter than `primary_dim`. Inventing a new hex would be adding a §2 token,
+   which §8 reserves to Vincent and path (c) did not open.
+
+   The price is real and is named rather than hidden: the CTA's silhouette
+   against the page background drops from 8.71:1 to 2.07:1, below the 3:1 that
+   WCAG 1.4.11 asks of the visual parts identifying a component. No remedy
+   exists inside §2 — the window satisfying both text and silhouette
+   (0.113 <= L <= 0.141) contains no token at all — so it is tracked for a §8
+   decision instead of being quietly accepted (mika#2912).
+
+   The class keeps its name although it paints no gradient any more: it is a
+   PUBLIC CSS class of this package, and renaming it would be an unannounced
+   breaking change in the middle of a flight whose whole subject is that an
+   unannounced change broke a consumer. Rename tracked with the next major.
+
+   It lives here, and not in `<Button>`'s TSX, because `theme.css` is the one
+   file all three surfaces already import (`site/` imports nothing else from
+   this package), and because this file is statically pinned — `theme.test.ts`
+   recomputes the contrast from the tokens below and fails if any stop drops
+   under 4.5:1 (its permanent guardian, mika#2912 AC2). Written in TSX the
    texture would be invisible to that guard.
 
    Composes tokens, never literals: that is what keeps it tracking §2 when §2
-   moves. Pinned by `theme.test.ts` § "LC.2 (mika#1801) ... CTA texture". */
+   moves. */
 .mika-cta-gradient {
-  background-image: linear-gradient(135deg, var(--color-primary), var(--color-primary-dim));
+  background-color: var(--color-secondary-container);
 }
 
 /* §5 prescribes no hover for the primary button, so this is an implementation
-   decision, named in the LC.2 PR body rather than invented into the rulebook.
-   It replaces the `hover:bg-accent-light` the five migrated CTAs carried — a
-   shift toward `--color-secondary`, i.e. darker — by sliding the gradient stops
-   toward `primary_dim`. No new colour is introduced, so the hover keeps tracking
-   §2 exactly as the rest state does.
+   decision, named in the PR body rather than invented into the rulebook. The
+   intention written by LC.2 (mika#1801) is kept literally — "a shift toward
+   `--color-secondary`, i.e. darker" — by mixing toward the page background,
+   which darkens and therefore RAISES the text contrast: 8.55:1. The amended
+   rule is satisfied by construction rather than by coincidence, and no colour
+   literal enters the rule (#3d2f8f is what it computes to, never what it says).
 
    `:not(:disabled)` because `:hover` fires on a disabled <button> in every
    engine; it is vacuously true on the <a href> branch of <Button>, so one
    selector serves both rendered elements. */
 .mika-cta-gradient:not(:disabled):hover {
-  background-image: linear-gradient(135deg, var(--color-primary) -25%, var(--color-primary-dim) 85%);
+  background-color: color-mix(in srgb, var(--color-secondary-container) 88%, var(--color-background));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
