@@ -721,6 +721,54 @@ pub struct TaskDispatcher {
         std::sync::Mutex<Option<crate::config_keys::ResolvedProactiveBudget>>,
 }
 
+/// Ce qu'une relecture du consentement `ready` a produit (mika#2995, tranche
+/// du 2026-11-03).
+///
+/// Cinq issues, cinq noms. Les deux premières dispatchent, les trois autres
+/// non — et parmi celles-là, une seule écrit un terminal. L'enum existe pour
+/// que cette asymétrie soit lisible au site de décision plutôt que répartie
+/// dans des `bool` imbriqués, exactement comme `BuildCallbackHead` le fait pour
+/// mika#2671.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WithdrawnConsentVerdict {
+    /// AC-T3 — parente absente, ou label hors du préfixe `ready-label:`
+    /// (groom, revue, dispatch manuel). **Aucune lecture réseau n'a eu lieu.**
+    NotAReadyLabelParent,
+    /// Dernier événement `labeled`, ou `unlabeled` d'une identité machine
+    /// (AC-T2 : le `remove` puis `add` de la Phase 2 d'`auto_pull`).
+    ConsentHeld,
+    /// Dernier événement `unlabeled` d'un acteur non machine : un humain a
+    /// retiré le consentement et ne l'a pas remis.
+    ConsentWithdrawn {
+        parked_by: Option<String>,
+        parked_at: String,
+    },
+    /// D4 — la relecture n'a pas abouti. `cause` est fermée à quatre valeurs
+    /// (`api`, `parse`, `truncated`, `identities`) pour que « la lecture échoue
+    /// en boucle » et « aucun wrapper n'est passé par la garde » ne rendent pas
+    /// zéro tous les deux (classe mika#2205).
+    TimelineUnreadable { cause: &'static str, detail: String },
+    /// D4 — aucun jeton GitHub résolu. Variante distincte de la précédente :
+    /// un jeton absent est une panne de configuration, une timeline illisible
+    /// est une panne d'API, et les deux remédiations n'ont rien en commun.
+    NoToken,
+}
+
+/// La parente `ready-label:` d'un wrapper différé, et l'issue dont elle porte
+/// le travail (mika#2995).
+///
+/// Les coordonnées viennent du **label** de la parente, pas de son
+/// `reference_url` : le label porte `owner/repo#N` en entier, là où le parseur
+/// d'URL rend le dépôt nu. `agent_id` est transporté parce que la ligne d'audit
+/// en a besoin pour sa session système, et le relire serait une seconde lecture
+/// pour une donnée déjà en main.
+struct ReadyLabelParent {
+    id: String,
+    agent_id: String,
+    repo: String,
+    issue: u64,
+}
+
 impl TaskDispatcher {
     /// Write `execution_trace_id` back to a task after a silent agent run completes.
     /// Best-effort: logs a warning on failure but does not propagate the error.
@@ -1331,6 +1379,303 @@ impl TaskDispatcher {
         }
     }
 
+    /// Les coordonnées d'une relecture de consentement : la parente d'un
+    /// wrapper différé **quand elle vient du feeder `ready-label`**, et l'issue
+    /// dont elle porte le travail.
+    ///
+    /// `None` est le cas d'AC-T3 — parente absente, ou label hors préfixe
+    /// (groom, revue, dispatch manuel). La parente est rendue entière parce que
+    /// la ligne d'audit a besoin de son `agent_id` : l'obtenir plus tard serait
+    /// une seconde lecture pour une donnée déjà en main.
+    async fn ready_label_parent_for_recheck(&self, task: &Task) -> Option<ReadyLabelParent> {
+        let parent_id = task.parent_task_id.as_deref()?;
+        let parent = match self.db.get_task_unscoped(parent_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => {
+                // Une base qui ne rend pas la parente ne prouve pas qu'elle
+                // n'est pas `ready-label`. Mais le dispatch qui suivrait lit la
+                // même base et échouerait pour la même raison, donc on nomme le
+                // fait au lieu de le taire, et on ne le transforme pas en refus.
+                warn!(
+                    task_id = %task.id,
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "mika#2995: parente illisible — relecture de consentement sautée"
+                );
+                return None;
+            }
+        };
+        let (repo, issue) = crate::ready_label::parse_ready_label_task_label(&parent.label)?;
+        Some(ReadyLabelParent {
+            id: parent.id,
+            agent_id: parent.agent_id,
+            repo,
+            issue,
+        })
+    }
+
+    /// Un wrapper différé dont la parente `ready-label:` a perdu son
+    /// consentement ne paie **ni tour LLM ni dispatch** (mika#2995, tranche du
+    /// 2026-11-03).
+    ///
+    /// # Le défaut que ceci ferme
+    ///
+    /// Le consentement est lu à l'**entrée** de la file — le webhook
+    /// `labeled ready` crée la tâche parente — et n'était **jamais relu à la
+    /// sortie**, au moment où le wrapper différé promu part en tour. Le
+    /// 2026-11-01 sur #3002 : `unlabeled ready` humain à 14:08:43Z, tour
+    /// mika-dev parti à 14:46:01Z. 37 minutes, et rien ne l'a relu. Le tour a
+    /// fermé le ticket, qu'un siège a dû rouvrir à la main à 15:32:14Z.
+    ///
+    /// # Le joint, et pourquoi `machine` passe par paramètre
+    ///
+    /// `machine_identities` mémoïse dans un `OnceLock` **à l'échelle du
+    /// processus** : un test qui l'alimenterait figerait les identités pour tous
+    /// les autres tests du binaire. Le `OnceLock` reste donc hors du périmètre
+    /// testé — exactement comme `is_parked` l'est déjà pour `auto_pull`.
+    ///
+    /// # L'ordre, et ce qu'il atteste
+    ///
+    /// Le discriminant de parente est le **premier** geste, et il est gratuit :
+    /// une parente hors préfixe rend `false` sans qu'un seul appel au fetcher
+    /// soit payé. C'est ce qu'AC-T3 épingle en comptant les appels, et c'est la
+    /// seule forme d'« octet pour octet » qu'un test puisse attester ici.
+    async fn skip_deferred_dispatch_on_withdrawn_consent_with(
+        &self,
+        task: &Task,
+        fetcher: &dyn crate::ready_label::TimelinePageFetcher,
+        machine: &crate::ready_label::MachineIdentities,
+    ) -> bool {
+        use crate::ready_label::{TimelineReadError, park_verdict_for_issue_with};
+
+        let parent = self.ready_label_parent_for_recheck(task).await;
+        let verdict = match &parent {
+            None => WithdrawnConsentVerdict::NotAReadyLabelParent,
+            // D3 — un jeu d'identités machine vide rend le prédicat
+            // inutilisable : **tout** retrait se lirait comme un park, y compris
+            // le `remove` puis `add` de la Phase 2 d'`auto_pull`. Le module
+            // refuse d'agir plutôt que de décider sur un prédicat aveugle, et
+            // ici « refuser d'agir » veut dire ne rien lancer et ne rien écrire.
+            Some(_) if machine.is_empty() => WithdrawnConsentVerdict::TimelineUnreadable {
+                cause: "identities",
+                detail: "machine identities unresolved (fail-closed)".to_string(),
+            },
+            Some(p) => {
+                match park_verdict_for_issue_with(fetcher, &p.repo, p.issue, machine).await {
+                    Ok(None) => WithdrawnConsentVerdict::ConsentHeld,
+                    Ok(Some((parked_by, parked_at))) => WithdrawnConsentVerdict::ConsentWithdrawn {
+                        parked_by,
+                        parked_at,
+                    },
+                    Err(e) => WithdrawnConsentVerdict::TimelineUnreadable {
+                        cause: match &e {
+                            TimelineReadError::Api(_) => "api",
+                            TimelineReadError::Parse(_) => "parse",
+                            TimelineReadError::Truncated { .. } => "truncated",
+                        },
+                        detail: e.to_string(),
+                    },
+                }
+            }
+        };
+
+        self.apply_withdrawn_consent_verdict(task, parent.as_ref(), verdict)
+            .await
+    }
+
+    /// Le site de production de [`Self::skip_deferred_dispatch_on_withdrawn_consent_with`].
+    ///
+    /// Le jeton vient de `resolve_github_token`, le convertisseur canonique de
+    /// l'ADR-008 — et **pas** de `resolve_periodic_scan_token`, dont le
+    /// paramètre `scan: PeriodicScan` est un enum fermé aux scans périodiques :
+    /// cette garde n'en est pas un, et y ajouter une variante donnerait au mot
+    /// « scan » deux populations sous un nom (classe mika#2205).
+    async fn skip_deferred_dispatch_on_withdrawn_consent(&self, task: &Task) -> bool {
+        // AC-T3 en premier, et gratuitement : une parente hors préfixe sort ici,
+        // sans jeton résolu et sans un seul appel réseau.
+        let Some(parent) = self.ready_label_parent_for_recheck(task).await else {
+            return false;
+        };
+
+        let Some(token) = self
+            .settings
+            .resolve_github_token(self.github_app.as_deref())
+            .await
+        else {
+            return self
+                .apply_withdrawn_consent_verdict(
+                    task,
+                    Some(&parent),
+                    WithdrawnConsentVerdict::NoToken,
+                )
+                .await;
+        };
+
+        let machine = crate::ready_label::machine_identities(&token).await;
+        let fetcher = crate::ready_label::GhTimelineFetcher::new(&token);
+        // La parente est relue une fois dans le joint. C'est un SELECT par clé
+        // primaire, sur la population la plus étroite du dispatcher, et c'est le
+        // prix d'un joint auto-suffisant : un joint qui dépendrait d'un
+        // pré-calcul de son appelant n'attesterait plus l'ordre qu'AC-T3 exige.
+        self.skip_deferred_dispatch_on_withdrawn_consent_with(task, &fetcher, machine)
+            .await
+    }
+
+    /// Applique le verdict : `true` quand le dispatch est refusé.
+    ///
+    /// Trois des cinq issues ne dispatchent pas, et **une seule écrit un
+    /// terminal**. L'asymétrie est la décision du § 6 du plan : une lecture qui
+    /// échoue ne doit ni lancer un tour (ce serait le défaut mesuré, rouvert)
+    /// ni graver un terminal (ce serait l'autre faux positif). Un faux négatif
+    /// coûte un tick de 10 minutes ; un faux positif coûte ~600 k tokens Opus
+    /// et casse un STOP opérateur.
+    async fn apply_withdrawn_consent_verdict(
+        &self,
+        task: &Task,
+        parent: Option<&ReadyLabelParent>,
+        verdict: WithdrawnConsentVerdict,
+    ) -> bool {
+        use crate::ready_label::{READY_CONSENT_RECHECK_TOOL_NAME, READY_CONSENT_WITHDRAWN_REASON};
+
+        // Les quatre verdicts qui ne sont pas `NotAReadyLabelParent` portent une
+        // parente par construction de l'appelant — même idiome que le
+        // `events.last().expect("is_parked is false on an empty set")` du
+        // prédicat qu'ils consomment.
+        let expect_parent =
+            || parent.expect("seul NotAReadyLabelParent peut naître sans parente `ready-label:`");
+
+        match verdict {
+            WithdrawnConsentVerdict::NotAReadyLabelParent
+            | WithdrawnConsentVerdict::ConsentHeld => false,
+
+            WithdrawnConsentVerdict::ConsentWithdrawn {
+                parked_by,
+                parked_at,
+            } => {
+                let parent = expect_parent();
+                info!(
+                    event = "deferred_dispatch_refused_consent_withdrawn",
+                    agent_id = %self.db.agent_id(),
+                    task_id = %task.id,
+                    parent_task_id = %parent.id,
+                    repo = %parent.repo,
+                    issue = parent.issue,
+                    parked_by = parked_by.as_deref().unwrap_or("<unknown>"),
+                    parked_at = %parked_at,
+                    "mika#2995: `ready` a été retiré par un acteur non machine — aucun tour \
+                     LLM, aucun dispatch. Reposez `ready` à la main pour relancer le ticket."
+                );
+
+                // Le wrapper d'abord : il est `completed` (il vient d'être
+                // promu), donc l'UPDATE gardé de `mark_deferred_wrapper_noop`
+                // s'applique. `expired` est le mot de mika#2169 pour « le tour a
+                // eu lieu et n'a rien dispatché » — ici il n'a même pas eu lieu,
+                // ce qui est strictement moins, et aucun sixième statut n'est
+                // inventé pour la nuance.
+                self.record_wrapper_noop(&task.id, READY_CONSENT_WITHDRAWN_REASON)
+                    .await;
+
+                // Puis la parente. **Le terminal n'est pas un verrou sur le
+                // ticket, il est la condition pour que le prochain « oui »
+                // humain soit pris** : `idx_tasks_manual_active_ref_url` exclut
+                // les statuts terminaux, donc une parente laissée `pending`
+                // garderait le créneau de l'issue occupé et un `labeled ready`
+                // reposé ensuite échouerait à créer sa tâche.
+                match self
+                    .db
+                    .update_task_failed(&parent.id, READY_CONSENT_WITHDRAWN_REASON)
+                    .await
+                {
+                    Ok(true) => {
+                        let trace_id = mika_common::trace::generate_trace_id();
+                        if let Err(e) = self
+                            .db
+                            .log_audit_event(
+                                &format!("system-{}", parent.agent_id),
+                                READY_CONSENT_RECHECK_TOOL_NAME,
+                                &parent.id,
+                                Some("pending"),
+                                Some("failed"),
+                                Some(READY_CONSENT_WITHDRAWN_REASON),
+                                Some(&trace_id),
+                            )
+                            .await
+                        {
+                            warn!(
+                                parent_task_id = %parent.id,
+                                error = %e,
+                                "mika#2995: ligne d'audit de relecture de consentement non écrite"
+                            );
+                        }
+                    }
+                    Ok(false) => {
+                        debug!(
+                            parent_task_id = %parent.id,
+                            "mika#2995: parente déjà terminale — terminal de relecture sauté"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            parent_task_id = %parent.id,
+                            error = %e,
+                            "mika#2995: terminal de la parente non écrit"
+                        );
+                    }
+                }
+                true
+            }
+
+            WithdrawnConsentVerdict::TimelineUnreadable { cause, detail } => {
+                Self::defer_consent_recheck(task, expect_parent(), cause, &detail);
+                true
+            }
+            WithdrawnConsentVerdict::NoToken => {
+                Self::defer_consent_recheck(
+                    task,
+                    expect_parent(),
+                    "no_token",
+                    "aucun jeton GitHub résolu (resolve_github_token)",
+                );
+                true
+            }
+        }
+    }
+
+    /// La sonde du report D4 — une ligne par report, distincte du refus.
+    ///
+    /// Sans elle, « la lecture échoue en boucle » et « aucun wrapper
+    /// `ready-label` n'est passé par la garde » rendraient zéro tous les deux
+    /// (classe mika#2205). Son **absence** veut dire un binaire antérieur à
+    /// cette tranche, pas un régime nominal (classe mika#2340) : l'instrument
+    /// n'est pas vivant avant `make deploy`.
+    ///
+    /// Le report est borné sans rien de neuf : le wrapper reste `completed` non
+    /// délivré, donc la boucle de délivrance le reprend au tick suivant et
+    /// **relit** la timeline ; au-delà de
+    /// `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS` (45 min) le faucheur d'orphelines
+    /// prend la main, et son propre budget `MAX_STUCK_REARMS = 2` finit en
+    /// terminal. La sortie du report est donc toujours un terminal, jamais un
+    /// tour.
+    fn defer_consent_recheck(
+        task: &Task,
+        parent: &ReadyLabelParent,
+        cause: &'static str,
+        detail: &str,
+    ) {
+        info!(
+            event = "deferred_dispatch_consent_recheck_deferred",
+            task_id = %task.id,
+            parent_task_id = %parent.id,
+            repo = %parent.repo,
+            issue = parent.issue,
+            cause = cause,
+            detail = detail,
+            "mika#2995: consentement non relisible — aucun dispatch et aucun terminal, le \
+             tick suivant relira"
+        );
+    }
+
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
         let is_callback = task.trigger_type == "callback";
 
@@ -1413,6 +1758,17 @@ impl TaskDispatcher {
         // porteur : la supersession est un test de base gratuit, la retenue
         // coûte un appel LLM.
         if is_callback && self.hold_callback_on_exhausted_credit(task).await {
+            return Ok(());
+        }
+
+        // mika#2995 — un wrapper différé dont la parente `ready-label:` a perdu
+        // son consentement humain ne paie ni tour LLM ni dispatch. Même rang que
+        // les deux gardes ci-dessus, et **après** elles : son discriminant est
+        // gratuit mais sa lecture de timeline est un appel réseau, donc elle
+        // passe en dernier des trois. Gatée sur `is_deferred_dispatch` et non sur
+        // `is_callback` : la population est celle des wrappers différés, et un
+        // callback de build n'a aucune parente à relire.
+        if is_deferred_dispatch && self.skip_deferred_dispatch_on_withdrawn_consent(task).await {
             return Ok(());
         }
 
@@ -11071,6 +11427,375 @@ mod tests {
 
             assert!(mock.calls_made() >= 1);
             assert_eq!(superseded_rows(&db).await, 0);
+        }
+    }
+
+    /// mika#2995, tranche du 2026-11-03 — un `ready-label` dont le
+    /// consentement a été retiré par un humain ne paie ni tour ni dispatch.
+    ///
+    /// Les cinq cas tirent sur le **joint**
+    /// `skip_deferred_dispatch_on_withdrawn_consent_with`, qui est la moitié
+    /// décidable de la garde : son retour `true`/`false` est exactement ce que
+    /// `dispatch_resume_agent` consomme. Le sixième, celui d'AC-T3, passe par
+    /// `dispatch` entier et compte les appels LLM — c'est le seul cas où le
+    /// site de production est atteignable sans réseau, parce que le
+    /// discriminant de parente sort avant toute résolution de jeton, et c'est
+    /// précisément la propriété qu'AC-T3 demande d'attester.
+    mod mika2995 {
+        use super::*;
+        use crate::ready_label::timeline_fixtures::{labeled_json, unlabeled_json};
+        use crate::ready_label::{
+            MachineIdentities, READY_CONSENT_RECHECK_TOOL_NAME, READY_CONSENT_WITHDRAWN_REASON,
+            READY_LABEL_TASK_PREFIX, TimelinePageFetcher,
+        };
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const REPO: &str = "senara-solutions/mika";
+        const ISSUE: u64 = 3002;
+        const HUMAN: &str = "samidarko";
+        const MACHINE: &str = "mika-platform-dev";
+        const POSE: &str = "2026-11-01T14:00:00Z";
+        const RETRAIT: &str = "2026-11-01T14:08:43Z";
+        const REPOSE: &str = "2026-11-01T14:09:12Z";
+
+        /// Un fournisseur de pages qui **compte** ses appels, et peut échouer.
+        ///
+        /// Le compteur est la pièce d'AC-T3 : « octet pour octet » n'est pas
+        /// observable, mais « aucun appel réseau n'a eu lieu » l'est.
+        struct CountingFetcher {
+            page: String,
+            calls: AtomicUsize,
+            fail: bool,
+        }
+
+        impl CountingFetcher {
+            fn with(events: &[String]) -> Self {
+                Self {
+                    page: format!("[{}]", events.join(",")),
+                    calls: AtomicUsize::new(0),
+                    fail: false,
+                }
+            }
+
+            fn failing() -> Self {
+                Self {
+                    page: String::new(),
+                    calls: AtomicUsize::new(0),
+                    fail: true,
+                }
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::Relaxed)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl TimelinePageFetcher for CountingFetcher {
+            async fn fetch(&self, _repo: &str, _issue: u64, page: u32) -> Result<String, String> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.fail {
+                    return Err("gh api: 502 Bad Gateway".to_string());
+                }
+                if page == 1 {
+                    Ok(self.page.clone())
+                } else {
+                    Ok("[]".to_string())
+                }
+            }
+        }
+
+        /// Le jeu d'identités machine du moteur, tel que `machine_identities`
+        /// le rendrait en production.
+        fn machine() -> MachineIdentities {
+            MachineIdentities::from_logins([MACHINE])
+        }
+
+        /// La timeline du 2026-11-01 sur #3002 : pose humaine, puis retrait
+        /// humain qui n'a pas été remis.
+        fn retrait_humain() -> Vec<String> {
+            vec![labeled_json(HUMAN, POSE), unlabeled_json(HUMAN, RETRAIT)]
+        }
+
+        /// Une parente et son wrapper différé promu. La parente porte `label`,
+        /// ce qui est le seul discriminant que la garde lit.
+        async fn seed_pair(db: &AsyncDatabase, parent_label: &str) -> (String, String) {
+            let parent = db
+                .create_task(NewTask {
+                    agent_id: "mika".to_string(),
+                    team_run_id: None,
+                    parent_task_id: None,
+                    depth: 0,
+                    label: parent_label.to_string(),
+                    trigger_type: "manual".to_string(),
+                    cron_expr: None,
+                    event_source: None,
+                    event_offset_secs: None,
+                    condition_expr: None,
+                    next_fire_at: None,
+                    timeout_at: None,
+                    action_type: "resume_agent".to_string(),
+                    action_config: "{}".to_string(),
+                    input_context: None,
+                    created_by_session: Some("ready-label-session".to_string()),
+                    created_trace_id: None,
+                    reference_url: Some(format!("https://github.com/{REPO}/issues/{ISSUE}")),
+                    source: None,
+                    metadata: None,
+                    r#type: None,
+                    dispatch_class: None,
+                })
+                .await
+                .unwrap();
+            let wrapper = db
+                .create_task(NewTask {
+                    agent_id: "mika".to_string(),
+                    team_run_id: None,
+                    parent_task_id: Some(parent.clone()),
+                    depth: 1,
+                    label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+                    trigger_type: "callback".to_string(),
+                    cron_expr: None,
+                    event_source: None,
+                    event_offset_secs: None,
+                    condition_expr: None,
+                    next_fire_at: None,
+                    timeout_at: None,
+                    action_type: "resume_agent".to_string(),
+                    action_config: "{}".to_string(),
+                    input_context: None,
+                    created_by_session: Some("ready-label-session".to_string()),
+                    created_trace_id: None,
+                    reference_url: None,
+                    source: None,
+                    metadata: None,
+                    r#type: None,
+                    dispatch_class: None,
+                })
+                .await
+                .unwrap();
+            // Promu : c'est l'état dans lequel la boucle de délivrance le prend,
+            // et le seul que l'UPDATE gardé du terminal accepte.
+            db.update_task_completed(&wrapper, Some("promoted"))
+                .await
+                .unwrap();
+            (parent, wrapper)
+        }
+
+        fn ready_label_parent() -> String {
+            format!("{READY_LABEL_TASK_PREFIX} {REPO}#{ISSUE}")
+        }
+
+        async fn task(db: &AsyncDatabase, id: &str) -> Task {
+            db.get_task_unscoped(id).await.unwrap().unwrap()
+        }
+
+        async fn audit_lines(db: &AsyncDatabase) -> i64 {
+            db.count_audit_events_by_tool_name(READY_CONSENT_RECHECK_TOOL_NAME)
+                .await
+                .unwrap()
+        }
+
+        /// AC-T1 — l'épisode mesuré. Retrait humain en dernier : la garde
+        /// refuse, le wrapper reçoit son terminal sous le motif nommé, la
+        /// parente aussi, et la ligne d'audit est posée.
+        #[tokio::test]
+        async fn mika2995_un_ready_label_dont_le_consentement_est_retire_ne_lance_aucun_tour() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                )
+                .await;
+
+            assert!(refused, "un consentement retiré refuse le dispatch");
+            let w = task(&db, &wrapper).await;
+            assert_eq!(w.status, "expired", "le wrapper reçoit son terminal");
+            assert_eq!(w.result.as_deref(), Some(READY_CONSENT_WITHDRAWN_REASON));
+            let p = task(&db, &parent).await;
+            assert_eq!(
+                p.status, "failed",
+                "la parente aussi — son créneau d'issue \
+                 doit se libérer pour le prochain oui humain"
+            );
+            assert_eq!(p.result.as_deref(), Some(READY_CONSENT_WITHDRAWN_REASON));
+            assert_eq!(audit_lines(&db).await, 1);
+        }
+
+        /// AC-T1 contrôle négatif — **la même fixture**, plus un `labeled`
+        /// humain en dernier. La garde laisse passer, et n'écrit rien.
+        #[tokio::test]
+        async fn mika2995_la_meme_fixture_avec_un_labeled_en_dernier_lance_le_tour() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let mut events = retrait_humain();
+            events.push(labeled_json(HUMAN, REPOSE));
+            let fetcher = CountingFetcher::with(&events);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                )
+                .await;
+
+            assert!(!refused, "un consentement reposé laisse partir le tour");
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// AC-T2 — le `remove` puis `add` machine de la Phase 2 d'`auto_pull`
+        /// n'est pas un retrait. La propriété est celle d'`is_parked` ; ce cas
+        /// la montre au site neuf, où une lecture naïve du dernier `unlabeled`
+        /// aurait arrêté le feeder sur son propre geste.
+        #[tokio::test]
+        async fn mika2995_un_remove_puis_add_machine_nest_pas_un_retrait() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let fetcher = CountingFetcher::with(&[
+                labeled_json(HUMAN, POSE),
+                unlabeled_json(MACHINE, RETRAIT),
+                labeled_json(MACHINE, REPOSE),
+            ]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                )
+                .await;
+
+            assert!(!refused, "la re-pose machine n'est pas un retrait humain");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// AC-T3, moitié joint — une parente hors préfixe ne coûte **aucun
+        /// appel** au fournisseur de timeline. C'est la forme observable de
+        /// « comportement inchangé » : le discriminant de parente passe avant
+        /// toute lecture.
+        #[tokio::test]
+        async fn mika2995_une_parente_de_groom_ne_paie_aucune_lecture() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, "long_running:run_claude_pilot_groom").await;
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                )
+                .await;
+
+            assert!(!refused, "une parente de groom n'est pas touchée");
+            assert_eq!(
+                fetcher.calls(),
+                0,
+                "aucune lecture de timeline sur une parente hors préfixe"
+            );
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+        }
+
+        /// AC-T3, moitié bout en bout — le même wrapper, par `dispatch`
+        /// entier : le tour part. Ce cas tient parce que la garde sort **avant**
+        /// de résoudre le jeton ; s'il devait le résoudre d'abord, un
+        /// dispatcher de test sans jeton reporterait ce tour et ce test serait
+        /// rouge. C'est l'ordre lui-même qui est épinglé ici.
+        #[tokio::test]
+        async fn mika2995_une_parente_de_groom_est_inchangee_de_bout_en_bout() {
+            let db = test_db();
+            let mock = Arc::new(
+                MockLlmProvider::builder()
+                    .responses((0..8).map(|_| text_response("Dispatched.")).collect())
+                    .build(),
+            );
+            let mut dispatcher = test_dispatcher(db.clone());
+            dispatcher.llm = mock.clone();
+            let (_parent, wrapper) = seed_pair(&db, "long_running:run_claude_pilot_groom").await;
+
+            dispatcher.dispatch(&wrapper).await.unwrap();
+
+            assert!(
+                mock.calls_made() >= 1,
+                "le tour du wrapper différé doit tourner"
+            );
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// D4 — une timeline illisible ne lance pas le tour et **n'écrit aucun
+        /// terminal**. Les deux moitiés comptent : refuser le tour ferme le
+        /// défaut mesuré, ne pas graver de terminal évite l'autre faux positif.
+        /// Le report est borné par le faucheur d'orphelines, pas par un
+        /// compteur neuf.
+        #[tokio::test]
+        async fn mika2995_une_timeline_illisible_reporte_sans_terminal() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let fetcher = CountingFetcher::failing();
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                )
+                .await;
+
+            assert!(refused, "une lecture qui échoue ne lance pas le tour");
+            assert_eq!(fetcher.calls(), 1, "la lecture a bien été tentée");
+            assert_eq!(
+                task(&db, &wrapper).await.status,
+                "completed",
+                "le wrapper reste promu non délivré — le tick suivant relira"
+            );
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// D3 — un jeu d'identités machine vide rend le prédicat aveugle :
+        /// **tout** retrait se lirait comme un park, y compris la re-pose
+        /// d'`auto_pull`. Le module refuse d'agir, donc ici : pas de tour, pas
+        /// de terminal, et pas même une lecture.
+        #[tokio::test]
+        async fn mika2995_des_identites_machine_vides_reportent_sans_lire() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &MachineIdentities::from_logins(Vec::<String>::new()),
+                )
+                .await;
+
+            assert!(refused, "un prédicat aveugle n'autorise pas le tour");
+            assert_eq!(
+                fetcher.calls(),
+                0,
+                "D3 est tranché avant la lecture, pas après"
+            );
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
         }
     }
 }
