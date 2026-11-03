@@ -1436,7 +1436,17 @@ where
     //    decision-point from the LLM's path. (`issue_url` was resolved at step
     //    2c, which needed it first.)
     let agent_id = db.agent_id().to_string();
-    let task_label = format!("ready-label: {}#{}", location.owner_repo(), location.number);
+    // Le préfixe vient de son site de définition unique (mika#2995) : la garde
+    // de relecture de consentement du dispatcher lit ses parentes par la même
+    // constante. Le littéral produit est identique, octet pour octet — ce
+    // commit ne change aucun comportement, il retire la seconde copie du
+    // discriminant.
+    let task_label = format!(
+        "{} {}#{}",
+        crate::ready_label::READY_LABEL_TASK_PREFIX,
+        location.owner_repo(),
+        location.number
+    );
 
     // 6b. Supersede-on-new-dispatch (mika#1934 AC2). Cancel any phantom tracking
     //     rows (blocked/in_progress, no process) left behind by a prior dispatch
