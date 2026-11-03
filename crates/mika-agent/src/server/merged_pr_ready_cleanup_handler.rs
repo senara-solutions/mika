@@ -43,8 +43,15 @@
 //!
 //! Voir mika#3022.
 
+use tracing::{debug, info, warn};
+
+use super::draft_pr_opened_handler::{
+    fetch_issue_labels, issue_has_ready_label, remove_ready_label,
+};
 use super::upstream_close_handler::{MERGED_TRUE_LINE, PR_CLOSED_PREFIX, extract_head_branch};
+use super::verdict_handler::VerdictAction;
 use super::webhook_queue_v2::parse_pr_action_event;
+use crate::async_db::AsyncDatabase;
 use crate::worktree_reaper::issue_number_from_branch;
 
 /// L'action que ce handler sert, telle que [`parse_pr_action_event`] la rend.
@@ -125,6 +132,163 @@ pub(crate) fn plan_ready_cleanup_on_merge(text: &str) -> MergedPrCleanup {
         repo: repo.to_string(),
         issue,
     }
+}
+
+/// Le geste : retirer `ready` du ticket que le merge vient de servir.
+///
+/// Rend `VerdictAction::Passthrough { enrichment: None }` sur **tous** les
+/// chemins — injecteur à effet de bord seul, comme `try_handle_draft_pr_opened`
+/// et `try_handle_pr_closed_milestone_context`. Le câblage dans `handlers.rs`
+/// tient cette propriété par trois `unreachable!()`.
+///
+/// Appelé **avant** `webhook_prefilter::skip_turn`, donc avant le tour LLM
+/// (AC1) ; l'ordre est mesuré par le détecteur de source
+/// `tests/eval/test_ready_cleanup_on_merge_3022.rs`, pas supposé.
+///
+/// Chaque sortie sans geste est **nommée** (AC3), et aucune ne coûte le tour :
+///
+/// | sortie | ligne |
+/// |---|---|
+/// | pas notre événement | aucune, délibérément muet |
+/// | PR fermée sans merge | `debug! merged_pr_ready_cleanup_not_merged` |
+/// | dépôt non reconnu | `warn! merged_pr_ready_cleanup_repo_unrecognized` |
+/// | branche hors forme | `warn! merged_pr_ready_cleanup_branch_off_form` |
+/// | token absent | `warn! merged_pr_ready_cleanup_no_token` |
+/// | `gh` en erreur | `warn! merged_pr_ready_cleanup_gh_failed`, champ `step` |
+/// | étiquette déjà absente | `debug! merged_pr_ready_cleanup_label_absent` |
+/// | retrait fait | `info! ready_label_cleaned_up_on_merge` + audit |
+///
+/// Les lignes portent `repo` et `issue`, jamais le numéro de PR : le seam rend
+/// le **ticket**, et la PR se rejoint par le `trace_id` que l'audit transporte.
+/// Y remettre la PR demanderait de rappeler [`parse_pr_action_event`] ici, donc
+/// de re-décider hors du seam ce que le seam a déjà décidé.
+pub(crate) async fn try_handle_merged_pr_ready_cleanup(
+    text: &str,
+    db: &AsyncDatabase,
+    github_token: Option<&str>,
+    session_id: &str,
+    trace_id: &str,
+) -> VerdictAction {
+    // 1. Le seam décide, et dit pourquoi quand il ne rend aucun ticket.
+    let (repo, issue) = match plan_ready_cleanup_on_merge(text) {
+        MergedPrCleanup::Clean { repo, issue } => (repo, issue),
+        // Muet par décision : ce handler voit tout le trafic webhook, et une
+        // ligne par message étranger noierait les sept autres.
+        MergedPrCleanup::Skip(SkipReason::NotOurEvent) => {
+            return VerdictAction::Passthrough { enrichment: None };
+        }
+        MergedPrCleanup::Skip(SkipReason::NotMerged) => {
+            debug!(
+                event = "merged_pr_ready_cleanup_not_merged",
+                "merged_pr_ready_cleanup_handler: PR closed sans Merged: true — aucun \
+                 consentement n'a été consommé, le label reste"
+            );
+            return VerdictAction::Passthrough { enrichment: None };
+        }
+        MergedPrCleanup::Skip(SkipReason::RepoUnrecognized) => {
+            warn!(
+                event = "merged_pr_ready_cleanup_repo_unrecognized",
+                "merged_pr_ready_cleanup_handler: en-tête illisible comme <repo>#<pr> closed \
+                 — passthrough sans geste"
+            );
+            return VerdictAction::Passthrough { enrichment: None };
+        }
+        MergedPrCleanup::Skip(SkipReason::BranchOffForm) => {
+            warn!(
+                event = "merged_pr_ready_cleanup_branch_off_form",
+                "merged_pr_ready_cleanup_handler: branche absente ou hors de la forme \
+                 <type>/<N>/… — le ticket serait deviné, passthrough sans geste"
+            );
+            return VerdictAction::Passthrough { enrichment: None };
+        }
+    };
+
+    // 2. Un token est nécessaire — son absence est un fail-open nommé.
+    let Some(token) = github_token else {
+        warn!(
+            event = "merged_pr_ready_cleanup_no_token",
+            repo = %repo,
+            issue = issue,
+            "merged_pr_ready_cleanup_handler: aucun token GitHub — retrait impossible"
+        );
+        return VerdictAction::Passthrough { enrichment: None };
+    };
+
+    // 3. Lire avant de retirer (mika#2331) : un instrument qui dit « retiré »
+    //    sur un ticket qui ne portait rien est un instrument qui mente, et
+    //    l'absence de l'étiquette n'est pas un retrait de plus.
+    let labels = match fetch_issue_labels(issue, &repo, token).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(
+                event = "merged_pr_ready_cleanup_gh_failed",
+                step = "issue_view",
+                repo = %repo,
+                issue = issue,
+                error = %e,
+                "merged_pr_ready_cleanup_handler: gh issue view a échoué — passthrough"
+            );
+            return VerdictAction::Passthrough { enrichment: None };
+        }
+    };
+    if !issue_has_ready_label(&labels) {
+        debug!(
+            event = "merged_pr_ready_cleanup_label_absent",
+            repo = %repo,
+            issue = issue,
+            "merged_pr_ready_cleanup_handler: le ticket ne portait pas ready — rien à rendre"
+        );
+        return VerdictAction::Passthrough { enrichment: None };
+    }
+
+    // 4. Le retrait, et lui seul : `--remove-label`, jamais `--add-label`
+    //    (voie B, mika#2995).
+    match remove_ready_label(issue, &repo, token).await {
+        Ok(()) => {
+            info!(
+                event = "ready_label_cleaned_up_on_merge",
+                repo = %repo,
+                issue = issue,
+                "merged_pr_ready_cleanup_handler: ready retiré du ticket servi par le merge"
+            );
+
+            // Trace opérateur, tirée-et-oubliée : l'échec de l'audit ne défait
+            // pas un retrait déjà posé sur GitHub.
+            if let Err(e) = db
+                .log_audit_event(
+                    session_id,
+                    "merged_pr_ready_label_cleaned",
+                    &format!("issue:{repo}#{issue}"),
+                    None,
+                    Some("ready_removed"),
+                    Some(&format!("repo={repo} issue={issue}")),
+                    Some(trace_id),
+                )
+                .await
+            {
+                warn!(
+                    event = "merged_pr_ready_cleanup_audit_failed",
+                    repo = %repo,
+                    issue = issue,
+                    error = %e,
+                    "merged_pr_ready_cleanup_handler: écriture de l'audit échouée (non fatal)"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                event = "merged_pr_ready_cleanup_gh_failed",
+                step = "remove_label",
+                repo = %repo,
+                issue = issue,
+                error = %e,
+                "merged_pr_ready_cleanup_handler: gh issue edit --remove-label a échoué — \
+                 passthrough"
+            );
+        }
+    }
+
+    VerdictAction::Passthrough { enrichment: None }
 }
 
 #[cfg(test)]
