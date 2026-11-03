@@ -55,10 +55,11 @@ Le geste `gh`, lui, reste partagé (D3).
 
 ### D2 — Aucun parseur nouveau : quatre lecteurs canoniques existants sont **appelés**
 
-Le dépôt refuse structurellement un second lecteur d'une grammaire d'événement
+Le dépôt porte une doctrine de lecteur unique par grammaire d'événement
 (`canonical_tokens.rs::mika2649_aucun_second_parseur_de_grammaire_devenement`,
-recensement `EVENT_GRAMMAR_PARSER_SITES`), et sa section RÉSOLUTION nomme les lecteurs
-à appeler. Ce vol les appelle tous :
+recensement `EVENT_GRAMMAR_PARSER_SITES` l. 7143), et ses assertions auto-nettoyantes
+(l. 7255 à 7280) nomment les lecteurs à appeler plutôt qu'à recopier. Ce vol les
+appelle tous :
 
 | ce qu'il faut lire | lecteur appelé | site |
 |---|---|---|
@@ -80,7 +81,20 @@ redéfinit pas.
 
 `extract_head_branch` lit la **première** ligne et son **dernier** `(branch: …)`, donc
 un titre de PR qui porte la forme ne déplace pas la branche réelle
-(`mika2242_a_title_carrying_the_shape_does_not_displace_the_branch`).
+(`upstream_close_handler.rs:589`,
+`mika2242_a_title_carrying_the_shape_does_not_displace_the_branch`).
+
+**Ce que la garde mika#2649 voit de ce vol : rien, et c'est exact.** Son prédicat porte
+sur un `Regex::new(` dont un littéral contient `[GitHub]` ; un `starts_with` ou un
+`contains` sur le même préfixe est **hors population par sa forme**, ce que son
+doc-comment nomme explicitement. Le respect de la doctrine n'est donc pas asservi ici
+par un détecteur existant — il est tenu par l'ordre de commit (commit 1 : promouvoir
+*avant* d'écrire le handler, de sorte qu'aucun chemin n'ait jamais besoin d'une copie)
+et par la table ci-dessus, qui est ce que l'architecte et mika-qa relisent. Le plan ne
+livre pas de détecteur pour cette classe : un second scan sur la forme
+`starts_with(PR_CLOSED_PREFIX)` recenserait les deux sites légitimes et le doublon
+préexistant de `milestone_context_handler`, donc il naîtrait rouge sur de la dette
+étrangère au défaut mesuré — exactement l'allowlist que mika#2309 condamne.
 
 > Dette nommée, hors vol : `server/milestone_context_handler.rs:28,31` porte un
 > **doublon** de `PR_CLOSED_PREFIX` et `MERGED_TRUE_LINE`. Ce vol n'en écrit pas un
@@ -103,9 +117,11 @@ est un instrument qui ment — mika#2331).
 ### D4 — Pourquoi « avant le tour LLM » est une propriété du site de câblage
 
 Le handler se câble dans le bloc des handlers structurels de
-`server/handlers.rs`, juste avant la fin du bloc (l. 2057), sur le patron exact de
-`upstream_close_handler` (quatre arms, `unreachable!()` sur `Handled` /
-`Dispatched`). Ce bloc tourne **avant** le pré-filtre
+`server/handlers.rs`, juste avant la fin du bloc (l. 2057), sur le patron exact du
+câblage de `upstream_close_handler` (l. 2037 à 2057) : quatre arms, dont **trois**
+`unreachable!()` — sur `Passthrough { enrichment: Some(_) }`, sur `Handled` et sur
+`Dispatched` — et un arm vide sur `Passthrough { enrichment: None }`, le seul que le
+handler rend. Ce bloc tourne **avant** le pré-filtre
 (`super::webhook_prefilter::skip_turn(`, l. 2084) et donc avant le tour. Le handler
 s'auto-sélectionne sur son préfixe : son rang dans le bloc est indifférent.
 
@@ -158,14 +174,16 @@ Vérifié par lecture des gardes, pas supposé :
 - **Test 13** (`ready_label.rs:1244`, `no_ready_label_write_outside_this_module`) :
   prédicat = une ligne contenant `gh_apply_label` ou `add_label_to_issue` **et** le
   jeton `ready`. Ce vol n'appelle ni l'un ni l'autre.
-- **D1 de #2995** (`ready_label.rs:1434`) : population
-  `est_surface_doutil(rel) = rel.starts_with("tools/") || rel == "skills/builtin_handlers.rs" || rel == "skills/executor.rs"`.
+- **D1 de #2995** (`ready_label.rs::mika2995_aucune_surface_doutil_natteint_lapplicateur_de_ready`,
+  l. 1435) : population `est_surface_doutil(rel)` (l. 1325)
+  `= rel.starts_with("tools/") || rel == "skills/builtin_handlers.rs" || rel == "skills/executor.rs"`.
   Un fichier sous `server/` est **hors population**.
-- **D2 de #2995** (`ready_label.rs:1736`) : `ARGV_ADD_LABEL_FLAG = "--add-label"`,
-  `ARGV_AMBIGUOUS_LABEL_FLAGS = ["\"--label\"", "--label=", "\"-l\""]`.
+- **D2 de #2995** (`ready_label.rs::mika2995_une_ecriture_de_ready_en_forme_argv_est_declaree`,
+  l. 1737) : `ARGV_ADD_LABEL_FLAG = "--add-label"` (l. 1541),
+  `ARGV_AMBIGUOUS_LABEL_FLAGS = ["\"--label\"", "--label=", "\"-l\""]` (l. 1566).
   `--remove-label` n'est dans **aucune** des deux listes.
-- **AC1 de #2995** (`canonical_tokens.rs:7485+`) : porte sur les *prescriptions* dans
-  les prompts bundle ; ce vol ne touche aucun prompt.
+- **AC1 de #2995** (`canonical_tokens.rs::READY_PRESCRIPTION_EXCEPTIONS`, l. 7495) :
+  porte sur les *prescriptions* dans les prompts bundle ; ce vol ne touche aucun prompt.
 - Le chemin de retrait ne passe **pas** par `apply_ready` : cet applicateur est la
   porte *gardée par le park* de l'**ajout**. « Retirer, c'est rendre un consentement,
   jamais s'en donner un. »
@@ -200,7 +218,7 @@ son offset).
 | merge + branche en forme ⇒ `Clean { repo, issue }` ; même texte en `Merged: false` ⇒ `Skip(NotMerged)` | **un seul** `#[test]` qui porte les deux appels (AC1) |
 | branche hors forme (`main`, `feat/slug`, `(branch: )` absent) ⇒ `Skip(BranchOffForm)` | tests de table sur le seam |
 | header non parsable ⇒ `Skip(RepoUnrecognized)` | test de table sur le seam |
-| un titre portant `(branch: …)` ne déplace pas la branche | test sur le seam, fixture du header réel (`webhook_dispatch.rs:2215+`) |
+| un titre portant `(branch: …)` ne déplace pas la branche | test sur le seam, sur la fixture de production `webhook_prefilter.rs::PR_CLOSED` (l. 1989) — forme de gateway, pas de synthèse ; sa sœur `PR_CLOSED_SANS_URL` couvre la deuxième ligne vide |
 | le handler rend toujours `Passthrough { enrichment: None }` | les arms `unreachable!()` du câblage + test sur le chemin `NotOurEvent` |
 | le geste précède le pré-filtre et le tour | détecteur d'ordre (D5) |
 | les gardes de voie B restent vertes, allowlists inchangées | `cargo test -p mika-agent ready_label`, `cargo test -p mika-agent canonical_tokens`, plus `git diff` vide sur les blocs `*_EXCEPTIONS` / `*_DECLARED` |
