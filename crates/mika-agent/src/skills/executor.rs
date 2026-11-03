@@ -2518,6 +2518,21 @@ pub const ALL_GROOM_ESCALATE_VERDICTS: &[&str] = &[
 /// pas « lu, rien à signaler » de « jamais passé ici » (mika#2205).
 pub(crate) const GROOM_VERDICT_NOT_ESCALATED: &str = "not_escalated";
 
+/// Le quatrième mot du champ `verdict` de la sonde, et pour la même raison que
+/// [`GROOM_VERDICT_NOT_ESCALATED`] : **pas** une entrée
+/// d'[`ALL_GROOM_ESCALATE_VERDICTS`] (mika#3027).
+///
+/// Une retenue d'ancrage **traverse** la porte : elle ne refuse rien, donc elle
+/// n'écrit rien dans `audit_events.after_value` et ne fait pas partie des deux
+/// motifs de refus dont la cardinalité est un format de fil. Elle a besoin d'un
+/// nom quand même, parce que `groom_verdict_selected` parle sur toutes ses
+/// branches : les lignes portant cette valeur sont **exactement** le numérateur
+/// de la mesure post-déploiement d'AC5 (les retenues qui ont traversé), et leur
+/// homologue `escalated` reste le contrôle positif qui sépare « la porte a laissé
+/// passer une retenue » de « aucune reprise automatique n'est passée par là »
+/// (classe mika#2205).
+pub(crate) const GROOM_VERDICT_ANCHOR_WITHHELD: &str = "anchor_withheld";
+
 /// La sonde de la sélection de ligne (mika#2795).
 ///
 /// Émise à **chaque** lecture du verdict, y compris quand `skipped_neutral`
@@ -2533,17 +2548,23 @@ pub(crate) const GROOM_VERDICT_SELECTED_EVENT: &str = "groom_verdict_selected";
 /// Est-ce que le dernier grooming de ce ticket a rendu un verdict de halte ?
 /// (mika#2545)
 ///
-/// Trois états, et **pas un booléen** : « ce ticket n'a pas escaladé » et « on ne
+/// Quatre états, et **pas un booléen** : « ce ticket n'a pas escaladé » et « on ne
 /// peut pas le savoir » appellent la même disposition (refuser) mais deux
 /// lectures opérateur différentes, et fondre les deux rendrait la population du
 /// fail-closed incomptable. Motif [`GroomedState`] (mika#2484 D1) : le
 /// consommateur fait un `match` **exhaustif sans bras `_ =>`**, donc un
-/// quatrième état devra être décidé par le compilateur.
+/// cinquième état devra être décidé par le compilateur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GroomVerdictState {
     /// Le dernier callback de groom porte [`GROOM_ESCALATE_MARKER`]. Un
     /// re-dispatch automatique de groom est refusé.
     Escalated,
+    /// Le dernier callback de groom porte un `Outcome: ESCALATE` que le MOTEUR a
+    /// écrit en retenant l'attestation d'ancrage (mika#2338), pas un jugement de
+    /// l'architecte. Une reprise automatique de groom est **autorisée** : la
+    /// mesure du 2026-11-03 dit que la passe suivante converge, et la dépense est
+    /// bornée par le frein mika#2786 en amont de cette porte.
+    AnchorWithheld,
     /// Aucun groom terminal, ou le dernier n'a pas escaladé. Le cas nominal.
     NotEscalated,
     /// La preuve n'a pas pu être lue (erreur base, ou callback terminal dont le
@@ -2565,16 +2586,26 @@ pub(crate) enum GroomVerdictState {
 /// et un callback terminal sans `result` est anormal — le chemin de complétion
 /// en écrit toujours un. La population est donc quasi vide, et son coût est
 /// convergent (voir le site de la garde).
+///
+/// **Qui a écrit l'escalade (mika#3027).** Un ESCALATE d'architecte et une
+/// retenue d'ancrage du moteur rendent le même octet ici — `Outcome: ESCALATE` —
+/// et ce ne sont pas les mêmes faits. Le reclassement se fait **en raffinement du
+/// bras `Escalated`**, donc seul un `result` déjà reconnu comme escalade peut
+/// l'atteindre : c'est fail-closed par construction, un texte sans ligne
+/// `Outcome: ESCALATE` ancrée ne peut pas rendre [`GroomVerdictState::AnchorWithheld`]
+/// quoi qu'il écrive sur `Engine reason:`.
 pub(crate) fn groom_escalate_verdict(result: Option<String>) -> GroomVerdictState {
     match result {
         Some(text) => {
-            if text
+            if !text
                 .lines()
                 .any(|line| line.starts_with(GROOM_ESCALATE_MARKER))
             {
-                GroomVerdictState::Escalated
-            } else {
                 GroomVerdictState::NotEscalated
+            } else if carries_engine_anchor_withholding(&text) {
+                GroomVerdictState::AnchorWithheld
+            } else {
+                GroomVerdictState::Escalated
             }
         }
         None => GroomVerdictState::Unreadable(
@@ -2684,6 +2715,7 @@ pub(crate) async fn groom_verdict_state(db: &AsyncDatabase, issue_url: &str) -> 
     let selection = groom_verdict_from_rows(rows);
     let verdict = match &selection.state {
         GroomVerdictState::Escalated => GROOM_ESCALATE_VERDICT_ESCALATED,
+        GroomVerdictState::AnchorWithheld => GROOM_VERDICT_ANCHOR_WITHHELD,
         GroomVerdictState::Unreadable(_) => GROOM_ESCALATE_VERDICT_UNREADABLE,
         GroomVerdictState::NotEscalated => GROOM_VERDICT_NOT_ESCALATED,
     };
@@ -2743,6 +2775,33 @@ pub(crate) const GROOM_ANCHOR_BRAKE_DEFAULT: usize = 3;
 /// `result` d'un callback quand l'ESCALATE vient du moteur, pas de l'architecte.
 const GROOM_ENGINE_REASON_PREFIX: &str = "Engine reason: ";
 
+/// Ce `result` porte-t-il une retenue d'ancrage écrite par le MOTEUR ?
+/// (mika#3027)
+///
+/// **Site unique** de lecture de [`GROOM_ENGINE_REASON_PREFIX`], épinglé par
+/// `canonical_tokens::mika3027_la_retenue_dancrage_a_un_seul_lecteur`. Deux
+/// orthographes de ce prédicat, c'est le frein mika#2786 et la porte mika#2545
+/// qui comptent deux populations différentes sous un seul nom.
+///
+/// Deux termes, et chacun est une décision :
+///
+/// - **`strip_prefix` sur une LIGNE**, jamais un `contains` sur le texte : la
+///   prose d'un pilote cite ce préfixe en parlant du mécanisme — le faux positif
+///   mesuré sur le Signal S (mika#2050) et sur les 651 détections d'`instr`
+///   (mika#2105). `_escalate_groom` écrit la vraie ligne en tête de ligne.
+/// - **La forme fixe est lue chez son propriétaire.** Le reste de la ligne est
+///   passé à [`crate::arch_disposition::is_engine_escalation_line`], la
+///   transcription Rust de `dispatch-lib.sh::_engine_escalation_line` qui sert
+///   déjà le tier 0b. Une prose qui écrit `Engine reason: quelque chose` sans la
+///   numérotation `F<n>:`, `(BLOCKING)`, `[mika-engine]` et `review-anchor:` ne
+///   passe pas.
+pub(crate) fn carries_engine_anchor_withholding(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.strip_prefix(GROOM_ENGINE_REASON_PREFIX)
+            .is_some_and(crate::arch_disposition::is_engine_escalation_line)
+    })
+}
+
 /// Parse pur du seuil du frein (mika#2786). Absent ou vide → défaut ;
 /// illisible → défaut avec un WARN ; `0` → désarmé.
 pub(crate) fn parse_groom_anchor_brake_max(raw: Option<&str>) -> usize {
@@ -2768,8 +2827,9 @@ pub(crate) fn parse_groom_anchor_brake_max(raw: Option<&str>) -> usize {
 ///
 /// Trois sortes de lignes, et la troisième est celle qui compte :
 ///
-/// - **une retenue** : une ligne qui commence par `Engine reason: ` et porte
-///   [`crate::agent_loop::REVIEW_ANCHOR_WITHHELD_MARKER`]. Elle allonge la série ;
+/// - **une retenue** : ce que [`carries_engine_anchor_withholding`] reconnaît —
+///   une ligne qui commence par `Engine reason: ` et dont le reste porte la forme
+///   fixe de l'escalade du moteur. Elle allonge la série ;
 /// - **un autre verdict** : une ligne qui commence par `Outcome: ` sans
 ///   retenue — un `PLAN_GROOMED`, un ESCALATE d'architecte, un
 ///   `PIPELINE_INCOMPLETE`. Elle arrête le compte ;
@@ -2787,10 +2847,7 @@ pub(crate) fn anchor_withheld_streak(results: &[Option<String>]) -> usize {
     let mut streak = 0;
     for result in results {
         let Some(text) = result else { continue };
-        let withheld = text.lines().any(|line| {
-            line.starts_with(GROOM_ENGINE_REASON_PREFIX)
-                && line.contains(crate::agent_loop::REVIEW_ANCHOR_WITHHELD_MARKER)
-        });
+        let withheld = carries_engine_anchor_withholding(text);
         if withheld {
             streak += 1;
         } else if text.lines().any(|line| line.starts_with("Outcome: ")) {
@@ -4321,10 +4378,30 @@ pub(crate) async fn validate_dispatch_readiness(
         let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
         let issue_url = format!("https://github.com/{owner_repo}/issues/{number}");
         let verdict = groom_verdict_state(db, &issue_url).await;
-        // `match` exhaustif, aucun bras `_ =>` : un quatrième état de
+        // `match` exhaustif, aucun bras `_ =>` : un cinquième état de
         // `GroomVerdictState` doit être décidé ici par le compilateur.
         let refusal = match verdict {
             GroomVerdictState::NotEscalated => None,
+            // mika#3027 — une retenue d'ancrage du MOTEUR n'est pas un jugement
+            // de l'architecte, et la porte ne doit pas les confondre.
+            //
+            // POURQUOI LAISSER PASSER. mika#2545 refuse le rejeu parce qu'« il ne
+            // change pas le verdict » : un ESCALATE d'architecte est un jugement
+            // sur le plan, et huit rejeux mesurés le 2026-09-26 n'en ont pas
+            // déplacé un. Une retenue d'ancrage est l'inverse — le moteur a
+            // retiré une disposition qu'il n'a pas pu attester, et les deux
+            // reprises humaines du 2026-11-03 (#2996, #3022) ont convergé dès le
+            // groom SUIVANT. Refuser ici, c'est facturer à l'opérateur un
+            // retrait/repose de `ready` pour obtenir ce que la passe suivante
+            // aurait rendu.
+            //
+            // LA DÉPENSE RESTE BORNÉE, et pas par ce bras : le frein mika#2786,
+            // en amont de cette porte dans cette même fonction, refuse à la 3e
+            // retenue d'affilée sous `dispatch_groom_anchor_brake`. Ce bras est
+            // ce qui rend ce frein ATTEIGNABLE — la série ne pouvait pas dépasser
+            // 1 tant que cette porte refusait la première retenue (0 ligne de
+            // frein mesurée depuis le 2026-10-18).
+            GroomVerdictState::AnchorWithheld => None,
             GroomVerdictState::Escalated => Some((
                 GROOM_ESCALATE_VERDICT_ESCALATED,
                 format!(
@@ -14431,7 +14508,11 @@ Harness ticket.
 
         /// Le `result` d'un groom retenu par la garde d'ancrage, dans la forme
         /// que `_escalate_groom` écrit (relevée sur mika#2762, 2026-10-18).
-        const WITHHELD: &str = "claude-pilot completed (status: success).\n\
+        ///
+        /// Visibilité élargie au parent pour mika#3027 : le module voisin en fait
+        /// le **témoin positif** des quatre formes d'AC4, et une fixture sosie
+        /// dériverait de celle-ci sans le dire.
+        pub(super) const WITHHELD: &str = "claude-pilot completed (status: success).\n\
              GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
              Verdict: ESCALATE — human review required.\n\
              Engine reason: F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld \
@@ -14489,6 +14570,33 @@ Harness ticket.
             let prose = "The guard writes `Engine reason: F1: (BLOCKING) [mika-engine] review-anchor:` \
                          on a withheld pass.\nOutcome: PLAN_GROOMED";
             assert_eq!(anchor_withheld_streak(&[r(prose)]), 0);
+        }
+
+        /// **Le rétrécissement assumé de mika#3027, dit plutôt que laissé
+        /// implicite.** Le prédicat de la série lit désormais la forme fixe chez
+        /// son propriétaire (`arch_disposition::is_engine_escalation_line`), donc
+        /// il exige la numérotation `F<n>:` que l'ancien `contains` du fragment
+        /// n'exigeait pas. Ce n'est pas un élargissement : c'est un rétrécissement
+        /// strict vers la forme que l'écrivain produit réellement —
+        /// `_escalate_groom` interpole la sortie de `_engine_escalation_line`, qui
+        /// *est* la ligne `F<n>:` complète. Le témoin positif est [`WITHHELD`],
+        /// relevé sur mika#2762 et compté par tous les tests voisins.
+        #[test]
+        fn mika3027_une_ligne_sans_numerotation_nest_plus_une_retenue() {
+            let sans_fn = "claude-pilot completed (status: success).\n\
+                 Engine reason: (BLOCKING) [mika-engine] review-anchor: attestation withheld.\n\
+                 Outcome: ESCALATE — first-pass";
+            assert_eq!(
+                anchor_withheld_streak(&[r(sans_fn)]),
+                0,
+                "sans la numérotation `F<n>:`, la ligne n'est pas celle que \
+                 l'écrivain produit — la série ne la compte plus"
+            );
+            assert_eq!(
+                anchor_withheld_streak(&[r(WITHHELD)]),
+                1,
+                "contrôle de bonne foi : la forme complète reste une retenue"
+            );
         }
 
         #[test]
@@ -14602,6 +14710,108 @@ Harness ticket.
             assert_eq!(audit_rows(&db).await, 0);
         }
 
+        /// **Le rouge du défaut mika#3027, et son contrôle négatif dans le même
+        /// test.** Une retenue d'ancrage traverse la porte mika#2545 sur une
+        /// reprise automatique ; un ESCALATE d'architecte — le même
+        /// `Outcome: ESCALATE`, sans ligne `Engine reason:` — y reste refusé.
+        ///
+        /// Les deux moitiés sont dans **un seul** test parce que la propriété
+        /// n'est pas « la porte laisse passer » : c'est « la porte sépare ». Un
+        /// vol qui aurait simplement désarmé la porte passerait la première
+        /// moitié, et c'est la seconde qui dit qu'il ne l'a pas fait. La fixture
+        /// de l'ESCALATE d'architecte est empruntée à mika#2545 plutôt que
+        /// recopiée : une fixture sosie dérive de l'originale sans le dire.
+        #[tokio::test]
+        async fn mika3027_une_retenue_traverse_la_porte_un_escalate_darchitecte_non() {
+            let (db, parent_id) = seeded(WITHHELD, 1);
+            if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "une retenue d'ancrage du moteur n'est pas un jugement de \
+                     l'architecte : la reprise automatique doit traverser cette \
+                     porte, et sa dépense est bornée par le frein en amont — \
+                     {rejection}"
+                );
+                assert!(
+                    !rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                    "une seule retenue n'atteint pas le seuil du frein : {rejection}"
+                );
+            }
+
+            let (db, parent_id) = seeded(super::mika2545_escalate_terminal::ESCALATED, 1);
+            let rejection = dispatch(&db, &parent_id, None)
+                .await
+                .expect_err("un ESCALATE d'architecte reste terminal (mika#2545)");
+            assert!(rejection.contains(GROOM_ESCALATED_ERROR), "{rejection}");
+            let body: serde_json::Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(
+                body["verdict"], "escalated",
+                "le refus garde son motif de fil : la population que mika#2545 \
+                 refuse n'est pas renommée par ce vol — {rejection}"
+            );
+        }
+
+        /// **La série que le frein n'avait jamais pu voir (mika#3027 AC3).**
+        ///
+        /// Le frein mika#2786 refuse à la 3e retenue d'affilée
+        /// (`MIKA_GROOM_ANCHOR_BRAKE_MAX`, défaut 3). Mesuré le 2026-11-03 :
+        /// **0 ligne** dans `audit_events`, 0 dans `server.log` depuis le
+        /// 2026-10-18. La cause n'était pas le frein — c'était la porte en aval,
+        /// qui refusait dès la **première** retenue, donc la série ne pouvait pas
+        /// dépasser 1 sur ce chemin.
+        ///
+        /// Ce test parcourt les trois rangs dans un seul appel, parce que la
+        /// propriété est la **progression** et non ses deux extrémités : aux
+        /// rangs 1 et 2 la reprise automatique traverse les DEUX gardes — c'est
+        /// ce qui fait monter le compteur — et au rang 3 le frein mord sous son
+        /// propre nom. Ses deux voisins pris séparément ne disent pas cela :
+        /// `mika2786_two_withholdings_do_not_brake` n'observe que l'absence du
+        /// frein, et sous l'ancien comportement il était vert alors que la porte
+        /// refusait le rang 2.
+        #[tokio::test]
+        async fn mika3027_la_serie_1_2_3_atteint_le_frein() {
+            for rang in [1usize, 2] {
+                let (db, parent_id) = seeded(WITHHELD, rang);
+                if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                    assert!(
+                        !rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                        "rang {rang} : sous le seuil, le frein ne mord pas — {rejection}"
+                    );
+                    assert!(
+                        !rejection.contains(GROOM_ESCALATED_ERROR),
+                        "rang {rang} : si la porte refuse ici, le compteur reste \
+                         bloqué à 1 et le frein est inatteignable — c'est le \
+                         défaut mesuré le 2026-11-03 — {rejection}"
+                    );
+                }
+                assert_eq!(
+                    audit_rows(&db).await,
+                    0,
+                    "rang {rang} : aucun refus du frein"
+                );
+            }
+
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            let rejection = dispatch(&db, &parent_id, None)
+                .await
+                .expect_err("rang 3 : le seuil est atteint, le frein refuse");
+            assert!(
+                rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                "rang 3 : le refus porte le nom du frein, pas celui de la porte — \
+                 les deux ne se lisent pas pareil dans `audit_events` — {rejection}"
+            );
+            assert!(
+                !rejection.contains(GROOM_ESCALATED_ERROR),
+                "rang 3 : le frein est en amont de la porte, donc c'est lui qui \
+                 tranche — {rejection}"
+            );
+            assert_eq!(
+                audit_rows(&db).await,
+                1,
+                "la morsure laisse la ligne qui manquait à la mesure d'AC5"
+            );
+        }
+
         /// **Contrôle négatif de la levée.** La demande explicite de l'opérateur
         /// traverse le frein, et la levée est écrite.
         #[tokio::test]
@@ -14682,7 +14892,11 @@ Harness ticket.
         use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent, set_created_at};
 
         /// Le `result` que `_escalate_groom` écrit depuis mika#2545.
-        const ESCALATED: &str = "claude-pilot completed (status: done).\n\
+        ///
+        /// **Aucune ligne `Engine reason:`** : c'est un jugement de l'architecte,
+        /// et c'est à ce titre que le module voisin l'emprunte comme contrôle
+        /// négatif de mika#3027 — d'où la visibilité élargie au parent.
+        pub(super) const ESCALATED: &str = "claude-pilot completed (status: done).\n\
              GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
              Verdict: ESCALATE — human review required.\n\
              \n\
@@ -14755,6 +14969,78 @@ Harness ticket.
             assert_eq!(
                 groom_escalate_verdict(Some(both.to_string())),
                 GroomVerdictState::Escalated
+            );
+        }
+
+        // --- Qui a écrit l'escalade (mika#3027) -------------------------------
+        //
+        // Quatre formes, et chacune a son test. Les trois premières *ressemblent*
+        // à une retenue d'ancrage sans en être une et doivent rester `Escalated`
+        // — fail-closed sur l'auteur. La quatrième est le **témoin positif** :
+        // sans elle, un prédicat qui rendrait toujours `false` passerait les trois
+        // premières et le vol serait un no-op vert.
+
+        /// **Forme 1 — aucune ligne `Engine reason:`.** C'est l'ESCALATE de
+        /// l'architecte, la population pour laquelle la porte mika#2545 existe
+        /// (huit rejeux mesurés le 2026-09-26). Inchangée par ce vol.
+        ///
+        /// Jumeau **délibéré** de `mika2545_an_escalate_line_reads_escalated` :
+        /// l'assertion est la même, mais le filtre du vol est `mika3027`, et le
+        /// premier cas d'AC4 doit y tomber. Supprimer celui-ci comme un doublon
+        /// sort ce cas de la couverture nommée du vol sans rien faire rougir.
+        #[test]
+        fn mika3027_sans_ligne_engine_reason_reste_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(ESCALATED.to_string())),
+                GroomVerdictState::Escalated
+            );
+        }
+
+        /// **Forme 2 — le préfixe cité au milieu d'une ligne de prose.** Un
+        /// pilote qui décrit ce mécanisme écrit `Engine reason: …` dans une
+        /// phrase ; le prédicat est un `strip_prefix` sur la LIGNE, donc il ne le
+        /// voit pas (faux positif du Signal S, mika#2050).
+        #[test]
+        fn mika3027_un_prefixe_cite_en_prose_reste_escalated() {
+            let prose = "claude-pilot completed (status: done).\n\
+                 The groom writes `Engine reason: F1: (BLOCKING) [mika-engine] \
+                 review-anchor: …` when it withholds.\n\
+                 Verdict: ESCALATE — human review required.\n\
+                 Outcome: ESCALATE — first-pass";
+            assert_eq!(
+                groom_escalate_verdict(Some(prose.to_string())),
+                GroomVerdictState::Escalated,
+                "une prose qui DÉCRIT la retenue n'en est pas une"
+            );
+        }
+
+        /// **Forme 3 — la ligne est bien là, la forme fixe n'y est pas.** Le
+        /// reste de la ligne est passé à `arch_disposition::is_engine_escalation_line`,
+        /// qui exige la numérotation `F<n>:`, `(BLOCKING)`, `[mika-engine]` et
+        /// `review-anchor:`. C'est la forme que l'écrivain produit réellement, et
+        /// rien d'autre ne traverse.
+        #[test]
+        fn mika3027_une_forme_non_conforme_reste_escalated() {
+            let approx = "claude-pilot completed (status: done).\n\
+                 Engine reason: the architect could not attest the anchors.\n\
+                 Verdict: ESCALATE — human review required.\n\
+                 Outcome: ESCALATE — first-pass";
+            assert_eq!(
+                groom_escalate_verdict(Some(approx.to_string())),
+                GroomVerdictState::Escalated,
+                "fail-closed sur l'auteur : une ligne `Engine reason:` libre \
+                 n'atteste pas que le MOTEUR l'a écrite"
+            );
+        }
+
+        /// **Forme 4 — le témoin positif**, relevé sur mika#2762 : la ligne
+        /// complète, en tête de ligne, derrière un `Outcome: ESCALATE`. C'est la
+        /// seule forme qui traverse la porte.
+        #[test]
+        fn mika3027_la_forme_complete_est_une_retenue() {
+            assert_eq!(
+                groom_escalate_verdict(Some(super::mika2786_anchor_brake::WITHHELD.to_string())),
+                GroomVerdictState::AnchorWithheld
             );
         }
 

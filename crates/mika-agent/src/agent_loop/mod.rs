@@ -9523,13 +9523,14 @@ const TERMINAL_DISPOSITIONS: &[&str] = &[
 /// line — never by `[mika-engine]` alone, which every corrective re-prompt also begins with
 /// and which the model recopies into its own prose. Keep in sync with the tier-0b pattern in
 /// `skills/bundled/_shared/dispatch-lib.sh`; `test-dispatch-lib.sh` compares the two.
+///
+/// **Module-private, and it stays that way (mika#3027).** The anchor brake in
+/// `skills::executor` used to count withheld attestations by this fragment through a
+/// `pub(crate)` alias; it now delegates to `arch_disposition::is_engine_escalation_line`,
+/// which matches the complete tier-0b shape instead of this fragment. One reader fewer, and
+/// the declaration above stays on one line — `test-dispatch-lib.sh` reads it with a one-line
+/// `grep`, and a longer declaration would wrap under rustfmt and blind it.
 const REVIEW_ANCHOR_ENGINE_FINDING_MARKER: &str = "(BLOCKING) [mika-engine] review-anchor:";
-
-/// The same marker, for the anchor brake in `skills::executor` (mika#2786), which counts
-/// withheld attestations by this fragment on the groom callback's `Engine reason:` line. An
-/// alias rather than a widened visibility: `test-dispatch-lib.sh` reads the declaration above
-/// with a one-line `grep`, and a longer declaration would wrap under rustfmt and blind it.
-pub(crate) const REVIEW_ANCHOR_WITHHELD_MARKER: &str = REVIEW_ANCHOR_ENGINE_FINDING_MARKER;
 
 /// The `ESCALATE` line of the same family as a declared disposition line
 /// (`Disposition: READY` → `Disposition: ESCALATE`, `Verdict: GROOMED` → `Verdict: ESCALATE`).
