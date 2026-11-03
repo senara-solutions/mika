@@ -14751,6 +14751,67 @@ Harness ticket.
             );
         }
 
+        /// **La série que le frein n'avait jamais pu voir (mika#3027 AC3).**
+        ///
+        /// Le frein mika#2786 refuse à la 3e retenue d'affilée
+        /// (`MIKA_GROOM_ANCHOR_BRAKE_MAX`, défaut 3). Mesuré le 2026-11-03 :
+        /// **0 ligne** dans `audit_events`, 0 dans `server.log` depuis le
+        /// 2026-10-18. La cause n'était pas le frein — c'était la porte en aval,
+        /// qui refusait dès la **première** retenue, donc la série ne pouvait pas
+        /// dépasser 1 sur ce chemin.
+        ///
+        /// Ce test parcourt les trois rangs dans un seul appel, parce que la
+        /// propriété est la **progression** et non ses deux extrémités : aux
+        /// rangs 1 et 2 la reprise automatique traverse les DEUX gardes — c'est
+        /// ce qui fait monter le compteur — et au rang 3 le frein mord sous son
+        /// propre nom. Ses deux voisins pris séparément ne disent pas cela :
+        /// `mika2786_two_withholdings_do_not_brake` n'observe que l'absence du
+        /// frein, et sous l'ancien comportement il était vert alors que la porte
+        /// refusait le rang 2.
+        #[tokio::test]
+        async fn mika3027_la_serie_1_2_3_atteint_le_frein() {
+            for rang in [1usize, 2] {
+                let (db, parent_id) = seeded(WITHHELD, rang);
+                if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                    assert!(
+                        !rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                        "rang {rang} : sous le seuil, le frein ne mord pas — {rejection}"
+                    );
+                    assert!(
+                        !rejection.contains(GROOM_ESCALATED_ERROR),
+                        "rang {rang} : si la porte refuse ici, le compteur reste \
+                         bloqué à 1 et le frein est inatteignable — c'est le \
+                         défaut mesuré le 2026-11-03 — {rejection}"
+                    );
+                }
+                assert_eq!(
+                    audit_rows(&db).await,
+                    0,
+                    "rang {rang} : aucun refus du frein"
+                );
+            }
+
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            let rejection = dispatch(&db, &parent_id, None)
+                .await
+                .expect_err("rang 3 : le seuil est atteint, le frein refuse");
+            assert!(
+                rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                "rang 3 : le refus porte le nom du frein, pas celui de la porte — \
+                 les deux ne se lisent pas pareil dans `audit_events` — {rejection}"
+            );
+            assert!(
+                !rejection.contains(GROOM_ESCALATED_ERROR),
+                "rang 3 : le frein est en amont de la porte, donc c'est lui qui \
+                 tranche — {rejection}"
+            );
+            assert_eq!(
+                audit_rows(&db).await,
+                1,
+                "la morsure laisse la ligne qui manquait à la mesure d'AC5"
+            );
+        }
+
         /// **Contrôle négatif de la levée.** La demande explicite de l'opérateur
         /// traverse le frein, et la levée est écrite.
         #[tokio::test]
