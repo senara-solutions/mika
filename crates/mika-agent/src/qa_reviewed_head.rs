@@ -1957,10 +1957,17 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
     /// terme, et c'est ce qui a permis de localiser la collision.
     #[test]
     fn mika2948_l2_la_garde_nest_pas_gardee_par_skip_remaining_guards() {
-        let src = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_loop/mod.rs"),
-        )
-        .unwrap();
+        // Lu par le lecteur canonique et non par `fs::read_to_string`
+        // (mika#3023) : les assertions ci-dessous portent sur une **absence**
+        // dans chaque condition, la classe qui reste verte en ayant cessé de
+        // prouver quoi que ce soit. Une fixture citant `record_due_but_missing(`
+        // entrerait dans la population et y apporterait sa propre condition ;
+        // l'anti-vacuité à deux sites deviendrait alors satisfaite par un
+        // littéral de test. La moitié production écarte la fixture par
+        // construction.
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
         let conditions = conditions_darmement_2948(&src);
 
         // Anti-vacuité : les deux sites d'armement, et pas un scan qui n'a rien
