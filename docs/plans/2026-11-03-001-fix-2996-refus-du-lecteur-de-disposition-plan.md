@@ -6,6 +6,15 @@
 **Base mesurée :** `f746ad5d2` (`main` au 2026-11-03)
 **Corps de PR :** `Refs mika#2996 (tranche refus du lecteur)` — **jamais `Closes`** : le ticket reste ouvert sur AC4.
 
+**Révision du 2026-11-03.** La première passe d'architecte sur ce plan a rendu `ESCALATE` à 06:01:17Z
+(`.iterate/escalate-first-pass.md`, session `f8c324a9`). Le constat unique est `F1 (BLOCKING) [mika-engine]` : la garde
+d'ancrage de mika#2037 a **retenu l'attestation** de l'architecte — `anchors_found=3, anchors_valid=2`,
+`miss_reason=QuoteNotInBrief` — parce que son ancre A3 paraphrasait ce plan (« La tranche protège sans la perturber » là
+où le § 6 écrit « La tranche **la** protège sans la perturber »). **Aucun reproche n'a été fait au contenu du plan** : la
+disposition n'est pas un jugement de l'architecte mais le refus du moteur de la vérifier. La révision ne change donc
+aucune décision de conception. Elle ajoute ce que la relecture du substrat a mesuré : le registre d'ancrages du § 3.10,
+et deux faits de la queue commune de `_escalate_groom` que le plan ne nommait pas (§ 3.5).
+
 ---
 
 ## 1. Le défaut, re-mesuré sur la base
@@ -203,7 +212,27 @@ Architect findings preserved at: ${findings_file}"
             ;;
 ```
 
-Le `$4` documenté de `_escalate_groom` (l. 10643-10650) gagne la troisième valeur dans son commentaire d'arguments.
+Le `$4` documenté de `_escalate_groom` (l. 10644-10650) gagne la troisième valeur dans son commentaire d'arguments. La
+même phrase dit aujourd'hui « Les **CINQ** sites d'appel la passent explicitement » (l. 10645) : elle devient SIX, dans le
+même commit que le sixième site. C'est de la prose, pas une attente — mais une prose qui compte, et qui est fausse si on
+l'oublie.
+
+**Deux faits de la queue commune, mesurés, que le reste de cette section n'avait pas nommés.** Après le `case`
+(l. 10700-10714), `_escalate_groom` exécute deux gestes pour **tous** les bras :
+
+1. **`_set_outcome_line "Outcome: ESCALATE — ${stage}"`** (l. 10714). Un refus du lecteur sera donc estampillé
+   `Outcome: ESCALATE — first-pass`, sans que le nouveau bras l'écrive. C'est la bonne lecture — l'arrêt *est* terminal —
+   mais il faut le dire, parce qu'AC-R2 exige l'absence d'`architect_unreadable` et de « the architect never emitted », et
+   **non** l'absence d'`Outcome: ESCALATE`. **La sonde ne doit pas asserter l'absence de cette ligne**, sinon elle rougit
+   sur un comportement voulu.
+2. **Le bloc mika#2338** (l. 10701-10713) lit `$content` par `_engine_escalation_line` et, s'il trouve la ligne
+   d'escalade moteur, **écrase** `GROOM_LOOP_FAILURE_REASON` avec « engine ESCALATE (…): review-anchor attestation
+   withheld ». Le `_groom_warn` du site (§ 3.6) s'exécute **avant** `_escalate_groom`, donc cet écrasement est en aval de
+   lui. Le cas est étroit — il faut que la garde d'ancrage ait retenu l'attestation **et** que le lecteur ait refusé — mais
+   c'est exactement la classe de cette tranche : une raison qui nomme le mauvais acteur. Conséquence d'implémentation :
+   **l'assertion d'AC-R2 porte sur la ligne `Groom-halt-cause:`**, qui est posée par le bras et que rien n'écrase, et non
+   sur `GROOM_LOOP_FAILURE_REASON` seul. Aucun code n'est ajouté pour ce cas : le bras est honnête, l'ordre est documenté,
+   et la cause d'audit reste juste.
 
 ### 3.6 Les trois sites d'appel
 
@@ -356,6 +385,50 @@ attente.
 - `crates/mika-agent/tests/eval/grounding_regressions/review_anchor_unparsed_retry_2996.rs` : aucune attente touchée —
   le chemin de relance sur UNPARSED réel est inchangé (§ 3.6), et AC-R3 l'épingle par le comportement.
 - La garde d'ancrage de mika#2037, `review_anchor.rs`, et le message de relance porteur du plan : inchangés.
+
+### 3.10 Les ancrages, re-mesurés sur `f746ad5d2`
+
+Chaque numéro de ligne de ce plan a été relu sur la base, et non repris du corps du ticket. Le pilote d'implémentation
+peut s'y fier, ou refaire la mesure par les mêmes commandes.
+
+| ancre | ligne mesurée | commande |
+|---|---|---|
+| `_ARCH_DISPOSITION_REFUSAL_FILE=` | 9808 | `grep -n '_ARCH_DISPOSITION_REFUSAL_FILE=' dispatch-lib.sh` |
+| `_disposition_was_fuzzy()` | 9816 | `grep -n '^_disposition_was_fuzzy()' dispatch-lib.sh` |
+| `_arch_disposition_refuse()` | 9883 | idem |
+| `_parse_disposition()` | 9893 | idem |
+| remise à zéro fuzzy, 1re enveloppe | 9900 | lecture de 9893-9933 |
+| `_parse_verdict()` | 9935 | `grep -n '^_parse_verdict()' dispatch-lib.sh` |
+| `_trail_append()` | 9975 | idem |
+| les trois constantes de cause | 10573, 10577, 10588 | `grep -n '^GROOM_HALT_CAUSE_' dispatch-lib.sh` |
+| `_escalate_groom()` | 10590 | idem |
+| doc de `$4` (« CINQ sites ») | 10644-10650 | lecture de 10590-10660 |
+| queue commune : bloc mika#2338 puis `_set_outcome_line` | 10701-10714 | lecture de 10665-10715 |
+| `_groom_warn()` | 10935 | idem *(le plan disait 10936 ; corrigé)* |
+| `_iterate_groom_loop()` | 11064 | idem |
+| site 1 — `_parse_disposition` | 11171 | `grep -n '_parse_disposition\|_parse_verdict' dispatch-lib.sh` |
+| site 2 — `_parse_verdict` après READY | 11264 | idem |
+| site 3 — `_parse_verdict` après ITERATE | 11408 | idem |
+| les cinq escalades existantes | 11307, 11318, 11443, 11448, 11455 | `grep -n '_escalate_groom ' dispatch-lib.sh` |
+| terminal double-UNPARSED, **sans** `_escalate_groom` | 11480-11481 | lecture de 11450-11484 |
+| `_annex_arch_disposition_refusal()` | 12746 | `grep -n '^_annex_arch_disposition_refusal()' dispatch-lib.sh` |
+| `_reason_pairing_check()` | 5880-5908 | `grep -n '_reason_pairing_check' test-dispatch-lib.sh` |
+| cardinalité sur `declare -f` (reste à **5**) | 1160-1161 | idem |
+| S-c, scan du **fichier** (passe à **6**) | 14540-14548 | `grep -n 'S-c' test-dispatch-lib.sh` |
+| S-c, population de causes (passe à **6**) | 14553-14556 | idem |
+| scans D4, préfixes **ancrés** | 14560, 14563 | idem |
+| gabarit `_groom_retry_plan_probe_2996` | 16852 | `grep -n '_groom_retry_plan_probe_2996' test-dispatch-lib.sh` |
+
+Les trois claims porteuses du choix de conception sont vérifiées, et non supposées :
+
+1. **Le scan de l. 1160 lit `declare -f _iterate_groom_loop`**, donc le corps d'une fonction séparée ne l'atteint pas : le
+   garde unique laisse ce compte à 5.
+2. **Le scan S-c de l. 14543 lit `"$DISPATCH_LIB"`**, le fichier entier, par
+   `grep -nE '^[[:space:]]*_escalate_groom[[:space:]]+"'` : l'appel du garde y compte, d'où 5 → 6. Son second prédicat
+   exige la constante de cause **en fin de ligne**, ce que la forme du garde respecte.
+3. **La fenêtre de `_reason_pairing_check` est `"$line$prev1$prev2"`**, et elle ignore les lignes vides pour avancer
+   `prev1`/`prev2`. Avec le `_groom_warn` au site, la fenêtre du `return 1` est (`return 1`, appel du garde,
+   `_groom_warn "…"`) et matche le motif `*_groom_warn\ *`. Le détecteur reste vert sans qu'on y touche.
 
 ---
 
@@ -520,6 +593,12 @@ détecteur pendant un vol, ce que la tranche n'a pas besoin de payer.
 
 Sous 1000 lignes : pas de découpage en phases.
 
+**La révision du 2026-11-03 n'ajoute aucune ligne de production.** Le registre d'ancrages (§ 3.10) est de la prose de
+plan, hors décompte par construction. Les deux faits de queue commune (§ 3.5) sont des **contraintes d'assertion** — ne
+pas asserter l'absence d'`Outcome:`, asserter la cause sur la ligne `Groom-halt-cause:` — et non du code neuf ; la prose
+« CINQ → SIX » du commentaire de `$4` tient dans les 16 lignes déjà comptées pour ce poste. Le total reste **227**, et il
+est désormais adossé à des numéros de ligne relus un par un plutôt qu'estimés.
+
 ---
 
 ## 10. Definition of Done
@@ -532,6 +611,11 @@ Sous 1000 lignes : pas de découpage en phases.
       `return 0`, aucune relance.
 - [ ] `_escalate_groom` a un quatrième bras qui écrit la ligne `Groom-halt-cause: disposition_reader_refused <stage>`,
       sans ligne `Verdict:`, en nommant le moteur.
+- [ ] Le commentaire d'arguments de `_escalate_groom` nomme la troisième valeur de `$4`, et son « CINQ sites » devient
+      « SIX » (§ 3.5).
+- [ ] La sonde n'asserte **pas** l'absence d'`Outcome: ESCALATE` : la queue commune la pose pour tous les bras (§ 3.5).
+- [ ] L'assertion d'AC-R2 porte sur la ligne `Groom-halt-cause:`, et non sur `GROOM_LOOP_FAILURE_REASON` seul, que le
+      bloc mika#2338 peut écraser en aval du `_groom_warn` du site (§ 3.5).
 - [ ] Les trois sites appellent le garde entre la capture et `_trail_append`, avec `_groom_warn` au site.
 - [ ] Sonde de refus aux trois sites : `arch_calls` = 1, 2, 2.
 - [ ] `RESULT` porte la cause et l'annexe, et ne porte ni `architect_unreadable` ni « the architect never emitted »
