@@ -2055,6 +2055,39 @@ pub(super) async fn run_agent_for_message(
                 unreachable!("upstream_close handler never dispatches");
             }
         }
+
+        // Retrait de `ready` au merge (mika#3022) : un `PR closed` portant
+        // `Merged: true` et une branche `<type>/<N>/…` rend le consentement du
+        // ticket #N, ici, en code, AVANT le tour LLM — cinq retraits à la main
+        // mesurés du 2026-10-30 au 2026-11-03, et entre le merge et le retrait
+        // le ticket reste exposé au feeder. Complémentaire de
+        // `draft_pr_opened_handler` ci-dessus et non redondant : celui-là sert
+        // `PR opened` draft et choisit par `closingIssuesReferences`, vide sur
+        // les PR d'un ticket gardé ouvert. Injecteur à effet de bord seul —
+        // jamais Handled/Dispatched, jamais d'enrichissement.
+        let merged_pr_ready_action =
+            super::merged_pr_ready_cleanup_handler::try_handle_merged_pr_ready_cleanup(
+                &req.text,
+                &a.db,
+                verdict_github_token.as_deref(),
+                &session_id,
+                &req.request_id,
+            )
+            .await;
+        match merged_pr_ready_action {
+            VerdictAction::Passthrough { enrichment: None } => {}
+            VerdictAction::Passthrough {
+                enrichment: Some(_),
+            } => {
+                unreachable!("merged_pr_ready_cleanup handler never enriches");
+            }
+            VerdictAction::Handled { .. } => {
+                unreachable!("merged_pr_ready_cleanup handler never handles");
+            }
+            VerdictAction::Dispatched { .. } => {
+                unreachable!("merged_pr_ready_cleanup handler never dispatches");
+            }
+        }
     }
 
     // mika#2675 — pré-filtre déterministe : APRÈS les handlers, qui gardent

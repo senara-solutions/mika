@@ -479,4 +479,11 @@ mod eval {
     // le créneau du site aval. Les neuf fixtures mono-site des vols 1 à 3 ne
     // pouvaient pas le voir — c'est leur R6/R7 resté vert (mika#2879, vol 4/4)
     mod test_fabrication_detected_p0_2879_collision;
+
+    // Le retrait de `ready` au merge tombe AVANT la porte du pré-filtre, donc
+    // avant le tour LLM — la moitié « quand » d'AC1, qui est une question de
+    // callsite et qu'aucun test de comportement ne peut voir : un handler câblé
+    // après la porte retirerait la même étiquette avec les mêmes tests verts
+    // (mika#3022)
+    mod test_ready_cleanup_on_merge_3022;
 }
