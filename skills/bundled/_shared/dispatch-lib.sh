@@ -4722,6 +4722,100 @@ _seed_pilot_scratch_dir() {
     _append_exclude_line "$exclude_file" "$_PILOT_SCRATCH_DIRNAME/"
 }
 
+# Ce que le pilote peut faire avec `gh` dans un worktree de dispatch. CLOSE, et
+# fermée par construction : tout ce qui n'est pas ici tombe sur `can_use_tool`,
+# donc sur la politique de claude-pilot — qui est le seul endroit où une
+# décision d'écriture GitHub doit se prendre, et le seul qui l'écrive au journal.
+#
+# mika#3030. Avant, le worktree recevait `Bash(gh pr:*)` / `Bash(gh issue:*)` par
+# copie de l'allowlist de l'opérateur ; un joker de famille, qui court-circuite
+# le callback pour TOUTE sous-commande de la famille. mika#3024 a été ouvert par
+# cette porte le 03/11 à 12:46:33Z, sans qu'aucune ligne de décision soit écrite
+# nulle part — ni `audit_events`, ni `server.log`, ni le transcript. Rejoué hors
+# ligne contre la politique installée, le même geste rend `deny`.
+#
+# Le prédicat de rejet est sur la FORME (toute entrée `Bash(…)` qui contient un
+# mot isolé `gh`), jamais sur une liste de commandes interdites : un filtre
+# indexé sur la liste laisse passer la dixième commande que personne n'a listée.
+# C'est la règle que mika#2309 a déjà écrite dans ce dépôt.
+#
+# Chaque entrée nomme UNE sous-commande. Jamais `gh pr:*`. Jamais `gh api` (dont
+# `-X PATCH` est une écriture : 2 appels mesurés, refusés par la politique — ils
+# doivent continuer à l'être ; distinguer la méthode HTTP est un prédicat qui
+# appartient à `permissions.py`, pas à un motif `Bash(…)`).
+#
+# Aucune entrée `gh pr ready` : le contrat draft de mika (#1613, #1682, #2624)
+# interdit au pilote de rendre prête une PR, parce qu'un draft peut être une
+# retenue posée exprès. Les 5 appels mesurés tomberont sur la politique, ce qui
+# est le lieu de cette décision.
+_WORKTREE_GH_ALLOW_NARROW=(
+    # Écritures du pipeline (mika#3030 AC2) — mesurées sur les transcripts.
+    "Bash(gh pr create:*)"        # 189 appels / 189 vols
+    "Bash(gh pr edit:*)"          #  99 appels /  85 vols — le stamp origin:loop
+    # Lectures. `gh pr list` / `diff` / `checks` étaient couvertes par le joker
+    # `Bash(gh pr:*)` ; les retirer sans les réinjecter ferait tomber des
+    # lectures de pipeline sur la politique — un élargissement du vol par
+    # accident. Aucune n'est une écriture, et chacune nomme sa sous-commande.
+    "Bash(gh pr view:*)"
+    "Bash(gh pr list:*)"
+    "Bash(gh pr diff:*)"
+    "Bash(gh pr checks:*)"
+    "Bash(gh issue view:*)"
+    "Bash(gh issue list:*)"
+)
+
+# mika#3030 — l'allowlist du worktree est CONSTRUITE, jamais copiée.
+#
+# Entrée : l'allowlist de la session de l'opérateur (hors vol, jamais modifiée).
+# Sortie : la même, moins toute entrée `Bash(…)` portant un mot isolé `gh`, plus
+# `_WORKTREE_GH_ALLOW_NARROW`. Les entrées non-`gh` (cargo, npm, git, `Read(…)`,
+# les serveurs MCP) continuent d'arriver : ce n'est pas un rétrécissement
+# général de ce que le pilote peut faire.
+#
+# Le repli est FAIL-CLOSED : il écrit la liste étroite SEULE et ne recopie jamais
+# la source. Un repli qui copie rendrait le joker de famille — donc le défaut —
+# le jour précis où le filtre n'a pas pu tourner.
+#
+# L'écriture passe par `$tmp` + `mv` et non par une redirection directe sur le
+# destinataire : `jq` qui échoue à mi-parcours laisserait un JSON tronqué que
+# Claude Code lirait comme « aucune permission », un troisième comportement ni
+# filtré ni fail-closed. Le `[ -s "$tmp" ]` est la borne basse du même souci.
+_seed_worktree_settings_allowlist() {
+    local platform_dir=$1 worktree_dir=$2
+    local src="$platform_dir/.claude/settings.local.json"
+    local dst="$worktree_dir/.claude/settings.local.json"
+    local narrow tmp i sep
+
+    if [ -f "$src" ] && command -v jq >/dev/null 2>&1; then
+        narrow=$(printf '%s\n' "${_WORKTREE_GH_ALLOW_NARROW[@]}" | jq -R . | jq -s -c .)
+        tmp="${dst}.tmp.$$"
+        if jq --argjson narrow "$narrow" '
+                .permissions.allow = (
+                    ((.permissions.allow // [])
+                        | map(select((type == "string"
+                                      and startswith("Bash(")
+                                      and test("\\bgh\\b")) | not)))
+                    + $narrow)
+            ' "$src" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+            mv "$tmp" "$dst"
+            echo "[dispatch-lib] worktree_allowlist: mode=filtered narrow=${#_WORKTREE_GH_ALLOW_NARROW[@]}" >&2
+            return 0
+        fi
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+
+    # Repli FAIL-CLOSED (mika#3030 R5) : la liste étroite SEULE.
+    {
+        printf '{\n  "permissions": {\n    "allow": [\n'
+        for i in "${!_WORKTREE_GH_ALLOW_NARROW[@]}"; do
+            if [ "$i" -lt $(( ${#_WORKTREE_GH_ALLOW_NARROW[@]} - 1 )) ]; then sep=,; else sep=; fi
+            printf '      "%s"%s\n' "${_WORKTREE_GH_ALLOW_NARROW[$i]}" "$sep"
+        done
+        printf '    ]\n  }\n}\n'
+    } > "$dst" 2>/dev/null || true
+    echo "[dispatch-lib] worktree_allowlist: mode=narrow_only narrow=${#_WORKTREE_GH_ALLOW_NARROW[@]}" >&2
+}
+
 # Set up a git worktree for the target issue's branch. Parses the repo#number
 # prompt format, derives branch name and canonical worktree path, creates or
 # reuses the worktree, rebases onto origin/main, and seeds slash commands.
@@ -6092,10 +6186,17 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
             echo "[dispatch-lib] rebase_gate: branch=${BRANCH} behind=0 ran=0 result=skipped" >&2
         fi
 
-        # Copy gitignored .claude/ config into worktree (relay + permissions only)
+        # Seed the gitignored .claude/ config into the worktree (relay config
+        # copied; permission allowlist BUILT).
         mkdir -p "$WORKTREE_DIR/.claude"
+        # The relay config is not an allowlist, and the `--relay-config` of
+        # CWD_ARGS below depends on it: it stays a copy.
         cp "$PLATFORM_DIR/.claude/claude-pilot.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
-        cp "$PLATFORM_DIR/.claude/settings.local.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+        # mika#3030 : l'allowlist est CONSTRUITE, jamais copiée. Un `cp` ici
+        # rendrait au worktree les jokers de famille de l'opérateur, et avec eux
+        # le court-circuit de `can_use_tool` qui a ouvert mika#3024 sans ligne
+        # de décision.
+        _seed_worktree_settings_allowlist "$PLATFORM_DIR" "$WORKTREE_DIR"
         # Seed meta-repo orchestration slash commands for the inner session.
         # Invariants (no-clobber of the worktree's tracked commands; clean git
         # status) live in _seed_worktree_slash_commands (mika#1173, #1255, #1415).
@@ -7304,7 +7405,12 @@ ${_files}"
 #                                  intentional deletion that shipped in PR #1348
 #                                  (mika#1193 Phase C) — the founding incident
 #                                  for mika#1419.
-#   - .claude/settings.local.json  operator permission allowlist cp'd at :490.
+#   - .claude/settings.local.json  the worktree permission allowlist. Since
+#                                  mika#3030 it is BUILT by
+#                                  `_seed_worktree_settings_allowlist`, not
+#                                  cp'd from the operator's session — so it is
+#                                  if anything more clearly ours and not the
+#                                  pilot's work. The exclusion is unchanged:
 #                                  cm#5 (2026-06-16) produced PR #16 whose only
 #                                  "rescued" content was a 143-line allowlist
 #                                  leak (mika#1552 founding incident).
@@ -11933,8 +12039,9 @@ _derive_recovery_pr_title() {
 #   * `_clean_worktree_for_rebase` Tier 2 (four surgical resets: the groom trail,
 #     `.iterate/`, `docs/plans/`, `.claude/commands/`), and
 #   * the rescue commit's own `git add -A` exclusions (`.claude/commands/`,
-#     `.claude/claude-pilot.json`, `.claude/settings.local.json`,
-#     `.claude/*.local.*`), whose NOTE line already calls them "scaffold paths".
+#     `.claude/claude-pilot.json`, `.claude/settings.local.json` — built by
+#     dispatch-lib since mika#3030, no longer copied —, `.claude/*.local.*`),
+#     whose NOTE line already calls them "scaffold paths".
 # A path the rebase overwrites, or that the rescue refuses to stage, cannot be a
 # deliverable.
 #
