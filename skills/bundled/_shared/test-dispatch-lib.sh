@@ -14532,11 +14532,18 @@ fi
 # fonction change (classe mika#2205, même raison qui a fait asserter
 # `cardinality == 3` dans le scan de mika#2496).
 #
-# Il y a DEUX assertions de cardinalité à 5, et leur redondance est délibérée :
+# Il y a DEUX assertions de cardinalité, et leur redondance est délibérée :
 # celle de la section ESCALATE lit le corps de `_iterate_groom_loop` par
 # `declare -f`, celle-ci lit le FICHIER ENTIER. Elles peuvent donc divergir — un
 # appel placé hors de la boucle rougit celle-ci et pas l'autre, un appel écrit
 # sans guillemets l'inverse — et c'est exactement pourquoi les deux restent.
+#
+# Depuis mika#2996 elles DIVERGENT, à 5 et à 6, et c'est la divergence prévue :
+# le sixième appel vit dans `_halt_groom_on_reader_refusal`, un corps que
+# `declare -f _iterate_groom_loop` ne montre pas. Le garde est une fonction
+# unique appelée aux trois sites de lecture plutôt que trois escalades recopiées
+# (mika#2158), donc le scan par `declare -f` reste à 5 sans rien relâcher : les
+# cinq terminaux de la boucle y sont toujours tous.
 _m2641_escalate_call_sites() {
     # Les APPELS, jamais la définition ni la prose : ligne dont le premier mot
     # est `_escalate_groom` suivi d'un espace et d'un argument.
@@ -14544,16 +14551,16 @@ _m2641_escalate_call_sites() {
 }
 M2641_CALL_LINES=$(_m2641_escalate_call_sites)
 M2641_CALL_COUNT=$(printf '%s' "$M2641_CALL_LINES" | grep -c . || true)
-assert_eq "mika#2641 (S-c): exactement cinq sites appellent _escalate_groom" \
-    "5" "$M2641_CALL_COUNT"
+assert_eq "mika#2641 (S-c): exactement six sites appellent _escalate_groom (mika#2996)" \
+    "6" "$M2641_CALL_COUNT"
 # Chaque site nomme sa cause PAR LA CONSTANTE, jamais par un littéral recopié.
 # C'est le prédicat plus fort des deux : il attrape à la fois le site qui omet
 # l'argument ET celui qui retape la valeur de fil à la main — or le format de
 # fil n'est exact que tant qu'il a un site de définition unique (D4).
 M2641_CAUSED_COUNT=$(printf '%s\n' "$M2641_CALL_LINES" \
-    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE)"[[:space:]]*$' || true)
-assert_eq "mika#2641 (S-c): les cinq sites passent une cause explicite, par la constante" \
-    "5" "$M2641_CAUSED_COUNT"
+    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE|DISPOSITION_READER_REFUSED)"[[:space:]]*$' || true)
+assert_eq "mika#2641 (S-c): les six sites passent une cause explicite, par la constante" \
+    "6" "$M2641_CAUSED_COUNT"
 
 # Le format de fil a un site de définition unique de chaque côté (D4). Côté
 # shell : une affectation, pas deux.
@@ -16955,6 +16962,242 @@ for _t2996_fn in _first_pass_retry_prompt _second_pass_retry_prompt; do
     )
     assert_eq "mika#2996: $_t2996_fn refuse un plan illisible (pas de relance sans plan)" \
         "1" "$_t2996_rc"
+done
+
+# ===========================================================================
+# mika#2996 — un refus du LECTEUR de disposition arrête le groom, sans relance
+#
+# Depuis la bascule du vol 5 de mika#2194, `_parse_disposition` et
+# `_parse_verdict` délèguent à `mika arch-disposition`. Sur un code `≥2` — ou sur
+# un `mktemp`/une écriture en échec dans l'enveloppe — elles écrivent un motif
+# dans `$_ARCH_DISPOSITION_REFUSAL_FILE` et rendent un jeton VIDE avec le code 0.
+# Les trois sites de lecture de `_iterate_groom_loop` ne distinguaient pas ce
+# vide d'un UNPARSED de l'architecte : ils payaient une relance, puis nommaient
+# `architect_unreadable` une cause qui est locale (classe mika#1772).
+#
+# Deux blocs ci-dessous, et il en faut deux :
+#   - le CANAL, mesuré sur les enveloppes elles-mêmes : le refus est par APPEL et
+#     non par processus, donc chaque enveloppe vide le fichier en tête ;
+#   - les TROIS SITES, mesurés sur le vrai `_iterate_groom_loop`, avec le
+#     contrôle négatif dans le même corps. Sans ce contrôle, « ne relance plus
+#     sur refus » et « ne relance plus du tout » se liraient pareil (AC-R3).
+# ===========================================================================
+
+echo ""
+echo "Test: le canal de refus est par appel, pas par processus (mika#2996)"
+echo "------------------------------------------------------------"
+
+# Le prédicat `_arch_disposition_refused` doit dire « CET appel a refusé », donc
+# un refus au tour n ne doit pas survivre au tour n+1. Mesuré directement sur
+# l'enveloppe : dans la boucle, un refus est terminal, donc AUCUN appel ne le
+# suit jamais — la remise à zéro n'y serait pas observable, et une assertion
+# qui ne peut pas rougir ne prouve rien.
+_m2996c_channel_probe() {
+    # $1 = code rendu au premier appel (passe `first`), $2 = au second (`second`).
+    #
+    # Le stub dispatche sur la PASSE et non sur un compteur : `mika` est invoqué
+    # dans un `$(...)`, donc un compteur posé par le stub mourrait avec la
+    # substitution et les deux appels liraient la même valeur.
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        M2996C_RC1="$1"
+        M2996C_RC2="$2"
+        mika() {
+            if [ "$3" = "first" ]; then return "$M2996C_RC1"; fi
+            return "$M2996C_RC2"
+        }
+        printf 'une réponse d architecte' | _parse_disposition >/dev/null 2>&1
+        if _arch_disposition_refused; then printf 'first=refused\n'; else printf 'first=clean\n'; fi
+        printf 'une réponse d architecte' | _parse_verdict >/dev/null 2>&1
+        if _arch_disposition_refused; then printf 'second=refused\n'; else printf 'second=clean\n'; fi
+    )
+}
+
+# Un refus, puis un UNPARSED : le second appel n'a PAS refusé, et c'est tout
+# l'objet de la remise à zéro en tête d'enveloppe.
+_m2996c_out=$(_m2996c_channel_probe 3 1) || _m2996c_out=""
+assert_contains "mika#2996: un code ≥2 arme le prédicat de refus" \
+    "first=refused" "$_m2996c_out"
+assert_contains "mika#2996: l'appel SUIVANT ne porte pas le refus du précédent (remise à zéro par appel)" \
+    "second=clean" "$_m2996c_out"
+
+# Symétrique : un UNPARSED n'arme rien, et un refus plus tard s'arme quand même.
+_m2996c_out=$(_m2996c_channel_probe 1 3) || _m2996c_out=""
+assert_contains "mika#2996: un UNPARSED (code 1) n'est pas un refus" \
+    "first=clean" "$_m2996c_out"
+assert_contains "mika#2996: _parse_verdict arme le prédicat sur son propre refus" \
+    "second=refused" "$_m2996c_out"
+
+echo ""
+echo "Test: un refus du lecteur arrête le groom aux trois sites, sans relance (mika#2996)"
+echo "------------------------------------------------------------"
+
+# $1 = site : first | second-ready | second-iterate
+# $2 = polarité : refuse (le lecteur rend 3) | unparsed (il rend 1)
+#
+# Imprime `arch_calls=`, le `RESULT` entre RESULT_BEGIN/RESULT_END, le motif
+# d'échec de boucle entre REASON_BEGIN/REASON_END, et le trail de verdicts entre
+# TRAIL_BEGIN/TRAIL_END.
+_groom_reader_refusal_probe_2996() {
+    local site="$1" polarity="$2" tmp wt plan
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    plan="$wt/docs/plans/2026-11-03-001-fix-2996-refus-lecteur-plan.md"
+    {
+        echo "# Plan rejouant le refus du lecteur de disposition (mika#2996)"
+        echo "**Ticket:** mika issue#2996"
+        for i in $(seq 1 40); do
+            echo "Ligne de corps $i — un refus local ne redemande rien à l'architecte."
+        done
+    } > "$plan"
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        export MIKA_ARCH_ASK_RETRY=0
+        RESULT=""
+        GROOM_LOOP_FAILURE_REASON=""
+        ARCH_CALLS="$tmp/arch-calls"
+        printf '0' > "$ARCH_CALLS"
+
+        # La passe sur laquelle le lecteur bute, et le jeton que la PREMIÈRE
+        # passe rend quand ce n'est pas elle qui bute — c'est lui qui amène la
+        # boucle jusqu'au site mesuré.
+        case "$site" in
+            first)          M2996R_AT="first";  M2996R_TOKEN1="" ;;
+            second-ready)   M2996R_AT="second"; M2996R_TOKEN1="READY" ;;
+            *)              M2996R_AT="second"; M2996R_TOKEN1="ITERATE" ;;
+        esac
+        # `refuse` → 3, membre de la famille `≥2` (« je n'ai pas pu regarder »).
+        # `unparsed` → 1, qui EST le chemin de relance de mika#1823/mika#2641.
+        M2996R_RC=3
+        [ "$polarity" = "refuse" ] || M2996R_RC=1
+
+        # Stub SÉLECTIF du lecteur, et sélectif par nécessité : un `return 3`
+        # inconditionnel ferait buter la première passe sur les trois sites, donc
+        # la boucle n'atteindrait jamais les deux sites de seconde passe.
+        # $1 = arch-disposition, $2 = --pass, $3 = first|second.
+        mika() {
+            if [ "$3" = "$M2996R_AT" ]; then
+                return "$M2996R_RC"
+            fi
+            printf '%s\n1\n' "$M2996R_TOKEN1"
+            return 0
+        }
+
+        _arch_ask() {
+            local n body
+            n=$(cat "$ARCH_CALLS")
+            n=$((n + 1))
+            printf '%s' "$n" > "$ARCH_CALLS"
+            # Le contenu ne décide de rien ici — le stub du lecteur décide — mais
+            # il doit rester inerte pour les DEUX reconnaisseurs que la queue
+            # commune de `_escalate_groom` fait tourner dessus :
+            # `_second_pass_explicit_iterate` (qui prendrait le terminal
+            # `verdict`) et `_engine_escalation_line` (qui écraserait
+            # `GROOM_LOOP_FAILURE_REASON`, mika#2338).
+            case "$site:$n" in
+                second-ready:1)   body='Disposition: READY' ;;
+                second-iterate:1) body='F1: un constat de première passe.
+
+Disposition: ITERATE' ;;
+                *)                body="$M2641_UNREADABLE" ;;
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-refus-2996"}}'
+        }
+        _write_canonical_callout() { return 0; }
+        _launch_revise_pilot() { return 0; }
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="2996" REPO="mika" BRANCH="probe-2996"
+        _iterate_groom_loop >/dev/null 2>&1 || true
+        # La sonde ne traverse pas `_deliver_callback`, qui est le seul appelant
+        # de l'annexe en production : elle l'appelle donc elle-même, au même
+        # point du fil (après le terminal, avant la lecture du `RESULT`).
+        _annex_arch_disposition_refusal || true
+
+        printf 'arch_calls=%s\n' "$(cat "$ARCH_CALLS")"
+        printf 'RESULT_BEGIN\n%s\nRESULT_END\n' "$RESULT"
+        printf 'REASON_BEGIN\n%s\nREASON_END\n' "${GROOM_LOOP_FAILURE_REASON:-}"
+        printf 'TRAIL_BEGIN\n'
+        cat -- "$wt/.claude/groom-verdict-trail.log" 2>/dev/null || true
+        printf 'TRAIL_END\n'
+    )
+    rm -rf "$tmp"
+}
+
+# L'ordre des polarités n'est pas libre : `refuse` D'ABORD. Le canal de refus est
+# un fichier porté par `$$`, que bash ne change PAS dans un sous-shell, donc les
+# six invocations se partagent le même chemin. Un refus qui fuirait vers la
+# polarité suivante y serait vu (le `rm -f` de chargement de la bibliothèque le
+# couvre déjà, et cet ordre refuse de s'en remettre à lui).
+for _m2996r_site in first second-ready second-iterate; do
+    case "$_m2996r_site" in
+        first) _m2996r_calls_refuse=1; _m2996r_calls_unparsed=2 ;;
+        *)     _m2996r_calls_refuse=2; _m2996r_calls_unparsed=3 ;;
+    esac
+    case "$_m2996r_site" in
+        first) _m2996r_stage="first-pass" ;;
+        second-ready) _m2996r_stage="second-pass-after-ready" ;;
+        *)     _m2996r_stage="second-pass-after-iterate" ;;
+    esac
+
+    # ── Polarité `refuse` : AC-R1, AC-R2, AC-R4 ──────────────────────────────
+    _m2996r_out=$(_groom_reader_refusal_probe_2996 "$_m2996r_site" refuse) || _m2996r_out=""
+    _m2996r_result=$(printf '%s\n' "$_m2996r_out" | sed -n '/^RESULT_BEGIN$/,/^RESULT_END$/p' | sed '1d;$d')
+    _m2996r_reason=$(printf '%s\n' "$_m2996r_out" | sed -n '/^REASON_BEGIN$/,/^REASON_END$/p' | sed '1d;$d')
+    _m2996r_trail=$(printf '%s\n' "$_m2996r_out" | sed -n '/^TRAIL_BEGIN$/,/^TRAIL_END$/p' | sed '1d;$d')
+
+    # AC-R1 — aucune relance : le compte d'appels architecte est celui du refus,
+    # pas celui du refus suivi d'un tour de remède de format.
+    assert_contains "mika#2996 ($_m2996r_site/refuse): aucune relance architecte sur un refus du lecteur" \
+        "arch_calls=$_m2996r_calls_refuse" "$_m2996r_out"
+    # AC-R2 — la cause nommée, avec son étape, sur la ligne ancrée.
+    assert_contains "mika#2996 ($_m2996r_site/refuse): RESULT porte la cause et l'étape" \
+        "Groom-halt-cause: disposition_reader_refused $_m2996r_stage" "$_m2996r_result"
+    assert_contains "mika#2996 ($_m2996r_site/refuse): RESULT porte l'annexe du motif" \
+        "REFUSED (arch-disposition, mika#2194) subcommand_error" "$_m2996r_result"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): RESULT n'accuse pas l'architecte" \
+        "architect_unreadable" "$_m2996r_result"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): le motif de boucle n'accuse pas l'architecte" \
+        "the architect never emitted" "$_m2996r_result
+$_m2996r_reason"
+    # AC-R4 — le trail : un jeton distinct, et pas de `-after-retry`.
+    assert_contains "mika#2996 ($_m2996r_site/refuse): le trail porte REFUSED-reader" \
+        "REFUSED-reader" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): le trail ne porte pas UNPARSED" \
+        "UNPARSED" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): aucune entrée -after-retry après un refus" \
+        "-after-retry" "$_m2996r_trail"
+
+    # ── Polarité `unparsed` : AC-R3, le contrôle négatif ─────────────────────
+    _m2996r_out=$(_groom_reader_refusal_probe_2996 "$_m2996r_site" unparsed) || _m2996r_out=""
+    _m2996r_result=$(printf '%s\n' "$_m2996r_out" | sed -n '/^RESULT_BEGIN$/,/^RESULT_END$/p' | sed '1d;$d')
+    _m2996r_reason=$(printf '%s\n' "$_m2996r_out" | sed -n '/^REASON_BEGIN$/,/^REASON_END$/p' | sed '1d;$d')
+    _m2996r_trail=$(printf '%s\n' "$_m2996r_out" | sed -n '/^TRAIL_BEGIN$/,/^TRAIL_END$/p' | sed '1d;$d')
+
+    assert_contains "mika#2996 ($_m2996r_site/unparsed): un UNPARSED réel relance toujours" \
+        "arch_calls=$_m2996r_calls_unparsed" "$_m2996r_out"
+    assert_contains "mika#2996 ($_m2996r_site/unparsed): le trail porte l'entrée -after-retry" \
+        "UNPARSED-after-retry" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/unparsed): aucun REFUSED-reader au trail" \
+        "REFUSED-reader" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/unparsed): aucune cause de refus dans RESULT" \
+        "disposition_reader_refused" "$_m2996r_result"
+    assert_not_contains "mika#2996 ($_m2996r_site/unparsed): aucune annexe de refus dans RESULT" \
+        "REFUSED (arch-disposition, mika#2194)" "$_m2996r_result"
+    # La cause d'un double UNPARSED reste celle de mika#2641 — sauf en première
+    # passe, dont le terminal (l. 11480) n'appelle pas `_escalate_groom` et ne
+    # pose donc aucune ligne de cause : son motif de boucle en tient lieu.
+    if [ "$_m2996r_site" = "first" ]; then
+        assert_contains "mika#2996 ($_m2996r_site/unparsed): le terminal de première passe est inchangé" \
+            "the architect never emitted a parsable 'Disposition:' line" "$_m2996r_reason"
+    else
+        assert_contains "mika#2996 ($_m2996r_site/unparsed): la cause architect_unreadable est inchangée" \
+            "Groom-halt-cause: architect_unreadable $_m2996r_stage" "$_m2996r_result"
+    fi
 done
 
 # --- Summary ---
