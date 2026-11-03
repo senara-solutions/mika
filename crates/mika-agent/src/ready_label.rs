@@ -1897,4 +1897,201 @@ fn lit_seulement(labels: &[String]) -> bool {
              le compteur de la porte de place et serait désarmé pour cette raison : {muets:?}"
         );
     }
+
+    // ── mika#2995, AC-T4 — un site de définition unique pour chaque nom ──────
+    //
+    // Troisième détecteur de ce module, et sa population est encore une autre :
+    // le test 13 refuse une *écriture* de `ready` hors du module, D1 refuse
+    // qu'une surface d'outil atteigne l'applicateur, D2 refuse une écriture de
+    // forme argv non déclarée — et D3 refuse qu'un **nom** de la relecture de
+    // consentement ait deux sites. Deux populations sous un même nom ne se
+    // soustraient pas (mika#2205), donc chacun porte sa disposition.
+
+    /// Les exceptions de D3. **Née vide, et destinée à le rester.**
+    ///
+    /// Trois champs : le fichier, le nom, et la raison. La raison est exigée
+    /// parce qu'une allowlist dont les entrées n'ont pas à se justifier est une
+    /// allowlist qui se remplit (mika#2309).
+    const CONSENT_RECHECK_NAME_EXCEPTIONS: &[(&str, &str, &str)] = &[];
+
+    /// Les quatre noms de la relecture de consentement, et le fichier qui
+    /// porte leur site unique.
+    ///
+    /// Les deux premiers sont les constantes d'AC-T4 au sens littéral — le
+    /// motif du terminal et le nom de l'outil d'audit. Les deux suivants sont
+    /// les noms d'événement des deux sondes, inclus parce qu'ils répondent à la
+    /// même question : un second émetteur de
+    /// `deferred_dispatch_consent_recheck_deferred` rendrait son compte
+    /// illisible exactement comme un second site du motif rendrait le terminal
+    /// ambigu.
+    const CONSENT_RECHECK_NAMES: &[(&str, &str)] = &[
+        (READY_CONSENT_WITHDRAWN_REASON, "ready_label.rs"),
+        (READY_CONSENT_RECHECK_TOOL_NAME, "ready_label.rs"),
+        (
+            "deferred_dispatch_refused_consent_withdrawn",
+            "task_engine/dispatcher.rs",
+        ),
+        (
+            "deferred_dispatch_consent_recheck_deferred",
+            "task_engine/dispatcher.rs",
+        ),
+    ];
+
+    /// Les lignes de production de `rel` où `nom` apparaît **comme littéral de
+    /// chaîne**.
+    ///
+    /// `"{nom}"` avec ses guillemets, et non le nom nu : un `use` de la
+    /// constante, un `match` sur elle ou une prose qui la cite ne sont pas des
+    /// sites de définition, et un prédicat sur le nom nu rougirait sur tous ses
+    /// lecteurs — donc finirait désarmé.
+    fn sites_du_nom(rel: &str, prod: &str, nom: &str) -> Vec<String> {
+        let litteral = format!("\"{nom}\"");
+        crate::source_scan::strip_comment_lines(prod)
+            .lines()
+            .filter(|l| l.contains(&litteral))
+            .map(|l| format!("{rel} — {}", l.trim()))
+            .collect()
+    }
+
+    /// **L'assertion sœur d'auto-vacuité de D3.**
+    ///
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction. Celle-ci rougit à la première entrée.
+    #[test]
+    fn mika2995_lallowlist_des_noms_de_relecture_est_vide() {
+        assert!(
+            CONSENT_RECHECK_NAME_EXCEPTIONS.is_empty(),
+            "une exception a été ajoutée à D3 : {:?}. La disposition de ce détecteur est de \
+             ROUTER le second site par la constante, pas de l'allowlister (mika#2201).",
+            CONSENT_RECHECK_NAME_EXCEPTIONS
+        );
+    }
+
+    /// **D3 — le motif du terminal et l'événement d'audit ont chacun un site de
+    /// définition unique, et aucun ne porte `noop` nu (AC-T4 de mika#2995).**
+    ///
+    /// # Ce qu'il refuse
+    ///
+    /// Qu'un second site écrive l'un de ces quatre noms en clair. C'est la
+    /// classe mika#2158 : une seconde copie ne rend **aucune décision fausse**
+    /// le jour où elle est écrite, et rate le premier renommage — après quoi
+    /// deux moitiés de la même population portent deux motifs, et le `grep` qui
+    /// répond « combien de wrappers ont été refusés pour consentement retiré »
+    /// en rend une seule sans dire qu'il en manque.
+    ///
+    /// # Pourquoi `noop` est interdit dans ces noms
+    ///
+    /// `deferred_dispatch_noop_completion` (mika#1124) et le statut `expired`
+    /// de mika#2169 occupent déjà ce mot pour « le tour a eu lieu et n'a rien
+    /// dispatché ». Ici le tour **n'a pas eu lieu**, ce qui est strictement
+    /// moins — et un nom partagé ferait des deux une seule population
+    /// (mika#2205).
+    ///
+    /// # Disposition si ce détecteur fire
+    ///
+    /// **Router le second site par la constante**, jamais l'allowlister. Voir
+    /// [`CONSENT_RECHECK_NAME_EXCEPTIONS`], et surfacer le site au corps de PR
+    /// sous `Fire-Disposition: second site d'un nom de relecture`.
+    #[test]
+    fn mika2995_le_motif_et_levenement_ont_un_site_de_definition_unique() {
+        for (nom, _) in CONSENT_RECHECK_NAMES {
+            assert!(
+                !nom.contains("noop"),
+                "`{nom}` porte `noop` nu, déjà pris par mika#1124 et mika#2169 pour « le tour a \
+                 eu lieu et n'a rien dispatché ». Ici le tour n'a pas eu lieu."
+            );
+        }
+
+        let fichiers = crate::source_scan::production_files();
+        assert!(
+            fichiers.len() > 100,
+            "D3 n'a scanné que {} fichier(s) — la population est cassée, et un détecteur qui \
+             ne scanne rien ne refuse rien (mika#2578)",
+            fichiers.len()
+        );
+
+        let mut offenders = Vec::new();
+        for (nom, attendu) in CONSENT_RECHECK_NAMES {
+            let mut sites = Vec::new();
+            for (rel, prod) in &fichiers {
+                if CONSENT_RECHECK_NAME_EXCEPTIONS
+                    .iter()
+                    .any(|(f, n, _)| f == rel && n == nom)
+                {
+                    continue;
+                }
+                sites.extend(sites_du_nom(rel, prod, nom));
+            }
+            // Zéro site est une infraction au même titre que deux : le nom
+            // aurait été renommé dans le code sans l'être ici, et D3 se serait
+            // rendormi en silence sur un nom qui n'existe plus.
+            if sites.len() != 1 {
+                offenders.push(format!(
+                    "`{nom}` a {} site(s) (attendu : 1, dans `{attendu}`) :\n  {}",
+                    sites.len(),
+                    sites.join("\n  ")
+                ));
+                continue;
+            }
+            if !sites[0].starts_with(*attendu) {
+                offenders.push(format!(
+                    "`{nom}` a bien un site unique, mais il a déménagé : attendu `{attendu}`, \
+                     vu `{}`",
+                    sites[0]
+                ));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2995 AC-T4 — un nom de la relecture de consentement n'a plus un site unique. \
+             Routez le second site par la constante ; ne l'allowlistez pas.\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// **Le contrôle de bonne foi de D3 — le scan rougit sur un second site.**
+    ///
+    /// Le scan pourrait être vert pour avoir **cessé de reconnaître sa forme**.
+    /// Aucune assertion sur l'arbre réel ne peut voir ça — elle passerait. Ce
+    /// test plante donc un second site et exige qu'il soit vu, puis trois
+    /// formes qui nomment la constante sans la définir et exige le silence sur
+    /// chacune.
+    #[test]
+    fn mika2995_le_scan_des_noms_rougit_sur_un_second_site() {
+        let plante = "\
+async fn un_autre_terminal(db: &AsyncDatabase, id: &str) {
+    db.mark_deferred_wrapper_noop(id, \"ready_consent_withdrawn\").await.ok();
+}
+";
+        let vus = sites_du_nom("second.rs", plante, READY_CONSENT_WITHDRAWN_REASON);
+        assert_eq!(
+            vus.len(),
+            1,
+            "le scan doit voir le second site planté, sinon il est vert pour avoir cessé de \
+             reconnaître sa forme : {vus:?}"
+        );
+        assert!(
+            vus[0].contains("second.rs") && vus[0].contains("mark_deferred_wrapper_noop"),
+            "l'offender doit nommer le fichier et rendre la ligne grep-able : {vus:?}"
+        );
+
+        // Les trois formes muettes, chacune pour sa raison : un commentaire qui
+        // cite le motif pour expliquer le site (la forme de mika#2425), un
+        // `use` de la constante, et une consommation de la constante — c'est
+        // exactement ce que le dispatcher fait, et D3 rougirait sur lui.
+        let muet = "\
+/// Le terminal est écrit sous \"ready_consent_withdrawn\", défini dans ready_label.
+use crate::ready_label::READY_CONSENT_WITHDRAWN_REASON;
+async fn consomme(db: &AsyncDatabase, id: &str) {
+    db.mark_deferred_wrapper_noop(id, READY_CONSENT_WITHDRAWN_REASON).await.ok();
+}
+";
+        let muets = sites_du_nom("muet.rs", muet, READY_CONSENT_WITHDRAWN_REASON);
+        assert!(
+            muets.is_empty(),
+            "citer ou consommer la constante n'est pas la définir — D3 rougirait sur tous ses \
+             lecteurs et finirait désarmé : {muets:?}"
+        );
+    }
 }
