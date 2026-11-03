@@ -337,7 +337,7 @@ serialization, connection acquisition). `request_bytes` rides on the **start** o
 the attempt because that is the only way to know the size of a request that never
 comes back: `llm_calls.request_bytes` is written after the call returns.
 
-**Structural guard.** `agent_loop::tests::mika2342_every_llm_call_is_wrapped_in_a_timeout`
+**Structural guard.** `mika2342_every_llm_call_is_wrapped_in_a_timeout`
 — a source scan, because removing the net breaks no assertion: the loop keeps
 working and every existing test stays green, only the call goes unbounded and
 silent again. Inventory closed at two call sites, **no allowlist** (an allowlist

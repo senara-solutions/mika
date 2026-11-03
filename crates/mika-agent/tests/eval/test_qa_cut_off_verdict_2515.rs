@@ -15,7 +15,7 @@
 //! | `DeadlineExceeded` | **coupure 1/2** |
 //! | `MaxStepsExceeded` | **coupure 2/2** |
 //!
-//! Le scan de source (`agent_loop::tests::mika2515_every_loop_exit_decides_…`)
+//! Le scan de source (`mika2515_every_loop_exit_decides_…`)
 //! asserte la **cardinalité** — le seul terme qu'aucune fixture ne peut voir.
 //! Ce fichier asserte le **câblage** : qu'un vrai tour silencieux, sur un vrai
 //! message de callback de build, avec `qa-review` chargé, lève bien la bonne
@@ -386,7 +386,7 @@ async fn p0_the_force_endturn_exit_is_unreachable_from_a_callback_turn() {
 /// `is_automated_trigger` est vrai dès que le message commence par `[callback:`,
 /// et c'est la forme que `run_silent_agent` émet pour un callback de build. Le
 /// premier garde (`mode.is_conversation()`) est asserté côté crate, où `LoopMode`
-/// est visible : `agent_loop::tests::mika2515_the_force_endturn_exit_is_mode_guarded`.
+/// est visible : `mika2515_the_force_endturn_exit_is_mode_guarded`.
 ///
 /// Reconstruit depuis la grammaire du moteur plutôt que recopié, pour que le test
 /// casse si l'une des deux moitiés du marqueur bouge.

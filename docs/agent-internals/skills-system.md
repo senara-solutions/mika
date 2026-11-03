@@ -104,7 +104,7 @@ delete `--only-skill "$skill"` from `_arch_ask` — shell only, no binary redepl
 `escalate_unattested_disposition` (mika#2037) is unaffected: it escalates within
 the withdrawn line's own family, and each arch skill declares its own family's
 `ESCALATE` (pinned by
-`agent_loop::tests::mika2363_escalation_still_has_a_declared_target_under_restriction`).
+`mika2363_escalation_still_has_a_declared_target_under_restriction`).
 
 **The trap, pinned.** Do **not** flip the three arch `always_on` flags to `false`
 now that the pass is declared. The channel cannot activate anything, and keyword
