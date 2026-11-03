@@ -18,6 +18,10 @@ pub mod investigate;
 pub mod iterate_dispatch;
 pub mod json_extractor;
 pub mod merge_ready_handler;
+// Privé comme `milestone_context_handler`, et pour la même raison : un injecteur
+// à effet de bord seul n'a qu'un appelant, `handlers`, qui est son frère sous
+// `server` et voit donc les items privés de leur parent commun (mika#3022).
+mod merged_pr_ready_cleanup_handler;
 mod milestone_context_handler;
 pub mod openapi;
 pub mod permissions_stream;
