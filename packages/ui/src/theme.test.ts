@@ -49,6 +49,45 @@ const declarationMap: Map<string, string> = (() => {
   return map
 })()
 
+/**
+ * The `--color-*` declarations of the legacy-alias block, as `[name, value]`.
+ *
+ * Read from `THEME_CSS_RAW` (comments intact) because the block is delimited by
+ * its own comments: from the `Legacy aliases` marker to the next SECTION
+ * comment — one that opens its own line. A note trailing a declaration
+ * (`--x: #y;  /* no-op *\/`) deliberately does not close the region: were it to,
+ * a seventh declaration written after such a note would fall outside the scan
+ * and pass in silence, which is the exact failure this guard exists for. The
+ * region is stripped of comments afterwards so a trailing note is never read
+ * as a value.
+ *
+ * Throws rather than returning an empty list when the marker is gone: a
+ * shape guard that silently scans nothing passes on a deleted block, which is
+ * the other way it could fail open.
+ */
+const aliasBlockDeclarations = (): Array<[name: string, value: string]> => {
+  const start = THEME_CSS_RAW.indexOf('/* Legacy aliases')
+  if (start < 0) {
+    throw new Error(
+      'theme.css: the `/* Legacy aliases` marker is gone — the alias-block shape guard (mika#2913) has nothing to scan.',
+    )
+  }
+  const afterMarker = THEME_CSS_RAW.indexOf('*/', start) + 2
+  const tail = THEME_CSS_RAW.slice(afterMarker)
+  const nextSection = tail.search(/\n[ \t]*\/\*/)
+  const region = tail
+    .slice(0, nextSection < 0 ? undefined : nextSection)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+
+  const out: Array<[string, string]> = []
+  const re = /(--[a-z0-9-]+)\s*:\s*([^;]+);/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(region)) !== null) {
+    out.push([m[1].toLowerCase(), collapse(m[2]).trim()])
+  }
+  return out
+}
+
 const canonicalTokens: Array<[name: string, hex: string, source: string]> = [
   // Surface hierarchy — rulebook §2 Full Token Reference
   ['--color-background', '#0c0e11', 'background/surface/surface_dim'],
@@ -87,30 +126,65 @@ const canonicalTokens: Array<[name: string, hex: string, source: string]> = [
   ['--color-error-container', '#a70138', 'error_container'],
 ]
 
-const backwardCompatAliases: Array<[legacy: string, canonical: string]> = [
-  ['--color-bg', 'var(--color-background)'],
-  ['--color-bg-card', 'var(--color-surface-container)'],
-  ['--color-accent', 'var(--color-primary)'],
-  ['--color-accent-light', 'var(--color-secondary)'],
-  ['--color-heading', 'var(--color-on-surface)'],
-  ['--color-muted', 'var(--color-on-surface-variant)'],
+/**
+ * mika#2913 — the legacy aliases are frozen at their 0.3.1 VALUES.
+ *
+ * This table replaces `backwardCompatAliases`, which asserted the opposite
+ * (`--color-accent: var(--color-primary)`). That form carried 0.5.0's
+ * intention — pull every unmigrated consumer onto §2 through the alias — and
+ * Vincent disavowed it on 2026-10-26: a minor bump recoloured all of
+ * mika-cloud#287's pages, including the ones it never touched. The guard is
+ * rewritten the other way round, not deleted: a consumer writing a legacy
+ * name gets the legacy value, and the canonical names keep canonical values.
+ *
+ * The expected value is a literal hex on purpose. A `var()` onto a canonical
+ * token is the exact mechanism the regression arrived by, so a `var()`
+ * reintroduced here fails printing the drift by name
+ * (`expected "#7c6af7", received "var(--color-primary)"`).
+ */
+const legacyAliasValues: Array<[legacy: string, hex: string, canonicalCounterpart: string]> = [
+  ['--color-bg', '#0d0f12', '--color-background'],
+  ['--color-bg-card', '#151820', '--color-surface-container'],
+  ['--color-accent', '#7c6af7', '--color-primary'],
+  // A no-op by value (`--color-secondary` is #9d8fff too). Listed anyway: the
+  // block-shape guard below slaves the *whole* block to one form, and a sixth
+  // member left in the other form would be the special case by which the guard
+  // stops being uniform.
+  ['--color-accent-light', '#9d8fff', '--color-secondary'],
+  ['--color-heading', '#e8ecf2', '--color-on-surface'],
+  ['--color-muted', '#a0a8b8', '--color-on-surface-variant'],
 ]
 
-// Formerly-live legacy hex values — must be absent from the theme file after
-// LC.1 reconciliation. Reintroducing any of them regresses the fix and forces
-// the operator to justify the reintroduction (or update this list with a
-// documented rationale).
+/**
+ * The §2 token each in-repo surface re-aliases a legacy name onto.
+ *
+ * Counterpart of the table above, and the reason restoring the legacy values
+ * is not merely moving the regression: `dashboard/src` (840 usages) and
+ * `site/src` (136) are surfaces the rulebook is the law of, so they take canon
+ * back locally instead of being de-canonised in silence on 791 lines nobody
+ * re-reads. Asserted here, and not in a dashboard test or a CI script, because
+ * `site/` declares no test runner at all (mika#2578/#2752: a guard nothing
+ * runs refuses nothing) while `npm test -w packages/ui` is already required.
+ */
+const inRepoRealiasConsumers: Array<[label: string, relPath: string]> = [
+  ['dashboard', '../../../dashboard/src/index.css'],
+  ['site', '../../../site/src/index.css'],
+]
+
+// Legacy hex values that must stay absent from the theme file. Reduced to two
+// entries by mika#2913: the five the table above now *requires* left the list,
+// because a guard that banned them would fail the repo against itself. What
+// remains is exactly the hex whose NAME is canonical §2 and whose canonical
+// value is not being restored.
 const bannedLegacyHexValues: Array<[hex: string, wasFor: string]> = [
-  ['#7c6af7', 'legacy accent — replaced by canonical primary #ada3ff'],
-  ['#0d0f12', 'legacy bg — replaced by canonical background #0c0e11'],
-  ['#151820', 'legacy bg-card — replaced by canonical surface_container #171a1d'],
-  ['#1e2130', 'legacy surface-container-high — replaced by canonical #1d2024'],
-  ['#e8ecf2', 'legacy heading — replaced by canonical on_surface #e8e8ec'],
-  ['#a0a8b8', 'legacy muted — replaced by canonical on_surface_variant #aaabaf'],
-  // Kept, and the entry outlives its contradiction on purpose: #1976 removed
-  // #ef4444 from the rulebook, which makes it a hex that *was* canonical and is
-  // no longer — the kind a consumer retypes from memory rather than reads.
-  ['#ef4444', 'former §5.5 error hex — removed from the rulebook by #1976'],
+  [
+    '#1e2130',
+    'legacy surface-container-high — the name is canonical §2, value #1d2024 (mika#2913 § 2.2)',
+  ],
+  [
+    '#ef4444',
+    'former §5.5 error hex — removed from the rulebook by #1976; restoring it would reverse the rulebook, not just the lib',
+  ],
 ]
 
 /**
@@ -151,14 +225,88 @@ describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
     },
   )
 
-  it.each(backwardCompatAliases)(
-    'preserves backward-compat alias %s → %s',
-    (legacy, canonical) => {
-      expect(declarationMap.get(legacy.toLowerCase())).toBe(
-        collapse(canonical).trim(),
-      )
+  it.each(legacyAliasValues)(
+    'freezes legacy alias %s at its 0.3.1 value %s',
+    (legacy, hex) => {
+      expect(declarationMap.get(legacy.toLowerCase())).toBe(hex.toLowerCase())
     },
   )
+
+  /**
+   * The table above is a LIST, so a seventh declaration added to the alias
+   * block with no entry in it would pass in silence — the class of defect
+   * `scripts/check-landing-tokens.sh` had to leave a list to catch, and that
+   * this file already names about its own denylist ("green on a *new* purple
+   * written in good faith"). So the rule here is on the SHAPE of the block,
+   * not on a set of values, and it is asserted both ways: an undeclared
+   * declaration fails, and an entry describing no declaration fails too —
+   * which is what makes the table expire with the block it describes.
+   */
+  it('declares no alias outside the table, and no table entry outside the block', () => {
+    const declared = aliasBlockDeclarations().map(([name]) => name)
+    const tabled = legacyAliasValues.map(([name]) => name.toLowerCase())
+
+    expect([...declared].sort()).toEqual([...tabled].sort())
+  })
+
+  it.each(legacyAliasValues)(
+    'writes %s as a literal, never as a var() onto §2',
+    (legacy) => {
+      // The `var()` form IS the regression mechanism (mika#2913 § 4.1): it
+      // renders identically the day it is written and recolours a consumer the
+      // next time §2 moves. Asserted on the raw block rather than on the value
+      // alone so the failure names the shape, not just the hex.
+      const value = aliasBlockDeclarations().find(([name]) => name === legacy.toLowerCase())?.[1]
+      expect(value).toBeDefined()
+      expect(value).not.toContain('var(')
+      expect(value).toMatch(/^#[0-9a-f]{3,8}$/)
+    },
+  )
+
+  /**
+   * Anti-stale, both tables. An entry stops being an assertion the day its
+   * premise dissolves, and a guard that keeps passing on a dissolved premise
+   * is worse than no guard: it reads as conformity.
+   *
+   *   - a banned hex that became a canonical token's value is no longer a ban,
+   *     it is a guard that would fail against the rulebook;
+   *   - a legacy alias value that coincides with its canonical counterpart's
+   *     value proves nothing — the alias would be tautological.
+   *
+   * Either way the crossing fails THIS entry and forces its removal.
+   */
+  it.each(bannedLegacyHexValues)(
+    'banned hex %s is not the value of a canonical token (anti-stale)',
+    (hex) => {
+      expect(canonicalTokens.map(([, h]) => h.toLowerCase())).not.toContain(hex.toLowerCase())
+    },
+  )
+
+  it.each(legacyAliasValues.filter(([name]) => name !== '--color-accent-light'))(
+    'legacy value of %s differs from its canonical counterpart (anti-tautology)',
+    (_legacy, hex, counterpart) => {
+      // `--color-accent-light` is excluded by name and by measurement: #9d8fff
+      // IS `--color-secondary`'s value, which is why mika#2913 § 2.3 calls the
+      // sixth alias a no-op. Excluding it here is what lets the other five
+      // carry a real assertion instead of a weakened one.
+      expect(declarationMap.get(counterpart)).not.toBe(hex.toLowerCase())
+    },
+  )
+
+  /**
+   * D5 — the in-repo surfaces take canon back locally. Without this, losing
+   * either block de-canonises a surface on hundreds of utilities that no
+   * review re-reads, which is this very ticket's defect pointed the other way.
+   */
+  it.each(inRepoRealiasConsumers)('%s re-aliases all six legacy names onto §2', (_label, relPath) => {
+    // `readFileSync` relative to `import.meta.url`, like THEME_CSS_RAW above: a
+    // move breaks the test rather than making it vacuous.
+    const css = collapse(readFileSync(join(HERE, relPath), 'utf8'))
+
+    for (const [legacy, , counterpart] of legacyAliasValues) {
+      expect(css).toContain(`${legacy}: var(${counterpart});`)
+    }
+  })
 
   it.each(bannedLegacyHexValues)(
     'does not reintroduce legacy hex %s (%s)',

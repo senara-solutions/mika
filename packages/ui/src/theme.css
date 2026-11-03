@@ -52,17 +52,28 @@
   --color-warning: #f59e0b;
   --color-blocked: #f97316;
 
-  /* Backward-compat aliases (legacy names → canonical values).
-     Ensures any consumer missed by the packages/ui + dashboard grep sweep
-     continues to render (with the new canonical color — the intended fix).
-     Remove once a cross-repo grep sweep (cloud-console, landing-page) confirms
-     zero legacy references. Tracked in plan § Out of scope. */
-  --color-bg: var(--color-background);
-  --color-bg-card: var(--color-surface-container);
-  --color-accent: var(--color-primary);
-  --color-accent-light: var(--color-secondary);
-  --color-heading: var(--color-on-surface);
-  --color-muted: var(--color-on-surface-variant);
+  /* Legacy aliases — the names below are frozen at their 0.3.1 VALUES, not just
+     their spelling. Until 0.5.0 they were `var(--color-*)` onto §2, which
+     recoloured a whole consumer on a minor bump (mika-cloud#287, 862 usages,
+     every page — not only the ones it touched). Vincent called that a
+     regression on 2026-10-26; mika#2913 restores the values.
+
+     Written as LITERAL hex, never as `var(--color-*)`: a `var()` onto a
+     canonical token is precisely the mechanism the regression arrived by, and
+     it would replay it at the next §2 move. Pinned both ways by
+     `theme.test.ts § legacyAliasValues` — a seventh declaration in this block,
+     or a `var(` in it, fails the suite.
+
+     This repo's own surfaces want canon and re-alias these six names locally
+     (`dashboard/src/index.css`, `site/src/index.css`), asserted by the same
+     test. `--color-error` and `--color-surface-container-high` are NOT here:
+     they are canonical §2 names, not aliases, and keep their §2 values. */
+  --color-bg: #0d0f12;
+  --color-bg-card: #151820;
+  --color-accent: #7c6af7;
+  --color-accent-light: #9d8fff;  /* no-op: identical to var(--color-secondary) */
+  --color-heading: #e8ecf2;
+  --color-muted: #a0a8b8;
 
   /* Roundedness scale per luminescent-core §6: "All interactive elements adhere
      to the `xl` (1.5rem) or `lg` (1rem) scale."
