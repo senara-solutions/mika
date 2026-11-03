@@ -4703,7 +4703,7 @@ mod tests {
     }
 
     /// Le `match` sur [`crate::skills::executor::GroomVerdictState`] n'a **aucun
-    /// bras joker** — motif `GroomedState` (mika#2484 D1). Un quatrième état
+    /// bras joker** — motif `GroomedState` (mika#2484 D1). Un cinquième état
     /// devra être décidé par le compilateur, jamais absorbé par un `_ =>` qui le
     /// ferait tomber du côté « laisser passer » en silence.
     ///
@@ -4720,6 +4720,14 @@ mod tests {
 
         // La plage du `match`, bornée sur la ligne qui le porte — composée à
         // l'exécution pour la même raison que le needle ci-dessus.
+        //
+        // 45 lignes, soit la hauteur du `match` depuis que mika#3027 y a ajouté
+        // le bras `AnchorWithheld` et les deux paragraphes qui le justifient. La
+        // fenêtre ne doit **pas** être élargie à l'aveugle : plus large que le
+        // `match`, elle lirait le code d'après et un `_ =>` étranger passerait
+        // pour un joker. C'est l'assertion de bonne foi juste en dessous qui dit
+        // quand la rehausser — elle rougit, en nommant le bras qui est tombé
+        // hors plage, dès que le `match` grandit.
         let opener = format!("let refusal = match {}", "verdict {");
         let start = content.find(opener.as_str()).unwrap_or_else(|| {
             panic!(
@@ -4729,15 +4737,16 @@ mod tests {
         });
         let body: String = content[start..]
             .lines()
-            .take(30)
+            .take(45)
             .collect::<Vec<_>>()
             .join("\n");
 
         assert!(
             body.contains("GroomVerdictState::NotEscalated")
+                && body.contains("GroomVerdictState::AnchorWithheld")
                 && body.contains("GroomVerdictState::Escalated")
                 && body.contains("GroomVerdictState::Unreadable"),
-            "bonne foi : la plage extraite doit bien porter les trois bras — {body}"
+            "bonne foi : la plage extraite doit bien porter les quatre bras — {body}"
         );
         for wildcard in ["_ =>", "_=>"] {
             assert!(
