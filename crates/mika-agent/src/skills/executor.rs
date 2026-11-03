@@ -2743,6 +2743,33 @@ pub(crate) const GROOM_ANCHOR_BRAKE_DEFAULT: usize = 3;
 /// `result` d'un callback quand l'ESCALATE vient du moteur, pas de l'architecte.
 const GROOM_ENGINE_REASON_PREFIX: &str = "Engine reason: ";
 
+/// Ce `result` porte-t-il une retenue d'ancrage écrite par le MOTEUR ?
+/// (mika#3027)
+///
+/// **Site unique** de lecture de [`GROOM_ENGINE_REASON_PREFIX`], épinglé par
+/// `canonical_tokens::mika3027_la_retenue_dancrage_a_un_seul_lecteur`. Deux
+/// orthographes de ce prédicat, c'est le frein mika#2786 et la porte mika#2545
+/// qui comptent deux populations différentes sous un seul nom.
+///
+/// Deux termes, et chacun est une décision :
+///
+/// - **`strip_prefix` sur une LIGNE**, jamais un `contains` sur le texte : la
+///   prose d'un pilote cite ce préfixe en parlant du mécanisme — le faux positif
+///   mesuré sur le Signal S (mika#2050) et sur les 651 détections d'`instr`
+///   (mika#2105). `_escalate_groom` écrit la vraie ligne en tête de ligne.
+/// - **La forme fixe est lue chez son propriétaire.** Le reste de la ligne est
+///   passé à [`crate::arch_disposition::is_engine_escalation_line`], la
+///   transcription Rust de `dispatch-lib.sh::_engine_escalation_line` qui sert
+///   déjà le tier 0b. Une prose qui écrit `Engine reason: quelque chose` sans la
+///   numérotation `F<n>:`, `(BLOCKING)`, `[mika-engine]` et `review-anchor:` ne
+///   passe pas.
+pub(crate) fn carries_engine_anchor_withholding(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.strip_prefix(GROOM_ENGINE_REASON_PREFIX)
+            .is_some_and(crate::arch_disposition::is_engine_escalation_line)
+    })
+}
+
 /// Parse pur du seuil du frein (mika#2786). Absent ou vide → défaut ;
 /// illisible → défaut avec un WARN ; `0` → désarmé.
 pub(crate) fn parse_groom_anchor_brake_max(raw: Option<&str>) -> usize {
@@ -2768,8 +2795,9 @@ pub(crate) fn parse_groom_anchor_brake_max(raw: Option<&str>) -> usize {
 ///
 /// Trois sortes de lignes, et la troisième est celle qui compte :
 ///
-/// - **une retenue** : une ligne qui commence par `Engine reason: ` et porte
-///   [`crate::agent_loop::REVIEW_ANCHOR_WITHHELD_MARKER`]. Elle allonge la série ;
+/// - **une retenue** : ce que [`carries_engine_anchor_withholding`] reconnaît —
+///   une ligne qui commence par `Engine reason: ` et dont le reste porte la forme
+///   fixe de l'escalade du moteur. Elle allonge la série ;
 /// - **un autre verdict** : une ligne qui commence par `Outcome: ` sans
 ///   retenue — un `PLAN_GROOMED`, un ESCALATE d'architecte, un
 ///   `PIPELINE_INCOMPLETE`. Elle arrête le compte ;
@@ -2787,10 +2815,7 @@ pub(crate) fn anchor_withheld_streak(results: &[Option<String>]) -> usize {
     let mut streak = 0;
     for result in results {
         let Some(text) = result else { continue };
-        let withheld = text.lines().any(|line| {
-            line.starts_with(GROOM_ENGINE_REASON_PREFIX)
-                && line.contains(crate::agent_loop::REVIEW_ANCHOR_WITHHELD_MARKER)
-        });
+        let withheld = carries_engine_anchor_withholding(text);
         if withheld {
             streak += 1;
         } else if text.lines().any(|line| line.starts_with("Outcome: ")) {
@@ -14489,6 +14514,33 @@ Harness ticket.
             let prose = "The guard writes `Engine reason: F1: (BLOCKING) [mika-engine] review-anchor:` \
                          on a withheld pass.\nOutcome: PLAN_GROOMED";
             assert_eq!(anchor_withheld_streak(&[r(prose)]), 0);
+        }
+
+        /// **Le rétrécissement assumé de mika#3027, dit plutôt que laissé
+        /// implicite.** Le prédicat de la série lit désormais la forme fixe chez
+        /// son propriétaire (`arch_disposition::is_engine_escalation_line`), donc
+        /// il exige la numérotation `F<n>:` que l'ancien `contains` du fragment
+        /// n'exigeait pas. Ce n'est pas un élargissement : c'est un rétrécissement
+        /// strict vers la forme que l'écrivain produit réellement —
+        /// `_escalate_groom` interpole la sortie de `_engine_escalation_line`, qui
+        /// *est* la ligne `F<n>:` complète. Le témoin positif est [`WITHHELD`],
+        /// relevé sur mika#2762 et compté par tous les tests voisins.
+        #[test]
+        fn mika3027_une_ligne_sans_numerotation_nest_plus_une_retenue() {
+            let sans_fn = "claude-pilot completed (status: success).\n\
+                 Engine reason: (BLOCKING) [mika-engine] review-anchor: attestation withheld.\n\
+                 Outcome: ESCALATE — first-pass";
+            assert_eq!(
+                anchor_withheld_streak(&[r(sans_fn)]),
+                0,
+                "sans la numérotation `F<n>:`, la ligne n'est pas celle que \
+                 l'écrivain produit — la série ne la compte plus"
+            );
+            assert_eq!(
+                anchor_withheld_streak(&[r(WITHHELD)]),
+                1,
+                "contrôle de bonne foi : la forme complète reste une retenue"
+            );
         }
 
         #[test]
