@@ -195,12 +195,22 @@ fn at_line_start(text: &str, marker: &str) -> bool {
     text.lines().any(|line| line.starts_with(marker))
 }
 
+/// Cette ligne est-elle une ligne d'escalade du moteur ? (mika#2338)
+///
+/// Le prédicat de [`engine_escalation_line`], exposé au module voisin pour
+/// mika#3027 : la porte mika#2545 doit distinguer une retenue du moteur d'un
+/// ESCALATE d'architecte, et la forme de référence est **celle-ci**, pas une
+/// seconde transcription du `grep -m1 -E` du bash. Interrogation ligne à ligne,
+/// pour la raison écrite sur [`ENGINE_ESCALATION_ANCHOR`].
+pub(crate) fn is_engine_escalation_line(line: &str) -> bool {
+    ENGINE_ESCALATION_ANCHOR.is_match(line)
+}
+
 /// La première ligne d'escalade du moteur, s'il y en a une.
 ///
 /// `grep -m1 -E '^…'` : la première ligne qui matche, et rien de plus.
 fn engine_escalation_line(text: &str) -> Option<&str> {
-    text.lines()
-        .find(|line| ENGINE_ESCALATION_ANCHOR.is_match(line))
+    text.lines().find(|line| is_engine_escalation_line(line))
 }
 
 /// Le premier jeton qui suit `label` dans le texte, à la manière du bash.
