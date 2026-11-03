@@ -547,7 +547,7 @@ pub(crate) async fn process_tool_calls(
             }
 
             // mika#3003 — LE site unique qui alimente le registre de lecture du
-            // tour, tenu par `agent_loop::tests::mika3003_le_registre_de_lecture_a_un_seul_ecrivain`.
+            // tour, tenu par `mika3003_le_registre_de_lecture_a_un_seul_ecrivain`.
             // Ici et pas plus haut : les deux autres `tool_results.push` de cette
             // fonction portent un texte écrit par le moteur (suppression de
             // frontière #771, refus de preuve mika#2934), pas un document qu'un

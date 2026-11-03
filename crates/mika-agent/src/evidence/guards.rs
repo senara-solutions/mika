@@ -6491,7 +6491,7 @@ mod tests {
     // | ii | `i won't send` dupliquée dans la moitié accomplie | **rouge** sur la table : la première branche de l'union gagne, donc l'alternative dupliquée rend `AccomplishedState` — et sur le compte (5 au lieu de 4) |
     // | iii | `je vais …` supprimée sans être replacée | **rouge** sur trois des dix tests de mika#2358. C'est le contrôle d'AC2 : retirer une alternative d'une moitié la retire **de la détection**, donc la détection n'a pas d'autre source que l'union |
     // | iv | `caps.name("accompli")` → `caps.name("engagement")` | **rouge** sur la table, dès sa première ligne — les douze natures s'inversent en bloc, le test s'arrête à la première |
-    // | v | `assertion_nature` retiré du `warn!` du résidu | **rouge** sur `agent_loop::tests::mika2879_les_deux_sites_5e_emettent_la_nature`, qui nomme lequel des deux sites est nu. Voir ci-dessous : ce n'est pas la forme que le plan prévoyait |
+    // | v | `assertion_nature` retiré du `warn!` du résidu | **rouge** sur `mika2879_les_deux_sites_5e_emettent_la_nature`, qui nomme lequel des deux sites est nu. Voir ci-dessous : ce n'est pas la forme que le plan prévoyait |
     // | vi | un second `Regex::new(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE)` hors union | **rouge** sur le scan d'union, avec le chemin et la ligne. Livré aussi comme test sur source injectée, pas seulement joué |
     //
     // ## La recette (v) : ce qui a été livré, et pourquoi pas ce qui était prévu

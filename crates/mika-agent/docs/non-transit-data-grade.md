@@ -578,7 +578,7 @@ it still does NOT cover:
     still one source of truth. The branch sits **before** `NonServi` on purpose:
     a testimony tool is never served (L2 removed it), so the branch placed after
     would be unreachable forever with every test green. Tests:
-    `agent_loop::tests::mika2814_*` (seven unit cases on the pure decision + one
+    `mika2814_*` under `agent_loop::tests` (seven unit cases on the pure decision + one
     end-to-end through the filter).
   - MCP publication filter (Layer 2): `crates/mika-agent/src/mcp/mod.rs` §
     `retain_publiables`, called by `McpManager::connect_all` (mika#2814). It

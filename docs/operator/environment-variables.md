@@ -3597,7 +3597,7 @@ Portage de contexte entre passes architecte : la question est tranchée (mika#23
   **contrôle négatif** sans le bloc, l'événement rend `agent` / `2` et l'autre ticket
   est présent. Ce second test est porteur : il distingue « le filtre filtre » de
   « le champ est une constante » et de « la requête est cassée ». Structurel :
-  `agent_loop::tests::mika2305_the_scope_has_a_single_decisional_reader` (un seul
+  `mika2305_the_scope_has_a_single_decisional_reader` (un seul
   lecteur décisionnel de `HistoryScope` hors désérialisation) avec son contrôle de
   bonne foi, et `…_the_label_match_has_no_wildcard_arm`. Côté shell, le contrat de
   session de `_arch_ask` / `_iterate_groom_loop` est épinglé dans

@@ -156,7 +156,7 @@ d'une valeur.** Il faut une valeur **posée**, et c'est `response_chars`.
 - **`response_text` et `reasoning` sur la ligne de continuation** — secondaire,
   gaté, pour **lire** une occurrence quand le compte en signale une
   (investigation 2 du ticket). Jamais la source du verdict.
-- **Une garde structurelle** : `agent_loop::tests::mika1910_every_unmeasured_site_declares_itself`
+- **Une garde structurelle** : `mika1910_every_unmeasured_site_declares_itself`
   refuse un `None` nu à la position `response_chars`, et son voisin
   `…_the_inventory_of_emission_sites_is_closed` fige l'inventaire à **trois**
   sites. Retirer la mesure ne casse **aucune assertion** — la boucle continue de
