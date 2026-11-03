@@ -9819,6 +9819,18 @@ _disposition_was_fuzzy() {
     [ -f "$_DISPOSITION_FUZZY_FILE" ] && [ "$(cat "$_DISPOSITION_FUZZY_FILE" 2>/dev/null)" = "1" ]
 }
 
+_arch_disposition_refused() {
+    # Vrai si le DERNIER appel à `_parse_disposition` / `_parse_verdict` a refusé
+    # de regarder la réponse (mika#2996). Jumeau de `_disposition_was_fuzzy` :
+    # même canal, même raison de sous-shell.
+    #
+    # `-s` et non `-f` : un fichier vide n'est pas un refus. Les deux enveloppes
+    # le vident en tête, donc l'absence ET le vide disent « cet appel n'a pas
+    # refusé » — mika#2331, absent n'est pas zéro, et ici les deux lectures
+    # doivent coïncider parce que le canal a deux états d'effacement.
+    [ -s "${_ARCH_DISPOSITION_REFUSAL_FILE:-}" ]
+}
+
 # _engine_escalation_line — Tier 0b recognizer (mika#2338).
 #
 # Since mika#2338 the engine no longer withholds an unattested disposition into
@@ -9898,6 +9910,12 @@ _parse_disposition() {
     # tier 2, "0" sinon — le `printf '0'` de tête reste, car un résidu du tour
     # précédent ferait mentir `_disposition_was_fuzzy` sur une réponse franche.
     printf '0' > "$_DISPOSITION_FUZZY_FILE"
+    # Un refus est par APPEL, pas par processus (mika#2996). Sans cette remise à
+    # zéro, `_arch_disposition_refused` dirait « cet appel a refusé » sur la foi
+    # du précédent, et le garde des trois sites arrêterait le groom sur un refus
+    # déjà traité. Le `rm` est en tête, AVANT le `mktemp`, pour que les deux
+    # chemins de refus de l'enveloppe le trouvent vide.
+    rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null || true
     local tmp out token tier rc=0
     tmp=$(mktemp "${TMPDIR:-/tmp}/mika-arch-dispo.XXXXXX") || {
         _arch_disposition_refuse "response_file_unwritable: mktemp a échoué (_parse_disposition)"
@@ -9941,6 +9959,8 @@ _parse_verdict() {
     # troisième passe (§ 4.5 / R11) — est portée par le moteur, qui la tient par
     # type plutôt que par l'absence d'un `case`.
     printf '0' > "$_DISPOSITION_FUZZY_FILE"
+    # Remise à zéro par appel — même raison qu'au-dessus (mika#2996).
+    rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null || true
     local tmp out token tier rc=0
     tmp=$(mktemp "${TMPDIR:-/tmp}/mika-arch-dispo.XXXXXX") || {
         _arch_disposition_refuse "response_file_unwritable: mktemp a échoué (_parse_verdict)"
@@ -10587,6 +10607,22 @@ GROOM_HALT_CAUSE_VERDICT="verdict"
 # populations sous un même mot.
 GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE="architect_unreadable"
 
+# Le lecteur de disposition du MOTEUR a refusé de regarder la réponse : code
+# `≥2` de `mika arch-disposition`, ou `mktemp`/écriture en échec dans
+# l'enveloppe (mika#2996). Ce n'est ni un verdict, ni une absence de verdict de
+# l'architecte : sa réponse n'a pas été lue.
+#
+# Le nom ne porte PAS `architect_`, et c'est la raison d'être de la constante :
+# `try_report_groom_architect_unreadable` (`task_engine/dispatcher.rs`) compte la
+# population « l'architecte n'a pas rendu de verdict », et un refus local qui y
+# entrerait est la classe mika#1772 exactement.
+#
+# Elle n'a PAS de lecteur Rust dans cette tranche : le refus reste lisible dans
+# `tasks.result` par la ligne `Groom-halt-cause:` et par l'annexe
+# `REFUSED (arch-disposition, mika#2194) <motif>` que `_deliver_callback` y
+# appose. Un lecteur viendra si la cause apparaît en production.
+GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED="disposition_reader_refused"
+
 _escalate_groom() {
     # Phase D escalation helper (mika#1271) — fail loudly per mika#1033 precedent
     # when the architect returns ESCALATE (first-pass or second-pass). Writes the
@@ -10642,7 +10678,9 @@ _escalate_groom() {
     #   $2: architect content (the escalation rationale text)
     #   $3: architect session_id (for callback observability + log correlation)
     #   $4: cause — "$GROOM_HALT_CAUSE_VERDICT" (défaut) |
-    #       "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE". Les CINQ sites d'appel la
+    #       "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE" |
+    #       "$GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED" (mika#2996, passée par
+    #       `_halt_groom_on_reader_refusal`). Les SIX sites d'appel la
     #       passent explicitement ; le défaut existe pour qu'un appelant inconnu
     #       reproduise le comportement d'hier, et le scan de cardinalité
     #       (`test-dispatch-lib.sh`, S-c) refuse qu'un site l'omette — un appel
@@ -10677,6 +10715,31 @@ Architect findings preserved at: ${findings_file}"
             RESULT="${RESULT}
 GROOM ESCALATED (terminal): mika-arch answered at ${stage} without a parsable verdict line.
 ${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE} ${stage} — no READY/ITERATE/GROOMED/ESCALATE line in two attempts (initial + corrective retry). This is an absence of signal, NOT an objection to the plan.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+            ;;
+        "$GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED")
+            echo "iterate_groom_loop: ${GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED} at ${stage} — the engine's disposition reader refused the response; no architect retry (mika#2996; findings at ${findings_file})" >&2
+            # AUCUNE ligne `Verdict:` : il n'y a pas de verdict, et la réponse de
+            # l'architecte n'a même pas été lue.
+            #
+            # La prose nomme le MOTEUR. Elle ne dit pas « the architect never
+            # emitted », parce que c'est faux ici — et c'est la seule phrase que
+            # l'opérateur verra dans `tasks.result` (PR#2028).
+            #
+            # Deux champs positionnels — la cause puis l'étape — comme le bras
+            # ci-dessus : un seul format de fil (D4).
+            #
+            # La prose RENVOIE à l'annexe sans en RECOPIER le marqueur, et c'est
+            # une condition de justesse, pas un choix de style :
+            # `_annex_arch_disposition_refusal` est idempotente par un `grep -qF`
+            # du marqueur dans `RESULT`, donc une citation littérale ici ferait
+            # croire à l'annexe qu'elle a déjà posé le motif, et l'opérateur
+            # lirait un renvoi vers un paragraphe absent. Mesuré par la sonde de
+            # cette tranche, sur les trois sites.
+            RESULT="${RESULT}
+GROOM ESCALATED (terminal): the engine's disposition reader refused the architect's response at ${stage}.
+${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED} ${stage} — \`mika arch-disposition\` could not read the response (exit ≥2, or a local mktemp/write failure). The architect was NOT asked again: this is a local refusal, not a missing verdict line. The engine's own motive is annexed to this result below, under the arch-disposition refusal marker of mika#2194.
 Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
             ;;
@@ -10715,6 +10778,39 @@ Engine reason: ${engine_line}"
     fi
 
     _set_outcome_line "Outcome: ESCALATE — ${stage}"
+}
+
+_halt_groom_on_reader_refusal() {
+    # Arrête le groom sur un refus du lecteur de disposition (mika#2996), SANS
+    # relance : la relance de mika#1823 / mika#2641 est un remède de format
+    # adressé à l'architecte, et ici sa réponse n'a pas été lue.
+    #
+    # UNE fonction pour TROIS sites, et ce n'est pas qu'une économie de lignes :
+    # trois escalades recopiées divergeraient (mika#2158), et le scan de
+    # cardinalité de `declare -f _iterate_groom_loop` compte les appels à
+    # `_escalate_groom` VISIBLES dans ce corps — un corps séparé ne s'y voit pas,
+    # donc l'attente de 5 du scan de mika#2641 reste vraie telle quelle.
+    #
+    # Appelée aux TROIS sites de lecture, entre la capture et `_trail_append` :
+    # avant, pour qu'aucune ligne `UNPARSED` ne soit écrite au trail pour un
+    # refus (AC-R4).
+    #
+    # Args: $1 = stage ("first-pass" | "second-pass-after-ready" |
+    #       "second-pass-after-iterate"), $2 = libellé de trail
+    #       ("groom-ticket" | "second-review"), $3 = réponse de l'architecte,
+    #       $4 = session_id.
+    #
+    # Rend TOUJOURS 0, comme les deux enveloppes et pour la même raison : les
+    # sites l'appellent en position d'instruction sous `set -e` vivant. C'est le
+    # `return 1` du SITE qui sort de la boucle — voir le commentaire du site.
+    local stage="$1" trail_skill="$2" content="$3" session_id="$4"
+    # Jeton distinct, et NU : ni `(fuzzy)` — le canal fuzzy vaut `0` sur un
+    # refus —, ni `-after-retry`, puisqu'il n'y a jamais de relance après lui.
+    # Il ne matche donc pas le filtre de la sonde AC4, qui lit
+    # `READY-after-retry` et `GROOMED-after-retry`.
+    _trail_append "$trail_skill" "$session_id" "REFUSED-reader"
+    _escalate_groom "$stage" "$content" "$session_id" "$GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED"
+    return 0
 }
 
 _write_canonical_callout() {
@@ -11169,6 +11265,20 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
             return 1
         }
         disposition=$(printf '%s' "$content1" | _parse_disposition)
+        # mika#2996 — un refus du lecteur n'est pas un UNPARSED. Lu ICI, entre la
+        # capture et le trail : plus bas, la ligne `UNPARSED` serait déjà écrite.
+        #
+        # Le `_groom_warn` est au SITE et non dans le garde, et c'est une
+        # contrainte structurelle : `_reason_pairing_check` exige que chaque
+        # `return 1` de ce corps ait son écrivain de motif dans sa fenêtre de
+        # trois lignes. Le `return 1` est au site pour la même raison qu'ailleurs
+        # dans cette boucle — c'est lui qui sort, le garde rend toujours 0.
+        if _arch_disposition_refused; then
+            _groom_warn "the engine's disposition reader refused the first-pass response (mika#2996) — \
+no architect retry; the architect was not asked again"
+            _halt_groom_on_reader_refusal "first-pass" "groom-ticket" "$content1" "$session_id"
+            return 1
+        fi
         local _trail_suffix=""
         _disposition_was_fuzzy && _trail_suffix=" (fuzzy)"
         local _attempt_marker=""
@@ -11262,6 +11372,15 @@ ${content2}"
                     forensic2="$content2"
                 fi
                 verdict=$(printf '%s' "$content2" | _parse_verdict)
+                # mika#2996 — même garde qu'en première passe, et le `$forensic2`
+                # plutôt que `$content2` : le fichier de constats garde les deux
+                # tentatives quand il y en a eu deux.
+                if _arch_disposition_refused; then
+                    _groom_warn "the engine's disposition reader refused the second-pass response after a READY first pass (mika#2996) — \
+no architect retry; the architect was not asked again"
+                    _halt_groom_on_reader_refusal "second-pass-after-ready" "second-review" "$forensic2" "$session_id"
+                    return 1
+                fi
                 local _trail_suffix_v=""
                 _disposition_was_fuzzy && _trail_suffix_v=" (fuzzy)"
                 local _attempt_marker_v=""
@@ -11406,6 +11525,15 @@ ${content2_iter}"
                     forensic2i="$content2_iter"
                 fi
                 verdict_iter=$(printf '%s' "$content2_iter" | _parse_verdict)
+                # mika#2996 — voir le site after-ready. Deux `for` distincts,
+                # donc un seul gardé se lirait exactement comme deux : la sonde
+                # épingle ce site séparément pour cette raison.
+                if _arch_disposition_refused; then
+                    _groom_warn "the engine's disposition reader refused the second-pass response after an ITERATE revise (mika#2996) — \
+no architect retry; the architect was not asked again"
+                    _halt_groom_on_reader_refusal "second-pass-after-iterate" "second-review" "$forensic2i" "$session_id"
+                    return 1
+                fi
                 local _trail_suffix_vi=""
                 _disposition_was_fuzzy && _trail_suffix_vi=" (fuzzy)"
                 local _attempt_marker_vi=""
