@@ -1175,6 +1175,20 @@ pub enum PromotionGate {
     Decline(DeclineReason),
 }
 
+impl PromotionGate {
+    /// Ce passage a-t-il le droit de réécrire le corps du ticket ?
+    ///
+    /// `Refuse` garde `true` : le comportement d'avant mika#3036, à l'identique.
+    /// Seul `Decline` dit non, et il le dit parce qu'un passage qui s'abstient
+    /// ne doit laisser aucune trace d'écriture (AC3).
+    pub fn authorizes_body_rewrite(&self) -> bool {
+        match self {
+            Self::Promote { .. } | Self::Refuse(_) => true,
+            Self::Decline(_) => false,
+        }
+    }
+}
+
 /// Extract the branch name from a ticket's grooming callout (mika#2123 U1).
 ///
 /// Mirrors [`extract_plan_path`], including its anchoring: the callout is
@@ -3925,6 +3939,81 @@ async fn stale_callout_cause(
     }
 }
 
+/// Réécrit le callout du ticket si la mesure vient de le dire périmé — et
+/// seulement si la décision autorise une écriture (mika#3036 AC3).
+///
+/// mika#2839, étendu par mika#3001 — la mesure vient peut-être de dire que le
+/// merge d'une PR a périmé le callout de ce ticket : le callout est périmé, le
+/// plan ne l'est pas. On le réécrit ici, et seulement ici, parce que c'est le
+/// seul endroit où cette réponse est déjà payée. Le discriminant de la *cause*
+/// vit tout entier dans [`stale_callout_cause`], qui lit la mesure et ne sonde
+/// la forge que sur la seule population candidate. L'écriture ne peut pas
+/// coûter le verdict que mika#2837 vient de rendre — voir
+/// [`rewrite_stale_callout`].
+///
+/// Extraite de [`promotion_gate_allows`] par mika#3036, dont elle hérite les
+/// neuf paramètres : un déclin ne doit laisser **aucune** trace d'écriture, et
+/// le garde-fou se lit mieux au seuil d'une fonction nommée qu'au milieu de la
+/// porte.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_rewrite_stale_callout(
+    db: &AsyncDatabase,
+    github_token: &str,
+    label_auth: &LabelWriteToken,
+    issue: &Issue,
+    measurement: &StalenessMeasurement,
+    decision: &PromotionGate,
+    phase: ExclusionPhase,
+    trace_id: &str,
+    session_id: &str,
+) {
+    if !decision.authorizes_body_rewrite() {
+        return;
+    }
+
+    // `plan_callout` et non [`extract_plan_path`] : c'est `normalized` qu'il faut
+    // ici — la forme sans préfixe de dépôt, celle des `filename` du `compare` et
+    // des `files[].path` d'une PR — et `extract_plan_path` jette ce champ.
+    let callout_plan =
+        crate::plan_callout::plan_callout(&issue.body, crate::plan_callout::FenceHandling::Strip);
+    let branch = extract_branch_name(&issue.body);
+    if let (Some(b), Some(callout)) = (branch.as_deref(), &callout_plan)
+        && let Some(cause) = stale_callout_cause(
+            github_token,
+            issue.number,
+            measurement,
+            b,
+            &callout.normalized,
+        )
+        .await
+    {
+        let rewrite = rewrite_stale_callout(
+            db,
+            github_token,
+            label_auth,
+            issue.number,
+            &issue.body,
+            b,
+            cause,
+            phase.gate_phase(),
+            trace_id,
+            session_id,
+        )
+        .await;
+        if let Err(e) = rewrite {
+            // Inatteignable par construction : la fonction nomme ses écarts par
+            // leur `cause` et rend toujours `Ok(())`. La branche existe pour que
+            // le verdict reste hors de portée si un futur éditeur lui donnait
+            // une erreur à remonter.
+            warn!(
+                error = %e,
+                issue = issue.number,
+                "auto_pull: la réécriture du callout a remonté une erreur"
+            );
+        }
+    }
+}
+
 /// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
 /// promoted; on `false` the ticket has already been handed to the operator.
 ///
@@ -3998,55 +4087,18 @@ async fn promotion_gate_allows(
         warn!(error = %e, issue = issue.number, "auto_pull: failed to write staleness audit event");
     }
 
-    // mika#2839, étendu par mika#3001 — la mesure vient peut-être de dire que le
-    // merge d'une PR a périmé le callout de ce ticket : le callout est périmé, le
-    // plan ne l'est pas. On le réécrit ici, et seulement ici, parce que c'est le
-    // seul endroit où cette réponse est déjà payée. L'appel est désormais
-    // **inconditionnel** — le discriminant vit tout entier dans
-    // [`stale_callout_cause`], qui lit la mesure et ne sonde la forge que sur la
-    // seule population candidate. L'écriture ne peut pas coûter le verdict que
-    // mika#2837 vient de rendre — voir [`rewrite_stale_callout`].
-    //
-    // `plan_callout` et non [`extract_plan_path`] : c'est `normalized` qu'il faut
-    // ici — la forme sans préfixe de dépôt, celle des `filename` du `compare` et
-    // des `files[].path` d'une PR — et `extract_plan_path` jette ce champ.
-    let callout_plan =
-        crate::plan_callout::plan_callout(&issue.body, crate::plan_callout::FenceHandling::Strip);
-    if let (Some(b), Some(callout)) = (branch.as_deref(), &callout_plan)
-        && let Some(cause) = stale_callout_cause(
-            github_token,
-            issue.number,
-            &measurement,
-            b,
-            &callout.normalized,
-        )
-        .await
-    {
-        let rewrite = rewrite_stale_callout(
-            db,
-            github_token,
-            label_auth,
-            issue.number,
-            &issue.body,
-            b,
-            cause,
-            phase.gate_phase(),
-            trace_id,
-            session_id,
-        )
-        .await;
-        if let Err(e) = rewrite {
-            // Inatteignable par construction : la fonction nomme ses écarts par
-            // leur `cause` et rend toujours `Ok(())`. La branche existe pour que
-            // le verdict reste hors de portée si un futur éditeur lui donnait
-            // une erreur à remonter.
-            warn!(
-                error = %e,
-                issue = issue.number,
-                "auto_pull: la réécriture du callout a remonté une erreur"
-            );
-        }
-    }
+    maybe_rewrite_stale_callout(
+        db,
+        github_token,
+        label_auth,
+        issue,
+        &measurement,
+        &decision,
+        phase,
+        trace_id,
+        session_id,
+    )
+    .await;
 
     match decision {
         PromotionGate::Promote { detail } => {
@@ -12844,6 +12896,106 @@ Un ticket à plusieurs vols.
     /// La branche du ticket #3030, celle que la PR #3032 a mergée puis
     /// supprimée : la mesure du § 1.1 du plan, rejouée.
     const BRANCH_3030: &str = "fix/3030/lallowlist-du-worktree-est-construite";
+
+    /// **AC3 — un déclin ne réécrit pas le corps, et le témoin dit que quelque
+    /// chose a tourné.**
+    ///
+    /// Les deux passages partagent tout — même mesure, même corps, même réponse
+    /// cannée disponible — et ne diffèrent que par la décision. Le témoin est ce
+    /// qui distingue « il n'a rien écrit » de « rien n'a tourné » : sans lui, un
+    /// câblage mort se lirait comme une abstention (mika#2340).
+    ///
+    /// La réponse de `gh issue view` est cannée **des deux côtés**. Le déclin
+    /// avait donc l'écriture à portée et ne l'a pas prise ; prouver l'abstention
+    /// par l'absence d'une réponse cannée aurait prouvé l'absence de la réponse.
+    #[tokio::test]
+    async fn mika3036_un_declin_ne_touche_pas_le_corps_du_ticket() {
+        let db = in_memory_db();
+        let measurement = StalenessMeasurement::BranchDeletedByMerge {
+            pr: DEAD_CALLOUT_MERGED_PR,
+        };
+        let declined = PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge {
+            pr: DEAD_CALLOUT_MERGED_PR,
+        });
+        let promoted = PromotionGate::Promote {
+            detail: "branch_deleted_by_merged_pr",
+        };
+
+        // Bande 990_3xx, cf. `mika2839_le_chemin_nominal_…` : le journal
+        // d'appels est process-global, donc deux tests sur un même numéro se
+        // liraient mutuellement (mika#2713 D4).
+        let n_declined = 990_306u64;
+        let n_witness = 990_307u64;
+        for n in [n_declined, n_witness] {
+            crate::gh_process::assert_fixture_issue(n);
+            crate::gh_process::set_canned_stdout(
+                crate::gh_process::GhSubject::Issue(n),
+                format!("{DEAD_CALLOUT_BODY}\n"),
+            );
+        }
+
+        let issue_declined = make_issue(n_declined, DEAD_CALLOUT_BODY, &[], "2026-11-04T06:20:02Z");
+        maybe_rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            &issue_declined,
+            &measurement,
+            &declined,
+            ExclusionPhase::Phase0Feeder,
+            "trace",
+            "session-3036-declin",
+        )
+        .await;
+
+        assert!(
+            callout_rewrite_rows(&db, "session-3036-declin")
+                .await
+                .is_empty(),
+            "AC3 — aucun `{CALLOUT_REWRITE_TARGET_KEY}` pour un ticket décliné ; \
+             vu : {:?}",
+            callout_rewrite_rows(&db, "session-3036-declin").await
+        );
+        assert!(
+            gh_calls_for(n_declined).is_empty(),
+            "AC3 — aucune écriture sur la forge, sous le jeton de l'App ou un \
+             autre : la moitié du défaut mesuré est précisément celle-là ; \
+             vu : {:?}",
+            gh_calls_for(n_declined)
+        );
+
+        // Le témoin : même mesure, même corps, décision promouvante — le câblage
+        // tourne et écrit.
+        let issue_witness = make_issue(n_witness, DEAD_CALLOUT_BODY, &[], "2026-11-04T06:20:02Z");
+        maybe_rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            &issue_witness,
+            &measurement,
+            &promoted,
+            ExclusionPhase::Phase1Pull,
+            "trace",
+            "session-3036-temoin",
+        )
+        .await;
+
+        let rows = callout_rewrite_rows(&db, "session-3036-temoin").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "témoin — une ligne de réécriture par passage ; vu : {rows:?}"
+        );
+        let edits: Vec<String> = gh_calls_for(n_witness)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "témoin — exactement un `issue edit` sur #{n_witness} ; vu : {edits:?}"
+        );
+    }
 
     /// **AC1 — en phase 0, une mesure de merge refuse la promotion.**
     ///
