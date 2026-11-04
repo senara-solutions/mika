@@ -1207,10 +1207,25 @@ _PILOT_DAEMON_STALE_DEFERRED="stale_deferred"
 _PILOT_DAEMON_UNDECIDABLE="undecidable"
 _PILOT_DAEMON_STALE_UNSTOPPABLE="stale_unstoppable"
 
-# Le budget d'inactivité de claude-pilot (`idle_timeout`, watchdog cpp#170). Ce
-# n'est pas un nombre inventé : une session dont le `.stderr` est silencieux plus
-# longtemps est déjà en train d'être tuée par son propre garde-fou.
-_PILOT_DAEMON_SIBLING_WINDOW_SECONDS=300
+# PLAFOND D'ANCIENNETÉ d'un `<id>.log` orphelin — et non « un vol est récent »
+# (mika#3031). Le détecteur de vol est l'appariement `.log` sans `.stderr` juste
+# en dessous, et il n'a PAS de fenêtre : il est vrai pendant toute la durée du
+# vol. Celle-ci sert uniquement à ce que les `.log` que plus aucun pilote n'écrit
+# cessent de compter. Sans elle, un vol tué par SIGKILL — qui ne copie jamais son
+# `.stderr` — différerait la relance POUR TOUJOURS, c'est-à-dire mika#2780
+# réintroduit par le correctif de mika#3031.
+#
+# La dérivation, et ses deux marges :
+#   - plancher — le plus grand plafond de silence d'un pilote VIVANT, que le
+#     pilote écrit lui-même dans son `.log` : `toolWaitCeiling` =
+#     `rateLimitCeiling` = 1 800 s. (`idleTimeout` vaut 480 s, non 300 : le
+#     commentaire d'avant citait un budget que le pilote ne porte pas.) C'est
+#     trois fois le plus long silence mesuré entre deux lignes d'un `.log`, 602 s.
+#   - plafond — très loin sous le plus jeune `.log` orphelin MORT de l'hôte,
+#     11,5 jours, soit 553 fois cette fenêtre.
+# Le fossé entre les deux bornes est de trois ordres de grandeur : le placement
+# ne demande aucun arbitrage fin.
+_PILOT_DAEMON_SIBLING_WINDOW_SECONDS=1800
 
 # Le pid qui SERT l'endpoint, jamais un pid dont la ligne de commande ressemble.
 # Même raison qu'au canary (`--restart-relay`, qui tue par identité de socket) :
@@ -1294,10 +1309,70 @@ _pilot_daemon_code_is_newer() {   # $1 = pid, $2.. = fichiers
 # signal SUR-APPROXIME « un frère vole », et c'est le bon sens de l'erreur : il
 # diffère trop souvent, jamais trop peu. La déférence est auto-guérissante — le
 # prochain dispatch sans frère en vol relance.
+#
+# mika#3031 — LE SIGNAL EST L'APPARIEMENT, PAS UNE FENÊTRE. Il cherchait la
+# preuve d'un vol dans un `*.stderr` de moins de 300 s. Or le `.stderr` d'un
+# pilote est copié APRÈS `PILOT_EXIT=$?` : il naît à la SORTIE, et pendant le vol
+# il n'existe pas. Le signal était donc faux pendant TOUTE la durée de chaque
+# vol, et vrai pendant les 300 s qui SUIVENT un vol fini — exactement à l'envers.
+# Sept relances mesurées sont tombées sur un pilote vivant : les SEPT portent un
+# `API Error 5xx` dans le `.log` du vol, 3 à 6 min après la coupure, et six ont
+# fini en `PIPELINE FAILURE`.
+#
+# Ce que le pilote écrit PENDANT son vol, c'est son `<id>.log` : il naît au
+# lancement et s'écrit jusqu'à la sortie. Mesuré sur trois vols, l'écart entre
+# les deux naissances est de 4 min 32 s, 6 min 34 s et 7 min 50 s, et la
+# naissance du `.stderr` tombe à la seconde sur la fin du pilote. Le signal est
+# donc :
+#
+#     il existe un `<id>.log` dont le `<id>.stderr` n'existe pas.
+#
+# Sans fenêtre sur le vol lui-même, donc vrai quel que soit son âge — et c'est la
+# bonne forme, parce que le mtime du `.log` suit les TOURS du pilote et non le
+# temps mural : trois intervalles de plus de 300 s ont été mesurés sur un seul
+# vol, dont un de 602 s. Un prédicat « `.log` écrit récemment » n'aurait que
+# déplacé la panne.
+#
+# Trois sorties, pas deux :
+#   0 — un frère vole ;
+#   1 — aucun ;
+#   2 — INDÉCIDABLE. `date -u -d` n'a aucun précédent dans ce fichier (son format
+#       en a cinq, son option `-d` aucun) et échouerait sur un `date` non-GNU.
+#       Les deux replis muets sont faux dans les deux sens : rendre « un frère
+#       vole » gèle la relance pour toujours, rendre « aucun » réintroduit en
+#       silence la panne de ce ticket. Le verdicteur mappe donc 2 sur
+#       `undecidable` — démon conservé, cause nommée. Même raison que la branche
+#       par défaut du `case` de la découverte du porteur, D2 ci-dessus.
 _pilot_sibling_pilot_in_flight() {
     _pilot_log_dir; [ -d "$_PILOT_LOG_DIR" ] || return 1
-    _pilot_log_dir; [ -n "$(find "$_PILOT_LOG_DIR" -maxdepth 1 -name '*.stderr' \
-        -newermt "-${_PILOT_DAEMON_SIBLING_WINDOW_SECONDS} seconds" -print -quit 2>/dev/null)" ]
+    local _cut _logs _log
+    # Coupure en ISO 8601 ABSOLU, jamais un offset relatif ni un `@epoch` : c'est
+    # la seule forme que GNU `find` documente, et la seule mesurée correcte sous
+    # les deux implémentations rencontrées sur ce parc (GNU findutils 4.10.0 et
+    # bfs 4.1.1 — un `find` sur le PATH n'est pas forcément GNU). Un scan de la
+    # suite refuse le retour des deux autres formes.
+    _cut="$(date -u -d "-${_PILOT_DAEMON_SIBLING_WINDOW_SECONDS} seconds" \
+        +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || true
+    case "$_cut" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) : ;;
+        *)  echo "dispatch-lib: pilot_sibling_in_flight.undecidable \`date -u -d\` n'a pas rendu d'instant ISO 8601 — « un pilote frère vole-t-il ? » reste sans réponse (mika#3031)" >&2
+            return 2 ;;
+    esac
+    # `find` reste le PRÉ-FILTRE : un seul processus pour les milliers d'entrées
+    # du répertoire, là où apparier d'abord forkerait un test par `.log` orphelin
+    # (878 sur l'hôte au moment de la mesure). L'appariement ne s'applique donc
+    # qu'aux rares candidats que le plafond d'ancienneté laisse passer.
+    _pilot_log_dir; _logs="$(find "$_PILOT_LOG_DIR" -maxdepth 1 -name '*.log' \
+        -newermt "$_cut" 2>/dev/null)" || true
+    [ -n "$_logs" ] || return 1
+    while IFS= read -r _log; do
+        [ -n "$_log" ] || continue
+        # Le `.stderr` apparié existe : ce pilote est SORTI. Il n'a plus de tunnel
+        # CONNECT à couper, donc il ne diffère rien.
+        [ -e "${_log%.log}.stderr" ] && continue
+        return 0
+    done <<< "$_logs"
+    return 1
 }
 
 # Le verdict, et la ligne nommée qui va avec. N'AGIT PAS, ne refuse rien : il
@@ -1311,23 +1386,33 @@ _pilot_sibling_pilot_in_flight() {
 _pilot_daemon_freshness() {   # $1 = nom lisible, $2 = endpoint typé, $3.. = fichiers de code
     local _label="$1" _endpoint="$2"
     shift 2
-    local _pid _newer
+    local _pid _newer _sib _cause=""
+    # Les DEUX causes d'indécidabilité sortent par la même émission, en bas : la
+    # ligne nommée `undecidable` reste unique, donc le compte de trois lignes
+    # nommées que `T2029_VERDICT_BLOCK` épingle ne bouge pas, et les deux causes
+    # ne peuvent pas diverger le jour où l'une est touchée (D1 ci-dessus).
     if ! _pid="$(_pilot_daemon_holder_pid "$_endpoint")"; then
-        printf '%s' "$_PILOT_DAEMON_UNDECIDABLE"
-        echo "dispatch-lib: pilot_daemon_freshness.undecidable $_label écoute sur $_endpoint mais son porteur n'est pas identifiable (fuser absent, endpoint sans porteur lisible, ou endpoint mal typé) — démon conservé (mika#2029)" >&2
-        return 0
-    fi
-    if ! _newer="$(_pilot_daemon_code_is_newer "$_pid" "$@")"; then
+        _cause="$_label écoute sur $_endpoint mais son porteur n'est pas identifiable (fuser absent, endpoint sans porteur lisible, ou endpoint mal typé)"
+    elif _newer="$(_pilot_daemon_code_is_newer "$_pid" "$@")"; then
+        _pilot_sibling_pilot_in_flight; _sib=$?
+        case "$_sib" in
+            0)  printf '%s' "$_PILOT_DAEMON_STALE_DEFERRED"
+                echo "dispatch-lib: pilot_daemon_freshness.stale_deferred $_label (pid $_pid) est périmé mais un pilote frère vole — relance différée au prochain dispatch (mika#2029)" >&2
+                return 0 ;;
+            # mika#3031 — le signal lui-même est sans réponse (il a déjà nommé sa
+            # cause sur stderr). Ni « un frère vole » ni « aucun » : les deux
+            # seraient un repli muet sur une question posée et non résolue.
+            2)  _cause="$_label (pid $_pid) est périmé mais « un pilote frère vole-t-il ? » est resté sans réponse (voir la ligne pilot_sibling_in_flight.undecidable ci-dessus)" ;;
+            *)  printf '%s' "$_PILOT_DAEMON_STALE"
+                echo "dispatch-lib: pilot_daemon_freshness.stale $_label (pid $_pid) a démarré avant l'installation de $(basename "$_newer") — relance (mika#2029)" >&2
+                return 0 ;;
+        esac
+    else
         printf '%s' "$_PILOT_DAEMON_FRESH"
         return 0
     fi
-    if _pilot_sibling_pilot_in_flight; then
-        printf '%s' "$_PILOT_DAEMON_STALE_DEFERRED"
-        echo "dispatch-lib: pilot_daemon_freshness.stale_deferred $_label (pid $_pid) est périmé mais un pilote frère vole — relance différée au prochain dispatch (mika#2029)" >&2
-        return 0
-    fi
-    printf '%s' "$_PILOT_DAEMON_STALE"
-    echo "dispatch-lib: pilot_daemon_freshness.stale $_label (pid $_pid) a démarré avant l'installation de $(basename "$_newer") — relance (mika#2029)" >&2
+    printf '%s' "$_PILOT_DAEMON_UNDECIDABLE"
+    echo "dispatch-lib: pilot_daemon_freshness.undecidable $_cause — démon conservé (mika#2029)" >&2
     return 0
 }
 
