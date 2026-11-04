@@ -1315,12 +1315,15 @@ _pilot_daemon_code_is_newer() {   # $1 = pid, $2.. = fichiers
 # pilote est copié APRÈS `PILOT_EXIT=$?` : il naît à la SORTIE, et pendant le vol
 # il n'existe pas. Le signal était donc faux pendant TOUTE la durée de chaque
 # vol, et vrai pendant les 300 s qui SUIVENT un vol fini — exactement à l'envers.
-# Sept relances mesurées sont tombées sur un pilote vivant, dont six ont fini en
-# `API Error 5xx` dans le `.log` du vol.
+# Sept relances mesurées sont tombées sur un pilote vivant : les SEPT portent un
+# `API Error 5xx` dans le `.log` du vol, 3 à 6 min après la coupure, et six ont
+# fini en `PIPELINE FAILURE`.
 #
 # Ce que le pilote écrit PENDANT son vol, c'est son `<id>.log` : il naît au
-# lancement et s'écrit jusqu'à la sortie (mesuré à +0,6 s et +3,3 s avant le
-# `.stderr` sur trois vols). Le signal est donc :
+# lancement et s'écrit jusqu'à la sortie. Mesuré sur trois vols, l'écart entre
+# les deux naissances est de 4 min 32 s, 6 min 34 s et 7 min 50 s, et la
+# naissance du `.stderr` tombe à la seconde sur la fin du pilote. Le signal est
+# donc :
 #
 #     il existe un `<id>.log` dont le `<id>.stderr` n'existe pas.
 #
