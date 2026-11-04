@@ -7108,6 +7108,12 @@ mod tests {
     /// R4 / DoD — no content conflict is ever auto-resolved. The gate has no
     /// merge strategy because it performs no merge; this asserts the module
     /// never grew one.
+    ///
+    /// **Porte aussi le détecteur S1 de mika#3036** (AC2 et le premier membre
+    /// d'AC4). Greffé ici plutôt que câblé à part : la tranche de production est
+    /// déjà lue, et son contrôle positif déjà posé. S1 asserte des **comptes**,
+    /// jamais des présences — une présence survit à un second lecteur de la
+    /// phase ajouté à côté du premier, et c'est précisément ce qu'AC2 interdit.
     #[test]
     fn test_promotion_gate_never_resolves_conflicts() {
         // Scan the production half only: the needles below appear verbatim in
@@ -7135,6 +7141,47 @@ mod tests {
                 "auto_pull must never carry a merge strategy flag ({forbidden})"
             );
         }
+
+        // ── S1 (mika#3036) — un seul lecteur de la phase, trois ledgers ──
+
+        // Le type `[&str; 0]` fait mieux que l'assertion : une entrée ajoutée
+        // sans élargir le type ne compile pas, et l'élargir est le geste visible
+        // au `grep` que mika#1574 demande. L'assertion reste parce qu'elle nomme
+        // la règle à qui la lira.
+        const T3036_PHASE_READER_ALLOWLIST: [&str; 0] = [];
+        assert!(
+            T3036_PHASE_READER_ALLOWLIST.is_empty(),
+            "S1: table d'exceptions du scan de lecteur de phase — doit rester vide; \
+             toute entrée nomme sa donnée et son ticket de suivi (mika#3036)"
+        );
+
+        assert_eq!(
+            production.matches("match phase {").count(),
+            1,
+            "AC2 — la phase décide dans UN seul site. Un second `match phase` \
+             dans la production de ce fichier est le défaut de mika#3036 qui \
+             repousse : deux lecteurs de la même sonde peuvent dériver l'un \
+             sans l'autre"
+        );
+
+        // « Suivi de » et non « présent dans le fichier » : les trois appels
+        // n'ont pas la même mise en forme — deux sur une ligne, un éclaté sur
+        // cinq — donc on découpe sur l'appel et on lit ses arguments.
+        let gate_ledgers = production
+            .split("ledger.record(")
+            .skip(1)
+            .filter(|rest| {
+                rest.split(')')
+                    .next()
+                    .is_some_and(|args| args.contains("FILTER_PROMOTION_GATE"))
+            })
+            .count();
+        assert_eq!(
+            gate_ledgers, 3,
+            "AC4 — les trois phases comptent leur exclusion de porte sous \
+             `{FILTER_PROMOTION_GATE}`. Un compte qui tombe à deux, c'est une \
+             phase dont les refus — déclins compris — ne se comptent plus"
+        );
     }
 
     // ── is_groomed tests ──
