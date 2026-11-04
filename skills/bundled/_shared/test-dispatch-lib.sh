@@ -17200,6 +17200,286 @@ $_m2996r_reason"
     fi
 done
 
+# ─────────────────────────────────────────────────────────────────────────────
+# mika#3030 — l'allowlist du worktree est construite par dispatch-lib, plus
+# copiée de l'allowlist de la session de l'opérateur.
+#
+# Le défaut fermé : `cp "$PLATFORM_DIR/.claude/settings.local.json"` rendait au
+# worktree les jokers de famille `Bash(gh pr:*)` / `Bash(gh issue:*)`. Une règle
+# allow des réglages court-circuite `can_use_tool`, donc la politique de
+# claude-pilot n'est JAMAIS interrogée pour la sous-commande couverte. mika#3024
+# a été ouvert par cette porte sans qu'aucune ligne de décision existe nulle
+# part. Rejoué hors ligne contre la politique installée, le geste rend `deny`.
+#
+# La sonde est FONCTIONNELLE : elle source dispatch-lib.sh, bâtit une fixture
+# qui porte ce que le ticket a mesuré, appelle `_seed_worktree_settings_allowlist`
+# et lit le fichier produit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "Test: mika#3030 — allowlist du worktree filtrée au seeding"
+
+# L'AC énonce une COUVERTURE (« aucune règle allow ne couvre une commande de
+# L »), pas une absence de sous-chaîne. Un `grep -v 'gh issue'` passerait sur
+# `Bash(gh issue *)` tout en manquant `Bash(gh:*)`. Ce matcher implémente la
+# sémantique de préfixe de Claude Code : `Bash(X)` → X ; X terminé par `:*` →
+# préfixe, donc le glob `X*` ; puis glob bash natif. `[[ ]]` ne fait pas de
+# word-splitting, donc un motif à espaces tient sans quoting.
+_t3030_covers() {
+    local entry=$1 cmd=$2 pat
+    case "$entry" in Bash\(*\)) pat=${entry#Bash(}; pat=${pat%)} ;; *) return 1 ;; esac
+    case "$pat" in *:\*) pat="${pat%:\*}*" ;; esac
+    # shellcheck disable=SC2053  # le glob est voulu : c'est le motif d'allowlist
+    [[ $cmd == $pat ]]
+}
+
+# Vrai si au moins une entrée de la liste (une par ligne, sur stdin) couvre $1.
+_t3030_any_covers() {
+    local cmd=$1 entry
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        if _t3030_covers "$entry" "$cmd"; then return 0; fi
+    done
+    return 1
+}
+
+# La liste L du ticket : ce qu'aucune règle allow du worktree ne doit couvrir.
+_T3030_FORBIDDEN=(
+    "gh issue create --title x"
+    "gh issue close 1"
+    "gh issue edit 1 --add-label ready"
+    "gh issue comment 1 --body x"
+    "gh pr merge 1"
+    "gh pr review 1 --approve"
+    "gh pr close 1"
+    "gh repo delete x"
+    "gh label create x"
+)
+
+# AC2 : les gestes du pipeline qui passaient par le joker copié restent permis.
+# `gh pr ready` n'y est PAS, et c'est délibéré — le contrat draft de mika
+# (#1613, #1682, #2624) interdit au pilote de rendre prête une PR ; voir le
+# contrôle négatif plus bas.
+_T3030_ALLOWED=(
+    "gh pr create --title x --body-file pr-body.md"
+    "gh pr view 1"
+    "gh pr edit 1 --add-label origin:loop"
+    "gh pr list --state open"
+    "gh pr diff 1"
+    "gh pr checks 1"
+    "gh issue view 3030"
+    "gh issue list --search x"
+)
+
+# Les entrées non-`gh` de l'allowlist de l'opérateur doivent SURVIVRE. Sans
+# cette famille, la famille « refus » passerait trivialement sur un filtre qui
+# jette tout — et on aurait livré un rétrécissement général en croyant livrer
+# un filtre.
+_T3030_PRESERVED=(
+    "Bash(cargo clippy:*)"
+    "Bash(ls:*)"
+    "Read(//home/x/**)"
+    "WebSearch"
+)
+
+# Écrit la fixture `platform/.claude/settings.local.json` sous $1.
+_t3030_write_fixture() {
+    local platform_dir=$1
+    mkdir -p "$platform_dir/.claude"
+    cat > "$platform_dir/.claude/settings.local.json" <<'T3030_FIXTURE'
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh pr:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh issue *)",
+      "Bash(gh label *)",
+      "Bash(gh issue view:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(ls:*)",
+      "Read(//home/x/**)",
+      "WebSearch"
+    ]
+  }
+}
+T3030_FIXTURE
+}
+
+# Lance le seeding et imprime les entrées allow produites, une par ligne.
+# $3 = mode : "normal", "no-src" (source absente), "no-jq" (PATH sans jq).
+_t3030_seed_and_read() {
+    local base_dir=$1 mode=$2
+    local platform_dir="$base_dir/platform" worktree_dir="$base_dir/worktree"
+    mkdir -p "$worktree_dir/.claude"
+    [ "$mode" = "no-src" ] || _t3030_write_fixture "$platform_dir"
+    mkdir -p "$platform_dir/.claude"
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB"
+        if [ "$mode" = "no-jq" ]; then
+            # Un PATH qui ne contient aucun jq : le repli doit s'armer.
+            PATH="$base_dir/empty-path"
+            mkdir -p "$PATH"
+            export PATH
+        fi
+        _seed_worktree_settings_allowlist "$platform_dir" "$worktree_dir" 2>/dev/null
+    )
+
+    local produced="$worktree_dir/.claude/settings.local.json"
+    [ -f "$produced" ] || { echo "__MISSING__"; return 0; }
+    # Lecture par jq quand il est là (le cas normal), sinon par un grep de
+    # forme — le repli écrit une entrée par ligne, entre guillemets.
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.permissions.allow[]?' "$produced" 2>/dev/null
+    else
+        sed -n 's/^ *"\(.*\)",\{0,1\}$/\1/p' "$produced"
+    fi
+}
+
+# ── Cas normal : jq présent, source présente ─────────────────────────────────
+_t3030_base=$(mktemp -d)
+_t3030_entries=$(_t3030_seed_and_read "$_t3030_base" normal)
+
+assert_not_contains "mika#3030: le seeding normal produit un fichier" \
+    "__MISSING__" "$_t3030_entries"
+
+# Famille 1 — refus (AC1). Aucune entrée produite ne couvre une commande de L.
+for _t3030_cmd in "${_T3030_FORBIDDEN[@]}"; do
+    if printf '%s\n' "$_t3030_entries" | _t3030_any_covers "$_t3030_cmd"; then
+        _t3030_verdict="COUVERTE"
+    else
+        _t3030_verdict="non couverte"
+    fi
+    assert_eq "mika#3030 AC1: le worktree ne couvre pas \`$_t3030_cmd\`" \
+        "non couverte" "$_t3030_verdict"
+done
+
+# Famille 2 — témoin positif (AC2). Un par geste du pipeline.
+for _t3030_cmd in "${_T3030_ALLOWED[@]}"; do
+    if printf '%s\n' "$_t3030_entries" | _t3030_any_covers "$_t3030_cmd"; then
+        _t3030_verdict="couverte"
+    else
+        _t3030_verdict="NON COUVERTE"
+    fi
+    assert_eq "mika#3030 AC2: le worktree couvre encore \`$_t3030_cmd\`" \
+        "couverte" "$_t3030_verdict"
+done
+
+# Famille 3 — contrôle négatif d'AC1 : une entrée de LECTURE reste présente.
+# Elle y est par RÉINJECTION (le filtre jette toutes les entrées `gh` avant
+# d'ajouter la liste close), pas par préservation. L'AC porte sur l'observable
+# — « reste présente dans le worktree » — et l'observable est identique. Noté
+# ici pour qu'une relecture n'y lise pas un contournement.
+assert_contains "mika#3030 AC1 (contrôle négatif): Bash(gh issue view:*) est dans le worktree" \
+    "Bash(gh issue view:*)" "$_t3030_entries"
+
+# Le contrat draft : aucune entrée ne rend prête une PR (#1613, #1682, #2624).
+# Le corps du ticket le dit explicitement — « Aucune entrée `gh pr ready` n'est
+# écrite ».
+if printf '%s\n' "$_t3030_entries" | _t3030_any_covers "gh pr ready 1"; then
+    _t3030_verdict="COUVERTE"
+else
+    _t3030_verdict="non couverte"
+fi
+assert_eq "mika#3030 AC2: aucune entrée ne couvre \`gh pr ready\` (contrat draft)" \
+    "non couverte" "$_t3030_verdict"
+
+# Famille 4 — contrôle positif du filtrage (R3). Les entrées non-`gh` de
+# l'allowlist de l'opérateur survivent : le vol n'est pas un rétrécissement
+# général.
+for _t3030_entry in "${_T3030_PRESERVED[@]}"; do
+    assert_contains "mika#3030 R3: l'entrée non-gh \`$_t3030_entry\` survit au filtre" \
+        "$_t3030_entry" "$_t3030_entries"
+done
+
+# Et aucun joker de famille `gh` ne subsiste.
+for _t3030_wild in "Bash(gh pr:*)" "Bash(gh issue:*)" "Bash(gh repo:*)" \
+                   "Bash(gh issue *)" "Bash(gh label *)"; do
+    assert_not_contains "mika#3030 AC1: le joker \`$_t3030_wild\` a disparu du worktree" \
+        "$_t3030_wild" "$_t3030_entries"
+done
+
+rm -rf "$_t3030_base"
+
+# ── Les deux cas de repli : fail-closed ──────────────────────────────────────
+# Chacun doit rendre un fichier qui porte la liste étroite, ne couvre aucune
+# commande de L, et ne porte AUCUNE entrée de la fixture — la preuve que le
+# repli n'a pas copié la source.
+for _t3030_mode in no-src no-jq; do
+    _t3030_base=$(mktemp -d)
+    _t3030_fb=$(_t3030_seed_and_read "$_t3030_base" "$_t3030_mode")
+
+    assert_not_contains "mika#3030 R5 ($_t3030_mode): le repli produit tout de même un fichier" \
+        "__MISSING__" "$_t3030_fb"
+    assert_contains "mika#3030 R5 ($_t3030_mode): le repli porte la liste étroite" \
+        "Bash(gh pr create:*)" "$_t3030_fb"
+
+    for _t3030_cmd in "${_T3030_FORBIDDEN[@]}"; do
+        if printf '%s\n' "$_t3030_fb" | _t3030_any_covers "$_t3030_cmd"; then
+            _t3030_verdict="COUVERTE"
+        else
+            _t3030_verdict="non couverte"
+        fi
+        assert_eq "mika#3030 R5 ($_t3030_mode): le repli ne couvre pas \`$_t3030_cmd\`" \
+            "non couverte" "$_t3030_verdict"
+    done
+
+    # La preuve du fail-closed : rien de la fixture n'a été recopié. Un repli
+    # naïf (`jq … || cp "$src" "$dst"`) reconstituerait le défaut, silencieusement,
+    # le jour où jq manque.
+    for _t3030_entry in "${_T3030_PRESERVED[@]}"; do
+        assert_not_contains "mika#3030 R5 ($_t3030_mode): le repli n'a pas copié \`$_t3030_entry\`" \
+            "$_t3030_entry" "$_t3030_fb"
+    done
+
+    rm -rf "$_t3030_base"
+done
+
+# ── Le matcher lui-même, sur ses trois formes réelles ────────────────────────
+# Un matcher faux rendrait toutes les assertions ci-dessus vertes pour la
+# mauvaise raison.
+_t3030_matcher_case() {
+    if _t3030_covers "$1" "$2"; then echo couvre; else echo "ne couvre pas"; fi
+}
+assert_eq "mika#3030 matcher: Bash(gh pr:*) couvre gh pr merge 1" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh pr:*)' 'gh pr merge 1')"
+assert_eq "mika#3030 matcher: Bash(gh issue *) couvre gh issue create --title x" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh issue *)' 'gh issue create --title x')"
+assert_eq "mika#3030 matcher: Bash(gh pr edit:*) couvre gh pr edit 1 --add-label origin:loop" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh pr edit:*)' 'gh pr edit 1 --add-label origin:loop')"
+assert_eq "mika#3030 matcher: Bash(gh pr edit:*) ne couvre PAS gh pr merge 1" \
+    "ne couvre pas" "$(_t3030_matcher_case 'Bash(gh pr edit:*)' 'gh pr merge 1')"
+assert_eq "mika#3030 matcher: Bash(gh:*) couvre gh issue create (le cas qu'un grep manque)" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh:*)' 'gh issue create --title x')"
+assert_eq "mika#3030 matcher: une entrée non-Bash ne couvre aucune commande" \
+    "ne couvre pas" "$(_t3030_matcher_case 'Read(//home/x/**)' 'gh issue create')"
+
+# ── AC4 — aucun `cp` d'un fichier de réglages vers le worktree ───────────────
+# La cible est le GESTE, pas la mention : les commentaires de scaffold nomment
+# `settings.local.json` sans `cp` devant, et le pathspec d'exclusion du rescue
+# non plus. Le `^[^#]*` écarte une ligne de commentaire ; le `[^;&|]*` borne la
+# lecture au segment du `cp`, de sorte qu'un `cp a b && echo settings.local.json`
+# ne compte pas.
+#
+# L'assertion est une ÉGALITÉ STRICTE à 0, jamais un `<= N`. Un seuil est une
+# exception sans date d'expiration : le registre d'exceptions de ce vol est vide
+# et doit le rester (Fire-Disposition, option (a)).
+_t3030_cp_count=$(grep -cE '^[^#]*\bcp\b[^;&|]*settings\.local\.json' "$DISPATCH_LIB" || true)
+assert_eq "mika#3030 AC4: aucun cp d'un settings.local.json dans dispatch-lib.sh" \
+    "0" "$_t3030_cp_count"
+
+# ── AC1, seconde porte — la source `project` tient par une ABSENCE ───────────
+# Le filtre ne tient AC1 que pour la source `local`. `.claude/settings.json` est
+# tracké par le dépôt et ne porte aujourd'hui que la clé `hooks` ; rien ne garde
+# cette absence. Un `permissions.allow` ajouté là rendrait `Bash(gh issue:*)` au
+# worktree par l'autre porte, avec le dépôt pour véhicule et le filtre
+# impuissant. Son propre `$comment` déclare déjà l'invariant — « noms de
+# fichiers distincts ET clés disjointes » ; ici on l'épingle du côté qui compte.
+assert_eq "mika#3030 AC1: le settings.json tracké (source project) ne porte aucune permission" \
+    "null" "$(jq -r '.permissions // "null"' "$REPO_ROOT/.claude/settings.json" 2>/dev/null)"
+
 # --- Summary ---
 
 echo ""
