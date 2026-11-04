@@ -317,14 +317,25 @@ qui l'a déclenchée — rien à faire, c'est l'issue souhaitée, et attendez-vo
 voir une fois par démon après chaque `make install` (le `Makefile` réécrit ces
 fichiers inconditionnellement, contenu identique ou non : c'est un coût assumé,
 un deploy étant précisément l'instant où l'on veut que le démon reprenne son
-code). `stale_deferred` dit qu'un pilote frère vole — un `*.stderr` de moins de
-300 s dans `/var/log/claude-pilot` — et que la relance attend : **aucun geste**,
-le prochain dispatch sans frère en vol la fera. `undecidable` dit que l'endpoint
-est tenu mais que son porteur n'est pas identifiable (`fuser` absent, endpoint
+code). `stale_deferred` dit qu'un pilote frère vole — dans
+`/var/log/claude-pilot`, un `<id>.log` dont le `<id>.stderr` n'existe pas
+encore — et que la relance attend : **aucun geste**, le prochain dispatch sans
+frère en vol la fera. Le signal est l'**appariement**, non un âge : il est vrai
+pendant toute la durée du vol, quel qu'en soit l'âge, parce que le `.stderr` d'un
+pilote naît à sa SORTIE et pas avant (mika#3031 — il se lisait auparavant sur un
+`*.stderr` de moins de 300 s, donc il était faux pendant chaque vol et vrai
+pendant les 300 s qui le suivaient). Les 1 800 s qui restent dans le code sont un
+plafond d'ancienneté sur le `.log`, pour qu'un vol tué par `KILL` — qui ne copie
+jamais son `.stderr` — ne diffère pas la relance indéfiniment.
+`undecidable` a deux causes, et la ligne nomme laquelle : soit l'endpoint est
+tenu mais son porteur n'est pas identifiable (`fuser` absent, endpoint
 sans porteur lisible, ou lanceur appelé depuis un namespace PID qui ne voit pas
-le porteur) ; « on ne sait pas » n'est pas « périmé », le démon est conservé
-et **rien ne vous est demandé** — sauf si la ligne se répète à chaque dispatch,
-auquel cas installez `psmisc`. Seul `stale_unstoppable` appelle un regard : le
+le porteur) — installez `psmisc` si la ligne se répète à chaque dispatch —, soit
+la question « un pilote frère vole-t-il ? » est elle-même restée sans réponse,
+auquel cas une ligne `pilot_sibling_in_flight.undecidable` la précède et dit que
+`date -u -d` n'a pas rendu d'instant ISO 8601 (un `date` non-GNU sur le PATH).
+Dans les deux cas « on ne sait pas » n'est pas « périmé », le démon est conservé
+et **rien ne vous est demandé**. Seul `stale_unstoppable` appelle un regard : le
 porteur tient toujours son endpoint trois secondes après un `TERM`, il n'y a pas
 d'escalade en `KILL`, et le démon périmé est conservé plutôt que de laisser un
 endpoint orphelin — allez voir qui le tient, avec
