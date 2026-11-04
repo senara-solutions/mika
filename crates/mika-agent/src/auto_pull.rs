@@ -1126,6 +1126,42 @@ impl RefusalReason {
     }
 }
 
+/// Pourquoi la porte s'abstient — sans rien reprocher au ticket.
+///
+/// Distinct de [`RefusalReason`] parce que les suites diffèrent : un refus
+/// escalade (label `operator-review`, `ready` retiré, commentaire), un déclin
+/// n'écrit RIEN sur la forge. Le ticket est sain ; c'est le consentement qui
+/// manque, et seul un humain ou une phase qui le voit déjà peut le rendre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// mika#3036 — en phase 0 le ticket ne porte pas `ready`, et la branche a
+    /// disparu parce qu'une PR a été mergée. Le merge vient de *rendre* le
+    /// consentement (mika#3022) ; le reprendre serait s'en donner un.
+    ConsentReturnedByMerge { pr: u64 },
+}
+
+impl DeclineReason {
+    /// Le nom sous lequel ce déclin se compte. **Distinct** de
+    /// `branch_absent_on_origin` : les deux mesures se ressemblent — une
+    /// branche absente dans les deux cas — mais l'une est une anomalie et
+    /// l'autre la trace normale d'un merge. Les compter sous un même nom, c'est
+    /// de nouveau mika#2205.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::ConsentReturnedByMerge { .. } => "consent_returned_by_merge",
+        }
+    }
+
+    /// La PR dont le merge a rendu le consentement, quand ce déclin en nomme
+    /// une. `None` — jamais `0` — pour un déclin qui n'en porte pas
+    /// (mika#2331).
+    pub fn merged_pr(&self) -> Option<u64> {
+        match self {
+            Self::ConsentReturnedByMerge { pr } => Some(*pr),
+        }
+    }
+}
+
 /// The gate's verdict on one ticket (mika#2123 U2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromotionGate {
@@ -1134,6 +1170,9 @@ pub enum PromotionGate {
     Promote { detail: &'static str },
     /// Do not promote; hand the ticket to the operator.
     Refuse(RefusalReason),
+    /// Ne pas promouvoir, et ne rien reprocher au ticket (mika#3036). Aucune
+    /// écriture sur la forge : ni label, ni commentaire, ni corps.
+    Decline(DeclineReason),
 }
 
 /// Extract the branch name from a ticket's grooming callout (mika#2123 U1).
@@ -1350,10 +1389,15 @@ pub fn classify_absent_branch(probe: Result<Option<MergedPrEvidence>>) -> Stalen
 /// Rule order matters and is the plan's (U2), not an accident: the salvage rule
 /// is checked before the distance rule because it is the more specific fact
 /// about the same branch, and its remedy is different.
+///
+/// `phase` depuis mika#3036 : **une seule** mesure la consulte, celle du merge.
+/// Toutes les autres décident pareil dans les trois phases, et le paramètre les
+/// laisse intactes.
 pub fn classify_promotion(
     measurement: &StalenessMeasurement,
     branch: Option<&str>,
     max_behind: i64,
+    phase: ExclusionPhase,
 ) -> PromotionGate {
     let staleness = match measurement {
         StalenessMeasurement::NoBranchCallout => {
@@ -1373,9 +1417,25 @@ pub fn classify_promotion(
         // `branch_absent_on_origin` (AC1) pour qu'un opérateur compte les deux
         // populations séparément — c'est ce que le refus unique rendait
         // impossible.
-        StalenessMeasurement::BranchDeletedByMerge { .. } => {
-            return PromotionGate::Promote {
-                detail: "branch_deleted_by_merged_pr",
+        //
+        // mika#3036 — et c'est **le seul site** où la phase décide. Pas de bras
+        // `_` : une quatrième phase ne compilera pas sans qu'on dise ici ce
+        // qu'elle fait.
+        StalenessMeasurement::BranchDeletedByMerge { pr } => {
+            return match phase {
+                // Le ticket ne porte pas `ready`. Le merge l'a retiré
+                // (mika#3022) ; le reposer serait se donner le consentement
+                // qu'on vient de rendre.
+                ExclusionPhase::Phase0Feeder => {
+                    PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: *pr })
+                }
+                // Le ticket porte déjà `ready`. mika#2837 inchangé : c'est
+                // ainsi que part le vol suivant d'un ticket à plusieurs vols.
+                ExclusionPhase::Phase1Pull | ExclusionPhase::Phase2StuckReady => {
+                    PromotionGate::Promote {
+                        detail: "branch_deleted_by_merged_pr",
+                    }
+                }
             };
         }
         // Inchangé, et c'est AC2 : aucune PR mergée ne porte la branche, ou la
@@ -1542,6 +1602,11 @@ fn staleness_audit_json(
     let (outcome, reason) = match decision {
         PromotionGate::Promote { detail } => ("promote", *detail),
         PromotionGate::Refuse(r) => ("refuse", r.slug()),
+        // mika#3036 — `"decline"` est une **valeur nouvelle** du vocabulaire
+        // `outcome`, pas un renommage : les agrégats `WHERE outcome='promote'`
+        // et `='refuse'` restent sommables, et la nouvelle population
+        // s'interroge seule (mika#2205).
+        PromotionGate::Decline(r) => ("decline", r.slug()),
     };
     let measurement_slug = match measurement {
         StalenessMeasurement::Measured(_) => "measured",
@@ -1696,19 +1761,38 @@ fn feeder_rank(labels: &[IssueLabel]) -> u8 {
 /// Carried on every ledger entry so the operator can tell a Phase 2 skip
 /// (a `ready` ticket that will not be re-driven) from a Phase 0 one (a backlog
 /// ticket that will not be promoted) — the two call for different actions.
+/// `pub` depuis mika#3036 : [`classify_promotion`] est publique et reçoit la
+/// phase, et un test d'intégration l'appelle — un paramètre de type privé dans
+/// une signature publique est refusé par `private_interfaces`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum ExclusionPhase {
+pub enum ExclusionPhase {
     Phase0Feeder,
     Phase1Pull,
     Phase2StuckReady,
 }
 
 impl ExclusionPhase {
+    /// Le format de fil du **ledger d'exclusion**.
     fn as_str(self) -> &'static str {
         match self {
             Self::Phase0Feeder => "phase0_feeder",
             Self::Phase1Pull => "phase1_pull",
             Self::Phase2StuckReady => "phase2_stuck_ready",
+        }
+    }
+
+    /// Le format de fil de la **porte de promotion** — celui que
+    /// `auto_pull_staleness_measured.phase` porte depuis mika#2470.
+    ///
+    /// Deux projections, deux vocabulaires, et ils ne sont PAS
+    /// interchangeables : les deux sont déjà dans `audit_events`, et un
+    /// opérateur les groupe. Les faire converger renommerait une population à
+    /// moitié (mika#2205).
+    pub fn gate_phase(self) -> &'static str {
+        match self {
+            Self::Phase0Feeder => "phase0_feeder",
+            Self::Phase1Pull => "phase1_idle_pull",
+            Self::Phase2StuckReady => "phase2_stuck_rescue",
         }
     }
 }
@@ -3860,7 +3944,7 @@ async fn promotion_gate_allows(
     github_token: &str,
     label_auth: &LabelWriteToken,
     issue: &Issue,
-    phase: &str,
+    phase: ExclusionPhase,
     trace_id: &str,
     session_id: &str,
 ) -> bool {
@@ -3886,7 +3970,7 @@ async fn promotion_gate_allows(
         (m, _) => m,
     };
     let threshold = max_behind();
-    let decision = classify_promotion(&measurement, branch.as_deref(), threshold);
+    let decision = classify_promotion(&measurement, branch.as_deref(), threshold, phase);
     let audit = staleness_audit_json(
         issue.number,
         branch.as_deref(),
@@ -3906,7 +3990,7 @@ async fn promotion_gate_allows(
             "auto_pull_staleness_measured",
             None,
             Some(&audit),
-            Some(phase),
+            Some(phase.gate_phase()),
             Some(trace_id),
         )
         .await
@@ -3946,7 +4030,7 @@ async fn promotion_gate_allows(
             &issue.body,
             b,
             cause,
-            phase,
+            phase.gate_phase(),
             trace_id,
             session_id,
         )
@@ -3968,7 +4052,7 @@ async fn promotion_gate_allows(
         PromotionGate::Promote { detail } => {
             info!(
                 issue = issue.number,
-                phase,
+                phase = phase.gate_phase(),
                 detail,
                 staleness = %audit,
                 "auto_pull_promotion_allowed"
@@ -3982,12 +4066,26 @@ async fn promotion_gate_allows(
                 label_auth,
                 issue.number,
                 reason,
-                phase,
+                phase.gate_phase(),
                 &audit,
                 trace_id,
                 session_id,
             )
             .await;
+            false
+        }
+        // mika#3036 — aucune écriture sur la forge : ni label, ni commentaire.
+        // Le ticket est sain ; il attend un consentement que seul un humain peut
+        // rendre. Le `false` suffit, et c'est lui qui fait compter le déclin dans
+        // le ledger d'exclusion du site d'appel (AC4).
+        PromotionGate::Decline(reason) => {
+            warn!(
+                issue = issue.number,
+                merged_pr = ?reason.merged_pr(),
+                reason = reason.slug(),
+                phase = phase.gate_phase(),
+                "auto_pull_promotion_declined"
+            );
             false
         }
     }
@@ -5143,7 +5241,7 @@ async fn phase0_feed_ready_pool(
                     github_token,
                     label_auth,
                     issue,
-                    "phase0_feeder",
+                    ExclusionPhase::Phase0Feeder,
                     trace_id,
                     session_id,
                 )
@@ -5309,7 +5407,7 @@ async fn phase1_promote_groomed(
         github_token,
         label_auth,
         &candidate,
-        "phase1_idle_pull",
+        ExclusionPhase::Phase1Pull,
         trace_id,
         session_id,
     )
@@ -5924,7 +6022,7 @@ async fn phase2_reconcile_stuck_ready(
             github_token,
             label_auth,
             issue,
-            "phase2_stuck_rescue",
+            ExclusionPhase::Phase2StuckReady,
             trace_id,
             session_id,
         )
@@ -6086,6 +6184,19 @@ mod tests {
     }
 
     // ── mika#2123 promotion staleness gate ──
+
+    /// Ancre les tests antérieurs à mika#3036 sur la phase dont ce vol ne change
+    /// RIEN. C'est ce qui en fait leur contrôle de non-régression : s'ils
+    /// bougent, c'est que les phases 1 et 2 ont bougé. Les tests de la phase
+    /// appellent [`super::classify_promotion`] nommément, avec leur phase
+    /// explicite.
+    fn classify_promotion(
+        m: &StalenessMeasurement,
+        branch: Option<&str>,
+        max_behind: i64,
+    ) -> PromotionGate {
+        super::classify_promotion(m, branch, max_behind, ExclusionPhase::Phase1Pull)
+    }
 
     /// A measurement whose file list is **unavailable** (`files` absent from
     /// the payload). Kept at its original signature so every test that never
@@ -12742,22 +12853,73 @@ Un ticket à plusieurs vols.
     /// promeut, parce qu'elle laisse partir le vol suivant d'un ticket à
     /// plusieurs vols.
     ///
-    /// Écrit sur la signature d'**aujourd'hui** — `classify_promotion` ne reçoit
-    /// pas encore la phase —, ce test est le défaut mesuré reproduit à la
-    /// demande : faute de phase, la porte décide pareil partout, donc la phase 0
-    /// promeut. Il est **rouge** jusqu'au commit suivant, et c'est son objet.
+    /// **Une seule** mesure, trois appels : le contrôle négatif vit dans le même
+    /// test que l'exigence, parce que deux tests séparés peuvent dériver l'un
+    /// sans l'autre et laisser « la phase décide » vrai sans que « les phases 1
+    /// et 2 n'ont pas bougé » le soit encore.
+    ///
+    /// AC4 y est tenu aussi : la ligne d'audit du déclin est relue sur le JSON
+    /// de [`staleness_audit_json`], et `issue` comme `merged_pr` y sont exigés
+    /// **non nuls** — un `0` ou un `""` se lirait comme une valeur mesurée
+    /// (mika#2331).
     #[test]
     fn mika3036_la_phase_decide_de_la_mesure_de_merge() {
         let measurement = StalenessMeasurement::BranchDeletedByMerge { pr: 3032 };
 
-        let decision = classify_promotion(&measurement, Some(BRANCH_3030), 50);
+        let declined = super::classify_promotion(
+            &measurement,
+            Some(BRANCH_3030),
+            50,
+            ExclusionPhase::Phase0Feeder,
+        );
+        assert_eq!(
+            declined,
+            PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: 3032 }),
+            "AC1 — en `phase0_feeder`, le `ready` que le merge a rendu n'est pas \
+             un consentement que le feeder puisse se redonner"
+        );
+        let PromotionGate::Decline(reason) = &declined else {
+            panic!("la décision de la phase 0 vient d'être assertée `Decline`");
+        };
+        assert_eq!(reason.slug(), "consent_returned_by_merge");
+        assert_ne!(
+            reason.slug(),
+            "branch_absent_on_origin",
+            "AC1 — une branche absente par anomalie et une branche absente par \
+             merge sont deux populations ; un nom commun les additionnerait \
+             (mika#2205)"
+        );
 
+        // Le contrôle négatif : mika#2837 inchangé là où le ticket porte déjà
+        // `ready`.
+        for phase in [ExclusionPhase::Phase1Pull, ExclusionPhase::Phase2StuckReady] {
+            assert_eq!(
+                super::classify_promotion(&measurement, Some(BRANCH_3030), 50, phase),
+                PromotionGate::Promote {
+                    detail: "branch_deleted_by_merged_pr",
+                },
+                "AC1 — {phase:?} promeut toujours : c'est ainsi que part le vol \
+                 suivant d'un ticket à plusieurs vols"
+            );
+        }
+
+        // AC4 — la ligne d'audit du déclin, relisible.
+        let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
+            3030,
+            Some(BRANCH_3030),
+            &measurement,
+            &declined,
+            50,
+        ))
+        .expect("l'audit est du JSON valide");
+        assert_eq!(json["outcome"], "decline");
+        assert_eq!(json["reason"], "consent_returned_by_merge");
+        assert_eq!(json["issue"], 3030);
+        assert_eq!(json["merged_pr"], 3032);
         assert!(
-            !matches!(decision, PromotionGate::Promote { .. }),
-            "AC1 — en `phase0_feeder`, une mesure de merge doit décliner sous une \
-             raison nommée, jamais promouvoir : le `ready` que le merge a rendu \
-             n'est pas un consentement que le feeder puisse se redonner ; \
-             vu : {decision:?}"
+            !json["issue"].is_null() && !json["merged_pr"].is_null(),
+            "AC4 — les deux dimensions que l'opérateur groupe doivent être \
+             présentes et non nulles ; vu : {json}"
         );
     }
 }
