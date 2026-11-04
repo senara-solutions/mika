@@ -14992,6 +14992,95 @@ echo ""
 echo "Test mika#2029: fraîcheur du démon helper — le code installé bat la vivacité"
 echo "------------------------------------------------------------"
 
+# `_pilot_flight_fixture <état> <répertoire>` — pose dans <répertoire> l'état des
+# fichiers qu'un pilote laisse derrière lui, tel qu'il a été MESURÉ sur l'hôte
+# (mika#3031). Partagé par les DEUX sondes de fraîcheur, pour qu'elles ne
+# puissent pas en porter deux copies qui divergeraient le jour où l'une bouge.
+#
+# CE QUE LA MESURE DIT. Le `.log` naît au lancement du pilote et s'écrit jusqu'à
+# sa sortie ; le `.stderr` naît À LA SORTIE — il est copié après `PILOT_EXIT=$?`.
+# Pendant le vol, il n'existe pas. Sur trois vols mesurés, l'écart entre la
+# dernière écriture du `.log` et la naissance du `.stderr` va de +0,6 s à +3,3 s.
+#
+# CE QUE LES FIXTURES D'AVANT FABRIQUAIENT. Un `*.stderr` frais, c'est-à-dire
+# l'état d'un pilote DÉJÀ SORTI — jamais celui d'un vol. Les deux tests de
+# déférence étaient donc verts sur un état qui n'arrive pas pendant un vol, et
+# muets sur le seul qui arrive.
+#
+# L'ÂGE posé sur le `.log` est ce qui discrimine un vol d'un `.log` orphelin pour
+# de bon : l'hôte en porte 878 sur 3 539 `.log`, et le plus jeune orphelin MORT a
+# 11,5 jours. Un signal qui ne regarderait que l'appariement resterait vrai à
+# jamais sur ces 878, donc gèlerait la relance pour toujours — c'est-à-dire
+# mika#2780 réintroduit par le correctif de mika#3031.
+_pilot_flight_fixture() {   # $1 = état, $2 = répertoire de logs
+    local state="$1" dir="$2" id age_s
+    case "$state" in
+        # un vol qui vient de naître, puis un vol plus vieux que l'ancienne
+        # fenêtre de 300 s : la déférence ne doit dépendre d'aucune fenêtre tant
+        # qu'un pilote vole
+        deferred)     id=vol-en-cours; age_s=0 ;;
+        deferred_old) id=vol-ancien;   age_s=600 ;;
+        # un pilote SORTI : les deux fichiers, tous deux frais. Il n'a plus de
+        # tunnel CONNECT à couper, donc il ne doit plus rien différer
+        exited)       id=vol-sorti;    age_s=0 ;;
+        # un `.log` que plus aucun pilote n'écrit et que plus aucun `.stderr` ne
+        # viendra apparier
+        orphan)       id=vol-orphelin; age_s=259200 ;;
+        *)            return 0 ;;
+    esac
+    printf 'ligne de vol %s\n' "$id" > "$dir/$id.log"
+    if [ "$state" = exited ]; then
+        printf 'sortie de %s\n' "$id" > "$dir/$id.stderr"
+    fi
+    if [ "$age_s" -gt 0 ]; then
+        touch -d "-${age_s} seconds" "$dir/$id.log"
+    fi
+    return 0
+}
+
+# CONTRÔLE DE L'INSTRUMENT, et il est tiré AVANT les assertions qui en dépendent.
+#
+# L'âge de la fixture est posé par `touch -d` sous forme relative. Sur un `touch`
+# qui ne la connaît pas, le `.log` resterait FRAIS : `vol-ancien` deviendrait
+# indiscernable de `vol-en-cours`, `vol-orphelin` d'un vol, et les deux
+# assertions passeraient au vert sur le mauvais état. Cette ligne mesure donc
+# l'âge plutôt que de le supposer — et elle est aussi la forme la plus nue de ce
+# que le vol établit : un `.log` de 600 s est HORS d'une fenêtre de 300 s, donc
+# tout prédicat fenêtré à 300 s rend faux sur un vol de cet âge.
+T3031_FIXTURE_DIR=$(mktemp -d)
+_pilot_flight_fixture deferred_old "$T3031_FIXTURE_DIR"
+T3031_FIXTURE_AGE="$(
+    _cut300=$(date -u -d "-300 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    _cut1800=$(date -u -d "-1800 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    _in300=$(find "$T3031_FIXTURE_DIR" -maxdepth 1 -name '*.log' \
+        -newermt "${_cut300:-1970-01-01T00:00:00Z}" -print -quit 2>/dev/null)
+    _in1800=$(find "$T3031_FIXTURE_DIR" -maxdepth 1 -name '*.log' \
+        -newermt "${_cut1800:-1970-01-01T00:00:00Z}" -print -quit 2>/dev/null)
+    printf '%s %s' \
+        "$([ -n "$_in300" ] && echo dedans || echo dehors)" \
+        "$([ -n "$_in1800" ] && echo dedans || echo dehors)"
+)"
+assert_eq "mika#3031 instrument: un vol de 600 s est hors d'une fenêtre de 300 s, dans celle de 1800 s" \
+    "dehors dedans" "$T3031_FIXTURE_AGE"
+rm -rf "$T3031_FIXTURE_DIR"
+
+# L'autre moitié du contrôle : AUCUNE fixture de vol ne pose de `.stderr`. C'est
+# la propriété que les fixtures d'avant violaient, et un `.stderr` qui
+# reviendrait en douce rendrait les tests de déférence verts pour la mauvaise
+# raison. Compté sur les quatre états à la fois, `<.log>/<.stderr>`.
+T3031_FIXTURE_SHAPE="$(
+    for _s in deferred deferred_old exited orphan; do
+        _d=$(mktemp -d)
+        _pilot_flight_fixture "$_s" "$_d"
+        printf '%s=%s/%s ' "$_s" \
+            "$(find "$_d" -maxdepth 1 -name '*.log' 2>/dev/null | wc -l | tr -d ' ')" \
+            "$(find "$_d" -maxdepth 1 -name '*.stderr' 2>/dev/null | wc -l | tr -d ' ')"
+        rm -rf "$_d"
+    done
+)"
+assert_eq "mika#3031 instrument: seul l'état « sorti » pose un \`.stderr\`" \
+    "deferred=1/0 deferred_old=1/0 exited=1/1 orphan=1/0 " "$T3031_FIXTURE_SHAPE"
+
 # `_daemon_freshness_probe <état> [lib]` — monte un VRAI porteur de port sur un
 # port éphémère, met l'état en place, rappelle `_ensure_pilot_helper`, et rend
 # ce que la garde en a fait :
@@ -15073,9 +15162,11 @@ FAKE_MITMDUMP
 
         # `make install` réécrit l'addon sous le démon déjà lancé.
         case "$state" in
-            stale|deferred|undecidable) sleep 1.1; touch "$ghaddon" ;;
+            stale|deferred|deferred_old|exited|orphan|undecidable)
+                sleep 1.1; touch "$ghaddon" ;;
         esac
-        [ "$state" = deferred ] && touch "$tmp/pilotlogs/frere.stderr"
+        # L'état des fichiers de vol, mesuré plutôt que fabriqué (mika#3031).
+        _pilot_flight_fixture "$state" "$tmp/pilotlogs"
         if [ "$state" = undecidable ]; then
             # Un porteur que la découverte ne rend pas. L'état de PÉREMPTION est
             # identique à V2 : seule la lisibilité du porteur change, donc la
@@ -15142,13 +15233,42 @@ else
         "rc=0 token=stale launches=2 first=dead listening=yes" \
         "$(_daemon_freshness_probe stale)"
 
-    # V3 — DÉFÉRENCE (D4). Même état que V2, plus un `*.stderr` frais dans
-    # PILOT_LOG_DIR : tuer le mitmdump sous un pilote qui stream fabriquerait la
-    # classe de panne que mika#2029 existe pour éteindre. Aucun TERM, rc 0, et le
-    # prochain dispatch sans frère en vol relancera (auto-guérissant).
+    # V3 — DÉFÉRENCE (D4). Même état que V2, plus l'état MESURÉ d'un vol dans
+    # PILOT_LOG_DIR — un `.log` qui s'écrit, aucun `.stderr`. Tuer le mitmdump
+    # sous un pilote qui stream fabriquerait la classe de panne que mika#2029
+    # existe pour éteindre. Aucun TERM, rc 0, et le prochain dispatch sans frère
+    # en vol relancera (auto-guérissant).
     assert_eq "V3 déférence: pilote frère en vol ⇒ stale_deferred, aucun TERM" \
         "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
         "$(_daemon_freshness_probe deferred)"
+
+    # V3b — LE VOL QUI DURE. Même état que V3, le `.log` vieilli de 600 s. C'est
+    # l'état que les 7 relances mesurées par le ticket ont rencontré : leurs vols
+    # avaient 79, 103, 189, 512, 679, 1 351 et 1 439 s. Un prédicat fenêtré à
+    # 300 s rend faux sur cinq d'entre eux, et c'est exactement ce que fait
+    # celui d'avant — voir le test de bonne foi plus bas.
+    assert_eq "V3b déférence: un vol de plus de 300 s diffère quand même" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe deferred_old)"
+
+    # V3c — LE PILOTE SORTI NE DIFFÈRE PLUS. Les deux fichiers, tous deux frais.
+    # Le `.stderr` quitte le prédicat : il naît à la sortie, il ne témoigne
+    # d'aucun vol, et sa seule contribution d'avant était de différer la relance
+    # 300 s après chaque vol FINI. Un pilote sorti n'a plus de tunnel CONNECT à
+    # couper, donc le démon périmé est relancé tout de suite.
+    assert_eq "V3c sorti: \`.log\` et \`.stderr\` tous deux frais ⇒ stale, relance" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_daemon_freshness_probe exited)"
+
+    # V3d — LE CONTRÔLE NÉGATIF QUI COMPTE VRAIMENT (AC2). Un `.log` de trois
+    # jours sans `.stderr` : un vol tué par SIGKILL n'en aura jamais. L'hôte en
+    # porte 878, et un appariement SANS plafond d'ancienneté resterait vrai sur
+    # eux à jamais — la relance gelée pour toujours, c'est-à-dire mika#2780
+    # réintroduit par ce correctif-ci. Le plafond est donc armé, et cette ligne
+    # est ce qui le tient.
+    assert_eq "V3d orphelin: un \`.log\` de 3 jours sans \`.stderr\` ⇒ stale, relance" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_daemon_freshness_probe orphan)"
 
     # V4 — INDÉCIDABLE. Le port est tenu, mais la découverte ne rend pas son
     # porteur. « On ne sait pas » n'est pas « périmé » : aucun TERM, rc 0, et la
@@ -15269,9 +15389,11 @@ FAKE_RELAY
         # `make install` réécrit le binaire sous le démon déjà lancé — c'est
         # littéralement l'occurrence du 2026-10-18 (mika#2778).
         case "$state" in
-            stale|deferred) sleep 1.1; touch "$bin" ;;
+            stale|deferred|deferred_old) sleep 1.1; touch "$bin" ;;
         esac
-        [ "$state" = deferred ] && touch "$tmp/pilotlogs/frere.stderr"
+        # Même fixture que la sonde jumelle, et c'est le point : l'état d'un vol
+        # n'a pas deux définitions dans cette suite (mika#3031).
+        _pilot_flight_fixture "$state" "$tmp/pilotlogs"
 
         _ensure_pilot_egress_proxy >/dev/null 2>"$err"
     ) && rc=0 || rc=$?
@@ -15333,14 +15455,23 @@ else
         "rc=0 token=stale launches=2 first=dead listening=yes" \
         "$(_relay_freshness_probe stale)"
 
-    # R3 — DÉFÉRENCE (D4). Même état que R2, plus un `*.stderr` frais dans
-    # PILOT_LOG_DIR. Tuer le relais sous un pilote qui stream couperait ses
-    # tunnels CONNECT en vol — la classe de panne que mika#2029 existe pour
-    # éteindre. Aucun TERM, rc 0, et le prochain dispatch sans frère en vol
-    # relancera (auto-guérissant).
+    # R3 — DÉFÉRENCE (D4). Même état que R2, plus l'état MESURÉ d'un vol dans
+    # PILOT_LOG_DIR — un `.log` qui s'écrit, aucun `.stderr`. Tuer le relais sous
+    # un pilote qui stream couperait ses tunnels CONNECT en vol — la classe de
+    # panne que mika#2029 existe pour éteindre. Aucun TERM, rc 0, et le prochain
+    # dispatch sans frère en vol relancera (auto-guérissant).
     assert_eq "R3 déférence: pilote frère en vol ⇒ stale_deferred, aucun TERM" \
         "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
         "$(_relay_freshness_probe deferred)"
+
+    # R3b — LE VOL QUI DURE, sur CE porteur-ci. C'est celui des deux dont la
+    # relance coupe les tunnels CONNECT du pilote, donc l'état des 7 relances
+    # mesurées par le ticket vaut d'être tenu ici aussi — et non délégué au
+    # verdicteur partagé comme l'est `undecidable` (voir R4). Les trois autres
+    # états de la sonde jumelle, eux, sont bien des propriétés du verdicteur.
+    assert_eq "R3b déférence: un vol de plus de 300 s diffère quand même" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_relay_freshness_probe deferred_old)"
 
     # R4 — CONTRE-VACUITÉ, constatée et consignée dans la PR. Le crochet `lib`
     # ci-dessus, pointé sur une copie de `main`
