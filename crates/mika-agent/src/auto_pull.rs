@@ -12727,4 +12727,37 @@ Un ticket à plusieurs vols.
             );
         }
     }
+
+    // ─── mika#3036 — la phase sépare rendre un consentement et s'en donner un ───
+
+    /// La branche du ticket #3030, celle que la PR #3032 a mergée puis
+    /// supprimée : la mesure du § 1.1 du plan, rejouée.
+    const BRANCH_3030: &str = "fix/3030/lallowlist-du-worktree-est-construite";
+
+    /// **AC1 — en phase 0, une mesure de merge refuse la promotion.**
+    ///
+    /// Le merge vient de rendre le `ready` (mika#3022, voie B de mika#2995) ; le
+    /// feeder ne peut pas se le redonner. En phases 1 et 2 le ticket porte déjà
+    /// `ready`, et la règle de mika#2837 y reste entière : la même mesure
+    /// promeut, parce qu'elle laisse partir le vol suivant d'un ticket à
+    /// plusieurs vols.
+    ///
+    /// Écrit sur la signature d'**aujourd'hui** — `classify_promotion` ne reçoit
+    /// pas encore la phase —, ce test est le défaut mesuré reproduit à la
+    /// demande : faute de phase, la porte décide pareil partout, donc la phase 0
+    /// promeut. Il est **rouge** jusqu'au commit suivant, et c'est son objet.
+    #[test]
+    fn mika3036_la_phase_decide_de_la_mesure_de_merge() {
+        let measurement = StalenessMeasurement::BranchDeletedByMerge { pr: 3032 };
+
+        let decision = classify_promotion(&measurement, Some(BRANCH_3030), 50);
+
+        assert!(
+            !matches!(decision, PromotionGate::Promote { .. }),
+            "AC1 — en `phase0_feeder`, une mesure de merge doit décliner sous une \
+             raison nommée, jamais promouvoir : le `ready` que le merge a rendu \
+             n'est pas un consentement que le feeder puisse se redonner ; \
+             vu : {decision:?}"
+        );
+    }
 }
