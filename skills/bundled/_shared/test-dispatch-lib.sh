@@ -15449,6 +15449,76 @@ else
         "vu=oui relatif=0" "$T3031_T5_SEEN"
 fi
 
+# --- mika#3031 : deux scans refusent le retour du prédicat et de l'offset -----
+
+echo ""
+echo "Test mika#3031: deux scans structurels — un seul signal, aucune coupure relative"
+echo "------------------------------------------------------------"
+
+# FIRE-DISPOSITION, option (a) pour les deux scans ci-dessous : la table
+# d'exceptions est DÉCLARÉE et VIDE, et son vide est asserté à l'exécution.
+# Déclarée pour que le prochain qui veut y mettre une entrée voie d'abord qu'elle
+# existe exprès ; assertée vide pour qu'une entrée ajoutée en silence tire. Les
+# détecteurs partent ARMÉS — doctrine mika#2201. C'est cette assertion-ci qui
+# empêche l'allowlist de devenir celle que mika#2309 condamne : y ajouter une
+# entrée sans nommer sa donnée et son ticket rougit la suite.
+T3031_SIBLING_PREDICATE_ALLOWLIST=()
+assert_eq "S1: table d'exceptions du scan « un seul prédicat frère en vol » — zero entries" \
+    "0" "${#T3031_SIBLING_PREDICATE_ALLOWLIST[@]}"
+T3031_RELATIVE_NEWERMT_ALLOWLIST=()
+assert_eq "S2: table d'exceptions du scan \`-newermt\` relatif — zero entries" \
+    "0" "${#T3031_RELATIVE_NEWERMT_ALLOWLIST[@]}"
+
+# S1 (AC4) — UN SEUL PRÉDICAT « frère en vol », donc un seul signal pour les deux
+# démons. Le relais et le `mitmdump` passent déjà par le même verdicteur ; ce que
+# ce scan refuse, c'est le geste qui les séparerait — un second prédicat écrit
+# pour l'un des deux, qui dériverait du premier le jour où l'un est touché (D1).
+#
+# COMPTÉ, JAMAIS CHERCHÉ : un `grep -c` qui rend `0` est aussi ce que rendrait une
+# extraction vide. Les deux nombres sont donc non nuls et assertés ensemble — une
+# définition, un appel.
+T3031_S1_DEFS=$(grep -cE '^_pilot_sibling_pilot_in_flight\(\)' "$DISPATCH_LIB" || true)
+T3031_S1_MENTIONS=$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" \
+    | grep -cE '_pilot_sibling_pilot_in_flight' || true)
+assert_eq "S1 (AC4): un seul prédicat « frère en vol », appelé une seule fois" \
+    "defs=1 appels=1" \
+    "defs=$T3031_S1_DEFS appels=$((T3031_S1_MENTIONS - T3031_S1_DEFS))"
+
+# S2 — AUCUNE COUPURE `-newermt` EN FORME RELATIVE NI `@epoch`. La forme ISO 8601
+# absolue est la seule que GNU documente, donc la seule sur laquelle on puisse
+# écrire un invariant qui vaille sur un `find` qu'on n'a pas mesuré. Un lecteur
+# futur qui « simplifierait » vers `-newermt "-1800 seconds"` économiserait un
+# `date` et rendrait le signal dépendant de l'implémentation présente sur le PATH
+# du démon — sans aucune erreur, puisque les deux formes marchent ici.
+#
+# LE TOTAL EST ASSERTÉ EN REGARD DU ZÉRO, et c'est tout le sujet : un `relatif=0`
+# serait aussi ce que rendrait la DISPARITION de la ligne. Le couple dit donc
+# « il y a bien une coupure, et elle n'est pas relative » plutôt que « je n'ai
+# rien trouvé ».
+T3031_S2_TOTAL=$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cE -- '-newermt' || true)
+T3031_S2_RELATIVE=$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" \
+    | grep -cE -- '-newermt[[:space:]]+"?[-+@]' || true)
+assert_eq "S2: une seule coupure \`-newermt\`, et elle n'est ni relative ni \`@epoch\`" \
+    "total=1 relatif=0" \
+    "total=$T3031_S2_TOTAL relatif=$T3031_S2_RELATIVE"
+
+# ANTI-VACUITÉ DU MOTIF DE S2 : il APPARIE-T-IL les trois formes qu'il refuse ?
+# Sans cette ligne, `relatif=0` serait aussi la réponse d'une expression cassée,
+# et le scan passerait vert sur le jour même où quelqu'un réécrit la coupure en
+# relatif. Tiré sur des lignes synthétiques, jamais sur la source.
+T3031_S2_MOTIF="$(
+    _m() { printf '%s\n' "$1" | grep -cE -- '-newermt[[:space:]]+"?[-+@]' || true; }
+    printf 'moins=%s plus=%s epoch=%s nu=%s iso=%s var=%s' \
+        "$(_m '    -newermt "-1800 seconds" \')" \
+        "$(_m '    -newermt "+1800 seconds" \')" \
+        "$(_m '    -newermt "@1762244000" \')" \
+        "$(_m '    -newermt -1800 \')" \
+        "$(_m '    -newermt "2026-03-18T12:00:00Z" \')" \
+        "$(_m '    -newermt "$_cut" 2>/dev/null)" || true')"
+)"
+assert_eq "S2 anti-vacuité: le motif apparie bien le relatif et l'\`@epoch\`, et laisse passer l'ISO" \
+    "moins=1 plus=1 epoch=1 nu=1 iso=0 var=0" "$T3031_S2_MOTIF"
+
 # --- mika#2780 : la fraîcheur couvre le SECOND porteur, le relais d'egress ----
 
 echo ""
