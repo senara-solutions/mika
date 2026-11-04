@@ -15301,6 +15301,154 @@ assert_eq "mika#2029: le verdicteur écrit 3 lignes nommées, aucune pour \`fres
     "3 0" \
     "$(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.' || true) $(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.fresh' || true)"
 
+# --- mika#3031 : bonne foi — les trois causes sont reproductibles -------------
+
+echo ""
+echo "Test mika#3031: bonne foi — chaque cause du signal « frère en vol » se rejoue"
+echo "------------------------------------------------------------"
+
+# T3 (AC3) — LA CAUSE A, reproduite à la demande. Sur la fixture d'un vol de
+# 600 s, le prédicat d'AVANT et celui d'APRÈS sont tirés côte à côte, et ils ne
+# disent pas la même chose : l'ancien rend FAUX sur un pilote vivant.
+#
+# L'ancien prédicat est RECOPIÉ EN LIGNE plutôt que lu dans une autre révision.
+# C'est la raison pour laquelle V5 et R4 ne sont, eux, pas assertés en
+# permanence : lire `origin/main` depuis la suite donnerait un test vert hors
+# réseau et rouge en archive détachée. Il tient en un `find`, donc le recopier ne
+# coûte rien et le garde exécutable partout.
+T3031_T3_DIR=$(mktemp -d)
+_pilot_flight_fixture deferred_old "$T3031_T3_DIR"
+T3031_T3="$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB" 2>/dev/null || true
+    _old=$(find "$T3031_T3_DIR" -maxdepth 1 -name '*.stderr' \
+        -newermt "-300 seconds" -print -quit 2>/dev/null)
+    PILOT_LOG_DIR="$T3031_T3_DIR"
+    _pilot_sibling_pilot_in_flight; _rc=$?
+    case "$_rc" in
+        0) _new=vrai ;;
+        1) _new=faux ;;
+        *) _new="rc$_rc" ;;
+    esac
+    printf 'avant=%s après=%s' "$([ -n "$_old" ] && echo vrai || echo faux)" "$_new"
+)"
+assert_eq "T3 bonne foi (cause A): sur un vol de 600 s, l'ancien prédicat rend faux, le nouveau vrai" \
+    "avant=faux après=vrai" "$T3031_T3"
+rm -rf "$T3031_T3_DIR"
+
+# T4 — CONTRÔLE DE FORME DU TIMESTAMP, sur un `.log` posé à un mtime CONNU
+# plutôt qu'à un âge relatif : les deux coupures encadrent cet instant à une
+# seconde près, de part et d'autre, donc une forme mal interprétée ne peut pas
+# rendre la bonne réponse par chance.
+#
+# Ce que la ligne établit : la forme ISO 8601 absolue — celle que le prédicat
+# emploie — est exacte DANS LES DEUX SENS. C'est l'assertion qui compte, parce
+# qu'un `-newermt` mal interprété ne lève aucune erreur : il rend simplement le
+# mauvais ensemble, et le signal devient faux en silence.
+#
+# Elle mesure `@epoch` en regard, et la mesure CORRIGE le grooming de ce ticket :
+# la forme epoch est exacte elle aussi sous les deux `find` de ce parc (GNU
+# findutils 4.10.0 et bfs 4.1.1). Le § M3 du plan lui prêtait une mauvaise
+# interprétation ; le re-calcul montre que l'erreur était dans ses deux libellés
+# d'instants, non dans la réponse de `find`. L'ISO absolu reste la forme retenue
+# pour une autre raison, qui tient : c'est la seule que GNU documente. Que la
+# source n'emploie ni l'une ni l'autre des deux autres formes est une propriété
+# STRUCTURELLE, tenue par le scan S2 et non par cette ligne.
+#
+# `date -u -d` et `touch -d` en forme absolue sont supposés GNU, comme partout
+# ailleurs dans cette suite (`_pilot_flight_fixture` vieillit déjà par `touch -d`).
+T3031_T4_DIR=$(mktemp -d)
+printf 'ligne de vol\n' > "$T3031_T4_DIR/connu.log"
+touch -d "2026-03-18T12:00:00Z" "$T3031_T4_DIR/connu.log"
+T3031_T4="$(
+    _t4_probe() {   # $1 = instant de coupure ; rend trouve|rien
+        if [ -n "$(find "$T3031_T4_DIR" -maxdepth 1 -name '*.log' \
+            -newermt "$1" -print -quit 2>/dev/null)" ]; then echo trouve; else echo rien; fi
+    }
+    printf 'iso_avant=%s iso_apres=%s epoch_avant=%s epoch_apres=%s' \
+        "$(_t4_probe '2026-03-18T11:59:59Z')" \
+        "$(_t4_probe '2026-03-18T12:00:01Z')" \
+        "$(_t4_probe "@$(date -u -d '2026-03-18T11:59:59Z' +%s)")" \
+        "$(_t4_probe "@$(date -u -d '2026-03-18T12:00:01Z' +%s)")"
+)"
+assert_eq "T4 forme du timestamp: l'ISO absolu est exact dans les deux sens sur un mtime connu" \
+    "iso_avant=trouve iso_apres=rien epoch_avant=trouve epoch_apres=rien" "$T3031_T4"
+rm -rf "$T3031_T4_DIR"
+
+# T5 — LA CAUSE B, tenue SANS dépendre du `find` de l'hôte. Un `find` hostile qui
+# refuse tout instant relatif est monté par surcharge, et le signal doit rester
+# vrai sur la fixture d'un vol. Sous un `find` réel la ligne ne prouverait rien :
+# elle serait verte là où la forme relative est acceptée (les deux
+# implémentations de ce parc) et n'aurait jamais tiré sur celle qui la refuse.
+#
+# La surcharge n'existe QUE dans le sous-shell de la sonde — définie au niveau du
+# fichier, elle fuirait dans tous les blocs suivants.
+#
+# Elle TRACE tout `-newermt` qu'elle voit passer dans `$_T3031_T5_TRACE`, et cette
+# trace est ce qui rend T5 non vide. Sans elle, T5 serait vert aussi bien quand la
+# surcharge est atteinte que quand elle ne l'est pas — un doublon de V3b déguisé
+# en mesure, puisque le prédicat corrigé ne passe plus aucun instant relatif.
+_t3031_hostile_find() {
+    local _prev="" _a
+    for _a in "$@"; do
+        if [ "$_prev" = "-newermt" ]; then
+            [ -n "${_T3031_T5_TRACE:-}" ] && printf '%s\n' "$_a" >> "$_T3031_T5_TRACE"
+            case "$_a" in
+                -*|+*)
+                    echo "find: hostile (mika#3031): refuse un instant relatif : $_a" >&2
+                    return 1 ;;
+            esac
+        fi
+        _prev="$_a"
+    done
+    command find "$@"
+}
+
+# CONTRÔLE DE L'INSTRUMENT, tiré avant l'assertion qui en dépend : la surcharge
+# refuse-t-elle VRAIMENT le relatif, et laisse-t-elle VRAIMENT passer l'ISO ? Une
+# surcharge qui déléguerait tout rendrait T5 vert sans rien avoir mesuré.
+T3031_T5_INSTRUMENT="$(
+    _d=$(mktemp -d)
+    printf 'x\n' > "$_d/a.log"
+    find() { _t3031_hostile_find "$@"; }
+    _rel=$(find "$_d" -maxdepth 1 -name '*.log' -newermt "-1800 seconds" -print -quit 2>/dev/null)
+    _iso=$(find "$_d" -maxdepth 1 -name '*.log' -newermt "1970-01-01T00:00:00Z" -print -quit 2>/dev/null)
+    printf 'relatif=%s iso=%s' \
+        "$([ -n "$_rel" ] && echo passe || echo refuse)" \
+        "$([ -n "$_iso" ] && echo passe || echo refuse)"
+    rm -rf "$_d"
+)"
+assert_eq "mika#3031 instrument: le \`find\` hostile refuse le relatif et accepte l'ISO" \
+    "relatif=refuse iso=passe" "$T3031_T5_INSTRUMENT"
+
+if ! command -v fuser >/dev/null 2>&1; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP T5 mika#3031 — 'fuser' introuvable : la sonde de fraîcheur ne peut"
+    echo "    rien mesurer sans lui (même cause que le SKIP de mika#2029 ci-dessus)."
+    echo "    Remède : installer psmisc (Debian/Ubuntu) ou sys-process/psmisc (Gentoo)."
+else
+    T3031_T5_TRACE_FILE=$(mktemp)
+    T3031_T5="$(
+        _T3031_T5_TRACE="$T3031_T5_TRACE_FILE"
+        find() { _t3031_hostile_find "$@"; }
+        _daemon_freshness_probe deferred_old
+    )"
+    # `vu=oui` dit que la surcharge a bien été ATTEINTE dans le sous-shell de la
+    # sonde, et `relatif=0` qu'aucun des instants qui y sont passés n'était
+    # relatif — donc que le vert ci-dessus est celui du prédicat corrigé sous un
+    # `find` hostile, et non celui d'un `find` réel qui n'aurait rien refusé.
+    T3031_T5_SEEN="$(
+        _n=$(wc -l < "$T3031_T5_TRACE_FILE" | tr -d ' ')
+        _rel=$(grep -cE '^[-+]' "$T3031_T5_TRACE_FILE" || true)
+        printf 'vu=%s relatif=%s' "$([ "$_n" -gt 0 ] && echo oui || echo non)" "$_rel"
+    )"
+    rm -f "$T3031_T5_TRACE_FILE"
+    assert_eq "T5 bonne foi (cause B): sous un \`find\` qui refuse le relatif, le vol diffère quand même" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" "$T3031_T5"
+    assert_eq "T5 anti-vacuité: la surcharge est atteinte, et aucun instant relatif n'y passe" \
+        "vu=oui relatif=0" "$T3031_T5_SEEN"
+fi
+
 # --- mika#2780 : la fraîcheur couvre le SECOND porteur, le relais d'egress ----
 
 echo ""
