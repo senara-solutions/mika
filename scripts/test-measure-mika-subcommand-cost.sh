@@ -188,12 +188,12 @@ run_measure bash "$MEASURE_PATH" --mika "$FAKE_DIR/mika" --repeat 1 --dispatch-l
 BOTH="$(cat "$WORK/out" "$WORK/err")"
 if [[ "$RC" -ne 2 ]]; then
     ko "6. anti-vacuité : code 2" "2" "$RC — sortie: $(printf '%s' "$BOTH" | tr '\n' ' ')"
-elif ! printf '%s' "$BOTH" | grep -q 'sites-total: 0'; then
+elif ! grep -qF -- 'sites-total: 0' <<<"$BOTH"; then
     ko "6. anti-vacuité : le compte rend 0" "'sites-total: 0'" "$(printf '%s' "$BOTH" | tr '\n' ' ')"
-elif ! printf '%s' "$BOTH" | grep -q 'population vide'; then
+elif ! grep -qF -- 'population vide' <<<"$BOTH"; then
     ko "6. anti-vacuité : la population vide est SIGNALÉE" \
         "'population vide'" "$(printf '%s' "$BOTH" | tr '\n' ' ')"
-elif printf '%s' "$BOTH" | grep -q 'pire-cas'; then
+elif grep -qF -- 'pire-cas' <<<"$BOTH"; then
     ko "6. anti-vacuité : AUCUN coût n'est rendu" \
         "pas de 'pire-cas' — un 0 ms se lirait « négligeable »" "$(printf '%s' "$BOTH" | tr '\n' ' ')"
 else
