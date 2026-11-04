@@ -12,11 +12,23 @@
 //! `tests/fixtures/auto_pull_compare/PROVENANCE.md`.
 
 use mika_agent::auto_pull::{
-    PromotionGate, RefusalReason, StalenessMeasurement, classify_promotion, parse_compare_payload,
+    ExclusionPhase, PromotionGate, RefusalReason, StalenessMeasurement, parse_compare_payload,
 };
 
 /// The default threshold at the time these fixtures were frozen.
 const THRESHOLD: i64 = 50;
+
+/// Ancre cette suite, antérieure à mika#3036, sur la phase dont ce vol ne change
+/// RIEN. C'est ce qui en fait son contrôle de non-régression : si un de ces
+/// rejeux bouge, c'est que les phases 1 et 2 ont bougé. Aucune de ces mesures
+/// n'est celle du merge — la seule que la phase départage.
+fn classify_promotion(
+    m: &StalenessMeasurement,
+    branch: Option<&str>,
+    max_behind: i64,
+) -> PromotionGate {
+    mika_agent::auto_pull::classify_promotion(m, branch, max_behind, ExclusionPhase::Phase1Pull)
+}
 
 fn fixture(name: &str) -> StalenessMeasurement {
     let path = concat!(
@@ -91,6 +103,14 @@ fn auto_pull_replay_1680_is_refused_by_name() {
         }
         PromotionGate::Promote { detail } => {
             panic!("#1680 must not be promoted (got promote/{detail})")
+        }
+        // mika#3036 — un déclin ici serait un défaut : aucune de ces mesures
+        // n'est celle du merge, la seule que la phase départage.
+        PromotionGate::Decline(ref r) => {
+            panic!(
+                "#1680 is not a merge measurement (got decline/{})",
+                r.slug()
+            )
         }
     }
 }
@@ -403,6 +423,12 @@ fn auto_pull_replay_the_promote_refuse_partition_is_unchanged() {
             PromotionGate::Promote { detail } => {
                 assert_eq!(detail, verdict, "{name}: promotion detail changed");
                 promoted.push(name);
+            }
+            // mika#3036 — aucune de ces fixtures n'est une mesure de merge ; un
+            // déclin signalerait que la phase décide d'une population qui n'est
+            // pas la sienne.
+            PromotionGate::Decline(r) => {
+                panic!("{name}: not a merge measurement (got decline/{})", r.slug())
             }
         }
     }
