@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# measure-mika-subcommand-cost — la sonde S3, en une commande (mika#2194, vol 7).
+# Ce que coûte UN démarrage de `mika` sur le chemin nominal de chaque prédicat
+# que la migration a mis sur le chemin d'un dispatch. La halte est écrite dans
+# `docs/architecture/dispatch-lib-migration.md` § 8 ; cet en-tête ne garde que ce
+# qui défend le code adjacent.
+#
+# DEUX SOUS-COMMANDES, DEUX FIXTURES, ET L'INSTRUMENT LES ÉCRIT LUI-MÊME.
+#   mika plan-callout    --body-file <f>                  sur un callout bien formé
+#   mika arch-disposition --pass first --response-file <f> sur `Disposition: READY`
+# Les deux fixtures naissent dans un `mktemp` et meurent avec le `trap`. La
+# mesure ne lit AUCUN fichier du dépôt — sinon le chiffre dépendrait du répertoire
+# courant, de la taille d'un corps de ticket réel et du cache de page de l'hôte,
+# c'est-à-dire de tout sauf de ce qu'on mesure. Le chemin nominal est VÉRIFIÉ :
+# la première répétition doit sortir à `0`, sinon on chronométrerait le chemin
+# d'erreur en l'appelant « coût du prédicat ».
+#
+# P50 ET P95, JAMAIS UNE MOYENNE. Un démarrage de processus a une longue traîne
+# — premier accès disque, planification, pression mémoire — et une moyenne mêle
+# le coût stable au pic en un seul nombre dont aucune des deux moitiés ne se
+# relit. Le p50 dit ce qu'on paie d'habitude, le p95 ce qu'on paie au pire ; la
+# halte se décide sur le p95, parce qu'un dispatch n'a pas droit à la moyenne.
+#
+# LE COMPTE DE SITES EST DÉRIVÉ À CHAQUE PASSAGE, JAMAIS ÉCRIT. `dispatch-lib.sh`
+# est la source de vérité du nombre d'appels de production ; une constante ici en
+# serait une seconde, c'est-à-dire exactement la duplication que mika#2194 existe
+# pour retirer. Le compte se lit sur les TROIS ENVELOPPES — `_extract_plan_path`,
+# `_parse_disposition`, `_parse_verdict` — et non sur les invocations brutes de
+# `mika` : les enveloppes sont partagées, donc compter les invocations rendrait
+# trois pour six sites réellement traversés.
+#
+#   plan-callout      ← `_extract_plan_path`                        (3 sites)
+#   arch-disposition  ← `_parse_disposition`, `_parse_verdict`      (3 sites)
+#
+# CE QUE LE COMPTE EXCLUT, ET PAR QUELLE FORME. Les commentaires d'abord (même
+# `strip_comments` que `scripts/check-suite-wiring.sh`), ce qui écarte la
+# douzaine de lignes de doctrine qui nomment les enveloppes. Les trois
+# DÉFINITIONS ensuite, par le caractère suivant : un `(` collé au nom n'est
+# jamais un appel en bash, c'est une déclaration. Les six littéraux de message
+# (`… (_parse_disposition)"`) enfin, par le caractère PRÉCÉDENT : un site est en
+# position de commande — après `$(`, après un `|`, après un `&&`, après un
+# mot-clé, ou en tête de ligne — et une parenthèse nue n'est aucune de ces
+# positions. Le compte porte sur les OCCURRENCES (`grep -oE`), pas sur les
+# lignes : une ligne qui porterait deux sites ne doit pas en valoir un.
+#
+# LE PRODUIT `p95 × sites` EST NOMMÉ POUR CE QU'IL EST : le pire cas d'un
+# dispatch dev-groom qui prendrait TOUTES les branches. Aucun dispatch réel ne
+# les prend toutes — c'est un majorant, et le présenter comme « le coût d'un
+# dispatch » serait une inflation d'instrument.
+#
+# POPULATION VIDE ≠ COÛT NUL (classe mika#2205). Si une des deux familles ne
+# compte plus aucun site, le produit vaut `0` et se lirait « négligeable » alors
+# que rien n'a été compté. L'instrument REFUSE en rendant le compte et en nommant
+# la population vide : une sonde que personne n'exerce se lit exactement comme
+# une sonde qui marche.
+#
+# TROIS CODES DE SORTIE, ET LE `3` EST UN RÉSULTAT, PAS UNE PANNE.
+#   0  les deux p95 sont sous le seuil — le chemin court l'est.
+#   3  un p95 dépasse le seuil. stderr nomme la sous-commande, son p95 et le
+#      remède de la doctrine : le PLACEMENT dans `main.rs`, JAMAIS un cache —
+#      un cache sur un prédicat pur est une seconde source de vérité, c'est-à-dire
+#      la duplication qu'on vient de retirer.
+#   2  rien n'a été mesuré : `mika` introuvable, `dispatch-lib.sh` illisible,
+#      population vide, horloge trop grossière, argument inconnu. Un SKIP BRUYANT,
+#      jamais un `0 ms` — la classe mika#2205 : une mesure qui n'a pas eu lieu ne
+#      doit pas être lisible comme une mesure excellente.
+#
+# L'HORLOGE EST `EPOCHREALTIME`, ET SON ABSENCE EST UN REFUS. C'est la seule
+# source de temps que bash lise SANS `fork` ; `date +%s%N` coûte un démarrage de
+# processus par borne, donc l'instrument mesurerait son propre instrument. Un
+# bash antérieur à 5.0 sort donc à `2` plutôt que de rendre un chiffre gonflé.
+#
+# USAGE
+#   measure-mika-subcommand-cost [--repeat N] [--threshold-ms N]
+#                                [--dispatch-lib F] [--mika BIN]
+#   `--mika` (ou `$MIKA_BIN`) sert la suite : elle y pointe un faux binaire dont
+#   la latence vient d'un `sleep`, ce qui rend les deux polarités du seuil
+#   reproductibles indépendamment de la machine.
+
+set -uo pipefail
+
+ME="measure-mika-subcommand-cost"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+REPEAT=10
+THRESHOLD_MS=500
+DISPATCH_LIB="$REPO_ROOT/skills/bundled/_shared/dispatch-lib.sh"
+MIKA_BIN="${MIKA_BIN:-mika}"
+
+_refuse() {
+    printf '%s: %s\n' "$ME" "$1" >&2
+    exit 2
+}
+
+_positive_int() {
+    case "$1" in
+        '' | *[!0-9]*) return 1 ;;
+        *) [[ "$1" -gt 0 ]] ;;
+    esac
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --repeat)        REPEAT="${2:-}"; shift 2 ;;
+        --threshold-ms)  THRESHOLD_MS="${2:-}"; shift 2 ;;
+        --dispatch-lib)  DISPATCH_LIB="${2:-}"; shift 2 ;;
+        --mika)          MIKA_BIN="${2:-}"; shift 2 ;;
+        # L'en-tête est servi par sa FORME, non par une plage de lignes : la
+        # forme ne se décale pas quand on ajoute un paragraphe (motif
+        # `measure-webhook-turn-cost`).
+        -h | --help)     awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0"; exit 0 ;;
+        *) printf '%s: argument inconnu : %s\n' "$ME" "$1" >&2; exit 2 ;;
+    esac
+done
+
+_positive_int "$REPEAT" \
+    || _refuse "--repeat attend un entier strictement positif, pas « $REPEAT » — rien mesuré"
+_positive_int "$THRESHOLD_MS" \
+    || _refuse "--threshold-ms attend un entier strictement positif, pas « $THRESHOLD_MS » — rien mesuré"
+
+# -- l'horloge -----------------------------------------------------------------
+#
+# `_now_us` écrit dans `$_NOW_US` plutôt que sur stdout : une substitution de
+# commande forkerait un sous-shell à chaque borne, et ce fork entrerait dans la
+# mesure.
+
+_NOW_US=0
+_now_us() {
+    local er="${EPOCHREALTIME:-}" s f
+    s="${er%%[.,]*}"
+    f="${er#*[.,]}000000"
+    _NOW_US="${s}${f:0:6}"
+}
+
+_now_us
+case "$_NOW_US" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    *) _refuse "\$EPOCHREALTIME est absent ou illisible (bash < 5.0) — la seule
+   horloge que bash lise sans fork. Mesurer avec \`date\` ajouterait un démarrage
+   de processus par borne, donc le chiffre rendu serait celui de l'instrument :
+   rien mesuré." ;;
+esac
+
+# -- le binaire ----------------------------------------------------------------
+#
+# Un SKIP BRUYANT, et le message ne porte AUCUN chiffre : un nombre dans une
+# sortie de refus est ce qui se recopie ensuite dans une doctrine.
+
+MIKA_RESOLVED="$(command -v -- "$MIKA_BIN" 2>/dev/null)" || MIKA_RESOLVED=""
+if [[ -z "$MIKA_RESOLVED" || ! -x "$MIKA_RESOLVED" ]]; then
+    printf '%s: binaire introuvable (« %s ») — rien n'\''a été mesuré, et aucun coût nul n'\''est rendu. Déployer (`make deploy`), vérifier `cat ~/.mika/skills/.manifest-writer`, puis relancer.\n' \
+        "$ME" "$MIKA_BIN" >&2
+    exit 2
+fi
+
+# -- le compte de sites, dérivé ------------------------------------------------
+
+[[ -f "$DISPATCH_LIB" && -r "$DISPATCH_LIB" ]] \
+    || _refuse "dispatch-lib illisible : $DISPATCH_LIB — le compte de sites ne peut pas être dérivé, donc aucun pire cas n'est rendu ; rien mesuré"
+
+# Position de commande : après `$(`, après un `|`, après un `&&`, après un
+# mot-clé, ou en tête de ligne. Une parenthèse nue n'y est pas, ce qui écarte les
+# littéraux de message.
+_SITE_LEAD='(\$\(|\|[[:space:]]*|&&[[:space:]]*|^[[:space:]]*|[[:space:]](if|elif|while|until|then|else|do|!)[[:space:]]+)'
+# Frontière de mot, MOINS la parenthèse ouvrante : `nom(` est une définition.
+_SITE_TAIL='([^A-Za-z0-9_(]|$)'
+
+_count_sites() {
+    local alt="$1" n
+    n="$(sed -E 's/(^|[[:space:]])#.*$//' "$DISPATCH_LIB" \
+        | grep -oE "${_SITE_LEAD}(${alt})${_SITE_TAIL}" \
+        | grep -c .)" || n=0
+    printf '%s' "$n"
+}
+
+SITES_PLAN_CALLOUT="$(_count_sites '_extract_plan_path')"
+SITES_ARCH_DISPOSITION="$(_count_sites '_parse_disposition|_parse_verdict')"
+SITES_TOTAL=$((SITES_PLAN_CALLOUT + SITES_ARCH_DISPOSITION))
+
+if [[ "$SITES_PLAN_CALLOUT" -eq 0 || "$SITES_ARCH_DISPOSITION" -eq 0 ]]; then
+    printf '%s: population vide — sites-total: %d (plan-callout: %d, arch-disposition: %d) dans %s.\n' \
+        "$ME" "$SITES_TOTAL" "$SITES_PLAN_CALLOUT" "$SITES_ARCH_DISPOSITION" "$DISPATCH_LIB" >&2
+    printf '%s: un pire cas de 0 ms se lirait « négligeable » alors que rien n'\''a été compté (classe mika#2205) — rien mesuré.\n' \
+        "$ME" >&2
+    exit 2
+fi
+
+# -- les fixtures, écrites ici et nulle part ailleurs --------------------------
+
+WORK="$(mktemp -d)" || _refuse "mktemp a échoué — les fixtures ne peuvent pas être écrites ; rien mesuré"
+trap 'rm -rf "$WORK"' EXIT
+
+# La forme que `plan_callout.rs` capture (son propre test l. 578) : trois lignes
+# `> - ` contiguës, dont celle du plan.
+{
+    printf '> - **Branch:** `refactor/2194/sonde-s3`\n'
+    printf '> - **Plan:** `docs/plans/2026-11-04-001-refactor-2194-vol-7-sonde-s3-executable-plan.md` (committed on branch @ `abc1234`)\n'
+    printf '> - **Grooming history:** first-pass (READY) → second-pass (GROOMED)\n'
+} >"$WORK/plan-callout-body.md" || _refuse "écriture de la fixture plan-callout impossible dans $WORK — rien mesuré"
+
+# Tier 1a, passe `first` : la forme canonique littérale.
+printf 'Disposition: READY\n\nLe plan est prêt.\n' >"$WORK/arch-response.md" \
+    || _refuse "écriture de la fixture arch-disposition impossible dans $WORK — rien mesuré"
+
+# -- la mesure -----------------------------------------------------------------
+
+SORTED=()
+_PCT=0
+_pct() {
+    local p="$1" n="${#SORTED[@]}" idx
+    # Plafond : le p95 de 10 échantillons est le 10e, pas une interpolation.
+    idx=$(((p * n + 99) / 100))
+    ((idx < 1)) && idx=1
+    ((idx > n)) && idx=$n
+    _PCT="${SORTED[idx - 1]}"
+}
+
+P50=0
+P95=0
+_measure() {
+    local label="$1"
+    shift
+    local i t0 t1 rc=0 first_rc=0
+    : >"$WORK/samples"
+    for ((i = 0; i < REPEAT; i++)); do
+        _now_us
+        t0="$_NOW_US"
+        "$@" >/dev/null 2>&1
+        rc=$?
+        _now_us
+        t1="$_NOW_US"
+        [[ "$i" -eq 0 ]] && first_rc="$rc"
+        printf '%s\n' "$(((t1 - t0 + 500) / 1000))" >>"$WORK/samples"
+    done
+    if [[ "$first_rc" -ne 0 ]]; then
+        printf '%s: %s a rendu %d sur son chemin NOMINAL — ce qui serait chronométré est le chemin d'\''erreur, pas le coût du prédicat ; rien mesuré.\n' \
+            "$ME" "$label" "$first_rc" >&2
+        return 2
+    fi
+    sort -n "$WORK/samples" >"$WORK/sorted"
+    mapfile -t SORTED <"$WORK/sorted"
+    _pct 50
+    P50="$_PCT"
+    _pct 95
+    P95="$_PCT"
+}
+
+_measure 'plan-callout' \
+    "$MIKA_RESOLVED" plan-callout --body-file "$WORK/plan-callout-body.md" || exit 2
+P50_PLAN_CALLOUT="$P50"
+P95_PLAN_CALLOUT="$P95"
+
+_measure 'arch-disposition' \
+    "$MIKA_RESOLVED" arch-disposition --pass first --response-file "$WORK/arch-response.md" || exit 2
+P50_ARCH_DISPOSITION="$P50"
+P95_ARCH_DISPOSITION="$P95"
+
+# -- la sortie -----------------------------------------------------------------
+
+WORST_PLAN_CALLOUT=$((P95_PLAN_CALLOUT * SITES_PLAN_CALLOUT))
+WORST_ARCH_DISPOSITION=$((P95_ARCH_DISPOSITION * SITES_ARCH_DISPOSITION))
+WORST_TOTAL=$((WORST_PLAN_CALLOUT + WORST_ARCH_DISPOSITION))
+
+printf '%s — sonde S3 (mika#2194)\n' "$ME"
+printf '  mika         : %s\n' "$MIKA_RESOLVED"
+printf '  dispatch-lib : %s\n' "$DISPATCH_LIB"
+printf '  répétitions  : %d   seuil : %d ms\n\n' "$REPEAT" "$THRESHOLD_MS"
+printf 'plan-callout      p50=%dms p95=%dms sites=%d pire-cas=%dms\n' \
+    "$P50_PLAN_CALLOUT" "$P95_PLAN_CALLOUT" "$SITES_PLAN_CALLOUT" "$WORST_PLAN_CALLOUT"
+printf 'arch-disposition  p50=%dms p95=%dms sites=%d pire-cas=%dms\n' \
+    "$P50_ARCH_DISPOSITION" "$P95_ARCH_DISPOSITION" "$SITES_ARCH_DISPOSITION" "$WORST_ARCH_DISPOSITION"
+printf 'sites-total: %d\n' "$SITES_TOTAL"
+printf 'pire-cas-dispatch: %d ms — p95 × sites, sommé ; un dispatch dev-groom qui prendrait TOUTES les branches\n' \
+    "$WORST_TOTAL"
+
+# -- la halte ------------------------------------------------------------------
+
+_over=0
+for _pair in "plan-callout:$P95_PLAN_CALLOUT" "arch-disposition:$P95_ARCH_DISPOSITION"; do
+    _name="${_pair%%:*}"
+    _p95="${_pair##*:}"
+    if [[ "$_p95" -gt "$THRESHOLD_MS" ]]; then
+        _over=1
+        printf '%s: HALTE 3 — %s a un p95 de %d ms, au-delà du seuil de %d ms.\n' \
+            "$ME" "$_name" "$_p95" "$THRESHOLD_MS" >&2
+        printf '%s: le chemin court ne l'\''est pas, ou la sous-commande résout quelque chose qu'\''elle ne devrait pas. Remède : le placement dans `main.rs`, jamais un cache — un cache sur un prédicat pur est une seconde source de vérité, c'\''est-à-dire la duplication qu'\''on vient de retirer.\n' \
+            "$ME" >&2
+    fi
+done
+
+[[ "$_over" -eq 0 ]] || exit 3
+exit 0
