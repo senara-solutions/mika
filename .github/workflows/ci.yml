@@ -124,6 +124,13 @@ jobs:
       - name: Webhook-turn register reader — the turn is a SUM (mika#2680)
         run: make test-measure-webhook-turn-cost
 
+      # La sonde S3 décide (seuil 500 ms, code 3), donc elle doit être exercée
+      # aux DEUX polarités — mika#2578 : une garde que le pipeline ne lance pas
+      # ne refuse rien. La suite fabrique son propre `mika` : aucun binaire,
+      # aucun réseau, aucun jeton.
+      - name: S3 probe — both threshold polarities, derived site count (mika#2194)
+        run: make test-measure-mika-subcommand-cost
+
       # mika#2578, une troisième fois : `make test-egress-push-bound` existait
       # dans le Makefile depuis mika#2736 et aucun fichier de `.github/` ne
       # l'appelait, donc les douze cas de la borne `git-receive-pack`
