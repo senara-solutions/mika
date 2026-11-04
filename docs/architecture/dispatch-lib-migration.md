@@ -20,8 +20,11 @@ inscrite au § 6 depuis le 2026-11-02.
 Ce document ne décrit pas un programme souhaitable : il décrit ce que **trois**
 maillons ont établi, pour que le suivant ne redécouvre pas les mêmes bornes. Tout
 ce qui n'a pas été mesuré est marqué comme tel — au premier rang le coût réel d'un
-démarrage de `mika`, que la phase 2 porte à trois par dispatch (§ 2) et la phase 3
-à un de plus par passe d'architecte (§ 6), sans l'avoir chronométré.
+démarrage de `mika`, que les phases 2 et 3 portent à **six sites** sur le chemin
+d'un dispatch dev-groom (§ 2). Il est désormais **chronométrable en une commande**
+— `scripts/measure-mika-subcommand-cost`, § 8 — et **n'a pas encore été
+chronométré** : rendre le chiffre productible et le produire sont deux gestes, et
+le second demande l'hôte.
 
 ---
 
@@ -84,21 +87,35 @@ n'est pas ce maillon.
 `mika plan-callout`. Le raisonnement ne repose sur aucun chiffre mesuré : le coût
 réel d'un démarrage de `mika` n'était pas mesurable depuis le bac à sable de
 dispatch (`mika --version` y est refusé par la permission-policy), et c'est une
-**sonde post-déploiement** (§ 7, S3), pas un acquis.
+**sonde post-déploiement** (§ 8, S3), pas un acquis.
 
-**La phase 2 porte ce compte à TROIS par dispatch dev-groom**, et le chiffre est
-écrit plutôt que laissé à découvrir : `_committed_plan_on_branch` depuis
-`_set_up_worktree`, le `elif` de `_set_up_worktree`, puis
-`_committed_plan_on_branch` depuis la composition du `RESULT` d'un groom non
-convergé. La même arithmétique tient — trois démarrages contre un dispatch qui
-dure des minutes à des heures — mais elle **consomme** la marge que ce tableau
-décrivait, donc la sonde S3 cesse d'être une curiosité et devient la précondition
-de la phase suivante.
+**Les phases 2 et 3 portent ce compte à SIX SITES sur le chemin d'un dispatch
+dev-groom**, et l'unité a changé avec le compte. Elle n'est plus « par
+dispatch » : elle est le **site d'appel**, parce que le coût se paie en
+DÉMARRAGES de processus et qu'une passe d'architecte n'en vaut pas un. La phase 3
+a ajouté deux enveloppes dont le nombre de traversées dépend de l'itération, pas
+du dispatch — « trois par dispatch, plus un par passe » mêlait donc deux unités
+et ne se sommait pas. Les six sites, tous dans `dispatch-lib.sh`, par enveloppe :
 
-**Si S3 rend un chiffre au-delà de ce que trois démarrages tolèrent, le remède est
-le PLACEMENT dans `main.rs`, jamais un cache.** Un cache sur un prédicat pur est
-une seconde source de vérité, c'est-à-dire très exactement la duplication que ces
-deux phases viennent de retirer.
+| enveloppe | sous-commande | sites |
+|---|---|---|
+| `_extract_plan_path` | `mika plan-callout` | 3 |
+| `_parse_disposition`, `_parse_verdict` | `mika arch-disposition` | 3 |
+
+**Et ce compte n'est pas écrit ici comme une constante à tenir à jour.**
+`scripts/measure-mika-subcommand-cost` le **dérive** de `dispatch-lib.sh` à
+chaque passage (§ 8) ; le tableau ci-dessus est ce que l'instrument a rendu le
+2026-11-04, pas la source. Une constante serait une seconde source de vérité,
+c'est-à-dire la duplication que ces trois phases viennent de retirer — et c'est
+le compte DÉRIVÉ qui fait du produit `p95 × sites` un majorant qu'on peut citer :
+le pire cas d'un dispatch qui prendrait toutes les branches, jamais « le coût
+d'un dispatch ».
+
+**Si S3 rend un p95 au-delà de ce qu'un démarrage tolère, le remède est le
+PLACEMENT dans `main.rs`, jamais un cache.** Un cache sur un prédicat pur est une
+seconde source de vérité, c'est-à-dire très exactement la duplication que ces
+phases viennent de retirer. L'instrument le dit lui-même sur stderr quand il sort
+à `3`, pour que le remède n'ait pas à être retrouvé ici.
 
 Un prédicat appelé en boucle est un autre arbitrage. Ne pas transporter la
 conclusion de la phase 1 vers lui sans mesurer : ce serait exactement l'erreur que
@@ -751,11 +768,36 @@ promotion perdue est la panne qui a coûté quinze heures de boucle à mika#2120
 elle est silencieuse.
 
 **S3 — le coût est ce qu'on a supposé** (première semaine). Le chiffre que le bac à
-sable n'a pas pu produire : chronométrer `mika plan-callout` sur l'hôte.
-*Halte 3 — au-delà de ~500 ms :* le chemin court ne l'est pas, ou la sous-commande
-résout quelque chose qu'elle ne devrait pas. **Réparer le placement dans
-`main.rs`, pas mettre en cache** — un cache sur un prédicat pur est une seconde
-source de vérité, c'est-à-dire la duplication qu'on vient de retirer.
+sable n'a pas pu produire se demande en **une commande**, sur l'hôte, après le
+préalable ci-dessus :
+
+```sh
+scripts/measure-mika-subcommand-cost
+```
+
+Elle chronomètre un démarrage de chacun des deux prédicats sur son chemin nominal
+— elle écrit ses propres fixtures dans un `mktemp`, donc elle ne lit aucun fichier
+du dépôt —, rend le **p50** et le **p95** de chacun en millisecondes entières,
+**dérive** le compte de sites de `dispatch-lib.sh`, et rend `p95 × sites`. Seuil
+par défaut **500 ms** (`--threshold-ms`), répétitions par défaut 10 (`--repeat`).
+
+*Halte 3 — code `3` :* un p95 dépasse le seuil. Le chemin court ne l'est pas, ou
+la sous-commande résout quelque chose qu'elle ne devrait pas. **Réparer le
+placement dans `main.rs`, pas mettre en cache** — un cache sur un prédicat pur est
+une seconde source de vérité, c'est-à-dire la duplication qu'on vient de retirer.
+L'instrument écrit ce remède sur stderr avec le nom de la sous-commande et son
+p95 : il n'y a rien à retrouver ici pour agir.
+
+*Code `2` — rien n'a été mesuré :* binaire introuvable, `dispatch-lib.sh`
+illisible, population de sites vide. C'est un SKIP **bruyant**, jamais un `0 ms`,
+et il ne doit jamais se lire comme un succès (classe mika#2205). Le code `3` est
+un RÉSULTAT, le code `2` une panne d'instrument : les confondre fait prendre une
+sonde morte pour une sonde verte.
+
+**Au 2026-11-04, S3 n'a pas tourné.** Le vol 7 rend le chiffre productible ; il ne
+le produit pas. L'exécuter depuis un dispatch est impossible — la
+permission-policy y refuse `mika` — donc c'est un geste d'hôte, et le seul qui
+reste dû sur cette sonde.
 
 **S4 — contrôle négatif du refus** (7 jours). Aucun `REFUSED (plan-callout…)` sur
 un dispatch sain :
@@ -806,5 +848,9 @@ qui marche* (mika#2205).
   « mika#2194 (AC4) » : tier 2 au vol 5, tier 1 au vol 6)
 - `skills/bundled/_shared/tests/lib-mika-bin.sh` — la résolution du binaire `mika`
   pour les suites bash, partagée plutôt que recopiée
+- `scripts/measure-mika-subcommand-cost` — la sonde S3 (§ 8), p50/p95 par
+  sous-commande et compte de sites dérivé ; `scripts/test-measure-mika-subcommand-cost.sh`
+  épingle ses deux polarités de seuil sans aucun `mika` réel (`make
+  test-measure-mika-subcommand-cost`)
 - `scripts/canonical-tokens.tsv` — l'inventaire des sites de match (mika#2201)
 - `docs/solutions/architecture-patterns/guard-parser-must-be-as-permissive-as-downstream-consumer-2026-08-29.md`
