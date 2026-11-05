@@ -40,6 +40,7 @@ pub mod milestone_manager;
 pub mod model_transmission;
 pub mod operational;
 pub mod panic_hook;
+mod parent_rehabilitation;
 pub mod perimeter;
 pub mod pilot_egress_stamp;
 pub mod pilot_launcher_health;
