@@ -12143,12 +12143,34 @@ _derive_recovery_pr_title() {
 # Every path added here takes weight away from the net in its useful case, so an
 # extension must arrive with its symmetric test.
 #
-# Base is the THREE-dot form `origin/main...HEAD` — the file set GitHub shows on
-# the PR, i.e. what this branch introduces relative to the merge base. This
-# diverges deliberately from `_ac6_verbatim_stats_block`'s two-dot form: the
-# question here is "what does this PR carry", not "how does it differ from main's
-# tip". On a freshly-rebased branch the two coincide; on a branch that is behind,
-# only the three-dot form answers the question actually being asked.
+# Base is the INTERSECTION of the two diff forms, and mika#3038 is the reason it
+# is not either one of them alone. The question this function asks is "what does
+# this branch ADD to `origin/main`", and neither form answers it by itself:
+#
+#   * THREE dots, `origin/main...HEAD` — what the branch introduces since the
+#     merge base. Was this function's sole base until mika#3038. A squash merge
+#     puts the branch's CONTENT on main without making any branch commit an
+#     ancestor of it, so the merge base does not move and this set shows the
+#     already-merged work all over again. That is how four rescue drafts — #2197,
+#     #2702, #2899, #3034 — read `carries-work` and wrote `Closes #N` on branches
+#     whose tree was byte-identical to main's.
+#   * TWO dots, `origin/main HEAD` — how the head differs from main's tip, the
+#     form `_ac6_verbatim_stats_block` takes. Alone it fails in the other
+#     direction, and fails OPEN: on a branch that is merely BEHIND, main's own
+#     newer files are reported as differences, so a branch adding nothing reads
+#     `carries-work`.
+#
+# A path that is in both sets is a path this branch introduced AND that main's
+# tip does not already have — which is exactly the definition being sought. The
+# intersection is therefore not a belt-and-braces precaution; each form on its
+# own is wrong on a population this repo produces, and they are wrong on
+# different ones.
+#
+# Its sister `_branch_tree_equals_main` answers the stronger question — does the
+# branch add anything AT ALL — on tree SHAs, and the rescue consults it first. It
+# is not a substitute: a branch can add one real file and nine merged ones, and
+# the marker on the draft that then opens has to say `carries-work` while naming
+# only the one. Which is V7 of the suite, and the #3016 case in the ticket.
 #
 # `core.quotePath=false` + `-z` is load-bearing, not hygiene. Under git's default
 # `core.quotePath=true`, ANY path holding a non-ASCII byte comes back wrapped in
@@ -12187,8 +12209,32 @@ _rescue_diff_carries_work() {
         return 1
     fi
 
+    # mika#3038 : le set « diffère de la tête de main », lu UNE FOIS avant la
+    # boucle plutôt qu'un `git diff` par chemin — un vol dont la branche porte
+    # 900 fichiers paierait sinon 900 invocations de git pour une réponse que ce
+    # seul appel contient déjà.
+    #
+    # `tr '\0' '\n'` parce que le témoin est interrogé par `grep -qxF`, qui est
+    # ligne à ligne. Un chemin contenant un saut de ligne littéral serait donc
+    # scindé et ne s'apparierait plus — et cette perte tombe du bon côté :
+    # l'appariement manqué fait `continue`, le chemin compte comme échafaudage,
+    # la réponse va vers `Refs`. Fail-closed, comme le reste de cette fonction.
+    local _vs_main
+    _vs_main=$(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main HEAD 2>/dev/null | tr '\0' '\n')
+
     while IFS= read -r -d '' f; do
         [ -n "$f" ] || continue
+        # L'intersection de mika#3038 : ce chemin, la branche l'a introduit
+        # depuis la base de fusion (la boucle), ET la tête de main ne l'a pas
+        # déjà (ce témoin). Un `-qxF` et non un `-q` : sans l'ancrage de ligne
+        # entière, `src/a.rs` s'apparierait sur `src/a.rs.orig`, et sans le `-F`
+        # un chemin portant un point s'apparierait sur ses voisins.
+        #
+        # Here-string et jamais `printf … | grep -q` (mika#2055) : `grep -q`
+        # sort au premier appariement et ferme le tube, le producteur prend
+        # SIGPIPE, rend 141, et sous le `pipefail` des handlers qui sourcent ce
+        # fichier ce 141 devient le statut du pipeline.
+        grep -qxF -- "$f" <<<"$_vs_main" || continue
         # mika#2144: les deux motifs qui ne viennent PAS du Tier 2 restent locaux,
         # avec leur provenance. Ils sortent de la SECONDE autorité de cette
         # fonction — les exclusions `git add -A` du commit de rescue — et les
