@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-measure-webhook-turn-cost test-measure-mika-subcommand-cost test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-pilot-phase2b-argv test-pilot-orientation-block test-demote-pipeline-failure test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-push-scope-staging test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-pilot-instruction-paths check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-root-files check-release-debuginfo check-release-tag check-install-major-gate check-suite-wiring test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-measure-webhook-turn-cost test-measure-mika-subcommand-cost test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-tree-equals-main test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-pilot-phase2b-argv test-pilot-orientation-block test-demote-pipeline-failure test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-push-scope-staging test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-pilot-instruction-paths check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-root-files check-release-debuginfo check-release-tag check-install-major-gate check-suite-wiring test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -224,6 +224,12 @@ test-rescue-closes-guard: ## Verify the rescue net only writes `Closes #N` when 
 
 test-rescue-pipeline-verified: ## Verify the `rescue-pipeline-verified` marker is measured, fail-closed, kill-switchable (mika#2354)
 	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
+
+# mika#3038 — ce target lance la suite SEULE. Sa porte de merge est l'étape
+# nommée du job `dispatch-lib-offline-suites` de ci.yml, pas ce target : un
+# target qu'aucun workflow ne nomme ne refuse rien (mika#2578).
+test-rescue-tree-equals-main: ## Verify no rescue draft opens on a head whose tree is already origin/main's (mika#3038)
+	@bash skills/bundled/_shared/tests/test_rescue_tree_equals_main.sh
 
 test-handler-crash-step: ## Verify a long-running handler names the step it crashed on, and arms its trap first (mika#2532)
 	@bash skills/bundled/_shared/tests/test_handler_crash_step.sh
