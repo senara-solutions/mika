@@ -746,6 +746,13 @@ jobs:
       # dispatch rule about scratch files rests on.
       - name: .pilot-scratch never reaches a published commit (mika#1282)
         run: bash skills/bundled/_shared/tests/test_rescue_scratch_not_published.sh
+      # A rescue draft is never opened on a head whose tree is already main's.
+      # Four such drafts opened between 2026-09-04 and 2026-11-04, each less than
+      # 20 minutes after a merge of a PR on its own branch; the squash is what
+      # makes the three-dot diff show the already-merged work again. Offline: real
+      # temp git repositories with a local bare `origin`, only `gh` is faked.
+      - name: A rescue draft is not opened on a tree already in main (mika#3038)
+        run: bash skills/bundled/_shared/tests/test_rescue_tree_equals_main.sh
       # The two invariants of worktree command seeding: never overwrite a
       # command the branch tracks, never dirty `git status`. Their breach was
       # the dirty-worktree cause behind mika#1414.

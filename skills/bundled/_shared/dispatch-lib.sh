@@ -8959,6 +8959,44 @@ Remote-probe: existence of origin/$BRANCH could not be measured (ls-remote rc=$r
 Stale-ref: origin/$BRANCH points at $local_ref_sha locally but the remote has no such branch (mika#2626) — pushing as first-push"
     fi
 
+    # mika#3038, AC3 : une branche que le merge de sa PR a supprimée d'`origin`
+    # n'y est pas recréée quand elle n'apporte rien à `origin/main`.
+    #
+    # LE TERME EST SUR `remote_known_absent`, PAS SUR `remote_has_branch`, et la
+    # distinction est celle que le commentaire à deux cellules d'ici vient
+    # d'établir : le second est une DÉCISION qui retombe sur la ref de suivi
+    # locale quand la mesure a échoué, le premier est le FAIT d'une absence
+    # mesurée. Refuser un push sur une décision, c'est refuser de publier du
+    # travail sur un `ls-remote` qui n'a pas répondu — et celui-là, contrairement
+    # à une draft fantôme, personne ne le rouvre d'un clic.
+    #
+    # CE N'EST PAS UNE OPTIMISATION, ET LE RETIRER NE SE RATTRAPE PAS PLUS BAS.
+    # Recréer la branche sur `origin` publie zéro octet, mais rend à la fin de
+    # vol une branche distante sur laquelle ouvrir une draft — c'est le premier
+    # maillon de la chaîne qui a produit #2197, #2702, #2899 et #3034. Le refus
+    # de l'AC1 coupe le second ; celui-ci coupe le premier, et chacun des deux
+    # tient sans l'autre.
+    #
+    # Le `return 0` et non un `return 1` : il n'y a rien à publier, donc rien n'a
+    # échoué. Un non-zéro ici ferait porter au vol un échec de push qui n'a pas
+    # eu lieu.
+    local _tree_rc=0
+    _branch_tree_equals_main "$WORKTREE_DIR" || _tree_rc=$?
+    if [ "$remote_known_absent" -eq 1 ] && [ "$_tree_rc" -eq 0 ]; then
+        echo "push_branch.skipped_empty: HEAD tree equals origin/main and the remote has no branch $BRANCH — nothing to publish (mika#3038)" >&2
+        # Dans le RESULT, pour la raison des lignes `Remote-probe:` et
+        # `Stale-ref:` juste au-dessus : le stderr d'avant-pilote est
+        # structurellement perdu sur un dispatch qui réussit (classe mika#2050).
+        RESULT="${RESULT}
+Push: SKIPPED — the remote has no branch $BRANCH (its PR was merged, which deleted it) and the tree at HEAD is identical to origin/main; re-creating the branch would publish nothing (mika#3038)"
+        return 0
+    fi
+    # Forme `if` et non `[ … ] && _note…`, pour la raison mesurée une cellule
+    # plus haut : sous le `set -e` des handlers qui sourcent ce fichier, une
+    # telle chaîne devient le rc de la fonction si un éditeur la déplace en
+    # dernière commande.
+    if [ "$_tree_rc" -eq 2 ]; then _note_tree_compare_undetermined; fi
+
     # Deux termes, et la CONJONCTION est le correctif. Le premier est la question
     # réellement posée (le distant porte-t-il la branche ?). Le second est que la
     # ref de suivi locale existe, puisque tout le bloc ci-dessous la LIT
@@ -12143,12 +12181,34 @@ _derive_recovery_pr_title() {
 # Every path added here takes weight away from the net in its useful case, so an
 # extension must arrive with its symmetric test.
 #
-# Base is the THREE-dot form `origin/main...HEAD` — the file set GitHub shows on
-# the PR, i.e. what this branch introduces relative to the merge base. This
-# diverges deliberately from `_ac6_verbatim_stats_block`'s two-dot form: the
-# question here is "what does this PR carry", not "how does it differ from main's
-# tip". On a freshly-rebased branch the two coincide; on a branch that is behind,
-# only the three-dot form answers the question actually being asked.
+# Base is the INTERSECTION of the two diff forms, and mika#3038 is the reason it
+# is not either one of them alone. The question this function asks is "what does
+# this branch ADD to `origin/main`", and neither form answers it by itself:
+#
+#   * THREE dots, `origin/main...HEAD` — what the branch introduces since the
+#     merge base. Was this function's sole base until mika#3038. A squash merge
+#     puts the branch's CONTENT on main without making any branch commit an
+#     ancestor of it, so the merge base does not move and this set shows the
+#     already-merged work all over again. That is how four rescue drafts — #2197,
+#     #2702, #2899, #3034 — read `carries-work` and wrote `Closes #N` on branches
+#     whose tree was byte-identical to main's.
+#   * TWO dots, `origin/main HEAD` — how the head differs from main's tip, the
+#     form `_ac6_verbatim_stats_block` takes. Alone it fails in the other
+#     direction, and fails OPEN: on a branch that is merely BEHIND, main's own
+#     newer files are reported as differences, so a branch adding nothing reads
+#     `carries-work`.
+#
+# A path that is in both sets is a path this branch introduced AND that main's
+# tip does not already have — which is exactly the definition being sought. The
+# intersection is therefore not a belt-and-braces precaution; each form on its
+# own is wrong on a population this repo produces, and they are wrong on
+# different ones.
+#
+# Its sister `_branch_tree_equals_main` answers the stronger question — does the
+# branch add anything AT ALL — on tree SHAs, and the rescue consults it first. It
+# is not a substitute: a branch can add one real file and nine merged ones, and
+# the marker on the draft that then opens has to say `carries-work` while naming
+# only the one. Which is V7 of the suite, and the #3016 case in the ticket.
 #
 # `core.quotePath=false` + `-z` is load-bearing, not hygiene. Under git's default
 # `core.quotePath=true`, ANY path holding a non-ASCII byte comes back wrapped in
@@ -12187,8 +12247,32 @@ _rescue_diff_carries_work() {
         return 1
     fi
 
+    # mika#3038 : le set « diffère de la tête de main », lu UNE FOIS avant la
+    # boucle plutôt qu'un `git diff` par chemin — un vol dont la branche porte
+    # 900 fichiers paierait sinon 900 invocations de git pour une réponse que ce
+    # seul appel contient déjà.
+    #
+    # `tr '\0' '\n'` parce que le témoin est interrogé par `grep -qxF`, qui est
+    # ligne à ligne. Un chemin contenant un saut de ligne littéral serait donc
+    # scindé et ne s'apparierait plus — et cette perte tombe du bon côté :
+    # l'appariement manqué fait `continue`, le chemin compte comme échafaudage,
+    # la réponse va vers `Refs`. Fail-closed, comme le reste de cette fonction.
+    local _vs_main
+    _vs_main=$(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main HEAD 2>/dev/null | tr '\0' '\n')
+
     while IFS= read -r -d '' f; do
         [ -n "$f" ] || continue
+        # L'intersection de mika#3038 : ce chemin, la branche l'a introduit
+        # depuis la base de fusion (la boucle), ET la tête de main ne l'a pas
+        # déjà (ce témoin). Un `-qxF` et non un `-q` : sans l'ancrage de ligne
+        # entière, `src/a.rs` s'apparierait sur `src/a.rs.orig`, et sans le `-F`
+        # un chemin portant un point s'apparierait sur ses voisins.
+        #
+        # Here-string et jamais `printf … | grep -q` (mika#2055) : `grep -q`
+        # sort au premier appariement et ferme le tube, le producteur prend
+        # SIGPIPE, rend 141, et sous le `pipefail` des handlers qui sourcent ce
+        # fichier ce 141 devient le statut du pipeline.
+        grep -qxF -- "$f" <<<"$_vs_main" || continue
         # mika#2144: les deux motifs qui ne viennent PAS du Tier 2 restent locaux,
         # avec leur provenance. Ils sortent de la SECONDE autorité de cette
         # fonction — les exclusions `git add -A` du commit de rescue — et les
@@ -12311,6 +12395,124 @@ _rescue_touches_tracked_tree() {
     # there is no content. Open (and the gate's other terms decide).
     [ "$_measured" = "1" ] || return 0
     return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _branch_tree_equals_main — cette branche apporte-t-elle QUELQUE CHOSE à main ?
+#
+# mika#3038. Quatre drafts de secours depuis le 2026-09-04 (#2197, #2702, #2899,
+# #3034) se sont ouvertes sur une tête dont l'arbre est OCTET POUR OCTET celui
+# d'`origin/main`. Toutes portaient `rescue-diff: carries-work`, toutes moins de
+# 20 minutes après le merge d'une PR de leur propre branche, toutes fermées à la
+# main par l'opérateur. Sur #3034 GitHub affichait `+953 −23` pendant que
+# `d97b53bdf^{tree}` était exactement `d7de73137^{tree}`.
+#
+# L'ILLUSION VIENT DU SQUASH, et c'est tout le ticket. Un merge par squash pose
+# sur `main` un commit dont le CONTENU est celui de la branche, sans qu'aucun
+# commit de la branche en soit un ancêtre. La base de fusion reste donc là où
+# elle était avant le merge, et la forme à trois points montre à nouveau
+# l'intégralité du travail déjà mergé. L'arbre ne se laisse pas tromper : il est
+# le contenu, pas l'histoire.
+#
+# LE PRÉDICAT EST SUR L'ARBRE, PAS SUR LE DIFF, et c'est ce qui le rend court.
+# Deux SHA d'arbre égaux, c'est la preuve que tout fichier de cette tête est
+# déjà dans main, à l'octet : aucune liste de chemins à classer, donc aucune
+# liste à tenir à jour, et aucune question de quoting — le défaut
+# `core.quotePath=true` qui oblige sa voisine du dessus à lire le diff en `-z`
+# n'a pas de prise sur un SHA.
+#
+# LE FETCH EST LOAD-BEARING, PAS DE L'HYGIÈNE. La population mesurée est
+# exactement celle où le merge a eu lieu PENDANT le vol : la ref de suivi
+# `origin/main` du checkout partagé date alors d'avant ce merge, et la
+# comparaison rendrait « différents » sur la seule population qui compte.
+# `_fetch_main_ref_once` la rafraîchit, une fois par dispatch.
+#
+# TROIS ISSUES, et l'indéterminée est NOMMÉE plutôt que choisie par défaut —
+# même contrat que `_remote_branch_exists` (mika#2626), même règle maison « un
+# signal qu'on ne peut pas lire n'est jamais un terme satisfait » (mika#2277) :
+#
+#   rend | sens
+#   ---- | --------------------------------------------------------------------
+#   0    | MESURÉ ÉGAL — cette tête n'apporte rien à `origin/main`
+#   1    | MESURÉ DIFFÉRENT — elle apporte quelque chose
+#   2    | INDÉTERMINÉ — `origin/main` absente, dépôt illisible, $1 vide
+#
+# Les deux appelants traitent `2` en retombant sur le comportement d'avant ce
+# ticket, et le DISENT en une ligne (la sœur juste en dessous). C'est le
+# fail-closed de l'AC4, et sa direction est l'inverse de celle de
+# `_rescue_diff_carries_work` pour une raison et une seule : ce correctif-ci
+# RETIRE une draft. Une mesure ratée ne doit donc jamais la retirer — elle doit
+# rendre la main au comportement courant, qui est visible et réversible.
+#
+# Le garde sur $1 vide a la raison écrite sur ses deux voisines : `git -C ""`
+# opère silencieusement sur le CWD du process de dispatch — un checkout vivant.
+# Mesurer le MAUVAIS arbre ici rendrait « égal » sur un arbre qui n'est pas
+# celui de la branche, c'est-à-dire retirerait une draft légitime.
+#
+# Args: $1 — worktree dir
+# Returns: 0 égal, 1 différent, 2 indéterminé (jamais 0 sur une mesure ratée).
+_branch_tree_equals_main() {
+    local wt_dir="${1-}" _head_tree _main_tree
+    [ -n "$wt_dir" ] || return 2
+    git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 2
+    _fetch_main_ref_once "$wt_dir"
+    # `--verify` plutôt qu'un `rev-parse` nu : sans lui git rend la chaîne
+    # inchangée avec un rc non nul, et un `|| return 2` qui lit la chaîne
+    # confondrait « ref absente » avec « SHA ». Les deux lectures sont gardées
+    # par leur rc ET par la non-vacuité ci-dessous.
+    _head_tree=$(git -C "$wt_dir" rev-parse --verify 'HEAD^{tree}' 2>/dev/null) || return 2
+    _main_tree=$(git -C "$wt_dir" rev-parse --verify 'origin/main^{tree}' 2>/dev/null) || return 2
+    [ -n "$_head_tree" ] && [ -n "$_main_tree" ] || return 2
+    [ "$_head_tree" = "$_main_tree" ]
+}
+
+# _fetch_main_ref_once — rafraîchir `origin/main`, une fois par dispatch.
+#
+# mika#3038. `fetch origin main` NOMMÉMENT, jamais `fetch --prune origin` nu :
+# ce dernier fetche toutes les branches du dépôt et mute les refs de suivi du
+# common dir, partagé par tous les worktrees du checkout, donc il toucherait
+# aussi celles des dispatches en vol. Le raisonnement complet vit sur
+# `_remote_branch_exists`, qui l'a écarté pour les mêmes raisons.
+#
+# Une seule tentative par dispatch, et le drapeau est armé AVANT le fetch : un
+# distant injoignable ne doit pas faire payer un aller-retour réseau à chacun
+# des deux appelants. Un fetch raté ne se signale pas ici — il laisse la ref
+# telle qu'elle est, et c'est l'appelant qui rend 2 s'il n'a rien à lire.
+_MAIN_REF_FETCHED=0
+_fetch_main_ref_once() {
+    # Forme `if` et non `[ … ] && return 0`, pour la raison mesurée sur
+    # `_push_branch` : sous le `set -e` où les handlers sourcent ce fichier, une
+    # telle chaîne devient le rc de la fonction si un éditeur la déplace en
+    # dernière commande. La forme `if` retire la question au lieu de la faire
+    # dépendre de la position de la ligne.
+    if [ -z "${1-}" ]; then return 0; fi
+    if [ "$_MAIN_REF_FETCHED" = "1" ]; then return 0; fi
+    _MAIN_REF_FETCHED=1
+    git -C "${1-}" fetch --quiet origin main 2>/dev/null || true
+}
+
+# La ligne unique de l'AC4 de mika#3038 : quand la comparaison d'arbres n'a pas
+# pu se mesurer, le comportement d'avant ce ticket reste en place ET le résultat
+# le dit.
+#
+# ELLE VA DANS LE RESULT, pas seulement sur stderr, et c'est la même doctrine
+# que les lignes `Remote-probe:` et `Stale-ref:` de `_push_branch` : le stderr
+# d'avant-pilote est structurellement perdu sur un dispatch qui réussit (classe
+# mika#2050, Signaux M et Q), parce que `spawn_long_running_exec` ne lit son
+# `Stdio::piped()` que dans `if !status.success()`. Une surface que personne ne
+# lit reproduirait le défaut qu'on vient de citer.
+#
+# UNE SEULE FOIS PAR DISPATCH. Les deux sites de consultation peuvent tomber sur
+# l'issue indéterminée dans le même dispatch — `_push_branch` puis le secours de
+# fin de vol —, et deux lignes identiques dans le callback se liraient comme
+# deux incidents distincts.
+_TREE_COMPARE_UNDETERMINED_NOTED=0
+_note_tree_compare_undetermined() {
+    if [ "$_TREE_COMPARE_UNDETERMINED_NOTED" = "1" ]; then return 0; fi
+    _TREE_COMPARE_UNDETERMINED_NOTED=1
+    echo "tree_compare.undetermined: could not compare HEAD to origin/main — pre-mika#3038 behaviour in force" >&2
+    RESULT="${RESULT}
+Tree-probe: HEAD could not be compared to origin/main (ref absent or repository unreadable) — the pre-mika#3038 behaviour is in force (mika#3038)"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14122,6 +14324,50 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
     local _recovery_pr_due=0
     if [ -n "$RECOVERY_CLASS" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
         _recovery_pr_due=1
+    fi
+
+    # mika#3038: refuse to open a PR whose head tree is ALREADY `origin/main`'s.
+    #
+    # Four drafts since 2026-09-04 — #2197, #2702, #2899, #3034 — opened on a
+    # head whose tree was byte-identical to main's, all four less than 20 minutes
+    # after a merge of a PR on their own branch, all four closed by hand. Six
+    # seconds after #3034 opened, `ready` was stripped off #2194 on its account:
+    # a phantom draft is not inert, it moves labels.
+    #
+    # IT COMES BEFORE THE mika#2503 REFUSAL, AND THE ORDER IS LOAD-BEARING. The
+    # two are mutually exclusive through the flag the first one to fire
+    # extinguishes, so whichever runs first is the one that gets to name the
+    # reason. This ticket's whole measured population is `wip()`-free work on
+    # `crates/` and `docs/` — tracked top-level directories — so mika#2503 would
+    # not have fired on it; but a rescue whose content IS scratch AND whose tree
+    # equals main's is reachable, and on it `rescue_scratch_only` would send the
+    # operator looking for a probe crate when the fact is simply that main
+    # already has everything. The more specific diagnosis goes first.
+    #
+    # NOTHING IS LOST, AND HERE THAT IS NOT A REASSURANCE BUT A TAUTOLOGY: an
+    # equal tree means no byte of this head is absent from main. The mika#2503
+    # refusal has to argue the point (the commit exists, the branch is pushed);
+    # this one does not need to.
+    #
+    # The undetermined issue falls back to the behaviour from before this ticket
+    # — the draft opens — and says so in one line. That direction is the inverse
+    # of `_rescue_diff_carries_work`'s for one reason: this refusal REMOVES a
+    # draft, so a failed measurement must never remove one.
+    local _tree_rc=0
+    _branch_tree_equals_main "$WORKTREE_DIR" || _tree_rc=$?
+    if [ "$_recovery_pr_due" = "1" ] && [ "$_tree_rc" -eq 0 ]; then
+        _recovery_pr_due=0
+        # Convenience only, not a probe: see the note on the mika#2503 refusal
+        # below — on a dispatch that succeeds this stderr is dropped unread
+        # (mika#2050 class). RESULT is the operator surface.
+        echo "rescue_empty_tree_refused: HEAD tree equals origin/main — draft PR withheld (branch=$BRANCH, mika#3038)" >&2
+        RESULT="${RESULT}
+Draft PR withheld (mika#3038): the tree at HEAD is byte-identical to origin/main, so this branch adds nothing to main — the work it carried is already merged (typically by a squash of its own PR, which leaves the branch commits unmerged while their content is in main).
+Nothing was lost — there is nothing to lose: no content here is absent from main.
+If you believe otherwise: git -C ${WORKTREE_DIR} diff origin/main HEAD --stat"
+        _set_pr_status_line "NO_PR: rescue_adds_nothing_to_main"
+    elif [ "$_tree_rc" -eq 2 ]; then
+        _note_tree_compare_undetermined
     fi
 
     # mika#2503: refuse to open a PR whose whole content is pilot scratch — a
