@@ -12314,6 +12314,124 @@ _rescue_touches_tracked_tree() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _branch_tree_equals_main — cette branche apporte-t-elle QUELQUE CHOSE à main ?
+#
+# mika#3038. Quatre drafts de secours depuis le 2026-09-04 (#2197, #2702, #2899,
+# #3034) se sont ouvertes sur une tête dont l'arbre est OCTET POUR OCTET celui
+# d'`origin/main`. Toutes portaient `rescue-diff: carries-work`, toutes moins de
+# 20 minutes après le merge d'une PR de leur propre branche, toutes fermées à la
+# main par l'opérateur. Sur #3034 GitHub affichait `+953 −23` pendant que
+# `d97b53bdf^{tree}` était exactement `d7de73137^{tree}`.
+#
+# L'ILLUSION VIENT DU SQUASH, et c'est tout le ticket. Un merge par squash pose
+# sur `main` un commit dont le CONTENU est celui de la branche, sans qu'aucun
+# commit de la branche en soit un ancêtre. La base de fusion reste donc là où
+# elle était avant le merge, et la forme à trois points montre à nouveau
+# l'intégralité du travail déjà mergé. L'arbre ne se laisse pas tromper : il est
+# le contenu, pas l'histoire.
+#
+# LE PRÉDICAT EST SUR L'ARBRE, PAS SUR LE DIFF, et c'est ce qui le rend court.
+# Deux SHA d'arbre égaux, c'est la preuve que tout fichier de cette tête est
+# déjà dans main, à l'octet : aucune liste de chemins à classer, donc aucune
+# liste à tenir à jour, et aucune question de quoting — le défaut
+# `core.quotePath=true` qui oblige sa voisine du dessus à lire le diff en `-z`
+# n'a pas de prise sur un SHA.
+#
+# LE FETCH EST LOAD-BEARING, PAS DE L'HYGIÈNE. La population mesurée est
+# exactement celle où le merge a eu lieu PENDANT le vol : la ref de suivi
+# `origin/main` du checkout partagé date alors d'avant ce merge, et la
+# comparaison rendrait « différents » sur la seule population qui compte.
+# `_fetch_main_ref_once` la rafraîchit, une fois par dispatch.
+#
+# TROIS ISSUES, et l'indéterminée est NOMMÉE plutôt que choisie par défaut —
+# même contrat que `_remote_branch_exists` (mika#2626), même règle maison « un
+# signal qu'on ne peut pas lire n'est jamais un terme satisfait » (mika#2277) :
+#
+#   rend | sens
+#   ---- | --------------------------------------------------------------------
+#   0    | MESURÉ ÉGAL — cette tête n'apporte rien à `origin/main`
+#   1    | MESURÉ DIFFÉRENT — elle apporte quelque chose
+#   2    | INDÉTERMINÉ — `origin/main` absente, dépôt illisible, $1 vide
+#
+# Les deux appelants traitent `2` en retombant sur le comportement d'avant ce
+# ticket, et le DISENT en une ligne (la sœur juste en dessous). C'est le
+# fail-closed de l'AC4, et sa direction est l'inverse de celle de
+# `_rescue_diff_carries_work` pour une raison et une seule : ce correctif-ci
+# RETIRE une draft. Une mesure ratée ne doit donc jamais la retirer — elle doit
+# rendre la main au comportement courant, qui est visible et réversible.
+#
+# Le garde sur $1 vide a la raison écrite sur ses deux voisines : `git -C ""`
+# opère silencieusement sur le CWD du process de dispatch — un checkout vivant.
+# Mesurer le MAUVAIS arbre ici rendrait « égal » sur un arbre qui n'est pas
+# celui de la branche, c'est-à-dire retirerait une draft légitime.
+#
+# Args: $1 — worktree dir
+# Returns: 0 égal, 1 différent, 2 indéterminé (jamais 0 sur une mesure ratée).
+_branch_tree_equals_main() {
+    local wt_dir="${1-}" _head_tree _main_tree
+    [ -n "$wt_dir" ] || return 2
+    git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 2
+    _fetch_main_ref_once "$wt_dir"
+    # `--verify` plutôt qu'un `rev-parse` nu : sans lui git rend la chaîne
+    # inchangée avec un rc non nul, et un `|| return 2` qui lit la chaîne
+    # confondrait « ref absente » avec « SHA ». Les deux lectures sont gardées
+    # par leur rc ET par la non-vacuité ci-dessous.
+    _head_tree=$(git -C "$wt_dir" rev-parse --verify 'HEAD^{tree}' 2>/dev/null) || return 2
+    _main_tree=$(git -C "$wt_dir" rev-parse --verify 'origin/main^{tree}' 2>/dev/null) || return 2
+    [ -n "$_head_tree" ] && [ -n "$_main_tree" ] || return 2
+    [ "$_head_tree" = "$_main_tree" ]
+}
+
+# _fetch_main_ref_once — rafraîchir `origin/main`, une fois par dispatch.
+#
+# mika#3038. `fetch origin main` NOMMÉMENT, jamais `fetch --prune origin` nu :
+# ce dernier fetche toutes les branches du dépôt et mute les refs de suivi du
+# common dir, partagé par tous les worktrees du checkout, donc il toucherait
+# aussi celles des dispatches en vol. Le raisonnement complet vit sur
+# `_remote_branch_exists`, qui l'a écarté pour les mêmes raisons.
+#
+# Une seule tentative par dispatch, et le drapeau est armé AVANT le fetch : un
+# distant injoignable ne doit pas faire payer un aller-retour réseau à chacun
+# des deux appelants. Un fetch raté ne se signale pas ici — il laisse la ref
+# telle qu'elle est, et c'est l'appelant qui rend 2 s'il n'a rien à lire.
+_MAIN_REF_FETCHED=0
+_fetch_main_ref_once() {
+    # Forme `if` et non `[ … ] && return 0`, pour la raison mesurée sur
+    # `_push_branch` : sous le `set -e` où les handlers sourcent ce fichier, une
+    # telle chaîne devient le rc de la fonction si un éditeur la déplace en
+    # dernière commande. La forme `if` retire la question au lieu de la faire
+    # dépendre de la position de la ligne.
+    if [ -z "${1-}" ]; then return 0; fi
+    if [ "$_MAIN_REF_FETCHED" = "1" ]; then return 0; fi
+    _MAIN_REF_FETCHED=1
+    git -C "${1-}" fetch --quiet origin main 2>/dev/null || true
+}
+
+# La ligne unique de l'AC4 de mika#3038 : quand la comparaison d'arbres n'a pas
+# pu se mesurer, le comportement d'avant ce ticket reste en place ET le résultat
+# le dit.
+#
+# ELLE VA DANS LE RESULT, pas seulement sur stderr, et c'est la même doctrine
+# que les lignes `Remote-probe:` et `Stale-ref:` de `_push_branch` : le stderr
+# d'avant-pilote est structurellement perdu sur un dispatch qui réussit (classe
+# mika#2050, Signaux M et Q), parce que `spawn_long_running_exec` ne lit son
+# `Stdio::piped()` que dans `if !status.success()`. Une surface que personne ne
+# lit reproduirait le défaut qu'on vient de citer.
+#
+# UNE SEULE FOIS PAR DISPATCH. Les deux sites de consultation peuvent tomber sur
+# l'issue indéterminée dans le même dispatch — `_push_branch` puis le secours de
+# fin de vol —, et deux lignes identiques dans le callback se liraient comme
+# deux incidents distincts.
+_TREE_COMPARE_UNDETERMINED_NOTED=0
+_note_tree_compare_undetermined() {
+    if [ "$_TREE_COMPARE_UNDETERMINED_NOTED" = "1" ]; then return 0; fi
+    _TREE_COMPARE_UNDETERMINED_NOTED=1
+    echo "tree_compare.undetermined: could not compare HEAD to origin/main — pre-mika#3038 behaviour in force" >&2
+    RESULT="${RESULT}
+Tree-probe: HEAD could not be compared to origin/main (ref absent or repository unreadable) — the pre-mika#3038 behaviour is in force (mika#3038)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AC4 CENSUS — every reader of `STATUS = success` in this file (mika#2631)
 #
 # `STATUS = success` means "the pilot's session CONCLUDED". It does not mean "the
