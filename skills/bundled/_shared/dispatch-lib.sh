@@ -8101,8 +8101,41 @@ _pilot_had_no_shipping_tail() {
 # stopped on the marker would run to end-of-file.
 _POLICY_DENY_EXCERPT_MAX_LINES=12
 
-# _policy_deny_excerpt — read ANSI-stripped stderr on stdin, print the first
-# `[policy:deny]` event in full rather than its first line only (mika#2493 U3).
+# _policy_deny_excerpt — read ANSI-stripped stderr on stdin, print ONE
+# `[policy:deny]` event in full rather than its first line only (mika#2493 U3):
+# the first event that carries `(terminal)` when the stream has one, the first
+# event of the stream otherwise (mika#3040).
+#
+# WHY the terminal one and not the first. The caller writes "The deny's
+# lethality marker says (terminal): it ended the session" and then interpolates
+# this excerpt under the words `Halt event:`. Lethality is read from the WHOLE
+# file (`_policy_deny_lethality`), so on a session carrying several denies the
+# two readings answer about different objects and the sentence names an event
+# that did not end anything. Measured (mika#3040) over the 3162 `.stderr` of
+# `/var/log/claude-pilot` (2026-05-15 → 2026-11-03): 118 sessions carry a
+# terminal deny EVENT, and in 98 of them the terminal one is not the first.
+# The origin case is groom `e71ada95` (mika#3030), whose `result` cited a
+# `cause=default-deny (non-terminal)` refusal under `Halt event:` while the
+# `[bash-grep] (terminal)` one six minutes later was what actually ended it.
+#
+# WHY no parameter. "An event carries `(terminal)`" IMPLIES
+# `_policy_deny_lethality` returns `terminal`, since that function greps the
+# same file — so selecting the terminal event unconditionally always agrees
+# with the announced lethality. The converse is false and its case is named:
+# lethality can read `terminal` from the pilot's own PROSE (the mika#2050
+# Signal-S cost named above `_policy_deny_lethality`) with no event carrying the
+# marker. There this function falls back to the first event — today's behaviour,
+# unchanged. Passing the lethality in would add no information the stream does
+# not already carry.
+#
+# FIRST terminal, not last: a terminal deny ENDS its session (mika#2493 M4,
+# verified on `da4aa7ae`), so the two coincide on the real population, and only
+# "the first" survives a truncated file.
+#
+# COST, named: the discrimination is a literal substring over the whole event,
+# so a refused command whose own text contains `(terminal)` would promote its
+# event. Same exposure class, and the same bound, as the whole-file scan of
+# `_policy_deny_lethality`.
 #
 # WHY this is not a one-line grep. The rendered deny is
 #   `[policy:deny] <Tool>: <detail>[ [rule-id]] (terminal|non-terminal)`
@@ -8134,27 +8167,51 @@ _POLICY_DENY_EXCERPT_MAX_LINES=12
 # already interpolates the raw deny line) and scrubbing the evidence would
 # contradict the non-truncation doctrine this function exists to honour.
 #
-# Reads stdin so the caller keeps its own `sed`-based ANSI strip visible at the
-# site. Never short-circuits its input: the awk program keeps draining stdin
-# after it is done printing, so the upstream `sed` can never take SIGPIPE and
-# be promoted to the pipeline's status under `pipefail` (mika#2055 class).
+# Reads stdin, so the one `sed`-based ANSI strip stays visible at its single
+# reading site (`_policy_deny_read`). Never short-circuits its input: the awk
+# program prints only in `END`, so it reads the whole stream BY CONSTRUCTION and
+# the upstream `sed` can never take SIGPIPE and be promoted to the pipeline's
+# status under `pipefail` (mika#2055 class). That property used to be a
+# deliberate drain after printing; it is now a consequence of the shape — a
+# future "simplification" that reintroduced an `exit` on the terminal match
+# would break it, which is why it is written down here.
 _policy_deny_excerpt() {
+    # Two candidates, one pass: `fallback` is the first event of the stream,
+    # `term` the first that carries the marker. `close_event` is the only place
+    # either is recorded, so the two bookkeepings cannot drift apart.
     awk -v max="${_POLICY_DENY_EXCERPT_MAX_LINES:-12}" '
-        done_printing { next }
-        !started {
-            if (index($0, "[policy:deny]") > 0) {
-                started = 1
-                n = 1
-                print
-                if ($0 ~ /\((non-)?terminal\)/) done_printing = 1
+        function close_event() {
+            if (n == 0) return
+            if (fallback == "") fallback = buf
+            # Literal substring, never a word regex: `(non-terminal)` does NOT
+            # contain `(terminal)` — the opening parenthesis the latter needs is
+            # occupied by the `-`. Inverting this would reclassify the 1093
+            # measured non-terminal denies in one go (mika#2493 T6).
+            if (term == "" && index(buf, "(terminal)") > 0) term = buf
+            n = 0
+            buf = ""
+        }
+        function open_event(line) {
+            buf = line
+            n = 1
+            if (line ~ /\((non-)?terminal\)/) close_event()
+        }
+        n > 0 {
+            if ($0 ~ /^[[:space:]]*\[/) {
+                close_event()
+                if (index($0, "[policy:deny]") > 0) open_event($0)
+                next
             }
+            n++
+            buf = buf "\n    " $0
+            if ($0 ~ /\((non-)?terminal\)/ || n >= max) close_event()
             next
         }
-        {
-            if ($0 ~ /^[[:space:]]*\[/) { done_printing = 1; next }
-            n++
-            print "    " $0
-            if ($0 ~ /\((non-)?terminal\)/ || n >= max) done_printing = 1
+        index($0, "[policy:deny]") > 0 { open_event($0) }
+        END {
+            close_event()
+            if (term != "") print term
+            else if (fallback != "") print fallback
         }
     '
 }
@@ -8212,6 +8269,63 @@ _policy_deny_lethality() {
     else
         printf '%s' 'undeclared'
     fi
+}
+
+# _policy_deny_read <stderr_path> — the SINGLE site that turns one stderr file
+# into the pair (`POLICY_DENY`, `POLICY_DENY_LETHALITY`) (mika#3040 G2).
+#
+# WHY one function and not two calls at each site. The two sites (dev-pilot's
+# HEAD-unchanged branch and dev-groom's drift branch) each asked the two
+# questions separately, in near-literal copies of one another. That duplication
+# was the material condition for the two readings to drift apart, and they did:
+# the sentence "the marker says (terminal): it ended the session" was printed
+# next to an event that ended nothing, in 98 of the 118 measured sessions
+# carrying a terminal deny. One reading, one pair of values, one place to fix.
+#
+# IT PUBLISHES, IT DOES NOT PRINT. Two values come out of one reading and one of
+# them is free multi-line text, so a stdout return would need a separator in a
+# stream that cannot guarantee its absence. Same motif as `_resolve_halt_subtype`
+# and its `_HALT_SUBTYPE_RESOLVED`. Neither site declares `local POLICY_DENY`,
+# so the assignment reaches the same variable as before and `_rescue_cause_token`
+# reads it unchanged.
+#
+# THE ANSI STRIP LIVES HERE NOW, and that REVERSES a mika#2493 instruction
+# written twice in this file ("the ANSI strip stays here, at the site"). The
+# intent of that note was that the normalisation be VISIBLE, not that it be
+# DUPLICATED — and duplicated is exactly what let the two sites diverge. A
+# single site for a `sed` that normalises is still a visible site. Said
+# explicitly so the next reader of dispatch-lib does not find a mika#2493
+# instruction broken without knowing it was broken knowingly.
+#
+# Fail-open, identical to the two sites it replaces: an absent, unreadable or
+# empty file leaves `POLICY_DENY` empty and the lethality `undeclared` (T7), and
+# the halt branches fall through to their generic diagnosis. The two defaults
+# are set BEFORE any reading, so no early return can leave them unset.
+#
+# Writes: POLICY_DENY, POLICY_DENY_LETHALITY (caller-scoped globals).
+_policy_deny_read() {
+    local _stderr_path="${1:-}"
+
+    POLICY_DENY=""
+    POLICY_DENY_LETHALITY="undeclared"
+
+    # `if`, not an `&&` chain — a non-zero `&&` chain is what `set -e` kills.
+    if [ -z "$_stderr_path" ] || [ ! -f "$_stderr_path" ] || [ ! -r "$_stderr_path" ]; then
+        return 0
+    fi
+
+    # mika#2312: the line shape is
+    #   `[policy:deny] <Tool>: <detail>[ [rule-id]] (terminal|non-terminal)`
+    # and the lethality marker (cpp#151) FOLLOWS the rule-id tag, so the rule-id
+    # is the last *bracketed* token, not the last token. An absent tag means
+    # `rule_id=None` — the policy default deny (no rule matched), NOT a
+    # non-deterministic refusal.
+    # mika#2493 (U3): the whole EVENT, not just its first line — `<detail>` is
+    # multi-line whenever the refused command is, and both the rule-id and the
+    # marker sit at its END.
+    POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_stderr_path" 2>/dev/null \
+        | _policy_deny_excerpt || true)
+    POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$_stderr_path")
 }
 
 # Sentinel the note below is keyed on. Both POLICY_DENY sites can fire on one
@@ -8321,19 +8435,13 @@ _post_flight_recovery() {
             #
             # See: docs/solutions/workflow-issues/
             #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
-            POLICY_DENY=""
-            POLICY_DENY_LETHALITY="undeclared"
+            # mika#3040 (G2): ONE call for the two values. The site builds the
+            # path — it knows which file is its own — and `_policy_deny_read`
+            # knows how to read it: ANSI strip, `-f`/`-r` fail-open guard, the
+            # excerpt and the lethality, from a single reading that cannot
+            # disagree with itself.
             _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
-            if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
-                # mika#2493 (U3): the whole deny EVENT, not its first line. A
-                # `grep -m1 '[policy:deny]'` loses the [rule-id] and the
-                # lethality marker on every multi-line deny — 23 % of the
-                # measured population, the ticket's own proof 98b60020 among
-                # them. The ANSI strip stays here, at the site.
-                POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                    | _policy_deny_excerpt || true)
-                POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
-            fi
+            _policy_deny_read "$PERSISTENT_STDERR_PATH"
 
             # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
             # expected when the plan was already committed in a prior run.
@@ -8556,24 +8664,12 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # the persistent stderr for [policy:deny] before declaring drift.
         # Fail-open: if stderr is unavailable, fall through to the
         # existing drift messages.
-        POLICY_DENY=""
-        POLICY_DENY_LETHALITY="undeclared"
+        # mika#3040 (G2): ONE call for the two values, the same one the
+        # dev-pilot site makes. This site and that one were near-literal copies,
+        # and that is what let the excerpt and the lethality answer about
+        # different objects. See `_policy_deny_read` for the reading itself.
         _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
-        if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
-            # Strip ANSI color codes, then extract the first [policy:deny] event.
-            # The line shape is
-            #   `[policy:deny] <Tool>: <detail>[ \[rule-id\]] (terminal|non-terminal)`
-            # mika#2312: the trailing lethality marker (cpp#151) FOLLOWS the
-            # rule-id tag, so the rule-id is the last *bracketed* token, not the
-            # last token. An absent tag means `rule_id=None` — the policy default
-            # deny (no rule matched), NOT a non-deterministic refusal.
-            # mika#2493 (U3): the EVENT, not just its first line — `<detail>` is
-            # multi-line whenever the refused command is, and both the rule-id and
-            # the marker sit at its END. The ANSI strip stays here, at the site.
-            POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                | _policy_deny_excerpt || true)
-            POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
-        fi
+        _policy_deny_read "$PERSISTENT_STDERR_PATH"
 
         # mika#2493 (U1): `[ -z "$VALID_PLAN" ]` — this is the branch that
         # produced the ticket. It tested POLICY_DENY at the head of the chain with
