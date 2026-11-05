@@ -8101,8 +8101,41 @@ _pilot_had_no_shipping_tail() {
 # stopped on the marker would run to end-of-file.
 _POLICY_DENY_EXCERPT_MAX_LINES=12
 
-# _policy_deny_excerpt — read ANSI-stripped stderr on stdin, print the first
-# `[policy:deny]` event in full rather than its first line only (mika#2493 U3).
+# _policy_deny_excerpt — read ANSI-stripped stderr on stdin, print ONE
+# `[policy:deny]` event in full rather than its first line only (mika#2493 U3):
+# the first event that carries `(terminal)` when the stream has one, the first
+# event of the stream otherwise (mika#3040).
+#
+# WHY the terminal one and not the first. The caller writes "The deny's
+# lethality marker says (terminal): it ended the session" and then interpolates
+# this excerpt under the words `Halt event:`. Lethality is read from the WHOLE
+# file (`_policy_deny_lethality`), so on a session carrying several denies the
+# two readings answer about different objects and the sentence names an event
+# that did not end anything. Measured (mika#3040) over the 3162 `.stderr` of
+# `/var/log/claude-pilot` (2026-05-15 → 2026-11-03): 118 sessions carry a
+# terminal deny EVENT, and in 98 of them the terminal one is not the first.
+# The origin case is groom `e71ada95` (mika#3030), whose `result` cited a
+# `cause=default-deny (non-terminal)` refusal under `Halt event:` while the
+# `[bash-grep] (terminal)` one six minutes later was what actually ended it.
+#
+# WHY no parameter. "An event carries `(terminal)`" IMPLIES
+# `_policy_deny_lethality` returns `terminal`, since that function greps the
+# same file — so selecting the terminal event unconditionally always agrees
+# with the announced lethality. The converse is false and its case is named:
+# lethality can read `terminal` from the pilot's own PROSE (the mika#2050
+# Signal-S cost named above `_policy_deny_lethality`) with no event carrying the
+# marker. There this function falls back to the first event — today's behaviour,
+# unchanged. Passing the lethality in would add no information the stream does
+# not already carry.
+#
+# FIRST terminal, not last: a terminal deny ENDS its session (mika#2493 M4,
+# verified on `da4aa7ae`), so the two coincide on the real population, and only
+# "the first" survives a truncated file.
+#
+# COST, named: the discrimination is a literal substring over the whole event,
+# so a refused command whose own text contains `(terminal)` would promote its
+# event. Same exposure class, and the same bound, as the whole-file scan of
+# `_policy_deny_lethality`.
 #
 # WHY this is not a one-line grep. The rendered deny is
 #   `[policy:deny] <Tool>: <detail>[ [rule-id]] (terminal|non-terminal)`
@@ -8134,27 +8167,51 @@ _POLICY_DENY_EXCERPT_MAX_LINES=12
 # already interpolates the raw deny line) and scrubbing the evidence would
 # contradict the non-truncation doctrine this function exists to honour.
 #
-# Reads stdin so the caller keeps its own `sed`-based ANSI strip visible at the
-# site. Never short-circuits its input: the awk program keeps draining stdin
-# after it is done printing, so the upstream `sed` can never take SIGPIPE and
-# be promoted to the pipeline's status under `pipefail` (mika#2055 class).
+# Reads stdin, so the one `sed`-based ANSI strip stays visible at its single
+# reading site (`_policy_deny_read`). Never short-circuits its input: the awk
+# program prints only in `END`, so it reads the whole stream BY CONSTRUCTION and
+# the upstream `sed` can never take SIGPIPE and be promoted to the pipeline's
+# status under `pipefail` (mika#2055 class). That property used to be a
+# deliberate drain after printing; it is now a consequence of the shape — a
+# future "simplification" that reintroduced an `exit` on the terminal match
+# would break it, which is why it is written down here.
 _policy_deny_excerpt() {
+    # Two candidates, one pass: `fallback` is the first event of the stream,
+    # `term` the first that carries the marker. `close_event` is the only place
+    # either is recorded, so the two bookkeepings cannot drift apart.
     awk -v max="${_POLICY_DENY_EXCERPT_MAX_LINES:-12}" '
-        done_printing { next }
-        !started {
-            if (index($0, "[policy:deny]") > 0) {
-                started = 1
-                n = 1
-                print
-                if ($0 ~ /\((non-)?terminal\)/) done_printing = 1
+        function close_event() {
+            if (n == 0) return
+            if (fallback == "") fallback = buf
+            # Literal substring, never a word regex: `(non-terminal)` does NOT
+            # contain `(terminal)` — the opening parenthesis the latter needs is
+            # occupied by the `-`. Inverting this would reclassify the 1093
+            # measured non-terminal denies in one go (mika#2493 T6).
+            if (term == "" && index(buf, "(terminal)") > 0) term = buf
+            n = 0
+            buf = ""
+        }
+        function open_event(line) {
+            buf = line
+            n = 1
+            if (line ~ /\((non-)?terminal\)/) close_event()
+        }
+        n > 0 {
+            if ($0 ~ /^[[:space:]]*\[/) {
+                close_event()
+                if (index($0, "[policy:deny]") > 0) open_event($0)
+                next
             }
+            n++
+            buf = buf "\n    " $0
+            if ($0 ~ /\((non-)?terminal\)/ || n >= max) close_event()
             next
         }
-        {
-            if ($0 ~ /^[[:space:]]*\[/) { done_printing = 1; next }
-            n++
-            print "    " $0
-            if ($0 ~ /\((non-)?terminal\)/ || n >= max) done_printing = 1
+        index($0, "[policy:deny]") > 0 { open_event($0) }
+        END {
+            close_event()
+            if (term != "") print term
+            else if (fallback != "") print fallback
         }
     '
 }

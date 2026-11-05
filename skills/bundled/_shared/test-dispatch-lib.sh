@@ -10131,6 +10131,104 @@ assert_not_contains "T14: ni la ligne de fin de session" \
 assert_eq "T14: sans marqueur ni autre événement, la capture est plafonnée" \
     "12" "$(_t2493_excerpt "$T2493_FIXTURE_DIR/deny_unbounded.stderr" | grep -c . || true)"
 
+# --- mika#3040 : l'extrait cite l'événement qui a TUÉ la session -------------
+#
+# Le site annonce « The deny's lethality marker says (terminal): it ended the
+# session », puis joint le PREMIER refus du flux. Les deux lectures portent sur
+# des objets différents — la létalité sur le fichier entier, l'extrait sur le
+# premier événement — et elles divergent dès qu'une session porte plusieurs
+# refus. Rejeu sur les 3162 `.stderr` du 2026-05-15 au 2026-11-03 : 118 sessions
+# portent un événement de refus terminal, et 98 d'entre elles citaient un
+# événement NON terminal sous le mot « Halt ».
+#
+# Le défaut vivait exactement dans la case que le produit cartésien des fixtures
+# ci-dessus laisse vide : T5 porte cinq refus dont un terminal, mais n'interroge
+# que la létalité ; T13 et T14 interrogent l'extrait, mais sur des refus
+# uniques. La paire « plusieurs refus ET extrait » est ci-dessous.
+
+# La forme exacte du cas d'origine, groom `e71ada95` (mika#3030) : un refus
+# `cause=default-deny` non terminal à 19:53:52Z, du bruit de journal, puis le
+# refus tier3 `[bash-grep]` terminal à 19:59:41Z qui a réellement fini la
+# session. Aucune ligne de continuation n'ouvre par `[` : la borne D6 s'applique
+# aux continuations comme au reste, et une fixture qui l'ignorerait mesurerait
+# une forme que le corpus ne porte pas.
+printf '%s\n' \
+    '[2026-11-03T19:53:52.000Z] [policy:deny] Bash: git -C /data/workspace/mika-platform/claude-pilot rev-parse --git-dir \' \
+    '  cause=default-deny (non-terminal)' \
+    '[debug] tool_use id=abc' \
+    '[2026-11-03T19:59:41.000Z] [policy:deny] Bash: grep -c "bash -c" ~/.mika/data/pilot-transcripts/*.jsonl \' \
+    '  | sort -rn \' \
+    '  cause=tier3 [bash-grep] (terminal)' \
+    '[done] Halted | 37 turns' \
+    > "$T2493_FIXTURE_DIR/two_denies.stderr"
+# Bonne foi AVANT les assertions : la fixture reproduit bien la forme mesurée.
+# Si sa létalité n'était pas `terminal`, le site n'annoncerait pas « it ended
+# the session » et tout ce qui suit ne mesurerait plus rien.
+assert_eq "AC1 (bonne foi): la fixture à deux refus a bien une létalité terminal" \
+    "terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/two_denies.stderr")"
+T3040_EXCERPT_TWO=$(_t2493_excerpt "$T2493_FIXTURE_DIR/two_denies.stderr")
+assert_contains "AC1: l'extrait cite le [rule-id] du refus TERMINAL" \
+    "[bash-grep]" "$T3040_EXCERPT_TWO"
+assert_contains "AC1: et le marqueur cité concorde avec la létalité annoncée" \
+    "(terminal)" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: le premier refus, non terminal, n'est PAS celui qu'on cite" \
+    "rev-parse --git-dir" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: et son marqueur non terminal n'apparaît pas" \
+    "(non-terminal)" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: les bornes d'événement tiennent entre deux refus ([debug])" \
+    "[debug]" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: ni la ligne de fin de session ([done])" \
+    "[done]" "$T3040_EXCERPT_TWO"
+# L'ÉVÉNEMENT TERMINAL EN ENTIER, à l'octet. Assertion d'égalité et non de
+# contenance, pour deux raisons : les continuations du terminal doivent être
+# emportées (sans quoi le [rule-id] et le marqueur se reperdent, le défaut même
+# de mika#2493), et elles doivent rester indentées de 4 espaces — D5 :
+# l'indentation neutralise les jetons de reclassification ancrés en début de
+# ligne. Les continuations de la fixture portent déjà 2 espaces, d'où 6 ici.
+#
+# `assert_contains` ne peut pas tenir cette moitié : son `grep -qF` traite une
+# aiguille multi-ligne comme PLUSIEURS motifs, et la ligne vide d'une aiguille
+# qui ouvre par un saut de ligne matche n'importe quoi — l'assertion passerait
+# au vert sur l'extrait d'aujourd'hui (mesuré).
+T3040_EXPECTED_TWO=$(printf '%s\n' \
+    '[2026-11-03T19:59:41.000Z] [policy:deny] Bash: grep -c "bash -c" ~/.mika/data/pilot-transcripts/*.jsonl \' \
+    '      | sort -rn \' \
+    '      cause=tier3 [bash-grep] (terminal)')
+assert_eq "AC1: l'extrait EST l'événement terminal entier, continuations indentées" \
+    "$T3040_EXPECTED_TWO" "$T3040_EXCERPT_TWO"
+
+# AC2, premier contrôle négatif — un refus unique NON terminal : l'extrait est
+# inchangé, parce que le candidat de repli a servi (aucun événement du flux ne
+# porte `(terminal)`). La valeur attendue est lue sur la FIXTURE et non réécrite
+# ici : sur un refus mono-ligne l'événement EST sa première ligne, donc
+# `grep -m1` en est la référence — propriété que T13 montre fausse dès que le
+# refus est multi-ligne.
+assert_eq "AC2: un refus unique non terminal ⇒ extrait inchangé (repli)" \
+    "$(sed 's/\x1b\[[0-9;]*[mK]//g' "$T2493_FIXTURE_DIR/nonterm.stderr" | grep -m1 '\[policy:deny\]' || true)" \
+    "$(_t2493_excerpt "$T2493_FIXTURE_DIR/nonterm.stderr")"
+
+# AC2, second contrôle négatif — un refus unique TERMINAL : extrait inchangé.
+assert_eq "AC2: un refus unique terminal ⇒ extrait inchangé" \
+    "$(grep -m1 '\[policy:deny\]' "$T2493_FIXTURE_DIR/term.stderr" || true)" \
+    "$(_t2493_excerpt "$T2493_FIXTURE_DIR/term.stderr")"
+
+# Et la même chose sur une forme MULTI-LIGNE. Sans cette fixture, le candidat
+# terminal n'est jamais exercé sur un événement à continuations : une
+# implémentation qui ne retiendrait que la première ligne du terminal — celle
+# qui perd le [rule-id] et le marqueur, le défaut de mika#2493 — passerait.
+printf '%s\n' \
+    '[policy:deny] Bash: grep -rn "token" /etc/shadow /etc/sudoers \' \
+    '  --include="*" \' \
+    '  cause=tier3 [bash-sensitive-read] (terminal)' \
+    > "$T2493_FIXTURE_DIR/term_multiline.stderr"
+T3040_EXCERPT_TERM_ML=$(_t2493_excerpt "$T2493_FIXTURE_DIR/term_multiline.stderr")
+T3040_EXPECTED_TERM_ML=$(printf '%s\n' \
+    '[policy:deny] Bash: grep -rn "token" /etc/shadow /etc/sudoers \' \
+    '      --include="*" \' \
+    '      cause=tier3 [bash-sensitive-read] (terminal)')
+assert_eq "AC2: terminal multi-ligne — l'événement entier, première ligne à fleur" \
+    "$T3040_EXPECTED_TERM_ML" "$T3040_EXCERPT_TERM_ML"
+
 # --- T8 : garde de préemption, formulée sur la POPULATION des sites ----------
 #
 # Formulé sur la population — toute branche qui déclare un halt sur un deny —
