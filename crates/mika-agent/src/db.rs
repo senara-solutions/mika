@@ -2075,6 +2075,67 @@ impl Database {
         Ok(row)
     }
 
+    /// La dernière **transition d'état** inscrite sur `target_key`, quel que soit
+    /// l'outil qui l'a écrite (mika#3044) — son `tool_name`, son `before_value`,
+    /// son `after_value` et son `created_at`.
+    ///
+    /// # Ce qui compte comme transition (D1)
+    ///
+    /// Une ligne qui porte un état **avant ET après** :
+    /// `before_value IS NOT NULL AND after_value IS NOT NULL`. Les lignes de
+    /// jugement (`manager_flight_verdict`, `mpc_flight_judgment` —
+    /// `flight_verdict_ledger.rs`) n'en portent qu'un et tombent du bon côté,
+    /// comme le bord `reaper_db_error` de `task_engine::engine` qui écrit un reap
+    /// **qui n'a pas eu lieu** avec `after_value = NULL`.
+    ///
+    /// # Pourquoi ce n'est pas [`Self::latest_audit_event_for_target`]
+    ///
+    /// Cette voisine filtre sur un `tool_name` donné, donc elle sait répondre
+    /// *« la dernière ligne de cet outil »* et jamais *« la dernière transition,
+    /// quel que soit l'outil »*. Ses cinq sœurs
+    /// ([`Self::count_recent_audit_events_for_target`],
+    /// [`Self::count_recent_audit_events_by_value`],
+    /// [`Self::count_audit_events_by_tool_name`],
+    /// [`Self::get_audit_event_rows_by_tool_name`],
+    /// [`Self::list_audit_events_for_tool_since`]) sont bornées à un outil elles
+    /// aussi. Or mika#3044 a besoin des deux moitiés d'une même question — *la
+    /// dernière transition est-elle le reap de groom, et aucune ne le suit-elle ?*
+    /// — et le `LIMIT 1` les rend propriétés de **la même ligne** : pas de fenêtre
+    /// entre les deux lectures.
+    ///
+    /// `before_value` et `after_value` sont rendus comme les `Option<String>` que
+    /// les colonnes sont, bien que le `WHERE` garantisse ici leur présence : la
+    /// projection reste celle de la table, et coercer un NULL en `""` est ce que
+    /// mika#2331 refuse.
+    ///
+    /// `id DESC` tranche l'égalité : `created_at` est à la seconde, donc deux
+    /// lignes écrites dans la même seconde sont sinon ordonnées arbitrairement.
+    ///
+    /// `target_key` n'est pas indexé ; la lecture chevauche
+    /// `idx_audit_agent_created(agent_id, created_at DESC)`, et elle a lieu une
+    /// fois par dispatch d'une parente terminale.
+    pub fn latest_state_transition_for_target(
+        &self,
+        agent_id: &str,
+        target_key: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestStateTransitionProjection>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT tool_name, before_value, after_value, created_at
+                 FROM audit_events
+                 WHERE agent_id = ?1 AND target_key = ?2
+                   AND before_value IS NOT NULL
+                   AND after_value IS NOT NULL
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![agent_id, target_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Read a `schema_meta` value, or `None` when the key was never stamped.
     pub fn get_schema_meta(&self, key: &str) -> Result<Option<String>> {
         let value = self

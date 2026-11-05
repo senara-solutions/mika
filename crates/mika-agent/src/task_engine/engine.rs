@@ -133,9 +133,20 @@ const REAPER_CLASS_DISPOSITIONS: [(&str, &str, &str); 2] = [
     (
         "groom",
         "groom_callback_delivered_without_redispatch",
-        "groom_parent_orphaned",
+        GROOM_PARENT_ORPHANED_EVENT,
     ),
 ];
+
+/// Nom d'événement d'audit du reap de la classe `groom` — l'outil sous lequel
+/// [`TaskEngine::reap_orphaned_parent_tasks`] écrit la transition
+/// `in_progress` → `failed` d'une parente orpheline.
+///
+/// Nommé parce qu'il a **deux** lecteurs depuis mika#3044 : la table
+/// [`REAPER_CLASS_DISPOSITIONS`] ci-dessus, qui l'écrit, et
+/// [`crate::parent_rehabilitation::decide`], qui le relit pour savoir si l'état
+/// terminal d'une parente est exactement ce reap. Deux littéraux identiques dans
+/// deux fichiers sont ce qui dérive.
+pub(crate) const GROOM_PARENT_ORPHANED_EVENT: &str = "groom_parent_orphaned";
 
 /// Default grace window (seconds) before the childless-parent reaper transitions
 /// a self_dev issue parent left `in_progress` with **zero** callback children to

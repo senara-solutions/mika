@@ -63,6 +63,17 @@ pub const AUDIT_RETENTION_DAYS: u32 = 90;
 /// had to write for `request_bytes`.
 pub type LatestAuditEventProjection = (Option<String>, Option<String>, String);
 
+/// `(tool_name, before_value, after_value, created_at)` d'une transition d'état,
+/// telle que [`Database::latest_state_transition_for_target`] la projette
+/// (mika#3044).
+///
+/// Nommée pour la même raison que sa voisine, et avec une de plus : `tool_name`
+/// est ici en **première** position parce que c'est lui que le lecteur teste
+/// d'abord — *cette transition est-elle le reap de groom ?* Les deux `Option`
+/// restent celles des colonnes bien que la requête exige leur présence : la
+/// projection dit ce que la table porte, pas ce que le `WHERE` filtre.
+pub type LatestStateTransitionProjection = (String, Option<String>, Option<String>, String);
+
 impl Database {
     // ===== Audit Events =====
 
