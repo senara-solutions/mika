@@ -217,16 +217,35 @@ pub(crate) struct GhCall {
 static CALL_LOG: std::sync::LazyLock<std::sync::Mutex<Vec<GhCall>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-/// `stdout` canné par sujet, pour le test qui a besoin d'une charge fabriquée.
+/// `stdout` canné par sujet **et par motif d'`argv`**, pour le test qui a besoin
+/// d'une charge fabriquée.
 ///
 /// Keyed par sujet **exprès** : la suite tourne en parallèle dans un seul
 /// processus, donc un override global serait lu par les tests voisins. Chaque
 /// test posant un override le pose sur son propre numéro de fixture, qui est
 /// distinct de ceux des autres (mika#2713 D4).
+///
+/// **Et par motif depuis mika#3047**, la symétrique de [`CANNED_FAILURES`] et
+/// pour la raison exacte que son doc-comment écrit déjà : un appel de la phase 2
+/// porte **deux lectures sur la même issue** — la timeline du label
+/// (`gh api …/issues/<n>/timeline`) et la relecture d'état avant dispatch
+/// (`gh issue view <n> --json state,labels,body,updatedAt`) — qui doivent rendre
+/// deux charges différentes. Une table keyée par le seul sujet n'en sert qu'une,
+/// donc le test ne pouvait pas atteindre le dispatch : il mesurait la sortie
+/// `no_ready_label_event` en croyant mesurer la relecture.
+///
+/// La liste est ordonnée : le premier motif qui apparie l'`argv` gagne, et
+/// l'entrée **sans** motif (celle que [`set_canned_stdout`] pose) sert de
+/// défaut. L'ordre de résolution entier vit dans [`run_gh`].
 #[cfg(test)]
 static CANNED_STDOUT: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<GhSubjectKey, Vec<u8>>>,
+    std::sync::Mutex<std::collections::HashMap<GhSubjectKey, Vec<CannedStdout>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Une charge cannée : son motif d'`argv` (`None` = la charge par défaut du
+/// sujet) et les octets que le double rendra.
+#[cfg(test)]
+type CannedStdout = (Option<String>, Vec<u8>);
 
 /// Échec canné par sujet **et par motif d'`argv`** (mika#2839).
 ///
@@ -303,12 +322,25 @@ pub(crate) async fn run_gh(
         });
     }
 
-    let stdout = CANNED_STDOUT
-        .lock()
-        .expect("la table d'overrides `gh` doit être lisible")
-        .get(&subject_key(subject))
-        .cloned()
-        .unwrap_or_else(|| b"[]".to_vec());
+    // L'ordre de résolution (mika#3047) : premier motif qui apparie l'`argv`,
+    // puis la charge sans motif, puis `b"[]"`. Le motif passe avant le défaut
+    // pour qu'un test puisse poser une charge générale ET l'exception d'un
+    // appel ; l'inverse rendrait l'exception inatteignable.
+    let stdout = {
+        let table = CANNED_STDOUT
+            .lock()
+            .expect("la table d'overrides `gh` doit être lisible");
+        table
+            .get(&subject_key(subject))
+            .and_then(|payloads| {
+                payloads
+                    .iter()
+                    .find(|(pattern, _)| pattern.as_deref().is_some_and(|p| args.contains(p)))
+                    .or_else(|| payloads.iter().find(|(pattern, _)| pattern.is_none()))
+            })
+            .map(|(_, stdout)| stdout.clone())
+            .unwrap_or_else(|| b"[]".to_vec())
+    };
 
     Ok(Output {
         status: canned_success(),
@@ -370,13 +402,47 @@ pub(crate) fn recorded_calls() -> Vec<GhCall> {
         .clone()
 }
 
-/// Fabrique le `stdout` que le double rendra pour ce sujet.
+/// Fabrique le `stdout` que le double rendra pour ce sujet, sur tout appel
+/// qu'aucun motif ne réclame.
+///
+/// Sémantique de remplacement inchangée depuis mika#3047 : deux appels laissent
+/// **une** charge par défaut, la seconde. Ce qu'un motif a réclamé n'est pas
+/// touché, et réciproquement — voir [`set_canned_stdout_for`].
 #[cfg(test)]
 pub(crate) fn set_canned_stdout(subject: GhSubject, stdout: impl Into<Vec<u8>>) {
-    CANNED_STDOUT
+    upsert_canned_stdout(subject, None, stdout.into());
+}
+
+/// Fabrique le `stdout` que le double rendra pour ce sujet, sur les appels dont
+/// l'`argv` joint contient `argv_needle` (mika#3047).
+///
+/// Les autres appels du même sujet continuent de lire la charge par défaut :
+/// c'est la propriété qui rend testable « la timeline a répondu ceci, la
+/// relecture d'état cela », dans un seul appel de la phase 2.
+#[cfg(test)]
+pub(crate) fn set_canned_stdout_for(
+    subject: GhSubject,
+    argv_needle: impl Into<String>,
+    stdout: impl Into<Vec<u8>>,
+) {
+    upsert_canned_stdout(subject, Some(argv_needle.into()), stdout.into());
+}
+
+/// Pose une charge sous son motif, en remplaçant celle du **même** motif.
+///
+/// Un `push` nu ferait de la table un journal : la seconde pose du même motif
+/// serait ignorée, puisque la résolution s'arrête au premier appariement, et un
+/// test qui se croit réécrit lirait la charge d'avant.
+#[cfg(test)]
+fn upsert_canned_stdout(subject: GhSubject, pattern: Option<String>, stdout: Vec<u8>) {
+    let mut table = CANNED_STDOUT
         .lock()
-        .expect("la table d'overrides `gh` doit être lisible")
-        .insert(subject_key(subject), stdout.into());
+        .expect("la table d'overrides `gh` doit être lisible");
+    let payloads = table.entry(subject_key(subject)).or_default();
+    match payloads.iter_mut().find(|(p, _)| *p == pattern) {
+        Some(slot) => slot.1 = stdout,
+        None => payloads.push((pattern, stdout)),
+    }
 }
 
 /// Fabrique l'échec que le double rendra pour ce sujet, sur les appels dont
