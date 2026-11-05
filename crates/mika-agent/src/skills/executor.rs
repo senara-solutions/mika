@@ -4053,21 +4053,43 @@ pub(crate) async fn validate_dispatch_readiness(
     };
 
     // Only pending and in_progress are dispatchable
+    //
+    // mika#3044 — un état terminal n'est plus toujours le dernier mot. Une
+    // parente `self_dev` que le reaper de groom a fauchée, et qu'un groom
+    // convergé dément ensuite, est réhabilitée `failed` → `in_progress` puis
+    // dispatchée. Le prédicat est évalué **ici**, dans la branche de la garde,
+    // et non avant elle : c'est le seul endroit d'où une décision peut
+    // *empêcher* le `return Err` plutôt que le constater après coup (doctrine
+    // mika#1646). L'écriture, elle, n'a pas lieu ici — voir `rehab_pending`.
+    let mut rehab_pending: Option<crate::parent_rehabilitation::RehabPending> = None;
     if !matches!(task.status.as_str(), "pending" | "in_progress") {
-        let pr_url = extract_pr_url(&task.metadata);
-        let rejection = serde_json::json!({
-            "error": "task_not_dispatchable",
-            "task_id": task_id,
-            "current_status": task.status,
-            "pr_url": pr_url,
-            "reason": format!(
-                "Task is in '{}' state and cannot be dispatched. \
-                 Only 'pending' and 'in_progress' tasks can be dispatched.",
-                task.status
-            )
-        });
-        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
-        return Err(rejection.to_string());
+        match crate::parent_rehabilitation::decide(db, &task).await {
+            crate::parent_rehabilitation::RehabDecision::Eligible(pending) => {
+                // (a), (b) et (c) tiennent. Reste (d) : tout le reste de cette
+                // fonction. Le jeton voyage jusqu'après la claim mika#1948 et
+                // n'est écrit que là — si une garde en aval refuse, la parente
+                // reste `failed`, ce qu'AC1(d) exige.
+                rehab_pending = Some(pending);
+            }
+            crate::parent_rehabilitation::RehabDecision::Refused(refusal) => {
+                crate::parent_rehabilitation::refuse(db, task_id, refusal).await;
+
+                let pr_url = extract_pr_url(&task.metadata);
+                let rejection = serde_json::json!({
+                    "error": "task_not_dispatchable",
+                    "task_id": task_id,
+                    "current_status": task.status,
+                    "pr_url": pr_url,
+                    "reason": format!(
+                        "Task is in '{}' state and cannot be dispatched. \
+                         Only 'pending' and 'in_progress' tasks can be dispatched.",
+                        task.status
+                    )
+                });
+                record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+                return Err(rejection.to_string());
+            }
+        }
     }
 
     // Check for active callback children (double-dispatch prevention)
@@ -5076,6 +5098,22 @@ pub(crate) async fn validate_dispatch_readiness(
     // release one. The only thing between this claim and the callback row is
     // the caller's own dispatch.
     //
+    // mika#3044 amends that last paragraph, and does not pretend otherwise. A
+    // parent rehabilitation (`failed` → `in_progress`) is written AFTER this
+    // claim, and it is fallible twice over: the guarded UPDATE can match no row
+    // (someone else moved the parent meanwhile) and it can error. So there is
+    // now exactly one error path that leaves here holding a lease. It is
+    // deliberately **not** released: releasing it would mean a second writer
+    // could claim the slot while this dispatch is still unwinding, which is the
+    // very property this claim exists to deny. The cost is bounded by the lease
+    // TTL — the class stalls for one TTL, exactly as it does when a dispatcher
+    // dies mid-claim, and the deferred wrapper re-drives the dispatch.
+    //
+    // Why after the claim and not before it: AC1(d) requires the rehabilitation
+    // to be written only once every other guard has passed. The claim IS one of
+    // those guards — the last one — so "after all the guards" and "after the
+    // claim" are the same instant.
+    //
     // Fail-closed on contention, per the ticket: a missed dispatch is
     // recoverable (the deferred wrapper re-drives it), two writers on one
     // branch are not. The bounded TTL is what keeps fail-closed from becoming
@@ -5187,6 +5225,35 @@ pub(crate) async fn validate_dispatch_readiness(
             })
             .to_string());
         }
+    }
+
+    // mika#3044 — la dernière étape avant le `Ok`. Toutes les gardes ont passé,
+    // la claim est tenue : (d) est satisfaite, la réhabilitation peut s'écrire.
+    if let Some(pending) = rehab_pending.as_ref() {
+        if let Err(refusal) = crate::parent_rehabilitation::commit(db, task_id, pending).await {
+            let rejection = serde_json::json!({
+                "error": "parent_rehabilitation_failed",
+                "task_id": task_id,
+                "current_status": task.status,
+                "refusal": refusal.as_reason(),
+                "reason": format!(
+                    "The parent was eligible for rehabilitation (a groom reap overturned by a \
+                     converged plan, mika#3044) but the guarded 'failed' -> 'in_progress' \
+                     transition did not happen ({}). The parent stays in its terminal state \
+                     and is not dispatched.",
+                    refusal.as_reason()
+                )
+            });
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
+        }
+        // `task` a été relu avant la garde d'état : son `status` y est figé à
+        // `"failed"`. Rendre `task.status` dirait l'état d'avant la transition
+        // qu'on vient d'écrire, et `wi_status` (plus bas dans ce fichier) lit
+        // cette valeur pour décider s'il faut appeler `mark_parent_dispatched` —
+        // sur `"in_progress"` il ne l'appelle pas, ce qui est l'issue voulue pour
+        // une parente déjà dispatchée une fois.
+        return Ok(crate::parent_rehabilitation::REHABILITATED_STATUS.to_string());
     }
 
     Ok(task.status.clone())
@@ -18036,6 +18103,405 @@ Harness ticket.
                 Some(1),
                 "une écriture reflowée par rustfmt sur deux lignes doit compter \
                  pour une — c'est la forme EXACTE du vrai site : {sites:?}"
+            );
+        }
+    }
+
+    /// mika#3044 — une parente `self_dev` fauchée par le reaper de groom, qu'un
+    /// plan convergé démente.
+    ///
+    /// **Tout passe par `validate_dispatch_readiness`**, et c'est la condition
+    /// pour que ces tests disent quelque chose : la garde d'état est au milieu
+    /// d'une quinzaine d'autres, et AC1(d) porte précisément sur leur conjonction.
+    /// Un test du prédicat seul serait vert alors qu'aucun dispatch n'aboutit.
+    ///
+    /// Les cas passent par cette porte et **non** par `execute_skill_tool` :
+    /// `tools/mod.rs` l. 1049, `validate_task` refuse une parente `manual` en
+    /// `failed` avec *« is not an active task »* **avant** d'arriver ici. Ce refus
+    /// amont est hors vol (il est le même pour les deux issues et ne distingue
+    /// rien) ; le lever serait un autre ticket.
+    mod mika3044_parente_fauchee {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::Database;
+        use crate::db::tests::{
+            GROOM_CALLBACK_AUTO_SKIPPED, GROOM_CALLBACK_PLAN_GROOMED, GROOM_CALLBACK_PLAN_ITERATE,
+            GROOM_ISSUE_URL, db, groom_callback, groom_parent, rendre_les_audits_illisibles,
+            set_completed_at,
+        };
+        use crate::parent_rehabilitation::{
+            PARENT_REHABILITATED_EVENT, PARENT_REHABILITATION_REFUSED_EVENT, RehabDecision,
+            RehabRefusal,
+        };
+        use crate::task_engine::engine::GROOM_PARENT_ORPHANED_EVENT;
+
+        /// L'instant terminal de l'enfant de groom, forcé **après** le reap.
+        ///
+        /// La fixture monte les deux rows dans la même seconde, et la condition
+        /// (c) est un `>` strict : sans ce forçage le test serait rouge pour une
+        /// raison qui n'est pas la sienne. Forcer l'enfant plutôt que reculer le
+        /// reap garde l'ordre d'écriture de la production (le reap, puis le groom).
+        const APRES_LE_REAP: &str = "2099-01-01T00:00:00Z";
+
+        /// Le motif du reaper de la classe `implement` — l'autre entrée de
+        /// `REAPER_CLASS_DISPOSITIONS`, et le premier des « autres motifs » d'AC2.
+        const REAP_IMPLEMENT: &str = "task_engine_reaper";
+
+        /// La transition qu'écrit le reap, telle que
+        /// `reap_orphaned_parent_tasks` l'inscrit : `target_key` = l'id de parente
+        /// **nu**, `session_id` = `system-<agent>`, les deux états présents.
+        fn transition(sync: &Database, parent_id: &str, outil: &str, apres: &str) {
+            sync.log_audit_event(
+                "mika",
+                "system-mika",
+                outil,
+                parent_id,
+                Some("in_progress"),
+                Some(apres),
+                Some("groom_callback_delivered_without_redispatch"),
+                None,
+            )
+            .unwrap();
+        }
+
+        /// La forme des trois parentes de la Mesure : une parente `manual` /
+        /// `self_dev` passée à `failed` par un reap, et — quand
+        /// `result_du_groom` est `Some` — un enfant de groom terminal livré
+        /// après lui.
+        ///
+        /// Chaque row naît du chemin d'écriture de **production** (`create_task`,
+        /// `update_task_completed`, `update_task_failed`, `log_audit_event`) :
+        /// une fixture montée en SQL brut atteste une forme que rien ne produit.
+        fn parente_fauchee(
+            outil_du_reap: &str,
+            result_du_groom: Option<&str>,
+        ) -> (AsyncDatabase, String) {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            if let Some(result) = result_du_groom {
+                let child_id = sync
+                    .create_task(&groom_callback("mika", &parent_id, "groom"))
+                    .unwrap();
+                assert!(
+                    sync.update_task_completed(&child_id, "mika", Some(result))
+                        .unwrap()
+                );
+                set_completed_at(&sync, &child_id, APRES_LE_REAP);
+            }
+            assert!(
+                sync.update_task_failed(
+                    &parent_id,
+                    "mika",
+                    "groom_callback_delivered_without_redispatch"
+                )
+                .unwrap()
+            );
+            transition(&sync, &parent_id, outil_du_reap, "failed");
+            (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        /// Le dispatch du dev-pilot — celui qui a été refusé trois fois.
+        async fn dispatch(db: &AsyncDatabase, parent_id: &str) -> Result<String, String> {
+            let input = serde_json::json!({
+                "skill": "dev-pilot", "prompt": "mika#123", "task_id": parent_id
+            });
+            validate_dispatch_readiness(db, parent_id, None, Some(&input), None).await
+        }
+
+        /// Les `(before_value, after_value)` des lignes de refus, dans l'ordre.
+        async fn refus(db: &AsyncDatabase) -> Vec<(Option<String>, Option<String>)> {
+            db.get_audit_event_rows_by_tool_name(PARENT_REHABILITATION_REFUSED_EVENT)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, before, after, _)| (before, after))
+                .collect()
+        }
+
+        async fn statut(db: &AsyncDatabase, parent_id: &str) -> String {
+            db.get_task(parent_id).await.unwrap().unwrap().status
+        }
+
+        /// Le refus d'aujourd'hui, mot pour mot — c'est ce qu'AC1 demande de
+        /// laisser intact sur tous les cas négatifs.
+        fn est_le_refus_dhier(rejection: &str, statut: &str) {
+            let body: serde_json::Value = serde_json::from_str(rejection).unwrap();
+            assert_eq!(body["error"], "task_not_dispatchable", "{rejection}");
+            assert_eq!(body["current_status"], statut, "{rejection}");
+            assert_eq!(
+                body["reason"],
+                format!(
+                    "Task is in '{statut}' state and cannot be dispatched. \
+                     Only 'pending' and 'in_progress' tasks can be dispatched."
+                ),
+                "le motif part mot pour mot comme avant le vol : {rejection}"
+            );
+        }
+
+        /// **T1 — le contrôle positif.** La forme des trois vols perdus : reap de
+        /// groom, puis un groom convergé, puis une ligne de **jugement**. La
+        /// parente est réhabilitée et le dispatch aboutit.
+        ///
+        /// La ligne `manager_flight_verdict` n'est pas un décor : les trois
+        /// parentes de la Mesure en portent une après leur reap, et la condition
+        /// (b) tiendrait pour de mauvaises raisons si le prédicat la comptait
+        /// comme une transition. Elle est donc le **contrôle négatif de D1** —
+        /// « une ligne de jugement n'est pas une transition » — et il vit dans le
+        /// contrôle positif parce que c'est là qu'il était dans la réalité.
+        #[tokio::test]
+        async fn mika3044_une_parente_fauchee_quun_plan_converge_dement_est_rehabilitee() {
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            db.log_audit_event(
+                "system-mika",
+                "manager_flight_verdict",
+                &parent_id,
+                None,
+                Some("ship"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let status = dispatch(&db, &parent_id).await.expect(
+                "un plan convergé après un reap de groom doit rendre la parente dispatchable",
+            );
+
+            assert_eq!(
+                status, "in_progress",
+                "la porte rend l'état d'APRÈS la transition : `task` a été relu \
+                 avant la garde et son `status` y est figé à `failed`, que \
+                 `wi_status` lirait comme une parente jamais dispatchée"
+            );
+            assert_eq!(statut(&db, &parent_id).await, "in_progress");
+            assert!(refus(&db).await.is_empty(), "aucun refus n'est écrit");
+
+            let lignes = db
+                .get_audit_event_rows_by_tool_name(PARENT_REHABILITATED_EVENT)
+                .await
+                .unwrap();
+            assert_eq!(
+                lignes.len(),
+                1,
+                "une réhabilitation, une ligne : {lignes:?}"
+            );
+            let (cible, avant, apres, raison) = lignes.into_iter().next().unwrap();
+            assert_eq!(cible, parent_id, "la cible est l'id de parente nu");
+            assert_eq!(
+                (avant.as_deref(), apres.as_deref()),
+                (Some("failed"), Some("in_progress")),
+                "la ligne de succès porte les DEUX états : c'est une transition, \
+                 et c'est ce qui rend le vol idempotent"
+            );
+            let raison = raison.expect("la ligne nomme ce qui a été renversé");
+            assert!(raison.contains("groom_reap_overturned"), "{raison}");
+            assert!(
+                raison.contains("groom_child:"),
+                "un opérateur doit pouvoir remonter à QUEL groom a convergé : {raison}"
+            );
+        }
+
+        /// **T1b — l'idempotence, et par quoi elle tient.** Rejouer le dispatch
+        /// sur une parente déjà réhabilitée n'en écrit pas une seconde.
+        ///
+        /// Aucun compteur ni table ne le garantit : la ligne de succès **est** une
+        /// transition, donc la dernière transition de la parente n'est plus le
+        /// reap, donc (b) refuserait — et (a) refuse avant elle, la parente étant
+        /// désormais `in_progress`. C'est la propriété qu'il faut protéger : faire
+        /// de la ligne de succès un simple jugement (`before_value = None`) la
+        /// détruirait sans rougir ailleurs.
+        #[tokio::test]
+        async fn mika3044_une_parente_rehabilitee_ne_lest_pas_deux_fois() {
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            dispatch(&db, &parent_id).await.expect("premier dispatch");
+
+            let _ = dispatch(&db, &parent_id).await;
+
+            assert_eq!(
+                db.count_audit_events_by_tool_name(PARENT_REHABILITATED_EVENT)
+                    .await
+                    .unwrap(),
+                1,
+                "la seconde traversée ne réhabilite rien : la parente est déjà \
+                 `in_progress`, donc la garde d'état ne tire plus"
+            );
+        }
+
+        /// **T2 — un autre motif terminal.** Le reap de la classe `implement`, et
+        /// un `cancelled` : deux états terminaux que rien ne démente, deux refus
+        /// mot pour mot, deux raisons nommées.
+        ///
+        /// Les deux moitiés sont dans un seul test parce que la propriété n'est
+        /// pas « la porte refuse » mais « la porte **sépare** » : un vol qui
+        /// aurait désarmé la garde passerait un cas positif et échouerait ici.
+        #[tokio::test]
+        async fn mika3044_un_autre_motif_terminal_reste_refuse() {
+            let (db, parent_id) =
+                parente_fauchee(REAP_IMPLEMENT, Some(GROOM_CALLBACK_PLAN_GROOMED));
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("le motif `implement` du reaper n'est pas le reap de groom");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("last_transition_not_groom_reap".to_string()))],
+                "le refus porte sa raison, et `before_value` y est NULL : une \
+                 ligne de refus est un jugement, pas une transition — sinon elle \
+                 deviendrait « la dernière transition » et empoisonnerait (b)"
+            );
+
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            db.update_task_status(&parent_id, "cancelled")
+                .await
+                .unwrap();
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("une parente annulée reste terminale");
+            est_le_refus_dhier(&rejection, "cancelled");
+            assert_eq!(statut(&db, &parent_id).await, "cancelled");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("not_self_dev_failed_parent".to_string()))],
+                "(a) tombe la première et nomme SA raison : `cancelled` n'est pas \
+                 `failed`, et confondre les deux refus rendrait les deux \
+                 populations insoustrayables (classe mika#2205)"
+            );
+        }
+
+        /// **T3 — une transition suit le reap.** Le reap n'est plus le dernier
+        /// mot : quelque chose a bougé après lui, et ce quelque chose décide.
+        #[tokio::test]
+        async fn mika3044_une_transition_apres_le_reap_referme_la_porte() {
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            // Une vraie transition, écrite après le reap. `created_at` tombe dans
+            // la même seconde : c'est le départage par `id DESC` qui la place
+            // après, exactement comme en base.
+            db.log_audit_event(
+                "system-mika",
+                PARENT_REHABILITATED_EVENT,
+                &parent_id,
+                Some("failed"),
+                Some("in_progress"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("une transition postérieure au reap referme (b)");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("last_transition_not_groom_reap".to_string()))]
+            );
+        }
+
+        /// **T4 — un groom qui n'a pas convergé.** Deux formes, un seul refus :
+        /// le verdict absent, et le marqueur hors de sa position.
+        ///
+        /// La seconde est la forme mesurée de mika#2590 : une enveloppe JSON
+        /// d'auto-skip dont le champ `note` cite `PLAN_GROOMED` en toutes
+        /// lettres. Un prédicat qui filtrerait le marqueur en SQL — ou par un
+        /// `contains` — réhabiliterait sur elle. C'est tout l'intérêt de lire la
+        /// convergence par `groom_result_convergence` et non par la chaîne.
+        #[tokio::test]
+        async fn mika3044_un_groom_sans_plan_converge_laisse_la_parente_fauchee() {
+            for (forme, result) in [
+                ("verdict non convergé", GROOM_CALLBACK_PLAN_ITERATE),
+                ("marqueur hors position", GROOM_CALLBACK_AUTO_SKIPPED),
+            ] {
+                let (db, parent_id) = parente_fauchee(GROOM_PARENT_ORPHANED_EVENT, Some(result));
+                let rejection = match dispatch(&db, &parent_id).await {
+                    Err(rejection) => rejection,
+                    Ok(status) => panic!("{forme} : le dispatch doit rester refusé ({status})"),
+                };
+                est_le_refus_dhier(&rejection, "failed");
+                assert_eq!(statut(&db, &parent_id).await, "failed", "{forme}");
+                assert_eq!(
+                    refus(&db).await,
+                    vec![(None, Some("no_groomed_child_since_reap".to_string()))],
+                    "{forme} : (c) tombe, et sa raison la nomme"
+                );
+            }
+
+            // Et le cas sans aucun enfant de groom, qui tombe du même côté.
+            let (db, parent_id) = parente_fauchee(GROOM_PARENT_ORPHANED_EVENT, None);
+            dispatch(&db, &parent_id)
+                .await
+                .expect_err("aucun groom livré après le reap");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("no_groomed_child_since_reap".to_string()))]
+            );
+        }
+
+        /// **T5 — la piste d'audit illisible.** Fail-closed : un signal qu'on ne
+        /// peut pas lire n'est jamais un terme satisfait (mika#2277/#2279).
+        ///
+        /// Les deux moitiés ne sont pas redondantes, et la seconde ne peut pas
+        /// passer par la porte. La porte relit la parente (`get_task`) **avant**
+        /// la garde d'état : une base entièrement coupée refuserait sous
+        /// `dispatch_check_failed`, bien avant le prédicat, et le test serait vert
+        /// pour la mauvaise raison. La fixture rend donc `audit_events` seule
+        /// illisible — le dispatch refuse mot pour mot, mais sa ligne de refus ne
+        /// peut pas s'écrire non plus (elle va dans la table absente), donc c'est
+        /// le prédicat lui-même qui est interrogé pour la raison nommée.
+        #[tokio::test]
+        async fn mika3044_une_piste_daudit_illisible_ne_rehabilite_rien() {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let child_id = sync
+                .create_task(&groom_callback("mika", &parent_id, "groom"))
+                .unwrap();
+            assert!(
+                sync.update_task_completed(&child_id, "mika", Some(GROOM_CALLBACK_PLAN_GROOMED))
+                    .unwrap()
+            );
+            set_completed_at(&sync, &child_id, APRES_LE_REAP);
+            assert!(
+                sync.update_task_failed(&parent_id, "mika", "reaped")
+                    .unwrap()
+            );
+            transition(&sync, &parent_id, GROOM_PARENT_ORPHANED_EVENT, "failed");
+            // Tout est en place pour une réhabilitation — puis la piste disparaît.
+            rendre_les_audits_illisibles(&sync);
+            let db = AsyncDatabase::new_with_agent(sync, "mika");
+
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("sur une piste illisible, le refus d'hier reste");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+
+            let task = db.get_task(&parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                crate::parent_rehabilitation::decide(&db, &task).await,
+                RehabDecision::Refused(RehabRefusal::AuditTrailUnreadable),
+                "la lecture (b) a échoué : le prédicat rend l'illisible, jamais \
+                 `Eligible` — et jamais le refus d'une condition qu'il n'a pas pu \
+                 évaluer"
             );
         }
     }

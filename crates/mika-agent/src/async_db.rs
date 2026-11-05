@@ -647,6 +647,38 @@ impl AsyncDatabase {
         Ok(transitioned)
     }
 
+    /// Réhabilite une parente `self_dev` de `failed` → `in_progress`
+    /// (mika#3044).
+    ///
+    /// # Aucune `TaskEventFrame` n'est émise, et c'est un choix
+    ///
+    /// Le contrat mika#1758 n'a **pas** de variante pour `failed → in_progress` :
+    /// ses six formes sont `TaskCreated`, `TaskClaimed`, `TaskCancelled`,
+    /// `completed`, `failed` et `TaskDelivered`. `TaskClaimed` appartient à
+    /// `claim_and_fire_task` et dirait une claim qui n'a pas lieu ici. Inventer une
+    /// forme pour un cas unique mettrait sur le fil un évènement qu'aucun
+    /// consommateur ne sait lire ; la réhabilitation se lit dans `audit_events`,
+    /// où [`crate::parent_rehabilitation`] écrit sa ligne.
+    pub async fn promote_task_in_progress(&self, id: &str) -> Result<bool> {
+        let (i, a) = (id.to_owned(), self.agent_id.clone());
+        self.with_db(move |db| db.promote_task_in_progress(&i, &a))
+            .await
+    }
+
+    /// `(id, result)` des enfants de groom de cette parente livrés après
+    /// `since`, `result` brut (mika#3044, condition (c)).
+    pub async fn groom_children_delivered_since(
+        &self,
+        parent_task_id: &str,
+        since: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        let s = since.to_owned();
+        self.with_db(move |db| db.groom_children_delivered_since(&a, &p, &s))
+            .await
+    }
+
     pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
         let (i, nf) = (id.to_owned(), next_fire_at.to_owned());
         self.with_db(move |db| db.update_task_next_fire_at(&i, &nf))
@@ -846,6 +878,20 @@ impl AsyncDatabase {
         let tk = target_key.to_owned();
         let sn = since.to_owned();
         self.with_db(move |db| db.latest_audit_event_for_target(&a, &tn, &tk, &sn))
+            .await
+    }
+
+    /// La dernière transition d'état inscrite sur `target_key`, quel que soit
+    /// l'outil : `(tool_name, before_value, after_value, created_at)`
+    /// (mika#3044). Une transition est une ligne qui porte un état avant **et**
+    /// après — une ligne de jugement n'en porte qu'un.
+    pub async fn latest_state_transition_for_target(
+        &self,
+        target_key: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestStateTransitionProjection>> {
+        let a = self.agent_id.clone();
+        let tk = target_key.to_owned();
+        self.with_db(move |db| db.latest_state_transition_for_target(&a, &tk))
             .await
     }
 

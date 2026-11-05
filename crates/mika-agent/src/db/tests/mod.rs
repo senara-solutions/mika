@@ -1012,7 +1012,11 @@ pub(crate) const GROOM_ISSUE_URL: &str = "https://github.com/senara-solutions/mi
 pub(crate) const GROOM_CALLBACK_PLAN_GROOMED: &str =
     "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-2287";
 
-const GROOM_CALLBACK_PLAN_ITERATE: &str =
+/// Le contrôle négatif de la convergence : même forme, verdict non convergé.
+///
+/// `pub(crate)` depuis mika#3044, où la réhabilitation d'une parente fauchée a
+/// besoin du groom qui n'a PAS convergé pour attester que (c) refuse.
+pub(crate) const GROOM_CALLBACK_PLAN_ITERATE: &str =
     "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-2287";
 
 /// Le plan du **vol 1** — celui que les preuves liées de ce module nomment.
@@ -1292,6 +1296,24 @@ pub(crate) fn set_completed_at(db: &Database, task_id: &str, completed_at: &str)
         )
         .unwrap();
     assert_eq!(n, 1, "la row de test doit exister");
+}
+
+/// Rend la table `audit_events` **illisible** sans la détruire : elle est
+/// renommée, donc toute lecture rend `no such table` et toute écriture échoue,
+/// pendant que `tasks` reste intacte (mika#3044).
+///
+/// C'est la seule façon d'atteindre la branche fail-closed d'un prédicat qui lit
+/// la piste d'audit : couper la base entière ne la teste pas — un `get_task` qui
+/// échoue refuse le dispatch bien avant, sous un autre nom, et le test serait
+/// vert pour la mauvaise raison. Un renommage plutôt qu'une destruction parce
+/// qu'il est réversible et qu'il ne laisse aucun doute sur l'intention.
+///
+/// `pub(crate)` pour la même raison que ses deux voisines : `Database::conn` est
+/// privé à `crate::db`, et c'est `skills::executor` qui monte la fixture.
+pub(crate) fn rendre_les_audits_illisibles(db: &Database) {
+    db.conn
+        .execute_batch("ALTER TABLE audit_events RENAME TO audit_events_deplacee")
+        .unwrap();
 }
 
 /// L'état de l'enfant d'**implémentation** sous une parente de groom relancée

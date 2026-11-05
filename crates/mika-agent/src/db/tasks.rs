@@ -852,6 +852,39 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Réhabilite une parente `self_dev` de `failed` → `in_progress`
+    /// (mika#3044). Rend `true` si la transition a eu lieu.
+    ///
+    /// Sœur de [`Self::promote_task_completed`] : même patron de *compare-and-swap*,
+    /// l'état attendu dans le `WHERE`, et `rows > 0` rendu au lecteur plutôt
+    /// qu'un succès supposé.
+    ///
+    /// # Le `WHERE` n'est pas une redite du prédicat
+    ///
+    /// [`crate::parent_rehabilitation::decide`] a déjà vérifié ces trois colonnes
+    /// — mais entre cette lecture et cette écriture, `validate_dispatch_readiness`
+    /// a fait plusieurs allers-retours GitHub de 10 s. La garde est ce qui rend la
+    /// course perdable : `Ok(false)` veut dire *quelqu'un d'autre a bougé la
+    /// parente*, et l'appelant refuse le dispatch au lieu de l'écrire.
+    ///
+    /// # Ce qui n'est délibérément pas touché
+    ///
+    /// - `completed_at` parle d'une fin ; cette transition en est l'inverse.
+    /// - `fired_at` (mika#2335) a été estampillé au dispatch d'origine, et c'est
+    ///   bien de celui-là que la parente est issue.
+    pub fn promote_task_in_progress(&self, id: &str, agent_id: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'in_progress',
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1 AND agent_id = ?2
+               AND status = 'failed'
+               AND trigger_type = 'manual'
+               AND source = 'self_dev'",
+            params![id, agent_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET next_fire_at = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
@@ -4742,6 +4775,70 @@ impl Database {
                 params![agent_id, exact_url, legacy_groom_url, limit],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `(id, result)` des enfants de groom **de cette parente** livrés
+    /// strictement après l'instant `since`, du plus récent au plus ancien
+    /// (mika#3044, condition (c)). Le `result` revient **brut**.
+    ///
+    /// L'`id` est projeté parce que la ligne d'audit de la réhabilitation le
+    /// nomme (`groom_child: …`) : sans lui, un opérateur lirait *« un groom a
+    /// convergé »* sans pouvoir remonter auquel.
+    ///
+    /// # Pourquoi une lecture neuve plutôt qu'une des quatre voisines
+    ///
+    /// Les trois lecteurs de preuve de groom
+    /// ([`Self::has_completed_groom_for_issue`],
+    /// [`Self::groom_callback_results_newest_first`],
+    /// [`Self::recent_groom_results_for_issue`]) sont tous clés sur
+    /// `parent.reference_url` et ne portent **aucune borne d'instant**. Réutiliser
+    /// l'un d'eux élargirait (c) en silence : un groom convergé d'un *autre* vol
+    /// sur le même ticket, ou convergé *avant* le reap, suffirait à réhabiliter.
+    /// La clé est donc `parent_task_id` et la borne est explicite.
+    ///
+    /// # Quatre décisions, chacune empruntée à une voisine
+    ///
+    /// - **Le marqueur n'est JAMAIS filtré en SQL.** Le `result` revient brut et
+    ///   le verdict se prend dans [`crate::task_state::tasks::groom_result_convergence`],
+    ///   seul lecteur de `PLAN_GROOMED`. Un `LIKE '%PLAN_GROOMED%'` accepterait un
+    ///   marqueur cité en prose et masquerait un `MarkerOutOfPosition` — doctrine
+    ///   mika#2590, écrite sur [`Self::has_completed_groom_for_issue`] : *une ligne
+    ///   écartée par SQL est invisible au verdict*.
+    /// - **`status IN ('completed','delivered')` et `label NOT LIKE '%:deferred%'`**
+    ///   sont ceux de [`Self::recent_groom_results_for_issue`] : un lanceur différé
+    ///   est un callback de groom qui ne porte aucun verdict.
+    /// - **`COALESCE(completed_at, updated_at)`** est l'instant terminal que les
+    ///   deux voisines utilisent ; la comparaison lexicographique est correcte
+    ///   parce que [`crate::timestamp`] écrit de l'UTC à largeur fixe.
+    /// - **`>` strict.** Un groom livré dans la même seconde que le reap ne le
+    ///   dément pas — même stricture, et même raison, que `bound_unbound_grace`.
+    ///
+    /// La clé de jointure est couverte par `idx_tasks_parent(parent_task_id,
+    /// agent_id)`.
+    pub fn groom_children_delivered_since(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+        since: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT child.id, child.result FROM tasks child
+             WHERE child.agent_id = ?1
+               AND child.parent_task_id = ?2
+               AND child.trigger_type = 'callback'
+               AND child.dispatch_class = 'groom'
+               AND child.status IN ('completed', 'delivered')
+               AND COALESCE(child.completed_at, child.updated_at) > ?3
+               AND child.label NOT LIKE '%:deferred%'
+             ORDER BY child.created_at DESC, child.id DESC
+             LIMIT 10",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, parent_task_id, since], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
