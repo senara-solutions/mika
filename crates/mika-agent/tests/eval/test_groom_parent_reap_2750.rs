@@ -86,6 +86,27 @@ fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
     })
 }
 
+/// Le même dispatcher, en mode **démon**.
+///
+/// mika#3042 : depuis que les six balayages terminaux de parentes `self_dev`
+/// sont réservés au démon, un test qui attend un fauchage **par `tick()`** doit
+/// porter un moteur de démon — sinon il atteste la garde, pas la faucheuse. Les
+/// deux tests de ce fichier qui assertent un état terminal le prennent ; les
+/// deux contrôles négatifs gardent `test_dispatcher`, parce qu'un moteur CLI
+/// refuserait leur population pour la mauvaise raison.
+///
+/// Rien d'autre ne change : les trois balayages que `!cli_mode` ouvre en plus
+/// (`promote_pending_deferred_if_idle`, `dispatch_undelivered_callbacks`,
+/// `alert_undelivered_build_verdicts`) ne voient aucune ligne de ces fixtures —
+/// leurs enfants sont `delivered`, donc déjà hors de la population du dispatch.
+fn daemon_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
+    let cli = test_dispatcher(db);
+    Arc::new(TaskDispatcher {
+        cli_mode: false,
+        ..Arc::try_unwrap(cli).ok().expect("un seul détenteur")
+    })
+}
+
 /// La scène du ticket, semée en une fois : le parent de suivi ready-label
 /// (`manual` / `none` / `self_dev`, `in_progress`, metadata sans `pr_url`) et
 /// son enfant callback de la classe demandée, `delivered` au-delà de la grâce.
@@ -195,7 +216,8 @@ async fn run_one_scan(engine: &mut TaskEngine) {
 async fn un_groom_dont_le_callback_a_delivre_quitte_in_progress() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let db = test_db().await;
-        let dispatcher = test_dispatcher(db.clone());
+        // mika#3042 : moteur de démon — c'est lui qui fauche.
+        let dispatcher = daemon_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         let parent = seed_groom_scene(&db, "groom", false).await;
@@ -277,7 +299,8 @@ async fn un_groom_dont_le_pilote_vit_encore_ne_bouge_pas() {
 async fn la_classe_implement_garde_son_motif_mot_pour_mot() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let db = test_db().await;
-        let dispatcher = test_dispatcher(db.clone());
+        // mika#3042 : moteur de démon — c'est lui qui fauche.
+        let dispatcher = daemon_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         let parent = seed_groom_scene(&db, "implement", false).await;

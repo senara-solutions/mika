@@ -941,6 +941,19 @@ pub async fn reflection_cron_for_agent(home_dir: &Path, db: &AsyncDatabase) -> O
     Some(format!("0 {} {} * * *", utc_time.minute(), utc_time.hour()))
 }
 
+// mika#3042 AC3 — le scan structurel du corps de `tick()`, en fichier séparé.
+//
+// **Déclaré ICI, au bas du fichier, et ce n'est pas un rangement.**
+// `canonical_tokens::tests::production_sources` tronque chaque source au
+// **premier `#[cfg(test)]`** rencontré, quelle que soit sa forme — déclaration
+// externe comprise. Cette déclaration placée en tête, à côté des `pub mod`,
+// coupait le fichier avant `ensure_recurring_task` et rendait le scan mika#2601
+// aveugle sur sa propre cible : vu rouge, exactement la classe que la note de
+// [`RecurringRetryPolicy`] plus haut avait prédite. Collée au `mod tests`
+// ci-dessous, elle laisse la troncature là où elle était déjà.
+#[cfg(test)]
+mod tick_cli_guard_scan;
+
 #[cfg(test)]
 mod tests {
     use super::*;
