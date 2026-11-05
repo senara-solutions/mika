@@ -5977,9 +5977,15 @@ pub(crate) fn extract_callback_fields(result: &str) -> serde_json::Value {
 ///
 /// Mirror of `RE_PR_URL` above: `(?m)^NO_PR:` is line-anchored so a free-text
 /// mention never matches, and the reason is constrained to the lowercase-token
-/// charset the three `dispatch-lib.sh` emission sites produce (`no_pr_on_branch`,
+/// charset the `dispatch-lib.sh` emission sites produce (`no_pr_on_branch`,
 /// `gh_query_failed`, `branch_unset`, `repo_unset`, `rescue_pr_create_failed` —
-/// KTD2). Returns `None` when no `NO_PR:` line is present, which is the AC-G2
+/// KTD2 — plus the two refusals the rescue can pronounce: `rescue_scratch_only`,
+/// mika#2503, and `rescue_adds_nothing_to_main`, mika#3038). This list is the
+/// only enumeration an operator reads to know what the loop can answer, so a
+/// reason the parser accepts but nothing here names is a reason nobody can look
+/// up: `rescue_scratch_only` was such a reason until mika#3038 added its
+/// neighbour and found it missing.
+/// Returns `None` when no `NO_PR:` line is present, which is the AC-G2
 /// contract: a callback carrying neither `PR:` nor `NO_PR:` (a producer that
 /// predates U1) leaves the generic `callback_delivered_without_pr_url` motif
 /// intact. The reaper (`engine::reap_orphaned_parent_tasks`) calls this to
@@ -7379,13 +7385,20 @@ mod tests {
 
     #[test]
     fn test_parse_no_pr_reason_known_reasons() {
-        // All five reasons U1 emits across the three dispatch-lib sites.
+        // Every reason dispatch-lib can emit: the five of U1 across its three
+        // sites, then the two refusals the end-of-flight rescue pronounces —
+        // `rescue_scratch_only` (mika#2503) and `rescue_adds_nothing_to_main`
+        // (mika#3038). The two refusals matter more to this table than the five,
+        // not less: U1's reasons report a failure to look, theirs report a
+        // deliberate decision not to open, and the reaper routes on the token.
         for reason in [
             "no_pr_on_branch",
             "gh_query_failed",
             "branch_unset",
             "repo_unset",
             "rescue_pr_create_failed",
+            "rescue_scratch_only",
+            "rescue_adds_nothing_to_main",
         ] {
             let result = format!("Outcome: PIPELINE_INCOMPLETE\nNO_PR: {reason}");
             assert_eq!(parse_no_pr_reason(&result).as_deref(), Some(reason));

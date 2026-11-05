@@ -14242,6 +14242,50 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
         _recovery_pr_due=1
     fi
 
+    # mika#3038: refuse to open a PR whose head tree is ALREADY `origin/main`'s.
+    #
+    # Four drafts since 2026-09-04 — #2197, #2702, #2899, #3034 — opened on a
+    # head whose tree was byte-identical to main's, all four less than 20 minutes
+    # after a merge of a PR on their own branch, all four closed by hand. Six
+    # seconds after #3034 opened, `ready` was stripped off #2194 on its account:
+    # a phantom draft is not inert, it moves labels.
+    #
+    # IT COMES BEFORE THE mika#2503 REFUSAL, AND THE ORDER IS LOAD-BEARING. The
+    # two are mutually exclusive through the flag the first one to fire
+    # extinguishes, so whichever runs first is the one that gets to name the
+    # reason. This ticket's whole measured population is `wip()`-free work on
+    # `crates/` and `docs/` — tracked top-level directories — so mika#2503 would
+    # not have fired on it; but a rescue whose content IS scratch AND whose tree
+    # equals main's is reachable, and on it `rescue_scratch_only` would send the
+    # operator looking for a probe crate when the fact is simply that main
+    # already has everything. The more specific diagnosis goes first.
+    #
+    # NOTHING IS LOST, AND HERE THAT IS NOT A REASSURANCE BUT A TAUTOLOGY: an
+    # equal tree means no byte of this head is absent from main. The mika#2503
+    # refusal has to argue the point (the commit exists, the branch is pushed);
+    # this one does not need to.
+    #
+    # The undetermined issue falls back to the behaviour from before this ticket
+    # — the draft opens — and says so in one line. That direction is the inverse
+    # of `_rescue_diff_carries_work`'s for one reason: this refusal REMOVES a
+    # draft, so a failed measurement must never remove one.
+    local _tree_rc=0
+    _branch_tree_equals_main "$WORKTREE_DIR" || _tree_rc=$?
+    if [ "$_recovery_pr_due" = "1" ] && [ "$_tree_rc" -eq 0 ]; then
+        _recovery_pr_due=0
+        # Convenience only, not a probe: see the note on the mika#2503 refusal
+        # below — on a dispatch that succeeds this stderr is dropped unread
+        # (mika#2050 class). RESULT is the operator surface.
+        echo "rescue_empty_tree_refused: HEAD tree equals origin/main — draft PR withheld (branch=$BRANCH, mika#3038)" >&2
+        RESULT="${RESULT}
+Draft PR withheld (mika#3038): the tree at HEAD is byte-identical to origin/main, so this branch adds nothing to main — the work it carried is already merged (typically by a squash of its own PR, which leaves the branch commits unmerged while their content is in main).
+Nothing was lost — there is nothing to lose: no content here is absent from main.
+If you believe otherwise: git -C ${WORKTREE_DIR} diff origin/main HEAD --stat"
+        _set_pr_status_line "NO_PR: rescue_adds_nothing_to_main"
+    elif [ "$_tree_rc" -eq 2 ]; then
+        _note_tree_compare_undetermined
+    fi
+
     # mika#2503: refuse to open a PR whose whole content is pilot scratch — a
     # probe crate and its build artefacts, touching nothing the repo knows about.
     #
