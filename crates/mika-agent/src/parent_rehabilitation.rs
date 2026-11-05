@@ -390,3 +390,286 @@ async fn write_audit_line(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Sites de production exemptés de
+    /// [`mika3044_le_predicat_de_rehabilitation_na_quun_lecteur`].
+    ///
+    /// **Livrée vide, et quand le scan tire la résolution est de router le site
+    /// par le prédicat, jamais d'ajouter une entrée ici** (doctrine mika#2201 /
+    /// mika#2309). Même contrat que `CONTEXT_HISTORY_READERS_ALLOWED`
+    /// (mika#2425) et que `ZERO_BUDGET_READER_EXCEPTIONS` (mika#1833) : une
+    /// liste née vide est un emplacement pour le prochain écart, donc sa
+    /// vacuité est elle-même assertée — l'assertion ci-dessous exige de toute
+    /// entrée qu'elle nomme le ticket (`mika#NNNN`) qui la retirera, et il n'y
+    /// a ici aucune violation existante à exempter : le vol 1 a fait naître
+    /// [`super::decide`] avec un appelant.
+    const REHAB_PREDICATE_READERS_ALLOWED: &[&str] = &[];
+
+    /// `needle` apparaît-il dans `line` à frontière de mot — à droite toujours,
+    /// à gauche seulement si `left` ?
+    ///
+    /// La frontière de droite est la pièce load-bearing, et le cas qui le
+    /// prouve est dans ce fichier même : la sonde de [`super::decide`] s'appelle
+    /// `parent_rehabilitation_decided`, dont `decided` contient `decide`. Même
+    /// classe que la frontière de gauche de mika#1833, qui sortait `per_budget`
+    /// et `total_budget` de la population de `budget`.
+    fn occurs_at_boundary(line: &str, needle: &str, left: bool) -> bool {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        line.match_indices(needle).any(|(at, _)| {
+            let right_ok = !line[at + needle.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_word);
+            let left_ok = !left || !line[..at].chars().next_back().is_some_and(is_word);
+            left_ok && right_ok
+        })
+    }
+
+    /// La ligne lit-elle le prédicat ? **L'aiguille a deux formes**, et la
+    /// seconde est l'échappatoire de la première.
+    ///
+    /// - **A — l'appel qualifié** : la ligne contient
+    ///   `parent_rehabilitation::decide` sans caractère de mot derrière.
+    /// - **B — l'importation** : la ligne est un `use`, elle nomme le module et
+    ///   elle porte l'identifiant `decide` à frontières de mot des deux côtés.
+    ///
+    /// [`super::decide`] est `pub(crate)` : un scan qui ne chercherait que le
+    /// chemin qualifié laisserait passer `use crate::parent_rehabilitation::decide;`
+    /// suivi d'un appel nu `decide(db, &task)`. La forme B rougit **avant** que
+    /// l'appel nu existe, et on ne la contourne pas sans repasser par la forme
+    /// A. Un `use … as autre_nom` reste visible : la ligne comptée est
+    /// l'importation, pas l'alias.
+    fn line_reads_the_predicate(line: &str) -> bool {
+        const MODULE: &str = "parent_rehabilitation";
+        const QUALIFIED: &str = "parent_rehabilitation::decide";
+
+        occurs_at_boundary(line, QUALIFIED, false)
+            || (line.starts_with("use ")
+                && line.contains(MODULE)
+                && occurs_at_boundary(line, "decide", true))
+    }
+
+    /// Les lignes de production lisant le prédicat, en `(ligne 1-based, texte
+    /// élagué)`.
+    ///
+    /// Trois exclusions, dans cet ordre, les mêmes que mika#2425 pour les mêmes
+    /// raisons :
+    ///
+    /// 1. **Chemin de test** → aucune moitié de production
+    ///    ([`crate::source_scan::is_test_source_path`], mika#2321). Un module de
+    ///    test extrait ne porte aucun littéral `#[cfg(test)]`, donc une
+    ///    troncature le scannerait entier comme de la production. C'est aussi ce
+    ///    qui garderait ce scan correct si ces tests déménageaient un jour vers
+    ///    `parent_rehabilitation/tests.rs`.
+    /// 2. **Régions de test masquées**
+    ///    ([`mika_common::source_guard::mask_test_regions`], mika#2398), qui
+    ///    conserve les numéros de ligne — une troncature au premier marqueur
+    ///    couperait `executor.rs` à son premier doc-comment nommant le prédicat.
+    ///    C'est également ce qui empêche ce module-ci de se compter lui-même :
+    ///    les fixtures de
+    ///    [`mika3044_le_scan_de_lecteur_unique_rougit_sur_un_second_lecteur`]
+    ///    *contiennent* l'aiguille.
+    /// 3. **Une ligne de commentaire n'est pas un appel** (`//`, `///`, `*`).
+    ///    Ce n'est pas cosmétique : le site de lecture d'`executor.rs` porte sept
+    ///    lignes de commentaire nommant le prédicat, ce fichier-ci une
+    ///    trentaine, et `engine.rs` comme `db/tasks.rs` le citent en
+    ///    doc-comment. Un prédicat non ancré les accuse — la forme exacte du
+    ///    faux positif Signal S de mika#2050, où un grep a apparié la prose
+    ///    écrite *à propos* du signal. Un commentaire de fin de ligne n'exempte
+    ///    pas le code qui le précède : la ligne ne *commence* alors plus par le
+    ///    marqueur.
+    fn rehab_predicate_reader_sites(path: &std::path::Path, src: &str) -> Vec<(usize, String)> {
+        if crate::source_scan::is_test_source_path(path) {
+            return Vec::new();
+        }
+        mika_common::source_guard::mask_test_regions(src)
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line.trim().to_string()))
+            .filter(|(_, line)| {
+                !line.starts_with("//") && !line.starts_with('*') && line_reads_the_predicate(line)
+            })
+            .collect()
+    }
+
+    /// **T8 — le prédicat de réhabilitation n'a qu'un lecteur, et le scan le
+    /// tient.** C'est la moitié d'AC3 qu'aucune assertion comportementale ne
+    /// peut voir.
+    ///
+    /// Un second site appelant [`super::decide`] appliquerait la décision **sans
+    /// son audit** : les trois lignes
+    /// (`parent_rehabilitation_decided`, `…_rehabilitated`,
+    /// `…_rehabilitation_refused`) ne sont écrites qu'au site qui les écrit, donc
+    /// un second lecteur réhabiliterait — ou refuserait — en silence, et la sonde
+    /// AC4 compterait un dénominateur qu'elle ne pourrait joindre à aucun refus
+    /// nommé. La copie ne rend aucune décision fausse le jour où elle est
+    /// écrite : c'est la classe `grooming_marker` (mika#2158), déjà payée deux
+    /// fois dans ce crate.
+    ///
+    /// Quatre assertions, et ce que chacune seule laisserait passer :
+    ///
+    /// | assertion | sans elle |
+    /// |---|---|
+    /// | chaque entrée de l'allowlist nomme un `mika#` | une exemption que personne ne possède — *how a guard stops guarding* |
+    /// | **exactement un** site, jamais « au plus un » | **zéro** lecteur : un prédicat orphelin par renommage ou par câblage retiré, c'est-à-dire un correctif désarmé, que `<= 1` lit comme un arbre propre |
+    /// | ce site est sous `skills/executor.rs` | un lecteur unique déplacé hors de la garde d'état, où il observerait le refus au lieu de l'empêcher (doctrine mika#1646) |
+    /// | le scanner a vu des fichiers | un chemin cassé — indiscernable d'un arbre propre, et c'est la vacuité que T9 ferme sur l'autre axe |
+    #[test]
+    fn mika3044_le_predicat_de_rehabilitation_na_quun_lecteur() {
+        assert!(
+            REHAB_PREDICATE_READERS_ALLOWED
+                .iter()
+                .all(|entry| entry.contains("mika#")),
+            "mika#3044 — toute entrée de REHAB_PREDICATE_READERS_ALLOWED doit nommer le \
+             ticket de suivi qui la retirera. Une exemption que personne ne possède est la \
+             façon dont une garde cesse de garder. Liste actuelle : \
+             {REHAB_PREDICATE_READERS_ALLOWED:?}"
+        );
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut sites: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+
+        scanner.for_each(|path, production| {
+            scanned += 1;
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if REHAB_PREDICATE_READERS_ALLOWED
+                .iter()
+                .any(|allowed| rel.contains(allowed))
+            {
+                return;
+            }
+            for (line, text) in rehab_predicate_reader_sites(path, production) {
+                sites.push(format!("{rel}:{line}: {text}"));
+            }
+        });
+
+        assert!(
+            scanned > 0,
+            "mika#3044 — le scan n'a vu aucun fichier : un chemin cassé est indiscernable \
+             d'un arbre propre, et c'est la vacuité qui ferait passer cette garde pour verte \
+             sans qu'elle regarde quoi que ce soit"
+        );
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "mika#3044 (AC3) — on attend EXACTEMENT UN lecteur de production du prédicat de \
+             réhabilitation : la garde d'état de `validate_dispatch_readiness`. Trouvé {} :\n{}\
+             \n\nSi vous en avez ajouté un second, routez-le par le site existant au lieu de \
+             l'exempter — un second lecteur applique la décision sans les trois lignes d'audit \
+             qu'AC3 exige, et rien de visible ne casse. Si le compte est ZÉRO, le correctif est \
+             désarmé : le prédicat a été renommé ou son câblage retiré.",
+            sites.len(),
+            sites.join("\n")
+        );
+        assert!(
+            sites[0].starts_with("skills/executor.rs:")
+                || sites[0].starts_with("skills\\executor.rs:"),
+            "mika#3044 — l'unique lecteur doit être la garde d'état de \
+             `validate_dispatch_readiness`, le seul endroit où la décision peut **empêcher** le \
+             refus plutôt que l'observer après coup (doctrine mika#1646) :\n{}",
+            sites[0]
+        );
+    }
+
+    /// **T9 — le contrôle de bonne foi de T8.**
+    ///
+    /// T8 pourrait être vert parce qu'il ne regarde rien — exactement le mode de
+    /// défaillance que T8 existe pour rendre visible, sur l'autre axe. Le
+    /// prédicat de ligne est donc appelé directement sur six fixtures. Les cas 1
+    /// et 2 sont les contrôles **positifs** : sans eux, les quatre autres
+    /// diraient seulement que le prédicat ne trouve rien.
+    #[test]
+    fn mika3044_le_scan_de_lecteur_unique_rougit_sur_un_second_lecteur() {
+        let prod = std::path::Path::new("src/ailleurs.rs");
+
+        // 1. Forme A — l'appel qualifié ajouté ailleurs.
+        let forme_a = "async fn ailleurs(db: &AsyncDatabase, task: &Task) {\n    \
+             let _ = crate::parent_rehabilitation::decide(db, task).await;\n}\n";
+        assert_eq!(
+            rehab_predicate_reader_sites(prod, forme_a).len(),
+            1,
+            "le scan doit voir un lecteur ajouté hors du site de décision"
+        );
+
+        // 2. Forme B — l'importation, l'échappatoire de la forme A : le chemin
+        // qualifié disparaît de l'appel, donc un scan qui ne cherche que lui ne
+        // voit plus rien. La ligne comptée est le `use`, pas l'appel nu.
+        let forme_b = "use crate::parent_rehabilitation::decide;\n\n\
+             async fn ailleurs() {\n    let _ = decide(db, task).await;\n}\n";
+        assert_eq!(
+            rehab_predicate_reader_sites(prod, forme_b).len(),
+            1,
+            "une importation rougit AVANT que l'appel nu existe"
+        );
+
+        // 3. La frontière de mot à droite, et le cas qui serait réellement
+        // tombé : la sonde de `decide` s'appelle `parent_rehabilitation_decided`.
+        let sonde = "        event = \"parent_rehabilitation_decided\",\n";
+        assert!(
+            rehab_predicate_reader_sites(prod, sonde).is_empty(),
+            "la sonde du prédicat n'est pas un appel au prédicat — une aiguille non ancrée \
+             à droite compte la ligne `info!` de ce fichier même"
+        );
+        // Et la forme où cette frontière décide vraiment : une importation d'un
+        // nom qui *commence* par `decide`.
+        let voisin = "use crate::parent_rehabilitation::decided_event;\n";
+        assert!(
+            rehab_predicate_reader_sites(prod, voisin).is_empty(),
+            "`decided_event` n'est pas `decide` : la frontière de droite vaut aussi pour la \
+             forme B"
+        );
+
+        // 4. Un type n'est pas le prédicat.
+        let types = "use crate::parent_rehabilitation::{RehabDecision, RehabPending};\n";
+        assert!(
+            rehab_predicate_reader_sites(prod, types).is_empty(),
+            "importer les types de la décision n'est pas lire la décision"
+        );
+
+        // 5. La prose — un commentaire ne peut pas appeler. La forme exacte du
+        // faux positif Signal S de mika#2050.
+        let prose = "\
+// `validate_dispatch_readiness` appelle `parent_rehabilitation::decide` une seule fois.
+/// Un second appel à `crate::parent_rehabilitation::decide` appliquerait la décision sans audit.
+ * `parent_rehabilitation::decide` est LE prédicat.
+";
+        assert!(
+            rehab_predicate_reader_sites(prod, prose).is_empty(),
+            "la prose nommant le prédicat n'est pas un appel — un prédicat non ancré accuse \
+             les commentaires mêmes qui expliquent pourquoi il n'a qu'un lecteur"
+        );
+        // …mais un commentaire de fin de ligne n'exempte pas le code qui le précède.
+        let trailing = "    match crate::parent_rehabilitation::decide(db, &task).await { \
+             // le seul site\n";
+        assert_eq!(
+            rehab_predicate_reader_sites(prod, trailing).len(),
+            1,
+            "seule une ligne qui COMMENCE par un marqueur de commentaire est de la prose"
+        );
+
+        // 6. Les deux exclusions, séparément.
+        let en_region_de_test = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    \
+             let _ = crate::parent_rehabilitation::decide(&db, &task).await;\n}\n";
+        assert!(
+            rehab_predicate_reader_sites(prod, en_region_de_test).is_empty(),
+            "mika#2398 — une région de test est masquée avant le scan, et c'est ce qui \
+             empêche ce test-ci de se compter lui-même"
+        );
+        let chemin_de_test = std::path::Path::new("src/skills/tests/executor.rs");
+        assert!(
+            rehab_predicate_reader_sites(chemin_de_test, forme_a).is_empty(),
+            "mika#2321 — un fichier sous `tests/` est du test quel que soit son contenu, et \
+             un module de test extrait ne porte aucun littéral `#[cfg(test)]`"
+        );
+    }
+}
