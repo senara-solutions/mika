@@ -1446,19 +1446,36 @@ impl TaskEngine {
                 // lignes qu'un autre chemin sert.
                 self.alert_undelivered_build_verdicts().await;
             }
-            // Reap parent self_dev tasks left in_progress after their callback
-            // subtask delivered without producing a PR (#871).
-            self.reap_orphaned_parent_tasks("implement").await;
-            // mika#2750 : même balayage pour la classe `groom`. Les deux
-            // populations sont disjointes par construction (le prédicat porte sur
-            // `child.dispatch_class`), donc deux appels par passe.
-            self.reap_orphaned_parent_tasks("groom").await;
+            // mika#3042 — bloc 1/2 : tout balayage qui écrit un état terminal
+            // sur une parente `self_dev` est réservé au démon. `mika chat`
+            // (`cli_mode: true`) tourne contre la base QU'IL PARTAGE avec un
+            // démon possiblement vivant, et avec le code de SON binaire — un TUI
+            // ouvert avant un deploy fauche avec l'ancien reaper (mesuré : 4
+            // parentes `ready-label` fauchées par un TUI après mika#2986, dont
+            // une perdue en `task_not_dispatchable`). Même raisonnement que le
+            // gating de l'étape 2a (mika#2379, l. 1033) et de la restauration
+            // des récurrentes (mika#2575, l. 1202).
+            //
+            // Rien n'est perdu : ces six balayages n'existent QUE dans ce
+            // `tick()`, donc le démon les exécute au premier tick multiple de
+            // `DB_SCAN_INTERVAL_TICKS` après son démarrage. Et un re-dispatch
+            // écrit en mode CLI ne serait de toute façon pas servi —
+            // `dispatch_undelivered_callbacks` est déjà sous cette garde (#264).
+            if !self.dispatcher.cli_mode {
+                // Reap parent self_dev tasks left in_progress after their callback
+                // subtask delivered without producing a PR (#871).
+                self.reap_orphaned_parent_tasks("implement").await;
+                // mika#2750 : même balayage pour la classe `groom`. Les deux
+                // populations sont disjointes par construction (le prédicat porte sur
+                // `child.dispatch_class`), donc deux appels par passe.
+                self.reap_orphaned_parent_tasks("groom").await;
 
-            // Auto-complete parent self_dev tasks left in_progress after their
-            // callback subtask delivered WITH a PR url (mika#1162). Success-side
-            // sibling to the reaper: catches crash-recovery cases and pre-deploy
-            // wedges that the inline path in `dispatch_resume_agent` can't reach.
-            self.complete_parent_tasks_on_callback_success().await;
+                // Auto-complete parent self_dev tasks left in_progress after their
+                // callback subtask delivered WITH a PR url (mika#1162). Success-side
+                // sibling to the reaper: catches crash-recovery cases and pre-deploy
+                // wedges that the inline path in `dispatch_resume_agent` can't reach.
+                self.complete_parent_tasks_on_callback_success().await;
+            }
 
             // Close `manual` tracking rows whose every callback child is
             // terminal (mika#2405). Placed AFTER the two self_dev reapers so
@@ -1467,34 +1484,48 @@ impl TaskEngine {
             // `COALESCE(parent.source,'') != 'self_dev'` term is what keeps the
             // richer self_dev verdicts (failed-without-PR / completed-with-PR)
             // out of this single-verdict closer.
+            //
+            // mika#3042 : HORS de la garde `cli_mode`, et ce n'est pas un
+            // oubli — ce même terme `COALESCE(parent.source, '') != 'self_dev'`
+            // (db/tasks.rs:2720) l'empêche structurellement d'écrire sur la
+            // population que mika#3042 protège. Épinglé par
+            // `ac3_settle_dispatch_parents_reste_hors_predicat`.
             self.settle_dispatch_parents().await;
 
-            // Reap parent self_dev issue tasks left in_progress with ZERO
-            // callback children, aged past the childless grace window (mika#1687).
-            // The silent-pilot-death backstop: a parent that reached in_progress
-            // without ever recording a callback child falls through both reapers
-            // above (they INNER-JOIN a delivered child) and the watchdog (it keys
-            // off a callback child's PID). Runs AFTER the completer so any
-            // delivered-child success/failure case resolves first and only
-            // genuinely childless parents reach here.
-            self.reap_childless_stuck_parent_tasks().await;
+            // mika#3042 — bloc 2/2. Même garde, même raison : les trois
+            // balayages ci-dessous portent tous `parent.source = 'self_dev'`
+            // (db/tasks.rs:2778, :2955, :3128) et écrivent un état terminal par
+            // `update_task_failed`. Les deux derniers re-dispatchent en plus, ce
+            // qu'un moteur CLI ne peut pas servir.
+            if !self.dispatcher.cli_mode {
+                // Reap parent self_dev issue tasks left in_progress with ZERO
+                // callback children, aged past the childless grace window (mika#1687).
+                // The silent-pilot-death backstop: a parent that reached in_progress
+                // without ever recording a callback child falls through both reapers
+                // above (they INNER-JOIN a delivered child) and the watchdog (it keys
+                // off a callback child's PID). Runs AFTER the completer so any
+                // delivered-child success/failure case resolves first and only
+                // genuinely childless parents reach here.
+                self.reap_childless_stuck_parent_tasks().await;
 
-            // Reap `pending` self_dev issue parents that no callback child
-            // represents any more (mika#2045). Runs AFTER the three
-            // `in_progress` reapers above so any task that can still resolve
-            // through them does; this one owns the population none of them see.
-            self.reap_orphaned_pending_issue_tasks().await;
+                // Reap `pending` self_dev issue parents that no callback child
+                // represents any more (mika#2045). Runs AFTER the three
+                // `in_progress` reapers above so any task that can still resolve
+                // through them does; this one owns the population none of them see.
+                self.reap_orphaned_pending_issue_tasks().await;
 
-            // The net for `blocked` parents refused on a busy dispatch slot
-            // (mika#2169, L3b). Placed right after the `pending` reaper: the
-            // two select disjoint populations (`status`, plus the
-            // `global_dispatch_active` discriminant that keeps deliberate
-            // operator gates out of this one), so the order costs nothing and
-            // keeps the whole repair ladder readable in one place.
-            self.reap_stale_blocked_dispatch_tasks().await;
+                // The net for `blocked` parents refused on a busy dispatch slot
+                // (mika#2169, L3b). Placed right after the `pending` reaper: the
+                // two select disjoint populations (`status`, plus the
+                // `global_dispatch_active` discriminant that keeps deliberate
+                // operator gates out of this one), so the order costs nothing and
+                // keeps the whole repair ladder readable in one place.
+                self.reap_stale_blocked_dispatch_tasks().await;
+            }
 
             // Measure promotion starvation — warning only, no mutation
-            // (mika#2169, L2b).
+            // (mika#2169, L2b). mika#3042 : hors garde, parce qu'il n'écrit
+            // aucun état — il mesure et il avertit.
             self.report_promotion_starvation().await;
 
             // Reap orphaned team runs left in `status='running'` when no
@@ -7525,6 +7556,163 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // -- mika#3042 : le moteur CLI ne fauche pas les parentes du démon --
+
+    /// Helper mika#3042 : une parente `self_dev` fauchable par le reaper de la
+    /// classe `groom`. Dérivé de [`seed_completable_parent`], à trois
+    /// différences près, et chacune est un prédicat de
+    /// `find_orphaned_parent_tasks` :
+    ///
+    /// - **aucun `metadata`** — donc aucun `$.claude_pilot.pr_url` : c'est ce
+    ///   qui range la parente du côté du reaper plutôt que du côté du
+    ///   complèteur ;
+    /// - l'enfant porte `dispatch_class: Some("groom")` — le prédicat de classe
+    ///   porte sur l'enfant, pas sur la parente ;
+    /// - **aucun frère vivant** : la fixture n'en crée pas, donc le `NOT EXISTS`
+    ///   de mika#2980 ne protège rien ici.
+    ///
+    /// L'enfant est `delivered` puis reculé de 700 s, au-delà des 600 s de
+    /// [`REAPER_GRACE_SECONDS`].
+    async fn seed_orphaned_groom_parent(db: &AsyncDatabase) -> String {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Groom mika#3042".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot_groom".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        };
+        let child_id = db.create_task(child).await.unwrap();
+        db.update_task_completed(&child_id, Some("done"))
+            .await
+            .unwrap();
+        db.mark_task_delivered(&child_id).await.unwrap();
+        backdate_task(db, &child_id).await;
+        parent_id
+    }
+
+    /// Helper mika#3042 : fait exécuter à `engine` le bloc de scan DB de
+    /// `tick()` — exactement une fois.
+    ///
+    /// Ce bloc est gardé par `tick_count.is_multiple_of(DB_SCAN_INTERVAL_TICKS)`,
+    /// et `tick()` incrémente avant de tester. Positionner le compteur à
+    /// `DB_SCAN_INTERVAL_TICKS - 1` suffit donc ; une boucle de 60 tours
+    /// mesurerait la cadence, qui n'est pas l'objet du test.
+    async fn tick_once_through_db_scan(engine: &mut TaskEngine) {
+        engine.tick_count = DB_SCAN_INTERVAL_TICKS - 1;
+        engine.tick().await;
+    }
+
+    /// mika#3042 AC1 — un balayage terminal de parente `self_dev` est réservé
+    /// au démon, et le même appel porte son contrôle négatif.
+    ///
+    /// `mika chat` construit son propre `TaskEngine` (`cli_mode: true`) contre
+    /// la base qu'il PARTAGE avec le démon, et le fait tourner avec le code de
+    /// SON binaire : un TUI ouvert avant un deploy fauche avec l'ancien reaper.
+    /// Mesuré le 2026-11-05 : 21 reaps d'origine TUI depuis le 2026-10-07, dont
+    /// 4 parentes `ready-label` fauchées après le correctif de mika#2986 — une
+    /// perdue en `task_not_dispatchable`.
+    ///
+    /// Deux bases, une par moteur : deux moteurs sur une seule base feraient de
+    /// l'ordre d'exécution un facteur, et c'est précisément ce qu'on ne veut pas
+    /// mesurer. La seule différence entre les deux moteurs est `cli_mode`.
+    #[tokio::test]
+    async fn mika3042_le_mode_cli_ne_fauche_pas_une_parente_self_dev() {
+        let groom_audit = REAPER_CLASS_DISPOSITIONS
+            .iter()
+            .find(|(class, _, _)| *class == "groom")
+            .map(|(_, _, audit)| *audit)
+            .expect("la classe `groom` est au recensement de REAPER_CLASS_DISPOSITIONS");
+
+        // Contrôle négatif : la fixture EST fauchable. Sans cette moitié, la
+        // moitié CLI mesurerait une absence triviale.
+        let daemon_db = test_db();
+        let daemon_parent = seed_orphaned_groom_parent(&daemon_db).await;
+        let mut daemon_engine = observing_engine(
+            daemon_db.clone(),
+            test_dispatcher_with(daemon_db.clone(), |_| {}),
+        );
+        tick_once_through_db_scan(&mut daemon_engine).await;
+
+        let reaped = daemon_db.get_task(&daemon_parent).await.unwrap().unwrap();
+        assert_eq!(
+            reaped.status, "failed",
+            "contrôle négatif : un moteur démon fauche bien cette fixture"
+        );
+
+        // Le correctif.
+        let cli_db = test_db();
+        let cli_parent = seed_orphaned_groom_parent(&cli_db).await;
+        let dispatcher = test_dispatcher_with(cli_db.clone(), |_| {});
+        let dispatcher = Arc::new(TaskDispatcher {
+            cli_mode: true,
+            ..Arc::try_unwrap(dispatcher).ok().expect("un seul détenteur")
+        });
+        let mut cli_engine = observing_engine(cli_db.clone(), dispatcher);
+        tick_once_through_db_scan(&mut cli_engine).await;
+
+        let spared = cli_db.get_task(&cli_parent).await.unwrap().unwrap();
+        assert_eq!(
+            spared.status, "in_progress",
+            "le moteur de `mika chat` laisse la parente du démon intacte"
+        );
+        // « rien n'a changé » et « quelque chose a changé puis a été remis » ne
+        // se lisent pas pareil : le moteur CLI n'a rien instrumenté non plus.
+        assert_eq!(
+            cli_db
+                .count_audit_events_by_tool_name(groom_audit)
+                .await
+                .unwrap(),
+            0,
+            "aucun événement d'audit du reaper : le balayage n'a pas tourné du tout"
+        );
     }
 
     #[tokio::test]
