@@ -4107,9 +4107,19 @@ echo "Test 13: Policy-deny disambiguation precedes drift detection (structural)"
 echo "-------------------------------------------------------------------------"
 
 DRIFT_BLOCK=$(sed -n '/Post-flight plan validation/,/Issue #138: Discover/p' "$DISPATCH_LIB")
+# mika#3040 (G2): la lecture du refus a quitté les deux sites pour une fonction
+# unique. Les trois claims qui portaient sur le CORPS de la lecture
+# (initialisation, strip ANSI, marqueur cherché) se mesurent donc là où la
+# lecture vit désormais ; les sites, eux, gardent leur claim propre — qu'ils
+# passent bien par cet appel-là. Les assertions n'ont pas été supprimées : une
+# assertion qui reste verte parce que son bloc contient encore le mot `sed` par
+# ailleurs ne mesure plus rien.
+POLICY_DENY_READ_BLOCK=$(sed -n '/^_policy_deny_read() {/,/^}/p' "$DISPATCH_LIB")
 
-assert_contains "POLICY_DENY variable initialized" \
-    'POLICY_DENY=""' "$DRIFT_BLOCK"
+assert_contains "POLICY_DENY variable initialized (dans le lecteur unique, mika#3040)" \
+    'POLICY_DENY=""' "$POLICY_DENY_READ_BLOCK"
+assert_contains "le site dev-groom passe par le lecteur unique (mika#3040 AC3)" \
+    '_policy_deny_read "$PERSISTENT_STDERR_PATH"' "$DRIFT_BLOCK"
 # mika#2165 moved the directory behind the single resolver `_pilot_log_dir`;
 # the LOG_ID convention this assertion exists for is unchanged, only its
 # spelling is. The default literal now lives at exactly one site, pinned below.
@@ -4121,9 +4131,9 @@ assert_contains "PERSISTENT_STDERR_PATH uses LOG_ID convention" \
 assert_contains "Reads from persistent stderr (mika#1097 channel)" \
     '"$PERSISTENT_STDERR_PATH"' "$DRIFT_BLOCK"
 assert_contains "Strips ANSI before grep (UI ANSI shouldn't break match)" \
-    'sed' "$DRIFT_BLOCK"
+    "sed 's/\\x1b\\[[0-9;]*[mK]//g'" "$POLICY_DENY_READ_BLOCK"
 assert_contains "Searches for [policy:deny] marker" \
-    '[policy:deny]' "$DRIFT_BLOCK"
+    '_policy_deny_excerpt' "$POLICY_DENY_READ_BLOCK"
 assert_contains "Class C message identifies policy halt explicitly" \
     'halted by claude-pilot policy deny' "$DRIFT_BLOCK"
 assert_contains "Class C message explicitly NOT drift" \
@@ -4226,14 +4236,19 @@ POSTFLIGHT_BLOCK=$(sed -n '/Post-flight diff check: detect zero-commit/,/Unit 1 
 
 assert_contains "Class C check fires on HEAD-unchanged for ALL skills (not just dev-groom)" \
     'Policy-deny pre-check (Class C disambiguation, extended to dev-pilot' "$POSTFLIGHT_BLOCK"
-assert_contains "POLICY_DENY variable set in HEAD-unchanged path" \
-    'POLICY_DENY=""' "$POSTFLIGHT_BLOCK"
+# mika#3040 (G2) : même déplacement qu'au Test 13 ci-dessus, et c'est le fond
+# du geste — ce site et celui de dev-groom étaient des copies quasi-littérales,
+# et c'est cette duplication qui a laissé l'extrait et la létalité répondre sur
+# deux objets différents. Ce que ce site doit encore prouver, c'est qu'il passe
+# par le MÊME appel.
+assert_contains "POLICY_DENY set via the single reader in HEAD-unchanged path (mika#3040)" \
+    '_policy_deny_read "$PERSISTENT_STDERR_PATH"' "$POSTFLIGHT_BLOCK"
 assert_contains "Reads persistent stderr at LOG_ID path" \
     '_pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"' "$POSTFLIGHT_BLOCK"
 assert_contains "Strips ANSI before grep" \
-    'sed' "$POSTFLIGHT_BLOCK"
+    "sed 's/\\x1b\\[[0-9;]*[mK]//g'" "$POLICY_DENY_READ_BLOCK"
 assert_contains "Searches for [policy:deny] marker" \
-    '[policy:deny]' "$POSTFLIGHT_BLOCK"
+    '_policy_deny_excerpt' "$POLICY_DENY_READ_BLOCK"
 assert_contains "Class C message — halted by policy deny, NOT generic exit" \
     'halted by policy deny — not generic exit' "$POSTFLIGHT_BLOCK"
 assert_contains "Links to investigation doc" \
@@ -10273,6 +10288,51 @@ assert_eq "T8: tout site de halt sur deny est réservé à la létalité termina
 # résultat identique — et donnerait l'apparence d'un fix qui corrige ses tests.
 assert_eq "D1: les deux sites gardent POLICY_DENY en conjoint de tête" \
     "2" "$(grep -c 'if \[ -n "\$POLICY_DENY" \] && \[ -z "\$VALID_PLAN" \]' "$DISPATCH_LIB" || true)"
+
+# --- mika#3040 AC3 : un seul site construit le couple (extrait, létalité) ----
+#
+# Le défaut de mika#3040 n'était dans aucune des deux fonctions — chacune
+# répondait juste à sa propre question. Il était dans le fait que DEUX sites
+# posaient les deux questions séparément, en copies quasi-littérales l'un de
+# l'autre : c'est cette duplication qui était la condition matérielle de la
+# divergence. `_policy_deny_read` la supprime ; ce scan refuse qu'elle revienne.
+#
+# Même patron que T8 ci-dessus : une allowlist déclarée vide et tenue vide par
+# une assertion, un scan structurel, et un contrôle de bonne foi. « On déclare,
+# on n'allowliste pas » (mika#2201, mika#2323) : quand ce scan tire, la
+# résolution est de router le nouveau site par `_policy_deny_read`, JAMAIS
+# d'ajouter une entrée ici. Une exception ne peut d'ailleurs pas devenir stale,
+# parce qu'elle ne peut pas exister : toute entrée rougit l'assertion suivante
+# au premier run.
+POLICY_DENY_CONSTRUCTION_SITES_ALLOWED=""   # mika#3040 : LIVRÉE VIDE, et un test le tient
+assert_eq "AC3: allowlist des sites de construction — zero entries" \
+    "" "$POLICY_DENY_CONSTRUCTION_SITES_ALLOWED"
+
+# Les commentaires et les trois lignes de DÉFINITION sont exclus : on compte les
+# APPELS. Les trois premières mesures doivent toutes tomber dans
+# `_policy_deny_read`, la quatrième est ce qui empêche le scan de mesurer le
+# vide — un fichier où plus aucun site ne lirait le refus rendrait `0:0:0` et
+# passerait vert à vide, le mode de panne que mika#2578 et mika#2752 ont payé.
+T3040_READ_SCAN=$(awk '
+    /^[[:space:]]*#/ { next }
+    index($0, "_policy_deny_excerpt() {") > 0 { next }
+    index($0, "_policy_deny_lethality() {") > 0 { next }
+    index($0, "_policy_deny_read() {") > 0 { next }
+    index($0, "POLICY_DENY=$(") > 0 { ctor++ }
+    index($0, "_policy_deny_excerpt") > 0 { exc++ }
+    index($0, "_policy_deny_lethality") > 0 { leth++ }
+    index($0, "_policy_deny_read") > 0 { rd++ }
+    END { printf "%d:%d:%d:%d", ctor + 0, exc + 0, leth + 0, rd + 0 }
+' "$DISPATCH_LIB")
+# Bonne foi d'abord, comme T8 : le scan voit bien les deux sites d'appel.
+assert_eq "AC3 (bonne foi): le scan voit au moins deux appels de _policy_deny_read" \
+    "yes" "$([ "${T3040_READ_SCAN##*:}" -ge 2 ] && echo yes || echo "non ($T3040_READ_SCAN)")"
+assert_eq "AC3: une seule ligne construit POLICY_DENY par substitution" \
+    "1" "$(printf '%s' "$T3040_READ_SCAN" | cut -d: -f1)"
+assert_eq "AC3: _policy_deny_excerpt n'est appelé qu'une fois (jamais sans la létalité)" \
+    "1" "$(printf '%s' "$T3040_READ_SCAN" | cut -d: -f2)"
+assert_eq "AC3: _policy_deny_lethality n'est appelé qu'une fois (jamais dissocié)" \
+    "1" "$(printf '%s' "$T3040_READ_SCAN" | cut -d: -f3)"
 
 # --- T9, T10, T11, T15, T16 : comportement bout-en-bout ---------------------
 #
