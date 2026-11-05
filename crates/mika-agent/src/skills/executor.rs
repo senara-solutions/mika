@@ -18176,6 +18176,20 @@ Harness ticket.
             outil_du_reap: &str,
             result_du_groom: Option<&str>,
         ) -> (AsyncDatabase, String) {
+            parente_fauchee_avec(Some(outil_du_reap), result_du_groom)
+        }
+
+        /// La même fixture, où `outil_du_reap` à `None` signifie *« le reaper
+        /// n'a abouti à aucune transition »* — la seule forme que le wrapper
+        /// ci-dessus ne sait pas monter, et la seule chose que ce paramètre
+        /// ajoute.
+        ///
+        /// Les six appels de T1 à T6 passent par le wrapper et sont inchangés :
+        /// si l'un d'eux rougit, c'est le wrapper qui est faux, pas le prédicat.
+        fn parente_fauchee_avec(
+            outil_du_reap: Option<&str>,
+            result_du_groom: Option<&str>,
+        ) -> (AsyncDatabase, String) {
             let sync = db();
             let parent_id = sync
                 .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
@@ -18199,8 +18213,34 @@ Harness ticket.
                 )
                 .unwrap()
             );
-            transition(&sync, &parent_id, outil_du_reap, "failed");
+            if let Some(outil) = outil_du_reap {
+                transition(&sync, &parent_id, outil, "failed");
+            }
             (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        /// La ligne de bord du reaper — `engine.rs`, la branche `Err` de la
+        /// transition de fauche : le reaper a **essayé** de faucher et sa
+        /// transition a échoué.
+        ///
+        /// Elle porte donc le même `tool_name` que le reap — `engine.rs` passe
+        /// son `audit_tool_name` à la branche d'erreur comme à celle du succès —
+        /// l'état d'**avant** seul, et le `reasoning` `reaper_db_error: …`. Le
+        /// `after` à `None` n'est pas une commodité de test : c'est la colonne
+        /// telle que la production l'écrit, et coercer un NULL en `""` est ce que
+        /// mika#2331 refuse.
+        async fn ligne_de_bord(db: &AsyncDatabase, parent_id: &str) {
+            db.log_audit_event(
+                "system-mika",
+                GROOM_PARENT_ORPHANED_EVENT,
+                parent_id,
+                Some("in_progress"),
+                None,
+                Some("reaper_db_error: database is locked"),
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         /// Le dispatch du dev-pilot — celui qui a été refusé trois fois.
@@ -18502,6 +18542,50 @@ Harness ticket.
                 "la lecture (b) a échoué : le prédicat rend l'illisible, jamais \
                  `Eligible` — et jamais le refus d'une condition qu'il n'a pas pu \
                  évaluer"
+            );
+        }
+
+        /// **T7 — une ligne de bord `reaper_db_error` ne vaut pas un reap de
+        /// groom.** La fauche a été *tentée* et sa transition a échoué : la
+        /// parente ne porte qu'une ligne qui ne dit que l'état d'**avant**. Elle
+        /// porte le même `tool_name` que le reap, donc rien ne la distingue d'un
+        /// reap sinon son `after_value` absent — et c'est précisément ce qui rend
+        /// ce cas nécessaire.
+        ///
+        /// La fixture force `status = 'failed'` et un groom convergé, et **ce
+        /// forçage est le test** : (a) et (c) tiennent, donc seul D1 décide. Sans
+        /// lui, le refus pourrait venir de l'un des deux et le test serait vert
+        /// pour une raison qui n'est pas la sienne.
+        ///
+        /// C'est le bord symétrique de T1, dont la ligne `manager_flight_verdict`
+        /// ne porte qu'un état *après*. Aucune branche neuve n'est traversée : le
+        /// `WHERE … after_value IS NOT NULL` de `latest_state_transition_for_target`
+        /// exclut déjà la ligne, et le prédicat redouble avec l'égalité sur
+        /// `after_value`. Ce test épingle le discriminant pour que l'élargir
+        /// devienne un geste visible — la propriété tient aujourd'hui par deux
+        /// filtres dont aucun n'était testé sur cette forme.
+        #[tokio::test]
+        async fn mika3044_une_ligne_de_bord_reaper_db_error_ne_vaut_pas_un_reap() {
+            let (db, parent_id) = parente_fauchee_avec(None, Some(GROOM_CALLBACK_PLAN_GROOMED));
+            ligne_de_bord(&db, &parent_id).await;
+
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("une fauche qui n'a pas abouti n'est pas un reap");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("last_transition_not_groom_reap".to_string()))],
+                "(b) tombe sur l'absence de transition, et sa raison la nomme"
+            );
+
+            let task = db.get_task(&parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                crate::parent_rehabilitation::decide(&db, &task).await,
+                RehabDecision::Refused(RehabRefusal::LastTransitionNotGroomReap),
+                "la ligne de bord n'est pas lue comme une transition : ni un reap, \
+                 ni une piste illisible"
             );
         }
     }
