@@ -8959,6 +8959,44 @@ Remote-probe: existence of origin/$BRANCH could not be measured (ls-remote rc=$r
 Stale-ref: origin/$BRANCH points at $local_ref_sha locally but the remote has no such branch (mika#2626) — pushing as first-push"
     fi
 
+    # mika#3038, AC3 : une branche que le merge de sa PR a supprimée d'`origin`
+    # n'y est pas recréée quand elle n'apporte rien à `origin/main`.
+    #
+    # LE TERME EST SUR `remote_known_absent`, PAS SUR `remote_has_branch`, et la
+    # distinction est celle que le commentaire à deux cellules d'ici vient
+    # d'établir : le second est une DÉCISION qui retombe sur la ref de suivi
+    # locale quand la mesure a échoué, le premier est le FAIT d'une absence
+    # mesurée. Refuser un push sur une décision, c'est refuser de publier du
+    # travail sur un `ls-remote` qui n'a pas répondu — et celui-là, contrairement
+    # à une draft fantôme, personne ne le rouvre d'un clic.
+    #
+    # CE N'EST PAS UNE OPTIMISATION, ET LE RETIRER NE SE RATTRAPE PAS PLUS BAS.
+    # Recréer la branche sur `origin` publie zéro octet, mais rend à la fin de
+    # vol une branche distante sur laquelle ouvrir une draft — c'est le premier
+    # maillon de la chaîne qui a produit #2197, #2702, #2899 et #3034. Le refus
+    # de l'AC1 coupe le second ; celui-ci coupe le premier, et chacun des deux
+    # tient sans l'autre.
+    #
+    # Le `return 0` et non un `return 1` : il n'y a rien à publier, donc rien n'a
+    # échoué. Un non-zéro ici ferait porter au vol un échec de push qui n'a pas
+    # eu lieu.
+    local _tree_rc=0
+    _branch_tree_equals_main "$WORKTREE_DIR" || _tree_rc=$?
+    if [ "$remote_known_absent" -eq 1 ] && [ "$_tree_rc" -eq 0 ]; then
+        echo "push_branch.skipped_empty: HEAD tree equals origin/main and the remote has no branch $BRANCH — nothing to publish (mika#3038)" >&2
+        # Dans le RESULT, pour la raison des lignes `Remote-probe:` et
+        # `Stale-ref:` juste au-dessus : le stderr d'avant-pilote est
+        # structurellement perdu sur un dispatch qui réussit (classe mika#2050).
+        RESULT="${RESULT}
+Push: SKIPPED — the remote has no branch $BRANCH (its PR was merged, which deleted it) and the tree at HEAD is identical to origin/main; re-creating the branch would publish nothing (mika#3038)"
+        return 0
+    fi
+    # Forme `if` et non `[ … ] && _note…`, pour la raison mesurée une cellule
+    # plus haut : sous le `set -e` des handlers qui sourcent ce fichier, une
+    # telle chaîne devient le rc de la fonction si un éditeur la déplace en
+    # dernière commande.
+    if [ "$_tree_rc" -eq 2 ]; then _note_tree_compare_undetermined; fi
+
     # Deux termes, et la CONJONCTION est le correctif. Le premier est la question
     # réellement posée (le distant porte-t-il la branche ?). Le second est que la
     # ref de suivi locale existe, puisque tout le bloc ci-dessous la LIT
