@@ -12519,6 +12519,68 @@ This ticket has been GROOMED and is ready.
         );
     }
 
+    /// **AC3 — le handler décide sur la lecture fraîche, pas sur la copie du
+    /// tick.**
+    ///
+    /// Les quatre tests ci-dessus prouvent qu'une relecture *refusante* arrête
+    /// le dispatch. Aucun d'eux ne prouve qu'une relecture *acceptante* est
+    /// bien celle qui arrive au handler : T1 canne le même corps que la liste du
+    /// tick, donc il resterait vert si la phase 2 passait la copie du tick après
+    /// avoir relu pour rien. C'est précisément la régression la plus plausible
+    /// de ce vol — ajouter la lecture, oublier de la passer — et c'est ce test
+    /// qui la ferme.
+    ///
+    /// Le discriminant est **comportemental**, pas structurel : les deux corps
+    /// mènent à deux routages observables du handler, celui-là même que
+    /// `mika2470_the_handler_decides_groom_vs_implement` épingle. La liste du
+    /// tick porte `UNGROOMED_BODY`, qui route `dev-groom` ; la relecture porte
+    /// `GROOMED_BODY` avec sa preuve en base, qui route `dev-pilot`. Un seul des
+    /// deux peut sortir, et il nomme sa source.
+    ///
+    /// Le scan structurel d'AC3 — « aucun chemin de dispatch de la phase 2
+    /// n'utilise plus la copie du tick » — part au vol 2 (§ 6 du plan) : il
+    /// répond d'une autre question, l'absence de *tout autre* chemin, que ce
+    /// test ne couvre pas et ne prétend pas couvrir.
+    #[tokio::test]
+    async fn mika3047_le_handler_decide_sur_la_lecture_fraiche_pas_sur_le_tick() {
+        let n = 990_109u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        // La seule chose qui diffère de T1 : la liste du tick, délibérément
+        // périmée. La fixture pose un `GROOMED_BODY` ; ici le tick a lu un corps
+        // d'avant le grooming, et la forge en porte un d'après.
+        let liste_du_tick = vec![make_issue(n, UNGROOMED_BODY, &["ready"], "t")];
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-ac3";
+        let _ = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &liste_du_tick,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            audit_after_values(&t.db, session, "ready_label_handled").await,
+            vec!["dev-pilot_dispatch_prepared".to_string()],
+            "le handler a décidé sur `GROOMED_BODY`, donc sur la lecture \
+             fraîche. `dev-groom_dispatch_prepared` ici voudrait dire que la \
+             copie du tick est encore celle qui part au dispatch : la relecture \
+             aurait été payée et jetée"
+        );
+    }
+
     // ── mika#2839 : le callout d'une branche morte est réécrit ──
 
     /// Le corps d'un ticket dont la branche a été supprimée par le merge de sa
