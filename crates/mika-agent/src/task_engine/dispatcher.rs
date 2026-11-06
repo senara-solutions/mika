@@ -11506,7 +11506,13 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         const REPO: &str = "senara-solutions/mika";
-        const ISSUE: u64 = 3002;
+        /// Au-dessus du plancher de fixture (mika#2713), et non le `3002` réel
+        /// du cas mesuré : dès que la garde relit l'**état** du ticket
+        /// (mika#3050), toute branche qui atteint `ConsentHeld` franchit le
+        /// double `run_gh`, et celui-ci panique sur un numéro sous le plancher
+        /// — il n'y a pas d'allowlist. Un panic masquerait la lecture du
+        /// défaut, d'où la renumérotation **avant** la composition.
+        const ISSUE: u64 = 990_002;
         const HUMAN: &str = "samidarko";
         const MACHINE: &str = "mika-platform-dev";
         const POSE: &str = "2026-11-01T14:00:00Z";
