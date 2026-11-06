@@ -1498,11 +1498,44 @@ impl TaskDispatcher {
     /// une parente hors préfixe rend `false` sans qu'un seul appel au fetcher
     /// soit payé. C'est ce qu'AC-T3 épingle en comptant les appels, et c'est la
     /// seule forme d'« octet pour octet » qu'un test puisse attester ici.
+    ///
+    /// # Deux prédicats, et pourquoi le parc passe d'abord (mika#3050 D1)
+    ///
+    /// Le prédicat de parc rend « non parqué » sur un `unlabeled` **machine** —
+    /// à dessein, c'est sa propriété D2, celle qui tolère le `remove`→`add` de
+    /// la Phase 2 d'`auto_pull`. Mais depuis mika#3022 c'est une identité
+    /// machine qui retire `ready` à chaque merge de la boucle, donc une parente
+    /// en attente au moment d'un merge `Refs` est dans cette forme **par
+    /// construction** : le parc la laisse passer, et le tour part sur un ticket
+    /// qui ne consent plus (`0529ed9b`/#3044).
+    ///
+    /// L'état du ticket est donc consulté — mais **seulement sur le `Ok(None)`
+    /// du parc**. Un retrait humain rend le ticket simultanément parqué *et*
+    /// sans `ready` : si l'état passait d'abord, chaque park humain basculerait
+    /// vers la raison de mika#3050 et le compte de mika#2995 tomberait à zéro
+    /// sans qu'aucune régression ait eu lieu — deux populations sous un nom ne
+    /// se soustraient pas (mika#2205). L'ordre décide sous quelle raison la
+    /// population est comptée, et il est fixé ici.
+    ///
+    /// # Le prédicat d'état est appelé, pas redérivé (mika#3050 D2)
+    ///
+    /// « `ready` est posé » se dériverait de la timeline déjà lue — le dernier
+    /// événement de la série est un `labeled` — pour zéro appel réseau de plus.
+    /// C'est précisément ce qu'il ne faut pas faire : ce serait un **second
+    /// lecteur** de « ouvert et portant `ready` », avec une seconde
+    /// implémentation, contre la doctrine du lecteur unique (mika#2158,
+    /// mika#2205, mika#3049). Et la timeline de `ready` ne porte pas `state` :
+    /// le parc seul ne peut pas rendre la moitié « ouvert » qu'AC1 exige.
+    ///
+    /// Le `token` est ici par le même raisonnement que `machine` : le joint est
+    /// auto-suffisant, et le double `#[cfg(test)] run_gh` canne l'état sans
+    /// qu'un seam de plus soit introduit.
     async fn skip_deferred_dispatch_on_withdrawn_consent_with(
         &self,
         task: &Task,
         fetcher: &dyn crate::ready_label::TimelinePageFetcher,
         machine: &crate::ready_label::MachineIdentities,
+        token: &str,
     ) -> bool {
         use crate::ready_label::{TimelineReadError, park_verdict_for_issue_with};
 
@@ -1520,7 +1553,9 @@ impl TaskDispatcher {
             },
             Some(p) => {
                 match park_verdict_for_issue_with(fetcher, &p.repo, p.issue, machine).await {
-                    Ok(None) => WithdrawnConsentVerdict::ConsentHeld,
+                    // Le parc ne voit pas de retrait humain. C'est là, et
+                    // seulement là, que l'état du ticket est consulté.
+                    Ok(None) => Self::state_verdict_at_promotion(token, p).await,
                     Ok(Some((parked_by, parked_at))) => WithdrawnConsentVerdict::ConsentWithdrawn {
                         parked_by,
                         parked_at,
@@ -1539,6 +1574,32 @@ impl TaskDispatcher {
 
         self.apply_withdrawn_consent_verdict(task, parent.as_ref(), verdict)
             .await
+    }
+
+    /// Le second prédicat : le ticket est-il encore ouvert, et porte-t-il encore
+    /// `ready` ? (mika#3050 D2)
+    ///
+    /// Trois états et un quatrième que le type ne porte pas : la relecture en
+    /// erreur, qui est le `Err` du `Result`. Elle devient
+    /// [`WithdrawnConsentVerdict::StateUnreadable`] — un **report**, jamais un
+    /// terminal. Une panne de forge n'est pas un état du ticket, et l'écrire
+    /// comme tel ferait classer une indisponibilité en retrait de consentement,
+    /// donc poserait un terminal sur une parente parfaitement consentante
+    /// (mika#2131, mika#2331 : une absence n'est pas un zéro). Le prédicat est
+    /// déjà fail-closed champ par champ ; cette fonction est ce qui rend ce
+    /// fail-closed conséquent au site de promotion.
+    async fn state_verdict_at_promotion(
+        token: &str,
+        parent: &ReadyLabelParent,
+    ) -> WithdrawnConsentVerdict {
+        use crate::ready_label::{RearmConsent, reread_issue_consent_via_gh};
+
+        match reread_issue_consent_via_gh(token, &parent.repo, parent.issue).await {
+            Ok(RearmConsent::Held) => WithdrawnConsentVerdict::ConsentHeld,
+            Ok(RearmConsent::ReadyAbsent) => WithdrawnConsentVerdict::ReadyAbsentAtPromotion,
+            Ok(RearmConsent::Closed) => WithdrawnConsentVerdict::IssueClosedAtPromotion,
+            Err(detail) => WithdrawnConsentVerdict::StateUnreadable { detail },
+        }
     }
 
     /// Le site de production de [`Self::skip_deferred_dispatch_on_withdrawn_consent_with`].
@@ -1575,7 +1636,7 @@ impl TaskDispatcher {
         // primaire, sur la population la plus étroite du dispatcher, et c'est le
         // prix d'un joint auto-suffisant : un joint qui dépendrait d'un
         // pré-calcul de son appelant n'attesterait plus l'ordre qu'AC-T3 exige.
-        self.skip_deferred_dispatch_on_withdrawn_consent_with(task, &fetcher, machine)
+        self.skip_deferred_dispatch_on_withdrawn_consent_with(task, &fetcher, machine, &token)
             .await
     }
 
@@ -11673,6 +11734,27 @@ mod tests {
         /// entrelacement ne les distingue.
         const ISSUE_T1_READY_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_051;
 
+        /// Le jeton que les tests passent au joint.
+        ///
+        /// Le double `#[cfg(test)] run_gh` ne le lit pas — il n'y a pas de
+        /// forge à l'autre bout. Il est là parce que le joint le **transporte**
+        /// plutôt que de le résoudre : un dispatcher de test n'a pas de jeton,
+        /// donc un joint qui appellerait `resolve_github_token` lui-même
+        /// rendrait `NoToken` sur chacun des huit cas, et T4 — le contrôle
+        /// positif, celui qui dit que le tour part encore — ne pourrait jamais
+        /// être vert. Le site de production, lui, l'a déjà résolu avant
+        /// d'entrer : la résolution reste à **un** site.
+        const FIXTURE_TOKEN: &str = "fake-token";
+
+        /// L'état d'un ticket qui consent encore : ouvert, et portant `ready`.
+        ///
+        /// C'est la charge des quatre premiers cas du tableau de mesure du
+        /// ticket — la forme saine — et celle que les deux tests de mika#2995
+        /// qui atteignent `ConsentHeld` doivent canner depuis mika#3050, sans
+        /// quoi le double `gh` leur rendrait une sortie vide et le verdict
+        /// basculerait en `StateUnreadable`.
+        const ETAT_HELD: &str = r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#;
+
         /// Fabrique la réponse d'état que le double `gh` rendra pour ce ticket.
         ///
         /// Le motif d'`argv` est `issue view`, celui du vol 2 : le prédicat
@@ -11879,6 +11961,7 @@ mod tests {
                     &task(&db, &wrapper).await,
                     &fetcher,
                     &machine(),
+                    FIXTURE_TOKEN,
                 )
                 .await;
 
@@ -11898,11 +11981,18 @@ mod tests {
 
         /// AC-T1 contrôle négatif — **la même fixture**, plus un `labeled`
         /// humain en dernier. La garde laisse passer, et n'écrit rien.
+        ///
+        /// Depuis mika#3050 ce cas franchit le second prédicat : le parc rend
+        /// `Ok(None)`, donc l'état est relu. Il canne la forme saine — c'est la
+        /// fixture du contrôle négatif, pas un détail de plomberie : sans elle
+        /// le test resterait « vert » sur un `StateUnreadable`, qui refuse
+        /// aussi le tour, et n'attesterait plus rien.
         #[tokio::test]
         async fn mika2995_la_meme_fixture_avec_un_labeled_en_dernier_lance_le_tour() {
             let db = test_db();
             let dispatcher = test_dispatcher(db.clone());
             let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            canner_etat(ISSUE, ETAT_HELD);
             let mut events = retrait_humain();
             events.push(labeled_json(HUMAN, REPOSE));
             let fetcher = CountingFetcher::with(&events);
@@ -11912,6 +12002,7 @@ mod tests {
                     &task(&db, &wrapper).await,
                     &fetcher,
                     &machine(),
+                    FIXTURE_TOKEN,
                 )
                 .await;
 
@@ -11930,6 +12021,9 @@ mod tests {
             let db = test_db();
             let dispatcher = test_dispatcher(db.clone());
             let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            // mika#3050 — même raison que ci-dessus : le parc laisse passer,
+            // donc l'état est relu, et c'est la forme saine qu'il faut canner.
+            canner_etat(ISSUE, ETAT_HELD);
             let fetcher = CountingFetcher::with(&[
                 labeled_json(HUMAN, POSE),
                 unlabeled_json(MACHINE, RETRAIT),
@@ -11941,6 +12035,7 @@ mod tests {
                     &task(&db, &wrapper).await,
                     &fetcher,
                     &machine(),
+                    FIXTURE_TOKEN,
                 )
                 .await;
 
@@ -11965,6 +12060,7 @@ mod tests {
                     &task(&db, &wrapper).await,
                     &fetcher,
                     &machine(),
+                    FIXTURE_TOKEN,
                 )
                 .await;
 
@@ -12027,6 +12123,7 @@ mod tests {
                     &task(&db, &wrapper).await,
                     &fetcher,
                     &machine(),
+                    FIXTURE_TOKEN,
                 )
                 .await;
 
@@ -12057,6 +12154,7 @@ mod tests {
                     &task(&db, &wrapper).await,
                     &fetcher,
                     &MachineIdentities::from_logins(Vec::<String>::new()),
+                    FIXTURE_TOKEN,
                 )
                 .await;
 
@@ -12112,6 +12210,7 @@ mod tests {
                     &task(&db, &wrapper).await,
                     &fetcher,
                     &machine(),
+                    FIXTURE_TOKEN,
                 )
                 .await;
 
