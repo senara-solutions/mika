@@ -2565,4 +2565,142 @@ async fn consomme(db: &AsyncDatabase, id: &str) {
             CENSUS_WRITER_DECLARED
         );
     }
+
+    /// Le nom de l'événement, tel que la production l'écrit. C'est un **littéral**
+    /// à son site d'émission : le scan ci-dessous cherche donc la même forme.
+    const CENSUS_EVENT_LITERAL: &str = "rearm_consent_checked";
+
+    /// Les sites qui émettent `rearm_consent_checked`, un par ligne non-commentaire
+    /// portant le littéral.
+    ///
+    /// Paramétré par ses fichiers plutôt que les lisant lui-même : c'est ce qui
+    /// rend le contrôle de bonne foi possible. Un scan qui lit le disque ne peut
+    /// pas être mis à l'épreuve sans écrire dans l'arbre.
+    ///
+    /// Les commentaires sont retirés d'abord ([`crate::source_scan::strip_comment_lines`])
+    /// — le doc-comment de l'enveloppe nomme l'événement pour dire qu'elle en est
+    /// le seul écrivain, et une prose qui *décrit* le motif ne doit pas se lire
+    /// comme une violation de celui-ci (classe mika#2323). Le numéro de ligne
+    /// n'est donc pas rapporté : après la coupe, il ne désigne plus rien dans le
+    /// fichier d'origine, et un numéro faux dans un message d'échec envoie le
+    /// lecteur au mauvais endroit.
+    fn census_writers_in(files: &[(String, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, prod) in files {
+            let hits = crate::source_scan::strip_comment_lines(prod)
+                .lines()
+                .filter(|l| l.contains(CENSUS_EVENT_LITERAL))
+                .count();
+            for _ in 0..hits {
+                out.push(format!("src/{rel}"));
+            }
+        }
+        out
+    }
+
+    /// **Un seul écrivain du recensement, et c'est une égalité.**
+    ///
+    /// AC4 compte des ré-armements à partir de cette ligne, donc le dénominateur
+    /// qu'elle fournit n'est juste que si elle est émise **une fois par passage**.
+    /// Un second site l'émettrait sur un sous-ensemble des branches, et le
+    /// quotient qu'un opérateur en tire serait faux sans que rien ne l'en avertisse
+    /// — un instrument qui compte deux fois ne se signale pas, il se lit.
+    ///
+    /// L'assertion est une **égalité**, pas un `<=` : zéro écrivain est une
+    /// régression aussi réelle que deux. Supprimer la ligne rendrait tous les
+    /// tests de `RearmOutcome` de #3052 verts, et AC4 muette.
+    #[test]
+    fn mika3050_levenement_de_recensement_a_un_ecrivain_unique() {
+        let writers = census_writers_in(&crate::source_scan::production_files());
+        assert_eq!(
+            writers.len(),
+            1,
+            "`{CENSUS_EVENT_LITERAL}` doit avoir exactement un écrivain de \
+             production ; trouvés : {writers:?}. Deux sites doublent le \
+             dénominateur d'AC4, zéro la rend muette. Ramenez l'émission à \
+             l'enveloppe `reread_consent_before_rearm` plutôt que d'ajouter une \
+             entrée à `CENSUS_WRITER_DECLARED`."
+        );
+        assert_eq!(
+            writers[0], "src/skills/executor.rs",
+            "l'écrivain doit être l'enveloppe de la garde, pas un autre module"
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus : il rougit bien sur un second
+    /// site.
+    ///
+    /// Sans ce contrôle, un scan dont le prédicat ne trouve plus rien — littéral
+    /// renommé, coupe de commentaires trop large — passe au vert en comptant zéro
+    /// puis *un*, et l'égalité le masquerait. Le fichier synthétique porte aussi
+    /// une **prose** nommant l'événement, pour que la coupe des commentaires soit
+    /// attestée en même temps que la détection.
+    #[test]
+    fn mika3050_le_scan_decrivain_rougit_sur_un_second_site() {
+        let synthetic = vec![
+            (
+                "skills/executor.rs".to_string(),
+                "    info!(event = \"rearm_consent_checked\", verdict = c.as_str());\n".to_string(),
+            ),
+            (
+                "task_engine/engine.rs".to_string(),
+                "    // Cette prose nomme `rearm_consent_checked` sans l'émettre.\n\
+                 /// Et ce doc-comment aussi : `rearm_consent_checked`.\n\
+                 info!(event = \"rearm_consent_checked\", verdict = \"held\");\n"
+                    .to_string(),
+            ),
+        ];
+        assert_eq!(
+            census_writers_in(&synthetic),
+            vec!["src/skills/executor.rs", "src/task_engine/engine.rs"],
+            "le scan doit voir les deux sites et aucune des deux proses"
+        );
+    }
+
+    /// **L'enveloppe émet sans condition — c'est ce qui fait les huit branches.**
+    ///
+    /// Les cinq tests de capture de `skills::executor::tests::mika3050_recensement`
+    /// atteignent sept des huit branches par un chemin réel. La huitième, et plus
+    /// généralement la propriété « *toutes* les branches », n'est pas une somme de
+    /// tests : c'est une propriété du **corps** de l'enveloppe, qui appelle
+    /// `reread_consent_verdict` puis émet, sans rien examiner entre les deux.
+    ///
+    /// Un `if` ajouté là — « n'émettons pas sur la branche saine, elle est
+    /// bruyante » — redonnerait exactement le défaut que ce vol ferme : un
+    /// numérateur sans dénominateur. Aucun test de comportement ne le verrait,
+    /// puisque les sept autres branches resteraient recensées.
+    ///
+    /// Ce test n'est pas au § 5 du plan ; il y est ajouté parce que le
+    /// doc-comment de l'enveloppe promet cette absence d'embranchement et qu'une
+    /// promesse non gardée s'érode.
+    #[test]
+    fn mika3050_lenveloppe_emet_sans_condition() {
+        let (_, prod) = crate::source_scan::production_files()
+            .into_iter()
+            .find(|(rel, _)| rel == "skills/executor.rs")
+            .expect("le site de la garde doit être un fichier de production");
+        let (_, body) = crate::source_scan::fn_bodies(&prod)
+            .into_iter()
+            .find(|(name, _)| name == "reread_consent_before_rearm")
+            .expect("l'enveloppe de la garde doit être trouvable par son nom");
+
+        for keyword in ["if", "match", "else"] {
+            let branching: Vec<&str> = body
+                .lines()
+                .filter(|l| crate::source_scan::occurs_at_boundary(l, keyword, true))
+                .collect();
+            assert!(
+                branching.is_empty(),
+                "le corps de `reread_consent_before_rearm` porte un `{keyword}` : \
+                 {branching:?}. L'émission inconditionnelle EST la propriété « les \
+                 huit branches sont recensées » ; un embranchement ici rend AC4 \
+                 partielle sans qu'aucun test de comportement ne rougisse."
+            );
+        }
+        assert!(
+            body.contains(CENSUS_EVENT_LITERAL),
+            "…et le corps doit bien porter l'émission : un corps vide passerait \
+             l'assertion ci-dessus"
+        );
+    }
 }
