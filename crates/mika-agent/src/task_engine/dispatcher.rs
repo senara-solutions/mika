@@ -11659,6 +11659,35 @@ mod tests {
         const RETRAIT: &str = "2026-11-01T14:08:43Z";
         const REPOSE: &str = "2026-11-01T14:09:12Z";
 
+        /// Un numéro de fixture par cas de mika#3050.
+        ///
+        /// Les tables de charges cannées de `gh_process` sont **globales au
+        /// processus** : deux tests qui décrivent deux réponses de la forge pour
+        /// un même numéro se marcheraient dessus sous `cargo test` parallèle.
+        /// Chaque variante prend donc son propre numéro — c'est la doctrine du
+        /// vol 2 (`rearm_fixture_with_issue`), et c'est aussi ce qui rend
+        /// `recorded_calls()` filtrable par test, dont T7 a besoin.
+        ///
+        /// Les deux tests de mika#2995 qui atteignent `ConsentHeld` gardent
+        /// [`ISSUE`] : ils cannent la **même** charge `Held`, donc aucun
+        /// entrelacement ne les distingue.
+        const ISSUE_T1_READY_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_051;
+
+        /// Fabrique la réponse d'état que le double `gh` rendra pour ce ticket.
+        ///
+        /// Le motif d'`argv` est `issue view`, celui du vol 2 : le prédicat
+        /// d'état appelle `gh issue view <n> --repo … --json state,labels`, et
+        /// le motif laisse les autres appels du même sujet lire leur propre
+        /// charge (mika#3047).
+        fn canner_etat(issue: u64, payload: &str) {
+            crate::gh_process::assert_fixture_issue(issue);
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(issue),
+                "issue view",
+                payload,
+            );
+        }
+
         /// Un fournisseur de pages qui **compte** ses appels, et peut échouer.
         ///
         /// Le compteur est la pièce d'AC-T3 : « octet pour octet » n'est pas
@@ -11721,6 +11750,20 @@ mod tests {
         /// Une parente et son wrapper différé promu. La parente porte `label`,
         /// ce qui est le seul discriminant que la garde lit.
         async fn seed_pair(db: &AsyncDatabase, parent_label: &str) -> (String, String) {
+            seed_pair_sur(db, parent_label, ISSUE).await
+        }
+
+        /// [`seed_pair`] sur un numéro de ticket choisi (mika#3050).
+        ///
+        /// Le numéro va dans le `reference_url` **et** dans le label que
+        /// l'appelant compose : c'est le label que la garde lit pour ses
+        /// coordonnées, et un `reference_url` qui nommerait un autre ticket
+        /// serait une fixture qui se contredit.
+        async fn seed_pair_sur(
+            db: &AsyncDatabase,
+            parent_label: &str,
+            issue: u64,
+        ) -> (String, String) {
             let parent = db
                 .create_task(NewTask {
                     agent_id: "mika".to_string(),
@@ -11740,7 +11783,7 @@ mod tests {
                     input_context: None,
                     created_by_session: Some("ready-label-session".to_string()),
                     created_trace_id: None,
-                    reference_url: Some(format!("https://github.com/{REPO}/issues/{ISSUE}")),
+                    reference_url: Some(format!("https://github.com/{REPO}/issues/{issue}")),
                     source: None,
                     metadata: None,
                     r#type: None,
@@ -11784,7 +11827,11 @@ mod tests {
         }
 
         fn ready_label_parent() -> String {
-            format!("{READY_LABEL_TASK_PREFIX} {REPO}#{ISSUE}")
+            ready_label_parent_sur(ISSUE)
+        }
+
+        fn ready_label_parent_sur(issue: u64) -> String {
+            format!("{READY_LABEL_TASK_PREFIX} {REPO}#{issue}")
         }
 
         async fn task(db: &AsyncDatabase, id: &str) -> Task {
@@ -11795,6 +11842,26 @@ mod tests {
             db.count_audit_events_by_tool_name(READY_CONSENT_RECHECK_TOOL_NAME)
                 .await
                 .unwrap()
+        }
+
+        /// Les **raisons** portées par les lignes d'audit de la relecture.
+        ///
+        /// Le compte seul ne suffit plus depuis mika#3050 : trois refus écrivent
+        /// désormais une ligne sous le même `tool_name`, et c'est la raison qui
+        /// les distingue. Un test qui n'assertait que le compte lirait un refus
+        /// de parc comme un refus d'état — exactement la fusion de populations
+        /// que mika#2205 interdit, et que T5 est là pour épingler.
+        ///
+        /// La session est celle que la garde écrit, `system-<agent>` ; l'`agent_id`
+        /// de la ligne vient de la poignée.
+        async fn audit_reasons(db: &AsyncDatabase) -> Vec<String> {
+            db.get_audit_events(&format!("system-{}", db.agent_id()))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.tool_name == READY_CONSENT_RECHECK_TOOL_NAME)
+                .filter_map(|e| e.reasoning)
+                .collect()
         }
 
         /// AC-T1 — l'épisode mesuré. Retrait humain en dernier : la garde
@@ -12002,6 +12069,78 @@ mod tests {
             assert_eq!(task(&db, &wrapper).await.status, "completed");
             assert_eq!(task(&db, &parent).await.status, "pending");
             assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        // ── mika#3050 — l'autre moitié d'AC1, au site de promotion ──────────
+        //
+        // Le prédicat de parc ci-dessus rend « non parqué » sur un `unlabeled`
+        // **machine**. Depuis mika#3022 c'est une identité machine qui retire
+        // `ready` à chaque merge de la boucle, donc un lanceur promu sur un
+        // ticket sans `ready` franchissait la garde et payait son tour. Les huit
+        // cas qui suivent tirent sur le **même joint** que ceux de mika#2995 —
+        // le vol n'en introduit aucun autre — et cannent l'état du ticket par le
+        // double `run_gh` de `gh_process.rs`.
+
+        /// **T1 — `ready` retiré par la machine : aucun tour, et un terminal.**
+        ///
+        /// La forme exacte de `0529ed9b`/#3044 : pose humaine, puis retrait
+        /// **machine** (le `merged_pr_ready_label_cleaned` de mika#3022, une
+        /// seconde avant la création de la parente). Le parc rend « non
+        /// parqué » — c'est juste, aucun humain n'a rien retiré — et c'est
+        /// l'état du ticket qui refuse, sous sa propre raison.
+        ///
+        /// **C'est le test du défaut** : sur `e0691c76f` il est rouge, parce que
+        /// rien ne relit l'état.
+        #[tokio::test]
+        async fn mika3050_un_ready_retire_par_la_machine_refuse_la_promotion() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair_sur(
+                &db,
+                &ready_label_parent_sur(ISSUE_T1_READY_ABSENT),
+                ISSUE_T1_READY_ABSENT,
+            )
+            .await;
+            canner_etat(ISSUE_T1_READY_ABSENT, r#"{"state":"OPEN","labels":[]}"#);
+            let fetcher = CountingFetcher::with(&[
+                labeled_json(HUMAN, POSE),
+                unlabeled_json(MACHINE, RETRAIT),
+            ]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                )
+                .await;
+
+            assert!(
+                refused,
+                "un ticket sans `ready` à l'instant de la promotion ne lance aucun tour"
+            );
+            let w = task(&db, &wrapper).await;
+            assert_eq!(w.status, "expired", "le wrapper reçoit son terminal");
+            assert_eq!(
+                w.result.as_deref(),
+                Some(crate::ready_label::READY_ABSENT_AT_REARM_REASON)
+            );
+            let p = task(&db, &parent).await;
+            assert_eq!(
+                p.status, "failed",
+                "la parente aussi — son créneau d'issue doit se libérer pour le \
+                 prochain oui humain"
+            );
+            assert_eq!(
+                p.result.as_deref(),
+                Some(crate::ready_label::READY_ABSENT_AT_REARM_REASON),
+                "la raison est lisible sur la tâche, pas seulement dans un log"
+            );
+            assert_eq!(
+                audit_reasons(&db).await,
+                vec![crate::ready_label::READY_ABSENT_AT_REARM_REASON.to_string()],
+                "une ligne d'audit, et elle nomme la raison qu'AC1 exige"
+            );
         }
     }
 }
