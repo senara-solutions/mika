@@ -1528,8 +1528,19 @@ impl TaskDispatcher {
     /// le parc seul ne peut pas rendre la moitié « ouvert » qu'AC1 exige.
     ///
     /// Le `token` est ici par le même raisonnement que `machine` : le joint est
-    /// auto-suffisant, et le double `#[cfg(test)] run_gh` canne l'état sans
-    /// qu'un seam de plus soit introduit.
+    /// auto-suffisant, et le double de `run_gh` compilé sous le `cfg` de test
+    /// canne l'état sans qu'un seam de plus soit introduit.
+    ///
+    /// L'attribut de compilation conditionnelle n'est **pas** écrit en toutes
+    /// lettres ici, et ce n'est pas un détail de style :
+    /// `canonical_tokens::tests::production_sources` coupe chaque fichier à sa
+    /// **première** occurrence de ce littéral, doc-comments compris. Un fichier
+    /// qui le nomme avant son vrai module de test voit toute sa production
+    /// disparaître du scan, et les trois gardes d'écrivain unique qui exigent ce
+    /// fichier (`pilot_cost_overrun` mika#2496, `groom_pilot_autofire_stopped`
+    /// mika#2498, le recensement de dispatch mika#2506) rougissent sur leur
+    /// anti-vacuité — « ce scan vise un nom mort ». Mesuré sur `cf1bcee93`,
+    /// dont le doc-comment le nommait.
     async fn skip_deferred_dispatch_on_withdrawn_consent_with(
         &self,
         task: &Task,
