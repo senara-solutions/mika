@@ -137,6 +137,43 @@ pub(crate) fn strip_comment_lines(src: &str) -> String {
         .join("\n")
 }
 
+/// `needle` apparaît-il dans `line` à frontière de mot — à droite toujours,
+/// à gauche seulement si `left` ?
+///
+/// La frontière de droite est la pièce load-bearing, et le cas qui le prouve
+/// vit dans [`crate::parent_rehabilitation`], son premier appelant : la sonde de
+/// `parent_rehabilitation::decide` s'appelle `parent_rehabilitation_decided`,
+/// dont `decided` contient `decide`. Même classe que la frontière de gauche de
+/// mika#1833, qui sortait `per_budget` et `total_budget` de la population de
+/// `budget`.
+///
+/// **Pourquoi `left` est un paramètre et non les deux frontières en dur.** Les
+/// appelants ne cherchent pas la même forme d'aiguille. Un identifiant nu —
+/// `decide`, `budget`, la liaison du tick de mika#3047 — a besoin des deux
+/// frontières : sans celle de gauche, `per_budget` entre dans la population de
+/// `budget`. Un chemin qualifié (`parent_rehabilitation::decide`) n'en a pas
+/// l'usage, parce que ce qui le précède est toujours un `::` ou un début de
+/// ligne, donc jamais un caractère de mot ; le `false` de mika#3044 dit que
+/// cette frontière ne décide rien là, pas qu'on l'écarte. `false` est donc
+/// délibérément laxiste sur un **préfixe de mot** — une aiguille de la forme
+/// `faux_module::fonction` passerait — et c'est le test de ce fichier qui pose
+/// cette limite plutôt que de la laisser découvrir.
+///
+/// Extrait ici plutôt que recopié par garde : c'est la règle écrite de ce module
+/// (« un seul lecteur, pas une copie par garde »), et la classe que
+/// `grooming_marker` a dû graver une fois (mika#2158).
+pub(crate) fn occurs_at_boundary(line: &str, needle: &str, left: bool) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(needle).any(|(at, _)| {
+        let right_ok = !line[at + needle.len()..]
+            .chars()
+            .next()
+            .is_some_and(is_word);
+        let left_ok = !left || !line[..at].chars().next_back().is_some_and(is_word);
+        left_ok && right_ok
+    })
+}
+
 /// Découpe une source Rust en `(nom de fonction, corps)`, commentaires retirés.
 ///
 /// Les gardes structurelles de ce crate posent toutes la même question — *quelle
@@ -370,6 +407,62 @@ fn unrelated() {
             !other.contains("continuation"),
             "la continuation d'un bloc /* */ reste un commentaire : {other}"
         );
+    }
+
+    /// Les deux frontières de [`occurs_at_boundary`], chacune sur le cas réel
+    /// qui l'a rendue nécessaire (mika#3047 vol 2).
+    ///
+    /// Ce test est la raison pour laquelle le prédicat monte ici : il vivait
+    /// dans le `mod tests` de [`crate::parent_rehabilitation`], où un second
+    /// scan ne pouvait pas l'atteindre. Les deux cas ci-dessous ne sont pas
+    /// synthétiques — ce sont les deux faux positifs mesurés que les frontières
+    /// écartent.
+    #[test]
+    fn mika3047_les_deux_frontieres_du_predicat_de_token() {
+        // Frontière de droite — le cas de mika#3044 : la sonde du prédicat
+        // s'appelle `parent_rehabilitation_decided`, et `decided` contient
+        // `decide`.
+        assert!(!occurs_at_boundary(
+            "            event = \"parent_rehabilitation_decided\",",
+            "parent_rehabilitation::decide",
+            false
+        ));
+        assert!(occurs_at_boundary(
+            "    match crate::parent_rehabilitation::decide(db, &task).await {",
+            "parent_rehabilitation::decide",
+            false
+        ));
+
+        // Frontière de gauche — le cas de mika#1833 : `per_budget` et
+        // `total_budget` ne sont pas la population de `budget`.
+        assert!(!occurs_at_boundary("let per_budget = n;", "budget", true));
+        assert!(!occurs_at_boundary("let total_budget = n;", "budget", true));
+        assert!(occurs_at_boundary("let budget = n;", "budget", true));
+
+        // Un `::` n'est pas un caractère de mot, donc la frontière de gauche ne
+        // décide rien sur un chemin qualifié : les deux valeurs de `left`
+        // coïncident sur le site réel.
+        for left in [false, true] {
+            assert!(occurs_at_boundary(
+                "use crate::parent_rehabilitation::decide;",
+                "parent_rehabilitation::decide",
+                left
+            ));
+        }
+
+        // La limite de `left = false`, posée ici plutôt que laissée à
+        // découvrir : un **préfixe de mot** ne ferme pas la population. Aucune
+        // aiguille réelle n'en souffre aujourd'hui, et `true` la fermerait.
+        assert!(occurs_at_boundary(
+            "let d = faux_parent_rehabilitation::decide;",
+            "parent_rehabilitation::decide",
+            false
+        ));
+        assert!(!occurs_at_boundary(
+            "let d = faux_parent_rehabilitation::decide;",
+            "parent_rehabilitation::decide",
+            true
+        ));
     }
 
     #[test]
