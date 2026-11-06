@@ -2026,6 +2026,22 @@ impl TaskEngine {
             self.dispatcher.settings.store_llm_calls || self.dispatcher.settings.store_tool_calls;
         let engine_uptime_seconds = self.started_at.elapsed().as_secs() as i64;
 
+        // mika#3050 D7 — un jeton par PASSE, pas par candidate : résoudre un
+        // jeton d'installation d'App est un appel réseau, et cette boucle tourne
+        // sur N candidates. La résolution vit après le `return` sur file vide,
+        // donc un tick sans candidate ne la paie pas.
+        //
+        // `None` n'est pas une permission : la garde de `rearm_deferred_callback`
+        // le lit comme un refus fail-closed (`rearm_reread_no_token`). C'est
+        // `resolve_github_token` et non `resolve_periodic_scan_token`, comme le
+        // site frère de mika#2995 — la relecture lit un ticket à la demande du
+        // moteur, pas un scan périodique.
+        let github_token = self
+            .dispatcher
+            .settings
+            .resolve_github_token(self.dispatcher.github_app.as_deref())
+            .await;
+
         for candidate in candidates {
             let system_session = format!("system-{}", self.db.agent_id());
 
@@ -2169,6 +2185,8 @@ impl TaskEngine {
                         // reaper acts on a parent, not on a turn. Nothing to
                         // take out of the population.
                         None,
+                        // mika#3050 — resolved once per pass, above the loop.
+                        github_token.as_deref(),
                     )
                     .await
                 }
@@ -2233,6 +2251,46 @@ impl TaskEngine {
                     {
                         warn!(error = %e, "failed to write stuck_pending_task_rearmed audit event");
                     }
+                    continue;
+                }
+                // mika#3050 AC1 — the ticket does not consent any more. The
+                // terminal and the audit line are ALREADY written by the guard
+                // (D6), at the single site that decided it; re-posing them here
+                // would be a second writer for one decision. What belongs to
+                // the caller is what the caller alone owns: the surviving
+                // wrappers. Cancel them, or one promoted later would replay the
+                // very dispatch this refusal just suppressed.
+                RearmOutcome::ConsentWithdrawn { reason } => {
+                    match self
+                        .db
+                        .cancel_deferred_wrappers_of_parent(&candidate.id)
+                        .await
+                    {
+                        Ok(n) if n > 0 => {
+                            info!(
+                                task_id = %candidate.id,
+                                cancelled_wrappers = n,
+                                "mika#3050 : lanceurs différés annulés après un refus de consentement"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                task_id = %candidate.id,
+                                error = %e,
+                                "task_engine_stuck_pending_reaper: failed to cancel surviving wrappers"
+                            );
+                        }
+                    }
+                    info!(
+                        event = "stuck_pending_rearm_refused_consent_withdrawn",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        previous_rearm_count = candidate.rearm_count,
+                        reason,
+                        "mika#3050 : le ticket ne consent plus — parente sortie en terminal, aucun tour mika-dev"
+                    );
                     continue;
                 }
                 RearmOutcome::Unrepairable => {}
@@ -2516,6 +2574,15 @@ impl TaskEngine {
 
         let system_session = format!("system-{}", self.db.agent_id());
 
+        // mika#3050 D7 — même discipline que le reaper : un jeton par passe,
+        // après le `return` sur file vide, et `None` est un refus fail-closed
+        // lu par la garde, jamais une permission.
+        let github_token = self
+            .dispatcher
+            .settings
+            .resolve_github_token(self.dispatcher.github_app.as_deref())
+            .await;
+
         for candidate in candidates {
             // (1) The blocker the refusal named.
             if let Some(ref blocker_id) = candidate.blocking_callback_id {
@@ -2636,6 +2703,8 @@ impl TaskEngine {
                         // mika#2413 — the sweep acts on a parent, not on a
                         // consumed turn: no wrapper to take out.
                         None,
+                        // mika#3050 — resolved once per pass, above the loop.
+                        github_token.as_deref(),
                     )
                     .await
                 }
@@ -2658,6 +2727,45 @@ impl TaskEngine {
                         task_id = %candidate.id,
                         issue = %candidate.reference_url,
                         "stale_blocked_dispatch: parent already represented — nothing to repair"
+                    );
+                }
+                // mika#3050 AC1 — same refusal as the reaper's, and the same
+                // division of labour: the guard has already written the
+                // terminal and the audit line (D6), the caller cancels the
+                // wrappers only it knows about. Note that the parent was put
+                // back to `pending` a few lines above, so the terminal the
+                // guard posed reads `pending` → `failed` — the transition AC1
+                // names, not a `blocked` → `failed` the queue never saw.
+                RearmOutcome::ConsentWithdrawn { reason } => {
+                    match self
+                        .db
+                        .cancel_deferred_wrappers_of_parent(&candidate.id)
+                        .await
+                    {
+                        Ok(n) if n > 0 => {
+                            info!(
+                                task_id = %candidate.id,
+                                cancelled_wrappers = n,
+                                "mika#3050 : lanceurs différés annulés après un refus de consentement"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                task_id = %candidate.id,
+                                error = %e,
+                                "stale_blocked_dispatch: failed to cancel surviving wrappers"
+                            );
+                        }
+                    }
+                    info!(
+                        event = "stale_blocked_rearm_refused_consent_withdrawn",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        previous_rearm_count = candidate.rearm_count,
+                        reason,
+                        "mika#3050 : le ticket ne consent plus — parente sortie en terminal, aucun tour mika-dev"
                     );
                 }
                 RearmOutcome::Rearmed => {
@@ -8166,6 +8274,16 @@ mod tests {
         .unwrap();
     }
 
+    /// Le ticket de la trace du 2026-09-04, décalé dans la bande de fixture.
+    ///
+    /// La trace réelle porte `#2140`. Depuis mika#3050 le ré-armement relit le
+    /// ticket à la forge, donc ce numéro atteint la couture d'appel `gh`
+    /// (mika#2713), qui refuse tout numéro sous `FIXTURE_ISSUE_FLOOR`. Ce que
+    /// ce replay atteste est une **forme** — un bail, un bloqueur terminé, un
+    /// lanceur promu et non consommé — jamais les chiffres du ticket. Le remède
+    /// est le numéro, pas une exemption : il n'y a pas d'allowlist (D8).
+    const ISSUE_2140: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 2140;
+
     /// Seed the shared 2026-09-04 shape. `parent_status` is what separates the
     /// verbatim replay (`failed` — its real state at 03:35:31Z, the instant of
     /// the first sterile turn) from the counterfactual (`blocked` — the same
@@ -8177,6 +8295,15 @@ mod tests {
         blocker_status: &str,
         with_wrapper: bool,
     ) {
+        // mika#3050 — ouvert, portant `ready` : le consentement que ces replays
+        // supposaient avant que la garde existe.
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(ISSUE_2140),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#,
+        );
+        let issue_url = format!("https://github.com/senara-solutions/mika/issues/{ISSUE_2140}");
+
         // The blocking callback the refusal named.
         seed_raw_task(
             db,
@@ -8200,11 +8327,11 @@ mod tests {
             db,
             PARENT_2140,
             None,
-            "ready-label: senara-solutions/mika#2140",
+            &format!("ready-label: senara-solutions/mika#{ISSUE_2140}"),
             "manual",
             parent_status,
             "{}",
-            Some("https://github.com/senara-solutions/mika/issues/2140"),
+            Some(issue_url.as_str()),
             Some("self_dev"),
             Some("issue"),
             Some(&refusal_result_json()),
@@ -8223,12 +8350,7 @@ mod tests {
                 crate::agent::DEFERRED_DISPATCH_LABEL,
                 "callback",
                 "completed",
-                &rebuild_deferred_action_config(
-                    PARENT_2140,
-                    "https://github.com/senara-solutions/mika/issues/2140",
-                    "implement",
-                )
-                .unwrap(),
+                &rebuild_deferred_action_config(PARENT_2140, &issue_url, "implement").unwrap(),
                 None,
                 Some("deferred_dispatch".to_string()).as_deref(),
                 None,
@@ -8541,23 +8663,42 @@ mod tests {
 
     const PARENT_2025: &str = "e7c4e9ad-0000-4000-8000-000000000001";
 
+    /// Le ticket de la forme du 2026-09-19, décalé dans la bande de fixture —
+    /// même raison et même remède qu'[`ISSUE_2140`] : la trace réelle porte
+    /// `#2025`, et ce que cette forme atteste est un siège d'architecte tenu,
+    /// pas les chiffres du ticket.
+    const ISSUE_2025: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 2025;
+
+    fn issue_2025_url() -> String {
+        format!("https://github.com/senara-solutions/mika/issues/{ISSUE_2025}")
+    }
+
     /// The 2026-09-19 shape: `#2025`'s groom parent, `pending`, `groom` class,
     /// with the arch seat held by another groom.
     async fn seed_2413_groom_parent(db: &AsyncDatabase, metadata: Option<&str>) {
+        // mika#3050 — ouvert, portant `ready` : cette forme décrit une parente
+        // dont le consentement tient, et dont le budget n'est pas dépensé.
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(ISSUE_2025),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#,
+        );
         db.with_db({
             let metadata = metadata.map(str::to_string);
+            let label = format!("ready-label: senara-solutions/mika#{ISSUE_2025}");
+            let url = issue_2025_url();
             move |d| {
                 d.conn.execute(
                     "INSERT INTO tasks
                          (id, agent_id, depth, label, trigger_type, action_type,
                           action_config, status, reference_url, source, type,
                           metadata, dispatch_class, created_at, updated_at)
-                     VALUES (?1, 'mika', 0, 'ready-label: senara-solutions/mika#2025',
+                     VALUES (?1, 'mika', 0, ?3,
                              'manual', 'none', '{}', 'pending',
-                             'https://github.com/senara-solutions/mika/issues/2025',
+                             ?4,
                              'self_dev', 'issue', ?2, 'groom',
                              '2026-09-19T18:55:00Z', '2026-09-19T18:55:00Z')",
-                    rusqlite::params![PARENT_2025, metadata],
+                    rusqlite::params![PARENT_2025, metadata, label, url],
                 )?;
                 Ok(())
             }
@@ -8568,12 +8709,8 @@ mod tests {
 
     /// One deferred wrapper of `#2025`'s parent, in a chosen status.
     async fn seed_2413_wrapper(db: &AsyncDatabase, id: &str, status: &str) {
-        let config = rebuild_deferred_action_config(
-            PARENT_2025,
-            "https://github.com/senara-solutions/mika/issues/2025",
-            "groom",
-        )
-        .unwrap();
+        let config =
+            rebuild_deferred_action_config(PARENT_2025, &issue_2025_url(), "groom").unwrap();
         db.with_db({
             let (id, status) = (id.to_string(), status.to_string());
             move |d| {
