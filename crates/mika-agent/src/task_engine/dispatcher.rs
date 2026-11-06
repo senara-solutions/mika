@@ -722,13 +722,25 @@ pub struct TaskDispatcher {
 }
 
 /// Ce qu'une relecture du consentement `ready` a produit (mika#2995, tranche
-/// du 2026-11-03).
+/// du 2026-11-03 ; élargi par mika#3050).
 ///
-/// Cinq issues, cinq noms. Les deux premières dispatchent, les trois autres
-/// non — et parmi celles-là, une seule écrit un terminal. L'enum existe pour
+/// Huit issues, huit noms. Les deux premières dispatchent, les six autres
+/// non — et parmi celles-là, trois écrivent un terminal. L'enum existe pour
 /// que cette asymétrie soit lisible au site de décision plutôt que répartie
 /// dans des `bool` imbriqués, exactement comme `BuildCallbackHead` le fait pour
 /// mika#2671.
+///
+/// # Deux prédicats, et pourquoi leurs refus ne se fondent pas
+///
+/// La garde consulte deux lecteurs : le **parc** de la timeline (qui a retiré
+/// `ready`, et quand) puis, seulement sur son verdict de non-park, l'**état** du
+/// ticket à la forge (ouvert ? portant `ready` ?). Chacun porte ses propres
+/// variantes de refus, et aucune n'est partagée : un retrait humain est
+/// simultanément un park *et* un `ready` absent, donc fondre les deux ferait
+/// tomber le compte de mika#2995 à zéro sans qu'aucune régression ait eu lieu —
+/// deux populations sous un nom ne se soustraient pas (mika#2205). L'ordre
+/// décide sous quelle raison la population est comptée, et il est fixé :
+/// **le parc d'abord** (mika#3050 D1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WithdrawnConsentVerdict {
     /// AC-T3 — parente absente, ou label hors du préfixe `ready-label:`
@@ -752,6 +764,51 @@ enum WithdrawnConsentVerdict {
     /// un jeton absent est une panne de configuration, une timeline illisible
     /// est une panne d'API, et les deux remédiations n'ont rien en commun.
     NoToken,
+    /// mika#3050 — le parc rend « non parqué », mais le ticket ne porte plus
+    /// `ready`. La forme de `0529ed9b`/#3044 : depuis mika#3022 une identité
+    /// **machine** retire `ready` à chaque merge de la boucle, donc le prédicat
+    /// de parc rend `Ok(None)` et le tour partait. Terminal, sous
+    /// `READY_ABSENT_AT_REARM_REASON`.
+    ReadyAbsentAtPromotion,
+    /// mika#3050 — le parc rend « non parqué », mais le ticket est fermé. L'état
+    /// est le seul des deux prédicats qui puisse le dire : la timeline de
+    /// `ready` ne porte pas `state`. Terminal, sous
+    /// `ISSUE_CLOSED_AT_REARM_REASON`.
+    IssueClosedAtPromotion,
+    /// mika#3050 — la relecture d'**état** n'a pas abouti. Report, **jamais**
+    /// terminal : c'est l'asymétrie D4 du module (`ready_label.rs:69`)
+    /// transposée mot pour mot. Un faux négatif coûte un tick de latence ; un
+    /// faux positif terminal tuerait une parente consentante sur une panne
+    /// d'API. Variante distincte de [`Self::TimelineUnreadable`], parce qu'une
+    /// panne du lecteur d'état et une panne du lecteur de timeline ne se
+    /// remédient pas au même endroit.
+    StateUnreadable { detail: String },
+}
+
+impl WithdrawnConsentVerdict {
+    /// Le nom du verdict dans la ligne de recensement `promotion_consent_checked`.
+    ///
+    /// Exhaustif et sans bras `_` : une neuvième variante ne doit pas pouvoir
+    /// hériter en silence du nom d'une huitième, qui est exactement comment un
+    /// recensement se met à compter deux populations sous un libellé
+    /// (mika#2205). Même contrat que l'`as_str()` de
+    /// [`crate::ready_label::RearmConsentCensus`], et les noms des trois
+    /// verdicts d'état disent **`_at_promotion`** plutôt que de reprendre les
+    /// motifs d'audit `*_at_rearm` : ces derniers sont des constantes dont le
+    /// site de définition est unique (D3 de `ready_label.rs`), et les recopier
+    /// ici en littéral en ouvrirait un second.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAReadyLabelParent => "not_a_ready_label_parent",
+            Self::ConsentHeld => "consent_held",
+            Self::ConsentWithdrawn { .. } => "consent_withdrawn",
+            Self::TimelineUnreadable { .. } => "timeline_unreadable",
+            Self::NoToken => "no_token",
+            Self::ReadyAbsentAtPromotion => "ready_absent_at_promotion",
+            Self::IssueClosedAtPromotion => "issue_closed_at_promotion",
+            Self::StateUnreadable { .. } => "state_unreadable",
+        }
+    }
 }
 
 /// La parente `ready-label:` d'un wrapper différé, et l'issue dont elle porte
@@ -1524,26 +1581,62 @@ impl TaskDispatcher {
 
     /// Applique le verdict : `true` quand le dispatch est refusé.
     ///
-    /// Trois des cinq issues ne dispatchent pas, et **une seule écrit un
+    /// Six des huit issues ne dispatchent pas, et **trois seulement écrivent un
     /// terminal**. L'asymétrie est la décision du § 6 du plan : une lecture qui
     /// échoue ne doit ni lancer un tour (ce serait le défaut mesuré, rouvert)
     /// ni graver un terminal (ce serait l'autre faux positif). Un faux négatif
     /// coûte un tick de 10 minutes ; un faux positif coûte ~600 k tokens Opus
     /// et casse un STOP opérateur.
+    ///
+    /// # L'écrivain unique du recensement (mika#3050 § 3)
+    ///
+    /// Cette fonction est **le seul site** qui émet `promotion_consent_checked`,
+    /// et elle l'émet **avant** le `match`, donc inconditionnellement : les huit
+    /// branches passent par cette ligne, branche saine comprise. C'est ce qui
+    /// donne au recensement son dénominateur — un compte d'anomalies seules n'en
+    /// a pas (mika#1833, mika#1926). C'est aussi le seul point du dispatcher que
+    /// **toutes** les branches traversent : le joint y aboutit sur ses sept
+    /// verdicts, et le site de production y entre directement pour son huitième
+    /// (`NoToken`, qui naît avant le joint).
+    ///
+    /// Le nom est neuf plutôt qu'emprunté à `rearm_consent_checked` (vol 2,
+    /// `executor.rs`) : cette enveloppe-là rend un `RearmOutcome` là où la garde
+    /// rend un `bool`, et un second émetteur rendrait le compte du vol 2
+    /// illisible. Deux populations, deux instruments — la même raison qui
+    /// interdit de partager le motif de refus interdit de partager le nom de la
+    /// sonde.
     async fn apply_withdrawn_consent_verdict(
         &self,
         task: &Task,
         parent: Option<&ReadyLabelParent>,
         verdict: WithdrawnConsentVerdict,
     ) -> bool {
-        use crate::ready_label::{READY_CONSENT_RECHECK_TOOL_NAME, READY_CONSENT_WITHDRAWN_REASON};
+        use crate::ready_label::{
+            ISSUE_CLOSED_AT_REARM_REASON, READY_ABSENT_AT_REARM_REASON,
+            READY_CONSENT_WITHDRAWN_REASON,
+        };
 
-        // Les quatre verdicts qui ne sont pas `NotAReadyLabelParent` portent une
+        // Les sept verdicts qui ne sont pas `NotAReadyLabelParent` portent une
         // parente par construction de l'appelant — même idiome que le
         // `events.last().expect("is_parked is false on an empty set")` du
         // prédicat qu'ils consomment.
         let expect_parent =
             || parent.expect("seul NotAReadyLabelParent peut naître sans parente `ready-label:`");
+
+        info!(
+            target: "mika::otel",
+            event = "promotion_consent_checked",
+            agent_id = %self.db.agent_id(),
+            task_id = %task.id,
+            verdict = verdict.as_str(),
+            // `Option` et non une valeur de repli : sur `NotAReadyLabelParent`
+            // les trois champs doivent être **absents** du log, pas vides. `""`
+            // et `0` ont la forme d'une réponse sans en être une, et un `jq` qui
+            // les agrège ne s'en aperçoit pas (mika#2331).
+            parent_task_id = parent.map(|p| p.id.as_str()),
+            repo = parent.map(|p| p.repo.as_str()),
+            issue = parent.map(|p| p.issue),
+        );
 
         match verdict {
             WithdrawnConsentVerdict::NotAReadyLabelParent
@@ -1566,68 +1659,44 @@ impl TaskDispatcher {
                     "mika#2995: `ready` a été retiré par un acteur non machine — aucun tour \
                      LLM, aucun dispatch. Reposez `ready` à la main pour relancer le ticket."
                 );
-
-                // Le wrapper d'abord : il est `completed` (il vient d'être
-                // promu), donc l'UPDATE gardé de `mark_deferred_wrapper_noop`
-                // s'applique. `expired` est le mot de mika#2169 pour « le tour a
-                // eu lieu et n'a rien dispatché » — ici il n'a même pas eu lieu,
-                // ce qui est strictement moins, et aucun sixième statut n'est
-                // inventé pour la nuance.
-                self.record_wrapper_noop(&task.id, READY_CONSENT_WITHDRAWN_REASON)
+                self.write_promotion_consent_terminal(task, parent, READY_CONSENT_WITHDRAWN_REASON)
                     .await;
+                true
+            }
 
-                // Puis la parente. **Le terminal n'est pas un verrou sur le
-                // ticket, il est la condition pour que le prochain « oui »
-                // humain soit pris** : `idx_tasks_manual_active_ref_url` exclut
-                // les statuts terminaux, donc une parente laissée `pending`
-                // garderait le créneau de l'issue occupé et un `labeled ready`
-                // reposé ensuite échouerait à créer sa tâche.
-                match self
-                    .db
-                    .update_task_failed(&parent.id, READY_CONSENT_WITHDRAWN_REASON)
-                    .await
-                {
-                    Ok(true) => {
-                        let trace_id = mika_common::trace::generate_trace_id();
-                        if let Err(e) = self
-                            .db
-                            .log_audit_event(
-                                &format!("system-{}", parent.agent_id),
-                                READY_CONSENT_RECHECK_TOOL_NAME,
-                                &parent.id,
-                                Some("pending"),
-                                Some("failed"),
-                                Some(READY_CONSENT_WITHDRAWN_REASON),
-                                Some(&trace_id),
-                            )
-                            .await
-                        {
-                            warn!(
-                                parent_task_id = %parent.id,
-                                error = %e,
-                                "mika#2995: ligne d'audit de relecture de consentement non écrite"
-                            );
-                        }
-                    }
-                    Ok(false) => {
-                        debug!(
-                            parent_task_id = %parent.id,
-                            "mika#2995: parente déjà terminale — terminal de relecture sauté"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            parent_task_id = %parent.id,
-                            error = %e,
-                            "mika#2995: terminal de la parente non écrit"
-                        );
-                    }
-                }
+            // Les deux refus d'état n'ont **pas** de ligne de diagnostic à eux :
+            // le recensement émis ci-dessus porte déjà leur verdict, leurs
+            // coordonnées et leur parente, et la ligne d'audit en base porte la
+            // raison qu'AC1 nomme. Un troisième nom d'événement ici serait un
+            // nom de la famille de la relecture de consentement, donc une
+            // quatrième entrée au détecteur D3 — pour une information déjà
+            // portée deux fois.
+            WithdrawnConsentVerdict::ReadyAbsentAtPromotion => {
+                self.write_promotion_consent_terminal(
+                    task,
+                    expect_parent(),
+                    READY_ABSENT_AT_REARM_REASON,
+                )
+                .await;
+                true
+            }
+
+            WithdrawnConsentVerdict::IssueClosedAtPromotion => {
+                self.write_promotion_consent_terminal(
+                    task,
+                    expect_parent(),
+                    ISSUE_CLOSED_AT_REARM_REASON,
+                )
+                .await;
                 true
             }
 
             WithdrawnConsentVerdict::TimelineUnreadable { cause, detail } => {
                 Self::defer_consent_recheck(task, expect_parent(), cause, &detail);
+                true
+            }
+            WithdrawnConsentVerdict::StateUnreadable { detail } => {
+                Self::defer_consent_recheck(task, expect_parent(), "state", &detail);
                 true
             }
             WithdrawnConsentVerdict::NoToken => {
@@ -1638,6 +1707,77 @@ impl TaskDispatcher {
                     "aucun jeton GitHub résolu (resolve_github_token)",
                 );
                 true
+            }
+        }
+    }
+
+    /// Le terminal des trois refus de la garde : wrapper en no-op, parente
+    /// `failed`, une ligne d'audit qui nomme la raison.
+    ///
+    /// Extrait du bras `ConsentWithdrawn` par mika#3050 plutôt que recopié deux
+    /// fois : les trois refus ne diffèrent que par leur **raison**, et c'est
+    /// exactement la forme qu'une copie rate au premier élargissement
+    /// (mika#2158). La raison reste le paramètre, jamais une valeur par défaut :
+    /// c'est elle qui garde les trois populations soustractables (mika#2205).
+    async fn write_promotion_consent_terminal(
+        &self,
+        task: &Task,
+        parent: &ReadyLabelParent,
+        reason: &str,
+    ) {
+        use crate::ready_label::READY_CONSENT_RECHECK_TOOL_NAME;
+
+        // Le wrapper d'abord : il est `completed` (il vient d'être promu), donc
+        // l'UPDATE gardé de `mark_deferred_wrapper_noop` s'applique. `expired`
+        // est le mot de mika#2169 pour « le tour a eu lieu et n'a rien
+        // dispatché » — ici il n'a même pas eu lieu, ce qui est strictement
+        // moins, et aucun sixième statut n'est inventé pour la nuance.
+        self.record_wrapper_noop(&task.id, reason).await;
+
+        // Puis la parente. **Le terminal n'est pas un verrou sur le ticket, il
+        // est la condition pour que le prochain « oui » humain soit pris** :
+        // `idx_tasks_manual_active_ref_url` exclut les statuts terminaux, donc
+        // une parente laissée `pending` garderait le créneau de l'issue occupé
+        // et un `labeled ready` reposé ensuite échouerait à créer sa tâche.
+        match self.db.update_task_failed(&parent.id, reason).await {
+            Ok(true) => {
+                let trace_id = mika_common::trace::generate_trace_id();
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &format!("system-{}", parent.agent_id),
+                        // Le nom de l'outil est celui de la **promotion**, pour
+                        // les trois raisons : `REARM_CONSENT_RECHECK_TOOL_NAME`
+                        // nomme un ré-armement refusé 45 min plus tard, et c'est
+                        // une autre population (mika#2205).
+                        READY_CONSENT_RECHECK_TOOL_NAME,
+                        &parent.id,
+                        Some("pending"),
+                        Some("failed"),
+                        Some(reason),
+                        Some(&trace_id),
+                    )
+                    .await
+                {
+                    warn!(
+                        parent_task_id = %parent.id,
+                        error = %e,
+                        "mika#2995: ligne d'audit de relecture de consentement non écrite"
+                    );
+                }
+            }
+            Ok(false) => {
+                debug!(
+                    parent_task_id = %parent.id,
+                    "mika#2995: parente déjà terminale — terminal de relecture sauté"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    parent_task_id = %parent.id,
+                    error = %e,
+                    "mika#2995: terminal de la parente non écrit"
+                );
             }
         }
     }

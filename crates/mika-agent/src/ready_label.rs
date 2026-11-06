@@ -2150,7 +2150,7 @@ fn lit_seulement(labels: &[String]) -> bool {
     /// allowlist qui se remplit (mika#2309).
     const CONSENT_RECHECK_NAME_EXCEPTIONS: &[(&str, &str, &str)] = &[];
 
-    /// Les quatre noms de la relecture de consentement, et le fichier qui
+    /// Les sept noms de la relecture de consentement, et le fichier qui
     /// porte leur site unique.
     ///
     /// Les deux premiers sont les constantes d'AC-T4 au sens littéral — le
@@ -2160,6 +2160,16 @@ fn lit_seulement(labels: &[String]) -> bool {
     /// `deferred_dispatch_consent_recheck_deferred` rendrait son compte
     /// illisible exactement comme un second site du motif rendrait le terminal
     /// ambigu.
+    ///
+    /// Les trois derniers sont la part de mika#3050, qui a doté le site de
+    /// **promotion** du prédicat d'état (ticket ouvert, et portant `ready`) :
+    /// sa ligne de recensement, et les deux motifs d'audit de ses deux refus
+    /// terminaux. Ces deux motifs sont les constantes du vol 1 — le site de
+    /// promotion les consomme **par la constante** et n'en écrit aucun littéral,
+    /// donc la déclaration vaut « le `const` de ce module est leur seul site ».
+    /// Les y déclarer est la disposition du § 5 du plan : ne pas le faire
+    /// laisserait D3 se rendormir sur une population incomplète, le mode de
+    /// mensonge que son propre doc-comment nomme.
     const CONSENT_RECHECK_NAMES: &[(&str, &str)] = &[
         (READY_CONSENT_WITHDRAWN_REASON, "ready_label.rs"),
         (READY_CONSENT_RECHECK_TOOL_NAME, "ready_label.rs"),
@@ -2171,6 +2181,9 @@ fn lit_seulement(labels: &[String]) -> bool {
             "deferred_dispatch_consent_recheck_deferred",
             "task_engine/dispatcher.rs",
         ),
+        ("promotion_consent_checked", "task_engine/dispatcher.rs"),
+        (READY_ABSENT_AT_REARM_REASON, "ready_label.rs"),
+        (ISSUE_CLOSED_AT_REARM_REASON, "ready_label.rs"),
     ];
 
     /// Les lignes de production de `rel` où `nom` apparaît **comme littéral de
