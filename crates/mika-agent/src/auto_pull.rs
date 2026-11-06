@@ -1445,6 +1445,14 @@ pub fn classify_promotion(
                 }
                 // Le ticket porte déjà `ready`. mika#2837 inchangé : c'est
                 // ainsi que part le vol suivant d'un ticket à plusieurs vols.
+                //
+                // mika#3047 — « porte déjà `ready` » est ce que la **liste du
+                // tick** dit, et c'est ce qui a dispatché #3044 sans
+                // consentement : au merge, le retrait de `ready` par mika#3022
+                // et cette promotion se sont croisés à 163 ms. Cette fonction
+                // garde sa décision, qui porte sur une branche ; c'est la phase
+                // 2 qui relit le label juste avant de dispatcher
+                // (`gh_reread_issue_at_dispatch`).
                 ExclusionPhase::Phase1Pull | ExclusionPhase::Phase2StuckReady => {
                     PromotionGate::Promote {
                         detail: "branch_deleted_by_merged_pr",
@@ -1944,6 +1952,45 @@ const FILTER_EGRESS_DOWN: &str = "egress_relay_down";
 /// `below_threshold` / [`FILTER_NO_READY_LABEL_EVENT`] (mika#2131) et
 /// `in_flight_self_dev` / [`FILTER_LIVE_PILOT`] (mika#2279) ont déjà dû payer.
 const FILTER_LAUNCHER_BRAKED: &str = "pilot_launcher_braked";
+
+/// `ready` avait disparu de la forge à l'instant du dispatch (mika#3047 AC1).
+///
+/// **Le succès de mika#3047, et le numérateur de sa sonde AC4.** La course a eu
+/// lieu — `ready` retiré entre la liste du tick et le dispatch — et la garde a
+/// mordu : aucun dispatch préparé, aucune parente créée, et surtout aucun churn
+/// (voir le site d'appel). Le défaut mesuré le 2026-11-05 au merge de #3045
+/// s'inscrit ici au lieu de produire un `dev-pilot`.
+///
+/// Nom distinct de [`FILTER_READY_PARKED`], qui décrit le même label absent :
+/// celui-là est un **parc** mesuré sur la timeline, décidé avant la mesure
+/// d'âge, et son remède est un geste d'opérateur. Celui-ci est une **course**
+/// gagnée à l'instant du dispatch, et son remède est qu'il n'y a rien à faire.
+const FILTER_READY_ABSENT_AT_DISPATCH: &str = "ready_absent_at_dispatch";
+
+/// Le ticket avait été fermé à l'instant du dispatch (mika#3047 AC1).
+///
+/// Distinct du précédent bien que les deux rendent le même « pas de dispatch » :
+/// un ticket fermé n'attend rien de la boucle, tandis qu'un `ready` retiré peut
+/// revenir au prochain geste d'opérateur. Et surtout, c'est la population sur
+/// laquelle **rien ne doit être écrit** : un commentaire ou un label posé sur un
+/// ticket fermé est la forme exacte de la fuite mika#2713 (29 commentaires et un
+/// `operator-gated` sur le #2636 fermé).
+const FILTER_ISSUE_CLOSED_AT_DISPATCH: &str = "issue_closed_at_dispatch";
+
+/// La relecture d'état n'a pas pu répondre (mika#3047 AC2, fail-closed).
+///
+/// Troisième nom et non une fusion dans l'un des deux précédents : c'est une
+/// **panne de forge**, pas un état du ticket. Un compte qui ne décroît pas nomme
+/// une panne à traiter à sa source, pas un ticket à filtrer plus fort — et fondu
+/// dans `ready_absent_at_dispatch` il gonflerait le numérateur de la sonde AC4
+/// de refus qui ne sont pas des courses gagnées, rendant les deux populations
+/// non soustractables (mika#2205).
+///
+/// Il couvre les trois formes de « on ne sait pas lire » : le `gh` en échec, le
+/// JSON illisible, et le champ absent ou inconnu. Voir
+/// [`gh_reread_issue_at_dispatch`] pour pourquoi un champ absent ne prend pas
+/// son défaut (mika#2331).
+const FILTER_DISPATCH_REREAD_FAILED: &str = "dispatch_reread_failed";
 
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
@@ -5593,6 +5640,130 @@ fn churn_is_moot(action: &VerdictAction, engine_holds_ticket: bool) -> bool {
     !matches!(action, VerdictAction::Dispatched { .. }) && engine_holds_ticket
 }
 
+// ───── La relecture d'état juste avant le dispatch (mika#3047) ─────
+
+/// Ce que la forge répond quand on relit un ticket juste avant de le dispatcher.
+///
+/// Trois états, parce que trois remèdes — et un quatrième que ce type ne porte
+/// pas : la relecture en erreur, qui est le `Err` du `Result` et non une
+/// variante. Une panne de forge n'est pas un état du ticket.
+#[derive(Debug)]
+enum DispatchReread {
+    /// Ouvert, et portant `ready` : la lecture fraîche, celle qu'on dispatche.
+    Ready(Issue),
+    /// Ouvert, mais `ready` a disparu depuis la liste du tick.
+    ReadyAbsent,
+    /// Fermé depuis la liste du tick.
+    Closed,
+}
+
+/// L'état **frais** d'un ticket, relu à la forge juste avant le dispatch en
+/// processus (mika#3047 AC1).
+///
+/// # Pourquoi cette lecture existe
+///
+/// La phase 2 décide sur la liste d'`issues` lue une fois par tick (l. 3031) et
+/// agit sur la forge. Le 2026-11-05 au merge de #3045, `ready` a été retiré à
+/// 14:10:05.646Z par le nettoyage de mika#3022 et un `dev-pilot` a été préparé
+/// 163 ms plus tard, sur la copie du tick : un dispatch sans consentement, que
+/// seul le refus `dispatch_no_grooming_marker` a arrêté — et il l'a gagné d'une
+/// course de 184 µs. C'est cette copie que cette fonction remplace.
+///
+/// # Ce qu'elle demande, et pourquoi quatre champs
+///
+/// Elle mire [`gh_issue_body`] jusqu'au traitement du `status` non nul, à deux
+/// différences près. Pas de `-q` : les quatre champs sont parsés en Rust, parce
+/// que la **décision** a besoin de `state` et de `labels`, et que le **dispatch**
+/// a besoin de `body` et de `labels`.
+///
+/// `updatedAt` est demandé bien que personne ne le lise ici : l'[`Issue`] rendue
+/// est une `Issue` entière, pas une `Issue` à un champ vide. Un `updated_at: ""`
+/// serait un champ qui mente à son prochain lecteur (mika#2331), pour un coût
+/// nul.
+///
+/// # Fail-closed, champ par champ
+///
+/// `gh` rend `"OPEN"` ou `"CLOSED"` ; la comparaison est insensible à la casse,
+/// et **toute autre valeur** — champ absent, JSON illisible, `state` inconnu —
+/// rend `Err`, jamais [`DispatchReread::Ready`]. Une valeur qu'on ne sait pas
+/// lire n'est pas « ouvert ».
+///
+/// Les trois autres champs sont **exigés** eux aussi, et c'est la doctrine
+/// mika#2131 plutôt que de la prudence en plus : un `labels` absent a bien un
+/// défaut fail-closed — vide, donc pas de `ready` — mais il s'inscrirait au
+/// ledger sous `ready_absent_at_dispatch`, le nom d'une course gagnée. Une panne
+/// de forge comptée comme un succès de la garde, c'est la sonde AC4 qui mesure
+/// le contraire de ce qu'elle croit. L'absence n'est pas un zéro (mika#2331) :
+/// elle a son propre nom, `dispatch_reread_failed`.
+async fn gh_reread_issue_at_dispatch(github_token: &str, n: u64) -> Result<DispatchReread> {
+    let output = run_gh(
+        github_token,
+        GhSubject::Issue(n),
+        &[
+            "issue",
+            "view",
+            &n.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--json",
+            "state,labels,body,updatedAt",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh issue view --json state,labels,body,updatedAt failed for #{}: {}",
+            n,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw: serde_json::Value = serde_json::from_str(&stdout)?;
+
+    let state = raw["state"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh issue view returned no `state` for #{n}"))?;
+    if state.eq_ignore_ascii_case("CLOSED") {
+        return Ok(DispatchReread::Closed);
+    }
+    if !state.eq_ignore_ascii_case("OPEN") {
+        return Err(anyhow!(
+            "gh issue view returned an unknown `state` for #{n}: {state:?}"
+        ));
+    }
+
+    let labels: Vec<IssueLabel> = raw["labels"]
+        .as_array()
+        .ok_or_else(|| anyhow!("gh issue view returned no `labels` array for #{n}"))?
+        .iter()
+        .filter_map(|l| {
+            l["name"].as_str().map(|name| IssueLabel {
+                name: name.to_string(),
+            })
+        })
+        .collect();
+    if !labels.iter().any(|l| l.name == "ready") {
+        return Ok(DispatchReread::ReadyAbsent);
+    }
+
+    let body = raw["body"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh issue view returned no `body` for #{n}"))?
+        .to_string();
+    let updated_at = raw["updatedAt"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh issue view returned no `updatedAt` for #{n}"))?
+        .to_string();
+
+    Ok(DispatchReread::Ready(Issue {
+        number: n,
+        body,
+        labels,
+        updated_at,
+    }))
+}
+
 /// mika#2470 — dispatch a rescued ticket by a **direct, in-process** call of the
 /// ready-label handler. The webhook channel may be dead: nothing here depends
 /// on it.
@@ -5600,10 +5771,20 @@ fn churn_is_moot(action: &VerdictAction, engine_holds_ticket: bool) -> bool {
 /// This is the handler the gateway's `labeled ready` event reaches — its fifteen
 /// gates (repo allowlist, live pilot, egress relay, seat, held, groomed →
 /// `dev-pilot` / not → `dev-groom`, slot and deferral, spawn) apply unchanged,
-/// by construction rather than by copy (D1). The issue body and labels the tick
-/// has already read are handed in as the injected fetcher (D2): no `gh issue
-/// view` per rescue, and the handler decides on the **same snapshot** the
-/// Phase 2 filters just used to call the ticket eligible.
+/// by construction rather than by copy (D1). The issue body and labels are
+/// handed in as the injected fetcher (D2), so the handler runs no `gh issue
+/// view` of its own.
+///
+/// **Quelle `Issue` arrive ici, et ce que mika#3047 y a changé.** La phase 2
+/// passait la copie du tick — un snapshot pouvant dater de plusieurs secondes,
+/// et c'était le défaut : un ticket dont `ready` venait d'être retiré se
+/// dispatchait quand même. Elle passe désormais la lecture **fraîche** de
+/// [`gh_reread_issue_at_dispatch`], relue à la forge juste avant cet appel. La
+/// propriété recherchée en mika#2470 — zéro `gh issue view` par secours —
+/// s'achetait sur le consentement ; cet appel coûte une lecture par dispatch
+/// **tenté**, borné par `MAX_STUCK_RESCUE_PER_TICK`, et c'est ce coût qui achète
+/// le consentement. La signature est inchangée : la fonction prend toujours un
+/// `&Issue`, elle ne décide pas lequel.
 async fn dispatch_rescued_ticket_in_process(
     db: &AsyncDatabase,
     ctx: &DirectDispatchCtx<'_>,
@@ -6057,10 +6238,16 @@ async fn phase2_reconcile_stuck_ready(
         // owed a real case, but it now waits with a **count** rather than an
         // argument. See the `stale_branch_without_plan` reading rule in
         // `docs/operator/environment-variables.md` for the query and its halts.
-        // The issue is needed twice below — for the staleness gate and for the
-        // in-process dispatch (its body and labels are the injected fetcher).
-        // Without it we can neither decide nor dispatch, and churning the label
-        // without dispatching is exactly the defect of mika#2470: skip, loudly.
+        // The issue is needed below for the staleness gate, which decides on the
+        // branch callout the tick read. Without it we cannot decide, and
+        // churning the label without dispatching is exactly the defect of
+        // mika#2470: skip, loudly.
+        //
+        // mika#3047 — ce n'est plus cette copie qui part au dispatch : la
+        // relecture fraîche de `gh_reread_issue_at_dispatch` la remplace, plus
+        // bas. Le gate de staleness garde la copie du tick, et c'est correct :
+        // il mesure une branche, pas un consentement, et son propre mécanisme de
+        // péremption est la réécriture de callout de mika#2839.
         let Some(issue) = issues.iter().find(|i| i.number == n) else {
             warn!(
                 issue = n,
@@ -6089,8 +6276,74 @@ async fn phase2_reconcile_stuck_ready(
         // back, under the tick's trace_id, so `SELECT after_value, count(*) …
         // GROUP BY 1` answers "how many rescues actually dispatched" (D5).
         attempted += 1;
+
+        // mika#3047 — la relecture d'état, **dernier** contrôle avant le
+        // dispatch, et sur la forge plutôt que sur la copie du tick.
+        //
+        // Placée APRÈS `attempted += 1` exprès : c'est un contrôle du dispatch,
+        // donc il est borné par le même budget que lui — au plus
+        // `MAX_STUCK_RESCUE_PER_TICK` lectures par tick, quoi que fasse la
+        // forge. Avant l'incrément, une forge qui répond mal ferait une lecture
+        // par candidat et par tick, sans borne autre que la taille du vivier :
+        // le coût caché que le commentaire ci-dessus refuse déjà pour la chaîne
+        // de readiness du handler, et la relecture est de la même classe.
+        //
+        // Les trois refus `continue` **ici**, donc avant le churn des l. ci-
+        // dessous, et cette moitié est celle qui compte :
+        //
+        // - sur `ready_absent_at_dispatch`, re-poser `ready` serait se rendre le
+        //   consentement qu'on vient de rendre — ce que la phase 0 refuse depuis
+        //   mika#3036 sous `ConsentReturnedByMerge`. Le défaut serait alors pire
+        //   qu'avant ce vol : non plus un dispatch sans consentement, mais un
+        //   consentement fabriqué par la boucle ;
+        // - sur `issue_closed_at_dispatch`, toute écriture part vers un ticket
+        //   fermé (la forme de la fuite mika#2713).
+        //
+        // Un refus ne touche donc ni `rescued`, ni le budget de re-drive, ni le
+        // compteur d'échecs : il n'y a pas eu d'échec, il y a eu une décision.
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(DispatchReread::Ready(fresh)) => fresh,
+            Ok(DispatchReread::ReadyAbsent) => {
+                warn!(
+                    issue = n,
+                    "auto_pull: `ready` a disparu entre la liste du tick et le \
+                     dispatch ; aucun dispatch préparé (mika#3047)"
+                );
+                ledger.record(
+                    ExclusionPhase::Phase2StuckReady,
+                    n,
+                    FILTER_READY_ABSENT_AT_DISPATCH,
+                );
+                continue;
+            }
+            Ok(DispatchReread::Closed) => {
+                info!(
+                    issue = n,
+                    "auto_pull: ticket fermé entre la liste du tick et le \
+                     dispatch ; aucun dispatch préparé, aucune écriture (mika#3047)"
+                );
+                ledger.record(
+                    ExclusionPhase::Phase2StuckReady,
+                    n,
+                    FILTER_ISSUE_CLOSED_AT_DISPATCH,
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: la relecture d'état avant dispatch a échoué ; fail-closed, aucun dispatch (mika#3047)");
+                ledger.record(
+                    ExclusionPhase::Phase2StuckReady,
+                    n,
+                    FILTER_DISPATCH_REREAD_FAILED,
+                );
+                continue;
+            }
+        };
+
+        // AC3 — c'est `fresh`, et non la copie du tick, que le fetcher injecté
+        // rend au handler.
         let action =
-            dispatch_rescued_ticket_in_process(db, ctx, issue, github_token, trace_id, session_id)
+            dispatch_rescued_ticket_in_process(db, ctx, &fresh, github_token, trace_id, session_id)
                 .await;
         let action_label = direct_dispatch_action_label(&action);
         let task_id = match &action {
@@ -8202,8 +8455,14 @@ This ticket has been GROOMED and is ready.
         let end = body.find("\n}\n").expect("function body must close");
         let body = &body[..end];
 
+        // mika#3047 — l'aiguille se resserre : l'argument ne s'appelle plus
+        // `issue` mais `&fresh`, la lecture relue à la forge. Le resserrement
+        // est un gain, pas une concession : ce scan garde un **ordre** (le
+        // dispatch précède le churn), jamais le nom d'une variable locale, et
+        // une aiguille qui épingle ce nom est stale au premier renommage sans
+        // que la propriété ait bougé.
         let dispatch = body
-            .find("dispatch_rescued_ticket_in_process(db, ctx, issue")
+            .find("dispatch_rescued_ticket_in_process(db, ctx, ")
             .expect("Phase 2 must dispatch in-process (mika#2470 R1)");
         let churn = body
             .find("gh_remove_label(label_auth, n, \"ready\")")
@@ -10288,6 +10547,15 @@ This ticket has been GROOMED and is ready.
             EmptyBacklogCause::InFlightUnreadable.event_name(),
             EVENT_IN_FLIGHT_UNREADABLE
         );
+        // mika#3047 — les trois noms de la relecture avant dispatch, dans le
+        // MÊME test de wire-format que leurs quatorze aînés et pour la raison du
+        // commentaire de mika#2161 ci-dessus. Les deux premiers sont les chaînes
+        // qu'AC1 nomme à l'octet : les renommer casserait la sonde AC4, dont le
+        // numérateur est le compte de `ready_absent_at_dispatch`.
+        assert_eq!(FILTER_READY_ABSENT_AT_DISPATCH, "ready_absent_at_dispatch");
+        assert_eq!(FILTER_ISSUE_CLOSED_AT_DISPATCH, "issue_closed_at_dispatch");
+        assert_eq!(FILTER_DISPATCH_REREAD_FAILED, "dispatch_reread_failed");
+
         assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
         // mika#2361 — the audit `tool_name`s are wire format too: an operator
         // greps them by hand, so a rename silently empties their query.
@@ -11878,6 +12146,438 @@ This ticket has been GROOMED and is ready.
              Un journal vide ici veut dire que la couture n'est plus sur ce \
              chemin : l'appel est reparti vers la forge réelle. Appels vus \
              pour #{n} : {mine:?}"
+        );
+    }
+
+    // ── mika#3047 : la phase 2 relit le ticket à la forge avant de dispatcher ──
+
+    /// La charge que le double rendra pour `gh issue view --json
+    /// state,labels,body,updatedAt` — construite par `serde_json`, jamais par
+    /// une `format!` de JSON à la main : `GROOMED_BODY` porte des retours à la
+    /// ligne et des backticks, et un échappement artisanal ferait échouer le
+    /// test sur sa propre fixture plutôt que sur le code.
+    fn relecture_cannee(state: &str, labels: &[&str], body: &str) -> String {
+        serde_json::json!({
+            "state": state,
+            "labels": labels
+                .iter()
+                .map(|name| serde_json::json!({ "name": name }))
+                .collect::<Vec<_>>(),
+            "body": body,
+            // L'instant exact de la mesure du ticket : le tick de 14:10 du
+            // 2026-11-05, celui qui a dispatché #3044 163 ms après le retrait
+            // de `ready`.
+            "updatedAt": "2026-11-05T14:10:05Z",
+        })
+        .to_string()
+    }
+
+    /// Un tick dont **tout** est prêt à dispatcher, sauf la relecture.
+    ///
+    /// Les quatre tests d'AC2 ne diffèrent que par la charge que le double rend
+    /// au `gh issue view` de [`gh_reread_issue_at_dispatch`] : c'est le seul
+    /// degré de liberté, et c'est ce qui fait de T1 un contrôle positif et non
+    /// un cinquième montage.
+    ///
+    /// Ce que la fixture pose, et pourquoi chaque pièce est nécessaire pour que
+    /// la phase 2 atteigne le point d'insertion :
+    ///
+    /// - la **liste du tick** porte `ready` et `GROOMED_BODY` — sans quoi le
+    ///   filtre 1 écarte le ticket avant toute I/O ;
+    /// - la **timeline cannée** porte un `labeled(ready)` de 2020, donc un âge
+    ///   très au-dessus du seuil : sans elle le double rend `b"[]"` par défaut,
+    ///   la mesure d'âge rend `Ok(None)` et le ticket sort sous
+    ///   `no_ready_label_event`. C'est exactement par là que les sept appels
+    ///   existants de `phase2_reconcile_stuck_ready` sortent, et c'est pourquoi
+    ///   aucun d'eux n'atteint la nouvelle lecture (§ 5.4 du plan) ;
+    /// - la **preuve `PLAN_GROOMED`** en base est ce qui route le handler vers
+    ///   `dev-pilot` plutôt que `dev-groom` (mika#2484) ;
+    /// - la parente de groom que cette preuve traîne est **terminée** ici, alors
+    ///   que `completed_groom_pair` la laisse `in_progress`. Sans cela elle
+    ///   serait une tâche `self_dev` active sur l'URL du ticket, le filtre 4 de
+    ///   la phase 2 écarterait le candidat comme `in_flight`, et les quatre
+    ///   tests seraient verts sans jamais relire quoi que ce soit.
+    ///
+    /// Le numéro vit dans la bande 990 105+ : au-dessus du plancher
+    /// `FIXTURE_ISSUE_FLOOR`, et distinct de 990 101-990 104, parce que le
+    /// journal d'appels du double est global au processus (mika#2713 D4).
+    struct TickPretADispatcher {
+        db: AsyncDatabase,
+        issues: Vec<Issue>,
+        auth: mika_common::label_write::LabelWriteToken,
+        fx: TestCtxFixture,
+        /// Les parentes que la **fixture** a posées, avant tout dispatch : la
+        /// preuve de grooming en est une, et elle porte l'URL du ticket. C'est
+        /// la ligne de base de « zéro parente créée », qui se lit donc comme un
+        /// delta et non comme un absolu — un zéro absolu serait faux ici, et
+        /// l'assertion passerait pour une autre raison que la bonne.
+        parentes_de_la_fixture: usize,
+    }
+
+    async fn tick_pret_a_dispatcher(n: u64) -> TickPretADispatcher {
+        crate::gh_process::assert_fixture_issue(n);
+
+        let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
+        let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+        // L'API d'écriture de production (mika#2310), jamais un `INSERT` SQL
+        // brut — voir `mika2470_the_handler_decides_groom_vs_implement`.
+        let (parente_de_groom, _) = crate::db::tests::completed_groom_pair(
+            &sync_db,
+            "mika",
+            &url,
+            crate::db::tests::GROOM_CALLBACK_PLAN_GROOMED,
+        );
+        assert!(
+            sync_db
+                .update_task_completed(&parente_de_groom, "mika", None)
+                .expect("terminer la parente de groom"),
+            "la parente de groom doit être terminée, sinon le filtre 4 de la \
+             phase 2 écarte le candidat comme `in_flight`"
+        );
+        let db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "/timeline?",
+            r#"[{"event":"labeled","label":{"name":"ready"},"actor":{"login":"samidarko"},"created_at":"2020-01-01T00:00:00Z"}]"#,
+        );
+
+        let parentes_de_la_fixture = parents_for(&db, n).await;
+        assert_eq!(
+            parentes_de_la_fixture, 1,
+            "la preuve de grooming pose exactement une parente portant l'URL"
+        );
+
+        TickPretADispatcher {
+            db,
+            issues: vec![make_issue(n, GROOMED_BODY, &["ready"], "t")],
+            auth: fake_label_auth(),
+            fx: test_ctx_fixture(),
+            parentes_de_la_fixture,
+        }
+    }
+
+    /// Les écritures que le double a vues pour ce ticket — tout ce qui n'est ni
+    /// la lecture de timeline ni la relecture d'état.
+    ///
+    /// « Aucune écriture » se lit sur le journal du double, pas sur une absence
+    /// de panique : la couture enregistre l'appel au lieu de le laisser partir
+    /// (mika#2713), donc un chemin qui écrirait serait vert sans cette lecture.
+    fn ecritures_forge_pour(n: u64) -> Vec<String> {
+        gh_calls_for(n)
+            .into_iter()
+            .filter(|a| !a.contains("/timeline?") && !a.contains("issue view"))
+            .collect()
+    }
+
+    /// **T1 — le contrôle positif : la relecture confirme, le dispatch part.**
+    ///
+    /// Sans lui, les trois tests qui suivent seraient satisfaits par une garde
+    /// qui refuse tout le monde — le mode de défaillance que les contrôles
+    /// négatifs de mika#2049 et de mika#2634 ont dû ajouter après coup.
+    ///
+    /// L'observable n'est pas `rescued` : avec un registre de skills vide le
+    /// handler s'arrête à `tool_not_found` (porte 9a), rend `Handled` en
+    /// laissant une parente `pending`, et le churn devient donc sans objet
+    /// (`FILTER_IN_FLIGHT`). Ce que ce test lit est ce que la phase 2 a
+    /// réellement obtenu : une parente de plus, et la ligne de routage du
+    /// handler.
+    #[tokio::test]
+    async fn mika3047_la_relecture_confirme_ready_et_le_dispatch_part() {
+        let n = 990_105u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t1";
+        let _ = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture + 1,
+            "une parente de plus : le dispatch a bien atteint l'étape 7 du handler"
+        );
+        assert_eq!(
+            audit_after_values(&t.db, session, "ready_label_handled").await,
+            vec!["dev-pilot_dispatch_prepared".to_string()],
+            "le handler décide, et il décide `dev-pilot` : la relecture lui a \
+             rendu un ticket ouvert, `ready`, et groomé"
+        );
+        for filtre in [
+            FILTER_READY_ABSENT_AT_DISPATCH,
+            FILTER_ISSUE_CLOSED_AT_DISPATCH,
+            FILTER_DISPATCH_REREAD_FAILED,
+        ] {
+            assert!(
+                !ledger
+                    .entries
+                    .iter()
+                    .any(|(_, _, reason)| *reason == filtre),
+                "aucun des trois filtres de mika#3047 sur le chemin nominal ; \
+                 {filtre} vu dans {:?}",
+                ledger.entries
+            );
+        }
+    }
+
+    /// **T2 — `ready` a disparu entre la liste du tick et le dispatch.**
+    ///
+    /// C'est la mesure du 2026-11-05 rejouée : la liste du tick porte `ready`,
+    /// la forge ne le porte plus. Aucun dispatch, aucune parente — et surtout
+    /// **aucune écriture**, parce que re-poser `ready` au churn fabriquerait le
+    /// consentement qu'on vient de rendre.
+    #[tokio::test]
+    async fn mika3047_ready_retire_avant_le_dispatch_ne_dispatche_pas() {
+        let n = 990_106u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["p1-important"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t2";
+        let rescued = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "aucun secours sans consentement");
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_READY_ABSENT_AT_DISPATCH
+            )),
+            "l'exclusion est comptable sous son propre nom — c'est le \
+             numérateur de la sonde AC4 ; ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture,
+            "aucune parente créée : c'est la parente `pending` de la mesure, \
+             celle qui a coûté deux tours mika-dev pour rien"
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "aucune écriture, et le `--remove-label` du churn en particulier : \
+             le retirer puis le re-poser rendrait un consentement que \
+             l'opérateur vient de retirer (mika#3036)"
+        );
+    }
+
+    /// **T3 — le ticket a été fermé entre la liste du tick et le dispatch.**
+    ///
+    /// Un nom distinct de T2 parce que le remède est distinct : sur un `ready`
+    /// retiré, un opérateur peut le remettre ; sur un ticket fermé, il n'y a
+    /// rien à reprendre. Et la forme que ce refus évite est nommée : 29
+    /// commentaires sur le #2636 fermé, sous l'identité du moteur (mika#2713).
+    #[tokio::test]
+    async fn mika3047_un_ticket_ferme_avant_le_dispatch_nest_pas_ecrit() {
+        let n = 990_107u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("CLOSED", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t3";
+        let rescued = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "un ticket fermé ne se secourt pas");
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_ISSUE_CLOSED_AT_DISPATCH
+            )),
+            "ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture,
+            "aucune parente sur un ticket fermé"
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "rien ne part vers un ticket fermé — la forme exacte de la fuite \
+             mika#2713"
+        );
+    }
+
+    /// **T4 — la relecture échoue : fail-closed, sous son propre nom.**
+    ///
+    /// Une panne de la forge n'est pas un état du ticket. Elle porte donc un
+    /// troisième filtre, et pas celui de T2 : confondre les deux ferait lire
+    /// une panne de lecture comme une course gagnée, et empoisonnerait le
+    /// numérateur de la sonde AC4 (mika#2131, mika#2205, mika#2331).
+    #[tokio::test]
+    async fn mika3047_une_relecture_en_erreur_ne_dispatche_pas() {
+        let n = 990_108u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        // L'échec est posé **par motif** : la lecture de timeline du même sujet
+        // doit continuer de répondre, sans quoi le ticket sortirait sur
+        // `probe_error` et ce test n'exercerait pas la relecture.
+        crate::gh_process::set_canned_failure(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            "HTTP 502: Bad Gateway",
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t4";
+        let rescued = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            rescued, 0,
+            "fail-closed : une lecture en panne ne dispatche pas"
+        );
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_DISPATCH_REREAD_FAILED
+            )),
+            "le ledger du tick inscrit la panne sous un filtre nommé (AC2) ; \
+             ledger = {:?}",
+            ledger.entries
+        );
+        assert!(
+            !ledger
+                .entries
+                .iter()
+                .any(|(_, _, reason)| *reason == FILTER_READY_ABSENT_AT_DISPATCH),
+            "une panne de lecture n'est pas un `ready` retiré : les deux noms \
+             ne se mélangent pas ; ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture,
+            "aucune parente sur une relecture en erreur"
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "aucune écriture non plus : le refus est en amont du churn"
+        );
+    }
+
+    /// **AC3 — le handler décide sur la lecture fraîche, pas sur la copie du
+    /// tick.**
+    ///
+    /// Les quatre tests ci-dessus prouvent qu'une relecture *refusante* arrête
+    /// le dispatch. Aucun d'eux ne prouve qu'une relecture *acceptante* est
+    /// bien celle qui arrive au handler : T1 canne le même corps que la liste du
+    /// tick, donc il resterait vert si la phase 2 passait la copie du tick après
+    /// avoir relu pour rien. C'est précisément la régression la plus plausible
+    /// de ce vol — ajouter la lecture, oublier de la passer — et c'est ce test
+    /// qui la ferme.
+    ///
+    /// Le discriminant est **comportemental**, pas structurel : les deux corps
+    /// mènent à deux routages observables du handler, celui-là même que
+    /// `mika2470_the_handler_decides_groom_vs_implement` épingle. La liste du
+    /// tick porte `UNGROOMED_BODY`, qui route `dev-groom` ; la relecture porte
+    /// `GROOMED_BODY` avec sa preuve en base, qui route `dev-pilot`. Un seul des
+    /// deux peut sortir, et il nomme sa source.
+    ///
+    /// Le scan structurel d'AC3 — « aucun chemin de dispatch de la phase 2
+    /// n'utilise plus la copie du tick » — part au vol 2 (§ 6 du plan) : il
+    /// répond d'une autre question, l'absence de *tout autre* chemin, que ce
+    /// test ne couvre pas et ne prétend pas couvrir.
+    #[tokio::test]
+    async fn mika3047_le_handler_decide_sur_la_lecture_fraiche_pas_sur_le_tick() {
+        let n = 990_109u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        // La seule chose qui diffère de T1 : la liste du tick, délibérément
+        // périmée. La fixture pose un `GROOMED_BODY` ; ici le tick a lu un corps
+        // d'avant le grooming, et la forge en porte un d'après.
+        let liste_du_tick = vec![make_issue(n, UNGROOMED_BODY, &["ready"], "t")];
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-ac3";
+        let _ = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &liste_du_tick,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            audit_after_values(&t.db, session, "ready_label_handled").await,
+            vec!["dev-pilot_dispatch_prepared".to_string()],
+            "le handler a décidé sur `GROOMED_BODY`, donc sur la lecture \
+             fraîche. `dev-groom_dispatch_prepared` ici voudrait dire que la \
+             copie du tick est encore celle qui part au dispatch : la relecture \
+             aurait été payée et jetée"
         );
     }
 
