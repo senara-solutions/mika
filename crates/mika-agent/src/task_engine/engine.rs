@@ -6095,6 +6095,13 @@ mod tests {
     ) -> Arc<TaskDispatcher> {
         let tmp = tempfile::tempdir().unwrap();
         let mut settings = mika_common::config::Settings::load(tmp.path()).unwrap();
+        // mika#3050 — un jeton par défaut, posé AVANT le hook pour qu'un test
+        // puisse le retirer. Depuis mika#3050 le ré-armement d'une parente
+        // `ready-label` relit le ticket, et l'absence de jeton est un refus
+        // fail-closed (`rearm_reread_no_token`) : sans ce jeton, les 21 tests de
+        // reaper cesseraient de décrire le ré-armement et ne mesureraient plus
+        // que leur propre absence de configuration.
+        settings.github_token = Some(secrecy::SecretString::from("fake-token"));
         tweak(&mut settings);
         Arc::new(TaskDispatcher {
             db,
@@ -7900,7 +7907,25 @@ mod tests {
 
     /// Seed the `ready-label` shape: a `pending` self_dev issue parent carrying a
     /// `reference_url`, backdated `age_secs` into the past.
+    ///
+    /// **Le numéro reçu est décalé dans la bande de fixture** (mika#2713), et
+    /// c'est pourquoi aucun des 21 sites d'appel n'a bougé : depuis mika#3050 le
+    /// ré-armement relit le ticket à la forge, donc ces parentes atteignent la
+    /// couture d'appel `gh`, qui refuse un numéro d'issue réel. Le décalage vit
+    /// ici plutôt qu'aux appels pour que la bande reste une propriété de la
+    /// fixture — un site d'appel qui l'oublierait rendrait la panique de la
+    /// couture, jamais un faux vert. Il n'y a pas d'allowlist.
+    ///
+    /// La fixture pose aussi la relecture canée — ouvert, portant `ready` : la
+    /// forme des 4 premiers cas du tableau de mesure de mika#3050, c'est-à-dire
+    /// le comportement que ces tests décrivaient déjà avant la garde.
     async fn seed_pending_issue_parent(db: &AsyncDatabase, issue: u32, age_secs: i64) -> String {
+        let issue = u64::from(issue) + crate::gh_process::FIXTURE_ISSUE_FLOOR;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(issue),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#,
+        );
         let parent = NewTask {
             agent_id: "mika".to_string(),
             team_run_id: None,
@@ -7983,8 +8008,12 @@ mod tests {
                 .contains(crate::skills::executor::INTERNAL_DEFERRED_DISPATCH_FIELD),
             "the rebuilt call must keep the sentinel that stops the open-PR livelock"
         );
+        // Le numéro attendu se dérive de la bande de fixture plutôt que de
+        // s'écrire en dur : le décalage vit dans `seed_pending_issue_parent`
+        // (mika#2713/mika#3050), et une constante recopiée ici dériverait d'elle.
+        let attendu = format!("\"mika#{}\"", 2013 + crate::gh_process::FIXTURE_ISSUE_FLOOR);
         assert!(
-            wrappers[0].action_config.contains("\"mika#2013\""),
+            wrappers[0].action_config.contains(&attendu),
             "prompt must be the bare <repo>#<num> form (mika#1593)"
         );
     }
@@ -9304,7 +9333,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             names,
-            vec!["https://github.com/senara-solutions/mika/issues/2158".to_string()],
+            vec![format!(
+                "https://github.com/senara-solutions/mika/issues/{}",
+                2158 + crate::gh_process::FIXTURE_ISSUE_FLOOR
+            )],
             "only the promoted-wrapper shelter counts; plain queueing does not"
         );
 
