@@ -5898,9 +5898,12 @@ async fn reread_consent_before_rearm(
     // `ready-label` sort d'ici sans qu'un jeton soit lu ni qu'un appel `gh` soit
     // émis. C'est ce que T6 atteste par un `recorded_calls()` vide — l'issue
     // rendue seule ne le dirait pas.
-    let Some((owner_repo, issue)) = parse_ready_label_task_label(&parent.label) else {
-        return None;
-    };
+    //
+    // `?` et non un `let … else { return None }` : `None` veut dire « ré-armer
+    // comme avant » dans les deux cas, et clippy::question_mark refuse la forme
+    // longue. Le `?` porte donc ici la décision d'AC3 — le commentaire
+    // ci-dessus est ce qui l'empêche de se lire comme une propagation d'erreur.
+    let (owner_repo, issue) = parse_ready_label_task_label(&parent.label)?;
 
     let Some(token) = github_token else {
         warn!(
