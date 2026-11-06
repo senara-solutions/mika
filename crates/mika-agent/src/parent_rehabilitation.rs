@@ -393,6 +393,14 @@ async fn write_audit_line(
 
 #[cfg(test)]
 mod tests {
+    // Le prédicat de frontière de token, **un seul lecteur** : il est monté
+    // dans `crate::source_scan::occurs_at_boundary` au vol 2 de mika#3047,
+    // parce que le scan de la copie du tick de la phase 2 en avait besoin et que
+    // le recopier est la classe mika#2158. Le corps est inchangé ; le cas qui
+    // justifie sa frontière de droite reste celui de ce fichier (`decided`
+    // contient `decide`), et le doc-comment du site unique le cite nommément.
+    use crate::source_scan::occurs_at_boundary;
+
     /// Sites de production exemptés de
     /// [`mika3044_le_predicat_de_rehabilitation_na_quun_lecteur`].
     ///
@@ -406,26 +414,6 @@ mod tests {
     /// a ici aucune violation existante à exempter : le vol 1 a fait naître
     /// [`super::decide`] avec un appelant.
     const REHAB_PREDICATE_READERS_ALLOWED: &[&str] = &[];
-
-    /// `needle` apparaît-il dans `line` à frontière de mot — à droite toujours,
-    /// à gauche seulement si `left` ?
-    ///
-    /// La frontière de droite est la pièce load-bearing, et le cas qui le
-    /// prouve est dans ce fichier même : la sonde de [`super::decide`] s'appelle
-    /// `parent_rehabilitation_decided`, dont `decided` contient `decide`. Même
-    /// classe que la frontière de gauche de mika#1833, qui sortait `per_budget`
-    /// et `total_budget` de la population de `budget`.
-    fn occurs_at_boundary(line: &str, needle: &str, left: bool) -> bool {
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        line.match_indices(needle).any(|(at, _)| {
-            let right_ok = !line[at + needle.len()..]
-                .chars()
-                .next()
-                .is_some_and(is_word);
-            let left_ok = !left || !line[..at].chars().next_back().is_some_and(is_word);
-            left_ok && right_ok
-        })
-    }
 
     /// La ligne lit-elle le prédicat ? **L'aiguille a deux formes**, et la
     /// seconde est l'échappatoire de la première.

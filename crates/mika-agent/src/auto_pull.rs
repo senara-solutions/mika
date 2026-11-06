@@ -8507,6 +8507,577 @@ This ticket has been GROOMED and is ready.
         );
     }
 
+    /// Lignes de la boucle de secours exemptées du compte de
+    /// [`mika3047_la_copie_du_tick_na_quun_lecteur_dans_la_boucle_de_dispatch`].
+    ///
+    /// **Livrée vide, et quand le scan tire, la résolution est de router la
+    /// lecture par la relecture fraîche de [`gh_reread_issue_at_dispatch`],
+    /// jamais d'ajouter une entrée ici** (doctrine mika#2201 / mika#2309). Même
+    /// contrat que `REHAB_PREDICATE_READERS_ALLOWED` (mika#3044),
+    /// `CONTEXT_HISTORY_READERS_ALLOWED` (mika#2425),
+    /// `BRIEF_SIZE_THRESHOLD_READERS_ALLOWED` (mika#2474) et
+    /// `ZERO_BUDGET_READER_EXCEPTIONS` (mika#1833) : une liste née vide est un
+    /// emplacement pour le prochain écart, donc sa vacuité est elle-même
+    /// assertée — et l'assertion exige de toute entrée qu'elle nomme le
+    /// `mika#NNNN` qui la retirera. Il n'y a ici aucune violation existante à
+    /// exempter : la fenêtre mesurée le 2026-11-06 en porte zéro.
+    const TICK_COPY_READERS_ALLOWED: &[&str] = &[];
+
+    /// L'ancre de début de la fenêtre : la boucle de **secours** seule.
+    ///
+    /// Elle nomme la sortie de la sélection pure, pas une variable de commodité.
+    /// `for &n in &survivors {` est l'autre boucle `for &n` de cette fonction,
+    /// elle apparaît deux fois et elle est avant : l'ancre complète les
+    /// distingue.
+    const RESCUE_LOOP_ANCHOR: &str = "for &n in &selected {";
+
+    /// L'ancre de droite du motif de liaison, § 4.2 du plan.
+    ///
+    /// C'est `issues.iter().find(` et **non** `let Some(` : ce dernier apparaît
+    /// plusieurs fois dans la fenêtre (`if let Some(&age)`), alors que la copie
+    /// du tick est la seule liaison issue d'une recherche dans `issues`.
+    const BINDING_ANCHOR: &str = ") = issues.iter().find(";
+
+    const BINDING_OPEN: &str = "let Some(";
+
+    /// La fenêtre de comptage : la boucle de secours de
+    /// `phase2_reconcile_stuck_ready`, commentaires retirés.
+    ///
+    /// **Pourquoi la moitié de production et non un `find` nu.** Le motif
+    /// `async fn phase2_reconcile_stuck_ready(` apparaît **deux** fois dans ce
+    /// fichier : la définition, et la chaîne littérale du scan mika#2470
+    /// ci-dessus. Un `find` rend aujourd'hui la bonne — la première — mais par
+    /// accident d'ordre. [`crate::source_scan::production_half`] coupe au
+    /// `\n#[cfg(test)]\nmod tests`, donc la fenêtre ne peut pas, même par
+    /// réordonnancement, tomber sur une fixture de test.
+    ///
+    /// **Pourquoi pas le corps entier de la fonction.** La boucle de filtrage
+    /// qui précède lit la copie du tick une dizaine de fois, légitimement : un
+    /// scan posé sur le corps entier serait rouge par construction, et la
+    /// réaction naturelle serait d'allowlister ces sites — une allowlist née
+    /// pleine, exactement ce que mika#2309 condamne, parce que sa taille ne dit
+    /// plus rien et que sa vacuité cesse d'être assertable.
+    ///
+    /// Rend `Err` plutôt que de paniquer, pour que le contrôle de bonne foi
+    /// puisse montrer le scan **rougir** sur une source synthétique.
+    /// Blanchit le **contenu** des littéraux de chaîne, en préservant les
+    /// longueurs en octets et les retours à la ligne.
+    ///
+    /// **La prémisse que le plan de ce vol avait fausse.** Le plan § 4.3 avait
+    /// mesuré « zéro violation » dans la fenêtre et nommé un seul faux positif
+    /// résiduel, celui du commentaire de fin de ligne. Il en restait un, et il
+    /// n'est pas réparable en déplaçant quoi que ce soit : le `warn!` de la
+    /// liaison elle-même porte la prose anglaise *« candidate absent from the
+    /// issue list; cannot decide or dispatch »*, où `issue` est suivi d'un
+    /// espace non suivi de `=` — donc compté comme une lecture. Un message
+    /// d'opérateur n'est pas un site à déplacer, et la classe entière (prose
+    /// dans un `warn!`, `format!("issue:{n}")`) se ferme ici plutôt que par une
+    /// entrée d'allowlist.
+    ///
+    /// **Pourquoi des espaces et non une suppression.** Tout le scan raisonne en
+    /// **positions** — l'exclusion de la liaison, le span des arguments du gate,
+    /// l'ordre vis-à-vis de la relecture. Un blanchiment à longueur constante
+    /// laisse ces positions comparables à celles de la source dépouillée ; une
+    /// suppression les décalerait. Un caractère multi-octets est donc remplacé
+    /// par autant d'espaces qu'il pèse.
+    ///
+    /// **Les limites, nommées.** Ni les chaînes brutes (`r"…"`), ni les
+    /// littéraux de caractère (`'"'`) ne sont reconnus : aucun des deux
+    /// n'apparaît dans la fenêtre, et un `'"'` qui y entrerait désynchroniserait
+    /// l'état — ce que le contrôle de bonne foi ne peut pas voir, d'où cette
+    /// phrase. Le dépouillement des commentaires passe **avant**, pour qu'un
+    /// guillemet de prose ne décide de rien.
+    ///
+    /// Reste local à ce scan parce qu'il en est le seul lecteur. S'il en gagne
+    /// un second, il monte dans [`crate::source_scan`] — c'est la règle écrite
+    /// de ce module, et la classe mika#2158.
+    fn blank_string_literals(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for c in src.chars() {
+            let blank = |out: &mut String, c: char| {
+                for _ in 0..c.len_utf8() {
+                    out.push(' ');
+                }
+            };
+            if !in_string {
+                out.push(c);
+                if c == '"' {
+                    in_string = true;
+                }
+                continue;
+            }
+            if escaped {
+                escaped = false;
+                if c == '\n' {
+                    out.push('\n');
+                } else {
+                    blank(&mut out, c);
+                }
+                continue;
+            }
+            match c {
+                '\\' => {
+                    escaped = true;
+                    out.push(' ');
+                }
+                '"' => {
+                    in_string = false;
+                    out.push('"');
+                }
+                '\n' => out.push('\n'),
+                _ => blank(&mut out, c),
+            }
+        }
+        out
+    }
+
+    fn phase2_rescue_window(src: &str) -> Result<String, String> {
+        let half = blank_string_literals(&crate::source_scan::strip_comment_lines(
+            crate::source_scan::production_half(src),
+        ));
+
+        // Terme de non-vacuité 1 : l'ancre est présente **une seule fois**.
+        // Deux occurrences voudraient dire que la boucle a été dupliquée, et le
+        // scan ne regarderait plus que la première.
+        let anchors = half.matches(RESCUE_LOOP_ANCHOR).count();
+        if anchors != 1 {
+            return Err(format!(
+                "l'ancre de fenêtre `{RESCUE_LOOP_ANCHOR}` apparaît {anchors} fois dans la \
+                 moitié de production (attendu : 1) — le scan de mika#3047 ne vise plus la \
+                 boucle de secours de la phase 2. RÉSOLUTION : réparer l'ancre, pas le compte."
+            ));
+        }
+        let start = half
+            .find(RESCUE_LOOP_ANCHOR)
+            .expect("compté juste au-dessus");
+        let tail = &half[start..];
+        // Fin de fenêtre : la fermeture du corps de la fonction, seul `}` en
+        // colonne 0 après la boucle — même borne que le scan mika#2470 voisin.
+        let end = tail.find("\n}\n").ok_or_else(|| {
+            "le corps de `phase2_reconcile_stuck_ready` ne se referme pas".to_string()
+        })?;
+        let window = &tail[..end];
+
+        // Termes de non-vacuité 2 et 3. Sans eux, un renommage ou une refonte
+        // rendrait le scan vert en ne regardant rien : le mode de panne qu'il
+        // existe précisément pour rendre visible.
+        if !window.contains(BINDING_ANCHOR) {
+            return Err(format!(
+                "la fenêtre ne porte plus le motif de liaison `{BINDING_ANCHOR}` — le site a \
+                 été refondu et ce scan ne mesure plus rien. RÉSOLUTION : réancrer le scan sur \
+                 le nouveau site, jamais le laisser vert."
+            ));
+        }
+        if !window.contains("gh_reread_issue_at_dispatch") {
+            return Err(
+                "la fenêtre ne porte plus `gh_reread_issue_at_dispatch` — l'ordre que ce scan \
+                 vérifie n'a plus de sens, et son absence serait le vol 1 de mika#3047 défait"
+                    .to_string(),
+            );
+        }
+        Ok(window.to_string())
+    }
+
+    /// Le nom de la liaison, **lu dans la source** plutôt qu'écrit ici.
+    ///
+    /// La propriété épinglée par mika#3047 ne porte sur aucun nom de variable :
+    /// un `rename` qui laisserait deux lecteurs doit rougir. Si l'extraction
+    /// échoue, le scan échoue — il ne retombe **pas** sur `"issue"` en dur. Un
+    /// défaut nommé est une garde ; un défaut silencieux est le nom de variable
+    /// qu'on avait refusé d'épingler, réintroduit par la porte de service.
+    ///
+    /// Rend `(nom, position de l'occurrence de liaison dans la fenêtre)` — la
+    /// position sert à exclure la liaison du compte **par position et non par
+    /// forme** : elle est l'origine de la fenêtre de comptage, pas un de ses
+    /// habitants.
+    fn tick_copy_binding(window: &str) -> Result<(String, usize), String> {
+        let anchor = window
+            .find(BINDING_ANCHOR)
+            .ok_or_else(|| format!("motif de liaison `{BINDING_ANCHOR}` absent de la fenêtre"))?;
+        let open = window[..anchor].rfind(BINDING_OPEN).ok_or_else(|| {
+            format!("`{BINDING_OPEN}` introuvable avant `{BINDING_ANCHOR}` — la liaison a changé de forme")
+        })?;
+        let at = open + BINDING_OPEN.len();
+        let name = window[at..anchor].trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(format!(
+                "le nom extrait du motif de liaison n'est pas un identifiant : {name:?}"
+            ));
+        }
+        // `trim` a pu avancer : on rend la position réelle du nom.
+        let at = at + window[at..anchor].find(name).unwrap_or(0);
+        Ok((name.to_string(), at))
+    }
+
+    /// Les positions des **lectures** de `name` dans `window`.
+    ///
+    /// Une occurrence est une lecture quand elle est à frontière de token des
+    /// deux côtés **et** que le caractère qui la suit est l'un de `,` `)` `.`
+    /// `;`, ou un espace non suivi de `=`. Ce que chaque clause écarte, mesuré
+    /// sur la fenêtre d'aujourd'hui :
+    ///
+    /// | clause | écarte | occurrences |
+    /// |---|---|---|
+    /// | frontière de token | `issues`, `issue_url`, `timelines_by_issue` | 4 |
+    /// | espace non suivi de `=` | `issue = n` — un champ `tracing`, dont la valeur est `n` et jamais la liaison | ~20 |
+    /// | caractère suivant dans l'ensemble clos | `issue:` de `format!("issue:{n}")` | 2 |
+    /// | [`blank_string_literals`] | la prose anglaise du `warn!` de la liaison (`"… the issue list; cannot …"`) | 1 |
+    ///
+    /// La dernière ligne de cette table est celle que le plan de ce vol n'avait
+    /// pas : voir le doc-comment de [`blank_string_literals`].
+    ///
+    /// **La frontière a un seul juge**, [`crate::source_scan::occurs_at_boundary`]
+    /// (monté là au vol 2 de mika#3047 depuis le `mod tests` de
+    /// [`crate::parent_rehabilitation`]) : on l'interroge sur le **contexte
+    /// minimal** de chaque occurrence — le caractère précédent, le nom, le
+    /// caractère suivant — plutôt que de réécrire le prédicat ici. Recopier la
+    /// frontière serait la classe mika#2158.
+    ///
+    /// **Les deux faux positifs que ce prédicat admet encore**, nommés plutôt
+    /// que tus : [`crate::source_scan::strip_comment_lines`] est *à la ligne*,
+    /// jamais lexical, donc un commentaire de **fin** de ligne et l'intérieur
+    /// d'un bloc `/* … */` dont les continuations ne commencent pas par `*`
+    /// survivent au dépouillement. Une prose de fin de ligne écrivant `issue,`
+    /// dans la fenêtre serait comptée. Le remède est de déplacer le commentaire
+    /// — c'est un faux positif réparable, pas un trou de détection, et le
+    /// message d'échec le dit.
+    fn tick_copy_reads(window: &str, name: &str) -> Vec<usize> {
+        window
+            .match_indices(name)
+            .filter(|&(at, _)| {
+                let before = window[..at].chars().next_back();
+                let after = window[at + name.len()..].chars();
+                let mut after = after;
+                let next = after.next();
+                // Un seul juge pour la frontière : le contexte minimal ne porte
+                // qu'une occurrence du nom, donc le `any` du helper est exact.
+                let mut ctx = String::new();
+                if let Some(c) = before {
+                    ctx.push(c);
+                }
+                ctx.push_str(name);
+                if let Some(c) = next {
+                    ctx.push(c);
+                }
+                if !crate::source_scan::occurs_at_boundary(&ctx, name, true) {
+                    return false;
+                }
+                match next {
+                    Some(',') | Some(')') | Some('.') | Some(';') => true,
+                    Some(' ') => after.next() != Some('='),
+                    _ => false,
+                }
+            })
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    /// Le span des arguments d'un appel, par équilibrage de parenthèses.
+    ///
+    /// `callee` porte sa parenthèse ouvrante. L'équilibrage ignore les
+    /// parenthèses dans les littéraux de chaîne — aucun argument des appels
+    /// visés n'en porte, et une fixture qui en porterait le verrait.
+    fn call_arg_span(window: &str, callee: &str) -> Result<std::ops::Range<usize>, String> {
+        let open = window
+            .find(callee)
+            .ok_or_else(|| format!("appel `{callee}` absent de la fenêtre"))?
+            + callee.len();
+        let mut depth = 1usize;
+        for (i, c) in window[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(open..open + i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(format!(
+            "la liste d'arguments de `{callee}` ne se referme pas"
+        ))
+    }
+
+    /// Le scan entier, en `Result` pour que son contrôle de bonne foi puisse le
+    /// montrer rougir sur une source synthétique.
+    ///
+    /// Quatre propriétés, et elles ne sont pas redondantes : un compte, un
+    /// consommateur et un ordre sont trois propriétés dont chacune survit à la
+    /// violation des deux autres.
+    fn scan_tick_copy_single_reader(src: &str) -> Result<(), String> {
+        let window = phase2_rescue_window(src)?;
+        let (name, binding_at) = tick_copy_binding(&window)?;
+
+        let reads: Vec<usize> = tick_copy_reads(&window, &name)
+            .into_iter()
+            // La liaison elle-même n'est pas une lecture : exclusion **par
+            // position**, pas par forme.
+            .filter(|&at| at != binding_at)
+            // L'allowlist, livrée vide : une lecture dont la ligne porte une
+            // entrée est exemptée.
+            .filter(|&at| {
+                let line_start = window[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line_end = window[at..].find('\n').map_or(window.len(), |i| at + i);
+                let line = &window[line_start..line_end];
+                !TICK_COPY_READERS_ALLOWED.iter().any(|e| line.contains(e))
+            })
+            .collect();
+
+        let sites: Vec<&str> = reads
+            .iter()
+            .map(|&at| {
+                let line_start = window[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line_end = window[at..].find('\n').map_or(window.len(), |i| at + i);
+                window[line_start..line_end].trim()
+            })
+            .collect();
+
+        // **Exactement une**, jamais « au plus une ». Zéro voudrait dire le gate
+        // de staleness débranché, ou la liaison morte et le scan orphelin — un
+        // correctif désarmé qu'un `<= 1` lirait comme un arbre propre.
+        if reads.len() != 1 {
+            return Err(format!(
+                "la copie du tick (`{name}`) a {} lecteur(s) dans la boucle de dispatch de la \
+                 phase 2, attendu exactement 1 : {sites:?}\n\
+                 RÉSOLUTION : router la lecture par la relecture fraîche de \
+                 `gh_reread_issue_at_dispatch`, jamais ajouter une entrée à \
+                 TICK_COPY_READERS_ALLOWED (doctrine mika#2201).\n\
+                 ZÉRO n'est pas un arbre propre : c'est le gate de staleness débranché ou la \
+                 liaison devenue morte.\n\
+                 Si un site accusé est une PROSE de fin de ligne nommant `{name},` ou \
+                 `{name}.` : `strip_comment_lines` est à la ligne et non lexical — déplacez le \
+                 commentaire sur sa propre ligne.",
+                reads.len()
+            ));
+        }
+        let read = reads[0];
+
+        // Le consommateur. Sans cette assertion, une lecture **déplacée** — même
+        // compte, autre consommateur — passerait : un gate neuf lisant la copie
+        // du tick, c'est-à-dire le défaut de mika#3047 sous un autre nom.
+        let gate = call_arg_span(&window, "promotion_gate_allows(")?;
+        if !gate.contains(&read) {
+            return Err(format!(
+                "l'unique lecture de `{name}` n'est pas un argument de `promotion_gate_allows` : \
+                 {sites:?}\n\
+                 RÉSOLUTION : un gate qui décide sur la copie du tick est le défaut de \
+                 mika#3047 sous un autre nom — il décide sur la relecture fraîche."
+            ));
+        }
+
+        // L'ordre. Sans lui, la lecture unique glissée **après** la relecture
+        // laisserait le gate décider sur la copie pendant que le dispatch part
+        // sur la lecture fraîche : deux vérités dans un appel.
+        let reread = window
+            .find("gh_reread_issue_at_dispatch")
+            .ok_or_else(|| "`gh_reread_issue_at_dispatch` absent de la fenêtre".to_string())?;
+        if read >= reread {
+            return Err(format!(
+                "l'unique lecture de `{name}` est posée APRÈS `gh_reread_issue_at_dispatch` : le \
+                 gate décide sur la copie du tick pendant que le dispatch part sur la lecture \
+                 fraîche — deux vérités dans un appel (mika#3047 AC1)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// **AC3, seconde phrase — aucun chemin de dispatch de la phase 2 n'utilise
+    /// plus la copie du tick.**
+    ///
+    /// La liaison produite par `issues.iter().find(…)` — quel que soit son nom —
+    /// est lue **exactement une fois** dans la boucle de secours, et cette
+    /// lecture est l'argument de `promotion_gate_allows`, qui précède
+    /// `gh_reread_issue_at_dispatch`.
+    ///
+    /// **Pourquoi aucune assertion de comportement ne peut voir ça.** Un second
+    /// lecteur de la copie du tick ne rend aucune décision fausse le jour où il
+    /// est écrit : il est écrit sur une copie qui, ce jour-là, est encore
+    /// fraîche. C'est la classe que `grooming_marker` a dû graver une fois
+    /// (mika#2158), et seule une garde structurelle la voit.
+    #[test]
+    fn mika3047_la_copie_du_tick_na_quun_lecteur_dans_la_boucle_de_dispatch() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/auto_pull.rs"),
+        )
+        .expect("read auto_pull.rs");
+        if let Err(e) = scan_tick_copy_single_reader(&src) {
+            panic!("INVARIANT VIOLÉ (mika#3047 AC3) — {e}");
+        }
+    }
+
+    /// Le contrôle de bonne foi : le scan ci-dessus pourrait être vert parce
+    /// qu'il ne regarde rien — le mode de panne qu'il existe pour rendre
+    /// visible. On le montre donc **rougir** sur une source synthétique, et
+    /// **rester muet** sur les formes qui nomment la liaison sans la lire.
+    ///
+    /// Frère de `mika2474_the_reader_scan_reddens_on_a_second_reader` et de
+    /// `mika3044_le_scan_de_lecteur_unique_rougit_sur_un_second_lecteur`, sur un
+    /// troisième objet.
+    #[test]
+    fn mika3047_le_scan_de_lecteur_unique_rougit_sur_un_second_lecteur() {
+        /// Enveloppe une fenêtre synthétique dans une fonction de la bonne
+        /// forme : une boucle `survivors` avant, l'ancre de secours, et une
+        /// fermeture en colonne 0.
+        fn fixture(body: &str) -> String {
+            format!(
+                "async fn phase2_reconcile_stuck_ready(db: &Db) {{\n\
+                 \x20   for &n in &survivors {{\n\
+                 \x20       let _ = n;\n\
+                 \x20   }}\n\
+                 \x20   for &n in &selected {{\n\
+                 {body}\n\
+                 \x20       rescued += 1;\n\
+                 \x20   }}\n\
+                 }}\n\
+                 \n\
+                 fn apres_la_fonction() {{}}\n"
+            )
+        }
+
+        const SANE: &str = "\
+        let Some(issue) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        if !promotion_gate_allows(db, issue, trace_id).await {
+            continue;
+        }
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+
+        // Contrôle positif : la forme saine passe. Sans lui, les quatre rouges
+        // ci-dessous seraient compatibles avec un scan qui rougit sur tout.
+        scan_tick_copy_single_reader(&fixture(SANE))
+            .expect("la forme saine doit passer, sinon le scan rougit sur tout");
+
+        // 1 — une seconde lecture, ajoutée après la relecture.
+        let second = format!("{SANE}\n        let _ = sonde(issue);");
+        assert!(
+            scan_tick_copy_single_reader(&fixture(&second)).is_err(),
+            "un second lecteur de la copie du tick doit faire rougir le scan"
+        );
+
+        // 2 — une lecture **déplacée** : même compte, autre consommateur.
+        const DISPLACED: &str = "\
+        let Some(issue) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        if !promotion_gate_allows(db, trace_id).await {
+            continue;
+        }
+        if !un_gate_neuf(db, issue).await {
+            continue;
+        }
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(DISPLACED)).is_err(),
+            "une lecture déplacée vers un autre gate garde le compte et doit rougir"
+        );
+
+        // 3 — l'ordre inversé : la lecture unique posée après la relecture.
+        const INVERTED: &str = "\
+        let Some(issue) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if !promotion_gate_allows(db, issue, trace_id).await {
+            continue;
+        }
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(INVERTED)).is_err(),
+            "le gate décidant sur la copie APRÈS la relecture fraîche doit rougir"
+        );
+
+        // 4 — la liaison **renommée** et lue deux fois sous son nouveau nom.
+        // C'est ce qui prouve que le nom est lu dans la source et non écrit
+        // ici ; aucune autre assertion ne peut le voir.
+        const RENAMED: &str = "\
+        let Some(copie_du_tick) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        if !promotion_gate_allows(db, copie_du_tick, trace_id).await {
+            continue;
+        }
+        let _ = sonde(copie_du_tick);
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(RENAMED)).is_err(),
+            "un renommage de la liaison ne met pas le scan hors d'état : le nom est lu dans la \
+             source"
+        );
+
+        // 5 à 8 — reste muet sur les quatre formes qui nomment la liaison sans
+        // la lire : la frontière de token, le champ `tracing`, le littéral, et
+        // la prose de doc-comment (la forme exacte du faux positif Signal S de
+        // mika#2050, et la fenêtre réelle en porte une trentaine de lignes).
+        let silent = format!(
+            "{SANE}\n\
+             \x20       let issue_url = format!(\"https://github.com/{{R}}/issues/{{n}}\");\n\
+             \x20       let _ = timelines_by_issue.get(&n);\n\
+             \x20       warn!(issue = n, \"auto_pull: rien\");\n\
+             \x20       let _ = format!(\"issue:{{n}}\");\n\
+             \x20       // La liaison `issue` n'est lue qu'une fois, et cette lecture, issue,\n\
+             \x20       // est l'argument du gate — prose, pas une lecture."
+        );
+        scan_tick_copy_single_reader(&fixture(&silent))
+            .expect("les formes qui nomment la liaison sans la lire ne doivent pas être comptées");
+
+        // Le cas qui manquerait si on ne l'écrivait pas : l'extraction du nom en
+        // échec. Une fenêtre sans motif de liaison doit faire **échouer** le
+        // scan, et non le rendre vert sur un défaut tacite.
+        const NO_BINDING: &str = "\
+        if !promotion_gate_allows(db, trace_id).await {
+            continue;
+        }
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(NO_BINDING)).is_err(),
+            "une fenêtre sans motif de liaison doit faire ÉCHOUER le scan, jamais le rendre vert \
+             sur un défaut tacite"
+        );
+    }
+
+    /// L'allowlist du scan ci-dessus est **vide**, et sa vacuité est assertée —
+    /// une liste née vide est un emplacement pour le prochain écart.
+    #[test]
+    fn mika3047_lallowlist_du_scan_de_la_copie_du_tick_est_vide() {
+        for entry in TICK_COPY_READERS_ALLOWED {
+            assert!(
+                entry.contains("mika#"),
+                "toute entrée de TICK_COPY_READERS_ALLOWED doit nommer le ticket qui la \
+                 retirera : {entry:?}"
+            );
+        }
+        assert!(
+            TICK_COPY_READERS_ALLOWED.is_empty(),
+            "l'allowlist du scan de la copie du tick doit rester vide : quand le scan tire, on \
+             route la lecture par `gh_reread_issue_at_dispatch`, on n'ajoute pas un second \
+             lecteur (doctrine mika#2201)."
+        );
+    }
+
     /// T8 — Option A's predicate, pure (third-pass mika-arch): the churn is
     /// moot only when the direct call did **not** dispatch **and** the engine
     /// holds the ticket. Term by term, so neutralising either does not pass.
