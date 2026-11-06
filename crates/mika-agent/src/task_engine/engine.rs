@@ -8155,6 +8155,65 @@ mod tests {
         );
     }
 
+    /// **T7 (mika#3050) — bout en bout, par le reaper lui-même.**
+    ///
+    /// Les six tests d'unité de `rearm_deferred_callback` décrivent la garde ;
+    /// aucun ne dit que le reaper **câble** le jeton jusqu'à elle ni qu'il nomme
+    /// le bras `ConsentWithdrawn`. Le reaper résout son jeton une fois par passe
+    /// (D7) et choisit son bras lui-même : un câblage manquant rendrait `NotNow`
+    /// — donc une parente laissée `pending`, ré-essayée au tick suivant — avec
+    /// les six tests d'unité verts.
+    ///
+    /// La forme jouée est celle de `0529ed9b`/#3044 : `ready` retiré pendant que
+    /// la parente attendait sa grâce de 45 minutes, puis le ré-armement.
+    #[tokio::test]
+    async fn mika3050_the_reaper_refuses_a_rearm_whose_ticket_withdrew_its_ready() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 3060, 3600).await;
+        // La fixture pose la forme consentante ; on la remplace par celle du
+        // retrait. L'upsert est par (sujet, motif), donc c'est bien la même
+        // charge qui est écrasée.
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(
+                u64::from(3060u32) + crate::gh_process::FIXTURE_ISSUE_FLOOR,
+            ),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"type:bug"}]}"#,
+        );
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "la parente quitte la file dans un état terminal qui libère le \
+             prochain `ready` (AC1)"
+        );
+        assert_eq!(
+            parent.result.as_deref(),
+            Some(crate::ready_label::READY_ABSENT_AT_REARM_REASON)
+        );
+        assert!(
+            wrappers_of(&db, &parent_id).await.is_empty(),
+            "aucun lanceur créé, donc aucun tour mika-dev"
+        );
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            0,
+            "un refus de consentement ne dépense pas le budget de réparation"
+        );
+        assert_eq!(
+            db.count_audit_events_by_tool_name(crate::ready_label::REARM_CONSENT_RECHECK_TOOL_NAME)
+                .await
+                .unwrap(),
+            1,
+            "une ligne d'audit nomme la raison (AC1)"
+        );
+    }
+
     // -- mika#2169 replays and non-regressions --
     //
     // Three tests, three DIFFERENT statuses of proof, and conflating them is
