@@ -166,6 +166,28 @@ pub(crate) const READY_CONSENT_WITHDRAWN_REASON: &str = "ready_consent_withdrawn
 /// Les agréger sous un nom rendrait les deux non soustractibles.
 pub(crate) const READY_CONSENT_RECHECK_TOOL_NAME: &str = "ready_label_consent_recheck";
 
+// ──────── Les noms de la relecture AVANT un ré-armement (mika#3050) ────────
+//
+// mika#2995 garde la **promotion** d'un lanceur différé ; le **ré-armement**
+// d'une parente déjà en file ne l'était pas. Les deux gardes portent des raisons
+// terminales distinctes, exprès : deux populations sous un nom ne sont plus
+// soustractibles (mika#2205), et la cible d'AC4 est précisément un compte.
+
+/// Motif terminal de la parente dont le ticket ne porte plus `ready` à l'instant
+/// du ré-armement. Le littéral est celui qu'AC1 de mika#3050 exige.
+pub(crate) const READY_ABSENT_AT_REARM_REASON: &str = "ready_absent_at_rearm";
+
+/// Motif terminal de la parente dont le ticket a été **fermé** avant le
+/// ré-armement. Littéral exigé par AC1 de mika#3050.
+pub(crate) const ISSUE_CLOSED_AT_REARM_REASON: &str = "issue_closed_at_rearm";
+
+/// `tool_name` de la ligne d'audit de la relecture de ré-armement.
+///
+/// Distinct de [`READY_CONSENT_RECHECK_TOOL_NAME`] : celui-là nomme un *dispatch*
+/// refusé à la promotion, celui-ci un *ré-armement* refusé 45 min plus tard. Les
+/// agréger sous un nom rendrait les deux greps d'AC4 illisibles.
+pub(crate) const REARM_CONSENT_RECHECK_TOOL_NAME: &str = "ready_label_rearm_recheck";
+
 /// `"ready-label: senara-solutions/mika#3002"` → `("senara-solutions/mika", 3002)`.
 ///
 /// # Pourquoi les coordonnées se lisent dans le LABEL
@@ -531,6 +553,112 @@ pub(crate) async fn park_verdict_for_issue_with<F: TimelinePageFetcher + ?Sized>
     }
     let last = events.last().expect("is_parked is false on an empty set");
     Ok(Some((last.actor.clone(), last.created_at.clone())))
+}
+
+// ────────── L'état du ticket avant un ré-armement (mika#3050 D2) ──────────
+
+/// Ce que la forge répond quand on relit un ticket juste avant de **ré-armer**
+/// une parente `ready-label` (mika#3050 AC1).
+///
+/// Trois états, et un quatrième que ce type ne porte **pas** : la relecture en
+/// erreur, qui est le `Err` du `Result`. Une panne de forge n'est pas un état du
+/// ticket, et l'écrire comme tel ferait classer une indisponibilité en retrait
+/// de consentement — donc poserait un terminal sur une parente parfaitement
+/// consentante (mika#2131, mika#2331 : une absence n'est pas un zéro).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RearmConsent {
+    /// Ouvert, et portant `ready` : le consentement tient, le ré-armement suit.
+    Held,
+    /// Ouvert, mais `ready` n'y est plus — retiré depuis la mise en file.
+    ReadyAbsent,
+    /// Fermé depuis la mise en file.
+    Closed,
+}
+
+/// Relit l'état d'un ticket à la forge : ouvert, et portant `ready` ? (D2)
+///
+/// Frère du prédicat de parc ci-dessus, et volontairement **pas le même** : le
+/// parc lit la *timeline* pour savoir **qui** a retiré `ready` et **quand** ;
+/// ici on ne lit que l'**état courant**, parce que la question qu'AC1 pose est
+/// « le consentement tient-il à cet instant ? » et non « qui l'a retiré ? ». Une
+/// timeline de 20 pages pour répondre à une question d'état serait un
+/// amplificateur d'appels API sur chaque tick de reaper.
+///
+/// Pourquoi pas `server::ready_label_handler::fetch_issue_body_and_labels_via_gh`,
+/// que le ticket cite : il ne rend **pas** `state`, donc il ne peut pas répondre
+/// à la moitié « ouvert » du prédicat ; et il vit dans un module de handler HTTP,
+/// que le moteur de tâches n'a aucune raison d'atteindre.
+///
+/// **Fail-closed champ par champ** (D3). Tout ce qui n'est pas lisible selon le
+/// contrat rend `Err` plutôt qu'un état : `state` absent ou hors du couple
+/// `OPEN`/`CLOSED`, `labels` absent ou non-tableau. En particulier `labels`
+/// absent n'est **jamais** [`RearmConsent::ReadyAbsent`] — « le champ n'est pas
+/// là » et « le label n'est pas posé » sont deux faits distincts, et les
+/// confondre terminerait une parente sur une réponse tronquée.
+pub(crate) async fn reread_issue_consent_via_gh(
+    token: &str,
+    owner_repo: &str,
+    number: u64,
+) -> Result<RearmConsent, String> {
+    let output = run_gh(
+        token,
+        GhSubject::Issue(number),
+        &[
+            "issue",
+            "view",
+            &number.to_string(),
+            "--repo",
+            owner_repo,
+            "--json",
+            "state,labels",
+        ],
+    )
+    .await
+    .map_err(|e| format!("gh issue view ne s'est pas lancé pour {owner_repo}#{number} : {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh issue view a échoué pour {owner_repo}#{number} : {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_rearm_consent(&String::from_utf8_lossy(&output.stdout), owner_repo, number)
+}
+
+/// Le cœur de [`reread_issue_consent_via_gh`] : la lecture du JSON, sans réseau.
+///
+/// Séparé du fetch pour la raison qui a fait séparer [`parse_timeline_page`] :
+/// c'est ici que vit le contrat fail-closed, donc c'est ici que les cas se
+/// testent — un par champ, sans passer par un double d'appel `gh`.
+fn parse_rearm_consent(
+    stdout: &str,
+    owner_repo: &str,
+    number: u64,
+) -> Result<RearmConsent, String> {
+    let raw: serde_json::Value = serde_json::from_str(stdout).map_err(|e| {
+        format!("réponse de gh issue view illisible pour {owner_repo}#{number} : {e}")
+    })?;
+    let state = raw["state"]
+        .as_str()
+        .ok_or_else(|| format!("pas de champ `state` pour {owner_repo}#{number}"))?;
+    if state.eq_ignore_ascii_case("CLOSED") {
+        return Ok(RearmConsent::Closed);
+    }
+    if !state.eq_ignore_ascii_case("OPEN") {
+        return Err(format!(
+            "`state` hors contrat pour {owner_repo}#{number} : {state:?}"
+        ));
+    }
+    let labels = raw["labels"]
+        .as_array()
+        .ok_or_else(|| format!("pas de tableau `labels` pour {owner_repo}#{number}"))?;
+    if labels
+        .iter()
+        .any(|l| l["name"].as_str() == Some(READY_LABEL))
+    {
+        Ok(RearmConsent::Held)
+    } else {
+        Ok(RearmConsent::ReadyAbsent)
+    }
 }
 
 // ───────────────────── Les identités machine (D3) ─────────────────────
@@ -2092,6 +2220,113 @@ async fn consomme(db: &AsyncDatabase, id: &str) {
             muets.is_empty(),
             "citer ou consommer la constante n'est pas la définir — D3 rougirait sur tous ses \
              lecteurs et finirait désarmé : {muets:?}"
+        );
+    }
+
+    // ───── mika#3050 — le prédicat d'état avant un ré-armement (D2/D3) ─────
+
+    /// Une réponse `gh issue view --json state,labels` canée.
+    fn relecture(state: &str, labels: &[&str]) -> String {
+        let labels = labels
+            .iter()
+            .map(|l| format!(r#"{{"name":"{l}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"state":"{state}","labels":[{labels}]}}"#)
+    }
+
+    #[test]
+    fn mika3050_ouvert_et_portant_ready_rend_le_consentement_tenu() {
+        assert_eq!(
+            parse_rearm_consent(&relecture("OPEN", &["ready", "type:bug"]), "x/y", 1),
+            Ok(RearmConsent::Held),
+            "le contrôle positif : les 4 premiers cas du tableau de mesure"
+        );
+    }
+
+    #[test]
+    fn mika3050_ouvert_sans_ready_rend_ready_absent() {
+        assert_eq!(
+            parse_rearm_consent(&relecture("OPEN", &["type:bug"]), "x/y", 1),
+            Ok(RearmConsent::ReadyAbsent),
+            "la forme de 74130014/#3002 : ouvert, mais `ready` retiré entre-temps"
+        );
+    }
+
+    #[test]
+    fn mika3050_un_ticket_ferme_rend_closed_quel_que_soit_le_label() {
+        // `ready` encore posé ET fermé : le `state` décide d'abord, sinon un
+        // ticket fermé sans nettoyage de label ré-armerait.
+        assert_eq!(
+            parse_rearm_consent(&relecture("CLOSED", &["ready"]), "x/y", 1),
+            Ok(RearmConsent::Closed),
+        );
+        // La casse de l'API n'est pas un contrat : `closed` se lit aussi.
+        assert_eq!(
+            parse_rearm_consent(&relecture("closed", &[]), "x/y", 1),
+            Ok(RearmConsent::Closed),
+        );
+    }
+
+    #[test]
+    fn mika3050_un_state_hors_contrat_est_une_erreur_pas_un_etat() {
+        let v = parse_rearm_consent(&relecture("MERGED", &["ready"]), "x/y", 7);
+        let e = v.expect_err("un `state` inconnu ne doit pas se replier sur OPEN");
+        assert!(
+            e.contains("hors contrat") && e.contains("x/y#7") && e.contains("MERGED"),
+            "la cause doit nommer la valeur refusée, c'est elle qu'un opérateur grep : {e}"
+        );
+        // Un `state` absent est du même côté : fail-closed, jamais `Held`.
+        assert!(
+            parse_rearm_consent(r#"{"labels":[{"name":"ready"}]}"#, "x/y", 7).is_err(),
+            "pas de `state` ⇒ pas de verdict d'ouverture"
+        );
+    }
+
+    #[test]
+    fn mika3050_labels_absent_est_une_erreur_jamais_ready_absent() {
+        // Le cœur de D3 : « le champ n'est pas là » et « le label n'est pas
+        // posé » sont deux faits distincts. Les confondre poserait un terminal
+        // `ready_absent_at_rearm` sur une parente consentante, sur la foi d'une
+        // réponse tronquée (mika#2131, mika#2331).
+        let v = parse_rearm_consent(r#"{"state":"OPEN"}"#, "x/y", 7);
+        let e = v.expect_err("`labels` absent n'est pas un `ready` absent");
+        assert!(
+            e.contains("labels") && e.contains("x/y#7"),
+            "la cause doit nommer le champ manquant et le ticket : {e}"
+        );
+        assert!(
+            parse_rearm_consent("ceci n'est pas du json", "x/y", 7).is_err(),
+            "une charge illisible est une erreur, pas un état"
+        );
+    }
+
+    /// La commande émise, mot pour mot — c'est elle que la couture d'appel route
+    /// par motif d'argv (`"issue view"`, mika#3047), et c'est `--json
+    /// state,labels` qui rend les deux moitiés du prédicat lisibles. Un champ
+    /// retiré de ce `--json` ferait rendre `Err` à tous les tickets sains : la
+    /// garde deviendrait un `NotNow` permanent, et la file ne tournerait plus.
+    #[tokio::test]
+    async fn mika3050_la_relecture_demande_state_et_labels_sur_le_bon_depot() {
+        let n = 990_350u64;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture("OPEN", &["ready"]),
+        );
+
+        let v = reread_issue_consent_via_gh("fake-token", "senara-solutions/mika", n).await;
+        assert_eq!(v, Ok(RearmConsent::Held));
+
+        let argv = crate::gh_process::recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(n))
+            .map(|c| c.args)
+            .collect::<Vec<_>>();
+        assert_eq!(argv.len(), 1, "une relecture, un appel : {argv:?}");
+        assert_eq!(
+            argv[0],
+            format!("issue view {n} --repo senara-solutions/mika --json state,labels"),
         );
     }
 }

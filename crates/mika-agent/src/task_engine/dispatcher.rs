@@ -4034,6 +4034,16 @@ impl TaskDispatcher {
             return;
         }
 
+        // mika#3050 D7 — ici la « passe » est un seul lanceur consommé, donc la
+        // résolution est à son site d'appel ; elle vit après la garde L2a
+        // ci-dessus, pour qu'une parente déjà terminale ne la paie pas. Même
+        // porte que le site frère de mika#2995 : `resolve_github_token`, et non
+        // `resolve_periodic_scan_token`.
+        let github_token = self
+            .settings
+            .resolve_github_token(self.github_app.as_deref())
+            .await;
+
         let outcome = crate::skills::executor::rearm_deferred_callback(
             &self.db,
             parent_id,
@@ -4046,6 +4056,7 @@ impl TaskDispatcher {
             // the second shape would count itself as live for the whole
             // liveness window.
             Some(task.id.as_str()),
+            github_token.as_deref(),
         )
         .await;
 
@@ -4107,6 +4118,36 @@ impl TaskDispatcher {
                     ),
                 )
                 .await;
+            }
+            // mika#3050 AC1 — le ticket ne consent plus. Le terminal de la
+            // parente et la ligne d'audit sont **déjà** écrits par la garde
+            // (D6) ; ce qui reste au site d'appel est le registre du lanceur
+            // consommé, que lui seul connaît. Sans lui, ce lanceur reste
+            // `completed` et `count_promoted_undelivered_wrappers` (L2b) le lit
+            // comme « promu, jamais pris » — l'indicateur de famine tirerait
+            // sur un refus sain, exactement l'argument du bras
+            // `AlreadyRepresented` ci-dessus.
+            //
+            // `debug!` et non `info!` : la ligne de surface est celle de la
+            // garde, et la dupliquer au niveau INFO ferait deux populations
+            // sous un même compte (mika#2205), alors que la cible d'AC4 est un
+            // compte.
+            RearmOutcome::ConsentWithdrawn { reason } => {
+                self.record_wrapper_noop(
+                    &task.id,
+                    &format!(
+                        "noop: aucun dispatch produit (cause={cause}) — \
+                         consentement du ticket retiré ({reason})"
+                    ),
+                )
+                .await;
+                debug!(
+                    task_id = %task.id,
+                    parent_task_id = %parent_id,
+                    cause,
+                    reason,
+                    "mika#3050 : ré-armement refusé — le ticket ne consent plus"
+                );
             }
             RearmOutcome::Unrepairable => {
                 let reason = format!(

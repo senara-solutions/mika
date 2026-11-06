@@ -5819,9 +5819,213 @@ pub(crate) enum RearmOutcome {
     /// non-`NotNow` outcome as grounds to expire the parent, so a variant the
     /// compiler forces them to name is the only safe way to add one here.
     AlreadyRepresented,
+    /// Refusé parce que le ticket ne consent plus : il ne porte plus `ready`, ou
+    /// il a été fermé depuis la mise en file (mika#3050 D5). Le terminal et la
+    /// ligne d'audit sont **déjà écrits** quand cette variante est rendue ;
+    /// `reason` est le littéral qu'AC1 exige, pour le log de l'appelant.
+    ///
+    /// Pas une réutilisation d'[`RearmOutcome::Unrepairable`] : les trois
+    /// appelants y expirent déjà la parente sous
+    /// `stuck_pending_no_deferred_wrapper`, et fusionner les deux populations
+    /// les rend non-soustractibles (mika#2205) alors que la cible d'AC4 est un
+    /// compte. Le `match` des trois appelants est exhaustif et sans bras
+    /// `_ =>` (mika#2290, mika#2413) : cette variante ne compile pas sans que
+    /// chacun des trois la nomme.
+    ConsentWithdrawn { reason: &'static str },
     /// Refused for good: the repair budget is spent, or the dispatch cannot be
     /// reconstructed. Only this warrants expiring the task.
     Unrepairable,
+}
+
+/// La relecture du ticket avant un ré-armement — position 3 de
+/// [`rearm_deferred_callback`] (mika#3050 D1).
+///
+/// Rend `None` quand le ré-armement doit suivre son cours, pour l'une des deux
+/// raisons qui ne se ressemblent pas : la parente n'est pas de la classe
+/// `ready-label` (AC3), ou son ticket est ouvert et porte encore `ready` — le
+/// contrôle positif d'AC2, c'est-à-dire la forme des quatre premiers cas du
+/// tableau de mesure du ticket. Rend `Some(outcome)` dans tous les autres cas,
+/// et c'est **ici, une seule fois, au site de la garde** que le terminal et la
+/// ligne d'audit d'AC1 sont écrits (D6).
+///
+/// # Pourquoi un prédicat d'état et pas celui de mika#2995
+///
+/// mika#2995 garde la **promotion** d'un lanceur différé avec le prédicat de
+/// *parc de la timeline* : « le dernier événement sur `ready` est un `unlabeled`
+/// par un acteur non machine ». Le retrait de mika#3022
+/// (`merged_pr_ready_label_cleaned`) est fait par une identité **machine**, donc
+/// ce prédicat rend « non parqué » et le tour part : c'est exactement le cas
+/// `0529ed9b`/#3044. La question d'AC1 est « le consentement tient-il à cet
+/// instant ? », pas « qui l'a retiré ? » — un prédicat d'état, donc, et des
+/// raisons terminales distinctes de celles de mika#2995.
+async fn reread_consent_before_rearm(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    github_token: Option<&str>,
+    cause: &str,
+) -> Option<RearmOutcome> {
+    use crate::ready_label::{
+        ISSUE_CLOSED_AT_REARM_REASON, READY_ABSENT_AT_REARM_REASON, RearmConsent,
+        parse_ready_label_task_label, reread_issue_consent_via_gh,
+    };
+
+    let parent = match db.get_task_unscoped(parent_task_id).await {
+        Ok(Some(p)) => p,
+        // Aucune parente, donc aucune classe à discriminer : rien à relire. Le
+        // ré-armement qui suit insérera un lanceur sans parente vivante, ce
+        // qu'il faisait déjà — ce vol ne change pas cette population.
+        Ok(None) => return None,
+        Err(e) => {
+            // Fail-closed, et ce choix ne coûte rien de neuf : les deux gardes
+            // suivantes (`get_stuck_rearm_count`,
+            // `count_pending_deferred_callbacks`) rendent déjà `NotNow` sur la
+            // même base en erreur, donc aucune classe ne perd un ré-armement
+            // qu'elle aurait obtenu sans cette garde. Lire « ce n'est pas une
+            // parente `ready-label` » dans une erreur de lecture, en revanche,
+            // serait précisément le faux positif que ce ticket ferme.
+            warn!(
+                event = "rearm_parent_unreadable",
+                parent_task_id,
+                cause,
+                error = %e,
+                "mika#3050 : parente illisible — pas de ré-armement à ce tick"
+            );
+            return Some(RearmOutcome::NotNow);
+        }
+    };
+
+    // Le discriminant d'AC3, et il est local : une parente hors classe
+    // `ready-label` sort d'ici sans qu'un jeton soit lu ni qu'un appel `gh` soit
+    // émis. C'est ce que T6 atteste par un `recorded_calls()` vide — l'issue
+    // rendue seule ne le dirait pas.
+    //
+    // `?` et non un `let … else { return None }` : `None` veut dire « ré-armer
+    // comme avant » dans les deux cas, et clippy::question_mark refuse la forme
+    // longue. Le `?` porte donc ici la décision d'AC3 — le commentaire
+    // ci-dessus est ce qui l'empêche de se lire comme une propagation d'erreur.
+    let (owner_repo, issue) = parse_ready_label_task_label(&parent.label)?;
+
+    let Some(token) = github_token else {
+        warn!(
+            event = "rearm_reread_no_token",
+            parent_task_id,
+            repo = %owner_repo,
+            issue,
+            cause,
+            "mika#3050 : aucun jeton GitHub résolu — pas de ré-armement à ce tick"
+        );
+        return Some(RearmOutcome::NotNow);
+    };
+
+    match reread_issue_consent_via_gh(token, &owner_repo, issue).await {
+        // La forme des quatre premiers cas du tableau : on ré-arme comme avant.
+        Ok(RearmConsent::Held) => None,
+        Ok(RearmConsent::ReadyAbsent) => Some(
+            write_rearm_consent_terminal(
+                db,
+                &parent,
+                &owner_repo,
+                issue,
+                READY_ABSENT_AT_REARM_REASON,
+            )
+            .await,
+        ),
+        Ok(RearmConsent::Closed) => Some(
+            write_rearm_consent_terminal(
+                db,
+                &parent,
+                &owner_repo,
+                issue,
+                ISSUE_CLOSED_AT_REARM_REASON,
+            )
+            .await,
+        ),
+        // AC2 — une relecture qui échoue ne ré-arme pas à ce tick, et ne pose
+        // aucun terminal. L'asymétrie est chiffrée : un faux négatif coûte un
+        // tick de 10 minutes, un faux positif ~600 k tokens Opus et, dans le cas
+        // `74130014`/#3002, la fermeture d'un ticket gardé ouvert pour une sonde.
+        Err(detail) => {
+            warn!(
+                event = "rearm_reread_failed",
+                parent_task_id,
+                repo = %owner_repo,
+                issue,
+                cause,
+                detail = %detail,
+                "mika#3050 : relecture du ticket impossible — pas de ré-armement à ce tick"
+            );
+            Some(RearmOutcome::NotNow)
+        }
+    }
+}
+
+/// Le terminal et l'audit de la garde de ré-armement (mika#3050 D6).
+///
+/// **Le terminal n'est pas un verrou sur le ticket, il est la condition pour que
+/// le prochain « oui » soit pris** : `failed` est dans
+/// `TERMINAL_PARENT_STATUSES` et exclu de `idx_tasks_manual_active_ref_url`, donc
+/// une parente laissée `pending` garderait le créneau de l'issue occupé et un
+/// `labeled ready` reposé ensuite échouerait à créer sa tâche. C'est la troisième
+/// clause d'AC1, obtenue par un statut qui existe déjà — sans nouveau statut et
+/// sans migration.
+async fn write_rearm_consent_terminal(
+    db: &AsyncDatabase,
+    parent: &db::Task,
+    owner_repo: &str,
+    issue: u64,
+    reason: &'static str,
+) -> RearmOutcome {
+    use crate::ready_label::REARM_CONSENT_RECHECK_TOOL_NAME;
+
+    info!(
+        event = "rearm_refused_consent_withdrawn",
+        agent_id = %parent.agent_id,
+        parent_task_id = %parent.id,
+        repo = %owner_repo,
+        issue,
+        reason,
+        "mika#3050 : le ticket ne consent plus au ré-armement — aucun lanceur, \
+         aucun tour mika-dev. Reposez `ready` pour relancer le ticket."
+    );
+
+    match db.update_task_failed(&parent.id, reason).await {
+        Ok(true) => {
+            let trace_id = mika_common::trace::generate_trace_id();
+            if let Err(e) = db
+                .log_audit_event(
+                    &format!("system-{}", parent.agent_id),
+                    REARM_CONSENT_RECHECK_TOOL_NAME,
+                    &parent.id,
+                    Some("pending"),
+                    Some("failed"),
+                    Some(reason),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent.id,
+                    error = %e,
+                    "mika#3050 : ligne d'audit de la relecture de ré-armement non écrite"
+                );
+            }
+        }
+        Ok(false) => {
+            debug!(
+                parent_task_id = %parent.id,
+                "mika#3050 : parente déjà terminale — terminal de relecture sauté"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent.id,
+                error = %e,
+                "mika#3050 : terminal de la parente non écrit"
+            );
+        }
+    }
+
+    RearmOutcome::ConsentWithdrawn { reason }
 }
 
 /// Re-arm a parent whose deferred wrapper was consumed without dispatching
@@ -5859,6 +6063,20 @@ pub(crate) enum RearmOutcome {
 /// construction, is counted as a no-op by R9, and re-arms again. Three rounds,
 /// budget gone, parent `failed`, while the only thing that ever happened was
 /// another groom holding the slot.
+///
+/// # Invariant (mika#3050)
+///
+/// Une parente de la classe `ready-label` n'est ré-armée que si son ticket est
+/// **relu à la forge** : ouvert, et portant `ready`. La garde vit ici, en
+/// position 3, et non aux trois sites appelants — doctrine du lecteur unique
+/// (mika#2158, mika#2205, mika#3049) : trois copies d'un prédicat de
+/// consentement, c'est trois endroits où un futur éditeur peut en oublier un,
+/// avec toutes les assertions vertes.
+///
+/// `github_token` est résolu **une fois par passe** par l'appelant, pas par
+/// candidate : la résolution d'un jeton d'App fait un appel réseau et le reaper
+/// boucle sur N candidates. `None` est un refus fail-closed, pas une permission
+/// (D7).
 pub(crate) async fn rearm_deferred_callback(
     db: &AsyncDatabase,
     parent_task_id: &str,
@@ -5866,6 +6084,7 @@ pub(crate) async fn rearm_deferred_callback(
     dispatch_class: &str,
     cause: &str,
     consumed_wrapper_id: Option<&str>,
+    github_token: Option<&str>,
 ) -> RearmOutcome {
     // Guard: if the parent already has an active non-deferred callback, the
     // turn did dispatch and there is nothing to repair. Fail-closed on a query
@@ -5935,6 +6154,20 @@ pub(crate) async fn rearm_deferred_callback(
                 "failed to check for a live deferred wrapper — repairing on the nominal path"
             );
         }
+    }
+
+    // mika#3050 — le ticket consent-il encore ?
+    //
+    // Placement imposé, et il est symétrique de celui de mika#2413 juste
+    // au-dessus. APRÈS les deux gardes locales : il est inutile de payer un
+    // appel réseau pour une parente déjà représentée. AVANT
+    // `get_stuck_rearm_count` : un consentement retiré doit sortir la parente en
+    // terminal **immédiatement** — la faire d'abord épuiser son quota de
+    // ré-armements lui coûterait les tours mika-dev que ce ticket supprime.
+    if let Some(outcome) =
+        reread_consent_before_rearm(db, parent_task_id, github_token, cause).await
+    {
+        return outcome;
     }
 
     match db.get_stuck_rearm_count(parent_task_id).await {
@@ -12219,9 +12452,56 @@ mod tests {
 
     // -- rearm_deferred_callback tests (mika#2045) --
 
+    /// Le ticket de [`rearm_fixture`], dans la bande de la couture d'appel `gh`
+    /// (mika#2713) : sous `FIXTURE_ISSUE_FLOOR`, le double panique plutôt que
+    /// de laisser une fixture désigner un vrai ticket du dépôt. Il n'y a pas
+    /// d'allowlist — le remède est le numéro, jamais une exemption (D8).
+    const REARM_FIXTURE_ISSUE: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 2045;
+
+    /// Le jeton que ces tests passent à la garde de relecture (mika#3050 D7).
+    /// `None` est un refus fail-closed, pas une permission, donc un test qui
+    /// décrit un ré-armement doit en poser un — sinon il ne mesure plus que sa
+    /// propre absence de configuration.
+    const REARM_FIXTURE_TOKEN: Option<&str> = Some("fake-token");
+
     /// A `pending` self_dev issue parent plus a consumed deferred wrapper —
     /// the shape left behind when promotion fires and the turn never dispatches.
+    ///
+    /// La relecture canée est posée ici — ouvert, portant `ready` : c'est la
+    /// forme des quatre premiers cas du tableau de mesure de mika#3050, donc
+    /// exactement ce que ces tests décrivaient déjà avant la garde.
     async fn rearm_fixture() -> (crate::async_db::AsyncDatabase, String, String) {
+        rearm_fixture_with_issue(REARM_FIXTURE_ISSUE).await
+    }
+
+    /// [`rearm_fixture`] sur un numéro de ticket choisi.
+    ///
+    /// Les tables de charges cannées sont **globales au processus** : deux
+    /// tests qui décrivent deux réponses de la forge pour un même numéro se
+    /// marcheraient dessus sous `cargo test` parallèle. Chaque variante prend
+    /// donc son propre numéro, et c'est aussi ce qui rend `recorded_calls()`
+    /// filtrable par test.
+    async fn rearm_fixture_with_issue(
+        issue: u64,
+    ) -> (crate::async_db::AsyncDatabase, String, String) {
+        crate::gh_process::assert_fixture_issue(issue);
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(issue),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#,
+        );
+        rearm_fixture_labelled(issue, format!("ready-label: x/y#{issue}")).await
+    }
+
+    /// [`rearm_fixture_with_issue`] sans sa charge cannée et sous un label
+    /// choisi — le corps commun, pour que la classe de la parente soit un
+    /// paramètre du test plutôt qu'une copie de la fixture.
+    async fn rearm_fixture_labelled(
+        issue: u64,
+        label: String,
+    ) -> (crate::async_db::AsyncDatabase, String, String) {
+        crate::gh_process::assert_fixture_issue(issue);
+
         let db = crate::db::Database::open_in_memory().unwrap();
         db.create_session("test-session", "mika", "cli").unwrap();
         let async_db = crate::async_db::AsyncDatabase::new(db);
@@ -12231,7 +12511,7 @@ mod tests {
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: "ready-label: x/y#2045".to_string(),
+            label,
             trigger_type: "manual".to_string(),
             cron_expr: None,
             event_source: None,
@@ -12244,7 +12524,7 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
-            reference_url: Some("https://github.com/x/y/issues/2045".to_string()),
+            reference_url: Some(format!("https://github.com/x/y/issues/{issue}")),
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: Some("issue".to_string()),
@@ -12287,6 +12567,7 @@ mod tests {
             "implement",
             "noop_completion",
             None,
+            REARM_FIXTURE_TOKEN,
         )
         .await;
 
@@ -12312,7 +12593,8 @@ mod tests {
                 &action_config,
                 "groom",
                 "silent_turn_error",
-                None
+                None,
+                REARM_FIXTURE_TOKEN,
             )
             .await,
             RearmOutcome::Rearmed
@@ -12356,8 +12638,16 @@ mod tests {
 
         for _ in 0..MAX_STUCK_REARMS {
             assert_eq!(
-                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                    .await,
+                rearm_deferred_callback(
+                    &db,
+                    &parent_id,
+                    &action_config,
+                    "implement",
+                    "noop",
+                    None,
+                    REARM_FIXTURE_TOKEN,
+                )
+                .await,
                 RearmOutcome::Rearmed
             );
             // Consume the wrapper the way the engine does: promotion writes
@@ -12376,8 +12666,16 @@ mod tests {
             MAX_STUCK_REARMS
         );
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                .await,
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await,
             RearmOutcome::Unrepairable,
             "budget exhausted is terminal — the reaper may expire the task"
         );
@@ -12420,8 +12718,16 @@ mod tests {
         }
 
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                .await,
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await,
             RearmOutcome::NotNow,
             "a full queue clears on its own — the task must survive to be retried"
         );
@@ -12464,13 +12770,329 @@ mod tests {
         db.create_task(real_callback).await.unwrap();
 
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                .await,
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await,
             RearmOutcome::NotNow,
             "a live dispatch means nothing to repair — and nothing to expire either"
         );
         assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
         assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
+    }
+
+    // -- la relecture du ticket avant un ré-armement (mika#3050) --
+    //
+    // Un numéro de fixture par cas, et c'est structurel : les tables de charges
+    // cannées et le journal d'appels de la couture `gh` sont **globaux au
+    // processus**, donc deux tests qui décrivent deux réponses de la forge pour
+    // un même numéro se marcheraient dessus sous `cargo test` parallèle. C'est
+    // aussi ce qui rend `recorded_calls()` filtrable par test.
+
+    const ISSUE_T1_CONSENT_HELD: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3050;
+    const ISSUE_T2_READY_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3051;
+    const ISSUE_T3_CLOSED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3052;
+    const ISSUE_T4_REREAD_FAILED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3053;
+    const ISSUE_T5_NO_TOKEN: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3054;
+    const ISSUE_T6_OTHER_CLASS: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3055;
+
+    /// Les appels `gh` que le double a vus **sur ce numéro de fixture**.
+    fn gh_calls_on(issue: u64) -> Vec<String> {
+        crate::gh_process::recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(issue))
+            .map(|c| c.args)
+            .collect()
+    }
+
+    /// Les lignes d'audit de la relecture.
+    ///
+    /// Le scope de lecture est celui de la **poignée**, et c'est la seule
+    /// lecture juste : `log_audit_event` prend un `session_id` en premier
+    /// argument — la garde y passe `system-<agent>`, le marqueur de session
+    /// système — tandis que l'`agent_id` de la ligne vient de
+    /// `AsyncDatabase::agent_id`. Lire sous `system-mika` rendrait `0`, ce qui se
+    /// lirait comme « aucune ligne écrite ».
+    async fn rearm_recheck_audit_rows(db: &crate::async_db::AsyncDatabase) -> i64 {
+        db.count_audit_events_by_tool_name(crate::ready_label::REARM_CONSENT_RECHECK_TOOL_NAME)
+            .await
+            .unwrap()
+    }
+
+    /// **T1 — contrôle positif d'AC2.** Ticket ouvert, `ready` encore posé : la
+    /// forme des quatre premiers cas du tableau de mesure du ticket, qui
+    /// ré-arment comme avant le vol.
+    ///
+    /// L'issue seule ne suffirait pas : `test_rearm_registers_replacement_wrapper`
+    /// la vérifiait déjà *avant* la garde. Ce qui est neuf ici est que la forge
+    /// a bel et bien été **relue** — sans cette assertion, une garde court-circuitée
+    /// (un `None` rendu trop tôt) laisserait le test vert.
+    #[tokio::test]
+    async fn mika3050_a_held_consent_rearms_and_the_forge_was_reread() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T1_CONSENT_HELD).await;
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(outcome, RearmOutcome::Rearmed);
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 1);
+
+        let calls = gh_calls_on(ISSUE_T1_CONSENT_HELD);
+        assert_eq!(
+            calls.len(),
+            1,
+            "une relecture, et une seule, par ré-armement : {calls:?}"
+        );
+        assert!(
+            calls[0].contains("issue view") && calls[0].contains("state,labels"),
+            "la relecture lit l'état ET les labels — les deux clauses d'AC1 : {calls:?}"
+        );
+    }
+
+    /// **T2 — `ready` retiré (AC1).** Le cas `0529ed9b`/#3044, et celui que
+    /// mika#3022 rend structurel : aucun lanceur, un terminal qui libère le
+    /// créneau de l'issue, et une ligne d'audit qui nomme la raison.
+    #[tokio::test]
+    async fn mika3050_a_withdrawn_ready_label_refuses_the_rearm() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T2_READY_ABSENT).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(ISSUE_T2_READY_ABSENT),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"type:bug"}]}"#,
+        );
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RearmOutcome::ConsentWithdrawn {
+                reason: crate::ready_label::READY_ABSENT_AT_REARM_REASON
+            }
+        );
+        assert_eq!(
+            pending_wrappers_of(&db, &parent_id).await,
+            0,
+            "aucun lanceur créé, donc aucun tour mika-dev"
+        );
+
+        let parent = db
+            .get_task_unscoped(&parent_id)
+            .await
+            .unwrap()
+            .expect("la parente");
+        assert_eq!(
+            parent.status, "failed",
+            "un terminal, parce qu'une parente laissée `pending` garderait le \
+             créneau de l'issue occupé et le prochain `ready` échouerait"
+        );
+        assert_eq!(
+            parent.result.as_deref(),
+            Some(crate::ready_label::READY_ABSENT_AT_REARM_REASON),
+            "la raison est lisible sur la tâche, pas seulement dans un log"
+        );
+        assert_eq!(rearm_recheck_audit_rows(&db).await, 1);
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            0,
+            "un refus de consentement n'est pas une réparation : il ne dépense \
+             pas le budget de ré-armement"
+        );
+    }
+
+    /// **T3 — ticket fermé (AC1).** Même forme que T2, autre raison : les deux
+    /// populations doivent rester soustractibles (mika#2205), parce que la cible
+    /// d'AC4 est un compte.
+    #[tokio::test]
+    async fn mika3050_a_closed_issue_refuses_the_rearm_under_its_own_reason() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T3_CLOSED).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(ISSUE_T3_CLOSED),
+            "issue view",
+            r#"{"state":"CLOSED","labels":[{"name":"ready"}]}"#,
+        );
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RearmOutcome::ConsentWithdrawn {
+                reason: crate::ready_label::ISSUE_CLOSED_AT_REARM_REASON
+            },
+            "`ready` est encore posé ici — c'est l'état du ticket qui refuse, \
+             et il le dit sous son propre nom"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+
+        let parent = db
+            .get_task_unscoped(&parent_id)
+            .await
+            .unwrap()
+            .expect("la parente");
+        assert_eq!(parent.status, "failed");
+        assert_eq!(
+            parent.result.as_deref(),
+            Some(crate::ready_label::ISSUE_CLOSED_AT_REARM_REASON)
+        );
+        assert_eq!(rearm_recheck_audit_rows(&db).await, 1);
+    }
+
+    /// **T4 — relecture en erreur (AC2).** Fail-closed : pas de ré-armement à ce
+    /// tick, et **aucun terminal** — l'asymétrie est chiffrée, un faux négatif
+    /// coûte un tick de 10 minutes, un faux positif ~600 k tokens Opus et, dans
+    /// le cas `74130014`/#3002, la fermeture d'un ticket gardé ouvert pour une
+    /// sonde.
+    #[tokio::test]
+    async fn mika3050_an_unreadable_forge_defers_without_writing_a_terminal() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T4_REREAD_FAILED).await;
+        crate::gh_process::set_canned_failure(
+            crate::gh_process::GhSubject::Issue(ISSUE_T4_REREAD_FAILED),
+            "issue view",
+            "gh: could not resolve to an Issue (HTTP 502)",
+        );
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(outcome, RearmOutcome::NotNow);
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+
+        let parent = db
+            .get_task_unscoped(&parent_id)
+            .await
+            .unwrap()
+            .expect("la parente");
+        assert_eq!(
+            parent.status, "pending",
+            "une relecture illisible n'est pas un refus du ticket : la parente \
+             reste en file et le tick suivant relira"
+        );
+        assert_eq!(
+            rearm_recheck_audit_rows(&db).await,
+            0,
+            "aucune raison d'AC1 n'est vraie ici — une ligne d'audit la nommerait \
+             à tort et fausserait le compte d'AC4"
+        );
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
+    }
+
+    /// **T5 — aucun jeton résolu (AC2, D7).** `None` n'est pas une permission.
+    /// Et la garde refuse **avant** le réseau : le journal d'appels de ce numéro
+    /// reste vide, ce qu'une assertion sur la seule issue ne dirait pas.
+    #[tokio::test]
+    async fn mika3050_a_missing_token_defers_before_any_network_call() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T5_NO_TOKEN).await;
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RearmOutcome::NotNow);
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+        assert_eq!(
+            db.get_task_unscoped(&parent_id)
+                .await
+                .unwrap()
+                .expect("la parente")
+                .status,
+            "pending"
+        );
+        assert_eq!(rearm_recheck_audit_rows(&db).await, 0);
+        assert!(
+            gh_calls_on(ISSUE_T5_NO_TOKEN).is_empty(),
+            "la garde sort avant l'appel : {:?}",
+            gh_calls_on(ISSUE_T5_NO_TOKEN)
+        );
+    }
+
+    /// **T6 — une autre classe garde son comportement (AC3).** Le label est
+    /// celui du dispatch opérateur (`operator-iterate:`,
+    /// `server/iterate_dispatch.rs`) et non un label inventé : il porte les
+    /// **mêmes** coordonnées `owner/repo#numéro` que celui du feeder
+    /// `ready-label`, donc ce test atteste que le discriminant est le préfixe et
+    /// jamais la présence de coordonnées lisibles.
+    ///
+    /// Aucune charge cannée n'est posée, exprès. Deux filets, donc : l'issue
+    /// (`Rearmed`) et le journal d'appels vide. Si la garde relisait ici, le
+    /// double rendrait `b"[]"`, la relecture échouerait et l'issue serait
+    /// `NotNow` — les deux assertions tombent ensemble, et aucune ne peut passer
+    /// seule.
+    #[tokio::test]
+    async fn mika3050_a_parent_of_another_class_rearms_without_reading_the_forge() {
+        let (db, parent_id, action_config) = rearm_fixture_labelled(
+            ISSUE_T6_OTHER_CLASS,
+            format!("operator-iterate: x/y#{ISSUE_T6_OTHER_CLASS}"),
+        )
+        .await;
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RearmOutcome::Rearmed,
+            "hors classe `ready-label`, le comportement d'avant le vol"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 1);
+        assert!(
+            gh_calls_on(ISSUE_T6_OTHER_CLASS).is_empty(),
+            "aucun appel `gh` pour une parente hors classe : {:?}",
+            gh_calls_on(ISSUE_T6_OTHER_CLASS)
+        );
     }
 
     #[tokio::test]
