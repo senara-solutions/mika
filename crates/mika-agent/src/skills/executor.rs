@@ -18,6 +18,7 @@ use super::manifest::ToolHandler;
 use crate::async_db::AsyncDatabase;
 use crate::db::{self, NewTask};
 use crate::github_graphql::{fetch_issue_body, fetch_pr_summary, parse_pr_url};
+use crate::ready_label::RearmConsentCensus;
 use crate::task_engine::types::{action_type, trigger_type};
 use crate::task_state::tasks::{DISPATCH_NO_GROOMING_MARKER, GroomConvergence};
 use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
@@ -5848,6 +5849,43 @@ pub(crate) enum RearmOutcome {
 /// et c'est **ici, une seule fois, au site de la garde** que le terminal et la
 /// ligne d'audit d'AC1 sont écrits (D6).
 ///
+/// La décision elle-même vit dans [`reread_consent_verdict`], qui rend en plus
+/// le verdict de recensement ; cette fonction-ci en est l'enveloppe, et sa
+/// signature est celle d'avant mika#3050 D2 — ses trois appelants n'ont pas
+/// bougé.
+async fn reread_consent_before_rearm(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    github_token: Option<&str>,
+    cause: &str,
+) -> Option<RearmOutcome> {
+    let (_census, outcome) = reread_consent_verdict(db, parent_task_id, github_token, cause).await;
+    outcome
+}
+
+/// La décision de la garde, **et le verdict qui la décrit** (mika#3050 D2).
+///
+/// Le corps de [`reread_consent_before_rearm`] d'avant la scission, à ceci près
+/// que chacune de ses sorties rend aussi le [`RearmConsentCensus`] qui la nomme.
+/// La logique de décision est inchangée — mêmes verdicts, mêmes terminaux,
+/// mêmes raisons d'audit qu'au merge de #3052 — et les treize tests qui la
+/// tiennent le vérifient sans modification.
+///
+/// # Diagnostic et recensement ne sont pas le même log
+///
+/// Les trois `warn!` ci-dessous (`rearm_parent_unreadable`,
+/// `rearm_reread_no_token`, `rearm_reread_failed`) et l'`info!`
+/// `rearm_refused_consent_withdrawn` de [`write_rearm_consent_terminal`]
+/// **restent où ils sont** : ils portent `error`, `detail` et le texte de remède
+/// qu'un opérateur lit quand quelque chose a mal tourné. Ce sont des lignes de
+/// *diagnostic*, et elles ne sont émises que sur les branches anormales — donc
+/// elles n'ont pas de dénominateur et ne peuvent pas servir de compte.
+///
+/// La ligne de *recensement* `rearm_consent_checked`, émise par l'enveloppe sur
+/// **les huit** branches, branche saine comprise, est l'autre question : elle
+/// répond à AC4, pas à « qu'est-ce qui a échoué ? ». Ce n'est donc pas un
+/// doublon, et les deux ne se remplacent pas (mika#1833, mika#1926).
+///
 /// # Pourquoi un prédicat d'état et pas celui de mika#2995
 ///
 /// mika#2995 garde la **promotion** d'un lanceur différé avec le prédicat de
@@ -5858,12 +5896,12 @@ pub(crate) enum RearmOutcome {
 /// `0529ed9b`/#3044. La question d'AC1 est « le consentement tient-il à cet
 /// instant ? », pas « qui l'a retiré ? » — un prédicat d'état, donc, et des
 /// raisons terminales distinctes de celles de mika#2995.
-async fn reread_consent_before_rearm(
+async fn reread_consent_verdict(
     db: &AsyncDatabase,
     parent_task_id: &str,
     github_token: Option<&str>,
     cause: &str,
-) -> Option<RearmOutcome> {
+) -> (RearmConsentCensus, Option<RearmOutcome>) {
     use crate::ready_label::{
         ISSUE_CLOSED_AT_REARM_REASON, READY_ABSENT_AT_REARM_REASON, RearmConsent,
         parse_ready_label_task_label, reread_issue_consent_via_gh,
@@ -5874,7 +5912,7 @@ async fn reread_consent_before_rearm(
         // Aucune parente, donc aucune classe à discriminer : rien à relire. Le
         // ré-armement qui suit insérera un lanceur sans parente vivante, ce
         // qu'il faisait déjà — ce vol ne change pas cette population.
-        Ok(None) => return None,
+        Ok(None) => return (RearmConsentCensus::ParentAbsent, None),
         Err(e) => {
             // Fail-closed, et ce choix ne coûte rien de neuf : les deux gardes
             // suivantes (`get_stuck_rearm_count`,
@@ -5890,7 +5928,10 @@ async fn reread_consent_before_rearm(
                 error = %e,
                 "mika#3050 : parente illisible — pas de ré-armement à ce tick"
             );
-            return Some(RearmOutcome::NotNow);
+            return (
+                RearmConsentCensus::ParentUnreadable,
+                Some(RearmOutcome::NotNow),
+            );
         }
     };
 
@@ -5899,11 +5940,13 @@ async fn reread_consent_before_rearm(
     // émis. C'est ce que T6 atteste par un `recorded_calls()` vide — l'issue
     // rendue seule ne le dirait pas.
     //
-    // `?` et non un `let … else { return None }` : `None` veut dire « ré-armer
-    // comme avant » dans les deux cas, et clippy::question_mark refuse la forme
-    // longue. Le `?` porte donc ici la décision d'AC3 — le commentaire
-    // ci-dessus est ce qui l'empêche de se lire comme une propagation d'erreur.
-    let (owner_repo, issue) = parse_ready_label_task_label(&parent.label)?;
+    // La sortie rend `None` comme la branche saine — « ré-armer comme avant » —
+    // mais son verdict la distingue : `other_class` est la population d'AC3, et
+    // la confondre avec un `held` absent est ce que le § 1 du plan reproche aux
+    // trois lignes `*_rearmed`.
+    let Some((owner_repo, issue)) = parse_ready_label_task_label(&parent.label) else {
+        return (RearmConsentCensus::OtherClass, None);
+    };
 
     let Some(token) = github_token else {
         warn!(
@@ -5914,31 +5957,57 @@ async fn reread_consent_before_rearm(
             cause,
             "mika#3050 : aucun jeton GitHub résolu — pas de ré-armement à ce tick"
         );
-        return Some(RearmOutcome::NotNow);
+        return (
+            RearmConsentCensus::NoToken {
+                repo: owner_repo,
+                issue,
+            },
+            Some(RearmOutcome::NotNow),
+        );
     };
 
     match reread_issue_consent_via_gh(token, &owner_repo, issue).await {
         // La forme des quatre premiers cas du tableau : on ré-arme comme avant.
-        Ok(RearmConsent::Held) => None,
-        Ok(RearmConsent::ReadyAbsent) => Some(
-            write_rearm_consent_terminal(
-                db,
-                &parent,
-                &owner_repo,
+        // Son verdict est le **dénominateur d'AC4**, et c'est la seule branche
+        // que le vol précédent ne rendait pas comptable.
+        Ok(RearmConsent::Held) => (
+            RearmConsentCensus::Held {
+                repo: owner_repo,
                 issue,
-                READY_ABSENT_AT_REARM_REASON,
-            )
-            .await,
+            },
+            None,
         ),
-        Ok(RearmConsent::Closed) => Some(
-            write_rearm_consent_terminal(
-                db,
-                &parent,
-                &owner_repo,
+        Ok(RearmConsent::ReadyAbsent) => (
+            RearmConsentCensus::ReadyAbsent {
+                repo: owner_repo.clone(),
                 issue,
-                ISSUE_CLOSED_AT_REARM_REASON,
-            )
-            .await,
+            },
+            Some(
+                write_rearm_consent_terminal(
+                    db,
+                    &parent,
+                    &owner_repo,
+                    issue,
+                    READY_ABSENT_AT_REARM_REASON,
+                )
+                .await,
+            ),
+        ),
+        Ok(RearmConsent::Closed) => (
+            RearmConsentCensus::IssueClosed {
+                repo: owner_repo.clone(),
+                issue,
+            },
+            Some(
+                write_rearm_consent_terminal(
+                    db,
+                    &parent,
+                    &owner_repo,
+                    issue,
+                    ISSUE_CLOSED_AT_REARM_REASON,
+                )
+                .await,
+            ),
         ),
         // AC2 — une relecture qui échoue ne ré-arme pas à ce tick, et ne pose
         // aucun terminal. L'asymétrie est chiffrée : un faux négatif coûte un
@@ -5954,7 +6023,13 @@ async fn reread_consent_before_rearm(
                 detail = %detail,
                 "mika#3050 : relecture du ticket impossible — pas de ré-armement à ce tick"
             );
-            Some(RearmOutcome::NotNow)
+            (
+                RearmConsentCensus::RereadFailed {
+                    repo: owner_repo,
+                    issue,
+                },
+                Some(RearmOutcome::NotNow),
+            )
         }
     }
 }
