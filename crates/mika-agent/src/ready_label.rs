@@ -575,6 +575,114 @@ pub(crate) enum RearmConsent {
     Closed,
 }
 
+/// Pourquoi la garde de ré-armement a tranché comme elle l'a fait (mika#3050 D1).
+///
+/// Vocabulaire **clos** de ce que la garde de `reread_consent_before_rearm`
+/// observe, de la parente introuvable jusqu'au consentement qui tient. C'est le
+/// verdict que porte la ligne de recensement `rearm_consent_checked`, un par
+/// branche de la garde, **branche saine comprise** : le motif de
+/// `kg_budget_resolved` (mika#1833) et de `team_stop_topic_inheritance`
+/// (mika#1926) — *un recensement qui ne compte que les anomalies n'a pas de
+/// dénominateur.*
+///
+/// Huit variantes et non trois, parce que chaque absence a sa cause et que les
+/// fusionner les rend non-soustractibles (mika#2205) :
+///
+/// - [`Held`](Self::Held) est le **dénominateur d'AC4** — les ré-armements de
+///   parentes `ready-label` effectivement partis.
+/// - [`ReadyAbsent`](Self::ReadyAbsent) et [`IssueClosed`](Self::IssueClosed)
+///   sont les deux refus d'AC1, qui portent déjà des raisons d'audit distinctes
+///   (`ready_absent_at_rearm` / `issue_closed_at_rearm`) et qu'un verdict
+///   commun aurait re-fusionnées.
+/// - [`ParentUnreadable`](Self::ParentUnreadable),
+///   [`RereadFailed`](Self::RereadFailed) et [`NoToken`](Self::NoToken) sont les
+///   trois fail-closed d'AC2, chacun sous son nom.
+/// - [`OtherClass`](Self::OtherClass) est la population d'AC3, **comptable** au
+///   lieu d'inférable par soustraction.
+/// - [`ParentAbsent`](Self::ParentAbsent) est la parente que la base ne rend
+///   plus, et qui n'est ni un refus ni un consentement.
+///
+/// Les coordonnées sont portées par la variante plutôt qu'à côté d'elle, parce
+/// que les trois premières n'en ont **pas** : la classe de la parente n'est
+/// connue qu'après [`parse_ready_label_task_label`], donc un `repo: String`
+/// commun aurait dû valoir `""` sur ces branches — et `""` se lit comme une
+/// coordonnée dans un log (mika#2331 : une absence n'est pas un zéro).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RearmConsentCensus {
+    /// La base ne rend plus la parente : rien à ré-armer, et rien à refuser.
+    ParentAbsent,
+    /// La lecture de la parente a échoué — fail-closed, sans coordonnées parce
+    /// que c'est la ligne de la parente qui manque.
+    ParentUnreadable,
+    /// La parente n'est pas de la classe `ready-label` : la garde ne la regarde
+    /// pas, et son ré-armement suit le chemin d'avant #3052 (AC3).
+    OtherClass,
+    /// Parente `ready-label`, mais aucun token de forge : fail-closed avant tout
+    /// appel réseau.
+    NoToken { repo: String, issue: u64 },
+    /// La relecture à la forge a échoué : fail-closed, et surtout **pas** un
+    /// retrait de consentement.
+    RereadFailed { repo: String, issue: u64 },
+    /// Ouvert et portant `ready` : le consentement tient, le ré-armement part.
+    Held { repo: String, issue: u64 },
+    /// Ouvert, mais `ready` a été retiré depuis la mise en file.
+    ReadyAbsent { repo: String, issue: u64 },
+    /// Fermé depuis la mise en file.
+    IssueClosed { repo: String, issue: u64 },
+}
+
+impl RearmConsentCensus {
+    /// L'étiquette que lit l'opérateur dans le champ `verdict` de la ligne.
+    ///
+    /// Le `match` est exhaustif **sans bras `_ =>`** (mika#2290, mika#2413) :
+    /// une neuvième branche de la garde ne compilera pas sans se nommer ici, et
+    /// ne pourra donc pas se faire compter sous une étiquette qui décrit autre
+    /// chose.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::ParentAbsent => "parent_absent",
+            Self::ParentUnreadable => "parent_unreadable",
+            Self::OtherClass => "other_class",
+            Self::NoToken { .. } => "no_token",
+            Self::RereadFailed { .. } => "reread_failed",
+            Self::Held { .. } => "held",
+            Self::ReadyAbsent { .. } => "ready_absent",
+            Self::IssueClosed { .. } => "issue_closed",
+        }
+    }
+
+    /// Le `owner/repo` du ticket relu, ou `None` quand la branche n'en a pas.
+    ///
+    /// `None` et non `""` : le champ doit être **absent** du log, pas vide
+    /// (mika#2331). L'`impl Value for Option<T>` de `tracing` s'en charge dès
+    /// lors que c'est bien un `Option` qu'on lui passe.
+    pub(crate) fn repo(&self) -> Option<&str> {
+        match self {
+            Self::ParentAbsent | Self::ParentUnreadable | Self::OtherClass => None,
+            Self::NoToken { repo, .. }
+            | Self::RereadFailed { repo, .. }
+            | Self::Held { repo, .. }
+            | Self::ReadyAbsent { repo, .. }
+            | Self::IssueClosed { repo, .. } => Some(repo.as_str()),
+        }
+    }
+
+    /// Le numéro du ticket relu, ou `None` quand la branche n'en a pas.
+    ///
+    /// `None` et non `0` : `0` n'est pas un numéro de ticket, mais il en a la
+    /// forme, et un `jq` qui l'additionne ne s'en apercevra pas.
+    pub(crate) fn issue(&self) -> Option<u64> {
+        match self {
+            Self::ParentAbsent | Self::ParentUnreadable | Self::OtherClass => None,
+            Self::NoToken { issue, .. }
+            | Self::RereadFailed { issue, .. }
+            | Self::Held { issue, .. }
+            | Self::ReadyAbsent { issue, .. }
+            | Self::IssueClosed { issue, .. } => Some(*issue),
+        }
+    }
+}
+
 /// Relit l'état d'un ticket à la forge : ouvert, et portant `ready` ? (D2)
 ///
 /// Frère du prédicat de parc ci-dessus, et volontairement **pas le même** : le
@@ -2327,6 +2435,272 @@ async fn consomme(db: &AsyncDatabase, id: &str) {
         assert_eq!(
             argv[0],
             format!("issue view {n} --repo senara-solutions/mika --json state,labels"),
+        );
+    }
+
+    // ───── mika#3050 D1 — le vocabulaire du recensement de ré-armement ─────
+
+    /// Les huit variantes, une par branche de la garde, dans l'ordre du type.
+    ///
+    /// Énumérées **à la main** et non dérivées : c'est la liste que le `match`
+    /// de `as_str` doit couvrir, et une liste calculée depuis le type ne
+    /// refuserait rien de plus que le compilateur.
+    fn les_huit_verdicts() -> Vec<RearmConsentCensus> {
+        vec![
+            RearmConsentCensus::ParentAbsent,
+            RearmConsentCensus::ParentUnreadable,
+            RearmConsentCensus::OtherClass,
+            RearmConsentCensus::NoToken {
+                repo: "x/y".to_string(),
+                issue: 1,
+            },
+            RearmConsentCensus::RereadFailed {
+                repo: "x/y".to_string(),
+                issue: 2,
+            },
+            RearmConsentCensus::Held {
+                repo: "x/y".to_string(),
+                issue: 3,
+            },
+            RearmConsentCensus::ReadyAbsent {
+                repo: "x/y".to_string(),
+                issue: 4,
+            },
+            RearmConsentCensus::IssueClosed {
+                repo: "x/y".to_string(),
+                issue: 5,
+            },
+        ]
+    }
+
+    /// **D1 — les huit étiquettes sont deux à deux distinctes, et portent leurs
+    /// coordonnées ou leur absence.**
+    ///
+    /// Ce que ce test refuse : deux branches de la garde comptées sous la même
+    /// étiquette. Un `verdict` partagé entre `ready_absent` et `issue_closed`,
+    /// ou entre les trois fail-closed, rendrait leurs comptes non-soustractibles
+    /// (mika#2205) — et c'est exactement le défaut que le § 1 du plan reproche
+    /// aux trois lignes `*_rearmed`, qui ne disent pas la classe de la parente.
+    ///
+    /// Il refuse aussi une coordonnée **vide** : `repo = ""` et `issue = 0` ont
+    /// la forme d'une réponse et n'en sont pas une (mika#2331). Les trois
+    /// branches sans coordonnées rendent `None`, que `tracing` traduit par un
+    /// champ absent du log ; les cinq autres rendent ce qu'elles ont lu.
+    #[test]
+    fn mika3050_les_huit_verdicts_portent_des_etiquettes_distinctes() {
+        let verdicts = les_huit_verdicts();
+        let etiquettes: Vec<&str> = verdicts.iter().map(|v| v.as_str()).collect();
+
+        let mut triees = etiquettes.clone();
+        triees.sort_unstable();
+        triees.dedup();
+        assert_eq!(
+            triees.len(),
+            8,
+            "deux branches de la garde partagent une étiquette, donc leurs comptes \
+             ne se soustraient plus : {etiquettes:?}"
+        );
+
+        for e in &etiquettes {
+            assert!(
+                !e.is_empty()
+                    && e.chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "`{e}` n'est pas une étiquette `snake_case` : un `jq` sur `verdict` \
+                 la groupe, donc sa forme est un contrat de lecture"
+            );
+        }
+
+        // Les trois sans coordonnées : la classe de la parente n'est pas encore
+        // connue, ou la parente elle-même manque.
+        for v in verdicts.iter().take(3) {
+            assert_eq!(
+                (v.repo(), v.issue()),
+                (None, None),
+                "`{}` n'a pas de coordonnées : elles doivent être ABSENTES, \
+                 jamais \"\" ni 0 (mika#2331)",
+                v.as_str()
+            );
+        }
+        // Les cinq autres les portent, et les rendent telles quelles.
+        for (i, v) in verdicts.iter().skip(3).enumerate() {
+            assert_eq!(
+                (v.repo(), v.issue()),
+                (Some("x/y"), Some(i as u64 + 1)),
+                "`{}` doit rendre les coordonnées qu'il porte",
+                v.as_str()
+            );
+        }
+    }
+
+    /// **Les écrivains de `rearm_consent_checked` qui sont DÉCLARÉS — aucun.**
+    ///
+    /// `(chemin depuis la racine du dépôt, ticket, le fait précis)`. L'événement
+    /// est créé par ce vol : son unique site est celui que ce vol écrit, donc il
+    /// n'existe aucune violation préexistante à déclarer.
+    ///
+    /// Elle est assurée vide plutôt que supposée vide (test ci-dessous) : y
+    /// ajouter une entrée exige de rougir ce test et d'y écrire la donnée
+    /// précise, son ticket de suivi et sa raison. C'est ce qui sépare une
+    /// déclaration d'une allowlist (mika#2309).
+    const CENSUS_WRITER_DECLARED: &[(&str, &str, &str)] = &[];
+
+    /// **Fire-Disposition option (a) — l'allowlist d'écrivain est livrée VIDE.**
+    ///
+    /// Le scan d'écrivain unique du § 9 exige **exactement un** site émettant
+    /// `rearm_consent_checked`. Son allowlist est vide à la livraison, et ce
+    /// test fixe ce fait pour qu'une entrée future soit un geste explicite plutôt
+    /// qu'une dérive silencieuse.
+    ///
+    /// Disposition si un second écrivain apparaît : ramener l'émission au site
+    /// unique de `reread_consent_before_rearm`, jamais ajouter une ligne ici.
+    /// Deux sites doubleraient le dénominateur d'AC4 sans que rien ne le dise.
+    #[test]
+    fn mika3050_lallowlist_decrivain_du_recensement_est_vide() {
+        assert!(
+            CENSUS_WRITER_DECLARED.is_empty(),
+            "l'allowlist d'écrivain de `rearm_consent_checked` n'est plus vide : {:?}. \
+             Un second écrivain double le dénominateur d'AC4 — ramenez l'émission au \
+             site unique au lieu de la déclarer.",
+            CENSUS_WRITER_DECLARED
+        );
+    }
+
+    /// Le nom de l'événement, tel que la production l'écrit. C'est un **littéral**
+    /// à son site d'émission : le scan ci-dessous cherche donc la même forme.
+    const CENSUS_EVENT_LITERAL: &str = "rearm_consent_checked";
+
+    /// Les sites qui émettent `rearm_consent_checked`, un par ligne non-commentaire
+    /// portant le littéral.
+    ///
+    /// Paramétré par ses fichiers plutôt que les lisant lui-même : c'est ce qui
+    /// rend le contrôle de bonne foi possible. Un scan qui lit le disque ne peut
+    /// pas être mis à l'épreuve sans écrire dans l'arbre.
+    ///
+    /// Les commentaires sont retirés d'abord ([`crate::source_scan::strip_comment_lines`])
+    /// — le doc-comment de l'enveloppe nomme l'événement pour dire qu'elle en est
+    /// le seul écrivain, et une prose qui *décrit* le motif ne doit pas se lire
+    /// comme une violation de celui-ci (classe mika#2323). Le numéro de ligne
+    /// n'est donc pas rapporté : après la coupe, il ne désigne plus rien dans le
+    /// fichier d'origine, et un numéro faux dans un message d'échec envoie le
+    /// lecteur au mauvais endroit.
+    fn census_writers_in(files: &[(String, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, prod) in files {
+            let hits = crate::source_scan::strip_comment_lines(prod)
+                .lines()
+                .filter(|l| l.contains(CENSUS_EVENT_LITERAL))
+                .count();
+            for _ in 0..hits {
+                out.push(format!("src/{rel}"));
+            }
+        }
+        out
+    }
+
+    /// **Un seul écrivain du recensement, et c'est une égalité.**
+    ///
+    /// AC4 compte des ré-armements à partir de cette ligne, donc le dénominateur
+    /// qu'elle fournit n'est juste que si elle est émise **une fois par passage**.
+    /// Un second site l'émettrait sur un sous-ensemble des branches, et le
+    /// quotient qu'un opérateur en tire serait faux sans que rien ne l'en avertisse
+    /// — un instrument qui compte deux fois ne se signale pas, il se lit.
+    ///
+    /// L'assertion est une **égalité**, pas un `<=` : zéro écrivain est une
+    /// régression aussi réelle que deux. Supprimer la ligne rendrait tous les
+    /// tests de `RearmOutcome` de #3052 verts, et AC4 muette.
+    #[test]
+    fn mika3050_levenement_de_recensement_a_un_ecrivain_unique() {
+        let writers = census_writers_in(&crate::source_scan::production_files());
+        assert_eq!(
+            writers.len(),
+            1,
+            "`{CENSUS_EVENT_LITERAL}` doit avoir exactement un écrivain de \
+             production ; trouvés : {writers:?}. Deux sites doublent le \
+             dénominateur d'AC4, zéro la rend muette. Ramenez l'émission à \
+             l'enveloppe `reread_consent_before_rearm` plutôt que d'ajouter une \
+             entrée à `CENSUS_WRITER_DECLARED`."
+        );
+        assert_eq!(
+            writers[0], "src/skills/executor.rs",
+            "l'écrivain doit être l'enveloppe de la garde, pas un autre module"
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus : il rougit bien sur un second
+    /// site.
+    ///
+    /// Sans ce contrôle, un scan dont le prédicat ne trouve plus rien — littéral
+    /// renommé, coupe de commentaires trop large — passe au vert en comptant zéro
+    /// puis *un*, et l'égalité le masquerait. Le fichier synthétique porte aussi
+    /// une **prose** nommant l'événement, pour que la coupe des commentaires soit
+    /// attestée en même temps que la détection.
+    #[test]
+    fn mika3050_le_scan_decrivain_rougit_sur_un_second_site() {
+        let synthetic = vec![
+            (
+                "skills/executor.rs".to_string(),
+                "    info!(event = \"rearm_consent_checked\", verdict = c.as_str());\n".to_string(),
+            ),
+            (
+                "task_engine/engine.rs".to_string(),
+                "    // Cette prose nomme `rearm_consent_checked` sans l'émettre.\n\
+                 /// Et ce doc-comment aussi : `rearm_consent_checked`.\n\
+                 info!(event = \"rearm_consent_checked\", verdict = \"held\");\n"
+                    .to_string(),
+            ),
+        ];
+        assert_eq!(
+            census_writers_in(&synthetic),
+            vec!["src/skills/executor.rs", "src/task_engine/engine.rs"],
+            "le scan doit voir les deux sites et aucune des deux proses"
+        );
+    }
+
+    /// **L'enveloppe émet sans condition — c'est ce qui fait les huit branches.**
+    ///
+    /// Les cinq tests de capture de `skills::executor::tests::mika3050_recensement`
+    /// atteignent sept des huit branches par un chemin réel. La huitième, et plus
+    /// généralement la propriété « *toutes* les branches », n'est pas une somme de
+    /// tests : c'est une propriété du **corps** de l'enveloppe, qui appelle
+    /// `reread_consent_verdict` puis émet, sans rien examiner entre les deux.
+    ///
+    /// Un `if` ajouté là — « n'émettons pas sur la branche saine, elle est
+    /// bruyante » — redonnerait exactement le défaut que ce vol ferme : un
+    /// numérateur sans dénominateur. Aucun test de comportement ne le verrait,
+    /// puisque les sept autres branches resteraient recensées.
+    ///
+    /// Ce test n'est pas au § 5 du plan ; il y est ajouté parce que le
+    /// doc-comment de l'enveloppe promet cette absence d'embranchement et qu'une
+    /// promesse non gardée s'érode.
+    #[test]
+    fn mika3050_lenveloppe_emet_sans_condition() {
+        let (_, prod) = crate::source_scan::production_files()
+            .into_iter()
+            .find(|(rel, _)| rel == "skills/executor.rs")
+            .expect("le site de la garde doit être un fichier de production");
+        let (_, body) = crate::source_scan::fn_bodies(&prod)
+            .into_iter()
+            .find(|(name, _)| name == "reread_consent_before_rearm")
+            .expect("l'enveloppe de la garde doit être trouvable par son nom");
+
+        for keyword in ["if", "match", "else"] {
+            let branching: Vec<&str> = body
+                .lines()
+                .filter(|l| crate::source_scan::occurs_at_boundary(l, keyword, true))
+                .collect();
+            assert!(
+                branching.is_empty(),
+                "le corps de `reread_consent_before_rearm` porte un `{keyword}` : \
+                 {branching:?}. L'émission inconditionnelle EST la propriété « les \
+                 huit branches sont recensées » ; un embranchement ici rend AC4 \
+                 partielle sans qu'aucun test de comportement ne rougisse."
+            );
+        }
+        assert!(
+            body.contains(CENSUS_EVENT_LITERAL),
+            "…et le corps doit bien porter l'émission : un corps vide passerait \
+             l'assertion ci-dessus"
         );
     }
 }

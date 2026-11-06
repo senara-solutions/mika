@@ -11770,7 +11770,13 @@ mod tests {
         /// de résoudre le jeton ; s'il devait le résoudre d'abord, un
         /// dispatcher de test sans jeton reporterait ce tour et ce test serait
         /// rouge. C'est l'ordre lui-même qui est épinglé ici.
+        // `#[serial_test::serial]` : ce test traverse `rearm_consumed_deferred_wrapper`,
+        // donc le callsite de `rearm_consent_checked` (mika#3050 D3), qu'il ne capture
+        // pas. Un poisonneur non annoté éteint l'`Interest` du callsite pour tout le
+        // processus et rend la capture muette ailleurs (doctrine mika#2646, au
+        // sous-module `mika3050_recensement` de `skills::executor::tests`).
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2995_une_parente_de_groom_est_inchangee_de_bout_en_bout() {
             let db = test_db();
             let mock = Arc::new(

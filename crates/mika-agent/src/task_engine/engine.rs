@@ -8093,7 +8093,17 @@ mod tests {
 
     /// Rung 2: orphaned with budget left -> re-armed, still `pending`, and a
     /// fresh wrapper now represents it.
+    // `#[serial_test::serial]` sur les dix-huit tests de ce module qui traversent
+    // `rearm_deferred_callback` : ils atteignent le callsite de
+    // `rearm_consent_checked` (mika#3050 D3) sans le capturer, et le premier
+    // thread qui atteint un callsite `tracing` y fixe son `Interest` — sans
+    // abonné, il l'éteint pour tout le processus. Ce sont donc des poisonneurs, et
+    // `#[serial]` ne sérialise que contre ses propres porteurs : les annoter est
+    // la moitié porteuse de la capture (doctrine mika#2646, défaut fondateur :
+    // PR #2643). La liste vient d'une mesure, pas d'une estimation — voir le
+    // sous-module `mika3050_recensement` de `skills::executor::tests`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stuck_pending_reaper_rearms_before_expiring() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -8130,6 +8140,7 @@ mod tests {
     /// `implement` would queue a `dev-pilot` run for work that still needs
     /// `dev-groom`, and would occupy the wrong slot doing it.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stuck_pending_reaper_repairs_into_the_parents_own_class() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -8167,6 +8178,7 @@ mod tests {
     /// La forme jouée est celle de `0529ed9b`/#3044 : `ready` retiré pendant que
     /// la parente attendait sa grâce de 45 minutes, puis le ré-armement.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3050_the_reaper_refuses_a_rearm_whose_ticket_withdrew_its_ready() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -8518,6 +8530,7 @@ mod tests {
     /// Reddens on `main` on assertion: there `rearm_deferred_callback` returns
     /// `Unrepairable`, the value is discarded, and the parent stays `blocked`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_replay_2026_09_04_live_blocked_parent_budget_exhausted() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -8562,6 +8575,7 @@ mod tests {
     /// proves NO reddening and is deliberately excluded from the anti-vacuity
     /// protocol; mixing it into L4a or L4b would destroy their proof.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_replay_2026_09_04_stale_blocked_sweep_recovers() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -8590,6 +8604,7 @@ mod tests {
     /// L4c, second branch: budget spent -> the net writes a visible failure
     /// naming `stale_blocked_dispatch` rather than leaving the parent blocked.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_replay_2026_09_04_stale_blocked_sweep_expires_without_budget() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -8943,6 +8958,7 @@ mod tests {
     /// Reddens on `main` on the first half: there the sibling changes nothing,
     /// the re-arm succeeds, and `stuck_rearm_count` reaches 1.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2413_the_guard_reads_the_wrapper_population_and_nothing_else() {
         // Half A — a live sibling exists: refuse, spend nothing.
         {
@@ -9056,6 +9072,7 @@ mod tests {
     /// for the whole liveness window, and mika#2045's repair would be dead on
     /// that path.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2413_a_wrapper_cannot_represent_its_own_parent() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9186,6 +9203,7 @@ mod tests {
     /// Rung 3: budget spent -> expired, and the freed slot lets the `ready`
     /// sweep create a replacement for the same issue.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stuck_pending_reaper_expires_once_budget_is_spent() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9241,6 +9259,7 @@ mod tests {
     /// replay a dispatch against a dead parent while a live replacement exists
     /// for the same issue. It must be cancelled first.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stuck_pending_reaper_cancels_surviving_wrappers_on_expiry() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9475,6 +9494,7 @@ mod tests {
     /// the reaper must still repair (mika#2181). This is the guard that keeps the
     /// bound from drifting to infinity in a later refactor.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_reaper_repairs_when_promoted_wrapper_is_stale() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9547,6 +9567,7 @@ mod tests {
     /// AC4 (mika#2181): the re-arm event names which wrappers the reaper saw and
     /// what statuses produced the "absent" verdict.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stuck_pending_rearm_audit_names_the_wrappers_seen() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9571,6 +9592,7 @@ mod tests {
 
     /// AC4, the empty rendering: a parent that never had a wrapper says so.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stuck_pending_rearm_audit_renders_wrappers_none() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9592,6 +9614,7 @@ mod tests {
     /// AC4 on the other terminal event: expiry ends the battle and reads even
     /// worse than a re-arm, so it carries the same inventory.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stuck_pending_expiry_audit_names_the_wrappers_seen() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9818,6 +9841,7 @@ mod tests {
     /// un prédicat cassé dans l'autre direction (qui n'épargne jamais personne)
     /// rougit sur la seconde assertion.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2184_activity_of_another_parent_does_not_spare_the_candidate() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9865,6 +9889,7 @@ mod tests {
     /// classification est `Silent`, et le comportement est celui d'aujourd'hui,
     /// bit pour bit (R5).
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2184_a_genuinely_dead_turn_is_still_rearmed_then_expired() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
@@ -9906,6 +9931,7 @@ mod tests {
     /// en prudence. Le test rejoue la **même entrée** sous deux uptimes et exige
     /// deux verdicts opposés.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2184_a_young_process_spares_and_the_ignorance_extinguishes_itself() {
         // Uptime 120 s < window 600 s: the process could not have observed.
         let db = test_db();
@@ -9943,6 +9969,7 @@ mod tests {
     /// cadavre-bouclier que mika#2181 a dû borner — *ce qui ne peut pas
     /// s'éteindre tout seul ne peut pas épargner.*
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2184_disarmed_telemetry_reaps_rather_than_spares() {
         let db = test_db();
         let dispatcher = test_dispatcher_with(db.clone(), |s| {

@@ -18,6 +18,7 @@ use super::manifest::ToolHandler;
 use crate::async_db::AsyncDatabase;
 use crate::db::{self, NewTask};
 use crate::github_graphql::{fetch_issue_body, fetch_pr_summary, parse_pr_url};
+use crate::ready_label::RearmConsentCensus;
 use crate::task_engine::types::{action_type, trigger_type};
 use crate::task_state::tasks::{DISPATCH_NO_GROOMING_MARKER, GroomConvergence};
 use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
@@ -5848,6 +5849,68 @@ pub(crate) enum RearmOutcome {
 /// et c'est **ici, une seule fois, au site de la garde** que le terminal et la
 /// ligne d'audit d'AC1 sont écrits (D6).
 ///
+/// La décision elle-même vit dans [`reread_consent_verdict`], qui rend en plus
+/// le verdict de recensement ; cette fonction-ci en est l'enveloppe, et sa
+/// signature est celle d'avant mika#3050 D2 — ses trois appelants n'ont pas
+/// bougé.
+///
+/// # L'écrivain unique du recensement (D3)
+///
+/// Cette enveloppe est **le seul site** qui émet `rearm_consent_checked`, et
+/// elle l'émet **inconditionnellement** : son corps n'a ni `if` ni `match`, donc
+/// les huit branches de la garde passent par cette ligne, branche saine
+/// comprise. C'est ce qui donne au recensement son dénominateur — un compte
+/// d'anomalies seules n'en a pas (mika#1833, mika#1926), et deux sites
+/// émetteurs doubleraient celui-ci en silence. Les deux propriétés sont
+/// gardées : l'unicité par le scan de source
+/// `mika3050_levenement_de_recensement_a_un_ecrivain_unique`, l'absence
+/// d'embranchement par `mika3050_lenveloppe_emet_sans_condition`.
+async fn reread_consent_before_rearm(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    github_token: Option<&str>,
+    cause: &str,
+) -> Option<RearmOutcome> {
+    let (census, outcome) = reread_consent_verdict(db, parent_task_id, github_token, cause).await;
+    info!(
+        target: "mika::otel",
+        event = "rearm_consent_checked",
+        parent_task_id,
+        cause,
+        verdict = census.as_str(),
+        // `Option` et non une valeur de repli : sur les trois branches sans
+        // coordonnées le champ doit être **absent** du log, pas vide. `""` et
+        // `0` ont la forme d'une réponse sans en être une, et un `jq` qui les
+        // agrège ne s'en aperçoit pas (mika#2331).
+        repo = census.repo(),
+        issue = census.issue(),
+    );
+    outcome
+}
+
+/// La décision de la garde, **et le verdict qui la décrit** (mika#3050 D2).
+///
+/// Le corps de [`reread_consent_before_rearm`] d'avant la scission, à ceci près
+/// que chacune de ses sorties rend aussi le [`RearmConsentCensus`] qui la nomme.
+/// La logique de décision est inchangée — mêmes verdicts, mêmes terminaux,
+/// mêmes raisons d'audit qu'au merge de #3052 — et les treize tests qui la
+/// tiennent le vérifient sans modification.
+///
+/// # Diagnostic et recensement ne sont pas le même log
+///
+/// Les trois `warn!` ci-dessous (`rearm_parent_unreadable`,
+/// `rearm_reread_no_token`, `rearm_reread_failed`) et l'`info!`
+/// `rearm_refused_consent_withdrawn` de [`write_rearm_consent_terminal`]
+/// **restent où ils sont** : ils portent `error`, `detail` et le texte de remède
+/// qu'un opérateur lit quand quelque chose a mal tourné. Ce sont des lignes de
+/// *diagnostic*, et elles ne sont émises que sur les branches anormales — donc
+/// elles n'ont pas de dénominateur et ne peuvent pas servir de compte.
+///
+/// La ligne de *recensement* `rearm_consent_checked`, émise par l'enveloppe sur
+/// **les huit** branches, branche saine comprise, est l'autre question : elle
+/// répond à AC4, pas à « qu'est-ce qui a échoué ? ». Ce n'est donc pas un
+/// doublon, et les deux ne se remplacent pas (mika#1833, mika#1926).
+///
 /// # Pourquoi un prédicat d'état et pas celui de mika#2995
 ///
 /// mika#2995 garde la **promotion** d'un lanceur différé avec le prédicat de
@@ -5858,12 +5921,12 @@ pub(crate) enum RearmOutcome {
 /// `0529ed9b`/#3044. La question d'AC1 est « le consentement tient-il à cet
 /// instant ? », pas « qui l'a retiré ? » — un prédicat d'état, donc, et des
 /// raisons terminales distinctes de celles de mika#2995.
-async fn reread_consent_before_rearm(
+async fn reread_consent_verdict(
     db: &AsyncDatabase,
     parent_task_id: &str,
     github_token: Option<&str>,
     cause: &str,
-) -> Option<RearmOutcome> {
+) -> (RearmConsentCensus, Option<RearmOutcome>) {
     use crate::ready_label::{
         ISSUE_CLOSED_AT_REARM_REASON, READY_ABSENT_AT_REARM_REASON, RearmConsent,
         parse_ready_label_task_label, reread_issue_consent_via_gh,
@@ -5874,7 +5937,7 @@ async fn reread_consent_before_rearm(
         // Aucune parente, donc aucune classe à discriminer : rien à relire. Le
         // ré-armement qui suit insérera un lanceur sans parente vivante, ce
         // qu'il faisait déjà — ce vol ne change pas cette population.
-        Ok(None) => return None,
+        Ok(None) => return (RearmConsentCensus::ParentAbsent, None),
         Err(e) => {
             // Fail-closed, et ce choix ne coûte rien de neuf : les deux gardes
             // suivantes (`get_stuck_rearm_count`,
@@ -5890,7 +5953,10 @@ async fn reread_consent_before_rearm(
                 error = %e,
                 "mika#3050 : parente illisible — pas de ré-armement à ce tick"
             );
-            return Some(RearmOutcome::NotNow);
+            return (
+                RearmConsentCensus::ParentUnreadable,
+                Some(RearmOutcome::NotNow),
+            );
         }
     };
 
@@ -5899,11 +5965,13 @@ async fn reread_consent_before_rearm(
     // émis. C'est ce que T6 atteste par un `recorded_calls()` vide — l'issue
     // rendue seule ne le dirait pas.
     //
-    // `?` et non un `let … else { return None }` : `None` veut dire « ré-armer
-    // comme avant » dans les deux cas, et clippy::question_mark refuse la forme
-    // longue. Le `?` porte donc ici la décision d'AC3 — le commentaire
-    // ci-dessus est ce qui l'empêche de se lire comme une propagation d'erreur.
-    let (owner_repo, issue) = parse_ready_label_task_label(&parent.label)?;
+    // La sortie rend `None` comme la branche saine — « ré-armer comme avant » —
+    // mais son verdict la distingue : `other_class` est la population d'AC3, et
+    // la confondre avec un `held` absent est ce que le § 1 du plan reproche aux
+    // trois lignes `*_rearmed`.
+    let Some((owner_repo, issue)) = parse_ready_label_task_label(&parent.label) else {
+        return (RearmConsentCensus::OtherClass, None);
+    };
 
     let Some(token) = github_token else {
         warn!(
@@ -5914,31 +5982,57 @@ async fn reread_consent_before_rearm(
             cause,
             "mika#3050 : aucun jeton GitHub résolu — pas de ré-armement à ce tick"
         );
-        return Some(RearmOutcome::NotNow);
+        return (
+            RearmConsentCensus::NoToken {
+                repo: owner_repo,
+                issue,
+            },
+            Some(RearmOutcome::NotNow),
+        );
     };
 
     match reread_issue_consent_via_gh(token, &owner_repo, issue).await {
         // La forme des quatre premiers cas du tableau : on ré-arme comme avant.
-        Ok(RearmConsent::Held) => None,
-        Ok(RearmConsent::ReadyAbsent) => Some(
-            write_rearm_consent_terminal(
-                db,
-                &parent,
-                &owner_repo,
+        // Son verdict est le **dénominateur d'AC4**, et c'est la seule branche
+        // que le vol précédent ne rendait pas comptable.
+        Ok(RearmConsent::Held) => (
+            RearmConsentCensus::Held {
+                repo: owner_repo,
                 issue,
-                READY_ABSENT_AT_REARM_REASON,
-            )
-            .await,
+            },
+            None,
         ),
-        Ok(RearmConsent::Closed) => Some(
-            write_rearm_consent_terminal(
-                db,
-                &parent,
-                &owner_repo,
+        Ok(RearmConsent::ReadyAbsent) => (
+            RearmConsentCensus::ReadyAbsent {
+                repo: owner_repo.clone(),
                 issue,
-                ISSUE_CLOSED_AT_REARM_REASON,
-            )
-            .await,
+            },
+            Some(
+                write_rearm_consent_terminal(
+                    db,
+                    &parent,
+                    &owner_repo,
+                    issue,
+                    READY_ABSENT_AT_REARM_REASON,
+                )
+                .await,
+            ),
+        ),
+        Ok(RearmConsent::Closed) => (
+            RearmConsentCensus::IssueClosed {
+                repo: owner_repo.clone(),
+                issue,
+            },
+            Some(
+                write_rearm_consent_terminal(
+                    db,
+                    &parent,
+                    &owner_repo,
+                    issue,
+                    ISSUE_CLOSED_AT_REARM_REASON,
+                )
+                .await,
+            ),
         ),
         // AC2 — une relecture qui échoue ne ré-arme pas à ce tick, et ne pose
         // aucun terminal. L'asymétrie est chiffrée : un faux négatif coûte un
@@ -5954,7 +6048,13 @@ async fn reread_consent_before_rearm(
                 detail = %detail,
                 "mika#3050 : relecture du ticket impossible — pas de ré-armement à ce tick"
             );
-            Some(RearmOutcome::NotNow)
+            (
+                RearmConsentCensus::RereadFailed {
+                    repo: owner_repo,
+                    issue,
+                },
+                Some(RearmOutcome::NotNow),
+            )
         }
     }
 }
@@ -12556,7 +12656,14 @@ mod tests {
             .count()
     }
 
+    // `#[serial_test::serial]` sur les quatre tests de ré-armement qui suivent, et
+    // sur les six de #3050 plus bas : ils traversent `rearm_deferred_callback`,
+    // donc le callsite de `rearm_consent_checked`. Ce ne sont pas des capturants,
+    // ce sont des **poisonneurs** — le premier thread à atteindre un callsite y
+    // fixe son `Interest`, et sans abonné il l'éteint globalement. Voir la
+    // doctrine mika#2646 au sous-module `mika3050_recensement`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_registers_replacement_wrapper() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
@@ -12583,6 +12690,7 @@ mod tests {
     /// The replacement replays the same dispatch — including the sentinel that
     /// keeps the open-PR guard (mika#920) from livelocking the replay.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_preserves_action_config_and_class() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
@@ -12633,6 +12741,7 @@ mod tests {
     /// ever does on the `silent_turn_error` path — and the new guard is
     /// deliberately meant to refuse a re-arm in that state.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_refuses_once_budget_is_exhausted() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
@@ -12686,6 +12795,7 @@ mod tests {
     /// this task. Reporting it as terminal would let the reaper destroy a task
     /// that still had repair budget left.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_reports_flood_cap_as_transient_not_terminal() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
@@ -12834,6 +12944,7 @@ mod tests {
     /// a bel et bien été **relue** — sans cette assertion, une garde court-circuitée
     /// (un `None` rendu trop tôt) laisserait le test vert.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3050_a_held_consent_rearms_and_the_forge_was_reread() {
         let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T1_CONSENT_HELD).await;
 
@@ -12867,6 +12978,7 @@ mod tests {
     /// mika#3022 rend structurel : aucun lanceur, un terminal qui libère le
     /// créneau de l'issue, et une ligne d'audit qui nomme la raison.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3050_a_withdrawn_ready_label_refuses_the_rearm() {
         let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T2_READY_ABSENT).await;
         crate::gh_process::set_canned_stdout_for(
@@ -12926,6 +13038,7 @@ mod tests {
     /// populations doivent rester soustractibles (mika#2205), parce que la cible
     /// d'AC4 est un compte.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3050_a_closed_issue_refuses_the_rearm_under_its_own_reason() {
         let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T3_CLOSED).await;
         crate::gh_process::set_canned_stdout_for(
@@ -12974,6 +13087,7 @@ mod tests {
     /// le cas `74130014`/#3002, la fermeture d'un ticket gardé ouvert pour une
     /// sonde.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3050_an_unreadable_forge_defers_without_writing_a_terminal() {
         let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T4_REREAD_FAILED).await;
         crate::gh_process::set_canned_failure(
@@ -13019,6 +13133,7 @@ mod tests {
     /// Et la garde refuse **avant** le réseau : le journal d'appels de ce numéro
     /// reste vide, ce qu'une assertion sur la seule issue ne dirait pas.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3050_a_missing_token_defers_before_any_network_call() {
         let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T5_NO_TOKEN).await;
 
@@ -13064,6 +13179,7 @@ mod tests {
     /// `NotNow` — les deux assertions tombent ensemble, et aucune ne peut passer
     /// seule.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3050_a_parent_of_another_class_rearms_without_reading_the_forge() {
         let (db, parent_id, action_config) = rearm_fixture_labelled(
             ISSUE_T6_OTHER_CLASS,
@@ -13093,6 +13209,431 @@ mod tests {
             "aucun appel `gh` pour une parente hors classe : {:?}",
             gh_calls_on(ISSUE_T6_OTHER_CLASS)
         );
+    }
+
+    /// Le recensement de la garde — la ligne qui donne à AC4 son dénominateur
+    /// (mika#3050 D3).
+    ///
+    /// Ce que ces tests ajoutent aux treize de #3052 : ceux-là assèrent le
+    /// `RearmOutcome`, et **resteraient tous verts si la ligne n'était pas
+    /// émise**. Ici c'est le couple `(verdict, repo, issue)` qui est lu, sur
+    /// chacune des huit branches.
+    ///
+    /// # La sonde, et pourquoi `#[serial]` déborde ce module (mika#2646)
+    ///
+    /// L'installation passe par `test_helpers::install_capturing_subscriber`, le
+    /// site unique permis par mika#2646. Mais **`#[serial_test::serial]` est la
+    /// moitié porteuse**, et elle doit couvrir les *poisonneurs* autant que les
+    /// capturants : un callsite `tracing` ne s'enregistre qu'à sa **première**
+    /// atteinte, et son `Interest` est alors décidé par le défaut du thread qui
+    /// l'enregistre — un voisin qui y arrive d'abord sans abonné l'éteint
+    /// **globalement**, y compris pour un abonné déjà installé ailleurs. Annoter
+    /// les seuls capturants laisserait la course entière ouverte (défaut
+    /// fondateur : PR #2643).
+    ///
+    /// La population est close par **mesure**, pas par prudence : un
+    /// `panic!` posé dans l'enveloppe, puis `cargo test -p mika-agent --lib`,
+    /// a nommé **29** tests — dix dans ce module, dix-huit dans
+    /// `task_engine::engine::tests`, un dans `task_engine::dispatcher::tests` —
+    /// tous annotés. C'est la traversée de `rearm_deferred_callback` qui les
+    /// qualifie, et rien d'autre : un test qui l'appellerait depuis un
+    /// `tokio::spawn` n'aurait pas paniqué visiblement, donc un futur appelant
+    /// *détaché* est le seul angle mort de cette liste.
+    mod mika3050_recensement {
+        use super::*;
+
+        /// Le nom de l'événement, tel que l'enveloppe l'écrit et tel que le scan
+        /// d'écrivain unique le cherche.
+        const CENSUS_EVENT: &str = "rearm_consent_checked";
+
+        /// Un numéro par branche : les charges cannées **et** le journal
+        /// d'appels de la couture `gh` sont globaux au processus, et T1 de #3052
+        /// assère une **égalité** à 1 sur son propre numéro — la réutiliser ici
+        /// la ferait rougir pour une raison qui n'est pas la sienne.
+        const CENSUS_HELD: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3060;
+        const CENSUS_OTHER_CLASS: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3061;
+        const CENSUS_READY_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3062;
+        const CENSUS_CLOSED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3063;
+        const CENSUS_NO_TOKEN: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3064;
+        const CENSUS_REREAD_FAILED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3065;
+        const CENSUS_PARENT_UNREADABLE: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3066;
+        const CENSUS_PARENT_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3067;
+
+        type CapturedEvents =
+            std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+        struct CapturingLayer(CapturedEvents);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut std::collections::HashMap<String, String>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut fields = std::collections::HashMap::new();
+                event.record(&mut V(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        fn capture_events() -> (tracing::subscriber::DefaultGuard, CapturedEvents) {
+            use tracing_subscriber::layer::SubscriberExt;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+            let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            (guard, events)
+        }
+
+        /// Les lignes de recensement, dans l'ordre d'émission, filtrées sur leur
+        /// champ `event` — jamais sur le niveau ni sur le message, qu'une des
+        /// quatre lignes de diagnostic voisines pourrait partager.
+        fn census_lines(events: &CapturedEvents) -> Vec<std::collections::HashMap<String, String>> {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.get("event").map(String::as_str) == Some(CENSUS_EVENT))
+                .cloned()
+                .collect()
+        }
+
+        /// Le triplet qu'AC4 lit. Les coordonnées rendent `None` quand le champ
+        /// est **absent** de la ligne, ce qui est le cas testé : `tracing`
+        /// n'enregistre rien pour un `Option::None`, donc l'absence est
+        /// observable et ne se confond pas avec `""` ni `0` (mika#2331).
+        fn triplet(
+            line: &std::collections::HashMap<String, String>,
+        ) -> (&str, Option<&str>, Option<&str>) {
+            (
+                line.get("verdict")
+                    .map(String::as_str)
+                    .unwrap_or("<absent>"),
+                line.get("repo").map(String::as_str),
+                line.get("issue").map(String::as_str),
+            )
+        }
+
+        /// La ligne unique d'un passage — l'unicité est une assertion, pas une
+        /// commodité : deux lignes pour un passage doubleraient le dénominateur
+        /// d'AC4 aussi sûrement que deux sites émetteurs.
+        fn only_census_line(events: &CapturedEvents) -> std::collections::HashMap<String, String> {
+            let lines = census_lines(events);
+            assert_eq!(
+                lines.len(),
+                1,
+                "un passage, une ligne de recensement : {lines:?}"
+            );
+            lines.into_iter().next().unwrap()
+        }
+
+        /// **La branche saine est recensée** — le défaut que ce vol ferme. Sans
+        /// cette ligne, AC4 n'a qu'un numérateur, et un compte nul ne se
+        /// distingue pas d'une absence de ré-armements (mika#1833, mika#1926).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_recensement_nomme_held_sur_la_branche_saine() {
+            let (db, parent_id, action_config) = rearm_fixture_with_issue(CENSUS_HELD).await;
+            let (_guard, events) = capture_events();
+
+            let outcome = rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop_completion",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await;
+
+            assert_eq!(outcome, RearmOutcome::Rearmed);
+            let line = only_census_line(&events);
+            assert_eq!(
+                triplet(&line),
+                ("held", Some("x/y"), Some(CENSUS_HELD.to_string().as_str())),
+                "le dénominateur d'AC4 porte ses coordonnées : {line:?}"
+            );
+            assert_eq!(
+                line.get("parent_task_id").map(String::as_str),
+                Some(parent_id.as_str()),
+                "la ligne se joint à la parente, sinon elle ne se restreint à \
+                 aucune population : {line:?}"
+            );
+            assert_eq!(
+                line.get("cause").map(String::as_str),
+                Some("noop_completion"),
+                "et elle nomme le chemin de ré-armement : {line:?}"
+            );
+        }
+
+        /// **AC3 n'est pas un `held` absent.** Les deux branches rendent `None`
+        /// — « ré-armer comme avant » — et c'est exactement la confusion que le
+        /// plan reproche aux trois lignes `*_rearmed`. Le label est celui du
+        /// dispatch opérateur, réel, et il porte les **mêmes** coordonnées que
+        /// celui du feeder `ready-label`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_recensement_nomme_other_class_hors_ready_label() {
+            let (db, parent_id, action_config) = rearm_fixture_labelled(
+                CENSUS_OTHER_CLASS,
+                format!("operator-iterate: x/y#{CENSUS_OTHER_CLASS}"),
+            )
+            .await;
+            let (_guard, events) = capture_events();
+
+            let outcome = rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop_completion",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await;
+
+            assert_eq!(outcome, RearmOutcome::Rearmed);
+            assert_eq!(
+                triplet(&only_census_line(&events)),
+                ("other_class", None, None),
+                "hors classe, la garde n'a lu aucune coordonnée : elle ne peut \
+                 donc pas en déclarer"
+            );
+        }
+
+        /// **Les deux refus d'AC1 gardent chacun son verdict.** Fusionnés, leurs
+        /// comptes ne se soustraient plus (mika#2205), et la cible d'AC4 est un
+        /// compte. Deux passages dans un seul test : c'est leur **différence**
+        /// qui est la propriété.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_recensement_distingue_ready_absent_de_issue_closed() {
+            let (db_a, parent_a, config_a) = rearm_fixture_with_issue(CENSUS_READY_ABSENT).await;
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(CENSUS_READY_ABSENT),
+                "issue view",
+                r#"{"state":"OPEN","labels":[{"name":"type:bug"}]}"#,
+            );
+            let (db_b, parent_b, config_b) = rearm_fixture_with_issue(CENSUS_CLOSED).await;
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(CENSUS_CLOSED),
+                "issue view",
+                r#"{"state":"CLOSED","labels":[{"name":"ready"}]}"#,
+            );
+
+            let (_guard, events) = capture_events();
+            for (db, parent, config) in
+                [(&db_a, &parent_a, &config_a), (&db_b, &parent_b, &config_b)]
+            {
+                let outcome = rearm_deferred_callback(
+                    db,
+                    parent,
+                    config,
+                    "implement",
+                    "noop_completion",
+                    None,
+                    REARM_FIXTURE_TOKEN,
+                )
+                .await;
+                assert!(matches!(outcome, RearmOutcome::ConsentWithdrawn { .. }));
+            }
+
+            let lines = census_lines(&events);
+            assert_eq!(lines.len(), 2, "un passage, une ligne : {lines:?}");
+            assert_eq!(
+                triplet(&lines[0]),
+                (
+                    "ready_absent",
+                    Some("x/y"),
+                    Some(CENSUS_READY_ABSENT.to_string().as_str())
+                )
+            );
+            assert_eq!(
+                triplet(&lines[1]),
+                (
+                    "issue_closed",
+                    Some("x/y"),
+                    Some(CENSUS_CLOSED.to_string().as_str())
+                ),
+                "`ready` est encore posé ici : c'est l'état du ticket qui refuse, \
+                 et le verdict le dit sous son propre nom"
+            );
+        }
+
+        /// **Les trois fail-closed d'AC2 ne tiennent pas sous un nom commun.**
+        /// Elles rendent le même `RearmOutcome::NotNow`, donc les treize tests de
+        /// #3052 ne peuvent pas les distinguer ; leurs causes sont une
+        /// configuration absente, une forge en panne et une base illisible —
+        /// trois remèdes différents pour un opérateur.
+        ///
+        /// Les deux premières passent par `rearm_deferred_callback`, le chemin
+        /// réel. La troisième appelle l'enveloppe **directement**, et ce n'est
+        /// pas un raccourci de confort : la position 1 de
+        /// `rearm_deferred_callback` lit déjà la base
+        /// (`has_non_deferred_active_callback_child`) et rend `NotNow` avant la
+        /// garde, donc une base morte n'atteint jamais la position 3 par ce
+        /// chemin. Que les trois sites appelants traversent bien l'enveloppe est
+        /// tenu ailleurs, par les treize tests de #3052.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_les_trois_fail_closed_portent_chacun_son_verdict() {
+            let (db_t, parent_t, config_t) = rearm_fixture_with_issue(CENSUS_NO_TOKEN).await;
+            let (db_f, parent_f, config_f) = rearm_fixture_with_issue(CENSUS_REREAD_FAILED).await;
+            crate::gh_process::set_canned_failure(
+                crate::gh_process::GhSubject::Issue(CENSUS_REREAD_FAILED),
+                "issue view",
+                "gh: could not resolve to an Issue (HTTP 502)",
+            );
+            let (db_u, parent_u, _) = rearm_fixture_labelled(
+                CENSUS_PARENT_UNREADABLE,
+                format!("ready-label: x/y#{CENSUS_PARENT_UNREADABLE}"),
+            )
+            .await;
+
+            let (_guard, events) = capture_events();
+            // `None` n'est pas une permission (D7).
+            assert_eq!(
+                rearm_deferred_callback(
+                    &db_t,
+                    &parent_t,
+                    &config_t,
+                    "implement",
+                    "noop_completion",
+                    None,
+                    None,
+                )
+                .await,
+                RearmOutcome::NotNow
+            );
+            assert_eq!(
+                rearm_deferred_callback(
+                    &db_f,
+                    &parent_f,
+                    &config_f,
+                    "implement",
+                    "noop_completion",
+                    None,
+                    REARM_FIXTURE_TOKEN,
+                )
+                .await,
+                RearmOutcome::NotNow
+            );
+            db_u.shutdown();
+            assert_eq!(
+                reread_consent_before_rearm(
+                    &db_u,
+                    &parent_u,
+                    REARM_FIXTURE_TOKEN,
+                    "noop_completion"
+                )
+                .await,
+                Some(RearmOutcome::NotNow),
+                "une base illisible ne se lit pas « ce n'est pas une parente \
+                 `ready-label` »"
+            );
+
+            let lines = census_lines(&events);
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|l| triplet(l).0.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["no_token", "reread_failed", "parent_unreadable"],
+                "trois passages, trois verdicts, dans l'ordre : {lines:?}"
+            );
+            assert_eq!(
+                triplet(&lines[0]).1,
+                Some("x/y"),
+                "les deux premières ont lu le label, donc elles portent leurs \
+                 coordonnées : {lines:?}"
+            );
+            assert_eq!(triplet(&lines[1]).1, Some("x/y"));
+        }
+
+        /// **Hors classe, une coordonnée absente reste absente.** Les trois
+        /// branches qui sortent avant d'avoir lu un label n'ont pas de
+        /// coordonnées à déclarer, et `""`/`0` ont la forme d'une réponse sans
+        /// en être une : un `jq` qui agrège par `repo` compterait un dépôt nommé
+        /// `""`, et un `select(.issue == 0)` ne trouverait rien à redire
+        /// (mika#2331). L'assertion porte donc sur la **présence de la clé**,
+        /// jamais sur sa valeur.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_les_coordonnees_sont_absentes_et_jamais_vides_hors_classe() {
+            let (db_a, _, _) = rearm_fixture_labelled(
+                CENSUS_PARENT_ABSENT,
+                format!("ready-label: x/y#{CENSUS_PARENT_ABSENT}"),
+            )
+            .await;
+            let (db_u, parent_u, _) = rearm_fixture_labelled(
+                CENSUS_PARENT_UNREADABLE,
+                format!("ready-label: x/y#{CENSUS_PARENT_UNREADABLE}"),
+            )
+            .await;
+            let (db_o, parent_o, config_o) = rearm_fixture_labelled(
+                CENSUS_OTHER_CLASS,
+                format!("operator-iterate: x/y#{CENSUS_OTHER_CLASS}"),
+            )
+            .await;
+
+            let (_guard, events) = capture_events();
+            assert_eq!(
+                reread_consent_before_rearm(
+                    &db_a,
+                    "une-parente-qui-nexiste-pas",
+                    REARM_FIXTURE_TOKEN,
+                    "stuck_pending"
+                )
+                .await,
+                None,
+                "aucune parente, donc aucune classe à discriminer : le \
+                 ré-armement suit son cours, comme avant le vol"
+            );
+            db_u.shutdown();
+            let _ =
+                reread_consent_before_rearm(&db_u, &parent_u, REARM_FIXTURE_TOKEN, "stuck_pending")
+                    .await;
+            let _ = rearm_deferred_callback(
+                &db_o,
+                &parent_o,
+                &config_o,
+                "implement",
+                "stuck_pending",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await;
+
+            let lines = census_lines(&events);
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|l| triplet(l).0.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["parent_absent", "parent_unreadable", "other_class"]
+            );
+            for line in &lines {
+                assert!(
+                    !line.contains_key("repo") && !line.contains_key("issue"),
+                    "la clé elle-même doit manquer, pas valoir du vide : {line:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
