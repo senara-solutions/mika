@@ -3597,9 +3597,10 @@ async fn report_pr_ready_undraft_refusal(
     }
 }
 
-/// Destructive-action grounding gate (mika#1646) — refuses `gh pr close` /
-/// `gh issue close` that cannot show it is founded on the target's CURRENT
-/// state, and refuses a *repeat* close that does not acknowledge the prior one.
+/// Destructive-action grounding gate (mika#1646) — refuses `gh pr close` that
+/// cannot show it is founded on the target's CURRENT state, refuses a *repeat*
+/// close that does not acknowledge the prior one, and since mika#3056 refuses
+/// every `gh issue close` outright.
 ///
 /// # Why this runs here and not at EndTurn
 ///
@@ -3610,6 +3611,27 @@ async fn report_pr_ready_undraft_refusal(
 /// PR is already closed and re-prompting can only annotate an accomplished
 /// fact. So this gate sits in `run_gh`'s pre-subprocess chain, next to
 /// mika#1196 / mika#1682 / mika#1167, and refuses before any side effect.
+///
+/// # Le bras issue, et pourquoi il précède les couches (mika#3056)
+///
+/// Bearing de Prime du 2026-11-06 : « mika-dev ne ferme que ce qu'un merge
+/// approuvé ferme. » Fermer un ticket est un **verdict**, pas un fait d'état —
+/// une lecture de la cible, même juste et même citée, ne le fonde donc pas. Les
+/// deux couches ci-dessous demandent une preuve ; pour une issue, ce qui manque
+/// n'est pas une preuve, c'est un merge. Aucune des deux ne peut rendre ce
+/// refus, parce qu'aucune ne porte sur la bonne grandeur.
+///
+/// Le bras est donc en **tête** de la garde, au-dessus de la couche B, et il ne
+/// lit rien : ni base, ni forge, ni historique des appels. Il ne peut défaillir
+/// pour aucune des raisons qui font défaillir A et B (mesuré : sur 9 tentatives
+/// du 10/09 au 06/11, 3 fermetures ont été autorisées après 1 à 3 refus, une
+/// fois que la relecture et la citation satisfaisaient la couche A). La voie que
+/// son remède prescrit — écrire `Closes #N` dans un corps de PR — passe par
+/// `gh pr create` / `gh pr edit`, que le détecteur ne reconnaît pas et que cette
+/// garde ne touche pas.
+///
+/// `gh pr close` garde ses deux couches : une PR n'est pas un ticket, et sa
+/// fermeture par un agent est hors du périmètre de mika#3056.
 ///
 /// # The two layers
 ///
@@ -3635,7 +3657,11 @@ async fn report_pr_ready_undraft_refusal(
 ///
 /// Detection is **fail-open**: an argv this does not recognize as a close is
 /// none of its business, so the gate never becomes a blanket refusal of `gh`.
-/// Everything after recognition is **fail-closed**: once the call IS a
+/// Everything after recognition is **fail-closed**, and since mika#3056 the
+/// fail-closed half begins **before the first read** for the issue case: the
+/// issue arm needs no substrate at all, so there is no state of the world in
+/// which it fails to refuse. For `pr close`, fail-closed keeps its original
+/// meaning — once the call IS a
 /// recognized destructive action, any inability to prove it founded — missing
 /// grounding, unreadable history, tool-call persistence disabled, DB error —
 /// yields a refusal. That inverts the deliberately fail-open policy of
@@ -3652,7 +3678,7 @@ async fn validate_destructive_action_grounding(
     ctx: &ToolContext<'_>,
 ) -> Result<(), ToolOutput> {
     use crate::evidence::guards::{
-        DESTRUCTIVE_ACTION_AUDIT_TOOL, destructive_comment_cites_evidence,
+        DESTRUCTIVE_ACTION_AUDIT_TOOL, DestructiveTargetKind, destructive_comment_cites_evidence,
         destructive_grounding_satisfied, destructive_repeat_acknowledged,
         detect_destructive_action, repeat_action_window_secs,
     };
@@ -3726,6 +3752,30 @@ async fn validate_destructive_action_grounding(
             .await),
             None => Err(ToolOutput::error(body.to_string())),
         }
+    }
+
+    // mika#3056 — une fermeture d'issue ne se fonde pas, elle se mérite par un
+    // merge. Ce bras est en tête de la garde et ne lit rien : il ne peut donc
+    // défaillir pour aucune des raisons qui font défaillir les couches A et B.
+    // Il partage la clôture `refuse` ci-dessus, donc sa décision s'écrit sur la
+    // MÊME ligne d'audit que les autres (AC1) — c'est elle que la sonde AC5 lit
+    // par `GROUP BY after_value`. `diagnostic = None` : rien n'est indisponible.
+    if action.kind == DestructiveTargetKind::Issue {
+        return refuse(
+            ctx,
+            &target_key,
+            "block[issue_close_not_by_merge]",
+            "issue close is not an engine gesture — no reading of the target founds it",
+            "Closing a ticket is not an engine gesture. It comes from the `Closes` line of \
+             a pull request whose merge has been approved, or it comes from Vincent. No \
+             re-reading, no citation and no rewording of this close lifts this refusal: \
+             what is missing is not evidence, it is a merge. If the work is done, the pull \
+             request carries it and its merge closes the ticket. If the ticket must be \
+             closed without a pull request, Vincent is the one who does it — tell Vincent \
+             and leave the ticket open.",
+            None,
+        )
+        .await;
     }
 
     // --- Layer B first: "you are repeating yourself" is the more specific and
