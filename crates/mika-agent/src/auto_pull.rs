@@ -1189,6 +1189,31 @@ impl PromotionGate {
     }
 }
 
+/// Ce que le site d'appel apprend de la porte (mika#3058).
+///
+/// Un `bool` ne disait que « promu ou pas ». La phase 1 a besoin de la
+/// distinction : sur un **refus** le ticket est escaladé et porte désormais le
+/// marqueur qui l'exclut de toutes les phases, donc le tick s'arrête ; sur un
+/// **déclin** rien n'est écrit — le ticket est sain, il reste en tête du
+/// backlog, et le tick suivant le reverrait à l'identique. C'est cette seule
+/// branche qui a le droit d'essayer le candidat d'après (AC3).
+///
+/// `Declined` ne porte aucune donnée : la raison est déjà au journal, à l'audit
+/// et au ledger, et un second porteur dériverait du premier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    Allowed,
+    Refused,
+    Declined,
+}
+
+impl GateOutcome {
+    /// La lecture des phases 0 et 2 : elles ne distinguent pas les deux non.
+    fn allows(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
 /// Extract the branch name from a ticket's grooming callout (mika#2123 U1).
 ///
 /// Mirrors [`extract_plan_path`], including its anchoring: the callout is
@@ -1437,27 +1462,38 @@ pub fn classify_promotion(
         // qu'elle fait.
         StalenessMeasurement::BranchDeletedByMerge { pr } => {
             return match phase {
-                // Le ticket ne porte pas `ready`. Le merge l'a retiré
+                // Le ticket ne porte pas `ready` — dans NI L'UNE ni l'autre de
+                // ces deux phases. Le feeder le pose, et la phase 1 le pose
+                // aussi : elle pioche dans le backlog des tickets qui ne le
+                // portent pas, puis le leur pose (`apply_ready_label`,
+                // `"phase1_idle_pull"`). Le merge vient de le retirer
                 // (mika#3022) ; le reposer serait se donner le consentement
                 // qu'on vient de rendre.
-                ExclusionPhase::Phase0Feeder => {
+                //
+                // mika#3058 — la phase 1 était du côté promouvant, sous un
+                // commentaire qui disait « le ticket porte déjà `ready` ».
+                // C'était faux de cette phase-là, et douze vols sont partis
+                // sans mot humain depuis le 21/10 : la phase 0 refusait à
+                // 06:40:03Z le 06/11, la phase 1 promouvait à 06:40:04Z sur la
+                // même mesure.
+                ExclusionPhase::Phase0Feeder | ExclusionPhase::Phase1Pull => {
                     PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: *pr })
                 }
-                // Le ticket porte déjà `ready`. mika#2837 inchangé : c'est
-                // ainsi que part le vol suivant d'un ticket à plusieurs vols.
+                // Le ticket porte VRAIMENT `ready` : le vivier de la phase 2
+                // est celui des tickets qui le portent déjà et que rien ne
+                // dispatche. mika#2837 inchangé : c'est ainsi que part le vol
+                // suivant d'un ticket à plusieurs vols.
                 //
-                // mika#3047 — « porte déjà `ready` » est ce que la **liste du
-                // tick** dit, et c'est ce qui a dispatché #3044 sans
-                // consentement : au merge, le retrait de `ready` par mika#3022
-                // et cette promotion se sont croisés à 163 ms. Cette fonction
-                // garde sa décision, qui porte sur une branche ; c'est la phase
-                // 2 qui relit le label juste avant de dispatcher
+                // mika#3047 — « porte `ready` » est ce que la **liste du tick**
+                // dit, et c'est ce qui a dispatché #3044 sans consentement : au
+                // merge, le retrait de `ready` par mika#3022 et cette promotion
+                // se sont croisés à 163 ms. Cette fonction garde sa décision,
+                // qui porte sur une branche ; c'est la phase 2 qui relit le
+                // label juste avant de dispatcher
                 // (`gh_reread_issue_at_dispatch`).
-                ExclusionPhase::Phase1Pull | ExclusionPhase::Phase2StuckReady => {
-                    PromotionGate::Promote {
-                        detail: "branch_deleted_by_merged_pr",
-                    }
-                }
+                ExclusionPhase::Phase2StuckReady => PromotionGate::Promote {
+                    detail: "branch_deleted_by_merged_pr",
+                },
             };
         }
         // Inchangé, et c'est AC2 : aucune PR mergée ne porte la branche, ou la
@@ -1860,6 +1896,19 @@ const FILTER_BELOW_THRESHOLD: &str = "below_threshold";
 const FILTER_NO_READY_LABEL_EVENT: &str = "no_ready_label_event";
 /// The mika#2123 promotion staleness gate refused this branch.
 const FILTER_PROMOTION_GATE: &str = "promotion_gate_refused";
+/// La porte s'est **abstenue** : le merge d'une PR vient de rendre le `ready`,
+/// et le reposer serait se donner le consentement qu'on rend (mika#3036, puis
+/// mika#3058 pour la phase 1).
+///
+/// Délibérément distinct de [`FILTER_PROMOTION_GATE`], et pour la raison qui a
+/// déjà séparé `below_threshold` de [`FILTER_NO_READY_LABEL_EVENT`]
+/// (mika#2131) : un refus escalade — label, `ready` retiré, commentaire — et
+/// l'opérateur a un geste à faire ; un déclin n'écrit rien et le ticket est
+/// sain. Les additionner sous un seul nom rendrait « combien de tickets ce
+/// vivier a-t-il escaladés » insoluble (mika#2205). Le nom est celui du slug de
+/// [`DeclineReason::ConsentReturnedByMerge`], et un test l'asserte : l'audit et
+/// le ledger se joignent alors sur une seule chaîne (AC4).
+const FILTER_CONSENT_RETURNED_BY_MERGE: &str = "consent_returned_by_merge";
 /// A DB probe failed and the ticket was skipped conservatively.
 const FILTER_PROBE_ERROR: &str = "state_probe_failed";
 /// A seat verdict refused without naming itself (defensive; see
@@ -2217,32 +2266,54 @@ impl ExclusionLedger {
 /// (p0 > p1 > p2 > p3 > unlabelled) and by oldest `updated_at` within same
 /// priority.
 ///
-/// Ledger-free view of [`select_best_candidate_recording`], kept for callers and
-/// tests that want the selection alone. Phase 1 goes through the recording form
-/// (mika#2131) — a tick that selects without recording is the silence that
+/// Ledger-free view of [`select_candidates_ranked_recording`], kept for callers
+/// and tests that want the selection alone. Phase 1 goes through the recording
+/// form (mika#2131) — a tick that selects without recording is the silence that
 /// ticket closed.
+///
+/// Rend la **tête** du classement, c'est-à-dire exactement ce que le `max_by`
+/// d'avant mika#3058 rendait. Les treize appelants de ce nom sont inchangés par
+/// le passage à la liste.
 pub fn select_best_candidate(
     issues: Vec<Issue>,
     open_pr_issue_numbers: &HashSet<u64>,
 ) -> Option<Issue> {
-    select_best_candidate_recording(
+    select_candidates_ranked_recording(
         issues,
         open_pr_issue_numbers,
         &mut ExclusionLedger::default(),
     )
+    .into_iter()
+    .next()
 }
 
 /// [`select_best_candidate`], recording why each dropped ticket was dropped
-/// (mika#2131).
+/// (mika#2131), et rendant **le classement entier** plutôt que son seul
+/// maximum.
 ///
-/// The selection is unchanged — the ledger is the only addition. The two are
+/// The filter chain is unchanged — the ledger is the only addition. The two are
 /// one function rather than two so the trace can never describe a filter chain
 /// the selection no longer runs.
-fn select_best_candidate_recording(
+///
+/// **mika#3058 — pourquoi la liste.** La phase 1 ne choisissait qu'un candidat
+/// par tick, et un déclin n'écrit rien : le ticket décliné reste sain, sans
+/// marqueur, donc en tête du classement au tick suivant, et la phase ne
+/// promouvrait plus jamais rien d'autre. Exclure le ticket à la **sélection**
+/// était l'autre voie, et elle n'est pas atteignable : `groomed_candidate_exclusion`
+/// est pure sur les labels et les PR ouvertes, là où la mesure du merge coûte
+/// un à deux appels forge par ticket. D'où le classement entier, que
+/// [`phase1_first_promotable`] parcourt.
+///
+/// L'ordre est celui de l'ancien `max_by`, **ex æquo compris** : `max_by` rend
+/// le **dernier** élément maximal, donc le tri descend sur l'index d'entrée en
+/// dernier critère. Sans ce détail, un ex æquo parfait changerait de vainqueur
+/// en silence, et treize tests le liraient comme une égalité qui ne les
+/// concerne pas.
+fn select_candidates_ranked_recording(
     issues: Vec<Issue>,
     open_pr_issue_numbers: &HashSet<u64>,
     ledger: &mut ExclusionLedger,
-) -> Option<Issue> {
+) -> Vec<Issue> {
     let candidates: Vec<_> = issues
         .into_iter()
         // Partitioning filter, not an exclusion: a ticket already carrying
@@ -2264,15 +2335,111 @@ fn select_best_candidate_recording(
         })
         .collect();
 
-    if candidates.is_empty() {
-        return None;
-    }
-
-    candidates.into_iter().max_by(|a, b| {
+    // L'index d'entrée, capturé AVANT le tri : c'est lui qui reproduit le
+    // dernier-maximal de `max_by`. `sort_by` est stable, mais la stabilité
+    // préserve l'ordre d'entrée — donc le PREMIER ex æquo — et ce n'est pas ce
+    // que `max_by` rendait.
+    let mut ranked: Vec<(usize, Issue)> = candidates.into_iter().enumerate().collect();
+    ranked.sort_by(|(ia, a), (ib, b)| {
         let pa = priority_rank(&a.labels);
         let pb = priority_rank(&b.labels);
-        pa.cmp(&pb).then_with(|| b.updated_at.cmp(&a.updated_at))
-    })
+        // `b` puis `a` : `max_by` cherchait le maximum, le tri veut le meilleur
+        // en tête — l'ordre du comparateur est donc inversé, index compris.
+        pb.cmp(&pa)
+            .then_with(|| a.updated_at.cmp(&b.updated_at))
+            .then_with(|| ib.cmp(ia))
+    });
+    ranked.into_iter().map(|(_, issue)| issue).collect()
+}
+
+/// Combien de candidats la phase 1 interroge au plus par tick (mika#3058 D4).
+///
+/// La porte coûte un à deux appels forge par candidat ; sans borne, un tick sur
+/// une file de vingt tickets fraîchement mergés en ferait quarante. Trois,
+/// parce que la mesure du ticket montre au plus deux tickets simultanément dans
+/// cet état (#3047 et #3050 le 06/11) et que la borne doit laisser une marge
+/// sans devenir un balayage. Au-delà, la phase abandonne le tick — et le tick
+/// suivant reprend du début, puisque rien n'est persisté.
+const PHASE1_DECLINE_BUDGET: usize = 3;
+
+/// Ce qu'un candidat de phase 1 vaut, du point de vue de la boucle (mika#3058).
+///
+/// Trois issues et non deux, parce que « ne pas promouvoir » couvre deux suites
+/// opposées : un refus ou un circuit-breaker a **écrit** quelque chose — label,
+/// commentaire, compteur — et le ticket est désormais exclu ou tenu, donc le
+/// tick s'arrête ; un déclin n'a rien écrit, le ticket reste sain et en tête du
+/// classement, donc s'arrêter là gèlerait la phase pour de bon.
+///
+/// Chaque verdict est consigné au ledger **par le site qui le rend**, jamais
+/// par la boucle : c'est ce qui permet au circuit-breaker et à la porte de
+/// garder leurs deux noms distincts sous un seul `AbandonTick`.
+enum Phase1Verdict {
+    /// Promouvable : la boucle s'arrête, et le tick continue sur ce candidat.
+    Promote,
+    /// Le tick s'arrête ici. Le site qui rend ce verdict a déjà consigné
+    /// pourquoi.
+    AbandonTick,
+    /// Rien n'a été écrit sur ce candidat ; la boucle essaie le suivant.
+    TryNext,
+}
+
+/// La sonde que [`phase1_first_promotable`] interroge, un candidat à la fois.
+///
+/// Un trait plutôt qu'une fermeture, et ce n'est pas une préférence de style :
+/// la sonde de production emprunte le ledger du tick en **mutable**, et une
+/// `FnMut` dont le futur emprunte ses captures n'est pas exprimable — le type
+/// du futur rendu dépendrait de l'emprunt. Le futur est boxé **et `Send`**, et
+/// le trait lui-même l'est, parce que le tick entier part dans un
+/// `tokio::spawn` : sans ces deux bornes, l'erreur ne remonte pas ici mais dans
+/// `server/handlers.rs` et `task_engine/engine.rs`, à mille lignes du site
+/// (mesuré en écrivant ce vol — le futur `Send` seul ne suffit pas, c'est le
+/// `&mut dyn` tenu en travers de l'`await` qui manque la borne).
+trait Phase1Probe: Send {
+    fn probe<'a>(
+        &'a mut self,
+        candidate: &'a Issue,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Phase1Verdict> + Send + 'a>>;
+}
+
+/// Le premier candidat promouvable du classement de phase 1 (mika#3058 AC3).
+///
+/// La phase ne choisissait qu'un candidat par tick, et c'était tenable tant que
+/// le seul « non » de la porte était un refus : il posait [`REFUSAL_LABEL`],
+/// `is_feeder_excluded` écartait le ticket, et le tick suivant atteignait le
+/// candidat d'après — un tick perdu, auto-guéri. Le déclin de mika#3036 n'écrit
+/// rien, par construction (AC4) : rien ne marque le ticket, il revient en tête
+/// à chaque tick, et la phase ne promeut plus jamais rien. D'où le parcours.
+///
+/// La sonde est injectée plutôt qu'appelée ici pour une seule raison, et ce
+/// n'est pas l'esthétique : la version de production coûte un à deux appels
+/// forge par candidat, et un test qui doit compter **combien de candidats la
+/// boucle interroge** ne peut pas le faire sur du réseau. Le compte est la
+/// moitié de ce que garde T2 — une implémentation qui interroge les trois
+/// candidats et rend quand même le bon passerait une assertion de résultat
+/// seul.
+///
+/// Bornée par [`PHASE1_DECLINE_BUDGET`]. Rien n'est persisté : un tick qui
+/// épuise son budget laisse l'état exactement comme il l'a trouvé, et le tick
+/// suivant repart de la tête.
+async fn phase1_first_promotable(ranked: Vec<Issue>, probe: &mut dyn Phase1Probe) -> Option<Issue> {
+    let mut tried = 0usize;
+    for candidate in ranked.into_iter().take(PHASE1_DECLINE_BUDGET) {
+        tried += 1;
+        match probe.probe(&candidate).await {
+            Phase1Verdict::Promote => return Some(candidate),
+            Phase1Verdict::AbandonTick => return None,
+            Phase1Verdict::TryNext => {}
+        }
+    }
+    // mika#2340 — la ligne existe pour que « le budget a été épuisé » se
+    // distingue de « la phase n'a pas tourné ». Sans elle, un tick qui décline
+    // trois fois est indiscernable d'un tick qui n'a trouvé aucun candidat.
+    info!(
+        tried,
+        budget = PHASE1_DECLINE_BUDGET,
+        "auto_pull_phase1_no_promotable_candidate"
+    );
+    None
 }
 
 /// The filter that drops `issue` from the groomed-candidate pool shared by
@@ -4061,8 +4228,11 @@ async fn maybe_rewrite_stale_callout(
     }
 }
 
-/// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
-/// promoted; on `false` the ticket has already been handed to the operator.
+/// The promotion gate (mika#2123 R1–R5). Returns [`GateOutcome::Allowed`] when
+/// the ticket may be promoted; on [`GateOutcome::Refused`] the ticket has
+/// already been handed to the operator, and on [`GateOutcome::Declined`]
+/// (mika#3058) nothing at all was written — the ticket is sound and waits for a
+/// consent only a human can return.
 ///
 /// Called from **all three** sites that apply the `ready` label — the Phase 0
 /// feeder, the Phase 1 idle pull, and the Phase 2 stuck-ready rescue. The
@@ -4083,7 +4253,7 @@ async fn promotion_gate_allows(
     phase: ExclusionPhase,
     trace_id: &str,
     session_id: &str,
-) -> bool {
+) -> GateOutcome {
     let branch = extract_branch_name(&issue.body);
     let measurement = match branch.as_deref() {
         Some(b) => gh_compare_branch(github_token, b).await,
@@ -4156,7 +4326,7 @@ async fn promotion_gate_allows(
                 staleness = %audit,
                 "auto_pull_promotion_allowed"
             );
-            true
+            GateOutcome::Allowed
         }
         PromotionGate::Refuse(reason) => {
             refuse_promotion(
@@ -4171,11 +4341,11 @@ async fn promotion_gate_allows(
                 session_id,
             )
             .await;
-            false
+            GateOutcome::Refused
         }
         // mika#3036 — aucune écriture sur la forge : ni label, ni commentaire.
         // Le ticket est sain ; il attend un consentement que seul un humain peut
-        // rendre. Le `false` suffit, et c'est lui qui fait compter le déclin dans
+        // rendre. Le verdict suffit, et c'est lui qui fait compter le déclin dans
         // le ledger d'exclusion du site d'appel (AC4).
         PromotionGate::Decline(reason) => {
             warn!(
@@ -4185,7 +4355,7 @@ async fn promotion_gate_allows(
                 phase = phase.gate_phase(),
                 "auto_pull_promotion_declined"
             );
-            false
+            GateOutcome::Declined
         }
     }
 }
@@ -5335,7 +5505,7 @@ async fn phase0_feed_ready_pool(
         // failure class wearing a different hat. It gets a WARN, not a shrug.
         match issues.iter().find(|i| i.number == n) {
             Some(issue) => {
-                if !promotion_gate_allows(
+                let outcome = promotion_gate_allows(
                     db,
                     github_token,
                     label_auth,
@@ -5344,10 +5514,27 @@ async fn phase0_feed_ready_pool(
                     trace_id,
                     session_id,
                 )
-                .await
-                {
-                    ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_PROMOTION_GATE);
-                    continue;
+                .await;
+                // mika#3058 — le **comportement** est celui d'avant : les deux
+                // non passent au candidat suivant. Seul le nom sous lequel
+                // l'exclusion se compte change, et il change parce qu'un refus
+                // escalade — label, `ready` retiré, commentaire, un geste
+                // d'opérateur à faire — là où un déclin n'écrit rien. Les
+                // additionner sous `promotion_gate_refused`, c'est mika#2205.
+                match outcome {
+                    GateOutcome::Allowed => {}
+                    GateOutcome::Refused => {
+                        ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_PROMOTION_GATE);
+                        continue;
+                    }
+                    GateOutcome::Declined => {
+                        ledger.record(
+                            ExclusionPhase::Phase0Feeder,
+                            n,
+                            FILTER_CONSENT_RETURNED_BY_MERGE,
+                        );
+                        continue;
+                    }
                 }
             }
             None => warn!(
@@ -5401,6 +5588,124 @@ async fn phase0_feed_ready_pool(
     promoted
 }
 
+/// La sonde de production de la phase 1 : circuit-breaker, puis porte de
+/// promotion (mika#3058 AC3).
+///
+/// Elle porte le ledger du tick en emprunt **mutable** — c'est la raison pour
+/// laquelle [`Phase1Probe`] est un trait et non une fermeture. Chaque verdict
+/// qui arrête le tick consigne son propre nom au ledger ici même, et non dans
+/// la boucle : `circuit_breaker` et `promotion_gate` restent deux refus
+/// distincts sous un seul [`Phase1Verdict::AbandonTick`], et le déclin de
+/// mika#3036 garde le sien.
+struct GateProbe<'p> {
+    db: &'p AsyncDatabase,
+    github_token: &'p str,
+    label_auth: &'p LabelWriteToken,
+    trace_id: &'p str,
+    session_id: &'p str,
+    ledger: &'p mut ExclusionLedger,
+}
+
+impl Phase1Probe for GateProbe<'_> {
+    fn probe<'a>(
+        &'a mut self,
+        candidate: &'a Issue,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Phase1Verdict> + Send + 'a>> {
+        Box::pin(async move {
+            // 4. Circuit-breaker check (AC3): skip if failure_count >= threshold.
+            //
+            // Lu PAR CANDIDAT, et non plus sur la seule tête de liste : la
+            // boucle peut désormais promouvoir un candidat de rang 2, et il doit
+            // passer la même garde. Son verdict reste celui de mika#3058 D5 — il
+            // abandonne le tick, il ne passe pas au suivant.
+            match self
+                .db
+                .get_auto_pull_failure_count(DEFAULT_REPO, candidate.number)
+                .await
+            {
+                Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
+                    info!(
+                        issue = candidate.number,
+                        failure_count = count,
+                        "auto_pull: circuit-breaker skip for #{} ({}× failures)",
+                        candidate.number,
+                        count
+                    );
+                    // Audit the skip decision
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            self.session_id,
+                            "auto_pull",
+                            "auto_pull_skip",
+                            None,
+                            Some(&format!(
+                                "#{} skipped: failure_count={} >= threshold={}",
+                                candidate.number, count, CIRCUIT_BREAKER_THRESHOLD
+                            )),
+                            None,
+                            Some(self.trace_id),
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "auto_pull: failed to write skip audit event");
+                    }
+                    self.ledger.record(
+                        ExclusionPhase::Phase1Pull,
+                        candidate.number,
+                        FILTER_CIRCUIT_BREAKER,
+                    );
+                    return Phase1Verdict::AbandonTick;
+                }
+                Err(e) => {
+                    warn!(error = %e, "auto_pull: failed to check circuit-breaker, proceeding");
+                    // Fail-open: proceed with the selection
+                }
+                _ => {} // count < threshold, proceed
+            }
+
+            // 4b. mika#2123: the promotion staleness gate. Same gate as Phase 0
+            // and Phase 2 — all three apply `ready`, so all three must pass
+            // through it.
+            match promotion_gate_allows(
+                self.db,
+                self.github_token,
+                self.label_auth,
+                candidate,
+                ExclusionPhase::Phase1Pull,
+                self.trace_id,
+                self.session_id,
+            )
+            .await
+            {
+                GateOutcome::Allowed => Phase1Verdict::Promote,
+                // Un refus a escaladé : le ticket porte [`REFUSAL_LABEL`], un
+                // opérateur a un geste à faire, et le tick s'arrête comme il
+                // s'arrêtait avant ce vol.
+                GateOutcome::Refused => {
+                    self.ledger.record(
+                        ExclusionPhase::Phase1Pull,
+                        candidate.number,
+                        FILTER_PROMOTION_GATE,
+                    );
+                    Phase1Verdict::AbandonTick
+                }
+                // mika#3058 — le déclin a son propre compte, et il n'escalade
+                // rien : le ticket reste sain, donc en tête du classement. C'est
+                // le seul verdict qui fait avancer la boucle.
+                GateOutcome::Declined => {
+                    self.ledger.record(
+                        ExclusionPhase::Phase1Pull,
+                        candidate.number,
+                        FILTER_CONSENT_RETURNED_BY_MERGE,
+                    );
+                    Phase1Verdict::TryNext
+                }
+            }
+        })
+    }
+}
+
 /// Phase 1 (mika#1363): promote the best groomed-not-ready ticket to `ready`.
 ///
 /// Verbatim of the original `auto_pull_groomed_ticket` body, including its own
@@ -5434,91 +5739,35 @@ async fn phase1_promote_groomed(
         return None;
     }
 
-    // 3. Select the best groomed-not-ready candidate (skip those with open PRs).
-    let candidate =
-        match select_best_candidate_recording(issues.to_vec(), open_pr_issue_numbers, ledger) {
-            Some(c) => c,
-            None => {
-                debug!("auto_pull: no groomed-not-ready candidates found");
-                return None;
-            }
-        };
-
-    // 4. Circuit-breaker check (AC3): skip if failure_count >= threshold.
-    match db
-        .get_auto_pull_failure_count(DEFAULT_REPO, candidate.number)
-        .await
-    {
-        Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
-            info!(
-                issue = candidate.number,
-                failure_count = count,
-                "auto_pull: circuit-breaker skip for #{} ({}× failures)",
-                candidate.number,
-                count
-            );
-            // Audit the skip decision
-            if let Err(e) = db
-                .log_audit_event(
-                    session_id,
-                    "auto_pull",
-                    "auto_pull_skip",
-                    None,
-                    Some(&format!(
-                        "#{} skipped: failure_count={} >= threshold={}",
-                        candidate.number, count, CIRCUIT_BREAKER_THRESHOLD
-                    )),
-                    None,
-                    Some(trace_id),
-                )
-                .await
-            {
-                warn!(error = %e, "auto_pull: failed to write skip audit event");
-            }
-            ledger.record(
-                ExclusionPhase::Phase1Pull,
-                candidate.number,
-                FILTER_CIRCUIT_BREAKER,
-            );
-            return None;
-        }
-        Err(e) => {
-            warn!(error = %e, "auto_pull: failed to check circuit-breaker, proceeding");
-            // Fail-open: proceed with the selection
-        }
-        _ => {} // count < threshold, proceed
+    // 3. Rank the groomed-not-ready candidates (skip those with open PRs).
+    //
+    // mika#3058 — le classement entier, et non plus son seul maximum. Un déclin
+    // de porte n'écrit RIEN : le ticket décliné n'a ni label ni marqueur, donc
+    // il reste en tête au tick suivant, et la phase ne promouvrait plus jamais
+    // rien d'autre (AC3). Le commentaire d'avant disait l'inverse, et il avait
+    // raison du seul cas qu'il connaissait : un *refus* pose [`REFUSAL_LABEL`],
+    // que `is_feeder_excluded` voit, et c'est cette auto-guérison qui rendait
+    // la boucle inutile.
+    let ranked = select_candidates_ranked_recording(issues.to_vec(), open_pr_issue_numbers, ledger);
+    if ranked.is_empty() {
+        debug!("auto_pull: no groomed-not-ready candidates found");
+        return None;
     }
 
-    let rank = priority_rank(&candidate.labels);
-
-    // 4b. mika#2123: the promotion staleness gate. Same gate as Phase 0 and
-    // Phase 2 — all three apply `ready`, so all three must pass through it.
-    //
-    // Phase 1 picks exactly one candidate, so a refusal here costs the whole
-    // tick: nothing is promoted even if a healthy candidate ranked just below.
-    // Left that way deliberately. The refused ticket now carries
-    // [`REFUSAL_LABEL`], `is_feeder_excluded` drops it, and the next tick
-    // reaches the next-best candidate — one idle tick, self-healing, against the
-    // complexity of a retry loop inside a phase whose whole shape is "one pick
-    // when the queue is idle".
-    if !promotion_gate_allows(
+    // 4 et 4b. Par candidat, dans l'ordre : le circuit-breaker (AC3 de
+    // mika#2123), puis la porte de promotion de mika#2123. Les deux abandonnent
+    // le tick ; seul un déclin essaie le candidat d'après.
+    let mut probe = GateProbe {
         db,
         github_token,
         label_auth,
-        &candidate,
-        ExclusionPhase::Phase1Pull,
         trace_id,
         session_id,
-    )
-    .await
-    {
-        ledger.record(
-            ExclusionPhase::Phase1Pull,
-            candidate.number,
-            FILTER_PROMOTION_GATE,
-        );
-        return None;
-    }
+        ledger,
+    };
+    let candidate = phase1_first_promotable(ranked, &mut probe).await?;
+
+    let rank = priority_rank(&candidate.labels);
 
     // 5. Apply the `ready` label to trigger webhook-driven dispatch — through
     // the canonical applicator, which refuses a parked ticket (mika#2315).
@@ -6266,7 +6515,11 @@ async fn phase2_reconcile_stuck_ready(
             session_id,
         )
         .await
+        .allows()
         {
+            // mika#3058 — un seul nom suffit ici : par AC1, la phase 2 ne
+            // décline jamais. Son vivier est celui des tickets qui portent
+            // déjà `ready`, donc aucune promotion n'y fabrique de consentement.
             ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROMOTION_GATE);
             continue;
         }
@@ -6490,9 +6743,14 @@ mod tests {
 
     // ── mika#2123 promotion staleness gate ──
 
-    /// Ancre les tests antérieurs à mika#3036 sur la phase dont ce vol ne change
-    /// RIEN. C'est ce qui en fait leur contrôle de non-régression : s'ils
-    /// bougent, c'est que les phases 1 et 2 ont bougé. Les tests de la phase
+    /// Ancre les tests antérieurs à mika#3036 sur la phase dont aucun vol n'a
+    /// changé la décision. C'est ce qui en fait leur contrôle de
+    /// non-régression : s'ils bougent, c'est que la phase 2 a bougé.
+    ///
+    /// L'ancre était `Phase1Pull` jusqu'à mika#3058, parce que mika#3036 n'avait
+    /// déplacé que la phase 0. Ce vol déplace la phase 1 — elle décline
+    /// désormais sur `BranchDeletedByMerge` — donc l'ancre passe à
+    /// `Phase2StuckReady`, la seule qui promeut encore. Les tests de la phase
     /// appellent [`super::classify_promotion`] nommément, avec leur phase
     /// explicite.
     fn classify_promotion(
@@ -6500,7 +6758,7 @@ mod tests {
         branch: Option<&str>,
         max_behind: i64,
     ) -> PromotionGate {
-        super::classify_promotion(m, branch, max_behind, ExclusionPhase::Phase1Pull)
+        super::classify_promotion(m, branch, max_behind, ExclusionPhase::Phase2StuckReady)
     }
 
     /// A measurement whose file list is **unavailable** (`files` absent from
@@ -7420,20 +7678,55 @@ mod tests {
         // « Suivi de » et non « présent dans le fichier » : les trois appels
         // n'ont pas la même mise en forme — deux sur une ligne, un éclaté sur
         // cinq — donc on découpe sur l'appel et on lit ses arguments.
-        let gate_ledgers = production
-            .split("ledger.record(")
-            .skip(1)
-            .filter(|rest| {
-                rest.split(')')
-                    .next()
-                    .is_some_and(|args| args.contains("FILTER_PROMOTION_GATE"))
-            })
-            .count();
+        let ledger_filter_count = |needle: &str| {
+            production
+                .split("ledger.record(")
+                .skip(1)
+                .filter(|rest| rest.split(')').next().is_some_and(|a| a.contains(needle)))
+                .count()
+        };
         assert_eq!(
-            gate_ledgers, 3,
-            "AC4 — les trois phases comptent leur exclusion de porte sous \
+            ledger_filter_count("FILTER_PROMOTION_GATE"),
+            3,
+            "AC4 — les trois phases comptent leur **refus** de porte sous \
              `{FILTER_PROMOTION_GATE}`. Un compte qui tombe à deux, c'est une \
-             phase dont les refus — déclins compris — ne se comptent plus"
+             phase dont les refus ne se comptent plus. Les déclins, eux, ont \
+             leur propre compte depuis mika#3058 — `{FILTER_CONSENT_RETURNED_BY_MERGE}` \
+             ci-dessous : un refus escalade, un déclin n'écrit rien, et les \
+             additionner serait mika#2205"
+        );
+
+        // ── T5 (mika#3058) — le recensement du déclin au ledger ──
+
+        // Même forme que l'allowlist de S1 ci-dessus, et pour la même raison :
+        // une entrée ajoutée sans élargir le type ne compile pas, et l'élargir
+        // est le geste visible au `grep` que mika#1574 demande.
+        const T3058_DECLINE_LEDGER_ALLOWLIST: [&str; 0] = [];
+        assert!(
+            T3058_DECLINE_LEDGER_ALLOWLIST.is_empty(),
+            "mika#3058 — table d'exceptions du recensement de déclin au ledger : \
+             doit rester vide ; toute entrée nomme sa donnée précise et son \
+             ticket de suivi"
+        );
+
+        // La constante du ledger et le slug de la raison sont **le même texte**.
+        // Sans cette égalité, l'audit et le ledger se joindraient sur deux
+        // chaînes voisines, et la requête de la sonde AC5 ne verrait qu'une
+        // moitié de la population.
+        assert_eq!(
+            FILTER_CONSENT_RETURNED_BY_MERGE,
+            DeclineReason::ConsentReturnedByMerge { pr: 0 }.slug(),
+            "AC4 — le ledger et l'audit comptent le déclin sous le MÊME slug ; \
+             deux textes voisins ne se joignent pas"
+        );
+
+        assert_eq!(
+            ledger_filter_count("FILTER_CONSENT_RETURNED_BY_MERGE"),
+            2,
+            "AC4 — **deux** sites, pas trois : les phases 0 et 1 déclinent, la \
+             phase 2 jamais (AC1 — son vivier porte déjà `ready`). Un troisième \
+             site dirait qu'une phase a commencé à décliner sans qu'on le \
+             décide, et un seul qu'une des deux a cessé de se compter"
         );
     }
 
@@ -10313,7 +10606,8 @@ This ticket has been GROOMED and is ready.
         let mut ledger = ExclusionLedger::default();
         let pool = vec![make_issue(2118, GROOMED_BODY, &["p1-important"], "t")];
         assert!(
-            select_best_candidate_recording(pool.clone(), &HashSet::new(), &mut ledger).is_some()
+            !select_candidates_ranked_recording(pool.clone(), &HashSet::new(), &mut ledger)
+                .is_empty()
         );
         assert!(ledger.entries.is_empty(), "{:?}", ledger.entries);
 
@@ -10338,7 +10632,7 @@ This ticket has been GROOMED and is ready.
     fn mika2131_the_partitioning_filter_is_not_an_exclusion() {
         let mut ledger = ExclusionLedger::default();
         let pool = vec![make_issue(2119, GROOMED_BODY, &["ready"], "t")];
-        assert!(select_best_candidate_recording(pool, &HashSet::new(), &mut ledger).is_none());
+        assert!(select_candidates_ranked_recording(pool, &HashSet::new(), &mut ledger).is_empty());
         assert!(
             ledger.entries.is_empty(),
             "a ticket belonging to another phase was not dropped by this one: {:?}",
@@ -10384,7 +10678,7 @@ This ticket has been GROOMED and is ready.
         let open_pr: HashSet<u64> = [4003].into_iter().collect();
 
         let mut ledger = ExclusionLedger::default();
-        assert!(select_best_candidate_recording(pool.clone(), &open_pr, &mut ledger).is_none());
+        assert!(select_candidates_ranked_recording(pool.clone(), &open_pr, &mut ledger).is_empty());
         let recorded: HashSet<(u64, &str)> = ledger
             .entries
             .iter()
@@ -14315,41 +14609,69 @@ Un ticket à plusieurs vols.
         );
     }
 
-    /// **AC1 — en phase 0, une mesure de merge refuse la promotion.**
+    /// **AC1 et AC2 (mika#3058) — les trois phases, dans un seul appel, sur une
+    /// seule mesure.**
     ///
-    /// Le merge vient de rendre le `ready` (mika#3022, voie B de mika#2995) ; le
-    /// feeder ne peut pas se le redonner. En phases 1 et 2 le ticket porte déjà
-    /// `ready`, et la règle de mika#2837 y reste entière : la même mesure
-    /// promeut, parce qu'elle laisse partir le vol suivant d'un ticket à
-    /// plusieurs vols.
+    /// Le merge vient de rendre le `ready` (mika#3022, voie B de mika#2995), et
+    /// deux des trois phases ne peuvent pas se le redonner :
+    ///
+    /// - la **phase 0** pose `ready` sur un ticket du vivier qui ne le porte
+    ///   pas — c'est ce que mika#3036 a tranché ;
+    /// - la **phase 1** le pose aussi (`apply_ready_label`,
+    ///   `"phase1_idle_pull"`), sur un candidat du backlog que la sélection
+    ///   choisit précisément parce qu'il ne le porte pas. mika#3036 l'avait
+    ///   laissée du côté promouvant sous un commentaire disant « le ticket
+    ///   porte déjà `ready` » : faux de cette phase-là. Le 06/11 à 06:40Z la
+    ///   phase 0 déclinait à `:03Z` et la phase 1 promouvait à `:04Z` **sur la
+    ///   même mesure** ; le vol 2 de #3047 est parti sans mot humain ;
+    /// - la **phase 2** promeut, et c'est le contrôle négatif : son vivier est
+    ///   celui des tickets qui portent déjà `ready` et que rien ne dispatche,
+    ///   donc mika#2837 y reste entier, et mika#3047 lui fait relire le label
+    ///   juste avant le dispatch.
     ///
     /// **Une seule** mesure, trois appels : le contrôle négatif vit dans le même
     /// test que l'exigence, parce que deux tests séparés peuvent dériver l'un
-    /// sans l'autre et laisser « la phase décide » vrai sans que « les phases 1
-    /// et 2 n'ont pas bougé » le soit encore.
+    /// sans l'autre et laisser « la phase 1 décline » vrai sans que « la phase 2
+    /// promeut toujours » le soit encore.
     ///
-    /// AC4 y est tenu aussi : la ligne d'audit du déclin est relue sur le JSON
-    /// de [`staleness_audit_json`], et `issue` comme `merged_pr` y sont exigés
-    /// **non nuls** — un `0` ou un `""` se lirait comme une valeur mesurée
-    /// (mika#2331).
+    /// AC4 y est tenu aussi : la ligne d'audit du déclin de **phase 1** est
+    /// relue sur le JSON de [`staleness_audit_json`], et `issue` comme
+    /// `merged_pr` y sont exigés **non nuls** — un `0` ou un `""` se lirait
+    /// comme une valeur mesurée (mika#2331).
     #[test]
-    fn mika3036_la_phase_decide_de_la_mesure_de_merge() {
+    fn mika3058_les_trois_phases_dans_un_seul_appel() {
         let measurement = StalenessMeasurement::BranchDeletedByMerge { pr: 3032 };
+        let expected_decline =
+            PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: 3032 });
 
-        let declined = super::classify_promotion(
+        let declined_phase0 = super::classify_promotion(
             &measurement,
             Some(BRANCH_3030),
             50,
             ExclusionPhase::Phase0Feeder,
         );
         assert_eq!(
-            declined,
-            PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: 3032 }),
+            declined_phase0, expected_decline,
             "AC1 — en `phase0_feeder`, le `ready` que le merge a rendu n'est pas \
              un consentement que le feeder puisse se redonner"
         );
-        let PromotionGate::Decline(reason) = &declined else {
-            panic!("la décision de la phase 0 vient d'être assertée `Decline`");
+
+        let declined_phase1 = super::classify_promotion(
+            &measurement,
+            Some(BRANCH_3030),
+            50,
+            ExclusionPhase::Phase1Pull,
+        );
+        assert_eq!(
+            declined_phase1, expected_decline,
+            "AC1 (mika#3058) — en `phase1_idle_pull` non plus : la phase pioche \
+             dans le backlog des tickets SANS `ready`, puis le leur pose. C'est \
+             la promotion du 06/11 06:40:04Z sur #3047, une seconde après le \
+             déclin de la phase 0 sur la même mesure"
+        );
+
+        let PromotionGate::Decline(reason) = &declined_phase1 else {
+            panic!("la décision de la phase 1 vient d'être assertée `Decline`");
         };
         assert_eq!(reason.slug(), "consent_returned_by_merge");
         assert_ne!(
@@ -14360,25 +14682,29 @@ Un ticket à plusieurs vols.
              (mika#2205)"
         );
 
-        // Le contrôle négatif : mika#2837 inchangé là où le ticket porte déjà
-        // `ready`.
-        for phase in [ExclusionPhase::Phase1Pull, ExclusionPhase::Phase2StuckReady] {
-            assert_eq!(
-                super::classify_promotion(&measurement, Some(BRANCH_3030), 50, phase),
-                PromotionGate::Promote {
-                    detail: "branch_deleted_by_merged_pr",
-                },
-                "AC1 — {phase:?} promeut toujours : c'est ainsi que part le vol \
-                 suivant d'un ticket à plusieurs vols"
-            );
-        }
+        // Le contrôle négatif : mika#2837 inchangé là où le ticket porte
+        // vraiment `ready`.
+        assert_eq!(
+            super::classify_promotion(
+                &measurement,
+                Some(BRANCH_3030),
+                50,
+                ExclusionPhase::Phase2StuckReady,
+            ),
+            PromotionGate::Promote {
+                detail: "branch_deleted_by_merged_pr",
+            },
+            "AC1 — `phase2_stuck_rescue` promeut toujours : c'est ainsi que part \
+             le vol suivant d'un ticket à plusieurs vols, et elle relit le label \
+             avant de dispatcher (mika#3047)"
+        );
 
-        // AC4 — la ligne d'audit du déclin, relisible.
+        // AC4 — la ligne d'audit du déclin de phase 1, relisible.
         let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
             3030,
             Some(BRANCH_3030),
             &measurement,
-            &declined,
+            &declined_phase1,
             50,
         ))
         .expect("l'audit est du JSON valide");
@@ -14390,6 +14716,204 @@ Un ticket à plusieurs vols.
             !json["issue"].is_null() && !json["merged_pr"].is_null(),
             "AC4 — les deux dimensions que l'opérateur groupe doivent être \
              présentes et non nulles ; vu : {json}"
+        );
+    }
+
+    /// La sonde de phase 1 d'un test : un verdict par numéro de ticket, et la
+    /// liste **ordonnée** des candidats effectivement interrogés (mika#3058).
+    ///
+    /// Le compte des interrogations n'est pas de la décoration : une boucle qui
+    /// interroge les trois candidats et rend quand même le bon passerait une
+    /// assertion portant sur le seul résultat. Or chaque interrogation coûte un
+    /// à deux appels forge en production, et `PHASE1_DECLINE_BUDGET` n'existe
+    /// que pour les borner — un budget qu'aucun test ne mesure ne borne rien.
+    ///
+    /// Un numéro absent de la table est un échec du test, pas un `TryNext` par
+    /// défaut : un défaut silencieux ferait passer une boucle qui interroge un
+    /// candidat que le classement n'aurait pas dû lui donner.
+    struct ScriptedProbe {
+        verdicts: Vec<(u64, Phase1Verdict)>,
+        seen: Vec<u64>,
+    }
+
+    impl Phase1Probe for ScriptedProbe {
+        fn probe<'a>(
+            &'a mut self,
+            candidate: &'a Issue,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Phase1Verdict> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.seen.push(candidate.number);
+                match self
+                    .verdicts
+                    .iter()
+                    .find(|(number, _)| *number == candidate.number)
+                {
+                    Some((_, Phase1Verdict::Promote)) => Phase1Verdict::Promote,
+                    Some((_, Phase1Verdict::AbandonTick)) => Phase1Verdict::AbandonTick,
+                    Some((_, Phase1Verdict::TryNext)) => Phase1Verdict::TryNext,
+                    None => panic!(
+                        "la boucle a interrogé #{} — le scénario ne lui donne pas \
+                         de verdict, donc le classement l'a produit par erreur",
+                        candidate.number
+                    ),
+                }
+            })
+        }
+    }
+
+    /// **AC3 — un déclin en tête ne fige pas la phase.**
+    ///
+    /// C'est la moitié du défaut que l'AC1 seul laisserait ouverte. Avant ce
+    /// vol, le seul « non » de la porte en phase 1 était un **refus** : il pose
+    /// [`REFUSAL_LABEL`], `is_feeder_excluded` écarte le ticket, et le tick
+    /// suivant atteint le candidat d'après — un tick perdu, auto-guéri. Le
+    /// déclin de mika#3036 n'écrit **rien**, par construction (AC4) : rien ne
+    /// marque le ticket, il revient en tête du classement à chaque tick, et une
+    /// phase qui s'arrête au premier « non » ne promeut plus jamais rien. Le
+    /// ticket #3050, gardé ouvert après son merge `Refs`, est exactement ce
+    /// candidat-là.
+    ///
+    /// Trois candidats, et non deux : avec deux, une boucle qui prendrait
+    /// systématiquement le **dernier** du classement passerait aussi. Le troisième
+    /// est là pour que « le premier sain » se distingue de « le dernier ».
+    ///
+    /// La moitié ledger de l'AC4 n'est pas ici : la sonde scriptée ne consigne
+    /// rien, par choix — c'est la sonde de **production** qui consigne, et c'est
+    /// le scan structurel de
+    /// [`test_promotion_gate_never_resolves_conflicts`] qui garde ses deux
+    /// sites et leur constante.
+    #[tokio::test]
+    async fn mika3058_un_declin_en_tete_ne_fige_pas_la_phase() {
+        let declined = make_issue(3050, GROOMED_BODY, &["p1-important"], "t");
+        let healthy = make_issue(3051, GROOMED_BODY, &["p1-important"], "t");
+        let never_reached = make_issue(3052, GROOMED_BODY, &["p1-important"], "t");
+
+        let mut probe = ScriptedProbe {
+            verdicts: vec![
+                (3050, Phase1Verdict::TryNext),
+                (3051, Phase1Verdict::Promote),
+                (3052, Phase1Verdict::TryNext),
+            ],
+            seen: Vec::new(),
+        };
+
+        let promoted =
+            phase1_first_promotable(vec![declined, healthy, never_reached], &mut probe).await;
+
+        assert_eq!(
+            promoted.map(|i| i.number),
+            Some(3051),
+            "AC3 — le candidat sain derrière le ticket décliné est promu dans le \
+             MÊME tick ; sans ce parcours, la phase 1 ne promouvrait plus rien \
+             tant que #3050 reste ouvert"
+        );
+        assert_eq!(
+            probe.seen,
+            vec![3050, 3051],
+            "la boucle s'arrête au premier promouvable : #3052 n'est jamais \
+             interrogé, donc la porte ne lui coûte aucun appel forge"
+        );
+    }
+
+    /// **D4 — le budget borne le tick, et le tick suivant repart du début.**
+    ///
+    /// Sans borne, un tick sur une file de vingt tickets fraîchement mergés
+    /// paierait quarante appels forge pour ne rien promouvoir. Avec la borne,
+    /// la phase abandonne, et comme un déclin ne persiste rien, le tick suivant
+    /// reprend le classement du début — ce n'est pas une perte, c'est le même
+    /// état.
+    ///
+    /// Quatre candidats pour un budget de trois : avec exactement trois, un
+    /// `take` absent passerait le test par coïncidence.
+    #[tokio::test]
+    async fn mika3058_le_budget_de_declins_borne_le_tick() {
+        let ranked: Vec<Issue> = (0..4)
+            .map(|i| make_issue(4100 + i, GROOMED_BODY, &["p1-important"], "t"))
+            .collect();
+        let mut probe = ScriptedProbe {
+            verdicts: (0..4).map(|i| (4100 + i, Phase1Verdict::TryNext)).collect(),
+            seen: Vec::new(),
+        };
+
+        let promoted = phase1_first_promotable(ranked, &mut probe).await;
+
+        assert!(
+            promoted.is_none(),
+            "quatre déclins d'affilée ne promeuvent personne"
+        );
+        assert_eq!(
+            probe.seen.len(),
+            PHASE1_DECLINE_BUDGET,
+            "D4 — la boucle s'arrête à {PHASE1_DECLINE_BUDGET} interrogations et \
+             n'atteint pas le quatrième candidat ; vu : {:?}",
+            probe.seen
+        );
+    }
+
+    /// **Le classement rend le même premier que `max_by` rendait.**
+    ///
+    /// `select_best_candidate_recording` rendait `max_by(…)`, que mika#3058
+    /// remplace par un `sort_by` dont la tête doit être le même ticket — sinon
+    /// le vol change, en silence, quel ticket la phase 1 promeut quand elle
+    /// promeut, et ce changement n'est dans aucun critère d'acceptation.
+    ///
+    /// Trois propriétés, parce que l'ordre en a trois niveaux :
+    ///
+    /// 1. priorité d'abord (rang le plus HAUT gagne) ;
+    /// 2. à priorité égale, le `updated_at` le plus ANCIEN gagne — la phase sert
+    ///    le ticket qui attend depuis le plus longtemps ;
+    /// 3. à égalité parfaite, le **dernier** de la liste d'entrée gagne. Ce n'est
+    ///    pas un choix : c'est ce que `Iterator::max_by` fait, documenté, et
+    ///    l'inverser déplacerait silencieusement la promotion d'un tick.
+    ///
+    /// Les labels de priorité sont écrits **nus** (`"p0"`, `"p1"`, `"p2"`) et
+    /// non suffixés, parce que c'est ce que [`priority_rank`] matche — le bug
+    /// latent nommé dans la doc de [`feeder_rank`], qui rend 0 pour tout vrai
+    /// ticket de la taxonomie. Ce test garde l'ordre **tel qu'il est**, pas tel
+    /// qu'il devrait être : corriger le ranker déplacerait quel ticket la phase
+    /// 1 promeut, et ce n'est dans aucun critère de ce vol.
+    #[test]
+    fn mika3058_lordre_des_candidats_est_celui_de_max_by() {
+        let rank = |pool: Vec<Issue>| -> Vec<u64> {
+            select_candidates_ranked_recording(
+                pool,
+                &HashSet::new(),
+                &mut ExclusionLedger::default(),
+            )
+            .into_iter()
+            .map(|i| i.number)
+            .collect()
+        };
+
+        assert_eq!(
+            rank(vec![
+                make_issue(5001, GROOMED_BODY, &["p2"], "2026-01-01T00:00:00Z"),
+                make_issue(5002, GROOMED_BODY, &["p0"], "2026-06-01T00:00:00Z"),
+            ]),
+            vec![5002, 5001],
+            "la priorité passe avant l'ancienneté : le p0 récent devance le p2 \
+             ancien"
+        );
+
+        assert_eq!(
+            rank(vec![
+                make_issue(5011, GROOMED_BODY, &["p1"], "2026-06-01T00:00:00Z"),
+                make_issue(5012, GROOMED_BODY, &["p1"], "2026-01-01T00:00:00Z"),
+            ]),
+            vec![5012, 5011],
+            "à priorité égale, le plus ancien `updated_at` passe devant"
+        );
+
+        assert_eq!(
+            rank(vec![
+                make_issue(5021, GROOMED_BODY, &["p1"], "2026-01-01T00:00:00Z"),
+                make_issue(5022, GROOMED_BODY, &["p1"], "2026-01-01T00:00:00Z"),
+            ]),
+            vec![5022, 5021],
+            "à égalité parfaite, le DERNIER de la liste d'entrée gagne — c'est \
+             ce que rendait `max_by`, et l'inverser déplacerait la promotion sans \
+             qu'aucun critère ne l'ait demandé"
         );
     }
 }
