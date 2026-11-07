@@ -306,6 +306,42 @@ pub fn bundled_skill_tool_map() -> std::collections::HashMap<String, Vec<String>
     map
 }
 
+/// Chaque fichier **exécutable** du bundle, en triplets
+/// `(propriétaire, chemin dans le bundle, contenu)`.
+///
+/// Le propriétaire est le nom du skill, ou celui du répertoire de support pour
+/// les fichiers de `_shared/` — qu'[`all_bundled_skills`] n'atteint pas, un
+/// `SupportDir` n'étant pas un skill. Les deux sources sont nécessaires : c'est
+/// `_shared/dispatch-lib.sh` qui porte toute la plomberie de dispatch.
+///
+/// **Lit les constantes compilées, jamais un checkout** (mika#2340) : ce que le
+/// binaire sert est ce que `build.rs` a figé, et un scan de `skills/bundled/`
+/// répondrait sur le répertoire de travail plutôt que sur le binaire.
+///
+/// **Restreint à la moitié exécutable, délibérément** (mika#3056). Un
+/// `system_prompt.md` qui dit à un agent d'appeler `gh issue close` ne ferme
+/// rien : il route vers `run_gh`, dont la garde de mika#1646 refuse ce geste.
+/// Compter la prose ferait rougir chaque prompt de pilote sur un fait qui n'est
+/// pas un chemin d'exécution.
+///
+/// Sous `#[cfg(test)]` : son unique lecteur est le recensement d'AC4
+/// ([`crate::evidence::forge_close_census`]), qui est lui-même une assertion et
+/// non un chemin d'exécution.
+#[cfg(test)]
+pub(crate) fn bundled_executables() -> Vec<(&'static str, &'static str, &'static str)> {
+    let from_skills = all_bundled_skills()
+        .into_iter()
+        .flat_map(|s| s.files.iter().map(move |f| (s.name, f)));
+    let from_support = SUPPORT_DIRS
+        .iter()
+        .flat_map(|d| d.files.iter().map(move |f| (d.name, f)));
+    from_skills
+        .chain(from_support)
+        .filter(|(_, f)| f.executable)
+        .map(|(owner, f)| (owner, f.path, f.content))
+        .collect()
+}
+
 /// Trust-critical bundled skills whose prompts must NOT be reviewed or adapted.
 ///
 /// These skills govern the agent's self-awareness, security posture, or ability
