@@ -7440,6 +7440,358 @@ mod tests {
         );
     }
 
+    // --- mika#3056 — le bras issue, et les quatre états où il ne lit rien ----
+
+    // Les prédicats des couches A et B, importés ici parce que les témoins de
+    // non-vacuité ci-dessous les appellent : un test qui affirme « la couche A
+    // était satisfaite » doit le lui demander, pas le supposer. La garde elle
+    // les importe dans son propre corps.
+    use crate::evidence::guards::{
+        DESTRUCTIVE_ACTION_AUDIT_TOOL, destructive_comment_cites_evidence,
+        destructive_grounding_satisfied, destructive_repeat_acknowledged,
+        detect_destructive_action, repeat_action_window_secs,
+    };
+
+    /// Le libellé que le bras issue écrit, épelé une fois.
+    const MIKA3056_LABEL: &str = "block[issue_close_not_by_merge]";
+
+    /// Un commentaire de fermeture qui cite une relecture — il satisfait
+    /// `destructive_comment_cites_evidence` par deux marqueurs (`state:` et
+    /// `no commits`). C'est la forme qui PASSAIT : les 3 fermetures autorisées
+    /// du 10/09 au 06/11 l'ont obtenue après 1 à 3 refus.
+    const MIKA3056_CITING_COMMENT: &str =
+        "read back state: OPEN, no commits on the branch — superseded";
+
+    /// The argv of an issue close the mika#1646 detector recognises (mika#3056).
+    fn mika3056_issue_close_args(comment: &str) -> Vec<String> {
+        ["issue", "close", "42", "--comment", comment]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Les quatre états que AC2 énumère, et l'invariant qui ne dépend d'aucun :
+    /// le refus tombe, et il porte le libellé du bras issue — jamais celui d'une
+    /// couche que le bras précède.
+    ///
+    /// `tier` est un paramètre parce que le quatrième état se mesure là : c'est
+    /// le palier qui ROUTE le diagnostic de la couche A (mika#1964), donc c'est
+    /// le seul endroit où l'on peut voir que le bras issue n'en route aucun. Il
+    /// passe `diagnostic = None` — rien n'est indisponible — donc aucun palier
+    /// n'écrit de ligne `substrate_unavailable`.
+    async fn assert_issue_close_refused(
+        h: &TestHarness,
+        etat: &str,
+        tier: mika_common::home::AgentTier,
+        comment: &str,
+    ) {
+        let ctx = h.ctx_with_tier_and_brave(tier, None);
+        let args = mika3056_issue_close_args(comment);
+        let Err(refusal) = validate_destructive_action_grounding(&args, None, &ctx).await else {
+            panic!("[{etat}] une fermeture d'issue doit être refusée");
+        };
+
+        assert!(refusal.is_error, "[{etat}] le refus doit être une erreur");
+        let body: serde_json::Value = serde_json::from_str(&refusal.content)
+            .unwrap_or_else(|e| panic!("[{etat}] corps illisible ({e}): {}", refusal.content));
+        assert_eq!(
+            body["error"], MIKA3056_LABEL,
+            "[{etat}] libellé de bloc inattendu: {}",
+            refusal.content
+        );
+        assert_eq!(
+            body["target"], "issue:close:42",
+            "[{etat}] {}",
+            refusal.content
+        );
+        // Le bras ne lit aucun substrat, donc il n'en nomme aucun : le nom du
+        // réglage de persistance appartient à la couche A seule.
+        assert!(
+            !refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "[{etat}] le bras issue a emprunté le diagnostic de la couche A: {}",
+            refusal.content
+        );
+
+        // AC1 — le remède nomme la seule voie, et n'en propose aucune autre.
+        let remedy = body["remedy"]
+            .as_str()
+            .unwrap_or_else(|| panic!("[{etat}] remède absent: {}", refusal.content));
+        for nomme in ["Closes", "merge", "Vincent"] {
+            assert!(
+                remedy.contains(nomme),
+                "[{etat}] le remède ne nomme pas « {nomme} »: {remedy}"
+            );
+        }
+        for contournement in ["retry", "read the", "cite", "--comment"] {
+            assert!(
+                !remedy.contains(contournement),
+                "[{etat}] le remède propose « {contournement} », donc un contournement: {remedy}"
+            );
+        }
+
+        // AC1 — une décision, une ligne, sous le même `tool_name` que les
+        // autres : c'est elle que la sonde AC5 compte par `GROUP BY after_value`.
+        let events =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+        let blocks: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == DESTRUCTIVE_ACTION_AUDIT_TOOL)
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "[{etat}] une décision doit écrire une ligne et une seule: {events:?}"
+        );
+        assert_eq!(
+            blocks[0].after_value.as_deref(),
+            Some(MIKA3056_LABEL),
+            "[{etat}] {events:?}"
+        );
+        assert_eq!(
+            blocks[0].target_key, "issue:close:42",
+            "[{etat}] {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.tool_name == "substrate_unavailable"),
+            "[{etat}] le bras issue ne déclare aucun substrat indisponible: {events:?}"
+        );
+    }
+
+    /// AC2, état 1 — la relecture est là et le commentaire la cite. C'est
+    /// exactement l'état qui autorisait la fermeture avant mika#3056, et le
+    /// seul des quatre où la couche A est satisfaite : d'où le témoin de
+    /// non-vacuité ci-dessous, sans lequel ce test ne mesurerait que l'état 2.
+    #[tokio::test]
+    async fn mika3056_une_fermeture_dissue_relue_et_citee_est_refusee() {
+        let h = TestHarness::new();
+        let trace_id = h.ctx().trace_id.to_string();
+        // La relecture de la cible, enregistrée par l'écrivain de production
+        // (mika#2565) et portée par la trace du tour — donc vue de la couche A.
+        h.db.save_tool_call(
+            &format!("tc-{}", uuid::Uuid::new_v4()),
+            "test-session",
+            Some(&trace_id),
+            None,
+            1,
+            "run_gh",
+            "builtin",
+            Some("github"),
+            Some(
+                &serde_json::json!({
+                    "command": ["issue", "view", "42", "--json", "state,comments"]
+                })
+                .to_string(),
+            ),
+            Some(r#"{"state":"OPEN","comments":[]}"#),
+            true,
+            false,
+            12,
+            None,
+        )
+        .await
+        .expect("la ligne de relecture doit être enregistrée");
+
+        // Témoin : les deux moitiés de la couche A sont réellement satisfaites.
+        let action = detect_destructive_action(&mika3056_issue_close_args(MIKA3056_CITING_COMMENT))
+            .expect("le détecteur reconnaît cette fermeture");
+        let rows =
+            h.db.query_tool_calls_by_trace(&trace_id)
+                .await
+                .expect("query_tool_calls_by_trace");
+        assert!(
+            destructive_grounding_satisfied(
+                &action,
+                rows.iter()
+                    .map(|r| (r.tool_name.as_str(), r.input.as_deref().unwrap_or("")))
+            ),
+            "la fixture doit satisfaire la couche A, sinon le test ne mesure rien: {rows:?}"
+        );
+        assert!(
+            destructive_comment_cites_evidence(action.comment.as_deref()),
+            "la fixture doit satisfaire la citation de la couche A"
+        );
+
+        assert_issue_close_refused(
+            &h,
+            "relecture présente et citée",
+            mika_common::home::AgentTier::Default,
+            MIKA3056_CITING_COMMENT,
+        )
+        .await;
+    }
+
+    /// AC2, état 2 — aucune relecture. La couche A refuserait aussi, mais sous
+    /// son libellé et avec son diagnostic ; le helper garde les deux faits.
+    #[tokio::test]
+    async fn mika3056_une_fermeture_dissue_sans_relecture_est_refusee() {
+        let h = TestHarness::new();
+        assert_issue_close_refused(
+            &h,
+            "relecture absente",
+            mika_common::home::AgentTier::Default,
+            "superseded",
+        )
+        .await;
+    }
+
+    /// AC2, état 3 — répétition. Une fermeture antérieure de la même cible dans
+    /// la fenêtre fait tirer la couche B ; le libellé rendu est quand même celui
+    /// du bras issue, et c'est la preuve qu'il est en TÊTE de la garde.
+    #[tokio::test]
+    async fn mika3056_une_repetition_porte_le_libelle_du_bras_pas_celui_de_la_couche_b() {
+        let h = TestHarness::new();
+        h.db.save_tool_call(
+            &format!("tc-{}", uuid::Uuid::new_v4()),
+            "test-session",
+            None,
+            None,
+            1,
+            "run_gh",
+            "builtin",
+            Some("github"),
+            Some(
+                &serde_json::json!({
+                    "command": ["issue", "close", "42", "--comment", "superseded"]
+                })
+                .to_string(),
+            ),
+            Some("closed"),
+            true,
+            false,
+            12,
+            None,
+        )
+        .await
+        .expect("la fermeture antérieure doit être enregistrée");
+
+        // Témoin : la couche B voit bien cette répétition.
+        let prior =
+            h.db.find_recent_destructive_actions(
+                h.db.agent_id(),
+                "issue",
+                "42",
+                repeat_action_window_secs(),
+            )
+            .await
+            .expect("find_recent_destructive_actions");
+        assert!(
+            !prior.is_empty(),
+            "la fixture doit être visible de la couche B, sinon l'état 3 n'est pas joué"
+        );
+        assert!(
+            !destructive_repeat_acknowledged(Some("superseded")),
+            "le commentaire ne doit PAS se déclarer, sinon la couche B ne tirerait pas"
+        );
+
+        assert_issue_close_refused(
+            &h,
+            "répétition",
+            mika_common::home::AgentTier::Default,
+            "superseded",
+        )
+        .await;
+
+        let events =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.after_value.as_deref() == Some("block[destructive_repeat_unreviewed]")),
+            "la couche B a rendu la décision, donc le bras n'est pas en tête: {events:?}"
+        );
+    }
+
+    /// AC2, état 4 — persistance des appels désactivée. Au moteur, cet état se
+    /// présente comme un tour sans appel enregistré : c'est la branche
+    /// `turn_calls.is_empty()` de la couche A, celle qui route son diagnostic
+    /// vers l'opérateur sur le palier Family (mika#1964). Le bras issue n'a
+    /// besoin d'aucun substrat, donc il n'en déclare aucun indisponible.
+    #[tokio::test]
+    async fn mika3056_persistance_desactivee_le_refus_tombe_sans_router_de_diagnostic() {
+        let h = TestHarness::new();
+        assert_issue_close_refused(
+            &h,
+            "persistance désactivée",
+            mika_common::home::AgentTier::Family,
+            "superseded",
+        )
+        .await;
+    }
+
+    /// AC3, dans le même appel qu'AC1 — l'issue prend le refus de mika#3056, la
+    /// PR garde ses couches A et B. Les deux décisions s'écrivent sous le même
+    /// `tool_name` d'audit, donc sur la même ligne au sens d'AC1 : la sonde AC5
+    /// les sépare par `after_value`, pas par table.
+    #[tokio::test]
+    async fn mika3056_lissue_prend_le_nouveau_refus_la_pr_garde_le_sien() {
+        let h = TestHarness::new();
+        assert_issue_close_refused(
+            &h,
+            "AC3 — volet issue",
+            mika_common::home::AgentTier::Default,
+            "superseded",
+        )
+        .await;
+
+        let ctx = h.ctx();
+        let Err(pr_refusal) =
+            validate_destructive_action_grounding(&mika1964_ungrounded_close_args(), None, &ctx)
+                .await
+        else {
+            panic!("une fermeture de PR non fondée doit rester refusée par la couche A");
+        };
+        // Sur le palier par défaut, la couche A APPEND son diagnostic opérateur
+        // après le corps JSON au lieu de le router (mika#1964) : le contenu
+        // n'est donc pas un seul document JSON. On en prend la tête, ce qui
+        // garde l'assertion stricte sans supposer l'absence de la queue.
+        let body = serde_json::Deserializer::from_str(&pr_refusal.content)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect("le refus PR doit commencer par un corps JSON")
+            .expect("corps de refus PR parseable");
+        assert_eq!(
+            body["error"], "block[destructive_grounding]",
+            "la PR doit garder le libellé de ses couches: {}",
+            pr_refusal.content
+        );
+        assert_eq!(body["target"], "pr:close:42", "{}", pr_refusal.content);
+        // La couche A garde son diagnostic : le bras issue ne l'a pas remplacée.
+        assert!(
+            pr_refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "la couche A a perdu son diagnostic sur la PR: {}",
+            pr_refusal.content
+        );
+
+        let events =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+        let decisions: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == DESTRUCTIVE_ACTION_AUDIT_TOOL)
+            .map(|e| (e.target_key.as_str(), e.after_value.as_deref()))
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            2,
+            "deux décisions, deux lignes, un seul `tool_name`: {events:?}"
+        );
+        assert!(
+            decisions.contains(&("issue:close:42", Some(MIKA3056_LABEL))),
+            "{decisions:?}"
+        );
+        assert!(
+            decisions.contains(&("pr:close:42", Some("block[destructive_grounding]"))),
+            "{decisions:?}"
+        );
+    }
+
     #[test]
     fn test_truncate_output_short() {
         let mut output = ToolOutput::success("short content");
