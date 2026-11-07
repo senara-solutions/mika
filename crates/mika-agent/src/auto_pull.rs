@@ -1189,6 +1189,31 @@ impl PromotionGate {
     }
 }
 
+/// Ce que le site d'appel apprend de la porte (mika#3058).
+///
+/// Un `bool` ne disait que « promu ou pas ». La phase 1 a besoin de la
+/// distinction : sur un **refus** le ticket est escaladé et porte désormais le
+/// marqueur qui l'exclut de toutes les phases, donc le tick s'arrête ; sur un
+/// **déclin** rien n'est écrit — le ticket est sain, il reste en tête du
+/// backlog, et le tick suivant le reverrait à l'identique. C'est cette seule
+/// branche qui a le droit d'essayer le candidat d'après (AC3).
+///
+/// `Declined` ne porte aucune donnée : la raison est déjà au journal, à l'audit
+/// et au ledger, et un second porteur dériverait du premier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    Allowed,
+    Refused,
+    Declined,
+}
+
+impl GateOutcome {
+    /// La lecture des phases 0 et 2 : elles ne distinguent pas les deux non.
+    fn allows(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
 /// Extract the branch name from a ticket's grooming callout (mika#2123 U1).
 ///
 /// Mirrors [`extract_plan_path`], including its anchoring: the callout is
@@ -1437,27 +1462,38 @@ pub fn classify_promotion(
         // qu'elle fait.
         StalenessMeasurement::BranchDeletedByMerge { pr } => {
             return match phase {
-                // Le ticket ne porte pas `ready`. Le merge l'a retiré
+                // Le ticket ne porte pas `ready` — dans NI L'UNE ni l'autre de
+                // ces deux phases. Le feeder le pose, et la phase 1 le pose
+                // aussi : elle pioche dans le backlog des tickets qui ne le
+                // portent pas, puis le leur pose (`apply_ready_label`,
+                // `"phase1_idle_pull"`). Le merge vient de le retirer
                 // (mika#3022) ; le reposer serait se donner le consentement
                 // qu'on vient de rendre.
-                ExclusionPhase::Phase0Feeder => {
+                //
+                // mika#3058 — la phase 1 était du côté promouvant, sous un
+                // commentaire qui disait « le ticket porte déjà `ready` ».
+                // C'était faux de cette phase-là, et douze vols sont partis
+                // sans mot humain depuis le 21/10 : la phase 0 refusait à
+                // 06:40:03Z le 06/11, la phase 1 promouvait à 06:40:04Z sur la
+                // même mesure.
+                ExclusionPhase::Phase0Feeder | ExclusionPhase::Phase1Pull => {
                     PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: *pr })
                 }
-                // Le ticket porte déjà `ready`. mika#2837 inchangé : c'est
-                // ainsi que part le vol suivant d'un ticket à plusieurs vols.
+                // Le ticket porte VRAIMENT `ready` : le vivier de la phase 2
+                // est celui des tickets qui le portent déjà et que rien ne
+                // dispatche. mika#2837 inchangé : c'est ainsi que part le vol
+                // suivant d'un ticket à plusieurs vols.
                 //
-                // mika#3047 — « porte déjà `ready` » est ce que la **liste du
-                // tick** dit, et c'est ce qui a dispatché #3044 sans
-                // consentement : au merge, le retrait de `ready` par mika#3022
-                // et cette promotion se sont croisés à 163 ms. Cette fonction
-                // garde sa décision, qui porte sur une branche ; c'est la phase
-                // 2 qui relit le label juste avant de dispatcher
+                // mika#3047 — « porte `ready` » est ce que la **liste du tick**
+                // dit, et c'est ce qui a dispatché #3044 sans consentement : au
+                // merge, le retrait de `ready` par mika#3022 et cette promotion
+                // se sont croisés à 163 ms. Cette fonction garde sa décision,
+                // qui porte sur une branche ; c'est la phase 2 qui relit le
+                // label juste avant de dispatcher
                 // (`gh_reread_issue_at_dispatch`).
-                ExclusionPhase::Phase1Pull | ExclusionPhase::Phase2StuckReady => {
-                    PromotionGate::Promote {
-                        detail: "branch_deleted_by_merged_pr",
-                    }
-                }
+                ExclusionPhase::Phase2StuckReady => PromotionGate::Promote {
+                    detail: "branch_deleted_by_merged_pr",
+                },
             };
         }
         // Inchangé, et c'est AC2 : aucune PR mergée ne porte la branche, ou la
@@ -1860,6 +1896,19 @@ const FILTER_BELOW_THRESHOLD: &str = "below_threshold";
 const FILTER_NO_READY_LABEL_EVENT: &str = "no_ready_label_event";
 /// The mika#2123 promotion staleness gate refused this branch.
 const FILTER_PROMOTION_GATE: &str = "promotion_gate_refused";
+/// La porte s'est **abstenue** : le merge d'une PR vient de rendre le `ready`,
+/// et le reposer serait se donner le consentement qu'on rend (mika#3036, puis
+/// mika#3058 pour la phase 1).
+///
+/// Délibérément distinct de [`FILTER_PROMOTION_GATE`], et pour la raison qui a
+/// déjà séparé `below_threshold` de [`FILTER_NO_READY_LABEL_EVENT`]
+/// (mika#2131) : un refus escalade — label, `ready` retiré, commentaire — et
+/// l'opérateur a un geste à faire ; un déclin n'écrit rien et le ticket est
+/// sain. Les additionner sous un seul nom rendrait « combien de tickets ce
+/// vivier a-t-il escaladés » insoluble (mika#2205). Le nom est celui du slug de
+/// [`DeclineReason::ConsentReturnedByMerge`], et un test l'asserte : l'audit et
+/// le ledger se joignent alors sur une seule chaîne (AC4).
+const FILTER_CONSENT_RETURNED_BY_MERGE: &str = "consent_returned_by_merge";
 /// A DB probe failed and the ticket was skipped conservatively.
 const FILTER_PROBE_ERROR: &str = "state_probe_failed";
 /// A seat verdict refused without naming itself (defensive; see
@@ -4061,8 +4110,11 @@ async fn maybe_rewrite_stale_callout(
     }
 }
 
-/// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
-/// promoted; on `false` the ticket has already been handed to the operator.
+/// The promotion gate (mika#2123 R1–R5). Returns [`GateOutcome::Allowed`] when
+/// the ticket may be promoted; on [`GateOutcome::Refused`] the ticket has
+/// already been handed to the operator, and on [`GateOutcome::Declined`]
+/// (mika#3058) nothing at all was written — the ticket is sound and waits for a
+/// consent only a human can return.
 ///
 /// Called from **all three** sites that apply the `ready` label — the Phase 0
 /// feeder, the Phase 1 idle pull, and the Phase 2 stuck-ready rescue. The
@@ -4083,7 +4135,7 @@ async fn promotion_gate_allows(
     phase: ExclusionPhase,
     trace_id: &str,
     session_id: &str,
-) -> bool {
+) -> GateOutcome {
     let branch = extract_branch_name(&issue.body);
     let measurement = match branch.as_deref() {
         Some(b) => gh_compare_branch(github_token, b).await,
@@ -4156,7 +4208,7 @@ async fn promotion_gate_allows(
                 staleness = %audit,
                 "auto_pull_promotion_allowed"
             );
-            true
+            GateOutcome::Allowed
         }
         PromotionGate::Refuse(reason) => {
             refuse_promotion(
@@ -4171,11 +4223,11 @@ async fn promotion_gate_allows(
                 session_id,
             )
             .await;
-            false
+            GateOutcome::Refused
         }
         // mika#3036 — aucune écriture sur la forge : ni label, ni commentaire.
         // Le ticket est sain ; il attend un consentement que seul un humain peut
-        // rendre. Le `false` suffit, et c'est lui qui fait compter le déclin dans
+        // rendre. Le verdict suffit, et c'est lui qui fait compter le déclin dans
         // le ledger d'exclusion du site d'appel (AC4).
         PromotionGate::Decline(reason) => {
             warn!(
@@ -4185,7 +4237,7 @@ async fn promotion_gate_allows(
                 phase = phase.gate_phase(),
                 "auto_pull_promotion_declined"
             );
-            false
+            GateOutcome::Declined
         }
     }
 }
@@ -5335,7 +5387,7 @@ async fn phase0_feed_ready_pool(
         // failure class wearing a different hat. It gets a WARN, not a shrug.
         match issues.iter().find(|i| i.number == n) {
             Some(issue) => {
-                if !promotion_gate_allows(
+                let outcome = promotion_gate_allows(
                     db,
                     github_token,
                     label_auth,
@@ -5344,10 +5396,27 @@ async fn phase0_feed_ready_pool(
                     trace_id,
                     session_id,
                 )
-                .await
-                {
-                    ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_PROMOTION_GATE);
-                    continue;
+                .await;
+                // mika#3058 — le **comportement** est celui d'avant : les deux
+                // non passent au candidat suivant. Seul le nom sous lequel
+                // l'exclusion se compte change, et il change parce qu'un refus
+                // escalade — label, `ready` retiré, commentaire, un geste
+                // d'opérateur à faire — là où un déclin n'écrit rien. Les
+                // additionner sous `promotion_gate_refused`, c'est mika#2205.
+                match outcome {
+                    GateOutcome::Allowed => {}
+                    GateOutcome::Refused => {
+                        ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_PROMOTION_GATE);
+                        continue;
+                    }
+                    GateOutcome::Declined => {
+                        ledger.record(
+                            ExclusionPhase::Phase0Feeder,
+                            n,
+                            FILTER_CONSENT_RETURNED_BY_MERGE,
+                        );
+                        continue;
+                    }
                 }
             }
             None => warn!(
@@ -5501,7 +5570,7 @@ async fn phase1_promote_groomed(
     // reaches the next-best candidate — one idle tick, self-healing, against the
     // complexity of a retry loop inside a phase whose whole shape is "one pick
     // when the queue is idle".
-    if !promotion_gate_allows(
+    let gate = promotion_gate_allows(
         db,
         github_token,
         label_auth,
@@ -5510,14 +5579,28 @@ async fn phase1_promote_groomed(
         trace_id,
         session_id,
     )
-    .await
-    {
-        ledger.record(
-            ExclusionPhase::Phase1Pull,
-            candidate.number,
-            FILTER_PROMOTION_GATE,
-        );
-        return None;
+    .await;
+    match gate {
+        GateOutcome::Allowed => {}
+        GateOutcome::Refused => {
+            ledger.record(
+                ExclusionPhase::Phase1Pull,
+                candidate.number,
+                FILTER_PROMOTION_GATE,
+            );
+            return None;
+        }
+        // mika#3058 — le déclin a son propre compte, et il n'escalade rien :
+        // le ticket reste sain, sans marqueur, donc en tête du backlog au tick
+        // suivant. C'est ce que la boucle de candidats résout (AC3).
+        GateOutcome::Declined => {
+            ledger.record(
+                ExclusionPhase::Phase1Pull,
+                candidate.number,
+                FILTER_CONSENT_RETURNED_BY_MERGE,
+            );
+            return None;
+        }
     }
 
     // 5. Apply the `ready` label to trigger webhook-driven dispatch — through
@@ -6266,7 +6349,11 @@ async fn phase2_reconcile_stuck_ready(
             session_id,
         )
         .await
+        .allows()
         {
+            // mika#3058 — un seul nom suffit ici : par AC1, la phase 2 ne
+            // décline jamais. Son vivier est celui des tickets qui portent
+            // déjà `ready`, donc aucune promotion n'y fabrique de consentement.
             ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROMOTION_GATE);
             continue;
         }
@@ -6490,9 +6577,14 @@ mod tests {
 
     // ── mika#2123 promotion staleness gate ──
 
-    /// Ancre les tests antérieurs à mika#3036 sur la phase dont ce vol ne change
-    /// RIEN. C'est ce qui en fait leur contrôle de non-régression : s'ils
-    /// bougent, c'est que les phases 1 et 2 ont bougé. Les tests de la phase
+    /// Ancre les tests antérieurs à mika#3036 sur la phase dont aucun vol n'a
+    /// changé la décision. C'est ce qui en fait leur contrôle de
+    /// non-régression : s'ils bougent, c'est que la phase 2 a bougé.
+    ///
+    /// L'ancre était `Phase1Pull` jusqu'à mika#3058, parce que mika#3036 n'avait
+    /// déplacé que la phase 0. Ce vol déplace la phase 1 — elle décline
+    /// désormais sur `BranchDeletedByMerge` — donc l'ancre passe à
+    /// `Phase2StuckReady`, la seule qui promeut encore. Les tests de la phase
     /// appellent [`super::classify_promotion`] nommément, avec leur phase
     /// explicite.
     fn classify_promotion(
@@ -6500,7 +6592,7 @@ mod tests {
         branch: Option<&str>,
         max_behind: i64,
     ) -> PromotionGate {
-        super::classify_promotion(m, branch, max_behind, ExclusionPhase::Phase1Pull)
+        super::classify_promotion(m, branch, max_behind, ExclusionPhase::Phase2StuckReady)
     }
 
     /// A measurement whose file list is **unavailable** (`files` absent from
@@ -7420,20 +7512,55 @@ mod tests {
         // « Suivi de » et non « présent dans le fichier » : les trois appels
         // n'ont pas la même mise en forme — deux sur une ligne, un éclaté sur
         // cinq — donc on découpe sur l'appel et on lit ses arguments.
-        let gate_ledgers = production
-            .split("ledger.record(")
-            .skip(1)
-            .filter(|rest| {
-                rest.split(')')
-                    .next()
-                    .is_some_and(|args| args.contains("FILTER_PROMOTION_GATE"))
-            })
-            .count();
+        let ledger_filter_count = |needle: &str| {
+            production
+                .split("ledger.record(")
+                .skip(1)
+                .filter(|rest| rest.split(')').next().is_some_and(|a| a.contains(needle)))
+                .count()
+        };
         assert_eq!(
-            gate_ledgers, 3,
-            "AC4 — les trois phases comptent leur exclusion de porte sous \
+            ledger_filter_count("FILTER_PROMOTION_GATE"),
+            3,
+            "AC4 — les trois phases comptent leur **refus** de porte sous \
              `{FILTER_PROMOTION_GATE}`. Un compte qui tombe à deux, c'est une \
-             phase dont les refus — déclins compris — ne se comptent plus"
+             phase dont les refus ne se comptent plus. Les déclins, eux, ont \
+             leur propre compte depuis mika#3058 — `{FILTER_CONSENT_RETURNED_BY_MERGE}` \
+             ci-dessous : un refus escalade, un déclin n'écrit rien, et les \
+             additionner serait mika#2205"
+        );
+
+        // ── T5 (mika#3058) — le recensement du déclin au ledger ──
+
+        // Même forme que l'allowlist de S1 ci-dessus, et pour la même raison :
+        // une entrée ajoutée sans élargir le type ne compile pas, et l'élargir
+        // est le geste visible au `grep` que mika#1574 demande.
+        const T3058_DECLINE_LEDGER_ALLOWLIST: [&str; 0] = [];
+        assert!(
+            T3058_DECLINE_LEDGER_ALLOWLIST.is_empty(),
+            "mika#3058 — table d'exceptions du recensement de déclin au ledger : \
+             doit rester vide ; toute entrée nomme sa donnée précise et son \
+             ticket de suivi"
+        );
+
+        // La constante du ledger et le slug de la raison sont **le même texte**.
+        // Sans cette égalité, l'audit et le ledger se joindraient sur deux
+        // chaînes voisines, et la requête de la sonde AC5 ne verrait qu'une
+        // moitié de la population.
+        assert_eq!(
+            FILTER_CONSENT_RETURNED_BY_MERGE,
+            DeclineReason::ConsentReturnedByMerge { pr: 0 }.slug(),
+            "AC4 — le ledger et l'audit comptent le déclin sous le MÊME slug ; \
+             deux textes voisins ne se joignent pas"
+        );
+
+        assert_eq!(
+            ledger_filter_count("FILTER_CONSENT_RETURNED_BY_MERGE"),
+            2,
+            "AC4 — **deux** sites, pas trois : les phases 0 et 1 déclinent, la \
+             phase 2 jamais (AC1 — son vivier porte déjà `ready`). Un troisième \
+             site dirait qu'une phase a commencé à décliner sans qu'on le \
+             décide, et un seul qu'une des deux a cessé de se compter"
         );
     }
 
@@ -14315,41 +14442,69 @@ Un ticket à plusieurs vols.
         );
     }
 
-    /// **AC1 — en phase 0, une mesure de merge refuse la promotion.**
+    /// **AC1 et AC2 (mika#3058) — les trois phases, dans un seul appel, sur une
+    /// seule mesure.**
     ///
-    /// Le merge vient de rendre le `ready` (mika#3022, voie B de mika#2995) ; le
-    /// feeder ne peut pas se le redonner. En phases 1 et 2 le ticket porte déjà
-    /// `ready`, et la règle de mika#2837 y reste entière : la même mesure
-    /// promeut, parce qu'elle laisse partir le vol suivant d'un ticket à
-    /// plusieurs vols.
+    /// Le merge vient de rendre le `ready` (mika#3022, voie B de mika#2995), et
+    /// deux des trois phases ne peuvent pas se le redonner :
+    ///
+    /// - la **phase 0** pose `ready` sur un ticket du vivier qui ne le porte
+    ///   pas — c'est ce que mika#3036 a tranché ;
+    /// - la **phase 1** le pose aussi (`apply_ready_label`,
+    ///   `"phase1_idle_pull"`), sur un candidat du backlog que la sélection
+    ///   choisit précisément parce qu'il ne le porte pas. mika#3036 l'avait
+    ///   laissée du côté promouvant sous un commentaire disant « le ticket
+    ///   porte déjà `ready` » : faux de cette phase-là. Le 06/11 à 06:40Z la
+    ///   phase 0 déclinait à `:03Z` et la phase 1 promouvait à `:04Z` **sur la
+    ///   même mesure** ; le vol 2 de #3047 est parti sans mot humain ;
+    /// - la **phase 2** promeut, et c'est le contrôle négatif : son vivier est
+    ///   celui des tickets qui portent déjà `ready` et que rien ne dispatche,
+    ///   donc mika#2837 y reste entier, et mika#3047 lui fait relire le label
+    ///   juste avant le dispatch.
     ///
     /// **Une seule** mesure, trois appels : le contrôle négatif vit dans le même
     /// test que l'exigence, parce que deux tests séparés peuvent dériver l'un
-    /// sans l'autre et laisser « la phase décide » vrai sans que « les phases 1
-    /// et 2 n'ont pas bougé » le soit encore.
+    /// sans l'autre et laisser « la phase 1 décline » vrai sans que « la phase 2
+    /// promeut toujours » le soit encore.
     ///
-    /// AC4 y est tenu aussi : la ligne d'audit du déclin est relue sur le JSON
-    /// de [`staleness_audit_json`], et `issue` comme `merged_pr` y sont exigés
-    /// **non nuls** — un `0` ou un `""` se lirait comme une valeur mesurée
-    /// (mika#2331).
+    /// AC4 y est tenu aussi : la ligne d'audit du déclin de **phase 1** est
+    /// relue sur le JSON de [`staleness_audit_json`], et `issue` comme
+    /// `merged_pr` y sont exigés **non nuls** — un `0` ou un `""` se lirait
+    /// comme une valeur mesurée (mika#2331).
     #[test]
-    fn mika3036_la_phase_decide_de_la_mesure_de_merge() {
+    fn mika3058_les_trois_phases_dans_un_seul_appel() {
         let measurement = StalenessMeasurement::BranchDeletedByMerge { pr: 3032 };
+        let expected_decline =
+            PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: 3032 });
 
-        let declined = super::classify_promotion(
+        let declined_phase0 = super::classify_promotion(
             &measurement,
             Some(BRANCH_3030),
             50,
             ExclusionPhase::Phase0Feeder,
         );
         assert_eq!(
-            declined,
-            PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: 3032 }),
+            declined_phase0, expected_decline,
             "AC1 — en `phase0_feeder`, le `ready` que le merge a rendu n'est pas \
              un consentement que le feeder puisse se redonner"
         );
-        let PromotionGate::Decline(reason) = &declined else {
-            panic!("la décision de la phase 0 vient d'être assertée `Decline`");
+
+        let declined_phase1 = super::classify_promotion(
+            &measurement,
+            Some(BRANCH_3030),
+            50,
+            ExclusionPhase::Phase1Pull,
+        );
+        assert_eq!(
+            declined_phase1, expected_decline,
+            "AC1 (mika#3058) — en `phase1_idle_pull` non plus : la phase pioche \
+             dans le backlog des tickets SANS `ready`, puis le leur pose. C'est \
+             la promotion du 06/11 06:40:04Z sur #3047, une seconde après le \
+             déclin de la phase 0 sur la même mesure"
+        );
+
+        let PromotionGate::Decline(reason) = &declined_phase1 else {
+            panic!("la décision de la phase 1 vient d'être assertée `Decline`");
         };
         assert_eq!(reason.slug(), "consent_returned_by_merge");
         assert_ne!(
@@ -14360,25 +14515,29 @@ Un ticket à plusieurs vols.
              (mika#2205)"
         );
 
-        // Le contrôle négatif : mika#2837 inchangé là où le ticket porte déjà
-        // `ready`.
-        for phase in [ExclusionPhase::Phase1Pull, ExclusionPhase::Phase2StuckReady] {
-            assert_eq!(
-                super::classify_promotion(&measurement, Some(BRANCH_3030), 50, phase),
-                PromotionGate::Promote {
-                    detail: "branch_deleted_by_merged_pr",
-                },
-                "AC1 — {phase:?} promeut toujours : c'est ainsi que part le vol \
-                 suivant d'un ticket à plusieurs vols"
-            );
-        }
+        // Le contrôle négatif : mika#2837 inchangé là où le ticket porte
+        // vraiment `ready`.
+        assert_eq!(
+            super::classify_promotion(
+                &measurement,
+                Some(BRANCH_3030),
+                50,
+                ExclusionPhase::Phase2StuckReady,
+            ),
+            PromotionGate::Promote {
+                detail: "branch_deleted_by_merged_pr",
+            },
+            "AC1 — `phase2_stuck_rescue` promeut toujours : c'est ainsi que part \
+             le vol suivant d'un ticket à plusieurs vols, et elle relit le label \
+             avant de dispatcher (mika#3047)"
+        );
 
-        // AC4 — la ligne d'audit du déclin, relisible.
+        // AC4 — la ligne d'audit du déclin de phase 1, relisible.
         let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
             3030,
             Some(BRANCH_3030),
             &measurement,
-            &declined,
+            &declined_phase1,
             50,
         ))
         .expect("l'audit est du JSON valide");
