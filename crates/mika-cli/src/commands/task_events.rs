@@ -67,8 +67,20 @@ impl TaskEventStream {
     /// indistinguishable from an agent with no tasks.
     pub async fn open(base_url: Option<String>) -> Result<Self> {
         let base_url = base_url.unwrap_or_else(crate::commands::dashboard::spirit_url);
-        let url = stream_url(&base_url);
         let token = crate::commands::dashboard::auth_token()?;
+        Self::open_with_token(base_url, token).await
+    }
+
+    /// Open the stream with the base URL and the bearer token already
+    /// resolved.
+    ///
+    /// Split from [`TaskEventStream::open`] for the reason `chat_turn.rs`
+    /// splits its endpoint out: the TUI's subscription is exercised against a
+    /// throwaway server, and the alternative would be mutating
+    /// `MIKA_SPIRIT_URL` / `MIKA_INTERNAL_TOKEN` — process-global state that
+    /// parallel `cargo` tests fight over.
+    pub async fn open_with_token(base_url: String, token: String) -> Result<Self> {
+        let url = stream_url(&base_url);
 
         let client = reqwest::Client::new();
         let resp = client

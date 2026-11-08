@@ -8,10 +8,12 @@ use tui_textarea::TextArea;
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::TeamRunSummary;
+use mika_agent::server::tasks_stream::TaskEventFrame;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::teams::types::{TeamEvent, TeamPhase};
 use mika_common::llm::LlmProvider;
 
+use crate::commands::task_events::TaskEventStream;
 use crate::tui::attachment::ImageAttachment;
 use crate::tui::commands;
 use crate::tui::commands::autocomplete::AutocompleteState;
@@ -622,6 +624,26 @@ pub struct App<'a> {
     /// Agent-scoped — NOT reset on /clear.
     pub queued_task_count: usize,
 
+    // Callback delivery by the task-events SSE stream (mika#1727 V2b)
+    /// Frames this agent's subscription has pushed, drained at the tick (D3).
+    ///
+    /// `None` until the first tick starts the subscription: `App::new` is also
+    /// called from tests that never enter a tokio runtime, so the spawn cannot
+    /// live in the constructor. The `Option` is itself the already-started
+    /// flag — nothing respawns a subscription that ended.
+    pub task_event_rx: Option<mpsc::UnboundedReceiver<TaskEventFrame>>,
+    /// mika-spirit base URL for the callback path, resolved once on the first
+    /// drain. `None` means "not resolved yet".
+    ///
+    /// A field for one reason: the tests point at a throwaway `axum::Router`,
+    /// and the alternative would be mutating `MIKA_SPIRIT_URL` —
+    /// process-global state that parallel `cargo` tests fight over. Same
+    /// reason, same shape as `commands/chat_turn.rs::send_turn_to_endpoint`.
+    pub spirit_base_url: Option<String>,
+    /// Bearer token for the same path, resolved alongside the base URL and for
+    /// the same reason.
+    pub spirit_token: Option<String>,
+
     // Team mode fields (None when in agent mode)
     /// Team worker channel for sending goals.
     pub team_tx: Option<mpsc::UnboundedSender<TeamRequest>>,
@@ -661,6 +683,92 @@ pub const MODEL_CONTEXT_LIMIT: u32 = 200_000;
 
 /// Poll interval for cross-channel messages in ticks (~5 seconds at 30ms tick rate).
 const POLL_INTERVAL_TICKS: u64 = 167;
+
+/// The task a terminal frame names, and the `original_status` its **variant**
+/// carries (mika#1727 V2b, D1).
+///
+/// `original_status` comes from the variant and from no field: the frames carry
+/// none, and the task row cannot answer either — by the time
+/// `AgentRequest::CallbackResult` is built, the atomic claim has already moved
+/// that row to `delivered`. The match is exhaustive for the same reason as
+/// `commands/task_events.rs::frame_agent_id`: a new variant on the wire fails
+/// to compile here rather than silently falling out of the callback path.
+fn terminal_callback_frame(frame: &TaskEventFrame) -> Option<(&str, &'static str)> {
+    match frame {
+        TaskEventFrame::TaskCompleted { task_id, .. } => Some((task_id.as_str(), "completed")),
+        TaskEventFrame::TaskFailed { task_id, .. } => Some((task_id.as_str(), "failed")),
+        TaskEventFrame::TaskCreated { .. }
+        | TaskEventFrame::TaskClaimed { .. }
+        | TaskEventFrame::TaskDelivered { .. }
+        | TaskEventFrame::TaskCancelled { .. }
+        | TaskEventFrame::OverflowMarker { .. }
+        | TaskEventFrame::Unknown => None,
+    }
+}
+
+/// The detail fields a terminal frame does not carry (mika#1727 V2b, D1).
+///
+/// A local mirror rather than the server's `TaskDetailResponse`, which derives
+/// `Serialize` only; serde ignores the eighteen other fields of the response.
+/// `status` is **deliberately absent** — that is what makes D1's prohibition
+/// structural rather than stated, see [`terminal_callback_frame`].
+#[derive(serde::Deserialize)]
+struct CallbackTaskDetail {
+    label: String,
+    result: Option<String>,
+    created_by_session: Option<String>,
+    created_trace_id: Option<String>,
+    parent_task_id: Option<String>,
+}
+
+/// Subscribe to the task-events stream and push this agent's frames to the
+/// tick (mika#1727 V2b, D3).
+///
+/// The agent filter is applied **on the wire** by
+/// [`TaskEventStream::consume`]: it is the free half of the two-stage filter,
+/// the half that drops another agent's frame with no detail round-trip at all
+/// (the stream is per-process — see `server/tasks_stream.rs`).
+///
+/// If the stream falls, the task reopens it after a small back-off, and the
+/// retained poll (D5) covers the window. Nothing respawns this task if it ends:
+/// the loop is infinite by construction, and respawning from the tick would be
+/// a hot loop at 30 ms. That the subscription can die silently is a named risk
+/// of this flight; the poll covers it, and its observability is owed at the
+/// next one.
+fn spawn_task_event_subscription(
+    agent_id: String,
+    base_url: String,
+    token: String,
+) -> mpsc::UnboundedReceiver<TaskEventFrame> {
+    let (tx, rx) = mpsc::unbounded_channel::<TaskEventFrame>();
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            match TaskEventStream::open_with_token(base_url.clone(), token.clone()).await {
+                Ok(stream) => {
+                    backoff = std::time::Duration::from_secs(1);
+                    let sender = tx.clone();
+                    if let Err(e) = stream
+                        .consume(Some(&agent_id), |_payload, frame| {
+                            let _ = sender.send(frame.clone());
+                        })
+                        .await
+                    {
+                        tracing::debug!("task-events stream ended: {e}");
+                    }
+                }
+                Err(e) => tracing::debug!("task-events stream unavailable: {e}"),
+            }
+            // The TUI dropped its receiver: this agent is gone.
+            if tx.is_closed() {
+                return;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+        }
+    });
+    rx
+}
 
 impl<'a> App<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -740,6 +848,9 @@ impl<'a> App<'a> {
             footer_open_rect: None,
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
+            task_event_rx: None,
+            spirit_base_url: None,
+            spirit_token: None,
         }
     }
 
@@ -833,6 +944,10 @@ impl<'a> App<'a> {
             footer_open_rect: None,
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
+            // Team mode has no agent session, so no callback subscription.
+            task_event_rx: None,
+            spirit_base_url: None,
+            spirit_token: None,
         }
     }
 
@@ -1115,6 +1230,13 @@ impl<'a> App<'a> {
             self.executing_task_count = counts.executing;
             self.queued_task_count = counts.queued;
             self.needs_redraw = true;
+        }
+
+        // Callback delivery: a callback the daemon terminated arrives by the
+        // task-events SSE stream (mika#1727 V2b). Drained at every tick, so
+        // the latency is the wire's and not the poll interval's.
+        if !self.is_team_mode() && self.status == AgentStatus::Idle {
+            self.drain_task_event_frames().await;
         }
 
         // Callback delivery polling: check for completed-but-undelivered callback tasks.
@@ -1592,7 +1714,179 @@ impl<'a> App<'a> {
         self.needs_redraw = true;
     }
 
+    /// Inject the callbacks the daemon terminated, as the task-events SSE
+    /// stream delivers them (mika#1727 V2b, criterion 2).
+    ///
+    /// Resolves the base URL and the bearer token **once** and caches them on
+    /// `self`. Before the subscription exists the attempt is rate-limited to
+    /// the poll interval: the resolution reads `~/.mika/.env`, and a shell with
+    /// no token must not re-read it thirty times a second. Once it is up, the
+    /// drain itself is a `try_recv` and runs at every tick — the latency is the
+    /// wire's, not the poll's.
+    ///
+    /// A missing token is not an error here. The TUI talks to a daemon it does
+    /// not own, and `chat::run`'s startup probe already says so in the
+    /// conversation; the retained poll (D5) covers the gap.
+    async fn drain_task_event_frames(&mut self) {
+        if self.spirit_base_url.is_none() {
+            if !self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) {
+                return;
+            }
+            let Ok(token) = crate::commands::dashboard::auth_token() else {
+                return;
+            };
+            self.spirit_base_url = Some(crate::commands::dashboard::spirit_url());
+            self.spirit_token = Some(token);
+        }
+        let (Some(base_url), Some(token)) =
+            (self.spirit_base_url.clone(), self.spirit_token.clone())
+        else {
+            return;
+        };
+        self.drain_task_event_frames_from(&base_url, &token).await;
+    }
+
+    /// The body of [`App::drain_task_event_frames`], base URL and token already
+    /// resolved.
+    ///
+    /// Split for one reason: the tests point at a throwaway `axum::Router`, and
+    /// the alternative would be mutating `MIKA_SPIRIT_URL` and
+    /// `MIKA_INTERNAL_TOKEN` — process-global state that parallel `cargo` tests
+    /// fight over. Same reason, same shape as
+    /// `commands/chat_turn.rs::send_turn_to_endpoint`.
+    async fn drain_task_event_frames_from(&mut self, base_url: &str, token: &str) {
+        if self.task_event_rx.is_none() {
+            self.task_event_rx = Some(spawn_task_event_subscription(
+                self.db.agent_id().to_string(),
+                base_url.to_string(),
+                token.to_string(),
+            ));
+        }
+
+        loop {
+            // Taken in a statement of its own so the mutable borrow of `self`
+            // ends before the injection path below needs it.
+            let frame = match self.task_event_rx.as_mut() {
+                Some(rx) => rx.try_recv().ok(),
+                None => None,
+            };
+            let Some(frame) = frame else { return };
+
+            // Created, claimed, delivered, cancelled, an overflow marker or an
+            // event this binary does not know: no callback to inject.
+            let Some((task_id, original_status)) = terminal_callback_frame(&frame) else {
+                continue;
+            };
+
+            // Stage two of the two-stage filter (D1). The agent was matched on
+            // the wire; the session cannot be, because the frames carry
+            // neither it nor the four other fields
+            // `AgentRequest::CallbackResult` consumes.
+            let Some(detail) = self
+                .fetch_callback_task_detail(base_url, token, task_id)
+                .await
+            else {
+                continue;
+            };
+            if detail.created_by_session.as_deref() != Some(self.session_id.as_str()) {
+                continue;
+            }
+
+            let is_failed = original_status == "failed";
+
+            // Atomically claim this task — prevents double-processing by
+            // multiple TUI instances. It is the single point of uniqueness
+            // (D4), shared with the poll below: whichever path sees the
+            // callback first, the other gets `Ok(false)`.
+            match self.db.mark_task_delivered(task_id).await {
+                Ok(true) => {}
+                Ok(false) => continue, // already claimed by another instance
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, "failed to mark task delivered: {e}");
+                    continue;
+                }
+            }
+
+            let result = match detail.result {
+                Some(r) if !r.is_empty() => r,
+                _ if is_failed => mika_agent::agent::FAILED_TASK_FALLBACK.to_string(),
+                _ => continue, // skip completed tasks with no result
+            };
+
+            // Show a system message that a callback arrived
+            let status_label = if is_failed { "failed" } else { "completed" };
+            self.messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: format!("[{}] {}", detail.label, status_label),
+                rendered: None,
+                channel: None,
+            });
+
+            // Send to agent worker for processing
+            let _ = self.agent_tx.send(AgentRequest::CallbackResult {
+                task_id: task_id.to_string(),
+                label: detail.label,
+                result,
+                trace_id: detail.created_trace_id,
+                original_status: original_status.to_string(),
+                parent_task_id: detail.parent_task_id,
+            });
+
+            self.status = AgentStatus::Thinking;
+            self.needs_redraw = true;
+            // Only inject one callback per tick to keep the agent responsive
+            break;
+        }
+    }
+
+    /// `GET /api/v1/tasks/{task_id}` — the detail a terminal frame does not
+    /// carry (mika#1727 V2b, D1).
+    ///
+    /// Every failure is a `None` with its cause named: the stream is a receipt,
+    /// and one unanswered detail must neither inject a half-built callback nor
+    /// end the drain. The row stays unclaimed, so the retained poll (D5) picks
+    /// it up.
+    async fn fetch_callback_task_detail(
+        &self,
+        base_url: &str,
+        token: &str,
+        task_id: &str,
+    ) -> Option<CallbackTaskDetail> {
+        let url = format!("{}/api/v1/tasks/{task_id}", base_url.trim_end_matches('/'));
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("authorization", format!("Bearer {token}"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => match r.json::<CallbackTaskDetail>().await {
+                Ok(detail) => Some(detail),
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, "callback detail unreadable: {e}");
+                    None
+                }
+            },
+            Ok(r) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    status = %r.status(),
+                    "callback detail refused",
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, "callback detail failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Poll for completed-but-undelivered callback tasks and inject them into the conversation.
+    ///
+    /// Subordinate safety net since mika#1727 V2b (D5): the SSE drain above is
+    /// the primary path, and this one covers the window while the subscription
+    /// reconnects. It leaves with criterion 1, at the next flight.
     async fn poll_callback_tasks(&mut self) {
         // Look back 7 days for undelivered callbacks
         let since = mika_agent::timestamp::now_minus(chrono::Duration::days(7));
