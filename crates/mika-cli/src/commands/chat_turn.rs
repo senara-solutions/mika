@@ -597,4 +597,119 @@ mod tests {
             );
         }
     }
+
+    /// Allowlist du scan structurel du vol V2a — **livrée vide**, et c'est la
+    /// propriété (doctrine mika#2201, #2323, #2425, #2457, #2759).
+    ///
+    /// Elle est au niveau du module pour que la garde de vacuité
+    /// [`mika1727_v2a_lallowlist_est_livree_vide`] observe la constante que le
+    /// scan lit réellement, et non une copie qui pourrait diverger d'elle.
+    const V2A_ALLOWED: &[&str] = &[];
+
+    /// **Critère 1 du vol V2a** — `mika-cli` ne construit plus de moteur de
+    /// tâches.
+    ///
+    /// Le scan porte sur le **geste de construction**, jamais sur le chemin de
+    /// module : `commands/tasks.rs` importe légitimement neuf utilitaires de
+    /// `mika_agent::task_engine` pour lire et écrire des tâches par la base, et
+    /// un scan sur `task_engine::` rougirait sur ce lecteur-là en laissant
+    /// passer un `TaskDispatcher` construit sous un alias.
+    ///
+    /// `prune_old_tasks(` n'est délibérément **pas** une aiguille : c'est une
+    /// purge que n'importe quel client pourrait légitimement déclencher, pas la
+    /// preuve d'un moteur local. Les quatre aiguilles retenues ne se
+    /// prononcent que sur « ce processus possède un moteur ».
+    ///
+    /// Le remède quand ce test rougit est de router le besoin par mika-spirit,
+    /// **jamais** d'élargir [`V2A_ALLOWED`].
+    #[test]
+    fn mika1727_v2a_la_tui_ne_construit_plus_de_moteur_de_taches() {
+        const NEEDLES: &[&str] = &[
+            "TaskEngine::new(",
+            "TaskDispatcher {",
+            "spawn_tick_loop(",
+            "startup_recovery(",
+        ];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut violations: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if V2A_ALLOWED.contains(&rel.as_str()) {
+                return;
+            }
+            for (idx, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if NEEDLES.iter().any(|needle| line.contains(needle)) {
+                    violations.push(format!("{rel}:{} — {}", idx + 1, line.trim()));
+                }
+            }
+        });
+
+        assert!(
+            violations.is_empty(),
+            "mika#1727 V2a — `mika-cli` construit de nouveau un moteur de tâches \
+             dans son processus. Le daemon est le seul enregistreur des \
+             récurrentes d'un agent (course de mika#2351) ; le remède est de \
+             passer par un endpoint de mika-spirit, jamais d'élargir \
+             V2A_ALLOWED :\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// Anti-vacuité (mika#2103, mika#2205) du scan ci-dessus.
+    ///
+    /// Un balayage qui ne voit rien refuse tout aussi silencieusement qu'un
+    /// balayage conforme : il passe la revue, passe la CI par construction, et
+    /// laisse la régression atterrir. Les deux fichiers nommés ici sont les
+    /// deux moitiés de la propriété — celui d'où le moteur est parti, et le
+    /// lecteur légitime de `task_engine::` que le scan doit laisser passer sans
+    /// exception.
+    #[test]
+    fn mika1727_v2a_le_scan_du_moteur_nest_pas_vide() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let files = scanner.files();
+
+        assert!(
+            files.len() > 10,
+            "le balayage de `mika-cli` doit voir tout son arbre ; vu {} fichier(s)",
+            files.len()
+        );
+        // `commands/` est porté exprès : `Path::ends_with` compare par
+        // composants, donc le suffixe nu `tasks.rs` serait satisfait par
+        // n'importe quel `tasks.rs` de l'arbre.
+        for expected in ["commands/chat.rs", "commands/tasks.rs"] {
+            assert!(
+                files.iter().any(|p| p.ends_with(expected)),
+                "le balayage doit voir {expected} ; sinon la garde du vol V2a \
+                 n'inspecte pas ce qu'elle prétend"
+            );
+        }
+    }
+
+    /// L'allowlist du vol V2a est vide, et le reste.
+    ///
+    /// Sans cette garde, la première régression se réparerait d'une ligne dans
+    /// [`V2A_ALLOWED`] et le scan deviendrait ce que mika#2323 refuse : un
+    /// recensement de ses propres exceptions. Une entrée ici n'est pas un
+    /// réglage, c'est le vol V2a annulé.
+    #[test]
+    fn mika1727_v2a_lallowlist_est_livree_vide() {
+        assert!(
+            V2A_ALLOWED.is_empty(),
+            "mika#1727 V2a — V2A_ALLOWED est livrée vide et doit le rester : un \
+             site qui construit un moteur de tâches dans `mika-cli` se supprime, \
+             il ne s'exempte pas. Trouvé : {V2A_ALLOWED:?}"
+        );
+    }
 }
