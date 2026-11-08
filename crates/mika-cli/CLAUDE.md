@@ -384,9 +384,10 @@ appelant par l'envoi existant, jamais d'élargir l'allowlist.
 **L'unique appel local restant est le bras `CallbackResult`, et il est borné.**
 La porte A2A écrit `is_callback_turn: false` en dur (`server/a2a.rs:343`), donc
 le fil ne sait pas exprimer un tour de callback ; le réparer demande une clé
-dans `crates/mika-a2a/` et sa lecture dans `crates/mika-agent/`. Il part au vol
-V2 avec le `TaskEngine` et le poll des callbacks, et l'entrée d'allowlist avec
-lui. Le périmètre des quatre vols est dans le corps de mika#1727.
+dans `crates/mika-a2a/` et sa lecture dans `crates/mika-agent/`. Il part avec le
+poll des callbacks au vol V2b, et l'entrée d'allowlist avec lui ; le
+`TaskEngine`, lui, est déjà parti (vol V2a, voir plus bas). Le périmètre des
+quatre vols est dans le corps de mika#1727.
 
 **Trois entrées de la TUI n'atteignent plus le tour, et se disent à voix haute.**
 `chat_turn::inertia_notice` rend un avis **à chaque tour qui les exerce** — pas
@@ -419,6 +420,41 @@ la sonde rend la même absence pour un daemon injoignable et pour un shell sans
 `MIKA_INTERNAL_TOKEN` ; en désigner une seule serait une fausse provenance
 (motif mika#2331). Le chemin `--team` garde `is_dashboard_running()` — son tour
 ne passe pas par ce bras, et il part au vol V4.
+
+### La TUI ne possède plus de moteur de tâches (mika#1727, vol V2a sur 4)
+
+`commands/chat.rs` construisait un `TaskDispatcher`, un `TaskEngine`, les deux
+paires de récurrentes intégrées (`heartbeat` et `reflection`),
+`startup_recovery`, la purge des tâches anciennes et une boucle de tick. Tout
+cela est parti : **le daemon (`mika-agent/src/server/mod.rs`) est désormais le
+seul enregistreur des récurrentes d'un agent.** Le refus est structurel —
+`mika1727_v2a_la_tui_ne_construit_plus_de_moteur_de_taches` (module `tests` de
+`commands/chat_turn.rs`) balaie la moitié production du crate et refuse
+`TaskEngine::new(`, `TaskDispatcher {`, `spawn_tick_loop(` et
+`startup_recovery(` **partout**, allowlist livrée vide et pinnée vide. Le scan
+porte sur le geste de construction et jamais sur `task_engine::` :
+`commands/tasks.rs` importe légitimement neuf utilitaires de ce module pour lire
+et écrire des tâches par la base. Quand il rougit, le remède est un endpoint de
+mika-spirit, jamais une entrée d'allowlist.
+
+**Effet de lecture, à retenir avant de diagnostiquer `auto_pull`.** Jusqu'à ce
+vol, le moteur de la TUI disputait aux daemons les récurrentes de son agent
+(mika#2351) ; le 2026-11-08 c'était lui qui exécutait `auto_pull` pour mika-dev.
+La course est éteinte par construction, donc **l'absence de lignes `auto_pull_*`
+dans le journal CLI par agent (`~/.mika/agents/<nom>/logs/mika.log.YYYY-MM-DD`)
+est le régime nominal après ce merge, et non une absence d'`auto_pull`** (classe
+mika#2340). Ces lignes se lisent côté daemon, dans
+`$MIKA_SPIRIT_LOG_FILE` (`mika logs paths --agent <a>`), et la récurrente
+elle-même dans `mika tasks list`.
+
+**Les deux entrées de recensement de `canonical_tokens.rs` ont bougé avec le
+code.** `HEARTBEAT_GATE_REGISTRATION_SITES` (mika#2847) et
+`REFLECTION_GATE_REGISTRATION_SITES` (mika#2850) perdent
+`crates/mika-cli/src/commands/chat.rs` — nécessairement dans le même commit,
+leurs boucles `seen == len` visant sinon un nom mort. L'entrée n'est **pas**
+passée dans `*_READER_ALLOWED` : le retrait **durcit** les deux scans, puisque
+toute réapparition d'une lecture de porte sous `crates/mika-cli/` est désormais
+un `strangers`.
 
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)

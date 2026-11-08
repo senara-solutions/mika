@@ -29,21 +29,19 @@ use mika_agent::agent;
 use mika_agent::prompt;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::assembly::assemble_agent_registry;
-use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
 use mika_agent::teams::types::TeamEvent;
 use mika_agent::tools;
 use mika_common::config::Settings;
 use mika_common::team;
 use std::path::Path;
 
-/// Holds the agent worker supervisor handle, poller handle, the AppContext (for DB shutdown),
+/// Holds the agent worker supervisor handle, the AppContext (for DB shutdown),
 /// and the shutdown-initiated flag the supervisor reads to distinguish operator-driven
 /// shutdown from worker death (mika#1149).
 struct AgentWorker {
     /// Supervisor task — owns the worker's JoinHandle and forwards unexpected exits
     /// as `AgentResponse::WorkerCrashed` events.
     supervisor_handle: JoinHandle<()>,
-    poller_handle: JoinHandle<()>,
     /// Set to `true` before tearing down the worker (Quit, agent switch, /restart)
     /// so the supervisor exits silently on the resulting `Ok(())` from the worker loop.
     shutdown_initiated: Arc<AtomicBool>,
@@ -174,94 +172,15 @@ async fn spawn_agent_worker(
     // the posed hosting fact is read, once.
     let cli_deployment = mika_common::home::Deployment::from_env();
 
-    // Set up task engine for background tasks (reminders, reflection)
-    let dispatcher = Arc::new(TaskDispatcher {
-        db: ctx.async_db.clone(),
-        tier: cli_tier,
-        deployment: cli_deployment,
-        llm: ctx.llm.clone(),
-        tools: tool_registry.clone(),
-        skills: skill_registry.clone(),
-        home_dir: ctx.home_dir.clone(),
-        // mika#2329 — le home global porte le fichier sentinelle du STOP à chaud.
-        // `auto_pull` ne tourne pas en mode CLI, mais le champ décrit le
-        // dispatcher, pas le scan : le renseigner faussement ici ferait mentir
-        // n'importe quel futur lecteur.
-        global_home_dir: ctx.global_home.clone(),
-        message_sender: message_sender.clone(),
-        embedding_client: embedding_client.clone(),
-        brave_api_key: brave_api_key.clone(),
-        github_token: github_token.clone(),
-        gateway_url: ctx.settings.routing_url.clone(),
-        internal_token: ctx
-            .settings
-            .internal_token
-            .as_ref()
-            .map(|s| s.expose_secret().to_string()),
-        github_app: ctx.github_app.clone(),
-        skills_dirty: skills_dirty.clone(),
-        // CLI mode: no agent_lock passed. The task engine may run heartbeat/reflection
-        // concurrently with user message processing (both use the same AsyncDatabase,
-        // which serializes at the DB thread level). Concurrent Claude API calls are
-        // accepted in CLI mode; rate-limit errors are handled by the Claude client.
-        agent_lock: None,
-        // CLI mode: the TUI's poll_callback_tasks() handles callback delivery with
-        // session-scoped queries and atomic claiming. Skip engine dispatch to prevent
-        // the engine from stealing callbacks. See #264.
-        cli_mode: true,
-        settings: ctx.settings.clone(),
-        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-        auto_pull_stop_armed: AtomicBool::new(false),
-        worktree_reap_stop_armed: AtomicBool::new(false),
-        proactive_budget_reported: std::sync::Mutex::new(None),
-    });
-    let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
-        ctx.async_db.clone(),
-        dispatcher,
-    )));
-
-    // Register recurring built-in tasks and run startup recovery
-    if task_engine::heartbeat_enabled_for_agent(&ctx.home_dir).await {
-        task_engine::ensure_recurring_task(
-            &ctx.async_db,
-            &ctx.home_dir,
-            "heartbeat",
-            "0 0 * * * *",
-            r#"{"trigger":"heartbeat"}"#,
-        )
-        .await;
-    } else if let Err(e) = ctx
-        .async_db
-        .cancel_recurring_task_by_label("heartbeat")
-        .await
-    {
-        tracing::warn!(error = %e, "failed to cancel stale heartbeat task");
-    }
-    if let Some(cron) = task_engine::reflection_cron_for_agent(&ctx.home_dir, &ctx.async_db).await {
-        task_engine::ensure_recurring_task(
-            &ctx.async_db,
-            &ctx.home_dir,
-            "reflection",
-            &cron,
-            r#"{"trigger":"reflection"}"#,
-        )
-        .await;
-    } else if let Err(e) = ctx
-        .async_db
-        .cancel_recurring_task_by_label("reflection")
-        .await
-    {
-        tracing::warn!(error = %e, "failed to cancel stale reflection task");
-    }
-    {
-        let mut eng = task_engine.lock().await;
-        if let Err(e) = eng.startup_recovery().await {
-            tracing::warn!(error = %e, "task engine startup recovery failed");
-        }
-    }
-    // Prune completed tasks older than 30 days to prevent unbounded DB growth
-    task_engine::prune_old_tasks(&ctx.async_db).await;
-    let poller_handle = TaskEngine::spawn_tick_loop(task_engine);
+    // mika#1727 vol V2a — la TUI ne construit plus de moteur de tâches. Le
+    // `TaskDispatcher`, le `TaskEngine`, la boucle de tick, `startup_recovery`,
+    // la purge des tâches anciennes et l'enregistrement des récurrentes
+    // `heartbeat` / `reflection` vivaient ici ; ils étaient un second
+    // exemplaire, divergent par construction, de ce que le daemon possède
+    // déjà. Le daemon (`mika-agent/src/server/mod.rs`) est désormais le seul
+    // enregistreur des récurrentes de l'agent, ce qui éteint la course de
+    // mika#2351. Le détecteur qui refuse le retour du geste vit dans le module
+    // `tests` de `commands/chat_turn.rs`.
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
@@ -582,7 +501,6 @@ async fn spawn_agent_worker(
 
     let worker = AgentWorker {
         supervisor_handle,
-        poller_handle,
         shutdown_initiated,
         _ctx: ctx,
     };
@@ -825,7 +743,6 @@ pub async fn run(
             // window expires.
             let _ = app.agent_tx.send(AgentRequest::Quit);
 
-            worker.poller_handle.abort();
             let old_supervisor = std::mem::replace(
                 &mut worker.supervisor_handle,
                 tokio::spawn(async {}), // placeholder
@@ -932,7 +849,6 @@ pub async fn run(
             }
 
             worker.shutdown_initiated.store(true, Ordering::Release);
-            worker.poller_handle.abort();
             let old_supervisor = std::mem::replace(
                 &mut worker.supervisor_handle,
                 tokio::spawn(async {}), // placeholder
@@ -1030,9 +946,6 @@ pub async fn run(
     {
         tracing::warn!(error = %e, "failed to end session");
     }
-
-    // Stop the reminder poller
-    worker.poller_handle.abort();
 
     // Wait for the supervisor (which owns the worker JoinHandle). It exits
     // silently because shutdown_initiated was set in the Quit branch above
