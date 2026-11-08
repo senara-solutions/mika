@@ -489,4 +489,112 @@ mod tests {
             "{deux}"
         );
     }
+
+    /// **AC1** — aucun tour utilisateur de la TUI ne fait tourner la boucle ici.
+    ///
+    /// Le bras `CallbackResult` de `chat.rs` est le dernier appel local du
+    /// crate. Il part au vol V2 avec le `TaskEngine` et le poll des callbacks :
+    /// la porte A2A écrit `is_callback_turn: false` en dur
+    /// (`server/a2a.rs:343`), et le réparer demanderait une clé de fil dans
+    /// `crates/mika-a2a/` et sa lecture dans `crates/mika-agent/` — deux crates
+    /// hors du périmètre de ce vol.
+    /// Tracked in: senara-solutions/mika#1727
+    #[test]
+    fn mika1727_v1_le_tour_de_la_tui_ne_fait_plus_tourner_la_boucle() {
+        const ALLOWED: &[&str] = &["commands/chat.rs"];
+        const NEEDLES: &[&str] = &["agent::run_agent(", "AgentParams"];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut violations: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if ALLOWED.contains(&rel.as_str()) {
+                return;
+            }
+            for (idx, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if NEEDLES.iter().any(|needle| line.contains(needle)) {
+                    violations.push(format!("{rel}:{} — {}", idx + 1, line.trim()));
+                }
+            }
+        });
+
+        assert!(
+            violations.is_empty(),
+            "mika#1727 V1 — la boucle d'agent tourne de nouveau dans le processus \
+             de la TUI. Le remède est de router le tour par \
+             `chat_turn::send_turn_to_spirit`, jamais d'élargir ALLOWED :\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// **AC1, seconde moitié** — le site toléré n'a qu'un seul appel local.
+    ///
+    /// L'allowlist seule serait un faux vert : les deux bras vivent dans le
+    /// *même fichier*, donc une exception au niveau du fichier ne verrait pas le
+    /// tour utilisateur régresser à côté du bras toléré. Deux
+    /// `agent::run_agent(` dans `commands/chat.rs` = le tour utilisateur est
+    /// revenu en processus. Le remède est de le router par
+    /// `chat_turn::send_turn_to_spirit`, JAMAIS d'incrémenter ce compte.
+    #[test]
+    fn mika1727_v1_le_site_tolere_na_quun_seul_appel_local() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let site = scanner.src_root().join("commands").join("chat.rs");
+        let production = scanner.production_of(&site);
+
+        let locals: Vec<&str> = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("agent::run_agent("))
+            .collect();
+
+        assert_eq!(
+            locals.len(),
+            1,
+            "mika#1727 V1 — `commands/chat.rs` ne tolère qu'un appel local, celui \
+             du bras `CallbackResult` (§ D2). Trouvé {} :\n{}",
+            locals.len(),
+            locals.join("\n")
+        );
+    }
+
+    /// Anti-vacuité (mika#2103) — le balayage a réellement vu les deux fichiers
+    /// du vol.
+    ///
+    /// Un scanner qui ne voit rien passe les deux gardes ci-dessus sans
+    /// refuser quoi que ce soit : c'est la forme de garde qui passe la revue,
+    /// passe la CI par construction, et laisse la régression atterrir.
+    #[test]
+    fn mika1727_v1_le_scan_nest_pas_vide() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let files = scanner.files();
+
+        assert!(
+            files.len() > 10,
+            "le balayage de `mika-cli` doit voir tout son arbre ; vu {} fichier(s)",
+            files.len()
+        );
+        // `commands/` est porté exprès : `Path::ends_with` compare par
+        // composants, donc le suffixe nu `chat.rs` serait satisfait par
+        // n'importe quel `chat.rs` de l'arbre — la forme de vérification qui
+        // passe pendant qu'une moitié de la propriété est fausse.
+        for expected in ["commands/chat.rs", "commands/chat_turn.rs"] {
+            assert!(
+                files.iter().any(|p| p.ends_with(expected)),
+                "le balayage doit voir {expected} ; sinon les gardes de ce vol \
+                 n'inspectent pas ce qu'elles prétendent"
+            );
+        }
+    }
 }
