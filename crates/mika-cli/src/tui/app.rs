@@ -331,6 +331,13 @@ pub enum AgentResponse {
         /// If skills were hot-reloaded during this turn, contains the new registry.
         updated_skills: Option<Arc<SkillRegistry>>,
     },
+    /// Un avis du worker à destination de l'opérateur, rendu en `System` et
+    /// sans rapport avec la réussite du tour (mika#1727 V1 § D3 : les entrées de
+    /// la TUI qui n'atteignent plus le tour se disent à voix haute).
+    ///
+    /// Distinct de `Reply { is_error: true }` : un avis n'est pas un échec, et
+    /// il peut précéder une réponse réussie dans le même tour.
+    Notice { content: String },
     /// The agent worker task exited unexpectedly. `/restart` recovers.
     WorkerCrashed { reason: String },
 }
@@ -1346,6 +1353,19 @@ impl<'a> App<'a> {
                         self.status = AgentStatus::Responding(0);
                     }
                 }
+                self.needs_redraw = true;
+            }
+            Ok(AgentResponse::Notice { content }) => {
+                // mika#1727 V1 § D3 — un avis se rend, et ne touche NI le statut
+                // NI `pending_response` : le tour qu'il annote est encore en
+                // vol, et remettre le spinner à `Idle` ici ferait croire que la
+                // réponse est arrivée.
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content,
+                    rendered: None,
+                    channel: None,
+                });
                 self.needs_redraw = true;
             }
             Ok(AgentResponse::WorkerCrashed { reason }) => {

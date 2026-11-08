@@ -129,6 +129,24 @@ fn wrap_turn_error(err: &anyhow::Error, endpoint: &str) -> anyhow::Error {
     }
 }
 
+/// Ce qu'une image collée laisse derrière elle quand le tour part sans elle.
+///
+/// Le tour ne portant que du texte, les deux champs que la TUI capture pour
+/// l'envoi — le type MIME et la charge base64 — n'ont plus de consommateur sur
+/// le chemin d'envoi. Ils en gardent un ici, et c'est délibéré : le seul endroit
+/// où ils ont encore un sens est l'avis qui dit à l'opérateur ce qui est tombé.
+/// Les jeter de `tui::attachment::ImageAttachment` à la place demanderait de
+/// réécrire l'encodage du collage le jour où une part fichier voyage.
+pub(crate) struct DroppedImage {
+    /// Le type MIME tel que le collage l'a reconnu.
+    pub media_type: String,
+    /// La taille de la charge base64 que le tour a transportée pour rien.
+    ///
+    /// Distincte de `ImageAttachment::size_bytes`, qui est la taille décodée :
+    /// c'est bien l'encodage qui a voyagé, environ un tiers plus gros.
+    pub payload_bytes: usize,
+}
+
 /// L'avis à afficher pour les entrées de la TUI qui n'atteignent plus le tour.
 ///
 /// Trois inerties, un seul avis, **à chaque tour qui les exerce** — pas une
@@ -143,13 +161,13 @@ fn wrap_turn_error(err: &anyhow::Error, endpoint: &str) -> anyhow::Error {
 ///   cause — le `Task` A2A ne porte pas de part de pensée — donc les deux sont
 ///   dits dans le même avis.
 /// - image collée → `remote_ask::build_send_params` ne bâtit que des parts
-///   texte. Les images sont abandonnées, et leur nombre est dit.
+///   texte. Les images sont abandonnées, et l'avis dit **ce qui** est tombé.
 ///
 /// `None` quand le tour n'exerce aucune des deux entrées : un avis qui
 /// s'afficherait sans cause est un avis qu'on apprend à ignorer.
 pub(crate) fn inertia_notice(
     thinking_budget: Option<u32>,
-    dropped_images: usize,
+    dropped_images: &[DroppedImage],
 ) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     if thinking_budget.is_some() {
@@ -159,10 +177,22 @@ pub(crate) fn inertia_notice(
                 .to_string(),
         );
     }
-    if dropped_images > 0 {
+    if !dropped_images.is_empty() {
+        let mut kinds: Vec<&str> = Vec::new();
+        for image in dropped_images {
+            let kind = image.media_type.as_str();
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        let payload: usize = dropped_images.iter().map(|image| image.payload_bytes).sum();
         lines.push(format!(
-            "{dropped_images} image(s) abandonnée(s) : un tour vers mika-spirit ne porte que du \
-             texte — envoyer le message sans pièce jointe éteint l'avis"
+            "{} image(s) abandonnée(s) ({} ; {} de base64 porté jusqu'au worker puis jeté) : \
+             un tour vers mika-spirit ne porte que du texte — envoyer le message sans pièce \
+             jointe éteint l'avis",
+            dropped_images.len(),
+            kinds.join(", "),
+            crate::tui::attachment::ImageAttachment::format_size(payload),
         ));
     }
     if lines.is_empty() {
@@ -398,16 +428,24 @@ mod tests {
         assert_eq!(reply.input_tokens, Some(41_000));
     }
 
+    /// Une image abandonnée, pour les assertions de l'avis d'inertie.
+    fn dropped(media_type: &str, payload_bytes: usize) -> DroppedImage {
+        DroppedImage {
+            media_type: media_type.to_string(),
+            payload_bytes,
+        }
+    }
+
     /// Les trois inerties de D3 sont dites, et chacune nomme son extinction.
     #[test]
     fn mika1727_v1_les_inerties_nomment_le_geste_qui_les_eteint() {
         assert_eq!(
-            inertia_notice(None, 0),
+            inertia_notice(None, &[]),
             None,
             "un tour qui n'exerce aucune inertie ne doit rien afficher"
         );
 
-        let pensee = inertia_notice(Some(10_000), 0).expect("un budget de pensée doit être dit");
+        let pensee = inertia_notice(Some(10_000), &[]).expect("un budget de pensée doit être dit");
         assert!(
             pensee.contains("/think off"),
             "l'avis doit nommer le geste qui l'éteint ; obtenu : {pensee}"
@@ -417,13 +455,38 @@ mod tests {
             "la disparition du bloc de pensée est dite dans le même avis ; obtenu : {pensee}"
         );
 
-        let images = inertia_notice(None, 2).expect("des images abandonnées doivent être dites");
+        let images = inertia_notice(
+            None,
+            &[
+                dropped("image/png", 300 * 1024),
+                dropped("image/png", 200 * 1024),
+            ],
+        )
+        .expect("des images abandonnées doivent être dites");
         assert!(
             images.contains('2'),
             "le nombre d'images abandonnées doit être dit ; obtenu : {images}"
         );
+        assert!(
+            images.contains("image/png"),
+            "le type de ce qui est tombé doit être dit ; obtenu : {images}"
+        );
+        assert_eq!(
+            images.matches("image/png").count(),
+            1,
+            "deux images du même type se disent une fois : répéter le type ferait \
+             d'un avis de dix images collées un pavé illisible ; obtenu : {images}"
+        );
+        assert!(
+            images.contains("500KB"),
+            "la charge transportée pour rien est la somme des deux ; obtenu : {images}"
+        );
 
-        let deux = inertia_notice(Some(10_000), 1).expect("les deux causes doivent être dites");
-        assert!(deux.contains("/think off") && deux.contains('1'), "{deux}");
+        let deux = inertia_notice(Some(10_000), &[dropped("image/jpeg", 1024)])
+            .expect("les deux causes doivent être dites");
+        assert!(
+            deux.contains("/think off") && deux.contains('1') && deux.contains("image/jpeg"),
+            "{deux}"
+        );
     }
 }
