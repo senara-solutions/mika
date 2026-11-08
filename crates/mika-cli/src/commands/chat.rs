@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::commands::chat_turn;
 use crate::commands::team_outcome::TeamOutcome;
 use crate::init::{self, AppContext};
 use crate::tui::app::{
@@ -24,16 +25,14 @@ use crate::tui::app::{
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
-use mika_agent::agent::{self, AgentParams, check_onboarding};
+use mika_agent::agent;
 use mika_agent::prompt;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::assembly::assemble_agent_registry;
 use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
 use mika_agent::teams::types::TeamEvent;
 use mika_agent::tools;
-use mika_common::claude::ThinkingConfig;
 use mika_common::config::Settings;
-use mika_common::llm::LlmImage;
 use mika_common::team;
 use std::path::Path;
 
@@ -54,7 +53,7 @@ struct AgentWorker {
 /// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
 async fn spawn_agent_worker(
     ctx: AppContext,
-    _agent_name: &str,
+    agent_name: &str,
     http_client: &reqwest::Client,
     session_id: Option<&str>,
 ) -> Result<(
@@ -291,6 +290,9 @@ async fn spawn_agent_worker(
     let worker_dirty = skills_dirty.clone();
     let mut worker_mcp = mcp_manager;
     let worker_global_home = ctx.global_home.clone();
+    // mika#1727 V1 — l'agent visé par l'endpoint A2A du tour. C'est le nom tel
+    // que l'opérateur l'a lancé, le même que `commands::ask` met dans son URL.
+    let worker_agent_name = agent_name.to_string();
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -319,66 +321,34 @@ async fn spawn_agent_worker(
                         skills_reloaded = true;
                     }
 
-                    let thinking = thinking_budget.map(|budget| ThinkingConfig::Enabled {
-                        budget_tokens: budget,
-                    });
-
-                    // Convert ImageAttachments to provider-agnostic LlmImage
-                    let image_sources: Vec<LlmImage> = images
-                        .into_iter()
-                        .map(|img| LlmImage {
-                            media_type: img.media_type,
-                            data: img.base64_data,
+                    // mika#1727 V1 § D3 — les entrées qui cessent d'atteindre le
+                    // tour se disent à voix haute, une fois par tour, chacune
+                    // nommant le geste qui l'éteint (mika#1883). L'avis est émis
+                    // ici, dans le worker, parce que c'est l'unique point où
+                    // atterrissent les DEUX expéditeurs d'`AgentRequest::Message`
+                    // (la saisie de `tui/app.rs` et le coup unique de `/think`
+                    // dans `tui/commands/handlers.rs`).
+                    let dropped: Vec<chat_turn::DroppedImage> = images
+                        .iter()
+                        .map(|img| chat_turn::DroppedImage {
+                            media_type: img.media_type.clone(),
+                            payload_bytes: img.base64_data.len(),
                         })
                         .collect();
+                    if let Some(notice) = chat_turn::inertia_notice(thinking_budget, &dropped)
+                        && agent_tx
+                            .send(AgentResponse::Notice { content: notice })
+                            .is_err()
+                    {
+                        break;
+                    }
 
-                    let is_onboarding = check_onboarding(&worker_db).await;
-                    let result = agent::run_agent(&AgentParams {
-                        db: &worker_db,
-                        tier: cli_tier,
-                        deployment: cli_deployment,
-                        llm: worker_llm.as_ref(),
-                        tools: &worker_tools,
-                        skills: &worker_skills,
-                        user_message: &text,
-                        channel_type: "cli",
-                        session_id: &worker_session,
-                        home_dir: &worker_home,
-                        is_onboarding,
-                        message_sender: worker_sender.clone(),
-                        skip_compaction: false,
-                        embedding_client: worker_embedding.as_ref(),
-                        thinking,
-                        user_images: &image_sources,
-                        brave_api_key: worker_brave_key.as_deref(),
-                        github_token: worker_github_token.as_deref(),
-                        gateway_url: worker_gateway_url.as_deref(),
-                        internal_token: worker_internal_token.as_deref(),
-                        github_app: worker_github_app.as_deref(),
-                        skills_dirty: &worker_dirty,
-                        skill_nudge: None, // mika#1583: nudges apply in server mode only
-                        mcp_manager: worker_mcp.as_ref(),
-                        global_home_dir: Some(&worker_global_home),
-                        is_callback_turn: false,
-                        settings: Some(&worker_settings),
-                        // mika#2304: `mika chat --model` is applied in-process by
-                        // `AppContext::override_model`, so `worker_llm` already
-                        // *is* the caller's model. There is no server-side
-                        // override for a skill's `[llm]` section to displace, and
-                        // the #463 precedence is unchanged on this path.
-                        caller_model_override: false,
-                        session_isolated: false,
-                        trace_id: None,
-                        correlated_task_id: None,
-                        internal: false,
-                        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-                        // mika#3004: a CLI chat turn is not born of a webhook, so
-                        // there is no pre-handler event text distinct from the turn
-                        // message; `ProprietesDuTour::depuis` falls back to it.
-                        webhook_event_text: None,
-                        stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
-                    })
-                    .await;
+                    // mika#1727 V1 § D1 — le tour part vers mika-spirit, qui
+                    // possède la boucle, la session et les outils. Plus rien de ce
+                    // bras ne fait tourner `agent::run_agent`.
+                    let result =
+                        chat_turn::send_turn_to_spirit(&text, &worker_agent_name, &worker_session)
+                            .await;
 
                     // If the dirty flag is set after this turn, rebuild now so we
                     // can send the updated registry to the TUI for autocomplete.
@@ -405,11 +375,14 @@ async fn spawn_agent_worker(
                     };
 
                     let response = match result {
-                        Ok(output) => AgentResponse::Reply {
-                            content: output.text.unwrap_or_default(),
+                        Ok(reply) => AgentResponse::Reply {
+                            content: reply.content,
                             is_error: false,
-                            thinking: output.thinking,
-                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens as u32),
+                            // § D3 — un tour A2A synchrone ne rend aucun bloc de
+                            // pensée : la part `thinking` ne voyage pas sur le
+                            // fil. L'avis d'inertie ci-dessus l'a déjà dit.
+                            thinking: None,
+                            input_tokens: reply.input_tokens,
                             updated_skills,
                         },
                         Err(e) => AgentResponse::Reply {
@@ -460,8 +433,12 @@ async fn spawn_agent_worker(
                         is_failed,
                     );
 
-                    let is_onboarding = check_onboarding(&worker_db).await;
-                    let callback_result = agent::run_agent(&AgentParams {
+                    // mika#1727 V1 — chemin par le module, et non par un import de
+                    // tête : le bras `Message` n'appelle plus rien de `agent`, et
+                    // un import nu de ces deux noms survivrait au vol V2 qui
+                    // emporte ce bras. Le corps du bras est inchangé par ailleurs.
+                    let is_onboarding = agent::check_onboarding(&worker_db).await;
+                    let callback_result = agent::run_agent(&agent::AgentParams {
                         db: &worker_db,
                         tier: cli_tier,
                         deployment: cli_deployment,
@@ -744,7 +721,34 @@ pub async fn run(
     app.last_seen_msg_id = worker._ctx.async_db.max_message_id().await.unwrap_or(0);
 
     // One-time dashboard status check at startup (no periodic polling).
-    app.dashboard_running = crate::commands::dashboard::is_dashboard_running().await;
+    //
+    // mika#1727 V1 § D4 — la même sonde répond à deux questions depuis que le
+    // tour passe par mika-spirit : le tableau de bord est-il servi, et le spirit
+    // répond-il **tout court**. `is_dashboard_running()` écrase les deux en un
+    // `bool`, donc un daemon à terre y est indistinguable d'un tableau de bord
+    // simplement désactivé. On lit l'option, et un `None` est dit AVANT le
+    // premier tour plutôt que découvert par son échec.
+    let dashboard_status = crate::commands::dashboard::query_dashboard_status().await;
+    app.dashboard_running = dashboard_status.is_some_and(|(enabled, _, _)| enabled);
+    if dashboard_status.is_none() {
+        // La cause n'est pas résolue ici : la sonde rend `None` pour un daemon
+        // injoignable comme pour un shell sans jeton, et en désigner une seule
+        // serait une fausse provenance. Les deux sont nommées, et avec elles le
+        // geste qui les lève.
+        app.messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: format!(
+                "\u{26a0} mika#1727 — mika-spirit n'a pas répondu sur {}. Depuis ce vol, \
+                 chaque tour de la TUI y est envoyé : sans lui, le prochain message \
+                 échouera en nommant l'endpoint. Démarre le daemon (`mika-spirit`), ou \
+                 vérifie `MIKA_INTERNAL_TOKEN` dans ce shell — la sonde rend la même \
+                 absence dans les deux cas.",
+                crate::commands::dashboard::spirit_url()
+            ),
+            rendered: None,
+            channel: None,
+        });
+    }
 
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();

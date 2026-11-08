@@ -363,6 +363,63 @@ site, pourquoi par attestation) est dans `crates/mika-a2a/CLAUDE.md`
 
 ## TUI Features
 
+### Un tour de la TUI exige mika-spirit (mika#1727, vol V1 sur 4)
+
+Depuis ce vol, un message tapé dans `mika` / `mika chat` **part sur le fil** :
+`chat::spawn_agent_worker`, bras `AgentRequest::Message`, envoie le tour par
+`commands/chat_turn.rs::send_turn_to_spirit` vers `{spirit_url}/a2a/{agent}`, et
+rend ce que le serveur a produit. La boucle, la session de boucle, les outils,
+les permissions et le dispatch LLM sont chez mika-spirit — qui les possédait
+déjà pour `mika ask` depuis mika#1881. **Sans daemon, la TUI n'a plus de mode
+autonome** : le démarrage le dit (voir plus bas) et le tour échoue en nommant
+l'endpoint, jamais en rendant une réponse vide (mika#2270).
+
+`chat_turn.rs` est l'**unique** site d'envoi, et c'est structurel :
+`mika1727_v1_le_tour_de_la_tui_ne_fait_plus_tourner_la_boucle` balaie la moitié
+production du crate et refuse `agent::run_agent(` comme `AgentParams` partout
+sauf dans `commands/chat.rs`, où `mika1727_v1_le_site_tolere_na_quun_seul_appel_local`
+n'en tolère **qu'un**. Quand l'une rougit, le remède est de router le nouvel
+appelant par l'envoi existant, jamais d'élargir l'allowlist.
+
+**L'unique appel local restant est le bras `CallbackResult`, et il est borné.**
+La porte A2A écrit `is_callback_turn: false` en dur (`server/a2a.rs:343`), donc
+le fil ne sait pas exprimer un tour de callback ; le réparer demande une clé
+dans `crates/mika-a2a/` et sa lecture dans `crates/mika-agent/`. Il part au vol
+V2 avec le `TaskEngine` et le poll des callbacks, et l'entrée d'allowlist avec
+lui. Le périmètre des quatre vols est dans le corps de mika#1727.
+
+**Trois entrées de la TUI n'atteignent plus le tour, et se disent à voix haute.**
+`chat_turn::inertia_notice` rend un avis **à chaque tour qui les exerce** — pas
+une fois par session — et chacun nomme le geste qui l'éteint ; c'est la forme de
+`cli_skill_flag_inert` (mika#1883), pour la même raison : un réglage qui ne fait
+plus ce qu'il annonce doit se voir chaque fois qu'on s'en sert.
+
+| entrée | ce qui se passe | cause |
+|---|---|---|
+| `/think <budget>` | le budget ne voyage pas | aucune clé de fil ; le serveur ne lit pas `thinking_level` |
+| bloc `thinking:` en réponse | il n'apparaît plus | un `Task` A2A ne porte pas de part de pensée |
+| image collée (Ctrl+V) | elle est abandonnée | `remote_ask::build_send_params` ne bâtit que des parts texte |
+
+L'avis est émis dans le **worker**, pas à la saisie : c'est l'unique point où
+atterrissent les **deux** expéditeurs d'`AgentRequest::Message` (`tui/app.rs` et
+le coup unique de `/think` dans `tui/commands/handlers.rs`). Il voyage par
+`AgentResponse::Notice`, rendu en `ChatRole::System` **sans toucher au statut** :
+un avis n'est pas un échec et ne doit pas éteindre le spinner du tour qu'il
+annote. L'avis des images nomme ce qui est tombé — types MIME dédupliqués et
+charge base64 transportée pour rien — et c'est aussi ce qui garde un
+consommateur à `ImageAttachment::media_type` et `base64_data`, que le tour texte
+seul n'envoie plus.
+
+**Le démarrage dit un spirit muet avant le premier tour.** `chat::run` lit
+`dashboard::query_dashboard_status()` et non `is_dashboard_running()` : la même
+sonde répond désormais à deux questions, et le `bool` les écrasait — un daemon à
+terre y était indiscernable d'un tableau de bord désactivé. Un `None` pousse un
+message `System` qui nomme l'endpoint et **les deux** causes possibles, parce que
+la sonde rend la même absence pour un daemon injoignable et pour un shell sans
+`MIKA_INTERNAL_TOKEN` ; en désigner une seule serait une fausse provenance
+(motif mika#2331). Le chemin `--team` garde `is_dashboard_running()` — son tour
+ne passe pas par ce bras, et il part au vol V4.
+
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)
 - `/restart` tears down a crashed agent-worker tokio task and spawns a fresh worker for the same agent (mika#1149). Refuses on a healthy worker — `/clear` is the right tool for starting a new session. The lost in-flight prompt is NOT replayed; the operator must re-type. Background callback tasks survive the restart and continue delivering to the new worker
