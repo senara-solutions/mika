@@ -24,6 +24,7 @@ pub mod setup;
 pub mod skills;
 pub mod skills_variants;
 pub mod status;
+pub mod task_events;
 pub mod tasks;
 pub mod team_outcome;
 pub mod teams;
