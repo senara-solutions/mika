@@ -4043,6 +4043,7 @@ impl AsyncDatabase {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use tokio::sync::broadcast;
 
     fn test_async_db() -> AsyncDatabase {
         let db = Database::open_in_memory().unwrap();
@@ -4226,6 +4227,151 @@ mod tests {
         let t = db.get_task(&id).await.unwrap().unwrap();
         assert_eq!(t.label, "Async reminder");
         assert_eq!(t.status, "pending");
+    }
+
+    // -- mika#1727 V2b § 4.1: the emission sites are attested --
+    //
+    // Nothing tested the emission itself until this flight. The channel had
+    // exactly one test (`broadcast_frame_zero_subscribers_returns_false`, in
+    // `server/tasks_stream.rs`), which attests the primitive and not a single
+    // call site — so "the wire emits since mika#1758" was a reading of the
+    // code, never a measurement. The TUI consumer of V2b injects a callback
+    // into a conversation on the strength of these frames: an emission that
+    // stopped firing would show up as a callback that never arrives, with no
+    // red test anywhere. Hence one test per transition the consumer reads,
+    // plus the negative control that bounds delivery to one.
+
+    /// Create a task on `db`'s own agent and return its id. The caller
+    /// subscribes to the channel **after** this returns, so the `TaskCreated`
+    /// frame `create_task` emits is broadcast to zero receivers and never
+    /// pollutes the assertions below.
+    async fn task_in_flight(db: &AsyncDatabase, label: &str) -> String {
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        db.create_task(task).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2b_update_task_completed_emet_exactement_une_trame() {
+        let db = test_async_db();
+        let channel = Arc::new(TaskEventsChannel::new());
+        db.set_task_events_channel(channel.clone());
+        let id = task_in_flight(&db, "callback terminé").await;
+        let mut rx = channel.subscribe();
+
+        assert!(
+            db.update_task_completed(&id, Some("le résultat"))
+                .await
+                .unwrap(),
+            "une tâche en vol doit transitionner"
+        );
+
+        match rx.try_recv().expect("une trame doit être émise") {
+            TaskEventFrame::TaskCompleted {
+                task_id,
+                agent_id,
+                result_preview,
+                ..
+            } => {
+                assert_eq!(task_id, id);
+                assert_eq!(agent_id, db.agent_id());
+                assert_eq!(result_preview.as_deref(), Some("le résultat"));
+            }
+            other => panic!("trame inattendue : {other:?}"),
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "exactement une trame, pas deux"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2b_update_task_failed_emet_exactement_une_trame() {
+        let db = test_async_db();
+        let channel = Arc::new(TaskEventsChannel::new());
+        db.set_task_events_channel(channel.clone());
+        let id = task_in_flight(&db, "callback en échec").await;
+        let mut rx = channel.subscribe();
+
+        assert!(
+            db.update_task_failed(&id, "ça a cassé").await.unwrap(),
+            "une tâche en vol doit transitionner"
+        );
+
+        match rx.try_recv().expect("une trame doit être émise") {
+            TaskEventFrame::TaskFailed {
+                task_id,
+                agent_id,
+                error_preview,
+                ..
+            } => {
+                assert_eq!(task_id, id);
+                assert_eq!(agent_id, db.agent_id());
+                assert_eq!(error_preview.as_deref(), Some("ça a cassé"));
+            }
+            other => panic!("trame inattendue : {other:?}"),
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "exactement une trame, pas deux"
+        );
+    }
+
+    /// The `if transitioned` guard is what bounds the TUI to one injection per
+    /// callback: a second proposer — the poll V2b deliberately keeps as a
+    /// subordinate safety net — finds `Ok(false)` and the wire stays silent.
+    /// If emission ever moved outside that guard, the frame would fire again
+    /// and the conversation would receive the same callback twice.
+    #[tokio::test]
+    async fn mika1727_v2b_un_second_appel_sur_une_tache_terminale_nemet_rien() {
+        let db = test_async_db();
+        let channel = Arc::new(TaskEventsChannel::new());
+        db.set_task_events_channel(channel.clone());
+        let id = task_in_flight(&db, "callback déjà terminé").await;
+
+        assert!(
+            db.update_task_completed(&id, Some("premier"))
+                .await
+                .unwrap()
+        );
+
+        let mut rx = channel.subscribe();
+
+        assert!(
+            !db.update_task_completed(&id, Some("second")).await.unwrap(),
+            "une tâche terminale ne transitionne pas une seconde fois"
+        );
+        assert!(
+            !db.update_task_failed(&id, "second").await.unwrap(),
+            "ni par le site d'échec"
+        );
+
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "aucune trame ne doit être émise hors transition"
+        );
     }
 
     #[tokio::test]
