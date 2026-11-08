@@ -1772,15 +1772,20 @@ mod tests {
         // Démarrage du démon, par agent : la boucle qui enregistre les
         // récurrentes intégrées de chaque agent chargé.
         "crates/mika-agent/src/server/mod.rs",
-        // Démarrage du TUI, agent courant : la même paire, pour le seul agent
-        // de la session.
-        "crates/mika-cli/src/commands/chat.rs",
+        // `crates/mika-cli/src/commands/chat.rs` était le second site — le
+        // démarrage du TUI, pour le seul agent de la session. Retiré par
+        // mika#1727 vol V2a avec le `TaskEngine` de la TUI : le daemon est
+        // désormais le seul enregistreur des récurrentes d'un agent. **Ce
+        // retrait durcit ce scan au lieu de le relâcher** : toute réapparition
+        // d'une lecture de la porte sous `crates/mika-cli/` est maintenant un
+        // `strangers` et rougit. Ne pas réintroduire l'entrée pour accueillir
+        // une telle lecture — c'est le site qu'il faut supprimer.
     ];
 
     /// **Livrée vide, et le test plus bas l'assert.**
     ///
-    /// Zéro violation existante, et c'est mesuré : les seuls lecteurs de
-    /// production sont les deux sites recensés ci-dessus. Il n'y a donc rien à
+    /// Zéro violation existante, et c'est mesuré : le seul lecteur de
+    /// production est le site recensé ci-dessus. Il n'y a donc rien à
     /// excepter, ni de case où déposer la prochaine infraction (mika#2323).
     /// Quand le scan tire, **on route la lecture par un site d'enregistrement
     /// existant**, on n'ajoute pas d'entrée (doctrine mika#2201) : un lecteur
@@ -1838,8 +1843,8 @@ mod tests {
     /// (mika#2850) — d'où le nom génériques de section plutôt qu'un nom qui
     /// désigne une porte. Le `label` arrive **guillemets compris**, et il est
     /// cherché **sur la même ligne** que l'appel d'annulation, pas
-    /// indépendamment dans la fenêtre. Ce resserrage n'est pas cosmétique : aux
-    /// deux sites recensés, les blocs `heartbeat` et `reflection` sont
+    /// indépendamment dans la fenêtre. Ce resserrage n'est pas cosmétique : au
+    /// site recensé, les blocs `heartbeat` et `reflection` sont
     /// **collés** (`cancel_recurring_task_by_label("heartbeat")` est trois
     /// lignes avant la lecture de `reflection` dans `server/mod.rs`). Avec les
     /// trois termes cherchés indépendamment, supprimer la branche `else` de
@@ -1854,8 +1859,8 @@ mod tests {
     /// l'aiguille contient elle-même le nom de la section.
     ///
     /// **`ensure_recurring_task` reste un terme de fenêtre non corrélé, et
-    /// c'est mesuré.** Aux deux sites, l'appel et son argument de label sont sur
-    /// des lignes **différentes** (`server/mod.rs` : appel `:1920`, label
+    /// c'est mesuré.** Au site recensé, l'appel et son argument de label sont
+    /// sur des lignes **différentes** (`server/mod.rs` : appel `:1920`, label
     /// `:1923`) : corréler ce terme-là sur une ligne rendrait le prédicat rouge
     /// sur un arbre conforme. Le résidu que ça laisse — supprimer l'appel
     /// d'enregistrement en gardant l'annulation garderait la fenêtre verte via
@@ -1873,11 +1878,12 @@ mod tests {
     ///
     /// La fenêtre vaut 25 et a **un seul site de vérité**, partagé par les deux
     /// labels. Les distances réelles sont de 9 lignes (`server/mod.rs`
-    /// 1906→1915) et 11 lignes (`chat.rs` 229→240) pour `heartbeat`, de 10
-    /// lignes (`server/mod.rs` 1918→1928) et 11 lignes (`chat.rs` 245→256) pour
-    /// `reflection` : large sans être molle, et plus serrée encore sur le texte
-    /// décommenté puisque [`crate::source_scan::strip_comment_lines`]
-    /// **supprime** les lignes de commentaire au lieu de les vider.
+    /// 1906→1915) pour `heartbeat` et de 10 lignes (`server/mod.rs` 1918→1928)
+    /// pour `reflection` : large sans être molle, et plus serrée encore sur le
+    /// texte décommenté puisque [`crate::source_scan::strip_comment_lines`]
+    /// **supprime** les lignes de commentaire au lieu de les vider. Les deux
+    /// autres mesures citées ici étaient celles de `commands/chat.rs` (11
+    /// lignes chacune), retiré du recensement par mika#1727 vol V2a.
     fn section_gate_reads_at_registration(content: &str, needle: &str, label: &str) -> bool {
         const WINDOW: usize = 25;
         let cancels = format!("cancel_recurring_task_by_label({label}");
@@ -2031,7 +2037,7 @@ mod tests {
              devenu inerte et D3 se lirait exactement comme une porte registration-only"
         );
 
-        // Positive — la forme réelle des deux sites recensés.
+        // Positive — la forme réelle du site recensé.
         let at_registration = [
             format!("if task_engine::{needle}(&home_dir).await {{"),
             "    task_engine::ensure_recurring_task(".to_string(),
@@ -2045,7 +2051,7 @@ mod tests {
         .join("\n");
         assert!(
             section_gate_reads_at_registration(&at_registration, &needle, &label),
-            "le prédicat refuse la forme réelle des deux sites recensés : il est trop \
+            "le prédicat refuse la forme réelle du site recensé : il est trop \
              serré, et D3 rougirait sur un arbre conforme"
         );
     }
@@ -2073,29 +2079,34 @@ mod tests {
     /// rend le scan rouge. L'allowlist, elle, est
     /// [`REFLECTION_GATE_READER_ALLOWED`], et elle est vide.
     ///
-    /// Le recensement naît à **deux** entrées parce que la proposition attestée
-    /// est *« tous les lecteurs sont à l'enregistrement »*, pas *« il y a un
-    /// lecteur »*. Précédents de la même forme :
+    /// Le recensement est né à **deux** entrées parce que la proposition
+    /// attestée est *« tous les lecteurs sont à l'enregistrement »*, pas
+    /// *« il y a un lecteur »* — et il en porte une depuis que mika#1727 vol
+    /// V2a a retiré le `TaskEngine` de la TUI. Précédents de la même forme :
     /// [`HEARTBEAT_GATE_REGISTRATION_SITES`] (mika#2847) et
     /// `TESTIMONY_PREDICATE_READERS` (mika#2627).
     const REFLECTION_GATE_REGISTRATION_SITES: &[&str] = &[
         // Démarrage du démon, par agent : la boucle qui enregistre les
         // récurrentes intégrées de chaque agent chargé.
         "crates/mika-agent/src/server/mod.rs",
-        // Démarrage du TUI, agent courant : la même paire, pour le seul agent
-        // de la session.
-        "crates/mika-cli/src/commands/chat.rs",
+        // `crates/mika-cli/src/commands/chat.rs` était le second site — le
+        // démarrage du TUI, pour le seul agent de la session. Retiré par
+        // mika#1727 vol V2a avec le `TaskEngine` de la TUI, exactement comme
+        // chez [`HEARTBEAT_GATE_REGISTRATION_SITES`] : le daemon est désormais
+        // le seul enregistreur. Le retrait **durcit** ce scan — une lecture de
+        // la porte qui reviendrait sous `crates/mika-cli/` est un `strangers`
+        // et rougit. Ne pas réintroduire l'entrée pour l'accueillir.
     ];
 
     /// **Livrée vide, et le test plus bas l'assert.**
     ///
-    /// Zéro violation existante, et c'est mesuré : les trois hits de l'aiguille
-    /// dans l'arbre sont la **définition**
+    /// Zéro violation existante, et c'est mesuré : les hits de l'aiguille dans
+    /// l'arbre sont la **définition**
     /// (`task_engine/mod.rs:909`, écartée par le filtre `fn …(` de
-    /// [`reads_section_gate`]) et exactement les **deux** lecteurs recensés
-    /// ci-dessus. Aucun hit dans `dispatcher.rs`, donc aucun lecteur au tir. Il
-    /// n'y a donc rien à excepter, ni de case où déposer la prochaine
-    /// infraction (mika#2323).
+    /// [`reads_section_gate`]) et exactement le lecteur recensé ci-dessus.
+    /// Aucun hit dans `dispatcher.rs`, donc aucun lecteur au tir. Il n'y a donc
+    /// rien à excepter, ni de case où déposer la prochaine infraction
+    /// (mika#2323).
     ///
     /// Quand le scan tire, **on route la lecture par un site d'enregistrement
     /// existant**, on n'ajoute pas d'entrée (doctrine mika#2201) : un lecteur
@@ -2238,7 +2249,7 @@ mod tests {
              VOISINE. Son paramètre de label ne porte rien, et \
              mika2850_chaque_lecteur_recense_annule_a_lenregistrement resterait vert \
              sur un arbre où `reflection` n'annule plus rien — la régression la plus \
-             probable des deux sites, puisque les deux blocs y sont collés."
+             probable du site recensé, puisque les deux blocs y sont collés."
         );
 
         // Négative n°2 — aucune annulation du tout.
@@ -2257,7 +2268,7 @@ mod tests {
              s'est fermée"
         );
 
-        // Positive — la forme réelle des deux sites recensés. Sans ce volet, un
+        // Positive — la forme réelle du site recensé. Sans ce volet, un
         // prédicat trop serré rendrait D3 rouge sur un arbre conforme et le
         // test ne le dirait pas.
         let real_form = [
@@ -2272,7 +2283,7 @@ mod tests {
         .join("\n");
         assert!(
             section_gate_reads_at_registration(&real_form, &needle, &label),
-            "le prédicat refuse la forme réelle des deux sites recensés : il est trop \
+            "le prédicat refuse la forme réelle du site recensé : il est trop \
              serré, et mika2850_chaque_lecteur_recense_annule_a_lenregistrement \
              rougirait sur un arbre conforme"
         );
