@@ -19,26 +19,27 @@ ci-dessous sont remesurés sur `225d87ad1`.
 
 ### 0.1 Le fil émet déjà, et il n'est pas dormant
 
-`GET /api/v1/dashboard/tasks/stream` (`server/mod.rs:338-346`, auth
+`GET /api/v1/dashboard/tasks/stream` (`server/mod.rs:358`, auth
 dashboard-ou-interne) sert `tasks_stream::handle_tasks_events_stream`. Depuis
 mika#1758, `async_db.rs` émet depuis dix sites couvrant six transitions. Trois
 d'entre eux portent ce vol :
 
 | site | ligne | trame |
 |---|---|---|
-| `AsyncDatabase::update_task_completed` | `async_db.rs:540-566` | `TaskCompleted` |
+| `AsyncDatabase::update_task_completed` | `async_db.rs:563-588` | `TaskCompleted` |
 | `AsyncDatabase::update_task_failed` | `async_db.rs:591-616` | `TaskFailed` |
 | `AsyncDatabase::promote_task_completed` | `async_db.rs:619-648` | `TaskCompleted` (second légitime pour le même `task_id`, justifié sur place) |
 
 Les trois n'émettent que si l'`UPDATE` gardé a réellement transité
 (`if transitioned`) : `Ok(false)` ne produit aucune trame. Le canal est attaché
-**dans le processus serveur seul** (`server/mod.rs:1914`, `server/state.rs:312`) ;
-dans la TUI l'`OnceLock` est vide, donc une écriture côté TUI n'émet rien. C'est
-la topologie que ce vol exploite, pas une à construire.
+**dans le processus serveur seul** (`server/mod.rs:1909-1915`,
+`server/state.rs:312`) ; dans la TUI l'`OnceLock` de
+`emit_task_event` (`async_db.rs:108-112`) est vide, donc une écriture côté TUI
+n'émet rien. C'est la topologie que ce vol exploite, pas une à construire.
 
 **Deux commentaires de production mentent encore** et disent ce fil dormant :
 
-- `server/mod.rs:335-337` : *« Wire-only in v1 — emission from task_engine transition sites lands in a follow-up ticket. »*
+- `server/mod.rs:355-356` : *« Wire-only in v1 — emission from task_engine transition sites lands in a follow-up ticket. »*
 - module doc de `server/tasks_stream.rs:8-12` : *« Emission from `task_engine` transition sites is deferred to a follow-up ticket; the wire is dormant until that lands. »*
 
 Ce suivi **a atterri** (mika#1758). Les deux phrases tombent dans ce vol — c'est
@@ -57,7 +58,7 @@ TaskFailed    { task_id: String, agent_id: String, failed_at: String,
                 error_preview: Option<String> },
 ```
 
-`AgentRequest::CallbackResult` (`tui/app.rs:289-315`) consomme six champs :
+`AgentRequest::CallbackResult` (`tui/app.rs:297-309`) consomme six champs :
 `task_id`, `label`, `result`, `trace_id`, `original_status`, `parent_task_id`.
 Cinq manquent sur la trame.
 
@@ -101,7 +102,7 @@ Diagnostic — not integrated into the TUI. mika#1727 handles TUI consumption. �
 
 ### 0.5 Ce que la TUI fait aujourd'hui, et avec quoi
 
-`poll_callback_tasks` (`tui/app.rs:1595-1704`, ~110 lignes), appelée au tick
+`poll_callback_tasks` (`tui/app.rs:1596-1704`, ~110 lignes), appelée au tick
 (`app.rs:1126`) : fenêtre de 7 jours, `get_undelivered_callback_tasks_for_session(&since, &self.session_id)`,
 garde de fraîcheur sur les échecs (`STALE_FAILED_CALLBACK_MINUTES`, nettoyage
 silencieux + message agrégé), réclamation atomique (`mark_task_delivered` →
@@ -286,9 +287,21 @@ d'abord, le retrait du filet ensuite** :
 - **Vol suivant — critère 1.** `poll_callback_tasks` et son appel disparaissent,
   un détecteur structurel rougit si `mika-cli` relit la requête en local
   (allowlist épinglée vide + anti-vacuité, sur le patron de V1 et V2a,
-  `commands/chat_turn.rs:607-714`), le commentaire `#264` de `chat.rs:412-414`
-  devient vrai, et `crates/mika-cli/CLAUDE.md` gagne son paragraphe V2b.
-  `Tracked in: senara-solutions/mika#1727`.
+  `commands/chat_turn.rs:607-714`), le commentaire de
+  `task_engine/engine.rs:1441-1444` cesse de nommer `poll_callback_tasks` comme
+  le livreur du mode CLI, et `crates/mika-cli/CLAUDE.md` gagne son paragraphe
+  V2b. `Tracked in: senara-solutions/mika#1727`.
+
+  **Correction d'une assertion du matériau V2.** Le corps du ticket et le § D8
+  du plan V2 annoncent qu'« un commentaire `#264` de `chat.rs` devient faux au
+  merge de ce vol ». La mesure dit qu'il n'existe pas :
+  `grep -rn '#264' crates/mika-cli/src/` ne rend **rien**. Le seul `#264` du
+  dépôt sur ce sujet est `task_engine/engine.rs:1474`, et il porte sur la garde
+  de `dispatch_undelivered_callbacks`, côté daemon — il reste vrai, ce vol n'y
+  touche pas. La dette qui existe vraiment est le commentaire voisin
+  `engine.rs:1441-1444` (« In CLI mode, the TUI's `poll_callback_tasks()`
+  handles callback delivery »), et il ne devient faux que lorsque le poll part,
+  donc au vol suivant et non ici.
 
 Ce découpage se note en commentaire sur mika#1727 et dans le corps de la PR
 (gel des tickets). Il n'ouvre rien.
@@ -299,7 +312,7 @@ Ce découpage se note en commentaire sur mika#1727 et dans le corps de la PR
 
 ### 3.1 `crates/mika-agent/src/server/mod.rs`
 
-Le commentaire `l. 335-337` dit le contraire du code depuis mika#1758. Il
+Le commentaire `l. 355-356` dit le contraire du code depuis mika#1758. Il
 devient : le flux émet, depuis les sites de transition de `async_db.rs`, dans
 le processus serveur seul. Pas de changement de route, pas de changement d'auth.
 
@@ -348,8 +361,8 @@ intégré »). `find_event_separator` et ses tests suivent le module.
 ### 3.6 Ce qui ne bouge pas, et pourquoi
 
 - `commands/chat.rs` : le bras `CallbackResult` est conservé à l'identique
-  (§ 0.8) ; son commentaire `#264` reste vrai tant que le poll vit, et tombe au
-  vol suivant.
+  (§ 0.8), commentaires compris — ceux de V1 (`chat.rs:265-267` et `355-358`)
+  restent vrais, et aucun `#264` n'y vit (§ 2).
 - `async_db.rs` et les trois sites d'émission : aucun champ ajouté (D1). Seuls
   des tests s'y ajoutent.
 - `crates/mika-cli/CLAUDE.md` : documenté au vol suivant, quand la forme est
@@ -543,7 +556,7 @@ livrés par ce vol ; le critère 1 est porté par le vol suivant (§ 2).
 
 ## Definition of Done
 
-- [ ] Les deux commentaires périmés de `server/mod.rs:335-337` et du module doc
+- [ ] Les deux commentaires périmés de `server/mod.rs:355-356` et du module doc
       de `server/tasks_stream.rs:8-12` ne disent plus le fil dormant.
 - [ ] Les trois sites d'émission de `async_db.rs` sont sous test, y compris
       l'invariant « `Ok(false)` n'émet rien » (§ 4.1).
