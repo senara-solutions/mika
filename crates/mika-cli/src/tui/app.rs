@@ -2552,4 +2552,438 @@ mod tests {
         assert!(!app.worker_crashed, "Reply must not arm /restart");
         assert_eq!(app.pending_response.as_deref(), Some("hello"));
     }
+
+    // === mika#1727 V2b § 4.2 / § 4.3: a terminated callback arrives once, in
+    // the right conversation, carried by the SSE stream ===
+    //
+    // End-to-end against both real surfaces: the task-events stream and
+    // `GET /api/v1/tasks/{id}`. The frames are built by
+    // `TaskEventFrame::completed` / `::failed`, so they are subject to the same
+    // truncation invariant as production — which is what makes "the whole
+    // result, not the preview" a measurement rather than a restatement.
+    //
+    // No env var is touched: the base URL and the token travel by argument, so
+    // these tests cannot be perturbed by — nor perturb — the `MIKA_SPIRIT_URL`
+    // mutators in `commands/agents.rs`.
+
+    const OTHER_SESSION: &str = "une-autre-session";
+    const OTHER_AGENT: &str = "mika-dev";
+
+    fn sse_payload(frames: &[TaskEventFrame]) -> String {
+        frames
+            .iter()
+            .map(|f| format!("data: {}\n\n", serde_json::to_string(f).unwrap()))
+            .collect()
+    }
+
+    /// A task detail as mika-spirit serves it.
+    ///
+    /// `status` is `delivered` on purpose: by the time the TUI reads the
+    /// detail, the claim has moved the row. A `original_status` taken from here
+    /// would be wrong, which is why `CallbackTaskDetail` does not carry the
+    /// field (D1). The extra keys attest that serde ignores the eighteen other
+    /// fields of the real response.
+    fn detail_json(
+        label: &str,
+        result: Option<&str>,
+        session: Option<&str>,
+        trace: Option<&str>,
+        parent: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": "ignored-by-the-mirror",
+            "status": "delivered",
+            "agent_id": "mika",
+            "label": label,
+            "result": result,
+            "created_by_session": session,
+            "created_trace_id": trace,
+            "parent_task_id": parent,
+        })
+    }
+
+    /// Serve both surfaces on a throwaway socket. Returns the base URL and the
+    /// list of task ids whose detail was fetched — the negative control for
+    /// "another agent's frame costs no round-trip at all".
+    async fn spawn_fake_spirit(
+        sse: String,
+        details: Vec<(String, serde_json::Value)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::{Router, extract::Path};
+        use futures_util::StreamExt;
+
+        let hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let detail_map: Arc<std::collections::HashMap<String, serde_json::Value>> =
+            Arc::new(details.into_iter().collect());
+        let hits_for_route = Arc::clone(&hits);
+
+        let router = Router::new()
+            .route(
+                "/api/v1/dashboard/tasks/stream",
+                get(move || {
+                    let payload = sse.clone();
+                    async move {
+                        // The frames, then a body that never ends: a clean
+                        // close would make the subscription reconnect and
+                        // replay them, which is timing the test must not depend on.
+                        let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                            axum::body::Bytes::from(payload),
+                        )])
+                        .chain(futures_util::stream::pending());
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from_stream(stream))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/tasks/{task_id}",
+                get(move |Path(task_id): Path<String>| {
+                    let detail_map = Arc::clone(&detail_map);
+                    let hits = Arc::clone(&hits_for_route);
+                    async move {
+                        hits.lock().unwrap().push(task_id.clone());
+                        match detail_map.get(&task_id) {
+                            Some(v) => axum::Json(v.clone()).into_response(),
+                            None => (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({ "error": "not found" })),
+                            )
+                                .into_response(),
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// An in-memory DB with a session, on the default agent (`mika`).
+    async fn callback_db() -> (AsyncDatabase, String) {
+        let db = AsyncDatabase::new(mika_agent::db::Database::open_in_memory().unwrap());
+        let session_id = uuid::Uuid::new_v4().to_string();
+        db.create_session(&session_id, db.agent_id(), "cli")
+            .await
+            .unwrap();
+        (db, session_id)
+    }
+
+    /// A callback task already in a terminal state — the only shape
+    /// `mark_task_delivered`'s guarded UPDATE accepts.
+    async fn terminal_task(
+        db: &AsyncDatabase,
+        label: &str,
+        session: Option<&str>,
+        result: &str,
+        failed: bool,
+    ) -> String {
+        let task = mika_agent::db::NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: session.map(str::to_string),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        if failed {
+            db.update_task_failed(&id, result).await.unwrap();
+        } else {
+            db.update_task_completed(&id, Some(result)).await.unwrap();
+        }
+        id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn app_on(
+        db: AsyncDatabase,
+        session_id: String,
+        base_url: &str,
+        is_singleton_session: bool,
+        temp_dir: &tempfile::TempDir,
+    ) -> (App<'static>, mpsc::UnboundedReceiver<AgentRequest>) {
+        let (agent_tx, request_rx) = mpsc::unbounded_channel();
+        let (_response_tx, response_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            agent_tx,
+            response_rx,
+            session_id,
+            "test-model".to_string(),
+            "Mika".to_string(),
+            db,
+            mika_common::llm::dummy_provider(),
+            temp_dir.path().to_path_buf(),
+            Arc::new(SkillRegistry::empty()),
+            "mika".to_string(),
+            temp_dir.path().to_path_buf(),
+            mika_common::llm::ProviderKind::Anthropic,
+            false,
+            is_singleton_session,
+        );
+        app.spirit_base_url = Some(base_url.to_string());
+        app.spirit_token = Some("ab".repeat(32));
+        (app, request_rx)
+    }
+
+    /// Drain for long enough that every frame on the wire has been offered.
+    ///
+    /// The subscription is a real socket, so the test waits on it instead of
+    /// assuming a tick order. Nothing here breaks early: the duplicate frame
+    /// must be *consumed and refused*, not merely left in the channel.
+    async fn drain_for_a_while(app: &mut App<'static>, base_url: &str) {
+        let token = "ab".repeat(32);
+        for _ in 0..200 {
+            app.drain_task_event_frames_from(base_url, &token).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2b_un_callback_termine_arrive_une_fois_dans_la_bonne_conversation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (db, session_id) = callback_db().await;
+
+        // A result longer than the frame's preview cap, so "the whole result"
+        // and "the preview" cannot be confused.
+        let long_result = "z".repeat(900);
+        let ours = terminal_task(
+            &db,
+            "notre-callback",
+            Some(&session_id),
+            &long_result,
+            false,
+        )
+        .await;
+        let other_session = terminal_task(
+            &db,
+            "callback-dune-autre-session",
+            Some(OTHER_SESSION),
+            "ok",
+            false,
+        )
+        .await;
+        let other_agent = "tache-dun-autre-agent";
+
+        let ours_frame = TaskEventFrame::completed(
+            &ours,
+            db.agent_id(),
+            "2026-11-08T10:00:00Z",
+            Some(&long_result),
+        );
+        let TaskEventFrame::TaskCompleted {
+            result_preview: Some(ref preview),
+            ..
+        } = ours_frame
+        else {
+            panic!("`completed` builds a TaskCompleted carrying a preview");
+        };
+        assert!(
+            preview.chars().count() < long_result.chars().count(),
+            "the frame must carry a truncated preview, else this test proves nothing"
+        );
+
+        let sse = sse_payload(&[
+            ours_frame.clone(),
+            // (b) another agent — dropped on the wire, before any round-trip.
+            TaskEventFrame::completed(
+                other_agent,
+                OTHER_AGENT,
+                "2026-11-08T10:00:01Z",
+                Some("peu importe"),
+            ),
+            // (c) our agent, another session.
+            TaskEventFrame::completed(
+                &other_session,
+                db.agent_id(),
+                "2026-11-08T10:00:02Z",
+                Some("ok"),
+            ),
+            // (d) the same frame twice.
+            ours_frame,
+        ]);
+        let details = vec![
+            (
+                ours.clone(),
+                detail_json(
+                    "notre-callback",
+                    Some(&long_result),
+                    Some(&session_id),
+                    Some("trace-42"),
+                    Some("parent-7"),
+                ),
+            ),
+            (
+                other_session.clone(),
+                detail_json(
+                    "callback-dune-autre-session",
+                    Some("ok"),
+                    Some(OTHER_SESSION),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                other_agent.to_string(),
+                detail_json("jamais-demande", Some("ok"), Some(&session_id), None, None),
+            ),
+        ];
+
+        let (base_url, detail_hits) = spawn_fake_spirit(sse, details).await;
+        let (mut app, mut requests) =
+            app_on(db.clone(), session_id.clone(), &base_url, false, &temp_dir);
+
+        drain_for_a_while(&mut app, &base_url).await;
+
+        // (a) one CallbackResult, carrying the whole result and the status of
+        // the frame's variant.
+        let req = requests.try_recv().expect("one callback injected");
+        let AgentRequest::CallbackResult {
+            task_id,
+            label,
+            result,
+            trace_id,
+            original_status,
+            parent_task_id,
+        } = req
+        else {
+            panic!("the SSE path injects a CallbackResult");
+        };
+        assert_eq!(task_id, ours);
+        assert_eq!(label, "notre-callback");
+        assert_eq!(
+            result, long_result,
+            "the detail's whole result, never the frame's preview"
+        );
+        assert_eq!(trace_id.as_deref(), Some("trace-42"));
+        assert_eq!(parent_task_id.as_deref(), Some("parent-7"));
+        assert_eq!(
+            original_status, "completed",
+            "read off the frame variant — the detail says `delivered` (D1)"
+        );
+        assert_eq!(app.status, AgentStatus::Thinking);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content == "[notre-callback] completed"),
+            "the system message is the one the poll pushed, verbatim; got {:?}",
+            app.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+
+        // (d) the same frame twice is one injection and one transition.
+        assert!(
+            requests.try_recv().is_err(),
+            "a duplicate frame must not reach the agent a second time"
+        );
+        assert_eq!(
+            db.get_task(&ours).await.unwrap().unwrap().status,
+            "delivered"
+        );
+
+        // (c) another session: nothing injected, nothing marked.
+        assert_eq!(
+            db.get_task(&other_session).await.unwrap().unwrap().status,
+            "completed",
+            "a callback of another session must stay undelivered"
+        );
+
+        // (b) another agent: the wire filter means no detail call at all.
+        let hits = detail_hits.lock().unwrap().clone();
+        assert!(
+            !hits.iter().any(|h| h == other_agent),
+            "another agent's frame must cost no detail round-trip; hits: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h == &ours),
+            "our own callback is the one that pays for a detail; hits: {hits:?}"
+        );
+    }
+
+    /// § 4.3: the failure framing, and a `singleton` agent.
+    ///
+    /// D7: a singleton is the *same* filter, not a second path — `session_id`
+    /// is the canonical session, and also the `created_by_session` spirit has
+    /// adopted since V1. So the only thing that changes here is the flag.
+    #[tokio::test]
+    async fn mika1727_v2b_un_echec_arrive_avec_son_repli_sur_un_agent_singleton() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (db, session_id) = callback_db().await;
+
+        let failed = terminal_task(&db, "callback-en-echec", Some(&session_id), "boom", true).await;
+
+        let sse = sse_payload(&[TaskEventFrame::failed(
+            &failed,
+            db.agent_id(),
+            "2026-11-08T10:00:00Z",
+            Some("boom"),
+        )]);
+        // An empty `result` on the detail: the fallback substitution is what
+        // keeps a failed callback from being skipped as "terminal with nothing
+        // to say".
+        let details = vec![(
+            failed.clone(),
+            detail_json("callback-en-echec", Some(""), Some(&session_id), None, None),
+        )];
+
+        let (base_url, _hits) = spawn_fake_spirit(sse, details).await;
+        let (mut app, mut requests) =
+            app_on(db.clone(), session_id.clone(), &base_url, true, &temp_dir);
+        assert!(
+            app.is_singleton_session,
+            "the singleton flag is the only difference"
+        );
+
+        drain_for_a_while(&mut app, &base_url).await;
+
+        let AgentRequest::CallbackResult {
+            result,
+            original_status,
+            ..
+        } = requests.try_recv().expect("the failure is injected too")
+        else {
+            panic!("the SSE path injects a CallbackResult");
+        };
+        assert_eq!(
+            result,
+            mika_agent::agent::FAILED_TASK_FALLBACK,
+            "an empty result on a failure takes the fallback"
+        );
+        assert_eq!(
+            original_status, "failed",
+            "read off the TaskFailed variant (D1)"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content == "[callback-en-echec] failed"),
+            "the failure's system message is the poll's, verbatim"
+        );
+        assert_eq!(
+            db.get_task(&failed).await.unwrap().unwrap().status,
+            "delivered"
+        );
+    }
 }
