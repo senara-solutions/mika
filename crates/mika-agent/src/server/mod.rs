@@ -352,8 +352,12 @@ fn build_router(state: AppState) -> Router {
             post(permissions_stream::handle_permission_answer),
         )
         // Task-event live stream (mika#1732 sub-B): SSE surface for task
-        // lifecycle transitions. Wire-only in v1 — emission from task_engine
-        // transition sites lands in a follow-up ticket.
+        // lifecycle transitions. It emits since mika#1758, from the transition
+        // sites of `async_db.rs`, and in this server process alone — nothing
+        // but the attach below (and its lazy twin in `state.rs`) fills the
+        // `OnceLock`, so in the TUI the same emission is a silent no-op.
+        // Consumers filter on `agent_id` themselves (the channel is
+        // per-process).
         .route(
             "/dashboard/tasks/stream",
             get(tasks_stream::handle_tasks_events_stream),

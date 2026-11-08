@@ -5,11 +5,25 @@
 //! delivered / cancelled) is broadcast on an SSE channel. Consumers see live
 //! task state changes without polling `GET /api/v1/tasks`.
 //!
-//! **Wire-first split (mika#1732 v1).** This module ships the SSE surface —
-//! the enum, the channel primitive, the handler, and the route contract.
-//! Emission from `task_engine` transition sites is deferred to a follow-up
-//! ticket; the wire is dormant until that lands. Same pattern as mika#1741
-//! (`permissions_stream.rs`) and mika#1731 (`mika_a2a::streaming`).
+//! **The wire emits (mika#1758, measured again by mika#1727 V2b).** It shipped
+//! wire-first in mika#1732 v1 — enum, channel primitive, handler, route — and
+//! the sentence that said emission was "deferred to a follow-up ticket; the
+//! wire is dormant until that lands" stopped being true at mika#1758, which
+//! attached the emission to the transition sites of `async_db.rs`
+//! (`update_task_completed`, `update_task_failed`, `promote_task_completed`,
+//! `update_task_status`), each under its `if transitioned` guard — so a second
+//! call on an already-terminal task emits nothing, and that invariant is what
+//! bounds a consumer to one delivery per transition.
+//!
+//! The channel is attached through a `OnceLock` on `AsyncDatabase`, and the
+//! two sites that fill it are both here in `server/` — `run_server` for the
+//! agents known at boot, `AppState::resolve_agent` for the ones it
+//! lazy-constructs afterwards. In the
+//! TUI process nothing fills it, and emission is a silent no-op there rather
+//! than an error. So the frames exist **in the server process alone**, and the channel
+//! is per-process rather than per-agent — a consumer filters on `agent_id`
+//! itself (mika#1727 V2b does exactly that, then resolves the rest of the
+//! callback through `GET /api/v1/tasks/{task_id}`).
 //!
 //! **Sibling divergence — do not conflate.** Three sibling SSE surfaces
 //! now coexist, each with a deliberate choice of discriminator key + scope:
