@@ -2,6 +2,7 @@ pub mod agents;
 pub mod arch_disposition;
 pub mod ask;
 pub mod chat;
+pub mod chat_turn;
 pub mod config;
 pub mod credential_helper;
 pub mod dashboard;
