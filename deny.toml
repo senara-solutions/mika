@@ -17,6 +17,10 @@ reason = "event-listener !Send tags via StackSlot (unsound); transitive dep only
 id = "RUSTSEC-2026-0205"
 reason = "scc Array::insert exception safety (unsound); transitive dep only, we do not pass panicking compare fns."
 
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0459"
+reason = "Temporary exception set 2026-11-09, approved by Vincent. libsqlite3-sys 0.30.1 (bundled SQLite < 3.54.0) via rusqlite 0.32 (Cargo.toml:30); the fix (>= 0.39.0) needs a major rusqlite bump to 0.41, tracked on the parking mika#2983 for a dedicated flight. Keep in sync with .cargo/audit.toml."
+
 [licenses]
 allow = [
     "MIT",
