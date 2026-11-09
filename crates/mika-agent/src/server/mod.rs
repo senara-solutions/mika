@@ -352,8 +352,10 @@ fn build_router(state: AppState) -> Router {
             post(permissions_stream::handle_permission_answer),
         )
         // Task-event live stream (mika#1732 sub-B): SSE surface for task
-        // lifecycle transitions. Wire-only in v1 — emission from task_engine
-        // transition sites lands in a follow-up ticket.
+        // lifecycle transitions. Emission landed at mika#1758 — this route
+        // serves real frames, one per transition. The channel is attached
+        // per-process from two sites, one of them `run_server` below; see
+        // `tasks_stream`'s module doc for what a consumer may assume.
         .route(
             "/dashboard/tasks/stream",
             get(tasks_stream::handle_tasks_events_stream),
