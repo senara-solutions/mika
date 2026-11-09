@@ -395,8 +395,8 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
-        Some(TaskCommand::Stream { url }) => {
-            stream_task_events(url).await?;
+        Some(TaskCommand::Stream { url, agent }) => {
+            stream_task_events(url, agent).await?;
         }
     }
 
@@ -412,7 +412,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
 /// [`TaskEventStream::open`]: `dashboard::auth_token` reads the process
 /// environment and fails without it, so a consumer resolving its own
 /// credentials could not be driven from a test at all (mika#1727 vol V2b-1b).
-async fn stream_task_events(url_override: Option<String>) -> Result<()> {
+async fn stream_task_events(url_override: Option<String>, agent: Option<String>) -> Result<()> {
     let base_url = url_override.unwrap_or_else(crate::commands::dashboard::spirit_url);
     let token = crate::commands::dashboard::auth_token()?;
 
@@ -420,7 +420,7 @@ async fn stream_task_events(url_override: Option<String>) -> Result<()> {
         "mika#1758 task-event stream: connecting to {}",
         stream_url(&base_url)
     );
-    stream_task_events_into(&base_url, &token, &mut std::io::stdout()).await
+    stream_task_events_into(&base_url, &token, agent.as_deref(), &mut std::io::stdout()).await
 }
 
 /// `mika tasks stream`, with its output sink as a parameter.
@@ -431,16 +431,22 @@ async fn stream_task_events(url_override: Option<String>) -> Result<()> {
 /// from a Rust test without a subprocess. The two `eprintln!` stay on stderr and
 /// are therefore absent from the sink: that absence *is* the measurement of
 /// "nothing else", not a restatement of it.
+///
+/// `agent_filter` is `--agent` as [`TaskEventStream::consume`] takes it. The
+/// sink gets the **raw** payload either way — the decode travels so the filter
+/// can read it, not so the output changes shape — which is why `None` yields the
+/// output of before the flag existed, to the byte.
 async fn stream_task_events_into<W: std::io::Write>(
     base_url: &str,
     token: &str,
+    agent_filter: Option<&str>,
     out: &mut W,
 ) -> Result<()> {
     let stream = TaskEventStream::open(base_url, token).await?;
     eprintln!("mika#1758 task-event stream: connected. Streaming frames (Ctrl-C to stop).");
 
     stream
-        .consume(None, |payload, _frame| {
+        .consume(agent_filter, |payload, _frame| {
             let _ = writeln!(out, "{payload}");
             let _ = out.flush();
         })
@@ -1096,13 +1102,37 @@ mod tests {
         let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
 
         let mut puits: Vec<u8> = Vec::new();
-        stream_task_events_into(&base, "jeton-de-test", &mut puits)
+        stream_task_events_into(&base, "jeton-de-test", None, &mut puits)
             .await
             .unwrap();
 
         assert_eq!(
             String::from_utf8(puits).unwrap(),
             "{\"task_id\":\"t-1\"}\n{\"task_id\":\"t-2\"}\n{\"task_id\":\"t-3\"}\n"
+        );
+    }
+
+    /// `mika tasks stream --agent <id>` n'écrit que les lignes de cet agent.
+    /// C'est ce test qui fait du flag un **lecteur mesuré** du filtre : l'égalité
+    /// porte sur tout le puits, donc une ligne fuitée rougit autant qu'une ligne
+    /// perdue, et la sortie reste la charge **brute** — le décodage voyage pour
+    /// le filtre, pas pour changer la forme de l'écriture.
+    #[tokio::test]
+    async fn mika1727_v2b2a_mika_tasks_stream_agent_necrit_que_les_lignes_de_lagent_demande() {
+        let charges = [
+            r#"{"event":"task_completed","task_id":"t-1","agent_id":"mika-dev","completed_at":"2026-11-09T10:00:00Z","result_preview":null}"#,
+            r#"{"event":"task_completed","task_id":"t-2","agent_id":"mika-qa","completed_at":"2026-11-09T10:00:01Z","result_preview":null}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut puits: Vec<u8> = Vec::new();
+        stream_task_events_into(&base, "jeton-de-test", Some("mika-dev"), &mut puits)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(puits).unwrap(),
+            format!("{}\n", charges[0])
         );
     }
 
