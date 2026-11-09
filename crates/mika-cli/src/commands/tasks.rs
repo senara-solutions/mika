@@ -1004,6 +1004,51 @@ mod tests {
         assert_eq!(buffer, b"data: {\"task_id\":\"t-2\"");
     }
 
+    /// Le consommateur s'ouvre sur une URL et un jeton **donnés**, et rend ses
+    /// trames une fois chacune, dans l'ordre : une trame perdue ou doublée fait
+    /// rougir l'égalité.
+    #[tokio::test]
+    async fn mika1727_v2b1b_le_consommateur_rend_ses_trames_dans_lordre() {
+        let charges = [
+            r#"{"task_id":"t-1","status":"pending"}"#,
+            r#"{"task_id":"t-2","status":"in_progress"}"#,
+            r#"{"task_id":"t-3","status":"completed"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let flux = TaskEventStream::open(&base, "jeton-de-test").await.unwrap();
+        let mut rendues: Vec<String> = Vec::new();
+        flux.consume(|charge| rendues.push(charge.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(rendues, charges);
+    }
+
+    /// `mika tasks stream` écrit une ligne par charge `data:` et **rien
+    /// d'autre** : l'assertion est une égalité sur tout le puits, jamais un
+    /// `contains`. Les deux lignes de connexion partent sur stderr, donc leur
+    /// absence d'ici *est* la mesure de « rien d'autre » — pas une redite.
+    #[tokio::test]
+    async fn mika1727_v2b1b_mika_tasks_stream_ecrit_une_ligne_par_charge_et_rien_dautre() {
+        let charges = [
+            r#"{"task_id":"t-1"}"#,
+            r#"{"task_id":"t-2"}"#,
+            r#"{"task_id":"t-3"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut puits: Vec<u8> = Vec::new();
+        stream_task_events_into(&base, "jeton-de-test", &mut puits)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(puits).unwrap(),
+            "{\"task_id\":\"t-1\"}\n{\"task_id\":\"t-2\"}\n{\"task_id\":\"t-3\"}\n"
+        );
+    }
+
     // -- the terminal filter reaches the operator's surface (mika#2670) --
 
     /// A callback row, as `dispatch-lib` leaves it: the pgid on the row itself,
@@ -1516,5 +1561,67 @@ mod tests {
             read_handler_failure(Some(r#"{"handler_failure":"a string"}"#)).is_none(),
             "the key present but not the expected shape"
         );
+    }
+}
+
+/// Un serveur SSE factice pour le flux task-events de mika-spirit, sur le patron
+/// `axum::serve` du crate (`commands/chat_turn.rs`, `commands/agents.rs`,
+/// `budget_floor.rs`).
+///
+/// **`pub(crate)` pour que le vol V2b-2 le reprenne** depuis les tests de la
+/// TUI, au lieu d'en écrire un second.
+///
+/// Deux choses sur son emplacement, qui ne sont pas des détails de goût :
+///
+/// - c'est un **bloc** `#[cfg(test)] pub(crate) mod …`, et non un `#[cfg(test)]`
+///   posé sur des `fn` isolées : le scanner egress
+///   (`scripts/lib/egress_manifest_lint.py`) n'écarte le code de test que sous
+///   cette forme, et une `fn` annotée seule serait lue comme de la production ;
+/// - il est posé **après** le module `tests`, en fin de fichier, là où la coupure
+///   du scanner a déjà eu lieu. Le placer plus haut déplacerait cette coupure
+///   vers lui et rendrait invisibles au lint toutes les lignes qui suivent.
+#[cfg(test)]
+pub(crate) mod fake_spirit {
+    use axum::Router;
+    use axum::routing::get;
+    use tokio::net::TcpListener;
+
+    /// Encode une suite de charges en un corps SSE : un événement par charge,
+    /// terminé par `\n\n`.
+    pub(crate) fn sse_payload(charges: &[&str]) -> String {
+        charges
+            .iter()
+            .map(|charge| format!("data: {charge}\n\n"))
+            .collect()
+    }
+
+    /// Sert `payload` sur `/api/v1/dashboard/tasks/stream`, puis ferme.
+    ///
+    /// Le corps est **fini** : à la fermeture `consume` rend `Ok(())`, donc un
+    /// test assertant toute la séquence s'arrête de lui-même, sans timeout ni
+    /// `abort`. Un flux qui reste ouvert est ce dont la souscription de la TUI
+    /// aura besoin (vol V2b-2) ; il arrivera avec son appelant, pas avant.
+    ///
+    /// Rend l'URL de **base**, celle que [`super::TaskEventStream::open`]
+    /// complète.
+    pub(crate) async fn spawn(payload: String) -> String {
+        let router = Router::new().route(
+            "/api/v1/dashboard/tasks/stream",
+            get(move || {
+                let corps = payload.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(corps))
+                        .expect("corps SSE factice")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        format!("http://{addr}")
     }
 }
