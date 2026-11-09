@@ -406,68 +406,146 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
 /// print each `TaskEventFrame` JSON payload to stdout (one line per frame).
 ///
 /// Diagnostic — not integrated into the TUI. mika#1727 handles TUI consumption.
+///
+/// Resolving the base URL and the bearer token lives **here**, never under
+/// [`TaskEventStream::open`]: `dashboard::auth_token` reads the process
+/// environment and fails without it, so a consumer resolving its own
+/// credentials could not be driven from a test at all (mika#1727 vol V2b-1b).
 async fn stream_task_events(url_override: Option<String>) -> Result<()> {
-    use std::io::Write;
-
     let base_url = url_override.unwrap_or_else(crate::commands::dashboard::spirit_url);
-    let stream_url = format!(
-        "{}/api/v1/dashboard/tasks/stream",
-        base_url.trim_end_matches('/')
-    );
     let token = crate::commands::dashboard::auth_token()?;
 
-    eprintln!("mika#1758 task-event stream: connecting to {stream_url}");
-    let client = reqwest::Client::new();
-    let mut resp = client
-        .get(&stream_url)
-        .header("authorization", format!("Bearer {token}"))
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .with_context(|| format!("failed to open SSE stream at {stream_url}"))?;
+    eprintln!(
+        "mika#1758 task-event stream: connecting to {}",
+        stream_url(&base_url)
+    );
+    stream_task_events_into(&base_url, &token, &mut std::io::stdout()).await
+}
 
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!(
-            "mika-spirit returned {} for {}: {}",
-            status,
-            stream_url,
-            resp.text().await.unwrap_or_default()
-        );
-    }
+/// `mika tasks stream`, with its output sink as a parameter.
+///
+/// The sink is a parameter because the property to hold is "one line per `data:`
+/// payload, **and nothing else**", and that is only measurable by comparing the
+/// whole stream to an expected string — which `std::io::stdout()` does not allow
+/// from a Rust test without a subprocess. The two `eprintln!` stay on stderr and
+/// are therefore absent from the sink: that absence *is* the measurement of
+/// "nothing else", not a restatement of it.
+async fn stream_task_events_into<W: std::io::Write>(
+    base_url: &str,
+    token: &str,
+    out: &mut W,
+) -> Result<()> {
+    let stream = TaskEventStream::open(base_url, token).await?;
     eprintln!("mika#1758 task-event stream: connected. Streaming frames (Ctrl-C to stop).");
 
-    // Minimal SSE frame parser: buffer bytes, split on double-newline event
-    // separator, extract `data: <payload>` lines. Using `Response::chunk()`
-    // avoids pulling the `futures-util` `Stream` extension (workspace dep is
-    // `default-features = false`).
-    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    let stdout = std::io::stdout();
+    stream
+        .consume(|payload| {
+            let _ = writeln!(out, "{payload}");
+            let _ = out.flush();
+        })
+        .await
+}
 
-    while let Some(chunk) = resp.chunk().await.context("SSE stream read failed")? {
-        buffer.extend_from_slice(&chunk);
+/// The task-events stream URL for a mika-spirit base URL.
+fn stream_url(base_url: &str) -> String {
+    format!(
+        "{}/api/v1/dashboard/tasks/stream",
+        base_url.trim_end_matches('/')
+    )
+}
 
-        // Split on SSE event separator (`\r\n\r\n` / `\n\n` / `\r\r`, spec
-        // § 9.2). Keep the trailing partial event in the buffer for the
-        // next iteration.
-        while let Some((sep_idx, sep_len)) = find_event_separator(&buffer) {
-            let event_bytes: Vec<u8> = buffer.drain(..sep_idx + sep_len).collect();
-            // Drop the trailing separator; parse the remainder line-by-line.
-            let event_str = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - sep_len]);
-            for line in event_str.split(['\n', '\r']) {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim_start();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    let mut handle = stdout.lock();
-                    writeln!(handle, "{data}").ok();
-                    handle.flush().ok();
+/// An open task-events stream.
+///
+/// Opening and reading are two gestures rather than one call, because the
+/// callers tell them apart: `mika tasks stream` prints "connected" **between**
+/// the two — a connected-but-idle wire must not read as a hung one — and the
+/// TUI's subscription (vol V2b-2) backs off on a failed **open** while an ended
+/// stream is only a reconnect. A single call would make both the same `Err`.
+pub(crate) struct TaskEventStream {
+    resp: reqwest::Response,
+}
+
+impl TaskEventStream {
+    /// Open the stream against `base_url`, authenticating with `token`.
+    ///
+    /// Both travel by argument and nothing is resolved under here, so a caller
+    /// — a test against a throwaway server included — can drive the consumer
+    /// without touching the process environment the two `dashboard` resolvers
+    /// read.
+    ///
+    /// A non-success status fails explicitly, body included: a stream that
+    /// silently yields nothing is indistinguishable from an agent with no task.
+    pub(crate) async fn open(base_url: &str, token: &str) -> Result<Self> {
+        let url = stream_url(base_url);
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("authorization", format!("Bearer {token}"))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .with_context(|| format!("failed to open SSE stream at {url}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "mika-spirit returned {} for {}: {}",
+                status,
+                url,
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(Self { resp })
+    }
+
+    /// Read until the server closes the stream, handing every `data:` payload to
+    /// `on_payload` **as it came off the wire**, one at a time and in order.
+    ///
+    /// Nothing is deserialized here. The only caller of this flight relays
+    /// bytes, and a decode nobody reads is the same fault this promotion
+    /// corrects one layer up — vol V2b-2 brings the decode together with the
+    /// per-agent filter that reads it. Returns `Ok(())` on a clean close; the
+    /// caller decides whether to reconnect.
+    pub(crate) async fn consume(mut self, mut on_payload: impl FnMut(&str)) -> Result<()> {
+        // Minimal SSE frame parser: buffer bytes, split on the event separator,
+        // extract `data: <payload>` lines. Using `Response::chunk()` avoids
+        // pulling the `futures-util` `Stream` extension (workspace dep is
+        // `default-features = false`).
+        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+
+        while let Some(chunk) = self.resp.chunk().await.context("SSE stream read failed")? {
+            buffer.extend_from_slice(&chunk);
+            drain_events(&mut buffer, &mut on_payload);
+        }
+        Ok(())
+    }
+}
+
+/// Hand every **complete** event sitting in `buffer` to `on_payload`, and leave
+/// a trailing partial one in place for the next read.
+///
+/// A free function rather than the body of the read loop, because that is the
+/// only way to attest the re-splicing without depending on a timing: an event
+/// cut across two packets is a property of the **buffer**, and a test making the
+/// server emit in two `sleep`-separated writes would go green without measuring
+/// anything on the day a layer coalesced them.
+fn drain_events(buffer: &mut Vec<u8>, on_payload: &mut impl FnMut(&str)) {
+    // Split on SSE event separator (`\r\n\r\n` / `\n\n` / `\r\r`, spec § 9.2).
+    // Keep the trailing partial event in the buffer for the next read.
+    while let Some((sep_idx, sep_len)) = find_event_separator(buffer) {
+        let event_bytes: Vec<u8> = buffer.drain(..sep_idx + sep_len).collect();
+        // Drop the trailing separator; parse the remainder line-by-line.
+        let event_str = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - sep_len]);
+        for line in event_str.split(['\n', '\r']) {
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim_start();
+                if data.is_empty() {
+                    continue;
                 }
+                on_payload(data);
             }
         }
     }
-    Ok(())
 }
 
 /// Locate the first SSE event separator in the buffer, and return
@@ -860,6 +938,116 @@ fn task_to_json(t: &Task) -> Value {
 mod tests {
     use super::*;
     use mika_agent::db::OrphanedPendingTask;
+
+    // -- la découpe d'événements SSE est attestée (mika#1727, vol V2b-1b) --
+    //
+    // `find_event_separator` est arrivée ici avec le consommateur de diagnostic
+    // (mika#1758) et **rien ne la mesurait** : son doc-comment nomme l'ordre
+    // d'essai des trois terminateurs, et c'était une affirmation sur du code.
+    // Ces trois tests atterrissent **avant** que le consommateur bouge — écrits
+    // après, ils n'attesteraient que l'état d'arrivée du refactor.
+
+    #[test]
+    fn mika1727_v2b1b_les_trois_separateurs_sont_reconnus() {
+        assert_eq!(find_event_separator(b"data: x\n\n"), Some((7, 2)));
+        assert_eq!(find_event_separator(b"data: x\r\n\r\n"), Some((7, 4)));
+        assert_eq!(find_event_separator(b"data: x\r\r"), Some((7, 2)));
+        assert_eq!(find_event_separator(b"data: x\n"), None);
+    }
+
+    /// L'ordre d'essai est la moitié porteuse : un `\r\n\r\n` doit se lire comme
+    /// un seul terminateur de 4 octets, jamais comme le `\n\n` qui siège à
+    /// l'offset+1 — ce qui laisserait un `\r` orphelin en tête de l'événement
+    /// suivant.
+    #[test]
+    fn mika1727_v2b1b_un_crlfcrlf_nest_pas_lu_comme_un_lflf_decale() {
+        let (idx, len) = find_event_separator(b"a\r\n\r\nb").unwrap();
+        assert_eq!((idx, len), (1, 4));
+        assert_eq!(&b"a\r\n\r\nb"[idx + len..], b"b");
+    }
+
+    #[test]
+    fn mika1727_v2b1b_le_premier_separateur_gagne() {
+        assert_eq!(find_event_separator(b"a\n\nb\n\nc"), Some((1, 2)));
+    }
+
+    /// Le recollage se mesure sur le **tampon**, et pas sur une socket : un
+    /// serveur factice qui écrirait en deux paquets séparés d'un `sleep`
+    /// passerait au vert le jour où une couche les fusionne, sans plus rien
+    /// mesurer. Ici les deux moitiés sont choisies à la main, donc la coupure
+    /// est la propriété tenue et non un effet de cadence.
+    #[test]
+    fn mika1727_v2b1b_un_evenement_coupe_en_deux_paquets_est_rendu_entier_une_fois() {
+        let mut rendues: Vec<String> = Vec::new();
+        let mut buffer: Vec<u8> = Vec::new();
+
+        // Premier paquet : la charge est tronquée en plein milieu du JSON, et
+        // aucun séparateur n'est encore arrivé.
+        buffer.extend_from_slice(b"data: {\"task_id\":\"t-1\",\"sta");
+        drain_events(&mut buffer, &mut |charge: &str| {
+            rendues.push(charge.to_string())
+        });
+        assert!(
+            rendues.is_empty(),
+            "un événement incomplet ne doit rien rendre : {rendues:?}"
+        );
+
+        // Second paquet : la fin de la charge, son séparateur, puis le début
+        // d'un troisième événement qui doit rester en attente.
+        buffer.extend_from_slice(b"tus\":\"done\"}\n\ndata: {\"task_id\":\"t-2\"");
+        drain_events(&mut buffer, &mut |charge: &str| {
+            rendues.push(charge.to_string())
+        });
+        assert_eq!(rendues, vec![r#"{"task_id":"t-1","status":"done"}"#]);
+
+        // Et le résidu est conservé tel quel pour la lecture suivante.
+        assert_eq!(buffer, b"data: {\"task_id\":\"t-2\"");
+    }
+
+    /// Le consommateur s'ouvre sur une URL et un jeton **donnés**, et rend ses
+    /// trames une fois chacune, dans l'ordre : une trame perdue ou doublée fait
+    /// rougir l'égalité.
+    #[tokio::test]
+    async fn mika1727_v2b1b_le_consommateur_rend_ses_trames_dans_lordre() {
+        let charges = [
+            r#"{"task_id":"t-1","status":"pending"}"#,
+            r#"{"task_id":"t-2","status":"in_progress"}"#,
+            r#"{"task_id":"t-3","status":"completed"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let flux = TaskEventStream::open(&base, "jeton-de-test").await.unwrap();
+        let mut rendues: Vec<String> = Vec::new();
+        flux.consume(|charge| rendues.push(charge.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(rendues, charges);
+    }
+
+    /// `mika tasks stream` écrit une ligne par charge `data:` et **rien
+    /// d'autre** : l'assertion est une égalité sur tout le puits, jamais un
+    /// `contains`. Les deux lignes de connexion partent sur stderr, donc leur
+    /// absence d'ici *est* la mesure de « rien d'autre » — pas une redite.
+    #[tokio::test]
+    async fn mika1727_v2b1b_mika_tasks_stream_ecrit_une_ligne_par_charge_et_rien_dautre() {
+        let charges = [
+            r#"{"task_id":"t-1"}"#,
+            r#"{"task_id":"t-2"}"#,
+            r#"{"task_id":"t-3"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut puits: Vec<u8> = Vec::new();
+        stream_task_events_into(&base, "jeton-de-test", &mut puits)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(puits).unwrap(),
+            "{\"task_id\":\"t-1\"}\n{\"task_id\":\"t-2\"}\n{\"task_id\":\"t-3\"}\n"
+        );
+    }
 
     // -- the terminal filter reaches the operator's surface (mika#2670) --
 
@@ -1373,5 +1561,67 @@ mod tests {
             read_handler_failure(Some(r#"{"handler_failure":"a string"}"#)).is_none(),
             "the key present but not the expected shape"
         );
+    }
+}
+
+/// Un serveur SSE factice pour le flux task-events de mika-spirit, sur le patron
+/// `axum::serve` du crate (`commands/chat_turn.rs`, `commands/agents.rs`,
+/// `budget_floor.rs`).
+///
+/// **`pub(crate)` pour que le vol V2b-2 le reprenne** depuis les tests de la
+/// TUI, au lieu d'en écrire un second.
+///
+/// Deux choses sur son emplacement, qui ne sont pas des détails de goût :
+///
+/// - c'est un **bloc** `#[cfg(test)] pub(crate) mod …`, et non un `#[cfg(test)]`
+///   posé sur des `fn` isolées : le scanner egress
+///   (`scripts/lib/egress_manifest_lint.py`) n'écarte le code de test que sous
+///   cette forme, et une `fn` annotée seule serait lue comme de la production ;
+/// - il est posé **après** le module `tests`, en fin de fichier, là où la coupure
+///   du scanner a déjà eu lieu. Le placer plus haut déplacerait cette coupure
+///   vers lui et rendrait invisibles au lint toutes les lignes qui suivent.
+#[cfg(test)]
+pub(crate) mod fake_spirit {
+    use axum::Router;
+    use axum::routing::get;
+    use tokio::net::TcpListener;
+
+    /// Encode une suite de charges en un corps SSE : un événement par charge,
+    /// terminé par `\n\n`.
+    pub(crate) fn sse_payload(charges: &[&str]) -> String {
+        charges
+            .iter()
+            .map(|charge| format!("data: {charge}\n\n"))
+            .collect()
+    }
+
+    /// Sert `payload` sur `/api/v1/dashboard/tasks/stream`, puis ferme.
+    ///
+    /// Le corps est **fini** : à la fermeture `consume` rend `Ok(())`, donc un
+    /// test assertant toute la séquence s'arrête de lui-même, sans timeout ni
+    /// `abort`. Un flux qui reste ouvert est ce dont la souscription de la TUI
+    /// aura besoin (vol V2b-2) ; il arrivera avec son appelant, pas avant.
+    ///
+    /// Rend l'URL de **base**, celle que [`super::TaskEventStream::open`]
+    /// complète.
+    pub(crate) async fn spawn(payload: String) -> String {
+        let router = Router::new().route(
+            "/api/v1/dashboard/tasks/stream",
+            get(move || {
+                let corps = payload.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(corps))
+                        .expect("corps SSE factice")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        format!("http://{addr}")
     }
 }
