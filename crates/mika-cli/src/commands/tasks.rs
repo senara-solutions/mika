@@ -1195,6 +1195,78 @@ mod tests {
         assert_eq!(frame_agent_id(&TaskEventFrame::Unknown), None);
     }
 
+    /// Les charges de test sont des JSON **littéraux**, et non des
+    /// `TaskEventFrame` sérialisés : un aller-retour `to_string` → `from_str` du
+    /// même type ne mesurerait que la symétrie de serde avec elle-même, et
+    /// resterait vert le jour où le tag cesserait d'être `event` — c'est-à-dire
+    /// le jour où le consommateur cesserait de comprendre ce que le serveur
+    /// émet. Le littéral épingle le format du **fil**, qui est le contrat réel
+    /// entre `mika-agent` et `mika-cli`.
+    ///
+    /// Le contrôle négatif vit dans ce test : sous `None`, les trois trames
+    /// passent. Sans lui, un filtre qui écarterait *tout* serait vert.
+    #[tokio::test]
+    async fn mika1727_v2b2a_une_trame_dun_autre_agent_est_ecartee_du_fil() {
+        let charges = [
+            r#"{"event":"task_claimed","task_id":"t-1","agent_id":"mika-dev","claimed_at":"2026-11-09T10:00:00Z"}"#,
+            r#"{"event":"task_claimed","task_id":"t-2","agent_id":"mika-qa","claimed_at":"2026-11-09T10:00:01Z"}"#,
+            r#"{"event":"task_completed","task_id":"t-3","agent_id":"mika-dev","completed_at":"2026-11-09T10:00:02Z","result_preview":"fait"}"#,
+        ];
+
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+        let mut filtrees: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(Some("mika-dev"), |charge, _| {
+                filtrees.push(charge.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtrees, vec![charges[0], charges[2]]);
+
+        let mut toutes: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(None, |charge, _| toutes.push(charge.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(toutes, charges);
+    }
+
+    /// Le filtre n'écarte que ce qu'il a **compris** comme étranger. Un
+    /// `overflow_marker` dit à un consommateur filtré qu'il a perdu des trames,
+    /// dont peut-être les siennes : l'écarter serait perdre la seule information
+    /// qui dit que l'information manque.
+    ///
+    /// L'égalité porte sur toute la séquence, ce qui mesure du même coup que
+    /// `consume` est allée **jusqu'au bout du corps** : une charge indécodable
+    /// qui interromprait la lecture tronquerait la séquence au lieu de la
+    /// changer.
+    #[tokio::test]
+    async fn mika1727_v2b2a_le_filtre_laisse_passer_ce_quil_ne_comprend_pas() {
+        let charges = [
+            r#"{"event":"overflow_marker","dropped_count":3}"#,
+            r#"{"event":"trame_du_futur","task_id":"t-9","agent_id":"mika-qa"}"#,
+            r#"ceci n'est pas du JSON"#,
+            r#"{"event":"task_failed","task_id":"t-2","agent_id":"mika-qa","failed_at":"2026-11-09T10:00:01Z","error_preview":null}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut rendues: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(Some("mika-dev"), |charge, _| {
+                rendues.push(charge.to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rendues, vec![charges[0], charges[1], charges[2]]);
+    }
+
     // -- the terminal filter reaches the operator's surface (mika#2670) --
 
     /// A callback row, as `dispatch-lib` leaves it: the pgid on the row itself,
