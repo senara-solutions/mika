@@ -861,6 +861,38 @@ mod tests {
     use super::*;
     use mika_agent::db::OrphanedPendingTask;
 
+    // -- la découpe d'événements SSE est attestée (mika#1727, vol V2b-1b) --
+    //
+    // `find_event_separator` est arrivée ici avec le consommateur de diagnostic
+    // (mika#1758) et **rien ne la mesurait** : son doc-comment nomme l'ordre
+    // d'essai des trois terminateurs, et c'était une affirmation sur du code.
+    // Ces trois tests atterrissent **avant** que le consommateur bouge — écrits
+    // après, ils n'attesteraient que l'état d'arrivée du refactor.
+
+    #[test]
+    fn mika1727_v2b1b_les_trois_separateurs_sont_reconnus() {
+        assert_eq!(find_event_separator(b"data: x\n\n"), Some((7, 2)));
+        assert_eq!(find_event_separator(b"data: x\r\n\r\n"), Some((7, 4)));
+        assert_eq!(find_event_separator(b"data: x\r\r"), Some((7, 2)));
+        assert_eq!(find_event_separator(b"data: x\n"), None);
+    }
+
+    /// L'ordre d'essai est la moitié porteuse : un `\r\n\r\n` doit se lire comme
+    /// un seul terminateur de 4 octets, jamais comme le `\n\n` qui siège à
+    /// l'offset+1 — ce qui laisserait un `\r` orphelin en tête de l'événement
+    /// suivant.
+    #[test]
+    fn mika1727_v2b1b_un_crlfcrlf_nest_pas_lu_comme_un_lflf_decale() {
+        let (idx, len) = find_event_separator(b"a\r\n\r\nb").unwrap();
+        assert_eq!((idx, len), (1, 4));
+        assert_eq!(&b"a\r\n\r\nb"[idx + len..], b"b");
+    }
+
+    #[test]
+    fn mika1727_v2b1b_le_premier_separateur_gagne() {
+        assert_eq!(find_event_separator(b"a\n\nb\n\nc"), Some((1, 2)));
+    }
+
     // -- the terminal filter reaches the operator's surface (mika#2670) --
 
     /// A callback row, as `dispatch-lib` leaves it: the pgid on the row itself,
