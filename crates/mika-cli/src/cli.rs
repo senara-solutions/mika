@@ -1060,6 +1060,12 @@ pub enum TaskCommand {
         id: String,
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+        /// Read the detail from mika-spirit over HTTP instead of the local DB
+        /// (mika#1727). The server reads by **exact** id, so no prefix is
+        /// resolved, and pilot liveness — a local measurement this door has no
+        /// answer for — is not probed.
+        #[arg(long)]
+        spirit: bool,
     },
     /// Cancel a task by ID (from `mika tasks`)
     Cancel {
