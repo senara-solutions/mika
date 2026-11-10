@@ -499,6 +499,76 @@ fn frame_agent_id(frame: &TaskEventFrame) -> Option<&str> {
     }
 }
 
+/// La tâche et l'`original_status` qu'une trame **terminale** nomme.
+///
+/// Jumelle de [`frame_agent_id`] : une lecture de variante, rien d'autre. Elle
+/// vit donc ici et non dans `tui/app.rs`, ce qui laisse la TUI sans aucune
+/// connaissance du format du fil — la même frontière que « aucun client HTTP
+/// dans `tui/app.rs` » trace. La doc d'exhaustivité ci-dessus vaut mot pour mot
+/// pour ce `match`-ci : **pas de bras `_ => None`**, parce qu'une variante neuve
+/// portant un `task_id` tomberait silencieusement hors du chemin des callbacks.
+///
+/// **L'`original_status` vient de la variante, et de rien d'autre.**
+/// `mark_task_delivered` passe la ligne à `delivered` avant que le
+/// `CallbackResult` ne se bâtisse, donc le `status` du détail dirait `delivered`
+/// et serait faux. Le miroir **porte** ce champ — les trois formats le rendent —
+/// si bien que l'interdit est dit ici et attesté par un test, pas structurel.
+pub(crate) fn terminal_callback_frame(frame: &TaskEventFrame) -> Option<(&str, &'static str)> {
+    match frame {
+        TaskEventFrame::TaskCompleted { task_id, .. } => Some((task_id, "completed")),
+        TaskEventFrame::TaskFailed { task_id, .. } => Some((task_id, "failed")),
+        TaskEventFrame::TaskCreated { .. }
+        | TaskEventFrame::TaskClaimed { .. }
+        | TaskEventFrame::TaskDelivered { .. }
+        | TaskEventFrame::TaskCancelled { .. }
+        | TaskEventFrame::OverflowMarker { .. }
+        | TaskEventFrame::Unknown => None,
+    }
+}
+
+/// Ouvrir le fil des tâches **une fois** et pousser sur un canal les callbacks
+/// terminés de `agent_id`, en couples `(task_id, original_status)`.
+///
+/// Le canal porte exactement ce que la variante sait dire, et rien de plus : le
+/// détail se lit du côté du drainage, parce que la fermeture de
+/// [`TaskEventStream::consume`] est **synchrone** et qu'aucun des quatre gestes
+/// de la livraison — lire le détail, appliquer le prédicat, réclamer, livrer —
+/// n'est autre que `async`. Les trames d'un autre agent sont écartées par
+/// `consume`, les non-terminales par [`terminal_callback_frame`] : le canal ne
+/// reçoit donc que des candidats, jamais le fil brut.
+///
+/// **Une seule ouverture, aucun recul, aucune reconnexion** (vol V2b-2b-3). Un
+/// échec d'ouverture ou une fin de flux arrête la tâche et rien ne la relance.
+/// Ce que ça coûte, nommé plutôt que découvert : à partir de cet instant les
+/// callbacks de cette conversation n'arrivent plus que par `poll_callback_tasks`,
+/// toutes les `POLL_INTERVAL_TICKS`. C'est une dégradation de latence, pas une
+/// perte — et c'est pourquoi le poll reste le filet de ce vol.
+pub(crate) fn spawn_callback_subscription(
+    agent_id: String,
+    base_url: String,
+    token: String,
+) -> tokio::sync::mpsc::UnboundedReceiver<(String, &'static str)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let flux = match TaskEventStream::open(&base_url, &token).await {
+            Ok(flux) => flux,
+            Err(e) => {
+                tracing::warn!("task-events subscription failed to open: {e:#}");
+                return;
+            }
+        };
+        let issue = flux
+            .consume(Some(&agent_id), |_, trame| {
+                if let Some((task_id, original_status)) = trame.and_then(terminal_callback_frame) {
+                    let _ = tx.send((task_id.to_string(), original_status));
+                }
+            })
+            .await;
+        tracing::debug!("task-events subscription ended: {issue:?}");
+    });
+    rx
+}
+
 /// An open task-events stream.
 ///
 /// Opening and reading are two gestures rather than one call, because the
@@ -613,7 +683,8 @@ impl TaskEventStream {
 /// La visibilité le dit champ par champ. `label`, `result`, `created_trace_id` et
 /// `parent_task_id` sont `pub(crate)` parce que le drainage les lit depuis
 /// `tui/app.rs`. Les six autres restent **privés** : leur seul lecteur hors des
-/// trois formats est le prédicat du poll, qui est une méthode d'ici.
+/// trois formats est [`TaskDetailMirror::is_resume_callback_for`], qui est une
+/// méthode d'ici.
 #[derive(serde::Deserialize, serde::Serialize)]
 pub(crate) struct TaskDetailMirror {
     id: String,
@@ -626,6 +697,32 @@ pub(crate) struct TaskDetailMirror {
     pub(crate) result: Option<String>,
     pub(crate) created_trace_id: Option<String>,
     pub(crate) parent_task_id: Option<String>,
+}
+
+impl TaskDetailMirror {
+    /// Le détail est-il un callback de reprise **de cette conversation** ?
+    ///
+    /// Les quatre colonnes de `get_undelivered_callback_tasks_for_session`
+    /// (`crates/mika-agent/src/db/tasks.rs`), dans l'ordre où son SQL les écrit :
+    /// la livraison par le fil applique **le prédicat du poll**, et non un
+    /// prédicat voisin qui divergerait au premier changement de l'un des deux.
+    ///
+    /// Une méthode du miroir et non une fonction de `tui/app.rs`, parce que
+    /// quatre des cinq champs qu'elle lit n'ont aucun autre lecteur hors de ce
+    /// module : posée dehors, elle les rendrait tous `pub(crate)` et le miroir
+    /// perdrait son énoncé « chaque champ a son lecteur, et pas un de plus ».
+    ///
+    /// **Les deux colonnes du poll qui n'y sont pas** ne manquent pas, elles
+    /// sont dites ailleurs : `status IN ('completed','failed')` l'est par la
+    /// variante de la trame, puis une seconde fois en SQL par
+    /// `mark_task_delivered` ; `completed_at NOT NULL` l'est par construction,
+    /// une trame terminale étant émise **à la transition**.
+    pub(crate) fn is_resume_callback_for(&self, agent_id: &str, session_id: &str) -> bool {
+        self.agent_id == agent_id
+            && self.trigger_type == "callback"
+            && self.action_type == "resume_agent"
+            && self.created_by_session.as_deref() == Some(session_id)
+    }
 }
 
 /// Lire `GET /api/v1/tasks/{task_id}` sur mika-spirit.
@@ -2063,6 +2160,20 @@ pub(crate) mod fake_spirit {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
+    /// Mettre `router` en écoute sur un port libre et rendre son URL de base.
+    ///
+    /// La queue des trois constructeurs — `bind`, `local_addr`, `tokio::spawn`,
+    /// `format!` — était écrite trois fois à l'identique. Trois lignes dupliquées
+    /// valent mieux qu'une abstraction, neuf non.
+    async fn servir(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        format!("http://{addr}")
+    }
+
     /// Encode une suite de charges en un corps SSE : un événement par charge,
     /// terminé par `\n\n`.
     pub(crate) fn sse_payload(charges: &[&str]) -> String {
@@ -2094,12 +2205,7 @@ pub(crate) mod fake_spirit {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, router.into_make_service()).await;
-        });
-        format!("http://{addr}")
+        servir(router).await
     }
 
     /// L'en-tête `authorization` tel que la socket l'a reçu, `None` avant la requête.
@@ -2133,11 +2239,60 @@ pub(crate) mod fake_spirit {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, router.into_make_service()).await;
-        });
-        (format!("http://{addr}"), recu)
+        (servir(router).await, recu)
+    }
+
+    /// Sert le flux **et** les détails sur une **même** URL de base, parce que la
+    /// TUI n'en connaît qu'une : `flux` sur `/api/v1/dashboard/tasks/stream`, et
+    /// `details` — des triplets `(task_id, statut, corps)` — sur
+    /// `/api/v1/tasks/{task_id}`, résolus par identifiant dans une table
+    /// partagée. Un identifiant hors table rend un 404, comme le vrai serveur.
+    ///
+    /// Le corps SSE reste **fini** : sans reconnexion, un test assertant toute la
+    /// séquence s'arrête de lui-même, sans timeout ni `abort`. La variante au flux
+    /// jamais fermé arrive au vol qui la sert (V2b-2b-3).
+    pub(crate) async fn spawn_stream_and_details(
+        flux: String,
+        details: Vec<(String, u16, String)>,
+    ) -> String {
+        let table: Arc<std::collections::HashMap<String, (u16, String)>> = Arc::new(
+            details
+                .into_iter()
+                .map(|(id, statut, corps)| (id, (statut, corps)))
+                .collect(),
+        );
+        let router = Router::new()
+            .route(
+                "/api/v1/dashboard/tasks/stream",
+                get(move || {
+                    let corps = flux.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(corps))
+                            .expect("corps SSE factice")
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/tasks/{task_id}",
+                get(
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        let table = Arc::clone(&table);
+                        async move {
+                            let (statut, corps) = table.get(&id).cloned().unwrap_or((
+                                404,
+                                format!(r#"{{"error":"task '{id}' not found"}}"#),
+                            ));
+                            axum::response::Response::builder()
+                                .status(statut)
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(corps))
+                                .expect("corps de détail factice")
+                        }
+                    },
+                ),
+            );
+        servir(router).await
     }
 }

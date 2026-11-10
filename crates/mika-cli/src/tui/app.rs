@@ -651,6 +651,23 @@ pub struct App<'a> {
 
     /// Pending dashboard action from footer button click (processed in tick).
     pub pending_dashboard_action: Option<DashboardAction>,
+
+    /// Les callbacks terminés que le fil des tâches de mika-spirit a annoncés,
+    /// en couples `(task_id, original_status)` (mika#1727, vol V2b-2b-2).
+    ///
+    /// `None` quand rien n'est abonné, et c'est le cas nominal de deux chemins :
+    /// le mode équipe, où `run_team` n'a pas le site de spawn, et une TUI sans
+    /// jeton pour le démon. Dans les deux cas le drainage sort au premier
+    /// `try_recv` et `poll_callback_tasks` couvre.
+    pub task_event_rx: Option<mpsc::UnboundedReceiver<(String, &'static str)>>,
+    /// L'URL de base de mika-spirit, résolue **une fois** par `chat::run`.
+    ///
+    /// Elle voyage par champ et non par variable d'environnement : `MIKA_SPIRIT_URL`
+    /// est un état global que les tests `cargo` parallèles se disputent, et c'est
+    /// cette couture qui laisse un test viser un `axum::Router` jetable.
+    pub spirit_base_url: Option<String>,
+    /// Le jeton interne de mika-spirit, résolu **une fois** par `chat::run`.
+    pub spirit_token: Option<String>,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -740,6 +757,9 @@ impl<'a> App<'a> {
             footer_open_rect: None,
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
+            task_event_rx: None,
+            spirit_base_url: None,
+            spirit_token: None,
         }
     }
 
@@ -833,6 +853,9 @@ impl<'a> App<'a> {
             footer_open_rect: None,
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
+            task_event_rx: None,
+            spirit_base_url: None,
+            spirit_token: None,
         }
     }
 
@@ -1115,6 +1138,14 @@ impl<'a> App<'a> {
             self.executing_task_count = counts.executing;
             self.queued_task_count = counts.queued;
             self.needs_redraw = true;
+        }
+
+        // Livraison par le fil (mika#1727, vol V2b-2b-2) : à l'endroit et sous la
+        // condition du poll, mais **sans** `POLL_INTERVAL_TICKS` — c'est tout
+        // l'intérêt, la latence devient celle du fil au lieu des ~5 s du poll qui
+        // suit et qui reste le filet.
+        if !self.is_team_mode() && self.status == AgentStatus::Idle {
+            self.drain_callback_deliveries().await;
         }
 
         // Callback delivery polling: check for completed-but-undelivered callback tasks.
@@ -1589,6 +1620,86 @@ impl<'a> App<'a> {
             self.last_seen_msg_id = last.id;
         }
         // Auto-scroll: stays at bottom if scroll_offset == 0; preserves position otherwise.
+        self.needs_redraw = true;
+    }
+
+    /// Livrer **au plus un** callback annoncé par le fil des tâches (mika#1727).
+    ///
+    /// Six gestes dans l'ordre, et chacun des cinq premiers peut sortir sans
+    /// livrer **ni réclamer** : un `Err` du détail laisse la ligne `completed` et
+    /// le poll la reprendra au tour suivant ; un prédicat faux écarte la tâche
+    /// d'un autre agent, d'une autre session, ou qui n'est pas un callback de
+    /// reprise ; un `Ok(false)` de la réclamation dit que le poll ou une autre
+    /// TUI l'a déjà prise.
+    ///
+    /// **Aucune boucle, et c'est un choix mesuré.** Le poll boucle parce qu'il
+    /// reçoit une liste et doit sauter les échecs anciens. Ici tout ce qui est sur
+    /// le canal est déjà un candidat — `consume` a filtré l'agent,
+    /// `terminal_callback_frame` les trames non terminales — et un élément
+    /// consommé qui ne livre pas coûte un tick de 30 ms, soit 167 fois plus serré
+    /// que le poll qu'il double.
+    ///
+    /// **La duplication des gestes 4 à 6 avec `poll_callback_tasks` est assumée,
+    /// pas subie** : ce vol a pour critère de ne pas toucher au poll, qui est son
+    /// filet. Les deux copies vivent exactement un vol — V2b-3 retire le poll et
+    /// la duplication avec lui.
+    async fn drain_callback_deliveries(&mut self) {
+        let (Some(rx), Some(base_url), Some(token)) = (
+            self.task_event_rx.as_mut(),
+            self.spirit_base_url.as_deref(),
+            self.spirit_token.as_deref(),
+        ) else {
+            return;
+        };
+        let Ok((task_id, original_status)) = rx.try_recv() else {
+            return;
+        };
+
+        let detail = match crate::commands::tasks::fetch_task_detail(base_url, token, &task_id)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!(task_id = %task_id, "callback detail unreadable, left unclaimed: {e:#}");
+                return;
+            }
+        };
+        if !detail.is_resume_callback_for(self.db.agent_id(), &self.session_id) {
+            return;
+        }
+
+        match self.db.mark_task_delivered(&task_id).await {
+            Ok(true) => {}
+            Ok(false) => return, // le poll ou une autre TUI l'a prise
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, "failed to mark task delivered: {e}");
+                return;
+            }
+        }
+
+        // La règle du poll à l'identique : un `completed` sans résultat est sauté,
+        // un `failed` sans résultat prend le repli.
+        let result = match detail.result {
+            Some(r) if !r.is_empty() => r,
+            _ if original_status == "failed" => mika_agent::agent::FAILED_TASK_FALLBACK.to_string(),
+            _ => return,
+        };
+
+        self.messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: format!("[{}] {}", detail.label, original_status),
+            rendered: None,
+            channel: None,
+        });
+        let _ = self.agent_tx.send(AgentRequest::CallbackResult {
+            task_id,
+            label: detail.label,
+            result,
+            trace_id: detail.created_trace_id,
+            original_status: original_status.to_string(),
+            parent_task_id: detail.parent_task_id,
+        });
+        self.status = AgentStatus::Thinking;
         self.needs_redraw = true;
     }
 

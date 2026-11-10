@@ -559,6 +559,25 @@ pub async fn run(
         is_singleton_session, // single-session-by-nature (mika#1401)
     );
 
+    // L'abonnement au fil des tâches part d'ici et non du constructeur ni du tick
+    // (mika#1727, vol V2b-2b-2) : le constructeur a des appelants de test hors de
+    // tout runtime tokio, où un `tokio::spawn` paniquerait, et au tick il faudrait
+    // distinguer « pas encore démarré » de « mort » toutes les 30 ms. `run_team`
+    // n'a pas ce site, et c'est ainsi que le mode équipe n'ouvre rien.
+    //
+    // Un jeton absent n'est pas une erreur : la TUI parle à un démon qu'elle ne
+    // possède pas. Les trois champs restent `None` et `poll_callback_tasks` couvre.
+    if let Ok(token) = crate::commands::dashboard::auth_token() {
+        let base_url = crate::commands::dashboard::spirit_url();
+        app.task_event_rx = Some(crate::commands::tasks::spawn_callback_subscription(
+            agent_name.to_string(),
+            base_url.clone(),
+            token.clone(),
+        ));
+        app.spirit_base_url = Some(base_url);
+        app.spirit_token = Some(token);
+    }
+
     // Load recent conversation history so the user sees prior messages on restart.
     // In inbox mode (default), internal messages are filtered at the DB level.
     // The hidden count seeds the [N hidden] footer badge (mika#593).
