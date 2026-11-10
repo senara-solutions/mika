@@ -610,13 +610,14 @@ impl TaskEventStream {
 /// Le miroir ne prend **aucun champ « pour plus tard »** : c'est l'arrivée d'un
 /// lecteur, pas la largeur du serveur, qui fait entrer un champ ici.
 ///
-/// La visibilité le dit champ par champ. `label`, `result`, `created_trace_id` et
-/// `parent_task_id` sont `pub(crate)` parce que le drainage les lit depuis
-/// `tui/app.rs`. Les six autres restent **privés** : leur seul lecteur hors des
-/// trois formats est le prédicat du poll, qui est une méthode d'ici.
+/// La visibilité le dit champ par champ. `id`, `label`, `result`,
+/// `created_trace_id` et `parent_task_id` sont `pub(crate)` parce que le drainage
+/// les lit depuis `tui/app.rs` — `id` depuis le vol V2b-2b-2, qui le passe à
+/// `mark_task_delivered`. Les cinq autres restent **privés** : leur seul lecteur
+/// hors des trois formats est le prédicat du poll, qui est une méthode d'ici.
 #[derive(serde::Deserialize, serde::Serialize)]
 pub(crate) struct TaskDetailMirror {
-    id: String,
+    pub(crate) id: String,
     agent_id: String,
     pub(crate) label: String,
     status: String,
@@ -662,6 +663,148 @@ pub(crate) async fn fetch_task_detail(
     resp.json::<TaskDetailMirror>()
         .await
         .with_context(|| format!("unreadable task detail for '{task_id}' from {url}"))
+}
+
+/// Le `task_id` d'une trame qui **mène à une livraison**, et de nulle autre.
+///
+/// `TaskCompleted` est la seule dans ce vol : `poll_callback_tasks` reste en
+/// place et livre les `failed`, donc les prendre ici les livrerait deux fois.
+/// Le `match` **énumère les huit variantes** sans bras `_`, pour la raison déjà
+/// écrite sur [`frame_agent_id`] : sous un `_`, une variante neuve qui mériterait
+/// une livraison tomberait du côté « rien » sans que rien ne le dise.
+///
+/// L'argument est un `Option` parce que c'est ce que rend [`TaskEventStream::consume`] :
+/// une charge indécodable est un `None`, qui ne mène à rien comme une trame
+/// comprise et sans intérêt.
+fn terminal_callback_frame(frame: Option<&TaskEventFrame>) -> Option<String> {
+    match frame? {
+        TaskEventFrame::TaskCompleted { task_id, .. } => Some(task_id.clone()),
+        TaskEventFrame::TaskCreated { .. }
+        | TaskEventFrame::TaskClaimed { .. }
+        | TaskEventFrame::TaskFailed { .. }
+        | TaskEventFrame::TaskDelivered { .. }
+        | TaskEventFrame::TaskCancelled { .. }
+        | TaskEventFrame::OverflowMarker { .. }
+        | TaskEventFrame::Unknown => None,
+    }
+}
+
+impl TaskDetailMirror {
+    /// Le prédicat de `get_undelivered_callback_tasks_for_session`, porté sur le
+    /// détail : le même agent, `callback` / `resume_agent`, et la session de
+    /// cette TUI. Une tâche qui n'y répond pas n'est **ni livrée ni réclamée**.
+    ///
+    /// `status` en est, bien que le fil n'amène ici que des `TaskCompleted` :
+    /// c'est lui qui rend vrai, par le type, l'`original_status = "completed"`
+    /// que le drainage écrit en dur.
+    fn est_un_callback_a_livrer(&self, agent_id: &str, session_id: &str) -> bool {
+        self.agent_id == agent_id
+            && self.trigger_type == "callback"
+            && self.action_type == "resume_agent"
+            && self.status == "completed"
+            && self.created_by_session.as_deref() == Some(session_id)
+    }
+}
+
+/// La couture entre le fil des tâches et la TUI.
+///
+/// Elle porte **ensemble** le canal, l'URL de base et le jeton, et n'expose
+/// qu'un geste : le prochain candidat recevable, ou rien. C'est ce qui rend
+/// vraie *par le type* la contrainte « `tui/app.rs` ne détient ni l'URL, ni le
+/// jeton, ni le nom de la lecture HTTP », et ce qui garde exacte la déclaration
+/// `cli-spirit-tasks` du manifeste egress, dont le périmètre est ce fichier.
+///
+/// Le canal ne porte qu'un `task_id` : `TaskFailed` étant hors de ce vol, le
+/// statut d'origine d'un candidat est toujours `"completed"`, et un second champ
+/// ne dirait rien que le type ne dise déjà.
+pub(crate) struct CallbackFeed {
+    rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    base_url: String,
+    token: String,
+}
+
+impl CallbackFeed {
+    /// Ouvrir **une fois** le fil de `agent_id`, sans recul ni reconnexion.
+    ///
+    /// Un échec d'ouverture rend `None` — jeton refusé, daemon à terre — et la
+    /// TUI tourne alors sans souscription : `poll_callback_tasks` couvre, c'est
+    /// le filet de ce vol. Le drainage vit dans une tâche à part parce que
+    /// `consume` lit jusqu'à la fermeture du flux : sans elle, le démarrage de la
+    /// TUI y resterait.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "appelée depuis chat::run au commit 2 du même vol")
+    )]
+    pub(crate) async fn open_for(agent_id: &str, base_url: String, token: String) -> Option<Self> {
+        let flux = TaskEventStream::open(&base_url, &token).await.ok()?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = agent_id.to_string();
+        tokio::spawn(async move {
+            let _ = flux
+                .consume(Some(&agent), |_, trame| {
+                    if let Some(id) = terminal_callback_frame(trame) {
+                        let _ = tx.send(id);
+                    }
+                })
+                .await;
+        });
+        Some(Self {
+            rx,
+            base_url,
+            token,
+        })
+    }
+
+    /// Le prochain candidat **recevable**, ou rien.
+    ///
+    /// Les gardes 1 et 2 du vol, dans l'ordre, et **aucune ne réclame** : canal
+    /// vide, détail en erreur HTTP, détail illisible, prédicat non satisfait —
+    /// les quatre refus rendent `None`, et la ligne reste `completed` pour le
+    /// poll.
+    ///
+    /// `session_id` voyage **par appel** et non dans le type : `/new` et un
+    /// changement d'agent réassignent `app.session_id` sans rouvrir le fil, donc
+    /// une session figée à l'ouverture livrerait à la mauvaise conversation.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "appelée depuis drain_callback_deliveries au commit 2 du même vol"
+        )
+    )]
+    pub(crate) async fn next_candidate(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Option<TaskDetailMirror> {
+        let task_id = self.rx.try_recv().ok()?;
+        let detail = fetch_task_detail(&self.base_url, &self.token, &task_id)
+            .await
+            .ok()?;
+        detail
+            .est_un_callback_a_livrer(agent_id, session_id)
+            .then_some(detail)
+    }
+
+    /// Une couture dont le canal est **alimenté par le test**, pour mesurer
+    /// `next_candidate` seule : `fake_spirit::spawn_detail` sert le détail et non
+    /// le flux, et un constructeur neuf de serveur factice coûterait plus que ces
+    /// quelques lignes.
+    #[cfg(test)]
+    pub(crate) fn from_channel(
+        base_url: String,
+        token: String,
+    ) -> (tokio::sync::mpsc::UnboundedSender<String>, Self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            tx,
+            Self {
+                rx,
+                base_url,
+                token,
+            },
+        )
+    }
 }
 
 /// Rendre le miroir en texte, sur le modèle visuel de [`print_task_detail`].
@@ -1523,6 +1666,109 @@ mod tests {
         let message = format!("{:#}", issue.expect_err("un corps illisible doit échouer"));
         assert!(message.contains("t-1"), "la tâche est nommée : {message}");
         assert!(puits.is_empty(), "rien n'est écrit : {puits:?}");
+    }
+
+    // -- la couture du fil vers la TUI (mika#1727, vol V2b-2b-2) --
+
+    /// **Critères 2 et 3** — une seule séquence, parce que les quatre propriétés
+    /// qu'elle mesure sont des propriétés de *la même* souscription : une trame
+    /// d'un autre agent est écartée, `TaskFailed`, `OverflowMarker` et une trame
+    /// incomprise ne mènent à rien, et le `TaskCompleted` qui les **suit** entre
+    /// encore — donc l'abonnement n'a pas cassé. Quatre tests sur quatre serveurs
+    /// ne diraient pas ce dernier point.
+    ///
+    /// Le canal se lit à nu plutôt que par `next_candidate` : ce que la trame
+    /// décide, c'est l'entrée dans le canal, et y ajouter une lecture HTTP
+    /// mesurerait la garde suivante sans rien dire de celle-ci. Les charges sont
+    /// littérales, comme au vol V2b-2a : c'est le contrat de fil qui est épinglé.
+    #[tokio::test]
+    async fn mika1727_v2b2b2_seul_un_completed_de_lagent_entre_dans_le_canal() {
+        let charges = [
+            r#"{"event":"task_completed","task_id":"t-1","agent_id":"mika-qa","completed_at":"2026-11-10T10:00:00Z","result_preview":"fait"}"#,
+            r#"{"event":"task_failed","task_id":"t-2","agent_id":"mika-dev","failed_at":"2026-11-10T10:00:01Z","error_preview":"boum"}"#,
+            r#"{"event":"overflow_marker","dropped_count":3}"#,
+            r#"{"event":"trame_du_futur","task_id":"t-4","agent_id":"mika-dev"}"#,
+            r#"{"event":"task_claimed","task_id":"t-5","agent_id":"mika-dev","claimed_at":"2026-11-10T10:00:02Z"}"#,
+            r#"{"event":"task_completed","task_id":"t-6","agent_id":"mika-dev","completed_at":"2026-11-10T10:00:03Z","result_preview":"fait"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut couture = CallbackFeed::open_for("mika-dev", base, "jeton".to_string())
+            .await
+            .expect("le fil factice s'ouvre");
+        // Le corps du factice est fini : le drainage rend la main, lâche son
+        // expéditeur, et `recv` finit par rendre `None`. C'est ce qui rend ce
+        // relevé complet plutôt qu'instantané.
+        let mut recus: Vec<String> = Vec::new();
+        while let Some(id) = couture.rx.recv().await {
+            recus.push(id);
+        }
+
+        assert_eq!(recus, vec!["t-6".to_string()]);
+    }
+
+    /// Un candidat demandé à une couture dont le canal porte `t-42` et dont le
+    /// détail est servi avec `statut` et `corps`.
+    async fn candidat(
+        statut: u16,
+        corps: String,
+        agent: &str,
+        session: &str,
+    ) -> Option<TaskDetailMirror> {
+        let (base, _) = fake_spirit::spawn_detail(statut, corps).await;
+        let (tx, mut couture) = CallbackFeed::from_channel(base, "jeton".to_string());
+        tx.send("t-42".to_string()).expect("le canal est ouvert");
+        couture.next_candidate(agent, session).await
+    }
+
+    /// **Critères 1, 2 et 3** — `next_candidate` enchaîne les gardes 1 et 2, et
+    /// **aucune ne réclame** : rien ici ne touche à une base, donc la ligne reste
+    /// `completed` pour le poll dans les cinq refus.
+    ///
+    /// Le témoin positif est dans le même test que les refus, et non à part :
+    /// c'est lui qui sépare « la garde mord » de « rien ne passe jamais »
+    /// (mika#2205). Chaque cas a son serveur parce que le statut et le corps du
+    /// détail sont figés à la construction du factice.
+    #[tokio::test]
+    async fn mika1727_v2b2b2_le_candidat_passe_les_deux_gardes_ou_ne_passe_pas() {
+        let temoin = candidat(200, corps_de_detail(), "mika-qa", "s-7")
+            .await
+            .expect("le témoin positif doit passer");
+        assert_eq!(
+            (
+                temoin.id.as_str(),
+                temoin.result.as_deref(),
+                temoin.created_trace_id.as_deref(),
+                temoin.parent_task_id.as_deref(),
+            ),
+            ("t-42", Some("ok"), Some("tr-9"), Some("t-41")),
+            "le candidat porte ce que la livraison lit"
+        );
+
+        let autre_session = candidat(200, corps_de_detail(), "mika-qa", "s-autre").await;
+        assert!(autre_session.is_none(), "une autre session ne passe pas");
+
+        let autre_agent = candidat(200, corps_de_detail(), "mika-dev", "s-7").await;
+        assert!(autre_agent.is_none(), "un autre agent ne passe pas");
+
+        let recurrente = corps_de_detail().replace("\"callback\"", "\"recurring\"");
+        let pas_un_callback = candidat(200, recurrente, "mika-qa", "s-7").await;
+        assert!(
+            pas_un_callback.is_none(),
+            "ce qui n'est pas callback / resume_agent ne passe pas"
+        );
+
+        let erreur_http = candidat(
+            500,
+            r#"{"error":"database is locked"}"#.to_string(),
+            "mika-qa",
+            "s-7",
+        )
+        .await;
+        assert!(erreur_http.is_none(), "un détail en erreur ne passe pas");
+
+        let illisible = candidat(200, r#"{"id":"t-42"}"#.to_string(), "mika-qa", "s-7").await;
+        assert!(illisible.is_none(), "un détail illisible ne passe pas");
     }
 
     // -- the terminal filter reaches the operator's surface (mika#2670) --
