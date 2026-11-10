@@ -83,7 +83,19 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
-        Some(TaskCommand::Get { id, format }) => {
+        Some(TaskCommand::Get { id, format, spirit }) => {
+            // `--spirit` sort **avant** le chemin local plutôt que dans un `else` :
+            // ré-indenter le corps d'aujourd'hui en ferait des lignes modifiées, là
+            // où le critère 3 le veut identique à l'octet près. Cette porte ne
+            // résout pas de préfixe — le serveur lit par identifiant exact — et ne
+            // sonde pas la vivacité du pilote, qui est locale.
+            if spirit {
+                let url = super::dashboard::spirit_url();
+                let jeton = super::dashboard::auth_token()?;
+                let mut sortie = std::io::stdout();
+                return get_task_detail_from_spirit_into(&url, &jeton, &id, format, &mut sortie)
+                    .await;
+            }
             let resolved_id = match resolve_task_id(db, &id).await? {
                 Some(id) => id,
                 None => {
@@ -582,6 +594,108 @@ impl TaskEventStream {
         }
         Ok(())
     }
+}
+
+/// Le détail d'une tâche de mika-spirit, réduit aux champs que ce vol lit.
+///
+/// **Miroir local faute d'autre forme disponible** :
+/// `mika_agent::server::dashboard::TaskDetailResponse` ne dérive que
+/// `Serialize`, et ce vol ne modifie pas `crates/mika-agent/`. Ses autres champs
+/// sont ignorés par serde — tolérance voulue, attestée par `corps_de_detail`.
+///
+/// Six champs, et **chacun a son lecteur ici** : les trois formats de
+/// [`get_task_detail_from_spirit_into`] les rendent tous. `created_trace_id` et
+/// `parent_task_id`, que portait le matériau de #3062, n'en ont aucun et
+/// n'entrent pas. `Serialize` est un lecteur lui aussi.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct TaskDetailMirror {
+    id: String,
+    agent_id: String,
+    label: String,
+    status: String,
+    created_by_session: Option<String>,
+    result: Option<String>,
+}
+
+/// Lire `GET /api/v1/tasks/{task_id}` sur mika-spirit.
+///
+/// URL de base et jeton voyagent **par argument**, pour la raison déjà écrite
+/// sur [`TaskEventStream::open`] : un consommateur qui résout ses propres accès
+/// ne se pilote pas depuis un test.
+///
+/// **Échoue, là où le matériau de #3062 rendait `None`.** Ce `None` était juste
+/// dans `tui/app.rs` — la ligne restait non réclamée et le tour suivant la
+/// reprenait. Ici il n'y a aucun repli, et un échec avalé rendrait un détail vide
+/// comme un succès ; au drainage (vol V2b-2b-2), c'est **l'appelant** qui traduira
+/// ce `Err` en « je passe et je ne réclame pas ». Le `timeout` de 5 s vient du
+/// matériau : un flux a le droit de se taire, une requête courte non.
+async fn fetch_task_detail(base_url: &str, token: &str, task_id: &str) -> Result<TaskDetailMirror> {
+    let url = format!("{}/api/v1/tasks/{task_id}", base_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch task detail at {url}"))?;
+
+    let statut = resp.status();
+    if !statut.is_success() {
+        let corps = resp.text().await.unwrap_or_default();
+        anyhow::bail!("mika-spirit returned {statut} for {url}: {corps}");
+    }
+    resp.json::<TaskDetailMirror>()
+        .await
+        .with_context(|| format!("unreadable task detail for '{task_id}' from {url}"))
+}
+
+/// Rendre le miroir en texte, sur le modèle visuel de [`print_task_detail`].
+///
+/// Un écrivain **neuf** pour trois raisons dont aucune n'est de goût. Un critère
+/// de ce vol : `print_task_detail` n'est pas modifiée. Son type : elle prend un
+/// `&Task` de vingt champs que le miroir n'a pas. Son second argument : la
+/// vivacité du pilote est **locale**, donc sans réponse sous `--spirit`, et
+/// l'absence de ligne `Dispatch pilot:` est exacte, pas incomplète.
+fn write_task_detail_text<W: std::io::Write>(detail: &TaskDetailMirror, out: &mut W) -> Result<()> {
+    let session = detail.created_by_session.as_deref().unwrap_or("—");
+    let resultat = detail.result.as_deref().unwrap_or("—");
+    writeln!(out, "\n  Task Detail (mika-spirit)")?;
+    writeln!(out, "  ───────────────────────────────────")?;
+    for (etiquette, valeur) in [
+        ("ID:", detail.id.as_str()),
+        ("Label:", &detail.label),
+        ("Status:", &detail.status),
+        ("Agent:", &detail.agent_id),
+        ("Session:", session),
+        ("Result:", resultat),
+    ] {
+        writeln!(out, "  {etiquette:<15}{valeur}")?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Ce que `mika tasks get <id> --spirit` rend, avec son puits en paramètre.
+///
+/// Le puits est un paramètre pour la raison déjà écrite sur
+/// [`stream_task_events_into`] : la propriété à tenir est « le détail, **et rien
+/// d'autre** », et elle ne se mesure qu'en comparant tout le puits. Et **l'ordre
+/// des gestes porte la moitié du critère 2** : lecture, puis `?`, puis écriture —
+/// un échec laisse donc le puits vide par conséquence, non par politique.
+async fn get_task_detail_from_spirit_into<W: std::io::Write>(
+    base_url: &str,
+    token: &str,
+    task_id: &str,
+    format: OutputFormat,
+    out: &mut W,
+) -> Result<()> {
+    let detail = fetch_task_detail(base_url, token, task_id).await?;
+    match format {
+        OutputFormat::Text => write_task_detail_text(&detail, out)?,
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&detail)?)?,
+        OutputFormat::Yaml => write!(out, "{}", yaml_serde::to_string(&detail)?)?,
+    }
+    Ok(())
 }
 
 /// Hand every **complete** event sitting in `buffer` to `on_payload`, and leave
@@ -1267,6 +1381,123 @@ mod tests {
         assert_eq!(rendues, vec![charges[0], charges[1], charges[2]]);
     }
 
+    // -- le détail se lit sur mika-spirit (mika#1727, vol V2b-2b-1) --
+
+    /// Un corps tel que `dashboard::handle_task_detail` le rend : les six champs du
+    /// miroir, **plus deux** qu'il laisse tomber — et qui mesurent la tolérance,
+    /// sans quoi elle resterait une affirmation du commentaire.
+    fn corps_de_detail() -> String {
+        json!({"id": "t-42", "agent_id": "mika-qa", "label": "sonde:detail",
+               "status": "completed", "created_by_session": "s-7", "result": "ok",
+               "parent_task_id": null, "depth": 1})
+        .to_string()
+    }
+
+    /// Lire le détail sur `base` et rendre les deux moitiés que ces tests mesurent.
+    async fn lire_detail(base: &str, id: &str, format: OutputFormat) -> (Vec<u8>, Result<()>) {
+        let mut puits: Vec<u8> = Vec::new();
+        let issue = get_task_detail_from_spirit_into(base, "jeton", id, format, &mut puits).await;
+        (puits, issue)
+    }
+
+    /// **Critère 1** — `mika tasks get <id> --spirit` rend le détail lu sur
+    /// mika-spirit, et le jeton part en `Bearer`. Deux mesures dans un test parce
+    /// qu'elles portent sur **la même requête** : ce qui en est revenu, et ce qui y
+    /// est parti. L'égalité porte sur tout le puits, donc elle mesure aussi
+    /// l'absence de la ligne `Dispatch pilot:`.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_mika_tasks_get_spirit_rend_le_detail_lu_sur_mika_spirit() {
+        let (base, recu) = fake_spirit::spawn_detail(200, corps_de_detail()).await;
+
+        let (puits, issue) = lire_detail(&base, "t-42", OutputFormat::Text).await;
+
+        issue.unwrap();
+        let attendu = concat!(
+            "\n  Task Detail (mika-spirit)\n",
+            "  ───────────────────────────────────\n",
+            "  ID:            t-42\n  Label:         sonde:detail\n",
+            "  Status:        completed\n  Agent:         mika-qa\n",
+            "  Session:       s-7\n  Result:        ok\n\n",
+        );
+        assert_eq!(String::from_utf8(puits).unwrap(), attendu);
+        let entete = recu.lock().unwrap().clone();
+        assert_eq!(entete.as_deref(), Some("Bearer jeton"));
+    }
+
+    /// **Critère 1** — les trois formats rendent le même miroir, ni un champ de plus
+    /// ni un de moins : les deux attentes se dérivent d'**une** liste de six paires,
+    /// donc un septième champ rendu ne peut pas être vert ici.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_les_trois_formats_rendent_le_meme_miroir() {
+        let (base, _) = fake_spirit::spawn_detail(200, corps_de_detail()).await;
+        let champs = [
+            ("id", "t-42"),
+            ("agent_id", "mika-qa"),
+            ("label", "sonde:detail"),
+            ("status", "completed"),
+            ("created_by_session", "s-7"),
+            ("result", "ok"),
+        ];
+
+        let (rendu, issue) = lire_detail(&base, "t-42", OutputFormat::Json).await;
+        issue.unwrap();
+        let lignes = champs.map(|(c, v)| format!("  \"{c}\": \"{v}\""));
+        let attendu = format!("{{\n{}\n}}\n", lignes.join(",\n"));
+        assert_eq!(String::from_utf8(rendu).unwrap(), attendu);
+
+        let (rendu, issue) = lire_detail(&base, "t-42", OutputFormat::Yaml).await;
+        issue.unwrap();
+        let corps: String = champs.iter().map(|(c, v)| format!("{c}: {v}\n")).collect();
+        assert_eq!(String::from_utf8(rendu).unwrap(), corps);
+    }
+
+    /// **Critère 2** — un 404 échoue explicitement et n'écrit rien. Le corps est
+    /// celui que `dashboard::handle_task_detail` rend vraiment. « Explicitement » se
+    /// mesure par le statut présent dans le message ; « n'écrit rien » par le puits
+    /// vide, qui tient à l'ordre des gestes et non à une politique d'écriture.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_un_404_echoue_explicitement_et_necrit_rien() {
+        let (base, _) =
+            fake_spirit::spawn_detail(404, r#"{"error":"task 't-absente' not found"}"#.to_string())
+                .await;
+
+        let (puits, issue) = lire_detail(&base, "t-absente", OutputFormat::Text).await;
+
+        let message = format!("{:#}", issue.expect_err("un 404 doit échouer"));
+        assert!(message.contains("404"), "le statut est nommé : {message}");
+        assert!(puits.is_empty(), "rien n'est écrit : {puits:?}");
+    }
+
+    /// **Critère 2** — un 500 échoue explicitement et n'écrit rien. Deux tests et non
+    /// un seul paramétré : le critère demande « un test pour chacun des trois cas »,
+    /// et 404 et 500 ne diront pas la même chose au vol V2b-2b-2 qui lira l'erreur.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_un_500_echoue_explicitement_et_necrit_rien() {
+        let (base, _) =
+            fake_spirit::spawn_detail(500, r#"{"error":"database is locked"}"#.to_string()).await;
+
+        let (puits, issue) = lire_detail(&base, "t-1", OutputFormat::Json).await;
+
+        let message = format!("{:#}", issue.expect_err("un 500 doit échouer"));
+        assert!(message.contains("500"), "le statut est nommé : {message}");
+        assert!(puits.is_empty(), "rien n'est écrit : {puits:?}");
+    }
+
+    /// **Critère 2** — un corps illisible échoue explicitement et n'écrit rien. Un
+    /// **200**, un JSON valide, et `agent_id` absent : c'est le cas qui compte, car
+    /// c'est la forme qu'un serveur ayant dérivé rendrait, et elle ne doit jamais
+    /// passer pour un succès.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_un_corps_illisible_echoue_explicitement_et_necrit_rien() {
+        let (base, _) = fake_spirit::spawn_detail(200, r#"{"id":"t-1"}"#.to_string()).await;
+
+        let (puits, issue) = lire_detail(&base, "t-1", OutputFormat::Text).await;
+
+        let message = format!("{:#}", issue.expect_err("un corps illisible doit échouer"));
+        assert!(message.contains("t-1"), "la tâche est nommée : {message}");
+        assert!(puits.is_empty(), "rien n'est écrit : {puits:?}");
+    }
+
     // -- the terminal filter reaches the operator's surface (mika#2670) --
 
     /// A callback row, as `dispatch-lib` leaves it: the pgid on the row itself,
@@ -1802,6 +2033,7 @@ mod tests {
 pub(crate) mod fake_spirit {
     use axum::Router;
     use axum::routing::get;
+    use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
     /// Encode une suite de charges en un corps SSE : un événement par charge,
@@ -1841,5 +2073,44 @@ pub(crate) mod fake_spirit {
             let _ = axum::serve(listener, router.into_make_service()).await;
         });
         format!("http://{addr}")
+    }
+
+    /// L'en-tête `authorization` tel que la socket l'a reçu, `None` avant la requête.
+    pub(crate) type EnTeteRecu = Arc<Mutex<Option<String>>>;
+
+    /// Sert `/api/v1/tasks/{task_id}` avec le `statut` et le `corps` que le test
+    /// choisit, et rend l'URL de base avec le témoin de l'en-tête reçu.
+    ///
+    /// Le chemin est **paramétré** et le corps cloné par le gestionnaire : un seul
+    /// serveur répond donc à plusieurs identifiants et à plusieurs requêtes, ce dont
+    /// le test des trois formats a besoin. Le témoin fait de « le jeton part en
+    /// `Bearer` » une mesure prise **sur la socket**, non une relecture du code.
+    pub(crate) async fn spawn_detail(statut: u16, corps: String) -> (String, EnTeteRecu) {
+        let recu: EnTeteRecu = Arc::new(Mutex::new(None));
+        let temoin = Arc::clone(&recu);
+        let router = Router::new().route(
+            "/api/v1/tasks/{task_id}",
+            get(move |en_tetes: axum::http::HeaderMap| {
+                let corps = corps.clone();
+                let temoin = Arc::clone(&temoin);
+                async move {
+                    *temoin.lock().expect("témoin d'en-tête") = en_tetes
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    axum::response::Response::builder()
+                        .status(statut)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(corps))
+                        .expect("corps de détail factice")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        (format!("http://{addr}"), recu)
     }
 }
