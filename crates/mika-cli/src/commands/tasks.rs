@@ -731,10 +731,6 @@ impl CallbackFeed {
     /// le filet de ce vol. Le drainage vit dans une tâche à part parce que
     /// `consume` lit jusqu'à la fermeture du flux : sans elle, le démarrage de la
     /// TUI y resterait.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "appelée depuis chat::run au commit 2 du même vol")
-    )]
     pub(crate) async fn open_for(agent_id: &str, base_url: String, token: String) -> Option<Self> {
         let flux = TaskEventStream::open(&base_url, &token).await.ok()?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -765,13 +761,6 @@ impl CallbackFeed {
     /// `session_id` voyage **par appel** et non dans le type : `/new` et un
     /// changement d'agent réassignent `app.session_id` sans rouvrir le fil, donc
     /// une session figée à l'ouverture livrerait à la mauvaise conversation.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "appelée depuis drain_callback_deliveries au commit 2 du même vol"
-        )
-    )]
     pub(crate) async fn next_candidate(
         &mut self,
         agent_id: &str,
