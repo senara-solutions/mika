@@ -654,8 +654,8 @@ pub struct App<'a> {
     pub pending_dashboard_action: Option<DashboardAction>,
 
     /// La couture vers le fil des tâches (mika#1727, vol V2b-2b-2). Posée après
-    /// construction, comme `dashboard_running` : `None` en mode équipe et quand
-    /// l'ouverture a échoué, et `poll_callback_tasks` couvre alors.
+    /// construction, comme `dashboard_running` ; `None` en mode équipe et quand
+    /// l'ouverture échoue — `poll_callback_tasks` couvre alors.
     pub callback_feed: Option<CallbackFeed>,
 }
 
@@ -840,7 +840,6 @@ impl<'a> App<'a> {
             footer_open_rect: None,
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
-            // Le mode équipe n'ouvre rien : la souscription part de `chat::run`.
             callback_feed: None,
         }
     }
@@ -1126,10 +1125,8 @@ impl<'a> App<'a> {
             self.needs_redraw = true;
         }
 
-        // Livraison par le fil (mika#1727, vol V2b-2b-2) : au repos, hors mode
-        // équipe, et **sans** `POLL_INTERVAL_TICKS` — la latence que la
-        // souscription achète est précisément cette attente-là. Sans couture,
-        // le drainage rend la main sur un test d'`Option`.
+        // Livraison par le fil (mika#1727, vol V2b-2b-2), **sans**
+        // `POLL_INTERVAL_TICKS` : cette attente-là est ce que le fil rachète.
         if !self.is_team_mode() && self.status == AgentStatus::Idle {
             self.drain_callback_deliveries().await;
         }
@@ -1609,25 +1606,21 @@ impl<'a> App<'a> {
         self.needs_redraw = true;
     }
 
-    /// Les gardes 3 et 4 du vol V2b-2b-2 : réclamer, puis livrer un candidat
-    /// que la couture a déjà jugé recevable.
+    /// Les gardes 3 et 4 du vol V2b-2b-2 : réclamer, puis livrer un candidat que
+    /// la couture a déjà jugé recevable.
     ///
-    /// La forme de livraison est celle de [`Self::poll_callback_tasks`] — même
-    /// message système, même `CallbackResult`, même `Thinking`, même `break`
-    /// après un envoi pour que l'agent reste réactif. Trois choses viennent du
-    /// vol : le détail arrive par HTTP et non de la base, le statut d'origine est
-    /// toujours `"completed"` puisque le fil ne retient que `TaskCompleted`, et
-    /// il n'y a donc pas de garde d'ancienneté — elle ne vise que les `failed`,
-    /// que le poll livre toujours.
-    ///
-    /// Un candidat refusé par la réclamation **ne rend pas la main** : sinon une
-    /// ligne que le poll vient de prendre retarderait d'un tick celle qui la
-    /// suit dans le canal.
+    /// La forme est celle de [`Self::poll_callback_tasks`] — même message
+    /// système, même `CallbackResult`, même `Thinking`, même sortie après un
+    /// envoi pour que l'agent reste réactif. Trois choses viennent du vol : le
+    /// détail arrive par HTTP, `original_status` est toujours `"completed"`
+    /// puisque le fil ne retient que `TaskCompleted`, et il n'y a donc pas de
+    /// garde d'ancienneté — elle ne vise que les `failed`, que le poll livre
+    /// toujours. Un candidat refusé par la réclamation **ne rend pas la main** :
+    /// sinon une ligne que le poll vient de prendre retarderait d'un tick celle
+    /// qui la suit dans le canal.
     async fn drain_callback_deliveries(&mut self) {
-        // Les deux identités sont copiées avant la boucle : `next_candidate`
-        // emprunte la couture, donc `self`, et ne peut pas les lire en même
-        // temps. Elles voyagent par appel — `/new` les réassigne sans rouvrir
-        // le fil.
+        // Copiées avant la boucle : `next_candidate` emprunte la couture, donc
+        // `self`. Elles voyagent par appel — `/new` les réassigne.
         let agent = self.agent_name.clone();
         let session = self.session_id.clone();
         loop {
@@ -2238,10 +2231,8 @@ mod tests {
 
     /// Build a minimal `App` whose `agent_rx` is paired with the returned sender,
     /// so a test can simulate the supervisor delivering events to the TUI.
-    ///
-    /// Le receveur des `AgentRequest` est **rendu** et non jeté (mika#1727, vol
-    /// V2b-2b-2) : « livré une seule fois » ne se mesure que sur le canal où la
-    /// livraison atterrit.
+    /// Le receveur des `AgentRequest` est **rendu**, non jeté : « livré une seule
+    /// fois » ne se mesure que là où la livraison atterrit (mika#1727).
     async fn app_with_response_sender() -> (
         App<'static>,
         mpsc::UnboundedSender<AgentResponse>,
@@ -2347,13 +2338,11 @@ mod tests {
 
     // === livraison d'un `completed` par le fil (mika#1727, vol V2b-2b-2) ===
 
-    /// Une ligne de callback `completed` en base, **et** un mika-spirit factice
-    /// qui sert son détail, puis une couture dont le canal porte son id.
-    ///
-    /// Les trois moitiés viennent du même helper parce qu'elles doivent porter le
-    /// **même** id : c'est la base qui le choisit, et le détail HTTP doit le
-    /// refléter. Séparées, elles divergeraient en silence et les deux tests
-    /// seraient verts sans rien livrer (mika#2205).
+    /// Une ligne de callback `completed` en base, un mika-spirit factice qui sert
+    /// son détail, et une couture dont le canal porte son id. Les trois tiennent
+    /// dans un seul helper parce qu'ils doivent porter le **même** id, choisi par
+    /// la base : séparés, ils divergeraient en silence et les deux tests seraient
+    /// verts sans rien livrer (mika#2205).
     async fn couture_dun_callback_livrable(
         app: &App<'static>,
     ) -> (String, mpsc::UnboundedSender<String>, CallbackFeed) {
@@ -2364,9 +2353,8 @@ mod tests {
             .create_task(NewTask {
                 agent_id: app.agent_name.clone(),
                 team_run_id: None,
-                // La ligne n'a ni parent ni trace : ces deux champs, la livraison
-                // les lit sur le **détail**, et les laisser divergents ici le
-                // prouve plutôt que de le supposer.
+                // Ni parent ni trace : la livraison les lit sur le **détail**, et
+                // les laisser divergents ici le prouve au lieu de le supposer.
                 parent_task_id: None,
                 depth: 1,
                 label: "long_running:run_claude_pilot".to_string(),
@@ -2395,18 +2383,12 @@ mod tests {
             .await
             .expect("set status");
 
-        // Le détail est servi par HTTP, et c'est lui — non la ligne — que la
-        // livraison lit : c'est le contrat du critère 1.
+        // Servi par HTTP : c'est lui, non la ligne, que la livraison lit.
         let corps = serde_json::json!({
-            "id": id,
-            "agent_id": app.agent_name,
-            "label": "long_running:run_claude_pilot",
-            "status": "completed",
-            "trigger_type": "callback",
-            "action_type": "resume_agent",
-            "created_by_session": app.session_id,
-            "result": "le pilote a fini",
-            "created_trace_id": "tr-9",
+            "id": id, "agent_id": app.agent_name, "status": "completed",
+            "label": "long_running:run_claude_pilot", "trigger_type": "callback",
+            "action_type": "resume_agent", "created_by_session": app.session_id,
+            "result": "le pilote a fini", "created_trace_id": "tr-9",
             "parent_task_id": "t-parent",
         })
         .to_string();
@@ -2415,12 +2397,9 @@ mod tests {
         (id, tx, feed)
     }
 
-    /// **Critère 1** — le même candidat est livré **une fois**, pas deux.
-    ///
-    /// Le canal porte son id deux fois, et le second tour trouve la ligne déjà
-    /// réclamée : `mark_task_delivered` rend `Ok(false)`, la garde 3 passe, et
-    /// rien ne repart. L'assertion porte sur le canal des `AgentRequest`, parce
-    /// que c'est là qu'atterrit la livraison.
+    /// **Critère 1** — le même candidat est livré **une fois**, pas deux. Le
+    /// canal porte son id deux fois ; au second tour la ligne est déjà réclamée,
+    /// `mark_task_delivered` rend `Ok(false)`, la garde 3 passe, rien ne repart.
     #[tokio::test]
     async fn mika1727_v2b2b2_un_completed_du_fil_est_livre_une_seule_fois() {
         let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
@@ -2431,25 +2410,23 @@ mod tests {
 
         app.drain_callback_deliveries().await;
 
-        let livraison = request_rx.try_recv().expect("une livraison");
-        match livraison {
-            AgentRequest::CallbackResult {
-                task_id,
-                label,
-                result,
-                trace_id,
-                original_status,
-                parent_task_id,
-            } => {
-                assert_eq!(task_id, id);
-                assert_eq!(label, "long_running:run_claude_pilot");
-                assert_eq!(result, "le pilote a fini", "le résultat vient du détail");
-                assert_eq!(trace_id.as_deref(), Some("tr-9"));
-                assert_eq!(original_status, "completed");
-                assert_eq!(parent_task_id.as_deref(), Some("t-parent"));
-            }
-            _ => panic!("la livraison doit être un CallbackResult"),
-        }
+        let AgentRequest::CallbackResult {
+            task_id,
+            label,
+            result,
+            trace_id,
+            original_status,
+            parent_task_id,
+        } = request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(task_id, id);
+        assert_eq!(label, "long_running:run_claude_pilot");
+        assert_eq!(result, "le pilote a fini", "le résultat vient du détail");
+        assert_eq!(trace_id.as_deref(), Some("tr-9"));
+        assert_eq!(original_status, "completed");
+        assert_eq!(parent_task_id.as_deref(), Some("t-parent"));
         assert_eq!(app.status, AgentStatus::Thinking, "le tour repart");
 
         app.status = AgentStatus::Idle;
@@ -2460,11 +2437,10 @@ mod tests {
         );
     }
 
-    /// **Critère 1** — rien n'est livré quand le poll a déjà réclamé la ligne.
-    ///
-    /// La réclamation du poll est jouée telle quelle, par `mark_task_delivered` :
-    /// c'est elle qui est atomique, et le drainage n'a aucun autre moyen de
-    /// savoir que l'autre chemin est passé avant lui.
+    /// **Critère 1** — rien n'est livré quand le poll a déjà réclamé la ligne. Sa
+    /// réclamation est jouée telle quelle, par `mark_task_delivered` : c'est elle
+    /// qui est atomique, et le drainage n'a aucun autre moyen de savoir que
+    /// l'autre chemin est passé avant lui.
     #[tokio::test]
     async fn mika1727_v2b2b2_rien_nest_livre_si_le_poll_a_deja_reclame() {
         let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;

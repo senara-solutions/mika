@@ -610,11 +610,11 @@ impl TaskEventStream {
 /// Le miroir ne prend **aucun champ « pour plus tard »** : c'est l'arrivée d'un
 /// lecteur, pas la largeur du serveur, qui fait entrer un champ ici.
 ///
-/// La visibilité le dit champ par champ. `id`, `label`, `result`,
-/// `created_trace_id` et `parent_task_id` sont `pub(crate)` parce que le drainage
-/// les lit depuis `tui/app.rs` — `id` depuis le vol V2b-2b-2, qui le passe à
-/// `mark_task_delivered`. Les cinq autres restent **privés** : leur seul lecteur
-/// hors des trois formats est le prédicat du poll, qui est une méthode d'ici.
+/// La visibilité le dit champ par champ. `id` (vol V2b-2b-2, qui le passe à
+/// `mark_task_delivered`), `label`, `result`, `created_trace_id` et
+/// `parent_task_id` sont `pub(crate)` parce que le drainage les lit depuis
+/// `tui/app.rs`. Les cinq autres restent **privés** : leur seul lecteur hors des
+/// trois formats est le prédicat du poll, qui est une méthode d'ici.
 #[derive(serde::Deserialize, serde::Serialize)]
 pub(crate) struct TaskDetailMirror {
     pub(crate) id: String,
@@ -668,14 +668,10 @@ pub(crate) async fn fetch_task_detail(
 /// Le `task_id` d'une trame qui **mène à une livraison**, et de nulle autre.
 ///
 /// `TaskCompleted` est la seule dans ce vol : `poll_callback_tasks` reste en
-/// place et livre les `failed`, donc les prendre ici les livrerait deux fois.
-/// Le `match` **énumère les huit variantes** sans bras `_`, pour la raison déjà
+/// place et livre les `failed`, donc les prendre ici les livrerait deux fois. Le
+/// `match` **énumère les huit variantes** sans bras `_`, pour la raison déjà
 /// écrite sur [`frame_agent_id`] : sous un `_`, une variante neuve qui mériterait
-/// une livraison tomberait du côté « rien » sans que rien ne le dise.
-///
-/// L'argument est un `Option` parce que c'est ce que rend [`TaskEventStream::consume`] :
-/// une charge indécodable est un `None`, qui ne mène à rien comme une trame
-/// comprise et sans intérêt.
+/// une livraison tomberait du côté « rien » en silence.
 fn terminal_callback_frame(frame: Option<&TaskEventFrame>) -> Option<String> {
     match frame? {
         TaskEventFrame::TaskCompleted { task_id, .. } => Some(task_id.clone()),
@@ -691,9 +687,7 @@ fn terminal_callback_frame(frame: Option<&TaskEventFrame>) -> Option<String> {
 
 impl TaskDetailMirror {
     /// Le prédicat de `get_undelivered_callback_tasks_for_session`, porté sur le
-    /// détail : le même agent, `callback` / `resume_agent`, et la session de
-    /// cette TUI. Une tâche qui n'y répond pas n'est **ni livrée ni réclamée**.
-    ///
+    /// détail. Une tâche qui n'y répond pas n'est **ni livrée ni réclamée**.
     /// `status` en est, bien que le fil n'amène ici que des `TaskCompleted` :
     /// c'est lui qui rend vrai, par le type, l'`original_status = "completed"`
     /// que le drainage écrit en dur.
@@ -709,14 +703,12 @@ impl TaskDetailMirror {
 /// La couture entre le fil des tâches et la TUI.
 ///
 /// Elle porte **ensemble** le canal, l'URL de base et le jeton, et n'expose
-/// qu'un geste : le prochain candidat recevable, ou rien. C'est ce qui rend
-/// vraie *par le type* la contrainte « `tui/app.rs` ne détient ni l'URL, ni le
-/// jeton, ni le nom de la lecture HTTP », et ce qui garde exacte la déclaration
-/// `cli-spirit-tasks` du manifeste egress, dont le périmètre est ce fichier.
-///
-/// Le canal ne porte qu'un `task_id` : `TaskFailed` étant hors de ce vol, le
-/// statut d'origine d'un candidat est toujours `"completed"`, et un second champ
-/// ne dirait rien que le type ne dise déjà.
+/// qu'un geste. C'est ce qui rend vraie *par le type* la contrainte
+/// « `tui/app.rs` ne détient ni l'URL, ni le jeton, ni le nom de la lecture
+/// HTTP », et ce qui garde exacte la déclaration `cli-spirit-tasks` du manifeste
+/// egress, dont le périmètre est ce fichier. Le canal ne porte qu'un `task_id` :
+/// `TaskFailed` étant hors de ce vol, le statut d'origine est toujours
+/// `"completed"`, et un second champ ne dirait rien que le type ne dise déjà.
 pub(crate) struct CallbackFeed {
     rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     base_url: String,
@@ -724,13 +716,11 @@ pub(crate) struct CallbackFeed {
 }
 
 impl CallbackFeed {
-    /// Ouvrir **une fois** le fil de `agent_id`, sans recul ni reconnexion.
-    ///
-    /// Un échec d'ouverture rend `None` — jeton refusé, daemon à terre — et la
-    /// TUI tourne alors sans souscription : `poll_callback_tasks` couvre, c'est
-    /// le filet de ce vol. Le drainage vit dans une tâche à part parce que
-    /// `consume` lit jusqu'à la fermeture du flux : sans elle, le démarrage de la
-    /// TUI y resterait.
+    /// Ouvrir **une fois** le fil de `agent_id`, sans recul ni reconnexion. Un
+    /// échec rend `None` — jeton refusé, daemon à terre — et `poll_callback_tasks`
+    /// couvre alors, c'est le filet de ce vol. Le drainage vit dans une tâche à
+    /// part parce que `consume` lit jusqu'à la fermeture du flux : sans elle, le
+    /// démarrage de la TUI y resterait.
     pub(crate) async fn open_for(agent_id: &str, base_url: String, token: String) -> Option<Self> {
         let flux = TaskEventStream::open(&base_url, &token).await.ok()?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -751,12 +741,10 @@ impl CallbackFeed {
         })
     }
 
-    /// Le prochain candidat **recevable**, ou rien.
-    ///
-    /// Les gardes 1 et 2 du vol, dans l'ordre, et **aucune ne réclame** : canal
-    /// vide, détail en erreur HTTP, détail illisible, prédicat non satisfait —
-    /// les quatre refus rendent `None`, et la ligne reste `completed` pour le
-    /// poll.
+    /// Le prochain candidat **recevable**, ou rien. Les gardes 1 et 2 du vol, et
+    /// **aucune ne réclame** : canal vide, détail en erreur HTTP, détail
+    /// illisible, prédicat non satisfait — les quatre refus rendent `None`, et la
+    /// ligne reste `completed` pour le poll.
     ///
     /// `session_id` voyage **par appel** et non dans le type : `/new` et un
     /// changement d'agent réassignent `app.session_id` sans rouvrir le fil, donc
@@ -776,9 +764,7 @@ impl CallbackFeed {
     }
 
     /// Une couture dont le canal est **alimenté par le test**, pour mesurer
-    /// `next_candidate` seule : `fake_spirit::spawn_detail` sert le détail et non
-    /// le flux, et un constructeur neuf de serveur factice coûterait plus que ces
-    /// quelques lignes.
+    /// `next_candidate` seule : `spawn_detail` sert le détail, pas le flux.
     #[cfg(test)]
     pub(crate) fn from_channel(
         base_url: String,
@@ -1660,16 +1646,13 @@ mod tests {
     // -- la couture du fil vers la TUI (mika#1727, vol V2b-2b-2) --
 
     /// **Critères 2 et 3** — une seule séquence, parce que les quatre propriétés
-    /// qu'elle mesure sont des propriétés de *la même* souscription : une trame
-    /// d'un autre agent est écartée, `TaskFailed`, `OverflowMarker` et une trame
-    /// incomprise ne mènent à rien, et le `TaskCompleted` qui les **suit** entre
-    /// encore — donc l'abonnement n'a pas cassé. Quatre tests sur quatre serveurs
-    /// ne diraient pas ce dernier point.
-    ///
-    /// Le canal se lit à nu plutôt que par `next_candidate` : ce que la trame
-    /// décide, c'est l'entrée dans le canal, et y ajouter une lecture HTTP
-    /// mesurerait la garde suivante sans rien dire de celle-ci. Les charges sont
-    /// littérales, comme au vol V2b-2a : c'est le contrat de fil qui est épinglé.
+    /// mesurées sont celles de *la même* souscription : une trame d'un autre
+    /// agent est écartée, `TaskFailed`, `OverflowMarker` et une trame incomprise
+    /// ne mènent à rien, et le `TaskCompleted` qui les **suit** entre encore —
+    /// donc l'abonnement n'a pas cassé, ce que quatre tests sur quatre serveurs
+    /// ne diraient pas. Le canal se lit à nu : y ajouter une lecture HTTP
+    /// mesurerait la garde suivante. Charges littérales, comme au vol V2b-2a :
+    /// c'est le contrat de fil qui est épinglé.
     #[tokio::test]
     async fn mika1727_v2b2b2_seul_un_completed_de_lagent_entre_dans_le_canal() {
         let charges = [
@@ -1685,9 +1668,8 @@ mod tests {
         let mut couture = CallbackFeed::open_for("mika-dev", base, "jeton".to_string())
             .await
             .expect("le fil factice s'ouvre");
-        // Le corps du factice est fini : le drainage rend la main, lâche son
-        // expéditeur, et `recv` finit par rendre `None`. C'est ce qui rend ce
-        // relevé complet plutôt qu'instantané.
+        // Le corps du factice est fini : le drainage lâche son expéditeur et
+        // `recv` rend `None`, ce qui rend ce relevé complet, non instantané.
         let mut recus: Vec<String> = Vec::new();
         while let Some(id) = couture.rx.recv().await {
             recus.push(id);
@@ -1696,8 +1678,7 @@ mod tests {
         assert_eq!(recus, vec!["t-6".to_string()]);
     }
 
-    /// Un candidat demandé à une couture dont le canal porte `t-42` et dont le
-    /// détail est servi avec `statut` et `corps`.
+    /// Un candidat tiré d'une couture dont le canal porte `t-42`.
     async fn candidat(
         statut: u16,
         corps: String,
@@ -1712,27 +1693,19 @@ mod tests {
 
     /// **Critères 1, 2 et 3** — `next_candidate` enchaîne les gardes 1 et 2, et
     /// **aucune ne réclame** : rien ici ne touche à une base, donc la ligne reste
-    /// `completed` pour le poll dans les cinq refus.
-    ///
-    /// Le témoin positif est dans le même test que les refus, et non à part :
-    /// c'est lui qui sépare « la garde mord » de « rien ne passe jamais »
-    /// (mika#2205). Chaque cas a son serveur parce que le statut et le corps du
-    /// détail sont figés à la construction du factice.
+    /// `completed` pour le poll dans les cinq refus. Le témoin positif vit dans
+    /// le même test qu'eux : c'est lui qui sépare « la garde mord » de « rien ne
+    /// passe jamais » (mika#2205). Chaque cas a son serveur parce que statut et
+    /// corps sont figés à la construction du factice.
     #[tokio::test]
     async fn mika1727_v2b2b2_le_candidat_passe_les_deux_gardes_ou_ne_passe_pas() {
         let temoin = candidat(200, corps_de_detail(), "mika-qa", "s-7")
             .await
             .expect("le témoin positif doit passer");
-        assert_eq!(
-            (
-                temoin.id.as_str(),
-                temoin.result.as_deref(),
-                temoin.created_trace_id.as_deref(),
-                temoin.parent_task_id.as_deref(),
-            ),
-            ("t-42", Some("ok"), Some("tr-9"), Some("t-41")),
-            "le candidat porte ce que la livraison lit"
-        );
+        assert_eq!(temoin.id, "t-42");
+        assert_eq!(temoin.result.as_deref(), Some("ok"));
+        assert_eq!(temoin.created_trace_id.as_deref(), Some("tr-9"));
+        assert_eq!(temoin.parent_task_id.as_deref(), Some("t-41"));
 
         let autre_session = candidat(200, corps_de_detail(), "mika-qa", "s-autre").await;
         assert!(autre_session.is_none(), "une autre session ne passe pas");
