@@ -1111,6 +1111,16 @@ pub enum TaskCommand {
         /// http://localhost:$MIKA_SPIRIT_PORT / http://localhost:8080).
         #[arg(long)]
         url: Option<String>,
+        /// Only print frames naming this agent.
+        ///
+        /// The stream is per **process**, not per agent, so this is a
+        /// client-side filter and never a server-side subscription. It drops
+        /// only what it has understood as foreign: an overflow marker, an
+        /// unknown event and an undecodable payload still print, since a
+        /// filtered consumer that hid them would hide the very notice that it
+        /// lost frames (mika#1727 vol V2b-2a).
+        #[arg(long)]
+        agent: Option<String>,
     },
 }
 

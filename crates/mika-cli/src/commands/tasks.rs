@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
 use mika_agent::live_pilot::TaskPilot;
+use mika_agent::server::tasks_stream::TaskEventFrame;
 use mika_agent::task_engine::engine::{HANDLER_FAILURE_METADATA_KEY, HandlerFailure};
 use mika_common::config::Settings;
 use serde_json::{Value, json};
@@ -394,8 +395,8 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
-        Some(TaskCommand::Stream { url }) => {
-            stream_task_events(url).await?;
+        Some(TaskCommand::Stream { url, agent }) => {
+            stream_task_events(url, agent).await?;
         }
     }
 
@@ -411,7 +412,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
 /// [`TaskEventStream::open`]: `dashboard::auth_token` reads the process
 /// environment and fails without it, so a consumer resolving its own
 /// credentials could not be driven from a test at all (mika#1727 vol V2b-1b).
-async fn stream_task_events(url_override: Option<String>) -> Result<()> {
+async fn stream_task_events(url_override: Option<String>, agent: Option<String>) -> Result<()> {
     let base_url = url_override.unwrap_or_else(crate::commands::dashboard::spirit_url);
     let token = crate::commands::dashboard::auth_token()?;
 
@@ -419,7 +420,7 @@ async fn stream_task_events(url_override: Option<String>) -> Result<()> {
         "mika#1758 task-event stream: connecting to {}",
         stream_url(&base_url)
     );
-    stream_task_events_into(&base_url, &token, &mut std::io::stdout()).await
+    stream_task_events_into(&base_url, &token, agent.as_deref(), &mut std::io::stdout()).await
 }
 
 /// `mika tasks stream`, with its output sink as a parameter.
@@ -430,16 +431,22 @@ async fn stream_task_events(url_override: Option<String>) -> Result<()> {
 /// from a Rust test without a subprocess. The two `eprintln!` stay on stderr and
 /// are therefore absent from the sink: that absence *is* the measurement of
 /// "nothing else", not a restatement of it.
+///
+/// `agent_filter` is `--agent` as [`TaskEventStream::consume`] takes it. The
+/// sink gets the **raw** payload either way — the decode travels so the filter
+/// can read it, not so the output changes shape — which is why `None` yields the
+/// output of before the flag existed, to the byte.
 async fn stream_task_events_into<W: std::io::Write>(
     base_url: &str,
     token: &str,
+    agent_filter: Option<&str>,
     out: &mut W,
 ) -> Result<()> {
     let stream = TaskEventStream::open(base_url, token).await?;
     eprintln!("mika#1758 task-event stream: connected. Streaming frames (Ctrl-C to stop).");
 
     stream
-        .consume(|payload| {
+        .consume(agent_filter, |payload, _frame| {
             let _ = writeln!(out, "{payload}");
             let _ = out.flush();
         })
@@ -452,6 +459,32 @@ fn stream_url(base_url: &str) -> String {
         "{}/api/v1/dashboard/tasks/stream",
         base_url.trim_end_matches('/')
     )
+}
+
+/// L'agent qu'une trame du fil nomme, quand elle en nomme un.
+///
+/// Le `match` **énumère les huit variantes**, sans bras `_`, et c'est une garde
+/// de structure et non un goût de style : le fil est additif par contrat — « new
+/// variants may ship additively » dit le doc de [`TaskEventFrame`], qui nomme
+/// déjà mika#1734 et mika#1736. Sous un bras `_ => None`, une variante neuve
+/// portant un `agent_id` tomberait **silencieusement** du bon côté du filtre
+/// d'un autre agent. Énumérées, elle ne compile plus ici, et le compilateur
+/// nomme le site qui doit décider.
+///
+/// `None` pour `OverflowMarker` et `Unknown` : ces deux-là ne portent aucun
+/// agent. Ce que le filtre en fait est la décision de
+/// [`TaskEventStream::consume`] — il n'écarte que ce qu'il a **compris** comme
+/// étranger.
+fn frame_agent_id(frame: &TaskEventFrame) -> Option<&str> {
+    match frame {
+        TaskEventFrame::TaskCreated { agent_id, .. }
+        | TaskEventFrame::TaskClaimed { agent_id, .. }
+        | TaskEventFrame::TaskCompleted { agent_id, .. }
+        | TaskEventFrame::TaskFailed { agent_id, .. }
+        | TaskEventFrame::TaskDelivered { agent_id, .. }
+        | TaskEventFrame::TaskCancelled { agent_id, .. } => Some(agent_id),
+        TaskEventFrame::OverflowMarker { .. } | TaskEventFrame::Unknown => None,
+    }
 }
 
 /// An open task-events stream.
@@ -499,23 +532,53 @@ impl TaskEventStream {
     }
 
     /// Read until the server closes the stream, handing every `data:` payload to
-    /// `on_payload` **as it came off the wire**, one at a time and in order.
+    /// `on_event` — the bytes as they came off the wire, **and** their decode
+    /// into a [`TaskEventFrame`] when it succeeds — one at a time and in order.
     ///
-    /// Nothing is deserialized here. The only caller of this flight relays
-    /// bytes, and a decode nobody reads is the same fault this promotion
-    /// corrects one layer up — vol V2b-2 brings the decode together with the
-    /// per-agent filter that reads it. Returns `Ok(())` on a clean close; the
-    /// caller decides whether to reconnect.
-    pub(crate) async fn consume(mut self, mut on_payload: impl FnMut(&str)) -> Result<()> {
+    /// `agent_filter` is a **first, free stage**: under `Some(id)`, a payload
+    /// that decodes to a frame naming another agent never reaches `on_event`.
+    /// What the filter has *not* understood goes through — an `OverflowMarker`
+    /// (the only thing that says information is missing, including possibly the
+    /// caller's own), an `Unknown`, and an undecodable payload. Under `None`
+    /// nothing is dropped and the raw sequence is the one this consumer yielded
+    /// before the filter existed.
+    ///
+    /// The second closure parameter is an `Option<&TaskEventFrame>` rather than
+    /// a `&TaskEventFrame` because the two callers read disjoint halves:
+    /// `mika tasks stream` relays the raw payload and must keep showing what it
+    /// cannot decode — an instrument blind to a malformed frame measures
+    /// nothing — while the TUI's subscription reads the frame and ignores the
+    /// bytes. Returns `Ok(())` on a clean close; the caller decides whether to
+    /// reconnect.
+    pub(crate) async fn consume(
+        mut self,
+        agent_filter: Option<&str>,
+        mut on_event: impl FnMut(&str, Option<&TaskEventFrame>),
+    ) -> Result<()> {
         // Minimal SSE frame parser: buffer bytes, split on the event separator,
         // extract `data: <payload>` lines. Using `Response::chunk()` avoids
         // pulling the `futures-util` `Stream` extension (workspace dep is
         // `default-features = false`).
         let mut buffer: Vec<u8> = Vec::with_capacity(4096);
 
+        // The decode and the filter live in this relay, and not in
+        // `drain_events`, whose one responsibility is re-splicing an event cut
+        // across two packets — a property of the buffer alone, attested with no
+        // decode in the way.
+        let mut relay = |payload: &str| {
+            let frame = serde_json::from_str::<TaskEventFrame>(payload).ok();
+            let etrangere = match (agent_filter, frame.as_ref().and_then(frame_agent_id)) {
+                (Some(voulu), Some(porte)) => porte != voulu,
+                _ => false,
+            };
+            if !etrangere {
+                on_event(payload, frame.as_ref());
+            }
+        };
+
         while let Some(chunk) = self.resp.chunk().await.context("SSE stream read failed")? {
             buffer.extend_from_slice(&chunk);
-            drain_events(&mut buffer, &mut on_payload);
+            drain_events(&mut buffer, &mut relay);
         }
         Ok(())
     }
@@ -1018,7 +1081,7 @@ mod tests {
 
         let flux = TaskEventStream::open(&base, "jeton-de-test").await.unwrap();
         let mut rendues: Vec<String> = Vec::new();
-        flux.consume(|charge| rendues.push(charge.to_string()))
+        flux.consume(None, |charge, _| rendues.push(charge.to_string()))
             .await
             .unwrap();
 
@@ -1039,7 +1102,7 @@ mod tests {
         let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
 
         let mut puits: Vec<u8> = Vec::new();
-        stream_task_events_into(&base, "jeton-de-test", &mut puits)
+        stream_task_events_into(&base, "jeton-de-test", None, &mut puits)
             .await
             .unwrap();
 
@@ -1047,6 +1110,161 @@ mod tests {
             String::from_utf8(puits).unwrap(),
             "{\"task_id\":\"t-1\"}\n{\"task_id\":\"t-2\"}\n{\"task_id\":\"t-3\"}\n"
         );
+    }
+
+    /// `mika tasks stream --agent <id>` n'écrit que les lignes de cet agent.
+    /// C'est ce test qui fait du flag un **lecteur mesuré** du filtre : l'égalité
+    /// porte sur tout le puits, donc une ligne fuitée rougit autant qu'une ligne
+    /// perdue, et la sortie reste la charge **brute** — le décodage voyage pour
+    /// le filtre, pas pour changer la forme de l'écriture.
+    #[tokio::test]
+    async fn mika1727_v2b2a_mika_tasks_stream_agent_necrit_que_les_lignes_de_lagent_demande() {
+        let charges = [
+            r#"{"event":"task_completed","task_id":"t-1","agent_id":"mika-dev","completed_at":"2026-11-09T10:00:00Z","result_preview":null}"#,
+            r#"{"event":"task_completed","task_id":"t-2","agent_id":"mika-qa","completed_at":"2026-11-09T10:00:01Z","result_preview":null}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut puits: Vec<u8> = Vec::new();
+        stream_task_events_into(&base, "jeton-de-test", Some("mika-dev"), &mut puits)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(puits).unwrap(),
+            format!("{}\n", charges[0])
+        );
+    }
+
+    // -- le filtre par agent du fil des tâches (mika#1727, vol V2b-2a) --
+
+    /// Chaque variante du fil dit, ou non, son agent. Ce test mesure le
+    /// **choix** — six variantes en portent un, `OverflowMarker` et `Unknown`
+    /// n'en portent pas — et non l'exhaustivité du `match`, qui est tenue par le
+    /// compilateur et n'a pas besoin d'un test pour l'être.
+    #[test]
+    fn mika1727_v2b2a_chaque_variante_du_fil_dit_ou_non_son_agent() {
+        let quand = "2026-11-09T10:00:00Z".to_string();
+        let porteuses = [
+            TaskEventFrame::TaskCreated {
+                task_id: "t-1".to_string(),
+                agent_id: "mika-dev".to_string(),
+                kind: "callback".to_string(),
+                action_type: "resume_agent".to_string(),
+                label: None,
+                parent_task_id: None,
+                created_at: quand.clone(),
+            },
+            TaskEventFrame::TaskClaimed {
+                task_id: "t-2".to_string(),
+                agent_id: "mika-dev".to_string(),
+                claimed_at: quand.clone(),
+            },
+            TaskEventFrame::TaskCompleted {
+                task_id: "t-3".to_string(),
+                agent_id: "mika-dev".to_string(),
+                completed_at: quand.clone(),
+                result_preview: None,
+            },
+            TaskEventFrame::TaskFailed {
+                task_id: "t-4".to_string(),
+                agent_id: "mika-dev".to_string(),
+                failed_at: quand.clone(),
+                error_preview: None,
+            },
+            TaskEventFrame::TaskDelivered {
+                task_id: "t-5".to_string(),
+                agent_id: "mika-dev".to_string(),
+                delivered_at: quand.clone(),
+            },
+            TaskEventFrame::TaskCancelled {
+                task_id: "t-6".to_string(),
+                agent_id: "mika-dev".to_string(),
+                cancelled_at: quand,
+                reason: None,
+            },
+        ];
+        for trame in &porteuses {
+            assert_eq!(frame_agent_id(trame), Some("mika-dev"), "{trame:?}");
+        }
+
+        assert_eq!(
+            frame_agent_id(&TaskEventFrame::OverflowMarker { dropped_count: 7 }),
+            None
+        );
+        assert_eq!(frame_agent_id(&TaskEventFrame::Unknown), None);
+    }
+
+    /// Les charges de test sont des JSON **littéraux**, et non des
+    /// `TaskEventFrame` sérialisés : un aller-retour `to_string` → `from_str` du
+    /// même type ne mesurerait que la symétrie de serde avec elle-même, et
+    /// resterait vert le jour où le tag cesserait d'être `event` — c'est-à-dire
+    /// le jour où le consommateur cesserait de comprendre ce que le serveur
+    /// émet. Le littéral épingle le format du **fil**, qui est le contrat réel
+    /// entre `mika-agent` et `mika-cli`.
+    ///
+    /// Le contrôle négatif vit dans ce test : sous `None`, les trois trames
+    /// passent. Sans lui, un filtre qui écarterait *tout* serait vert.
+    #[tokio::test]
+    async fn mika1727_v2b2a_une_trame_dun_autre_agent_est_ecartee_du_fil() {
+        let charges = [
+            r#"{"event":"task_claimed","task_id":"t-1","agent_id":"mika-dev","claimed_at":"2026-11-09T10:00:00Z"}"#,
+            r#"{"event":"task_claimed","task_id":"t-2","agent_id":"mika-qa","claimed_at":"2026-11-09T10:00:01Z"}"#,
+            r#"{"event":"task_completed","task_id":"t-3","agent_id":"mika-dev","completed_at":"2026-11-09T10:00:02Z","result_preview":"fait"}"#,
+        ];
+
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+        let mut filtrees: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(Some("mika-dev"), |charge, _| {
+                filtrees.push(charge.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtrees, vec![charges[0], charges[2]]);
+
+        let mut toutes: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(None, |charge, _| toutes.push(charge.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(toutes, charges);
+    }
+
+    /// Le filtre n'écarte que ce qu'il a **compris** comme étranger. Un
+    /// `overflow_marker` dit à un consommateur filtré qu'il a perdu des trames,
+    /// dont peut-être les siennes : l'écarter serait perdre la seule information
+    /// qui dit que l'information manque.
+    ///
+    /// L'égalité porte sur toute la séquence, ce qui mesure du même coup que
+    /// `consume` est allée **jusqu'au bout du corps** : une charge indécodable
+    /// qui interromprait la lecture tronquerait la séquence au lieu de la
+    /// changer.
+    #[tokio::test]
+    async fn mika1727_v2b2a_le_filtre_laisse_passer_ce_quil_ne_comprend_pas() {
+        let charges = [
+            r#"{"event":"overflow_marker","dropped_count":3}"#,
+            r#"{"event":"trame_du_futur","task_id":"t-9","agent_id":"mika-qa"}"#,
+            r#"ceci n'est pas du JSON"#,
+            r#"{"event":"task_failed","task_id":"t-2","agent_id":"mika-qa","failed_at":"2026-11-09T10:00:01Z","error_preview":null}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut rendues: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(Some("mika-dev"), |charge, _| {
+                rendues.push(charge.to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rendues, vec![charges[0], charges[1], charges[2]]);
     }
 
     // -- the terminal filter reaches the operator's surface (mika#2670) --
