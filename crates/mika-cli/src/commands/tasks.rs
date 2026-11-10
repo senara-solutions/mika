@@ -603,18 +603,29 @@ impl TaskEventStream {
 /// `Serialize`, et ce vol ne modifie pas `crates/mika-agent/`. Ses autres champs
 /// sont ignorés par serde — tolérance voulue, attestée par `corps_de_detail`.
 ///
-/// Six champs, et **chacun a son lecteur ici** : les trois formats de
-/// [`get_task_detail_from_spirit_into`] les rendent tous. `created_trace_id` et
-/// `parent_task_id`, que portait le matériau de #3062, n'en ont aucun et
-/// n'entrent pas. `Serialize` est un lecteur lui aussi.
+/// Dix champs, et **chacun a son lecteur dans ce vol** : `Serialize` en rend dix
+/// en `json` et `yaml`, l'écrivain texte en rend les six que l'opérateur lit, et
+/// les quatre neufs — `trigger_type`, `action_type`, `created_trace_id` et
+/// `parent_task_id` — sont lus par la livraison d'un callback (vol V2b-2b-2).
+/// Le miroir ne prend **aucun champ « pour plus tard »** : c'est l'arrivée d'un
+/// lecteur, pas la largeur du serveur, qui fait entrer un champ ici.
+///
+/// La visibilité le dit champ par champ. `label`, `result`, `created_trace_id` et
+/// `parent_task_id` sont `pub(crate)` parce que le drainage les lit depuis
+/// `tui/app.rs`. Les six autres restent **privés** : leur seul lecteur hors des
+/// trois formats est le prédicat du poll, qui est une méthode d'ici.
 #[derive(serde::Deserialize, serde::Serialize)]
-struct TaskDetailMirror {
+pub(crate) struct TaskDetailMirror {
     id: String,
     agent_id: String,
-    label: String,
+    pub(crate) label: String,
     status: String,
+    trigger_type: String,
+    action_type: String,
     created_by_session: Option<String>,
-    result: Option<String>,
+    pub(crate) result: Option<String>,
+    pub(crate) created_trace_id: Option<String>,
+    pub(crate) parent_task_id: Option<String>,
 }
 
 /// Lire `GET /api/v1/tasks/{task_id}` sur mika-spirit.
@@ -629,7 +640,11 @@ struct TaskDetailMirror {
 /// comme un succès ; au drainage (vol V2b-2b-2), c'est **l'appelant** qui traduira
 /// ce `Err` en « je passe et je ne réclame pas ». Le `timeout` de 5 s vient du
 /// matériau : un flux a le droit de se taire, une requête courte non.
-async fn fetch_task_detail(base_url: &str, token: &str, task_id: &str) -> Result<TaskDetailMirror> {
+pub(crate) async fn fetch_task_detail(
+    base_url: &str,
+    token: &str,
+    task_id: &str,
+) -> Result<TaskDetailMirror> {
     let url = format!("{}/api/v1/tasks/{task_id}", base_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .get(&url)
@@ -1383,13 +1398,15 @@ mod tests {
 
     // -- le détail se lit sur mika-spirit (mika#1727, vol V2b-2b-1) --
 
-    /// Un corps tel que `dashboard::handle_task_detail` le rend : les six champs du
+    /// Un corps tel que `dashboard::handle_task_detail` le rend : les dix champs du
     /// miroir, **plus deux** qu'il laisse tomber — et qui mesurent la tolérance,
     /// sans quoi elle resterait une affirmation du commentaire.
     fn corps_de_detail() -> String {
         json!({"id": "t-42", "agent_id": "mika-qa", "label": "sonde:detail",
-               "status": "completed", "created_by_session": "s-7", "result": "ok",
-               "parent_task_id": null, "depth": 1})
+               "status": "completed", "trigger_type": "callback",
+               "action_type": "resume_agent", "created_by_session": "s-7",
+               "result": "ok", "created_trace_id": "tr-9", "parent_task_id": "t-41",
+               "depth": 1, "action_config": "{}"})
         .to_string()
     }
 
@@ -1424,9 +1441,15 @@ mod tests {
         assert_eq!(entete.as_deref(), Some("Bearer jeton"));
     }
 
-    /// **Critère 1** — les trois formats rendent le même miroir, ni un champ de plus
-    /// ni un de moins : les deux attentes se dérivent d'**une** liste de six paires,
-    /// donc un septième champ rendu ne peut pas être vert ici.
+    /// **Critère 1** — `json` et `yaml` rendent le même miroir, ni un champ de plus
+    /// ni un de moins : les deux attentes se dérivent d'**une** liste de dix paires,
+    /// donc un onzième champ rendu ne peut pas être vert ici.
+    ///
+    /// La liste est à dix depuis le vol V2b-2b-2, et l'attente du **texte** ne l'a
+    /// pas suivie : elle reste les six paires du test précédent, parce que
+    /// l'écrivain texte ne rend pas `trigger_type` ni `action_type` — des colonnes
+    /// de machine, pas une lecture d'opérateur. L'invariant « ni un de plus ni un de
+    /// moins » survit donc sur chaque format, pris séparément.
     #[tokio::test]
     async fn mika1727_v2b2b1_les_trois_formats_rendent_le_meme_miroir() {
         let (base, _) = fake_spirit::spawn_detail(200, corps_de_detail()).await;
@@ -1435,8 +1458,12 @@ mod tests {
             ("agent_id", "mika-qa"),
             ("label", "sonde:detail"),
             ("status", "completed"),
+            ("trigger_type", "callback"),
+            ("action_type", "resume_agent"),
             ("created_by_session", "s-7"),
             ("result", "ok"),
+            ("created_trace_id", "tr-9"),
+            ("parent_task_id", "t-41"),
         ];
 
         let (rendu, issue) = lire_detail(&base, "t-42", OutputFormat::Json).await;
