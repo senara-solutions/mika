@@ -1,20 +1,26 @@
-# mika#1727 — vol V2b-2b-2 : halte sur la borne par vol
+# mika#1727 — vol V2b-2b-2 : halte, sur un plancher remesuré à 326
 
-> **Verdict du groom : HALTE.** Le périmètre écrit de ce vol mesure
-> **395 lignes** hors `docs/`, pour une borne par vol de **279**.
-> Le corps du ticket ordonne la conduite à tenir : « Si le total dépasse 279, le
-> groom s'arrête et le dit. **Il ne recoupe pas lui-même** : ce vol est déjà le
-> recoupage. » Ce plan est donc la remontée, pas la conception.
+> **Verdict du groom : HALTE.** Le périmètre de ce vol mesure **326 lignes**
+> hors `docs/`, pour une borne par vol de **279**. Le corps du ticket ordonne la
+> conduite : « Si le total dépasse 279, le groom s'arrête et le dit. **Il ne
+> recoupe pas lui-même** : ce vol est déjà le recoupage. »
 >
-> **Troisième passe, et c'est la mesure qui est le livrable.** Le verdict est
-> celui des deux passes antérieures (15:03Z, 15:29Z), mais il n'est pas repris
-> de confiance : chaque poste du plancher a été remesuré sur le code et sur le
-> matériau au diff. Le § 0.2 dit lequel, et par quelle commande.
+> **Quatrième passe, et le chiffre a changé.** Les trois passes antérieures
+> (15:03Z, 15:29Z, puis la réécriture de ce fichier) ont écrit **395**. Cette
+> passe écrit **326**, et le § 1 nomme la cause de l'écart : les trois
+> antérieures ont chiffré **l'emplacement que #3069 donne au code**, jamais le
+> plancher du but. Déplacer la lecture HTTP et le prédicat derrière une couture
+> de `tasks.rs` retire 69 lignes, renforce une contrainte du corps au lieu de
+> l'affaiblir, et rend quatre des huit propriétés exigées testables sans base ni
+> `App`.
 >
-> **Ce que cette passe ajoute, et qui manquait :** le § 5, qui nomme l'issue
-> machine attendue de cette halte. Son absence est la raison pour laquelle ce
-> ticket a été redispatché deux fois au lieu d'atteindre Vincent — un quatrième
-> dispatch ne produirait pas un quatrième chiffre, il produirait le même.
+> **Ce que l'écart change, et c'est tout l'objet de cette passe.** Il ne suffit
+> pas à passer sous 279 — il reste 47 lignes de trop. Mais il refait la table
+> des arbitrages du § 5 : **A4 seul suffit désormais**, avec une marge de 24 %
+> au-dessus du biais d'estimation de 16 % mesuré au § 0.3, là où la passe 3 le
+> jugeait un pari à 8 % et n'admettait que le couple A4 + A1. Le geste qui
+> débloque passe donc de « deux gestes, ou un critère perdu » à **un seul geste
+> d'opérateur, et aucun critère perdu**.
 
 ---
 
@@ -22,71 +28,78 @@
 
 ### 0.1 — L'état de `main` (`766a62788`)
 
-Tout ce que le corps du ticket décrit sous « Ce qui est sur main » est exact,
-vérifié site par site :
+Tout ce que le corps décrit sous « Ce qui est sur main » est exact, vérifié site
+par site cette passe :
 
 | affirmation du corps | site vérifié |
 |---|---|
 | `TaskEventStream::open` / `consume` sont `pub(crate)` | `crates/mika-cli/src/commands/tasks.rs:523` et `:565` |
-| `fetch_task_detail` et `TaskDetailMirror` sont privés au module, six champs | `tasks.rs:611-618` et `:632` |
+| `fetch_task_detail` et `TaskDetailMirror` sont privés au module | `tasks.rs:632` et `:611` |
+| le miroir porte **six** champs | `tasks.rs:611-618` |
 | le détail échoue explicitement sur un statut non-succès ou un corps illisible | `tasks.rs:643-650` |
 | `fake_spirit` a deux constructeurs, chacun sur son serveur | `tasks.rs:2057` (`spawn`), `:2088` (`spawn_detail`) |
-| `poll_callback_tasks` réclame par `mark_task_delivered` et livre | `tui/app.rs:1596`, `:1646`, `:1673` |
-| `app_with_response_sender` bâtit une `App` sur une base en mémoire | `tui/app.rs:2158` |
-| `TaskEventFrame` a **huit** variantes | les huit, énumérées au `match` du matériau |
+| `poll_callback_tasks` réclame par `mark_task_delivered` et livre | `tui/app.rs:1596` |
+| il est appelé au tick, au repos, hors mode équipe, toutes les 167 | `tui/app.rs:1123`, `POLL_INTERVAL_TICKS` à `:663` |
+| `app_with_response_sender` bâtit une `App` sur une base en mémoire | `tui/app.rs:2160` |
+| `TaskEventFrame` a **huit** variantes | `crates/mika-agent/src/server/tasks_stream.rs:102-150` |
 
-**Les six champs du miroir, nommément** — ce point gouverne tout le § 3 :
-`id`, `agent_id`, `label`, `status`, `created_by_session`, `result`
-(`tasks.rs:611-618`). Ni `trigger_type`, ni `action_type`, ni `created_trace_id`,
-ni `parent_task_id`. Le critère 1 exige que le `CallbackResult` porte
-« `trace_id` et `parent_task_id` **tirés du détail** » : **le miroir à dix champs
-est donc obligatoire au but écrit**, et non un confort.
+**Les six champs du miroir, nommément**, parce que ce point gouverne le § 3 :
+`id`, `agent_id`, `label`, `status`, `created_by_session`, `result`. Ni
+`trigger_type`, ni `action_type`, ni `created_trace_id`, ni `parent_task_id`. Le
+critère 1 exige que le `CallbackResult` porte « `trace_id` et `parent_task_id`
+**tirés du détail** », et la garde 2 exige `trigger_type` et `action_type` : **le
+miroir à dix champs est obligatoire au but écrit**, pas un confort.
 
-Deux points que le corps ne dit pas et qui pèsent sur la mesure :
+Trois points que le corps ne dit pas et qui pèsent sur la mesure :
 
 - `app_with_response_sender` **jette** le receveur des `AgentRequest`
-  (`let (agent_tx, _request_rx) = …`, `tui/app.rs:2179`). Le critère 1 exige
-  d'observer un `AgentRequest::CallbackResult` et ses six champs : le helper doit
-  rendre ce receveur, ce qui touche sa signature et ses appelants.
+  (`let (agent_tx, _request_rx) = …`). Le critère 1 exige d'observer un
+  `AgentRequest::CallbackResult` : le helper doit rendre ce receveur, ce qui
+  touche sa signature et ses **trois** appelants.
 - **`poll_callback_tasks` n'a aucun test.** Les deux seules occurrences du nom
-  dans `tui/app.rs` sont sa définition (`:1596`) et son appel au tick (`:1126`).
-  Il n'existe donc, côté `tui/app.rs`, aucun helper d'ensemencement d'une ligne
-  de callback à réutiliser. Celui de ce vol part de zéro, et c'est le poste F1
-  ci-dessous.
+  dans `tui/app.rs` sont sa définition (`:1596`) et son appel au tick (`:1123`).
+  Aucun helper d'ensemencement d'une ligne de callback n'existe donc côté
+  `tui/app.rs` : celui de ce vol part de zéro.
+- **`NewTask` ne dérive que `Debug, Clone`** — vérifié à
+  `crates/mika-agent/src/task_state/tasks.rs:1049-1050`, aucun `Default`. Lui en
+  ajouter un serait modifier `crates/mika-agent/`, que le corps exclut. Le
+  littéral de 23 champs est donc irréductible **depuis `mika-cli`**, et c'est ce
+  qui fixe le poste le plus lourd des tests (§ 3, 36 lignes).
 
-### 0.2 — Ce que cette troisième passe a remesuré elle-même
+### 0.2 — Le matériau, remesuré au diff
 
-Le plancher du § 2 est le fait dur de cette halte. Il est donc remesuré, et non
-hérité. Ce tableau dit ce qui a été lu et comment, pour que chaque ligne soit
-contestable séparément :
+Les deux commits de #3069 sont lisibles localement (`git cat-file -t` les
+confirme), et leurs chiffres sont ceux du corps :
 
-| poste | mesure de cette passe | commande |
+| mesure | commande | résultat |
 |---|---|---|
-| miroir `23525549c` | **`+41 −14`** sur `tasks.rs`, exact | `git diff --numstat 766a62788 23525549c` |
-| matériau `5321ba47d` | **`+298`** code : 19 `chat.rs`, 168 `tasks.rs`, 111 `app.rs` | `git diff --numstat 23525549c 5321ba47d` |
-| `terminal_callback_frame` | **12** lignes de code, **11** une fois `TaskFailed` replié dans le bras `None` | lecture au diff |
-| `spawn_callback_subscription` | **25** lignes de code | lecture au diff |
-| `is_resume_callback_for` | **8** lignes de code (`impl` + signature + quatre conjonctions) | lecture au diff |
-| `drain_callback_deliveries` | **≈ 56** lignes de code, branche `failed` retirée | lecture au diff |
-| site d'appel au tick | **8** lignes dont 4 de commentaire | lecture au diff |
-| `TaskEventFrame` | **8** variantes — le `match` sans bras `_` qu'exige le corps les porte toutes | lecture au diff |
-| `NewTask` | **23** paramètres d'INSERT, **aucun `Default`** | `crates/mika-agent/src/db/tasks.rs:99-122` |
+| miroir `23525549c` | `git diff --numstat 766a62788 23525549c` | **`+41 −14`** sur `tasks.rs` |
+| matériau `5321ba47d` | `git diff --numstat 23525549c 5321ba47d` | **`+298`** : 19 `chat.rs`, 168 `tasks.rs`, 111 `app.rs` |
 
-Deux conséquences de ce remesurage, et elles vont dans le sens de la halte :
+Lu ligne par ligne, le matériau de `tasks.rs` se décompose ainsi — et **56 de ses
+168 lignes sont hors du périmètre de ce vol**, ce que les passes antérieures
+n'avaient pas isolé :
 
-- **Les chiffres de code du matériau sont confirmés, pas revus.** Les postes du
-  § 1 sont ces mesures plus une part de documentation déjà comprimée ; aucun
-  n'est gonflé. Le poste le plus lourd — `drain_callback_deliveries` à 57 — est
-  à une ligne de son mesuré.
-- **Le plancher des tests est confirmé par `NewTask`.** 23 paramètres sans
-  `Default` : le littéral seul d'une ligne de callback est irréductible, et les
-  30 lignes du helper d'ensemencement sont un plancher mesuré, pas une
-  approximation.
+| bloc du matériau | lignes | sort dans ce vol |
+|---|---|---|
+| `terminal_callback_frame` | 25 | retenu, réduit (`TaskFailed` au bras `None`) |
+| `spawn_callback_subscription` | 41 | retenu, refondu en `CallbackFeed` |
+| `is_resume_callback_for` | 28 | **absorbé** par la couture du § 2 |
+| ajustement du commentaire du miroir | 2 | retenu |
+| helper `servir` de `fake_spirit` | 14 | **hors périmètre** (pas de constructeur neuf) |
+| `spawn_stream_and_details` | 55 | **hors périmètre** (constructeur neuf, interdit) |
+
+Le matériau porte donc un troisième constructeur de serveur factice que le corps
+exclut nommément. Les tests de ce plan s'en passent : T1 se sert de `spawn`, T2
+de `spawn_detail`, et le § 3 ne contient aucun poste de constructeur. **Aucun
+critère de ce plan n'échoue sans constructeur neuf** — c'est la réponse à la
+clause « un constructeur neuf n'entre que si un critère ne tient pas sans lui, et
+le plan dit lequel ».
 
 ### 0.3 — La calibration de l'estimateur, mesurée sur le vol précédent
 
-Le vol V2b-2b-1 a écrit `Total estimé : 241 lignes`
-(`docs/plans/2026-11-10-001-…-plan.md:539`) et a livré, hors `docs/plans/` :
+Le vol V2b-2b-1 a écrit `Total estimé : 241 lignes` et a livré, hors
+`docs/plans/` :
 
 ```
 $ git diff --numstat dbc6d2b01..766a62788
@@ -95,299 +108,378 @@ $ git diff --numstat dbc6d2b01..766a62788
 1    1   docs/egress/egress-manifest.toml
 ```
 
-**279 lignes ajoutées pour 241 estimées — une sous-estimation de 16 %**, et un
-atterrissage exactement sur la borne. Ce n'est pas une anecdote : même fichier,
-même style de commentaire, même auteur de plan. La mesure ci-dessous est moins
-exposée à ce biais — 41 de ses lignes sont mesurées au commit et ~165 sont lues
-au diff du matériau — mais ses 185 lignes de tests, elles, n'ont jamais été
-écrites et portent le biais entier.
+**279 ajoutées pour 241 estimées — une sous-estimation de 16 %**, et un
+atterrissage exactement sur la borne. Même fichier, même style, même auteur de
+plan : ce biais est la grandeur contre laquelle toute marge de ce plan doit être
+jugée, et c'est à ce titre qu'il décide du § 5.
+
+### 0.4 — Egress Manifest Lint, mesuré maintenant
+
+```
+$ bash scripts/verify-egress-manifest.sh --report
+egress-manifest: 400 fichier(s) .rs de production scanné(s), 31 portant une
+construction de client, 22 host(s) distinct(s) rencontré(s), 31 entrée(s)
+[[sink]] confrontée(s).
+No egress-manifest violations found.
+```
+
+**Vert aujourd'hui, et le critère 4 est tenable sans toucher `docs/egress/`** —
+sous les deux formes, celle du matériau comme celle du § 2. La raison est
+précise, et elle n'est pas celle qu'on devine : le lint confronte les fichiers
+qui **construisent un client** et les hosts qu'ils visent, pas les sites
+d'appel. `tui/app.rs` en construit déjà un (`:1004`, les boutons du tableau de
+bord, déclaré par `cli-spirit-tui`), et le compte est déjà équilibré à 31/31.
+Appeler `fetch_task_detail` depuis `tui/app.rs` ne construirait aucun client de
+plus : le lint resterait vert.
+
+Ce que la couture du § 2 améliore n'est donc **pas la couleur du lint**, c'est la
+véracité du manifeste : `cli-spirit-tasks` déclare
+`call_site = "crates/mika-cli/src/commands/tasks.rs"` pour « les deux gestes »,
+l'ouverture du flux et la lecture du détail (`docs/egress/egress-manifest.toml:352-359`).
+Sous la forme du matériau, le second geste s'appelle depuis `tui/app.rs` et cette
+déclaration devient fausse en silence — un manifeste qui ne mord pas. Sous la
+couture, elle reste exacte sans être modifiée. C'est un argument de justesse
+documentaire, et il est énoncé comme tel.
 
 ---
 
-## 1 — La mesure, livrable par livrable
+## 1 — L'hypothèse que les trois passes antérieures n'ont pas testée
 
-Le découpage suit l'ordre de commit que le corps impose — « le pilote commite
-après chaque garde verte avec son test ». La colonne « source » dit ce qui est
-mesuré et ce qui est estimé.
+Les trois passes ont établi un plancher de **210 lignes hors tests** et conclu
+qu'aucun découpage ne ramenait le but sous 279. Leur mesure est fidèle — chaque
+poste est vérifiable au diff du matériau. Mais elle chiffre **une implémentation
+particulière** : celle de #3069, qui place dans `tui/app.rs` la lecture HTTP du
+détail et l'application du prédicat, et qui fait donc voyager vers la TUI l'URL
+de base, le jeton, et la connaissance du miroir.
+
+Ce qu'aucune des trois n'a demandé : *le plancher change-t-il si la couture
+change ?* Il change, et de 69 lignes. Le plancher de 210 n'est pas une propriété
+du but écrit ; c'est une propriété de l'emplacement du code.
+
+Trois conséquences se tiennent, et la seconde est la plus importante :
+
+1. **Les trois champs posés sur `App` deviennent un seul**, et ni l'URL ni le
+   jeton n'entrent dans `tui/app.rs`.
+2. **La contrainte du corps est renforcée, pas contournée.** « Aucun client HTTP
+   dans `tui/app.rs`. La TUI appelle ce que `tasks.rs` expose » : le matériau la
+   satisfait à la lettre — il appelle bien une fonction de `tasks.rs` — mais
+   `tui/app.rs` y détient l'URL, le jeton et le nom de la lecture. Sous la
+   couture, la TUI n'a aucun des trois : la contrainte devient une propriété du
+   **type**, et non une consigne qu'une relecture doit vérifier.
+3. **Quatre des huit propriétés exigées se testent sans base ni `App`** —
+   l'économie de test la plus lourde, détaillée au § 3.1.
+
+---
+
+## 2 — La couture, et ce qu'elle déplace
+
+Un type dans `tasks.rs` porte les trois éléments indissociables du fil, et expose
+**un seul geste** à la TUI : « donne-moi le prochain candidat recevable ».
+
+```rust
+pub(crate) struct CallbackFeed {
+    rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    base_url: String,
+    token: String,
+}
+```
+
+- **`CallbackFeed::open_for(agent_id, base_url, token)`** ouvre le flux une
+  fois, sans recul ni reconnexion, et pousse sur le canal les `task_id` que
+  `terminal_callback_frame` reconnaît. Le canal ne porte **que** le `task_id` :
+  `TaskFailed` étant hors de ce vol, l'`original_status` vaut toujours
+  `"completed"` et n'a pas à voyager — le couple du matériau tombe.
+- **`CallbackFeed::next_candidate(agent_id, session_id) -> Option<TaskDetailMirror>`**
+  enchaîne les deux premières gardes : `try_recv`, puis la lecture HTTP du
+  détail, puis le prédicat du poll. `None` couvre les quatre refus — canal vide,
+  détail en erreur, détail illisible, prédicat faux — et **aucun ne réclame**,
+  ce qui est exactement « je passe et je ne réclame pas », la ligne restant
+  `completed` pour le poll.
+
+`is_resume_callback_for` disparaît comme méthode publique : ses quatre
+conjonctions vivent dans `next_candidate`, qui est son seul appelant, et les
+quatre champs qu'elles lisent restent **privés** au module — le miroir conserve
+son énoncé « chaque champ a son lecteur, et pas un de plus » sans élargir aucune
+visibilité. C'est le poste de 28 lignes du matériau qui s'absorbe.
+
+`tui/app.rs` garde alors les quatre derniers gestes, et eux seuls : réclamer par
+`mark_task_delivered`, sauter un `completed` sans résultat, pousser le message
+système, envoyer le `CallbackResult` puis passer en `Thinking`. Le `match` sur
+`TaskEventFrame` reste exhaustif, sans bras `_`, dans `terminal_callback_frame`.
+
+**Ce que la couture ne fait pas.** Elle ne touche pas `poll_callback_tasks`
+(critère 4), n'ajoute aucun constructeur de serveur factice, ne modifie ni
+`crates/mika-agent/` ni `crates/mika-a2a/`, et laisse `docs/egress/` intact.
+Elle ne supprime pas non plus la duplication des gestes 4 à 6 avec le poll :
+cette duplication est assumée pour un vol, V2b-3 retirant le poll et elle avec.
+
+---
+
+## 3 — La mesure, livrable par livrable
+
+L'ordre suit celui des commits que le corps impose — « le pilote commite après
+chaque garde verte avec son test ». La colonne « source » dit ce qui est mesuré
+et ce qui est estimé, pour que chaque ligne soit contestable séparément.
 
 ### Commit A — le miroir grandit avec son lecteur
 
 | livrable | source | lignes |
 |---|---|---|
-| reprise de `23525549c`, tests de format compris | **mesuré** | 41 |
+| reprise de `23525549c` telle quelle, tests de format compris | **mesuré** | 41 |
+
+Une version resserrée coûterait ≈ 25 — l'essentiel des 41 est une réécriture de
+doc et la mise à jour de l'attente « ni un champ de plus ni un de moins », qui
+passe de six à dix paires. Le corps blesse pourtant la reprise telle quelle
+(« MPC l'a relu et le juge sain : il peut être repris tel quel »), et un
+`cherry-pick` coûte moins de tours qu'une réécriture. **C'est 41 qui est retenu**,
+et la différence de 16 lignes est nommée ici pour que l'arbitrage reste ouvert.
 
 ### Commit B — l'abonnement (`tasks.rs`, `chat.rs`)
 
 | livrable | source | lignes |
 |---|---|---|
-| `terminal_callback_frame` — `match` exhaustif sur huit variantes, sans bras `_` | **mesuré 11**, + doc | 20 |
-| `CallbackFeed` + `spawn_callback_subscription` | **mesuré 25**, + struct, + doc | 43 |
-| `TaskDetailMirror::is_resume_callback_for` | **mesuré 8**, + doc | 18 |
-| commentaire du miroir ajusté à son nouveau lecteur | **mesuré** | 2 |
-| site d'abonnement dans `chat::run` | matériau 19, comprimé | 14 |
-| tests — T1 abonnement filtrant (une séquence SSE multi-trames), T2 prédicat (cinq cas) | estimé | 57 |
+| `terminal_callback_frame` — `match` exhaustif sur huit variantes, sans bras `_` | **mesuré 11** + 6 doc | 17 |
+| `CallbackFeed` + `open_for` + `next_candidate` | matériau 66 refondu, écrit ligne à ligne | 66 |
+| site d'abonnement dans `chat::run` | matériau 19, comprimé | 12 |
+| tests — T1 abonnement filtrant, T2 les six refus | estimé | 56 |
 
-**Sous-total B : 154.**
+**Sous-total B : 151.**
 
-Trois notes, parce que ces chiffres sont déjà le résultat d'une compression et
-non du matériau brut :
-
-- `terminal_callback_frame` ne rend plus le couple `(task_id, original_status)`
-  du matériau mais le `task_id` seul : `TaskFailed` étant hors de ce vol,
-  l'`original_status` vaut toujours `"completed"` et n'a pas à voyager. Replier
-  `TaskFailed` dans le bras `None` fait tomber le code de 12 à 11 lignes — c'est
-  tout ce que cette exclusion économise, le `match` exhaustif sur les huit
-  variantes restant dû.
-- Le matériau pose **trois** champs sur `App` (`task_event_rx`,
-  `spirit_base_url`, `spirit_token`). Ce plan les regroupe en un `CallbackFeed` :
-  le trio est indissociable — le drainage exige les trois ou sort — et le
-  regroupement économise quatre lignes d'initialisation et supprime le
-  `let (Some, Some, Some) = … else` triple. Le gain net est de 5 lignes.
-- Les commentaires sont déjà coupés : 60 lignes de doc sur les 395, soit 15 %,
-  contre 39 % dans `crates/` de #3069 (131 sur 338, chiffre du corps).
+Les 66 lignes de `CallbackFeed` ont été écrites ligne à ligne pour cette mesure,
+et non extrapolées : 50 de code (5 de struct, 21 d'`open_for`, 16 de
+`next_candidate`, 8 d'`impl` et de signatures) et 16 de doc, soit 24 % — contre
+39 % dans `crates/` de #3069 (131 sur 338, chiffre du corps). Le commentaire y
+dit le pourquoi qu'on ne lit pas dans le code : pourquoi l'abonnement part de
+`chat::run` et non du constructeur, pourquoi le canal ne porte que le `task_id`,
+pourquoi aucun des quatre refus ne réclame.
 
 ### Commit C — le drainage (`tui/app.rs`)
 
 | livrable | source | lignes |
 |---|---|---|
-| champ `callback_feed` + les deux initialisations de constructeur | matériau 23, comprimé | 7 |
-| `drain_callback_deliveries` (les quatre gardes) | **mesuré 56**, doc comprimée | 57 |
-| site d'appel au tick, au repos, hors mode équipe | **mesuré** | 8 |
-| helper d'ensemencement d'une ligne de callback en base | estimé, **plancher** | 30 |
-| `app_with_response_sender` rend le receveur + ses appelants | estimé | 8 |
-| tests — T3 à T6 (voir § 1.1) | estimé | 90 |
+| champ `callback_feed` + les deux initialisations de constructeur | matériau 23, comprimé | 9 |
+| `drain_callback_deliveries` (les quatre derniers gestes) | matériau 56, écrit ligne à ligne | 38 |
+| site d'appel au tick, au repos, hors mode équipe | **mesuré** | 7 |
+| helper d'ensemencement d'une ligne de callback en base | estimé, **plancher** | 36 |
+| `app_with_response_sender` rend le receveur + ses trois appelants | estimé | 6 |
+| tests — T3 livré une fois et pas deux, T4 déjà réclamé | estimé | 38 |
 
-**Sous-total C : 200.**
+**Sous-total C : 134.**
 
-Le helper d'ensemencement coûte 30 lignes et c'est un plancher mesuré :
-`create_task` prend un `NewTask` de **23 paramètres sans `Default`**
-(`crates/mika-agent/src/db/tasks.rs:99-122`), et le seul précédent du dépôt sur
-exactement cette forme de ligne — `seed_callback_row`, `tasks.rs:1509-1562` —
-en fait la démonstration en 53 lignes, dont 23 pour le seul littéral.
+Le drainage tombe de 56 à 38 parce que les deux premières gardes sont parties
+dans `next_candidate` : il ne reste que le `let Some(detail) = … else { return }`,
+le `match` sur `mark_task_delivered`, le saut d'un résultat vide, et la
+livraison.
 
-### 1.1 — Le jeu de tests est déjà minimal
+Le helper d'ensemencement coûte 36 lignes et **c'est un plancher mesuré, non une
+approximation** : `create_task` prend un `NewTask` de 23 champs sans `Default`
+(§ 0.1), ce qui fait 23 lignes pour le seul littéral, plus la signature, l'ouverture
+de la base en mémoire, le passage du statut à `completed` et la relecture de
+l'identifiant. Le seul précédent du dépôt sur exactement cette forme —
+`seed_callback_row`, `tasks.rs:1509-1562` — en fait la démonstration en 53 lignes,
+et il est de surcroît `#[cfg(target_os = "linux")]` et paramétré pour un pgid :
+il n'est pas réutilisable ici.
+
+### 3.1 — Le jeu de tests est déjà minimal, et c'est la couture qui l'a réduit
 
 Le corps est sans ambiguïté : « Chaque garde arrive avec ses tests, dans le même
 commit. Les tests ne se reportent jamais à un vol suivant. » Les cinq critères
 exigent huit propriétés distinctes. Voici le groupement le plus serré qui les
-couvre toutes, et il tient en **six** tests :
+couvre, et la colonne « coût » dit ce que la couture a changé :
 
-| propriété exigée | critère | test | où |
-|---|---|---|---|
-| une trame d'un autre agent ne passe pas | 2 | T1 | `tasks.rs` |
-| `TaskFailed`, `Unknown`, `OverflowMarker` ignorées sans casser l'abonnement | 3 | T1 | `tasks.rs` |
-| `callback` / `resume_agent` exigés | 2 | T2 | `tasks.rs` |
-| un `completed` n'est livré qu'une fois | 1 | T3 | `app.rs` |
-| rien si le poll a déjà réclamé | 1 | T4 | `app.rs` |
-| une autre session n'est ni livrée ni réclamée | 2 | T5 | `app.rs` |
-| détail en erreur HTTP ou illisible : ni livré ni réclamé, ligne encore `completed` | 3 | T6 | `app.rs` |
+| propriété exigée | critère | test | où | coût |
+|---|---|---|---|---|
+| une trame d'un autre agent ne passe pas | 2 | T1 | `tasks.rs` | sans base, sans `App` |
+| `TaskFailed`, `Unknown`, `OverflowMarker` ignorées sans casser l'abonnement | 3 | T1 | `tasks.rs` | sans base, sans `App` |
+| `callback` / `resume_agent` exigés | 2 | T2 | `tasks.rs` | sans base, sans `App` |
+| une autre session n'est ni livrée ni réclamée | 2 | T2 | `tasks.rs` | sans base, sans `App` |
+| détail en erreur HTTP : ni livré ni réclamé | 3 | T2 | `tasks.rs` | sans base, sans `App` |
+| détail illisible : ni livré ni réclamé | 3 | T2 | `tasks.rs` | sans base, sans `App` |
+| un `completed` n'est livré qu'**une** fois | 1 | T3 | `app.rs` | base + `App` |
+| rien si le poll a déjà réclamé | 1 | T4 | `app.rs` | base + `App` |
 
-T1 porte quatre propriétés en une seule séquence SSE, et T6 porte ses deux cas en
-un test paramétré : la compression des tests est **déjà appliquée** dans le
-chiffre de 147 (57 + 90). Elle ne peut aller plus loin sans perdre une propriété,
-et le corps interdit de perdre une propriété.
+**Six propriétés sur huit quittent `app.rs`.** C'est l'effet principal de la
+couture : sous la forme du matériau, « autre session », « pas un callback » et
+« détail illisible » exigeaient chacun une `App` et une ligne en base, parce que
+le prédicat et la lecture HTTP y vivaient. Sous `next_candidate`, un test les
+mesure avec un canal qu'il alimente lui-même et un `spawn_detail` jetable — et
+l'unique helper de 36 lignes ne sert plus que **deux** tests au lieu de six.
 
-Aucun constructeur neuf de serveur factice n'entre : T1 se sert de `spawn`, T3 à
-T6 de `spawn_detail` avec un canal bâti par le test. C'est ce que le corps
-demande, et le plan n'a pas de critère qui échoue sans un constructeur neuf.
+T1 porte quatre propriétés en une seule séquence SSE de six trames ; T2 porte ses
+six refus et son témoin positif en un test paramétré par un corps de détail.
+La compression est **déjà appliquée** dans le chiffre de 94 (56 + 38) : elle ne
+peut aller plus loin sans perdre une propriété, et le corps l'interdit.
 
 ---
 
-## 2 — Le fait dur : le plancher du but dépasse déjà, avant les tests
+## 4 — Le fait dur : le plancher, et ce qui reste pour les tests
 
-C'est ici que cette halte se distingue d'un simple dépassement de périmètre.
-
-Le code **structurellement nécessaire au but écrit** — un `completed` arrive par
-le SSE, se lit par HTTP, se réclame, se livre une fois — est la somme des postes
-hors tests :
+Le code structurellement nécessaire au but écrit — un `completed` arrive par le
+SSE, se lit par HTTP, se réclame, se livre une fois — hors tout test :
 
 ```
-41  miroir à dix champs        (critère 1 : trace_id + parent_task_id du détail)
-20  terminal_callback_frame    (le fil dit quelle tâche)
-43  CallbackFeed + abonnement  (une ouverture, un canal)
-18  is_resume_callback_for     (le prédicat du poll, garde 2)
- 2  commentaire du miroir
-14  site d'abonnement          (chat::run, pas run_team)
- 7  champ + inits
-57  drain_callback_deliveries  (les quatre gardes)
- 8  site d'appel au tick
---
-210  plancher, hors tout test
+ 41  miroir à dix champs        (critère 1 : trace_id + parent_task_id du détail)
+ 17  terminal_callback_frame    (le fil dit quelle tâche, sans bras `_`)
+ 66  CallbackFeed               (ouverture, canal, lecture HTTP, prédicat)
+ 12  site d'abonnement          (chat::run, pas run_team)
+  9  champ + deux inits
+ 38  drain_callback_deliveries  (réclamer, sauter un vide, livrer)
+  7  site d'appel au tick
+---
+190  plancher, hors tout test
 ```
 
-La borne est à 279. **Il reste 69 lignes pour l'ensemble des tests** — dont 30
-sont prises par le seul helper d'ensemencement, qui est un plancher mesuré. Soit
-**39 lignes pour six tests et huit propriétés**, environ 6 lignes par test, sans
-compter le receveur à rendre.
+La borne est à 279 : **il reste 89 lignes pour les tests**, dont 36 prises par le
+seul helper d'ensemencement et 6 par le receveur à rendre. Soit **47 lignes pour
+six tests et huit propriétés**, quand la mesure du § 3 en demande 94.
 
-Ce n'est pas une marge serrée, c'est l'absence de marge. Et le corps ferme la
-seule sortie qui resterait : « Si le budget ne tient pas avec les tests, c'est le
-périmètre qui se réduit, **jamais les tests**. »
+Les deux leviers restants sont déjà tirés :
 
-Les deux autres leviers sont déjà tirés :
+- **Les commentaires.** À 24 % du code neuf, contre 39 % au matériau. Les ramener
+  à zéro — un plan refusé en revue, et à juste titre — laisserait ≈ **287**.
+  Toujours au-dessus, et la marge serait alors négative sous le biais de 16 %.
+- **Le rangement des tests.** C'est précisément ce que la couture a déjà fait, et
+  à grande échelle : six propriétés sur huit ont quitté `app.rs` (§ 3.1). La
+  porte « il suffisait de mieux ranger les tests » n'est pas fermée par un avis,
+  elle est **franchie**, et le résultat est les 326 de ce plan au lieu des 395 des
+  passes antérieures.
 
-- **Les commentaires.** Déjà à 15 % contre 39 % au matériau. Les ramener à zéro —
-  ce qui serait un plan refusé en revue, et à juste titre — laisserait **335**.
-  Toujours au-dessus.
-- **Le rangement des tests.** Migrer vers `tasks.rs` tout ce qui se teste sans
-  base (T2, T6, et le prédicat de T5) économise le setup `App` de trois tests,
-  ≈ −25, et coûte une fonction d'enveloppe, ≈ +8. Net **−17**, à 378. La porte
-  « il suffisait de mieux ranger les tests » est donc fermée par la mesure, et
-  non par un avis.
-
-### 2.1 — La coupe que mika#2205 interdit
+### 4.1 — La coupe que mika#2205 interdit
 
 La coupe qui vient d'abord à l'esprit — l'abonnement dans ce vol, le drainage
-dans le suivant — est **interdite**, et le corps la ferme nommément : « Un
-abonnement dont personne ne draine le canal, ou un drainage sans livraison, ne
-passe pas non plus (mika#2205). » Elle n'est pas une coupe candidate, et ce plan
-ne la propose pas.
+dans le suivant — est fermée nommément par le corps : « Un abonnement dont
+personne ne draine le canal, ou un drainage sans livraison, ne passe pas non plus
+(mika#2205). » Elle n'est pas candidate, et ce plan ne la propose pas.
 
-Son corollaire, qui est le résultat de ce groom : puisque le plancher
-bout-en-bout vaut 210 et que mika#2205 exige que chaque PR soit utile de bout en
-bout, **aucun découpage en vols ne ramène ce but sous 279**. Un découpage en deux
-PR dont la première serait le miroir seul (41) laisse 354 à la seconde. Le choix
-qui reste n'est donc pas un choix de taille : c'est l'un des quatre arbitrages
-ci-dessous.
-
----
-
-## 3 — Les arbitrages candidats, chiffrés et non choisis
-
-Ils sont la matière de la décision de Vincent. Aucun n'est retenu ici.
-
-### A1 — Le miroir part seul, et part aujourd'hui
-
-Le commit `23525549c` (`+41 −14`, relu par MPC, jugé sain) est **mergeable
-seul**, et ses lecteurs sont immédiats et déjà sur `main` : les trois formats de
-`mika tasks get <id> --spirit` rendent les quatre champs neufs en `json` et
-`yaml` dès ce commit. Il ne porte aucun champ « pour plus tard » — l'énoncé
-« chaque champ a son lecteur » survit sans l'abonnement, et mika#2205 est
-satisfait.
-
-Reste à livrer : **354**. L'arbitrage ne suffit pas seul, mais il sort 41 lignes
-du chemin critique, sans risque, et il est le seul des quatre qui soit livrable
-immédiatement.
-
-### A2 — Le prédicat se lit sur la base, et non sur le détail HTTP
-
-Au lieu de `is_resume_callback_for` sur le détail, le drainage rapproche le
-`task_id` que le fil annonce de la liste que
-`get_undelivered_callback_tasks_for_session` rend déjà — code en place, déjà
-testé, et qui porte le prédicat du poll **par construction** plutôt que par
-copie.
-
-Gain : −18 (`is_resume_callback_for`) −22 (T2) = **355**.
-
-**Correction d'un chiffrage antérieur, et elle est confirmée par cette passe.**
-La première version de ce plan créditait cet arbitrage de −41 de plus, en
-supposant que le miroir sortait avec le prédicat, et l'annonçait à ≈ 264 — sous la
-borne. **C'est faux :** les six champs du miroir sur `main` (§ 0.1, relu cette
-passe à `tasks.rs:611-618`) ne comprennent ni `created_trace_id` ni
-`parent_task_id`, que le critère 1 exige « tirés du détail ». Le miroir à dix
-champs reste donc obligatoire tant que le critère 1 tient, et cet arbitrage **ne
-passe pas** sous la borne.
-
-### A3 — Le détail HTTP sort du chemin : le fil devient un réveil
-
-C'est le seul arbitrage mesuré **sous la borne**, et il a un prix explicite.
-
-La ligne locale porte déjà tout ce que la livraison lit — `result`, `label`,
-`created_trace_id`, `parent_task_id` — et le drainage doit de toute façon la
-toucher pour `mark_task_delivered`. Si le détail HTTP sort, le fil n'apporte plus
-que la **latence** : le réveil au tick au lieu des ~5 s du poll.
-
-| poste | lignes |
-|---|---|
-| `terminal_callback_frame` | 20 |
-| `CallbackFeed` + abonnement | 43 |
-| site d'abonnement `chat.rs` | 14 |
-| champ + inits | 7 |
-| drainage sans lecture ni prédicat (réutilise la liste du poll) | 35 |
-| site d'appel au tick | 8 |
-| tests — T1 abonnement, puis livré-une-fois, déjà-réclamé, autre-session | 103 |
-
-**Total ≈ 230**, miroir **non** compris : A3 ne le requiert plus du tout, et les
-quatre champs neufs ne valent alors que pour `mika tasks get --spirit`, c'est-à-dire
-par A1 et pour lui seul.
-
-**Son prix :** le but écrit du vol est « se lit par HTTP, se réclame et se livre ».
-A3 garde « se réclame et se livre » et abandonne « se lit par HTTP ». Il fait
-tomber les critères 1 (partiellement) et 3, et il supprime au passage la
-duplication du prédicat que le matériau assume. **Ce n'est pas un arbitrage de
-taille, c'est un arbitrage d'architecture** — et c'est pourquoi le groom le
-remonte au lieu de le prendre.
-
-### A4 — La borne de ce vol est relevée explicitement
-
-La borne de 279 dérive d'un plafond de 150 tours (`(150 − 27 − 30) × 9 / 3`, site
-de vérité `_plan_size_per_flight_bound` dans
-`skills/bundled/_shared/dispatch-lib.sh`). Le label `loop-substrate` porterait le
-plafond à 200 tours, donc la borne à `(200 − 27 − 30) × 9 / 3 = 429`.
-
-Avec A1 appliqué (le miroir en PR séparée), le vol tombe à **354** pour une borne
-de 429 : une marge de 75 lignes, soit 21 %. C'est **au-dessus** du biais de 16 %
-mesuré au § 0.3, et c'est ce qui distingue cet arbitrage d'un pari.
-
-Sans A1, le vol est à 395 pour 429 : une marge de 8 %, **sous** le biais mesuré.
-Le couple **A4 + A1** est donc la seule combinaison dont la mesure soutienne la
-marge ; A4 seul atterrirait là où le vol précédent a atterri — à la borne exacte.
+Son corollaire : puisque le plancher bout-en-bout vaut 190 et que mika#2205 exige
+que chaque PR soit utile de bout en bout, **aucun découpage du but ne ramène ce
+vol sous 279**. Le seul découpage licite est celui du miroir (A1 ci-dessous),
+mergeable seul parce que ses quatre champs neufs ont un lecteur immédiat — les
+formats `json` et `yaml` de `mika tasks get <id> --spirit`, déjà sur `main` — et
+il laisse 285, encore au-dessus. Le choix qui reste n'est donc pas un choix de
+taille.
 
 ---
 
-## 4 — Ce que ce groom n'a pas fait
+## 5 — Les arbitrages, rechiffrés — et c'est ici que cette passe change la décision
 
-- **Il n'a pas recoupé le périmètre.** Le corps le lui retire explicitement.
+Ils sont la matière de la décision de Vincent. Aucun n'est retenu ici. Les
+totaux de la passe 3 sont rappelés pour que l'écart soit lisible.
+
+| voie | total passe 3 | **total cette passe** | borne | marge | ce qu'elle coûte |
+|---|---|---|---|---|---|
+| **A4** — plafond relevé à 200 tours | 395 | **326** | 429 | **+24 %** | un geste d'opérateur. **Aucun critère.** |
+| **A4 + A1** | 354 | **285** (+41 en vol séparé) | 429 | **+34 %** | deux gestes. Aucun critère. |
+| **A1** — le miroir part seul | 354 | **285** | 279 | −2 % | ne passe pas |
+| **A3** — le détail HTTP sort du chemin | ≈ 230 | ≈ **226** | 279 | +19 % | le critère 3, et une part du critère 1 |
+
+**A4 est la voie que cette passe ouvre.** La borne de 279 dérive d'un plafond de
+150 tours (`(150 − 27 − 30) × 9 / 3`, site de vérité
+`_plan_size_per_flight_bound` dans `skills/bundled/_shared/dispatch-lib.sh`). Un
+plafond de 200 tours donne `(200 − 27 − 30) × 9 / 3 = 429`. À 326, la marge est
+de 24 % — **au-dessus du biais de 16 % mesuré au § 0.3**, ce qui distingue cet
+arbitrage d'un pari. À 395, la passe 3 n'avait que 8 % et concluait, justement,
+qu'A4 seul atterrirait là où le vol précédent a atterri : sur la borne exacte.
+
+Deux chemins mènent à ce plafond, et ils ne se valent pas :
+
+- le label **`loop-substrate`**, qui porte le plafond à 200 via
+  `PILOT_LABEL_TURN_CEILINGS`. C'est le chemin nommé par la passe 3. Il a un
+  coût que ce plan signale plutôt que de le taire : le label est **sémantique**
+  autant que machine, et mika#1727 est un travail de client mince de la TUI, pas
+  du substrat de boucle. L'apposer pour son seul effet de bord mélange les deux
+  lectures du label ;
+- une **surcharge `PILOT_MAX_TURNS`** sur ce dispatch, qui produit le même
+  plafond sans rien affirmer sur la nature du ticket. C'est le chemin que la
+  mesure recommande, et il est hors de la main du groom.
+
+**A1 ne suffit plus comme complément obligé, mais il reste bon.** Le commit
+`23525549c` est mergeable seul, relu, et sort 41 lignes du chemin critique sans
+risque. Il porte la marge de 24 % à 34 %. Il est utile, il n'est plus nécessaire.
+
+**A3 reste sous la borne, et reste le seul des quatre à coûter un critère.** Le
+but écrit est « se lit par HTTP, se réclame et se livre » ; A3 garde les deux
+derniers et abandonne le premier, la ligne locale portant déjà `result`,
+`created_trace_id` et `parent_task_id`. Le fil n'apporte alors plus que la
+latence. C'est un arbitrage d'architecture, pas de taille — et c'est pourquoi le
+groom le remonte au lieu de le prendre. Son chiffre de ≈ 226 est aussi le
+moins étayé des quatre : il n'a pas été écrit ligne à ligne comme les 326, et il
+conserve le helper de 36 lignes, que le prédicat lu en base rend plus nécessaire
+encore.
+
+---
+
+## 6 — Ce que ce groom n'a pas fait
+
+- **Il n'a pas recoupé le périmètre.** Le corps le lui retire explicitement, et
+  le § 4.1 montre qu'aucun découpage du but n'existe sous mika#2205.
+- **Il n'a pas déclaré un plafond que le ticket ne porte pas.** La section
+  `## Taille estimée` écrit `150 (défaut)`, parce que c'est l'état d'aujourd'hui.
+  Écrire 200 pour faire tenir le plan serait fabriquer un état de label.
 - **Il n'a ouvert aucun ticket**, pas même de suivi : gel des tickets jusqu'au
   01/12. La suite se note `Tracked in: senara-solutions/mika#1727`.
 - **Il n'a touché aucun fichier hors `docs/plans/`.** Rien sous
   `.github/workflows/`, `.claude/`, `skills/bundled/`,
   `crates/mika-agent/src/well_known_agents.rs`, `.mika/` ni `docs/egress/`.
-  `crates/mika-agent/` et `crates/mika-a2a/` sont intacts.
-- **Il n'a écrit aucun code.** Ce plan ne livre **aucun détecteur** : le gate
-  `## Fire-Disposition` (mika#2306) est **N/A** et n'est donc pas inventé. Il
-  redeviendra dû sur le plan qui livrera les six tests du § 1.1.
+  `crates/mika-agent/` et `crates/mika-a2a/` sont intacts. Aucune ligne de
+  `crates/mika-cli/` n'a été écrite.
 - **Il n'a pas ouvert un second plan concurrent.** Ce fichier est la mise à jour
-  des deux plans commités à 15:03Z et 15:29Z, dont il confirme le verdict par
-  une troisième mesure indépendante (§ 0.2).
+  des trois passes antérieures, dont il corrige le chiffre et refait la table
+  des arbitrages.
 
 ---
 
-## 5 — L'issue machine de cette halte, et pourquoi un quatrième dispatch n'est pas le remède
+## 7 — L'issue machine de cette halte
 
-Cette section est ce que les deux passes antérieures n'ont pas écrit, et son
-absence est la raison pour laquelle ce ticket a été redispatché deux fois.
+**ESCALATE est l'issue attendue, et c'est la bonne.** mika#2693 est explicite :
+« Un total au-dessus de la borne par vol sans découpage en vols […] fait rendre
+ITERATE à mika-arch en première passe et ESCALATE en seconde. » Ce plan porte
+`Total estimé : 326` pour une borne de 279 et ne porte aucun découpage en vols,
+parce que le corps du ticket le lui interdit nommément et que le § 4.1 démontre
+qu'aucun n'existe.
 
-**ESCALATE est l'issue attendue, et c'est la bonne.** La règle de grooming
-mika#2693 est explicite : « Un total au-dessus de la borne par vol sans
-découpage en vols […] fait rendre ITERATE à mika-arch en première passe et
-ESCALATE en seconde. » Ce plan porte `Total estimé : 395` pour une borne de 279
-et **ne porte aucun découpage en vols** — parce que le corps du ticket le lui
-interdit nommément, et parce que le § 2.1 démontre qu'aucun découpage n'existe.
+Les deux règles ne se contredisent pas, elles se composent : le corps dit au
+groom de s'arrêter et de le dire, mika#2693 dit comment une halte voyage.
+**ESCALATE *est* le canal par lequel « le groom s'arrête et le dit » atteint
+l'opérateur.**
 
-Les deux règles ne se contredisent donc pas : elles se composent. Le corps dit
-au groom de s'arrêter et de le dire ; mika#2693 dit à la machine comment une
-halte voyage. **ESCALATE *est* le canal par lequel « le groom s'arrête et le
-dit » atteint l'opérateur.** Lu ainsi, un ESCALATE sur ce plan n'est pas un
-défaut de grooming à corriger — c'est la halte qui arrive à destination.
+**Ce qu'un cinquième dispatch produirait.** Les trois premières passes ont écrit
+395 ; celle-ci écrit 326, en remettant en cause non leur arithmétique mais leur
+hypothèse d'emplacement. Cette hypothèse-là est maintenant épuisée : les six
+propriétés que la couture pouvait déplacer hors de `app.rs` l'ont été, le
+littéral `NewTask` est irréductible depuis `mika-cli` par une propriété vérifiée
+du type, et le plancher restant est à 24 % au-dessus de la borne. Un cinquième
+groom chercherait une seconde couture dans un espace que celle-ci a vidé.
 
-**Ce qu'un quatrième dispatch produirait.** Le plancher de 210 lignes est une
-propriété du but écrit et de l'état de `main`, pas du style du plan. Trois
-mesures indépendantes l'ont établi, la troisième en relisant chaque poste au
-diff (§ 0.2). Un quatrième groom remesurerait les mêmes sites et écrirait le
-même nombre : la variable qui doit changer n'est pas le plan, c'est **l'un des
-quatre arbitrages du § 3**, et aucun des quatre n'est à la main du groom — A1,
-A2 et A3 touchent les critères du vol, A4 touche sa borne.
+**Le geste qui débloque, et son auteur.** Vincent relève le plafond de ce
+dispatch — par `PILOT_MAX_TURNS` de préférence au label, pour la raison du § 5 —
+et le vol part tel qu'il est décrit ici, aucun critère perdu. À défaut, il tranche
+A3 et le corps du ticket est amendé pour en retirer le critère 3 et la part du
+critère 1 qui exige la lecture HTTP. Les deux voies sont mesurées ; ce plan n'en
+choisit aucune.
 
-**Le geste qui débloque, et son auteur.** Vincent tranche l'un des quatre, puis
-le corps du ticket est amendé en conséquence ; le groom suivant repart sur un
-but dont le plancher tient sous sa borne. Les deux voies que la mesure soutient,
-sans que ce plan en choisisse une :
+---
 
-| voie | total | borne | ce qu'elle coûte |
-|---|---|---|---|
-| **A3** | ≈ 230 | 279 | le critère 3 et une part du critère 1 — « se lit par HTTP » sort du vol |
-| **A4 + A1** | 354 | 429 | le label `loop-substrate` sur le ticket, et le miroir en PR séparée |
+## Fire-Disposition
+
+Ce plan spécifie six détecteurs — les tests T1 à T4 du § 3.1, dont le chemin de
+succès est « aucune violation trouvée ». Disposition retenue :
+**(c) halte-et-remontée.**
+
+Aucun des six n'atterrit, armé ou désarmé : ce plan n'autorise pas l'écriture
+d'une ligne de `crates/mika-cli/`, et la remontée à l'opérateur est son objet
+même (§ 7). Il n'y a donc ni exception à nommer en allowlist, ni `#[ignore]` à
+poser, ni suivi d'armement à ouvrir — le gel des tickets jusqu'au 01/12
+l'interdirait de toute façon, et la suite se note
+`Tracked in: senara-solutions/mika#1727`.
+
+Pour mémoire, à l'intention du plan qui livrera effectivement ces six tests une
+fois l'arbitrage tranché : leur disposition sera **(a) exception nommée en
+allowlist, avec une allowlist vide**. Ils mesurent une surface **neuve** — un
+abonnement et un drainage qui n'existent pas sur `main` — donc aucune violation
+préexistante n'est à amnistier, et aucune entrée grep-visible n'est due. Un test
+qui rougirait à l'atterrissage y signalerait un défaut de l'implémentation, pas
+une dette héritée.
 
 ---
 
@@ -396,23 +488,29 @@ sans que ce plan en choisisse une :
 La DoD de **ce plan** est la remontée, non l'implémentation :
 
 1. Le plan est commité sur `feat/1727/tui-v2b2b2-callbacks-termines-par-le-sse`.
-2. Il porte la mesure livrable par livrable (§ 1), chaque ligne étiquetée
+2. Il porte la mesure livrable par livrable (§ 3), chaque ligne étiquetée
    « mesuré » ou « estimé » pour être contestable séparément.
-3. Il porte le remesurage de cette troisième passe (§ 0.2), poste par poste,
-   avec la commande qui l'établit — le verdict n'est pas hérité.
+3. Il nomme l'hypothèse non testée des trois passes antérieures et l'écart
+   qu'elle produit — 395 contre 326 (§ 1), avec la décomposition du matériau qui
+   l'établit (§ 0.2), dont les 56 lignes hors périmètre que personne n'avait
+   isolées.
 4. Il porte le **plancher** du but écrit, hors tests, et le budget de tests qui
-   en reste (§ 2) — c'est le fait dur de la halte.
-5. Il porte la calibration de l'estimateur sur le vol précédent (§ 0.3), mesurée
-   et non rappelée.
-6. Il porte la coupe que mika#2205 interdit (§ 2.1) et son corollaire : aucun
-   découpage en vols ne ramène ce but sous la borne.
-7. Il porte les quatre arbitrages candidats avec leur gain mesuré, **sans en
-   choisir aucun** (§ 3), en nommant celui qui passe (A3) et le couple dont la
-   marge est soutenue par la mesure (A4 + A1).
-8. Il porte l'issue machine attendue de la halte (§ 5) et dit pourquoi un
-   quatrième dispatch de groom ne la fait pas avancer.
-9. Il porte sa section `## Taille estimée` au format de mika#2636, avec le total
-   réel — y compris quand ce total est ce qui déclenche la halte.
+   en reste (§ 4) — c'est le fait dur de la halte.
+5. Il porte les deux propriétés vérifiées qui rendent deux postes irréductibles :
+   les six champs du miroir sur `main` et l'absence de `Default` sur `NewTask`
+   (§ 0.1).
+6. Il porte la calibration de l'estimateur sur le vol précédent (§ 0.3), mesurée
+   et non rappelée, et juge chaque marge du § 5 contre elle.
+7. Il porte l'état mesuré d'Egress Manifest Lint (§ 0.4) et dit, sans le
+   surestimer, ce que la couture y change — la véracité du manifeste, pas la
+   couleur du lint.
+8. Il porte la coupe que mika#2205 interdit (§ 4.1) et son corollaire.
+9. Il porte les quatre arbitrages avec leur gain rechiffré, **sans en choisir
+   aucun** (§ 5), en nommant celui qui suffit désormais seul (A4), le coût
+   sémantique du chemin par label, et celui qui coûte un critère (A3).
+10. Il porte l'issue machine attendue (§ 7), sa section `## Fire-Disposition` et
+    sa section `## Taille estimée` au format de mika#2636, avec le total réel —
+    y compris quand ce total est ce qui déclenche la halte.
 
 **Ce qu'aucune de ces lignes n'autorise :** écrire une ligne de
 `crates/mika-cli/`. Le prochain geste appartient à Vincent.
@@ -445,11 +543,12 @@ tranché — ils ne sont pas la DoD de ce plan, qui est la halte ci-dessus.
 5. La PR porte `Refs mika#1727` et aucun `Closes`, `Fixes` ni `Resolves`.
 
 **État de ces critères sous ce plan : aucun n'est tenu, et aucun ne peut l'être** —
-le plancher qui les porte mesure 210 lignes hors tests, pour une borne de 279 dont
-30 sont prises par le seul helper d'ensemencement. Le § 1.1 établit la
-correspondance critère → test, afin que l'arbitrage retenu puisse être jugé sur ce
-qu'il ferait perdre : A3 est le seul qui passe, et il coûte le critère 3 et une
-part du critère 1.
+le plancher qui les porte mesure 190 lignes hors tests, pour une borne de 279 dont
+42 sont prises par le helper d'ensemencement et le receveur à rendre. Le § 3.1
+établit la correspondance critère → test, afin que l'arbitrage retenu puisse être
+jugé sur ce qu'il ferait perdre : A4 ne fait rien perdre, A3 coûte le critère 3 et
+une part du critère 1. Le critère 4 est tenable sous les deux (§ 0.4, lint mesuré
+vert aujourd'hui).
 
 ---
 
@@ -458,33 +557,35 @@ part du critère 1.
 | livrable | lignes de code (hors `docs/`) |
 |---|---|
 | `crates/mika-cli/src/commands/tasks.rs` — miroir à dix champs (reprise de `23525549c`, mesuré) | 41 |
-| `crates/mika-cli/src/commands/tasks.rs` — `terminal_callback_frame` | 20 |
-| `crates/mika-cli/src/commands/tasks.rs` — `CallbackFeed` + `spawn_callback_subscription` | 43 |
-| `crates/mika-cli/src/commands/tasks.rs` — `is_resume_callback_for` | 18 |
-| `crates/mika-cli/src/commands/tasks.rs` — commentaire du miroir ajusté | 2 |
-| `crates/mika-cli/src/commands/chat.rs` — site d'abonnement | 14 |
-| tests (`crates/mika-cli/src/commands/tasks.rs`) — T1 abonnement, T2 prédicat | 57 |
-| `crates/mika-cli/src/tui/app.rs` — champ `callback_feed` + deux inits | 7 |
-| `crates/mika-cli/src/tui/app.rs` — `drain_callback_deliveries` | 57 |
-| `crates/mika-cli/src/tui/app.rs` — site d'appel au tick | 8 |
-| tests (`crates/mika-cli/src/tui/app.rs`) — helper d'ensemencement | 30 |
-| tests (`crates/mika-cli/src/tui/app.rs`) — receveur rendu + appelants | 8 |
-| tests (`crates/mika-cli/src/tui/app.rs`) — T3 à T6 | 90 |
+| `crates/mika-cli/src/commands/tasks.rs` — `terminal_callback_frame` | 17 |
+| `crates/mika-cli/src/commands/tasks.rs` — `CallbackFeed` + `open_for` + `next_candidate` | 66 |
+| `crates/mika-cli/src/commands/chat.rs` — site d'abonnement | 12 |
+| tests (`crates/mika-cli/src/commands/tasks.rs`) — T1 abonnement filtrant, six trames | 22 |
+| tests (`crates/mika-cli/src/commands/tasks.rs`) — T2 `candidat` + `corps_candidat` + six refus | 34 |
+| `crates/mika-cli/src/tui/app.rs` — champ `callback_feed` + deux inits | 9 |
+| `crates/mika-cli/src/tui/app.rs` — `drain_callback_deliveries` | 38 |
+| `crates/mika-cli/src/tui/app.rs` — site d'appel au tick | 7 |
+| tests (`crates/mika-cli/src/tui/app.rs`) — ensemencement d'une ligne de callback (`NewTask`, 23 champs) | 36 |
+| tests (`crates/mika-cli/src/tui/app.rs`) — `app_with_response_sender` rend le receveur + trois appelants | 6 |
+| tests (`crates/mika-cli/src/tui/app.rs`) — T3 livré une fois et pas deux, T4 déjà réclamé | 38 |
 
-Total estimé : 395 lignes
+Total estimé : 326 lignes
 Plafond de tours : 150 (défaut)
 Borne par vol : 279 lignes estimées — (150 − 27 − 30) × 9 / 3
 
-**Le total dépasse la borne de 116 lignes, soit 1,42×.** Et le dépassement ne
-vient pas d'un périmètre trop large : le **plancher** du but écrit, hors tout
-test, vaut déjà 210, ce qui laisse 39 lignes pour six tests une fois le helper
-d'ensemencement payé (§ 2). Conformément au corps du ticket, le groom **s'arrête
-et le dit**, et ne recoupe pas lui-même : ce vol est déjà le recoupage de
-mika#3069.
+**Le total dépasse la borne de 47 lignes, soit 1,17×** — contre 1,42× aux trois
+passes antérieures. L'écart ne vient pas d'un périmètre revu à la baisse : le but
+est le même, les cinq critères sont les mêmes, et c'est l'emplacement du code qui
+a changé (§ 1 et § 2). Le dépassement restant n'est pas un excès de périmètre : le
+**plancher** du but, hors tout test, vaut 190, ce qui laisse 47 lignes pour six
+tests et huit propriétés quand la mesure en demande 94 (§ 4). Conformément au
+corps du ticket, le groom **s'arrête et le dit**, et ne recoupe pas lui-même : ce
+vol est déjà le recoupage de mika#3069.
 
-Le § 5 dit l'issue machine attendue de cette halte — ESCALATE, qui est le canal
-par lequel elle atteint l'opérateur — et pourquoi un quatrième groom écrirait le
-même nombre. La suite est l'un des quatre arbitrages du § 3, tranché par Vincent,
-le gel des tickets jusqu'au 01/12 interdisant d'ouvrir un second ticket :
+Le § 7 dit l'issue machine attendue — ESCALATE, qui est le canal par lequel cette
+halte atteint l'opérateur. Ce que cette passe apporte à la décision tient en une
+ligne : **A4 seul suffit désormais** (326 pour une borne de 429, soit 24 % de
+marge contre un biais mesuré de 16 %), et il ne coûte aucun critère. Le gel des
+tickets jusqu'au 01/12 interdisant d'ouvrir un second ticket :
 
 Tracked in: senara-solutions/mika#1727
