@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::commands::chat_turn;
+use crate::commands::tasks::CallbackFeed;
 use crate::commands::team_outcome::TeamOutcome;
 use crate::init::{self, AppContext};
 use crate::tui::app::{
@@ -558,6 +559,16 @@ pub async fn run(
         start_in_audit_mode,  // audit mode launch (#773)
         is_singleton_session, // single-session-by-nature (mika#1401)
     );
+
+    // La souscription au fil des tâches (mika#1727, vol V2b-2b-2). Une seule
+    // ouverture, sans recul ni reconnexion : un jeton absent ou un daemon à terre
+    // n'ouvre rien, et `poll_callback_tasks` couvre — c'est le filet de ce vol.
+    // `run_team` n'appelle pas ce chemin, donc le mode équipe n'ouvre rien.
+    if let Ok(token) = crate::commands::dashboard::auth_token() {
+        app.callback_feed =
+            CallbackFeed::open_for(agent_name, crate::commands::dashboard::spirit_url(), token)
+                .await;
+    }
 
     // Load recent conversation history so the user sees prior messages on restart.
     // In inbox mode (default), internal messages are filtered at the DB level.
