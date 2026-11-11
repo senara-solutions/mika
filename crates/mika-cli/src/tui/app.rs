@@ -2447,7 +2447,7 @@ mod tests {
         })
         .to_string();
         let (base, _) = crate::commands::tasks::fake_spirit::spawn_detail(200, corps).await;
-        let (tx, feed) = CallbackFeed::from_channel(base, "jeton".to_string());
+        let (tx, feed) = CallbackFeed::from_channel(&app.agent_name, base, "jeton".to_string());
         (id, tx, feed)
     }
 
