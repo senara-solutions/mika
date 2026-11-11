@@ -1626,6 +1626,18 @@ impl<'a> App<'a> {
     /// ligne que le poll vient de prendre retarderait d'un tick celle qui la suit
     /// dans le canal.
     async fn drain_callback_deliveries(&mut self) {
+        // Le fil ne rejoue rien : à son ouverture comme après un `OverflowMarker`,
+        // il dit seulement qu'il a pu manquer quelque chose. Le balayage est la
+        // lecture que le poll fait déjà — appelée, jamais recopiée.
+        let couture = self.callback_feed.as_ref();
+        if couture.is_some_and(|f| f.prendre_le_rattrapage()) {
+            self.poll_callback_tasks().await;
+            // Une livraison relance le tour, et la boucle du fil ne doit pas en
+            // empiler une seconde : même règle que le `break` du poll.
+            if self.status != AgentStatus::Idle {
+                return;
+            }
+        }
         // Copiées avant la boucle : `next_candidate` emprunte la couture, donc
         // `self`. Elles voyagent par appel — `/new` les réassigne.
         let agent = self.agent_name.clone();
@@ -2627,5 +2639,73 @@ mod tests {
             .expect("relire la ligne")
             .expect("la ligne existe");
         assert_eq!(ligne.status, "delivered", "la ligne est bien réclamée");
+    }
+
+    /// Terminer la ligne comme le pilote : statut, résultat et `completed_at` en
+    /// une écriture. La couture pose le sien par `update_task_status`, qui laisse
+    /// `completed_at` nul — or le balayage lit la **ligne**, pas le détail HTTP.
+    async fn terminer_la_ligne(app: &App<'static>, id: &str) {
+        let fini = app.db.update_task_completed(id, Some("fini")).await;
+        assert!(fini.expect("terminer la ligne"), "pending → completed");
+    }
+
+    /// **Critère 3** — un callback semé en base, sans **aucune** trame dans le
+    /// canal, est livré sur le seul signal. `trace_id` et `parent_task_id` à
+    /// `None` sont la signature du balayage, tout en base : le chemin du fil les
+    /// lit sur le détail et les aurait à `tr-9` et `t-parent`.
+    #[tokio::test]
+    async fn mika1727_v2b3a_un_callback_sans_trame_est_livre_sur_le_signal() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let (id, _tx, feed) = couture_dun_callback_livrable(&app, "pending", None, None).await;
+        terminer_la_ligne(&app, &id).await;
+        feed.armer_le_rattrapage();
+        app.callback_feed = Some(feed);
+
+        app.drain_callback_deliveries().await;
+        let AgentRequest::CallbackResult {
+            task_id,
+            result,
+            trace_id,
+            original_status,
+            parent_task_id,
+            ..
+        } = request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(task_id, id);
+        assert_eq!(result, "fini");
+        assert_eq!(original_status, "completed");
+        assert_eq!(trace_id, None, "le balayage lit la ligne, pas le détail");
+        assert_eq!(parent_task_id, None, "idem");
+        assert_eq!(app.status, AgentStatus::Thinking, "le tour repart");
+        let dernier = app.messages.last().expect("un message système");
+        assert_eq!(dernier.content, "[long_running:run_claude_pilot] completed");
+        assert!(request_rx.try_recv().is_err(), "une seule livraison");
+    }
+
+    /// **Critère 4** — deux signaux en file ne livrent pas deux fois. Le second
+    /// passage repart d'un `Idle` remis à la main : sinon la garde du tour en
+    /// cours suffirait seule à expliquer le silence, et le test serait vert sur
+    /// une autre raison que la sienne (mika#2205).
+    #[tokio::test]
+    async fn mika1727_v2b3a_deux_signaux_ne_livrent_pas_deux_fois_le_meme_callback() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let (id, _tx, feed) = couture_dun_callback_livrable(&app, "pending", None, None).await;
+        terminer_la_ligne(&app, &id).await;
+        feed.armer_le_rattrapage();
+        feed.armer_le_rattrapage();
+        app.callback_feed = Some(feed);
+
+        app.drain_callback_deliveries().await;
+        assert!(request_rx.try_recv().is_ok(), "une livraison");
+        assert!(request_rx.try_recv().is_err(), "une seule");
+
+        app.status = AgentStatus::Idle;
+        let couture = app.callback_feed.as_ref().expect("la couture est là");
+        couture.armer_le_rattrapage();
+        couture.armer_le_rattrapage();
+        app.drain_callback_deliveries().await;
+        assert!(request_rx.try_recv().is_err(), "rien au second passage");
     }
 }
