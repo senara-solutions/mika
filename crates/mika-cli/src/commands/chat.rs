@@ -561,12 +561,11 @@ pub async fn run(
     );
 
     // La souscription au fil des tâches (mika#1727, vol V2b-2b-4). Le fil se
-    // rouvre de lui-même, avec un recul qui double jusqu'à un plafond, donc un
-    // daemon à terre au lancement n'est plus définitif : la couture existe et se
-    // rattrape à son retour. Un jeton absent, lui, n'ouvre toujours rien — c'est
-    // le seul cas où `app.callback_feed` reste `None`, et `poll_callback_tasks`
-    // couvre alors, comme il couvre ce que le fil manque pendant une coupure.
-    // `run_team` n'appelle pas ce chemin, donc le mode équipe n'ouvre rien.
+    // rouvre de lui-même, donc un daemon à terre au lancement n'est plus
+    // définitif. Un jeton absent, lui, n'ouvre toujours rien : c'est le seul cas
+    // où `callback_feed` reste `None`, et `poll_callback_tasks` couvre alors,
+    // comme il couvre ce que le fil manque pendant une coupure. `run_team`
+    // n'appelle pas ce chemin.
     if let Ok(token) = crate::commands::dashboard::auth_token() {
         app.callback_feed = Some(CallbackFeed::open_for(
             agent_name,
