@@ -603,30 +603,36 @@ impl TaskEventStream {
 /// `Serialize`, et ce vol ne modifie pas `crates/mika-agent/`. Ses autres champs
 /// sont ignorés par serde — tolérance voulue, attestée par `corps_de_detail`.
 ///
-/// Dix champs, et **chacun a son lecteur dans ce vol** : `Serialize` en rend dix
-/// en `json` et `yaml`, l'écrivain texte en rend les six que l'opérateur lit, et
-/// les quatre neufs — `trigger_type`, `action_type`, `created_trace_id` et
-/// `parent_task_id` — sont lus par la livraison d'un callback (vol V2b-2b-2).
-/// Le miroir ne prend **aucun champ « pour plus tard »** : c'est l'arrivée d'un
-/// lecteur, pas la largeur du serveur, qui fait entrer un champ ici.
+/// Onze champs, et **chacun a son lecteur dans ce vol** : `Serialize` en rend
+/// onze en `json` et `yaml`, l'écrivain texte en rend les six que l'opérateur
+/// lit, et `trigger_type`, `action_type`, `created_trace_id` et
+/// `parent_task_id` sont lus par la livraison d'un callback (vol V2b-2b-2).
+/// `completed_at` est entré au vol V2b-2b-3 pour un **lecteur unique** : la garde
+/// d'ancienneté du drainage, qui écarte un `failed` plus vieux que
+/// `STALE_FAILED_CALLBACK_MINUTES`. Le miroir ne prend **aucun champ « pour plus
+/// tard »** : c'est l'arrivée d'un lecteur, pas la largeur du serveur, qui fait
+/// entrer un champ ici.
 ///
 /// La visibilité le dit champ par champ. `id` (vol V2b-2b-2, qui le passe à
-/// `mark_task_delivered`), `label`, `result`, `created_trace_id` et
-/// `parent_task_id` sont `pub(crate)` parce que le drainage les lit depuis
-/// `tui/app.rs`. Les cinq autres restent **privés** : leur seul lecteur hors des
-/// trois formats est le prédicat du poll, qui est une méthode d'ici.
+/// `mark_task_delivered`), `label`, `status`, `result`, `created_trace_id`,
+/// `parent_task_id` et `completed_at` sont `pub(crate)` parce que le drainage les
+/// lit depuis `tui/app.rs` — `status` depuis le vol V2b-2b-3, qui en tire
+/// l'`original_status` au lieu de l'écrire en dur. Les quatre autres restent
+/// **privés** : leur seul lecteur hors des trois formats est le prédicat du poll,
+/// qui est une méthode d'ici.
 #[derive(serde::Deserialize, serde::Serialize)]
 pub(crate) struct TaskDetailMirror {
     pub(crate) id: String,
     agent_id: String,
     pub(crate) label: String,
-    status: String,
+    pub(crate) status: String,
     trigger_type: String,
     action_type: String,
     created_by_session: Option<String>,
     pub(crate) result: Option<String>,
     pub(crate) created_trace_id: Option<String>,
     pub(crate) parent_task_id: Option<String>,
+    pub(crate) completed_at: Option<String>,
 }
 
 /// Lire `GET /api/v1/tasks/{task_id}` sur mika-spirit.
@@ -667,17 +673,21 @@ pub(crate) async fn fetch_task_detail(
 
 /// Le `task_id` d'une trame qui **mène à une livraison**, et de nulle autre.
 ///
-/// `TaskCompleted` est la seule dans ce vol : `poll_callback_tasks` reste en
-/// place et livre les `failed`, donc les prendre ici les livrerait deux fois. Le
+/// **Deux** trames en sont depuis le vol V2b-2b-3, et elles ont en commun
+/// d'annoncer une tâche *terminée dont le résultat n'est pas encore remis* —
+/// exactement la population que `mark_task_delivered` accepte
+/// (`status IN ('completed','failed')`). Les deux voisines qui pourraient le
+/// laisser croire n'en sont pas : `TaskDelivered` annonce une remise **déjà
+/// faite**, et `TaskCancelled` une tâche qui n'a aucun résultat à rendre. Le
 /// `match` **énumère les huit variantes** sans bras `_`, pour la raison déjà
 /// écrite sur [`frame_agent_id`] : sous un `_`, une variante neuve qui mériterait
 /// une livraison tomberait du côté « rien » en silence.
 fn terminal_callback_frame(frame: Option<&TaskEventFrame>) -> Option<String> {
     match frame? {
-        TaskEventFrame::TaskCompleted { task_id, .. } => Some(task_id.clone()),
+        TaskEventFrame::TaskCompleted { task_id, .. }
+        | TaskEventFrame::TaskFailed { task_id, .. } => Some(task_id.clone()),
         TaskEventFrame::TaskCreated { .. }
         | TaskEventFrame::TaskClaimed { .. }
-        | TaskEventFrame::TaskFailed { .. }
         | TaskEventFrame::TaskDelivered { .. }
         | TaskEventFrame::TaskCancelled { .. }
         | TaskEventFrame::OverflowMarker { .. }
@@ -688,14 +698,17 @@ fn terminal_callback_frame(frame: Option<&TaskEventFrame>) -> Option<String> {
 impl TaskDetailMirror {
     /// Le prédicat de `get_undelivered_callback_tasks_for_session`, porté sur le
     /// détail. Une tâche qui n'y répond pas n'est **ni livrée ni réclamée**.
-    /// `status` en est, bien que le fil n'amène ici que des `TaskCompleted` :
-    /// c'est lui qui rend vrai, par le type, l'`original_status = "completed"`
-    /// que le drainage écrit en dur.
+    ///
+    /// Le `matches!` est **fermé sur deux statuts**, et non écrit « tout sauf
+    /// `pending` » : un `delivered` est précisément la ligne que le poll vient de
+    /// prendre, et un `running` n'a pas encore de résultat. C'est aussi lui qui
+    /// rend vrai, par le type, l'`original_status` que le drainage lit sur ce
+    /// champ — il vaut `completed` ou `failed`, et rien d'autre.
     fn est_un_callback_a_livrer(&self, agent_id: &str, session_id: &str) -> bool {
         self.agent_id == agent_id
             && self.trigger_type == "callback"
             && self.action_type == "resume_agent"
-            && self.status == "completed"
+            && matches!(self.status.as_str(), "completed" | "failed")
             && self.created_by_session.as_deref() == Some(session_id)
     }
 }
@@ -706,9 +719,11 @@ impl TaskDetailMirror {
 /// qu'un geste. C'est ce qui rend vraie *par le type* la contrainte
 /// « `tui/app.rs` ne détient ni l'URL, ni le jeton, ni le nom de la lecture
 /// HTTP », et ce qui garde exacte la déclaration `cli-spirit-tasks` du manifeste
-/// egress, dont le périmètre est ce fichier. Le canal ne porte qu'un `task_id` :
-/// `TaskFailed` étant hors de ce vol, le statut d'origine est toujours
-/// `"completed"`, et un second champ ne dirait rien que le type ne dise déjà.
+/// egress, dont le périmètre est ce fichier. Le canal ne porte qu'un `task_id`,
+/// et **pas** le statut de la trame : le détail est l'autorité sur le statut, et
+/// un second champ en serait une seconde — capable de diverger le jour où la
+/// trame dit `failed` et où le détail, repris entre-temps, dit `completed`.
+/// `original_status` mentirait alors à l'agent. Un lecteur, une source.
 pub(crate) struct CallbackFeed {
     rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     base_url: String,
@@ -1516,14 +1531,15 @@ mod tests {
 
     // -- le détail se lit sur mika-spirit (mika#1727, vol V2b-2b-1) --
 
-    /// Un corps tel que `dashboard::handle_task_detail` le rend : les dix champs du
-    /// miroir, **plus deux** qu'il laisse tomber — et qui mesurent la tolérance,
-    /// sans quoi elle resterait une affirmation du commentaire.
+    /// Un corps tel que `dashboard::handle_task_detail` le rend : les onze champs
+    /// du miroir, **plus deux** qu'il laisse tomber — et qui mesurent la
+    /// tolérance, sans quoi elle resterait une affirmation du commentaire.
     fn corps_de_detail() -> String {
         json!({"id": "t-42", "agent_id": "mika-qa", "label": "sonde:detail",
                "status": "completed", "trigger_type": "callback",
                "action_type": "resume_agent", "created_by_session": "s-7",
                "result": "ok", "created_trace_id": "tr-9", "parent_task_id": "t-41",
+               "completed_at": "2026-11-11T10:00:00Z",
                "depth": 1, "action_config": "{}"})
         .to_string()
     }
@@ -1560,10 +1576,10 @@ mod tests {
     }
 
     /// **Critère 1** — `json` et `yaml` rendent le même miroir, ni un champ de plus
-    /// ni un de moins : les deux attentes se dérivent d'**une** liste de dix paires,
-    /// donc un onzième champ rendu ne peut pas être vert ici.
+    /// ni un de moins : les deux attentes se dérivent d'**une** liste de onze
+    /// paires, donc un douzième champ rendu ne peut pas être vert ici.
     ///
-    /// La liste est à dix depuis le vol V2b-2b-2, et l'attente du **texte** ne l'a
+    /// La liste est à onze depuis le vol V2b-2b-3, et l'attente du **texte** ne l'a
     /// pas suivie : elle reste les six paires du test précédent, parce que
     /// l'écrivain texte ne rend pas `trigger_type` ni `action_type` — des colonnes
     /// de machine, pas une lecture d'opérateur. L'invariant « ni un de plus ni un de
@@ -1582,6 +1598,7 @@ mod tests {
             ("result", "ok"),
             ("created_trace_id", "tr-9"),
             ("parent_task_id", "t-41"),
+            ("completed_at", "2026-11-11T10:00:00Z"),
         ];
 
         let (rendu, issue) = lire_detail(&base, "t-42", OutputFormat::Json).await;
@@ -1645,16 +1662,17 @@ mod tests {
 
     // -- la couture du fil vers la TUI (mika#1727, vol V2b-2b-2) --
 
-    /// **Critères 2 et 3** — une seule séquence, parce que les quatre propriétés
-    /// mesurées sont celles de *la même* souscription : une trame d'un autre
-    /// agent est écartée, `TaskFailed`, `OverflowMarker` et une trame incomprise
-    /// ne mènent à rien, et le `TaskCompleted` qui les **suit** entre encore —
-    /// donc l'abonnement n'a pas cassé, ce que quatre tests sur quatre serveurs
-    /// ne diraient pas. Le canal se lit à nu : y ajouter une lecture HTTP
-    /// mesurerait la garde suivante. Charges littérales, comme au vol V2b-2a :
-    /// c'est le contrat de fil qui est épinglé.
+    /// **Critère 4** — une seule séquence, parce que les propriétés mesurées sont
+    /// celles de *la même* souscription : une trame d'un autre agent est écartée,
+    /// `OverflowMarker`, une trame incomprise et un `task_claimed` ne mènent à
+    /// rien, le `TaskFailed` de l'agent entre depuis le vol V2b-2b-3, et le
+    /// `TaskCompleted` qui les **suit tous** entre encore — donc l'abonnement n'a
+    /// pas cassé, ce que cinq tests sur cinq serveurs ne diraient pas. Le canal
+    /// se lit à nu : y ajouter une lecture HTTP mesurerait la garde suivante.
+    /// Charges littérales, comme au vol V2b-2a : c'est le contrat de fil qui est
+    /// épinglé.
     #[tokio::test]
-    async fn mika1727_v2b2b2_seul_un_completed_de_lagent_entre_dans_le_canal() {
+    async fn mika1727_v2b2b3_un_completed_et_un_failed_de_lagent_entrent_dans_le_canal() {
         let charges = [
             r#"{"event":"task_completed","task_id":"t-1","agent_id":"mika-qa","completed_at":"2026-11-10T10:00:00Z","result_preview":"fait"}"#,
             r#"{"event":"task_failed","task_id":"t-2","agent_id":"mika-dev","failed_at":"2026-11-10T10:00:01Z","error_preview":"boum"}"#,
@@ -1675,7 +1693,7 @@ mod tests {
             recus.push(id);
         }
 
-        assert_eq!(recus, vec!["t-6".to_string()]);
+        assert_eq!(recus, vec!["t-2".to_string(), "t-6".to_string()]);
     }
 
     /// Un candidat tiré d'une couture dont le canal porte `t-42`.
@@ -1691,14 +1709,17 @@ mod tests {
         couture.next_candidate(agent, session).await
     }
 
-    /// **Critères 1, 2 et 3** — `next_candidate` enchaîne les gardes 1 et 2, et
+    /// **Critères 1, 2, 3 et 4** — `next_candidate` enchaîne les gardes 1 et 2, et
     /// **aucune ne réclame** : rien ici ne touche à une base, donc la ligne reste
-    /// `completed` pour le poll dans les cinq refus. Le témoin positif vit dans
-    /// le même test qu'eux : c'est lui qui sépare « la garde mord » de « rien ne
-    /// passe jamais » (mika#2205). Chaque cas a son serveur parce que statut et
-    /// corps sont figés à la construction du factice.
+    /// intacte pour le poll dans les six refus. Les deux témoins positifs vivent
+    /// dans le même test qu'eux : c'est eux qui séparent « la garde mord » de
+    /// « rien ne passe jamais » (mika#2205), et le second atteste que le `failed`
+    /// du vol V2b-2b-3 passe le prédicat comme le `completed`. Le refus d'un
+    /// `delivered` est ce qui empêche le `matches!` de devenir un jour « tout sauf
+    /// `pending` ». Chaque cas a son serveur parce que statut et corps sont figés
+    /// à la construction du factice.
     #[tokio::test]
-    async fn mika1727_v2b2b2_le_candidat_passe_les_deux_gardes_ou_ne_passe_pas() {
+    async fn mika1727_v2b2b3_le_candidat_passe_les_deux_gardes_ou_ne_passe_pas() {
         let temoin = candidat(200, corps_de_detail(), "mika-qa", "s-7")
             .await
             .expect("le témoin positif doit passer");
@@ -1706,6 +1727,20 @@ mod tests {
         assert_eq!(temoin.result.as_deref(), Some("ok"));
         assert_eq!(temoin.created_trace_id.as_deref(), Some("tr-9"));
         assert_eq!(temoin.parent_task_id.as_deref(), Some("t-41"));
+        assert_eq!(temoin.completed_at.as_deref(), Some("2026-11-11T10:00:00Z"));
+
+        let echoue = corps_de_detail().replace("\"completed\"", "\"failed\"");
+        let temoin_echoue = candidat(200, echoue, "mika-qa", "s-7")
+            .await
+            .expect("un `failed` doit passer le prédicat");
+        assert_eq!(temoin_echoue.status, "failed");
+
+        let remise = corps_de_detail().replace("\"completed\"", "\"delivered\"");
+        let deja_remise = candidat(200, remise, "mika-qa", "s-7").await;
+        assert!(
+            deja_remise.is_none(),
+            "un détail déjà `delivered` ne passe pas"
+        );
 
         let autre_session = candidat(200, corps_de_detail(), "mika-qa", "s-autre").await;
         assert!(autre_session.is_none(), "une autre session ne passe pas");
