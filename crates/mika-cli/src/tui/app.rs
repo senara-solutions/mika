@@ -655,7 +655,9 @@ pub struct App<'a> {
 
     /// La couture vers le fil des tâches (mika#1727, vol V2b-2b-2). Posée après
     /// construction, comme `dashboard_running` ; `None` en mode équipe et quand
-    /// l'ouverture échoue — `poll_callback_tasks` couvre alors.
+    /// l'ouverture échoue — le minuteur de `poll_callback_tasks` couvre alors,
+    /// et seulement alors depuis le vol V2b-3b : une couture qui suit l'agent
+    /// courant le fait taire, une qui suit un autre agent le laisse balayer.
     pub callback_feed: Option<CallbackFeed>,
 
     /// La dernière session que le drainage a balayée (mika#1727, vol V2b-3b).
@@ -1142,11 +1144,24 @@ impl<'a> App<'a> {
             self.drain_callback_deliveries().await;
         }
 
-        // Callback delivery polling: check for completed-but-undelivered callback tasks.
-        // Only poll when idle (agent not processing) and not in team mode.
+        // Le minuteur ne balaie plus que là où la couture ne couvre pas
+        // (mika#1727, vol V2b-3b) : sans couture, et quand celle qui existe suit
+        // un **autre** agent — l'agent du fil est figé à son ouverture, celui de
+        // la TUI change. Sous une couture qui suit l'agent courant, le balayage
+        // vient du signal du fil et du changement de session, tous deux portés
+        // par le drainage ci-dessus.
+        //
+        // `is_some_and` nié : une couture absente rend `false`, donc la négation
+        // rend `true` et le minuteur balaie. Le biais va vers le balayage, jamais
+        // vers le silence — une livraison de trop est réclamée, une de moins est
+        // un tour qui ne repart pas.
         if !self.is_team_mode()
             && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
             && self.status == AgentStatus::Idle
+            && !self
+                .callback_feed
+                .as_ref()
+                .is_some_and(|f| f.suit_lagent(&self.agent_name))
         {
             self.poll_callback_tasks().await;
         }
@@ -1620,9 +1635,12 @@ impl<'a> App<'a> {
     /// Les gardes 3 et 4 du vol V2b-2b-2 : réclamer, puis livrer un candidat que
     /// la couture a déjà jugé recevable. Le vol V2b-2b-3 y amène les `failed`.
     ///
-    /// La parité avec [`Self::poll_callback_tasks`] **est** le contrat, et elle
-    /// doit tenir avant le vol V2b-3, qui retire le poll : ce qui n'est pas ici
-    /// ce jour-là est perdu. Deux divergences, voulues.
+    /// La parité avec [`Self::poll_callback_tasks`] **est** le contrat, et son
+    /// échéance est le vol qui sortira la lecture vers spirit : ce qui n'est pas
+    /// ici ce jour-là est perdu. Le vol V2b-3b, lui, ne retire pas le balayage —
+    /// il le retire du **minuteur**, ce qui suffit déjà à rendre la parité
+    /// exigible : sous une couture qui suit l'agent courant, ce qui manque ici
+    /// n'est plus rattrapé cinq secondes plus tard. Deux divergences, voulues.
     ///
     /// L'ordre. Le statut se lit **avant** la réclamation, qui écrit `delivered`
     /// sur la ligne ; la garde d'ancienneté, elle, s'applique **après**, avec un
@@ -2688,6 +2706,96 @@ mod tests {
         let (id, _tx, _feed) = couture_dun_callback_livrable(app, "pending", None, None).await;
         terminer_la_ligne(app, &id).await;
         id
+    }
+
+    /// Un tour de minuteur, et rien d'autre. La session est déjà balayée et
+    /// aucun signal n'est armé : une livraison ne peut donc venir que du bloc
+    /// `POLL_INTERVAL_TICKS`. Sans ces deux mises au neutre, le drainage
+    /// livrerait à sa place et les trois tests du minuteur seraient verts sur
+    /// sa raison, pas sur la leur (mika#2205).
+    async fn un_tour_de_minuteur(app: &mut App<'static>) {
+        app.derniere_session_balayee = Some(app.session_id.clone());
+        app.tick_count = POLL_INTERVAL_TICKS - 1;
+        app.tick().await;
+        assert!(
+            app.tick_count.is_multiple_of(POLL_INTERVAL_TICKS),
+            "le tick doit tomber sur le minuteur"
+        );
+    }
+
+    /// Qu'une ligne balayable soit restée intacte : ni réclamée, ni livrée. Le
+    /// statut, parce que `mark_task_delivered` écrit `delivered` — un silence du
+    /// canal sans cette seconde mesure ne distinguerait pas « pas balayé » de
+    /// « balayé, réclamé, puis perdu ».
+    async fn la_ligne_est_intacte(app: &App<'static>, id: &str) {
+        let ligne = app
+            .db
+            .get_task(id)
+            .await
+            .expect("lire la ligne")
+            .expect("la ligne existe");
+        assert_eq!(ligne.status, "completed", "rien n'a été réclamé");
+    }
+
+    /// **Critère 1 du vol V2b-3b** — sous une couture qui suit l'agent courant,
+    /// le minuteur ne balaie plus. Le canal de la couture reste vide et son
+    /// signal désarmé : ce que le test mesure est le silence du minuteur seul.
+    #[tokio::test]
+    async fn mika1727_v2b3b_le_minuteur_se_tait_sous_la_couture_de_lagent_courant() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let id = une_ligne_balayable(&app).await;
+        let (_tx, feed) = CallbackFeed::from_channel(&app.agent_name, String::new(), String::new());
+        app.callback_feed = Some(feed);
+
+        un_tour_de_minuteur(&mut app).await;
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "le minuteur ne balaie plus sous la couture"
+        );
+        la_ligne_est_intacte(&app, &id).await;
+    }
+
+    /// **Critère 2** — sans couture, le même tour livre, comme avant le vol.
+    /// C'est le témoin qui sépare « le minuteur s'est tu » de « la ligne
+    /// n'était pas balayable » : les deux tests posent la même ligne.
+    #[tokio::test]
+    async fn mika1727_v2b3b_sans_couture_le_minuteur_balaie_toujours() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let id = une_ligne_balayable(&app).await;
+        // Explicite, bien que ce soit l'état du harnais : c'est l'axe du test.
+        app.callback_feed = None;
+
+        un_tour_de_minuteur(&mut app).await;
+
+        let AgentRequest::CallbackResult { task_id, .. } =
+            request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(task_id, id, "la ligne du test, pas une autre");
+    }
+
+    /// **Critère 3** — une couture qui suit **un autre** agent ne fait pas taire
+    /// le minuteur. C'est le cas du changement d'agent : le fil reste figé sur
+    /// l'agent de son ouverture, la TUI en sert un autre, et personne ne
+    /// couvrirait le nouveau si le minuteur se taisait aussi (dette D1).
+    #[tokio::test]
+    async fn mika1727_v2b3b_une_couture_dun_autre_agent_laisse_le_minuteur_balayer() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let id = une_ligne_balayable(&app).await;
+        assert_ne!(app.agent_name, "mika-qa", "l'autre agent doit être autre");
+        let (_tx, feed) = CallbackFeed::from_channel("mika-qa", String::new(), String::new());
+        app.callback_feed = Some(feed);
+
+        un_tour_de_minuteur(&mut app).await;
+
+        let AgentRequest::CallbackResult { task_id, .. } =
+            request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(task_id, id, "la ligne du test, pas une autre");
     }
 
     /// **Critère 4 du vol V2b-3b** — un changement de session balaie une fois,
