@@ -657,6 +657,15 @@ pub struct App<'a> {
     /// construction, comme `dashboard_running` ; `None` en mode équipe et quand
     /// l'ouverture échoue — `poll_callback_tasks` couvre alors.
     pub callback_feed: Option<CallbackFeed>,
+
+    /// La dernière session que le drainage a balayée (mika#1727, vol V2b-3b).
+    ///
+    /// `None` tant qu'aucune ne l'a été, ce qui fait du premier drainage un
+    /// balayage : au lancement, tout callback fini de cette session est un trou.
+    /// Une `Option<String>` et non un booléen — c'est la **comparaison** qui
+    /// porte la propriété, un « déjà balayé » ne couvrirait jamais la seconde
+    /// session.
+    derniere_session_balayee: Option<String>,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -747,6 +756,7 @@ impl<'a> App<'a> {
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
             callback_feed: None,
+            derniere_session_balayee: None,
         }
     }
 
@@ -841,6 +851,7 @@ impl<'a> App<'a> {
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
             callback_feed: None,
+            derniere_session_balayee: None,
         }
     }
 
@@ -1629,8 +1640,27 @@ impl<'a> App<'a> {
         // Le fil ne rejoue rien : à son ouverture comme après un `OverflowMarker`,
         // il dit seulement qu'il a pu manquer quelque chose. Le balayage est la
         // lecture que le poll fait déjà — appelée, jamais recopiée.
-        let couture = self.callback_feed.as_ref();
-        if couture.is_some_and(|f| f.prendre_le_rattrapage()) {
+        //
+        // Deux sources, un seul balayage (vol V2b-3b). Le signal est pris
+        // **avant** le `if` et hors de tout court-circuit : placé en second dans
+        // un `||`, il survivrait au balayage que le changement de session vient
+        // de faire, et le passage suivant en ferait un second. Un passage, un
+        // appel.
+        let signal = self
+            .callback_feed
+            .as_ref()
+            .is_some_and(|f| f.prendre_le_rattrapage());
+        // La requête du balayage filtre sur `session_id` : un balayage fait sous
+        // l'ancienne session ne couvre pas la nouvelle, d'où la comparaison
+        // plutôt qu'un drapeau. Le drainage tourne à chaque tick, donc la
+        // détection coûte un tick, pas un tour de minuteur.
+        let session_neuve =
+            self.derniere_session_balayee.as_deref() != Some(self.session_id.as_str());
+        if signal || session_neuve {
+            // Retenue même quand le balayage vient du signal : la requête filtre
+            // sur `session_id`, donc cette session **est** balayée dans les deux
+            // cas.
+            self.derniere_session_balayee = Some(self.session_id.clone());
             self.poll_callback_tasks().await;
             // Une livraison relance le tour, et la boucle du fil ne doit pas en
             // empiler une seconde : même règle que le `break` du poll.
@@ -2647,6 +2677,69 @@ mod tests {
     async fn terminer_la_ligne(app: &App<'static>, id: &str) {
         let fini = app.db.update_task_completed(id, Some("fini")).await;
         assert!(fini.expect("terminer la ligne"), "pending → completed");
+    }
+
+    /// Une ligne de callback que le **balayage** verra : le helper ci-dessus la
+    /// crée, `terminer_la_ligne` la rend visible. Les deux, parce qu'un statut
+    /// posé par `update_task_status` laisse `completed_at` nul et reste
+    /// invisible de `get_undelivered_callback_tasks_for_session` — un test monté
+    /// sur lui seul serait vert sans rien mesurer (mika#2205).
+    async fn une_ligne_balayable(app: &App<'static>) -> String {
+        let (id, _tx, _feed) = couture_dun_callback_livrable(app, "pending", None, None).await;
+        terminer_la_ligne(app, &id).await;
+        id
+    }
+
+    /// **Critère 4 du vol V2b-3b** — un changement de session balaie une fois,
+    /// et une seule. Les deux moitiés tiennent dans un test parce que la seconde
+    /// ne veut rien dire sans la première.
+    ///
+    /// Le passage se fait par `tick`, et `tick_count = 1` le laisse **hors**
+    /// multiple de `POLL_INTERVAL_TICKS` : c'est la moitié « sans passer par le
+    /// minuteur » du critère. Appeler `drain_callback_deliveries` seul la
+    /// prouverait par construction plutôt que par mesure, et la remplacer par un
+    /// multiple « parce que ça livre quand même » l'effacerait.
+    #[tokio::test]
+    async fn mika1727_v2b3b_un_changement_de_session_balaie_une_fois() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        une_ligne_balayable(&app).await;
+        let (_tx, feed) = CallbackFeed::from_channel(&app.agent_name, String::new(), String::new());
+        app.callback_feed = Some(feed);
+        app.derniere_session_balayee = Some("s-precedente".to_string());
+        app.tick_count = 1;
+
+        app.tick().await;
+
+        assert!(
+            request_rx.try_recv().is_ok(),
+            "la session neuve est balayée"
+        );
+        assert!(request_rx.try_recv().is_err(), "une seule livraison");
+        assert_eq!(
+            app.derniere_session_balayee.as_deref(),
+            Some(app.session_id.as_str()),
+            "la session balayée est retenue"
+        );
+
+        // Remis à la main : sinon la garde du tour en cours expliquerait seule le
+        // silence, et le test serait vert sur une autre raison que la sienne
+        // (mika#2205).
+        app.status = AgentStatus::Idle;
+        let deuxieme = une_ligne_balayable(&app).await;
+
+        app.tick().await;
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "la même session ne se rebalaie pas"
+        );
+        let ligne = app
+            .db
+            .get_task(&deuxieme)
+            .await
+            .expect("lire la ligne")
+            .expect("la ligne existe");
+        assert_eq!(ligne.status, "completed", "et rien n'a été réclamé");
     }
 
     /// **Critère 3** — un callback semé en base, sans **aucune** trame dans le
