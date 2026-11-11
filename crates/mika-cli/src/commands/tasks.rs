@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
@@ -695,6 +698,49 @@ fn terminal_callback_frame(frame: Option<&TaskEventFrame>) -> Option<String> {
     }
 }
 
+/// La trame dit-elle **qu'il manque quelque chose**, sans dire quoi ?
+///
+/// Une seule des huit en est : [`TaskEventFrame::OverflowMarker`]. Son
+/// `dropped_count` n'est **pas** lu — le balayage qu'il déclenche relit la
+/// session entière, donc le compte des trames tombées n'y changerait rien. Le
+/// `match` énumère les huit variantes sans bras `_`, et un `matches!` est
+/// refusé pour la même raison : sous l'un comme sous l'autre, une variante
+/// neuve qui annoncerait une perte tomberait du côté « rien » en silence.
+fn frame_annonce_un_trou(frame: Option<&TaskEventFrame>) -> bool {
+    match frame {
+        Some(TaskEventFrame::OverflowMarker { .. }) => true,
+        Some(
+            TaskEventFrame::TaskCreated { .. }
+            | TaskEventFrame::TaskClaimed { .. }
+            | TaskEventFrame::TaskCompleted { .. }
+            | TaskEventFrame::TaskFailed { .. }
+            | TaskEventFrame::TaskDelivered { .. }
+            | TaskEventFrame::TaskCancelled { .. }
+            | TaskEventFrame::Unknown,
+        )
+        | None => false,
+    }
+}
+
+/// Ce que le superviseur fait d'**une** trame : au plus une livraison dans le
+/// canal, au plus un armement du rattrapage, les deux indépendants.
+///
+/// Fonction **nommée** plutôt que corps de fermeture, pour que le critère 2 du
+/// vol se mesure **sans serveur** : dans une fermeture, il aurait fallu un faux
+/// spirit capable de produire un `Lagged`, c'est-à-dire une course à gagner.
+fn appliquer_la_trame(
+    trame: Option<&TaskEventFrame>,
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    rattrapage: &AtomicBool,
+) {
+    if let Some(id) = terminal_callback_frame(trame) {
+        let _ = tx.send(id);
+    }
+    if frame_annonce_un_trou(trame) {
+        rattrapage.store(true, Ordering::SeqCst);
+    }
+}
+
 impl TaskDetailMirror {
     /// Le prédicat de `get_undelivered_callback_tasks_for_session`, porté sur le
     /// détail. Une tâche qui n'y répond pas n'est **ni livrée ni réclamée**.
@@ -749,19 +795,29 @@ impl Recul {
 
 /// La couture entre le fil des tâches et la TUI.
 ///
-/// Elle porte **ensemble** le canal, l'URL de base et le jeton, et n'expose
-/// qu'un geste. C'est ce qui rend vraie *par le type* la contrainte
-/// « `tui/app.rs` ne détient ni l'URL, ni le jeton, ni le nom de la lecture
-/// HTTP », et ce qui garde exacte la déclaration `cli-spirit-tasks` du manifeste
-/// egress, dont le périmètre est ce fichier. Le canal ne porte qu'un `task_id`,
-/// et **pas** le statut de la trame : le détail est l'autorité sur le statut, et
-/// un second champ en serait une seconde — capable de diverger le jour où la
-/// trame dit `failed` et où le détail, repris entre-temps, dit `completed`.
-/// `original_status` mentirait alors à l'agent. Un lecteur, une source.
+/// Elle porte **ensemble** le canal, l'URL de base, le jeton et le drapeau de
+/// rattrapage, et n'expose que des gestes. C'est ce qui rend vraie *par le type*
+/// la contrainte « `tui/app.rs` ne détient ni l'URL, ni le jeton, ni le nom de
+/// la lecture HTTP », et ce qui garde exacte la déclaration `cli-spirit-tasks`
+/// du manifeste egress, dont le périmètre est ce fichier.
+///
+/// **Le canal ne porte qu'un `task_id`**, et **pas** le statut de la trame : le
+/// détail est l'autorité sur le statut, et un second champ en serait une
+/// seconde — capable de diverger le jour où la trame dit `failed` et où le
+/// détail, repris entre-temps, dit `completed`. `original_status` mentirait
+/// alors à l'agent. Un lecteur, une source.
+///
+/// **Le rattrapage voyage à côté du canal, et non dedans** (vol V2b-3a). Un
+/// `AtomicBool` ne s'empile pas, donc dix signaux ne donnent qu'un balayage
+/// sans qu'aucune garde ne l'écrive ; il ne porte ni statut ni `task_id`, donc
+/// il ne rouvre pas la question tranchée au paragraphe précédent. L'ordre entre
+/// les deux est sans objet : le signal dit seulement « il a pu manquer quelque
+/// chose », et la base reste l'autorité sur ce qui reste à livrer.
 pub(crate) struct CallbackFeed {
     rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     base_url: String,
     token: String,
+    rattrapage: Arc<AtomicBool>,
 }
 
 impl CallbackFeed {
@@ -773,11 +829,15 @@ impl CallbackFeed {
     /// parce qu'il n'y a plus d'échec à rendre. Le cas du jeton absent reste celui
     /// de l'appelant.
     ///
-    /// **Ce qu'il ne garantit pas : le rattrapage.** Le serveur diffuse par un
-    /// `broadcast` sans reprise par curseur, donc une trame émise pendant une
-    /// coupure est perdue pour le fil, comme celles qu'un `OverflowMarker` déclare
-    /// perdues. Ce vol borne la durée des trous, il ne les comble pas ;
-    /// `poll_callback_tasks` reste le filet qui les couvre.
+    /// **Ce qu'il garantit depuis le vol V2b-3a : il dit qu'il a pu manquer
+    /// quelque chose.** Le serveur diffuse par un `broadcast` sans reprise par
+    /// curseur, donc une trame émise pendant une coupure est perdue, comme
+    /// celles qu'un `OverflowMarker` déclare perdues. Le fil ne les rejoue pas :
+    /// il **arme le rattrapage** à chaque ouverture réussie et à chaque
+    /// `OverflowMarker`, et c'est le drainage qui en fait un balayage.
+    ///
+    /// **Ce qu'il ne garantit toujours pas : le compte des trous.** Le drapeau
+    /// est un booléen, donc `dropped_count` n'est pas conservé — coût assumé.
     pub(crate) fn open_for(agent_id: &str, base_url: String, token: String) -> Self {
         Self::open_for_avec_recul(agent_id, base_url, token, Recul::DEFAUT)
     }
@@ -786,9 +846,11 @@ impl CallbackFeed {
     /// les tests prennent des délais en millisecondes sans suspendre d'horloge.
     fn open_for_avec_recul(agent_id: &str, base_url: String, token: String, recul: Recul) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rattrapage = Arc::new(AtomicBool::new(false));
         let agent = agent_id.to_string();
         let base = base_url.clone();
         let jeton = token.clone();
+        let drapeau = Arc::clone(&rattrapage);
         tokio::spawn(async move {
             let mut tentative: u32 = 0;
             loop {
@@ -808,11 +870,15 @@ impl CallbackFeed {
                     // Sur l'**ouverture**, pas sur la livraison : un flux calme est
                     // un fil sain (keep-alive), pas un recul à faire grandir.
                     tentative = 0;
+                    // Le rattrapage s'arme sur l'**ouverture** et non sur la
+                    // première trame : ce qui a été manqué l'a été *avant* elle,
+                    // et un fil qui s'ouvre sur un silence complet est le cas même
+                    // où le balayage sert. La première ouverture n'est pas un cas
+                    // à part — au lancement, tout callback fini est un trou.
+                    drapeau.store(true, Ordering::SeqCst);
                     let _ = flux
                         .consume(Some(&agent), |_, trame| {
-                            if let Some(id) = terminal_callback_frame(trame) {
-                                let _ = tx.send(id);
-                            }
+                            appliquer_la_trame(trame, &tx, &drapeau);
                         })
                         .await;
                 }
@@ -827,7 +893,25 @@ impl CallbackFeed {
             rx,
             base_url,
             token,
+            rattrapage,
         }
+    }
+
+    /// Prendre le signal de rattrapage : vrai **au plus une fois** par salve.
+    ///
+    /// `swap(false)` et non un `load` : le signal est consommé par sa lecture,
+    /// donc une réouverture suivie de deux `OverflowMarker` ne donne qu'un seul
+    /// balayage — propriété du type, pas garde à tenir.
+    pub(crate) fn prendre_le_rattrapage(&self) -> bool {
+        self.rattrapage.swap(false, Ordering::SeqCst)
+    }
+
+    /// Armer le signal depuis un test, sans fil ni serveur. C'est ce qui laisse
+    /// [`CallbackFeed::from_channel`] garder sa signature, donc les tests qui
+    /// lisent le canal à nu intacts (critère 5 du vol).
+    #[cfg(test)]
+    pub(crate) fn armer_le_rattrapage(&self) {
+        self.rattrapage.store(true, Ordering::SeqCst);
     }
 
     /// Le prochain candidat **recevable**, ou rien. Les gardes 1 et 2 du vol, et
@@ -866,6 +950,7 @@ impl CallbackFeed {
                 rx,
                 base_url,
                 token,
+                rattrapage: Arc::new(AtomicBool::new(false)),
             },
         )
     }
@@ -1898,6 +1983,102 @@ mod tests {
             connexions.load(std::sync::atomic::Ordering::SeqCst),
             apres_lacher,
             "le compteur ne monte plus après le lâcher"
+        );
+    }
+
+    // -- le signal de rattrapage (mika#1727, vol V2b-3a) --
+
+    /// **Critère 1** — la première connexion sert un `task_claimed` : il passe le
+    /// filtre d'agent, n'est pas terminal et n'annonce aucun trou, donc un
+    /// drapeau armé ne peut venir que de l'**ouverture**. Le compteur de
+    /// connexions est le témoin positif des deux moitiés.
+    #[tokio::test]
+    async fn mika1727_v2b3a_la_premiere_ouverture_et_la_reouverture_arment_le_rattrapage() {
+        let premiere = fake_spirit::sse_payload(&[
+            r#"{"event":"task_claimed","task_id":"t-5","agent_id":"mika-dev","claimed_at":"2026-11-11T10:00:00Z"}"#,
+        ]);
+        let seconde = fake_spirit::sse_payload(&[
+            r#"{"event":"task_completed","task_id":"t-7","agent_id":"mika-dev","completed_at":"2026-11-11T10:00:01Z","result_preview":"fait"}"#,
+        ]);
+        let (base, connexions) =
+            fake_spirit::spawn_sequence(vec![(200, premiere), (200, seconde)]).await;
+
+        let mut couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            // Une seconde, et non les 20 ms des tests voisins : c'est la fenêtre
+            // qui laisse **prendre** le signal de la première ouverture avant que
+            // la seconde ne le réarme. Sans elle les deux armements se
+            // confondraient et la réouverture ne serait plus mesurée.
+            Recul {
+                initial_ms: 1_000,
+                plafond_ms: 1_000,
+            },
+        );
+
+        let arme = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !couture.prendre_le_rattrapage() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(arme.is_ok(), "la première ouverture arme le rattrapage");
+        assert!(
+            connexions.load(Ordering::SeqCst) >= 1,
+            "le fil s'est ouvert"
+        );
+
+        let recu = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+            .await
+            .expect("la trame de la seconde connexion arrive")
+            .expect("le canal reste ouvert");
+        assert_eq!(recu, "t-7");
+        assert!(
+            connexions.load(Ordering::SeqCst) >= 2,
+            "par la seconde, donc"
+        );
+        assert!(couture.prendre_le_rattrapage(), "la réouverture a réarmé");
+    }
+
+    /// **Critère 2** — mesuré sur [`appliquer_la_trame`], donc sans serveur et
+    /// sans course : un `Lagged` ne se commande pas depuis un faux spirit. Le
+    /// troisième cas est le témoin positif que mika#2205 réclame — sans lui, une
+    /// fonction devenue vide passerait les deux refus qui précèdent.
+    #[test]
+    fn mika1727_v2b3a_un_overflow_arme_le_rattrapage_sans_rien_mettre_dans_le_canal() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rattrapage = AtomicBool::new(false);
+
+        appliquer_la_trame(
+            Some(&TaskEventFrame::OverflowMarker { dropped_count: 3 }),
+            &tx,
+            &rattrapage,
+        );
+        assert!(rattrapage.swap(false, Ordering::SeqCst), "l'overflow arme");
+        assert!(rx.try_recv().is_err(), "et ne livre aucun `task_id`");
+
+        appliquer_la_trame(Some(&TaskEventFrame::Unknown), &tx, &rattrapage);
+        assert!(
+            !rattrapage.load(Ordering::SeqCst),
+            "`Unknown` est sans effet"
+        );
+        assert!(rx.try_recv().is_err(), "`Unknown` ne livre rien non plus");
+
+        appliquer_la_trame(
+            Some(&TaskEventFrame::TaskCompleted {
+                task_id: "t-1".to_string(),
+                agent_id: "mika-dev".to_string(),
+                completed_at: "2026-11-11T10:00:00Z".to_string(),
+                result_preview: Some("fait".to_string()),
+            }),
+            &tx,
+            &rattrapage,
+        );
+        assert_eq!(rx.try_recv().ok(), Some("t-1".to_string()));
+        assert!(
+            !rattrapage.load(Ordering::SeqCst),
+            "elle n'annonce aucun trou"
         );
     }
 
