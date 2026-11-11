@@ -713,6 +713,40 @@ impl TaskDetailMirror {
     }
 }
 
+/// Le délai entre deux ouvertures du fil (mika#1727, vol V2b-2b-4).
+///
+/// Fonction **pure** de la tentative : elle se mesure sans suspendre d'horloge,
+/// d'où l'absence de `tokio/test-util`. **1 s en initial**, parce que le cas
+/// nominal est un redémarrage de mika-spirit : 100 ms y produiraient une rafale
+/// de refus pour rien, 10 s feraient payer dix secondes à une coupure passagère,
+/// et une seconde reste sous le filet du poll (~5 s). **30 s en plafond** — six
+/// passages du poll, qui couvre pendant ce temps ; plus bas, un daemon
+/// durablement à terre se ferait marteler, ce que le recul existe pour éviter.
+struct Recul {
+    initial_ms: u64,
+    plafond_ms: u64,
+}
+
+impl Recul {
+    const DEFAUT: Self = Self {
+        initial_ms: 1_000,
+        plafond_ms: 30_000,
+    };
+
+    /// **`checked_pow` puis `checked_mul`, et non un décalage** : `checked_shl` ne
+    /// valide que la **largeur** du décalage, pas la perte de bits, donc
+    /// `1_000u64 << 60` rendrait un nombre tronqué plutôt que `None` — un recul
+    /// redevenu court après avoir été long.
+    fn delai(&self, tentative: u32) -> std::time::Duration {
+        let ms = 2u64
+            .checked_pow(tentative)
+            .and_then(|facteur| self.initial_ms.checked_mul(facteur))
+            .unwrap_or(self.plafond_ms)
+            .min(self.plafond_ms);
+        std::time::Duration::from_millis(ms)
+    }
+}
+
 /// La couture entre le fil des tâches et la TUI.
 ///
 /// Elle porte **ensemble** le canal, l'URL de base et le jeton, et n'expose
@@ -731,29 +765,69 @@ pub(crate) struct CallbackFeed {
 }
 
 impl CallbackFeed {
-    /// Ouvrir **une fois** le fil de `agent_id`, sans recul ni reconnexion. Un
-    /// échec rend `None` — jeton refusé, daemon à terre — et `poll_callback_tasks`
-    /// couvre alors, c'est le filet de ce vol. Le drainage vit dans une tâche à
-    /// part parce que `consume` lit jusqu'à la fermeture du flux : sans elle, le
-    /// démarrage de la TUI y resterait.
-    pub(crate) async fn open_for(agent_id: &str, base_url: String, token: String) -> Option<Self> {
-        let flux = TaskEventStream::open(&base_url, &token).await.ok()?;
+    /// Lancer le superviseur du fil de `agent_id` (mika#1727, vol V2b-2b-4).
+    ///
+    /// **Ce qu'il garantit.** Le fil se rouvre de lui-même après une fermeture
+    /// comme après un échec d'ouverture, en attendant le [`Recul`]. La couture est
+    /// donc rendue **même si la première ouverture échoue** — plus d'`Option`,
+    /// parce qu'il n'y a plus d'échec à rendre. Le cas du jeton absent reste celui
+    /// de l'appelant.
+    ///
+    /// **Ce qu'il ne garantit pas : le rattrapage.** Le serveur diffuse par un
+    /// `broadcast` sans reprise par curseur, donc une trame émise pendant une
+    /// coupure est perdue pour le fil, comme celles qu'un `OverflowMarker` déclare
+    /// perdues. Ce vol borne la durée des trous, il ne les comble pas ;
+    /// `poll_callback_tasks` reste le filet qui les couvre.
+    pub(crate) fn open_for(agent_id: &str, base_url: String, token: String) -> Self {
+        Self::open_for_avec_recul(agent_id, base_url, token, Recul::DEFAUT)
+    }
+
+    /// Le corps d'[`CallbackFeed::open_for`], avec le recul en paramètre pour que
+    /// les tests prennent des délais en millisecondes sans suspendre d'horloge.
+    fn open_for_avec_recul(agent_id: &str, base_url: String, token: String, recul: Recul) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let agent = agent_id.to_string();
+        let base = base_url.clone();
+        let jeton = token.clone();
         tokio::spawn(async move {
-            let _ = flux
-                .consume(Some(&agent), |_, trame| {
-                    if let Some(id) = terminal_callback_frame(trame) {
-                        let _ = tx.send(id);
-                    }
-                })
-                .await;
+            let mut tentative: u32 = 0;
+            loop {
+                // L'arrêt se lit sur l'expéditeur : la couture possède le
+                // récepteur, donc `is_closed` suffit — aucune seconde voie
+                // d'annulation. **Avant l'ouverture** plutôt que dans un `select!`
+                // parce que c'est la connexion qu'il s'agit de ne pas faire ; la
+                // tâche survit au lâcher jusqu'à son réveil, au plus un recul.
+                if tx.is_closed() {
+                    return;
+                }
+                // Un échec d'ouverture et une fin de flux tombent tous les deux
+                // sur le `sleep` qui suit : le `if let Ok` sans `else` *est* la
+                // forme qui les rend équivalents, et l'`Err` de `consume` (lecture
+                // coupée) y vaut son `Ok` (fermeture propre).
+                if let Ok(flux) = TaskEventStream::open(&base, &jeton).await {
+                    // Sur l'**ouverture**, pas sur la livraison : un flux calme est
+                    // un fil sain (keep-alive), pas un recul à faire grandir.
+                    tentative = 0;
+                    let _ = flux
+                        .consume(Some(&agent), |_, trame| {
+                            if let Some(id) = terminal_callback_frame(trame) {
+                                let _ = tx.send(id);
+                            }
+                        })
+                        .await;
+                }
+                tokio::time::sleep(recul.delai(tentative)).await;
+                // `saturating_add` parce qu'une TUI laissée ouverte un week-end
+                // contre un daemon mort ne doit pas déborder son compteur : au
+                // plafond depuis longtemps, elle ne doit pas non plus paniquer.
+                tentative = tentative.saturating_add(1);
+            }
         });
-        Some(Self {
+        Self {
             rx,
             base_url,
             token,
-        })
+        }
     }
 
     /// Le prochain candidat **recevable**, ou rien. Les gardes 1 et 2 du vol, et
@@ -1683,17 +1757,148 @@ mod tests {
         ];
         let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
 
-        let mut couture = CallbackFeed::open_for("mika-dev", base, "jeton".to_string())
-            .await
-            .expect("le fil factice s'ouvre");
-        // Le corps du factice est fini : le drainage lâche son expéditeur et
-        // `recv` rend `None`, ce qui rend ce relevé complet, non instantané.
+        let mut couture = CallbackFeed::open_for("mika-dev", base, "jeton".to_string());
+        // Le superviseur **ne lâche plus** son expéditeur à la fin du corps : il
+        // rouvre, donc `recv` ne rend plus `None`. La fenêtre de silence est à 5×
+        // sous le premier recul par défaut (1 s) — aucune seconde connexion ne
+        // peut y rejouer `t-2`, et la borne est une constante du code.
         let mut recus: Vec<String> = Vec::new();
-        while let Some(id) = couture.rx.recv().await {
+        for _ in 0..2 {
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+                .await
+                .expect("les deux identifiants arrivent")
+                .expect("le canal reste ouvert");
             recus.push(id);
         }
+        let silence =
+            tokio::time::timeout(std::time::Duration::from_millis(200), couture.rx.recv()).await;
+        assert!(silence.is_err(), "rien ne suit les deux identifiants");
 
         assert_eq!(recus, vec!["t-2".to_string(), "t-6".to_string()]);
+    }
+
+    // -- la reconnexion et le recul (mika#1727, vol V2b-2b-4) --
+
+    /// **Critère 1** — les trois dernières tentatives sont les trois populations
+    /// de débordement : `64` déborde sur `checked_mul`, `1 000` sur `checked_pow`,
+    /// `u32::MAX` sur les deux — aucune ne panique.
+    #[test]
+    fn mika1727_v2b2b4_le_recul_double_jusquau_plafond_et_ne_panique_pas() {
+        let recul = Recul::DEFAUT;
+        let ms = |tentative| recul.delai(tentative).as_millis();
+
+        assert_eq!(
+            [ms(0), ms(1), ms(2), ms(3), ms(4)],
+            [1_000, 2_000, 4_000, 8_000, 16_000]
+        );
+        assert_eq!(ms(5), 30_000, "32 s est plafonnée");
+        assert_eq!([ms(64), ms(1_000), ms(u32::MAX)], [30_000; 3]);
+    }
+
+    /// **Critère 2** — la première connexion sert un `task_claimed` : le filtre
+    /// d'agent le laisse passer mais `terminal_callback_frame` ne le retient pas,
+    /// donc **rien n'entre dans le canal par elle**. `t-7` n'a pu arriver que par
+    /// la seconde — ce que le compteur confirme indépendamment.
+    #[tokio::test]
+    async fn mika1727_v2b2b4_apres_une_fermeture_le_fil_se_rouvre() {
+        let premiere = fake_spirit::sse_payload(&[
+            r#"{"event":"task_claimed","task_id":"t-5","agent_id":"mika-dev","claimed_at":"2026-11-11T10:00:00Z"}"#,
+        ]);
+        let seconde = fake_spirit::sse_payload(&[
+            r#"{"event":"task_completed","task_id":"t-7","agent_id":"mika-dev","completed_at":"2026-11-11T10:00:01Z","result_preview":"fait"}"#,
+        ]);
+        let (base, connexions) =
+            fake_spirit::spawn_sequence(vec![(200, premiere), (200, seconde)]).await;
+
+        let mut couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            Recul {
+                initial_ms: 20,
+                plafond_ms: 20,
+            },
+        );
+
+        let recu = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+            .await
+            .expect("la trame de la seconde connexion arrive")
+            .expect("le canal reste ouvert");
+        assert_eq!(recu, "t-7");
+        assert!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "la trame n'a pu arriver que par la seconde connexion"
+        );
+    }
+
+    /// **Critère 3** — que la couture soit rendue malgré un échec d'ouverture est
+    /// d'abord un fait de **type**, `open_for_avec_recul` ne rendant pas d'`Option`
+    /// ; ce test l'exerce sur le cas « daemon à terre au lancement de la TUI ».
+    #[tokio::test]
+    async fn mika1727_v2b2b4_un_echec_douverture_rend_quand_meme_la_couture() {
+        let retour = fake_spirit::sse_payload(&[
+            r#"{"event":"task_completed","task_id":"t-8","agent_id":"mika-dev","completed_at":"2026-11-11T10:00:02Z","result_preview":"fait"}"#,
+        ]);
+        let (base, connexions) =
+            fake_spirit::spawn_sequence(vec![(503, "daemon à terre".to_string()), (200, retour)])
+                .await;
+
+        let mut couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            Recul {
+                initial_ms: 20,
+                plafond_ms: 20,
+            },
+        );
+
+        let recu = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+            .await
+            .expect("le fil se rouvre après le 503")
+            .expect("le canal reste ouvert");
+        assert_eq!(recu, "t-8");
+        assert!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "le 503 a été suivi d'une seconde ouverture"
+        );
+    }
+
+    /// **Critère 4** — la séquence est vide, donc chaque connexion reçoit un corps
+    /// vide et se referme aussitôt : le compteur monte à chaque recul. La première
+    /// assertion est le **témoin positif** que mika#2205 réclame à côté d'un refus
+    /// — sans elle, un superviseur qui n'aurait jamais rouvert passerait aussi.
+    #[tokio::test]
+    async fn mika1727_v2b2b4_une_couture_lachee_ne_rouvre_plus_le_fil() {
+        let (base, connexions) = fake_spirit::spawn_sequence(Vec::new()).await;
+        let couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            Recul {
+                initial_ms: 20,
+                plafond_ms: 20,
+            },
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "le fil se rouvrait bien tant que la couture vivait"
+        );
+
+        drop(couture);
+        // Le lâcher ne réveille pas la tâche : elle dort jusqu'à son recul, lit
+        // alors `is_closed` et rend la main. Ce délai lui laisse ce réveil.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let apres_lacher = connexions.load(std::sync::atomic::Ordering::SeqCst);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst),
+            apres_lacher,
+            "le compteur ne monte plus après le lâcher"
+        );
     }
 
     /// Un candidat tiré d'une couture dont le canal porte `t-42`.
@@ -2343,6 +2548,47 @@ pub(crate) mod fake_spirit {
             let _ = axum::serve(listener, router.into_make_service()).await;
         });
         format!("http://{addr}")
+    }
+
+    /// Sert une **séquence** de réponses sur `/api/v1/dashboard/tasks/stream`,
+    /// une par connexion, et compte les connexions (mika#1727, vol V2b-2b-4).
+    ///
+    /// La n-ième connexion reçoit `reponses[n]` ; **au-delà de la séquence**, un
+    /// `200` à corps vide, qui se ferme aussitôt et provoque une reconnexion de
+    /// plus — ce dont le test du lâcher a besoin pour voir un compteur monter
+    /// avant de s'arrêter. Le compteur est le nombre de requêtes **reçues sur
+    /// cette route**, incrémenté avant de servir : c'est la définition de
+    /// « connexion » dans ces tests, écrite ici plutôt que supposée.
+    pub(crate) async fn spawn_sequence(
+        reponses: Vec<(u16, String)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let connexions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compteur = Arc::clone(&connexions);
+        let router = Router::new().route(
+            "/api/v1/dashboard/tasks/stream",
+            get(move || {
+                let reponses = reponses.clone();
+                let compteur = Arc::clone(&compteur);
+                async move {
+                    let rang = compteur.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (statut, corps) = reponses
+                        .get(rang)
+                        .cloned()
+                        .unwrap_or_else(|| (200, String::new()));
+                    axum::response::Response::builder()
+                        .status(statut)
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(corps))
+                        .expect("corps SSE factice à séquence")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        (format!("http://{addr}"), connexions)
     }
 
     /// L'en-tête `authorization` tel que la socket l'a reçu, `None` avant la requête.
