@@ -796,6 +796,16 @@ impl CallbackFeed {
         tokio::spawn(async move {
             let mut tentative: u32 = 0;
             loop {
+                // L'arrêt se lit sur l'expéditeur, **avant l'ouverture** : la
+                // couture possède le récepteur, donc `is_closed` devient vrai
+                // dès que la TUI la lâche, et aucune seconde voie d'annulation
+                // n'est nécessaire. Avant l'ouverture plutôt que dans un
+                // `select!` parce que c'est la connexion qu'il s'agit de ne pas
+                // faire : la tâche survit au lâcher jusqu'à son réveil suivant,
+                // au plus un recul au plafond, en ne tenant qu'un `Sender` clos.
+                if tx.is_closed() {
+                    return;
+                }
                 // Un échec d'ouverture et une fin de flux tombent tous les deux
                 // sur le `sleep` qui suit : le `if let Ok` sans `else` *est* la
                 // forme qui les rend équivalents, et l'`Err` de `consume`
@@ -1862,6 +1872,47 @@ mod tests {
         assert!(
             connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "le 503 a été suivi d'une seconde ouverture"
+        );
+    }
+
+    /// **Critère 4** — une couture lâchée ne rouvre plus le fil. La séquence est
+    /// vide, donc chaque connexion reçoit un corps vide et se referme aussitôt :
+    /// le compteur monte à chaque recul. La première assertion est le **témoin
+    /// positif** que mika#2205 réclame à côté d'un test de refus — sans elle, un
+    /// superviseur qui n'aurait jamais rouvert passerait aussi. L'intervalle final
+    /// vaut dix reculs : il couvre « plusieurs reculs », et un `assert_eq!` sur un
+    /// compteur relevé avant lui est plus fort qu'une borne.
+    #[tokio::test]
+    async fn mika1727_v2b2b4_une_couture_lachee_ne_rouvre_plus_le_fil() {
+        let (base, connexions) = fake_spirit::spawn_sequence(Vec::new()).await;
+        let couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            Recul {
+                initial_ms: 20,
+                plafond_ms: 20,
+            },
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "le fil se rouvrait bien tant que la couture vivait"
+        );
+
+        drop(couture);
+        // Le lâcher ne réveille pas la tâche : elle dort jusqu'à son recul, lit
+        // alors `is_closed` et rend la main. Ce premier délai lui laisse ce
+        // réveil, le relevé qui suit est donc son dernier état.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let apres_lacher = connexions.load(std::sync::atomic::Ordering::SeqCst);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst),
+            apres_lacher,
+            "le compteur ne monte plus après le lâcher"
         );
     }
 
