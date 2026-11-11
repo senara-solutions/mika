@@ -1607,22 +1607,31 @@ impl<'a> App<'a> {
     }
 
     /// Les gardes 3 et 4 du vol V2b-2b-2 : réclamer, puis livrer un candidat que
-    /// la couture a déjà jugé recevable.
+    /// la couture a déjà jugé recevable. Le vol V2b-2b-3 y amène les `failed`.
     ///
-    /// La forme est celle de [`Self::poll_callback_tasks`] — même message
-    /// système, même `CallbackResult`, même `Thinking`, même sortie après un
-    /// envoi pour que l'agent reste réactif. Trois choses viennent du vol : le
-    /// détail arrive par HTTP, `original_status` est toujours `"completed"`
-    /// puisque le fil ne retient que `TaskCompleted`, et il n'y a donc pas de
-    /// garde d'ancienneté — elle ne vise que les `failed`, que le poll livre
-    /// toujours. Un candidat refusé par la réclamation **ne rend pas la main** :
-    /// sinon une ligne que le poll vient de prendre retarderait d'un tick celle
-    /// qui la suit dans le canal.
+    /// La parité avec [`Self::poll_callback_tasks`] **est** le contrat, et elle
+    /// doit tenir avant le vol V2b-3, qui retire le poll : ce qui n'est pas ici
+    /// ce jour-là est perdu. Deux divergences, voulues.
+    ///
+    /// L'ordre. Le statut se lit **avant** la réclamation, qui écrit `delivered`
+    /// sur la ligne ; la garde d'ancienneté, elle, s'applique **après**, avec un
+    /// `continue`. Le poll réclame en deux endroits parce qu'il tient un compteur
+    /// de lignes écartées — ici une réclamation unique suffit.
+    ///
+    /// L'absence du résumé `"Cleared N stale failed task(s)"`. Le critère 3 veut
+    /// qu'un `failed` périmé ne pousse **aucun** message système, et un décompte
+    /// à la ligne serait du bruit. L'écart se lit dans les traces `debug`.
+    ///
+    /// Un candidat refusé par la réclamation **ne rend pas la main** : sinon une
+    /// ligne que le poll vient de prendre retarderait d'un tick celle qui la suit
+    /// dans le canal.
     async fn drain_callback_deliveries(&mut self) {
         // Copiées avant la boucle : `next_candidate` emprunte la couture, donc
         // `self`. Elles voyagent par appel — `/new` les réassigne.
         let agent = self.agent_name.clone();
         let session = self.session_id.clone();
+        let stale_threshold =
+            chrono::Duration::minutes(mika_agent::planning::policy::STALE_FAILED_CALLBACK_MINUTES);
         loop {
             let Some(feed) = self.callback_feed.as_mut() else {
                 return;
@@ -1630,6 +1639,10 @@ impl<'a> App<'a> {
             let Some(detail) = feed.next_candidate(&agent, &session).await else {
                 return;
             };
+
+            // Lu avant la réclamation, qui écrit `delivered` sur la ligne. Le
+            // prédicat de la couture garantit `completed` ou `failed`.
+            let est_un_echec = detail.status == "failed";
 
             match self.db.mark_task_delivered(&detail.id).await {
                 Ok(true) => {}
@@ -1640,13 +1653,34 @@ impl<'a> App<'a> {
                 }
             }
 
-            let Some(result) = detail.result.filter(|r| !r.is_empty()) else {
-                continue; // un `completed` sans résultat est sauté, comme au poll
+            // Un `failed` trop vieux ne vaut plus pour la conversation en cours ;
+            // un `completed`, lui, vaut encore. `is_older_than` rend `false` sur
+            // un horodatage illisible et `is_some_and` sur son absence : les deux
+            // biais vont vers la livraison, jamais vers le silence.
+            if est_un_echec
+                && detail
+                    .completed_at
+                    .as_deref()
+                    .is_some_and(|ts| mika_agent::timestamp::is_older_than(ts, stale_threshold))
+            {
+                tracing::debug!(
+                    task_id = %detail.id,
+                    label = %detail.label,
+                    "skipped stale failed callback"
+                );
+                continue;
+            }
+
+            let result = match detail.result {
+                Some(r) if !r.is_empty() => r,
+                _ if est_un_echec => mika_agent::agent::FAILED_TASK_FALLBACK.to_string(),
+                _ => continue, // un `completed` sans résultat est sauté, comme au poll
             };
 
+            let status_label = if est_un_echec { "failed" } else { "completed" };
             self.messages.push(ChatMessage {
                 role: ChatRole::System,
-                content: format!("[{}] completed", detail.label),
+                content: format!("[{}] {}", detail.label, status_label),
                 rendered: None,
                 channel: None,
             });
@@ -1656,7 +1690,7 @@ impl<'a> App<'a> {
                 label: detail.label,
                 result,
                 trace_id: detail.created_trace_id,
-                original_status: "completed".to_string(),
+                original_status: detail.status,
                 parent_task_id: detail.parent_task_id,
             });
 
@@ -2336,15 +2370,23 @@ mod tests {
         assert_eq!(app.pending_response.as_deref(), Some("hello"));
     }
 
-    // === livraison d'un `completed` par le fil (mika#1727, vol V2b-2b-2) ===
+    // === livraison d'un callback par le fil (mika#1727, vols V2b-2b-2 et -3) ===
 
-    /// Une ligne de callback `completed` en base, un mika-spirit factice qui sert
-    /// son détail, et une couture dont le canal porte son id. Les trois tiennent
-    /// dans un seul helper parce qu'ils doivent porter le **même** id, choisi par
-    /// la base : séparés, ils divergeraient en silence et les deux tests seraient
-    /// verts sans rien livrer (mika#2205).
+    /// Une ligne de callback en base, un mika-spirit factice qui sert son détail,
+    /// et une couture dont le canal porte son id. Les trois tiennent dans un seul
+    /// helper parce qu'ils doivent porter le **même** id, choisi par la base :
+    /// séparés, ils divergeraient en silence et les tests seraient verts sans
+    /// rien livrer (mika#2205).
+    ///
+    /// Les trois paramètres sont les trois axes que le vol V2b-2b-3 fait varier,
+    /// et le `statut` va **à la fois** sur la ligne et sur le détail : la ligne
+    /// parce que `mark_task_delivered` ne prend que `completed` et `failed`, le
+    /// détail parce que c'est lui que la livraison lit.
     async fn couture_dun_callback_livrable(
         app: &App<'static>,
+        statut: &str,
+        resultat: Option<&str>,
+        completed_at: Option<&str>,
     ) -> (String, mpsc::UnboundedSender<String>, CallbackFeed) {
         use mika_agent::db::NewTask;
 
@@ -2379,17 +2421,17 @@ mod tests {
             .await
             .expect("create callback row");
         app.db
-            .update_task_status(&id, "completed")
+            .update_task_status(&id, statut)
             .await
             .expect("set status");
 
         // Servi par HTTP : c'est lui, non la ligne, que la livraison lit.
         let corps = serde_json::json!({
-            "id": id, "agent_id": app.agent_name, "status": "completed",
+            "id": id, "agent_id": app.agent_name, "status": statut,
             "label": "long_running:run_claude_pilot", "trigger_type": "callback",
             "action_type": "resume_agent", "created_by_session": app.session_id,
-            "result": "le pilote a fini", "created_trace_id": "tr-9",
-            "parent_task_id": "t-parent",
+            "result": resultat, "created_trace_id": "tr-9",
+            "parent_task_id": "t-parent", "completed_at": completed_at,
         })
         .to_string();
         let (base, _) = crate::commands::tasks::fake_spirit::spawn_detail(200, corps).await;
@@ -2403,7 +2445,8 @@ mod tests {
     #[tokio::test]
     async fn mika1727_v2b2b2_un_completed_du_fil_est_livre_une_seule_fois() {
         let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
-        let (id, tx, feed) = couture_dun_callback_livrable(&app).await;
+        let (id, tx, feed) =
+            couture_dun_callback_livrable(&app, "completed", Some("le pilote a fini"), None).await;
         tx.send(id.clone()).unwrap();
         tx.send(id.clone()).unwrap();
         app.callback_feed = Some(feed);
@@ -2444,7 +2487,8 @@ mod tests {
     #[tokio::test]
     async fn mika1727_v2b2b2_rien_nest_livre_si_le_poll_a_deja_reclame() {
         let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
-        let (id, tx, feed) = couture_dun_callback_livrable(&app).await;
+        let (id, tx, feed) =
+            couture_dun_callback_livrable(&app, "completed", Some("le pilote a fini"), None).await;
         assert!(
             app.db.mark_task_delivered(&id).await.unwrap(),
             "le poll réclame le premier"
@@ -2457,5 +2501,131 @@ mod tests {
         assert!(request_rx.try_recv().is_err(), "rien n'est livré");
         assert_eq!(app.status, AgentStatus::Idle, "le tour ne repart pas");
         assert!(app.messages.is_empty(), "aucun message système");
+    }
+
+    // === livraison d'un `failed` par le fil (mika#1727, vol V2b-2b-3) ===
+
+    /// **Critère 1** — un `failed` avec résultat est livré **une fois**, et il
+    /// porte `original_status = "failed"`, lu sur le détail et non écrit en dur.
+    /// Le canal porte son id deux fois : au second tour la ligne est déjà
+    /// réclamée, `mark_task_delivered` rend `Ok(false)`, rien ne repart.
+    #[tokio::test]
+    async fn mika1727_v2b2b3_un_failed_du_fil_est_livre_une_seule_fois() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let (id, tx, feed) =
+            couture_dun_callback_livrable(&app, "failed", Some("le pilote a cassé"), None).await;
+        tx.send(id.clone()).unwrap();
+        tx.send(id.clone()).unwrap();
+        app.callback_feed = Some(feed);
+
+        app.drain_callback_deliveries().await;
+
+        let AgentRequest::CallbackResult {
+            task_id,
+            label,
+            result,
+            trace_id,
+            original_status,
+            parent_task_id,
+        } = request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(task_id, id);
+        assert_eq!(label, "long_running:run_claude_pilot");
+        assert_eq!(result, "le pilote a cassé", "le résultat vient du détail");
+        assert_eq!(trace_id.as_deref(), Some("tr-9"));
+        assert_eq!(original_status, "failed", "lu sur le détail");
+        assert_eq!(parent_task_id.as_deref(), Some("t-parent"));
+        assert_eq!(
+            app.messages.last().map(|m| m.content.as_str()),
+            Some("[long_running:run_claude_pilot] failed"),
+            "le message système dit `failed`, comme au poll"
+        );
+        assert_eq!(app.status, AgentStatus::Thinking, "le tour repart");
+
+        app.status = AgentStatus::Idle;
+        app.drain_callback_deliveries().await;
+        assert!(
+            request_rx.try_recv().is_err(),
+            "le second passage ne livre rien"
+        );
+    }
+
+    /// **Critère 2** — un `failed` sans résultat est livré quand même, avec le
+    /// texte de repli du poll. L'attendu est la constante elle-même : recopiée,
+    /// le test resterait vert le jour où le poll et le drainage divergeraient.
+    #[tokio::test]
+    async fn mika1727_v2b2b3_un_failed_sans_resultat_prend_le_repli() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let (id, tx, feed) = couture_dun_callback_livrable(&app, "failed", None, None).await;
+        tx.send(id).unwrap();
+        app.callback_feed = Some(feed);
+
+        app.drain_callback_deliveries().await;
+
+        let AgentRequest::CallbackResult { result, .. } =
+            request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(result, mika_agent::agent::FAILED_TASK_FALLBACK);
+    }
+
+    /// **Critère 2** — l'autre moitié de la règle : un `completed` sans résultat
+    /// reste sauté. Le voisin du test précédent, parce que c'est la **paire** qui
+    /// est la garde : seul, chacun passerait avec un `if` qui ignore le statut.
+    /// La ligne est tout de même réclamée — le drainage ne la rendra pas au poll.
+    #[tokio::test]
+    async fn mika1727_v2b2b3_un_completed_sans_resultat_reste_saute() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let (id, tx, feed) = couture_dun_callback_livrable(&app, "completed", None, None).await;
+        tx.send(id.clone()).unwrap();
+        app.callback_feed = Some(feed);
+
+        app.drain_callback_deliveries().await;
+
+        assert!(request_rx.try_recv().is_err(), "rien n'est livré");
+        assert!(app.messages.is_empty(), "aucun message système");
+        assert_eq!(app.status, AgentStatus::Idle, "le tour ne repart pas");
+    }
+
+    /// **Critère 3** — un `failed` plus vieux que
+    /// `STALE_FAILED_CALLBACK_MINUTES` est **réclamé sans être livré**. Les trois
+    /// assertions sont les trois moitiés de cette phrase : aucun `CallbackResult`,
+    /// aucun message système, et la ligne relue en `delivered` — sans quoi
+    /// « écarté » serait indistinguable de « jamais vu », et le poll la
+    /// reprendrait au tick suivant.
+    ///
+    /// L'horodatage est **dérivé du seuil**, pas écrit à la main : une minute
+    /// au-delà de ce que la policy déclare. Un `6` en dur mentirait le jour où le
+    /// seuil bouge, et le test serait vert sur la mauvaise raison.
+    #[tokio::test]
+    async fn mika1727_v2b2b3_un_failed_perime_est_reclame_sans_etre_livre() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let trop_vieux = mika_agent::timestamp::now_minus(chrono::Duration::minutes(
+            mika_agent::planning::policy::STALE_FAILED_CALLBACK_MINUTES + 1,
+        ));
+        let (id, tx, feed) = couture_dun_callback_livrable(
+            &app,
+            "failed",
+            Some("le pilote a cassé il y a longtemps"),
+            Some(&trop_vieux),
+        )
+        .await;
+        tx.send(id.clone()).unwrap();
+        app.callback_feed = Some(feed);
+
+        app.drain_callback_deliveries().await;
+
+        assert!(request_rx.try_recv().is_err(), "aucun CallbackResult");
+        assert!(app.messages.is_empty(), "aucun message système");
+        let ligne = app
+            .db
+            .get_task(&id)
+            .await
+            .expect("relire la ligne")
+            .expect("la ligne existe");
+        assert_eq!(ligne.status, "delivered", "la ligne est bien réclamée");
     }
 }
