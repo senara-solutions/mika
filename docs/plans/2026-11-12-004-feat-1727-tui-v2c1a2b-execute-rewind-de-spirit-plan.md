@@ -20,6 +20,9 @@ ici parce qu'une décision du § 2 s'appuie sur chacun. Les cinq mesures neuves 
 celles que V2c-1a-2a a changées, ou que le plan matériau n'avait pas — sont
 marquées **(neuf)** et ont été lues sur `9540b746`.
 
+Les neuf citations de ligne de cette section ont été **relues sur
+`9540b746`** : `main` n'a pas bougé depuis la rédaction, et aucune n'a dérivé.
+
 **F5 — le 422 d'`execute` porte un autre corps que celui de `preview`.**
 `server/rewind.rs:305-312` : sur une erreur dont le message contient
 `"Rewind blocked"`, le handler rend `(422, {"error": <message>})`. Ce n'est
@@ -219,11 +222,26 @@ Trois décisions à écrire dans le code, chacune avec son pourquoi :
   matériau qu'un diagnostic puisse utiliser. `Display` rend alors
   « mika-spirit refuses the rewind: <repli> », une phrase complète, là où une
   chaîne vide donnerait un deux-points suivi de rien.
+- **Ce repli n'est pas celui de `preview`, et les mutualiser serait la faute.**
+  `preview` en a déjà un (`rewind_remote.rs:331`, « mika-spirit blocked the
+  rewind without saying why »), et il est tentant de l'extraire en constante
+  partagée. Les deux populations sont **disjointes** : celui de `preview` couvre
+  un corps **parfaitement lisible** dont le seul champ `block_reason` est absent
+  — le serveur a parlé, il n'a pas dit pourquoi ; celui-ci couvre un corps que le
+  client **ne sait pas lire du tout**, c'est-à-dire l'écart de version. Une
+  constante unique donnerait la même phrase à deux pannes dont les remèdes
+  diffèrent (élargir le domaine contre réaligner les versions), et c'est
+  précisément l'information que le repli existe pour porter. Le repli d'ici
+  **cite le corps reçu** ; celui de `preview` n'a rien à citer.
 - **`preview: None`, toujours, et le champ reste annoté.** Le 422 d'`execute` ne
   porte aucun aperçu (F5) : il n'y a rien à mettre là, et un `Some` fabriqué
   serait une invention. Écrire `None` n'est pas une *lecture* du champ, donc
   l'`expect(dead_code)` qu'il porte (`rewind_remote.rs:91`) reste satisfait — il
-  tombera avec V2c-1b, son premier lecteur.
+  tombera avec V2c-1b, son premier lecteur. **Ce n'est pas une déduction, c'est
+  le régime actuel :** `preview` écrit déjà ce champ, à `rewind_remote.rs:338`,
+  et l'attente de la ligne 91 est satisfaite sur `9540b746` — `main` compile
+  sans `unfulfilled_lint_expectation`. Un second écrivain ne change donc rien à
+  l'attente, et ce vol n'a pas à la toucher.
 
 **Le 200 illisible est `Unexpected`, avec ses trois pièces.** Statut, URL
 (par `rewind_url(base_url, "execute")`, F14 du vol précédent) et texte reçu : les
@@ -318,6 +336,24 @@ témoin revient avec, parce que T2 et T3 lisent la socket.
 | T4 | 3 | 422 `{"error": "Rewind blocked: …"}` → `Blocked`, `reason` **égale** le champ `error` du serveur, `preview` est `None` |
 | T5 | 3 | 422 au corps illisible → `Blocked` aussi, `reason` porte le repli nommé, `preview` est `None`, et le rendu n'est **jamais** `Unexpected` |
 | T6 | 4 | 200 au corps illisible → `Unexpected { status: Some(200), .. }`, et le message porte l'URL de la route `execute` |
+
+**« Illisible » veut dire « que `from_str::<ResultMirror>` refuse », et le
+fixture de T6 prend la forme la plus discriminante.** Aucun des huit champs ne
+porte `#[serde(default)]` (`rewind_remote.rs:63-72`), donc un objet JSON
+**valide mais tronqué** échoue tout autant qu'un texte qui n'est pas du JSON.
+T6 sert donc `{"messages_deleted":3}` et non `"pas du json"` : c'est la forme
+réelle de l'écart de version — un serveur qui renomme ou retire un champ —, et
+c'est la seule des deux qu'une implémentation naïve passerait. Lire le corps en
+`Value` puis extraire les huit champs avec des défauts rendrait un
+`ResultMirror` à sept zéros **en position de succès** sur ce fixture, et serait
+vert sur l'autre. T6 est ce qui interdit cette implémentation.
+
+**T1 ne double pas le test de `rewind_remote.rs:564`.** Celui-là appelle
+`serde_json::from_str::<ResultMirror>` **directement** : il mesure la forme du
+miroir, c'est-à-dire serde. T1 passe par la porte, et mesure que le bras 200
+rend `Ok(miroir)` — chemin qui n'existe pas encore sur `9540b746`. C'est aussi
+pourquoi T1 ne remplace pas l'autre : si la porte régressait vers `Unexpected`,
+le test de la ligne 564 resterait vert.
 
 **T2 et T3 sont une paire, et ni l'un ni l'autre ne suffit.** T2 seul passerait
 sur une implémentation qui écrit toujours la clé — en `null` quand l'origine est
@@ -566,4 +602,8 @@ des deux lectures, la dissymétrie assumée avec `preview`), au niveau du
 voisinage que ce fichier impose déjà. Si le code écrit dépasse 429, le pilote
 s'arrête et le dit, conformément au ticket.
 
-`Tracked in: senara-solutions/mika#1727`
+La suite — la porte `resolve` (V2c-1a-2c), puis le câblage de `/rewind`,
+`/rewind to` et `/undo` (V2c-1b) — est nommée par la ligne ci-dessous, et par
+elle seule : le gel des tickets jusqu'au 01/12 interdit d'en ouvrir un.
+
+Tracked in: senara-solutions/mika#1727
