@@ -6,7 +6,7 @@
 //! ne se pilote pas depuis un test. V2c-1a-2 câble les portes et la conversion
 //! vers [`RewindPreview`], et retire avec elles les `expect(dead_code)` d'ici.
 
-use mika_agent::rewind::RewindPreview;
+use mika_agent::rewind::{ReversalAction, RewindPreview};
 use serde::Deserialize;
 
 // Les six miroirs du fil. Les réponses de `mika-agent/src/server/rewind.rs` ne
@@ -164,6 +164,35 @@ async fn post(
             url,
             body: corps,
         }),
+    }
+}
+
+/// Les trois graphies que le serveur écrit par `format!("{:?}")`, et le refus de
+/// tout le reste.
+///
+/// **Aucun repli sur `Skip`.** `Skip` veut dire « rien à inverser », et
+/// `format_preview` lui met l'icône `⏭` : un repli ferait donc afficher « rien à
+/// inverser » pour une variante que le serveur aurait ajoutée — il mentirait sur
+/// un effet mémoire non réversible, en présentant une mutation qu'on ne sait pas
+/// défaire comme une mutation qu'il n'y a pas à défaire. Un repli sur `Restore`
+/// ou `Delete` serait pire encore : il annoncerait un effet.
+///
+/// Pas de `Deserialize` sur `ReversalAction` pour s'en dispenser : ce type vit
+/// dans `crates/mika-agent/`, hors périmètre, et un dérive ajouté là produirait
+/// par défaut le même refus **sans** le message qui nomme la valeur reçue.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "câblé par preview_to_domain, mika#1727")
+)]
+fn reversal_action_from_label(label: &str) -> Result<ReversalAction, String> {
+    match label {
+        "Restore" => Ok(ReversalAction::Restore),
+        "Delete" => Ok(ReversalAction::Delete),
+        "Skip" => Ok(ReversalAction::Skip),
+        inconnue => Err(format!(
+            "mika-spirit sent an unknown reversal action {inconnue:?} \
+             (expected one of \"Restore\", \"Delete\", \"Skip\")"
+        )),
     }
 }
 
@@ -412,5 +441,35 @@ mod tests {
             bloque,
             RewindRemoteIssue::Blocked { preview: None, .. }
         ));
+    }
+
+    #[test]
+    fn mika1727_les_trois_graphies_du_serveur_donnent_les_trois_actions() {
+        // Une par une, et non une seule : trois bras distincts, trois icônes
+        // distinctes dans `format_preview`. Un seul cas laisserait passer une
+        // table **permutée**, l'erreur la plus probable à l'écriture.
+        for (graphie, attendue) in [
+            ("Restore", ReversalAction::Restore),
+            ("Delete", ReversalAction::Delete),
+            ("Skip", ReversalAction::Skip),
+        ] {
+            let rendue = reversal_action_from_label(graphie)
+                .unwrap_or_else(|erreur| panic!("{graphie} est une graphie du serveur : {erreur}"));
+            assert_eq!(rendue, attendue, "graphie {graphie}");
+        }
+    }
+
+    #[test]
+    fn mika1727_une_action_inconnue_est_refusee_en_nommant_la_valeur_recue() {
+        // `expect_err` **est** la mesure du non-repli : une table qui se
+        // replierait sur `Skip` rendrait un `Ok` et rougirait ici.
+        let message = reversal_action_from_label("Rollback")
+            .expect_err("une quatrième graphie n'a aucun repli");
+        assert!(message.contains("Rollback"), "{message}");
+        // Les trois graphies acceptées rendent le message exploitable, et non
+        // seulement présent : c'est ce qui dit à l'opérateur ce qu'il a lu.
+        for graphie in ["Restore", "Delete", "Skip"] {
+            assert!(message.contains(graphie), "{message}");
+        }
     }
 }
