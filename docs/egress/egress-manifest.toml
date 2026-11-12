@@ -360,6 +360,17 @@ call_site          = "crates/mika-cli/src/commands/tasks.rs"
 owner              = "@samidarko"
 
 [[sink]]
+id                 = "cli-spirit-rewind"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "un POST générique vers les routes rewind de mika-spirit (/api/v1/rewind/{resolve,preview,execute}) : le corps JSON que l'appelant fournit — identifiant de session, identifiant de message d'ancrage, nom d'agent, nombre d'échanges — et le jeton interne en en-tête Authorization"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/rewind_remote.rs"
+call_site          = "crates/mika-cli/src/commands/rewind_remote.rs"
+owner              = "@samidarko"
+
+[[sink]]
 id                 = "cli-spirit-iterate"
 destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
 destination_source = "config"
