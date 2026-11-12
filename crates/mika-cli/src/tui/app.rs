@@ -655,8 +655,19 @@ pub struct App<'a> {
 
     /// La couture vers le fil des tâches (mika#1727, vol V2b-2b-2). Posée après
     /// construction, comme `dashboard_running` ; `None` en mode équipe et quand
-    /// l'ouverture échoue — `poll_callback_tasks` couvre alors.
+    /// l'ouverture échoue — le minuteur de `poll_callback_tasks` couvre alors,
+    /// et seulement alors depuis le vol V2b-3b : une couture qui suit l'agent
+    /// courant le fait taire, une qui suit un autre agent le laisse balayer.
     pub callback_feed: Option<CallbackFeed>,
+
+    /// La dernière session que le drainage a balayée (mika#1727, vol V2b-3b).
+    ///
+    /// `None` tant qu'aucune ne l'a été, ce qui fait du premier drainage un
+    /// balayage : au lancement, tout callback fini de cette session est un trou.
+    /// Une `Option<String>` et non un booléen — c'est la **comparaison** qui
+    /// porte la propriété, un « déjà balayé » ne couvrirait jamais la seconde
+    /// session.
+    derniere_session_balayee: Option<String>,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -747,6 +758,7 @@ impl<'a> App<'a> {
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
             callback_feed: None,
+            derniere_session_balayee: None,
         }
     }
 
@@ -841,6 +853,7 @@ impl<'a> App<'a> {
             footer_start_stop_rect: None,
             pending_dashboard_action: None,
             callback_feed: None,
+            derniere_session_balayee: None,
         }
     }
 
@@ -1131,11 +1144,24 @@ impl<'a> App<'a> {
             self.drain_callback_deliveries().await;
         }
 
-        // Callback delivery polling: check for completed-but-undelivered callback tasks.
-        // Only poll when idle (agent not processing) and not in team mode.
+        // Le minuteur ne balaie plus que là où la couture ne couvre pas
+        // (mika#1727, vol V2b-3b) : sans couture, et quand celle qui existe suit
+        // un **autre** agent — l'agent du fil est figé à son ouverture, celui de
+        // la TUI change. Sous une couture qui suit l'agent courant, le balayage
+        // vient du signal du fil et du changement de session, tous deux portés
+        // par le drainage ci-dessus.
+        //
+        // `is_some_and` nié : une couture absente rend `false`, donc la négation
+        // rend `true` et le minuteur balaie. Le biais va vers le balayage, jamais
+        // vers le silence — une livraison de trop est réclamée, une de moins est
+        // un tour qui ne repart pas.
         if !self.is_team_mode()
             && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
             && self.status == AgentStatus::Idle
+            && !self
+                .callback_feed
+                .as_ref()
+                .is_some_and(|f| f.suit_lagent(&self.agent_name))
         {
             self.poll_callback_tasks().await;
         }
@@ -1609,9 +1635,12 @@ impl<'a> App<'a> {
     /// Les gardes 3 et 4 du vol V2b-2b-2 : réclamer, puis livrer un candidat que
     /// la couture a déjà jugé recevable. Le vol V2b-2b-3 y amène les `failed`.
     ///
-    /// La parité avec [`Self::poll_callback_tasks`] **est** le contrat, et elle
-    /// doit tenir avant le vol V2b-3, qui retire le poll : ce qui n'est pas ici
-    /// ce jour-là est perdu. Deux divergences, voulues.
+    /// La parité avec [`Self::poll_callback_tasks`] **est** le contrat, et son
+    /// échéance est le vol qui sortira la lecture vers spirit : ce qui n'est pas
+    /// ici ce jour-là est perdu. Le vol V2b-3b, lui, ne retire pas le balayage —
+    /// il le retire du **minuteur**, ce qui suffit déjà à rendre la parité
+    /// exigible : sous une couture qui suit l'agent courant, ce qui manque ici
+    /// n'est plus rattrapé cinq secondes plus tard. Deux divergences, voulues.
     ///
     /// L'ordre. Le statut se lit **avant** la réclamation, qui écrit `delivered`
     /// sur la ligne ; la garde d'ancienneté, elle, s'applique **après**, avec un
@@ -1629,8 +1658,27 @@ impl<'a> App<'a> {
         // Le fil ne rejoue rien : à son ouverture comme après un `OverflowMarker`,
         // il dit seulement qu'il a pu manquer quelque chose. Le balayage est la
         // lecture que le poll fait déjà — appelée, jamais recopiée.
-        let couture = self.callback_feed.as_ref();
-        if couture.is_some_and(|f| f.prendre_le_rattrapage()) {
+        //
+        // Deux sources, un seul balayage (vol V2b-3b). Le signal est pris
+        // **avant** le `if` et hors de tout court-circuit : placé en second dans
+        // un `||`, il survivrait au balayage que le changement de session vient
+        // de faire, et le passage suivant en ferait un second. Un passage, un
+        // appel.
+        let signal = self
+            .callback_feed
+            .as_ref()
+            .is_some_and(|f| f.prendre_le_rattrapage());
+        // La requête du balayage filtre sur `session_id` : un balayage fait sous
+        // l'ancienne session ne couvre pas la nouvelle, d'où la comparaison
+        // plutôt qu'un drapeau. Le drainage tourne à chaque tick, donc la
+        // détection coûte un tick, pas un tour de minuteur.
+        let session_neuve =
+            self.derniere_session_balayee.as_deref() != Some(self.session_id.as_str());
+        if signal || session_neuve {
+            // Retenue même quand le balayage vient du signal : la requête filtre
+            // sur `session_id`, donc cette session **est** balayée dans les deux
+            // cas.
+            self.derniere_session_balayee = Some(self.session_id.clone());
             self.poll_callback_tasks().await;
             // Une livraison relance le tour, et la boucle du fil ne doit pas en
             // empiler une seconde : même règle que le `break` du poll.
@@ -2447,7 +2495,7 @@ mod tests {
         })
         .to_string();
         let (base, _) = crate::commands::tasks::fake_spirit::spawn_detail(200, corps).await;
-        let (tx, feed) = CallbackFeed::from_channel(base, "jeton".to_string());
+        let (tx, feed) = CallbackFeed::from_channel(&app.agent_name, base, "jeton".to_string());
         (id, tx, feed)
     }
 
@@ -2647,6 +2695,159 @@ mod tests {
     async fn terminer_la_ligne(app: &App<'static>, id: &str) {
         let fini = app.db.update_task_completed(id, Some("fini")).await;
         assert!(fini.expect("terminer la ligne"), "pending → completed");
+    }
+
+    /// Une ligne de callback que le **balayage** verra : le helper ci-dessus la
+    /// crée, `terminer_la_ligne` la rend visible. Les deux, parce qu'un statut
+    /// posé par `update_task_status` laisse `completed_at` nul et reste
+    /// invisible de `get_undelivered_callback_tasks_for_session` — un test monté
+    /// sur lui seul serait vert sans rien mesurer (mika#2205).
+    async fn une_ligne_balayable(app: &App<'static>) -> String {
+        let (id, _tx, _feed) = couture_dun_callback_livrable(app, "pending", None, None).await;
+        terminer_la_ligne(app, &id).await;
+        id
+    }
+
+    /// Un tour de minuteur, et rien d'autre. La session est déjà balayée et
+    /// aucun signal n'est armé : une livraison ne peut donc venir que du bloc
+    /// `POLL_INTERVAL_TICKS`. Sans ces deux mises au neutre, le drainage
+    /// livrerait à sa place et les trois tests du minuteur seraient verts sur
+    /// sa raison, pas sur la leur (mika#2205).
+    async fn un_tour_de_minuteur(app: &mut App<'static>) {
+        app.derniere_session_balayee = Some(app.session_id.clone());
+        app.tick_count = POLL_INTERVAL_TICKS - 1;
+        app.tick().await;
+        assert!(
+            app.tick_count.is_multiple_of(POLL_INTERVAL_TICKS),
+            "le tick doit tomber sur le minuteur"
+        );
+    }
+
+    /// Qu'une ligne balayable soit restée intacte : ni réclamée, ni livrée. Le
+    /// statut, parce que `mark_task_delivered` écrit `delivered` — un silence du
+    /// canal sans cette seconde mesure ne distinguerait pas « pas balayé » de
+    /// « balayé, réclamé, puis perdu ».
+    async fn la_ligne_est_intacte(app: &App<'static>, id: &str) {
+        let ligne = app
+            .db
+            .get_task(id)
+            .await
+            .expect("lire la ligne")
+            .expect("la ligne existe");
+        assert_eq!(ligne.status, "completed", "rien n'a été réclamé");
+    }
+
+    /// **Critère 1 du vol V2b-3b** — sous une couture qui suit l'agent courant,
+    /// le minuteur ne balaie plus. Le canal de la couture reste vide et son
+    /// signal désarmé : ce que le test mesure est le silence du minuteur seul.
+    #[tokio::test]
+    async fn mika1727_v2b3b_le_minuteur_se_tait_sous_la_couture_de_lagent_courant() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let id = une_ligne_balayable(&app).await;
+        let (_tx, feed) = CallbackFeed::from_channel(&app.agent_name, String::new(), String::new());
+        app.callback_feed = Some(feed);
+
+        un_tour_de_minuteur(&mut app).await;
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "le minuteur ne balaie plus sous la couture"
+        );
+        la_ligne_est_intacte(&app, &id).await;
+    }
+
+    /// **Critère 2** — sans couture, le même tour livre, comme avant le vol.
+    /// C'est le témoin qui sépare « le minuteur s'est tu » de « la ligne
+    /// n'était pas balayable » : les deux tests posent la même ligne.
+    #[tokio::test]
+    async fn mika1727_v2b3b_sans_couture_le_minuteur_balaie_toujours() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let id = une_ligne_balayable(&app).await;
+        // Explicite, bien que ce soit l'état du harnais : c'est l'axe du test.
+        app.callback_feed = None;
+
+        un_tour_de_minuteur(&mut app).await;
+
+        let AgentRequest::CallbackResult { task_id, .. } =
+            request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(task_id, id, "la ligne du test, pas une autre");
+    }
+
+    /// **Critère 3** — une couture qui suit **un autre** agent ne fait pas taire
+    /// le minuteur. C'est le cas du changement d'agent : le fil reste figé sur
+    /// l'agent de son ouverture, la TUI en sert un autre, et personne ne
+    /// couvrirait le nouveau si le minuteur se taisait aussi (dette D1).
+    #[tokio::test]
+    async fn mika1727_v2b3b_une_couture_dun_autre_agent_laisse_le_minuteur_balayer() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        let id = une_ligne_balayable(&app).await;
+        assert_ne!(app.agent_name, "mika-qa", "l'autre agent doit être autre");
+        let (_tx, feed) = CallbackFeed::from_channel("mika-qa", String::new(), String::new());
+        app.callback_feed = Some(feed);
+
+        un_tour_de_minuteur(&mut app).await;
+
+        let AgentRequest::CallbackResult { task_id, .. } =
+            request_rx.try_recv().expect("une livraison")
+        else {
+            panic!("la livraison doit être un CallbackResult");
+        };
+        assert_eq!(task_id, id, "la ligne du test, pas une autre");
+    }
+
+    /// **Critère 4 du vol V2b-3b** — un changement de session balaie une fois,
+    /// et une seule. Les deux moitiés tiennent dans un test parce que la seconde
+    /// ne veut rien dire sans la première.
+    ///
+    /// Le passage se fait par `tick`, et `tick_count = 1` le laisse **hors**
+    /// multiple de `POLL_INTERVAL_TICKS` : c'est la moitié « sans passer par le
+    /// minuteur » du critère. Appeler `drain_callback_deliveries` seul la
+    /// prouverait par construction plutôt que par mesure, et la remplacer par un
+    /// multiple « parce que ça livre quand même » l'effacerait.
+    #[tokio::test]
+    async fn mika1727_v2b3b_un_changement_de_session_balaie_une_fois() {
+        let (mut app, _rtx, mut request_rx, _td) = app_with_response_sender().await;
+        une_ligne_balayable(&app).await;
+        let (_tx, feed) = CallbackFeed::from_channel(&app.agent_name, String::new(), String::new());
+        app.callback_feed = Some(feed);
+        app.derniere_session_balayee = Some("s-precedente".to_string());
+        app.tick_count = 1;
+
+        app.tick().await;
+
+        assert!(
+            request_rx.try_recv().is_ok(),
+            "la session neuve est balayée"
+        );
+        assert!(request_rx.try_recv().is_err(), "une seule livraison");
+        assert_eq!(
+            app.derniere_session_balayee.as_deref(),
+            Some(app.session_id.as_str()),
+            "la session balayée est retenue"
+        );
+
+        // Remis à la main : sinon la garde du tour en cours expliquerait seule le
+        // silence, et le test serait vert sur une autre raison que la sienne
+        // (mika#2205).
+        app.status = AgentStatus::Idle;
+        let deuxieme = une_ligne_balayable(&app).await;
+
+        app.tick().await;
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "la même session ne se rebalaie pas"
+        );
+        let ligne = app
+            .db
+            .get_task(&deuxieme)
+            .await
+            .expect("lire la ligne")
+            .expect("la ligne existe");
+        assert_eq!(ligne.status, "completed", "et rien n'a été réclamé");
     }
 
     /// **Critère 3** — un callback semé en base, sans **aucune** trame dans le

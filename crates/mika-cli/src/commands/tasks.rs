@@ -813,8 +813,16 @@ impl Recul {
 /// il ne rouvre pas la question tranchée au paragraphe précédent. L'ordre entre
 /// les deux est sans objet : le signal dit seulement « il a pu manquer quelque
 /// chose », et la base reste l'autorité sur ce qui reste à livrer.
+///
+/// **L'agent du type n'est pas celui de [`CallbackFeed::next_candidate`]**
+/// (vol V2b-3b). Celui-ci est figé à l'ouverture, parce que c'est sur lui que
+/// `consume` filtre les trames, et rien ne rouvre le fil quand l'agent courant
+/// change. Celui de `next_candidate` voyage par appel, parce qu'il est l'agent
+/// **courant** de la TUI. Un changement d'agent les sépare, et c'est cette
+/// divergence que le minuteur doit couvrir.
 pub(crate) struct CallbackFeed {
     rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    agent_id: String,
     base_url: String,
     token: String,
     rattrapage: Arc<AtomicBool>,
@@ -891,10 +899,20 @@ impl CallbackFeed {
         });
         Self {
             rx,
+            agent_id: agent_id.to_string(),
             base_url,
             token,
             rattrapage,
         }
+    }
+
+    /// Quel agent ce fil suit-il — et est-ce celui que la TUI sert en ce moment ?
+    ///
+    /// Un prédicat plutôt qu'un accesseur : rendre la chaîne laisserait
+    /// l'appelant la comparer, donc se tromper de côté. La comparaison vit là où
+    /// vit la donnée (mika#1727, vol V2b-3b).
+    pub(crate) fn suit_lagent(&self, agent_id: &str) -> bool {
+        self.agent_id == agent_id
     }
 
     /// Prendre le signal de rattrapage : vrai **au plus une fois** par salve.
@@ -938,8 +956,12 @@ impl CallbackFeed {
 
     /// Une couture dont le canal est **alimenté par le test**, pour mesurer
     /// `next_candidate` seule : `spawn_detail` sert le détail, pas le flux.
+    ///
+    /// L'agent suivi est **nommé**, sans valeur par défaut : un défaut ferait
+    /// passer un test pour vert sur un agent qu'il n'a pas choisi.
     #[cfg(test)]
     pub(crate) fn from_channel(
+        agent_id: &str,
         base_url: String,
         token: String,
     ) -> (tokio::sync::mpsc::UnboundedSender<String>, Self) {
@@ -948,6 +970,7 @@ impl CallbackFeed {
             tx,
             Self {
                 rx,
+                agent_id: agent_id.to_string(),
                 base_url,
                 token,
                 rattrapage: Arc::new(AtomicBool::new(false)),
@@ -2090,9 +2113,26 @@ mod tests {
         session: &str,
     ) -> Option<TaskDetailMirror> {
         let (base, _) = fake_spirit::spawn_detail(statut, corps).await;
-        let (tx, mut couture) = CallbackFeed::from_channel(base, "jeton".to_string());
+        let (tx, mut couture) = CallbackFeed::from_channel(agent, base, "jeton".to_string());
         tx.send("t-42".to_string()).expect("le canal est ouvert");
         couture.next_candidate(agent, session).await
+    }
+
+    /// **Vol V2b-3b** — la couture dit quel agent elle suit, et le dit des deux
+    /// côtés. Le témoin négatif est ce qui sépare « la méthode répond » de « la
+    /// méthode rend toujours vrai ».
+    #[tokio::test]
+    async fn mika1727_v2b3b_la_couture_dit_quel_agent_elle_suit() {
+        let (_tx, couture) = CallbackFeed::from_channel("mika-dev", String::new(), String::new());
+
+        assert!(
+            couture.suit_lagent("mika-dev"),
+            "elle suit l'agent de son ouverture"
+        );
+        assert!(
+            !couture.suit_lagent("mika-qa"),
+            "et elle ne suit pas un autre"
+        );
     }
 
     /// **Critères 1, 2, 3 et 4** — `next_candidate` enchaîne les gardes 1 et 2, et
