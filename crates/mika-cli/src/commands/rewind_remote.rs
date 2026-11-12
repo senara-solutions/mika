@@ -6,7 +6,9 @@
 //! ne se pilote pas depuis un test. V2c-1a-2 câble les portes et la conversion
 //! vers [`RewindPreview`], et retire avec elles les `expect(dead_code)` d'ici.
 
-use mika_agent::rewind::{ReversalAction, RewindPreview};
+use mika_agent::rewind::{
+    MessagePreview, ReversalAction, ReversalPreview, RewindPreview, TaskPreview,
+};
 use serde::Deserialize;
 
 // Les six miroirs du fil. Les réponses de `mika-agent/src/server/rewind.rs` ne
@@ -21,7 +23,6 @@ pub(crate) struct ResolveMirror {
     pub(crate) trace_ids: Vec<String>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct PreviewMirror {
     pub(crate) messages: Vec<MessageMirror>,
@@ -32,7 +33,6 @@ pub(crate) struct PreviewMirror {
     pub(crate) block_reason: Option<String>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessageMirror {
     pub(crate) id: i64,
@@ -40,7 +40,6 @@ pub(crate) struct MessageMirror {
     pub(crate) content_snippet: String,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReversalMirror {
     pub(crate) audit_event_id: i64,
@@ -50,7 +49,6 @@ pub(crate) struct ReversalMirror {
     pub(crate) description: String,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct TaskMirror {
     pub(crate) task_id: String,
@@ -180,10 +178,6 @@ async fn post(
 /// Pas de `Deserialize` sur `ReversalAction` pour s'en dispenser : ce type vit
 /// dans `crates/mika-agent/`, hors périmètre, et un dérive ajouté là produirait
 /// par défaut le même refus **sans** le message qui nomme la valeur reçue.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblé par preview_to_domain, mika#1727")
-)]
 fn reversal_action_from_label(label: &str) -> Result<ReversalAction, String> {
     match label {
         "Restore" => Ok(ReversalAction::Restore),
@@ -194,6 +188,79 @@ fn reversal_action_from_label(label: &str) -> Result<ReversalAction, String> {
              (expected one of \"Restore\", \"Delete\", \"Skip\")"
         )),
     }
+}
+
+/// L'aperçu du fil reconstruit sous la forme du domaine, pour que l'affichage
+/// reste [`mika_agent::rewind::format_preview`] : c'est la seule mise en forme
+/// de l'aperçu, elle est testée chez elle, et un second formateur côté CLI
+/// serait exactement la duplication que mika#1727 existe pour retirer. La
+/// conversion est le prix d'admission, et elle garde une seule vérité
+/// d'affichage — d'autant qu'aucun des quatre types d'aperçu ne dérive
+/// `PartialEq` : comparer deux aperçus ne peut passer que par ce texte.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "câblée par la porte preview, mika#1727")
+)]
+fn preview_to_domain(miroir: PreviewMirror) -> Result<RewindPreview, String> {
+    let reversals = miroir
+        .reversals
+        .into_iter()
+        .map(|reversal| {
+            Ok(ReversalPreview {
+                audit_event_id: reversal.audit_event_id,
+                tool_name: reversal.tool_name,
+                target_key: reversal.target_key,
+                // Une action inconnue fait échouer l'aperçu **entier**, par `?`,
+                // et n'est pas un reversal silencieusement sauté : sauter
+                // rendrait un aperçu *plus court que la réalité* — un opérateur
+                // lirait « 2 changements mémoire » là où il y en a trois, et
+                // validerait un rembobinage dont une partie ne se verrait jamais.
+                action: reversal_action_from_label(&reversal.action)?,
+                description: reversal.description,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(RewindPreview {
+        messages: miroir
+            .messages
+            .into_iter()
+            .map(|message| MessagePreview {
+                id: message.id,
+                role: message.role,
+                content_snippet: message.content_snippet,
+                // Le fil ne porte pas ce champ (`MessagePreviewResponse`,
+                // `server/rewind.rs:31-35`) et `format_preview` ne le lit pas :
+                // il lit le *nombre* de messages, puis les reversals, les tasks
+                // et les warnings. L'absence est donc sans effet sur le texte
+                // **aujourd'hui**, et c'est la seule divergence que cette
+                // conversion introduit volontairement. La ligne qui rougira à la
+                // relecture le jour où elle cesse d'être sans effet est
+                // `rewind.rs:739` : si `format_preview` se met à lire `trace_id`,
+                // c'est le fil qu'il faut élargir, pas ce `None` qu'il faut
+                // deviner.
+                trace_id: None,
+            })
+            .collect(),
+        reversals,
+        tasks: miroir
+            .tasks
+            .into_iter()
+            .map(|tache| TaskPreview {
+                task_id: tache.task_id,
+                label: tache.label,
+                actioned: tache.actioned,
+            })
+            .collect(),
+        warnings: miroir.warnings,
+        // Les deux traversent la conversion sans être consommés par elle. La
+        // porte les lit **avant**, pour sa propre décision, mais
+        // `format_preview` les lit en premier (`rewind.rs:742-748`) : les
+        // laisser passer n'est donc pas une redite, c'est ce qui permet au
+        // `BLOCKED: …` d'être rendu si un appelant formate un aperçu bloqué.
+        blocked: miroir.blocked,
+        block_reason: miroir.block_reason,
+    })
 }
 
 // Les tests vivent ici, **en fin de fichier** : le scanner d'egress coupe la
@@ -471,5 +538,99 @@ mod tests {
         for graphie in ["Restore", "Delete", "Skip"] {
             assert!(message.contains(graphie), "{message}");
         }
+    }
+
+    /// Un miroir à **deux** reversals, dont le second porte la graphie passée :
+    /// c'est ce qui permet à T4 de mesurer que l'aperçu entier échoue, et non
+    /// qu'il revient avec un reversal de moins.
+    fn un_miroir(action_du_second: &str) -> PreviewMirror {
+        let reversal = |id: i64, action: &str| ReversalMirror {
+            audit_event_id: id,
+            tool_name: "store_fact".to_string(),
+            target_key: format!("people:vincent:{id}"),
+            action: action.to_string(),
+            description: format!("change mémoire n°{id}"),
+        };
+        PreviewMirror {
+            messages: vec![
+                MessageMirror {
+                    id: 41,
+                    role: "user".to_string(),
+                    content_snippet: "pose la question".to_string(),
+                },
+                MessageMirror {
+                    id: 42,
+                    role: "assistant".to_string(),
+                    content_snippet: "y répond".to_string(),
+                },
+            ],
+            reversals: vec![reversal(7, "Restore"), reversal(8, action_du_second)],
+            tasks: vec![TaskMirror {
+                task_id: "t-1".to_string(),
+                label: "relire le plan".to_string(),
+                actioned: true,
+            }],
+            warnings: vec!["un avertissement".to_string()],
+            blocked: false,
+            block_reason: None,
+        }
+    }
+
+    #[test]
+    fn mika1727_la_conversion_rend_tout_lapercu_du_fil() {
+        let apercu = preview_to_domain(un_miroir("Delete")).expect("deux graphies du serveur");
+
+        assert_eq!(apercu.messages.len(), 2);
+        assert_eq!(apercu.messages[0].id, 41);
+        assert_eq!(apercu.messages[0].role, "user");
+        assert_eq!(apercu.messages[0].content_snippet, "pose la question");
+        // `trace_id` à `None` sur **chaque** message : le fil ne le porte pas, et
+        // c'est la seule divergence volontaire de la conversion.
+        for message in &apercu.messages {
+            assert!(message.trace_id.is_none(), "{:?}", message.trace_id);
+        }
+
+        assert_eq!(apercu.reversals.len(), 2);
+        assert_eq!(apercu.reversals[0].audit_event_id, 7);
+        assert_eq!(apercu.reversals[0].tool_name, "store_fact");
+        assert_eq!(apercu.reversals[0].target_key, "people:vincent:7");
+        assert_eq!(apercu.reversals[0].action, ReversalAction::Restore);
+        assert_eq!(apercu.reversals[0].description, "change mémoire n°7");
+        assert_eq!(apercu.reversals[1].action, ReversalAction::Delete);
+
+        assert_eq!(apercu.tasks.len(), 1);
+        assert_eq!(apercu.tasks[0].task_id, "t-1");
+        assert_eq!(apercu.tasks[0].label, "relire le plan");
+        assert!(apercu.tasks[0].actioned);
+
+        assert_eq!(apercu.warnings, vec!["un avertissement".to_string()]);
+        assert!(!apercu.blocked);
+        assert!(apercu.block_reason.is_none());
+
+        // `blocked` et `block_reason` traversent bien la conversion, mesuré sur
+        // le bras qui les porte : sans ce second appel, deux champs passeraient
+        // la conversion sans jamais être lus à autre chose que leur défaut.
+        let mut bloque = un_miroir("Skip");
+        bloque.blocked = true;
+        bloque.block_reason = Some("un verrou tient l'agent".to_string());
+        let bloque = preview_to_domain(bloque).expect("un aperçu bloqué se convertit aussi");
+        assert!(bloque.blocked);
+        assert_eq!(
+            bloque.block_reason.as_deref(),
+            Some("un verrou tient l'agent")
+        );
+    }
+
+    #[test]
+    fn mika1727_une_action_inconnue_fait_echouer_lapercu_entier() {
+        // Le miroir porte **deux** reversals dont un seul est illisible, et c'est
+        // ce qui fait de l'`expect_err` une mesure : la variante qui saute le
+        // reversal inconnu rendrait un `Ok` à un reversal de moins — un aperçu
+        // *plus court que la réalité*, où l'opérateur lirait « 1 changement
+        // mémoire » pour deux. Sur un miroir à un seul reversal, les deux
+        // conduites rendraient un résultat également vide de ce reversal.
+        let message = preview_to_domain(un_miroir("Rollback"))
+            .expect_err("une action inconnue n'est pas sautée");
+        assert!(message.contains("Rollback"), "{message}");
     }
 }
