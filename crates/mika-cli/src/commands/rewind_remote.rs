@@ -3,8 +3,10 @@
 //! miroirs du fil, vocabulaire d'erreur, et un `post` unique. L'URL de base et
 //! le jeton arrivent **par argument**, pour la raison déjà écrite sur
 //! [`super::tasks::fetch_task_detail`] : un client qui résout ses propres accès
-//! ne se pilote pas depuis un test. V2c-1a-2 câble les portes et la conversion
-//! vers [`RewindPreview`], et retire avec elles les `expect(dead_code)` d'ici.
+//! ne se pilote pas depuis un test. La porte [`preview`] et la conversion vers
+//! [`RewindPreview`] sont câblées (vol V2c-1a-2a) ; `resolve` et `execute` vont
+//! à V2c-1a-2b, et c'est pourquoi `ResolveMirror` et `ResultMirror` gardent seuls
+//! leur `expect(dead_code)`. L'appelant de [`preview`] arrive avec V2c-1b.
 
 use mika_agent::rewind::{
     MessagePreview, ReversalAction, ReversalPreview, RewindPreview, TaskPreview,
@@ -79,11 +81,14 @@ pub(crate) struct ResultMirror {
 /// session là où le défaut est un nom d'agent. `Denied` ne porte rien, le nom de
 /// la variable étant la moitié utile du message. Et `None` sur `status` dit
 /// « aucune réponse reçue », là où un `0` se lirait comme un statut HTTP.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
 #[derive(Debug)]
 pub(crate) enum RewindRemoteIssue {
     Blocked {
         reason: String,
+        // La porte l'**écrit** ; le premier à le *lire* est V2c-1b, qui affiche
+        // l'aperçu du refus. Un champ écrit sans lecteur est encore mort pour
+        // rustc, et c'est l'attente qui le dit plutôt qu'un silence.
+        #[cfg_attr(not(test), expect(dead_code, reason = "lu par V2c-1b, mika#1727"))]
         preview: Option<Box<RewindPreview>>,
     },
     NotFound {
@@ -120,16 +125,24 @@ impl std::fmt::Display for RewindRemoteIssue {
     }
 }
 
+/// L'URL d'une route rewind, extraite parce qu'elle a **deux** lecteurs. `post`
+/// rend `Result<(u16, String), _>` : sur le chemin `Ok` l'URL n'est pas rendue,
+/// et une porte qui veut la nommer dans un `Unexpected` doit la recomposer. Deux
+/// `format!` jumeaux dériveraient le jour où le préfixe de route change ; ici le
+/// `trim_end_matches` qui absorbe un `base_url` à barre finale vit une fois.
+fn rewind_url(base_url: &str, route: &str) -> String {
+    format!("{}/api/v1/rewind/{route}", base_url.trim_end_matches('/'))
+}
+
 /// Le POST que les trois routes partagent. `route` est un `&str` et non un enum
 /// à trois variants sans producteur : la socket mesure, pas le typage.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
 async fn post(
     base_url: &str,
     token: &str,
     route: &str,
     body: &serde_json::Value,
 ) -> Result<(u16, String), RewindRemoteIssue> {
-    let url = format!("{}/api/v1/rewind/{route}", base_url.trim_end_matches('/'));
+    let url = rewind_url(base_url, route);
     // Client construit ici, au site de l'appel : c'est ce que déclare l'entrée
     // d'egress `cli-spirit-rewind`, qu'un client en argument rendrait aveugle.
     let reponse = reqwest::Client::new()
@@ -197,10 +210,6 @@ fn reversal_action_from_label(label: &str) -> Result<ReversalAction, String> {
 /// conversion est le prix d'admission, et elle garde une seule vérité
 /// d'affichage — d'autant qu'aucun des quatre types d'aperçu ne dérive
 /// `PartialEq` : comparer deux aperçus ne peut passer que par ce texte.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblée par la porte preview, mika#1727")
-)]
 fn preview_to_domain(miroir: PreviewMirror) -> Result<RewindPreview, String> {
     let reversals = miroir
         .reversals
@@ -260,6 +269,82 @@ fn preview_to_domain(miroir: PreviewMirror) -> Result<RewindPreview, String> {
         // `BLOCKED: …` d'être rendu si un appelant formate un aperçu bloqué.
         blocked: miroir.blocked,
         block_reason: miroir.block_reason,
+    })
+}
+
+/// L'aperçu d'un rembobinage, sous la forme du domaine, pour que l'appelant
+/// l'affiche par [`mika_agent::rewind::format_preview`] et rien d'autre.
+///
+/// Un refus du serveur est un `Blocked` et non un `Ok` portant un aperçu dont
+/// `blocked` serait vrai : `format_preview` rend alors `BLOCKED: …`, et ce texte
+/// en position de succès se lirait comme un aperçu — l'opérateur validerait un
+/// rembobinage que le serveur a déjà refusé.
+#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1b, mika#1727"))]
+pub(crate) async fn preview(
+    base_url: &str,
+    token: &str,
+    agent: &str,
+    session_id: &str,
+    after_message_id: i64,
+) -> Result<RewindPreview, RewindRemoteIssue> {
+    // `agent` part **toujours**, y compris vide. Le serveur le déclare
+    // `#[serde(default)]` (`server/rewind.rs:14-15`) : un champ absent lui fait
+    // résoudre *son* agent par défaut, qui n'est pas celui de la TUI. L'aperçu
+    // rendu serait celui d'un autre fil que celui qu'on croit viser — et comme
+    // `execute` porte le même corps, l'omission appliquerait un effet
+    // destructeur sur la mauvaise base. Le champ présent et vide dit au serveur
+    // la même chose, mais il le dit, et T8 le lit sur la socket.
+    let envoye = serde_json::json!({
+        "session_id": session_id,
+        "after_message_id": after_message_id,
+        "agent": agent,
+    });
+    let (statut, corps) = post(base_url, token, "preview", &envoye).await?;
+
+    // Une forme illisible est `Unexpected`, jamais `Blocked`. Un blocage est une
+    // décision du serveur ; une forme illisible est une incapacité du client, et
+    // l'ordinaire de sa cause est un écart de version (rien ne tient les miroirs
+    // en lockstep avec `server/rewind.rs`). Les confondre afficherait
+    // « mika-spirit refuses the rewind » là où mika-spirit a dit oui.
+    // `Unexpected` est aussi le seul bras qui porte à la fois le statut, l'URL et
+    // le texte reçu — les trois choses qu'un écart de version demande.
+    let miroir: PreviewMirror =
+        serde_json::from_str(&corps).map_err(|cause| RewindRemoteIssue::Unexpected {
+            status: Some(statut),
+            url: rewind_url(base_url, "preview"),
+            body: format!("unreadable rewind preview ({cause}): {corps}"),
+        })?;
+
+    // Le 422 **et** le 200 dont `blocked` est vrai. Le second n'est pas produit
+    // par ce serveur, qui choisit son statut sur `resp.blocked`
+    // (`server/rewind.rs:235-243`) : la branche couvre une incohérence serveur,
+    // et c'est le champ qui décide, non le statut, parce que propager un aperçu
+    // bloqué en `Ok` rendrait `BLOCKED: …` en position de succès.
+    if statut == 422 || miroir.blocked {
+        // Le repli nomme ce qui s'est passé plutôt qu'il n'invente une cause. Le
+        // domaine remplit toujours `block_reason` avec `blocked`, mais le type
+        // autorise l'absence, et `Display` rendrait alors « mika-spirit refuses
+        // the rewind: » — une phrase coupée là où l'opérateur attend la cause.
+        let reason = miroir
+            .block_reason
+            .clone()
+            .unwrap_or_else(|| "mika-spirit blocked the rewind without saying why".to_string());
+        // L'aperçu est best-effort ; le blocage ne l'est pas. Si le corps du
+        // refus porte une action inconnue, rendre `Unexpected` perdrait la
+        // **raison du refus** — l'information que l'opérateur est venu chercher
+        // — pour un diagnostic de version qu'il n'a pas demandé.
+        return Err(RewindRemoteIssue::Blocked {
+            reason,
+            preview: preview_to_domain(miroir).ok().map(Box::new),
+        });
+    }
+
+    // Un succès dont la conversion échoue n'a pas de raison de refus à préserver,
+    // donc il dit l'écart de version au lieu de le taire.
+    preview_to_domain(miroir).map_err(|cause| RewindRemoteIssue::Unexpected {
+        status: Some(statut),
+        url: rewind_url(base_url, "preview"),
+        body: cause,
     })
 }
 
@@ -632,5 +717,200 @@ mod tests {
         let message = preview_to_domain(un_miroir("Rollback"))
             .expect_err("une action inconnue n'est pas sautée");
         assert!(message.contains("Rollback"), "{message}");
+    }
+
+    /// Le couple *(corps que le factice sert, aperçu du domaine attendu)* pour
+    /// une action. L'attendu est bâti **à la main**, et non par
+    /// `preview_to_domain` : passer par la conversion ferait comparer le résultat
+    /// à lui-même, et les trois tests seraient verts sur une table permutée.
+    fn un_apercu(graphie: &str, action: ReversalAction) -> (String, RewindPreview) {
+        let servi = serde_json::json!({
+            "messages": [{"id": 7, "role": "user", "content_snippet": "la demande"}],
+            "reversals": [{
+                "audit_event_id": 3,
+                "tool_name": "store_fact",
+                "target_key": "people:vincent",
+                "action": graphie,
+                "description": "un fait posé",
+            }],
+            "tasks": [{"task_id": "t-9", "label": "une tâche", "actioned": false}],
+            "warnings": ["un avertissement"],
+            "blocked": false,
+            "block_reason": null,
+        });
+        let attendu = RewindPreview {
+            messages: vec![MessagePreview {
+                id: 7,
+                role: "user".to_string(),
+                content_snippet: "la demande".to_string(),
+                trace_id: None,
+            }],
+            reversals: vec![ReversalPreview {
+                audit_event_id: 3,
+                tool_name: "store_fact".to_string(),
+                target_key: "people:vincent".to_string(),
+                action,
+                description: "un fait posé".to_string(),
+            }],
+            tasks: vec![TaskPreview {
+                task_id: "t-9".to_string(),
+                label: "une tâche".to_string(),
+                actioned: false,
+            }],
+            warnings: vec!["un avertissement".to_string()],
+            blocked: false,
+            block_reason: None,
+        };
+        (servi.to_string(), attendu)
+    }
+
+    /// La porte appelée contre un factice qui sert `statut`/`corps` sur
+    /// `preview`, et le témoin de ce qu'il a vu sur la socket.
+    async fn par_la_porte(
+        statut: StatusCode,
+        corps: &str,
+    ) -> (
+        Result<RewindPreview, RewindRemoteIssue>,
+        Arc<Mutex<Vec<RequeteRecue>>>,
+    ) {
+        let (base, recues) = fake_spirit(&[("/api/v1/rewind/preview", statut, corps)]).await;
+        let rendu = preview(&base, "jeton", "mika-dev", "s-1", 42).await;
+        (rendu, recues)
+    }
+
+    /// T5-T7 : l'égalité du critère 1 se mesure par `format_preview`, parce
+    /// qu'aucun des quatre types d'aperçu ne dérive `PartialEq` — le texte est
+    /// la seule égalité disponible, et c'est aussi la seule qui compte ici,
+    /// puisque c'est ce texte que l'opérateur lit.
+    async fn la_porte_rend_laction(graphie: &str, action: ReversalAction) {
+        let (servi, attendu) = un_apercu(graphie, action);
+        let (rendu, _) = par_la_porte(StatusCode::OK, &servi).await;
+        let rendu = rendu.unwrap_or_else(|erreur| panic!("{graphie} passe la porte : {erreur}"));
+        assert_eq!(
+            mika_agent::rewind::format_preview(&rendu),
+            mika_agent::rewind::format_preview(&attendu),
+            "graphie {graphie}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_la_porte_rend_un_apercu_restore() {
+        la_porte_rend_laction("Restore", ReversalAction::Restore).await;
+    }
+
+    #[tokio::test]
+    async fn mika1727_la_porte_rend_un_apercu_delete() {
+        la_porte_rend_laction("Delete", ReversalAction::Delete).await;
+    }
+
+    #[tokio::test]
+    async fn mika1727_la_porte_rend_un_apercu_skip() {
+        la_porte_rend_laction("Skip", ReversalAction::Skip).await;
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_corps_de_la_porte_porte_ses_trois_champs() {
+        let (servi, _) = un_apercu("Restore", ReversalAction::Restore);
+        let (rendu, recues) = par_la_porte(StatusCode::OK, &servi).await;
+        rendu.expect("le factice sert un aperçu lisible");
+
+        let vues = recues.lock().unwrap();
+        let corps: serde_json::Value =
+            serde_json::from_str(&vues[0].corps).expect("le corps envoyé est du JSON");
+        // Lu sur la socket, et non sur la valeur passée à `post` : c'est la
+        // seule lecture qui mesure ce que le serveur recevra.
+        assert_eq!(corps["session_id"], "s-1");
+        assert_eq!(corps["after_message_id"], 42);
+        assert_eq!(corps["agent"], "mika-dev");
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_422_est_un_blocage_avec_sa_raison_et_son_apercu() {
+        let (servi, _) = un_apercu("Restore", ReversalAction::Restore);
+        let mut servi: serde_json::Value = serde_json::from_str(&servi).unwrap();
+        servi["blocked"] = serde_json::json!(true);
+        servi["block_reason"] = serde_json::json!("un verrou tient l'agent");
+        let (rendu, _) = par_la_porte(StatusCode::UNPROCESSABLE_ENTITY, &servi.to_string()).await;
+
+        match rendu.expect_err("un 422 est un refus du serveur") {
+            RewindRemoteIssue::Blocked { reason, preview } => {
+                // Égale, et non `contains` : la raison du serveur arrive à
+                // l'opérateur telle qu'elle a été écrite.
+                assert_eq!(reason, "un verrou tient l'agent");
+                assert!(preview.is_some(), "l'aperçu du refus est lisible");
+            }
+            autre => panic!("{autre:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_200_dont_blocked_est_vrai_est_aussi_un_blocage() {
+        // Ce serveur ne produit pas cette forme — il choisit son statut sur
+        // `resp.blocked`. C'est une incohérence serveur, et la propager en `Ok`
+        // ferait rendre `BLOCKED: …` en position de succès.
+        let (servi, _) = un_apercu("Restore", ReversalAction::Restore);
+        let mut servi: serde_json::Value = serde_json::from_str(&servi).unwrap();
+        servi["blocked"] = serde_json::json!(true);
+        servi["block_reason"] = serde_json::json!("incohérent, mais dit");
+        let (rendu, _) = par_la_porte(StatusCode::OK, &servi.to_string()).await;
+
+        match rendu.expect_err("un aperçu bloqué n'est pas un succès") {
+            RewindRemoteIssue::Blocked { reason, .. } => {
+                assert_eq!(reason, "incohérent, mais dit");
+            }
+            autre => panic!("{autre:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_action_inconnue_par_la_porte_ne_rend_aucune_icone() {
+        let (servi, _) = un_apercu("Rollback", ReversalAction::Skip);
+        let (rendu, _) = par_la_porte(StatusCode::OK, &servi).await;
+        let erreur = rendu.expect_err("une action inconnue n'est pas un succès");
+        let message = erreur.to_string();
+        assert!(message.contains("Rollback"), "{message}");
+        // La seconde moitié du critère 2, et elle ne se mesure que par la porte :
+        // les trois icônes, non `⏭` seule, parce qu'un repli sur `Restore` ou
+        // `Delete` est tout aussi possible à l'écriture.
+        for icone in ["↩", "🗑", "⏭"] {
+            assert!(!message.contains(icone), "{icone} dans {message}");
+        }
+        assert!(
+            matches!(erreur, RewindRemoteIssue::Unexpected { .. }),
+            "{erreur:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_422_garde_sa_raison_quand_son_apercu_est_illisible() {
+        let (servi, _) = un_apercu("Rollback", ReversalAction::Skip);
+        let mut servi: serde_json::Value = serde_json::from_str(&servi).unwrap();
+        servi["block_reason"] = serde_json::json!("la session est verrouillée");
+        let (rendu, _) = par_la_porte(StatusCode::UNPROCESSABLE_ENTITY, &servi.to_string()).await;
+
+        match rendu.expect_err("un 422 reste un refus") {
+            // La raison survit à l'échec de la conversion : c'est elle que
+            // l'opérateur est venu chercher, pas le diagnostic de version.
+            RewindRemoteIssue::Blocked { reason, preview } => {
+                assert_eq!(reason, "la session est verrouillée");
+                assert!(preview.is_none(), "l'aperçu, lui, est perdu");
+            }
+            autre => panic!("{autre:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_422_sans_raison_porte_un_repli_nomme() {
+        let (servi, _) = un_apercu("Restore", ReversalAction::Restore);
+        let (rendu, _) = par_la_porte(StatusCode::UNPROCESSABLE_ENTITY, &servi).await;
+
+        match rendu.expect_err("le statut suffit à faire le refus") {
+            RewindRemoteIssue::Blocked { reason, .. } => {
+                // Non vide : `Display` rendrait sinon « refuses the rewind: »,
+                // une phrase coupée à l'endroit où la cause est attendue.
+                assert!(reason.contains("without saying why"), "{reason}");
+            }
+            autre => panic!("{autre:?}"),
+        }
     }
 }
