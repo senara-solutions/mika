@@ -13,6 +13,7 @@
 //! en production. V2c-1a-2 les câble, et retire avec elles les attributs
 //! `expect(dead_code)` posés ici.
 
+use mika_agent::rewind::RewindPreview;
 use serde::Deserialize;
 
 // Les six miroirs du fil. Les réponses de `mika-agent/src/server/rewind.rs` ne
@@ -79,6 +80,72 @@ pub(crate) struct ResultMirror {
     pub(crate) rewind_trace_id: String,
 }
 
+/// Le vocabulaire d'erreur que les trois routes partagent.
+///
+/// `Blocked` n'a aucun producteur dans ce vol — `post` rend le 422 à l'appelant
+/// sans le traduire (§ 2.3). Il atterrit quand même ici parce qu'il est la seule
+/// pièce de ce vocabulaire que V2c-1a-2 aurait à **redéfinir** plutôt qu'à
+/// construire s'il manquait : ajouter un variant est additif, changer la forme
+/// d'un variant existant est une modification.
+#[expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727")]
+#[derive(Debug)]
+pub(crate) enum RewindRemoteIssue {
+    /// `preview` porte l'aperçu entier dans son 422, `execute` n'y met qu'une
+    /// raison : d'où l'`Option`, qui laisse la porte dire laquelle des deux
+    /// formes elle a reçue. Le `Box` n'est pas une précaution de style — c'est
+    /// la condition d'un `cargo clippy` vert : `post` rend
+    /// `Result<_, RewindRemoteIssue>`, donc `result_large_err` évalue la taille
+    /// du variant `Err` **dès ce vol**, et `RewindPreview` nu (quatre `Vec`, un
+    /// `bool`, un `Option<String>`) y porte l'enum au-dessus du seuil.
+    Blocked {
+        reason: String,
+        preview: Option<Box<RewindPreview>>,
+    },
+    /// Le 404 a deux causes côté serveur et le client ne peut pas trancher : le
+    /// message les nomme toutes deux au lieu d'en affirmer une. En choisir une
+    /// enverrait le lecteur chercher une session là où le défaut est un nom
+    /// d'agent. L'URL voyage parce qu'elle porte la route et la base.
+    NotFound {
+        url: String,
+    },
+    Busy,
+    /// Ne porte rien : le nom de la variable est la moitié utile du message.
+    /// Sans lui un 401 se lit comme une panne du serveur, avec lui comme un
+    /// jeton à poser.
+    Denied,
+    /// `status` est un `Option` parce que `None` dit « aucune réponse reçue »
+    /// (panne de transport). Un `0` conventionnel se lirait comme un statut HTTP
+    /// dans un journal ; l'`Option` ne ment pas.
+    Unexpected {
+        status: Option<u16>,
+        url: String,
+        body: String,
+    },
+}
+
+// `Display` à la main plutôt que `thiserror` : l'enum n'a pas de source à
+// chaîner et ne franchit aucune frontière de bibliothèque.
+impl std::fmt::Display for RewindRemoteIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blocked { reason, .. } => write!(f, "mika-spirit refuses the rewind: {reason}"),
+            Self::NotFound { url } => write!(
+                f,
+                "mika-spirit found nothing at {url}: no exchanges to rewind, or unknown agent"
+            ),
+            Self::Busy => write!(f, "the agent is busy: another turn holds its lock"),
+            Self::Denied => write!(
+                f,
+                "mika-spirit denied the request: set MIKA_INTERNAL_TOKEN to the server's token"
+            ),
+            Self::Unexpected { status, url, body } => match status {
+                Some(statut) => write!(f, "mika-spirit returned {statut} for {url}: {body}"),
+                None => write!(f, "mika-spirit is unreachable at {url}: {body}"),
+            },
+        }
+    }
+}
+
 // Tout le code de test vit ici, **à la fin du fichier** : le scanner d'egress
 // (`scripts/lib/egress_manifest_lint.py`) coupe la production au premier
 // `#[cfg(test)]`, donc un item de production qui reprendrait après la coupure
@@ -142,5 +209,25 @@ mod tests {
         assert_eq!(resultat.warnings, vec!["w".to_string()]);
         assert_eq!(resultat.reversal_descriptions, vec!["d".to_string()]);
         assert_eq!(resultat.rewind_trace_id, "rw-1");
+    }
+
+    // Le seul bras de l'enum qu'aucun statut ne produit dans ce vol : sans ce
+    // test il atterrirait sans mesure.
+    #[test]
+    fn mika1727_le_bras_bloque_se_lit_sans_apercu() {
+        let bloque = RewindRemoteIssue::Blocked {
+            reason: "une tâche tient le verrou".to_string(),
+            preview: None,
+        };
+        assert!(
+            bloque.to_string().contains("une tâche tient le verrou"),
+            "le Display doit porter la raison, pas seulement le nom du bras : {bloque}"
+        );
+        // Le message tient sans aperçu : c'est la forme du 422 d'`execute` (F5),
+        // qui ne porte qu'une raison.
+        assert!(matches!(
+            bloque,
+            RewindRemoteIssue::Blocked { preview: None, .. }
+        ));
     }
 }
