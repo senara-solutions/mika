@@ -102,7 +102,8 @@ run_verify() {
   local pr_body="${1:-}"
   local exit_code=0
   local output
-  output=$(PATH="$TEST_DIR:$PATH" GITHUB_PR_BODY="$pr_body" bash scripts/verify-pipeline.sh main 2>&1) || exit_code=$?
+  output=$(PATH="$TEST_DIR:$PATH" GITHUB_PR_BODY="$pr_body" \
+    env -u GITHUB_EVENT_PATH bash scripts/verify-pipeline.sh main 2>&1) || exit_code=$?
   echo "$output"
   return $exit_code
 }
@@ -110,9 +111,11 @@ run_verify() {
 # --- mika#2419: synthetic GitHub Actions event payloads ---
 #
 # The automated-author exemption reads `.pull_request.user.login` from
-# $GITHUB_EVENT_PATH. `run_verify` above deliberately does NOT set that variable
-# (it is the fail-closed baseline — see F3), so the author cases need their own
-# runner.
+# $GITHUB_EVENT_PATH. `run_verify` above deliberately STRIPS that variable
+# (it is the fail-closed baseline — see F3, F3b): in CI the runner exports it
+# pointing at the real PR event, so without the strip every baseline case on a
+# dependabot PR takes the automated-author exemption (mika#2983). The author
+# cases therefore need their own runner.
 
 # Write an event payload carrying a PR author login. Shape mirrors both what
 # GitHub Actions provides on `pull_request` events and what qa-review's Step 2B
@@ -695,6 +698,24 @@ write_mock_gh ""
 output="" ; exit_code=0
 output=$(run_verify "") || exit_code=$?
 assert_fail "F3: no event file → no exemption (a local run never exempts)" "$exit_code" "$output" "[pipeline-exempt: none] REJECT: code-only PR"
+cleanup_test_repo
+
+echo ""
+echo "=== F3b: inherited dependabot GITHUB_EVENT_PATH does not reach run_verify (mika#2983) ==="
+# On a dependabot PR the runner exports GITHUB_EVENT_PATH; if run_verify let
+# it through, every baseline case would take the automated-author exemption.
+setup_test_repo
+git checkout -b feat/test -q
+echo "fn main() {}" > main.rs
+git add main.rs
+git commit -q -m "feat: code only"
+write_mock_gh ""
+write_event_with_author "dependabot[bot]"
+export GITHUB_EVENT_PATH="$TEST_DIR/event.json"
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+unset GITHUB_EVENT_PATH
+assert_fail "F3b: runner's dependabot event is stripped from the baseline" "$exit_code" "$output" "[pipeline-exempt: none] REJECT: code-only PR"
 cleanup_test_repo
 
 echo ""
