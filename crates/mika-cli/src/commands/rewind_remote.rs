@@ -5,10 +5,11 @@
 //! [`super::tasks::fetch_task_detail`] : un client qui résout ses propres accès
 //! ne se pilote pas depuis un test. Les **trois** portes sont posées —
 //! [`preview`] et la conversion vers [`RewindPreview`] (vol V2c-1a-2a),
-//! [`execute`] (vol V2c-1a-2b), [`resolve`] (vol V2c-1a-2c) — et **leurs
-//! appelants arrivent avec V2c-1b** : c'est pourquoi chaque porte garde un
-//! `expect(dead_code)`, et pourquoi les miroirs qu'elles rendent gardent le leur
-//! sur des champs que personne ne lit encore.
+//! [`execute`] (vol V2c-1a-2b), [`resolve`] (vol V2c-1a-2c) — et depuis le vol
+//! V2c-1b **elles ont leur appelant** : `tui/commands/handlers.rs::rewind_par_spirit`,
+//! qui y fait passer `/undo`, `/rewind <n>` et `/rewind to <id>`. Les six
+//! `expect(dead_code)` que ce fichier portait sont tombées avec ce câblage ; le
+//! `dead_code` qui mordait ici est désormais celui qui mord chez l'appelant.
 
 use mika_agent::rewind::{
     MessagePreview, ReversalAction, ReversalPreview, RewindPreview, TaskPreview,
@@ -19,19 +20,18 @@ use serde::Deserialize;
 // dérivent que `Serialize`, et `crates/mika-agent/` est hors périmètre : ces
 // structs *sont* le contrat de fil côté client, sans règle de domaine (§ 2.4).
 
-// Le type n'est plus mort — [`resolve`] le rend —, ce sont ses **champs** que
-// personne ne lit encore. Mesuré à `cargo clippy -p mika-cli` : « fields
-// `session_id`, `after_message_id`, and `trace_ids` are never read », et non
-// « struct is never constructed » comme avant ce vol.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "champs lus par V2c-1b, mika#1727")
-)]
+// Le miroir ne déclare plus `trace_ids`, que le serveur continue d'envoyer :
+// `serde` ignore par défaut ce qu'un `Deserialize` ne déclare pas, donc rien ne
+// casse sur le fil. Ce qui change, c'est que le miroir ne déclare plus que ce
+// qu'il **consomme** — l'ancrage repart vers [`preview`] puis [`execute`] et
+// n'est jamais montré à l'opérateur, donc les traces n'avaient aucun lecteur
+// naturel. Un champ déclaré sans lecteur est du code mort sous une attente. Le
+// jour où un appelant veut les traces, il rajoute le champ et son lecteur dans
+// le même geste — la seule façon de ne jamais retomber ici.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResolveMirror {
     pub(crate) session_id: String,
     pub(crate) after_message_id: i64,
-    pub(crate) trace_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,15 +67,9 @@ pub(crate) struct TaskMirror {
     pub(crate) actioned: bool,
 }
 
-// L'attribut reste, mais sa raison change : le type n'est plus mort — [`execute`]
-// le rend —, ce sont ses **champs** que personne ne lit encore, la porte les
-// passant à son appelant sans les ouvrir. Mesuré à `cargo clippy -p mika-cli
-// --all-targets` : « multiple fields are never read », comme pour
-// `ResolveMirror` ci-dessus depuis que [`resolve`] le construit.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "champs lus par V2c-1b, mika#1727")
-)]
+// Les huit champs ont désormais leur lecteur, dans le rendu de
+// `rewind_par_spirit` — y compris les trois que l'attente couvrait seule
+// (`reversals_skipped`, `reversal_descriptions`, `rewind_trace_id`).
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResultMirror {
     pub(crate) messages_deleted: usize,
@@ -117,10 +111,8 @@ pub(crate) struct ErrorMirror {
 pub(crate) enum RewindRemoteIssue {
     Blocked {
         reason: String,
-        // La porte l'**écrit** ; le premier à le *lire* est V2c-1b, qui affiche
-        // l'aperçu du refus. Un champ écrit sans lecteur est encore mort pour
-        // rustc, et c'est l'attente qui le dit plutôt qu'un silence.
-        #[cfg_attr(not(test), expect(dead_code, reason = "lu par V2c-1b, mika#1727"))]
+        // Lu par `rewind_par_spirit`, qui affiche l'aperçu du refus sous sa
+        // raison quand le serveur l'a joint.
         preview: Option<Box<RewindPreview>>,
     },
     NotFound {
@@ -211,13 +203,11 @@ async fn post(
 }
 
 /// L'ancrage d'un rembobinage de `count` échanges, tel que mika-spirit le
-/// calcule : la session visée, le `after_message_id` jusqu'où remonter, et les
-/// `trace_ids` des tours concernés.
+/// calcule : la session visée et le `after_message_id` jusqu'où remonter.
 ///
 /// Rendu en [`ResolveMirror`] et non converti vers un type de domaine, parce
-/// qu'il n'y en a pas : les trois champs repartent tels quels vers [`preview`]
+/// qu'il n'y en a pas : les deux champs repartent tels quels vers [`preview`]
 /// puis [`execute`], et l'ancrage n'est jamais montré à l'opérateur.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1b, mika#1727"))]
 pub(crate) async fn resolve(
     base_url: &str,
     token: &str,
@@ -376,7 +366,6 @@ fn preview_to_domain(miroir: PreviewMirror) -> Result<RewindPreview, String> {
 /// `blocked` serait vrai : `format_preview` rend alors `BLOCKED: …`, et ce texte
 /// en position de succès se lirait comme un aperçu — l'opérateur validerait un
 /// rembobinage que le serveur a déjà refusé.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1b, mika#1727"))]
 pub(crate) async fn preview(
     base_url: &str,
     token: &str,
@@ -451,13 +440,12 @@ pub(crate) async fn preview(
 /// Rendu en `ResultMirror` et non converti vers `mika_agent::rewind::RewindResult`,
 /// parce qu'il n'existe aucun formateur de domaine pour un résultat — `rewind.rs`
 /// n'expose que `format_preview`, et la mise en forme vit en ligne chez
-/// l'appelant, dans un fichier que ce vol n'ouvre pas. Recopier huit champs
-/// identiques vers un type que personne ne lit avant V2c-1b trancherait à la
-/// place de V2c-1b entre convertir ici et déplacer ce formatage.
+/// l'appelant, dans un fichier que ce vol n'ouvre pas. V2c-1b a tranché en
+/// gardant ce miroir : le rendu reste en ligne chez l'appelant, là où il était
+/// déjà, et aucun des huit champs n'est recopié vers un type intermédiaire.
 ///
 /// `Option<&str>` pour l'origine : l'appelant tient son `session_id` d'origine
 /// dans son propre état et n'a pas à l'allouer pour le prêter.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1b, mika#1727"))]
 pub(crate) async fn execute(
     base_url: &str,
     token: &str,
@@ -526,8 +514,15 @@ pub(crate) async fn execute(
 
 // Les tests vivent ici, **en fin de fichier** : le scanner d'egress coupe la
 // production au premier `#[cfg(test)]`, et un item d'après en sortirait.
+//
+// `pub(crate)` sur le module et sur le factice : depuis V2c-1b les tests de
+// `tui/commands/handlers.rs` visent le même serveur de test que ceux d'ici,
+// plutôt qu'une seconde copie libre d'en diverger. Le module reste sous
+// `#[cfg(test)]`, donc rien de cela n'existe en production. Précédents du même
+// geste : `mika-agent/src/grooming_marker.rs`, `db.rs`,
+// `server/webhook_prefilter.rs`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::Router;
     use axum::extract::{Request, State};
@@ -537,11 +532,11 @@ mod tests {
 
     /// Ce que le factice a vu sur la socket : le témoin est ce qui fait du
     /// `Bearer` et du corps intact des mesures, non des relectures du code.
-    struct RequeteRecue {
-        methode: String,
-        chemin: String,
-        autorisation: Option<String>,
-        corps: String,
+    pub(crate) struct RequeteRecue {
+        pub(crate) methode: String,
+        pub(crate) chemin: String,
+        pub(crate) autorisation: Option<String>,
+        pub(crate) corps: String,
     }
 
     #[derive(Clone)]
@@ -576,7 +571,7 @@ mod tests {
     /// Un `fallback` unique, et non trois routes déclarées : un seul factice sert
     /// les trois **et** prouve la visée, là où une route déclarée rendrait un 404
     /// qui se lirait comme le cas métier de `NotFound`.
-    async fn fake_spirit(
+    pub(crate) async fn fake_spirit(
         reponses: &[(&str, StatusCode, &str)],
     ) -> (String, Arc<Mutex<Vec<RequeteRecue>>>) {
         let recues = Arc::new(Mutex::new(Vec::new()));
@@ -735,7 +730,9 @@ mod tests {
         .expect("la forme de RewindResolveResponse");
         assert_eq!(resolu.session_id, "s-1");
         assert_eq!(resolu.after_message_id, 40);
-        assert_eq!(resolu.trace_ids, ["tr-1", "tr-2"]);
+        // La fixture garde `trace_ids`, que le serveur envoie toujours et que le
+        // miroir ne déclare plus : la lecture au-dessus atteste que `serde` le
+        // laisse passer au lieu d'échouer sur un champ non déclaré.
 
         let resultat: ResultMirror = serde_json::from_str(
             r#"{"messages_deleted":2,"reversals_applied":3,"reversals_skipped":1,
@@ -1242,9 +1239,8 @@ mod tests {
         assert!(message.contains("/api/v1/rewind/execute"), "{message}");
     }
 
-    /// Un ancrage à trois champs, tous distincts de leurs voisins : deux
-    /// `trace_ids` parce qu'un seul ne dirait pas que la liste est reprise en
-    /// entier.
+    /// Un ancrage tel que le serveur l'écrit, `trace_ids` compris — que le
+    /// miroir ne déclare plus depuis V2c-1b, et que `serde` laisse passer.
     const UN_ANCRAGE: &str =
         r#"{"session_id":"s-1","after_message_id":40,"trace_ids":["tr-1","tr-2"]}"#;
 
@@ -1269,16 +1265,10 @@ mod tests {
         let (rendu, _) = par_la_porte_resolve(StatusCode::OK, UN_ANCRAGE, 1).await;
         let ancrage =
             rendu.unwrap_or_else(|erreur| panic!("un 200 lisible passe la porte : {erreur}"));
-        // Les trois champs un à un : `ResolveMirror` ne dérive pas `PartialEq`,
+        // Les deux champs un à un : `ResolveMirror` ne dérive pas `PartialEq`,
         // et l'énumération est seule à dire *lequel* a dérivé.
         assert_eq!(ancrage.session_id, "s-1");
         assert_eq!(ancrage.after_message_id, 40);
-        // Sur le contenu, et non sur la longueur : deux `trace_ids` permutés ou
-        // vidés garderaient un `len() == 2`.
-        assert_eq!(
-            ancrage.trace_ids,
-            vec!["tr-1".to_string(), "tr-2".to_string()]
-        );
     }
 
     #[tokio::test]

@@ -1210,97 +1210,199 @@ async fn handle_rewind(app: &mut App<'_>, args: &str) -> String {
     }
 }
 
+/// Une source de variables d'environnement. `&dyn` et non un générique : la
+/// lecture est appelée depuis un seul site de production ; un paramètre de type
+/// ferait monomorphiser pour rien et se propagerait dans la signature de tout ce
+/// qui l'appelle.
+type SourceEnv<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Lit le jeton que les trois portes rewind de mika-spirit exigent.
+///
+/// Pas de repli sur `MIKA_DASHBOARD_TOKEN`, contrairement à
+/// `commands::dashboard::auth_token()`. Les trois routes rewind sont montées sous
+/// `require_internal_token` (`server/mod.rs:368-376`) : ce jeton-là y prend un 401,
+/// donc un refus **après** l'appel. `commands/iterate.rs:72-79` a tranché l'inverse
+/// pour une route qui *lance* un dispatch — un aller-retour pour un 401 lisible n'y
+/// coûte qu'un appel sans effet. Ici l'appel qui suivrait n'est pas sans effet :
+/// c'est `resolve` puis `preview` puis `execute`, et le 401 tomberait sur la
+/// première des trois, laissant à l'opérateur un message qui nomme le transport là
+/// où la cause est sa configuration. Refuser avant l'appel nomme la cause, et ne
+/// touche à rien.
+fn jeton_interne(lire: SourceEnv<'_>) -> Result<String, String> {
+    lire("MIKA_INTERNAL_TOKEN").ok_or_else(|| {
+        "Rewind requires MIKA_INTERNAL_TOKEN to reach mika-spirit. Set it in ~/.mika/.env \
+         (MIKA_DASHBOARD_TOKEN is not accepted by the rewind routes)."
+            .to_string()
+    })
+}
+
 async fn handle_rewind_impl(
     app: &mut App<'_>,
     exchange_count: usize,
     after_message_id: Option<i64>,
 ) -> String {
-    use mika_agent::rewind;
-
     if app.status != AgentStatus::Idle {
         return "Cannot rewind while agent is busy.".to_string();
     }
 
-    // Determine the anchor message ID and the session to rewind
-    let (rewind_session, anchor_id) = if let Some(id) = after_message_id {
+    // Le `.env` de la home est chargé ici et non dans `jeton_interne` : la
+    // lecture prend sa source en paramètre pour qu'un test la pilote, et un
+    // chargement caché derrière ce paramètre ferait mentir sa signature.
+    if let Ok(home) = mika_common::home::resolve_home_dir() {
+        mika_common::dotenv::load_dotenv(&home);
+    }
+    let base_url = crate::commands::dashboard::spirit_url();
+    rewind_par_spirit(
+        app,
+        &base_url,
+        &|nom| std::env::var(nom).ok(),
+        exchange_count,
+        after_message_id,
+    )
+    .await
+}
+
+/// Le rembobinage tel que mika-spirit l'applique : l'ancrage, l'aperçu et
+/// l'exécution passent par les trois portes de [`crate::commands::rewind_remote`].
+///
+/// L'URL de base et la source d'environnement arrivent **par argument**, comme
+/// `commands/chat_turn.rs::send_turn_to_endpoint` le fait pour le tour : c'est ce
+/// qui permet aux tests de viser un factice et de lire ce qui est parti sur la
+/// socket, plutôt que de relire le code qui l'écrit.
+async fn rewind_par_spirit(
+    app: &mut App<'_>,
+    base_url: &str,
+    lire_env: SourceEnv<'_>,
+    exchange_count: usize,
+    after_message_id: Option<i64>,
+) -> String {
+    use crate::commands::rewind_remote;
+    use mika_agent::rewind;
+
+    let jeton = match jeton_interne(lire_env) {
+        Ok(jeton) => jeton,
+        Err(refus) => return refus,
+    };
+
+    // L'ancrage. `/rewind to <id>` le tient déjà et n'appelle rien ; `/undo` et
+    // `/rewind <n>` le demandent à `resolve`, qui peut rendre une session
+    // antérieure. Un `Err` est rendu par son `Display`, qui nomme déjà la cause —
+    // dont le 404 « no exchanges to rewind, or unknown agent », qui couvre ce que
+    // le `Ok(None)` local rendait avant ce vol.
+    let (session, ancrage) = if let Some(id) = after_message_id {
         (app.session_id.clone(), id)
     } else {
-        // Find N recent exchanges (may fall back to a previous session)
-        match rewind::find_recent_exchanges(&app.db, &app.session_id, exchange_count).await {
-            Ok(Some(m)) => (m.session_id, m.anchor_message_id),
-            Ok(None) => return "No exchanges found to rewind.".to_string(),
-            Err(e) => return format!("Error finding exchanges: {e}"),
+        match rewind_remote::resolve(
+            base_url,
+            &jeton,
+            &app.agent_name,
+            &app.session_id,
+            exchange_count,
+        )
+        .await
+        {
+            Ok(ancrage) => (ancrage.session_id, ancrage.after_message_id),
+            Err(probleme) => return format!("Error finding exchanges: {probleme}"),
         }
     };
 
-    // Preview
-    let preview = match rewind::preview_rewind(&app.db, &rewind_session, anchor_id).await {
-        Ok(p) => p,
-        Err(e) => return format!("Error previewing rewind: {e}"),
+    // L'aperçu. `format_preview` reste la **seule** mise en forme d'un aperçu, de
+    // part et d'autre de la porte : c'est tout l'intérêt de la conversion vers le
+    // type de domaine que le vol V2c-1a-2a a payée.
+    let apercu_rendu =
+        match rewind_remote::preview(base_url, &jeton, &app.agent_name, &session, ancrage).await {
+            Ok(apercu) => rewind::format_preview(&apercu),
+            Err(rewind_remote::RewindRemoteIssue::Blocked { reason, preview }) => {
+                let mut sortie = format!("Rewind blocked: {reason}");
+                // L'aperçu du refus quand le serveur l'a joint : il dit *ce qui*
+                // aurait été défait, ce que la seule raison ne dit pas.
+                if let Some(apercu) = preview {
+                    sortie.push_str("\n\n");
+                    sortie.push_str(&rewind::format_preview(&apercu));
+                }
+                return sortie;
+            }
+            Err(probleme) => return format!("Error previewing rewind: {probleme}"),
+        };
+
+    // Cloné et non emprunté : `app` est repris en `&mut` juste après pour le
+    // rechargement, et un emprunt immuable traversant l'`await` d'`execute`
+    // ferait porter au lecteur la charge de vérifier qu'il meurt à temps.
+    let origine = (session != app.session_id).then(|| app.session_id.clone());
+
+    let resultat = match rewind_remote::execute(
+        base_url,
+        &jeton,
+        &app.agent_name,
+        &session,
+        ancrage,
+        origine.as_deref(),
+    )
+    .await
+    {
+        Ok(resultat) => resultat,
+        Err(probleme) => return format!("Rewind failed: {probleme}"),
     };
 
-    if preview.blocked {
-        return format!(
-            "Rewind blocked: {}",
-            preview.block_reason.unwrap_or_default()
-        );
-    }
-
-    // Show preview and execute (no confirmation in TUI — the preview is shown as output)
-    let preview_text = rewind::format_preview(&preview);
-
-    // Execute
-    let originating = if rewind_session != app.session_id {
-        Some(app.session_id.as_str())
-    } else {
-        None
-    };
-    match rewind::execute_rewind(&app.db, &rewind_session, anchor_id, originating).await {
-        Ok(result) => {
-            // Remove rewound messages from the TUI display — but only if we
-            // rewound the current session. Cross-session rewinds affect a prior
-            // session whose messages were loaded at startup; the TUI display
-            // should be fully refreshed instead.
-            // Reload messages from DB for both same-session and cross-session
-            // rewinds. The DB may contain intermediate assistant messages (tool_use)
-            // that are never in app.messages, so counting-based truncation is unreliable.
-            // This mirrors the startup loader in chat.rs.
-            app.messages.clear();
-            if let Ok((recent, _hidden_count)) = app
-                .db
-                .load_recent_messages_filtered(20, app.inbox_mode)
-                .await
-            {
-                for msg in &recent {
-                    if let Some(chat_msg) = session_message_to_chat_message(msg) {
-                        app.messages.push(chat_msg);
-                    }
-                }
+    // Reload messages from DB for both same-session and cross-session
+    // rewinds. The DB may contain intermediate assistant messages (tool_use)
+    // that are never in app.messages, so counting-based truncation is unreliable.
+    // This mirrors the startup loader in chat.rs.
+    //
+    // C'est **spirit** qui a écrit cette base, et la TUI qui la relit : les deux
+    // processus partagent le fichier, et le déplacement de la session hors du
+    // processus de la TUI est un vol ultérieur de mika#1727. Jusque-là, ce
+    // rechargement est précisément ce qui rend le rembobinage distant visible ici.
+    app.messages.clear();
+    if let Ok((recent, _hidden_count)) = app
+        .db
+        .load_recent_messages_filtered(20, app.inbox_mode)
+        .await
+    {
+        for msg in &recent {
+            if let Some(chat_msg) = session_message_to_chat_message(msg) {
+                app.messages.push(chat_msg);
             }
-            app.scroll_offset = 0;
-            app.messages_layout = MessagesLayout::default();
-
-            let mut output = preview_text;
-            output.push_str(&format!(
-                "\n\nRewind complete: {} messages deleted, {} reversals applied.",
-                result.messages_deleted, result.reversals_applied
-            ));
-            if result.tasks_deleted > 0 || result.tasks_cancelled > 0 {
-                output.push_str(&format!(
-                    "\nTasks: {} deleted, {} cancelled.",
-                    result.tasks_deleted, result.tasks_cancelled
-                ));
-            }
-            if !result.warnings.is_empty() {
-                output.push_str("\n\nWarnings:");
-                for w in &result.warnings {
-                    output.push_str(&format!("\n  - {w}"));
-                }
-            }
-            output
         }
-        Err(e) => format!("Rewind failed: {e}"),
     }
+    app.scroll_offset = 0;
+    app.messages_layout = MessagesLayout::default();
+
+    let mut output = apercu_rendu;
+    output.push_str(&format!(
+        "\n\nRewind complete: {} messages deleted, {} reversals applied",
+        resultat.messages_deleted, resultat.reversals_applied
+    ));
+    // `reversals_skipped` et `reversal_descriptions` disent **ce que le
+    // rembobinage n'a pas su défaire**. Un effet mémoire non inversé qu'on tait
+    // est exactement le mensonge que `reversal_action_from_label` refuse déjà de
+    // produire côté aperçu ; le taire ici le produirait une porte plus loin.
+    if resultat.reversals_skipped > 0 {
+        output.push_str(&format!(", {} skipped", resultat.reversals_skipped));
+    }
+    output.push('.');
+    if resultat.tasks_deleted > 0 || resultat.tasks_cancelled > 0 {
+        output.push_str(&format!(
+            "\nTasks: {} deleted, {} cancelled.",
+            resultat.tasks_deleted, resultat.tasks_cancelled
+        ));
+    }
+    if !resultat.reversal_descriptions.is_empty() {
+        output.push_str("\n\nReversals:");
+        for description in &resultat.reversal_descriptions {
+            output.push_str(&format!("\n  - {description}"));
+        }
+    }
+    if !resultat.warnings.is_empty() {
+        output.push_str("\n\nWarnings:");
+        for w in &resultat.warnings {
+            output.push_str(&format!("\n  - {w}"));
+        }
+    }
+    if !resultat.rewind_trace_id.is_empty() {
+        output.push_str(&format!("\nTrace: {}", resultat.rewind_trace_id));
+    }
+    output
 }
 
 #[cfg(test)]
@@ -2320,5 +2422,290 @@ mod tests {
             output.contains("not replayed"),
             "confirmation should warn the prompt is lost: {output}"
         );
+    }
+
+    // --- Le rembobinage par mika-spirit (mika#1727, vol V2c-1b) ---
+
+    /// T1 — sans jeton, le refus nomme la variable à poser.
+    #[test]
+    fn mika1727_v2c1b_sans_jeton_interne_le_refus_nomme_la_variable() {
+        let refus = jeton_interne(&|_| None).expect_err("une source vide ne rend aucun jeton");
+        assert!(
+            refus.contains("MIKA_INTERNAL_TOKEN"),
+            "le refus doit nommer la variable à poser : {refus}"
+        );
+    }
+
+    /// T2 — `MIKA_DASHBOARD_TOKEN` seul ne suffit pas.
+    #[test]
+    fn mika1727_v2c1b_un_jeton_de_tableau_de_bord_ne_suffit_pas() {
+        // La source ne rend que `MIKA_DASHBOARD_TOKEN` : l'environnement d'un
+        // opérateur qui a configuré le tableau de bord et rien d'autre. Le repli de
+        // `dashboard::auth_token()` l'accepterait ici, pour prendre un 401 sur
+        // `resolve`. La source est un paramètre, donc rien de tout cela ne mute
+        // l'environnement du processus de test.
+        let tableau_de_bord =
+            |nom: &str| (nom == "MIKA_DASHBOARD_TOKEN").then(|| "jeton-tb".to_string());
+        assert!(
+            jeton_interne(&tableau_de_bord).is_err(),
+            "le jeton du tableau de bord ne passe pas require_internal_token"
+        );
+        // Contrôle positif : la même lecture rend bien le jeton quand il est posé,
+        // sans quoi le refus ci-dessus serait vrai par construction.
+        assert_eq!(
+            jeton_interne(
+                &|nom: &str| (nom == "MIKA_INTERNAL_TOKEN").then(|| "jeton-interne".to_string())
+            )
+            .expect("un MIKA_INTERNAL_TOKEN posé se lit"),
+            "jeton-interne"
+        );
+    }
+
+    /// Le factice des trois portes est **emprunté** à `rewind_remote` (§ 2.7) :
+    /// un second témoin de socket ouvrirait une seconde vérité sur « ce que le
+    /// serveur a vu », dans un ticket qui existe pour retirer des duplications.
+    use crate::commands::rewind_remote::tests::{RequeteRecue, fake_spirit};
+    use std::sync::Mutex;
+
+    /// Une source qui pose le jeton interne, pour les tests qui veulent voir les
+    /// appels partir.
+    fn avec_jeton(nom: &str) -> Option<String> {
+        (nom == "MIKA_INTERNAL_TOKEN").then(|| "jeton-interne".to_string())
+    }
+
+    const APERCU_SERVI: &str = r#"{"messages":[{"id":41,"role":"user","content_snippet":"la question"}],
+        "reversals":[],"tasks":[],"warnings":[],"blocked":false,"block_reason":null}"#;
+
+    const RESULTAT_SERVI: &str = r#"{"messages_deleted":2,"reversals_applied":3,"reversals_skipped":1,
+        "tasks_deleted":0,"tasks_cancelled":0,"warnings":[],
+        "reversal_descriptions":["la fiche de Vincent"],"rewind_trace_id":"rw-7"}"#;
+
+    /// Les chemins des trois portes, dans l'ordre où la couture les traverse.
+    fn trois_portes(ancrage: &str) -> Vec<(&'static str, axum::http::StatusCode, String)> {
+        vec![
+            (
+                "/api/v1/rewind/resolve",
+                axum::http::StatusCode::OK,
+                ancrage.to_string(),
+            ),
+            (
+                "/api/v1/rewind/preview",
+                axum::http::StatusCode::OK,
+                APERCU_SERVI.to_string(),
+            ),
+            (
+                "/api/v1/rewind/execute",
+                axum::http::StatusCode::OK,
+                RESULTAT_SERVI.to_string(),
+            ),
+        ]
+    }
+
+    /// Monte le factice sur `reponses` et fait passer un rembobinage dessus.
+    async fn par_la_couture(
+        app: &mut App<'_>,
+        reponses: &[(&str, axum::http::StatusCode, String)],
+        lire_env: SourceEnv<'_>,
+        exchange_count: usize,
+        after_message_id: Option<i64>,
+    ) -> (String, Arc<Mutex<Vec<RequeteRecue>>>) {
+        let empruntes = reponses
+            .iter()
+            .map(|(chemin, statut, corps)| (*chemin, *statut, corps.as_str()))
+            .collect::<Vec<_>>();
+        let (base, vues) = fake_spirit(&empruntes).await;
+        let sortie =
+            rewind_par_spirit(app, &base, lire_env, exchange_count, after_message_id).await;
+        (sortie, vues)
+    }
+
+    /// T3 — sans jeton, aucune requête n'atteint le factice.
+    #[tokio::test]
+    async fn mika1727_v2c1b_sans_jeton_aucune_requete_ne_part() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let (sortie, vues) =
+            par_la_couture(&mut app, &trois_portes("{}"), &|_| None, 1, None).await;
+        assert!(
+            sortie.contains("MIKA_INTERNAL_TOKEN"),
+            "la sortie doit nommer la variable : {sortie}"
+        );
+        // Le refus tombe **avant** l'appel, et c'est la socket qui l'atteste : un
+        // message exact ne dirait pas qu'aucun `resolve` n'est parti.
+        assert_eq!(
+            vues.lock().unwrap().len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+    }
+
+    /// T4 — `/undo` traverse les trois portes dans l'ordre, sous son agent, et
+    /// rend les compteurs du résultat servi.
+    #[tokio::test]
+    async fn mika1727_v2c1b_undo_traverse_les_trois_portes_dans_lordre() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let ancrage = format!(
+            r#"{{"session_id":"{}","after_message_id":40,"trace_ids":[]}}"#,
+            app.session_id
+        );
+        let (sortie, vues) =
+            par_la_couture(&mut app, &trois_portes(&ancrage), &avec_jeton, 1, None).await;
+
+        let vues = vues.lock().unwrap();
+        let chemins = vues.iter().map(|v| v.chemin.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            chemins,
+            [
+                "/api/v1/rewind/resolve",
+                "/api/v1/rewind/preview",
+                "/api/v1/rewind/execute"
+            ],
+            "les trois portes, dans cet ordre"
+        );
+        for vue in vues.iter() {
+            assert!(
+                vue.corps.contains(r#""agent":"mika""#),
+                "l'agent de la TUI part dans les trois corps : {}",
+                vue.corps
+            );
+        }
+        assert!(sortie.contains("2 messages deleted"), "{sortie}");
+        assert!(sortie.contains("3 reversals applied"), "{sortie}");
+        // Les trois champs que l'attente `dead_code` de `ResultMirror` couvrait.
+        assert!(sortie.contains("1 skipped"), "{sortie}");
+        assert!(sortie.contains("la fiche de Vincent"), "{sortie}");
+        assert!(sortie.contains("Trace: rw-7"), "{sortie}");
+    }
+
+    /// T5 — `/rewind to <id>` n'appelle pas `resolve`, et le corps d'`execute`
+    /// ne porte **pas** de clé `originating_session_id`.
+    #[tokio::test]
+    async fn mika1727_v2c1b_rewind_to_nappelle_pas_resolve() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let (_sortie, vues) =
+            par_la_couture(&mut app, &trois_portes("{}"), &avec_jeton, 0, Some(40)).await;
+
+        let vues = vues.lock().unwrap();
+        assert_eq!(vues.len(), 2, "aperçu puis exécution, et rien avant");
+        assert_eq!(vues[0].chemin, "/api/v1/rewind/preview");
+        assert_eq!(vues[1].chemin, "/api/v1/rewind/execute");
+        // Lu sur la socket : un `None` côté Rust et une clé `null` sur le fil sont
+        // indiscernables depuis l'appelant, et c'est cette distinction que le
+        // commentaire d'`execute` déclare load-bearing.
+        assert!(
+            !vues[1].corps.contains("originating_session_id"),
+            "pas de clé d'origine quand la session ne bouge pas : {}",
+            vues[1].corps
+        );
+    }
+
+    /// T6 — quand `resolve` rend une autre session, l'origine part avec celle de
+    /// la TUI.
+    #[tokio::test]
+    async fn mika1727_v2c1b_une_autre_session_fait_partir_lorigine() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let ancrage = r#"{"session_id":"s-anterieure","after_message_id":40,"trace_ids":[]}"#;
+        let (_sortie, vues) =
+            par_la_couture(&mut app, &trois_portes(ancrage), &avec_jeton, 2, None).await;
+
+        let vues = vues.lock().unwrap();
+        let execute = vues
+            .iter()
+            .find(|v| v.chemin == "/api/v1/rewind/execute")
+            .expect("la porte execute est atteinte");
+        assert!(
+            execute
+                .corps
+                .contains(&format!(r#""originating_session_id":"{}""#, app.session_id)),
+            "l'origine est la session de la TUI : {}",
+            execute.corps
+        );
+        // Et la session visée est bien celle que `resolve` a rendue, sans quoi
+        // l'assertion ci-dessus passerait sur un rembobinage de la session courante.
+        assert!(
+            execute.corps.contains(r#""session_id":"s-anterieure""#),
+            "{}",
+            execute.corps
+        );
+    }
+
+    /// T7 — un 422 de `preview` dit le refus et la raison du serveur, et rien
+    /// n'est exécuté.
+    #[tokio::test]
+    async fn mika1727_v2c1b_un_refus_de_lapercu_nexecute_rien() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let mut reponses = trois_portes("{}");
+        // La forme que le serveur sert sur un refus : un aperçu dont `blocked`
+        // est vrai, sous un 422. Un corps d'erreur libre serait rendu
+        // `Unexpected` par la porte — un diagnostic de version, pas un refus.
+        reponses[1] = (
+            "/api/v1/rewind/preview",
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"messages":[],"reversals":[],"tasks":[],"warnings":[],
+                "blocked":true,"block_reason":"un verrou de session"}"#
+                .to_string(),
+        );
+        let (sortie, vues) = par_la_couture(&mut app, &reponses, &avec_jeton, 0, Some(40)).await;
+
+        assert!(sortie.contains("Rewind blocked"), "{sortie}");
+        assert!(
+            sortie.contains("un verrou de session"),
+            "la raison du serveur est rendue : {sortie}"
+        );
+        let vues = vues.lock().unwrap();
+        assert!(
+            vues.iter().all(|v| v.chemin != "/api/v1/rewind/execute"),
+            "un refus d'aperçu n'exécute rien"
+        );
+    }
+
+    /// T8 — la garde structurelle : la TUI ne rembobine plus la base en local.
+    ///
+    /// Le scan porte sur les trois gestes qui *lisent ou écrivent le
+    /// rembobinage en local*, et sur rien d'autre : `rewind::` reste importé
+    /// pour `format_preview`, le formateur légitime, et `app.db` reste lu pour
+    /// le rechargement.
+    #[test]
+    fn mika1727_v2c1b_la_tui_ne_rembobine_plus_la_base_en_local() {
+        // Livrée vide, et vide par construction : quand la garde rougit, le
+        // remède est la porte que son message nomme, jamais une entrée ici.
+        const ALLOWED: &[&str] = &[];
+        assert!(ALLOWED.is_empty(), "l'allowlist de cette garde reste vide");
+        const MOTIFS: &[(&str, &str)] = &[
+            ("find_recent_exchanges(", "rewind_remote::resolve"),
+            ("preview_rewind(", "rewind_remote::preview"),
+            ("execute_rewind(", "rewind_remote::execute"),
+        ];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let site = scanner.src_root().join("tui/commands/handlers.rs");
+        let production = scanner.production_of(&site);
+
+        // Sans ce témoin, une garde qui balaie un chemin faux, ou un balayeur
+        // qui masquerait le fichier entier, serait verte **par cécité** —
+        // l'exact défaut que `ProductionScanner` existe pour refuser
+        // (mika#2398). Le témoin vise un nom de la moitié *production* : s'il
+        // disparaît, la garde rougit et demande qu'on la re-vise, au lieu de
+        // continuer à ne rien regarder.
+        assert!(
+            production.contains("async fn handle_rewind_impl("),
+            "la garde n'a pas lu la moitié production de handlers.rs"
+        );
+
+        for (motif, porte) in MOTIFS {
+            let violations: Vec<String> = production
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
+                .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+                .collect();
+            assert!(
+                violations.is_empty(),
+                "mika#1727 V2c-1b — `{motif}` rembobine la base dans le processus de \
+                 la TUI. Le remède est de passer par `{porte}`, jamais une entrée \
+                 d'allowlist :\n{}",
+                violations.join("\n")
+            );
+        }
     }
 }
