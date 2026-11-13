@@ -27,6 +27,7 @@ pub mod openapi;
 pub mod permissions_stream;
 pub mod ready_label_handler;
 pub mod rewind;
+pub mod sessions;
 pub mod state;
 pub mod sync_debounce;
 pub mod tasks_stream;
@@ -375,6 +376,25 @@ fn build_router(state: AppState) -> Router {
             auth::require_internal_token,
         ));
 
+    // Ouverture de session (mika#1727, vol V2d-1a) — jeton interne seul.
+    //
+    // Groupe à part plutôt qu'une ligne de plus dans `rewind_routes` : ouvrir
+    // une session n'est pas un rembobinage, et les deux surfaces n'évolueront
+    // pas ensemble.
+    //
+    // Jeton interne seul, alors que le `GET /sessions` voisin accepte aussi le
+    // jeton du tableau de bord : ouvrir une session écrit une ligne. C'est le
+    // raisonnement d'`operator_v1_routes` ci-dessous — une mutation n'est pas
+    // une lecture d'observabilité, même quand son chemin jouxte celui d'une
+    // lecture. Deux déclarations pour un même chemin ne se marchent pas dessus :
+    // `route_layer` ne s'applique qu'aux méthodes déjà posées sur le groupe.
+    let session_routes = Router::new()
+        .route("/sessions", post(sessions::handle_create_session))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_internal_token,
+        ));
+
     // Operator mutation routes under /api/v1 — internal token ONLY, never the
     // dashboard token. mika#2506: `iterate` spawns a pilot that writes on a
     // reviewed PR's branch; that is not an observability read, so it does not
@@ -426,6 +446,7 @@ fn build_router(state: AppState) -> Router {
             "/api/v1",
             dashboard_routes
                 .merge(rewind_routes)
+                .merge(session_routes)
                 .merge(operator_v1_routes)
                 .layer(cors),
         )
@@ -5630,6 +5651,195 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ===== Routes de session (mika#1727 V2d-1a) =====
+
+    #[tokio::test]
+    async fn mika1727_sans_jeton_la_porte_de_session_rend_401() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 401 et non 404 : la route existe bien, c'est la porte qui refuse.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_jeton_du_tableau_de_bord_est_refuse() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Le `GET /sessions` voisin accepte ce jeton ; le POST non : ouvrir une
+        // session écrit une ligne.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_non_singleton_recoit_une_session_neuve() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["canonical"], serde_json::Value::Bool(false));
+        let session_id = json["session_id"].as_str().unwrap().to_string();
+        assert!(!session_id.is_empty());
+
+        // La lecture en base EST le test : un identifiant rendu sans sa ligne
+        // est exactement le défaut que la route ferme.
+        let session = db
+            .get_session(&session_id)
+            .await
+            .unwrap()
+            .expect("la ligne de session doit exister en base");
+        assert_eq!(session.agent_id, "mika");
+        assert_eq!(session.channel_type, "cli");
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_inconnu_rend_404_sans_ecrire() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        // Un couple avant/après, et non `== 0` : ce qui est mesuré est qu'un
+        // 404 n'écrit rien, pas que la base était vide au départ.
+        let avant = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"agent-inexistant-1727"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["error"].as_str().unwrap().is_empty());
+
+        let apres = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(avant, apres);
+    }
+
+    /// Un état dont l'agent `mika` est singleton (mika#1401). Même geste que
+    /// `mika2671_b2_state` : la `DashMap` détient seule l'`Arc`, donc
+    /// `Arc::get_mut` réussit tant qu'aucun clone n'en est sorti.
+    fn mika1727_state_singleton(canonical: &str) -> AppState {
+        let state = test_state();
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .canonical_session_id = Some(canonical.to_string());
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_singleton_recoit_toujours_sa_session_canonique() {
+        let state = mika1727_state_singleton("canonical-mika-1727");
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        async fn ouvrir(app: &Router) -> serde_json::Value {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sessions")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-token-secret")
+                        .body(Body::from(r#"{"agent":"mika"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        // Un couple avant/après, comme pour le 404 : la base du harnais porte
+        // déjà des sessions pour `mika`, donc ce qui se mesure est le nombre de
+        // lignes que les deux appels créent, pas le total.
+        let avant = db
+            .count_sessions(Some("mika".to_string()), None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let premier = ouvrir(&app).await;
+        let second = ouvrir(&app).await;
+
+        assert_eq!(premier["canonical"], serde_json::Value::Bool(true));
+        assert_eq!(second["canonical"], serde_json::Value::Bool(true));
+        assert_eq!(premier["session_id"], second["session_id"]);
+
+        // Une seule ligne née des deux appels : le second n'a rien fabriqué de
+        // plus, parce qu'une session canonique ne se remplace pas.
+        let apres = db
+            .count_sessions(Some("mika".to_string()), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(apres, avant + 1);
     }
 
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
