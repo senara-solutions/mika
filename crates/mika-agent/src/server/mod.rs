@@ -388,8 +388,10 @@ fn build_router(state: AppState) -> Router {
     // une lecture d'observabilité, même quand son chemin jouxte celui d'une
     // lecture. Deux déclarations pour un même chemin ne se marchent pas dessus :
     // `route_layer` ne s'applique qu'aux méthodes déjà posées sur le groupe.
+    // Clore tombe du même côté qu'ouvrir : poser un `ended_at` écrit une ligne.
     let session_routes = Router::new()
         .route("/sessions", post(sessions::handle_create_session))
+        .route("/sessions/{id}/end", post(sessions::handle_end_session))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
@@ -5840,6 +5842,237 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(apres, avant + 1);
+    }
+
+    // ===== Clôture de session (mika#1727 V2d-1b) =====
+
+    #[tokio::test]
+    async fn mika1727_sans_jeton_la_cloture_de_session_rend_401() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-401/end")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 401 et non 404 : la route existe bien, c'est la porte qui refuse.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_jeton_du_tableau_de_bord_est_refuse_a_la_cloture() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Le `GET /sessions/{id}` voisin accepte ce jeton ; la clôture non :
+        // poser un `ended_at` écrit une ligne.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-dash/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_session_de_lagent_se_clot() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        db.create_session("sess-1727-a", "mika", "cli")
+            .await
+            .unwrap();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-a/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ended"], serde_json::Value::Bool(true));
+        assert_eq!(json["canonical"], serde_json::Value::Bool(false));
+
+        // La lecture de la ligne EST le test : un 200 qui n'aurait rien écrit
+        // laisserait la TUI croire la session close alors qu'elle reste ouverte.
+        let session = db
+            .get_session("sess-1727-a")
+            .await
+            .unwrap()
+            .expect("la ligne de session doit exister en base");
+        assert!(session.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_session_inconnue_rend_404() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        // Un couple avant/après, et non `== 0` : la base du harnais porte déjà
+        // des sessions, donc une assertion à zéro mesurerait la vacuité du banc
+        // plutôt que l'absence d'écriture.
+        let avant = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-jamais-ecrite/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["error"].as_str().unwrap().is_empty());
+
+        let apres = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(avant, apres);
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_session_dun_autre_agent_rend_404_et_reste_ouverte() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        // `create_session` prend l'`agent_id` en paramètre : une session d'un
+        // autre agent s'écrit depuis la poignée de `mika`, sans provisionner un
+        // second agent — ce qui est exactement la raison d'être du contrôle
+        // d'appartenance, la base étant unique par conteneur. La ligne `agents`
+        // est due à la clé étrangère de `sessions.agent_id` ; elle n'entre pas
+        // dans l'`AppState`, donc cet agent reste inconnu de `resolve_agent` —
+        // ce qui est exactement le banc voulu.
+        db.register_agent("autre-agent-1727", "Autre 1727", "")
+            .await
+            .unwrap();
+        db.create_session("sess-1727-b", "autre-agent-1727", "cli")
+            .await
+            .unwrap();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-b/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Le couple des deux assertions EST la propriété : le 404 seul
+        // laisserait passer une clôture silencieuse, et l'`ended_at` seul
+        // laisserait passer un 403 bavard qui dirait à l'appelant que la session
+        // existe chez quelqu'un d'autre.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let session = db
+            .get_session("sess-1727-b")
+            .await
+            .unwrap()
+            .expect("la session de l'autre agent doit rester en base");
+        assert!(session.ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn mika1727_la_session_canonique_ne_se_clot_jamais() {
+        let state = mika1727_state_singleton("canonical-mika-1727");
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        // La session naît **par la route de V2d-1a** plutôt que par
+        // `get_or_create_canonical_session` : c'est le chemin que le client
+        // suivra en V2d-4, et le faire ainsi atteste au passage que les deux
+        // routes du vol V2d parlent du même identifiant.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let canonical_id = json["session_id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/sessions/{canonical_id}/end"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 200 et non une erreur : le client lit `ended: false` comme un fait sur
+        // la nature de la session, pas comme un refus.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ended"], serde_json::Value::Bool(false));
+        assert_eq!(json["canonical"], serde_json::Value::Bool(true));
+
+        let session = db
+            .get_session(&canonical_id)
+            .await
+            .unwrap()
+            .expect("la session canonique doit exister en base");
+        assert!(session.ended_at.is_none(), "mika#1401 : elle reste ouverte");
     }
 
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
