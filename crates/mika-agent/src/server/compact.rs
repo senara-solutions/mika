@@ -94,9 +94,14 @@ pub async fn handle_compact(
         return ok(false, messages);
     }
 
-    // Au-delà du seuil, l'appel à `maybe_compact` arrive au commit suivant de ce
-    // vol ; d'ici là la route rend l'issue qu'elle sait tenir.
-    ok(false, messages)
+    // Le LLM est celui de l'agent servi, `agent_state.llm`, et c'est tout l'objet
+    // du vol. Même appel que la compaction d'après tour (`handlers.rs`), donc
+    // aucune logique de compaction et aucun SQL ne sont écrits ici.
+    if let Err(e) = compaction::maybe_compact(&agent_state.db, agent_state.llm.as_ref()).await {
+        return compaction_failed(e);
+    }
+
+    ok(true, messages)
 }
 
 fn ok(compacted: bool, messages: usize) -> axum::response::Response {
@@ -115,6 +120,18 @@ fn count_failed(e: anyhow::Error) -> axum::response::Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({"error": format!("message count failed: {e}")})),
+    )
+        .into_response()
+}
+
+/// L'autre site, et il porte son propre texte pour la même raison : lire,
+/// résumer et remplacer échouent chacun dans `maybe_compact`, mais l'appel au
+/// LLM est le seul qui dépende du dehors. Un journal qui ne le distingue pas du
+/// compte envoie chercher une panne de base là où il y a un fournisseur à bout.
+fn compaction_failed(e: anyhow::Error) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": format!("compaction failed: {e}")})),
     )
         .into_response()
 }

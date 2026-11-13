@@ -6278,6 +6278,92 @@ mod tests {
         assert_eq!(db.count_messages().await.unwrap(), avant);
     }
 
+    #[tokio::test]
+    async fn mika1727_au_dela_du_seuil_la_route_compacte_avec_le_llm_de_lagent() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response("Fact: la conversation a été condensée.")])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        mika1727_seed_messages(&db, crate::compaction::COMPACTION_THRESHOLD + 1).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["compacted"], serde_json::Value::Bool(true));
+        assert_eq!(json["messages"], serde_json::json!(avant));
+
+        // Le compte **d'avant** dans l'issue, et le mock de l'`AgentState` appelé
+        // une fois : c'est tout l'objet du vol. Un appel par le LLM de la TUI
+        // laisserait ce compteur à zéro tout en condensant quand même.
+        assert_eq!(mock.calls_made(), 1, "le LLM de l'agent, une fois");
+
+        let resume = db.load_conversation_summary().await.unwrap();
+        assert!(resume.is_some(), "une ligne summary existe en base");
+        assert!(
+            db.count_messages().await.unwrap() < avant,
+            "le compte a baissé"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_erreur_du_llm_rend_500_sans_toucher_au_compte() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .error(mika_common::llm::LlmError::ProviderError(
+                    "fournisseur à bout".to_string(),
+                ))
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        mika1727_seed_messages(&db, crate::compaction::COMPACTION_THRESHOLD + 1).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Rien n'a été écrit, et ce n'est pas une garde de la route : l'appel au
+        // LLM arrive **avant** `replace_with_summary` dans `maybe_compact`, donc
+        // l'échec laisse l'historique entier. Le test l'atteste plutôt que de le
+        // supposer — si cet ordre changeait, un 500 pourrait perdre des messages.
+        assert_eq!(db.count_messages().await.unwrap(), avant);
+    }
+
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
 
     /// Un état d'agent dont le LLM compte ses appels. Assez de réponses EndTurn
