@@ -2657,4 +2657,55 @@ mod tests {
             "un refus d'aperçu n'exécute rien"
         );
     }
+
+    /// T8 — la garde structurelle : la TUI ne rembobine plus la base en local.
+    ///
+    /// Le scan porte sur les trois gestes qui *lisent ou écrivent le
+    /// rembobinage en local*, et sur rien d'autre : `rewind::` reste importé
+    /// pour `format_preview`, le formateur légitime, et `app.db` reste lu pour
+    /// le rechargement.
+    #[test]
+    fn mika1727_v2c1b_la_tui_ne_rembobine_plus_la_base_en_local() {
+        // Livrée vide, et vide par construction : quand la garde rougit, le
+        // remède est la porte que son message nomme, jamais une entrée ici.
+        const ALLOWED: &[&str] = &[];
+        assert!(ALLOWED.is_empty(), "l'allowlist de cette garde reste vide");
+        const MOTIFS: &[(&str, &str)] = &[
+            ("find_recent_exchanges(", "rewind_remote::resolve"),
+            ("preview_rewind(", "rewind_remote::preview"),
+            ("execute_rewind(", "rewind_remote::execute"),
+        ];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let site = scanner.src_root().join("tui/commands/handlers.rs");
+        let production = scanner.production_of(&site);
+
+        // Sans ce témoin, une garde qui balaie un chemin faux, ou un balayeur
+        // qui masquerait le fichier entier, serait verte **par cécité** —
+        // l'exact défaut que `ProductionScanner` existe pour refuser
+        // (mika#2398). Le témoin vise un nom de la moitié *production* : s'il
+        // disparaît, la garde rougit et demande qu'on la re-vise, au lieu de
+        // continuer à ne rien regarder.
+        assert!(
+            production.contains("async fn handle_rewind_impl("),
+            "la garde n'a pas lu la moitié production de handlers.rs"
+        );
+
+        for (motif, porte) in MOTIFS {
+            let violations: Vec<String> = production
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
+                .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+                .collect();
+            assert!(
+                violations.is_empty(),
+                "mika#1727 V2c-1b — `{motif}` rembobine la base dans le processus de \
+                 la TUI. Le remède est de passer par `{porte}`, jamais une entrée \
+                 d'allowlist :\n{}",
+                violations.join("\n")
+            );
+        }
+    }
 }
