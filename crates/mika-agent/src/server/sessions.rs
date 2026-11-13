@@ -11,8 +11,17 @@
 //! seul endroit où l'identifiant et sa ligne naissent ensemble.
 //!
 //! Ce vol n'a aucun appelant : la bascule de la TUI est en V2d-4.
+//!
+//! **`POST /api/v1/sessions/{id}/end` — la clôture (mika#1727, vol V2d-1b).**
+//! La route symétrique de la création : elle pose l'`ended_at` d'une session de
+//! l'agent servi. Elle rend `ended: false` **sans erreur** quand la session est
+//! la canonique de l'agent : une session canonique ne se clôt jamais
+//! (mika#1401), donc le client lit ce booléen comme un fait sur la nature de la
+//! session, et non comme un refus qu'il devrait réessayer ou remonter.
+//!
+//! Elle non plus n'a aucun appelant dans ce vol.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -99,6 +108,96 @@ pub async fn handle_create_session(
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EndSessionRequest {
+    /// Agent servi. Toujours envoyé, comme pour la création ; une chaîne vide
+    /// désigne l'agent par défaut, par `resolve_agent`.
+    #[serde(default)]
+    pub agent: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndSessionResponse {
+    /// Faux **sans erreur** quand la session est la canonique de l'agent : elle
+    /// ne se clôt jamais (mika#1401). Le client lit un fait, pas un refus.
+    pub ended: bool,
+    pub canonical: bool,
+}
+
+pub async fn handle_end_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<EndSessionRequest>,
+) -> impl IntoResponse {
+    let agent_state = match state.resolve_agent(&req.agent).await {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("agent '{}' not found", req.agent)})),
+            )
+                .into_response();
+        }
+    };
+
+    // Pas de verrou d'agent ici non plus : clore la fenêtre d'une TUI pendant
+    // que l'agent répond à un webhook n'invalide aucun tour en cours, puisque le
+    // tour en cours n'est pas celui de cette session. Le raisonnement complet est
+    // sur `handle_create_session` ci-dessus — une seconde copie serait une
+    // seconde chose à tenir à jour.
+
+    match agent_state.db.get_session(&session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return session_not_found(&session_id),
+        Err(e) => return end_failed(e),
+    }
+
+    // `canonical_session_id` est passé bien que le cas soit traité en amont, et
+    // la redondance est délibérée : les deux gardes répondent à deux questions
+    // différentes. En amont se décide la **réponse** (`canonical: true`,
+    // `ended: false` — un fait, pas une erreur) ; ici se tient l'**écriture**,
+    // c'est-à-dire l'invariant mika#1401 lui-même (l'`ended_at` de la canonique
+    // reste `NULL` pour toujours). Appeler `end_session` « puisque le cas est
+    // déjà traité » déplacerait cet invariant dans l'ordre des lignes du
+    // handler, que V2d-4 réordonnera.
+    match agent_state
+        .db
+        .end_session_unless_canonical(&session_id, agent_state.canonical_session_id.as_deref())
+        .await
+    {
+        Ok(()) => ended(true, false),
+        Err(e) => end_failed(e),
+    }
+}
+
+/// Le 404 de la clôture. Le texte ne nomme jamais l'agent propriétaire de la
+/// session.
+fn session_not_found(session_id: &str) -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": format!("session '{session_id}' not found")})),
+    )
+        .into_response()
+}
+
+fn ended(ended: bool, canonical: bool) -> axum::response::Response {
+    let resp = EndSessionResponse { ended, canonical };
+    (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+}
+
+/// Un second site plutôt qu'un message générique partagé avec `write_failed` :
+/// un 500 dont le texte ne dit pas quelle opération a échoué est un 500 qu'on
+/// diagnostique en relisant le code. Couvre la lecture comme l'écriture — les
+/// deux échouent sur la même base, et l'appelant n'a rien à faire de différent
+/// selon laquelle.
+fn end_failed(e: anyhow::Error) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": format!("session end failed: {e}")})),
+    )
+        .into_response()
 }
 
 fn ok(session_id: String, canonical: bool) -> axum::response::Response {
