@@ -456,6 +456,32 @@ passée dans `*_READER_ALLOWED` : le retrait **durcit** les deux scans, puisque
 toute réapparition d'une lecture de porte sous `crates/mika-cli/` est désormais
 un `strangers`.
 
+### Le rembobinage de la TUI est appliqué par mika-spirit (mika#1727, vol V2c-1b)
+
+`/undo`, `/rewind <n>` et `/rewind to <id>` ne touchent plus la base dans le
+processus de la TUI. `tui/commands/handlers.rs::rewind_par_spirit` traverse les
+**trois portes** de `commands/rewind_remote.rs` — `resolve` (l'ancrage :
+session visée et `after_message_id`), `preview` (ce qui serait défait), puis
+`execute` — toutes sur `{spirit_url}/api/v1/rewind/*`. `/rewind to <id>` saute
+`resolve` : l'ancrage est déjà donné.
+
+**Le refus structurel.**
+`mika1727_v2c1b_la_tui_ne_rembobine_plus_la_base_en_local` (module `tests` de
+`handlers.rs`) balaie la moitié production du fichier par `ProductionScanner` et
+refuse `find_recent_exchanges(`, `preview_rewind(` et `execute_rewind(`, chacun
+avec le nom de sa porte de remplacement. Son **allowlist est livrée vide et
+assertie vide** : quand elle rougit, le remède est de router l'appelant par la
+porte nommée, jamais d'y ajouter une ligne. Elle ne refuse ni `rewind::` ni
+`format_preview(` — le formateur reste légitime, et `app.db` reste lu pour le
+rechargement.
+
+**`MIKA_INTERNAL_TOKEN` est exigé, et le refus tombe avant tout appel.**
+`jeton_interne` lit la variable et refuse en la nommant : **`MIKA_DASHBOARD_TOKEN`
+ne suffit pas** — les routes rewind ne l'acceptent pas. Le refus est posé avant
+`resolve`, parce que l'appel qui suivrait n'est pas sans effet : un 401 tomberait
+sur la première des trois portes et nommerait le transport là où la cause est la
+configuration du shell.
+
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)
 - `/restart` tears down a crashed agent-worker tokio task and spawns a fresh worker for the same agent (mika#1149). Refuses on a healthy worker — `/clear` is the right tool for starting a new session. The lost in-flight prompt is NOT replayed; the operator must re-type. Background callback tasks survive the restart and continue delivering to the new worker
