@@ -6017,6 +6017,64 @@ mod tests {
         assert!(session.ended_at.is_none());
     }
 
+    #[tokio::test]
+    async fn mika1727_la_session_canonique_ne_se_clot_jamais() {
+        let state = mika1727_state_singleton("canonical-mika-1727");
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        // La session naît **par la route de V2d-1a** plutôt que par
+        // `get_or_create_canonical_session` : c'est le chemin que le client
+        // suivra en V2d-4, et le faire ainsi atteste au passage que les deux
+        // routes du vol V2d parlent du même identifiant.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let canonical_id = json["session_id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/sessions/{canonical_id}/end"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 200 et non une erreur : le client lit `ended: false` comme un fait sur
+        // la nature de la session, pas comme un refus.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ended"], serde_json::Value::Bool(false));
+        assert_eq!(json["canonical"], serde_json::Value::Bool(true));
+
+        let session = db
+            .get_session(&canonical_id)
+            .await
+            .unwrap()
+            .expect("la session canonique doit exister en base");
+        assert!(session.ended_at.is_none(), "mika#1401 : elle reste ouverte");
+    }
+
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
 
     /// Un état d'agent dont le LLM compte ses appels. Assez de réponses EndTurn

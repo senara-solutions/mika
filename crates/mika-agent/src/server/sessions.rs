@@ -148,6 +148,21 @@ pub async fn handle_end_session(
     // sur `handle_create_session` ci-dessus — une seconde copie serait une
     // seconde chose à tenir à jour.
 
+    // La garde canonique passe **avant** la lecture en base, et cet ordre est la
+    // décision : la ligne de la session canonique ne naît qu'au premier
+    // `get_or_create_canonical_session`, donc un client qui clôt avant de l'avoir
+    // ouverte recevrait un 404 — une issue qui dépendrait de l'ordre de ses
+    // propres appels, c'est-à-dire d'un état qu'il ne peut pas observer.
+    //
+    // Court-circuiter ici saute le contrôle d'appartenance ci-dessous, et c'est
+    // sans risque par construction : `canonical_session_id` est un champ de
+    // l'`AgentState` **de l'agent servi**, résolu à son `init_agent` depuis sa
+    // propre `identity.toml`. Il ne peut donc pas désigner la session d'un autre
+    // agent — ce n'est pas une donnée de la requête.
+    if agent_state.canonical_session_id.as_deref() == Some(session_id.as_str()) {
+        return ended(false, true);
+    }
+
     // Le contrôle d'appartenance est nécessaire **parce que la base est unique
     // par conteneur** : `agent_state.db` est une poignée dont l'`agent_id` est
     // un identifiant porté, pas une partition des données (`with_agent` est un
