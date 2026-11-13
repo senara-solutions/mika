@@ -148,9 +148,16 @@ pub async fn handle_end_session(
     // sur `handle_create_session` ci-dessus — une seconde copie serait une
     // seconde chose à tenir à jour.
 
+    // Le contrôle d'appartenance est nécessaire **parce que la base est unique
+    // par conteneur** : `agent_state.db` est une poignée dont l'`agent_id` est
+    // un identifiant porté, pas une partition des données (`with_agent` est un
+    // clone qui partage l'`Arc` interne), et `get_session` fait un `SELECT …
+    // WHERE id = ?` sans clause sur `agent_id`. Sans cette comparaison, la route
+    // clôt la session de n'importe quel agent du conteneur sur simple
+    // connaissance de son identifiant.
     match agent_state.db.get_session(&session_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return session_not_found(&session_id),
+        Ok(Some(s)) if s.agent_id == agent_state.db.agent_id() => {}
+        Ok(Some(_)) | Ok(None) => return session_not_found(&session_id),
         Err(e) => return end_failed(e),
     }
 
@@ -172,8 +179,15 @@ pub async fn handle_end_session(
     }
 }
 
-/// Le 404 de la clôture. Le texte ne nomme jamais l'agent propriétaire de la
-/// session.
+/// Un seul site pour les deux cas — session inconnue et session appartenant à un
+/// autre agent — et c'est le fond de la décision de sécurité du vol : un 403, ou
+/// un message qui différerait entre les deux, répondrait à une question que
+/// l'appelant n'a pas le droit de poser, *cette session existe-t-elle chez
+/// quelqu'un d'autre ?*. Avec deux issues distinguables, un porteur du jeton
+/// interne énumère les identifiants de session de tout le conteneur. Deux
+/// `format!` voisins seraient la même chose en sursis : une édition future les
+/// ferait diverger sans rien casser. Le texte ne nomme donc jamais l'agent
+/// propriétaire.
 fn session_not_found(session_id: &str) -> axum::response::Response {
     (
         StatusCode::NOT_FOUND,

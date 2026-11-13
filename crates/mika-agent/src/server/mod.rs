@@ -5971,6 +5971,52 @@ mod tests {
         assert_eq!(avant, apres);
     }
 
+    #[tokio::test]
+    async fn mika1727_une_session_dun_autre_agent_rend_404_et_reste_ouverte() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        // `create_session` prend l'`agent_id` en paramètre : une session d'un
+        // autre agent s'écrit depuis la poignée de `mika`, sans provisionner un
+        // second agent — ce qui est exactement la raison d'être du contrôle
+        // d'appartenance, la base étant unique par conteneur. La ligne `agents`
+        // est due à la clé étrangère de `sessions.agent_id` ; elle n'entre pas
+        // dans l'`AppState`, donc cet agent reste inconnu de `resolve_agent` —
+        // ce qui est exactement le banc voulu.
+        db.register_agent("autre-agent-1727", "Autre 1727", "")
+            .await
+            .unwrap();
+        db.create_session("sess-1727-b", "autre-agent-1727", "cli")
+            .await
+            .unwrap();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-b/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Le couple des deux assertions EST la propriété : le 404 seul
+        // laisserait passer une clôture silencieuse, et l'`ended_at` seul
+        // laisserait passer un 403 bavard qui dirait à l'appelant que la session
+        // existe chez quelqu'un d'autre.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let session = db
+            .get_session("sess-1727-b")
+            .await
+            .unwrap()
+            .expect("la session de l'autre agent doit rester en base");
+        assert!(session.ended_at.is_none());
+    }
+
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
 
     /// Un état d'agent dont le LLM compte ses appels. Assez de réponses EndTurn
