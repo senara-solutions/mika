@@ -5778,6 +5778,70 @@ mod tests {
         assert_eq!(avant, apres);
     }
 
+    /// Un état dont l'agent `mika` est singleton (mika#1401). Même geste que
+    /// `mika2671_b2_state` : la `DashMap` détient seule l'`Arc`, donc
+    /// `Arc::get_mut` réussit tant qu'aucun clone n'en est sorti.
+    fn mika1727_state_singleton(canonical: &str) -> AppState {
+        let state = test_state();
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .canonical_session_id = Some(canonical.to_string());
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_singleton_recoit_toujours_sa_session_canonique() {
+        let state = mika1727_state_singleton("canonical-mika-1727");
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        async fn ouvrir(app: &Router) -> serde_json::Value {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sessions")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-token-secret")
+                        .body(Body::from(r#"{"agent":"mika"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        // Un couple avant/après, comme pour le 404 : la base du harnais porte
+        // déjà des sessions pour `mika`, donc ce qui se mesure est le nombre de
+        // lignes que les deux appels créent, pas le total.
+        let avant = db
+            .count_sessions(Some("mika".to_string()), None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let premier = ouvrir(&app).await;
+        let second = ouvrir(&app).await;
+
+        assert_eq!(premier["canonical"], serde_json::Value::Bool(true));
+        assert_eq!(second["canonical"], serde_json::Value::Bool(true));
+        assert_eq!(premier["session_id"], second["session_id"]);
+
+        // Une seule ligne née des deux appels : le second n'a rien fabriqué de
+        // plus, parce qu'une session canonique ne se remplace pas.
+        let apres = db
+            .count_sessions(Some("mika".to_string()), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(apres, avant + 1);
+    }
+
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
 
     /// Un état d'agent dont le LLM compte ses appels. Assez de réponses EndTurn

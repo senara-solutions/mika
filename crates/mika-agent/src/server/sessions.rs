@@ -68,29 +68,56 @@ pub async fn handle_create_session(
     // d'ouvrir une fenêtre parce que l'agent travaille, c'est l'inverse du
     // service rendu.
 
-    let session_id = Uuid::new_v4().to_string();
-    match agent_state
-        .db
-        .create_session(&session_id, agent_state.db.agent_id(), CLI_CHANNEL)
-        .await
-    {
-        Ok(()) => {
-            let resp = CreateSessionResponse {
-                session_id,
-                canonical: false,
-            };
-            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+    // `canonical_session_id` est le seul discriminant du singleton. Il est figé
+    // à l'`init_agent` par `prompt::resolve_canonical_session_id` et ne vaut
+    // `Some` que pour un agent `[session] singleton = true` : la route ne relit
+    // ni `identity.toml`, ni les `Settings`.
+    match agent_state.canonical_session_id.as_deref() {
+        Some(canonical) => {
+            match agent_state
+                .db
+                .get_or_create_canonical_session(canonical, CLI_CHANNEL)
+                .await
+            {
+                // L'identifiant rendu est celui que la base rend, jamais
+                // `canonical.to_string()` : une session canonique ne se
+                // remplace pas (mika#1401), donc c'est la base qui dit laquelle
+                // est en place, pas l'appelant.
+                Ok(session_id) => ok(session_id, true),
+                Err(e) => write_failed(e),
+            }
         }
-        // Le corps ne porte aucun `session_id`, et c'est tout l'objet de la
-        // route : rendre un identifiant dont la ligne n'existe pas, c'est
-        // livrer exactement le défaut que l'en-tête de module décrit. `/send`
-        // avale le sien en `warn!` parce qu'il possède le tour qui suit ; ici
-        // le tour appartient à un client qu'on ne reverra qu'à la requête
-        // suivante.
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("session creation failed: {e}")})),
-        )
-            .into_response(),
+        None => {
+            let session_id = Uuid::new_v4().to_string();
+            match agent_state
+                .db
+                .create_session(&session_id, agent_state.db.agent_id(), CLI_CHANNEL)
+                .await
+            {
+                Ok(()) => ok(session_id, false),
+                Err(e) => write_failed(e),
+            }
+        }
     }
+}
+
+fn ok(session_id: String, canonical: bool) -> axum::response::Response {
+    let resp = CreateSessionResponse {
+        session_id,
+        canonical,
+    };
+    (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+}
+
+/// Le corps ne porte aucun `session_id`, et c'est tout l'objet de la route :
+/// rendre un identifiant dont la ligne n'existe pas, c'est livrer exactement le
+/// défaut que l'en-tête de module décrit. `/send` avale le sien en `warn!`
+/// parce qu'il possède le tour qui suit ; ici le tour appartient à un client
+/// qu'on ne reverra qu'à la requête suivante.
+fn write_failed(e: anyhow::Error) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": format!("session creation failed: {e}")})),
+    )
+        .into_response()
 }
